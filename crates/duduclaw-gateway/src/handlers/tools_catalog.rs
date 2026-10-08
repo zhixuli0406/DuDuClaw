@@ -123,6 +123,7 @@ impl MethodHandler {
                     { "name": "mcp.remote_complete", "description": "Finish a remote MCP sign-in from a pasted callback URL (admin)" },
                     { "name": "mcp.remote_status", "description": "List connected remote MCP servers, no secrets (admin)" },
                     { "name": "mcp.remote_disconnect", "description": "Delete a remote MCP server's stored credentials (admin)" },
+                    { "name": "mcp.tool_effects", "description": "Third-party MCP tools last listed for an agent, with derived effect class and verdict (admin)" },
                     { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
                     { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
                     { "name": "install_requests.decide", "description": "Approve/deny an install request; executes on final approval" },

@@ -1163,9 +1163,31 @@ async fn execute_proactive_check(
             // Attach agent's MCP server definitions so Notion/Gmail/etc tools
             // are available during the proactive run. `--strict-mcp-config`
             // prevents ambient global MCP from leaking in.
+            //
+            // Third-party stdio servers are routed through `duduclaw
+            // mcp-proxy` (2026-10-08), which applies the explore lane to
+            // their tools: only tools classed `read` are listed and callable,
+            // and a server's `readOnlyHint` counts only when the operator
+            // lists it in `[capabilities] trusted_read_hint_servers`. Remote
+            // bridges gate themselves (they inherit `DUDUCLAW_LANE`). If the
+            // rewritten config cannot be written the check is skipped rather
+            // than started with ungated servers.
             let mcp_json = agent_dir.join(".mcp.json");
+            let mut _gated_mcp: Option<tempfile::TempPath> = None;
             if mcp_json.exists() {
-                cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]);
+                let mut target = mcp_json.to_string_lossy().to_string();
+                match explore_lane_mcp_config(&mcp_json) {
+                    Ok(Some(tmp)) => {
+                        target = tmp.to_string_lossy().to_string();
+                        _gated_mcp = Some(tmp);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(agent = agent_id, "Proactive check skipped: {e}");
+                        return;
+                    }
+                }
+                cmd.args(["--mcp-config", &target]);
                 cmd.arg("--strict-mcp-config");
             }
 
@@ -2024,4 +2046,37 @@ mod stop_tree_tests {
         }
         assert_eq!(rows(), 1, "once per process per employee");
     }
+}
+
+/// The explore-lane `--mcp-config` for a proactive check: third-party stdio
+/// servers wrapped in `duduclaw mcp-proxy` (tool gate only). `Ok(None)` ⇒
+/// nothing to wrap, use the file as is.
+fn explore_lane_mcp_config(mcp_json: &std::path::Path) -> Result<Option<tempfile::TempPath>, String> {
+    use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_proxy_with};
+    let raw = std::fs::read_to_string(mcp_json).map_err(|e| format!("cannot read .mcp.json: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("malformed .mcp.json: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the duduclaw binary: {e}"))?;
+    let rewritten = rewrite_mcp_config_for_proxy_with(
+        &parsed,
+        &exe,
+        ProxyPurpose { redaction: false, tool_gate: true },
+    );
+    if rewritten == parsed {
+        return Ok(None);
+    }
+    let mut file = tempfile::Builder::new()
+        .prefix("duduclaw-mcp-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|e| format!("cannot create the gated MCP config: {e}"))?;
+    {
+        use std::io::Write;
+        let body = serde_json::to_string_pretty(&rewritten).map_err(|e| e.to_string())?;
+        file.write_all(body.as_bytes()).map_err(|e| format!("cannot write the gated MCP config: {e}"))?;
+        file.flush().map_err(|e| e.to_string())?;
+    }
+    let path = file.into_temp_path();
+    duduclaw_core::platform::set_owner_only(&path).ok();
+    Ok(Some(path))
 }

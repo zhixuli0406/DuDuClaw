@@ -166,6 +166,11 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mcp_remote_disconnect(params, ctx).await
             }
+            // Third-party tools with their derived effect class (2026-10-08).
+            "mcp.tool_effects" => {
+                require_admin!();
+                self.handle_mcp_tool_effects(params).await
+            }
 
             // ── MCP OAuth (admin only) ──────────────────────────
             "mcp.oauth.providers" => {

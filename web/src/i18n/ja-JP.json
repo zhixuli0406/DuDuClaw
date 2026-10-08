@@ -7433,5 +7433,13 @@
   "workflow.activation.suspendedLimit": "このバージョンは一時停止しています。実行が回数上限に繰り返し達したか、上限が必要な値より低く変更されました。",
   "workflow.activation.expiredBecause": "このバージョンの承認は {at} に期限切れになり、スケジュールは停止しました。",
   "approval.activation.expiresAt": "承認すると {at} まで有効です。期限後は自動で停止し、続けるには再申請が必要です。",
-  "approval.activation.countLimitsOnly": "単価が未設定のため費用上限は効きません。有効なのは回数上限（実行・ステップ・読み取り・変更）です。"
+  "approval.activation.countLimitsOnly": "単価が未設定のため費用上限は効きません。有効なのは回数上限（実行・ステップ・読み取り・変更）です。",
+  "mcp.toolEffects.title": "サードパーティのツールと動作の種類",
+  "mcp.toolEffects.desc": "この従業員のほかの MCP サーバーのツール（DuDuClaw 経由で最後に一覧化されたもの）と、DuDuClaw が判定する動作の種類、動作ルールの判断です。",
+  "mcp.toolEffects.empty": "まだ記録がありません。従業員のセッションが DuDuClaw 経由でツールを一覧化すると表示されます（リモートサーバーは常に経由、ローカルサーバーは動作ルール・匿名化・読み取り専用レーンがあるとき）。",
+  "mcp.toolEffects.trusted": "読み取り専用ラベルを信頼",
+  "mcp.toolEffects.untrusted": "読み取り専用ラベルを信頼しない",
+  "mcp.toolEffects.observed": "{at} に一覧化",
+  "mcp.toolEffects.exploreHidden": "読み取り専用実行では非表示",
+  "mcp.toolEffects.trustHelp": "ラベルはサーバー自身が付けるもので、誰も確認しません。読み取り専用と付いたツールは、管理者がサーバーを従業員の trusted_read_hint_servers に加えない限り「記録の変更」として扱われます。破壊的と付いたツールは常に「削除」です。"
 }

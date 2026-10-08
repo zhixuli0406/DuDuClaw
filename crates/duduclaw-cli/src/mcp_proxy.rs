@@ -75,6 +75,7 @@ use duduclaw_redaction::EgressDecision;
 use crate::mcp_redaction::{
     McpRedactionLayer, decide_tool_args_with, egress_deny_response, redact_tool_result_with,
 };
+use duduclaw_gateway::third_party_tools::ThirdPartyGate;
 
 /// Env var carrying the upstream server's `.mcp.json` `env` map, JSON-encoded.
 /// Written by the gateway's config rewrite, consumed (and removed) here.
@@ -255,6 +256,20 @@ pub async fn run_proxy_io(
     layer: Option<Arc<McpRedactionLayer>>,
     io: ProxyIo,
 ) -> std::io::Result<()> {
+    run_proxy_io_gated(server, layer, None, io).await
+}
+
+/// [`run_proxy_io`] with the third-party tool gate (2026-10-08,
+/// `duduclaw_gateway::third_party_tools`): `tools/list` answers are filtered
+/// and annotated, `tools/call` requests are refused or held for approval
+/// before they reach the upstream. `gate` `None` ⇒ no gate (the upstream is
+/// a remote bridge, which gates itself).
+pub async fn run_proxy_io_gated(
+    server: &str,
+    layer: Option<Arc<McpRedactionLayer>>,
+    gate: Option<Arc<ThirdPartyGate>>,
+    io: ProxyIo,
+) -> std::io::Result<()> {
     let ProxyIo {
         client_in,
         mut client_out,
@@ -263,8 +278,8 @@ pub async fn run_proxy_io(
     } = io;
 
     // One writer owns `client_out`, because two producers write to it: the
-    // upstream→client pump, and the deny responses the client→upstream pump
-    // answers itself.
+    // upstream→client pump, and the answers the client→upstream pump gives
+    // itself (redaction denials, refused tools).
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
         while let Some(mut line) = rx.recv().await {
@@ -278,12 +293,27 @@ pub async fn run_proxy_io(
         }
     });
 
+    // One writer owns `upstream_in` too: a call held for approval is
+    // forwarded later, from its own task.
+    let (up_tx, mut up_rx) = mpsc::unbounded_channel::<String>();
+    let up_writer = tokio::spawn(async move {
+        while let Some(line) = up_rx.recv().await {
+            if write_line(&mut upstream_in, &line).await.is_err() {
+                break;
+            }
+        }
+        // Dropping `upstream_in` closes the upstream's stdin.
+    });
+
     let pending = Arc::new(tokio::sync::Mutex::new(PendingCalls::new()));
+    let list_ids = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
 
     // ── upstream → client ────────────────────────────────────────────
     let up_task = {
         let pending = pending.clone();
         let layer = layer.clone();
+        let gate = gate.clone();
+        let list_ids = list_ids.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(upstream_out).lines();
@@ -297,6 +327,7 @@ pub async fn run_proxy_io(
                     // Non-JSON: opaque, forward verbatim.
                     None => line,
                     Some(frame) => {
+                        let (frame, line) = filter_listing(gate.as_deref(), &list_ids, frame, line);
                         rewrite_upstream_frame(layer.as_deref(), &pending, frame, line).await
                     }
                 };
@@ -308,6 +339,7 @@ pub async fn run_proxy_io(
     };
 
     // ── client → upstream ────────────────────────────────────────────
+    let mut held = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(client_in).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -315,55 +347,139 @@ pub async fn run_proxy_io(
         }
         let Some(frame) = parse_frame(&line) else {
             // Opaque line — forward verbatim.
-            if write_line(&mut upstream_in, &line).await.is_err() {
+            if up_tx.send(line).is_err() {
                 break;
             }
             continue;
         };
 
-        let forward = match (layer.as_deref(), tool_call_of(&frame)) {
-            // Redaction off, or not a tools/call → verbatim.
-            (None, _) | (_, None) => Some(line.clone()),
-            (Some(layer), Some((id, tool, args))) => {
-                let ns = namespaced_tool(server, &tool);
-                let decided = decide_args(layer, &ns, &args);
-                match decided {
-                    ArgDecision::Deny {
-                        reason,
-                        tokens_seen,
-                    } => {
-                        // Answer here; the call NEVER reaches upstream.
-                        let resp = egress_deny_response(&id, &ns, &reason, tokens_seen);
-                        let _ = tx.send(resp.to_string());
-                        None
+        if let Some(gate) = gate.as_ref() {
+            if frame.get("method").and_then(|m| m.as_str()) == Some("tools/list")
+                && let Some(k) = frame.get("id").and_then(id_key)
+                && let Ok(mut ids) = list_ids.lock()
+            {
+                ids.insert(k);
+            }
+            if let Some((id, tool, _)) = tool_call_of(&frame) {
+                match gate.decide(&tool).1 {
+                    duduclaw_core::ThirdPartyDecision::Allow => {}
+                    duduclaw_core::ThirdPartyDecision::Block(_) => {
+                        let msg = gate.check_call(&tool).await.err().unwrap_or_default();
+                        let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                        continue;
                     }
-                    ArgDecision::Forward(restored) => {
-                        let effective_args = restored.clone().unwrap_or_else(|| args.clone());
-                        pending.lock().await.insert(&id, ns, effective_args);
-                        match restored {
-                            Some(new_args) => {
-                                Some(with_restored_args(&frame, new_args).to_string())
+                    duduclaw_core::ThirdPartyDecision::Ask => {
+                        // Wait for a person without stalling the stream.
+                        let (gate, tx, up_tx) = (gate.clone(), tx.clone(), up_tx.clone());
+                        let (pending, layer) = (pending.clone(), layer.clone());
+                        let server = server.to_string();
+                        held.spawn(async move {
+                            match gate.check_call(&tool).await {
+                                Ok(()) => {
+                                    if let Some(payload) =
+                                        prepare_upstream(&server, layer.as_deref(), &pending, &tx, &frame, &line).await
+                                    {
+                                        let _ = up_tx.send(payload);
+                                    }
+                                }
+                                Err(msg) => {
+                                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                                }
                             }
-                            None => Some(line.clone()),
-                        }
+                        });
+                        continue;
                     }
                 }
             }
-        };
+        }
 
-        let Some(payload) = forward else { continue };
-        if write_line(&mut upstream_in, &payload).await.is_err() {
+        let Some(payload) = prepare_upstream(server, layer.as_deref(), &pending, &tx, &frame, &line).await
+        else {
+            continue;
+        };
+        if up_tx.send(payload).is_err() {
             break;
         }
     }
 
-    // Client hung up (or the pipe broke): close the upstream's stdin so it
-    // shuts down, then drain whatever it still has to say.
-    drop(upstream_in);
+    // Client hung up (or the pipe broke): let held calls finish (an
+    // approval resolves or expires), close the upstream's stdin so it shuts
+    // down, then drain whatever it still has to say.
+    while held.join_next().await.is_some() {}
+    drop(up_tx);
+    let _ = up_writer.await;
     drop(tx);
     let _ = up_task.await;
     let _ = writer.await;
     Ok(())
+}
+
+/// Apply the redaction egress decision to one client frame and return the
+/// line to send upstream, or `None` when the proxy answered it itself.
+async fn prepare_upstream(
+    server: &str,
+    layer: Option<&McpRedactionLayer>,
+    pending: &Arc<tokio::sync::Mutex<PendingCalls>>,
+    tx: &mpsc::UnboundedSender<String>,
+    frame: &Value,
+    line: &str,
+) -> Option<String> {
+    match (layer, tool_call_of(frame)) {
+        // Redaction off, or not a tools/call → verbatim.
+        (None, _) | (_, None) => Some(line.to_string()),
+        (Some(layer), Some((id, tool, args))) => {
+            let ns = namespaced_tool(server, &tool);
+            match decide_args(layer, &ns, &args) {
+                ArgDecision::Deny {
+                    reason,
+                    tokens_seen,
+                } => {
+                    // Answer here; the call NEVER reaches upstream.
+                    let resp = egress_deny_response(&id, &ns, &reason, tokens_seen);
+                    let _ = tx.send(resp.to_string());
+                    None
+                }
+                ArgDecision::Forward(restored) => {
+                    let effective_args = restored.clone().unwrap_or_else(|| args.clone());
+                    pending.lock().await.insert(&id, ns, effective_args);
+                    match restored {
+                        Some(new_args) => Some(with_restored_args(frame, new_args).to_string()),
+                        None => Some(line.to_string()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// When `frame` answers a `tools/list` this proxy saw, let the gate hide the
+/// tools the employee may not call and record annotations. Returns the frame
+/// and the line to pass on.
+fn filter_listing(
+    gate: Option<&ThirdPartyGate>,
+    list_ids: &std::sync::Mutex<std::collections::HashSet<String>>,
+    mut frame: Value,
+    line: String,
+) -> (Value, String) {
+    let Some(gate) = gate else { return (frame, line) };
+    if !is_response(&frame) {
+        return (frame, line);
+    }
+    let Some(k) = frame.get("id").and_then(id_key) else {
+        return (frame, line);
+    };
+    let ours = list_ids.lock().map(|mut ids| ids.remove(&k)).unwrap_or(false);
+    if !ours {
+        return (frame, line);
+    }
+    match frame.get_mut("result") {
+        Some(result) => {
+            gate.filter_list_result(result);
+            let line = frame.to_string();
+            (frame, line)
+        }
+        None => (frame, line),
+    }
 }
 
 /// What to do with a `tools/call`'s arguments.
@@ -501,6 +617,16 @@ pub async fn run_mcp_proxy(
         }
     };
 
+    // Third-party tool gate (2026-10-08). Not applied when the upstream is
+    // DuDuClaw's own remote bridge, which gates the same tools itself (the
+    // redaction rewrite wraps bridges; gating twice would ask twice).
+    let upstream_is_bridge = std::env::current_exe().is_ok_and(|exe| {
+        duduclaw_core::mcp_proxy_rewrite::is_remote_bridge_invocation(command, args, &exe)
+    });
+    let gate = (!upstream_is_bridge).then(|| {
+        Arc::new(ThirdPartyGate::new(home_dir, &default_agent, server, "proxy"))
+    });
+
     let env_blob = std::env::var(PROXY_UPSTREAM_ENV_VAR).ok();
     let env_pairs = upstream_env(std::env::vars(), env_blob.as_deref());
 
@@ -536,7 +662,7 @@ pub async fn run_mcp_proxy(
         upstream_out: Box::new(upstream_out),
     };
 
-    if let Err(e) = run_proxy_io(server, layer, io).await {
+    if let Err(e) = run_proxy_io_gated(server, layer, gate, io).await {
         tracing::warn!(server = %server, error = %e, "mcp-proxy: stream loop ended with an error");
     }
 
@@ -822,6 +948,122 @@ mod tests {
             replies.push(l);
         }
         (seen, replies)
+    }
+
+    /// The third-party tool gate in the proxy: a blocked tool is hidden and
+    /// refused without reaching the upstream, an `ask` tool waits for an
+    /// ApprovalBroker decision, a trusted read passes.
+    #[tokio::test]
+    async fn gate_hides_refuses_and_holds_calls_for_approval() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent = tmp.path().join("agents").join("a1");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("agent.toml"),
+            "[capabilities]\naction_rules = [{ effect = \"delete\", verdict = \"block\" }, { effect = \"modify\", verdict = \"ask\" }]\ntrusted_read_hint_servers = [\"crm\"]\n",
+        )
+        .unwrap();
+        let gate = Arc::new(ThirdPartyGate::with_lane(
+            tmp.path(),
+            "a1",
+            "crm",
+            "proxy",
+            duduclaw_core::ProcessLane::Normal,
+        ));
+
+        let (client_w, client_in) = duplex(1 << 16);
+        let (client_out, client_r) = duplex(1 << 16);
+        let (up_in, up_side_out) = duplex(1 << 16);
+        let (up_side_in, up_out) = duplex(1 << 16);
+        let proxy = tokio::spawn(async move {
+            run_proxy_io_gated(
+                "crm",
+                None,
+                Some(gate),
+                ProxyIo {
+                    client_in: Box::new(client_in),
+                    client_out: Box::new(client_out),
+                    upstream_in: Box::new(up_in),
+                    upstream_out: Box::new(up_out),
+                },
+            )
+            .await
+        });
+        let upstream = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut lines = BufReader::new(up_side_out).lines();
+            let mut out = up_side_in;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                seen.push(line);
+                let result = if req["method"] == "tools/list" {
+                    json!({ "tools": [
+                        { "name": "get", "annotations": { "readOnlyHint": true } },
+                        { "name": "put" },
+                        { "name": "drop", "annotations": { "destructiveHint": true } },
+                    ]})
+                } else {
+                    json!({ "content": [{ "type": "text", "text": "done" }] })
+                };
+                let resp = json!({ "jsonrpc": "2.0", "id": req["id"], "result": result });
+                out.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
+                out.flush().await.unwrap();
+            }
+            seen
+        });
+        // A person approves whatever is waiting.
+        let home = tmp.path().to_path_buf();
+        let approver = tokio::spawn(async move {
+            let broker = duduclaw_gateway::approval::ApprovalBroker::open(&home).unwrap();
+            for _ in 0..200 {
+                let pending = broker.list_pending(Some("a1")).await.unwrap_or_default();
+                if let Some(rec) = pending.first() {
+                    assert_eq!(rec.action_kind, "mcp_call");
+                    assert!(rec.summary.contains("crm.put"), "{}", rec.summary);
+                    broker.decide(&rec.id, true, "dashboard:admin").await.unwrap();
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        });
+
+        let mut w = client_w;
+        let mut lines = BufReader::new(client_r).lines();
+        let mut replies = Vec::new();
+        // List first (a call before any listing knows no annotations, so the
+        // tool counts as `modify`), then call.
+        w.write_all(format!("{}\n", json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).as_bytes())
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        replies.push(serde_json::from_str::<Value>(&lines.next_line().await.unwrap().unwrap()).unwrap());
+        for (id, name) in [(2, "get"), (3, "drop"), (4, "put")] {
+            let frame = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": {} } });
+            w.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+        }
+        w.flush().await.unwrap();
+        drop(w);
+
+        assert!(approver.await.unwrap(), "an approval was filed");
+        proxy.await.unwrap().unwrap();
+        let seen = upstream.await.unwrap();
+        while let Ok(Some(l)) = lines.next_line().await {
+            replies.push(serde_json::from_str::<Value>(&l).unwrap());
+        }
+        assert!(seen.iter().all(|l| !l.contains("\"drop\"")), "{seen:?}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        let by_id = |id: i64| replies.iter().find(|r| r["id"] == id).cloned().unwrap();
+        let listed: Vec<String> = by_id(1)["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, vec!["get", "put"]);
+        assert!(by_id(2)["result"].is_object());
+        assert_eq!(by_id(3)["error"]["code"], json!(-32003));
+        assert!(by_id(4)["result"].is_object(), "approved call ran");
     }
 
     #[tokio::test]

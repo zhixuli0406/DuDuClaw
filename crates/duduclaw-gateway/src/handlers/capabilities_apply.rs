@@ -220,6 +220,35 @@ pub(crate) fn apply_capabilities_to_table(
         changes.push(format!("capabilities.action_rules = [{n} rules]"));
     }
 
+    // ── trusted_read_hint_servers (2026-10-08) — third-party servers whose
+    // `readOnlyHint` the tool gate believes. REPLACE semantics; each entry
+    // must be a valid `.mcp.json` server name (not DuDuClaw's own).
+    if let Some(raw) = cap.get("trusted_read_hint_servers") {
+        let arr = raw
+            .as_array()
+            .ok_or_else(|| "capabilities.trusted_read_hint_servers must be an array".to_string())?;
+        let mut out: Vec<String> = Vec::with_capacity(arr.len());
+        for (i, v) in arr.iter().enumerate() {
+            let name = v.as_str().map(str::trim).unwrap_or("");
+            if !crate::mcp_scan::is_valid_mcp_server_name(name)
+                || duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name)
+            {
+                return Err(format!(
+                    "capabilities.trusted_read_hint_servers[{i}] must be a third-party MCP server name"
+                ));
+            }
+            if !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+        }
+        let n = out.len();
+        section.insert(
+            "trusted_read_hint_servers".into(),
+            toml::Value::Array(out.into_iter().map(toml::Value::String).collect()),
+        );
+        changes.push(format!("capabilities.trusted_read_hint_servers = [{n} servers]"));
+    }
+
     // ── [capabilities.computer_use_config] sub-table ──
     if let Some(cfg) = cap.get("computer_use_config").and_then(|v| v.as_object()) {
         let sub = section

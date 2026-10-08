@@ -61,6 +61,9 @@ struct Bridge {
     /// another process already renewed the token.
     last_auth: Mutex<Option<UpstreamAuth>>,
     out: mpsc::UnboundedSender<String>,
+    /// Effect classes / `action_rules` / explore lane for this server's
+    /// tools (2026-10-08, [`crate::third_party_tools`]).
+    gate: crate::third_party_tools::ThirdPartyGate,
 }
 
 fn error_frame(id: &Value, message: &str) -> String {
@@ -151,8 +154,25 @@ impl Bridge {
             }
         };
         let kind = classify(&frame);
-        let is_initialize = frame.get("method").and_then(|m| m.as_str()) == Some("initialize");
-        if let Err(msg) = self.exchange(&line, &kind, is_initialize).await {
+        let method = frame.get("method").and_then(|m| m.as_str());
+        let is_initialize = method == Some("initialize");
+        // Third-party tool gate: a refused or unapproved call never leaves.
+        if let (Kind::Request(id), Some("tools/call")) = (&kind, method) {
+            let tool = frame
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if let Err(msg) = self.gate.check_call(tool).await {
+                self.emit(crate::third_party_tools::refusal_frame(id, &msg));
+                return;
+            }
+        }
+        let list_id = match (&kind, method) {
+            (Kind::Request(id), Some("tools/list")) => Some(id.clone()),
+            _ => None,
+        };
+        if let Err(msg) = self.exchange(&line, &kind, is_initialize, list_id.as_ref()).await {
             match &kind {
                 Kind::Request(id) => self.emit(error_frame(id, &msg)),
                 _ => tracing::warn!(server = %self.server, error = %msg, "remote MCP message not delivered"),
@@ -160,7 +180,13 @@ impl Bridge {
         }
     }
 
-    async fn exchange(&self, body: &str, kind: &Kind, is_initialize: bool) -> Result<(), String> {
+    async fn exchange(
+        &self,
+        body: &str,
+        kind: &Kind,
+        is_initialize: bool,
+        list_id: Option<&Value>,
+    ) -> Result<(), String> {
         let mut auth = self.auth(false).await.map_err(|e| e.to_string())?;
         let mut resp = self.post(&auth, body).await?;
         if resp.status().as_u16() == 401 {
@@ -208,7 +234,7 @@ impl Bridge {
             .unwrap_or("")
             .to_ascii_lowercase();
         if content_type.starts_with("text/event-stream") {
-            self.relay_sse(resp, expect_id.as_ref(), is_initialize).await
+            self.relay_sse(resp, expect_id.as_ref(), is_initialize, list_id).await
         } else {
             let bytes = super::http::read_capped(resp, MAX_MESSAGE_BYTES).await?;
             if bytes.iter().all(|b| b.is_ascii_whitespace()) {
@@ -223,16 +249,25 @@ impl Bridge {
             match v {
                 Value::Array(items) => {
                     for item in items {
-                        self.deliver(item, is_initialize).await;
+                        self.deliver(item, is_initialize, list_id).await;
                     }
                 }
-                other => self.deliver(other, is_initialize).await,
+                other => self.deliver(other, is_initialize, list_id).await,
             }
             Ok(())
         }
     }
 
-    async fn deliver(&self, msg: Value, is_initialize: bool) {
+    async fn deliver(&self, mut msg: Value, is_initialize: bool, list_id: Option<&Value>) {
+        // The answer to a `tools/list`: hide the tools this employee may not
+        // call here and remember every tool's annotations.
+        if let Some(id) = list_id
+            && msg.get("id") == Some(id)
+            && msg.get("method").is_none()
+            && let Some(result) = msg.get_mut("result")
+        {
+            self.gate.filter_list_result(result);
+        }
         if is_initialize
             && let Some(v) = msg
                 .get("result")
@@ -254,6 +289,7 @@ impl Bridge {
         mut resp: reqwest::Response,
         expect_id: Option<&Value>,
         is_initialize: bool,
+        list_id: Option<&Value>,
     ) -> Result<(), String> {
         let mut buf: Vec<u8> = Vec::new();
         let mut answered = expect_id.is_none();
@@ -275,7 +311,7 @@ impl Bridge {
                     let is_answer = expect_id.is_some_and(|id| {
                         v.get("id") == Some(id) && v.get("method").is_none()
                     });
-                    self.deliver(v, is_initialize).await;
+                    self.deliver(v, is_initialize, list_id).await;
                     if is_answer {
                         answered = true;
                     }
@@ -364,6 +400,7 @@ where
         clients: Mutex::new(ClientCache { client: None }),
         last_auth: Mutex::new(None),
         out: tx,
+        gate: crate::third_party_tools::ThirdPartyGate::new(home, agent_id, server, "bridge"),
     });
 
     let mut lines = input.lines();

@@ -443,6 +443,45 @@ pub fn load_action_rules(agent_dir: &Path) -> crate::tool_effect::ActionRules {
     }
 }
 
+/// `[capabilities] action_rules` + `trusted_read_hint_servers` for the
+/// third-party MCP tool gate (`duduclaw mcp-proxy`, `duduclaw
+/// mcp-remote-bridge`).
+///
+/// The rules are read exactly like [`load_action_rules`] (fail closed). The
+/// trusted-server list is read from the same file: anything other than an
+/// array of non-empty strings trusts no server, so a typo can only make
+/// tools stricter.
+pub fn load_third_party_policy(agent_dir: &Path) -> crate::tool_effect::ThirdPartyPolicy {
+    let rules = load_action_rules(agent_dir);
+    let text = match resolved_override_path(agent_dir).map(|p| std::fs::read_to_string(&p)) {
+        Some(Ok(text)) => Some(text),
+        _ => std::fs::read_to_string(agent_dir.join("agent.toml")).ok(),
+    };
+    let trusted = text
+        .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+        .and_then(|doc| {
+            let list = doc.get("capabilities")?.get("trusted_read_hint_servers")?.as_array()?.clone();
+            let names: Option<Vec<String>> = list
+                .iter()
+                .map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                .collect();
+            names
+        })
+        .unwrap_or_default();
+    crate::tool_effect::ThirdPartyPolicy {
+        rules,
+        trusted_read_hint_servers: trusted,
+    }
+}
+
+/// Does a spawn out of `agent_dir` need its third-party MCP servers routed
+/// through `duduclaw mcp-proxy` for the tool gate? Yes when the employee has
+/// an `action_rules` key (even a malformed one) or the spawn runs in the
+/// explore lane.
+pub fn third_party_gate_needed(agent_dir: &Path, explore_lane: bool) -> bool {
+    explore_lane || load_third_party_policy(agent_dir).has_rules()
+}
+
 /// Env kill-switch for the minimal-context spawn optimization (WP-7A). Set to
 /// `0`/`false`/`no`/`off` to disable globally, `1`/`true`/`yes`/`on` to
 /// force-enable; unset defers to per-agent `[runtime] minimal_context`, then the
@@ -523,6 +562,22 @@ mod tests {
         // `[capabilities]` of the wrong shape: same.
         std::fs::write(dir.path().join("agent.toml"), "capabilities = 3\n").unwrap();
         assert!(load_action_rules(dir.path()).malformed);
+        assert!(third_party_gate_needed(dir.path(), false));
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[capabilities]\ntrusted_read_hint_servers = [\"github\"]\n",
+        )
+        .unwrap();
+        let p = load_third_party_policy(dir.path());
+        assert!(p.trusts_read_hint("github") && !p.trusts_read_hint("git"));
+        assert!(!third_party_gate_needed(dir.path(), false));
+        assert!(third_party_gate_needed(dir.path(), true));
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[capabilities]\ntrusted_read_hint_servers = [\"github\", 3]\n",
+        )
+        .unwrap();
+        assert!(load_third_party_policy(dir.path()).trusted_read_hint_servers.is_empty());
         // No key: no rules.
         std::fs::write(dir.path().join("agent.toml"), "[capabilities]\nos_native = true\n").unwrap();
         assert!(load_action_rules(dir.path()).is_absent());

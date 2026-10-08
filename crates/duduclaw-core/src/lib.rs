@@ -51,6 +51,7 @@ pub mod team_gate;
 pub mod text_utils;
 pub mod tool_catalog;
 pub mod tool_effect;
+pub mod mcp_proxy_rewrite;
 pub mod toml_merge;
 pub mod traits;
 pub mod types;
@@ -149,8 +150,9 @@ pub use takeover_state::{
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use tool_effect::{
-    effect_of, effect_of_builtin, ActionRule, ActionRules, ActionTarget, ActionVerdict, ProcessLane,
-    ToolEffect, ENV_LANE, LANE_EXPLORE,
+    effect_from_annotations, effect_of, effect_of_builtin, third_party_tool_ref, ActionRule,
+    ActionRules, ActionTarget, ActionVerdict, ProcessLane, ThirdPartyBlock, ThirdPartyDecision,
+    ThirdPartyPolicy, ToolAnnotations, ToolEffect, ENV_LANE, LANE_EXPLORE,
 };
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;

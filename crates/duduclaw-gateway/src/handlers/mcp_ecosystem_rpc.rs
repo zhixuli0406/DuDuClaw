@@ -360,6 +360,27 @@ impl MethodHandler {
         }
     }
 
+    /// `mcp.tool_effects { agent_id }` — Admin only. Every third-party
+    /// server whose `tools/list` passed `duduclaw mcp-proxy` or `duduclaw
+    /// mcp-remote-bridge` for this employee, each tool with the effect class
+    /// and verdict the current policy gives it (recomputed now from the
+    /// recorded annotations; `observed_at` says when the list was seen).
+    pub(crate) async fn handle_mcp_tool_effects(&self, params: Value) -> WsFrame {
+        let agent_id = str_param(&params, "agent_id").unwrap_or("").to_string();
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        let home = self.home_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::third_party_tools::load_snapshots(&home, &agent_id)
+        })
+        .await
+        {
+            Ok(servers) => WsFrame::ok_response("", json!({ "servers": servers })),
+            Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
+        }
+    }
+
     /// `mcp.remote_disconnect { agent_id, name, forget? }` — Admin only.
     /// Deletes the stored credentials (local only). `forget: true` also
     /// removes the record and the `.mcp.json` entry.

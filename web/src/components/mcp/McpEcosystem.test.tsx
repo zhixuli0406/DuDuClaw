@@ -179,3 +179,31 @@ describe('McpPage remote catalogue cards (E3)', () => {
     expect(screen.queryByRole('button', { name: /install to agent/i })).toBeNull();
   });
 });
+
+describe('ToolEffectsPanel', () => {
+  it('lists third-party tools with their effect class and verdict', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.tool_effects') {
+        return Promise.resolve({
+          servers: [
+            {
+              server: 'crm', seen_by: 'proxy', observed_at: '2026-10-08T00:00:00Z', read_hint_trusted: false,
+              tools: [
+                { name: 'get', description: '', annotations: { readOnlyHint: true }, effect: 'modify', verdict: 'ask', explore_visible: false },
+                { name: 'drop', description: '', annotations: { destructiveHint: true }, effect: 'delete', verdict: 'block', explore_visible: false },
+              ],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({});
+    });
+    const { ToolEffectsPanel } = await import('./ToolEffectsPanel');
+    renderWithProviders(<ToolEffectsPanel agents={agents} />);
+    const rows = await screen.findAllByTestId('tool-effect-row');
+    expect(rows).toHaveLength(2);
+    expect(mockWsClient.call).toHaveBeenCalledWith('mcp.tool_effects', { agent_id: 'nova' });
+    expect(screen.getByText(/labels not trusted/i)).toBeInTheDocument();
+    expect(screen.getByText('Never')).toBeInTheDocument();
+  });
+});

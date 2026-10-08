@@ -22,6 +22,7 @@ import {
 import { AlertTriangle, Cloud, Loader2, RefreshCw, Unplug, Trash2, ExternalLink } from 'lucide-react';
 import { AgentSelect, type AgentLite } from './AgentSelect';
 import { ConfirmDialog } from '@/components/settings/controls';
+import { ToolEffectsPanel } from './ToolEffectsPanel';
 
 /** The dashboard origin the OAuth redirect comes back to (validated by the gateway). */
 export function dashboardOrigin(): string {
@@ -534,6 +535,8 @@ export function RemoteServersTab({ agents }: { agents: ReadonlyArray<AgentLite> 
           ))}
         </div>
       )}
+
+      <ToolEffectsPanel agents={agents} />
 
       <RemoteConnectDialog
         open={dialog !== null}

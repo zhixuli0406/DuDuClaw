@@ -398,7 +398,7 @@ fn parse_rule(item: &serde_json::Value) -> Option<ActionRule> {
             if t.is_empty() {
                 return None;
             }
-            ActionTarget::Tool(t.to_string())
+            ActionTarget::Tool(normalize_tool_rule(t))
         }
         _ => return None,
     };
@@ -431,6 +431,175 @@ impl Serialize for ActionRules {
         match &self.raw {
             Some(v) => v.serialize(s),
             None => serde_json::Value::Array(Vec::new()).serialize(s),
+        }
+    }
+}
+
+/// A tool rule may name a third-party tool as `<server>.<tool>` (the form
+/// `duduclaw mcp-proxy` and the redaction rules use) or as the Claude CLI
+/// form `mcp__<server>__<tool>`; the first is rewritten into the second so
+/// one matcher serves both. DuDuClaw's own tool names never contain a dot, so
+/// a dotted name can only mean a third-party tool. `<server>.*` names every
+/// tool of that server.
+fn normalize_tool_rule(t: &str) -> String {
+    if t.starts_with("mcp__") {
+        return t.to_string();
+    }
+    match t.split_once('.') {
+        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+            format!("mcp__{server}__{tool}")
+        }
+        _ => t.to_string(),
+    }
+}
+
+// ── Third-party MCP tools (2026-10-08) ───────────────────────────────────
+
+/// The `annotations` an MCP server declares for one tool in `tools/list`
+/// (MCP 2025-03-26 and later). Every field is a *hint* the server makes
+/// about itself: nothing checks it. A value that is not a JSON boolean
+/// counts as absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAnnotations {
+    #[serde(rename = "readOnlyHint", skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<bool>,
+    #[serde(rename = "idempotentHint", skip_serializing_if = "Option::is_none")]
+    pub idempotent: Option<bool>,
+    #[serde(rename = "openWorldHint", skip_serializing_if = "Option::is_none")]
+    pub open_world: Option<bool>,
+}
+
+impl ToolAnnotations {
+    /// Read the `annotations` object of one `tools/list` entry.
+    pub fn from_tool(tool: &serde_json::Value) -> Self {
+        let Some(a) = tool.get("annotations").and_then(|a| a.as_object()) else {
+            return Self::default();
+        };
+        let flag = |k: &str| a.get(k).and_then(|v| v.as_bool());
+        Self {
+            read_only: flag("readOnlyHint"),
+            destructive: flag("destructiveHint"),
+            idempotent: flag("idempotentHint"),
+            open_world: flag("openWorldHint"),
+        }
+    }
+}
+
+/// The name action rules see for a third-party tool:
+/// `mcp__<server>__<tool>`, the Claude CLI's form, so `tool =
+/// "mcp__github__*"`, `tool = "github.create_issue"` and a bare server rule
+/// `tool = "mcp__github"` all match it (see [`ActionRules::resolve`]).
+pub fn third_party_tool_ref(server: &str, tool: &str) -> String {
+    format!("mcp__{server}__{tool}")
+}
+
+/// The class of a third-party tool from its annotations.
+///
+/// - `destructiveHint: true` ⇒ [`ToolEffect::Delete`] (believed from every
+///   server: it can only make the tool stricter);
+/// - `readOnlyHint: true` ⇒ [`ToolEffect::Read`] **only** when
+///   `trust_read_hint` (the operator listed the server in
+///   `[capabilities] trusted_read_hint_servers`), otherwise
+///   [`ToolEffect::Modify`];
+/// - anything else, including absent annotations ⇒ [`ToolEffect::Modify`].
+///
+/// Why `read` needs an opt-in: a malicious or careless server can declare
+/// `readOnlyHint: true` on a tool that deletes things. Believed, that tool
+/// would pass every `read` rule and the explore lane. Not believed, the
+/// cost is that a genuinely read-only tool of an untrusted server is treated
+/// like a write (asked, blocked or hidden wherever `modify` is).
+pub fn effect_from_annotations(ann: &ToolAnnotations, trust_read_hint: bool) -> ToolEffect {
+    if ann.destructive == Some(true) {
+        return ToolEffect::Delete;
+    }
+    if ann.read_only == Some(true) && trust_read_hint {
+        return ToolEffect::Read;
+    }
+    ToolEffect::Modify
+}
+
+/// Why a third-party tool is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThirdPartyBlock {
+    /// An `action_rules` entry says `block`.
+    Rule,
+    /// The process runs in the explore lane and the tool is not `read`.
+    Lane,
+}
+
+impl ThirdPartyBlock {
+    /// Audit token.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThirdPartyBlock::Rule => "action_rule",
+            ThirdPartyBlock::Lane => "explore_lane",
+        }
+    }
+}
+
+/// What the proxy / bridge does with one third-party tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThirdPartyDecision {
+    /// Listed and forwarded.
+    Allow,
+    /// Listed; each call waits for an ApprovalBroker decision.
+    Ask,
+    /// Hidden from `tools/list`; a call is answered with a JSON-RPC error.
+    Block(ThirdPartyBlock),
+}
+
+/// One employee's policy for tools of servers other than DuDuClaw's own:
+/// its `action_rules` plus the servers whose read-only hint it believes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThirdPartyPolicy {
+    pub rules: ActionRules,
+    pub trusted_read_hint_servers: Vec<String>,
+}
+
+impl ThirdPartyPolicy {
+    /// Does this employee believe `server`'s `readOnlyHint`? Exact name.
+    pub fn trusts_read_hint(&self, server: &str) -> bool {
+        self.trusted_read_hint_servers.iter().any(|s| s == server)
+    }
+
+    /// The class this employee gives `server`'s `tool`.
+    pub fn effect(&self, server: &str, ann: &ToolAnnotations) -> ToolEffect {
+        effect_from_annotations(ann, self.trusts_read_hint(server))
+    }
+
+    /// Is there anything to enforce outside the explore lane? `false` means
+    /// the proxy would only pass frames through, which is the pre-2026-10-08
+    /// behaviour (no rules ⇒ no friction).
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_absent() || self.rules.malformed
+    }
+
+    /// The decision for one tool in one lane.
+    ///
+    /// The explore lane admits only `read`, and a lane value other than
+    /// `explore` refuses everything (as for DuDuClaw's own tools). Outside
+    /// the lane the action rules decide; no rule ⇒ allow.
+    pub fn decide(
+        &self,
+        server: &str,
+        tool: &str,
+        ann: &ToolAnnotations,
+        lane: &ProcessLane,
+    ) -> ThirdPartyDecision {
+        let effect = self.effect(server, ann);
+        let lane_ok = match lane {
+            ProcessLane::Normal => true,
+            ProcessLane::Explore => effect == ToolEffect::Read,
+            ProcessLane::Invalid => false,
+        };
+        let verdict = self.rules.resolve(&third_party_tool_ref(server, tool), effect);
+        match verdict {
+            Some(ActionVerdict::Block) => ThirdPartyDecision::Block(ThirdPartyBlock::Rule),
+            _ if !lane_ok => ThirdPartyDecision::Block(ThirdPartyBlock::Lane),
+            Some(ActionVerdict::Ask) => ThirdPartyDecision::Ask,
+            _ => ThirdPartyDecision::Allow,
         }
     }
 }
@@ -536,6 +705,62 @@ mod tests {
         assert_eq!(r.resolve("mail_send", ToolEffect::Send), Some(ActionVerdict::Block));
         assert_eq!(r.resolve("wiki_write", ToolEffect::Modify), Some(ActionVerdict::Ask));
         assert_eq!(r.resolve("memory_search", ToolEffect::Read), None);
+    }
+
+    #[test]
+    fn third_party_annotations_classify_and_read_needs_trust() {
+        let ann = |v: serde_json::Value| ToolAnnotations::from_tool(&serde_json::json!({ "annotations": v }));
+        let ro = ann(serde_json::json!({ "readOnlyHint": true }));
+        assert_eq!(effect_from_annotations(&ro, false), ToolEffect::Modify);
+        assert_eq!(effect_from_annotations(&ro, true), ToolEffect::Read);
+        let del = ann(serde_json::json!({ "readOnlyHint": true, "destructiveHint": true }));
+        assert_eq!(effect_from_annotations(&del, true), ToolEffect::Delete);
+        // Non-boolean hints count as absent; absent never classifies as read.
+        let junk = ann(serde_json::json!({ "readOnlyHint": "true" }));
+        assert_eq!(junk.read_only, None);
+        assert_eq!(effect_from_annotations(&junk, true), ToolEffect::Modify);
+        assert_eq!(effect_from_annotations(&ToolAnnotations::default(), true), ToolEffect::Modify);
+    }
+
+    #[test]
+    fn third_party_policy_applies_rules_and_lane() {
+        let ro = ToolAnnotations { read_only: Some(true), ..Default::default() };
+        let none = ToolAnnotations::default();
+        let p = ThirdPartyPolicy {
+            rules: rules(serde_json::json!([
+                { "effect": "modify", "verdict": "ask" },
+                { "tool": "github.delete_repo", "verdict": "block" },
+                { "tool": "mcp__notion__*", "verdict": "allow" },
+            ])),
+            trusted_read_hint_servers: vec!["github".into()],
+        };
+        assert!(p.has_rules());
+        let n = ProcessLane::Normal;
+        assert_eq!(p.decide("github", "get_issue", &ro, &n), ThirdPartyDecision::Allow);
+        assert_eq!(p.decide("github", "create_issue", &none, &n), ThirdPartyDecision::Ask);
+        assert_eq!(p.decide("github", "delete_repo", &ro, &n), ThirdPartyDecision::Block(ThirdPartyBlock::Rule));
+        // Untrusted server: its read-only claim is a modify.
+        assert_eq!(p.decide("evil", "wipe", &ro, &n), ThirdPartyDecision::Ask);
+        assert_eq!(p.decide("notion", "write_page", &none, &n), ThirdPartyDecision::Allow);
+        let e = ProcessLane::Explore;
+        assert_eq!(p.decide("github", "get_issue", &ro, &e), ThirdPartyDecision::Allow);
+        assert_eq!(p.decide("evil", "wipe", &ro, &e), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));
+        assert_eq!(p.decide("notion", "write_page", &none, &e), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));
+        assert_eq!(p.decide("github", "get_issue", &ro, &ProcessLane::Invalid), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));
+        // No rules at all: nothing changes outside the lane.
+        let empty = ThirdPartyPolicy::default();
+        assert!(!empty.has_rules());
+        assert_eq!(empty.decide("x", "y", &none, &n), ThirdPartyDecision::Allow);
+        assert!(ThirdPartyPolicy { rules: ActionRules::unreadable(), ..Default::default() }.has_rules());
+    }
+
+    #[test]
+    fn dotted_tool_rules_name_third_party_tools_only() {
+        let r = rules(serde_json::json!([{ "tool": "crm.update", "verdict": "block" }]));
+        assert_eq!(r.resolve("mcp__crm__update", ToolEffect::Modify), Some(ActionVerdict::Block));
+        assert_eq!(r.resolve("update", ToolEffect::Modify), None);
+        // Serialization keeps what the operator wrote.
+        assert_eq!(serde_json::to_value(&r).unwrap()[0]["tool"], "crm.update");
     }
 
     #[test]

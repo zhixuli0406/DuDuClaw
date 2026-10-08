@@ -7433,5 +7433,13 @@
   "workflow.activation.suspendedLimit": "This version is paused: its runs kept hitting the run limits, or the limits were lowered below what it needs.",
   "workflow.activation.expiredBecause": "This version's approval ran out at {at} and its schedule is off.",
   "approval.activation.expiresAt": "If approved, it stays active until {at}; after that it stops and needs a new approval.",
-  "approval.activation.countLimitsOnly": "No unit prices are set, so cost limits do not apply; only the count limits (runs, steps, reads, changes) do."
+  "approval.activation.countLimitsOnly": "No unit prices are set, so cost limits do not apply; only the count limits (runs, steps, reads, changes) do.",
+  "mcp.toolEffects.title": "Third-party tools and what they do",
+  "mcp.toolEffects.desc": "Tools of this employee's other MCP servers, as last listed through DuDuClaw, with the kind of action DuDuClaw counts them as and what the employee's action rules decide.",
+  "mcp.toolEffects.empty": "Nothing recorded yet. A server appears after the employee's session lists its tools through DuDuClaw (remote servers always; servers on this machine when action rules, redaction or the read-only lane apply).",
+  "mcp.toolEffects.trusted": "Read-only labels trusted",
+  "mcp.toolEffects.untrusted": "Read-only labels not trusted",
+  "mcp.toolEffects.observed": "Listed {at}",
+  "mcp.toolEffects.exploreHidden": "Hidden in read-only runs",
+  "mcp.toolEffects.trustHelp": "A server labels its own tools, and nothing checks the label. A tool labelled read-only counts as \"Change records\" unless an administrator lists the server in the employee's trusted_read_hint_servers; a tool labelled destructive always counts as \"Delete\"."
 }

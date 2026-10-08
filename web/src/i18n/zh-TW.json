@@ -7433,5 +7433,13 @@
   "workflow.activation.suspendedLimit": "這個版本已暫停：執行一再碰到次數上限，或上限被調到比它需要的還低。",
   "workflow.activation.expiredBecause": "這個版本的核准在 {at} 到期，排程已關閉。",
   "approval.activation.expiresAt": "核准後有效到 {at}；到期會自動停止，要繼續得重新送審。",
-  "approval.activation.countLimitsOnly": "還沒設定單價，費用上限不會生效；目前生效的是次數上限（執行、步驟、讀取、改動）。"
+  "approval.activation.countLimitsOnly": "還沒設定單價，費用上限不會生效；目前生效的是次數上限（執行、步驟、讀取、改動）。",
+  "mcp.toolEffects.title": "第三方工具與其動作類型",
+  "mcp.toolEffects.desc": "此員工其他 MCP 伺服器的工具（最近一次經 DuDuClaw 列出），以及 DuDuClaw 將它們歸入的動作類型與員工動作規則的決定。",
+  "mcp.toolEffects.empty": "尚無紀錄。員工的工作階段經 DuDuClaw 列出某伺服器的工具後才會出現（遠端伺服器一律經過；本機伺服器在設有動作規則、去識別化或唯讀探索時經過）。",
+  "mcp.toolEffects.trusted": "採信唯讀標記",
+  "mcp.toolEffects.untrusted": "不採信唯讀標記",
+  "mcp.toolEffects.observed": "列出於 {at}",
+  "mcp.toolEffects.exploreHidden": "唯讀執行時隱藏",
+  "mcp.toolEffects.trustHelp": "工具的標記由伺服器自己填寫，沒有人查核。標為唯讀的工具會被當成「修改資料」，除非管理員把該伺服器加入員工的 trusted_read_hint_servers；標為破壞性的工具一律算「刪除」。"
 }

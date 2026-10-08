@@ -2437,6 +2437,24 @@ export interface McpRemoteServerStatus {
   updated_at: string;
 }
 
+/** One third-party MCP tool with the effect class DuDuClaw derives (2026-10-08). */
+export interface McpToolEffect {
+  name: string;
+  description: string;
+  annotations: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
+  effect: ToolEffect;
+  verdict: 'allow' | 'ask' | 'block';
+  explore_visible: boolean;
+}
+
+export interface McpServerToolEffects {
+  server: string;
+  seen_by: 'proxy' | 'bridge';
+  observed_at: string;
+  read_hint_trusted: boolean;
+  tools: McpToolEffect[];
+}
+
 export type McpRemoteConnectResult =
   | { status: 'connected'; agent_id: string; server: string }
   | {
@@ -6810,6 +6828,9 @@ export const api = {
       client.call('mcp.remote_status', agentId ? { agent_id: agentId } : {}) as Promise<{
         servers: McpRemoteServerStatus[];
       }>,
+    /** Admin: third-party tools last listed for an agent, with derived effect class. */
+    toolEffects: (agentId: string) =>
+      client.call('mcp.tool_effects', { agent_id: agentId }) as Promise<{ servers: McpServerToolEffects[] }>,
     /** Admin: delete stored credentials; `forget` also removes the entry. */
     remoteDisconnect: (agentId: string, name: string, forget = false) =>
       client.call('mcp.remote_disconnect', { agent_id: agentId, name, forget }) as Promise<{
