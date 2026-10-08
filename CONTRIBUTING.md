@@ -22,7 +22,7 @@ Thanks for wanting to extend DuDuClaw! This page is the map — where each kind 
 
 - **Setup**: `cargo build` (workspace), `cd web && npm install && npm run dev` for the dashboard. `cargo test -p <crate> --lib` for focused test runs.
 - **Style**: match the file you're in. The repo is not rustfmt-clean — format only the lines you touch, never whole files. No unanchored `contains` for security/routing decisions; no raw byte-index string slicing (see `CLAUDE.md` → Coding Conventions).
-- **Branches and PRs**: branch from `main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`) and open the PR against `main`. CI runs Rust on Ubuntu, macOS and Windows, the dashboard tests and the Python tests.
+- **Branches and PRs**: branch from `main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`) and open the PR against `main`. CI runs Rust on Ubuntu, macOS and Windows, the dashboard tests, the Python tests and a dependency audit (`cargo audit`). Merging needs Rust on Ubuntu and macOS, the dashboard, Python and the audit to pass.
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:` / `fix:` / `docs:` …).
 - **Definition of done**: builds + tests pass locally, behavior changes update the docs **in the same PR** (README/CHANGELOG/guides — stale docs are treated as bugs), and `CHANGELOG.md [Unreleased]` gets a human-readable entry.
 - **Security gates fail closed**: if your change adds a permission/authz/parsing decision point, the unknown case must DENY. PRs that loosen a gate need an explicit rationale in the description.
