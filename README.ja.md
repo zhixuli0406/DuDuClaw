@@ -23,8 +23,6 @@ npm install -g duduclaw
 duduclaw run                  # 起動後 http://localhost:18789 を開く
 ```
 
-https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
-
 ## 目次
 
 - [なぜ DuDuClaw なのか](#why)
