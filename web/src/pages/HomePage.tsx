@@ -30,6 +30,7 @@ import { UsageSummary } from '@/components/home/UsageSummary';
 import { CustomWidgetFrame } from '@/components/home/CustomWidgetFrame';
 import { HealthOverview } from '@/components/home/HealthOverview';
 import { SinceLastVisit } from '@/components/home/SinceLastVisit';
+import { EmployeeDigestCard } from '@/components/home/EmployeeDigestCard';
 import {
   LayoutGrid,
   ArrowUp,
@@ -443,6 +444,7 @@ export function HomePage() {
         <>
           <HealthOverview agents={agents} enabled={authed} />
           <SinceLastVisit enabled={authed} />
+          <EmployeeDigestCard enabled={authed} />
         </>
       )}
 

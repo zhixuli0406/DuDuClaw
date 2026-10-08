@@ -5245,6 +5245,133 @@ export interface TaskStopStatus {
   };
 }
 
+/** P9: one finished item in the employee digest. */
+export interface DigestItem {
+  kind: 'task' | 'goal' | string;
+  id: string;
+  title: string;
+  completed_at: string | null;
+}
+
+export interface DigestAgent {
+  agent_id: string;
+  finished: DigestItem[];
+  finished_total: number;
+  activity_count: number;
+  pending_approvals: number;
+  runs_done: number;
+  runs_not_done: number;
+  spend_usd: number | null;
+}
+
+export interface EmployeeDigest {
+  date: string;
+  since: string;
+  generated_at: string;
+  agents: DigestAgent[];
+}
+
+export type DeliverableVerdict = 'up' | 'down' | 'changes';
+
+/** P5: a standing responsibility as the server stores it. */
+export interface ResponsibilityRow {
+  responsibility_id: string;
+  owner_agent_id: string;
+  created_by: string;
+  objective: string;
+  acceptance_template: string;
+  /** JSON: `{event_names: string[], lane?: "explore"}` */
+  scope_json: string;
+  source_refs_json: string;
+  notification_policy_json: string;
+  schedule_json: string | null;
+  occurrence_hours: number;
+  occurrence_cost_cap_cents: number;
+  budget_period: 'day' | 'week' | 'month' | string;
+  budget_timezone: string;
+  period_cost_limit_cents: number;
+  period_occurrence_limit: number;
+  min_wake_interval_secs: number;
+  max_consecutive_failures: number;
+  stop_at: string;
+  /** `active` | `paused` | `budget_paused` | `failure_paused` | `disabled` | `expired` */
+  state: string;
+  state_reason: string | null;
+  state_changed_by: string | null;
+  state_changed_at: string | null;
+  contract_revision: number;
+  contract_hash: string;
+  control_epoch: number;
+  consecutive_failures: number;
+  last_occurrence_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ResponsibilityOccurrence {
+  responsibility_id: string;
+  occurrence_key: string;
+  task_id: string;
+  contract_revision: number;
+  control_epoch: number;
+  period_key: string;
+  reserved_cents: number;
+  charged_cents: number | null;
+  cost_basis: string | null;
+  /** `null` while the run is open. */
+  outcome: string | null;
+  predecessor_task_id: string | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
+export interface ResponsibilitySummary {
+  responsibility: ResponsibilityRow;
+  next_due_at: string | null;
+  pending_fires: number;
+  period_key: string | null;
+  period_occurrences: number;
+  /** `null` when cost telemetry could not be read. */
+  period_spent: number | null;
+  open_occurrence: ResponsibilityOccurrence | null;
+  subscriptions: unknown[];
+  cost_not_counted: string[];
+}
+
+export interface ResponsibilityStatus {
+  enabled: boolean;
+  dispatch_enabled: boolean;
+  max_stop_at_days: number;
+  lanes: string[];
+}
+
+/** Input of `responsibilities.create` (server validates every field). */
+export interface ResponsibilityInput {
+  owner_agent_id: string;
+  objective: string;
+  acceptance_template: string;
+  source_refs?: string[];
+  notification_policy?: { enabled: boolean; on: string[] } | null;
+  schedule?: { cron: string; timezone: string } | null;
+  event_subscriptions?: { event_name: string; filter?: unknown; timeout_at?: string | null }[];
+  occurrence_hours: number;
+  occurrence_cost_cap_cents: number;
+  budget_period: 'day' | 'week' | 'month';
+  budget_timezone: string;
+  period_cost_limit_cents: number;
+  period_occurrence_limit: number;
+  min_wake_interval_secs: number;
+  max_consecutive_failures?: number;
+  stop_at: string;
+  /** `"explore"` = every run is read-only (P5). */
+  lane?: 'explore';
+}
+
+/** P5: answer of a responsibility control (`conflict` when it changed). */
+export type ResponsibilityCas =
+  | { responsibility: ResponsibilityRow; conflict?: undefined }
+  | { conflict: true; current: ResponsibilityRow };
+
 export const api = {
   /** WebChat past-conversation browsing + resume (WP3). Goes through the
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
@@ -5562,6 +5689,59 @@ export const api = {
    *  Manager-gated, same tier as the approval centre. `decide` does not send:
    *  it records the human decision, and the gateway's mail worker performs
    *  (or refuses) the transmission on its next pass. */
+  /** P9 — the per-employee "while you were away" digest and feedback on
+   *  finished work (Operator + task audience, checked server-side). */
+  digest: {
+    latest: () =>
+      client.call('digest.latest') as Promise<{
+        enabled: boolean;
+        digest: EmployeeDigest | null;
+        feedback: Record<string, DeliverableVerdict>;
+      }>,
+    feedback: (taskId: string, verdict: DeliverableVerdict, note?: string) =>
+      client.call('digest.feedback', { task_id: taskId, verdict, ...(note ? { note } : {}) }) as Promise<{
+        task_id: string;
+        verdict: DeliverableVerdict;
+      }>,
+  },
+  /** P5 — standing responsibilities (P2-A backend). Every call is checked
+   *  server-side against the caller's binding to the owner employee. */
+  responsibilities: {
+    status: () => client.call('responsibilities.status') as Promise<ResponsibilityStatus>,
+    /** Non-admins fan out over their bound employees (the server requires
+     *  `agent_id` from them). */
+    list: (agentId?: string) =>
+      fanOutByAgent<{ agent_id?: string }, { responsibilities: ResponsibilityRow[] }>(
+        agentId ? { agent_id: agentId } : undefined,
+        (p) =>
+          client.call('responsibilities.list', p) as Promise<{ responsibilities: ResponsibilityRow[] }>,
+        (rs) => ({ responsibilities: rs.flatMap((r) => r.responsibilities ?? []) }),
+      ),
+    get: (id: string) =>
+      client.call('responsibilities.get', { responsibility_id: id }) as Promise<{
+        summary: ResponsibilitySummary | null;
+      }>,
+    occurrences: (id: string) =>
+      client.call('responsibilities.occurrences', { responsibility_id: id }) as Promise<{
+        occurrences: ResponsibilityOccurrence[];
+      }>,
+    create: (input: ResponsibilityInput) =>
+      client.call('responsibilities.create', input as unknown as Record<string, unknown>) as Promise<{
+        responsibility: ResponsibilityRow;
+        usage_warnings?: unknown[];
+      }>,
+    control: (
+      action: 'pause' | 'resume' | 'disable' | 'enable' | 'clear_failures',
+      id: string,
+      expectedControlEpoch: number,
+      reason?: string,
+    ) =>
+      client.call(`responsibilities.${action}`, {
+        responsibility_id: id,
+        expected_control_epoch: expectedControlEpoch,
+        ...(reason ? { reason } : {}),
+      }) as Promise<ResponsibilityCas>,
+  },
   mail: {
     status: () => client.call('mail.status') as Promise<MailStatus>,
     list: (params: { agent_id?: string; include_archived?: boolean; limit?: number } = {}) =>

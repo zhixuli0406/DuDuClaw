@@ -1634,6 +1634,9 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     envs.extend(duduclaw_core::mcp_forward_env_vars());
     // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
     envs.extend(crate::runtime::round_task_env());
+    // P5: an explore-lane responsibility round (openai-compat runtime and
+    // the local tool loop have no built-ins; the MCP server is the gate).
+    envs.extend(crate::runtime::round_lane_env());
     // P2-B N4: the turn/run source identity, so the openai-compat tool loop's
     // memory writes are tied to their conversation like the CLI paths.
     envs.extend(crate::memory_provenance::turn_source_env_pairs());
@@ -3928,8 +3931,14 @@ fn prepare_claude_cmd(
     // the curated default that restores WebSearch/WebFetch research capability.
     const DEFAULT_ALLOWED_TOOLS: &str =
         "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite";
+    // P5: an explore-lane responsibility round only auto-approves DuDuClaw
+    // MCP tools and the read-only built-ins (never wider than the employee's
+    // own allowlist).
+    let explore_lane = crate::runtime::explore_lane_claude_tools(&caps);
     let allowed = caps.allowed_tools();
-    let allowed_csv = if allowed.is_empty() {
+    let allowed_csv = if let Some((_, lane_allowed)) = &explore_lane {
+        lane_allowed.join(",")
+    } else if allowed.is_empty() {
         DEFAULT_ALLOWED_TOOLS.to_string()
     } else {
         allowed.join(",")
@@ -3965,8 +3974,8 @@ fn prepare_claude_cmd(
     // schema the allowlist would not auto-approve is pure token waste here.
     // `project,local` keeps the agent's own `.claude/settings.json`. Default ON;
     // env kill-switch / per-agent [runtime] minimal_context = false opts out.
-    let explore_lane = crate::explore_lane::in_explore();
-    if explore_lane {
+    let event_lane = crate::explore_lane::in_explore();
+    if event_lane {
         // Read-only explore lane (2026-10-08): only the read built-ins exist,
         // whatever minimal_context says; the MCP children inherit the lane.
         cmd.args(["--setting-sources", "project,local"]);
@@ -3979,9 +3988,18 @@ fn prepare_claude_cmd(
         cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
     } else if duduclaw_core::agent_toml::resolve_minimal_context(config_dir) {
         cmd.args(["--setting-sources", "project,local"]);
-        let tools =
-            caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
-        cmd.args(["--tools", &tools.join(",")]);
+        if explore_lane.is_none() {
+            let tools =
+                caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
+            cmd.args(["--tools", &tools.join(",")]);
+        }
+    }
+    // P5: the explore lane narrows the built-ins whatever `minimal_context`
+    // says, and tells the DuDuClaw MCP server (inherited env) to list and
+    // allow only read / draft tools.
+    if let Some((lane_tools, _)) = &explore_lane {
+        cmd.args(["--tools", &lane_tools.join(",")]);
+        cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
     }
 
     // NOTE: `caps.browser_via_bash` deliberately injects no env flag. The

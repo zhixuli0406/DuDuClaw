@@ -13,7 +13,7 @@
 | 実行中の goal タスクに指示を渡す | ダッシュボードのタスク詳細ページ |
 | タスクとサブタスクを止める | タスク詳細ページ（即時に有効）、またはコマンドライン（承認が必要） |
 
-ダッシュボードにはまだ `/responsibilities` ページがありません。
+ダッシュボードの `/responsibilities` ページは下の「継続タスクページ」を参照してください。
 
 ## スイッチと設定
 
@@ -202,6 +202,29 @@ v1.70.0 の次のリリースから、すでに変わった状態に対して出
 
 すべて止めたいときは、先に `disable`、次に実行中の 1 回を停止します。
 
+## 継続タスクページ
+
+`/responsibilities`（ナビゲーション：仕事 → 継続タスク）は、あなたが紐づいている AI従業員の継続タスクを従業員ごとに一覧表示します。各行には状態、読み取り専用で実行するか、次回起動、今の予算期間の費用と上限、今期の回数と上限、連続失敗と上限、終了日が表示されます。データはすべて既存の RPC（`responsibilities.list`／`.get`／`.occurrences`）から取得し、サンプルデータは表示しません。
+
+- **機能がオフのとき**：`responsibilities.status` が 2 つのスイッチを返します。`[responsibilities] enabled` または `[dispatch] enabled` がオフなら、ページはそう明示して 2 つの設定キーを示します。既存の項目は一時停止と無効化だけできます（機能オフ中にサーバーが受け付けるのはこの 2 つの狭める操作だけです）。
+- **操作**：一時停止・再開・無効化・有効化には従業員に対する Operator が必要で、連続失敗のリセットには Manager 以上も必要です。呼び出しは画面に表示した `control_epoch` を送り、「その間に変更された」という応答なら再送せず一覧を更新します。詳細ダイアログには受け入れ基準、実行中の回（既存の停止ボタン付き）、直近 20 回の結果と費用が表示されます。
+- **作成**：テンプレートは **毎日のブリーフィング（読み取り専用）**、**毎週の振り返り（読み取り専用）**、**カスタム** の 3 つ。読み取り専用テンプレートは常に `lane = "explore"` を付け、予算期間ごとに最大 1 回、1 回 1 時間、小さな上限（変更可）で動きます。カスタムは既定で読み取り専用で、チェックを外せます。値はすべてコマンドラインと同じ規則でサーバーが検証します。
+
+### 読み取り専用の実行（`lane = "explore"`）
+
+継続タスクの契約には `"lane": "explore"` を付けられます（RPC `responsibilities.create`／`update_contract`、コマンドラインの契約ファイル）。この値は契約の scope に保存されるので契約ハッシュに含まれます。付けていない継続タスクは以前とバイト単位で同じです。それ以外の値は拒否されます（`invalid_lane`）。
+
+このような継続タスクの各実行の各ラウンドは、heartbeat の能動チェック用に作られた読み取り専用の explore lane で動きます：
+
+| ランタイム | 動作 |
+|---|---|
+| Claude CLI | 起動時に `DUDUCLAW_LANE=explore`（継承した DuDuClaw MCP サーバーは `read`／`draft` ツールだけを一覧・実行）、`--tools` は `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（`denied_tools` を除く）だけ、`--allowedTools` は DuDuClaw MCP ツールとそれらの組み込みツールだけ（従業員自身の許可リストより広くならず、`.mcp.json` の他のサーバーのツールは自動承認されません） |
+| OpenAI 互換ランタイム、ローカル推論のツールループ | 組み込みツールなし。MCP 子プロセスに `DUDUCLAW_LANE=explore` が渡ります |
+| Codex、Gemini CLI、Antigravity、Grok、汎用 CLI | 拒否：そのラウンドはディスパッチ前に失敗し（`explore_lane_unsupported`）、フェイルオーバーで到達した場合に備えて各ランタイムの `execute` にも同じ拒否があります |
+| タスクサンドボックス（`[container] sandbox_enabled`） | 拒否（サンドボックスでは従業員がシェルを使えるため） |
+
+拒否されたラウンドは不成功の実行として数えられ、連続失敗でいずれ継続タスクは一時停止します。lane を読み取れない場合もそのラウンドは失敗します（`explore_lane_unreadable`）。対象外：後で heartbeat が起こすサブタスクは lane の外で動きます（lane 内では `tasks_create` は `modify` なので拒否され、読み取り専用の実行は自らサブタスクを作れません）。実際のゲートウェイではまだ動かしていません。
+
 ## タスク詳細ページ
 
 ### 指示（ステアリング）
@@ -277,12 +300,12 @@ AI従業員は継続タスクを作成、変更、再開、再有効化できず
 - 使用量を報告しないおそれのあるランタイムについての費用の警告は、コマンドラインと `duduclaw doctor` にだけ表示されます。ダッシュボードは `responsibilities.create` が返す `usage_warnings` を表示せず、外部判定（`[dispatch] judge = "external"`）も検査の対象外です。
 - 同じデータディレクトリで複数のゲートウェイを起動した場合、`<home>/locks/gateway.lock` を保持している 1 つだけが、継続タスクの起床、停止の突き合わせ、指示のスイープ、途中まで進んだ永続ラウンドの修復を実行します。ほかのゲートウェイも goal ラウンドはこれまでどおりディスパッチします（永続ラウンドの固定メッセージ ID により二重送信されません）。
 - ある従業員のタスクボードを 3 回続けて読めなかった場合、その従業員のタスクボード起床が止まったことをアクティビティフィードに 1 件表示します（ゲートウェイのプロセスごとに 1 回）。失敗は毎回、警告としてもログに記録されます。
-- `/responsibilities` ページはまだありません。このリリースにあるのは、コマンドラインと受信箱での承認、タスク詳細ページでの指示と停止です。
+- `/responsibilities` ページでは一覧、作成、一時停止／再開／無効化／有効化／連続失敗のリセットができます。契約の変更は引き続きコマンドラインです。
 
 ## 開発者向け
 
 - コード：`crates/duduclaw-gateway/src/responsibility/`（`wake.rs`、`events.rs`、`cost.rs`、`stop.rs`、`steering.rs`、`operator_gate.rs`、`notify.rs`）。テーブルは `tasks.db` にあります。
-- ダッシュボード RPC（`handlers/responsibilities_rpc.rs`）：`responsibilities.create`／`list`／`get`／`occurrences`／`fires`／`update_contract`／`pause`／`resume`／`disable`／`enable`／`clear_failures`、および `tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status`。読み取りには Viewer、変更には担当 AI従業員に対する Operator が必要です。ただし `clear_failures` は Manager が必要で、書き込みのたびに監査記録が 1 件追加されます。`responsibilities.create` は `usage_warnings`（使用量を報告しないおそれのあるランタイム）も返します。`system.update_config` は `responsibilities.enabled` と `goal_loop.steering_enabled` を受け付けます。
+- ダッシュボード RPC（`handlers/responsibilities_rpc.rs`）：`responsibilities.status`／`create`／`list`／`get`／`occurrences`／`fires`／`update_contract`／`pause`／`resume`／`disable`／`enable`／`clear_failures`、および `tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status`。読み取りには Viewer、変更には担当 AI従業員に対する Operator が必要です。ただし `clear_failures` は Manager が必要で、書き込みのたびに監査記録が 1 件追加されます。`responsibilities.create` は `usage_warnings`（使用量を報告しないおそれのあるランタイム）も返します。`system.update_config` は `responsibilities.enabled` と `goal_loop.steering_enabled` を受け付けます。
 - コマンドライン：`crates/duduclaw-cli/src/responsibility_cmd.rs`。承認の種類は `responsibility_operator_change` で、ダッシュボード上の Admin だけが判断できます（`decided_by` が `dashboard:` で始まる）。
 - Bash レーンでの遮断：共通の担当者コマンド照合（`duduclaw_core::bash_operator_command_decision`、`GuardDecision::BlockedOperatorCommand`）で、一覧は `responsibility_cmd::OPERATOR_COMMANDS` にあり、agent-file-guard フックで LINE 受信箱コマンドの後に連結されます。
 - 継続タスク、指示、停止の各 RPC は、呼び出し元をアカウントストアから毎回読み直します（`handlers/task_privacy.rs::live_reader_context`）。`tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status` はさらにタスク内容ゲート（`authorize_private_task_read`：従業員へのアクセス権とタスクの対象者）を通ります。

@@ -57,6 +57,7 @@ async fn responsibility_of(home: &std::path::Path, owner: &str) -> String {
         min_wake_interval_secs: 300,
         max_consecutive_failures: 3,
         stop_at: now + chrono::Duration::days(5),
+        lane: None,
     };
     duduclaw_gateway::responsibility::service::create(&store, home, &input, "op", now)
         .await

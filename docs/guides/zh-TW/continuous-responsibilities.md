@@ -13,7 +13,7 @@
 | 送指示給進行中的 goal 任務 | 儀表板任務詳情頁 |
 | 停止任務與子任務 | 儀表板任務詳情頁（立即生效），或指令列（要核准） |
 
-儀表板還沒有 `/responsibilities` 頁面。
+儀表板的 `/responsibilities` 頁面見下方「持續任務頁面」。
 
 ## 開關與設定
 
@@ -202,6 +202,29 @@ v1.70.0 之後的版本起，等待中的請求如果是在已經改變的狀態
 
 全部停下來的做法：先 `disable`，再停止正在跑的那一次。
 
+## 持續任務頁面
+
+`/responsibilities`（導覽：工作 → 持續任務）依員工分組，列出你有綁定的員工的所有持續任務。每一列顯示狀態、是否唯讀執行、下次叫醒時間、本預算期花費與上限、本期次數與上限、連續失敗與上限、到期日。資料全部來自既有 RPC（`responsibilities.list`／`.get`／`.occurrences`），頁面不畫任何示範資料。
+
+- **功能關閉時**：`responsibilities.status` 回報兩個開關。`[responsibilities] enabled` 或 `[dispatch] enabled` 任一關閉時，頁面明說並列出兩個設定鍵。既有項目仍可暫停或停用（功能關閉時伺服器只接受這兩個收窄的動作）。
+- **動作**：暫停、恢復、停用、啟用需要對該員工的 Operator；清除連續失敗另需 Manager 以上。每次呼叫都送出畫面上的 `control_epoch`，伺服器回「期間被改過」時頁面重新整理而不自動重送。詳細視窗顯示驗收標準、目前這一輪（附既有的停止按鈕）與最近 20 輪的結果與花費。
+- **新增**：三個範本：**每日簡報（唯讀）**、**每週回顧（唯讀）**、**自訂**。唯讀範本一律帶 `lane = "explore"`、每個預算期最多跑一次、每輪 1 小時、上限很小（可調整）；自訂範本預設唯讀，可取消勾選。所有數值由伺服器照指令列同樣的規則檢查。
+
+### 唯讀執行（`lane = "explore"`）
+
+持續任務的合約可以帶 `"lane": "explore"`（RPC `responsibilities.create`／`update_contract`，以及指令列的合約檔）。這個欄位存在合約的 scope 裡，因此算進合約雜湊；沒有這個欄位的持續任務與以前逐位相同。其他值一律拒絕（`invalid_lane`）。
+
+這種持續任務每一次執行的每一輪，都在原本為 heartbeat 主動檢查做的唯讀 explore lane 裡跑：
+
+| 執行環境 | 行為 |
+|---|---|
+| Claude CLI | 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw MCP 伺服器繼承後只列出、只執行 `read`／`draft` 工具）；`--tools` 只剩 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（扣掉 `denied_tools`）；`--allowedTools` 只剩 DuDuClaw MCP 工具與這些內建工具（不會比員工自己的允許清單寬；`.mcp.json` 其他伺服器的工具不自動核准） |
+| OpenAI 相容執行環境、本地推論工具迴圈 | 沒有內建工具；MCP 子程序拿到 `DUDUCLAW_LANE=explore` |
+| Codex、Gemini CLI、Antigravity、Grok、通用 CLI | 拒絕：這一輪在派工前失敗（`explore_lane_unsupported`），而且這些執行環境的 `execute` 裡也有同樣的拒絕，以防備援切換到它們 |
+| 任務沙箱（`[container] sandbox_enabled`） | 拒絕（沙箱給員工一個 shell） |
+
+被拒絕的一輪算一次不成功的執行，所以連續失敗最後會讓持續任務暫停。lane 讀不出來也會讓這一輪失敗（`explore_lane_unreadable`）。未涵蓋：之後由 heartbeat 叫醒的子任務不在 lane 內（在 lane 內 `tasks_create` 屬於 `modify`，會被拒絕，所以唯讀執行本身建不了子任務）；尚未在真實 gateway 上跑過。
+
 ## 儀表板任務詳情頁
 
 ### 送指示
@@ -277,12 +300,12 @@ AI 員工不能建立、修改、恢復、重新啟用持續任務，也不能�
 - 可能不回報用量的執行環境所觸發的花費警告，只出現在指令列與 `duduclaw doctor`；儀表板不顯示 `responsibilities.create` 回傳的 `usage_warnings`，外部裁決（`[dispatch] judge = "external"`）也不在檢查範圍內。
 - 同一個資料目錄上啟動多個閘道時，只有持有 `<home>/locks/gateway.lock` 的那一個會執行持續任務的喚醒、停止對帳、指示掃描，以及修復做到一半的持久輪；其他閘道仍照常派送 goal 輪（持久輪固定的訊息 ID 讓它不會被送出兩次）。
 - 如果某位員工的任務看板連續三次讀取失敗，動態紀錄會出現一則訊息，說明該員工的任務看板喚醒已經停止（每個閘道行程一次）；每一次失敗也都會以警告寫進日誌。
-- 儀表板還沒有 `/responsibilities` 頁面。這一版只有指令列加收件匣核准，以及任務詳情頁的送指示與停止。
+- `/responsibilities` 頁面可以列出、新增，以及暫停／恢復／停用／啟用／清除連續失敗；修改合約仍走指令列。
 
 ## 給開發者
 
 - 程式：`crates/duduclaw-gateway/src/responsibility/`（喚醒 `wake.rs`、事件 `events.rs`、花費 `cost.rs`、停止 `stop.rs`、送指示 `steering.rs`、核准閘 `operator_gate.rs`、通知 `notify.rs`），資料表在 `tasks.db`。
-- 儀表板 RPC（`handlers/responsibilities_rpc.rs`）：`responsibilities.create`／`list`／`get`／`occurrences`／`fires`／`update_contract`／`pause`／`resume`／`disable`／`enable`／`clear_failures`，以及 `tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status`。讀取要 Viewer、變更要 Operator（對擁有者員工），但 `clear_failures` 要 Manager，每次寫入記一筆稽核。`responsibilities.create` 也會回傳 `usage_warnings`（可能不回報用量的執行環境）。`system.update_config` 接受 `responsibilities.enabled` 與 `goal_loop.steering_enabled`。
+- 儀表板 RPC（`handlers/responsibilities_rpc.rs`）：`responsibilities.status`／`create`／`list`／`get`／`occurrences`／`fires`／`update_contract`／`pause`／`resume`／`disable`／`enable`／`clear_failures`，以及 `tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status`。讀取要 Viewer、變更要 Operator（對擁有者員工），但 `clear_failures` 要 Manager，每次寫入記一筆稽核。`responsibilities.create` 也會回傳 `usage_warnings`（可能不回報用量的執行環境）。`system.update_config` 接受 `responsibilities.enabled` 與 `goal_loop.steering_enabled`。
 - 指令列：`crates/duduclaw-cli/src/responsibility_cmd.rs`；核准種類 `responsibility_operator_change`，只能在儀表板由 Admin 決定（`decided_by` 以 `dashboard:` 開頭）。
 - Bash 通道阻擋：共用的操作者指令比對器（`duduclaw_core::bash_operator_command_decision`，`GuardDecision::BlockedOperatorCommand`），清單在 `responsibility_cmd::OPERATOR_COMMANDS`，在 agent-file-guard hook 中串接於 LINE 收件匣指令之後。
 - 每個持續任務、指示與停止 RPC 都會從帳號資料庫重新讀取呼叫者（`handlers/task_privacy.rs::live_reader_context`）；`tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status` 另外還要通過任務內容閘（`authorize_private_task_read`：員工存取權加上任務的受眾）。
