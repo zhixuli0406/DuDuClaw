@@ -1176,7 +1176,7 @@ async fn execute_proactive_check(
             let mut _gated_mcp: Option<tempfile::TempPath> = None;
             if mcp_json.exists() {
                 let mut target = mcp_json.to_string_lossy().to_string();
-                match explore_lane_mcp_config(&mcp_json) {
+                match explore_lane_mcp_config(home_dir, agent_id, &mcp_json) {
                     Ok(Some(tmp)) => {
                         target = tmp.to_string_lossy().to_string();
                         _gated_mcp = Some(tmp);
@@ -2051,17 +2051,39 @@ mod stop_tree_tests {
 /// The explore-lane `--mcp-config` for a proactive check: third-party stdio
 /// servers wrapped in `duduclaw mcp-proxy` (tool gate only). `Ok(None)` ⇒
 /// nothing to wrap, use the file as is.
-fn explore_lane_mcp_config(mcp_json: &std::path::Path) -> Result<Option<tempfile::TempPath>, String> {
-    use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_proxy_with};
+fn explore_lane_mcp_config(
+    home_dir: &std::path::Path,
+    agent_id: &str,
+    mcp_json: &std::path::Path,
+) -> Result<Option<tempfile::TempPath>, String> {
+    use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_gate};
     let raw = std::fs::read_to_string(mcp_json).map_err(|e| format!("cannot read .mcp.json: {e}"))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("malformed .mcp.json: {e}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate the duduclaw binary: {e}"))?;
-    let rewritten = rewrite_mcp_config_for_proxy_with(
+    let rewrite = rewrite_mcp_config_for_gate(
         &parsed,
         &exe,
         ProxyPurpose { redaction: false, tool_gate: true },
     );
+    // Direct `url` / `type` entries cannot be gated; they were removed.
+    for server in &rewrite.dropped_remote {
+        duduclaw_security::audit::append_audit_event(
+            home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "third_party_remote_entry_dropped",
+                agent_id,
+                duduclaw_security::audit::Severity::Warning,
+                serde_json::json!({
+                    "server": server,
+                    "explore_lane": true,
+                    "path": "heartbeat_proactive",
+                    "fix": "connect it with mcp.remote_connect so it runs through the bridge",
+                }),
+            ),
+        );
+    }
+    let rewritten = rewrite.config;
     if rewritten == parsed {
         return Ok(None);
     }

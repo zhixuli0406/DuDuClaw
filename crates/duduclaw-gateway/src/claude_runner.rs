@@ -3673,25 +3673,34 @@ tokio::task_local! {
 /// auto-discovery unchanged). `--strict-mcp-config` is only ever added
 /// together with the rewritten file — it is what stops the CLI from ALSO
 /// merging the ambient/global config once we start naming one explicitly.
+///
+/// `Err` ⇒ the third-party tool gate is needed and its config could not be
+/// produced; the spawn must be refused (2026-10-08 close-out).
 pub(crate) fn mcp_proxy_cli_args(
     home_dir: &Path,
     work_dir: Option<&Path>,
-) -> Option<(Vec<String>, tempfile::TempPath)> {
-    let mcp_json = work_dir?.join(".mcp.json");
+) -> Result<Option<(Vec<String>, tempfile::TempPath)>, String> {
+    let Some(work_dir) = work_dir else {
+        return Ok(None);
+    };
+    let mcp_json = work_dir.join(".mcp.json");
     if !mcp_json.exists() {
-        return None;
+        return Ok(None);
     }
-    let proxied = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
+    let Some(proxied) = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
         home_dir,
         &mcp_json,
         crate::explore_lane::in_explore(),
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     let args = vec![
         "--mcp-config".to_string(),
         proxied.to_string_lossy().to_string(),
         "--strict-mcp-config".to_string(),
     ];
-    Some((args, proxied))
+    Ok(Some((args, proxied)))
 }
 
 /// The `--mcp-config` flags for this spawn, with an optional **explicit**
@@ -3724,9 +3733,9 @@ fn mcp_config_cli_args(
     home_dir: &Path,
     work_dir: Option<&Path>,
     explicit: Option<&Path>,
-) -> Option<(Vec<String>, Option<tempfile::TempPath>)> {
+) -> Result<Option<(Vec<String>, Option<tempfile::TempPath>)>, String> {
     let Some(path) = explicit else {
-        return mcp_proxy_cli_args(home_dir, work_dir).map(|(args, guard)| (args, Some(guard)));
+        return Ok(mcp_proxy_cli_args(home_dir, work_dir)?.map(|(args, guard)| (args, Some(guard))));
     };
     if !path.exists() {
         warn!(
@@ -3734,34 +3743,34 @@ fn mcp_config_cli_args(
             "explicit --mcp-config file is missing — naming it anyway so the CLI refuses \
              instead of reading the working directory's .mcp.json"
         );
-        return Some((
+        return Ok(Some((
             vec![
                 "--mcp-config".to_string(),
                 path.to_string_lossy().to_string(),
                 "--strict-mcp-config".to_string(),
             ],
             None,
-        ));
+        )));
     }
     let (target, guard) = match crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
         home_dir,
         path,
         crate::explore_lane::in_explore(),
-    ) {
+    )? {
         Some(proxied) => {
             let rendered = proxied.to_string_lossy().to_string();
             (rendered, Some(proxied))
         }
         None => (path.to_string_lossy().to_string(), None),
     };
-    Some((
+    Ok(Some((
         vec![
             "--mcp-config".to_string(),
             target,
             "--strict-mcp-config".to_string(),
         ],
         guard,
-    ))
+    )))
 }
 
 /// Guards whose lifetime must cover the spawned child: the temp files the
@@ -3800,7 +3809,7 @@ fn prepare_claude_cmd(
     // and an explicit `--mcp-config` source. Both `None` (every pre-existing
     // caller) ⇒ the cwd answers both questions, exactly as before.
     identity: SpawnIdentity<'_>,
-) -> (tokio::process::Command, ClaudeCmdGuards) {
+) -> Result<(tokio::process::Command, ClaudeCmdGuards), String> {
     let mut cmd = duduclaw_core::platform::async_command_for(claude_path);
 
     // WP-8B (credentials doctrine P3, 2026-08): the child used to inherit the
@@ -3870,7 +3879,7 @@ fn prepare_claude_cmd(
     // RFC-23 §13.6: override that auto-discovery with a proxied copy when
     // redaction is active (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
     // all, auto-discovery unchanged.
-    let mcp_proxy_guard = match mcp_config_cli_args(home_dir, work_dir, identity.mcp_config) {
+    let mcp_proxy_guard = match mcp_config_cli_args(home_dir, work_dir, identity.mcp_config)? {
         Some((args, guard)) => {
             cmd.args(&args);
             guard
@@ -4103,14 +4112,14 @@ fn prepare_claude_cmd(
         .and_then(|n| n.to_str())
         .and_then(crate::computer_use_sessions::turns::register_current_turn);
 
-    (
+    Ok((
         cmd,
         ClaudeCmdGuards {
             prompt: prompt_guard,
             mcp_proxy: mcp_proxy_guard,
             turn,
         },
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -4150,6 +4159,7 @@ mod role_cache_ttl_tests {
                     mcp_config: None,
                 },
             )
+            .unwrap()
             .0
         };
         let role = build(Some(&role_dir));
@@ -4192,7 +4202,7 @@ async fn call_claude_with_env(
         &duduclaw_core::platform::duduclaw_home(),
         effort,
         identity,
-    );
+    )?;
 
     for (key, value) in env_vars {
         if value.is_empty() {
@@ -5097,7 +5107,7 @@ mod redaction_proxy_cli_args_tests {
         // dropped for every dispatch turn.
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
     }
 
     /// 2026-10-08: the explore lane and `action_rules` route third-party
@@ -5106,9 +5116,9 @@ mod redaction_proxy_cli_args_tests {
     fn explore_lane_and_action_rules_route_through_the_proxy() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
         let (args, _guard) = crate::explore_lane::EXPLORE
-            .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)))
+            .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap())
             .expect("explore lane proxies third-party servers");
         let body = std::fs::read_to_string(&args[1]).unwrap();
         assert!(body.contains("mcp-proxy"), "{body}");
@@ -5117,7 +5127,56 @@ mod redaction_proxy_cli_args_tests {
             "[capabilities]\naction_rules = [{ effect = \"modify\", verdict = \"ask\" }]\n",
         )
         .unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_some());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_some());
+    }
+
+    /// 2026-10-08 close-out: when the gate is needed and the gated copy
+    /// cannot be produced, the spawn is refused instead of falling back to
+    /// the ungated file; redaction alone keeps the old fallback.
+    #[test]
+    fn an_unproducible_gated_config_refuses_the_spawn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agents").join("agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"), "{ not json").unwrap();
+        // Nothing needs gating ⇒ untouched.
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        // Redaction only ⇒ old fallback.
+        enable_redaction(tmp.path());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        // Explore lane ⇒ refused with the spawn-gate marker and audited.
+        let err = crate::explore_lane::EXPLORE
+            .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)))
+            .expect_err("explore lane must fail closed");
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err), "{err}");
+        // action_rules ⇒ refused too.
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\naction_rules = [{ effect = \"send\", verdict = \"ask\" }]\n",
+        )
+        .unwrap();
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_err());
+        let audit = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("third_party_gate_config_unavailable"), "{audit}");
+    }
+
+    /// Direct `url` entries are dropped from a gated spawn and audited.
+    #[test]
+    fn a_gated_spawn_drops_direct_remote_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        cfg["mcpServers"]["direct"] = json!({ "type": "http", "url": "https://mcp.example.com/mcp" });
+        std::fs::write(dir.join(".mcp.json"), cfg.to_string()).unwrap();
+        let (args, _g) = crate::explore_lane::EXPLORE
+            .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)))
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
+        assert!(body["mcpServers"].get("direct").is_none());
+        let audit = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("third_party_remote_entry_dropped") && audit.contains("direct"), "{audit}");
     }
 
     #[test]
@@ -5127,7 +5186,7 @@ mod redaction_proxy_cli_args_tests {
         enable_redaction(tmp.path());
 
         let (args, guard) =
-            mcp_proxy_cli_args(tmp.path(), Some(&dir)).expect("an external stdio server to proxy");
+            mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().expect("an external stdio server to proxy");
         assert_eq!(args[0], "--mcp-config");
         assert_eq!(args[1], guard.to_string_lossy());
         assert_eq!(args[2], "--strict-mcp-config");
@@ -5164,11 +5223,11 @@ mod redaction_proxy_cli_args_tests {
     fn no_work_dir_or_no_mcp_json_is_a_no_op() {
         let tmp = tempfile::TempDir::new().unwrap();
         enable_redaction(tmp.path());
-        assert!(mcp_proxy_cli_args(tmp.path(), None).is_none());
+        assert!(mcp_proxy_cli_args(tmp.path(), None).unwrap().is_none());
 
         let bare = tmp.path().join("agents").join("no-config");
         std::fs::create_dir_all(&bare).unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&bare)).is_none());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&bare)).unwrap().is_none());
     }
 
     #[test]
@@ -5185,7 +5244,7 @@ mod redaction_proxy_cli_args_tests {
                 .to_string(),
         )
         .unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
     }
 
     #[test]
@@ -5194,7 +5253,7 @@ mod redaction_proxy_cli_args_tests {
         let dir = agent_dir_with_mcp_json(tmp.path());
         enable_redaction(tmp.path());
 
-        let (_args, guard) = mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap();
+        let (_args, guard) = mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().unwrap();
         let path = guard.to_path_buf();
         assert!(path.exists());
         drop(guard);
@@ -5236,7 +5295,7 @@ mod redaction_proxy_cli_args_tests {
         .unwrap();
 
         let (args, guard) =
-            mcp_config_cli_args(tmp.path(), Some(&employee), Some(&member_mcp)).unwrap();
+            mcp_config_cli_args(tmp.path(), Some(&employee), Some(&member_mcp)).unwrap().unwrap();
         assert_eq!(args[0], "--mcp-config");
         assert_eq!(args[1], member_mcp.to_string_lossy());
         assert_eq!(args[2], "--strict-mcp-config");
@@ -5258,7 +5317,7 @@ mod redaction_proxy_cli_args_tests {
         )
         .unwrap();
         // Redaction inactive ⇒ no flags at all, auto-discovery untouched.
-        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), None).is_none());
+        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), None).unwrap().is_none());
     }
 
     #[test]
@@ -5271,7 +5330,7 @@ mod redaction_proxy_cli_args_tests {
         // N10: the missing file is still named with --strict-mcp-config, so
         // the CLI cannot discover the employee's <cwd>/.mcp.json instead.
         let (args, guard) =
-            mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).expect("flags");
+            mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).unwrap().expect("flags");
         assert_eq!(
             args,
             vec![
