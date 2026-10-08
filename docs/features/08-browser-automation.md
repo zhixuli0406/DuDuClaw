@@ -77,7 +77,7 @@ Session rules:
 
 - **One session per employee.** A second `computer_session_start` while one is live is refused and names the live session. Only that employee can see or drive it.
 - **Five sessions at once across the gateway.**
-- **Limits.** A session ends after `max_session_minutes` (default 10), after 2 minutes without any operation (time spent waiting for an approval does not count as idle), or on `computer_session_stop`. Each click, type, key, scroll and navigate counts against `max_actions` (default 50); screenshots do not. After the budget is spent the session can still take screenshots and stop.
+- **Limits.** A session ends after `max_session_minutes` (default 10), after 2 minutes without any operation (time spent waiting for an approval, an open dashboard viewer or a human takeover do not count as idle; with `keep_alive_minutes` the container is paused instead, see [Keep-alive, live view and takeover](#keep-alive-live-view-and-takeover)), or on `computer_session_stop`. Each click, type, key, scroll and navigate counts against `max_actions` (default 50); screenshots do not. After the budget is spent the session can still take screenshots and stop.
 - **Refused callers and modes.** Ephemeral agents (including Team-as-Agent role members, which copy their parent's capabilities) cannot start a session. An employee whose `[capabilities] computer_use_mode` is `"native"` is refused with error code `native_unsupported` and a message saying the mode was removed and to delete the key or set it to `"container"`; there is no silent fallback to a container. `"auto"` or no key behaves as `"container"`.
 - **Threat level.** A new session starts only while `~/.duduclaw/threat_level` is GREEN (or absent). YELLOW allows only screenshots and stop; RED ends every session. A chat message that is exactly an emergency-stop word (`停止`, `stop`, `abort`, `やめて`, …) ends every computer-use session.
 - **Cleanup.** A reaper checks every 15 seconds for sessions past their deadline or idle limit. Containers carry a label naming the owning DuDuClaw home and a deadline label; a sweep at gateway start and every 10 minutes removes this home's containers that have exited or are more than 10 minutes past their deadline, and removes nothing when Docker cannot be listed.
@@ -95,7 +95,7 @@ Earlier versions also had a second path: when a channel message looked like a co
 
 Now a channel message that mentions clicking or screenshots takes the normal reply path, and the employee decides whether to call the tools. Computer use reads no Anthropic API key (the direct-API reply fallback still does).
 
-**The image.** `container/Dockerfile.computer-use` builds a Debian (`debian:trixie-slim`) image of about 1.09 GB: Xvfb, the `openbox` window manager, Chromium (the real Debian `chromium` package) in kiosk mode, optional VNC, `xdotool` and `scrot` for actions and screenshots, the domain filter, the `duduclaw-eval-dom` masking helper and the `duduclaw-navigate` helper that `computer_navigate` uses. The browser and window manager run as an unprivileged `sandbox` user. Until 2026-10-01 this image never worked (its Ubuntu browser package was a snap stub that cannot start in a container, the entrypoint aborted under `--network=none`, and there was no window manager or masking helper); it was repaired and verified on that date.
+**The image.** `container/Dockerfile.computer-use` builds a Debian (`debian:trixie-slim`) image of about 1.09 GB: Xvfb, the `openbox` window manager, Chromium (the real Debian `chromium` package) in kiosk mode, an on-demand VNC server for the dashboard's live view (unix socket only), `xdotool` and `scrot` for actions and screenshots, the domain filter, the `duduclaw-eval-dom` masking helper and the `duduclaw-navigate` helper that `computer_navigate` uses. The browser and window manager run as an unprivileged `sandbox` user. Until 2026-10-01 this image never worked (its Ubuntu browser package was a snap stub that cannot start in a container, the entrypoint aborted under `--network=none`, and there was no window manager or masking helper); it was repaired and verified on that date.
 
 The release workflow `.github/workflows/computer-use-image.yml` publishes it. It runs on git tags `v*` or manual dispatch, builds `linux/amd64` and `linux/arm64` on native runners, and smoke-tests each build with the gateway's own container flags (window manager up, a screenshot taken, the DOM helper returning `[]`, `duduclaw-navigate` failing cleanly without a network) before pushing `ghcr.io/zhixuli0406/duduclaw-computer-use:<tag>` and `:latest`. The workflow first runs on the first release tag after v1.66.1, so no published image exists for v1.66.1 or earlier. `scripts/release.sh verify` does not check this image.
 
@@ -118,7 +118,7 @@ Upgrade note: a machine that only has a locally built `duduclaw-computer-use:lat
 
 After DOM masking the gateway reads the focused window's title. A title containing a credential marker masks the whole screenshot. A title that cannot be read (command error, timeout, non-zero exit, non-UTF-8 output) also masks the whole screenshot. An empty title that was read successfully leaves the screenshot as it is.
 
-A fully masked screenshot says so. The gateway's answer carries `fully_masked` (true/false) and `mask_reason` (`several_pages`, `title_sensitive`, `title_unreadable`, `helper_failed`, or none); when the helper fails, the title is not consulted. The tool text then tells the AI that the whole picture was hidden for safety and what to do: for several windows, call `computer_navigate` again, which closes the extra windows; for a sensitive or unreadable front window, the screen cannot be shown while that window is in front; otherwise take another screenshot, and if it keeps happening stop the session and start a new one. Partially masked and unmasked screenshots keep the usual text.
+A fully masked screenshot says so. The gateway's answer carries `fully_masked` (true/false) and `mask_reason` (`several_pages`, `title_sensitive`, `title_unreadable`, `helper_failed`, `injection_suspected`, `text_unscanned`, or none; the last two are described under [Injection pause](#injection-pause)); when the helper fails, the title is not consulted. The tool text then tells the AI that the whole picture was hidden for safety and what to do: for several windows, call `computer_navigate` again, which closes the extra windows; for a sensitive or unreadable front window, the screen cannot be shown while that window is in front; otherwise take another screenshot, and if it keeps happening stop the session and start a new one. Partially masked and unmasked screenshots keep the usual text.
 
 **Network and the site allowlist.** A session has no network unless the employee has a site allowlist in `agent.toml`:
 
@@ -222,3 +222,66 @@ High-risk Computer Use confirmations use the inbound account and exact conversat
 A computer-use container is removed when its session ends. To keep what an employee gathered, a session can attach a **computer-use workspace**: `computer_session_start` with `workspace = "new"` or an existing `ws-…` id. The gateway is the only writer (`computer_workspace_write`, into the workspace the employee's live session attached); `computer_workspace_list` and `computer_workspace_read` work without a session. Inside the container the files are read-only at `/workspace/files`, under a root-only tmpfs the browser's account cannot enter. Off by default: `config.toml [computer_use.workspaces] enabled = true` plus the employee's `[capabilities.computer_use_config] workspace = true`. macOS and Linux only.
 
 Quotas, retention, the one-session lease, operator commands (`duduclaw ops computer-workspaces`, where every state-changing action needs an Admin's approval in the dashboard; emergencies go through the dashboard or the master switch) and the known limitations, including that owner isolation holds for the three workspace tools only and not for an employee with `Read` or Bash, are in the [computer-use workspaces guide](../guides/computer-workspaces.md).
+
+## Keep-alive, live view and takeover
+
+Three additions let a person watch an employee's computer and step in, and let a session survive a pause in the work. All of them only narrow what the employee can do. Code: `crates/duduclaw-gateway/src/computer_use_sessions/` (`keepalive.rs`, `live_view.rs`, `live_ops.rs`, `view_ws.rs`, `rfb.rs`), dashboard `web/src/components/agent/ComputerSessionPanel.tsx`.
+
+### Keep-alive
+
+```toml
+[capabilities.computer_use_config]
+keep_alive_minutes = 30      # default 0 = end after 2 idle minutes, as before; at most 240
+takeover_idle_minutes = 10   # default 10; at most 60
+```
+
+With `keep_alive_minutes` above 0, a session idle for 2 minutes is not ended: the reaper pauses its container (`docker pause`). The next `computer_*` call of the employee, or a dashboard viewer, resumes it (`docker unpause`) and the call goes on. A session paused for longer than `keep_alive_minutes` ends. Everything else still applies while paused: the `max_session_minutes` deadline keeps counting, `max_actions` is unchanged, a RED threat level, the chat emergency stop, a revoked capability, a lost workspace lease and `computer_session_stop` end it. A paused session keeps its slot, so it counts toward the limit of five sessions. Lowering or removing `keep_alive_minutes` takes effect on a session that is already running; raising it does not. A container that will not resume ends the session (`resume_failed`). The sweep removes a paused container past its deadline label without the usual 10-minute grace, in the gateway holding the instance lock, after unpausing it; every gateway still removes it 10 minutes after the deadline. Pauses and resumes are audited (`session_pause`, `session_resume`).
+
+### Live view
+
+The employee page has a **Computer** tab (shown when the employee has `computer_use`). It shows whether the session is running, paused, held for review or under human control, the actions used, the time left, the keep-alive window and how many people are watching, refreshed every 5 seconds. **Watch** opens a live picture of the screen.
+
+Who may do what (role and bindings re-read from `users.db` on every request and every viewer connection):
+
+| | Admin | Manager bound to the employee | Account bound at Operator level or above |
+|---|---|---|---|
+| Status, watch, stop | yes | yes (any binding level) | yes |
+| Take over, hand back, resume after an injection pause | yes | only when bound at Operator level or above | no |
+
+How the picture travels: when someone watches, the gateway starts `x11vnc` inside the container (`docker exec … duduclaw-vnc start viewonly`, with a new random 8-character password passed on stdin). It listens only on a unix socket in the root-only `/tmp/duduclaw-root`, never on a TCP port (the helper refuses to keep running if anything listens on 5900–5999), so neither the network nor the browser's unprivileged account can reach it. Nothing is published on the host. The dashboard asks the `computer_sessions.view` RPC for a single-use ticket valid for 30 seconds and opens `/ws/computer-view?ticket=…` on the gateway, which checks the Origin like the dashboard socket, consumes the ticket, re-reads and re-authorizes the account, allows at most four viewers per session, and pipes the WebSocket to `docker exec -i … duduclaw-vnc-relay` (a unix-socket-to-stdio relay). The connection closes when the session ends and when the account loses access (checked every 30 seconds). The dashboard draws the picture with noVNC.
+
+A published port on 127.0.0.1 relayed by the gateway was the other option; it was not used because any process of any user on the host could connect to such a port, while a `docker exec` relay needs access to the Docker daemon.
+
+The gateway reads the viewer's side of the protocol (RFB 3.7/3.8): keyboard, mouse, clipboard and extended-key messages go through only from the account holding the takeover; requests to resize the screen (`SetDesktopSize`, which would break screenshot masking) and `xvp` shutdown or reboot requests are always dropped; anything it does not recognise closes the connection. The VNC server additionally runs with `-viewonly` while nobody holds a takeover, and with `-noremote -nocmds -nosel` always (no clipboard either way). Every viewer connection writes `view_start` and `view_stop` (who, how long, how many input messages were forwarded) to the browser audit log; the picture and keystrokes are not recorded.
+
+### Take over and hand back
+
+**Take over** gives the account a lease on the session. While the lease is held:
+
+- every `computer_click`, `computer_type`, `computer_key`, `computer_scroll`, `computer_navigate` and `computer_workspace_write` of the employee is refused with `human_has_control` and a message telling it to wait; screenshots, status and stop still work, and screenshots are masked as always;
+- the stream restarts in input mode with a new password, and only the holder's keyboard and mouse reach the screen;
+- the session does not idle out or pause.
+
+The lease ends on **Hand back** (the holder or an Admin), after `takeover_idle_minutes` without input from the holder, when the stream cannot be started, or when the session ends. The stream then returns to view-only. The employee gets a structured `continue` handoff through its working state (the same store `working_state_handoff` writes): who took over, for how long, how many inputs were sent, why it ended, the optional note from the person (passed through `input_guard`; a suspicious note is replaced by a marker) and the previous handoff, shortened, with the next step "take a screenshot first, do not reuse old coordinates". Audit rows: `takeover_start`, `takeover_end`. An action that had already passed its last check when the lease was taken finishes; the lease stops everything after it.
+
+### Injection pause
+
+Every `computer_screenshot` also reads the visible page's text (`document.body.innerText`, up to 32,768 characters) through `duduclaw-eval-dom` in an isolated world and runs it through `input_guard` at the blocking threshold. On a block-level hit the session is held:
+
+- the screenshot is fully masked with `mask_reason` `injection_suspected`, and so is every screenshot until a person resumes;
+- every action and workspace write of the employee is refused with `injection_suspected`;
+- an Activity Feed entry and an L3 notice to the employee's notification channel name the matched rule categories;
+- the audit row `injection_suspected` records the rule categories only, never the page text.
+
+A person resumes it from the Computer tab (**Resume**, audited `injection_resume`). When the page text cannot be read, the screenshot is fully masked with `mask_reason` `text_unscanned` (unless it already was) and the session is not held. The text is read right after the screenshot, so a page that changes in between is scanned in its newer state. The guard's limits apply: it matches sentence shapes, so ordinary pages can trip it and well-disguised text can pass.
+
+### Not covered and not verified
+
+- No Docker was available where this was built: the pause/resume, the VNC helper, the relay and the stream were tested with fakes and unit tests only. The relay script and the TCP-port check were run on plain Linux; the image workflow's smoke test now checks the RFB banner through the relay, that the browser's account cannot reach the socket and that no VNC TCP port listens, but it has not run yet. Whether `x11vnc` in the Debian image accepts `-rfbport 0 -unixsock` exactly as used is unverified; if it does not, the stream refuses to start and nothing is exposed.
+- The noVNC picture in a real browser against a real container, and `docker pause` / `docker unpause` and `docker rm --force` on paused containers, are unverified.
+- VNC authentication uses an 8-character password and DES; the real protection is the root-only unix socket and the gateway's authenticated, filtered relay. The password reaches the authorized viewer's browser.
+- A Manager or Operator bound to the employee sees the whole screen (masking applies to the employee's screenshots, not to the live stream), including what a site displays.
+- Switching between view-only and input mode restarts the VNC server, so open viewers disconnect and reconnect.
+- Keep-alive, takeover and the viewer count live in the gateway process: a gateway restart ends sessions as before.
+- The settings are read from `agent.toml`; the employee edit page has no fields for them yet.
+
