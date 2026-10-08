@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+- **持續任務頁面**（`/responsibilities`，三語）：依員工列出持續任務的狀態、是否唯讀、下次叫醒、本期花費／上限、本期次數／上限、連續失敗、到期日；詳細視窗有最近 20 輪與目前這一輪的停止按鈕；依觀看者綁定顯示新增、暫停／恢復／停用／啟用與清除連續失敗（後者需 Manager）。功能關閉時明說並列出 `[responsibilities] enabled` 與 `[dispatch] enabled`，不畫示範資料。新 RPC `responsibilities.status`。新增「每日簡報（唯讀）」「每週回顧（唯讀）」兩個安全範本。
+- **持續任務的唯讀執行**：合約可帶 `lane = "explore"`（存在 `scope_json`，沒帶的合約位元不變）。這種持續任務的每一輪都帶 `DUDUCLAW_LANE=explore`：Claude CLI 的內建工具只剩唯讀五個、自動核准只剩 DuDuClaw MCP 工具與這五個；OpenAI 相容執行環境與本地推論工具迴圈的 MCP 子程序也帶這個變數；Codex、Gemini CLI、Antigravity、Grok、通用 CLI 與任務沙箱一律拒絕執行（`explore_lane_unsupported`，fail closed）。
+- **員工動作的單次核准（ActionGrant）**：`send`／`purchase` 類工具與 `action_rules` 判 `ask` 的呼叫，核准請求帶 `payload.action_grant`（員工、工具、動作類別、正規化參數的 SHA-256 指紋、遮蔽後的參數摘要）；核准後必須與實際呼叫一致並且只能消耗一次（`consumed:action_grant:<uuid>`），否則拒絕。收件匣詳細面板新增「這份核准涵蓋的內容」。
+- **員工摘要「你不在的時候」**：`config.toml [digest] enabled = false`（預設關）、`hour`、`timezone`、`exclude_agents`。持有 gateway 實例鎖的 gateway 每天組一次（不呼叫模型），存成 `<home>/digest/<date>.json`、顯示在首頁並以純文字送給管理員已驗證的連結通道；以 `<home>/digest/state.json` 每天只送一次。首頁的完成項目可給 👍／👎／需要修改，寫入 `feedback.jsonl`（`source = "deliverable"`），由演化反思的使用者回饋訊號讀取。新 RPC `digest.latest`、`digest.feedback`。
+- **回覆較慢時的進度狀態**：`[channel_reply] interim_status = false`（預設關）、`interim_status_secs = 8`、`interim_status_show_task = false`。外部通道的回覆超過設定秒數仍無任何顯示時，送一行不經模型的狀態（已等多久、員工另有背景工作多久），每輪最多一次。預設關閉，因為多數 CLI 回覆都超過 8 秒，會讓不能原地編輯的通道每輪多一則訊息。
+
+### Changed
+- 主動訊息的「被忽略」判斷略過 `feedback.jsonl` 中 `source = "deliverable"` 的列。
+
 ## [1.71.0] - 2026-10-07 — MCP 獨立模式（mcp init）、外部金鑰的 MCP 授權修補、預設英文 README、商業連結改導總經銷
 
 ### Added

@@ -9,11 +9,12 @@ What this release ships:
 | To do this | Use |
 |---|---|
 | Create, change, pause, resume, disable or re-enable a responsibility | The command line `duduclaw responsibility …`; every change needs an Admin's approval in the dashboard |
-| Look at responsibilities, their runs and wake records | The command line (read commands need no approval) |
+| Look at responsibilities, their runs and wake records | The `/responsibilities` dashboard page, or the command line (read commands need no approval) |
+| Create, pause, resume, turn off or on, clear failures from the dashboard | The `/responsibilities` page (your binding to the employee decides which buttons work) |
 | Give a running goal task a direction | The task detail page in the dashboard |
 | Stop a task and its sub-tasks | The task detail page (takes effect at once), or the command line (needs approval) |
 
-There is no `/responsibilities` page in the dashboard yet.
+The dashboard's `/responsibilities` page is described below under "The responsibilities page".
 
 ## Switches and settings
 
@@ -202,6 +203,29 @@ With the feature off, actions that widen permissions or spending (`create`, `upd
 
 To stop everything: `disable` first, then stop the open run.
 
+## The responsibilities page
+
+`/responsibilities` (navigation: Work → Responsibilities) lists the responsibilities of every employee you are bound to, grouped by employee. Each row shows the state, whether runs are read-only, the next wake-up, this budget window's spend against its cap, this window's run count against its limit, the failure streak against its limit, and the end date. Everything comes from the existing RPCs (`responsibilities.list`, `.get`, `.occurrences`); the page draws no sample data.
+
+- **Feature off.** `responsibilities.status` reports both switches. When `[responsibilities] enabled` or `[dispatch] enabled` is off, the page says so and names the two keys. Existing rows can still be paused or turned off (the server accepts only those two narrowing actions while the feature is off).
+- **Actions.** Pause, resume, turn off and turn on need Operator on the employee; clearing the failure count also needs Manager or higher; every call sends the `control_epoch` it showed, and a "changed in the meantime" answer refreshes the list instead of retrying. The detail dialog shows the acceptance text, the open run (with the existing stop button) and the last 20 runs with their outcome and charge.
+- **Create.** Three templates: **daily briefing (read-only)**, **weekly review (read-only)** and **custom**. The read-only templates always set `lane = "explore"`, run at most once per budget window with a 1-hour run limit and a small cap you can change; the custom template is read-only unless you untick it. The server validates every value as it does for the command line.
+
+### Read-only runs (`lane = "explore"`)
+
+A responsibility's contract may carry `"lane": "explore"` (RPC `responsibilities.create` / `update_contract`, and the command line's contract file). The lane is stored in the contract's scope, so it is part of the contract hash; a responsibility without it is byte-identical to before. Any other value is refused (`invalid_lane`).
+
+Every round of every run of such a responsibility runs in the read-only explore lane introduced for the heartbeat proactive check:
+
+| Runtime | What happens |
+|---|---|
+| Claude CLI | `DUDUCLAW_LANE=explore` on the spawn (inherited by the DuDuClaw MCP server, which then lists and runs only `read` / `draft` tools), `--tools` limited to `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch` minus `denied_tools`, and `--allowedTools` limited to DuDuClaw MCP tools and those built-ins (never wider than the employee's own allowlist; tools of other `.mcp.json` servers are not auto-approved) |
+| OpenAI-compatible runtime, local-inference tool loop | No built-in tools; the MCP child gets `DUDUCLAW_LANE=explore` |
+| Codex, Gemini CLI, Antigravity, Grok, generic CLI | Refused: the round fails before dispatch (`explore_lane_unsupported`), and the same refusal sits in each of those runtimes' `execute` in case a failover reaches them |
+| Task sandbox (`[container] sandbox_enabled`) | Refused (the sandbox gives the employee a shell) |
+
+A refused round counts as an unsuccessful run, so the failure streak eventually pauses the responsibility. An unreadable lane fails the round too (`explore_lane_unreadable`). Not covered: a run's sub-tasks woken later by the heartbeat run outside the lane (in the lane, `tasks_create` is a `modify` tool and is refused, so a read-only run cannot create them itself); not exercised against a live gateway.
+
 ## The task detail page
 
 ### Directions (steering)
@@ -277,12 +301,12 @@ A push carries only the responsibility's name, its state and a dashboard link, n
 - Spending warnings for runtimes that may not report usage appear on the command line and in `duduclaw doctor` only; the dashboard does not show the `usage_warnings` that `responsibilities.create` returns, and an external judge (`[dispatch] judge = "external"`) is not checked.
 - When several gateways are started on the same data directory, only the one holding `<home>/locks/gateway.lock` runs the responsibility wake pass, the stop reconciliation, the steering sweep and the repair of half-done durable rounds; the others still dispatch goal rounds as before (a durable round's fixed message id keeps it from being sent twice).
 - If the task board cannot be read for an employee three times in a row, an Activity Feed entry says that employee's task-board wake-ups have stopped (once per gateway process); every failure is also logged as a warning.
-- There is no `/responsibilities` page yet: this release has the command line with inbox approval, and directions and stopping on the task detail page.
+- The `/responsibilities` page covers listing, creating and the pause / resume / turn off / turn on / clear-failures controls; contract updates and responsibility-level stop still go through the command line.
 
 ## For developers
 
 - Code: `crates/duduclaw-gateway/src/responsibility/` (`wake.rs`, `events.rs`, `cost.rs`, `stop.rs`, `steering.rs`, `operator_gate.rs`, `notify.rs`); tables live in `tasks.db`.
-- Dashboard RPC (`handlers/responsibilities_rpc.rs`): `responsibilities.create` / `list` / `get` / `occurrences` / `fires` / `update_contract` / `pause` / `resume` / `disable` / `enable` / `clear_failures`, plus `tasks.steer` / `tasks.steering` / `tasks.stop` / `tasks.stop_status`. Reads need Viewer and changes need Operator on the owning employee, except `clear_failures`, which needs Manager; every write appends an audit row. `responsibilities.create` also returns `usage_warnings` (runtimes that may not report usage). `system.update_config` accepts `responsibilities.enabled` and `goal_loop.steering_enabled`.
+- Dashboard RPC (`handlers/responsibilities_rpc.rs`): `responsibilities.status` / `create` / `list` / `get` / `occurrences` / `fires` / `update_contract` / `pause` / `resume` / `disable` / `enable` / `clear_failures`, plus `tasks.steer` / `tasks.steering` / `tasks.stop` / `tasks.stop_status`. Reads need Viewer and changes need Operator on the owning employee, except `clear_failures`, which needs Manager; every write appends an audit row. `responsibilities.create` also returns `usage_warnings` (runtimes that may not report usage). `system.update_config` accepts `responsibilities.enabled` and `goal_loop.steering_enabled`.
 - Command line: `crates/duduclaw-cli/src/responsibility_cmd.rs`; approval kind `responsibility_operator_change`, decided only by an Admin in the dashboard (`decided_by` starting with `dashboard:`).
 - Bash-lane block: the shared operator-command matcher (`duduclaw_core::bash_operator_command_decision`, `GuardDecision::BlockedOperatorCommand`) with the list in `responsibility_cmd::OPERATOR_COMMANDS`, chained after the LINE inbox commands in the agent-file-guard hook.
 - Every responsibility, steering and stop RPC re-reads the caller from the account store (`handlers/task_privacy.rs::live_reader_context`); `tasks.steer` / `tasks.steering` / `tasks.stop` / `tasks.stop_status` also go through the task-content gate (`authorize_private_task_read`: agent access plus the task's audience).

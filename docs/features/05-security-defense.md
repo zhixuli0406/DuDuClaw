@@ -173,6 +173,15 @@ A `tool` rule (same anchored matcher as the other `[capabilities]` tool lists, s
 
 **Not covered and not verified.** Action rules gate DuDuClaw's own MCP tools; Claude Code's built-in tools are governed by `allowed_tools` / `denied_tools` only, and other MCP servers in `.mcp.json` are not classified. A `tool` rule naming a removed tool name does not follow the call that replaced it. The action review does not run for the OS action tools (they have their own situation classifier), for `skill_hub_install` (its own approval after the security scan) or for the `computer_*` tools. Classification is per tool name, so an argument-dependent tool always gets its stricter class. None of the three layers has been exercised against a live gateway with a real model yet; the tests are unit and dispatcher-level.
 
+## Single-use approvals for employee actions (ActionGrant)
+
+Added 2026-10-08 (unreleased). Before this change every tool call that needed a person's approval already filed its own request and waited for that request's decision, so an approval could not be reused by a later call. What was missing was a binding: the card did not show the arguments, and nothing tied the decision to the call that ran. Now, for a call whose tool is in the `send` or `purchase` class (for example `mail_send`, `odoo_sale_confirm`) or that reached human approval because an `action_rules` rule said `ask`, the request carries `payload.action_grant` (`duduclaw-gateway/src/approval/action_grant.rs`):
+
+- employee, tool, effect class, a SHA-256 digest of employee + tool + canonical arguments (object keys sorted), and a summary of up to eight `key = value` lines built from identifier-shaped argument keys and scalar values. Secret-looking keys and values are masked with the same helpers `tool_calls.jsonl` uses, strings are cut at 60 characters, nested values are shown only as counts. The card text and the inbox detail panel ("What this approval covers") show it.
+- On approval the stored binding must match the call about to run (same employee, tool and digest); the approval is then consumed once (`approved → invalidated`, reason `consumed:action_grant:<uuid>`) before the call proceeds. A mismatch, a lost claim or a second use is a denial.
+
+Other approval paths (install approvals, the OS situation gate, PolicyKernel `ask`, workflow runs, `computer_*`) are unchanged. Not covered: the digest is computed over the arguments at the approval gate, which runs after PolicyKernel rewrites and egress secret restoration; a person with database access could edit the stored payload and card together. Unit and broker tests only.
+
 ## Supporting layers
 
 **MCP authorization gate** — every MCP tool is enumerated in a scope table; a tool that is not listed defaults to requiring Admin scope. Scope, per-agent capability grants and `denied_tools` are each enforced at the dispatcher front door, and every refusal is audited with an `error_class`.

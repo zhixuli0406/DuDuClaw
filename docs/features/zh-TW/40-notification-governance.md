@@ -153,6 +153,36 @@ daily_digest_at = "09:00"   # 本地時間
 
 ---
 
+## 員工摘要（「你不在的時候」）
+
+2026-10-08 新增（尚未發行），與上面全部署的 `[notify] daily_digest` 分開。
+
+```toml
+# ~/.duduclaw/config.toml
+[digest]
+enabled = false            # 預設關閉
+hour = 8                   # 當地時（0–23）
+timezone = "Asia/Taipei"   # IANA 時區，預設 UTC
+exclude_agents = []        # 不列入的員工
+```
+
+每天在 `timezone` 的 `hour` 之後，持有 gateway 實例鎖（`duduclaw_core::gateway_instance`）的 gateway 不呼叫任何模型，組出每位員工的摘要（`duduclaw-gateway/src/digest.rs`）：上次摘要以來（最多回溯 7 天）完成的任務與目標、動態、待核准、已結算的持續任務執行與花費。沒事可報的員工不列。摘要存成 `<home>/digest/<date>.json`，顯示在儀表板首頁（RPC `digest.latest`，只列觀看者可讀的員工與任務），並以純文字送到每位啟用中管理員已驗證的連結通道。`<home>/digest/state.json` 在送出前用檔案鎖認領當地日期，所以重啟或第二個 gateway 都不會重送（認領後、送出前當機則跳過當天）。`[digest]` 任一值不對就視為關閉。
+
+首頁上每個完成項目都有 👍／👎／「需要修改」（可附備註）。RPC `digest.feedback` 需要對該員工的 Operator 並通過任務可見範圍檢查；只有 `done` 的任務可以回饋。回饋附加到 `<home>/feedback.jsonl`（演化反思的使用者回饋訊號原本就讀這個檔），`type` 為 `positive`／`negative`／`correction`，並帶 `source = "deliverable"`、`item_kind`、`item_id`、`verdict`、`user_id`、`note`。主動訊息的「被忽略」判斷會略過這些列。未完成：通道按鈕、產物的回饋、摘要列出產物；未在真實通道驗證。
+
+## 回覆較慢時的進度狀態
+
+2026-10-08 新增（尚未發行），預設關閉。
+
+```toml
+[channel_reply]
+interim_status = false            # 慢的那一輪送一行狀態
+interim_status_secs = 8           # 0 = 關閉（最多 600）
+interim_status_show_task = false  # 是否寫出員工正在跑的任務名稱
+```
+
+外部通道（Telegram、Discord、Slack、LINE、WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘；不含 WebChat 與內部工作階段）的回覆在 `interim_status_secs` 秒後仍什麼都沒顯示時，回覆本身的進度回呼會收到一行不經模型組出的狀態：已等多久，以及員工若另有已認領的任務看板工作，那項工作已跑多久。任務名稱只有在 `interim_status_show_task = true` 且任務可見範圍允許該通道讀取時才會出現，因為通道使用者可能是外部客戶。每一輪最多一次；通道沒有提供進度回呼就不送。可原地編輯的通道會把它當成進度訊息的第一個狀態，之後被答覆取代；其他通道會另發一則訊息（LINE 與 WhatsApp 會用到推播額度），所以預設關閉（`duduclaw-gateway/src/channel_reply/interim.rs`）。
+
 ## 行動率量測
 
 每則通知送出時記一筆，每次有人真的把決定按掉時記一筆，存在 `~/.duduclaw/notify_events.jsonl`。
