@@ -166,3 +166,121 @@ async fn headers_server_stream_and_tool_gate() {
     assert_eq!(views[0].server, "crm");
     assert_eq!(views[0].tools.len(), 2);
 }
+
+// ── POST answer stream resumption (2026-10-08 close-out) ────────────────────
+
+#[derive(Default)]
+struct Resume {
+    gets: Vec<Option<String>>,
+}
+type R = Arc<Mutex<Resume>>;
+
+async fn resume_post(body: String) -> Response {
+    let frame: Value = serde_json::from_str(&body).unwrap();
+    let method = frame["method"].as_str().unwrap_or("").to_string();
+    if frame.get("id").is_none() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    match method.as_str() {
+        "initialize" => (
+            [("content-type", "application/json"), ("mcp-session-id", "sess-r")],
+            json!({"jsonrpc":"2.0","id":frame["id"],"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"1"}}}).to_string(),
+        )
+            .into_response(),
+        // A priming event with an id and a short retry hint, a progress
+        // notification, then the stream closes before the answer.
+        "tools/call" if frame["params"]["name"] == "slow" => {
+            let note = json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"t","progress":1}});
+            (
+                [("content-type", "text/event-stream")],
+                format!("id: p-0\nretry: 50\ndata:\n\nid: p-1\ndata: {note}\n\n"),
+            )
+                .into_response()
+        }
+        // No event ids: nothing to resume from.
+        "tools/call" => (
+            [("content-type", "text/event-stream")],
+            "data:\n\n".to_string(),
+        )
+            .into_response(),
+        _ => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+async fn resume_get(State(s): State<R>, headers: HeaderMap) -> Response {
+    let last = headers.get("last-event-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let n = {
+        let mut f = s.lock().unwrap();
+        f.gets.push(last.clone());
+        f.gets.len()
+    };
+    if headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) != Some("sess-r") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if n == 1 {
+        // First resume: the server is briefly unavailable.
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    assert_eq!(last.as_deref(), Some("p-1"));
+    let answer = json!({"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"resumed"}]}});
+    ([("content-type", "text/event-stream")], format!("id: p-2\ndata: {answer}\n\n")).into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_post_answer_stream_is_resumed_with_last_event_id() {
+    let s: R = Arc::new(Mutex::new(Resume::default()));
+    let app = Router::new()
+        .route(
+            "/mcp",
+            post(resume_post).get(resume_get).delete(|| async { StatusCode::NO_CONTENT }),
+        )
+        .with_state(s.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+    std::fs::create_dir_all(home.join("agents").join("a1")).unwrap();
+    connect::start_connect(
+        home,
+        connect::ConnectRequest {
+            agent_id: "a1".into(),
+            server: "slowsrv".into(),
+            url: Some(format!("{base}/mcp")),
+            auth: store::AuthKind::None,
+            bearer: None,
+            redirect_origin: None,
+            client_id: None,
+            client_secret: None,
+            allowed_origins: vec![],
+            headers: None,
+            server_stream: Some(false),
+        },
+    )
+    .await
+    .expect("connect");
+
+    let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n\
+                 {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\
+                 {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}}}\n\
+                 {\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"plain\",\"arguments\":{}}}\n";
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let code = bridge::run_bridge(home, "a1", "slowsrv", input.as_bytes(), server).await;
+    assert_eq!(code, 0);
+    let mut out = String::new();
+    tokio::io::BufReader::new(client).read_to_string(&mut out).await.unwrap();
+    let msgs: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let by_id = |id: i64| msgs.iter().find(|m| m["id"] == id).cloned().unwrap_or(Value::Null);
+    // The progress notification arrived before the break, the answer after
+    // the resume (a 503 first, retried within the bounds).
+    assert!(msgs.iter().any(|m| m["method"] == "notifications/progress"), "{out}");
+    assert_eq!(by_id(7)["result"]["content"][0]["text"], "resumed", "{out}");
+    let gets = s.lock().unwrap().gets.clone();
+    assert_eq!(gets, vec![Some("p-1".to_string()), Some("p-1".to_string())], "{gets:?}");
+    // A stream without event ids cannot be resumed: the request fails.
+    assert!(
+        by_id(8)["error"]["message"].as_str().unwrap_or("").contains("without an answer"),
+        "{out}"
+    );
+}
