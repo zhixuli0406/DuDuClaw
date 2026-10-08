@@ -383,6 +383,8 @@ pub mod redaction_integration;
 // ── RFC-23 §13.6: redaction for external MCP servers + the direct-API loop ──
 pub mod redaction_proxy;
 pub mod third_party_tools;
+pub mod explore_lane;
+pub mod mcp_events;
 
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{GatewayConfig, start_gateway};

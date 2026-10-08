@@ -291,6 +291,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
+    // ── MCP Events: keep subscriptions alive (2026-10-08) ─────────
+    // Re-calls `events/subscribe` before each grant runs out; does nothing
+    // on an install with no subscriptions file.
+    crate::mcp_events::service::spawn_refresh_sweep(home_dir.clone());
+
     let extension = config.extension.clone();
     let edition_override = config.edition;
     {
@@ -2666,6 +2671,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     if let Some(tx) = odoo_event_tx.clone() {
         app = app.merge(crate::odoo_events::router(home_dir.clone(), tx));
     }
+
+    // ── MCP Events receiver (2026-10-08) ─────────────────────────
+    // Always mounted; an unknown subscription id answers 404. Each
+    // subscription carries its own signing secret (crate::mcp_events).
+    app = app.merge(crate::mcp_events::receiver::router(home_dir.clone()));
 
     // ── .well-known endpoints for protocol discovery ──────────────
     app = app

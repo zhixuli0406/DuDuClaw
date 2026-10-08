@@ -389,6 +389,10 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             duduclaw_memory::feedback::CURRENT_TURN_ID.scope(msg.turn_id.clone(), dispatch_fut);
         let dispatch_fut =
             crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
+        // 2026-10-08: a run woken by an external event stays read-only
+        // unless its source was opted into normal mode (`crate::explore_lane`).
+        let dispatch_fut = crate::explore_lane::EXPLORE
+            .scope(crate::explore_lane::is_explore(msg.lane.as_deref()), dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes

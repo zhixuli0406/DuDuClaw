@@ -207,3 +207,44 @@ describe('ToolEffectsPanel', () => {
     expect(screen.getByText('Never')).toBeInTheDocument();
   });
 });
+
+describe('McpEventsPanel', () => {
+  it('lists subscriptions and subscribes in read-only mode by default', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.events_list') {
+        return Promise.resolve({
+          public_base_url_set: false,
+          public_base_url_problem: 'set it',
+          subscriptions: [
+            {
+              id: 'mev_1', agent_id: 'nova', server: 'pager', event_types: ['incident.created'], mode: 'explore',
+              status: 'active', callback_url: null, upstream: [], created_at: '', updated_at: '', rotated_at: null,
+              last_delivery_at: null, deliveries: 2,
+            },
+          ],
+        });
+      }
+      if (method === 'mcp.events_subscribe') return Promise.resolve({ subscription: {} });
+      return Promise.resolve({});
+    });
+    const { McpEventsPanel } = await import('./McpEventsPanel');
+    const servers = [
+      {
+        agent_id: 'nova', server: 'pager', auth: 'none' as const, host: 'x', status: 'connected' as const,
+        access_expires_at: null, access_token_expired: false, has_refresh_token: false, installed: true,
+        created_at: '', updated_at: '',
+      },
+    ];
+    renderWithProviders(<McpEventsPanel servers={servers} />);
+    expect(await screen.findAllByTestId('event-sub-row')).toHaveLength(1);
+    expect(screen.getByText(/public_base_url/)).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'nova/pager' } });
+    fireEvent.change(screen.getByPlaceholderText(/incident.created/), { target: { value: 'a.b, c' } });
+    fireEvent.click(screen.getByRole('button', { name: /^subscribe$/i }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('mcp.events_subscribe', {
+        agent_id: 'nova', server: 'pager', event_types: ['a.b', 'c'], mode: 'explore',
+      }),
+    );
+  });
+});

@@ -925,6 +925,19 @@ async fn call_claude_for_agent_impl(
     // attributes get the same value, matching what the `chat` spans below do.
     record_runtime_on_span(delegation_settings.provider);
 
+    // 2026-10-08: the read-only explore lane is wired for the Claude CLI
+    // spawn only (`crate::explore_lane`). Any other route would run the
+    // employee's tools without the lane, so it is refused here.
+    if crate::explore_lane::in_explore()
+        && (delegation_settings.non_claude_provider().is_some()
+            || duduclaw_llm::is_moa_model_id(&claude_model))
+    {
+        return Err(format!(
+            "Agent '{agent_id}' cannot run this read-only (explore lane) task: the lane is only \
+             enforced on the Claude CLI runtime"
+        ));
+    }
+
     // O1: confidence-aware multi-scale routing for delegated sub-tasks
     // (arXiv:2601.04861). Opt-in, default OFF — `config.toml [delegation]
     // confidence_routing`, per-agent override `agent.toml [model]
@@ -1083,6 +1096,12 @@ async fn call_claude_for_agent_impl(
     // P0 fix: global mode gate BEFORE per-agent routing
     let inference_mode = get_inference_mode(home_dir).await;
     match inference_mode.as_str() {
+        "local" if crate::explore_lane::in_explore() => {
+            return Err(format!(
+                "Agent '{agent_name}' cannot run this read-only (explore lane) task in local-only \
+                 inference mode: the lane is only enforced on the Claude CLI runtime"
+            ));
+        }
         "local" => {
             // Force local inference regardless of per-agent prefer_local
             let model_id = local_config.as_ref().map(|c| c.model.as_str());
@@ -1189,7 +1208,9 @@ async fn call_claude_for_agent_impl(
     // ── ① Local offload: only for clearly simple queries ─────────
     let adaptive_prefer = crate::cost_telemetry::should_prefer_local(agent_id).await;
     if let Some(ref local) = local_config {
-        let should_try_local = adaptive_prefer || local.use_router || local.prefer_local;
+        let should_try_local = (adaptive_prefer || local.use_router || local.prefer_local)
+            // The local tool loop does not carry the explore lane.
+            && !crate::explore_lane::in_explore();
         if should_try_local {
             let reason = if adaptive_prefer {
                 "adaptive-override"
@@ -3647,7 +3668,11 @@ pub(crate) fn mcp_proxy_cli_args(
     if !mcp_json.exists() {
         return None;
     }
-    let proxied = crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, &mcp_json)?;
+    let proxied = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
+        home_dir,
+        &mcp_json,
+        crate::explore_lane::in_explore(),
+    )?;
     let args = vec![
         "--mcp-config".to_string(),
         proxied.to_string_lossy().to_string(),
@@ -3705,7 +3730,11 @@ fn mcp_config_cli_args(
             None,
         ));
     }
-    let (target, guard) = match crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, path) {
+    let (target, guard) = match crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
+        home_dir,
+        path,
+        crate::explore_lane::in_explore(),
+    ) {
         Some(proxied) => {
             let rendered = proxied.to_string_lossy().to_string();
             (rendered, Some(proxied))
@@ -3936,7 +3965,19 @@ fn prepare_claude_cmd(
     // schema the allowlist would not auto-approve is pure token waste here.
     // `project,local` keeps the agent's own `.claude/settings.json`. Default ON;
     // env kill-switch / per-agent [runtime] minimal_context = false opts out.
-    if duduclaw_core::agent_toml::resolve_minimal_context(config_dir) {
+    let explore_lane = crate::explore_lane::in_explore();
+    if explore_lane {
+        // Read-only explore lane (2026-10-08): only the read built-ins exist,
+        // whatever minimal_context says; the MCP children inherit the lane.
+        cmd.args(["--setting-sources", "project,local"]);
+        let tools: Vec<String> = caps
+            .minimal_builtin_tools(duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS)
+            .into_iter()
+            .filter(|t| duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS.contains(&t.as_str()))
+            .collect();
+        cmd.args(["--tools", &tools.join(",")]);
+        cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
+    } else if duduclaw_core::agent_toml::resolve_minimal_context(config_dir) {
         cmd.args(["--setting-sources", "project,local"]);
         let tools =
             caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
@@ -5043,6 +5084,26 @@ mod redaction_proxy_cli_args_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
         assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+    }
+
+    /// 2026-10-08: the explore lane and `action_rules` route third-party
+    /// servers through the gated proxy even with redaction off.
+    #[test]
+    fn explore_lane_and_action_rules_route_through_the_proxy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+        let (args, _guard) = crate::explore_lane::EXPLORE
+            .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)))
+            .expect("explore lane proxies third-party servers");
+        let body = std::fs::read_to_string(&args[1]).unwrap();
+        assert!(body.contains("mcp-proxy"), "{body}");
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\naction_rules = [{ effect = \"modify\", verdict = \"ask\" }]\n",
+        )
+        .unwrap();
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_some());
     }
 
     #[test]

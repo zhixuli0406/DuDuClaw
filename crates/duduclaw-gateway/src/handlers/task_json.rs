@@ -211,6 +211,9 @@ pub(crate) const AUTOPILOT_CREATE_TRIGGER_EVENTS: &[&str] = &[
     // before this; without the entry here a dashboard-authored rule could
     // not subscribe to an ERP change.
     "odoo_event",
+    // 2026-10-08 — `autopilot_engine::AutopilotEvent::McpEvent`, MCP Events
+    // webhook deliveries accepted by `crate::mcp_events`.
+    "mcp_event",
 ];
 
 /// Trigger events still accepted on stored rules (update / re-validation) but

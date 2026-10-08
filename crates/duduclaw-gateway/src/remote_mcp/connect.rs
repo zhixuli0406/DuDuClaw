@@ -664,6 +664,15 @@ pub struct UpstreamAuth {
     pub expires_at: Option<i64>,
 }
 
+/// Put the credential (and any other headers the record carries) on a
+/// request to the remote server.
+pub fn apply_upstream_headers(mut req: reqwest::RequestBuilder, auth: &UpstreamAuth) -> reqwest::RequestBuilder {
+    if let Some(a) = &auth.authorization {
+        req = req.header("Authorization", a);
+    }
+    req
+}
+
 fn not_connected(agent_id: &str, server: &str, why: &str) -> AuthError {
     AuthError::NotConnected(format!(
         "remote MCP server '{server}' for employee '{agent_id}' {why}; \

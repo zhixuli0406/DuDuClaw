@@ -2437,6 +2437,23 @@ export interface McpRemoteServerStatus {
   updated_at: string;
 }
 
+/** An MCP Events subscription (2026-10-08). No secret is ever returned. */
+export interface McpEventSubscription {
+  id: string;
+  agent_id: string;
+  server: string;
+  event_types: string[];
+  mode: 'explore' | 'normal';
+  status: 'pending' | 'active' | 'failed' | 'terminated';
+  callback_url: string | null;
+  upstream: { name: string; upstream_id?: string | null; refresh_before?: string | null; last_error?: string | null }[];
+  created_at: string;
+  updated_at: string;
+  rotated_at: string | null;
+  last_delivery_at: string | null;
+  deliveries: number;
+}
+
 /** One third-party MCP tool with the effect class DuDuClaw derives (2026-10-08). */
 export interface McpToolEffect {
   name: string;
@@ -6828,6 +6845,20 @@ export const api = {
       client.call('mcp.remote_status', agentId ? { agent_id: agentId } : {}) as Promise<{
         servers: McpRemoteServerStatus[];
       }>,
+    /** Admin: MCP Events subscriptions (no secrets). */
+    eventsList: (agentId?: string) =>
+      client.call('mcp.events_list', agentId ? { agent_id: agentId } : {}) as Promise<{
+        subscriptions: McpEventSubscription[];
+        public_base_url_set: boolean;
+        public_base_url_problem: string | null;
+      }>,
+    /** Admin: subscribe a connected remote server's events. */
+    eventsSubscribe: (params: { agent_id: string; server: string; event_types: string[]; mode: 'explore' | 'normal' }) =>
+      client.call('mcp.events_subscribe', params) as Promise<{ subscription: McpEventSubscription }>,
+    eventsUnsubscribe: (id: string) =>
+      client.call('mcp.events_unsubscribe', { id }) as Promise<{ success: boolean; upstream_acknowledged: boolean }>,
+    eventsRotate: (id: string) =>
+      client.call('mcp.events_rotate', { id }) as Promise<{ subscription: McpEventSubscription }>,
     /** Admin: third-party tools last listed for an agent, with derived effect class. */
     toolEffects: (agentId: string) =>
       client.call('mcp.tool_effects', { agent_id: agentId }) as Promise<{ servers: McpServerToolEffects[] }>,

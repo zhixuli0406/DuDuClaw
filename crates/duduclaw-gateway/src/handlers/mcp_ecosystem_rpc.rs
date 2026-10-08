@@ -381,6 +381,73 @@ impl MethodHandler {
         }
     }
 
+    /// `mcp.events_subscribe { agent_id, server, event_types, mode? }` —
+    /// Admin only. Subscribes the employee's remote server's events to this
+    /// gateway's webhook. `mode`: `explore` (default, read-only runs) or
+    /// `normal` (an explicit operator opt-in).
+    pub(crate) async fn handle_mcp_events_subscribe(&self, params: Value) -> WsFrame {
+        let agent_id = str_param(&params, "agent_id").unwrap_or("").to_string();
+        let server = str_param(&params, "server").unwrap_or("").to_string();
+        let types: Vec<String> = match params.get("event_types").and_then(|v| v.as_array()) {
+            Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            None => return WsFrame::error_response("", "event_types must be an array of names"),
+        };
+        let mode = match str_param(&params, "mode").unwrap_or("explore") {
+            "explore" => crate::mcp_events::store::EventMode::Explore,
+            "normal" => crate::mcp_events::store::EventMode::Normal,
+            _ => return WsFrame::error_response("", "mode must be explore or normal"),
+        };
+        match crate::mcp_events::service::subscribe(&self.home_dir, &agent_id, &server, &types, mode).await {
+            Ok(v) => WsFrame::ok_response("", json!({ "subscription": v })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `mcp.events_list { agent_id? }` — Admin only. No secrets.
+    pub(crate) async fn handle_mcp_events_list(&self, params: Value) -> WsFrame {
+        let filter = str_param(&params, "agent_id").map(str::to_string);
+        if let Some(a) = &filter
+            && !is_valid_agent_id(a)
+        {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        let home = self.home_dir.clone();
+        let base_ok = crate::mcp_events::service::public_base_url(&home);
+        match tokio::task::spawn_blocking(move || crate::mcp_events::service::list(&home, filter.as_deref())).await {
+            Ok(Ok(list)) => WsFrame::ok_response(
+                "",
+                json!({
+                    "subscriptions": list,
+                    "public_base_url_set": base_ok.is_ok(),
+                    "public_base_url_problem": base_ok.err(),
+                }),
+            ),
+            Ok(Err(e)) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
+        }
+    }
+
+    /// `mcp.events_unsubscribe { id }` — Admin only. Local delete first (the
+    /// callback URL answers 404 at once), then `events/unsubscribe` upstream,
+    /// best effort.
+    pub(crate) async fn handle_mcp_events_unsubscribe(&self, params: Value) -> WsFrame {
+        let id = str_param(&params, "id").unwrap_or("").to_string();
+        match crate::mcp_events::service::unsubscribe(&self.home_dir, &id).await {
+            Ok(ack) => WsFrame::ok_response("", json!({ "success": true, "upstream_acknowledged": ack })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `mcp.events_rotate { id }` — Admin only. New signing secret; the old
+    /// one is accepted for 15 minutes.
+    pub(crate) async fn handle_mcp_events_rotate(&self, params: Value) -> WsFrame {
+        let id = str_param(&params, "id").unwrap_or("").to_string();
+        match crate::mcp_events::service::rotate(&self.home_dir, &id).await {
+            Ok(v) => WsFrame::ok_response("", json!({ "subscription": v })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     /// `mcp.remote_disconnect { agent_id, name, forget? }` — Admin only.
     /// Deletes the stored credentials (local only). `forget: true` also
     /// removes the record and the `.mcp.json` entry.

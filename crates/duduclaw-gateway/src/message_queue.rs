@@ -94,6 +94,11 @@ pub struct QueueMessage {
     /// dropped both halves; the receiving run records the upstream as
     /// unknown instead of treating the message as having no upstream.
     pub upstream_unknown: bool,
+    /// 2026-10-08: the lane the receiving run uses. `Some("explore")` makes
+    /// the dispatcher run it read-only (`DUDUCLAW_LANE=explore`, explore
+    /// built-in tools, third-party MCP servers through the gated proxy);
+    /// any other value is read as explore too. `None` = normal.
+    pub lane: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +109,7 @@ pub struct QueueMessage {
 /// `idx_mq_sender_status`, pinned by a query-plan test).
 const OPEN_TASK_MESSAGES_SQL: &str = "SELECT id, sender, target, payload, status, retry_count, \
      delegation_depth, origin_agent, sender_agent, error, response, created_at, acked_at, \
-     completed_at, reply_channel, turn_id, session_id, upstream_unknown \
+     completed_at, reply_channel, turn_id, session_id, upstream_unknown, lane \
      FROM message_queue \
      WHERE sender IN ('goal-loop-driver', 'heartbeat-scheduler') \
        AND status IN ('pending', 'acked', 'processing')";
@@ -191,6 +196,8 @@ impl MessageQueue {
             "upstream_unknown",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // 2026-10-08: read-only explore lane for event-woken runs.
+        Self::ensure_column(conn, "message_queue", "lane", "TEXT")?;
         Ok(())
     }
 
@@ -232,8 +239,8 @@ impl MessageQueue {
             "INSERT INTO message_queue \
              (id, sender, target, payload, status, retry_count, delegation_depth, \
               origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
-              upstream_unknown) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              upstream_unknown, lane) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 msg.id,
                 msg.sender,
@@ -249,6 +256,7 @@ impl MessageQueue {
                 msg.turn_id,
                 msg.session_id,
                 msg.upstream_unknown,
+                msg.lane,
             ],
         )
         .map_err(|e| format!("enqueue: {e}"))?;
@@ -326,7 +334,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id, upstream_unknown \
+                 reply_channel, turn_id, session_id, upstream_unknown, lane \
                  FROM message_queue WHERE status = 'pending' \
                  ORDER BY created_at ASC LIMIT ?1",
             )
@@ -354,7 +362,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id, upstream_unknown \
+                 reply_channel, turn_id, session_id, upstream_unknown, lane \
                  FROM message_queue WHERE status = 'acked' AND acked_at < ?1",
             )
             .map_err(|e| format!("prepare stale: {e}"))?;
@@ -379,7 +387,7 @@ impl MessageQueue {
         conn.query_row(
             "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
              origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-             reply_channel, turn_id, session_id, upstream_unknown \
+             reply_channel, turn_id, session_id, upstream_unknown, lane \
              FROM message_queue WHERE id = ?1",
             params![message_id],
             |row| Self::row_to_message(row),
@@ -447,6 +455,7 @@ impl MessageQueue {
             turn_id: row.get(15)?,
             session_id: row.get(16)?,
             upstream_unknown: row.get::<_, Option<bool>>(17)?.unwrap_or(false),
+            lane: row.get::<_, Option<String>>(18).ok().flatten(),
         })
     }
 
@@ -485,7 +494,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id, upstream_unknown \
+                 reply_channel, turn_id, session_id, upstream_unknown, lane \
                  FROM message_queue \
                  WHERE sender = 'goal-loop-driver' \
                    AND (id LIKE ?1 ESCAPE '\\' OR payload LIKE ?2 ESCAPE '\\') \
@@ -644,6 +653,7 @@ mod tests {
             turn_id: None,
             session_id: None,
             upstream_unknown: false,
+            lane: None,
         }
     }
 

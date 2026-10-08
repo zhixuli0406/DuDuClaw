@@ -23,6 +23,7 @@ import { AlertTriangle, Cloud, Loader2, RefreshCw, Unplug, Trash2, ExternalLink 
 import { AgentSelect, type AgentLite } from './AgentSelect';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { ToolEffectsPanel } from './ToolEffectsPanel';
+import { McpEventsPanel } from './McpEventsPanel';
 
 /** The dashboard origin the OAuth redirect comes back to (validated by the gateway). */
 export function dashboardOrigin(): string {
@@ -535,6 +536,8 @@ export function RemoteServersTab({ agents }: { agents: ReadonlyArray<AgentLite> 
           ))}
         </div>
       )}
+
+      <McpEventsPanel servers={rows} />
 
       <ToolEffectsPanel agents={agents} />
 

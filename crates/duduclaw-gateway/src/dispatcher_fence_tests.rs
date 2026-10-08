@@ -292,6 +292,7 @@ async fn queued_message_with_intent_still_intended_runs_exactly_once() {
         turn_id: None,
         session_id: None,
         upstream_unknown: false,
+        lane: None,
     };
     rig.queue.enqueue(&msg).await.unwrap();
     model_call_probe::set_dry_run(true);
@@ -343,6 +344,7 @@ fn plain_goal_message(id: &str, task_id: &str) -> QueueMessage {
         turn_id: None,
         session_id: None,
         upstream_unknown: false,
+        lane: None,
     }
 }
 
