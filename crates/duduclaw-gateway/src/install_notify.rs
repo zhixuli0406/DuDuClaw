@@ -244,7 +244,7 @@ pub async fn notify_requester(home_dir: &Path, db: &UserDb, req: &InstallRequest
 /// credentials live in home-dir config, not on a `ChannelTarget`) and falls
 /// through to `NullSender`, whose `send_text` always returns `Ok(())` — a
 /// message that was never sent would look identical to one that was.
-async fn send_plain_text(
+pub(crate) async fn send_plain_text(
     home_dir: &Path,
     http: &reqwest::Client,
     channel: &str,

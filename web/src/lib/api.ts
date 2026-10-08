@@ -5206,6 +5206,34 @@ export interface TaskStopStatus {
   };
 }
 
+/** P9: one finished item in the employee digest. */
+export interface DigestItem {
+  kind: 'task' | 'goal' | string;
+  id: string;
+  title: string;
+  completed_at: string | null;
+}
+
+export interface DigestAgent {
+  agent_id: string;
+  finished: DigestItem[];
+  finished_total: number;
+  activity_count: number;
+  pending_approvals: number;
+  runs_done: number;
+  runs_not_done: number;
+  spend_usd: number | null;
+}
+
+export interface EmployeeDigest {
+  date: string;
+  since: string;
+  generated_at: string;
+  agents: DigestAgent[];
+}
+
+export type DeliverableVerdict = 'up' | 'down' | 'changes';
+
 /** P5: a standing responsibility as the server stores it. */
 export interface ResponsibilityRow {
   responsibility_id: string;
@@ -5622,6 +5650,21 @@ export const api = {
    *  Manager-gated, same tier as the approval centre. `decide` does not send:
    *  it records the human decision, and the gateway's mail worker performs
    *  (or refuses) the transmission on its next pass. */
+  /** P9 — the per-employee "while you were away" digest and feedback on
+   *  finished work (Operator + task audience, checked server-side). */
+  digest: {
+    latest: () =>
+      client.call('digest.latest') as Promise<{
+        enabled: boolean;
+        digest: EmployeeDigest | null;
+        feedback: Record<string, DeliverableVerdict>;
+      }>,
+    feedback: (taskId: string, verdict: DeliverableVerdict, note?: string) =>
+      client.call('digest.feedback', { task_id: taskId, verdict, ...(note ? { note } : {}) }) as Promise<{
+        task_id: string;
+        verdict: DeliverableVerdict;
+      }>,
+  },
   /** P5 — standing responsibilities (P2-A backend). Every call is checked
    *  server-side against the caller's binding to the owner employee. */
   responsibilities: {

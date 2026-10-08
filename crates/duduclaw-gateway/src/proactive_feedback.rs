@@ -225,6 +225,8 @@ async fn probe_explicit_dismiss(
         .any(|v| {
             v.get("agent_id").and_then(|a| a.as_str()) == Some(agent_id)
                 && v.get("type").and_then(|t| t.as_str()) == Some("negative")
+                // P9: a 👎 on finished work is not a dismissed proactive message.
+                && v.get("source").and_then(|s| s.as_str()) != Some(crate::digest::FEEDBACK_SOURCE)
                 && v.get("timestamp")
                     .and_then(|t| t.as_str())
                     .and_then(|t| DateTime::parse_from_rfc3339(t).ok())

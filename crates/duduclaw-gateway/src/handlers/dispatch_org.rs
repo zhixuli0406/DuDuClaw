@@ -212,6 +212,10 @@ impl MethodHandler {
                 self.handle_google_integration_set(params).await
             }
 
+            // P9 employee digest + feedback on finished work (per-call ACL
+            // inside: Viewer to read, Operator + task audience to rate).
+            "digest.latest" | "digest.feedback" => self.handle_digest_rpc(method, params, ctx).await,
+
             // ── Task Board (agent-scoped — HS4 fix) ────
             "responsibilities.create"
             | "responsibilities.status"

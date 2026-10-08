@@ -7496,5 +7496,15 @@
   "approval.grant.effect": "動作類別",
   "approval.grant.args": "參數（機密已遮蔽）",
   "approval.grant.noArgs": "（無）",
-  "approval.grant.digest": "參數指紋："
+  "approval.grant.digest": "參數指紋：",
+  "home.digest.title": "你不在的時候（{date}）",
+  "home.digest.counts": "完成 {done} 項・{pending} 項等你決定・持續任務 {runs} 輪・{activity} 則動態",
+  "home.digest.up": "做得好",
+  "home.digest.down": "不理想",
+  "home.digest.changes": "需要修改",
+  "home.digest.verdict.up": "👍 已評",
+  "home.digest.verdict.down": "👎 已評",
+  "home.digest.verdict.changes": "已要求修改",
+  "home.digest.notePlaceholder": "哪裡要改？（可不填）",
+  "home.digest.sendChanges": "送出"
 }

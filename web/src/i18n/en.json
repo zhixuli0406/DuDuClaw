@@ -7496,5 +7496,15 @@
   "approval.grant.effect": "Kind of action",
   "approval.grant.args": "Arguments (secrets hidden)",
   "approval.grant.noArgs": "(none)",
-  "approval.grant.digest": "Argument fingerprint:"
+  "approval.grant.digest": "Argument fingerprint:",
+  "home.digest.title": "While you were away ({date})",
+  "home.digest.counts": "{done} finished · {pending} waiting on you · {runs} responsibility runs · {activity} updates",
+  "home.digest.up": "Good result",
+  "home.digest.down": "Not good",
+  "home.digest.changes": "Needs changes",
+  "home.digest.verdict.up": "👍 rated",
+  "home.digest.verdict.down": "👎 rated",
+  "home.digest.verdict.changes": "Changes asked",
+  "home.digest.notePlaceholder": "What should change? (optional)",
+  "home.digest.sendChanges": "Send"
 }

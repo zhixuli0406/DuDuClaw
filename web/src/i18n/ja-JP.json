@@ -7496,5 +7496,15 @@
   "approval.grant.effect": "動作の種類",
   "approval.grant.args": "引数（機密は伏せ字）",
   "approval.grant.noArgs": "（なし）",
-  "approval.grant.digest": "引数の指紋："
+  "approval.grant.digest": "引数の指紋：",
+  "home.digest.title": "不在の間に（{date}）",
+  "home.digest.counts": "完了 {done} 件・あなたの判断待ち {pending} 件・継続タスク {runs} 回・更新 {activity} 件",
+  "home.digest.up": "良い結果",
+  "home.digest.down": "良くない",
+  "home.digest.changes": "修正が必要",
+  "home.digest.verdict.up": "👍 評価済み",
+  "home.digest.verdict.down": "👎 評価済み",
+  "home.digest.verdict.changes": "修正を依頼済み",
+  "home.digest.notePlaceholder": "どこを直すべきですか？（任意）",
+  "home.digest.sendChanges": "送信"
 }
