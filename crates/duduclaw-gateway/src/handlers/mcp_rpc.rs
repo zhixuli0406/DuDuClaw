@@ -183,15 +183,34 @@ impl MethodHandler {
                         .is_some_and(|d| crate::remote_mcp::bridge_def::is_bridge_def(&d));
                     remove_server_from_config(&ad, &sn)?;
                     // Removing a remote server also deletes its stored
-                    // credentials (no orphaned tokens).
+                    // credentials (no orphaned tokens), then revokes them
+                    // at the provider (best effort, after the local delete).
+                    let target = if was_bridge {
+                        crate::remote_mcp::connect::revocation_target(&home, &aid, &sn)
+                    } else {
+                        None
+                    };
                     if was_bridge && let Err(e) = crate::remote_mcp::connect::disconnect(&home, &aid, &sn, true) {
                         warn!(agent = %aid, server = %sn, error = %e, "remote MCP credentials not removed");
                     }
-                    Ok::<(), String>(())
+                    Ok::<_, String>((target, home, aid, sn))
                 })
                 .await
                 {
-                    Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
+                    Ok(Ok((target, home, aid, sn))) => {
+                        if let Some(t) = target {
+                            tokio::spawn(async move {
+                                let outcome = crate::remote_mcp::connect::revoke_at_provider(t).await;
+                                crate::remote_mcp::audit(
+                                    &home,
+                                    crate::remote_mcp::AUDIT_TOKEN_REVOCATION,
+                                    &aid,
+                                    json!({ "agent_id": aid, "server": sn, "outcome": outcome }),
+                                );
+                            });
+                        }
+                        WsFrame::ok_response("", json!({ "success": true }))
+                    }
                     Ok(Err(e)) => WsFrame::error_response("", &e),
                     Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
                 }

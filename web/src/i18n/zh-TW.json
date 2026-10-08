@@ -7465,5 +7465,12 @@
   "mcp.events.deliveries": "已收到 {n} 個事件",
   "mcp.events.rotate": "更換簽章金鑰",
   "mcp.events.unsubscribe": "取消訂閱",
-  "mcp.events.unsubscribeConfirm": "停止接收 {server} 的事件？回呼位址會立即失效。"
+  "mcp.events.unsubscribeConfirm": "停止接收 {server} 的事件？回呼位址會立即失效。",
+  "mcp.remote.advanced": "額外標頭與伺服器串流（選用）",
+  "mcp.remote.headers": "額外標頭",
+  "mcp.remote.headersHelp": "每行一個「名稱: 值」，每次呼叫此伺服器都會帶上，並加密保存。留空則沿用已儲存的標頭。Authorization、Host、Content-Length、工作階段等傳輸用標頭不能在此設定。",
+  "mcp.remote.headersInvalid": "每行標頭須為「名稱: 值」的格式。",
+  "mcp.remote.serverStream": "接收伺服器主動傳來的訊息",
+  "mcp.remote.serverStreamHelp": "預設關閉。開啟後，員工的連線會另外保持一條串流，接收伺服器在兩次呼叫之間主動送出的通知，中斷後會接續。",
+  "mcp.remote.serverStreamOn": "伺服器串流"
 }

@@ -2435,6 +2435,10 @@ export interface McpRemoteServerStatus {
   installed: boolean;
   created_at: string;
   updated_at: string;
+  /** Server-initiated GET stream opted in (2026-10-08). */
+  server_stream?: boolean;
+  /** Names of operator-supplied headers; values are never returned. */
+  header_names?: string[];
 }
 
 /** An MCP Events subscription (2026-10-08). No secret is ever returned. */
@@ -6832,6 +6836,9 @@ export const api = {
       redirect_origin?: string;
       client_id?: string;
       client_secret?: string;
+      /** Extra request headers, stored encrypted; omitted = keep the stored ones. */
+      headers?: Record<string, string>;
+      server_stream?: boolean;
     }) => client.call('mcp.remote_connect', params) as Promise<McpRemoteConnectResult>,
     /** Admin: finish a `completion: "paste"` sign-in with the URL from the browser's address bar. */
     remoteComplete: (callbackUrl: string) =>

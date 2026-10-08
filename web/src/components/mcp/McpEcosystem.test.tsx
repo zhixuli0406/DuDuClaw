@@ -248,3 +248,12 @@ describe('McpEventsPanel', () => {
     );
   });
 });
+
+describe('parseHeaderLines', () => {
+  it('parses Name: value lines and refuses lines without a colon', async () => {
+    const { parseHeaderLines } = await import('./RemoteServersTab');
+    expect(parseHeaderLines('X-Workspace: acme\n\nX-Team:  t1 ')).toEqual({ 'X-Workspace': 'acme', 'X-Team': 't1' });
+    expect(parseHeaderLines('nocolon')).toBeNull();
+    expect(parseHeaderLines(': empty name')).toBeNull();
+  });
+});

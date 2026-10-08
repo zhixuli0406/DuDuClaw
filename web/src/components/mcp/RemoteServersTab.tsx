@@ -10,6 +10,7 @@ import {
   Input,
   Segmented,
   Empty,
+  Switch,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -28,6 +29,22 @@ import { McpEventsPanel } from './McpEventsPanel';
 /** The dashboard origin the OAuth redirect comes back to (validated by the gateway). */
 export function dashboardOrigin(): string {
   return typeof window === 'undefined' ? '' : window.location.origin;
+}
+
+/**
+ * Parse the "extra headers" box: one `Name: value` per line, blank lines
+ * ignored. Returns `null` when a line has no colon (the gateway validates
+ * names and values again).
+ */
+export function parseHeaderLines(raw: string): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    const i = line.indexOf(':');
+    if (i <= 0) return null;
+    out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return out;
 }
 
 /** Same rule as the gateway's `sanitize_mcp_name`. */
@@ -84,6 +101,9 @@ export function RemoteConnectDialog({
   const [bearer, setBearer] = useState('');
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
+  // Empty = keep the headers already stored for this server.
+  const [headerText, setHeaderText] = useState('');
+  const [serverStream, setServerStream] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
@@ -108,6 +128,8 @@ export function RemoteConnectDialog({
     setBearer('');
     setClientId('');
     setClientSecret('');
+    setHeaderText('');
+    setServerStream(false);
     setError(null);
     setAuthorizeUrl(null);
     setPasteRedirect(null);
@@ -157,8 +179,16 @@ export function RemoteConnectDialog({
     setBusy(true);
     setError(null);
     const startedAt = Date.now();
+    const headers = headerText.trim() === '' ? null : parseHeaderLines(headerText);
+    if (headerText.trim() !== '' && headers === null) {
+      setError(intl.formatMessage({ id: 'mcp.remote.headersInvalid' }));
+      setBusy(false);
+      return;
+    }
     try {
       const res = await api.mcp.remoteConnect({
+        ...(headers ? { headers } : {}),
+        server_stream: serverStream,
         agent_id: agentId,
         name,
         ...(url.trim() ? { url: url.trim() } : {}),
@@ -170,6 +200,7 @@ export function RemoteConnectDialog({
       });
       setBearer('');
       setClientSecret('');
+      setHeaderText('');
       if (res.status === 'connected') {
         toast.success(intl.formatMessage({ id: 'mcp.remote.connected' }, { server: name }));
         onConnected?.(agentId, name);
@@ -380,6 +411,32 @@ export function RemoteConnectDialog({
                 </div>
               </details>
             )}
+            <details className="text-xs">
+              <summary className="cursor-pointer text-muted-foreground">
+                {intl.formatMessage({ id: 'mcp.remote.advanced' })}
+              </summary>
+              <div className="mt-2 space-y-2">
+                <p className="text-muted-foreground">{intl.formatMessage({ id: 'mcp.remote.headersHelp' })}</p>
+                <textarea
+                  className="min-h-16 w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground"
+                  aria-label={intl.formatMessage({ id: 'mcp.remote.headers' })}
+                  placeholder="X-Workspace: acme"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={headerText}
+                  onChange={(e) => setHeaderText(e.target.value)}
+                />
+                <label className="flex items-center gap-2 text-muted-foreground">
+                  <Switch
+                    checked={serverStream}
+                    onCheckedChange={(v) => setServerStream(Boolean(v))}
+                    aria-label={intl.formatMessage({ id: 'mcp.remote.serverStream' })}
+                  />
+                  {intl.formatMessage({ id: 'mcp.remote.serverStream' })}
+                </label>
+                <p className="text-muted-foreground">{intl.formatMessage({ id: 'mcp.remote.serverStreamHelp' })}</p>
+              </div>
+            </details>
           </div>
         )}
 
@@ -500,9 +557,13 @@ export function RemoteServersTab({ agents }: { agents: ReadonlyArray<AgentLite> 
                   {!row.installed && (
                     <Badge variant="secondary">{intl.formatMessage({ id: 'mcp.remote.notInstalled' })}</Badge>
                   )}
+                  {row.server_stream && (
+                    <Badge variant="secondary">{intl.formatMessage({ id: 'mcp.remote.serverStreamOn' })}</Badge>
+                  )}
                 </div>
                 <p className="truncate text-xs text-muted-foreground">
                   {agentLabel(row.agent_id)} · {row.host}
+                  {row.header_names && row.header_names.length > 0 ? ` · ${row.header_names.join(', ')}` : ''}
                 </p>
               </div>
               <div className="flex shrink-0 gap-1.5">

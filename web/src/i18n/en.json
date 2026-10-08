@@ -7465,5 +7465,12 @@
   "mcp.events.deliveries": "{n, plural, one {# event} other {# events}} received",
   "mcp.events.rotate": "Replace signing secret",
   "mcp.events.unsubscribe": "Unsubscribe",
-  "mcp.events.unsubscribeConfirm": "Stop receiving events from {server}? The callback address stops working at once."
+  "mcp.events.unsubscribeConfirm": "Stop receiving events from {server}? The callback address stops working at once.",
+  "mcp.remote.advanced": "Extra headers and server stream (optional)",
+  "mcp.remote.headers": "Extra headers",
+  "mcp.remote.headersHelp": "One \"Name: value\" per line, sent on every request to this server and stored encrypted. Leave empty to keep the ones already saved. Authorization, Host, Content-Length, session and other transport headers cannot be set here.",
+  "mcp.remote.headersInvalid": "Each header line must look like \"Name: value\".",
+  "mcp.remote.serverStream": "Listen for messages the server sends on its own",
+  "mcp.remote.serverStreamHelp": "Off by default. When on, the employee's connection also keeps a stream open for notifications the server sends between requests, and resumes it after a drop.",
+  "mcp.remote.serverStreamOn": "Server stream"
 }

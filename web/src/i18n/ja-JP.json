@@ -7465,5 +7465,12 @@
   "mcp.events.deliveries": "{n} 件のイベントを受信",
   "mcp.events.rotate": "署名用シークレットを交換",
   "mcp.events.unsubscribe": "購読を解除",
-  "mcp.events.unsubscribeConfirm": "{server} からのイベント受信を停止しますか？コールバックアドレスはすぐに無効になります。"
+  "mcp.events.unsubscribeConfirm": "{server} からのイベント受信を停止しますか？コールバックアドレスはすぐに無効になります。",
+  "mcp.remote.advanced": "追加ヘッダーとサーバーストリーム（任意）",
+  "mcp.remote.headers": "追加ヘッダー",
+  "mcp.remote.headersHelp": "1 行に 1 つ「名前: 値」。このサーバーへの毎回のリクエストに付けられ、暗号化して保存されます。空のままなら保存済みのものを使います。Authorization、Host、Content-Length、セッションなど通信用のヘッダーはここでは設定できません。",
+  "mcp.remote.headersInvalid": "各行は「名前: 値」の形式にしてください。",
+  "mcp.remote.serverStream": "サーバーから自発的に届くメッセージを受け取る",
+  "mcp.remote.serverStreamHelp": "既定ではオフ。オンにすると、従業員の接続はリクエストの合間にサーバーが送る通知用のストリームも開いたままにし、切れたら続きから再開します。",
+  "mcp.remote.serverStreamOn": "サーバーストリーム"
 }

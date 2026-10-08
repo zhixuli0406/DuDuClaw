@@ -124,6 +124,8 @@ async fn subscribe_verify_deliver_rotate_unsubscribe() {
             client_id: None,
             client_secret: None,
             allowed_origins: vec![],
+            headers: None,
+            server_stream: None,
         },
     )
     .await
@@ -223,6 +225,8 @@ async fn servers_without_events_are_refused_and_terminated_subscriptions_answer_
             client_id: None,
             client_secret: None,
             allowed_origins: vec![],
+            headers: None,
+            server_stream: None,
         },
     )
     .await

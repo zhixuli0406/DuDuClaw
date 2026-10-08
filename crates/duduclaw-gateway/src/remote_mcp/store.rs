@@ -87,6 +87,13 @@ pub struct RemoteServerRecord {
     pub access_expires_at: Option<i64>,
     #[serde(default)]
     pub has_refresh_token: bool,
+    /// Open the optional server-initiated `GET` stream after `initialize`
+    /// (2026-10-08; default off, operator opt-in per server).
+    #[serde(default)]
+    pub server_stream: bool,
+    /// Names of the operator-supplied headers (values are in the secrets).
+    #[serde(default)]
+    pub header_names: Vec<String>,
     /// [`RemoteSecrets`] as JSON, encrypted. See the module doc.
     pub secret_enc: String,
 }
@@ -99,6 +106,67 @@ pub struct RemoteSecrets {
     pub bearer: Option<String>,
     #[serde(default)]
     pub oauth: Option<OAuthSecrets>,
+    /// Operator-supplied request headers (2026-10-08), sent on every request
+    /// to the server. Never in `.mcp.json`, argv or env. Validated by
+    /// [`validate_custom_headers`].
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+}
+
+/// Header names DuDuClaw sets itself (transport, session, auth) or that
+/// change how the connection behaves; an operator cannot supply them.
+pub const RESERVED_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "host",
+    "content-length",
+    "content-type",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "expect",
+    "accept",
+    "accept-encoding",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "last-event-id",
+    "cookie",
+];
+/// Most custom headers per server.
+pub const MAX_CUSTOM_HEADERS: usize = 16;
+
+/// Check operator-supplied headers: RFC 9110 token names, no reserved name,
+/// no duplicates (case-insensitive), values ≤ 4096 bytes of visible ASCII,
+/// space or tab (so no CR, LF or NUL). Returns them trimmed.
+pub fn validate_custom_headers(raw: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+    if raw.len() > MAX_CUSTOM_HEADERS {
+        return Err(format!("at most {MAX_CUSTOM_HEADERS} custom headers"));
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in raw {
+        let name = k.trim();
+        let tchar = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+        if name.is_empty() || name.len() > 128 || !name.chars().all(tchar) {
+            return Err(format!("header name '{}' is not valid", duduclaw_core::truncate_chars(name, 40)));
+        }
+        let lower = name.to_ascii_lowercase();
+        if RESERVED_HEADERS.contains(&lower.as_str()) || lower.starts_with("sec-") || lower.starts_with("proxy-") {
+            return Err(format!("header '{name}' is set by DuDuClaw itself and cannot be supplied"));
+        }
+        let value = v.trim();
+        if value.len() > 4096 || value.chars().any(|c| !(c == ' ' || c == '\t' || c.is_ascii_graphic())) {
+            return Err(format!("the value of header '{name}' is too long or contains control or non-ASCII characters"));
+        }
+        if out.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            return Err(format!("header '{name}' is given twice"));
+        }
+        out.push((name.to_string(), value.to_string()));
+    }
+    Ok(out)
 }
 
 impl std::fmt::Debug for RemoteSecrets {
@@ -107,6 +175,7 @@ impl std::fmt::Debug for RemoteSecrets {
             .field("url", &"«redacted»")
             .field("bearer", &self.bearer.as_ref().map(|_| "«set»"))
             .field("oauth", &self.oauth.as_ref().map(|_| "«set»"))
+            .field("headers", &self.headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
             .finish()
     }
 }
@@ -131,6 +200,10 @@ pub struct OAuthSecrets {
     /// Unix seconds.
     #[serde(default)]
     pub expires_at: Option<i64>,
+    /// RFC 7009 revocation endpoint from the authorization server metadata
+    /// (2026-10-08), used best effort on disconnect.
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -319,6 +392,7 @@ mod tests {
 
     fn record(home: &Path, agent: &str, server: &str, token: &str) -> RemoteServerRecord {
         let secrets = RemoteSecrets {
+            headers: vec![],
             url: "https://mcp.example.com/api/s/KEY123/mcp".into(),
             bearer: Some(token.into()),
             oauth: None,
@@ -333,8 +407,26 @@ mod tests {
             updated_at: now_rfc3339(),
             access_expires_at: None,
             has_refresh_token: false,
+            server_stream: false,
+            header_names: vec![],
             secret_enc: seal(home, &secrets).unwrap(),
         }
+    }
+
+    #[test]
+    fn custom_headers_are_validated() {
+        let h = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        assert_eq!(validate_custom_headers(&h(" X-Workspace ", " acme ")).unwrap(), h("X-Workspace", "acme"));
+        for bad in ["Authorization", "host", "Content-Length", "Mcp-Session-Id", "mcp-protocol-version", "Proxy-X", "Sec-Fetch", "Last-Event-ID", "a b", "", "x:y"] {
+            assert!(validate_custom_headers(&h(bad, "v")).is_err(), "{bad}");
+        }
+        for bad in ["a\r\nb", "a\nb", "a\0b", "café"] {
+            assert!(validate_custom_headers(&h("X-A", bad)).is_err(), "{bad:?}");
+        }
+        let dup = vec![("X-A".to_string(), "1".to_string()), ("x-a".to_string(), "2".to_string())];
+        assert!(validate_custom_headers(&dup).is_err());
+        let many: Vec<_> = (0..17).map(|i| (format!("X-{i}"), "v".to_string())).collect();
+        assert!(validate_custom_headers(&many).is_err());
     }
 
     #[test]

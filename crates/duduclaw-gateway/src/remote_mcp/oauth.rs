@@ -164,6 +164,9 @@ pub struct AuthServerMetadata {
     pub token_endpoint: Url,
     pub registration_endpoint: Option<Url>,
     pub token_endpoint_auth_methods: Vec<String>,
+    /// RFC 7009 revocation endpoint, when advertised (screened like the
+    /// other endpoints).
+    pub revocation_endpoint: Option<Url>,
 }
 
 /// The result of discovery for one MCP URL.
@@ -220,7 +223,11 @@ pub fn parse_as_metadata(
     let token_endpoint = endpoint(doc, "token_endpoint", policy)?
         .ok_or_else(|| "authorization server metadata has no token_endpoint".to_string())?;
     let registration_endpoint = endpoint(doc, "registration_endpoint", policy)?;
+    // A revocation endpoint that fails the screen is dropped, not fatal:
+    // revocation is best effort and never needed to sign in.
+    let revocation_endpoint = endpoint(doc, "revocation_endpoint", policy).ok().flatten();
     Ok(AuthServerMetadata {
+        revocation_endpoint,
         issuer: declared.to_string(),
         authorization_endpoint,
         token_endpoint,
@@ -555,6 +562,30 @@ impl std::fmt::Display for TokenError {
             Self::InvalidGrant(s) | Self::Other(s) => f.write_str(s),
         }
     }
+}
+
+/// RFC 7009 token revocation, best effort. Client authentication follows
+/// the token endpoint's method. Returns the HTTP status (200 = revoked or
+/// already invalid, per RFC 7009 §2.2).
+pub async fn revoke_token(
+    endpoint: &Url,
+    policy: OutboundPolicy,
+    creds: &ClientCredentials,
+    token: &str,
+    token_type_hint: &str,
+) -> Result<u16, String> {
+    let mut form: Vec<(&str, String)> = vec![("token", token.to_string()), ("token_type_hint", token_type_hint.to_string())];
+    let mut basic: Option<(&str, &str)> = None;
+    match (creds.token_endpoint_auth.as_str(), creds.client_secret.as_deref()) {
+        ("client_secret_basic", Some(secret)) => basic = Some((creds.client_id.as_str(), secret)),
+        ("client_secret_post", Some(secret)) => {
+            form.push(("client_id", creds.client_id.clone()));
+            form.push(("client_secret", secret.to_string()));
+        }
+        _ => form.push(("client_id", creds.client_id.clone())),
+    }
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    super::http::post_form(endpoint, policy, &pairs, basic).await.map(|(status, _)| status)
 }
 
 async fn token_request(

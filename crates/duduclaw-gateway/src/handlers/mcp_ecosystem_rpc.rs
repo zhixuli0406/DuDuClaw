@@ -248,6 +248,26 @@ impl MethodHandler {
             client_id: str_param(&params, "client_id").map(str::to_string),
             client_secret: params.get("client_secret").and_then(|v| v.as_str()).map(str::to_string),
             allowed_origins: crate::server::allowed_origins_snapshot(),
+            headers: match params.get("headers") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(m)) => {
+                    let mut out = Vec::new();
+                    for (k, v) in m {
+                        let Some(v) = v.as_str() else {
+                            return WsFrame::error_response("", "header values must be strings");
+                        };
+                        out.push((k.clone(), v.to_string()));
+                    }
+                    // Validated here so a bad header is refused before any
+                    // network call.
+                    if let Err(e) = store::validate_custom_headers(&out) {
+                        return WsFrame::error_response("", &e);
+                    }
+                    Some(out)
+                }
+                Some(_) => return WsFrame::error_response("", "headers must be an object of name: value"),
+            },
+            server_stream: params.get("server_stream").and_then(|v| v.as_bool()),
         };
         let host = req
             .url
@@ -459,7 +479,9 @@ impl MethodHandler {
         }
         let forget = params.get("forget").and_then(|v| v.as_bool()).unwrap_or(false);
         let (home, a, s) = (self.home_dir.clone(), agent_id.clone(), server.clone());
-        let res = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let res = tokio::task::spawn_blocking(move || -> Result<(bool, Option<connect::RevocationTarget>), String> {
+            // Read what to revoke before the local delete removes it.
+            let target = connect::revocation_target(&home, &a, &s);
             let existed = connect::disconnect(&home, &a, &s, forget)?;
             if forget {
                 let agent_dir = home.join("agents").join(&a);
@@ -471,11 +493,25 @@ impl MethodHandler {
                     duduclaw_agent::mcp_template::remove_server_from_config(&agent_dir, &s)?;
                 }
             }
-            Ok(existed)
+            Ok((existed, target))
         })
         .await;
         match res {
-            Ok(Ok(existed)) => {
+            Ok(Ok((existed, target))) => {
+                // RFC 7009 revocation at the provider, after the local delete
+                // and off the request path: best effort, audited.
+                if let Some(t) = target {
+                    let (home, a, s) = (self.home_dir.clone(), agent_id.clone(), server.clone());
+                    tokio::spawn(async move {
+                        let outcome = connect::revoke_at_provider(t).await;
+                        remote_mcp::audit(
+                            &home,
+                            remote_mcp::AUDIT_TOKEN_REVOCATION,
+                            &a,
+                            json!({ "agent_id": a, "server": s, "outcome": outcome }),
+                        );
+                    });
+                }
                 remote_mcp::audit(
                     &self.home_dir,
                     remote_mcp::AUDIT_DISCONNECTED,

@@ -31,6 +31,8 @@ pub const AUDIT_CONNECT_STARTED: &str = "remote_mcp_connect_started";
 pub const AUDIT_CONNECTED: &str = "remote_mcp_connected";
 pub const AUDIT_CONNECT_FAILED: &str = "remote_mcp_connect_failed";
 pub const AUDIT_DISCONNECTED: &str = "remote_mcp_disconnected";
+/// Outcome of the RFC 7009 revocation sent after a disconnect.
+pub const AUDIT_TOKEN_REVOCATION: &str = "remote_mcp_token_revocation";
 
 /// Write one audit row (agent id, server, host; never URL paths or tokens).
 pub fn audit(home: &std::path::Path, event: &str, agent_id: &str, details: serde_json::Value) {
