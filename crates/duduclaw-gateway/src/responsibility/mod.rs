@@ -45,7 +45,13 @@ pub const DEFAULT_EVENT_POLL_BATCH: i64 = 500;
 /// M-4: `activity.new` is not offered — every activity row is written by the
 /// employee it is about, so it could only ever be the owner's own event and
 /// never wake anything.
-pub const EVENT_WHITELIST: [&str; 2] = ["task.created", "task.updated"];
+///
+/// `mcp.event` (2026-10-08) is written by the gateway's MCP Events receiver
+/// (`crate::mcp_events`) with `agent_id` = the subscription's employee. Only
+/// deliveries of a subscription the operator opted into `normal` mode wake a
+/// responsibility (an occurrence runs as an ordinary goal task); events of an
+/// explore-lane subscription are recorded as `dropped(explore_lane)`.
+pub const EVENT_WHITELIST: [&str; 3] = ["task.created", "task.updated", "mcp.event"];
 /// Error text prefix the dispatcher writes when it refuses a stale durable
 /// `goal:` round. The driver frees the slot without counting a failure.
 pub const FENCE_ERROR_PREFIX: &str = "stale_dispatch_fenced";

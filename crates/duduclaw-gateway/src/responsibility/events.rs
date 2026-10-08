@@ -131,13 +131,23 @@ fn fire_for(
         .iter()
         .any(|id| own_tasks.contains(id))
         || event_actor(&row.event, payload) == Some(owner);
+    // An external event wakes a responsibility only from a subscription the
+    // operator opted into normal mode (occurrences are not run read-only).
+    let explore_only = row.event == "mcp.event"
+        && payload.get("lane").and_then(Value::as_str) != Some("normal");
     Some(NewFire {
         wakeup_id: wakeup.wakeup_id.clone(),
         fire_key: format!("e:{}", row.id),
         reason: "event".into(),
         data_json: Some(data),
         guard_flags_json: Some(flags),
-        dropped: is_self.then(|| "self_event".to_string()),
+        dropped: if is_self {
+            Some("self_event".to_string())
+        } else if explore_only {
+            Some("explore_lane".to_string())
+        } else {
+            None
+        },
     })
 }
 
@@ -235,7 +245,7 @@ pub async fn event_pass(
             let Some(fire) = fire_for(row, &payload, w, owner, mine) else {
                 continue;
             };
-            if fire.dropped.is_some() {
+            if fire.dropped.as_deref() == Some("self_event") {
                 report.self_events += 1;
             }
             if store.record_fire(&fire, None, now).await? {
@@ -282,6 +292,28 @@ mod tests {
             ts: "2026-10-05T00:00:00Z".into(),
             source: None,
         }
+    }
+
+    #[test]
+    fn mcp_events_wake_only_from_normal_mode_subscriptions() {
+        let none = HashSet::new();
+        let mut w = sub(None);
+        w.event_name = Some("mcp.event".into());
+        let row = |lane: &str| EventRow {
+            id: 9,
+            event: "mcp.event".into(),
+            payload: serde_json::json!({"agent_id": "alice", "lane": lane, "data": {}}).to_string(),
+            ts: "2026-10-08T00:00:00Z".into(),
+            source: None,
+        };
+        let r = row("explore");
+        let p: serde_json::Map<String, Value> = serde_json::from_str(&r.payload).unwrap();
+        let f = fire_for(&r, &p, &w, "alice", &none).unwrap();
+        assert_eq!(f.dropped.as_deref(), Some("explore_lane"));
+        let r = row("normal");
+        let p: serde_json::Map<String, Value> = serde_json::from_str(&r.payload).unwrap();
+        assert!(fire_for(&r, &p, &w, "alice", &none).unwrap().dropped.is_none());
+        assert!(fire_for(&r, &p, &w, "bob", &none).is_none());
     }
 
     #[test]

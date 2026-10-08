@@ -37,6 +37,9 @@ struct PendingConnect {
     creds: ClientCredentials,
     resource: String,
     scope: Option<String>,
+    revocation_endpoint: Option<Url>,
+    headers: Vec<(String, String)>,
+    server_stream: bool,
     created: Instant,
 }
 
@@ -263,6 +266,12 @@ pub struct ConnectRequest {
     pub client_secret: Option<String>,
     /// The gateway's allowed dashboard origins.
     pub allowed_origins: Vec<String>,
+    /// Operator-supplied headers (2026-10-08). `None` keeps the ones stored
+    /// for (agent, server); `Some` replaces them (`Some(vec![])` clears).
+    pub headers: Option<Vec<(String, String)>>,
+    /// Open the server-initiated `GET` stream (default off). `None` keeps
+    /// the stored choice.
+    pub server_stream: Option<bool>,
 }
 
 /// Result of [`start_connect`].
@@ -287,6 +296,23 @@ fn resolve_url(home: &Path, req: &ConnectRequest) -> Result<Url, String> {
     }
 }
 
+/// The headers and stream choice a request ends up with: what it says, or
+/// what is stored for (agent, server).
+fn effective_options(home: &Path, req: &ConnectRequest) -> Result<(Vec<(String, String)>, bool), String> {
+    let existing = store::get(home, &req.agent_id, &req.server)?;
+    let headers = match &req.headers {
+        Some(h) => store::validate_custom_headers(h)?,
+        None => match &existing {
+            Some(r) => store::open(home, r).map(|s| s.headers).unwrap_or_default(),
+            None => Vec::new(),
+        },
+    };
+    let stream = req
+        .server_stream
+        .unwrap_or_else(|| existing.as_ref().is_some_and(|r| r.server_stream));
+    Ok((headers, stream))
+}
+
 fn save_connected(
     home: &Path,
     agent_id: &str,
@@ -294,11 +320,13 @@ fn save_connected(
     url: &Url,
     auth: AuthKind,
     secrets: RemoteSecrets,
+    server_stream: bool,
 ) -> Result<(), String> {
     let now = store::now_rfc3339();
     let created_at = store::get(home, agent_id, server)?
         .map(|r| r.created_at)
         .unwrap_or_else(|| now.clone());
+    let header_names = secrets.headers.iter().map(|(k, _)| k.clone()).collect();
     let (expires, has_refresh) = match &secrets.oauth {
         Some(o) => (o.expires_at, o.refresh_token.is_some()),
         None => (None, false),
@@ -315,6 +343,8 @@ fn save_connected(
             updated_at: now,
             access_expires_at: expires,
             has_refresh_token: has_refresh,
+            server_stream,
+            header_names,
             secret_enc: store::seal(home, &secrets)?,
         },
     )
@@ -326,6 +356,7 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
     store::validate_ids(&req.agent_id, &req.server)?;
     let url = resolve_url(home, &req)?;
     let policy = OutboundPolicy::for_mcp_url(&url);
+    let (headers, server_stream) = effective_options(home, &req)?;
     match req.auth {
         AuthKind::None | AuthKind::Bearer => {
             let bearer = match req.auth {
@@ -348,14 +379,15 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 }
                 _ => None,
             };
-            probe_static(&url, policy, bearer.as_deref()).await?;
+            probe_static(&url, policy, bearer.as_deref(), &headers).await?;
             save_connected(
                 home,
                 &req.agent_id,
                 &req.server,
                 &url,
                 req.auth,
-                RemoteSecrets { url: url.to_string(), bearer, oauth: None },
+                RemoteSecrets { url: url.to_string(), bearer, oauth: None, headers },
+                server_stream,
             )?;
             Ok(ConnectOutcome::Connected)
         }
@@ -411,9 +443,16 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                         updated_at: now,
                         access_expires_at: None,
                         has_refresh_token: false,
+                        server_stream,
+                        header_names: headers.iter().map(|(k, _)| k.clone()).collect(),
                         secret_enc: store::seal(
                             home,
-                            &RemoteSecrets { url: url.to_string(), bearer: None, oauth: None },
+                            &RemoteSecrets {
+                                url: url.to_string(),
+                                bearer: None,
+                                oauth: None,
+                                headers: headers.clone(),
+                            },
                         )?,
                     },
                 )?;
@@ -431,6 +470,9 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 creds,
                 resource: disc.resource,
                 scope: disc.scope,
+                revocation_endpoint: disc.metadata.revocation_endpoint.clone(),
+                headers,
+                server_stream,
                 created: Instant::now(),
             };
             {
@@ -445,12 +487,20 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
 }
 
 /// Probe a server with `initialize` using a static credential (or none).
-async fn probe_static(url: &Url, policy: OutboundPolicy, bearer: Option<&str>) -> Result<(), String> {
+async fn probe_static(
+    url: &Url,
+    policy: OutboundPolicy,
+    bearer: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<(), String> {
     let client = super::url_policy::pinned_client(url, policy, super::http::REQUEST_TIMEOUT).await?;
     let mut req = client
         .post(url.clone())
         .header("Accept", "application/json, text/event-stream")
         .json(&oauth::initialize_probe_frame());
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
     if let Some(b) = bearer {
         req = req.bearer_auth(b);
     }
@@ -467,6 +517,9 @@ async fn probe_static(url: &Url, policy: OutboundPolicy, bearer: Option<&str>) -
     // Close the probe session politely; failures are irrelevant.
     if let Some(sid) = session {
         let mut del = client.delete(url.clone()).header("Mcp-Session-Id", sid);
+        for (k, v) in headers {
+            del = del.header(k.as_str(), v.as_str());
+        }
         if let Some(b) = bearer {
             del = del.bearer_auth(b);
         }
@@ -570,6 +623,7 @@ async fn complete_inner(
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_at: tokens.expires_at,
+        revocation_endpoint: p.revocation_endpoint.as_ref().map(|u| u.to_string()),
     };
     save_connected(
         home,
@@ -577,15 +631,18 @@ async fn complete_inner(
         &p.server,
         &url,
         AuthKind::Oauth,
-        RemoteSecrets { url: url.to_string(), bearer: None, oauth: Some(oauth_secrets) },
+        RemoteSecrets { url: url.to_string(), bearer: None, oauth: Some(oauth_secrets), headers: p.headers.clone() },
+        p.server_stream,
     )?;
     Ok(Completed { agent_id: p.agent_id, server: p.server, redirect_origin: p.redirect_origin })
 }
 
 /// Forget the credentials of a connection. `forget = false` keeps the record
 /// (URL) as `not_connected` so it can be connected again; `forget = true`
-/// removes it. Returns whether a record existed. Local only: no revocation
-/// request is sent to the authorization server.
+/// removes it. Returns whether a record existed. Local only; the caller
+/// revokes at the provider afterwards ([`revocation_target`] read before,
+/// [`revoke_at_provider`] after), so a slow or failing provider never blocks
+/// the local delete.
 pub fn disconnect(home: &Path, agent_id: &str, server: &str, forget: bool) -> Result<bool, String> {
     store::validate_ids(agent_id, server)?;
     if forget {
@@ -594,12 +651,13 @@ pub fn disconnect(home: &Path, agent_id: &str, server: &str, forget: bool) -> Re
     let Some(rec) = store::get(home, agent_id, server)? else {
         return Ok(false);
     };
-    // Keep only the URL; a record whose secrets cannot be opened is removed.
-    let url = match store::open(home, &rec) {
-        Ok(s) => s.url,
+    // Keep only the URL and the operator's headers; a record whose secrets
+    // cannot be opened is removed.
+    let (url, headers) = match store::open(home, &rec) {
+        Ok(s) => (s.url, s.headers),
         Err(_) => return store::remove(home, agent_id, server),
     };
-    let sealed = store::seal(home, &RemoteSecrets { url, bearer: None, oauth: None })?;
+    let sealed = store::seal(home, &RemoteSecrets { url, bearer: None, oauth: None, headers })?;
     store::update(home, agent_id, server, move |r| {
         r.status = ConnStatus::NotConnected;
         r.access_expires_at = None;
@@ -607,6 +665,57 @@ pub fn disconnect(home: &Path, agent_id: &str, server: &str, forget: bool) -> Re
         r.secret_enc = sealed;
         Ok(true)
     })
+}
+
+/// What to revoke at the provider for (agent, server): its OAuth
+/// revocation endpoint, client credentials and the token to revoke (refresh
+/// token if any, else access token). `None` for bearer / none records or
+/// when the server advertised no endpoint.
+pub struct RevocationTarget {
+    pub endpoint: Url,
+    pub creds: ClientCredentials,
+    pub token: String,
+    pub hint: &'static str,
+    pub policy: OutboundPolicy,
+}
+
+pub fn revocation_target(home: &Path, agent_id: &str, server: &str) -> Option<RevocationTarget> {
+    let rec = store::get(home, agent_id, server).ok()??;
+    let secrets = store::open(home, &rec).ok()?;
+    let o = secrets.oauth?;
+    let endpoint = Url::parse(o.revocation_endpoint.as_deref()?).ok()?;
+    let mcp_url = Url::parse(&secrets.url).ok()?;
+    let (token, hint) = match o.refresh_token {
+        Some(r) if !r.is_empty() => (r, "refresh_token"),
+        _ => (o.access_token, "access_token"),
+    };
+    Some(RevocationTarget {
+        endpoint,
+        creds: ClientCredentials {
+            client_id: o.client_id,
+            client_secret: o.client_secret,
+            token_endpoint_auth: o.token_endpoint_auth,
+        },
+        token,
+        hint,
+        policy: OutboundPolicy::for_mcp_url(&mcp_url),
+    })
+}
+
+/// RFC 7009 revocation at the provider, best effort (10 s). Returns an
+/// outcome token for the audit row: `revoked`, `http_<status>`, `failed`,
+/// `timeout`.
+pub async fn revoke_at_provider(target: RevocationTarget) -> &'static str {
+    let fut = oauth::revoke_token(&target.endpoint, target.policy, &target.creds, &target.token, target.hint);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+        Ok(Ok(200)) => "revoked",
+        Ok(Ok(400)) => "http_400",
+        Ok(Ok(401)) => "http_401",
+        Ok(Ok(503)) => "http_503",
+        Ok(Ok(_)) => "http_other",
+        Ok(Err(_)) => "failed",
+        Err(_) => "timeout",
+    }
 }
 
 /// Non-secret view of every record (optionally one employee's).
@@ -629,6 +738,8 @@ pub fn status_list(home: &Path, agent_filter: Option<&str>) -> Result<Vec<Value>
                 "access_expires_at": r.access_expires_at,
                 "access_token_expired": r.access_expires_at.is_some_and(|e| e <= now),
                 "has_refresh_token": r.has_refresh_token,
+                "server_stream": r.server_stream,
+                "header_names": r.header_names,
                 "installed": installed,
                 "created_at": r.created_at,
                 "updated_at": r.updated_at,
@@ -662,6 +773,20 @@ pub struct UpstreamAuth {
     pub authorization: Option<String>,
     /// Unix seconds the access token expires, if known.
     pub expires_at: Option<i64>,
+    /// Operator-supplied headers (validated when stored).
+    pub headers: Vec<(String, String)>,
+}
+
+/// Put the credential (and any other headers the record carries) on a
+/// request to the remote server.
+pub fn apply_upstream_headers(mut req: reqwest::RequestBuilder, auth: &UpstreamAuth) -> reqwest::RequestBuilder {
+    for (k, v) in &auth.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(a) = &auth.authorization {
+        req = req.header("Authorization", a);
+    }
+    req
 }
 
 fn not_connected(agent_id: &str, server: &str, why: &str) -> AuthError {
@@ -685,13 +810,14 @@ fn load_usable(home: &Path, agent_id: &str, server: &str) -> Result<(RemoteServe
 }
 
 fn to_upstream(secrets: &RemoteSecrets) -> Result<UpstreamAuth, AuthError> {
+    let headers = secrets.headers.clone();
     let url = validate_remote_url(&secrets.url).map_err(AuthError::NotConnected)?;
     let (authorization, expires_at) = match (&secrets.bearer, &secrets.oauth) {
         (Some(b), _) => (Some(format!("Bearer {b}")), None),
         (None, Some(o)) => (Some(format!("Bearer {}", o.access_token)), o.expires_at),
         (None, None) => (None, None),
     };
-    Ok(UpstreamAuth { url, authorization, expires_at })
+    Ok(UpstreamAuth { url, authorization, expires_at, headers })
 }
 
 /// Take the per-record refresh lock (a separate lock file, held across the
@@ -916,6 +1042,9 @@ mod tests {
                     creds: ClientCredentials { client_id: "c".into(), client_secret: None, token_endpoint_auth: "none".into() },
                     resource: "https://mcp.example.com/mcp".into(),
                     scope: None,
+                    revocation_endpoint: None,
+                    headers: vec![],
+                    server_stream: false,
                     created: Instant::now(),
                 },
             );
@@ -965,6 +1094,9 @@ mod tests {
                     creds: ClientCredentials { client_id: "c".into(), client_secret: None, token_endpoint_auth: "none".into() },
                     resource: "https://mcp.example.com/mcp".into(),
                     scope: None,
+                    revocation_endpoint: None,
+                    headers: vec![],
+                    server_stream: false,
                     created: Instant::now() - PENDING_TTL - Duration::from_secs(1),
                 },
             );
@@ -983,7 +1115,8 @@ mod tests {
             url: url.to_string(),
             bearer: Some("tok".into()),
             oauth: None,
-        })
+            headers: vec![("X-Workspace".into(), "w1".into())],
+        }, false)
         .unwrap();
         assert!(disconnect(home, "a1", "s1", false).unwrap());
         let rec = store::get(home, "a1", "s1").unwrap().unwrap();

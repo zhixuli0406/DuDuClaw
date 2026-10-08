@@ -1833,6 +1833,16 @@ pub struct CapabilitiesConfig {
     /// [`crate::tool_effect::ActionRules`].
     #[serde(default, skip_serializing_if = "crate::tool_effect::ActionRules::is_absent")]
     pub action_rules: crate::tool_effect::ActionRules,
+
+    /// Third-party MCP servers (`.mcp.json` keys) whose `readOnlyHint`
+    /// annotation is believed (2026-10-08). For any other server a tool that
+    /// says it is read-only is still classed `modify`, because a server can
+    /// claim anything about itself. Exact names; read fail-closed by
+    /// [`crate::agent_toml::load_third_party_policy`] (a malformed value
+    /// trusts no server). See [`crate::tool_effect::ThirdPartyPolicy`].
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_read_hint_servers: Vec<String>,
 }
 
 /// Effect of a [`ToolPolicy`] rule.
@@ -2104,6 +2114,7 @@ impl Default for CapabilitiesConfig {
             autonomy_level: None,
             auto_approve_install: None,
             action_rules: crate::tool_effect::ActionRules::default(),
+            trusted_read_hint_servers: Vec::new(),
         }
     }
 }

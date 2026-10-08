@@ -302,6 +302,7 @@ fn heartbeat_message(id: &str, task_id: &str) -> QueueMessage {
         turn_id: None,
         session_id: None,
         upstream_unknown: false,
+        lane: None,
     }
 }
 

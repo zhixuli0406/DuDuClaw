@@ -166,6 +166,28 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mcp_remote_disconnect(params, ctx).await
             }
+            // Third-party tools with their derived effect class (2026-10-08).
+            "mcp.tool_effects" => {
+                require_admin!();
+                self.handle_mcp_tool_effects(params).await
+            }
+            // MCP Events subscriptions hold signing secrets: Admin only.
+            "mcp.events_subscribe" => {
+                require_admin!();
+                self.handle_mcp_events_subscribe(params).await
+            }
+            "mcp.events_list" => {
+                require_admin!();
+                self.handle_mcp_events_list(params).await
+            }
+            "mcp.events_unsubscribe" => {
+                require_admin!();
+                self.handle_mcp_events_unsubscribe(params).await
+            }
+            "mcp.events_rotate" => {
+                require_admin!();
+                self.handle_mcp_events_rotate(params).await
+            }
 
             // ── MCP OAuth (admin only) ──────────────────────────
             "mcp.oauth.providers" => {

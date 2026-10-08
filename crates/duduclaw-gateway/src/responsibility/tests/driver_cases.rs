@@ -316,6 +316,7 @@ async fn enqueued_but_unmarked_intent_is_repaired_not_resent() {
         turn_id: None,
         session_id: None,
         upstream_unknown: false,
+        lane: None,
     };
     env.queue.enqueue(&msg).await.unwrap();
     let fresh = env.driver();

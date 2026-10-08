@@ -402,5 +402,6 @@ pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) ->
         session_id: None,
         // P2-B: a goal round carries no upstream channel turn to lose.
         upstream_unknown: false,
+        lane: None,
     }
 }

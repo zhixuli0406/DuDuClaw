@@ -29,160 +29,35 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use duduclaw_llm::{InterceptDecision, ToolInterceptor};
 use duduclaw_redaction::{EgressDecision, RedactionManager};
 
 /// Env var carrying the wrapped server's original `.mcp.json` `env` map,
-/// JSON-encoded, to the proxy process.
-///
-/// **Must match `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_VAR`** (the cli
-/// crate cannot be depended on from here — see the module docs). A rename on
-/// either side is caught by `proxy_env_var_name_is_the_documented_contract`
-/// in `duduclaw-cli`.
-pub const PROXY_UPSTREAM_ENV_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV";
+/// JSON-encoded, to the proxy process. **Must match
+/// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_VAR`** (checked by
+/// `proxy_env_var_name_is_the_documented_contract` in `duduclaw-cli`).
+pub use duduclaw_core::mcp_proxy_rewrite::{PROXY_CARRY_ENV, PROXY_UPSTREAM_ENV_VAR};
+use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_proxy_with};
 
 /// Placeholder substituted for a tool result the pipeline could not redact.
 /// Mirrors `duduclaw_cli::mcp_redaction::REDACTION_FAILED_PLACEHOLDER`.
 pub const REDACTION_FAILED_PLACEHOLDER: &str = "[redaction failed — value withheld]";
 
-/// Env names copied from the `.mcp.json` `duduclaw` entry onto every
-/// rewritten proxy entry, so the proxy process resolves the same home, the
-/// same agent identity and the same MCP credential the built-in server does.
-///
-/// `DUDUCLAW_AGENT_TOKEN` is deliberately NOT carried: it is the MAC proving
-/// an agent id was issued by DuDuClaw, used only to authorise MCP tool calls.
-/// The proxy makes none — it just redacts a byte stream — so handing it (and,
-/// by inheritance, a third-party server) that token would widen the blast
-/// radius for nothing.
-///
-/// `DUDUCLAW_SESSION_ID` is not listed because the Claude CLI passes its own
-/// environment down to MCP children and the gateway already sets it on the
-/// CLI process (see `channel_reply::spawn_claude_cli_with_env`) — the proxy
-/// inherits exactly the same value `duduclaw mcp-server` does.
-pub const PROXY_CARRY_ENV: &[&str] = &[
-    "DUDUCLAW_HOME",
-    "DUDUCLAW_PORT",
-    "DUDUCLAW_INSTANCE",
-    "DUDUCLAW_AGENT_ID",
-    "DUDUCLAW_MCP_API_KEY",
-    "DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED",
-];
-
 // ── 1. Spawn-time `.mcp.json` rewrite ───────────────────────────────────────
 
-/// Is this `.mcp.json` entry DuDuClaw's own MCP server?
-///
-/// `duduclaw` is the default key; `duduclaw-pro` is the legacy name and
-/// `duduclaw-<instance>` is the multi-instance form
-/// (`duduclaw_core::mcp_server_key`). Never proxied — it already redacts.
-fn is_duduclaw_server(name: &str) -> bool {
-    name == "duduclaw" || name.starts_with("duduclaw-")
-}
-
 /// Rewrite every third-party **stdio** server so it launches through
-/// `duduclaw mcp-proxy`.
-///
-/// Pure: no IO, no env reads. Left untouched are
-/// - DuDuClaw's own entry ([`is_duduclaw_server`]),
-/// - `type` / `url` entries (HTTP / SSE MCP servers — there is no child
-///   process to wrap; a warn is logged so the gap is visible, not silent),
-/// - entries with no `command`,
-/// - entries already pointing at `mcp-proxy` (idempotent).
-///
-/// The original `env` map rides along in [`PROXY_UPSTREAM_ENV_VAR`] rather
-/// than in argv, so a `PGPASSWORD` never lands in a world-readable
-/// `/proc/<pid>/cmdline`.
+/// `duduclaw mcp-proxy` for redaction (remote bridges included). The pure
+/// rewrite lives in `duduclaw_core::mcp_proxy_rewrite`, shared with the
+/// heartbeat explore-lane spawn and the third-party tool gate.
 pub fn rewrite_mcp_config_for_proxy(json: &Value, self_exe: &Path) -> Value {
-    let mut out = json.clone();
-    let exe = self_exe.to_string_lossy().into_owned();
-
-    let Some(servers) = out.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
-        return out;
-    };
-
-    let carry = carry_env(servers);
-    let names: Vec<String> = servers.keys().cloned().collect();
-
-    for name in names {
-        if is_duduclaw_server(&name) {
-            continue;
-        }
-        let Some(def) = servers.get(&name).cloned() else {
-            continue;
-        };
-        if def.get("url").is_some() || def.get("type").is_some() {
-            warn!(
-                server = %name,
-                "RFC-23: HTTP/SSE MCP server is NOT proxied — its tool results reach the model unredacted"
-            );
-            continue;
-        }
-        let Some(command) = def.get("command").and_then(|c| c.as_str()) else {
-            continue;
-        };
-        if is_already_proxied(&def, &exe) {
-            continue;
-        }
-
-        let mut args = vec![
-            json!("mcp-proxy"),
-            json!("--server"),
-            json!(name),
-            json!("--"),
-            json!(command),
-        ];
-        if let Some(orig) = def.get("args").and_then(|a| a.as_array()) {
-            args.extend(orig.iter().cloned());
-        }
-
-        let original_env = def
-            .get("env")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new()));
-        let mut env = carry.clone();
-        env.insert(
-            PROXY_UPSTREAM_ENV_VAR.to_string(),
-            Value::String(original_env.to_string()),
-        );
-
-        servers.insert(
-            name,
-            json!({ "command": exe, "args": args, "env": Value::Object(env) }),
-        );
-    }
-    out
-}
-
-/// The env pairs the proxy needs, lifted off whichever DuDuClaw entry this
-/// config carries. Absent entry ⇒ empty (the proxy then relies on the Claude
-/// CLI's inherited environment, exactly as a bare `.mcp.json` would).
-fn carry_env(servers: &Map<String, Value>) -> Map<String, Value> {
-    let mut out = Map::new();
-    let Some((_, def)) = servers.iter().find(|(k, _)| is_duduclaw_server(k)) else {
-        return out;
-    };
-    let Some(env) = def.get("env").and_then(|e| e.as_object()) else {
-        return out;
-    };
-    for key in PROXY_CARRY_ENV {
-        if let Some(v) = env.get(*key) {
-            out.insert((*key).to_string(), v.clone());
-        }
-    }
-    out
-}
-
-fn is_already_proxied(def: &Value, exe: &str) -> bool {
-    def.get("command").and_then(|c| c.as_str()) == Some(exe)
-        && def
-            .get("args")
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .and_then(|a| a.as_str())
-            == Some("mcp-proxy")
+    rewrite_mcp_config_for_proxy_with(
+        json,
+        self_exe,
+        ProxyPurpose { redaction: true, tool_gate: false },
+    )
 }
 
 /// Is RFC-23 redaction active for a spawn out of `home_dir`?
@@ -285,39 +160,81 @@ pub fn data_file_guard_env_for_spawn(home_dir: &Path) -> Option<String> {
 
 /// Produce the `--mcp-config` path this spawn should use.
 ///
-/// `None` ⇒ use the agent's `.mcp.json` unchanged (redaction inactive, no
-/// `.mcp.json`, a config we cannot read/parse, or a config with nothing to
-/// proxy). `Some(temp)` ⇒ pass `temp`'s path; the returned
-/// [`tempfile::TempPath`] deletes the file when dropped, so callers hold it
-/// until the child has exited — the same lifetime discipline the
-/// `--system-prompt-file` guard uses at the same spawn sites.
+/// `None` ⇒ use the agent's `.mcp.json` unchanged (neither redaction nor the
+/// third-party tool gate needs the proxy, no `.mcp.json`, a config we cannot
+/// read/parse, or a config with nothing to proxy). `Some(temp)` ⇒ pass
+/// `temp`'s path; the returned [`tempfile::TempPath`] deletes the file when
+/// dropped, so callers hold it until the child has exited — the same
+/// lifetime discipline the `--system-prompt-file` guard uses at the same
+/// spawn sites.
+///
+/// Same as [`maybe_proxy_mcp_config_in_lane`] outside the explore lane.
 pub fn maybe_proxy_mcp_config(home_dir: &Path, mcp_json: &Path) -> Option<tempfile::TempPath> {
-    if !redaction_active_for_spawn(home_dir) {
+    maybe_proxy_mcp_config_in_lane(home_dir, mcp_json, false)
+}
+
+/// [`maybe_proxy_mcp_config`] for a spawn that may run in the explore lane
+/// (`DUDUCLAW_LANE=explore` set on the CLI).
+///
+/// The proxy is put in the path when redaction is active (every third-party
+/// stdio server, remote bridges included) or when the third-party tool gate
+/// needs it (2026-10-08: the employee has `[capabilities] action_rules`, or
+/// `explore_lane`; remote bridges are left alone because they gate
+/// themselves). The employee directory is the `.mcp.json`'s parent.
+///
+/// Known limit: if the temp file cannot be written the original file is
+/// used (logged), so the gate does not reach stdio servers for that spawn.
+pub fn maybe_proxy_mcp_config_in_lane(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+) -> Option<tempfile::TempPath> {
+    let purpose = ProxyPurpose {
+        redaction: redaction_active_for_spawn(home_dir),
+        tool_gate: mcp_json
+            .parent()
+            .is_some_and(|dir| duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)),
+    };
+    if purpose.none() {
         return None;
     }
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "RFC-23 mcp-proxy: current_exe() failed — external MCP servers stay unproxied");
+            warn!(error = %e, "mcp-proxy: current_exe() failed — external MCP servers stay unproxied");
             return None;
         }
     };
-    write_proxy_mcp_config(mcp_json, &self_exe)
+    write_proxy_mcp_config_for(mcp_json, &self_exe, purpose)
 }
 
-/// The IO half of [`maybe_proxy_mcp_config`], split out so the rewrite can be
-/// exercised against a real file without touching process state.
+/// The IO half of [`maybe_proxy_mcp_config`] for redaction, split out so the
+/// rewrite can be exercised against a real file without touching process
+/// state.
 pub fn write_proxy_mcp_config(mcp_json: &Path, self_exe: &Path) -> Option<tempfile::TempPath> {
+    write_proxy_mcp_config_for(
+        mcp_json,
+        self_exe,
+        ProxyPurpose { redaction: true, tool_gate: false },
+    )
+}
+
+/// [`write_proxy_mcp_config`] for any [`ProxyPurpose`].
+pub fn write_proxy_mcp_config_for(
+    mcp_json: &Path,
+    self_exe: &Path,
+    purpose: ProxyPurpose,
+) -> Option<tempfile::TempPath> {
     let raw = std::fs::read_to_string(mcp_json)
-        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "RFC-23 mcp-proxy: unreadable .mcp.json"))
+        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "mcp-proxy: unreadable .mcp.json"))
         .ok()?;
     let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "RFC-23 mcp-proxy: malformed .mcp.json"))
+        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "mcp-proxy: malformed .mcp.json"))
         .ok()?;
 
-    let rewritten = rewrite_mcp_config_for_proxy(&parsed, self_exe);
+    let rewritten = rewrite_mcp_config_for_proxy_with(&parsed, self_exe, purpose);
     if rewritten == parsed {
-        debug!("RFC-23 mcp-proxy: nothing to proxy in this .mcp.json");
+        debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return None;
     }
 
@@ -325,13 +242,13 @@ pub fn write_proxy_mcp_config(mcp_json: &Path, self_exe: &Path) -> Option<tempfi
         .prefix("duduclaw-mcp-")
         .suffix(".json")
         .tempfile()
-        .map_err(|e| warn!(error = %e, "RFC-23 mcp-proxy: temp file creation failed"))
+        .map_err(|e| warn!(error = %e, "mcp-proxy: temp file creation failed"))
         .ok()?;
     {
         use std::io::Write;
         let body = serde_json::to_string_pretty(&rewritten).ok()?;
         file.write_all(body.as_bytes())
-            .map_err(|e| warn!(error = %e, "RFC-23 mcp-proxy: temp file write failed"))
+            .map_err(|e| warn!(error = %e, "mcp-proxy: temp file write failed"))
             .ok()?;
         file.flush().ok()?;
     }
@@ -543,6 +460,8 @@ fn resolve_manager(home_dir: &Path) -> Result<Arc<RedactionManager>, String> {
 #[cfg(test)]
 mod redaction_data_file_guard_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use serde_json::json;
 
     fn home_with(config: &str) -> tempfile::TempDir {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -625,6 +544,8 @@ mod redaction_data_file_guard_tests {
 #[cfg(test)]
 mod mcp_config_proxy_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use serde_json::json;
 
     fn exe() -> PathBuf {
         PathBuf::from("/opt/duduclaw/bin/duduclaw")
@@ -841,6 +762,8 @@ mod mcp_config_proxy_tests {
 #[cfg(test)]
 mod interceptor_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use serde_json::json;
     use duduclaw_redaction::{ManagerPaths, RedactionConfig, RestoreScope, RuleKind, RuleSpec};
 
     fn manager(home: &Path) -> Arc<RedactionManager> {

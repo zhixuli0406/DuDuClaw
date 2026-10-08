@@ -140,7 +140,7 @@ pub fn prepare_for_install(
                 existing.as_ref().is_none_or(|r| r.status != ConnStatus::Connected)
             } else {
                 let now = store::now_rfc3339();
-                let secrets = RemoteSecrets { url: url.to_string(), bearer: None, oauth: None };
+                let secrets = RemoteSecrets { url: url.to_string(), bearer: None, oauth: None, headers: vec![] };
                 store::upsert(
                     home,
                     RemoteServerRecord {
@@ -153,6 +153,8 @@ pub fn prepare_for_install(
                         updated_at: now,
                         access_expires_at: None,
                         has_refresh_token: false,
+                        server_stream: false,
+                        header_names: vec![],
                         secret_enc: store::seal(home, &secrets)?,
                     },
                 )?;

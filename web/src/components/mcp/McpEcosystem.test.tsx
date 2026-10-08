@@ -179,3 +179,81 @@ describe('McpPage remote catalogue cards (E3)', () => {
     expect(screen.queryByRole('button', { name: /install to agent/i })).toBeNull();
   });
 });
+
+describe('ToolEffectsPanel', () => {
+  it('lists third-party tools with their effect class and verdict', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.tool_effects') {
+        return Promise.resolve({
+          servers: [
+            {
+              server: 'crm', seen_by: 'proxy', observed_at: '2026-10-08T00:00:00Z', read_hint_trusted: false,
+              tools: [
+                { name: 'get', description: '', annotations: { readOnlyHint: true }, effect: 'modify', verdict: 'ask', explore_visible: false },
+                { name: 'drop', description: '', annotations: { destructiveHint: true }, effect: 'delete', verdict: 'block', explore_visible: false },
+              ],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({});
+    });
+    const { ToolEffectsPanel } = await import('./ToolEffectsPanel');
+    renderWithProviders(<ToolEffectsPanel agents={agents} />);
+    const rows = await screen.findAllByTestId('tool-effect-row');
+    expect(rows).toHaveLength(2);
+    expect(mockWsClient.call).toHaveBeenCalledWith('mcp.tool_effects', { agent_id: 'nova' });
+    expect(screen.getByText(/labels not trusted/i)).toBeInTheDocument();
+    expect(screen.getByText('Never')).toBeInTheDocument();
+  });
+});
+
+describe('McpEventsPanel', () => {
+  it('lists subscriptions and subscribes in read-only mode by default', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.events_list') {
+        return Promise.resolve({
+          public_base_url_set: false,
+          public_base_url_problem: 'set it',
+          subscriptions: [
+            {
+              id: 'mev_1', agent_id: 'nova', server: 'pager', event_types: ['incident.created'], mode: 'explore',
+              status: 'active', callback_url: null, upstream: [], created_at: '', updated_at: '', rotated_at: null,
+              last_delivery_at: null, deliveries: 2,
+            },
+          ],
+        });
+      }
+      if (method === 'mcp.events_subscribe') return Promise.resolve({ subscription: {} });
+      return Promise.resolve({});
+    });
+    const { McpEventsPanel } = await import('./McpEventsPanel');
+    const servers = [
+      {
+        agent_id: 'nova', server: 'pager', auth: 'none' as const, host: 'x', status: 'connected' as const,
+        access_expires_at: null, access_token_expired: false, has_refresh_token: false, installed: true,
+        created_at: '', updated_at: '',
+      },
+    ];
+    renderWithProviders(<McpEventsPanel servers={servers} />);
+    expect(await screen.findAllByTestId('event-sub-row')).toHaveLength(1);
+    expect(screen.getByText(/public_base_url/)).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'nova/pager' } });
+    fireEvent.change(screen.getByPlaceholderText(/incident.created/), { target: { value: 'a.b, c' } });
+    fireEvent.click(screen.getByRole('button', { name: /^subscribe$/i }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('mcp.events_subscribe', {
+        agent_id: 'nova', server: 'pager', event_types: ['a.b', 'c'], mode: 'explore',
+      }),
+    );
+  });
+});
+
+describe('parseHeaderLines', () => {
+  it('parses Name: value lines and refuses lines without a colon', async () => {
+    const { parseHeaderLines } = await import('./RemoteServersTab');
+    expect(parseHeaderLines('X-Workspace: acme\n\nX-Team:  t1 ')).toEqual({ 'X-Workspace': 'acme', 'X-Team': 't1' });
+    expect(parseHeaderLines('nocolon')).toBeNull();
+    expect(parseHeaderLines(': empty name')).toBeNull();
+  });
+});

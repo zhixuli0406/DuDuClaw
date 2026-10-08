@@ -25,7 +25,7 @@ import {
 const SERVER_CREATE_TRIGGERS = [
   'task_created', 'task_updated', 'task_status_changed', 'activity_new',
   'channel_message', 'agent_idle', 'run_at_risk', 'os_file',
-  'os_frontmost', 'tick', 'security_event', 'odoo_event',
+  'os_frontmost', 'tick', 'security_event', 'odoo_event', 'mcp_event',
 ];
 const SERVER_LEGACY_TRIGGERS = ['cron_tick'];
 const SERVER_KNOWN_TRIGGERS = [...SERVER_CREATE_TRIGGERS, ...SERVER_LEGACY_TRIGGERS];

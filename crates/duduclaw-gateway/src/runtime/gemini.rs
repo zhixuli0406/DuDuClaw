@@ -271,7 +271,7 @@ impl AgentRuntime for GeminiRuntime {
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
         // P5: this runtime cannot carry the read-only explore lane.
-        super::refuse_unsupported_lane("gemini")?;
+        crate::explore_lane::refuse_unsupported_runtime("gemini")?;
         info!(agent = %context.agent_id, "GeminiRuntime: executing via gemini -p --output-format stream-json");
 
         // Limit system_prompt to 64KB to avoid ARG_MAX issues.

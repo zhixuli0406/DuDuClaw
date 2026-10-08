@@ -754,7 +754,7 @@ impl AgentRuntime for GenericCliRuntime {
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
         // P5: this runtime cannot carry the read-only explore lane.
-        super::refuse_unsupported_lane("generic CLI")?;
+        crate::explore_lane::refuse_unsupported_runtime("generic CLI")?;
         self.run(prompt, context).await.map_err(Into::into)
     }
 

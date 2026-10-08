@@ -25,6 +25,21 @@ claude.ai 會自動走 OAuth 探索（RFC 9728 → RFC 8414 → 動態註冊）�
 DuDuClaw 的授權頁。頁面上貼一把**內部 MCP API key**（`config.toml [mcp_keys]` 中
 `is_external = false` 的 key）按「同意連線」即完成。
 
+## 從 ChatGPT 使用
+
+ChatGPT 可以把 DuDuClaw 加成自訂連接器（開發者模式下的「應用程式」）。不會發布到任何商店，連接器只存在你自己的 ChatGPT 帳號裡。
+
+1. 讓 `duduclaw http-server` 有一個固定的 **https** 位址（反向代理或具名通道；ChatGPT 從 OpenAI 的伺服器連線，loopback 或區網位址不行）。
+2. 在 ChatGPT 開啟開發者模式（設定 → 應用程式與連接器 → 進階設定；哪些方案提供由 OpenAI 決定），以伺服器網址 `https://<你的位址>/mcp`、驗證方式 OAuth 建立連接器。
+3. ChatGPT 會找到授權伺服器（RFC 9728 → RFC 8414）並自行註冊：透過動態用戶端註冊（`POST /oauth/register`），或用 Client ID Metadata Document（`client_id` 是 DuDuClaw 會去讀取的 https 網址；2026-10-08 起支援，見下方）。依第三方指南，它的轉回網址是 `https://chatgpt.com/connector_platform_oauth_redirect`；DuDuClaw 接受任何 https 轉回網址，不必另外設定。
+4. DuDuClaw 的授權頁出現後，貼上一把**內部** MCP API key 並同意。
+
+ChatGPT 拿到的權限與所有 OAuth 用戶端相同（見下方「外部用戶端」等級）：基礎工具，加上最多 `memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`。連接器、執行、人員名冊與 Admin 工具永遠不會經 OAuth 開放。
+
+Client ID Metadata Document：`client_id` 是帶路徑的 `https://` 網址且不是已註冊的 id 時，DuDuClaw 會去讀取它（只連公開位址、固定解析、不跟隨轉址、5 秒、5 KiB、快取一小時）。文件中的 `client_id` 必須與網址相同，`redirect_uris` 必須是 https（或 loopback http）網址且包含實際使用的那個，只接受公開用戶端（`token_endpoint_auth_method` 不存在或為 `none`）。授權伺服器中繼資料會宣告 `client_id_metadata_document_supported: true`。
+
+未驗證：沒有用真的 ChatGPT 帳號測試。轉回網址與註冊方式取自第三方連接器指南（撰寫時無法取得 OpenAI 自己的頁面）；流程只用本機請求測試過。
+
 ## 授權模型（重要）
 
 OAuth 簽發的存取權杖**永遠是「外部客戶端」等級**，與對外工具面的 scope 政策共用同

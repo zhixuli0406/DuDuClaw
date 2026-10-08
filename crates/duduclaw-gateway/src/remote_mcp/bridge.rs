@@ -15,9 +15,15 @@
 //! rest); other requests run concurrently so a long tool call does not block
 //! the next one.
 //!
-//! Not implemented: the optional `GET` stream for server-initiated messages
-//! outside a request, and resuming a broken SSE stream (`Last-Event-ID`).
-//! Legacy HTTP+SSE (2024-11-05) servers are not supported by this bridge.
+//! Server-initiated `GET` stream (2026-10-08, off by default, per-server
+//! opt-in `server_stream` on the record): after `notifications/initialized`
+//! the bridge opens `GET <url>` with `Accept: text/event-stream`, forwards
+//! every message on it to stdout, remembers the last SSE `id:` and reconnects
+//! with `Last-Event-ID` (backoff 1 s doubling to 30 s, reset by an event); a
+//! `405` (the server offers no such stream) or `404` (session gone) stops it,
+//! and it is aborted when stdin ends. Resuming a broken *POST* answer stream
+//! is still not implemented. Legacy HTTP+SSE (2024-11-05) servers are not
+//! supported by this bridge.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,6 +67,11 @@ struct Bridge {
     /// another process already renewed the token.
     last_auth: Mutex<Option<UpstreamAuth>>,
     out: mpsc::UnboundedSender<String>,
+    /// Effect classes / `action_rules` / explore lane for this server's
+    /// tools (2026-10-08, [`crate::third_party_tools`]).
+    gate: crate::third_party_tools::ThirdPartyGate,
+    /// The record's `server_stream` opt-in.
+    server_stream: bool,
 }
 
 fn error_frame(id: &Value, message: &str) -> String {
@@ -123,9 +134,7 @@ impl Bridge {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(body.to_string());
-        if let Some(a) = &auth.authorization {
-            req = req.header("Authorization", a);
-        }
+        req = super::connect::apply_upstream_headers(req, auth);
         {
             let s = self.session.lock().await;
             if let Some(id) = &s.session_id {
@@ -151,8 +160,25 @@ impl Bridge {
             }
         };
         let kind = classify(&frame);
-        let is_initialize = frame.get("method").and_then(|m| m.as_str()) == Some("initialize");
-        if let Err(msg) = self.exchange(&line, &kind, is_initialize).await {
+        let method = frame.get("method").and_then(|m| m.as_str());
+        let is_initialize = method == Some("initialize");
+        // Third-party tool gate: a refused or unapproved call never leaves.
+        if let (Kind::Request(id), Some("tools/call")) = (&kind, method) {
+            let tool = frame
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if let Err(msg) = self.gate.check_call(tool).await {
+                self.emit(crate::third_party_tools::refusal_frame(id, &msg));
+                return;
+            }
+        }
+        let list_id = match (&kind, method) {
+            (Kind::Request(id), Some("tools/list")) => Some(id.clone()),
+            _ => None,
+        };
+        if let Err(msg) = self.exchange(&line, &kind, is_initialize, list_id.as_ref()).await {
             match &kind {
                 Kind::Request(id) => self.emit(error_frame(id, &msg)),
                 _ => tracing::warn!(server = %self.server, error = %msg, "remote MCP message not delivered"),
@@ -160,7 +186,13 @@ impl Bridge {
         }
     }
 
-    async fn exchange(&self, body: &str, kind: &Kind, is_initialize: bool) -> Result<(), String> {
+    async fn exchange(
+        &self,
+        body: &str,
+        kind: &Kind,
+        is_initialize: bool,
+        list_id: Option<&Value>,
+    ) -> Result<(), String> {
         let mut auth = self.auth(false).await.map_err(|e| e.to_string())?;
         let mut resp = self.post(&auth, body).await?;
         if resp.status().as_u16() == 401 {
@@ -208,7 +240,7 @@ impl Bridge {
             .unwrap_or("")
             .to_ascii_lowercase();
         if content_type.starts_with("text/event-stream") {
-            self.relay_sse(resp, expect_id.as_ref(), is_initialize).await
+            self.relay_sse(resp, expect_id.as_ref(), is_initialize, list_id).await
         } else {
             let bytes = super::http::read_capped(resp, MAX_MESSAGE_BYTES).await?;
             if bytes.iter().all(|b| b.is_ascii_whitespace()) {
@@ -223,16 +255,25 @@ impl Bridge {
             match v {
                 Value::Array(items) => {
                     for item in items {
-                        self.deliver(item, is_initialize).await;
+                        self.deliver(item, is_initialize, list_id).await;
                     }
                 }
-                other => self.deliver(other, is_initialize).await,
+                other => self.deliver(other, is_initialize, list_id).await,
             }
             Ok(())
         }
     }
 
-    async fn deliver(&self, msg: Value, is_initialize: bool) {
+    async fn deliver(&self, mut msg: Value, is_initialize: bool, list_id: Option<&Value>) {
+        // The answer to a `tools/list`: hide the tools this employee may not
+        // call here and remember every tool's annotations.
+        if let Some(id) = list_id
+            && msg.get("id") == Some(id)
+            && msg.get("method").is_none()
+            && let Some(result) = msg.get_mut("result")
+        {
+            self.gate.filter_list_result(result);
+        }
         if is_initialize
             && let Some(v) = msg
                 .get("result")
@@ -254,6 +295,7 @@ impl Bridge {
         mut resp: reqwest::Response,
         expect_id: Option<&Value>,
         is_initialize: bool,
+        list_id: Option<&Value>,
     ) -> Result<(), String> {
         let mut buf: Vec<u8> = Vec::new();
         let mut answered = expect_id.is_none();
@@ -275,7 +317,7 @@ impl Bridge {
                     let is_answer = expect_id.is_some_and(|id| {
                         v.get("id") == Some(id) && v.get("method").is_none()
                     });
-                    self.deliver(v, is_initialize).await;
+                    self.deliver(v, is_initialize, list_id).await;
                     if is_answer {
                         answered = true;
                     }
@@ -296,12 +338,142 @@ impl Bridge {
         let Some(sid) = sid else { return };
         let Ok(auth) = self.auth(false).await else { return };
         let Ok(client) = self.client_for(&auth.url).await else { return };
-        let mut req = client.delete(auth.url.clone()).header("Mcp-Session-Id", sid);
-        if let Some(a) = &auth.authorization {
-            req = req.header("Authorization", a);
-        }
+        let req = super::connect::apply_upstream_headers(
+            client.delete(auth.url.clone()).header("Mcp-Session-Id", sid),
+            &auth,
+        );
         let _ = tokio::time::timeout(Duration::from_secs(5), req.send()).await;
     }
+
+    /// The optional server-initiated stream (see the module docs). Runs
+    /// until the server says it has none (405), the session is gone (404),
+    /// the credential cannot be renewed, or the task is aborted.
+    async fn server_stream_loop(self: Arc<Self>) {
+        let mut last_event_id: Option<String> = None;
+        let mut backoff = STREAM_BACKOFF_START;
+        loop {
+            match self.server_stream_once(&mut last_event_id).await {
+                StreamEnd::Stop(why) => {
+                    tracing::debug!(server = %self.server, why, "server-initiated stream stopped");
+                    return;
+                }
+                StreamEnd::Progress => backoff = STREAM_BACKOFF_START,
+                StreamEnd::Retry => {}
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(STREAM_BACKOFF_MAX);
+        }
+    }
+
+    async fn server_stream_once(&self, last_event_id: &mut Option<String>) -> StreamEnd {
+        let mut forced = false;
+        let resp = loop {
+            let auth = match self.auth(forced).await {
+                Ok(a) => a,
+                Err(_) => return StreamEnd::Stop("credential unavailable"),
+            };
+            let client = match self.client_for(&auth.url).await {
+                Ok(c) => c,
+                Err(_) => return StreamEnd::Retry,
+            };
+            // Long-lived: no overall timeout, only connect/idle limits of the
+            // pinned client.
+            let mut req = client.get(auth.url.clone()).header("Accept", "text/event-stream");
+            req = super::connect::apply_upstream_headers(req, &auth);
+            {
+                let s = self.session.lock().await;
+                if let Some(id) = &s.session_id {
+                    req = req.header("Mcp-Session-Id", id);
+                }
+                if let Some(v) = &s.protocol_version {
+                    req = req.header("MCP-Protocol-Version", v);
+                }
+            }
+            if let Some(id) = last_event_id.as_deref() {
+                req = req.header("Last-Event-ID", id);
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(_) => return StreamEnd::Retry,
+            };
+            if resp.status().as_u16() == 401 && !forced {
+                forced = true;
+                continue;
+            }
+            break resp;
+        };
+        match resp.status().as_u16() {
+            405 => return StreamEnd::Stop("server offers no GET stream"),
+            404 => return StreamEnd::Stop("session gone"),
+            401 | 403 => return StreamEnd::Stop("credential refused"),
+            s if !(200..300).contains(&s) => return StreamEnd::Retry,
+            _ => {}
+        }
+        let is_sse = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.to_ascii_lowercase().starts_with("text/event-stream"));
+        if !is_sse {
+            return StreamEnd::Stop("not an event stream");
+        }
+        let mut resp = resp;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut progressed = false;
+        loop {
+            let chunk = match resp.chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) | Err(_) => break,
+            };
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_MESSAGE_BYTES {
+                return StreamEnd::Retry;
+            }
+            while let Some((event, rest)) = split_event(&buf) {
+                buf = rest;
+                if let Some(id) = event_id(&event) {
+                    *last_event_id = Some(id);
+                }
+                if let Some(data) = event_data(&event)
+                    && let Ok(v) = serde_json::from_str::<Value>(&data)
+                {
+                    self.deliver(v, false, None).await;
+                    progressed = true;
+                }
+            }
+        }
+        if progressed { StreamEnd::Progress } else { StreamEnd::Retry }
+    }
+}
+
+/// How one `GET` stream attempt ended.
+enum StreamEnd {
+    /// Do not reconnect.
+    Stop(&'static str),
+    /// At least one message arrived; reconnect from the start of the backoff.
+    Progress,
+    /// Reconnect after the current backoff.
+    Retry,
+}
+
+const STREAM_BACKOFF_START: Duration = Duration::from_secs(1);
+const STREAM_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The `id:` of one SSE event (no NUL, at most 256 bytes, as sent back in
+/// `Last-Event-ID`).
+pub(crate) fn event_id(event: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(event);
+    let mut out = None;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(rest) = line.strip_prefix("id:") {
+            let v = rest.strip_prefix(' ').unwrap_or(rest);
+            if !v.contains('\0') && v.len() <= 256 && v.chars().all(|c| c.is_ascii_graphic()) {
+                out = Some(v.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Split the first complete SSE event (terminated by a blank line) off `buf`.
@@ -364,7 +536,13 @@ where
         clients: Mutex::new(ClientCache { client: None }),
         last_auth: Mutex::new(None),
         out: tx,
+        gate: crate::third_party_tools::ThirdPartyGate::new(home, agent_id, server, "bridge"),
+        server_stream: super::store::get(home, agent_id, server)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.server_stream),
     });
+    let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut lines = input.lines();
     let mut tasks = tokio::task::JoinSet::new();
@@ -384,15 +562,24 @@ where
             bridge.emit(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"message too large"}}).to_string());
             continue;
         }
-        let ordered = match serde_json::from_str::<Value>(&line) {
-            Ok(v) => {
-                !matches!(classify(&v), Kind::Request(_))
+        let parsed = serde_json::from_str::<Value>(&line).ok();
+        let ordered = match &parsed {
+            Some(v) => {
+                !matches!(classify(v), Kind::Request(_))
                     || v.get("method").and_then(|m| m.as_str()) == Some("initialize")
             }
-            Err(_) => true,
+            None => true,
         };
+        let is_initialized = parsed
+            .as_ref()
+            .and_then(|v| v.get("method"))
+            .and_then(|m| m.as_str())
+            == Some("notifications/initialized");
         if ordered {
             bridge.forward(line).await;
+            if is_initialized && bridge.server_stream && stream_task.is_none() {
+                stream_task = Some(tokio::spawn(bridge.clone().server_stream_loop()));
+            }
         } else {
             let b = bridge.clone();
             tasks.spawn(async move { b.forward(line).await });
@@ -400,6 +587,10 @@ where
         while tasks.try_join_next().is_some() {}
     }
     while tasks.join_next().await.is_some() {}
+    if let Some(t) = stream_task.take() {
+        t.abort();
+        let _ = t.await;
+    }
     bridge.close_session().await;
     drop(bridge);
     let _ = writer.await;
@@ -419,6 +610,8 @@ mod tests {
         assert_eq!(event_data(&e2).unwrap(), "{\"b\":\n2}");
         assert!(split_event(&rest).is_none());
         assert!(event_data(b": comment only").is_none());
+        assert_eq!(event_id(b"id: 42\ndata: {}").as_deref(), Some("42"));
+        assert_eq!(event_id(b"data: {}"), None);
     }
 
     #[test]

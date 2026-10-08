@@ -34,6 +34,7 @@ struct Fake {
     issued: u32,
     grants: Vec<String>,
     mcp_calls: Vec<(String, String)>,
+    revoked: Vec<(String, String)>,
 }
 
 type S = Arc<Mutex<Fake>>;
@@ -111,6 +112,7 @@ async fn as_meta(State(s): State<S>) -> Response {
         "authorization_endpoint": format!("{base}/as/authorize"),
         "token_endpoint": format!("{base}/as/token"),
         "registration_endpoint": format!("{base}/as/register"),
+        "revocation_endpoint": format!("{base}/as/revoke"),
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     }))
@@ -173,6 +175,12 @@ async fn token(State(s): State<S>, Form(form): Form<HashMap<String, String>>) ->
     }
 }
 
+async fn revoke(State(s): State<S>, Form(form): Form<HashMap<String, String>>) -> Response {
+    assert_eq!(form.get("client_id").map(String::as_str), Some("cid-1"));
+    s.lock().unwrap().revoked.push((form["token"].clone(), form["token_type_hint"].clone()));
+    StatusCode::OK.into_response()
+}
+
 async fn start_fake() -> (S, String) {
     let state: S = Arc::new(Mutex::new(Fake::default()));
     let app = Router::new()
@@ -182,6 +190,7 @@ async fn start_fake() -> (S, String) {
         .route("/as/register", post(register))
         .route("/as/authorize", get(authorize))
         .route("/as/token", post(token))
+        .route("/as/revoke", post(revoke))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -219,6 +228,8 @@ async fn oauth_connect_callback_bridge_and_refresh() {
             client_id: None,
             client_secret: None,
             allowed_origins: vec![],
+            headers: None,
+            server_stream: None,
         },
     )
     .await
@@ -292,6 +303,12 @@ async fn oauth_connect_callback_bridge_and_refresh() {
     let secrets = store::open(home, &rec).unwrap();
     assert_eq!(secrets.oauth.unwrap().refresh_token.as_deref(), Some("rt-3"), "rotated refresh token stored");
 
+    // 5b. RFC 7009: the disconnect path reads the target before the local
+    //     delete and revokes the refresh token at the provider.
+    let target = connect::revocation_target(home, "a1", "fake").expect("a revocation endpoint was advertised");
+    assert_eq!(connect::revoke_at_provider(target).await, "revoked");
+    assert_eq!(fake.lock().unwrap().revoked, vec![("rt-3".to_string(), "refresh_token".to_string())]);
+
     // 6. A refresh token the server no longer accepts marks the record
     //    needs_reauth and the bridge answers with an operator-facing error.
     {
@@ -320,6 +337,8 @@ async fn bearer_connect_probes_and_a_refused_token_is_reported() {
         client_id: None,
         client_secret: None,
         allowed_origins: vec![],
+        headers: None,
+        server_stream: None,
     };
     assert!(connect::start_connect(home, req("wrong")).await.is_err());
     assert!(matches!(connect::start_connect(home, req("Bearer static-1")).await, Ok(connect::ConnectOutcome::Connected)));
@@ -352,6 +371,8 @@ async fn lan_http_dashboard_signs_in_through_a_pasted_loopback_callback() {
             client_id: None,
             client_secret: None,
             allowed_origins: vec![],
+            headers: None,
+            server_stream: None,
         },
     )
     .await

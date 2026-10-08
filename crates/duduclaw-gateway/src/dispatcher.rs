@@ -329,38 +329,38 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         // covers plain `send_to_agent` delegation callbacks AND goal-loop
         // work items (which have no callback of their own; see the
         // fallback in `build_typing_guard_for_sqlite_message`).
-        // P5: a responsibility round whose contract carries the read-only
-        // explore lane runs only on a runtime that can carry it; anything
-        // else (or an unreadable lane) fails the round before it starts.
-        let explore_lane = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
+        // One explore lane (`crate::explore_lane`), two sources: a goal-loop
+        // round of a responsibility whose contract has `lane = "explore"`
+        // (P5) and a message woken by an external event (`message_queue.lane`).
+        // Either way the run starts only on a runtime that can carry the
+        // lane; anything else (or an unreadable lane) fails it before it
+        // starts, and a refused goal round is returned unrun.
+        let responsibility_lane = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
             match extract_goal_loop_task_id_and_round(&msg.payload) {
                 Some((task_id, _)) => {
-                    match crate::responsibility::round_requires_explore_lane(home_dir, task_id)
+                    crate::responsibility::round_requires_explore_lane(home_dir, task_id)
                         .await
-                    {
-                        Ok(true) => match crate::responsibility::lane::explore_round_refusal(
-                            home_dir,
-                            &msg.target,
-                        ) {
-                            None => Ok(true),
-                            Some(reason) => Err(reason),
-                        },
-                        Ok(false) => Ok(false),
-                        Err(e) => Err(format!("explore_lane_unreadable: {e}")),
-                    }
+                        .map_err(|e| format!("explore_lane_unreadable: {e}"))
                 }
                 None => Ok(false),
             }
         } else {
             Ok(false)
         };
-        let explore_lane = match explore_lane {
+        let explore_lane = match resolve_dispatch_lane(
+            home_dir,
+            &msg.target,
+            responsibility_lane,
+            msg.lane.as_deref(),
+        ) {
             Ok(v) => v,
             Err(reason) => {
-                warn!(msg_id = %msg.id, agent = %msg.target, reason = %reason, "SQLite queue: explore-lane round refused");
+                warn!(msg_id = %msg.id, agent = %msg.target, reason = %reason, "SQLite queue: explore-lane run refused");
                 queue.fail(&msg.id, &reason).await?;
                 if msg.id.starts_with("goal:") {
                     crate::responsibility::return_unrun_round(home_dir, &msg.id).await;
+                } else {
+                    forward_delegation_response(home_dir, &msg.id, &reason, &msg.target).await;
                 }
                 continue;
             }
@@ -426,9 +426,9 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             duduclaw_memory::feedback::CURRENT_TURN_ID.scope(msg.turn_id.clone(), dispatch_fut);
         let dispatch_fut =
             crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
-        // P5: every spawn of this round (Claude CLI, the openai-compat tool
-        // loop's MCP child) carries the read-only lane; other runtimes refuse.
-        let dispatch_fut = crate::runtime::EXPLORE_ROUND_LANE.scope(explore_lane, dispatch_fut);
+        // Every spawn of this run (Claude CLI, the openai-compat tool loop's
+        // MCP child) carries the read-only lane; other runtimes refuse.
+        let dispatch_fut = crate::explore_lane::EXPLORE.scope(explore_lane, dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -3578,6 +3578,28 @@ pub(crate) fn extract_heartbeat_task_id(payload: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
 }
 
+/// Whether a queued run goes in the read-only explore lane, folding the
+/// lane's two sources into the one flag (`crate::explore_lane::EXPLORE`):
+/// `responsibility` is the P5 contract lane of a goal-loop round (an error
+/// when it could not be read), `msg_lane` the external-event lane on the
+/// message. `Err` (fail closed) when the lane cannot be read or `target`
+/// cannot carry it (`crate::explore_lane::dispatch_refusal`), the same rule
+/// for both sources.
+pub(crate) fn resolve_dispatch_lane(
+    home_dir: &Path,
+    target: &str,
+    responsibility: Result<bool, String>,
+    msg_lane: Option<&str>,
+) -> Result<bool, String> {
+    let lane = responsibility? || crate::explore_lane::is_explore(msg_lane);
+    if lane {
+        if let Some(reason) = crate::explore_lane::dispatch_refusal(home_dir, target) {
+            return Err(reason);
+        }
+    }
+    Ok(lane)
+}
+
 pub(crate) fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str, u32)> {
     let rest = payload.strip_prefix("[goal-loop task_id=")?;
     let inner = &rest[..rest.find(']')?];
@@ -5412,5 +5434,64 @@ bot_token = "{token}"
         }
         let reply = dispatch_failure_reply(&DispatchError::Other("hard timeout after 300s".into()));
         assert_eq!(reply, "⚠️ 子任務處理失敗：處理超時。請稍後再試或改寫指令。");
+    }
+
+    /// One explore lane, two sources: a responsibility round's contract lane
+    /// and an external-event message lane resolve to the same flag, and an
+    /// employee whose runtime cannot carry it is refused for either source.
+    #[tokio::test]
+    async fn both_lane_sources_set_one_flag_and_share_the_runtime_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let write = |id: &str, body: &str| {
+            let a = home.join("agents").join(id);
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::write(a.join("agent.toml"), body).unwrap();
+        };
+        write("claude", "[agent]\nname = \"claude\"\n");
+        write(
+            "compat",
+            "[agent]\nname = \"compat\"\n[runtime]\nprovider = \"openai-compat\"\n",
+        );
+        write("codex", "[agent]\nname = \"codex\"\n[runtime]\nprovider = \"codex\"\n");
+        write(
+            "boxed",
+            "[agent]\nname = \"boxed\"\n[container]\nsandbox_enabled = true\n",
+        );
+
+        // Neither source ⇒ normal lane, whatever the runtime.
+        assert_eq!(resolve_dispatch_lane(home, "codex", Ok(false), None), Ok(false));
+        // Each source alone puts a supported runtime in the lane.
+        for agent in ["claude", "compat"] {
+            assert_eq!(resolve_dispatch_lane(home, agent, Ok(true), None), Ok(true));
+            assert_eq!(
+                resolve_dispatch_lane(home, agent, Ok(false), Some("explore")),
+                Ok(true)
+            );
+        }
+        // Each source refuses an unsupported runtime and a sandboxed employee.
+        for agent in ["codex", "boxed"] {
+            for (resp, lane) in [(Ok(true), None), (Ok(false), Some("explore"))] {
+                let err = resolve_dispatch_lane(home, agent, resp, lane).unwrap_err();
+                assert!(err.starts_with("explore_lane_unsupported"), "{agent}: {err}");
+            }
+        }
+        // An unreadable responsibility lane fails closed even with no message lane.
+        assert!(resolve_dispatch_lane(home, "claude", Err("x".into()), None).is_err());
+
+        // The resolved value is the one task-local every spawn reads.
+        for (resp, lane) in [(Ok(true), None), (Ok(false), Some("explore"))] {
+            let v = resolve_dispatch_lane(home, "claude", resp, lane).unwrap();
+            let seen = crate::explore_lane::EXPLORE
+                .scope(v, async {
+                    (
+                        crate::explore_lane::in_explore(),
+                        crate::explore_lane::lane_env().is_some(),
+                        crate::explore_lane::refuse_unsupported_runtime("codex").is_err(),
+                    )
+                })
+                .await;
+            assert_eq!(seen, (true, true, true));
+        }
     }
 }

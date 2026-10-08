@@ -214,14 +214,15 @@ v1.70.0 の次のリリースから、すでに変わった状態に対して出
 
 継続タスクの契約には `"lane": "explore"` を付けられます（RPC `responsibilities.create`／`update_contract`、コマンドラインの契約ファイル）。この値は契約の scope に保存されるので契約ハッシュに含まれます。付けていない継続タスクは以前とバイト単位で同じです。それ以外の値は拒否されます（`invalid_lane`）。
 
-このような継続タスクの各実行の各ラウンドは、heartbeat の能動チェック用に作られた読み取り専用の explore lane で動きます：
+このような継続タスクの各実行の各ラウンドは、heartbeat の能動チェック用に作られた読み取り専用の explore lane で動きます。MCP Events の配信で起こされる作業も同じ lane を使います（[MCP エコシステム](mcp-ecosystem.md)）：ディスパッチャーは両方に同じ 1 つのフラグを立てるので、下の表はどちらにも同じく当てはまります。
 
 | ランタイム | 動作 |
 |---|---|
-| Claude CLI | 起動時に `DUDUCLAW_LANE=explore`（継承した DuDuClaw MCP サーバーは `read`／`draft` ツールだけを一覧・実行）、`--tools` は `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（`denied_tools` を除く）だけ、`--allowedTools` は DuDuClaw MCP ツールとそれらの組み込みツールだけ（従業員自身の許可リストより広くならず、`.mcp.json` の他のサーバーのツールは自動承認されません） |
-| OpenAI 互換ランタイム、ローカル推論のツールループ | 組み込みツールなし。MCP 子プロセスに `DUDUCLAW_LANE=explore` が渡ります |
+| Claude CLI | 起動時に `DUDUCLAW_LANE=explore`（継承した DuDuClaw MCP サーバーは `read`／`draft` ツールだけを一覧・実行）、`--tools` は `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（`denied_tools` を除く）だけ、`--allowedTools` は DuDuClaw MCP ツールとそれらの組み込みツールだけ（従業員自身の許可リストより広くならず、`.mcp.json` の他のサーバーのツールは自動承認されません）。`.mcp.json` の他の stdio サーバーは制御付きプロキシを通り、`read` ツールだけを一覧します |
+| OpenAI 互換ランタイム | 組み込みツールなし。DuDuClaw MCP 子プロセスに `DUDUCLAW_LANE=explore` が渡ります。lane 内では `agent.toml [mcp.external]` のサーバーをマウントせず、このランタイムは `.mcp.json` のサーバーを起動しません |
+| MoA モデル、`inference_mode = "local"` | 拒否（`explore_lane_unsupported`）。lane 内ではハイブリッドのローカル振り分けを使いません |
 | Codex、Gemini CLI、Antigravity、Grok、汎用 CLI | 拒否：そのラウンドはディスパッチ前に失敗し（`explore_lane_unsupported`）、フェイルオーバーで到達した場合に備えて各ランタイムの `execute` にも同じ拒否があります |
-| タスクサンドボックス（`[container] sandbox_enabled`） | 拒否（サンドボックスでは従業員がシェルを使えるため） |
+| タスクサンドボックス（`[container] sandbox_enabled`） | ディスパッチ前に拒否（サンドボックスでは従業員がシェルを使えるため） |
 
 拒否されたラウンドは不成功の実行として数えられ、連続失敗でいずれ継続タスクは一時停止します。lane を読み取れない場合もそのラウンドは失敗します（`explore_lane_unreadable`）。対象外：後で heartbeat が起こすサブタスクは lane の外で動きます（lane 内では `tasks_create` は `modify` なので拒否され、読み取り専用の実行は自らサブタスクを作れません）。実際のゲートウェイではまだ動かしていません。
 

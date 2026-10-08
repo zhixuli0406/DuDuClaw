@@ -41,6 +41,7 @@ export const SERVER_TRIGGER_EVENTS = [
   'tick',
   'security_event',
   'odoo_event',
+  'mcp_event',
 ] as const;
 
 /**
@@ -183,10 +184,11 @@ export const TRIGGER_FIELD_SUGGESTIONS: Record<AutopilotTriggerEvent, readonly s
   tick: ['source'],
   security_event: ['severity', 'event_type', 'agent_id', 'source'],
   odoo_event: ['event_type', 'model', 'record_id'],
+  mcp_event: ['server', 'name', 'agent_id', 'lane', 'suspicious'],
 };
 
 /** Triggers whose interesting fields are defined by the operator's own data. */
-export const FREE_FORM_FIELD_TRIGGERS: ReadonlySet<string> = new Set(['tick', 'odoo_event']);
+export const FREE_FORM_FIELD_TRIGGERS: ReadonlySet<string> = new Set(['tick', 'odoo_event', 'mcp_event']);
 
 // ── Form state ──────────────────────────────────────────────
 

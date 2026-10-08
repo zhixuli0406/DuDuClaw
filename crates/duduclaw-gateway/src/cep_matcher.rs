@@ -121,6 +121,8 @@ pub const KNOWN_EVENT_NAMES: &[&str] = &[
     // confirmed, then no payment within 7 days" is exactly the shape this
     // matcher exists for.
     "odoo_event",
+    // 2026-10-08: MCP Events deliveries (`crate::mcp_events`).
+    "mcp_event",
 ];
 
 /// Bounds on `within_secs` — floor rejects a degenerate always-false-window

@@ -248,6 +248,26 @@ impl MethodHandler {
             client_id: str_param(&params, "client_id").map(str::to_string),
             client_secret: params.get("client_secret").and_then(|v| v.as_str()).map(str::to_string),
             allowed_origins: crate::server::allowed_origins_snapshot(),
+            headers: match params.get("headers") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(m)) => {
+                    let mut out = Vec::new();
+                    for (k, v) in m {
+                        let Some(v) = v.as_str() else {
+                            return WsFrame::error_response("", "header values must be strings");
+                        };
+                        out.push((k.clone(), v.to_string()));
+                    }
+                    // Validated here so a bad header is refused before any
+                    // network call.
+                    if let Err(e) = store::validate_custom_headers(&out) {
+                        return WsFrame::error_response("", &e);
+                    }
+                    Some(out)
+                }
+                Some(_) => return WsFrame::error_response("", "headers must be an object of name: value"),
+            },
+            server_stream: params.get("server_stream").and_then(|v| v.as_bool()),
         };
         let host = req
             .url
@@ -360,6 +380,94 @@ impl MethodHandler {
         }
     }
 
+    /// `mcp.tool_effects { agent_id }` — Admin only. Every third-party
+    /// server whose `tools/list` passed `duduclaw mcp-proxy` or `duduclaw
+    /// mcp-remote-bridge` for this employee, each tool with the effect class
+    /// and verdict the current policy gives it (recomputed now from the
+    /// recorded annotations; `observed_at` says when the list was seen).
+    pub(crate) async fn handle_mcp_tool_effects(&self, params: Value) -> WsFrame {
+        let agent_id = str_param(&params, "agent_id").unwrap_or("").to_string();
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        let home = self.home_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::third_party_tools::load_snapshots(&home, &agent_id)
+        })
+        .await
+        {
+            Ok(servers) => WsFrame::ok_response("", json!({ "servers": servers })),
+            Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
+        }
+    }
+
+    /// `mcp.events_subscribe { agent_id, server, event_types, mode? }` —
+    /// Admin only. Subscribes the employee's remote server's events to this
+    /// gateway's webhook. `mode`: `explore` (default, read-only runs) or
+    /// `normal` (an explicit operator opt-in).
+    pub(crate) async fn handle_mcp_events_subscribe(&self, params: Value) -> WsFrame {
+        let agent_id = str_param(&params, "agent_id").unwrap_or("").to_string();
+        let server = str_param(&params, "server").unwrap_or("").to_string();
+        let types: Vec<String> = match params.get("event_types").and_then(|v| v.as_array()) {
+            Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            None => return WsFrame::error_response("", "event_types must be an array of names"),
+        };
+        let mode = match str_param(&params, "mode").unwrap_or("explore") {
+            "explore" => crate::mcp_events::store::EventMode::Explore,
+            "normal" => crate::mcp_events::store::EventMode::Normal,
+            _ => return WsFrame::error_response("", "mode must be explore or normal"),
+        };
+        match crate::mcp_events::service::subscribe(&self.home_dir, &agent_id, &server, &types, mode).await {
+            Ok(v) => WsFrame::ok_response("", json!({ "subscription": v })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `mcp.events_list { agent_id? }` — Admin only. No secrets.
+    pub(crate) async fn handle_mcp_events_list(&self, params: Value) -> WsFrame {
+        let filter = str_param(&params, "agent_id").map(str::to_string);
+        if let Some(a) = &filter
+            && !is_valid_agent_id(a)
+        {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        let home = self.home_dir.clone();
+        let base_ok = crate::mcp_events::service::public_base_url(&home);
+        match tokio::task::spawn_blocking(move || crate::mcp_events::service::list(&home, filter.as_deref())).await {
+            Ok(Ok(list)) => WsFrame::ok_response(
+                "",
+                json!({
+                    "subscriptions": list,
+                    "public_base_url_set": base_ok.is_ok(),
+                    "public_base_url_problem": base_ok.err(),
+                }),
+            ),
+            Ok(Err(e)) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
+        }
+    }
+
+    /// `mcp.events_unsubscribe { id }` — Admin only. Local delete first (the
+    /// callback URL answers 404 at once), then `events/unsubscribe` upstream,
+    /// best effort.
+    pub(crate) async fn handle_mcp_events_unsubscribe(&self, params: Value) -> WsFrame {
+        let id = str_param(&params, "id").unwrap_or("").to_string();
+        match crate::mcp_events::service::unsubscribe(&self.home_dir, &id).await {
+            Ok(ack) => WsFrame::ok_response("", json!({ "success": true, "upstream_acknowledged": ack })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `mcp.events_rotate { id }` — Admin only. New signing secret; the old
+    /// one is accepted for 15 minutes.
+    pub(crate) async fn handle_mcp_events_rotate(&self, params: Value) -> WsFrame {
+        let id = str_param(&params, "id").unwrap_or("").to_string();
+        match crate::mcp_events::service::rotate(&self.home_dir, &id).await {
+            Ok(v) => WsFrame::ok_response("", json!({ "subscription": v })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     /// `mcp.remote_disconnect { agent_id, name, forget? }` — Admin only.
     /// Deletes the stored credentials (local only). `forget: true` also
     /// removes the record and the `.mcp.json` entry.
@@ -371,7 +479,9 @@ impl MethodHandler {
         }
         let forget = params.get("forget").and_then(|v| v.as_bool()).unwrap_or(false);
         let (home, a, s) = (self.home_dir.clone(), agent_id.clone(), server.clone());
-        let res = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let res = tokio::task::spawn_blocking(move || -> Result<(bool, Option<connect::RevocationTarget>), String> {
+            // Read what to revoke before the local delete removes it.
+            let target = connect::revocation_target(&home, &a, &s);
             let existed = connect::disconnect(&home, &a, &s, forget)?;
             if forget {
                 let agent_dir = home.join("agents").join(&a);
@@ -383,11 +493,25 @@ impl MethodHandler {
                     duduclaw_agent::mcp_template::remove_server_from_config(&agent_dir, &s)?;
                 }
             }
-            Ok(existed)
+            Ok((existed, target))
         })
         .await;
         match res {
-            Ok(Ok(existed)) => {
+            Ok(Ok((existed, target))) => {
+                // RFC 7009 revocation at the provider, after the local delete
+                // and off the request path: best effort, audited.
+                if let Some(t) = target {
+                    let (home, a, s) = (self.home_dir.clone(), agent_id.clone(), server.clone());
+                    tokio::spawn(async move {
+                        let outcome = connect::revoke_at_provider(t).await;
+                        remote_mcp::audit(
+                            &home,
+                            remote_mcp::AUDIT_TOKEN_REVOCATION,
+                            &a,
+                            json!({ "agent_id": a, "server": s, "outcome": outcome }),
+                        );
+                    });
+                }
                 remote_mcp::audit(
                     &self.home_dir,
                     remote_mcp::AUDIT_DISCONNECTED,

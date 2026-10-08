@@ -28,6 +28,21 @@ DuDuClawの認可ページへ遷移する。ページ上で**内部MCP APIキー
 内で `is_external = false` になっているキー）を貼り付け、「接続に同意する」（同意連線）を
 クリックすれば完了する。
 
+## ChatGPT から使う
+
+ChatGPT は DuDuClaw をカスタムコネクタ（開発者モードの「アプリ」）として追加できます。ストアには何も公開されず、コネクタはあなたの ChatGPT アカウントの中にだけあります。
+
+1. `duduclaw http-server` を固定の **https** アドレスで公開します（リバースプロキシや名前付きトンネル。ChatGPT は OpenAI のサーバーから接続するため、ループバックや LAN のアドレスでは届きません）。
+2. ChatGPT で開発者モードを有効にし（設定 → アプリとコネクタ → 詳細設定。提供プランは OpenAI 次第）、サーバー URL `https://<あなたのアドレス>/mcp`、認証 OAuth でコネクタを作成します。
+3. ChatGPT は認可サーバーを見つけ（RFC 9728 → RFC 8414）、動的クライアント登録（`POST /oauth/register`）か Client ID Metadata Document（`client_id` が DuDuClaw の読みに行く https URL。2026-10-08 から対応、下記）で自分を登録します。サードパーティのガイドによるとリダイレクト URI は `https://chatgpt.com/connector_platform_oauth_redirect` です。DuDuClaw は任意の https リダイレクト URI を受け付けるので、特別な設定は要りません。
+4. DuDuClaw の同意ページが開いたら、**内部** MCP API キーを貼り付けて承認します。
+
+ChatGPT が得る権限はすべての OAuth クライアントと同じ外部クライアント等級（下記）です：基本ツールに加え、最大で `memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`。コネクタ、実行系、名簿、Admin のツールは OAuth では決して公開されません。
+
+Client ID Metadata Document：`client_id` がパス付きの `https://` URL で登録済み id でない場合、DuDuClaw はそれを取得します（公開アドレスのみ、固定解決、リダイレクトに従わない、5 秒、5 KiB、1 時間キャッシュ）。文書の `client_id` は URL と一致し、`redirect_uris` は https（またはループバックの http）で実際に使うものを含む必要があり、公開クライアント（`token_endpoint_auth_method` がないか `none`）だけを受け付けます。認可サーバーのメタデータは `client_id_metadata_document_supported: true` を宣言します。
+
+未検証：実際の ChatGPT アカウントでは試していません。リダイレクト URI と登録方法はサードパーティのコネクタガイドによるもので（執筆時に OpenAI 自身のページは取得できませんでした）、フローはローカルのリクエストでのみテストしています。
+
 ## 認可モデル（重要）
 
 OAuthが発行するアクセストークンは**常に「外部クライアント」ティア**として扱われ、外部向け
