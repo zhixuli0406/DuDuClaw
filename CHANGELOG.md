@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.72.0] - 2026-10-09 — 第三方 MCP 動作規則、MCP Events 與唯讀探索通道
+
 ### Added
 - **第三方 MCP 工具的動作類型與動作規則**：`.mcp.json` 其他 MCP server 的工具，依其 `tools/list` 的 `annotations` 分類（`destructiveHint` ⇒ `delete`；`readOnlyHint` 只有在 `agent.toml [capabilities] trusted_read_hint_servers` 列出該伺服器時才算 `read`，否則 `modify`；沒有標記一律 `modify`），並在 `duduclaw mcp-proxy` 與 `duduclaw mcp-remote-bridge` 套用 `action_rules`：`block` 從員工看到的 `tools/list` 隱藏並以 `-32003` 拒絕（稽核 `third_party_tool_refused`），`ask` 走 ApprovalBroker（核准系統不可用即拒絕，稽核 `third_party_tool_approval`），探索通道只開放 `read`。工具規則可寫 `<伺服器>.<工具>`。啟動時的 `.mcp.json` 改寫在員工有 `action_rules` 或處於探索通道時也會把 stdio 伺服器包進 proxy（原本只有遮蔽啟用時），心跳主動檢查的 spawn 一併改用。儀表板 `MCP → 遠端伺服器` 新增「第三方工具與其動作類型」（RPC `mcp.tool_effects`，管理者）。只有 Claude CLI 涉及；`url`／`type` 項目不涵蓋。
 - **MCP Events 接收端**（草案 MCP Events 擴充的 webhook 模式，依 Triggers & Events 工作小組設計草稿實作）：管理者 RPC `mcp.events_subscribe`／`_list`／`_unsubscribe`／`_rotate`，對已連線的遠端伺服器呼叫 `events/subscribe`，事件送到一律掛載的 `POST /webhook/mcp-events/{id}`（不認得的 id 回 404）。每個訂閱有自己的 `whsec_` 簽章金鑰（以本機金鑰檔加密，可更換、可撤銷），投遞依 Standard Webhooks 以常數時間驗證，5 分鐘時間窗、重播快取、256 KiB 上限、每訂閱每分鐘 120 次；回應驗證挑戰，記錄 `gap`／`terminated`，排程在授權到期前重新訂閱。接受的事件寫成 `events.db` 的 `mcp.event`（`input_guard` 掃描、資料上限 16 KiB），自動化規則新增觸發 `mcp_event`，持續責任新增事件來源 `mcp.event`。事件啟動的工作預設在唯讀探索通道執行（佇列新增 `lane` 欄位、Claude CLI 帶 `DUDUCLAW_LANE=explore` 與唯讀內建工具），訂閱時明確允許才用一般模式；與唯讀持續任務共用同一個旗標與同一套限制：只有 Claude CLI 與 OpenAI 相容執行環境的員工能執行，其他 runtime 與任務沙箱在開始前就拒絕（`explore_lane_unsupported`），MoA 模型與純本機推論也拒絕。需要 `config.toml [mcp_events] public_base_url`。儀表板「遠端伺服器的事件」區塊，三種語言。
