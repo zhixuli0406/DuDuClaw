@@ -30,4 +30,9 @@ RUN npm install \
     && npm install -g . \
     && duduclaw --version
 
-CMD ["mcp-proxy", "--", "/app/distribution/glama/entrypoint.sh"]
+# mcp-proxy 6.7.16 listens on IPv6 "::" port 8080 and does not read PORT.
+# A gateway that dials the container's IPv4 address, or probes $PORT, gets
+# an immediate 502. Exec form cannot expand these variables.
+# MCP_PROXY_HOST is a backstop for a regenerated CMD that drops the flags.
+ENV MCP_PROXY_HOST=0.0.0.0
+CMD ["sh", "-c", "exec mcp-proxy --host \"${MCP_PROXY_HOST:-0.0.0.0}\" --port \"${MCP_PROXY_PORT:-${PORT:-8080}}\" -- /app/distribution/glama/entrypoint.sh"]

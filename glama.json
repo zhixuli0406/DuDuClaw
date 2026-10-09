@@ -1,8 +1,12 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "maintainers": ["zhixuli0406"]
+  "maintainers": ["zhixuli0406"],
   "build": {
-	"dockerfile": "Dockerfile"
-  }
-  "command": ["mcp-proxy", "--", "/app/distribution/glama/entrypoint.sh"]
+    "dockerfile": "Dockerfile"
+  },
+  "command": [
+    "sh",
+    "-c",
+    "exec mcp-proxy --host \"${MCP_PROXY_HOST:-0.0.0.0}\" --port \"${MCP_PROXY_PORT:-${PORT:-8080}}\" -- /app/distribution/glama/entrypoint.sh"
+  ]
 }
