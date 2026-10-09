@@ -1,4 +1,8 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
   "maintainers": ["zhixuli0406"]
+  "build": {
+	"dockerfile": "Dockerfile"
+  }
+  "command": ["mcp-proxy", "--", "/app/distribution/glama/entrypoint.sh"]
 }
