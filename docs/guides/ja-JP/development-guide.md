@@ -72,7 +72,7 @@ fallback = "claude"        # 検出できない場合に使うバックエンド
 |----------|-----------|------|------|
 | `claude` | `claude`（常に利用可能、コア） | OAuth / API Key ローテーション | デフォルトバックエンド |
 | `codex` | `codex` | OpenAI | — |
-| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 で非推奨、v1.72.0 で削除予定**（[非推奨となった名称](deprecations.md)参照）。個人版 OAuth は 2026-06-18 に廃止；有料 API キーは引き続き利用可 |
+| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 で非推奨、v1.73.0 で削除予定**（[非推奨となった名称](deprecations.md)参照）。個人版 OAuth は 2026-06-18 に廃止；有料 API キーは引き続き利用可 |
 | `antigravity` | `agy`（`~/.local/bin/agy`） | Google サインイン（ターミナルで `agy` を実行）/ `GEMINI_API_KEY` | Gemini CLI の公式後継、マルチモデル（Gemini 3.x + Claude + GPT-OSS） |
 | `openai_compat` | HTTP（CLI なし） | プロバイダーごとのキー | Exo / llamafile / vLLM などの OpenAI 互換エンドポイント |
 

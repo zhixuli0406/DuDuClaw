@@ -2,12 +2,12 @@
 
 ## 架構總覽（依 v1.67.0 校對）
 
-DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Platform）**，透過統一的 `AgentRuntime` trait 支援 **Claude Code / Codex / Antigravity / Grok** CLI（另有 OpenAI 相容 API）作為 AI 後端（Gemini CLI 後端自 v1.67.0 起棄用，v1.72.0 移除，由 Antigravity 取代），具備自動偵測與逐 Agent 設定能力。DuDuClaw 並非獨立的 LLM 產品；它是把一個（或多個）AI CLI 轉變成長駐運作 Agent 的管線層，涵蓋通道路由、對話記憶、自我演化、多帳號輪替、本機 LLM 推理、瀏覽器自動化與 IDE 整合。
+DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Platform）**，透過統一的 `AgentRuntime` trait 支援 **Claude Code / Codex / Antigravity / Grok** CLI（另有 OpenAI 相容 API）作為 AI 後端（Gemini CLI 後端自 v1.67.0 起棄用，v1.73.0 移除，由 Antigravity 取代），具備自動偵測與逐 Agent 設定能力。DuDuClaw 並非獨立的 LLM 產品；它是把一個（或多個）AI CLI 轉變成長駐運作 Agent 的管線層，涵蓋通道路由、對話記憶、自我演化、多帳號輪替、本機 LLM 推理、瀏覽器自動化與 IDE 整合。
 
 ## 關鍵架構決策
 
 ### 執行環境與傳輸層
-- **Multi-Runtime**（`AgentRuntime` trait）— `runtime_catalog.rs` 中有 13 個 runtime id：12 個 CLI 後端（Claude、Codex、Antigravity（`agy`）、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode，以及 v1.67.0 起棄用、v1.72.0 移除的 Gemini CLI），加上 OpenAI-compat HTTP。其中 5 個 CLI 與 OpenAI-compat 各有自己的模組；其餘 7 個 CLI 共用一個通用的 print-mode runtime。`RuntimeRegistry` 自動偵測，逐 Agent 設定寫在 `agent.toml [runtime] provider`。
+- **Multi-Runtime**（`AgentRuntime` trait）— `runtime_catalog.rs` 中有 13 個 runtime id：12 個 CLI 後端（Claude、Codex、Antigravity（`agy`）、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode，以及 v1.67.0 起棄用、v1.73.0 移除的 Gemini CLI），加上 OpenAI-compat HTTP。其中 5 個 CLI 與 OpenAI-compat 各有自己的模組；其餘 7 個 CLI 共用一個通用的 print-mode runtime。`RuntimeRegistry` 自動偵測，逐 Agent 設定寫在 `agent.toml [runtime] provider`。
 - **跨 runtime failover 的模型替換**（`failover.rs`）：當 `[runtime] fallback` 把呼叫轉到*不同*的 provider 時，備援 runtime 不再沿用主要 runtime 的模型 id（過去 codex Agent 的 `gpt-5.4` 會被拿去丟給 Claude runtime）。模型依四個有序分支解析：① `agent.toml [model] fallbacks` 中第一個明確屬於備援 runtime 模型家族的項目（帶 `provider/model` 前綴的會去掉前綴）；② 若該 runtime 本來就能服務所要求的模型，則保留原模型（`openai_compat` 不宣告模型家族，靠這條分支繼續代理任意 id）；③ runtime catalog 為該後端列出的第一個模型；④ 以上皆無則**拒絕 spawn**，回報 `no model configured for fallback runtime <P>`，並記為一次失敗的嘗試。每次替換都會輸出 `warn!`，帶有 `agent` / `from_runtime` / `to_runtime` / `from_model` / `to_model`。
 - **MCP Server（stdio）**（`duduclaw mcp-server`）透過 stdin/stdout 上的 JSON-RPC 2.0，把通道、記憶、Agent、skill、task、共用 wiki、autopilot 等工具暴露給 AI Runtime。註冊層級在 Agent 端的 `<agent>/.mcp.json`（v1.8.5 撤回了 v1.8.4 的全域註冊，因為 Claude CLI `-p --dangerously-skip-permissions` 只會讀取專案層級的 `.mcp.json`）。Gateway 啟動時會自動為所有 Agent 建立／修復 `.mcp.json`。
 - **MCP Server（HTTP/SSE）**（`duduclaw http-server --bind 127.0.0.1:8765`，v1.9.4）— Bearer 驗證的 `POST /mcp/v1/call`（單次 JSON-RPC 工具呼叫）、`GET /mcp/v1/stream`（長駐 SSE 事件串流，Bearer 或 `?api_key=`）、`POST /mcp/v1/stream/call`（非同步 + SSE 結果推送）、`GET /healthz`（免驗證）。Token bucket 速率限制（60 req/min）。`mcp_sse_store.rs` 用 broadcast channel 管理 SSE 連線。與 stdio 互補，服務外部 HTTP client。

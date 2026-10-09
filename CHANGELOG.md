@@ -26,6 +26,7 @@
   - 未驗證：開發環境沒有 Docker，暫停／恢復、VNC、轉送與串流只用替身與單元測試驗證，真實瀏覽器中的 noVNC 也沒跑過；`x11vnc` 是否接受 `-rfbport 0 -unixsock` 未驗證（不接受時串流拒絕啟動）。即時串流本身不遮罩。說明：`docs/features/08-browser-automation.md`「Keep-alive, live view and takeover」（三種語言）。
 
 ### Changed
+- **Gemini CLI runtime 的移除時間由 v1.72.0 再延到 v1.73.0**（runtime id `gemini`，仍是棄用狀態，行為不變）：v1.69.1 修正後用真的 Gemini 金鑰重驗 Antigravity 的步驟還沒做，移除等重驗完成。`duduclaw doctor` 與 `runtime.detect` 顯示的移除版本同步改為 v1.73.0，三種語言的文件一併更新。
 - 主動訊息的「被忽略」判斷略過 `feedback.jsonl` 中 `source = "deliverable"` 的列。
 
 ### Fixed

@@ -185,7 +185,7 @@ Declaring only a `model` is fine — the catalog binds it to the runtime that se
 
 ### 2. First-batch runtimes only
 
-`claude`, `codex`, `gemini` (deprecated in v1.67.0, removed in v1.72.0: use `antigravity`), `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
+`claude`, `codex`, `gemini` (deprecated in v1.67.0, removed in v1.73.0: use `antigravity`), `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
 
 The reason is tools, not capability: these five register DuDuClaw's MCP server natively, so a role running on one gets the full tool surface. A role that silently loses its tools produces confident tool-free narration, which the verifier cannot tell apart from actual work.
 

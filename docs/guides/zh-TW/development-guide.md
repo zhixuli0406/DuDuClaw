@@ -67,7 +67,7 @@ fallback = "claude"        # 後端偵測不到時改用此後端
 |----------|-----------|------|------|
 | `claude` | `claude`（永遠可用，核心） | OAuth / API Key 輪替 | 預設後端 |
 | `codex` | `codex` | OpenAI | — |
-| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 棄用，v1.72.0 移除**（見[已棄用名稱](deprecations.md#gemini-cli-runtime)）。個人版 OAuth 於 2026-06-18 停用；付費金鑰仍可用 |
+| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 棄用，v1.73.0 移除**（見[已棄用名稱](deprecations.md#gemini-cli-runtime)）。個人版 OAuth 於 2026-06-18 停用；付費金鑰仍可用 |
 | `antigravity` | `agy`（`~/.local/bin/agy`） | Google 登入（在終端機執行 `agy`）/ `GEMINI_API_KEY` | Gemini CLI 的官方後繼者，多模型（Gemini 3.x + Claude + GPT-OSS） |
 | `openai_compat` | HTTP（無 CLI） | per-provider key | Exo / llamafile / vLLM 等 OpenAI 相容端點 |
 

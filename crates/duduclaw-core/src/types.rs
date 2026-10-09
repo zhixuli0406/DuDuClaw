@@ -5601,7 +5601,7 @@ runtime = "gemini"
         );
         assert_eq!(dn[0].code(), "deprecated_runtime");
         let text = dn[0].to_string();
-        assert!(text.contains("antigravity") && text.contains("v1.72.0"), "{text}");
+        assert!(text.contains("antigravity") && text.contains("v1.73.0"), "{text}");
 
         let c = team(
             r#"
