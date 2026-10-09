@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **電腦操作即時畫面的 VNC 不再聽 TCP**：Debian 的 x11vnc 0.9.17（libvncserver 0.9.15）在 `-rfbport 0 -unixsock -localhost -noipv6` 下仍在 IPv6 `::1:5900` 聽 port。v1.72.0 的 computer-use 映像 smoke 因此在 unix socket 起來之後拒絕啟動（`a VNC TCP port is listening; refusing`），`ghcr.io/zhixuli0406/duduclaw-computer-use:v1.72.0` 沒有推上去。`duduclaw-vnc` 改為 `-rfbport 0 -rfbportv6 -1`（`-rfbport` 必須維持 0，改成 `-1` 會讓 x11vnc 刪掉 unix socket）。5900–5999 的 LISTEN 檢查保留。本機 arm64 映像驗證：沒有 5900–5999 LISTEN，unix socket 回 `RFB 003.008`。兩種架構的映像 CI 與真實瀏覽器的 noVNC 還沒跑。
+
 ## [1.72.0] - 2026-10-09 — 第三方 MCP 動作規則、MCP Events 與唯讀探索通道
 
 ### Added

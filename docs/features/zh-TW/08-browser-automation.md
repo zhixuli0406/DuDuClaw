@@ -277,7 +277,7 @@ gateway 會解析觀看端送來的協定內容（RFB 3.7/3.8）：鍵盤、滑�
 
 ### 未涵蓋與未驗證
 
-- 開發環境沒有 Docker：暫停／恢復、VNC 輔助程式、轉送與串流只用替身與單元測試驗證。轉送腳本與 TCP port 檢查在一般 Linux 上跑過；映像 workflow 的 smoke test 已加上透過轉送讀 RFB 開頭、瀏覽器帳號連不到 socket、沒有 VNC TCP port 的檢查，但還沒跑過。Debian 映像裡的 `x11vnc` 是否完全照用法接受 `-rfbport 0 -unixsock` 未驗證；不接受時串流會拒絕啟動，不會暴露任何東西。
+- 開發環境沒有 Docker：暫停／恢復與串流只用替身與單元測試驗證。v1.72.0 的映像 smoke 有跑，而且拒絕啟動：Debian 的 x11vnc 0.9.17（連到 libvncserver 0.9.15）在 `-rfbport 0 -unixsock -localhost -noipv6` 下仍在 IPv6 `::1:5900` 聽 port，helper 因此停掉伺服器。本機 arm64 映像上試過 `-rfbport 0 -rfbportv6 -1 -unixsock`（其餘旗標不變）：5900–5999 沒有 LISTEN，unix socket 回 `RFB 003.008`。兩種架構的映像 CI 與真實瀏覽器的 noVNC 還沒跑。
 - 真實瀏覽器中的 noVNC 畫面、真實容器的 `docker pause`／`docker unpause` 以及對暫停中容器的 `docker rm --force` 都未驗證。
 - VNC 認證是 8 字元密碼與 DES；真正的保護是 root 專用的 unix socket 與 gateway 經過驗證、過濾的轉送。密碼會送到有權觀看者的瀏覽器。
 - 綁定該員工的主管或 Operator 看得到整個畫面（遮罩只套用在員工拿到的截圖，不套用在即時串流），包括網站顯示的內容。

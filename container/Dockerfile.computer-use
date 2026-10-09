@@ -70,8 +70,9 @@ COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
 COPY container/scripts/duduclaw-eval-dom /usr/local/bin/duduclaw-eval-dom
 COPY container/scripts/duduclaw-navigate /usr/local/bin/duduclaw-navigate
 COPY container/scripts/duduclaw_cdp.py /usr/local/bin/duduclaw_cdp.py
-# Live view (P8): started on demand by the gateway through `docker exec`;
-# x11vnc listens only on a unix socket in the root-only /tmp/duduclaw-root.
+# Live view (P8): started on demand by the gateway through `docker exec`.
+# x11vnc listens only on a unix socket (`-rfbport 0 -rfbportv6 -1`) in the
+# root-only /tmp/duduclaw-root. The helper refuses if 5900-5999 still listens.
 COPY container/scripts/duduclaw-vnc /usr/local/bin/duduclaw-vnc
 COPY container/scripts/duduclaw-vnc-relay /usr/local/bin/duduclaw-vnc-relay
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh \
