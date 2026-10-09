@@ -283,5 +283,5 @@ A person resumes it from the Computer tab (**Resume**, audited `injection_resume
 - A Manager or Operator bound to the employee sees the whole screen (masking applies to the employee's screenshots, not to the live stream), including what a site displays.
 - Switching between view-only and input mode restarts the VNC server, so open viewers disconnect and reconnect.
 - Keep-alive, takeover and the viewer count live in the gateway process: a gateway restart ends sessions as before.
-- The settings are read from `agent.toml`; the employee edit page has no fields for them yet.
+- Both settings are on the employee edit page (computer-use section, Admin only, through `agents.update`): keep-alive 0–240 minutes, takeover idle limit 1–60 minutes; the server refuses any other value or type.
 

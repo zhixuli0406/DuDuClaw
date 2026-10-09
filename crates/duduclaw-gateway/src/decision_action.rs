@@ -61,6 +61,11 @@ pub enum DecisionSource {
     Install,
     /// An autopilot rule whose circuit breaker tripped (`autopilot.db`).
     Autopilot,
+    /// P9: feedback on one finished item of a saved daily digest
+    /// (`<home>/digest/<date>.json`, recorded in `feedback.jsonl`). Not a
+    /// decision anything waits on; it shares the codec so every channel
+    /// dispatcher routes the press without a new branch.
+    Digest,
 }
 
 impl DecisionSource {
@@ -72,6 +77,7 @@ impl DecisionSource {
             Self::Approval => "apv",
             Self::Install => "inst",
             Self::Autopilot => "auto",
+            Self::Digest => "dig",
         }
     }
 
@@ -82,6 +88,7 @@ impl DecisionSource {
             "apv" => Some(Self::Approval),
             "inst" => Some(Self::Install),
             "auto" => Some(Self::Autopilot),
+            "dig" => Some(Self::Digest),
             _ => None,
         }
     }
@@ -97,6 +104,7 @@ impl DecisionSource {
             Self::Approval => "approval",
             Self::Install => "install",
             Self::Autopilot => "autopilot_circuit",
+            Self::Digest => "digest_feedback",
         }
     }
 }
@@ -121,6 +129,12 @@ pub enum DecisionAct {
     /// `Submit`/`Take over`). Deliberately distinct from [`Self::Done`]/
     /// [`Self::Abort`] — it does not resolve the task, only claims it.
     Takeover,
+    /// Digest: 👍 on a finished item.
+    Up,
+    /// Digest: 👎 on a finished item.
+    Down,
+    /// Digest: "needs changes" on a finished item.
+    Changes,
 }
 
 impl DecisionAct {
@@ -134,6 +148,9 @@ impl DecisionAct {
             Self::Deny => "no",
             Self::Pause => "pause",
             Self::Takeover => "take",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Changes => "chg",
         }
     }
 
@@ -146,6 +163,9 @@ impl DecisionAct {
             "no" => Some(Self::Deny),
             "pause" => Some(Self::Pause),
             "take" => Some(Self::Takeover),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            "chg" => Some(Self::Changes),
             _ => None,
         }
     }
@@ -166,6 +186,7 @@ impl DecisionAct {
                 matches!(self, Self::Approve | Self::Deny)
             }
             DecisionSource::Autopilot => matches!(self, Self::Pause),
+            DecisionSource::Digest => matches!(self, Self::Up | Self::Down | Self::Changes),
         }
     }
 }
@@ -307,14 +328,15 @@ fn parse_legacy(data: &str) -> Option<DecisionAction> {
 mod tests {
     use super::*;
 
-    const ALL_SOURCES: [DecisionSource; 5] = [
+    const ALL_SOURCES: [DecisionSource; 6] = [
         DecisionSource::Goal,
         DecisionSource::Kickoff,
         DecisionSource::Approval,
         DecisionSource::Install,
         DecisionSource::Autopilot,
+        DecisionSource::Digest,
     ];
-    const ALL_ACTS: [DecisionAct; 7] = [
+    const ALL_ACTS: [DecisionAct; 10] = [
         DecisionAct::Retry,
         DecisionAct::Done,
         DecisionAct::Abort,
@@ -322,6 +344,9 @@ mod tests {
         DecisionAct::Deny,
         DecisionAct::Pause,
         DecisionAct::Takeover,
+        DecisionAct::Up,
+        DecisionAct::Down,
+        DecisionAct::Changes,
     ];
 
     #[test]
@@ -386,6 +411,26 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn digest_feedback_is_its_own_verb_set() {
+        for act in [DecisionAct::Up, DecisionAct::Down, DecisionAct::Changes] {
+            let wire = encode(DecisionSource::Digest, act, "20261008.12");
+            assert!(wire.len() <= MAX_ACTION_ID_BYTES, "{wire}");
+            let got = parse(&wire).unwrap();
+            assert_eq!((got.source, got.act, got.id.as_str()), (DecisionSource::Digest, act, "20261008.12"));
+            for other in [
+                DecisionSource::Goal,
+                DecisionSource::Kickoff,
+                DecisionSource::Approval,
+                DecisionSource::Install,
+                DecisionSource::Autopilot,
+            ] {
+                assert_eq!(parse(&encode(other, act, "x")), None);
+            }
+        }
+        assert_eq!(parse(&encode(DecisionSource::Digest, DecisionAct::Approve, "x")), None);
     }
 
     #[test]

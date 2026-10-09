@@ -474,6 +474,10 @@ pub enum NoticeKind {
     /// A decision card. Re-rendered with its buttons at delivery time and
     /// never merged — each one needs its own tap targets.
     Decision,
+    /// P9: the daily digest (`decision_id` = the saved digest's date),
+    /// re-rendered with its feedback buttons from `<home>/digest/<date>.json`
+    /// at delivery time and never merged.
+    Digest,
 }
 
 impl Default for NoticeKind {
@@ -795,6 +799,17 @@ impl DeferredNotifyDrainer {
         for n in due.iter().filter(|n| n.kind == NoticeKind::Decision) {
             if self.deliver_decision(&http, n).await {
                 delivered += 1;
+            }
+        }
+
+        // Daily digests → individually, from the saved digest.
+        for n in due.iter().filter(|n| n.kind == NoticeKind::Digest) {
+            if crate::digest::deliver_deferred(&self.home_dir, &http, n).await {
+                delivered += 1;
+                let lvl = NotifyLevel::from_str_token(&n.level).unwrap_or(NotifyLevel::Fyi);
+                crate::notify_stats::record_push(&self.home_dir, &n.notify_type, lvl, None);
+            } else {
+                warn!(channel = %n.channel, "notify-governance: 延後的每日摘要未能投遞");
             }
         }
 

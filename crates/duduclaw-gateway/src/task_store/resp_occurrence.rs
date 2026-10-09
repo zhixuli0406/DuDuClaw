@@ -228,6 +228,39 @@ impl TaskStore {
         Ok(Some((occ, resp)))
     }
 
+    /// The responsibilities whose occurrence is `task_id` itself or one of
+    /// its ancestors (parent chain, up to [`STOP_ANCESTRY_DEPTH`] levels):
+    /// every responsibility run whose tree contains the task.
+    pub async fn occurrence_tree_responsibilities(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<ResponsibilityRow>, String> {
+        let conn = self.conn.lock().await;
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT DISTINCT o.responsibility_id FROM responsibility_occurrences o \
+                     WHERE o.task_id IN (WITH RECURSIVE anc(id, depth) AS ( \
+                       SELECT ?1, 0 UNION ALL SELECT t.parent_task_id, anc.depth + 1 FROM tasks t \
+                       JOIN anc ON t.id = anc.id WHERE t.parent_task_id IS NOT NULL \
+                         AND anc.depth < {STOP_ANCESTRY_DEPTH}) SELECT id FROM anc)"
+                ))
+                .map_err(|e| format!("occurrence tree: {e}"))?;
+            stmt.query_map(params![task_id], |r| r.get(0))
+                .map_err(|e| format!("occurrence tree: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("occurrence tree: {e}"))?
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(
+                get_responsibility_conn(&conn, &id)?
+                    .ok_or("occurrence without responsibility")?,
+            );
+        }
+        Ok(out)
+    }
+
     pub async fn list_occurrences(
         &self,
         responsibility_id: &str,

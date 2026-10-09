@@ -62,6 +62,8 @@ pub enum DecisionVerb {
     /// task is NOT resolved — it stays `needs_human`; only the channel card
     /// collapses.
     TakenOver,
+    /// P9: feedback on a digest item was recorded (nothing waits on it).
+    FeedbackRecorded,
 }
 
 impl DecisionVerb {
@@ -75,6 +77,7 @@ impl DecisionVerb {
             Self::Abandoned => "已放棄",
             Self::Paused => "已暫停",
             Self::TakenOver => "已接手",
+            Self::FeedbackRecorded => "已記錄回饋",
         }
     }
 
@@ -88,6 +91,7 @@ impl DecisionVerb {
             Self::Abandoned => "⛔",
             Self::Paused => "⏸",
             Self::TakenOver => "👤",
+            Self::FeedbackRecorded => "📝",
         }
     }
 

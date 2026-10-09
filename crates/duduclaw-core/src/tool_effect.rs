@@ -225,17 +225,45 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
     Some(effect)
 }
 
-/// The class of a native Claude Code tool (catalog display only; action
-/// rules are enforced on DuDuClaw MCP tools, see the module docs).
+/// The class of a native Claude Code tool by exact name, or `None` for a
+/// name this table does not know (see [`effect_of_cli_builtin`]).
 pub fn effect_of_native(tool_name: &str) -> Option<ToolEffect> {
     use ToolEffect::*;
     Some(match tool_name {
         "Read" | "Glob" | "Grep" | "WebFetch" | "WebSearch" => Read,
         "TodoWrite" => Draft,
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => Modify,
-        "Bash" | "Task" => Admin,
+        "Bash" | "Task" | "Agent" => Admin,
         _ => return None,
     })
+}
+
+/// The Claude Code built-in tools [`ActionRules::builtins_refused`] judges
+/// at spawn. Names outside [`effect_of_native`] are classed `admin`.
+pub const CLAUDE_CLI_BUILTIN_TOOLS: &[&str] = &[
+    "Read",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Task",
+    "Agent",
+    "SlashCommand",
+    "ExitPlanMode",
+];
+
+/// The class of a Claude Code built-in tool: the [`effect_of_native`] entry,
+/// or [`ToolEffect::Admin`] for any other name (fail closed).
+pub fn effect_of_cli_builtin(tool_name: &str) -> ToolEffect {
+    effect_of_native(tool_name).unwrap_or(ToolEffect::Admin)
 }
 
 /// The class a gate applies to `tool_name`: the table entry, or
@@ -381,6 +409,61 @@ impl ActionRules {
             return Some(verdict.map_or(ActionVerdict::Ask, |v| v.max(ActionVerdict::Ask)));
         }
         verdict
+    }
+
+    /// The strictest verdict among the `tool` rules naming `tool_name`
+    /// (effect rules ignored). Used for a rule written for a removed tool
+    /// name, which keeps gating the call that replaced it
+    /// ([`crate::tool_catalog::removed_name_for_call`]).
+    pub fn tool_rule_verdict(&self, tool_name: &str) -> Option<ActionVerdict> {
+        self.rules
+            .iter()
+            .filter(|r| match &r.target {
+                ActionTarget::Tool(entry) => {
+                    crate::tool_catalog::tool_entry_matches(entry, tool_name)
+                }
+                ActionTarget::Effect(_) => false,
+            })
+            .map(|r| r.verdict)
+            .max()
+    }
+
+    /// The verdict for one call with its arguments: [`Self::resolve`] for the
+    /// tool, raised by any `tool` rule written for the removed name this
+    /// call replaces (`wiki_write` with `scope = "shared"` is still
+    /// `shared_wiki_write`). Only ever stricter than [`Self::resolve`].
+    pub fn resolve_for_call(
+        &self,
+        tool_name: &str,
+        effect: ToolEffect,
+        args: &serde_json::Value,
+    ) -> Option<ActionVerdict> {
+        let own = self.resolve(tool_name, effect);
+        let legacy = crate::tool_catalog::removed_name_for_call(tool_name, args)
+            .and_then(|legacy| self.tool_rule_verdict(legacy));
+        match (own, legacy) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The Claude Code built-in tools these rules keep away from a spawned
+    /// Claude CLI (`--disallowedTools`). A built-in call never reaches the
+    /// ApprovalBroker, so `ask` is treated as `block` here (fail closed);
+    /// built-ins are classed by [`effect_of_cli_builtin`] (unknown ⇒
+    /// `admin`). Empty when the key is absent.
+    pub fn builtins_refused(&self) -> Vec<String> {
+        if self.is_absent() && !self.malformed {
+            return Vec::new();
+        }
+        CLAUDE_CLI_BUILTIN_TOOLS
+            .iter()
+            .filter(|name| {
+                self.resolve(name, effect_of_cli_builtin(name))
+                    .is_some_and(|v| v >= ActionVerdict::Ask)
+            })
+            .map(|name| (*name).to_string())
+            .collect()
     }
 }
 
@@ -673,6 +756,92 @@ mod tests {
 
     fn rules(v: serde_json::Value) -> ActionRules {
         ActionRules::from_value(v)
+    }
+
+    #[test]
+    fn cli_builtins_are_classified_and_unknown_names_are_admin() {
+        assert_eq!(effect_of_cli_builtin("Read"), ToolEffect::Read);
+        assert_eq!(effect_of_cli_builtin("WebSearch"), ToolEffect::Read);
+        assert_eq!(effect_of_cli_builtin("TodoWrite"), ToolEffect::Draft);
+        assert_eq!(effect_of_cli_builtin("MultiEdit"), ToolEffect::Modify);
+        assert_eq!(effect_of_cli_builtin("Bash"), ToolEffect::Admin);
+        assert_eq!(effect_of_cli_builtin("Task"), ToolEffect::Admin);
+        assert_eq!(effect_of_cli_builtin("Agent"), ToolEffect::Admin);
+        assert_eq!(effect_of_cli_builtin("SomethingNew"), ToolEffect::Admin);
+        assert_eq!(effect_of_cli_builtin("read"), ToolEffect::Admin, "exact names only");
+    }
+
+    #[test]
+    fn builtins_refused_treats_ask_as_block_and_never_touches_absent_rules() {
+        assert!(ActionRules::default().builtins_refused().is_empty());
+        let r = rules(serde_json::json!([
+            { "effect": "modify", "verdict": "ask" },
+            { "tool": "Bash", "verdict": "block" },
+            { "effect": "read", "verdict": "allow" },
+        ]));
+        let refused = r.builtins_refused();
+        for t in ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] {
+            assert!(refused.contains(&t.to_string()), "{t}: {refused:?}");
+        }
+        for t in ["Read", "Grep", "Task", "TodoWrite"] {
+            assert!(!refused.contains(&t.to_string()), "{t}: {refused:?}");
+        }
+        // A tool rule beats an effect rule, as for MCP tools.
+        let r = rules(serde_json::json!([
+            { "effect": "admin", "verdict": "block" },
+            { "tool": "Task", "verdict": "allow" },
+        ]));
+        let refused = r.builtins_refused();
+        assert!(refused.contains(&"Bash".to_string()));
+        assert!(refused.contains(&"SlashCommand".to_string()), "unknown ⇒ admin");
+        assert!(!refused.contains(&"Task".to_string()));
+        // Malformed ⇒ every side-effecting built-in kept away; reads stay.
+        let bad = rules(serde_json::json!([{ "effect": "send", "verdict": "maybe" }]));
+        let refused = bad.builtins_refused();
+        assert!(refused.contains(&"Write".to_string()) && refused.contains(&"Bash".to_string()));
+        assert!(!refused.contains(&"Read".to_string()));
+        assert!(!refused.contains(&"TodoWrite".to_string()));
+        let unreadable = ActionRules::unreadable().builtins_refused();
+        assert!(unreadable.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn a_rule_for_a_removed_name_follows_its_replacement_call() {
+        let r = rules(serde_json::json!([
+            { "tool": "shared_wiki_write", "verdict": "block" },
+            { "tool": "schedule_task", "verdict": "ask" },
+        ]));
+        let eff = |t: &str| crate::effect_of(t);
+        let shared = serde_json::json!({"scope": "shared"});
+        assert_eq!(
+            r.resolve_for_call("wiki_write", eff("wiki_write"), &shared),
+            Some(ActionVerdict::Block)
+        );
+        assert_eq!(
+            r.resolve_for_call("wiki_write", eff("wiki_write"), &serde_json::json!({})),
+            None
+        );
+        assert_eq!(
+            r.resolve_for_call(
+                "tasks_create",
+                eff("tasks_create"),
+                &serde_json::json!({"schedule": "0 9 * * *"})
+            ),
+            Some(ActionVerdict::Ask)
+        );
+        // Never looser than the call's own verdict.
+        let r = rules(serde_json::json!([
+            { "tool": "wiki_write", "verdict": "block" },
+            { "tool": "shared_wiki_write", "verdict": "allow" },
+        ]));
+        assert_eq!(
+            r.resolve_for_call("wiki_write", eff("wiki_write"), &shared),
+            Some(ActionVerdict::Block)
+        );
+        // An effect rule does not match the removed name (it would class it
+        // `admin`).
+        let r = rules(serde_json::json!([{ "effect": "admin", "verdict": "block" }]));
+        assert_eq!(r.tool_rule_verdict("shared_wiki_write"), None);
     }
 
     #[test]

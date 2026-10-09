@@ -151,17 +151,79 @@ fn approval_denied(message: String) -> OpError {
     OpError::new(ErrorCode::ApprovalDenied, message)
 }
 
+/// P3 action review (`config.toml [action_review] mode`, default off) for a
+/// computer tool every list gate let run without a person: the same review
+/// the MCP gate runs for other tools, which skips the `computer_*` tools
+/// because the gateway owns them. `Ok(false)` runs, `Ok(true)` needs a
+/// person's approval (`ask`, or no verdict under `enforce` — fail closed),
+/// `Err` refuses (`block` under `enforce`). Only argument keys reach the
+/// reviewer. One `tool_calls.jsonl` row per review.
+pub(super) async fn action_review(
+    home: &Path,
+    agent_id: &str,
+    tool: &'static str,
+    args: &serde_json::Value,
+) -> Result<bool, OpError> {
+    use crate::action_review::{self as ar, ActionReviewMode, ReviewOutcome};
+    if !duduclaw_core::effect_of(tool).is_side_effecting() {
+        return Ok(false);
+    }
+    let mode = ActionReviewMode::from_home(home);
+    if mode == ActionReviewMode::Off {
+        return Ok(false);
+    }
+    let dir = agent_dir(home, agent_id);
+    let input = ar::ReviewInput::build(tool, &json!({ "arguments": args }), &dir);
+    let verdict = ar::review(home, &dir, &input).await;
+    let result = ar::outcome(mode, verdict);
+    {
+        let (home, agent) = (home.to_path_buf(), agent_id.to_string());
+        let audit = ar::audit_value(verdict);
+        let mode_s = mode.as_str();
+        let ok = result == ReviewOutcome::Run;
+        let _ = tokio::task::spawn_blocking(move || {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                &home,
+                &agent,
+                tool,
+                &format!("action review ({mode_s}) → {audit}"),
+                ok,
+                &[
+                    ("action_review", serde_json::Value::String(audit.to_string())),
+                    ("action_review_mode", serde_json::Value::String(mode_s.to_string())),
+                ],
+            );
+        })
+        .await;
+    }
+    match result {
+        ReviewOutcome::Run => Ok(false),
+        ReviewOutcome::AskPerson => Ok(true),
+        ReviewOutcome::Refuse => Err(forbidden(format!(
+            "工具「{tool}」的呼叫經動作審查（[action_review] enforce）判定會越過此員工的界線，已拒絕執行。"
+        ))),
+    }
+}
+
 /// Ask a human through the [`ApprovalBroker`] (`action_kind = "mcp_call"`)
 /// and wait for the decision. `detail` is gateway-built text (never
 /// agent-controlled free text). Anything but an approval refuses.
+///
+/// P7 (2026-10-08 close-out): the request is a single-use
+/// [`ActionGrant`](crate::approval::action_grant::ActionGrant) bound to this
+/// employee, tool and `args` (a gateway-built snapshot of the operation:
+/// hashes for typed text and URLs, never the raw text); on approval the
+/// binding is checked against the call and consumed once before it runs.
 pub(super) async fn obtain_approval(
     home: &Path,
     agent_id: &str,
     tool: &'static str,
     detail: &str,
+    args: &serde_json::Value,
     ttl_secs: i64,
     poll: Duration,
 ) -> Result<(), OpError> {
+    use crate::approval::action_grant::{ACTION_GRANT_KEY, ActionGrant, GrantRefusal, verify_and_consume};
     let broker = match ApprovalBroker::open(home) {
         Ok(b) => b,
         Err(e) => {
@@ -171,10 +233,17 @@ pub(super) async fn obtain_approval(
             )));
         }
     };
+    let call = json!({ "arguments": args });
+    let grant = ActionGrant::build(agent_id, tool, &call);
     let summary = format!(
-        "AI 員工 {agent_id} 要使用電腦操作工具「{tool}」{detail}；此工具列在審批清單中，需經管理員核可後才能執行。"
+        "AI 員工 {agent_id} 要使用電腦操作工具「{tool}」{detail}；此工具列在審批清單中，需經管理員核可後才能執行。\n\n{}",
+        grant.card_text()
     );
-    let payload = json!({"tool": tool, "via": "computer_use_route"});
+    let payload = json!({
+        "tool": tool,
+        "via": "computer_use_route",
+        ACTION_GRANT_KEY: grant.to_json(),
+    });
     let id = match broker.request(agent_id, "mcp_call", &summary, payload, ttl_secs).await {
         Ok(id) => id,
         Err(e) => {
@@ -185,7 +254,18 @@ pub(super) async fn obtain_approval(
         }
     };
     match broker.await_decision(&id, poll).await {
-        Ok(ApprovalStatus::Approved) => Ok(()),
+        Ok(ApprovalStatus::Approved) => match verify_and_consume(&broker, &id, &grant).await {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                warn!(approval = %id, ?refusal, "computer tool approval not usable — denying (fail-closed)");
+                let what = match refusal {
+                    GrantRefusal::Mismatch => "核准內容與這次呼叫不符",
+                    GrantRefusal::AlreadyUsed | GrantRefusal::NotApproved => "這份核准已被使用或已失效",
+                    GrantRefusal::Store(_) => "無法確認核准內容",
+                };
+                Err(approval_denied(format!("{what}，工具「{tool}」的呼叫已拒絕。")))
+            }
+        },
         Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) =>
             Err(approval_denied(format!(
             "工具「{tool}」的呼叫已被管理員拒絕（審核編號 {id}）。"

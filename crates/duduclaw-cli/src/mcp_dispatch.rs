@@ -344,6 +344,19 @@ pub(crate) fn action_rule_verdict(
     rules.resolve(tool_name, duduclaw_core::effect_of(tool_name))
 }
 
+/// [`action_rule_verdict`] for one call with its arguments: a `tool` rule
+/// written for a removed tool name (`shared_wiki_write`, `schedule_task`,
+/// `skill_bank_search`) keeps gating the call that replaced it, like
+/// `denied_tools` does (`tool_catalog::removed_name_for_call`). Only ever
+/// stricter than the listing verdict.
+pub(crate) fn action_rule_verdict_for_call(
+    rules: &duduclaw_core::ActionRules,
+    tool_name: &str,
+    args: &Value,
+) -> Option<duduclaw_core::ActionVerdict> {
+    rules.resolve_for_call(tool_name, duduclaw_core::effect_of(tool_name), args)
+}
+
 /// Tools always governed by a `[permissions]` flag (v1.68), by exact name.
 pub(crate) const PERMISSION_GATED_TOOLS: &[(&str, &str)] = &[
     ("create_agent", "can_create_agents"),
@@ -1011,8 +1024,11 @@ impl McpDispatcher {
         // layer". The `computer_*` tools apply the same resolution in the
         // gateway (`computer_use_sessions::gates`), which owns their session.
         if !principal.is_external
-            && action_rule_verdict(&agent_gate.action_rules, tool_name)
-                == Some(duduclaw_core::ActionVerdict::Block)
+            && action_rule_verdict_for_call(
+                &agent_gate.action_rules,
+                tool_name,
+                params_owned.get("arguments").unwrap_or(&Value::Null),
+            ) == Some(duduclaw_core::ActionVerdict::Block)
         {
             let effect = duduclaw_core::effect_of(tool_name);
             let msg = format!(
@@ -1136,39 +1152,28 @@ impl McpDispatcher {
                                 );
                             }
                         };
-                        let approval_id = match broker
-                            .request(
-                                gate_agent,
-                                "mcp_call",
-                                &risk,
-                                duduclaw_core::with_host_task_id(
-                                    params_owned.clone(),
-                                    duduclaw_core::host_task_id().as_deref(),
-                                ),
-                                POLICY_ASK_TTL_SECONDS,
-                            )
-                            .await
-                        {
-                            Ok(aid) => aid,
-                            Err(e) => {
-                                warn!(error = %e, "approval request failed — denying (fail-closed)");
-                                duduclaw_gateway::otel::record_tool_outcome(
-                                    &tracing::Span::current(),
-                                    false,
-                                );
-                                return jsonrpc_error(
-                                    id,
-                                    -32003,
-                                    "Approval request failed (fail-closed deny)",
-                                );
-                            }
-                        };
-                        let granted = broker
-                            .await_decision(&approval_id, POLICY_ASK_POLL)
-                            .await
-                            .map(|s| s.is_granted())
-                            .unwrap_or(false);
-                        if !granted {
+                        // P7: the approval is bound to this exact call
+                        // (employee, tool, canonical arguments) and used
+                        // once; a second use or a changed call is refused.
+                        let grant = duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                            gate_agent,
+                            tool_name,
+                            &params_owned,
+                        );
+                        let outcome = crate::mcp::approval::run_approval_bound(
+                            &broker,
+                            gate_agent,
+                            crate::mcp::approval::ApprovalSubject::ToolCall(tool_name),
+                            &risk,
+                            params_owned.clone(),
+                            POLICY_ASK_TTL_SECONDS,
+                            POLICY_ASK_POLL,
+                            None,
+                            Some(&grant),
+                        )
+                        .await;
+                        if let crate::mcp::InstallApprovalOutcome::Denied(msg) = outcome {
+                            warn!(agent = %gate_agent, tool = %tool_name, %msg, "PolicyKernel ask not approved");
                             duduclaw_gateway::otel::record_tool_outcome(
                                 &tracing::Span::current(),
                                 false,
@@ -3737,6 +3742,150 @@ effect = "forbid"
         assert!(
             msg.contains("denied or expired at human approval"),
             "got: {result}"
+        );
+    }
+
+    /// P7: a PolicyKernel `ask` approval is bound to the exact call and
+    /// consumed by it (single use).
+    #[tokio::test]
+    async fn policy_ask_approval_is_bound_and_consumed_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_acting_agent_toml(
+            &tmp,
+            "[[capabilities.policy]]\ntool = \"memory_search\"\neffect = \"ask\"\n",
+        );
+        let (rec, result) = dispatch_held_then_decide(
+            &tmp,
+            internal_principal(),
+            "memory_search",
+            serde_json::json!({ "query": "x" }),
+            true,
+        )
+        .await;
+        assert_ne!(result["error"]["code"], -32003, "approved call runs: {result}");
+        let grant = &rec.payload[duduclaw_gateway::approval::action_grant::ACTION_GRANT_KEY];
+        assert_eq!(grant["tool"], "memory_search");
+        assert_eq!(grant["agent_id"], "dudu");
+        assert!(rec.summary.contains("此核准只涵蓋這一次呼叫"), "{}", rec.summary);
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        let after = broker.get(&rec.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            duduclaw_gateway::approval::ApprovalStatus::Invalidated,
+            "a used approval is consumed"
+        );
+    }
+
+    // ── P3 action review, `enforce`, end to end through the dispatcher ──────
+    //
+    // The reviewer answer is fixed through the gateway's task-local test seam
+    // (`action_review::REVIEWER_FIXTURE`), so nothing reaches a model; the
+    // ApprovalBroker is the real in-process store, decided by the test.
+
+    fn enforce_home() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[action_review]\nmode = \"enforce\"\n",
+        )
+        .unwrap();
+        write_acting_agent_toml(&tmp, "[agent]\nname = \"dudu\"\n");
+        tmp
+    }
+
+    fn store_args() -> Value {
+        serde_json::json!({ "content": "review fixture note" })
+    }
+
+    async fn dispatch_reviewed(
+        tmp: &tempfile::TempDir,
+        verdict: Option<duduclaw_gateway::action_review::ReviewVerdict>,
+        decide: Option<bool>,
+    ) -> (Option<duduclaw_gateway::approval::ApprovalRecord>, Value) {
+        let dispatcher = make_dispatcher(tmp).await;
+        let params = make_params("memory_store", store_args());
+        let task = tokio::spawn(duduclaw_gateway::action_review::REVIEWER_FIXTURE.scope(
+            verdict,
+            async move {
+                dispatcher
+                    .dispatch_tool_call(
+                        &internal_principal(),
+                        &make_ns_ctx(false),
+                        &params,
+                        &serde_json::json!(51),
+                    )
+                    .await
+            },
+        ));
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        let mut filed = None;
+        for _ in 0..400 {
+            if let Some(rec) = broker.list_pending(None).await.unwrap_or_default().into_iter().next() {
+                filed = Some(rec);
+                break;
+            }
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let (Some(rec), Some(approve)) = (&filed, decide) {
+            broker.decide(&rec.id, approve, "test-approver").await.unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("dispatch returns")
+            .unwrap();
+        (filed, result)
+    }
+
+    #[tokio::test]
+    async fn enforce_review_block_refuses_without_asking_anyone() {
+        use duduclaw_gateway::action_review::ReviewVerdict;
+        let tmp = enforce_home();
+        let (filed, result) = dispatch_reviewed(&tmp, Some(ReviewVerdict::Block), None).await;
+        assert!(filed.is_none(), "block files no approval");
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+        assert!(
+            result["error"]["message"].as_str().unwrap_or("").contains("動作審查"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_review_ask_runs_only_after_an_approval() {
+        use duduclaw_gateway::action_review::ReviewVerdict;
+        let tmp = enforce_home();
+        let (filed, result) =
+            dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(true)).await;
+        let rec = filed.expect("ask files an approval");
+        assert_eq!(rec.agent_id, "dudu");
+        assert!(rec.summary.contains("動作審查"), "{}", rec.summary);
+        assert!(result.get("error").is_none(), "approved call runs: {result}");
+
+        let tmp = enforce_home();
+        let (filed, result) =
+            dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(false)).await;
+        assert!(filed.is_some());
+        assert_eq!(result["error"]["code"], -32003, "denied call refused: {result}");
+    }
+
+    #[tokio::test]
+    async fn enforce_review_unavailable_asks_a_person_and_allow_runs() {
+        use duduclaw_gateway::action_review::ReviewVerdict;
+        let tmp = enforce_home();
+        let (filed, result) = dispatch_reviewed(&tmp, None, Some(false)).await;
+        assert!(filed.is_some(), "no verdict under enforce asks a person");
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+
+        let tmp = enforce_home();
+        let (filed, result) = dispatch_reviewed(&tmp, Some(ReviewVerdict::Allow), None).await;
+        assert!(filed.is_none(), "allow files nothing");
+        assert!(result.get("error").is_none(), "allow runs: {result}");
+        let rows = read_tool_call_rows(&tmp);
+        assert!(
+            rows.iter().any(|r| r["action_review"] == "allow"),
+            "every review is audited"
         );
     }
 

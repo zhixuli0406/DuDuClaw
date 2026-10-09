@@ -95,6 +95,7 @@ import {
   kvRowsFromTable,
   teamRolesShareVendor,
   type OdooFormState,
+  clampInt,
 } from './editPayload';
 import { ToolNameListField, TypedKvTable } from './v168-controls';
 import { ActionRulesEditor } from './ActionRulesEditor';
@@ -514,7 +515,13 @@ export function EditAgentPage() {
     setCaps({
       ...DEFAULT_CAPABILITIES,
       ...(c ?? {}),
-      computer_use_config: { ...DEFAULT_CAPABILITIES.computer_use_config, ...(c?.computer_use_config ?? {}) },
+      computer_use_config: {
+        ...DEFAULT_CAPABILITIES.computer_use_config,
+        ...(c?.computer_use_config ?? {}),
+        // 0 on disk means "the default" (10 minutes) for the takeover window.
+        takeover_idle_minutes:
+          c?.computer_use_config?.takeover_idle_minutes || DEFAULT_CAPABILITIES.computer_use_config.takeover_idle_minutes,
+      },
     } as typeof DEFAULT_CAPABILITIES);
     // Auto-expand the advanced editors when the agent already carries
     // engineer-level config an operator would otherwise not see.
@@ -1306,6 +1313,22 @@ export function EditAgentPage() {
               <RowNumber label={t('agents.cap.maxActions')} description="1-10000" value={caps.computer_use_config.max_actions} min={1} max={10000} onChange={(v) => updateCapConfig('max_actions', v)} />
               <RowNumber label={t('agents.cap.displayWidth')} description="320-7680" value={caps.computer_use_config.display_width} min={320} max={7680} onChange={(v) => updateCapConfig('display_width', v)} />
               <RowNumber label={t('agents.cap.displayHeight')} description="240-4320" value={caps.computer_use_config.display_height} min={240} max={4320} onChange={(v) => updateCapConfig('display_height', v)} />
+              <RowNumber
+                label={t('agents.cap.keepAliveMinutes')}
+                description={t('agents.cap.keepAliveMinutes.help')}
+                value={caps.computer_use_config.keep_alive_minutes}
+                min={0}
+                max={240}
+                onChange={(v) => updateCapConfig('keep_alive_minutes', clampInt(v, 0, 240))}
+              />
+              <RowNumber
+                label={t('agents.cap.takeoverIdleMinutes')}
+                description={t('agents.cap.takeoverIdleMinutes.help')}
+                value={caps.computer_use_config.takeover_idle_minutes}
+                min={1}
+                max={60}
+                onChange={(v) => updateCapConfig('takeover_idle_minutes', clampInt(v, 1, 60))}
+              />
               <RowSwitch disabled={!isAdmin} label={t('agents.cap.autoConfirmTrusted')} description={t('agents.cap.autoConfirmTrusted.help')} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
             </SettingsCard>
           </DangerZone>

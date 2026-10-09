@@ -949,10 +949,34 @@ impl ComputerUseSessions {
     /// (the session does not idle out meanwhile) and the tool gates run
     /// again after it. `detail` is gateway-built text for the approval
     /// summary.
-    async fn admit(&self, agent_id: &str, tool: &'static str, detail: &str) -> Result<(), OpError> {
+    ///
+    /// `args` is the gateway-built snapshot of the operation the approval is
+    /// bound to (P7, single use) and whose keys the action review sees (P3,
+    /// `[action_review] mode`, default off: a call no list sends to a person
+    /// is reviewed; `block` refuses, `ask` / no verdict asks a person).
+    async fn admit(
+        &self,
+        agent_id: &str,
+        tool: &'static str,
+        detail: &str,
+        args: &Value,
+    ) -> Result<(), OpError> {
         gates::tool_gates(&self.home, agent_id, tool).await?;
         if !gates::approval_required(&self.home, agent_id, tool) {
-            return Ok(());
+            match gates::action_review(&self.home, agent_id, tool, args).await {
+                Ok(false) => return Ok(()),
+                Ok(true) => {}
+                Err(err) => {
+                    self.audit_line(
+                        agent_id,
+                        "action_refused",
+                        json!({"tool": tool, "code": err.code.as_str(), "by": "action_review"}),
+                        None,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
         }
         let waiting = self
             .entry(agent_id)
@@ -962,6 +986,7 @@ impl ComputerUseSessions {
             agent_id,
             tool,
             detail,
+            args,
             self.approval_ttl_secs,
             self.approval_poll,
         )
@@ -1009,7 +1034,13 @@ impl ComputerUseSessions {
             ));
         }
         self.start_allowed(agent_id).await?;
-        self.admit(agent_id, gates::TOOL_START, "").await?;
+        let start_args = json!({
+            "width": req.width,
+            "height": req.height,
+            "workspace": req.workspace,
+            "task_hash": req.task.as_ref().map(|t| crate::approval::payload_hash(&json!(t))),
+        });
+        self.admit(agent_id, gates::TOOL_START, "", &start_args).await?;
         // Re-checked after a possible approval wait.
         let caps = self.start_allowed(agent_id).await?;
         // An existing live session is reported, never replaced.
@@ -1207,7 +1238,7 @@ impl ComputerUseSessions {
         agent_id: &str,
         session_id: Option<&str>,
     ) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_SCREENSHOT, "").await?;
+        self.admit(agent_id, gates::TOOL_SCREENSHOT, "", &json!({})).await?;
         let mut session = self.locked(agent_id, session_id).await?;
         let shot = session.backend.screenshot().await;
         let now = Instant::now();
@@ -1330,18 +1361,25 @@ impl ComputerUseSessions {
         // names the destination host — the validated, gateway-held host,
         // never the agent's free text. The lock is released again before the
         // (possibly long) approval wait; `navigate` re-validates under it.
-        let detail = match req {
+        let (detail, grant_args) = match req {
             ActionRequest::Navigate { url } => {
                 gates::tool_gates(&self.home, agent_id, tool).await?;
                 let session = self.locked(agent_id, session_id).await?;
                 let checked =
                     navigation::validate_url(url, &session.nav_hosts, session.nav_configured)?;
                 drop(session);
-                navigate_approval_detail(&checked)
+                // Bound to the exact URL through its hash; the card shows
+                // only the validated host.
+                let args = json!({
+                    "type": "navigate",
+                    "host": checked.host,
+                    "url_hash": crate::approval::payload_hash(&json!(url)),
+                });
+                (navigate_approval_detail(&checked), args)
             }
-            _ => approval_detail(req),
+            _ => (approval_detail(req), approval_action_snapshot(req)),
         };
-        self.admit(agent_id, tool, &detail).await?;
+        self.admit(agent_id, tool, &detail, &grant_args).await?;
         let mut session = self.locked(agent_id, session_id).await?;
         session.last_activity = Instant::now();
         self.ensure_not_paused(&session).await?;
@@ -1962,7 +2000,7 @@ impl ComputerUseSessions {
     // ── stop / status ────────────────────────────────────────────────────
 
     pub async fn stop(&self, agent_id: &str, session_id: Option<&str>) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_STOP, "").await?;
+        self.admit(agent_id, gates::TOOL_STOP, "", &json!({})).await?;
         let entry = self.lookup(agent_id).ok_or_else(not_found)?;
         let mut session = entry.lock().await;
         if session.ended || session.agent_id != agent_id {

@@ -7,6 +7,11 @@
 //! * `digest.feedback {task_id, verdict: up|down|changes, note?}` — Operator
 //!   on the employee and the task's audience (the shared task-content gate);
 //!   only a finished (`done`) task takes feedback.
+//! * `digest.feedback {artifact: {agent_id, archived_name}, verdict, note?}`
+//!   — a file the employee handed over (`artifacts.jsonl`, outbound only):
+//!   one tied to a task needs what that task needs (minus the `done` rule),
+//!   one without a task needs Operator on the employee. An unknown file and
+//!   a refusal read the same.
 
 #[allow(unused_imports)]
 use super::*;
@@ -65,6 +70,26 @@ impl MethodHandler {
                                     }
                                 }
                                 a.finished = kept;
+                                let mut kept_files = Vec::new();
+                                for art in a.artifacts.into_iter() {
+                                    let readable = match (&art.task_id, &store) {
+                                        (None, _) => true,
+                                        (Some(task_id), Some(s)) => self
+                                            .authorize_private_task_read(
+                                                s,
+                                                &live,
+                                                task_id,
+                                                AccessLevel::Viewer,
+                                            )
+                                            .await
+                                            .is_ok(),
+                                        (Some(_), None) => false,
+                                    };
+                                    if readable {
+                                        kept_files.push(art);
+                                    }
+                                }
+                                a.artifacts = kept_files;
                             }
                             agents.push(a);
                         }
@@ -75,8 +100,12 @@ impl MethodHandler {
                 let feedback: serde_json::Map<String, Value> = digest
                     .iter()
                     .flat_map(|d| d.agents.iter())
-                    .flat_map(|a| a.finished.iter())
-                    .filter_map(|i| verdicts.get(&i.id).map(|v| (i.id.clone(), json!(v))))
+                    .flat_map(|a| {
+                        a.finished.iter().map(|i| i.id.clone()).chain(a.artifacts.iter().map(
+                            |x| crate::digest::artifact_item_id(&x.agent_id, &x.archived_name),
+                        ))
+                    })
+                    .filter_map(|id| verdicts.get(&id).map(|v| (id.clone(), json!(v))))
                     .collect();
                 WsFrame::ok_response(
                     "",
@@ -86,6 +115,90 @@ impl MethodHandler {
                         "feedback": feedback,
                     }),
                 )
+            }
+            "digest.feedback" if params.get("artifact").is_some() => {
+                // A delivered file: `{artifact: {agent_id, archived_name}}`.
+                let art = &params["artifact"];
+                let (Some(agent_id), Some(archived)) = (
+                    art.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+                    art.get("archived_name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+                ) else {
+                    return WsFrame::error_response("", "artifact.agent_id and artifact.archived_name are required");
+                };
+                let Some(verdict) = params
+                    .get("verdict")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::digest::Verdict::parse)
+                else {
+                    return WsFrame::error_response("", "verdict must be up, down or changes");
+                };
+                let denied = || WsFrame::error_response("", super::task_privacy::PERMISSION_DENIED);
+                let home = self.home_dir.clone();
+                let (a, n) = (agent_id.to_string(), archived.to_string());
+                let row = tokio::task::spawn_blocking(move || {
+                    crate::artifacts::find_delivered(&home, &a, &n)
+                })
+                .await
+                .ok()
+                .flatten();
+                // Unknown file and no access read the same.
+                let Some(row) = row else { return denied() };
+                match &row.task_id {
+                    Some(task_id) => {
+                        let store = match self.task_store().await {
+                            Ok(s) => s,
+                            Err(f) => return f,
+                        };
+                        match self
+                            .authorize_private_task_read(&store, &live, task_id, AccessLevel::Operator)
+                            .await
+                        {
+                            Ok((t, _)) if t.assigned_to == row.agent_id => {}
+                            _ => return denied(),
+                        }
+                    }
+                    None => {
+                        if !live.has_agent_access(&row.agent_id, AccessLevel::Operator) {
+                            return denied();
+                        }
+                    }
+                }
+                let user = if live.user_id.is_empty() {
+                    "system".to_string()
+                } else {
+                    live.user_id.clone()
+                };
+                let item_id = crate::digest::artifact_item_id(&row.agent_id, &row.archived_name);
+                let title = if row.display_name.is_empty() {
+                    row.archived_name.clone()
+                } else {
+                    row.display_name.clone()
+                };
+                let note = params.get("note").and_then(|v| v.as_str()).map(str::to_string);
+                let home = self.home_dir.clone();
+                let (agent, id) = (row.agent_id.clone(), item_id.clone());
+                let written = tokio::task::spawn_blocking(move || {
+                    crate::digest::record_feedback(
+                        &home,
+                        &agent,
+                        "artifact",
+                        &id,
+                        &title,
+                        verdict,
+                        note.as_deref(),
+                        &user,
+                        Utc::now(),
+                    )
+                })
+                .await;
+                match written {
+                    Ok(Ok(_)) => WsFrame::ok_response(
+                        "",
+                        json!({ "item_id": item_id, "verdict": verdict.as_str() }),
+                    ),
+                    Ok(Err(e)) => WsFrame::error_response("", &format!("feedback not stored: {e}")),
+                    Err(e) => WsFrame::error_response("", &format!("feedback not stored: {e}")),
+                }
             }
             "digest.feedback" => {
                 let Some(task_id) = params

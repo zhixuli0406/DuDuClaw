@@ -4,6 +4,7 @@ import zhTW from '@/i18n/zh-TW.json';
 import jaJP from '@/i18n/ja-JP.json';
 import {
   buildUpdatePayload,
+  clampInt,
   isAdminOnlyPath,
   kvRowsFromTable,
   parseKvRow,
@@ -110,6 +111,22 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(r.payload).toEqual({
       capabilities: { approval_required_tools: ['send_message'], computer_use_config: { max_actions: 7 } },
     });
+  });
+
+  it('sends the keep-alive and takeover windows only when edited, clamped to range', () => {
+    const s = state({
+      caps: {
+        ...DEFAULT_CAPABILITIES,
+        computer_use_config: { ...DEFAULT_CAPABILITIES.computer_use_config, keep_alive_minutes: 30, takeover_idle_minutes: 5 },
+      },
+    });
+    const r = buildUpdatePayload(s, new Set(['caps.computer_use_config.keep_alive_minutes']), CTX);
+    expect(r.payload).toEqual({ capabilities: { computer_use_config: { keep_alive_minutes: 30 } } });
+    expect(clampInt(999, 0, 240)).toBe(240);
+    expect(clampInt(-3, 0, 240)).toBe(0);
+    expect(clampInt(0, 1, 60)).toBe(1);
+    expect(clampInt(2.6, 1, 60)).toBe(3);
+    expect(clampInt(Number.NaN, 1, 60)).toBe(1);
   });
 
   it('sends only edited odoo keys (no blanking profile/url when one allowlist changes)', () => {

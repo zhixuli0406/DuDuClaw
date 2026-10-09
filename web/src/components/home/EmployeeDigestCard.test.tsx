@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter } from 'react-router';
@@ -31,6 +31,17 @@ const digest = {
       runs_done: 1,
       runs_not_done: 0,
       spend_usd: 0.12,
+      artifacts: [
+        {
+          agent_id: 'alice',
+          archived_name: '1700000000_report.xlsx',
+          name: 'report.xlsx',
+          task_id: null,
+          produced_at: '2026-10-08T00:00:00Z',
+          no: 2,
+        },
+      ],
+      artifacts_total: 1,
     },
   ],
 };
@@ -54,10 +65,33 @@ describe('EmployeeDigestCard (P9)', () => {
     });
     renderCard();
     expect(await screen.findByText('Weekly report')).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole('button', { name: 'Good result' }));
+    await userEvent
+      .setup()
+      .click(within(screen.getByTestId('digest-item-t1')).getByRole('button', { name: 'Good result' }));
     await waitFor(() =>
       expect(calls.find(([m]) => m === 'digest.feedback')?.[1]).toEqual({ task_id: 't1', verdict: 'up' }),
     );
     expect(await screen.findByText('👍 rated')).toBeInTheDocument();
+  });
+
+  it('lists handed-over files and sends feedback on one', async () => {
+    const calls: Array<[string, unknown]> = [];
+    mockWsClient.call.mockImplementation((m: string, p?: unknown) => {
+      calls.push([m, p]);
+      if (m === 'digest.latest') return Promise.resolve({ enabled: true, digest, feedback: {} });
+      return Promise.resolve({ item_id: 'artifact:alice/1700000000_report.xlsx', verdict: 'down' });
+    });
+    renderCard();
+    expect(await screen.findByText('report.xlsx')).toBeInTheDocument();
+    expect(screen.getByText(/1 file handed over/)).toBeInTheDocument();
+    const row = screen.getByTestId('digest-item-artifact:alice/1700000000_report.xlsx');
+    await userEvent.setup().click(within(row).getByRole('button', { name: 'Not good' }));
+    await waitFor(() =>
+      expect(calls.find(([m]) => m === 'digest.feedback')?.[1]).toEqual({
+        artifact: { agent_id: 'alice', archived_name: '1700000000_report.xlsx' },
+        verdict: 'down',
+      }),
+    );
+    expect(await within(row).findByText('👎 rated')).toBeInTheDocument();
   });
 });

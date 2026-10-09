@@ -193,9 +193,22 @@ Argument values are withheld; only the keys, the effect class and closed evidenc
 shown. Answer allow if the call plausibly stays within the employee's boundaries, ask if a \
 person should confirm it first, block if it would clearly cross a boundary.";
 
+tokio::task_local! {
+    /// Test seam: inside this scope [`review`] returns the given answer
+    /// without a model call (`None` = the reviewer is unavailable). Only
+    /// in-process Rust code can enter a task-local scope, and no production
+    /// path does; it exists so the dispatcher tests can drive `enforce` end to
+    /// end without a network.
+    #[doc(hidden)]
+    pub static REVIEWER_FIXTURE: Option<ReviewVerdict>;
+}
+
 /// Review one call. `None` when the reviewer is unavailable or broke the
 /// reply contract.
 pub async fn review(home: &Path, agent_dir: &Path, input: &ReviewInput) -> Option<ReviewVerdict> {
+    if let Ok(fixed) = REVIEWER_FIXTURE.try_with(|v| *v) {
+        return fixed;
+    }
     let idx = crate::decide::decide_for_agent(
         home,
         Some(agent_dir),

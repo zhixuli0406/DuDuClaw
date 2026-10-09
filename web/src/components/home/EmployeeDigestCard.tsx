@@ -1,25 +1,100 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
-import { ThumbsDown, ThumbsUp, PencilLine } from 'lucide-react';
+import { Paperclip, ThumbsDown, ThumbsUp, PencilLine } from 'lucide-react';
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, Textarea } from '@/components/mds';
-import { api, type DeliverableVerdict, type EmployeeDigest } from '@/lib/api';
+import {
+  api,
+  digestArtifactKey,
+  type DeliverableVerdict,
+  type DigestArtifact,
+  type EmployeeDigest,
+} from '@/lib/api';
+
+type Translate = (id: string, values?: Record<string, string | number>) => string;
+
+/**
+ * 👍 / 👎 / "needs changes" (with an optional note) for one digest target.
+ * `send` performs the server call; the server checks the viewer's binding
+ * and the task's audience.
+ */
+function FeedbackRow({
+  itemKey,
+  given,
+  label,
+  t,
+  send,
+}: {
+  itemKey: string;
+  given: DeliverableVerdict | undefined;
+  label: ReactNode;
+  t: Translate;
+  send: (verdict: DeliverableVerdict, note?: string) => Promise<boolean>;
+}) {
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [note, setNote] = useState('');
+  return (
+    <li className="flex flex-col gap-1" data-testid={`digest-item-${itemKey}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        {label}
+        {given && <Badge variant="secondary">{t(`home.digest.verdict.${given}`)}</Badge>}
+        <span className="ml-auto flex gap-1">
+          <Button size="sm" variant="ghost" aria-label={t('home.digest.up')} onClick={() => void send('up')}>
+            <ThumbsUp className="size-3.5" />
+          </Button>
+          <Button size="sm" variant="ghost" aria-label={t('home.digest.down')} onClick={() => void send('down')}>
+            <ThumbsDown className="size-3.5" />
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-label={t('home.digest.changes')}
+            onClick={() => {
+              setNoteOpen(true);
+              setNote('');
+            }}
+          >
+            <PencilLine className="size-3.5" />
+          </Button>
+        </span>
+      </div>
+      {noteOpen && (
+        <div className="space-y-1">
+          <Textarea
+            className="h-14"
+            value={note}
+            placeholder={t('home.digest.notePlaceholder')}
+            onChange={(e) => setNote(e.target.value)}
+          />
+          <Button
+            size="sm"
+            onClick={() =>
+              void send('changes', note).then((ok) => {
+                if (ok) setNoteOpen(false);
+              })
+            }
+          >
+            {t('home.digest.sendChanges')}
+          </Button>
+        </div>
+      )}
+    </li>
+  );
+}
 
 /**
  * EmployeeDigestCard (P9) — the newest per-employee "while you were away"
  * digest the gateway assembled (no model call), with 👍 / 👎 / "needs
- * changes" on each finished item. Renders nothing while the feature is off
- * or before the first digest exists ("無事不報"); every item and every
- * feedback write is checked server-side against the viewer's binding and
- * the task's audience.
+ * changes" on each finished item and on each file the employee handed over.
+ * Renders nothing while the feature is off or before the first digest exists
+ * ("無事不報"); every item and every feedback write is checked server-side
+ * against the viewer's binding and the task's audience.
  */
 export function EmployeeDigestCard({ enabled }: { enabled: boolean }) {
   const intl = useIntl();
-  const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const t: Translate = (id, values) => intl.formatMessage({ id }, values);
   const [digest, setDigest] = useState<EmployeeDigest | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, DeliverableVerdict>>({});
-  const [noteFor, setNoteFor] = useState<string | null>(null);
-  const [note, setNote] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,17 +117,22 @@ export function EmployeeDigestCard({ enabled }: { enabled: boolean }) {
 
   if (!digest || digest.agents.length === 0) return null;
 
-  const send = async (taskId: string, verdict: DeliverableVerdict, text?: string) => {
+  const record = async (key: string, verdict: DeliverableVerdict, call: () => Promise<unknown>) => {
     setError(null);
     try {
-      await api.digest.feedback(taskId, verdict, text);
-      setVerdicts((v) => ({ ...v, [taskId]: verdict }));
-      setNoteFor(null);
-      setNote('');
+      await call();
+      setVerdicts((v) => ({ ...v, [key]: verdict }));
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return false;
     }
   };
+
+  const sendTask = (taskId: string) => (verdict: DeliverableVerdict, note?: string) =>
+    record(taskId, verdict, () => api.digest.feedback(taskId, verdict, note));
+  const sendFile = (file: DigestArtifact) => (verdict: DeliverableVerdict, note?: string) =>
+    record(digestArtifactKey(file), verdict, () => api.digest.feedbackArtifact(file, verdict, note));
 
   return (
     <Card data-testid="employee-digest">
@@ -71,62 +151,46 @@ export function EmployeeDigestCard({ enabled }: { enabled: boolean }) {
                 runs: a.runs_done + a.runs_not_done,
                 activity: a.activity_count,
               })}
+              {(a.artifacts_total ?? 0) > 0 ? ` · ${t('home.digest.files', { count: a.artifacts_total ?? 0 })}` : ''}
               {a.spend_usd != null && a.spend_usd > 0 ? ` · $${a.spend_usd.toFixed(2)}` : ''}
             </p>
             <ul className="space-y-1">
-              {a.finished.map((item) => {
-                const given = verdicts[item.id];
+              {a.finished.map((item) => (
+                <FeedbackRow
+                  key={item.id}
+                  itemKey={item.id}
+                  given={verdicts[item.id]}
+                  t={t}
+                  send={sendTask(item.id)}
+                  label={
+                    <Link className="underline-offset-2 hover:underline" to={`/tasks/${item.id}`}>
+                      {item.title}
+                    </Link>
+                  }
+                />
+              ))}
+              {(a.artifacts ?? []).map((file) => {
+                const key = digestArtifactKey(file);
                 return (
-                  <li key={item.id} className="flex flex-col gap-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Link className="underline-offset-2 hover:underline" to={`/tasks/${item.id}`}>
-                        {item.title}
-                      </Link>
-                      {given && <Badge variant="secondary">{t(`home.digest.verdict.${given}`)}</Badge>}
-                      <span className="ml-auto flex gap-1">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          aria-label={t('home.digest.up')}
-                          onClick={() => void send(item.id, 'up')}
-                        >
-                          <ThumbsUp className="size-3.5" />
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          aria-label={t('home.digest.down')}
-                          onClick={() => void send(item.id, 'down')}
-                        >
-                          <ThumbsDown className="size-3.5" />
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          aria-label={t('home.digest.changes')}
-                          onClick={() => {
-                            setNoteFor(item.id);
-                            setNote('');
-                          }}
-                        >
-                          <PencilLine className="size-3.5" />
-                        </Button>
+                  <FeedbackRow
+                    key={key}
+                    itemKey={key}
+                    given={verdicts[key]}
+                    t={t}
+                    send={sendFile(file)}
+                    label={
+                      <span className="inline-flex items-center gap-1">
+                        <Paperclip className="size-3.5 text-muted-foreground" aria-label={t('home.digest.fileLabel')} />
+                        {file.task_id ? (
+                          <Link className="underline-offset-2 hover:underline" to={`/tasks/${file.task_id}`}>
+                            {file.name}
+                          </Link>
+                        ) : (
+                          <span>{file.name}</span>
+                        )}
                       </span>
-                    </div>
-                    {noteFor === item.id && (
-                      <div className="space-y-1">
-                        <Textarea
-                          className="h-14"
-                          value={note}
-                          placeholder={t('home.digest.notePlaceholder')}
-                          onChange={(e) => setNote(e.target.value)}
-                        />
-                        <Button size="sm" onClick={() => void send(item.id, 'changes', note)}>
-                          {t('home.digest.sendChanges')}
-                        </Button>
-                      </div>
-                    )}
-                  </li>
+                    }
+                  />
                 );
               })}
             </ul>

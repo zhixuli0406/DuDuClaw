@@ -340,17 +340,21 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         // Either way the run starts only on a runtime that can carry the
         // lane; anything else (or an unreadable lane) fails it before it
         // starts, and a refused goal round is returned unrun.
-        let responsibility_lane = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
-            match extract_goal_loop_task_id_and_round(&msg.payload) {
-                Some((task_id, _)) => {
-                    crate::responsibility::round_requires_explore_lane(home_dir, task_id)
-                        .await
-                        .map_err(|e| format!("explore_lane_unreadable: {e}"))
-                }
-                None => Ok(false),
-            }
+        // The responsibility source covers the occurrence's whole task tree:
+        // a goal round of the occurrence or of a sub-goal under it, and a
+        // heartbeat task-board wake-up for any task under it.
+        let lane_task_id = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
+            extract_goal_loop_task_id_and_round(&msg.payload).map(|(task_id, _)| task_id)
+        } else if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
+            extract_heartbeat_task_id(&msg.payload)
         } else {
-            Ok(false)
+            None
+        };
+        let responsibility_lane = match lane_task_id {
+            Some(task_id) => crate::responsibility::round_requires_explore_lane(home_dir, task_id)
+                .await
+                .map_err(|e| format!("explore_lane_unreadable: {e}")),
+            None => Ok(false),
         };
         let explore_lane = match resolve_dispatch_lane(
             home_dir,

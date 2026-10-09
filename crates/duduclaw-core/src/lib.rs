@@ -150,7 +150,8 @@ pub use takeover_state::{
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use tool_effect::{
-    effect_from_annotations, effect_of, effect_of_builtin, third_party_tool_ref, ActionRule,
+    effect_from_annotations, effect_of, effect_of_builtin, effect_of_cli_builtin,
+    third_party_tool_ref, ActionRule, CLAUDE_CLI_BUILTIN_TOOLS,
     ActionRules, ActionTarget, ActionVerdict, ProcessLane, ThirdPartyBlock, ThirdPartyDecision,
     ThirdPartyPolicy, ToolAnnotations, ToolEffect, ENV_LANE, LANE_EXPLORE,
 };

@@ -552,6 +552,49 @@ fn read_ledger(home_dir: &Path) -> Vec<ArtifactRecord> {
         .collect()
 }
 
+/// P9: files `agent` handed over (outbound origin) with `produced_at` in
+/// `[since, until]`, newest first. Rows with an unparseable timestamp are
+/// left out.
+pub fn delivered_between(
+    home_dir: &Path,
+    agent: &str,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Vec<ArtifactRecord> {
+    if agent.is_empty() {
+        return Vec::new();
+    }
+    let mut rows: Vec<ArtifactRecord> = read_ledger(home_dir)
+        .into_iter()
+        .filter(|r| r.agent_id == agent && r.origin.is_outbound())
+        .filter(|r| {
+            chrono::DateTime::parse_from_rfc3339(&r.produced_at)
+                .map(|t| {
+                    let t = t.with_timezone(&chrono::Utc);
+                    t >= since && t <= until
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.produced_at.cmp(&a.produced_at));
+    // One row per archived file (a re-recorded hand-over keeps the newest).
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|r| seen.insert(r.archived_name.clone()));
+    rows
+}
+
+/// P9: the newest ledger row for the file `archived_name` that `agent`
+/// handed over (outbound origin), exact match on both.
+pub fn find_delivered(home_dir: &Path, agent: &str, archived_name: &str) -> Option<ArtifactRecord> {
+    if agent.is_empty() || archived_name.is_empty() {
+        return None;
+    }
+    read_ledger(home_dir)
+        .into_iter()
+        .rev()
+        .find(|r| r.agent_id == agent && r.archived_name == archived_name && r.origin.is_outbound())
+}
+
 /// Provenance for one archived file, as `/api/files` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileProvenance {

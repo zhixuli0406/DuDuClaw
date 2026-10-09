@@ -9,7 +9,8 @@
 | 想做的事 | 在哪裡做 |
 |---|---|
 | 建立、修改、暫停、恢復、停用、重新啟用持續任務 | 指令列 `duduclaw responsibility …`，每個變更都要管理員在儀表板核准 |
-| 查看持續任務、執行紀錄、喚醒紀錄 | 指令列（查詢指令不需核准） |
+| 查看持續任務、執行紀錄、喚醒紀錄 | 儀表板 `/responsibilities` 頁面，或指令列（查詢指令不需核准） |
+| 在儀表板新增、暫停、恢復、停用或重新啟用持續任務、清除連續失敗 | `/responsibilities` 頁面（你對該員工的綁定決定哪些按鈕可用） |
 | 送指示給進行中的 goal 任務 | 儀表板任務詳情頁 |
 | 停止任務與子任務 | 儀表板任務詳情頁（立即生效），或指令列（要核准） |
 
@@ -214,7 +215,7 @@ v1.70.0 之後的版本起，等待中的請求如果是在已經改變的狀態
 
 持續任務的合約可以帶 `"lane": "explore"`（RPC `responsibilities.create`／`update_contract`，以及指令列的合約檔）。這個欄位存在合約的 scope 裡，因此算進合約雜湊；沒有這個欄位的持續任務與以前逐位相同。其他值一律拒絕（`invalid_lane`）。
 
-這種持續任務每一次執行的每一輪，都在原本為 heartbeat 主動檢查做的唯讀 explore lane 裡跑。MCP Events 投遞喚醒的工作也用同一條 lane（見 [MCP 生態系](mcp-ecosystem.md)）：派工器對兩種來源設定同一個旗標，所以下表對兩者都一樣。
+這種持續任務每一次執行的每一輪，都在原本為 heartbeat 主動檢查做的唯讀 explore lane 裡跑；這次執行任務樹下之後的所有工作也一樣：子 goal 的每一輪，以及 heartbeat 從任務看板叫醒的任何子任務（派工器沿父任務往上最多找 64 層，只要包含這個任務的任一持續任務執行是唯讀，就用 explore lane）。MCP Events 投遞喚醒的工作也用同一條 lane（見 [MCP 生態系](mcp-ecosystem.md)）：派工器對兩種來源設定同一個旗標，所以下表對兩者都一樣。
 
 | 執行環境 | 行為 |
 |---|---|
@@ -225,7 +226,7 @@ v1.70.0 之後的版本起，等待中的請求如果是在已經改變的狀態
 | Gemini CLI、Antigravity、Grok、通用 CLI | 拒絕：這一輪在派工前失敗（`explore_lane_unsupported`），而且這些執行環境的 `execute` 裡也有同樣的拒絕，以防備援切換到它們。Antigravity 沒有唯讀模式（`agy --sandbox` 只限制終端機，且它使用者層級的 `permissions.allow` 由同一系統使用者的所有員工共用）；Gemini CLI、Grok 與通用 CLI 沒有可證明唯讀的機制 |
 | 任務沙箱（`[container] sandbox_enabled`） | 派工前拒絕（沙箱給員工一個 shell） |
 
-被拒絕的一輪算一次不成功的執行，所以連續失敗最後會讓持續任務暫停。lane 讀不出來也會讓這一輪失敗（`explore_lane_unreadable`）。未涵蓋：之後由 heartbeat 叫醒的子任務不在 lane 內（在 lane 內 `tasks_create` 屬於 `modify`，會被拒絕，所以唯讀執行本身建不了子任務）；尚未在真實 gateway 上跑過。
+被拒絕的一輪算一次不成功的執行，所以連續失敗最後會讓持續任務暫停。lane 讀不出來也會讓這一輪失敗（`explore_lane_unreadable`）；所屬執行的 lane 讀不出來時，heartbeat 叫醒的子任務也一樣失敗。尚未在真實 gateway 上跑過。
 
 ## 儀表板任務詳情頁
 

@@ -166,9 +166,15 @@ timezone = "Asia/Taipei"   # IANA 時區，預設 UTC
 exclude_agents = []        # 不列入的員工
 ```
 
-每天在 `timezone` 的 `hour` 之後，持有 gateway 實例鎖（`duduclaw_core::gateway_instance`）的 gateway 不呼叫任何模型，組出每位員工的摘要（`duduclaw-gateway/src/digest.rs`）：上次摘要以來（最多回溯 7 天）完成的任務與目標、動態、待核准、已結算的持續任務執行與花費。沒事可報的員工不列。摘要存成 `<home>/digest/<date>.json`，顯示在儀表板首頁（RPC `digest.latest`，只列觀看者可讀的員工與任務），並以純文字送到每位啟用中管理員已驗證的連結通道。`<home>/digest/state.json` 在送出前用檔案鎖認領當地日期，所以重啟或第二個 gateway 都不會重送（認領後、送出前當機則跳過當天）。預設開啟（2026-10-08 擁有者決定）：沒有 `[digest]` 區段時於 UTC 08:00 執行。`enabled = false` 可關閉；`config.toml` 存在但無法解析，或 `[digest]` 任一值不對，也視為關閉。
+每天在 `timezone` 的 `hour` 之後，持有 gateway 實例鎖（`duduclaw_core::gateway_instance`）的 gateway 不呼叫任何模型，組出每位員工的摘要（`duduclaw-gateway/src/digest.rs`）：上次摘要以來（最多回溯 7 天）完成的任務與目標、動態、待核准、已結算的持續任務執行與花費。沒事可報的員工不列。摘要存成 `<home>/digest/<date>.json`，顯示在儀表板首頁（RPC `digest.latest`，只列觀看者可讀的員工與任務），並送到每位啟用中管理員已驗證的連結通道。`<home>/digest/state.json` 在送出前用檔案鎖認領當地日期，所以重啟或第二個 gateway 都不會重送（認領後、送出前當機則跳過當天）。預設開啟（2026-10-08 擁有者決定）：沒有 `[digest]` 區段時於 UTC 08:00 執行。`enabled = false` 可關閉；`config.toml` 存在但無法解析，或 `[digest]` 任一值不對，也視為關閉。
 
-首頁上每個完成項目都有 👍／👎／「需要修改」（可附備註）。RPC `digest.feedback` 需要對該員工的 Operator 並通過任務可見範圍檢查；只有 `done` 的任務可以回饋。回饋附加到 `<home>/feedback.jsonl`（演化反思的使用者回饋訊號原本就讀這個檔），`type` 為 `positive`／`negative`／`correction`，並帶 `source = "deliverable"`、`item_kind`、`item_id`、`verdict`、`user_id`、`note`。主動訊息的「被忽略」判斷會略過這些列。未完成：通道按鈕、產物的回饋、摘要列出產物；未在真實通道驗證。
+首頁上每個完成項目都有 👍／👎／「需要修改」（可附備註）。RPC `digest.feedback` 需要對該員工的 Operator 並通過任務可見範圍檢查；只有 `done` 的任務可以回饋。回饋附加到 `<home>/feedback.jsonl`（演化反思的使用者回饋訊號原本就讀這個檔），`type` 為 `positive`／`negative`／`correction`，並帶 `source = "deliverable"`、`item_kind`、`item_id`、`verdict`、`user_id`、`note`。主動訊息的「被忽略」判斷會略過這些列。
+
+**檔案。** 每位員工的段落也列出這段期間交付的檔案（`artifacts.jsonl` 帳本中對外交付的列，最新五個），每個檔案都能給同樣的回饋：`digest.feedback { artifact: { agent_id, archived_name }, verdict, note? }`。屬於某個任務的檔案照該任務授權（不要求 `done`）；沒有任務的檔案需要對該員工的 Operator。回饋列的 `item_kind` 為 `artifact`，`item_id` 為 `artifact:<員工>/<封存檔名>`。不存在的檔案與被拒絕的回覆相同。
+
+**通道按鈕。** 通道訊息為顯示的項目編號（`[1]`、`[2]`…；每位員工最多三個完成項目與三個檔案），在 Telegram、Discord、Slack、LINE 上為前四項附上 👍／👎／✏️ 按鈕（Discord 每則訊息最多五列按鈕，LINE 最多十三個快速回覆）。按下時的授權與 `digest.feedback` 相同：按的人的通道身分必須對應到已驗證、啟用中的儀表板帳號（按下時重新讀取），且對該員工有 Operator；任務可見範圍必須同時允許這個帳號與這個通道；任務必須是 `done`。在 Telegram、Discord、Slack 上還會先通過該通道本身的存取設定。按鈕無法附備註，所以從通道按「需要修改」不帶備註，回覆會請對方到儀表板補充。通道文字中，可見範圍沒有列出該通道的任務只顯示編號、不顯示標題（`channel_may_read_task`）。
+
+**勿擾時段。** 通道投遞是一則 L1 通知，套用全部署的 `[notify] quiet_hours`（摘要不屬於任何單一員工）。時段內會以 `digest` 種類排入 `notify_queue.jsonl`，時段結束後由已存的摘要重新組出並送出，不與其他通知合併；每次送出在行動率統計記為 `digest.daily`。未在真實通道驗證。
 
 ## 回覆較慢時的進度狀態
 
