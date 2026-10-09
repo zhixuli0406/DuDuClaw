@@ -88,7 +88,7 @@ Rust workspace 由 24 個 crate 組成:核心地基 `duduclaw-core`、服務層 
 
 DuDuClaw 本身不含 LLM,需要一個 AI 大腦。三選一(之後也能在瀏覽器引導中設定):
 
-- 裝好一個支援的 AI CLI,例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex) 或 Antigravity(完整清單見 [multi-runtime](docs/features/zh-TW/13-multi-runtime.md);[Gemini CLI](https://github.com/google-gemini/gemini-cli) 已棄用,v1.72.0 移除),並給它一把 API key。Anthropic 與 Google 會封鎖第三方產品使用的消費者訂閱 token,也有帳號因此被停權,所以請用 API key
+- 裝好一個支援的 AI CLI,例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex) 或 Antigravity(完整清單見 [multi-runtime](docs/features/zh-TW/13-multi-runtime.md);[Gemini CLI](https://github.com/google-gemini/gemini-cli) 已棄用,v1.73.0 移除),並給它一把 API key。Anthropic 與 Google 會封鎖第三方產品使用的消費者訂閱 token,也有帳號因此被停權,所以請用 API key
 - 準備一把 API key,走任何 OpenAI 相容供應商
 - 或把本地模型掛在 OpenAI 相容伺服器後面(llama-server、Ollama、vLLM、llamafile),不需要任何雲端帳號
 
@@ -179,7 +179,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 領域 | 內建能力 | 深入閱讀 |
 |------|----------|----------|
 | 通訊通道 | 11 通道(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板;Telegram 語音訊息經 OpenAI Whisper API 轉文字。Discord 語音頻道是非預設的編譯選項,發行版 binary 不含 | [docs/features](docs/features/README.md) |
-| Multi-Runtime | 13 個 runtime id:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI(已棄用,v1.72.0 移除)加上 OpenAI-compat;自動偵測、per-agent 設定、換後端保留上下文 | [docs/features/13](docs/features/zh-TW/13-multi-runtime.md) |
+| Multi-Runtime | 13 個 runtime id:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI(已棄用,v1.73.0 移除)加上 OpenAI-compat;自動偵測、per-agent 設定、換後端保留上下文 | [docs/features/13](docs/features/zh-TW/13-multi-runtime.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP Server | 247 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport;外部客戶端的 key 預設只能用 7 個基本工具,操作者可另外授與記憶、wiki 或訊息類 scope,連接器、執行類與管理類工具一律不對外 | [docs/api](docs/api/README.md) |
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |

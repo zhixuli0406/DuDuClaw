@@ -311,7 +311,7 @@ OPENAI_API_KEY=sk-proj-...
 
 ### 6.3 Gemini（Google）CLI（已棄用）
 
-> **v1.67.0 棄用，v1.72.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務免費、Google AI Pro 與 Google AI Ultra 的個人帳號，所以個人 Google 登入已經無法搭配它使用。API key 與企業（Gemini Code Assist）用法不受影響。image 在移除前仍內含 Gemini CLI。請改用 Antigravity runtime（`antigravity`，執行檔 `agy`），詳見[已棄用名稱](deprecations.md#gemini-cli-runtime)。
+> **v1.67.0 棄用，v1.73.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務免費、Google AI Pro 與 Google AI Ultra 的個人帳號，所以個人 Google 登入已經無法搭配它使用。API key 與企業（Gemini Code Assist）用法不受影響。image 在移除前仍內含 Gemini CLI。請改用 Antigravity runtime（`antigravity`，執行檔 `agy`），詳見[已棄用名稱](deprecations.md#gemini-cli-runtime)。
 >
 > 透過 `agy` 登入 Antigravity 需要終端機與 OS keyring，容器裡兩者都沒有，所以容器請用 API key 模式：設定 `config.toml [antigravity] auth = "api_key"`，並提供同一把 Gemini API key（`gemini` provider 帳號，或下方的 `GEMINI_API_KEY`）。Antigravity 的設定同樣存在 `~/.gemini` 底下，所以下方的 `duduclaw-gemini` volume 要保留。
 

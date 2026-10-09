@@ -37,7 +37,7 @@ AgentRuntime trait:
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（貼回驗證碼） | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login`（localhost 回呼） | `~/.codex/auth.json` |
-| Gemini CLI（v1.67.0 棄用，v1.72.0 移除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost 回呼） | `~/.gemini/oauth_creds.json` |
+| Gemini CLI（v1.67.0 棄用，v1.73.0 移除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost 回呼） | `~/.gemini/oauth_creds.json` |
 | Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json（v1.2.10） | 在終端機執行 `agy` 完成 Google 登入（沒有 `login` 子指令），或 API key 模式 | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | 無（僅 API key） | `~/.qwen/.env` |
@@ -101,7 +101,7 @@ Agent 設定：runtime = "codex"
 
 **Gemini Runtime** — 呼叫 Google Gemini CLI，使用 `--output-format stream-json` 取得結構化輸出。
 
-> **v1.67.0 棄用，v1.72.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務個人帳號（免費、AI Pro、AI Ultra），請改用 Antigravity runtime。移除前仍可照常使用。Gemini API provider 不受影響。遷移步驟見[已棄用名稱](../../guides/zh-TW/deprecations.md#gemini-cli-runtime)。
+> **v1.67.0 棄用，v1.73.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務個人帳號（免費、AI Pro、AI Ultra），請改用 Antigravity runtime。移除前仍可照常使用。Gemini API provider 不受影響。遷移步驟見[已棄用名稱](../../guides/zh-TW/deprecations.md#gemini-cli-runtime)。
 
 ```
 Agent 設定：runtime = "gemini"

@@ -147,5 +147,5 @@ value from config.toml first and rerun, or import as a separate agent with `--re
 
 **Q: What happens with a non-Claude model?**
 It is kept as-is in `[model] preferred` and marked `PARTIAL`, prompting you to manually
-confirm which runtime it maps to (codex / antigravity / openai_compat, or gemini, which is deprecated in v1.67.0 and removed in v1.72.0; see [deprecations](deprecations.md#gemini-cli-runtime)). DuDuClaw will not
+confirm which runtime it maps to (codex / antigravity / openai_compat, or gemini, which is deprecated in v1.67.0 and removed in v1.73.0; see [deprecations](deprecations.md#gemini-cli-runtime)). DuDuClaw will not
 guess on your behalf.

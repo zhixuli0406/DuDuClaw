@@ -309,7 +309,7 @@ OPENAI_API_KEY=sk-proj-...
 
 ### 6.3 Gemini（Google）CLI（非推奨）
 
-> **v1.67.0 で非推奨、v1.72.0 で削除予定。** Google は 2026-06-18 に、無料、Google AI Pro、Google AI Ultra の個人アカウントに対する Gemini CLI での提供を停止したため、個人の Google ログインではもう使えません。API キーとエンタープライズ（Gemini Code Assist）での利用は影響を受けません。イメージは削除まで Gemini CLI を同梱し続けます。代わりに Antigravity ランタイム（`antigravity`、実行ファイル `agy`）を使ってください。詳細は[非推奨となった名称](deprecations.md)を参照してください。
+> **v1.67.0 で非推奨、v1.73.0 で削除予定。** Google は 2026-06-18 に、無料、Google AI Pro、Google AI Ultra の個人アカウントに対する Gemini CLI での提供を停止したため、個人の Google ログインではもう使えません。API キーとエンタープライズ（Gemini Code Assist）での利用は影響を受けません。イメージは削除まで Gemini CLI を同梱し続けます。代わりに Antigravity ランタイム（`antigravity`、実行ファイル `agy`）を使ってください。詳細は[非推奨となった名称](deprecations.md)を参照してください。
 >
 > `agy` 経由の Antigravity サインインにはターミナルと OS キーリングが必要ですが、コンテナにはどちらもありません。コンテナでは API キーモードを使います。`config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー（`gemini` プロバイダーアカウント、または下記の `GEMINI_API_KEY`）を用意してください。Antigravity も設定を `~/.gemini` 配下に保存するため、下記の `duduclaw-gemini` volume は残します。
 
