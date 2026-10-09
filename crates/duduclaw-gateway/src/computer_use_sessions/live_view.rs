@@ -7,9 +7,11 @@
 //! `x11vnc` runs inside the session container, started on demand by the
 //! gateway (`docker exec … duduclaw-vnc start <viewonly|control>`, a fresh
 //! random password on stdin) and listening **only on a unix socket in the
-//! root-only `/tmp/duduclaw-root`** (`-rfbport 0 -unixsock`, plus
-//! `-localhost`), so neither the host network nor the browser's unprivileged
-//! `sandbox` user can reach it. No port is published: a viewer's bytes go
+//! root-only `/tmp/duduclaw-root`** (`-rfbport 0 -rfbportv6 -1 -unixsock`,
+//! plus `-localhost`). `-rfbport` stays 0: Debian's libvncserver 0.9.15
+//! still binds `::1:5900` unless `-rfbportv6 -1` is set, and `-rfbport -1`
+//! makes x11vnc delete the unix socket. Neither the host network nor the
+//! browser's unprivileged `sandbox` user can reach it. No port is published: a viewer's bytes go
 //! dashboard → the gateway's authenticated WebSocket
 //! (`/ws/computer-view`, [`super::view_ws`]) → `docker exec -i … duduclaw-vnc-relay`
 //! (a unix-socket ↔ stdio pipe) → x11vnc. The rejected alternative, a port

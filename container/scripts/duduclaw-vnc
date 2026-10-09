@@ -12,9 +12,12 @@
 #   - x11vnc listens ONLY on the unix socket /tmp/duduclaw-root/vnc.sock,
 #     inside the root-only (0700) scratch directory the entrypoint created,
 #     so the browser's unprivileged `sandbox` user cannot connect to it, and
-#     no TCP port is opened (-rfbport 0; -localhost as a second fence). After
-#     start the script checks /proc/net/tcp{,6} and refuses (stops the
-#     server, exits 1) if anything listens on 5900-5999.
+#     no TCP port is opened. Debian x11vnc 0.9.17 linked to libvncserver
+#     0.9.15 still binds IPv6 ::1:5900 with `-rfbport 0 -noipv6`; `-rfbportv6
+#     -1` is what stops that listen. `-rfbport` must stay 0: `-rfbport -1`
+#     makes x11vnc exit and delete the unix socket. `-localhost` stays as a
+#     second fence. After start the script checks /proc/net/tcp{,6} and
+#     refuses (stops the server, exits 1) if anything listens on 5900-5999.
 #   - The gateway reaches the socket only through `duduclaw-vnc-relay`
 #     (`docker exec -i`, stdio <-> socket); nothing is published.
 #   - `viewonly` passes -viewonly (all viewer input ignored). `control`
@@ -87,7 +90,7 @@ case "${1:-}" in
         stop_server
         (umask 077 && printf '%s\n' "$pass" >"$PASSFILE")
         unset pass
-        x11vnc -display :99 -rfbport 0 -unixsock "$SOCK" -localhost -noipv6 \
+        x11vnc -display :99 -rfbport 0 -rfbportv6 -1 -unixsock "$SOCK" -localhost -noipv6 \
             -forever -shared -noremote -nocmds -nosel \
             -passwdfile "rm:$PASSFILE" "${mode_args[@]}" \
             -bg -o "$LOG" -q >/dev/null 2>&1 || {
