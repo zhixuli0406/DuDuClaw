@@ -39,10 +39,11 @@ curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.zhi
 
 已收錄：https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw 。Glama 會在沙箱裡建置並啟動 server，再呼叫 `tools/list` 打分數（Server Coherence、TDQS）。
 
-- repo 根目錄的 `glama.json` 只宣告維護者（schema `https://glama.ai/mcp/schemas/server.json`，唯一必填欄位 `maintainers`）。
-- `distribution/glama/Dockerfile` 從 npm 安裝最新的 `duduclaw`，只跑獨立模式的 MCP server，不含 gateway。建置要以 repo 根目錄為 context：`docker build -f distribution/glama/Dockerfile .`。
-- `distribution/glama/entrypoint.sh`：沒有 `DUDUCLAW_MCP_API_KEY` 時先在容器自己的資料目錄跑 `duduclaw mcp init --client print` 發一把金鑰（只有記憶與 wiki 範圍），再啟動 `duduclaw mcp-server`。2026-10-08 在本機 Docker 實測列出 24 個工具。
-- Glama 後台（👤，Admin → Dockerfile）若沒有自動用這個檔，把內容貼進去；建置成功後在 Releases 建一個 release，分數項目才會開始評。
+- repo 根目錄的 `glama.json`（schema `https://glama.ai/mcp/schemas/server.json`，必填欄位 `maintainers`）另外宣告 `build.dockerfile`（repo 根的 `Dockerfile`）與 `command`。後台若依 `command` 重生 Admin Dockerfile 的 `CMD`，必須跟根目錄 `Dockerfile` 的 `CMD` 同一條。
+- 根目錄 `Dockerfile` 是 Glama Admin 建置用的：安裝 `mcp-proxy@6.7.16`，前面掛獨立 MCP server。`mcp-proxy` 預設只聽 IPv6 `::` 的 8080，也不讀平台注入的 `PORT`。`CMD` 改成 shell，綁 `0.0.0.0`，連接埠依序用 `MCP_PROXY_PORT`、`PORT`、8080。
+- `distribution/glama/Dockerfile` 從 npm 安裝最新的 `duduclaw`，只跑獨立模式的 MCP server（stdio），不含 gateway，也不加 `mcp-proxy`。建置要以 repo 根目錄為 context：`docker build -f distribution/glama/Dockerfile .`。
+- `distribution/glama/entrypoint.sh`：沒有 `DUDUCLAW_MCP_API_KEY` 時先在容器自己的資料目錄跑 `duduclaw mcp init --client print` 發一把金鑰（只有記憶與 wiki 範圍），再啟動 `duduclaw mcp-server`。預設目錄（`DUDUCLAW_HOME`，否則 `$HOME/.duduclaw`）寫不進去時改用 `/tmp/duduclaw-home`，失敗時印出抹掉金鑰後的錯誤。2026-10-08 在本機 Docker 實測列出 24 個工具。
+- Glama 後台（👤，Admin → Dockerfile）若沒有自動用根目錄這個檔，把內容貼進去；建置成功後在 Releases 建一個 release，分數項目才會開始評。
 
 送件前若改過 `server.json`，可以先用官方 schema 驗證（例如 `python -m jsonschema` 或任何 JSON Schema 驗證器，schema 網址見檔案的 `$schema`）。Glama 與 awesome-mcp-servers 不讀這個檔案，收錄流程依各自網站（本 repo 未驗證）。
 

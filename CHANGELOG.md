@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Glama 託管的 MCP server 不再只聽 IPv6、也不再忽略 `PORT`**：repo 根目錄 `Dockerfile`（Glama Admin 建置）與 `glama.json` 的 `command` 讓 `mcp-proxy` 綁 `0.0.0.0`，連接埠依序讀 `MCP_PROXY_PORT`、`PORT`、8080。`distribution/glama/entrypoint.sh` 在資料目錄不可寫時改用 `/tmp/duduclaw-home`，發金鑰失敗時印出已遮罩的錯誤。本機 stdio 映像 `distribution/glama/Dockerfile` 不加 proxy。
+
 ## [1.72.0] - 2026-10-09 — 第三方 MCP 動作規則、MCP Events 與唯讀探索通道
 
 ### Added
