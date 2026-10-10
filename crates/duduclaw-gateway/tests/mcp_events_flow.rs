@@ -601,17 +601,71 @@ async fn webhook_cursor_refresh_delivery_status_and_gap_catch_up() {
     };
     let gap = json!({ "type": "gap", "cursor": "w4" }).to_string();
     assert_eq!(deliver_raw(&url, &secret_now, "msg_gap_1", &gap, Some("sub_x")).await.0, 200);
-    let mut recovered = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if mcp_event_rows(home).await.len() == 3 {
-            recovered = true;
+    // Event ingestion finishes before the background catch-up clears its
+    // cursor and writes the audit row. Wait for the whole operation.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let rows = mcp_event_rows(home).await.len();
+        let rec = ev_store::get(home, &v.id).unwrap().unwrap();
+        let gap_cursor = &rec.upstream[0].gap_cursor;
+        let audited = audit_contains(home, "gap_catch_up");
+        if rows == 3 && gap_cursor.is_none() && audited {
             break;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "catch-up incomplete: events={rows} (expected 3), gap_cursor={gap_cursor:?}, cursor={:?}, gap_catch_up_audited={audited}",
+            rec.upstream[0].cursor,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(recovered, "events 3 and 4 were caught up from the cursor held before the gap: {:?}", mcp_event_rows(home).await.len());
     let rec = ev_store::get(home, &v.id).unwrap().unwrap();
     assert_eq!(rec.upstream[0].cursor.as_deref(), Some("w4"), "the fresh cursor is kept");
     assert!(rec.upstream[0].gap_cursor.is_none(), "one attempt per gap");
     assert!(audit_contains(home, "gap_catch_up"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gap_catch_up_store_failure_is_audited_and_retried() {
+    let (fake, home_dir, _, _) = setup2(vec!["webhook", "poll"]).await;
+    let home = home_dir.path();
+    let v = service::subscribe(home, "a1", "pager", &["incident.created".to_string()], ev_store::EventMode::Explore)
+        .await
+        .unwrap();
+    ev_store::update(home, &v.id, |r| {
+        r.upstream[0].cursor = Some("w4".into());
+        r.upstream[0].gap_cursor = Some("w2".into());
+        Ok(true)
+    })
+    .unwrap();
+
+    // A directory at the lock path makes writes fail on every platform,
+    // while the subscription remains readable. An empty poll answer isolates
+    // the write that clears gap_cursor from event-ingestion writes.
+    let mut lock_name = ev_store::store_path(home).into_os_string();
+    lock_name.push(".lock");
+    let lock_path = std::path::PathBuf::from(lock_name);
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+    poll::catch_up_gaps(home, &v.id).await;
+    let rec = ev_store::get(home, &v.id).unwrap().unwrap();
+    assert_eq!(rec.upstream[0].gap_cursor.as_deref(), Some("w2"), "a failed clear leaves the gap for retry");
+    assert_eq!(rec.upstream[0].cursor.as_deref(), Some("w4"));
+    let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+    let failures: Vec<Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).filter(|row: &Value| row["details"]["type"] == "gap_catch_up").collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["details"]["outcome"], "store_unavailable");
+
+    std::fs::remove_dir(&lock_path).unwrap();
+    poll::catch_up_all(home).await;
+    let rec = ev_store::get(home, &v.id).unwrap().unwrap();
+    assert!(rec.upstream[0].gap_cursor.is_none(), "the sweep retries and clears the gap when writes recover");
+    assert_eq!(rec.upstream[0].cursor.as_deref(), Some("w4"));
+    let f = fake.lock().unwrap();
+    assert_eq!(f.polls.len(), 2);
+    assert!(f.polls.iter().all(|p| p["cursor"] == "w2"));
+    let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+    let attempts: Vec<Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).filter(|row: &Value| row["details"]["type"] == "gap_catch_up").collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1]["details"]["outcome"], "ok");
 }

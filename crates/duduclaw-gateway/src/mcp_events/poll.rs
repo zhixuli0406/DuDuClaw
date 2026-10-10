@@ -212,7 +212,7 @@ pub async fn poll_once(home: &Path, sub_id: &str, name: &str) -> Result<u64, Str
 
 /// One best-effort catch-up per recorded gap: poll from the cursor held
 /// before the `gap` (bounded by `maxAgeMs`) and record whatever the server
-/// can still serve; the attempt is made once whatever the outcome.
+/// can still serve; an unavailable local store leaves the gap for retry.
 pub async fn catch_up_gaps(home: &Path, sub_id: &str) {
     let Ok(Some(rec)) = store::get(home, sub_id) else { return };
     if rec.status == SubStatus::Terminated {
@@ -263,12 +263,16 @@ pub async fn catch_up_gaps(home: &Path, sub_id: &str) {
         }
         if outcome != "store_unavailable" {
             let n2 = name.clone();
-            let _ = store::update(home, sub_id, |r| {
+            if store::update(home, sub_id, |r| {
                 if let Some(u) = r.upstream.iter_mut().find(|u| u.name == n2) {
                     u.gap_cursor = None;
                 }
                 Ok(true)
-            });
+            })
+            .is_err()
+            {
+                outcome = "store_unavailable";
+            }
         }
         super::audit(
             home,
