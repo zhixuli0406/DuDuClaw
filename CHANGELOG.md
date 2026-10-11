@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- CI 對同一 PR 與 main 取消過期執行，PR 等待 60 秒再啟動全套檢查；保留三平台、功能組合、整合測試、E2E 與安全稽核，並支援手動全套執行。CI 關閉 dev/test 除錯符號、E2E 只啟動實際含案例的 gateway library，降低編譯與無效啟動成本；既有必需檢查與 Windows advisory 狀態不變。
+
 ### Fixed
 - MCP Events 的 gap 補抓測試改為等待事件入庫、補抓 cursor 清除及稽核紀錄都完成，修復 Windows CI 提早檢查造成的偶發失敗。補抓完成後若無法寫回訂閱資料，稽核結果改記 `store_unavailable`，保留 gap cursor 供後續掃描重試；新增寫入失敗與恢復後重試的回歸測試。
 
