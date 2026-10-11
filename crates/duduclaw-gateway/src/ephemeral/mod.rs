@@ -37,7 +37,7 @@
 //! # Team role members (Team-as-Agent P1/WP-2)
 //!
 //! The same scaffold carries the **role members** of a team ([decision A] in
-//! `commercial/docs/DESIGN-team-as-agent-2026-09.md` §3.7): one transient agent
+//! `commercial/docs/specs/DESIGN-team-as-agent-2026-09.md` §3.7): one transient agent
 //! per `(task, round, role)`, each pinned to its own `(runtime, model, effort)`
 //! so a team's planner can run on one vendor and its verifier on another.
 //! Three properties keep that from weakening anything above:

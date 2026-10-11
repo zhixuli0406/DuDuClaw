@@ -2,7 +2,7 @@
 //! `agent.toml [container] sandbox_enabled = true` inside a locked-down
 //! container, and hand back only the final reply text.
 //!
-//! Design: `commercial/docs/DESIGN-task-sandbox-completion-2026-10.md`.
+//! Design: `commercial/docs/specs/DESIGN-task-sandbox-completion-2026-10.md`.
 //! Built on the Discovery attempt-container building blocks (reviewed and
 //! live-verified): per-family argv / environment / stdin / runtime files and
 //! credential documents (`discovery::attempt_adapter`), the host-side stream

@@ -1,7 +1,7 @@
 //! `duduclaw-sysd` — the DuDuClaw appliance image's privilege-separated
 //! root system service.
 //!
-//! See `commercial/docs/DESIGN-agent-os-native-apps-2026-08.md` §2 L1 for
+//! See `commercial/docs/specs/DESIGN-agent-os-native-apps-2026-08.md` §2 L1 for
 //! the design context (internal doc, not part of this public crate — this
 //! crate's own docs are self-contained). In short: the DuDuClaw gateway
 //! process runs as an unprivileged `duduclaw` user and has no business

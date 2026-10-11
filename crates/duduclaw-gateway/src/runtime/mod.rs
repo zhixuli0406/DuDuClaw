@@ -179,7 +179,7 @@ pub fn native_tool_events_from_chunks(chunks: &[RuntimeChunk]) -> Vec<NativeTool
 
 // ── WP-A4/A5/T10: runtime-neutral native-tool collector ─────────────────
 //
-// See `commercial/docs/design-task-forward-model-2026-08-06.md` §5.3, §8.2,
+// See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §5.3, §8.2,
 // §9. Goal loop dispatch (`dispatcher.rs` → `claude_runner.rs`, and — for
 // non-Claude agents — the same call chain's `runtime_dispatch::run_agent_prompt`
 // → `AgentRuntime::execute`) is the ONE place native (non-MCP-audit) tool

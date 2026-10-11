@@ -197,5 +197,5 @@ Anti-tamper 防得了沒誠意的人，防不了想 crack 的人。
 
 - 開源 repo：[github.com/zhixuli0406/DuDuClaw](https://github.com/zhixuli0406/DuDuClaw)
 - 完整定價：[duduclaw.dudustudio.monster#pricing](https://duduclaw.dudustudio.monster#pricing)
-- 商業模式背後的思考：[Solo-Founder Business Plan v2.0](https://github.com/zhixuli0406/DuDuClaw/blob/main/commercial/docs/business-plan.md)（僅內部，公開版本 2026 Q3）
-- PayUni 整合筆記：[PayUni reverse-engineered](https://github.com/zhixuli0406/DuDuClaw/blob/main/commercial/docs/payuni-integration-notes.md)（同上）
+- 商業模式背後的思考：[Solo-Founder Business Plan v2.0](https://github.com/zhixuli0406/DuDuClaw/blob/main/commercial/docs/business/business-plan.md)（僅內部，公開版本 2026 Q3）
+- PayUni 整合筆記：[PayUni reverse-engineered](https://github.com/zhixuli0406/DuDuClaw/blob/main/commercial/docs/business/payuni-integration-notes.md)（同上）

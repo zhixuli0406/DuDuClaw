@@ -8,7 +8,7 @@
 //! down by the serde shape tests at the bottom of that file. Do not import
 //! `duduclaw_comp` from this module.
 //!
-//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`
 //! §3.2 (execution ladder), §3.4 (approval/guardrails reuse), §5 (CD-1
 //! row), §6 (safety red lines), §8-3 (refuse-list). This module is the
 //! CD-1 gateway-side driver: agent-seat injection over the comp socket,

@@ -59,14 +59,14 @@
 
 - [`marketing/blog/2026-06-05-why-pay-for-apache-2.md`](../blog/2026-06-05-why-pay-for-apache-2.md) — 為什麼開源還要付錢的核心論述（HN / PH / Landing 都引用）
 - [`commercial/website/index.html`](../../commercial/website/index.html) — Landing page MVP（PayUni checkout 自助流程）
-- [`commercial/docs/payuni-integration-notes.md`](../../commercial/docs/payuni-integration-notes.md) — 金流整合筆記（如果 HN 問「為什麼用 PayUni 不用 Stripe」可貼此連結 — **但只在重視的留言才貼**，因為它在 commercial 閉源目錄）
+- [`commercial/docs/business/payuni-integration-notes.md`](../../commercial/docs/business/payuni-integration-notes.md) — 金流整合筆記（如果 HN 問「為什麼用 PayUni 不用 Stripe」可貼此連結 — **但只在重視的留言才貼**，因為它在 commercial 閉源目錄）
 
 ---
 
 ## 文件未涵蓋
 
 - **媒體（記者）outreach**：本批不做。一人公司沒記者人脈，主動 outreach ROI 極低。
-- **付費廣告投放**：不做。已在 [business-plan.md](../../commercial/docs/business-plan.md) §4.3 明列 Anti-strategy。
+- **付費廣告投放**：不做。已在 [business-plan.md](../../commercial/docs/business/business-plan.md) §4.3 明列 Anti-strategy。
 - **PR 公關公司聘用**：不做。一人公司的真實感是最強的 PR。
 
 ---

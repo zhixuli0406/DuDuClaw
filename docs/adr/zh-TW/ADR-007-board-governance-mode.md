@@ -2,7 +2,7 @@
 
 - Status: Accepted(opt-in,預設關閉)
 - Date: 2026-07-09
-- Related: WP17(`commercial/docs/TODO-client-demo-gaps-2026-07-08.md`)、ADR-004、RFC-21
+- Related: WP17(`commercial/docs/plans/TODO-client-demo-gaps-2026-07-08.md`)、ADR-004、RFC-21
 
 ## Context
 

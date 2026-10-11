@@ -2,7 +2,7 @@
 //!
 //! Borrowed from WorkBuddy's Agent Mail (`research/harness-2026-08/
 //! workbuddy-codebuddy-work.md` §2.10 / N5, planned as H15 / B10 in
-//! `commercial/docs/DESIGN-harness-borrowings-2026-08.md`). Three product
+//! `commercial/docs/specs/DESIGN-harness-borrowings-2026-08.md`). Three product
 //! rules come across verbatim, and this module is where they are enforced:
 //!
 //! 1. **收件在介面看，幹活在對話裡** — arriving mail is a *record*, not a task.

@@ -546,6 +546,6 @@ runtime 沒有回報用量時，用量欄位會整個省略。寫 `0` 等於宣�
 
 ## 參考
 
-- 設計：`commercial/docs/DESIGN-team-as-agent-2026-09.md`（§1、§3.1–§3.6、§3.8–§3.11）
+- 設計：`commercial/docs/specs/DESIGN-team-as-agent-2026-09.md`（§1、§3.1–§3.6、§3.8–§3.11）
 - 封包參考：[spec/task-packet.md](../../spec/task-packet.md)
 - 相關：[13-multi-runtime.md](13-multi-runtime.md)、[goal-loop 指南](../../guides/zh-TW/goal-loop.md)

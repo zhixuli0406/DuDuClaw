@@ -19,7 +19,7 @@
 //! without provider calls; reports redact private policy source.
 //!
 //! The authoritative semantics are in
-//! `commercial/docs/SPEC-discovery-tree-replay-2026-09.md`; a Python
+//! `commercial/docs/specs/SPEC-discovery-tree-replay-2026-09.md`; a Python
 //! implementation of the same spec must produce identical numbers (after
 //! 9-decimal rounding) on the shared fixtures under
 //! `crates/duduclaw-gateway/tests/fixtures/discovery/`.

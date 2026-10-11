@@ -1,6 +1,6 @@
 //! OS image update staging — download, verify, bind, then hand to sysupdate (H3d).
 //!
-//! Full design: `commercial/docs/DESIGN-ab-update-rollback-2026-08.md` §5.
+//! Full design: `commercial/docs/specs/DESIGN-ab-update-rollback-2026-08.md` §5.
 //!
 //! ## Why the gateway does the verifying
 //!
@@ -48,7 +48,7 @@
 //!
 //! ## T4 (2026-09-02): selection, not rewrite, whenever a release allows it
 //!
-//! `commercial/docs/DESIGN-os-trust-chain-2026-09.md`'s 2026-09-02 修正案
+//! `commercial/docs/specs/DESIGN-os-trust-chain-2026-09.md`'s 2026-09-02 修正案
 //! entry: Secure Boot's Authenticode signature covers the whole UKI PE
 //! image, so patching `.cmdline` bytes on the device — the original binding
 //! step this module used — corrupts that signature, and a SB-enforcing
@@ -71,7 +71,7 @@
 //!
 //! ## VER-V (2026-09-02): dm-verity hash tree
 //!
-//! `commercial/docs/DESIGN-os-trust-chain-2026-09.md` §3.3 + the
+//! `commercial/docs/specs/DESIGN-os-trust-chain-2026-09.md` §3.3 + the
 //! 2026-09-02 拍板紀錄 entries. Unlike the UKI, the hash tree needs no
 //! per-slot variant: `veritysetup format`'s root hash is a pure function of
 //! the root payload's *content*, not of which slot it eventually lands in

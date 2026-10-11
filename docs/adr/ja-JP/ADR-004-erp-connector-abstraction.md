@@ -36,7 +36,7 @@ registry」が長期にわたって保守可能であることが証明されて
 これを再発明する理由はない。
 
 trait の完全な仕様(メソッドシグネチャ、`duduclaw-erp` スケルトン crate の分割、
-ERPNext 実装の詳細)は、すでに `commercial/docs/TODO-feature-gaps-2026-07.md`
+ERPNext 実装の詳細)は、すでに `commercial/docs/plans/TODO-feature-gaps-2026-07.md`
 §1 で計画済みであり、それは調査の成果物である。本 ADR が行うのはただ一つ:
 その計画を正式な決定に昇格させ、トレードオフを記録することである。仕様は
 ここでは繰り返さない——実行時には両方の文書を同時に開いておくこと。

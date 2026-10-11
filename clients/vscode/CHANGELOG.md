@@ -7,7 +7,7 @@
 
 ## [0.3.0] - 2026-08-18
 
-對應 `commercial/docs/DESIGN-vscode-client-v2-2026-08.md` §4 P1「把 IDE 變成第 12 個通道做好」。
+對應 `commercial/docs/specs/DESIGN-vscode-client-v2-2026-08.md` §4 P1「把 IDE 變成第 12 個通道做好」。
 
 ### Added
 

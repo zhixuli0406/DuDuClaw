@@ -1,5 +1,5 @@
 //! v1.68.0 — `agents.update` / `agents.inspect` additions
-//! (`commercial/docs/TODO-dashboard-switches-v1.68-2026-10.md`, contract
+//! (`commercial/docs/plans/TODO-dashboard-switches-v1.68-2026-10.md`, contract
 //! section `agents.update`).
 //!
 //! * New per-agent keys, each written only when sent (every object is

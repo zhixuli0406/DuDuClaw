@@ -3,7 +3,7 @@
 //! (comp/display, gateway system, gateway network) DuDuClaw already exposes
 //! through the dashboard WS RPC and the `mcp_os_ops.rs` MCP tool bridge.
 //! Full design + rejected alternatives:
-//! `commercial/docs/DESIGN-os-self-drive-2026-08.md`.
+//! `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md`.
 //!
 //! This module owns every real implementation; `lib.rs`'s `OsCommands`/
 //! `OsDisplayCommands`/`OsSystemCommands`/`OsNetworkCommands` enums and the

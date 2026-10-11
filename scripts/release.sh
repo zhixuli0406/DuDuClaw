@@ -430,7 +430,7 @@ echo ""
 if $DRY_RUN; then
     echo "[DRY RUN] Would bump every manifest above to $NEW_VERSION, update CHANGELOG,"
     echo "          cargo check, generate distributor HTML when sources exist, then commit + tag v$NEW_VERSION."
-    echo "[DRY RUN] Distributor output: commercial/marketing/distributor/duduclaw-technology-brief-v$NEW_VERSION.html"
+    echo "[DRY RUN] Distributor output: commercial/marketing/distributor/releases/duduclaw-technology-brief-v$NEW_VERSION.html"
     echo "[DRY RUN] After tag push, CI release.yml publishes GitHub + npm + PyPI."
     echo "[DRY RUN] Confirm with: $0 verify $NEW_VERSION"
     echo "[DRY RUN] Requires signed two-manual / three-website delivery assertion before any mutation."
@@ -712,7 +712,7 @@ fi
 # Never stage commercial artifacts in the public release commit.
 echo ""
 echo "Generating distributor technical brief..."
-if ! python3 "$(dirname "$0")/build-distributor-brief.py" --version "$NEW_VERSION" --skip-missing; then
+if ! python3 "$(dirname "$0")/build-distributor-brief.py" --version "$NEW_VERSION" --output-dir "commercial/marketing/distributor/releases" --skip-missing; then
     echo "Error: distributor HTML generation failed; no release commit or tag was created."
     echo "       Fix the document source and regenerate before retrying the release."
     echo "       The version bump remains uncommitted for inspection."
@@ -792,7 +792,7 @@ fi
 
 # --- Enterprise pro binary assets (darwin + linux-x64, commercial checkout only) ---
 # Bare-metal duduclaw-pro binaries for the P0 control-plane auto-update
-# channel (commercial/docs/DESIGN-pro-auto-update-2026-08.md §3 P0, §4 item
+# channel (commercial/docs/specs/DESIGN-pro-auto-update-2026-08.md §3 P0, §4 item
 # 3). Signed with an INDEPENDENT minisign keypair
 # (~/.minisign/duduclaw-pro-release.key) so a control-plane compromise can
 # never poison CE users via the CE update channel, or vice versa (design

@@ -1,5 +1,5 @@
 //! Tamper-evident hash-chained JSONL audit writer (B1, OS security line P0
-//! — `commercial/docs/DESIGN-os-security-line-2026-09.md` §2 支柱二).
+//! — `commercial/docs/specs/DESIGN-os-security-line-2026-09.md` §2 支柱二).
 //!
 //! Generalizes the `_prev_hash` SHA-256 chain pattern pioneered by
 //! `duduclaw-gateway::screenshot_audit::BrowserAuditLog` (the only prior

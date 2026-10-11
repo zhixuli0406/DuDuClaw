@@ -4,7 +4,7 @@
 //! https://code.claude.com/docs/en/cli-reference
 //! https://developers.openai.com/codex/config-reference
 //! https://geminicli.com/docs/reference/configuration/
-//! Design: commercial/docs/DESIGN-discovery-runtime-parity-2026-10.md (§2, §5, §6, §7).
+//! Design: commercial/docs/specs/DESIGN-discovery-runtime-parity-2026-10.md (§2, §5, §6, §7).
 use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 use serde_json::{Value, json};
 use super::contracts::AttemptInfraError;

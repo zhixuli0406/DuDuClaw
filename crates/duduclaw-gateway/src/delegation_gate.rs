@@ -1,6 +1,6 @@
 //! WP21 choke point **C1** — the delegation gate on the bus-consumption path.
 //!
-//! Design doc `commercial/docs/design-a2a-dept-rank-isolation.md` §2.4: the
+//! Design doc `commercial/docs/specs/design-a2a-dept-rank-isolation.md` §2.4: the
 //! front-door MCP checks (`send_to_agent` / `spawn_agent`) only produce a nicer
 //! error message; the rule has to be enforced *where the work actually starts*.
 //! For the dispatcher that is the moment a queued task is about to become a

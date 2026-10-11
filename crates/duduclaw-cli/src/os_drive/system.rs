@@ -8,7 +8,7 @@
 //! rendering, and the `os_drive_system` audit rows (a deliberately different
 //! event name from the dashboard's `timedate_set`, so the trail can tell an
 //! operator-terminal change apart from a dashboard one). See
-//! `commercial/docs/DESIGN-os-self-drive-2026-08.md` §3 for why this
+//! `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §3 for why this
 //! sidesteps the dashboard WS/Ed25519 auth entirely, and §7 for the same-uid
 //! boundary the two writes hit.
 

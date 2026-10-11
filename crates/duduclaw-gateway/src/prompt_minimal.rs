@@ -16,8 +16,8 @@
 //! - Drops team roster verbatim (agents query via `list_agents`)
 //! - Keeps IDENTITY.md, CONTRACT, sender block, pinned task as-is
 //!
-//! See [`commercial/docs/TODO-runtime-health-fixes-202605.md#11`](
-//! ../../../commercial/docs/TODO-runtime-health-fixes-202605.md
+//! See [`commercial/docs/plans/TODO-runtime-health-fixes-202605.md#11`](
+//! ../../../commercial/docs/plans/TODO-runtime-health-fixes-202605.md
 //! ) for the rationale and ROI estimate (75 % cliff reduction).
 
 use duduclaw_agent::LoadedAgent;

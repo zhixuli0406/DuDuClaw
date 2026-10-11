@@ -1,6 +1,6 @@
 //! `duduclaw mcp-proxy` — a redacting stdio JSON-RPC pass-through for
 //! **external** MCP servers (design
-//! `commercial/docs/DESIGN-redaction-field-rules-2026-09.md` §13.3 plan A,
+//! `commercial/docs/specs/DESIGN-redaction-field-rules-2026-09.md` §13.3 plan A,
 //! contract §13.6).
 //!
 //! ## Why

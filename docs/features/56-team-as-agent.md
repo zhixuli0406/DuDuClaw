@@ -631,6 +631,6 @@ Honest list, so nothing here reads as more finished than it is:
 
 ## References
 
-- Design: `commercial/docs/DESIGN-team-as-agent-2026-09.md` (§1, §3.1–§3.6, §3.8–§3.11)
+- Design: `commercial/docs/specs/DESIGN-team-as-agent-2026-09.md` (§1, §3.1–§3.6, §3.8–§3.11)
 - Packet reference: [spec/task-packet.md](../spec/task-packet.md)
 - Related: [13-multi-runtime.md](13-multi-runtime.md), [goal-loop guide](../guides/goal-loop.md)

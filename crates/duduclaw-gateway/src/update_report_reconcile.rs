@@ -1,5 +1,5 @@
 //! Cross-restart update result reconciliation (Y8-3, T1 —
-//! `commercial/docs/DESIGN-agent-body-update-2026-08.md` §3.4/§13).
+//! `commercial/docs/specs/DESIGN-agent-body-update-2026-08.md` §3.4/§13).
 //!
 //! Y5-3 designed but explicitly did NOT implement "agent triggers an OS/self
 //! update → the box (or the gateway process) restarts → someone still has to

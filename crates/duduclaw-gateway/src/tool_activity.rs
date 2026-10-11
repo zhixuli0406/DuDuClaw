@@ -8,7 +8,7 @@
 //! version — this is a pure code-motion refactor, `dispatch_engine`'s own
 //! tests (which exercise `filter_tool_activity` directly) are unchanged.
 //!
-//! See `commercial/docs/design-task-forward-model-2026-08-06.md` §5.3.
+//! See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §5.3.
 
 /// One `tool_calls.jsonl` line's fields relevant to the review window.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

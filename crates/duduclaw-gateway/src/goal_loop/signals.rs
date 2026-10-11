@@ -26,7 +26,7 @@ use crate::tool_activity::{ToolActivityRecord, read_tool_activity_records};
 // goal_gap_fingerprint ══════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════════════
 // Gap fingerprinting for the goal loop's no-progress guard — **H4**
-// (`commercial/docs/DESIGN-harness-borrowings-2026-08.md` WP-B, borrowed
+// (`commercial/docs/specs/DESIGN-harness-borrowings-2026-08.md` WP-B, borrowed
 // from grok-build's `gap_fingerprint`, `session/goal_tracker.rs:1208`).
 //
 // ## Problem this replaces
@@ -556,7 +556,7 @@ pub fn detect_tool_streak(
 // goal_bail_detect ══════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════════════
 // Premature-stop ("bail") detection for the goal loop — **H5**
-// (`commercial/docs/DESIGN-harness-borrowings-2026-08.md` WP-B, borrowed
+// (`commercial/docs/specs/DESIGN-harness-borrowings-2026-08.md` WP-B, borrowed
 // from grok-build's `goal_stop_detector.rs`, nine `^`-anchored regexes
 // compared only against the turn's last non-empty paragraph).
 //

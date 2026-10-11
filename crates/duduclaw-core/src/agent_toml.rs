@@ -270,7 +270,7 @@ pub struct ExternalMcpEntryView {
 }
 
 /// `agent.toml [goal_intent]` — per-agent override for the channel-side goal
-/// intent router (P0, `commercial/docs/DESIGN-goal-intent-router-2026-08.md`).
+/// intent router (P0, `commercial/docs/specs/DESIGN-goal-intent-router-2026-08.md`).
 ///
 /// Every field is optional: an absent key falls back to the global
 /// `config.toml [goal_intent]` value, which itself falls back to the hard

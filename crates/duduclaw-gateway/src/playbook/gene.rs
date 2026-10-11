@@ -29,7 +29,7 @@ pub const GENE_SCHEMA: &str = "1.0";
 ///
 /// Why not the bare `name`: `name` uniqueness across a suite tree is
 /// unenforced today, and any CLI-side selection by name alone risks
-/// selecting the wrong subset (see `commercial/docs/DESIGN-evolution-v3-aee.md`
+/// selecting the wrong subset (see `commercial/docs/specs/DESIGN-evolution-v3-aee.md`
 /// §1.4.2). This crate resolves a ref's existence independently of
 /// `duduclaw-cli::eval` (which `duduclaw-gateway` cannot depend on — see
 /// CLAUDE.md's dependency-direction note) by parsing `[case].name` out of
@@ -72,7 +72,7 @@ pub fn compute_asset_id(
 /// Lossless export of a playbook entry into a GEP-gene-shaped JSON document.
 ///
 /// Note on two fields the GEP shape names but this function's signature
-/// (matching `commercial/docs/DESIGN-evolution-v3-aee.md` §1.4 exactly) has
+/// (matching `commercial/docs/specs/DESIGN-evolution-v3-aee.md` §1.4 exactly) has
 /// no direct source for:
 /// - `confidence`: the design's mapping table sources this from "the memory
 ///   row's `confidence` column", which isn't part of `(content, meta,

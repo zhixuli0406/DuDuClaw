@@ -120,7 +120,7 @@ fn any_agent_hard_budget(home_dir: &Path) -> bool {
 // config.toml plaintext-looking?") for the posture score. The dashboard needs
 // something an operator can *act* on: which field, and is it safe to
 // auto-remove. That safety question is exactly the 2026-08-15 incident
-// (commercial/docs/DESIGN-credentials-doctrine-2026-08.md §1.5): a plaintext
+// (commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md §1.5): a plaintext
 // `[[accounts]].oauth_token` sat next to its already-authoritative
 // `oauth_token_enc` twin with nothing ever cleaning it up, and — separately —
 // `system.config`'s array-of-tables masking gap meant it could be read back

@@ -3,7 +3,7 @@
 //! Split out of `driver.rs` to keep both files under the project's
 //! per-file size convention (200-400 lines typical).
 //!
-//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`
 //! §3.3.2 (highlight predisplay), §3.4 (approval reuse), §3.1 (freeze is
 //! human-input-priority, "「交還」是明確動作").
 

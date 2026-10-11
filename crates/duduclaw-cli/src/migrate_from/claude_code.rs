@@ -2,7 +2,7 @@
 //! session transcript, per user pin: P0 includes transcripts).
 //!
 //! Source shapes, mapping table, and provenance rules are
-//! `commercial/docs/DESIGN-runtime-state-sync-2026-08.md` §1.2/§3.2/§3.4:
+//! `commercial/docs/specs/DESIGN-runtime-state-sync-2026-08.md` §1.2/§3.2/§3.4:
 //!
 //! - `~/.claude/CLAUDE.md`, `<real-project-path>/CLAUDE.md` → agent-local
 //!   wiki `imported/claude-code/<label>/CLAUDE.md` (layer=context, trust=0.3,

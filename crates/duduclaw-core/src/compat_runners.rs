@@ -2,14 +2,14 @@
 //!
 //! # Why this exists
 //!
-//! `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §1 specifies a
+//! `commercial/docs/specs/DESIGN-app-compat-layer-2026-08.md` §1 specifies a
 //! SteamOS-style compat layer, copied verbatim in shape: a **discovery
 //! directory** (scan `compat.d/` for declaration files), a **declaration**
 //! (`from_os → to_os` capability claim), and an **entry point** (execution
 //! command + a `require_tool` layer of PATH-resolvable dependencies). This
 //! module is the discovery + declaration half — [`discover_runners`] scans
 //! and reports; nothing here executes an `entrypoint` (that is a later
-//! wave, see `commercial/docs/TODO-compat-cp1-2026-08.md`'s "整合" row).
+//! wave, see `commercial/docs/plans/TODO-compat-cp1-2026-08.md`'s "整合" row).
 //!
 //! Third-party runners (a GE-Proton-style community package) plug into the
 //! exact same interface by dropping a `.toml` file into either scan layer —

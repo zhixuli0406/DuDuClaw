@@ -316,7 +316,7 @@ impl MethodHandler {
                     "",
                     json!({
                         "ok": true,
-                        "crl_note": "本地已標記撤銷；遠端撤銷需發布 CRL（見 commercial/LICENSE-OPERATIONS.md）",
+                        "crl_note": "本地已標記撤銷；遠端撤銷需發布 CRL（見 commercial/docs/runbooks/licensing/LICENSE-OPERATIONS.md）",
                     }),
                 )
             }

@@ -180,7 +180,7 @@ pub enum SysdRequest {
     /// the factory-reset confirmation — the default is to KEEP saved
     /// Wi-Fi credentials, since losing them on a headless LAN appliance can
     /// mean permanent physical-access-only recovery (see
-    /// `commercial/docs/DESIGN-network-settings-2026-08.md` §4.4).
+    /// `commercial/docs/specs/DESIGN-network-settings-2026-08.md` §4.4).
     ClearNetworkCredentials,
     /// `hostnamectl set-hostname <set>`. `set` is passed to
     /// `Command::arg()`, never shell-interpreted; the server still
@@ -254,7 +254,7 @@ pub enum SysdRequest {
     /// this verb at an arbitrary unit (see `dispatch.rs`'s module doc for the
     /// "every argv is a literal" rule this mirrors).
     ///
-    /// Maintenance-mode Entry A (`commercial/docs/DESIGN-maintenance-mode-2026-08.md`
+    /// Maintenance-mode Entry A (`commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md`
     /// §2.6): the ONE verb that actually changes the device's network attack
     /// surface, gated dashboard-side by Admin-only + type-to-confirm + a hard
     /// TTL. This daemon has no opinion about TTL/authorization policy at all

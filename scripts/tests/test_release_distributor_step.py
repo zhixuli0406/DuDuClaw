@@ -58,8 +58,9 @@ class ReleaseDistributorStepTests(unittest.TestCase):
         )
         result = self.run_step()
         self.assertEqual(result.returncode, 0, result.stderr)
-        output = self.source.parent / "duduclaw-technology-brief-v1.70.0.html"
+        output = self.source.parent / "releases/duduclaw-technology-brief-v1.70.0.html"
         self.assertTrue(output.is_file())
+        self.assertFalse((self.source.parent / output.name).exists())
         self.assertIn("1.69.0", output.read_text())
         self.assertIn("REACHED_COMMIT_STAGE", result.stdout)
 

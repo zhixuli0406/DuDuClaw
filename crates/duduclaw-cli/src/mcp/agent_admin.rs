@@ -108,7 +108,7 @@ pub(crate) fn removal_message_for_ai(agent_id: &str) -> String {
 /// honours, so an unreadable value must never be treated as an implicit
 /// grant. `rbac.rs` (the previous, never-called reader of this field) is
 /// deleted as part of this WP — see the B3 verdict in
-/// `commercial/docs/TODO-evolution-v3-2026-08.md` §5.5.
+/// `commercial/docs/plans/TODO-evolution-v3-2026-08.md` §5.5.
 pub(crate) async fn can_modify_own_soul(home_dir: &Path, agent_id: &str) -> bool {
     #[derive(serde::Deserialize, Default)]
     struct PermsOnly {

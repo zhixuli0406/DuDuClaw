@@ -1,6 +1,6 @@
 //! Belief Loop — WP1 platform backend core.
 //!
-//! See `commercial/docs/DESIGN-market-belief-loop-2026-08.md` §2 (schema)
+//! See `commercial/docs/specs/DESIGN-market-belief-loop-2026-08.md` §2 (schema)
 //! and §3 WP1 (this module). Domain-agnostic on purpose: any agent can
 //! record a structured belief about ANY external subject (a ticker, an
 //! index, a KPI…) and have it settled against a realized outcome later —

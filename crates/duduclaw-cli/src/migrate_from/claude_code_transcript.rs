@@ -1,7 +1,7 @@
 //! Claude Code session-transcript parsing (WP-9A): noise filtering + PII
 //! redaction, kept apart from `claude_code.rs`'s orchestration.
 //!
-//! Signal-to-noise measured on-machine (`commercial/docs/DESIGN-runtime-state-sync-2026-08.md`
+//! Signal-to-noise measured on-machine (`commercial/docs/specs/DESIGN-runtime-state-sync-2026-08.md`
 //! §1.6): human prompt text is ~1.1% of transcript bytes, assistant final-reply
 //! text ~0.4% — combined 1.5%. The remaining 98.5% (hook `attachment` output,
 //! `thinking` blocks, `tool_use`/`tool_result` payloads, `queue-operation`,
@@ -49,7 +49,7 @@ pub(super) enum LineKind {
 
 /// Classify one already-parsed JSONL record. Pure — no I/O, fully unit
 /// testable against fixture `serde_json::Value`s mirroring real records
-/// (see `commercial/docs/DESIGN-runtime-state-sync-2026-08.md` §1.2(a)).
+/// (see `commercial/docs/specs/DESIGN-runtime-state-sync-2026-08.md` §1.2(a)).
 pub(super) fn classify_line(v: &serde_json::Value) -> LineKind {
     match v.get("type").and_then(|t| t.as_str()) {
         Some("ai-title") => {

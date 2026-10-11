@@ -1,7 +1,7 @@
 //! `duduclaw preset` — WP-6F (agent presets P1) operator CLI surface.
 //!
 //! P1 deliberately ships no switching UI (see
-//! `commercial/docs/DESIGN-agent-presets-2026-08.md` §9's P1 scope: "不含切
+//! `commercial/docs/specs/DESIGN-agent-presets-2026-08.md` §9's P1 scope: "不含切
 //! 換 UI、registry、版本流") — this module is the one write path for P1,
 //! mirroring `cmd_org_sync`'s shape: refuse from inside an agent session
 //! (binding changes an agent's capabilities — letting an agent bind itself

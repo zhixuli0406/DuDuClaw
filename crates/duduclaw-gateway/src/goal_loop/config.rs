@@ -217,7 +217,7 @@ impl GoalLoopConfig {
 /// autonomous loop must never resurrect itself after a process restart — an
 /// unattended process crash/redeploy must not silently resume driving a
 /// goal that a human has not re-confirmed is still safe to continue. See
-/// H6 in `commercial/docs/DESIGN-harness-borrowings-2026-08.md`.
+/// H6 in `commercial/docs/specs/DESIGN-harness-borrowings-2026-08.md`.
 ///
 /// H6 shipped with [`GoalLoopConfig`]'s default string set to `"auto"`
 /// (byte-identical to pre-H6 behavior) pending the P1 rollout decision in

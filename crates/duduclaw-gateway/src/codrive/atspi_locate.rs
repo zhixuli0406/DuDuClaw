@@ -152,7 +152,7 @@
 //! its value) is redacted to a fixed placeholder in the audit-facing
 //! `detail` string; the locate/click coordinates themselves are unaffected.
 //!
-//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`
 //! §3.2 (execution ladder), §3.4 (perception/DATA discipline). Continues
 //! WP-CD4a's `registry.rs` (C-L2) — see that module's doc for the sibling
 //! "why the generic zbus proxy, not attribute macros trusted blindly" and

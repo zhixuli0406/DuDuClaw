@@ -33,7 +33,7 @@ the ERP side.
 
 The full spec for the trait surface (method signatures, the `duduclaw-erp` skeleton crate
 split, ERPNext implementation details) was already planned out in
-`commercial/docs/TODO-feature-gaps-2026-07.md` §1 — that document is the research output.
+`commercial/docs/plans/TODO-feature-gaps-2026-07.md` §1 — that document is the research output.
 This ADR does exactly one thing: promote that plan to a formal decision and record the
 trade-offs. The spec is not repeated here — both documents should be open side by side
 during implementation.

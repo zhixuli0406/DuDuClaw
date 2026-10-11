@@ -1,5 +1,5 @@
 //! v1.68.0 — the keys `system.update_config` gained from the dashboard
-//! switch audit (`commercial/docs/TODO-dashboard-switches-v1.68-2026-10.md`,
+//! switch audit (`commercial/docs/plans/TODO-dashboard-switches-v1.68-2026-10.md`,
 //! RPC contract table).
 //!
 //! Pure: [`apply_v168_keys`] mutates a parsed `config.toml` table and reports

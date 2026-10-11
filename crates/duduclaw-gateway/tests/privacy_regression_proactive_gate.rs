@@ -15,8 +15,8 @@
 //! change that edits both the implementation AND its co-located tests still
 //! trips a regression here.
 //!
-//! Design doc: `commercial/docs/TODO-os-native-agent.md` P3-5;
-//! `commercial/docs/research-os-native-agent-methodology.md` §5.1 (Release
+//! Design doc: `commercial/docs/plans/TODO-os-native-agent.md` P3-5;
+//! `commercial/docs/research/research-os-native-agent-methodology.md` §5.1 (Release
 //! Governance) and the design note "①-1 fail-closed: 算不出分數 → 不主動打擾"
 //! (ContextAgent 𝒯ℛ single-gate design).
 //!

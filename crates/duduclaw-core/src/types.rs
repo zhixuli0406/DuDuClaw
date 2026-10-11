@@ -232,7 +232,7 @@ pub const DEFAULT_PREFERRED_MODEL: &str = "claude-sonnet-4-6";
 // `[team]` — Team-as-Agent role composition (P1/WP-1)
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Design: `commercial/docs/DESIGN-team-as-agent-2026-09.md` §1, §3.1, §3.11.
+// Design: `commercial/docs/specs/DESIGN-team-as-agent-2026-09.md` §1, §3.1, §3.11.
 //
 // An **employee** stays the only user-visible unit (agent directory, SOUL.md,
 // channels, memory, playbook — unchanged). A **team** is a role grouping
@@ -1725,7 +1725,7 @@ pub struct CapabilitiesConfig {
     pub system_operator: bool,
 
     /// Opt-in human-machine co-drive (人機共駕, CD-1,
-    /// `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1:
+    /// `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1:
     /// "共駕能力預設關；開啟是 per-agent 明確授權"). Master switch for the
     /// `codrive_run` MCP tool — GUI-level mouse/keyboard injection into a
     /// shared desktop via the `duduclaw-comp` compositor's agent-injection
@@ -3575,7 +3575,7 @@ pub struct AgentConfig {
     /// Default `Full` preserves v1.12.x behaviour; opt-in `Minimal` switches
     /// to Anthropic Skills-style "index + MCP on demand" — wiki/skill
     /// content is fetched at tool-call time instead of injected upfront.
-    /// See `commercial/docs/TODO-runtime-health-fixes-202605.md #11`.
+    /// See `commercial/docs/plans/TODO-runtime-health-fixes-202605.md #11`.
     #[serde(default)]
     pub prompt: PromptConfig,
 
@@ -3651,7 +3651,7 @@ pub struct PromptConfig {
     /// (loses OAuth, skips hooks). Operators opt in per-agent after
     /// verifying their AccountRotator has an API key fallback.
     ///
-    /// See [#15 in commercial/docs/TODO-runtime-health-fixes-202605.md].
+    /// See [#15 in commercial/docs/plans/TODO-runtime-health-fixes-202605.md].
     pub cli_bare_mode: bool,
 }
 

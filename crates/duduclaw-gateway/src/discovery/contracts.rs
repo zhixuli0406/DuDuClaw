@@ -13,7 +13,7 @@
 //! - the orchestrator (`online.rs`) — owns budgets, concurrency, the ledger
 //!   and the round loop, and is the only component that talks to all three.
 //!
-//! Design: `commercial/docs/DESIGN-dream-rsi-2026-09.md` §7.5–§7.8.
+//! Design: `commercial/docs/specs/DESIGN-dream-rsi-2026-09.md` §7.5–§7.8.
 //! Invariants every implementation must keep (design §7.5):
 //!
 //! - I1: the attempt prompt is a function of the goal, the ancestor chain,

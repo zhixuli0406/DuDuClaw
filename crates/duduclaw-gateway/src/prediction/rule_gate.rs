@@ -1,6 +1,6 @@
 //! WP-P3 — held-out rule gate (pure functions).
 //!
-//! See `commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §1.4, §4
+//! See `commercial/docs/specs/DESIGN-lwm-calibration-2026-08-10.md` §1.4, §4
 //! (platform section), §6 (the seven anti-overfitting criteria), §9.
 //!
 //! ## The one rule this module enforces

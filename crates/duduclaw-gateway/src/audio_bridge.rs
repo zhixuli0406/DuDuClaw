@@ -1,7 +1,7 @@
 //! Y10-1: agent→audio gateway bridge — the "耳朵與嘴" agent-body surface
 //! (volume/mute/output-device), built on the exact pattern A7c established
 //! for `display_bridge.rs` (see this crate's `display_bridge` module doc and
-//! `commercial/docs/DESIGN-os-self-drive-2026-08.md` §11 first). Read that
+//! `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §11 first). Read that
 //! module's doc before this one — everything below is either "same shape,
 //! restated for audio" or an explicit, justified divergence.
 //!

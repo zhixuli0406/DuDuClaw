@@ -715,7 +715,7 @@ struct CodexUsage {
 /// Parse a complete `codex exec --json` stdout buffer into `(content,
 /// input_tokens, output_tokens, chunks)`.
 ///
-/// T10 (design commercial/docs/design-task-forward-model-2026-08-06.md
+/// T10 (design commercial/docs/specs/design-task-forward-model-2026-08-06.md
 /// §8.2/§9): the previously zero-constructor `RuntimeChunk::ToolUse` /
 /// `ToolResult` variants (`runtime/mod.rs`) are populated from `item.
 /// completed` events whose `item.type` is `command_execution` or

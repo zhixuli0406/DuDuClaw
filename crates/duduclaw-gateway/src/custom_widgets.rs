@@ -1,5 +1,5 @@
 //! Custom dashboard widgets (2026-07-16 design:
-//! `commercial/docs/custom-widgets-design-2026-07-16.md`).
+//! `commercial/docs/specs/custom-widgets-design-2026-07-16.md`).
 //!
 //! A custom widget is a **single-file HTML document** rendered by the
 //! dashboard inside a sandboxed iframe (`sandbox="allow-scripts"`, no

@@ -1,7 +1,7 @@
 //! WP-6A / A2 — harness-knob telemetry snapshot (read-only, zero behavior
 //! change).
 //!
-//! `commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md` §0 concludes
+//! `commercial/docs/specs/DESIGN-evolution-harness-knobs-2026-08.md` §0 concludes
 //! that letting the evolution engine *tune* these knobs is SHELVED — see the
 //! design doc's §6.8 for why an automatic loop is never the right tool for
 //! any of them. What the document DOES recommend as a cheap, zero-risk

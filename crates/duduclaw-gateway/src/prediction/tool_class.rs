@@ -1,6 +1,6 @@
 //! WP-A1 — `ToolClass`: the only runtime-neutral tool-semantics unit.
 //!
-//! See `commercial/docs/design-task-forward-model-2026-08-06.md` §2.2. A
+//! See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §2.2. A
 //! specific tool name is NOT comparable across runtimes — Claude's `Bash`,
 //! codex's shell item, and gemini's `run_shell_command` are the same
 //! *thing* under three different names. Prediction and diff therefore never

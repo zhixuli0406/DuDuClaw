@@ -8,7 +8,7 @@ impl MethodHandler {
     /// non-empty — a revoked/expired/permission-stripped token reported
     /// "success" and the user only found out the channel was actually dead
     /// when a real message needed to go out (breakpoint #5,
-    /// `commercial/docs/ux-redesign-2026-08/01-current-state-map.md`).
+    /// `commercial/design/reviews/ux-redesign-2026-08/01-current-state-map.md`).
     ///
     /// Now: when a live destination can be found, an actual test message is
     /// sent through the shared `channel_sender::ChannelSender` impls (never a

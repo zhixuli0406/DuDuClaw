@@ -5,7 +5,7 @@ use super::*;
 
 impl MethodHandler {
     // ── Maintenance Mode — Entry A ────────────────────────────
-    // `commercial/docs/DESIGN-maintenance-mode-2026-08.md` §2. Dispatch gates
+    // `commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md` §2. Dispatch gates
     // (Admin-only + appliance-only) live in `dispatch()`'s method match, same
     // as every other `device.*`/`network.*` handler; these methods are the
     // orchestration + re-auth/confirm checks specific to this RPC family.

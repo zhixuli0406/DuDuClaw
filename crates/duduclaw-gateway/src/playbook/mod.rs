@@ -1,5 +1,5 @@
 //! Playbook — gene-shaped experience entries for the AEE evolution loop
-//! (WP1.2 + WP1.3; GEP G1/G2/G3/G5/G6; `commercial/docs/DESIGN-evolution-v3-aee.md` §1).
+//! (WP1.2 + WP1.3; GEP G1/G2/G3/G5/G6; `commercial/docs/specs/DESIGN-evolution-v3-aee.md` §1).
 //!
 //! **Carrier decision (§1.1)**: a playbook entry is a `duduclaw-memory`
 //! semantic-layer row (`source_event = `[`entry::PLAYBOOK_SOURCE_EVENT`])

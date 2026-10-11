@@ -348,7 +348,7 @@ pub const ENV_DATA_FILE_GUARD: &str = "DUDUCLAW_DATA_FILE_GUARD";
 
 /// `working_state` key used for the agent-body update vertical slice's
 /// cross-restart result report handshake (Y8-3, T1 —
-/// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §13). Shared here
+/// `commercial/docs/specs/DESIGN-agent-body-update-2026-08.md` §13). Shared here
 /// (rather than hardcoded as the same string literal in two crates) because
 /// both the writer (`duduclaw-cli`'s `mcp_os_ops.rs`, inside the per-session
 /// `duduclaw mcp-server` subprocess) and the reader (`duduclaw-gateway`'s

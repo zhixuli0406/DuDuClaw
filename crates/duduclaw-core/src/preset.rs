@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! `commercial/docs/DESIGN-agent-presets-2026-08.md` names the problem: a
+//! `commercial/docs/specs/DESIGN-agent-presets-2026-08.md` names the problem: a
 //! deployed agent's `agent.toml` is a one-time copy of a shared department
 //! kit — the moment `cp -r` finishes, source and copy are permanently
 //! disconnected. This module turns "copy once" into "reference continuously":

@@ -2,7 +2,7 @@
 //! face (`os_*` MCP tools in `duduclaw-cli/src/mcp_os_ops.rs`), plus
 //! parameter completion and a safety triage.
 //!
-//! Design authority: `commercial/docs/DESIGN-agent-os-native-apps-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-agent-os-native-apps-2026-08.md`
 //! §6.3 O-1, §6.4 (coupling/security). Core contract from that section:
 //!
 //! - **Routing only, never execution** (maker-checker): this module produces
@@ -99,7 +99,7 @@ pub enum OsTool {
     /// Agent-body network vertical slice (Y2-3): rich Wi-Fi link/IP/
     /// connectivity status (`network.status`) — NOT the same data as
     /// [`OsTool::NetworkInfo`] (bare interface list, `device.network`). See
-    /// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §4.
+    /// `commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §4.
     WifiStatus,
     /// Agent-body network vertical slice (Y2-3): nearby Wi-Fi networks
     /// (`network.wifi_scan`).
@@ -120,7 +120,7 @@ pub enum OsTool {
     /// boot assessment for the running version (`device.boot_assessment`) —
     /// the tool an agent uses to answer "did the update I applied actually
     /// take" across a reboot. See
-    /// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §4.
+    /// `commercial/docs/specs/DESIGN-agent-body-update-2026-08.md` §4.
     BootAssessment,
     /// Agent-body update vertical slice (Y5-3): roll back to the previously
     /// installed A/B slot, then reboot (`device.update_rollback`) —
@@ -1129,7 +1129,7 @@ mod tests {
 
     /// Agent-body network vertical slice (Y2-3): "幫我連 Wi-Fi" resolves to
     /// the sensing tool (`WifiScan`), not a nonexistent connect tool — see
-    /// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §5 for why the
+    /// `commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §5 for why the
     /// join step is deliberately NOT an O-1-routable tool call. Also checks
     /// the new Wi-Fi phrase groups don't collide with `NetworkInfo`'s
     /// existing interface/IP phrases (would show up here as a `Grey`

@@ -467,7 +467,7 @@ pub fn extract_readonly_result_artifact(events: &[NativeToolEvent]) -> Option<Va
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// T1 (`commercial/docs/DESIGN-agent-body-network-2026-08.md` §5.2/§12): the
+// T1 (`commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §5.2/§12): the
 // THIRD O-4→O-3 artifact source. Neither `marker_to_artifact` (a PENDING
 // confirmation decided BEFORE any tool call, from static `OsIntentResult`
 // params) nor `extract_readonly_result_artifact` (a SUCCESSFUL read-only

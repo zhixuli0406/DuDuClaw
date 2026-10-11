@@ -32,7 +32,7 @@
 //! Every object path, interface name, property, and method used below was
 //! read from iwd's own upstream `doc/*.rst` D-Bus API documentation, NOT
 //! spot-checked against a running `iwd` in this session — the design brief
-//! (`commercial/docs/DESIGN-network-settings-2026-08.md` §7) ran a real
+//! (`commercial/docs/specs/DESIGN-network-settings-2026-08.md` §7) ran a real
 //! spike against `mac80211_hwsim` and confirmed scan/connect/forget/
 //! persistence/permissions all work end to end, but that spike used `iwctl`
 //! interactively, not this exact D-Bus call sequence. Every property read

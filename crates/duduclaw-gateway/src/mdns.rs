@@ -5,7 +5,7 @@
 //! module advertises the gateway as `_duduclaw._tcp.local.` so the desktop
 //! shell's `gateway_discover` command can browse and list reachable gateways.
 //!
-//! Design (`commercial/docs/design-gateway-picker.md` §2 / §2.5):
+//! Design (`commercial/docs/specs/design-gateway-picker.md` §2 / §2.5):
 //! - service type `_duduclaw._tcp.local.`, instance = the gateway's display name
 //! - TXT records: `version`, `name`, `tls=0/1`
 //! - `config.toml [server] mdns_advertise` (default **false** since §2.5 — an
