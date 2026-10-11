@@ -14,9 +14,22 @@ on:
   push:
     tags: ["desktop-v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Desktop release tag (desktop-vX.Y.Z)
+        required: true
+        type: string
 
 jobs:
+  delivery-gate:
+    uses: ./.github/workflows/release-delivery-gate.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
+
   build:
+    needs: delivery-gate
     permissions:
       contents: write
     strategy:
@@ -33,7 +46,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Validate publish tag family
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.delivery-gate.outputs.commit }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -92,8 +113,8 @@ jobs:
         with:
           projectPath: src-tauri
           args: --target ${{ matrix.target }}
-          tagName: ${{ github.ref_name }}
-          releaseName: "DuDuClaw Desktop ${{ github.ref_name }}"
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "DuDuClaw Desktop ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
           # tauri-action emits latest.json (updater manifest) when the updater
@@ -149,8 +170,9 @@ jobs:
       - name: Republish latest.json under the desktop-updater tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+          gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" \
             --pattern latest.json --output latest.json
           if ! gh release view desktop-updater --repo "${{ github.repository }}" >/dev/null 2>&1; then
             # prerelease so it never becomes the repo's "latest" release (the
@@ -170,10 +192,11 @@ jobs:
       - name: Restore the CLI release as the repo's "Latest"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          CLI_TAG="${GITHUB_REF_NAME#desktop-}"
+          CLI_TAG="${RELEASE_TAG#desktop-}"
           if gh release view "$CLI_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release edit "$CLI_TAG" --repo "${{ github.repository }}" --latest
           else
-            gh release edit "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --latest=false
+            gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --latest=false
           fi

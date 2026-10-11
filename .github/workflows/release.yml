@@ -14,7 +14,15 @@ permissions:
   contents: write
 
 jobs:
+  delivery-gate:
+    uses: ./.github/workflows/release-delivery-gate.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
+
   build:
+    needs: delivery-gate
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     permissions:
@@ -40,9 +48,15 @@ jobs:
             artifact: duduclaw-windows-x64
 
     steps:
+      - name: Validate publish tag family
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.delivery-gate.outputs.commit }}
 
       - uses: actions/setup-node@v7
         with:
@@ -173,12 +187,14 @@ jobs:
 
   # Publish to npm
   npm-publish:
-    needs: release
+    needs: [release, delivery-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.delivery-gate.outputs.commit }}
 
       - uses: actions/setup-node@v7
         with:
@@ -203,13 +219,15 @@ jobs:
 
   # Publish Python SDK to PyPI
   pypi-publish:
-    needs: release
+    needs: [release, delivery-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write  # Required for PyPI Trusted Publisher (OIDC)
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.delivery-gate.outputs.commit }}
 
       - uses: actions/setup-python@v6
         with:

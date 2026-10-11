@@ -1,5 +1,9 @@
 # Release distributor technical brief
 
+This optional legacy HTML is separate from the mandatory [two-manual and
+three-website delivery gate](release-delivery-sync.md). An absent brief source
+does not exempt a release from preparing and reviewing the two complete manuals.
+
 `scripts/release.sh` generates the distributor technical brief after the Rust
 checks succeed and before creating the release commit or tags. It calls:
 
