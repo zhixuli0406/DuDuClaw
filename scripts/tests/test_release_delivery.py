@@ -210,6 +210,35 @@ class DeliveryTests(unittest.TestCase):
             self.assertIn("  build:\n    needs: delivery-gate", body)
             self.assertIn("ref: ${{ needs.delivery-gate.outputs.commit }}", body)
 
+    def test_install_exact_verified_bytes(self):
+        raw, sig = self.sign()
+        delivery.install_assertion(self.root, "1.2.4", raw, sig)
+        self.assertEqual((self.root / "distribution/release-delivery/v1.2.4.json").read_bytes(), raw)
+        with self.assertRaises(ValueError): delivery.install_assertion(self.root, "1.2.4", raw, sig)
+
+    def test_target_symlink_never_overwrites_outside_file(self):
+        raw, sig = self.sign()
+        folder = self.root / "distribution/release-delivery"; folder.mkdir()
+        outside = self.root / "sentinel"; outside.write_bytes(b"protected")
+        (folder / "v1.2.4.json").symlink_to(outside)
+        with self.assertRaises(ValueError): delivery.install_assertion(self.root, "1.2.4", raw, sig)
+        self.assertEqual(outside.read_bytes(), b"protected")
+
+    def test_directory_symlink_never_writes_outside(self):
+        raw, sig = self.sign()
+        outside = self.root / "outside"; outside.mkdir()
+        (self.root / "distribution/release-delivery").symlink_to(outside)
+        with self.assertRaises(OSError): delivery.install_assertion(self.root, "1.2.4", raw, sig)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_dangling_signature_link_does_not_create_target(self):
+        raw, sig = self.sign()
+        folder = self.root / "distribution/release-delivery"; folder.mkdir()
+        outside = self.root / "absent-target"
+        (folder / "v1.2.4.sig").symlink_to(outside)
+        with self.assertRaises(ValueError): delivery.install_assertion(self.root, "1.2.4", raw, sig)
+        self.assertFalse(outside.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

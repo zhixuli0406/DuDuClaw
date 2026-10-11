@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 
@@ -15,6 +16,44 @@ ITEMS = {"it_manual", "user_manual", "product_site", "os_site", "company_site"}
 SHA = re.compile(r"[0-9a-f]{40}")
 HASH = re.compile(r"[0-9a-f]{64}")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+
+
+def read_regular(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("assertion input must be a regular file")
+        return stream.read(32769)
+
+
+def install_assertion(root, version, raw, signature):
+    """Install verified bytes without following links or overwriting editions."""
+    folder = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in ("distribution", "release-delivery"):
+            try:
+                os.mkdir(component, dir_fd=folder)
+            except FileExistsError:
+                pass
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+            os.close(folder)
+            folder = child
+        # Existing regular files and both live/dangling links are all refused.
+        for suffix in ("json", "sig"):
+            try:
+                os.stat(f"v{version}.{suffix}", dir_fd=folder, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise ValueError("delivery edition already exists; inspect before retrying")
+        for suffix, contents in (("json", raw), ("sig", signature + b"\n")):
+            fd = os.open(f"v{version}.{suffix}", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o644, dir_fd=folder)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(contents)
+                stream.flush()
+                os.fsync(stream.fileno())
+    finally:
+        os.close(folder)
 
 
 def git(root, *args):
@@ -232,6 +271,7 @@ def main():
     parser.add_argument("--public-key", type=Path)
     parser.add_argument("--release-ref", help="Validate a final release commit/tag instead of pre-bump HEAD")
     parser.add_argument("--require-main", action="store_true", help="Require released commit to be merged into origin/main")
+    parser.add_argument("--install", action="store_true", help="Exclusively stage verified neutral bytes before bumping")
     args = parser.parse_args()
     try:
         key = args.public_key.read_text() if args.public_key else os.environ.get("RELEASE_DELIVERY_PUBLIC_KEY_PEM", "")
@@ -251,12 +291,14 @@ def main():
         else:
             if not args.assertion or not args.signature:
                 raise ValueError("a reviewed delivery assertion and signature are required before bumping")
-            raw = args.assertion.read_bytes()
-            signature = args.signature.read_bytes().strip()
+            raw = read_regular(args.assertion)
+            signature = read_regular(args.signature).strip()
             source = git(args.root, "rev-parse", "HEAD").decode().strip()
         verify_assertion(raw, signature, key, args.version, args.root, source)
         if args.release_ref:
             verify_release_commit(args.root, revision, source, args.version)
+        elif args.install:
+            install_assertion(args.root, args.version, raw, signature)
         print("Release delivery gate: PASS (two manuals and three websites independently reviewed)")
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError, json.JSONDecodeError):
         # Do not print external/private content, paths, diffs, or subprocess stderr.

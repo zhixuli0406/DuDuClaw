@@ -105,9 +105,10 @@ Git, Actions secrets/logs, release assets or a website. Its operator storage and
 rotation procedure are documented privately. A release fails closed when the
 repository variable is absent, the key is wrong, the assertion expired, or a
 signature/digest does not match. Rotating the key requires re-signing any pending
-release assertion; previously published binaries are unaffected, but rerunning
-historical publishing workflows under a new key deliberately requires a new
-reviewed assertion rather than silently trusting the old key.
+release assertion before its bump commit is prepared. Previously published
+binaries are unaffected. Expired assertions and historical tags signed by a
+retired key cannot be re-signed in place or republished with this tool: prepare
+a new version and complete its delivery review instead.
 
 This workflow cannot prevent an administrator from replacing the key, changing
 the workflows or pushing a historical tag whose old workflow predates this

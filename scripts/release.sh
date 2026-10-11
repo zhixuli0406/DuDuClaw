@@ -452,13 +452,10 @@ if [[ -z "${RELEASE_DELIVERY_PUBLIC_KEY_PEM:-}" ]]; then
     export RELEASE_DELIVERY_PUBLIC_KEY_PEM
 fi
 python3 "$(dirname "$0")/release_delivery.py" --version "$NEW_VERSION" \
-    --assertion "$DELIVERY_ASSERTION" --signature "$DELIVERY_SIGNATURE"
+    --assertion "$DELIVERY_ASSERTION" --signature "$DELIVERY_SIGNATURE" --install
 # Snapshot exact bytes that were verified; the pre-tag validator verifies them
 # again after commit, so changes to external inputs cannot reach a tag.
 DELIVERY_DIR="distribution/release-delivery"
-mkdir -p "$DELIVERY_DIR"
-cp "$DELIVERY_ASSERTION" "$DELIVERY_DIR/v$NEW_VERSION.json"
-cp "$DELIVERY_SIGNATURE" "$DELIVERY_DIR/v$NEW_VERSION.sig"
 
 # --- Bump every platform manifest (rewrites ANY semver, so drift is corrected) ---
 echo "Bumping all platform manifests to $NEW_VERSION..."
