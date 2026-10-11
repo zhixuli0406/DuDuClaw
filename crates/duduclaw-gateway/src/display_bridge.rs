@@ -2,7 +2,7 @@
 //! makes A7a's `display` group (comp's `shell_control` socket: cursor
 //! size/source, theme, output scale) reachable from an agent identity.
 //!
-//! Design authority: `commercial/docs/DESIGN-os-self-drive-2026-08.md` (A7a,
+//! Design authority: `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` (A7a,
 //! §7 — the uid-boundary finding this module closes) and this crate's
 //! `mcp_os_ops.rs`-style "same capability, two front doors, same gate set"
 //! convention (see that file's module doc in `duduclaw-cli`).
@@ -104,7 +104,7 @@ async fn call_at(path: &Path, req: Value) -> Result<Value, String> {
     if !path.exists() {
         return Err(format!(
             "shell socket 不存在：{}。comp/殼可能未啟動，或這台不是值班機（appliance）——A7c 的固定路徑\
-             只在真正的 kiosk session 上存在，見 commercial/docs/DESIGN-os-self-drive-2026-08.md §7。",
+             只在真正的 kiosk session 上存在，見 commercial/docs/specs/DESIGN-os-self-drive-2026-08.md §7。",
             path.display()
         ));
     }
