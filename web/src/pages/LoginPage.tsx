@@ -5,7 +5,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
 import { Field } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
-import { useEffectiveName, useEffectiveLogo, useEffectiveSubtitle } from '@/lib/branding';
+import { useEffectiveName } from '@/lib/product-identity';
 
 type Mode = 'password' | 'otp';
 type OtpStep = 'email' | 'code';
@@ -13,12 +13,7 @@ type OtpStep = 'email' | 'code';
 export function LoginPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  // Pre-auth branding comes from the localStorage cache the store hydrates at
-  // module load; a white-label distributor sees their brand on the login page.
   const brandName = useEffectiveName();
-  const brandLogo = useEffectiveLogo();
-  // v1.68: a distributor subtitle replaces the default tagline.
-  const brandSubtitle = useEffectiveSubtitle();
   const login = useAuthStore((s) => s.login);
   const otpRequest = useAuthStore((s) => s.otpRequest);
   const otpVerify = useAuthStore((s) => s.otpVerify);
@@ -163,20 +158,10 @@ export function LoginPage() {
     <div className="flex min-h-screen items-center justify-center bg-app-shell p-4">
       <div className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center text-center">
-          {/* A white-label distributor with a custom logo shows it here;
-              otherwise DuDu greets the returning operator (§7.3 接待員). */}
-          {brandLogo.isImage ? (
-            <img
-              src={brandLogo.value}
-              alt={brandName}
-              className="h-16 w-16 rounded-xl object-cover ring-1 ring-surface-border"
-            />
-          ) : (
-            <DuDu face="waving" size={72} label="DuDu" />
-          )}
+          <DuDu face="waving" size={72} label="DuDu" />
           <h1 className="mt-3 text-base font-medium text-foreground">{brandName}</h1>
           <p className="mt-1 text-sm text-muted-foreground" data-testid="login-subtitle">
-            {brandSubtitle ?? intl.formatMessage({ id: 'login.subtitle' })}
+            {intl.formatMessage({ id: 'login.subtitle' })}
           </p>
         </div>
 

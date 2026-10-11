@@ -2147,6 +2147,7 @@ async fn try_direct_api(
     rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    crate::product_policy::require_model(crate::product_policy::load(home_dir)?, model)?;
     if let DirectApiRoute::LlmProvider(provider_id) = direct_api_route(model) {
         return try_llm_provider_api(
             agent_id,
@@ -2367,6 +2368,8 @@ async fn try_direct_api_chain(
     request_type: crate::cost_telemetry::RequestType,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    let policy = crate::product_policy::load(home_dir)?;
+    crate::product_policy::require_model(policy, preferred_model)?;
     // Rotator is best-effort: if it can't be built we still resolve keys via env.
     let rotator = get_rotator(home_dir).await.ok();
 
@@ -2378,7 +2381,8 @@ async fn try_direct_api_chain(
         if providers_with_keys.contains(&provider) {
             continue;
         }
-        if candidate_provider_has_key(&provider, home_dir, rotator.as_deref()).await {
+        if policy.require_provider(&provider).is_ok()
+            && candidate_provider_has_key(&provider, home_dir, rotator.as_deref()).await {
             providers_with_keys.insert(provider);
         }
     }
@@ -2406,6 +2410,9 @@ async fn try_direct_api_chain(
     let rotator_ref = rotator.as_deref();
     drive_direct_api_chain(&candidates, |model| async move {
         let (provider, bare) = provider_and_bare(&model);
+        if let Err(message) = crate::product_policy::require_provider(home_dir, &provider) {
+            return Err(ChainError { message, failover: false });
+        }
         if provider == "anthropic" {
             match try_direct_api(
                 home_dir,

@@ -25,7 +25,7 @@ fn enterprise_surfaces_are_listed() {
         "departments.list",
         "departments.create",
         "departments.remove",
-        // 經銷商管理／發授權／白牌品牌
+        // 總經銷授權交付與管理
         "distributor.status",
         "distributor.list",
         "distributor.add",
@@ -34,15 +34,6 @@ fn enterprise_surfaces_are_listed() {
         "distributor.issue",
         "distributor.revoke",
         "distributor.upgrade",
-        "distributor.bundle.sign",
-        // 夥伴入口（經銷 CRM）
-        "partner.profile",
-        "partner.profile.update",
-        "partner.stats",
-        "partner.customers",
-        "partner.customer.add",
-        "partner.customer.update",
-        "partner.customer.delete",
         // 身分解析
         "identity.config_get",
         "identity.config_set",
@@ -77,7 +68,6 @@ fn personal_surfaces_are_untouched() {
         "license.status",
         "license.fingerprint",
         "license.activate",
-        "license.redeem",
         // 審批 / 稽核 / 日誌 / kill switch (D9)
         "approvals.list",
         "approvals.decide",

@@ -755,6 +755,7 @@ impl AgentRuntime for GenericCliRuntime {
     ) -> Result<RuntimeResponse, String> {
         // P5: this runtime cannot carry the read-only explore lane.
         crate::explore_lane::refuse_unsupported_runtime("generic CLI")?;
+        crate::product_policy::require_runtime(&context.home_dir, self.spec.id)?;
         self.run(prompt, context).await.map_err(Into::into)
     }
 
@@ -1071,6 +1072,20 @@ mod tests {
         let fut = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("t-77".into()), fut);
         let resp = fut.await.unwrap();
         assert_eq!(resp.content, "t-77|telegram:9|abc123");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn futureoffice_refuses_generic_runtime_before_spawning_even_if_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[product]\nprofile='futureoffice'").unwrap();
+        for id in ["qwen", "kimi"] {
+            let bin = fake_bin(dir.path(), id, "touch spawned\necho '{\"result\":\"should not run\"}'");
+            let rt = GenericCliRuntime::with_program(spec_for(id).unwrap(), bin.to_string_lossy());
+            let err = rt.execute("hi", &ctx(dir.path())).await.unwrap_err();
+            assert!(err.contains("Product profile"), "{err}");
+            assert!(!dir.path().join("spawned").exists());
+        }
     }
 
     #[cfg(unix)]

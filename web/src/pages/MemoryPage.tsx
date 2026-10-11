@@ -1,3 +1,4 @@
+import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import type { IntlShape } from 'react-intl';
 import { useIntl } from 'react-intl';
@@ -162,6 +163,8 @@ export function MemoryPage() {
         title={intl.formatMessage({ id: 'nav.memory' })}
         description={intl.formatMessage({ id: 'nav.memory.desc' })}
       />
+
+      {view === 'memories' && <div className="px-4 py-2"><DataExportButton dataset="memories" agentId={selectedAgent} /></div>}
 
       {/* Control row: view switcher + agent picker + (memories) search. */}
       <div className="flex h-12 shrink-0 items-center gap-2 overflow-x-auto border-b border-surface-border px-4">

@@ -49,6 +49,8 @@ impl MethodHandler {
         };
         let content = super::config_commit::render_preserving(&original, table)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        crate::product_policy::validate_write(&self.home_dir, &target, &original, &content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
         tokio::fs::write(path, content).await
     }
 

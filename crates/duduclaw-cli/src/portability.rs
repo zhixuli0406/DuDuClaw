@@ -101,6 +101,7 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool) -> Result<()> {
             format!("archive not found: {}", archive.display()),
         ));
     }
+    validate_import_policy(archive, home)?;
     let existing_agents = home.join("agents");
     if existing_agents.exists() {
         if !force {
@@ -239,4 +240,50 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+    #[test]
+    fn import_cannot_remove_installation_profile_or_restore_blocked_agent() {
+        let root = unique_tmp("profile-policy");
+        let source = root.join("source");
+        let target = root.join("target");
+        write(&source.join("config.toml"), "[product]\nprofile='standard'");
+        write(&target.join("config.toml"), "[product]\nprofile='futureoffice'");
+        write(&target.join("agents/kept/SOUL.md"), "keep");
+        let archive = root.join("input.tar.gz");
+        export_home(&source, &archive).unwrap();
+        assert!(import_archive(&archive, &target, true).is_err());
+        assert_eq!(fs::read_to_string(target.join("agents/kept/SOUL.md")).unwrap(), "keep");
+        write(&source.join("config.toml"), "[product]\nprofile='futureoffice'");
+        write(&source.join("agents/test/agent.toml"), "[runtime]\nprovider='kimi'");
+        export_home(&source, &archive).unwrap();
+        assert!(import_archive(&archive, &target, true).is_err());
+        assert!(!target.join("agents.pre-import").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+fn validate_import_policy(archive: &Path, home: &Path) -> Result<()> {
+    use std::io::Read;
+    let policy = duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?;
+    let file = File::open(archive).map_err(|e| io_err("import policy", e))?;
+    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    for entry in archive.entries().map_err(|e| io_err("import policy", e))? {
+        let mut entry = entry.map_err(|e| io_err("import policy", e))?;
+        let path: PathBuf = entry.path().map_err(|e| io_err("import policy", e))?.components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir)).collect();
+        if path == Path::new("config.toml") || path.file_name().and_then(|v| v.to_str()) == Some("agent.toml") {
+            if !entry.header().entry_type().is_file() || entry.header().size().unwrap_or(u64::MAX) > 1024 * 1024 {
+                return Err(io_err("import policy", "invalid or oversized configuration entry"));
+            }
+            let mut text = String::new();
+            entry.read_to_string(&mut text).map_err(|e| io_err("import policy", e))?;
+            let table: toml::Table = text.parse().map_err(|_| io_err("import policy", "invalid configuration"))?;
+            duduclaw_gateway::product_policy::validate_table(policy, &table).map_err(DuDuClawError::Config)?;
+            if path == Path::new("config.toml") {
+                let before = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+                duduclaw_gateway::product_policy::validate_write(home, &home.join("config.toml"), &before, &text)
+                    .map_err(DuDuClawError::Config)?;
+            }
+        }
+    }
+    Ok(())
 }

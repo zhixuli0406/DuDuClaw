@@ -1,3 +1,4 @@
+import { useProductPolicyStore } from '@/lib/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -81,6 +82,7 @@ function setRole(role: 'admin' | 'manager' | 'employee') {
 let updateAgent: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
+  useProductPolicyStore.setState({policy:{profile:'standard',blocked_channels:[],blocked_runtimes:[],blocked_providers:[]},loading:false,error:false});
   vi.clearAllMocks();
   setRole('admin');
   mockWsClient.call.mockResolvedValue({ ...FULL });
@@ -161,6 +163,16 @@ describe('new controls round-trip from inspect to payload', () => {
     expect(await screen.findAllByText(en['agents.v168.genericCli.note'])).not.toHaveLength(0);
     await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
     expect(lastPayload()).toEqual({ runtime: { provider: 'qwen' } });
+  });
+
+  it('does not offer Qwen or Kimi runtimes in the distributor profile', async () => {
+    useProductPolicyStore.setState({policy:{profile:'futureoffice',blocked_channels:['wecom','dingtalk','feishu'],blocked_runtimes:['qwen','kimi'],blocked_providers:['minimax','deepseek']}});
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=brain');
+    await user.click(await screen.findByRole('combobox', { name: 'AI Backend (Provider)' }));
+    expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Qwen (generic command-line tool)' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Kimi (generic command-line tool)' })).not.toBeInTheDocument();
   });
 
   it('prefills fork + guardrails and sends one section per edit', async () => {

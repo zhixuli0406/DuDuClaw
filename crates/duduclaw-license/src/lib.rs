@@ -24,7 +24,6 @@
 //!
 //! See `commercial/docs/spec-license-module.md` for the full design rationale.
 
-pub mod bundle;
 pub mod crl;
 pub mod error;
 pub mod fingerprint;
@@ -35,9 +34,6 @@ pub mod storage;
 pub mod tier;
 
 // Re-export primary types for ergonomic use.
-pub use bundle::{
-    sign_bundle, verify_bundle, BrandingBundle, BrandingConfig, BUNDLE_KEY_ID, BUNDLE_SCHEMA,
-};
 pub use crl::SignedCrl;
 pub use error::{LicenseError, Result};
 pub use fingerprint::{
@@ -76,7 +72,7 @@ mod integration_tests {
         // Sanity checks against the v2 manifest
         assert!(!gate.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(gate.check(LicenseTier::Studio, "premium_templates"));
-        assert!(gate.check(LicenseTier::Oem, "white_label"));
+        assert!(!gate.check(LicenseTier::Oem, "white_label"));
         // Service commitments are display-only — `check()` never gates on
         // them, even where the manifest says `true`.
         assert!(!gate.check(LicenseTier::SelfHostPro, "dashboard_enterprise"));

@@ -84,6 +84,7 @@ const FEATURES: &[&str] = &[
 /// importing a data file. On confirmation, scaffolds a new agent directory
 /// from the matching template.
 pub async fn cmd_wizard(home: &Path) -> Result<()> {
+    duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?;
     println!("\n  {} DuDuClaw Agent Setup Wizard\n", style("🐾").bold(),);
 
     // 1. Select industry
@@ -102,7 +103,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         );
         println!(
             "     {}\n",
-            style("解鎖：duduclaw license activate <key>  ·  https://duduclaw.dudustudio.monster#pricing").dim()
+            style("啟用：duduclaw license activate <key>  ·  總經銷：  https://futurecorp.tw").dim()
         );
     }
 
@@ -252,6 +253,11 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
     // Ensure agent.toml exists even if no template was copied
     let agent_toml_path = agent_dir.join("agent.toml");
     if agent_toml_path.exists() {
+        let content = tokio::fs::read_to_string(&agent_toml_path).await
+            .map_err(|e| DuDuClawError::Agent(format!("Cannot read template: {e}")))?;
+        let table: toml::Table = content.parse().map_err(|_| DuDuClawError::Agent("Invalid template configuration".into()))?;
+        duduclaw_gateway::product_policy::validate_table(duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?, &table)
+            .map_err(DuDuClawError::Agent)?;
         // Patch the copied template with wizard inputs
         patch_agent_toml(
             &agent_toml_path,

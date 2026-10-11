@@ -64,7 +64,7 @@ impl FeatureGate {
 /// resale rights — rather than anything the binary enforces.
 ///
 /// None of them has ever had a `check()` call site, yet they are shaped
-/// exactly like the three real capability gates, which invites a future
+/// exactly like the two real capability gates, which invites a future
 /// author to "gate" on one and ship a feature that silently does nothing.
 /// [`FeatureGate::check`] therefore refuses them outright; read them through
 /// [`FeatureGate::service_commitment`], which is display-only by name.
@@ -275,7 +275,6 @@ license_grace_period_days = 30
 
 [oem]
 self_host_only = true
-white_label = true
 redistribution = true
 license_phone_home_interval_days = 7
 license_grace_period_days = 60
@@ -307,14 +306,14 @@ license_grace_period_days = 60
         assert!(!g.service_commitment(LicenseTier::OpenSource, "dashboard_enterprise"));
     }
 
-    /// The three real capability gates keep working through `check()`, and
+    /// The two real capability gates keep working through `check()`, and
     /// `service_commitment()` refuses them (so the two readers can't be
     /// swapped by accident).
     #[test]
     fn capability_gates_stay_on_check_only() {
         let g = gate();
         assert!(g.check(LicenseTier::Studio, "premium_templates"));
-        assert!(g.check(LicenseTier::Oem, "white_label"));
+        assert!(!g.check(LicenseTier::Oem, "white_label"));
         assert!(!g.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(!g.service_commitment(LicenseTier::Studio, "premium_templates"));
         assert!(!g.service_commitment(LicenseTier::Oem, "white_label"));
@@ -428,8 +427,8 @@ license_grace_period_days = 60
         let g = gate();
         assert!(g.check(LicenseTier::Oem, "premium_templates"));
         assert!(g.check(LicenseTier::Oem, "industry_evolution_params"));
-        // OEM-specific capability gate.
-        assert!(g.check(LicenseTier::Oem, "white_label"));
+        // Removed white-label capability stays unavailable.
+        assert!(!g.check(LicenseTier::Oem, "white_label"));
         // Service commitments inherit through the same chain, read through
         // the display-only reader.
         assert!(g.service_commitment(LicenseTier::Oem, "dashboard_enterprise"));
@@ -570,7 +569,7 @@ license_grace_period_days = 60
         // Sanity checks
         assert!(!gate.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(gate.check(LicenseTier::Studio, "premium_templates"));
-        assert!(gate.check(LicenseTier::Oem, "white_label"));
+        assert!(!gate.check(LicenseTier::Oem, "white_label"));
         assert!(gate.service_commitment(LicenseTier::SelfHostPro, "dashboard_enterprise"));
 
         // Phone-home defaults

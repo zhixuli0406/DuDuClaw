@@ -39,6 +39,7 @@ pub mod platform;
 pub mod preset;
 pub mod protected_section;
 pub mod provider_env;
+pub mod product_profile;
 pub mod relay_protocol;
 pub mod runtime_catalog;
 pub mod sandbox_image;

@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import { api, type AgentInfo } from '@/lib/api';
@@ -128,6 +129,7 @@ export function AddChannelDialog({
   fixedType?: string;
   lockedAgent?: string;
 }) {
+  const policy = useProductPolicy();
   const intl = useIntl();
   // Parse fixedType: "discord:lab-bot" → platform="discord", agent="lab-bot"
   const parsedPlatform = fixedType?.split(':')[0];
@@ -167,6 +169,7 @@ export function AddChannelDialog({
   const [addError, setAddError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
+    if (!policy.allows('channels', channelType)) return;
     if (!token.trim()) return;
     setSubmitting(true);
     try {
@@ -345,7 +348,7 @@ export function AddChannelDialog({
                 <SelectValue>{typeLabel}</SelectValue>
               </SelectTrigger>
               <SelectContent>
-                {CHANNEL_TYPES.map((c) => (
+                {CHANNEL_TYPES.filter(c => policy.allows('channels', c.value)).map((c) => (
                   <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>
                 ))}
               </SelectContent>
@@ -482,7 +485,7 @@ export function AddChannelDialog({
           <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'channels.dialog.cancel' })}
           </Button>
-          <Button variant="brand" onClick={() => { setAddError(null); handleSubmit(); }} disabled={submitting || !token.trim()}>
+          <Button variant="brand" onClick={() => { setAddError(null); handleSubmit(); }} disabled={!policy.allows('channels', channelType) || submitting || !token.trim()}>
             {submitting ? intl.formatMessage({ id: 'channels.dialog.adding' }) : intl.formatMessage({ id: 'channels.dialog.add' })}
           </Button>
         </DialogFooter>

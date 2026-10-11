@@ -1,3 +1,4 @@
+import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -302,6 +303,8 @@ export function BillingPage() {
           <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'billing.subtitle' })}</p>
         </div>
       </div>
+
+      <DataExportButton dataset="usage" />
 
       {/* Spend-cap mechanisms overview — R-EDIT-SOURCE map, WP-D §2-4 */}
       <SpendCapsOverview />

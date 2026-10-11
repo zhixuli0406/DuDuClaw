@@ -394,6 +394,13 @@ pub fn self_config_marker_field(channel_type: &str) -> Option<&'static str> {
 /// This is the primary entry point for the orchestrator to obtain a sender
 /// without knowing the specific channel implementation.
 pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn ChannelSender> {
+    create_sender_for_home(&duduclaw_core::platform::duduclaw_home(), target, http)
+}
+
+pub fn create_sender_for_home(home_dir: &Path, target: &ChannelTarget, http: reqwest::Client) -> Box<dyn ChannelSender> {
+    if let Err(message) = crate::product_policy::require_channel(home_dir, &target.channel_type) {
+        return Box::new(PolicyBlockedSender { message });
+    }
     match target.channel_type.as_str() {
         "telegram" => Box::new(TelegramSender {
             bot_token: target.token.clone(),
@@ -424,6 +431,7 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
             http,
         }),
         "feishu" => Box::new(FeishuSender {
+            home_dir: home_dir.to_path_buf(),
             access_token: target.token.clone(),
             chat_id: target.chat_id.clone(),
             http,
@@ -454,11 +462,11 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
             target.extra_id.clone().unwrap_or_default(),
         ),
         "wecom" => Box::new(WeComSender {
-            home_dir: duduclaw_core::platform::duduclaw_home(),
+            home_dir: home_dir.to_path_buf(),
             touser: target.chat_id.clone(),
         }),
         "dingtalk" => Box::new(DingTalkSender {
-            home_dir: duduclaw_core::platform::duduclaw_home(),
+            home_dir: home_dir.to_path_buf(),
             conversation_id: target.chat_id.clone(),
             user_id: target.extra_id.clone().unwrap_or_default(),
         }),
@@ -696,7 +704,7 @@ pub(crate) async fn send_plain_text(
                 token: token.to_string(),
                 extra_id: None,
             };
-            create_sender(&target, http.clone())
+            create_sender_for_home(home_dir, &target, http.clone())
         }
     };
     match sender.send_text(text).await {
@@ -751,6 +759,7 @@ pub async fn resolve_channel_target(
     channel: &str,
     chat_id: &str,
 ) -> Result<ChannelTarget, String> {
+    crate::product_policy::require_channel(home_dir, channel)?;
     if channel == "webchat" {
         return Err(
             "webchat is not supported here — no persistent session to deliver into".to_string(),
@@ -1565,6 +1574,7 @@ impl ChannelSender for WhatsAppSender {
 
 /// Feishu channel sender — Open API `im/v1/messages`.
 pub struct FeishuSender {
+    pub(crate) home_dir: std::path::PathBuf,
     pub(crate) access_token: String,
     pub(crate) chat_id: String,
     pub(crate) http: reqwest::Client,
@@ -1573,6 +1583,7 @@ pub struct FeishuSender {
 #[async_trait]
 impl ChannelSender for FeishuSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+        crate::product_policy::require_channel(&self.home_dir, "feishu").map_err(ChannelSendError)?;
         let resp = self
             .http
             .post("https://open.feishu.cn/open-apis/im/v1/messages")
@@ -1592,6 +1603,7 @@ impl ChannelSender for FeishuSender {
     }
 
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        crate::product_policy::require_channel(&self.home_dir, "feishu").map_err(ChannelSendError)?;
         // Step 1: Upload image to Feishu
         let file_part = reqwest::multipart::Part::bytes(png_data.to_vec())
             .file_name("screenshot.png")
@@ -1647,6 +1659,7 @@ impl ChannelSender for FeishuSender {
         filename: &str,
         _mime: &str,
     ) -> Result<(), ChannelSendError> {
+        crate::product_policy::require_channel(&self.home_dir, "feishu").map_err(ChannelSendError)?;
         // Step 1: upload file (Feishu file_type — map the well-known ones, else
         // "stream" for a generic binary). Office docs use their native types.
         let file_type = match filename
@@ -2592,4 +2605,13 @@ mod tests {
         let sender = create_sender(&target, reqwest::Client::new());
         assert_eq!(sender.channel_type(), "null");
     }
+}
+
+struct PolicyBlockedSender { message: String }
+#[async_trait]
+impl ChannelSender for PolicyBlockedSender {
+    async fn send_text(&self, _: &str) -> Result<(), ChannelSendError> { Err(ChannelSendError(self.message.clone())) }
+    async fn send_photo(&self, _: &[u8], _: &str) -> Result<(), ChannelSendError> { Err(ChannelSendError(self.message.clone())) }
+    async fn request_confirmation(&self, _: &str, _: Option<&[u8]>, _: u64) -> Result<bool, ChannelSendError> { Err(ChannelSendError(self.message.clone())) }
+    fn channel_type(&self) -> &'static str { "policy_blocked" }
 }

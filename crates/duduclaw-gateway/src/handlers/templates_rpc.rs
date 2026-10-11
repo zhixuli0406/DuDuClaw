@@ -124,7 +124,9 @@ impl MethodHandler {
     ) -> Result<crate::premium_templates::AssembledRole, String> {
         use crate::premium_templates as pt;
         if role_id == pt::CEO_ROLE_ID {
-            return pt::assemble_ceo(premium_dir);
+            let assembled = pt::assemble_ceo(premium_dir)?;
+            self.validate_template_policy(&assembled)?;
+            return Ok(assembled);
         }
         let industry = match params.get("industry").and_then(|v| v.as_str()) {
             Some(i) if !i.is_empty() => i.to_string(),
@@ -134,7 +136,14 @@ impl MethodHandler {
                 .ok_or_else(|| "尚未選擇產業（請先備妥產業板模）".to_string())?,
         };
         let manifest = pt::load_team_manifest(premium_dir, &industry)?;
-        pt::assemble_role(premium_dir, &manifest, role_id)
+        let assembled = pt::assemble_role(premium_dir, &manifest, role_id)?;
+        self.validate_template_policy(&assembled)?;
+        Ok(assembled)
+    }
+
+    pub(crate) fn validate_template_policy(&self, assembled: &crate::premium_templates::AssembledRole) -> Result<(), String> {
+        let table: toml::Table = assembled.agent_toml.parse().map_err(|_| "Template configuration is invalid")?;
+        crate::product_policy::validate_table(crate::product_policy::load(&self.home_dir)?, &table)
     }
 
     /// `templates.role` — the editable file set for one role: SOUL.md prompt

@@ -213,6 +213,16 @@ pub(crate) fn commit_rendered_locked(
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
+        if matches!(path.file_name().and_then(|n| n.to_str()), Some("config.toml" | "agent.toml" | "inference.toml")) {
+            let home = if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
+                path.parent().and_then(Path::parent).and_then(Path::parent)
+            } else { path.parent() };
+            if let Some(home) = home {
+                if let Err(e) = crate::product_policy::validate_write(home, path, &current, &new_content) {
+                    return Ok(Err(e));
+                }
+            }
+        }
         replace_owner_only(path, &new_content)?;
         Ok(Ok(()))
     });

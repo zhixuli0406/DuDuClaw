@@ -1000,7 +1000,7 @@ async fn deliver_cron_result(
     // cron pipeline fires at most once per minute per task so we don't
     // need a shared pool.
     let http = reqwest::Client::new();
-    let sender = crate::channel_sender::create_sender(&target, http);
+    let sender = crate::channel_sender::create_sender_for_home(home_dir, &target, http);
     sender
         .send_text(&body)
         .await

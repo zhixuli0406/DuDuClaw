@@ -297,15 +297,15 @@ export function ChannelsPage() {
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={() => setShowLineQr(true)}>
+          <Button variant="outline" size="sm" aria-label={intl.formatMessage({ id: 'channels.lineQr.action' })} onClick={() => setShowLineQr(true)}>
             <QrCodeIcon />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'channels.lineQr.action' })}</span>
           </Button>
-          <Button variant="outline" size="sm" onClick={() => setShowBindDialog(true)}>
+          <Button variant="outline" size="sm" aria-label={intl.formatMessage({ id: 'channels.bind.action' })} onClick={() => setShowBindDialog(true)}>
             <Link2 />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'channels.bind.action' })}</span>
           </Button>
-          <Button variant="brand" size="sm" onClick={() => setShowAddDialog(true)}>
+          <Button variant="brand" size="sm" aria-label={intl.formatMessage({ id: 'channels.add' })} onClick={() => setShowAddDialog(true)}>
             <Plus />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'channels.add' })}</span>
           </Button>

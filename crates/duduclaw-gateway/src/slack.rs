@@ -1056,7 +1056,7 @@ async fn handle_slash_command_envelope(
         .await
     {
         let product =
-            crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+            "DuDuClaw".to_string();
         respond_via_response_url(
             http,
             response_url,

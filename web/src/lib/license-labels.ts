@@ -10,7 +10,7 @@ export const TIER_LABELS: Record<LicenseSnapshot['tier'], string> = {
   partner: 'Partner (NFR)',
   personal_pro_self_host: 'Personal Pro',
   self_host_pro: 'Self-Host Pro',
-  oem: 'OEM',
+  oem: 'Distributor License',
 };
 
 /** Label for a tier string coming from a loosely-typed RPC (e.g. `about.get`). */

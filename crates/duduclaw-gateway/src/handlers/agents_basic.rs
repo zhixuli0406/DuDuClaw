@@ -114,8 +114,8 @@ impl MethodHandler {
             if crate::license_runtime::cap_exceeded(cap, current) {
                 return Some(format!(
                     "個人版最多可建立 {cap} 個 AI 員工。\
-                     升級企業版以建立更多，並解鎖部門、多帳號等管理功能：\
-                     https://duduclaw.dudustudio.monster#pricing"
+                     如需調整授權範圍，請聯絡總經銷：\
+                     https://futurecorp.tw"
                 ));
             }
             // Under the personal cap → allow, without consulting license tiers.
@@ -158,7 +158,7 @@ impl MethodHandler {
         let noun = if kind == "agent" { "Agent" } else { "通道" };
         Some(format!(
             "您的方案（{tier}）最多可建立 {max} 個{noun}。\
-             請升級方案以新增更多：https://duduclaw.dudustudio.monster#pricing"
+             如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw"
         ))
     }
 

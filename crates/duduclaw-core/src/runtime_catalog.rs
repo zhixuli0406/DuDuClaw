@@ -1628,3 +1628,8 @@ mod tests {
         assert!(!crate::types::RuntimeType::Claude.is_deprecated());
     }
 }
+
+/// The installation-aware view of the same immutable CLI catalog.
+pub fn cli_specs_for_profile(profile: crate::product_profile::ProductProfile) -> impl Iterator<Item = &'static RuntimeSpec> {
+    cli_specs().filter(move |spec| profile.require_runtime(spec.id).is_ok())
+}

@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
 import { useIntl } from 'react-intl';
@@ -159,6 +160,7 @@ function CredentialStateBadge({
  * of per-account cards; add / edit / one-click-login all go through MDS dialogs.
  */
 export function AccountsPage() {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [loading, setLoading] = useState(false);
@@ -412,7 +414,7 @@ export function AccountsPage() {
             </p>
           </div>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {cliCreds.map((c) => (
+            {cliCreds.filter(c => policy.allows('runtimes', c.runtime)).map((c) => (
               <Card key={c.runtime}>
                 <CardContent className="pt-5">
                   <div className="flex items-start justify-between gap-2">
@@ -477,6 +479,7 @@ function AddAccountDialog({
   onClose: () => void;
   onCreated: () => void;
 }) {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const [name, setName] = useState('');
   const [accountType, setAccountType] = useState('api_key');
@@ -560,7 +563,7 @@ function AddAccountDialog({
                 <SelectValue>{providerEntry?.label ?? provider}</SelectValue>
               </SelectTrigger>
               <SelectContent>
-                {PROVIDER_CATALOG.map((p) => (
+                {PROVIDER_CATALOG.filter(p => policy.allows('providers', p.id)).map((p) => (
                   <SelectItem key={p.id} value={p.id}>
                     {p.label}
                   </SelectItem>

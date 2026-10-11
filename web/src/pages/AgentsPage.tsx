@@ -5,7 +5,6 @@ import { cn } from '@/lib/utils';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAssignStore } from '@/stores/assign-store';
 import { useTasksStore } from '@/stores/tasks-store';
-import { useSystemStore } from '@/stores/system-store';
 import { type AgentDetail } from '@/lib/api';
 import {
   CollectionPageHeader,
@@ -33,7 +32,6 @@ import { toast } from '@/lib/toast';
 import { agentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { timeAgo } from '@/lib/format';
-import { useCommercialContact } from '@/lib/commercial-contact';
 import {
   Bot,
   Plus,
@@ -44,8 +42,6 @@ import {
   Archive,
   RotateCcw,
   LogOut,
-  Sparkles,
-  X,
 } from 'lucide-react';
 
 /**
@@ -63,11 +59,6 @@ type Scope = 'active' | 'archived';
  *  so their tracks collapse to zero once `hideBelow` sets the cells to
  *  `display:none` on narrow containers, leaving only name + status. */
 const GRID_COLUMNS = 'minmax(0,1fr) auto auto auto auto 2.5rem';
-
-/** B+C decision (2026-07-16): the Personal edition has NO hard agent cap;
- *  above this recommended size we show a gentle, dismiss-forever upgrade hint. */
-const PERSONAL_RECOMMENDED_AGENTS = 3;
-const GROWTH_HINT_KEY = 'duduclaw:agents:growth-hint-dismissed';
 
 /** Lifecycle → semantic dot colour + ActorAvatar availability status. */
 function statusDotClass(status: string, archived: boolean): string {
@@ -93,7 +84,6 @@ function actorStatus(status: string, archived: boolean): ActorStatus {
 
 export function AgentsPage() {
   const intl = useIntl();
-  const commercialContact = useCommercialContact();
   const navigate = useNavigate();
   const errorText = useErrorMessage();
   const {
@@ -119,25 +109,6 @@ export function AgentsPage() {
   // acceptance judge.
   const openAssign = useAssignStore((s) => s.openAssign);
   const [offboardTarget, setOffboardTarget] = useState<AgentDetail | null>(null);
-
-  // Soft growth hint (B+C): Personal edition, above the recommended size,
-  // dismiss-forever. Never blocks anything.
-  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
-  const [growthHintDismissed, setGrowthHintDismissed] = useState(() => {
-    try {
-      return localStorage.getItem(GROWTH_HINT_KEY) === '1';
-    } catch {
-      return true; // private mode — just never show it
-    }
-  });
-  const dismissGrowthHint = useCallback(() => {
-    setGrowthHintDismissed(true);
-    try {
-      localStorage.setItem(GROWTH_HINT_KEY, '1');
-    } catch {
-      /* private mode — dismiss lasts for this session only */
-    }
-  }, []);
 
   useEffect(() => {
     fetchAgents();
@@ -184,13 +155,6 @@ export function AgentsPage() {
     [agents, scope],
   );
 
-  const activeAgentCount = useMemo(() => agents.filter((a) => !a.archived).length, [agents]);
-  const showGrowthHint =
-    isPersonal &&
-    !growthHintDismissed &&
-    scope === 'active' &&
-    activeAgentCount > PERSONAL_RECOMMENDED_AGENTS;
-
   const scopeOptions: SegmentedOption<Scope>[] = [
     { value: 'active', label: intl.formatMessage({ id: 'agents.scope.active' }) },
     { value: 'archived', label: intl.formatMessage({ id: 'agents.scope.archived' }) },
@@ -223,39 +187,6 @@ export function AgentsPage() {
           aria-label={intl.formatMessage({ id: 'agents.scope.active' })}
         />
       </div>
-
-      {showGrowthHint && (
-        <div className="mx-4 mt-3 flex items-start gap-3 rounded-xl bg-brand/8 p-4 ring-1 ring-inset ring-brand/20">
-          <span className="mt-0.5 grid size-8 shrink-0 place-items-center rounded-lg bg-brand/12 text-brand">
-            <Sparkles className="size-4" />
-          </span>
-          <div className="min-w-0 flex-1 text-sm">
-            <p className="font-medium text-foreground">
-              {intl.formatMessage({ id: 'agents.growthHint.title' })}
-            </p>
-            <p className="mt-0.5 text-muted-foreground">
-              {intl.formatMessage({ id: 'agents.growthHint.body' }, { count: activeAgentCount, distributor: commercialContact.name })}
-            </p>
-            <a
-              href={commercialContact.url}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-1.5 inline-block font-medium text-brand hover:underline"
-            >
-              {intl.formatMessage({ id: 'agents.growthHint.cta' })}
-            </a>
-          </div>
-          <button
-            type="button"
-            onClick={dismissGrowthHint}
-            aria-label={intl.formatMessage({ id: 'agents.growthHint.dismiss' })}
-            title={intl.formatMessage({ id: 'agents.growthHint.dismiss' })}
-            className="shrink-0 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground"
-          >
-            <X className="size-4" />
-          </button>
-        </div>
-      )}
 
       {/* Body */}
       {!loaded && loading ? (

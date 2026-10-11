@@ -150,6 +150,13 @@ fn now_rfc3339() -> String {
 /// provider that can't be probed live falls back to a marked static list.
 pub async fn discover_all(home_dir: &Path) -> RuntimeModelsCache {
     let mut providers = BTreeMap::new();
+    let policy = match crate::product_policy::load(home_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "Product policy refused model discovery");
+            return RuntimeModelsCache { providers, fetched_at: now_rfc3339() };
+        }
+    };
 
     // Claude keeps its own path: it is the only provider with a live models
     // API (`api.anthropic.com/v1/models`), so discovery is API-first with a
@@ -165,8 +172,8 @@ pub async fn discover_all(home_dir: &Path) -> RuntimeModelsCache {
     // home — a HOME-rooted probe against it alone would look in
     // `~/.duduclaw/.local/bin/<cli>` and never find anything.
     // `detect_runtime` does PATH/real-HOME first, then this dir.
-    for spec in duduclaw_core::runtime_catalog::cli_specs() {
-        if spec.id == "claude" {
+    for spec in duduclaw_core::runtime_catalog::cli_specs_for_profile(policy) {
+        if spec.id == "claude" || policy.require_runtime(spec.id).is_err() {
             continue;
         }
         let Some(bin) = duduclaw_core::detect_runtime(spec.id, home_dir) else {

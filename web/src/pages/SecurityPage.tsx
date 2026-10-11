@@ -9,7 +9,6 @@ import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { toast, formatError } from '@/lib/toast';
-import { useEffectiveSubtitle } from '@/lib/branding';
 import {
   TRIGGER_KEYS,
   enforcedFrom,
@@ -83,8 +82,6 @@ export function SecurityPage() {
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
   const [status, setStatus] = useState<SecurityStatus | null>(null);
-  // v1.68: a distributor subtitle replaces the default tagline.
-  const brandSubtitle = useEffectiveSubtitle();
   const connectionState = useConnectionStore((s) => s.state);
 
   useEffect(() => {
@@ -110,7 +107,7 @@ export function SecurityPage() {
           <Shield className="size-5 text-muted-foreground" />
           <div>
             <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.security' })}</h1>
-            <p className="text-sm text-muted-foreground">{brandSubtitle ?? intl.formatMessage({ id: 'app.subtitle' })}</p>
+            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'app.subtitle' })}</p>
           </div>
         </div>
       </div>

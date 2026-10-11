@@ -1,3 +1,7 @@
+mod data_exports_http;
+#[cfg(test)]
+mod data_exports_http_tests;
+
 use axum::body::Bytes;
 use axum::{
     Json, Router,
@@ -246,6 +250,27 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let home_dir = home_dir.clone();
         tokio::spawn(async move {
             crate::migration_alert::check_and_notify(&home_dir).await;
+        });
+    }
+
+    // Validate the installation policy after a possible restore and before runtime startup.
+    crate::product_policy::load(&home_dir)
+        .map_err(duduclaw_core::error::DuDuClawError::Config)?;
+    crate::data_exports::initialize(&home_dir)
+        .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
+    {
+        let export_home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                let home = export_home.clone();
+                match tokio::task::spawn_blocking(move || crate::data_exports::sweep(&home)).await {
+                    Ok(Ok(())) => {}
+                    _ => warn!("customer data export cleanup failed"),
+                }
+            }
         });
     }
 
@@ -561,7 +586,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // ── First-run license seeding (E2, enterprise Docker distribution) ──
     //
-    // Symmetric to the branding-bundle seeding above: when this binary ships
+    // When this binary ships
     // co-located with a signed OEM `license.json` (its path in the
     // `DUDUCLAW_LICENSE_FILE` env var — the compose pack mounts it read-only at
     // `/opt/license.json`), verify it against the baked issuer registry and copy
@@ -605,19 +630,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let _tasks = runtime.spawn_background_tasks();
         runtime
     };
-
-    // ── First-run branding bundle seeding (§11.2) ───────────────
-    //
-    // When this binary ships co-located with a signed branding.bundle.json
-    // (DUDUCLAW_BRANDING_BUNDLE env / executable sibling / macOS .app
-    // Resources), verify it against the baked issuer registry and copy it into
-    // ~/.duduclaw/ *before* any branding::load reads it. Idempotent (never
-    // overwrites an existing bundle) and fail-closed (an unverifiable candidate
-    // is warned once and skipped). Runs after the license runtime so the same
-    // production registry the branding verifier uses is warm; the desktop
-    // sidecar path (`duduclaw run --yes` → start_gateway) is covered here too.
-    // The call logs its own outcome; the return value is only for tests.
-    let _ = crate::branding::seed_bundle_if_absent(&home_dir);
 
     // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
     // Best-effort: if open fails, the rest of the system still works — RAG
@@ -2173,8 +2185,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Edition live-watch: license transitions that do NOT flow through an RPC
     // (phone-home downgrade, CRL revocation, grace-period expiry) must still
-    // reach open dashboards. The RPC paths (`license.activate` /
-    // `license.redeem`) broadcast inline; this 60s poll is the safety net for
+    // reach open dashboards. `license.activate` broadcasts inline; this 60s
+    // poll is the safety net for
     // background transitions, broadcasting only on an actual change.
     {
         let bg_state = state.clone();
@@ -2256,6 +2268,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // a `token` query param so browser preview/download links work.
         .route("/api/files", get(handle_files_list))
         .route("/api/files/download", get(handle_files_download))
+        .route("/api/data-exports/{id}/download", get(data_exports_http::download))
         .route("/api/files/preview", get(handle_files_preview))
         .route("/api/ccr/dashboard", get(handle_ccr_dashboard))
         .route(
@@ -2648,7 +2661,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         );
     }
 
-    // ── License control-plane (P2, white-label owner) ─────────────
+    // ── License control-plane (P2, distributor issuer) ─────────────
     // Always mounted; each handler self-gates on `[distributor] issuer_key_path`
     // (absent ⇒ 404) so a plain gateway exposes no behaviour. Public (no bearer)
     // — trust is proven by subscription_id + machine_fingerprint. Own state
@@ -14800,7 +14813,7 @@ async fn handle_tts(
     };
 
     let models_dir = state.home_dir.join("models");
-    let router = TtsRouter::auto_detect(&models_dir, strategy);
+    let router = TtsRouter::auto_detect_for_home(&state.home_dir, &models_dir, strategy);
 
     let voice = if req.voice.trim().is_empty() {
         cfg_voice

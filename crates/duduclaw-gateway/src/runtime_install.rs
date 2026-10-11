@@ -309,6 +309,9 @@ pub async fn start_install(
     event_tx: Option<tokio::sync::broadcast::Sender<String>>,
 ) -> StartOutcome {
     let command = command_display(spec);
+    if crate::product_policy::require_runtime(&home_dir, spec.id).is_err() {
+        return StartOutcome::Declined { reason: "product_policy_blocked", command, prerequisite: None };
+    }
 
     // Already there → don't reinstall; the caller just needs to re-detect.
     if detect_binary(spec) {

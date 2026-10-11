@@ -72,13 +72,16 @@ scraper = "0.22"
 rusqlite = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
+csv = "1.3"
+# Native XLSX output (MIT OR Apache-2.0), pinned to the reviewed writer API.
+rust_xlsxwriter = "=0.99.1"
 # WeCom (企業微信) callback crypto — SHA1 msg_signature + AES-256-CBC message
 # envelope (wecom.rs). Both crates are already in Cargo.lock as transitive
 # deps (sha1 via ring-adjacent stacks, aes via aes-gcm), so no new units.
 sha1 = "0.10"
 aes = "0.8"
 base64 = { workspace = true }
-# White-label About-block HTML sanitization (branding.rs §10.2).
+# HTML sanitization for interactive canvas content.
 ammonia = { workspace = true }
 jsonwebtoken = "9"
 ring = { workspace = true }
@@ -203,6 +206,7 @@ otel = [
 ]
 
 [dev-dependencies]
+calamine = "0.36.1"
 # P2-B: `Provenance::test_only` exists only with this feature (never in a
 # production build).
 duduclaw-memory = { workspace = true, features = ["test-hooks"] }

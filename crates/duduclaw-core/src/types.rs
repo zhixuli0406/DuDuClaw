@@ -1386,7 +1386,7 @@ impl EditionProfile {
     /// Decision 2026-07-16 (B+C): the self-host / open-core promise ("never
     /// limit self-host") wins — the Personal edition ships UNCAPPED by
     /// default. Upgrade desire is driven by the enterprise capability gates
-    /// (departments, approvals, multi-account, white-label) plus a soft
+    /// (departments, approvals, multi-account) plus a soft
     /// dashboard hint above [`PERSONAL_RECOMMENDED_AGENTS`] — not by a hard
     /// block. Managed/hosted deployments that DO want a hard cap set
     /// `DUDUCLAW_PERSONAL_MAX_AGENTS`. The Enterprise edition is never

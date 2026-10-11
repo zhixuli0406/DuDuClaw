@@ -117,6 +117,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
         // Look up provider config from config.toml accounts, honouring agent's preferred_provider
+        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
         let (api_key, base_url, provider_name) = resolve_provider_config(
             &context.home_dir,
             &context.agent_id,
@@ -659,6 +660,8 @@ async fn resolve_provider_config(
     _agent_id: &str,
     preferred_provider: Option<&str>,
 ) -> Result<(String, String, String), String> {
+    let policy = crate::product_policy::load(home_dir)?;
+    if let Some(id) = preferred_provider { policy.require_provider(id)?; }
     // 1. If agent specifies a provider, try that first
     if let Some(provider_name) = preferred_provider {
         if let Some(provider) = PROVIDERS.iter().find(|p| p.name == provider_name) {
@@ -678,6 +681,7 @@ async fn resolve_provider_config(
     // preset list today, but now shared with the rest of the workspace
     // instead of independently derived here).
     for provider in PROVIDERS {
+        if policy.require_provider(provider.name).is_err() { continue; }
         if let Some(key) = duduclaw_core::provider_env::resolve_env_key(provider.name) {
             return Ok((
                 key,
@@ -723,7 +727,7 @@ async fn resolve_provider_config(
                     let provider = acc.get("provider").and_then(|p| p.as_str()).unwrap_or("");
                     let base_url = acc.get("base_url").and_then(|u| u.as_str());
 
-                    if !provider.is_empty() {
+                    if !provider.is_empty() && policy.require_provider(provider).is_ok() {
                         let secret_ref = duduclaw_security::secret_ref::SecretRef::from_typed(
                             acc.get("api_key_enc").and_then(|v| v.as_str()),
                             acc.get("api_key").and_then(|v| v.as_str()).unwrap_or(""),
@@ -781,6 +785,7 @@ impl OpenAiCompatRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<super::RuntimeResponse, String> {
+        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
         let (api_key, base_url, _provider_name) = resolve_provider_config(
             &context.home_dir,
             &context.agent_id,
@@ -1451,5 +1456,18 @@ mod tests {
         let total = provider.total();
         assert_eq!(total.input_tokens, 230);
         assert_eq!(total.output_tokens, 28);
+    }
+}
+
+#[cfg(test)]
+mod product_policy_tests {
+    #[tokio::test]
+    async fn explicit_disallowed_provider_refuses_before_credentials_are_resolved() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[product]\nprofile='futureoffice'").unwrap();
+        for id in ["minimax", "deepseek"] {
+            let error = super::resolve_provider_config(home.path(), "test", Some(id)).await.unwrap_err();
+            assert!(error.contains("Product profile"), "{error}");
+        }
     }
 }

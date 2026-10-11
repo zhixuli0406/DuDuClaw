@@ -52,6 +52,9 @@ impl MethodHandler {
             .get("provider")
             .and_then(|v| v.as_str())
             .unwrap_or("anthropic");
+        if let Err(e) = crate::product_policy::require_provider(&self.home_dir, provider) {
+            return WsFrame::error_response("", &e);
+        }
         if !duduclaw_core::provider_env::KNOWN_PROVIDER_IDS.contains(&provider) {
             return WsFrame::error_response(
                 "",

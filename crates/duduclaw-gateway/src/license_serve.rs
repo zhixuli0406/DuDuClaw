@@ -1,7 +1,7 @@
 //! Owner-gateway control-plane endpoints (P2): `POST /v1/license/refresh` and
 //! `GET /v1/license/crl`.
 //!
-//! When an owner instance is configured as a white-label issuer (`config.toml`
+//! When an owner instance is configured as a distributor issuer (`config.toml`
 //! `[distributor] issuer_key_path`), it can also act as the *control-plane* for
 //! the OEM licenses it signs — re-signing them on phone-home so they never trip
 //! the 60-day offline downgrade, and publishing a signed CRL so revocations
@@ -44,7 +44,7 @@ use tracing::warn;
 use crate::distributor_store::{DistributorStore, IssuedLicense};
 
 /// CRL TTL: 7 days, matching the cloud control-plane (`crl.rs`) and the
-/// distributor-client polling cadence documented in the white-label guide.
+/// distributor-client polling cadence documented in the distributor licensing guide.
 const CRL_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// The issuer key id this owner instance signs under (pinned to the baked v2
@@ -57,11 +57,6 @@ static REFRESH_RATE_LIMITER: LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static CRL_RATE_LIMITER: LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// §10.3 branding-sign limiter: 10 req/min/IP (self-service bundle signing is
-/// far rarer than phone-home).
-static BRANDING_SIGN_RATE_LIMITER: LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Returns `true` if the request from `ip` is within `max` per 60s.
@@ -98,10 +93,7 @@ pub fn router(home_dir: PathBuf) -> Router {
     Router::new()
         .route("/v1/license/refresh", post(refresh_handler))
         .route("/v1/license/crl", get(crl_handler))
-        .route("/v1/branding/sign", post(branding_sign_handler))
-        // Bundles carry an inline logo (≤512 KB) + 64 KB about_html → allow a
-        // larger body here than the tiny refresh JSON.
-        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(LicenseServeState { home_dir })
 }
 
@@ -370,140 +362,6 @@ async fn crl_handler(
         })),
     )
         .into_response()
-}
-
-// ── POST /v1/branding/sign (§10.3) ───────────────────────────────────────────
-
-/// Sign a distributor's branding into a portable, self-applying bundle.
-///
-/// Trust model mirrors `refresh`: the caller proves entitlement with
-/// `subscription_id` + `machine_fingerprint` (reusing [`refresh_decision`] as
-/// the gate), so a revoked / expired / fingerprint-mismatched key cannot obtain
-/// a fresh bundle. The owner is the authoritative sanitizer — the submitted
-/// branding is run through `validate_input` (ammonia + all field checks) before
-/// signing, so a distributor cannot smuggle unsafe HTML into the signed body.
-async fn branding_sign_handler(
-    State(state): State<LicenseServeState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    if !within_rate_limit(&BRANDING_SIGN_RATE_LIMITER, addr.ip(), 10) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "error": "rate_limited" })),
-        )
-            .into_response();
-    }
-
-    // Not an issuer ⇒ 404 (do not reveal the endpoint exists).
-    let key_path = match issuer_key_path(&state.home_dir).await {
-        Some(p) => p,
-        None => return not_found(),
-    };
-
-    let subscription_id = body
-        .get("subscription_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let machine_fingerprint = body
-        .get("machine_fingerprint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if subscription_id.is_empty() || machine_fingerprint.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "subscription_id and machine_fingerprint are required" })),
-        )
-            .into_response();
-    }
-
-    // Parse the submitted branding (may include server-stamped fields — they are
-    // dropped by the `BrandingConfig → BrandingInput` projection).
-    let submitted: crate::branding::BrandingConfig = match body.get("branding") {
-        Some(v) => match serde_json::from_value(v.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": format!("invalid branding: {e}") })),
-                )
-                    .into_response();
-            }
-        },
-        None => crate::branding::BrandingConfig::default(),
-    };
-
-    let store = store_for(&state.home_dir);
-    let rec = match store.get_license_by_subscription_id(&subscription_id) {
-        Some(r) => r,
-        None => return not_found(),
-    };
-
-    // Same three gates as refresh — revoked / fingerprint / expired.
-    match refresh_decision(&rec, &machine_fingerprint, Utc::now()) {
-        RefreshDecision::Revoked { .. } => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "license_revoked" })),
-            )
-                .into_response();
-        }
-        RefreshDecision::Forbidden => {
-            return (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response();
-        }
-        RefreshDecision::Proceed => {}
-    }
-
-    // Owner-authoritative sanitize + validation (fail-closed on any bad field).
-    let sanitized = match crate::branding::validate_input(submitted.into()) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("branding rejected: {e}") })),
-            )
-                .into_response();
-        }
-    };
-
-    let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
-        Ok(s) => s,
-        Err(_) => return internal_error(),
-    };
-
-    let issued_at = Utc::now().to_rfc3339();
-    let bundle = match crate::branding::sign_bundle(
-        &seed,
-        &rec.distributor_id,
-        &subscription_id,
-        &sanitized,
-        &issued_at,
-        crate::branding::BUNDLE_KEY_ID,
-    ) {
-        Ok(b) => b,
-        Err(_) => return internal_error(),
-    };
-
-    crate::security_autopilot::audit_and_emit(
-        &state.home_dir,
-        &duduclaw_security::audit::AuditEvent::new(
-            "branding_bundle_signed",
-            "control-plane",
-            duduclaw_security::audit::Severity::Info,
-            json!({
-                "distributor_id": rec.distributor_id,
-                "subscription_id": rec.subscription_id,
-            }),
-        ),
-    );
-
-    let bundle_v = match serde_json::to_value(&bundle) {
-        Ok(v) => v,
-        Err(_) => return internal_error(),
-    };
-    (StatusCode::OK, Json(bundle_v)).into_response()
 }
 
 // ── Error responses (no internal detail leaks) ───────────────────────────────

@@ -4,7 +4,7 @@
  * SOURCE OF TRUTH is `crates/duduclaw-license/features.toml` (`max_agents` /
  * `max_channels` per tier), enforced server-side. This table MIRRORS the
  * personal cloud tiers purely to render a **non-blocking** "you're near your
- * plan limit" hint + upgrade CTA. It never blocks any action. Keep in sync
+ * plan limit" hint. It never blocks any action. Keep in sync
  * with features.toml; `soft-limits.test.ts` pins the expected values.
  *
  * `0` / absent = unlimited (no hint). Tier keys match the `edition` string

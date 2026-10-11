@@ -1,3 +1,4 @@
+import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -1107,6 +1108,7 @@ export function TaskBoardPage() {
         <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'nav.tasks' })}</h1>
         <span className="font-mono text-xs tabular-nums text-muted-foreground">{filteredTasks.length}</span>
         <div className="ml-auto flex items-center gap-2">
+          <DataExportButton dataset="tasks" />
           {/* Two distinct actions, deliberately not the same weight (UX plan
               I-1a). 新增任務 files a passive card for the human's own tracking
               and never dispatches; 交辦任務 hands the work to an AI employee

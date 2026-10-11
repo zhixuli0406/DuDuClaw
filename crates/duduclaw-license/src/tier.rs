@@ -30,34 +30,33 @@ pub enum LicenseTier {
     /// Cloud trial tier (14 days).
     Hobby,
 
-    /// Cloud paid tier — NT$990/mo.
+    /// Cloud licensed tier.
     Solo,
 
-    /// Cloud paid tier — NT$2,990/mo (premium templates included).
+    /// Cloud licensed tier (premium templates included).
     Studio,
 
-    /// Cloud paid tier — NT$8,900/mo (Odoo + private support).
+    /// Cloud licensed tier (Odoo + private support).
     Business,
 
     /// **Partner (NFR — Not For Resale)** — a *free* self-host license granted
     /// to integration / channel partners for their own use, demos, and
     /// evaluation. Unlocks the same commercial value-add modules as
-    /// [`SelfHostPro`](Self::SelfHostPro) **except** white-label /
-    /// redistribution (a partner may use, not resell, the product). Price is
-    /// always 0; it is issued via partner-code redemption or admin issuance,
-    /// never through the paid checkout flow, and is independently revocable.
+    /// [`SelfHostPro`](Self::SelfHostPro) except distribution rights. This
+    /// independently revocable license is issued for authorized use and demos,
+    /// through distributor administration.
     Partner,
 
-    /// Self-host **Personal** subscription — NT$490/mo or NT$4,900/yr.
+    /// Self-host **Personal** subscription.
     /// The personal-form-factor self-host tier: unlocks premium templates +
     /// priority patches for individual developers who self-host. Sits below
     /// [`SelfHostPro`](Self::SelfHostPro) (the enterprise self-host tier).
     PersonalProSelfHost,
 
-    /// Self-host subscription tier — NT$1,490/mo or NT$14,900/yr.
+    /// Self-host subscription tier.
     SelfHostPro,
 
-    /// OEM white-label / redistribution license (custom pricing, Year 2+).
+    /// Distributor-issued license with per-customer authorization limits.
     Oem,
 }
 

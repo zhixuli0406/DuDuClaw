@@ -575,12 +575,14 @@ pub enum TtsStrategy {
 
 /// TTS Router — dispatches to the best available provider.
 pub struct TtsRouter {
+    home_dir: Option<std::path::PathBuf>,
     providers: Vec<Box<dyn TtsProvider>>,
 }
 
 impl TtsRouter {
     pub fn new() -> Self {
         Self {
+            home_dir: None,
             providers: Vec::new(),
         }
     }
@@ -601,7 +603,13 @@ impl TtsRouter {
     /// - EdgeOnly: edge-tts only
     /// - CloudBest: MiniMax → OpenAI → edge-tts (paid first for quality)
     pub fn auto_detect(models_dir: &std::path::Path, strategy: TtsStrategy) -> Self {
+        Self::auto_detect_for_home(&duduclaw_core::platform::duduclaw_home(), models_dir, strategy)
+    }
+
+    pub fn auto_detect_for_home(home_dir: &std::path::Path, models_dir: &std::path::Path, strategy: TtsStrategy) -> Self {
         let mut router = Self::new();
+        router.home_dir = Some(home_dir.to_path_buf());
+        let Ok(policy) = crate::product_policy::load(home_dir) else { return router; };
 
         if matches!(strategy, TtsStrategy::LocalFirst) {
             // Piper local (highest priority)
@@ -632,6 +640,7 @@ impl TtsRouter {
             router.providers.push(Box::new(EdgeTtsProvider::new()));
         }
 
+        router.providers.retain(|provider| policy.require_provider(provider.name()).is_ok());
         if router.providers.is_empty() {
             tracing::warn!("TTS Router: no providers available");
         }
@@ -648,6 +657,10 @@ impl TtsProvider for TtsRouter {
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
         let mut last_err = None;
         for provider in &self.providers {
+            if let Some(home) = self.home_dir.as_deref() {
+                let policy = crate::product_policy::load(home)?;
+                if policy.require_provider(provider.name()).is_err() { continue; }
+            }
             match provider.synthesize(text, voice).await {
                 Ok(audio) if !audio.is_empty() => {
                     info!(

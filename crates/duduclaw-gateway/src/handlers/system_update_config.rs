@@ -11,6 +11,9 @@ impl MethodHandler {
     /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
     /// Uses atomic write (temp + rename) and never touches token/key fields.
     pub(crate) async fn handle_system_update_config(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if params.get("product").is_some() || params.get("product.profile").is_some() || params.get("product_profile").is_some() {
+            return WsFrame::error_response("", "product.profile is installation-owned and read-only");
+        }
         // v1.68: the contract names parameters after their TOML path and may
         // send them nested; map those onto the flat names this handler reads.
         let params = super::system_update_config_v168::normalize_legacy_aliases(&params);

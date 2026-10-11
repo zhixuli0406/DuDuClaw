@@ -1859,9 +1859,11 @@ dependencies = [
  "atspi",
  "axum",
  "base64 0.22.1",
+ "calamine",
  "chrono",
  "chrono-tz",
  "cron",
+ "csv",
  "dirs 5.0.1",
  "duduclaw-agent",
  "duduclaw-auth",
@@ -1907,6 +1909,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rusqlite",
+ "rust_xlsxwriter",
  "scraper",
  "serde",
  "serde_json",
@@ -2032,6 +2035,7 @@ dependencies = [
  "duduclaw-memory",
  "fs2",
  "ignore",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5682,6 +5686,15 @@ checksum = "5bcdef0be6fe7f6fa333b1073c949729274b05f123a0ad7efcb8efd878e5c3b1"
 dependencies = [
  "sha2",
  "walkdir",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34f2d2cda7223168a14fb86bc7411dbc3379bd7d49749ecc53b91ed98585b6b0"
+dependencies = [
+ "zip 8.6.0",
 ]
 
 [[package]]

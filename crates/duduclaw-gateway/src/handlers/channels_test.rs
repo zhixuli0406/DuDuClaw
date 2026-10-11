@@ -32,6 +32,9 @@ impl MethodHandler {
             None => (channel_type, None),
         };
 
+        if let Err(e) = crate::product_policy::require_channel(&self.home_dir, platform) {
+            return WsFrame::error_response("", &e);
+        }
         match agent_hint {
             Some(agent_name) => self.test_per_agent_channel(platform, agent_name).await,
             None => self.test_global_channel(platform).await,
@@ -239,7 +242,7 @@ impl MethodHandler {
                     token: token.to_string(),
                     extra_id,
                 };
-                crate::channel_sender::create_sender(&target, reqwest::Client::new())
+                crate::channel_sender::create_sender_for_home(&self.home_dir, &target, reqwest::Client::new())
             }
         };
 

@@ -236,6 +236,11 @@ pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_
         strategy = "balanced"
         max_silence_hours = 12.0
     };
+    if let Err(error) = duduclaw_core::product_profile::load(home_dir)
+        .and_then(|policy| duduclaw_gateway::product_policy::validate_table(policy, &agent_config)) {
+        let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+        return tool_error(&error);
+    }
     let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
     if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {

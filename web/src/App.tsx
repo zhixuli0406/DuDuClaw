@@ -59,9 +59,6 @@ const KnowledgeHubPage = lazyPage(() => import('./pages/KnowledgeHubPage'), 'Kno
 const SharedWikiPage = lazyPage(() => import('./pages/SharedWikiPage'), 'SharedWikiPage');
 const OrgChartPage = lazyPage(() => import('./pages/OrgChartPage'), 'OrgChartPage');
 const WorldPage = lazyPage(() => import('./pages/WorldPage'), 'WorldPage');
-// PartnerPortalPage is mounted inside LicenseShell (`/manage/license`); the
-// bare-page import was only needed for the now-removed `/partner` legacy
-// route below, which redirects instead.
 const ReportPage = lazyPage(() => import('./pages/ReportPage'), 'ReportPage');
 const BillingPage = lazyPage(() => import('./pages/BillingPage'), 'BillingPage');
 const LogsPage = lazyPage(() => import('./pages/LogsPage'), 'LogsPage');
@@ -463,7 +460,7 @@ export function App() {
                 <Route path="billing" element={<BillingPage />} />
                 {/* 授權 relocated to `/app/system/license` (N-3) — this legacy
                     alias used to render the bare `LicensePage` (pre-dating the
-                    license+partner tab merge); it now lands on the same
+                    license management); it now lands on the same
                     canonical `LicenseShell` every other license route does. */}
                 <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
                 <Route path="logs" element={<LogsPage />} />

@@ -118,6 +118,9 @@ where
 
     let model_before = read_model_preferred(&table);
     mutate(&mut table)?;
+    if let Some(home) = home_dir.as_deref() {
+        crate::product_policy::validate_table(crate::product_policy::load(home)?, &table)?;
+    }
     let model_changed = read_model_preferred(&table)
         .is_some_and(|after| Some(after.as_str()) != model_before.as_deref());
 

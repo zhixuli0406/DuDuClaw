@@ -37,6 +37,13 @@ impl MethodHandler {
         }
 
         match method {
+            "data_exports.create" => self.handle_data_exports_create(params, ctx).await,
+            "data_exports.get" => self.handle_data_exports_get(params, ctx).await,
+            "data_exports.cancel" => self.handle_data_exports_cancel(params, ctx).await,
+            "system.product_profile" => match crate::product_policy::payload(&self.home_dir) {
+                Ok(payload) => WsFrame::ok_response("", payload),
+                Err(error) => WsFrame::error_response("", &error),
+            },
             "finetune.datasets.delete" => {
                 require_admin!();
                 let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");

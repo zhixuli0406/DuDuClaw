@@ -136,6 +136,7 @@ pub struct SandboxFailure {
 
 /// Reason codes of failures after the sandbox started working on a task.
 pub mod failure_code {
+    pub const PRODUCT_POLICY_REFUSED: &str = "product_policy_refused";
     pub const AGENT_NOT_FOUND: &str = "agent_not_found";
     pub const WORKSPACE_FAILED: &str = "workspace_failed";
     pub const AGENT_DIR_UNMOUNTABLE: &str = "agent_dir_unmountable";
@@ -411,6 +412,12 @@ pub async fn dispatch(
         runtime_settings.non_claude_provider().is_none(),
     );
     let spec = TaskSpec { runtime: runtime_settings.provider, model, ..spec };
+    if let Err(message) = crate::product_policy::load(home).and_then(|policy| {
+        policy.require_runtime(spec.runtime.as_str())?;
+        crate::product_policy::require_model(policy, &spec.model)
+    }) {
+        return SandboxDispatch::Completed(Err(SandboxFailure::failed(failure_code::PRODUCT_POLICY_REFUSED, message)));
+    }
     let (loaded, when_unavailable) = settings::load(home);
     let result = match loaded {
         Err(why) => Err(SandboxError::Unavailable(Unavailable::InvalidConfig(why))),
@@ -542,6 +549,10 @@ pub async fn run(
     spec: &TaskSpec,
     rotator: Result<&AccountRotator, String>,
 ) -> Result<String, SandboxError> {
+    crate::product_policy::load(home).and_then(|policy| {
+        policy.require_runtime(spec.runtime.as_str())?;
+        crate::product_policy::require_model(policy, &spec.model)
+    }).map_err(|message| SandboxError::Failed(SandboxFailure::failed(failure_code::PRODUCT_POLICY_REFUSED, message)))?;
     let unavailable = SandboxError::Unavailable;
     let family = preflight(settings, spec).map_err(unavailable)?;
     if !container::docker_reachable().await {

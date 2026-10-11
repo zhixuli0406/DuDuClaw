@@ -127,6 +127,10 @@ impl FeishuState {
 ///
 /// Returns `None` if Feishu is not configured.
 pub async fn start_feishu_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
+    if let Err(e) = crate::product_policy::require_channel(home_dir, "feishu") {
+        tracing::warn!(error = %e, "Product policy refused channel startup");
+        return None;
+    }
     let app_id = read_feishu_config(home_dir, "feishu_app_id").await?;
     let app_secret = read_feishu_config(home_dir, "feishu_app_secret").await?;
     let verification_token = read_feishu_config(home_dir, "feishu_verification_token")
@@ -298,6 +302,7 @@ fn strip_feishu_mentions(text: &str) -> String {
 }
 
 async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
+    if crate::product_policy::require_channel(&state.ctx.home_dir, "feishu").is_err() { return; }
     let message = match event.get("message") {
         Some(m) => m,
         None => return,
@@ -504,6 +509,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     let reply = match state.get_token().await {
         Ok(token) => {
             let doc_sender = crate::channel_sender::FeishuSender {
+                home_dir: state.ctx.home_dir.clone(),
                 access_token: token,
                 chat_id: chat_id.to_string(),
                 http: state.http.clone(),
@@ -620,6 +626,7 @@ async fn send_feishu_payload(
     msg_type: &str,
     content: &str,
 ) -> bool {
+    if crate::product_policy::require_channel(&state.ctx.home_dir, "feishu").is_err() { return false; }
     let token = match state.get_token().await {
         Ok(t) => t,
         Err(e) => {
@@ -761,6 +768,7 @@ async fn reply_message(state: &FeishuState, message_id: &str, text: &str) {
 }
 
 async fn read_feishu_config(home_dir: &Path, field: &str) -> Option<String> {
+    if crate::product_policy::require_channel(home_dir, "feishu").is_err() { return None; }
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field).await
 }
 
