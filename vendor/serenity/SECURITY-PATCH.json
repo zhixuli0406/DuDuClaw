@@ -1,0 +1,76 @@
+{
+  "base_version": "0.12.5",
+  "base_crate_sha256": "9bde37f42765dfdc34e2a039e0c84afbf79a3101c1941763b0beb816c2f17541",
+  "upstream_repository": "https://github.com/serenity-rs/serenity",
+  "security_dependency": "rustls-webpki >=0.103.13 via tokio-tungstenite 0.26",
+  "patched_files": [
+    "Cargo.toml",
+    "src/gateway/ws.rs",
+    "src/gateway/shard.rs",
+    "src/gateway/error.rs",
+    "src/gateway/bridge/shard_runner.rs",
+    "src/utils/token.rs"
+  ],
+  "scanner_note": "Serenity retains its true 0.12.5 version. The old TLS transport is removed from the resolved dependency graph; no feature is removed.",
+  "replacements": {
+    "Cargo.toml": [
+      [
+        "[dependencies.tokio-tungstenite]\nversion = \"0.21.0\"",
+        "[dependencies.tokio-tungstenite]\nversion = \"0.26\"\nfeatures = [\"url\"]"
+      ]
+    ],
+    "src/gateway/shard.rs": [
+      [
+        "CloseFrame<'static>",
+        "CloseFrame"
+      ]
+    ],
+    "src/gateway/error.rs": [
+      [
+        "CloseFrame<'static>",
+        "CloseFrame"
+      ]
+    ],
+    "src/gateway/ws.rs": [
+      [
+        "CloseFrame<'_>",
+        "CloseFrame"
+      ],
+      [
+        "to_string(value).map(Message::Text)?",
+        "to_string(value).map(|payload| Message::Text(payload.into()))?"
+      ],
+      [
+        "        let config = WebSocketConfig {\n            max_message_size: None,\n            max_frame_size: None,\n            ..Default::default()\n        };",
+        "        let config = WebSocketConfig::default().max_message_size(None).max_frame_size(None);"
+      ],
+      [
+        "Message::Text(payload) => from_str(&payload)",
+        "Message::Text(payload) => from_str(payload.as_str())"
+      ]
+    ],
+    "src/gateway/bridge/shard_runner.rs": [
+      [
+        "use std::borrow::Cow;\n",
+        ""
+      ],
+      [
+        "Cow::from(\"\")",
+        "\"\".into()"
+      ],
+      [
+        "Cow::from(reason)",
+        "reason.into()"
+      ]
+    ]
+  },
+  "line_redactions": {
+    "src/utils/token.rs": [
+      {
+        "line": 20,
+        "original_sha256": "96491a92c6643b7029af23f097e93fce9263bb9989fe4eb58870773903c3eb5a",
+        "replacement": "/// if let Ok(token) = std::env::var(\"DISCORD_BOT_TOKEN\") {\n///     assert!(validate(token).is_ok());\n/// }\n"
+      }
+    ]
+  }
+}

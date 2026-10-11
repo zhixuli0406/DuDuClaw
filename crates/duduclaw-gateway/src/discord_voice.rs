@@ -24,8 +24,14 @@
 //! Requires the `discord-voice` feature flag and `libopus` system library.
 
 use std::collections::HashMap;
+#[cfg(feature = "discord-voice")]
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
+#[cfg(feature = "discord-voice")]
+use async_trait::async_trait;
+#[cfg(feature = "discord-voice")]
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -299,6 +305,11 @@ impl DiscordVoiceManager {
 
 // ── Songbird Integration (feature-gated) ────────────────────────
 
+#[cfg(feature = "discord-voice")]
+fn voice_snowflake(id: u64, kind: &str) -> Result<NonZeroU64, String> {
+    NonZeroU64::new(id).ok_or_else(|| format!("Invalid Discord {kind} ID: zero"))
+}
+
 /// Songbird VoiceTick event handler — bridges Songbird decoded audio
 /// into the `DiscordVoiceManager` processing pipeline.
 ///
@@ -397,12 +408,13 @@ pub async fn join_voice_channel(
 ) -> Result<mpsc::Receiver<(u64, String, Vec<f32>)>, String> {
     use songbird::CoreEvent;
 
+    // Validate before reserving local state or contacting the voice gateway.
+    let guild = songbird::id::GuildId::from(voice_snowflake(guild_id, "guild")?);
+    let channel = songbird::id::ChannelId::from(voice_snowflake(channel_id, "channel")?);
+
     if !voice_manager.try_join(guild_id).await {
         return Err("Cannot join: voice channels limit reached or disabled".into());
     }
-
-    let guild = songbird::id::GuildId::from(guild_id);
-    let channel = songbird::id::ChannelId::from(channel_id);
 
     let handler_lock = match songbird_manager.join(guild, channel).await {
         Ok(h) => h,
@@ -457,7 +469,7 @@ impl songbird::events::EventHandler for SpeakingStateHandler {
         if let EventContext::SpeakingStateUpdate(speaking) = ctx {
             debug!(
                 ssrc = speaking.ssrc,
-                speaking = speaking.speaking,
+                speaking = ?speaking.speaking,
                 "Discord voice: speaking state"
             );
         }
@@ -472,7 +484,7 @@ pub async fn leave_voice_channel(
     guild_id: u64,
     voice_manager: Arc<DiscordVoiceManager>,
 ) -> Result<(), String> {
-    let guild = songbird::id::GuildId::from(guild_id);
+    let guild = songbird::id::GuildId::from(voice_snowflake(guild_id, "guild")?);
     let result = songbird_manager
         .leave(guild)
         .await
@@ -485,6 +497,20 @@ pub async fn leave_voice_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "discord-voice")]
+    #[test]
+    fn voice_snowflakes_reject_zero_and_preserve_valid_ids() {
+        for kind in ["guild", "channel"] {
+            assert!(voice_snowflake(0, kind).is_err());
+        }
+        for id in [1, 123456789012345678, u64::MAX] {
+            let guild = songbird::id::GuildId::from(voice_snowflake(id, "guild").unwrap());
+            let channel = songbird::id::ChannelId::from(voice_snowflake(id, "channel").unwrap());
+            assert_eq!(guild.0.get(), id);
+            assert_eq!(channel.0.get(), id);
+        }
+    }
 
     #[test]
     fn user_audio_buffer_conversion() {

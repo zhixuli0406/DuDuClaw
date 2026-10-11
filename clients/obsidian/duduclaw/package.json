@@ -8,8 +8,8 @@
     "build": "npm run check && esbuild src/main.ts --bundle --outfile=main.js --format=cjs --platform=browser --target=es2022 --external:obsidian"
   },
   "devDependencies": {
-    "esbuild": "^0.23.0",
-    "obsidian": "^1.5.7",
+    "esbuild": "^0.25.12",
+    "obsidian": "^1.14.4",
     "typescript": "^5.5.0"
   }
 }

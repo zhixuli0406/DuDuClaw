@@ -36,7 +36,7 @@ jobs:
             pkg-config libwayland-dev libxcb1-dev libxcb-randr0-dev \
             libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev \
             libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev \
-            libxdo-dev
+            libxdo-dev libopus-dev
       - name: Stub dashboard assets for compile
         # `duduclaw-cli` has `default = ["dashboard"]`, so the workspace build
         # compiles `duduclaw-dashboard` (via cli) even though it's `--exclude`d
@@ -65,6 +65,11 @@ jobs:
       # `--features otel` could not compile on macOS or Windows at all (H7 in
       # the feature audit moved them into the plain `[dependencies]` table;
       # verified locally on aarch64-apple-darwin the same day).
+      - name: Test gateway Discord voice TLS transport
+        # Songbird is an existing Linux-only dependency. Exercise its Serenity
+        # bridge so the security transport backport cannot silently rot.
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p duduclaw-gateway --no-default-features --features discord-voice --lib discord_voice
       - name: Check gateway with OpenTelemetry feature
         run: cargo check -p duduclaw-gateway --no-default-features --features otel
       # S16 (2026-09-29): the `duduclaw compat` family is OS-only — DuDuClaw
@@ -176,6 +181,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
@@ -186,14 +192,24 @@ jobs:
             --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2025-0057 \
             --ignore RUSTSEC-2025-0119 \
-            --ignore RUSTSEC-2025-0134 \
-            --ignore RUSTSEC-2026-0049 \
-            --ignore RUSTSEC-2026-0097 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2026-0150 \
             --ignore RUSTSEC-2026-0173 \
             --ignore RUSTSEC-2026-0176 \
             --ignore RUSTSEC-2026-0177 \
             --ignore RUSTSEC-2026-0293
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
+        with:
+          node-version: 22
+      - name: Audit JavaScript dependency locks
+        run: |
+          for directory in web clients/vscode clients/streamdeck clients/obsidian/duduclaw adapters/paperclip-adapter; do
+            npm --prefix "$directory" audit --package-lock-only --audit-level=low
+          done
+      - name: Verify security backport provenance
+        run: python3 scripts/verify_security_vendor.py
+      - name: Audit desktop dependency lock
+        run: cargo audit --file src-tauri/Cargo.lock
+      - name: Install GLib development files
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev
+      - name: Exercise optimized GLib string iterators
+        run: cargo test --release --locked --manifest-path src-tauri/Cargo.toml -p glib --lib variant_iter::tests::test_variant_str_iter

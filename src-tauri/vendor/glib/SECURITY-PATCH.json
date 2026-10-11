@@ -1,0 +1,24 @@
+{
+  "advisory": "GHSA-wrw7-89jp-8q8g",
+  "rustsec": "RUSTSEC-2024-0429",
+  "base_version": "0.18.5",
+  "base_crate_sha256": "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5",
+  "upstream_fix": "https://github.com/gtk-rs/gtk-rs-core/pull/1343",
+  "upstream_merge_commit": "05dff0ee696f9bcd8617cd48c4b812d046d440cb",
+  "changes": [
+    "src/variant_iter.rs: use mutable pointer and mutable out-argument"
+  ],
+  "scanner_note": "The real version remains 0.18.5. Version-only scanners may continue reporting this advisory; no dismissal or false patched version is used.",
+  "replacements": {
+    "src/variant_iter.rs": [
+      [
+        "let p: *mut libc::c_char",
+        "let mut p: *mut libc::c_char"
+      ],
+      [
+        "&p,",
+        "&mut p,"
+      ]
+    ]
+  }
+}

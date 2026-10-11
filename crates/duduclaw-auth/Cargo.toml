@@ -19,7 +19,7 @@ argon2 = { version = "0.5", features = ["std"] }
 password-hash = "0.5"
 
 # JWT
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 
 [dev-dependencies]
 tempfile = "3"
