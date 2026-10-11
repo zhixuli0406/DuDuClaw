@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- MCP Events 的 gap 補抓測試改為等待事件入庫、補抓 cursor 清除及稽核紀錄都完成，修復 Windows CI 提早檢查造成的偶發失敗。補抓完成後若無法寫回訂閱資料，稽核結果改記 `store_unavailable`，保留 gap cursor 供後續掃描重試；新增寫入失敗與恢復後重試的回歸測試。
+
 ## [1.72.1] - 2026-10-10 — 電腦操作 VNC 不再聽 TCP，Glama MCP 改綁所有介面
 
 ### Fixed
