@@ -1,6 +1,15 @@
 //! Cross-process worker lifetime. Cancellation does not release CPU/IO quota.
 use super::*;
 use fs2::FileExt;
+
+pub(super) fn is_lock_contention(error: &std::io::Error) -> bool {
+    // Windows reports ERROR_LOCK_VIOLATION, which need not be WouldBlock.
+    // Only fs2's known OS error is contention; unknown failures stay closed.
+    error
+        .raw_os_error()
+        .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
 #[derive(Debug)]
 pub(super) struct WorkerLease {
     pub id: String,
@@ -58,7 +67,7 @@ fn lease(home: &Path, id: &str, create: bool) -> ExportResult<Option<WorkerLease
             _file: file,
             active: false,
         })),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) if is_lock_contention(&e) => Ok(None),
         Err(_) => Err("EXPORT_IO".into()),
     }
 }

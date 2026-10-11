@@ -20,6 +20,78 @@ fn fixture() -> tempfile::TempDir {
     initialize(dir.path()).unwrap();
     dir
 }
+
+#[test]
+fn worker_lock_contention_preserves_owner_and_releases_on_drop() {
+    let dir = fixture();
+    let id = "0123456789abcdef0123456789abcdef";
+    let lease = worker_lease::try_lease(dir.path(), id).unwrap().unwrap();
+    assert!(worker_lease::try_lease(dir.path(), id).unwrap().is_none());
+    assert!(
+        worker_lease::try_existing_lease(dir.path(), id)
+            .unwrap()
+            .is_none()
+    );
+    drop(lease);
+    assert!(
+        worker_lease::try_existing_lease(dir.path(), id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn download_lock_contention_uses_both_slots_and_releases_on_drop() {
+    let dir = fixture();
+    let one = limits::download_permit(dir.path()).unwrap();
+    let two = limits::download_permit(dir.path()).unwrap();
+    assert_eq!(
+        limits::download_permit(dir.path()).unwrap_err(),
+        "EXPORT_BUSY"
+    );
+    drop(one);
+    let replacement = limits::download_permit(dir.path()).unwrap();
+    assert_eq!(
+        limits::download_permit(dir.path()).unwrap_err(),
+        "EXPORT_BUSY"
+    );
+    drop(two);
+    drop(replacement);
+    assert!(limits::download_permit(dir.path()).is_ok());
+}
+
+#[test]
+fn lock_contention_requires_the_known_os_error_code() {
+    assert!(worker_lease::is_lock_contention(
+        &fs2::lock_contended_error()
+    ));
+    assert!(!worker_lease::is_lock_contention(&std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "no OS error code",
+    )));
+    assert!(!worker_lease::is_lock_contention(
+        &std::io::Error::from_raw_os_error(i32::MAX)
+    ));
+}
+
+#[test]
+fn invalid_lock_paths_remain_io_errors_even_with_available_capacity() {
+    let dir = fixture();
+    let locks = dir.path().join("data_exports/.locks");
+    std::fs::create_dir_all(&locks).unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    std::fs::create_dir(locks.join(id)).unwrap();
+    assert_eq!(
+        worker_lease::try_lease(dir.path(), id).unwrap_err(),
+        "EXPORT_IO"
+    );
+    std::fs::create_dir(locks.join("download-0")).unwrap();
+    assert_eq!(
+        limits::download_permit(dir.path()).unwrap_err(),
+        "EXPORT_IO"
+    );
+}
+
 fn build_now(home: &Path, ctx: &UserContext, request: &ExportRequest) -> String {
     let (id, _lease) = reserve(home, ctx, request).unwrap();
     build(home, ctx, request, &id).unwrap();

@@ -52,7 +52,7 @@ pub(super) fn download_permit(home: &Path) -> ExportResult<DownloadPermit> {
             .map_err(|_| "EXPORT_IO".to_string())?;
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(DownloadPermit { _file: file }),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) if worker_lease::is_lock_contention(&e) => {}
             Err(_) => return Err("EXPORT_IO".into()),
         }
     }
