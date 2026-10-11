@@ -1,6 +1,6 @@
 //! First-run license seeding (E2 — enterprise Docker distribution).
 //!
-//! Symmetric to [`crate::branding::seed_bundle_if_absent`]: when a binary ships
+//! When a binary ships
 //! co-located with a signed OEM `license.json` (its path handed in via the
 //! `DUDUCLAW_LICENSE_FILE` env var, exactly like the compose pack mounts it),
 //! verify that file's Ed25519 signature against the baked production issuer
@@ -8,7 +8,7 @@
 //! runtime bootstraps. A customer who runs `docker compose up` then gets the
 //! baked (unbound OEM) license with **zero** `duduclaw license activate`.
 //!
-//! Discipline (mirrors the branding seeder):
+//! Seeding discipline:
 //!   - **idempotent** — an existing `<home>/license.json` is never overwritten
 //!     (a customer who later activates their own key keeps it);
 //!   - **fail-closed** — an unreadable, malformed, or signature-invalid

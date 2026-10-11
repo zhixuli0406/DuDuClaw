@@ -459,17 +459,22 @@ async fn models_handler(
     if !authorized(&headers, &st.proxy_key) {
         return err_json(StatusCode::UNAUTHORIZED, "缺少或無效的 Bearer proxy key");
     }
+    let policy = match duduclaw_core::product_profile::load(&st.home) {
+        Ok(policy) => policy,
+        Err(error) => return err_json(StatusCode::FORBIDDEN, &error),
+    };
     let created = now_ts();
     let mut catalogue = models_list_json(&st.registry, created);
     // Append seat models only for providers that currently have a live seat.
     let mut seat_providers: Vec<&str> = Vec::new();
     for provider in ["github", "qwen"] {
-        if st.rotator.has_seat_for_provider(provider).await {
+        if policy.require_runtime(provider).is_ok() && st.rotator.has_seat_for_provider(provider).await {
             seat_providers.push(provider);
         }
     }
     if let Some(data) = catalogue.get_mut("data").and_then(|d| d.as_array_mut()) {
         data.extend(seat_models_json(&seat_providers, created));
+        data.retain(|model| policy.require_provider(model.get("owned_by").and_then(|v| v.as_str()).unwrap_or("")).is_ok());
     }
     Json(catalogue).into_response()
 }
@@ -494,6 +499,9 @@ async fn completions_handler(
         return err_json(StatusCode::BAD_REQUEST, "請求缺少 model 欄位");
     };
     let (provider, bare) = resolve_provider_and_model(model, &st.default_provider);
+    if let Err(error) = duduclaw_core::product_profile::load(&st.home).and_then(|policy| policy.require_provider(&provider)) {
+        return err_json(StatusCode::FORBIDDEN, &error);
+    }
 
     // 4. Select an account from the rotator's pool for this provider.
     let Some(sel) = st.rotator.select_for_provider(&provider).await else {
@@ -510,6 +518,9 @@ async fn completions_handler(
     //     Only OAuth accounts are seats — an API-key qwen account (DashScope
     //     key) falls through to the normal OpenAI-compat path below.
     if takes_seat_path(&provider, &sel.auth_method) {
+        if let Err(error) = duduclaw_core::product_profile::load(&st.home).and_then(|policy| policy.require_runtime(&provider)) {
+            return err_json(StatusCode::FORBIDDEN, &error);
+        }
         let Some(seat_token) = sel.seat_token.clone() else {
             return err_json(
                 StatusCode::SERVICE_UNAVAILABLE,

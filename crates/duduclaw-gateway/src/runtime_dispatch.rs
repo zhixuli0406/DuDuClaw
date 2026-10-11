@@ -152,6 +152,7 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
         }
     };
     let provider = req.provider_override.unwrap_or(settings.provider);
+    crate::product_policy::require_runtime(req.home_dir, provider.as_str())?;
     let fallback = settings
         .fallback
         // Always fall back to Claude (the always-available core) if nothing set.

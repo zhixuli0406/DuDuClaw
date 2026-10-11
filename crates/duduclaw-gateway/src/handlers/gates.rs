@@ -71,7 +71,7 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 ///   target from `ctx.user_id`, never from params). §1.6 keeps the 帳號與密碼
 ///   tab open in Personal, and it is the *only* password path there.
 /// - `license.*` — 授權管理 is `personalHidden` in the UI, but `license.activate`
-///   / `license.redeem` are the upgrade path itself. Blocking them in Personal
+///   is the authorized license installation path. Blocking it in Personal
 ///   would make Enterprise unreachable (edition is derived from license tier).
 /// - `delegation.get` / `delegation.set` — §1.6 marks 委派權限 ✅ Personal:
 ///   it governs which *agent* may hand work to which agent, not which person.
@@ -98,10 +98,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         "users"
         // 部門 — 人的組織分群
         | "departments"
-        // 經銷商管理／發授權／白牌品牌 — 賣給別人的客戶
+        // 總經銷授權交付與管理
         | "distributor"
-        // 夥伴入口（經銷 CRM）— 客戶數／抽成
-        | "partner"
         // 身分解析 — 把不同通道上的「人」對到同一身分
         | "identity"
     ) {
@@ -130,8 +128,8 @@ pub(crate) fn enterprise_only_reject_frame() -> WsFrame {
         error: Some(json!({
             "code": ENTERPRISE_ONLY_ERROR_CODE,
             "message": "此功能屬多人團隊版，個人版沒有開放。\
-                        升級後可解鎖成員、部門、治理政策與身分解析等多人協作功能：\
-                        https://duduclaw.dudustudio.monster#pricing",
+                        如需調整授權範圍，請聯絡總經銷：\
+                        https://futurecorp.tw",
         })),
     }
 }

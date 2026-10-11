@@ -7048,6 +7048,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     use dialoguer::{Confirm, Input, Password, Select};
 
     let home = duduclaw_home();
+    let product_policy = duduclaw_core::product_profile::load(&home).map_err(DuDuClawError::Config)?;
 
     // Soft-deprecation: the dashboard now handles first-run setup. This CLI
     // wizard stays for headless/advanced use, but most users should just
@@ -7554,6 +7555,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             "WhatsApp",
             "Feishu（飛書）",
         ];
+        let channel_options = if product_policy.require_channel("feishu").is_err() {
+            &channel_options[..5]
+        } else { &channel_options[..] };
         let channels: Vec<usize> = dialoguer::MultiSelect::new()
             .with_prompt("選擇通道（空白鍵選取，Enter 確認）")
             .items(channel_options)
@@ -10512,6 +10516,8 @@ async fn cmd_agent_create(
             .map_err(|e| DuDuClawError::Agent(format!("--runtime: {e}")))?,
         None => duduclaw_core::types::RuntimeType::Claude,
     };
+    duduclaw_core::product_profile::load(&home).and_then(|policy| policy.require_runtime(provider.as_str()))
+        .map_err(DuDuClawError::Agent)?;
     // R1 (2026-10): a deprecated runtime is still accepted; say so once.
     if let Some(notice) = runtime_deprecation_notice(provider) {
         eprintln!("{} {notice}", style("deprecated:").yellow());

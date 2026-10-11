@@ -30,6 +30,9 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-typescript = "0.23.2"
 ignore = "0.4.27"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # Integration tests (`tests/`) build the library without `cfg(test)`; they get

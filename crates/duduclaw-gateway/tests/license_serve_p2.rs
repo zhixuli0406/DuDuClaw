@@ -24,7 +24,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use duduclaw_gateway::distributor_store::{
-    issue_signed_oem_license, resign_license_for_refresh, DistributorInput, DistributorStore,
+    issue_signed_distributor_license, resign_license_for_refresh, DistributorInput, DistributorStore,
     IssuedLicense,
 };
 use duduclaw_gateway::license_serve::{
@@ -94,7 +94,7 @@ fn resign_preserves_validity_and_reverifies() {
     let (seed, registry) = issuer_pair();
     let fp = generate_fingerprint();
     let (original, blob) =
-        issue_signed_oem_license(&seed, &registry, "v2", "dist-r-1", "dist-r", &fp, 365, None, None, None)
+        issue_signed_distributor_license(&seed, &registry, "v2", "dist-r-1", "dist-r", &fp, 365, None, None)
             .unwrap();
 
     let rec = IssuedLicense {
@@ -240,4 +240,17 @@ fn rate_limiter_trips_after_max() {
     // A different IP is unaffected.
     let other: IpAddr = "203.0.113.6".parse().unwrap();
     assert!(within_rate_limit(&limiter, other, 3));
+}
+
+#[tokio::test]
+async fn branding_sign_endpoint_is_removed_even_from_issuer_instances() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[distributor]\nissuer_key_path = 'issuer.key'\n").unwrap();
+    let response = duduclaw_gateway::license_serve::router(home.path().to_path_buf())
+        .oneshot(Request::builder().method("POST").uri("/v1/branding/sign")
+            .header("content-type", "application/json").body(Body::from("{}")).unwrap())
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

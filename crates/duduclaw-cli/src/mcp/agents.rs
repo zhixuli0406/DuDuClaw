@@ -1,7 +1,11 @@
 use super::*;
 
 /// Create a persistent sub-agent directory with agent.toml, SOUL.md, etc.
-pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+pub(crate) async fn handle_create_agent(
+    params: &Value,
+    home_dir: &Path,
+    caller_agent: &str,
+) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let display_name = params
         .get("display_name")
@@ -169,25 +173,8 @@ pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_
         });
     }
 
-    // Create directory structure
-    if let Err(e) = tokio::fs::create_dir_all(&agent_dir).await {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error creating agent directory: {e}")}],
-            "isError": true
-        });
-    }
-    let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
-    // RFC-26 P6.3: seed the deep-agents default skill set (code-review / refactor
-    // / test-writer / git-workflow). Idempotent; never overwrites operator edits.
-    match duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
-        Ok(written) if !written.is_empty() => {
-            info!(agent = name, skills = ?written, "seeded built-in skills");
-        }
-        Ok(_) => {}
-        Err(e) => warn!("failed to seed built-in skills for {name}: {e}"),
-    }
-
-    // Write agent.toml — use toml crate to prevent injection via display_name/trigger/icon
+    // Prepare and validate configuration before any scaffold or file writes.
+    // Use the toml crate to prevent injection via display_name/trigger/icon.
     // Clone values that will be consumed by the toml! macro
     let reports_to_display = reports_to.clone();
     let agent_config = toml::toml! {
@@ -236,7 +223,30 @@ pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_
         strategy = "balanced"
         max_silence_hours = 12.0
     };
+    if let Err(error) = duduclaw_core::product_profile::load(home_dir)
+        .and_then(|policy| duduclaw_gateway::product_policy::validate_table(policy, &agent_config))
+    {
+        return tool_error(&error);
+    }
     let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
+
+    // Create directory structure
+    if let Err(e) = tokio::fs::create_dir_all(&agent_dir).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error creating agent directory: {e}")}],
+            "isError": true
+        });
+    }
+    let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
+    // RFC-26 P6.3: seed the deep-agents default skill set (code-review / refactor
+    // / test-writer / git-workflow). Idempotent; never overwrites operator edits.
+    match duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
+        Ok(written) if !written.is_empty() => {
+            info!(agent = name, skills = ?written, "seeded built-in skills");
+        }
+        Ok(_) => {}
+        Err(e) => warn!("failed to seed built-in skills for {name}: {e}"),
+    }
 
     if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {
         return serde_json::json!({
@@ -599,7 +609,10 @@ pub(crate) async fn handle_agent_status(params: &Value, home_dir: &Path, caller:
 /// `None` when the file is missing / unparseable / the field is absent, so
 /// callers can decide the indeterminate policy (spawn treats indeterminate as
 /// operational for backward-compat with pre-WP4 configs that lack the field).
-pub(crate) fn agent_status_of(home_dir: &Path, agent_id: &str) -> Option<duduclaw_core::types::AgentStatus> {
+pub(crate) fn agent_status_of(
+    home_dir: &Path,
+    agent_id: &str,
+) -> Option<duduclaw_core::types::AgentStatus> {
     // Shared typed parse point (R2 unification). `status` stays a raw String
     // on the view so an unrecognised value keeps resolving to `None`
     // (indeterminate) here rather than becoming a hard deserialization error
@@ -610,4 +623,100 @@ pub(crate) fn agent_status_of(home_dir: &Path, agent_id: &str) -> Option<duducla
     // AgentStatus derives Deserialize with snake_case rename, so a bare status
     // string round-trips through serde.
     serde_json::from_value(serde_json::Value::String(status_str)).ok()
+}
+
+#[cfg(test)]
+mod product_policy_creation_tests {
+    use super::*;
+    use std::fs;
+
+    const CONFIG: &str = "[product]\nprofile = 'restricted'\n";
+
+    fn fixture() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), CONFIG).unwrap();
+        home
+    }
+
+    fn params(model: &str) -> Value {
+        serde_json::json!({
+            "name": "policy-candidate",
+            "display_name": "Policy candidate",
+            "reports_to": "none",
+            "model": model,
+            "soul": "Keep this valid employee's instructions."
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_create_policy_denial_has_zero_filesystem_side_effects() {
+        let home = fixture();
+        let response =
+            handle_create_agent(&params("openai/gpt-4o"), home.path(), "dashboard").await;
+        assert_eq!(response["isError"], true, "{response}");
+        let message = response["content"][0]["text"].as_str().unwrap();
+        assert!(
+            message.contains("Product profile") && message.contains("openai"),
+            "{response}"
+        );
+        assert!(!home.path().join("agents").exists());
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            CONFIG
+        );
+        let entries: Vec<_> = fs::read_dir(home.path()).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "denied creation must not scaffold any files"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_create_denied_same_name_preserves_existing_employee() {
+        let home = fixture();
+        let agent_dir = home.path().join("agents/policy-candidate");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let config =
+            "[agent]\nname='policy-candidate'\n[model]\npreferred='anthropic/claude-sonnet-4-6'\n";
+        let soul = "Keep this existing employee's instructions.";
+        fs::write(agent_dir.join("agent.toml"), config).unwrap();
+        fs::write(agent_dir.join("SOUL.md"), soul).unwrap();
+
+        let response =
+            handle_create_agent(&params("openai/gpt-4o"), home.path(), "dashboard").await;
+        assert_eq!(response["isError"], true, "{response}");
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("agent.toml")).unwrap(),
+            config
+        );
+        assert_eq!(fs::read_to_string(agent_dir.join("SOUL.md")).unwrap(), soul);
+        assert_eq!(fs::read_dir(&agent_dir).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_create_concurrent_policy_denial_preserves_valid_same_name_creation() {
+        let home = fixture();
+        let denied_params = params("openai/gpt-4o");
+        let valid_params = params("anthropic/claude-sonnet-4-6");
+        let (denied, valid) = tokio::join!(
+            handle_create_agent(&denied_params, home.path(), "dashboard"),
+            handle_create_agent(&valid_params, home.path(), "dashboard")
+        );
+        assert_eq!(denied["isError"], true, "{denied}");
+        assert_ne!(valid["isError"], true, "{valid}");
+        let agent_dir = home.path().join("agents/policy-candidate");
+        let config: toml::Table = fs::read_to_string(agent_dir.join("agent.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config["model"]["preferred"].as_str(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("SOUL.md")).unwrap(),
+            "Keep this valid employee's instructions."
+        );
+    }
 }

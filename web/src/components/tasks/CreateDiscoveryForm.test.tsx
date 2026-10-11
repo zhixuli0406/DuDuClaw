@@ -1,11 +1,29 @@
-import { describe, expect, it, vi } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { setStandardProductPolicyFixture } from '@/test/product-policy';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { CreateDiscoveryForm } from './CreateDiscoveryForm';
 import type { DiscoveryCatalog } from '@/lib/discovery-api';
+import { useProductPolicyStore, type ProductPolicy } from '@/lib/product-policy';
 const catalog: DiscoveryCatalog = { roots: [{ id: 'approved-1', label: 'Synthetic workspace' }], evaluators: [{ name: 'sum', label: 'Sum evaluator' }], runtimes: ['codex'], can_create: true, requires_approval: true };
 describe('CreateDiscoveryForm', () => {
+  it.each<ProductPolicy | null>([
+    null,
+    { profile: 'restricted', blocked_channels: ['slack'], blocked_runtimes: ['claude'], blocked_providers: ['openai'] },
+  ])('refuses a blocked or unverified runtime even when the form is submitted directly', async (policy) => {
+    useProductPolicyStore.setState({ policy, loading: false, error: false });
+    const create = vi.fn().mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    const { container } = renderWithProviders(<CreateDiscoveryForm catalog={{ ...catalog, runtimes: ['claude'] }} agentId="agnes" onCreate={create} />);
+    await user.type(screen.getByRole('textbox', { name: 'Title' }), 'Compare outputs');
+    await user.type(screen.getByRole('textbox', { name: 'Description' }), 'Find a valid alternative');
+    await user.type(screen.getByRole('textbox', { name: 'Model' }), 'configured-model');
+    expect(screen.getByRole('button', { name: 'Create exploration' })).toBeDisabled();
+    expect(screen.queryByRole('option', { name: 'Claude' })).not.toBeInTheDocument();
+    fireEvent.submit(container.querySelector('form')!);
+    expect(create).not.toHaveBeenCalled();
+  });
   it('submits approved IDs and independent call/dollar/wall budgets, preserving approval notice', async () => {
     const create=vi.fn().mockResolvedValue(undefined); const user=userEvent.setup();
     renderWithProviders(<CreateDiscoveryForm catalog={catalog} agentId="agnes" onCreate={create} />);
@@ -79,3 +97,6 @@ describe('CreateDiscoveryForm', () => {
     expect(screen.getByText(/Currently 2 nodes per round/)).toBeInTheDocument();
   });
 });
+
+// This suite exercises the standard installation catalog.
+beforeEach(setStandardProductPolicyFixture);

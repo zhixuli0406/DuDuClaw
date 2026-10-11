@@ -236,6 +236,11 @@ impl MethodHandler {
             }
         };
 
+        if let Err(e) = crate::product_policy::load(&self.home_dir)
+            .and_then(|policy| crate::product_policy::validate_table(policy, &agent_config)) {
+            let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+            return WsFrame::error_response("", &e);
+        }
         let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
         // XC.2: atomic write (temp + rename) — mirror the per-agent update path.

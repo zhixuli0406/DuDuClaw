@@ -28,7 +28,7 @@ import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
-import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
+import { useEffectiveName, useEffectiveLogo } from '@/lib/product-identity';
 import {
   SidebarHeader,
   SidebarContent,

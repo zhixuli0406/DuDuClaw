@@ -334,7 +334,7 @@ async fn webhook_handler(
                 .unwrap_or("(unknown)");
             info!("Google Chat: added to space {space}");
             let product =
-                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+                "DuDuClaw".to_string();
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({

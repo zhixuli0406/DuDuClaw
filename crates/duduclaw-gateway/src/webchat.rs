@@ -1299,7 +1299,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 /// Build a `session_info` frame for `session_id` describing the agent that will
 /// answer (`agent = None` → the main/default agent). WP3 uses this to echo the
 /// effective session on resume so the client can confirm the switch and refresh
-/// its header. Falls back to the white-label product name when no agent is
+/// its header. Falls back to the fixed product name when no agent is
 /// loaded — mirrors the connect-time computation.
 async fn build_session_info_frame(
     state: &Arc<WebChatState>,
@@ -1320,7 +1320,7 @@ async fn build_session_info_frame(
                 a.config.model.preferred.clone(),
             ),
             None => (
-                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home()),
+                "DuDuClaw".to_string(),
                 "🐾".to_string(),
                 String::new(),
                 // No agent ⇒ the reply path falls back to this same default

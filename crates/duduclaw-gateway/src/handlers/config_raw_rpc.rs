@@ -790,6 +790,7 @@ impl MethodHandler {
         // Every validation message is scrubbed of restored secrets.
         let after = validate_raw(&kind, &new_text).map_err(|e| rctx.scrub(&e))?;
         let before: toml::Table = stored.parse().unwrap_or_default();
+        crate::product_policy::validate_write(&self.home_dir, &path, &stored, &new_text)?;
         let sensitive = sensitive_key_changes(&kind, &before, &after)?;
         if let RawFile::Agent(id) = &kind {
             let name_before = super::config_commit::toml_at(&before, "agent.name");

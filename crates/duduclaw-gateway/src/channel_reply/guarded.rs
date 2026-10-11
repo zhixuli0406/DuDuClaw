@@ -222,21 +222,13 @@ pub async fn build_guarded_reply_with_session(
     let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
     let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
-    let final_text = append_branding_footer(with_notice, &ctx.home_dir, session_id).await;
+    let final_text = append_product_footer(with_notice, session_id);
     attach_turn_rollback(final_text, artifact, guards, delivery, ctx).await
 }
 
-/// WP1.4 (ecosystem, 2026-08-13 拍板): free-tier branding footer on
-/// end-customer channel replies. Free tiers (OpenSource / Hobby) always show
-/// it; paid tiers may opt out via `config.toml [branding] reply_footer =
-/// false` — the config is license-gated, so flipping it on a free install is
-/// a no-op. Consistent with the edition principle: quota/branding-locked,
-/// never capability-locked.
-///
-/// Scope: EXTERNAL channel sessions only (the surfaces end customers see).
-/// The dashboard's own WebChat console and internal sessions (cron / bus /
-/// "default") stay clean — branding the owner's console serves nobody.
-pub(super) const BRANDING_FOOTER: &str = "— Powered by DuDuClaw 🐾";
+/// Fixed product attribution on external messaging replies. Internal sessions,
+/// the dashboard console and deliberate silence remain unchanged.
+pub(super) const PRODUCT_FOOTER: &str = "— Powered by DuDuClaw 🐾";
 
 /// Session prefixes that reach end customers (external messaging platforms).
 pub(super) const FOOTER_CHANNELS: &[&str] = &[
@@ -260,43 +252,9 @@ pub(super) fn footer_applies_to_session(session_id: &str) -> bool {
     })
 }
 
-/// `[branding] reply_footer` from config.toml; absent/malformed ⇒ `true`
-/// (footer on) — fail-open to visibility, never to silence.
-pub(super) fn branding_footer_enabled(home_dir: &std::path::Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(home_dir.join("config.toml")) else {
-        return true;
-    };
-    let Ok(v) = raw.parse::<toml::Value>() else {
-        return true;
-    };
-    v.get("branding")
-        .and_then(|b| b.get("reply_footer"))
-        .and_then(|x| x.as_bool())
-        .unwrap_or(true)
-}
-
-pub(super) async fn append_branding_footer(
-    reply: String,
-    home_dir: &std::path::Path,
-    session_id: &str,
-) -> String {
-    // Deliberate silences (gates upstream) stay silent; non-customer
-    // sessions stay unbranded.
+pub(super) fn append_product_footer(reply: String, session_id: &str) -> String {
     if reply.is_empty() || !footer_applies_to_session(session_id) {
         return reply;
     }
-    // Paid tiers may opt out; free tiers (and no-license installs) always
-    // show the footer. `global()` absent ⇒ treat as free (fail to visible).
-    let paid = match crate::license_runtime::global() {
-        Some(rt) => !matches!(
-            rt.current_tier().await,
-            duduclaw_license::LicenseTier::OpenSource | duduclaw_license::LicenseTier::Hobby
-        ),
-        None => false,
-    };
-    if paid && !branding_footer_enabled(home_dir) {
-        return reply;
-    }
-    format!("{reply}\n\n{BRANDING_FOOTER}")
+    format!("{reply}\n\n{PRODUCT_FOOTER}")
 }
-

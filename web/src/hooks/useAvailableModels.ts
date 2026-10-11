@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 
@@ -80,6 +81,7 @@ function refreshModels(): Promise<Snapshot> {
  * triggers a server-side live re-probe (`models.refresh`).
  */
 export function useAvailableModels(): AvailableModelsResult {
+  const policy = useProductPolicy();
   const [models, setModels] = useState<AvailableModel[]>(() =>
     isFresh() ? cache!.snapshot.models : []
   );
@@ -127,5 +129,5 @@ export function useAvailableModels(): AvailableModelsResult {
     }
   }, []);
 
-  return { models, loading, error, discoveredAt, refreshing, refresh };
+  return { models: models.filter(m => m.type === 'local' || policy.allows('providers', m.provider ?? '')), loading, error, discoveredAt, refreshing, refresh };
 }

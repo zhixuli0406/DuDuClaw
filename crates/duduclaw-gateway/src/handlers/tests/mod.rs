@@ -67,3 +67,7 @@ mod agents_inspect_sandbox_tests;
 mod knowledge_quarantine_decide_tests;
 mod v168_config_rpc_tests;
 mod responsibilities_rpc_tests;
+
+mod reseller_boundary_tests;
+
+mod product_policy_tests;

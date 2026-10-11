@@ -38,6 +38,9 @@ pub(crate) async fn handle_channel_config(args: &Value, home_dir: &Path) -> Valu
         None => return tool_error("Missing required parameter: key"),
     };
 
+    if let Err(error) = duduclaw_core::product_profile::load(home_dir).and_then(|policy| policy.require_channel(channel)) {
+        return tool_error(&error);
+    }
     if !VALID_CHANNELS.contains(&channel) {
         return tool_error(&format!("Invalid channel type: {channel}"));
     }
@@ -85,6 +88,9 @@ pub(crate) async fn handle_channel_config_list(args: &Value, home_dir: &Path) ->
         None => return tool_error("Missing required parameter: scope_id"),
     };
 
+    if let Err(error) = duduclaw_core::product_profile::load(home_dir).and_then(|policy| policy.require_channel(channel)) {
+        return tool_error(&error);
+    }
     if !VALID_CHANNELS.contains(&channel) {
         return tool_error(&format!("Invalid channel type: {channel}"));
     }

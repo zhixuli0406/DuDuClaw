@@ -13,6 +13,9 @@ impl MethodHandler {
 
     pub(crate) async fn handle_cli_login_start(&self, params: Value) -> WsFrame {
         let runtime_str = params.get("runtime").and_then(|v| v.as_str()).unwrap_or("");
+        if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, runtime_str) {
+            return WsFrame::error_response("", &e);
+        }
         if runtime_str.is_empty() {
             return WsFrame::error_response(
                 "",
@@ -228,6 +231,9 @@ impl MethodHandler {
                 None => return WsFrame::error_response("", "login session not found"),
             }
         };
+        if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, session.runtime.as_str()) {
+            return WsFrame::error_response("", &e);
+        }
         if session.status() != crate::cli_auth::AuthStatus::Succeeded {
             return WsFrame::ok_response(
                 "",

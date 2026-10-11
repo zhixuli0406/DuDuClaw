@@ -1,62 +1,27 @@
 use super::*;
 
 #[cfg(test)]
-mod branding_footer_tests {
+mod product_footer_tests {
     use super::*;
 
     #[test]
     fn footer_targets_external_channels_only() {
         assert!(footer_applies_to_session("line:U123"));
         assert!(footer_applies_to_session("telegram:42#topic:7"));
-        // Owner console + internal sessions stay unbranded.
         assert!(!footer_applies_to_session("webchat:conn#agent:a"));
         assert!(!footer_applies_to_session("default"));
         assert!(!footer_applies_to_session("cron:daily"));
-        // Prefix must be exact-token (`linex:` is not `line:`).
         assert!(!footer_applies_to_session("linex:U123"));
     }
 
     #[test]
-    fn config_gate_fails_open_to_visible() {
-        let dir = tempfile::tempdir().unwrap();
-        // No config at all ⇒ on.
-        assert!(branding_footer_enabled(dir.path()));
-        // Malformed config ⇒ on.
-        std::fs::write(dir.path().join("config.toml"), "{{{").unwrap();
-        assert!(branding_footer_enabled(dir.path()));
-        // Explicit opt-out parses.
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[branding]\nreply_footer = false\n",
-        )
-        .unwrap();
-        assert!(!branding_footer_enabled(dir.path()));
-    }
-
-    #[tokio::test]
-    async fn footer_appends_on_free_tier_and_skips_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        // No global license runtime in tests ⇒ treated as free ⇒ footer on,
-        // even when the config says off (the opt-out is paid-gated).
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[branding]\nreply_footer = false\n",
-        )
-        .unwrap();
-        let out = append_branding_footer("好的，已完成".into(), dir.path(), "line:U1").await;
-        assert!(
-            out.ends_with(BRANDING_FOOTER),
-            "free tier must keep the footer: {out}"
-        );
-        // Deliberate silence stays silent.
-        let silent = append_branding_footer(String::new(), dir.path(), "line:U1").await;
-        assert!(silent.is_empty());
-        // Owner console stays unbranded.
-        let console = append_branding_footer("hi".into(), dir.path(), "webchat:c#a").await;
-        assert_eq!(console, "hi");
+    fn footer_is_fixed_and_skips_empty_and_internal_replies() {
+        let out = append_product_footer("好的，已完成".into(), "line:U1");
+        assert!(out.ends_with(PRODUCT_FOOTER));
+        assert!(append_product_footer(String::new(), "line:U1").is_empty());
+        assert_eq!(append_product_footer("hi".into(), "webchat:c#a"), "hi");
     }
 }
-
 
 #[cfg(test)]
 mod channel_gvu_gate_tests {

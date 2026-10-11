@@ -123,7 +123,7 @@ pub mod autopilot_engine;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
 pub mod autopilot_store;
-pub mod branding;
+mod image_data;
 pub mod cep_matcher;
 pub mod cron_scheduler;
 pub mod cron_store;
@@ -140,7 +140,6 @@ pub mod notify_governance;
 // card rendering deliberately stay with them.
 pub(crate) mod notify_push;
 pub mod notify_stats;
-pub mod partner_store;
 pub mod posture_watch;
 pub mod premium_templates;
 pub mod security_autopilot;
@@ -555,3 +554,6 @@ pub mod role_turns;
 /// Team-as-Agent (P1/WP-4): per-task team spec freeze, the decomposability
 /// gate, and the planner → executor(s) → verifier round.
 pub mod team_composer;
+
+pub mod product_policy;
+pub mod data_exports;

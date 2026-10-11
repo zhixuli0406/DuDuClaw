@@ -159,6 +159,10 @@ impl FailoverManager {
         context: &RuntimeContext,
         model_fallbacks: &[String],
     ) -> Result<RuntimeResponse, String> {
+        let policy = crate::product_policy::load(&context.home_dir)?;
+        policy.require_runtime(primary.as_str())?;
+        crate::product_policy::require_model(policy, &context.model)?;
+        if let Some(provider) = context.preferred_provider.as_deref() { policy.require_provider(provider)?; }
         // Check primary health (with cooldown recovery)
         let primary_available = {
             let mut health = self.health.write().await;
@@ -255,6 +259,7 @@ impl FailoverManager {
 
         // Try fallback
         if let Some(fb) = fallback {
+            policy.require_runtime(fb.as_str())?;
             let fb_available = {
                 let mut health = self.health.write().await;
                 let entry = health

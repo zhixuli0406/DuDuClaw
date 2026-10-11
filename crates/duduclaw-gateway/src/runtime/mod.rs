@@ -525,6 +525,13 @@ impl RuntimeRegistry {
     pub async fn new(home_dir: &Path) -> Self {
         let mut runtimes: HashMap<RuntimeType, Box<dyn AgentRuntime>> = HashMap::new();
 
+        let policy = match crate::product_policy::load(home_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "Product policy refused runtime registry startup");
+                return Self { runtimes };
+            }
+        };
         // Claude is always available (it's the core)
         runtimes.insert(
             RuntimeType::Claude,
@@ -577,8 +584,8 @@ impl RuntimeRegistry {
         // like the bespoke ones: a runtime that is configured but not installed
         // must fail over, not spawn a missing program.
         let user_home = std::path::PathBuf::from(duduclaw_core::platform::home_dir());
-        for spec in duduclaw_core::runtime_catalog::cli_specs() {
-            if BESPOKE_RUNTIME_IDS.contains(&spec.id) {
+        for spec in duduclaw_core::runtime_catalog::cli_specs_for_profile(policy) {
+            if BESPOKE_RUNTIME_IDS.contains(&spec.id) || policy.require_runtime(spec.id).is_err() {
                 continue;
             }
             let Some(rt) = RuntimeType::from_id(spec.id) else {

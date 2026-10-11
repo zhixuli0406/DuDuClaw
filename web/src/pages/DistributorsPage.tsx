@@ -1,7 +1,5 @@
 import { useEffect, useState, useCallback, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate } from 'react-router';
-import { useUrlState } from '@/lib/use-url-state';
 import {
   Store,
   Plus,
@@ -11,28 +9,16 @@ import {
   Trash2,
   Ban,
   Info,
-  FileSignature,
-  Download,
-  Palette,
   MoreHorizontal,
   Loader2,
 } from 'lucide-react';
 import {
   Card,
   CardContent,
-  Tabs,
-  TabsList,
-  TabsTab,
   Button,
   Badge,
   Input,
   Textarea,
-  Checkbox,
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -48,39 +34,15 @@ import {
   ListGridRow,
   ListGridCell,
   Empty,
-  CrossLink,
 } from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
-import { BrandingTab } from '@/components/settings/sections/BrandingTab';
 import { toast, formatError } from '@/lib/toast';
 import {
   api,
   type DistributorProfile,
   type DistributorStats,
   type IssuedLicense,
-  type BrandingConfig,
 } from '@/lib/api';
-
-/**
- * DistributorsPage (design-distributor-white-label §4.5) — the combined "白牌與經銷"
- * console (`/manage/distributors`, admin-gated). Two tabs on one page so the
- * brand-appearance settings and the distributor issuance ledger no longer live in
- * two unrelated corners (2026-07-12 walkthrough: "分開很難找"):
- *   - 品牌設定  → the reusable `BrandingTab` (product name / logo / accent / About
- *                HTML; keeps its WP8 field-level masking).
- *   - 經銷商簽發 → the OWNER console: sign OEM white-label licenses, keep the
- *                distributor ledger, and revoke locally.
- *
- * This is a /manage surface, so internal terms (license / OEM / fingerprint) are
- * fine in the distributor tab — the branding tab stays customer-facing.
- *
- * Fail-closed: when the gateway reports no issuer key configured, the distributor
- * tab shows an empty state explaining how to set `[distributor] issuer_key_path`
- * and never offers an issue action.
- */
-
-const WHITE_LABEL_TABS = ['branding', 'distributors'] as const;
-type WhiteLabelTab = (typeof WHITE_LABEL_TABS)[number];
 
 const DEFAULT_EXPIRES_DAYS = 365;
 
@@ -88,37 +50,6 @@ const DEFAULT_EXPIRES_DAYS = 365;
 const DIST_COLUMNS = 'minmax(0,1.6fr) minmax(0,1.4fr) minmax(0,0.7fr) 2.5rem';
 const LEDGER_COLUMNS =
   'minmax(0,1.4fr) minmax(0,1fr) minmax(0,0.7fr) minmax(0,1fr) minmax(0,1.4fr) 2.5rem';
-
-/**
- * Branding fields a reseller can grant to a customer license (WP8). The `field`
- * values are the exact `branding.set` serde keys the gateway validates against;
- * `labelId` reuses the customer-facing branding labels so the wording matches
- * the "品牌設定" tab. Order mirrors the BrandingTab form.
- */
-const BRANDING_FIELDS: { field: string; labelId: string }[] = [
-  { field: 'product_name', labelId: 'branding.productName' },
-  { field: 'subtitle', labelId: 'branding.subtitle' },
-  { field: 'logo_data_uri', labelId: 'branding.logo' },
-  { field: 'company_name', labelId: 'branding.company' },
-  { field: 'website', labelId: 'branding.website' },
-  { field: 'support_email', labelId: 'branding.supportEmail' },
-  { field: 'description', labelId: 'branding.description' },
-  { field: 'about_html', labelId: 'branding.aboutHtml' },
-  { field: 'accent_color', labelId: 'branding.accent' },
-];
-
-/** Trigger a client-side download of a pretty-printed JSON object. */
-function downloadJson(filename: string, obj: unknown): void {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
 
 /** Compact a long license id to `first8…last4` for the ledger. */
 function maskId(id: string): string {
@@ -150,12 +81,6 @@ function DialogField({
 
 export function DistributorsPage() {
   const intl = useIntl();
-  const navigate = useNavigate();
-  // Default to 品牌設定 — the more commonly-edited surface and the one users
-  // struggled to find. `?tab=distributors` (or legacy `?tab=branding`)
-  // deep-links, and switching tabs writes back (P11: it used to read the param
-  // once at mount, so a refresh always dumped you back on 品牌設定).
-  const [tab, setTab] = useUrlState('tab', 'branding', { allowed: WHITE_LABEL_TABS });
   const [issuerConfigured, setIssuerConfigured] = useState<boolean | null>(null);
   const [refreshEndpointActive, setRefreshEndpointActive] = useState(false);
   const [stats, setStats] = useState<DistributorStats | null>(null);
@@ -164,7 +89,6 @@ export function DistributorsPage() {
 
   // Dialog state
   const [addOpen, setAddOpen] = useState(false);
-  const [signBundleOpen, setSignBundleOpen] = useState(false);
   const [issueTarget, setIssueTarget] = useState<DistributorProfile | null>(null);
   const [removeTarget, setRemoveTarget] = useState<DistributorProfile | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<IssuedLicense | null>(null);
@@ -252,18 +176,12 @@ export function DistributorsPage() {
               {intl.formatMessage({ id: 'manage.distributors' })}
             </h1>
             <p className="text-sm text-muted-foreground">
-              {intl.formatMessage({ id: 'whitelabel.subtitle' })}
+              {intl.formatMessage({ id: 'distributor.subtitle' })}
             </p>
           </div>
         </div>
-        {tab === 'distributors' && issuerConfigured && (
+        {issuerConfigured && (
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={() => setSignBundleOpen(true)}>
-              <FileSignature />
-              <span className="hidden sm:inline">
-                {intl.formatMessage({ id: 'distributor.bundle.sign' })}
-              </span>
-            </Button>
             <Button variant="brand" size="sm" onClick={() => setAddOpen(true)}>
               <Plus />
               <span className="hidden sm:inline">
@@ -274,39 +192,12 @@ export function DistributorsPage() {
         )}
       </div>
 
-      <Tabs variant="line" value={tab} onValueChange={(v) => setTab(v as WhiteLabelTab)}>
-        <TabsList>
-          <TabsTab value="branding">
-            <Palette />
-            {intl.formatMessage({ id: 'settings.branding' })}
-          </TabsTab>
-          <TabsTab value="distributors">
-            <Store />
-            {intl.formatMessage({ id: 'distributor.title' })}
-          </TabsTab>
-        </TabsList>
-      </Tabs>
-
-      {tab === 'branding' && <BrandingTab />}
-
-      {tab === 'distributors' && (
         <div className="space-y-4">
-          {/* Scope disclaimer (UX audit §2-10) — this tab issues real, verifiable
-              licenses; it is not the sales/commission tracker (that's the
-              Partner tab, /app/system/license?tab=partner — relocated by N-3,
-              2026-08). Shown regardless of issuer/loading state so the
-              distinction is clear up front. X03 (§3.3): the cross-reference
-              used to be plain, unclickable text — now a real CrossLink over
-              to the Partner tab. */}
           <div className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-info/30 bg-info/10 px-3 py-2 text-xs text-foreground">
             <div className="flex items-start gap-2">
               <Info className="mt-0.5 h-4 w-4 shrink-0 text-info" />
               <p>{intl.formatMessage({ id: 'distributor.scopeNote' })}</p>
             </div>
-            <CrossLink
-              label={intl.formatMessage({ id: 'crosslink.distributor.toPartner' })}
-              onClick={() => navigate('/app/system/license?tab=partner')}
-            />
           </div>
 
           {loading ? (
@@ -580,7 +471,6 @@ public_url = "https://your-gateway.example.com"`}
           </>
           )}
         </div>
-      )}
 
       {/* Add distributor */}
       <AddDistributorDialog
@@ -588,13 +478,6 @@ public_url = "https://your-gateway.example.com"`}
         busy={busy}
         onClose={() => setAddOpen(false)}
         onSubmit={handleAdd}
-      />
-
-      {/* Counter-sign a branding bundle for a distributor */}
-      <SignBundleDialog
-        open={signBundleOpen}
-        distributors={distributors}
-        onClose={() => setSignBundleOpen(false)}
       />
 
       {/* Issue license */}
@@ -710,113 +593,6 @@ function AddDistributorDialog({
   );
 }
 
-function SignBundleDialog({
-  open,
-  distributors,
-  onClose,
-}: {
-  open: boolean;
-  distributors: DistributorProfile[];
-  onClose: () => void;
-}) {
-  const intl = useIntl();
-  const [distributorId, setDistributorId] = useState('');
-  const [json, setJson] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    if (open) {
-      setDistributorId(distributors[0]?.id ?? '');
-      setJson('');
-    }
-  }, [open, distributors]);
-
-  const handleSign = async () => {
-    let branding: BrandingConfig;
-    try {
-      branding = JSON.parse(json) as BrandingConfig;
-      if (typeof branding !== 'object' || branding === null || Array.isArray(branding)) {
-        throw new Error('not an object');
-      }
-    } catch {
-      toast.error(intl.formatMessage({ id: 'distributor.bundle.invalidJson' }));
-      return;
-    }
-    setBusy(true);
-    try {
-      const res = await api.distributor.bundle.sign({ distributor_id: distributorId, branding });
-      downloadJson('branding.bundle.json', res.bundle);
-      toast.success(intl.formatMessage({ id: 'distributor.bundle.done' }));
-      onClose();
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'distributor.bundle.sign' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            {intl.formatMessage({ id: 'distributor.bundle.sign.desc' })}
-          </p>
-          <DialogField label={intl.formatMessage({ id: 'distributor.bundle.selectDistributor' })}>
-            <Select value={distributorId} onValueChange={(v) => setDistributorId(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>
-                  {distributors.find((d) => d.id === distributorId)?.name}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {distributors.map((d) => (
-                  <SelectItem key={d.id} value={d.id}>
-                    {d.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </DialogField>
-          <DialogField
-            label={intl.formatMessage({ id: 'distributor.bundle.brandingJson' })}
-            help={intl.formatMessage({ id: 'distributor.bundle.brandingJson.hint' })}
-            htmlFor="sign-json"
-          >
-            <Textarea
-              id="sign-json"
-              className="font-mono text-xs"
-              rows={8}
-              spellCheck={false}
-              value={json}
-              onChange={(e) => setJson(e.target.value)}
-              placeholder={'{\n  "product_name": "Acme",\n  "accent_color": "#3b82f6"\n}'}
-            />
-          </DialogField>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button
-            variant="brand"
-            disabled={busy || distributorId.length === 0 || json.trim().length === 0}
-            onClick={handleSign}
-          >
-            <Download />
-            {busy
-              ? intl.formatMessage({ id: 'common.saving' })
-              : intl.formatMessage({ id: 'distributor.bundle.submit' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 function IssueLicenseDialog({
   distributor,
   onClose,
@@ -831,16 +607,6 @@ function IssueLicenseDialog({
   const [busy, setBusy] = useState(false);
   const [blob, setBlob] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  // WP8: default = grant the full reseller branding range (omit the param).
-  // Enabling `restrictBranding` narrows the customer to the checked fields.
-  const [restrictBranding, setRestrictBranding] = useState(false);
-  const [brandingFields, setBrandingFields] = useState<string[]>([]);
-
-  const toggleField = (field: string) =>
-    setBrandingFields((prev) =>
-      prev.includes(field) ? prev.filter((f) => f !== field) : [...prev, field],
-    );
-
   const handleIssue = async () => {
     setBusy(true);
     try {
@@ -849,9 +615,6 @@ function IssueLicenseDialog({
         machine_fingerprint: fingerprint.trim(),
         expires_days: expiresDays,
         note: note.trim() || undefined,
-        // Omit for the full reseller range; send the (possibly empty) subset when
-        // the reseller chose to restrict the customer's editable branding.
-        branding_editable: restrictBranding ? brandingFields : undefined,
       });
       setBlob(res.license_blob);
       toast.success(intl.formatMessage({ id: 'distributor.issue.done' }));
@@ -951,41 +714,6 @@ function IssueLicenseDialog({
             >
               <Input id="issue-note" value={note} onChange={(e) => setNote(e.target.value)} />
             </DialogField>
-
-            {/* WP8: branding edit-scope for the issued customer license. */}
-            <div className="space-y-2 rounded-lg border border-surface-border bg-muted/40 p-3">
-              <div className="flex items-start gap-2">
-                <Checkbox
-                  className="mt-0.5"
-                  checked={restrictBranding}
-                  onCheckedChange={(c) => setRestrictBranding(c === true)}
-                />
-                <span className="text-sm text-foreground">
-                  <span className="font-medium">
-                    {intl.formatMessage({ id: 'distributor.issue.branding.restrict' })}
-                  </span>
-                  <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
-                    {intl.formatMessage({ id: 'distributor.issue.branding.hint' })}
-                  </span>
-                </span>
-              </div>
-              {restrictBranding && (
-                <div className="grid grid-cols-1 gap-1.5 border-t border-surface-border pt-2 sm:grid-cols-2">
-                  {BRANDING_FIELDS.map(({ field, labelId }) => (
-                    <label
-                      key={field}
-                      className="flex items-center gap-2 text-sm text-muted-foreground"
-                    >
-                      <Checkbox
-                        checked={brandingFields.includes(field)}
-                        onCheckedChange={() => toggleField(field)}
-                      />
-                      {intl.formatMessage({ id: labelId })}
-                    </label>
-                  ))}
-                </div>
-              )}
-            </div>
 
             <DialogFooter>
               <Button variant="outline" onClick={onClose}>

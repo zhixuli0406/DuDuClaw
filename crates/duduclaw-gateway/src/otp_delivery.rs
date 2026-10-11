@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::channel_sender::{ChannelTarget, create_sender};
+use crate::channel_sender::ChannelTarget;
 use crate::config_crypto::channel_dm_token_candidates;
 
 /// Sends an already-composed OTP message to a channel DM. Fail-closed: a
@@ -81,7 +81,7 @@ impl OtpDeliverer for ConfigOtpDeliverer {
                 token,
                 extra_id: None,
             };
-            match create_sender(&target, self.http.clone())
+            match crate::channel_sender::create_sender_for_home(&self.home_dir, &target, self.http.clone())
                 .send_text(text)
                 .await
             {

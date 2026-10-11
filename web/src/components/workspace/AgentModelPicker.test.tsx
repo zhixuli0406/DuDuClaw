@@ -1,3 +1,4 @@
+import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -34,3 +35,6 @@ describe('AgentModelPicker', () => {
     expect(onChange).toHaveBeenCalledWith('nova');
   });
 });
+
+// This suite exercises the standard installation catalog.
+beforeEach(setStandardProductPolicyFixture);

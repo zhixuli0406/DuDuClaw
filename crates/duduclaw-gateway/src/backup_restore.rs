@@ -574,6 +574,23 @@ pub fn perform_pending_restore_swap(
         return Err(RestoreSwapError::StagingMissingOrEmpty);
     }
 
+    // A dashboard restore must not replace the installation-owned product policy.
+    // Validate before markers or data movement, leaving both trees intact on refusal.
+    let current_config = home_dir.join("config.toml");
+    let read_config = |path: &Path| -> Result<String, RestoreSwapError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(RestoreSwapError::Io(error.to_string())),
+        }
+    };
+    crate::product_policy::validate_write(
+        home_dir,
+        &current_config,
+        &read_config(&current_config)?,
+        &read_config(&restore_root.join("config.toml"))?,
+    ).map_err(RestoreSwapError::Io)?;
+
     // LINE inbox (F2/F5): events restored from an archive may already have
     // been handled on the device the archive came from. This one-shot marker
     // makes the inbox hold them for an operator instead of running them
@@ -985,6 +1002,30 @@ mod tests {
     // ── perform_pending_restore_swap ────────────────────────────
 
     #[test]
+    fn restore_cannot_remove_or_replace_installation_profile() {
+        for restored in ["", "[product]\nprofile='standard'\n"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let original = "[product]\nprofile='restricted'\n";
+            std::fs::write(home.join("config.toml"), original).unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            if !restored.is_empty() {
+                std::fs::write(staging.join("config.toml"), restored).unwrap();
+            }
+            std::fs::write(staging.join("customer-data.txt"), "preserve me").unwrap();
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "isolated-test.tar.gz".into(),
+            }).unwrap();
+            let result = perform_pending_restore_swap(home, "profile-test");
+            assert!(matches!(result, Err(RestoreSwapError::Io(ref error)) if error.contains("installation-owned")));
+            assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), original);
+            assert!(staging.join("customer-data.txt").exists());
+            assert!(!home.join("restore-backup-profile-test").exists());
+        }
+    }
+
+    #[test]
     fn no_marker_is_a_cheap_noop() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -1026,7 +1067,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         // Old (current) data.
-        std::fs::write(home.join("config.toml"), b"old-config").unwrap();
+        std::fs::write(home.join("config.toml"), b"# old-config\n").unwrap();
         std::fs::create_dir_all(home.join("agents/kiki")).unwrap();
         std::fs::write(home.join("agents/kiki/SOUL.md"), b"old-soul").unwrap();
 
@@ -1035,7 +1076,7 @@ mod tests {
         let staging = staging_dir(home);
         let nested = staging.join(home.file_name().unwrap());
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("config.toml"), b"new-config").unwrap();
+        std::fs::write(nested.join("config.toml"), b"# new-config\n").unwrap();
         std::fs::create_dir_all(nested.join("agents/miki")).unwrap();
         std::fs::write(nested.join("agents/miki/SOUL.md"), b"new-soul").unwrap();
 
@@ -1059,7 +1100,7 @@ mod tests {
         // New data is now live.
         assert_eq!(
             std::fs::read(home.join("config.toml")).unwrap(),
-            b"new-config"
+            b"# new-config\n"
         );
         assert_eq!(
             std::fs::read(home.join("agents/miki/SOUL.md")).unwrap(),
@@ -1070,7 +1111,7 @@ mod tests {
         let preserved = home.join("restore-backup-20260101T000000Z");
         assert_eq!(
             std::fs::read(preserved.join("config.toml")).unwrap(),
-            b"old-config"
+            b"# old-config\n"
         );
         assert_eq!(
             std::fs::read(preserved.join("agents/kiki/SOUL.md")).unwrap(),
@@ -1090,13 +1131,13 @@ mod tests {
     fn swap_stops_before_moving_anything_when_the_inbox_marker_cannot_be_written() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        std::fs::write(home.join("config.toml"), b"old-config").unwrap();
+        std::fs::write(home.join("config.toml"), b"# old-config\n").unwrap();
         // A directory where the marker file should go makes the write fail.
         std::fs::create_dir_all(home.join(crate::channel_ingress::RESTORE_MARKER)).unwrap();
         let staging = staging_dir(home);
         let nested = staging.join(home.file_name().unwrap());
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("config.toml"), b"new-config").unwrap();
+        std::fs::write(nested.join("config.toml"), b"# new-config\n").unwrap();
         write_marker(
             home,
             &RestoreMarker {
@@ -1107,7 +1148,7 @@ mod tests {
         .unwrap();
         let err = perform_pending_restore_swap(home, "20260101T000000Z").unwrap_err();
         assert!(matches!(err, RestoreSwapError::Io(ref m) if m.contains("restore marker")));
-        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"old-config");
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"# old-config\n");
         assert!(!home.join("restore-backup-20260101T000000Z").exists());
         assert!(read_marker(home).is_some(), "pending restore kept for the next boot");
         assert!(nested.join("config.toml").exists());
@@ -1117,11 +1158,11 @@ mod tests {
     fn swap_falls_back_to_the_staging_root_when_not_nested() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        std::fs::write(home.join("config.toml"), b"old").unwrap();
+        std::fs::write(home.join("config.toml"), b"# old\n").unwrap();
 
         let staging = staging_dir(home);
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("config.toml"), b"new").unwrap();
+        std::fs::write(staging.join("config.toml"), b"# new\n").unwrap();
 
         write_marker(
             home,
@@ -1132,17 +1173,17 @@ mod tests {
         )
         .unwrap();
         perform_pending_restore_swap(home, "ts1").unwrap();
-        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"new");
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"# new\n");
     }
 
     #[test]
     fn a_second_boot_with_no_new_marker_is_a_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        std::fs::write(home.join("config.toml"), b"old").unwrap();
+        std::fs::write(home.join("config.toml"), b"# old\n").unwrap();
         let staging = staging_dir(home);
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("config.toml"), b"new").unwrap();
+        std::fs::write(staging.join("config.toml"), b"# new\n").unwrap();
         write_marker(
             home,
             &RestoreMarker {

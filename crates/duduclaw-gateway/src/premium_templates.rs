@@ -758,7 +758,7 @@ fn agent_name_field(agent_toml: &str) -> Option<String> {
 /// Locate the shipped eval suite for a premium role.
 ///
 /// Two layouts are accepted, first match wins:
-/// 1. `<premium_dir>/evals/<role>/` — the shipped/white-label bundle layout
+/// 1. `<premium_dir>/evals/<role>/` — the shipped distributor bundle layout
 ///    (the packaging step places `evals/` inside the premium tree);
 /// 2. `<premium_dir>/../evals/<role>/` — the dev checkout, where
 ///    `commercial/templates-premium/` and `commercial/evals/` (the authoring

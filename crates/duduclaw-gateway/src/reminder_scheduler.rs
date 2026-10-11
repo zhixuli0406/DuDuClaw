@@ -244,7 +244,7 @@ pub async fn send_channel_message(
     text: &str,
 ) -> Result<(), String> {
     let target = resolve_channel_target(home_dir, channel, chat_id).await?;
-    crate::channel_sender::create_sender(&target, http.clone())
+    crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
         .send_text(text)
         .await
         .map_err(|e| e.to_string())

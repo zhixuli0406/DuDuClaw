@@ -11,6 +11,9 @@ impl MethodHandler {
     /// step so we can flag detected vs. not-installed backends. Viewer-level:
     /// returns only presence booleans + subscription tier, never any secret.
     pub(crate) async fn handle_runtime_detect(&self) -> WsFrame {
+        let policy = match crate::product_policy::load(&self.home_dir) {
+            Ok(p) => p, Err(e) => return WsFrame::error_response("", &e),
+        };
         // `which_runtime_in_home` expects the OS USER home (`~`) — its
         // candidates are `~/.bun/bin`, `~/.nvm/...`, etc. Passing
         // `self.home_dir` (`~/.duduclaw`) here made every HOME-rooted install
@@ -26,7 +29,8 @@ impl MethodHandler {
         let mut flags = serde_json::Map::new();
         let mut rows: Vec<Value> = Vec::new();
         let mut claude_bin: Option<String> = None;
-        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+        for spec in duduclaw_core::runtime_catalog::cli_specs_for_profile(policy) {
+            if policy.require_runtime(spec.id).is_err() { continue; }
             let found = duduclaw_core::detect_runtime(spec.id, &user_home);
             if spec.id == "claude" {
                 claude_bin = found.clone();
@@ -78,6 +82,9 @@ impl MethodHandler {
             .get("provider")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, provider) {
+            return WsFrame::error_response("", &e);
+        }
         let Some(spec) = crate::runtime_install::spec_for(provider) else {
             // Fail closed: unknown / malformed provider resolves to nothing.
             // The accepted list comes from the catalog, so it cannot go stale.
@@ -125,7 +132,14 @@ impl MethodHandler {
     ) -> WsFrame {
         // Cloud models: deduped across providers, each tagged provider/source/
         // fetched_at.
+        let policy = match crate::product_policy::load(&self.home_dir) {
+            Ok(p) => p, Err(e) => return WsFrame::error_response("", &e),
+        };
         let mut models = crate::runtime_models::merged_models(cache);
+        models.retain(|model| {
+            let provider = model.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+            policy.require_runtime(provider).is_ok() && policy.require_provider(provider).is_ok()
+        });
 
         // Local models: scan ~/.duduclaw/models/ for GGUF files
         let models_dir = self.home_dir.join("models");

@@ -1,3 +1,4 @@
+import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -208,3 +209,6 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
     expect(screen.queryByRole('button', { name: /sign in now/i })).not.toBeInTheDocument();
   });
 });
+
+// This suite exercises the standard installation catalog.
+beforeEach(setStandardProductPolicyFixture);

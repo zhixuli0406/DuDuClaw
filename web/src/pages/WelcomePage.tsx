@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useState, useEffect, useCallback, useRef, type ComponentType } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -238,6 +239,7 @@ function DetectBadge({ ok, intl }: { ok: boolean | undefined; intl: ReturnType<t
 // ---------------------------------------------------------------------------
 
 export function WelcomePage() {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const navigate = useNavigate();
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
@@ -869,7 +871,7 @@ export function WelcomePage() {
                     {intl.formatMessage({ id: 'welcome.backend.otherCli.pick' })}
                   </p>
                   <div className="flex flex-wrap gap-2">
-                    {OTHER_CLIS.map((cli) => {
+                    {OTHER_CLIS.filter(cli => policy.allows('runtimes', cli)).map((cli) => {
                       const installed = detect
                         ? cli === 'codex'
                           ? detect.codex

@@ -1,3 +1,4 @@
+import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -51,3 +52,6 @@ describe('<VoiceTab>', () => {
     expect(screen.queryByText('Language')).toBeNull();
   });
 });
+
+// This suite exercises the standard installation catalog.
+beforeEach(setStandardProductPolicyFixture);

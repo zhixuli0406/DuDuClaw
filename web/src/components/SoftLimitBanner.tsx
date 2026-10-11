@@ -5,7 +5,6 @@ import { api } from '@/lib/api';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { softLimitStatus } from '@/lib/soft-limits';
-import { useCommercialContact } from '@/lib/commercial-contact';
 
 /**
  * Non-blocking banner shown when a personal cloud tenant reaches its plan's
@@ -15,7 +14,6 @@ import { useCommercialContact } from '@/lib/commercial-contact';
  */
 export function SoftLimitBanner() {
   const intl = useIntl();
-  const contact = useCommercialContact();
   const status = useSystemStore((s) => s.status);
   const agents = useAgentsStore((s) => s.agents);
   const [tier, setTier] = useState<string | undefined>();
@@ -62,17 +60,6 @@ export function SoftLimitBanner() {
             }
           )}
         </p>
-        <p className="mt-0.5 text-warning/90">
-          {intl.formatMessage({ id: 'softLimit.body' }, { distributor: contact.name })}
-        </p>
-        <a
-          href={contact.url}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-1.5 inline-block font-medium text-warning underline underline-offset-2 hover:text-warning/80"
-        >
-          {intl.formatMessage({ id: 'softLimit.upgrade' })}
-        </a>
       </div>
       <button
         onClick={() => setDismissed(true)}

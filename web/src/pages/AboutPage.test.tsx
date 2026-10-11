@@ -2,13 +2,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 
-// Mock the API so about.get is deterministic. branding.ts only touches `api`
-// inside its (unused-here) fetch(), so a minimal shape is safe.
+// Keep technical attribution deterministic. Arbitrary extra brand fields must not render.
 const aboutGet = vi.fn();
 vi.mock('@/lib/api', () => ({
   api: {
     about: { get: (...a: unknown[]) => aboutGet(...a) },
-    branding: { get: vi.fn() },
   },
 }));
 
@@ -40,16 +38,18 @@ describe('<AboutPage>', () => {
     expect(screen.getByText(/DuDu Digital Technology Co\., Ltd\./)).toBeInTheDocument();
     // Version surfaced from the response.
     expect(screen.getByText('1.42.0')).toBeInTheDocument();
+    expect(screen.getByText('Distributor License')).toBeInTheDocument();
   });
 
-  it('renders the sanitized about_html block when present', async () => {
+  it('ignores arbitrary branding and About HTML while retaining technical attribution', async () => {
     aboutGet.mockResolvedValue({
       vendor: {
         name_zh: '嘟嘟數位科技有限公司',
         name_en: 'DuDu Digital Technology Co., Ltd.',
         url: 'https://duduclaw.dudustudio.monster',
       },
-      // Backend-sanitized HTML block (structured fields are ignored when set).
+      // Extra arbitrary fields are ignored, even if a response includes them.
+      product_name: 'Other Product',
       branding: {
         about_html: '<h2>Acme Robotics</h2><p>Your friendly automation partner.</p>',
         company_name: '此欄位被 HTML 覆蓋',
@@ -62,10 +62,14 @@ describe('<AboutPage>', () => {
 
     renderWithProviders(<AboutPage />);
 
-    // HTML block content renders…
-    expect(await screen.findByText('Acme Robotics')).toBeInTheDocument();
-    expect(screen.getByText('Your friendly automation partner.')).toBeInTheDocument();
-    // …and the structured company field is suppressed in favor of the HTML.
+    // Ignore arbitrary extra brand content in a response.
+    expect(await screen.findByText('1.42.0')).toBeInTheDocument();
+    expect(screen.queryByText('Acme Robotics')).not.toBeInTheDocument();
+    expect(screen.getByText('DuDuClaw')).toBeInTheDocument();
+    expect(screen.queryByText('Other Product')).not.toBeInTheDocument();
+    expect(screen.queryByText('Your friendly automation partner.')).not.toBeInTheDocument();
+    expect(screen.getByRole('link')).toHaveAttribute('href', 'https://duduclaw.dudustudio.monster');
+    // Structured custom branding must not render either.
     expect(screen.queryByText('此欄位被 HTML 覆蓋')).not.toBeInTheDocument();
     // The fixed vendor block is still always present.
     expect(screen.getByText('嘟嘟數位科技有限公司')).toBeInTheDocument();
@@ -78,7 +82,7 @@ describe('<AboutPage>', () => {
 
     // The front-end VENDOR_FALLBACK guarantees attribution even with no RPC.
     expect(await screen.findByText('嘟嘟數位科技有限公司')).toBeInTheDocument();
-    // Default product name when no white-label branding is set.
+    // Product identity remains fixed.
     expect(screen.getByText('DuDuClaw')).toBeInTheDocument();
   });
 });

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { ChevronDown, Check } from 'lucide-react';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
+import { useEffectiveName, useEffectiveLogo } from '@/lib/product-identity';
 import { cn } from '@/lib/utils';
 
 /**

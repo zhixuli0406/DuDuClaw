@@ -1,3 +1,4 @@
+import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -98,6 +99,7 @@ export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
   const inner = (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
+        <DataExportButton dataset="wiki" agentId={selectedAgent} scope="agent" />
         <Segmented
           value={view}
           onValueChange={setView}
