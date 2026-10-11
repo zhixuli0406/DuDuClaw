@@ -5,12 +5,35 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Superseded revisions do not need to finish their full suite. Separate event
+# groups keep a manual run from cancelling PR or post-merge verification.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep debug assertions and the complete test suite, but omit debug symbols
+  # from CI builds to reduce compilation, linking, binary size and cache cost.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  settle:
+    name: Await latest revision
+    runs-on: ubuntu-latest
+    steps:
+      - name: Allow consecutive PR pushes to settle
+        if: github.event_name == 'pull_request'
+        run: sleep 60
+
   rust:
+    needs: settle
+    # A failed settle job must still run every required check; only workflow
+    # cancellation should prevent these jobs from starting.
+    if: ${{ !cancelled() }}
     name: Rust ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -49,9 +72,9 @@ jobs:
           mkdir -p crates/duduclaw-dashboard/dist
           printf '<!doctype html><title>ci-stub</title>' > crates/duduclaw-dashboard/dist/index.html
       - name: Build core crates (no dashboard)
-        run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+        run: cargo build --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Build gateway (no dashboard)
-        run: cargo build -p duduclaw-gateway --no-default-features
+        run: cargo build --locked -p duduclaw-gateway --no-default-features
       # H7: `otel.rs` (883 LOC) sits behind a default-off cargo feature that no
       # build in this repo had ever turned on, so its `gen_ai.*` span code could
       # rot unnoticed. One cheap `cargo check` keeps it compiling. Deliberately
@@ -71,7 +94,7 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --locked -p duduclaw-gateway --no-default-features --features discord-voice --lib discord_voice
       - name: Check gateway with OpenTelemetry feature
-        run: cargo check -p duduclaw-gateway --no-default-features --features otel
+        run: cargo check --locked -p duduclaw-gateway --no-default-features --features otel
       # S16 (2026-09-29): the `duduclaw compat` family is OS-only — DuDuClaw
       # OS's shell spawns `duduclaw compat windows-vm app`, no platform install
       # does — so it moved behind the default-off `app-compat` feature and NO
@@ -81,42 +104,46 @@ jobs:
       # would otherwise never run anywhere but an OS bake.
       - name: Test cli with app-compat feature (OS-only surface)
         run: |
-          cargo test -p duduclaw-core --lib --features app-compat -- compat_runners
-          cargo test -p duduclaw-cli --lib --features app-compat -- compat
+          cargo test --locked -p duduclaw-core --lib --features app-compat -- compat_runners
+          cargo test --locked -p duduclaw-cli --lib --features app-compat -- compat
       - name: Test (no dashboard)
-        run: cargo test --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+        run: cargo test --locked --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       # The reviewable-workflow end-to-end tests drive a real stdio CLI and
       # pause it at test checkpoints; they run in their own step below.
       - name: Test gateway
-        run: cargo test --no-fail-fast -p duduclaw-gateway --no-default-features -- --skip three_page_pilot_ --skip security_race_tests --skip resume_tests --skip f1b_e2e_tests --skip f5a_e2e_tests
+        run: cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features -- --skip three_page_pilot_ --skip security_race_tests --skip resume_tests --skip f1b_e2e_tests --skip f5a_e2e_tests
       - name: Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --no-fail-fast -p duduclaw-cli --test workflow_stdio --features workflow-test-checkpoints
+        run: cargo test --locked --no-fail-fast -p duduclaw-cli --test workflow_stdio --features workflow-test-checkpoints
       - name: Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI
         if: matrix.os == 'ubuntu-latest'
         env:
           DUDUCLAW_P1_PILOT_EVIDENCE_DIR: ${{ runner.temp }}/pilot-evidence
         run: |
-          cargo build -p duduclaw-cli
+          cargo build --locked -p duduclaw-cli
           mkdir -p "$DUDUCLAW_P1_PILOT_EVIDENCE_DIR"
           export DUDUCLAW_P1_PILOT_BINARY="$GITHUB_WORKSPACE/target/debug/duduclaw"
-          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features three_page_pilot_ -- --test-threads=1
-          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::security_race_tests -- --test-threads=1
-          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::resume_tests -- --test-threads=1
-          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::f1b_e2e_tests -- --test-threads=1
-          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::f5a_e2e_tests -- --test-threads=1
+          cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib three_page_pilot_ -- --test-threads=1
+          cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::security_race_tests -- --test-threads=1
+          cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::resume_tests -- --test-threads=1
+          cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::f1b_e2e_tests -- --test-threads=1
+          cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::f5a_e2e_tests -- --test-threads=1
       # Clippy is advisory for now: `-D warnings` was never enforced (CI never
       # went green before, so the step never ran), leaving accumulated pre-existing
       # lints across the workspace. Kept running for visibility via continue-on-error
       # so it does not block CI. TODO: dedicated clippy cleanup, then drop these flags.
       - name: Clippy (no dashboard)
         continue-on-error: true
-        run: cargo clippy --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway -- -D warnings
+        run: cargo clippy --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway -- -D warnings
       - name: Clippy gateway
         continue-on-error: true
-        run: cargo clippy -p duduclaw-gateway --no-default-features -- -D warnings
+        run: cargo clippy --locked -p duduclaw-gateway --no-default-features -- -D warnings
 
   dashboard:
+    needs: settle
+    # A failed settle job must still run every required check; only workflow
+    # cancellation should prevent these jobs from starting.
+    if: ${{ !cancelled() }}
     name: Dashboard
     runs-on: ubuntu-latest
     steps:
@@ -148,9 +175,13 @@ jobs:
       - name: Build frontend
         run: cd web && npm run build
       - name: Build dashboard crate
-        run: cargo build -p duduclaw-dashboard -p duduclaw-gateway --features duduclaw-gateway/dashboard -p duduclaw-cli --features duduclaw-cli/dashboard
+        run: cargo build --locked -p duduclaw-dashboard -p duduclaw-gateway --features duduclaw-gateway/dashboard -p duduclaw-cli --features duduclaw-cli/dashboard
 
   python:
+    needs: settle
+    # A failed settle job must still run every required check; only workflow
+    # cancellation should prevent these jobs from starting.
+    if: ${{ !cancelled() }}
     name: Python
     runs-on: ubuntu-latest
     steps:
@@ -171,12 +202,18 @@ jobs:
           else
             echo "No Python tests found, skipping"
           fi
+      - name: Test CI coverage contract
+        run: python3 -m unittest discover -s scripts/tests -p test_ci_workflow.py -v
       - name: Test distributor release tooling
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_*distributor*.py' -v
           bash -n scripts/release.sh
 
   security:
+    needs: settle
+    # A failed settle job must still run every required check; only workflow
+    # cancellation should prevent these jobs from starting.
+    if: ${{ !cancelled() }}
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
