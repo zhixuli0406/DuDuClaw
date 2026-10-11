@@ -9,6 +9,7 @@ authors = ["DuDuClaw Contributors"]
 # Detached from the Rust workspace on purpose (see root Cargo.toml `exclude`):
 # the desktop shell carries heavy GUI deps and its own lockfile.
 [workspace]
+members = ["vendor/glib"]
 
 # Desktop-only: a plain binary crate (src/main.rs). No `[lib]` — the mobile-ready
 # staticlib/cdylib template needs a src/lib.rs we don't ship (iOS/Android are out
@@ -71,3 +72,8 @@ duduclaw-pets = { path = "../crates/duduclaw-pets", features = ["onnx"] }
 [features]
 # Bundle artifacts use this; keep parity with Tauri's default template.
 custom-protocol = ["tauri/custom-protocol"]
+
+# GTK3 requires glib 0.18. Backport the upstream mutability fix without changing
+# its version or disabling Linux desktop functionality (gtk-rs-core PR #1343).
+[patch.crates-io]
+glib = { path = "vendor/glib" }

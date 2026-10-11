@@ -80,7 +80,7 @@ aes = "0.8"
 base64 = { workspace = true }
 # White-label About-block HTML sanitization (branding.rs §10.2).
 ammonia = { workspace = true }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 ring = { workspace = true }
 futures-util = { workspace = true }
 tempfile = "3"

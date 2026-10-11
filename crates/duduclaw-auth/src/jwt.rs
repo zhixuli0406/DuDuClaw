@@ -274,6 +274,43 @@ mod tests {
     }
 
     #[test]
+    fn malformed_optional_nbf_rejected_when_validation_is_enabled() {
+        let config = JwtConfig::new(b"test-secret-at-least-32-bytes-long!!");
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": chrono::Utc::now().timestamp() + 3600,
+            "nbf": "99999999999"
+        });
+        let token = encode(&Header::default(), &claims, &config.encoding_key).unwrap();
+        let mut validation = JwtConfig::strict_validation();
+        validation.validate_nbf = true;
+        assert!(!validation.required_spec_claims.contains("nbf"));
+        assert!(decode::<serde_json::Value>(&token, &config.decoding_key, &validation).is_err());
+    }
+
+    #[test]
+    fn malformed_optional_exp_rejected_when_validation_is_enabled() {
+        let config = JwtConfig::new(b"test-secret-at-least-32-bytes-long!!");
+        let claims = serde_json::json!({ "sub": "user-123", "exp": "never" });
+        let token = encode(&Header::default(), &claims, &config.encoding_key).unwrap();
+        let mut validation = JwtConfig::strict_validation();
+        validation.required_spec_claims.remove("exp");
+        assert!(decode::<serde_json::Value>(&token, &config.decoding_key, &validation).is_err());
+    }
+
+    #[test]
+    fn missing_optional_nbf_still_accepted_when_validation_is_enabled() {
+        let config = JwtConfig::new(b"test-secret-at-least-32-bytes-long!!");
+        let claims = serde_json::json!({
+            "sub": "user-123", "exp": chrono::Utc::now().timestamp() + 3600
+        });
+        let token = encode(&Header::default(), &claims, &config.encoding_key).unwrap();
+        let mut validation = JwtConfig::strict_validation();
+        validation.validate_nbf = true;
+        assert!(decode::<serde_json::Value>(&token, &config.decoding_key, &validation).is_ok());
+    }
+
+    #[test]
     fn wrong_secret_rejected() {
         let config1 = JwtConfig::new(b"secret-one-at-least-32-bytes-long!!");
         let config2 = JwtConfig::new(b"secret-two-at-least-32-bytes-long!!");
