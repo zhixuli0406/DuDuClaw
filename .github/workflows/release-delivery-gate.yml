@@ -1,0 +1,42 @@
+name: Release delivery gate
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+    outputs:
+      commit:
+        value: ${{ jobs.validate.outputs.commit }}
+        description: Exact commit validated for publishing
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.verify.outputs.commit }}
+    steps:
+      - name: Validate tag syntax
+        env:
+          DELIVERY_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$DELIVERY_TAG" =~ ^(desktop-)?v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify signed delivery assertion and released source
+        id: verify
+        env:
+          DELIVERY_TAG: ${{ inputs.tag }}
+          RELEASE_DELIVERY_PUBLIC_KEY_PEM: ${{ vars.RELEASE_DELIVERY_PUBLIC_KEY_PEM }}
+        run: |
+          VERSION="${DELIVERY_TAG#desktop-}"
+          VERSION="${VERSION#v}"
+          python3 scripts/release_delivery.py --version "$VERSION" --release-ref "$DELIVERY_TAG" --require-main
+          echo "commit=$(git --no-replace-objects rev-parse HEAD)" >> "$GITHUB_OUTPUT"

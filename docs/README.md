@@ -6,6 +6,9 @@
 
 ## Feature Highlights
 
+Release maintainers: [Release documentation and website synchronization](guides/release-delivery-sync.md)
+describes the mandatory two-manual / three-website delivery gate.
+
 Detailed introductions to DuDuClaw's standout features, with metaphors and flow diagrams for developers.
 
 | Document | Description |

@@ -32,7 +32,8 @@
 # Steps (bump mode):
 #   1. Validate working tree is clean
 #   2. Pre-flight audit: print every platform's current version + flag drift
-#   3. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs / installers / desktop)
+#   3. Require signed delivery review of both manuals and all three websites
+#   4. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs / installers / desktop)
 #   4. POST-BUMP ASSERT: every platform manifest now reads the new version, else abort
 #   5. Update CHANGELOG.md
 #   6. cargo check
@@ -432,8 +433,29 @@ if $DRY_RUN; then
     echo "[DRY RUN] Distributor output: commercial/marketing/distributor/duduclaw-technology-brief-v$NEW_VERSION.html"
     echo "[DRY RUN] After tag push, CI release.yml publishes GitHub + npm + PyPI."
     echo "[DRY RUN] Confirm with: $0 verify $NEW_VERSION"
+    echo "[DRY RUN] Requires signed two-manual / three-website delivery assertion before any mutation."
     exit 0
 fi
+
+# --- Mandatory delivery review (before any source mutation) ---
+# Only the neutral, signed assertion enters this public repository. The actual
+# manuals, feature impact decisions and acceptance evidence stay private.
+DELIVERY_ASSERTION="${RELEASE_DELIVERY_ASSERTION:-}"
+DELIVERY_SIGNATURE="${RELEASE_DELIVERY_SIGNATURE:-}"
+RELEASE_BRANCH="$(git branch --show-current)"
+if [[ -z "$RELEASE_BRANCH" || "$RELEASE_BRANCH" == "main" || "$RELEASE_BRANCH" == "master" ]]; then
+    echo "Error: create a release branch from latest origin/main; release commits must go through a pull request."
+    exit 1
+fi
+if [[ -z "${RELEASE_DELIVERY_PUBLIC_KEY_PEM:-}" ]]; then
+    RELEASE_DELIVERY_PUBLIC_KEY_PEM="$(gh variable get RELEASE_DELIVERY_PUBLIC_KEY_PEM --repo zhixuli0406/DuDuClaw)"
+    export RELEASE_DELIVERY_PUBLIC_KEY_PEM
+fi
+python3 "$(dirname "$0")/release_delivery.py" --version "$NEW_VERSION" \
+    --assertion "$DELIVERY_ASSERTION" --signature "$DELIVERY_SIGNATURE" --install
+# Snapshot exact bytes that were verified; the pre-tag validator verifies them
+# again after commit, so changes to external inputs cannot reach a tag.
+DELIVERY_DIR="distribution/release-delivery"
 
 # --- Bump every platform manifest (rewrites ANY semver, so drift is corrected) ---
 echo "Bumping all platform manifests to $NEW_VERSION..."
@@ -721,8 +743,18 @@ while IFS='|' read -r _kind file; do
 done < <(platform_manifests)
 [[ -f Cargo.lock ]] && STAGE_FILES+=("Cargo.lock")
 STAGE_FILES+=("CHANGELOG.md")
+STAGE_FILES+=("$DELIVERY_DIR/v$NEW_VERSION.json" "$DELIVERY_DIR/v$NEW_VERSION.sig")
 git add -- "${STAGE_FILES[@]}"
 git commit -m "chore: bump v$NEW_VERSION"
+# Validate the actual committed bytes and exact version-only parent before
+# creating any tag. A temporary local ref is removed even on validation failure.
+git tag "v$NEW_VERSION"
+if ! python3 "$(dirname "$0")/release_delivery.py" --version "$NEW_VERSION" --release-ref "v$NEW_VERSION"; then
+    git tag -d "v$NEW_VERSION" >/dev/null
+    echo "Error: final delivery gate failed; release commit remains for inspection, no publishable tag remains."
+    exit 1
+fi
+git tag -d "v$NEW_VERSION" >/dev/null
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 # Desktop tag rides the same bump commit: pushing it triggers
 # .github/workflows/desktop-release.yml (Tauri build, sign/notarize, publish —
