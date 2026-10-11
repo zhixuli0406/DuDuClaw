@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.72.2] - 2026-10-11 — 安全更新與資料匯出
+
+### Added
+- 儀表板新增 CSV／XLSX 資料匯出：任務、對話紀錄、使用量與成本、記憶及 Wiki。匯出工作支援查詢狀態、取消與下載，依呼叫者的角色、員工及任務可見範圍篩選；檔案保留時間、資料量及並行工作均有上限。
+- 安裝政策由建置來源提供，標準安裝與受限制的安裝設定分開判定；設定檔或環境變數不能放寬編譯時的政策，未配置或格式不符時拒絕使用受限制設定。一般公開安裝保持標準設定。
+
 ### Changed
 - CI 對同一 PR 與 main 取消過期執行，PR 等待 60 秒再啟動全套檢查；保留三平台、功能組合、整合測試、E2E 與安全稽核，並支援手動全套執行。CI 關閉 dev/test 除錯符號、E2E 只啟動實際含案例的 gateway library，降低編譯與無效啟動成本；既有必需檢查與 Windows advisory 狀態不變。
 - Release preparation and all four publishing workflows now require a signed,
@@ -10,6 +16,9 @@
 
 ### Fixed
 - MCP Events 的 gap 補抓測試改為等待事件入庫、補抓 cursor 清除及稽核紀錄都完成，修復 Windows CI 提早檢查造成的偶發失敗。補抓完成後若無法寫回訂閱資料，稽核結果改記 `store_unavailable`，保留 gap cursor 供後續掃描重試；新增寫入失敗與恢復後重試的回歸測試。
+
+### Security
+- 修補 GitHub Dependabot 指出的 Rust、JavaScript 與桌面依賴問題；無上游可用版本的修補保留 vendored 來源、差異及回歸驗證。公開儲存庫的安裝與發布依賴鎖檔一併更新。
 
 ## [1.72.1] - 2026-10-10 — 電腦操作 VNC 不再聽 TCP，Glama MCP 改綁所有介面
 
