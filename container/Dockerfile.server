@@ -89,7 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # backoff, a shebang check, and a loud failure message replace the pipe.
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
-      if curl -fsSL --retry 3 -o /tmp/agy-install.sh https://antigravity.google/cli/install.sh \
+      if curl -fsSL --compressed --retry 3 -o /tmp/agy-install.sh https://antigravity.google/cli/install.sh \
          && head -c 2 /tmp/agy-install.sh | grep -q '^#!'; then break; fi; \
       echo "antigravity install script fetch/validation failed (attempt $attempt/5)" >&2; \
       if [ "$attempt" = 5 ]; then echo "ERROR: https://antigravity.google/cli/install.sh did not return a shell script" >&2; head -c 300 /tmp/agy-install.sh >&2 || true; exit 1; fi; \
@@ -117,7 +117,7 @@ RUN set -eu; \
 # installer endpoint must not be able to fail a five-hour image build silently).
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
-      if curl -fsSL --retry 3 -o /tmp/grok-install.sh https://x.ai/cli/install.sh \
+      if curl -fsSL --compressed --retry 3 -o /tmp/grok-install.sh https://x.ai/cli/install.sh \
          && head -c 2 /tmp/grok-install.sh | grep -q '^#!'; then break; fi; \
       echo "grok install script fetch/validation failed (attempt $attempt/5)" >&2; \
       if [ "$attempt" = 5 ]; then echo "ERROR: https://x.ai/cli/install.sh did not return a shell script" >&2; head -c 300 /tmp/grok-install.sh >&2 || true; exit 1; fi; \
