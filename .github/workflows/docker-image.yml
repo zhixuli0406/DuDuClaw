@@ -65,6 +65,54 @@ jobs:
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
 
+      - name: Select pinned workflow build recipe
+        id: recipe
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.delivery-gate.outputs.commit }}
+          RECIPE_COMMIT: ${{ github.sha }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$RECIPE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$(git --no-replace-objects rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || exit 1
+          # Repair a build recipe through a reviewed workflow commit while
+          # keeping the program source at the signed, immutable release tag.
+          git --no-replace-objects fetch --no-tags --depth=1 origin "$RECIPE_COMMIT"
+          recipe_file=$(mktemp "${RUNNER_TEMP}/duduclaw-server-recipe.XXXXXX")
+          git --no-replace-objects show "$RECIPE_COMMIT:container/Dockerfile.server" > "$recipe_file"
+          recipe_sha=$(sha256sum "$recipe_file" | cut -d ' ' -f 1)
+          [[ "$(git --no-replace-objects rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || exit 1
+          git diff --exit-code --quiet
+          git diff --cached --exit-code --quiet
+          printf 'Released program source: %s\nBuild recipe commit: %s\nBuild recipe SHA-256: %s\n' "$SOURCE_COMMIT" "$RECIPE_COMMIT" "$recipe_sha"
+          printf 'file=%s\ncommit=%s\nsha256=%s\n' "$recipe_file" "$RECIPE_COMMIT" "$recipe_sha" >> "$GITHUB_OUTPUT"
+          RECIPE_SHA256="$recipe_sha" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          receipt = {
+              "scope": "released_source_and_build_recipe_inputs",
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "recipe_commit": os.environ["RECIPE_COMMIT"],
+              "recipe_path": "container/Dockerfile.server",
+              "recipe_sha256": os.environ["RECIPE_SHA256"],
+              "platform": os.environ["BUILD_PLATFORM"],
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / ("docker-build-recipe-" + os.environ["BUILD_ARCH"] + ".json")
+          with path.open("x") as file:
+              file.write(json.dumps(receipt, indent=2) + "\n")
+          PY
+
+      - name: Upload build recipe receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-build-recipe-${{ matrix.arch }}
+          path: ${{ runner.temp }}/docker-build-recipe-${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -82,7 +130,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: container/Dockerfile.server
+          file: ${{ steps.recipe.outputs.file }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.delivery-gate.outputs.commit }}
+            org.duduclaw.build-recipe-revision=${{ steps.recipe.outputs.commit }}
+            org.duduclaw.build-recipe-sha256=${{ steps.recipe.outputs.sha256 }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}

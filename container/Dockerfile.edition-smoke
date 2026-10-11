@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 # duduclaw-memory/-cli use include_str! against templates/wiki/* and docs/README.md
 COPY templates/ templates/
 COPY docs/README.md docs/README.md
