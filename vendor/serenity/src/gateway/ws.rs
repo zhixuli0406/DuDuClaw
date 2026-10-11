@@ -138,7 +138,7 @@ impl WsClient {
                     why
                 })?
             },
-            Message::Text(payload) => from_str(&payload).map_err(|why| {
+            Message::Text(payload) => from_str(payload.as_str()).map_err(|why| {
                 warn!("Err deserializing text: {why:?}; text: {payload}");
 
                 why

@@ -13,7 +13,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 PROVENANCE_SHA256 = {
     "glib": "de7a59cce6352ea2913ae5c1be1306909b592b019c5cbf911a78c8790dd66ed4",
-    "serenity": "47b2f10c0cfc2133a8665d94b95c2c72225a21f3961c36160a65cbb837c10549",
+    "serenity": "3c1726725fd45dc5cdb389ff93b535b14a5df69cd573977936d0aa25d5fbeb13",
 }
 PACKAGES = {
     "glib": (ROOT / "src-tauri/vendor/glib", "0.18.5", "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5"),

@@ -43,6 +43,10 @@
       [
         "        let config = WebSocketConfig {\n            max_message_size: None,\n            max_frame_size: None,\n            ..Default::default()\n        };",
         "        let config = WebSocketConfig::default().max_message_size(None).max_frame_size(None);"
+      ],
+      [
+        "Message::Text(payload) => from_str(&payload)",
+        "Message::Text(payload) => from_str(payload.as_str())"
       ]
     ],
     "src/gateway/bridge/shard_runner.rs": [
