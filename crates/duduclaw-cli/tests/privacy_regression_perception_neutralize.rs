@@ -39,8 +39,8 @@
 //! call the dispatcher makes on a hit. That is real production code, just
 //! orchestrated without the final host side effect.
 //!
-//! Design doc: `commercial/docs/TODO-os-native-agent.md` P3-5;
-//! `commercial/docs/research-os-native-agent-methodology.md` §5.3
+//! Design doc: `commercial/docs/plans/TODO-os-native-agent.md` P3-5;
+//! `commercial/docs/research/research-os-native-agent-methodology.md` §5.3
 //! (indirect prompt injection — "檔名本身也是攻擊面").
 //!
 //! Run: `cargo test -p duduclaw-cli --test privacy_regression_perception_neutralize`

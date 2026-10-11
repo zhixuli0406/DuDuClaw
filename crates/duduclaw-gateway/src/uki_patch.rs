@@ -2,7 +2,7 @@
 //!
 //! ## Why this exists at all
 //!
-//! The A/B design (`commercial/docs/DESIGN-ab-update-rollback-2026-08.md`
+//! The A/B design (`commercial/docs/specs/DESIGN-ab-update-rollback-2026-08.md`
 //! §4.2/§4.3, option A) requires that a kernel and the root partition it
 //! mounts retire *together*: sd-boot's boot counting can only retire an ESP
 //! entry, and a kernel whose modules live on the other slot's root is a
@@ -55,7 +55,7 @@
 //!
 //! ## T4 status update (2026-09-02) — rewrite is now the fallback, not the norm
 //!
-//! `commercial/docs/DESIGN-os-trust-chain-2026-09.md`'s 2026-09-02 修正案
+//! `commercial/docs/specs/DESIGN-os-trust-chain-2026-09.md`'s 2026-09-02 修正案
 //! entry: once Secure Boot signs the whole UKI as one Authenticode PE, the
 //! [`rewrite_root_partuuid`] byte-patch described above corrupts that
 //! signature — a SB-enforcing firmware refuses to load the patched image.
@@ -216,7 +216,7 @@ pub fn root_partuuid(cmdline: &str) -> Result<String, String> {
 }
 
 /// The dm-verity root-hash token on a kernel command line (VER-V wave —
-/// `commercial/docs/DESIGN-os-trust-chain-2026-09.md` §3.2 P1's cmdline
+/// `commercial/docs/specs/DESIGN-os-trust-chain-2026-09.md` §3.2 P1's cmdline
 /// shape, once a build line bakes it in per the 2026-09-02 依賴鏈補記
 /// entry). Per `systemd-veritysetup-generator(8)`, this is the SHA-256 root
 /// hash of the dm-verity hash tree: 64 lowercase hex characters, fixed

@@ -173,7 +173,7 @@ impl DispatchEngine {
             _ => (crate::fault_attribution::FaultSide::Model, "model"),
         };
 
-        // WP-P2 (commercial/docs/DESIGN-lwm-calibration-2026-08-10.md §4):
+        // WP-P2 (commercial/docs/specs/DESIGN-lwm-calibration-2026-08-10.md §4):
         // loaded fresh here — same convention as `rule_induction_enabled`
         // below — rather than threaded through `TaskForwardModel`'s
         // constructor, since this is the one place both the settle-time

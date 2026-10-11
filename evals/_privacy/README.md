@@ -1,6 +1,6 @@
 # Privacy regression suite (P3-5)
 
-`commercial/docs/TODO-os-native-agent.md` P3-5: "隱私回歸案例納入 duduclaw eval（更新
+`commercial/docs/plans/TODO-os-native-agent.md` P3-5: "隱私回歸案例納入 duduclaw eval（更新
 不得回退隱私性質）". This directory is the **index** for that regression suite —
 "an update must not silently regress an OS-native privacy/security property".
 

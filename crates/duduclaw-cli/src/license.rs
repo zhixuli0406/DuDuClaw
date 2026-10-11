@@ -17,7 +17,7 @@
 //! - `activate` accepts the license either as a base64-encoded blob, a
 //!   raw JSON string, or a path to a JSON file. We auto-detect.
 //! - Phone-home is intentionally a stub until the control-plane crate
-//!   lands (see commercial/docs/spec-license-module.md §6).
+//!   lands (see commercial/docs/specs/spec-license-module.md §6).
 
 use std::fs;
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ pub enum LicenseCommands {
     /// and reset the grace-period timer.
     ///
     /// Currently a stub — control-plane lands in Phase 2 of the M1 plan
-    /// (see commercial/docs/spec-license-module.md §6).
+    /// (see commercial/docs/specs/spec-license-module.md §6).
     Refresh,
 
     /// Print the current license to stdout for transfer to another machine.

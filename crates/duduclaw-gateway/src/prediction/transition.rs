@@ -1,6 +1,6 @@
 //! WP-B1/B2/B3 — episodic transition material: schema, write, read.
 //!
-//! See `commercial/docs/design-task-forward-model-2026-08-06.md` §6.2/§6.3.
+//! See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §6.2/§6.3.
 //! T6 (design §11) settled on option (a): `task_prediction_log` is the
 //! single source of truth for transition data; episodic memory holds only a
 //! pointer-sized (≤200 char) indicator row. This module writes and reads
@@ -85,7 +85,7 @@ pub struct TransitionOutcome {
     /// CJK-safe, ≤ [`FEEDBACK_DIGEST_CHAR_CAP`] chars.
     pub feedback_digest: Option<String>,
     pub composite_error: Option<f64>,
-    /// WP-P2 (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §4):
+    /// WP-P2 (`commercial/docs/specs/DESIGN-lwm-calibration-2026-08-10.md` §4):
     /// `error.prediction.confidence` at settle time, only populated when
     /// `[task_forward_model] calibration_enabled = true`. `#[serde(default)]`
     /// so a transition row written before this field existed still

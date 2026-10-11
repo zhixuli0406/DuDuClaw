@@ -1,5 +1,5 @@
 //! Network settings (Wi-Fi) — D4a. See
-//! `commercial/docs/DESIGN-network-settings-2026-08.md` for the full
+//! `commercial/docs/specs/DESIGN-network-settings-2026-08.md` for the full
 //! selection rationale (iwd + systemd-networkd), permission topology
 //! (gateway joins the `netdev` group and speaks iwd D-Bus directly — no
 //! sysd verb, see design §3), and the API contract (§5) this module

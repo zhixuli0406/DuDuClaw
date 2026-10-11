@@ -3,7 +3,7 @@
 //! O16: every verb is a thin adapter over [`duduclaw_gateway::os_ops`], the
 //! single authority the agent-facing MCP tools and the dashboard
 //! `device.*`/`network.*` RPCs also go through. No write verbs here on
-//! purpose (see `commercial/docs/DESIGN-os-self-drive-2026-08.md` §2 —
+//! purpose (see `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §2 —
 //! `wifi_connect`/`wired_config` stay behind the dashboard RPC and
 //! `mcp_os_ops.rs`'s more heavily-gated surface).
 

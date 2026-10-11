@@ -55,7 +55,7 @@ use crate::task_store::{TaskIterationRow, TaskRow};
 // placeholder — see the earlier revision of this comment for why (the
 // source data lived in `dispatch_engine.rs`, off-limits to the work
 // package that first built this module). **WP-A9**
-// (`commercial/docs/design-task-forward-model-2026-08-06.md` §4.2) wires
+// (`commercial/docs/specs/design-task-forward-model-2026-08-06.md` §4.2) wires
 // it: `dispatch_engine.rs`'s acceptance review now appends this round's
 // zero-LLM deterministic pass signals — the WP2.4 `outcome_spec` check and
 // the B3 grounding pre-check's `Grounded` conclusion — into

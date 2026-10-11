@@ -1,6 +1,6 @@
 //! Team composer — the gateway half of Team-as-Agent (P1/WP-4).
 //!
-//! Design: `commercial/docs/DESIGN-team-as-agent-2026-09.md` §3.1–§3.6, §3.8–§3.10.
+//! Design: `commercial/docs/specs/DESIGN-team-as-agent-2026-09.md` §3.1–§3.6, §3.8–§3.10.
 //!
 //! Three things live here:
 //!

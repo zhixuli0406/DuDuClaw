@@ -1,5 +1,5 @@
 //! WP-A9 integration test (design
-//! `commercial/docs/design-task-forward-model-2026-08-06.md` §9, WP-A10's
+//! `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §9, WP-A10's
 //! first half): drives the goal-loop dispatch (predict hook) and the
 //! dispatch-engine review (settle hook) together — mirroring exactly how
 //! `server.rs` / `handlers.rs` wire the SAME `Arc<TaskForwardModel>` into

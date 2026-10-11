@@ -1,6 +1,6 @@
 //! P0/P1 — channel-side goal intent router.
 //!
-//! Design: `commercial/docs/DESIGN-goal-intent-router-2026-08.md`. Problem:
+//! Design: `commercial/docs/specs/DESIGN-goal-intent-router-2026-08.md`. Problem:
 //! `/goal` (and dashboard `tasks.goal_create`) are the only way to start an
 //! autonomous goal loop — a user typing "整理這批客戶資料成月報並寄出" into
 //! Telegram gets an ordinary chat reply and never learns the feature exists.

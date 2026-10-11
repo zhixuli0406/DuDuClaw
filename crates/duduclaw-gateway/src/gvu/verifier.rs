@@ -18,7 +18,7 @@
 //! - [`verify_wiki_proposals`] — wiki-proposal path validation, used by the
 //!   skill-extraction and MCP wiki writers, not by evolution at all
 //!
-//! Earlier history: `commercial/docs/DESIGN-evolution-v3-aee.md` §2.1 audited
+//! Earlier history: `commercial/docs/specs/DESIGN-evolution-v3-aee.md` §2.1 audited
 //! the original eight layers and found two of them (L2's 0.5 Jaccard
 //! similarity, L3's 0.7 judge score) held a one-vote veto over quality
 //! heuristics with no empirical backing — root cause R6 — and that L4 and

@@ -1,7 +1,7 @@
 //! WP-A4 — task-layer prediction-diff → rule induce/update/prune pipeline
 //! (WALL-E arXiv:2410.07484 + WorldEvolver arXiv:2606.30639).
 //!
-//! See `commercial/docs/design-task-forward-model-2026-08-06.md` §6.5. That
+//! See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §6.5. That
 //! section's T8/T9 open questions (does A4 flow through `playbook::Add`,
 //! and which "book" settles task-layer rule credit) are resolved by
 //! explicit product decision, NOT by picking one of the doc's own listed

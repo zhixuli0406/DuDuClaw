@@ -1,4 +1,4 @@
-//! WP-G1 (`commercial/docs/DESIGN-llm-contract-goal-loop-2026-10.md` §2):
+//! WP-G1 (`commercial/docs/specs/DESIGN-llm-contract-goal-loop-2026-10.md` §2):
 //! judge replies under the strict JSON contract, shadow first.
 //!
 //! The goal loop has three places that turn an LLM (or external command)

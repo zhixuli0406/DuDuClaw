@@ -24,7 +24,7 @@ pub async fn build_reply_for_agent(
 /// inside a fresh [`crate::runtime::NATIVE_TOOL_COLLECTOR`] scope and pair its
 /// raw text with any read-only `os_*` result artifact captured during the
 /// turn (`os_operator::extract_readonly_result_artifact`) — OR, per T1
-/// (`commercial/docs/DESIGN-agent-body-network-2026-08.md` §5.2/§12), a
+/// (`commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §5.2/§12), a
 /// `wifi_password_request` artifact when the turn's LATEST `os_wifi_connect`
 /// call failed with `wrong_password`
 /// (`os_operator::extract_wifi_password_request_artifact`). The password

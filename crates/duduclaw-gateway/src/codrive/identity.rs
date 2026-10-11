@@ -8,7 +8,7 @@
 //! independent of a live MCP round trip. `handle_codrive_run` calls
 //! [`resolve_run_identity`] instead of duplicating this logic.
 //!
-//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`
 //! §9's CD-1 carry-forward note ("agent 參數身分語意...現＝覆寫整個呼叫
 //! 身分含 capability 再檢＋approval 歸屬，保守解讀防權限逃逸").
 

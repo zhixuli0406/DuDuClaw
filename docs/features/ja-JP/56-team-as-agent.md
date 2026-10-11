@@ -546,6 +546,6 @@ runtime が使用量を報告しなかった場合、使用量のフィールド
 
 ## 参考資料
 
-- 設計: `commercial/docs/DESIGN-team-as-agent-2026-09.md`（§1、§3.1–§3.6、§3.8–§3.11）
+- 設計: `commercial/docs/specs/DESIGN-team-as-agent-2026-09.md`（§1、§3.1–§3.6、§3.8–§3.11）
 - パケットのリファレンス: [spec/task-packet.md](../../spec/task-packet.md)
 - 関連: [13-multi-runtime.md](13-multi-runtime.md)、[goal-loop ガイド](../../guides/ja-JP/goal-loop.md)

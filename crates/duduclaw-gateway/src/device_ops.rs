@@ -354,7 +354,7 @@ impl SysdDeviceOps {
         .await
     }
 
-    /// Maintenance-mode Entry A (`commercial/docs/DESIGN-maintenance-mode-2026-08.md`
+    /// Maintenance-mode Entry A (`commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md`
     /// §2.6): `systemctl start ssh.service`. Not part of the `DeviceOps`
     /// trait — same reasoning as `set_hostname` above: this is a verb
     /// specific to the `maintenance.*` RPC surface (see `maintenance.rs`),

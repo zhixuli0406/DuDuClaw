@@ -15,7 +15,7 @@
 //!     in `~/.gemini/antigravity-cli/settings.json`, opted into explicitly via
 //!     `config.toml [antigravity] auth = "api_key"` (agy 1.1.13+; there is no
 //!     `ANTIGRAVITY_API_KEY` — the variable this runtime used to forward never
-//!     existed, see `commercial/docs/REPORT-antigravity-runtime-auth-2026-10.md`)
+//!     existed, see `commercial/docs/reports/REPORT-antigravity-runtime-auth-2026-10.md`)
 //!   - MCP config in `<workspace>/.agents/mcp_config.json` (agy ignores
 //!     `mcpServers` in any `settings.json`); identity rides the spawn env
 //!

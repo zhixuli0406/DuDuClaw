@@ -3222,7 +3222,7 @@ struct ClaudeResponse {
     usage: Option<crate::cost_telemetry::TokenUsage>,
 }
 
-/// WP-A4 (design commercial/docs/design-task-forward-model-2026-08-06.md
+/// WP-A4 (design commercial/docs/specs/design-task-forward-model-2026-08-06.md
 /// §5.3/§9): pure per-event ingestion for the native-tool collector,
 /// extracted out of `call_claude_streaming`'s stream loop so it can be
 /// exercised with fixture stream-json lines without spawning a real `claude`
@@ -3393,7 +3393,7 @@ async fn call_claude_streaming(
     let mut last_tool_reported: Option<String> = None;
 
     // WP-A4: runtime-neutral native-tool collector (design
-    // commercial/docs/design-task-forward-model-2026-08-06.md §5.3/§9). This
+    // commercial/docs/specs/design-task-forward-model-2026-08-06.md §5.3/§9). This
     // is the dispatcher-side stream-json loop (goal loop dispatch), distinct
     // from `channel_reply`'s own parser — design §1 "更正一之一" confirmed
     // this path had zero native-tool capture before WP-A4. Pairing mirrors

@@ -1,7 +1,7 @@
 //! The MCP-facing co-drive script schema (`codrive_run`'s `script` param)
 //! and its structural validation/sanitization.
 //!
-//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`.
+//! Design authority: `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`.
 //! The shape here is exactly the JSON schema given in the CD-1 work
 //! package: `target_app` / `task_summary` / `steps[]`, each step an
 //! optional `highlight`, an `action` (tagged union), and an optional

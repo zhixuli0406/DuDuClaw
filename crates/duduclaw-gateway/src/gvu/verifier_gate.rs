@@ -1,5 +1,5 @@
 //! WP2.4 — the **Gate** half of the Gate/Measure split
-//! (`commercial/docs/DESIGN-evolution-v3-aee.md` §2.2).
+//! (`commercial/docs/specs/DESIGN-evolution-v3-aee.md` §2.2).
 //!
 //! A Gate is deterministic, costs zero LLM tokens, and **keeps its veto**.
 //! Everything that is actually a *quality judgement* (LLM judge, similarity

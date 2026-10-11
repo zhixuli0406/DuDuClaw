@@ -139,7 +139,7 @@ pub(super) fn build_system_prompt(
 ) -> String {
     // #11 (2026-05-12) — Minimal mode: short-circuit to the lean assembler.
     // Agents opt in via `agent.toml [prompt] mode = "minimal"`. See
-    // commercial/docs/TODO-runtime-health-fixes-202605.md #11.
+    // commercial/docs/plans/TODO-runtime-health-fixes-202605.md #11.
     if let Some(a) = agent {
         if a.config.prompt.mode == duduclaw_core::types::PromptMode::Minimal {
             return crate::prompt_minimal::build_minimal_system_prompt(

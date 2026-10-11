@@ -5,7 +5,7 @@
 //! in the row's `metadata` JSON blob under the [`PLAYBOOK_KEY`] key, beside
 //! (never replacing) the existing `rule_stats` key already maintained by
 //! `crate::prediction::rule_lifecycle`. See
-//! `commercial/docs/DESIGN-evolution-v3-aee.md` §1.2 for the full spec this
+//! `commercial/docs/specs/DESIGN-evolution-v3-aee.md` §1.2 for the full spec this
 //! module implements.
 //!
 //! `helpful`/`harmful` deliberately stay in `RuleStats` / the `rule_stats`

@@ -11,7 +11,7 @@
 //! don't need to live in fast memory; the flag belongs to whatever local
 //! OpenAI-compatible server the user runs, not to this crate).
 //!
-//! Design doc: commercial/docs/DESIGN-local-model-marketplace-2026-08-13.md
+//! Design doc: commercial/docs/specs/DESIGN-local-model-marketplace-2026-08-13.md
 //! (HF API surface live-verified 2026-08-13). Fail-open everywhere: HF
 //! unreachable ⇒ cached results or empty list, never an error page.
 

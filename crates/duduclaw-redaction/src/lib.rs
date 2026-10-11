@@ -5,7 +5,7 @@
 //! restoration at trusted boundaries (user channel reply, whitelisted tool
 //! egress).
 //!
-//! See [`commercial/docs/RFC-23-redaction-pipeline.md`] for the full design.
+//! See [`commercial/docs/specs/RFC-23-redaction-pipeline.md`] for the full design.
 //!
 //! ## High-level flow
 //!

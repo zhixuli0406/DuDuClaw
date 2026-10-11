@@ -1,5 +1,5 @@
 //! Personal-edition passwordless local session (WP-F1, design doc
-//! `commercial/docs/ux-redesign-2026-08/09-edition-split-features.md` §2,
+//! `commercial/design/reviews/ux-redesign-2026-08/09-edition-split-features.md` §2,
 //! decision D3 = plan A "loopback 自動發 session").
 //!
 //! A single-owner (Personal) install running on its default `127.0.0.1` bind

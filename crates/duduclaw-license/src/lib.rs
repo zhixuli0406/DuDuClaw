@@ -22,7 +22,7 @@
 //! - makes the customer-facing CLI (`duduclaw license activate / status / refresh / …`)
 //!   work without any closed-source dependency
 //!
-//! See `commercial/docs/spec-license-module.md` for the full design rationale.
+//! See `commercial/docs/specs/spec-license-module.md` for the full design rationale.
 
 pub mod crl;
 pub mod error;

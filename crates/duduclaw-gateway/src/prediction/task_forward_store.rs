@@ -1,6 +1,6 @@
 //! WP-A7 — statistical buckets + `TaskForwardModel` storage.
 //!
-//! See `commercial/docs/design-task-forward-model-2026-08-06.md` §2.4, §5.
+//! See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §2.4, §5.
 //! Split out of `task_forward.rs` (WP-A2/A8: schema + diff algorithm) purely
 //! to keep both files under the project's ~800-line convention — this
 //! module depends on `task_forward`'s types, `task_forward` has zero
@@ -81,7 +81,7 @@ pub struct TaskForwardModelConfig {
     /// prediction/observation/diff machinery running while suppressing rule
     /// writes and injection entirely.
     pub rule_induction: bool,
-    /// WP-P2 (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §4
+    /// WP-P2 (`commercial/docs/specs/DESIGN-lwm-calibration-2026-08-10.md` §4
     /// platform section): gates the calibrated-forward-model scoring path
     /// — proper-scoring (`prediction::calibration::brier_binary`) of every
     /// settled `TaskPrediction.confidence` against whether the round turned
@@ -96,7 +96,7 @@ pub struct TaskForwardModelConfig {
     /// byte-identical to the pre-calibration behavior).
     pub calibration_enabled: bool,
     /// WP-P3 + v1.54 shadow→promotion pass
-    /// (`commercial/docs/DESIGN-lwm-calibration-2026-08-10.md` §1.4, §6):
+    /// (`commercial/docs/specs/DESIGN-lwm-calibration-2026-08-10.md` §1.4, §6):
     /// gates the held-out rule gate — the anti-overfitting adoption authority
     /// that turns self-learning into "reflection PROPOSES a candidate, an
     /// external numeric oracle DECIDES adoption". **Defaults `true`

@@ -1,5 +1,5 @@
 //! Read-only SQL data sources for DuDuClaw (WP-D,
-//! `commercial/docs/DESIGN-redaction-field-rules-2026-09.md` §13.7).
+//! `commercial/docs/specs/DESIGN-redaction-field-rules-2026-09.md` §13.7).
 //!
 //! DuDuClaw's redaction pipeline only sees what passes through its own MCP
 //! choke point. A customer who keeps their business data in PostgreSQL / MySQL

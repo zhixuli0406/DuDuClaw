@@ -1,5 +1,5 @@
 //! A7a — the `requires_approval` gate. See
-//! `commercial/docs/DESIGN-os-self-drive-2026-08.md` §5 for the full
+//! `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §5 for the full
 //! semantics; short version: an operator terminal (no `DUDUCLAW_AGENT_ID` in
 //! the environment) runs a `requires_approval` command directly, an
 //! agent-identity caller must clear `ApprovalBroker` first — the exact same

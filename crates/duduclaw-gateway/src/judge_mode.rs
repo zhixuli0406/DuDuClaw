@@ -2,7 +2,7 @@
 //!
 //! ## Why this module exists
 //!
-//! `commercial/docs/DESIGN-everything-is-a-plugin-2026-08.md` §2 row 8 graded
+//! `commercial/docs/specs/DESIGN-everything-is-a-plugin-2026-08.md` §2 row 8 graded
 //! [`AcceptanceJudge`](crate::dispatch_engine::AcceptanceJudge) **T — a fake
 //! seam**: a `pub trait` with exactly ONE production implementation
 //! (`LlmAcceptanceJudge`), one hardcoded injection point
@@ -1086,7 +1086,7 @@ impl ExternalAcceptanceJudge {
         // 目前的設計取捨" — operators who want isolation are told to wrap
         // `judge_command` in a script that clears its own env). Applying
         // the allowlist here would silently break that documented contract
-        // outside this WP's mandate (`commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+        // outside this WP's mandate (`commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md`
         // §3 P3 names the agent-CLI spawn paths only, not this one).
         // Deliberately left untouched — flagged in the WP-8B report as a
         // same-family follow-up that needs its own decision + doc update,

@@ -9,7 +9,7 @@
 //! `~/.duduclaw/imported/<platform>/raw/` so no data is lost even when v1 does
 //! not parse it into `sessions.db`.
 //!
-//! Design spec: `commercial/docs/TODO-migrate-from-2026-07-11.md` (L3).
+//! Design spec: `commercial/docs/plans/TODO-migrate-from-2026-07-11.md` (L3).
 
 mod apply;
 mod claude_code;

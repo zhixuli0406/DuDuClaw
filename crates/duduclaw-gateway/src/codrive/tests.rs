@@ -1,6 +1,6 @@
 //! Integration tests for the CD-1 co-drive driver against a fake comp
 //! socket server that speaks the exact wire protocol described in the WP
-//! brief (`commercial/docs/DESIGN-codrive-desktop-2026-08.md`). unix-only
+//! brief (`commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`). unix-only
 //! (see `mod.rs`'s `#[cfg(all(test, unix))]`) — `CodriveClient` itself is
 //! a no-op stub on non-unix targets.
 //!

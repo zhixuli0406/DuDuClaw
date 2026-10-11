@@ -1,6 +1,6 @@
 //! Claude Code plugin importer (`.claude-plugin/plugin.json`) — P0.
 //!
-//! Mapping (design `commercial/docs/design-expert-pack.md` §2.2):
+//! Mapping (design `commercial/docs/specs/design-expert-pack.md` §2.2):
 //!
 //! | Claude Code plugin            | DuDuClaw                                  |
 //! |-------------------------------|-------------------------------------------|

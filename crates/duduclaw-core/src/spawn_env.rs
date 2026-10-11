@@ -1,6 +1,6 @@
 //! Allowlisted environment for spawned agent-CLI subprocesses.
 //!
-//! WP-8B (credentials doctrine P3, `commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+//! WP-8B (credentials doctrine P3, `commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md`
 //! §1.6 / §3 P3): the primary agent-spawn paths (`claude_runner.rs`'s
 //! `prepare_claude_cmd`, `channel_reply.rs`'s `spawn_claude_cli_with_env` /
 //! `spawn_claude_cli_pty_with_env`, and the external-judge spawn in

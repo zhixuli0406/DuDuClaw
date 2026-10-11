@@ -49,7 +49,7 @@ pub mod telemetry;
 
 // ---------------------------------------------------------------------------
 // WP2.3 / WP2.4 / WP2.5 (2026-08-06) — AEE (Agentic Evolution Engine)
-// `commercial/docs/DESIGN-evolution-v3-aee.md` chapters 2 and 3.
+// `commercial/docs/specs/DESIGN-evolution-v3-aee.md` chapters 2 and 3.
 // ---------------------------------------------------------------------------
 
 /// WP2.3 §3 + WP2.5 — the agentic inner loop, strategy mix, prompt assembly
@@ -68,7 +68,7 @@ mod tests_gate;
 #[cfg(test)]
 mod tests_measure;
 
-// WP-6A / A2 (2026-08-15, `commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md`
+// WP-6A / A2 (2026-08-15, `commercial/docs/specs/DESIGN-evolution-harness-knobs-2026-08.md`
 // §7.2-A2) — read-only harness-knob telemetry snapshot, appended at the end
 // for the same reason as the WP0.x modules above (concurrent sibling edits).
 pub mod knob_snapshot;

@@ -388,7 +388,7 @@ impl OpenAiCompatRuntime {
             "OpenAiCompatRuntime: MCP tool loop"
         );
 
-        // WP-A5 (design commercial/docs/design-task-forward-model-2026-08-06.md
+        // WP-A5 (design commercial/docs/specs/design-task-forward-model-2026-08-06.md
         // §5.3/§9): use the provenance-tracking variant (policy `Off` by
         // default here, so behavior is otherwise byte-identical to
         // `run_tool_loop`) purely to get `ToolLoopOutcome.tool_calls` — the

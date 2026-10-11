@@ -1,7 +1,7 @@
 //! A7a `display` group — a thin client for comp's `shell_control` socket
 //! (DuDuClaw-OS repo, `crates/duduclaw-comp/src/shell_control/protocol.rs`;
 //! that crate moved out of this repo on 2026-09-29). See
-//! `commercial/docs/DESIGN-os-self-drive-2026-08.md` §3/§7/§8 for why this
+//! `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §3/§7/§8 for why this
 //! hand-rolls the wire JSON instead of depending on `duduclaw-comp` (a
 //! smithay/Wayland crate that would break the macOS dev build, and whose own
 //! module doc already frames this socket as "reuse only the pure JSON data,

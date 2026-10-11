@@ -12,7 +12,7 @@
 //! whether any of it was worth sending.
 //!
 //! The design follows the escalation ladder in
-//! `commercial/docs/ux-redesign-2026-08/02-ux-methodology.md` §主題 4 (P4-1),
+//! `commercial/design/reviews/ux-redesign-2026-08/02-ux-methodology.md` §主題 4 (P4-1),
 //! which is Google SRE's page/ticket/report triage rendered as four levels.
 //! [`NotifyLevel`] is that ladder as a type, stamped at every send site:
 //!

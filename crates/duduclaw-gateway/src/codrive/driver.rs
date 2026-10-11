@@ -7,7 +7,7 @@
 //! size convention). This file owns the report shape, the activity-feed
 //! ticker, and the top-level control flow.
 //!
-//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md`
 //! §3.4 (approval reuse), §6 (safety red lines), §8-3 (refuse-list).
 //!
 //! **CD-2 file-size note**: this file is already near this project's

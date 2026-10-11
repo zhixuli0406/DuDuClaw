@@ -2,7 +2,7 @@
 //! type covering what used to be three (really four) separate declarations of
 //! "a pre-configured set of AI employees".
 //!
-//! Design: `commercial/docs/DESIGN-pack-format-unification-2026-09.md`
+//! Design: `commercial/docs/specs/DESIGN-pack-format-unification-2026-09.md`
 //! (feature audit 2026-09-29, item **T5 / O2**).
 //!
 //! # The four legacy formats this reads

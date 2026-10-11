@@ -251,7 +251,7 @@ duduclaw dashboard → notify.stats RPC
 
 ## 関連
 
-- 設計根拠：`commercial/docs/ux-redesign-2026-08/02-ux-methodology.md` テーマ4（P4-1、P4-4、P4-5、P4-6）および`03-analogous-products.md` C1／C7／C8／C12
+- 設計根拠：`commercial/design/reviews/ux-redesign-2026-08/02-ux-methodology.md` テーマ4（P4-1、P4-4、P4-5、P4-6）および`03-analogous-products.md` C1／C7／C8／C12
 - コード：`crates/duduclaw-gateway/src/notify_governance.rs`、`notify_stats.rs`、`notify_digest.rs`
 - フロントエンド：`web/src/pages/agent-form/EditAgentPage.tsx`（自動化タブ）、`web/src/components/settings/sections/ProactiveTab.tsx`、`SystemTab.tsx`、`web/src/pages/ReportPage.tsx`
 - 関連機能：[34-goal-loop.md](34-goal-loop.md)（needs_human決定カード）、[23-autopilot-engine.md](23-autopilot-engine.md)（ルールのサーキットブレーカー通知）

@@ -1,5 +1,5 @@
 //! WP2.4 — the **Measure** half of the Gate/Measure split
-//! (`commercial/docs/DESIGN-evolution-v3-aee.md` §2.3 / §2.4).
+//! (`commercial/docs/specs/DESIGN-evolution-v3-aee.md` §2.3 / §2.4).
 //!
 //! A Measure dimension scores a candidate. **No dimension has a veto.** The
 //! only thing that can zero a whole vector is a CONTRACT `must_not` hit

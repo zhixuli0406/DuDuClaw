@@ -1,7 +1,7 @@
 //! `duduclaw compat` — CP-1/A3 operator CLI surface for the `compat.d`
 //! declarative app-compatibility runner registry
 //! (`duduclaw_core::compat_runners`). See
-//! `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §1 and the
+//! `commercial/docs/specs/DESIGN-app-compat-layer-2026-08.md` §1 and the
 //! DuDuClaw-OS repo's `docs/guides/app-compat.md` (moved there 2026-09-29;
 //! this module is OS-only and lives behind the `app-compat` cargo feature).
 //!

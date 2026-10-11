@@ -148,7 +148,7 @@ pub enum AutopilotEvent {
         then_event: String,
         fields: Value,
     },
-    /// OS security line P0 (C1, `commercial/docs/DESIGN-os-security-line-2026-09.md`
+    /// OS security line P0 (C1, `commercial/docs/specs/DESIGN-os-security-line-2026-09.md`
     /// §2 支柱三): a security-relevant signal — either mirrored from a
     /// gateway-side `duduclaw_security::audit` write (`source: "audit"`,
     /// via [`crate::security_autopilot::emit_security_autopilot_event`]) or

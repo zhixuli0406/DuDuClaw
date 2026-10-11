@@ -14,7 +14,7 @@ pub struct ToolLoopOutcome {
     /// Every taint hit / overflow event on a *sensitive* tool call, in
     /// dispatch order. Empty when the policy is `Off` or nothing flagged.
     pub provenance_flags: Vec<ProvenanceFlag>,
-    /// WP-A5 (design `commercial/docs/design-task-forward-model-2026-08-06.md`
+    /// WP-A5 (design `commercial/docs/specs/design-task-forward-model-2026-08-06.md`
     /// §5.3/§9), extended R1 (2026-08,
     /// `wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md`
     /// §6): every tool call dispatched across the whole loop, in dispatch

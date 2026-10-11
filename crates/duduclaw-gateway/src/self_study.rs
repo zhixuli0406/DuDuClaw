@@ -1,6 +1,6 @@
 //! Per-agent "自主研究" (self-study) — Belief Loop × Goal Contract gap 2.
 //!
-//! See `commercial/docs/DESIGN-market-belief-loop-2026-08.md` §3:
+//! See `commercial/docs/specs/DESIGN-market-belief-loop-2026-08.md` §3:
 //!
 //! ```text
 //! ┌─ 自主研究（做功課）───────────────────────────────────────

@@ -312,7 +312,7 @@ async fn live_bridge_real_human_freeze_and_resume() {
 }
 
 // ── WP-CD4c (2026-08-22): VM/QMP live acceptance for CD-4a (C-L2 registry)
-// + CD-4b (C-L3 AT-SPI2) — see commercial/docs/DESIGN-codrive-desktop-2026-08.md
+// + CD-4b (C-L3 AT-SPI2) — see commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md
 // §5 CD-4 row. Unlike the CD-1/CD-2 tests above, this round runs the whole
 // stack (this test binary + comp + the AT-SPI probe app) natively inside
 // the appliance VM's real Debian trixie guest, not bridged from the Mac

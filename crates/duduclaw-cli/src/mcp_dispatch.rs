@@ -103,7 +103,7 @@ pub(crate) const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
 
 /// The human-machine co-drive MCP tool face gated by the `[capabilities]
 /// codrive` master switch (CD-1,
-/// `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1).
+/// `commercial/docs/specs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1).
 /// Same deny-by-default shape as [`OS_NATIVE_TOOLS`] / [`RECORDING_TOOLS`]
 /// / [`SYSTEM_OPERATOR_TOOLS`] — both tools are already `Scope::Admin`
 /// (mcp_auth.rs), but scope alone is opt-out; this makes them opt-in per
@@ -614,7 +614,7 @@ impl McpDispatcher {
     /// fired (e.g. `"insufficient_scope"`, `"capability_grant_missing"`,
     /// `"denied_tools"`) — chosen to read consistently with the credential-
     /// resolution line's `describe().last_resolve.error_class` field
-    /// (commercial/docs/DESIGN-credentials-doctrine-2026-08.md §4.3's
+    /// (commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md §4.3's
     /// "failures must leave a trace with a consistent field name" note).
     ///
     /// Agent attribution mirrors `crate::mcp::handle_tools_call`'s own

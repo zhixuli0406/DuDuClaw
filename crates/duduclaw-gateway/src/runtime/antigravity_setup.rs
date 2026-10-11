@@ -6,7 +6,7 @@
 //! without touching the real `~/.gemini`.
 //!
 //! First-hand facts (agy 1.2.14, 2026-10-01 —
-//! `commercial/docs/REPORT-antigravity-runtime-auth-2026-10.md`):
+//! `commercial/docs/reports/REPORT-antigravity-runtime-auth-2026-10.md`):
 //!   - there is no `ANTIGRAVITY_API_KEY` (the binary does not contain the
 //!     string); the API-key route needs `GEMINI_API_KEY` in the environment
 //!     AND `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`;

@@ -1269,7 +1269,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // silence-event consumer and the dispatcher so both code paths fire GVU
     // through the same plumbing (loop / notebook / home dir). Constructed
     // before the silence consumer spawn — see #3.3 in
-    // commercial/docs/TODO-runtime-health-fixes-202605.md for context.
+    // commercial/docs/plans/TODO-runtime-health-fixes-202605.md for context.
     // WP0.8: `notebook` reuses the same Arc handed to `reply_ctx` above —
     // one notebook instance for the channel-reply write path and the
     // GVU-trigger read path.

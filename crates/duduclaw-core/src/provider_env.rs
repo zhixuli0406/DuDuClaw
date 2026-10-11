@@ -1,7 +1,7 @@
 //! Canonical provider → API-key environment-variable name table.
 //!
 //! Single source of truth for "which env var(s) hold provider X's API key".
-//! Before WP-8B (credentials doctrine P3, `commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+//! Before WP-8B (credentials doctrine P3, `commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md`
 //! §3 P3) this table was copy-pasted three times and had already started to
 //! drift in shape (identical values, three independent definitions):
 //!

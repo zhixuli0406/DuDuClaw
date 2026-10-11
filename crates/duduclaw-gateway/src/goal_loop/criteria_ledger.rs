@@ -9,7 +9,7 @@
 //! `<criteria_status>` reply tag, and gives the judge and the human the same
 //! ledger to look at.
 //!
-//! Design: `commercial/docs/DESIGN-llm-contract-goal-loop-2026-10.md` §2
+//! Design: `commercial/docs/specs/DESIGN-llm-contract-goal-loop-2026-10.md` §2
 //! "WP-G2" and its "實作前修訂" subsection (normative where they differ).
 //!
 //! Rules carried over from the `llm_contract` primitives:

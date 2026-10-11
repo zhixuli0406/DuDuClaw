@@ -1,6 +1,6 @@
 //! `duduclaw pack` — the single front door for every pre-configured bundle of
 //! AI employees (T5 / O2, design
-//! `commercial/docs/DESIGN-pack-format-unification-2026-09.md`).
+//! `commercial/docs/specs/DESIGN-pack-format-unification-2026-09.md`).
 //!
 //! Before this, "install a ready-made set of agents" had three verbs
 //! (`expert install`, `preset install-builtin`, dashboard one-click), three

@@ -1,6 +1,6 @@
 //! Single-source-of-truth channel × capability matrix.
 //!
-//! WP-9B (P2 of `commercial/docs/DESIGN-everything-is-a-plugin-2026-08.md`).
+//! WP-9B (P2 of `commercial/docs/specs/DESIGN-everything-is-a-plugin-2026-08.md`).
 //!
 //! Before this module, "does channel X support capability Y" was answered by
 //! a different scattered mechanism per capability:

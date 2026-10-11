@@ -1,7 +1,7 @@
 //! `duduclaw compat windows-vm` — CP-2/B3: self-packaged Windows VM +
 //! RemoteApp bootstrap CLI (design §2.3 路 B). See
-//! `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §2.3/§5 CP-2,
-//! `commercial/docs/TODO-compat-cp2-2026-08.md`'s B3 row, and the
+//! `commercial/docs/specs/DESIGN-app-compat-layer-2026-08.md` §2.3/§5 CP-2,
+//! `commercial/docs/plans/TODO-compat-cp2-2026-08.md`'s B3 row, and the
 //! DuDuClaw-OS repo's `docs/guides/app-compat.md` (moved there 2026-09-29
 //! together with the shell crates; this module is OS-only and lives behind
 //! the `app-compat` cargo feature).

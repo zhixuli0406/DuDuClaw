@@ -297,7 +297,7 @@ pub(super) async fn resolve_api_key(home_dir: &Path, table: &toml::Table) -> Str
 /// Standard environment-variable name(s) for a provider's API key.
 ///
 /// Thin delegate to `duduclaw_core::provider_env::provider_env_key_names`, the
-/// single source of truth for this table (WP-8B, `commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+/// single source of truth for this table (WP-8B, `commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md`
 /// §3 P3). `duduclaw-agent` already depends on `duduclaw-core` (see
 /// `Cargo.toml`), so there is no new dependency edge — this used to be a third
 /// hand-copied table that had already drifted in comments from the canonical

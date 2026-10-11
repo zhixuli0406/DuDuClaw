@@ -44,7 +44,7 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 ///
 /// # Source of truth
 ///
-/// `commercial/docs/ux-redesign-2026-08/09-edition-split-features.md` §1 — the
+/// `commercial/design/reviews/ux-redesign-2026-08/09-edition-split-features.md` §1 — the
 /// 89-unit inventory. Exactly the units marked ➖ (Personal-hidden) that have a
 /// dashboard RPC of their own are listed here. The dividing axis is **"needs a
 /// second natural person" / "sells to someone else's customers"**, never

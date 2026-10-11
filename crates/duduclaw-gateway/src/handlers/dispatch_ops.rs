@@ -423,7 +423,7 @@ impl MethodHandler {
             }
 
             // ── Maintenance Mode — Entry A ────────────────────
-            // `commercial/docs/DESIGN-maintenance-mode-2026-08.md` §2. Same
+            // `commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md` §2. Same
             // gate as the rest of the `device.*`/`network.*` appliance-only
             // family (Admin-only + appliance-only): the whole point of this
             // feature is to widen what an appliance's dashboard operator can

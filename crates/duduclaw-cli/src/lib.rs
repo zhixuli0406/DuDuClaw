@@ -1724,7 +1724,7 @@ enum OpsCommands {
 
     /// Manage AI 員工職務組合 (agent presets) — named, versioned configuration
     /// bundles an agent can reference (`~/.duduclaw/presets/`). See
-    /// `commercial/docs/DESIGN-agent-presets-2026-08.md`.
+    /// `commercial/docs/specs/DESIGN-agent-presets-2026-08.md`.
     Preset {
         #[command(subcommand)]
         command: PresetCommands,
@@ -2765,7 +2765,7 @@ enum OsCommands {
 
     /// A7a: self-drive display group — human pointer size/source + comp's
     /// own decoration theme, via comp's `shell_control` socket. See
-    /// `commercial/docs/DESIGN-os-self-drive-2026-08.md` §3/§7 for the
+    /// `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §3/§7 for the
     /// same-uid `SO_PEERCRED` boundary this hits when called by an
     /// agent-identity CLI subprocess on the appliance (comp/殼 run as
     /// `duduclaw-kiosk`, agents run as `duduclaw` — structurally two
@@ -2907,7 +2907,7 @@ enum OsNetworkCommands {
 /// declarative `clap` parser, not a hand-rolled arg scanner, so this class
 /// of bug is structurally different here — but the design doc's brief
 /// explicitly asks for a dedicated regression test pinning the guarantee
-/// (`commercial/docs/DESIGN-os-self-drive-2026-08.md` §6), so this exists to
+/// (`commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §6), so this exists to
 /// catch a FUTURE regression (e.g. someone adding a raw/external-subcommand
 /// arg sink to one of these enums) rather than a bug that exists today.
 #[cfg(test)]
@@ -3248,7 +3248,7 @@ enum CompatCommands {
 
 /// CP-2/B3 — `duduclaw compat windows-vm` subcommands. See
 /// `crates/duduclaw-cli/src/compat_windows_vm.rs` module docs and
-/// `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §2.3.
+/// `commercial/docs/specs/DESIGN-app-compat-layer-2026-08.md` §2.3.
 /// OS-only — behind the `app-compat` feature (S15, 2026-09-29).
 #[cfg(feature = "app-compat")]
 #[derive(Subcommand)]
@@ -3717,7 +3717,7 @@ enum EvolutionCommands {
     /// own exam is exactly the reward-hacking entry point WP-4E closed.
     /// `ChampionStore::clear_holdout_rotation` had zero call sites until this
     /// command — once raised, nothing ever cleared it. See
-    /// `commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md` §7.2-A3.
+    /// `commercial/docs/specs/DESIGN-evolution-harness-knobs-2026-08.md` §7.2-A3.
     ///
     /// Example:
     ///     duduclaw evolution clear-holdout-rotation --agent agnes --dry-run

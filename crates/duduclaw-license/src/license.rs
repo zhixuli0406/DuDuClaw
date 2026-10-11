@@ -1,6 +1,6 @@
 //! License data structure v2 (subscription-aware).
 //!
-//! See `commercial/docs/spec-license-module.md` for the design rationale.
+//! See `commercial/docs/specs/spec-license-module.md` for the design rationale.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};

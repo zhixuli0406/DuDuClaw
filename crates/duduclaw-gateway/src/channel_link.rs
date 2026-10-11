@@ -6,7 +6,7 @@
 //! channel pushes) in the opposite direction. Every URL builder below is a
 //! **pure function** — no I/O, no async — so each platform's capability
 //! ceiling can be pinned with a plain unit test. The 03b capability survey
-//! (`commercial/docs/ux-redesign-2026-08/03b-channel-embedded-gui-capabilities.md`)
+//! (`commercial/design/reviews/ux-redesign-2026-08/03b-channel-embedded-gui-capabilities.md`)
 //! is the source of truth for what is constructible at all; a platform not
 //! covered there by a documented "open this chat/message" mechanism gets no
 //! builder and [`conversation_link`] returns `None` for it — never a guess,

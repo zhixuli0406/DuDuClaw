@@ -226,7 +226,7 @@ impl MethodHandler {
     /// `security.credential_cleanup` (WP-K) — removes ONLY plaintext
     /// credential fields that already have a confirmed `_enc` twin (the
     /// residue pattern from the 2026-08-15 `[[accounts]] oauth_token`
-    /// incident — see `commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+    /// incident — see `commercial/docs/specs/DESIGN-credentials-doctrine-2026-08.md`
     /// §1.5 / §3 P1). Fields with no twin are left completely untouched by
     /// this pass — encrypting an unfamiliar field in place risks writing a
     /// corrupt `config.toml`; those are surfaced by

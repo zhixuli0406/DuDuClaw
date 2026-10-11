@@ -14,8 +14,8 @@
 //! transports use, so a regression here fails a build that never touched
 //! `mcp_dispatch.rs` at all.
 //!
-//! Design doc: `commercial/docs/TODO-os-native-agent.md` P3-5;
-//! `commercial/docs/research-os-native-agent-methodology.md` §5.1
+//! Design doc: `commercial/docs/plans/TODO-os-native-agent.md` P3-5;
+//! `commercial/docs/research/research-os-native-agent-methodology.md` §5.1
 //! ("Release Governance" control point — regression tests must catch a
 //! privacy property regressing across an update).
 //!

@@ -1,7 +1,7 @@
 //! WP-A2/A8 — task-layer forward model: schema + the deterministic diff
 //! algorithm.
 //!
-//! See `commercial/docs/design-task-forward-model-2026-08-06.md` §2, §3.
+//! See `commercial/docs/specs/design-task-forward-model-2026-08-06.md` §2, §3.
 //! This module is deliberately **parallel to, not shared with**,
 //! `prediction::engine::PredictionEngine` (design §4.3): the conversational
 //! `Prediction` predicts user reaction; `TaskPrediction` predicts what a

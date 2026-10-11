@@ -1,5 +1,5 @@
 //! A7a — machine-readable metadata table backing `duduclaw os commands
-//! --json`. See `commercial/docs/DESIGN-os-self-drive-2026-08.md` §4 for the
+//! --json`. See `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §4 for the
 //! schema rationale (why a plain `const` array, not an inventory/macro
 //! registry — 15 commands is small enough that a hand-written table is
 //! easier to review than macro infrastructure, and the lint tests below give

@@ -1,6 +1,6 @@
 //! Maintenance Mode — Entry A (dashboard software toggle + TTL).
 //!
-//! Authority: `commercial/docs/DESIGN-maintenance-mode-2026-08.md` §2. This
+//! Authority: `commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md` §2. This
 //! module implements exactly the Entry A scope of that design: a
 //! remote-reachable, Admin-only, TTL-bounded, fully-audited software switch
 //! that unlocks two sub-capabilities beyond the normal (Info-Enhanced) tier —

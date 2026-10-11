@@ -1,6 +1,6 @@
 //! AEE — the Agentic Evolution Engine (WP2.3 / WP2.5).
 //!
-//! `commercial/docs/DESIGN-evolution-v3-aee.md` chapter 3. AEE is what GVU
+//! `commercial/docs/specs/DESIGN-evolution-v3-aee.md` chapter 3. AEE is what GVU
 //! becomes once the evolution target moves off SOUL.md: the outer loop still
 //! belongs to [`crate::gvu::loop_::GvuLoop`], but a single generation is now
 //! an *agentic* step rather than one blind shot —
@@ -105,7 +105,7 @@ pub struct AeeRoundRecord {
     /// Degradation flags — an absent eval dimension must be visible in the
     /// audit trail, not inferred from a missing field.
     pub case_dimension_available: bool,
-    /// WP-6A / A2 (`commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md`
+    /// WP-6A / A2 (`commercial/docs/specs/DESIGN-evolution-harness-knobs-2026-08.md`
     /// §7.2-A2) — the harness-knob values in effect for this round. Purely
     /// observational (see [`crate::gvu::knob_snapshot`]): never read back by
     /// any decision in this loop, only carried into telemetry so a future

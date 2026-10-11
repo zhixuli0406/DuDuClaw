@@ -1,7 +1,7 @@
 //! `duduclaw export playbook` — gene JSON export CLI (D5=B).
 //!
 //! Thin CLI wrapper over `duduclaw_gateway::playbook::{list_active, to_gene}`
-//! (§1.4 of `commercial/docs/DESIGN-evolution-v3-aee.md`): lists every
+//! (§1.4 of `commercial/docs/specs/DESIGN-evolution-v3-aee.md`): lists every
 //! currently-valid playbook entry for one agent and serializes each as a
 //! GEP-gene-shaped JSON document (independent implementation of a JSON
 //! shape — see `gene.rs`'s own doc comment; no evolver code or hub client is

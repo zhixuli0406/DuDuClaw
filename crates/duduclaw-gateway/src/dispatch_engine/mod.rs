@@ -393,7 +393,7 @@ impl DispatchEngine {
             crate::maintenance::sweep_expired_maintenance_window(home).await;
         }
 
-        // 5) Y8-3 T1 (`commercial/docs/DESIGN-agent-body-update-2026-08.md`
+        // 5) Y8-3 T1 (`commercial/docs/specs/DESIGN-agent-body-update-2026-08.md`
         // §3.4/§13): agent-body update vertical slice's cross-restart result
         // reconciliation. Same "piggy-back on the existing tick, no new
         // timer" reasoning as steps 3/4 above — this is also the module that

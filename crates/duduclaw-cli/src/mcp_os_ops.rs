@@ -1,7 +1,7 @@
 //! O-0: agent-facing bridge for the dashboard-only `device.*` (WP-B) and
 //! `system.*` (check_update/apply_update/doctor/status) RPCs.
 //!
-//! Design authority: `commercial/docs/DESIGN-agent-os-native-apps-2026-08.md`
+//! Design authority: `commercial/docs/specs/DESIGN-agent-os-native-apps-2026-08.md`
 //! §6 (NL-OS) — §6.1 core principle, §6.3 O-0, §6.4 coupling/security. Core
 //! rule: **same capability, two front doors, same gate set**. Every tool
 //! here reuses the SAME admin / appliance / confirm / ApprovalBroker / sysd
@@ -165,7 +165,7 @@ pub(crate) async fn handle_os_network_info() -> Value {
 /// Agent-body vertical slice (Y2-3): this is the "eye" — a caller asks
 /// "what's my Wi-Fi doing right now" and gets link state / IP / captive-
 /// portal verdict in one call. See
-/// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §4.
+/// `commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §4.
 pub(crate) async fn handle_os_wifi_status() -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
@@ -201,7 +201,7 @@ pub(crate) async fn handle_os_wifi_scan(args: &Value) -> Value {
 /// `psk` parameter** — there is no code path in this function's signature
 /// that can accept, forward, log, or audit a plaintext Wi-Fi passphrase.
 /// This is deliberate, not an oversight (see
-/// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §5): a secret
+/// `commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §5): a secret
 /// typed into a chat turn becomes part of the LLM's context, the transcript,
 /// and potentially `tool_calls.jsonl` — none of which this platform treats
 /// as a secret store. Calling `network::wifi_connect(ssid, None)` reuses
@@ -569,11 +569,11 @@ async fn require_factory_reset_approval_via(
 /// `tool_gate` already classified `ApplyUpdate` as needing one — the router
 /// only gates the FIRST message of an NL-matched turn, not every tool call
 /// deeper in an autonomous/multi-step task (see
-/// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §6.2), so the
+/// `commercial/docs/specs/DESIGN-agent-body-network-2026-08.md` §6.2), so the
 /// actual enforcement has to live here.
 ///
 /// **Cross-restart result report handshake (Y8-3, T1 —
-/// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §3.4/§13)**: both
+/// `commercial/docs/specs/DESIGN-agent-body-update-2026-08.md` §3.4/§13)**: both
 /// success branches below call [`record_pending_update_report`] before
 /// returning. This is a deterministic, handler-side write — not a
 /// system-prompt instruction hoping the model remembers to call
@@ -810,7 +810,7 @@ pub(crate) async fn handle_os_update_rollback(args: &Value) -> Value {
 // kiosk socket path each call, which is exactly why it is reachable from
 // this out-of-process `mcp-server` subprocess at all (see that module's own
 // doc for the full "why this works cross-process" reasoning, and
-// `commercial/docs/DESIGN-os-self-drive-2026-08.md` for A7a's original
+// `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` for A7a's original
 // uid-boundary finding this closes). `is_appliance()` is still checked here
 // first, matching every other appliance-only tool's fast-fail shape — the
 // bridge itself does not redundantly re-check it (see its own doc).
