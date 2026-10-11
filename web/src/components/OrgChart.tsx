@@ -3,7 +3,7 @@ import * as d3 from 'd3';
 import type { AgentDetail } from '@/lib/api';
 import { characterFor } from '@/lib/character-gen';
 import { glyphText } from '@/lib/agent-glyph';
-import { useEffectiveName, useEffectiveLogoGlyph } from '@/lib/branding';
+import { useEffectiveName, useEffectiveLogoGlyph } from '@/lib/product-identity';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -140,7 +140,7 @@ const NODE_RX = 10;
 export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  // Synthetic-root name/glyph follow the active (white-label) brand.
+  // Use the fixed product identity for the synthetic root.
   const brandName = useEffectiveName();
   const brandGlyph = useEffectiveLogoGlyph();
 

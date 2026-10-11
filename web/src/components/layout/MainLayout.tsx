@@ -1,3 +1,4 @@
+import { ProductPolicyNotice } from '@/components/ProductPolicyNotice';
 import { Suspense, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { AppSidebar } from './AppSidebar';
@@ -25,7 +26,7 @@ import { useIntl } from 'react-intl';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { useTourStore } from '@/stores/tour-store';
 import { useSystemStore } from '@/stores/system-store';
-import { useBrandingStore, useEffectiveName } from '@/lib/branding';
+import { useEffectiveName } from '@/lib/product-identity';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useNavProgressStore } from '@/stores/nav-progress-store';
 import { useUpdateStore } from '@/stores/update-store';
@@ -151,6 +152,7 @@ function AppShell() {
 
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
           <div className="empty:hidden [&>*+*]:mt-2 [&:not(:empty)]:px-4 [&:not(:empty)]:pt-3 md:[&:not(:empty)]:px-6">
+            <ProductPolicyNotice />
             <SoftLimitBanner />
             <LicenseExpiryBanner />
             <UpdateBanner />
@@ -198,17 +200,8 @@ export function MainLayout() {
   const status = useSystemStore((s) => s.status);
   const fetchStatus = useSystemStore((s) => s.fetchStatus);
   const recordVisit = useCommandPaletteStore((s) => s.recordVisit);
-  const fetchBranding = useBrandingStore((s) => s.fetch);
 
-  // Router-level `document.title` sync (UX audit phase4-manage-settings /
-  // phase4-daily-work: `document.title` never changed with the route across all
-  // 16+38 audited pages — `lib/branding.ts` only ever sets one static
-  // "{brand} Dashboard" title, once, at branding-load time). Fixed once here
-  // instead of per-page: reuse the same `crumbsFor` lookup the breadcrumb header
-  // already relies on to resolve the current route's nav-model label, translate
-  // it, and compose "{頁名} · {brand}". Routes `crumbsFor` doesn't recognise
-  // (e.g. `/welcome`, which sits outside the nav model) fall back to the bare
-  // brand name rather than a stale/wrong page name.
+  // Keep the document title in sync with the current page and fixed product name.
   useEffect(() => {
     const trail = crumbsFor(location.pathname);
     const page = trail[trail.length - 1];
@@ -219,12 +212,6 @@ export function MainLayout() {
   useEffect(() => {
     hydrateTour();
   }, [hydrateTour]);
-
-  // Refresh the authoritative branding (white-label) now that we're past auth +
-  // WS handshake; the cache already primed the pre-auth surfaces (LoginPage).
-  useEffect(() => {
-    fetchBranding();
-  }, [fetchBranding]);
 
   // System status drives the edition badge + sidebar gating — fetch it
   // shell-wide so every page sees it.

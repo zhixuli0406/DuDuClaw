@@ -2009,35 +2009,6 @@ export interface BillingInvoice {
   pdf_url?: string;
 }
 
-// ── Partner Portal types ───────────────────────────────────
-
-export interface PartnerProfile {
-  company: string | null;
-  tier: string;
-  partner_id: string | null;
-  certified_at: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface PartnerStats {
-  total_sold: number;
-  active_customers: number;
-  this_month_commission_cents: number;
-  lifetime_commission_cents: number;
-}
-
-export interface PartnerCustomer {
-  id: string;
-  name: string;
-  tier: string;
-  activated_at: string;
-  status: string;
-  commission_cents: number;
-  notes: string | null;
-  created_at: string;
-}
-
 /**
  * License snapshot returned by `license.status` RPC.
  *
@@ -2085,7 +2056,7 @@ export interface LicenseSnapshot {
   fingerprint_match?: boolean | null;
   /**
    * NFR (Not-For-Resale) internal-test license. Renders a badge that
-   * white-label branding must never remove — the anti-resale watermark.
+   * must remain visible as the anti-resale watermark.
    */
   nfr?: boolean;
 }
@@ -4919,94 +4890,16 @@ export interface MigrateResult {
   report_path: string | null;
 }
 
-// ── Branding / white-label (design-distributor-white-label §3.5) ────────────
-
-/** The upstream software vendor block — authored by the backend const, never
- *  writable from the dashboard. Always present in `branding.get` / `about.get`. */
-export interface BrandingVendor {
-  name_zh: string;
-  name_en: string;
-  url: string;
-}
-
-/** Distributor-authored branding. All fields optional — a null/absent field
- *  means "use the DuDuClaw default". `updated_at` is server-set (read-only). */
-export interface BrandingConfig {
-  product_name?: string | null;
-  subtitle?: string | null;
-  /** Inline `data:image/{png,jpeg,webp};base64,…` logo, or null for the default. */
-  logo_data_uri?: string | null;
-  company_name?: string | null;
-  website?: string | null;
-  support_email?: string | null;
-  description?: string | null;
-  /** Sanitized HTML block for the About page (server-sanitized on read). */
-  about_html?: string | null;
-  /** Brand accent color as `#rrggbb`, or null for the default amber. */
-  accent_color?: string | null;
-  updated_at?: string | null;
-}
-
-/** Where the active branding resolved from (design §10.1 resolution order). */
-export type BrandingSource = 'local' | 'bundle' | 'default';
-
-/** Server-provided defaults used when a field is unset. */
-export interface BrandingDefaults {
-  product_name: string;
-  subtitle_key: string;
-}
-
-/** Response of `branding.get`. */
-export interface BrandingGetResponse {
-  branding: BrandingConfig;
-  vendor: BrandingVendor;
-  defaults: BrandingDefaults;
-  white_label_active: boolean;
-  /** Which layer the active branding resolved from (local / bundle / default). */
-  source: BrandingSource;
-  /** WP8: branding field names this instance may edit (serde keys, 1:1 with the
-   *  `branding.set` payload). Empty ⇒ no field is editable (fail-closed). Fields
-   *  absent from this list are provider-managed and must be masked in the form. */
-  editable_fields: string[];
-}
-
-/** Writable subset accepted by `branding.set` (mirrors the backend whitelist). */
-export interface BrandingSetInput {
-  product_name?: string;
-  subtitle?: string;
-  logo_data_uri?: string;
-  company_name?: string;
-  website?: string;
-  support_email?: string;
-  description?: string;
-  about_html?: string;
-  accent_color?: string;
-}
-
-/** Response of `about.get` — distributor branding + fixed vendor + version/tier. */
+/** Immutable software attribution returned by about.get. */
+export interface SoftwareVendor { name_zh: string; name_en: string; url: string; }
 export interface AboutResponse {
-  vendor: BrandingVendor;
-  branding: BrandingConfig;
+  vendor: SoftwareVendor;
+  product_name: 'DuDuClaw';
   version: string;
   tier: string;
-  white_label_active: boolean;
-  /** Which layer the About branding resolved from. */
-  source: BrandingSource;
 }
 
-/** A signed branding bundle (design §10.1) — dropped into a customer's
- *  `~/.duduclaw/branding.bundle.json` to auto-apply the brand with no license. */
-export interface BrandingBundle {
-  schema: number;
-  distributor_id: string;
-  subscription_id: string;
-  branding: BrandingConfig;
-  issued_at: string;
-  public_key_id: string;
-  signature: string;
-}
-
-// ── Distributor management (owner-only, design-distributor-white-label §3) ──
+// ── Distributor license management (owner-only) ──
 
 /** A distributor account (owner bookkeeping). */
 export interface DistributorProfile {
@@ -6860,7 +6753,7 @@ export const api = {
      * can render without conditional-loading the call.
      */
     status: () => client.call('license.status') as Promise<LicenseSnapshot>,
-    /** Machine fingerprint — customers quote this when purchasing a license. */
+    /** Machine fingerprint provided to the general distributor for licensing. */
     fingerprint: () =>
       client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,
     /**
@@ -6874,12 +6767,6 @@ export const api = {
         success: boolean;
         status: LicenseSnapshot;
       }>,
-    /** Partner (NFR) redeem-code path — free activation, same hot-reload. */
-    redeem: (code: string, email?: string) =>
-      client.call('license.redeem', {
-        code,
-        ...(email ? { email } : {}),
-      }) as Promise<{ success: boolean; status: LicenseSnapshot }>,
   },
   marketplace: {
     list: () =>
@@ -7477,35 +7364,6 @@ export const api = {
     adopt: (skillName: string, targetAgentId: string) =>
       client.call('skills.adopt', { skill_name: skillName, target_agent_id: targetAgentId }) as Promise<{ success: boolean }>,
   },
-  partner: {
-    profile: () =>
-      client.call('partner.profile') as Promise<PartnerProfile>,
-    stats: () =>
-      client.call('partner.stats') as Promise<PartnerStats>,
-    customers: (status?: string, limit = 100) =>
-      client.call('partner.customers', { status, limit }) as Promise<{
-        customers: PartnerCustomer[];
-      }>,
-    updateProfile: (
-      input: Omit<PartnerProfile, 'created_at' | 'updated_at'>,
-    ) =>
-      client.call('partner.profile.update', input) as Promise<PartnerProfile>,
-    addCustomer: (input: Omit<PartnerCustomer, 'id' | 'created_at'>) =>
-      client.call('partner.customer.add', input) as Promise<{ id: string }>,
-    updateCustomer: (
-      id: string,
-      patch: Partial<Omit<PartnerCustomer, 'id' | 'created_at'>>,
-    ) =>
-      client.call('partner.customer.update', { id, patch }) as Promise<{
-        success: boolean;
-      }>,
-    deleteCustomer: (id: string) =>
-      client.call('partner.customer.delete', { id }) as Promise<{
-        success: boolean;
-      }>,
-    // License generation is CLI-only (`duduclaw license generate`); the dashboard
-    // intentionally exposes no RPC for it (UI.4).
-  },
   contract: {
     get: (agentId: string) =>
       client.call('contract.get', { agent_id: agentId }) as Promise<
@@ -7768,32 +7626,8 @@ export const api = {
     auditLog: (params?: { user_id?: string; action?: string; limit?: number }) =>
       client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
   },
-  // ── Branding / white-label ────────────────────────────────────
-  branding: {
-    /** Read the active branding + fixed vendor block. Any authed user. */
-    get: () => client.call('branding.get') as Promise<BrandingGetResponse>,
-    /** Update the distributor branding. admin + white_label gated (fail-closed). */
-    set: (input: BrandingSetInput) =>
-      client.call('branding.set', { ...input }) as Promise<{ ok: boolean; branding: BrandingConfig }>,
-    /** Clear all custom branding → revert to DuDuClaw defaults. */
-    reset: () => client.call('branding.reset') as Promise<{ ok: boolean }>,
-    /** Sanitize raw About-page HTML for live preview. admin + white_label gated. */
-    preview: (aboutHtml: string) =>
-      client.call('branding.preview', { about_html: aboutHtml }) as Promise<{
-        ok: boolean;
-        sanitized_html: string;
-      }>,
-    bundle: {
-      /** Produce a signed branding bundle for this instance to ship to customers. */
-      create: () =>
-        client.call('branding.bundle.create') as Promise<{
-          ok: boolean;
-          bundle: BrandingBundle;
-        }>,
-    },
-  },
   about: {
-    /** About-page payload: distributor branding + fixed vendor + version/tier. */
+    /** Fixed software identity, vendor attribution and version. */
     get: () => client.call('about.get') as Promise<AboutResponse>,
   },
   // ── Distributor management (owner instance only) ──────────────
@@ -7815,16 +7649,12 @@ export const api = {
       client.call('distributor.update', { id, patch }) as Promise<{ ok: boolean }>,
     remove: (id: string) =>
       client.call('distributor.remove', { id }) as Promise<{ ok: boolean }>,
-    /** Sign a new OEM white-label license for the distributor's machine. */
+    /** Sign a distributor license for the authorized sales channel. */
     issue: (params: {
       distributor_id: string;
       machine_fingerprint: string;
       expires_days?: number;
       note?: string;
-      /** WP8: narrow the customer's editable branding range (serde field names).
-       *  Omit ⇒ full reseller (Vendor) range. Provide ⇒ Customer scope limited to
-       *  these fields (non-branding names are rejected by the gateway). */
-      branding_editable?: string[];
     }) =>
       client.call('distributor.issue', { ...params }) as Promise<{
         ok: boolean;
@@ -7837,15 +7667,6 @@ export const api = {
         ok: boolean;
         crl_note: string;
       }>,
-    bundle: {
-      /** Owner-side counter-sign of a branding bundle for a distributor (used
-       *  when the distributor instance cannot reach this gateway directly). */
-      sign: (params: { distributor_id: string; branding: BrandingConfig }) =>
-        client.call('distributor.bundle.sign', { ...params }) as Promise<{
-          ok: boolean;
-          bundle: BrandingBundle;
-        }>,
-    },
   },
   // ── OS-native page (P4-3) ───────────────────────────────────────
   os: {

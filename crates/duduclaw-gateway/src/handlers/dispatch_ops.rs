@@ -201,49 +201,8 @@ impl MethodHandler {
             "growth.snapshot" => self.handle_growth_snapshot().await,
             "growth.daily_report" => self.handle_growth_daily_report(params).await,
 
-            // ── Partner Portal ──────────────────────────────
-            "partner.profile" => self.handle_partner_profile().await,
-            "partner.stats" => self.handle_partner_stats().await,
-            "partner.customers" => self.handle_partner_customers(params).await,
-            "partner.profile.update" => {
-                require_admin!();
-                self.handle_partner_profile_update(params).await
-            }
-            "partner.customer.add" => {
-                require_admin!();
-                self.handle_partner_customer_add(params).await
-            }
-            "partner.customer.update" => {
-                require_admin!();
-                self.handle_partner_customer_update(params).await
-            }
-            "partner.customer.delete" => {
-                require_admin!();
-                self.handle_partner_customer_delete(params).await
-            }
-
-            // ── White-label branding + About ─────────────────
-            // `branding.get` / `about.get` are readable by any logged-in user
-            // (the dashboard needs the product name on every page). Writes go
-            // through require_admin! AND the white_label feature gate.
-            "branding.get" => self.handle_branding_get().await,
+            // Fixed product and upstream attribution.
             "about.get" => self.handle_about_get().await,
-            "branding.set" => {
-                require_admin!();
-                self.handle_branding_set(params).await
-            }
-            "branding.reset" => {
-                require_admin!();
-                self.handle_branding_reset().await
-            }
-            "branding.preview" => {
-                require_admin!();
-                self.handle_branding_preview(params).await
-            }
-            "branding.bundle.create" => {
-                require_admin!();
-                self.handle_branding_bundle_create().await
-            }
 
             // ── Distributor management (owner instance) ──────
             "distributor.status" => {
@@ -277,10 +236,6 @@ impl MethodHandler {
             "distributor.upgrade" => {
                 require_admin!();
                 self.handle_distributor_upgrade(params).await
-            }
-            "distributor.bundle.sign" => {
-                require_admin!();
-                self.handle_distributor_bundle_sign(params).await
             }
 
             // ── Billing ──────────────────────────────────────

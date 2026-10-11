@@ -85,29 +85,6 @@ impl MethodHandler {
         }
     }
 
-    /// `license.redeem {code, email?}` — partner (NFR) code redemption from
-    /// the dashboard; control-plane issues a free license bound to this
-    /// machine, installed with the same fail-closed verification.
-    pub(crate) async fn handle_license_redeem(&self, params: Value) -> WsFrame {
-        let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        let email = params
-            .get("email")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let Some(runtime) = crate::license_runtime::global() else {
-            return WsFrame::error_response("", "授權服務尚未就緒，請稍後再試");
-        };
-        match crate::license_runtime::redeem_partner_code(runtime, code, email).await {
-            Ok(snapshot) => {
-                info!(tier = %snapshot.tier, "partner code redeemed via dashboard");
-                self.broadcast_system_status().await;
-                WsFrame::ok_response("", json!({ "success": true, "status": snapshot }))
-            }
-            Err(e) => WsFrame::error_response("", &e),
-        }
-    }
-
     pub(crate) async fn handle_license_status(&self) -> WsFrame {
         let snapshot = match crate::license_runtime::global() {
             Some(runtime) => runtime.snapshot().await,
@@ -122,7 +99,6 @@ impl MethodHandler {
                 last_phone_home: None,
                 days_since_phone_home: None,
                 fingerprint_match: None,
-                branding_editable: None,
                 max_agents: None,
                 nfr: false,
             },

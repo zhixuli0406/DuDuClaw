@@ -1,3 +1,4 @@
+import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
@@ -18,3 +19,6 @@ describe('IdentityPage (MDS)', () => {
     expect(await screen.findByText('Lookup source')).toBeInTheDocument();
   });
 });
+
+// This suite exercises the standard installation catalog.
+beforeEach(setStandardProductPolicyFixture);

@@ -103,6 +103,18 @@ impl MethodHandler {
                 }));
             }
         }
+        let policy = crate::product_policy::load(&self.home_dir);
+        if policy.as_ref().is_ok_and(|p| *p == crate::product_policy::ProductProfile::Restricted) {
+        roles.retain(|role| {
+            let Some(id) = role.get("role_id").and_then(|v| v.as_str()) else { return false; };
+            let assembled = if id == pt::CEO_ROLE_ID {
+                pt::assemble_ceo(premium_dir)
+            } else if let Some(manifest) = manifest {
+                pt::assemble_role(premium_dir, manifest, id)
+            } else { return false; };
+            assembled.is_ok_and(|value| self.validate_template_policy(&value).is_ok())
+        });
+        } else if policy.is_err() { roles.clear(); }
         json!({
             "industry": manifest.map(|m| m.industry.clone()),
             "label": manifest.map(|m| m.label.clone()),

@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type ExpertDraftPreview } from '@/lib/api';
@@ -57,6 +58,7 @@ export function GenerateExpertDialog({
   onOpenChange: (open: boolean) => void;
   onInstalled: () => void;
 }) {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const t = useCallback(
     (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values),
@@ -241,7 +243,7 @@ export function GenerateExpertDialog({
             <div className="space-y-1.5">
               <span className="text-sm font-medium">{t('experts.generate.channels')}</span>
               <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3">
-                {CHANNEL_OPTIONS.map((ch) => (
+                {CHANNEL_OPTIONS.filter(ch => policy.allows('channels', ch.value)).map((ch) => (
                   <label
                     key={ch.value}
                     className="flex items-center gap-2 text-sm text-muted-foreground"

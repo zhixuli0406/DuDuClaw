@@ -3,7 +3,7 @@ import { useAuthStore } from './auth-store';
 import type { VisemeShape } from '@/components/mascot';
 import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
-import { effectiveName, effectiveLogoGlyph } from '@/lib/branding';
+import { effectiveName, effectiveLogoGlyph } from '@/lib/product-identity';
 import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
 
 export interface ChatAttachmentMeta {

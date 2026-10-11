@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -124,6 +125,7 @@ export function AutopilotRuleDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const t = useCallback(
     (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values),
@@ -361,7 +363,7 @@ export function AutopilotRuleDialog({
                     label={t('autopilot.field.channel')}
                     value={form.channel}
                     onChange={(v) => patch({ channel: v })}
-                    options={NOTIFY_CHANNELS.map((c) => ({ value: c, label: channelLabel(c) }))}
+                    options={NOTIFY_CHANNELS.filter(c => policy.allows('channels', c)).map((c) => ({ value: c, label: channelLabel(c) }))}
                   />
                 )}
               </div>

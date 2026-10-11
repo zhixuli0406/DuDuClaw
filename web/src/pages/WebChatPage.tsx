@@ -1,3 +1,4 @@
+import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
@@ -350,6 +351,7 @@ export function WebChatPage() {
           <span className="hidden sm:inline">{statusText}</span>
         </span>
         <div className="ml-auto flex items-center gap-0.5">
+          <DataExportButton dataset="conversations" agentId={selectedAgentId ?? undefined} />
           <VoicePlayToggle />
           {/* 對話紀錄 lives in the sidebar (newest five) and on its own page —
               the page-local duplicate list was removed 2026-08-04 (D17), so

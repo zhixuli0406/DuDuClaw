@@ -1,3 +1,4 @@
+import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -188,3 +189,6 @@ describe('AccountsPage (MDS)', () => {
     expect(screen.queryByText('Org disabled')).not.toBeInTheDocument();
   });
 });
+
+// This suite exercises the standard installation catalog.
+beforeEach(setStandardProductPolicyFixture);

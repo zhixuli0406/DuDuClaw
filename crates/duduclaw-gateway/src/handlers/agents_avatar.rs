@@ -168,7 +168,7 @@ impl MethodHandler {
     }
 
     /// Read an agent's stored avatar (if any) back into a data URI. Mirrors the
-    /// branding-logo model (inline data URI) so the front-end renders it under
+    /// raster data URI model (inline data URI) so the front-end renders it under
     /// the same `img-src data:` CSP. `None` when no `avatar.*` file exists.
     pub(crate) fn agent_avatar_data_uri(&self, agent_id: &str) -> Option<String> {
         let agent_dir = self.home_dir.join("agents").join(agent_id);

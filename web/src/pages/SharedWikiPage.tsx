@@ -1,3 +1,4 @@
+import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
@@ -96,6 +97,7 @@ export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
 
   const inner = (
     <div className="space-y-4">
+      <DataExportButton dataset="wiki" scope="shared" />
       {/* Embedded contexts (the memory-page tab) skip CollectionPageHeader, so
           the plain-language distinction from the personal knowledge base would
           otherwise never render there. Standalone gets it via the header

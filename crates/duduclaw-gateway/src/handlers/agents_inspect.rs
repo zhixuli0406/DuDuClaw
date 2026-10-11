@@ -87,7 +87,7 @@ impl MethodHandler {
                         "role": format!("{:?}", cfg.agent.role).to_lowercase(),
                         "status": format!("{:?}", cfg.agent.status).to_lowercase(),
                         "archived": matches!(cfg.agent.status, duduclaw_core::types::AgentStatus::Archived),
-                        // WP4: full avatar as an inline data URI (branding-logo model)
+                        // WP4: full avatar as an inline data URI (raster data URI model)
                         // + a cheap boolean the list view also uses.
                         "has_avatar": self.agent_has_avatar(&cfg.agent.name),
                         "avatar": self.agent_avatar_data_uri(&cfg.agent.name),

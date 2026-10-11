@@ -1647,7 +1647,7 @@ impl AutopilotEngine {
                     token: token.clone(),
                     extra_id: None,
                 };
-                match crate::channel_sender::create_sender(&target, notify_http_client().clone())
+                match crate::channel_sender::create_sender_for_home(&self.home_dir, &target, notify_http_client().clone())
                     .send_text(&text)
                     .await
                 {
@@ -1669,7 +1669,7 @@ impl AutopilotEngine {
         // channels are refused inside `resolve_channel_target`.
         let target =
             crate::channel_sender::resolve_channel_target(&self.home_dir, channel, chat_id).await?;
-        crate::channel_sender::create_sender(&target, notify_http_client().clone())
+        crate::channel_sender::create_sender_for_home(&self.home_dir, &target, notify_http_client().clone())
             .send_text(&text)
             .await
             .map_err(|e| e.to_string())

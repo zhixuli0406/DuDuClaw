@@ -380,12 +380,6 @@ impl LicenseRuntime {
         self.gate.clone()
     }
 
-    /// The resolved control-plane base URL for this instance (§10.5). Used by
-    /// `branding.bundle.create` to reach the owner gateway's `/v1/branding/sign`
-    /// with the exact same precedence phone-home uses.
-    pub fn control_url(&self) -> &str {
-        &self.control_url
-    }
 
     /// Effective agent-count limit for the active license: the signed
     /// per-license `max_agents` override when present, else the tier default.
@@ -531,62 +525,6 @@ pub fn parse_license_key(input: &str) -> Result<License, String> {
     serde_json::from_slice(&decoded).map_err(|e| format!("授權內容解析失敗：{e}"))
 }
 
-/// Redeem a partner (NFR) code at the control-plane and install the returned
-/// license. Mirrors `duduclaw license redeem`, but finishes with the runtime
-/// hot-reload so the dashboard unlocks immediately.
-pub async fn redeem_partner_code(
-    rt: &LicenseRuntime,
-    code: &str,
-    email: Option<String>,
-) -> Result<LicenseSnapshot, String> {
-    let code = code.trim();
-    if code.is_empty() {
-        return Err("兌換碼不可為空".to_string());
-    }
-    let endpoint = format!(
-        "{}/v1/partner/redeem",
-        rt.control_url().trim_end_matches('/')
-    );
-    let client = reqwest::Client::builder()
-        .timeout(StdDuration::from_secs(20))
-        .build()
-        .map_err(|e| format!("建立 HTTP client 失敗：{e}"))?;
-    let body = json!({
-        "code": code,
-        "machine_fingerprint": cached_fingerprint(),
-        "email": email,
-    });
-    let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("無法連線授權伺服器：{e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let msg = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("message")
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(format!("授權伺服器回應 HTTP {status}：{msg}"));
-    }
-    let envelope: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("兌換回應解析失敗：{e}"))?;
-    let license: License = envelope
-        .get("license")
-        .cloned()
-        .ok_or_else(|| "兌換回應缺少 license 欄位".to_string())
-        .and_then(|v| serde_json::from_value(v).map_err(|e| format!("授權內容解析失敗：{e}")))?;
-    rt.install_and_reload(license).await
-}
-
 /// Read-only view of the runtime state for dashboards / metrics.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LicenseSnapshot {
@@ -600,17 +538,13 @@ pub struct LicenseSnapshot {
     pub last_phone_home: Option<chrono::DateTime<Utc>>,
     pub days_since_phone_home: Option<i64>,
     pub fingerprint_match: Option<bool>,
-    /// WP8: the active license's signed white-label field-level edit claim, if
-    /// any. `None` (no claim) resolves to the full vendor-editable set — see
-    /// `crate::branding::resolve_edit_scope`.
-    pub branding_editable: Option<Vec<String>>,
     /// P-License: the active license's signed per-license agent-count quota, if
     /// any. `None` = no override → the tier default applies. Surfaced so the
     /// enforcement path can detect an explicit issuer-set limit (`is_some()`)
     /// even on a self-host tier — see `handlers::tier_limit_message`.
     pub max_agents: Option<u32>,
     /// NFR (Not-For-Resale) internal-test marker from the signed license. The
-    /// dashboard MUST render this as a visible badge that white-label branding
+    /// dashboard MUST render this as a visible badge that operators
     /// cannot remove — it is the anti-resale watermark for free test licenses.
     pub nfr: bool,
 }
@@ -638,7 +572,6 @@ impl LicenseSnapshot {
             last_phone_home: license.map(|l| l.last_phone_home),
             days_since_phone_home: license.map(|l| l.days_since_phone_home()),
             fingerprint_match: license.map(|l| l.is_valid_for_machine(&current_fp)),
-            branding_editable: license.and_then(|l| l.branding_editable.clone()),
             max_agents: license.and_then(|l| l.max_agents),
             nfr: license.is_some_and(|l| l.nfr),
         }
@@ -957,8 +890,8 @@ pub async fn agent_cap_message_from_disk(
         if cap_exceeded(cap, current) {
             return Some(format!(
                 "個人版最多可建立 {cap} 個 AI 員工。\
-                 升級企業版以建立更多，並解鎖部門、多帳號等管理功能：\
-                 https://duduclaw.dudustudio.monster#pricing"
+                 如需調整授權範圍，請聯絡總經銷：\
+                 https://futurecorp.tw"
             ));
         }
         return None;
@@ -975,7 +908,7 @@ pub async fn agent_cap_message_from_disk(
     }
     Some(format!(
         "您的方案（{}）最多可建立 {max} 個 Agent。\
-         請升級方案以新增更多：https://duduclaw.dudustudio.monster#pricing",
+         如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw",
         snapshot.tier
     ))
 }
@@ -1639,7 +1572,7 @@ mod tests {
 
     #[test]
     fn effective_fingerprint_defaults_to_strong_and_records_legacy_matches() {
-        // The effective fingerprint is what phone-home / redeem / branding send.
+        // The effective fingerprint is what phone-home requests send.
         // It must fall back to the strong value whenever nothing matched, and
         // carry the legacy value while a legacy-bound license is active.
         clear_effective_fingerprint();

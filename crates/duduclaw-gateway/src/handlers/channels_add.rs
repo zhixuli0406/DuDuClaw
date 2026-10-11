@@ -9,6 +9,9 @@ impl MethodHandler {
             Some(t) => t,
             None => return WsFrame::error_response("", "Missing 'type' parameter"),
         };
+        if let Err(e) = crate::product_policy::require_channel(&self.home_dir, channel_type) {
+            return WsFrame::error_response("", &e);
+        }
         let config_obj = params.get("config").cloned().unwrap_or(json!({}));
         let token = config_obj
             .get("token")

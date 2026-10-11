@@ -92,7 +92,7 @@ pub(crate) fn is_valid_skill_name(name: &str) -> bool {
 // ── WP4 agent avatar upload ───────────────────────────────────────────────
 //
 // Avatars are stored as a single `agents/<id>/avatar.<ext>` file (raw bytes),
-// mirroring the branding-logo policy: PNG/JPEG/WebP only (SVG excluded — it can
+// mirroring the raster image validation policy: PNG/JPEG/WebP only (SVG excluded — it can
 // carry script), a 512 KB decoded ceiling, and magic-byte confirmation of the
 // declared mime. Read back into an inline data URI for the dashboard (same
 // `img-src data:` CSP as the logo).
@@ -107,15 +107,15 @@ pub(crate) const AVATAR_EXT_MIME: &[(&str, &str)] = &[
     ("webp", "image/webp"),
 ];
 
-/// Maximum decoded avatar size (512 KB) — matches the branding-logo ceiling.
+/// Maximum decoded avatar size (512 KB) — bounds decoded raster allocations.
 pub(crate) const MAX_AVATAR_DECODED_BYTES: usize = 512 * 1024;
 
 /// Decode + validate an avatar data URI. Returns `(bytes, extension)` on success.
-/// Thin wrapper over the shared `branding::validate_image_data_uri` (single
+/// Thin wrapper over the shared `image_data::validate_image_data_uri` (single
 /// source of truth for raster data-URI validation) — fails closed on unknown
 /// mime, oversized payload (bounded pre-decode), or a magic-byte mismatch.
 pub(crate) fn decode_avatar_data_uri(uri: &str) -> Result<(Vec<u8>, &'static str), String> {
-    let img = crate::branding::validate_image_data_uri(uri, MAX_AVATAR_DECODED_BYTES, "Avatar")?;
+    let img = crate::image_data::validate_image_data_uri(uri, MAX_AVATAR_DECODED_BYTES, "Avatar")?;
     let ext = img.kind.ext();
     Ok((img.bytes, ext))
 }

@@ -149,7 +149,7 @@ impl MethodHandler {
         }
     }
 
-    /// Sign a fresh OEM (`tier=Oem`) white-label license for a distributor.
+    /// Sign a fresh distributor (`tier=Oem`) license for a distributor.
     ///
     /// Reuses the existing License v2 format so `duduclaw license activate`
     /// consumes it unchanged. The issuer private key path comes ONLY from
@@ -176,42 +176,6 @@ impl MethodHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(365)
             .clamp(1, 36_500) as i64;
-
-        // WP8: optional field-level white-label edit claim. Absent ⇒ `None` ⇒ the
-        // consumer resolves to the full vendor set (a reseller token). Present ⇒
-        // a narrowed range (a customer token). Fail-closed: every listed name
-        // must be a real vendor-editable field — a claim can never grant a
-        // system-only / unknown field, so a bad list rejects the whole issue.
-        let branding_editable: Option<Vec<String>> = match params.get("branding_editable") {
-            None | Some(Value::Null) => None,
-            Some(Value::Array(arr)) => {
-                let list: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect();
-                let invalid: Vec<&str> = list
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|f| {
-                        crate::branding::field_level(f)
-                            != crate::branding::BrandingFieldLevel::Vendor
-                    })
-                    .collect();
-                if !invalid.is_empty() {
-                    return WsFrame::error_response(
-                        "",
-                        &format!(
-                            "branding_editable 含不可授權的欄位（僅允許品牌面欄位）：{}",
-                            invalid.join("、")
-                        ),
-                    );
-                }
-                Some(list)
-            }
-            Some(_) => {
-                return WsFrame::error_response("", "branding_editable 必須是欄位名稱的字串陣列");
-            }
-        };
 
         // P-License: optional signed per-license agent-count quota. Absent ⇒
         // `None` ⇒ no override (the Oem tier default applies). Present ⇒ sell
@@ -260,7 +224,7 @@ impl MethodHandler {
         let public_url = self.distributor_public_url().await;
 
         let registry = crate::license_runtime::production_registry();
-        let (license, blob) = match crate::distributor_store::issue_signed_oem_license(
+        let (license, blob) = match crate::distributor_store::issue_signed_distributor_license(
             &seed,
             &registry,
             "v2",
@@ -269,7 +233,6 @@ impl MethodHandler {
             &machine_fingerprint,
             expires_days,
             public_url.as_deref(),
-            branding_editable,
             max_agents,
         ) {
             Ok(v) => v,
@@ -361,7 +324,7 @@ impl MethodHandler {
         }
     }
 
-    /// Local (offline-backup) white-label upgrade: re-sign an already-issued OEM
+    /// Local (offline-backup) agent quota update: re-sign an already-issued distributor
     /// license with a new `max_agents` (P-License add-on, plan §12.1).
     ///
     /// The issuer key re-signs the SAME key — preserving subscription / customer
@@ -458,81 +421,4 @@ impl MethodHandler {
         )
     }
 
-    /// Owner-side offline co-signing of a branding bundle (§10.3): the operator
-    /// pastes a distributor's branding JSON and the owner signs it directly with
-    /// the local issuer key — covering the case where the distributor instance
-    /// cannot reach `/v1/branding/sign`. Admin-gated; the owner is the
-    /// authoritative sanitizer (branding is run through `validate_input`).
-    pub(crate) async fn handle_distributor_bundle_sign(&self, params: Value) -> WsFrame {
-        let distributor_id = match params.get("distributor_id").and_then(|v| v.as_str()) {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => return WsFrame::error_response("", "缺少 'distributor_id' 參數"),
-        };
-        let store = self.distributor_store();
-        if store.get_distributor(&distributor_id).is_none() {
-            return WsFrame::error_response("", "找不到該經銷商");
-        }
-
-        // Parse + authoritatively sanitize the submitted branding.
-        let submitted: crate::branding::BrandingConfig = match params.get("branding") {
-            Some(v) => match serde_json::from_value(v.clone()) {
-                Ok(c) => c,
-                Err(e) => return WsFrame::error_response("", &format!("branding 欄位無效：{e}")),
-            },
-            None => crate::branding::BrandingConfig::default(),
-        };
-        let sanitized = match crate::branding::validate_input(submitted.into()) {
-            Ok(c) => c,
-            Err(e) => return WsFrame::error_response("", &e),
-        };
-
-        // Traceability subscription id: explicit param, else derived from the id.
-        let subscription_id = params
-            .get("subscription_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("dist-{distributor_id}"));
-
-        let key_path = match self.distributor_issuer_key_path().await {
-            Some(p) => p,
-            None => {
-                return WsFrame::error_response(
-                    "",
-                    "尚未配置簽發金鑰：請在 config.toml 設定 [distributor] issuer_key_path 指向 license-signing-v2.key",
-                );
-            }
-        };
-        let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
-            Ok(s) => s,
-            Err(e) => return WsFrame::error_response("", &e),
-        };
-
-        let issued_at = chrono::Utc::now().to_rfc3339();
-        let bundle = match crate::branding::sign_bundle(
-            &seed,
-            &distributor_id,
-            &subscription_id,
-            &sanitized,
-            &issued_at,
-            crate::branding::BUNDLE_KEY_ID,
-        ) {
-            Ok(b) => b,
-            Err(e) => return WsFrame::error_response("", &e),
-        };
-
-        self.audit_distributor_event(
-            "branding_bundle_signed",
-            json!({
-                "distributor_id": distributor_id,
-                "subscription_id": subscription_id,
-                "mode": "owner_offline",
-            }),
-        );
-
-        match serde_json::to_value(&bundle) {
-            Ok(v) => WsFrame::ok_response("", json!({ "ok": true, "bundle": v })),
-            Err(e) => WsFrame::error_response("", &format!("serialize bundle: {e}")),
-        }
-    }
 }

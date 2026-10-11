@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useIntl } from 'react-intl';
 import { Button, ErrorState, Input, SettingsCard, SettingsRow, SettingsSection } from '@/components/mds';
 import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
@@ -33,6 +34,7 @@ function readRoles(tables: TomlTables): Record<string, string> {
  * the composer reads these per goal, so a save applies to the next goal.
  */
 export function TeamDefaultsSection() {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
 
@@ -54,12 +56,12 @@ export function TeamDefaultsSection() {
     raw: e,
   }));
   const runtimeOptionsFor = (saved: string): SelectOption[] => [
-    ...ROLE_RUNTIMES.map((r) => ({
+    ...ROLE_RUNTIMES.filter(r => policy.allows('runtimes', r)).map((r) => ({
       value: r as string,
       label: r === '' ? t('settings.team.runtime.default') : t(`settings.team.runtime.${r}`),
       raw: r as string,
     })),
-    ...(saved && !(ROLE_RUNTIMES as readonly string[]).includes(saved)
+    ...(saved && policy.allows('runtimes', saved) && !(ROLE_RUNTIMES as readonly string[]).includes(saved)
       ? [{ value: saved, label: intl.formatMessage({ id: 'settings.team.runtime.other' }, { name: saved }), raw: saved }]
       : []),
   ];

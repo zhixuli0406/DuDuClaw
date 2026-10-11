@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
@@ -33,6 +34,7 @@ const EMPTY_STT: SttConfig = {
 };
 
 export function VoiceTab() {
+  const policy = useProductPolicy();
   const intl = useIntl();
   // Only the [voice] keys the gateway actually reads: `tts_provider` /
   // `tts_voice` (the speech-synthesis endpoint in server.rs). The former
@@ -89,7 +91,7 @@ export function VoiceTab() {
   const ttsOptions: SelectOption[] = [
     { value: 'auto', label: intl.formatMessage({ id: 'voice.provider.auto' }), raw: 'auto' },
     { value: 'edge-tts', label: intl.formatMessage({ id: 'voice.provider.edgeTts' }), raw: 'edge-tts' },
-    { value: 'minimax', label: intl.formatMessage({ id: 'voice.provider.minimax' }), raw: 'minimax' },
+    ...(policy.allows('providers', 'minimax') ? [{ value: 'minimax', label: intl.formatMessage({ id: 'voice.provider.minimax' }), raw: 'minimax' }] : []),
     { value: 'openai-tts', label: intl.formatMessage({ id: 'voice.provider.openaiTts' }), raw: 'openai-tts' },
     { value: 'piper', label: intl.formatMessage({ id: 'voice.provider.piper' }), raw: 'piper' },
   ];

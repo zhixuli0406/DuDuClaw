@@ -480,9 +480,9 @@ enum TokenCheck {
 
 /// Register bot commands with Telegram.
 async fn register_commands(client: &reqwest::Client, api_base: &str) {
-    // §10.6: user-visible product name honours white-label branding.
+    // Product attribution is fixed across messaging channels.
     let product =
-        crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+        "DuDuClaw".to_string();
     let commands = json!({
         "commands": [
             { "command": "ask", "description": format!("向 {product} AI 提問") },

@@ -114,9 +114,9 @@ const BOT_INTENTS: u64 = INTENT_GUILDS
 // ── Slash command definitions ───────────────────────────────
 
 fn slash_command_definitions() -> Vec<Value> {
-    // §10.6: user-visible product name honours white-label branding.
+    // Product attribution is fixed across messaging channels.
     let product =
-        crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+        "DuDuClaw".to_string();
     vec![
         json!({
             "name": "ask",
@@ -2873,9 +2873,7 @@ async fn handle_slash_command(
                     .is_guild_allowed("discord", guild_id)
                     .await
             {
-                let product = crate::branding::effective_product_name(
-                    &duduclaw_core::platform::duduclaw_home(),
-                );
+                let product = "DuDuClaw".to_string();
                 send_interaction_response(http, interaction_id, interaction_token, 4,
                     Some(json!({"content": format!("❌ 此伺服器未被授權使用 {product}"), "flags": 64}))).await;
                 return;
@@ -2966,7 +2964,7 @@ async fn handle_slash_command(
             );
 
             let product =
-                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+                "DuDuClaw".to_string();
             let embed = json!({
                 "embeds": [{
                     "title": format!("{product} Status"),

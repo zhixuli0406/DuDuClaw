@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { RefreshCw } from 'lucide-react';
@@ -59,10 +60,11 @@ export function ModelSelect({
   refreshing,
   onRefresh,
 }: ModelSelectProps) {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const [custom, setCustom] = useState(false);
 
-  const cloud = models.filter((m) => m.type === 'cloud');
+  const cloud = models.filter((m) => m.type === 'cloud' && policy.allows('providers', m.provider ?? ''));
   const local = models.filter((m) => m.type === 'local');
   const known = models.some((m) => m.id === value);
   const noList = Boolean(error) || (!loading && models.length === 0);

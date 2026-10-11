@@ -45,6 +45,9 @@ impl MethodHandler {
                 ));
             }
         };
+        if let Err(e) = crate::product_policy::require_channel(&self.home_dir, &channel) {
+            return Err(WsFrame::error_response("", &e));
+        }
         if !crate::channel_settings::VALID_CHANNEL_TYPES.contains(&channel.as_str()) {
             return Err(WsFrame::error_response(
                 "",

@@ -17,105 +17,18 @@ import {
   Badge,
   Button,
   ErrorState,
-  Input,
   Textarea,
   SettingsCard,
   SettingsRow,
-  Table,
-  TableHeader,
-  TableBody,
-  TableRow,
-  TableHead,
-  TableCell,
 } from '@/components/mds';
 import {
   KeyRound,
-  ShieldCheck,
   Fingerprint,
   RefreshCw,
   ExternalLink,
-  Sparkles,
-  Building2,
-  FileBarChart2,
-  MessagesSquare,
-  Database,
-  Globe,
-  Check,
-  Minus,
   Copy,
-  Ticket,
   FlaskConical,
 } from 'lucide-react';
-
-/** Commercial-module feature flags advertised on the LicensePage matrix. */
-const COMMERCIAL_FEATURES: ReadonlyArray<{
-  key: string;
-  label: string;
-  icon: typeof Sparkles;
-  tiers: ReadonlySet<LicenseSnapshot['tier']>;
-}> = [
-  {
-    key: 'premium_templates',
-    label: 'license.feature.premiumTemplates',
-    icon: Sparkles,
-    tiers: new Set([
-      'studio',
-      'business',
-      'partner',
-      'personal_pro_self_host',
-      'self_host_pro',
-      'oem',
-    ]),
-  },
-  {
-    key: 'industry_evolution_params',
-    label: 'license.feature.evolutionParams',
-    icon: FileBarChart2,
-    tiers: new Set(['business', 'partner', 'self_host_pro', 'oem']),
-  },
-  {
-    key: 'dashboard_enterprise',
-    label: 'license.feature.dashboardEnterprise',
-    icon: Database,
-    tiers: new Set(['business', 'partner', 'self_host_pro', 'oem']),
-  },
-  {
-    key: 'priority_security_patch',
-    label: 'license.feature.prioritySecurityPatch',
-    icon: ShieldCheck,
-    tiers: new Set([
-      'business',
-      'partner',
-      'personal_pro_self_host',
-      'self_host_pro',
-      'oem',
-    ]),
-  },
-  {
-    key: 'private_discord_support',
-    label: 'license.feature.privateDiscord',
-    icon: MessagesSquare,
-    tiers: new Set([
-      'business',
-      'partner',
-      'personal_pro_self_host',
-      'self_host_pro',
-      'oem',
-    ]),
-  },
-  {
-    key: 'odoo_integration_supported',
-    label: 'license.feature.odoo',
-    icon: Building2,
-    tiers: new Set(['business', 'partner']),
-  },
-  {
-    key: 'white_label',
-    label: 'license.feature.whiteLabel',
-    icon: Globe,
-    tiers: new Set(['oem']),
-  },
-] as const;
 
 type ExpiryTone = 'expired' | 'critical' | 'warning' | 'ok' | 'unknown';
 
@@ -325,7 +238,7 @@ export function LicensePage() {
       {snapshot && (
         <>
           {/* ── NFR watermark: signed into the license, never hidden by
-              white-label branding — the anti-resale marker ────── */}
+              the permanent anti-resale marker ────── */}
           {snapshot.nfr && (
             <div
               role="status"
@@ -380,7 +293,7 @@ export function LicensePage() {
             />
           </div>
 
-          {/* ── Upgrade / activate — prominent while on OpenSource ── */}
+          {/* ── Activate — prominent while on OpenSource ── */}
           {!snapshot.installed && (
             <ActivateLicenseCard collapsed={false} onActivated={() => void load()} />
           )}
@@ -421,88 +334,14 @@ export function LicensePage() {
             </SettingsRow>
           </SettingsCard>
 
-          {/* ── Commercial modules matrix ───────────────────── */}
           <Card>
-            <CardHeader>
-              <CardTitle>{intl.formatMessage({ id: 'license.modules.title' })}</CardTitle>
-              <CardDescription>{intl.formatMessage({ id: 'license.modules.subtitle' })}</CardDescription>
-            </CardHeader>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>{intl.formatMessage({ id: 'license.modules.col.module' })}</TableHead>
-                    <TableHead className="text-right">
-                      {intl.formatMessage({ id: 'license.modules.col.status' })}
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {COMMERCIAL_FEATURES.map(({ key, label, icon: Icon, tiers }) => {
-                    const unlocked = tiers.has(snapshot.tier);
-                    return (
-                      <TableRow key={key} className={cn(unlocked && 'bg-surface-selected')}>
-                        <TableCell>
-                          <span className="flex items-center gap-2">
-                            <Icon
-                              className={cn(
-                                'size-4 shrink-0',
-                                unlocked ? 'text-success' : 'text-muted-foreground/50',
-                              )}
-                            />
-                            <span className={cn('text-sm', !unlocked && 'text-muted-foreground')}>
-                              {intl.formatMessage({ id: label })}
-                            </span>
-                          </span>
-                        </TableCell>
-                        <TableCell className="text-right">
-                          {unlocked ? (
-                            <Badge variant="secondary" className="bg-success/15 text-success">
-                              <Check className="size-3.5" />
-                            </Badge>
-                          ) : (
-                            <Badge variant="ghost">
-                              <Minus className="size-3.5" />
-                            </Badge>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
+            <CardContent>
+              <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'license.distributorNotice' }, {distributor: contact.name})}</p>
+              <a href={contact.url} target="_blank" rel="noopener noreferrer" className="mt-2 inline-block text-sm text-brand hover:underline">
+                {intl.formatMessage({id: 'license.distributorContact'})}
+              </a>
             </CardContent>
           </Card>
-
-          {/* ── CTA: upgrade / activate / docs ──────────────── */}
-          {!snapshot.installed && (
-            <Card>
-              <CardHeader>
-                <CardTitle>{intl.formatMessage({ id: 'license.cta.opensource.title' })}</CardTitle>
-                <CardDescription>{intl.formatMessage({ id: 'license.cta.opensource.body' }, { distributor: contact.name })}</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="flex flex-wrap gap-3">
-                  <a href={contact.url} target="_blank" rel="noopener noreferrer">
-                    <Button variant="brand">
-                      {intl.formatMessage({ id: 'license.cta.pricing' })}
-                      <ExternalLink />
-                    </Button>
-                  </a>
-                  <a
-                    href="https://github.com/zhixuli0406/DuDuClaw#-installation"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <Button variant="outline">
-                      {intl.formatMessage({ id: 'license.cta.docs' })}
-                      <ExternalLink />
-                    </Button>
-                  </a>
-                </div>
-              </CardContent>
-            </Card>
-          )}
 
           {snapshot.installed && expiryClassification.tone !== 'ok' && (
             <Card>
@@ -544,17 +383,6 @@ export function LicensePage() {
                 <li>$ duduclaw license deactivate</li>
               </ul>
 
-              <p className="pt-1 text-sm font-medium text-foreground">
-                {intl.formatMessage({ id: 'license.cli.selfService' })}
-              </p>
-              <ul className="space-y-1 font-mono text-xs text-foreground">
-                {/* Free partner (NFR) path — redeem a code, no payment. */}
-                <li>$ duduclaw license redeem &lt;PARTNER-CODE&gt;</li>
-                {/* Self-service machine migration (re-sign for this machine). */}
-                <li>$ duduclaw license rebind</li>
-                {/* Remote subscription / renewal status from the control-plane. */}
-                <li>$ duduclaw license subscriptions</li>
-              </ul>
             </CardContent>
           </Card>
         </>
@@ -564,8 +392,8 @@ export function LicensePage() {
 }
 
 /**
- * Upgrade / activate license card — machine fingerprint (copyable), license
- * key activation, and the free partner redeem-code path. Prominent while on
+ * Activate license card — machine fingerprint (copyable), license
+ * key activation. Prominent while on
  * OpenSource; collapsed into a <details> once a commercial license is live.
  * Activation hot-reloads the gateway LicenseRuntime, so `onActivated` only
  * needs to re-fetch `license.status` — no restart.
@@ -588,10 +416,6 @@ function ActivateLicenseCard({
   const [key, setKey] = useState('');
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState<string | null>(null);
-  const [code, setCode] = useState('');
-  const [email, setEmail] = useState('');
-  const [redeeming, setRedeeming] = useState(false);
-  const [redeemError, setRedeemError] = useState<string | null>(null);
   const [activated, setActivated] = useState(false);
 
   useEffect(() => {
@@ -633,27 +457,9 @@ function ActivateLicenseCard({
     }
   };
 
-  const handleRedeem = async () => {
-    if (!code.trim()) return;
-    setRedeemError(null);
-    setRedeeming(true);
-    try {
-      await api.license.redeem(code.trim(), email.trim() || undefined);
-      toast.success(intl.formatMessage({ id: 'license.activate.success' }));
-      setCode('');
-      setEmail('');
-      setActivated(true);
-      onActivated();
-    } catch (e) {
-      setRedeemError(formatError(e));
-    } finally {
-      setRedeeming(false);
-    }
-  };
-
   const body = (
     <div className="space-y-6">
-      {/* 1 — machine fingerprint + purchase link */}
+      {/* 1 — machine fingerprint + general distributor contact */}
       <div className="space-y-2">
         <p className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
           <Fingerprint className="size-3.5" />
@@ -674,7 +480,7 @@ function ActivateLicenseCard({
             rel="noopener noreferrer"
             className="font-medium text-brand hover:underline"
           >
-            {intl.formatMessage({ id: 'license.cta.pricing' })}
+            {intl.formatMessage({ id: 'license.distributorContact' })}
             <ExternalLink className="ml-0.5 inline size-3" />
           </a>
         </p>
@@ -687,6 +493,7 @@ function ActivateLicenseCard({
           help={intl.formatMessage({ id: 'license.activate.key.hint' })}
         >
           <Textarea
+            aria-label={intl.formatMessage({ id: 'license.activate.key.label' })}
             value={key}
             onChange={(e) => setKey(e.target.value)}
             spellCheck={false}
@@ -698,40 +505,6 @@ function ActivateLicenseCard({
           <KeyRound />
           {intl.formatMessage({
             id: activating ? 'license.activate.submitting' : 'license.activate.submit',
-          })}
-        </Button>
-      </div>
-
-      {/* 3 — partner (NFR) redeem code, free path */}
-      <div className="space-y-3 border-t border-surface-border pt-4">
-        <p className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          <Ticket className="size-3.5" />
-          {intl.formatMessage({ id: 'license.activate.redeem.title' })}
-        </p>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <LicenseField label={intl.formatMessage({ id: 'license.activate.redeem.code' })}>
-            <Input
-              type="text"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              spellCheck={false}
-              className="font-mono"
-              placeholder="PARTNER-CODE"
-            />
-          </LicenseField>
-          <LicenseField label={intl.formatMessage({ id: 'license.activate.redeem.email' })}>
-            <Input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="off"
-            />
-          </LicenseField>
-        </div>
-        {redeemError && <p className="text-sm text-destructive">{redeemError}</p>}
-        <Button variant="secondary" onClick={() => void handleRedeem()} disabled={redeeming || !code.trim()}>
-          {intl.formatMessage({
-            id: redeeming ? 'license.activate.redeem.submitting' : 'license.activate.redeem.submit',
           })}
         </Button>
       </div>

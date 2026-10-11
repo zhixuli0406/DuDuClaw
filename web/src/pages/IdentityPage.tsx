@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import {
@@ -82,6 +83,7 @@ function Field({
  * People DB, and test-resolve an identifier live.
  */
 export function IdentityPage() {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
 
@@ -356,7 +358,7 @@ export function IdentityPage() {
                   <SelectValue>{t(`identity.channel.${resolveChannel}`)}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
-                  {RESOLVE_CHANNELS.map((ch) => (
+                  {RESOLVE_CHANNELS.filter(ch => policy.allows('channels', ch)).map((ch) => (
                     <SelectItem key={ch} value={ch}>
                       {t(`identity.channel.${ch}`)}
                     </SelectItem>

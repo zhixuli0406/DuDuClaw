@@ -40,7 +40,7 @@
 //!   applies it atomically within the same call — same "never trust a
 //!   caller-supplied URL" invariant, different (still safe) mechanism. It
 //!   does not go through a gateway extension's custom update provider
-//!   (white-label/distributor channel) — see the function doc comment.
+//!   (distributor channel) — see the function doc comment.
 //!
 //! Every tool is admin-scope-gated at the shared MCP dispatch choke point
 //! (`mcp_auth::tool_requires_scope` → `Scope::Admin`, enforced in
@@ -700,7 +700,7 @@ async fn record_pending_update_report(
 ///
 /// Known gap (documented, not silently papered over): this does NOT consult
 /// `self.extension.update_provider()` — a gateway-extension-supplied custom
-/// update channel some white-label/distributor builds configure. Those
+/// update channel some distributor builds configure. Those
 /// deployments' `os_apply_update(target="system")` falls back to the OSS
 /// default GitHub/control-plane channel instead. Reaching the extension's
 /// provider would require exposing its resolution to a cross-process

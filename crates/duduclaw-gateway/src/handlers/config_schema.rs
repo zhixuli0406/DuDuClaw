@@ -70,6 +70,7 @@ use Ty::*;
 
 /// `(section path, key, type)` for every typed key a reader consumes.
 pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
+    ("product", "profile", OneOf(&["standard", "restricted"])),
     ("general", "log_level", Str),
     ("general", "default_agent", Str),
     ("general", "default_language", Str),
@@ -214,7 +215,6 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("runtime", "utility_provider", Str),
     ("runtime", "utility_model", Str),
     ("proactive", "natural_timing", Bool),
-    ("branding", "reply_footer", Bool),
     ("evolution", "fault_attribution", Bool),
     ("evolution", "eval_suites_root", Str),
     ("evolution", "eval_binary", Str),

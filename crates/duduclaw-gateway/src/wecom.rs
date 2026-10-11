@@ -380,6 +380,10 @@ async fn fetch_access_token(
 
 /// Create the WeCom webhook router. Returns `None` if not configured.
 pub async fn start_wecom_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
+    if let Err(e) = crate::product_policy::require_channel(home_dir, "wecom") {
+        tracing::warn!(error = %e, "Product policy refused channel startup");
+        return None;
+    }
     let corp_id = read_wecom_config(home_dir, "wecom_corp_id")
         .await
         .unwrap_or_default();
@@ -603,6 +607,7 @@ async fn handle_webhook(
 }
 
 async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
+    if crate::product_policy::require_channel(&state.ctx.home_dir, "wecom").is_err() { return; }
     let msg_type = xml_field(msg_xml, "MsgType").unwrap_or_default();
     if msg_type != "text" {
         return;
@@ -822,6 +827,7 @@ async fn send_wecom_msg(
 /// a fresh access token, and sends `text` chunks to `touser`. Standalone so
 /// the dispatcher can forward without a `ReplyContext`.
 pub async fn send_text_via_config(home_dir: &Path, touser: &str, text: &str) -> Result<(), String> {
+    crate::product_policy::require_channel(home_dir, "wecom")?;
     let corp_id = read_wecom_config(home_dir, "wecom_corp_id")
         .await
         .unwrap_or_default();
@@ -881,6 +887,7 @@ pub async fn send_photo_via_config(
     touser: &str,
     png_data: &[u8],
 ) -> Result<(), String> {
+    crate::product_policy::require_channel(home_dir, "wecom")?;
     let corp_id = read_wecom_config(home_dir, "wecom_corp_id")
         .await
         .unwrap_or_default();
@@ -957,6 +964,7 @@ pub async fn send_photo_via_config(
 }
 
 async fn read_wecom_config(home_dir: &Path, field: &str) -> Option<String> {
+    if crate::product_policy::require_channel(home_dir, "wecom").is_err() { return None; }
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field).await
 }
 

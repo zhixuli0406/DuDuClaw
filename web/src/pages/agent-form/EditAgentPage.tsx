@@ -1,3 +1,4 @@
+import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
@@ -209,6 +210,7 @@ const DEFAULT_ODOO_FORM: OdooFormState = {
  * overwritten. Admin-only fields are disabled and never sent for non-admins.
  */
 export function EditAgentPage() {
+  const policy = useProductPolicy();
   const intl = useIntl();
   const errorText = useErrorMessage();
   const navigate = useNavigate();
@@ -915,7 +917,7 @@ export function EditAgentPage() {
     { value: 'direct', label: intl.formatMessage({ id: 'agents.apiMode.direct' }), raw: 'direct' },
     { value: 'auto', label: intl.formatMessage({ id: 'agents.apiMode.auto' }), raw: 'auto' },
   ];
-  const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
+  const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
   const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
   // A saved deprecated runtime (e.g. gemini) is no longer offered, but stays
   // visible and labelled so the current value is shown and can be kept.

@@ -12,8 +12,8 @@
 #
 # TWO KINDS OF BOOLEAN IN THIS FILE (2026-09 — do not confuse them):
 #   1. Capability gates — a code path actually calls `FeatureGate::check()` on
-#      them and behaves differently. There are exactly three:
-#        premium_templates, white_label, industry_evolution_params
+#      them and behaves differently. There are exactly two:
+#        premium_templates, industry_evolution_params
 #   2. Service commitments — what the subscription PROMISES a human will do
 #      (support channels, patch SLA, hosting form factor, resale rights). They
 #      have NO enforcement anywhere in the binary and must never grow one by
@@ -37,16 +37,16 @@
 # Tier mapping to LicenseTier enum (see src/tier.rs):
 #   OpenSource     → no license file (default)
 #   Hobby          → Cloud trial (14d)
-#   Solo           → Cloud paid
-#   Studio         → Cloud paid
-#   Business             → Cloud paid
+#   Solo           → Cloud licensed
+#   Studio         → Cloud licensed
+#   Business             → Cloud licensed
 #   Partner              → Self-host FREE (NFR — partner use/demo, not resale)
-#   PersonalProSelfHost  → Self-host paid (personal form factor, NT$490/mo)
-#   SelfHostPro          → Self-host paid (enterprise form factor)
-#   Oem                  → Reserved for Year 2+
+#   PersonalProSelfHost  → Self-host licensed (personal form factor, )
+#   SelfHostPro          → Self-host licensed (enterprise form factor)
+#   Oem                  → Distributor-issued license
 #
 # See `commercial/docs/spec-license-module.md` for full specification.
-# See `commercial/docs/business-plan.md` for pricing rationale.
+# Licensing delivery and plan changes are handled by the exclusive distributor.
 
 # =============================================================================
 # OpenSource — default when no license file exists
@@ -97,10 +97,10 @@ license_phone_home_interval_days = 3
 license_grace_period_days = 7
 
 # =============================================================================
-# Solo — Cloud paid tier NT$990/mo
+# Solo — Cloud licensed tier
 # =============================================================================
 [solo]
-description = "Cloud Solo — NT$990/mo (1 agent, 2 channels)"
+description = "Cloud Solo — (1 agent, 2 channels)"
 cloud_only = true
 
 max_agents = 1
@@ -116,10 +116,10 @@ license_phone_home_interval_days = 7
 license_grace_period_days = 30
 
 # =============================================================================
-# Studio — Cloud paid tier NT$2,990/mo (premium templates included)
+# Studio — Cloud licensed tier  (premium templates included)
 # =============================================================================
 [studio]
-description = "Cloud Studio — NT$2,990/mo (3 agents, 5 channels, templates)"
+description = "Cloud Studio — (3 agents, 5 channels, templates)"
 cloud_only = true
 
 max_agents = 3
@@ -135,10 +135,10 @@ license_phone_home_interval_days = 7
 license_grace_period_days = 30
 
 # =============================================================================
-# Business — Cloud paid tier NT$8,900/mo (Odoo + private support)
+# Business — Cloud licensed tier  (Odoo + private support)
 # =============================================================================
 [business]
-description = "Cloud Business — NT$8,900/mo (unlimited, Odoo, private support)"
+description = "Cloud Business — (unlimited, Odoo, private support)"
 cloud_only = true
 
 max_agents = 0                      # unlimited
@@ -160,8 +160,8 @@ license_grace_period_days = 30
 # Partner (NFR — Not For Resale) — FREE self-host grant for partners
 # Granted to integration / channel partners for their own use, demos and
 # evaluation. Unlocks the same commercial modules as Self-Host Pro EXCEPT
-# white-label / redistribution (a partner may use, not resell). Price = 0;
-# issued via partner-code redemption or admin issuance, independently revocable.
+# redistribution (a partner may use, not resell). Price = 0;
+# issued through distributor administration, independently revocable.
 # =============================================================================
 [partner]
 description = "Partner (NFR) — free self-host grant for partners (use/demo, not resale)"
@@ -179,22 +179,21 @@ priority_security_patch = true      # ✓ immediate patches
 private_discord_support = true      # ✓ partner support channel
 odoo_integration_supported = true   # ✓
 
-# …but NOT resale rights — that is the OEM tier's paid differentiator.
-white_label = false                 # ✗ may not remove DuDuClaw branding
+# Distribution is managed through the exclusive distributor.
 redistribution = false              # ✗ may not embed in a product for sale
 
 license_phone_home_interval_days = 7
 license_grace_period_days = 30
 
 # =============================================================================
-# Personal Pro (Self-Host) — On-prem PERSONAL tier NT$490/mo or NT$4,900/yr
+# Personal Pro (Self-Host) — On-prem PERSONAL tier
 # The individual-developer self-host tier. Personal form factor.
 # Core is Apache 2.0 → NO max_* limits. Unlocks premium templates + priority
 # patches, but NOT the enterprise modules (evolution params / enterprise
 # dashboard) — those remain Self-Host Pro's differentiator.
 # =============================================================================
 [personal_pro_self_host]
-description = "Personal Pro (Self-Host) — NT$490/mo or NT$4,900/yr (templates + patches)"
+description = "Personal Pro (Self-Host) — (templates + patches)"
 self_host_only = true
 
 max_agents = 0
@@ -212,12 +211,12 @@ license_phone_home_interval_days = 7
 license_grace_period_days = 30
 
 # =============================================================================
-# Self-Host Pro — On-prem paid tier NT$1,490/mo or NT$14,900/yr
+# Self-Host Pro — On-prem licensed tier
 # Core is Apache 2.0, so NO max_* limits are enforced.
 # License gates only commercial/* modules.
 # =============================================================================
 [self_host_pro]
-description = "Self-Host Pro — NT$1,490/mo or NT$14,900/yr (commercial modules)"
+description = "Self-Host Pro — (commercial modules)"
 self_host_only = true
 
 # Limits ALWAYS unlimited for self-host (cannot enforce on customer's hardware
@@ -238,10 +237,10 @@ license_phone_home_interval_days = 7
 license_grace_period_days = 30
 
 # =============================================================================
-# OEM — Reserved for Year 2+ white-label customers
+# OEM — Distributor-issued licenses
 # =============================================================================
 [oem]
-description = "OEM license — white-label embedding/redistribution (Year 2+)"
+description = "Distributor-issued license"
 self_host_only = true
 
 max_agents = 0
@@ -253,8 +252,7 @@ industry_evolution_params = true
 dashboard_enterprise = true
 priority_security_patch = true
 private_discord_support = true
-white_label = true                  # ✓ remove DuDuClaw branding
-redistribution = true               # ✓ embed in own product for sale
+redistribution = true               # distributor delivery authorization
 dedicated_engineer = true
 
 license_phone_home_interval_days = 7

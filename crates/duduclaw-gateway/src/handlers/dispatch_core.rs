@@ -428,10 +428,6 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_license_activate(params).await
             }
-            "license.redeem" => {
-                require_admin!();
-                self.handle_license_redeem(params).await
-            }
 
             "accounts.list" => {
                 require_admin!();

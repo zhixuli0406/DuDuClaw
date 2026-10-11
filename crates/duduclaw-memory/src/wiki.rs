@@ -434,6 +434,48 @@ impl WikiStore {
         Ok((page, content))
     }
 
+    /// Read one bounded version for customer exports. Missing frontmatter
+    /// timestamps use the same file handle's mtime, never a moving `now()`.
+    pub fn read_export_page(&self, path: &str, max_bytes: u64) -> Result<(WikiPage, String)> {
+        use std::io::Read;
+        self.validate_page_path(path)?;
+        let _lease = self.delivery_fence().try_shared()?;
+        let full = self.wiki_dir.join(path);
+        let metadata = std::fs::symlink_metadata(&full)
+            .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DuDuClawError::Memory("export page path refused".into()));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&full)
+            .map_err(|e| DuDuClawError::Memory(format!("export page open: {e}")))?;
+        let metadata = file.metadata()
+            .map_err(|e| DuDuClawError::Memory(format!("export page metadata: {e}")))?;
+        if !metadata.is_file() {
+            return Err(DuDuClawError::Memory("export page path refused".into()));
+        }
+        if metadata.len() > max_bytes {
+            return Err(DuDuClawError::Memory("EXPORT_TOO_LARGE".into()));
+        }
+        let modified: DateTime<Utc> = metadata.modified()
+            .map_err(|e| DuDuClawError::Memory(format!("export page timestamp: {e}")))?.into();
+        let mut raw = String::new();
+        file.take(max_bytes.saturating_add(1)).read_to_string(&mut raw)
+            .map_err(|e| DuDuClawError::Memory(format!("export page read: {e}")))?;
+        if raw.len() as u64 > max_bytes {
+            return Err(DuDuClawError::Memory("EXPORT_TOO_LARGE".into()));
+        }
+        let mut page = parse_wiki_page(path, &raw)?;
+        if extract_datetime_field(&raw, "updated").is_none() { page.updated = modified; }
+        if extract_datetime_field(&raw, "created").is_none() { page.created = modified; }
+        Ok((page, raw))
+    }
+
     /// Read raw content of any wiki file (including reserved files).
     pub fn read_raw(&self, path: &str) -> Result<String> {
         if path.is_empty() || path.contains("..") || path.starts_with('/') || path.starts_with('\\') || path.contains('\0')

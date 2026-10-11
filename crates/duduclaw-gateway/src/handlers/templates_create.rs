@@ -138,6 +138,10 @@ impl MethodHandler {
                 return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}"));
             }
         };
+        if let Err(e) = crate::product_policy::load(&self.home_dir)
+            .and_then(|policy| crate::product_policy::validate_table(policy, &parsed_agent)) {
+            return WsFrame::error_response("", &e);
+        }
         let final_role = parsed_agent
             .get("agent")
             .and_then(|v| v.as_table())
