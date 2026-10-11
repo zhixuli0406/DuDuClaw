@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # to resolve the workspace, even though only duduclaw-relay is compiled).
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 
 RUN cargo build --release -p duduclaw-relay
 
