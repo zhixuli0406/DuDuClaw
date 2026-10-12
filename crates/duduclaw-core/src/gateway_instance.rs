@@ -68,7 +68,7 @@ pub fn acquire(home: &Path) -> Result<(), String> {
     }
     let result = (|| -> Result<File, String> {
         std::fs::create_dir_all(home.join("locks")).map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
