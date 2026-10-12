@@ -8,6 +8,7 @@ mod has_api_key_configured_tests;
 mod doctor_repair_hint_tests;
 mod edition_rpc_gate_table_tests;
 mod must_change_password_gate_tests;
+mod users_change_email_tests;
 mod data_file_guard_field_tests;
 mod evolution_v3_dashboard_tests;
 mod goal_task_settle_verb_tests;

@@ -122,6 +122,9 @@ impl MethodHandler {
             // and it's the sole password path in the single-owner edition (the
             // multi-user Users page is hidden there).
             "users.change_password" => self.handle_users_change_password(params, ctx).await,
+            // Self-service, same reasoning as `users.change_password`: it only
+            // changes the caller's own login email.
+            "users.change_email" => self.handle_users_change_email(params, ctx).await,
             "users.audit_log" => {
                 require_admin!();
                 self.handle_users_audit_log(params).await

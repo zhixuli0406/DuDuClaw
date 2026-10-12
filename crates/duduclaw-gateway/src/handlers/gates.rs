@@ -67,9 +67,10 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 ///
 /// # Deliberate exclusions (documented so they are not "fixed" back in)
 ///
-/// - `users.me` / `users.change_password` — self-service only (both resolve the
-///   target from `ctx.user_id`, never from params). §1.6 keeps the 帳號與密碼
-///   tab open in Personal, and it is the *only* password path there.
+/// - `users.me` / `users.change_password` / `users.change_email` — self-service
+///   only (all resolve the target from `ctx.user_id`, never from params). §1.6
+///   keeps the 帳號與密碼 tab open in Personal, and it is the *only* password
+///   and email path there.
 /// - `license.*` — 授權管理 is `personalHidden` in the UI, but `license.activate`
 ///   is the authorized license installation path. Blocking it in Personal
 ///   would make Enterprise unreachable (edition is derived from license tier).
@@ -86,7 +87,7 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
     // ── Self-service carve-outs inside an otherwise Enterprise family ──────
     // Checked first so the family rule below cannot swallow them.
-    if matches!(method, "users.me" | "users.change_password") {
+    if matches!(method, "users.me" | "users.change_password" | "users.change_email") {
         return false;
     }
 

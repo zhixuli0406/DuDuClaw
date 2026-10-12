@@ -1,11 +1,12 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate } from 'react-router';
 import { KeyRound } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api } from '@/lib/api';
+import { api, type EmailSetup } from '@/lib/api';
+import { changeOwnEmail, emailChangeErrorId } from '@/lib/account-email';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
@@ -17,7 +18,7 @@ import {
 } from '@/components/mds';
 import { SettingRow } from './shared';
 
-// ── Account tab — self-service password change ────────────────────────────────
+// ── Account tab — self-service email and password change ──────────────────────
 // The single-owner (personal) edition hides the multi-user Users page, so this
 // is the only place the sole admin can rotate their own dashboard password.
 // Available in every edition; it only mutates the logged-in user's own account.
@@ -50,6 +51,47 @@ export function AccountTab() {
   // so "did my old password not match?" was unanswerable 7 seconds later. The
   // reason now stays under the field group until the next attempt.
   const [submitError, setSubmitError] = useState<unknown>(null);
+
+  // Self-service email change. `users.me` says whether the current password
+  // is needed: a Personal owner signed in by local auto-login never chose one.
+  const [emailSetup, setEmailSetup] = useState<EmailSetup | null>(null);
+  const [newEmail, setNewEmail] = useState('');
+  const [emailPassword, setEmailPassword] = useState('');
+  const [emailSaving, setEmailSaving] = useState(false);
+  const [emailError, setEmailError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    api.users
+      .me()
+      .then((me) => {
+        if (active) setEmailSetup(me.email_setup ?? { placeholder: false, password_required: true });
+      })
+      .catch(() => {
+        if (active) setEmailSetup({ placeholder: false, password_required: true });
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const emailPasswordRequired = emailSetup?.password_required ?? true;
+
+  const submitEmail = async () => {
+    setEmailError('');
+    setEmailSaving(true);
+    try {
+      await changeOwnEmail(newEmail, emailPasswordRequired ? emailPassword : undefined);
+      toast.success(intl.formatMessage({ id: 'settings.account.email.changed' }));
+      setNewEmail('');
+      setEmailPassword('');
+      setEmailSetup((prev) => (prev ? { ...prev, placeholder: false } : prev));
+    } catch (e) {
+      setEmailError(intl.formatMessage({ id: emailChangeErrorId(e) }));
+    } finally {
+      setEmailSaving(false);
+    }
+  };
 
   const submit = async () => {
     if (next.length < 8) {
@@ -185,6 +227,57 @@ export function AccountTab() {
             : intl.formatMessage({ id: 'settings.account.submit' })}
         </Button>
       </div>
+
+      <SettingsSection
+        title={intl.formatMessage({ id: 'settings.account.email.title' })}
+        description={intl.formatMessage({ id: 'settings.account.email.hint' })}
+      >
+        <SettingsCard>
+          <SettingsRow label={intl.formatMessage({ id: 'settings.account.email.new' })} tier="text">
+            <Input
+              type="email"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              autoComplete="email"
+              placeholder="you@company.com"
+              aria-invalid={emailError !== ''}
+              aria-describedby={emailError ? 'account-email-error' : undefined}
+            />
+          </SettingsRow>
+          {emailPasswordRequired && (
+            <SettingsRow label={intl.formatMessage({ id: 'settings.account.current' })} tier="text">
+              <Input
+                type="password"
+                value={emailPassword}
+                onChange={(e) => setEmailPassword(e.target.value)}
+                autoComplete="current-password"
+              />
+            </SettingsRow>
+          )}
+        </SettingsCard>
+        {emailError && (
+          <p id="account-email-error" role="alert" className="mt-2 text-sm text-destructive">
+            {emailError}
+          </p>
+        )}
+        <div className="mt-3 flex items-center justify-end">
+          <Button
+            variant="brand"
+            size="sm"
+            onClick={() => void submitEmail()}
+            disabled={
+              emailSetup === null ||
+              emailSaving ||
+              newEmail.trim() === '' ||
+              (emailPasswordRequired && !emailPassword)
+            }
+          >
+            {emailSaving
+              ? intl.formatMessage({ id: 'common.saving' })
+              : intl.formatMessage({ id: 'settings.account.email.submit' })}
+          </Button>
+        </div>
+      </SettingsSection>
     </div>
   );
 }

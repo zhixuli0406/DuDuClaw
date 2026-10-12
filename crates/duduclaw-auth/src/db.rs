@@ -450,6 +450,31 @@ impl UserDb {
         Ok(())
     }
 
+    /// Change a user's login email. `email` must already have passed
+    /// [`validate_account_email`]. An address another account already uses
+    /// returns [`EMAIL_IN_USE`] and changes nothing.
+    pub fn change_email(&self, user_id: &str, email: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn();
+        let affected = conn
+            .execute(
+                "UPDATE users SET email = ?1, updated_at = ?2 WHERE id = ?3",
+                params![email, now, user_id],
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(f, _)
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    EMAIL_IN_USE.to_string()
+                }
+                other => format!("update error: {other}"),
+            })?;
+        if affected == 0 {
+            return Err("user not found".to_string());
+        }
+        Ok(())
+    }
+
     /// Set a user's status (active / suspended / offboarded).
     pub fn set_user_status(&self, user_id: &str, status: UserStatus) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
@@ -830,6 +855,10 @@ impl UserDb {
 /// `pending-account.json`, the Personal-edition implicit claim) keep it.
 pub const BOOTSTRAP_PLACEHOLDER_EMAIL: &str = "admin@local";
 
+/// Error returned when an email is already used by another account. Stable
+/// string: the gateway passes it through and the dashboard keys on it.
+pub const EMAIL_IN_USE: &str = "email is already in use";
+
 /// Maximum length of an email address (RFC 5321 path limit).
 const MAX_EMAIL_LEN: usize = 254;
 
@@ -1130,6 +1159,27 @@ mod tests {
         drop(db);
         let db = UserDb::new(tmp.path()).unwrap();
         assert_eq!(db.get_bootstrap_owner().unwrap().unwrap().email, "owner@example.com");
+    }
+
+    #[test]
+    fn change_email_updates_login_and_refuses_taken_address() {
+        let (db, _tmp) = test_db();
+        let a = db
+            .create_user("a@example.com", "A", "password-a", UserRole::Admin)
+            .unwrap();
+        db.create_user("b@example.com", "B", "password-b", UserRole::Employee)
+            .unwrap();
+
+        db.change_email(&a.id, "a-new@example.com").unwrap();
+        assert!(db.verify_password("a-new@example.com", "password-a").is_ok());
+        assert!(db.verify_password("a@example.com", "password-a").is_err());
+
+        assert_eq!(
+            db.change_email(&a.id, "b@example.com").unwrap_err(),
+            EMAIL_IN_USE
+        );
+        assert_eq!(db.get_user(&a.id).unwrap().unwrap().email, "a-new@example.com");
+        assert!(db.change_email("no-such-id", "c@example.com").is_err());
     }
 
     #[test]

@@ -3669,6 +3669,7 @@ async fn handle_first_run_status(
 ///      single-shot;
 ///   3. minimum password length;
 ///   4. email shape, when one is given (omitted = keep `admin@local`).
+///
 /// After a successful claim the flag is cleared and the endpoint goes inert.
 /// The response carries the email the account now logs in with.
 async fn handle_first_run_claim(
@@ -3709,7 +3710,7 @@ async fn handle_first_run_claim(
         if matches!(state.user_db.get_user_by_email(email), Ok(Some(_))) {
             return (
                 axum::http::StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "email is already in use"})),
+                Json(serde_json::json!({"error": duduclaw_auth::db::EMAIL_IN_USE})),
             )
                 .into_response();
         }
