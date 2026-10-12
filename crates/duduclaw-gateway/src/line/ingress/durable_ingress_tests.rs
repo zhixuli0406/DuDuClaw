@@ -242,7 +242,7 @@ async fn slow_conversation_does_not_block_others_and_same_chat_stays_ordered() {
         );
     }
     let worker = tokio::spawn(drain_line_ingress(state.clone()));
-    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, entered.notified())
         .await
         .unwrap();
     for _ in 0..150 {
@@ -379,7 +379,7 @@ async fn assert_worker_exit_stops_renewal(panic_worker: bool) {
             drain_line_worker(worker_state, IngressLane::Normal).await;
         }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, entered.notified())
         .await
         .unwrap();
     let store = state.ingress.as_ref().unwrap();
@@ -390,7 +390,7 @@ async fn assert_worker_exit_stops_renewal(panic_worker: bool) {
         .into_iter()
         .find(|r| r.event_id == event_id)
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
         loop {
             if probe
                 .renewals
@@ -415,7 +415,7 @@ async fn assert_worker_exit_stops_renewal(panic_worker: bool) {
             .await
             .line_workers
             + 1;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
             while probe.starts.load(std::sync::atomic::Ordering::SeqCst) <= lanes {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

@@ -189,7 +189,7 @@ impl BranchOverlay {
     /// Last-resort recovery: relinquish automatic deletion of the private root.
     pub(crate) fn keep_source(self) -> PathBuf {
         let workspace = self.work.clone();
-        self._root.keep();
+        let _ = self._root.keep();
         workspace
     }
 

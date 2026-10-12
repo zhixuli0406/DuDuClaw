@@ -1540,7 +1540,6 @@ impl Drop for BoundedChannelExecutor {
 
 #[cfg(test)]
 pub(crate) mod native_loop_fixture {
-    use super::*;
     use crate::computer_use::{ComputerAction, ComputerUseError};
     use crate::computer_use_orchestrator::{MaskedScreenshot, OrchestratorControl};
     use crate::computer_use_sessions::{ComputerUseSessions, SessionBackend};
@@ -1548,6 +1547,10 @@ pub(crate) mod native_loop_fixture {
         Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     };
+    /// Upper bound for the fixture's poll-until-state helpers; each wait ends
+    /// as soon as the state is reached. 5 s was missed on a loaded Windows CI
+    /// runner (2026-10-12).
+    const FIXTURE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
     type Job = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
     type Pause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
     fn pauses() -> &'static Mutex<std::collections::HashMap<String, Pause>> {
@@ -1582,26 +1585,6 @@ pub(crate) mod native_loop_fixture {
             >,
         > = OnceLock::new();
         JOBS.get_or_init(Default::default)
-    }
-    pub(crate) fn take_job(token: &str) -> Option<Job> {
-        jobs()
-            .lock()
-            .unwrap()
-            .get_mut(token)?
-            .pop_front()
-            .map(|(_, job)| job)
-    }
-    pub(crate) fn install_job<F: std::future::Future<Output = ()> + Send + 'static>(
-        token: &str,
-        work: F,
-    ) -> JobGuard {
-        jobs()
-            .lock()
-            .unwrap()
-            .entry(token.to_owned())
-            .or_default()
-            .push_back((None, Box::pin(work)));
-        JobGuard(token.to_owned())
     }
     pub(crate) fn take_job_for(token: &str, text: &str) -> Option<Job> {
         let mut map = jobs().lock().unwrap();
@@ -1897,7 +1880,7 @@ pub(crate) mod native_loop_fixture {
             }
         }
         pub(crate) async fn pending_id(&self) -> String {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::time::timeout(FIXTURE_WAIT, async {
                 loop {
                     if let Ok(b) = crate::approval::ApprovalBroker::open(self.home.path()) {
                         if let Ok(rows) = b.list_pending(Some("alice")).await {
@@ -1913,7 +1896,7 @@ pub(crate) mod native_loop_fixture {
             .expect("actual CU never reached persisted approval wait")
         }
         pub(crate) async fn wait_executed(&self) {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::time::timeout(FIXTURE_WAIT, async {
                 loop {
                     if self.executed.load(Ordering::SeqCst) == 1 {
                         if let Ok(broker) = crate::approval::ApprovalBroker::open(self.home.path())

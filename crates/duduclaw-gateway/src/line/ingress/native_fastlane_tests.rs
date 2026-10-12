@@ -33,7 +33,7 @@ async fn send(state: &LineState, value: &serde_json::Value) -> StatusCode {
     handle_line_webhook(state.clone(), &headers, Bytes::from(bytes)).await
 }
 async fn wait_status(state: &LineState, event_id: &str, wanted: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
         loop {
             if state
                 .ingress
@@ -253,7 +253,7 @@ async fn signed_line_same_chat_confirmation_bypasses_waiting_cu_fifo_and_shares_
         assert_eq!(send(&state, &confirmation).await, StatusCode::OK);
         if postback {
             tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                crate::line::ingress::TEST_WAIT,
                 decision_committed.notified(),
             )
             .await
@@ -420,7 +420,7 @@ async fn signed_line_legacy_postback_keeps_original_domain_auth_and_corrupt_bind
             crate::approval::ApprovalStatus::Denied
         };
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            tokio::time::timeout(crate::line::ingress::TEST_WAIT, waiter)
                 .await
                 .unwrap()
                 .unwrap(),

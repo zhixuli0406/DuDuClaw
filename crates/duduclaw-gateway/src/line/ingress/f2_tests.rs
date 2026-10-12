@@ -119,7 +119,7 @@ pub(super) async fn wait_for(
     wanted: &[&str],
 ) -> crate::channel_ingress::IngressRow {
     let store = state.ingress.as_ref().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
         loop {
             if let Some(row) = store
                 .list()
@@ -451,7 +451,7 @@ async fn unreadable_authority_backs_off_before_quarantine() {
     assert_eq!(post(&state, &envelope("b", "follow")).await, StatusCode::OK);
     // F5 N1: only a snapshotted event is claimable; let the snapshot land.
     let store = state.ingress.as_ref().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
         while store.list().await.unwrap()[0].snapshot_pending() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -461,7 +461,7 @@ async fn unreadable_authority_backs_off_before_quarantine() {
     // The routed employee's file becomes unreadable (a half-written save).
     std::fs::write(dir.path().join("agents/line-agent/agent.toml"), "half = [").unwrap();
     let worker = tokio::spawn(drain_line_worker(state.clone(), IngressLane::Normal));
-    let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let row = tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
         loop {
             let row = store.list().await.unwrap().remove(0);
             if row.unavailable_count > 0 {
@@ -633,7 +633,7 @@ async fn rerun_after_switching_to_fail_policy_runs_nothing() {
     age_events(&state, 120).await;
     let store = state.ingress.as_ref().unwrap();
     // Let the post-commit snapshot land first, so the CAS below is stable.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::line::ingress::TEST_WAIT, async {
         while store.list().await.unwrap()[0].snapshot_pending() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
