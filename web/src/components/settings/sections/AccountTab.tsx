@@ -53,7 +53,8 @@ export function AccountTab() {
   const [submitError, setSubmitError] = useState<unknown>(null);
 
   // Self-service email change. `users.me` says whether the current password
-  // is needed: a Personal owner signed in by local auto-login never chose one.
+  // is needed (for the email AND the password forms): a Personal owner signed
+  // in by local auto-login never chose one.
   const [emailSetup, setEmailSetup] = useState<EmailSetup | null>(null);
   const [newEmail, setNewEmail] = useState('');
   const [emailPassword, setEmailPassword] = useState('');
@@ -102,14 +103,14 @@ export function AccountTab() {
       toast.error(intl.formatMessage({ id: 'settings.account.mismatch' }));
       return;
     }
-    if (next === current) {
+    if (emailPasswordRequired && next === current) {
       toast.error(intl.formatMessage({ id: 'settings.account.sameAsOld' }));
       return;
     }
     setSaving(true);
     setSubmitError(null);
     try {
-      await api.users.changePassword(current, next);
+      await api.users.changePassword(emailPasswordRequired ? current : '', next);
       toast.success(intl.formatMessage({ id: 'settings.account.changed' }));
       setCurrent('');
       setNext('');
@@ -171,16 +172,18 @@ export function AccountTab() {
 
       <SettingsSection description={intl.formatMessage({ id: 'settings.account.hint' })}>
         <SettingsCard>
-          <SettingsRow label={intl.formatMessage({ id: 'settings.account.current' })} tier="text">
-            <Input
-              type="password"
-              value={current}
-              onChange={(e) => setCurrent(e.target.value)}
-              autoComplete="current-password"
-              aria-invalid={submitError != null}
-              aria-describedby={submitError != null ? 'account-submit-error' : undefined}
-            />
-          </SettingsRow>
+          {emailPasswordRequired && (
+            <SettingsRow label={intl.formatMessage({ id: 'settings.account.current' })} tier="text">
+              <Input
+                type="password"
+                value={current}
+                onChange={(e) => setCurrent(e.target.value)}
+                autoComplete="current-password"
+                aria-invalid={submitError != null}
+                aria-describedby={submitError != null ? 'account-submit-error' : undefined}
+              />
+            </SettingsRow>
+          )}
           <SettingsRow label={intl.formatMessage({ id: 'settings.account.new' })} tier="text">
             <Input
               type="password"
@@ -220,7 +223,7 @@ export function AccountTab() {
           variant="brand"
           size="sm"
           onClick={() => void submit()}
-          disabled={saving || !current || !next || !confirm}
+          disabled={saving || emailSetup === null || (emailPasswordRequired && !current) || !next || !confirm}
         >
           {saving
             ? intl.formatMessage({ id: 'common.saving' })
