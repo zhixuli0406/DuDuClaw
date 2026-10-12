@@ -36,7 +36,7 @@
 #   4. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs / installers / desktop)
 #   4. POST-BUMP ASSERT: every platform manifest now reads the new version, else abort
 #   5. Update CHANGELOG.md
-#   6. cargo check
+#   6. cargo check (+ re-resolve the desktop app's own src-tauri/Cargo.lock)
 #   7. Generate versioned distributor HTML when commercial sources are present
 #   8. git commit + tag
 #   9. Print next steps + the registry-verify command
@@ -705,6 +705,23 @@ if [ -d "commercial/duduclaw-pro-gateway" ]; then
     fi
 fi
 
+# The desktop app (src-tauri) is its own Cargo workspace with its own
+# Cargo.lock, and that lock pins the versions of the workspace crates it
+# reaches by path (duduclaw-core, duduclaw-pets). `cargo check --workspace`
+# never touches it, so after a bump those entries still carry the old version
+# and every `--locked` build of the desktop refuses the lock: the CI Security
+# Audit, the desktop release workflow. v1.72.3's bump PR failed exactly that
+# way. `cargo metadata` re-resolves the lock and rewrites only those path
+# entries (same transformation release_delivery.py accepts for a Cargo.lock).
+if [[ -f src-tauri/Cargo.toml && -f src-tauri/Cargo.lock ]]; then
+    echo "Re-resolving src-tauri/Cargo.lock for the new workspace crate versions..."
+    if ! cargo metadata --format-version 1 --manifest-path src-tauri/Cargo.toml >/dev/null; then
+        echo "Error: could not re-resolve src-tauri/Cargo.lock. Reverting version bump."
+        git reset --hard HEAD
+        exit 1
+    fi
+fi
+
 # --- Distributor technical brief (private source, separate repository) ---
 # Keep content review dates and historical feature versions intact. The renderer
 # labels a newer release edition separately from the source's reviewed version.
@@ -742,6 +759,7 @@ while IFS='|' read -r _kind file; do
     fi
 done < <(platform_manifests)
 [[ -f Cargo.lock ]] && STAGE_FILES+=("Cargo.lock")
+[[ -f src-tauri/Cargo.lock ]] && STAGE_FILES+=("src-tauri/Cargo.lock")
 STAGE_FILES+=("CHANGELOG.md")
 STAGE_FILES+=("$DELIVERY_DIR/v$NEW_VERSION.json" "$DELIVERY_DIR/v$NEW_VERSION.sig")
 git add -- "${STAGE_FILES[@]}"
