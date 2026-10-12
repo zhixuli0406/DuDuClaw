@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- 儀表板首次設定改成填入你自己的電子郵件和密碼，之後用這個信箱登入，不再固定是 `admin@local`。`POST /api/first-run/claim` 新增選填的 `email` 欄位，回應帶回實際登入用的信箱；沒帶 `email` 的呼叫端（DuDuClaw OS 開機設定、安裝程式留下的 `pending-account.json`、個人版本機自動登入）照舊沿用 `admin@local`。使用者資料表新增 `bootstrap_owner` 欄位標記初始擁有者帳號，舊資料庫升級時會把 `admin@local` 那一列標上；首次設定狀態與本機自動登入改用這個標記找帳號，不再依信箱查詢。已完成設定的安裝不受影響，帳號信箱維持原樣。
+
 ## [1.72.2] - 2026-10-11 — 安全更新與資料匯出
 
 ### Added

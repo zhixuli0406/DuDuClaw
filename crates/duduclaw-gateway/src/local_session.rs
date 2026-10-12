@@ -7,7 +7,8 @@
 //! password into their own laptop buys nothing: anything able to reach the
 //! endpoint can already read `~/.duduclaw/jwt_secret` (§2.4.4). So the
 //! dashboard asks the gateway for a session and the gateway issues a **normal
-//! JWT pair for the real `admin@local` user** — not a synthetic context. That
+//! JWT pair for the real bootstrap owner** (`UserDb::get_bootstrap_owner`,
+//! found by flag so a claimed email still resolves) — not a synthetic context. That
 //! choice is the whole point of plan A: every downstream authorization
 //! decision (203 `require_admin!` sites, the WS handshake, audit attribution)
 //! keeps working byte-identically, because only the *way the token is
@@ -54,10 +55,6 @@
 
 use axum::http::HeaderMap;
 use std::path::Path;
-
-/// The single-owner account a local session is issued for. Same row
-/// `ensure_default_admin` bootstraps and `claim_default_admin` claims.
-pub(crate) const LOCAL_ADMIN_EMAIL: &str = "admin@local";
 
 /// Header the dashboard must send. Its *value* matters less than its
 /// existence (a custom header is what forces the preflight), but we pin `1`

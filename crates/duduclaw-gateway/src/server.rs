@@ -816,12 +816,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let loopback_only = matches!(config.bind.as_str(), "127.0.0.1" | "::1" | "localhost");
         if loopback_only {
             println!(
-                "\n  🔑 First-run setup: open the dashboard and set the admin password there (admin@local)."
+                "\n  🔑 First-run setup: open the dashboard and set the owner email and password there."
             );
             println!();
         } else {
             println!("\n  🔑 First-run admin — log in with this, you'll be asked to change it:");
-            println!("     Email:    admin@local");
+            println!("     Email:    {}", duduclaw_auth::db::BOOTSTRAP_PLACEHOLDER_EMAIL);
             println!(
                 "     Password: {}",
                 bootstrap_password.as_deref().unwrap_or_default()
@@ -3638,6 +3638,10 @@ async fn handle_change_password(
 
 #[derive(serde::Deserialize)]
 struct FirstRunClaimRequest {
+    /// The owner's real email. Optional for backward compatibility: the OS
+    /// shell OOBE sends a password only and keeps the placeholder address.
+    #[serde(default)]
+    email: Option<String>,
     password: String,
 }
 
@@ -3655,14 +3659,18 @@ async fn handle_first_run_status(
     Json(serde_json::json!({ "claimable": claimable }))
 }
 
-/// POST /api/first-run/claim — set the initial `admin@local` password WITHOUT an
-/// old password, so a first-time operator (incl. Desktop-app users with no
-/// console) can get in. Fail-closed on three gates:
+/// POST /api/first-run/claim — set the bootstrap owner's email and password
+/// WITHOUT an old password, so a first-time operator (incl. Desktop-app users
+/// with no console) can get in under their own address. Fail-closed on four
+/// gates:
 ///   1. loopback caller only (a remote attacker cannot reach the flow);
 ///   2. instance still unclaimed (`must_change_password = 1`) — enforced
-///      atomically inside `claim_default_admin`, so it is single-shot;
-///   3. minimum password length.
+///      atomically inside `claim_default_admin_with_email`, so it is
+///      single-shot;
+///   3. minimum password length;
+///   4. email shape, when one is given (omitted = keep `admin@local`).
 /// After a successful claim the flag is cleared and the endpoint goes inert.
+/// The response carries the email the account now logs in with.
 async fn handle_first_run_claim(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -3682,12 +3690,40 @@ async fn handle_first_run_claim(
         )
             .into_response();
     }
-    match state.user_db.claim_default_admin(&body.password) {
+    let email = match body.email.as_deref() {
+        None => None,
+        Some(raw) => match duduclaw_auth::db::validate_account_email(raw) {
+            Ok(email) => Some(email),
+            Err(reason) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": reason})),
+                )
+                    .into_response();
+            }
+        },
+    };
+    // Only the owner exists before the claim, so this is near-unreachable;
+    // without it a taken address would surface as the UNIQUE failure's 500.
+    if let Some(email) = email {
+        if matches!(state.user_db.get_user_by_email(email), Ok(Some(_))) {
+            return (
+                axum::http::StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "email is already in use"})),
+            )
+                .into_response();
+        }
+    }
+    match state
+        .user_db
+        .claim_default_admin_with_email(email, &body.password)
+    {
         Ok(true) => {
             let _ = state
                 .user_db
                 .log_action(None, "first_run_claim", None, None, None);
-            Json(serde_json::json!({"ok": true})).into_response()
+            let email = email.unwrap_or(duduclaw_auth::db::BOOTSTRAP_PLACEHOLDER_EMAIL);
+            Json(serde_json::json!({"ok": true, "email": email})).into_response()
         }
         Ok(false) => (
             axum::http::StatusCode::CONFLICT,
@@ -3889,7 +3925,7 @@ async fn handle_first_run_network_connect(
 /// POST /api/session/local — Personal-edition passwordless local session
 /// (WP-F1, design §2.3, decision D3 = plan A).
 ///
-/// Issues a **normal** JWT pair for the real `admin@local` user to a caller
+/// Issues a **normal** JWT pair for the real bootstrap owner to a caller
 /// that has proven it is sitting at this machine. Nothing downstream changes:
 /// the token is indistinguishable from one obtained via `/api/login`, so every
 /// `require_admin!` site, the WS handshake, and audit attribution keep working
@@ -3901,7 +3937,7 @@ async fn handle_first_run_network_connect(
 /// state, or which condition it tripped — same rule as
 /// `handle_first_run_status` never advertising `claimable` off-loopback.
 ///
-/// One subtlety worth stating: the bootstrap `admin@local` carries
+/// One subtlety worth stating: the unclaimed bootstrap owner carries
 /// `must_change_password = 1`, and `authenticate_jwt` refuses *all* operations
 /// while that flag is set — so a token issued without clearing it would be
 /// dead on its very next request. The endpoint therefore performs an implicit
@@ -3954,12 +3990,9 @@ async fn handle_local_session(
         }
     }
 
-    let user = match state
-        .user_db
-        .get_user_by_email(local_session::LOCAL_ADMIN_EMAIL)
-    {
+    let user = match state.user_db.get_bootstrap_owner() {
         Ok(Some(u)) => u,
-        // No bootstrap admin (operator deleted/renamed it) — fall back to the
+        // No bootstrap owner (operator deleted it) — fall back to the
         // login page rather than inventing an identity.
         Ok(None) => return refused(),
         Err(e) => {

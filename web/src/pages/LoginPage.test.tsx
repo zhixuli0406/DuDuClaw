@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { LoginPage } from './LoginPage';
@@ -31,5 +31,32 @@ describe('<LoginPage>', () => {
     // Email + password fields and the brand submit button.
     expect(screen.getByLabelText('Email')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Sign In' })).toBeInTheDocument();
+  });
+});
+
+describe('<LoginPage> first-run claim', () => {
+  it('asks for the owner email and sends it with the password', async () => {
+    const firstRunClaim = vi.fn(async () => undefined);
+    useAuthStore.setState({
+      firstRunStatus: (async () => true) as never,
+      firstRunClaim: firstRunClaim as never,
+    });
+    renderWithProviders(<LoginPage />);
+
+    const email = await screen.findByLabelText('Your email');
+    const submit = screen.getByRole('button', { name: 'Set password & sign in' });
+    fireEvent.change(screen.getByLabelText('Set a password'), { target: { value: 'a-strong-pw' } });
+    fireEvent.change(screen.getByLabelText('Confirm password'), { target: { value: 'a-strong-pw' } });
+    // No email yet → cannot submit.
+    expect(submit).toBeDisabled();
+
+    fireEvent.change(email, { target: { value: 'owner@example.com' } });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(firstRunClaim).toHaveBeenCalledWith('owner@example.com', 'a-strong-pw'),
+    );
+    expect(screen.queryByPlaceholderText('admin@local')).not.toBeInTheDocument();
   });
 });
