@@ -1540,7 +1540,6 @@ impl Drop for BoundedChannelExecutor {
 
 #[cfg(test)]
 pub(crate) mod native_loop_fixture {
-    use super::*;
     use crate::computer_use::{ComputerAction, ComputerUseError};
     use crate::computer_use_orchestrator::{MaskedScreenshot, OrchestratorControl};
     use crate::computer_use_sessions::{ComputerUseSessions, SessionBackend};
@@ -1586,26 +1585,6 @@ pub(crate) mod native_loop_fixture {
             >,
         > = OnceLock::new();
         JOBS.get_or_init(Default::default)
-    }
-    pub(crate) fn take_job(token: &str) -> Option<Job> {
-        jobs()
-            .lock()
-            .unwrap()
-            .get_mut(token)?
-            .pop_front()
-            .map(|(_, job)| job)
-    }
-    pub(crate) fn install_job<F: std::future::Future<Output = ()> + Send + 'static>(
-        token: &str,
-        work: F,
-    ) -> JobGuard {
-        jobs()
-            .lock()
-            .unwrap()
-            .entry(token.to_owned())
-            .or_default()
-            .push_back((None, Box::pin(work)));
-        JobGuard(token.to_owned())
     }
     pub(crate) fn take_job_for(token: &str, text: &str) -> Option<Job> {
         let mut map = jobs().lock().unwrap();
