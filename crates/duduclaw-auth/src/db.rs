@@ -58,7 +58,8 @@ impl UserDb {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_login TEXT,
-                must_change_password INTEGER NOT NULL DEFAULT 0
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                bootstrap_owner INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS user_agent_bindings (
@@ -154,6 +155,34 @@ impl UserDb {
         if !has_dept {
             conn.execute("ALTER TABLE users ADD COLUMN department TEXT", [])
                 .map_err(|e| format!("failed to migrate users.department: {e}"))?;
+        }
+
+        // Idempotent migration: `bootstrap_owner` marks the row
+        // `ensure_default_admin` created, so the first-run claim and the
+        // Personal-edition local session can find the owner after the claim
+        // replaced its placeholder email. Databases from before this column
+        // existed only ever had the owner under the placeholder address, so
+        // the backfill runs once, in the same step that adds the column.
+        let has_owner = conn
+            .prepare("PRAGMA table_info(users)")
+            .and_then(|mut stmt| {
+                let cols = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<String>, _>>()?;
+                Ok(cols.iter().any(|c| c == "bootstrap_owner"))
+            })
+            .map_err(|e| format!("failed to inspect users table: {e}"))?;
+        if !has_owner {
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN bootstrap_owner INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("failed to migrate users.bootstrap_owner: {e}"))?;
+            conn.execute(
+                "UPDATE users SET bootstrap_owner = 1 WHERE email = ?1",
+                params![BOOTSTRAP_PLACEHOLDER_EMAIL],
+            )
+            .map_err(|e| format!("failed to backfill users.bootstrap_owner: {e}"))?;
         }
         Ok(())
     }
@@ -421,6 +450,31 @@ impl UserDb {
         Ok(())
     }
 
+    /// Change a user's login email. `email` must already have passed
+    /// [`validate_account_email`]. An address another account already uses
+    /// returns [`EMAIL_IN_USE`] and changes nothing.
+    pub fn change_email(&self, user_id: &str, email: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn();
+        let affected = conn
+            .execute(
+                "UPDATE users SET email = ?1, updated_at = ?2 WHERE id = ?3",
+                params![email, now, user_id],
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(f, _)
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    EMAIL_IN_USE.to_string()
+                }
+                other => format!("update error: {other}"),
+            })?;
+        if affected == 0 {
+            return Err("user not found".to_string());
+        }
+        Ok(())
+    }
+
     /// Set a user's status (active / suspended / offboarded).
     pub fn set_user_status(&self, user_id: &str, status: UserStatus) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
@@ -452,20 +506,24 @@ impl UserDb {
 
     // ── First-run claim (onboarding chicken-and-egg fix) ─────
     //
-    // A fresh install bootstraps `admin@local` with a random one-time password
-    // and `must_change_password = 1`. That password is only visible on the
-    // server console, which a Desktop-app / non-terminal operator never sees —
-    // so the LoginPage offers a browser "claim" flow instead. These helpers back
-    // it; the HTTP handler additionally gates the flow to loopback callers.
+    // A fresh install bootstraps an owner account under the placeholder email
+    // `admin@local` with a random one-time password and
+    // `must_change_password = 1`. That password is only visible on the server
+    // console, which a Desktop-app / non-terminal operator never sees — so the
+    // LoginPage offers a browser "claim" flow instead, where the operator sets
+    // their own email and password. These helpers back it; the HTTP handler
+    // additionally gates the flow to loopback callers. The owner row is found
+    // by its `bootstrap_owner` flag, never by email, because the claim may
+    // replace the placeholder address.
 
-    /// True while the instance is unclaimed: `admin@local` still carries the
-    /// forced-change flag (its bootstrap password has never been replaced).
+    /// True while the instance is unclaimed: the bootstrap owner still carries
+    /// the forced-change flag (its bootstrap password has never been replaced).
     /// Once the password is set (via claim or a normal change), this is false
     /// and the claim endpoint becomes inert.
     pub fn is_unclaimed_default_admin(&self) -> bool {
         let conn = self.conn();
         conn.query_row(
-            "SELECT must_change_password FROM users WHERE email = 'admin@local'",
+            "SELECT must_change_password FROM users WHERE bootstrap_owner = 1",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -473,29 +531,45 @@ impl UserDb {
         .unwrap_or(false) // no such row / error → not claimable (fail-closed)
     }
 
-    /// Atomically set the bootstrap admin's password and clear the forced-change
-    /// flag, but ONLY while still unclaimed (`must_change_password = 1`). The
-    /// single guarded `UPDATE` is the concurrency gate: a second racing claim
-    /// affects 0 rows. Returns `Ok(true)` when this call performed the claim,
-    /// `Ok(false)` when the instance was already claimed.
+    /// Claim the bootstrap owner keeping its current email. See
+    /// [`Self::claim_default_admin_with_email`].
     pub fn claim_default_admin(&self, new_password: &str) -> Result<bool, String> {
+        self.claim_default_admin_with_email(None, new_password)
+    }
+
+    /// Atomically set the bootstrap owner's password (and, when given, replace
+    /// its placeholder email) and clear the forced-change flag, but ONLY while
+    /// still unclaimed (`must_change_password = 1`). The single guarded
+    /// `UPDATE` is the concurrency gate: a second racing claim affects 0 rows.
+    /// Returns `Ok(true)` when this call performed the claim, `Ok(false)` when
+    /// the instance was already claimed.
+    ///
+    /// `email` must already have passed [`validate_account_email`]; an address
+    /// another account already uses fails the `email UNIQUE` constraint and
+    /// returns `Err` without claiming.
+    pub fn claim_default_admin_with_email(
+        &self,
+        email: Option<&str>,
+        new_password: &str,
+    ) -> Result<bool, String> {
         let hash = hash_password(new_password)?;
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
         let affected = conn
             .execute(
-                "UPDATE users SET password_hash = ?1, updated_at = ?2, must_change_password = 0 \
-                 WHERE email = 'admin@local' AND must_change_password = 1",
-                params![hash, now],
+                "UPDATE users SET password_hash = ?1, updated_at = ?2, must_change_password = 0, \
+                 email = COALESCE(?3, email) \
+                 WHERE bootstrap_owner = 1 AND must_change_password = 1",
+                params![hash, now, email],
             )
             .map_err(|e| format!("claim error: {e}"))?;
         Ok(affected == 1)
     }
 
-    /// Claim the bootstrap admin with a freshly generated random password.
+    /// Claim the bootstrap owner with a freshly generated random password.
     ///
     /// Used by the Personal-edition local session endpoint: `ensure_default_admin`
-    /// leaves `admin@local` flagged `must_change_password = 1`, and
+    /// leaves the owner flagged `must_change_password = 1`, and
     /// `authenticate_jwt` refuses every operation while that flag is set — so a
     /// token issued without clearing it would be dead on arrival. The generated
     /// password is intentionally discarded: "no password prompt" must not mean
@@ -506,6 +580,30 @@ impl UserDb {
     /// call) — a racing claim affects zero rows and gets `Ok(false)`.
     pub fn claim_default_admin_random(&self) -> Result<bool, String> {
         self.claim_default_admin(&generate_password(32))
+    }
+
+    /// The account `ensure_default_admin` bootstrapped, whatever email it
+    /// carries now. `Ok(None)` when it was deleted (or predates the
+    /// `bootstrap_owner` column and had already been renamed away from the
+    /// placeholder address).
+    ///
+    /// Like [`Self::get_user_by_email`], presents no credential: the only
+    /// caller is the Personal-edition local session endpoint, whose authority
+    /// is the TCP peer address being loopback.
+    pub fn get_bootstrap_owner(&self) -> Result<Option<User>, String> {
+        let id: String = {
+            let conn = self.conn();
+            match conn.query_row(
+                "SELECT id FROM users WHERE bootstrap_owner = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(id) => id,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(e) => return Err(format!("query error: {e}")),
+            }
+        };
+        self.get_user(&id)
     }
 
     // ── Agent Bindings ───────────────────────────────────────
@@ -696,14 +794,15 @@ impl UserDb {
 
     // ── Bootstrap ────────────────────────────────────────────
 
-    /// Ensure at least one admin user exists. Creates a default admin
-    /// with email `admin@local` and a random 24-char password if the users
-    /// table is empty. Returns the generated password (if created) so the
+    /// Ensure at least one admin user exists. Creates the bootstrap owner
+    /// with the placeholder email [`BOOTSTRAP_PLACEHOLDER_EMAIL`] and a random
+    /// 24-char password if the users table is empty; the first-run claim
+    /// replaces both. Returns the generated password (if created) so the
     /// caller can display it once.
     pub fn ensure_default_admin(&self) -> Result<Option<String>, String> {
         // Race safety (L28): there is no explicit transaction here. The
         // `email UNIQUE` constraint plus `INSERT OR IGNORE` makes a concurrent
-        // double-bootstrap idempotent — at most one `admin@local` row can
+        // double-bootstrap idempotent — at most one placeholder-email row can
         // exist, and the post-insert COUNT verifies whether *this* call was
         // the one that created it before returning the generated password.
         let conn = self.conn();
@@ -722,28 +821,70 @@ impl UserDb {
             let password_hash = hash_password(&default_password)?;
 
             conn.execute(
-                "INSERT OR IGNORE INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, must_change_password)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, 1)",
-                params![id, "admin@local", "Administrator", password_hash, "admin", now],
+                "INSERT OR IGNORE INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, must_change_password, bootstrap_owner)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, 1, 1)",
+                params![id, BOOTSTRAP_PLACEHOLDER_EMAIL, "Administrator", password_hash, "admin", now],
             )
             .map_err(|e| format!("failed to create default admin: {e}"))?;
 
             // Verify it was actually inserted (not ignored due to race)
             let inserted: i64 = conn
-                .query_row("SELECT COUNT(*) FROM users WHERE email = 'admin@local'", [], |row| row.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE email = ?1",
+                    params![BOOTSTRAP_PLACEHOLDER_EMAIL],
+                    |row| row.get(0),
+                )
                 .map_err(|e| format!("failed to verify admin creation: {e}"))?;
 
             if inserted > 0 {
                 warn!("╔════════════════════════════════════════════════════════╗");
                 warn!("║  DEFAULT ADMIN CREATED — set a password on first login   ║");
-                warn!("║  Email:    admin@local                                   ║");
-                warn!("║  A one-time random password was generated and returned   ║");
-                warn!("║  to the bootstrap caller. You MUST change it on login.    ║");
+                warn!("║  Open the dashboard from this machine to set the owner   ║");
+                warn!("║  email and password. Until then the account is reachable ║");
+                warn!("║  only as admin@local with a one-time random password.    ║");
                 warn!("╚════════════════════════════════════════════════════════╝");
                 return Ok(Some(default_password));
             }
         }
         Ok(None)
+    }
+}
+
+/// Email the bootstrap owner carries until the first-run claim replaces it.
+/// Callers that set no email at claim time (the OS shell OOBE, the installer's
+/// `pending-account.json`, the Personal-edition implicit claim) keep it.
+pub const BOOTSTRAP_PLACEHOLDER_EMAIL: &str = "admin@local";
+
+/// Error returned when an email is already used by another account. Stable
+/// string: the gateway passes it through and the dashboard keys on it.
+pub const EMAIL_IN_USE: &str = "email is already in use";
+
+/// Maximum length of an email address (RFC 5321 path limit).
+const MAX_EMAIL_LEN: usize = 254;
+
+/// Validate an account email entered by an operator and return it trimmed.
+///
+/// Deliberately a shape check, not RFC 5322 parsing: one `@` with a non-empty
+/// local part and domain, no whitespace or control characters, at most 254
+/// bytes. Case is preserved because login matches the stored email exactly.
+pub fn validate_account_email(raw: &str) -> Result<&str, &'static str> {
+    let email = raw.trim();
+    if email.is_empty() {
+        return Err("email is required");
+    }
+    if email.len() > MAX_EMAIL_LEN {
+        return Err("email is too long");
+    }
+    if email.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("invalid email format");
+    }
+    match email.split_once('@') {
+        Some((local, domain))
+            if !local.is_empty() && !domain.is_empty() && !domain.contains('@') =>
+        {
+            Ok(email)
+        }
+        _ => Err("invalid email format"),
     }
 }
 
@@ -923,6 +1064,138 @@ mod tests {
             "the claim must clear the flag, otherwise every issued token is dead on arrival",
         );
         assert!(db.get_user_by_email("nobody@example.com").unwrap().is_none());
+    }
+
+    /// The first-run claim replaces the placeholder email, and the owner stays
+    /// findable (claim state, local session lookup) by its flag afterwards.
+    #[test]
+    fn claim_with_email_replaces_placeholder_and_owner_stays_findable() {
+        let (db, _tmp) = test_db();
+        db.ensure_default_admin().unwrap().expect("admin created");
+
+        assert!(db
+            .claim_default_admin_with_email(Some("owner@example.com"), "a-strong-password")
+            .unwrap());
+        assert!(!db.is_unclaimed_default_admin());
+        assert!(db.get_user_by_email(BOOTSTRAP_PLACEHOLDER_EMAIL).unwrap().is_none());
+
+        let user = db
+            .verify_password("owner@example.com", "a-strong-password")
+            .expect("log in with the claimed email");
+        assert!(!user.must_change_password);
+        assert_eq!(user.role, UserRole::Admin);
+
+        let owner = db.get_bootstrap_owner().unwrap().expect("owner by flag");
+        assert_eq!(owner.id, user.id);
+        assert_eq!(owner.email, "owner@example.com");
+
+        // Single-shot: a later claim cannot move the email again.
+        assert!(!db
+            .claim_default_admin_with_email(Some("attacker@example.com"), "another-password")
+            .unwrap());
+        assert!(db.get_user_by_email("attacker@example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn claim_without_email_keeps_placeholder() {
+        let (db, _tmp) = test_db();
+        db.ensure_default_admin().unwrap().expect("admin created");
+        assert!(db.claim_default_admin("a-strong-password").unwrap());
+        assert!(db
+            .verify_password(BOOTSTRAP_PLACEHOLDER_EMAIL, "a-strong-password")
+            .is_ok());
+    }
+
+    /// An email another account already uses must not claim (the UNIQUE
+    /// constraint fails the whole UPDATE), so the instance stays claimable.
+    #[test]
+    fn claim_with_taken_email_errors_and_stays_unclaimed() {
+        let (db, _tmp) = test_db();
+        db.ensure_default_admin().unwrap().expect("admin created");
+        db.create_user("taken@example.com", "Someone", "password-1", UserRole::Employee)
+            .unwrap();
+        assert!(db
+            .claim_default_admin_with_email(Some("taken@example.com"), "a-strong-password")
+            .is_err());
+        assert!(db.is_unclaimed_default_admin());
+    }
+
+    /// Databases created before `bootstrap_owner` existed: the migration
+    /// marks the placeholder-email row as the owner, exactly once.
+    #[test]
+    fn migration_backfills_bootstrap_owner_on_legacy_db() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    display_name TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'employee',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login TEXT,
+                    must_change_password INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            let hash = hash_password("legacy-bootstrap").unwrap();
+            conn.execute(
+                "INSERT INTO users VALUES ('legacy-id', 'admin@local', 'Administrator', ?1, 'admin', 'active', 'x', 'x', NULL, 1)",
+                params![hash],
+            )
+            .unwrap();
+        }
+        let db = UserDb::new(tmp.path()).unwrap();
+        assert!(db.is_unclaimed_default_admin());
+        assert_eq!(db.get_bootstrap_owner().unwrap().unwrap().id, "legacy-id");
+        assert!(db
+            .claim_default_admin_with_email(Some("owner@example.com"), "a-strong-password")
+            .unwrap());
+        // Re-opening must not re-run the backfill against the renamed row.
+        drop(db);
+        let db = UserDb::new(tmp.path()).unwrap();
+        assert_eq!(db.get_bootstrap_owner().unwrap().unwrap().email, "owner@example.com");
+    }
+
+    #[test]
+    fn change_email_updates_login_and_refuses_taken_address() {
+        let (db, _tmp) = test_db();
+        let a = db
+            .create_user("a@example.com", "A", "password-a", UserRole::Admin)
+            .unwrap();
+        db.create_user("b@example.com", "B", "password-b", UserRole::Employee)
+            .unwrap();
+
+        db.change_email(&a.id, "a-new@example.com").unwrap();
+        assert!(db.verify_password("a-new@example.com", "password-a").is_ok());
+        assert!(db.verify_password("a@example.com", "password-a").is_err());
+
+        assert_eq!(
+            db.change_email(&a.id, "b@example.com").unwrap_err(),
+            EMAIL_IN_USE
+        );
+        assert_eq!(db.get_user(&a.id).unwrap().unwrap().email, "a-new@example.com");
+        assert!(db.change_email("no-such-id", "c@example.com").is_err());
+    }
+
+    #[test]
+    fn validate_account_email_shape() {
+        assert_eq!(validate_account_email("  owner@example.com "), Ok("owner@example.com"));
+        assert_eq!(validate_account_email("Owner@Example.COM"), Ok("Owner@Example.COM"));
+        assert!(validate_account_email("").is_err());
+        assert!(validate_account_email("   ").is_err());
+        assert!(validate_account_email("no-at-sign").is_err());
+        assert!(validate_account_email("@example.com").is_err());
+        assert!(validate_account_email("owner@").is_err());
+        assert!(validate_account_email("a@b@c").is_err());
+        assert!(validate_account_email("own er@example.com").is_err());
+        assert!(validate_account_email("owner@exa\u{0}mple.com").is_err());
+        let long = format!("{}@example.com", "a".repeat(250));
+        assert!(validate_account_email(&long).is_err());
     }
 
     #[test]

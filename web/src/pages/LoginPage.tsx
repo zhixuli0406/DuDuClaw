@@ -31,6 +31,7 @@ export function LoginPage() {
   // visitor SET the admin password in the browser — no console one-time
   // password to copy. `null` = still checking; `true` = show the claim form.
   const [firstRun, setFirstRun] = useState<boolean | null>(null);
+  const [ownerEmail, setOwnerEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
 
@@ -71,10 +72,14 @@ export function LoginPage() {
       return;
     }
     try {
-      await firstRunClaim(newPassword);
+      await firstRunClaim(ownerEmail, newPassword);
       navigate('/', { replace: true });
-    } catch {
-      setError(intl.formatMessage({ id: 'login.claim.failed' }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message.toLowerCase() : '';
+      let id = 'login.claim.failed';
+      if (msg.includes('already in use')) id = 'login.claim.emailTaken';
+      else if (msg.includes('email')) id = 'login.claim.invalidEmail';
+      setError(intl.formatMessage({ id }));
     }
   };
 
@@ -180,6 +185,17 @@ export function LoginPage() {
               <p className="text-sm text-muted-foreground">
                 {intl.formatMessage({ id: 'login.claim.intro' })}
               </p>
+              <Field label={intl.formatMessage({ id: 'login.claim.email' })} htmlFor="claim-email">
+                <Input
+                  id="claim-email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={ownerEmail}
+                  onChange={(e) => setOwnerEmail(e.target.value)}
+                  placeholder="you@company.com"
+                />
+              </Field>
               <Field label={intl.formatMessage({ id: 'login.claim.newPassword' })} htmlFor="claim-pw">
                 <Input
                   id="claim-pw"
@@ -208,7 +224,7 @@ export function LoginPage() {
                 type="submit"
                 variant="brand"
                 size="lg"
-                disabled={loading || newPassword.length < 8}
+                disabled={loading || ownerEmail.trim() === '' || newPassword.length < 8}
                 className="w-full"
               >
                 {submitLabel(loading, 'login.loading', 'login.claim.submit')}
@@ -224,7 +240,7 @@ export function LoginPage() {
                   required
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="admin@local"
+                  placeholder="you@company.com"
                 />
               </Field>
               <Field label={intl.formatMessage({ id: 'login.password' })} htmlFor="password">

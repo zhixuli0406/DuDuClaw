@@ -359,11 +359,16 @@ impl MethodHandler {
         match db.get_user(&ctx.user_id) {
             Ok(Some(user)) => {
                 let bindings = db.get_user_agents(&user.id).unwrap_or_default();
+                let setup = self.email_setup_state(&db, &user).await;
                 WsFrame::ok_response(
                     "",
                     json!({
                         "user": user,
                         "bindings": bindings,
+                        "email_setup": {
+                            "placeholder": setup.placeholder,
+                            "password_required": setup.password_required,
+                        },
                     }),
                 )
             }
@@ -378,6 +383,90 @@ impl MethodHandler {
                     "bindings": [],
                 }),
             ),
+        }
+    }
+
+    /// How the caller's own email can be changed.
+    ///
+    /// `placeholder`: the caller is the bootstrap owner still on
+    /// `admin@local` (the Personal-edition implicit claim, or a claim that set
+    /// no email), so the dashboard offers to set a real address.
+    ///
+    /// `password_required`: an email change needs the current password, except
+    /// for the bootstrap owner on a Personal install with local auto-login on.
+    /// There the owner never chose a password (the implicit claim discards a
+    /// random one) and anyone at the machine already gets this session without
+    /// one, so asking for it would only lock the owner out.
+    async fn email_setup_state(
+        &self,
+        db: &duduclaw_auth::UserDb,
+        user: &duduclaw_auth::User,
+    ) -> EmailSetupState {
+        let is_owner = matches!(db.get_bootstrap_owner(), Ok(Some(ref o)) if o.id == user.id);
+        let passwordless_owner = is_owner
+            && crate::local_session::auto_login_enabled(&self.home_dir)
+            && self.resolve_edition_profile().await.is_personal();
+        EmailSetupState {
+            placeholder: is_owner && user.email == duduclaw_auth::db::BOOTSTRAP_PLACEHOLDER_EMAIL,
+            password_required: !passwordless_owner,
+        }
+    }
+
+    /// Self-service email change for the logged-in user. Like
+    /// `users.change_password`, it only ever touches the caller's own account
+    /// (`ctx.user_id`) and needs no admin role. The current password is
+    /// required unless [`Self::email_setup_state`] says otherwise. The caller's
+    /// tokens keep the old email until refreshed; the dashboard refreshes them
+    /// right after.
+    pub(crate) async fn handle_users_change_email(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        let raw = params.get("email").and_then(|v| v.as_str()).unwrap_or("");
+        let email = match duduclaw_auth::db::validate_account_email(raw) {
+            Ok(e) => e,
+            Err(reason) => return WsFrame::error_response("", reason),
+        };
+        let user = match db.get_user(&ctx.user_id) {
+            Ok(Some(u)) => u,
+            _ => return WsFrame::error_response("", "user not found"),
+        };
+        if self.email_setup_state(&db, &user).await.password_required {
+            let current = params
+                .get("current_password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if db.verify_password(&user.email, current).is_err() {
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "email.change_failed",
+                    Some(&ctx.user_id),
+                    None,
+                    None,
+                );
+                return WsFrame::error_response("", "current password is incorrect");
+            }
+        }
+        if email == user.email {
+            return WsFrame::ok_response("", json!({"status": "unchanged", "email": email}));
+        }
+        match db.change_email(&ctx.user_id, email) {
+            Ok(()) => {
+                // The audit row keeps both addresses: it is the only record of
+                // which login name the account used before.
+                let detail = format!("{} -> {}", user.email, email);
+                let _ = db.log_action(
+                    Some(&ctx.user_id),
+                    "email.change",
+                    Some(&ctx.user_id),
+                    Some(&detail),
+                    None,
+                );
+                WsFrame::ok_response("", json!({"status": "changed", "email": email}))
+            }
+            Err(e) if e == duduclaw_auth::db::EMAIL_IN_USE => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &format!("failed to change email: {e}")),
         }
     }
 
@@ -465,4 +554,10 @@ impl MethodHandler {
             Err(e) => WsFrame::error_response("", &format!("failed to query audit log: {e}")),
         }
     }
+}
+
+/// See [`MethodHandler::email_setup_state`].
+struct EmailSetupState {
+    placeholder: bool,
+    password_required: bool,
 }

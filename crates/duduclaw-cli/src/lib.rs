@@ -8504,7 +8504,7 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
             // claim endpoint is loopback-only).
             if bind == "127.0.0.1" || bind == "::1" || bind == "localhost" {
                 println!(
-                    "   🔐 First run: open http://localhost:{port} and set the admin password there."
+                    "   🔐 First run: open http://localhost:{port} and set the owner email and password there."
                 );
             } else {
                 println!("   🔐 First run: a default admin is being created —");

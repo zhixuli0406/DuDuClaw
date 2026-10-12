@@ -61,6 +61,7 @@ fn personal_surfaces_are_untouched() {
         // Self-service account management (§1.6 帳號與密碼 ✅)
         "users.me",
         "users.change_password",
+        "users.change_email",
         // 委派權限 — 跨 agent 不是跨人 (§1.6)
         "delegation.get",
         "delegation.set",

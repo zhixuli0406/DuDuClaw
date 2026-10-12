@@ -45,7 +45,7 @@ interface AuthStore {
   firstRunStatus: () => Promise<boolean>;
   /** First-run onboarding: set the initial admin password, then establish the
    *  session (no console one-time password needed). */
-  firstRunClaim: (password: string) => Promise<void>;
+  firstRunClaim: (email: string, password: string) => Promise<void>;
   logout: () => void;
   refresh: () => Promise<void>;
   loadFromStorage: () => Promise<boolean>;
@@ -360,13 +360,14 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     }
   },
 
-  firstRunClaim: async (password: string) => {
+  firstRunClaim: async (email: string, password: string) => {
     set({ loading: true });
     try {
-      await apiPost('/api/first-run/claim', { password });
-      // Claim only sets the password; establish the session via the normal
-      // login path so token wiring / refresh timer are identical.
-      await get().login('admin@local', password);
+      const res = await apiPost<{ email?: string }>('/api/first-run/claim', { email, password });
+      // Claim only sets the owner's email and password; establish the session
+      // via the normal login path so token wiring / refresh timer are
+      // identical. The server echoes the stored (trimmed) email.
+      await get().login(res.email ?? email.trim(), password);
     } catch (e) {
       set({ loading: false });
       throw e;

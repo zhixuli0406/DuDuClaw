@@ -16,6 +16,11 @@ beforeEach(() => {
   } as never);
   useSystemStore.setState({ status: null });
   useConnectionStore.setState({ mustChangePassword: false } as never);
+  vi.spyOn(api.users, 'me').mockResolvedValue({
+    user: {},
+    bindings: [],
+    email_setup: { placeholder: false, password_required: false },
+  } as never);
 });
 
 // The three password fields (現在/新/確認) render through `SettingsRow`,
@@ -90,5 +95,49 @@ describe('<AccountTab> — WP-0 must-change-password recovery', () => {
 
     await waitFor(() => expect(connectSpy).toHaveBeenCalledTimes(1));
     expect(screen.getByText('Set your password first')).toBeInTheDocument();
+  });
+});
+
+describe('<AccountTab> — email change', () => {
+  it('changes the email without a password when the server says none is needed', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.users, 'changeEmail').mockResolvedValue({ status: 'changed', email: 'owner@example.com' });
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    useAuthStore.setState({ refresh } as never);
+    const connectSpy = vi.fn().mockResolvedValue(undefined);
+    useConnectionStore.setState({ connectWithAuth: connectSpy, disconnect: vi.fn() } as never);
+
+    renderWithProviders(<AccountTab />);
+    const input = await screen.findByPlaceholderText('you@company.com');
+    // Only the three password-change fields: no current-password field for email.
+    await waitFor(() => expect(document.querySelectorAll('input[type="password"]')).toHaveLength(3));
+    await user.type(input, 'owner@example.com');
+    await user.click(screen.getByRole('button', { name: 'Update email' }));
+
+    await waitFor(() => expect(api.users.changeEmail).toHaveBeenCalledWith('owner@example.com', undefined));
+    expect(refresh).toHaveBeenCalled();
+    expect(connectSpy).toHaveBeenCalled();
+  });
+
+  it('asks for the current password and shows a taken-email error', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.users, 'me').mockResolvedValue({
+      user: {},
+      bindings: [],
+      email_setup: { placeholder: false, password_required: true },
+    } as never);
+    vi.spyOn(api.users, 'changeEmail').mockRejectedValue('email is already in use');
+
+    renderWithProviders(<AccountTab />);
+    await waitFor(() => expect(document.querySelectorAll('input[type="password"]')).toHaveLength(4));
+    await user.type(screen.getByPlaceholderText('you@company.com'), 'taken@example.com');
+    const pw = document.querySelectorAll<HTMLInputElement>('input[type="password"]')[3];
+    await user.type(pw, 'secret-pw');
+    await user.click(screen.getByRole('button', { name: 'Update email' }));
+
+    await waitFor(() =>
+      expect(api.users.changeEmail).toHaveBeenCalledWith('taken@example.com', 'secret-pw'),
+    );
+    expect(await screen.findByText('Another account already uses this email. Please use a different one.')).toBeInTheDocument();
   });
 });

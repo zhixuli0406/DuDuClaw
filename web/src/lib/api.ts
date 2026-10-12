@@ -2076,6 +2076,14 @@ export interface UserInfo {
   last_login?: string;
 }
 
+/** How the caller's own login email can be changed (`users.me`). */
+export interface EmailSetup {
+  /** The bootstrap owner is still on the placeholder `admin@local`. */
+  placeholder: boolean;
+  /** `users.change_email` needs `current_password`. */
+  password_required: boolean;
+}
+
 export interface UserAgentBinding {
   user_id: string;
   agent_name: string;
@@ -7615,7 +7623,18 @@ export const api = {
         transferred_agents: string[];
       }>,
     me: () =>
-      client.call('users.me') as Promise<{ user: UserInfo; bindings: UserAgentBinding[] }>,
+      client.call('users.me') as Promise<{
+        user: UserInfo;
+        bindings: UserAgentBinding[];
+        /** Absent on gateways older than v1.73. */
+        email_setup?: EmailSetup;
+      }>,
+    /** Self-service: the logged-in user changes their OWN login email. */
+    changeEmail: (email: string, currentPassword?: string) =>
+      client.call('users.change_email', {
+        email,
+        ...(currentPassword ? { current_password: currentPassword } : {}),
+      }) as Promise<{ status: 'changed' | 'unchanged'; email: string }>,
     // Self-service: the logged-in user changes their OWN password (works in the
     // single-owner edition where the Users page is hidden).
     changePassword: (currentPassword: string, newPassword: string) =>

@@ -7,6 +7,7 @@ import { crumbsFor } from './nav-model';
 import { MobileBottomNav } from './MobileBottomNav';
 import { GuidedTour } from '@/components/tour/GuidedTour';
 import { TourPrompt } from '@/components/tour/TourPrompt';
+import { OwnerEmailPrompt } from '@/components/OwnerEmailPrompt';
 import { SoftLimitBanner } from '@/components/SoftLimitBanner';
 import { LicenseExpiryBanner } from '@/components/LicenseExpiryBanner';
 import { CommandPalette } from '@/components/CommandPalette';
@@ -172,6 +173,7 @@ function AppShell() {
       {content && <PropertiesPanel />}
 
       <TourPrompt />
+      <OwnerEmailPrompt />
       <GuidedTour />
       <CommandPalette />
       {/* The one 交辦 panel (UX plan I-1a). Mounted once here so every entry
