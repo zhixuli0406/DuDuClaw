@@ -6,11 +6,12 @@
 - 帳號設定頁（設定 → 帳號與密碼）可以修改自己的登入信箱，對應新的自助 RPC `users.change_email`。一般帳號要輸入目前密碼；個人版開著本機自動登入時，擁有者本人不用輸入（這種模式下擁有者從沒設過密碼，在這台電腦前本來就能免密碼進來）。改完會刷新 token 並重新連線，稽核紀錄 `email.change` 會留下新舊兩個信箱。
 - 擁有者帳號還是 `admin@local` 時，儀表板會跳出「設定你的電子郵件」對話框。個人版首次自動登入後會先看到它，既有安裝升級後也會看到一次；按「稍後再說」後這個瀏覽器不再提示。
 
-### Fixed
-- 個人版開著本機自動登入時，擁有者在「設定 → 帳號與密碼」設定密碼不再要求輸入目前密碼。之前那組密碼是自動登入時隨機產生、本人從不知道的，所以根本改不了。同一頁的說明也改成正確順序：先設密碼，再把 `local_auto_login` 設成 off。稽核紀錄記為 `password.set_local_owner`；其他帳號、非個人版、或自動登入已關的情況，照舊要輸入目前密碼。
-
 ### Changed
 - 儀表板首次設定改成填入你自己的電子郵件和密碼，之後用這個信箱登入，不再固定是 `admin@local`。`POST /api/first-run/claim` 新增選填的 `email` 欄位，回應帶回實際登入用的信箱；沒帶 `email` 的呼叫端（DuDuClaw OS 開機設定、安裝程式留下的 `pending-account.json`、個人版本機自動登入）照舊沿用 `admin@local`。使用者資料表新增 `bootstrap_owner` 欄位標記初始擁有者帳號，舊資料庫升級時會把 `admin@local` 那一列標上；首次設定狀態與本機自動登入改用這個標記找帳號，不再依信箱查詢。已完成設定的安裝不受影響，帳號信箱維持原樣。
+
+### Fixed
+- 個人版開著本機自動登入時，擁有者在「設定 → 帳號與密碼」設定密碼不再要求輸入目前密碼。之前那組密碼是自動登入時隨機產生、本人從不知道的，所以根本改不了。同一頁的說明也改成正確順序：先設密碼，再把 `local_auto_login` 設成 off。稽核紀錄記為 `password.set_local_owner`；其他帳號、非個人版、或自動登入已關的情況，照舊要輸入目前密碼。
+- Docker 映像建置配方：`container/Dockerfile.server`、`Dockerfile.edition-smoke` 與 relay 的 Dockerfile 一併複製 vendored SDK（`vendor/`），Antigravity／Grok 安裝程式改用 `curl --compressed` 下載，避免伺服器回傳壓縮內容時安裝程式驗證失敗；發版用的 Docker workflow 固定建置配方。v1.72.2 的 server 映像已用這套配方補發。
 
 ## [1.72.2] - 2026-10-11 — 安全更新與資料匯出
 
