@@ -97,6 +97,12 @@ pub(super) fn claim_worker_home(state: &LineState) -> bool {
     true
 }
 
+/// Upper bound for LINE ingress tests that poll until the worker reaches a
+/// state. Generous on purpose: each wait ends as soon as the state is
+/// reached, and a loaded Windows CI runner (8,000+ gateway tests at once)
+/// has missed the old 5 s bound (2026-10-12, run 38209169522).
+#[cfg(test)]
+pub(crate) const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
 mod durable_ingress_tests;
 #[cfg(test)]
