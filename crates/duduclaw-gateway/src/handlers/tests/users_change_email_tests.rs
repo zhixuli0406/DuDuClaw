@@ -204,3 +204,52 @@ fn change_email_is_open_in_personal_and_closed_to_flagged_accounts() {
     assert!(!is_enterprise_only_method("users.change_email"));
     assert!(!is_password_change_allowlisted("users.change_email"));
 }
+
+/// The same exception covers setting a password: a Personal owner signed in
+/// by local auto-login can set one (the step before turning auto-login off)
+/// without the random password the implicit claim discarded.
+#[tokio::test]
+async fn personal_auto_login_owner_sets_password_without_current() {
+    let f = fixture(false).await;
+    let frame = f
+        .handler
+        .handle(
+            "users.change_password",
+            json!({"new_password": "chosen-password-1"}),
+            &f.owner,
+        )
+        .await;
+    assert_eq!(ok_payload(&frame)["status"], json!("changed"));
+    assert!(f
+        .db
+        .verify_password("admin@local", "chosen-password-1")
+        .is_ok());
+}
+
+#[tokio::test]
+async fn password_change_still_needs_current_password_elsewhere() {
+    let f = fixture(true).await;
+    let frame = f
+        .handler
+        .handle(
+            "users.change_password",
+            json!({"new_password": "chosen-password-1"}),
+            &f.owner,
+        )
+        .await;
+    assert!(error_text(&frame).contains("current password is incorrect"));
+    assert!(f
+        .db
+        .verify_password("admin@local", "owner-password-1")
+        .is_ok());
+
+    let frame = f
+        .handler
+        .handle(
+            "users.change_password",
+            json!({"current_password": "owner-password-1", "new_password": "chosen-password-1"}),
+            &f.owner,
+        )
+        .await;
+    assert_eq!(ok_payload(&frame)["status"], json!("changed"));
+}

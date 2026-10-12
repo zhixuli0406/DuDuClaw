@@ -3579,7 +3579,7 @@
   "login.claim.tooShort": "Password must be at least 8 characters",
   "login.claim.mismatch": "Passwords do not match",
   "login.claim.failed": "Setup failed, please try again",
-  "login.local.accountNote": "Local auto-login is on: opening the dashboard on this computer needs no password. To go back to password protection (say, before letting other devices connect), set local_auto_login to off in config.toml, then set a password below.",
+  "login.local.accountNote": "Local auto-login is on: opening the dashboard on this computer needs no password. To go back to password protection (say, before letting other devices connect), first set a password below (no current password needed), then set local_auto_login to off in config.toml. Doing it the other way round leaves you needing a password you never set.",
   "settings.advanced": "Advanced",
   "settings.everyday": "Everyday",
   "tasks.view.kanban": "Board",

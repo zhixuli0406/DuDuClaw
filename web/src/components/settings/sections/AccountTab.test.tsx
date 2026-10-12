@@ -19,7 +19,7 @@ beforeEach(() => {
   vi.spyOn(api.users, 'me').mockResolvedValue({
     user: {},
     bindings: [],
-    email_setup: { placeholder: false, password_required: false },
+    email_setup: { placeholder: false, password_required: true },
   } as never);
 });
 
@@ -101,6 +101,11 @@ describe('<AccountTab> — WP-0 must-change-password recovery', () => {
 describe('<AccountTab> — email change', () => {
   it('changes the email without a password when the server says none is needed', async () => {
     const user = userEvent.setup();
+    vi.spyOn(api.users, 'me').mockResolvedValue({
+      user: {},
+      bindings: [],
+      email_setup: { placeholder: false, password_required: false },
+    } as never);
     vi.spyOn(api.users, 'changeEmail').mockResolvedValue({ status: 'changed', email: 'owner@example.com' });
     const refresh = vi.fn().mockResolvedValue(undefined);
     useAuthStore.setState({ refresh } as never);
@@ -109,8 +114,8 @@ describe('<AccountTab> — email change', () => {
 
     renderWithProviders(<AccountTab />);
     const input = await screen.findByPlaceholderText('you@company.com');
-    // Only the three password-change fields: no current-password field for email.
-    await waitFor(() => expect(document.querySelectorAll('input[type="password"]')).toHaveLength(3));
+    // Only new + confirm: no current-password field in either form.
+    await waitFor(() => expect(document.querySelectorAll('input[type="password"]')).toHaveLength(2));
     await user.type(input, 'owner@example.com');
     await user.click(screen.getByRole('button', { name: 'Update email' }));
 
@@ -139,5 +144,28 @@ describe('<AccountTab> — email change', () => {
       expect(api.users.changeEmail).toHaveBeenCalledWith('taken@example.com', 'secret-pw'),
     );
     expect(await screen.findByText('Another account already uses this email. Please use a different one.')).toBeInTheDocument();
+  });
+});
+
+describe('<AccountTab> — Personal owner sets a password', () => {
+  it('hides the current-password field and sends none when the server says so', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.users, 'me').mockResolvedValue({
+      user: {},
+      bindings: [],
+      email_setup: { placeholder: false, password_required: false },
+    } as never);
+    vi.spyOn(api.users, 'changePassword').mockResolvedValue({ status: 'changed' });
+
+    renderWithProviders(<AccountTab />);
+    await waitFor(() => expect(document.querySelectorAll('input[type="password"]')).toHaveLength(2));
+    const [newInput, confirmInput] = Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[type="password"]'),
+    );
+    await user.type(newInput, 'chosen-pw-1');
+    await user.type(confirmInput, 'chosen-pw-1');
+    await user.click(screen.getByRole('button', { name: 'Update password' }));
+
+    await waitFor(() => expect(api.users.changePassword).toHaveBeenCalledWith('', 'chosen-pw-1'));
   });
 });

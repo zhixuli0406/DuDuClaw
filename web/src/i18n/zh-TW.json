@@ -3579,7 +3579,7 @@
   "login.claim.tooShort": "密碼至少需 8 個字元",
   "login.claim.mismatch": "兩次輸入的密碼不一致",
   "login.claim.failed": "設定失敗，請重試",
-  "login.local.accountNote": "本機自動登入已啟用：在這台電腦上開啟儀表板不需要輸入密碼。想改回密碼保護（例如打算讓其他裝置連進來），把 config.toml 的 local_auto_login 設成 off，再回到下方設定一組密碼。",
+  "login.local.accountNote": "本機自動登入已啟用：在這台電腦上開啟儀表板不需要輸入密碼。想改回密碼保護（例如打算讓其他裝置連進來），請先在下方設定一組密碼（不需要目前密碼），再把 config.toml 的 local_auto_login 設成 off。順序反過來的話，會需要一組你從沒設過的密碼。",
   "settings.advanced": "進階設定",
   "settings.everyday": "常用",
   "tasks.view.kanban": "看板",

@@ -3579,7 +3579,7 @@
   "login.claim.tooShort": "パスワードは8文字以上必要です",
   "login.claim.mismatch": "パスワードが一致しません",
   "login.claim.failed": "設定に失敗しました。もう一度お試しください",
-  "login.local.accountNote": "ローカル自動ログインが有効です。このパソコンからダッシュボードを開くときにパスワードは不要です。パスワード保護に戻す場合（他の端末から接続させる前など）は、config.toml の local_auto_login を off にしてから、下でパスワードを設定してください。",
+  "login.local.accountNote": "ローカル自動ログインが有効です。このパソコンからダッシュボードを開くときにパスワードは不要です。パスワード保護に戻す場合（他の端末から接続させる前など）は、先に下でパスワードを設定してから（現在のパスワードは不要）、config.toml の local_auto_login を off にしてください。順番が逆だと、一度も設定していないパスワードが必要になります。",
   "settings.advanced": "詳細設定",
   "settings.everyday": "日常",
   "tasks.view.kanban": "ボード",

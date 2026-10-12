@@ -2080,7 +2080,7 @@ export interface UserInfo {
 export interface EmailSetup {
   /** The bootstrap owner is still on the placeholder `admin@local`. */
   placeholder: boolean;
-  /** `users.change_email` needs `current_password`. */
+  /** `users.change_email` and `users.change_password` need `current_password`. */
   password_required: boolean;
 }
 

@@ -392,18 +392,23 @@ impl MethodHandler {
     /// `admin@local` (the Personal-edition implicit claim, or a claim that set
     /// no email), so the dashboard offers to set a real address.
     ///
-    /// `password_required`: an email change needs the current password, except
-    /// for the bootstrap owner on a Personal install with local auto-login on.
-    /// There the owner never chose a password (the implicit claim discards a
-    /// random one) and anyone at the machine already gets this session without
-    /// one, so asking for it would only lock the owner out.
+    /// `password_required`: changing the email or the password needs the
+    /// current password, except for the bootstrap owner on a Personal install
+    /// with local auto-login on. There the owner never chose a password (the
+    /// implicit claim discards a random one) and anyone at the machine already
+    /// gets this session without one, so asking for it would only lock the
+    /// owner out — including out of setting a password before turning
+    /// auto-login off.
     async fn email_setup_state(
         &self,
         db: &duduclaw_auth::UserDb,
         user: &duduclaw_auth::User,
     ) -> EmailSetupState {
         let is_owner = matches!(db.get_bootstrap_owner(), Ok(Some(ref o)) if o.id == user.id);
+        // `must_change_password` still set means the implicit claim never ran:
+        // the owner holds the one-time bootstrap password and must prove it.
         let passwordless_owner = is_owner
+            && !user.must_change_password
             && crate::local_session::auto_login_enabled(&self.home_dir)
             && self.resolve_edition_profile().await.is_personal();
         EmailSetupState {
@@ -475,7 +480,8 @@ impl MethodHandler {
     /// page, so this is the only way the sole admin can rotate their own
     /// password. No admin role required — it only ever mutates the caller's own
     /// account (identified by `ctx.user_id`). Verifies the current password
-    /// first; on success `update_user` also clears any `must_change_password`.
+    /// first, unless [`Self::email_setup_state`] says none is needed; on
+    /// success `update_user` also clears any `must_change_password`.
     pub(crate) async fn handle_users_change_password(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
@@ -505,7 +511,8 @@ impl MethodHandler {
         };
 
         // Verify the current password (timing-safe inside verify_password).
-        if db.verify_password(&user.email, current).is_err() {
+        let password_required = self.email_setup_state(&db, &user).await.password_required;
+        if password_required && db.verify_password(&user.email, current).is_err() {
             let _ = db.log_action(
                 Some(&ctx.user_id),
                 "password.change_failed",
@@ -516,7 +523,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "current password is incorrect");
         }
 
-        if current == new_password {
+        if password_required && current == new_password {
             return WsFrame::error_response("", "new password must differ from the current one");
         }
 
@@ -524,7 +531,7 @@ impl MethodHandler {
             Ok(()) => {
                 let _ = db.log_action(
                     Some(&ctx.user_id),
-                    "password.change",
+                    if password_required { "password.change" } else { "password.set_local_owner" },
                     Some(&ctx.user_id),
                     None,
                     None,
