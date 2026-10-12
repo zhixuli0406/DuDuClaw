@@ -31,6 +31,7 @@ import {
 } from '@/components/mds';
 import { RowText, RowSecret, RowNumber, RowSwitch, RowSelect } from '@/pages/agent-form/form-rows';
 import { DangerZone, ConfirmDialog, type SelectOption } from '@/components/settings/controls';
+import { OdooLivechatSection } from '@/pages/odoo-livechat/OdooLivechatSection';
 
 const FEATURE_MODULES = ['crm', 'sale', 'inventory', 'accounting', 'project', 'hr'] as const;
 type FeatureKey = (typeof FEATURE_MODULES)[number];
@@ -562,6 +563,9 @@ export function OdooPage() {
 
       {/* Per-agent credential override */}
       <AgentOdooOverride pickedModels={Array.from(pickedModels)} />
+
+      {/* Website Live Chat: AI employees answer as an Odoo operator */}
+      <OdooLivechatSection />
 
       {confirmUnblock && (
         <ConfirmDialog

@@ -2122,6 +2122,87 @@ export interface OdooSchemaModel {
 }
 
 /** Result of an `odoo.discover_schema` scan. */
+// ── Odoo website Live Chat bridge (`odoo.livechat.*`, Admin only) ──────
+
+export type OdooLivechatVisitorKind = 'any' | 'logged_in' | 'anonymous';
+
+/** One audience rule: every non-empty criterion must hold; first match wins. */
+export interface OdooLivechatRule {
+  name: string;
+  agent: string;
+  enabled: boolean;
+  livechat_channel_ids: number[];
+  chatbot_script_ids: number[];
+  country_codes: string[];
+  langs: string[];
+  visitor: OdooLivechatVisitorKind;
+  partner_tags: string[];
+  keywords: string[];
+}
+
+/** `config.toml [odoo_livechat]` (the bot key is write-only, never returned). */
+export interface OdooLivechatConfig {
+  enabled: boolean;
+  bot_username: string;
+  livechat_channel_ids: number[];
+  poll_interval_seconds: number;
+  default_agent: string;
+  greeting: string;
+  handoff_user_ids: number[];
+  handoff_keywords: string[];
+  handoff_message: string;
+  audience_rules: OdooLivechatRule[];
+}
+
+export interface OdooLivechatBridgeStatus {
+  /** `off` | `connecting` | `online` | `error` */
+  state: string;
+  message: string;
+  bot_name: string;
+  bot_partner_id: number | null;
+  /** `bus` (Odoo 17/18) or `mail` (Odoo 19+). */
+  presence_api: string | null;
+  last_poll_at: string | null;
+  last_error_at: string | null;
+}
+
+export interface OdooLivechatSession {
+  id: number;
+  agent: string;
+  rule: string | null;
+  human: boolean;
+  /** `operator_spoke` | `visitor_requested` | `operator_member` */
+  human_reason: string | null;
+  visitor_name: string;
+  country: string | null;
+  lang: string | null;
+  logged_in: boolean;
+  replies: number;
+  first_seen: string;
+  last_activity: string;
+}
+
+export interface OdooLivechatStatusResult {
+  status: OdooLivechatBridgeStatus;
+  sessions: OdooLivechatSession[];
+}
+
+export interface OdooLivechatGetResult extends OdooLivechatStatusResult {
+  config: OdooLivechatConfig;
+  bot_api_key_set: boolean;
+  odoo_configured: boolean;
+}
+
+export interface OdooLivechatTestResult {
+  bot: { uid: number; partner_id: number; name: string; im_status: string };
+  odoo_generation: '17/18' | '19+';
+  channels: Array<{ id: number; name: string; operator_ids: number[]; bot_is_operator: boolean }>;
+  chatbot_scripts: Array<{ id: number; name: string }>;
+  users: Array<{ id: number; name: string; login: string }>;
+  /** Codes: `shares_main_user` | `not_operator` | `odoo19_admin_presence`. */
+  warnings: string[];
+}
+
 export interface OdooDiscoverSchemaResult {
   success: boolean;
   message?: string;
@@ -6818,6 +6899,22 @@ export const api = {
         'odoo.discover_schema',
         maxModels ? { max_models: maxModels } : {},
       ) as Promise<OdooDiscoverSchemaResult>,
+    /** Website Live Chat bridge settings + live status. */
+    livechatGet: () => client.call('odoo.livechat.get') as Promise<OdooLivechatGetResult>,
+    livechatStatus: () =>
+      client.call('odoo.livechat.status') as Promise<OdooLivechatStatusResult>,
+    /** `bot_api_key`: a new value sets it, omitted keeps the stored one. */
+    livechatSet: (config: OdooLivechatConfig, botApiKey?: string, clearBotApiKey?: boolean) =>
+      client.call('odoo.livechat.set', {
+        config,
+        ...(botApiKey ? { bot_api_key: botApiKey } : {}),
+        ...(clearBotApiKey ? { clear_bot_api_key: true } : {}),
+      }) as Promise<{ saved: boolean }>,
+    /** Sign in as the bot and list channels / chatbots / users. Read-only. */
+    livechatTest: (params: { bot_username?: string; bot_api_key?: string }) =>
+      client.call('odoo.livechat.test', { ...params }) as Promise<OdooLivechatTestResult>,
+    livechatResume: (sessionId: number) =>
+      client.call('odoo.livechat.resume', { session_id: sessionId }) as Promise<{ resumed: boolean }>,
   },
   /** Read-only SQL data sources (`config.toml [db_sources.*]`). Admin only.
    *  The connection string is never returned — `url_status` says whether one
