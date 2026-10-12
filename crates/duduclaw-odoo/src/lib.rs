@@ -3,6 +3,8 @@ pub mod config;
 pub mod connector;
 pub mod edition;
 pub mod events;
+/// Odoo website Live Chat bridge (DuDuClaw answers as an operator).
+pub mod livechat;
 pub mod models;
 pub mod rpc;
 /// X1 方案 4 — Odoo Helpdesk / Project as a decision-twin support queue.

@@ -1188,6 +1188,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let r = crate::webhook_slots::start_webhook(channel, &home_dir, reply_ctx.clone()).await;
         webhook_slots.set(channel, r);
     }
+    // Odoo website Live Chat: the bot answers as an Odoo operator. Always
+    // spawned; it idles until `[odoo_livechat] enabled = true`, so the
+    // dashboard can switch it on without a restart (crate::odoo_livechat).
+    bg_handles.push(crate::odoo_livechat::spawn(&home_dir, reply_ctx.clone()));
     let webchat_ctx = reply_ctx.clone();
     info!("boot: channel startup done — starting schedulers");
 
@@ -2855,6 +2859,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             info!("Withdrawing mDNS advertisement...");
             adv.stop();
         }
+        // Mark the Odoo Live Chat bot offline so visitors are not routed to
+        // a bot that is about to stop answering.
+        bounded_step("odoo livechat offline", 5, crate::odoo_livechat::go_offline_on_shutdown()).await;
         bounded_step("prediction engine flush", 20, pe_for_shutdown.flush_all()).await;
         bounded_step(
             "metacognition persist",

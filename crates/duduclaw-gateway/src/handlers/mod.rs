@@ -116,6 +116,7 @@ mod odoo_util;
 mod odoo_configure;
 mod odoo_schema;
 mod odoo_agent_rpc;
+mod odoo_livechat_rpc;
 mod agents_list_rpc;
 mod dashboard_layout;
 mod widgets_custom;

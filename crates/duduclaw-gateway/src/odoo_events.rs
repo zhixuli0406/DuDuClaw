@@ -121,7 +121,7 @@ pub fn load_odoo_config(home_dir: &Path) -> OdooConfig {
 /// Returns `None` rather than the ciphertext when decryption fails — a
 /// `secret://` reference or an undecryptable blob must never be sent to Odoo
 /// as if it were the credential.
-async fn resolve_credential(home_dir: &Path) -> Option<String> {
+pub(crate) async fn resolve_credential(home_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
     let table = raw.parse::<toml::Table>().ok()?;
     let auth_method = table

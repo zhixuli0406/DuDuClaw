@@ -88,7 +88,12 @@ pub(super) async fn build_reply_with_session_inner(
     // is resolved. Lives here rather than in each channel's command
     // interceptor because it is the only place that carries BOTH the
     // conversation and the sender's channel account id.
-    if let Some(tk) = crate::chat_commands::parse_takeover(text) {
+    // A public website visitor (Odoo Live Chat) never reaches the channel
+    // takeover commands or the typing-takeover gate: takeover there is
+    // Odoo-native (an operator speaking in the chat, `crate::odoo_livechat`),
+    // and the `/takeover` status text is written for operators.
+    let public_visitor = crate::odoo_livechat::is_public_visitor_session(session_id);
+    if let Some(tk) = crate::chat_commands::parse_takeover(text).filter(|_| !public_visitor) {
         return crate::chat_commands::handle_takeover(ctx, session_id, user_id, &tk).await;
     }
 
@@ -101,7 +106,12 @@ pub(super) async fn build_reply_with_session_inner(
     // treats as "send nothing" (the same contract the blocked-user and
     // circuit-breaker paths use); the inbound turn is still recorded in the
     // session so the AI resumes with full context.
-    match crate::takeover::intercept(ctx, session_id, user_id, text).await {
+    let intercepted = if public_visitor {
+        None
+    } else {
+        crate::takeover::intercept(ctx, session_id, user_id, text).await
+    };
+    match intercepted {
         Some(crate::takeover::Intercepted::Announce(msg)) => return msg,
         Some(crate::takeover::Intercepted::Silent) => return String::new(),
         None => {}
@@ -3598,6 +3608,12 @@ pub(super) async fn build_reply_with_session_inner(
         }
     }
 
+    // A public website visitor (Odoo Live Chat) is a customer, not the
+    // operator: account states, dashboard links and file names must not
+    // reach them. The audit row above keeps the real reason.
+    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+        return crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string();
+    }
     // The spawn gate already wrote its own audit event; the person sees the
     // gate's sentence (which names the employee and asks the operator to
     // check the file) instead of a generic "something failed" message.

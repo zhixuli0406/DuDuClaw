@@ -155,7 +155,14 @@ pub async fn build_guarded_reply_for_agent(
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, agent_name).await;
-    let final_text = append_pending_agent_notice(enforced, &ctx.home_dir, agent_name);
+    // The "rules changed / model switched" FYI is for the operator; a public
+    // website visitor must not see it (it stays pending for the next
+    // operator-facing reply).
+    let final_text = if crate::odoo_livechat::is_public_visitor_session(session_id) {
+        enforced
+    } else {
+        append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
+    };
     attach_turn_rollback(final_text, artifact, guards, delivery, ctx).await
 }
 
