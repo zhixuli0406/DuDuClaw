@@ -51,6 +51,19 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 - Website chat widget: "Open the website chat widget" writes `[webchat] public_widget` and "Widget key" writes `[webchat] widget_key` (16 to 256 visible ASCII characters, with a Generate button; turning the widget on requires a key; the key is never returned). Applies immediately. The widget key is stored in plain text in `config.toml`: it is the public key that appears in the website's page source, so it is not treated as a secret.
 - WhatsApp, Feishu, Google Chat, Teams, WeCom and DingTalk: the six webhook routes are always mounted. A route answers 404 until its channel is configured; after that it enforces the platform's signature check and answers 401 to a bad signature. `channels.add` starts the channel without a restart: `channels.add` returns `hot_started` and `restart_required: false`, with `not_started_reason` when credentials are incomplete. A per-employee Slack bot also starts when it is added.
 
+## Integrations → Odoo → Website live chat
+
+Saved with its own button through `odoo.livechat.set` (admin) into `[odoo_livechat]`, a separate section from `[odoo]` because the Odoo connection save rewrites the whole `[odoo]` section. The bot API key is stored encrypted as `bot_api_key_enc` and never returned; leaving the field empty keeps it. Every save and every **Hand back to AI** is written to the audit log. See [features/61-odoo-livechat.md](../features/61-odoo-livechat.md).
+
+| Control | Key | Takes effect |
+|---|---|---|
+| Answer website live chat | `enabled` | Within seconds (the bridge re-reads config every poll; turning it off sets the bot offline in Odoo) |
+| Bot user login / API key | `bot_username`, `bot_api_key_enc` | Next poll (the bridge reconnects) |
+| Default AI employee, greeting, check interval | `default_agent`, `greeting`, `poll_interval_seconds` (2–60) | Next poll |
+| Live Chat channels to serve | `livechat_channel_ids` | Next poll |
+| Hand off to a person | `handoff_user_ids`, `handoff_keywords`, `handoff_message` | Next poll |
+| Audience rules | `[[odoo_livechat.audience_rules]]` (`name`, `agent`, `enabled`, `livechat_channel_ids`, `chatbot_script_ids`, `country_codes`, `langs`, `visitor`, `partner_tags`, `keywords`); every named AI employee must exist or the save is refused | New chats (a chat keeps the employee it was routed to) |
+
 ## Inference
 
 After a successful save (`inference.update`, admin) the gateway resets the inference engine, so the next reply uses the new settings without a restart.

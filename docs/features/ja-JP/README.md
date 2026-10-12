@@ -65,6 +65,7 @@
 | 58 | [ナイトエンジン](58-night-engine.md) | アイドル時間の記憶整理：4 つのサブパス（2 つは決定論的、2 つはユーティリティモデル）、パスごとの支出上限と日次サーキットブレーカー。独立した 2 つのスイッチで既定オフ。成果のあるパスは Activity Feed に表示 |
 | 59 | [ローカルプロキシ](59-local-proxy.md) | `duduclaw proxy` — Aider / Cline / Codex がアカウントプールを借りられる OpenAI 互換の localhost エンドポイント。Bearer 必須、既定は loopback、OAuth シートを転送できないことも明記 |
 | 60 | [Discovery](60-discovery.md) | 承認済み workspace の探索、予算とツリー台帳、hash 検証済み成果、ゼロ LLM held-out ポリシー比較。統合検証中 |
+| 61 | [Odoo Web サイトのライブチャット](61-odoo-livechat.md) | AI 社員が担当者として Odoo ライブチャットの訪問者に返信。オーディエンスルールで担当を振り分け、有人対応への切り替え |
 
 ---
 
