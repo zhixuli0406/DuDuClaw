@@ -793,12 +793,10 @@ mod tests {
     /// Write an executable shell script that plays the part of a vendor CLI.
     fn fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::write_executable(&path, format!("#!/bin/sh\n{body}\n"), 0o755);
+        #[cfg(not(unix))]
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         path
     }
 

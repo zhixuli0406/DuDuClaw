@@ -348,13 +348,8 @@
 
     #[cfg(unix)]
     fn judge_script(dir: &std::path::Path, name: &str, body: &str) -> String {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\n{body}").unwrap();
-        drop(f);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&path, format!("#!/bin/sh\n{body}\n"), 0o755);
         path.to_string_lossy().into_owned()
     }
 

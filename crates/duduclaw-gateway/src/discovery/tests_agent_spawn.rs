@@ -134,15 +134,13 @@ async fn invalid_workspace_fails_closed() {
 async fn fake_runner(script: &str, calls: u32) -> (tempfile::TempDir, ClaudeAttemptRunner, AttemptRequest) {
     use duduclaw_agent::account_rotator::{Account, AccountRotator, RotationStrategy};
     use super::super::contracts::RunBudget;
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let node = dir.path().join("discovery/runs/run/r1/b0/a0/ws");
     super::super::workspace::create_private_directory(&node).unwrap();
     let tools = dir.path().join("tools");
     std::fs::create_dir(&tools).unwrap();
     let cli = tools.join("fake-claude");
-    std::fs::write(&cli, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_exec::write_executable(&cli, format!("#!/bin/sh\n{script}\n"), 0o700);
     let rotator = AccountRotator::new(RotationStrategy::RoundRobin, 0);
     let mut account: Account = serde_json::from_value(serde_json::json!({
         "id":"test", "auth_method":"api_key", "provider":"anthropic",
@@ -657,15 +655,13 @@ async fn scripted(family:&str,provider:&str,seats:&[(&str,bool,&str)],stream:&st
     ->(tempfile::TempDir,Box<dyn AttemptRunner>,AttemptRequest,SharedBudget) {
     use duduclaw_agent::account_rotator::{Account, AccountRotator, RotationStrategy};
     use super::super::contracts::RunBudget;
-    use std::os::unix::fs::PermissionsExt;
     let dir=tempfile::tempdir().unwrap();
     let node=dir.path().join("discovery/runs/run/r1/b0/a0/ws");
     super::super::workspace::create_private_directory(&node).unwrap();
     let tools=dir.path().join("tools");std::fs::create_dir(&tools).unwrap();
     std::fs::write(tools.join("events.ndjson"),stream).unwrap();
     let client=tools.join("container-client");
-    std::fs::write(&client,format!("#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\ncreate) printf '%s\\n' \"$OPENAI_API_KEY$XAI_API_KEY$GEMINI_API_KEY$DUDU_CREDENTIAL_DOC\" >> \"$d/keys\"; printf '%064d\\n' 1;;\nstart) printf 'start\\n' >> \"$d/starts\"; /bin/cat >/dev/null; /bin/cat \"$d/events.ndjson\"; {tail};;\nrm) ;;\n*) exit 3;;\nesac\n")).unwrap();
-    std::fs::set_permissions(&client,std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_exec::write_executable(&client, format!("#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\ncreate) printf '%s\\n' \"$OPENAI_API_KEY$XAI_API_KEY$GEMINI_API_KEY$DUDU_CREDENTIAL_DOC\" >> \"$d/keys\"; printf '%064d\\n' 1;;\nstart) printf 'start\\n' >> \"$d/starts\"; /bin/cat >/dev/null; /bin/cat \"$d/events.ndjson\"; {tail};;\nrm) ;;\n*) exit 3;;\nesac\n"), 0o700);
     super::super::attempt_container::DOCKER_PROGRAM.with(|p|*p.borrow_mut()=Some(client));
     let rotator=AccountRotator::new(RotationStrategy::RoundRobin,0);
     for (id,oauth,secret) in seats {

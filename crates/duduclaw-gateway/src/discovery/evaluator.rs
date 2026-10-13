@@ -1054,7 +1054,6 @@ mod tests {
 #[cfg(all(test, unix))]
 mod container_lifecycle_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     const ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1063,8 +1062,7 @@ mod container_lifecycle_tests {
     fn fixture(mode: &str) -> (tempfile::TempDir, Command) {
         let home = tempfile::tempdir().unwrap();
         let client = home.path().join("docker-mock");
-        fs::write(&client, format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$LOG\"\ncase \"$1\" in\ncreate) case \"$MODE\" in create_fail) exit 2;; bad_id) echo unconfirmed;; *) echo {ID};; esac;;\nstart) if [ \"$MODE\" = hang ]; then sleep 30; else cat >/dev/null; echo '{{\"pass\":true,\"valid\":true,\"score\":5,\"fail_class\":\"ok\"}}'; fi;;\nrm) if [ \"$MODE\" = cleanup_fail ]; then exit 3; fi;;\n*) exit 4;;\nesac\n")).unwrap();
-        fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&client, format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$LOG\"\ncase \"$1\" in\ncreate) case \"$MODE\" in create_fail) exit 2;; bad_id) echo unconfirmed;; *) echo {ID};; esac;;\nstart) if [ \"$MODE\" = hang ]; then sleep 30; else cat >/dev/null; echo '{{\"pass\":true,\"valid\":true,\"score\":5,\"fail_class\":\"ok\"}}'; fi;;\nrm) if [ \"$MODE\" = cleanup_fail ]; then exit 3; fi;;\n*) exit 4;;\nesac\n"), 0o755);
         let mut command = Command::new(client);
         command.env_clear().env("PATH", "/usr/bin:/bin")
             .env("LOG", home.path().join("lifecycle.log")).env("MODE", mode)
@@ -1148,8 +1146,7 @@ mod container_lifecycle_tests {
         fs::create_dir(&snapshot).unwrap();
         fs::write(snapshot.join("values.json"), "[2,3]").unwrap();
         let judge = root.join("judge.py");
-        fs::write(&judge, "#!/usr/bin/env python3\nimport json,sys,socket\nfrom pathlib import Path\nw=Path(sys.argv[1])\ntry:\n (w/'forbidden').write_text('x')\n raise RuntimeError('readonly mount is writable')\nexcept OSError: pass\ntry:\n socket.create_connection(('1.1.1.1',443),timeout=0.2)\n raise RuntimeError('network is reachable')\nexcept OSError: pass\ns=sum(json.loads((w/'values.json').read_text()))\nprint(json.dumps(dict(pass_=True,valid=True,score=s,fail_class='ok')).replace('pass_', 'pass'))\n").unwrap();
-        fs::set_permissions(&judge, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&judge, "#!/usr/bin/env python3\nimport json,sys,socket\nfrom pathlib import Path\nw=Path(sys.argv[1])\ntry:\n (w/'forbidden').write_text('x')\n raise RuntimeError('readonly mount is writable')\nexcept OSError: pass\ntry:\n socket.create_connection(('1.1.1.1',443),timeout=0.2)\n raise RuntimeError('network is reachable')\nexcept OSError: pass\ns=sum(json.loads((w/'values.json').read_text()))\nprint(json.dumps(dict(pass_=True,valid=True,score=s,fail_class='ok')).replace('pass_', 'pass'))\n", 0o755);
         let mut config = super::tests::config(vec![judge.to_string_lossy().into_owned()]);
         config.image = Some("python:3.12-alpine".into());
         config.pids = 64;
@@ -1194,7 +1191,6 @@ mod container_lifecycle_tests {
 #[cfg(all(test, unix))]
 mod sealed_execution_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     fn fixture(cheating_valid: bool) -> (tempfile::TempDir, RegisteredEvaluator) {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
@@ -1210,8 +1206,7 @@ mod sealed_execution_tests {
         };
         fs::write(root.join("good/verdict.json"), good.to_string()).unwrap();
         fs::write(root.join("bad/verdict.json"), bad.to_string()).unwrap();
-        fs::write(root.join("judge"), "#!/bin/sh\ncat \"$1/verdict.json\"\n").unwrap();
-        fs::set_permissions(root.join("judge"), fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&root.join("judge"), "#!/bin/sh\ncat \"$1/verdict.json\"\n", 0o755);
         let entry = EvaluatorConfig {
             command: vec![root.join("judge").to_string_lossy().into_owned()],
             sha256: directory_sha256(&root).unwrap(),

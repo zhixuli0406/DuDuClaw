@@ -14,9 +14,6 @@
 //! playbook is really written and re-read, and the champion / settlement rows
 //! really land in `evolution.db`.
 
-use std::io::Write as _;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -43,11 +40,7 @@ const AGENT: &str = "aee-wiring";
 #[cfg(unix)]
 fn fake_binary(dir: &Path, script: &str) -> PathBuf {
     let path = dir.join("fake-duduclaw.sh");
-    let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "#!/bin/sh").unwrap();
-    write!(f, "{script}").unwrap();
-    drop(f);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_exec::write_executable(&path, format!("#!/bin/sh\n{script}"), 0o755);
     path
 }
 
