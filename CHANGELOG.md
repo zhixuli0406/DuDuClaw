@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- AI 員工可以接 Odoo 網站線上客服（Live Chat）：在 Odoo 建一個專用使用者並加進線上客服頻道的客服人員，DuDuClaw 讓它保持上線，Odoo 就會把訪客對話（直接或由聊天機器人轉接）分派給它，AI 員工以這個帳號回覆。設定在「管理 → 整合 → Odoo → 網站線上客服」，寫入新的 `[odoo_livechat]` 區段，預設關閉、改設定不用重啟。支援 Odoo 17 以上，已在 Odoo 18.0 與 19.0 實機驗證；Odoo 19 由 `[odoo]` 連線帳號（需管理員角色）代為維持上線。新 RPC：`odoo.livechat.get`、`set`、`test`、`status`、`resume`（皆限管理員）。
+- 線上客服分眾規則：依線上客服頻道、轉接的聊天機器人腳本、是否登入、客戶標籤、國家、語言與訊息關鍵字，由上往下第一條符合的規則決定由哪位 AI 員工回覆，沒有符合時交給預設 AI 員工；分派在訪客第一則訊息決定，整段對話不換人。Odoo 內部人員在對話中發言即自動停話；訪客說出轉接關鍵字時邀請指定的 Odoo 使用者加入並停話；設定頁列出進行中的對話，可「交回 AI」。
 - 帳號設定頁（設定 → 帳號與密碼）可以修改自己的登入信箱，對應新的自助 RPC `users.change_email`。一般帳號要輸入目前密碼；個人版開著本機自動登入時，擁有者本人不用輸入（這種模式下擁有者從沒設過密碼，在這台電腦前本來就能免密碼進來）。改完會刷新 token 並重新連線，稽核紀錄 `email.change` 會留下新舊兩個信箱。
 - 擁有者帳號還是 `admin@local` 時，儀表板會跳出「設定你的電子郵件」對話框。個人版首次自動登入後會先看到它，既有安裝升級後也會看到一次；按「稍後再說」後這個瀏覽器不再提示。
 
@@ -13,6 +15,7 @@
 - **Gemini CLI runtime 的移除時間由 v1.73.0 再延到 v1.74.0**（runtime id `gemini`，仍是棄用狀態，行為不變）：v1.69.1 修正後用真的 Gemini 金鑰重驗 Antigravity 的步驟還沒做，移除等重驗完成。`duduclaw doctor` 與 `runtime.detect` 顯示的移除版本同步改為 v1.74.0，三種語言的文件一併更新。還在用 `gemini` 的員工請改成 `antigravity`，換法見 `docs/guides/deprecations.md`。
 
 ### Fixed
+- 網站訪客這類公開對話不再看到給管理者的系統訊息：AI 無法回覆時只送一句簡短道歉（真正原因寫進通道失敗紀錄），「規則已變更」通知與 `/takeover` 狀態說明也不會出現在訪客對話。
 - 個人版開著本機自動登入時，擁有者在「設定 → 帳號與密碼」設定密碼不再要求輸入目前密碼。之前那組密碼是自動登入時隨機產生、本人從不知道的，所以根本改不了。同一頁的說明也改成正確順序：先設密碼，再把 `local_auto_login` 設成 off。稽核紀錄記為 `password.set_local_owner`；其他帳號、非個人版、或自動登入已關的情況，照舊要輸入目前密碼。
 - Docker 映像建置配方：`container/Dockerfile.server`、`Dockerfile.edition-smoke` 與 relay 的 Dockerfile 一併複製 vendored SDK（`vendor/`），Antigravity／Grok 安裝程式改用 `curl --compressed` 下載，避免伺服器回傳壓縮內容時安裝程式驗證失敗；發版用的 Docker workflow 固定建置配方。v1.72.2 的 server 映像已用這套配方補發。
 

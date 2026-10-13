@@ -71,6 +71,7 @@ DuDuClaw is a multi-runtime AI agent platform: it routes channel messages and di
 
 ### Channels, dashboard, other lines
 - **Channels**: eleven (Telegram, LINE, Discord, Slack, WhatsApp, Feishu, Google Chat, Teams, WeCom, DingTalk, WebChat); capability table `channel_capabilities.rs`; durable LINE ingress (`channel_ingress/`); chat decisions need verb + full request UUID; per-employee bot tokens only for Telegram/Discord/Slack (`reports_to` cascade).
+- **Odoo website Live Chat** (`odoo_livechat/`, `[odoo_livechat]`, default off): the bot answers as an Odoo Live Chat operator kept online by the gateway; audience rules pick the employee per visitor; Odoo-native takeover. Public-visitor sessions (`odoolivechat:` prefix) never see operator-facing fallback text, notices or `/takeover`. Detail: `docs/features/61-odoo-livechat.md`.
 - **Dashboard**: JWT account or admin token; config writes through `handlers/config_commit.rs` (lock, hash compare, format-preserving); raw editor; settings map `docs/guides/dashboard-settings.md`. New nav pages carry a `newIn` version badge.
 - **Elsewhere**: OS-native line (`duduclaw-os`, `duduclaw-sysd`, `os_ops.rs` as the single authority for device `os_*` capabilities; gpui/smithay UI crates live in the DuDuClaw-OS repo); packs (`duduclaw pack`); skills; integrations gated by `[integrations]`; cost telemetry; OpenTelemetry (opt-in); A2A agent card; CCR, causal graph and decision twin (admin-only, gated).
 

@@ -65,6 +65,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 58 | [Night Engine](58-night-engine.md) | Idle-window memory tidy-up: four sub-passes (two deterministic, two on the utility model), a per-pass spend cap and a daily circuit breaker, behind two separate opt-in switches; productive passes appear in Activity Feed |
 | 59 | [Local Proxy](59-local-proxy.md) | `duduclaw proxy` — an OpenAI-compatible localhost endpoint so Aider / Cline / Codex can borrow the account pool; Bearer-gated, loopback by default, honest about OAuth seats not being forwardable |
 | 60 | [Discovery](60-discovery.md) | Approved-workspace exploration, budgeted tree records, verified artifacts and zero-LLM held-out policy comparisons; integration validation in progress |
+| 61 | [Odoo website live chat](61-odoo-livechat.md) | AI employees answer Odoo Live Chat visitors as an operator; audience rules pick the employee per visitor; human takeover and handoff |
 
 ---
 

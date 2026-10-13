@@ -51,6 +51,19 @@
 - 網站聊天元件：「開放網站聊天元件」寫 `[webchat] public_widget`，「元件金鑰」寫 `[webchat] widget_key`（16 到 256 個可見 ASCII 字元，有「產生」按鈕；開啟元件時必須有金鑰；金鑰不會在回應中回傳）。立即生效。元件金鑰以明文存在 `config.toml`：它是公開的金鑰，會出現在網站的頁面原始碼裡，所以不當成密鑰處理。
 - WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘：六條 webhook 路由一律掛著。通道設定好之前回 404；設定好之後會驗證平台的簽章，簽章錯誤回 401。`channels.add` 不必重啟就會啟動通道，`channels.add` 回 `hot_started` 與 `restart_required: false`；憑證不完整時附 `not_started_reason`。個別員工的 Slack bot 也會在新增時直接啟動。
 
+## 整合 → Odoo → 網站線上客服
+
+用自己的儲存按鈕透過 `odoo.livechat.set`（管理員）寫入 `[odoo_livechat]`。它和 `[odoo]` 分開，因為儲存 Odoo 連線設定時會整段改寫 `[odoo]`。機器人 API 金鑰加密存成 `bot_api_key_enc`，不會回傳；欄位留空表示不變。每次儲存與每次「交回 AI」都寫入稽核紀錄。詳見 [features/zh-TW/61-odoo-livechat.md](../../features/zh-TW/61-odoo-livechat.md)。
+
+| 控制項 | 設定鍵 | 生效時機 |
+|---|---|---|
+| 啟用網站線上客服 | `enabled` | 幾秒內（每次輪詢都重讀設定；關閉時機器人在 Odoo 改為離線） |
+| 機器人帳號／API 金鑰 | `bot_username`、`bot_api_key_enc` | 下一次輪詢（重新連線） |
+| 預設 AI 員工、開場白、檢查間隔 | `default_agent`、`greeting`、`poll_interval_seconds`（2～60） | 下一次輪詢 |
+| 服務的線上客服頻道 | `livechat_channel_ids` | 下一次輪詢 |
+| 轉接真人 | `handoff_user_ids`、`handoff_keywords`、`handoff_message` | 下一次輪詢 |
+| 分眾規則 | `[[odoo_livechat.audience_rules]]`（`name`、`agent`、`enabled`、`livechat_channel_ids`、`chatbot_script_ids`、`country_codes`、`langs`、`visitor`、`partner_tags`、`keywords`）；指定的 AI 員工必須存在，否則拒絕儲存 | 新對話（已分派的對話維持原本的 AI 員工） |
+
 ## 本地推理
 
 存檔（`inference.update`，管理員）成功後 gateway 會重設推理引擎，下一則回覆就用新設定，不必重啟。

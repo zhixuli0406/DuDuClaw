@@ -448,6 +448,27 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_odoo_agent_test(params).await
             }
+            // Odoo website Live Chat bridge (crate::odoo_livechat).
+            "odoo.livechat.get" => {
+                require_admin!();
+                self.handle_odoo_livechat_get().await
+            }
+            "odoo.livechat.status" => {
+                require_admin!();
+                self.handle_odoo_livechat_status().await
+            }
+            "odoo.livechat.set" => {
+                require_admin!();
+                self.handle_odoo_livechat_set(params, ctx).await
+            }
+            "odoo.livechat.test" => {
+                require_admin!();
+                self.handle_odoo_livechat_test(params).await
+            }
+            "odoo.livechat.resume" => {
+                require_admin!();
+                self.handle_odoo_livechat_resume(params, ctx).await
+            }
 
             // ── User management (admin only) ─────────────────
             // ── Personal dashboard (WP15) — per-user, no extra gate ──

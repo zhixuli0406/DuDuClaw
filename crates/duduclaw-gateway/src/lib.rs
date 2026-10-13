@@ -220,6 +220,7 @@ pub mod miniapp;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
 // background poller → autopilot bus. Both transports default OFF.
 pub mod odoo_events;
+pub mod odoo_livechat;
 pub mod os_events;
 pub mod os_frontmost;
 pub mod persona_induction;

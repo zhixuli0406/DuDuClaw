@@ -51,6 +51,19 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 - Web サイト用チャットウィジェット：公開の切り替えは `[webchat] public_widget`、ウィジェットキーは `[webchat] widget_key` に書き込みます（可視 ASCII 16〜256 文字、生成ボタンあり。公開するにはキーが必要。キーは応答に含まれません）。即時反映。ウィジェットキーは `config.toml` に平文で保存されます。Web サイトのページソースに現れる公開キーなので、シークレットとしては扱いません。
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
 
+## 連携 → Odoo → Web サイトのライブチャット
+
+専用の保存ボタンで `odoo.livechat.set`（管理者）から `[odoo_livechat]` に書き込みます。Odoo 接続の保存は `[odoo]` 全体を書き換えるため、別セクションにしています。ボットの API キーは `bot_api_key_enc` として暗号化保存され、返されません。空欄なら変更しません。保存と「AI に戻す」は監査ログに記録されます。詳細は [features/ja-JP/61-odoo-livechat.md](../../features/ja-JP/61-odoo-livechat.md)。
+
+| 項目 | キー | 反映 |
+|---|---|---|
+| Web サイトのライブチャットに応答する | `enabled` | 数秒以内（ポーリングごとに設定を再読込。オフでボットは Odoo でオフライン） |
+| ボットユーザーのログイン／API キー | `bot_username`、`bot_api_key_enc` | 次のポーリング（再接続） |
+| 既定の AI 社員、最初のあいさつ、確認間隔 | `default_agent`、`greeting`、`poll_interval_seconds`（2〜60） | 次のポーリング |
+| 対応するライブチャットチャネル | `livechat_channel_ids` | 次のポーリング |
+| 有人対応への引き継ぎ | `handoff_user_ids`、`handoff_keywords`、`handoff_message` | 次のポーリング |
+| オーディエンスルール | `[[odoo_livechat.audience_rules]]`（`name`、`agent`、`enabled`、`livechat_channel_ids`、`chatbot_script_ids`、`country_codes`、`langs`、`visitor`、`partner_tags`、`keywords`）。指定した AI 社員が存在しないと保存できません | 新しいチャット（振り分け済みのチャットは変わりません） |
+
 ## 推論
 
 保存（`inference.update`、管理者）に成功すると gateway が推論エンジンをリセットし、次の返信から新しい設定が使われます。再起動は不要です。

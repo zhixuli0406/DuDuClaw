@@ -9,7 +9,7 @@
 //! Unknown sections and unknown keys stay allowed (forward compatibility,
 //! operator notes); sections with a strict typed struct (`[container.sandbox]`,
 //! `[computer_use]`, `[[tick.sources]]`, `[team]`, `[takeover]`,
-//! `[redaction]`, `[db_sources]`, `[secret_manager]`) are additionally
+//! `[redaction]`, `[db_sources]`, `[secret_manager]`, `[odoo_livechat]`) are additionally
 //! deserialized by `config_raw_rpc::validate_config_table`.
 
 #[derive(Clone, Copy, Debug, PartialEq)]

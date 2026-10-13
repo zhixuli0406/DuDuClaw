@@ -65,6 +65,7 @@
 | 58 | [夜間引擎](58-night-engine.md) | 閒置時段的記憶整理：四個子階段（兩個確定性、兩個走輔助模型）、每 pass 花費上限與每日斷路器，兩道各自獨立的開關預設全關；有成果的整理會顯示於 Activity Feed |
 | 59 | [本機 proxy](59-local-proxy.md) | `duduclaw proxy`：OpenAI 相容的 localhost 端點，讓 Aider／Cline／Codex 借用帳號池；強制 Bearer、預設綁 loopback，並誠實揭露訂閱制 OAuth 席次無法轉發 |
 | 60 | [Discovery 探索](60-discovery.md) | 核准工作區探索、預算與樹狀帳本、雜湊驗證成品、零 LLM held-out 策略比較；整合驗證中 |
+| 61 | [Odoo 網站線上客服](61-odoo-livechat.md) | AI 員工以客服人員身分回覆 Odoo 線上客服訪客；分眾規則決定每位訪客由誰回覆；真人接手與轉接 |
 
 ---
 
