@@ -149,9 +149,13 @@ gateway, not by the desktop.
   working after you replace `admin@local` with your own address. The
   endpoint only answers yes (`{"ok": true}`) or no (401): it never hands out
   a login token and never returns the email. It accepts calls only from the
-  machine itself, refuses anything that came through a reverse proxy, and
-  shares the `/api/login` attempt limit (5 tries per 15 minutes), so it is
-  not a second way to guess the password.
+  machine itself and refuses anything that came through a reverse proxy.
+  Every local caller shares one attempt limit with a local `/api/login` for
+  the owner (5 tries per 15 minutes), so it is not a second way to guess the
+  password. The flip side: any program running on the machine can use up
+  those 5 tries and keep the lock screen refusing for up to 15 minutes. We
+  accept that, because a hostile program already running on the box is a
+  bigger problem than a locked screen.
 - **Nothing about the image is "trust us."** The build recipe that produces
   the image is public — see Building It Yourself below — so anyone can
   read every line that goes into the box before flashing it, rather than
