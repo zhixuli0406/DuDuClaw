@@ -140,6 +140,14 @@ class DeliveryTests(unittest.TestCase):
         self.data["delta_sha256"] = "0" * 64
         with self.assertRaises(ValueError): self.verify()
 
+    def test_delta_ignores_object_id_abbreviation(self):
+        # The signer's checkout and a CI clone may abbreviate object ids to
+        # different lengths; the bound delta must not depend on that.
+        before = delivery.delta(self.root, "v1.2.3", self.source)
+        for abbrev in ("7", "12", "40"):
+            self.run_git("config", "core.abbrev", abbrev)
+            self.assertEqual(delivery.delta(self.root, "v1.2.3", self.source), before)
+
     def test_expired(self):
         self.data["expires_at"] = self.data["issued_at"]
         with self.assertRaises(ValueError): self.verify()
