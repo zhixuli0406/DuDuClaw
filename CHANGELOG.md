@@ -9,6 +9,9 @@
 ### Changed
 - 儀表板首次設定改成填入你自己的電子郵件和密碼，之後用這個信箱登入，不再固定是 `admin@local`。`POST /api/first-run/claim` 新增選填的 `email` 欄位，回應帶回實際登入用的信箱；沒帶 `email` 的呼叫端（DuDuClaw OS 開機設定、安裝程式留下的 `pending-account.json`、個人版本機自動登入）照舊沿用 `admin@local`。使用者資料表新增 `bootstrap_owner` 欄位標記初始擁有者帳號，舊資料庫升級時會把 `admin@local` 那一列標上；首次設定狀態與本機自動登入改用這個標記找帳號，不再依信箱查詢。已完成設定的安裝不受影響，帳號信箱維持原樣。
 
+### Deprecated
+- **Gemini CLI runtime 的移除時間由 v1.73.0 再延到 v1.74.0**（runtime id `gemini`，仍是棄用狀態，行為不變）：v1.69.1 修正後用真的 Gemini 金鑰重驗 Antigravity 的步驟還沒做，移除等重驗完成。`duduclaw doctor` 與 `runtime.detect` 顯示的移除版本同步改為 v1.74.0，三種語言的文件一併更新。還在用 `gemini` 的員工請改成 `antigravity`，換法見 `docs/guides/deprecations.md`。
+
 ### Fixed
 - 個人版開著本機自動登入時，擁有者在「設定 → 帳號與密碼」設定密碼不再要求輸入目前密碼。之前那組密碼是自動登入時隨機產生、本人從不知道的，所以根本改不了。同一頁的說明也改成正確順序：先設密碼，再把 `local_auto_login` 設成 off。稽核紀錄記為 `password.set_local_owner`；其他帳號、非個人版、或自動登入已關的情況，照舊要輸入目前密碼。
 - Docker 映像建置配方：`container/Dockerfile.server`、`Dockerfile.edition-smoke` 與 relay 的 Dockerfile 一併複製 vendored SDK（`vendor/`），Antigravity／Grok 安裝程式改用 `curl --compressed` 下載，避免伺服器回傳壓縮內容時安裝程式驗證失敗；發版用的 Docker workflow 固定建置配方。v1.72.2 的 server 映像已用這套配方補發。

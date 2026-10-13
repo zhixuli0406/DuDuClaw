@@ -25,7 +25,7 @@ When a change lands: write the detail into `CHANGELOG.md` and the wiki reference
 ## Current state (v1.72.2, 2026-10-11)
 
 - Workspace version 1.72.2. Nothing is under `[Unreleased]` in `CHANGELOG.md` as of 2026-10-12.
-- Gemini CLI runtime (`gemini`) is deprecated, removal scheduled for v1.73.0; it waits for a real-key re-verification of Antigravity after v1.69.1. Version lives in `runtime_catalog.rs` `RuntimeSpec.deprecation`. The Gemini API provider is not deprecated.
+- Gemini CLI runtime (`gemini`) is deprecated, removal scheduled for v1.74.0; it waits for a real-key re-verification of Antigravity after v1.69.1. Version lives in `runtime_catalog.rs` `RuntimeSpec.deprecation`. The Gemini API provider is not deprecated.
 - Legacy pack manifests (`expert.toml`, `team.toml`, industry pack directories) are deprecated with no removal version (a `pack.toml` team/template pack cannot be installed yet).
 - Deprecation policy: a renamed or merged public name survives two minor versions. MCP tool: stays listed and callable with a `[deprecated → …]` description prefix; CLI: hidden clap alias; config value: still parses and warns once per process; dashboard: offers only the new name. Table: `docs/guides/deprecations.md`.
 
