@@ -74,7 +74,10 @@ def delta(root, previous_tag, source):
         raise ValueError("invalid previous release tag")
     # Require a real ancestor tag, never a caller-supplied arbitrary revision.
     git(root, "merge-base", "--is-ancestor", previous_tag, source)
-    return hashlib.sha256(git(root, "diff", "--binary", "--no-ext-diff",
+    # --full-index: without it the `index` lines carry abbreviated object ids
+    # whose length git picks from the repository's object count, so a full
+    # clone (CI) and the signer's checkout hashed the same diff differently.
+    return hashlib.sha256(git(root, "diff", "--binary", "--full-index", "--no-ext-diff",
                               "--no-textconv", previous_tag, source, "--")).hexdigest()
 
 
