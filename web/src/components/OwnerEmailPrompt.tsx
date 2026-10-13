@@ -45,6 +45,11 @@ function rememberDismissed() {
 export function OwnerEmailPrompt() {
   const intl = useIntl();
   const connected = useConnectionStore((s) => s.state) === 'authenticated';
+  // An account that must change its password first can only call the
+  // password-change RPCs, so `users.change_email` would be refused. Wait until
+  // the password is set; the forced reconnect after that clears the flag and
+  // this effect runs again.
+  const mustChangePassword = useConnectionStore((s) => s.mustChangePassword);
   const [setup, setSetup] = useState<EmailSetup | null>(null);
   const [open, setOpen] = useState(false);
   const [email, setEmail] = useState('');
@@ -53,7 +58,7 @@ export function OwnerEmailPrompt() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    if (!connected || setup || wasDismissed()) return;
+    if (!connected || mustChangePassword || setup || wasDismissed()) return;
     let active = true;
     api.users
       .me()
@@ -68,7 +73,7 @@ export function OwnerEmailPrompt() {
     return () => {
       active = false;
     };
-  }, [connected, setup]);
+  }, [connected, mustChangePassword, setup]);
 
   const later = () => {
     rememberDismissed();
@@ -90,7 +95,7 @@ export function OwnerEmailPrompt() {
     }
   };
 
-  if (!setup?.placeholder) return null;
+  if (!setup?.placeholder || mustChangePassword) return null;
 
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : later())}>
