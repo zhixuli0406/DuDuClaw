@@ -48,12 +48,33 @@ pub(crate) fn check_ws_rate_limit(ip: IpAddr) -> bool {
 /// remote attacker lock out any known account for 15 minutes simply by sending
 /// bad passwords. Now the key includes the source IP (so one attacker IP cannot
 /// exhaust the limit for a victim on a different IP) and a successful login
-/// clears the counter (`reset_login_rate_limit`).
+/// clears the counter (`reset_login_rate_limit`). Every loopback source
+/// (127.0.0.0/8, ::1) counts as one IP, see [`login_throttle_ip`]. Shared by
+/// `/api/login`, `/api/otp/request` and `/api/owner/verify`.
 static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (Instant, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Rate-limit key address for every loopback caller. `is_loopback()` covers
+/// all of `127.0.0.0/8` and `::1`, so keying by the raw peer would let a local
+/// process rotate source addresses (127.0.0.2, .3, …) for a fresh budget each
+/// time. Every loopback source collapses onto this one address; non-loopback
+/// addresses keep their own key (M2: a remote attacker on one IP cannot spend
+/// a victim's budget on another).
+const LOOPBACK_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// The address the login limiter keys on for a peer `ip`.
+fn login_throttle_ip(ip: IpAddr) -> IpAddr {
+    if ip.is_loopback() {
+        LOOPBACK_THROTTLE_IP
+    } else {
+        ip
+    }
+}
+
 /// Returns `true` if the attempt from `(ip, email)` is within the rate budget.
+/// Loopback peers share one key per email ([`login_throttle_ip`]).
 fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
+    let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if map.len() > 10000 {
@@ -71,6 +92,7 @@ fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
 /// Clear the failed-attempt counter for `(ip, email)` after a successful login
 /// so a legitimate user is never penalised for earlier typos (M2).
 fn reset_login_rate_limit(ip: IpAddr, email: &str) {
+    let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&(ip, email.to_string()));
 }
@@ -2257,6 +2279,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             post(handle_first_run_network_connect),
         )
         .route("/api/session/local", post(handle_local_session))
+        // OS lock screen: owner password check by `bootstrap_owner` flag.
+        .route("/api/owner/verify", post(handle_owner_verify))
         .with_state(state.clone());
 
     let mut app = Router::new()
@@ -3745,6 +3769,160 @@ async fn handle_first_run_claim(
                 Json(serde_json::json!({"error": "failed to set password"})),
             )
                 .into_response()
+        }
+    }
+}
+
+// ── Owner password verification (OS lock screen) ─────────────────────────
+
+/// Upper bound on the password the verify endpoint will even look at. Same
+/// value as `duduclaw_auth::db`'s private `MAX_PASSWORD_LEN`; anything longer
+/// is refused as a malformed body before it costs an Argon2 run.
+const OWNER_VERIFY_MAX_PASSWORD_BYTES: usize = 1024;
+
+/// Email that can never exist (no `@`, rejected by `validate_account_email`).
+/// Looking it up makes `verify_password` run its dummy Argon2 hash, so the
+/// "no owner" path costs the same as a real mismatch.
+const OWNER_VERIFY_NO_OWNER_EMAIL: &str = "no-bootstrap-owner.invalid";
+
+#[derive(serde::Deserialize)]
+struct OwnerVerifyRequest {
+    password: String,
+}
+
+/// POST /api/owner/verify — "is this the machine owner's password?"
+///
+/// The DuDuClaw OS lock screen needs to check the owner's password, but the
+/// owner may have replaced the placeholder `admin@local` with a real email
+/// (v1.73.0) and the shell cannot always learn it (no local session when
+/// auto-login is off or the edition is not Personal). This endpoint resolves
+/// the owner by its `bootstrap_owner` flag instead of by email.
+///
+/// It answers yes/no and nothing else: no token is issued, the email is never
+/// returned, the password is never logged.
+///
+/// Gates, in order (all fail closed):
+///   1. TCP peer is loopback (`ConnectInfo`, never a header), no proxy-class
+///      header is present (a reverse proxy on the same box makes every peer
+///      loopback — `local_session::PROXY_HEADERS`), and the `Origin`, if any,
+///      passes the loopback allowlist. One uniform 403.
+///   2. Well-formed JSON body with a non-empty password of at most
+///      [`OWNER_VERIFY_MAX_PASSWORD_BYTES`]. Axum's `Json` extractor also
+///      requires `Content-Type: application/json`, so a cross-site page cannot
+///      send a CORS "simple request" here. 400.
+///   3. Shared login throttle: the `/api/login` limiter, keyed
+///      `(127.0.0.1, owner email)` for EVERY loopback caller
+///      ([`login_throttle_ip`]), so rotating loopback source addresses
+///      buys nothing, and a local `/api/login` for the owner (which arrives
+///      from 127.0.0.1) draws on the same bucket — alternating endpoints never
+///      buys extra guesses either. 429. A match clears the bucket, as a login
+///      does.
+///   4. `UserDb::verify_password` (timing-safe, Active status required).
+///      Mismatch, missing owner and inactive owner all return the same 401;
+///      the missing-owner path runs the same dummy hash as an unknown email.
+///
+/// Accepted trade-off: because all local callers share one bucket, any local
+/// process can spend it with wrong guesses and keep the owner's lock screen
+/// (and local `/api/login` for the owner) at 429 for up to 15 minutes. A
+/// hostile process already running on the box is a compromise in its own
+/// right; per-caller budgets would instead hand it unlimited guesses.
+///
+/// Unlike `/api/session/local`, the `X-DuDuClaw-Local` marker header is not
+/// required: the JSON content type already forces a CORS preflight (which this
+/// gateway never answers with an allow-origin), and the endpoint issues no
+/// token. The OS shell does not send the marker today.
+///
+/// An owner still flagged `must_change_password` (unclaimed instance) is
+/// verified like any other: its one-time password is valid for `/api/login`
+/// too, and this endpoint grants nothing that login would not.
+async fn handle_owner_verify(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<OwnerVerifyRequest>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    fn reply(status: StatusCode, value: serde_json::Value) -> axum::response::Response {
+        (status, Json(value)).into_response()
+    }
+    let unauthorized = || {
+        reply(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": "invalid password"}),
+        )
+    };
+
+    let ip = addr.ip();
+    if !ip.is_loopback()
+        || crate::local_session::proxy_header_present(&headers).is_some()
+        || !origin_is_allowed(&headers)
+    {
+        return reply(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "owner verification is only available from localhost"}),
+        );
+    }
+
+    let password = match body {
+        Ok(Json(req))
+            if !req.password.is_empty()
+                && req.password.len() <= OWNER_VERIFY_MAX_PASSWORD_BYTES =>
+        {
+            req.password
+        }
+        _ => {
+            return reply(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "expected a JSON body with a password"}),
+            );
+        }
+    };
+
+    let owner = match state.user_db.get_bootstrap_owner() {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            let _ = state
+                .user_db
+                .verify_password(OWNER_VERIFY_NO_OWNER_EMAIL, &password);
+            return unauthorized();
+        }
+        Err(e) => {
+            error!("owner verify: owner lookup failed: {e}");
+            let _ = state
+                .user_db
+                .verify_password(OWNER_VERIFY_NO_OWNER_EMAIL, &password);
+            return unauthorized();
+        }
+    };
+
+    if !check_login_rate_limit(ip, &owner.email) {
+        return reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({"error": "too many attempts, try again in 15 minutes"}),
+        );
+    }
+
+    let ip_str = ip.to_string();
+    match state.user_db.verify_password(&owner.email, &password) {
+        Ok(user) if user.id == owner.id && user.status == duduclaw_auth::UserStatus::Active => {
+            reset_login_rate_limit(ip, &owner.email);
+            let _ =
+                state
+                    .user_db
+                    .log_action(Some(&user.id), "owner_verify", None, None, Some(&ip_str));
+            reply(StatusCode::OK, serde_json::json!({"ok": true}))
+        }
+        _ => {
+            warn!("owner verify failed from {ip_str}");
+            let _ = state.user_db.log_action(
+                None,
+                "owner_verify_failed",
+                Some(&owner.id),
+                None,
+                Some(&ip_str),
+            );
+            unauthorized()
         }
     }
 }
@@ -16191,6 +16369,348 @@ async fn well_known_mcp_server_card() -> axum::Json<serde_json::Value> {
 }
 
 #[cfg(test)]
+mod owner_verify_tests {
+    //! `POST /api/owner/verify`. Driven through a real `Router` so axum's
+    //! `Json` rejection (400) is exercised. The login rate limiter is
+    //! process-global and every loopback caller shares one key per owner
+    //! email, so each test claims the owner under its OWN email.
+    use super::*;
+    use duduclaw_auth::{UserRole, UserStatus};
+    use tower::ServiceExt;
+
+    const OWNER_PASSWORD: &str = "correct horse battery";
+    const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+
+    async fn state_with(user_db: UserDb, home: std::path::PathBuf) -> Arc<AppState> {
+        let (tx, _) = broadcast::channel(4);
+        let (event_tx, _) = broadcast::channel(4);
+        Arc::new(AppState {
+            auth: AuthManager::new(None),
+            handler: MethodHandler::new(home.clone()).await,
+            tx,
+            event_tx,
+            user_db: Arc::new(user_db),
+            jwt_config: Arc::new(JwtConfig::new(b"owner-verify-test-secret-32-bytes!!")),
+            otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
+                home.clone(),
+                reqwest::Client::new(),
+            )),
+            home_dir: home,
+        })
+    }
+
+    /// Bootstrap owner claimed under a real email, the v1.73.0 shape.
+    async fn claimed_state(dir: &tempfile::TempDir, email: &str) -> Arc<AppState> {
+        let home = dir.path().to_path_buf();
+        let db = UserDb::new(&home.join("users.db")).unwrap();
+        db.ensure_default_admin().unwrap().expect("owner created");
+        assert!(
+            db.claim_default_admin_with_email(Some(email), OWNER_PASSWORD)
+                .unwrap()
+        );
+        state_with(db, home).await
+    }
+
+    fn verify_req_from(
+        peer: SocketAddr,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/owner/verify")
+            .header("content-type", "application/json");
+        for (k, v) in extra {
+            builder = builder.header(*k, *v);
+        }
+        let mut req = builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req
+    }
+
+    fn verify_req(
+        ip: [u8; 4],
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> axum::http::Request<axum::body::Body> {
+        verify_req_from(SocketAddr::from((ip, 40000)), body, extra)
+    }
+
+    fn pw_body(password: &str) -> String {
+        serde_json::json!({ "password": password }).to_string()
+    }
+
+    /// Same route definition as production (`auth_router`).
+    fn app(state: &Arc<AppState>) -> Router {
+        Router::new()
+            .route("/api/owner/verify", post(handle_owner_verify))
+            .with_state(state.clone())
+    }
+
+    async fn call(
+        state: &Arc<AppState>,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> (axum::http::StatusCode, String) {
+        let resp = app(state).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn audit_rows(state: &Arc<AppState>, action: &str) -> Vec<duduclaw_auth::AuditEntry> {
+        state
+            .user_db
+            .query_audit_log(None, Some(action), 50)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn correct_password_is_ok_audited_and_reveals_nothing() {
+        let email = "ov-ok@example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, email).await;
+        let (status, body) =
+            call(&state, verify_req(LOOPBACK, &pw_body(OWNER_PASSWORD), &[])).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, r#"{"ok":true}"#);
+        assert!(!body.contains(email));
+        let owner = state.user_db.get_bootstrap_owner().unwrap().unwrap();
+        let rows = audit_rows(&state, "owner_verify");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_id.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(rows[0].ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_401_and_audited_without_the_password() {
+        let email = "ov-wrong@example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, email).await;
+        let (status, body) = call(
+            &state,
+            verify_req(LOOPBACK, &pw_body("nope-nope-nope"), &[]),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(!body.contains(email));
+        let rows = audit_rows(&state, "owner_verify_failed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ip.as_deref(), Some("127.0.0.1"));
+        let rendered = format!("{:?} {:?}", rows[0].target, rows[0].detail);
+        assert!(
+            !rendered.contains("nope-nope-nope"),
+            "password must not be logged"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_loopback_peer_is_403_even_with_correct_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, "ov-remote@example.test").await;
+        let (status, _) = call(
+            &state,
+            verify_req([192, 0, 2, 10], &pw_body(OWNER_PASSWORD), &[]),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn proxied_request_is_403_even_from_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, "ov-proxy@example.test").await;
+        for header in crate::local_session::PROXY_HEADERS {
+            let req = verify_req(
+                LOOPBACK,
+                &pw_body(OWNER_PASSWORD),
+                &[(header, "203.0.113.9")],
+            );
+            let (status, _) = call(&state, req).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "header {header}");
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_origin_is_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, "ov-origin@example.test").await;
+        let req = verify_req(
+            LOOPBACK,
+            &pw_body(OWNER_PASSWORD),
+            &[("origin", "https://evil.example")],
+        );
+        let (status, _) = call(&state, req).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_gets_no_allow_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, "ov-preflight@example.test").await;
+        let mut req = axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri("/api/owner/verify")
+            .header("origin", "https://evil.example")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((LOOPBACK, 40000))));
+        let resp = app(&state).oneshot(req).await.unwrap();
+        assert!(!resp.status().is_success(), "status {}", resp.status());
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_or_oversized_body_is_400_and_free() {
+        let email = "ov-body@example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, email).await;
+        let long = "x".repeat(OWNER_VERIFY_MAX_PASSWORD_BYTES + 1);
+        for body in ["", "{}", "not json", r#"{"password":""}"#, &pw_body(&long)] {
+            let (status, _) = call(&state, verify_req(LOOPBACK, body, &[])).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "body {body:.40}"
+            );
+        }
+        // Wrong content type: refused before any password check.
+        let mut req = verify_req(LOOPBACK, &pw_body(OWNER_PASSWORD), &[]);
+        req.headers_mut()
+            .insert("content-type", "text/plain".parse().unwrap());
+        let (status, _) = call(&state, req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        // None of the above consumed the login budget.
+        assert!(check_login_rate_limit(LOOPBACK_THROTTLE_IP, email));
+    }
+
+    #[tokio::test]
+    async fn shares_the_login_rate_limit_bucket() {
+        let email = "ov-shared@example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, email).await;
+        for _ in 0..5 {
+            let (status, _) = call(
+                &state,
+                verify_req(LOOPBACK, &pw_body("wrong-password"), &[]),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        }
+        // Budget spent: even the right password is throttled now…
+        let (status, _) = call(&state, verify_req(LOOPBACK, &pw_body(OWNER_PASSWORD), &[])).await;
+        assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        // …and so is a local /api/login for the owner's email.
+        assert!(!check_login_rate_limit(LOOPBACK_THROTTLE_IP, email));
+    }
+
+    #[tokio::test]
+    async fn rotating_loopback_addresses_shares_one_bucket() {
+        let email = "ov-rotate@example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, email).await;
+        let peers: Vec<SocketAddr> = vec![
+            SocketAddr::from(([127, 0, 0, 2], 40000)),
+            SocketAddr::from(([127, 0, 0, 3], 40001)),
+            SocketAddr::from(([127, 1, 2, 3], 40002)),
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 40003)),
+            SocketAddr::from(([127, 255, 255, 254], 40004)),
+        ];
+        for peer in &peers {
+            let (status, _) = call(
+                &state,
+                verify_req_from(*peer, &pw_body("wrong-password"), &[]),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "peer {peer}");
+        }
+        let fresh = SocketAddr::from(([127, 0, 0, 99], 40005));
+        let (status, _) = call(
+            &state,
+            verify_req_from(fresh, &pw_body(OWNER_PASSWORD), &[]),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn login_attempts_count_against_verify_and_success_resets() {
+        let email = "ov-reset@example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, email).await;
+        for _ in 0..4 {
+            assert!(check_login_rate_limit(LOOPBACK_THROTTLE_IP, email));
+        }
+        // 5th attempt overall: still within budget, and a match clears it.
+        let (status, _) = call(
+            &state,
+            verify_req([127, 0, 0, 7], &pw_body(OWNER_PASSWORD), &[]),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        for _ in 0..4 {
+            let (status, _) = call(
+                &state,
+                verify_req(LOOPBACK, &pw_body("wrong-password"), &[]),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_bootstrap_owner_is_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let db = UserDb::new(&home.join("users.db")).unwrap();
+        // An admin exists, but not the bootstrap owner.
+        db.create_user(
+            "ov-noowner@example.test",
+            "Admin",
+            OWNER_PASSWORD,
+            UserRole::Admin,
+        )
+        .unwrap();
+        let state = state_with(db, home).await;
+        let (status, _) = call(&state, verify_req(LOOPBACK, &pw_body(OWNER_PASSWORD), &[])).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn inactive_owner_is_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = claimed_state(&dir, "ov-inactive@example.test").await;
+        let owner = state.user_db.get_bootstrap_owner().unwrap().unwrap();
+        state
+            .user_db
+            .set_user_status(&owner.id, UserStatus::Suspended)
+            .unwrap();
+        let (status, _) = call(&state, verify_req(LOOPBACK, &pw_body(OWNER_PASSWORD), &[])).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unclaimed_owner_one_time_password_verifies() {
+        // Documented choice: the console one-time password is accepted by
+        // /api/login, so verifying it here grants nothing new. The owner is
+        // still `admin@local` here, which no other test in this module uses.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let db = UserDb::new(&home.join("users.db")).unwrap();
+        let one_time = db.ensure_default_admin().unwrap().expect("owner created");
+        let state = state_with(db, home).await;
+        let (status, _) = call(&state, verify_req(LOOPBACK, &pw_body(&one_time), &[])).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
 mod login_rate_limit_tests {
     use super::*;
     use std::net::Ipv4Addr;
@@ -16246,6 +16766,38 @@ mod login_rate_limit_tests {
             check_login_rate_limit(victim, email),
             "victim should still pass"
         );
+    }
+
+    #[test]
+    fn rotating_loopback_addresses_share_one_bucket() {
+        // A local process cannot rotate 127.0.0.0/8 / ::1 source addresses
+        // for fresh login budgets: every loopback peer is one key.
+        let email = "rl-loopback@test.invalid";
+        let peers = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3)),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 255, 255, 254)),
+        ];
+        for peer in peers {
+            assert!(check_login_rate_limit(peer, email), "{peer} within budget");
+        }
+        assert!(
+            !check_login_rate_limit(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 99)), email),
+            "a sixth loopback address must not get a fresh budget"
+        );
+        // A non-loopback peer still has its own budget.
+        assert!(check_login_rate_limit(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40)),
+            email
+        ));
+        // A success from any loopback address clears the shared bucket.
+        reset_login_rate_limit(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 7)), email);
+        assert!(check_login_rate_limit(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            email
+        ));
     }
 }
 
