@@ -184,8 +184,10 @@ pub struct AudienceRule {
     pub visitor: VisitorKind,
     /// `res.partner.category` names; logged-in visitors only.
     pub partner_tags: Vec<String>,
-    /// Phrases looked for in the visitor's messages so far (including the
-    /// answers they clicked in a Chatbot script).
+    /// Phrases looked for in the visitor messages that are still unanswered
+    /// when the session is routed (`TurnInput` pending text). Answers clicked
+    /// in a Chatbot script are followed by a script line, end up in
+    /// `earlier` and are not matched; route on `chatbot_script_ids` instead.
     pub keywords: Vec<String>,
 }
 
