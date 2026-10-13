@@ -695,20 +695,18 @@ pub(super) async fn memory_graph_absent_db_is_empty_not_error() {
 #[cfg(unix)]
 #[tokio::test]
 pub(super) async fn experts_install_spawns_the_pack_group() {
-    use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let log = home.path().join("argv.txt");
     let fake = home.path().join("fake-duduclaw");
-    std::fs::write(
+    crate::test_exec::write_executable(
         &fake,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho \"home=$DUDUCLAW_HOME\"\n",
             log.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
 
     let args: Vec<std::ffi::OsString> =
         vec!["install".into(), "/tmp/pack".into(), "--attach-under".into(), "ceo".into()];

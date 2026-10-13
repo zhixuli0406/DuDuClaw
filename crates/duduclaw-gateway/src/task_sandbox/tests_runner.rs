@@ -1,6 +1,5 @@
 //! Runner tests with a scripted container client (no Docker needed), plus the
 //! per-family `docker create` argv properties.
-use std::os::unix::fs::PermissionsExt;
 
 use duduclaw_agent::account_rotator::{Account, AccountRotator, RotationStrategy};
 use serde_json::json;
@@ -44,7 +43,7 @@ fn fixture(events: &[Value], tail: &str, image_present: bool) -> Fixture {
     std::fs::write(tools.join("events.ndjson"), stream).unwrap();
     let inspect = if image_present { "printf 'sha256:%064d\\n' 7" } else { "echo 'Error: No such image' >&2; exit 1" };
     let client = tools.join("docker");
-    std::fs::write(&client, format!(
+    crate::test_exec::write_executable(&client, format!(
         "#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\n\
          info) echo 27.3.1;;\n\
          ps) case \"$*\" in *--last*) ;; *) exit 3;; esac;;\n\
@@ -53,8 +52,7 @@ fn fixture(events: &[Value], tail: &str, image_present: bool) -> Fixture {
 printf '%s|' \"$ANTHROPIC_API_KEY\" \"$OPENAI_API_KEY\" \"$CODEX_API_KEY\" \"$XAI_API_KEY\" \"$GEMINI_API_KEY\" > \"$d/keys\"; printf '%064d\\n' 1;;\n\
          start) /bin/cat > \"$d/stdin\"; /bin/cat \"$d/events.ndjson\"; {tail};;\n\
          rm) printf 'rm %s\\n' \"$3\" >> \"$d/rm\";;\n\
-         *) exit 3;;\nesac\n")).unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+         *) exit 3;;\nesac\n"), 0o700);
     DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
     Fixture { dir, home, agent, tools }
 }
@@ -466,13 +464,12 @@ async fn sweep_removes_orphans_and_keeps_live_runs() {
     let stale = "b".repeat(64);
     let running = "c".repeat(64);
     let client = tools.join("docker");
-    std::fs::write(&client, format!(
+    crate::test_exec::write_executable(&client, format!(
         "#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\n\
          ps) case \"$*\" in *id=*) [ -f \"$d/removed\" ] || echo {stale};; \
 *) printf '%s|running|{orphan}|1\\n%s|running|{live}|{future}\\n' {stale} {running};; esac;;\n\
          rm) echo \"$3\" > \"$d/removed\";;\n\
-         *) exit 3;;\nesac\n", future = now + 3600)).unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+         *) exit 3;;\nesac\n", future = now + 3600), 0o700);
     DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
     let report = super::sweep::sweep_once(&home).await;
     assert_eq!(report.containers_removed, 1, "{report:?}");
@@ -495,8 +492,7 @@ async fn sweep_with_docker_unreachable_keeps_directories_and_audits() {
     let tools = dir.path().join("tools");
     std::fs::create_dir(&tools).unwrap();
     let client = tools.join("docker");
-    std::fs::write(&client, "#!/bin/sh\necho 'Cannot connect to the Docker daemon' >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_exec::write_executable(&client, "#!/bin/sh\necho 'Cannot connect to the Docker daemon' >&2\nexit 1\n", 0o700);
     DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
     let report = super::sweep::sweep_once(&home).await;
     assert!(run.exists());
@@ -550,11 +546,10 @@ async fn sweep_drains_a_large_backlog_in_bounded_batches() {
     let listing: String = (0..total).map(|i| format!("{:064x}|exited|{:032x}|\n", i, i)).collect();
     std::fs::write(tools.join("listing"), listing).unwrap();
     let client = tools.join("docker");
-    std::fs::write(&client, "#!/bin/sh\nd=\"${0%/*}\"\ncase \"$1\" in\n\
+    crate::test_exec::write_executable(&client, "#!/bin/sh\nd=\"${0%/*}\"\ncase \"$1\" in\n\
          ps) case \"$*\" in *id=*) ;; *) cat \"$d/listing\";; esac;;\n\
          rm) echo \"$3\" >> \"$d/removed\";;\n\
-         *) exit 3;;\nesac\n").unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+         *) exit 3;;\nesac\n", 0o700);
     DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
     let report = super::sweep::sweep_once(&home).await;
     assert_eq!(report.containers_removed, MAX_REMOVALS_PER_SWEEP, "{report:?}");
@@ -568,8 +563,7 @@ async fn sweep_drains_a_large_backlog_in_bounded_batches() {
 fn fake_docker(script: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let client = dir.path().join("docker");
-    std::fs::write(&client, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_exec::write_executable(&client, format!("#!/bin/sh\n{script}\n"), 0o700);
     DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
     dir
 }

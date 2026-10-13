@@ -62,12 +62,10 @@ fn mutable_tags_zero_caps_host_executable_and_ledger_read_are_refused() {
 
 #[cfg(unix)]
 fn mock(mode:&str) -> (tempfile::TempDir, PreparedAttemptContainer, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let (home,request,settings,runtime)=fixture();
     let mut prepared=prepare(home.path(),&request,&settings,QuotaLimits::default(),&runtime,&[],&BTreeMap::new(),Duration::from_secs(5)).unwrap();
     let client=home.path().join("docker-mock");let log=home.path().join("calls.log");
-    std::fs::write(&client,"#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$LOG\"\ncase \"$1\" in\ncreate) if [ \"$MODE\" = bad_id ]; then echo bad; else printf '%064d\\n' 1; fi;;\nstart) if [ \"$MODE\" = hang ]; then sleep 30; else cat >/dev/null; echo '{\"type\":\"result\",\"result\":\"done\",\"total_cost_usd\":0.001}'; fi;;\nrm) if [ \"$MODE\" = cleanup_fail ]; then exit 2; fi;;\n*) exit 3;;\nesac\n").unwrap();
-    std::fs::set_permissions(&client,std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_exec::write_executable(&client, "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$LOG\"\ncase \"$1\" in\ncreate) if [ \"$MODE\" = bad_id ]; then echo bad; else printf '%064d\\n' 1; fi;;\nstart) if [ \"$MODE\" = hang ]; then sleep 30; else cat >/dev/null; echo '{\"type\":\"result\",\"result\":\"done\",\"total_cost_usd\":0.001}'; fi;;\nrm) if [ \"$MODE\" = cleanup_fail ]; then exit 2; fi;;\n*) exit 3;;\nesac\n", 0o700);
     let args=prepared.create.get_args().map(|arg|arg.to_owned()).collect::<Vec<_>>();
     prepared.create=Command::new(client);prepared.create.args(args).env_clear().env("LOG",&log).env("MODE",mode).env("PATH","/usr/bin:/bin");
     (home,prepared,log)

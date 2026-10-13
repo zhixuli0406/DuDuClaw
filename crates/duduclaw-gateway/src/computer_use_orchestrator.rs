@@ -2365,9 +2365,8 @@ mod failed_run_cleanup_tests {
 
     /// A fake `docker`: image present, `run` fails, every call logged.
     fn fake_docker(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let client = dir.join("docker");
-        std::fs::write(
+        crate::test_exec::write_executable(
             &client,
             "#!/bin/sh\nd=\"${0%/*}\"\necho \"$*\" >> \"$d/calls\"\ncase \"$1\" in\n\
              info) echo 27.3.1;;\n\
@@ -2375,9 +2374,8 @@ mod failed_run_cleanup_tests {
              image) printf 'sha256:%064d\\n' 7;;\n\
              run) echo 'docker: Error response from daemon: boom' >&2; exit 125;;\n\
              *) ;;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         client
     }
 

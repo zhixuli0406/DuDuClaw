@@ -790,8 +790,7 @@ mod container_tests {
         let log = dir.path().join("cleanup.log");
         // An external fake client gives the same pipe/process-group lifecycle
         // without consulting Docker, global environment, or an API account.
-        std::fs::write(&docker, "#!/bin/sh\ncase \"$1\" in\ncreate) printf 'created\\n';;\nstart) if [ \"$MODE\" = hang ]; then sleep 30; else printf 'reply\\n'; fi;;\nrm) printf '%s\\n' \"$*\" >> \"$CLEANUP_LOG\";;\n*) exit 2;;\nesac\n").unwrap();
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&docker, "#!/bin/sh\ncase \"$1\" in\ncreate) printf 'created\\n';;\nstart) if [ \"$MODE\" = hang ]; then sleep 30; else printf 'reply\\n'; fi;;\nrm) printf '%s\\n' \"$*\" >> \"$CLEANUP_LOG\";;\n*) exit 2;;\nesac\n", 0o755);
         let client = DockerClient { executable: docker, env: vec![
             ("PATH".into(), "/usr/bin:/bin".into()), ("MODE".into(), mode.into()),
             ("CLEANUP_LOG".into(), log.clone().into_os_string())] };

@@ -466,7 +466,6 @@ mod tests {
 
     #[cfg(unix)]
     fn sweep_fixture(home: &Path, foreign: &Path, mode: &str) -> (tempfile::TempDir, SweepClient, String, String) {
-        use std::os::unix::fs::PermissionsExt;
         let fixture = tempfile::tempdir().unwrap();
         let owned = "a".repeat(64);
         let other = "b".repeat(64);
@@ -478,7 +477,7 @@ mod tests {
             std::fs::write(fixture.path().join(format!("{id}.json")), serde_json::to_vec(&labels).unwrap()).unwrap();
         }
         let program = fixture.path().join("docker");
-        std::fs::write(&program, r#"#!/bin/sh
+        crate::test_exec::write_executable(&program, r#"#!/bin/sh
 echo "$*" >> "$LOG"
 for last in "$@"; do :; done
 case "$1" in
@@ -490,8 +489,7 @@ rm) [ "$MODE" != fail ] || exit 3
     awk -v id="$last" '$0 != id' "$IDS" > "$IDS.tmp"; mv "$IDS.tmp" "$IDS";;
 *) exit 4;;
 esac
-"#).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+"#, 0o755);
         let environment = vec![("PATH".into(), "/usr/bin:/bin".into()),
             ("LOG".into(), fixture.path().join("log").into_os_string()),
             ("IDS".into(), fixture.path().join("ids").into_os_string()),

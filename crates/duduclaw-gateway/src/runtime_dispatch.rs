@@ -774,7 +774,7 @@ mod hint_tests {
             return;
         }
 
-        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::os::unix::process::CommandExt;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let bin = home.join("bin");
@@ -813,8 +813,7 @@ mod hint_tests {
             std::fs::write(home.join(file), lines).unwrap();
         }
         let wrapper = bin.join("claude");
-        std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '99999.0.0\\n'; exit 0; fi\nif [ \"$1\" = auth ]; then printf '{\"loggedIn\":false}\\n'; exit 0; fi\nn=0\nif [ -f \"$HOME/cli-count\" ]; then n=$(/bin/cat \"$HOME/cli-count\"); fi\nn=$((n+1))\nprintf '%s' \"$n\" > \"$HOME/cli-count\"\ncase \"$n\" in\n1) /bin/cat \"$HOME/first.jsonl\";;\n2) /bin/cat \"$HOME/second.jsonl\";;\n3) /bin/cat \"$HOME/unmeasured.jsonl\";;\n4) /bin/cat \"$HOME/synthetic-after-model.jsonl\";;\n5) /bin/cat \"$HOME/synthetic-only.jsonl\";;\n*) exit 2;;\nesac\n").unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&wrapper, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '99999.0.0\\n'; exit 0; fi\nif [ \"$1\" = auth ]; then printf '{\"loggedIn\":false}\\n'; exit 0; fi\nn=0\nif [ -f \"$HOME/cli-count\" ]; then n=$(/bin/cat \"$HOME/cli-count\"); fi\nn=$((n+1))\nprintf '%s' \"$n\" > \"$HOME/cli-count\"\ncase \"$n\" in\n1) /bin/cat \"$HOME/first.jsonl\";;\n2) /bin/cat \"$HOME/second.jsonl\";;\n3) /bin/cat \"$HOME/unmeasured.jsonl\";;\n4) /bin/cat \"$HOME/synthetic-after-model.jsonl\";;\n5) /bin/cat \"$HOME/synthetic-only.jsonl\";;\n*) exit 2;;\nesac\n", 0o755);
         // Global telemetry/CLI discovery are process singletons. An isolated
         // child test keeps PATH/HOME/auth and parent parallel tests untouched.
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());

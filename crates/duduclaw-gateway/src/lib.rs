@@ -104,6 +104,8 @@ pub mod rate_limit_watch;
 pub(crate) mod synthetic_connector_adapter;
 #[cfg(test)]
 pub(crate) mod test_channel_provider;
+#[cfg(all(test, unix))]
+pub(crate) mod test_exec;
 pub mod watchdog;
 pub mod killswitch_triggers;
 pub mod redaction_sources;
