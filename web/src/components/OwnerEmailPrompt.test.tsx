@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { act, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { OwnerEmailPrompt } from './OwnerEmailPrompt';
@@ -20,6 +20,7 @@ beforeEach(() => {
   localStorage.clear();
   useConnectionStore.setState({
     state: 'authenticated',
+    mustChangePassword: false,
     connectWithAuth: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn(),
   } as never);
@@ -41,6 +42,18 @@ describe('<OwnerEmailPrompt>', () => {
 
     await waitFor(() => expect(api.users.changeEmail).toHaveBeenCalledWith('owner@example.com', undefined));
     await waitFor(() => expect(screen.queryByText('Set your email')).toBeNull());
+  });
+
+  it('waits while the account must change its password, then asks', async () => {
+    mockMe(true);
+    useConnectionStore.setState({ mustChangePassword: true } as never);
+    renderWithProviders(<OwnerEmailPrompt />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(api.users.me).not.toHaveBeenCalled();
+    expect(screen.queryByText('Set your email')).toBeNull();
+
+    act(() => useConnectionStore.setState({ mustChangePassword: false } as never));
+    expect(await screen.findByText('Set your email')).toBeInTheDocument();
   });
 
   it('stays hidden once the owner has a real email', async () => {
