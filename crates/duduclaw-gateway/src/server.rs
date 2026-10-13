@@ -48,12 +48,33 @@ pub(crate) fn check_ws_rate_limit(ip: IpAddr) -> bool {
 /// remote attacker lock out any known account for 15 minutes simply by sending
 /// bad passwords. Now the key includes the source IP (so one attacker IP cannot
 /// exhaust the limit for a victim on a different IP) and a successful login
-/// clears the counter (`reset_login_rate_limit`).
+/// clears the counter (`reset_login_rate_limit`). Every loopback source
+/// (127.0.0.0/8, ::1) counts as one IP, see [`login_throttle_ip`]. Shared by
+/// `/api/login`, `/api/otp/request` and `/api/owner/verify`.
 static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (Instant, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Rate-limit key address for every loopback caller. `is_loopback()` covers
+/// all of `127.0.0.0/8` and `::1`, so keying by the raw peer would let a local
+/// process rotate source addresses (127.0.0.2, .3, …) for a fresh budget each
+/// time. Every loopback source collapses onto this one address; non-loopback
+/// addresses keep their own key (M2: a remote attacker on one IP cannot spend
+/// a victim's budget on another).
+const LOOPBACK_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// The address the login limiter keys on for a peer `ip`.
+fn login_throttle_ip(ip: IpAddr) -> IpAddr {
+    if ip.is_loopback() {
+        LOOPBACK_THROTTLE_IP
+    } else {
+        ip
+    }
+}
+
 /// Returns `true` if the attempt from `(ip, email)` is within the rate budget.
+/// Loopback peers share one key per email ([`login_throttle_ip`]).
 fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
+    let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if map.len() > 10000 {
@@ -71,6 +92,7 @@ fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
 /// Clear the failed-attempt counter for `(ip, email)` after a successful login
 /// so a legitimate user is never penalised for earlier typos (M2).
 fn reset_login_rate_limit(ip: IpAddr, email: &str) {
+    let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&(ip, email.to_string()));
 }
@@ -3758,13 +3780,6 @@ async fn handle_first_run_claim(
 /// is refused as a malformed body before it costs an Argon2 run.
 const OWNER_VERIFY_MAX_PASSWORD_BYTES: usize = 1024;
 
-/// Rate-limit key address for every owner-verify caller. `is_loopback()`
-/// accepts all of `127.0.0.0/8` and `::1`, so keying by the raw peer would let
-/// a local process rotate source addresses (127.0.0.2, .3, …) for a fresh
-/// budget each time. All loopback callers collapse onto this one address,
-/// which is also the address a normal local `/api/login` arrives from.
-const OWNER_VERIFY_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-
 /// Email that can never exist (no `@`, rejected by `validate_account_email`).
 /// Looking it up makes `verify_password` run its dummy Argon2 hash, so the
 /// "no owner" path costs the same as a real mismatch.
@@ -3797,7 +3812,7 @@ struct OwnerVerifyRequest {
 ///      send a CORS "simple request" here. 400.
 ///   3. Shared login throttle: the `/api/login` limiter, keyed
 ///      `(127.0.0.1, owner email)` for EVERY loopback caller
-///      ([`OWNER_VERIFY_THROTTLE_IP`]), so rotating loopback source addresses
+///      ([`login_throttle_ip`]), so rotating loopback source addresses
 ///      buys nothing, and a local `/api/login` for the owner (which arrives
 ///      from 127.0.0.1) draws on the same bucket — alternating endpoints never
 ///      buys extra guesses either. 429. A match clears the bucket, as a login
@@ -3881,7 +3896,7 @@ async fn handle_owner_verify(
         }
     };
 
-    if !check_login_rate_limit(OWNER_VERIFY_THROTTLE_IP, &owner.email) {
+    if !check_login_rate_limit(ip, &owner.email) {
         return reply(
             StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({"error": "too many attempts, try again in 15 minutes"}),
@@ -3891,7 +3906,7 @@ async fn handle_owner_verify(
     let ip_str = ip.to_string();
     match state.user_db.verify_password(&owner.email, &password) {
         Ok(user) if user.id == owner.id && user.status == duduclaw_auth::UserStatus::Active => {
-            reset_login_rate_limit(OWNER_VERIFY_THROTTLE_IP, &owner.email);
+            reset_login_rate_limit(ip, &owner.email);
             let _ =
                 state
                     .user_db
@@ -16572,7 +16587,7 @@ mod owner_verify_tests {
         let (status, _) = call(&state, req).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         // None of the above consumed the login budget.
-        assert!(check_login_rate_limit(OWNER_VERIFY_THROTTLE_IP, email));
+        assert!(check_login_rate_limit(LOOPBACK_THROTTLE_IP, email));
     }
 
     #[tokio::test]
@@ -16592,7 +16607,7 @@ mod owner_verify_tests {
         let (status, _) = call(&state, verify_req(LOOPBACK, &pw_body(OWNER_PASSWORD), &[])).await;
         assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
         // …and so is a local /api/login for the owner's email.
-        assert!(!check_login_rate_limit(OWNER_VERIFY_THROTTLE_IP, email));
+        assert!(!check_login_rate_limit(LOOPBACK_THROTTLE_IP, email));
     }
 
     #[tokio::test]
@@ -16630,7 +16645,7 @@ mod owner_verify_tests {
         let dir = tempfile::tempdir().unwrap();
         let state = claimed_state(&dir, email).await;
         for _ in 0..4 {
-            assert!(check_login_rate_limit(OWNER_VERIFY_THROTTLE_IP, email));
+            assert!(check_login_rate_limit(LOOPBACK_THROTTLE_IP, email));
         }
         // 5th attempt overall: still within budget, and a match clears it.
         let (status, _) = call(
@@ -16751,6 +16766,38 @@ mod login_rate_limit_tests {
             check_login_rate_limit(victim, email),
             "victim should still pass"
         );
+    }
+
+    #[test]
+    fn rotating_loopback_addresses_share_one_bucket() {
+        // A local process cannot rotate 127.0.0.0/8 / ::1 source addresses
+        // for fresh login budgets: every loopback peer is one key.
+        let email = "rl-loopback@test.invalid";
+        let peers = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3)),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 255, 255, 254)),
+        ];
+        for peer in peers {
+            assert!(check_login_rate_limit(peer, email), "{peer} within budget");
+        }
+        assert!(
+            !check_login_rate_limit(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 99)), email),
+            "a sixth loopback address must not get a fresh budget"
+        );
+        // A non-loopback peer still has its own budget.
+        assert!(check_login_rate_limit(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40)),
+            email
+        ));
+        // A success from any loopback address clears the shared bucket.
+        reset_login_rate_limit(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 7)), email);
+        assert!(check_login_rate_limit(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            email
+        ));
     }
 }
 
