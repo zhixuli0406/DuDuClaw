@@ -68,7 +68,7 @@ Each session is matched once, on the visitor's first message, against your rules
 | Customer tags | the logged-in contact's tags, for example `VIP` |
 | Country codes | the country Odoo derives from the visitor's IP (`TW`, `JP`) |
 | Languages | the visitor's Odoo language; `zh_TW` matches exactly, `zh` matches every Chinese variant |
-| Message keywords | what the visitor has written so far, including the chatbot options they clicked |
+| Message keywords | the visitor messages that are still unanswered when the AI employee takes over (usually what they write right after the chatbot forwards them); options clicked in a chatbot script are not matched, use *Forwarded by chatbot* to route by chatbot |
 
 Within one rule every filled-in condition must hold; within one field, any listed value is enough. A rule with no conditions matches everyone and works as a catch-all. A condition whose value Odoo does not know (an anonymous visitor's tags, an unknown country) does not match.
 

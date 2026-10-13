@@ -7596,7 +7596,7 @@
   "odoo.livechat.rule.langs": "Languages",
   "odoo.livechat.rule.langsDesc": "Odoo language codes. zh_TW matches only Traditional Chinese; zh matches every Chinese variant.",
   "odoo.livechat.rule.keywords": "Message keywords",
-  "odoo.livechat.rule.keywordsDesc": "Matched against what the visitor has written so far, including chatbot options they clicked.",
+  "odoo.livechat.rule.keywordsDesc": "Matched against the visitor messages still unanswered when the AI employee takes over. Chatbot options the visitor clicked are not matched; use “Forwarded by chatbot” for that.",
   "odoo.livechat.rule.needName": "Rule {n} needs a name",
   "odoo.livechat.rule.needAgent": "Rule {n} needs an AI employee",
   "odoo.livechat.save": "Save live chat settings",
