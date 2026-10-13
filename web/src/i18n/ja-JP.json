@@ -7596,7 +7596,7 @@
   "odoo.livechat.rule.langs": "言語",
   "odoo.livechat.rule.langsDesc": "Odoo の言語コード。zh_TW は繁体字中国語のみ、zh はすべての中国語に一致します。",
   "odoo.livechat.rule.keywords": "メッセージのキーワード",
-  "odoo.livechat.rule.keywordsDesc": "訪問者がこれまでに書いた内容（チャットボットで選んだ選択肢を含む）と照合します。",
+  "odoo.livechat.rule.keywordsDesc": "AI 従業員が引き継いだ時点でまだ返信されていない訪問者のメッセージと照合します。チャットボットで選んだ選択肢は照合されません。チャットボットで振り分ける場合は「チャットボットから転送」を使ってください。",
   "odoo.livechat.rule.needName": "ルール {n} に名前がありません",
   "odoo.livechat.rule.needAgent": "ルール {n} の AI 社員が未選択です",
   "odoo.livechat.save": "ライブチャット設定を保存",

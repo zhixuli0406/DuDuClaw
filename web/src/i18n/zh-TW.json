@@ -7596,7 +7596,7 @@
   "odoo.livechat.rule.langs": "語言",
   "odoo.livechat.rule.langsDesc": "Odoo 語言代碼。填 zh_TW 只比對繁中，填 zh 會比對所有中文。",
   "odoo.livechat.rule.keywords": "訊息關鍵字",
-  "odoo.livechat.rule.keywordsDesc": "比對訪客目前為止說的話，也包含在聊天機器人點選的選項。",
+  "odoo.livechat.rule.keywordsDesc": "比對 AI 員工接手時訪客尚未得到回覆的訊息。訪客在聊天機器人點選的選項不會比對，要依聊天機器人分流請用「經由聊天機器人轉入」條件。",
   "odoo.livechat.rule.needName": "第 {n} 條規則還沒有名稱",
   "odoo.livechat.rule.needAgent": "第 {n} 條規則還沒選 AI 員工",
   "odoo.livechat.save": "儲存線上客服設定",
