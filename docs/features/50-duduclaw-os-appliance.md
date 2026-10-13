@@ -144,6 +144,9 @@ gateway, not by the desktop.
   verifies a signature, never stores a channel secret, and never parses a
   payload. If the relay is ever compromised, it has nothing useful to leak.
 - **The lock screen checks your password without needing your email.**
+  (Shell `duduclaw-shell` 1.65.3 or later with platform v1.73.1 or later.
+  The published v0.2.0 image predates it: its lock screen still checks the
+  password as `admin@local`.)
   It asks the gateway `POST /api/owner/verify` with `{"password": "..."}`,
   which finds the owner account by its owner flag, so unlocking keeps
   working after you replace `admin@local` with your own address. The
