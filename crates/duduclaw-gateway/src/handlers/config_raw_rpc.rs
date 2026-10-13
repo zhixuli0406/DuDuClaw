@@ -515,6 +515,17 @@ pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
             .try_into::<duduclaw_security::secret_manager::SecretManagerConfig>()
             .map_err(|e| format!("[secret_manager]: {}", e.message()))?;
     }
+    // `LivechatConfig::from_toml` falls back to the default (disabled) for a
+    // section that does not deserialize, so a raw-editor typo would silently
+    // switch the Live Chat bridge off. Refuse it here with the same limits the
+    // dashboard settings page enforces.
+    if let Some(lc) = table.get(duduclaw_odoo::livechat::SECTION) {
+        let cfg = lc
+            .clone()
+            .try_into::<duduclaw_odoo::livechat::LivechatConfig>()
+            .map_err(|e| format!("[odoo_livechat]: {}", e.message()))?;
+        cfg.validate().map_err(|e| format!("[odoo_livechat]: {e}"))?;
+    }
     let db = duduclaw_db::parse_db_sources(table);
     if let Some(err) = db.errors.first() {
         return Err(format!("[db_sources.{}]: {}", err.name, err.message));
@@ -1099,6 +1110,9 @@ client_id = "x"
         assert!(validate_raw(&RawFile::Config, "[container.sandbox]\nbogus = 1\n").is_err());
         assert!(validate_raw(&RawFile::Config, "[[tick.sources]]\nid = \"x\"\nkind = \"command\"\ncommand = [\"/bin/true\"]\n").is_err());
         assert!(validate_raw(&RawFile::Config, "[takeover]\nduration_minutes = \"long\"\n").is_err());
+        assert!(validate_raw(&RawFile::Config, "[odoo_livechat]\nenabled = \"yes\"\n").is_err());
+        assert!(validate_raw(&RawFile::Config, "[odoo_livechat]\nhandoff_keywords = [\"  \"]\n").is_err());
+        assert!(validate_raw(&RawFile::Config, "[odoo_livechat]\nenabled = true\ndefault_agent = \"helper\"\n").is_ok());
         assert!(validate_raw(&RawFile::Config, "[general]\nname = \"box\"\n").is_ok());
     }
 
