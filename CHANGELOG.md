@@ -16,6 +16,9 @@
 - 個人版開著本機自動登入時，擁有者在「設定 → 帳號與密碼」設定密碼不再要求輸入目前密碼。之前那組密碼是自動登入時隨機產生、本人從不知道的，所以根本改不了。同一頁的說明也改成正確順序：先設密碼，再把 `local_auto_login` 設成 off。稽核紀錄記為 `password.set_local_owner`；其他帳號、非個人版、或自動登入已關的情況，照舊要輸入目前密碼。
 - Docker 映像建置配方：`container/Dockerfile.server`、`Dockerfile.edition-smoke` 與 relay 的 Dockerfile 一併複製 vendored SDK（`vendor/`），Antigravity／Grok 安裝程式改用 `curl --compressed` 下載，避免伺服器回傳壓縮內容時安裝程式驗證失敗；發版用的 Docker workflow 固定建置配方。v1.72.2 的 server 映像已用這套配方補發。
 
+### Security
+- 更新兩個有安全公告的相依套件：`quinn-proto` 0.11.16 → 0.11.19（RUSTSEC-2026-0339、RUSTSEC-2026-0341（high）、RUSTSEC-2026-0342，QUIC 串流重組與連線 ID 的記憶體耗盡），根目錄與桌面版 `src-tauri/Cargo.lock` 都已更新；`ammonia` 4.1.4 → 4.1.7（RUSTSEC-2021-0157，CSS `url("")` 跳脫錯誤，儀表板 canvas 的 HTML 清理用到它）。
+
 ## [1.72.2] - 2026-10-11 — 安全更新與資料匯出
 
 ### Added
