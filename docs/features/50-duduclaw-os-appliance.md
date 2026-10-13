@@ -143,6 +143,15 @@ gateway, not by the desktop.
   first and authenticated with its own key — the relay itself never
   verifies a signature, never stores a channel secret, and never parses a
   payload. If the relay is ever compromised, it has nothing useful to leak.
+- **The lock screen checks your password without needing your email.**
+  It asks the gateway `POST /api/owner/verify` with `{"password": "..."}`,
+  which finds the owner account by its owner flag, so unlocking keeps
+  working after you replace `admin@local` with your own address. The
+  endpoint only answers yes (`{"ok": true}`) or no (401): it never hands out
+  a login token and never returns the email. It accepts calls only from the
+  machine itself, refuses anything that came through a reverse proxy, and
+  shares the `/api/login` attempt limit (5 tries per 15 minutes), so it is
+  not a second way to guess the password.
 - **Nothing about the image is "trust us."** The build recipe that produces
   the image is public — see Building It Yourself below — so anyone can
   read every line that goes into the box before flashing it, rather than
