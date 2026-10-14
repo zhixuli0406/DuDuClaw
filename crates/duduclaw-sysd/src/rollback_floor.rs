@@ -22,6 +22,12 @@
 //! Every ESP entry other than the running one is checked, exhausted ones
 //! included (sd-boot still boots an exhausted entry when nothing else
 //! works); when the running entry cannot be identified, every entry is.
+//!
+//! Only Type #2 entries (UKIs under `EFI/Linux`) can be verified this way.
+//! A Type #1 entry (`loader/entries/*.conf`) names a kernel and initrd
+//! whose version is not bound to anything sysd can check as strictly, so
+//! with a floor set, any `.conf` entry on the ESP refuses the rollback
+//! ([`type1_entries_present`]). DuDuClaw OS ships Type #2 only.
 
 use std::cmp::Ordering;
 use std::io::{Read, Seek, SeekFrom};
@@ -211,6 +217,32 @@ pub fn entry_version(dir: &Path, name: &str) -> Result<OsVersion, String> {
     Ok(embedded_v)
 }
 
+/// Whether the ESP at `esp_root` holds any Type #1 boot entry
+/// (`loader/entries/*.conf`). A missing directory is `Ok(false)`; a
+/// directory that cannot be read is an error (the caller refuses).
+pub fn type1_entries_present(esp_root: &Path) -> Result<bool, String> {
+    let dir = esp_root.join("loader").join("entries");
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot list {}: {e}", dir.display())),
+    };
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() > ".conf".len() && name.to_ascii_lowercase().ends_with(".conf") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The ESP root for an `EFI/Linux` entries directory.
+pub fn esp_root_of(entries_dir: &Path) -> Option<&Path> {
+    entries_dir.parent()?.parent()
+}
+
 /// The entries a rollback could end up booting: every entry but the
 /// running one (all of them when the running one is unknown).
 pub fn rollback_candidates<'a>(entries: &'a [String], running: Option<&str>) -> Vec<&'a String> {
@@ -340,6 +372,25 @@ mod tests {
         let c = rollback_candidates(&entries, Some("duduclaw-os_0.4.0.efi"));
         assert_eq!(c, vec![&entries[1], &entries[2]], "exhausted entries count too");
         assert_eq!(rollback_candidates(&entries, None).len(), 3, "unknown running entry: check all");
+    }
+
+    #[test]
+    fn type1_entries_are_detected_and_unreadable_listings_fail() {
+        let esp = tempfile::tempdir().unwrap();
+        assert_eq!(type1_entries_present(esp.path()), Ok(false), "no loader/entries");
+        let entries = esp.path().join("loader").join("entries");
+        std::fs::create_dir_all(&entries).unwrap();
+        std::fs::write(entries.join("README"), "x").unwrap();
+        assert_eq!(type1_entries_present(esp.path()), Ok(false));
+        std::fs::write(entries.join("old-rootful.CONF"), "linux /vmlinuz\n").unwrap();
+        assert_eq!(type1_entries_present(esp.path()), Ok(true));
+        // A file where the directory should be cannot be listed: refuse.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join("loader")).unwrap();
+        std::fs::write(other.path().join("loader").join("entries"), "not a dir").unwrap();
+        assert!(type1_entries_present(other.path()).is_err());
+        let linux = esp.path().join("EFI").join("Linux");
+        assert_eq!(esp_root_of(&linux), Some(esp.path()));
     }
 
     #[test]

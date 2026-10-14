@@ -39,7 +39,8 @@ pub struct SysdServerConfig {
 enum MainPidGate {
     /// No main-pid requirement (uid check only).
     Off,
-    /// `systemctl show -p MainPID --value -- <unit>` at connect time.
+    /// The unit's main process, verified through the peer's pidfd
+    /// (`verify_unit_main_process`, Linux only).
     Unit(String),
     /// Tests: a fixed pid.
     #[cfg(test)]
@@ -71,23 +72,122 @@ pub fn peer_is_main_pid(peer_pid: Option<i32>, main_pid: Option<u32>) -> bool {
     }
 }
 
+/// Upper bound of one `systemctl show` lookup; a slower answer refuses the
+/// connection.
+pub const MAIN_PID_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Most verifications running at once. Every uid-matched connection costs a
+/// root `systemctl` spawn, so a flood of same-uid connections is refused
+/// beyond this instead of piling up processes.
+pub const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+
+#[cfg(target_os = "linux")]
+static VERIFICATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_VERIFICATIONS);
+
+/// A permit to run one verification, or `None` when all are in use (the
+/// caller refuses the connection).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn verification_permit(sem: &tokio::sync::Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    sem.try_acquire().ok()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn unit_main_pid(unit: &str) -> Option<u32> {
     if !valid_unit_name(unit) {
         return None;
     }
     let mut cmd = tokio::process::Command::new("systemctl");
-    cmd.args(["show", "-p", "MainPID", "--value", "--", unit]);
-    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
+    cmd.args(["show", "-p", "MainPID", "--value", "--", unit]).kill_on_drop(true);
+    let out = tokio::time::timeout(MAIN_PID_LOOKUP_TIMEOUT, cmd.output()).await.ok()?.ok()?;
     if !out.status.success() {
         return None;
     }
     parse_main_pid(&String::from_utf8_lossy(&out.stdout))
 }
 
-async fn main_pid_allows(gate: &MainPidGate, peer_pid: Option<i32>) -> bool {
+/// The `Pid:` line of a pidfd's `/proc/self/fdinfo` entry: the process it
+/// pins, or `None` when it has exited and been reaped (`Pid: -1`) or the
+/// text has no usable line.
+pub fn fdinfo_pid(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Whether `/proc/<pid>/cgroup` places the process directly in `unit`'s
+/// cgroup (cgroup v2 line `0::<path>` whose last component is the unit).
+/// A child moved into a sub-cgroup, a cgroup v1 layout or anything else is
+/// `false`.
+pub fn cgroup_is_unit(text: &str, unit: &str) -> bool {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .is_some_and(|path| path.trim().rsplit('/').next() == Some(unit))
+}
+
+/// Linux: authenticate the peer as `unit`'s main process through a pidfd,
+/// so a pid reused after the gateway restarted cannot pass. Order: take the
+/// peer's pidfd (`SO_PEERPIDFD`, Linux 6.5+), read the pid it pins, read the
+/// unit's MainPID (after the pidfd exists), compare, require the process to
+/// sit in the unit's own cgroup, then confirm through the pidfd that the
+/// same process is still alive. Any failure refuses.
+#[cfg(target_os = "linux")]
+async fn verify_unit_main_process(unit: &str, stream: &UnixStream) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if !valid_unit_name(unit) {
+        return false;
+    }
+    let Some(_permit) = verification_permit(&VERIFICATIONS) else {
+        warn!("sysd: too many caller verifications in flight; refusing this connection");
+        return false;
+    };
+    let mut raw: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `raw`/`len` are valid out-pointers of the advertised size for
+    // the duration of the call; the socket fd is owned by `stream`.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut raw as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || raw < 0 {
+        warn!("sysd: SO_PEERPIDFD unavailable; refusing (the main-pid gate needs Linux 6.5 or later)");
+        return false;
+    }
+    // SAFETY: the kernel just handed us this new descriptor; we own it.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fdinfo = |fd: &OwnedFd| std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok();
+    let Some(pid) = fdinfo(&pidfd).as_deref().and_then(fdinfo_pid) else {
+        return false;
+    };
+    if unit_main_pid(unit).await != Some(pid) {
+        return false;
+    }
+    let Ok(cgroup) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        return false;
+    };
+    if !cgroup_is_unit(&cgroup, unit) {
+        return false;
+    }
+    fdinfo(&pidfd).as_deref().and_then(fdinfo_pid) == Some(pid)
+}
+
+/// Other unix: no pidfd for peers, so the gate cannot be honoured.
+#[cfg(not(target_os = "linux"))]
+async fn verify_unit_main_process(unit: &str, _stream: &UnixStream) -> bool {
+    warn!(unit, "sysd: --require-main-pid-of is only supported on Linux; refusing");
+    false
+}
+
+async fn main_pid_allows(gate: &MainPidGate, stream: &UnixStream, peer_pid: Option<i32>) -> bool {
+    let _ = peer_pid;
     match gate {
         MainPidGate::Off => true,
-        MainPidGate::Unit(unit) => peer_is_main_pid(peer_pid, unit_main_pid(unit).await),
+        MainPidGate::Unit(unit) => verify_unit_main_process(unit, stream).await,
         #[cfg(test)]
         MainPidGate::Fixed(pid) => peer_is_main_pid(peer_pid, Some(*pid)),
     }
@@ -211,7 +311,7 @@ async fn handle_connection(stream: UnixStream, allowed_uid: Option<u32>, gate: s
     // The pid is the one recorded when the peer connected (SO_PEERCRED), so
     // a process that exits and leaves the socket to another cannot pass as
     // its parent; the main pid is read now, after the connection exists.
-    let authorized = uid_ok && main_pid_allows(&gate, peer_pid).await;
+    let authorized = uid_ok && main_pid_allows(&gate, &stream, peer_pid).await;
     if uid_ok && !authorized {
         warn!(audit_id = %audit_id, peer_pid = ?peer_pid, "sysd: rejected connection: caller is not the required unit's main process");
     }
@@ -413,6 +513,30 @@ mod tests {
         assert_eq!(resp.error.as_ref().unwrap().kind, "unauthorized");
         let resp = ask(MainPidGate::Unit("--help".into())).await;
         assert_eq!(resp.error.as_ref().unwrap().kind, "unauthorized");
+    }
+
+    #[test]
+    fn pidfd_fdinfo_and_cgroup_checks_fail_closed() {
+        assert_eq!(fdinfo_pid("pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1066\nPid:\t4242\nNSpid:\t4242\n"), Some(4242));
+        assert_eq!(fdinfo_pid("Pid:\t-1\n"), None, "reaped process");
+        assert_eq!(fdinfo_pid("Pid:\t0\n"), None);
+        assert_eq!(fdinfo_pid("pos:\t0\n"), None);
+        assert!(cgroup_is_unit("0::/system.slice/duduclaw-gateway.service\n", "duduclaw-gateway.service"));
+        assert!(!cgroup_is_unit("0::/system.slice/duduclaw-gateway.service/child\n", "duduclaw-gateway.service"));
+        assert!(!cgroup_is_unit("0::/user.slice/user-1000.slice/session-2.scope\n", "duduclaw-gateway.service"));
+        assert!(!cgroup_is_unit("0::/system.slice/evil-duduclaw-gateway.service\n", "duduclaw-gateway.service"));
+        assert!(!cgroup_is_unit("1:name=systemd:/system.slice/duduclaw-gateway.service\n", "duduclaw-gateway.service"));
+        assert!(!cgroup_is_unit("", "duduclaw-gateway.service"));
+    }
+
+    #[test]
+    fn verification_permits_are_bounded() {
+        let sem = tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS);
+        let held: Vec<_> = (0..MAX_CONCURRENT_VERIFICATIONS).map(|_| verification_permit(&sem).unwrap()).collect();
+        assert!(verification_permit(&sem).is_none(), "the fifth concurrent verification is refused");
+        drop(held);
+        assert!(verification_permit(&sem).is_some());
+        assert!(MAIN_PID_LOOKUP_TIMEOUT <= Duration::from_secs(2));
     }
 
     #[test]

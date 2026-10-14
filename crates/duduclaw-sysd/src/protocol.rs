@@ -86,8 +86,14 @@
 //!
 //! 1. **The caller must be authenticated as the gateway process itself.**
 //!    `--require-main-pid-of <unit>` (see `server.rs`) additionally requires
-//!    the peer pid from `SO_PEERCRED` to equal that unit's `MainPID`, read
-//!    from systemd at connect time; a MainPID that cannot be read denies. It
+//!    the peer to be that unit's main process, proven through a pidfd so a
+//!    pid reused after a gateway restart cannot pass: the peer's pidfd
+//!    (`SO_PEERPIDFD`, Linux 6.5+), the pid it pins, the unit's `MainPID`
+//!    read afterwards, the process's own cgroup being the unit's, and the
+//!    pidfd still pinning that live process at the end. At most four
+//!    verifications run at once and the `systemctl` lookup is bounded to
+//!    two seconds; anything that fails or is unavailable denies, and on
+//!    non-Linux hosts the flag denies every call. It
 //!    is opt-in so older OS images keep working, and the OS must turn it on
 //!    together with the non-root gateway. It holds only while (a) yama
 //!    `kernel.yama.ptrace_scope >= 1`, so the agent processes, which are the

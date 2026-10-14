@@ -1136,6 +1136,21 @@ async fn dispatch_update_rollback() -> DispatchResult {
                 .map(|name| (name.as_str(), crate::rollback_floor::entry_version(&dir, name)))
                 .collect();
         crate::rollback_floor::check_floor(floor, &versions).map_err(SysdError::unsupported)?;
+        // Type #1 entries cannot be verified as strictly: refuse while any exist.
+        let type1 = crate::rollback_floor::esp_root_of(&dir)
+            .ok_or_else(|| "the ESP root could not be determined".to_string())
+            .and_then(crate::rollback_floor::type1_entries_present);
+        match type1 {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(SysdError::unsupported(
+                    "refusing to roll back: the ESP holds Type #1 boot entries (loader/entries/*.conf) whose \
+                     version cannot be verified"
+                        .to_string(),
+                ));
+            }
+            Err(why) => return Err(SysdError::unsupported(format!("refusing to roll back: {why}"))),
+        }
     }
 
     let note = match state {

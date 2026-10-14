@@ -42,7 +42,9 @@ struct Cli {
     /// Also require the caller to be the main process (systemd `MainPID`)
     /// of this unit, e.g. `duduclaw-gateway.service`. Needed once the
     /// gateway's uid is shared with the AI employees' CLIs: a uid check
-    /// alone admits them. Fail-closed: a MainPID that cannot be read, or an
+    /// alone admits them. Verified through the peer's pidfd (Linux 6.5+,
+    /// `SO_PEERPIDFD`) plus the unit's cgroup. Fail-closed: a MainPID or
+    /// pidfd that cannot be read, a non-Linux host, or an
     /// invalid unit name, denies every call. Absent ⇒ uid check only (older
     /// OS images). Relies on yama `ptrace_scope >= 1`; see `protocol.rs`.
     #[arg(long, value_name = "UNIT")]

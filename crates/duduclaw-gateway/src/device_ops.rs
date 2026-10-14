@@ -454,7 +454,25 @@ async fn sysd_call(
             stdout: out.stdout,
             stderr: out.stderr,
         }),
-        Err(e) => Err(DeviceOpError::Unsupported(e.to_string())),
+        Err(e) => Err(sysd_error(e)),
+    }
+}
+
+/// Shown when sysd refuses the caller: it accepts only the gateway process
+/// (`--require-main-pid-of`), and this call came from another process, such
+/// as an operator command (`duduclaw os system timezone-set` / `ntp-set`)
+/// run in a terminal.
+pub const SYSD_CALLER_REFUSED: &str = "裝置的系統服務只接受 DuDuClaw gateway 本身的請求，這個入口無法直接變更系統設定；\
+     請改從儀表板的系統設定操作。";
+
+/// A sysd client error as the `OpResult` error every caller already
+/// handles; sysd's `unauthorized` refusal gets [`SYSD_CALLER_REFUSED`].
+fn sysd_error(e: duduclaw_sysd::SysdClientError) -> DeviceOpError {
+    match &e {
+        duduclaw_sysd::SysdClientError::Rejected { kind, .. } if kind == "unauthorized" => {
+            DeviceOpError::Unsupported(SYSD_CALLER_REFUSED.to_string())
+        }
+        _ => DeviceOpError::Unsupported(e.to_string()),
     }
 }
 
@@ -508,7 +526,7 @@ impl DeviceOps for SysdDeviceOps {
         match self.client.call(&req).await {
             Ok(out) => Ok(OpOutput { success: out.success, stdout: out.stdout, stderr: out.stderr }),
             Err(e) if is_unknown_verb_rejection(&e) => Err(DeviceOpError::Unsupported(OLD_SYSD_RESET_REFUSAL.to_string())),
-            Err(e) => Err(DeviceOpError::Unsupported(e.to_string())),
+            Err(e) => Err(sysd_error(e)),
         }
     }
 
@@ -947,6 +965,23 @@ mod tests {
             server.stop().await;
         }
 
+        /// L2: a separate process (an operator terminal command) refused by
+        /// sysd's main-pid gate gets a message pointing to the dashboard.
+        #[tokio::test]
+        async fn a_caller_refused_by_sysd_is_pointed_to_the_dashboard() {
+            let server = TestServer::spawn(Some(current_uid().wrapping_add(1))).await;
+            let ops = server.device_ops();
+            match ops.set_timezone("Asia/Taipei").await {
+                Err(DeviceOpError::Unsupported(msg)) => assert_eq!(msg, SYSD_CALLER_REFUSED),
+                other => panic!("expected the dashboard pointer, got {other:?}"),
+            }
+            match ops.set_ntp(true).await {
+                Err(DeviceOpError::Unsupported(msg)) => assert_eq!(msg, SYSD_CALLER_REFUSED),
+                other => panic!("expected the dashboard pointer, got {other:?}"),
+            }
+            server.stop().await;
+        }
+
         /// L5: an older sysd answers the unknown verb with `bad_request`;
         /// that is told apart from other failures and refused with its own
         /// text, nothing deleted.
@@ -1203,10 +1238,9 @@ mod tests {
             let result = ops.reboot().await;
             match result {
                 Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(
-                        msg.contains("unauthorized"),
-                        "expected unauthorized, got: {msg}"
-                    );
+                    // sysd's `unauthorized` refusal is surfaced with the
+                    // operator-facing text (L2).
+                    assert_eq!(msg, SYSD_CALLER_REFUSED, "expected the refusal text, got: {msg}");
                 }
                 other => panic!("expected an Unsupported(unauthorized) error, got {other:?}"),
             }
