@@ -125,18 +125,28 @@ gateway, not by the desktop.
 
 ## Security Design
 
-- **No new process runs as root just to make the dashboard's power/update
-  buttons work.** The handful of operations that genuinely need root
-  privileges — reboot, shutdown, applying an OS update, re-arming first-boot
-  setup — are handled by a small, separate helper process that speaks
-  exactly six fixed commands over a local Unix socket and checks the
-  identity of whoever's asking before doing anything. If that identity
-  check isn't configured, it refuses every request rather than defaulting
-  to trust.
-- **Closed by default, on every port.** The firewall denies all inbound
-  connections except the dashboard port and local network discovery.
-  Remote SSH access is off out of the box and only turns on if you
-  explicitly enable it from the dashboard.
+- **Root-level operations go through a small helper with a fixed command
+  list.** Operations that need root privileges (reboot, shutdown, applying
+  or rolling back an OS update, factory reset, network and time settings)
+  are handled by a separate helper, `duduclaw-sysd`, that accepts exactly
+  15 fixed commands over a local Unix socket and checks the caller's user
+  id before doing anything. If no allowed caller is configured, it refuses
+  every request. On the current images the gateway itself still runs as
+  root, and the helper is configured to accept root, so this split does
+  not yet limit what the gateway can do; moving the gateway to its own
+  non-root user is planned.
+- **The desktop edition denies inbound connections by default.** Its
+  firewall drops everything inbound except the dashboard port (18789),
+  mDNS for local network discovery (UDP 5353) and basic ICMP such as ping.
+  The image includes the dropbear SSH server, which listens on port 22
+  from boot, but the desktop edition's firewall has no rule for it, so SSH
+  cannot be reached from the network. The base edition (written by the
+  plain `installer` ISO) ships without this firewall, so on it dropbear
+  and the dashboard port are reachable from the LAN. The SSH switch in the
+  dashboard's maintenance mode does not change either case today: it
+  starts and stops a unit named `ssh.service` (the name used by the
+  earlier Debian-based image), which these images do not have, and it
+  never adds a firewall rule.
 - **The webhook relay never sees your channel secrets.** For webhook-style
   channels that need it, the relay's job is limited to forwarding an
   incoming request's raw bytes to the box over a connection the box opened
