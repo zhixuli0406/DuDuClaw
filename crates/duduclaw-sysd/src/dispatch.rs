@@ -14,7 +14,10 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use crate::protocol::{MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SysdError, SysdOpOutput, SysdRequest};
+use crate::protocol::{
+    MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT, SSH_UNITS, SysdError, SysdOpOutput,
+    SysdRequest,
+};
 
 /// Absolute path to `systemd-sysupdate`.
 ///
@@ -97,22 +100,26 @@ const MAX_DNS_ENTRIES: usize = 3;
 /// deleting one file.
 const KIOSK_HOME_DIR: &str = "/data/duduclaw-kiosk";
 
-/// Directory whose CONTENTS are iwd's persisted Wi-Fi credential files
-/// (`/data/network/iwd`, 0700 root:root — see
-/// `appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`). The
-/// directory itself is left in place (tmpfiles recreates it unconditionally
-/// every boot); only the credential files inside are removed, mirroring
+/// Directories whose CONTENTS are iwd's persisted Wi-Fi credential files,
+/// one per OS line: `/data/system/iwd` on the Yocto line (DuDuClaw-OS
+/// `meta-duduclaw/recipes-duduclaw/duduclaw-data-binds/files/
+/// var-lib-iwd.mount`) and `/data/network/iwd` on the Debian line
+/// (`appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`), both
+/// 0700 root:root. Until 2026-10 only the Debian path was listed, so on
+/// Yocto images "clear network settings" deleted nothing. The directories
+/// themselves are left in place (tmpfiles recreates them every boot); only
+/// the credential files inside are removed, mirroring
 /// `duduclaw-gateway/src/device_ops.rs`'s own `wipe_dir_contents` for
 /// `home_dir` — same "the mount point survives, what's inside does not"
 /// discipline this module's [`wipe_dir_contents`] below implements.
-const NETWORK_CREDENTIALS_DIR: &str = "/data/network/iwd";
+const NETWORK_CREDENTIALS_DIRS: [&str; 2] = ["/data/system/iwd", "/data/network/iwd"];
 
 /// Remove every entry directly under `dir` (not `dir` itself). Missing
 /// `dir` is not an error (nothing to wipe) — mirrors
 /// `duduclaw-gateway/src/device_ops.rs`'s identically-named helper for
 /// `home_dir`; this is that same discipline applied on the root side of
 /// the privilege boundary, for the two paths ([`KIOSK_HOME_DIR`],
-/// [`NETWORK_CREDENTIALS_DIR`]) the unprivileged gateway process cannot
+/// [`NETWORK_CREDENTIALS_DIRS`]) the unprivileged gateway process cannot
 /// reach on its own.
 fn wipe_dir_contents(dir: &Path) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
@@ -183,26 +190,48 @@ async fn dispatch_factory_reset() -> DispatchResult {
     })
 }
 
-/// Wipe the CONTENTS of [`NETWORK_CREDENTIALS_DIR`] — see that constant's
-/// doc comment for what lives there and why the directory entry itself
-/// survives. Unlike the kiosk-home wipe in [`dispatch_factory_reset`], a
-/// failure here is returned as a hard `Err` rather than folded into a
-/// `[warn]` note: this verb only ever runs when an operator explicitly
-/// opted in to "一併清除網路設定", and the gateway-side caller
-/// (`SysdDeviceOps::factory_reset`) treats that opt-in as fail-closed —
-/// silently downgrading a real failure to a warning would let the operator
-/// walk away believing saved Wi-Fi credentials are gone when they are not.
+/// Wipe the CONTENTS of every existing directory in
+/// [`NETWORK_CREDENTIALS_DIRS`] — see that constant's doc comment for what
+/// lives there and why the directory entries themselves survive. Unlike the
+/// kiosk-home wipe in [`dispatch_factory_reset`], a failure here is returned
+/// as a hard `Err` rather than folded into a `[warn]` note: this verb only
+/// ever runs when an operator explicitly opted in to "一併清除網路設定", and
+/// the gateway-side caller (`SysdDeviceOps::factory_reset`) treats that
+/// opt-in as fail-closed — silently downgrading a real failure to a warning
+/// would let the operator walk away believing saved Wi-Fi credentials are
+/// gone when they are not. For the same reason, finding none of the
+/// directories is an error, not "nothing to clear".
 async fn dispatch_clear_network_credentials() -> DispatchResult {
-    match wipe_dir_contents(Path::new(NETWORK_CREDENTIALS_DIR)) {
-        Ok(()) => Ok(SysdOpOutput {
+    let dirs: Vec<&Path> = NETWORK_CREDENTIALS_DIRS.iter().map(Path::new).collect();
+    match clear_credential_dirs(&dirs) {
+        Ok(cleared) => Ok(SysdOpOutput {
             success: true,
-            stdout: format!("cleared {NETWORK_CREDENTIALS_DIR}"),
+            stdout: format!("cleared {}", cleared.join(", ")),
             stderr: String::new(),
         }),
-        Err(e) => Err(SysdError::io(format!(
-            "clearing {NETWORK_CREDENTIALS_DIR} failed: {e}"
-        ))),
+        Err(e) => Err(SysdError::io(e)),
     }
+}
+
+/// Wipe the contents of each directory in `dirs` that exists and return the
+/// ones cleared. Errors when one cannot be wiped or none exists.
+fn clear_credential_dirs(dirs: &[&Path]) -> Result<Vec<String>, String> {
+    let mut cleared = Vec::new();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        wipe_dir_contents(dir).map_err(|e| format!("clearing {} failed: {e}", dir.display()))?;
+        cleared.push(dir.display().to_string());
+    }
+    if cleared.is_empty() {
+        let listed: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        return Err(format!(
+            "no network credential directory found (looked for {})",
+            listed.join(", ")
+        ));
+    }
+    Ok(cleared)
 }
 
 /// `hostnamectl set-hostname <name>`. Rejects an empty or over-length
@@ -1212,6 +1241,328 @@ async fn dispatch_clear_exhausted_update_target(version: &str) -> DispatchResult
     })
 }
 
+// ── Maintenance-mode SSH ────────────────────────────────────
+
+/// The OS firewall's nftables table and the named set its input chain
+/// accepts TCP ports from (`tcp dport @maintenance_tcp_ports accept`,
+/// DuDuClaw-OS `meta-duduclaw/recipes-duduclaw/duduclaw-firewall/files/
+/// nftables.conf`, added 2026-10). The set starts empty, so nothing extra
+/// is reachable until maintenance mode adds a port.
+const FIREWALL_FAMILY: &str = "inet";
+const FIREWALL_TABLE: &str = "filter";
+const MAINTENANCE_PORT_SET: &str = "maintenance_tcp_ports";
+/// The firewall's config file. When it exists the image is meant to filter,
+/// so a missing table means the firewall failed to load, not that there is
+/// no firewall.
+const FIREWALL_CONFIG: &str = "/etc/nftables.conf";
+
+/// What systemd says about a unit. Anything other than a clear answer is
+/// `Unknown`, which callers must not read as "not installed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnitLoad {
+    Loaded,
+    NotFound,
+    Unknown(String),
+}
+
+fn parse_load_state(success: bool, stdout: &str, stderr: &str) -> UnitLoad {
+    if !success {
+        return UnitLoad::Unknown(format!("systemctl show failed: {}", stderr.trim()));
+    }
+    match stdout.trim() {
+        // A masked unit can still be running; stopping it must be attempted.
+        "loaded" | "masked" => UnitLoad::Loaded,
+        "not-found" => UnitLoad::NotFound,
+        other => UnitLoad::Unknown(format!("unexpected LoadState {other:?}")),
+    }
+}
+
+async fn unit_load_state(unit: &str) -> UnitLoad {
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["show", "--property=LoadState", "--value", unit]);
+    match cmd.output().await {
+        Ok(out) => parse_load_state(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Err(e) => UnitLoad::Unknown(format!("failed to spawn systemctl: {e}")),
+    }
+}
+
+/// Firewall presence. `Unknown` blocks opening and is reported on close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Firewall {
+    Absent,
+    Present,
+    Unknown(String),
+}
+
+/// `table_found`: `Some(true)` table listed, `Some(false)` nft said it does
+/// not exist, `None` nft is not installed. `other_error` carries any other
+/// failure.
+fn classify_firewall(table_found: Option<bool>, other_error: Option<String>, config_exists: bool) -> Firewall {
+    if let Some(e) = other_error {
+        return Firewall::Unknown(e);
+    }
+    match (table_found, config_exists) {
+        (Some(true), _) => Firewall::Present,
+        (Some(false), false) | (None, false) => Firewall::Absent,
+        (Some(false), true) => Firewall::Unknown(format!(
+            "{FIREWALL_CONFIG} exists but table {FIREWALL_FAMILY} {FIREWALL_TABLE} is not loaded (did nftables.service fail?)"
+        )),
+        (None, true) => Firewall::Unknown(format!("{FIREWALL_CONFIG} exists but nft is not installed")),
+    }
+}
+
+/// nft reports a missing table, set or element with an ENOENT error line.
+fn nft_says_missing(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim_start().starts_with("Error: No such file or directory"))
+}
+
+/// The cgroup v2 root marker. A session cgroup directory that does not exist
+/// means "no sessions" only on a v2 host; anywhere else the path says nothing.
+const CGROUP_V2_MARKER: &str = "/sys/fs/cgroup/cgroup.controllers";
+
+async fn firewall_state() -> Firewall {
+    let config_exists = Path::new(FIREWALL_CONFIG).exists();
+    let mut cmd = Command::new("nft");
+    cmd.args(["list", "table", FIREWALL_FAMILY, FIREWALL_TABLE]);
+    match cmd.output().await {
+        Ok(out) if out.status.success() => classify_firewall(Some(true), None, config_exists),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if nft_says_missing(&stderr) {
+                classify_firewall(Some(false), None, config_exists)
+            } else {
+                classify_firewall(None, Some(format!("nft list table failed: {}", stderr.trim())), config_exists)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => classify_firewall(None, None, config_exists),
+        Err(e) => classify_firewall(None, Some(format!("failed to spawn nft: {e}")), config_exists),
+    }
+}
+
+fn ssh_port_element() -> String {
+    format!("{{ {SSH_PORT} }}")
+}
+
+async fn firewall_set_element(verb: &str) -> Result<(), String> {
+    let mut cmd = Command::new("nft");
+    cmd.args([verb, "element", FIREWALL_FAMILY, FIREWALL_TABLE, MAINTENANCE_PORT_SET])
+        .arg(ssh_port_element());
+    match cmd.output().await {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(e) => Err(format!("failed to spawn nft: {e}")),
+    }
+}
+
+/// `Some(true)` when the maintenance set holds [`SSH_PORT`], `Some(false)`
+/// when it does not or the set does not exist, `None` when the answer could
+/// not be read.
+async fn firewall_port_open() -> Option<bool> {
+    let mut cmd = Command::new("nft");
+    cmd.args(["-j", "list", "set", FIREWALL_FAMILY, FIREWALL_TABLE, MAINTENANCE_PORT_SET]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return nft_says_missing(&String::from_utf8_lossy(&out.stderr)).then_some(false);
+    }
+    set_json_has_port(&String::from_utf8_lossy(&out.stdout), SSH_PORT)
+}
+
+/// Read `nft -j list set` output. `None` when it is not the expected shape.
+fn set_json_has_port(raw: &str, port: u16) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let set = value
+        .get("nftables")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| entry.get("set"))?;
+    let Some(elems) = set.get("elem") else { return Some(false) };
+    Some(elems.as_array()?.iter().any(|e| e.as_u64() == Some(u64::from(port))))
+}
+
+/// Number of processes anywhere under a cgroup v2 directory; a directory
+/// that does not exist holds none.
+fn cgroup_process_count(dir: &Path) -> std::io::Result<usize> {
+    let mut count = match std::fs::read_to_string(dir.join("cgroup.procs")) {
+        Ok(procs) => procs.lines().filter(|l| !l.trim().is_empty()).count(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            count += cgroup_process_count(&entry.path())?;
+        }
+    }
+    Ok(count)
+}
+
+/// Kill every session process under `cgroup` and wait until none is left.
+/// `cgroup.kill` (Linux 5.14+) kills the whole subtree atomically.
+async fn end_ssh_sessions(cgroup: &Path) -> Result<(), String> {
+    if !cgroup.is_dir() {
+        if Path::new(CGROUP_V2_MARKER).exists() {
+            return Ok(());
+        }
+        return Err(format!(
+            "{} is missing and this host is not on cgroup v2, so open SSH sessions cannot be checked",
+            cgroup.display()
+        ));
+    }
+    if let Err(e) = std::fs::write(cgroup.join("cgroup.kill"), "1") {
+        return Err(format!("writing {}/cgroup.kill failed: {e}", cgroup.display()));
+    }
+    for _ in 0..20 {
+        match cgroup_process_count(cgroup) {
+            Ok(0) => return Ok(()),
+            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(e) => return Err(format!("reading {} failed: {e}", cgroup.display())),
+        }
+    }
+    match cgroup_process_count(cgroup) {
+        Ok(0) => Ok(()),
+        Ok(n) => Err(format!("{n} SSH session process(es) still running under {}", cgroup.display())),
+        Err(e) => Err(format!("reading {} failed: {e}", cgroup.display())),
+    }
+}
+
+/// Open the firewall port first, then start the unit, so a firewall that
+/// cannot be opened never leaves a listening server the operator cannot
+/// reach. A failed unit start takes the port back out.
+async fn dispatch_ssh_start() -> DispatchResult {
+    let mut chosen = None;
+    for candidate in SSH_UNITS {
+        match unit_load_state(candidate.unit).await {
+            UnitLoad::Loaded => {
+                chosen = Some(candidate);
+                break;
+            }
+            UnitLoad::NotFound => continue,
+            UnitLoad::Unknown(e) => {
+                return Err(SysdError::io(format!("could not check {}: {e}", candidate.unit)));
+            }
+        }
+    }
+    let unit = chosen.ok_or_else(|| SysdError::unsupported("this image has no SSH server unit"))?;
+
+    let firewall = match firewall_state().await {
+        Firewall::Present => true,
+        Firewall::Absent => false,
+        Firewall::Unknown(e) => return Err(SysdError::io(format!("firewall state unknown, not opening SSH: {e}"))),
+    };
+    if firewall {
+        if let Err(e) = firewall_set_element("add").await {
+            return Err(SysdError::io(format!(
+                "could not open tcp/{SSH_PORT} in the firewall; it has no {MAINTENANCE_PORT_SET} set \
+                 (DuDuClaw OS images built before 2026-10 and the Debian appliance line lack it): {e}"
+            )));
+        }
+    }
+
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["start", unit.unit]);
+    let started = run(cmd).await;
+    let failed = !matches!(&started, Ok(out) if out.success);
+    if failed {
+        let rollback = if firewall {
+            match firewall_set_element("delete").await {
+                Ok(()) => String::new(),
+                Err(e) => format!("; closing tcp/{SSH_PORT} again failed: {e}"),
+            }
+        } else {
+            String::new()
+        };
+        return match started {
+            Ok(out) => Ok(SysdOpOutput { stderr: format!("{}{rollback}", out.stderr.trim()), ..out }),
+            Err(e) => Err(SysdError::io(format!("{}{rollback}", e.message))),
+        };
+    }
+    let started = started?;
+    let firewall_note = if firewall {
+        format!("opened tcp/{SSH_PORT} in the firewall")
+    } else {
+        "no firewall on this image".to_string()
+    };
+    Ok(SysdOpOutput { stdout: format!("started {}; {firewall_note}", unit.unit), ..started })
+}
+
+/// Stop every loaded SSH unit, end its sessions, close the firewall port,
+/// then check what is actually left. Each step runs even if an earlier one
+/// failed; anything unclear counts as a problem, never as "closed".
+async fn dispatch_ssh_stop() -> DispatchResult {
+    let mut problems: Vec<String> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+
+    for unit in SSH_UNITS {
+        match unit_load_state(unit.unit).await {
+            UnitLoad::NotFound => continue,
+            UnitLoad::Unknown(e) => {
+                problems.push(format!("could not check {}: {e}", unit.unit));
+                continue;
+            }
+            UnitLoad::Loaded => {}
+        }
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["stop", unit.unit]);
+        match cmd.output().await {
+            Ok(out) if out.status.success() => done.push(format!("stopped {}", unit.unit)),
+            Ok(out) => problems.push(format!(
+                "systemctl stop {} failed: {}",
+                unit.unit,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => problems.push(format!("failed to spawn systemctl: {e}")),
+        }
+        if let Some(cgroup) = unit.session_cgroup {
+            match end_ssh_sessions(Path::new(cgroup)).await {
+                Ok(()) => {}
+                Err(e) => problems.push(e),
+            }
+        }
+        if let Some(pattern) = unit.sessions {
+            // Clears the now-empty session units; whether sessions really
+            // ended was judged from the cgroup above.
+            let mut cmd = Command::new("systemctl");
+            cmd.args(["stop", pattern]);
+            let _ = cmd.output().await;
+        }
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["is-active", unit.unit]);
+        match cmd.output().await {
+            Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+                "inactive" | "failed" => {}
+                state => problems.push(format!("{} is still {state:?} after stop", unit.unit)),
+            },
+            Err(e) => problems.push(format!("failed to spawn systemctl: {e}")),
+        }
+    }
+
+    match firewall_state().await {
+        Firewall::Absent => {}
+        Firewall::Unknown(e) => problems.push(format!("firewall state unknown: {e}")),
+        Firewall::Present => {
+            // Removing a port that is not there fails; the read below decides.
+            let _ = firewall_set_element("delete").await;
+            match firewall_port_open().await {
+                Some(false) => done.push(format!("tcp/{SSH_PORT} not open in the firewall")),
+                Some(true) => problems.push(format!("tcp/{SSH_PORT} is still open in the firewall")),
+                None => problems.push("could not read the firewall's maintenance port set".to_string()),
+            }
+        }
+    }
+
+    Ok(SysdOpOutput {
+        success: problems.is_empty(),
+        stdout: if done.is_empty() { "nothing was open".to_string() } else { done.join("; ") },
+        stderr: problems.join("; "),
+    })
+}
+
 /// Dispatch one already-authorized, already-parsed request to its
 /// hardcoded command sequence.
 pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
@@ -1262,16 +1613,8 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
         SysdRequest::ClearExhaustedUpdateTarget { version } => {
             dispatch_clear_exhausted_update_target(version).await
         }
-        SysdRequest::SshServiceStart => {
-            let mut cmd = Command::new("systemctl");
-            cmd.args(["start", "ssh.service"]);
-            run(cmd).await
-        }
-        SysdRequest::SshServiceStop => {
-            let mut cmd = Command::new("systemctl");
-            cmd.args(["stop", "ssh.service"]);
-            run(cmd).await
-        }
+        SysdRequest::SshServiceStart => dispatch_ssh_start().await,
+        SysdRequest::SshServiceStop => dispatch_ssh_stop().await,
     }
 }
 
@@ -1279,6 +1622,92 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn clear_credential_dirs_wipes_every_existing_line_and_refuses_when_none_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let yocto = root.path().join("system/iwd");
+        let debian = root.path().join("network/iwd");
+        std::fs::create_dir_all(&yocto).unwrap();
+        std::fs::write(yocto.join("home.psk"), "secret").unwrap();
+
+        let cleared = clear_credential_dirs(&[&yocto, &debian]).unwrap();
+        assert_eq!(cleared, vec![yocto.display().to_string()]);
+        assert!(yocto.is_dir(), "the directory itself survives");
+        assert_eq!(std::fs::read_dir(&yocto).unwrap().count(), 0);
+
+        let missing = root.path().join("nowhere");
+        let err = clear_credential_dirs(&[&missing, &debian]).unwrap_err();
+        assert!(err.contains("no network credential directory found"), "{err}");
+    }
+
+    #[test]
+    fn maintenance_set_json_is_read_by_element_not_by_substring() {
+        let open = r#"{"nftables":[{"metainfo":{"version":"1.1.6"}},{"set":{"family":"inet","name":"maintenance_tcp_ports","table":"filter","type":"inet_service","handle":4,"elem":[22]}}]}"#;
+        assert_eq!(set_json_has_port(open, 22), Some(true));
+        // An empty set has no "elem" key at all.
+        let empty = r#"{"nftables":[{"metainfo":{"version":"1.1.6"}},{"set":{"family":"inet","name":"maintenance_tcp_ports","table":"filter","type":"inet_service","handle":4}}]}"#;
+        assert_eq!(set_json_has_port(empty, 22), Some(false));
+        // 2222 must not count as 22.
+        let other = r#"{"nftables":[{"set":{"name":"maintenance_tcp_ports","elem":[2222,80]}}]}"#;
+        assert_eq!(set_json_has_port(other, 22), Some(false));
+        assert_eq!(set_json_has_port("not json", 22), None);
+        assert_eq!(set_json_has_port(r#"{"nftables":[{"metainfo":{}}]}"#, 22), None);
+    }
+
+    #[test]
+    fn ssh_units_prefer_dropbear_and_only_it_has_sessions() {
+        assert_eq!(SSH_UNITS[0].unit, "dropbear.socket");
+        assert_eq!(SSH_UNITS[0].sessions, Some("dropbear@*.service"));
+        assert_eq!(
+            SSH_UNITS[0].session_cgroup,
+            Some("/sys/fs/cgroup/system.slice/system-dropbear.slice")
+        );
+        assert_eq!(SSH_UNITS[1].unit, "ssh.service");
+        assert_eq!(SSH_UNITS[1].sessions, None);
+        assert_eq!(ssh_port_element(), "{ 22 }");
+    }
+
+    #[test]
+    fn only_a_clear_not_found_means_the_unit_is_absent() {
+        assert_eq!(parse_load_state(true, "loaded\n", ""), UnitLoad::Loaded);
+        assert_eq!(parse_load_state(true, "masked\n", ""), UnitLoad::Loaded);
+        assert_eq!(parse_load_state(true, "not-found\n", ""), UnitLoad::NotFound);
+        // A D-Bus timeout or empty output is not "no SSH server".
+        assert!(matches!(parse_load_state(false, "", "Failed to connect to bus"), UnitLoad::Unknown(_)));
+        assert!(matches!(parse_load_state(true, "", ""), UnitLoad::Unknown(_)));
+        assert!(matches!(parse_load_state(true, "error\n", ""), UnitLoad::Unknown(_)));
+    }
+
+    #[test]
+    fn a_configured_firewall_that_did_not_load_is_unknown_not_absent() {
+        assert_eq!(classify_firewall(Some(true), None, true), Firewall::Present);
+        assert_eq!(classify_firewall(Some(false), None, false), Firewall::Absent);
+        assert_eq!(classify_firewall(None, None, false), Firewall::Absent);
+        assert!(matches!(classify_firewall(Some(false), None, true), Firewall::Unknown(_)));
+        assert!(matches!(classify_firewall(None, None, true), Firewall::Unknown(_)));
+        assert!(matches!(
+            classify_firewall(None, Some("permission denied".into()), false),
+            Firewall::Unknown(_)
+        ));
+        assert!(nft_says_missing("Error: No such file or directory\nlist table inet filter"));
+        assert!(!nft_says_missing("Error: Operation not permitted"));
+        assert!(!nft_says_missing("Error: Could not process rule: No such file or directory"));
+    }
+
+    #[test]
+    fn cgroup_process_count_walks_the_whole_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        let slice = root.path().join("system-dropbear.slice");
+        assert_eq!(cgroup_process_count(&slice).unwrap(), 0, "missing cgroup holds nothing");
+        let session = slice.join("dropbear@0-10.0.0.2:22-10.0.0.9:50000.service");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(slice.join("cgroup.procs"), "").unwrap();
+        std::fs::write(session.join("cgroup.procs"), "4242\n4243\n").unwrap();
+        assert_eq!(cgroup_process_count(&slice).unwrap(), 2);
+        std::fs::write(session.join("cgroup.procs"), "").unwrap();
+        assert_eq!(cgroup_process_count(&slice).unwrap(), 0);
+    }
 
     #[test]
     fn bless_status_is_classified_by_whole_word() {

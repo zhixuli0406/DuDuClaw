@@ -118,6 +118,45 @@ pub const MAX_HOSTNAME_LEN: usize = 253;
 /// zoneinfo whitelist check in `dispatch.rs` even runs.
 pub const MAX_TIMEZONE_LEN: usize = 64;
 
+/// An SSH server unit the maintenance-mode verbs may act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshUnit {
+    pub unit: &'static str,
+    /// Unit pattern of its per-connection sessions, if it has any.
+    pub sessions: Option<&'static str>,
+    /// cgroup v2 directory holding every session process. Closing kills
+    /// everything under it and then checks it is empty, because upstream
+    /// `dropbear@.service` sets `KillMode=process`: stopping a session unit
+    /// ends only the dropbear process, and a shell's background jobs, `nohup`
+    /// or tmux stay behind in that cgroup.
+    pub session_cgroup: Option<&'static str>,
+}
+
+/// SSH server units in preference order. Opening starts the first one
+/// systemd reports as loaded; closing handles every loaded one. A closed
+/// list of literals, so a caller can never name an arbitrary unit.
+///
+/// The Yocto line ships dropbear socket-activated (`dropbear.socket`,
+/// `Accept=yes`, one `dropbear@<n>.service` per connection, all under
+/// `system-dropbear.slice` — openembedded-core `meta/recipes-core/dropbear`
+/// at the commit `kas/duduclaw-os.yml` pins). The frozen Debian line ships
+/// OpenSSH as `ssh.service`, whose sessions live in logind session scopes
+/// and are not tracked here. Until 2026-10 the verbs only knew `ssh.service`,
+/// which no Yocto image has, so the dashboard's maintenance SSH switch could
+/// never start anything there.
+pub const SSH_UNITS: [SshUnit; 2] = [
+    SshUnit {
+        unit: "dropbear.socket",
+        sessions: Some("dropbear@*.service"),
+        session_cgroup: Some("/sys/fs/cgroup/system.slice/system-dropbear.slice"),
+    },
+    SshUnit { unit: "ssh.service", sessions: None, session_cgroup: None },
+];
+
+/// TCP port the SSH units listen on; the verbs open and close exactly this
+/// port in the OS firewall.
+pub const SSH_PORT: u16 = 22;
+
 /// The closed verb set. See module docs for the "why no free-form
 /// command" reasoning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,10 +288,14 @@ pub enum SysdRequest {
     /// comment above for why that is enough to keep this verb out of the
     /// argv/path-injection hazard the rest of this file documents.
     ClearExhaustedUpdateTarget { version: String },
-    /// `systemctl start ssh.service`. Fieldless — the unit name is a fixed
-    /// literal, never a caller-supplied string, so there is no way to point
-    /// this verb at an arbitrary unit (see `dispatch.rs`'s module doc for the
-    /// "every argv is a literal" rule this mirrors).
+    /// Start the image's SSH server ([`SSH_UNITS`]: `dropbear.socket` on the
+    /// Yocto line, `ssh.service` on the Debian line) and add [`SSH_PORT`] to
+    /// the OS firewall's maintenance port set when the image has a firewall.
+    /// Fieldless — the unit is picked from a closed list of literals, never a
+    /// caller-supplied string, so there is no way to point this verb at an
+    /// arbitrary unit (see `dispatch.rs`'s module doc for the "every argv is a
+    /// literal" rule this mirrors). The wire name `ssh_service_start` is kept
+    /// for compatibility with older gateways.
     ///
     /// Maintenance-mode Entry A (`commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md`
     /// §2.6): the ONE verb that actually changes the device's network attack
@@ -261,11 +304,13 @@ pub enum SysdRequest {
     /// — it only ever runs the literal command; the gateway decides when to
     /// send it.
     SshServiceStart,
-    /// `systemctl stop ssh.service` — the close side of [`SysdRequest::SshServiceStart`].
-    /// Idempotent: stopping an already-stopped unit is still `success: true`
-    /// (systemd's own behavior), which is exactly what the maintenance-mode
-    /// TTL sweep / gateway-restart reassert-closed path relies on — calling
-    /// this when SSH was never started must never be an error.
+    /// The close side of [`SysdRequest::SshServiceStart`]: stop the SSH unit,
+    /// end its open sessions, and remove [`SSH_PORT`] from the firewall's
+    /// maintenance port set. Idempotent: closing something that was never
+    /// opened is still `success: true`, which is exactly what the
+    /// maintenance-mode TTL sweep / gateway-restart reassert-closed path
+    /// relies on. It reports `success: false` when a session or the port is
+    /// still open afterwards, so the window's close error is not papered over.
     SshServiceStop,
 }
 

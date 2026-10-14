@@ -79,7 +79,7 @@ pub mod server {
 
 pub use client::{SysdClient, SysdClientError};
 pub use protocol::{
-    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, SOCKET_PATH_ENV, SysdError, SysdOpOutput, SysdRequest,
-    SysdResponse, resolve_socket_path,
+    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, SOCKET_PATH_ENV, SSH_PORT, SSH_UNITS, SshUnit, SysdError,
+    SysdOpOutput, SysdRequest, SysdResponse, resolve_socket_path,
 };
 pub use server::{SysdServerConfig, bind, serve};

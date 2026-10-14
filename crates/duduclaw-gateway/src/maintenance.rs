@@ -36,7 +36,7 @@
 //!   — see [`reassert_closed_on_boot`] and §2.4's "reassert closed" design
 //!   decision. This is the SAME `resume_on_restart=pause` lineage as
 //!   `goal_loop.rs`, but stricter: there is no `auto` option here at all.
-//! - A close action (`systemctl stop ssh.service`) failing never gets
+//! - A close action (stopping the SSH server through `duduclaw-sysd`) failing never gets
 //!   papered over: [`MaintenanceWindow::close_error`] is a distinct column,
 //!   surfaced by `status()` alongside a LIVE observed probe
 //!   ([`ssh_service_observed_active`]) so the dashboard reports what the
@@ -128,7 +128,7 @@ pub struct MaintenanceWindow {
     pub revoke_reason: Option<String>,
     pub reminded_at: Option<String>,
     /// Best-effort record of a close-action failure (`systemctl stop
-    /// ssh.service` erroring) — never blocks the revoke itself (§6 fail-closed
+    /// <ssh unit>` erroring) — never blocks the revoke itself (§6 fail-closed
     /// principle #2 talks about STATUS REPORTING, not about refusing to
     /// record a revoke that a human/TTL sweep already decided on), but keeps
     /// the discrepancy visible to forensics and to `status()`.
@@ -541,32 +541,83 @@ impl MaintenanceAuditLog {
 
 // ── Live observed-state probe (§6 fail-closed principle #2) ─
 
-/// `systemctl is-active ssh.service` — read-only, needs no root (unlike
-/// `start`/`stop`), so this runs directly in the gateway process rather than
-/// crossing the `duduclaw-sysd` socket. `None` on any non-appliance host,
-/// spawn failure, or unrecognized output — callers must treat `None` as "no
-/// live signal available", never coerce it to `false`.
+/// Whether the image's SSH server is up: one of `duduclaw_sysd::SSH_UNITS`
+/// is active, or a session process is still running under its cgroup. Read-only and needs no root (unlike `start`/`stop`),
+/// so this runs directly in the gateway process rather than crossing the
+/// `duduclaw-sysd` socket. `None` on any non-appliance host, spawn failure,
+/// or unrecognized output; callers must treat `None` as "no live signal
+/// available", never coerce it to `false`.
 ///
 /// This exists so `maintenance.status()` can answer with what the system
 /// ACTUALLY looks like, not just what the ledger's `revoked_at` column
 /// optimistically claims — the exact fail-closed gap §6 principle #2 calls
 /// out ("狀態回報必須反映實際觀測到的系統狀態，而不是「應該要是什麼狀態」").
+/// Until 2026-10 it only asked about `ssh.service`, which Yocto images do not
+/// have, so it always answered "not running" there.
 pub async fn ssh_service_observed_active() -> Option<bool> {
     if !duduclaw_core::is_appliance() {
         return None;
     }
+    for unit in duduclaw_sysd::SSH_UNITS {
+        let (ok, load) =
+            systemctl_output(&["show", "--property=LoadState", "--value", unit.unit]).await?;
+        match (ok, load.trim()) {
+            (true, "not-found") => continue,
+            (true, "loaded" | "masked") => {}
+            _ => return None, // systemd gave no clear answer
+        }
+        let (_, state) = systemctl_output(&["is-active", unit.unit]).await?;
+        match state.trim() {
+            "active" | "activating" | "reloading" | "deactivating" => return Some(true),
+            "inactive" | "failed" => {}
+            _ => return None, // empty or unrecognized — no confident answer
+        }
+        if let Some(cgroup) = unit.session_cgroup {
+            let cgroup = std::path::Path::new(cgroup);
+            // A missing directory means "no sessions" only on a cgroup v2 host.
+            if !cgroup.is_dir() && !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+                return None;
+            }
+            match cgroup_has_processes(cgroup) {
+                Ok(true) => return Some(true),
+                Ok(false) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+    // Every candidate was checked and nothing is up (or none is installed).
+    Some(false)
+}
+
+/// Run `systemctl <args>`; `(exit success, stdout)`, or `None` if it cannot
+/// spawn. `is-active` exits non-zero for inactive units, so callers judge
+/// the output themselves.
+async fn systemctl_output(args: &[&str]) -> Option<(bool, String)> {
     let out = tokio::process::Command::new("systemctl")
-        .args(["is-active", "ssh.service"])
+        .args(args)
         .output()
         .await
         .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let state = stdout.trim();
-    match state {
-        "active" => Some(true),
-        "inactive" | "failed" | "unknown" | "" => Some(false),
-        _ => None, // an unrecognized token — no confident answer either way
+    Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// Whether any process lives anywhere under a cgroup v2 directory (session
+/// processes can outlive their unit, see `duduclaw_sysd::SshUnit`). A
+/// missing directory holds none. `cgroup.procs` is world-readable.
+fn cgroup_has_processes(dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::read_to_string(dir.join("cgroup.procs")) {
+        Ok(procs) if procs.lines().any(|l| !l.trim().is_empty()) => return Ok(true),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && cgroup_has_processes(&entry.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ── Orchestration (store + audit + device actions, one call each) ──
@@ -653,6 +704,13 @@ pub async fn enable(
     }
 
     if let Err(open_err) = run_open_actions(&sub_caps).await {
+        // The open may have taken effect even though it reported failure
+        // (e.g. sysd finished but the reply was lost). No window is recorded
+        // and no TTL would ever close it, so close now; closing is idempotent.
+        let rollback_error = run_close_actions(&sub_caps).await;
+        if let Some(close_err) = &rollback_error {
+            warn!(error = %close_err, "maintenance: rollback close after failed open failed");
+        }
         audit.record(
             "enable_failed",
             json!({
@@ -660,6 +718,7 @@ pub async fn enable(
                 "enabled_by_email": enabled_by_email,
                 "sub_capabilities": sub_caps,
                 "error": open_err,
+                "rollback_error": rollback_error,
             }),
         );
         return Err(format!(
@@ -1193,6 +1252,20 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn cgroup_has_processes_sees_leftover_session_processes() {
+        let root = tempfile::tempdir().unwrap();
+        let slice = root.path().join("system-dropbear.slice");
+        assert!(!cgroup_has_processes(&slice).unwrap());
+        let session = slice.join("dropbear@0.service");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(slice.join("cgroup.procs"), "").unwrap();
+        std::fs::write(session.join("cgroup.procs"), "").unwrap();
+        assert!(!cgroup_has_processes(&slice).unwrap());
+        std::fs::write(session.join("cgroup.procs"), "777\n").unwrap();
+        assert!(cgroup_has_processes(&slice).unwrap());
     }
 
     #[tokio::test]
