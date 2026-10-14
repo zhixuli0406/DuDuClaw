@@ -983,7 +983,31 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
             # into bogus KEY=VALUE pairs and fail the update).
             if gcloud run services update "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
                 --update-env-vars "^:^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}" >/dev/null 2>&1; then
-                echo "  Control-plane allowlist updated (new revision rolled out)."
+                # A staged rollout (update-traffic --to-revisions) pins traffic to
+                # one revision, and `services update` then creates a revision that
+                # never serves (pinned 2026-10-12 to 10-14, so the v1.73.0 and
+                # v1.73.1 allowlists never took effect). Route to the latest
+                # revision and check what the serving revision actually carries.
+                gcloud run services update-traffic "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                    --to-latest --quiet >/dev/null 2>&1 || true
+                CP_SERVING_REV="$(gcloud run services describe "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                    --format=json 2>/dev/null | python3 -c 'import json, sys
+live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic", []) if t.get("percent")]
+print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
+                CP_SERVING_VERSIONS=""
+                if [[ -n "$CP_SERVING_REV" ]]; then
+                    CP_SERVING_VERSIONS="$(gcloud run revisions describe "$CP_SERVING_REV" --project "$CP_PROJECT" --region "$CP_REGION" \
+                        --format=json 2>/dev/null | python3 -c 'import json, sys
+env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
+print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
+                fi
+                if [[ "$CP_SERVING_VERSIONS" == "$CP_VERSIONS" ]]; then
+                    echo "  Control-plane allowlist updated; serving revision $CP_SERVING_REV carries it."
+                else
+                    echo "  WARNING: control-plane allowlist was written but is NOT serving"
+                    echo "           (serving revision '${CP_SERVING_REV:-unknown}' has '${CP_SERVING_VERSIONS:-unknown}')."
+                    echo "           Check: gcloud run services describe $CP_SERVICE --region $CP_REGION --format='yaml(spec.traffic,status.traffic)'"
+                fi
             else
                 echo "  WARNING: control-plane env update FAILED. Run manually:"
                 echo "    gcloud run services update $CP_SERVICE --region $CP_REGION \\"
