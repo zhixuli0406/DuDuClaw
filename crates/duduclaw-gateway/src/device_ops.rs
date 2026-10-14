@@ -188,6 +188,14 @@ impl DeviceOps for SystemDeviceOps {
     }
 
     async fn update_apply(&self) -> OpResult {
+        // On an appliance this impl means "sysd unreachable": installing an
+        // OS image needs root's verification, so refuse instead of running
+        // sysupdate from the gateway.
+        if duduclaw_core::is_appliance() {
+            return Err(DeviceOpError::Unsupported(
+                "裝置的系統服務沒有回應，無法驗證並安裝更新，系統沒有被更動。請稍後再試。".to_string(),
+            ));
+        }
         let mut cmd = tokio::process::Command::new("systemd-sysupdate");
         cmd.arg("update");
         run(cmd).await
@@ -504,7 +512,9 @@ impl DeviceOps for SysdDeviceOps {
     }
 
     async fn update_apply(&self) -> OpResult {
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::SysupdateApply).await
+        // Never the unverified `SysupdateApply` on an appliance: the only
+        // install path is the one root verifies itself.
+        self.sysupdate_stage_apply().await
     }
 
     async fn update_rollback(&self) -> OpResult {

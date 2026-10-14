@@ -78,6 +78,11 @@ pub const MAIN_PID_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Most verifications running at once. Every uid-matched connection costs a
 /// root `systemctl` spawn, so a flood of same-uid connections is refused
 /// beyond this instead of piling up processes.
+///
+/// The limit is shared: same-uid processes (on DuDuClaw OS, any AI
+/// employee's process) can keep all permits busy and so make the gateway's
+/// own calls fail for a while. That is an availability effect only; it
+/// never admits a caller.
 pub const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 
 #[cfg(target_os = "linux")]

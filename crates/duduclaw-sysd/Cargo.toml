@@ -31,6 +31,9 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# Throwaway key pairs for the SysupdateStageApply end-to-end tests (never in
+# the shipped binary; production verifies with the compiled-in OS key).
+minisign = { version = "0.7", default-features = false }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 
 [lints]

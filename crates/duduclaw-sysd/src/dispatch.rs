@@ -198,6 +198,31 @@ async fn dispatch_factory_reset() -> DispatchResult {
     })
 }
 
+/// One update-related operation at a time (`SysupdateStageApply`,
+/// `SysupdateApply`, `UpdateRollback`, `ClearExhaustedUpdateTarget`): a
+/// second request while one runs is refused at once, never queued, so
+/// concurrent (possibly forged) calls cannot empty each other's staging
+/// directory or change boot entries mid-install.
+static UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn begin_update_op(lock: &'static tokio::sync::Mutex<()>) -> Result<tokio::sync::MutexGuard<'static, ()>, SysdError> {
+    lock.try_lock()
+        .map_err(|_| SysdError::new("busy", "another update operation is in progress; try again when it has finished"))
+}
+
+/// Plain `SysupdateApply` installs whatever the image's sysupdate source
+/// holds without verification; on an image with a rollback floor (a
+/// non-root gateway) only the verified `SysupdateStageApply` may install.
+fn plain_sysupdate_allowed(floor: &crate::rollback_floor::RollbackFloor) -> Result<(), SysdError> {
+    if *floor == crate::rollback_floor::RollbackFloor::Off {
+        Ok(())
+    } else {
+        Err(SysdError::unsupported(
+            "sysupdate_apply is disabled on this image; use sysupdate_stage_apply (verified install)",
+        ))
+    }
+}
+
 /// `SysupdateStageApply`: resolve the destination slot and the running
 /// version, verify and stage the release as root (`staged_update::stage`,
 /// blocking work on a blocking thread), install it, then empty the staging
@@ -1802,13 +1827,21 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
             run(cmd).await
         }
         SysdRequest::SysupdateApply => {
+            let _guard = begin_update_op(&UPDATE_LOCK)?;
+            plain_sysupdate_allowed(crate::rollback_floor::floor())?;
             let mut cmd = Command::new(SYSTEMD_SYSUPDATE_BIN);
             cmd.arg("update");
             run(cmd).await
         }
-        SysdRequest::SysupdateStageApply => dispatch_sysupdate_stage_apply().await,
+        SysdRequest::SysupdateStageApply => {
+            let _guard = begin_update_op(&UPDATE_LOCK)?;
+            dispatch_sysupdate_stage_apply().await
+        }
         SysdRequest::BootAssessmentStatus => bless_boot("status").await,
-        SysdRequest::UpdateRollback => dispatch_update_rollback().await,
+        SysdRequest::UpdateRollback => {
+            let _guard = begin_update_op(&UPDATE_LOCK)?;
+            dispatch_update_rollback().await
+        }
         SysdRequest::FactoryReset => dispatch_factory_reset_v2(false).await,
         SysdRequest::FactoryResetV2 { clear_network } => dispatch_factory_reset_v2(*clear_network).await,
         SysdRequest::ClearNetworkCredentials => dispatch_clear_network_credentials().await,
@@ -1832,6 +1865,9 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
             .await
         }
         SysdRequest::ClearExhaustedUpdateTarget { version } => {
+            // A malformed value is refused before the lock is even tried.
+            validate_update_version_syntax(version)?;
+            let _guard = begin_update_op(&UPDATE_LOCK)?;
             dispatch_clear_exhausted_update_target(version).await
         }
         SysdRequest::SshServiceStart => dispatch_ssh_start().await,
@@ -2167,6 +2203,50 @@ mod tests {
             let needle = format!("args([{q}{verb}{q}, {q}--{q}, {value}])");
             assert!(source.contains(&needle), "{needle}");
         }
+    }
+
+    /// H1: update operations are serialised; a second one while the first
+    /// holds the lock is refused immediately (busy), and the first is not
+    /// disturbed.
+    #[test]
+    fn update_operations_are_refused_while_one_runs() {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let first = begin_update_op(&LOCK).unwrap();
+        match begin_update_op(&LOCK) {
+            Err(e) => assert_eq!(e.kind, "busy"),
+            Ok(_) => panic!("a second update operation must be refused"),
+        }
+        drop(first);
+        assert!(begin_update_op(&LOCK).is_ok());
+    }
+
+    /// The real verbs take the shared lock: while one update operation runs,
+    /// a second stage/apply/rollback/clear is refused as busy before doing
+    /// anything (no other test in this crate dispatches these verbs).
+    #[tokio::test]
+    async fn concurrent_update_verbs_are_refused_as_busy() {
+        let held = begin_update_op(&UPDATE_LOCK).unwrap();
+        for req in [
+            SysdRequest::SysupdateStageApply,
+            SysdRequest::SysupdateApply,
+            SysdRequest::UpdateRollback,
+            SysdRequest::ClearExhaustedUpdateTarget { version: "0.5.0".into() },
+        ] {
+            match dispatch(&req).await {
+                Err(e) => assert_eq!(e.kind, "busy", "{req:?}"),
+                Ok(out) => panic!("{req:?} ran while another update operation held the lock: {out:?}"),
+            }
+        }
+        drop(held);
+    }
+
+    /// L3: plain sysupdate is refused once a rollback floor is set.
+    #[test]
+    fn plain_sysupdate_is_refused_on_images_with_a_floor() {
+        use crate::rollback_floor::{OsVersion, RollbackFloor};
+        assert!(plain_sysupdate_allowed(&RollbackFloor::Off).is_ok());
+        assert!(plain_sysupdate_allowed(&RollbackFloor::Min(OsVersion::parse("0.4.0").unwrap())).is_err());
+        assert!(plain_sysupdate_allowed(&RollbackFloor::Invalid("x".into())).is_err());
     }
 
     #[test]

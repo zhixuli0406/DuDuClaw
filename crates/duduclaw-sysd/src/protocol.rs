@@ -295,7 +295,9 @@ pub enum SysdRequest {
     /// OS, any process of the gateway's user) gets an arbitrary root image
     /// installed. Images that point their transfers at
     /// `staged_update::DEST_DIR` (root-only, empty between calls) make it
-    /// harmless; use [`SysdRequest::SysupdateStageApply`] there.
+    /// harmless; use [`SysdRequest::SysupdateStageApply`] there. Refused
+    /// outright when `--min-rollback-version` is set (a non-root-gateway
+    /// image), and serialised with the other update verbs.
     SysupdateApply,
     /// Verify and stage an OS update as root, then install it
     /// (`staged_update.rs`): the signed manifest in the gateway's download
@@ -304,8 +306,11 @@ pub enum SysdRequest {
     /// root-only staging directory (the UKI variant bound to the destination
     /// slot only), the staged image must be newer than the running one and
     /// at least `--min-rollback-version`, and only then does
-    /// `systemd-sysupdate update` run. The staging directory is emptied
-    /// before and after. Fieldless: every path is a constant.
+    /// `systemd-sysupdate update` run. All checks run in a private sibling
+    /// directory that is renamed into place only afterwards; the source
+    /// directory is opened `O_DIRECTORY|O_NOFOLLOW` and read with `openat`.
+    /// One update operation at a time (stage/apply/rollback/clear): a second
+    /// is refused as `busy`. Fieldless: every path is a constant.
     SysupdateStageApply,
     /// `/usr/lib/systemd/systemd-bless-boot status` — reports
     /// `good` / `bad` / `indeterminate` / `clean`. Read-only: it never

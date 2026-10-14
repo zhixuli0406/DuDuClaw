@@ -66,25 +66,36 @@ pub fn open_regular(path: &Path, max: u64) -> Result<(std::fs::File, u64), Strin
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let meta = file.metadata().map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-    if !meta.file_type().is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    if meta.len() > max {
-        return Err(format!("{} is larger than allowed ({} > {max} bytes)", path.display(), meta.len()));
-    }
-    Ok((file, meta.len()))
+    let len = check_regular(&file, path, max)?;
+    Ok((file, len))
 }
 
-/// Read a small file whole (manifest, signature).
-pub fn read_small(path: &Path, max: u64) -> Result<Vec<u8>, String> {
-    let (file, _) = open_regular(path, max)?;
+/// The open file is a regular file of at most `max` bytes; its length.
+fn check_regular(file: &std::fs::File, label: &Path, max: u64) -> Result<u64, String> {
+    let meta = file.metadata().map_err(|e| format!("cannot stat {}: {e}", label.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", label.display()));
+    }
+    if meta.len() > max {
+        return Err(format!("{} is larger than allowed ({} > {max} bytes)", label.display(), meta.len()));
+    }
+    Ok(meta.len())
+}
+
+fn read_bounded(file: std::fs::File, label: &Path, max: u64) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    file.take(max + 1).read_to_end(&mut out).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    file.take(max + 1).read_to_end(&mut out).map_err(|e| format!("cannot read {}: {e}", label.display()))?;
     if out.len() as u64 > max {
-        return Err(format!("{} grew past its size limit while being read", path.display()));
+        return Err(format!("{} grew past its size limit while being read", label.display()));
     }
     Ok(out)
+}
+
+/// Read a small file whole (by path; the source directory uses
+/// [`SourceDir::read_small`]).
+pub fn read_small(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+    let (file, _) = open_regular(path, max)?;
+    read_bounded(file, path, max)
 }
 
 /// Verify a minisign signature over `data` with `pubkey_b64`.
@@ -99,8 +110,20 @@ pub fn verify_signature(data: &[u8], sig_text: &str, pubkey_b64: &str) -> Result
 /// The copy is removed when the digest is not `sha256_hex` or anything
 /// fails.
 pub fn copy_verified(src: &Path, dst: &Path, sha256_hex: &str, max: u64) -> Result<u64, String> {
+    let (input, len) = open_regular(src, max)?;
+    copy_file_verified(input, len, src, dst, sha256_hex, max)
+}
+
+/// [`copy_verified`] from an already opened (and checked) file.
+fn copy_file_verified(
+    mut input: std::fs::File,
+    len: u64,
+    src: &Path,
+    dst: &Path,
+    sha256_hex: &str,
+    max: u64,
+) -> Result<u64, String> {
     let result = (|| {
-        let (mut input, len) = open_regular(src, max)?;
         let mut out = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -242,10 +265,115 @@ pub fn reset_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Everything before `systemd-sysupdate update`: verify, select, copy,
-/// check versions. `dest_partuuid` is the destination slot's PARTUUID,
-/// `running` the running image version. Leaves the staged files in `dest`
-/// on success; the caller empties `dest` afterwards either way.
+/// The untrusted source directory, opened once with `O_DIRECTORY |
+/// O_NOFOLLOW` (a symlink swapped in for the directory, or any component
+/// under it, is refused); every file is then opened relative to that
+/// descriptor with `openat(..., O_NOFOLLOW)`, and only plain basenames are
+/// accepted.
+pub struct SourceDir {
+    fd: std::os::fd::OwnedFd,
+    path: std::path::PathBuf,
+}
+
+impl SourceDir {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| "source path contains NUL".to_string())?;
+        // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(format!("cannot open {} as a real directory: {}", path.display(), std::io::Error::last_os_error()));
+        }
+        // SAFETY: a fresh descriptor this function owns.
+        Ok(Self { fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, path: path.to_path_buf() })
+    }
+
+    /// Open `name` (a plain basename) in this directory: no link followed,
+    /// regular file, at most `max` bytes.
+    pub fn open_file(&self, name: &str, max: u64) -> Result<(std::fs::File, u64), String> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        if !crate::release::is_safe_basename(name) {
+            return Err(format!("{name:?} is not a plain file name"));
+        }
+        let c = std::ffi::CString::new(name).map_err(|_| "file name contains NUL".to_string())?;
+        // SAFETY: valid directory descriptor and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        let label = self.path.join(name);
+        if fd < 0 {
+            return Err(format!("cannot open {}: {}", label.display(), std::io::Error::last_os_error()));
+        }
+        // SAFETY: a fresh descriptor this function owns.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let len = check_regular(&file, &label, max)?;
+        Ok((file, len))
+    }
+
+    pub fn read_small(&self, name: &str, max: u64) -> Result<Vec<u8>, String> {
+        let (file, _) = self.open_file(name, max)?;
+        read_bounded(file, &self.path.join(name), max)
+    }
+}
+
+/// Where a staging run builds its files: a fresh private sibling of `dest`
+/// (same filesystem, so the final rename is atomic).
+fn private_staging_dir(dest: &Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = dest.parent().ok_or("the staging directory has no parent")?;
+    let base = dest.file_name().and_then(|n| n.to_str()).ok_or("the staging directory has no name")?;
+    let dir = parent.join(format!(".{base}-staging-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// Put a fully verified staging directory in place as `dest`: the old
+/// `dest` (or a link planted there) is moved aside, the staging directory is
+/// renamed in, the old one removed. `dest` never holds a partial or
+/// unverified set.
+fn place(staging: &Path, dest: &Path) -> Result<(), String> {
+    let parent = dest.parent().ok_or("the staging directory has no parent")?;
+    let old = parent.join(format!(".old-{}", uuid::Uuid::new_v4().simple()));
+    let had_old = match std::fs::symlink_metadata(dest) {
+        Ok(_) => {
+            std::fs::rename(dest, &old).map_err(|e| format!("cannot move {} aside: {e}", dest.display()))?;
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("cannot inspect {}: {e}", dest.display())),
+    };
+    std::fs::rename(staging, dest).map_err(|e| format!("cannot put the staged update in place: {e}"))?;
+    if had_old {
+        let removed = match std::fs::symlink_metadata(&old) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(&old),
+            _ => std::fs::remove_file(&old),
+        };
+        if let Err(e) = removed {
+            tracing::warn!("could not remove the previous staging directory {}: {e}", old.display());
+        }
+    }
+    Ok(())
+}
+
+/// Everything before `systemd-sysupdate update`. All work happens in a
+/// private staging directory next to `dest`; every check (signature,
+/// hashes, slot-bound UKI, embedded version equal to the release, newer
+/// than running, at least the floor) passes there first, and only then is
+/// the directory renamed into place as `dest`, so sysupdate's source never
+/// holds an unverified or too-old image even briefly. On any failure the
+/// staging directory is removed and `dest` is emptied.
+///
+/// `pubkey` is a parameter only so tests can sign with a throwaway key; the
+/// one production caller (`dispatch`) passes the compiled-in
+/// [`crate::release::OS_IMAGE_UPDATE_PUBKEY`]. There is no runtime override.
+/// Callers serialise update operations (`dispatch`'s update lock).
 pub fn stage(
     source: &Path,
     dest: &Path,
@@ -255,17 +383,43 @@ pub fn stage(
     floor: &RollbackFloor,
     running: Option<&str>,
 ) -> Result<ReleaseFiles, String> {
-    let manifest = read_small(&source.join(crate::release::MANIFEST_NAME), MAX_MANIFEST_BYTES)?;
-    let sig = read_small(&source.join(crate::release::SIGNATURE_NAME), MAX_SIGNATURE_BYTES)?;
+    let result = private_staging_dir(dest).and_then(|staging| {
+        let staged = stage_inner(source, &staging, pubkey, arch, dest_partuuid, floor, running)
+            .and_then(|release| place(&staging, dest).map(|()| release));
+        if staged.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        staged
+    });
+    if result.is_err() {
+        if let Err(e) = reset_dir(dest) {
+            tracing::warn!("could not empty {}: {e}", dest.display());
+        }
+    }
+    result
+}
+
+fn stage_inner(
+    source: &Path,
+    staging: &Path,
+    pubkey: &str,
+    arch: &str,
+    dest_partuuid: &str,
+    floor: &RollbackFloor,
+    running: Option<&str>,
+) -> Result<ReleaseFiles, String> {
+    let src = SourceDir::open(source)?;
+    let manifest = src.read_small(crate::release::MANIFEST_NAME, MAX_MANIFEST_BYTES)?;
+    let sig = src.read_small(crate::release::SIGNATURE_NAME, MAX_SIGNATURE_BYTES)?;
     let sig = String::from_utf8(sig).map_err(|_| "the signature file is not text".to_string())?;
     verify_signature(&manifest, &sig, pubkey)?;
     let text = String::from_utf8(manifest).map_err(|_| "the manifest is not text".to_string())?;
     let entries = crate::release::parse_manifest(&text)?;
     let release = crate::release::select_release_files(&entries, arch)?;
 
-    reset_dir(dest)?;
     let copy = |entry: &ManifestEntry, as_name: &str, max: u64| {
-        copy_verified(&source.join(&entry.name), &dest.join(as_name), &entry.sha256, max)
+        let (file, len) = src.open_file(&entry.name, max)?;
+        copy_file_verified(file, len, &src.path.join(&entry.name), &staging.join(as_name), &entry.sha256, max)
     };
     // Kernel images first (small), into temporary names, to choose one.
     let canonical_tmp = format!(".candidate-{}", release.uki.name);
@@ -274,20 +428,20 @@ pub fn stage(
     if let (Some(entry), Some(tmp)) = (&release.uki_slot_b, &slot_b_tmp) {
         copy(entry, tmp, MAX_UKI_BYTES)?;
     }
-    let canonical_uuid = uki_root_partuuid(&dest.join(&canonical_tmp)).ok();
-    let slot_b_uuid = slot_b_tmp.as_ref().map(|tmp| uki_root_partuuid(&dest.join(tmp)).ok());
+    let canonical_uuid = uki_root_partuuid(&staging.join(&canonical_tmp)).ok();
+    let slot_b_uuid = slot_b_tmp.as_ref().map(|tmp| uki_root_partuuid(&staging.join(tmp)).ok());
     let choice = choose_uki(canonical_uuid.as_deref(), slot_b_uuid.as_ref().map(|o| o.as_deref()), dest_partuuid)?;
     let chosen_tmp = match choice {
         UkiChoice::Canonical => canonical_tmp.clone(),
         UkiChoice::SlotB => slot_b_tmp.clone().ok_or("no slot-B kernel image")?,
     };
-    let uki_final = dest.join(&release.uki.name);
-    std::fs::rename(dest.join(&chosen_tmp), &uki_final).map_err(|e| e.to_string())?;
-    for tmp in [Some(canonical_tmp), slot_b_tmp].into_iter().flatten() {
-        let _ = std::fs::remove_file(dest.join(tmp));
-    }
-    let embedded = crate::rollback_floor::uki_image_version(&uki_final).ok();
+    // Version check on the chosen file before it gets its sysupdate name.
+    let embedded = crate::rollback_floor::uki_image_version(&staging.join(&chosen_tmp)).ok();
     check_versions(embedded.as_deref(), &release.version, floor, running)?;
+    std::fs::rename(staging.join(&chosen_tmp), staging.join(&release.uki.name)).map_err(|e| e.to_string())?;
+    for tmp in [Some(canonical_tmp), slot_b_tmp].into_iter().flatten() {
+        let _ = std::fs::remove_file(staging.join(tmp));
+    }
 
     copy(&release.root, &release.root.name, MAX_ROOT_BYTES)?;
     if let Some(verity) = &release.verity {
@@ -329,7 +483,7 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         std::fs::write(src.path().join("SHA256SUMS"), "FAKE_BINARY").unwrap();
         std::fs::write(src.path().join("SHA256SUMS.minisig"), "bad").unwrap();
         assert!(stage(src.path(), &dest, TEST_PUBKEY, "x86-64", "x", &RollbackFloor::Off, Some("0.1.0")).is_err());
-        assert!(dest.join("leftover").exists(), "a refused release does not touch the destination");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0, "a refused release leaves the destination empty");
         // Correctly signed, but not a manifest: refused at parsing.
         std::fs::write(src.path().join("SHA256SUMS"), "FAKE_BINARY").unwrap();
         std::fs::write(src.path().join("SHA256SUMS.minisig"), TEST_SIG).unwrap();
@@ -422,5 +576,216 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         reset_dir(&planted).unwrap();
         assert!(outside.join("keep").exists());
         assert!(std::fs::symlink_metadata(&planted).unwrap().is_dir());
+    }
+    // ── end to end, with a throwaway signing key ──────────────────────────
+
+    const PART_A: &str = "11111111-2222-3333-4444-555555555555";
+    const PART_B: &str = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+    /// A minimal PE image with the given sections (enough for the `.osrel`
+    /// and `.cmdline` readers).
+    fn pe(sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let pe_at = 0x40usize;
+        let table = pe_at + 4 + 20;
+        let data_start = table + 40 * sections.len();
+        let mut out = vec![0u8; data_start];
+        out[0..2].copy_from_slice(b"MZ");
+        out[0x3c..0x40].copy_from_slice(&(pe_at as u32).to_le_bytes());
+        out[pe_at..pe_at + 4].copy_from_slice(b"PE\0\0");
+        out[pe_at + 6..pe_at + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        let mut ptr = data_start;
+        for (i, (name, data)) in sections.iter().enumerate() {
+            let at = table + i * 40;
+            out[at..at + name.len()].copy_from_slice(name.as_bytes());
+            out[at + 8..at + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            out[at + 16..at + 20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            out[at + 20..at + 24].copy_from_slice(&(ptr as u32).to_le_bytes());
+            ptr += data.len();
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    fn uki(version: &str, partuuid: &str) -> Vec<u8> {
+        pe(&[
+            (".osrel", format!("ID=duduclaw\nIMAGE_VERSION={version}\n").into_bytes()),
+            (".cmdline", format!("rootwait root=PARTUUID={partuuid} ro").into_bytes()),
+            (".linux", b"kernel".to_vec()),
+        ])
+    }
+
+    struct Release {
+        _dir: tempfile::TempDir,
+        source: std::path::PathBuf,
+        dest: std::path::PathBuf,
+        pubkey: String,
+        root_name: String,
+    }
+
+    /// A signed release `version` in a temp source dir: root payload (with a
+    /// hole), canonical UKI bound to slot A, slot-B UKI bound to slot B.
+    fn release(version: &str) -> Release {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let dest = dir.path().join("dest");
+        std::fs::create_dir(&source).unwrap();
+        let root_name = format!("duduclaw-os_{version}.root-x86-64.raw");
+        let mut root = b"root-fs-start".to_vec();
+        root.extend(std::iter::repeat_n(0u8, 5 * 1024 * 1024));
+        root.extend_from_slice(b"root-fs-end");
+        let files: Vec<(String, Vec<u8>)> = vec![
+            (root_name.clone(), root),
+            (format!("duduclaw-os_{version}.efi"), uki(version, PART_A)),
+            (format!("duduclaw-os_{version}.slot-b.efi"), uki(version, PART_B)),
+        ];
+        let mut manifest = String::new();
+        for (name, bytes) in &files {
+            std::fs::write(source.join(name), bytes).unwrap();
+            manifest.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
+        }
+        std::fs::write(source.join("SHA256SUMS"), &manifest).unwrap();
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let sig = minisign::sign(Some(&kp.pk), &kp.sk, std::io::Cursor::new(manifest.as_bytes()), Some("test"), None)
+            .unwrap()
+            .into_string();
+        std::fs::write(source.join("SHA256SUMS.minisig"), sig).unwrap();
+        Release { pubkey: kp.pk.to_base64(), source, dest, root_name, _dir: dir }
+    }
+
+    fn run(r: &Release, dest_partuuid: &str, floor: &RollbackFloor, running: &str) -> Result<ReleaseFiles, String> {
+        stage(&r.source, &r.dest, &r.pubkey, "x86-64", dest_partuuid, floor, Some(running))
+    }
+
+    fn assert_refused_and_empty(r: &Release, result: Result<ReleaseFiles, String>, what: &str) {
+        let err = result.expect_err(what);
+        assert!(!err.is_empty(), "{what}");
+        let left: Vec<_> = std::fs::read_dir(&r.dest).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+        assert!(left.is_empty(), "{what}: destination not emptied: {left:?}");
+    }
+
+    #[test]
+    fn a_signed_release_is_staged_with_the_uki_for_the_destination_slot() {
+        let r = release("0.5.0");
+        let floor = RollbackFloor::Min(OsVersion::parse("0.4.0").unwrap());
+        let staged = run(&r, PART_B, &floor, "0.4.0").unwrap();
+        assert_eq!(staged.version, "0.5.0");
+        let mut names: Vec<String> =
+            std::fs::read_dir(&r.dest).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        let mut want = vec![r.root_name.clone(), "duduclaw-os_0.5.0.efi".to_string()];
+        want.sort();
+        assert_eq!(names, want, "only what sysupdate needs");
+        let siblings: Vec<_> = std::fs::read_dir(r.dest.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(siblings.is_empty(), "no staging leftovers: {siblings:?}");
+        // The canonical name holds the slot-B variant's exact signed bytes.
+        assert_eq!(std::fs::read(r.dest.join("duduclaw-os_0.5.0.efi")).unwrap(), uki("0.5.0", PART_B));
+        assert_eq!(std::fs::read(r.dest.join(&r.root_name)).unwrap(), std::fs::read(r.source.join(&r.root_name)).unwrap());
+        // Slot A gets the canonical variant.
+        let staged = run(&r, PART_A, &floor, "0.4.0").unwrap();
+        assert_eq!(staged.version, "0.5.0");
+        assert_eq!(std::fs::read(r.dest.join("duduclaw-os_0.5.0.efi")).unwrap(), uki("0.5.0", PART_A));
+    }
+
+    #[test]
+    fn tampered_unsigned_or_misplaced_releases_are_refused_and_nothing_is_left() {
+        let off = RollbackFloor::Off;
+        // Tampered payload after signing.
+        let r = release("0.5.0");
+        std::fs::write(r.source.join(&r.root_name), b"evil root").unwrap();
+        assert_refused_and_empty(&r, run(&r, PART_A, &off, "0.4.0"), "tampered payload");
+        // Wrong key.
+        let r = release("0.5.0");
+        let other = minisign::KeyPair::generate_unencrypted_keypair().unwrap().pk.to_base64();
+        let res = stage(&r.source, &r.dest, &other, "x86-64", PART_A, &off, Some("0.4.0"));
+        assert_refused_and_empty(&r, res, "wrong key");
+        // Missing signature.
+        let r = release("0.5.0");
+        std::fs::remove_file(r.source.join("SHA256SUMS.minisig")).unwrap();
+        assert_refused_and_empty(&r, run(&r, PART_A, &off, "0.4.0"), "missing .minisig");
+        // A payload replaced by a symlink to an identical file elsewhere.
+        let r = release("0.5.0");
+        let elsewhere = r.source.parent().unwrap().join("elsewhere.raw");
+        std::fs::rename(r.source.join(&r.root_name), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, r.source.join(&r.root_name)).unwrap();
+        assert_refused_and_empty(&r, run(&r, PART_A, &off, "0.4.0"), "symlinked payload");
+        // No UKI bound to the destination slot.
+        let r = release("0.5.0");
+        assert_refused_and_empty(&r, run(&r, "deadbeef-0000-0000-0000-000000000000", &off, "0.4.0"), "unbound slot");
+    }
+
+    #[test]
+    fn old_equal_or_below_floor_releases_are_refused_and_nothing_is_left() {
+        let r = release("0.5.0");
+        assert_refused_and_empty(&r, run(&r, PART_A, &RollbackFloor::Off, "0.5.0"), "equal version");
+        assert_refused_and_empty(&r, run(&r, PART_A, &RollbackFloor::Off, "0.6.0"), "older than running");
+        let floor = RollbackFloor::Min(OsVersion::parse("0.6.0").unwrap());
+        assert_refused_and_empty(&r, run(&r, PART_A, &floor, "0.4.0"), "below the floor");
+        // A UKI whose embedded version disagrees with its signed name (an old
+        // image published under a newer name) is refused too.
+        let r = release("0.9.0");
+        let old = uki("0.3.0", PART_A);
+        std::fs::write(r.source.join("duduclaw-os_0.9.0.efi"), &old).unwrap();
+        let manifest = std::fs::read_to_string(r.source.join("SHA256SUMS")).unwrap();
+        let fixed: String = manifest
+            .lines()
+            .map(|l| {
+                if l.ends_with("  duduclaw-os_0.9.0.efi") {
+                    format!("{:x}  duduclaw-os_0.9.0.efi\n", Sha256::digest(&old))
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(r.source.join("SHA256SUMS"), &fixed).unwrap();
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let sig = minisign::sign(Some(&kp.pk), &kp.sk, std::io::Cursor::new(fixed.as_bytes()), None, None).unwrap();
+        std::fs::write(r.source.join("SHA256SUMS.minisig"), sig.into_string()).unwrap();
+        let res = stage(&r.source, &r.dest, &kp.pk.to_base64(), "x86-64", PART_A, &RollbackFloor::Off, Some("0.4.0"));
+        assert_refused_and_empty(&r, res, "embedded version differs from the release");
+    }
+
+    /// H1: work happens in a private sibling; `dest` is replaced only after
+    /// every check passed, and a refused release (here: older than running)
+    /// never reaches `dest` under its sysupdate name.
+    #[test]
+    fn checks_finish_before_anything_is_placed_where_sysupdate_reads() {
+        let r = release("0.5.0");
+        std::fs::create_dir_all(&r.dest).unwrap();
+        std::fs::write(r.dest.join("previous"), "x").unwrap();
+        // stage_inner never touches `dest`, whether it succeeds or fails.
+        let scratch = r.dest.parent().unwrap().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        assert!(stage_inner(&r.source, &scratch, &r.pubkey, "x86-64", PART_A, &RollbackFloor::Off, Some("0.6.0")).is_err());
+        assert!(r.dest.join("previous").exists());
+        assert!(!scratch.join("duduclaw-os_0.5.0.efi").exists(), "a too-old UKI never gets its sysupdate name");
+        let scratch2 = r.dest.parent().unwrap().join("scratch2");
+        std::fs::create_dir(&scratch2).unwrap();
+        assert!(stage_inner(&r.source, &scratch2, &r.pubkey, "x86-64", PART_A, &RollbackFloor::Off, Some("0.4.0")).is_ok());
+        assert!(r.dest.join("previous").exists(), "only stage() places, after the checks");
+        // stage() replaces `dest` as a whole on success.
+        run(&r, PART_A, &RollbackFloor::Off, "0.4.0").unwrap();
+        assert!(!r.dest.join("previous").exists());
+        assert!(r.dest.join("duduclaw-os_0.5.0.efi").exists());
+    }
+
+    /// L1: a source directory that is itself a symlink is refused.
+    #[test]
+    fn a_symlinked_source_directory_is_refused() {
+        let r = release("0.5.0");
+        let link = r.source.parent().unwrap().join("source-link");
+        std::os::unix::fs::symlink(&r.source, &link).unwrap();
+        let res = stage(&link, &r.dest, &r.pubkey, "x86-64", PART_A, &RollbackFloor::Off, Some("0.4.0"));
+        assert_refused_and_empty(&r, res, "symlinked source directory");
+        assert!(SourceDir::open(&link).is_err());
+        let dir = SourceDir::open(&r.source).unwrap();
+        assert!(dir.open_file("../SHA256SUMS", 1024).is_err(), "only plain names");
+        assert!(dir.read_small("SHA256SUMS", 64 * 1024).is_ok());
     }
 }
