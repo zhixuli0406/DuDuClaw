@@ -114,7 +114,7 @@ desktop:
 
 | Image | What it is | Ships as |
 |---|---|---|
-| **Desktop edition** (`duduclaw-image-appliance`) | The full machine: the desktop plus Chromium / LibreOffice / Steam preloaded offline, the app compatibility layer (Bottles, Windows VM, Waydroid), read-only root, the firewall, first-boot provisioning, and login hardening. | The whole-disk `.wic.zst`, and its own live installer ISO (`installer-desktop`, shipping since v0.1.0 on 2026-09-04). |
+| **Desktop edition** (`duduclaw-image-appliance`) | The full machine: the desktop plus Chromium / LibreOffice preloaded offline (Steam installs from Flathub), the app compatibility layer (Bottles, Windows VM, Waydroid), read-only root, the firewall, first-boot provisioning, and login hardening. | The whole-disk `.wic.zst`, and its own live installer ISO (`installer-desktop`, shipping since v0.1.0 on 2026-09-04). |
 | **Base image** (`duduclaw-image-ab`) | The same A/B layout, desktop shell and gateway, without the app layer, read-only root or firewall. A bring-up artifact rather than a product. | The payload of the plain live installer ISO (`installer`). |
 
 What the desktop does when no monitor is attached — whether it falls back

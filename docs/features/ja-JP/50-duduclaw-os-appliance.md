@@ -123,7 +123,7 @@ DuDuClaw OSのimageはどれも、起動するとDuDuClaw自身のデスクト�
 
 | image | 概要 | 提供形態 |
 |---|---|---|
-| **デスクトップ版**(`duduclaw-image-appliance`) | フルスペックのマシン全体: デスクトップに加えて、オフラインでプリロードされたChromium / LibreOffice / Steam、アプリ互換レイヤー(Bottles、Windows VM、Waydroid)、読み取り専用ルート、ファイアウォール、初回起動時のプロビジョニング、ログイン強化。 | ディスク全体の`.wic.zst`と、専用の live インストーラー ISO(`installer-desktop`、v0.1.0(2026-09-04)から出荷継続中)。 |
+| **デスクトップ版**(`duduclaw-image-appliance`) | フルスペックのマシン全体: デスクトップに加えて、オフラインでプリロードされたChromium / LibreOffice(SteamはFlathubからインストール)、アプリ互換レイヤー(Bottles、Windows VM、Waydroid)、読み取り専用ルート、ファイアウォール、初回起動時のプロビジョニング、ログイン強化。 | ディスク全体の`.wic.zst`と、専用の live インストーラー ISO(`installer-desktop`、v0.1.0(2026-09-04)から出荷継続中)。 |
 | **ベースイメージ**(`duduclaw-image-ab`) | 同じA/B構成、デスクトップシェル、gatewayを持ちながら、アプリ互換レイヤー・読み取り専用ルート・ファイアウォールは含みません。製品ではなくbring-up成果物という位置づけです。 | 通常の live インストーラー ISO(`installer`)に収められているペイロード。 |
 
 モニターが接続されていないときにデスクトップがどう振る舞うか、つま

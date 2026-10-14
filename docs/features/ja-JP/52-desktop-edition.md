@@ -56,8 +56,8 @@
   が表示されます。
 - **入力とオーディオ**——fcitx5中国語IME、PipeWire / WirePlumberオーデ
   ィオ、X11アプリケーション向けのXWayland。
-- **アプリ**——Chromium、LibreOffice、SteamはFlatpakとしてあらかじめオ
-  フラインでインストール済みです。Windowsデスクトップアプリは
+- **アプリ**——ChromiumとLibreOfficeはFlatpakとしてあらかじめオ
+  フラインでインストール済みで、SteamはFlathubからインストールできます。Windowsデスクトップアプリは
   Bottles経由、フルのWindowsはKVM仮想マシン+RDP経由、Androidアプリは
   Waydroid経由です。何が保証されていて何が保証されていないかはアプリ
   互換性ガイドに明記されています。このガイドは2026-09-29から

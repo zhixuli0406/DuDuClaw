@@ -124,7 +124,7 @@ npm install -g duduclaw
 
 ### DuDuClaw OS(值班機映像,pre-GA)
 
-不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice / Steam 與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,截至最新版 v0.3.0 仍未啟用,開機需先在 BIOS/UEFI 關閉 Secure Boot。
+不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice(Steam 從 Flathub 安裝)與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,截至最新版 v0.3.0 仍未啟用,開機需先在 BIOS/UEFI 關閉 Secure Boot。
 
 現行版本是 v0.3.0(內嵌平台 v1.73.1;先前的 v0.2.0 與 v0.1.0 仍留在 Releases 頁面,可作為回滾目標)。到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載整碟 `.wic.zst`(桌面版)、`installer-desktop` 安裝器 `.iso`(寫入桌面版)或 `installer` 安裝器 `.iso`(寫入基礎版,沒有應用層),每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令見[官方文件站的 OS README](https://os.duduclaw.dudustudio.monster/docs/os/readme/)。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
 

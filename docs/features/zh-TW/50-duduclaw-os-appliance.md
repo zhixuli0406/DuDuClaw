@@ -90,7 +90,7 @@ compositor 與 shell，附鎖定畫面、首次啟動精靈，還有一個能從
 
 | 映像 | 是什麼 | 出貨形式 |
 |---|---|---|
-| **桌面版**（`duduclaw-image-appliance`） | 完整機器：桌面加上離線預載的 Chromium／LibreOffice／Steam、app 相容層（Bottles、Windows VM、Waydroid）、唯讀 root、防火牆、首次開機 provision，以及登入硬化。 | 整碟 `.wic.zst`，以及自己的 live 安裝器 ISO（`installer-desktop`，自 v0.1.0（2026-09-04）起出貨）。 |
+| **桌面版**（`duduclaw-image-appliance`） | 完整機器：桌面加上離線預載的 Chromium／LibreOffice（Steam 從 Flathub 安裝）、app 相容層（Bottles、Windows VM、Waydroid）、唯讀 root、防火牆、首次開機 provision，以及登入硬化。 | 整碟 `.wic.zst`，以及自己的 live 安裝器 ISO（`installer-desktop`，自 v0.1.0（2026-09-04）起出貨）。 |
 | **基礎版**（`duduclaw-image-ab`） | 同樣的 A/B 架構、桌面殼層與 gateway，但沒有 app 相容層、唯讀 root 或防火牆。是一份 bring-up 產物，而非產品。 | 純安裝器 ISO（`installer`）打包的內容。 |
 
 沒接螢幕時桌面會怎麼表現，例如是否會退回成純儀表板的無頭模式，這件事還沒有

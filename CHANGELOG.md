@@ -8,6 +8,7 @@
 - 鎖定畫面次數用完的說明更正：15 分鐘的時間窗是固定的，持續執行的程式可以在每次重置後再用完，所以只要它還在跑，鎖定畫面就會一直拒絕；原本寫「最多 15 分鐘」不正確。取捨不變，解法是找出那支程式並停掉。
 
 ### Fixed
+- 公開文件（三語 README、docs/features/50、52）原寫桌面版「離線預載 Chromium／LibreOffice／Steam」，實際離線倉庫只有 Chromium 與 LibreOffice，Steam 要從 Flathub 安裝；已更正。
 - `docs/features/50`（三語）的防火牆與 SSH 說明改成映像實際行為：桌面版防火牆只放行儀表板 18789 埠、mDNS 與基本 ICMP；映像內的 dropbear SSH 開機就在 22 埠監聽，桌面版被防火牆擋住，基礎版沒有防火牆、區網連得到。原本寫「SSH 出廠關閉、要在儀表板打開才啟用」不正確；維護模式的 SSH 開關操作的是這些映像沒有的 `ssh.service`，也不會開防火牆埠。
 - 同頁 `duduclaw-sysd` 的說明：指令數是 15 個不是 6 個，並註明目前映像的 gateway 仍以 root 執行，權限拆分尚未實際生效。
 - `docs/README.md` 開頭不再寫死平台版本（原本停在 v1.63.0），改指向 `CHANGELOG.md`。
