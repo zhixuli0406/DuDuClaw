@@ -288,6 +288,13 @@ impl RegisteredEvaluator {
         }
         let (mut command, workspace_input) = match backend {
             IsolationBackend::Container => {
+                // Generated code runs here under --memory / --pids-limit: on a
+                // rootless engine those must be shown to take effect first.
+                if let Some(image) = config.image.as_deref()
+                    && let Err(verdict) = crate::task_sandbox::container::resource_limits(image).await
+                {
+                    return failure(FailClass::RuntimeError, verdict.reason_en(), backend);
+                }
                 let labels = match super::maintenance::scope_labels(&self.home, run_id, "evaluator") {
                     Ok(labels) => labels,
                     Err(reason) => return failure(FailClass::RuntimeError, &reason, backend),

@@ -121,7 +121,7 @@ pub trait DeviceOps: Send + Sync {
     ///
     /// `clear_network`: when `true`, ALSO clears saved Wi-Fi credentials
     /// under `/data/network/iwd` (D4a-8) — always requires root
-    /// ([`SysdDeviceOps`] only; see `SysdRequest::ClearNetworkCredentials`).
+    /// ([`SysdDeviceOps`] only; carried by `SysdRequest::FactoryResetV2`).
     /// Defaults to keeping them: losing Wi-Fi on a headless LAN appliance
     /// can mean permanent physical-access-only recovery, so this is an
     /// explicit opt-in the dashboard confirmation surfaces as a checkbox,
@@ -470,21 +470,19 @@ impl DeviceOps for SysdDeviceOps {
         // constant, so a gateway whose home is elsewhere refuses rather than
         // reporting a reset that left its own data in place.
         require_sysd_home(home_dir)?;
-        if clear_network {
-            // D4a-8, fail-closed: runs BEFORE the `FactoryReset` verb
-            // (which ends in `systemctl reboot`) so there is no race
-            // against the box going down mid-request, and a failure here
-            // aborts the whole call (`?`) rather than silently proceeding
-            // to reboot while leaving saved Wi-Fi credentials in place —
-            // an operator who explicitly asked for them to be cleared must
-            // never be told "done" when they were not.
-            sysd_call(
-                &self.client,
-                duduclaw_sysd::SysdRequest::ClearNetworkCredentials,
-            )
-            .await?;
+        // One verb carries the whole reset, `clear_network` included (D4a-8
+        // fail-closed semantics live in sysd: on the immediate path a
+        // credential-clear failure aborts before any wipe or reboot; on the
+        // deferred path the choice is written into the marker the OS
+        // oneshot reads). `FactoryResetV2`, not `FactoryReset`: an older
+        // sysd that predates the root-side home wipe refuses the unknown
+        // verb instead of rebooting with the gateway's data still there.
+        let req = duduclaw_sysd::SysdRequest::FactoryResetV2 { clear_network };
+        match self.client.call(&req).await {
+            Ok(out) => Ok(OpOutput { success: out.success, stdout: out.stdout, stderr: out.stderr }),
+            Err(e) if is_unknown_verb_rejection(&e) => Err(DeviceOpError::Unsupported(OLD_SYSD_RESET_REFUSAL.to_string())),
+            Err(e) => Err(DeviceOpError::Unsupported(e.to_string())),
         }
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::FactoryReset).await
     }
 
     async fn backup_create(&self, source_dir: &Path, dest_path: &Path) -> OpResult {
@@ -542,7 +540,20 @@ fn refuse_local_reset_on_appliance(is_appliance: bool) -> Result<(), DeviceOpErr
     Ok(())
 }
 
-/// [`SysdDeviceOps::factory_reset`] wipes through the `FactoryReset` verb,
+/// Shown when the device's sysd predates `FactoryResetV2` (the gateway and
+/// sysd ship in the same OS image; a mismatch means a partial update).
+const OLD_SYSD_RESET_REFUSAL: &str =
+    "裝置的系統服務版本太舊，無法由它清除資料，已取消還原原廠設定，資料沒有被刪除。請先把裝置系統更新到最新版本。";
+
+/// sysd refused the request because it does not know the verb (it is older
+/// than this gateway): the server answers `bad_request` with `malformed
+/// request: unknown variant …`.
+fn is_unknown_verb_rejection(e: &duduclaw_sysd::SysdClientError) -> bool {
+    matches!(e, duduclaw_sysd::SysdClientError::Rejected { kind, message }
+        if kind == "bad_request" && message.starts_with("malformed request") && message.contains("unknown variant"))
+}
+
+/// [`SysdDeviceOps::factory_reset`] wipes through the `FactoryResetV2` verb,
 /// which only knows [`duduclaw_sysd::GATEWAY_HOME_DIR`]: refuse when this
 /// gateway's home is a different directory.
 fn require_sysd_home(home_dir: &Path) -> Result<(), DeviceOpError> {
@@ -785,6 +796,7 @@ mod tests {
                 let config = duduclaw_sysd::SysdServerConfig {
                     socket_path: socket_path.clone(),
                     allowed_uid,
+                    require_main_pid_of: None,
                 };
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
                 let handle = tokio::spawn(async move {
@@ -873,6 +885,47 @@ mod tests {
             }
             assert!(home.path().join("leftover.txt").exists(), "nothing was wiped locally");
 
+            server.stop().await;
+        }
+
+        /// L5: an older sysd answers the unknown verb with `bad_request`;
+        /// that is told apart from other failures and refused with its own
+        /// text, nothing deleted.
+        #[test]
+        fn an_old_sysd_is_detected_by_its_unknown_verb_rejection() {
+            use duduclaw_sysd::SysdClientError;
+            let old = SysdClientError::Rejected {
+                kind: "bad_request".into(),
+                message: "malformed request: unknown variant `factory_reset_v2`, expected one of `reboot`, …".into(),
+            };
+            assert!(is_unknown_verb_rejection(&old));
+            let other = SysdClientError::Rejected { kind: "io".into(), message: "wiping failed".into() };
+            assert!(!is_unknown_verb_rejection(&other));
+            let unauthorized = SysdClientError::Rejected { kind: "unauthorized".into(), message: "x".into() };
+            assert!(!is_unknown_verb_rejection(&unauthorized));
+            assert!(OLD_SYSD_RESET_REFUSAL.contains("資料沒有被刪除"));
+        }
+
+        /// The real server refuses an unknown verb with exactly that shape
+        /// (stands in for an older sysd).
+        #[tokio::test]
+        async fn the_real_server_rejects_an_unknown_verb_in_the_detected_shape() {
+            let server = TestServer::spawn(Some(current_uid())).await;
+            let path = server.device_ops().client.socket_path().to_path_buf();
+            let raw = tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                writeln!(s, r#"{{"verb":"factory_reset_v9","params":{{"clear_network":false}}}}"#).unwrap();
+                s.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut out = String::new();
+                s.read_to_string(&mut out).unwrap();
+                out
+            })
+            .await
+            .unwrap();
+            let resp: duduclaw_sysd::SysdResponse = serde_json::from_str(raw.trim()).unwrap();
+            let err = resp.error.unwrap();
+            assert!(is_unknown_verb_rejection(&duduclaw_sysd::SysdClientError::Rejected { kind: err.kind, message: err.message }));
             server.stop().await;
         }
 

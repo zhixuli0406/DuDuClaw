@@ -34,6 +34,13 @@ pub const SCRIPT_LOG_MAX_FILES: &str = "1";
 /// … and at most this many bytes of it are read back into memory.
 pub const SCRIPT_LOG_READ_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// The script sandbox's resource-limit verdict for this process.
+static LIMITS_MEMO: duduclaw_core::container_engine::LimitMemo =
+    duduclaw_core::container_engine::LimitMemo::new();
+/// Last health answer, to notice the engine coming back.
+static ENGINE_REACHABILITY: duduclaw_core::container_engine::ReachabilityTracker =
+    duduclaw_core::container_engine::ReachabilityTracker::new();
+
 pub struct DockerRuntime {
     client: Docker,
     image: String,
@@ -85,11 +92,11 @@ impl DockerRuntime {
     /// pids limits back; otherwise the sandbox is unhealthy. A rootful
     /// engine passes without a probe. When the image is not present the
     /// check is skipped (the caller's image check reports that). The verdict
-    /// is kept per process; a failed attempt is retried after a minute.
+    /// is reused for ten minutes (a failed attempt for one) and dropped when
+    /// the engine comes back from unavailable (see `health_check`).
     async fn resource_limits(&self) -> std::result::Result<(), duduclaw_core::container_engine::LimitVerdict> {
-        use duduclaw_core::container_engine::{LimitMemo, LimitVerdict, security_options_report_rootless};
-        static MEMO: LimitMemo = LimitMemo::new();
-        if let Some(verdict) = MEMO.get() {
+        use duduclaw_core::container_engine::{LimitVerdict, security_options_report_rootless};
+        if let Some(verdict) = LIMITS_MEMO.get() {
             return if verdict.is_enforced() { Ok(()) } else { Err(verdict) };
         }
         let rootless = match tokio::time::timeout(duduclaw_core::docker_probe::PROBE_TIMEOUT, self.client.info()).await {
@@ -107,7 +114,7 @@ impl DockerRuntime {
                 Err(_) => LimitVerdict::ProbeFailed,
             }
         };
-        MEMO.put(verdict);
+        LIMITS_MEMO.put(verdict);
         if verdict.is_enforced() {
             Ok(())
         } else {
@@ -500,6 +507,9 @@ impl ContainerRuntime for DockerRuntime {
                 Some(Answer { success: matches!(list, Ok(Ok(_))), timed_out: list.is_err(), stdout: "", stderr: "" }),
             )
         };
+        if ENGINE_REACHABILITY.observe(status.is_reachable()) {
+            LIMITS_MEMO.clear();
+        }
         Ok(match status {
             DockerStatus::Reachable { server_version } => match self.resource_limits().await {
                 Ok(()) => RuntimeHealth {

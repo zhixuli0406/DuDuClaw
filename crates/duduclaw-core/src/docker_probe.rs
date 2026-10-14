@@ -19,7 +19,12 @@
 //! {{.ServerVersion}}`: both work on Docker, but Podman (5.8, also through
 //! its `docker` shim and in remote mode) rejects the `info` template, which
 //! made a healthy rootless Podman read as unavailable on DuDuClaw OS. The
-//! `version` template asks the server, so a half-dead daemon still fails it.
+//! `version` template asks the server, so a daemon that is down still fails
+//! it, but it is a lighter request than `info` (on 2026-10-03 the half-dead
+//! Docker Desktop failed `/info` while still answering cheap calls). The
+//! container list ([`LIST_ARGS`]) is therefore the part that has to stay
+//! meaningful: it needs the engine's container store, not just its API
+//! front, and must keep running after a successful version answer.
 
 use std::time::Duration;
 

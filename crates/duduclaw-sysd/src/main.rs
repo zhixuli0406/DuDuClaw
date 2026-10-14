@@ -38,6 +38,15 @@ struct Cli {
     /// fail-to-boot. See `protocol::ALLOWED_UID_ENV`.
     #[arg(long)]
     allowed_uid: Option<u32>,
+
+    /// Also require the caller to be the main process (systemd `MainPID`)
+    /// of this unit, e.g. `duduclaw-gateway.service`. Needed once the
+    /// gateway's uid is shared with the AI employees' CLIs: a uid check
+    /// alone admits them. Fail-closed: a MainPID that cannot be read, or an
+    /// invalid unit name, denies every call. Absent ⇒ uid check only (older
+    /// OS images). Relies on yama `ptrace_scope >= 1`; see `protocol.rs`.
+    #[arg(long, value_name = "UNIT")]
+    require_main_pid_of: Option<String>,
 }
 
 #[tokio::main]
@@ -68,11 +77,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, "sysd: starting");
+    let require_main_pid_of = cli.require_main_pid_of;
+    info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, require_main_pid_of = ?require_main_pid_of, "sysd: starting");
     let listener = bind(&socket_path, allowed_uid)?;
     info!(socket = %socket_path.display(), "sysd: listening");
 
-    let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid };
+    let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid, require_main_pid_of };
     serve(listener, config, shutdown_signal()).await?;
     info!("sysd: clean shutdown");
     Ok(())

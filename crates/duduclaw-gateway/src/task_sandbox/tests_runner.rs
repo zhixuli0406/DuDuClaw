@@ -669,3 +669,20 @@ async fn rootful_engine_is_not_probed() {
     go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap();
     assert!(!fx.tools.join("probe").exists());
 }
+
+/// M3: every gateway path that runs generated code under --memory /
+/// --pids-limit goes through the resource-limit gate (Discovery's policy
+/// runner checks memory.max / pids.max inside its own probe container).
+#[test]
+fn discovery_containers_are_behind_the_resource_limit_gate() {
+    let gate = "task_sandbox::container::resource_limits(";
+    for (name, source) in [
+        ("discovery/evaluator.rs", include_str!("../discovery/evaluator.rs")),
+        ("discovery/agent_spawn.rs", include_str!("../discovery/agent_spawn.rs")),
+        ("computer_use_image.rs", include_str!("../computer_use_image.rs")),
+    ] {
+        assert!(source.contains(gate), "{name} must call the resource-limit gate");
+    }
+    let policy = include_str!("../discovery/policy_runner.rs");
+    assert!(policy.contains("memory.max") && policy.contains("pids.max"), "policy runner keeps its own ceiling probe");
+}

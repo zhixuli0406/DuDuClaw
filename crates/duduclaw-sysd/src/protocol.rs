@@ -10,7 +10,7 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape that crate's protocol used)
-//! — the entire caller-reachable surface is sixteen fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is seventeen fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
@@ -63,8 +63,10 @@
 //!   base directory (see `dispatch::dispatch_clear_exhausted_update_target`
 //!   for the H3d §11.7 bug this closes).
 //!
-//! - [`SysdRequest::LocalModelService`] `{ action }` uses the
-//!   [`SysdRequest::SetNtp`] discipline: `action` is a closed
+//! - [`SysdRequest::LocalModelService`] `{ action }` and
+//!   [`SysdRequest::FactoryResetV2`] `{ clear_network }` use the
+//!   [`SysdRequest::SetNtp`] discipline (a bool or a closed enum selects a
+//!   literal). For `LocalModelService`: `action` is a closed
 //!   [`LocalModelAction`] enum (`stop` / `restart`; anything else fails to
 //!   parse), each variant selects one `&'static str` systemctl verb, and the
 //!   unit is the fixed literal [`LOCAL_MODEL_UNIT`]. No caller text reaches
@@ -78,8 +80,26 @@
 //!
 //! The server accepts exactly one peer uid. Once the OS runs the gateway
 //! unprivileged and points `--allowed-uid` at it, that uid is the same one
-//! the AI employees' CLIs run as, so **every request must be treated as
-//! attacker-controlled**. The parameterised verbs are built for that: closed
+//! the AI employees' CLIs run as, so a uid check alone admits any agent
+//! process, which can open the socket directly and bypass every gateway-side
+//! approval. Two consequences:
+//!
+//! 1. **The caller must be authenticated as the gateway process itself.**
+//!    `--require-main-pid-of <unit>` (see `server.rs`) additionally requires
+//!    the peer pid from `SO_PEERCRED` to equal that unit's `MainPID`, read
+//!    from systemd at connect time; a MainPID that cannot be read denies. It
+//!    is opt-in so older OS images keep working, and the OS must turn it on
+//!    together with the non-root gateway. It holds only while (a) yama
+//!    `kernel.yama.ptrace_scope >= 1`, so the agent processes, which are the
+//!    gateway's descendants and share its uid, cannot ptrace the gateway and
+//!    speak with its pid, and (b) the gateway never hands a connected sysd
+//!    socket to a child: the client opens one connection per call and drops
+//!    it when the call returns, and Rust std / tokio create every socket with
+//!    `SOCK_CLOEXEC`, so a spawned CLI does not inherit it. With the flag on,
+//!    sysd calls made from a separate `duduclaw mcp-server` process (the
+//!    `os_*` MCP tools) are refused like any agent's; they need a route
+//!    through the gateway process.
+//! 2. **Every request is still treated as attacker-controlled.** The parameterised verbs are built for that: closed
 //! enums or bools for choices, length and character whitelists for strings
 //! (`Hostname`, `SetTimezone`, `NetworkWiredConfig`'s `interface`,
 //! `ClearExhaustedUpdateTarget`), typed re-serialisation for file content,
@@ -87,16 +107,17 @@
 //! file a caller string selects, the timezone, is resolved inside
 //! `/usr/share/zoneinfo` and must be a regular file there).
 //!
-//! The parameterless verbs ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
-//! [`SysdRequest::SysupdateApply`], [`SysdRequest::UpdateRollback`],
-//! [`SysdRequest::FactoryReset`], [`SysdRequest::ClearNetworkCredentials`],
-//! [`SysdRequest::SshServiceStart`] / [`SysdRequest::SshServiceStop`],
-//! [`SysdRequest::LocalModelService`]) carry nothing to inject, but an agent
-//! that can reach the socket can still trigger them. That is an
-//! availability impact (a reboot, a wiped home, a stopped model service, an
-//! SSH window), not a privilege escalation: each runs only its fixed
-//! command. Gating them on an operator approval belongs to the gateway, not
-//! this daemon, and is not done here.
+//! The verbs without a free-form value (the fieldless ones, plus
+//! `LocalModelService` and `FactoryResetV2`, whose single field selects a
+//! literal) carry nothing to inject, but a caller that passes the gates can
+//! still trigger them, and two of them are not mere availability:
+//! [`SysdRequest::UpdateRollback`] boots the previous A/B slot, which after
+//! the first non-root upgrade is the old image whose gateway (and so the
+//! agents) still ran as root; [`SysdRequest::SshServiceStart`] opens a
+//! network service. The others (reboot, power off, update apply, factory
+//! reset, clearing Wi-Fi, stopping the model service) cost availability or
+//! data, not privilege. This is why the main-pid gate above matters: without
+//! it, gateway-side approvals for these verbs can be bypassed by any agent.
 
 use serde::{Deserialize, Serialize};
 
@@ -135,12 +156,10 @@ pub fn resolve_socket_path() -> std::path::PathBuf {
 /// not a limit that legitimate traffic could ever approach.
 pub const MAX_REQUEST_LINE_BYTES: usize = 4096;
 
-/// Maximum accepted length of a `Hostname { set }` value. RFC 1123 caps a
-/// full hostname at 253 chars; this is intentionally generous relative to
-/// that so a legitimate value is never rejected, while still refusing an
-/// obviously-wrong multi-kilobyte payload before it ever reaches
-/// `Command::arg()`.
-pub const MAX_HOSTNAME_LEN: usize = 253;
+/// Maximum accepted length of a `Hostname { set }` value: 64, the limit
+/// `systemd-hostnamed` enforces for the static host name (`HOST_NAME_MAX`),
+/// so a value that passes here is one `hostnamectl` can actually set.
+pub const MAX_HOSTNAME_LEN: usize = 64;
 
 /// Maximum accepted length (bytes) of a `SetTimezone { timezone }` value.
 /// IANA tz database identifiers (e.g. `"America/Argentina/Buenos_Aires"`,
@@ -195,6 +214,14 @@ pub const SSH_PORT: u16 = 22;
 /// container engine can belong to subordinate uids the gateway itself cannot
 /// delete. A closed constant, never a caller-supplied path.
 pub const GATEWAY_HOME_DIR: &str = "/data/duduclaw";
+
+/// Marker [`SysdRequest::FactoryResetV2`] writes to defer the wipe to the
+/// next boot (see that verb for the contract).
+pub const FACTORY_RESET_MARKER: &str = "/data/system/factory-reset.pending";
+
+/// The OS oneshot that consumes [`FACTORY_RESET_MARKER`]. Its unit file
+/// existing selects the deferred path.
+pub const FACTORY_RESET_UNIT_FILE: &str = "/usr/lib/systemd/system/duduclaw-factory-reset.service";
 
 /// The local model service unit ([`SysdRequest::LocalModelService`]). Must
 /// match `duduclaw_inference::appliance::LLAMA_SERVER_UNIT` and the image
@@ -271,7 +298,41 @@ pub enum SysdRequest {
     /// Home instead of re-running first-time setup — the gateway-side wipe
     /// of its own home dir alone was never enough. The unit-file re-arm and
     /// reboot are unchanged: both fixed literals.
+    ///
+    /// Since 2026-10 this is [`SysdRequest::FactoryResetV2`] with
+    /// `clear_network: false` (an older gateway clears Wi-Fi through
+    /// [`SysdRequest::ClearNetworkCredentials`] first and wipes its home
+    /// itself; both stay harmless when repeated).
     FactoryReset,
+    /// Factory reset, choosing how by what the image ships.
+    ///
+    /// **Deferred (the OS ships [`FACTORY_RESET_UNIT_FILE`]).** sysd writes
+    /// [`FACTORY_RESET_MARKER`] and reboots (the same `systemctl reboot` as
+    /// [`SysdRequest::Reboot`]); nothing is wiped while the gateway and its
+    /// containers still run, which avoided the half-wiped results the live
+    /// wipe could leave (a directory refilled during the wipe, files written
+    /// on shutdown). Contract with the OS oneshot:
+    /// - the marker is written atomically (a temp file in `/data/system`,
+    ///   then rename), mode 0600, owner root;
+    /// - its content is exactly one line, `clear_network=0` or
+    ///   `clear_network=1`, followed by `\n`;
+    /// - a failure to write it is an error and there is no reboot;
+    /// - at the next boot, before the container service and the gateway
+    ///   start, the oneshot wipes the contents of `/data/duduclaw` and
+    ///   `/data/duduclaw-kiosk`, removes `/data/system/containers/duduclaw`,
+    ///   wipes the contents of `/data/system/iwd` when `clear_network=1`,
+    ///   re-enables first-boot provisioning, and deletes the marker last.
+    ///
+    /// **Immediate (no such unit file: older images).** With
+    /// `clear_network`, Wi-Fi credentials are cleared first
+    /// ([`SysdRequest::ClearNetworkCredentials`], failure aborts); then what
+    /// [`SysdRequest::FactoryReset`] always did: wipe [`GATEWAY_HOME_DIR`]
+    /// (failure aborts), the kiosk home (best-effort), re-arm first boot,
+    /// reboot.
+    ///
+    /// A separate verb so a gateway can tell an older sysd (which refuses
+    /// the unknown verb and wipes nothing) from one that wipes the home.
+    FactoryResetV2 { clear_network: bool },
     /// Wipe the CONTENTS of `/data/network/iwd` — the iwd-managed store of
     /// saved Wi-Fi credentials (0700 root:root, see
     /// `appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`).
@@ -397,6 +458,7 @@ impl SysdRequest {
             SysdRequest::BootAssessmentStatus => "boot_assessment_status",
             SysdRequest::UpdateRollback => "update_rollback",
             SysdRequest::FactoryReset => "factory_reset",
+            SysdRequest::FactoryResetV2 { .. } => "factory_reset_v2",
             SysdRequest::ClearNetworkCredentials => "clear_network_credentials",
             SysdRequest::Hostname { .. } => "hostname",
             SysdRequest::SetTimezone { .. } => "set_timezone",
@@ -527,6 +589,21 @@ mod tests {
         }
         assert_eq!(LOCAL_MODEL_UNIT, "duduclaw-llama-server.service");
         assert_eq!(GATEWAY_HOME_DIR, "/data/duduclaw");
+    }
+
+    #[test]
+    fn factory_reset_v2_has_a_bool_and_a_stable_wire_shape() {
+        for clear_network in [true, false] {
+            let req = SysdRequest::FactoryResetV2 { clear_network };
+            let s = serde_json::to_string(&req).unwrap();
+            assert_eq!(s, format!(r#"{{"verb":"factory_reset_v2","params":{{"clear_network":{clear_network}}}}}"#));
+            assert_eq!(serde_json::from_str::<SysdRequest>(&s).unwrap(), req);
+        }
+        assert!(serde_json::from_str::<SysdRequest>(r#"{"verb":"factory_reset_v2","params":{"clear_network":"1"}}"#).is_err());
+        assert!(serde_json::from_str::<SysdRequest>(r#"{"verb":"factory_reset_v2","params":{"clear_network":true,"path":"/"}}"#).is_err());
+        assert_eq!(FACTORY_RESET_MARKER, "/data/system/factory-reset.pending");
+        assert_eq!(FACTORY_RESET_UNIT_FILE, "/usr/lib/systemd/system/duduclaw-factory-reset.service");
+        assert_eq!(MAX_HOSTNAME_LEN, 64);
     }
 
     #[test]

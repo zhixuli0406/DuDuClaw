@@ -18,7 +18,7 @@ use std::path::Path;
 use tokio::process::Command;
 
 use crate::protocol::{
-    GATEWAY_HOME_DIR, LOCAL_MODEL_UNIT, LocalModelAction, MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT,
+    FACTORY_RESET_MARKER, FACTORY_RESET_UNIT_FILE, GATEWAY_HOME_DIR, LOCAL_MODEL_UNIT, LocalModelAction, MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT,
     SSH_UNITS, SysdError, SysdOpOutput, SysdRequest,
 };
 
@@ -196,6 +196,73 @@ async fn dispatch_factory_reset() -> DispatchResult {
         stdout: format!("{}{kiosk_wipe_warn}{enable_warn}", reboot.stdout),
         ..reboot
     })
+}
+
+/// Which factory-reset path this image supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetPath {
+    /// Write the marker and reboot; the OS oneshot wipes at next boot.
+    Deferred,
+    /// Wipe now, then reboot (images without the oneshot).
+    Immediate,
+}
+
+fn reset_path(oneshot_unit_present: bool) -> ResetPath {
+    if oneshot_unit_present { ResetPath::Deferred } else { ResetPath::Immediate }
+}
+
+/// The marker's exact content (see `SysdRequest::FactoryResetV2`).
+fn marker_content(clear_network: bool) -> &'static str {
+    if clear_network { "clear_network=1\n" } else { "clear_network=0\n" }
+}
+
+/// Write `marker` atomically: a fresh temp file next to it (mode 0600, not
+/// following links), fsync, rename over the marker, fsync the directory.
+fn write_reset_marker(marker: &Path, clear_network: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = marker.parent().ok_or_else(|| std::io::Error::other("marker has no directory"))?;
+    let tmp = dir.join(".factory-reset.pending.tmp");
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&tmp)?;
+    file.write_all(marker_content(clear_network).as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, marker)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// `FactoryResetV2` (and the legacy `FactoryReset`, as `clear_network:
+/// false`): see the verb's doc comment for both paths.
+async fn dispatch_factory_reset_v2(clear_network: bool) -> DispatchResult {
+    match reset_path(Path::new(FACTORY_RESET_UNIT_FILE).exists()) {
+        ResetPath::Deferred => {
+            write_reset_marker(Path::new(FACTORY_RESET_MARKER), clear_network)
+                .map_err(|e| SysdError::io(format!("writing {FACTORY_RESET_MARKER} failed: {e}")))?;
+            let mut reboot_cmd = Command::new("systemctl");
+            reboot_cmd.arg("reboot");
+            let reboot = run(reboot_cmd).await?;
+            Ok(SysdOpOutput {
+                stdout: format!("factory reset scheduled for the next boot\n{}", reboot.stdout),
+                ..reboot
+            })
+        }
+        ResetPath::Immediate => {
+            if clear_network {
+                dispatch_clear_network_credentials().await?;
+            }
+            dispatch_factory_reset().await
+        }
+    }
 }
 
 /// Wipe the contents of the gateway home `dir` (a closed constant in
@@ -1666,7 +1733,8 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
         }
         SysdRequest::BootAssessmentStatus => bless_boot("status").await,
         SysdRequest::UpdateRollback => dispatch_update_rollback().await,
-        SysdRequest::FactoryReset => dispatch_factory_reset().await,
+        SysdRequest::FactoryReset => dispatch_factory_reset_v2(false).await,
+        SysdRequest::FactoryResetV2 { clear_network } => dispatch_factory_reset_v2(*clear_network).await,
         SysdRequest::ClearNetworkCredentials => dispatch_clear_network_credentials().await,
         SysdRequest::Hostname { set } => dispatch_hostname(set).await,
         SysdRequest::SetTimezone { timezone } => dispatch_set_timezone(timezone).await,
@@ -2023,6 +2091,35 @@ mod tests {
             let needle = format!("args([{q}{verb}{q}, {q}--{q}, {value}])");
             assert!(source.contains(&needle), "{needle}");
         }
+    }
+
+    #[test]
+    fn factory_reset_path_follows_the_oneshot_unit_file() {
+        assert_eq!(reset_path(true), ResetPath::Deferred);
+        assert_eq!(reset_path(false), ResetPath::Immediate);
+        assert_eq!(marker_content(true), "clear_network=1\n");
+        assert_eq!(marker_content(false), "clear_network=0\n");
+    }
+
+    #[test]
+    fn reset_marker_is_written_atomically_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("factory-reset.pending");
+        write_reset_marker(&marker, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "clear_network=1\n");
+        assert_eq!(std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777, 0o600);
+        // Rewritten, not appended; no temp file left behind.
+        write_reset_marker(&marker, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "clear_network=0\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // A stale temp file planted as a symlink is removed, never followed.
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(".factory-reset.pending.tmp")).unwrap();
+        write_reset_marker(&marker, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "clear_network=1\n");
     }
 
     #[test]

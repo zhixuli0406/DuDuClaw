@@ -16,11 +16,13 @@
 //! arbitrary command.
 //!
 //! The configured uid is the gateway's, which on DuDuClaw OS is also the
-//! uid the AI employees' CLIs run as: treat every request as coming from an
-//! agent. Parameterised verbs validate hostile input (see [`protocol`]'s
-//! "threat model" section); parameterless verbs (reboot, poweroff, update
-//! apply/rollback, factory reset, …) can be triggered by such a caller,
-//! which is an availability impact, not a privilege escalation.
+//! uid the AI employees' CLIs run as, so a uid match alone admits any agent.
+//! `--require-main-pid-of <unit>` narrows the caller to the gateway process
+//! itself (its systemd MainPID); see [`protocol`]'s "threat model" section
+//! for what that relies on. Without it, an agent reaching the socket can
+//! trigger every verb, including `update_rollback` (boots the previous
+//! image, which may still run its gateway as root) and `ssh_service_start`.
+//! Parameterised verbs validate hostile input either way.
 //!
 //! Module map:
 //! - [`protocol`] — the wire schema (closed request enum, response
@@ -56,6 +58,7 @@ pub mod server {
     pub struct SysdServerConfig {
         pub socket_path: std::path::PathBuf,
         pub allowed_uid: Option<u32>,
+        pub require_main_pid_of: Option<String>,
     }
 
     /// Never constructible — [`bind`] always errors on non-unix targets.
@@ -86,7 +89,8 @@ pub mod server {
 
 pub use client::{SysdClient, SysdClientError};
 pub use protocol::{
-    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, GATEWAY_HOME_DIR, LOCAL_MODEL_UNIT, LocalModelAction, SOCKET_PATH_ENV,
+    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, FACTORY_RESET_MARKER, FACTORY_RESET_UNIT_FILE, GATEWAY_HOME_DIR,
+    LOCAL_MODEL_UNIT, LocalModelAction, SOCKET_PATH_ENV,
     SSH_PORT, SSH_UNITS, SshUnit, SysdError,
     SysdOpOutput, SysdRequest, SysdResponse, resolve_socket_path,
 };

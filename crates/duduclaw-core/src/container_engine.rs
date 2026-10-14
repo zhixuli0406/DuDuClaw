@@ -25,7 +25,11 @@
 //!    `memory.max` / `pids.max`; `max` (or anything but the requested limit)
 //!    marks the features unavailable. This module holds the decision logic
 //!    (pure, unit-tested) and a per-process memo; the transports run the
-//!    requests.
+//!    requests. A verdict about the engine is reused for [`DEFINITIVE_TTL`]
+//!    and dropped as soon as the engine is seen coming back from
+//!    unavailable ([`ReachabilityTracker`]): restarting only the container
+//!    service, for example with a unit that lost its cgroup delegation, must
+//!    not keep an old "enforced".
 
 use std::ffi::OsString;
 use std::sync::Mutex;
@@ -134,6 +138,10 @@ pub fn limit_probe_args(image: &str, name: &str) -> Option<Vec<String>> {
         "ALL",
         "--security-opt",
         "no-new-privileges:true",
+        // The script sandbox's sweep key: a probe whose client was killed
+        // before `--rm` fired is still recognisable as ours.
+        "--label",
+        "managed-by=duduclaw",
         "--memory",
     ]
     .iter()
@@ -188,7 +196,7 @@ impl LimitVerdict {
         self == Self::Enforced
     }
 
-    /// A verdict about the engine itself (kept for the life of the process)
+    /// A verdict about the engine itself (kept for [`DEFINITIVE_TTL`])
     /// rather than about one attempt (retried after [`RETRY_AFTER`]).
     pub fn is_definitive(self) -> bool {
         matches!(self, Self::Enforced | Self::Ignored)
@@ -254,9 +262,13 @@ pub fn decide(rootless: Option<bool>, probe: impl FnOnce() -> LimitVerdict) -> L
 /// How long a non-definitive verdict is reused before the probe runs again.
 pub const RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// How long a verdict about the engine (see [`LimitVerdict::is_definitive`])
+/// is reused before the probe runs again.
+pub const DEFINITIVE_TTL: Duration = Duration::from_secs(600);
+
 /// Per-process memo of the verdict: a definitive one (see
-/// [`LimitVerdict::is_definitive`]) is kept for the life of the process, a
-/// failed attempt for [`RETRY_AFTER`].
+/// [`LimitVerdict::is_definitive`]) is kept for [`DEFINITIVE_TTL`], a failed
+/// attempt for [`RETRY_AFTER`]; [`LimitMemo::clear`] drops it at once.
 pub struct LimitMemo {
     slot: Mutex<Option<(Instant, LimitVerdict)>>,
 }
@@ -270,7 +282,8 @@ impl LimitMemo {
     pub fn get_at(&self, now: Instant) -> Option<LimitVerdict> {
         let slot = self.slot.lock().ok()?;
         let (at, verdict) = (*slot)?;
-        (verdict.is_definitive() || now.saturating_duration_since(at) < RETRY_AFTER).then_some(verdict)
+        let ttl = if verdict.is_definitive() { DEFINITIVE_TTL } else { RETRY_AFTER };
+        (now.saturating_duration_since(at) < ttl).then_some(verdict)
     }
 
     pub fn get(&self) -> Option<LimitVerdict> {
@@ -285,6 +298,40 @@ impl LimitMemo {
 
     pub fn put(&self, verdict: LimitVerdict) {
         self.put_at(verdict, Instant::now());
+    }
+
+    /// Forget the verdict (the engine came back; probe again before use).
+    pub fn clear(&self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Remembers whether the engine answered the last availability probe, so a
+/// transition from unavailable to available can clear a [`LimitMemo`].
+pub struct ReachabilityTracker {
+    /// 0 = never observed, 1 = unavailable, 2 = available.
+    last: std::sync::atomic::AtomicU8,
+}
+
+impl ReachabilityTracker {
+    pub const fn new() -> Self {
+        Self { last: std::sync::atomic::AtomicU8::new(0) }
+    }
+
+    /// Record one probe result; `true` when the engine was unavailable at the
+    /// previous observation and is available now.
+    pub fn observe(&self, reachable: bool) -> bool {
+        let now = if reachable { 2 } else { 1 };
+        let before = self.last.swap(now, std::sync::atomic::Ordering::AcqRel);
+        before == 1 && now == 2
+    }
+}
+
+impl Default for ReachabilityTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -355,7 +402,8 @@ mod tests {
             joined,
             format!(
                 "run --rm --pull never --name {name} --network none --read-only --user 65534:65534 \
-                 --cap-drop ALL --security-opt no-new-privileges:true --memory 33554432 --memory-swap 33554432 \
+                 --cap-drop ALL --security-opt no-new-privileges:true --label managed-by=duduclaw \
+                 --memory 33554432 --memory-swap 33554432 \
                  --pids-limit 32 --entrypoint cat ghcr.io/zhixuli0406/duduclaw:v1.73.2 \
                  /sys/fs/cgroup/memory.max /sys/fs/cgroup/pids.max"
             )
@@ -411,9 +459,26 @@ mod tests {
         assert_eq!(memo.get_at(t0 + Duration::from_secs(1)), Some(LimitVerdict::ProbeFailed));
         assert_eq!(memo.get_at(t0 + RETRY_AFTER), None, "a failed attempt is retried");
         memo.put_at(LimitVerdict::Ignored, t0);
-        assert_eq!(memo.get_at(t0 + Duration::from_secs(86_400)), Some(LimitVerdict::Ignored));
+        assert_eq!(memo.get_at(t0 + Duration::from_secs(300)), Some(LimitVerdict::Ignored));
         memo.put_at(LimitVerdict::Enforced, t0);
-        assert_eq!(memo.get_at(t0 + Duration::from_secs(86_400)), Some(LimitVerdict::Enforced));
+        assert_eq!(memo.get_at(t0 + Duration::from_secs(300)), Some(LimitVerdict::Enforced));
+        assert_eq!(memo.get_at(t0 + DEFINITIVE_TTL), None, "an enforced verdict is re-checked");
+        memo.put_at(LimitVerdict::Enforced, t0);
+        memo.clear();
+        assert_eq!(memo.get_at(t0), None);
+    }
+
+    #[test]
+    fn reachability_tracker_reports_only_the_comeback() {
+        let t = ReachabilityTracker::new();
+        assert!(!t.observe(true), "first observation is not a comeback");
+        assert!(!t.observe(true));
+        assert!(!t.observe(false));
+        assert!(t.observe(true), "unavailable -> available");
+        assert!(!t.observe(true));
+        let t = ReachabilityTracker::new();
+        assert!(!t.observe(false));
+        assert!(t.observe(true));
     }
 
     #[test]
