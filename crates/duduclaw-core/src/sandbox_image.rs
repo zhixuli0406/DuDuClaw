@@ -59,8 +59,21 @@ pub fn valid_image(image: &str) -> bool {
 /// The operator-facing remedy for a missing image. Shared wording so the
 /// task sandbox, the script sandbox and `doctor` all say the same thing.
 pub fn image_missing_message(image: &str) -> String {
-    format!("sandbox image {image} is not present locally (it is never pulled automatically); run `docker pull {image}`")
+    format!(
+        "sandbox image {image} is not present locally (it is never pulled automatically); run `docker pull {image}` \
+         ({OS_PULL_HINT_EN})"
+    )
 }
+
+/// Appended to every "run `docker pull`" remedy. On DuDuClaw OS the gateway
+/// runs rootless and keeps its own image store (reached through its
+/// `CONTAINER_HOST` / `DOCKER_HOST`); an image pulled into root's store is
+/// invisible to it.
+pub const OS_PULL_HINT_EN: &str =
+    "on DuDuClaw OS, pull into the gateway's rootless image store: run it with the gateway's CONTAINER_HOST";
+
+/// zh-TW form of [`OS_PULL_HINT_EN`].
+pub const OS_PULL_HINT_ZH: &str = "DuDuClaw OS 上要拉進閘道自己的 rootless 映像庫：請帶閘道的 CONTAINER_HOST 執行";
 
 /// The image's own unprivileged user (`duduclaw`, uid 1000).
 pub const IMAGE_DEFAULT_USER: &str = "1000:1000";
@@ -122,6 +135,7 @@ mod tests {
     fn missing_message_names_docker_pull() {
         let m = image_missing_message("ghcr.io/x/y:v1");
         assert!(m.contains("docker pull ghcr.io/x/y:v1"), "{m}");
+        assert!(m.contains("CONTAINER_HOST"), "{m}");
     }
 
     #[test]

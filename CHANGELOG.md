@@ -2,10 +2,19 @@
 
 ## [Unreleased]
 
+### Changed
+- 為 DuDuClaw OS 的閘道去 root、容器改用 rootless Podman 預做平台端準備（OS 端尚未改，現有安裝在沒有設定 `DOCKER_HOST`／`CONTAINER_HOST` 時行為不變）：
+  - Docker 可用性檢查改問 `docker version --format {{.Server.Version}}`。原本的 `docker info --format {{.ServerVersion}}` 在 Podman 5.8 會失敗，健康的 Podman 被當成無法使用；Docker 兩種都支援。
+  - 會清空環境變數的容器用戶端（任務沙箱、Discovery 嘗試與評分、清理）在閘道有設 `DOCKER_HOST`／`CONTAINER_HOST` 時會帶上這兩個變數，連到跟閘道同一個容器引擎。這兩個名稱沒有加進 AI CLI 的環境允許清單。Discovery 評分原本刻意固定用預設 daemon，設了這兩個變數後改用同一個引擎。
+  - Discovery 評分容器的 `/scratch` tmpfs 改用 `mode=1777`，不再帶 `uid=65534,gid=65534`（rootless Podman 不接受這兩個選項）；容器只以 65534 執行，可寫入的身分不變。
+  - Windows VM（`duduclaw compat windows-vm`）找不到 `docker` 時改用 `podman compose`，錯誤訊息一併說明需要 Docker 或 Podman 的 compose。
+  - 叫人執行 `docker pull` 的訊息（任務沙箱、腳本沙箱、電腦操作與 doctor）補一句：DuDuClaw OS 上 image 要拉進閘道自己的 rootless 映像庫，請帶閘道的 `CONTAINER_HOST` 執行。
+
 ### Fixed
 - 企業版主控台的版本清單從 v1.73.0 起沒有出現新版本：控制面在 10-12 一次分段部署後，流量固定在當時的 revision，`release.sh` 之後寫入的版本允許清單都建在不接流量的新 revision 上，卻照樣回報成功。`release.sh` 改成寫入後把流量切到最新 revision，並檢查實際承接流量的 revision 帶的是新清單，不一致就警告。
 
 ### Security
+- 容器資源上限改成先驗證再用：容器引擎回報 rootless 時，任務沙箱、腳本沙箱與電腦操作會先跑一個 32 MiB 記憶體、32 個行程上限的臨時容器，讀回它自己的 `memory.max` 與 `pids.max`。讀到 `max`（cgroup 控制器沒委派時，rootless 引擎會接受上限卻不套用）、讀到跟要求不同的值，或檢查沒跑完，這三項功能就停用並說明原因（任務沙箱代碼 `resource_limits_unenforced`），doctor 也會列出。一般 rootful Docker 不做這個檢查。結果在行程存活期間沿用，失敗則一分鐘後重試。尚未在真的 rootless Podman 上實測。
 - DuDuClaw OS 維護模式的 SSH 開關原本操作 `ssh.service`，Yocto 映像沒有這個單元，所以開關沒有作用，關閉時也結束不了任何東西。`duduclaw-sysd` 改成從固定清單（`dropbear.socket`、`ssh.service`）找映像上實際有的單元。開啟時先把 22 埠加進防火牆的 `maintenance_tcp_ports` 集合再啟動 dropbear；防火牆加不進去、或防火牆設定存在卻沒有載入時就拒絕開啟，啟動失敗會把 22 埠移除。關閉時停掉所有找到的 SSH 單元、透過 cgroup 結束所有連線行程（上游 `dropbear@.service` 是 `KillMode=process`，只停單元會留下背景程式），移除 22 埠，事後確認沒有行程、單元與埠還開著，查不清楚的一律回報失敗。維護頁的「SSH 實際狀態」改看同一組單元與連線行程，查不清楚時顯示未知。gateway 端開啟失敗時也會執行一次關閉，避免 sysd 其實已開啟、回應卻遺失時留下沒有紀錄的 SSH。
   - 需要搭配下一版 OS 映像（防火牆加入這個集合、dropbear 預設關閉、基礎版也裝防火牆），該版尚未發布；在 OS 映像上尚未實測。
   - 舊映像上的行為：OS v0.3.0 以前的桌面版與 Debian 線的防火牆沒有這個集合，開啟會被拒絕；開啟被拒後 gateway 補做的關閉會停掉原本預設就在跑的 dropbear；v0.3.0 以前的基礎版沒有防火牆，可以開啟，關閉時同樣會停掉 dropbear。兩者重開機後 dropbear 都會再啟動。

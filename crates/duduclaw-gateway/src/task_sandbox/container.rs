@@ -126,11 +126,18 @@ pub(super) fn docker_program() -> OsString {
     "docker".into()
 }
 
-/// The docker client's own environment: the agent-CLI spawn allowlist only
-/// (no gateway secrets). Secret values are added to the `create` call alone.
+/// The docker client's own environment: the agent-CLI spawn allowlist (no
+/// gateway secrets) plus the container endpoint (`DOCKER_HOST` /
+/// `CONTAINER_HOST`) when the gateway has one, so the client reaches the same
+/// engine as the gateway (DuDuClaw OS: its rootless Podman service). The
+/// endpoint names are added here, never to the agent allowlist. Secret values
+/// are added to the `create` call alone.
 fn client_command() -> Command {
     let mut command = Command::new(docker_program());
-    command.env_clear().envs(duduclaw_core::spawn_env::agent_cli_spawn_env_pairs());
+    command
+        .env_clear()
+        .envs(duduclaw_core::spawn_env::agent_cli_spawn_env_pairs())
+        .envs(duduclaw_core::container_engine::endpoint_env_pairs());
     command
 }
 
@@ -217,6 +224,59 @@ async fn probe_docker_uncached() -> (duduclaw_core::docker_probe::DockerStatus, 
 /// [`docker_status`] as a yes/no.
 pub async fn docker_reachable() -> bool {
     docker_status().await.is_reachable()
+}
+
+/// The resource-limit self-check (`duduclaw_core::container_engine`) for a
+/// container feature about to run `image`: on a rootless engine a probe
+/// container with a memory and pids limit must read its limits back, or the
+/// feature is unavailable (`Err` carries the verdict). Rootful engines pass
+/// without a probe. The verdict is kept per process (a failed attempt is
+/// retried after a minute). Call only after the daemon is reachable and the
+/// image is present.
+pub async fn resource_limits(image: &str) -> Result<(), duduclaw_core::container_engine::LimitVerdict> {
+    use duduclaw_core::container_engine::{LimitMemo, LimitVerdict};
+    static MEMO: LimitMemo = LimitMemo::new();
+    #[cfg(test)]
+    let use_memo = DOCKER_PROGRAM.with(|p| p.borrow().is_none());
+    #[cfg(not(test))]
+    let use_memo = true;
+    if use_memo && let Some(verdict) = MEMO.get() {
+        return if verdict.is_enforced() { Ok(()) } else { Err(verdict) };
+    }
+    let verdict = check_resource_limits(image).await;
+    if use_memo {
+        MEMO.put(verdict);
+    }
+    if verdict != LimitVerdict::Enforced {
+        tracing::warn!(reason = verdict.code(), "container resource limits are not enforced; container features unavailable");
+    }
+    if verdict.is_enforced() { Ok(()) } else { Err(verdict) }
+}
+
+async fn check_resource_limits(image: &str) -> duduclaw_core::container_engine::LimitVerdict {
+    use duduclaw_core::container_engine::{
+        LIMIT_PROBE_TIMEOUT, LimitVerdict, ROOTLESS_INFO_ARGS, classify_limit_output, info_reports_rootless,
+        limit_probe_args, new_probe_name,
+    };
+    let rootless = client_probe(&ROOTLESS_INFO_ARGS).await.and_then(|json| info_reports_rootless(&json));
+    if rootless == Some(false) {
+        return LimitVerdict::Enforced;
+    }
+    let name = new_probe_name();
+    let Some(args) = limit_probe_args(image, &name) else {
+        return LimitVerdict::ProbeFailed;
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = probe(&args, LIMIT_PROBE_TIMEOUT).await;
+    let verdict = match &output {
+        Some(o) => classify_limit_output(o.status.success() && !o.output_truncated, o.timed_out, &o.stdout),
+        None => LimitVerdict::ProbeFailed,
+    };
+    if output.as_ref().is_none_or(|o| o.timed_out) {
+        // `--rm` does not fire for a container whose client was killed.
+        let _ = probe(&["rm", "--force", &name], Duration::from_secs(10)).await;
+    }
+    verdict
 }
 
 /// `docker image inspect` finds the image locally. Never pulls.

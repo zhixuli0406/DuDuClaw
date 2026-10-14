@@ -127,7 +127,7 @@ AI 若使用了允許範圍（檔案與 shell）以外的工具，任務會被�
 
 ## 沙箱不能用的時候
 
-`sandbox_enabled = true` 時，只要符合下列任一項，任務就會失敗，不會改成不隔離執行：Docker 連不上、image 不在本機、gateway 以 root 執行、主機不是 unix 系統、設定無效、`network_access = false`、沒有可用帳號、runtime 不支援。每次失敗都會寫入稽核事件 `task_sandbox_unavailable`（附原因代碼），並回傳可讀的錯誤。
+`sandbox_enabled = true` 時，只要符合下列任一項，任務就會失敗，不會改成不隔離執行：Docker 連不上、image 不在本機、容器引擎以 rootless 執行卻沒有套用記憶體與行程數上限（每個 gateway 行程用一個很小的檢查容器確認一次；一般 rootful Docker 不檢查）、gateway 以 root 執行、主機不是 unix 系統、設定無效、`network_access = false`、沒有可用帳號、runtime 不支援。每次失敗都會寫入稽核事件 `task_sandbox_unavailable`（附原因代碼），並回傳可讀的錯誤。
 
 逃生口：在 `config.toml [container.sandbox]` 設 `when_unavailable = "run_unsandboxed"`。之後任務會像舊版一樣在主機上不隔離地執行，而且每個這樣的任務都會寫入稽核事件 `task_sandbox_bypassed`。只有在你接受不隔離執行時才用。
 
@@ -157,7 +157,8 @@ duduclaw doctor
 | 你看到的 | 原因 | 處理 |
 |---|---|---|
 | `(docker_unreachable)` | Docker 常駐程式沒在跑，或 gateway 使用者用不了。 | 啟動 Docker；確認 gateway 使用者能執行 `docker version`。 |
-| `(image_missing)` | image 不在這台機器上。 | 執行錯誤訊息中給的 `docker pull <image>`，或把 `image` 指向你已有的 image。 |
+| `(image_missing)` | image 不在這台機器上。 | 執行錯誤訊息中給的 `docker pull <image>`，或把 `image` 指向你已有的 image。DuDuClaw OS 上 gateway 用自己的 rootless 映像庫：pull 時要帶 gateway 的 `CONTAINER_HOST`，否則 image 會進 root 的映像庫，gateway 看不到。 |
+| `(resource_limits_unenforced)` | 容器引擎以 rootless 執行，卻沒有套用 `--memory`／`--pids-limit`（cgroup 控制器沒有委派給它）、回報的上限跟要求不同，或檢查容器沒有跑完。 | DuDuClaw OS 上這是映像的問題（容器服務單元需要 cgroup 委派），請回報。其他環境請把 memory 與 pids 控制器委派給 rootless 引擎的使用者。沙箱不會在沒有上限的情況下執行。 |
 | `(network_disabled)` | 該員工是 `network_access = false`。 | 在該員工的 `[container]` 設 `network_access = true`。 |
 | `(root_user)` | gateway 以 uid 0 執行。 | 改用一般使用者執行 gateway。 |
 | `(unsupported_platform)` | 主機不是 unix 系統（例如 Windows）。 | 在 Linux 或 macOS 上執行 gateway。 |

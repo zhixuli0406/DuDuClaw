@@ -90,10 +90,17 @@ pub fn load(home: &Path) -> Result<String, String> {
 pub fn missing_message(image: &str) -> String {
     format!(
         "電腦操作無法啟動：本機沒有 image {image}，系統不會自動下載。\
-         請在主機執行 `docker pull {image}`；\
+         請在主機執行 `docker pull {image}`（{os_hint}）；\
          或在 DuDuClaw 原始碼根目錄執行 `{LOCAL_BUILD_COMMAND}` 自行建置，\
-         再到 config.toml 設定 [computer_use] image = \"{LOCAL_BUILD_IMAGE}\"。"
+         再到 config.toml 設定 [computer_use] image = \"{LOCAL_BUILD_IMAGE}\"。",
+        os_hint = duduclaw_core::sandbox_image::OS_PULL_HINT_ZH,
     )
+}
+
+/// Session-start text when the container engine runs rootless and does not
+/// enforce the session container's resource limits (P10 self-check).
+pub fn limits_message(verdict: duduclaw_core::container_engine::LimitVerdict) -> String {
+    format!("電腦操作無法啟動：{}。", verdict.reason_zh())
 }
 
 /// Session-start text when Docker is unavailable (shared probe) or did not
@@ -130,6 +137,10 @@ pub enum Presence {
     Missing,
     /// Docker could not be run or did not answer in time.
     Unknown,
+    /// The image is present, but the engine runs rootless and does not
+    /// enforce the container's resource limits
+    /// (`task_sandbox::container::resource_limits`): fail closed.
+    LimitsUnenforced(duduclaw_core::container_engine::LimitVerdict),
 }
 
 /// `docker image inspect <image>`, bounded by [`IMAGE_INSPECT_TIMEOUT`],
@@ -154,7 +165,12 @@ pub async fn image_presence(image: &str) -> Presence {
     match crate::computer_use_orchestrator::docker_output(&args, IMAGE_INSPECT_TIMEOUT, "Image inspect")
         .await
     {
-        Ok(out) if out.status.success() && !out.stdout.trim_ascii().is_empty() => Presence::Present,
+        Ok(out) if out.status.success() && !out.stdout.trim_ascii().is_empty() => {
+            match crate::task_sandbox::container::resource_limits(image).await {
+                Ok(()) => Presence::Present,
+                Err(verdict) => Presence::LimitsUnenforced(verdict),
+            }
+        }
         Ok(_) => Presence::Missing,
         Err(e) => {
             warn!(error = %e, "computer-use image presence check did not complete");
@@ -185,7 +201,13 @@ pub async fn image_id(image: &str) -> Result<String, Presence> {
     {
         Ok(out) if out.status.success() => {
             let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if is_image_id(&id) { Ok(id) } else { Err(Presence::Missing) }
+            if !is_image_id(&id) {
+                return Err(Presence::Missing);
+            }
+            match crate::task_sandbox::container::resource_limits(image).await {
+                Ok(()) => Ok(id),
+                Err(verdict) => Err(Presence::LimitsUnenforced(verdict)),
+            }
         }
         Ok(_) => Err(Presence::Missing),
         Err(_) => Err(Presence::Unknown),
@@ -205,6 +227,7 @@ pub fn presence_error(image: &str, presence: Presence) -> Option<String> {
         Presence::Present => None,
         Presence::Missing => Some(missing_message(image)),
         Presence::Unknown => Some(unchecked_message(image)),
+        Presence::LimitsUnenforced(verdict) => Some(limits_message(verdict)),
     }
 }
 
@@ -247,9 +270,10 @@ pub fn verdict(
             } else {
                 problem = true;
                 lines.push(format!(
-                    "image 不在本機（不會自動下載），請執行 `docker pull {image}`；\
+                    "image 不在本機（不會自動下載），請執行 `docker pull {image}`（{os_hint}）；\
                      或在原始碼根目錄執行 `{LOCAL_BUILD_COMMAND}`，\
-                     再設定 config.toml [computer_use] image = \"{LOCAL_BUILD_IMAGE}\""
+                     再設定 config.toml [computer_use] image = \"{LOCAL_BUILD_IMAGE}\"",
+                    os_hint = duduclaw_core::sandbox_image::OS_PULL_HINT_ZH,
                 ));
             }
         }
@@ -362,9 +386,16 @@ pub fn allowlist_line(rows: &[(String, usize, usize)]) -> Option<String> {
 pub async fn check(home: &Path) -> (Level, String) {
     let image = load(home);
     let docker = crate::task_sandbox::container::docker_reachable().await;
-    let present = match (&image, docker) {
-        (Ok(image), true) => image_presence(image).await == Presence::Present,
-        _ => false,
+    let presence = match (&image, docker) {
+        (Ok(image), true) => Some(image_presence(image).await),
+        _ => None,
+    };
+    // A present image whose engine ignores resource limits is still
+    // present; the limits get their own line below.
+    let present = matches!(presence, Some(Presence::Present | Presence::LimitsUnenforced(_)));
+    let limits = match presence {
+        Some(Presence::LimitsUnenforced(verdict)) => Some(verdict),
+        _ => None,
     };
     let users = computer_use_agents(home).await;
     let native_users = native_mode_agents(home).await;
@@ -379,7 +410,19 @@ pub async fn check(home: &Path) -> (Level, String) {
         text.push_str("\n         ");
         text.push_str(&line);
     }
-    (level, text)
+    with_limits_line((level, text), limits, !users.is_empty())
+}
+
+/// Append the resource-limit self-check line when it failed: a warning when
+/// someone has computer use on, informational otherwise.
+pub fn with_limits_line(
+    (level, text): (Level, String),
+    limits: Option<duduclaw_core::container_engine::LimitVerdict>,
+    anyone_enabled: bool,
+) -> (Level, String) {
+    let Some(verdict) = limits else { return (level, text) };
+    let text = format!("{text}\n         {}", verdict.reason_zh());
+    (if anyone_enabled { Level::Warn } else { level }, text)
 }
 
 #[cfg(test)]
@@ -465,6 +508,14 @@ mod tests {
         assert_eq!(presence_error("x:y", Presence::Missing), Some(missing_message("x:y")));
         assert_eq!(presence_error("x:y", Presence::Unknown), Some(unchecked_message("x:y")));
         assert_eq!(presence_error("x:y", Presence::Present), None);
+        use duduclaw_core::container_engine::LimitVerdict;
+        let m = presence_error("x:y", Presence::LimitsUnenforced(LimitVerdict::Ignored)).unwrap();
+        assert!(m.starts_with("電腦操作無法啟動") && m.contains("rootless"), "{m}");
+        assert!(missing_message("x:y").contains("CONTAINER_HOST"), "the DuDuClaw OS pull hint");
+        let (level, text) = with_limits_line((Level::Pass, "ok".into()), Some(LimitVerdict::ProbeFailed), true);
+        assert_eq!(level, Level::Warn);
+        assert!(text.contains("rootless"), "{text}");
+        assert_eq!(with_limits_line((Level::Pass, "ok".into()), None, true), (Level::Pass, "ok".into()));
     }
 
     #[tokio::test]

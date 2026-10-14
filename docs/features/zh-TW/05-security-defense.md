@@ -206,6 +206,8 @@ action_rules = [
 
 **權限旗標（v1.68.0）** — `agent.toml [permissions]` 的 `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 寫成 `false` 時，MCP 分派閘會拒絕對應工具（稽核 `permission_denied`）。升級後第一次開機會把舊範本的 `false` 改成 `true`，見[儀表板設定對照](../../guides/zh-TW/dashboard-settings.md#ai-員工編輯頁)。
 
+**Rootless 容器引擎（尚未發版）** — DuDuClaw OS 正把閘道改成非 root 執行、容器改用 rootless Podman，閘道經 `DOCKER_HOST`／`CONTAINER_HOST` 連線。平台這邊配合兩件事：會清空環境變數的容器用戶端（任務沙箱、Discovery 嘗試與評分、清理）在閘道有設這兩個變數時只多帶這兩個，它們不在 AI CLI 的允許清單裡。容器引擎回報 rootless 時，任務沙箱、腳本沙箱與電腦操作要先跑一個 32 MiB 記憶體、32 個行程上限的臨時容器，讀回它自己的 `memory.max` 與 `pids.max`；讀到 `max`（cgroup 控制器沒有委派時，引擎接受上限卻不套用）、讀到跟要求不同的值，或檢查沒跑完，這些功能就停用並說明原因（任務沙箱的代碼是 `resource_limits_unenforced`），不會在沒有上限的情況下執行。一般（rootful）Docker 不做這個檢查。結果在行程存活期間沿用，檢查失敗則一分鐘後重試。
+
 ---
 
 ## 這些守衛擋不住什麼

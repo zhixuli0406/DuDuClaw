@@ -374,7 +374,17 @@ fn evaluator_template_ships_with_the_sandbox_off() {
 
 #[test]
 fn doctor_verdicts() {
-    use super::doctor::{Level, verdict};
+    use super::doctor::{Level, verdict, with_limits_line};
+    {
+        use duduclaw_core::container_engine::LimitVerdict;
+        let base = (Level::Pass, "ok".to_string());
+        assert_eq!(with_limits_line(base.clone(), None, true), base);
+        let (level, text) = with_limits_line(base.clone(), Some(LimitVerdict::Ignored), true);
+        assert_eq!(level, Level::Warn);
+        assert!(text.contains("rootless"), "{text}");
+        let (level, _) = with_limits_line(base, Some(LimitVerdict::Ignored), false);
+        assert_eq!(level, Level::Pass, "informational when nobody uses the sandbox");
+    }
     let s = SandboxSettings::default();
     let (level, text) = verdict(&[], Ok(&s), false, false);
     assert_eq!(level, Level::Pass, "{text}");

@@ -206,11 +206,11 @@ impl SweepClient {
         let environment = vec![("PATH".into(), "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin".into())];
         let default = Self { program: program.clone(), environment: environment.clone() };
         let mut operator = Self { program, environment };
-        for key in ["HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"] {
+        for key in ["HOME", "DOCKER_HOST", "CONTAINER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"] {
             if let Some(value) = std::env::var_os(key) { operator.environment.push((key.into(), value)); }
         }
-        // Evaluators intentionally use the default daemon; policy/attempt
-        // launchers can use the operator's trusted Docker context.
+        // The default daemon and the operator's endpoint (evaluators, policy
+        // and attempt launchers follow DOCKER_HOST / CONTAINER_HOST when set).
         Ok(if operator == default { vec![default] } else { vec![default, operator] })
     }
     fn output(&self, args: &[&str], lease: &OperatorLeaseGuard,

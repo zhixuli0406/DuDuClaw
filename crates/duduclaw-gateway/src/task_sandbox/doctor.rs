@@ -48,7 +48,10 @@ pub fn verdict(
             lines.push(format!("沙箱 image 已在本機：{image}"));
         } else {
             problem = true;
-            lines.push(format!("沙箱 image 不在本機，請執行 `docker pull {image}`（不會自動下載）"));
+            lines.push(format!(
+                "沙箱 image 不在本機，請執行 `docker pull {image}`（不會自動下載；{}）",
+                duduclaw_core::sandbox_image::OS_PULL_HINT_ZH
+            ));
         }
     }
     if sandboxed.is_empty() {
@@ -71,6 +74,19 @@ pub fn verdict(
         lines.push("沙箱不能用時任務會失敗（不會改成不隔離執行）".to_string());
     }
     (if problem { Level::Warn } else { Level::Pass }, lines.join("\n         "))
+}
+
+/// Append the resource-limit self-check line (`container::resource_limits`)
+/// when it failed. A warning only when someone uses the sandbox; otherwise
+/// informational, like the other prerequisites.
+pub fn with_limits_line(
+    (level, text): (Level, String),
+    limits: Option<duduclaw_core::container_engine::LimitVerdict>,
+    anyone_sandboxed: bool,
+) -> (Level, String) {
+    let Some(verdict) = limits else { return (level, text) };
+    let text = format!("{text}\n         {}", verdict.reason_zh());
+    (if anyone_sandboxed { Level::Warn } else { level }, text)
 }
 
 /// Agents under `<home>/agents` with `[container] sandbox_enabled = true`.
@@ -97,6 +113,11 @@ pub async fn check(home: &Path) -> (Level, String) {
         (Ok(s), true) => super::container::image_present(&s.image).await,
         _ => false,
     };
+    let limits = match (&settings, image) {
+        (Ok(s), true) => super::container::resource_limits(&s.image).await.err(),
+        _ => None,
+    };
     let agents = sandboxed_agents(home).await;
-    verdict(&agents, settings.as_ref().map_err(String::as_str), docker, image)
+    let anyone = !agents.is_empty();
+    with_limits_line(verdict(&agents, settings.as_ref().map_err(String::as_str), docker, image), limits, anyone)
 }

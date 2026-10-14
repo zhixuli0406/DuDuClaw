@@ -206,6 +206,8 @@ Since the 2026-10-08 close-out three more human-approval paths are bound the sam
 
 **Permission flags (v1.68.0)** — `agent.toml [permissions]` `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` are enforced at the MCP dispatch gate when written as `false` (refusal audited as `permission_denied`). A one-time boot migration turns old template `false` values into `true`; see [dashboard-settings.md](../guides/dashboard-settings.md#employee-edit-page).
 
+**Rootless container engines (Unreleased)** — DuDuClaw OS is moving the gateway off root and its containers to rootless Podman, reached through `DOCKER_HOST` / `CONTAINER_HOST`. Two platform pieces make that safe. Container clients that run with a cleared environment (task sandbox, Discovery attempts and scoring, cleanup) now carry exactly those two names from the gateway's environment when they are set; they are not on the AI CLI allowlist. Before the task sandbox, the script sandbox or computer use counts as available on a rootless engine (its `info` says `rootless`), a throw-away container with a 32 MiB memory and 32-process limit reads its own `memory.max` and `pids.max`; if they read `max` (an engine with undelegated cgroup controllers accepts the limit and silently ignores it) or anything other than the requested limit, or the check does not finish, those features are unavailable with a reason (task sandbox code `resource_limits_unenforced`) instead of running without ceilings. Rootful Docker is never probed. The result is kept for the life of the process; a failed check is retried after a minute.
+
 ---
 
 ## What these guards do not cover

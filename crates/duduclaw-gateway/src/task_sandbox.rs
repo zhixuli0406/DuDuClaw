@@ -71,6 +71,9 @@ pub enum Unavailable {
     UnsupportedPlatform,
     DockerUnreachable,
     ImageMissing(String),
+    /// The engine runs rootless and does not enforce the container's memory /
+    /// pids limits (`container::resource_limits`): fail closed.
+    ResourceLimits(duduclaw_core::container_engine::LimitVerdict),
     NoAccount { runtime: &'static str, accepted: String },
 }
 
@@ -84,6 +87,7 @@ impl Unavailable {
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::DockerUnreachable => "docker_unreachable",
             Self::ImageMissing(_) => "image_missing",
+            Self::ResourceLimits(_) => "resource_limits_unenforced",
             Self::NoAccount { .. } => "no_account",
         }
     }
@@ -101,8 +105,12 @@ impl Unavailable {
             Self::UnsupportedPlatform => "the task sandbox needs a unix host with Docker".into(),
             Self::DockerUnreachable => "Docker is not reachable (is the Docker daemon running?)".into(),
             Self::ImageMissing(image) => {
-                format!("the sandbox image is not on this machine; run `docker pull {image}` (it is never pulled automatically)")
+                format!(
+                    "the sandbox image is not on this machine; run `docker pull {image}` (it is never pulled automatically; {})",
+                    duduclaw_core::sandbox_image::OS_PULL_HINT_EN
+                )
             }
+            Self::ResourceLimits(verdict) => verdict.reason_en().to_string(),
             Self::NoAccount { runtime, accepted } => {
                 format!("no account can run `{runtime}` inside the sandbox; it needs {accepted}")
             }
@@ -560,6 +568,9 @@ pub async fn run(
     }
     if !container::image_present(&settings.image).await {
         return Err(unavailable(Unavailable::ImageMissing(settings.image.clone())));
+    }
+    if let Err(verdict) = container::resource_limits(&settings.image).await {
+        return Err(unavailable(Unavailable::ResourceLimits(verdict)));
     }
     let (provider, base_url, model) = if family == RuntimeFamily::OpenAiCompat {
         let (provider, base, wire) = openai_compat_target(&spec.model).map_err(unavailable)?;

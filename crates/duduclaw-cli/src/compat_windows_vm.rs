@@ -751,13 +751,72 @@ pub fn build_xfreerdp_remoteapp_args(
 
 // ── CLI commands ─────────────────────────────────────────────────────────
 
+// ── compose client (Docker or Podman) ───────────────────────────────────
+
+/// The compose front end the Windows VM is driven through. A closed set:
+/// `docker compose` (Docker's plugin, or Podman's `docker` shim which
+/// forwards to `podman compose`) and `podman compose` (DuDuClaw OS ships
+/// rootless Podman; the shim may be absent). Every argv element is a
+/// literal; only the compose file path is passed as a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeClient {
+    Docker,
+    Podman,
+}
+
+impl ComposeClient {
+    /// The program to spawn.
+    pub fn program(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
+    /// How the command reads in messages (`docker compose` / `podman compose`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Docker => "docker compose",
+            Self::Podman => "podman compose",
+        }
+    }
+}
+
+/// Prefer `docker` (Docker, or Podman's docker shim), else `podman`. `None`
+/// when neither is on `PATH`.
+pub fn pick_compose_client(tool_on_path: impl Fn(&str) -> bool) -> Option<ComposeClient> {
+    if tool_on_path("docker") {
+        Some(ComposeClient::Docker)
+    } else if tool_on_path("podman") {
+        Some(ComposeClient::Podman)
+    } else {
+        None
+    }
+}
+
+/// The argv after the program: `compose -f <file> <action...>`.
+pub fn compose_args(compose_file: &Path, action: &[&'static str]) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec!["compose".into(), "-f".into(), compose_file.into()];
+    args.extend(action.iter().map(std::ffi::OsString::from));
+    args
+}
+
+/// Error text when no compose client is installed.
+pub const NO_COMPOSE_CLIENT: &str =
+    "找不到 docker 或 podman（需要含 compose 的 Docker，或 Podman 的 podman compose）；見 `duduclaw compat list`";
+
+fn compose_client() -> Result<ComposeClient> {
+    pick_compose_client(duduclaw_core::compat_runners::tool_on_path)
+        .ok_or_else(|| DuDuClawError::Container(NO_COMPOSE_CLIENT.to_string()))
+}
+
 /// `duduclaw compat windows-vm setup [--yes] [--ram <GB>] [--disk <GB>]
 /// [--version 11]`.
 ///
 /// Flow (design §2.3 / TODO B3, in order — see this function's inline
 /// section markers): ① host RAM advisory (never blocks) → ② KVM
 /// fail-closed (hard refuse) → ③ license disclosure + confirmation → ④
-/// compose.yaml generation → ⑤ `docker compose up -d` → ⑥ status +
+/// compose.yaml generation → ⑤ `docker compose up -d` (or `podman compose`) → ⑥ status +
 /// next-steps summary.
 pub async fn cmd_compat_windows_vm_setup(
     auto_yes: bool,
@@ -844,21 +903,21 @@ pub async fn cmd_compat_windows_vm_setup(
     println!(
         "啟動容器中……（首次啟動會由容器自行下載 Windows 安裝映像，依網路與版本可能需要相當長時間）"
     );
-    let output = tokio::process::Command::new("docker")
-        .arg("compose")
-        .arg("-f")
-        .arg(&compose_file)
-        .arg("up")
-        .arg("-d")
+    let client = compose_client()?;
+    let label = client.label();
+    let output = tokio::process::Command::new(client.program())
+        .args(compose_args(&compose_file, &["up", "-d"]))
         .output()
         .await
         .map_err(|e| {
-            DuDuClawError::Container(format!("執行 `docker compose up -d` 失敗：{e}（docker 是否已安裝？見 `duduclaw compat list`）"))
+            DuDuClawError::Container(format!(
+                "執行 `{label} up -d` 失敗：{e}（需要 Docker 或 Podman 的 compose；見 `duduclaw compat list`）"
+            ))
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(DuDuClawError::Container(format!(
-            "`docker compose up -d` 結束碼非零（{}）：\n{}",
+            "`{label} up -d` 結束碼非零（{}）：\n{}",
             output.status,
             stderr.trim()
         )));
@@ -891,18 +950,17 @@ pub async fn cmd_compat_windows_vm_status() -> Result<()> {
         return Ok(());
     }
 
-    let output = tokio::process::Command::new("docker")
-        .arg("compose")
-        .arg("-f")
-        .arg(&compose_file)
-        .arg("ps")
+    let client = compose_client()?;
+    let label = client.label();
+    let output = tokio::process::Command::new(client.program())
+        .args(compose_args(&compose_file, &["ps"]))
         .output()
         .await
-        .map_err(|e| DuDuClawError::Container(format!("執行 `docker compose ps` 失敗：{e}")))?;
+        .map_err(|e| DuDuClawError::Container(format!("執行 `{label} ps` 失敗：{e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(DuDuClawError::Container(format!(
-            "`docker compose ps` 結束碼非零（{}）：\n{}",
+            "`{label} ps` 結束碼非零（{}）：\n{}",
             output.status,
             stderr.trim()
         )));
@@ -913,7 +971,7 @@ pub async fn cmd_compat_windows_vm_status() -> Result<()> {
         println!(
             "compose 設定存在（{}），但目前沒有執行中的容器。\n\
              執行 `duduclaw compat windows-vm setup` 重新啟動，或手動執行：\n  \
-             docker compose -f {} up -d",
+             {label} -f {} up -d",
             compose_file.display(),
             compose_file.display()
         );
@@ -1584,6 +1642,24 @@ mod tests {
             resolve_xfreerdp_binary_with(|tool| tool == "xfreerdp3"),
             "xfreerdp3"
         );
+    }
+
+    #[test]
+    fn compose_client_accepts_docker_or_podman() {
+        assert_eq!(pick_compose_client(|t| t == "docker" || t == "podman"), Some(ComposeClient::Docker));
+        assert_eq!(pick_compose_client(|t| t == "podman"), Some(ComposeClient::Podman));
+        assert_eq!(pick_compose_client(|_| false), None);
+        assert_eq!(ComposeClient::Podman.program(), "podman");
+        assert_eq!(ComposeClient::Podman.label(), "podman compose");
+        assert_eq!(ComposeClient::Docker.label(), "docker compose");
+        assert!(NO_COMPOSE_CLIENT.contains("podman"));
+    }
+
+    #[test]
+    fn compose_argv_is_literal_around_the_file() {
+        let args = compose_args(Path::new("/data/duduclaw/windows-vm/compose.yaml"), &["up", "-d"]);
+        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["compose", "-f", "/data/duduclaw/windows-vm/compose.yaml", "up", "-d"]);
     }
 
     #[test]

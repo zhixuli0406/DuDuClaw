@@ -12,6 +12,7 @@ pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod gateway_instance;
 pub mod config;
+pub mod container_engine;
 pub mod cron_tz;
 // H10 (2026-09 feature audit): the RFC-23 §14.4 data-file guard's decision
 // half, shared by `duduclaw hook data-file-guard` and the gateway installer.

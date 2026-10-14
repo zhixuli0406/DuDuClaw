@@ -206,6 +206,8 @@ action_rules = [
 
 **権限フラグ（v1.68.0）** — `agent.toml [permissions]` の `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` が `false` と書かれていると、MCP のディスパッチゲートで対応するツールが拒否されます（`permission_denied` として監査）。アップグレード後の最初の起動で古いテンプレートの `false` を `true` に移行します。[ダッシュボード設定の対応表](../../guides/ja-JP/dashboard-settings.md#ai-社員の編集ページ)を参照してください。
 
+**rootless コンテナエンジン（未リリース）** — DuDuClaw OS ではゲートウェイを root 以外で動かし、コンテナを rootless Podman に移す作業を進めています。ゲートウェイは `DOCKER_HOST`／`CONTAINER_HOST` で接続します。プラットフォーム側の対応は次のとおりです。環境変数を空にして起動するコンテナクライアント（タスクサンドボックス、Discovery の試行と採点、後片付け）は、ゲートウェイにこの 2 つが設定されているときだけ、その 2 つを引き継ぎます。AI CLI の許可リストには入れません。エンジンが rootless と報告した場合、タスクサンドボックス、スクリプトサンドボックス、コンピュータ操作は、メモリ 32 MiB・プロセス 32 個の上限を付けた使い捨てコンテナで自身の `memory.max` と `pids.max` を読み、`max`（cgroup コントローラが委譲されていないと、エンジンは上限を受け付けたうえで黙って無視します）や要求と異なる値が返った場合、または確認が終わらなかった場合は、上限なしで動かさずに理由付きで利用不可になります（タスクサンドボックスのコードは `resource_limits_unenforced`）。通常の（rootful）Docker では確認しません。結果はプロセスが動いている間使い回し、確認に失敗した場合は 1 分後に再試行します。
+
 ---
 
 ## これらのガードがカバーしないもの
