@@ -20,15 +20,25 @@
 //!   (power, update status/apply, boot assessment, rollback, factory
 //!   reset). SSH, network, hostname, timezone, local-model and Wi-Fi-only
 //!   verbs are refused even with a valid signature;
+//!
+//! None of these checks stops a same-uid agent that forges the signature
+//! (see "Known limit"), so the allowlist holds only verbs that cannot hand
+//! back root on their own: `update_rollback` stays only because sysd itself
+//! refuses a target older than `--min-rollback-version` whatever the caller;
+//! `sysupdate_apply` installs only the newest signed version; and
+//! `clear_exhausted_update_target` only deletes an exhausted, non-running
+//! entry. The rest cost availability or data (reboot, power off, factory
+//! reset), not privilege.
 //! - the host is an appliance with a sysd socket.
 //!
 //! The `mcp-server` side keeps every gate it has (scopes, `[permissions]`,
 //! confirmation, the factory-reset approval) and only then forwards.
 //!
 //! Known limit (the identity model's own): a process of the gateway's OS
-//! user that can read `identity.key` and the internal key can sign requests
-//! here too. The route narrows what such a process can ask for to the verbs
-//! above; it does not replace keeping AI employees away from those files.
+//! user, which on DuDuClaw OS includes an AI employee with a shell, can read
+//! `identity.key` and the internal key and sign requests here too. The route
+//! narrows what such a process can ask for to the verbs above; protection
+//! against regaining root is sysd's rollback floor, not this route.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

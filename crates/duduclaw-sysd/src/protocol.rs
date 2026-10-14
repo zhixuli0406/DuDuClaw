@@ -117,8 +117,27 @@
 //! agents) still ran as root; [`SysdRequest::SshServiceStart`] opens a
 //! network service. The others (reboot, power off, update apply, factory
 //! reset, clearing Wi-Fi, stopping the model service) cost availability or
-//! data, not privilege. This is why the main-pid gate above matters: without
-//! it, gateway-side approvals for these verbs can be bypassed by any agent.
+//! data, not privilege. The main-pid gate above keeps an agent from calling
+//! sysd directly, but it does not make the agent harmless: an AI employee
+//! with a shell runs as the gateway's uid, can read the gateway's keys and
+//! so forge any request the gateway makes (its signed internal routes, a
+//! dashboard session). The non-root gateway keeps such an agent from root,
+//! not from the gateway's own powers; the rule that real containment means
+//! not granting Bash, or using the task sandbox, still applies.
+//!
+//! Therefore the guard against a root-regaining rollback does not look at
+//! the caller at all: `--min-rollback-version` (`rollback_floor.rs`) makes
+//! `UpdateRollback` refuse when any entry it could boot is older than the
+//! first release with an unprivileged gateway, or its version cannot be read
+//! from the entry's own unified kernel image. The other verbs that touch
+//! boot entries cannot select an older image: `SysupdateApply` installs only
+//! what `systemd-sysupdate` resolves as the newest signed version from the
+//! image's read-only transfer definitions, and `ClearExhaustedUpdateTarget`
+//! only deletes an exhausted, non-running entry. Residual, outside sysd:
+//! sd-boot's own boot counting falls back to the other entry when a new one
+//! fails to start three times before it is blessed, and boots an exhausted
+//! entry when nothing else works; the OS should delete entries below the
+//! floor once a rootless release has booted successfully.
 
 use serde::{Deserialize, Serialize};
 

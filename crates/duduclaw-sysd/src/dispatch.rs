@@ -1106,7 +1106,7 @@ async fn dispatch_update_rollback() -> DispatchResult {
     // happily "roll back" — marking a bad entry bad again and spending a
     // reboot to end up exactly where it started. Refusing is the honest
     // answer, and it is the T7 case.
-    let (_dir, entries) = read_esp_entries().await?;
+    let (dir, entries) = read_esp_entries().await?;
     match running_entry_name() {
         Some(running) => {
             check_rollback_target(&entries, &running).map_err(SysdError::unsupported)?
@@ -1121,6 +1121,21 @@ async fn dispatch_update_rollback() -> DispatchResult {
             ));
         }
         None => {}
+    }
+
+    // Rollback floor (`--min-rollback-version`): every entry this could end
+    // up booting must carry a known version at or above the floor, read from
+    // the UKI itself (`rollback_floor`). Checked before any tier marks or
+    // renames anything, so a refusal leaves the ESP untouched.
+    let floor = crate::rollback_floor::floor();
+    if *floor != crate::rollback_floor::RollbackFloor::Off {
+        let running = running_entry_name();
+        let versions: Vec<(&str, Result<crate::rollback_floor::OsVersion, String>)> =
+            crate::rollback_floor::rollback_candidates(&entries, running.as_deref())
+                .into_iter()
+                .map(|name| (name.as_str(), crate::rollback_floor::entry_version(&dir, name)))
+                .collect();
+        crate::rollback_floor::check_floor(floor, &versions).map_err(SysdError::unsupported)?;
     }
 
     let note = match state {

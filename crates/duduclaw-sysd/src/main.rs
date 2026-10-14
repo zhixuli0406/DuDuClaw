@@ -47,6 +47,15 @@ struct Cli {
     /// OS images). Relies on yama `ptrace_scope >= 1`; see `protocol.rs`.
     #[arg(long, value_name = "UNIT")]
     require_main_pid_of: Option<String>,
+
+    /// Refuse `update_rollback` when any entry it could boot is older than
+    /// this OS version (or its version cannot be read from the entry's
+    /// unified kernel image). The OS sets it to its first release whose
+    /// gateway runs unprivileged, so a rollback can never bring back a
+    /// root-running gateway. A value that does not parse refuses every
+    /// rollback. Absent ⇒ unchanged (older OS images).
+    #[arg(long, value_name = "VERSION")]
+    min_rollback_version: Option<String>,
 }
 
 #[tokio::main]
@@ -78,6 +87,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let require_main_pid_of = cli.require_main_pid_of;
+    #[cfg(unix)]
+    {
+        let floor = duduclaw_sysd::rollback_floor::RollbackFloor::from_flag(cli.min_rollback_version.as_deref());
+        if let duduclaw_sysd::rollback_floor::RollbackFloor::Invalid(raw) = &floor {
+            warn!(value = %raw, "sysd: --min-rollback-version is not a version; every rollback will be refused");
+        }
+        info!(floor = ?floor, "sysd: rollback floor");
+        duduclaw_sysd::rollback_floor::set_floor(floor);
+    }
     info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, require_main_pid_of = ?require_main_pid_of, "sysd: starting");
     let listener = bind(&socket_path, allowed_uid)?;
     info!(socket = %socket_path.display(), "sysd: listening");
