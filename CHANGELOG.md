@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Security
+- rustls 從 0.23.45 升到 0.23.46（主程式與桌面版），修正 2026-10-14 公布的四則公告：用戶端 session 值的 `Debug` 輸出會帶出 TLS 秘密（RUSTSEC-2026-0346，medium）、ECH 被拒後緩衝資料送往外層伺服器（RUSTSEC-2026-0347）、Brotli 憑證解壓在驗證前最多配置 1 GiB（RUSTSEC-2026-0348）、未驗證的 ServerHello 可讓之後的連線降級為傳統金鑰交換（RUSTSEC-2026-0349）；後三則為 low。v1.73.2 以前的版本都含 0.23.45。
+
 ## [1.73.2] - 2026-10-14 — OS v0.3.0 公開文件更正
 
 ### Changed
