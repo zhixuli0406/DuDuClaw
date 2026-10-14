@@ -118,27 +118,39 @@ pub const MAX_HOSTNAME_LEN: usize = 253;
 /// zoneinfo whitelist check in `dispatch.rs` even runs.
 pub const MAX_TIMEZONE_LEN: usize = 64;
 
-/// An SSH server unit the maintenance-mode verbs may act on, with the unit
-/// pattern of its per-connection sessions (if it has any).
+/// An SSH server unit the maintenance-mode verbs may act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SshUnit {
     pub unit: &'static str,
+    /// Unit pattern of its per-connection sessions, if it has any.
     pub sessions: Option<&'static str>,
+    /// cgroup v2 directory holding every session process. Closing kills
+    /// everything under it and then checks it is empty, because upstream
+    /// `dropbear@.service` sets `KillMode=process`: stopping a session unit
+    /// ends only the dropbear process, and a shell's background jobs, `nohup`
+    /// or tmux stay behind in that cgroup.
+    pub session_cgroup: Option<&'static str>,
 }
 
-/// SSH server units in preference order; the first one systemd reports as
-/// `LoadState=loaded` is the one the verbs start and stop. A closed list of
-/// literals, so a caller can never name an arbitrary unit.
+/// SSH server units in preference order. Opening starts the first one
+/// systemd reports as loaded; closing handles every loaded one. A closed
+/// list of literals, so a caller can never name an arbitrary unit.
 ///
 /// The Yocto line ships dropbear socket-activated (`dropbear.socket`,
-/// `Accept=yes`, one `dropbear@<n>.service` per connection — openembedded-core
-/// `meta/recipes-core/dropbear` at the commit `kas/duduclaw-os.yml` pins).
-/// The frozen Debian line ships OpenSSH as `ssh.service`. Until 2026-10 the
-/// verbs only knew `ssh.service`, which no Yocto image has, so the dashboard's
-/// maintenance SSH switch could never start anything there.
+/// `Accept=yes`, one `dropbear@<n>.service` per connection, all under
+/// `system-dropbear.slice` — openembedded-core `meta/recipes-core/dropbear`
+/// at the commit `kas/duduclaw-os.yml` pins). The frozen Debian line ships
+/// OpenSSH as `ssh.service`, whose sessions live in logind session scopes
+/// and are not tracked here. Until 2026-10 the verbs only knew `ssh.service`,
+/// which no Yocto image has, so the dashboard's maintenance SSH switch could
+/// never start anything there.
 pub const SSH_UNITS: [SshUnit; 2] = [
-    SshUnit { unit: "dropbear.socket", sessions: Some("dropbear@*.service") },
-    SshUnit { unit: "ssh.service", sessions: None },
+    SshUnit {
+        unit: "dropbear.socket",
+        sessions: Some("dropbear@*.service"),
+        session_cgroup: Some("/sys/fs/cgroup/system.slice/system-dropbear.slice"),
+    },
+    SshUnit { unit: "ssh.service", sessions: None, session_cgroup: None },
 ];
 
 /// TCP port the SSH units listen on; the verbs open and close exactly this

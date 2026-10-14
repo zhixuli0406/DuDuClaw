@@ -149,10 +149,15 @@ gateway, not by the desktop.
   have, and it never added a firewall rule. Platform v1.73.3 fixes this:
   `duduclaw-sysd` now starts `dropbear.socket` and adds port 22 to the
   firewall's maintenance port set, and when the window closes it stops
-  dropbear, ends open sessions and removes the port. OS images pick this
-  up from the next OS release (embedding platform v1.73.3 or later, with
-  dropbear off by default and the firewall in the base edition too), which
-  has not shipped yet.
+  dropbear, ends every session process and removes the port. OS images
+  pick this up from the next OS release (embedding platform v1.73.3 or
+  later, with dropbear off by default and the firewall in the base edition
+  too), which has not shipped yet. On images up to v0.3.0, the desktop
+  edition's firewall has no such set, so opening is refused; the base
+  edition has no firewall, so closing stops the dropbear that was already
+  running, and it starts again on the next boot. Also, no account on the
+  current images can log in over SSH (root is locked and dropbear refuses
+  root logins), so for now the switch only controls the port.
 - **The webhook relay never sees your channel secrets.** For webhook-style
   channels that need it, the relay's job is limited to forwarding an
   incoming request's raw bytes to the box over a connection the box opened

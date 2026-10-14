@@ -15,7 +15,7 @@ use std::path::Path;
 use tokio::process::Command;
 
 use crate::protocol::{
-    MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT, SSH_UNITS, SshUnit, SysdError, SysdOpOutput,
+    MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT, SSH_UNITS, SysdError, SysdOpOutput,
     SysdRequest,
 };
 
@@ -1246,56 +1246,123 @@ async fn dispatch_clear_exhausted_update_target(version: &str) -> DispatchResult
 /// The OS firewall's nftables table and the named set its input chain
 /// accepts TCP ports from (`tcp dport @maintenance_tcp_ports accept`,
 /// DuDuClaw-OS `meta-duduclaw/recipes-duduclaw/duduclaw-firewall/files/
-/// nftables.conf`, from OS v0.3.1). The set starts empty, so nothing extra
+/// nftables.conf`, added 2026-10). The set starts empty, so nothing extra
 /// is reachable until maintenance mode adds a port.
 const FIREWALL_FAMILY: &str = "inet";
 const FIREWALL_TABLE: &str = "filter";
 const MAINTENANCE_PORT_SET: &str = "maintenance_tcp_ports";
+/// The firewall's config file. When it exists the image is meant to filter,
+/// so a missing table means the firewall failed to load, not that there is
+/// no firewall.
+const FIREWALL_CONFIG: &str = "/etc/nftables.conf";
 
-/// First unit in [`SSH_UNITS`] that systemd has loaded, or `None` when the
-/// image has no SSH server at all.
-async fn resolve_ssh_unit() -> Option<SshUnit> {
-    for candidate in SSH_UNITS {
-        let mut cmd = Command::new("systemctl");
-        cmd.args(["show", "--property=LoadState", "--value", candidate.unit]);
-        let Ok(out) = cmd.output().await else { return None };
-        if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "loaded" {
-            return Some(candidate);
-        }
-    }
-    None
+/// What systemd says about a unit. Anything other than a clear answer is
+/// `Unknown`, which callers must not read as "not installed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnitLoad {
+    Loaded,
+    NotFound,
+    Unknown(String),
 }
 
-/// Whether the image runs the DuDuClaw firewall table at all. An image
-/// without it (or without `nft`) filters nothing, so the SSH port is
-/// reachable as soon as the unit listens and there is no rule to manage.
-async fn firewall_present() -> bool {
+fn parse_load_state(success: bool, stdout: &str, stderr: &str) -> UnitLoad {
+    if !success {
+        return UnitLoad::Unknown(format!("systemctl show failed: {}", stderr.trim()));
+    }
+    match stdout.trim() {
+        // A masked unit can still be running; stopping it must be attempted.
+        "loaded" | "masked" => UnitLoad::Loaded,
+        "not-found" => UnitLoad::NotFound,
+        other => UnitLoad::Unknown(format!("unexpected LoadState {other:?}")),
+    }
+}
+
+async fn unit_load_state(unit: &str) -> UnitLoad {
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["show", "--property=LoadState", "--value", unit]);
+    match cmd.output().await {
+        Ok(out) => parse_load_state(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Err(e) => UnitLoad::Unknown(format!("failed to spawn systemctl: {e}")),
+    }
+}
+
+/// Firewall presence. `Unknown` blocks opening and is reported on close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Firewall {
+    Absent,
+    Present,
+    Unknown(String),
+}
+
+/// `table_found`: `Some(true)` table listed, `Some(false)` nft said it does
+/// not exist, `None` nft is not installed. `other_error` carries any other
+/// failure.
+fn classify_firewall(table_found: Option<bool>, other_error: Option<String>, config_exists: bool) -> Firewall {
+    if let Some(e) = other_error {
+        return Firewall::Unknown(e);
+    }
+    match (table_found, config_exists) {
+        (Some(true), _) => Firewall::Present,
+        (Some(false), false) | (None, false) => Firewall::Absent,
+        (Some(false), true) => Firewall::Unknown(format!(
+            "{FIREWALL_CONFIG} exists but table {FIREWALL_FAMILY} {FIREWALL_TABLE} is not loaded (did nftables.service fail?)"
+        )),
+        (None, true) => Firewall::Unknown(format!("{FIREWALL_CONFIG} exists but nft is not installed")),
+    }
+}
+
+/// nft reports a missing table, set or element with ENOENT's message.
+fn nft_says_missing(stderr: &str) -> bool {
+    stderr.contains("No such file or directory")
+}
+
+async fn firewall_state() -> Firewall {
+    let config_exists = Path::new(FIREWALL_CONFIG).exists();
     let mut cmd = Command::new("nft");
     cmd.args(["list", "table", FIREWALL_FAMILY, FIREWALL_TABLE]);
-    matches!(cmd.output().await, Ok(out) if out.status.success())
+    match cmd.output().await {
+        Ok(out) if out.status.success() => classify_firewall(Some(true), None, config_exists),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if nft_says_missing(&stderr) {
+                classify_firewall(Some(false), None, config_exists)
+            } else {
+                classify_firewall(None, Some(format!("nft list table failed: {}", stderr.trim())), config_exists)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => classify_firewall(None, None, config_exists),
+        Err(e) => classify_firewall(None, Some(format!("failed to spawn nft: {e}")), config_exists),
+    }
 }
 
 fn ssh_port_element() -> String {
     format!("{{ {SSH_PORT} }}")
 }
 
-async fn firewall_set_element(verb: &str) -> std::io::Result<std::process::Output> {
+async fn firewall_set_element(verb: &str) -> Result<(), String> {
     let mut cmd = Command::new("nft");
     cmd.args([verb, "element", FIREWALL_FAMILY, FIREWALL_TABLE, MAINTENANCE_PORT_SET])
         .arg(ssh_port_element());
-    cmd.output().await
+    match cmd.output().await {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(e) => Err(format!("failed to spawn nft: {e}")),
+    }
 }
 
-/// `Some(true)` when the maintenance set currently holds [`SSH_PORT`],
-/// `Some(false)` when it does not or the set does not exist, `None` when the
-/// answer could not be read.
+/// `Some(true)` when the maintenance set holds [`SSH_PORT`], `Some(false)`
+/// when it does not or the set does not exist, `None` when the answer could
+/// not be read.
 async fn firewall_port_open() -> Option<bool> {
     let mut cmd = Command::new("nft");
     cmd.args(["-j", "list", "set", FIREWALL_FAMILY, FIREWALL_TABLE, MAINTENANCE_PORT_SET]);
     let out = cmd.output().await.ok()?;
     if !out.status.success() {
-        // An image whose firewall predates the set has nothing to close.
-        return Some(false);
+        return nft_says_missing(&String::from_utf8_lossy(&out.stderr)).then_some(false);
     }
     set_json_has_port(&String::from_utf8_lossy(&out.stdout), SSH_PORT)
 }
@@ -1312,75 +1379,122 @@ fn set_json_has_port(raw: &str, port: u16) -> Option<bool> {
     Some(elems.as_array()?.iter().any(|e| e.as_u64() == Some(u64::from(port))))
 }
 
-/// Active session units of `unit`, e.g. `dropbear@3-…service`. `None` when
-/// systemd could not be asked.
-async fn active_ssh_sessions(unit: &SshUnit) -> Option<Vec<String>> {
-    let Some(pattern) = unit.sessions else { return Some(Vec::new()) };
-    let mut cmd = Command::new("systemctl");
-    cmd.args(["list-units", "--state=active", "--no-legend", "--plain", pattern]);
-    let out = cmd.output().await.ok()?;
-    if !out.status.success() {
-        return None;
+/// Number of processes anywhere under a cgroup v2 directory; a directory
+/// that does not exist holds none.
+fn cgroup_process_count(dir: &Path) -> std::io::Result<usize> {
+    let mut count = match std::fs::read_to_string(dir.join("cgroup.procs")) {
+        Ok(procs) => procs.lines().filter(|l| !l.trim().is_empty()).count(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            count += cgroup_process_count(&entry.path())?;
+        }
     }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
-            .collect(),
-    )
+    Ok(count)
+}
+
+/// Kill every session process under `cgroup` and wait until none is left.
+/// `cgroup.kill` (Linux 5.14+) kills the whole subtree atomically.
+async fn end_ssh_sessions(cgroup: &Path) -> Result<(), String> {
+    if !cgroup.is_dir() {
+        return Ok(());
+    }
+    if let Err(e) = std::fs::write(cgroup.join("cgroup.kill"), "1") {
+        return Err(format!("writing {}/cgroup.kill failed: {e}", cgroup.display()));
+    }
+    for _ in 0..20 {
+        match cgroup_process_count(cgroup) {
+            Ok(0) => return Ok(()),
+            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(e) => return Err(format!("reading {} failed: {e}", cgroup.display())),
+        }
+    }
+    match cgroup_process_count(cgroup) {
+        Ok(0) => Ok(()),
+        Ok(n) => Err(format!("{n} SSH session process(es) still running under {}", cgroup.display())),
+        Err(e) => Err(format!("reading {} failed: {e}", cgroup.display())),
+    }
 }
 
 /// Open the firewall port first, then start the unit, so a firewall that
 /// cannot be opened never leaves a listening server the operator cannot
 /// reach. A failed unit start takes the port back out.
 async fn dispatch_ssh_start() -> DispatchResult {
-    let unit = resolve_ssh_unit()
-        .await
-        .ok_or_else(|| SysdError::unsupported("this image has no SSH server unit"))?;
-
-    let firewall = firewall_present().await;
-    if firewall {
-        match firewall_set_element("add").await {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                return Err(SysdError::io(format!(
-                    "could not open tcp/{SSH_PORT} in the firewall (this image's firewall has no \
-                     {MAINTENANCE_PORT_SET} set; DuDuClaw OS 0.3.1 or later is needed): {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
+    let mut chosen = None;
+    for candidate in SSH_UNITS {
+        match unit_load_state(candidate.unit).await {
+            UnitLoad::Loaded => {
+                chosen = Some(candidate);
+                break;
             }
-            Err(e) => return Err(SysdError::io(format!("failed to spawn nft: {e}"))),
+            UnitLoad::NotFound => continue,
+            UnitLoad::Unknown(e) => {
+                return Err(SysdError::io(format!("could not check {}: {e}", candidate.unit)));
+            }
+        }
+    }
+    let unit = chosen.ok_or_else(|| SysdError::unsupported("this image has no SSH server unit"))?;
+
+    let firewall = match firewall_state().await {
+        Firewall::Present => true,
+        Firewall::Absent => false,
+        Firewall::Unknown(e) => return Err(SysdError::io(format!("firewall state unknown, not opening SSH: {e}"))),
+    };
+    if firewall {
+        if let Err(e) = firewall_set_element("add").await {
+            return Err(SysdError::io(format!(
+                "could not open tcp/{SSH_PORT} in the firewall; it has no {MAINTENANCE_PORT_SET} set \
+                 (DuDuClaw OS images built before 2026-10 and the Debian appliance line lack it): {e}"
+            )));
         }
     }
 
     let mut cmd = Command::new("systemctl");
     cmd.args(["start", unit.unit]);
-    let started = run(cmd).await?;
-    if !started.success {
-        if firewall {
-            let _ = firewall_set_element("delete").await;
-        }
-        return Ok(started);
+    let started = run(cmd).await;
+    let failed = !matches!(&started, Ok(out) if out.success);
+    if failed {
+        let rollback = if firewall {
+            match firewall_set_element("delete").await {
+                Ok(()) => String::new(),
+                Err(e) => format!("; closing tcp/{SSH_PORT} again failed: {e}"),
+            }
+        } else {
+            String::new()
+        };
+        return match started {
+            Ok(out) => Ok(SysdOpOutput { stderr: format!("{}{rollback}", out.stderr.trim()), ..out }),
+            Err(e) => Err(SysdError::io(format!("{}{rollback}", e.message))),
+        };
     }
+    let started = started?;
     let firewall_note = if firewall {
         format!("opened tcp/{SSH_PORT} in the firewall")
     } else {
         "no firewall on this image".to_string()
     };
-    Ok(SysdOpOutput {
-        stdout: format!("started {}; {firewall_note}", unit.unit),
-        ..started
-    })
+    Ok(SysdOpOutput { stdout: format!("started {}; {firewall_note}", unit.unit), ..started })
 }
 
-/// Stop the unit, end its sessions, close the firewall port, then check
-/// what is actually left open. Each step runs even if an earlier one failed.
+/// Stop every loaded SSH unit, end its sessions, close the firewall port,
+/// then check what is actually left. Each step runs even if an earlier one
+/// failed; anything unclear counts as a problem, never as "closed".
 async fn dispatch_ssh_stop() -> DispatchResult {
     let mut problems: Vec<String> = Vec::new();
     let mut done: Vec<String> = Vec::new();
 
-    let unit = resolve_ssh_unit().await;
-    if let Some(unit) = &unit {
+    for unit in SSH_UNITS {
+        match unit_load_state(unit.unit).await {
+            UnitLoad::NotFound => continue,
+            UnitLoad::Unknown(e) => {
+                problems.push(format!("could not check {}: {e}", unit.unit));
+                continue;
+            }
+            UnitLoad::Loaded => {}
+        }
         let mut cmd = Command::new("systemctl");
         cmd.args(["stop", unit.unit]);
         match cmd.output().await {
@@ -1392,26 +1506,41 @@ async fn dispatch_ssh_stop() -> DispatchResult {
             )),
             Err(e) => problems.push(format!("failed to spawn systemctl: {e}")),
         }
+        if let Some(cgroup) = unit.session_cgroup {
+            match end_ssh_sessions(Path::new(cgroup)).await {
+                Ok(()) => {}
+                Err(e) => problems.push(e),
+            }
+        }
         if let Some(pattern) = unit.sessions {
+            // Clears the now-empty session units; whether sessions really
+            // ended was judged from the cgroup above.
             let mut cmd = Command::new("systemctl");
             cmd.args(["stop", pattern]);
-            // The outcome is judged by the check below, not by this exit code:
-            // a pattern that matches no session is not a failure.
             let _ = cmd.output().await;
         }
-        match active_ssh_sessions(unit).await {
-            Some(left) if left.is_empty() => {}
-            Some(left) => problems.push(format!("SSH sessions still active: {}", left.join(", "))),
-            None => problems.push("could not list SSH sessions".to_string()),
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["is-active", unit.unit]);
+        match cmd.output().await {
+            Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+                "inactive" | "failed" => {}
+                state => problems.push(format!("{} is still {state:?} after stop", unit.unit)),
+            },
+            Err(e) => problems.push(format!("failed to spawn systemctl: {e}")),
         }
     }
 
-    if firewall_present().await {
-        let _ = firewall_set_element("delete").await;
-        match firewall_port_open().await {
-            Some(false) => done.push(format!("tcp/{SSH_PORT} not open in the firewall")),
-            Some(true) => problems.push(format!("tcp/{SSH_PORT} is still open in the firewall")),
-            None => problems.push("could not read the firewall's maintenance port set".to_string()),
+    match firewall_state().await {
+        Firewall::Absent => {}
+        Firewall::Unknown(e) => problems.push(format!("firewall state unknown: {e}")),
+        Firewall::Present => {
+            // Removing a port that is not there fails; the read below decides.
+            let _ = firewall_set_element("delete").await;
+            match firewall_port_open().await {
+                Some(false) => done.push(format!("tcp/{SSH_PORT} not open in the firewall")),
+                Some(true) => problems.push(format!("tcp/{SSH_PORT} is still open in the firewall")),
+                None => problems.push("could not read the firewall's maintenance port set".to_string()),
+            }
         }
     }
 
@@ -1518,9 +1647,53 @@ mod tests {
     fn ssh_units_prefer_dropbear_and_only_it_has_sessions() {
         assert_eq!(SSH_UNITS[0].unit, "dropbear.socket");
         assert_eq!(SSH_UNITS[0].sessions, Some("dropbear@*.service"));
+        assert_eq!(
+            SSH_UNITS[0].session_cgroup,
+            Some("/sys/fs/cgroup/system.slice/system-dropbear.slice")
+        );
         assert_eq!(SSH_UNITS[1].unit, "ssh.service");
         assert_eq!(SSH_UNITS[1].sessions, None);
         assert_eq!(ssh_port_element(), "{ 22 }");
+    }
+
+    #[test]
+    fn only_a_clear_not_found_means_the_unit_is_absent() {
+        assert_eq!(parse_load_state(true, "loaded\n", ""), UnitLoad::Loaded);
+        assert_eq!(parse_load_state(true, "masked\n", ""), UnitLoad::Loaded);
+        assert_eq!(parse_load_state(true, "not-found\n", ""), UnitLoad::NotFound);
+        // A D-Bus timeout or empty output is not "no SSH server".
+        assert!(matches!(parse_load_state(false, "", "Failed to connect to bus"), UnitLoad::Unknown(_)));
+        assert!(matches!(parse_load_state(true, "", ""), UnitLoad::Unknown(_)));
+        assert!(matches!(parse_load_state(true, "error\n", ""), UnitLoad::Unknown(_)));
+    }
+
+    #[test]
+    fn a_configured_firewall_that_did_not_load_is_unknown_not_absent() {
+        assert_eq!(classify_firewall(Some(true), None, true), Firewall::Present);
+        assert_eq!(classify_firewall(Some(false), None, false), Firewall::Absent);
+        assert_eq!(classify_firewall(None, None, false), Firewall::Absent);
+        assert!(matches!(classify_firewall(Some(false), None, true), Firewall::Unknown(_)));
+        assert!(matches!(classify_firewall(None, None, true), Firewall::Unknown(_)));
+        assert!(matches!(
+            classify_firewall(None, Some("permission denied".into()), false),
+            Firewall::Unknown(_)
+        ));
+        assert!(nft_says_missing("Error: No such file or directory\nlist table inet filter"));
+        assert!(!nft_says_missing("Error: Operation not permitted"));
+    }
+
+    #[test]
+    fn cgroup_process_count_walks_the_whole_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        let slice = root.path().join("system-dropbear.slice");
+        assert_eq!(cgroup_process_count(&slice).unwrap(), 0, "missing cgroup holds nothing");
+        let session = slice.join("dropbear@0-10.0.0.2:22-10.0.0.9:50000.service");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(slice.join("cgroup.procs"), "").unwrap();
+        std::fs::write(session.join("cgroup.procs"), "4242\n4243\n").unwrap();
+        assert_eq!(cgroup_process_count(&slice).unwrap(), 2);
+        std::fs::write(session.join("cgroup.procs"), "").unwrap();
+        assert_eq!(cgroup_process_count(&slice).unwrap(), 0);
     }
 
     #[test]
