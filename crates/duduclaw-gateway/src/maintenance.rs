@@ -36,7 +36,7 @@
 //!   — see [`reassert_closed_on_boot`] and §2.4's "reassert closed" design
 //!   decision. This is the SAME `resume_on_restart=pause` lineage as
 //!   `goal_loop.rs`, but stricter: there is no `auto` option here at all.
-//! - A close action (`systemctl stop ssh.service`) failing never gets
+//! - A close action (stopping the SSH server through `duduclaw-sysd`) failing never gets
 //!   papered over: [`MaintenanceWindow::close_error`] is a distinct column,
 //!   surfaced by `status()` alongside a LIVE observed probe
 //!   ([`ssh_service_observed_active`]) so the dashboard reports what the
@@ -128,7 +128,7 @@ pub struct MaintenanceWindow {
     pub revoke_reason: Option<String>,
     pub reminded_at: Option<String>,
     /// Best-effort record of a close-action failure (`systemctl stop
-    /// ssh.service` erroring) — never blocks the revoke itself (§6 fail-closed
+    /// <ssh unit>` erroring) — never blocks the revoke itself (§6 fail-closed
     /// principle #2 talks about STATUS REPORTING, not about refusing to
     /// record a revoke that a human/TTL sweep already decided on), but keeps
     /// the discrepancy visible to forensics and to `status()`.
@@ -541,32 +541,58 @@ impl MaintenanceAuditLog {
 
 // ── Live observed-state probe (§6 fail-closed principle #2) ─
 
-/// `systemctl is-active ssh.service` — read-only, needs no root (unlike
-/// `start`/`stop`), so this runs directly in the gateway process rather than
-/// crossing the `duduclaw-sysd` socket. `None` on any non-appliance host,
-/// spawn failure, or unrecognized output — callers must treat `None` as "no
-/// live signal available", never coerce it to `false`.
+/// Whether the image's SSH server is up: its unit (the first of
+/// `duduclaw_sysd::SSH_UNITS` systemd has loaded) is active, or it still has
+/// an active session. Read-only and needs no root (unlike `start`/`stop`),
+/// so this runs directly in the gateway process rather than crossing the
+/// `duduclaw-sysd` socket. `None` on any non-appliance host, spawn failure,
+/// or unrecognized output; callers must treat `None` as "no live signal
+/// available", never coerce it to `false`.
 ///
 /// This exists so `maintenance.status()` can answer with what the system
 /// ACTUALLY looks like, not just what the ledger's `revoked_at` column
 /// optimistically claims — the exact fail-closed gap §6 principle #2 calls
 /// out ("狀態回報必須反映實際觀測到的系統狀態，而不是「應該要是什麼狀態」").
+/// Until 2026-10 it only asked about `ssh.service`, which Yocto images do not
+/// have, so it always answered "not running" there.
 pub async fn ssh_service_observed_active() -> Option<bool> {
     if !duduclaw_core::is_appliance() {
         return None;
     }
+    let mut loaded = None;
+    for candidate in duduclaw_sysd::SSH_UNITS {
+        let out = systemctl_stdout(&["show", "--property=LoadState", "--value", candidate.unit]).await?;
+        if out.trim() == "loaded" {
+            loaded = Some(candidate);
+            break;
+        }
+    }
+    // No SSH server on the image at all: nothing can be running.
+    let Some(unit) = loaded else { return Some(false) };
+    let unit_active = match systemctl_stdout(&["is-active", unit.unit]).await?.trim() {
+        "active" | "activating" | "reloading" | "deactivating" => true,
+        "inactive" | "failed" | "unknown" | "" => false,
+        _ => return None, // an unrecognized token — no confident answer either way
+    };
+    if unit_active {
+        return Some(true);
+    }
+    let Some(pattern) = unit.sessions else { return Some(false) };
+    let sessions =
+        systemctl_stdout(&["list-units", "--state=active", "--no-legend", "--plain", pattern]).await?;
+    Some(sessions.lines().any(|line| !line.trim().is_empty()))
+}
+
+/// Run `systemctl <args>` and return its stdout; `None` if it cannot spawn.
+/// `is-active` exits non-zero for inactive units, so the exit code is not
+/// treated as a failure here.
+async fn systemctl_stdout(args: &[&str]) -> Option<String> {
     let out = tokio::process::Command::new("systemctl")
-        .args(["is-active", "ssh.service"])
+        .args(args)
         .output()
         .await
         .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let state = stdout.trim();
-    match state {
-        "active" => Some(true),
-        "inactive" | "failed" | "unknown" | "" => Some(false),
-        _ => None, // an unrecognized token — no confident answer either way
-    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 // ── Orchestration (store + audit + device actions, one call each) ──

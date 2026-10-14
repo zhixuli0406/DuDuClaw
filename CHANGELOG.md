@@ -6,6 +6,8 @@
 - 企業版主控台的版本清單從 v1.73.0 起沒有出現新版本：控制面在 10-12 一次分段部署後，流量固定在當時的 revision，`release.sh` 之後寫入的版本允許清單都建在不接流量的新 revision 上，卻照樣回報成功。`release.sh` 改成寫入後把流量切到最新 revision，並檢查實際承接流量的 revision 帶的是新清單，不一致就警告。
 
 ### Security
+- DuDuClaw OS 維護模式的 SSH 開關原本操作 `ssh.service`，Yocto 映像沒有這個單元，所以開關沒有作用，關閉時也結束不了任何東西。`duduclaw-sysd` 改成從固定清單（`dropbear.socket`、`ssh.service`）挑映像上實際有的單元：開啟時先把 22 埠加進防火牆的 `maintenance_tcp_ports` 集合再啟動 dropbear，防火牆加不進去就拒絕開啟；關閉時停掉 dropbear、結束進行中的連線並移除 22 埠，事後檢查還有連線或埠沒關就回報失敗。維護頁的「SSH 實際狀態」也改看同一個單元與它的連線。要搭配下一版 OS 映像（防火牆加入這個集合、dropbear 預設關閉、基礎版也裝防火牆），該版尚未發布；在 OS 映像上尚未實測。
+- DuDuClaw OS 恢復原廠時勾選「一併清除網路設定」，在 Yocto 映像上其實沒有刪掉任何 Wi-Fi 憑證：`duduclaw-sysd` 只清 Debian 版的 `/data/network/iwd`，Yocto 版存在 `/data/system/iwd`。現在兩個位置都會清，兩個都找不到就回報失敗，不再當作已清除。
 - rustls 從 0.23.45 升到 0.23.46（主程式與桌面版），修正 2026-10-14 公布的四則公告：用戶端 session 值的 `Debug` 輸出會帶出 TLS 秘密（RUSTSEC-2026-0346，medium）、ECH 被拒後緩衝資料送往外層伺服器（RUSTSEC-2026-0347）、Brotli 憑證解壓在驗證前最多配置 1 GiB（RUSTSEC-2026-0348）、未驗證的 ServerHello 可讓之後的連線降級為傳統金鑰交換（RUSTSEC-2026-0349）；後三則為 low。v1.73.2 以前的版本都含 0.23.45。
 
 ## [1.73.2] - 2026-10-14 — OS v0.3.0 公開文件更正

@@ -355,7 +355,8 @@ impl SysdDeviceOps {
     }
 
     /// Maintenance-mode Entry A (`commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md`
-    /// §2.6): `systemctl start ssh.service`. Not part of the `DeviceOps`
+    /// §2.6): start the image's SSH server and open its port in the OS
+    /// firewall (`duduclaw_sysd::SSH_UNITS`; sysd picks the unit). Not part of the `DeviceOps`
     /// trait — same reasoning as `set_hostname` above: this is a verb
     /// specific to the `maintenance.*` RPC surface (see `maintenance.rs`),
     /// not a shape every `DeviceOps` implementor needs to answer for
@@ -364,9 +365,10 @@ impl SysdDeviceOps {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::SshServiceStart).await
     }
 
-    /// The close side of [`Self::ssh_start`] — `systemctl stop ssh.service`.
-    /// Idempotent (stopping an already-stopped unit is still `success:
-    /// true`), which the TTL sweep / gateway-restart reassert-closed path in
+    /// The close side of [`Self::ssh_start`]: stop the SSH server, end its
+    /// sessions and close the firewall port. Idempotent (closing what was
+    /// never opened is still `success: true`), which the TTL sweep /
+    /// gateway-restart reassert-closed path in
     /// `maintenance.rs` relies on: it always calls this, whether or not SSH
     /// was actually running.
     pub async fn ssh_stop(&self) -> OpResult {

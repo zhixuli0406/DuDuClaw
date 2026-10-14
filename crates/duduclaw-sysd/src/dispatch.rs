@@ -14,7 +14,10 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use crate::protocol::{MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SysdError, SysdOpOutput, SysdRequest};
+use crate::protocol::{
+    MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT, SSH_UNITS, SshUnit, SysdError, SysdOpOutput,
+    SysdRequest,
+};
 
 /// Absolute path to `systemd-sysupdate`.
 ///
@@ -97,22 +100,26 @@ const MAX_DNS_ENTRIES: usize = 3;
 /// deleting one file.
 const KIOSK_HOME_DIR: &str = "/data/duduclaw-kiosk";
 
-/// Directory whose CONTENTS are iwd's persisted Wi-Fi credential files
-/// (`/data/network/iwd`, 0700 root:root — see
-/// `appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`). The
-/// directory itself is left in place (tmpfiles recreates it unconditionally
-/// every boot); only the credential files inside are removed, mirroring
+/// Directories whose CONTENTS are iwd's persisted Wi-Fi credential files,
+/// one per OS line: `/data/system/iwd` on the Yocto line (DuDuClaw-OS
+/// `meta-duduclaw/recipes-duduclaw/duduclaw-data-binds/files/
+/// var-lib-iwd.mount`) and `/data/network/iwd` on the Debian line
+/// (`appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`), both
+/// 0700 root:root. Until 2026-10 only the Debian path was listed, so on
+/// Yocto images "clear network settings" deleted nothing. The directories
+/// themselves are left in place (tmpfiles recreates them every boot); only
+/// the credential files inside are removed, mirroring
 /// `duduclaw-gateway/src/device_ops.rs`'s own `wipe_dir_contents` for
 /// `home_dir` — same "the mount point survives, what's inside does not"
 /// discipline this module's [`wipe_dir_contents`] below implements.
-const NETWORK_CREDENTIALS_DIR: &str = "/data/network/iwd";
+const NETWORK_CREDENTIALS_DIRS: [&str; 2] = ["/data/system/iwd", "/data/network/iwd"];
 
 /// Remove every entry directly under `dir` (not `dir` itself). Missing
 /// `dir` is not an error (nothing to wipe) — mirrors
 /// `duduclaw-gateway/src/device_ops.rs`'s identically-named helper for
 /// `home_dir`; this is that same discipline applied on the root side of
 /// the privilege boundary, for the two paths ([`KIOSK_HOME_DIR`],
-/// [`NETWORK_CREDENTIALS_DIR`]) the unprivileged gateway process cannot
+/// [`NETWORK_CREDENTIALS_DIRS`]) the unprivileged gateway process cannot
 /// reach on its own.
 fn wipe_dir_contents(dir: &Path) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
@@ -183,26 +190,48 @@ async fn dispatch_factory_reset() -> DispatchResult {
     })
 }
 
-/// Wipe the CONTENTS of [`NETWORK_CREDENTIALS_DIR`] — see that constant's
-/// doc comment for what lives there and why the directory entry itself
-/// survives. Unlike the kiosk-home wipe in [`dispatch_factory_reset`], a
-/// failure here is returned as a hard `Err` rather than folded into a
-/// `[warn]` note: this verb only ever runs when an operator explicitly
-/// opted in to "一併清除網路設定", and the gateway-side caller
-/// (`SysdDeviceOps::factory_reset`) treats that opt-in as fail-closed —
-/// silently downgrading a real failure to a warning would let the operator
-/// walk away believing saved Wi-Fi credentials are gone when they are not.
+/// Wipe the CONTENTS of every existing directory in
+/// [`NETWORK_CREDENTIALS_DIRS`] — see that constant's doc comment for what
+/// lives there and why the directory entries themselves survive. Unlike the
+/// kiosk-home wipe in [`dispatch_factory_reset`], a failure here is returned
+/// as a hard `Err` rather than folded into a `[warn]` note: this verb only
+/// ever runs when an operator explicitly opted in to "一併清除網路設定", and
+/// the gateway-side caller (`SysdDeviceOps::factory_reset`) treats that
+/// opt-in as fail-closed — silently downgrading a real failure to a warning
+/// would let the operator walk away believing saved Wi-Fi credentials are
+/// gone when they are not. For the same reason, finding none of the
+/// directories is an error, not "nothing to clear".
 async fn dispatch_clear_network_credentials() -> DispatchResult {
-    match wipe_dir_contents(Path::new(NETWORK_CREDENTIALS_DIR)) {
-        Ok(()) => Ok(SysdOpOutput {
+    let dirs: Vec<&Path> = NETWORK_CREDENTIALS_DIRS.iter().map(Path::new).collect();
+    match clear_credential_dirs(&dirs) {
+        Ok(cleared) => Ok(SysdOpOutput {
             success: true,
-            stdout: format!("cleared {NETWORK_CREDENTIALS_DIR}"),
+            stdout: format!("cleared {}", cleared.join(", ")),
             stderr: String::new(),
         }),
-        Err(e) => Err(SysdError::io(format!(
-            "clearing {NETWORK_CREDENTIALS_DIR} failed: {e}"
-        ))),
+        Err(e) => Err(SysdError::io(e)),
     }
+}
+
+/// Wipe the contents of each directory in `dirs` that exists and return the
+/// ones cleared. Errors when one cannot be wiped or none exists.
+fn clear_credential_dirs(dirs: &[&Path]) -> Result<Vec<String>, String> {
+    let mut cleared = Vec::new();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        wipe_dir_contents(dir).map_err(|e| format!("clearing {} failed: {e}", dir.display()))?;
+        cleared.push(dir.display().to_string());
+    }
+    if cleared.is_empty() {
+        let listed: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        return Err(format!(
+            "no network credential directory found (looked for {})",
+            listed.join(", ")
+        ));
+    }
+    Ok(cleared)
 }
 
 /// `hostnamectl set-hostname <name>`. Rejects an empty or over-length
@@ -1212,6 +1241,187 @@ async fn dispatch_clear_exhausted_update_target(version: &str) -> DispatchResult
     })
 }
 
+// ── Maintenance-mode SSH ────────────────────────────────────
+
+/// The OS firewall's nftables table and the named set its input chain
+/// accepts TCP ports from (`tcp dport @maintenance_tcp_ports accept`,
+/// DuDuClaw-OS `meta-duduclaw/recipes-duduclaw/duduclaw-firewall/files/
+/// nftables.conf`, from OS v0.3.1). The set starts empty, so nothing extra
+/// is reachable until maintenance mode adds a port.
+const FIREWALL_FAMILY: &str = "inet";
+const FIREWALL_TABLE: &str = "filter";
+const MAINTENANCE_PORT_SET: &str = "maintenance_tcp_ports";
+
+/// First unit in [`SSH_UNITS`] that systemd has loaded, or `None` when the
+/// image has no SSH server at all.
+async fn resolve_ssh_unit() -> Option<SshUnit> {
+    for candidate in SSH_UNITS {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["show", "--property=LoadState", "--value", candidate.unit]);
+        let Ok(out) = cmd.output().await else { return None };
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "loaded" {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether the image runs the DuDuClaw firewall table at all. An image
+/// without it (or without `nft`) filters nothing, so the SSH port is
+/// reachable as soon as the unit listens and there is no rule to manage.
+async fn firewall_present() -> bool {
+    let mut cmd = Command::new("nft");
+    cmd.args(["list", "table", FIREWALL_FAMILY, FIREWALL_TABLE]);
+    matches!(cmd.output().await, Ok(out) if out.status.success())
+}
+
+fn ssh_port_element() -> String {
+    format!("{{ {SSH_PORT} }}")
+}
+
+async fn firewall_set_element(verb: &str) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("nft");
+    cmd.args([verb, "element", FIREWALL_FAMILY, FIREWALL_TABLE, MAINTENANCE_PORT_SET])
+        .arg(ssh_port_element());
+    cmd.output().await
+}
+
+/// `Some(true)` when the maintenance set currently holds [`SSH_PORT`],
+/// `Some(false)` when it does not or the set does not exist, `None` when the
+/// answer could not be read.
+async fn firewall_port_open() -> Option<bool> {
+    let mut cmd = Command::new("nft");
+    cmd.args(["-j", "list", "set", FIREWALL_FAMILY, FIREWALL_TABLE, MAINTENANCE_PORT_SET]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        // An image whose firewall predates the set has nothing to close.
+        return Some(false);
+    }
+    set_json_has_port(&String::from_utf8_lossy(&out.stdout), SSH_PORT)
+}
+
+/// Read `nft -j list set` output. `None` when it is not the expected shape.
+fn set_json_has_port(raw: &str, port: u16) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let set = value
+        .get("nftables")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| entry.get("set"))?;
+    let Some(elems) = set.get("elem") else { return Some(false) };
+    Some(elems.as_array()?.iter().any(|e| e.as_u64() == Some(u64::from(port))))
+}
+
+/// Active session units of `unit`, e.g. `dropbear@3-…service`. `None` when
+/// systemd could not be asked.
+async fn active_ssh_sessions(unit: &SshUnit) -> Option<Vec<String>> {
+    let Some(pattern) = unit.sessions else { return Some(Vec::new()) };
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["list-units", "--state=active", "--no-legend", "--plain", pattern]);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Open the firewall port first, then start the unit, so a firewall that
+/// cannot be opened never leaves a listening server the operator cannot
+/// reach. A failed unit start takes the port back out.
+async fn dispatch_ssh_start() -> DispatchResult {
+    let unit = resolve_ssh_unit()
+        .await
+        .ok_or_else(|| SysdError::unsupported("this image has no SSH server unit"))?;
+
+    let firewall = firewall_present().await;
+    if firewall {
+        match firewall_set_element("add").await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                return Err(SysdError::io(format!(
+                    "could not open tcp/{SSH_PORT} in the firewall (this image's firewall has no \
+                     {MAINTENANCE_PORT_SET} set; DuDuClaw OS 0.3.1 or later is needed): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            Err(e) => return Err(SysdError::io(format!("failed to spawn nft: {e}"))),
+        }
+    }
+
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["start", unit.unit]);
+    let started = run(cmd).await?;
+    if !started.success {
+        if firewall {
+            let _ = firewall_set_element("delete").await;
+        }
+        return Ok(started);
+    }
+    let firewall_note = if firewall {
+        format!("opened tcp/{SSH_PORT} in the firewall")
+    } else {
+        "no firewall on this image".to_string()
+    };
+    Ok(SysdOpOutput {
+        stdout: format!("started {}; {firewall_note}", unit.unit),
+        ..started
+    })
+}
+
+/// Stop the unit, end its sessions, close the firewall port, then check
+/// what is actually left open. Each step runs even if an earlier one failed.
+async fn dispatch_ssh_stop() -> DispatchResult {
+    let mut problems: Vec<String> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+
+    let unit = resolve_ssh_unit().await;
+    if let Some(unit) = &unit {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["stop", unit.unit]);
+        match cmd.output().await {
+            Ok(out) if out.status.success() => done.push(format!("stopped {}", unit.unit)),
+            Ok(out) => problems.push(format!(
+                "systemctl stop {} failed: {}",
+                unit.unit,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => problems.push(format!("failed to spawn systemctl: {e}")),
+        }
+        if let Some(pattern) = unit.sessions {
+            let mut cmd = Command::new("systemctl");
+            cmd.args(["stop", pattern]);
+            // The outcome is judged by the check below, not by this exit code:
+            // a pattern that matches no session is not a failure.
+            let _ = cmd.output().await;
+        }
+        match active_ssh_sessions(unit).await {
+            Some(left) if left.is_empty() => {}
+            Some(left) => problems.push(format!("SSH sessions still active: {}", left.join(", "))),
+            None => problems.push("could not list SSH sessions".to_string()),
+        }
+    }
+
+    if firewall_present().await {
+        let _ = firewall_set_element("delete").await;
+        match firewall_port_open().await {
+            Some(false) => done.push(format!("tcp/{SSH_PORT} not open in the firewall")),
+            Some(true) => problems.push(format!("tcp/{SSH_PORT} is still open in the firewall")),
+            None => problems.push("could not read the firewall's maintenance port set".to_string()),
+        }
+    }
+
+    Ok(SysdOpOutput {
+        success: problems.is_empty(),
+        stdout: if done.is_empty() { "nothing was open".to_string() } else { done.join("; ") },
+        stderr: problems.join("; "),
+    })
+}
+
 /// Dispatch one already-authorized, already-parsed request to its
 /// hardcoded command sequence.
 pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
@@ -1262,16 +1472,8 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
         SysdRequest::ClearExhaustedUpdateTarget { version } => {
             dispatch_clear_exhausted_update_target(version).await
         }
-        SysdRequest::SshServiceStart => {
-            let mut cmd = Command::new("systemctl");
-            cmd.args(["start", "ssh.service"]);
-            run(cmd).await
-        }
-        SysdRequest::SshServiceStop => {
-            let mut cmd = Command::new("systemctl");
-            cmd.args(["stop", "ssh.service"]);
-            run(cmd).await
-        }
+        SysdRequest::SshServiceStart => dispatch_ssh_start().await,
+        SysdRequest::SshServiceStop => dispatch_ssh_stop().await,
     }
 }
 
@@ -1279,6 +1481,47 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn clear_credential_dirs_wipes_every_existing_line_and_refuses_when_none_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let yocto = root.path().join("system/iwd");
+        let debian = root.path().join("network/iwd");
+        std::fs::create_dir_all(&yocto).unwrap();
+        std::fs::write(yocto.join("home.psk"), "secret").unwrap();
+
+        let cleared = clear_credential_dirs(&[&yocto, &debian]).unwrap();
+        assert_eq!(cleared, vec![yocto.display().to_string()]);
+        assert!(yocto.is_dir(), "the directory itself survives");
+        assert_eq!(std::fs::read_dir(&yocto).unwrap().count(), 0);
+
+        let missing = root.path().join("nowhere");
+        let err = clear_credential_dirs(&[&missing, &debian]).unwrap_err();
+        assert!(err.contains("no network credential directory found"), "{err}");
+    }
+
+    #[test]
+    fn maintenance_set_json_is_read_by_element_not_by_substring() {
+        let open = r#"{"nftables":[{"metainfo":{"version":"1.1.6"}},{"set":{"family":"inet","name":"maintenance_tcp_ports","table":"filter","type":"inet_service","handle":4,"elem":[22]}}]}"#;
+        assert_eq!(set_json_has_port(open, 22), Some(true));
+        // An empty set has no "elem" key at all.
+        let empty = r#"{"nftables":[{"metainfo":{"version":"1.1.6"}},{"set":{"family":"inet","name":"maintenance_tcp_ports","table":"filter","type":"inet_service","handle":4}}]}"#;
+        assert_eq!(set_json_has_port(empty, 22), Some(false));
+        // 2222 must not count as 22.
+        let other = r#"{"nftables":[{"set":{"name":"maintenance_tcp_ports","elem":[2222,80]}}]}"#;
+        assert_eq!(set_json_has_port(other, 22), Some(false));
+        assert_eq!(set_json_has_port("not json", 22), None);
+        assert_eq!(set_json_has_port(r#"{"nftables":[{"metainfo":{}}]}"#, 22), None);
+    }
+
+    #[test]
+    fn ssh_units_prefer_dropbear_and_only_it_has_sessions() {
+        assert_eq!(SSH_UNITS[0].unit, "dropbear.socket");
+        assert_eq!(SSH_UNITS[0].sessions, Some("dropbear@*.service"));
+        assert_eq!(SSH_UNITS[1].unit, "ssh.service");
+        assert_eq!(SSH_UNITS[1].sessions, None);
+        assert_eq!(ssh_port_element(), "{ 22 }");
+    }
 
     #[test]
     fn bless_status_is_classified_by_whole_word() {

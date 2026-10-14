@@ -3304,7 +3304,7 @@ export interface MaintenanceWindow {
 }
 
 /** `maintenance.status` payload. `ssh_observed_active` is a LIVE probe
- *  (`systemctl is-active ssh.service`), deliberately separate from
+ *  (the image's SSH unit or one of its sessions is active), deliberately separate from
  *  `window`'s ledger state — a mismatch (e.g. `active: false` but
  *  `ssh_observed_active: true`) means a close action failed and SSH is
  *  still actually reachable; see §6 fail-closed principle #2. `null` = no

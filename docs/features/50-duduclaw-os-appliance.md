@@ -142,11 +142,17 @@ gateway, not by the desktop.
   from boot, but the desktop edition's firewall has no rule for it, so SSH
   cannot be reached from the network. The base edition (written by the
   plain `installer` ISO) ships without this firewall, so on it dropbear
-  and the dashboard port are reachable from the LAN. The SSH switch in the
-  dashboard's maintenance mode does not change either case today: it
-  starts and stops a unit named `ssh.service` (the name used by the
-  earlier Debian-based image), which these images do not have, and it
-  never adds a firewall rule.
+  and the dashboard port are reachable from the LAN. Up to platform
+  v1.73.2 the SSH switch in the dashboard's maintenance mode changed
+  neither case: it started and stopped a unit named `ssh.service` (the
+  name used by the earlier Debian-based image), which these images do not
+  have, and it never added a firewall rule. Platform v1.73.3 fixes this:
+  `duduclaw-sysd` now starts `dropbear.socket` and adds port 22 to the
+  firewall's maintenance port set, and when the window closes it stops
+  dropbear, ends open sessions and removes the port. OS images pick this
+  up from the next OS release (embedding platform v1.73.3 or later, with
+  dropbear off by default and the firewall in the base edition too), which
+  has not shipped yet.
 - **The webhook relay never sees your channel secrets.** For webhook-style
   channels that need it, the relay's job is limited to forwarding an
   incoming request's raw bytes to the box over a connection the box opened
