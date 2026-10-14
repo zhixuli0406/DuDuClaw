@@ -43,8 +43,8 @@ Windows 與 Android 應用程式；同時 DuDuClaw gateway 與它的 AI 員工�
   成頁的摘要會寫最後授權了幾家。
 - **輸入與音訊**：fcitx5 中文輸入法、PipeWire / WirePlumber 音訊，
   XWayland 讓 X11 應用程式也能跑。
-- **應用程式**：Chromium、LibreOffice 和 Steam 預先以 Flatpak 形式離線裝
-  好；Windows 桌面應用程式走 Bottles，完整 Windows 走 KVM 虛擬機 + RDP，
+- **應用程式**：Chromium、LibreOffice 預先以 Flatpak 形式離線裝好，Steam
+  可從 Flathub 安裝；Windows 桌面應用程式走 Bottles，完整 Windows 走 KVM 虛擬機 + RDP，
   Android 應用程式走 Waydroid。哪些有承諾、哪些沒有，寫在應用程式相容性
   指南裡——該文件自 2026-09-29 起放在
   [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo 的

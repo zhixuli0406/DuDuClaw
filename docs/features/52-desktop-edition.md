@@ -51,7 +51,8 @@ them.
   click; the summary at the end says how many providers ended up authorized.
 - **Input and audio** — fcitx5 Chinese IME, PipeWire / WirePlumber audio,
   XWayland for X11 applications.
-- **Apps** — Chromium, LibreOffice and Steam preloaded offline as Flatpaks;
+- **Apps** — Chromium and LibreOffice preloaded offline as Flatpaks, Steam
+  installable from Flathub;
   Windows desktop apps through Bottles, full Windows through a KVM virtual
   machine + RDP, Android apps through Waydroid. What is and is not promised
   is spelled out in the app compatibility guide, which lives in the
