@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 企業版主控台的版本清單從 v1.73.0 起沒有出現新版本：控制面在 10-12 一次分段部署後，流量固定在當時的 revision，`release.sh` 之後寫入的版本允許清單都建在不接流量的新 revision 上，卻照樣回報成功。`release.sh` 改成寫入後把流量切到最新 revision，並檢查實際承接流量的 revision 帶的是新清單，不一致就警告。
+
 ### Security
 - rustls 從 0.23.45 升到 0.23.46（主程式與桌面版），修正 2026-10-14 公布的四則公告：用戶端 session 值的 `Debug` 輸出會帶出 TLS 秘密（RUSTSEC-2026-0346，medium）、ECH 被拒後緩衝資料送往外層伺服器（RUSTSEC-2026-0347）、Brotli 憑證解壓在驗證前最多配置 1 GiB（RUSTSEC-2026-0348）、未驗證的 ServerHello 可讓之後的連線降級為傳統金鑰交換（RUSTSEC-2026-0349）；後三則為 low。v1.73.2 以前的版本都含 0.23.45。
 
