@@ -123,7 +123,7 @@ The rules, all enforced in `duduclaw-comp` rather than in the agent:
 
 ## Current Status
 
-- As of v0.2.0 (the current release; shipped this way since v0.1.0), the
+- As of v0.3.0 (the current release; shipped this way since v0.1.0), the
   whole-disk image ships this desktop. Co-driving is compiled in and
   **off by default**.
 - Verified so far, with real input events rather than simulators: freeze /
