@@ -10,9 +10,6 @@
   - Windows VM（`duduclaw compat windows-vm`）找不到 `docker` 時改用 `podman compose`，錯誤訊息一併說明需要 Docker 或 Podman 的 compose。
   - 叫人執行 `docker pull` 的訊息（任務沙箱、腳本沙箱、電腦操作與 doctor）補一句：DuDuClaw OS 上 image 要拉進閘道自己的 rootless 映像庫，請帶閘道的 `CONTAINER_HOST` 執行。
 
-### Fixed
-- 企業版主控台的版本清單從 v1.73.0 起沒有出現新版本：控制面在 10-12 一次分段部署後，流量固定在當時的 revision，`release.sh` 之後寫入的版本允許清單都建在不接流量的新 revision 上，卻照樣回報成功。`release.sh` 改成寫入後把流量切到最新 revision，並檢查實際承接流量的 revision 帶的是新清單，不一致就警告。
-
 ### Security
 - 容器資源上限改成先驗證再用：容器引擎回報 rootless 時，任務沙箱、腳本沙箱、電腦操作與 Discovery 的嘗試和評分容器會先跑一個 32 MiB 記憶體、32 個行程上限的臨時容器，讀回它自己的 `memory.max` 與 `pids.max`。讀到 `max`（cgroup 控制器沒委派時，rootless 引擎會接受上限卻不套用）、讀到跟要求不同的值，或檢查沒跑完，這些功能就停用並說明原因（任務沙箱代碼 `resource_limits_unenforced`），doctor 也會列出。一般 rootful Docker 不做這個檢查。結果沿用十分鐘（失敗則一分鐘後重試），容器引擎從無法使用恢復時立刻重新檢查。腳本沙箱在 `mcp-server` 裡執行，閘道有 `DOCKER_HOST`／`CONTAINER_HOST` 時會一併寫進員工 MCP 設定裡 DuDuClaw 自己那一項的環境變數，讓它連到同一個引擎。
 - DuDuClaw OS 上的音量、靜音與輸出裝置改由殼程式（comp，以 kiosk 使用者執行）透過 shell_control 的 `get_audio`／`set_audio`／`set_audio_output` 代為操作，閘道不再直接連 PipeWire：PipeWire 的 socket 誰連得上就能錄麥克風、接上螢幕串流，而閘道的使用者也是 AI 員工的使用者，OS 已把那個 socket 收回成 0600。靜音切換改成先讀再寫。舊版 comp 不認得這些指令（回 `parse_error`）時才退回原本直接呼叫 `wpctl` 的方式；其他錯誤照實回報。
@@ -21,7 +18,14 @@
 - `duduclaw-sysd` 的呼叫者改成一律當作不可信（OS 之後會把允許的 uid 從 root 改成閘道的 uid，而 AI 員工的 CLI 也用這個 uid，只比對 uid 的話員工能直接開 socket、繞過閘道的核准）。新增 `--require-main-pid-of <unit>`：呼叫者必須是該單元的 systemd 主行程，以 pidfd（`SO_PEERPIDFD`，Linux 6.5 以上）確認、避免 pid 重複使用冒充，並須位在該單元的 cgroup；同時最多四個檢查、每個最多兩秒，任何一步失敗或非 Linux 主機都拒絕；操作者終端的 `duduclaw os system timezone-set`／`ntp-set` 打開旗標後會失敗並指向儀表板；選擇性開啟，舊 OS 映像不受影響，前提是 yama `ptrace_scope` ≥ 1 且閘道不把 sysd 連線交給子行程。不打開的話，員工能觸發的不只可用性問題：`update_rollback` 會開回閘道仍以 root 執行的舊映像，`ssh_service_start` 會開網路服務。`os_*` MCP 工具（在 `mcp-server` 行程裡）在 DuDuClaw OS 上改成先過完原本的檢查，再經閘道新增的簽章本機路由 `/api/internal/sysd` 轉送，由閘道自己連 sysd；這條路由只接受電源、更新、開機評估、回退與恢復原廠，SSH、網路、主機名稱、時區與本地模型一律拒絕。閘道沒在執行或 MCP 伺服器沒有員工身分時工具會失敗，不會直接連 sysd。主機名稱改成最長 64 位元組的 RFC 1123 白名單：之前只檢查長度，`-` 開頭的值會被 `hostnamectl` 當成選項。時區與網路介面名稱必須以英數字開頭，這類值一律放在 `--` 之後。順手修正網路介面存在檢查：真實 sysfs 的 `/sys/class/net/<介面>` 是符號連結，原本的檢查在實機上永遠判定介面不存在。
 - 本地模型服務的停止與重啟改走 `duduclaw-sysd` 新增的固定指令（只能對 `duduclaw-llama-server.service` 停止或重啟），閘道不再自己執行 `systemctl`；DuDuClaw OS 上連不到 sysd 時回報「無法控制」，不會退回直接呼叫 `systemctl`。
 - 恢復原廠改成由 `duduclaw-sysd` 一個指令完成（`factory_reset_v2`，連同「一併清除網路設定」的選擇），閘道本身不再清自己的資料目錄。映像有 `duduclaw-factory-reset.service` 這個 oneshot 時，sysd 寫入 `/data/system/factory-reset.pending`（內容 `clear_network=0` 或 `=1`）後重開機，由 oneshot 在容器服務與閘道啟動前清除 `/data/duduclaw`、`/data/duduclaw-kiosk`、`/data/system/containers/duduclaw` 與（有勾選時）Wi-Fi，避免邊執行邊清造成只清一半；沒有這個 oneshot 的舊映像照舊立即清除（先清網路設定、再清閘道資料目錄，失敗就中止、不重開機），改由 root 端依固定路徑執行。閘道的資料目錄不是 `/data/duduclaw`、裝置上連不到 sysd、或 sysd 版本太舊不認得這個指令時，都會在刪除任何東西前拒絕。閘道與 sysd 必須來自同一版 OS 映像。非 DuDuClaw OS 的安裝仍由閘道自己清。
-- DuDuClaw OS 維護模式的 SSH 開關原本操作 `ssh.service`，Yocto 映像沒有這個單元，所以開關沒有作用，關閉時也結束不了任何東西。`duduclaw-sysd` 改成從固定清單（`dropbear.socket`、`ssh.service`）找映像上實際有的單元。開啟時先把 22 埠加進防火牆的 `maintenance_tcp_ports` 集合再啟動 dropbear；防火牆加不進去、或防火牆設定存在卻沒有載入時就拒絕開啟，啟動失敗會把 22 埠移除。關閉時停掉所有找到的 SSH 單元、透過 cgroup 結束所有連線行程（上游 `dropbear@.service` 是 `KillMode=process`，只停單元會留下背景程式），移除 22 埠，事後確認沒有行程、單元與埠還開著，查不清楚的一律回報失敗。維護頁的「SSH 實際狀態」改看同一組單元與連線行程，查不清楚時顯示未知。gateway 端開啟失敗時也會執行一次關閉，避免 sysd 其實已開啟、回應卻遺失時留下沒有紀錄的 SSH。
+
+## [1.73.3] - 2026-10-15 — 安全修補：維護模式 SSH、Wi-Fi 憑證清除、rustls
+
+### Fixed
+- 企業版主控台的版本清單從 v1.73.0 起沒有出現新版本：控制面在 10-12 一次分段部署後，流量固定在當時的 revision，`release.sh` 之後寫入的版本允許清單都建在不接流量的新 revision 上，卻照樣回報成功。`release.sh` 改成寫入後把流量切到最新 revision，並檢查實際承接流量的 revision 帶的是新清單，不一致就警告。
+
+### Security
+- DuDuClaw OS 維護模式的 SSH 開關原本操作 `ssh.service`，Yocto 映像沒有這個單元，所以開關沒有作用，關閉時也結束不了任何東西。`duduclaw-sysd` 改成從固定清單（`dropbear.socket`、`ssh.service`）找映像上實際有的單元。開啟時先把 22 埠加進防火牆的 `maintenance_tcp_ports` 集合再啟動 dropbear；防火牆加不進去、或防火牆設定存在卻沒有載入時就拒絕開啟，啟動失敗會把 22 埠移除。關閉時停掉所有找到的 SSH 單元、透過 cgroup 結束所有連線行程（上游 `dropbear@.service` 是 `KillMode=process`，只停單元會留下背景程式），移除 22 埠，事後確認沒有行程、單元與埠還開著，查不清楚的一律回報失敗。維護頁用來核對 SSH 實際狀態的探測改看同一組單元與連線行程，查不清楚時回報「無法判斷」，不再當成沒在執行；儀表板只在視窗已關閉、SSH 卻仍在執行時警告，無法判斷時不會顯示任何提示，所以沒有警告不代表已確認 SSH 關閉。關閉時等連線行程結束最多 2 秒，逾時回報失敗。gateway 端開啟失敗時也會執行一次關閉，避免 sysd 其實已開啟、回應卻遺失時留下沒有紀錄的 SSH。
   - 需要搭配下一版 OS 映像（防火牆加入這個集合、dropbear 預設關閉、基礎版也裝防火牆），該版尚未發布；在 OS 映像上尚未實測。
   - 舊映像上的行為：OS v0.3.0 以前的桌面版與 Debian 線的防火牆沒有這個集合，開啟會被拒絕；開啟被拒後 gateway 補做的關閉會停掉原本預設就在跑的 dropbear；v0.3.0 以前的基礎版沒有防火牆，可以開啟，關閉時同樣會停掉 dropbear。兩者重開機後 dropbear 都會再啟動。
   - 目前的映像上沒有能透過 SSH 登入的帳號：root 已鎖定，dropbear 預設也禁止 root 登入（`-w`）。所以這個開關目前只能控制連接埠，維護 SSH 要用什麼帳號登入還沒決定。
