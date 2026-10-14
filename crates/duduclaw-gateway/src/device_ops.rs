@@ -211,6 +211,13 @@ impl DeviceOps for SystemDeviceOps {
     }
 
     async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
+        // On an appliance this impl is only reached when the sysd socket is
+        // missing (see `select_device_ops`). The unprivileged gateway cannot
+        // finish a reset there (the home can hold files of the rootless
+        // container engine's subordinate uids; the kiosk home and the reboot
+        // need root), so refuse before deleting anything instead of leaving
+        // a half-wiped box.
+        refuse_local_reset_on_appliance(duduclaw_core::is_appliance())?;
         if let Err(e) = wipe_dir_contents(home_dir) {
             return Err(DeviceOpError::Io(format!(
                 "wiping {} failed: {e}",
@@ -375,6 +382,13 @@ impl SysdDeviceOps {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::SshServiceStop).await
     }
 
+    /// `systemctl stop|restart` of the local model service through the
+    /// `LocalModelService` verb (the gateway no longer runs as root). Not
+    /// part of the `DeviceOps` trait: only `inference_local` uses it.
+    pub async fn local_model_service(&self, action: duduclaw_sysd::LocalModelAction) -> OpResult {
+        sysd_call(&self.client, duduclaw_sysd::SysdRequest::LocalModelService { action }).await
+    }
+
     /// System-settings app: `network.wired_config`. `dns` is cloned into the
     /// request as owned `String`s — the wire shape (`SysdRequest::
     /// NetworkWiredConfig`) takes `Vec<String>`, not a borrowed slice.
@@ -448,18 +462,14 @@ impl DeviceOps for SysdDeviceOps {
     }
 
     async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
-        // The wipe itself is filesystem-only and needs no root (the
-        // `duduclaw` user already owns `home_dir`) — only the unit re-arm
-        // + kiosk-home wipe + reboot that follow need root, which is
-        // exactly what the `FactoryReset` verb does on the sysd side (it
-        // now also wipes `/data/duduclaw-kiosk` — see that verb's doc
-        // comment for the OOBE-flag bug this closes).
-        if let Err(e) = wipe_dir_contents(home_dir) {
-            return Err(DeviceOpError::Io(format!(
-                "wiping {} failed: {e}",
-                home_dir.display()
-            )));
-        }
+        // The gateway home is wiped by the `FactoryReset` verb on the root
+        // side (`duduclaw_sysd::GATEWAY_HOME_DIR`, a closed constant): once
+        // the gateway runs rootless, files its container engine wrote can
+        // belong to subordinate uids the gateway cannot delete. Until
+        // 2026-10 the gateway wiped it here itself. The verb wipes only its
+        // constant, so a gateway whose home is elsewhere refuses rather than
+        // reporting a reset that left its own data in place.
+        require_sysd_home(home_dir)?;
         if clear_network {
             // D4a-8, fail-closed: runs BEFORE the `FactoryReset` verb
             // (which ends in `systemctl reboot`) so there is no race
@@ -518,6 +528,35 @@ pub fn select_sysd_ops() -> Option<SysdDeviceOps> {
         Some(SysdDeviceOps::default())
     } else {
         None
+    }
+}
+
+/// Fail-closed half of [`SystemDeviceOps::factory_reset`]: on an appliance
+/// (where this impl means "sysd unreachable") a factory reset is refused.
+fn refuse_local_reset_on_appliance(is_appliance: bool) -> Result<(), DeviceOpError> {
+    if is_appliance {
+        return Err(DeviceOpError::Unsupported(
+            "裝置的系統服務沒有回應，無法還原原廠設定；資料沒有被刪除。請稍後再試，或重新開機後再試一次。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`SysdDeviceOps::factory_reset`] wipes through the `FactoryReset` verb,
+/// which only knows [`duduclaw_sysd::GATEWAY_HOME_DIR`]: refuse when this
+/// gateway's home is a different directory.
+fn require_sysd_home(home_dir: &Path) -> Result<(), DeviceOpError> {
+    let fixed = Path::new(duduclaw_sysd::GATEWAY_HOME_DIR);
+    let same = home_dir == fixed
+        || matches!((home_dir.canonicalize(), fixed.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    if same {
+        Ok(())
+    } else {
+        Err(DeviceOpError::Unsupported(format!(
+            "這台裝置的資料目錄（{}）不是系統服務會清除的位置（{}），已取消還原原廠設定，資料沒有被刪除。",
+            home_dir.display(),
+            duduclaw_sysd::GATEWAY_HOME_DIR
+        )))
     }
 }
 
@@ -809,85 +848,85 @@ mod tests {
             server.stop().await;
         }
 
-        /// `factory_reset` wipes `home_dir` locally (no root needed) even
-        /// though the follow-up unit-re-arm + reboot go over the socket —
-        /// this is the split documented on `SysdDeviceOps::factory_reset`.
+        /// P6: the gateway no longer wipes its home itself on the sysd path
+        /// (the `FactoryReset` verb does, root side, from a closed constant).
+        /// A home other than that constant is refused before anything is
+        /// deleted or sent, so a reset can never report success while the
+        /// gateway's real data stays in place.
         #[tokio::test]
-        async fn factory_reset_wipes_locally_then_calls_sysd() {
+        async fn factory_reset_never_wipes_locally_and_refuses_a_foreign_home() {
             let server = TestServer::spawn(Some(current_uid())).await;
             let ops = server.device_ops();
 
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
 
-            let result = ops.factory_reset(home.path(), false).await;
-            // The wipe must have happened regardless of whether the
-            // downstream `systemctl` calls exist on this host.
-            let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
-            assert!(
-                remaining.is_empty(),
-                "home dir must be wiped: {remaining:?}"
-            );
-            match result {
-                Ok(_) => {}
-                Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+            for clear_network in [false, true] {
+                let result = ops.factory_reset(home.path(), clear_network).await;
+                match result {
+                    Err(DeviceOpError::Unsupported(msg)) => {
+                        assert!(msg.contains(duduclaw_sysd::GATEWAY_HOME_DIR), "{msg}");
+                        assert!(msg.contains("資料沒有被刪除"), "{msg}");
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
                 }
-                Err(e) => panic!("unexpected error variant: {e}"),
             }
+            assert!(home.path().join("leftover.txt").exists(), "nothing was wiped locally");
 
             server.stop().await;
         }
 
-        /// D4a-8: `clear_network: true` must ALSO reach the
-        /// `ClearNetworkCredentials` verb (not just `FactoryReset`) —
-        /// asserted the same "authorization outcome, not underlying
-        /// filesystem state" way as `authorized_calls_reach_real_dispatch_
-        /// not_auth_rejection` above (the real `/data/network/iwd` does not
-        /// exist on this dev/CI host, but `wipe_dir_contents` treats a
-        /// missing directory as a no-op success, so this reaches real
-        /// dispatch and returns `Ok` rather than erroring for an unrelated
-        /// filesystem reason).
+        #[test]
+        fn the_sysd_home_check_accepts_only_the_fixed_directory() {
+            assert!(require_sysd_home(std::path::Path::new(duduclaw_sysd::GATEWAY_HOME_DIR)).is_ok());
+            assert!(require_sysd_home(std::path::Path::new("/data/duduclaw-other")).is_err());
+            assert!(require_sysd_home(std::path::Path::new("/tmp")).is_err());
+        }
+
+        /// P6: off the appliance the local reset keeps working; on an
+        /// appliance with sysd unreachable it is refused.
+        #[test]
+        fn a_local_reset_is_refused_on_an_appliance_only() {
+            assert!(refuse_local_reset_on_appliance(false).is_ok());
+            match refuse_local_reset_on_appliance(true) {
+                Err(DeviceOpError::Unsupported(msg)) => assert!(msg.contains("資料沒有被刪除"), "{msg}"),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        /// The local model verb reaches real dispatch for an authorized
+        /// caller (asserted on the authorization outcome; `systemctl` may
+        /// not exist on this host).
         #[tokio::test]
-        async fn factory_reset_with_clear_network_reaches_real_dispatch() {
+        async fn local_model_service_reaches_real_dispatch() {
             let server = TestServer::spawn(Some(current_uid())).await;
             let ops = server.device_ops();
-
-            let home = tempfile::tempdir().unwrap();
-            let result = ops.factory_reset(home.path(), true).await;
-            match result {
-                Ok(_) => {}
-                Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+            for action in [duduclaw_sysd::LocalModelAction::Stop, duduclaw_sysd::LocalModelAction::Restart] {
+                match ops.local_model_service(action).await {
+                    Ok(_) => {}
+                    Err(DeviceOpError::Unsupported(msg)) => {
+                        assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+                    }
+                    Err(e) => panic!("unexpected error variant: {e}"),
                 }
-                Err(e) => panic!("unexpected error variant: {e}"),
             }
-
             server.stop().await;
         }
 
         /// D4a-8 fail-closed contract: when `clear_network: true` and the
         /// sysd socket is unreachable, `factory_reset` must surface an
         /// `Err` — never silently proceed to a fabricated "Ok" while saved
-        /// Wi-Fi credentials were never actually cleared. `home_dir`'s own
-        /// (unprivileged, local) wipe still happens first and must succeed
-        /// regardless — only the privileged half is unreachable here.
+        /// Wi-Fi credentials were never actually cleared. Nothing is wiped
+        /// on the gateway side (P6: the home wipe is the verb's).
         #[tokio::test]
         async fn factory_reset_with_clear_network_fails_closed_when_socket_unreachable() {
             let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(std::path::PathBuf::from(
                 "/tmp/duduclaw-sysd-test-no-such-socket.sock",
             )));
 
-            let home = tempfile::tempdir().unwrap();
-            std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
+            let home = std::path::Path::new(duduclaw_sysd::GATEWAY_HOME_DIR);
+            let result = ops.factory_reset(home, true).await;
 
-            let result = ops.factory_reset(home.path(), true).await;
-
-            let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
-            assert!(
-                remaining.is_empty(),
-                "the local home_dir wipe must still have happened: {remaining:?}"
-            );
             assert!(
                 matches!(result, Err(DeviceOpError::Unsupported(_))),
                 "an unreachable socket must surface as Err, never a fabricated success: {result:?}"

@@ -3,11 +3,14 @@
 //! Every `Command::new(...)` argument here is a literal, exactly the
 //! discipline `duduclaw-gateway/src/device_ops.rs` documents for its own
 //! `SystemDeviceOps` — this module is that same rule applied on the root
-//! side of the privilege boundary. The only caller-supplied value that
-//! ever reaches a spawned process is [`SysdRequest::Hostname`]'s `set`
-//! field, and it is passed via `Command::arg()` (never a shell), so its
-//! content can only ever be *the hostname value*, never *which command
-//! runs*.
+//! side of the privilege boundary. Caller-supplied values that reach a
+//! spawned process (`Hostname`'s `set`, `SetTimezone`'s `timezone`,
+//! `NetworkWiredConfig`'s `interface`) pass a character whitelist that
+//! forbids a leading `-` and are placed after a literal `--`, via
+//! `Command::arg()` (never a shell): their content can only ever be *the
+//! value*, never *which command runs* nor *an option* (`hostnamectl -H
+//! <host>` would run ssh as root). The caller is treated as hostile: see
+//! the threat-model section of `protocol.rs`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -15,8 +18,8 @@ use std::path::Path;
 use tokio::process::Command;
 
 use crate::protocol::{
-    MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT, SSH_UNITS, SysdError, SysdOpOutput,
-    SysdRequest,
+    GATEWAY_HOME_DIR, LOCAL_MODEL_UNIT, LocalModelAction, MAX_HOSTNAME_LEN, MAX_TIMEZONE_LEN, SSH_PORT,
+    SSH_UNITS, SysdError, SysdOpOutput, SysdRequest,
 };
 
 /// Absolute path to `systemd-sysupdate`.
@@ -164,6 +167,11 @@ async fn run(mut cmd: Command) -> DispatchResult {
 /// `SysdRequest::FactoryReset`'s doc comment) and must not be silently
 /// skipped just because a later step also happened to fail.
 async fn dispatch_factory_reset() -> DispatchResult {
+    // The gateway home first, and fail-closed: a reset that could not wipe
+    // the gateway's data must not reboot into a box that still holds it
+    // (the same contract the gateway-side wipe had before it moved here).
+    wipe_gateway_home(Path::new(GATEWAY_HOME_DIR))
+        .map_err(|e| SysdError::io(format!("wiping {GATEWAY_HOME_DIR} failed: {e}")))?;
     let kiosk_wipe_warn = match wipe_dir_contents(Path::new(KIOSK_HOME_DIR)) {
         Ok(()) => String::new(),
         Err(e) => format!("\n[warn] wiping {KIOSK_HOME_DIR} failed: {e}"),
@@ -188,6 +196,36 @@ async fn dispatch_factory_reset() -> DispatchResult {
         stdout: format!("{}{kiosk_wipe_warn}{enable_warn}", reboot.stdout),
         ..reboot
     })
+}
+
+/// Wipe the contents of the gateway home `dir` (a closed constant in
+/// production, a temp dir in tests). Root runs this inside a directory the
+/// unprivileged gateway owns, so the directory itself must be a real
+/// directory, not a symlink planted to redirect the wipe; a missing
+/// directory is nothing to wipe. Entries are never followed:
+/// [`wipe_dir_contents`] removes a symlink entry as a link, and
+/// `remove_dir_all` does not follow links inside the tree.
+fn wipe_gateway_home(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(std::io::Error::other(
+            "the gateway home is not a plain directory; refusing to wipe through it",
+        )),
+        Ok(_) => wipe_dir_contents(dir),
+    }
+}
+
+/// `systemctl <stop|restart> duduclaw-llama-server.service`: both elements
+/// literals, the verb picked by the closed [`LocalModelAction`].
+fn local_model_argv(action: LocalModelAction) -> [&'static str; 2] {
+    [action.systemctl_verb(), LOCAL_MODEL_UNIT]
+}
+
+async fn dispatch_local_model_service(action: LocalModelAction) -> DispatchResult {
+    let mut cmd = Command::new("systemctl");
+    cmd.args(local_model_argv(action));
+    run(cmd).await
 }
 
 /// Wipe the CONTENTS of every existing directory in
@@ -239,18 +277,41 @@ fn clear_credential_dirs(dirs: &[&Path]) -> Result<Vec<String>, String> {
 /// `Command::arg()` is already injection-safe regardless of content, this
 /// check exists purely to refuse an obviously-wrong request early.
 async fn dispatch_hostname(name: &str) -> DispatchResult {
+    let host = validate_hostname_syntax(name)?;
+    let mut cmd = Command::new("hostnamectl");
+    cmd.args(["set-hostname", "--", host]);
+    run(cmd).await
+}
+
+/// RFC 1123 host name: at most [`MAX_HOSTNAME_LEN`] bytes, dot-separated
+/// labels of 1..=63 ASCII letters, digits and `-`, no label starting or
+/// ending with `-`. The caller may be an agent (see `protocol.rs`), so this
+/// is a whitelist: until 2026-10 only the length was checked and a value
+/// such as `-Hroot@host` reached `hostnamectl` as an option (its `-H`
+/// connects over ssh). The value is also placed after `--`.
+pub(crate) fn validate_hostname_syntax(name: &str) -> Result<&str, SysdError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(SysdError::bad_request("hostname value must not be empty"));
     }
-    if trimmed.chars().count() > MAX_HOSTNAME_LEN {
+    if trimmed.len() > MAX_HOSTNAME_LEN {
         return Err(SysdError::bad_request(format!(
-            "hostname value exceeds {MAX_HOSTNAME_LEN} chars"
+            "hostname value exceeds {MAX_HOSTNAME_LEN} bytes"
         )));
     }
-    let mut cmd = Command::new("hostnamectl");
-    cmd.args(["set-hostname", trimmed]);
-    run(cmd).await
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    if !trimmed.split('.').all(label_ok) {
+        return Err(SysdError::bad_request(
+            "hostname must be letters, digits and '-' in dot-separated labels (no leading or trailing '-')",
+        ));
+    }
+    Ok(trimmed)
 }
 
 /// Pure syntax check for a `SetTimezone { timezone }` value — no
@@ -299,6 +360,16 @@ pub(crate) fn validate_timezone_syntax(tz: &str) -> Result<&str, SysdError> {
             "timezone value has too many path segments",
         ));
     }
+    // Every IANA zone segment starts with a letter or digit; requiring it
+    // keeps a value from ever reading as an option (`-H…`) or a hidden name.
+    if !trimmed
+        .split('/')
+        .all(|seg| seg.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric()))
+    {
+        return Err(SysdError::bad_request(
+            "each timezone segment must start with a letter or digit",
+        ));
+    }
     Ok(trimmed)
 }
 
@@ -340,7 +411,7 @@ async fn dispatch_set_timezone(timezone: &str) -> DispatchResult {
         ));
     }
     let mut cmd = Command::new("timedatectl");
-    cmd.args(["set-timezone", tz]);
+    cmd.args(["set-timezone", "--", tz]);
     run(cmd).await
 }
 
@@ -395,23 +466,29 @@ pub(crate) fn validate_interface_syntax(iface: &str) -> Result<&str, SysdError> 
             "interface name may only contain letters, digits, '_' and '-'",
         ));
     }
+    // Never an option to `networkctl reconfigure` (also placed after `--`).
+    if !trimmed.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric()) {
+        return Err(SysdError::bad_request(
+            "interface name must start with a letter or digit",
+        ));
+    }
     Ok(trimmed)
 }
 
-/// Whitelist check: `<root>/<iface>` must canonicalize to a path still
-/// contained under the canonicalized root — the same containment
-/// discipline [`timezone_exists`] uses, applied to `/sys/class/net`'s
-/// per-interface symlinks. `root` is a parameter so tests can point this
-/// at a temp dir instead of the real sysfs tree.
+/// Whitelist check: `<root>/<iface>` must be an entry directly in `root`.
+/// `iface` already passed [`validate_interface_syntax`] (no `/`, no `.`), so
+/// the join cannot leave `root`. The entry itself is not followed: in real
+/// sysfs every `/sys/class/net/<iface>` is a symlink into `/sys/devices/…`,
+/// so the former "canonicalized target stays under the root" check could
+/// never pass on a real host and refused every interface. `root` is a
+/// parameter so tests can point this at a temp dir instead of the real
+/// sysfs tree.
 fn interface_exists(root: &Path, iface: &str) -> bool {
-    let root_canon = match root.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    match root.join(iface).canonicalize() {
-        Ok(p) => p.starts_with(&root_canon),
-        Err(_) => false,
+    if validate_interface_syntax(iface).is_err() {
+        return false;
     }
+    let candidate = root.join(iface);
+    candidate.parent() == Some(root) && std::fs::symlink_metadata(&candidate).is_ok()
 }
 
 /// Parse `"<ipv4>/<prefix>"` (the `NetworkWiredConfig.address` shape). An
@@ -610,7 +687,7 @@ async fn dispatch_network_wired_config(
     // already succeeded by this point, and losing that success behind a
     // generic error would be misleading.
     let mut reconfigure_cmd = Command::new("networkctl");
-    reconfigure_cmd.args(["reconfigure", iface]);
+    reconfigure_cmd.args(["reconfigure", "--", iface]);
     let (reconfigure_success, reconfigure_stdout, reconfigure_stderr) =
         match reconfigure_cmd.output().await {
             Ok(out) => (
@@ -1615,6 +1692,7 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
         }
         SysdRequest::SshServiceStart => dispatch_ssh_start().await,
         SysdRequest::SshServiceStop => dispatch_ssh_stop().await,
+        SysdRequest::LocalModelService { action } => dispatch_local_model_service(*action).await,
     }
 }
 
@@ -1908,6 +1986,76 @@ mod tests {
         assert!(matches!(result, Err(e) if e.kind == "bad_request"));
     }
 
+    /// P12: the caller may be an agent. Option-shaped, multi-byte, spaced or
+    /// otherwise non-RFC-1123 values never reach `hostnamectl`.
+    #[tokio::test]
+    async fn hostname_is_a_whitelisted_rfc1123_name() {
+        for ok in ["duty-box-01", "a", "box.lan", "  duty-box  ", "x1.y-2.z3"] {
+            assert!(validate_hostname_syntax(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "-Hroot@evil",
+            "--host=root@evil",
+            "-M",
+            "box -H evil",
+            "box;reboot",
+            "box\nx",
+            "盒子",
+            "a..b",
+            ".lan",
+            "box.",
+            "-box",
+            "box-",
+            "a_b",
+            &"a".repeat(64),
+        ] {
+            let result = dispatch_hostname(bad).await;
+            assert!(matches!(result, Err(e) if e.kind == "bad_request"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn value_carrying_argv_puts_the_value_after_a_double_dash() {
+        // Needles assembled at runtime so this test's own text cannot match.
+        let source = include_str!("dispatch.rs");
+        let q = '"';
+        for (verb, value) in [("set-hostname", "host"), ("set-timezone", "tz"), ("reconfigure", "iface")] {
+            let needle = format!("args([{q}{verb}{q}, {q}--{q}, {value}])");
+            assert!(source.contains(&needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn local_model_argv_is_two_literals() {
+        assert_eq!(local_model_argv(LocalModelAction::Stop), ["stop", "duduclaw-llama-server.service"]);
+        assert_eq!(local_model_argv(LocalModelAction::Restart), ["restart", "duduclaw-llama-server.service"]);
+    }
+
+    #[test]
+    fn gateway_home_wipe_empties_the_directory_and_never_follows_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("agents/a")).unwrap();
+        std::fs::write(home.join("config.toml"), "x").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+        wipe_gateway_home(&home).unwrap();
+        assert!(home.is_dir(), "the directory itself survives");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+        assert!(outside.join("keep").exists(), "a symlinked target is not wiped");
+
+        // A home that is itself a symlink is refused, not followed.
+        let redirected = dir.path().join("redirected");
+        std::os::unix::fs::symlink(&outside, &redirected).unwrap();
+        assert!(wipe_gateway_home(&redirected).is_err());
+        assert!(outside.join("keep").exists());
+        // Missing: nothing to wipe.
+        assert!(wipe_gateway_home(&dir.path().join("missing")).is_ok());
+        assert_eq!(GATEWAY_HOME_DIR, "/data/duduclaw");
+    }
+
     /// The two systemd helpers this daemon shells out to live in a directory
     /// that is on no service's `PATH`, so they may only ever be spawned by
     /// absolute path. Pinning the literals here makes an accidental
@@ -2122,6 +2270,25 @@ mod tests {
         std::fs::write(dir.path().join("enp1s0"), b"fake sysfs entry").unwrap();
         assert!(interface_exists(dir.path(), "enp1s0"));
         assert!(!interface_exists(dir.path(), "eth99"));
+        assert!(!interface_exists(dir.path(), "../enp1s0"));
+        // Real sysfs: the entry is a symlink into /sys/devices/….
+        let devices = tempfile::tempdir().unwrap();
+        std::fs::create_dir(devices.path().join("eth0")).unwrap();
+        std::os::unix::fs::symlink(devices.path().join("eth0"), dir.path().join("eth0")).unwrap();
+        assert!(interface_exists(dir.path(), "eth0"));
+    }
+
+    #[test]
+    fn interface_and_timezone_values_never_read_as_options() {
+        for bad in ["-H", "--help", "_x"] {
+            assert!(matches!(validate_interface_syntax(bad), Err(e) if e.kind == "bad_request"), "{bad}");
+        }
+        for bad in ["-Hroot", "Asia/-x", "+0800", "Etc/.hidden", "_x/y"] {
+            assert!(matches!(validate_timezone_syntax(bad), Err(e) if e.kind == "bad_request"), "{bad}");
+        }
+        for ok in ["Etc/GMT+8", "Etc/GMT-8", "America/Port-au-Prince", "Asia/Taipei"] {
+            assert!(validate_timezone_syntax(ok).is_ok(), "{ok}");
+        }
     }
 
     #[test]

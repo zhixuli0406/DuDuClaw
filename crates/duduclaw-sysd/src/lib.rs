@@ -9,11 +9,18 @@
 //! a `systemd-sysupdate` OS image, re-arming first-boot provisioning for a
 //! factory reset, changing the hostname) genuinely require root. Rather
 //! than run the whole gateway as root, or grant it broad sudo/polkit
-//! rules, this crate is a small standalone root daemon exposing exactly
-//! six fixed verbs over a Unix domain socket gated by peer-credential
-//! (`SO_PEERCRED`) verification — the gateway is the only caller that can
-//! ever reach it, and even the gateway can only ever ask for one of the
-//! six fixed things, never an arbitrary command.
+//! rules, this crate is a small standalone root daemon exposing a closed
+//! set of fixed verbs over a Unix domain socket gated by peer-credential
+//! (`SO_PEERCRED`) verification. Only the configured uid can reach it, and
+//! that uid can only ever ask for one of the fixed things, never an
+//! arbitrary command.
+//!
+//! The configured uid is the gateway's, which on DuDuClaw OS is also the
+//! uid the AI employees' CLIs run as: treat every request as coming from an
+//! agent. Parameterised verbs validate hostile input (see [`protocol`]'s
+//! "threat model" section); parameterless verbs (reboot, poweroff, update
+//! apply/rollback, factory reset, …) can be triggered by such a caller,
+//! which is an availability impact, not a privilege escalation.
 //!
 //! Module map:
 //! - [`protocol`] — the wire schema (closed request enum, response
@@ -79,7 +86,8 @@ pub mod server {
 
 pub use client::{SysdClient, SysdClientError};
 pub use protocol::{
-    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, SOCKET_PATH_ENV, SSH_PORT, SSH_UNITS, SshUnit, SysdError,
+    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, GATEWAY_HOME_DIR, LOCAL_MODEL_UNIT, LocalModelAction, SOCKET_PATH_ENV,
+    SSH_PORT, SSH_UNITS, SshUnit, SysdError,
     SysdOpOutput, SysdRequest, SysdResponse, resolve_socket_path,
 };
 pub use server::{SysdServerConfig, bind, serve};

@@ -10,7 +10,7 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape that crate's protocol used)
-//! — the entire caller-reachable surface is thirteen fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is sixteen fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
@@ -63,9 +63,40 @@
 //!   base directory (see `dispatch::dispatch_clear_exhausted_update_target`
 //!   for the H3d §11.7 bug this closes).
 //!
+//! - [`SysdRequest::LocalModelService`] `{ action }` uses the
+//!   [`SysdRequest::SetNtp`] discipline: `action` is a closed
+//!   [`LocalModelAction`] enum (`stop` / `restart`; anything else fails to
+//!   parse), each variant selects one `&'static str` systemctl verb, and the
+//!   unit is the fixed literal [`LOCAL_MODEL_UNIT`]. No caller text reaches
+//!   argv.
+//!
 //! An unrecognized `verb` string, or any malformed JSON, fails
 //! `serde_json::from_str` and the server responds with a structured
 //! `bad_request` error — never a panic, never a silent no-op.
+//!
+//! ## Who the caller is (threat model)
+//!
+//! The server accepts exactly one peer uid. Once the OS runs the gateway
+//! unprivileged and points `--allowed-uid` at it, that uid is the same one
+//! the AI employees' CLIs run as, so **every request must be treated as
+//! attacker-controlled**. The parameterised verbs are built for that: closed
+//! enums or bools for choices, length and character whitelists for strings
+//! (`Hostname`, `SetTimezone`, `NetworkWiredConfig`'s `interface`,
+//! `ClearExhaustedUpdateTarget`), typed re-serialisation for file content,
+//! fixed write targets, and no path ever joined from caller text (the one
+//! file a caller string selects, the timezone, is resolved inside
+//! `/usr/share/zoneinfo` and must be a regular file there).
+//!
+//! The parameterless verbs ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
+//! [`SysdRequest::SysupdateApply`], [`SysdRequest::UpdateRollback`],
+//! [`SysdRequest::FactoryReset`], [`SysdRequest::ClearNetworkCredentials`],
+//! [`SysdRequest::SshServiceStart`] / [`SysdRequest::SshServiceStop`],
+//! [`SysdRequest::LocalModelService`]) carry nothing to inject, but an agent
+//! that can reach the socket can still trigger them. That is an
+//! availability impact (a reboot, a wiped home, a stopped model service, an
+//! SSH window), not a privilege escalation: each runs only its fixed
+//! command. Gating them on an operator approval belongs to the gateway, not
+//! this daemon, and is not done here.
 
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +188,38 @@ pub const SSH_UNITS: [SshUnit; 2] = [
 /// port in the OS firewall.
 pub const SSH_PORT: u16 = 22;
 
+/// The gateway's data directory on the appliance (`DUDUCLAW_HOME`, both OS
+/// lines: `duduclaw-gateway.service` sets `Environment=DUDUCLAW_HOME=
+/// /data/duduclaw`). [`SysdRequest::FactoryReset`] wipes its contents on the
+/// root side: once the gateway runs rootless, files written through its
+/// container engine can belong to subordinate uids the gateway itself cannot
+/// delete. A closed constant, never a caller-supplied path.
+pub const GATEWAY_HOME_DIR: &str = "/data/duduclaw";
+
+/// The local model service unit ([`SysdRequest::LocalModelService`]). Must
+/// match `duduclaw_inference::appliance::LLAMA_SERVER_UNIT` and the image
+/// recipe.
+pub const LOCAL_MODEL_UNIT: &str = "duduclaw-llama-server.service";
+
+/// What [`SysdRequest::LocalModelService`] does to [`LOCAL_MODEL_UNIT`]. A
+/// closed set: anything else fails to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalModelAction {
+    Stop,
+    Restart,
+}
+
+impl LocalModelAction {
+    /// The `systemctl` verb, a literal.
+    pub fn systemctl_verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
 /// The closed verb set. See module docs for the "why no free-form
 /// command" reasoning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,16 +252,18 @@ pub enum SysdRequest {
     /// until this verb did. See `dispatch::dispatch_update_rollback` for the
     /// two tiers and why the second one is needed.
     UpdateRollback,
-    /// Wipe the `duduclaw-kiosk` service user's home directory
+    /// Wipe the contents of the gateway's data directory
+    /// ([`GATEWAY_HOME_DIR`]; a failure aborts before anything else, no
+    /// reboot), then the `duduclaw-kiosk` service user's home directory
     /// (`/data/duduclaw-kiosk`, best-effort), re-arm first-boot provisioning
     /// (`systemctl enable duduclaw-firstboot-provision.service`,
     /// best-effort) then `systemctl reboot`. Deliberately carries no
-    /// path/param — wiping the GATEWAY's data directory does not need root
-    /// (the `duduclaw` user already owns it) and stays a caller-side
-    /// filesystem operation, but wiping `/data/duduclaw-kiosk` DOES need
-    /// root: it is owned by the *different* unprivileged `duduclaw-kiosk`
-    /// user (postinst.d/20-users-and-units.sh), which is the sysd peer
-    /// (`duduclaw`) has no access to. This closes a real bug: the shell
+    /// path/param: both directories are closed constants. Both need root:
+    /// the gateway home can hold files owned by the rootless container
+    /// engine's subordinate uids (until 2026-10 the gateway wiped it itself),
+    /// and `/data/duduclaw-kiosk` is owned by the *different* unprivileged
+    /// `duduclaw-kiosk` user (postinst.d/20-users-and-units.sh), which the
+    /// sysd peer has no access to. This closes a real bug: the shell
     /// persists its OOBE-completion flag at
     /// `/data/duduclaw-kiosk/shell/oobe_state.json` (see
     /// `duduclaw-shell/src/oobe/persistence.rs`), so without this wipe a
@@ -312,6 +377,11 @@ pub enum SysdRequest {
     /// relies on. It reports `success: false` when a session or the port is
     /// still open afterwards, so the window's close error is not papered over.
     SshServiceStop,
+    /// `systemctl stop|restart duduclaw-llama-server.service`: the
+    /// appliance's local model service, which the gateway (no longer root)
+    /// cannot control itself. `action` is a closed enum; the unit is the
+    /// fixed literal [`LOCAL_MODEL_UNIT`].
+    LocalModelService { action: LocalModelAction },
 }
 
 impl SysdRequest {
@@ -335,6 +405,7 @@ impl SysdRequest {
             SysdRequest::ClearExhaustedUpdateTarget { .. } => "clear_exhausted_update_target",
             SysdRequest::SshServiceStart => "ssh_service_start",
             SysdRequest::SshServiceStop => "ssh_service_stop",
+            SysdRequest::LocalModelService { .. } => "local_model_service",
         }
     }
 }
@@ -433,6 +504,29 @@ mod tests {
         let s = serde_json::to_string(&SysdRequest::SshServiceStop).unwrap();
         assert_eq!(s, r#"{"verb":"ssh_service_stop"}"#);
         assert_eq!(SysdRequest::SshServiceStop.verb_name(), "ssh_service_stop");
+    }
+
+    #[test]
+    fn local_model_service_has_a_closed_action_and_a_stable_wire_shape() {
+        for (action, word) in [(LocalModelAction::Stop, "stop"), (LocalModelAction::Restart, "restart")] {
+            let req = SysdRequest::LocalModelService { action };
+            let s = serde_json::to_string(&req).unwrap();
+            assert_eq!(s, format!(r#"{{"verb":"local_model_service","params":{{"action":"{word}"}}}}"#));
+            assert_eq!(serde_json::from_str::<SysdRequest>(&s).unwrap(), req);
+            assert_eq!(req.verb_name(), "local_model_service");
+            assert_eq!(action.systemctl_verb(), word);
+        }
+        for raw in [
+            r#"{"verb":"local_model_service","params":{"action":"start"}}"#,
+            r#"{"verb":"local_model_service","params":{"action":"stop; reboot"}}"#,
+            r#"{"verb":"local_model_service","params":{"action":"stop","unit":"sshd.service"}}"#,
+            r#"{"verb":"local_model_service"}"#,
+            r#"{"verb":"local_model_service","params":{"action":"Stop"}}"#,
+        ] {
+            assert!(serde_json::from_str::<SysdRequest>(raw).is_err(), "{raw}");
+        }
+        assert_eq!(LOCAL_MODEL_UNIT, "duduclaw-llama-server.service");
+        assert_eq!(GATEWAY_HOME_DIR, "/data/duduclaw");
     }
 
     #[test]

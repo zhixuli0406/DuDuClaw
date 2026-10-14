@@ -15,6 +15,9 @@
 
 ### Security
 - 容器資源上限改成先驗證再用：容器引擎回報 rootless 時，任務沙箱、腳本沙箱與電腦操作會先跑一個 32 MiB 記憶體、32 個行程上限的臨時容器，讀回它自己的 `memory.max` 與 `pids.max`。讀到 `max`（cgroup 控制器沒委派時，rootless 引擎會接受上限卻不套用）、讀到跟要求不同的值，或檢查沒跑完，這三項功能就停用並說明原因（任務沙箱代碼 `resource_limits_unenforced`），doctor 也會列出。一般 rootful Docker 不做這個檢查。結果在行程存活期間沿用，失敗則一分鐘後重試。尚未在真的 rootless Podman 上實測。
+- `duduclaw-sysd` 的呼叫者改成一律當作不可信（OS 之後會把允許的 uid 從 root 改成閘道的 uid，而 AI 員工的 CLI 也用這個 uid）。主機名稱改成 RFC 1123 白名單：之前只檢查長度，`-` 開頭的值會被 `hostnamectl` 當成選項，其中 `-H` 會以 root 走 ssh 連線。時區與網路介面名稱必須以英數字開頭，這類值一律放在 `--` 之後。順手修正網路介面存在檢查：真實 sysfs 的 `/sys/class/net/<介面>` 是符號連結，原本的檢查在實機上永遠判定介面不存在。不帶參數的指令（重開機、關機、更新、回退、恢復原廠等）這樣的呼叫者仍能觸發，屬可用性風險，不是提權，本版沒有另加關卡。
+- 本地模型服務的停止與重啟改走 `duduclaw-sysd` 新增的固定指令（只能對 `duduclaw-llama-server.service` 停止或重啟），閘道不再自己執行 `systemctl`；DuDuClaw OS 上連不到 sysd 時回報「無法控制」，不會退回直接呼叫 `systemctl`。
+- 恢復原廠時，閘道資料目錄（`/data/duduclaw`）改由 `duduclaw-sysd` 以 root 依固定路徑清除，順序是：先清網路設定（有勾選時）、再清閘道資料目錄（失敗就中止、不重開機）、再清 kiosk 家目錄、重新啟用首次開機設定、重開機。閘道本身不再自己清。閘道的資料目錄不是那個固定路徑時拒絕執行；DuDuClaw OS 上連不到 sysd 時，恢復原廠會在刪除任何東西前拒絕，不再只清一半。非 DuDuClaw OS 的安裝仍由閘道自己清。
 - DuDuClaw OS 維護模式的 SSH 開關原本操作 `ssh.service`，Yocto 映像沒有這個單元，所以開關沒有作用，關閉時也結束不了任何東西。`duduclaw-sysd` 改成從固定清單（`dropbear.socket`、`ssh.service`）找映像上實際有的單元。開啟時先把 22 埠加進防火牆的 `maintenance_tcp_ports` 集合再啟動 dropbear；防火牆加不進去、或防火牆設定存在卻沒有載入時就拒絕開啟，啟動失敗會把 22 埠移除。關閉時停掉所有找到的 SSH 單元、透過 cgroup 結束所有連線行程（上游 `dropbear@.service` 是 `KillMode=process`，只停單元會留下背景程式），移除 22 埠，事後確認沒有行程、單元與埠還開著，查不清楚的一律回報失敗。維護頁的「SSH 實際狀態」改看同一組單元與連線行程，查不清楚時顯示未知。gateway 端開啟失敗時也會執行一次關閉，避免 sysd 其實已開啟、回應卻遺失時留下沒有紀錄的 SSH。
   - 需要搭配下一版 OS 映像（防火牆加入這個集合、dropbear 預設關閉、基礎版也裝防火牆），該版尚未發布；在 OS 映像上尚未實測。
   - 舊映像上的行為：OS v0.3.0 以前的桌面版與 Debian 線的防火牆沒有這個集合，開啟會被拒絕；開啟被拒後 gateway 補做的關閉會停掉原本預設就在跑的 dropbear；v0.3.0 以前的基礎版沒有防火牆，可以開啟，關閉時同樣會停掉 dropbear。兩者重開機後 dropbear 都會再啟動。
