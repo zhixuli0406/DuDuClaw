@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.73.2] - 2026-10-14 — OS v0.3.0 公開文件更正
+
 ### Changed
 - 公開文件跟上 DuDuClaw OS v0.3.0（2026-10-14 發布，內嵌平台 v1.73.1）：三語 README 的 OS 段落與功能表、`docs/features/50`、`52` 與 `docs/guides/appliance-build.md`（皆含 zh-TW／ja-JP）的現行版本、測試範圍與信任鏈狀態改寫成 v0.3.0；v0.2.0 與 v0.1.0 仍留在 Releases 頁面可回滾。Secure Boot 簽章、dm-verity、TPM2 到 v0.3.0 仍未啟用。
 - 鎖定畫面免信箱解鎖註明從 OS v0.3.0 起提供（`duduclaw-shell` 1.65.3＋平台 v1.73.1），v0.2.0 以前仍以 `admin@local` 驗證。
