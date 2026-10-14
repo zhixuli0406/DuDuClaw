@@ -49,10 +49,11 @@ shell）とgateway＋dashboard、プリロード済みアプリ、アプリ互�
 備えます。Secure Boot署名、dm-verityによるルート検証、TPM2鍵封印は、こ
 のlayerの中ではビルド時のオーバーレイオプション
 （`kas/sb-signing.yml`、`kas/tpm-luks.yml`）として存在しますが、現行の
-v0.2.0（プラットフォームv1.63.0を同梱）時点でも**まだ有効化されていま
+v0.3.0（プラットフォームv1.73.1を同梱）時点でも**まだ有効化されていま
 せん**。公開されているimageは今もSecure Bootをオフにした状態で起動しま
-す——`release-os.sh`は現在`serial1.yml`というreleaseオーバーレイのみを
-連結します。インストーラーISOはベースイメージ`duduclaw-image-ab`（同じ
+す。`release-os.sh`はビルドごとにreleaseオーバーレイを1つだけ重ね（既
+定は`serial1.yml`、v0.3.0では`release-linux-builder.yml`）、どちらも署
+名、verity、TPMを有効にしません。インストーラーISOはベースイメージ`duduclaw-image-ab`（同じ
 構成とデスクトップシェルだが、アプリ層なし）を書き込みます。デスクトッ
 プ版専用のインストーラーISO（`duduclaw-os-installer-desktop-…`）は
 v0.1.0（2026-09-04）以降、これと並んで出荷されています。定義されている

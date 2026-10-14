@@ -125,18 +125,28 @@ gateway, not by the desktop.
 
 ## Security Design
 
-- **No new process runs as root just to make the dashboard's power/update
-  buttons work.** The handful of operations that genuinely need root
-  privileges — reboot, shutdown, applying an OS update, re-arming first-boot
-  setup — are handled by a small, separate helper process that speaks
-  exactly six fixed commands over a local Unix socket and checks the
-  identity of whoever's asking before doing anything. If that identity
-  check isn't configured, it refuses every request rather than defaulting
-  to trust.
-- **Closed by default, on every port.** The firewall denies all inbound
-  connections except the dashboard port and local network discovery.
-  Remote SSH access is off out of the box and only turns on if you
-  explicitly enable it from the dashboard.
+- **Root-level operations go through a small helper with a fixed command
+  list.** Operations that need root privileges (reboot, shutdown, applying
+  or rolling back an OS update, factory reset, network and time settings)
+  are handled by a separate helper, `duduclaw-sysd`, that accepts exactly
+  15 fixed commands over a local Unix socket and checks the caller's user
+  id before doing anything. If no allowed caller is configured, it refuses
+  every request. On the current images the gateway itself still runs as
+  root, and the helper is configured to accept root, so this split does
+  not yet limit what the gateway can do; moving the gateway to its own
+  non-root user is planned.
+- **The desktop edition denies inbound connections by default.** Its
+  firewall drops everything inbound except the dashboard port (18789),
+  mDNS for local network discovery (UDP 5353) and basic ICMP such as ping.
+  The image includes the dropbear SSH server, which listens on port 22
+  from boot, but the desktop edition's firewall has no rule for it, so SSH
+  cannot be reached from the network. The base edition (written by the
+  plain `installer` ISO) ships without this firewall, so on it dropbear
+  and the dashboard port are reachable from the LAN. The SSH switch in the
+  dashboard's maintenance mode does not change either case today: it
+  starts and stops a unit named `ssh.service` (the name used by the
+  earlier Debian-based image), which these images do not have, and it
+  never adds a firewall rule.
 - **The webhook relay never sees your channel secrets.** For webhook-style
   channels that need it, the relay's job is limited to forwarding an
   incoming request's raw bytes to the box over a connection the box opened
@@ -144,9 +154,9 @@ gateway, not by the desktop.
   verifies a signature, never stores a channel secret, and never parses a
   payload. If the relay is ever compromised, it has nothing useful to leak.
 - **The lock screen checks your password without needing your email.**
-  (Shell `duduclaw-shell` 1.65.3 or later with platform v1.73.1 or later.
-  The published v0.2.0 image predates it: its lock screen still checks the
-  password as `admin@local`.)
+  (DuDuClaw OS v0.3.0 and later, which ship shell `duduclaw-shell` 1.65.3
+  with platform v1.73.1. On v0.2.0 and earlier images the lock screen still
+  checks the password as `admin@local`.)
   It asks the gateway `POST /api/owner/verify` with `{"password": "..."}`,
   which finds the owner account by its owner flag, so unlocking keeps
   working after you replace `admin@local` with your own address. The
@@ -156,9 +166,12 @@ gateway, not by the desktop.
   Every local caller shares one attempt limit with a local `/api/login` for
   the owner (5 tries per 15 minutes), so it is not a second way to guess the
   password. The flip side: any program running on the machine can use up
-  those 5 tries and keep the lock screen refusing for up to 15 minutes. We
-  accept that, because a hostile program already running on the box is a
-  bigger problem than a locked screen.
+  those 5 tries, and because the 15-minute window is fixed, a program that
+  keeps running can use them up again each time the window resets, so the
+  lock screen can keep refusing for as long as that program runs. We accept
+  that, because a hostile program already running on the box is a bigger
+  problem than a locked screen; the fix is to find that program and stop
+  it.
 - **Nothing about the image is "trust us."** The build recipe that produces
   the image is public — see Building It Yourself below — so anyone can
   read every line that goes into the box before flashing it, rather than
@@ -180,32 +193,38 @@ CHANGELOG, and SECURITY notes — under `/docs/`.
 ## Current Status
 
 This is a young part of the platform, and it's worth being direct about
-where it stands rather than rounding up. As of DuDuClaw OS v0.2.0
-(2026-09-09, embedding platform v1.63.0; v0.1.0 from 2026-09-04 stays
-available as a rollback target):
+where it stands rather than rounding up. As of DuDuClaw OS v0.3.0
+(2026-10-14, embedding platform v1.73.1; the earlier v0.2.0 and v0.1.0
+releases stay available on the Releases page as rollback targets):
 
 - x86-64 images exist and are published for both machines, in three forms
   per machine (the desktop-edition whole-disk image, a live installer ISO
   for the desktop edition, and a live installer ISO for the base image),
   all signed with SHA-256 and minisign (the whole-disk image also ships a
-  `.manifest.json` for provenance only). The QEMU machine is boot-verified
-  for every form; the real-hardware machine (`duduclaw-genericx86-64`) has
-  been config-audited only — it has not booted on real hardware yet.
+  `.manifest.json` for provenance only). For v0.3.0, the QEMU machine's
+  whole-disk image and both of its installer ISOs were booted under QEMU
+  (software emulation, no KVM) to a login prompt or the live environment's
+  automatic login; the installer wizard was not run end to end. The
+  real-hardware machine (`duduclaw-genericx86-64`) was built but not
+  boot-tested, and it has not booted on real hardware yet.
 - Full real-hardware validation — burn the media, boot it, install, walk
   through setup, exchange a message on a chat channel, apply an OS update,
   force a rollback, and run a factory reset, all on the actual certified
   hardware — hasn't happened yet. It is the most important open item.
 - The trust chain is wired in the build layer but only partly switched on
-  in the published images. Shipped since v0.1.0 and unchanged in v0.2.0:
-  A/B atomic update with rollback, a read-only root in the desktop edition,
-  and a minisign signature on every release artifact. Still **not** enabled
-  as of v0.2.0: Secure Boot signing of the UKIs and dm-verity root
+  in the published images. Shipped since v0.1.0 and unchanged through
+  v0.3.0: A/B atomic update with rollback, a read-only root in the desktop
+  edition, and a minisign signature on every release artifact. Still
+  **not** enabled as of v0.3.0: Secure Boot signing of the UKIs and dm-verity root
   verification (both come from the `sb-signing` build overlay), and TPM2 +
   LUKS key sealing (the `tpm-luks` overlay; its automatic enrollment is
-  still an open defect that needs a real-hardware TPM to close). The
-  v0.2.0 build chains neither overlay — `release-os.sh` today chains only
-  the `serial1.yml` release overlay — so the published images still boot
-  with Secure Boot off.
+  still an open defect that needs a real-hardware TPM to close). No
+  release so far has chained either overlay: `release-os.sh` adds one
+  release overlay per build (`serial1.yml` by default; v0.3.0 used
+  `release-linux-builder.yml`, which only sets build parallelism and turns
+  off SPDX output). The published v0.3.0 whole-disk images have no verity
+  partition, and their UKIs and boot loader carry no signature, so they
+  still boot with Secure Boot off.
 - The OS is versioned independently of the platform (`0.x` = bring-up;
   `1.0.0` will mark the first GA). Release-by-release status lives in the
   [DuDuClaw-OS CHANGELOG](https://os.duduclaw.dudustudio.monster/docs/os/changelog/).

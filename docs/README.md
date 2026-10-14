@@ -1,6 +1,6 @@
 # DuDuClaw Documentation
 
-> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.63.0).
+> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform. What shipped in each version is in [CHANGELOG.md](../CHANGELOG.md).
 
 ---
 

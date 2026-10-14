@@ -40,9 +40,10 @@ OS 本身有自己的 repo、自己的 release 線、自己的 changelog。
 ＋ shell）搭配 gateway ＋ dashboard、預載應用程式，以及 app 相容層。
 Secure Boot 簽章、dm-verity root 驗證與 TPM2 金鑰封裝在這個 layer 裡都是
 建置期的 overlay 選項（`kas/sb-signing.yml`、`kas/tpm-luks.yml`），但截至
-現行 v0.2.0（內嵌平台 v1.63.0）**仍然沒有**啟用，開機時 Secure Boot 依舊
-是關閉的——`release-os.sh` 目前只串連 `serial1.yml` 這個 release
-overlay。安裝器 ISO 寫入的是基礎版 `duduclaw-image-ab`（同樣的架構與桌面
+現行 v0.3.0（內嵌平台 v1.73.1）**仍然沒有**啟用，開機時 Secure Boot 依舊
+是關閉的。`release-os.sh` 每次建置只疊一個 release overlay（預設
+`serial1.yml`，v0.3.0 用 `release-linux-builder.yml`），兩者都不會開啟簽章、
+verity 或 TPM。安裝器 ISO 寫入的是基礎版 `duduclaw-image-ab`（同樣的架構與桌面
 殼層，但沒有 app 層）；桌面版專屬的安裝器 ISO
 （`duduclaw-os-installer-desktop-…`）自 v0.1.0（2026-09-04）起就與它一起
 出貨。目前定義了兩個機型：`duduclaw-qemux86-64`（QEMU bring-up 目標，已
