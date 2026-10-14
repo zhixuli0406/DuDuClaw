@@ -153,9 +153,10 @@ gateway, not by the desktop.
   pick this up from the next OS release (embedding platform v1.73.3 or
   later, with dropbear off by default and the firewall in the base edition
   too), which has not shipped yet. On images up to v0.3.0, the desktop
-  edition's firewall has no such set, so opening is refused; the base
-  edition has no firewall, so closing stops the dropbear that was already
-  running, and it starts again on the next boot. Also, no account on the
+  edition's firewall has no such set, so opening is refused, and the close
+  that follows the refusal stops the dropbear that was already running;
+  the base edition has no firewall, and closing likewise stops that
+  dropbear. On both, dropbear starts again on the next boot. Also, no account on the
   current images can log in over SSH (root is locked and dropbear refuses
   root logins), so for now the switch only controls the port.
 - **The webhook relay never sees your channel secrets.** For webhook-style

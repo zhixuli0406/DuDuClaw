@@ -1315,10 +1315,16 @@ fn classify_firewall(table_found: Option<bool>, other_error: Option<String>, con
     }
 }
 
-/// nft reports a missing table, set or element with ENOENT's message.
+/// nft reports a missing table, set or element with an ENOENT error line.
 fn nft_says_missing(stderr: &str) -> bool {
-    stderr.contains("No such file or directory")
+    stderr
+        .lines()
+        .any(|line| line.trim_start().starts_with("Error: No such file or directory"))
 }
+
+/// The cgroup v2 root marker. A session cgroup directory that does not exist
+/// means "no sessions" only on a v2 host; anywhere else the path says nothing.
+const CGROUP_V2_MARKER: &str = "/sys/fs/cgroup/cgroup.controllers";
 
 async fn firewall_state() -> Firewall {
     let config_exists = Path::new(FIREWALL_CONFIG).exists();
@@ -1400,7 +1406,13 @@ fn cgroup_process_count(dir: &Path) -> std::io::Result<usize> {
 /// `cgroup.kill` (Linux 5.14+) kills the whole subtree atomically.
 async fn end_ssh_sessions(cgroup: &Path) -> Result<(), String> {
     if !cgroup.is_dir() {
-        return Ok(());
+        if Path::new(CGROUP_V2_MARKER).exists() {
+            return Ok(());
+        }
+        return Err(format!(
+            "{} is missing and this host is not on cgroup v2, so open SSH sessions cannot be checked",
+            cgroup.display()
+        ));
     }
     if let Err(e) = std::fs::write(cgroup.join("cgroup.kill"), "1") {
         return Err(format!("writing {}/cgroup.kill failed: {e}", cgroup.display()));
@@ -1680,6 +1692,7 @@ mod tests {
         ));
         assert!(nft_says_missing("Error: No such file or directory\nlist table inet filter"));
         assert!(!nft_says_missing("Error: Operation not permitted"));
+        assert!(!nft_says_missing("Error: Could not process rule: No such file or directory"));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 ### Security
 - DuDuClaw OS 維護模式的 SSH 開關原本操作 `ssh.service`，Yocto 映像沒有這個單元，所以開關沒有作用，關閉時也結束不了任何東西。`duduclaw-sysd` 改成從固定清單（`dropbear.socket`、`ssh.service`）找映像上實際有的單元。開啟時先把 22 埠加進防火牆的 `maintenance_tcp_ports` 集合再啟動 dropbear；防火牆加不進去、或防火牆設定存在卻沒有載入時就拒絕開啟，啟動失敗會把 22 埠移除。關閉時停掉所有找到的 SSH 單元、透過 cgroup 結束所有連線行程（上游 `dropbear@.service` 是 `KillMode=process`，只停單元會留下背景程式），移除 22 埠，事後確認沒有行程、單元與埠還開著，查不清楚的一律回報失敗。維護頁的「SSH 實際狀態」改看同一組單元與連線行程，查不清楚時顯示未知。gateway 端開啟失敗時也會執行一次關閉，避免 sysd 其實已開啟、回應卻遺失時留下沒有紀錄的 SSH。
   - 需要搭配下一版 OS 映像（防火牆加入這個集合、dropbear 預設關閉、基礎版也裝防火牆），該版尚未發布；在 OS 映像上尚未實測。
-  - 舊映像上的行為：OS v0.3.0 以前的桌面版與 Debian 線的防火牆沒有這個集合，開啟會被拒絕；v0.3.0 以前的基礎版沒有防火牆，可以開啟，關閉時會停掉原本預設就在跑的 dropbear，但重開機後它又會啟動。
+  - 舊映像上的行為：OS v0.3.0 以前的桌面版與 Debian 線的防火牆沒有這個集合，開啟會被拒絕；開啟被拒後 gateway 補做的關閉會停掉原本預設就在跑的 dropbear；v0.3.0 以前的基礎版沒有防火牆，可以開啟，關閉時同樣會停掉 dropbear。兩者重開機後 dropbear 都會再啟動。
   - 目前的映像上沒有能透過 SSH 登入的帳號：root 已鎖定，dropbear 預設也禁止 root 登入（`-w`）。所以這個開關目前只能控制連接埠，維護 SSH 要用什麼帳號登入還沒決定。
 - DuDuClaw OS 恢復原廠時勾選「一併清除網路設定」，在 Yocto 映像上其實沒有刪掉任何 Wi-Fi 憑證：`duduclaw-sysd` 只清 Debian 版的 `/data/network/iwd`，Yocto 版存在 `/data/system/iwd`。現在兩個位置都會清，兩個都找不到就回報失敗，不再當作已清除。
 - rustls 從 0.23.45 升到 0.23.46（主程式與桌面版），修正 2026-10-14 公布的四則公告：用戶端 session 值的 `Debug` 輸出會帶出 TLS 秘密（RUSTSEC-2026-0346，medium）、ECH 被拒後緩衝資料送往外層伺服器（RUSTSEC-2026-0347）、Brotli 憑證解壓在驗證前最多配置 1 GiB（RUSTSEC-2026-0348）、未驗證的 ServerHello 可讓之後的連線降級為傳統金鑰交換（RUSTSEC-2026-0349）；後三則為 low。v1.73.2 以前的版本都含 0.23.45。

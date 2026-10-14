@@ -573,7 +573,12 @@ pub async fn ssh_service_observed_active() -> Option<bool> {
             _ => return None, // empty or unrecognized — no confident answer
         }
         if let Some(cgroup) = unit.session_cgroup {
-            match cgroup_has_processes(std::path::Path::new(cgroup)) {
+            let cgroup = std::path::Path::new(cgroup);
+            // A missing directory means "no sessions" only on a cgroup v2 host.
+            if !cgroup.is_dir() && !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+                return None;
+            }
+            match cgroup_has_processes(cgroup) {
                 Ok(true) => return Some(true),
                 Ok(false) => {}
                 Err(_) => return None,
