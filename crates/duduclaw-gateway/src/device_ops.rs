@@ -287,20 +287,47 @@ impl DeviceOps for SystemDeviceOps {
 /// already owns, so it is delegated straight to `SystemDeviceOps`'s local
 /// shell-out rather than duplicated here.
 pub struct SysdDeviceOps {
-    client: duduclaw_sysd::SysdClient,
+    client: SysdTransport,
+}
+
+/// How a [`SysdDeviceOps`] reaches sysd.
+pub enum SysdTransport {
+    /// The sysd Unix socket (the gateway process).
+    Socket(duduclaw_sysd::SysdClient),
+    /// The gateway's signed loopback route (`crate::sysd_route`), for the
+    /// separate `mcp-server` process: sysd may answer only the gateway's
+    /// main process (`--require-main-pid-of`).
+    Gateway(std::path::PathBuf),
+}
+
+impl SysdTransport {
+    pub async fn call(
+        &self,
+        req: &duduclaw_sysd::SysdRequest,
+    ) -> Result<duduclaw_sysd::SysdOpOutput, duduclaw_sysd::SysdClientError> {
+        match self {
+            Self::Socket(client) => client.call(req).await,
+            Self::Gateway(home) => crate::sysd_route::call_via_gateway(home, req).await,
+        }
+    }
 }
 
 impl Default for SysdDeviceOps {
     fn default() -> Self {
         Self {
-            client: duduclaw_sysd::SysdClient::from_env(),
+            client: SysdTransport::Socket(duduclaw_sysd::SysdClient::from_env()),
         }
     }
 }
 
 impl SysdDeviceOps {
     pub fn new(client: duduclaw_sysd::SysdClient) -> Self {
-        Self { client }
+        Self { client: SysdTransport::Socket(client) }
+    }
+
+    /// Reach sysd through the gateway route of `home` (mcp-server process).
+    pub fn via_gateway(home: &Path) -> Self {
+        Self { client: SysdTransport::Gateway(home.to_path_buf()) }
     }
 
     /// Not part of the `DeviceOps` trait — there is no `device.*`
@@ -418,7 +445,7 @@ impl SysdDeviceOps {
 /// other `DeviceOps` impl returns, so callers (handlers.rs) don't need to
 /// know which backend answered.
 async fn sysd_call(
-    client: &duduclaw_sysd::SysdClient,
+    client: &SysdTransport,
     req: duduclaw_sysd::SysdRequest,
 ) -> OpResult {
     match client.call(&req).await {
@@ -507,11 +534,43 @@ impl DeviceOps for SysdDeviceOps {
 /// human-triggered operation and avoids making every `device.*` RPC pay
 /// for a connect probe just to decide which backend to use.
 pub fn select_device_ops() -> Box<dyn DeviceOps> {
-    if duduclaw_core::is_appliance() && duduclaw_sysd::resolve_socket_path().exists() {
-        Box::new(SysdDeviceOps::default())
-    } else {
-        Box::new(SystemDeviceOps)
+    match current_backend() {
+        Backend::Gateway(home) => Box::new(SysdDeviceOps::via_gateway(home)),
+        Backend::Socket => Box::new(SysdDeviceOps::default()),
+        Backend::Local => Box::new(SystemDeviceOps),
     }
+}
+
+/// Which way privileged device operations go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend<'a> {
+    /// No sysd: `SystemDeviceOps` (off the appliance, or sysd not up yet).
+    Local,
+    /// The sysd socket (the gateway process on an appliance).
+    Socket,
+    /// The gateway's signed route (an `mcp-server` process on an appliance).
+    Gateway(&'a Path),
+}
+
+/// The decision (pure). On an appliance, a process switched to forwarding
+/// (`sysd_route::forward_sysd_through_gateway`, set by `mcp-server`) always
+/// goes through the gateway, whether or not it could open the socket, and
+/// never falls back to it.
+pub fn backend<'a>(is_appliance: bool, socket_exists: bool, forward_home: Option<&'a Path>) -> Backend<'a> {
+    match (is_appliance, forward_home) {
+        (false, _) => Backend::Local,
+        (true, Some(home)) => Backend::Gateway(home),
+        (true, None) if socket_exists => Backend::Socket,
+        (true, None) => Backend::Local,
+    }
+}
+
+fn current_backend() -> Backend<'static> {
+    backend(
+        duduclaw_core::is_appliance(),
+        duduclaw_sysd::resolve_socket_path().exists(),
+        crate::sysd_route::forward_home(),
+    )
 }
 
 /// Same condition [`select_device_ops`] uses, but for the system-settings
@@ -522,10 +581,10 @@ pub fn select_device_ops() -> Box<dyn DeviceOps> {
 /// backend reachable", which callers map to a `backend_unavailable` refusal
 /// rather than attempting a local shell-out that would need root anyway.
 pub fn select_sysd_ops() -> Option<SysdDeviceOps> {
-    if duduclaw_core::is_appliance() && duduclaw_sysd::resolve_socket_path().exists() {
-        Some(SysdDeviceOps::default())
-    } else {
-        None
+    match current_backend() {
+        Backend::Gateway(home) => Some(SysdDeviceOps::via_gateway(home)),
+        Backend::Socket => Some(SysdDeviceOps::default()),
+        Backend::Local => None,
     }
 }
 
@@ -911,7 +970,7 @@ mod tests {
         #[tokio::test]
         async fn the_real_server_rejects_an_unknown_verb_in_the_detected_shape() {
             let server = TestServer::spawn(Some(current_uid())).await;
-            let path = server.device_ops().client.socket_path().to_path_buf();
+            let path = server.socket_path.clone();
             let raw = tokio::task::spawn_blocking(move || {
                 use std::io::{Read, Write};
                 let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
@@ -927,6 +986,30 @@ mod tests {
             let err = resp.error.unwrap();
             assert!(is_unknown_verb_rejection(&duduclaw_sysd::SysdClientError::Rejected { kind: err.kind, message: err.message }));
             server.stop().await;
+        }
+
+        /// The mcp-server process forwards through the gateway on an
+        /// appliance, never the socket; the gateway process uses the socket.
+        #[test]
+        fn backend_choice_forwards_mcp_server_calls_through_the_gateway() {
+            let home = std::path::Path::new("/data/duduclaw");
+            assert_eq!(backend(false, true, Some(home)), Backend::Local, "off the appliance nothing changes");
+            assert_eq!(backend(false, true, None), Backend::Local);
+            assert_eq!(backend(true, true, Some(home)), Backend::Gateway(home));
+            assert_eq!(backend(true, false, Some(home)), Backend::Gateway(home), "no socket fallback either way");
+            assert_eq!(backend(true, true, None), Backend::Socket);
+            assert_eq!(backend(true, false, None), Backend::Local);
+        }
+
+        /// Forwarding with no gateway listening is an error, not a direct
+        /// sysd call.
+        #[tokio::test]
+        async fn forwarding_to_an_unreachable_gateway_fails_closed() {
+            let home = tempfile::tempdir().unwrap();
+            // A port nothing listens on.
+            std::fs::write(home.path().join("config.toml"), "[gateway]\nport = 9\n").unwrap();
+            let ops = SysdDeviceOps::via_gateway(home.path());
+            assert!(matches!(ops.reboot().await, Err(DeviceOpError::Unsupported(_))));
         }
 
         #[test]

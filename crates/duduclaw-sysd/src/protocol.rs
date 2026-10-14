@@ -95,10 +95,11 @@
 //!    speak with its pid, and (b) the gateway never hands a connected sysd
 //!    socket to a child: the client opens one connection per call and drops
 //!    it when the call returns, and Rust std / tokio create every socket with
-//!    `SOCK_CLOEXEC`, so a spawned CLI does not inherit it. With the flag on,
-//!    sysd calls made from a separate `duduclaw mcp-server` process (the
-//!    `os_*` MCP tools) are refused like any agent's; they need a route
-//!    through the gateway process.
+//!    `SOCK_CLOEXEC`, so a spawned CLI does not inherit it. The `os_*` MCP
+//!    tools run in a separate `duduclaw mcp-server` process and therefore
+//!    reach sysd through the gateway's signed loopback route
+//!    (`duduclaw_gateway::sysd_route`, a closed verb subset), never this
+//!    socket.
 //! 2. **Every request is still treated as attacker-controlled.** The parameterised verbs are built for that: closed
 //! enums or bools for choices, length and character whitelists for strings
 //! (`Hostname`, `SetTimezone`, `NetworkWiredConfig`'s `interface`,

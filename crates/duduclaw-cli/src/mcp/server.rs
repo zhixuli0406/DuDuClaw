@@ -22,6 +22,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         )));
     }
 
+    // `os_*` tools: on an appliance every sysd call from this process goes
+    // through the gateway's signed route, never the sysd socket directly
+    // (sysd may be limited to the gateway's main process).
+    duduclaw_gateway::sysd_route::forward_sysd_through_gateway(home_dir);
+
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()

@@ -45,6 +45,7 @@ pub mod device;
 // ── System-settings app: `device.about` / `device.timedate*` data ─────────
 pub mod device_about;
 pub mod device_ops;
+pub mod sysd_route;
 // ── O16: the single authority behind every `os_*` device/system capability.
 // The MCP tools (`duduclaw-cli::mcp_os_ops`), the operator CLI leaves
 // (`duduclaw-cli::os_drive`) and the dashboard `device.*`/`network.*` RPCs
