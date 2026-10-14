@@ -334,13 +334,53 @@ fn private_staging_dir(dest: &Path) -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+/// Remove what an interrupted run (power cut, sysd killed mid-copy) left
+/// next to `dest`: directories directly in `dest`'s parent named exactly
+/// `.<dest name>-staging-<32 hex>` or `.<dest name>-old-<32 hex>`, that are
+/// real directories (never a symlink, never followed) owned by `owner_uid`
+/// (root in production: sysd's own euid). Anything else is left alone.
+/// Returns how many were removed. Called at the start of each staging run,
+/// under the update lock.
+pub fn remove_staging_leftovers(dest: &Path, owner_uid: u32) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let (Some(parent), Some(base)) = (dest.parent(), dest.file_name().and_then(|n| n.to_str())) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else { return 0 };
+    let shape = |name: &str| {
+        [format!(".{base}-staging-"), format!(".{base}-old-")].iter().any(|prefix| {
+            name.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !shape(name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != owner_uid {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!("could not remove leftover {}: {e}", path.display()),
+        }
+    }
+    removed
+}
+
 /// Put a fully verified staging directory in place as `dest`: the old
 /// `dest` (or a link planted there) is moved aside, the staging directory is
 /// renamed in, the old one removed. `dest` never holds a partial or
 /// unverified set.
 fn place(staging: &Path, dest: &Path) -> Result<(), String> {
     let parent = dest.parent().ok_or("the staging directory has no parent")?;
-    let old = parent.join(format!(".old-{}", uuid::Uuid::new_v4().simple()));
+    let base = dest.file_name().and_then(|n| n.to_str()).ok_or("the staging directory has no name")?;
+    let old = parent.join(format!(".{base}-old-{}", uuid::Uuid::new_v4().simple()));
     let had_old = match std::fs::symlink_metadata(dest) {
         Ok(_) => {
             std::fs::rename(dest, &old).map_err(|e| format!("cannot move {} aside: {e}", dest.display()))?;
@@ -383,6 +423,12 @@ pub fn stage(
     floor: &RollbackFloor,
     running: Option<&str>,
 ) -> Result<ReleaseFiles, String> {
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let cleared = remove_staging_leftovers(dest, me);
+    if cleared > 0 {
+        tracing::info!("removed {cleared} leftover staging director(y/ies) from an interrupted update");
+    }
     let result = private_staging_dir(dest).and_then(|staging| {
         let staged = stage_inner(source, &staging, pubkey, arch, dest_partuuid, floor, running)
             .and_then(|release| place(&staging, dest).map(|()| release));
@@ -787,5 +833,53 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let dir = SourceDir::open(&r.source).unwrap();
         assert!(dir.open_file("../SHA256SUMS", 1024).is_err(), "only plain names");
         assert!(dir.read_small("SHA256SUMS", 64 * 1024).is_ok());
+    }
+
+    /// Leftovers of an interrupted run are removed: exact names only, real
+    /// directories only, owned by the expected uid only, links never
+    /// followed.
+    #[test]
+    fn leftovers_of_an_interrupted_run_are_removed_and_nothing_else() {
+        // SAFETY: getuid has no preconditions.
+        let me = unsafe { libc::getuid() };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("updates");
+        let hex = "0123456789abcdef0123456789abcdef";
+        let staging = dir.path().join(format!(".updates-staging-{hex}"));
+        let old = dir.path().join(format!(".updates-old-{hex}"));
+        for d in [&staging, &old] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+            std::fs::write(d.join("sub/big.raw"), "x").unwrap();
+        }
+        // Not ours: other names, a file with our shape, a symlink with our shape.
+        let other = dir.path().join(".updates-staging-short");
+        std::fs::create_dir(&other).unwrap();
+        let unrelated = dir.path().join(".old-0123456789abcdef0123456789abcdef");
+        std::fs::create_dir(&unrelated).unwrap();
+        let file = dir.path().join(format!(".updates-old-{}", "f".repeat(32)));
+        std::fs::write(&file, "x").unwrap();
+        let target = dir.path().join("keep");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("precious"), "x").unwrap();
+        let link = dir.path().join(format!(".updates-staging-{}", "e".repeat(32)));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(remove_staging_leftovers(&dest, me.wrapping_add(1)), 0, "wrong owner: untouched");
+        assert!(staging.exists() && old.exists());
+        assert_eq!(remove_staging_leftovers(&dest, me), 2);
+        assert!(!staging.exists() && !old.exists());
+        assert!(other.exists() && unrelated.exists() && file.exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "a link is not removed or followed");
+        assert!(target.join("precious").exists());
+    }
+
+    /// stage() clears leftovers before it starts.
+    #[test]
+    fn staging_starts_by_clearing_leftovers() {
+        let r = release("0.5.0");
+        let leftover = r.dest.parent().unwrap().join(format!(".dest-staging-{}", "a".repeat(32)));
+        std::fs::create_dir(&leftover).unwrap();
+        run(&r, PART_A, &RollbackFloor::Off, "0.4.0").unwrap();
+        assert!(!leftover.exists());
     }
 }
