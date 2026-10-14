@@ -24,6 +24,10 @@ clap = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"
+# SysupdateStageApply: verify the signed OS release manifest and hash the
+# staged payloads as root (same crates and versions the gateway uses).
+minisign-verify = "0.2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

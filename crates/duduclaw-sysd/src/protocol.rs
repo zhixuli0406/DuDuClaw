@@ -10,7 +10,7 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape that crate's protocol used)
-//! — the entire caller-reachable surface is seventeen fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is eighteen fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
@@ -123,7 +123,10 @@
 //! agents) still ran as root; [`SysdRequest::SshServiceStart`] opens a
 //! network service. The others (reboot, power off, update apply, factory
 //! reset, clearing Wi-Fi, stopping the model service) cost availability or
-//! data, not privilege. The main-pid gate above keeps an agent from calling
+//! data, not privilege — except [`SysdRequest::SysupdateApply`] on an image
+//! whose sysupdate source is the gateway's writable download directory (see
+//! that verb); [`SysdRequest::SysupdateStageApply`] is the verb that keeps
+//! the trust decision on the root side. The main-pid gate above keeps an agent from calling
 //! sysd directly, but it does not make the agent harmless: an AI employee
 //! with a shell runs as the gateway's uid, can read the gateway's keys and
 //! so forge any request the gateway makes (its signed internal routes, a
@@ -135,11 +138,11 @@
 //! the caller at all: `--min-rollback-version` (`rollback_floor.rs`) makes
 //! `UpdateRollback` refuse when any entry it could boot is older than the
 //! first release with an unprivileged gateway, or its version cannot be read
-//! from the entry's own unified kernel image. The other verbs that touch
-//! boot entries cannot select an older image: `SysupdateApply` installs only
-//! what `systemd-sysupdate` resolves as the newest signed version from the
-//! image's read-only transfer definitions, and `ClearExhaustedUpdateTarget`
-//! only deletes an exhausted, non-running entry. Residual, outside sysd:
+//! from the entry's own unified kernel image. `SysupdateStageApply` applies
+//! the same floor, and requires a strictly newer version, to what it
+//! installs, reading the version from the staged UKI after verifying the
+//! release signature itself; `ClearExhaustedUpdateTarget` only deletes an
+//! exhausted, non-running entry. Residual, outside sysd:
 //! sd-boot's own boot counting falls back to the other entry when a new one
 //! fails to start three times before it is blessed, and boots an exhausted
 //! entry when nothing else works; the OS should delete entries below the
@@ -284,8 +287,26 @@ pub enum SysdRequest {
     Poweroff,
     /// `systemd-sysupdate list --json=short`.
     SysupdateStatus,
-    /// `systemd-sysupdate update`.
+    /// `systemd-sysupdate update`, installing whatever the image's
+    /// transfers find in their source directory. On images whose transfers
+    /// read the gateway's own download directory this is **not** merely an
+    /// availability verb: sysupdate's `regular-file` source does no
+    /// authentication, so a caller able to write that directory (on DuDuClaw
+    /// OS, any process of the gateway's user) gets an arbitrary root image
+    /// installed. Images that point their transfers at
+    /// `staged_update::DEST_DIR` (root-only, empty between calls) make it
+    /// harmless; use [`SysdRequest::SysupdateStageApply`] there.
     SysupdateApply,
+    /// Verify and stage an OS update as root, then install it
+    /// (`staged_update.rs`): the signed manifest in the gateway's download
+    /// directory is checked against the OS image key compiled into sysd, the
+    /// listed payloads are hash-checked while being copied into the
+    /// root-only staging directory (the UKI variant bound to the destination
+    /// slot only), the staged image must be newer than the running one and
+    /// at least `--min-rollback-version`, and only then does
+    /// `systemd-sysupdate update` run. The staging directory is emptied
+    /// before and after. Fieldless: every path is a constant.
+    SysupdateStageApply,
     /// `/usr/lib/systemd/systemd-bless-boot status` — reports
     /// `good` / `bad` / `indeterminate` / `clean`. Read-only: it never
     /// renames anything and never reboots, so the dashboard can ask "is a
@@ -481,6 +502,7 @@ impl SysdRequest {
             SysdRequest::Poweroff => "poweroff",
             SysdRequest::SysupdateStatus => "sysupdate_status",
             SysdRequest::SysupdateApply => "sysupdate_apply",
+            SysdRequest::SysupdateStageApply => "sysupdate_stage_apply",
             SysdRequest::BootAssessmentStatus => "boot_assessment_status",
             SysdRequest::UpdateRollback => "update_rollback",
             SysdRequest::FactoryReset => "factory_reset",
@@ -576,6 +598,7 @@ mod tests {
             SysdRequest::ClearNetworkCredentials,
             SysdRequest::SshServiceStart,
             SysdRequest::SshServiceStop,
+            SysdRequest::SysupdateStageApply,
         ] {
             let s = serde_json::to_string(&req).unwrap();
             let back: SysdRequest = serde_json::from_str(&s).unwrap();
@@ -630,6 +653,7 @@ mod tests {
         assert_eq!(FACTORY_RESET_MARKER, "/data/system/factory-reset.pending");
         assert_eq!(FACTORY_RESET_UNIT_FILE, "/usr/lib/systemd/system/duduclaw-factory-reset.service");
         assert_eq!(MAX_HOSTNAME_LEN, 64);
+        assert_eq!(serde_json::to_string(&SysdRequest::SysupdateStageApply).unwrap(), r#"{"verb":"sysupdate_stage_apply"}"#);
     }
 
     #[test]

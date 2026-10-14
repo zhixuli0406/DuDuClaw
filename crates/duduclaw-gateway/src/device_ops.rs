@@ -409,6 +409,19 @@ impl SysdDeviceOps {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::SshServiceStop).await
     }
 
+    /// Verified install (`SysupdateStageApply`): sysd re-checks the signed
+    /// release in the download directory, stages it as root and runs
+    /// sysupdate. An older sysd that does not know the verb is refused with
+    /// [`OLD_SYSD_UPDATE_REFUSAL`] (gateway and sysd ship in one OS image;
+    /// the unverified `SysupdateApply` is not used as a fallback).
+    pub async fn sysupdate_stage_apply(&self) -> OpResult {
+        match self.client.call(&duduclaw_sysd::SysdRequest::SysupdateStageApply).await {
+            Ok(out) => Ok(OpOutput { success: out.success, stdout: out.stdout, stderr: out.stderr }),
+            Err(e) if is_unknown_verb_rejection(&e) => Err(DeviceOpError::Unsupported(OLD_SYSD_UPDATE_REFUSAL.to_string())),
+            Err(e) => Err(sysd_error(e)),
+        }
+    }
+
     /// `systemctl stop|restart` of the local model service through the
     /// `LocalModelService` verb (the gateway no longer runs as root). Not
     /// part of the `DeviceOps` trait: only `inference_local` uses it.
@@ -621,6 +634,10 @@ fn refuse_local_reset_on_appliance(is_appliance: bool) -> Result<(), DeviceOpErr
 /// sysd ship in the same OS image; a mismatch means a partial update).
 const OLD_SYSD_RESET_REFUSAL: &str =
     "裝置的系統服務版本太舊，無法由它清除資料，已取消還原原廠設定，資料沒有被刪除。請先把裝置系統更新到最新版本。";
+
+/// Shown when the device's sysd predates `SysupdateStageApply`.
+pub const OLD_SYSD_UPDATE_REFUSAL: &str =
+    "裝置的系統服務版本太舊，無法由它驗證並安裝更新，已取消安裝，系統沒有被更動。請改用完整的系統映像更新。";
 
 /// sysd refused the request because it does not know the verb (it is older
 /// than this gateway): the server answers `bad_request` with `malformed

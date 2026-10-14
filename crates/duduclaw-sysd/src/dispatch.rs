@@ -198,6 +198,51 @@ async fn dispatch_factory_reset() -> DispatchResult {
     })
 }
 
+/// `SysupdateStageApply`: resolve the destination slot and the running
+/// version, verify and stage the release as root (`staged_update::stage`,
+/// blocking work on a blocking thread), install it, then empty the staging
+/// directory whatever happened.
+async fn dispatch_sysupdate_stage_apply() -> DispatchResult {
+    use crate::staged_update::{DEST_DIR, SOURCE_DIR, reset_dir, stage};
+    let dest = Path::new(DEST_DIR);
+    let staged = tokio::task::spawn_blocking(|| -> Result<crate::release::ReleaseFiles, String> {
+        let current = crate::release::current_root_device()?;
+        let slots = crate::release::read_slot_entries(Path::new(crate::release::BY_PARTLABEL_DIR))?;
+        let destination = crate::release::pick_destination_slot(&slots, &current)?;
+        let dest_partuuid =
+            crate::release::partuuid_of(Path::new(crate::release::BY_PARTUUID_DIR), &destination.device)?;
+        stage(
+            Path::new(SOURCE_DIR),
+            Path::new(DEST_DIR),
+            crate::release::OS_IMAGE_UPDATE_PUBKEY,
+            crate::release::machine_arch(),
+            &dest_partuuid,
+            crate::rollback_floor::floor(),
+            running_image_version().as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| SysdError::io(format!("staging task failed: {e}")))
+    .and_then(|r| r.map_err(|why| SysdError::unsupported(format!("update refused: {why}"))));
+    let release = match staged {
+        Ok(release) => release,
+        Err(e) => {
+            if let Err(wipe) = reset_dir(dest) {
+                tracing::warn!("could not empty {DEST_DIR}: {wipe}");
+            }
+            return Err(e);
+        }
+    };
+    let mut cmd = Command::new(SYSTEMD_SYSUPDATE_BIN);
+    cmd.arg("update");
+    let result = run(cmd).await;
+    if let Err(wipe) = reset_dir(dest) {
+        tracing::warn!("could not empty {DEST_DIR}: {wipe}");
+    }
+    let out = result?;
+    Ok(SysdOpOutput { stdout: format!("verified and staged {}\n{}", release.version, out.stdout), ..out })
+}
+
 /// Which factory-reset path this image supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResetPath {
@@ -1761,6 +1806,7 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
             cmd.arg("update");
             run(cmd).await
         }
+        SysdRequest::SysupdateStageApply => dispatch_sysupdate_stage_apply().await,
         SysdRequest::BootAssessmentStatus => bless_boot("status").await,
         SysdRequest::UpdateRollback => dispatch_update_rollback().await,
         SysdRequest::FactoryReset => dispatch_factory_reset_v2(false).await,

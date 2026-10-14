@@ -38,8 +38,11 @@
 pub mod client;
 #[cfg(unix)]
 pub mod dispatch;
+pub mod release;
 #[cfg(unix)]
 pub mod rollback_floor;
+#[cfg(unix)]
+pub mod staged_update;
 pub mod protocol;
 #[cfg(unix)]
 pub mod server;

@@ -17,7 +17,7 @@
 //! - the body names this route (`"route": "sysd"`), so a signed body made
 //!   for another internal route cannot be replayed here;
 //! - the verb is on [`forwardable`], the closed set the `os_*` tools use
-//!   (power, update status/apply, boot assessment, rollback, factory
+//!   (power, update status, verified update install, boot assessment, rollback, factory
 //!   reset). SSH, network, hostname, timezone, local-model and Wi-Fi-only
 //!   verbs are refused even with a valid signature;
 //!
@@ -25,9 +25,12 @@
 //! (see "Known limit"), so the allowlist holds only verbs that cannot hand
 //! back root on their own: `update_rollback` stays only because sysd itself
 //! refuses a target older than `--min-rollback-version` whatever the caller;
-//! `sysupdate_apply` installs only the newest signed version; and
+//! `sysupdate_stage_apply` installs only a release root has verified itself
+//! (signature, hashes, newer than running, at least the floor); and
 //! `clear_exhausted_update_target` only deletes an exhausted, non-running
-//! entry. The rest cost availability or data (reboot, power off, factory
+//! entry. Plain `sysupdate_apply` is not forwarded: on an image whose
+//! sysupdate reads the gateway's download directory it installs whatever a
+//! same-uid process put there. The rest cost availability or data (reboot, power off, factory
 //! reset), not privilege.
 //! - the host is an appliance with a sysd socket.
 //!
@@ -99,7 +102,7 @@ pub fn forwardable(req: &SysdRequest) -> bool {
         SysdRequest::Reboot
             | SysdRequest::Poweroff
             | SysdRequest::SysupdateStatus
-            | SysdRequest::SysupdateApply
+            | SysdRequest::SysupdateStageApply
             | SysdRequest::BootAssessmentStatus
             | SysdRequest::UpdateRollback
             | SysdRequest::ClearExhaustedUpdateTarget { .. }
@@ -341,7 +344,7 @@ mod tests {
             SysdRequest::Reboot,
             SysdRequest::Poweroff,
             SysdRequest::SysupdateStatus,
-            SysdRequest::SysupdateApply,
+            SysdRequest::SysupdateStageApply,
             SysdRequest::BootAssessmentStatus,
             SysdRequest::UpdateRollback,
             SysdRequest::ClearExhaustedUpdateTarget { version: "0.4.0".into() },
@@ -350,6 +353,7 @@ mod tests {
             assert!(forwardable(&req), "{req:?}");
         }
         for req in [
+            SysdRequest::SysupdateApply,
             SysdRequest::SshServiceStart,
             SysdRequest::SshServiceStop,
             SysdRequest::FactoryReset,

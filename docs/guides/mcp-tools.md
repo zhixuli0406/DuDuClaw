@@ -323,7 +323,7 @@ limitations: [Computer-use workspaces](computer-workspaces.md).
 
 ### `os_*` — device operations on DuDuClaw OS
 
-The `os_*` tools that need root (power, update status and apply, boot
+The `os_*` tools that need root (power, update status, the update install that sysd re-verifies, boot
 assessment, rollback, factory reset) keep every check they had in the MCP
 server (Admin scope, `[permissions]`, the confirmation, the factory-reset
 approval) and then send the request to the gateway over loopback

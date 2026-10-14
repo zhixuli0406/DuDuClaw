@@ -133,7 +133,18 @@ pub enum DeviceUpdateApplyOutcome {
 /// reachable from the separate `duduclaw mcp-server` process as
 /// [`create_device_backup_archive`] already is.
 pub async fn stage_and_apply_device_update(home_dir: &Path) -> DeviceUpdateApplyOutcome {
-    let staged = match crate::os_update::stage_update(home_dir).await {
+    // On DuDuClaw OS (a sysd backend is reachable) the install goes through
+    // `SysupdateStageApply`: root re-verifies the signed release and stages
+    // it itself, because sysupdate's source has no authentication of its own
+    // and this process's user can write the download directory. The gateway
+    // still verifies everything first. Off the appliance nothing changes.
+    let sysd = crate::device_ops::select_sysd_ops();
+    let staged = if sysd.is_some() {
+        crate::os_update::stage_update_for_sysd(home_dir).await
+    } else {
+        crate::os_update::stage_update(home_dir).await
+    };
+    let staged = match staged {
         Ok(report) => {
             tracing::info!(
                 "[stage_and_apply_device_update] staged {} for {} ({} bytes)",
@@ -178,7 +189,7 @@ pub async fn stage_and_apply_device_update(home_dir: &Path) -> DeviceUpdateApply
     // On-appliance, a genuine failure here is treated as fatal to the whole
     // apply rather than best-effort: proceeding anyway risks reproducing the
     // exact "reports success but did nothing" bug this step exists to close.
-    if let Some(sysd) = crate::device_ops::select_sysd_ops() {
+    if let Some(sysd) = &sysd {
         if let Err(e) = sysd.clear_exhausted_update_target(&staged.version).await {
             tracing::error!(
                 "[stage_and_apply_device_update] could not prepare the ESP for {}: {e}",
@@ -190,7 +201,14 @@ pub async fn stage_and_apply_device_update(home_dir: &Path) -> DeviceUpdateApply
         }
     }
 
-    let applied = crate::device_ops::select_device_ops().update_apply().await;
+    let applied = match &sysd {
+        Some(sysd) => sysd.sysupdate_stage_apply().await,
+        None => crate::device_ops::select_device_ops().update_apply().await,
+    };
+    if sysd.is_some() && !matches!(&applied, Ok(out) if out.success) {
+        // Nothing was installed: do not leave the download behind.
+        crate::os_update::cleanup_staged(&staged);
+    }
     // Only when sysupdate actually succeeded: confirm from the live GPT that
     // it wrote the slot the kernel image was bound to, and reclaim the
     // ~4 GiB of payload now that the partition label is the ledger. A
