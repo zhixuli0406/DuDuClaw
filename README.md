@@ -13,7 +13,7 @@ All you need is one Rust binary. Channel routing, conversation memory, multi-acc
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.73.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
-[![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+[![Glama MCP server score](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw/badges/score.svg)](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 **Quick start** (needs [Node.js](https://nodejs.org/) 20+; prefer a desktop app? see [Install](#install)):
@@ -141,7 +141,7 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 
 ### Python SDK (optional library)
 
-The core gateway/CLI is a Rust binary and needs no Python. The `duduclaw` package on PyPI is a pure library for `import duduclaw` (agents / channels / mcp / memory_eval modules) with no command-line entry point, which is why `pipx install duduclaw` fails by design. If you need it:
+The core gateway/CLI is a Rust binary and needs no Python. The [`duduclaw` package on PyPI](https://pypi.org/project/duduclaw/) is a pure library for `import duduclaw` (agents / channels / mcp / memory_eval modules) with no command-line entry point, which is why `pipx install duduclaw` fails by design. If you need it:
 
 ```bash
 pip install duduclaw

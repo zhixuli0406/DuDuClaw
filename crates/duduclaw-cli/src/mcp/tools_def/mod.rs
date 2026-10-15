@@ -36,6 +36,7 @@
 use super::{ToolDef, Value};
 
 mod agents;
+mod annotations;
 mod channels;
 mod data;
 mod exec;
@@ -101,7 +102,8 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 // ── Parameter types ──────────────────────────────────────────
 
 /// JSON Schema types of the parameters that are not strings, as
-/// `(tool, param, type)`. Every other parameter renders as `"string"`.
+/// `(tool, param, type)`. Every other parameter renders as `"string"`; an
+/// `"array"` row renders as an array of strings.
 ///
 /// An overlay rather than a field on `ParamDef`: the table holds ~530
 /// `ParamDef` literals that are all strings, and a field would have to be
@@ -117,6 +119,22 @@ pub(crate) const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("computer_session_start", "width", "integer"),
     ("computer_session_start", "height", "integer"),
     ("computer_workspace_write", "expected_revision", "integer"),
+    // Standalone-profile tools (2026-10, Glama TDQS): handlers read these
+    // through `crate::mcp_args`, which also accepts the stringified form.
+    ("code_map", "max_files", "integer"),
+    ("code_map", "chat_files", "array"),
+    ("memory_fetch_batch", "ids", "array"),
+    ("memory_fetch_batch", "include_metadata", "boolean"),
+    ("memory_improve", "limit", "integer"),
+    ("memory_search", "limit", "integer"),
+    ("memory_search", "tags", "array"),
+    ("memory_store", "tags", "array"),
+    ("user_profile_record", "origin_trust", "number"),
+    ("wiki_graph", "depth", "integer"),
+    ("wiki_search", "limit", "integer"),
+    ("wiki_search", "min_trust", "number"),
+    ("wiki_search", "expand", "boolean"),
+    ("wiki_write", "update_index", "boolean"),
 ];
 
 /// The JSON Schema type of one parameter (see [`PARAM_TYPES`]).
@@ -135,13 +153,12 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
     let mut required = Vec::new();
 
     for param in tool.params {
-        properties.insert(
-            param.name.to_string(),
-            serde_json::json!({
-                "type": param_type(tool.name, param.name),
-                "description": param.description
-            }),
-        );
+        let ty = param_type(tool.name, param.name);
+        let mut prop = serde_json::json!({ "type": ty, "description": param.description });
+        if ty == "array" {
+            prop["items"] = serde_json::json!({ "type": "string" });
+        }
+        properties.insert(param.name.to_string(), prop);
         if param.required {
             required.push(Value::String(param.name.to_string()));
         }
@@ -177,7 +194,8 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
             "type": "object",
             "properties": properties,
             "required": required
-        }
+        },
+        "annotations": annotations::tool_annotations(tool.name)
     })
 }
 
@@ -190,7 +208,10 @@ mod registration_tests {
         for (tool, param, ty) in PARAM_TYPES {
             let def = tools().find(|t| t.name == *tool).unwrap_or_else(|| panic!("{tool} not registered"));
             assert!(def.params.iter().any(|p| p.name == *param), "{tool}.{param} does not exist");
-            assert!(matches!(*ty, "integer" | "boolean" | "number"), "{tool}.{param}: {ty}");
+            assert!(
+                matches!(*ty, "integer" | "boolean" | "number" | "array"),
+                "{tool}.{param}: {ty}"
+            );
         }
     }
 
@@ -210,9 +231,33 @@ mod registration_tests {
         assert_eq!(start["inputSchema"]["properties"]["width"]["type"], "integer");
         assert_eq!(start["inputSchema"]["required"], serde_json::json!([]));
         // Other tools are untouched.
-        let other = schema("memory_search");
+        let other = schema("memory_get_at");
         for (_, p) in other["inputSchema"]["properties"].as_object().unwrap() {
             assert_eq!(p["type"], "string");
+        }
+    }
+
+    #[test]
+    fn standalone_tool_schemas_declare_real_json_types() {
+        let schema = |name: &str| build_tool_schema(tools().find(|t| t.name == name).unwrap());
+        let batch = schema("memory_fetch_batch");
+        let ids = &batch["inputSchema"]["properties"]["ids"];
+        assert_eq!(ids["type"], "array");
+        assert_eq!(ids["items"]["type"], "string");
+        assert_eq!(batch["inputSchema"]["properties"]["include_metadata"]["type"], "boolean");
+        let search = schema("memory_search");
+        assert_eq!(search["inputSchema"]["properties"]["limit"]["type"], "integer");
+        assert_eq!(search["inputSchema"]["required"], serde_json::json!(["query"]));
+        assert_eq!(schema("wiki_search")["inputSchema"]["properties"]["min_trust"]["type"], "number");
+        // A string parameter carries no `items`.
+        assert!(search["inputSchema"]["properties"]["query"].get("items").is_none());
+    }
+
+    #[test]
+    fn every_tool_schema_carries_annotations() {
+        for t in tools() {
+            let s = build_tool_schema(t);
+            assert!(s["annotations"]["readOnlyHint"].is_boolean(), "{}", t.name);
         }
     }
 

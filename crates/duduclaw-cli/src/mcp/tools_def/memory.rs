@@ -10,25 +10,37 @@ use super::super::{ParamDef, ToolDef};
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "memory_search",
-        description: "Search your own memory: what you stored plus what the gateway learned from your conversations (the facts injected into your prompt).",
-        params: &[ParamDef {
-            name: "query",
-            description: "Search query",
-            required: true,
-        }],
+        description: "Keyword search over your own memory: notes you stored plus facts the gateway learned from your chats. Returns JSON {results,total}. Use before answering from recall; for a known id use memory_read.",
+        params: &[
+            ParamDef {
+                name: "query",
+                description: "Keywords or a short phrase to match",
+                required: true,
+            },
+            ParamDef {
+                name: "limit",
+                description: "Max results (default 10, max 100)",
+                required: false,
+            },
+            ParamDef {
+                name: "tags",
+                description: "Only entries carrying at least one of these tags (array, or a comma-separated string)",
+                required: false,
+            },
+        ],
     },
     ToolDef {
         name: "memory_store",
-        description: "Store a memory entry in your own memory (the same store the gateway injects from and the dashboard shows).",
+        description: "Save one free-text note to your own memory; memory_search finds it and later prompts get it injected. Returns memory_id. Never overwrites. Per-user preferences go to user_profile_record.",
         params: &[
             ParamDef {
                 name: "content",
-                description: "Memory content",
+                description: "The note, plain text; stored as one entry",
                 required: true,
             },
             ParamDef {
                 name: "tags",
-                description: "Comma-separated tags",
+                description: "Optional tags (array, or a comma-separated string); memory_search can filter on them",
                 required: false,
             },
         ],
@@ -272,32 +284,32 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "memory_read",
-        description: "Read a single memory entry by ID",
+        description: "Read one of your memory entries by id (from memory_store or memory_search): content, tags, layer, importance, created_at. Unknown or foreign ids are refused. Several ids: memory_fetch_batch.",
         params: &[ParamDef {
             name: "memory_id",
-            description: "Memory entry UUID from memory_store",
+            description: "Memory entry id (UUID) returned by memory_store or memory_search",
             required: true,
         }],
     },
     ToolDef {
         name: "memory_fetch_batch",
-        description: "Fetch multiple memory entries by their IDs in a single call (max 100)",
+        description: "Fetch up to 100 of your memory entries by id in one call. Returns {memories, missing_ids}; unknown or foreign ids go to missing_ids instead of failing. Use instead of repeated memory_read.",
         params: &[
             ParamDef {
                 name: "ids",
-                description: "Array of memory entry UUIDs to fetch (max 100)",
+                description: "Memory entry ids (UUIDs), 1 to 100",
                 required: true,
             },
             ParamDef {
                 name: "include_metadata",
-                description: "Include full metadata (tags, layer, created_at). Default false",
+                description: "Also return tags, layer and created_at (default false)",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "memory_alias_add",
-        description: "Add an entity alias so the knowledge graph treats a surface form (e.g. '老闆') as the same entity as its canonical name, improving recall. Both sides are normalized; alias chains are flattened.",
+        description: "Fold a surface form into a canonical entity (e.g. '老闆' -> 'Wang Ming') so recall treats them as one. Lowercased; chains flattened; re-adding an alias re-points it. See memory_alias_list.",
         params: &[
             ParamDef {
                 name: "canonical",
@@ -313,12 +325,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "memory_alias_list",
-        description: "List the entity aliases registered for this agent as (canonical, alias) pairs.",
+        description: "List your memory's entity aliases as {canonical, alias} pairs plus a total. Check here before memory_alias_add so you do not re-point an existing alias by accident.",
         params: &[],
     },
     ToolDef {
         name: "memory_get_history",
-        description: "Return the full temporal supersession chain (oldest → newest, expired rows included) for a (subject, predicate) triple — how a fact changed and which write superseded which.",
+        description: "Every value a (subject, predicate) fact has had, oldest to newest, expired rows included, showing which write superseded which. For the value at one instant use memory_get_at.",
         params: &[
             ParamDef {
                 name: "subject",
@@ -334,7 +346,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "memory_get_at",
-        description: "Point-in-time lookup: the single fact for a (subject, predicate) triple that was valid at an instant. Bi-temporal — resolves by world time, robust to out-of-order ingestion.",
+        description: "The single (subject, predicate) fact valid at one instant by world time, or found:false. Safe with out-of-order ingestion. Full change log: memory_get_history; free-text recall: memory_search.",
         params: &[
             ParamDef {
                 name: "subject",
@@ -392,7 +404,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "code_map",
-        description: "Rank a repository's source files by relevance to a query using an Aider-style code symbol graph (tree-sitter + PageRank). Best for locating where symbols are defined/used across a codebase.",
+        description: "Rank a local repo's source files by relevance to a query (tree-sitter symbol graph + PageRank) and summarise their key symbols. Read-only. Use to find where code lives; it does not return file bodies.",
         params: &[
             ParamDef {
                 name: "query",
@@ -406,19 +418,19 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "max_files",
-                description: "Max ranked files to return (default 15, cap 100)",
+                description: "Max ranked files to return (default 15, 1 to 100)",
                 required: false,
             },
             ParamDef {
                 name: "chat_files",
-                description: "Array of repo-relative paths already in context; their symbols bias the ranking",
+                description: "Repo-relative paths already in context; their symbols bias the ranking. Either this or query must be non-empty",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "user_profile_record",
-        description: "Record one durable preference fact about a specific end user (tea, timezone, language). Re-recording the same predicate supersedes it. Injected as '## About This User' — stable preferences only.",
+        description: "Record one durable preference of a specific end user (timezone, language, 'prefers tea'). Same predicate again supersedes the old value, history kept. Notes not tied to a user: memory_store.",
         params: &[
             ParamDef {
                 name: "user_id",
@@ -437,14 +449,14 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "origin_trust",
-                description: "Confidence 0..1 in this observation (default 1.0; stored at most 0.6, the AI-record ceiling)",
+                description: "Confidence 0 to 1 in this observation (default 1.0; stored at most 0.6, the AI-record ceiling)",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "user_profile_get",
-        description: "Fetch a user's currently-valid preference traits and the rendered '## About This User' block (the same text injected into replies). Read-only.",
+        description: "One user's currently-valid preference facts plus the rendered '## About This User' block injected into replies to them. Read-only. Add or change facts with user_profile_record.",
         params: &[ParamDef {
             name: "user_id",
             description: "Stable per-user id from the channel",
@@ -453,7 +465,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "user_code_profile",
-        description: "Compile this agent's user-as-code profile: typed preference and constraint rules parsed from currently-valid memory facts, plus unresolved conflicts and the untyped-row count. Read-only.",
+        description: "Compile your user-as-code profile from current memory facts: typed preference and constraint rules, unresolved conflicts, untyped-row count. Read-only. One user's view: user_profile_get.",
         params: &[],
     },
     ToolDef {

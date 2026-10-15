@@ -13,7 +13,7 @@ DuDuClaw 把 Claude Code、Codex、Antigravity 這類 AI 指令列工具，變�
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.73.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
-[![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+[![Glama MCP server score](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw/badges/score.svg)](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 **快速開始**(需要 [Node.js](https://nodejs.org/) 20+;想用桌面版請看[安裝](#install)):
@@ -142,7 +142,7 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 
 ### Python SDK(選用函式庫)
 
-核心 gateway / CLI 是 Rust binary,不需要 Python。PyPI 上的 `duduclaw` 是給 `import duduclaw` 用的純函式庫(agents / channels / mcp / memory_eval 模組),沒有命令列工具,所以 `pipx install duduclaw` 會失敗是預期行為。需要時:
+核心 gateway / CLI 是 Rust binary,不需要 Python。[PyPI 上的 `duduclaw`](https://pypi.org/project/duduclaw/) 是給 `import duduclaw` 用的純函式庫(agents / channels / mcp / memory_eval 模組),沒有命令列工具,所以 `pipx install duduclaw` 會失敗是預期行為。需要時:
 
 ```bash
 pip install duduclaw

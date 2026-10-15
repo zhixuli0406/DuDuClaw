@@ -529,9 +529,7 @@ pub async fn handle_memory_search(
         _ => return mcp_error("Missing required parameter: query"),
     };
 
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
+    let limit = crate::mcp_args::arg_u64(params, "limit")
         .unwrap_or(10)
         .min(100) as usize; // cap at 100 to prevent runaway queries
 
@@ -667,14 +665,9 @@ pub async fn handle_memory_fetch_batch(
     memory: &SqliteMemoryEngine,
     ns_ctx: &NamespaceContext,
 ) -> Value {
-    let ids: Vec<String> = match params.get("ids") {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|x| x.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        _ => return mcp_error("Missing required parameter: ids (array of memory IDs)"),
+    let ids: Vec<String> = match crate::mcp_args::arg_string_list(params, "ids") {
+        Some(ids) => ids,
+        None => return mcp_error("Missing required parameter: ids (array of memory IDs)"),
     };
 
     if ids.is_empty() {
@@ -684,10 +677,7 @@ pub async fn handle_memory_fetch_batch(
         return mcp_error("Parameter 'ids' exceeds the maximum of 100 entries per request");
     }
 
-    let include_metadata = params
-        .get("include_metadata")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let include_metadata = crate::mcp_args::arg_bool(params, "include_metadata").unwrap_or(false);
 
     let namespace = &ns_ctx.write_namespace;
 
@@ -1024,9 +1014,7 @@ pub async fn handle_memory_improve(
         Some(t) if !t.trim().is_empty() => t.trim(),
         _ => return mcp_error("Missing required parameter: topic (the area to reflect on)"),
     };
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
+    let limit = crate::mcp_args::arg_u64(params, "limit")
         .unwrap_or(40)
         .min(100) as usize;
     let namespace = &ns_ctx.write_namespace;
@@ -1096,15 +1084,8 @@ pub async fn handle_code_map(params: &Value) -> Value {
         .map(|s| s.to_string())
         .unwrap_or_default();
     // A non-empty query OR chat_files is required to have something to seed on.
-    let chat_files: Vec<String> = params
-        .get("chat_files")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let chat_files: Vec<String> =
+        crate::mcp_args::arg_string_list(params, "chat_files").unwrap_or_default();
     if query.trim().is_empty() && chat_files.is_empty() {
         return mcp_error("code_map requires a non-empty 'query' or 'chat_files'");
     }
@@ -1115,9 +1096,7 @@ pub async fn handle_code_map(params: &Value) -> Value {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let max_files = params
-        .get("max_files")
-        .and_then(|v| v.as_u64())
+    let max_files = crate::mcp_args::arg_u64(params, "max_files")
         .unwrap_or(15)
         .clamp(1, 100) as usize;
 
@@ -1179,10 +1158,7 @@ pub async fn handle_user_profile_record(
         Some(s) if !s.trim().is_empty() => s,
         _ => return mcp_error("Missing required parameter: value"),
     };
-    let origin_trust = params
-        .get("origin_trust")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0);
+    let origin_trust = crate::mcp_args::arg_f64(params, "origin_trust").unwrap_or(1.0);
     // A pseudo-user (system / anonymous / unknown) has no profile.
     if duduclaw_gateway::profile_distill::is_anonymous(user_id) {
         return mcp_error("user_profile_record refused: user_id is not a real person");

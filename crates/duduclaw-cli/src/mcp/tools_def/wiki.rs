@@ -10,7 +10,7 @@ use super::super::{ParamDef, ToolDef};
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "wiki_ls",
-        description: "List wiki pages. Returns directory tree with page titles and last-updated timestamps from YAML frontmatter. Pass scope=\"shared\" to list the cross-agent shared wiki instead of your own.",
+        description: "List wiki pages as a directory tree with titles and last-updated dates. scope=\"shared\" lists the cross-agent wiki. Use to browse; to find pages by content use wiki_search.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -47,7 +47,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_write",
-        description: "Create or update a wiki page; _index.md and _log.md update automatically, written atomically. scope=\"shared\" writes the cross-agent wiki, honouring the .scope.toml namespace policy.",
+        description: "Create or overwrite a whole wiki page (content incl. YAML frontmatter); atomic, updates _index.md and _log.md. scope=\"shared\" obeys the namespace policy. To edit, wiki_read the page first.",
         params: &[
             ParamDef {
                 name: "page_path",
@@ -66,7 +66,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "update_index",
-                description: "Update _index.md automatically (default: true). Ignored when scope=\"shared\".",
+                description: "Add the page to _index.md (default true). Ignored when scope=\"shared\".",
                 required: false,
             },
             ParamDef {
@@ -78,7 +78,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_search",
-        description: "Full-text search across wiki pages with trust-weighted ranking. Supports layer/trust filtering and 1-hop expand via related pages. Pass scope=\"shared\" to search the cross-agent shared wiki.",
+        description: "Full-text search of wiki pages, trust-weighted, with layer/min_trust filters and optional 1-hop expand. scope=\"shared\" searches the shared wiki. Notes outside the wiki: memory_search.",
         params: &[
             ParamDef {
                 name: "query",
@@ -92,12 +92,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default: 10)",
+                description: "Max results (default 10, max 100)",
                 required: false,
             },
             ParamDef {
                 name: "min_trust",
-                description: "Minimum trust score filter (0.0-1.0)",
+                description: "Drop pages whose trust is below this, 0.0 to 1.0",
                 required: false,
             },
             ParamDef {
@@ -107,7 +107,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "expand",
-                description: "1-hop expand via related/backlinks (true/false, default: false). Ignored when scope=\"shared\".",
+                description: "Also return pages one related/backlink hop away (default false). Ignored when scope=\"shared\".",
                 required: false,
             },
             ParamDef {
@@ -119,7 +119,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_lint",
-        description: "Health check on the wiki: orphan pages, broken links, stale pages, missing required frontmatter. scope=\"shared\" audits the cross-agent wiki instead of your own.",
+        description: "Audit the wiki for orphan pages, broken links and stale pages; returns a report and changes nothing. scope=\"shared\" audits the shared wiki and its frontmatter schema. Totals only: wiki_stats.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -135,7 +135,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_stats",
-        description: "Get wiki statistics: total pages, index entries, recent activity, health score. Pass scope=\"shared\" for the cross-agent shared wiki (contributor breakdown) instead of your own.",
+        description: "Wiki totals: pages, index entries, recent activity, health score (shared scope adds per-contributor counts). Read-only. To see the problems behind the score use wiki_lint.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -151,11 +151,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_export",
-        description: "Export the wiki as Obsidian vault (directory of .md files with wikilinks) or a single HTML file. Returns the output path or HTML content.",
+        description: "Export a wiki (yours by default) under <home>/exports as one HTML file (default) or an Obsidian vault folder; returns the path. Overwrites the previous export, never the wiki itself.",
         params: &[
             ParamDef {
                 name: "format",
-                description: "Export format: 'obsidian' or 'html' (default: html)",
+                description: "'html' (default, one file) or 'obsidian' (a folder of .md files with wikilinks)",
                 required: false,
             },
             ParamDef {
@@ -167,7 +167,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_dedup",
-        description: "Detect potential duplicate wiki pages using title and tag similarity. Returns candidate pairs with trust scores for merge decisions.",
+        description: "Find likely duplicate wiki pages by title and tag similarity; returns pairs with each page's trust and the reason. Read-only, merges nothing: merge by hand with wiki_write.",
         params: &[ParamDef {
             name: "agent_id",
             description: "Agent name (default: main agent)",
@@ -176,7 +176,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_graph",
-        description: "Export wiki knowledge graph as Mermaid diagram. Nodes=pages, edges=related links. Supports focused view around a center page.",
+        description: "Render the wiki link graph as a Mermaid diagram (nodes = pages, edges = related links), or only pages within `depth` hops of `center`. Read-only.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -190,14 +190,14 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "depth",
-                description: "Max hops from center (default: 2, ignored without center)",
+                description: "Max hops from center (default 2; ignored without center)",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "wiki_rebuild_fts",
-        description: "Rebuild the FTS5 full-text search index from all wiki pages on disk. Use if search results seem stale.",
+        description: "Rebuild the wiki full-text index from the pages on disk; returns the page count. Safe to repeat. Use only when wiki_search misses pages you know exist, e.g. after files were edited directly.",
         params: &[ParamDef {
             name: "agent_id",
             description: "Agent name (default: main agent)",
@@ -299,16 +299,16 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_share",
-        description: "Share a page from your wiki to the shared wiki. Creates a source-attributed copy in shared/wiki/sources/.",
+        description: "Publish a summary of one of your wiki pages to the shared wiki at sources/<you>--<name>.md with attribution; re-sharing overwrites it. Secret-scanned. Full shared pages: wiki_write scope=shared.",
         params: &[
             ParamDef {
                 name: "page_path",
-                description: "Page path in your own wiki to share",
+                description: "Page path in your own wiki, relative to wiki/ (e.g. 'concepts/return-policy.md')",
                 required: true,
             },
             ParamDef {
                 name: "summary",
-                description: "Optional custom summary (default: first 500 chars of body)",
+                description: "Text to publish (default: first 500 characters of the page body)",
                 required: false,
             },
         ],

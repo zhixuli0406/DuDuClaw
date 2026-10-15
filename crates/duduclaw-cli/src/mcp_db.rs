@@ -396,8 +396,8 @@ fn query_result_json(out: &duduclaw_db::QueryResult) -> Value {
     })
 }
 
-/// The MCP `inputSchema` builder in `mcp.rs` declares every parameter as
-/// `"type": "string"`, so a well-behaved model may well hand back
+/// The MCP `inputSchema` builder (`build_tool_schema`) declares these
+/// parameters as `"type": "string"`, so a well-behaved model may well hand back
 /// `"[\"id\",\"name\"]"` instead of a real array. Parse a JSON string into
 /// its value before type-checking, rather than refusing something the schema
 /// we published actually asked for.
