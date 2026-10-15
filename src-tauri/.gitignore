@@ -6,6 +6,9 @@
 /icons/*.png
 /icons/*.icns
 /icons/*.ico
+# Mobile sets `cargo tauri icon` (tauri-cli 2.x) also emits; desktop-only app
+/icons/android/
+/icons/ios/
 
 # Staged sidecar binaries (build artifacts) — keep the README only
 /binaries/*

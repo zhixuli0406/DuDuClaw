@@ -240,9 +240,9 @@ class StatusAction extends SingletonAction {
     const refresh = async () => {
       try {
         const res = (await gateway.rpc('approvals.list', {})) as { approvals?: Approval[] };
-        await ev.action.setTitle(`🐾 DuDuClaw\n待審 ${res.approvals?.length ?? 0}`);
+        await ev.action.setTitle(`DuDuClaw\n待審 ${res.approvals?.length ?? 0}`);
       } catch {
-        await ev.action.setTitle('🐾 DuDuClaw\n未連線');
+        await ev.action.setTitle('DuDuClaw\n未連線');
       }
     };
     await refresh();

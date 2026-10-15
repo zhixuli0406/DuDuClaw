@@ -17,7 +17,7 @@ service, no telemetry. DuDuClaw itself: https://github.com/zhixuli0406/DuDuClaw
 """,
     "version": "18.0.0.1.0",
     "category": "Productivity",
-    "author": "DuDu Digital",
+    "author": "Dudu Technology Ltd.",
     "website": "https://github.com/zhixuli0406/DuDuClaw",
     "license": "LGPL-3",
     "depends": ["base", "base_setup"],

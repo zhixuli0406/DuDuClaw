@@ -83,7 +83,7 @@ Word count: ~480 EN, well under the 1200 limit.
 - No tables — HN doesn't render them
 - No "we / our team" language — single founder, own it
 - No claim "the only / the first" — HN will fact-check you to death
-- No emoji 🐾 (we live with the brand on the site, but not in the post)
+- No emoji (the brand lives on the site, not in the post)
 - No screenshots in the post (only allowed: one URL)
 
 ---

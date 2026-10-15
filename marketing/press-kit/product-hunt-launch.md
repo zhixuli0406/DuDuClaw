@@ -21,10 +21,8 @@ Solo founders self-hunt to keep credit:
 ## Name
 
 ```
-DuDuClaw 🐾
+DuDuClaw
 ```
-
-(PH does support the paw emoji here, unlike HN.)
 
 ## Tagline (max 60 chars)
 
@@ -50,8 +48,8 @@ The plumbing your AI agent stack should already have.
 
 ## Logo (240×240)
 
-- Existing repo asset: `marketing/press-kit/logo-512.png` (TODO: extract from `web/public/favicon`)
-- Background: soft amber (`#fef3c7`), centered paw print
+- Repo asset: `marketing/press-kit/logos/duduclaw-avatar-1024.png` (downscale to 240×240)
+- Cream background (`#F5F4F0`), navy cat mark with the amber tail, centered
 - Avoid the gradient — PH compresses gradients into mud
 
 ## Gallery

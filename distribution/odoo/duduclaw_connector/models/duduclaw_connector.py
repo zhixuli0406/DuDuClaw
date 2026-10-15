@@ -68,7 +68,7 @@ class DuduclawConnector(models.AbstractModel):
             req = urllib.request.Request(f"{url}/healthz", method="GET")
             with urllib.request.urlopen(req, timeout=TIMEOUT_SECS) as resp:
                 if resp.status == 200:
-                    return True, "連線成功 🐾（gateway 健康檢查通過）"
+                    return True, "連線成功（gateway 健康檢查通過）"
                 return False, f"gateway 回應 HTTP {resp.status}"
         except Exception as e:  # noqa: BLE001 - settings-page UX, report anything
             return False, f"連不上 gateway：{e}"

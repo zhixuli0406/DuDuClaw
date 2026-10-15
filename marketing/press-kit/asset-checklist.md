@@ -21,7 +21,7 @@
 6-9s   切回 LINE，AI 回覆「今晚營業至 21:30」+ 客戶滿意 ❤
 9-15s  慢動作回放：左邊對話、右邊終端，並排
 15-25s 文字疊圖：本次對話成本 = NT$0、回應時間 = 800ms
-25-30s 收尾畫面：DuDuClaw 🐾 logo + "GitHub: zhixuli0406/DuDuClaw"
+25-30s 收尾畫面：DuDuClaw 橫式 logo（logos/duduclaw-logo-horizontal-light.png）+ "GitHub: zhixuli0406/DuDuClaw"
 ```
 
 ## B. 靜態截圖
@@ -74,8 +74,8 @@
 
 | 內容 | 路徑 | 狀態 |
 |---|---|---|
-| 高解析 Logo（512 / 1024 / 2048 px PNG + SVG） | `marketing/press-kit/logos/` | TODO |
-| 純爪印去背版（無 amber 方塊，透明底，供安裝文件插圖） | `marketing/press-kit/paw-transparent.svg` + `paw-transparent-1024.png` | DONE 2026-08-04（僅 1024px；512/2048 尚未產出） |
+| 高解析 Logo（512 / 1024 / 2048 px PNG + SVG） | `marketing/press-kit/logos/` | DONE 2026-10-16（C1 識別：`duduclaw-mark.svg`／`-mono.svg`、`duduclaw-icon-512.png`／`-1024.png` 去背、`duduclaw-avatar-1024.png` 含米白底、橫式 logo light／dark／transparent；2048px 尚未產出） |
+| 去背貓 mark（透明底，供安裝文件插圖；舊爪印 paw-transparent 已於 2026-10-16 退役） | `marketing/press-kit/logos/duduclaw-mark.svg` + `duduclaw-icon-1024.png` | DONE 2026-10-16 |
 | 創辦人正臉照（高 + 中 + 低解析） | `marketing/press-kit/portraits/` | TODO 自拍 |
 | 一句話簡介 zh-TW + EN | `marketing/press-kit/boilerplate.md` | TODO |
 | 三段不同字數的產品描述（30 / 100 / 250 字） | `marketing/press-kit/boilerplate.md` | TODO |
