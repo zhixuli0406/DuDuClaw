@@ -331,7 +331,9 @@ approval) and then send the request to the gateway over loopback
 The gateway forwards it to `duduclaw-sysd` with its own connection, so the
 tools work when sysd answers only the gateway process. The route accepts only
 those verbs; SSH, network, hostname, timezone and local-model operations are
-refused there. When the gateway is not running, or the MCP server was not
+refused there. This needs platform v1.73.4 or later on the device, so it applies
+from the next DuDuClaw OS image (v0.3.0 embeds v1.73.1, where the tools still
+call sysd directly). When the gateway is not running, or the MCP server was not
 started by the gateway (no employee identity), the tool fails with a reason;
 it never talks to sysd directly. Off DuDuClaw OS nothing changes.
 
