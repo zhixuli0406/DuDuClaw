@@ -33,7 +33,7 @@ import {
 import { CliLoginModal, type LoginRuntime } from '@/components/CliLoginModal';
 import { SubscriptionSetupWizard } from '@/components/SubscriptionSetupWizard';
 import { SubscriptionRiskDisclosure, SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
-import { isSubscriptionRiskRefusal } from '@/lib/subscription-risk';
+import { isSubscriptionRiskRefusal, subscriptionVendorFor } from '@/lib/subscription-risk';
 import {
   Wallet,
   Plus,
@@ -638,7 +638,13 @@ function AddAccountDialog({
             </Field>
           </div>
 
-          {isOauth && <SubscriptionRiskDisclosure checked={riskAck} onCheckedChange={setRiskAck} />}
+          {isOauth && (
+            <SubscriptionRiskDisclosure
+              checked={riskAck}
+              onCheckedChange={setRiskAck}
+              vendor={subscriptionVendorFor(provider)}
+            />
+          )}
 
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>

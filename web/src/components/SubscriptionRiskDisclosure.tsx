@@ -4,17 +4,17 @@ import { AlertTriangle, ExternalLink } from 'lucide-react';
 import { Checkbox } from '@/components/mds';
 import { openExternal } from '@/lib/external-link';
 import { cn } from '@/lib/utils';
-import { ANTHROPIC_LEGAL_URL } from '@/lib/subscription-risk';
+import { ANTHROPIC_LEGAL_URL, VENDOR_TERMS_URL, type SubscriptionVendor } from '@/lib/subscription-risk';
 
-function PolicyLink({ labelId }: { labelId: string }) {
+function PolicyLink({ labelId, url = ANTHROPIC_LEGAL_URL }: { labelId: string; url?: string }) {
   const intl = useIntl();
   const onClick = (e: MouseEvent<HTMLAnchorElement>) => {
     e.preventDefault();
-    openExternal(ANTHROPIC_LEGAL_URL);
+    openExternal(url);
   };
   return (
     <a
-      href={ANTHROPIC_LEGAL_URL}
+      href={url}
       target="_blank"
       rel="noreferrer"
       onClick={onClick}
@@ -36,20 +36,26 @@ function PolicyLink({ labelId }: { labelId: string }) {
  * request carries `accept_subscription_risk: true`, and each acknowledgment is
  * written to the security audit log.
  *
- * Wording follows Anthropic's legal-and-compliance page and Consumer Terms.
- * It states policy, never a technical block (`claude -p` with an OAuth token
- * still works). The Google/OpenAI sentence is the pre-existing wording, kept
- * until a primary source is cited.
+ * `vendor` picks whose terms are shown: Anthropic's (the default, Claude
+ * logins and Claude accounts) or the runtime's own vendor for Codex, Gemini
+ * CLI, Antigravity and Grok, each with a link to that vendor's terms page.
+ * Every sentence cites a vendor page; where a vendor has published nothing
+ * DuDuClaw could find, the copy says the position is unclear instead of
+ * guessing. It states policy, never a technical block (`claude -p` with an
+ * OAuth token still works).
  */
 export function SubscriptionRiskDisclosure({
   checked,
   onCheckedChange,
+  vendor = 'anthropic',
 }: {
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
+  vendor?: SubscriptionVendor;
 }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
+  const vendorUrl = VENDOR_TERMS_URL[vendor];
   return (
     <div
       className="space-y-3 rounded-lg border border-warning/30 bg-warning/10 p-3"
@@ -59,16 +65,32 @@ export function SubscriptionRiskDisclosure({
         <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
         {t('subscriptionRisk.title')}
       </p>
-      <div className="max-h-[45vh] space-y-2 overflow-y-auto pr-1 text-xs leading-relaxed text-foreground/90">
-        <p>{t('subscriptionRisk.policy')}</p>
-        <p>{t('subscriptionRisk.conflicts')}</p>
-        <p>{t('subscriptionRisk.enforcement')}</p>
-        <p className="text-muted-foreground">{t('subscriptionRisk.others')}</p>
-        <p>{t('subscriptionRisk.recommendation')}</p>
-        <p>
-          <PolicyLink labelId="subscriptionRisk.link" />
-        </p>
-      </div>
+      {vendor === 'anthropic' ? (
+        <div className="max-h-[45vh] space-y-2 overflow-y-auto pr-1 text-xs leading-relaxed text-foreground/90">
+          <p>{t('subscriptionRisk.policy')}</p>
+          <p>{t('subscriptionRisk.conflicts')}</p>
+          <p>{t('subscriptionRisk.enforcement')}</p>
+          <p className="text-muted-foreground">{t('subscriptionRisk.others')}</p>
+          <p>{t('subscriptionRisk.recommendation')}</p>
+          <p>
+            <PolicyLink labelId="subscriptionRisk.link" />
+          </p>
+        </div>
+      ) : (
+        <div
+          className="max-h-[45vh] space-y-2 overflow-y-auto pr-1 text-xs leading-relaxed text-foreground/90"
+          data-vendor={vendor}
+        >
+          <p>{t(`subscriptionRisk.vendor.${vendor}.policy`)}</p>
+          <p>{t('subscriptionRisk.generic.conflicts')}</p>
+          <p>{t('subscriptionRisk.generic.recommendation')}</p>
+          {vendorUrl && (
+            <p>
+              <PolicyLink labelId={`subscriptionRisk.vendor.${vendor}.link`} url={vendorUrl} />
+            </p>
+          )}
+        </div>
+      )}
       <label className="flex items-start gap-2 text-xs font-medium text-foreground">
         <Checkbox
           checked={checked}

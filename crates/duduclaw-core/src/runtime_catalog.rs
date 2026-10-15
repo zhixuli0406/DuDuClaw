@@ -528,9 +528,11 @@ pub const CATALOG: &[RuntimeSpec] = &[
             },
             credential_paths: &[".gemini/oauth_creds.json"],
             tos_note: Some(LocaleText {
-                en: "Google blocks consumer subscription tokens used by third-party products server-side (since 2026-03). The API key path is the supported one.",
-                zh_tw: "Google 自 2026-03 起在伺服器端封鎖第三方產品使用消費者訂閱 token，建議走 API key。",
-                ja_jp: "Google は 2026-03 以降、サードパーティ製品による消費者向けサブスクリプション トークンの利用をサーバー側でブロックしています。API キーの利用を推奨します。",
+                // Cited terms only (geminicli.com/docs/resources/tos-privacy,
+                // fetched 2026-10-16); see `crate::subscription_risk`.
+                en: "Google's Gemini CLI terms say directly accessing the services behind Gemini CLI with third-party software, tools or services through Gemini CLI OAuth violates its terms and may lead to suspension or termination of the account (geminicli.com/docs/resources/tos-privacy). Use an API key for anything long-running.",
+                zh_tw: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止（geminicli.com/docs/resources/tos-privacy）。要長期使用請走 API key。",
+                ja_jp: "Google の Gemini CLI 規約では、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反とされ、アカウントの停止または終了の理由になり得ます（geminicli.com/docs/resources/tos-privacy）。継続的に使う場合は API キーをご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Complete the Google sign-in in a browser on this machine (localhost callback).",
@@ -597,9 +599,11 @@ pub const CATALOG: &[RuntimeSpec] = &[
             // skipped for this runtime.
             credential_paths: &[],
             tos_note: Some(LocaleText {
-                en: "Same Google consumer-subscription restriction as Gemini CLI. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
-                zh_tw: "與 Gemini CLI 相同的 Google 消費者訂閱限制。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
-                ja_jp: "Gemini CLI と同じ Google の消費者向けサブスクリプション制限が適用されます。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
+                // Cited terms only (antigravity.google/terms §6, fetched
+                // 2026-10-16); see `crate::subscription_risk`.
+                en: "Google's Antigravity terms (antigravity.google/terms, section 6) say using third-party software, tools or services to access the service is a breach that may lead to suspension or termination of the Antigravity and/or Gemini CLI accounts. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
+                zh_tw: "Google 的 Antigravity 條款（antigravity.google/terms 第 6 節）寫明：用第三方軟體、工具或服務存取該服務屬於違約，可能導致 Antigravity 和／或 Gemini CLI 帳號被停權或終止。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
+                ja_jp: "Google の Antigravity 規約（antigravity.google/terms 第 6 条）では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすることは契約違反とされ、Antigravity や Gemini CLI のアカウントの停止または終了の理由になり得ます。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Sign in by running `agy` in a terminal on this machine and following the prompts. For remote or container deployments use API-key mode: config.toml [antigravity] auth = \"api_key\" plus a Gemini API key.",

@@ -15,7 +15,7 @@ import { isImeComposing } from '@/lib/keyboard';
 import { client } from '@/lib/ws-client';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
 import { SubscriptionRiskDisclosure } from '@/components/SubscriptionRiskDisclosure';
-import { isSubscriptionRiskRefusal } from '@/lib/subscription-risk';
+import { isSubscriptionRiskRefusal, subscriptionVendorFor } from '@/lib/subscription-risk';
 import { formatError } from '@/lib/toast';
 
 /* eslint-disable no-control-regex */
@@ -263,7 +263,11 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
 
         {!started ? (
           <div className="space-y-3">
-            <SubscriptionRiskDisclosure checked={riskAck} onCheckedChange={setRiskAck} />
+            <SubscriptionRiskDisclosure
+              checked={riskAck}
+              onCheckedChange={setRiskAck}
+              vendor={subscriptionVendorFor(runtime)}
+            />
             <div className="flex items-center justify-end gap-2 pt-1">
               <Button variant="outline" onClick={() => void handleClose()}>
                 {intl.formatMessage({ id: 'common.cancel' })}

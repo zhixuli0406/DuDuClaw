@@ -260,9 +260,12 @@ fn bind_is_loopback(bind: &str) -> bool {
 // configures one must say the policy risk. `doctor` is where an operator who
 // set the account up long ago (or by hand in config.toml) still sees it.
 
-/// Ids of `[[accounts]]` entries with `type = "oauth"` (consumer
-/// subscription tokens), in file order. Entries with no id are counted as
-/// `"(未命名)"` so the count stays honest.
+/// Ids of Claude subscription accounts: `[[accounts]]` entries with
+/// `type = "oauth"` whose `provider` is `anthropic` or unset (the rotator's
+/// default), in file order. Other providers' oauth entries (a GitHub Copilot
+/// seat from `duduclaw auth device`, say) are left out: the line below quotes
+/// Anthropic's policy, which does not cover them. Entries with no id are
+/// counted as `"(未命名)"` so the count stays honest.
 pub fn subscription_account_ids_of(table: &toml::Table) -> Vec<String> {
     table
         .get("accounts")
@@ -271,6 +274,12 @@ pub fn subscription_account_ids_of(table: &toml::Table) -> Vec<String> {
             arr.iter()
                 .filter_map(|a| a.as_table())
                 .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("oauth"))
+                .filter(|t| {
+                    matches!(
+                        t.get("provider").and_then(|v| v.as_str()),
+                        None | Some("anthropic")
+                    )
+                })
                 .map(|t| {
                     t.get("id")
                         .and_then(|v| v.as_str())
@@ -291,12 +300,12 @@ pub fn subscription_risk_notice_of(table: &toml::Table) -> Option<String> {
         return None;
     }
     let rotation = if ids.len() > 1 {
-        "用輪替多個訂閱帳號來避開用量上限，和 Pro / Max 以一般個人使用為前提的用量規定衝突。"
+        "用輪替多個訂閱帳號來避開用量上限，和 Pro / Max 以一般使用為前提的用量規定衝突。"
     } else {
         ""
     };
     Some(format!(
-        "已設定 {} 個訂閱（OAuth）帳號：{}。{}{}",
+        "已設定 {} 個 Claude 訂閱（OAuth）帳號：{}。{}{}",
         ids.len(),
         ids.join("、"),
         rotation,
@@ -341,6 +350,22 @@ mod subscription_risk_notice_tests {
         assert!(msg.contains("sub"), "{msg}");
         assert!(msg.contains(duduclaw_core::subscription_risk::ANTHROPIC_LEGAL_URL));
         assert!(!msg.contains("輪替"), "{msg}");
+    }
+
+    #[test]
+    fn other_providers_oauth_accounts_are_not_counted() {
+        assert!(
+            subscription_risk_notice_of(&table(
+                "[[accounts]]\nid='seat'\ntype='oauth'\nprovider='github'\n[[accounts]]\nid='c'\ntype='oauth'\nprovider='openai'\n"
+            ))
+            .is_none()
+        );
+        let msg = subscription_risk_notice_of(&table(
+            "[[accounts]]\nid='seat'\ntype='oauth'\nprovider='github'\n[[accounts]]\nid='claude'\ntype='oauth'\nprovider='anthropic'\n",
+        ))
+        .unwrap();
+        assert!(msg.contains("1 個"), "{msg}");
+        assert!(msg.contains("claude") && !msg.contains("seat"), "{msg}");
     }
 
     #[test]

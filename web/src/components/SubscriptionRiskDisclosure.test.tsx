@@ -28,15 +28,36 @@ describe('SubscriptionRiskDisclosure', () => {
     expect(onChange).toHaveBeenCalledWith(true, expect.anything());
   });
 
+  it.each([
+    ['openai', /OpenAI Terms of Use/, 'https://openai.com/policies/terms-of-use/', /ChatGPT sign-in for Codex is unclear/],
+    ['gemini', /Gemini CLI terms of service/, 'https://geminicli.com/docs/resources/tos-privacy/', /violates its terms/],
+    ['antigravity', /Google Antigravity terms/, 'https://antigravity.google/terms', /breach of the agreement/],
+    ['xai', /xAI Terms of Service/, 'https://x.ai/legal/terms-of-service', /SuperGrok or X Premium\+ subscription is unclear/],
+  ] as const)('shows %s its own vendor terms, not Anthropic text', (vendor, linkName, href, policy) => {
+    renderWithProviders(<SubscriptionRiskDisclosure checked={false} onCheckedChange={vi.fn()} vendor={vendor} />);
+    expect(screen.getByText(policy)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: linkName })).toHaveAttribute('href', href);
+    expect(screen.queryByText(/Anthropic/)).toBeNull();
+    expect(screen.queryByRole('link', { name: /legal and compliance/i })).toBeNull();
+    expect(screen.getByRole('checkbox', { name: /read the policy and risks/i })).toBeInTheDocument();
+  });
+
+  it('shows a vendor-neutral notice with no link for an unknown vendor', () => {
+    renderWithProviders(<SubscriptionRiskDisclosure checked={false} onCheckedChange={vi.fn()} vendor="other" />);
+    expect(screen.getByText(/Read this vendor's terms/)).toBeInTheDocument();
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
   it('renders the one-line note with the same link', () => {
     renderWithProviders(<SubscriptionRiskNote />);
     expect(screen.getByRole('link', { name: /read the policy/i })).toHaveAttribute('href', LEGAL);
   });
 });
 
-/** Copy guard: the Anthropic sentences state policy, never a technical block
- *  (owner decision 2026-10-16). Only the kept Google sentence (`.others`)
- *  may say "blocked". zh-TW also follows the house writing rules. */
+/** Copy guard: every sentence states cited policy, never a technical block
+ *  (owner decision 2026-10-16; the old "Google has blocked server-side since
+ *  2026-03" sentence had no primary source and is gone). zh-TW also follows
+ *  the house writing rules. */
 describe('subscription risk copy', () => {
   const anthropicKeys = [
     'subscriptionRisk.policy',
@@ -45,6 +66,14 @@ describe('subscription risk copy', () => {
     'subscriptionRisk.recommendation',
     'subscriptionRisk.short',
     'welcome.backend.claudeSub.risk',
+    'subscriptionRisk.others',
+    'subscriptionRisk.vendor.openai.policy',
+    'subscriptionRisk.vendor.gemini.policy',
+    'subscriptionRisk.vendor.antigravity.policy',
+    'subscriptionRisk.vendor.xai.policy',
+    'subscriptionRisk.vendor.other.policy',
+    'subscriptionRisk.generic.conflicts',
+    'subscriptionRisk.generic.recommendation',
   ];
   const catalogs: Record<string, Record<string, string>> = {
     'zh-TW': zhTW as Record<string, string>,
@@ -52,12 +81,16 @@ describe('subscription risk copy', () => {
     'ja-JP': ja as Record<string, string>,
   };
 
-  it.each(Object.keys(catalogs))('%s never claims Anthropic blocks it server-side', (loc) => {
+  it.each(Object.keys(catalogs))('%s never claims a vendor blocks it server-side', (loc) => {
     for (const key of anthropicKeys) {
       const text = catalogs[loc][key];
       expect(text, `${loc} ${key}`).toBeTruthy();
-      expect(text).not.toMatch(/封鎖|伺服器端|blocked|server side|server-side|ブロック|サーバー側/i);
+      expect(text).not.toMatch(/封鎖|伺服器端|blocked|server side|server-side|ブロック|サーバー側|2026-03|2026 年 3 月|2026年3月|March 2026/i);
     }
+  });
+
+  it.each(Object.keys(catalogs))('%s policy copy drops "individual" (the source says ordinary use)', (loc) => {
+    expect(catalogs[loc]['subscriptionRisk.policy']).not.toMatch(/individual|個人/i);
   });
 
   it('drops the old notice key everywhere', () => {
