@@ -212,7 +212,7 @@
 - [~] 🔴 sidecar 設定:release `duduclaw` 以 `externalBin: ["binaries/duduclaw"]` 註冊;App 啟動 → spawn `duduclaw run --yes`(完整 server = gateway + dashboard + channels;**非** `gateway`,也**沒有** `start` 子命令 —— 後者是 launchd 時代的筆誤,已修),退出 → `stop()` 終止。
 - [~] 🟡 視窗:預設 1280×840 / 最小 960×640、置中、深色 `#1c1917` 背景、`visible:false` 直到 ready 才 `show()`(防白閃)。
 - [x] 📝 `docs/guides/desktop-build.md`:本機 `tauri dev` / `tauri build` / 圖示生成 / 生命週期說明。
-- [x] 📝 `scripts/desktop/gen-icons.sh`:`cargo tauri icon` 主路徑 + macOS `sips`/`iconutil` 降級(產 PNG + `.icns`;`.ico` 仍需 Tauri CLI/ImageMagick,腳本明確告警)。**仍缺品牌 raster 來源** `web/public/paw-1024.png`(需提供 ≥1024² 方形 PNG)。
+- [x] 📝 `scripts/desktop/gen-icons.sh`:`cargo tauri icon` 主路徑 + macOS `sips`/`iconutil` 降級(產 PNG + `.icns`;`.ico` 仍需 Tauri CLI/ImageMagick,腳本明確告警)。**仍缺品牌 raster 來源** `web/public/paw-1024.png`(需提供 ≥1024² 方形 PNG)。(C1 後來源已改為 `src-tauri/icons/source/duduclaw-1024.png`,舊 paw 檔已刪除。)
 - [ ] 🧪 冒煙:`tauri dev` 起得來、WebView 顯示登入頁、可送一句 chat(**阻塞:無工具鏈/顯示器**)。
 
 ### D1 與既有啟動方式互斥  🔴
