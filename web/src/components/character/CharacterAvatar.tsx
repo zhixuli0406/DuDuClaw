@@ -142,8 +142,22 @@ function Cheeks({ h }: { h: Head }) {
   const rr = h.r * 0.13;
   return (
     <g opacity={0.5}>
-      <circle cx={h.cx - dx} cy={cy} r={rr} fill="var(--agent-2b)" opacity={0.35} />
-      <circle cx={h.cx + dx} cy={cy} r={rr} fill="var(--agent-2b)" opacity={0.35} />
+      <circle cx={h.cx - dx} cy={cy} r={rr} fill="var(--character-blush)" opacity={0.35} />
+      <circle cx={h.cx + dx} cy={cy} r={rr} fill="var(--character-blush)" opacity={0.35} />
+    </g>
+  );
+}
+
+/** A small cat paw: a rounded mitten with three toe beans along the top. */
+function CatPaw({ x, y }: { x: number; y: number }) {
+  return (
+    <g data-cat-paw="">
+      <ellipse cx={x} cy={y} rx={2.6} ry={2.3} fill="var(--character-ink)" />
+      <g fill="var(--character-paw-bean)">
+        <circle cx={x - 1.1} cy={y - 0.7} r={0.5} />
+        <circle cx={x} cy={y - 1.1} r={0.5} />
+        <circle cx={x + 1.1} cy={y - 0.7} r={0.5} />
+      </g>
     </g>
   );
 }
@@ -196,7 +210,7 @@ function BustBody({ pose, gradId, animated }: { pose: CharacterPose; gradId: str
     <g>
       {/* Shoulders / body mound */}
       <path d="M6 48 Q6 31 24 31 Q42 31 42 48 Z" fill={grad} />
-      {/* Arms + paw hands */}
+      {/* Arms + cat paws (navy mitten with cream toe beans, C1 palette) */}
       {arms.map((a, i) => (
         <g
           key={i}
@@ -204,7 +218,7 @@ function BustBody({ pose, gradId, animated }: { pose: CharacterPose; gradId: str
           style={a.wave && animated ? { transformOrigin: `${a.s.x}px ${a.s.y}px` } : undefined}
         >
           <line x1={a.s.x} y1={a.s.y} x2={a.hnd.x} y2={a.hnd.y} stroke={armColor} strokeWidth={armW} strokeLinecap="round" opacity={0.85} />
-          <circle cx={a.hnd.x} cy={a.hnd.y} r={2.4} fill="var(--character-ink-soft)" />
+          <CatPaw x={a.hnd.x} y={a.hnd.y} />
         </g>
       ))}
     </g>

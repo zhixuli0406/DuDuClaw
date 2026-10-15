@@ -30,9 +30,25 @@ App Shell 是浮島式（inset）：sidebar 與內容區各自 `rounded-xl`，�
 
 語義色成對出現（背景 + `-foreground`）：`--primary`、`--secondary`、`--muted`、`--accent`、`--destructive`、`--brand`、`--success` / `--warning` / `--info`，加上 `--border` / `--input` / `--ring`。Sidebar 有自己一組 `--sidebar-*`。
 
-- **Dark 主題不是把亮度乘負值**：`--primary` 在 dark 反轉為近白（`oklch(0.92 …)`），`--border` 改用半透明白（`oklch(1 0 0 / 10%)`）。改 token 一律雙主題同步。
-- **品牌色**：`--brand` 目前是藍（hue 255，light `0.55 0.16` / dark `0.65 0.16`），chart 色相跟隨 brand hue。這是刻意的中性偏冷基調；`index.css` 的 brand 區塊留有註解，日後要換回 amber 只需改這一處而不動其他層。
-- **圖表色 `--chart-1..5`**：以 brand 為 chart-1，向外堆疊「主→次→三級」層次。Light 遞減飽和、dark 反轉亮度（最重要最亮）。純 SVG 圖表一律讀這五個 token 上色，不引入圖表庫。
+- **Dark 主題不是把亮度乘負值**：`--primary` 在 dark 反轉為 Cream（`oklch(0.967 0.005 95.1)`，配 Navy 字），`--border` 改用半透明白（`oklch(1 0 0 / 10%)`）。改 token 一律雙主題同步。
+- **品牌色（C1 識別，2026-10 起）**：品牌主色是 Navy `#102B48`，DuDuClaw 的點綴色是 Amber `#CC8B2D`。
+  - `--primary` / `--brand` / `--sidebar-primary` light 都是 Navy（`oklch(0.285 0.063 252.3)`），上面的字用 Cream `#F5F4F0`。
+  - Dark：`--primary` 是 Cream 底 + Navy 字；`--brand` 是淡 Navy（`oklch(0.86 0.04 250)` ≈ `#BED4EB`，在 dark canvas 上 12.4:1），因為 Navy 放在深底只有 1.3:1，不能直接用。
+  - Amber 只做裝飾（填色、圖示、尾巴、點綴），在淺底上當文字只有 2.9:1。要用 amber 寫字：light 用 `text-amber-700`（`#8A5A10`），dark 用 `text-amber-400`（`#E0A54F`）。
+- **Tailwind `amber-*` 已重新定錨在 C1 Amber**（`index.css` 的 `@theme`）：500 = `#CC8B2D`、700 = `#8A5A10`、400 = `#E0A54F`，600 調暗到可當文字（白底 5.2:1）。全站約 40 個檔案的 `amber-*` 不用逐檔改就換成新色。這些用法絕大多數是**語意上的警示狀態**（待審、暫停、降級、過期），它們仍然是琥珀色系，照樣讀得出「警示」，只是換成品牌那支琥珀。`--status-*` / `--xp` / `--coin` 是獨立的語意 token，沒有跟著換。
+- `--color-primary-50..950` 是 Navy 色階（900 = `#102B48`、950 = `#0B1E33`），`--color-accent-400/500` 是 Amber（`#E0A54F` / `#CC8B2D`）。目前頁面沒有直接用這兩組 utility，留給需要色階的地方。
+- **圖表色 `--chart-1..5`**：以 brand 為 chart-1（Navy），向外堆疊「主→次→三級」層次，色相 252。Light 遞減深度、dark 反轉亮度（最重要最亮，chart-1 = 淡 Navy）。純 SVG 圖表一律讀這五個 token 上色，不引入圖表庫。
+
+### 1.2.1 品牌標誌與吉祥物（C1）
+
+| 用途 | 元件 / token | 規則 |
+|---|---|---|
+| 產品標誌 | `components/brand/BrandMark.tsx`（`<BrandMark size title mono />`） | C1 坐姿貓 mark，path 原封不動取自品牌包 `duduclaw-mark.svg`（`components/brand/mark-paths.ts`，不要手改）。墨色層吃 `--logo-ink`（light Navy / dark Cream），尾巴吃 `--logo-accent`（Amber，永不換色）。螢幕上最小 32px，導航列可用 28px；不放進色塊或圓圈裡；不加陰影、漸層、外框。 |
+| 吉祥物 | `components/mascot/DuDu.tsx` | 直接用 mark 的剪影畫成角色：身體 `--logo-ink`、尾巴 `--logo-accent`、五官 `--logo-face`（墨色的反色，light 是 Cream、dark 是 Navy）。13 個表情 preset、viseme 對嘴、尾巴擺動與前爪姿勢都在同一個 SVG；`prefers-reduced-motion` 時整隻靜止。 |
+| AI 員工角色 | `components/character/CharacterAvatar.tsx` | 每位員工各自的色調（`--agent-1..10`），五官墨色 `--character-ink` = Navy，臉頰 `--character-blush` = Amber，bust 版的手是貓掌（Navy 掌心 + Cream 肉球）。 |
+| Favicon | `components/brand/assets/favicon.svg`（+ 32px PNG） | 由 Vite 打包進 `/assets/`（gateway 只對外提供 `/assets/*`）。SVG 內含 `prefers-color-scheme: dark` 規則，深色分頁列上墨色會換成 Cream。 |
+
+`🐾` 不再代表產品。它只保留一個角色：AI 員工沒有自己圖示時的**預設頭像**（`DEFAULT_AGENT_GLYPH`，`lib/product-identity.ts`）。產品名稱旁、登入頁、對外海報、gateway 選擇頁都改用 `<BrandMark>` 或純文字。
 
 ### 1.3 三層陰影
 
@@ -257,6 +273,8 @@ IA 稽核 14 組分散功能中至少 8 組是同一個形狀：A 頁可以編�
 6. **對外錯誤顯示標準範本（禁 `err.message` / 原始 stdout/stderr 直通）。** 任何一頁把 `catch (e)` 抓到的值、或後端 shell-out 結果的 `stdout`/`stderr`，原封不動塞進 toast / 錯誤欄，都是 bug（`DRAFT-no-linux-surface-2026-08.md` item 7 的最大缺口）——`err.message` 可能是「Request timeout: system.config」這種內部字串，appliance 的 `stdout`/`stderr` 可能是 `systemctl`/`bootctl`/`systemd-sysupdate` 的原始輸出，兩者都不是使用者該看到的東西。**標準範本**：`lib/toast.ts` 的 `formatError(err)`（分類成 `errorState.manage.short.*` 人話 clause ＋ `sanitizeErrorDetail` 遮罩／截斷的技術細節，`clause（detail）`）；appliance 的 `device.*` shell-out 結果（`DeviceOpResult { success, stdout, stderr }`）額外走同檔案的 `formatDeviceOpDetail(res)`（`success:false` 走 `formatError`；`success:true` 只留遮罩後的殘餘文字，供支援排查，絕不是原始 dump）。**參照實作**：`DevicePage.tsx` 電源選單（`runDangerAction` / `runRestartAfterRestore`）——`toast.error(formatError(e))`，沒有分支渲染 `e.message` 或任何原始欄位；同頁「更新中心」的「顯示詳情」欄（`formatDeviceOpDetail(updateLog)`）與對話卡 `UpdateConfirmCard` / `UpdateStatusCard` 是同一範本的三個套用點。新頁面看到 `catch` 區塊想直接顯示錯誤內容時，先看這裡，不要重新發明。
 
 ### 5.1 刻意殘留清單（**不是**待清理債務）
+
+- **`web/public/paw-source.svg` / `paw-1024.png`**：舊 🐾 app icon 的來源檔。儀表板本身已不引用（gateway 也不對外提供根目錄檔案），留著只因桌面圖示產生器 `scripts/desktop/gen-icons.sh` 與 desktop-release CI 還指向它們；換成 C1 圖示來源後就可以刪掉。
 
 以下項目刻意不套 mds token / 樣式，改動前先確認你不是在「修正」一個刻意設計：
 

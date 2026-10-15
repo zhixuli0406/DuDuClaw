@@ -3,7 +3,7 @@ import { useAuthStore } from './auth-store';
 import type { VisemeShape } from '@/components/mascot';
 import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
-import { effectiveName, effectiveLogoGlyph } from '@/lib/product-identity';
+import { effectiveName, DEFAULT_AGENT_GLYPH } from '@/lib/product-identity';
 import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
 
 export interface ChatAttachmentMeta {
@@ -715,7 +715,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     convId: nextConvId(),
     sessionsRevision: 0,
     agentName: effectiveName(),
-    agentIcon: effectiveLogoGlyph(),
+    agentIcon: DEFAULT_AGENT_GLYPH,
     selectedAgentId: null,
     supportsVision: false,
     model: '',

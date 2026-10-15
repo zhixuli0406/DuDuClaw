@@ -29,6 +29,8 @@ const SIDEBAR_WIDTH_DEFAULT = 256;
 const SIDEBAR_WIDTH_MIN = 200;
 const SIDEBAR_WIDTH_MAX = 360;
 const SIDEBAR_WIDTH_ICON = '3rem';
+/** Inset rail: the 3rem icon panel plus the inset's 0.5rem padding per side. */
+const SIDEBAR_WIDTH_ICON_INSET = '4rem';
 const SIDEBAR_WIDTH_MOBILE = '18rem';
 const STORAGE_OPEN = 'sidebar_open';
 const STORAGE_WIDTH = 'sidebar_width';
@@ -192,7 +194,17 @@ export const Sidebar = forwardRef<
       data-slot="sidebar"
       data-variant={variant}
       data-state={state}
-      style={{ width: collapsed ? SIDEBAR_WIDTH_ICON : `${width}px` }}
+      // The inset variant pads the aside by 0.5rem per side. Without adding that
+      // back, the collapsed rail's panel is only 32 px wide, the sections' own
+      // px-2 squeezes header controls to 16 px, and the 32 px icon buttons get
+      // clipped by the panel's overflow-hidden.
+      style={{
+        width: collapsed
+          ? variant === 'inset'
+            ? SIDEBAR_WIDTH_ICON_INSET
+            : SIDEBAR_WIDTH_ICON
+          : `${width}px`,
+      }}
       className={cn(
         'relative hidden shrink-0 transition-[width] duration-200 ease-out md:block',
         variant === 'inset' && 'p-2',

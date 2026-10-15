@@ -5,7 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>DuDuClaw Dashboard</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐾</text></svg>" />
+    <!-- C1 cat mark. Vite fingerprints these into /assets/ (the gateway only
+         serves /assets/*); the SVG swaps its ink to Cream in dark mode. -->
+    <link rel="icon" type="image/svg+xml" href="/src/components/brand/assets/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/src/components/brand/assets/favicon-32.png" />
   </head>
   <body class="text-stone-900 dark:text-stone-100 antialiased">
     <div id="root"></div>

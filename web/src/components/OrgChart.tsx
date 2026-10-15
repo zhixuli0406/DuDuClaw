@@ -3,7 +3,14 @@ import * as d3 from 'd3';
 import type { AgentDetail } from '@/lib/api';
 import { characterFor } from '@/lib/character-gen';
 import { glyphText } from '@/lib/agent-glyph';
-import { useEffectiveName, useEffectiveLogoGlyph } from '@/lib/product-identity';
+import { useEffectiveName } from '@/lib/product-identity';
+import {
+  MARK_ACCENT_PATH,
+  MARK_INK_BODY_PATH,
+  MARK_INK_HEAD_PATH,
+  MARK_POTRACE_TRANSFORM,
+  MARK_VIEWBOX,
+} from '@/components/brand/mark-paths';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -34,9 +41,9 @@ interface OrgChartProps {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGlyph: string): OrgNode {
+function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string): OrgNode {
   if (agents.length === 0) {
-    return { name: '__root__', displayName: rootName, role: 'system', status: 'active', icon: rootGlyph, model: '', department: '', children: [] };
+    return { name: '__root__', displayName: rootName, role: 'system', status: 'active', icon: '', model: '', department: '', children: [] };
   }
 
   // Find the root: prefer role=main, then first agent with no reports_to
@@ -103,7 +110,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
     displayName: rootName,
     role: 'system',
     status: 'active',
-    icon: rootGlyph,
+    icon: '',
     model: '',
     department: '',
     children: agents.map((a) => toNode(a)),
@@ -112,18 +119,18 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGly
 
 const STATUS_COLORS: Record<string, { fill: string; stroke: string }> = {
   active: { fill: '#ecfdf5', stroke: '#10b981' },
-  paused: { fill: '#fffbeb', stroke: '#f59e0b' },
+  paused: { fill: '#fef6e8', stroke: '#cc8b2d' },
   terminated: { fill: '#fff1f2', stroke: '#f43f5e' },
 };
 
 const STATUS_COLORS_DARK: Record<string, { fill: string; stroke: string }> = {
   active: { fill: '#064e3b', stroke: '#34d399' },
-  paused: { fill: '#451a03', stroke: '#fbbf24' },
+  paused: { fill: '#351e04', stroke: '#e0a54f' },
   terminated: { fill: '#4c0519', stroke: '#fb7185' },
 };
 
 const ROLE_COLORS: Record<string, string> = {
-  main: '#f59e0b',
+  main: '#cc8b2d', // C1 amber accent
   specialist: '#3b82f6',
   worker: '#8b5cf6',
   system: '#6b7280',
@@ -142,7 +149,6 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Use the fixed product identity for the synthetic root.
   const brandName = useEffectiveName();
-  const brandGlyph = useEffectiveLogoGlyph();
 
   const render = useCallback(() => {
     if (!svgRef.current || !containerRef.current || agents.length === 0)
@@ -157,7 +163,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
 
-    const root = d3.hierarchy(buildTree(agents, brandName, brandGlyph));
+    const root = d3.hierarchy(buildTree(agents, brandName));
     const containerWidth = containerRef.current.clientWidth;
     const containerHeight = containerRef.current.clientHeight;
 
@@ -286,14 +292,26 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
     nodeGroups.each(function (d) {
       const g = d3.select(this);
       if (d.data.name === '__root__') {
-        // Synthetic root keeps the paw glyph.
-        g.append('text')
-          .attr('x', HEAD_CX)
-          .attr('y', HEAD_CY + 1)
-          .attr('text-anchor', 'middle')
-          .attr('dominant-baseline', 'middle')
-          .attr('font-size', '22px')
-          .text(d.data.icon);
+        // Synthetic root = the product itself → the C1 brand mark (ink follows
+        // the theme via --logo-ink, the tail keeps the amber accent).
+        const MARK = 28;
+        const mark = g
+          .append('svg')
+          .attr('x', HEAD_CX - MARK / 2)
+          .attr('y', HEAD_CY - MARK / 2)
+          .attr('width', MARK)
+          .attr('height', MARK)
+          .attr('viewBox', MARK_VIEWBOX)
+          .attr('aria-hidden', 'true');
+        const ink = mark.append('g').attr('transform', MARK_POTRACE_TRANSFORM).style('fill', 'var(--logo-ink)');
+        ink.append('path').attr('d', MARK_INK_HEAD_PATH);
+        ink.append('path').attr('d', MARK_INK_BODY_PATH);
+        mark
+          .append('g')
+          .attr('transform', MARK_POTRACE_TRANSFORM)
+          .style('fill', 'var(--logo-accent)')
+          .append('path')
+          .attr('d', MARK_ACCENT_PATH);
         return;
       }
       const traits = characterFor(d.data.name);
@@ -370,7 +388,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .attr('cy', 16)
       .attr('r', 4)
       .attr('fill', (d) => statusColors[d.data.status]?.stroke ?? '#a8a29e');
-  }, [agents, onNodeClick, brandName, brandGlyph]);
+  }, [agents, onNodeClick, brandName]);
 
   // Render on mount and when agents change
   useEffect(() => {

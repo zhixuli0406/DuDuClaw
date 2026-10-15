@@ -36,7 +36,7 @@ function Shell() {
 describe('<Sidebar>', () => {
   beforeEach(() => localStorage.clear());
 
-  it('toggles between expanded and collapsed (3rem icon mode)', async () => {
+  it('toggles between expanded and collapsed (3rem icon panel)', async () => {
     const user = userEvent.setup();
     const { container } = renderWithProviders(<Shell />);
     const aside = container.querySelector('[data-slot="sidebar"]')!;
@@ -46,7 +46,9 @@ describe('<Sidebar>', () => {
 
     await user.click(screen.getByRole('button', { name: 'Toggle sidebar' }));
     expect(aside).toHaveAttribute('data-state', 'collapsed');
-    expect((aside as HTMLElement).style.width).toBe('3rem');
+    // Sidebar defaults to the inset variant: 3rem icon panel + 0.5rem inset per side,
+    // so 32 px icon buttons are not clipped by the panel.
+    expect((aside as HTMLElement).style.width).toBe('4rem');
   });
 
   it('persists the open state to localStorage', async () => {

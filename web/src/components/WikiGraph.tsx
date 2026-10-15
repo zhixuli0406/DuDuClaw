@@ -32,7 +32,7 @@ interface GLink extends d3.SimulationLinkDatum<GNode> {
   label?: string;
 }
 
-const PAGE_COLOR = '#f59e0b'; // amber-500 — a page
+const PAGE_COLOR = '#cc8b2d'; // amber-500 — a page
 const TOPIC_COLOR: Record<TopicKind, string> = {
   tag: '#8b5cf6', // violet-500 — an explicit tag
   category: '#3b82f6', // blue-500 — the page's folder
@@ -41,7 +41,7 @@ const TOPIC_COLOR: Record<TopicKind, string> = {
 
 const LINK_STYLE: Record<LinkKind, { stroke: string; opacity: number; width: number; dash?: string }> = {
   'page-topic': { stroke: '#a8a29e', opacity: 0.35, width: 1 },
-  'page-page-link': { stroke: '#f59e0b', opacity: 0.6, width: 1.8 },
+  'page-page-link': { stroke: '#cc8b2d', opacity: 0.6, width: 1.8 },
   'page-page-shared': { stroke: '#a8a29e', opacity: 0.3, width: 1, dash: '4 3' },
   'topic-topic': { stroke: '#8b5cf6', opacity: 0.4, width: 1.4 },
 };

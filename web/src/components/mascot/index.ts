@@ -1,5 +1,5 @@
 /**
- * DuDu mascot barrel (§7). The DuDuClaw paw-creature companion — one SVG
+ * DuDu mascot barrel (§7). The DuDuClaw cat companion (drawn on the C1 mark) — one SVG
  * character, 13 face presets, viseme-driven speech. Import from
  * '@/components/mascot'.
  */

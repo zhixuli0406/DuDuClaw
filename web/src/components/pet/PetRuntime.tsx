@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PetRuntimePayload, SpriteAnimation } from '@/lib/pet';
 import { isTauri, onPetAgentSignal, openPetContextMenu, petMoveBy, startWindowDrag } from '@/lib/pet';
+import { DEFAULT_AGENT_GLYPH } from '@/lib/product-identity';
 
 /**
  * PetRuntime — the desktop-pet animator (WP-P3 / WP-P5-lite).
@@ -599,7 +600,7 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
             />
           ) : (
             <div className="grid size-[120px] place-items-center rounded-full bg-muted text-4xl">
-              🐾
+              {DEFAULT_AGENT_GLYPH}
             </div>
           )}
         </div>
@@ -622,7 +623,7 @@ export function PetRuntime({ pet, pendingCount = 0, onActivate }: PetRuntimeProp
                 width="40"
                 height="26"
                 rx="6"
-                fill="var(--status-agent-paused, #f59e0b)"
+                fill="var(--status-agent-paused, #cc8b2d)"
                 stroke="#fff"
                 strokeWidth="2"
               />
