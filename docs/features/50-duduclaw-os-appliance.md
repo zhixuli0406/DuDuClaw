@@ -224,9 +224,10 @@ v0.4.0 successfully cannot roll back to them):
   all signed with SHA-256 and minisign (the whole-disk image also ships a
   `.manifest.json` for provenance only). For v0.4.0, the QEMU machine's
   whole-disk image passed the release smoke boot under QEMU (software
-  emulation, no KVM), reaching the login prompt in about 65 seconds. No
-  boot test of the v0.4.0 installer ISOs is recorded, and the installer
-  wizard was not run end to end. The real-hardware machine
+  emulation, no KVM), reaching the login prompt in about 65 seconds, and
+  both QEMU-machine installer ISOs booted to the live environment's
+  automatic root login in about 125 seconds each; the installer wizard was
+  not run end to end. The real-hardware machine
   (`duduclaw-genericx86-64`) was built but not boot-tested, and it has not
   booted on real hardware yet.
 - The non-root gateway was checked on a test variant of the QEMU
