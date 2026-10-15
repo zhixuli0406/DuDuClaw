@@ -74,26 +74,27 @@ pub(crate) const TOOLS_LIST_WATCH_INTERVAL: std::time::Duration =
 
 // ── Method handlers ──────────────────────────────────────────
 
-pub(crate) fn handle_initialize(id: &Value, _request: &Value) -> Value {
+/// The capabilities the stdio server declares (legacy `initialize` and modern
+/// `server/discover` alike).
+///
+/// O7: `tools/list` is filtered by the caller's live capabilities, and those
+/// change mid-session (a PORTICO grant is minted, an operator edits
+/// `agent.toml`, the dashboard calls `agent_update`). Declaring `listChanged`
+/// is what makes hiding a tool honest rather than permanent: the stdio loop
+/// tells the client whenever the caller's visible set actually differs, as
+/// an unsolicited notification to a legacy client and on a
+/// `subscriptions/listen` stream to a modern one.
+pub(crate) fn stdio_capabilities() -> Value {
+    serde_json::json!({ "tools": { "listChanged": true } })
+}
+
+/// Legacy `initialize`: negotiate the client's revision (see
+/// `crate::mcp_protocol::negotiate_legacy`). `params` is the request's
+/// `params` object.
+pub(crate) fn handle_initialize(id: &Value, params: &Value) -> Value {
     jsonrpc_response(
         id,
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                // O7: `tools/list` is filtered by the caller's live
-                // capabilities, and those change mid-session (a PORTICO grant
-                // is minted, an operator edits `agent.toml`, the dashboard
-                // calls `agent_update`). Declaring `listChanged` is what makes
-                // hiding a tool honest rather than permanent — the stdio loop
-                // emits `notifications/tools/list_changed` whenever the
-                // caller's visible set actually differs.
-                "tools": { "listChanged": true }
-            },
-            "serverInfo": {
-                "name": "duduclaw",
-                "version": duduclaw_gateway::updater::current_version()
-            }
-        }),
+        crate::mcp_protocol::initialize_result(params, stdio_capabilities()),
     )
 }
 

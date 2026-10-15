@@ -65,7 +65,7 @@ SHA-256ハッシュとしてのみディスクに保存される（`~/.duduclaw/
 
 | パス | 用途 |
 |---|---|
-| `POST /mcp` | 標準MCPエンドポイント（initialize／tools/list／tools/call／ping） |
+| `POST /mcp` | 標準MCPエンドポイント：`server/discover`／`tools/list`／`tools/call`／`subscriptions/listen`（2026-07-28）、`initialize`／`ping`（旧世代）。[プロトコルバージョン](#プロトコルバージョン)を参照 |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728リソースメタデータ（401の `WWW-Authenticate` ヘッダーがここを指す） |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414認可サーバーメタデータ |
 | `POST /oauth/register` | RFC 7591動的クライアント登録（public client） |
@@ -76,6 +76,17 @@ SHA-256ハッシュとしてのみディスクに保存される（`~/.duduclaw/
 静的Bearerキー（`ddc_…`）とOAuthトークン（`ddc_oauth_…`）は同じ `Authorization: Bearer`
 インターフェースを共有する。スクリプトや自社の連携は引き続き静的キーを使えばよく、OAuthは
 claude.aiのように「OAuthしか話さない」クライアント向けに用意されている。
+
+## プロトコルバージョン
+
+`POST /mcp` と stdio の `duduclaw mcp-server` は、MCP の二つの世代の両方に対応しています。
+
+- **新世代 2026-07-28**：`initialize` はありません。各リクエストが `params._meta` にバージョンとクライアント機能（`io.modelcontextprotocol/protocolVersion`、`io.modelcontextprotocol/clientCapabilities`）を持ちます。`server/discover`・`tools/list`・`tools/call`・`subscriptions/listen` に対応します。HTTP では各リクエストに `MCP-Protocol-Version` と `Mcp-Method` ヘッダーが必要で、`tools/call` には `Mcp-Name` も必要です。ヘッダーの欠落や本文との不一致は `400` と `-32020`、未対応のバージョンは対応バージョン一覧付きの `-32022` になります。
+- **旧世代 2024-11-05 〜 2025-11-25**：`initialize` で交渉します。要求したバージョンをそのまま返し、知らないバージョンには 2025-11-25 を返します。`ping` にも応答します。
+
+ツール一覧が変わったとき：stdio の旧世代クライアントには従来どおり `notifications/tools/list_changed` が届きます。新世代クライアントには、`toolsListChanged: true` を付けて開いた `subscriptions/listen` の上でだけ届きます。HTTP エンドポイントは状態を持たず、呼び出し元のツールが変わったことを知る手段がないため、購読には通知種別なしで確認応答を返し、すぐに購読を終了します。HTTP クライアントは `tools/list` の `ttlMs`（5 秒）が切れたら読み直してください。
+
+2026-10-16 に公式 TypeScript クライアント `@modelcontextprotocol/client` 2.3.1 で、2026-07-28 固定・自動・旧世代の三つのモードを stdio と HTTP の両方で確認しました。
 
 ## セキュリティに関する補足
 

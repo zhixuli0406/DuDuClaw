@@ -170,6 +170,7 @@ does not:
 
 ## Troubleshooting
 
+- Protocol: the server speaks MCP 2026-07-28 (no `initialize`) and the `initialize`-based revisions up to 2025-11-25. Details: [remote-mcp.md, Protocol versions](remote-mcp.md#protocol-versions).
 - `MCP authentication failed: DUDUCLAW_MCP_API_KEY environment variable not set. Run: duduclaw mcp init --client claude-code`:
   the client started the server without the key. Re-run `mcp init` or add
   the `env` entry.
