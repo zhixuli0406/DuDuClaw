@@ -525,7 +525,7 @@ async fn completions_handler(
             return err_json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!(
-                    "provider `{provider}` 座位缺少憑證（請先執行 `duduclaw auth device --provider {}`）",
+                    "provider `{provider}` 座位缺少憑證（請先執行 `duduclaw auth device --provider {} --accept-subscription-risk`）",
                     if provider == "github" {
                         "copilot"
                     } else {

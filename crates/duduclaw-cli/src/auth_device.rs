@@ -287,6 +287,15 @@ async fn store_seat_account(
 
 // ── CLI entry point ──────────────────────────────────────────────────────────
 
+/// Terminal notice shown before a device-flow login stores a seat.
+pub fn subscription_risk_notice(cfg: &DeviceFlowConfig) -> String {
+    format!(
+        "! {} 訂閱帳號風險：{}",
+        cfg.display,
+        duduclaw_core::subscription_risk::vendor_policy(cfg.provider_id).line_zh()
+    )
+}
+
 /// Resolve the OAuth client id: CLI flag → `config.toml [auth.<provider>]
 /// client_id` → the documented public default.
 fn resolve_client_id(cfg: &DeviceFlowConfig, cli: Option<&str>, config: &toml::Table) -> String {
@@ -308,12 +317,45 @@ fn resolve_client_id(cfg: &DeviceFlowConfig, cli: Option<&str>, config: &toml::T
 }
 
 /// Run `duduclaw auth device --provider <provider>`.
-pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> Result<()> {
+pub async fn run(
+    provider: &str,
+    cli_client_id: Option<String>,
+    accept_subscription_risk: bool,
+    home: &Path,
+) -> Result<()> {
     let cfg = config_for(provider).ok_or_else(|| {
         DuDuClawError::Config(format!(
             "未知的 provider `{provider}`（支援：copilot）"
         ))
     })?;
+
+    // Subscription-risk acknowledgment, the terminal counterpart of the
+    // gateway's `accept_subscription_risk` gate (v1.74.0): this command stores
+    // a subscription seat credential, so it shows the notice and stops unless
+    // the operator passed the flag. Checked before any network call.
+    let notice = subscription_risk_notice(&cfg);
+    eprintln!("{notice}");
+    if !accept_subscription_risk {
+        return Err(DuDuClawError::Config(
+            "需要先閱讀上面的訂閱帳號風險說明；確認後加上 --accept-subscription-risk 重新執行。".to_string(),
+        ));
+    }
+    duduclaw_security::audit::append_audit_event(
+        home,
+        &duduclaw_security::audit::AuditEvent::new(
+            "subscription_risk_accepted",
+            "operator-cli",
+            duduclaw_security::audit::Severity::Info,
+            serde_json::json!({
+                "method": "duduclaw auth device",
+                "provider": cfg.provider_id,
+                "account_id": null,
+                "policy_url": duduclaw_core::subscription_risk::vendor_policy(cfg.provider_id).url,
+                "outcome": "acknowledged",
+                "note": "risk notice acknowledged; not a record of a successful login or save",
+            }),
+        ),
+    );
 
     let config: toml::Table = tokio::fs::read_to_string(home.join("config.toml"))
         .await
@@ -572,6 +614,24 @@ pub fn seat_model_ids(provider_id: &str) -> &'static [&'static str] {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn copilot_notice_cites_github_terms_not_anthropic() {
+        let n = subscription_risk_notice(&config_for("copilot").unwrap());
+        assert!(n.contains(duduclaw_core::subscription_risk::GITHUB_COPILOT_TERMS_URL), "{n}");
+        assert!(!n.contains("Anthropic"), "{n}");
+    }
+
+    /// Without the flag the command stops before any network call and writes
+    /// neither config nor an audit row.
+    #[tokio::test]
+    async fn run_without_the_flag_refuses_offline() {
+        let home = tempfile::tempdir().unwrap();
+        let err = run("copilot", None, false, home.path()).await.unwrap_err();
+        assert!(err.to_string().contains("--accept-subscription-risk"), "{err}");
+        assert!(!home.path().join("config.toml").exists());
+        assert!(!home.path().join("security_audit.jsonl").exists());
+    }
 
     #[test]
     fn config_for_aliases() {

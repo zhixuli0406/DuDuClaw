@@ -7846,8 +7846,15 @@ export const api = {
   configRaw: {
     get: (file: ConfigRawFile) =>
       client.call('config.raw.get', { file }) as Promise<ConfigRawGetResult>,
-    set: (file: ConfigRawFile, content: string, baseHash?: string) =>
-      client.call('config.raw.set', { file, content, ...(baseHash ? { base_hash: baseHash } : {}) }) as Promise<ConfigRawSetResult>,
+    /** `acceptSubscriptionRisk` sends `accept_subscription_risk: true`, which
+     *  the gateway requires when the edit adds an oauth `[[accounts]]` entry. */
+    set: (file: ConfigRawFile, content: string, baseHash?: string, acceptSubscriptionRisk = false) =>
+      client.call('config.raw.set', {
+        file,
+        content,
+        ...(baseHash ? { base_hash: baseHash } : {}),
+        ...(acceptSubscriptionRisk ? { accept_subscription_risk: true } : {}),
+      }) as Promise<ConfigRawSetResult>,
   },
   // ── v1.68 W2 (dashboard switches) — END ────────────────────────────
   // ── I-5: ⌘K cross-source content search ─────────────────────────

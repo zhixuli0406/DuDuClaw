@@ -251,3 +251,90 @@ async fn setup_token_start_without_flag_is_refused() {
     assert!(handler.setup_token_session.read().await.is_none());
     assert!(acceptance_rows(home.path()).is_empty());
 }
+
+// ── config.raw.set ───────────────────────────────────────────
+
+async fn raw_hash(handler: &MethodHandler) -> Value {
+    match handler
+        .handle("config.raw.get", json!({ "file": "config" }), &UserContext::admin_fallback())
+        .await
+    {
+        WsFrame::Response {
+            ok: true,
+            payload: Some(p),
+            ..
+        } => p["hash"].clone(),
+        other => panic!("config.raw.get failed: {other:?}"),
+    }
+}
+
+/// The raw editor is the other way to write an `[[accounts]]` entry the
+/// rotator reads. Adding an oauth one needs the same acknowledgment; the
+/// refusal writes nothing and names the entry's vendor.
+#[tokio::test]
+async fn raw_config_adding_an_oauth_account_needs_the_flag() {
+    let home = tempfile::tempdir().unwrap();
+    let base = "[[accounts]]\nid = \"key\"\ntype = \"api_key\"\nprovider = \"openai\"\n";
+    std::fs::write(home.path().join("config.toml"), base).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let ctx = UserContext::admin_fallback();
+    let edited = format!("{base}\n[[accounts]]\nid = \"sub\"\ntype = \"oauth\"\nprovider = \"openai\"\n");
+
+    let hash = raw_hash(&handler).await;
+    let res = handler
+        .handle(
+            "config.raw.set",
+            json!({ "file": "config", "content": edited, "base_hash": hash }),
+            &ctx,
+        )
+        .await;
+    assert_refused(&res);
+    assert!(
+        error_text(&res).contains(duduclaw_core::subscription_risk::OPENAI_TERMS_URL),
+        "{}",
+        error_text(&res)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+        base,
+        "a refused raw write must not touch config.toml"
+    );
+    assert!(acceptance_rows(home.path()).is_empty());
+
+    let res = handler
+        .handle(
+            "config.raw.set",
+            json!({ "file": "config", "content": edited, "base_hash": hash, ACCEPT_PARAM: true }),
+            &ctx,
+        )
+        .await;
+    assert!(
+        matches!(res, WsFrame::Response { ok: true, .. }),
+        "{}",
+        error_text(&res)
+    );
+    assert!(std::fs::read_to_string(home.path().join("config.toml")).unwrap().contains("sub"));
+    let rows = acceptance_rows(home.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].details["method"], "config.raw.set");
+    assert_eq!(rows[0].details["account_id"], "sub");
+    assert_eq!(rows[0].details["provider"], "openai");
+
+    // Editing the file again with the oauth account already there is not
+    // asked again.
+    let hash = raw_hash(&handler).await;
+    let current = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let res = handler
+        .handle(
+            "config.raw.set",
+            json!({ "file": "config", "content": format!("{current}\n[general]\nlog_level = \"info\"\n"), "base_hash": hash }),
+            &ctx,
+        )
+        .await;
+    assert!(
+        matches!(res, WsFrame::Response { ok: true, .. }),
+        "{}",
+        error_text(&res)
+    );
+    assert_eq!(acceptance_rows(home.path()).len(), 1);
+}
