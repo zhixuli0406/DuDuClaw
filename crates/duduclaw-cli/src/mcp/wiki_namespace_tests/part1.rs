@@ -645,3 +645,46 @@ async fn audit_trail_query_denied_without_admin_scope() {
         "error message must reference the required scope; got: {text}"
     );
 }
+
+/// `wiki_share` must only publish pages from the caller's own wiki: a
+/// traversal, an absolute path or a symlink out of the wiki is refused and
+/// nothing reaches the shared wiki.
+#[tokio::test(flavor = "current_thread")]
+async fn wiki_share_refuses_paths_outside_the_own_wiki() {
+    let tmp = TempDir::new();
+    let agent = "alice";
+    create_agent_dir(tmp.path(), agent);
+    let wiki_dir = resolve_wiki_dir(tmp.path(), agent).unwrap();
+    std::fs::create_dir_all(wiki_dir.join("notes")).unwrap();
+    std::fs::write(
+        wiki_dir.join("notes/ok.md"),
+        "---\ntitle: Ok\n---\nshareable body",
+    )
+    .unwrap();
+    let secret = tmp.path().join("agents").join(agent).join("SECRET.md");
+    std::fs::write(&secret, "do not publish").unwrap();
+
+    let share = |path: &str| serde_json::json!({ "page_path": path });
+    for bad in ["../SECRET.md", "notes/../../SECRET.md", secret.to_str().unwrap()] {
+        let r = handle_wiki_share(&share(bad), tmp.path(), agent).await;
+        assert_eq!(r["isError"], true, "{bad} must be refused: {r}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&secret, wiki_dir.join("notes/link.md")).unwrap();
+        let r = handle_wiki_share(&share("notes/link.md"), tmp.path(), agent).await;
+        assert_eq!(r["isError"], true, "a symlink out of the wiki must be refused: {r}");
+    }
+    let shared = tmp.path().join("shared").join("wiki").join("sources");
+    let leaked = std::fs::read_dir(&shared)
+        .map(|d| d.flatten().any(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|c| c.contains("do not publish"))
+        }))
+        .unwrap_or(false);
+    assert!(!leaked, "nothing from outside the wiki may reach the shared wiki");
+
+    let r = handle_wiki_share(&share("notes/ok.md"), tmp.path(), agent).await;
+    assert_ne!(r["isError"], true, "an own page is still shared: {r}");
+    let missing = handle_wiki_share(&share("notes/none.md"), tmp.path(), agent).await;
+    assert!(missing.to_string().contains("Page not found"), "{missing}");
+}

@@ -384,12 +384,19 @@ pub(crate) async fn handle_wiki_share(args: &Value, home_dir: &Path, caller_agen
         Err(e) => return tool_error(&e),
     };
 
-    let full_path = wiki_dir.join(page_path);
-    let source_content = match std::fs::read_to_string(&full_path) {
+    // Same guard as `wiki_read`, checked before the path touches the disk:
+    // without it `../..` or an absolute path published the first 500
+    // characters of any file the process can read into the shared wiki.
+    if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
+        return tool_error("Path traversal is not allowed");
+    }
+    if !wiki_dir.join(page_path).is_file() {
+        return tool_error(&format!("Page not found in your wiki: {}", page_path));
+    }
+    // `read_raw` repeats the string checks and refuses a symlink that
+    // resolves outside the wiki directory.
+    let source_content = match duduclaw_memory::WikiStore::new(wiki_dir.clone()).read_raw(page_path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return tool_error(&format!("Page not found in your wiki: {}", page_path));
-        }
         Err(e) => return tool_error(&format!("Failed to read source page: {e}")),
     };
 
