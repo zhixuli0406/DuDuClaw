@@ -103,6 +103,7 @@ npx duduclaw mcp init --client cursor
 
 ## トラブルシューティング
 
+- プロトコル：server は MCP 2026-07-28（`initialize` 不要）と、`initialize` で交渉する 2025-11-25 までの旧版に対応します。詳細は [remote-mcp.md のプロトコルバージョン](remote-mcp.md#プロトコルバージョン)。
 - `MCP authentication failed: DUDUCLAW_MCP_API_KEY environment variable not set. Run: duduclaw mcp init --client claude-code`：クライアントがキーなしでサーバーを起動しました。`mcp init` を再実行するか、`env` の設定を追加してください。
 - `API key not found in registry`：キーが失効済みか、サーバーが `mcp init` の書き込み先とは別のデータディレクトリを読んでいます（`DUDUCLAW_HOME` を確認）。
 - `API key expired`：キーの有効期間は 90 日です。`mcp init` を再実行してください。

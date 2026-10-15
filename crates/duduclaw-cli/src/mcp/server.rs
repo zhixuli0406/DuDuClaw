@@ -169,6 +169,14 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // file mtimes, so a touched-but-unchanged config emits nothing and a WAL
     // write we cannot stat still gets noticed.
     let mut last_advertised: Option<Vec<String>> = None;
+    // Protocol era bookkeeping (MCP 2026-07-28, see `crate::mcp_protocol`).
+    // A legacy client (`initialize`) gets the unsolicited `list_changed`; a
+    // modern client only gets it on a `subscriptions/listen` it opened, keyed
+    // by that request's id. A process that has seen neither keeps the old
+    // unsolicited behaviour.
+    let mut legacy_initialized = false;
+    let mut modern_seen = false;
+    let mut tool_subscriptions: Vec<Value> = Vec::new();
     let mut watch = tokio::time::interval(TOOLS_LIST_WATCH_INTERVAL);
     watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // First tick completes immediately; burn it so the watcher does not fire
@@ -207,7 +215,17 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                             "MCP tools/list changed — notifying client"
                         );
                         last_advertised = Some(current);
-                        write_response(&mut stdout, &tools_list_changed_notification()).await?;
+                        if legacy_initialized || !modern_seen {
+                            write_response(&mut stdout, &tools_list_changed_notification())
+                                .await?;
+                        }
+                        for sub in &tool_subscriptions {
+                            write_response(
+                                &mut stdout,
+                                &crate::mcp_protocol::tagged_tools_list_changed(sub),
+                            )
+                            .await?;
+                        }
                     }
                 }
                 continue;
@@ -233,17 +251,138 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-        let response = match method {
-            "initialize" => {
-                let mut response = handle_initialize(&id, &request);
-                if workflow_available {
-                    response["result"]["capabilities"]["experimental"] =
-                        serde_json::json!({"duduclaw_workflow":{"version":1}});
+        // A JSON-RPC notification (no `id`) is never answered, known or not.
+        if request.get("id").is_none() {
+            if method == "notifications/cancelled" {
+                // Ends a modern subscription; after it nothing more is sent
+                // for that id. Other requests here finish synchronously, so
+                // there is nothing else to stop.
+                if let Some(rid) = params.get("requestId") {
+                    tool_subscriptions.retain(|s| s != rid);
                 }
+            }
+            continue;
+        }
+
+        // `initialize` only exists in the legacy era; anything else carrying
+        // the modern `_meta` revision is served statelessly (2026-07-28).
+        let era = if method == "initialize" {
+            crate::mcp_protocol::RequestEra::Legacy
+        } else {
+            crate::mcp_protocol::request_era(&params)
+        };
+        let modern = match era {
+            crate::mcp_protocol::RequestEra::Unsupported(requested) => {
+                let err = crate::mcp_protocol::unsupported_version_error(&id, &requested);
+                write_response(&mut stdout, &err).await?;
+                continue;
+            }
+            crate::mcp_protocol::RequestEra::Modern(_) => true,
+            crate::mcp_protocol::RequestEra::Legacy => false,
+        };
+        if modern {
+            modern_seen = true;
+            if let Some(problem) = crate::mcp_protocol::modern_meta_problem(&params) {
+                let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
+                    &id, -32602, &problem,
+                ));
+                write_response(&mut stdout, &err).await?;
+                continue;
+            }
+        }
+        let capabilities = || {
+            let mut caps = stdio_capabilities();
+            if workflow_available {
+                caps["experimental"] = serde_json::json!({"duduclaw_workflow":{"version":1}});
+            }
+            caps
+        };
+
+        let response = match (method, modern) {
+            ("initialize", _) => {
+                legacy_initialized = true;
+                let mut response = handle_initialize(&id, &params);
+                response["result"]["capabilities"] = capabilities();
                 response
             }
-            "tools/list" => {
+            // Removed in 2026-07-28; still part of every legacy revision.
+            ("ping", false) => jsonrpc_response(&id, serde_json::json!({})),
+            ("server/discover", true) => jsonrpc_response(
+                &id,
+                crate::mcp_protocol::discover_result(capabilities()),
+            ),
+            ("subscriptions/listen", true) => {
+                // Acknowledge first (spec MUST), then deliver tagged
+                // `list_changed` until the client cancels. No response is
+                // written now: the request stays open.
+                let wants = crate::mcp_protocol::wants_tools_list_changed(&params);
+                if wants
+                    && !tool_subscriptions.contains(&id)
+                    && tool_subscriptions.len() >= crate::mcp_protocol::MAX_SUBSCRIPTIONS
+                {
+                    let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
+                        &id,
+                        -32000,
+                        &format!(
+                            "at most {} open subscriptions per process",
+                            crate::mcp_protocol::MAX_SUBSCRIPTIONS
+                        ),
+                    ));
+                    write_response(&mut stdout, &err).await?;
+                    continue;
+                }
+                // A subscriber the watcher cannot authenticate would never be
+                // compared against, so refuse instead of acknowledging.
+                let baseline = if wants {
+                    match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
+                        Ok(p) => Some(
+                            visible_tool_names(&p, home_dir, &default_agent)
+                                .await
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>(),
+                        ),
+                        Err(e) => {
+                            let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
+                                &id,
+                                -32003,
+                                &format!("MCP authentication failed: {e}"),
+                            ));
+                            write_response(&mut stdout, &err).await?;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let ack = crate::mcp_protocol::subscription_ack(&id, wants);
+                write_response(&mut stdout, &ack).await?;
+                if !wants {
+                    // Nothing this server offers was asked for: end the
+                    // subscription at once instead of leaving it open.
+                    write_response(&mut stdout, &crate::mcp_protocol::subscription_complete(&id))
+                        .await?;
+                    continue;
+                }
+                if last_advertised.is_none() {
+                    last_advertised = baseline;
+                }
+                if !tool_subscriptions.contains(&id) {
+                    tool_subscriptions.push(id.clone());
+                }
+                continue;
+            }
+            ("server/discover" | "subscriptions/listen", false) => jsonrpc_error(
+                &id,
+                -32602,
+                &format!(
+                    "{method} needs _meta[\"{}\"] (MCP 2026-07-28)",
+                    crate::mcp_protocol::META_PROTOCOL_VERSION
+                ),
+            ),
+            ("tools/list", _) => {
                 // Gap (a): re-authenticate per call instead of reusing the
                 // boot-time `principal` — a revoked/rescoped key must stop
                 // (or start) seeing tools without a restart.
@@ -257,14 +396,21 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                         // against the real wire content and the hot path pays
                         // for one pass, not two.
                         last_advertised = Some(advertised_tool_names(&resp));
-                        resp
+                        if modern {
+                            crate::mcp_protocol::with_cache_hints(
+                                resp,
+                                crate::mcp_protocol::TOOLS_LIST_TTL_MS,
+                            )
+                        } else {
+                            resp
+                        }
                     }
                     Err(e) => {
                         jsonrpc_error(&id, -32003, &format!("MCP authentication failed: {e}"))
                     }
                 }
             }
-            "tools/call" => {
+            ("tools/call", _) => {
                 // W20-P1 Phase 2A + P2-4: delegate to McpDispatcher, which now
                 // enforces the full pipeline — including RFC-23 egress ("secret
                 // in-use") arg-restoration and result redaction — inside the one
@@ -275,7 +421,6 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // `auth_cache` above) instead of reusing the boot-time
                 // `principal` for the whole life of this long-running
                 // subprocess.
-                let params = request.get("params").cloned().unwrap_or(Value::Null);
                 match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
                     Ok(p) => match resolve_ns(&p) {
                         Ok(ns) => dispatcher.dispatch_tool_call(&p, &ns, &params, &id).await,
@@ -290,11 +435,12 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                     }
                 }
             }
-            "notifications/initialized" => {
-                // This is a notification (no id expected in response), skip
-                continue;
-            }
             _ => jsonrpc_error(&id, -32601, &format!("Method not found: {method}")),
+        };
+        let response = if modern {
+            crate::mcp_protocol::modernize_response(response)
+        } else {
+            response
         };
 
         write_response(&mut stdout, &response).await?;

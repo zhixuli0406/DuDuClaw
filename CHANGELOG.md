@@ -5,16 +5,27 @@
 ### Added
 - MCP `tools/list` 的每個工具都帶 `annotations`（`readOnlyHint`、`destructiveHint`，部分工具另有 `idempotentHint`、`openWorldHint`），由派工閘門同一張效果分類表推導，不另立一套分類。這是給 MCP 用戶端的提示，不是授權，DuDuClaw 的閘門照常檢查。用戶端可能因此對唯讀工具少問一次確認。對照表見 `docs/guides/mcp-tools.md`。
 - `memory_search` 的 schema 補上處理程式本來就接受的 `limit`（預設 10、上限 100）與 `tags`（只回帶有其中任一標籤的項目）。
+- MCP server 支援 2026-07-28 協定（stdio 的 `duduclaw mcp-server` 與 HTTP 的 `POST /mcp`），同時保留舊版：
+  - 新世代用戶端不必先 `initialize`，每個請求在 `_meta` 帶版本與用戶端能力。支援 `server/discover`、`tools/list`、`tools/call` 與 `subscriptions/listen`；結果帶 `resultType` 與 server 身分，`tools/list` 和 `server/discover` 另帶快取提示（`ttlMs`、`cacheScope: "private"`，因為清單依金鑰與員工權限而不同）。
+  - 版本不支援回 `-32022` 並列出支援的版本；缺 `clientCapabilities` 回 `-32602`；新世代移除的 `ping` 回 `-32601`。
+  - HTTP 的新世代請求要帶 `MCP-Protocol-Version`、`Mcp-Method`，`tools/call` 另要 `Mcp-Name`（接受 `=?base64?…?=` 寫法）；缺漏或與內容不符回 `400` 加 `-32020`，未知方法回 `404`。
+  - 工具清單變動：stdio 的新世代用戶端只在自己開的 `subscriptions/listen` 上收到帶訂閱 id 的通知，不再收到不請自來的通知；舊世代用戶端照舊。HTTP 端點沒有狀態、無從得知清單變了，收到訂閱時回確認但不承諾任何通知類型，並立即結束訂閱。
+  - 新世代回應裡，DuDuClaw 自訂且落在規格保留範圍的錯誤碼（限流的 `-32029`），以及跟 2026-07-28 草案舊碼撞號的錯誤碼（認證失敗的 `-32003`）改成 `-32000`，原碼放在 `error.data.duduclawCode`；舊世代回應不變。
+  - 新世代請求的 `_meta` 會帶規格自己的 `io.modelcontextprotocol/*` 鍵，工作流程擴充（`duduclaw_workflow`）不再把它們當成未知的中繼資料拒絕。
+  - stdio 的 `subscriptions/listen` 在當下認證失敗時回錯誤，不再先確認訂閱、之後卻永遠收不到通知。
+  - 2026-10-16 用官方 TypeScript 用戶端 `@modelcontextprotocol/client` 2.3.1 在 stdio 與 HTTP 實測固定 2026-07-28、自動協商、舊世代三種模式，工具清單、工具呼叫與清單變動通知都正常。
 
 ### Changed
 - 獨立模式（`duduclaw mcp init`）列出的 24 個工具改寫說明：各自寫明何時用、該改用哪個相鄰工具、回傳什麼、會不會改動資料。起因是 Glama 的工具定義評分（2026-10-15 平均 3.6/5，最低是「使用時機」與「行為揭露」兩項）。每則說明仍在 200 bytes 上限內。
 - 下列參數的 schema 從字串改成實際型別，處理程式同時接受原生值與字串寫法（`"5"`、`"true"`、逗號分隔），舊用戶端不受影響：`code_map` 的 `max_files`（integer）與 `chat_files`（array）、`memory_fetch_batch` 的 `ids`（array）與 `include_metadata`（boolean）、`memory_search`／`memory_improve` 的 `limit`、`memory_search`／`memory_store` 的 `tags`（array）、`user_profile_record` 的 `origin_trust`（number）、`wiki_search` 的 `limit`／`min_trust`／`expand`、`wiki_write` 的 `update_index`、`wiki_graph` 的 `depth`。
 - 三語 README 的 PyPI badge 換成 Glama 分數 badge（badge 維持 5 個），PyPI 連結移到「Python SDK」段落。
 - 公開文件跟上 DuDuClaw OS v0.4.0（2026-10-16 發布，內嵌平台 v1.73.4）：三語 README 的 OS 段落與功能表、`docs/features/05`、`50`、`52`，以及 `docs/guides/task-sandbox.md`、`mcp-tools.md`、`appliance-build.md`（皆含 zh-TW／ja-JP）原本寫「下一版 OS 映像、尚未發版」的閘道去 root、rootless Podman、SSH 預設關閉、基礎版防火牆、`/api/internal/sysd` 與回退下限，改寫成從 v0.4.0 起提供；v0.3.0 以前的映像仍以 root 執行閘道與 Docker、內嵌較舊的平台。新增寫明：升級到 v0.4.0 是單向的（sysd 的回退下限加上第一次開機被標記成功後刪掉舊開機項目，成功開機過的裝置回不去 v0.3.0 以前）。測試範圍照 OS 的發版說明寫：QEMU 機型桌面版測試映像在建置主機的無頭 QEMU（TCG）跑兩輪驗證，第二輪 36 項過 35 項（沒過的是 doctor 標題，已在下方修正）；整碟映像通過發版前開機煙霧測試（約 65 秒到登入畫面）。仍未驗證：從 v0.3.0 經 A/B 更新升級、需要 LLM 憑證的任務沙箱／電腦操作／Discovery 完整流程、Windows VM、真機、genericx86-64 開機。SSH 目前還沒有能登入的帳號；Secure Boot、dm-verity、TPM2 在發布映像上仍未啟用。
+- 舊世代 `initialize` 改成真的協商：stdio 原本不管用戶端要什麼一律回 `2024-11-05`，HTTP 最高只到 `2025-06-18`。現在兩者共用同一段邏輯，支援 2025-11-25、2025-06-18、2025-03-26、2024-11-05，要哪個回哪個，不認得的版本回 2025-11-25。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
 - schema 與處理程式對參數型別的認知不一致，照 schema 傳值的用戶端會被拒或被默默忽略：`memory_fetch_batch` 收到字串形式的 `ids` 直接報錯；`include_metadata: "true"`、`max_files: "5"`、`origin_trust: "0.4"` 這類字串會被忽略並改用預設值；反過來，`wiki_search` 的 `limit: 5`、`expand: true`，`wiki_graph` 的 `depth: 3` 與 `wiki_write` 的 `update_index: false` 以原生 JSON 型別傳入時也會被忽略（`update_index: false` 照樣寫進 `_index.md`）。
+- stdio server 會回應不認得的 JSON-RPC 通知（例如 `notifications/cancelled`），送出一筆沒有 id 的錯誤，違反 JSON-RPC 規定；現在通知一律不回。stdio 也補上舊版規格要求的 `ping`，原本回「找不到方法」。
 
 ### Security
 - `wiki_share` 沒有檢查頁面路徑：`../`、絕對路徑或指向 wiki 外的符號連結都能讓它讀取員工自己 wiki 以外、行程讀得到的任何檔案，並把前 500 個字元（或呼叫者給的摘要）公開到所有員工都讀得到的共用 wiki，唯一的擋點是機密字樣掃描。現在跟 `wiki_read` 用同一道檢查，讀取時另外拒絕解析到 wiki 目錄外的連結。

@@ -59,7 +59,7 @@ OAuth 簽發的存取權杖**永遠是「外部客戶端」等級**，與對外�
 
 | 路徑 | 用途 |
 |---|---|
-| `POST /mcp` | 標準 MCP 端點（initialize／tools/list／tools/call／ping） |
+| `POST /mcp` | 標準 MCP 端點：`server/discover`／`tools/list`／`tools/call`／`subscriptions/listen`（2026-07-28），`initialize`／`ping`（舊世代）。見[協定版本](#協定版本) |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 資源中繼資料（401 的 `WWW-Authenticate` 會指向這裡） |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 授權伺服器中繼資料 |
 | `POST /oauth/register` | RFC 7591 動態客戶端註冊（public client） |
@@ -70,6 +70,17 @@ OAuth 簽發的存取權杖**永遠是「外部客戶端」等級**，與對外�
 靜態 Bearer key（`ddc_…`）與 OAuth 權杖（`ddc_oauth_…`）走同一個
 `Authorization: Bearer` 表面；腳本／自家整合繼續用靜態 key 即可，OAuth 是給
 「只會說 OAuth」的客戶端（claude.ai）用的。
+
+## 協定版本
+
+`POST /mcp` 與 stdio 的 `duduclaw mcp-server` 都同時支援 MCP 的兩個世代：
+
+- **新世代 2026-07-28**：沒有 `initialize`，每個請求在 `params._meta` 帶版本與用戶端能力（`io.modelcontextprotocol/protocolVersion`、`io.modelcontextprotocol/clientCapabilities`）。支援 `server/discover`、`tools/list`、`tools/call`、`subscriptions/listen`。走 HTTP 時每個請求還要帶 `MCP-Protocol-Version` 與 `Mcp-Method` 標頭，`tools/call` 另外要 `Mcp-Name`；標頭缺漏或與內容不符回 `400` 加 `-32020`，不支援的版本回 `-32022` 並列出支援的版本。
+- **舊世代 2024-11-05 到 2025-11-25**：用 `initialize` 協商，要哪個版本就回哪個，不認得的版本回 2025-11-25。`ping` 照常回應。
+
+工具清單變動時：stdio 的舊世代用戶端照舊收到 `notifications/tools/list_changed`；新世代用戶端要開 `subscriptions/listen` 並帶 `toolsListChanged: true` 才會收到。HTTP 端點沒有狀態，無從得知呼叫者的工具變了，所以收到訂閱時回確認但不承諾任何通知類型，接著直接結束訂閱；HTTP 用戶端在 `tools/list` 的 `ttlMs`（5 秒）到期後重新讀取即可。
+
+2026-10-16 用官方 TypeScript 用戶端 `@modelcontextprotocol/client` 2.3.1 實測：固定 2026-07-28、自動、舊世代三種模式，stdio 與 HTTP 都通過。
 
 ## 安全備註
 

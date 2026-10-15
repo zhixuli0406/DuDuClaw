@@ -90,7 +90,7 @@ token is stored on disk only as a SHA-256 hash (`~/.duduclaw/mcp_oauth_issued.js
 
 | Path | Purpose |
 |---|---|
-| `POST /mcp` | Standard MCP endpoint (initialize / tools/list / tools/call / ping) |
+| `POST /mcp` | Standard MCP endpoint: `server/discover` / `tools/list` / `tools/call` / `subscriptions/listen` (2026-07-28), `initialize` / `ping` (legacy). See [Protocol versions](#protocol-versions) |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 resource metadata (a 401's `WWW-Authenticate` header points here) |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
 | `POST /oauth/register` | RFC 7591 dynamic client registration (public client); an unregistered https `client_id` is read as a Client ID Metadata Document |
@@ -101,6 +101,17 @@ token is stored on disk only as a SHA-256 hash (`~/.duduclaw/mcp_oauth_issued.js
 Static Bearer keys (`ddc_…`) and OAuth tokens (`ddc_oauth_…`) share the same
 `Authorization: Bearer` surface: scripts and your own integrations can keep using a static key,
 while OAuth exists for clients that only speak OAuth, like claude.ai.
+
+## Protocol versions
+
+DuDuClaw serves both MCP eras, on `POST /mcp` and on the stdio `duduclaw mcp-server`:
+
+- **Modern, 2026-07-28.** No `initialize`. Each request names its revision and client capabilities in `params._meta` (`io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientCapabilities`). Supported: `server/discover`, `tools/list`, `tools/call` and `subscriptions/listen`. Over HTTP every request also needs `MCP-Protocol-Version` and `Mcp-Method` headers, and `tools/call` needs `Mcp-Name`. A missing or mismatched header returns `400` with `-32020`. An unsupported revision returns `-32022` with the supported list.
+- **Legacy, 2024-11-05 to 2025-11-25.** `initialize` negotiates: you get the revision you asked for, or 2025-11-25 if it is unknown. `ping` is still answered.
+
+Tool-list changes: over stdio, a legacy client gets `notifications/tools/list_changed` as before, and a modern client gets it on a `subscriptions/listen` stream with `toolsListChanged: true`. The HTTP endpoint is stateless and cannot tell that a caller's tools changed, so it acknowledges a subscription with no notification types and ends it straight away. HTTP clients re-read `tools/list` when its `ttlMs` (5 seconds) runs out.
+
+Verified on 2026-10-16 with the official TypeScript client `@modelcontextprotocol/client` 2.3.1, in pinned-2026-07-28, auto and legacy modes, over both stdio and HTTP.
 
 ## Security notes
 

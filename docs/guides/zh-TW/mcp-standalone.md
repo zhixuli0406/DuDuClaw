@@ -103,6 +103,7 @@ npx duduclaw mcp init --client cursor
 
 ## 疑難排解
 
+- 協定：server 支援 MCP 2026-07-28（不需 `initialize`），也支援以 `initialize` 協商的舊版到 2025-11-25。細節見 [remote-mcp.md 的協定版本](remote-mcp.md#協定版本)。
 - `MCP authentication failed: DUDUCLAW_MCP_API_KEY environment variable not set. Run: duduclaw mcp init --client claude-code`：用戶端啟動 server 時沒帶金鑰。重跑 `mcp init`，或補上 `env` 設定。
 - `API key not found in registry`：金鑰被撤銷，或 server 讀的資料目錄和 `mcp init` 寫入的不同（檢查 `DUDUCLAW_HOME`）。
 - `API key expired`：金鑰效期 90 天，重跑 `mcp init`。
