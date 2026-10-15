@@ -824,6 +824,9 @@ paths:
                   type: integer
                 monthly_budget_cents:
                   type: integer
+                accept_subscription_risk:
+                  type: boolean
+                  description: Required `true` when `type` is `oauth` (a consumer-subscription token). Without it the call is refused with error code `subscription_risk_not_accepted`, and each accepted call writes a `subscription_risk_accepted` row to the security audit log. The same parameter gates `auth.cli_login.start` and `accounts.setup_token_start`. See docs/features/13-multi-runtime.md, "Subscription-Login Risk Disclosure".
       responses:
         "200":
           description: Account added

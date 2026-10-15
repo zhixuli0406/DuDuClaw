@@ -2,7 +2,7 @@
 
 DuDuClaw lets a licensed reseller rebrand the dashboard — product name, logo,
 subtitle, and company info — while the upstream vendor credit
-(嘟嘟數位科技有限公司 / DuDu Digital Technology Co., Ltd.) stays visible on the
+(嘟嘟數位科技有限公司 / Dudu Technology Ltd.) stays visible on the
 About page. The credit is assembled from a compiled-in constant on every
 response: it is never read from config and cannot be written through any RPC.
 

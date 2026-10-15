@@ -66,7 +66,16 @@ Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
   Driving Kiro from DuDuClaw is exactly that. Calling `kiro-cli` directly from
   your own CI is allowed. This is why Kiro's install channel is manual: the
   decision is yours to make deliberately.
-- **Anthropic / Google** — since 2026-03, consumer subscription tokens used by
+- **Anthropic** — its [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party
+  developers may not offer Claude.ai login in their own applications or route
+  requests through Free, Pro or Max plan credentials on behalf of their users,
+  and may not collect, store or intermediate Claude.ai credentials or session
+  tokens. Signing in to the unmodified Claude Code binary with your own
+  subscription is allowed; Pro and Max limits assume ordinary, individual
+  usage. Anthropic may enforce this without prior notice, and users have
+  reported suspended accounts. An API key (Claude Console) is the documented
+  path for products.
+- **Google** — since 2026-03, consumer subscription tokens used by
   third-party products are blocked server-side, and accounts have been
   suspended. Use an API key.
 - **Qwen** — the free OAuth tier was discontinued 2026-04-15. API key
@@ -77,8 +86,9 @@ Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
 - **OpenAI** — policy on third-party products driving a ChatGPT subscription
   login is unclear. API key is the supported path.
 
-The dashboard shows the relevant note and requires an explicit "I understand
-the risk" acknowledgement before starting a subscription login.
+The dashboard shows the relevant note and requires an explicit acknowledgement
+before starting or saving a subscription login, and the gateway refuses the
+call without it (see [Subscription-Login Risk Disclosure](#subscription-login-risk-disclosure)).
 
 ### How Backends Are Driven
 
@@ -562,7 +572,15 @@ api_key_enc = "..."          # anthropic keeps the legacy anthropic_api_key_enc 
 
 ## Subscription-Login Risk Disclosure
 
-Every one-click "sign in with your subscription" flow — the CLI login modal, the guided QR-code setup wizard, and the OOBE runtime-setup card that opens one of the two — shows a risk notice before it starts: Anthropic and Google have blocked third-party products from using consumer-subscription tokens on the server side since March 2026 and have suspended accounts over it; OpenAI's policy on this is unspecified. An explicit "I understand the risk and accept it" checkbox must be ticked before the flow's own login step (CLI subprocess, browser callback, or device-code polling) begins. The API-key path is unaffected by this gate and remains the recommended default.
+Owner decision 2026-10-16: the subscription-login features stay as they are (setup-token capture, OAuth accounts, host-login adoption, rotation, one-click CLI login). What changed is the disclosure.
+
+**What the notice says.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens. Signing in to the unmodified Claude Code binary with your own subscription is allowed, and Pro/Max usage limits assume ordinary, individual usage. The Consumer Terms add that you may not make your account available to anyone else. Anthropic may enforce this without prior notice; account suspensions have been reported by press and users (reports, not an Anthropic statement). The notice names the DuDuClaw uses that conflict with the policy: one subscription serving other people (channel customers), rotating several subscriptions past the limits, and DuDuClaw storing the token. The Google/OpenAI sentence keeps its earlier wording. The notice never says the token is "blocked": `claude -p` with an OAuth token still works technically (v1.66.0).
+
+**Where it shows.** The full disclosure with a checkbox opens before any credential step in the CLI login modal, the guided QR-code setup wizard, and the OAuth Token path of Add account. A one-line note with a link to the policy sits on the Welcome page's Claude subscription card (and on its "already signed in" card, the host-login adoption case), the runtime setup card's sign-in row, the Accounts page's subscription hero card, the one-click CLI picker, the CLI credentials list, the agent editor's API mode row when it is set to the subscription CLI, and the account pool picker when a subscription account is in the pool.
+
+**Server-side gate.** `auth.cli_login.start` (every runtime that has a scriptable login), `accounts.setup_token_start` and `accounts.add` with `type = "oauth"` refuse unless the request carries `accept_subscription_risk: true`. The refusal is a structured error with code `subscription_risk_not_accepted`, which the dashboard shows in the user's language. Each accepted call writes one `subscription_risk_accepted` row to `security_audit.jsonl` with the timestamp, method, provider, account id (when known) and the acting dashboard user. The row records the acknowledgment, not a successful login. Internal reuse of `accounts.add` by `auth.cli_login.finalize` and `accounts.setup_token_submit` is not asked again; those finish a session that an acknowledged `start` opened. API-key accounts are not gated.
+
+**Terminal and logs.** `duduclaw onboard` prints the risk line next to "偵測到 Claude … 登入". When the account rotator adopts the host's own Claude login (`[account_loading] inherit_host_credentials`, still on by default), the gateway logs one WARN per process with the same line. `duduclaw doctor` and the dashboard doctor add a "訂閱帳號政策風險" row whenever an OAuth account is configured in `config.toml`.
 
 ---
 

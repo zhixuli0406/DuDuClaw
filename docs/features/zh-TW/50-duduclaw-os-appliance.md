@@ -37,7 +37,11 @@ Telegram/LINE/Discord/Slack，卻不想撥一台筆電專門給它用，也不�
 5. **連接模型帳號與聊天通道。** 設定精靈會在機器上執行 `claude
    setup-token`，顯示一個連結（附 QR code），你在自己的瀏覽器裡核准後把
    短碼貼回來，機器會在存下任何東西之前先真的打一次 API，確保失效或過
-   期的 token 不會被誤判成可用。直接貼 API key 也行，完全不用走 OAuth。
+   期的 token 不會被誤判成可用。開始之前，精靈會先顯示訂閱帳號的風險說
+   明，要你勾選同意：Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)
+   不允許第三方產品收集或保存 Claude.ai 憑證，也不允許用 Free/Pro/Max 方
+   案的憑證替使用者轉送請求，而且可能不經通知就執行。直接貼 API key 也
+   行，完全不用走 OAuth，這也是 Anthropic 為產品記載的做法。
    聊天通道方面：Telegram、Discord、Slack 和網頁聊天都是直接對外連線，
    貼上 token 就好。LINE 跟其他 webhook 型的通道，在一台躲在家用路由器
    NAT 後面的機器上收不到任何東西，所以這些通道要透過官方中繼服務轉

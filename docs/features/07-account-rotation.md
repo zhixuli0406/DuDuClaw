@@ -27,6 +27,8 @@ The system supports two types of API credentials:
 
 **OAuth Sessions** — Linked to subscription plans (Pro, Team, Max). These typically include a monthly quota of free API calls as part of the subscription. They're the "cashback cards" — use them first.
 
+> **Policy risk.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not route requests through Free, Pro or Max plan credentials on behalf of their users, or collect, store or intermediate those credentials, and that Pro and Max usage limits assume ordinary, individual usage. Anthropic may enforce this without prior notice, and users have reported suspended accounts. Rotating several subscription accounts to get past usage limits, or letting a subscription serve other people (for example channel customers), conflicts with that policy. Rotation itself is unchanged; API-key accounts are the path Anthropic documents for products. `duduclaw doctor` prints a reminder whenever an OAuth account is configured.
+
 **API Keys** — Pay-per-token. No quota limit, but every call costs money. They're the "emergency cards" — reliable but expensive.
 
 ### The Four Strategies

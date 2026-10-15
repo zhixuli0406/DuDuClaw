@@ -54,12 +54,13 @@ AgentRuntime trait:
 **啟用 runtime 前該讀的廠商條款：**
 
 - **Kiro**：AWS FAQ 明文寫著：不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面。用 DuDuClaw 驅動 Kiro 正屬此類；自行在 CI 直接呼叫 `kiro-cli` 則被允許。所以 Kiro 的安裝管道是手動的：這個決定要由你自己明確做出。
-- **Anthropic／Google**：2026-03 起，第三方產品使用消費者訂閱 token 會在伺服器端被封鎖，已有帳號被停權。請走 API key。
+- **Anthropic**：[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明，第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code；Pro 和 Max 的用量上限以一般個人使用為前提。Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。Anthropic 為產品記載的做法是 Claude Console 的 API key。
+- **Google**：2026-03 起，第三方產品使用消費者訂閱 token 會在伺服器端被封鎖，已有帳號被停權。請走 API key。
 - **Qwen**：免費 OAuth 方案已於 2026-04-15 停用，只剩 API key（ModelStudio／DashScope）。
 - **OpenCode**：MIT 授權、本身無限制，但它在 1.3.0 移除 Anthropic 訂閱 plugin，理由同上。請用各供應商的 API key。
 - **OpenAI**：對「第三方產品驅動 ChatGPT 訂閱登入」的政策不明，API key 才是受支援的路徑。
 
-Dashboard 會顯示對應的條款提示，並要求勾選「我了解風險」才開始訂閱登入。
+Dashboard 會顯示對應的條款提示，要求勾選同意後才開始或儲存訂閱登入；gateway 也會拒絕沒有帶同意旗標的呼叫（見[訂閱登入風險告知](#訂閱登入風險告知)）。
 
 ### 後端怎麼被驅動
 
@@ -431,7 +432,15 @@ api_key_enc = "..."          # anthropic 維持舊有的 anthropic_api_key_enc �
 
 ## 訂閱登入風險告知
 
-每一個「用你的訂閱帳號一鍵登入」的流程（CLI 登入彈窗、引導式 QR code 設定精靈，以及只會開啟這兩者之一的 OOBE runtime 設定卡片）在開始前都會先顯示風險告知：Anthropic 與 Google 自 2026 年 3 月起已在伺服器端封鎖第三方產品使用消費者訂閱帳號登入，且已有帳號因此被停權；OpenAI 目前政策不明。使用者必須勾選「我了解風險並自行承擔」，流程本身的登入步驟（CLI 子行程、瀏覽器回呼，或裝置碼輪詢）才會開始。API 金鑰路徑不受此關卡影響，仍是預設建議。
+擁有者 2026-10-16 決定：訂閱登入相關功能維持原樣（setup-token 擷取、OAuth 帳號、自動沿用主機登入、帳號輪替、CLI 一鍵登入），改的是風險告知。
+
+**告知內容。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code，Pro 和 Max 的用量上限以一般個人使用為前提。消費者條款另外規定帳號不得提供給其他人使用。Anthropic 可以不事先通知就執行；帳號停權是媒體與使用者的回報，非 Anthropic 官方聲明。告知會直接點出 DuDuClaw 裡和規範衝突的用法：一份訂閱替其他人服務（頻道上的客戶）、輪替多個訂閱帳號避開上限、讓 DuDuClaw 保存 token。Google／OpenAI 那句沿用原本的寫法。告知不說 token「被封鎖」，因為 OAuth token 跑 `claude -p` 在技術上仍可用（v1.66.0）。
+
+**出現在哪裡。** CLI 登入彈窗、引導式 QR code 設定精靈、新增帳號的 OAuth Token 路徑，在任何憑證步驟之前都會先顯示完整告知與勾選框。歡迎頁的 Claude 訂閱卡片（以及「已登入」卡片，也就是自動沿用主機登入的情況）、runtime 設定卡片的登入列、帳號頁的訂閱主卡片、CLI 一鍵登入選單、CLI 憑證清單、員工編輯頁 API 模式選「訂閱帳號（CLI）」時，以及帳號池選了訂閱帳號時，都會顯示一行提醒和規範連結。
+
+**伺服器端關卡。** `auth.cli_login.start`（所有有腳本化登入的 runtime）、`accounts.setup_token_start`，以及 `type = "oauth"` 的 `accounts.add`，請求沒有帶 `accept_subscription_risk: true` 就拒絕，回傳錯誤碼 `subscription_risk_not_accepted` 的結構化錯誤，dashboard 會以使用者的語言顯示。每次同意都會在 `security_audit.jsonl` 寫入一筆 `subscription_risk_accepted`，記錄時間、方法、provider、帳號 id（知道的話）與操作的 dashboard 使用者。這筆紀錄代表「已同意」，不代表登入成功。`auth.cli_login.finalize` 與 `accounts.setup_token_submit` 內部重用 `accounts.add` 時不會再問一次，因為它們收尾的流程已由同意過的 `start` 開啟。API 金鑰帳號不受關卡影響。
+
+**終端機與日誌。** `duduclaw onboard` 在「偵測到 Claude … 登入」旁邊印出風險提醒。帳號輪替器自動沿用主機的 Claude 登入時（`[account_loading] inherit_host_credentials`，預設仍是開），gateway 每個行程記一次 WARN，內容相同。只要 `config.toml` 設定了 OAuth 帳號，`duduclaw doctor` 與 dashboard 健康檢查都會多一列「訂閱帳號政策風險」。
 
 ---
 

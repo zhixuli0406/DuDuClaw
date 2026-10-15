@@ -21,6 +21,10 @@
 - 三語 README 的 PyPI badge 換成 Glama 分數 badge（badge 維持 5 個），PyPI 連結移到「Python SDK」段落。
 - 公開文件跟上 DuDuClaw OS v0.4.0（2026-10-16 發布，內嵌平台 v1.73.4）：三語 README 的 OS 段落與功能表、`docs/features/05`、`50`、`52`，以及 `docs/guides/task-sandbox.md`、`mcp-tools.md`、`appliance-build.md`（皆含 zh-TW／ja-JP）原本寫「下一版 OS 映像、尚未發版」的閘道去 root、rootless Podman、SSH 預設關閉、基礎版防火牆、`/api/internal/sysd` 與回退下限，改寫成從 v0.4.0 起提供；v0.3.0 以前的映像仍以 root 執行閘道與 Docker、內嵌較舊的平台。新增寫明：升級到 v0.4.0 是單向的（sysd 的回退下限加上第一次開機被標記成功後刪掉舊開機項目，成功開機過的裝置回不去 v0.3.0 以前）。測試範圍照 OS 的發版說明寫：QEMU 機型桌面版測試映像在建置主機的無頭 QEMU（TCG）跑兩輪驗證，第二輪 36 項過 35 項（沒過的是 doctor 標題，已在下方修正）；整碟映像通過發版前開機煙霧測試（約 65 秒到登入畫面）。仍未驗證：從 v0.3.0 經 A/B 更新升級、需要 LLM 憑證的任務沙箱／電腦操作／Discovery 完整流程、Windows VM、真機、genericx86-64 開機。SSH 目前還沒有能登入的帳號；Secure Boot、dm-verity、TPM2 在發布映像上仍未啟用。
 - 舊世代 `initialize` 改成真的協商：stdio 原本不管用戶端要什麼一律回 `2024-11-05`，HTTP 最高只到 `2025-06-18`。現在兩者共用同一段邏輯，支援 2025-11-25、2025-06-18、2025-03-26、2024-11-05，要哪個回哪個，不認得的版本回 2025-11-25。
+- 訂閱登入的風險說明改寫成 Anthropic 原文的意思（[Claude Code 法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)，2026-10-16 查閱）：第三方開發者不得在自己的產品提供 Claude.ai 登入、不得用 Free／Pro／Max 憑證替使用者轉送請求、不得收集、儲存或中介 Claude.ai 憑證；允許的是本人用自己的訂閱登入未經修改的 Claude Code，Pro／Max 上限以一般個人使用為前提；消費者條款規定帳號不得給他人使用；Anthropic 可不經通知執行，停權是媒體與使用者的回報。說明直接點出 DuDuClaw 裡和規範衝突的用法（一份訂閱替頻道客戶服務、輪替多個訂閱帳號避開上限、讓 DuDuClaw 保存 token），並附上原文連結。舊說法「Anthropic 已在伺服器端封鎖」移除，因為 OAuth token 跑 `claude -p` 技術上仍可用（v1.66.0）。Google／OpenAI 的說法維持原樣。三語（zh-TW／en／ja-JP），`runtime_catalog.rs` 的 Claude `tos_note` 一併更正。
+- 訂閱登入的每個入口都會先看到風險說明：新增帳號的「OAuth Token」路徑原本沒有任何告知，現在要勾選完整說明才能送出；歡迎頁「我有 Claude 訂閱」卡片加一行風險提醒（仍標「推薦」），已登入（沿用主機登入）的卡片也有提醒與連結；runtime 設定卡片的 Claude 登入列、帳號頁的訂閱主卡片、CLI 一鍵登入選單、CLI 憑證清單、員工編輯頁 API 模式為「訂閱帳號（CLI）」時、帳號池選到訂閱帳號時，都會顯示一行提醒與規範連結。
+- 終端機與日誌：`duduclaw onboard` 在「偵測到 Claude … 登入」下方加一行風險提醒與連結；帳號輪替器自動沿用主機 Claude 登入時（`inherit_host_credentials`，預設仍為開），每個行程記一次 WARN；`config.toml` 有 OAuth 帳號時，`duduclaw doctor` 與 dashboard 健康檢查多一列「訂閱帳號政策風險」（多個訂閱帳號時另外提到輪替）。功能與預設值都沒變：沒有移除或停用任何訂閱登入、輪替或主機登入沿用。
+- 文件同步：三語 README、`docs/guides/docker.md`（含 zh-TW／ja-JP）的 setup token 不再標「推薦」並改寫風險說明、`docs/features/07`（輪替的「回饋卡」段落加政策風險）、`50`（OS 設定精靈）、`13`（廠商條款與風險告知章節）三語、`docker-compose.yml` 的 `CLAUDE_CODE_OAUTH_TOKEN` 註解。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
@@ -29,6 +33,8 @@
 
 ### Security
 - `wiki_share` 沒有檢查頁面路徑：`../`、絕對路徑或指向 wiki 外的符號連結都能讓它讀取員工自己 wiki 以外、行程讀得到的任何檔案，並把前 500 個字元（或呼叫者給的摘要）公開到所有員工都讀得到的共用 wiki，唯一的擋點是機密字樣掃描。現在跟 `wiki_read` 用同一道檢查，讀取時另外拒絕解析到 wiki 目錄外的連結。
+- 訂閱帳號憑證改由 gateway 把關：`auth.cli_login.start`（所有有腳本化登入的 runtime：Claude、Codex、Gemini、Grok）、`accounts.setup_token_start`，以及 `type = "oauth"` 的 `accounts.add`，請求沒有帶 `accept_subscription_risk: true` 就拒絕，錯誤碼 `subscription_risk_not_accepted`（結構化 `{code, message, param}`，dashboard 依語系顯示）。之前只有 dashboard 的勾選框在擋，自己寫的 WebSocket 用戶端可以跳過。每次同意在 `security_audit.jsonl` 寫一筆 `subscription_risk_accepted`（時間、方法、provider、帳號 id、操作的使用者與 email），這筆代表已同意，不代表登入成功。`auth.cli_login.finalize` 與 `accounts.setup_token_submit` 內部重用 `accounts.add` 時不再問一次；API 金鑰帳號不受影響。dashboard 只在使用者勾選後才送出這個參數。關卡在 dispatch 層，程式在 `crates/duduclaw-gateway/src/subscription_risk_gate.rs`。
+  - 自己寫的用戶端呼叫上述三個 RPC 時要加上 `accept_subscription_risk: true`，否則會被拒絕。
 
 ## [1.73.4] - 2026-10-15 — DuDuClaw OS 閘道去 root 的平台端：sysd 加固、驗證過的更新、Podman 相容
 
