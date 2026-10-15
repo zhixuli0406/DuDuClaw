@@ -77,16 +77,17 @@ pub fn verdict(
 }
 
 /// Append the resource-limit self-check line (`container::resource_limits`)
-/// when it failed. A warning only when someone uses the sandbox; otherwise
-/// informational, like the other prerequisites.
+/// when it failed, and always warn: an engine that ignores resource limits
+/// is a broken host or image whether or not anyone uses the sandbox yet,
+/// and a PASS headline above "容器功能停用" read as healthy (first rootless
+/// image verification, 2026-10-15).
 pub fn with_limits_line(
     (level, text): (Level, String),
     limits: Option<duduclaw_core::container_engine::LimitVerdict>,
-    anyone_sandboxed: bool,
 ) -> (Level, String) {
     let Some(verdict) = limits else { return (level, text) };
     let text = format!("{text}\n         {}", verdict.reason_zh());
-    (if anyone_sandboxed { Level::Warn } else { level }, text)
+    (Level::Warn, text)
 }
 
 /// Agents under `<home>/agents` with `[container] sandbox_enabled = true`.
@@ -118,6 +119,5 @@ pub async fn check(home: &Path) -> (Level, String) {
         _ => None,
     };
     let agents = sandboxed_agents(home).await;
-    let anyone = !agents.is_empty();
-    with_limits_line(verdict(&agents, settings.as_ref().map_err(String::as_str), docker, image), limits, anyone)
+    with_limits_line(verdict(&agents, settings.as_ref().map_err(String::as_str), docker, image), limits)
 }
