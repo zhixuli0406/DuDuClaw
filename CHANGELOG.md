@@ -10,7 +10,9 @@
   - 版本不支援回 `-32022` 並列出支援的版本；缺 `clientCapabilities` 回 `-32602`；新世代移除的 `ping` 回 `-32601`。
   - HTTP 的新世代請求要帶 `MCP-Protocol-Version`、`Mcp-Method`，`tools/call` 另要 `Mcp-Name`（接受 `=?base64?…?=` 寫法）；缺漏或與內容不符回 `400` 加 `-32020`，未知方法回 `404`。
   - 工具清單變動：stdio 的新世代用戶端只在自己開的 `subscriptions/listen` 上收到帶訂閱 id 的通知，不再收到不請自來的通知；舊世代用戶端照舊。HTTP 端點沒有狀態、無從得知清單變了，收到訂閱時回確認但不承諾任何通知類型，並立即結束訂閱。
-  - 新世代回應裡 DuDuClaw 自訂、落在規格保留範圍的錯誤碼（限流的 `-32029`）改成 `-32000`，原碼放在 `error.data.duduclawCode`；舊世代回應不變。
+  - 新世代回應裡，DuDuClaw 自訂且落在規格保留範圍的錯誤碼（限流的 `-32029`），以及跟 2026-07-28 草案舊碼撞號的錯誤碼（認證失敗的 `-32003`）改成 `-32000`，原碼放在 `error.data.duduclawCode`；舊世代回應不變。
+  - 新世代請求的 `_meta` 會帶規格自己的 `io.modelcontextprotocol/*` 鍵，工作流程擴充（`duduclaw_workflow`）不再把它們當成未知的中繼資料拒絕。
+  - stdio 的 `subscriptions/listen` 在當下認證失敗時回錯誤，不再先確認訂閱、之後卻永遠收不到通知。
   - 2026-10-16 用官方 TypeScript 用戶端 `@modelcontextprotocol/client` 2.3.1 在 stdio 與 HTTP 實測固定 2026-07-28、自動協商、舊世代三種模式，工具清單、工具呼叫與清單變動通知都正常。
 
 ### Changed

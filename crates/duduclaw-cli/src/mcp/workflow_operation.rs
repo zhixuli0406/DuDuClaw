@@ -310,6 +310,9 @@ impl HumanBoundProof {
     }
 }
 
+/// `_meta` key namespace the MCP specification reserves for itself.
+const MCP_META_PREFIX: &str = "io.modelcontextprotocol/";
+
 pub(crate) struct WorkflowCall {
     session: Arc<WorkflowSession>,
     metadata: WorkflowMetadata,
@@ -337,7 +340,13 @@ impl WorkflowCall {
         let Some(raw) = obj.get(META_KEY) else {
             return Ok(None);
         };
-        if obj.len() != 1 {
+        // A modern (MCP 2026-07-28) request also carries the protocol's own
+        // `io.modelcontextprotocol/*` keys in `_meta` on every call; only
+        // keys outside that namespace compete with the workflow metadata.
+        if obj
+            .keys()
+            .any(|k| k != META_KEY && !k.starts_with(MCP_META_PREFIX))
+        {
             return Err("unknown workflow metadata".into());
         }
         canonical_bytes(raw)?;

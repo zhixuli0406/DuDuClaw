@@ -249,3 +249,29 @@ fn binary_hash_is_cached_per_process_and_equals_a_fresh_digest() {
     assert_eq!(current_binary_hash().unwrap(), first);
     assert!(started.elapsed() < std::time::Duration::from_millis(50), "second call re-hashed");
 }
+
+/// A modern MCP request carries `io.modelcontextprotocol/*` keys in `_meta`
+/// next to the workflow metadata; they must not be read as unknown workflow
+/// metadata, while any other extra key still is.
+#[tokio::test(flavor = "current_thread")]
+async fn workflow_metadata_tolerates_mcp_protocol_meta_keys_only() {
+    let principal = crate::mcp_auth::Principal {
+        client_id: duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID.into(),
+        scopes: Default::default(),
+        is_external: false,
+        created_at: Utc::now(),
+    };
+    let call = |meta: Value| json!({"name": "tasks_update", "arguments": args(), "_meta": meta});
+    let modern = call(json!({
+        META_KEY: {},
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    }));
+    let err = WorkflowCall::parse(None, &principal, &modern).await.err().unwrap();
+    // Past the key check: it now fails on the (deliberately empty) metadata.
+    assert_ne!(err, "unknown workflow metadata", "{err}");
+
+    let foreign = call(json!({META_KEY: {}, "io.example/other": 1}));
+    let err = WorkflowCall::parse(None, &principal, &foreign).await.err().unwrap();
+    assert_eq!(err, "unknown workflow metadata");
+}

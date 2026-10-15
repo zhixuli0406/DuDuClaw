@@ -647,3 +647,52 @@ fn stdio_subscriptions_complete_when_empty_and_are_capped() {
     assert_eq!(refused["id"], 16, "{refused}");
     assert_eq!(refused["error"]["code"], -32000);
 }
+
+/// A subscription the server cannot authenticate is refused, not acknowledged.
+#[test]
+fn stdio_listen_refuses_when_authentication_fails() {
+    let tmp = TempDir::new().unwrap();
+    let (home, data) = (tmp.path().join("home"), tmp.path().join("data"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    write_key(&data, "\"memory:read\"");
+    let mut child = base_command(&home, &data)
+        .env("DUDUCLAW_MCP_API_KEY", KEY)
+        .arg("mcp-server")
+        .current_dir(&data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mcp-server");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let mut s = Stdio_ { child, stdin, rx };
+    // Wait until the server has booted (boot authenticates too), then revoke.
+    s.send(
+        json!({"jsonrpc": "2.0", "id": "boot", "method": "server/discover",
+        "params": {"_meta": modern_meta()}}),
+    );
+    assert_eq!(s.next()["id"], "boot");
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(data.join("config.toml"), "").unwrap();
+    s.send(
+        json!({"jsonrpc": "2.0", "id": "sub", "method": "subscriptions/listen",
+        "params": {"_meta": modern_meta(), "notifications": {"toolsListChanged": true}}}),
+    );
+    let r = s.next();
+    assert_eq!(r["id"], "sub", "{r}");
+    assert_eq!(r["error"]["code"], -32000, "{r}");
+    assert_eq!(r["error"]["data"]["duduclawCode"], -32003);
+}

@@ -333,6 +333,30 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                     write_response(&mut stdout, &err).await?;
                     continue;
                 }
+                // A subscriber the watcher cannot authenticate would never be
+                // compared against, so refuse instead of acknowledging.
+                let baseline = if wants {
+                    match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
+                        Ok(p) => Some(
+                            visible_tool_names(&p, home_dir, &default_agent)
+                                .await
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>(),
+                        ),
+                        Err(e) => {
+                            let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
+                                &id,
+                                -32003,
+                                &format!("MCP authentication failed: {e}"),
+                            ));
+                            write_response(&mut stdout, &err).await?;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let ack = crate::mcp_protocol::subscription_ack(&id, wants);
                 write_response(&mut stdout, &ack).await?;
                 if !wants {
@@ -342,19 +366,10 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                         .await?;
                     continue;
                 }
+                if last_advertised.is_none() {
+                    last_advertised = baseline;
+                }
                 if !tool_subscriptions.contains(&id) {
-                    if last_advertised.is_none()
-                        && let Ok(p) =
-                            crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
-                    {
-                        last_advertised = Some(
-                            visible_tool_names(&p, home_dir, &default_agent)
-                                .await
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect(),
-                        );
-                    }
                     tool_subscriptions.push(id.clone());
                 }
                 continue;
