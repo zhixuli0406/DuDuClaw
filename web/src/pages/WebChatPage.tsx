@@ -31,6 +31,7 @@ import {
 } from '@/components/chat';
 import { CharacterAvatar } from '@/components/character';
 import { AgentGlyph } from '@/lib/agent-glyph';
+import { BrandMark } from '@/components/brand';
 import { DuDu } from '@/components/mascot';
 import { isImageMime, readAttachment } from '@/lib/attachments';
 
@@ -334,12 +335,16 @@ export function WebChatPage() {
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-3">
         {selectedAgentId ? (
           <CharacterAvatar agentId={selectedAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
-        ) : (
+        ) : agentIcon?.trim() ? (
           <AgentGlyph
             icon={agentIcon}
             className="text-xl leading-none"
             iconClassName="size-5 text-muted-foreground"
           />
+        ) : (
+          // No agent icon (the server resolved no agent): show the product
+          // mark instead of AgentGlyph's 🐾 per-agent placeholder.
+          <BrandMark size={28} />
         )}
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
