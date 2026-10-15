@@ -826,7 +826,7 @@ paths:
                   type: integer
                 accept_subscription_risk:
                   type: boolean
-                  description: Required `true` when `type` is `oauth` (a consumer-subscription token). Without it the call is refused with error code `subscription_risk_not_accepted`, and each accepted call writes a `subscription_risk_accepted` row to the security audit log. The same parameter gates `auth.cli_login.start` and `accounts.setup_token_start`. See docs/features/13-multi-runtime.md, "Subscription-Login Risk Disclosure".
+                  description: Required `true` when `type` is `oauth` (a consumer-subscription token). Without it the call is refused with error code `subscription_risk_not_accepted`, and each accepted call writes a `subscription_risk_accepted` row to the security audit log. The same parameter gates `auth.cli_login.start`, `accounts.setup_token_start` and `config.raw.set` edits that add an oauth account. Breaking for custom WebSocket clients since v1.74.0. See docs/features/13-multi-runtime.md, "Subscription-Login Risk Disclosure".
       responses:
         "200":
           description: Account added
@@ -1391,6 +1391,9 @@ paths:
                 file: { type: string }
                 content: { type: string, description: "«set» keeps the stored value" }
                 base_hash: { type: string }
+                accept_subscription_risk:
+                  type: boolean
+                  description: Since v1.74.0, required `true` when `file` is `config` and the new content adds an `[[accounts]]` entry with `type = "oauth"` that the stored file does not have (new id, or an existing id switched to oauth). Without it the call is refused with error code `subscription_risk_not_accepted` and nothing is written; each accepted new account writes a `subscription_risk_accepted` audit row.
       responses:
         "200":
           description: Written

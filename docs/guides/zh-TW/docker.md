@@ -219,7 +219,7 @@ docker compose up -d
 
 這代表 **登入一次後即使容器重建也不需重登**。
 
-> **訂閱登入有帳號風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token；Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。讓一份訂閱回覆頻道上的客戶、輪替多個訂閱帳號來避開用量上限、把 token 存在 DuDuClaw，都和這份規範衝突。Google 自 2026-03 起會在伺服器端封鎖第三方產品使用的消費者訂閱 token，也已有帳號被停權；OpenAI 對第三方產品驅動 ChatGPT 訂閱登入的政策尚不明確。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，功能照常可用，但建議使用 API key；dashboard 的登入流程會先要求你勾選同意這段說明。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
+> **訂閱登入有帳號風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token；Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。讓一份訂閱回覆頻道上的客戶、輪替多個訂閱帳號來避開用量上限、把 token 存在 DuDuClaw，都和這份規範衝突。Google 的 [Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)與 [Antigravity 條款](https://antigravity.google/terms)寫明，用第三方軟體透過 Gemini CLI 或 Antigravity 的 OAuth 存取其服務屬於違規，可能導致帳號被停權或終止；OpenAI 對第三方產品驅動 ChatGPT 訂閱登入的政策尚不明確。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，功能照常可用，但建議使用 API key；dashboard 的登入流程會先要求你勾選同意這段說明。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
 
 ### 6.1 Claude Code CLI
 

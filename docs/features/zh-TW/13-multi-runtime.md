@@ -54,11 +54,12 @@ AgentRuntime trait:
 **啟用 runtime 前該讀的廠商條款：**
 
 - **Kiro**：AWS FAQ 明文寫著：不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面。用 DuDuClaw 驅動 Kiro 正屬此類；自行在 CI 直接呼叫 `kiro-cli` 則被允許。所以 Kiro 的安裝管道是手動的：這個決定要由你自己明確做出。
-- **Anthropic**：[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明，第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code；Pro 和 Max 的用量上限以一般個人使用為前提。Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。Anthropic 為產品記載的做法是 Claude Console 的 API key。
-- **Google**：2026-03 起，第三方產品使用消費者訂閱 token 會在伺服器端被封鎖，已有帳號被停權。請走 API key。
+- **Anthropic**：[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明，第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code；Pro 和 Max 的用量上限以一般使用為前提。Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。Anthropic 為產品記載的做法是 Claude Console 的 API key。
+- **Google**：[Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)寫明，用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。[Antigravity 條款](https://antigravity.google/terms)第 6 節對第三方軟體存取 Antigravity 也有同樣規定，可能停權或終止 Antigravity 和／或 Gemini CLI 帳號。DuDuClaw 執行的是原版 CLI，算不算在條款範圍內由 Google 判斷。請走 API key。
 - **Qwen**：免費 OAuth 方案已於 2026-04-15 停用，只剩 API key（ModelStudio／DashScope）。
 - **OpenCode**：MIT 授權、本身無限制，但它在 1.3.0 移除 Anthropic 訂閱 plugin，理由同上。請用各供應商的 API key。
-- **OpenAI**：對「第三方產品驅動 ChatGPT 訂閱登入」的政策不明，API key 才是受支援的路徑。
+- **OpenAI**：對「第三方產品驅動 ChatGPT 訂閱登入」的政策不明，[使用條款](https://openai.com/policies/terms-of-use/)仍然適用。API key 才是受支援的路徑。
+- **xAI**：沒有找到 xAI 對第三方產品操作 SuperGrok／X Premium+ 訂閱的公開立場，[服務條款](https://x.ai/legal/terms-of-service)仍然適用。
 
 Dashboard 會顯示對應的條款提示，要求勾選同意後才開始或儲存訂閱登入；gateway 也會拒絕沒有帶同意旗標的呼叫（見[訂閱登入風險告知](#訂閱登入風險告知)）。
 
@@ -434,13 +435,15 @@ api_key_enc = "..."          # anthropic 維持舊有的 anthropic_api_key_enc �
 
 擁有者 2026-10-16 決定：訂閱登入相關功能維持原樣（setup-token 擷取、OAuth 帳號、自動沿用主機登入、帳號輪替、CLI 一鍵登入），改的是風險告知。
 
-**告知內容。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code，Pro 和 Max 的用量上限以一般個人使用為前提。消費者條款另外規定帳號不得提供給其他人使用。Anthropic 可以不事先通知就執行；帳號停權是媒體與使用者的回報，非 Anthropic 官方聲明。告知會直接點出 DuDuClaw 裡和規範衝突的用法：一份訂閱替其他人服務（頻道上的客戶）、輪替多個訂閱帳號避開上限、讓 DuDuClaw 保存 token。Google／OpenAI 那句沿用原本的寫法。告知不說 token「被封鎖」，因為 OAuth token 跑 `claude -p` 在技術上仍可用（v1.66.0）。
+**告知內容。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code，Pro 和 Max 的用量上限以一般使用為前提。消費者條款另外規定帳號不得提供給其他人使用。Anthropic 可以不事先通知就執行；帳號停權是媒體與使用者的回報，非 Anthropic 官方聲明。告知會直接點出 DuDuClaw 裡和規範衝突的用法：一份訂閱替其他人服務（頻道上的客戶）、輪替多個訂閱帳號避開上限、讓 DuDuClaw 保存 token。告知不說 token「被封鎖」，因為 OAuth token 跑 `claude -p` 在技術上仍可用（v1.66.0）。
+
+**依廠商顯示。** 上面的完整告知用在 Claude 登入與 Claude 帳號。Codex、Gemini CLI、Antigravity、Grok 的登入（以及新增帳號選了非 Anthropic provider 的 OAuth 路徑）改顯示該廠商自己的說明與條款連結，勾選框相同：Google 的 Gemini CLI 與 Antigravity 條文如上；OpenAI 與 xAI 則寫明立場不明、條款仍適用。不認得的 provider 顯示不指名廠商、沒有連結的提醒。每一句都對應到廠商頁面；舊的「Google 自 2026-03 起在伺服器端封鎖」找不到原始出處，已移除。廠商對照表在 `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）與 `web/src/lib/subscription-risk.ts`（dashboard）。
 
 **出現在哪裡。** CLI 登入彈窗、引導式 QR code 設定精靈、新增帳號的 OAuth Token 路徑，在任何憑證步驟之前都會先顯示完整告知與勾選框。歡迎頁的 Claude 訂閱卡片（以及「已登入」卡片，也就是自動沿用主機登入的情況）、runtime 設定卡片的登入列、帳號頁的訂閱主卡片、CLI 一鍵登入選單、CLI 憑證清單、員工編輯頁 API 模式選「訂閱帳號（CLI）」時，以及帳號池選了訂閱帳號時，都會顯示一行提醒和規範連結。
 
-**伺服器端關卡。** `auth.cli_login.start`（所有有腳本化登入的 runtime）、`accounts.setup_token_start`，以及 `type = "oauth"` 的 `accounts.add`，請求沒有帶 `accept_subscription_risk: true` 就拒絕，回傳錯誤碼 `subscription_risk_not_accepted` 的結構化錯誤，dashboard 會以使用者的語言顯示。每次同意都會在 `security_audit.jsonl` 寫入一筆 `subscription_risk_accepted`，記錄時間、方法、provider、帳號 id（知道的話）與操作的 dashboard 使用者。這筆紀錄代表「已同意」，不代表登入成功。`auth.cli_login.finalize` 與 `accounts.setup_token_submit` 內部重用 `accounts.add` 時不會再問一次，因為它們收尾的流程已由同意過的 `start` 開啟。API 金鑰帳號不受關卡影響。
+**伺服器端關卡。** `auth.cli_login.start`（所有有腳本化登入的 runtime）、`accounts.setup_token_start`、`type = "oauth"` 的 `accounts.add`，以及送出的 `config.toml` 新增了儲存檔裡沒有的 `type = "oauth"` 帳號（新的 id，或既有 id 改成 `oauth`）的 `config.raw.set`，請求沒有帶 `accept_subscription_risk: true` 就拒絕。這對自己寫的 WebSocket 用戶端是破壞性變更，隨 v1.74.0 發布（見[已棄用名稱](../../guides/zh-TW/deprecations.md)）。拒絕時回傳錯誤碼 `subscription_risk_not_accepted` 的結構化錯誤，附上 `provider` 與對應的 `policy_url`，dashboard 會以使用者的語言顯示；被拒的進階編輯不會寫檔，編輯器會就地顯示該廠商的說明，勾選後再儲存一次。每次同意都會在 `security_audit.jsonl` 寫入一筆 `subscription_risk_accepted`，記錄時間、方法、provider、帳號 id（知道的話）、操作的 dashboard 使用者、廠商的 `policy_url` 與 `outcome = "acknowledged"`；`note` 寫明這筆代表「已同意」，不代表登入或儲存成功。一次進階編輯新增多個 oauth 帳號時，每個各寫一筆。`auth.cli_login.finalize` 與 `accounts.setup_token_submit` 內部重用 `accounts.add` 時不會再問一次，因為它們收尾的流程已由同意過的 `start` 開啟。API 金鑰帳號不受關卡影響。
 
-**終端機與日誌。** `duduclaw onboard` 在「偵測到 Claude … 登入」旁邊印出風險提醒。帳號輪替器自動沿用主機的 Claude 登入時（`[account_loading] inherit_host_credentials`，預設仍是開），gateway 每個行程記一次 WARN，內容相同。只要 `config.toml` 設定了 OAuth 帳號，`duduclaw doctor` 與 dashboard 健康檢查都會多一列「訂閱帳號政策風險」。
+**終端機與日誌。** `duduclaw onboard` 在「偵測到 Claude … 登入」旁邊印出風險提醒。帳號輪替器自動沿用主機的 Claude 登入時（`[account_loading] inherit_host_credentials`，預設仍是開），gateway 每個行程記一次 WARN，內容相同。只要 `config.toml` 設定了 Claude 的 OAuth 帳號（provider 為 `anthropic` 或未設定），`duduclaw doctor` 與 dashboard 健康檢查都會多一列「訂閱帳號政策風險」；Copilot 座位等其他廠商的 oauth 帳號不算在內，因為這一列引用的是 Anthropic 的規範。把 GitHub Copilot 座位存進設定的操作者指令 `duduclaw auth device --provider copilot`，會先印出附 GitHub 條款連結的說明，沒有 `--accept-subscription-risk` 就停止；加上旗標時寫一筆同樣的稽核紀錄（操作者記為 `operator-cli`）。
 
 ---
 

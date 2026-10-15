@@ -20,6 +20,23 @@
 
 ---
 
+## 非推奨期間なしの変更（v1.74.0）
+
+以下の変更は既存の呼び出し元を壊しますが、名前の変更ではなく抜け道を塞ぐものなので、2 バージョンの猶予期間はありません。
+
+### サブスクリプションログイン RPC の `accept_subscription_risk`
+
+独自の WebSocket／RPC クライアントは、次の呼び出しで `accept_subscription_risk: true`（JSON の真偽値）を送る必要があります。送らないと gateway はエラーコード `subscription_risk_not_accepted` で拒否します。
+
+- `auth.cli_login.start`
+- `accounts.setup_token_start`
+- `type = "oauth"` の `accounts.add`
+- 送信した `config.toml` が保存済みファイルにない `type = "oauth"` の `[[accounts]]` を追加する `config.raw.set`
+
+利用者がサブスクリプションログインのリスク説明を読んだ後にだけ送ってください。API キーのアカウントとそれ以外の raw 編集は変わりません。ダッシュボードはチェック後にすでにこのフラグを送ります。運用者向けコマンド `duduclaw auth device --provider copilot` には `--accept-subscription-risk` が必要になりました。これを呼ぶスクリプトにはフラグを追加してください。詳細は[サブスクリプションログインのリスク開示](../../features/ja-JP/13-multi-runtime.md#サブスクリプションログインのリスク開示)を参照してください。
+
+---
+
 ## v1.69.0 で削除したもの
 
 ### MCP ツール

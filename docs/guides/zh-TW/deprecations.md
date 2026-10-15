@@ -18,6 +18,23 @@ v1.66.0 標為棄用的所有項目，例外見 [仍在棄用期](#仍在棄用�
 
 ---
 
+## 沒有棄用期的變更（v1.74.0）
+
+這些變更會讓既有的呼叫方失效，而且沒有兩個版本的緩衝期，因為它們是補上漏洞，不是改名。
+
+### 訂閱登入 RPC 需要 `accept_subscription_risk`
+
+自己寫的 WebSocket／RPC 用戶端呼叫下列方法時要帶 `accept_subscription_risk: true`（JSON 布林值），否則 gateway 會拒絕，錯誤碼 `subscription_risk_not_accepted`：
+
+- `auth.cli_login.start`
+- `accounts.setup_token_start`
+- `type = "oauth"` 的 `accounts.add`
+- `config.raw.set`，當送出的 `config.toml` 新增了儲存檔裡沒有的 `type = "oauth"` `[[accounts]]` 帳號
+
+請在使用者讀過訂閱登入風險說明之後才送出這個參數。API 金鑰帳號與其他進階編輯不受影響，dashboard 勾選後本來就會送。操作者指令 `duduclaw auth device --provider copilot` 現在要加 `--accept-subscription-risk`，呼叫它的腳本要補上這個旗標。詳見[訂閱登入風險告知](../../features/zh-TW/13-multi-runtime.md#訂閱登入風險告知)。
+
+---
+
 ## v1.69.0 已移除
 
 ### MCP 工具

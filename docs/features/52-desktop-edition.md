@@ -44,10 +44,11 @@ them.
   have one, an interactive sign-in: the machine drives that CLI's own login
   and shows you the device code and verification URL, with a button to open
   it in the appliance's browser. Signing in with a consumer subscription
-  shows the risk up front and will not start until you accept it: since
-  March 2026 Anthropic and Google block subscription tokens from
-  third-party products server-side and accounts have been suspended over it,
-  so an API key is the recommended path. The whole step is skippable in one
+  shows the risk up front and will not start until you accept it:
+  Anthropic's policy and Google's Gemini CLI and Antigravity terms restrict
+  third-party products using subscription credentials, and say accounts may
+  be restricted, suspended or terminated, so an API key is the recommended
+  path (vendor sources: [multi-runtime](13-multi-runtime.md#subscription-login-risk-disclosure)). The whole step is skippable in one
   click; the summary at the end says how many providers ended up authorized.
 - **Input and audio** — fcitx5 Chinese IME, PipeWire / WirePlumber audio,
   XWayland for X11 applications.

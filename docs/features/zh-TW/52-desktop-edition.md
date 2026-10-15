@@ -38,8 +38,9 @@ Windows 與 Android 應用程式；同時 DuDuClaw gateway 與它的 AI 員工�
   密的 `[[accounts]]` 路徑），CLI 有登入流程的也可以直接登入帳號：機器會
   代跑那支 CLI 自己的登入，把裝置代碼和登入網址顯示在畫面上，並提供按鈕
   用機器上的瀏覽器開啟。用消費者訂閱登入前會先顯示風險，你勾選同意才會
-  開始——2026 年 3 月起 Anthropic 與 Google 在伺服器端擋掉第三方產品使用
-  訂閱憑證，已經有帳號被停權，所以建議走 API 金鑰。整步可以一鍵略過；完
+  開始：Anthropic 的規範與 Google 的 Gemini CLI、Antigravity 條款都限制第
+  三方產品使用訂閱憑證，並寫明帳號可能被限制、停權或終止，所以建議走 API
+  金鑰（各廠商出處見[多 runtime](13-multi-runtime.md#訂閱登入風險告知)）。整步可以一鍵略過；完
   成頁的摘要會寫最後授權了幾家。
 - **輸入與音訊**：fcitx5 中文輸入法、PipeWire / WirePlumber 音訊，
   XWayland 讓 X11 應用程式也能跑。

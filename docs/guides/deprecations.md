@@ -21,6 +21,32 @@ How each surface signals a deprecation while the window is open:
 
 ---
 
+## Changed without a deprecation window (v1.74.0)
+
+These changes break existing callers and get no two-version window,
+because they close a gap rather than rename something.
+
+### `accept_subscription_risk` on subscription-login RPCs
+
+Custom WebSocket / RPC clients must send `accept_subscription_risk: true`
+(a JSON boolean) on these calls, or the gateway refuses them with error code
+`subscription_risk_not_accepted`:
+
+- `auth.cli_login.start`
+- `accounts.setup_token_start`
+- `accounts.add` with `type = "oauth"`
+- `config.raw.set` when the submitted `config.toml` adds an `[[accounts]]`
+  entry with `type = "oauth"` that the stored file does not have
+
+Send it only after the person has read the subscription-login risk notice.
+API-key accounts and other raw edits are unchanged, and the dashboard already
+sends the flag after its checkbox. The operator command
+`duduclaw auth device --provider copilot` now needs
+`--accept-subscription-risk`; scripts that call it must add the flag. Details:
+[Subscription-Login Risk Disclosure](../features/13-multi-runtime.md#subscription-login-risk-disclosure).
+
+---
+
 ## Removed in v1.69.0
 
 ### MCP tools
