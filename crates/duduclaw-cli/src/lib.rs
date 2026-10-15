@@ -7386,6 +7386,13 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                 console::style("✓").green(),
                 style(sub_label).cyan().bold()
             );
+            // Owner decision 2026-10-16: keep host-login adoption, but say
+            // the policy risk where the user first meets it.
+            println!(
+                "  {} {}",
+                style("!").yellow(),
+                style(duduclaw_core::subscription_risk::subscription_risk_line_zh()).yellow()
+            );
             if !env_key.is_empty() {
                 println!(
                     "  {} 同時偵測到 API Key 環境變數（作為備援）",
@@ -9780,6 +9787,12 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
             CheckStatus::Warn
         };
         checks.push(("憑證來源體檢".into(), status, audit.summary()));
+    }
+
+    // Check 2e (2026-10-16): subscription (OAuth) accounts configured. Shared
+    // with the dashboard `system.doctor` card `subscription_login_risk`.
+    if let Some(message) = duduclaw_gateway::doctor_probes::subscription_risk_notice(&home) {
+        checks.push(("訂閱帳號政策風險".into(), CheckStatus::Warn, message));
     }
 
     // Check 3: Claude Code CLI

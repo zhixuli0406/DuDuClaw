@@ -47,6 +47,7 @@ pub mod sandbox_image;
 pub mod sensitivity;
 pub mod spawn_admission;
 pub mod spawn_env;
+pub mod subscription_risk;
 pub mod takeover_state;
 pub mod task_packet;
 pub mod team_gate;

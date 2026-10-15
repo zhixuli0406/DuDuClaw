@@ -429,9 +429,12 @@ pub const CATALOG: &[RuntimeSpec] = &[
             },
             credential_paths: &[".claude/.credentials.json"],
             tos_note: Some(LocaleText {
-                en: "Anthropic blocks consumer Claude Pro/Max subscription tokens used by third-party products server-side (since 2026-03); accounts have been suspended. The API key path is the supported one.",
-                zh_tw: "Anthropic 自 2026-03 起在伺服器端封鎖第三方產品使用消費者 Claude Pro/Max 訂閱 token，已有帳號被停權。建議走 API key。",
-                ja_jp: "Anthropic は 2026-03 以降、サードパーティ製品による消費者向け Claude Pro/Max のサブスクリプション トークン利用をサーバー側でブロックしています（アカウント停止の事例あり）。API キーの利用を推奨します。",
+                // Policy wording, not a technical claim: OAuth `claude -p`
+                // still works (CHANGELOG v1.66.0). Source and rationale:
+                // `crate::subscription_risk`.
+                en: "Anthropic's policy does not permit third-party products to collect, store or route requests through Claude Free/Pro/Max subscription credentials, and Anthropic may enforce this without notice; users have reported suspended accounts. The API key path is the supported one.",
+                zh_tw: "Anthropic 的規範不允許第三方產品收集、保存 Claude Free/Pro/Max 訂閱憑證，或用它轉送請求，可能不經通知就執行；有使用者回報帳號被停權。建議走 API key。",
+                ja_jp: "Anthropic の規約では、サードパーティ製品が Claude Free/Pro/Max のサブスクリプション認証情報を収集・保存したり、それでリクエストを中継したりすることは認められておらず、予告なく執行される場合があります（アカウント停止の報告あり）。API キーの利用を推奨します。",
             }),
             login_hint: Some(LocaleText {
                 en: "Approve at the opened URL, then paste the verification code below and press Enter.",
