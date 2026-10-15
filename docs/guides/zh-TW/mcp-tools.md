@@ -97,7 +97,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `read` | `true` | （不帶） |
 | `draft`、`send` | `false` | `false` |
 | `publish` | `false` | `true`（公開後可能蓋掉別人已在讀的內容） |
-| `modify` | `false` | `true`；`memory_store`、`user_profile_record`、`wiki_export`、`wiki_rebuild_fts` 只新增或重新產生，標 `false` |
+| `modify` | `false` | `true`；`memory_store`、`user_profile_record`、`wiki_rebuild_fts` 只新增或重新產生，標 `false`。`wiki_export` 仍標 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault |
 | `delete`、`purchase`、`admin` 與表上沒有的名稱 | `false` | `true` |
 
 記憶、wiki、使用者偏好與 `code_map` 工具另外標 `openWorldHint: false`；`memory_alias_add`、`wiki_export`、`wiki_rebuild_fts` 標 `idempotentHint: true`。這幾份清單在 `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`。

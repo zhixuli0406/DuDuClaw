@@ -21,6 +21,8 @@
 - 三語 README 的 PyPI badge 換成 Glama 分數 badge（badge 維持 5 個），PyPI 連結移到「Python SDK」段落。
 - 公開文件跟上 DuDuClaw OS v0.4.0（2026-10-16 發布，內嵌平台 v1.73.4）：三語 README 的 OS 段落與功能表、`docs/features/05`、`50`、`52`，以及 `docs/guides/task-sandbox.md`、`mcp-tools.md`、`appliance-build.md`（皆含 zh-TW／ja-JP）原本寫「下一版 OS 映像、尚未發版」的閘道去 root、rootless Podman、SSH 預設關閉、基礎版防火牆、`/api/internal/sysd` 與回退下限，改寫成從 v0.4.0 起提供；v0.3.0 以前的映像仍以 root 執行閘道與 Docker、內嵌較舊的平台。新增寫明：升級到 v0.4.0 是單向的（sysd 的回退下限加上第一次開機被標記成功後刪掉舊開機項目，成功開機過的裝置回不去 v0.3.0 以前）。測試範圍照 OS 的發版說明寫：QEMU 機型桌面版測試映像在建置主機的無頭 QEMU（TCG）跑兩輪驗證，第二輪 36 項過 35 項（沒過的是 doctor 標題，已在下方修正）；整碟映像通過發版前開機煙霧測試（約 65 秒到登入畫面）。仍未驗證：從 v0.3.0 經 A/B 更新升級、需要 LLM 憑證的任務沙箱／電腦操作／Discovery 完整流程、Windows VM、真機、genericx86-64 開機。SSH 目前還沒有能登入的帳號；Secure Boot、dm-verity、TPM2 在發布映像上仍未啟用。
 - 舊世代 `initialize` 改成真的協商：stdio 原本不管用戶端要什麼一律回 `2024-11-05`，HTTP 最高只到 `2025-06-18`。現在兩者共用同一段邏輯，支援 2025-11-25、2025-06-18、2025-03-26、2024-11-05，要哪個回哪個，不認得的版本回 2025-11-25。
+- `os_doctor_repair` 的效果分類從 `read` 改成 `admin`：它除了回報，還會在全新安裝時建立、在過期時輪替閘道內部用的 MCP 金鑰，並啟動一個 `mcp-server` 子行程。MCP 的 `readOnlyHint` 因此變成 `false`，探索模式與只放行 `read` 的 `action_rules` 不再允許它。`odoo_connect` 檢查後維持 `read`：它只重讀已設定的 Odoo 連線並重新登入自己的連線槽，不寫檔也不改 Odoo 資料，而且所有 Odoo 讀取工具都要先呼叫它。
+- `wiki_export` 的 `destructiveHint` 改為 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault。`idempotentHint` 維持 `true`。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
