@@ -1,4 +1,8 @@
-# DuDuClaw 🐾
+# DuDuClaw
+
+<p align="center">
+  <img src="docs/assets/brand/duduclaw-readme-banner.png" width="100%" alt="DuDuClaw by Dudu Technology Ltd. Bring AI coding tools into your team's chat. Review results. Track costs. Keep context.">
+</p>
 
 <div align="center">
 
@@ -230,7 +234,7 @@ What you install is fully transparent:
 - **What's in the npm package**: a small JS wrapper plus platform binaries (`@duduclaw/<platform>` optionalDependencies). `postinstall` only checks that the platform package is present ([`install.js`](npm/duduclaw/scripts/install.js)); nothing is downloaded from arbitrary URLs or executed
 - **No telemetry**: no usage data or conversation content is sent to us. The gateway checks GitHub Releases for updates every 6 hours; with a paid license installed it also refreshes the license with the license server (every 3–7 days depending on tier) and fetches the revocation list daily. Without a license file there is no licensing traffic. Secrets stay on your machine, encrypted with AES-256-GCM
 - **No privilege escalation**: runs entirely in user space
-- **Maintainer**: DuDu Digital Technology Co., Ltd. (registered in Taiwan, tax ID 94139082)
+- **Maintainer**: Dudu Technology Ltd. (registered in Taiwan, tax ID 94139082)
 - **High-risk actions in chat**: an employee asks for approval of a high-risk computer-use step in its channel, and you answer with the request's full ID. An operation whose result is unknown is never re-sent automatically; an Admin settles it in the dashboard. See the [operator guide](docs/guides/durable-channel-decisions.md)
 
 Every release asset ships with three kinds of verification: a SHA-256 checksum, a [cosign](https://github.com/sigstore/cosign) keyless signature, and a minisign Ed25519 signature (the built-in auto-updater enforces this one and refuses unsigned or tampered releases):
@@ -285,5 +289,5 @@ Open core: the core is [Apache License 2.0](LICENSE), free to use, modify, and d
 Commercial licenses, enterprise rollout, training and support are provided by our authorised distributor, [Future Corp (未來企業股份有限公司)](https://www.futurecorp.tw/). We do not sell directly.
 
 <p align="center">
-  🐾 Built with louis.li
+  Built with louis.li
 </p>
