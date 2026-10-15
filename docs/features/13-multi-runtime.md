@@ -80,7 +80,9 @@ Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
   may be grounds for suspension or termination of the account. The
   [Antigravity terms](https://antigravity.google/terms) (section 6) say the
   same of third-party software accessing Antigravity, and may suspend or
-  terminate the Antigravity and/or Gemini CLI accounts. DuDuClaw runs the
+  terminate the Antigravity and/or Gemini CLI accounts; the same section also
+  lists using the service in connection with products not provided by Google
+  as abuse. DuDuClaw runs the
   unmodified CLIs; whether that falls under these clauses is Google's call.
   Use an API key.
 - **Qwen** — the free OAuth tier was discontinued 2026-04-15. API key

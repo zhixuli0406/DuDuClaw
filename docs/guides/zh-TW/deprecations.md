@@ -31,7 +31,11 @@ v1.66.0 標為棄用的所有項目，例外見 [仍在棄用期](#仍在棄用�
 - `type = "oauth"` 的 `accounts.add`
 - `config.raw.set`，當送出的 `config.toml` 新增了儲存檔裡沒有的 `type = "oauth"` `[[accounts]]` 帳號
 
-請在使用者讀過訂閱登入風險說明之後才送出這個參數。API 金鑰帳號與其他進階編輯不受影響，dashboard 勾選後本來就會送。操作者指令 `duduclaw auth device --provider copilot` 現在要加 `--accept-subscription-risk`，呼叫它的腳本要補上這個旗標。詳見[訂閱登入風險告知](../../features/zh-TW/13-multi-runtime.md#訂閱登入風險告知)。
+請在使用者讀過訂閱登入風險說明之後才送出這個參數。API 金鑰帳號與其他進階編輯不受影響，dashboard 勾選後本來就會送。操作者指令 `duduclaw auth device --provider copilot` 現在要加 `--accept-subscription-risk`，呼叫它的腳本要補上這個旗標。
+
+DuDuClaw OS 的首次設定（OOBE）也會呼叫 `auth.cli_login.start`。v0.4.0 以前的 OS 映像內嵌平台 v1.73.4，不受影響；OS shell 送出旗標的修改在 [DuDuClaw-OS #21](https://github.com/zhixuli0406/DuDuClaw-OS/pull/21)，OS 映像內嵌平台 v1.74.0 以上之前必須先出貨。
+
+`config.raw.set` 只在出現新的帳號 id 時要求同意。在進階編輯器裡修改既有的 `oauth` 帳號（換 token，或改 `provider`）不會再問一次。詳見[訂閱登入風險告知](../../features/zh-TW/13-multi-runtime.md#訂閱登入風險告知)。
 
 ---
 

@@ -35,7 +35,9 @@ pub const GEMINI_CLI_TERMS_URL: &str = "https://geminicli.com/docs/resources/tos
 /// Google Antigravity terms (fetched 2026-10-16). Section 6: using third
 /// party software, tools or services to access the Service (e.g. through
 /// Antigravity OAuth) is a breach, and may be grounds for suspension or
-/// termination of the Antigravity and/or Gemini CLI accounts.
+/// termination of the Antigravity and/or Gemini CLI accounts. The same
+/// section lists using the Service in connection with products not provided
+/// by Google as abuse.
 pub const ANTIGRAVITY_TERMS_URL: &str = "https://antigravity.google/terms";
 
 /// OpenAI Terms of Use. The page answers 403 to scripted clients, so its text
@@ -114,7 +116,7 @@ pub fn vendor_policy(id: &str) -> VendorPolicy {
         "antigravity" | "agy" => VendorPolicy {
             vendor: "google-antigravity",
             notice_zh: "Google 的 Antigravity 條款寫明：用第三方軟體、工具或服務存取該服務（例如透過 Antigravity OAuth）\
-                 屬於違約，可能導致 Antigravity 和 Gemini CLI 帳號被停權或終止。DuDuClaw 執行的是原版 agy，\
+                 屬於違約，可能導致 Antigravity 和 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 agy，\
                  但是否落在這條範圍內由 Google 判斷。遠端或容器部署請改用 API 金鑰模式。",
             url: Some(ANTIGRAVITY_TERMS_URL),
         },

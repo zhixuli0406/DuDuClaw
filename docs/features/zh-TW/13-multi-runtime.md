@@ -55,7 +55,7 @@ AgentRuntime trait:
 
 - **Kiro**：AWS FAQ 明文寫著：不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面。用 DuDuClaw 驅動 Kiro 正屬此類；自行在 CI 直接呼叫 `kiro-cli` 則被允許。所以 Kiro 的安裝管道是手動的：這個決定要由你自己明確做出。
 - **Anthropic**：[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明，第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code；Pro 和 Max 的用量上限以一般使用為前提。Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。Anthropic 為產品記載的做法是 Claude Console 的 API key。
-- **Google**：[Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)寫明，用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。[Antigravity 條款](https://antigravity.google/terms)第 6 節對第三方軟體存取 Antigravity 也有同樣規定，可能停權或終止 Antigravity 和／或 Gemini CLI 帳號。DuDuClaw 執行的是原版 CLI，算不算在條款範圍內由 Google 判斷。請走 API key。
+- **Google**：[Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)寫明，用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。[Antigravity 條款](https://antigravity.google/terms)第 6 節對第三方軟體存取 Antigravity 也有同樣規定，可能停權或終止 Antigravity 和／或 Gemini CLI 帳號；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 CLI，算不算在條款範圍內由 Google 判斷。請走 API key。
 - **Qwen**：免費 OAuth 方案已於 2026-04-15 停用，只剩 API key（ModelStudio／DashScope）。
 - **OpenCode**：MIT 授權、本身無限制，但它在 1.3.0 移除 Anthropic 訂閱 plugin，理由同上。請用各供應商的 API key。
 - **OpenAI**：對「第三方產品驅動 ChatGPT 訂閱登入」的政策不明，[使用條款](https://openai.com/policies/terms-of-use/)仍然適用。API key 才是受支援的路徑。

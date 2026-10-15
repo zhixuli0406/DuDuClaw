@@ -303,9 +303,9 @@ pub struct AuthSpec {
     /// first. Presence + mtime only are ever read; content never is.
     pub credential_paths: &'static [&'static str],
     /// Vendor terms-of-service caveat the dashboard must show BEFORE a
-    /// subscription login (decision §1-1: consumer-subscription tokens used
-    /// by third-party products are server-side blocked by some vendors and
-    /// have gotten accounts suspended). `None` ⇒ nothing special to say.
+    /// subscription login (decision §1-1, corrected 2026-10-16: cite only
+    /// what the vendor's own terms say, e.g. third-party access may get the
+    /// account suspended or terminated). `None` ⇒ nothing special to say.
     pub tos_note: Option<LocaleText>,
     /// Short zh-TW/en/ja instruction shown next to the login button.
     pub login_hint: Option<LocaleText>,
@@ -601,9 +601,9 @@ pub const CATALOG: &[RuntimeSpec] = &[
             tos_note: Some(LocaleText {
                 // Cited terms only (antigravity.google/terms §6, fetched
                 // 2026-10-16); see `crate::subscription_risk`.
-                en: "Google's Antigravity terms (antigravity.google/terms, section 6) say using third-party software, tools or services to access the service is a breach that may lead to suspension or termination of the Antigravity and/or Gemini CLI accounts. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
-                zh_tw: "Google 的 Antigravity 條款（antigravity.google/terms 第 6 節）寫明：用第三方軟體、工具或服務存取該服務屬於違約，可能導致 Antigravity 和／或 Gemini CLI 帳號被停權或終止。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
-                ja_jp: "Google の Antigravity 規約（antigravity.google/terms 第 6 条）では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすることは契約違反とされ、Antigravity や Gemini CLI のアカウントの停止または終了の理由になり得ます。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
+                en: "Google's Antigravity terms (antigravity.google/terms, section 6) say using third-party software, tools or services to access the service is a breach that may lead to suspension or termination of the Antigravity and/or Gemini CLI accounts; the same section also lists using the service in connection with products not provided by Google as abuse. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
+                zh_tw: "Google 的 Antigravity 條款（antigravity.google/terms 第 6 節）寫明：用第三方軟體、工具或服務存取該服務屬於違約，可能導致 Antigravity 和／或 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
+                ja_jp: "Google の Antigravity 規約（antigravity.google/terms 第 6 条）では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすることは契約違反とされ、Antigravity や Gemini CLI のアカウントの停止または終了の理由になり得ます。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Sign in by running `agy` in a terminal on this machine and following the prompts. For remote or container deployments use API-key mode: config.toml [antigravity] auth = \"api_key\" plus a Gemini API key.",

@@ -7633,7 +7633,7 @@
   "subscriptionRisk.vendor.xai.link": "xAI 服務條款（英文原文）",
   "subscriptionRisk.vendor.xai.policy": "xAI 對第三方產品代為操作 SuperGrok 或 X Premium+ 訂閱的立場不明：我們沒有找到 xAI 允許或禁止這種用法的說明。訂閱帳號仍受 xAI 服務條款約束。",
   "subscriptionRisk.vendor.antigravity.link": "Google Antigravity 條款（英文原文）",
-  "subscriptionRisk.vendor.antigravity.policy": "Google 的 Antigravity 條款第 6 節寫明：用第三方軟體、工具或服務存取該服務（例如透過 Antigravity 的 OAuth）屬於違約，可能導致你的 Antigravity 和 Gemini CLI 帳號被停權或終止。DuDuClaw 執行的是原版 agy，但這種用法算不算在內，由 Google 判斷。",
+  "subscriptionRisk.vendor.antigravity.policy": "Google 的 Antigravity 條款第 6 節寫明：用第三方軟體、工具或服務存取該服務（例如透過 Antigravity 的 OAuth）屬於違約，可能導致你的 Antigravity 和 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 agy，但這種用法算不算在內，由 Google 判斷。",
   "subscriptionRisk.vendor.gemini.link": "Gemini CLI 服務條款與隱私聲明（英文原文）",
   "subscriptionRisk.vendor.gemini.policy": "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務直接存取 Gemini CLI 背後的服務（例如透過 Gemini CLI 的 OAuth）屬於違規，可能導致帳號被停權或終止。DuDuClaw 執行的是原版 Gemini CLI，但這種用法算不算在內，由 Google 判斷。",
   "subscriptionRisk.vendor.openai.link": "OpenAI 使用條款（英文原文）",

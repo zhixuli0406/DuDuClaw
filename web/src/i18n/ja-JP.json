@@ -7633,7 +7633,7 @@
   "subscriptionRisk.vendor.xai.link": "xAI 利用規約（英語）",
   "subscriptionRisk.vendor.xai.policy": "サードパーティ製品が SuperGrok や X Premium+ のサブスクリプションを操作することについて、xAI の立場は不明です。これを認める、または禁じる xAI の説明は見つかりませんでした。サブスクリプションには引き続き xAI の利用規約が適用されます。",
   "subscriptionRisk.vendor.antigravity.link": "Google Antigravity 規約（英語）",
-  "subscriptionRisk.vendor.antigravity.policy": "Google の Antigravity 規約第 6 条では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすること（例：Antigravity の OAuth 経由）は契約違反とされ、Antigravity と Gemini CLI のアカウントの停止または終了の理由になり得ます。DuDuClaw は改変されていない agy を実行しますが、この使い方が該当するかどうかは Google が判断します。",
+  "subscriptionRisk.vendor.antigravity.policy": "Google の Antigravity 規約第 6 条では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすること（例：Antigravity の OAuth 経由）は契約違反とされ、Antigravity と Gemini CLI のアカウントの停止または終了の理由になり得ます。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。DuDuClaw は改変されていない agy を実行しますが、この使い方が該当するかどうかは Google が判断します。",
   "subscriptionRisk.vendor.gemini.link": "Gemini CLI 利用規約とプライバシー通知（英語）",
   "subscriptionRisk.vendor.gemini.policy": "Google の Gemini CLI 規約では、サードパーティのソフトウェア・ツール・サービスで Gemini CLI の背後にあるサービスへ直接アクセスすること（例：Gemini CLI の OAuth 経由）は規約違反とされ、アカウントの停止または終了の理由になり得ます。DuDuClaw は改変されていない Gemini CLI を実行しますが、この使い方が該当するかどうかは Google が判断します。",
   "subscriptionRisk.vendor.openai.link": "OpenAI 利用規約（英語）",

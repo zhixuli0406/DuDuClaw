@@ -33,7 +33,11 @@
 - `type = "oauth"` の `accounts.add`
 - 送信した `config.toml` が保存済みファイルにない `type = "oauth"` の `[[accounts]]` を追加する `config.raw.set`
 
-利用者がサブスクリプションログインのリスク説明を読んだ後にだけ送ってください。API キーのアカウントとそれ以外の raw 編集は変わりません。ダッシュボードはチェック後にすでにこのフラグを送ります。運用者向けコマンド `duduclaw auth device --provider copilot` には `--accept-subscription-risk` が必要になりました。これを呼ぶスクリプトにはフラグを追加してください。詳細は[サブスクリプションログインのリスク開示](../../features/ja-JP/13-multi-runtime.md#サブスクリプションログインのリスク開示)を参照してください。
+利用者がサブスクリプションログインのリスク説明を読んだ後にだけ送ってください。API キーのアカウントとそれ以外の raw 編集は変わりません。ダッシュボードはチェック後にすでにこのフラグを送ります。運用者向けコマンド `duduclaw auth device --provider copilot` には `--accept-subscription-risk` が必要になりました。これを呼ぶスクリプトにはフラグを追加してください。
+
+DuDuClaw OS の初回セットアップ（OOBE）も `auth.cli_login.start` を呼びます。v0.4.0 までの OS イメージはプラットフォーム v1.73.4 を内蔵しているため影響はありません。OS shell がフラグを送る変更は [DuDuClaw-OS #21](https://github.com/zhixuli0406/DuDuClaw-OS/pull/21) にあり、OS イメージがプラットフォーム v1.74.0 以降を内蔵する前に出荷する必要があります。
+
+`config.raw.set` が同意を求めるのは新しいアカウント id が現れたときだけです。raw エディタで既存の `oauth` アカウントを編集しても（token の差し替えや `provider` の変更）、もう一度は聞かれません。詳細は[サブスクリプションログインのリスク開示](../../features/ja-JP/13-multi-runtime.md#サブスクリプションログインのリスク開示)を参照してください。
 
 ---
 
