@@ -6,6 +6,7 @@ import { isImeComposing } from '@/lib/keyboard';
 import { QrCode } from '@/components/shared/QrCode';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
 import { SubscriptionRiskDisclosure } from '@/components/SubscriptionRiskDisclosure';
+import { SUBSCRIPTION_RISK_NOT_ACCEPTED } from '@/lib/subscription-risk';
 
 interface Props {
   open: boolean;
@@ -80,6 +81,9 @@ export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
   const describeError = useCallback(
     (err: unknown): string => {
       const code = errorCodeOf(err);
+      if (code === SUBSCRIPTION_RISK_NOT_ACCEPTED) {
+        return intl.formatMessage({ id: 'subscriptionRisk.error.notAccepted' });
+      }
       if (code && (KNOWN_ERROR_CODES as readonly string[]).includes(code)) {
         return intl.formatMessage({ id: `subscriptionSetup.error.${code}` });
       }
@@ -97,8 +101,10 @@ export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
     setAccountId(null);
     sidRef.current = null;
 
+    // Only reachable from the disclosure step's enabled Continue button (or
+    // the retry button after it); the gateway refuses without this flag.
     api.accounts
-      .setupTokenStart()
+      .setupTokenStart(riskAck)
       .then((r) => {
         sidRef.current = r.session_id;
         setAuthUrl(r.auth_url);
@@ -123,7 +129,7 @@ export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
         setStep('error');
         setErrorMsg(describeError(e));
       });
-  }, [describeError, stopPolling]);
+  }, [describeError, stopPolling, riskAck]);
 
   // Every open starts at the disclosure step, never mid-flow — this component
   // stays mounted across opens (`AccountsPage` toggles `open`, it doesn't

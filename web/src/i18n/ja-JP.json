@@ -5248,8 +5248,7 @@
   "cliLogin.registered.none": "ログインしましたが、アカウントは自動追加されませんでした。",
   "cliLogin.registered.noneReason": "ログインしましたが、アカウントは自動追加されませんでした（{reason}）。",
   "cliLogin.registerFailed": "アカウントを追加できませんでした：{message}",
-  "subscriptionRisk.notice": "2026年3月以降、AnthropicとGoogleはサードパーティ製品による消費者向けサブスクリプションアカウントでのログインをサーバー側でブロックしており、これによりアカウントが停止された例もあります。OpenAIの方針は現時点で不明です。APIキーの利用を推奨します——それでもサブスクリプションアカウントでログインする場合、アカウント停止のリスクはご自身の責任となります。",
-  "subscriptionRisk.checkbox": "リスクを理解し、自己責任で同意します",
+  "subscriptionRisk.checkbox": "上記の規約とリスクを読み、自己責任で同意します",
   "subscriptionRisk.continue": "続ける",
   "accounts.subscriptionSetup": "サブスクリプションアカウントを接続",
   "accounts.subscriptionSetup.heroTitle": "Claude サブスクリプションを接続",
@@ -7616,5 +7615,17 @@
   "odoo.livechat.sessions.handedOff": "訪問者が有人対応を希望",
   "odoo.livechat.sessions.resume": "AI に戻す",
   "odoo.livechat.sessions.resumed": "AI に戻しました。訪問者の次のメッセージから AI が返信します",
-  "odoo.livechat.sessions.operatorJoined": "担当者が参加中"
+  "odoo.livechat.sessions.operatorJoined": "担当者が参加中",
+  "subscriptionRisk.title": "サブスクリプションでサインインする前にお読みください",
+  "subscriptionRisk.policy": "Anthropic の規約では、サードパーティの開発者が自社アプリで Claude.ai ログインを提供することや、Free・Pro・Max プランの認証情報を使ってユーザーの代わりにリクエストを中継することは認められていません。Claude.ai の認証情報やセッショントークンを収集・保存・仲介することもできません。認められているのは、あなた自身のサブスクリプションで、改変されていない Claude Code にサインインすることです。Pro と Max の利用上限は、通常の個人利用を前提としています。",
+  "subscriptionRisk.conflicts": "DuDuClaw では、次の使い方がこの規約と衝突します。1 つのサブスクリプションで他の人に対応すること（例：AI 社員が LINE や Telegram で顧客に返信する）、利用上限を避けるために複数のサブスクリプションアカウントをローテーションすること、DuDuClaw にトークンを保存させること（サブスクリプションの接続や OAuth トークンの貼り付けでは、トークンが暗号化されて設定ファイルに保存されます）。Anthropic の消費者向け利用規約でも、アカウントを他人に利用させることは禁止されています。",
+  "subscriptionRisk.enforcement": "Anthropic は、これらの制限を事前の通知なく執行できるとしています。報道やユーザーからはアカウント停止の報告もあります（外部からの報告であり、Anthropic の公式発表ではありません）。",
+  "subscriptionRisk.others": "2026年3月以降、Google はサードパーティ製品による消費者向けサブスクリプションでのログインをサーバー側でブロックしており、これによりアカウントが停止された例もあります。OpenAI の方針は現時点で不明です。",
+  "subscriptionRisk.recommendation": "製品向けに Anthropic が案内しているのは Claude Console の API キーです。こちらを優先してください。それでもサブスクリプションでサインインする場合、アカウントの制限や停止のリスクはご自身の責任となります。",
+  "subscriptionRisk.link": "Anthropic の法務・コンプライアンスページ（英語）",
+  "subscriptionRisk.short": "Anthropic の規約では、サードパーティ製品がサブスクリプションの認証情報を扱うことや、他の人のためにサブスクリプション経由でリクエストを中継することは認められておらず、予告なく執行される場合があります。",
+  "subscriptionRisk.learnMore": "規約を読む",
+  "subscriptionRisk.error.notAccepted": "続ける前に、サブスクリプションのリスク説明を読んでチェックを入れてください。",
+  "welcome.backend.claudeSub.risk": "注意：Anthropic の規約では、サードパーティ製品がサブスクリプションの認証情報を扱うことは認められておらず、予告なくアカウントが制限される場合があります。",
+  "settings.doctor.check.subscription_login_risk": "サブスクリプションログインの規約リスク"
 }

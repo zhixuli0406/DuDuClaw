@@ -18,6 +18,7 @@ import { useTourStore } from '@/stores/tour-store';
 import { Card, Button, Badge, Input, Textarea } from '@/components/mds';
 import { Field, CompletionBadge, RuntimeSetupCard } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
+import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
 import type { DuduFace } from '@/components/mascot/faces';
 import {
   ChevronLeft,
@@ -746,6 +747,15 @@ export function WelcomePage() {
                         <p className="mt-0.5 text-xs text-muted-foreground">
                           {intl.formatMessage({ id: `welcome.backend.${id}.desc` })}
                         </p>
+                        {/* Plain text on purpose: the card is a <button>, so no
+                            link here. Picking it shows the note with the link
+                            below, and the sign-in wizard shows the full
+                            disclosure before any credential step. */}
+                        {id === 'claudeSub' && (
+                          <p className="mt-1 text-xs text-warning" data-testid="claude-sub-risk">
+                            {intl.formatMessage({ id: 'welcome.backend.claudeSub.risk' })}
+                          </p>
+                        )}
                       </div>
                     </button>
                   );
@@ -767,13 +777,16 @@ export function WelcomePage() {
                   wizard (D16). Already signed in ⇒ just confirm the plan. */}
               {state.backend === 'claudeSub' && detect && (
                 detect.claude_cli && detect.claude_oauth ? (
-                  <Card className="p-4">
+                  <Card className="gap-2 p-4">
                     <p className="text-sm text-muted-foreground">
                       {intl.formatMessage(
                         { id: 'welcome.backend.claudeLoggedIn' },
                         { plan: detect.claude_subscription ?? 'OAuth' },
                       )}
                     </p>
+                    {/* Host-login adoption (inherit_host_credentials): no
+                        wizard runs, so this line is the disclosure here. */}
+                    <SubscriptionRiskNote />
                   </Card>
                 ) : (
                   <RuntimeSetupCard

@@ -15,6 +15,8 @@ import { isImeComposing } from '@/lib/keyboard';
 import { client } from '@/lib/ws-client';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
 import { SubscriptionRiskDisclosure } from '@/components/SubscriptionRiskDisclosure';
+import { isSubscriptionRiskRefusal } from '@/lib/subscription-risk';
+import { formatError } from '@/lib/toast';
 
 /* eslint-disable no-control-regex */
 /**
@@ -100,7 +102,9 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     setInput('');
     sidRef.current = null;
     api.auth
-      .cliLoginStart(runtime)
+      // Only reached after the disclosure checkbox (`started` requires
+      // `riskAck`); the gateway refuses the call without this flag.
+      .cliLoginStart(runtime, riskAck)
       .then((r) => {
         if (cancelled) return;
         sidRef.current = r.session_id;
@@ -111,12 +115,16 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
       .catch((e: unknown) => {
         if (cancelled) return;
         setStatus('error');
-        setErrMsg(e instanceof Error ? e.message : String(e));
+        setErrMsg(
+          isSubscriptionRiskRefusal(e)
+            ? intl.formatMessage({ id: 'subscriptionRisk.error.notAccepted' })
+            : formatError(e),
+        );
       });
     return () => {
       cancelled = true;
     };
-  }, [open, runtime, started]);
+  }, [open, runtime, started, riskAck]);
 
   // Stream output + terminal status from the gateway event bus.
   useEffect(() => {

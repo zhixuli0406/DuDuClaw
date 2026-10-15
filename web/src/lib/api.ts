@@ -5929,8 +5929,17 @@ export const api = {
   // Interactive CLI login ("Dashboard 一鍵登入") — drives a CLI's native login
   // in a PTY on the gateway and streams it back via `auth.cli_login.*` events.
   auth: {
-    cliLoginStart: (runtime: 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok') =>
-      client.call('auth.cli_login.start', { runtime }) as Promise<{
+    /** `acceptSubscriptionRisk` must be `true` (the user ticked
+     *  `SubscriptionRiskDisclosure`); the gateway refuses with
+     *  `subscription_risk_not_accepted` otherwise. */
+    cliLoginStart: (
+      runtime: 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok',
+      acceptSubscriptionRisk: boolean,
+    ) =>
+      client.call('auth.cli_login.start', {
+        runtime,
+        accept_subscription_risk: acceptSubscriptionRisk,
+      }) as Promise<{
         session_id: string;
         runtime: string;
         program: string;
@@ -5973,8 +5982,12 @@ export const api = {
     // WP-D: "訂閱帳號" device-code-style setup wizard — a guided, single-
     // flight, pre-validated specialization of the auth.cliLogin* flow above,
     // scoped to Claude subscription accounts. See setup_token_wizard.rs.
-    setupTokenStart: () =>
-      client.call('accounts.setup_token_start') as Promise<{
+    /** Gated like `auth.cliLoginStart`: pass `true` only after the user
+     *  ticked `SubscriptionRiskDisclosure`. */
+    setupTokenStart: (acceptSubscriptionRisk: boolean) =>
+      client.call('accounts.setup_token_start', {
+        accept_subscription_risk: acceptSubscriptionRisk,
+      }) as Promise<{
         session_id: string;
         /** `null` until the CLI has printed it — poll `setupTokenStatus`. */
         auth_url: string | null;
@@ -6023,6 +6036,9 @@ export const api = {
       key: string;
       monthly_budget_cents: number;
       priority: number;
+      /** Required `true` when `type` is `'oauth'` (subscription token): the
+       *  gateway refuses with `subscription_risk_not_accepted` otherwise. */
+      accept_subscription_risk?: boolean;
     }) =>
       client.call('accounts.add', params) as Promise<{
         success: boolean;

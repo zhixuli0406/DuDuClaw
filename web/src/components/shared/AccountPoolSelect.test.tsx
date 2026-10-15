@@ -56,4 +56,21 @@ describe('AccountPoolSelect', () => {
       screen.getByText(/One of these accounts no longer exists/),
     ).toBeInTheDocument();
   });
+
+  it('shows the subscription risk note only when a subscription account is in the pool', async () => {
+    mockAccounts();
+    const { unmount } = renderWithProviders(<AccountPoolSelect values={['spare']} onChange={vi.fn()} />);
+    expect(await screen.findByRole('button', { name: 'remove spare' })).toBeInTheDocument();
+    expect(screen.queryByTestId('subscription-risk-note')).not.toBeInTheDocument();
+    unmount();
+
+    mockAccounts();
+    renderWithProviders(<AccountPoolSelect values={['main']} onChange={vi.fn()} />);
+    const note = await screen.findByTestId('subscription-risk-note');
+    expect(note).toHaveTextContent(/doesn't permit third-party products/i);
+    expect(screen.getByRole('link', { name: /read the policy/i })).toHaveAttribute(
+      'href',
+      'https://code.claude.com/docs/en/legal-and-compliance',
+    );
+  });
 });

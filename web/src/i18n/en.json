@@ -5287,8 +5287,7 @@
   "cliLogin.registered.none": "Signed in, but no account was added automatically.",
   "cliLogin.registered.noneReason": "Signed in, but no account was added automatically ({reason}).",
   "cliLogin.registerFailed": "Couldn't add the account: {message}",
-  "subscriptionRisk.notice": "Since March 2026, Anthropic and Google have blocked third-party products from using consumer-subscription sign-in on the server side, and have suspended accounts over it; OpenAI's policy on this is unclear. An API key is the recommended default — if you still sign in with a subscription account, you accept the risk of suspension yourself.",
-  "subscriptionRisk.checkbox": "I understand the risk and accept it.",
+  "subscriptionRisk.checkbox": "I've read the policy and risks above and accept them.",
   "subscriptionRisk.continue": "Continue",
   "accounts.subscriptionSetup": "Connect subscription account",
   "accounts.subscriptionSetup.heroTitle": "Connect your Claude subscription",
@@ -7616,5 +7615,17 @@
   "odoo.livechat.sessions.handedOff": "Visitor asked for a person",
   "odoo.livechat.sessions.resume": "Hand back to AI",
   "odoo.livechat.sessions.resumed": "Handed back; the AI answers from the visitor’s next message",
-  "odoo.livechat.sessions.operatorJoined": "A person is in the chat"
+  "odoo.livechat.sessions.operatorJoined": "A person is in the chat",
+  "subscriptionRisk.title": "Before you sign in with a subscription, read this",
+  "subscriptionRisk.policy": "Anthropic's policy says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro, or Max plan credentials on behalf of their users, and may not collect, store, or intermediate Claude.ai credentials or session tokens. What it allows is you signing in to the unmodified Claude Code binary with your own subscription. Pro and Max usage limits assume ordinary, individual usage.",
+  "subscriptionRisk.conflicts": "In DuDuClaw, these uses conflict with that policy: letting one subscription serve other people (for example, AI employees answering customers on LINE or Telegram), rotating several subscription accounts to get past usage limits, and having DuDuClaw store your token (connecting a subscription or pasting an OAuth token saves the token, encrypted, in the config file). Anthropic's Consumer Terms also say you may not make your account available to anyone else.",
+  "subscriptionRisk.enforcement": "Anthropic says it may enforce these restrictions without prior notice. Press and users have reported account suspensions (outside reports, not an official Anthropic statement).",
+  "subscriptionRisk.others": "Since March 2026, Google has blocked third-party products from using consumer-subscription sign-in on the server side and has suspended accounts over it; OpenAI's policy on this is unclear.",
+  "subscriptionRisk.recommendation": "An API key from Claude Console is the path Anthropic documents for products, and we suggest it first. If you still sign in with a subscription, you accept the risk of your account being restricted or suspended.",
+  "subscriptionRisk.link": "Anthropic's legal and compliance page",
+  "subscriptionRisk.short": "Anthropic's policy doesn't permit third-party products to handle subscription credentials or route requests for other people through a subscription, and it may enforce this without notice.",
+  "subscriptionRisk.learnMore": "Read the policy",
+  "subscriptionRisk.error.notAccepted": "Read the subscription risk notice and tick the box before continuing.",
+  "welcome.backend.claudeSub.risk": "Note: Anthropic's policy doesn't permit third-party products to handle subscription credentials; accounts may be restricted without notice.",
+  "settings.doctor.check.subscription_login_risk": "Subscription login policy risk"
 }
