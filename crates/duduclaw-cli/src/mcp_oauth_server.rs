@@ -497,8 +497,11 @@ fn filter_scope(requested: &str) -> String {
 }
 
 /// The C1 brand cat mark (navy ink + amber tail), inlined into the OAuth pages
-/// so they render with no extra request. Single source: the repo's brand kit.
-const BRAND_MARK_SVG: &str = include_str!("../../../docs/assets/brand/duduclaw-mark.svg");
+/// so they render with no extra request. The file is a copy of
+/// `docs/assets/brand/duduclaw-mark.svg` kept inside the crate because the
+/// Docker build contexts copy `crates/` but not `docs/assets/`;
+/// `brand_mark_matches_brand_kit` fails if the two copies drift apart.
+const BRAND_MARK_SVG: &str = include_str!("../assets/duduclaw-mark.svg");
 
 /// Shared head + page chrome for the OAuth pages: C1 palette (cream page, navy
 /// text, navy primary button) and a heading row of mark + title. `title` is
@@ -872,6 +875,21 @@ pub(crate) async fn token_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The crate-local mark must stay byte-identical to the brand kit copy.
+    /// Skipped when the brand kit is absent (e.g. a source tree without docs/).
+    #[test]
+    fn brand_mark_matches_brand_kit() {
+        let kit = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/assets/brand/duduclaw-mark.svg");
+        let Ok(kit_svg) = std::fs::read_to_string(&kit) else {
+            return;
+        };
+        assert_eq!(
+            BRAND_MARK_SVG, kit_svg,
+            "crates/duduclaw-cli/assets/duduclaw-mark.svg drifted from docs/assets/brand/duduclaw-mark.svg"
+        );
+    }
 
     #[test]
     fn cimd_ids_and_documents_are_validated() {
