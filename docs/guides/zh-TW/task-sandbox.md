@@ -157,8 +157,8 @@ duduclaw doctor
 | 你看到的 | 原因 | 處理 |
 |---|---|---|
 | `(docker_unreachable)` | Docker 常駐程式沒在跑，或 gateway 使用者用不了。 | 啟動 Docker；確認 gateway 使用者能執行 `docker version`。 |
-| `(image_missing)` | image 不在這台機器上。 | 執行錯誤訊息中給的 `docker pull <image>`，或把 `image` 指向你已有的 image。從 gateway 改用 rootless Podman 的 DuDuClaw OS 映像起（尚未發布；v0.3.0 以前仍以 root 執行 Docker），gateway 用自己的 rootless 映像庫：pull 時要帶 gateway 的 `CONTAINER_HOST`，否則 image 會進 root 的映像庫，gateway 看不到。 |
-| `(resource_limits_unenforced)` | 容器引擎以 rootless 執行，卻沒有套用 `--memory`／`--pids-limit`（cgroup 控制器沒有委派給它）、回報的上限跟要求不同，或檢查容器沒有跑完。 | 在改用 rootless Podman 的 DuDuClaw OS 映像上（尚未發布），這是映像的問題（容器服務單元需要 cgroup 委派），請回報。其他環境請把 memory 與 pids 控制器委派給 rootless 引擎的使用者。沙箱不會在沒有上限的情況下執行。 |
+| `(image_missing)` | image 不在這台機器上。 | 執行錯誤訊息中給的 `docker pull <image>`，或把 `image` 指向你已有的 image。從 DuDuClaw OS v0.4.0（內嵌平台 v1.73.4）起，gateway 改用 rootless Podman 和自己的映像庫（v0.3.0 以前仍以 root 執行 Docker）：pull 時要帶 gateway 的 `CONTAINER_HOST`，否則 image 會進 root 的映像庫，gateway 看不到。v0.4.0 的 root 登入 shell 已經設好這個變數（`/etc/profile.d/duduclaw-podman.sh`），在那裡 `podman pull` 會直接進 gateway 的映像庫。 |
+| `(resource_limits_unenforced)` | 容器引擎以 rootless 執行，卻沒有套用 `--memory`／`--pids-limit`（cgroup 控制器沒有委派給它）、回報的上限跟要求不同，或檢查容器沒有跑完。 | 在 DuDuClaw OS v0.4.0 以後（rootless Podman）的映像上，這是映像的問題（容器服務單元需要 cgroup 委派），請回報。其他環境請把 memory 與 pids 控制器委派給 rootless 引擎的使用者。沙箱不會在沒有上限的情況下執行。 |
 | `(network_disabled)` | 該員工是 `network_access = false`。 | 在該員工的 `[container]` 設 `network_access = true`。 |
 | `(root_user)` | gateway 以 uid 0 執行。 | 改用一般使用者執行 gateway。 |
 | `(unsupported_platform)` | 主機不是 unix 系統（例如 Windows）。 | 在 Linux 或 macOS 上執行 gateway。 |

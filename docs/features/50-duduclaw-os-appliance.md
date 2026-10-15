@@ -115,7 +115,7 @@ desktop:
 | Image | What it is | Ships as |
 |---|---|---|
 | **Desktop edition** (`duduclaw-image-appliance`) | The full machine: the desktop plus Chromium / LibreOffice preloaded offline (Steam installs from Flathub), the app compatibility layer (Bottles, Windows VM, Waydroid), read-only root, the firewall, first-boot provisioning, and login hardening. | The whole-disk `.wic.zst`, and its own live installer ISO (`installer-desktop`, shipping since v0.1.0 on 2026-09-04). |
-| **Base image** (`duduclaw-image-ab`) | The same A/B layout, desktop shell and gateway, without the app layer, read-only root or firewall. A bring-up artifact rather than a product. | The payload of the plain live installer ISO (`installer`). |
+| **Base image** (`duduclaw-image-ab`) | The same A/B layout, desktop shell and gateway, without the app layer or read-only root (from v0.4.0 it has the same firewall as the desktop edition; v0.3.0 and earlier have none). A bring-up artifact rather than a product. | The payload of the plain live installer ISO (`installer`). |
 
 What the desktop does when no monitor is attached — whether it falls back
 to a headless dashboard-only box — has not been defined on real hardware
@@ -131,34 +131,42 @@ gateway, not by the desktop.
   are handled by a separate helper, `duduclaw-sysd`, that accepts exactly
   18 fixed commands over a local Unix socket and checks the caller's user
   id before doing anything. If no allowed caller is configured, it refuses
-  every request. On the current images the gateway itself still runs as
-  root, and the helper is configured to accept root, so this split does
-  not yet limit what the gateway can do; moving the gateway to its own
-  non-root user is planned.
-- **The desktop edition denies inbound connections by default.** Its
-  firewall drops everything inbound except the dashboard port (18789),
-  mDNS for local network discovery (UDP 5353) and basic ICMP such as ping.
-  The image includes the dropbear SSH server, which listens on port 22
-  from boot, but the desktop edition's firewall has no rule for it, so SSH
-  cannot be reached from the network. The base edition (written by the
-  plain `installer` ISO) ships without this firewall, so on it dropbear
-  and the dashboard port are reachable from the LAN. Up to platform
-  v1.73.2 the SSH switch in the dashboard's maintenance mode changed
-  neither case: it started and stopped a unit named `ssh.service` (the
-  name used by the earlier Debian-based image), which these images do not
-  have, and it never added a firewall rule. Platform v1.73.3 fixes this:
-  `duduclaw-sysd` now starts `dropbear.socket` and adds port 22 to the
-  firewall's maintenance port set, and when the window closes it stops
-  dropbear, ends every session process and removes the port. OS images
-  pick this up from the next OS release (embedding platform v1.73.3 or
-  later, with dropbear off by default and the firewall in the base edition
-  too), which has not shipped yet. On images up to v0.3.0, the desktop
-  edition's firewall has no such set, so opening is refused, and the close
-  that follows the refusal stops the dropbear that was already running;
-  the base edition has no firewall, and closing likewise stops that
-  dropbear. On both, dropbear starts again on the next boot. Also, no account on the
-  current images can log in over SSH (root is locked and dropbear refuses
-  root logins), so for now the switch only controls the port.
+  every request. From DuDuClaw OS v0.4.0 (embeds platform v1.73.4) the
+  gateway runs as its own non-root user (`duduclaw`, uid 1000), and the
+  helper accepts only the gateway's main process, verifies OS updates
+  itself (signature, hashes, version) before installing them, and refuses
+  to roll back to an image older than v0.4.0. AI employees run as the same
+  user as the gateway, so this keeps them away from root, not away from the
+  gateway's own powers (see [Security defense](05-security-defense.md)).
+  On v0.3.0 and earlier images the gateway still runs as root and the
+  helper accepts root, so there the split does not limit what the gateway
+  can do.
+- **Inbound connections are denied by default, and SSH is off.** From
+  DuDuClaw OS v0.4.0 both editions (the desktop edition and the base
+  edition written by the plain `installer` ISO) ship a firewall that drops
+  everything inbound except the dashboard port (18789), mDNS for local
+  network discovery (UDP 5353) and basic ICMP such as ping. The dropbear
+  SSH server is installed but off by default. The SSH switch in the
+  dashboard's maintenance mode (platform v1.73.3 or later; v0.4.0 embeds
+  v1.73.4) has `duduclaw-sysd` start `dropbear.socket` and add port 22 to
+  the firewall's `maintenance_tcp_ports` set; when the window closes it
+  stops dropbear, ends every session process and removes the port. No
+  account on the images can log in over SSH yet (root is locked and
+  dropbear refuses root logins), so for now the switch only controls the
+  port.
+  On v0.3.0 and earlier images dropbear listens on port 22 from boot. The
+  desktop edition's firewall has no rule for it, so SSH cannot be reached
+  from the network there, but the base edition has no firewall, so on it
+  dropbear and the dashboard port are reachable from the LAN. Those images
+  embed platform v1.73.1 or older, and up to platform v1.73.2 the SSH
+  switch changed neither case: it started and stopped a unit named
+  `ssh.service` (the name used by the earlier Debian-based image), which
+  these images do not have, and it never added a firewall rule. A platform
+  v1.73.3 or later gateway on such an image cannot open SSH either: the
+  desktop edition's firewall has no maintenance port set, so opening is
+  refused, and the close that follows the refusal stops the dropbear that
+  was already running; on the base edition, closing likewise stops it. On
+  both, dropbear starts again on the next boot.
 - **The webhook relay never sees your channel secrets.** For webhook-style
   channels that need it, the relay's job is limited to forwarding an
   incoming request's raw bytes to the box over a connection the box opened
@@ -205,38 +213,60 @@ CHANGELOG, and SECURITY notes — under `/docs/`.
 ## Current Status
 
 This is a young part of the platform, and it's worth being direct about
-where it stands rather than rounding up. As of DuDuClaw OS v0.3.0
-(2026-10-14, embedding platform v1.73.1; the earlier v0.2.0 and v0.1.0
-releases stay available on the Releases page as rollback targets):
+where it stands rather than rounding up. As of DuDuClaw OS v0.4.0
+(2026-10-16, embedding platform v1.73.4; the earlier v0.3.0, v0.2.0 and
+v0.1.0 releases stay on the Releases page, but a device that has booted
+v0.4.0 successfully cannot roll back to them):
 
 - x86-64 images exist and are published for both machines, in three forms
   per machine (the desktop-edition whole-disk image, a live installer ISO
   for the desktop edition, and a live installer ISO for the base image),
   all signed with SHA-256 and minisign (the whole-disk image also ships a
-  `.manifest.json` for provenance only). For v0.3.0, the QEMU machine's
-  whole-disk image and both of its installer ISOs were booted under QEMU
-  (software emulation, no KVM) to a login prompt or the live environment's
-  automatic login; the installer wizard was not run end to end. The
-  real-hardware machine (`duduclaw-genericx86-64`) was built but not
-  boot-tested, and it has not booted on real hardware yet.
+  `.manifest.json` for provenance only). For v0.4.0, the QEMU machine's
+  whole-disk image passed the release smoke boot under QEMU (software
+  emulation, no KVM), reaching the login prompt in about 65 seconds. No
+  boot test of the v0.4.0 installer ISOs is recorded, and the installer
+  wizard was not run end to end. The real-hardware machine
+  (`duduclaw-genericx86-64`) was built but not boot-tested, and it has not
+  booted on real hardware yet.
+- The non-root gateway was checked on a test variant of the QEMU
+  machine's desktop image, under the same headless QEMU on the build
+  server, in two verification rounds. The second round passed 35 of 36
+  checks; the one failure was the `duduclaw doctor` headline, which still
+  said PASS while the container features had correctly turned themselves
+  off. That wording is fixed on the platform's main branch (#132), after
+  v1.73.4. Not verified for v0.4.0: upgrading an existing v0.3.0 device
+  through the A/B update path (the data ownership migration and the
+  cleanup of old boot entries), the full task sandbox, computer use and
+  Discovery flows that need LLM credentials, the Windows VM (it needs
+  KVM), Wi-Fi and audio on real hardware, and booting
+  `duduclaw-genericx86-64`.
+- Upgrading to v0.4.0 is one-way. `duduclaw-sysd` refuses rollbacks to
+  images older than v0.4.0, and once the first v0.4.0 boot has been marked
+  good the older boot entries are deleted, so the boot loader cannot fall
+  back to them either (those images run the gateway as root). A bad later
+  release is fixed by installing a newer image or using the rescue entry.
 - Full real-hardware validation — burn the media, boot it, install, walk
   through setup, exchange a message on a chat channel, apply an OS update,
   force a rollback, and run a factory reset, all on the actual certified
   hardware — hasn't happened yet. It is the most important open item.
 - The trust chain is wired in the build layer but only partly switched on
-  in the published images. Shipped since v0.1.0 and unchanged through
-  v0.3.0: A/B atomic update with rollback, a read-only root in the desktop
-  edition, and a minisign signature on every release artifact. Still
-  **not** enabled as of v0.3.0: Secure Boot signing of the UKIs and dm-verity root
+  in the published images. Shipped since v0.1.0 and still in v0.4.0: A/B
+  atomic update with rollback (from v0.4.0, rollback stops at v0.4.0
+  itself), a read-only root in the desktop edition, and a minisign
+  signature on every release artifact. Still **not** enabled as of v0.4.0:
+  Secure Boot signing of the UKIs and dm-verity root
   verification (both come from the `sb-signing` build overlay), and TPM2 +
   LUKS key sealing (the `tpm-luks` overlay; its automatic enrollment is
   still an open defect that needs a real-hardware TPM to close). No
   release so far has chained either overlay: `release-os.sh` adds one
   release overlay per build (`serial1.yml` by default; v0.3.0 used
   `release-linux-builder.yml`, which only sets build parallelism and turns
-  off SPDX output). The published v0.3.0 whole-disk images have no verity
-  partition, and their UKIs and boot loader carry no signature, so they
-  still boot with Secure Boot off.
+  off SPDX output). The published v0.3.0 whole-disk images were taken
+  apart and have no verity partition, and their UKIs and boot loader carry
+  no signature, so they boot with Secure Boot off; the v0.4.0 release
+  notes state that Secure Boot, dm-verity and TPM2 are still not enabled
+  on release images.
 - The OS is versioned independently of the platform (`0.x` = bring-up;
   `1.0.0` will mark the first GA). Release-by-release status lives in the
   [DuDuClaw-OS CHANGELOG](https://os.duduclaw.dudustudio.monster/docs/os/changelog/).
