@@ -10,6 +10,7 @@
 - 獨立模式（`duduclaw mcp init`）列出的 24 個工具改寫說明：各自寫明何時用、該改用哪個相鄰工具、回傳什麼、會不會改動資料。起因是 Glama 的工具定義評分（2026-10-15 平均 3.6/5，最低是「使用時機」與「行為揭露」兩項）。每則說明仍在 200 bytes 上限內。
 - 下列參數的 schema 從字串改成實際型別，處理程式同時接受原生值與字串寫法（`"5"`、`"true"`、逗號分隔），舊用戶端不受影響：`code_map` 的 `max_files`（integer）與 `chat_files`（array）、`memory_fetch_batch` 的 `ids`（array）與 `include_metadata`（boolean）、`memory_search`／`memory_improve` 的 `limit`、`memory_search`／`memory_store` 的 `tags`（array）、`user_profile_record` 的 `origin_trust`（number）、`wiki_search` 的 `limit`／`min_trust`／`expand`、`wiki_write` 的 `update_index`、`wiki_graph` 的 `depth`。
 - 三語 README 的 PyPI badge 換成 Glama 分數 badge（badge 維持 5 個），PyPI 連結移到「Python SDK」段落。
+- 公開文件跟上 DuDuClaw OS v0.4.0（2026-10-16 發布，內嵌平台 v1.73.4）：三語 README 的 OS 段落與功能表、`docs/features/05`、`50`、`52`，以及 `docs/guides/task-sandbox.md`、`mcp-tools.md`、`appliance-build.md`（皆含 zh-TW／ja-JP）原本寫「下一版 OS 映像、尚未發版」的閘道去 root、rootless Podman、SSH 預設關閉、基礎版防火牆、`/api/internal/sysd` 與回退下限，改寫成從 v0.4.0 起提供；v0.3.0 以前的映像仍以 root 執行閘道與 Docker、內嵌較舊的平台。新增寫明：升級到 v0.4.0 是單向的（sysd 的回退下限加上第一次開機被標記成功後刪掉舊開機項目，成功開機過的裝置回不去 v0.3.0 以前）。測試範圍照 OS 的發版說明寫：QEMU 機型桌面版測試映像在建置主機的無頭 QEMU（TCG）跑兩輪驗證，第二輪 36 項過 35 項（沒過的是 doctor 標題，已在下方修正）；整碟映像通過發版前開機煙霧測試（約 65 秒到登入畫面）。仍未驗證：從 v0.3.0 經 A/B 更新升級、需要 LLM 憑證的任務沙箱／電腦操作／Discovery 完整流程、Windows VM、真機、genericx86-64 開機。SSH 目前還沒有能登入的帳號；Secure Boot、dm-verity、TPM2 在發布映像上仍未啟用。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）

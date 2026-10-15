@@ -46,11 +46,15 @@ own desktop (compositor + shell) with the gateway + dashboard, preloaded
 apps, and the app compatibility layer. Secure Boot signing, dm-verity root
 verification and TPM2 key sealing exist in the layer as build-time overlays
 (`kas/sb-signing.yml`, `kas/tpm-luks.yml`) but are **still not** enabled as of
-the current v0.3.0 release (embedding platform v1.73.1), which continues to
+the current v0.4.0 release (embedding platform v1.73.4), which continues to
 boot with Secure Boot off: `release-os.sh` adds one release overlay per build
 (`serial1.yml` by default, `release-linux-builder.yml` for v0.3.0), and
-neither of those turns on signing, verity or TPM. The installer ISO writes the base image
-`duduclaw-image-ab` (same layout and desktop shell, without the app layer);
+neither of those turns on signing, verity or TPM. From v0.4.0 the gateway
+runs as a non-root user, containers run on rootless Podman, and SSH is off
+by default; a device that has booted v0.4.0 cannot roll back to v0.3.0 or
+earlier. The installer ISO writes the base image
+`duduclaw-image-ab` (same layout, desktop shell and, from v0.4.0, firewall,
+without the app layer);
 the desktop-edition installer ISO (`duduclaw-os-installer-desktop-…`) has
 shipped alongside it since v0.1.0 (2026-09-04). Two machines are defined:
 `duduclaw-qemux86-64` (QEMU bring-up target, boot-verified) and

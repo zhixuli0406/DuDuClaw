@@ -124,9 +124,9 @@ npm install -g duduclaw
 
 ### DuDuClaw OS(值班機映像,pre-GA)
 
-不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice(Steam 從 Flathub 安裝)與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,截至最新版 v0.3.0 仍未啟用,開機需先在 BIOS/UEFI 關閉 Secure Boot。
+不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice(Steam 從 Flathub 安裝)與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,截至最新版 v0.4.0 仍未啟用,開機需先在 BIOS/UEFI 關閉 Secure Boot。
 
-現行版本是 v0.3.0(內嵌平台 v1.73.1;先前的 v0.2.0 與 v0.1.0 仍留在 Releases 頁面,可作為回滾目標)。到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載整碟 `.wic.zst`(桌面版)、`installer-desktop` 安裝器 `.iso`(寫入桌面版)或 `installer` 安裝器 `.iso`(寫入基礎版,沒有應用層),每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令見[官方文件站的 OS README](https://os.duduclaw.dudustudio.monster/docs/os/readme/)。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
+現行版本是 [v0.4.0](https://github.com/zhixuli0406/DuDuClaw-OS/releases/tag/v0.4.0)(內嵌平台 v1.73.4)。gateway 改以非 root 帳號執行、容器改用 rootless Podman,SSH 預設關閉,基礎版也有和桌面版一樣的防火牆。升級是單向的:v0.4.0 成功開機過一次之後,裝置就回不去 v0.3.0 以前的版本,那些版本留在 Releases 頁面只是舊版紀錄。到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載整碟 `.wic.zst`(桌面版)、`installer-desktop` 安裝器 `.iso`(寫入桌面版)或 `installer` 安裝器 `.iso`(寫入基礎版,沒有應用層),每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令見[官方文件站的 OS README](https://os.duduclaw.dudustudio.monster/docs/os/readme/)。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**,既有 v0.3.0 機器經 A/B 更新升上來的路徑也還沒驗證。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
 
 ### 從原始碼建構
 
@@ -192,7 +192,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web Dashboard | React 19 + TypeScript SPA,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
 | ERP 整合 | Odoo 中間層 17 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto 值班機映像(現行 v0.3.0,內嵌平台 v1.73.1):自家 compositor / 殼與快捷鍵、人機共駕(agent 專屬 seat、影子工作區、人輸入即凍結、Super+Esc 急停,已編譯進映像但預設關閉)、A/B 原子更新與回滾、唯讀 root、首次開機自動 provision + 區網後台、app 相容層(Flatpak / Bottles / Waydroid);Secure Boot 簽章 / dm-verity / TPM2 為建置 overlay 選項,截至 v0.3.0 仍未啟用;獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
+| DuDuClaw OS | Yocto 值班機映像(現行 v0.4.0,內嵌平台 v1.73.4):自家 compositor / 殼與快捷鍵、人機共駕(agent 專屬 seat、影子工作區、人輸入即凍結、Super+Esc 急停,已編譯進映像但預設關閉)、A/B 原子更新與回滾(不能回滾到 v0.4.0 以前)、唯讀 root、非 root gateway 與 rootless Podman 容器、SSH 預設關閉、首次開機自動 provision + 區網後台、app 相容層(Flatpak / Bottles / Waydroid);Secure Boot 簽章 / dm-verity / TPM2 為建置 overlay 選項,截至 v0.4.0 仍未啟用;獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。
 

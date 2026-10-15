@@ -157,8 +157,8 @@ duduclaw doctor
 | 表示 | 原因 | 対処 |
 |---|---|---|
 | `(docker_unreachable)` | Docker デーモンが動いていない、または gateway ユーザーが使えない。 | Docker を起動し、gateway ユーザーが `docker version` を実行できるか確認する。 |
-| `(image_missing)` | イメージがこのマシンにない。 | エラーに示された `docker pull <image>` を実行するか、`image` を既にあるイメージに向ける。gateway を rootless Podman に移す DuDuClaw OS イメージ（未公開。v0.3.0 までは root の Docker のまま）からは、gateway は専用の rootless イメージストアを使います。gateway の `CONTAINER_HOST` を付けて pull しないと、イメージは root のストアに入り gateway からは見えません。 |
-| `(resource_limits_unenforced)` | コンテナエンジンが rootless で動いていて `--memory`／`--pids-limit` を適用していない（cgroup コントローラが委譲されていない）、要求と異なる上限を報告した、または確認用コンテナが終わらなかった。 | rootless Podman を使う DuDuClaw OS イメージ（未公開）ではイメージ側の問題（コンテナサービスのユニットに cgroup の委譲が必要）なので報告してください。それ以外の環境では memory と pids のコントローラを rootless エンジンのユーザーに委譲します。サンドボックスが上限なしで動くことはありません。 |
+| `(image_missing)` | イメージがこのマシンにない。 | エラーに示された `docker pull <image>` を実行するか、`image` を既にあるイメージに向ける。DuDuClaw OS v0.4.0（プラットフォーム v1.73.4 を同梱）からは、gateway は rootless Podman と専用のイメージストアを使います（v0.3.0 までは root の Docker のまま）。gateway の `CONTAINER_HOST` を付けて pull しないと、イメージは root のストアに入り gateway からは見えません。v0.4.0 の root ログインシェルではこの変数が設定済み（`/etc/profile.d/duduclaw-podman.sh`）なので、そこで `podman pull` すれば gateway のストアに入ります。 |
+| `(resource_limits_unenforced)` | コンテナエンジンが rootless で動いていて `--memory`／`--pids-limit` を適用していない（cgroup コントローラが委譲されていない）、要求と異なる上限を報告した、または確認用コンテナが終わらなかった。 | DuDuClaw OS v0.4.0 以降（rootless Podman）のイメージではイメージ側の問題（コンテナサービスのユニットに cgroup の委譲が必要）なので報告してください。それ以外の環境では memory と pids のコントローラを rootless エンジンのユーザーに委譲します。サンドボックスが上限なしで動くことはありません。 |
 | `(network_disabled)` | エージェントが `network_access = false`。 | そのエージェントの `[container]` で `network_access = true` にする。 |
 | `(root_user)` | gateway が uid 0 で動いている。 | 通常のユーザーで gateway を実行する。 |
 | `(unsupported_platform)` | ホストが unix 系ではない（Windows など）。 | Linux または macOS で gateway を実行する。 |

@@ -175,7 +175,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 ### `os_*`：DuDuClaw OS 上的裝置操作
 
-需要 root 的 `os_*` 工具（電源、更新狀態、由 sysd 重新驗證的更新安裝、開機評估、回退、恢復原廠）在 MCP 伺服器裡照舊先過完所有檢查（Admin 權限範圍、`[permissions]`、確認、恢復原廠的核准），再經本機回送位址把請求交給 gateway（`POST /api/internal/sysd`，跟 `computer_*` 一樣每次請求都簽章）。gateway 用自己的連線轉給 `duduclaw-sysd`，所以 sysd 只接受 gateway 行程時這些工具仍能用。這條路由只接受上述指令，SSH、網路、主機名稱、時區與本地模型操作一律拒絕。這需要裝置上的平台是 v1.73.4 以上，所以從下一版 DuDuClaw OS 映像起才適用（v0.3.0 內嵌 v1.73.1，工具仍直接呼叫 sysd）。gateway 沒在執行，或 MCP 伺服器不是由 gateway 啟動（沒有員工身分）時，工具會失敗並說明原因，不會直接連 sysd。非 DuDuClaw OS 的安裝沒有變化。
+需要 root 的 `os_*` 工具（電源、更新狀態、由 sysd 重新驗證的更新安裝、開機評估、回退、恢復原廠）在 MCP 伺服器裡照舊先過完所有檢查（Admin 權限範圍、`[permissions]`、確認、恢復原廠的核准），再經本機回送位址把請求交給 gateway（`POST /api/internal/sysd`，跟 `computer_*` 一樣每次請求都簽章）。gateway 用自己的連線轉給 `duduclaw-sysd`，所以 sysd 只接受 gateway 行程時這些工具仍能用。這條路由只接受上述指令，SSH、網路、主機名稱、時區與本地模型操作一律拒絕。這需要裝置上的平台是 v1.73.4 以上，所以從內嵌 v1.73.4 的 DuDuClaw OS v0.4.0 起適用（v0.3.0 內嵌 v1.73.1，工具仍直接呼叫 sysd）。gateway 沒在執行，或 MCP 伺服器不是由 gateway 啟動（沒有員工身分）時，工具會失敗並說明原因，不會直接連 sysd。非 DuDuClaw OS 的安裝沒有變化。
 
 ### `belief_stats` / `belief_settle`：已驗證與自報的結算
 
