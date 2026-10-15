@@ -410,19 +410,20 @@ pub async fn check(home: &Path) -> (Level, String) {
         text.push_str("\n         ");
         text.push_str(&line);
     }
-    with_limits_line((level, text), limits, !users.is_empty())
+    with_limits_line((level, text), limits)
 }
 
-/// Append the resource-limit self-check line when it failed: a warning when
-/// someone has computer use on, informational otherwise.
+/// Append the resource-limit self-check line when it failed, and always
+/// warn (see `task_sandbox::doctor::with_limits_line`): an engine that
+/// ignores resource limits is broken whether or not anyone has computer use
+/// on yet.
 pub fn with_limits_line(
     (level, text): (Level, String),
     limits: Option<duduclaw_core::container_engine::LimitVerdict>,
-    anyone_enabled: bool,
 ) -> (Level, String) {
     let Some(verdict) = limits else { return (level, text) };
     let text = format!("{text}\n         {}", verdict.reason_zh());
-    (if anyone_enabled { Level::Warn } else { level }, text)
+    (Level::Warn, text)
 }
 
 #[cfg(test)]
@@ -512,10 +513,10 @@ mod tests {
         let m = presence_error("x:y", Presence::LimitsUnenforced(LimitVerdict::Ignored)).unwrap();
         assert!(m.starts_with("電腦操作無法啟動") && m.contains("rootless"), "{m}");
         assert!(missing_message("x:y").contains("CONTAINER_HOST"), "the DuDuClaw OS pull hint");
-        let (level, text) = with_limits_line((Level::Pass, "ok".into()), Some(LimitVerdict::ProbeFailed), true);
+        let (level, text) = with_limits_line((Level::Pass, "ok".into()), Some(LimitVerdict::ProbeFailed));
         assert_eq!(level, Level::Warn);
         assert!(text.contains("rootless"), "{text}");
-        assert_eq!(with_limits_line((Level::Pass, "ok".into()), None, true), (Level::Pass, "ok".into()));
+        assert_eq!(with_limits_line((Level::Pass, "ok".into()), None), (Level::Pass, "ok".into()));
     }
 
     #[tokio::test]
