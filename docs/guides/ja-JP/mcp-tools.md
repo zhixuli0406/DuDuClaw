@@ -84,9 +84,25 @@ AI 社員のものになっているレコードを変更・起動するツー�
 
 ### 唯一の例外
 
-`team_handoff` の `packet` パラメータは TaskPacket の完全な形を保持します（上限 1,024 バイト）。`build_tool_schema` は全パラメータを素の JSON-Schema 文字列として宣言するため、実際の形を書ける場所はパラメータ説明だけです。さらに TaskPacket は切り詰めずに丸ごと拒否されるので、形が見えないエージェントは有効なパケットを作れません。完全な仕様は [../../spec/task-packet.md](../../spec/task-packet.md) です。
+`team_handoff` の `packet` パラメータは TaskPacket の完全な形を保持します（上限 1,024 バイト）。`build_tool_schema` は `PARAM_TYPES` の短いリストにある整数・数値・真偽値・文字列配列を除き、パラメータを素の JSON-Schema 文字列として宣言するため、TaskPacket のようなオブジェクトの実際の形を書ける場所はパラメータ説明だけです。さらに TaskPacket は切り詰めずに丸ごと拒否されるので、形が見えないエージェントは有効なパケットを作れません。完全な仕様は [../../spec/task-packet.md](../../spec/task-packet.md) です。
 
 例外は 1 つのリスト（`PARAM_CAP_EXEMPTIONS`）にまとめられ、例外が不要になったときにテストが落ちます。
+
+## ツールの annotations
+
+`tools/list` の各ツールには MCP の `annotations` が付きます。ディスパッチゲートと `action_rules` が使うのと同じ効果分類表（`duduclaw_core::effect_of`）から導出します。
+
+| 効果分類 | `readOnlyHint` | `destructiveHint` |
+|---|---|---|
+| `read` | `true` | （付けない） |
+| `draft`・`send` | `false` | `false` |
+| `publish` | `false` | `true`（公開は他者が読んでいる内容を置き換えうる） |
+| `modify` | `false` | `true`。ただし追加・再生成だけの `memory_store`・`user_profile_record`・`wiki_export`・`wiki_rebuild_fts` は `false` |
+| `delete`・`purchase`・`admin` と表にない名前 | `false` | `true` |
+
+メモリ・wiki・ユーザープロファイル・`code_map` のツールは `openWorldHint: false` も付きます。`memory_alias_add`・`wiki_export`・`wiki_rebuild_fts` は `idempotentHint: true` です。これらのリストは `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs` にあります。
+
+ヒントは MCP クライアント向け（呼び出し前に確認するかどうかなど）で、権限を与えるものではありません。DuDuClaw のゲートは毎回そのまま動きます。Claude Code と Codex はモデルに名前・説明・入力スキーマだけを渡すため、上の説明バイト予算には含めません。
 
 ## 説明から移した長い詳細
 

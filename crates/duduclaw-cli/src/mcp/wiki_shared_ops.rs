@@ -5,16 +5,10 @@ pub(crate) async fn handle_shared_wiki_search(args: &Value, home_dir: &Path, cal
         Some(q) if !q.is_empty() => q,
         _ => return tool_error("Missing required parameter: query"),
     };
-    let limit: usize = args
-        .get("limit")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10)
+    let limit: usize = crate::mcp_args::arg_u64(args, "limit")
+        .map_or(10, |n| n as usize)
         .min(100);
-    let min_trust: Option<f32> = args
-        .get("min_trust")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
+    let min_trust: Option<f32> = crate::mcp_args::arg_f64(args, "min_trust").map(|t| t as f32);
     let layer_filter: Option<duduclaw_memory::WikiLayer> = args
         .get("layer")
         .and_then(|v| v.as_str())

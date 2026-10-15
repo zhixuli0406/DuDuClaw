@@ -84,9 +84,25 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 ### 唯一的例外
 
-`team_handoff` 的 `packet` 參數帶著完整的 TaskPacket 形狀（上限 1,024 bytes）。`build_tool_schema` 把每個參數都宣告成裸 JSON-Schema 字串，所以參數說明是唯一能寫出真實形狀的地方——而 TaskPacket 是整筆拒絕不截斷的，看不到形狀的 AI 員工就產不出合法的封包。完整規格在 [../../spec/task-packet.md](../../spec/task-packet.md)。
+`team_handoff` 的 `packet` 參數帶著完整的 TaskPacket 形狀（上限 1,024 bytes）。`build_tool_schema` 除了 `PARAM_TYPES` 這份短清單列出的整數、數字、布林與字串陣列之外，參數一律宣告成裸 JSON-Schema 字串，所以 TaskPacket 這種物件只能在參數說明裡寫出真實形狀——而 TaskPacket 是整筆拒絕不截斷的，看不到形狀的 AI 員工就產不出合法的封包。完整規格在 [../../spec/task-packet.md](../../spec/task-packet.md)。
 
 所有例外集中在一份清單（`PARAM_CAP_EXEMPTIONS`），並有測試在例外不再必要時失敗。
+
+## 工具 annotations
+
+`tools/list` 的每個工具都帶 MCP `annotations`，由派工閘門與 `action_rules` 共用的同一張效果分類表（`duduclaw_core::effect_of`）推導：
+
+| 效果分類 | `readOnlyHint` | `destructiveHint` |
+|---|---|---|
+| `read` | `true` | （不帶） |
+| `draft`、`send` | `false` | `false` |
+| `publish` | `false` | `true`（公開後可能蓋掉別人已在讀的內容） |
+| `modify` | `false` | `true`；`memory_store`、`user_profile_record`、`wiki_export`、`wiki_rebuild_fts` 只新增或重新產生，標 `false` |
+| `delete`、`purchase`、`admin` 與表上沒有的名稱 | `false` | `true` |
+
+記憶、wiki、使用者偏好與 `code_map` 工具另外標 `openWorldHint: false`；`memory_alias_add`、`wiki_export`、`wiki_rebuild_fts` 標 `idempotentHint: true`。這幾份清單在 `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`。
+
+這些提示給 MCP 用戶端參考（例如呼叫前要不要先問人），不代表任何授權，DuDuClaw 的每道閘門照常檢查。它們不計入上面的說明字數預算：Claude Code 與 Codex 交給模型的工具清單只有名稱、說明與輸入 schema。
 
 ## 從說明搬出來的長版細節
 

@@ -160,14 +160,39 @@ Two consequences for anyone adding or editing a tool:
 ### The one exception
 
 `team_handoff`'s `packet` parameter carries the full TaskPacket shape (capped at
-1,024 bytes). `build_tool_schema` types every parameter as a bare JSON-Schema
-string, so a parameter description is the only place its real shape can be
-stated — and a TaskPacket is rejected whole rather than truncated, so an agent
+1,024 bytes). `build_tool_schema` types a parameter as a bare JSON-Schema
+string unless the short `PARAM_TYPES` list gives it a scalar or string-array
+type, so for an object such as a TaskPacket the parameter description is the
+only place its real shape can be stated — and a TaskPacket is rejected whole rather than truncated, so an agent
 that cannot see the shape cannot produce a valid one. The full reference is
 [../spec/task-packet.md](../spec/task-packet.md).
 
 Exceptions live in one list (`PARAM_CAP_EXEMPTIONS`) with a test that fails when
 an exemption stops being necessary.
+
+## Tool annotations
+
+Every tool in `tools/list` carries MCP `annotations`, derived from the same
+effect table the dispatch gate and `action_rules` use
+(`duduclaw_core::effect_of`):
+
+| Effect class | `readOnlyHint` | `destructiveHint` |
+|---|---|---|
+| `read` | `true` | (omitted) |
+| `draft`, `send` | `false` | `false` |
+| `publish` | `false` | `true` (a publish can replace what others already read) |
+| `modify` | `false` | `true`, except `memory_store`, `user_profile_record`, `wiki_export`, `wiki_rebuild_fts` (they only add or regenerate) |
+| `delete`, `purchase`, `admin`, and any unknown name | `false` | `true` |
+
+Memory, wiki, user-profile and `code_map` tools also say `openWorldHint: false`;
+`memory_alias_add`, `wiki_export` and `wiki_rebuild_fts` say
+`idempotentHint: true`. The overlays live in
+`crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`.
+
+The hints are for the MCP client (for example, whether it asks before a call).
+They never authorize anything: every DuDuClaw gate still runs on the call. They
+are also left out of the description budget above, because Claude Code and Codex
+build the model's tool list from name, description and input schema only.
 
 ## Long-form details moved out of descriptions
 

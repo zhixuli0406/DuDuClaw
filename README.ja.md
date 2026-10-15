@@ -13,7 +13,7 @@ DuDuClaw は、Claude Code・Codex・Antigravity などの AI コマンドライ
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.73.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
-[![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+[![Glama MCP server score](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw/badges/score.svg)](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 **クイックスタート**([Node.js](https://nodejs.org/) 20+ が必要。デスクトップアプリは[インストール](#install)を参照):
@@ -141,7 +141,7 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 
 ### Python SDK(任意のライブラリ)
 
-コアの gateway / CLI は Rust バイナリで、Python は不要です。PyPI の `duduclaw` は `import duduclaw` 用の純粋なライブラリ(agents / channels / mcp / memory_eval モジュール)で、コマンドラインツールを含みません。そのため `pipx install duduclaw` が失敗するのは想定どおりです。必要な場合:
+コアの gateway / CLI は Rust バイナリで、Python は不要です。[PyPI の `duduclaw`](https://pypi.org/project/duduclaw/) は `import duduclaw` 用の純粋なライブラリ(agents / channels / mcp / memory_eval モジュール)で、コマンドラインツールを含みません。そのため `pipx install duduclaw` が失敗するのは想定どおりです。必要な場合:
 
 ```bash
 pip install duduclaw

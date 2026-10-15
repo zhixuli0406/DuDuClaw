@@ -32,6 +32,7 @@ mod eval_scaffold; // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaf
 pub mod expert; // WP2.1/WP2.2: expert-pack install/pack/list/remove/export
 pub mod license; // M1: license activate/status/refresh/export/import/deactivate
 mod mcp;
+pub(crate) mod mcp_args; // type-tolerant MCP tool argument readers (native JSON or stringified)
 pub mod mcp_alias; // T5 O3/O4/O13: merged-entry parameter parsing (wiki scope / task kind / skill source)
 // T5 O14: `mcp_auth_strategy` (a never-constructed Strategy-Pattern
 // abstraction) was folded into `mcp_auth::strategy` on 2026-09-29.

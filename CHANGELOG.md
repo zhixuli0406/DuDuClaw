@@ -2,8 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- MCP `tools/list` 的每個工具都帶 `annotations`（`readOnlyHint`、`destructiveHint`，部分工具另有 `idempotentHint`、`openWorldHint`），由派工閘門同一張效果分類表推導，不另立一套分類。這是給 MCP 用戶端的提示，不是授權，DuDuClaw 的閘門照常檢查。用戶端可能因此對唯讀工具少問一次確認。對照表見 `docs/guides/mcp-tools.md`。
+- `memory_search` 的 schema 補上處理程式本來就接受的 `limit`（預設 10、上限 100）與 `tags`（只回帶有其中任一標籤的項目）。
+
+### Changed
+- 獨立模式（`duduclaw mcp init`）列出的 24 個工具改寫說明：各自寫明何時用、該改用哪個相鄰工具、回傳什麼、會不會改動資料。起因是 Glama 的工具定義評分（2026-10-15 平均 3.6/5，最低是「使用時機」與「行為揭露」兩項）。每則說明仍在 200 bytes 上限內。
+- 下列參數的 schema 從字串改成實際型別，處理程式同時接受原生值與字串寫法（`"5"`、`"true"`、逗號分隔），舊用戶端不受影響：`code_map` 的 `max_files`（integer）與 `chat_files`（array）、`memory_fetch_batch` 的 `ids`（array）與 `include_metadata`（boolean）、`memory_search`／`memory_improve` 的 `limit`、`memory_search`／`memory_store` 的 `tags`（array）、`user_profile_record` 的 `origin_trust`（number）、`wiki_search` 的 `limit`／`min_trust`／`expand`、`wiki_write` 的 `update_index`、`wiki_graph` 的 `depth`。
+- 三語 README 的 PyPI badge 換成 Glama 分數 badge（badge 維持 5 個），PyPI 連結移到「Python SDK」段落。
+
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
+- schema 與處理程式對參數型別的認知不一致，照 schema 傳值的用戶端會被拒或被默默忽略：`memory_fetch_batch` 收到字串形式的 `ids` 直接報錯；`include_metadata: "true"`、`max_files: "5"`、`origin_trust: "0.4"` 這類字串會被忽略並改用預設值；反過來，`wiki_search` 的 `limit: 5`、`expand: true`，`wiki_graph` 的 `depth: 3` 與 `wiki_write` 的 `update_index: false` 以原生 JSON 型別傳入時也會被忽略（`update_index: false` 照樣寫進 `_index.md`）。
 
 ### Security
 - `wiki_share` 沒有檢查頁面路徑：`../`、絕對路徑或指向 wiki 外的符號連結都能讓它讀取員工自己 wiki 以外、行程讀得到的任何檔案，並把前 500 個字元（或呼叫者給的摘要）公開到所有員工都讀得到的共用 wiki，唯一的擋點是機密字樣掃描。現在跟 `wiki_read` 用同一道檢查，讀取時另外拒絕解析到 wiki 目錄外的連結。

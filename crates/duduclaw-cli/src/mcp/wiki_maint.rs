@@ -52,11 +52,7 @@ pub(crate) async fn handle_wiki_graph(args: &Value, home_dir: &Path, default_age
     }
 
     let center = args.get("center").and_then(|v| v.as_str());
-    let depth: usize = args
-        .get("depth")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+    let depth: usize = crate::mcp_args::arg_u64(args, "depth").map_or(2, |n| n as usize);
 
     let store = duduclaw_memory::WikiStore::new(wiki_dir);
     match store.export_mermaid(center, depth) {

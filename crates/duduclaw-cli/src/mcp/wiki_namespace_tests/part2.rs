@@ -484,9 +484,9 @@ async fn codrive_run_schema_surfaces_api_action_and_locate() {
     }
 
     // The `script` param's description is where this tool's whole
-    // schema convention lives (see `build_tool_schema` — every param is
-    // typed as a bare JSON-Schema string, so the actual object shape is
-    // carried in the description text). It must spell out both fields'
+    // schema convention lives (see `build_tool_schema` — a param outside
+    // `PARAM_TYPES` is typed as a bare JSON-Schema string, so the actual
+    // object shape is carried in the description text). It must spell out both fields'
     // shapes, not just name-drop them.
     let script_desc = tool["inputSchema"]["properties"]["script"]["description"]
         .as_str()

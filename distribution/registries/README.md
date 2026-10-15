@@ -44,6 +44,8 @@ curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.zhi
 - `distribution/glama/Dockerfile` 從 npm 安裝最新的 `duduclaw`，只跑獨立模式的 MCP server（stdio），不含 gateway，也不加 `mcp-proxy`。建置要以 repo 根目錄為 context：`docker build -f distribution/glama/Dockerfile .`。
 - `distribution/glama/entrypoint.sh`：沒有 `DUDUCLAW_MCP_API_KEY` 時先在容器自己的資料目錄跑 `duduclaw mcp init --client print` 發一把金鑰（只有記憶與 wiki 範圍），再啟動 `duduclaw mcp-server`。預設目錄（`DUDUCLAW_HOME`，否則 `$HOME/.duduclaw`）寫不進去時改用 `/tmp/duduclaw-home`，失敗時印出抹掉金鑰後的錯誤。2026-10-08 在本機 Docker 實測列出 24 個工具。
 - Glama 後台（👤，Admin → Dockerfile）若沒有自動用根目錄這個檔，把內容貼進去；建置成功後在 Releases 建一個 release，分數項目才會開始評。
+- 2026-10-15 的分數：license、quality、maintenance 皆 A；工具定義（TDQS）平均 3.6/5，24 個工具中 4 個 B。最低的是「使用時機」（說明沒寫何時改用相鄰工具）與「行為揭露」（沒有 annotations），其次是 Server Coherence 的工具數量 3/5（24 個偏多）。之後的版本補了 annotations、改寫說明並修正參數型別；Glama 的映像從 npm 裝最新版，所以要等含這些變更的版本發布到 npm、Glama 重新建置之後分數才會更新。
+- README 標籤：`[![Glama MCP server score](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw/badges/score.svg)](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw)`（三語 README 都已放上）。
 
 送件前若改過 `server.json`，可以先用官方 schema 驗證（例如 `python -m jsonschema` 或任何 JSON Schema 驗證器，schema 網址見檔案的 `$schema`）。Glama 與 awesome-mcp-servers 不讀這個檔案，收錄流程依各自網站（本 repo 未驗證）。
 

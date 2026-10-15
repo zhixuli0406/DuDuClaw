@@ -72,7 +72,7 @@ async fn scaffold_tools_list() -> Value {
 async fn scaffold_agent_tools_list_stays_within_budget() {
     let resp = scaffold_tools_list().await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    let bytes = serde_json::to_string(&resp["result"])
+    let bytes = serde_json::to_string(&prompt_visible(&resp["result"]))
         .expect("serialize")
         .len();
 
@@ -92,6 +92,22 @@ async fn scaffold_agent_tools_list_stays_within_budget() {
     );
 }
 
+/// The part of a `tools/list` result that reaches the model: each tool's
+/// `annotations` are dropped. Claude Code and Codex turn an MCP tool into a
+/// model tool from its name, description and input schema; the hints only
+/// steer the client's own confirmation prompts (`tools_def::annotations`).
+fn prompt_visible(result: &Value) -> Value {
+    let mut out = result.clone();
+    if let Some(tools) = out["tools"].as_array_mut() {
+        for t in tools {
+            if let Some(obj) = t.as_object_mut() {
+                obj.remove("annotations");
+            }
+        }
+    }
+    out
+}
+
 /// No single tool may carry more than [`TOOL_DESCRIPTION_MAX_BYTES`] of prose.
 #[test]
 fn every_tool_description_is_within_the_byte_cap() {
@@ -109,8 +125,9 @@ fn every_tool_description_is_within_the_byte_cap() {
 
 /// Parameter descriptions ride the same wire, so they carry the same cap.
 ///
-/// `build_tool_schema` types every parameter as a bare JSON-Schema string, so
-/// a parameter's *description* is the only place its real shape can be stated
+/// `build_tool_schema` types a parameter as a bare JSON-Schema string unless
+/// `PARAM_TYPES` names a scalar or string-array type for it, so for an object
+/// parameter the *description* is the only place its real shape can be stated
 /// — which is why exactly one entry is exempt below rather than being trimmed
 /// into uselessness.
 const PARAM_DESCRIPTION_MAX_BYTES: usize = 200;
