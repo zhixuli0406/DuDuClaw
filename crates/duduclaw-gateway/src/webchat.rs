@@ -1321,7 +1321,9 @@ async fn build_session_info_frame(
             ),
             None => (
                 "DuDuClaw".to_string(),
-                "🐾".to_string(),
+                // No agent ⇒ no agent icon. Empty lets the client draw its
+                // own product mark (the 🐾 glyph is no longer the logo).
+                String::new(),
                 String::new(),
                 // No agent ⇒ the reply path falls back to this same default
                 // (channel_reply), so display it instead of an empty label.

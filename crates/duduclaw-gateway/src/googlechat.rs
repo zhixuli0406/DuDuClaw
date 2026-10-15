@@ -338,7 +338,7 @@ async fn webhook_handler(
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
-                    "text": format!("🐾 {product} 已加入！直接傳訊息即可對話。")
+                    "text": format!("{product} 已加入！直接傳訊息即可對話。")
                 })),
             )
                 .into_response()

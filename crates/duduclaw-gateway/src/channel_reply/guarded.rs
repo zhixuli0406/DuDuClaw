@@ -235,7 +235,7 @@ pub async fn build_guarded_reply_with_session(
 
 /// Fixed product attribution on external messaging replies. Internal sessions,
 /// the dashboard console and deliberate silence remain unchanged.
-pub(super) const PRODUCT_FOOTER: &str = "— Powered by DuDuClaw 🐾";
+pub(super) const PRODUCT_FOOTER: &str = "— Powered by DuDuClaw";
 
 /// Session prefixes that reach end customers (external messaging platforms).
 pub(super) const FOOTER_CHANNELS: &[&str] = &[

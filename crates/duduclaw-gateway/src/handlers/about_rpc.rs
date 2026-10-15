@@ -12,7 +12,7 @@ impl MethodHandler {
                 "product_name": "DuDuClaw",
                 "vendor": {
                     "name_zh": "嘟嘟數位科技有限公司",
-                    "name_en": "DuDu Digital Technology Co., Ltd.",
+                    "name_en": "Dudu Technology Ltd.",
                     "url": "https://duduclaw.dudustudio.monster",
                 },
                 "version": env!("CARGO_PKG_VERSION"),

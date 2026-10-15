@@ -29,7 +29,7 @@ use crate::mcp_oauth;
 pub const GOOGLE_PROVIDER: &str = "google";
 
 /// Feature gate for the whole Google Workspace integration (tools + dashboard
-/// tab + OAuth provider listing). Hidden by default until DuDu Studio's own
+/// tab + OAuth provider listing). Hidden by default until Dudu Technology Ltd.'s own
 /// OAuth app clears Google verification; operators can opt in early via
 /// `config.toml [integrations] google_workspace = true`. Missing / unreadable
 /// config reads as disabled (fail closed).

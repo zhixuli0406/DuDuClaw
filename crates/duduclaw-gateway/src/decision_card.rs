@@ -426,13 +426,13 @@ mod tests {
     #[test]
     fn collapse_body_joins_summary_and_result() {
         let body = collapse_body(
-            "🐾 目標任務：整理客戶月報",
+            "🎯 目標任務：整理客戶月報",
             DecisionVerb::MarkedDone,
             Some("Alice"),
         );
         let lines: Vec<&str> = body.split("\n\n").collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "🐾 目標任務：整理客戶月報");
+        assert_eq!(lines[0], "🎯 目標任務：整理客戶月報");
         assert!(lines[1].starts_with("✅ 已標記完成"));
     }
 
