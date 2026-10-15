@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.73.4] - 2026-10-15 — DuDuClaw OS 閘道去 root 的平台端：sysd 加固、驗證過的更新、Podman 相容
+
 ### Changed
 - 為 DuDuClaw OS 的閘道去 root、容器改用 rootless Podman 預做平台端準備（OS 端尚未改，現有安裝在沒有設定 `DOCKER_HOST`／`CONTAINER_HOST` 時行為不變）：
   - Docker 可用性檢查改問 `docker version --format {{.Server.Version}}`。原本的 `docker info --format {{.ServerVersion}}` 在 Podman 5.8 會失敗，健康的 Podman 被當成無法使用；Docker 兩種都支援。
