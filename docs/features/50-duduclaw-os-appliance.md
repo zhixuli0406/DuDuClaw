@@ -129,7 +129,7 @@ gateway, not by the desktop.
   list.** Operations that need root privileges (reboot, shutdown, applying
   or rolling back an OS update, factory reset, network and time settings)
   are handled by a separate helper, `duduclaw-sysd`, that accepts exactly
-  15 fixed commands over a local Unix socket and checks the caller's user
+  17 fixed commands over a local Unix socket and checks the caller's user
   id before doing anything. If no allowed caller is configured, it refuses
   every request. On the current images the gateway itself still runs as
   root, and the helper is configured to accept root, so this split does

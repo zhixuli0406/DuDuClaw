@@ -12,6 +12,7 @@ pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod gateway_instance;
 pub mod config;
+pub mod container_engine;
 pub mod cron_tz;
 // H10 (2026-09 feature audit): the RFC-23 §14.4 data-file guard's decision
 // half, shared by `duduclaw hook data-file-guard` and the gateway installer.
@@ -241,15 +242,27 @@ pub fn set_internal_mcp_api_key(key: String) {
 /// History: each assembly point used to hand-roll its own subset; all of them
 /// missed `DUDUCLAW_MCP_API_KEY`, so every non-Claude runtime lost its MCP
 /// tool surface after the M6 fail-closed auth change (v1.31).
+///
+/// The names, in order, are [`MCP_FORWARD_ENV_NAMES`].
+pub const MCP_FORWARD_ENV_NAMES: [&str; 7] = [
+    "DUDUCLAW_HOME",
+    "DUDUCLAW_PORT",
+    "DUDUCLAW_INSTANCE",
+    ENV_MCP_API_KEY,
+    ENV_MCP_ALLOW_UNAUTHENTICATED,
+    // The container engine endpoint (`container_engine::ENDPOINT_ENV_VARS`):
+    // the script sandbox runs inside `mcp-server` and connects through
+    // bollard, which reads `DOCKER_HOST`. On DuDuClaw OS the engine is the
+    // gateway's rootless Podman socket. Not a secret; never on the AI CLI
+    // allowlist (it reaches only the MCP server's own env).
+    "DOCKER_HOST",
+    "CONTAINER_HOST",
+];
+
+/// The values of [`MCP_FORWARD_ENV_NAMES`] (see the doc above).
 pub fn mcp_forward_env_vars() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for var in [
-        "DUDUCLAW_HOME",
-        "DUDUCLAW_PORT",
-        "DUDUCLAW_INSTANCE",
-        ENV_MCP_API_KEY,
-        ENV_MCP_ALLOW_UNAUTHENTICATED,
-    ] {
+    for var in MCP_FORWARD_ENV_NAMES {
         if let Ok(v) = std::env::var(var) {
             if !v.trim().is_empty() {
                 out.push((var.to_string(), v));
@@ -1405,6 +1418,17 @@ mod mcp_forward_env_tests {
             vars.iter().any(|(k, v)| k == ENV_MCP_API_KEY && !v.trim().is_empty()),
             "override key missing from forward set: {vars:?}"
         );
+    }
+
+    /// The script sandbox (bollard inside `mcp-server`) must reach the same
+    /// container engine as the gateway; the endpoint names never join the
+    /// AI CLI allowlist.
+    #[test]
+    fn forward_env_names_carry_the_container_endpoint() {
+        for name in crate::container_engine::ENDPOINT_ENV_VARS {
+            assert!(MCP_FORWARD_ENV_NAMES.contains(&name), "{name}");
+            assert!(!crate::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&name), "{name}");
+        }
     }
 }
 

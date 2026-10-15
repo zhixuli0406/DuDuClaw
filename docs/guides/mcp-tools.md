@@ -321,6 +321,20 @@ Paths are relative, at most 4 levels, letters, digits, inner spaces and
 the path or the content. Settings, the lease, operator commands and known
 limitations: [Computer-use workspaces](computer-workspaces.md).
 
+### `os_*` — device operations on DuDuClaw OS
+
+The `os_*` tools that need root (power, update status, the update install that sysd re-verifies, boot
+assessment, rollback, factory reset) keep every check they had in the MCP
+server (Admin scope, `[permissions]`, the confirmation, the factory-reset
+approval) and then send the request to the gateway over loopback
+(`POST /api/internal/sysd`, signed per request like the `computer_*` route).
+The gateway forwards it to `duduclaw-sysd` with its own connection, so the
+tools work when sysd answers only the gateway process. The route accepts only
+those verbs; SSH, network, hostname, timezone and local-model operations are
+refused there. When the gateway is not running, or the MCP server was not
+started by the gateway (no employee identity), the tool fails with a reason;
+it never talks to sysd directly. Off DuDuClaw OS nothing changes.
+
 ### `belief_stats` / `belief_settle` — verified and self-reported settlements
 
 Only a settlement cross-checked against a platform price counts toward

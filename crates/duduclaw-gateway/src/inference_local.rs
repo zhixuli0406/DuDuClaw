@@ -423,7 +423,7 @@ pub async fn serve(
 /// `inference.local.stop` — stop the local model service. Same honesty
 /// contract as [`serve`]: off-appliance it reports `stopped: false`.
 pub async fn stop() -> serde_json::Value {
-    let (stopped, detail) = run_unit_action("stop").await;
+    let (stopped, detail) = run_unit_action(duduclaw_sysd::LocalModelAction::Stop).await;
     // The backend just went away: drop the gateway's cached engine so the
     // next local call re-probes instead of talking to a dead port.
     crate::claude_runner::reset_inference_engine().await;
@@ -451,40 +451,56 @@ async fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
 /// so a model served for the first time is picked up by the next local
 /// call without a gateway restart.
 async fn restart_unit() -> (bool, String) {
-    let result = run_unit_action("restart").await;
+    let result = run_unit_action(duduclaw_sysd::LocalModelAction::Restart).await;
     crate::claude_runner::reset_inference_engine().await;
     result
 }
 
-/// Shell out to the service manager. Returns `(acted, human-readable
-/// detail)`. Refuses off-appliance rather than shelling out on a
-/// developer's laptop.
-async fn run_unit_action(action: &str) -> (bool, String) {
+/// Ask the service manager to act on the local model service. Returns
+/// `(acted, human-readable detail)`. Refuses off-appliance rather than
+/// touching a developer's laptop.
+///
+/// On the appliance the gateway runs unprivileged, so the action goes
+/// through the root `duduclaw-sysd` daemon's `LocalModelService` verb (a
+/// closed stop/restart enum on a fixed unit). When sysd is unreachable the
+/// answer is "not available"; it never falls back to calling `systemctl`
+/// directly.
+async fn run_unit_action(action: duduclaw_sysd::LocalModelAction) -> (bool, String) {
     if !appliance::appliance_defaults_active() {
         return (
             false,
             "此主機不是 DuDuClaw OS 裝置，只寫入設定檔、未啟動本地模型服務".to_string(),
         );
     }
-    let out = tokio::process::Command::new("systemctl")
-        .arg(action)
-        .arg(appliance::LLAMA_SERVER_UNIT)
-        .output()
-        .await;
-    // The service manager's own stderr names unit files and system paths.
-    // It goes to the log for an operator to read; the `detail` a person
-    // sees stays in product vocabulary (same bar the dashboard's
-    // `technical-terms` i18n guard enforces on the front end).
-    match out {
-        Ok(o) if o.status.success() => (true, String::new()),
+    let Some(ops) = crate::device_ops::select_sysd_ops() else {
+        warn!(action = action.systemctl_verb(), "local model service: system service socket missing");
+        return (false, SYSD_UNAVAILABLE_DETAIL.to_string());
+    };
+    unit_action_outcome(action, ops.local_model_service(action).await)
+}
+
+/// Shown when the root system service cannot be reached.
+const SYSD_UNAVAILABLE_DETAIL: &str = "裝置的系統服務沒有回應，目前無法控制本地模型服務，請稍後再試";
+
+/// Map the sysd answer to `(acted, detail)`. The service manager's own
+/// stderr names unit files and system paths: it goes to the log for an
+/// operator to read; the `detail` a person sees stays in product vocabulary
+/// (same bar the dashboard's `technical-terms` i18n guard enforces on the
+/// front end).
+fn unit_action_outcome(
+    action: duduclaw_sysd::LocalModelAction,
+    result: crate::device_ops::OpResult,
+) -> (bool, String) {
+    let action = action.systemctl_verb();
+    match result {
+        Ok(o) if o.success => (true, String::new()),
         Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            warn!(action, stderr = %err, "local model service action failed");
+            warn!(action, stderr = %o.stderr.trim(), "local model service action failed");
             (false, "本地模型服務沒有回應，請稍後再試一次".to_string())
         }
         Err(e) => {
-            warn!(action, error = %e, "could not invoke the service manager");
-            (false, "這台裝置上無法控制本地模型服務".to_string())
+            warn!(action, error = %e, "local model service: system service call failed");
+            (false, SYSD_UNAVAILABLE_DETAIL.to_string())
         }
     }
 }
@@ -748,6 +764,35 @@ mod tests {
         assert!(body.contains(&models.join("a.gguf").display().to_string()));
         // No temp file left behind.
         assert!(!dir.path().join("llama-server.env.tmp").exists());
+    }
+
+    #[test]
+    fn unit_action_outcome_reports_sysd_failures_honestly() {
+        use crate::device_ops::{DeviceOpError, OpOutput};
+        use duduclaw_sysd::LocalModelAction;
+        let ok = OpOutput { success: true, stdout: String::new(), stderr: String::new() };
+        assert_eq!(unit_action_outcome(LocalModelAction::Restart, Ok(ok)), (true, String::new()));
+        let failed = OpOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Failed to restart duduclaw-llama-server.service".into(),
+        };
+        let (acted, detail) = unit_action_outcome(LocalModelAction::Restart, Ok(failed));
+        assert!(!acted);
+        assert!(!detail.contains(".service"), "no unit names in the person-facing text: {detail}");
+        let (acted, detail) =
+            unit_action_outcome(LocalModelAction::Stop, Err(DeviceOpError::Unsupported("connect refused".into())));
+        assert!(!acted);
+        assert_eq!(detail, SYSD_UNAVAILABLE_DETAIL);
+    }
+
+    /// P5: the appliance path never spawns `systemctl` itself.
+    #[test]
+    fn the_gateway_never_runs_the_service_manager_directly() {
+        let source = include_str!("inference_local.rs");
+        let needle = format!("Command::new({q}systemctl{q})", q = '"');
+        assert!(!source.contains(&needle));
+        assert_eq!(duduclaw_sysd::LOCAL_MODEL_UNIT, appliance::LLAMA_SERVER_UNIT, "one unit name");
     }
 
     #[tokio::test(flavor = "current_thread")]

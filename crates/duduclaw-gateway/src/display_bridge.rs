@@ -92,12 +92,23 @@ const MAX_RESPONSE_LINE_BYTES: usize = 4096;
 /// generous headroom over "instant", not a real operation timeout.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn kiosk_socket_path() -> PathBuf {
+pub(crate) fn kiosk_socket_path() -> PathBuf {
     Path::new(KIOSK_RUNTIME_DIR).join(SOCKET_FILE_NAME)
 }
 
 #[cfg(unix)]
 async fn call_at(path: &Path, req: Value) -> Result<Value, String> {
+    let resp = call_raw_at(path, req, MAX_RESPONSE_LINE_BYTES).await?;
+    map_error_reply(resp)
+}
+
+/// One request/response exchange with comp's shell_control socket. `Err`
+/// only for transport problems (missing socket, timeout, oversize or
+/// non-JSON reply); a reply with `"ok": false` is returned as is, so a
+/// caller can tell comp's own error codes apart (the audio bridge treats
+/// `parse_error` from an older comp as "this op does not exist there").
+#[cfg(unix)]
+pub(crate) async fn call_raw_at(path: &Path, req: Value, max_reply_bytes: usize) -> Result<Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -123,7 +134,9 @@ async fn call_at(path: &Path, req: Value) -> Result<Value, String> {
 
     let mut buf = String::new();
     let bytes_read = {
-        let mut reader = BufReader::new(&mut stream);
+        use tokio::io::AsyncReadExt;
+        // Bounded read: never buffer more than the cap (plus the newline).
+        let mut reader = BufReader::new((&mut stream).take(max_reply_bytes as u64 + 2));
         tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut buf))
             .await
             .map_err(|_| "等待 shell socket 回應逾時。".to_string())?
@@ -135,19 +148,23 @@ async fn call_at(path: &Path, req: Value) -> Result<Value, String> {
     }
     // Defense-in-depth: a well-behaved server never sends a line anywhere
     // near this size — same bound the server enforces on OUR request.
-    if buf.len() > MAX_RESPONSE_LINE_BYTES {
+    if buf.len() > max_reply_bytes {
         return Err(format!(
-            "shell socket 回應超過 {MAX_RESPONSE_LINE_BYTES} bytes 上限，已拒絕解析。"
+            "shell socket 回應超過 {max_reply_bytes} bytes 上限，已拒絕解析。"
         ));
     }
 
-    let resp: Value = serde_json::from_str(buf.trim()).map_err(|e| {
+    serde_json::from_str(buf.trim()).map_err(|e| {
         format!(
             "shell socket 回應不是合法 JSON：{e}（原始內容：{}）",
-            buf.trim()
+            duduclaw_core::truncate_chars(buf.trim(), 300)
         )
-    })?;
+    })
+}
 
+/// Turn an `"ok": false` reply into this module's readable error.
+#[cfg(unix)]
+fn map_error_reply(resp: Value) -> Result<Value, String> {
     if resp.get("ok").and_then(Value::as_bool) == Some(false) {
         let err = resp
             .get("error")

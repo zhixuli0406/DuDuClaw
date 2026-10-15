@@ -5,7 +5,15 @@
 //! module's doc before this one — everything below is either "same shape,
 //! restated for audio" or an explicit, justified divergence.
 //!
-//! ## Why this does NOT touch `duduclaw-comp` at all
+//! ## 2026-10: on the appliance this now goes through `duduclaw-comp`
+//! The rootless gateway may not reach PipeWire (the kiosk socket is 0600
+//! again: any PipeWire client can record the microphone). Volume, mute and
+//! output selection use comp's `get_audio` / `set_audio` /
+//! `set_audio_output` shell_control verbs (see "comp's audio verbs" below);
+//! the direct `wpctl` path described next is kept only for an older comp
+//! that answers `parse_error` to those ops, and off the appliance.
+//!
+//! ## History: why this first bypassed `duduclaw-comp`
 //! A7c's display group had to fix a boundary INSIDE the compositor
 //! (`shell_control::listener::classify_peer`'s new `PeerAuthority::Agent`
 //! tier) because cursor/theme/output-scale are compositor-owned state, only
@@ -324,15 +332,136 @@ fn parse_sink_entry(content: &str) -> Option<AudioOutput> {
     })
 }
 
+// ── comp's audio verbs (rootless gateway, 2026-10) ─────────────────────────
+//
+// The gateway no longer reaches PipeWire itself: the kiosk session's PipeWire
+// socket is back to 0600, because any client of it may record the microphone
+// and attach to screen streams, and the gateway's uid is shared with the AI
+// employees. On the appliance, volume, mute and output selection go through
+// comp (running as the kiosk user) over the shell_control socket:
+// `get_audio`, `set_audio {volume_pct | muted}`, `set_audio_output {id}`.
+// `get_audio`'s `audio.status` is raw `wpctl status` text, parsed with the
+// same [`parse_sinks`]. An older comp does not know these ops and answers
+// `parse_error` to a well-formed request; only that answer falls back to the
+// direct `wpctl` path below (older images, whose PipeWire socket still lets
+// the gateway in). Any other failure is reported, never papered over.
+
+/// Largest reply accepted for an audio verb (`wpctl status` is capped at
+/// 64 KiB by comp; JSON escaping can grow it).
+const MAX_AUDIO_REPLY_BYTES: usize = 256 * 1024;
+
+/// What comp's `audio` block reported.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CompAudio {
+    volume_pct: Option<u8>,
+    muted: Option<bool>,
+    status: Option<String>,
+}
+
+/// The outcome of one comp audio call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompReply {
+    Audio(CompAudio),
+    /// The comp on this image predates the audio verbs.
+    Unsupported,
+}
+
+fn get_audio_request() -> Value {
+    json!({ "op": "get_audio" })
+}
+
+fn set_volume_request(pct: u8) -> Value {
+    json!({ "op": "set_audio", "params": { "volume_pct": pct.min(100) } })
+}
+
+fn set_mute_request(muted: bool) -> Value {
+    json!({ "op": "set_audio", "params": { "muted": muted } })
+}
+
+fn set_output_request(id: u32) -> Value {
+    json!({ "op": "set_audio_output", "params": { "id": id } })
+}
+
+/// Map comp's reply. `parse_error` to one of our own well-formed requests
+/// is how an older comp says it has no such op.
+fn map_comp_reply(resp: &Value) -> Result<CompReply, String> {
+    if resp.get("ok").and_then(Value::as_bool) != Some(true) {
+        let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
+        return match err {
+            "parse_error" => Ok(CompReply::Unsupported),
+            "unauthorized" | "forbidden_for_agent" => {
+                Err(format!("殼程式拒絕音量操作（{err}）：gateway 的身分未被 comp 接受"))
+            }
+            other => Err(format!("殼程式無法完成音量操作：{other}")),
+        };
+    }
+    let audio = resp.get("audio").ok_or("殼程式的回應缺少 audio 欄位")?;
+    Ok(CompReply::Audio(CompAudio {
+        volume_pct: audio
+            .get("volume_pct")
+            .and_then(Value::as_i64)
+            .map(|v| v.clamp(0, 100) as u8),
+        muted: audio.get("muted").and_then(Value::as_bool),
+        status: audio.get("status").and_then(Value::as_str).map(str::to_string),
+    }))
+}
+
+fn volume_of(audio: &CompAudio) -> Result<(u8, bool), String> {
+    match (audio.volume_pct, audio.muted) {
+        (Some(v), Some(m)) => Ok((v, m)),
+        _ => Err("殼程式的回應缺少音量或靜音狀態".to_string()),
+    }
+}
+
+fn outputs_of(audio: &CompAudio) -> Result<Vec<AudioOutput>, String> {
+    audio
+        .status
+        .as_deref()
+        .map(parse_sinks)
+        .ok_or_else(|| "殼程式的回應缺少輸出裝置清單".to_string())
+}
+
+/// Ask comp, on the appliance only. `Ok(None)` means "use the direct
+/// `wpctl` path" (off the appliance, or an older comp).
+async fn comp(req: Value) -> Result<Option<CompAudio>, String> {
+    if !duduclaw_core::is_appliance() {
+        return Ok(None);
+    }
+    comp_at(&crate::display_bridge::kiosk_socket_path(), req).await
+}
+
+#[cfg(unix)]
+async fn comp_at(path: &std::path::Path, req: Value) -> Result<Option<CompAudio>, String> {
+    let resp = crate::display_bridge::call_raw_at(path, req, MAX_AUDIO_REPLY_BYTES).await?;
+    match map_comp_reply(&resp)? {
+        CompReply::Audio(audio) => Ok(Some(audio)),
+        CompReply::Unsupported => {
+            tracing::info!("audio_bridge: comp has no audio verbs (older image); using wpctl directly");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn comp_at(_path: &std::path::Path, _req: Value) -> Result<Option<CompAudio>, String> {
+    Ok(None)
+}
+
 // ── Granular ops (mirror `duduclaw-shell::audio::AudioBackend`'s verbs) ────
 
 async fn get_volume() -> Result<(u8, bool), String> {
+    if let Some(audio) = comp(get_audio_request()).await? {
+        return volume_of(&audio);
+    }
     let raw = run_wpctl(&["get-volume", DEFAULT_SINK]).await?;
     parse_volume(&raw).ok_or_else(|| format!("unparsable wpctl get-volume output: {raw:?}"))
 }
 
 async fn set_volume(pct: u8) -> Result<(u8, bool), String> {
     let clamped = pct.min(100);
+    if let Some(audio) = comp(set_volume_request(clamped)).await? {
+        return volume_of(&audio);
+    }
     let arg = format!("{clamped}%");
     run_wpctl(&["set-volume", DEFAULT_SINK, &arg]).await?;
     get_volume().await
@@ -346,11 +475,22 @@ async fn set_volume(pct: u8) -> Result<(u8, bool), String> {
 /// the current state differs from what it wants — the same "read, then act"
 /// dialogue shape the A7c display flow already establishes.
 async fn toggle_mute() -> Result<(u8, bool), String> {
+    // comp has an explicit mute value, not a toggle: read, then write the
+    // opposite.
+    if let Some(current) = comp(get_audio_request()).await? {
+        let (_, muted) = volume_of(&current)?;
+        if let Some(audio) = comp(set_mute_request(!muted)).await? {
+            return volume_of(&audio);
+        }
+    }
     run_wpctl(&["set-mute", DEFAULT_SINK, "toggle"]).await?;
     get_volume().await
 }
 
 async fn list_outputs() -> Result<Vec<AudioOutput>, String> {
+    if let Some(audio) = comp(get_audio_request()).await? {
+        return outputs_of(&audio);
+    }
     let raw = run_wpctl(&["status"]).await?;
     Ok(parse_sinks(&raw))
 }
@@ -360,6 +500,9 @@ async fn list_outputs() -> Result<Vec<AudioOutput>, String> {
 /// discipline `duduclaw-shell::audio::wpctl::WpctlAudioBackend::
 /// set_default_output`'s own doc comment documents.
 async fn set_default_output(id: u32) -> Result<Vec<AudioOutput>, String> {
+    if let Some(audio) = comp(set_output_request(id)).await? {
+        return outputs_of(&audio);
+    }
     let arg = id.to_string();
     run_wpctl(&["set-default", &arg]).await?;
     list_outputs().await
@@ -690,5 +833,76 @@ Video
     async fn audio_set_rejects_a_non_integer_output_id_before_touching_any_subprocess() {
         let err = audio_set("output", "speakers").await.unwrap_err();
         assert!(err.contains("output"), "unexpected: {err}");
+    }
+
+    // ── comp's audio verbs (rootless gateway) ────────────────────────────
+
+    #[test]
+    fn comp_requests_match_the_shell_control_wire_shape() {
+        assert_eq!(get_audio_request(), json!({"op": "get_audio"}));
+        assert_eq!(set_volume_request(40), json!({"op": "set_audio", "params": {"volume_pct": 40}}));
+        assert_eq!(set_volume_request(250), json!({"op": "set_audio", "params": {"volume_pct": 100}}));
+        assert_eq!(set_mute_request(true), json!({"op": "set_audio", "params": {"muted": true}}));
+        assert_eq!(set_output_request(52), json!({"op": "set_audio_output", "params": {"id": 52}}));
+    }
+
+    #[test]
+    fn comp_replies_map_to_volume_and_outputs() {
+        let reply = json!({"ok": true, "audio": {"volume_pct": 45, "muted": true, "status": STATUS_SAMPLE}});
+        let CompReply::Audio(audio) = map_comp_reply(&reply).unwrap() else { panic!("expected audio") };
+        assert_eq!(volume_of(&audio), Ok((45, true)));
+        let outputs = outputs_of(&audio).unwrap();
+        assert_eq!(outputs.iter().map(|o| o.id).collect::<Vec<_>>(), vec![50, 53]);
+        // A setter that reports only the volume has no output list.
+        let reply = json!({"ok": true, "audio": {"volume_pct": 120, "muted": false}});
+        let CompReply::Audio(audio) = map_comp_reply(&reply).unwrap() else { panic!() };
+        assert_eq!(volume_of(&audio), Ok((100, false)));
+        assert!(outputs_of(&audio).is_err());
+        assert!(map_comp_reply(&json!({"ok": true})).is_err(), "no audio block");
+    }
+
+    #[test]
+    fn only_parse_error_means_an_older_comp() {
+        assert_eq!(map_comp_reply(&json!({"ok": false, "error": "parse_error"})), Ok(CompReply::Unsupported));
+        for err in ["wpctl_failed", "wpctl_timeout", "unauthorized", "forbidden_for_agent", "timeout"] {
+            assert!(map_comp_reply(&json!({"ok": false, "error": err})).is_err(), "{err}");
+        }
+        assert!(map_comp_reply(&json!({"ok": false})).is_err());
+    }
+
+    /// End to end against a stub comp: a reply over 4 KiB (a real `wpctl
+    /// status`) is accepted, and an older comp's `parse_error` selects the
+    /// fallback.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn comp_calls_round_trip_against_a_stub_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        async fn serve_once(path: std::path::PathBuf, reply: Value) -> tokio::task::JoinHandle<Value> {
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = String::new();
+                BufReader::new(&mut stream).read_line(&mut buf).await.unwrap();
+                let mut line = serde_json::to_string(&reply).unwrap();
+                line.push('\n');
+                stream.write_all(line.as_bytes()).await.unwrap();
+                serde_json::from_str(buf.trim()).unwrap()
+            })
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let big_status = format!("{STATUS_SAMPLE}{}", " ".repeat(8 * 1024));
+        let path = dir.path().join("a.sock");
+        let seen = serve_once(path.clone(), json!({"ok": true, "audio": {"volume_pct": 30, "muted": false, "status": big_status}})).await;
+        let audio = comp_at(&path, get_audio_request()).await.unwrap().unwrap();
+        assert_eq!(volume_of(&audio), Ok((30, false)));
+        assert_eq!(seen.await.unwrap(), get_audio_request());
+
+        let path = dir.path().join("b.sock");
+        let _ = serve_once(path.clone(), json!({"ok": false, "error": "parse_error"})).await;
+        assert_eq!(comp_at(&path, get_audio_request()).await, Ok(None), "older comp: fall back");
+
+        let path = dir.path().join("c.sock");
+        let _ = serve_once(path.clone(), json!({"ok": false, "error": "wpctl_failed"})).await;
+        assert!(comp_at(&path, get_audio_request()).await.is_err(), "a real failure is not a fallback");
     }
 }

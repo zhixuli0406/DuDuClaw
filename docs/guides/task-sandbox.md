@@ -127,7 +127,7 @@ If the AI uses a tool outside the allowed file and shell set, the task is stoppe
 
 ## When the sandbox cannot run
 
-With `sandbox_enabled = true`, a task fails (it does not run unsandboxed) when any of these holds: Docker is unreachable, the image is missing, the gateway runs as root, the host is not a unix system, the configuration is invalid, `network_access = false`, no usable account exists, or the runtime is not supported. Each failure writes the audit event `task_sandbox_unavailable` with a reason code and returns a readable error.
+With `sandbox_enabled = true`, a task fails (it does not run unsandboxed) when any of these holds: Docker is unreachable, the image is missing, the container engine runs rootless and does not enforce the memory and process limits (checked once per gateway process with a tiny probe container; rootful Docker is not probed), the gateway runs as root, the host is not a unix system, the configuration is invalid, `network_access = false`, no usable account exists, or the runtime is not supported. Each failure writes the audit event `task_sandbox_unavailable` with a reason code and returns a readable error.
 
 Escape hatch: set `when_unavailable = "run_unsandboxed"` in `config.toml [container.sandbox]`. Tasks then run on the host without isolation, as older versions did, and every such task writes the audit event `task_sandbox_bypassed`. Use it only when you accept running without isolation.
 
@@ -157,7 +157,8 @@ A failed sandbox task replies to whoever delegated it. When the sandbox refused 
 | What you see | Cause | Fix |
 |---|---|---|
 | `(docker_unreachable)` | The Docker daemon is not running or the gateway user cannot use it. | Start Docker; check that the gateway user can run `docker version`. |
-| `(image_missing)` | The image is not on this machine. | Run the `docker pull <image>` command shown in the error, or point `image` at an image you already have. |
+| `(image_missing)` | The image is not on this machine. | Run the `docker pull <image>` command shown in the error, or point `image` at an image you already have. On DuDuClaw OS the gateway uses its own rootless image store: run the pull with the gateway's `CONTAINER_HOST`, otherwise the image lands in root's store, which the gateway does not see. |
+| `(resource_limits_unenforced)` | The container engine runs rootless and ignores `--memory` / `--pids-limit` (its cgroup controllers are not delegated to it), reports other limits than requested, or the check container did not finish. | On DuDuClaw OS this is an image problem (the container service unit needs cgroup delegation); report it. Elsewhere, delegate the memory and pids controllers to the rootless engine's user. The sandbox never runs without its limits. |
 | `(network_disabled)` | The agent has `network_access = false`. | Set `network_access = true` in the agent's `[container]`. |
 | `(root_user)` | The gateway runs as uid 0. | Run the gateway as a normal user. |
 | `(unsupported_platform)` | The host is not a unix system (for example Windows). | Run the gateway on Linux or macOS. |

@@ -10,7 +10,7 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape that crate's protocol used)
-//! — the entire caller-reachable surface is thirteen fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is eighteen fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
@@ -63,9 +63,90 @@
 //!   base directory (see `dispatch::dispatch_clear_exhausted_update_target`
 //!   for the H3d §11.7 bug this closes).
 //!
+//! - [`SysdRequest::LocalModelService`] `{ action }` and
+//!   [`SysdRequest::FactoryResetV2`] `{ clear_network }` use the
+//!   [`SysdRequest::SetNtp`] discipline (a bool or a closed enum selects a
+//!   literal). For `LocalModelService`: `action` is a closed
+//!   [`LocalModelAction`] enum (`stop` / `restart`; anything else fails to
+//!   parse), each variant selects one `&'static str` systemctl verb, and the
+//!   unit is the fixed literal [`LOCAL_MODEL_UNIT`]. No caller text reaches
+//!   argv.
+//!
 //! An unrecognized `verb` string, or any malformed JSON, fails
 //! `serde_json::from_str` and the server responds with a structured
 //! `bad_request` error — never a panic, never a silent no-op.
+//!
+//! ## Who the caller is (threat model)
+//!
+//! The server accepts exactly one peer uid. Once the OS runs the gateway
+//! unprivileged and points `--allowed-uid` at it, that uid is the same one
+//! the AI employees' CLIs run as, so a uid check alone admits any agent
+//! process, which can open the socket directly and bypass every gateway-side
+//! approval. Two consequences:
+//!
+//! 1. **The caller must be authenticated as the gateway process itself.**
+//!    `--require-main-pid-of <unit>` (see `server.rs`) additionally requires
+//!    the peer to be that unit's main process, proven through a pidfd so a
+//!    pid reused after a gateway restart cannot pass: the peer's pidfd
+//!    (`SO_PEERPIDFD`, Linux 6.5+), the pid it pins, the unit's `MainPID`
+//!    read afterwards, the process's own cgroup being the unit's, and the
+//!    pidfd still pinning that live process at the end. At most four
+//!    verifications run at once and the `systemctl` lookup is bounded to
+//!    two seconds; anything that fails or is unavailable denies, and on
+//!    non-Linux hosts the flag denies every call. It
+//!    is opt-in so older OS images keep working, and the OS must turn it on
+//!    together with the non-root gateway. It holds only while (a) yama
+//!    `kernel.yama.ptrace_scope >= 1`, so the agent processes, which are the
+//!    gateway's descendants and share its uid, cannot ptrace the gateway and
+//!    speak with its pid, and (b) the gateway never hands a connected sysd
+//!    socket to a child: the client opens one connection per call and drops
+//!    it when the call returns, and Rust std / tokio create every socket with
+//!    `SOCK_CLOEXEC`, so a spawned CLI does not inherit it. The `os_*` MCP
+//!    tools run in a separate `duduclaw mcp-server` process and therefore
+//!    reach sysd through the gateway's signed loopback route
+//!    (`duduclaw_gateway::sysd_route`, a closed verb subset), never this
+//!    socket.
+//! 2. **Every request is still treated as attacker-controlled.** The parameterised verbs are built for that: closed
+//! enums or bools for choices, length and character whitelists for strings
+//! (`Hostname`, `SetTimezone`, `NetworkWiredConfig`'s `interface`,
+//! `ClearExhaustedUpdateTarget`), typed re-serialisation for file content,
+//! fixed write targets, and no path ever joined from caller text (the one
+//! file a caller string selects, the timezone, is resolved inside
+//! `/usr/share/zoneinfo` and must be a regular file there).
+//!
+//! The verbs without a free-form value (the fieldless ones, plus
+//! `LocalModelService` and `FactoryResetV2`, whose single field selects a
+//! literal) carry nothing to inject, but a caller that passes the gates can
+//! still trigger them, and two of them are not mere availability:
+//! [`SysdRequest::UpdateRollback`] boots the previous A/B slot, which after
+//! the first non-root upgrade is the old image whose gateway (and so the
+//! agents) still ran as root; [`SysdRequest::SshServiceStart`] opens a
+//! network service. The others (reboot, power off, update apply, factory
+//! reset, clearing Wi-Fi, stopping the model service) cost availability or
+//! data, not privilege — except [`SysdRequest::SysupdateApply`] on an image
+//! whose sysupdate source is the gateway's writable download directory (see
+//! that verb); [`SysdRequest::SysupdateStageApply`] is the verb that keeps
+//! the trust decision on the root side. The main-pid gate above keeps an agent from calling
+//! sysd directly, but it does not make the agent harmless: an AI employee
+//! with a shell runs as the gateway's uid, can read the gateway's keys and
+//! so forge any request the gateway makes (its signed internal routes, a
+//! dashboard session). The non-root gateway keeps such an agent from root,
+//! not from the gateway's own powers; the rule that real containment means
+//! not granting Bash, or using the task sandbox, still applies.
+//!
+//! Therefore the guard against a root-regaining rollback does not look at
+//! the caller at all: `--min-rollback-version` (`rollback_floor.rs`) makes
+//! `UpdateRollback` refuse when any entry it could boot is older than the
+//! first release with an unprivileged gateway, or its version cannot be read
+//! from the entry's own unified kernel image. `SysupdateStageApply` applies
+//! the same floor, and requires a strictly newer version, to what it
+//! installs, reading the version from the staged UKI after verifying the
+//! release signature itself; `ClearExhaustedUpdateTarget` only deletes an
+//! exhausted, non-running entry. Residual, outside sysd:
+//! sd-boot's own boot counting falls back to the other entry when a new one
+//! fails to start three times before it is blessed, and boots an exhausted
+//! entry when nothing else works; the OS should delete entries below the
+//! floor once a rootless release has booted successfully.
 
 use serde::{Deserialize, Serialize};
 
@@ -104,12 +185,10 @@ pub fn resolve_socket_path() -> std::path::PathBuf {
 /// not a limit that legitimate traffic could ever approach.
 pub const MAX_REQUEST_LINE_BYTES: usize = 4096;
 
-/// Maximum accepted length of a `Hostname { set }` value. RFC 1123 caps a
-/// full hostname at 253 chars; this is intentionally generous relative to
-/// that so a legitimate value is never rejected, while still refusing an
-/// obviously-wrong multi-kilobyte payload before it ever reaches
-/// `Command::arg()`.
-pub const MAX_HOSTNAME_LEN: usize = 253;
+/// Maximum accepted length of a `Hostname { set }` value: 64, the limit
+/// `systemd-hostnamed` enforces for the static host name (`HOST_NAME_MAX`),
+/// so a value that passes here is one `hostnamectl` can actually set.
+pub const MAX_HOSTNAME_LEN: usize = 64;
 
 /// Maximum accepted length (bytes) of a `SetTimezone { timezone }` value.
 /// IANA tz database identifiers (e.g. `"America/Argentina/Buenos_Aires"`,
@@ -157,6 +236,46 @@ pub const SSH_UNITS: [SshUnit; 2] = [
 /// port in the OS firewall.
 pub const SSH_PORT: u16 = 22;
 
+/// The gateway's data directory on the appliance (`DUDUCLAW_HOME`, both OS
+/// lines: `duduclaw-gateway.service` sets `Environment=DUDUCLAW_HOME=
+/// /data/duduclaw`). [`SysdRequest::FactoryReset`] wipes its contents on the
+/// root side: once the gateway runs rootless, files written through its
+/// container engine can belong to subordinate uids the gateway itself cannot
+/// delete. A closed constant, never a caller-supplied path.
+pub const GATEWAY_HOME_DIR: &str = "/data/duduclaw";
+
+/// Marker [`SysdRequest::FactoryResetV2`] writes to defer the wipe to the
+/// next boot (see that verb for the contract).
+pub const FACTORY_RESET_MARKER: &str = "/data/system/factory-reset.pending";
+
+/// The OS oneshot that consumes [`FACTORY_RESET_MARKER`]. Its unit file
+/// existing selects the deferred path.
+pub const FACTORY_RESET_UNIT_FILE: &str = "/usr/lib/systemd/system/duduclaw-factory-reset.service";
+
+/// The local model service unit ([`SysdRequest::LocalModelService`]). Must
+/// match `duduclaw_inference::appliance::LLAMA_SERVER_UNIT` and the image
+/// recipe.
+pub const LOCAL_MODEL_UNIT: &str = "duduclaw-llama-server.service";
+
+/// What [`SysdRequest::LocalModelService`] does to [`LOCAL_MODEL_UNIT`]. A
+/// closed set: anything else fails to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalModelAction {
+    Stop,
+    Restart,
+}
+
+impl LocalModelAction {
+    /// The `systemctl` verb, a literal.
+    pub fn systemctl_verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
 /// The closed verb set. See module docs for the "why no free-form
 /// command" reasoning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,8 +287,31 @@ pub enum SysdRequest {
     Poweroff,
     /// `systemd-sysupdate list --json=short`.
     SysupdateStatus,
-    /// `systemd-sysupdate update`.
+    /// `systemd-sysupdate update`, installing whatever the image's
+    /// transfers find in their source directory. On images whose transfers
+    /// read the gateway's own download directory this is **not** merely an
+    /// availability verb: sysupdate's `regular-file` source does no
+    /// authentication, so a caller able to write that directory (on DuDuClaw
+    /// OS, any process of the gateway's user) gets an arbitrary root image
+    /// installed. Images that point their transfers at
+    /// `staged_update::DEST_DIR` (root-only, empty between calls) make it
+    /// harmless; use [`SysdRequest::SysupdateStageApply`] there. Refused
+    /// outright when `--min-rollback-version` is set (a non-root-gateway
+    /// image), and serialised with the other update verbs.
     SysupdateApply,
+    /// Verify and stage an OS update as root, then install it
+    /// (`staged_update.rs`): the signed manifest in the gateway's download
+    /// directory is checked against the OS image key compiled into sysd, the
+    /// listed payloads are hash-checked while being copied into the
+    /// root-only staging directory (the UKI variant bound to the destination
+    /// slot only), the staged image must be newer than the running one and
+    /// at least `--min-rollback-version`, and only then does
+    /// `systemd-sysupdate update` run. All checks run in a private sibling
+    /// directory that is renamed into place only afterwards; the source
+    /// directory is opened `O_DIRECTORY|O_NOFOLLOW` and read with `openat`.
+    /// One update operation at a time (stage/apply/rollback/clear): a second
+    /// is refused as `busy`. Fieldless: every path is a constant.
+    SysupdateStageApply,
     /// `/usr/lib/systemd/systemd-bless-boot status` — reports
     /// `good` / `bad` / `indeterminate` / `clean`. Read-only: it never
     /// renames anything and never reboots, so the dashboard can ask "is a
@@ -189,16 +331,18 @@ pub enum SysdRequest {
     /// until this verb did. See `dispatch::dispatch_update_rollback` for the
     /// two tiers and why the second one is needed.
     UpdateRollback,
-    /// Wipe the `duduclaw-kiosk` service user's home directory
+    /// Wipe the contents of the gateway's data directory
+    /// ([`GATEWAY_HOME_DIR`]; a failure aborts before anything else, no
+    /// reboot), then the `duduclaw-kiosk` service user's home directory
     /// (`/data/duduclaw-kiosk`, best-effort), re-arm first-boot provisioning
     /// (`systemctl enable duduclaw-firstboot-provision.service`,
     /// best-effort) then `systemctl reboot`. Deliberately carries no
-    /// path/param — wiping the GATEWAY's data directory does not need root
-    /// (the `duduclaw` user already owns it) and stays a caller-side
-    /// filesystem operation, but wiping `/data/duduclaw-kiosk` DOES need
-    /// root: it is owned by the *different* unprivileged `duduclaw-kiosk`
-    /// user (postinst.d/20-users-and-units.sh), which is the sysd peer
-    /// (`duduclaw`) has no access to. This closes a real bug: the shell
+    /// path/param: both directories are closed constants. Both need root:
+    /// the gateway home can hold files owned by the rootless container
+    /// engine's subordinate uids (until 2026-10 the gateway wiped it itself),
+    /// and `/data/duduclaw-kiosk` is owned by the *different* unprivileged
+    /// `duduclaw-kiosk` user (postinst.d/20-users-and-units.sh), which the
+    /// sysd peer has no access to. This closes a real bug: the shell
     /// persists its OOBE-completion flag at
     /// `/data/duduclaw-kiosk/shell/oobe_state.json` (see
     /// `duduclaw-shell/src/oobe/persistence.rs`), so without this wipe a
@@ -206,7 +350,41 @@ pub enum SysdRequest {
     /// Home instead of re-running first-time setup — the gateway-side wipe
     /// of its own home dir alone was never enough. The unit-file re-arm and
     /// reboot are unchanged: both fixed literals.
+    ///
+    /// Since 2026-10 this is [`SysdRequest::FactoryResetV2`] with
+    /// `clear_network: false` (an older gateway clears Wi-Fi through
+    /// [`SysdRequest::ClearNetworkCredentials`] first and wipes its home
+    /// itself; both stay harmless when repeated).
     FactoryReset,
+    /// Factory reset, choosing how by what the image ships.
+    ///
+    /// **Deferred (the OS ships [`FACTORY_RESET_UNIT_FILE`]).** sysd writes
+    /// [`FACTORY_RESET_MARKER`] and reboots (the same `systemctl reboot` as
+    /// [`SysdRequest::Reboot`]); nothing is wiped while the gateway and its
+    /// containers still run, which avoided the half-wiped results the live
+    /// wipe could leave (a directory refilled during the wipe, files written
+    /// on shutdown). Contract with the OS oneshot:
+    /// - the marker is written atomically (a temp file in `/data/system`,
+    ///   then rename), mode 0600, owner root;
+    /// - its content is exactly one line, `clear_network=0` or
+    ///   `clear_network=1`, followed by `\n`;
+    /// - a failure to write it is an error and there is no reboot;
+    /// - at the next boot, before the container service and the gateway
+    ///   start, the oneshot wipes the contents of `/data/duduclaw` and
+    ///   `/data/duduclaw-kiosk`, removes `/data/system/containers/duduclaw`,
+    ///   wipes the contents of `/data/system/iwd` when `clear_network=1`,
+    ///   re-enables first-boot provisioning, and deletes the marker last.
+    ///
+    /// **Immediate (no such unit file: older images).** With
+    /// `clear_network`, Wi-Fi credentials are cleared first
+    /// ([`SysdRequest::ClearNetworkCredentials`], failure aborts); then what
+    /// [`SysdRequest::FactoryReset`] always did: wipe [`GATEWAY_HOME_DIR`]
+    /// (failure aborts), the kiosk home (best-effort), re-arm first boot,
+    /// reboot.
+    ///
+    /// A separate verb so a gateway can tell an older sysd (which refuses
+    /// the unknown verb and wipes nothing) from one that wipes the home.
+    FactoryResetV2 { clear_network: bool },
     /// Wipe the CONTENTS of `/data/network/iwd` — the iwd-managed store of
     /// saved Wi-Fi credentials (0700 root:root, see
     /// `appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`).
@@ -312,6 +490,11 @@ pub enum SysdRequest {
     /// relies on. It reports `success: false` when a session or the port is
     /// still open afterwards, so the window's close error is not papered over.
     SshServiceStop,
+    /// `systemctl stop|restart duduclaw-llama-server.service`: the
+    /// appliance's local model service, which the gateway (no longer root)
+    /// cannot control itself. `action` is a closed enum; the unit is the
+    /// fixed literal [`LOCAL_MODEL_UNIT`].
+    LocalModelService { action: LocalModelAction },
 }
 
 impl SysdRequest {
@@ -324,9 +507,11 @@ impl SysdRequest {
             SysdRequest::Poweroff => "poweroff",
             SysdRequest::SysupdateStatus => "sysupdate_status",
             SysdRequest::SysupdateApply => "sysupdate_apply",
+            SysdRequest::SysupdateStageApply => "sysupdate_stage_apply",
             SysdRequest::BootAssessmentStatus => "boot_assessment_status",
             SysdRequest::UpdateRollback => "update_rollback",
             SysdRequest::FactoryReset => "factory_reset",
+            SysdRequest::FactoryResetV2 { .. } => "factory_reset_v2",
             SysdRequest::ClearNetworkCredentials => "clear_network_credentials",
             SysdRequest::Hostname { .. } => "hostname",
             SysdRequest::SetTimezone { .. } => "set_timezone",
@@ -335,6 +520,7 @@ impl SysdRequest {
             SysdRequest::ClearExhaustedUpdateTarget { .. } => "clear_exhausted_update_target",
             SysdRequest::SshServiceStart => "ssh_service_start",
             SysdRequest::SshServiceStop => "ssh_service_stop",
+            SysdRequest::LocalModelService { .. } => "local_model_service",
         }
     }
 }
@@ -417,6 +603,7 @@ mod tests {
             SysdRequest::ClearNetworkCredentials,
             SysdRequest::SshServiceStart,
             SysdRequest::SshServiceStop,
+            SysdRequest::SysupdateStageApply,
         ] {
             let s = serde_json::to_string(&req).unwrap();
             let back: SysdRequest = serde_json::from_str(&s).unwrap();
@@ -433,6 +620,45 @@ mod tests {
         let s = serde_json::to_string(&SysdRequest::SshServiceStop).unwrap();
         assert_eq!(s, r#"{"verb":"ssh_service_stop"}"#);
         assert_eq!(SysdRequest::SshServiceStop.verb_name(), "ssh_service_stop");
+    }
+
+    #[test]
+    fn local_model_service_has_a_closed_action_and_a_stable_wire_shape() {
+        for (action, word) in [(LocalModelAction::Stop, "stop"), (LocalModelAction::Restart, "restart")] {
+            let req = SysdRequest::LocalModelService { action };
+            let s = serde_json::to_string(&req).unwrap();
+            assert_eq!(s, format!(r#"{{"verb":"local_model_service","params":{{"action":"{word}"}}}}"#));
+            assert_eq!(serde_json::from_str::<SysdRequest>(&s).unwrap(), req);
+            assert_eq!(req.verb_name(), "local_model_service");
+            assert_eq!(action.systemctl_verb(), word);
+        }
+        for raw in [
+            r#"{"verb":"local_model_service","params":{"action":"start"}}"#,
+            r#"{"verb":"local_model_service","params":{"action":"stop; reboot"}}"#,
+            r#"{"verb":"local_model_service","params":{"action":"stop","unit":"sshd.service"}}"#,
+            r#"{"verb":"local_model_service"}"#,
+            r#"{"verb":"local_model_service","params":{"action":"Stop"}}"#,
+        ] {
+            assert!(serde_json::from_str::<SysdRequest>(raw).is_err(), "{raw}");
+        }
+        assert_eq!(LOCAL_MODEL_UNIT, "duduclaw-llama-server.service");
+        assert_eq!(GATEWAY_HOME_DIR, "/data/duduclaw");
+    }
+
+    #[test]
+    fn factory_reset_v2_has_a_bool_and_a_stable_wire_shape() {
+        for clear_network in [true, false] {
+            let req = SysdRequest::FactoryResetV2 { clear_network };
+            let s = serde_json::to_string(&req).unwrap();
+            assert_eq!(s, format!(r#"{{"verb":"factory_reset_v2","params":{{"clear_network":{clear_network}}}}}"#));
+            assert_eq!(serde_json::from_str::<SysdRequest>(&s).unwrap(), req);
+        }
+        assert!(serde_json::from_str::<SysdRequest>(r#"{"verb":"factory_reset_v2","params":{"clear_network":"1"}}"#).is_err());
+        assert!(serde_json::from_str::<SysdRequest>(r#"{"verb":"factory_reset_v2","params":{"clear_network":true,"path":"/"}}"#).is_err());
+        assert_eq!(FACTORY_RESET_MARKER, "/data/system/factory-reset.pending");
+        assert_eq!(FACTORY_RESET_UNIT_FILE, "/usr/lib/systemd/system/duduclaw-factory-reset.service");
+        assert_eq!(MAX_HOSTNAME_LEN, 64);
+        assert_eq!(serde_json::to_string(&SysdRequest::SysupdateStageApply).unwrap(), r#"{"verb":"sysupdate_stage_apply"}"#);
     }
 
     #[test]

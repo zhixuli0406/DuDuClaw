@@ -358,7 +358,7 @@ impl PythonPolicyRuntime {
         let mut env = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"))];
         // These configure the trusted Docker client only. They are never
         // forwarded as container environment variables or mounted resources.
-        for key in ["HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"] {
+        for key in ["HOME", "DOCKER_HOST", "CONTAINER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"] {
             if let Some(value) = std::env::var_os(key) { env.push((key.into(), value)); }
         }
         let client = DockerClient { executable, env };

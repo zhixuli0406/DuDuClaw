@@ -448,7 +448,8 @@ impl ScriptSandboxUnavailable {
         let remedy = |image: &str| {
             format!(
                 "The script sandbox needs a running Docker and the image {image} present locally; \
-                 run `docker pull {image}` (it is never pulled automatically)."
+                 run `docker pull {image}` (it is never pulled automatically; {}).",
+                duduclaw_core::sandbox_image::OS_PULL_HINT_EN
             )
         };
         let (why, remedy) = match self {

@@ -2369,7 +2369,8 @@ mod failed_run_cleanup_tests {
         crate::test_exec::write_executable(
             &client,
             "#!/bin/sh\nd=\"${0%/*}\"\necho \"$*\" >> \"$d/calls\"\ncase \"$1\" in\n\
-             info) echo 27.3.1;;\n\
+             version) echo 27.3.1;;\n\
+             info) echo '{\"SecurityOptions\":[\"name=seccomp,profile=builtin\"]}';;\n\
              ps) ;;\n\
              image) printf 'sha256:%064d\\n' 7;;\n\
              run) echo 'docker: Error response from daemon: boom' >&2; exit 125;;\n\
@@ -2403,5 +2404,40 @@ mod failed_run_cleanup_tests {
         let removals: Vec<_> = calls.lines().filter(|l| l.starts_with("rm ")).collect();
         assert_eq!(removals, vec![format!("rm -f {name}").as_str()], "{calls}");
         assert!(!calls.contains("prune") && !calls.contains(" -v"));
+    }
+
+    /// P10: a rootless engine whose limit probe reads `max` refuses the
+    /// session before any session container is run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rootless_engine_ignoring_limits_refuses_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = dir.path().join("docker");
+        crate::test_exec::write_executable(
+            &client,
+            "#!/bin/sh\nd=\"${0%/*}\"\necho \"$*\" >> \"$d/calls\"\ncase \"$1\" in\n\
+             version) echo 5.8.7;;\n\
+             info) echo '{\"host\":{\"security\":{\"rootless\":true}}}';;\n\
+             ps) ;;\n\
+             image) printf 'sha256:%064d\\n' 7;;\n\
+             run) printf 'max\\nmax\\n';;\n\
+             *) ;;\nesac\n",
+            0o700,
+        );
+        crate::task_sandbox::container::DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
+        let mut orch = ComputerUseOrchestrator::new(
+            "alice".into(),
+            dir.path().to_path_buf(),
+            ComputerUseConfig { container_image: "duduclaw-computer-use:latest".into(), ..Default::default() },
+        );
+        let result = orch.start_container().await;
+        crate::task_sandbox::container::DOCKER_PROGRAM.with(|p| *p.borrow_mut() = None);
+        match result {
+            Err(ComputerUseError::Unavailable(message)) => assert!(message.contains("rootless"), "{message}"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let runs: Vec<_> = calls.lines().filter(|l| l.starts_with("run ")).collect();
+        assert_eq!(runs.len(), 1, "only the limit probe ran: {calls}");
+        assert!(runs[0].contains("--name duduclaw-limit-probe-") && runs[0].contains("--memory 33554432"), "{calls}");
     }
 }

@@ -45,7 +45,8 @@ fn fixture(events: &[Value], tail: &str, image_present: bool) -> Fixture {
     let client = tools.join("docker");
     crate::test_exec::write_executable(&client, format!(
         "#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\n\
-         info) echo 27.3.1;;\n\
+         version) echo 27.3.1;;\n\
+         info) echo '{{\"SecurityOptions\":[\"name=seccomp,profile=builtin\"]}}';;\n\
          ps) case \"$*\" in *--last*) ;; *) exit 3;; esac;;\n\
          image) {inspect};;\n\
          create) for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$d/create.args\"; \
@@ -574,8 +575,8 @@ fn fake_docker(script: &str) -> tempfile::TempDir {
 async fn docker_probe_half_dead_daemon_is_unavailable() {
     use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
     let _dir = fake_docker(
-        "case \"$1\" in\n version) echo 27.3.1;;\n \
-         info) echo 'error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/info\": EOF' >&2; exit 1;;\n \
+        "case \"$1\" in\n \
+         version) echo 'error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/version\": EOF' >&2; exit 1;;\n \
          ps) echo 'error during connect: EOF' >&2; exit 1;;\n *) exit 3;;\nesac",
     );
     assert_eq!(super::container::docker_status().await, DockerStatus::Unavailable(Unavailable::InfoFailed));
@@ -586,7 +587,7 @@ async fn docker_probe_half_dead_daemon_is_unavailable() {
 #[tokio::test]
 async fn docker_probe_list_failure_is_unavailable() {
     use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
-    let _dir = fake_docker("case \"$1\" in\n info) echo 27.3.1;;\n ps) exit 1;;\n *) exit 3;;\nesac");
+    let _dir = fake_docker("case \"$1\" in\n version) echo 27.3.1;;\n ps) exit 1;;\n *) exit 3;;\nesac");
     assert_eq!(super::container::docker_status().await, DockerStatus::Unavailable(Unavailable::ListFailed));
 }
 
@@ -595,7 +596,7 @@ async fn docker_probe_list_failure_is_unavailable() {
 #[tokio::test]
 async fn docker_probe_empty_info_is_unavailable() {
     use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
-    let _dir = fake_docker("case \"$1\" in\n info) echo;;\n ps) ;;\n *) exit 3;;\nesac");
+    let _dir = fake_docker("case \"$1\" in\n version) echo;;\n ps) ;;\n *) exit 3;;\nesac");
     assert_eq!(super::container::docker_status().await, DockerStatus::Unavailable(Unavailable::EmptyInfo));
 }
 
@@ -603,7 +604,7 @@ async fn docker_probe_empty_info_is_unavailable() {
 #[tokio::test]
 async fn docker_probe_healthy_daemon_is_reachable() {
     use duduclaw_core::docker_probe::DockerStatus;
-    let _dir = fake_docker("case \"$1\" in\n info) echo 27.3.1;;\n ps) ;;\n *) exit 3;;\nesac");
+    let _dir = fake_docker("case \"$1\" in\n version) echo 27.3.1;;\n ps) ;;\n *) exit 3;;\nesac");
     assert_eq!(
         super::container::docker_status().await,
         DockerStatus::Reachable { server_version: "27.3.1".into() }
@@ -617,7 +618,71 @@ async fn half_dead_docker_makes_the_task_sandbox_unavailable() {
     let fx = fixture(&[claude_result("final reply")], "exit 0", true);
     let client = fx.tools.join("docker");
     let script = std::fs::read_to_string(&client).unwrap();
-    std::fs::write(&client, script.replacen("info) echo 27.3.1;;", "info) echo EOF >&2; exit 1;;", 1)).unwrap();
+    std::fs::write(&client, script.replacen("version) echo 27.3.1;;", "version) echo EOF >&2; exit 1;;", 1)).unwrap();
     let err = go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
     assert!(matches!(err, SandboxError::Unavailable(Unavailable::DockerUnreachable)), "{err:?}");
+}
+
+/// Swap the fixture's `info` answer for a rootless engine and give it a
+/// `run` (the limit probe) that prints `probe_output` (memory.max, pids.max)
+/// and logs its argv.
+fn rootless_engine(fx: &Fixture, probe_output: &str) {
+    let client = fx.tools.join("docker");
+    let script = std::fs::read_to_string(&client).unwrap();
+    let rootful = "info) echo '{\"SecurityOptions\":[\"name=seccomp,profile=builtin\"]}';;";
+    assert!(script.contains(rootful), "{script}");
+    let rootless = format!(
+        "info) echo '{{\"host\":{{\"security\":{{\"rootless\":true}}}}}}';;\n run) printf '%s\\n' \"$*\" >> \"$d/probe\"; printf '{probe_output}';;"
+    );
+    std::fs::write(&client, script.replacen(rootful, &rootless, 1)).unwrap();
+}
+
+/// P10: on a rootless engine that accepts `--memory` and ignores it, the
+/// task sandbox is unavailable with its own reason code; nothing is created.
+#[tokio::test]
+async fn rootless_engine_ignoring_limits_makes_the_task_sandbox_unavailable() {
+    use duduclaw_core::container_engine::LimitVerdict;
+    let fx = fixture(&[claude_result("final reply")], "exit 0", true);
+    rootless_engine(&fx, "max\\nmax\\n");
+    let err = go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
+    assert_eq!(err, SandboxError::Unavailable(Unavailable::ResourceLimits(LimitVerdict::Ignored)));
+    assert_eq!(Unavailable::ResourceLimits(LimitVerdict::Ignored).code(), "resource_limits_unenforced");
+    let probe = fx.read("probe");
+    assert!(probe.contains("--memory 33554432") && probe.contains("--network none") && probe.contains(IMAGE), "{probe}");
+    assert!(!fx.tools.join("create.args").exists(), "no task container was created");
+}
+
+/// P10: a rootless engine that enforces the limits runs the task.
+#[tokio::test]
+async fn rootless_engine_enforcing_limits_runs_the_task() {
+    let fx = fixture(&[claude_result("final reply")], "exit 0", true);
+    rootless_engine(&fx, "33554432\\n32\\n");
+    let reply = go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap();
+    assert!(reply.contains("final reply"), "{reply}");
+    assert!(fx.read("probe").contains("--pids-limit 32"));
+}
+
+/// P10: a rootful engine is never probed.
+#[tokio::test]
+async fn rootful_engine_is_not_probed() {
+    let fx = fixture(&[claude_result("final reply")], "exit 0", true);
+    go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap();
+    assert!(!fx.tools.join("probe").exists());
+}
+
+/// M3: every gateway path that runs generated code under --memory /
+/// --pids-limit goes through the resource-limit gate (Discovery's policy
+/// runner checks memory.max / pids.max inside its own probe container).
+#[test]
+fn discovery_containers_are_behind_the_resource_limit_gate() {
+    let gate = "task_sandbox::container::resource_limits(";
+    for (name, source) in [
+        ("discovery/evaluator.rs", include_str!("../discovery/evaluator.rs")),
+        ("discovery/agent_spawn.rs", include_str!("../discovery/agent_spawn.rs")),
+        ("computer_use_image.rs", include_str!("../computer_use_image.rs")),
+    ] {
+        assert!(source.contains(gate), "{name} must call the resource-limit gate");
+    }
+    let policy = include_str!("../discovery/policy_runner.rs");
+    assert!(policy.contains("memory.max") && policy.contains("pids.max"), "policy runner keeps its own ceiling probe");
 }

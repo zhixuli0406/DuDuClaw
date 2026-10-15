@@ -10,18 +10,31 @@
 //! treats an error, EOF, empty answer or timeout as unavailable.
 //!
 //! This module holds only the classification (pure, unit-tested). The
-//! transports run the requests: the docker CLI (`docker info --format
-//! {{.ServerVersion}}` + `docker ps --quiet --last 1`, see
+//! transports run the requests: the container CLI (`docker version --format
+//! {{.Server.Version}}` + `docker ps --quiet --last 1`, see
 //! [`INFO_ARGS`] / [`LIST_ARGS`]) in the gateway, the Docker API (`info` +
 //! `list_containers`) in `duduclaw-container`.
+//!
+//! `version --format {{.Server.Version}}` rather than `info --format
+//! {{.ServerVersion}}`: both work on Docker, but Podman (5.8, also through
+//! its `docker` shim and in remote mode) rejects the `info` template, which
+//! made a healthy rootless Podman read as unavailable on DuDuClaw OS. The
+//! `version` template asks the server, so a daemon that is down still fails
+//! it, but it is a lighter request than `info` (on 2026-10-03 the half-dead
+//! Docker Desktop failed `/info` while still answering cheap calls). The
+//! container list ([`LIST_ARGS`]) is therefore the part that has to stay
+//! meaningful: it needs the engine's container store, not just its API
+//! front, and must keep running after a successful version answer.
 
 use std::time::Duration;
 
 /// Upper bound for each of the two requests.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// docker CLI arguments of the `info` request.
-pub const INFO_ARGS: [&str; 3] = ["info", "--format", "{{.ServerVersion}}"];
+/// docker / podman CLI arguments of the server-version request. Accepted by
+/// Docker and Podman alike; the field is filled from the server's answer, so
+/// a daemon that does not answer fails it.
+pub const INFO_ARGS: [&str; 3] = ["version", "--format", "{{.Server.Version}}"];
 /// docker CLI arguments of the cheap list request. `--last 1` (alias `-n`):
 /// `docker ps` has no `--limit` flag (docker CLI 29 answers `unknown flag:
 /// --limit`, exit 125, which made every surface report a healthy daemon as
@@ -199,7 +212,9 @@ mod tests {
         // `--limit` does not exist on `docker ps`; this argv must stay valid
         // for the installed CLIs (checked: `docker ps --quiet --last 1` exits 0).
         assert_eq!(LIST_ARGS, ["ps", "--quiet", "--last", "1"]);
-        assert_eq!(INFO_ARGS, ["info", "--format", "{{.ServerVersion}}"]);
+        // Podman 5.8 rejects `info --format {{.ServerVersion}}`; both engines
+        // accept this one.
+        assert_eq!(INFO_ARGS, ["version", "--format", "{{.Server.Version}}"]);
     }
 
     #[test]

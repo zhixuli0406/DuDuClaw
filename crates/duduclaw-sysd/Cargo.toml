@@ -24,9 +24,16 @@ clap = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"
+# SysupdateStageApply: verify the signed OS release manifest and hash the
+# staged payloads as root (same crates and versions the gateway uses).
+minisign-verify = "0.2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# Throwaway key pairs for the SysupdateStageApply end-to-end tests (never in
+# the shipped binary; production verifies with the compiled-in OS key).
+minisign = { version = "0.7", default-features = false }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 
 [lints]

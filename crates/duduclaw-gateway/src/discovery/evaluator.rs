@@ -288,6 +288,13 @@ impl RegisteredEvaluator {
         }
         let (mut command, workspace_input) = match backend {
             IsolationBackend::Container => {
+                // Generated code runs here under --memory / --pids-limit: on a
+                // rootless engine those must be shown to take effect first.
+                if let Some(image) = config.image.as_deref()
+                    && let Err(verdict) = crate::task_sandbox::container::resource_limits(image).await
+                {
+                    return failure(FailClass::RuntimeError, verdict.reason_en(), backend);
+                }
                 let labels = match super::maintenance::scope_labels(&self.home, run_id, "evaluator") {
                     Ok(labels) => labels,
                     Err(reason) => return failure(FailClass::RuntimeError, &reason, backend),
@@ -564,6 +571,10 @@ fn scrub_environment(command: &mut Command, scratch: &Path) {
         .env("TZ", "UTC")
         .env("PYTHONDONTWRITEBYTECODE", "1");
 }
+/// `--tmpfs` value of the scoring container's `/scratch`.
+fn scratch_tmpfs(bytes: u64) -> String {
+    format!("/scratch:rw,nosuid,nodev,noexec,size={bytes},mode=1777")
+}
 pub fn validate_argv(root: &Path, argv: &[String]) -> Result<(), String> {
     if argv.is_empty() || argv[0].is_empty() {
         return Err("evaluator command is empty".into());
@@ -747,8 +758,12 @@ fn docker_command_with_labels(
     let mut command = Command::new("docker");
     command.env_clear();
     // Docker context/credential files remain with the host launcher, never in
-    // the scoring container. The default daemon endpoint is intentional.
+    // the scoring container. The endpoint is the default daemon unless the
+    // gateway itself runs against an explicit one (`DOCKER_HOST` /
+    // `CONTAINER_HOST`, e.g. DuDuClaw OS's rootless Podman service); then
+    // the scorer uses the same engine as every other container feature.
     command.env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
+    command.envs(duduclaw_core::container_engine::endpoint_env_pairs());
     command.args([
         "create",
         // Never fetched behind the operator's back: the pinned image must
@@ -781,10 +796,11 @@ fn docker_command_with_labels(
         "--workdir",
         "/scratch",
         "--tmpfs",
-        &format!(
-            "/scratch:rw,nosuid,nodev,noexec,size={},mode=700,uid=65534,gid=65534",
-            config.scratch_bytes
-        ),
+        // `mode=1777`, not `uid=65534,gid=65534`: rootless Podman rejects the
+        // uid/gid tmpfs options (`unknown mount option`); Docker and Podman
+        // both accept a mode. The container runs only as 65534 (`--user`,
+        // no capabilities), so the writer set is the same.
+        &scratch_tmpfs(config.scratch_bytes),
         "--env",
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "--env",
@@ -1015,6 +1031,18 @@ mod tests {
             args.iter().filter(|arg| arg.ends_with(",readonly")).count(),
             2
         );
+        // P4': a tmpfs both Docker and rootless Podman accept (no uid=/gid=).
+        let tmpfs = args.windows(2).find(|p| p[0] == "--tmpfs").map(|p| p[1].clone()).unwrap();
+        assert_eq!(tmpfs, format!("/scratch:rw,nosuid,nodev,noexec,size={},mode=1777", 1u64 << 20));
+        assert!(!tmpfs.split(',').any(|o| o.starts_with("uid=") || o.starts_with("gid=")), "{tmpfs}");
+        // P2: the client keeps only PATH plus the container endpoint names.
+        for (key, _) in command.get_envs() {
+            let key = key.to_string_lossy();
+            assert!(
+                key == "PATH" || duduclaw_core::container_engine::ENDPOINT_ENV_VARS.contains(&key.as_ref()),
+                "unexpected client env {key}"
+            );
+        }
     }
     #[tokio::test]
     async fn missing_registry_or_isolation_never_spawns_worker_code() {

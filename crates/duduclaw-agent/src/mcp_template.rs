@@ -1458,6 +1458,43 @@ mod tests {
         serde_json::from_str(&content).unwrap()
     }
 
+    /// M1: the script sandbox runs inside `mcp-server`, so the gateway's
+    /// container endpoint reaches the `duduclaw` entry (and only when set).
+    #[test]
+    fn mcp_json_carries_the_container_endpoint_when_the_gateway_has_one() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        struct EndpointEnv;
+        impl Drop for EndpointEnv {
+            fn drop(&mut self) {
+                // SAFETY: serialized via `BIN_ENV_LOCK`.
+                unsafe {
+                    std::env::remove_var("DOCKER_HOST");
+                    std::env::remove_var("CONTAINER_HOST");
+                }
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents").join("worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let path = agent_dir.join(".mcp.json");
+
+        ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+        let env = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"].clone();
+        assert!(env.get("DOCKER_HOST").is_none() && env.get("CONTAINER_HOST").is_none(), "unset ⇒ absent: {env}");
+
+        let _endpoint = EndpointEnv;
+        // SAFETY: serialized via `BIN_ENV_LOCK`; removed by `EndpointEnv`.
+        unsafe {
+            std::env::set_var("DOCKER_HOST", "unix:///run/duduclaw-gateway/podman/podman.sock");
+            std::env::set_var("CONTAINER_HOST", "unix:///run/duduclaw-gateway/podman/podman.sock");
+        }
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap(), "the entry is rewritten");
+        let env = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"].clone();
+        assert_eq!(env["DOCKER_HOST"], "unix:///run/duduclaw-gateway/podman/podman.sock");
+        assert_eq!(env["CONTAINER_HOST"], "unix:///run/duduclaw-gateway/podman/podman.sock");
+    }
+
     #[test]
     fn mcp_json_migration_adds_agent_id_env() {
         let _guard = lock_bin_env();

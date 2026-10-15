@@ -2703,6 +2703,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));
+    // ── Device operations for the `os_*` MCP tools (internal) ─────
+    // The mcp-server process reaches duduclaw-sysd only through this route
+    // (sysd may answer only the gateway's main process). Same loopback +
+    // signed-identity authentication as the computer-use route, a closed
+    // verb list, appliance only (`sysd_route`).
+    app = app.merge(crate::sysd_route::router(home_dir.clone()));
     // ── Computer-use live view (P8) ───────────────────────────────
     // `/ws/computer-view?ticket=…`: one-time tickets from the
     // `computer_sessions.*` RPCs; Origin, identity and authorization are

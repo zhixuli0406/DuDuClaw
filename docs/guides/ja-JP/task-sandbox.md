@@ -127,7 +127,7 @@ AI が許可範囲（ファイルとシェル）外のツールを使うと、�
 
 ## サンドボックスが使えないとき
 
-`sandbox_enabled = true` の場合、次のいずれかに当てはまるとタスクは失敗します（隔離なしで実行されることはありません）。Docker に接続できない、イメージがない、gateway が root で動いている、ホストが unix 系でない、設定が無効、`network_access = false`、使えるアカウントがない、runtime が未対応。失敗のたびに理由コード付きの監査イベント `task_sandbox_unavailable` が書かれ、読みやすいエラーが返ります。
+`sandbox_enabled = true` の場合、次のいずれかに当てはまるとタスクは失敗します（隔離なしで実行されることはありません）。Docker に接続できない、イメージがない、コンテナエンジンが rootless で動いていてメモリとプロセス数の上限を適用していない（gateway プロセスごとに小さな確認用コンテナで 1 回確認します。通常の rootful Docker は確認しません）、gateway が root で動いている、ホストが unix 系でない、設定が無効、`network_access = false`、使えるアカウントがない、runtime が未対応。失敗のたびに理由コード付きの監査イベント `task_sandbox_unavailable` が書かれ、読みやすいエラーが返ります。
 
 回避手段：`config.toml [container.sandbox]` に `when_unavailable = "run_unsandboxed"` を設定します。すると以前のバージョンと同じようにホスト上で隔離なしに実行され、そのたびに監査イベント `task_sandbox_bypassed` が書かれます。隔離なしの実行を受け入れる場合にだけ使ってください。
 
@@ -157,7 +157,8 @@ duduclaw doctor
 | 表示 | 原因 | 対処 |
 |---|---|---|
 | `(docker_unreachable)` | Docker デーモンが動いていない、または gateway ユーザーが使えない。 | Docker を起動し、gateway ユーザーが `docker version` を実行できるか確認する。 |
-| `(image_missing)` | イメージがこのマシンにない。 | エラーに示された `docker pull <image>` を実行するか、`image` を既にあるイメージに向ける。 |
+| `(image_missing)` | イメージがこのマシンにない。 | エラーに示された `docker pull <image>` を実行するか、`image` を既にあるイメージに向ける。DuDuClaw OS では gateway は専用の rootless イメージストアを使います。gateway の `CONTAINER_HOST` を付けて pull しないと、イメージは root のストアに入り gateway からは見えません。 |
+| `(resource_limits_unenforced)` | コンテナエンジンが rootless で動いていて `--memory`／`--pids-limit` を適用していない（cgroup コントローラが委譲されていない）、要求と異なる上限を報告した、または確認用コンテナが終わらなかった。 | DuDuClaw OS ではイメージ側の問題（コンテナサービスのユニットに cgroup の委譲が必要）なので報告してください。それ以外の環境では memory と pids のコントローラを rootless エンジンのユーザーに委譲します。サンドボックスが上限なしで動くことはありません。 |
 | `(network_disabled)` | エージェントが `network_access = false`。 | そのエージェントの `[container]` で `network_access = true` にする。 |
 | `(root_user)` | gateway が uid 0 で動いている。 | 通常のユーザーで gateway を実行する。 |
 | `(unsupported_platform)` | ホストが unix 系ではない（Windows など）。 | Linux または macOS で gateway を実行する。 |

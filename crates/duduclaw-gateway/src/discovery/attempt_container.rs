@@ -268,7 +268,11 @@ pub fn prepare_with_files(home:&Path, request:&AttemptRequest, settings:&Attempt
     check_quota(&discovery,&request.run_id,quota,0).map_err(failure)?;
     let name=format!("dudu-attempt-{}",uuid::Uuid::new_v4().simple());
     let mut create=Command::new(docker_program());
-    create.env_clear().envs(duduclaw_core::spawn_env::agent_cli_spawn_env_pairs());
+    // The agent allowlist, plus the gateway's container endpoint when it has
+    // one (never on the agent allowlist itself). `client_env` carries both on
+    // to the later start/rm clients.
+    create.env_clear().envs(duduclaw_core::spawn_env::agent_cli_spawn_env_pairs())
+        .envs(duduclaw_core::container_engine::endpoint_env_pairs());
     // `--pull never`: the image presence check and the create must agree;
     // a missing image fails here instead of being fetched in between.
     create.args(["create","--interactive","--pull","never","--name",&name,"--read-only","--user",&format!("{uid}:{gid}"),

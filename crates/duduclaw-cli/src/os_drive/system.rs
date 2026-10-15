@@ -11,6 +11,14 @@
 //! `commercial/docs/specs/DESIGN-os-self-drive-2026-08.md` §3 for why this
 //! sidesteps the dashboard WS/Ed25519 auth entirely, and §7 for the same-uid
 //! boundary the two writes hit.
+//!
+//! `timezone-set` / `ntp-set` call `duduclaw-sysd` from this separate
+//! process. Once the OS starts sysd with `--require-main-pid-of
+//! duduclaw-gateway.service`, sysd accepts only the gateway process and
+//! these two verbs fail with `device_ops::SYSD_CALLER_REFUSED`, which points
+//! the operator to the dashboard's system settings. They are deliberately
+//! not added to the gateway's `/api/internal/sysd` route (its allowlist
+//! carries only the verbs the `os_*` MCP tools need).
 
 use std::path::Path;
 

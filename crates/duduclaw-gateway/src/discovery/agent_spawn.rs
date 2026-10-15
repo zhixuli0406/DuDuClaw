@@ -786,6 +786,12 @@ impl AttemptRunner for ContainerAttemptRunner {
             let (account,env)=match next.take() { Some(found)=>found, None=>self.usable_account(rotator,req,&rejected).await? };
             let argv=self.family.argv(model,req.max_turns,&node);
             let files=super::attempt_adapter::runtime_files(self.family,&node,req.max_turns,&req.prompt);
+            // The attempt runs model-driven code under --memory / --pids-limit:
+            // on a rootless engine those must be shown to take effect first.
+            if let Err(verdict)=crate::task_sandbox::container::resource_limits(&self.image.image).await {
+                tracing::warn!(reason=verdict.code(),"discovery attempt refused: container resource limits not enforced");
+                return Err(AttemptInfraError::IsolationUnavailable);
+            }
             let prepared=super::attempt_container::prepare_with_files(&factory.home_dir,req,&factory.attempt,factory.quota,&self.image,&argv,&env,&files,timeout)?;
             drop(env);
             let _lease=acquire_attempt_slot(&factory.home_dir,factory.max_concurrency,budget,seed_deadline).await?;

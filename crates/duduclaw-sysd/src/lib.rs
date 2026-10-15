@@ -9,11 +9,20 @@
 //! a `systemd-sysupdate` OS image, re-arming first-boot provisioning for a
 //! factory reset, changing the hostname) genuinely require root. Rather
 //! than run the whole gateway as root, or grant it broad sudo/polkit
-//! rules, this crate is a small standalone root daemon exposing exactly
-//! six fixed verbs over a Unix domain socket gated by peer-credential
-//! (`SO_PEERCRED`) verification — the gateway is the only caller that can
-//! ever reach it, and even the gateway can only ever ask for one of the
-//! six fixed things, never an arbitrary command.
+//! rules, this crate is a small standalone root daemon exposing a closed
+//! set of fixed verbs over a Unix domain socket gated by peer-credential
+//! (`SO_PEERCRED`) verification. Only the configured uid can reach it, and
+//! that uid can only ever ask for one of the fixed things, never an
+//! arbitrary command.
+//!
+//! The configured uid is the gateway's, which on DuDuClaw OS is also the
+//! uid the AI employees' CLIs run as, so a uid match alone admits any agent.
+//! `--require-main-pid-of <unit>` narrows the caller to the gateway process
+//! itself (its systemd MainPID); see [`protocol`]'s "threat model" section
+//! for what that relies on. Without it, an agent reaching the socket can
+//! trigger every verb, including `update_rollback` (boots the previous
+//! image, which may still run its gateway as root) and `ssh_service_start`.
+//! Parameterised verbs validate hostile input either way.
 //!
 //! Module map:
 //! - [`protocol`] — the wire schema (closed request enum, response
@@ -29,6 +38,11 @@
 pub mod client;
 #[cfg(unix)]
 pub mod dispatch;
+pub mod release;
+#[cfg(unix)]
+pub mod rollback_floor;
+#[cfg(unix)]
+pub mod staged_update;
 pub mod protocol;
 #[cfg(unix)]
 pub mod server;
@@ -49,6 +63,7 @@ pub mod server {
     pub struct SysdServerConfig {
         pub socket_path: std::path::PathBuf,
         pub allowed_uid: Option<u32>,
+        pub require_main_pid_of: Option<String>,
     }
 
     /// Never constructible — [`bind`] always errors on non-unix targets.
@@ -79,7 +94,9 @@ pub mod server {
 
 pub use client::{SysdClient, SysdClientError};
 pub use protocol::{
-    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, SOCKET_PATH_ENV, SSH_PORT, SSH_UNITS, SshUnit, SysdError,
+    ALLOWED_UID_ENV, DEFAULT_SOCKET_PATH, FACTORY_RESET_MARKER, FACTORY_RESET_UNIT_FILE, GATEWAY_HOME_DIR,
+    LOCAL_MODEL_UNIT, LocalModelAction, SOCKET_PATH_ENV,
+    SSH_PORT, SSH_UNITS, SshUnit, SysdError,
     SysdOpOutput, SysdRequest, SysdResponse, resolve_socket_path,
 };
 pub use server::{SysdServerConfig, bind, serve};

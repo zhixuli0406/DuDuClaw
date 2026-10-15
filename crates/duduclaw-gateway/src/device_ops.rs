@@ -121,7 +121,7 @@ pub trait DeviceOps: Send + Sync {
     ///
     /// `clear_network`: when `true`, ALSO clears saved Wi-Fi credentials
     /// under `/data/network/iwd` (D4a-8) — always requires root
-    /// ([`SysdDeviceOps`] only; see `SysdRequest::ClearNetworkCredentials`).
+    /// ([`SysdDeviceOps`] only; carried by `SysdRequest::FactoryResetV2`).
     /// Defaults to keeping them: losing Wi-Fi on a headless LAN appliance
     /// can mean permanent physical-access-only recovery, so this is an
     /// explicit opt-in the dashboard confirmation surfaces as a checkbox,
@@ -188,6 +188,14 @@ impl DeviceOps for SystemDeviceOps {
     }
 
     async fn update_apply(&self) -> OpResult {
+        // On an appliance this impl means "sysd unreachable": installing an
+        // OS image needs root's verification, so refuse instead of running
+        // sysupdate from the gateway.
+        if duduclaw_core::is_appliance() {
+            return Err(DeviceOpError::Unsupported(
+                "裝置的系統服務沒有回應，無法驗證並安裝更新，系統沒有被更動。請稍後再試。".to_string(),
+            ));
+        }
         let mut cmd = tokio::process::Command::new("systemd-sysupdate");
         cmd.arg("update");
         run(cmd).await
@@ -211,6 +219,13 @@ impl DeviceOps for SystemDeviceOps {
     }
 
     async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
+        // On an appliance this impl is only reached when the sysd socket is
+        // missing (see `select_device_ops`). The unprivileged gateway cannot
+        // finish a reset there (the home can hold files of the rootless
+        // container engine's subordinate uids; the kiosk home and the reboot
+        // need root), so refuse before deleting anything instead of leaving
+        // a half-wiped box.
+        refuse_local_reset_on_appliance(duduclaw_core::is_appliance())?;
         if let Err(e) = wipe_dir_contents(home_dir) {
             return Err(DeviceOpError::Io(format!(
                 "wiping {} failed: {e}",
@@ -280,20 +295,47 @@ impl DeviceOps for SystemDeviceOps {
 /// already owns, so it is delegated straight to `SystemDeviceOps`'s local
 /// shell-out rather than duplicated here.
 pub struct SysdDeviceOps {
-    client: duduclaw_sysd::SysdClient,
+    client: SysdTransport,
+}
+
+/// How a [`SysdDeviceOps`] reaches sysd.
+pub enum SysdTransport {
+    /// The sysd Unix socket (the gateway process).
+    Socket(duduclaw_sysd::SysdClient),
+    /// The gateway's signed loopback route (`crate::sysd_route`), for the
+    /// separate `mcp-server` process: sysd may answer only the gateway's
+    /// main process (`--require-main-pid-of`).
+    Gateway(std::path::PathBuf),
+}
+
+impl SysdTransport {
+    pub async fn call(
+        &self,
+        req: &duduclaw_sysd::SysdRequest,
+    ) -> Result<duduclaw_sysd::SysdOpOutput, duduclaw_sysd::SysdClientError> {
+        match self {
+            Self::Socket(client) => client.call(req).await,
+            Self::Gateway(home) => crate::sysd_route::call_via_gateway(home, req).await,
+        }
+    }
 }
 
 impl Default for SysdDeviceOps {
     fn default() -> Self {
         Self {
-            client: duduclaw_sysd::SysdClient::from_env(),
+            client: SysdTransport::Socket(duduclaw_sysd::SysdClient::from_env()),
         }
     }
 }
 
 impl SysdDeviceOps {
     pub fn new(client: duduclaw_sysd::SysdClient) -> Self {
-        Self { client }
+        Self { client: SysdTransport::Socket(client) }
+    }
+
+    /// Reach sysd through the gateway route of `home` (mcp-server process).
+    pub fn via_gateway(home: &Path) -> Self {
+        Self { client: SysdTransport::Gateway(home.to_path_buf()) }
     }
 
     /// Not part of the `DeviceOps` trait — there is no `device.*`
@@ -375,6 +417,26 @@ impl SysdDeviceOps {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::SshServiceStop).await
     }
 
+    /// Verified install (`SysupdateStageApply`): sysd re-checks the signed
+    /// release in the download directory, stages it as root and runs
+    /// sysupdate. An older sysd that does not know the verb is refused with
+    /// [`OLD_SYSD_UPDATE_REFUSAL`] (gateway and sysd ship in one OS image;
+    /// the unverified `SysupdateApply` is not used as a fallback).
+    pub async fn sysupdate_stage_apply(&self) -> OpResult {
+        match self.client.call(&duduclaw_sysd::SysdRequest::SysupdateStageApply).await {
+            Ok(out) => Ok(OpOutput { success: out.success, stdout: out.stdout, stderr: out.stderr }),
+            Err(e) if is_unknown_verb_rejection(&e) => Err(DeviceOpError::Unsupported(OLD_SYSD_UPDATE_REFUSAL.to_string())),
+            Err(e) => Err(sysd_error(e)),
+        }
+    }
+
+    /// `systemctl stop|restart` of the local model service through the
+    /// `LocalModelService` verb (the gateway no longer runs as root). Not
+    /// part of the `DeviceOps` trait: only `inference_local` uses it.
+    pub async fn local_model_service(&self, action: duduclaw_sysd::LocalModelAction) -> OpResult {
+        sysd_call(&self.client, duduclaw_sysd::SysdRequest::LocalModelService { action }).await
+    }
+
     /// System-settings app: `network.wired_config`. `dns` is cloned into the
     /// request as owned `String`s — the wire shape (`SysdRequest::
     /// NetworkWiredConfig`) takes `Vec<String>`, not a borrowed slice.
@@ -404,7 +466,7 @@ impl SysdDeviceOps {
 /// other `DeviceOps` impl returns, so callers (handlers.rs) don't need to
 /// know which backend answered.
 async fn sysd_call(
-    client: &duduclaw_sysd::SysdClient,
+    client: &SysdTransport,
     req: duduclaw_sysd::SysdRequest,
 ) -> OpResult {
     match client.call(&req).await {
@@ -413,7 +475,25 @@ async fn sysd_call(
             stdout: out.stdout,
             stderr: out.stderr,
         }),
-        Err(e) => Err(DeviceOpError::Unsupported(e.to_string())),
+        Err(e) => Err(sysd_error(e)),
+    }
+}
+
+/// Shown when sysd refuses the caller: it accepts only the gateway process
+/// (`--require-main-pid-of`), and this call came from another process, such
+/// as an operator command (`duduclaw os system timezone-set` / `ntp-set`)
+/// run in a terminal.
+pub const SYSD_CALLER_REFUSED: &str = "裝置的系統服務只接受 DuDuClaw gateway 本身的請求，這個入口無法直接變更系統設定；\
+     請改從儀表板的系統設定操作。";
+
+/// A sysd client error as the `OpResult` error every caller already
+/// handles; sysd's `unauthorized` refusal gets [`SYSD_CALLER_REFUSED`].
+fn sysd_error(e: duduclaw_sysd::SysdClientError) -> DeviceOpError {
+    match &e {
+        duduclaw_sysd::SysdClientError::Rejected { kind, .. } if kind == "unauthorized" => {
+            DeviceOpError::Unsupported(SYSD_CALLER_REFUSED.to_string())
+        }
+        _ => DeviceOpError::Unsupported(e.to_string()),
     }
 }
 
@@ -432,7 +512,9 @@ impl DeviceOps for SysdDeviceOps {
     }
 
     async fn update_apply(&self) -> OpResult {
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::SysupdateApply).await
+        // Never the unverified `SysupdateApply` on an appliance: the only
+        // install path is the one root verifies itself.
+        self.sysupdate_stage_apply().await
     }
 
     async fn update_rollback(&self) -> OpResult {
@@ -448,33 +530,27 @@ impl DeviceOps for SysdDeviceOps {
     }
 
     async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
-        // The wipe itself is filesystem-only and needs no root (the
-        // `duduclaw` user already owns `home_dir`) — only the unit re-arm
-        // + kiosk-home wipe + reboot that follow need root, which is
-        // exactly what the `FactoryReset` verb does on the sysd side (it
-        // now also wipes `/data/duduclaw-kiosk` — see that verb's doc
-        // comment for the OOBE-flag bug this closes).
-        if let Err(e) = wipe_dir_contents(home_dir) {
-            return Err(DeviceOpError::Io(format!(
-                "wiping {} failed: {e}",
-                home_dir.display()
-            )));
+        // The gateway home is wiped by the `FactoryReset` verb on the root
+        // side (`duduclaw_sysd::GATEWAY_HOME_DIR`, a closed constant): once
+        // the gateway runs rootless, files its container engine wrote can
+        // belong to subordinate uids the gateway cannot delete. Until
+        // 2026-10 the gateway wiped it here itself. The verb wipes only its
+        // constant, so a gateway whose home is elsewhere refuses rather than
+        // reporting a reset that left its own data in place.
+        require_sysd_home(home_dir)?;
+        // One verb carries the whole reset, `clear_network` included (D4a-8
+        // fail-closed semantics live in sysd: on the immediate path a
+        // credential-clear failure aborts before any wipe or reboot; on the
+        // deferred path the choice is written into the marker the OS
+        // oneshot reads). `FactoryResetV2`, not `FactoryReset`: an older
+        // sysd that predates the root-side home wipe refuses the unknown
+        // verb instead of rebooting with the gateway's data still there.
+        let req = duduclaw_sysd::SysdRequest::FactoryResetV2 { clear_network };
+        match self.client.call(&req).await {
+            Ok(out) => Ok(OpOutput { success: out.success, stdout: out.stdout, stderr: out.stderr }),
+            Err(e) if is_unknown_verb_rejection(&e) => Err(DeviceOpError::Unsupported(OLD_SYSD_RESET_REFUSAL.to_string())),
+            Err(e) => Err(sysd_error(e)),
         }
-        if clear_network {
-            // D4a-8, fail-closed: runs BEFORE the `FactoryReset` verb
-            // (which ends in `systemctl reboot`) so there is no race
-            // against the box going down mid-request, and a failure here
-            // aborts the whole call (`?`) rather than silently proceeding
-            // to reboot while leaving saved Wi-Fi credentials in place —
-            // an operator who explicitly asked for them to be cleared must
-            // never be told "done" when they were not.
-            sysd_call(
-                &self.client,
-                duduclaw_sysd::SysdRequest::ClearNetworkCredentials,
-            )
-            .await?;
-        }
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::FactoryReset).await
     }
 
     async fn backup_create(&self, source_dir: &Path, dest_path: &Path) -> OpResult {
@@ -499,11 +575,43 @@ impl DeviceOps for SysdDeviceOps {
 /// human-triggered operation and avoids making every `device.*` RPC pay
 /// for a connect probe just to decide which backend to use.
 pub fn select_device_ops() -> Box<dyn DeviceOps> {
-    if duduclaw_core::is_appliance() && duduclaw_sysd::resolve_socket_path().exists() {
-        Box::new(SysdDeviceOps::default())
-    } else {
-        Box::new(SystemDeviceOps)
+    match current_backend() {
+        Backend::Gateway(home) => Box::new(SysdDeviceOps::via_gateway(home)),
+        Backend::Socket => Box::new(SysdDeviceOps::default()),
+        Backend::Local => Box::new(SystemDeviceOps),
     }
+}
+
+/// Which way privileged device operations go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend<'a> {
+    /// No sysd: `SystemDeviceOps` (off the appliance, or sysd not up yet).
+    Local,
+    /// The sysd socket (the gateway process on an appliance).
+    Socket,
+    /// The gateway's signed route (an `mcp-server` process on an appliance).
+    Gateway(&'a Path),
+}
+
+/// The decision (pure). On an appliance, a process switched to forwarding
+/// (`sysd_route::forward_sysd_through_gateway`, set by `mcp-server`) always
+/// goes through the gateway, whether or not it could open the socket, and
+/// never falls back to it.
+pub fn backend<'a>(is_appliance: bool, socket_exists: bool, forward_home: Option<&'a Path>) -> Backend<'a> {
+    match (is_appliance, forward_home) {
+        (false, _) => Backend::Local,
+        (true, Some(home)) => Backend::Gateway(home),
+        (true, None) if socket_exists => Backend::Socket,
+        (true, None) => Backend::Local,
+    }
+}
+
+fn current_backend() -> Backend<'static> {
+    backend(
+        duduclaw_core::is_appliance(),
+        duduclaw_sysd::resolve_socket_path().exists(),
+        crate::sysd_route::forward_home(),
+    )
 }
 
 /// Same condition [`select_device_ops`] uses, but for the system-settings
@@ -514,10 +622,56 @@ pub fn select_device_ops() -> Box<dyn DeviceOps> {
 /// backend reachable", which callers map to a `backend_unavailable` refusal
 /// rather than attempting a local shell-out that would need root anyway.
 pub fn select_sysd_ops() -> Option<SysdDeviceOps> {
-    if duduclaw_core::is_appliance() && duduclaw_sysd::resolve_socket_path().exists() {
-        Some(SysdDeviceOps::default())
+    match current_backend() {
+        Backend::Gateway(home) => Some(SysdDeviceOps::via_gateway(home)),
+        Backend::Socket => Some(SysdDeviceOps::default()),
+        Backend::Local => None,
+    }
+}
+
+/// Fail-closed half of [`SystemDeviceOps::factory_reset`]: on an appliance
+/// (where this impl means "sysd unreachable") a factory reset is refused.
+fn refuse_local_reset_on_appliance(is_appliance: bool) -> Result<(), DeviceOpError> {
+    if is_appliance {
+        return Err(DeviceOpError::Unsupported(
+            "裝置的系統服務沒有回應，無法還原原廠設定；資料沒有被刪除。請稍後再試，或重新開機後再試一次。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Shown when the device's sysd predates `FactoryResetV2` (the gateway and
+/// sysd ship in the same OS image; a mismatch means a partial update).
+const OLD_SYSD_RESET_REFUSAL: &str =
+    "裝置的系統服務版本太舊，無法由它清除資料，已取消還原原廠設定，資料沒有被刪除。請先把裝置系統更新到最新版本。";
+
+/// Shown when the device's sysd predates `SysupdateStageApply`.
+pub const OLD_SYSD_UPDATE_REFUSAL: &str =
+    "裝置的系統服務版本太舊，無法由它驗證並安裝更新，已取消安裝，系統沒有被更動。請改用完整的系統映像更新。";
+
+/// sysd refused the request because it does not know the verb (it is older
+/// than this gateway): the server answers `bad_request` with `malformed
+/// request: unknown variant …`.
+fn is_unknown_verb_rejection(e: &duduclaw_sysd::SysdClientError) -> bool {
+    matches!(e, duduclaw_sysd::SysdClientError::Rejected { kind, message }
+        if kind == "bad_request" && message.starts_with("malformed request") && message.contains("unknown variant"))
+}
+
+/// [`SysdDeviceOps::factory_reset`] wipes through the `FactoryResetV2` verb,
+/// which only knows [`duduclaw_sysd::GATEWAY_HOME_DIR`]: refuse when this
+/// gateway's home is a different directory.
+fn require_sysd_home(home_dir: &Path) -> Result<(), DeviceOpError> {
+    let fixed = Path::new(duduclaw_sysd::GATEWAY_HOME_DIR);
+    let same = home_dir == fixed
+        || matches!((home_dir.canonicalize(), fixed.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    if same {
+        Ok(())
     } else {
-        None
+        Err(DeviceOpError::Unsupported(format!(
+            "這台裝置的資料目錄（{}）不是系統服務會清除的位置（{}），已取消還原原廠設定，資料沒有被刪除。",
+            home_dir.display(),
+            duduclaw_sysd::GATEWAY_HOME_DIR
+        )))
     }
 }
 
@@ -746,6 +900,7 @@ mod tests {
                 let config = duduclaw_sysd::SysdServerConfig {
                     socket_path: socket_path.clone(),
                     allowed_uid,
+                    require_main_pid_of: None,
                 };
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
                 let handle = tokio::spawn(async move {
@@ -809,85 +964,167 @@ mod tests {
             server.stop().await;
         }
 
-        /// `factory_reset` wipes `home_dir` locally (no root needed) even
-        /// though the follow-up unit-re-arm + reboot go over the socket —
-        /// this is the split documented on `SysdDeviceOps::factory_reset`.
+        /// P6: the gateway no longer wipes its home itself on the sysd path
+        /// (the `FactoryReset` verb does, root side, from a closed constant).
+        /// A home other than that constant is refused before anything is
+        /// deleted or sent, so a reset can never report success while the
+        /// gateway's real data stays in place.
         #[tokio::test]
-        async fn factory_reset_wipes_locally_then_calls_sysd() {
+        async fn factory_reset_never_wipes_locally_and_refuses_a_foreign_home() {
             let server = TestServer::spawn(Some(current_uid())).await;
             let ops = server.device_ops();
 
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
 
-            let result = ops.factory_reset(home.path(), false).await;
-            // The wipe must have happened regardless of whether the
-            // downstream `systemctl` calls exist on this host.
-            let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
-            assert!(
-                remaining.is_empty(),
-                "home dir must be wiped: {remaining:?}"
-            );
-            match result {
-                Ok(_) => {}
-                Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+            for clear_network in [false, true] {
+                let result = ops.factory_reset(home.path(), clear_network).await;
+                match result {
+                    Err(DeviceOpError::Unsupported(msg)) => {
+                        assert!(msg.contains(duduclaw_sysd::GATEWAY_HOME_DIR), "{msg}");
+                        assert!(msg.contains("資料沒有被刪除"), "{msg}");
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
                 }
-                Err(e) => panic!("unexpected error variant: {e}"),
             }
+            assert!(home.path().join("leftover.txt").exists(), "nothing was wiped locally");
 
             server.stop().await;
         }
 
-        /// D4a-8: `clear_network: true` must ALSO reach the
-        /// `ClearNetworkCredentials` verb (not just `FactoryReset`) —
-        /// asserted the same "authorization outcome, not underlying
-        /// filesystem state" way as `authorized_calls_reach_real_dispatch_
-        /// not_auth_rejection` above (the real `/data/network/iwd` does not
-        /// exist on this dev/CI host, but `wipe_dir_contents` treats a
-        /// missing directory as a no-op success, so this reaches real
-        /// dispatch and returns `Ok` rather than erroring for an unrelated
-        /// filesystem reason).
+        /// L2: a separate process (an operator terminal command) refused by
+        /// sysd's main-pid gate gets a message pointing to the dashboard.
         #[tokio::test]
-        async fn factory_reset_with_clear_network_reaches_real_dispatch() {
+        async fn a_caller_refused_by_sysd_is_pointed_to_the_dashboard() {
+            let server = TestServer::spawn(Some(current_uid().wrapping_add(1))).await;
+            let ops = server.device_ops();
+            match ops.set_timezone("Asia/Taipei").await {
+                Err(DeviceOpError::Unsupported(msg)) => assert_eq!(msg, SYSD_CALLER_REFUSED),
+                other => panic!("expected the dashboard pointer, got {other:?}"),
+            }
+            match ops.set_ntp(true).await {
+                Err(DeviceOpError::Unsupported(msg)) => assert_eq!(msg, SYSD_CALLER_REFUSED),
+                other => panic!("expected the dashboard pointer, got {other:?}"),
+            }
+            server.stop().await;
+        }
+
+        /// L5: an older sysd answers the unknown verb with `bad_request`;
+        /// that is told apart from other failures and refused with its own
+        /// text, nothing deleted.
+        #[test]
+        fn an_old_sysd_is_detected_by_its_unknown_verb_rejection() {
+            use duduclaw_sysd::SysdClientError;
+            let old = SysdClientError::Rejected {
+                kind: "bad_request".into(),
+                message: "malformed request: unknown variant `factory_reset_v2`, expected one of `reboot`, …".into(),
+            };
+            assert!(is_unknown_verb_rejection(&old));
+            let other = SysdClientError::Rejected { kind: "io".into(), message: "wiping failed".into() };
+            assert!(!is_unknown_verb_rejection(&other));
+            let unauthorized = SysdClientError::Rejected { kind: "unauthorized".into(), message: "x".into() };
+            assert!(!is_unknown_verb_rejection(&unauthorized));
+            assert!(OLD_SYSD_RESET_REFUSAL.contains("資料沒有被刪除"));
+        }
+
+        /// The real server refuses an unknown verb with exactly that shape
+        /// (stands in for an older sysd).
+        #[tokio::test]
+        async fn the_real_server_rejects_an_unknown_verb_in_the_detected_shape() {
+            let server = TestServer::spawn(Some(current_uid())).await;
+            let path = server.socket_path.clone();
+            let raw = tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                writeln!(s, r#"{{"verb":"factory_reset_v9","params":{{"clear_network":false}}}}"#).unwrap();
+                s.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut out = String::new();
+                s.read_to_string(&mut out).unwrap();
+                out
+            })
+            .await
+            .unwrap();
+            let resp: duduclaw_sysd::SysdResponse = serde_json::from_str(raw.trim()).unwrap();
+            let err = resp.error.unwrap();
+            assert!(is_unknown_verb_rejection(&duduclaw_sysd::SysdClientError::Rejected { kind: err.kind, message: err.message }));
+            server.stop().await;
+        }
+
+        /// The mcp-server process forwards through the gateway on an
+        /// appliance, never the socket; the gateway process uses the socket.
+        #[test]
+        fn backend_choice_forwards_mcp_server_calls_through_the_gateway() {
+            let home = std::path::Path::new("/data/duduclaw");
+            assert_eq!(backend(false, true, Some(home)), Backend::Local, "off the appliance nothing changes");
+            assert_eq!(backend(false, true, None), Backend::Local);
+            assert_eq!(backend(true, true, Some(home)), Backend::Gateway(home));
+            assert_eq!(backend(true, false, Some(home)), Backend::Gateway(home), "no socket fallback either way");
+            assert_eq!(backend(true, true, None), Backend::Socket);
+            assert_eq!(backend(true, false, None), Backend::Local);
+        }
+
+        /// Forwarding with no gateway listening is an error, not a direct
+        /// sysd call.
+        #[tokio::test]
+        async fn forwarding_to_an_unreachable_gateway_fails_closed() {
+            let home = tempfile::tempdir().unwrap();
+            // A port nothing listens on.
+            std::fs::write(home.path().join("config.toml"), "[gateway]\nport = 9\n").unwrap();
+            let ops = SysdDeviceOps::via_gateway(home.path());
+            assert!(matches!(ops.reboot().await, Err(DeviceOpError::Unsupported(_))));
+        }
+
+        #[test]
+        fn the_sysd_home_check_accepts_only_the_fixed_directory() {
+            assert!(require_sysd_home(std::path::Path::new(duduclaw_sysd::GATEWAY_HOME_DIR)).is_ok());
+            assert!(require_sysd_home(std::path::Path::new("/data/duduclaw-other")).is_err());
+            assert!(require_sysd_home(std::path::Path::new("/tmp")).is_err());
+        }
+
+        /// P6: off the appliance the local reset keeps working; on an
+        /// appliance with sysd unreachable it is refused.
+        #[test]
+        fn a_local_reset_is_refused_on_an_appliance_only() {
+            assert!(refuse_local_reset_on_appliance(false).is_ok());
+            match refuse_local_reset_on_appliance(true) {
+                Err(DeviceOpError::Unsupported(msg)) => assert!(msg.contains("資料沒有被刪除"), "{msg}"),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        /// The local model verb reaches real dispatch for an authorized
+        /// caller (asserted on the authorization outcome; `systemctl` may
+        /// not exist on this host).
+        #[tokio::test]
+        async fn local_model_service_reaches_real_dispatch() {
             let server = TestServer::spawn(Some(current_uid())).await;
             let ops = server.device_ops();
-
-            let home = tempfile::tempdir().unwrap();
-            let result = ops.factory_reset(home.path(), true).await;
-            match result {
-                Ok(_) => {}
-                Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+            for action in [duduclaw_sysd::LocalModelAction::Stop, duduclaw_sysd::LocalModelAction::Restart] {
+                match ops.local_model_service(action).await {
+                    Ok(_) => {}
+                    Err(DeviceOpError::Unsupported(msg)) => {
+                        assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+                    }
+                    Err(e) => panic!("unexpected error variant: {e}"),
                 }
-                Err(e) => panic!("unexpected error variant: {e}"),
             }
-
             server.stop().await;
         }
 
         /// D4a-8 fail-closed contract: when `clear_network: true` and the
         /// sysd socket is unreachable, `factory_reset` must surface an
         /// `Err` — never silently proceed to a fabricated "Ok" while saved
-        /// Wi-Fi credentials were never actually cleared. `home_dir`'s own
-        /// (unprivileged, local) wipe still happens first and must succeed
-        /// regardless — only the privileged half is unreachable here.
+        /// Wi-Fi credentials were never actually cleared. Nothing is wiped
+        /// on the gateway side (P6: the home wipe is the verb's).
         #[tokio::test]
         async fn factory_reset_with_clear_network_fails_closed_when_socket_unreachable() {
             let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(std::path::PathBuf::from(
                 "/tmp/duduclaw-sysd-test-no-such-socket.sock",
             )));
 
-            let home = tempfile::tempdir().unwrap();
-            std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
+            let home = std::path::Path::new(duduclaw_sysd::GATEWAY_HOME_DIR);
+            let result = ops.factory_reset(home, true).await;
 
-            let result = ops.factory_reset(home.path(), true).await;
-
-            let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
-            assert!(
-                remaining.is_empty(),
-                "the local home_dir wipe must still have happened: {remaining:?}"
-            );
             assert!(
                 matches!(result, Err(DeviceOpError::Unsupported(_))),
                 "an unreachable socket must surface as Err, never a fabricated success: {result:?}"
@@ -1028,10 +1265,9 @@ mod tests {
             let result = ops.reboot().await;
             match result {
                 Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(
-                        msg.contains("unauthorized"),
-                        "expected unauthorized, got: {msg}"
-                    );
+                    // sysd's `unauthorized` refusal is surfaced with the
+                    // operator-facing text (L2).
+                    assert_eq!(msg, SYSD_CALLER_REFUSED, "expected the refusal text, got: {msg}");
                 }
                 other => panic!("expected an Unsupported(unauthorized) error, got {other:?}"),
             }

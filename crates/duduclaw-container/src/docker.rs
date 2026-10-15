@@ -34,6 +34,13 @@ pub const SCRIPT_LOG_MAX_FILES: &str = "1";
 /// … and at most this many bytes of it are read back into memory.
 pub const SCRIPT_LOG_READ_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// The script sandbox's resource-limit verdict for this process.
+static LIMITS_MEMO: duduclaw_core::container_engine::LimitMemo =
+    duduclaw_core::container_engine::LimitMemo::new();
+/// Last health answer, to notice the engine coming back.
+static ENGINE_REACHABILITY: duduclaw_core::container_engine::ReachabilityTracker =
+    duduclaw_core::container_engine::ReachabilityTracker::new();
+
 pub struct DockerRuntime {
     client: Docker,
     image: String,
@@ -76,6 +83,86 @@ impl DockerRuntime {
             Ok(_) => Ok(true),
             Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
             Err(e) => Err(DuDuClawError::Container(format!("cannot inspect sandbox image {}: {e}", self.image))),
+        }
+    }
+
+    /// The resource-limit self-check over the Docker API (P10): on a
+    /// rootless engine (`SecurityOptions` names `rootless`, or cannot be read)
+    /// a probe container from this runtime's image must read its memory and
+    /// pids limits back; otherwise the sandbox is unhealthy. A rootful
+    /// engine passes without a probe. When the image is not present the
+    /// check is skipped (the caller's image check reports that). The verdict
+    /// is reused for ten minutes (a failed attempt for one) and dropped when
+    /// the engine comes back from unavailable (see `health_check`).
+    async fn resource_limits(&self) -> std::result::Result<(), duduclaw_core::container_engine::LimitVerdict> {
+        use duduclaw_core::container_engine::{LimitVerdict, security_options_report_rootless};
+        if let Some(verdict) = LIMITS_MEMO.get() {
+            return if verdict.is_enforced() { Ok(()) } else { Err(verdict) };
+        }
+        let rootless = match tokio::time::timeout(duduclaw_core::docker_probe::PROBE_TIMEOUT, self.client.info()).await {
+            Ok(Ok(info)) => info.security_options.map(|o| security_options_report_rootless(&o)),
+            _ => None,
+        };
+        let verdict = if rootless == Some(false) {
+            LimitVerdict::Enforced
+        } else {
+            match self.image_present().await {
+                Ok(true) => self.probe_limits().await,
+                // Missing image: nothing to probe with; the caller refuses
+                // on the image check. Not remembered.
+                Ok(false) => return Ok(()),
+                Err(_) => LimitVerdict::ProbeFailed,
+            }
+        };
+        LIMITS_MEMO.put(verdict);
+        if verdict.is_enforced() {
+            Ok(())
+        } else {
+            warn!(reason = verdict.code(), "script sandbox: container resource limits are not enforced");
+            Err(verdict)
+        }
+    }
+
+    /// Run the probe container once (bounded) and classify what it printed.
+    /// The container is removed on every path.
+    async fn probe_limits(&self) -> duduclaw_core::container_engine::LimitVerdict {
+        use duduclaw_core::container_engine::{LIMIT_PROBE_TIMEOUT, LimitVerdict, classify_limit_output, new_probe_name};
+        let name = new_probe_name();
+        let options = CreateContainerOptions { name: name.as_str(), platform: None };
+        let created = self.client.create_container(Some(options), limit_probe_config(&self.image)).await;
+        let Ok(created) = created else { return LimitVerdict::ProbeFailed };
+        let id = created.id;
+        let run = async {
+            self.client.start_container(&id, None::<StartContainerOptions<String>>).await.ok()?;
+            let mut wait = self.client.wait_container(&id, None::<WaitContainerOptions<String>>);
+            let mut exit_code = None;
+            while let Some(item) = wait.next().await {
+                exit_code = Some(match item {
+                    Ok(resp) => resp.status_code,
+                    Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => code,
+                    Err(_) => return None,
+                });
+            }
+            let options = LogsOptions::<String> { stdout: true, stderr: false, follow: false, ..Default::default() };
+            let mut logs = self.client.logs(&id, Some(options));
+            let mut stdout = String::new();
+            while let Some(Ok(chunk)) = logs.next().await {
+                stdout.push_str(&chunk.to_string());
+                if stdout.len() > 4096 {
+                    break;
+                }
+            }
+            Some((exit_code == Some(0), stdout))
+        };
+        let outcome = tokio::time::timeout(LIMIT_PROBE_TIMEOUT, run).await;
+        let _ = self
+            .client
+            .remove_container(&id, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .await;
+        match outcome {
+            Ok(Some((success, stdout))) => classify_limit_output(success, false, &stdout),
+            Ok(None) => LimitVerdict::ProbeFailed,
+            Err(_) => classify_limit_output(false, true, ""),
         }
     }
 
@@ -130,6 +217,33 @@ fn build_container_config(
         env,
         ..Default::default()
     })
+}
+
+/// The resource-limit probe container (P10, `duduclaw_core::container_engine`):
+/// `image` with `cat` as entrypoint printing `memory.max` / `pids.max`, the
+/// probe memory and pids limits, no network, read-only root, no
+/// capabilities, `nobody`. Every field is a literal except the image.
+fn limit_probe_config(image: &str) -> Config<String> {
+    use duduclaw_core::container_engine::{LIMIT_FILES, PROBE_MEMORY_BYTES, PROBE_PIDS_LIMIT};
+    let host_config = bollard::models::HostConfig {
+        network_mode: Some("none".to_string()),
+        readonly_rootfs: Some(true),
+        memory: Some(PROBE_MEMORY_BYTES as i64),
+        memory_swap: Some(PROBE_MEMORY_BYTES as i64),
+        pids_limit: Some(PROBE_PIDS_LIMIT as i64),
+        cap_drop: Some(vec!["ALL".to_string()]),
+        security_opt: Some(vec!["no-new-privileges".to_string()]),
+        ..Default::default()
+    };
+    Config {
+        image: Some(image.to_string()),
+        labels: Some(HashMap::from([("managed-by".to_string(), "duduclaw".to_string())])),
+        host_config: Some(host_config),
+        entrypoint: Some(vec!["cat".to_string()]),
+        cmd: Some(LIMIT_FILES.iter().map(|f| f.to_string()).collect()),
+        user: Some("65534:65534".to_string()),
+        ..Default::default()
+    }
 }
 
 /// Build the bind-mount strings (`host:container:mode`) for a container config.
@@ -393,11 +507,23 @@ impl ContainerRuntime for DockerRuntime {
                 Some(Answer { success: matches!(list, Ok(Ok(_))), timed_out: list.is_err(), stdout: "", stderr: "" }),
             )
         };
+        if ENGINE_REACHABILITY.observe(status.is_reachable()) {
+            LIMITS_MEMO.clear();
+        }
         Ok(match status {
-            DockerStatus::Reachable { server_version } => RuntimeHealth {
-                healthy: true,
-                message: format!("Docker daemon is healthy (server {server_version})"),
-                uptime_seconds: 0, // Docker API does not expose daemon uptime directly
+            DockerStatus::Reachable { server_version } => match self.resource_limits().await {
+                Ok(()) => RuntimeHealth {
+                    healthy: true,
+                    message: format!("Docker daemon is healthy (server {server_version})"),
+                    uptime_seconds: 0, // Docker API does not expose daemon uptime directly
+                },
+                // Fail closed: a rootless engine that ignores the script
+                // container's memory/pids ceilings is not a sandbox.
+                Err(verdict) => RuntimeHealth {
+                    healthy: false,
+                    message: format!("{} ({})", verdict.reason_en(), verdict.code()),
+                    uptime_seconds: 0,
+                },
             },
             DockerStatus::Unavailable(why) => RuntimeHealth {
                 healthy: false,
@@ -480,6 +606,24 @@ mod tests {
         );
         assert!(hc.tmpfs.is_some(), "tmpfs still applied with egress");
         assert_eq!(hc.memory, Some(2 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn limit_probe_container_has_the_probe_limits_and_no_network() {
+        use duduclaw_core::container_engine::{LIMIT_FILES, PROBE_MEMORY_BYTES, PROBE_PIDS_LIMIT};
+        let cfg = limit_probe_config("ghcr.io/x/y:v1");
+        let hc = cfg.host_config.clone().unwrap();
+        assert_eq!(hc.memory, Some(PROBE_MEMORY_BYTES as i64));
+        assert_eq!(hc.memory_swap, Some(PROBE_MEMORY_BYTES as i64));
+        assert_eq!(hc.pids_limit, Some(PROBE_PIDS_LIMIT as i64));
+        assert_eq!(hc.network_mode.as_deref(), Some("none"));
+        assert_eq!(hc.readonly_rootfs, Some(true));
+        assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
+        assert!(hc.binds.is_none(), "the probe mounts nothing");
+        assert_eq!(cfg.entrypoint, Some(vec!["cat".to_string()]));
+        assert_eq!(cfg.cmd, Some(LIMIT_FILES.iter().map(|f| f.to_string()).collect::<Vec<_>>()));
+        assert_eq!(cfg.user.as_deref(), Some("65534:65534"));
+        assert_eq!(cfg.image.as_deref(), Some("ghcr.io/x/y:v1"));
     }
 
     #[test]
