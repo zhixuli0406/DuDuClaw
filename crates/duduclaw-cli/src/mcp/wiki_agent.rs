@@ -85,9 +85,10 @@ pub(crate) async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agen
         }
     }
 
-    // Allow reading reserved files (e.g. _index.md, _schema.md) — validation only blocks writes
-    if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
-        return tool_error("Path traversal is not allowed");
+    // Shared validator, before the path touches the disk. Reserved files
+    // (_index.md, _schema.md) may be read; only writes refuse them.
+    if let Err(e) = validate_wiki_read_path(page_path) {
+        return tool_error(&e);
     }
 
     let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
@@ -105,67 +106,74 @@ pub(crate) async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agen
             Err(_) => return tool_error("Wiki is busy with a source update; retry the read"),
         };
 
-    let full_path = wiki_dir.join(page_path);
-
-    // Verify the resolved path is still under wiki_dir (symlink protection)
-    if let (Ok(canon_wiki), Ok(canon_page)) = (wiki_dir.canonicalize(), full_path.canonicalize())
-        && !canon_page.starts_with(&canon_wiki)
+    // Fail-closed, no-follow read: the page must resolve inside the wiki
+    // directory and be a regular file opened with O_NOFOLLOW (a canonicalize
+    // failure used to skip the escape check).
+    let content = match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path)
     {
-        return tool_error("Path escapes wiki directory");
-    }
-
-    let content = match std::fs::read_to_string(&full_path) {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return tool_error(&format!("Page not found: {}", page_path));
-        }
-        Err(e) => return tool_error(&format!("Failed to read page: {e}")),
+        Err(e) => return tool_error(&wiki_read_error(page_path, &e)),
     };
     let file_name = Path::new(page_path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if !WIKI_RESERVED.contains(&file_name) {
-        let store = duduclaw_memory::WikiStore::new(wiki_dir);
-        let (page, parsed_raw) = match store.read_page_with_raw(page_path) {
-            Ok(page) => page,
-            Err(_) => return tool_error("Wiki page is unavailable or invalid"),
-        };
-        if parsed_raw != content
-            || page.do_not_inject
-            || !page.trust.is_finite()
-            || page.trust < 0.1
-        {
-            return tool_error("Wiki page is quarantined or changed; content withheld");
-        }
-        let db = home_dir.join("wiki_trust.db");
-        if db.exists() {
-            let trust_state = (|| -> std::result::Result<Option<(f64, i64)>, rusqlite::Error> {
-                let conn = rusqlite::Connection::open_with_flags(
-                    &db,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                conn.query_row(
-                    "SELECT trust,do_not_inject FROM wiki_trust_state
-                     WHERE page_path=?1 AND agent_id=?2",
-                    rusqlite::params![page_path, agent_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-            })();
-            match trust_state {
-                Ok(Some((trust, do_not_inject)))
-                    if !trust.is_finite() || trust < 0.1 || do_not_inject != 0 =>
-                {
-                    return tool_error("Wiki page is quarantined; content withheld");
-                }
-                Err(_) => return tool_error("Wiki trust state unavailable; content withheld"),
-                _ => {}
-            }
-        }
+    if !WIKI_RESERVED.contains(&file_name)
+        && let Some(reason) = wiki_page_withheld(home_dir, &wiki_dir, agent_id, page_path, &content)
+    {
+        return tool_error(reason);
     }
     tool_text(&content)
+}
+
+/// Why a (non-reserved) page's content must not leave the wiki, or `None`.
+///
+/// Shared by `wiki_read` and `wiki_share`, so sharing a page cannot publish
+/// what reading it would withhold: the parsed page must match the raw bytes
+/// just read, must not be `do_not_inject` or below trust 0.1, and the live
+/// trust store (when present) must not quarantine it. Fail closed: an
+/// unreadable page or trust store withholds.
+pub(crate) fn wiki_page_withheld(
+    home_dir: &Path,
+    wiki_dir: &Path,
+    agent_id: &str,
+    page_path: &str,
+    raw: &str,
+) -> Option<&'static str> {
+    let store = duduclaw_memory::WikiStore::new(wiki_dir.to_path_buf());
+    let (page, parsed_raw) = match store.read_page_with_raw(page_path) {
+        Ok(page) => page,
+        Err(_) => return Some("Wiki page is unavailable or invalid"),
+    };
+    if parsed_raw != raw || page.do_not_inject || !page.trust.is_finite() || page.trust < 0.1 {
+        return Some("Wiki page is quarantined or changed; content withheld");
+    }
+    let db = home_dir.join("wiki_trust.db");
+    if db.exists() {
+        let trust_state = (|| -> std::result::Result<Option<(f64, i64)>, rusqlite::Error> {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.query_row(
+                "SELECT trust,do_not_inject FROM wiki_trust_state
+                 WHERE page_path=?1 AND agent_id=?2",
+                rusqlite::params![page_path, agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+        })();
+        match trust_state {
+            Ok(Some((trust, do_not_inject)))
+                if !trust.is_finite() || trust < 0.1 || do_not_inject != 0 =>
+            {
+                return Some("Wiki page is quarantined; content withheld");
+            }
+            Err(_) => return Some("Wiki trust state unavailable; content withheld"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Best-effort activity-feed trace for knowledge writes. Wiki pages used to
@@ -261,48 +269,33 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
         return tool_error(&e);
     }
 
-    let full_path = wiki_dir.join(page_path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = full_path.parent()
-        && !parent.exists()
-        && let Err(e) = std::fs::create_dir_all(parent)
+    // Validate and confine BEFORE creating anything: the nearest existing
+    // ancestor must resolve inside the canonical wiki dir (fail closed), so a
+    // symlinked subdirectory cannot make this create directories outside the
+    // wiki. Checked again after the parents are created.
+    let full_path = match duduclaw_memory::wiki_path::prepare_wiki_write_target(&wiki_dir, page_path)
     {
-        return tool_error(&format!("Failed to create directory: {e}"));
-    }
+        Ok(p) => p,
+        Err(e) => {
+            return tool_error(&format!(
+                "Page path refused: {e}. It must resolve inside the wiki directory."
+            ));
+        }
+    };
 
-    // L11: symlink-escape guard (parity with the read path). Canonicalize the
-    // wiki dir and the parent of the target (the file itself may not exist yet)
-    // and reject if the resolved location escapes the wiki directory.
-    if let Ok(canon_wiki) = wiki_dir.canonicalize()
-        && let Some(parent) = full_path.parent()
-        && let Ok(canon_parent) = parent.canonicalize()
-        && !canon_parent.starts_with(&canon_wiki)
-    {
-        return tool_error("Path escapes wiki directory");
-    }
-
-    let is_new = !full_path.exists();
+    let is_new = std::fs::symlink_metadata(&full_path).is_err();
 
     // P2-B H-4: record where this write came from (host env only).
-    let stamped = match crate::mcp_memory_handlers::host_wiki_stamp(
-        content,
-        std::fs::read_to_string(&full_path).ok().as_deref(),
-    ) {
+    let existing = duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path).ok();
+    let stamped = match crate::mcp_memory_handlers::host_wiki_stamp(content, existing.as_deref()) {
         Ok(s) => s,
         Err(e) => return tool_error(&e),
     };
     let content = stamped.as_str();
 
-    // Atomic write: temp file + rename
-    let tmp_path = full_path.with_extension("md.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, content) {
-        return tool_error(&format!("Failed to write temp file: {e}"));
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &full_path) {
-        // Clean up temp file on rename failure
-        let _ = std::fs::remove_file(&tmp_path);
-        return tool_error(&format!("Failed to rename temp file: {e}"));
+    // Atomic write: O_EXCL temp file + rename (never through a planted link).
+    if let Err(e) = duduclaw_memory::wiki_path::atomic_write_nofollow(&full_path, content) {
+        return tool_error(&format!("Failed to write page: {e}"));
     }
 
     // Update _index.md

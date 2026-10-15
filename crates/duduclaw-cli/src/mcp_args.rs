@@ -8,11 +8,24 @@
 
 use serde_json::Value;
 
-/// A non-negative integer: a JSON number or a numeric string.
+/// A non-negative integer: a JSON number or a numeric string. An integral
+/// float (`10.0`, `"10.0"`, `1e3`) counts as that integer — some clients
+/// serialize every number as a float. A fractional, negative, non-finite or
+/// out-of-range value reads as absent. Callers still clamp the result.
 pub(crate) fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    let from_float = |f: f64| {
+        // 2^64 is exactly representable; anything at or above it overflows.
+        (f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f < 18_446_744_073_709_551_616.0)
+            .then_some(f as u64)
+    };
     match args.get(key)? {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.trim().parse().ok(),
+        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().and_then(from_float)),
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse::<u64>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().and_then(from_float))
+        }
         _ => None,
     }
 }
@@ -90,6 +103,15 @@ mod tests {
         assert_eq!(arg_f64(&a, "f"), Some(0.25));
         assert_eq!(arg_f64(&a, "fs"), Some(0.5));
         assert_eq!(arg_f64(&a, "n"), Some(5.0));
+        // Integral floats are integers; fractional / negative ones are absent.
+        let fl = json!({"f": 10.0, "fs": "10.0", "e": 1e3, "frac": 2.5, "nf": -3.0, "big": 1e300});
+        assert_eq!(arg_u64(&fl, "f"), Some(10));
+        assert_eq!(arg_u64(&fl, "fs"), Some(10));
+        assert_eq!(arg_u64(&fl, "e"), Some(1000));
+        assert_eq!(arg_u64(&fl, "frac"), None);
+        assert_eq!(arg_u64(&fl, "nf"), None);
+        assert_eq!(arg_u64(&fl, "big"), None);
+        assert_eq!(arg_u64(&json!({"s": "NaN"}), "s"), None);
         let odd = json!({"nan": "NaN", "inf": "inf"});
         assert_eq!(arg_f64(&odd, "nan"), None);
         assert_eq!(arg_f64(&odd, "inf"), None);

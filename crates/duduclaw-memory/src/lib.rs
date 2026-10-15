@@ -33,6 +33,7 @@ pub mod user_profile;
 pub mod vector;
 pub mod wiki;
 pub mod wiki_fence;
+pub mod wiki_path;
 
 pub use bench::{graph_rank_bench, GraphBenchReport};
 pub use code_map::{CodeMap, CodeMapConfig, RankedFile, SymbolInfo, SymbolKind};
