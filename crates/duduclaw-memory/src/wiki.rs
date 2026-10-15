@@ -777,7 +777,7 @@ impl WikiStore {
             std::fs::remove_file(&full)
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
         }
-        let indexed = match std::fs::read_to_string(self.wiki_dir.join("_index.md")) {
+        let indexed = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, "_index.md") {
             Ok(t) => t.contains(&format!("]({path})")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
@@ -1062,7 +1062,7 @@ impl WikiStore {
 
         let content = lines.join("\n") + "\n";
         let index_path = self.wiki_dir.join("_index.md");
-        std::fs::write(&index_path, content)
+        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
             .map_err(|e| DuDuClawError::Memory(format!("rebuild index: {e}")))?;
 
         info!(pages = pages.len(), "Wiki index rebuilt");
@@ -1080,17 +1080,18 @@ impl WikiStore {
         let mut exported = 0;
 
         // Copy reserved files
+        // Read through the no-follow helper: a reserved file replaced by a
+        // symlink must not copy an outside file into the export.
         for reserved in &["_schema.md", "_index.md", "_log.md"] {
-            let src = self.wiki_dir.join(reserved);
-            if src.exists() {
-                let dst = output_dir.join(reserved);
-                std::fs::copy(&src, &dst)
-                    .map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?;
+            match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, reserved) {
+                Ok(content) => std::fs::write(output_dir.join(reserved), content)
+                    .map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(DuDuClawError::Memory(format!("copy {reserved}: {e}"))),
             }
         }
 
         for page in &pages {
-            let src = self.wiki_dir.join(&page.path);
             let dst = output_dir.join(&page.path);
 
             // Ensure parent dir
@@ -1100,7 +1101,7 @@ impl WikiStore {
                         .map_err(|e| DuDuClawError::Memory(format!("mkdir: {e}")))?;
                 }
 
-            let content = std::fs::read_to_string(&src)
+            let content = crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path)
                 .map_err(|e| DuDuClawError::Memory(format!("read {}: {e}", page.path)))?;
 
             // Append Obsidian wikilinks for related pages
@@ -1645,7 +1646,7 @@ impl WikiStore {
         // Advisory lock — blocks until acquired
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
-        let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+        let existing = self.read_index_nofollow()?;
         let now = Utc::now().format("%Y-%m-%d").to_string();
         // Escape title chars that break markdown link syntax
         let safe_title = title.replace('[', "\\[").replace(']', "\\]");
@@ -1666,15 +1667,9 @@ impl WikiStore {
         }
 
         // Atomic write: temp + rename under lock
-        let tmp_path = index_path.with_extension("md.idx_tmp");
         let content = lines.join("\n") + "\n";
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| format!("write index tmp: {e}"))?;
-        std::fs::rename(&tmp_path, &index_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("rename index: {e}")
-            })?;
+        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+            .map_err(|e| format!("write index: {e}"))?;
 
         // Lock released when lock_file is dropped
         Ok(())
@@ -1692,7 +1687,7 @@ impl WikiStore {
             .map_err(|e| format!("open lock: {e}"))?;
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
-        let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+        let existing = self.read_index_nofollow()?;
         let link_pattern = format!("]({})", page_path);
 
         let lines: Vec<&str> = existing
@@ -1700,15 +1695,20 @@ impl WikiStore {
             .filter(|line| !line.contains(&link_pattern))
             .collect();
 
-        let tmp_path = index_path.with_extension("md.idx_tmp");
         let content = lines.join("\n") + "\n";
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| format!("write index tmp: {e}"))?;
-        std::fs::rename(&tmp_path, &index_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("rename index: {e}")
-            })
+        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+            .map_err(|e| format!("write index: {e}"))
+    }
+
+    /// `_index.md` without following a symlink. Missing means empty; a link
+    /// or other non-regular file is an error, so the index is never rebuilt
+    /// from (or written over) a file outside the wiki.
+    fn read_index_nofollow(&self) -> std::result::Result<String, String> {
+        match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, "_index.md") {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("read index: {e}")),
+        }
     }
 
     fn append_log(&self, action: &str, page_path: &str) -> std::result::Result<(), String> {
@@ -1724,9 +1724,22 @@ impl WikiStore {
         };
 
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        // Never append through a symlink planted at `_log.md`: refuse a link
+        // up front (Windows) and let `O_NOFOLLOW` fail the open (unix).
+        match std::fs::symlink_metadata(&log_path) {
+            Ok(m) if !m.is_file() => return Err("open log: _log.md is not a regular file".to_string()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("open log: {e}")),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut f = options
             .open(&log_path)
             .map_err(|e| format!("open log: {e}"))?;
         f.write_all(entry.as_bytes())
@@ -2962,6 +2975,40 @@ This is the body of the page.
         // Deleting through a symlinked dir removes nothing outside.
         assert!(store.delete_page("linked/secret.md").is_err());
         assert!(outside.join("secret.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reserved_file_symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let outside_log = tmp.path().join("outside-log.md");
+        let outside_index = tmp.path().join("outside-index.md");
+        std::fs::write(&outside_log, "OUTSIDE LOG\n").unwrap();
+        std::fs::write(&outside_index, "OUTSIDE INDEX\n").unwrap();
+        let store = WikiStore::new(wiki.clone());
+        store.ensure_scaffold().unwrap();
+        std::fs::remove_file(wiki.join("_log.md")).unwrap();
+        std::fs::remove_file(wiki.join("_index.md")).unwrap();
+        symlink(&outside_log, wiki.join("_log.md")).unwrap();
+        symlink(&outside_index, wiki.join("_index.md")).unwrap();
+
+        // write_page logs and indexes: neither may write through the links.
+        store.write_page("concepts/a.md", "---\ntitle: A\n---\nbody").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside_log).unwrap(), "OUTSIDE LOG\n");
+        assert_eq!(std::fs::read_to_string(&outside_index).unwrap(), "OUTSIDE INDEX\n");
+
+        // Export must not copy the outside files into the vault.
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        assert!(store.export_obsidian(&vault).is_err());
+        assert!(!vault.join("_index.md").exists());
+
+        // rebuild_index replaces the link with a regular file, target untouched.
+        store.rebuild_index().unwrap();
+        assert_eq!(std::fs::read_to_string(&outside_index).unwrap(), "OUTSIDE INDEX\n");
+        assert!(!std::fs::symlink_metadata(wiki.join("_index.md")).unwrap().file_type().is_symlink());
     }
 
     #[cfg(unix)]
