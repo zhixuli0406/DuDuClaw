@@ -7,7 +7,7 @@
 
 | # | 題目 | 決定 |
 |---|---|---|
-| 1 | 訂閱帳號 OAuth 登入 | **B**：允許各家 CLI 的訂閱登入（Claude Pro/Max、ChatGPT、Google、Kimi、Copilot、Cursor、Grok、Kiro…），但在登入前**明示該廠商條款風險**（原寫「Anthropic 與 Google 自 2026-03 起伺服器端封鎖」，找不到一手出處，2026-10-16 更正為只引用廠商條款原文，見 [docs/features/zh-TW/13-multi-runtime.md](../features/zh-TW/13-multi-runtime.md)；OpenAI 政策不明），使用者勾選「我了解風險」才繼續。API key 路徑一律提供且為預設建議。 |
+| 1 | 訂閱帳號 OAuth 登入 | **B**：允許各家 CLI 的訂閱登入（Claude Pro/Max、ChatGPT、Google、Kimi、Copilot、Cursor、Grok、Kiro…），但在登入前**明示該廠商條款風險**（原寫「Anthropic 與 Google 自 2026-03 起伺服器端封鎖」，找不到一手出處，2026-10-16 更正為只引用廠商條款原文，見 [docs/features/zh-TW/13-multi-runtime.md](../features/zh-TW/13-multi-runtime.md)；OpenAI 自 2026-09-29 起有官方 Sign in with ChatGPT 計畫，開放給開源與經核准的商業合作夥伴，token 須留在使用者本機），使用者勾選「我了解風險」才繼續。API key 路徑一律提供且為預設建議。 |
 | 2 | 首版內建 runtime 範圍 | **全部**：Node 系（Claude Code、Codex、Gemini CLI、Qwen Code、Kimi Code、GitHub Copilot CLI）＋二進位系（Grok Build、Kiro CLI、Cursor `agent`、OpenCode）＋Python 系（Mistral Vibe）。root A/B 槽由 7168 MiB 升至 **8192 MiB**，`os_update.rs::MAX_ROOT_BYTES` 同步升至 9 GiB。 |
 | 3 | 本地模型 | **A**：映像內建 llama.cpp `llama-server`（MIT、Vulkan）；模型權重不進映像，OOBE／dashboard 一鍵從 Hugging Face 下載精選 GGUF 到 `/data/duduclaw/models`。 |
 | 4 | 微調／後訓練 | **C**：(a) dashboard「微調與後訓練」頁——從對話／審批紀錄整理資料集 → 送雲端 GPU 或使用者自己的 GPU 主機跑 LoRA／DPO → 匯回 GGUF；(b) LLaMA-Factory LlamaBoard 以 `compat.d` 選裝 runner（docker）提供給有獨顯的進階使用者。 |

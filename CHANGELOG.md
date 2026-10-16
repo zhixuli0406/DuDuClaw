@@ -13,6 +13,8 @@
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。
 - 憑證遮罩 `secret_redact`（`redact_secrets`、`mask_secret`、`redact_opt`）從 `duduclaw-gateway` 搬到 `duduclaw-core`，讓紀錄服務不必連結 gateway。`duduclaw_gateway::secret_redact` 改成轉出同一份實作，呼叫端不用改，行為不變（原有 14 個測試隨程式碼搬到 core，照常通過）。
+- 訂閱登入風險說明裡的 OpenAI 段落不再寫「立場不明」。OpenAI 已有官方的 Sign in with ChatGPT 計畫（[條款](https://openai.com/policies/sign-in-with-chatgpt-terms/) 2026-09-29 版、[快速入門](https://developers.openai.com/siwc/quickstart)、[說明文章](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)，2026-10-16 查閱）：在第三方應用程式使用 ChatGPT 方案開放給開源合作夥伴與選定的商業合作夥伴，商業產品要先取得 OpenAI 同意，驗證 token 只能存在使用者自己掌控的本機。Codex 登入彈窗、gateway 拒絕訊息與稽核列的 `policy_url` 改連到這份條款（原為 OpenAI 使用條款）；`runtime_catalog.rs` 的 Codex `tos_note`、三語 `docs/features/13-multi-runtime.md` 與 `docs/guides/docker.md` 的 Codex 段落同步改寫，Docker 的 ChatGPT 登入方法另註明 token 存在容器 volume、伺服器部署請優先用 API key。建議仍是 API key。xAI 沒有重新查證，維持「立場不明」。
+- Gemini CLI 的條款提示（`tos_note`、風險說明、三語文件）補上 Google [停用公告](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）的內容：自 2026-06-18 起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API key（Gemini API 或企業方案）仍可使用。Gemini CLI runtime 的棄用時程不變（v1.75.0 移除）。
 
 ## [1.74.0] - 2026-10-16 — 訂閱登入的伺服器端同意關卡、MCP 2026-07-28 協定、C1 品牌識別、wiki 路徑加固
 
