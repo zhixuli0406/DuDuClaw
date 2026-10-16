@@ -527,4 +527,3 @@ fn journal_read_argv(after: &str) -> Vec<String> {
         format!("_SYSTEMD_SLICE={}", journal::DROPBEAR_SLICE),
     ]
 }
-
