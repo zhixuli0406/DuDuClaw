@@ -356,6 +356,14 @@ mod tests {
             SysdRequest::SysupdateApply,
             SysdRequest::SshServiceStart,
             SysdRequest::SshServiceStop,
+            // The maintenance SSH verbs are gateway-only (design §8.1): an AI
+            // employee must never open a login path or read its audit view.
+            SysdRequest::SshMaintOpen {
+                public_key: "ssh-ed25519 AAAA".into(),
+                ttl_seconds: 600,
+                window_id: "w".into(),
+            },
+            SysdRequest::SshMaintStatus,
             SysdRequest::FactoryReset,
             SysdRequest::ClearNetworkCredentials,
             SysdRequest::Hostname { set: "x".into() },
@@ -382,6 +390,10 @@ mod tests {
         assert_eq!(decide(&reboot, true, false).0, Decision::NotAppliance);
         let ssh = body(serde_json::json!({"verb": "ssh_service_start"}));
         assert_eq!(decide(&ssh, true, true).0, Decision::VerbNotAllowed);
+        let maint = body(serde_json::json!({"verb": "ssh_maint_status"}));
+        assert_eq!(decide(&maint, true, true).0, Decision::VerbNotAllowed);
+        let open = body(serde_json::json!({"verb": "ssh_maint_open", "params": {"public_key": "k", "ttl_seconds": 600, "window_id": "w"}}));
+        assert_eq!(decide(&open, true, true).0, Decision::VerbNotAllowed);
         // A body made for another route, or with extra fields, is refused.
         assert_eq!(decide(br#"{"op":"status"}"#, true, true).0, Decision::BadRequest);
         let other = serde_json::to_vec(&serde_json::json!({"route": "computer-use", "request": {"verb": "reboot"}})).unwrap();
