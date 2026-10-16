@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+- 維修模式的 SSH 改用專用帳號加臨時金鑰，這次先做完 OS 端輔助程式 `duduclaw-sysd` 的部分（閘道與儀表板在後續 PR）。要等 DuDuClaw OS 出貨 `duduclaw-maint` 帳號後才會生效，在那之前使用者看不到任何改變。內容：
+  - 新指令 `ssh_maint_open`、`ssh_maint_status`（sysd 指令從 18 個變 20 個）。開窗時只收一把公鑰：Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元的 RSA（指數為奇數、不超過 64 位元）。輔助程式自己解碼並逐欄檢查，拒絕金鑰前的選項、憑證、私鑰、PuTTY 與 RFC 4716 區塊、一次多把；寫進檔案的只有固定選項（禁止轉送埠、agent、X11）加上解碼後的原始金鑰。
+  - 金鑰檔放在重開機就清空的 `/run/duduclaw-maint-ssh/`，寫入時不跟隨符號連結，已有金鑰時不覆蓋（回 `busy`），寫完讀回比對。
+  - 開窗前檢查 OS 實際生效的設定：就緒標記、帳號 uid／gid 4800、dropbear 合併後的啟動參數逐個比對、dropbear 綁在 sysd 上、擋住這個帳號連本機服務的防火牆規則與跳轉、22 埠只收區網與 VPN 來源。任何一項不符就回「不支援」，不會退回只開連接埠。
+  - 視窗最長 24 小時，期限以開機後經過時間計算，改系統時鐘延長不了；sysd 停擺時還有 systemd 的後備計時器收回金鑰。sysd 重啟時發現殘留的視窗會先補記事件再關閉。
+  - sysd 每 15 秒自己從 journal 讀登入與登出（只認 journald 自己填的欄位），寫進只有 root 能存取的 `/data/system/maint-ssh-audit.log`，不靠閘道輪詢。每個視窗前 50 筆登入逐筆記錄、之後只計數；稽核檔超過 1 MiB 輪替，保留 5 份舊檔，並把開窗紀錄重寫到新檔開頭。稽核檔寫不進去（例如鎖被佔住）時不會開窗；關窗時則回報問題，把紀錄與還沒讀到的事件留著重試，寫完之前不接受新的開窗。開窗每小時最多 12 次、間隔至少 5 秒。視窗狀態與 journal 讀取位置存在 `/data/system/maint-ssh/`（重開機後仍在），視窗期間重開機的話，下次開機會補記登入並以「重開機」關窗；視窗開著時若防火牆的維修出站規則不見了，會立即關窗。
+  - 映像有就緒標記 `/usr/lib/duduclaw/maint-ssh.ready` 時，舊的只開埠 `ssh_service_start` 會被拒絕；`ssh_service_stop` 另外負責刪金鑰、撤計時器、補記事件與寫關窗紀錄。兩個新指令都不開放給 `os_*` MCP 工具經閘道內部路由呼叫。
+  - 尚未驗證（要等 OS 映像在 QEMU 上跑活測）：systemd、nftables、dropbear、journald 的真實輸出格式，systemd-run 同時帶單調與絕對時間的計時器，sysd 單次重啟時 dropbear 是否保持運作。
+
 ### Changed
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。

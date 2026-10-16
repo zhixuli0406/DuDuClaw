@@ -98,12 +98,33 @@ async fn main() -> anyhow::Result<()> {
         info!(floor = ?floor, "sysd: rollback floor");
         duduclaw_sysd::rollback_floor::set_floor(floor);
     }
+    // Maintenance SSH: take SSH_LOCK before the socket accepts anything, so
+    // the startup cleanup of a window left by a previous run (R5) happens
+    // before any SSH verb; the same task then runs the 15 s tick (R4).
+    #[cfg(unix)]
+    {
+        let first = duduclaw_sysd::maint_ssh::SSH_LOCK.lock().await;
+        let supervisor = tokio::spawn(duduclaw_sysd::maint_ssh::run_supervisor(first));
+        // The supervisor never returns; if it panics, nobody enforces window
+        // deadlines any more, so exit and let systemd restart sysd (whose
+        // startup cleanup then closes the window).
+        tokio::spawn(async move {
+            let outcome = supervisor.await;
+            tracing::error!(?outcome, "sysd: maintenance SSH supervisor stopped; exiting so systemd restarts sysd");
+            std::process::exit(70);
+        });
+    }
     info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, require_main_pid_of = ?require_main_pid_of, "sysd: starting");
     let listener = bind(&socket_path, allowed_uid)?;
     info!(socket = %socket_path.display(), "sysd: listening");
 
     let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid, require_main_pid_of };
     serve(listener, config, shutdown_signal()).await?;
+    // A reboot stops sysd with SIGTERM: write the maintenance SSH events read
+    // so far and save the cursor before going (bounded; the next startup
+    // replays from the saved cursor anyway).
+    #[cfg(unix)]
+    duduclaw_sysd::maint_ssh::shutdown_flush(std::time::Duration::from_secs(5)).await;
     info!("sysd: clean shutdown");
     Ok(())
 }
