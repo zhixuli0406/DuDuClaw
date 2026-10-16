@@ -199,29 +199,22 @@ fn has_verdict(rule: &[Value], verdict: &str) -> bool {
     rule.iter().any(|e| e.get(verdict).is_some())
 }
 
-/// `nft -j list chain inet filter output`: a rule `oif "lo" jump
-/// duduclaw_maint_egress`, and no rule before it that can end evaluation
-/// (which would let loopback traffic skip the jump). Note for the OS: the
-/// simplest ruleset that passes puts the maintenance jump first in the
-/// output chain; jumps to other regular chains before it are allowed only
-/// because a jump returns.
+/// `nft -j list chain inet filter output`: a filter base chain on the
+/// output hook whose **first** rule is `oif "lo" jump duduclaw_maint_egress`
+/// (counters allowed). Nothing may run before it, so no earlier rule or
+/// jumped-to chain can accept the account's loopback traffic first. The OS
+/// ruleset must therefore list the maintenance jump before podman's.
 pub fn output_chain_ok(raw: &str) -> Result<(), String> {
     let dump: Value = serde_json::from_str(raw).map_err(|e| format!("nft output is not JSON: {e}"))?;
     let rules = chain_rules(&dump, OUTPUT_CHAIN, Some(("output", None)))?;
     let lo = Value::String("lo".to_string());
     let jump = serde_json::json!({ "jump": { "target": MAINT_EGRESS_CHAIN } });
-    let position = rules.iter().position(|rule| {
+    let first_is_jump = rules.first().is_some_and(|rule| {
         let s = statements(rule);
         s.len() == 2 && is_match(s[0], &meta("oif"), &lo) && *s[1] == jump
     });
-    let Some(position) = position else {
-        return Err(format!("output chain has no `oif \"lo\" jump {MAINT_EGRESS_CHAIN}` rule"));
-    };
-    // Jumps to other chains (podman's egress guard) come back; anything that
-    // can end evaluation in this base chain could let the traffic skip ours.
-    let ends_evaluation = |r: &&[Value]| ["accept", "return", "goto", "queue", "vmap"].iter().any(|v| has_verdict(r, v));
-    if rules[..position].iter().any(ends_evaluation) {
-        return Err(format!("an output rule before the jump to {MAINT_EGRESS_CHAIN} can accept loopback traffic"));
+    if !first_is_jump {
+        return Err(format!("the first output rule is not `oif \"lo\" jump {MAINT_EGRESS_CHAIN}`"));
     }
     Ok(())
 }
@@ -404,8 +397,8 @@ pub(crate) mod tests {
             r#"{{"nftables":[{{"metainfo":{{"version":"1.1.1"}}}},
             {{"chain":{{"family":"inet","table":"filter","name":"output","handle":3,"type":"filter","hook":"output","prio":0,"policy":"accept"}}}},
             {extra_before}
-            {{"rule":{{"family":"inet","table":"filter","chain":"output","handle":7,"expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"oif"}}}},"right":"lo"}}}},{{"jump":{{"target":"duduclaw_podman_egress"}}}}]}}}},
-            {{"rule":{{"family":"inet","table":"filter","chain":"output","handle":8,"expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"oif"}}}},"right":"lo"}}}},{{"jump":{{"target":"duduclaw_maint_egress"}}}}]}}}}]}}"#
+            {{"rule":{{"family":"inet","table":"filter","chain":"output","handle":8,"expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"oif"}}}},"right":"lo"}}}},{{"counter":{{"packets":0,"bytes":0}}}},{{"jump":{{"target":"duduclaw_maint_egress"}}}}]}}}},
+            {{"rule":{{"family":"inet","table":"filter","chain":"output","handle":7,"expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"oif"}}}},"right":"lo"}}}},{{"jump":{{"target":"duduclaw_podman_egress"}}}}]}}}}]}}"#
         )
     }
 
@@ -489,6 +482,9 @@ pub(crate) mod tests {
     #[test]
     fn output_chain_needs_the_jump_and_no_earlier_accept() {
         assert!(output_chain_ok(&output_chain("")).is_ok());
+        // Even a jump to another chain may not come first.
+        let podman_first = r#"{"rule":{"family":"inet","table":"filter","chain":"output","handle":5,"expr":[{"match":{"op":"==","left":{"meta":{"key":"oif"}},"right":"lo"}},{"jump":{"target":"duduclaw_podman_egress"}}]}},"#;
+        assert!(output_chain_ok(&output_chain(podman_first)).is_err());
         let early_accept = r#"{"rule":{"family":"inet","table":"filter","chain":"output","handle":5,"expr":[{"match":{"op":"==","left":{"meta":{"key":"oif"}},"right":"lo"}},{"accept":null}]}},"#;
         assert!(output_chain_ok(&output_chain(early_accept)).is_err());
         let no_jump = output_chain("").replace("duduclaw_maint_egress", "something_else");

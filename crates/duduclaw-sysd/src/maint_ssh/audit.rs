@@ -10,8 +10,18 @@
 //!   whole append (and sysd also for a rotation). sysd creates it with
 //!   `O_CREAT|O_NOFOLLOW` mode 0600 and refuses a lock file or audit file that
 //!   is not a regular file owned by root with no group/other bits, so the
-//!   script must create it under `umask 077` (e.g.
-//!   `umask 077; exec 9>>/data/system/maint-ssh-audit.log.lock; flock -w 10 9`).
+//!   script must create it under `umask 077`. busybox `flock` has no `-w`,
+//!   so wait with a bounded retry loop:
+//!   ```sh
+//!   umask 077
+//!   exec 9>>/data/system/maint-ssh-audit.log.lock
+//!   i=0
+//!   until flock -n 9; do
+//!       i=$((i + 1)); [ "$i" -ge 10 ] && exit 1   # give up after ~10 s
+//!       sleep 1
+//!   done
+//!   printf '%s\n' "$record" >>/data/system/maint-ssh-audit.log
+//!   ```
 //!   sysd never blocks on the lock: it retries without blocking for at most
 //!   [`LOCK_TIMEOUT`] and otherwise treats the write as failed (an open is
 //!   undone; a close records the problem and keeps the record queued).
@@ -21,7 +31,8 @@
 //!   the open record of the window in progress is written again at the top of
 //!   the new file with `"rewritten_after_rotation": true`. The script only
 //!   appends. Factory reset should remove `maint-ssh-audit.log`,
-//!   `maint-ssh-audit.log.1` … `.5` and `maint-ssh-audit.log.lock`.
+//!   `maint-ssh-audit.log.1` … `.5`, `maint-ssh-audit.log.lock` and the
+//!   window state directory `/data/system/maint-ssh/` (see `super::STATE_DIR`).
 //! - **Records** (`ts` is always an integer: Unix seconds, UTC):
 //!   - `{"event":"open","ts","window_id","key_type","key_fingerprint","ttl_seconds","expires_at","host_key_fingerprints":[…]}`
 //!     (`expires_at` Unix seconds; fingerprints `SHA256:<unpadded base64>`).
@@ -35,7 +46,11 @@
 //!     `trigger` is `stop`, `deadline` or `startup_cleanup` from sysd. The
 //!     script writes `{"event":"close","ts","trigger":"fallback_timer", …}`
 //!     with whatever of these fields it knows (`window_id` may be `null`);
-//!     sysd's next startup cleanup replays the journal from `window.json`.
+//!     sysd's next startup cleanup replays the journal from
+//!     `/data/system/maint-ssh/window.json`. After a reboot that cleanup
+//!     writes the close record with `"trigger": "reboot"`.
+//!   - `{"event":"audit_backlog_lost","ts","error"}` when the saved backlog
+//!     of owed records could not be read at startup.
 //!     A close record whose events could not all be read yet has
 //!     `"events_complete": false` and is held back until they are, then
 //!     written with `"events_complete": true` after them.
@@ -102,16 +117,26 @@ impl AuditLog {
         }
         let this = self.clone();
         let budget = self.lock_timeout + Duration::from_secs(5);
-        let task = tokio::task::spawn_blocking(move || this.append_blocking(&records, reopen.as_ref()));
+        // Set when the caller has given up, so a writer that only gets the
+        // lock afterwards writes nothing the caller believes failed.
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let task = tokio::task::spawn_blocking(move || this.append_blocking(&records, reopen.as_ref(), &flag));
         match tokio::time::timeout(budget, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => Err(format!("audit writer failed: {e}")),
-            Err(_) => Err(format!("writing {} did not finish in time", self.path.display())),
+            Err(_) => {
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(format!("writing {} did not finish in time", self.path.display()))
+            }
         }
     }
 
-    fn append_blocking(&self, records: &[Value], reopen: Option<&Value>) -> Result<(), String> {
+    fn append_blocking(&self, records: &[Value], reopen: Option<&Value>, cancelled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
         let _lock = self.acquire_lock()?;
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the caller gave up before the audit lock was taken".to_string());
+        }
         let result = (|| -> std::io::Result<()> {
             let mut file = open_append(&self.path, self.owner_uid)?;
             for record in records {

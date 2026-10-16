@@ -8,6 +8,7 @@
 //! [`MaintHost::ssh_start`] / [`MaintHost::ssh_stop`].
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::dispatch::DispatchResult;
@@ -43,6 +44,11 @@ pub trait MaintHost: Send + Sync {
     /// Wall clock since the Unix epoch (only for records and the PID 1
     /// fallback timer's calendar time, never for the deadline).
     fn realtime(&self) -> Result<Duration, String>;
+    /// The real path of a pinned executable, as journald records it in
+    /// `_EXE` (see [`resolve_exe`]).
+    fn trusted_exe(&self, pin: &ExePin) -> Result<String, String>;
+    /// This boot's id (`/proc/sys/kernel/random/boot_id`).
+    fn boot_id(&self) -> Result<String, String>;
     /// `(uid, primary gid)` of a user name.
     fn user_ids(&self, name: &str) -> Option<(u32, u32)>;
     /// gid of a group name.
@@ -59,6 +65,36 @@ pub struct Lines {
 
 /// Longest stdout line kept by [`MaintHost::run_lines`].
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
+
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+
+/// An executable whose identity is checked through journald's `_EXE`: the
+/// configured `path` may be a symlink (oe-core builds dropbear as
+/// `dropbearmulti` with `/usr/sbin/dropbear` linking to it), and its real
+/// path must be a file directly inside `dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExePin {
+    pub path: PathBuf,
+    pub dir: PathBuf,
+}
+
+/// Resolve `pin.path` to its real path, requiring a regular file directly
+/// inside `pin.dir` (both canonicalised), owned by `owner_uid` and not
+/// writable by group or others. Any failure refuses (no events of that
+/// process are trusted).
+pub fn resolve_exe(pin: &ExePin, owner_uid: u32) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let real = std::fs::canonicalize(&pin.path).map_err(|e| format!("cannot resolve {}: {e}", pin.path.display()))?;
+    let dir = std::fs::canonicalize(&pin.dir).map_err(|e| format!("cannot resolve {}: {e}", pin.dir.display()))?;
+    if real.parent() != Some(dir.as_path()) {
+        return Err(format!("{} resolves to {}, outside {}", pin.path.display(), real.display(), dir.display()));
+    }
+    let meta = std::fs::symlink_metadata(&real).map_err(|e| format!("{}: {e}", real.display()))?;
+    if !meta.is_file() || meta.uid() != owner_uid || meta.mode() & 0o022 != 0 {
+        return Err(format!("{} must be a regular file owned by uid {owner_uid}, not group/other writable", real.display()));
+    }
+    real.to_str().map(str::to_string).ok_or_else(|| format!("{} is not UTF-8", real.display()))
+}
 
 /// Build an owned argv from literals.
 pub fn argv(parts: &[&str]) -> Vec<String> {
@@ -144,6 +180,20 @@ impl MaintHost for SystemHost {
             .map_err(|e| format!("system clock before the epoch: {e}"))
     }
 
+    fn trusted_exe(&self, pin: &ExePin) -> Result<String, String> {
+        resolve_exe(pin, 0)
+    }
+
+    fn boot_id(&self) -> Result<String, String> {
+        let raw = std::fs::read_to_string(BOOT_ID_PATH).map_err(|e| format!("{BOOT_ID_PATH}: {e}"))?;
+        let id = raw.trim();
+        if id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            Ok(id.to_string())
+        } else {
+            Err(format!("{BOOT_ID_PATH} has unexpected content"))
+        }
+    }
+
     fn user_ids(&self, name: &str) -> Option<(u32, u32)> {
         lookup_user(name)
     }
@@ -186,36 +236,6 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -
 
 fn finish_line(buf: Vec<u8>, overlong: bool) -> String {
     if overlong { String::new() } else { String::from_utf8_lossy(&buf).into_owned() }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn bounded_lines_skip_overlong_ones() {
-        let mut data = b"a\n".to_vec();
-        data.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES + 10));
-        data.extend_from_slice(b"\nb\nc");
-        let mut r = tokio::io::BufReader::with_capacity(1024, &data[..]);
-        let mut got = Vec::new();
-        while let Some(l) = read_bounded_line(&mut r).await.unwrap() {
-            got.push(l);
-        }
-        assert_eq!(got, ["a", "", "b", "c"]);
-    }
-
-    #[tokio::test]
-    async fn run_lines_stops_at_the_limit() {
-        let host = SystemHost;
-        let out = host.run_lines(&argv(&["sh", "-c", "i=0; while [ $i -lt 100000 ]; do echo $i; i=$((i+1)); done"]), 10).await.unwrap();
-        assert_eq!(out.lines.len(), 10);
-        assert!(out.truncated);
-        assert_eq!(out.lines[9], "9");
-        let all = host.run_lines(&argv(&["sh", "-c", "echo a; echo b"]), 10).await.unwrap();
-        assert_eq!((all.lines.len(), all.truncated), (2, false));
-        assert!(host.run_lines(&argv(&["sh", "-c", "echo a; exit 3"]), 10).await.is_err());
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -270,4 +290,69 @@ fn lookup_group(name: &str) -> Option<u32> {
 fn unsafe_zeroed_passwd() -> libc::passwd {
     // SAFETY: `passwd` is plain old data; all-zero is a valid initial value.
     unsafe { std::mem::zeroed() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn me() -> u32 {
+        // SAFETY: no preconditions.
+        unsafe { libc::getuid() }
+    }
+
+    #[test]
+    fn exe_pins_resolve_plain_and_multi_call_layouts() {
+        let t = tempfile::tempdir().unwrap();
+        let sbin = t.path().join("usr/sbin");
+        std::fs::create_dir_all(&sbin).unwrap();
+        let sbin = std::fs::canonicalize(&sbin).unwrap();
+        // Plain: /usr/sbin/dropbear is the binary.
+        std::fs::write(sbin.join("dropbear"), b"x").unwrap();
+        let pin = ExePin { path: sbin.join("dropbear"), dir: sbin.clone() };
+        assert_eq!(resolve_exe(&pin, me()).unwrap(), sbin.join("dropbear").to_str().unwrap());
+        // Multi-call: /usr/sbin/dropbear -> dropbearmulti.
+        std::fs::remove_file(sbin.join("dropbear")).unwrap();
+        std::fs::write(sbin.join("dropbearmulti"), b"x").unwrap();
+        std::os::unix::fs::symlink("dropbearmulti", sbin.join("dropbear")).unwrap();
+        assert_eq!(resolve_exe(&pin, me()).unwrap(), sbin.join("dropbearmulti").to_str().unwrap());
+        // A link leaving the directory, a missing target, a writable file, a wrong owner.
+        let elsewhere = t.path().join("tmp-dropbear");
+        std::fs::write(&elsewhere, b"x").unwrap();
+        std::fs::remove_file(sbin.join("dropbear")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, sbin.join("dropbear")).unwrap();
+        assert!(resolve_exe(&pin, me()).is_err());
+        std::fs::remove_file(sbin.join("dropbear")).unwrap();
+        assert!(resolve_exe(&pin, me()).is_err());
+        std::os::unix::fs::symlink("dropbearmulti", sbin.join("dropbear")).unwrap();
+        std::fs::set_permissions(sbin.join("dropbearmulti"), std::os::unix::fs::PermissionsExt::from_mode(0o775)).unwrap();
+        assert!(resolve_exe(&pin, me()).is_err());
+        std::fs::set_permissions(sbin.join("dropbearmulti"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(resolve_exe(&pin, me().wrapping_add(1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_skip_overlong_ones() {
+        let mut data = b"a\n".to_vec();
+        data.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES + 10));
+        data.extend_from_slice(b"\nb\nc");
+        let mut r = tokio::io::BufReader::with_capacity(1024, &data[..]);
+        let mut got = Vec::new();
+        while let Some(l) = read_bounded_line(&mut r).await.unwrap() {
+            got.push(l);
+        }
+        assert_eq!(got, ["a", "", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn run_lines_stops_at_the_limit() {
+        let host = SystemHost;
+        let out = host.run_lines(&argv(&["sh", "-c", "i=0; while [ $i -lt 100000 ]; do echo $i; i=$((i+1)); done"]), 10).await.unwrap();
+        assert_eq!(out.lines.len(), 10);
+        assert!(out.truncated);
+        assert_eq!(out.lines[9], "9");
+        let all = host.run_lines(&argv(&["sh", "-c", "echo a; echo b"]), 10).await.unwrap();
+        assert_eq!((all.lines.len(), all.truncated), (2, false));
+        assert!(host.run_lines(&argv(&["sh", "-c", "echo a; exit 3"]), 10).await.is_err());
+    }
 }

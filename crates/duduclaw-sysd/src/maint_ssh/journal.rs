@@ -21,8 +21,16 @@ use serde_json::{Map, Value};
 /// `-o json` entries must come from this slice.
 pub const DROPBEAR_SLICE: &str = "system-dropbear.slice";
 
-/// dropbear's binary, as journald records it in `_EXE`.
-pub const DROPBEAR_EXE: &str = "/usr/sbin/dropbear";
+/// What the trusted-field filter compares against: the maint uid and the
+/// real paths (as journald records them in `_EXE`) of dropbear and the menu,
+/// resolved at read time (`host::resolve_exe`; dropbear is usually the
+/// `dropbearmulti` multi-call binary behind a symlink).
+#[derive(Debug, Clone, Copy)]
+pub struct Trust<'a> {
+    pub maint_uid: u32,
+    pub dropbear_exe: &'a str,
+    pub menu_exe: &'a str,
+}
 
 /// Fields asked from `journalctl --output-fields=` (the cursor and timestamps
 /// always come along).
@@ -107,15 +115,16 @@ fn str_field<'a>(entry: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 /// Parse one `journalctl -o json` line. Returns the entry's cursor (always,
 /// when readable) and the event when the entry passes the trusted-field
 /// filter and has a recognised message.
-pub fn classify_line(line: &str, maint_uid: u32) -> Option<(String, Option<SshEvent>)> {
+pub fn classify_line(line: &str, trust: &Trust<'_>) -> Option<(String, Option<SshEvent>)> {
     let value: Value = serde_json::from_str(line).ok()?;
     let entry = value.as_object()?;
     let cursor = str_field(entry, "__CURSOR").filter(|c| valid_cursor(c))?.to_string();
-    let event = classify_entry(entry, &cursor, maint_uid);
+    let event = classify_entry(entry, &cursor, trust);
     Some((cursor, event))
 }
 
-fn classify_entry(entry: &Map<String, Value>, cursor: &str, maint_uid: u32) -> Option<SshEvent> {
+fn classify_entry(entry: &Map<String, Value>, cursor: &str, trust: &Trust<'_>) -> Option<SshEvent> {
+    let maint_uid = trust.maint_uid;
     if str_field(entry, "_SYSTEMD_SLICE")? != DROPBEAR_SLICE {
         return None;
     }
@@ -136,7 +145,8 @@ fn classify_entry(entry: &Map<String, Value>, cursor: &str, maint_uid: u32) -> O
     };
 
     if str_field(entry, "SYSLOG_IDENTIFIER") == Some(MENU_IDENTIFIER) {
-        return (uid == maint_uid).then_some(base);
+        let from_menu = str_field(entry, "_EXE") == Some(trust.menu_exe);
+        return (uid == maint_uid && from_menu).then_some(base);
     }
     if uid != 0 && uid != maint_uid {
         return None;
@@ -147,7 +157,7 @@ fn classify_entry(entry: &Map<String, Value>, cursor: &str, maint_uid: u32) -> O
     // so the logout line comes from the maint uid; then the process image
     // (`_EXE`, filled in by journald from /proc) must be dropbear's.
     let from_root = uid == 0;
-    let exe_is_dropbear = str_field(entry, "_EXE") == Some(DROPBEAR_EXE);
+    let exe_is_dropbear = str_field(entry, "_EXE") == Some(trust.dropbear_exe);
     if message.starts_with(LOGIN_PREFIX) {
         if !from_root {
             return None;
@@ -211,6 +221,11 @@ fn parse_addr(text: &str) -> Option<String> {
 pub(crate) mod tests {
     use super::*;
 
+    /// oe-core's multi-call layout: `/usr/sbin/dropbear` → `dropbearmulti`.
+    pub(crate) const TEST_DROPBEAR_EXE: &str = "/usr/sbin/dropbearmulti";
+    pub(crate) const TEST_MENU_EXE: &str = "/usr/libexec/duduclaw/maint-shell";
+    pub(crate) const TRUST: Trust<'static> = Trust { maint_uid: 4800, dropbear_exe: TEST_DROPBEAR_EXE, menu_exe: TEST_MENU_EXE };
+
     pub(crate) fn entry(cursor: &str, slice: &str, uid: u32, ident: &str, pid: u32, msg: &str) -> String {
         serde_json::json!({
             "__CURSOR": cursor,
@@ -220,7 +235,7 @@ pub(crate) mod tests {
             "_PID": pid.to_string(),
             "SYSLOG_IDENTIFIER": ident,
             "_COMM": if ident == MENU_IDENTIFIER { "maint-shell" } else { "dropbear" },
-            "_EXE": if ident == MENU_IDENTIFIER { "/usr/libexec/duduclaw/maint-shell" } else { DROPBEAR_EXE },
+            "_EXE": if ident == MENU_IDENTIFIER { TEST_MENU_EXE } else { TEST_DROPBEAR_EXE },
             "MESSAGE": msg,
         })
         .to_string()
@@ -231,12 +246,12 @@ pub(crate) mod tests {
     pub(crate) const FAILED: &str = "Exit before auth from <100.64.3.4:4000>: (user 'root', 0 fails): Exited normally";
 
     fn kind(line: &str) -> Option<EventKind> {
-        classify_line(line, 4800).and_then(|(_, e)| e).map(|e| e.kind)
+        classify_line(line, &TRUST).and_then(|(_, e)| e).map(|e| e.kind)
     }
 
     #[test]
     fn dropbear_messages_are_classified() {
-        let (c, e) = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 77, LOGIN), 4800).unwrap();
+        let (c, e) = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 77, LOGIN), &TRUST).unwrap();
         let e = e.unwrap();
         assert_eq!(c, "s=1");
         assert_eq!(e.kind, EventKind::Login);
@@ -245,13 +260,13 @@ pub(crate) mod tests {
         assert_eq!(e.pid, Some(77));
         assert_eq!(e.realtime_usec, 1_760_600_000_000_000);
 
-        let e = classify_line(&entry("s=2", DROPBEAR_SLICE, 4800, "dropbear", 77, LOGOUT), 4800).unwrap().1.unwrap();
+        let e = classify_line(&entry("s=2", DROPBEAR_SLICE, 4800, "dropbear", 77, LOGOUT), &TRUST).unwrap().1.unwrap();
         assert_eq!((e.kind, e.source.as_deref()), (EventKind::Logout, Some("192.168.1.20")));
-        let e = classify_line(&entry("s=3", DROPBEAR_SLICE, 0, "dropbear", 78, FAILED), 4800).unwrap().1.unwrap();
+        let e = classify_line(&entry("s=3", DROPBEAR_SLICE, 0, "dropbear", 78, FAILED), &TRUST).unwrap().1.unwrap();
         assert_eq!((e.kind, e.source.as_deref()), (EventKind::AuthFailed, Some("100.64.3.4")));
         assert_eq!(kind(&entry("s=4", DROPBEAR_SLICE, 4800, MENU_IDENTIFIER, 80, "status")), Some(EventKind::MenuAction));
         // Unrecognised dropbear chatter yields a cursor but no event.
-        assert_eq!(classify_line(&entry("s=5", DROPBEAR_SLICE, 0, "dropbear", 1, "Child connection from x"), 4800).unwrap().1, None);
+        assert_eq!(classify_line(&entry("s=5", DROPBEAR_SLICE, 0, "dropbear", 1, "Child connection from x"), &TRUST).unwrap().1, None);
         let ipv6 = "Exit before auth from <fe80::1%eth0:22>: x";
         let _ = kind(&entry("s=6", DROPBEAR_SLICE, 0, "dropbear", 1, ipv6));
     }
@@ -277,6 +292,15 @@ pub(crate) mod tests {
         // `_COMM` is settable by the process (prctl); only `_EXE` counts.
         let renamed = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"4800","_COMM":"dropbear","_EXE":"/usr/bin/logger","SYSLOG_IDENTIFIER":"dropbear","MESSAGE":LOGOUT}).to_string();
         assert_eq!(kind(&renamed), None);
+        // With the plain layout the logout comes from /usr/sbin/dropbear; the
+        // multi-call path must then not be accepted, and vice versa.
+        let plain = Trust { dropbear_exe: "/usr/sbin/dropbear", ..TRUST };
+        let plain_logout = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"4800","_EXE":"/usr/sbin/dropbear","MESSAGE":LOGOUT}).to_string();
+        assert_eq!(classify_line(&plain_logout, &plain).unwrap().1.map(|e| e.kind), Some(EventKind::Logout));
+        assert_eq!(kind(&plain_logout), None);
+        // A menu line must come from the menu binary.
+        let fake_menu = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"4800","_EXE":"/usr/bin/logger","SYSLOG_IDENTIFIER":MENU_IDENTIFIER,"MESSAGE":"restart gateway"}).to_string();
+        assert_eq!(kind(&fake_menu), None);
         // Another account's login line is not a maintenance login.
         assert_eq!(kind(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, &LOGIN.replace("duduclaw-maint", "duduclaw-rescue"))), None);
         // Partial-success logins are not logins.
@@ -287,17 +311,17 @@ pub(crate) mod tests {
         let bytes_msg = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"0","MESSAGE":[80,117]}).to_string();
         assert_eq!(kind(&bytes_msg), None);
         // Bad cursor ⇒ unreadable entry.
-        assert!(classify_line(&entry("has space", DROPBEAR_SLICE, 0, "dropbear", 5, LOGIN), 4800).is_none());
-        assert!(classify_line("not json", 4800).is_none());
+        assert!(classify_line(&entry("has space", DROPBEAR_SLICE, 0, "dropbear", 5, LOGIN), &TRUST).is_none());
+        assert!(classify_line("not json", &TRUST).is_none());
     }
 
     #[test]
     fn attacker_text_cannot_steer_the_source() {
         let spoof = "Exit before auth from <10.9.9.9:22>: (user 'x <192.168.1.1:1>', 1 fails): bye";
-        let e = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, spoof), 4800).unwrap().1.unwrap();
+        let e = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, spoof), &TRUST).unwrap().1.unwrap();
         assert_eq!(e.source.as_deref(), Some("10.9.9.9"));
         let junk = "Exit before auth from <not-an-ip>: x";
-        let e = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, junk), 4800).unwrap().1.unwrap();
+        let e = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, junk), &TRUST).unwrap().1.unwrap();
         assert_eq!(e.source, None);
     }
 
@@ -308,7 +332,7 @@ pub(crate) mod tests {
         let long = "維".repeat(300);
         let out = sanitize(&long);
         assert_eq!(out.chars().count(), EVENT_TEXT_MAX_CHARS);
-        let e = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, &format!("Exit before auth from <1.2.3.4:5>: {}", "\u{1b}".repeat(10) + &"A".repeat(500))), 4800)
+        let e = classify_line(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, &format!("Exit before auth from <1.2.3.4:5>: {}", "\u{1b}".repeat(10) + &"A".repeat(500))), &TRUST)
             .unwrap()
             .1
             .unwrap();

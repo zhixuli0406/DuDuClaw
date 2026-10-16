@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::maint_ssh::host::{CmdOut, Lines};
-use crate::maint_ssh::journal::tests::{FAILED, LOGIN, LOGOUT, entry};
+use crate::maint_ssh::journal::tests::{FAILED, LOGIN, LOGOUT, TEST_DROPBEAR_EXE, TEST_MENU_EXE, entry};
 use crate::maint_ssh::journal::{DROPBEAR_SLICE, MENU_IDENTIFIER};
 use crate::maint_ssh::verify::tests as vt;
 
@@ -50,6 +50,7 @@ struct FakeHost {
     journal: Mutex<Vec<String>>,
     boot: Mutex<Duration>,
     real: Mutex<Duration>,
+    boot_id: Mutex<String>,
 }
 
 impl FakeHost {
@@ -74,6 +75,7 @@ impl FakeHost {
             journal: Mutex::new(Vec::new()),
             boot: Mutex::new(Duration::from_secs(1000)),
             real: Mutex::new(Duration::from_secs(1_760_600_000)),
+            boot_id: Mutex::new("0f0e0d0c-0b0a-4908-8706-050403020100".to_string()),
         }
     }
 
@@ -193,6 +195,19 @@ impl MaintHost for FakeHost {
     fn group_id(&self, name: &str) -> Option<u32> {
         (name == MAINT_USER).then_some(MAINT_GID)
     }
+
+    fn trusted_exe(&self, pin: &host::ExePin) -> Result<String, String> {
+        // The appliance layout: dropbear is the multi-call binary.
+        if pin.path.ends_with("dropbear") {
+            Ok(TEST_DROPBEAR_EXE.to_string())
+        } else {
+            Ok(TEST_MENU_EXE.to_string())
+        }
+    }
+
+    fn boot_id(&self) -> Result<String, String> {
+        Ok(self.boot_id.lock().unwrap().clone())
+    }
 }
 
 struct Env {
@@ -217,6 +232,10 @@ fn env() -> Env {
     let cfg = MaintConfig {
         ready_marker: marker,
         key_dir: tmp.path().join("run/duduclaw-maint-ssh"),
+        state_dir: tmp.path().join("data/maint-ssh"),
+        state_dir_owner: Ownership { uid, gid, mode: 0o700 },
+        dropbear_exe: host::ExePin { path: "/usr/sbin/dropbear".into(), dir: "/usr/sbin".into() },
+        menu_exe: host::ExePin { path: MAINT_SHELL.into(), dir: "/usr/libexec/duduclaw".into() },
         audit: AuditLog::new(tmp.path().join("data/maint-ssh-audit.log"), uid),
         dir_owner: Ownership { uid, gid, mode: 0o750 },
         key_owner: Ownership { uid, gid, mode: 0o640 },
@@ -236,7 +255,7 @@ impl Env {
         self.cfg.key_dir.join(KEY_FILE)
     }
     fn window_path(&self) -> PathBuf {
-        self.cfg.key_dir.join(WINDOW_FILE)
+        self.cfg.state_dir.join(WINDOW_FILE)
     }
     fn audit(&self) -> Vec<Value> {
         std::fs::read_to_string(&self.cfg.audit.path)
@@ -432,11 +451,13 @@ async fn stop_writes_pending_events_first_then_closes_everything() {
     assert_eq!(close_rec["removed_fingerprint"], "SHA256:YoPXM1Ypqr+D/3+TBuMYB3Z4IZH0k0ErqeSny62rhCE");
     assert_eq!(close_rec["auth_failures"], 1);
     assert_eq!(close_rec["auth_failure_sources"][0], "100.64.3.4");
-    // Timer stop comes before the legacy stop sequence; events read before the key went.
+    // Events are read before the key goes and once more after dropbear stopped.
     let calls = host.calls();
-    let read = calls.iter().rposition(|c| c.starts_with("journalctl --no-pager -o json --output-fields=")).unwrap();
+    let is_read = |c: &String| c.starts_with("journalctl --no-pager -o json --output-fields=");
+    let first_read = calls.iter().position(is_read).unwrap();
+    let last_read = calls.iter().rposition(is_read).unwrap();
     let stop_timer = calls.iter().rposition(|c| c == "systemctl stop duduclaw-maint-ssh-expire.timer").unwrap();
-    assert!(read < stop_timer);
+    assert!(first_read < stop_timer && stop_timer < last_read);
 
     // A second stop is idempotent and writes no second close record.
     let out = close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await;
@@ -714,6 +735,8 @@ async fn a_close_that_leaves_the_timer_running_is_retried_by_the_tick() {
         fn realtime(&self) -> Result<Duration, String> { self.0.realtime() }
         fn user_ids(&self, n: &str) -> Option<(u32, u32)> { self.0.user_ids(n) }
         fn group_id(&self, n: &str) -> Option<u32> { self.0.group_id(n) }
+        fn trusted_exe(&self, pin: &host::ExePin) -> Result<String, String> { self.0.trusted_exe(pin) }
+        fn boot_id(&self) -> Result<String, String> { self.0.boot_id() }
     }
     let e = env();
     let host = StuckTimer(FakeHost::new(), AtomicBool::new(false));
@@ -749,6 +772,7 @@ async fn a_held_audit_lock_fails_the_open_and_rolls_back_without_hanging() {
     assert!(!e.window_path().exists());
     assert!(!host.timer_active.load(Ordering::SeqCst));
     assert!(!host.ssh_running.load(Ordering::SeqCst));
+    assert_eq!(host.ssh_start_calls.load(Ordering::SeqCst), 0, "SSH never starts before the open record is written");
     assert!(state.window().is_none());
     drop(held);
     // The undone open left nothing that blocks the next one.
@@ -767,7 +791,7 @@ async fn a_close_whose_events_cannot_be_read_keeps_them_for_later() {
     assert!(!out.success);
     assert!(!e.key_path().exists(), "the key goes regardless");
     assert_eq!(e.audit_events(), ["open"], "close record held back behind the missing events");
-    assert!(e.cfg.key_dir.join(PENDING_FILE).exists());
+    assert!(e.cfg.state_dir.join(PENDING_FILE).exists());
     // An open waits for the owed audit work.
     assert_eq!(open(&mut state, &host, &e.cfg, &key_wire(), 600, "w-2").await.unwrap_err().kind, "busy");
 
@@ -780,7 +804,7 @@ async fn a_close_whose_events_cannot_be_read_keeps_them_for_later() {
     assert_eq!(rec["events_complete"], true);
     assert_eq!(rec["logins_recorded"], 1);
     assert_eq!(rec["last_cursor"], "c1");
-    assert!(!e.cfg.key_dir.join(PENDING_FILE).exists());
+    assert!(!e.cfg.state_dir.join(PENDING_FILE).exists());
     tick(&mut restarted, &host, &e.cfg).await;
     open(&mut restarted, &host, &e.cfg, &key_wire(), 600, "w-2").await.expect("open after the backfill");
 }
@@ -822,4 +846,109 @@ async fn opens_are_rate_limited() {
     open_default(&mut state, &host, &e).await.expect("the hour has passed");
     // Requests refused before the rate limit (bad key) do not use it up.
     assert!(e.audit_events().iter().filter(|k| *k == "open").count() == 3);
+}
+
+#[tokio::test]
+async fn a_reboot_with_the_window_open_is_closed_and_replayed_at_the_next_boot() {
+    let e = env();
+    let host = FakeHost::new();
+    {
+        let mut before = MaintState::new();
+        open_default(&mut before, &host, &e).await.unwrap();
+        // Log in and reboot before any tick ran: nothing was written yet.
+        host.push_journal(DROPBEAR_SLICE, 0, "dropbear", 9, LOGIN);
+        assert_eq!(e.audit_events(), ["open"]);
+    }
+    // The reboot: tmpfs (key directory) and the transient timer are gone.
+    std::fs::remove_dir_all(&e.cfg.key_dir).unwrap();
+    host.timer_active.store(false, Ordering::SeqCst);
+    *host.boot_id.lock().unwrap() = "11111111-2222-4333-8444-555555555555".to_string();
+    let mut after = MaintState::new();
+    startup_cleanup(&mut after, &host, &e.cfg).await;
+    assert_eq!(e.audit_events(), ["open", "login", "close"]);
+    let rec = e.audit().pop().unwrap();
+    assert_eq!(rec["trigger"], "reboot");
+    assert_eq!(rec["window_id"], "w-1");
+    assert_eq!(rec["logins_recorded"], 1);
+    assert_eq!(rec["events_complete"], true);
+    assert!(!e.window_path().exists());
+}
+
+#[tokio::test]
+async fn a_cursor_that_cannot_be_replayed_is_given_up_with_events_complete_false() {
+    let e = env();
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    open_default(&mut state, &host, &e).await.unwrap();
+    host.fail_journal.store(true, Ordering::SeqCst);
+    let out = close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await;
+    assert!(!out.success);
+    for _ in 0..MAX_BACKFILL_ATTEMPTS {
+        tick(&mut state, &host, &e.cfg).await;
+    }
+    assert_eq!(e.audit_events(), ["open", "close"]);
+    let rec = e.audit().pop().unwrap();
+    assert_eq!(rec["events_complete"], false);
+    assert_eq!(rec["events_lost"], true);
+    assert!(!e.cfg.state_dir.join(PENDING_FILE).exists());
+}
+
+#[tokio::test]
+async fn the_tick_closes_the_window_when_the_egress_rule_disappears() {
+    let e = env();
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    open_default(&mut state, &host, &e).await.unwrap();
+    tick(&mut state, &host, &e.cfg).await;
+    assert!(e.key_path().exists());
+    // `nftables` reload without the maint drop-in: the chain is empty.
+    *host.egress_chain.lock().unwrap() =
+        r#"{"nftables":[{"chain":{"family":"inet","table":"filter","name":"duduclaw_maint_egress","handle":9}}]}"#.to_string();
+    tick(&mut state, &host, &e.cfg).await;
+    assert!(!e.key_path().exists());
+    assert_eq!(e.audit().pop().unwrap()["trigger"], "firewall_changed");
+}
+
+#[tokio::test]
+async fn an_unreadable_backlog_is_recorded_as_lost() {
+    let e = env();
+    let host = FakeHost::new();
+    std::fs::create_dir_all(&e.cfg.state_dir).unwrap();
+    std::fs::set_permissions(&e.cfg.state_dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let p = e.cfg.state_dir.join(PENDING_FILE);
+    std::fs::write(&p, b"{not json").unwrap();
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let mut state = MaintState::new();
+    startup_cleanup(&mut state, &host, &e.cfg).await;
+    assert_eq!(e.audit_events(), ["audit_backlog_lost"]);
+    assert!(!p.exists());
+}
+
+#[tokio::test]
+async fn logouts_written_while_dropbear_stops_are_still_recorded() {
+    struct LogoutOnStop(FakeHost);
+    impl MaintHost for LogoutOnStop {
+        async fn run(&self, argv: &[String]) -> Result<CmdOut, String> { self.0.run(argv).await }
+        async fn run_lines(&self, argv: &[String], max: usize) -> Result<Lines, String> { self.0.run_lines(argv, max).await }
+        async fn ssh_start(&self) -> DispatchResult { self.0.ssh_start().await }
+        async fn ssh_stop(&self) -> DispatchResult {
+            // The killed session logs its exit as dropbear goes down.
+            self.0.push_journal(DROPBEAR_SLICE, 4800, "dropbear", 42, LOGOUT);
+            self.0.ssh_stop().await
+        }
+        fn boottime(&self) -> Result<Duration, String> { self.0.boottime() }
+        fn realtime(&self) -> Result<Duration, String> { Ok(Duration::from_secs(1_760_600_001)) }
+        fn user_ids(&self, n: &str) -> Option<(u32, u32)> { self.0.user_ids(n) }
+        fn group_id(&self, n: &str) -> Option<u32> { self.0.group_id(n) }
+        fn trusted_exe(&self, pin: &host::ExePin) -> Result<String, String> { self.0.trusted_exe(pin) }
+        fn boot_id(&self) -> Result<String, String> { self.0.boot_id() }
+    }
+    let e = env();
+    let host = LogoutOnStop(FakeHost::new());
+    let mut state = MaintState::new();
+    open(&mut state, &host, &e.cfg, &key_wire(), 600, "w-1").await.unwrap();
+    host.0.push_journal(DROPBEAR_SLICE, 0, "dropbear", 42, LOGIN);
+    let out = close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await;
+    assert!(out.success, "{}", out.stderr);
+    assert_eq!(e.audit_events(), ["open", "login", "logout", "close"]);
 }

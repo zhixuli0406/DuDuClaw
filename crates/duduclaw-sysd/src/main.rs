@@ -120,6 +120,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid, require_main_pid_of };
     serve(listener, config, shutdown_signal()).await?;
+    // A reboot stops sysd with SIGTERM: write the maintenance SSH events read
+    // so far and save the cursor before going (bounded; the next startup
+    // replays from the saved cursor anyway).
+    #[cfg(unix)]
+    duduclaw_sysd::maint_ssh::shutdown_flush(std::time::Duration::from_secs(5)).await;
     info!("sysd: clean shutdown");
     Ok(())
 }
