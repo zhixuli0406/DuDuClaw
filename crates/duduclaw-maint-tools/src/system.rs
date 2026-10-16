@@ -9,14 +9,19 @@ use crate::journal::{self, MENU_IDENTIFIER};
 use crate::logs_client::{self, RelayEnd};
 use crate::menu::Executor;
 use crate::protocol::{LOGS_SOCKET_PATH, LogRequest};
+use crate::sanitize::{PumpEnd, pump_filtered};
 use crate::signals;
 use crate::tools::{CHILD_ENV, Tool, resolve_tool};
 
 /// Most bytes of a captured stdout kept (only `LoadState` is captured).
 const MAX_CAPTURE_BYTES: usize = 4096;
 
+/// Most bytes of a displayed child's output (stdout and stderr together).
+pub const MAX_CHILD_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Spawns processes for real. Children get a cleared environment plus
-/// [`CHILD_ENV`], stdin from `/dev/null`, and the session's stdout/stderr.
+/// [`CHILD_ENV`] and stdin from `/dev/null`; their output is filtered before
+/// it reaches the session (see [`Executor::run`] below).
 #[derive(Debug, Default)]
 pub struct SystemExecutor;
 
@@ -34,11 +39,36 @@ impl Executor for SystemExecutor {
         resolve_tool(tool, |p| p.is_file())
     }
 
+    /// The child's stdout and stderr share one pipe that the menu reads and
+    /// passes through [`TerminalFilter`](crate::sanitize::TerminalFilter):
+    /// part of what these programs print comes from uid 1000 (a unit's
+    /// `Status:` text set via `sd_notify`, its description, process names),
+    /// so it must not reach the technician's terminal raw. Bounded at
+    /// [`MAX_CHILD_OUTPUT_BYTES`]; the child is killed past that.
     fn run(&mut self, program: &Path, args: &[String]) -> io::Result<Option<i32>> {
-        // Make sure our own buffered text appears before the child's.
         io::stdout().flush()?;
-        let status = command(program, args).status()?;
-        Ok(status.code())
+        let (mut reader, writer) = io::pipe()?;
+        let mut cmd = command(program, args);
+        cmd.stdout(writer.try_clone()?).stderr(writer);
+        let mut child = cmd.spawn()?;
+        // Close our copies of the write end, or the read below never sees EOF.
+        drop(cmd);
+        let end = {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            pump_filtered(&mut reader, &mut out, MAX_CHILD_OUTPUT_BYTES)
+        };
+        if !matches!(end, Ok(PumpEnd::Eof)) {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        match end? {
+            PumpEnd::Eof => Ok(status.code()),
+            PumpEnd::Capped => {
+                self.warn("\n（輸出過長，已截斷 / Output too long, cut off）\n");
+                Ok(status.code())
+            }
+        }
     }
 
     fn capture(&mut self, program: &Path, args: &[String]) -> io::Result<String> {

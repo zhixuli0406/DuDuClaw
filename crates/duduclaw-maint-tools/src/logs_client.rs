@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::protocol::LogRequest;
-use crate::sanitize::filter_relay_bytes;
+use crate::sanitize::TerminalFilter;
 
 /// How often a blocked read wakes up to check for Ctrl-C.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -37,7 +37,7 @@ pub fn fetch<W: Write + ?Sized>(
     relay(&mut stream, out, interrupted)
 }
 
-/// Copy `input` to `out`, dropping control bytes, until end of input or
+/// Copy `input` to `out` through [`TerminalFilter`], until end of input or
 /// `interrupted()`. Read timeouts are only wake-ups to check the flag.
 pub fn relay<R: Read + ?Sized, W: Write + ?Sized>(
     input: &mut R,
@@ -46,15 +46,22 @@ pub fn relay<R: Read + ?Sized, W: Write + ?Sized>(
 ) -> io::Result<RelayEnd> {
     let mut buf = [0u8; 8192];
     let mut filtered = Vec::with_capacity(buf.len());
+    let mut filter = TerminalFilter::default();
     loop {
         if interrupted() {
             return Ok(RelayEnd::Interrupted);
         }
         match input.read(&mut buf) {
-            Ok(0) => return Ok(RelayEnd::Eof),
+            Ok(0) => {
+                filtered.clear();
+                filter.finish(&mut filtered);
+                out.write_all(&filtered)?;
+                out.flush()?;
+                return Ok(RelayEnd::Eof);
+            }
             Ok(n) => {
                 filtered.clear();
-                filter_relay_bytes(&buf[..n], &mut filtered);
+                filter.feed(&buf[..n], &mut filtered);
                 out.write_all(&filtered)?;
                 out.flush()?;
             }
@@ -87,7 +94,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(end, RelayEnd::Eof);
-        assert_eq!(out, b"a[2Jb\nc\n");
+        assert_eq!(out, b"a [2Jb\nc\n");
     }
 
     /// A reader that times out forever, like a quiet `journalctl -f`.
