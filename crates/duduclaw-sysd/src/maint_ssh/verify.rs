@@ -200,8 +200,11 @@ fn has_verdict(rule: &[Value], verdict: &str) -> bool {
 }
 
 /// `nft -j list chain inet filter output`: a rule `oif "lo" jump
-/// duduclaw_maint_egress`, and no rule before it that accepts (which would
-/// let loopback traffic skip the jump).
+/// duduclaw_maint_egress`, and no rule before it that can end evaluation
+/// (which would let loopback traffic skip the jump). Note for the OS: the
+/// simplest ruleset that passes puts the maintenance jump first in the
+/// output chain; jumps to other regular chains before it are allowed only
+/// because a jump returns.
 pub fn output_chain_ok(raw: &str) -> Result<(), String> {
     let dump: Value = serde_json::from_str(raw).map_err(|e| format!("nft output is not JSON: {e}"))?;
     let rules = chain_rules(&dump, OUTPUT_CHAIN, Some(("output", None)))?;
@@ -247,11 +250,18 @@ pub fn maint_egress_chain_ok(raw: &str, uid: u32, user: &str) -> Result<(), Stri
 }
 
 /// `nft -j list chain inet filter input`: a filter base chain on the input
-/// hook with policy drop, in which every rule that matches `tcp dport
-/// @maintenance_tcp_ports` and accepts also requires a source in
-/// `@maintenance_src4` / `@maintenance_src6`; none jumps elsewhere; and an
-/// IPv4 accept rule exists. (An image still carrying the 2026-10 source-less
-/// `tcp dport @maintenance_tcp_ports accept` is refused.)
+/// hook with policy drop, in which
+/// - every rule matching `tcp dport @maintenance_tcp_ports` either rejects or
+///   drops, or accepts only together with a source match on
+///   `@maintenance_src4` / `@maintenance_src6`, and never jumps, goes to,
+///   queues or uses a verdict map;
+/// - no other rule accepts port 22 (a literal `22`, an anonymous set or a
+///   range containing it) without such a source match;
+/// - no rule is a bare `accept` with no match at all;
+/// - an IPv4 source-restricted accept exists.
+///
+/// (An image still carrying the 2026-10 `tcp dport @maintenance_tcp_ports
+/// accept` with no source is refused.)
 pub fn input_chain_ok(raw: &str) -> Result<(), String> {
     let dump: Value = serde_json::from_str(raw).map_err(|e| format!("nft output is not JSON: {e}"))?;
     let rules = chain_rules(&dump, INPUT_CHAIN, Some(("input", Some("drop"))))?;
@@ -260,25 +270,61 @@ pub fn input_chain_ok(raw: &str) -> Result<(), String> {
     let src6 = Value::String(format!("@{SRC6_SET}"));
     let mut v4_accept = false;
     for rule in rules {
-        if !rule.iter().any(|e| is_match(e, &payload("tcp", "dport"), &port_set)) {
-            continue;
-        }
-        if has_verdict(rule, "jump") || has_verdict(rule, "goto") {
-            return Err("a maintenance port rule jumps to another chain".to_string());
-        }
-        if has_verdict(rule, "accept") {
-            let v4 = rule.iter().any(|e| is_match(e, &payload("ip", "saddr"), &src4));
-            let v6 = rule.iter().any(|e| is_match(e, &payload("ip6", "saddr"), &src6));
-            if !v4 && !v6 {
+        let v4 = rule.iter().any(|e| is_match(e, &payload("ip", "saddr"), &src4));
+        let v6 = rule.iter().any(|e| is_match(e, &payload("ip6", "saddr"), &src6));
+        let accepts = has_verdict(rule, "accept");
+        let uses_port_set = rule.iter().any(|e| is_match(e, &payload("tcp", "dport"), &port_set));
+        if uses_port_set {
+            if ["jump", "goto", "queue", "vmap"].iter().any(|v| has_verdict(rule, v)) {
+                return Err("a maintenance port rule hands the decision to something else".to_string());
+            }
+            if accepts && !v4 && !v6 {
                 return Err("a maintenance port rule accepts without a source restriction".to_string());
             }
-            v4_accept |= v4;
+            v4_accept |= accepts && v4;
+            continue;
+        }
+        if accepts && statements(rule).iter().all(|e| e.get("accept").is_some()) {
+            return Err("the input chain has an unconditional accept".to_string());
+        }
+        if (accepts || has_verdict(rule, "vmap")) && matches_port_22(rule) && !v4 && !v6 {
+            return Err("an input rule accepts port 22 without the maintenance source sets".to_string());
         }
     }
     if !v4_accept {
         return Err(format!("input chain has no `ip saddr @{SRC4_SET}` maintenance rule"));
     }
     Ok(())
+}
+
+/// The rule matches TCP destination port 22 directly: a literal, an
+/// anonymous set or a range that contains it.
+fn matches_port_22(rule: &[Value]) -> bool {
+    let has_22 = |v: &Value| match v {
+        Value::Number(n) => n.as_u64() == Some(22),
+        Value::Object(o) => match (o.get("set"), o.get("range")) {
+            (Some(Value::Array(items)), _) => items.iter().any(|i| match i {
+                Value::Number(n) => n.as_u64() == Some(22),
+                Value::Object(r) => in_range(r.get("range")),
+                _ => false,
+            }),
+            (_, Some(r)) => in_range(Some(r)),
+            _ => false,
+        },
+        _ => false,
+    };
+    rule.iter().any(|e| {
+        let Some(m) = e.get("match") else { return false };
+        m.get("left") == Some(&payload("tcp", "dport")) && m.get("right").is_some_and(has_22)
+    })
+}
+
+fn in_range(r: Option<&Value>) -> bool {
+    let Some(Value::Array(ends)) = r else { return false };
+    match (ends.first().and_then(Value::as_u64), ends.get(1).and_then(Value::as_u64)) {
+        (Some(lo), Some(hi)) => lo <= 22 && 22 <= hi,
+        _ => false,
+    }
 }
 
 /// Elements of an interval set from `nft -j list set …`, as canonical
@@ -483,6 +529,28 @@ pub(crate) mod tests {
         assert!(input_chain_ok(&input_chain(false).replace(r#""policy":"drop""#, r#""policy":"accept""#)).is_err());
         assert!(input_chain_ok(&input_chain(false).replace(r#","type":"filter","hook":"input","prio":0"#, "")).is_err());
         assert!(input_chain_ok(&input_chain(false).replace(r#""hook":"input""#, r#""hook":"forward""#)).is_err());
+    }
+
+    #[test]
+    fn port_22_accepts_outside_the_maintenance_rules_are_refused() {
+        let with = |extra: &str| input_chain(false).replacen(r#"{"rule":"#, &format!(r#"{extra},{{"rule":"#), 1);
+        let lit = r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":5,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":22}},{"accept":null}]}}"#;
+        assert!(input_chain_ok(&with(lit)).is_err());
+        let set = r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":5,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":{"set":[80,22]}}},{"accept":null}]}}"#;
+        assert!(input_chain_ok(&with(set)).is_err());
+        let range = r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":5,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":{"range":[1,1024]}}},{"accept":null}]}}"#;
+        assert!(input_chain_ok(&with(range)).is_err());
+        let bare = r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":5,"expr":[{"counter":{"packets":0,"bytes":0}},{"accept":null}]}}"#;
+        assert!(input_chain_ok(&with(bare)).is_err());
+        let vmap = input_chain(false).replacen(r#"{"accept":null}"#, r#"{"vmap":{"key":{"meta":{"key":"l4proto"}},"data":"@x"}}"#, 1);
+        assert!(input_chain_ok(&vmap).is_err());
+        // Ordinary rules are fine: loopback, established, the dashboard port.
+        let ok = [
+            r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":2,"expr":[{"match":{"op":"==","left":{"meta":{"key":"iif"}},"right":"lo"}},{"accept":null}]}}"#,
+            r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":3,"expr":[{"match":{"op":"in","left":{"ct":{"key":"state"}},"right":["established","related"]}},{"accept":null}]}}"#,
+            r#"{"rule":{"family":"inet","table":"filter","chain":"input","handle":4,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":18789}},{"accept":null}]}}"#,
+        ];
+        assert!(input_chain_ok(&with(&ok.join(","))).is_ok());
     }
 
     #[test]

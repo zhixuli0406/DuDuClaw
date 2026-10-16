@@ -36,6 +36,9 @@ pub fn arm_argv(ttl_secs: u64, realtime_now: Duration) -> Vec<String> {
         format!("--on-active={delay}s"),
         format!("--timer-property=OnCalendar={}", utc_calendar(realtime_now.as_secs() + delay)),
         "--timer-property=AccuracySec=5s".to_string(),
+        // Unload the timer once it has fired, so a later window can reuse the
+        // unit name without a leftover elapsed timer.
+        "--timer-property=RemainAfterElapse=no".to_string(),
         "--property=Type=oneshot".to_string(),
         "--property=CollectMode=inactive-or-failed".to_string(),
         FALLBACK_SCRIPT.to_string(),
@@ -98,6 +101,7 @@ mod tests {
         assert!(a.contains(&"--property=CollectMode=inactive-or-failed".to_string()));
         assert!(a.contains(&"--property=Type=oneshot".to_string()));
         assert!(a.contains(&"--timer-property=AccuracySec=5s".to_string()));
+        assert!(a.contains(&"--timer-property=RemainAfterElapse=no".to_string()));
         assert_eq!(a.last().unwrap(), FALLBACK_SCRIPT);
         assert_eq!(reset_failed_argv(), ["systemctl", "reset-failed", FALLBACK_TIMER, FALLBACK_SERVICE]);
         assert_eq!(stop_argv(), ["systemctl", "stop", FALLBACK_TIMER]);

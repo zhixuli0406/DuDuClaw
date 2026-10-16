@@ -28,6 +28,11 @@ pub trait MaintHost: Send + Sync {
     /// Run `argv` (argv[0] is the program). `Err` only when it could not be
     /// spawned or timed out; a non-zero exit is `Ok` with `success: false`.
     fn run(&self, argv: &[String]) -> impl Future<Output = Result<CmdOut, String>> + Send;
+    /// Run `argv` and read at most `max_lines` lines of its stdout, stopping
+    /// the process once that many were read (`truncated` is then true). A
+    /// line longer than [`MAX_LINE_BYTES`] is replaced by an empty line. A
+    /// non-zero exit after all output was read is an `Err`.
+    fn run_lines(&self, argv: &[String], max_lines: usize) -> impl Future<Output = Result<Lines, String>> + Send;
     /// The legacy open sequence (firewall port, then the SSH unit).
     fn ssh_start(&self) -> impl Future<Output = DispatchResult> + Send;
     /// The legacy close sequence (stop units, kill sessions, close the port,
@@ -43,6 +48,17 @@ pub trait MaintHost: Send + Sync {
     /// gid of a group name.
     fn group_id(&self, name: &str) -> Option<u32>;
 }
+
+/// Stdout lines read by [`MaintHost::run_lines`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lines {
+    pub lines: Vec<String>,
+    /// The line limit was reached and the rest was not read.
+    pub truncated: bool,
+}
+
+/// Longest stdout line kept by [`MaintHost::run_lines`].
+pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
 /// Build an owned argv from literals.
 pub fn argv(parts: &[&str]) -> Vec<String> {
@@ -66,6 +82,47 @@ impl MaintHost for SystemHost {
             }),
             Ok(Err(e)) => Err(format!("failed to spawn {program}: {e}")),
             Err(_) => Err(format!("{program} did not finish within {}s", COMMAND_TIMEOUT.as_secs())),
+        }
+    }
+
+    async fn run_lines(&self, argv: &[String], max_lines: usize) -> Result<Lines, String> {
+        let (program, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {program}: {e}"))?;
+        let stdout = child.stdout.take().ok_or_else(|| format!("{program}: no stdout"))?;
+        let read = async {
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut out = Lines::default();
+            loop {
+                if out.lines.len() >= max_lines {
+                    out.truncated = true;
+                    return Ok::<_, String>(out);
+                }
+                match read_bounded_line(&mut reader).await.map_err(|e| format!("reading {program}: {e}"))? {
+                    None => return Ok(out),
+                    Some(line) => out.lines.push(line),
+                }
+            }
+        };
+        let out = match tokio::time::timeout(COMMAND_TIMEOUT, read).await {
+            Ok(r) => r?,
+            Err(_) => return Err(format!("{program} did not finish within {}s", COMMAND_TIMEOUT.as_secs())),
+        };
+        if out.truncated {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Ok(out);
+        }
+        match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(out),
+            Ok(Ok(status)) => Err(format!("{program} exited with {status}")),
+            Ok(Err(e)) => Err(format!("waiting for {program}: {e}")),
+            Err(_) => Err(format!("{program} did not exit within {}s", COMMAND_TIMEOUT.as_secs())),
         }
     }
 
@@ -93,6 +150,71 @@ impl MaintHost for SystemHost {
 
     fn group_id(&self, name: &str) -> Option<u32> {
         lookup_group(name)
+    }
+}
+
+/// One line of at most [`MAX_LINE_BYTES`] (without the newline); an overlong
+/// line is consumed and returned empty. `None` at end of input.
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut buf = Vec::new();
+    let mut overlong = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(if buf.is_empty() && !overlong { None } else { Some(finish_line(buf, overlong)) });
+        }
+        let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if !overlong {
+            let piece = if done { &chunk[..take - 1] } else { &chunk[..take] };
+            if buf.len() + piece.len() > MAX_LINE_BYTES {
+                overlong = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(piece);
+            }
+        }
+        reader.consume(take);
+        if done {
+            return Ok(Some(finish_line(buf, overlong)));
+        }
+    }
+}
+
+fn finish_line(buf: Vec<u8>, overlong: bool) -> String {
+    if overlong { String::new() } else { String::from_utf8_lossy(&buf).into_owned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_lines_skip_overlong_ones() {
+        let mut data = b"a\n".to_vec();
+        data.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES + 10));
+        data.extend_from_slice(b"\nb\nc");
+        let mut r = tokio::io::BufReader::with_capacity(1024, &data[..]);
+        let mut got = Vec::new();
+        while let Some(l) = read_bounded_line(&mut r).await.unwrap() {
+            got.push(l);
+        }
+        assert_eq!(got, ["a", "", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn run_lines_stops_at_the_limit() {
+        let host = SystemHost;
+        let out = host.run_lines(&argv(&["sh", "-c", "i=0; while [ $i -lt 100000 ]; do echo $i; i=$((i+1)); done"]), 10).await.unwrap();
+        assert_eq!(out.lines.len(), 10);
+        assert!(out.truncated);
+        assert_eq!(out.lines[9], "9");
+        let all = host.run_lines(&argv(&["sh", "-c", "echo a; echo b"]), 10).await.unwrap();
+        assert_eq!((all.lines.len(), all.truncated), (2, false));
+        assert!(host.run_lines(&argv(&["sh", "-c", "echo a; exit 3"]), 10).await.is_err());
     }
 }
 

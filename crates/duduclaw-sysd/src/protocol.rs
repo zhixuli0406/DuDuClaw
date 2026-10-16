@@ -523,7 +523,10 @@ pub enum SysdRequest {
     /// (`busy`), save the window state, start sysd's own `CLOCK_BOOTTIME`
     /// deadline, arm the PID 1 fallback timer, run the
     /// [`SysdRequest::SshServiceStart`] steps and write the open record. Any
-    /// failure undoes the earlier steps. On success `stdout` is one JSON line:
+    /// failure undoes the earlier steps. Attempts that pass validation are
+    /// rate-limited (at least 5 s apart, at most 12 per rolling hour;
+    /// `rate_limited`), and an open is refused as `busy` while a previous
+    /// window's audit records are still owed. On success `stdout` is one JSON line:
     /// `{"login_user","window_id","key_type","key_fingerprint","expires_in_s","host_key_fingerprints"}`.
     SshMaintOpen { public_key: String, ttl_seconds: u64, window_id: String },
     /// Read-only view of the maintenance SSH window (after writing any new

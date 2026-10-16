@@ -69,6 +69,8 @@ pub const KEY_DIR: &str = "/run/duduclaw-maint-ssh";
 pub const KEY_FILE: &str = "authorized_keys";
 /// sysd's window state (root 0600) next to the key.
 pub const WINDOW_FILE: &str = "window.json";
+/// Audit work still owed after a close (root 0600), see [`PendingAudit`].
+pub const PENDING_FILE: &str = "audit-pending.json";
 
 /// Root audit file.
 pub const AUDIT_LOG: &str = "/data/system/maint-ssh-audit.log";
@@ -100,6 +102,13 @@ pub const MAX_EVENTS_PER_READ: usize = 5000;
 pub const AUTH_FAILURE_SOURCES: usize = 5;
 /// Largest `window.json` read back.
 const MAX_WINDOW_FILE_BYTES: usize = 64 * 1024;
+/// Largest `audit-pending.json` read back.
+const MAX_PENDING_FILE_BYTES: usize = 1024 * 1024;
+/// `ssh_maint_open` rate limit: at least this long between attempts that pass
+/// validation, and at most [`OPEN_MAX_PER_HOUR`] of them per rolling hour. A
+/// caller looping open/close would otherwise flood the audit file.
+pub const OPEN_MIN_INTERVAL: Duration = Duration::from_secs(5);
+pub const OPEN_MAX_PER_HOUR: usize = 12;
 
 /// Where things live and who must own them. [`MaintConfig::system`] is the
 /// appliance; tests point everything at a temp directory.
@@ -121,6 +130,8 @@ pub struct MaintConfig {
     /// owned by `exec_owner_uid` and not writable by group or others.
     pub required_executables: Vec<PathBuf>,
     pub exec_owner_uid: u32,
+    pub open_min_interval: Duration,
+    pub open_max_per_hour: usize,
 }
 
 impl MaintConfig {
@@ -136,6 +147,8 @@ impl MaintConfig {
             maint_gid: MAINT_GID,
             required_executables: vec![PathBuf::from(MAINT_SHELL), PathBuf::from(timer::FALLBACK_SCRIPT)],
             exec_owner_uid: 0,
+            open_min_interval: OPEN_MIN_INTERVAL,
+            open_max_per_hour: OPEN_MAX_PER_HOUR,
         }
     }
 }
@@ -226,6 +239,37 @@ pub struct MaintState {
     sessions: BTreeMap<u32, Session>,
     /// Sessions whose login line carried no pid (kept in order).
     unkeyed_sessions: Vec<Session>,
+    /// Audit work not done yet (events still to replay, records not written).
+    pending: PendingAudit,
+    /// `CLOCK_BOOTTIME` ms of recent `ssh_maint_open` attempts (rate limit).
+    open_attempts_ms: Vec<u64>,
+}
+
+/// Events of a closed window that could not be read before it closed: the
+/// window state (with the last cursor already in the audit file) and the
+/// close time; later events belong to someone else and are not read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Backfill {
+    pub window: WindowFile,
+    pub until_usec: u64,
+}
+
+/// Persisted as [`PENDING_FILE`] so a sysd restart keeps retrying.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PendingAudit {
+    pub backfill: Option<Backfill>,
+    /// Records to write, in order, once `backfill` is done.
+    pub records: Vec<Value>,
+}
+
+impl PendingAudit {
+    const fn new() -> Self {
+        Self { backfill: None, records: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.backfill.is_none() && self.records.is_empty()
+    }
 }
 
 impl MaintState {
@@ -236,6 +280,8 @@ impl MaintState {
             events: EventBuffer::new(),
             sessions: BTreeMap::new(),
             unkeyed_sessions: Vec::new(),
+            pending: PendingAudit::new(),
+            open_attempts_ms: Vec::new(),
         }
     }
 
@@ -317,7 +363,7 @@ async fn run_ok<H: MaintHost>(host: &H, cmd: &[String]) -> Result<String, String
         Err(format!(
             "`{}` failed: {}",
             cmd.join(" "),
-            duduclaw_core::truncate_chars(out.stderr.trim(), 300)
+            journal::truncate_chars(out.stderr.trim(), 300)
         ))
     }
 }
@@ -396,6 +442,7 @@ fn journal_read_argv(after: &str) -> Vec<String> {
         "--no-pager".to_string(),
         "-o".to_string(),
         "json".to_string(),
+        format!("--output-fields={}", journal::OUTPUT_FIELDS),
         format!("--after-cursor={after}"),
         format!("_SYSTEMD_SLICE={}", journal::DROPBEAR_SLICE),
     ]
@@ -405,22 +452,36 @@ fn usec_to_secs(usec: u64) -> u64 {
     usec / 1_000_000
 }
 
-/// Read new journal events into the window: logins/logouts go to the audit
-/// file (first [`LOGIN_RECORD_CAP`] each, then counted), everything goes to
-/// the status buffer. State changes only after the audit write succeeded, so
-/// a failed write is retried from the same cursor. Returns whether the
-/// persisted window changed.
-async fn ingest<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfig) -> Result<bool, String> {
-    let Some(current) = state.window.as_ref() else { return Ok(false) };
-    if !journal::valid_cursor(&current.last_cursor) {
+/// What one journal read produced for a window.
+struct Read {
+    next: WindowFile,
+    records: Vec<Value>,
+    events: Vec<SshEvent>,
+    /// Everything up to `until` (or the journal's end) was read.
+    complete: bool,
+}
+
+/// Read journal events after `window.last_cursor` (at most
+/// [`MAX_EVENTS_PER_READ`] lines, streamed) and turn them into audit records:
+/// logins/logouts (first [`LOGIN_RECORD_CAP`] each, then counted) and failure
+/// counts. With `until_usec`, entries after that time are left alone.
+async fn read_events<H: MaintHost>(host: &H, cfg: &MaintConfig, window: &WindowFile, until_usec: Option<u64>) -> Result<Read, String> {
+    if !journal::valid_cursor(&window.last_cursor) {
         return Err("the window's journal cursor is invalid".to_string());
     }
-    let out = run_ok(host, &journal_read_argv(&current.last_cursor)).await?;
-    let mut next = current.clone();
+    let out = host.run_lines(&journal_read_argv(&window.last_cursor), MAX_EVENTS_PER_READ).await?;
+    let mut next = window.clone();
     let mut records = Vec::new();
     let mut events = Vec::new();
-    for line in out.lines().take(MAX_EVENTS_PER_READ) {
+    let mut complete = !out.truncated;
+    for line in &out.lines {
         let Some((cursor, event)) = journal::classify_line(line, cfg.maint_uid) else { continue };
+        if let (Some(until), Some(e)) = (until_usec, &event) {
+            if e.realtime_usec > until {
+                complete = true;
+                break;
+            }
+        }
         next.last_cursor = cursor;
         let Some(event) = event else { continue };
         match event.kind {
@@ -454,16 +515,100 @@ async fn ingest<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfi
         }
         events.push(event);
     }
-    if next == *current {
+    Ok(Read { next, records, events, complete })
+}
+
+/// Read new journal events into the open window: records go to the audit
+/// file, events to the status buffer. State changes only after the audit
+/// write succeeded, so a failed write is retried from the same cursor.
+/// Returns whether the persisted window changed.
+async fn ingest<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfig) -> Result<bool, String> {
+    let Some(current) = state.window.as_ref() else { return Ok(false) };
+    let read = read_events(host, cfg, current, None).await?;
+    if read.next == *current {
         return Ok(false);
     }
-    cfg.audit.append(&records, Some(&next.open_record))?;
-    for event in events {
+    cfg.audit.append(read.records, Some(read.next.open_record.clone())).await?;
+    for event in read.events {
         apply_session(state, &event);
         state.events.push(event);
     }
-    state.window = Some(next);
+    state.window = Some(read.next);
     Ok(true)
+}
+
+fn persist_pending(cfg: &MaintConfig, pending: &PendingAudit) -> Result<(), String> {
+    let Some(dir) = KeyDir::open_existing(&cfg.key_dir, cfg.dir_owner).map_err(|e| e.to_string())? else {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("{} is missing", cfg.key_dir.display()));
+    };
+    if pending.is_empty() {
+        return dir.remove(PENDING_FILE).map(|_| ()).map_err(|e| e.to_string());
+    }
+    let body = serde_json::to_vec(pending).map_err(|e| e.to_string())?;
+    dir.write_atomic(PENDING_FILE, &body, cfg.state_owner, false).map_err(|e| e.to_string())
+}
+
+fn load_pending(cfg: &MaintConfig) -> Result<Option<PendingAudit>, String> {
+    let Some(dir) = KeyDir::open_existing(&cfg.key_dir, cfg.dir_owner).map_err(|e| e.to_string())? else { return Ok(None) };
+    if !dir.exists(PENDING_FILE).map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let raw = dir.read(PENDING_FILE, cfg.state_owner, MAX_PENDING_FILE_BYTES).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&raw).map(Some).map_err(|e| format!("{PENDING_FILE}: {e}"))
+}
+
+/// Finish owed audit work: replay a closed window's remaining events, then
+/// write the held-back records (its close record last, completed with the
+/// final counters). Stops at the first failure and keeps the rest.
+async fn flush_pending<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfig) -> Result<(), String> {
+    if state.pending.is_empty() {
+        return Ok(());
+    }
+    let result = flush_pending_inner(state, host, cfg).await;
+    if let Err(e) = persist_pending(cfg, &state.pending) {
+        warn!(error = %e, "sysd: could not save pending maintenance SSH audit work");
+    }
+    result
+}
+
+async fn flush_pending_inner<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfig) -> Result<(), String> {
+    if let Some(bf) = state.pending.backfill.clone() {
+        let read = read_events(host, cfg, &bf.window, Some(bf.until_usec)).await?;
+        cfg.audit.append(read.records, None).await?;
+        let complete = read.complete;
+        let w = read.next;
+        if complete {
+            for record in state.pending.records.iter_mut() {
+                if record["event"] == "close" && record["window_id"] == json!(w.window_id) {
+                    fill_close_counters(record, &w, true);
+                }
+            }
+            state.pending.backfill = None;
+        } else {
+            state.pending.backfill = Some(Backfill { window: w, until_usec: bf.until_usec });
+            return Err("more events of a closed window remain to be written".to_string());
+        }
+    }
+    let records = std::mem::take(&mut state.pending.records);
+    if let Err(e) = cfg.audit.append(records.clone(), None).await {
+        state.pending.records = records;
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn fill_close_counters(record: &mut Value, w: &WindowFile, events_complete: bool) {
+    record["logins_recorded"] = json!(w.logins_recorded);
+    record["logins_over_cap"] = json!(w.logins_over_cap);
+    record["logouts_recorded"] = json!(w.logouts_recorded);
+    record["logouts_over_cap"] = json!(w.logouts_over_cap);
+    record["auth_failures"] = json!(w.auth_failures);
+    record["auth_failure_sources"] = json!(w.auth_failure_sources);
+    record["last_cursor"] = json!(w.last_cursor);
+    record["events_complete"] = json!(events_complete);
 }
 
 fn event_record(kind: &str, window_id: &str, event: &SshEvent) -> Value {
@@ -544,10 +689,11 @@ pub async fn open<H: MaintHost>(
     validate_window_id(window_id)?;
     validate_ttl(ttl_seconds)?;
     let key = crate::ssh_key::parse(public_key).map_err(|e| SysdError::bad_request(format!("ssh_key:{}", e.code())))?;
-    if state.window.is_some() || state.pending_cleanup {
+    if state.window.is_some() || state.pending_cleanup || !state.pending.is_empty() {
         return Err(busy("a maintenance window is already open or still being cleaned up"));
     }
     let now_boot = host.boottime().map_err(SysdError::io)?;
+    rate_limit(state, cfg, now_boot)?;
     let now_real = host.realtime().map_err(SysdError::io)?;
     let cursor = journal_position(host).await.map_err(SysdError::io)?;
 
@@ -612,13 +758,25 @@ pub async fn open<H: MaintHost>(
             Ok(out) => return Err(SysdError::io(format!("could not start SSH: {}", out.stderr.trim()))),
             Err(e) => return Err(SysdError::new(e.kind, format!("could not start SSH: {}", e.message))),
         }
-        cfg.audit.append(std::slice::from_ref(&open_record), Some(&open_record)).map_err(SysdError::io)?;
+        cfg.audit.append(vec![open_record.clone()], Some(open_record.clone())).await.map_err(SysdError::io)?;
         Ok(())
     }
     .await;
 
     if let Err(e) = result {
         let problems = undo_open(state, host, &dir, stage).await;
+        // Best effort: the audit file may be what failed.
+        let failed = json!({
+            "ts": now_real.as_secs(),
+            "event": "open_failed",
+            "window_id": window_id,
+            "key_fingerprint": key.fingerprint,
+            "error": e.kind,
+            "stage": format!("{stage:?}"),
+        });
+        if let Err(audit_err) = cfg.audit.append(vec![failed], None).await {
+            warn!(error = %audit_err, "sysd: could not record the failed maintenance SSH open");
+        }
         let message = if problems.is_empty() { e.message } else { format!("{}; undoing the open: {}", e.message, problems.join("; ")) };
         return Err(SysdError::new(e.kind, message));
     }
@@ -633,6 +791,28 @@ pub async fn open<H: MaintHost>(
         "host_key_fingerprints": host_key_fingerprints,
     });
     Ok(SysdOpOutput { success: true, stdout: body.to_string(), stderr: String::new() })
+}
+
+/// Count an open attempt against the rate limit, refusing when it is used up.
+fn rate_limit(state: &mut MaintState, cfg: &MaintConfig, now_boot: Duration) -> Result<(), SysdError> {
+    let now = now_boot.as_millis() as u64;
+    state.open_attempts_ms.retain(|t| now.saturating_sub(*t) < 3_600_000);
+    let too_soon = state
+        .open_attempts_ms
+        .last()
+        .is_some_and(|last| now.saturating_sub(*last) < cfg.open_min_interval.as_millis() as u64);
+    if too_soon || state.open_attempts_ms.len() >= cfg.open_max_per_hour {
+        return Err(SysdError::new(
+            "rate_limited",
+            format!(
+                "too many maintenance SSH opens: at most {} per hour, {} s apart",
+                cfg.open_max_per_hour,
+                cfg.open_min_interval.as_secs()
+            ),
+        ));
+    }
+    state.open_attempts_ms.push(now);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -715,11 +895,14 @@ pub async fn close<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintCo
         Some(d) => d.exists(KEY_FILE).unwrap_or(true),
         None => false,
     };
+    let mut events_complete = true;
     if state.window.is_some() {
         if let Err(e) = ingest(state, host, cfg).await {
-            problems.push(format!("writing pending SSH events: {e}"));
+            events_complete = false;
+            problems.push(format!("writing pending SSH events (kept for a retry): {e}"));
         }
     }
+    let close_usec = host.realtime().map(|d| d.as_micros() as u64).unwrap_or(u64::MAX);
     let removed_fingerprint = state
         .window
         .as_ref()
@@ -757,9 +940,9 @@ pub async fn close<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintCo
     }
 
     if window.is_some() || key_existed {
-        let now = host.realtime().map(|d| d.as_secs()).unwrap_or(0);
+        let now = close_usec / 1_000_000;
         let w = window.as_ref();
-        let record = json!({
+        let mut record = json!({
             "ts": now,
             "event": "close",
             "trigger": trigger.as_str(),
@@ -776,9 +959,27 @@ pub async fn close<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintCo
             // Sessions still logged in when the close ended them (their
             // processes are killed, so dropbear writes no logout line).
             "sessions_open_at_close": open_sessions,
+            "last_cursor": Value::Null,
+            "events_complete": events_complete,
         });
-        if let Err(e) = cfg.audit.append(&[record], None) {
-            problems.push(e);
+        if let Some(w) = w {
+            fill_close_counters(&mut record, w, events_complete);
+        }
+        match (events_complete, w) {
+            // Events still owed: hold the close record back until they are in.
+            (false, Some(w)) => {
+                state.pending.backfill = Some(Backfill { window: w.clone(), until_usec: close_usec });
+                state.pending.records.push(record);
+            }
+            _ => {
+                if let Err(e) = cfg.audit.append(vec![record.clone()], None).await {
+                    problems.push(format!("close record kept for a retry: {e}"));
+                    state.pending.records.push(record);
+                }
+            }
+        }
+        if let Err(e) = persist_pending(cfg, &state.pending) {
+            problems.push(format!("saving pending audit work: {e}"));
         }
         info!(trigger = trigger.as_str(), problems = problems.len(), "sysd: maintenance SSH window closed");
     }
@@ -857,6 +1058,7 @@ pub async fn status<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintC
         "auth_failures": w.map(|w| w.auth_failures),
         "host_key_fingerprints": w.map(|w| w.host_key_fingerprints.clone()).unwrap_or_default(),
         "pending_cleanup": state.pending_cleanup,
+        "pending_audit": !state.pending.is_empty(),
         "problems": problems,
     });
     Ok(SysdOpOutput { success: true, stdout: body.to_string(), stderr: String::new() })
@@ -865,6 +1067,9 @@ pub async fn status<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintC
 /// R4: write new events, then close at the deadline. Also retries an
 /// unfinished startup cleanup. Caller holds [`SSH_LOCK`].
 pub async fn tick<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfig) {
+    if let Err(e) = flush_pending(state, host, cfg).await {
+        warn!(error = %e, "sysd: maintenance SSH audit work still pending; retrying next tick");
+    }
     if state.window.is_none() {
         let leftover = match leftovers(cfg) {
             Ok(l) => l,
@@ -908,6 +1113,11 @@ pub async fn tick<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintCon
 
 /// R5: at startup, close whatever a previous sysd left behind.
 pub async fn startup_cleanup<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintConfig) {
+    match load_pending(cfg) {
+        Ok(Some(p)) => state.pending = p,
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "sysd: pending maintenance SSH audit work is unreadable"),
+    }
     let leftover = match leftovers(cfg) {
         Ok(l) => l,
         Err(e) => {
@@ -916,9 +1126,15 @@ pub async fn startup_cleanup<H: MaintHost>(state: &mut MaintState, host: &H, cfg
         }
     };
     if !leftover {
+        if let Err(e) = flush_pending(state, host, cfg).await {
+            warn!(error = %e, "sysd: maintenance SSH audit work still pending; retrying every tick");
+        }
         return;
     }
     let out = close(state, host, cfg, CloseTrigger::StartupCleanup).await;
+    if let Err(e) = flush_pending(state, host, cfg).await {
+        warn!(error = %e, "sysd: maintenance SSH audit work still pending; retrying every tick");
+    }
     if out.success {
         info!("sysd: closed a maintenance SSH window left by a previous run");
     } else {

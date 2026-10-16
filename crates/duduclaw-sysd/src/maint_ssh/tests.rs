@@ -6,10 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::*;
-use crate::maint_ssh::host::CmdOut;
+use crate::maint_ssh::host::{CmdOut, Lines};
 use crate::maint_ssh::journal::tests::{FAILED, LOGIN, LOGOUT, entry};
 use crate::maint_ssh::journal::{DROPBEAR_SLICE, MENU_IDENTIFIER};
 use crate::maint_ssh::verify::tests as vt;
+
+const JOURNAL_READ_PREFIX: &str =
+    "journalctl --no-pager -o json --output-fields=MESSAGE,_UID,_SYSTEMD_SLICE,_COMM,_EXE,_PID,SYSLOG_IDENTIFIER --after-cursor=c";
 
 const ED25519: &str = include_str!("../../tests/fixtures/ssh_keys/ed25519.pub");
 
@@ -36,6 +39,7 @@ struct FakeHost {
     user: Mutex<Option<(u32, u32)>>,
     fail_arm: AtomicBool,
     fail_start: AtomicBool,
+    fail_journal: AtomicBool,
     timer_active: AtomicBool,
     ssh_running: AtomicBool,
     ssh_start_calls: AtomicUsize,
@@ -61,6 +65,7 @@ impl FakeHost {
             user: Mutex::new(Some((MAINT_UID, MAINT_GID))),
             fail_arm: AtomicBool::new(false),
             fail_start: AtomicBool::new(false),
+            fail_journal: AtomicBool::new(false),
             timer_active: AtomicBool::new(false),
             ssh_running: AtomicBool::new(false),
             ssh_start_calls: AtomicUsize::new(0),
@@ -131,8 +136,11 @@ impl MaintHost for FakeHost {
                 self.timer_active.store(true, Ordering::SeqCst);
                 Self::ok("Running timer as unit: duduclaw-maint-ssh-expire.timer")
             }
-            _ if line.starts_with("journalctl --no-pager -o json --after-cursor=c") => {
-                let rest = line.trim_start_matches("journalctl --no-pager -o json --after-cursor=c");
+            _ if line.starts_with(JOURNAL_READ_PREFIX) => {
+                if self.fail_journal.load(Ordering::SeqCst) {
+                    return Self::fail("Failed to seek to cursor");
+                }
+                let rest = line.trim_start_matches(JOURNAL_READ_PREFIX);
                 let (n, filter) = rest.split_once(' ').unwrap();
                 assert_eq!(filter, "_SYSTEMD_SLICE=system-dropbear.slice");
                 let n: usize = n.parse().unwrap();
@@ -141,6 +149,16 @@ impl MaintHost for FakeHost {
             }
             _ => Err(format!("unexpected command: {line}")),
         }
+    }
+
+    async fn run_lines(&self, argv: &[String], max_lines: usize) -> Result<Lines, String> {
+        let out = self.run(argv).await?;
+        if !out.success {
+            return Err(out.stderr);
+        }
+        let all: Vec<String> = out.stdout.lines().map(str::to_string).collect();
+        let truncated = all.len() > max_lines;
+        Ok(Lines { lines: all.into_iter().take(max_lines).collect(), truncated })
     }
 
     async fn ssh_start(&self) -> DispatchResult {
@@ -207,6 +225,8 @@ fn env() -> Env {
         maint_gid: MAINT_GID,
         required_executables: executables,
         exec_owner_uid: uid,
+        open_min_interval: Duration::ZERO,
+        open_max_per_hour: usize::MAX,
     };
     Env { _tmp: tmp, cfg }
 }
@@ -366,7 +386,9 @@ async fn a_fallback_timer_that_cannot_be_armed_undoes_the_open() {
     assert!(!e.window_path().exists());
     assert!(state.window().is_none());
     assert_eq!(host.ssh_start_calls.load(Ordering::SeqCst), 0);
-    assert!(e.audit().is_empty());
+    // Only the best-effort record of the failed attempt.
+    assert_eq!(e.audit_events(), ["open_failed"]);
+    assert_eq!(e.audit()[0]["stage"], "TimerArmed");
 }
 
 #[tokio::test]
@@ -412,7 +434,7 @@ async fn stop_writes_pending_events_first_then_closes_everything() {
     assert_eq!(close_rec["auth_failure_sources"][0], "100.64.3.4");
     // Timer stop comes before the legacy stop sequence; events read before the key went.
     let calls = host.calls();
-    let read = calls.iter().rposition(|c| c.starts_with("journalctl --no-pager -o json --after-cursor")).unwrap();
+    let read = calls.iter().rposition(|c| c.starts_with("journalctl --no-pager -o json --output-fields=")).unwrap();
     let stop_timer = calls.iter().rposition(|c| c == "systemctl stop duduclaw-maint-ssh-expire.timer").unwrap();
     assert!(read < stop_timer);
 
@@ -685,6 +707,7 @@ async fn a_close_that_leaves_the_timer_running_is_retried_by_the_tick() {
             }
             self.0.run(argv).await
         }
+        async fn run_lines(&self, argv: &[String], max: usize) -> Result<Lines, String> { self.0.run_lines(argv, max).await }
         async fn ssh_start(&self) -> DispatchResult { self.0.ssh_start().await }
         async fn ssh_stop(&self) -> DispatchResult { self.0.ssh_stop().await }
         fn boottime(&self) -> Result<Duration, String> { self.0.boottime() }
@@ -706,4 +729,97 @@ async fn a_close_that_leaves_the_timer_running_is_retried_by_the_tick() {
     tick(&mut state, &host, &e.cfg).await;
     assert!(!host.0.timer_active.load(Ordering::SeqCst));
     open(&mut state, &host, &e.cfg, &key_wire(), 600, "w-2").await.expect("open after the retry");
+}
+
+#[tokio::test]
+async fn a_held_audit_lock_fails_the_open_and_rolls_back_without_hanging() {
+    let mut e = env();
+    e.cfg.audit.lock_timeout = Duration::from_millis(200);
+    let host = FakeHost::new();
+    let held = crate::maint_ssh::audit::tests::hold_lock(&e.cfg.audit);
+    let mut state = MaintState::new();
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(20), open_default(&mut state, &host, &e))
+        .await
+        .expect("open must not hang on the audit lock")
+        .unwrap_err();
+    assert!(err.message.contains("held by another process"), "{}", err.message);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!e.key_path().exists());
+    assert!(!e.window_path().exists());
+    assert!(!host.timer_active.load(Ordering::SeqCst));
+    assert!(!host.ssh_running.load(Ordering::SeqCst));
+    assert!(state.window().is_none());
+    drop(held);
+    // The undone open left nothing that blocks the next one.
+    open_default(&mut state, &host, &e).await.expect("open once the lock is free");
+}
+
+#[tokio::test]
+async fn a_close_whose_events_cannot_be_read_keeps_them_for_later() {
+    let e = env();
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    open_default(&mut state, &host, &e).await.unwrap();
+    host.push_journal(DROPBEAR_SLICE, 0, "dropbear", 42, LOGIN);
+    host.fail_journal.store(true, Ordering::SeqCst);
+    let out = close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await;
+    assert!(!out.success);
+    assert!(!e.key_path().exists(), "the key goes regardless");
+    assert_eq!(e.audit_events(), ["open"], "close record held back behind the missing events");
+    assert!(e.cfg.key_dir.join(PENDING_FILE).exists());
+    // An open waits for the owed audit work.
+    assert_eq!(open(&mut state, &host, &e.cfg, &key_wire(), 600, "w-2").await.unwrap_err().kind, "busy");
+
+    // A restarted sysd picks the work up from the file.
+    host.fail_journal.store(false, Ordering::SeqCst);
+    let mut restarted = MaintState::new();
+    startup_cleanup(&mut restarted, &host, &e.cfg).await;
+    assert_eq!(e.audit_events(), ["open", "login", "close"]);
+    let rec = e.audit().pop().unwrap();
+    assert_eq!(rec["events_complete"], true);
+    assert_eq!(rec["logins_recorded"], 1);
+    assert_eq!(rec["last_cursor"], "c1");
+    assert!(!e.cfg.key_dir.join(PENDING_FILE).exists());
+    tick(&mut restarted, &host, &e.cfg).await;
+    open(&mut restarted, &host, &e.cfg, &key_wire(), 600, "w-2").await.expect("open after the backfill");
+}
+
+#[tokio::test]
+async fn a_close_record_that_cannot_be_written_is_retried() {
+    let mut e = env();
+    e.cfg.audit.lock_timeout = Duration::from_millis(100);
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    open_default(&mut state, &host, &e).await.unwrap();
+    let held = crate::maint_ssh::audit::tests::hold_lock(&e.cfg.audit);
+    let out = close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await;
+    assert!(!out.success);
+    assert!(out.stderr.contains("close record kept"), "{}", out.stderr);
+    assert_eq!(e.audit_events(), ["open"]);
+    drop(held);
+    tick(&mut state, &host, &e.cfg).await;
+    assert_eq!(e.audit_events(), ["open", "close"]);
+    assert_eq!(e.audit().pop().unwrap()["last_cursor"], "c0");
+}
+
+#[tokio::test]
+async fn opens_are_rate_limited() {
+    let mut e = env();
+    e.cfg.open_min_interval = Duration::from_secs(5);
+    e.cfg.open_max_per_hour = 2;
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    open_default(&mut state, &host, &e).await.unwrap();
+    assert!(close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await.success);
+    assert_eq!(open_default(&mut state, &host, &e).await.unwrap_err().kind, "rate_limited");
+    *host.boot.lock().unwrap() += Duration::from_secs(6);
+    open_default(&mut state, &host, &e).await.unwrap();
+    assert!(close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await.success);
+    *host.boot.lock().unwrap() += Duration::from_secs(60);
+    assert_eq!(open_default(&mut state, &host, &e).await.unwrap_err().kind, "rate_limited", "two per hour");
+    *host.boot.lock().unwrap() += Duration::from_secs(3600);
+    open_default(&mut state, &host, &e).await.expect("the hour has passed");
+    // Requests refused before the rate limit (bad key) do not use it up.
+    assert!(e.audit_events().iter().filter(|k| *k == "open").count() == 3);
 }

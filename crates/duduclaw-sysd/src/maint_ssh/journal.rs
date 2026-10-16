@@ -21,6 +21,13 @@ use serde_json::{Map, Value};
 /// `-o json` entries must come from this slice.
 pub const DROPBEAR_SLICE: &str = "system-dropbear.slice";
 
+/// dropbear's binary, as journald records it in `_EXE`.
+pub const DROPBEAR_EXE: &str = "/usr/sbin/dropbear";
+
+/// Fields asked from `journalctl --output-fields=` (the cursor and timestamps
+/// always come along).
+pub const OUTPUT_FIELDS: &str = "MESSAGE,_UID,_SYSTEMD_SLICE,_COMM,_EXE,_PID,SYSLOG_IDENTIFIER";
+
 /// `SYSLOG_IDENTIFIER` the maintenance menu logs with.
 pub const MENU_IDENTIFIER: &str = "duduclaw-maint";
 
@@ -80,7 +87,13 @@ pub fn sanitize(text: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() && !is_bidi_control(*c))
         .collect();
-    duduclaw_core::truncate_chars(&cleaned, EVENT_TEXT_MAX_CHARS)
+    truncate_chars(&cleaned, EVENT_TEXT_MAX_CHARS)
+}
+
+/// At most `max` characters (never splits a code point). sysd carries its own
+/// copy so the crate has no path dependencies.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -131,10 +144,10 @@ fn classify_entry(entry: &Map<String, Value>, cursor: &str, maint_uid: u32) -> O
     // Authentication runs in dropbear's root process: login and pre-auth
     // lines are only accepted from uid 0. After `send_msg_userauth_success`
     // the same process switches to the maint user (DROPBEAR_SVR_DROP_PRIVS),
-    // so the logout line comes from the maint uid; then the kernel-set
-    // `_COMM` must also be dropbear's.
+    // so the logout line comes from the maint uid; then the process image
+    // (`_EXE`, filled in by journald from /proc) must be dropbear's.
     let from_root = uid == 0;
-    let comm_is_dropbear = str_field(entry, "_COMM") == Some("dropbear");
+    let exe_is_dropbear = str_field(entry, "_EXE") == Some(DROPBEAR_EXE);
     if message.starts_with(LOGIN_PREFIX) {
         if !from_root {
             return None;
@@ -156,7 +169,7 @@ fn classify_entry(entry: &Map<String, Value>, cursor: &str, maint_uid: u32) -> O
         return Some(SshEvent { kind: EventKind::Login, fingerprint, source, ..base });
     }
     if message.starts_with("Exit (") {
-        if !from_root && !comm_is_dropbear {
+        if !from_root && !exe_is_dropbear {
             return None;
         }
         // "Exit (<user>) from <<addr>>: <reason>"; the user is a passwd name
@@ -207,6 +220,7 @@ pub(crate) mod tests {
             "_PID": pid.to_string(),
             "SYSLOG_IDENTIFIER": ident,
             "_COMM": if ident == MENU_IDENTIFIER { "maint-shell" } else { "dropbear" },
+            "_EXE": if ident == MENU_IDENTIFIER { "/usr/libexec/duduclaw/maint-shell" } else { DROPBEAR_EXE },
             "MESSAGE": msg,
         })
         .to_string()
@@ -258,8 +272,11 @@ pub(crate) mod tests {
         // it must come from a process the kernel calls dropbear.
         assert_eq!(kind(&entry("s=1", DROPBEAR_SLICE, 4800, "dropbear", 5, LOGIN)), None);
         assert_eq!(kind(&entry("s=1", DROPBEAR_SLICE, 4800, "dropbear", 5, FAILED)), None);
-        let fake_logout = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"4800","_COMM":"logger","SYSLOG_IDENTIFIER":"dropbear","MESSAGE":LOGOUT}).to_string();
+        let fake_logout = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"4800","_COMM":"logger","_EXE":"/usr/bin/logger","SYSLOG_IDENTIFIER":"dropbear","MESSAGE":LOGOUT}).to_string();
         assert_eq!(kind(&fake_logout), None);
+        // `_COMM` is settable by the process (prctl); only `_EXE` counts.
+        let renamed = serde_json::json!({"__CURSOR":"s=1","_SYSTEMD_SLICE":DROPBEAR_SLICE,"_UID":"4800","_COMM":"dropbear","_EXE":"/usr/bin/logger","SYSLOG_IDENTIFIER":"dropbear","MESSAGE":LOGOUT}).to_string();
+        assert_eq!(kind(&renamed), None);
         // Another account's login line is not a maintenance login.
         assert_eq!(kind(&entry("s=1", DROPBEAR_SLICE, 0, "dropbear", 5, &LOGIN.replace("duduclaw-maint", "duduclaw-rescue"))), None);
         // Partial-success logins are not logins.

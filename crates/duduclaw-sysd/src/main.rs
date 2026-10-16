@@ -104,7 +104,15 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let first = duduclaw_sysd::maint_ssh::SSH_LOCK.lock().await;
-        tokio::spawn(duduclaw_sysd::maint_ssh::run_supervisor(first));
+        let supervisor = tokio::spawn(duduclaw_sysd::maint_ssh::run_supervisor(first));
+        // The supervisor never returns; if it panics, nobody enforces window
+        // deadlines any more, so exit and let systemd restart sysd (whose
+        // startup cleanup then closes the window).
+        tokio::spawn(async move {
+            let outcome = supervisor.await;
+            tracing::error!(?outcome, "sysd: maintenance SSH supervisor stopped; exiting so systemd restarts sysd");
+            std::process::exit(70);
+        });
     }
     info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, require_main_pid_of = ?require_main_pid_of, "sysd: starting");
     let listener = bind(&socket_path, allowed_uid)?;
