@@ -349,6 +349,10 @@ fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+#[cfg(all(test, unix))]
+#[path = "tests_socket.rs"]
+mod socket_tests;
+
 pub fn sanitize_opt(text: &Option<String>) -> Option<String> {
     text.as_deref()
         .map(|t| sanitize(t, EVENT_TEXT_MAX_CHARS))
