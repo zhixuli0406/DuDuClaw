@@ -28,6 +28,9 @@
 - 終端機與日誌：`duduclaw onboard` 在「偵測到 Claude … 登入」下方加一行風險提醒與連結；帳號輪替器自動沿用主機 Claude 登入時（`inherit_host_credentials`，預設仍為開），每個行程記一次 WARN；`config.toml` 有 Claude 的 OAuth 帳號（provider 為 anthropic 或未設定）時，`duduclaw doctor` 與 dashboard 健康檢查多一列「訂閱帳號政策風險」（多個訂閱帳號時另外提到輪替）；GitHub Copilot 座位等其他廠商的 oauth 帳號不算在內，因為這一列引用的是 Anthropic 的規範。功能與預設值都沒變：沒有移除或停用任何訂閱登入、輪替或主機登入沿用。
 - 文件同步：三語 `docs/guides/deprecations.md` 新增「v1.74.0 沒有棄用期的變更」段落，說明 `accept_subscription_risk` 參數；`docs/api/openapi.yaml` 與 RPC 說明（`tools_catalog.rs`）補上這個參數。三語 README、`docs/guides/docker.md`（含 zh-TW／ja-JP）的 setup token 不再標「推薦」並改寫風險說明、`docs/features/07`（輪替的「回饋卡」段落加政策風險）、`50`（OS 設定精靈）、`13`（廠商條款與風險告知章節）三語、`docker-compose.yml` 的 `CLAUDE_CODE_OAUTH_TOKEN` 註解。
 
+### Deprecated
+- Gemini CLI runtime（`gemini`）的移除再延到 **v1.75.0**（原訂 v1.74.0）：移除的前提是用真的 Gemini API key 重新驗證 Antigravity，這件事還沒做。執行期警告、儀表板與 `docs/guides/deprecations.md`（三語）同步改成 v1.75.0。Gemini API provider 不受影響。
+
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
 - schema 與處理程式對參數型別的認知不一致，照 schema 傳值的用戶端會被拒或被默默忽略：`memory_fetch_batch` 收到字串形式的 `ids` 直接報錯；`include_metadata: "true"`、`max_files: "5"`、`origin_trust: "0.4"` 這類字串會被忽略並改用預設值；反過來，`wiki_search` 的 `limit: 5`、`expand: true`，`wiki_graph` 的 `depth: 3` 與 `wiki_write` 的 `update_index: false` 以原生 JSON 型別傳入時也會被忽略（`update_index: false` 照樣寫進 `_index.md`）。
