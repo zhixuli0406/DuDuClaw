@@ -1,11 +1,12 @@
-//! The shell's side of the log socket: send one token, relay the answer.
+//! The shell's side of the helper socket: send one token, relay the answer
+//! (log lines, or the single status line of a restart).
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::protocol::LogRequest;
+use crate::protocol::{LogRequest, RestartTarget};
 use crate::sanitize::TerminalFilter;
 
 /// How often a blocked read wakes up to check for Ctrl-C.
@@ -21,7 +22,7 @@ pub enum RelayEnd {
     Interrupted,
 }
 
-/// Connect to the log service, ask for `req`, copy the answer to `out`.
+/// Connect to the helper, ask for log request `req`, copy the answer to `out`.
 pub fn fetch<W: Write + ?Sized>(
     socket: &Path,
     req: LogRequest,
@@ -35,6 +36,44 @@ pub fn fetch<W: Write + ?Sized>(
     // the client as "client gone" and stops following.
     stream.set_read_timeout(Some(POLL_INTERVAL))?;
     relay(&mut stream, out, interrupted)
+}
+
+/// Longest restart status line read from the helper.
+pub const MAX_REPLY_BYTES: usize = 512;
+
+/// How long to wait for a restart's status line: the helper waits up to
+/// [`crate::restart::RESTART_WAIT`] for systemctl, plus a margin.
+pub const RESTART_REPLY_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Ask the helper to restart `target` and return its status line, filtered
+/// for the terminal (`ok: …` or `error: …`).
+pub fn request_restart(socket: &Path, target: RestartTarget) -> io::Result<String> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(target.token().as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.set_read_timeout(Some(RESTART_REPLY_TIMEOUT))?;
+    read_reply_line(&mut stream)
+}
+
+/// Read one bounded line (up to `\n`, end of input or [`MAX_REPLY_BYTES`]),
+/// filtered for the terminal, without the newline.
+pub fn read_reply_line<R: Read + ?Sized>(input: &mut R) -> io::Result<String> {
+    let mut raw = Vec::with_capacity(64);
+    let mut buf = [0u8; 128];
+    while raw.len() < MAX_REPLY_BYTES && !raw.contains(&b'\n') {
+        match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    raw.truncate(MAX_REPLY_BYTES);
+    if let Some(i) = raw.iter().position(|&b| b == b'\n') {
+        raw.truncate(i);
+    }
+    let filtered = crate::sanitize::filter_terminal_bytes(&raw);
+    Ok(String::from_utf8_lossy(&filtered).trim().to_string())
 }
 
 /// Copy `input` to `out` through [`TerminalFilter`], until end of input or
@@ -120,8 +159,23 @@ mod tests {
     }
 
     #[test]
+    fn reply_line_is_bounded_and_filtered() {
+        assert_eq!(
+            read_reply_line(&mut Cursor::new(b"ok: restarted x\nextra".to_vec())).unwrap(),
+            "ok: restarted x"
+        );
+        assert_eq!(
+            read_reply_line(&mut Cursor::new(b"error: \x1b[2Jbad".to_vec())).unwrap(),
+            "error:  [2Jbad"
+        );
+        let long = read_reply_line(&mut Cursor::new(vec![b'a'; 10_000])).unwrap();
+        assert_eq!(long.len(), MAX_REPLY_BYTES);
+        assert_eq!(read_reply_line(&mut Cursor::new(Vec::new())).unwrap(), "");
+    }
+
+    #[test]
     fn fetch_sends_exactly_one_token_line() {
-        let dir = std::env::temp_dir().join(format!("maint-logs-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("maint-helper-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.sock");
         let _ = std::fs::remove_file(&path);

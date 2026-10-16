@@ -1,11 +1,12 @@
-//! `duduclaw-maint-logs` — per-connection root service behind
-//! `/run/duduclaw-maint-logs.sock` (`duduclaw-maint-logs.socket`,
+//! `duduclaw-maint-helper` — per-connection root service behind
+//! `/run/duduclaw-maint-helper.sock` (`duduclaw-maint-helper.socket`,
 //! `Accept=yes`, `StandardInput=socket`). Installed by the OS image as
-//! `/usr/libexec/duduclaw/maint-logs`.
+//! `/usr/libexec/duduclaw/maint-helper`.
 //!
 //! fd 0 is the connected socket. Only uid 4800 (`duduclaw-maint`) is served;
 //! the request is one of `gateway`, `gateway-follow`, `model`,
-//! `model-follow`. See `duduclaw_maint_tools::logs_server`.
+//! `model-follow`, `restart-gateway`, `restart-model`. See
+//! `duduclaw_maint_tools::helper_server` and `duduclaw_maint_tools::restart`.
 
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
@@ -14,15 +15,16 @@ fn main() -> std::process::ExitCode {
     use std::os::unix::net::UnixStream;
     use std::process::ExitCode;
 
-    use duduclaw_maint_tools::journal::{self, LOGS_IDENTIFIER, PRIORITY_INFO, PRIORITY_WARNING};
-    use duduclaw_maint_tools::logs_server::{ServeOutcome, serve_connection, spawn_journalctl};
+    use duduclaw_maint_tools::helper_server::{ServeOutcome, serve_connection, spawn_journalctl};
+    use duduclaw_maint_tools::journal::{self, HELPER_IDENTIFIER, PRIORITY_INFO, PRIORITY_WARNING};
     use duduclaw_maint_tools::protocol::MAINT_UID;
+    use duduclaw_maint_tools::restart::{RestartLimiter, RestartResult, restart_with_limit};
 
     // Diagnostics go to journald, never to stderr: under systemd's defaults
     // stderr is the same socket as the client.
     let note = |priority: u8, message: &str| {
         let _ = journal::send(&journal::entry_payload(
-            LOGS_IDENTIFIER,
+            HELPER_IDENTIFIER,
             priority,
             message,
             &[],
@@ -34,7 +36,7 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             note(
                 PRIORITY_WARNING,
-                &format!("maint-logs: cannot use stdin: {e}"),
+                &format!("maint-helper: cannot use stdin: {e}"),
             );
             return ExitCode::FAILURE;
         }
@@ -45,18 +47,26 @@ fn main() -> std::process::ExitCode {
         _ => {
             note(
                 PRIORITY_WARNING,
-                "maint-logs: stdin is not a socket; start it through duduclaw-maint-logs.socket",
+                "maint-helper: stdin is not a socket; start it through duduclaw-maint-helper.socket",
             );
             return ExitCode::FAILURE;
         }
     }
     let stream = UnixStream::from(std::os::fd::OwnedFd::from(file));
 
-    match serve_connection(&stream, MAINT_UID, spawn_journalctl, &chrono::Local) {
+    let limiter = RestartLimiter::production();
+    let outcome = serve_connection(
+        &stream,
+        MAINT_UID,
+        spawn_journalctl,
+        |target| restart_with_limit(&limiter, target),
+        &chrono::Local,
+    );
+    match outcome {
         ServeOutcome::Refused(why) => {
             note(
                 PRIORITY_WARNING,
-                &format!("maint-logs: refused connection: {why}"),
+                &format!("maint-helper: refused connection: {why}"),
             );
             // A refused client is not a service fault: exiting non-zero
             // would leave one failed instance unit per refusal, cluttering
@@ -66,16 +76,42 @@ fn main() -> std::process::ExitCode {
         ServeOutcome::BadRequest(_) => {
             note(
                 PRIORITY_WARNING,
-                "maint-logs: refused request (not one of the four tokens)",
+                "maint-helper: refused request (not one of the six tokens)",
             );
             ExitCode::SUCCESS
         }
         ServeOutcome::Unavailable(e) => {
             note(
                 PRIORITY_WARNING,
-                &format!("maint-logs: journalctl could not start: {e}"),
+                &format!("maint-helper: journalctl could not start: {e}"),
             );
             ExitCode::FAILURE
+        }
+        ServeOutcome::Restart { target, result } => {
+            let detail = match &result {
+                RestartResult::Unavailable(why) => format!(" ({why})"),
+                _ => String::new(),
+            };
+            let priority = if result == RestartResult::Done {
+                PRIORITY_INFO
+            } else {
+                PRIORITY_WARNING
+            };
+            note(
+                priority,
+                &format!(
+                    "maint-helper: {} requested by uid {MAINT_UID}: {}{detail}",
+                    target.token(),
+                    result.reply(target)
+                ),
+            );
+            // Rate-limited or failed restarts were answered; only an internal
+            // fault (stamp or systemctl unusable) marks the instance failed.
+            if matches!(result, RestartResult::Unavailable(_)) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         ServeOutcome::Streamed {
             request,
@@ -86,7 +122,7 @@ fn main() -> std::process::ExitCode {
             note(
                 PRIORITY_INFO,
                 &format!(
-                    "maint-logs: served {} ({} lines, {} withheld, {} malformed, {} oversized{}{})",
+                    "maint-helper: served {} ({} lines, {} withheld, {} malformed, {} oversized{}{})",
                     request.token(),
                     stats.emitted,
                     stats.withheld,
@@ -107,6 +143,6 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(unix))]
 fn main() -> std::process::ExitCode {
-    eprintln!("duduclaw-maint-logs runs only on DuDuClaw OS (Linux)");
+    eprintln!("duduclaw-maint-helper runs only on DuDuClaw OS (Linux)");
     std::process::ExitCode::FAILURE
 }

@@ -1,6 +1,6 @@
 //! journald JSON records → bounded, redacted, terminal-safe text lines.
 //!
-//! This is the part of `duduclaw-maint-logs` that decides what the
+//! This is the part of `duduclaw-maint-helper` that decides what the
 //! maintenance account may see. It runs on journald's own `MESSAGE` field
 //! (`journalctl -o json`), never on a pre-formatted line, so a message cannot
 //! smuggle a fake timestamp or unit name into the comparison.

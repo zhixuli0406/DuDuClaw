@@ -4,8 +4,10 @@
 
 ### Added
 - 新 crate `duduclaw-maint-tools`，給 DuDuClaw OS 維修 SSH 帳號 `duduclaw-maint`（uid 4800）用的兩個程式。要等 OS 映像裝上這個帳號才用得到，平台發行檔不打包，由 OS recipe 建置；說明見 `crates/duduclaw-maint-tools/README.md`。
-  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。`SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
-  - `duduclaw-maint-logs`：以 root 執行、每條連線一個實例的紀錄服務。對端 uid 由 `SO_PEERCRED` 取得，不是 4800 就拒絕；只收 `gateway`、`gateway-follow`、`model`、`model-follow` 四個字；以 `journalctl -o json` 依 `_SYSTEMD_UNIT` 與 `_UID=1000` 篩選。`MESSAGE` 去掉前置空白後以 `password:` 開頭（不分大小寫）的整筆丟掉，這是 gateway 首次開機印出的一次性密碼；其餘去控制字元、遮罩憑證、截成 4 KiB 後輸出。非 follow 最多 1000 行，超過 64 KiB 的紀錄跳過；請求要在 10 秒內送完，用戶端 30 秒不讀就斷線，follow 在用戶端斷線時立刻停止。
+  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會先提醒這會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。`SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。兩個重啟不在選單裡執行，而是請 helper 代做。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
+  - `duduclaw-maint-helper`：以 root 執行、每條連線一個實例的小服務，socket 是 `/run/duduclaw-maint-helper.sock`。對端 uid 由 `SO_PEERCRED` 取得，不是 4800 就拒絕；只收六個字：`gateway`、`gateway-follow`、`model`、`model-follow`、`restart-gateway`、`restart-model`。
+    - 紀錄：以 `journalctl -o json` 依 `_SYSTEMD_UNIT` 與 `_UID=1000` 篩選。`MESSAGE` 任一行去掉前置空白後以 `password:` 開頭（不分大小寫）的整筆丟掉，這是 gateway 首次開機印出的一次性密碼；其餘去控制字元、遮罩憑證、截成 4 KiB 後輸出。非 follow 最多 1000 行，超過 64 KiB 的紀錄跳過；請求要在 10 秒內送完，用戶端 30 秒不讀就斷線，follow 在用戶端斷線時立刻停止。
+    - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；狀態檔讀寫失敗就拒絕）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
 
 ### Changed
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。

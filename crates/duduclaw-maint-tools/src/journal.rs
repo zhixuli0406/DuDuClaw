@@ -14,8 +14,9 @@ use std::io;
 /// `SYSLOG_IDENTIFIER` of menu events (design §5.1, §6.2).
 pub const MENU_IDENTIFIER: &str = "duduclaw-maint";
 
-/// `SYSLOG_IDENTIFIER` of the log service's own notes (refused peers).
-pub const LOGS_IDENTIFIER: &str = "duduclaw-maint-logs";
+/// `SYSLOG_IDENTIFIER` of the helper's own entries (refusals, served log
+/// requests, restarts).
+pub const HELPER_IDENTIFIER: &str = "duduclaw-maint-helper";
 
 /// journald's native-protocol datagram socket.
 pub const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";

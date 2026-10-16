@@ -1,23 +1,37 @@
-//! Constants shared by `duduclaw-maint-shell` and `duduclaw-maint-logs`, and
-//! the closed token set spoken over the log socket.
+//! Constants shared by `duduclaw-maint-shell` and `duduclaw-maint-helper`,
+//! and the closed token set spoken over the helper socket.
 //!
-//! The wire protocol is one line from the client: exactly one of the four
-//! tokens below followed by `\n`. Nothing else is parsed. The server answers
-//! with plain-text lines and closes the connection when done (or, for the
-//! `-follow` tokens, when the client hangs up).
+//! The wire protocol is one line from the client: exactly one of the six
+//! tokens below followed by `\n`. Nothing else is parsed.
+//! - `gateway`, `gateway-follow`, `model`, `model-follow`: the helper answers
+//!   with plain-text log lines and closes the connection when done (or, for
+//!   the `-follow` tokens, when the client hangs up).
+//! - `restart-gateway`, `restart-model`: the helper restarts that one fixed
+//!   unit and answers with a single status line starting `ok:` or `error:`.
+//!
+//! The restarts go through this root helper rather than polkit (owner
+//! decision 2026-10-16: adding polkit to the base edition can renumber
+//! existing system accounts).
 
 /// uid (and gid) of the `duduclaw-maint` account. Fixed by the OS recipe
 /// (`useradd --system -u 4800`), chosen to stay clear of the host's dynamic
 /// system range, the gateway's subuid range and Android AIDs inside Waydroid.
-/// `duduclaw-maint-logs` admits only this uid.
+/// `duduclaw-maint-helper` admits only this uid.
 pub const MAINT_UID: u32 = 4800;
 
 /// uid the gateway and the local model server run as (`duduclaw`). The log
 /// service only returns journal records whose `_UID` is this value.
 pub const SERVICE_UID: u32 = 1000;
 
-/// Unix socket `duduclaw-maint-logs.socket` listens on.
-pub const LOGS_SOCKET_PATH: &str = "/run/duduclaw-maint-logs.sock";
+/// Unix socket `duduclaw-maint-helper.socket` listens on.
+pub const HELPER_SOCKET_PATH: &str = "/run/duduclaw-maint-helper.sock";
+
+/// Directory (systemd `RuntimeDirectory=duduclaw-maint-helper`, preserved
+/// across instances) where the helper keeps its per-unit restart stamps.
+pub const HELPER_STATE_DIR: &str = "/run/duduclaw-maint-helper";
+
+/// Minimum time between two restarts of the same unit through the helper.
+pub const RESTART_MIN_INTERVAL_SECS: u64 = 60;
 
 /// systemd unit of the gateway.
 pub const GATEWAY_UNIT: &str = "duduclaw-gateway.service";
@@ -26,7 +40,7 @@ pub const GATEWAY_UNIT: &str = "duduclaw-gateway.service";
 pub const MODEL_UNIT: &str = "duduclaw-llama-server.service";
 
 /// Longest request line (without the newline) the server reads. The longest
-/// token is 14 bytes; anything past this is rejected without buffering it.
+/// token is 15 bytes; anything past this is rejected without buffering it.
 pub const MAX_TOKEN_LINE_BYTES: usize = 32;
 
 /// Which service's journal to read.
@@ -52,6 +66,81 @@ pub struct LogRequest {
     pub source: LogSource,
     pub follow: bool,
 }
+
+/// Which unit a restart request targets. Only these two exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartTarget {
+    Gateway,
+    Model,
+}
+
+impl RestartTarget {
+    pub const ALL: [RestartTarget; 2] = [RestartTarget::Gateway, RestartTarget::Model];
+
+    /// The wire token.
+    pub fn token(self) -> &'static str {
+        match self {
+            RestartTarget::Gateway => "restart-gateway",
+            RestartTarget::Model => "restart-model",
+        }
+    }
+
+    /// The one unit this target restarts.
+    pub fn unit(self) -> &'static str {
+        match self {
+            RestartTarget::Gateway => GATEWAY_UNIT,
+            RestartTarget::Model => MODEL_UNIT,
+        }
+    }
+
+    /// Short name used for the helper's restart stamp file.
+    pub fn key(self) -> &'static str {
+        match self {
+            RestartTarget::Gateway => "gateway",
+            RestartTarget::Model => "model",
+        }
+    }
+
+    /// The fixed `systemctl` arguments (after the program path). Run by the
+    /// root helper, so no polkit is involved.
+    pub fn systemctl_args(self) -> [&'static str; 4] {
+        ["--no-pager", "--no-ask-password", "restart", self.unit()]
+    }
+}
+
+/// Everything the helper accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperRequest {
+    Logs(LogRequest),
+    Restart(RestartTarget),
+}
+
+impl HelperRequest {
+    /// The wire token.
+    pub fn token(self) -> &'static str {
+        match self {
+            HelperRequest::Logs(r) => r.token(),
+            HelperRequest::Restart(t) => t.token(),
+        }
+    }
+
+    /// Parse one request line (the bytes before `\n`): exact, byte-for-byte
+    /// match against the six tokens; no trimming, no case folding.
+    pub fn parse_token(line: &[u8]) -> Result<HelperRequest, TokenError> {
+        match LogRequest::parse_token(line) {
+            Ok(r) => Ok(HelperRequest::Logs(r)),
+            Err(TokenError::Unknown) => RestartTarget::ALL
+                .into_iter()
+                .find(|t| t.token().as_bytes() == line)
+                .map(HelperRequest::Restart)
+                .ok_or(TokenError::Unknown),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Reply line prefix for a successful restart.
+pub const REPLY_OK_PREFIX: &str = "ok:";
 
 /// Why a request line was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +267,64 @@ mod tests {
         assert_eq!(
             LogRequest::parse_token(&[b'a'; MAX_TOKEN_LINE_BYTES + 1]),
             Err(TokenError::TooLong)
+        );
+    }
+
+    #[test]
+    fn helper_tokens_round_trip_and_nothing_else_parses() {
+        for r in LogRequest::ALL {
+            assert_eq!(
+                HelperRequest::parse_token(r.token().as_bytes()),
+                Ok(HelperRequest::Logs(r))
+            );
+        }
+        for t in RestartTarget::ALL {
+            assert_eq!(
+                HelperRequest::parse_token(t.token().as_bytes()),
+                Ok(HelperRequest::Restart(t))
+            );
+            assert!(t.token().len() <= MAX_TOKEN_LINE_BYTES);
+        }
+        for bad in [
+            &b"restart"[..],
+            b"restart-sysd",
+            b"restart-shell",
+            b"restart-dropbear",
+            b"restart-gateway ",
+            b"restart-gateway\r",
+            b"Restart-model",
+            b"restart-model;reboot",
+            b"restart duduclaw-gateway.service",
+            b"reboot",
+            b"stop-gateway",
+        ] {
+            assert_eq!(
+                HelperRequest::parse_token(bad),
+                Err(TokenError::Unknown),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_args_are_fixed() {
+        assert_eq!(
+            RestartTarget::Gateway.systemctl_args(),
+            [
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "duduclaw-gateway.service"
+            ]
+        );
+        assert_eq!(
+            RestartTarget::Model.systemctl_args(),
+            [
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "duduclaw-llama-server.service"
+            ]
         );
     }
 

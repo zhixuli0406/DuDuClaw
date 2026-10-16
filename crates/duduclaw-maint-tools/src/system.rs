@@ -5,10 +5,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::helper_client::{self, RelayEnd};
 use crate::journal::{self, MENU_IDENTIFIER};
-use crate::logs_client::{self, RelayEnd};
 use crate::menu::Executor;
-use crate::protocol::{LOGS_SOCKET_PATH, LogRequest};
+use crate::protocol::{HELPER_SOCKET_PATH, LogRequest, RestartTarget};
 use crate::sanitize::{PumpEnd, pump_filtered};
 use crate::signals;
 use crate::tools::{CHILD_ENV, Tool, resolve_tool};
@@ -91,8 +91,8 @@ impl Executor for SystemExecutor {
         signals::clear();
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        let end = logs_client::fetch(
-            Path::new(LOGS_SOCKET_PATH),
+        let end = helper_client::fetch(
+            Path::new(HELPER_SOCKET_PATH),
             req,
             &mut out,
             &signals::interrupted,
@@ -103,6 +103,10 @@ impl Executor for SystemExecutor {
             signals::clear();
         }
         Ok(())
+    }
+
+    fn request_restart(&mut self, target: RestartTarget) -> io::Result<String> {
+        helper_client::request_restart(Path::new(HELPER_SOCKET_PATH), target)
     }
 
     fn record(&mut self, priority: u8, message: &str, fields: &[(&str, &str)]) {

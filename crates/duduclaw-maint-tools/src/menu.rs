@@ -14,12 +14,17 @@
 //! The menu's own `argv` (dropbear passes `-c <forced command>`) is ignored.
 //! No byte of client input is ever passed to a child: every argument below is
 //! a constant, and the only thing input does is pick one of nine actions.
+//! The two restarts are not run here at all: the menu asks the root
+//! `duduclaw-maint-helper` for `restart-gateway` / `restart-model` (owner
+//! decision 2026-10-16: no polkit).
 
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use crate::journal::{PRIORITY_INFO, PRIORITY_WARNING};
-use crate::protocol::{GATEWAY_UNIT, LogRequest, LogSource, MODEL_UNIT};
+use crate::protocol::{
+    GATEWAY_UNIT, LogRequest, LogSource, MODEL_UNIT, REPLY_OK_PREFIX, RestartTarget,
+};
 use crate::tools::Tool;
 
 /// Longest `SSH_ORIGINAL_COMMAND` considered at all. The longest valid
@@ -148,7 +153,8 @@ pub fn parse_menu_choice(input: &str) -> MenuChoice {
 }
 
 /// `systemctl` options every call carries: no pager, and never ask for a
-/// password (no polkit agent prompt on a pty; polkit's answer is final).
+/// password (nothing the menu runs needs privileges; a prompt would only
+/// hang the session).
 pub const SYSTEMCTL_BASE: [&str; 2] = ["--no-pager", "--no-ask-password"];
 
 /// Units `status` reports on, each only if it exists on this edition.
@@ -173,17 +179,19 @@ pub enum Step {
     Run {
         tool: Tool,
         args: Vec<&'static str>,
-        /// Whether a non-zero exit makes the action fail (true for restarts;
-        /// display commands such as `systemctl status` exit 3 for an inactive
-        /// unit, which is information, not failure).
+        /// Whether a non-zero exit makes the action fail (display commands
+        /// such as `systemctl status` exit 3 for an inactive unit, which is
+        /// information, not failure).
         check_status: bool,
         /// Skip quietly when the program is not installed (design: "若存在").
         optional: bool,
     },
     /// `systemctl status -n 0 <unit>` if the unit is loaded on this device.
     UnitStatus(&'static str),
-    /// Relay one log request from the log service.
+    /// Relay one log request from the helper.
     Logs(LogRequest),
+    /// Ask the helper to restart one fixed unit.
+    Restart(RestartTarget),
 }
 
 fn systemctl(rest: &[&'static str], check_status: bool) -> Step {
@@ -239,8 +247,8 @@ pub fn plan(action: Action) -> Vec<Step> {
             Step::Heading("== DNS =="),
             show(Tool::Resolvectl, &["--no-pager", "status"], true),
         ],
-        Action::RestartModel => vec![systemctl(&["restart", MODEL_UNIT], true)],
-        Action::RestartGateway => vec![systemctl(&["restart", GATEWAY_UNIT], true)],
+        Action::RestartModel => vec![Step::Restart(RestartTarget::Model)],
+        Action::RestartGateway => vec![Step::Restart(RestartTarget::Gateway)],
     }
 }
 
@@ -256,6 +264,8 @@ pub trait Executor {
     fn capture(&mut self, program: &Path, args: &[String]) -> io::Result<String>;
     /// Relay one log request to stdout.
     fn stream_logs(&mut self, req: LogRequest) -> io::Result<()>;
+    /// Ask the helper for a restart; returns its status line.
+    fn request_restart(&mut self, target: RestartTarget) -> io::Result<String>;
     /// Write one journal entry (identifier `duduclaw-maint`).
     fn record(&mut self, priority: u8, message: &str, fields: &[(&str, &str)]);
     /// Text for the technician (stdout).
@@ -357,11 +367,23 @@ fn run_step<E: Executor + ?Sized>(step: &Step, exec: &mut E) -> bool {
             }
         }
         Step::UnitStatus(unit) => run_unit_status(unit, exec),
+        Step::Restart(target) => match exec.request_restart(*target) {
+            Ok(line) => {
+                exec.print(&format!("{line}\n"));
+                line.starts_with(REPLY_OK_PREFIX)
+            }
+            Err(e) => {
+                exec.warn(&format!(
+                    "無法連到維修輔助服務 / The maintenance helper is not reachable: {e}\n"
+                ));
+                false
+            }
+        },
         Step::Logs(req) => match exec.stream_logs(*req) {
             Ok(()) => true,
             Err(e) => {
                 exec.warn(&format!(
-                    "無法取得紀錄（紀錄服務沒有回應）/ Logs are unavailable (log service not reachable): {e}\n"
+                    "無法取得紀錄（維修輔助服務沒有回應）/ Logs are unavailable (maintenance helper not reachable): {e}\n"
                 ));
                 false
             }
@@ -530,6 +552,10 @@ mod tests {
         not_loaded: Vec<&'static str>,
         fail_on: Option<&'static str>,
         logs_fail: bool,
+        restarts: Vec<RestartTarget>,
+        /// Reply the fake helper gives to a restart (default "ok: …").
+        restart_reply: Option<&'static str>,
+        restart_unreachable: bool,
     }
 
     impl Executor for Recorder {
@@ -562,6 +588,16 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        fn request_restart(&mut self, target: RestartTarget) -> io::Result<String> {
+            self.restarts.push(target);
+            if self.restart_unreachable {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no socket"));
+            }
+            Ok(self
+                .restart_reply
+                .map(String::from)
+                .unwrap_or_else(|| format!("ok: restarted {}", target.unit())))
         }
         fn record(&mut self, priority: u8, message: &str, fields: &[(&str, &str)]) {
             self.records.push((
@@ -691,42 +727,38 @@ mod tests {
     }
 
     #[test]
-    fn restarts_run_exactly_the_two_allowed_units() {
+    fn restarts_go_to_the_helper_and_run_nothing_locally() {
         let mut r = Recorder::default();
         assert_eq!(run_command_mode("restart model", &mut r), 0);
-        assert_eq!(
-            r.runs,
-            [[
-                "/usr/bin/systemctl",
-                "--no-pager",
-                "--no-ask-password",
-                "restart",
-                "duduclaw-llama-server.service"
-            ]]
+        assert_eq!(r.restarts, [RestartTarget::Model]);
+        assert!(
+            r.runs.is_empty(),
+            "no systemctl from the shell: {:?}",
+            r.runs
         );
+        assert!(
+            r.printed
+                .contains("ok: restarted duduclaw-llama-server.service")
+        );
+
         let mut r = Recorder::default();
         assert_eq!(run_command_mode("restart gateway confirm", &mut r), 0);
-        assert_eq!(
-            r.runs,
-            [[
-                "/usr/bin/systemctl",
-                "--no-pager",
-                "--no-ask-password",
-                "restart",
-                "duduclaw-gateway.service"
-            ]]
-        );
+        assert_eq!(r.restarts, [RestartTarget::Gateway]);
+        assert!(r.runs.is_empty());
         assert!(r.warned.contains("closes the maintenance window"));
-        // No action anywhere restarts or reboots anything else.
+
+        // No action runs a restart, reboot or unit change locally.
         for a in Action::ALL {
             for step in plan(a) {
                 if let Step::Run { args, .. } = step {
                     for bad in [
+                        "restart",
                         "reboot",
                         "poweroff",
                         "halt",
                         "kexec",
-                        "duduclaw-sysd.service",
+                        "stop",
+                        "start",
                         "edit",
                         "set-property",
                     ] {
@@ -738,13 +770,34 @@ mod tests {
     }
 
     #[test]
-    fn refused_restart_is_reported_as_failure() {
+    fn helper_refusals_are_reported_as_failure() {
+        for reply in [
+            "error: too soon, try again in 42 s",
+            "error: restart failed (exit 1)",
+            "error: not permitted",
+            "",
+        ] {
+            let mut r = Recorder {
+                restart_reply: Some(reply),
+                ..Default::default()
+            };
+            assert_eq!(
+                run_command_mode("restart model", &mut r),
+                EXIT_FAILED,
+                "{reply:?}"
+            );
+            assert!(r.printed.contains(reply));
+            assert!(r.warned.contains("did not succeed"));
+        }
         let mut r = Recorder {
-            fail_on: Some("restart"),
+            restart_unreachable: true,
             ..Default::default()
         };
-        assert_eq!(run_command_mode("restart model", &mut r), EXIT_FAILED);
-        assert!(r.warned.contains("did not succeed"));
+        assert_eq!(
+            run_command_mode("restart gateway confirm", &mut r),
+            EXIT_FAILED
+        );
+        assert!(r.warned.contains("helper is not reachable"));
     }
 
     #[test]
@@ -812,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn logs_go_through_the_log_service_only() {
+    fn logs_go_through_the_helper_only() {
         let mut r = Recorder::default();
         assert_eq!(run_command_mode("logs gateway", &mut r), 0);
         assert_eq!(
@@ -828,7 +881,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run_command_mode("logs model follow", &mut r), EXIT_FAILED);
-        assert!(r.warned.contains("log service not reachable"));
+        assert!(r.warned.contains("maintenance helper not reachable"));
     }
 
     #[test]
@@ -873,7 +926,7 @@ mod tests {
                 .all(|(_, _, f)| f.contains(&("MAINT_MODE".into(), "interactive".into())))
         );
         assert!(r.printed.contains("Enter a number from 0 to 9"));
-        assert!(!r.runs.iter().any(|a| a.contains(&"restart".to_string())));
+        assert!(r.restarts.is_empty());
     }
 
     #[test]
@@ -888,10 +941,7 @@ mod tests {
             let mut r = Recorder::default();
             let mut input = Cursor::new(format!("9\n{answer}0\n"));
             run_interactive(&mut input, &mut r);
-            let did = r
-                .runs
-                .iter()
-                .any(|a| a.contains(&"duduclaw-gateway.service".to_string()));
+            let did = r.restarts.contains(&RestartTarget::Gateway);
             assert_eq!(did, restarted, "answer {answer:?}");
             assert!(r.printed.contains("ends this connection"));
         }

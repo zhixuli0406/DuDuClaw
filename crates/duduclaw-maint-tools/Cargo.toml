@@ -4,15 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Fixed command menu and filtered journal service for the DuDuClaw OS maintenance SSH account (duduclaw-maint, uid 4800). Built by the OS image, not shipped in platform release artifacts."
+description = "Fixed command menu and root helper (filtered journal, two fixed restarts) for the DuDuClaw OS maintenance SSH account (duduclaw-maint, uid 4800). Built by the OS image, not shipped in platform release artifacts."
 
 [[bin]]
 name = "duduclaw-maint-shell"
 path = "src/bin/maint_shell.rs"
 
 [[bin]]
-name = "duduclaw-maint-logs"
-path = "src/bin/maint_logs.rs"
+name = "duduclaw-maint-helper"
+path = "src/bin/maint_helper.rs"
 
 [lib]
 path = "src/lib.rs"

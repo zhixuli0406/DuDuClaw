@@ -1,10 +1,10 @@
-//! One connection of `duduclaw-maint-logs`: peer gate → token → journalctl →
-//! filtered lines.
+//! One connection of `duduclaw-maint-helper`: peer gate → token → either
+//! filtered journal lines or one fixed restart.
 //!
 //! systemd (`Accept=yes`, `StandardInput=socket`) starts one instance per
 //! connection with the connected socket on fd 0. [`serve_connection`] is the
-//! whole life of that instance; the journal reader is injected so tests can
-//! substitute a fixture.
+//! whole life of that instance; the journal reader and the restart are
+//! injected so tests can substitute fixtures.
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -19,7 +19,8 @@ use chrono::TimeZone;
 
 use crate::logs_filter::{MAX_LINES_NON_FOLLOW, StreamStats, stream_records};
 use crate::peer::{PeerRejection, authorize_peer};
-use crate::protocol::{LogRequest, MAX_TOKEN_LINE_BYTES, TokenError};
+use crate::protocol::{HelperRequest, LogRequest, MAX_TOKEN_LINE_BYTES, RestartTarget, TokenError};
+use crate::restart::RestartResult;
 use crate::tools::{CHILD_ENV, Tool, resolve_tool};
 
 /// How long a client may take, in total, to send its token line.
@@ -63,10 +64,15 @@ pub enum ServeOutcome {
     /// Peer uid check failed before any client input was parsed (pending
     /// input is only drained and discarded so the refusal reaches the client).
     Refused(PeerRejection),
-    /// The request line was not one of the four tokens (or timed out).
+    /// The request line was not one of the six tokens (or timed out).
     BadRequest(TokenReadError),
     /// `journalctl` could not be started.
     Unavailable(io::Error),
+    /// A restart was requested; `result` was sent as one status line.
+    Restart {
+        target: RestartTarget,
+        result: RestartResult,
+    },
     /// Records were streamed. `client_gone` when the client hung up first.
     Streamed {
         request: LogRequest,
@@ -87,14 +93,14 @@ pub enum TokenReadError {
 
 /// Read one request line, byte by byte so nothing past the newline is
 /// consumed, never more than [`MAX_TOKEN_LINE_BYTES`] + 1 bytes.
-pub fn read_token_line<R: Read + ?Sized>(r: &mut R) -> Result<LogRequest, TokenReadError> {
+pub fn read_token_line<R: Read + ?Sized>(r: &mut R) -> Result<HelperRequest, TokenReadError> {
     let mut line = Vec::with_capacity(MAX_TOKEN_LINE_BYTES + 1);
     let mut byte = [0u8; 1];
     loop {
         match r.read(&mut byte) {
             Ok(0) => return Err(TokenReadError::NoNewline),
             Ok(_) if byte[0] == b'\n' => {
-                return LogRequest::parse_token(&line).map_err(TokenReadError::Token);
+                return HelperRequest::parse_token(&line).map_err(TokenReadError::Token);
             }
             Ok(_) => {
                 line.push(byte[0]);
@@ -124,18 +130,22 @@ pub fn spawn_journalctl(req: LogRequest) -> io::Result<Child> {
         .spawn()
 }
 
-/// Serve one connection. `expected_uid` is [`crate::protocol::MAINT_UID`] in
-/// production; `spawn` is [`spawn_journalctl`] in production.
-pub fn serve_connection<Tz, F>(
+/// Serve one connection. In production `expected_uid` is
+/// [`crate::protocol::MAINT_UID`], `spawn` is [`spawn_journalctl`] and
+/// `restart` is [`crate::restart::restart_with_limit`] with the production
+/// limiter.
+pub fn serve_connection<Tz, F, R>(
     stream: &UnixStream,
     expected_uid: u32,
     spawn: F,
+    restart: R,
     tz: &Tz,
 ) -> ServeOutcome
 where
     Tz: TimeZone,
     Tz::Offset: std::fmt::Display,
     F: FnOnce(LogRequest) -> io::Result<Child>,
+    R: FnOnce(RestartTarget) -> RestartResult,
 {
     let mut writer = stream;
 
@@ -145,7 +155,7 @@ where
         return ServeOutcome::Refused(rejection);
     }
 
-    // 2. What they want: one of four tokens.
+    // 2. What they want: one of six tokens.
     let request = read_token_line(&mut DeadlineReader {
         stream,
         deadline: Instant::now() + TOKEN_TIMEOUT,
@@ -157,7 +167,16 @@ where
             .map_err(TokenReadError::Io)
     });
     let request = match request {
-        Ok(r) => r,
+        Ok(HelperRequest::Logs(r)) => r,
+        Ok(HelperRequest::Restart(target)) => {
+            // Same peer gate as the logs above; the unit comes from the
+            // closed token set, never from the client's text.
+            let result = restart(target);
+            let mut line = result.reply(target);
+            line.push('\n');
+            finish_with_reply(stream, &line);
+            return ServeOutcome::Restart { target, result };
+        }
         Err(e) => {
             finish_with_reply(stream, REPLY_BAD_REQUEST);
             return ServeOutcome::BadRequest(e);
@@ -239,7 +258,7 @@ where
     if !gone && !stopped_early && exit_code != Some(0) {
         let code = exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string());
         let _ = writer
-            .write_all(format!("[maint-logs] journalctl exited with status {code}\n").as_bytes());
+            .write_all(format!("[maint-helper] journalctl exited with status {code}\n").as_bytes());
     }
     // Close both directions now: the client sees end-of-output, and the
     // hang-up watcher's read returns, so nothing outlives this connection
@@ -320,6 +339,10 @@ mod tests {
         f
     }
 
+    fn no_restart(_: RestartTarget) -> RestartResult {
+        panic!("no restart expected in this test")
+    }
+
     fn rec(msg: &str) -> String {
         serde_json::json!({ "__REALTIME_TIMESTAMP": "1792134000000000", "MESSAGE": msg })
             .to_string()
@@ -332,7 +355,7 @@ mod tests {
     #[test]
     fn token_line_reader() {
         assert!(
-            matches!(read_token_line(&mut Cursor::new(b"model\n")), Ok(r) if r == LogRequest::ALL[2])
+            matches!(read_token_line(&mut Cursor::new(b"model\n")), Ok(HelperRequest::Logs(r)) if r == LogRequest::ALL[2])
         );
         assert!(matches!(
             read_token_line(&mut Cursor::new(b"model")),
@@ -365,6 +388,7 @@ mod tests {
                 spawned = true;
                 Err(io::Error::other("must not spawn"))
             },
+            no_restart,
             &Utc,
         );
         assert!(matches!(
@@ -386,6 +410,7 @@ mod tests {
             &server,
             my_uid(),
             |_| Err(io::Error::other("must not spawn")),
+            no_restart,
             &Utc,
         );
         assert!(matches!(
@@ -418,6 +443,7 @@ mod tests {
                 seen = Some(req);
                 cat(path)(req)
             },
+            no_restart,
             &Utc,
         );
         assert_eq!(
@@ -469,7 +495,13 @@ mod tests {
             }
             n
         });
-        let outcome = serve_connection(&server, my_uid(), cat(f.path().to_path_buf()), &Utc);
+        let outcome = serve_connection(
+            &server,
+            my_uid(),
+            cat(f.path().to_path_buf()),
+            no_restart,
+            &Utc,
+        );
         match outcome {
             ServeOutcome::Streamed { stats, .. } => {
                 assert_eq!(stats.emitted, MAX_LINES_NON_FOLLOW);
@@ -506,6 +538,7 @@ mod tests {
                     .stdout(Stdio::piped())
                     .spawn()
             },
+            no_restart,
             &Utc,
         );
         hang_up.join().unwrap();
@@ -523,6 +556,86 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    fn restart_request(token: &[u8], uid: u32) -> (ServeOutcome, String, Vec<RestartTarget>) {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(token).unwrap();
+        let mut called = Vec::new();
+        let outcome = serve_connection(
+            &server,
+            uid,
+            |_| Err(io::Error::other("must not spawn")),
+            |t| {
+                called.push(t);
+                RestartResult::Done
+            },
+            &Utc,
+        );
+        drop(server);
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        (outcome, reply, called)
+    }
+
+    #[test]
+    fn restart_tokens_restart_exactly_their_unit() {
+        let (outcome, reply, called) = restart_request(b"restart-model\n", my_uid());
+        assert!(matches!(
+            outcome,
+            ServeOutcome::Restart {
+                target: RestartTarget::Model,
+                result: RestartResult::Done
+            }
+        ));
+        assert_eq!(called, [RestartTarget::Model]);
+        assert_eq!(reply, "ok: restarted duduclaw-llama-server.service\n");
+        let (_, reply, called) = restart_request(b"restart-gateway\n", my_uid());
+        assert_eq!(called, [RestartTarget::Gateway]);
+        assert_eq!(reply, "ok: restarted duduclaw-gateway.service\n");
+    }
+
+    #[test]
+    fn restart_from_wrong_peer_or_unknown_token_runs_nothing() {
+        let other = if my_uid() == MAINT_UID {
+            MAINT_UID + 1
+        } else {
+            MAINT_UID
+        };
+        let (outcome, reply, called) = restart_request(b"restart-gateway\n", other);
+        assert!(matches!(outcome, ServeOutcome::Refused(_)));
+        assert!(called.is_empty());
+        assert_eq!(reply, REPLY_NOT_PERMITTED);
+        for bad in [
+            &b"restart-sysd\n"[..],
+            b"restart gateway\n",
+            b"restart-gateway --now\n",
+        ] {
+            let (outcome, reply, called) = restart_request(bad, my_uid());
+            assert!(matches!(outcome, ServeOutcome::BadRequest(_)));
+            assert!(called.is_empty());
+            assert_eq!(reply, REPLY_BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn restart_refusal_is_sent_as_one_line() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(b"restart-model\n").unwrap();
+        let outcome = serve_connection(
+            &server,
+            my_uid(),
+            |_| Err(io::Error::other("must not spawn")),
+            |_| RestartResult::RateLimited {
+                retry_after_secs: 37,
+            },
+            &Utc,
+        );
+        assert!(matches!(outcome, ServeOutcome::Restart { .. }));
+        drop(server);
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "error: too soon, try again in 37 s\n");
     }
 
     #[test]
@@ -566,6 +679,7 @@ mod tests {
                     .stderr(Stdio::null())
                     .spawn()
             },
+            no_restart,
             &Utc,
         );
         assert!(matches!(
@@ -578,6 +692,6 @@ mod tests {
         drop(server);
         let mut reply = String::new();
         client.read_to_string(&mut reply).unwrap();
-        assert_eq!(reply, "[maint-logs] journalctl exited with status 3\n");
+        assert_eq!(reply, "[maint-helper] journalctl exited with status 3\n");
     }
 }

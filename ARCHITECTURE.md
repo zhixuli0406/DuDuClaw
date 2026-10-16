@@ -425,7 +425,7 @@ DuDuClaw/
 │   ├── duduclaw-pets/            # 照片轉桌面寵物包 + 本地去背
 │   ├── duduclaw-relay/           # Cloud Relay：webhook 轉發 + LAN 裝置探索（可獨立部署）
 │   ├── duduclaw-sysd/            # 值班機 image 的權限分離 root 系統服務（Unix socket）
-│   ├── duduclaw-maint-tools/     # OS 維修 SSH 帳號的固定選單 maint-shell 與 root 紀錄篩選服務 maint-logs（OS 映像建置）
+│   ├── duduclaw-maint-tools/     # OS 維修 SSH 帳號的固定選單 maint-shell 與 root 小服務 maint-helper（紀錄篩選＋兩個重啟，OS 映像建置）
 │   └── duduclaw-db/              # 唯讀 SQL 資料來源（PostgreSQL / MySQL / SQLite）
 │
 ├── web/                          # React Dashboard（見第十節）

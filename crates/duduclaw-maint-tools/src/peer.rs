@@ -1,4 +1,4 @@
-//! Peer-credential gate for the log socket.
+//! Peer-credential gate for the helper socket.
 //!
 //! The uid comes from the kernel (`SO_PEERCRED` on Linux, `getpeereid` on the
 //! BSDs/macOS used for development), recorded when the client connected —
