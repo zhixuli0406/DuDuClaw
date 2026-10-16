@@ -1,4 +1,8 @@
-# DuDuClaw 🐾
+# DuDuClaw
+
+<p align="center">
+  <img src="docs/assets/brand/duduclaw-readme-banner.png" width="100%" alt="DuDuClaw by Dudu Technology Ltd. Bring AI coding tools into your team's chat. Review results. Track costs. Keep context.">
+</p>
 
 <div align="center">
 
@@ -285,5 +289,5 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 商用ライセンス、企業導入、トレーニングとサポートは正規総代理店の [未來企業股份有限公司（Future Corp）](https://www.futurecorp.tw/) が提供します。開発元は直接販売していません。
 
 <p align="center">
-  🐾 Built with louis.li
+  Built with louis.li
 </p>

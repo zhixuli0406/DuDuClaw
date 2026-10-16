@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { ChevronDown, Check } from 'lucide-react';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useEffectiveName, useEffectiveLogo } from '@/lib/product-identity';
+import { useEffectiveName, DEFAULT_AGENT_GLYPH } from '@/lib/product-identity';
 import { cn } from '@/lib/utils';
 
 /**
@@ -28,8 +28,8 @@ export function AgentModelPicker({
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const loaded = useAgentsStore((s) => s.loaded);
   const brandName = useEffectiveName();
-  const brandLogo = useEffectiveLogo();
-  const fallbackIcon = brandLogo.isImage ? '🐾' : brandLogo.value;
+  // Agents without an icon of their own show the default agent avatar glyph.
+  const fallbackIcon = DEFAULT_AGENT_GLYPH;
 
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);

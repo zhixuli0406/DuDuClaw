@@ -1,4 +1,8 @@
-# DuDuClaw 🐾
+# DuDuClaw
+
+<p align="center">
+  <img src="docs/assets/brand/duduclaw-readme-banner.png" width="100%" alt="DuDuClaw by Dudu Technology Ltd. Bring AI coding tools into your team's chat. Review results. Track costs. Keep context.">
+</p>
 
 <div align="center">
 
@@ -285,5 +289,5 @@ Open core: the core is [Apache License 2.0](LICENSE), free to use, modify, and d
 Commercial licenses, enterprise rollout, training and support are provided by our authorised distributor, [Future Corp (未來企業股份有限公司)](https://www.futurecorp.tw/). We do not sell directly.
 
 <p align="center">
-  🐾 Built with louis.li
+  Built with louis.li
 </p>

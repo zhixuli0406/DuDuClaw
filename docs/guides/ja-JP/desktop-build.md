@@ -15,11 +15,11 @@ cargo install tauri-cli --version "^2"
 # macOS: Xcode CLT;  Linux: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 ```
 
-アプリアイコンを一度生成します。ブランド素材のソース`web/public/paw-1024.png`はコミット済みです。`src-tauri/icons/`配下に生成されるアイコンセットはgitignore対象なので、再生成してください（コミットしないこと）。
+アプリアイコンを一度生成します。ブランド素材のソース`src-tauri/icons/source/duduclaw-1024.png`はコミット済みです。`src-tauri/icons/`配下に生成されるアイコンセットはgitignore対象なので、再生成してください（コミットしないこと）。
 
 ```bash
 scripts/desktop/gen-icons.sh           # cargo tauri icon, with a macOS sips fallback
-# or directly:  cd src-tauri && cargo tauri icon ../web/public/paw-1024.png
+# or directly:  cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 ```
 
 ## Dev (hot-reload UI)
@@ -92,7 +92,7 @@ cd src-tauri && cargo tauri build
    は現在`binaries/`だけでなく`target/{debug,release}/`にもコピーします。`cargo clean`後は必ず`stage-sidecar.sh`を再実行してください。
 
 9. **アイコンに白い縁が出る。** ソース画像は透明な角がクリーンである必要があります（`qlmanage`でSVGをラスタライズすると透明部分が白でマット合成されるため使わないこと）。再生成した
-   `paw-1024.png`はフルブリードの琥珀色の正方形で、スーパーサンプリング済みの角丸alphaマスクを持ちます。`build.rs`は
+   `src-tauri/icons/source/duduclaw-1024.png`（`scripts/desktop/make-icon-master.py`で生成）はフルブリードのクリーム色の正方形に猫のマークを載せたもので、スーパーサンプリング済みの角丸alphaマスクを持ちます。`build.rs`は
    `rerun-if-changed=icons`を発行するため、再生成したアイコンセットは次のビルドで再度組み込まれます（そうしなければ古いアイコンが焼き込まれたままになります。macOS側でも古いものをキャッシュしている場合があります：`sudo rm -rf /Library/Caches/com.apple.iconservices.store && killall Dock`）。
 
 10. **`cargo tauri build`の最後に「A public key has been found, but no private

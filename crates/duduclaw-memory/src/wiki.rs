@@ -321,6 +321,11 @@ const WIKI_SUBDIRS: &[&str] = &["entities", "concepts", "sources", "synthesis"];
 /// Maximum directory recursion depth for file scanning.
 const MAX_RECURSION_DEPTH: usize = 20;
 
+/// Upper bound on `export_mermaid`'s BFS hops from `center`. Ten hops already
+/// covers any wiki whose graph a person can read; the MCP `wiki_graph` tool
+/// clamps its `depth` argument to the same value.
+pub const MAX_GRAPH_DEPTH: usize = 10;
+
 // ---------------------------------------------------------------------------
 // WikiStore
 // ---------------------------------------------------------------------------
@@ -427,8 +432,9 @@ impl WikiStore {
     /// content to its raw on-disk digest.
     pub fn read_page_with_raw(&self, path: &str) -> Result<(WikiPage, String)> {
         self.validate_page_path(path)?;
-        let full = self.wiki_dir.join(path);
-        let content = std::fs::read_to_string(&full)
+        // No-follow read: a page swapped for a symlink after the check is
+        // refused instead of followed (check/read TOCTOU).
+        let content = crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, path)
             .map_err(|e| DuDuClawError::Memory(format!("read {path}: {e}")))?;
         let page = parse_wiki_page(path, &content)?;
         Ok((page, content))
@@ -476,21 +482,21 @@ impl WikiStore {
         Ok((page, raw))
     }
 
-    /// Read raw content of any wiki file (including reserved files).
+    /// Read raw content of a wiki page, reserved files (`_index.md`,
+    /// `_schema.md`, `_log.md`) included. Only `.md` files: other files in a
+    /// wiki directory (FTS database, `.scope.toml`) are not pages. Callers
+    /// that publish a page (`wiki_share`) refuse reserved names themselves.
+    ///
+    /// Fail closed: the path must pass the shared validator, resolve inside
+    /// the wiki directory, and be a regular file opened without following a
+    /// symlink.
     pub fn read_raw(&self, path: &str) -> Result<String> {
-        if path.is_empty() || path.contains("..") || path.starts_with('/') || path.starts_with('\\') || path.contains('\0')
-            || path.contains("%2e") || path.contains("%2E") || path.contains("%2f") || path.contains("%2F")
-        {
-            return Err(DuDuClawError::Memory("path traversal not allowed".into()));
+        crate::wiki_path::validate_relative_wiki_path(path)
+            .map_err(|e| DuDuClawError::Memory(format!("invalid page path: {e}")))?;
+        if !path.ends_with(".md") {
+            return Err(DuDuClawError::Memory("page path must end with .md".into()));
         }
-        let full = self.wiki_dir.join(path);
-        // Canonicalize check — prevent symlink escape
-        if full.exists()
-            && let (Ok(canon_full), Ok(canon_wiki)) = (full.canonicalize(), self.wiki_dir.canonicalize())
-                && !canon_full.starts_with(&canon_wiki) {
-                    return Err(DuDuClawError::Memory("resolved path escapes wiki directory".into()));
-                }
-        std::fs::read_to_string(&full)
+        crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, path)
             .map_err(|e| DuDuClawError::Memory(format!("read {path}: {e}")))
     }
 
@@ -569,25 +575,15 @@ impl WikiStore {
             )));
         }
 
-        let full = self.wiki_dir.join(path);
+        // Validate and confine before creating any directory, then write
+        // through an O_EXCL temp file (never through a planted link).
+        let full = crate::wiki_path::prepare_wiki_write_target(&self.wiki_dir, path)
+            .map_err(|e| DuDuClawError::Memory(format!("page path refused: {e}")))?;
 
-        // Ensure parent directory
-        if let Some(parent) = full.parent()
-            && !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| DuDuClawError::Memory(format!("create dir: {e}")))?;
-            }
+        let is_new = std::fs::symlink_metadata(&full).is_err();
 
-        let is_new = !full.exists();
-
-        // Atomic write
-        let tmp = full.with_extension("md.tmp");
-        std::fs::write(&tmp, content)
-            .map_err(|e| DuDuClawError::Memory(format!("write temp: {e}")))?;
-        std::fs::rename(&tmp, &full).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            DuDuClawError::Memory(format!("rename temp: {e}"))
-        })?;
+        crate::wiki_path::atomic_write_nofollow(&full, content)
+            .map_err(|e| DuDuClawError::Memory(format!("write page: {e}")))?;
 
         // Update index
         let title = extract_title(content).unwrap_or_else(|| path.to_string());
@@ -604,18 +600,15 @@ impl WikiStore {
         // Check for missing reciprocal backlinks in related pages
         let related = extract_string_list(content, "related");
         for rel_path in &related {
-            let rel_full = self.wiki_dir.join(rel_path);
-            if rel_full.exists() {
-                if let Ok(rel_content) = std::fs::read_to_string(&rel_full) {
-                    let rel_related = extract_string_list(&rel_content, "related");
-                    if !rel_related.iter().any(|r| r == path) {
-                        info!(
-                            page = path,
-                            related = rel_path.as_str(),
-                            "Backlink suggestion: '{}' references '{}' but not vice versa",
-                            path, rel_path
-                        );
-                    }
+            if let Some(rel_content) = self.read_linked_page(rel_path) {
+                let rel_related = extract_string_list(&rel_content, "related");
+                if !rel_related.iter().any(|r| r == path) {
+                    info!(
+                        page = path,
+                        related = rel_path.as_str(),
+                        "Backlink suggestion: '{}' references '{}' but not vice versa",
+                        path, rel_path
+                    );
                 }
             }
         }
@@ -653,24 +646,23 @@ impl WikiStore {
             }
         }
         let dest = archive_root.join(path);
+        // Confirm the destination stays under wiki_dir/_archive before and
+        // after creating its parents (defence in depth — `path` is
+        // validate_page_path'd, but a symlink planted deeper in `_archive/`
+        // must not redirect the move). Fail closed: an unresolvable path
+        // denies instead of skipping the check.
+        let confine = |p: &Path| {
+            crate::wiki_path::ensure_within_wiki_dir(&archive_root, p).map_err(|e| {
+                DuDuClawError::Memory(format!(
+                    "archive destination escapes _archive/ (symlink detected): {e}"
+                ))
+            })
+        };
+        confine(&dest)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| DuDuClawError::Memory(format!("create archive dir: {e}")))?;
-        }
-        // Confirm the resolved destination still lives under wiki_dir/_archive
-        // (defence in depth — `path` is validate_page_path'd, but a future
-        // attacker who plants symlinks deeper in the tree shouldn't escape).
-        if let (Ok(canon_root), Ok(canon_dest)) = (
-            archive_root.canonicalize(),
-            dest.parent()
-                .map(|p| p.canonicalize())
-                .unwrap_or_else(|| Err(std::io::Error::other("no parent"))),
-        ) {
-            if !canon_dest.starts_with(&canon_root) {
-                return Err(DuDuClawError::Memory(
-                    "archive destination escapes _archive/ (symlink detected)".into(),
-                ));
-            }
+            confine(parent)?;
         }
         std::fs::rename(&src, &dest)
             .map_err(|e| DuDuClawError::Memory(format!("archive {path}: {e}")))?;
@@ -691,10 +683,25 @@ impl WikiStore {
     pub fn restore_archived(&self, path: &str) -> Result<bool> {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
-        let archived = self.wiki_dir.join("_archive").join(path);
-        if !archived.exists() {
-            return Ok(false);
+        let archive_root = self.wiki_dir.join("_archive");
+        let archived = archive_root.join(path);
+        match std::fs::symlink_metadata(&archived) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => {
+                return Err(DuDuClawError::Memory(
+                    "archived page is not a regular file".into(),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(DuDuClawError::Memory(format!("archived page: {e}"))),
         }
+        // A symlinked `_archive/` (or a link deeper in it) must not let a
+        // restore move an outside file into the live wiki.
+        if std::fs::symlink_metadata(&archive_root).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(DuDuClawError::Memory("_archive/ is a symlink".into()));
+        }
+        crate::wiki_path::ensure_within_wiki_dir(&archive_root, &archived)
+            .map_err(|e| DuDuClawError::Memory(format!("archived page refused: {e}")))?;
         let dest = self.wiki_dir.join(path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
@@ -770,7 +777,7 @@ impl WikiStore {
             std::fs::remove_file(&full)
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
         }
-        let indexed = match std::fs::read_to_string(self.wiki_dir.join("_index.md")) {
+        let indexed = match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, "_index.md") {
             Ok(t) => t.contains(&format!("]({path})")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
@@ -970,8 +977,7 @@ impl WikiStore {
 
             for hit in &hits {
                 // Outbound: read the page's `related` field
-                let full = self.wiki_dir.join(&hit.path);
-                if let Ok(content) = std::fs::read_to_string(&full) {
+                if let Some(content) = self.read_linked_page(&hit.path) {
                     for rel in extract_string_list(&content, "related") {
                         if !direct_paths.contains(&rel) {
                             expanded_paths.insert(rel);
@@ -990,10 +996,12 @@ impl WikiStore {
 
             // Read expanded pages and create SearchHits with score=0
             for exp_path in expanded_paths {
-                let full = self.wiki_dir.join(&exp_path);
-                let content = match std::fs::read_to_string(&full) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                // `related` entries are page content, i.e. caller-supplied:
+                // `related: [../../secret.md]` must not pull an outside file
+                // into the search results.
+                let content = match self.read_linked_page(&exp_path) {
+                    Some(c) => c,
+                    None => continue,
                 };
                 let title = extract_title(&content).unwrap_or_else(|| exp_path.clone());
                 let trust = extract_field(&content, "trust")
@@ -1054,7 +1062,7 @@ impl WikiStore {
 
         let content = lines.join("\n") + "\n";
         let index_path = self.wiki_dir.join("_index.md");
-        std::fs::write(&index_path, content)
+        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
             .map_err(|e| DuDuClawError::Memory(format!("rebuild index: {e}")))?;
 
         info!(pages = pages.len(), "Wiki index rebuilt");
@@ -1072,17 +1080,18 @@ impl WikiStore {
         let mut exported = 0;
 
         // Copy reserved files
+        // Read through the no-follow helper: a reserved file replaced by a
+        // symlink must not copy an outside file into the export.
         for reserved in &["_schema.md", "_index.md", "_log.md"] {
-            let src = self.wiki_dir.join(reserved);
-            if src.exists() {
-                let dst = output_dir.join(reserved);
-                std::fs::copy(&src, &dst)
-                    .map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?;
+            match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, reserved) {
+                Ok(content) => std::fs::write(output_dir.join(reserved), content)
+                    .map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(DuDuClawError::Memory(format!("copy {reserved}: {e}"))),
             }
         }
 
         for page in &pages {
-            let src = self.wiki_dir.join(&page.path);
             let dst = output_dir.join(&page.path);
 
             // Ensure parent dir
@@ -1092,7 +1101,7 @@ impl WikiStore {
                         .map_err(|e| DuDuClawError::Memory(format!("mkdir: {e}")))?;
                 }
 
-            let content = std::fs::read_to_string(&src)
+            let content = crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, &page.path)
                 .map_err(|e| DuDuClawError::Memory(format!("read {}: {e}", page.path)))?;
 
             // Append Obsidian wikilinks for related pages
@@ -1135,14 +1144,14 @@ impl WikiStore {
              <meta charset=\"utf-8\">\n\
              <title>Wiki Export</title>\n\
              <style>\n\
-             body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; color: #1c1917; }\n\
-             h1 { border-bottom: 2px solid #f59e0b; padding-bottom: 0.5rem; }\n\
-             h2 { color: #78716c; margin-top: 2rem; }\n\
-             .page { border: 1px solid #e7e5e4; border-radius: 12px; padding: 1.5rem; margin: 1rem 0; }\n\
-             .page h3 { margin-top: 0; color: #1c1917; }\n\
-             .meta { font-size: 0.8rem; color: #a8a29e; margin-bottom: 0.5rem; }\n\
-             .tags span { background: #fef3c7; color: #92400e; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; margin-right: 4px; }\n\
-             pre { background: #fafaf9; padding: 1rem; border-radius: 8px; overflow-x: auto; }\n\
+             body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; color: #102B48; background: #F5F4F0; }\n\
+             h1 { border-bottom: 2px solid #CC8B2D; padding-bottom: 0.5rem; }\n\
+             h2 { color: #5B6470; margin-top: 2rem; }\n\
+             .page { background: #FFFFFF; border: 1px solid #D4D7D8; border-radius: 10px; padding: 1.5rem; margin: 1rem 0; }\n\
+             .page h3 { margin-top: 0; color: #102B48; }\n\
+             .meta { font-size: 0.8rem; color: #5B6470; margin-bottom: 0.5rem; }\n\
+             .tags span { background: #F3E7D3; color: #8A5A10; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; margin-right: 4px; }\n\
+             pre { background: #102B48; color: #F5F4F0; padding: 1rem; border-radius: 8px; overflow-x: auto; }\n\
              </style>\n</head>\n<body>\n\
              <h1>Wiki Knowledge Base</h1>\n"
         );
@@ -1586,18 +1595,22 @@ impl WikiStore {
     /// names, `.md` suffix). `pub(crate)` so callers that touch the filesystem
     /// before `read_page_with_raw` — e.g. `causal_wiki`'s size probe — can
     /// validate FIRST instead of stat-ing an unvalidated path.
+    /// Read a page named by page content (a `related` entry, a backlink, a
+    /// search hit). Same rules as a caller-supplied path: shared validator,
+    /// `.md` only, inside the wiki, no symlink. `None` on any refusal.
+    fn read_linked_page(&self, rel: &str) -> Option<String> {
+        if crate::wiki_path::validate_relative_wiki_path(rel).is_err() || !rel.ends_with(".md") {
+            return None;
+        }
+        crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, rel).ok()
+    }
+
     pub(crate) fn validate_page_path(&self, path: &str) -> Result<()> {
-        if path.is_empty() {
-            return Err(DuDuClawError::Memory("empty page path".into()));
-        }
-        // String-level checks (first line of defense)
-        if path.contains("..") || path.starts_with('/') || path.starts_with('\\') {
-            return Err(DuDuClawError::Memory("path traversal not allowed".into()));
-        }
-        // Block null bytes and percent-encoded traversal
-        if path.contains('\0') || path.contains("%2e") || path.contains("%2E") || path.contains("%2f") || path.contains("%2F") {
-            return Err(DuDuClawError::Memory("encoded path traversal not allowed".into()));
-        }
+        // String-level checks shared with every MCP wiki tool: relative only,
+        // no NUL / `..` / encoded separators / drive prefix / Prefix, RootDir
+        // or ParentDir component.
+        crate::wiki_path::validate_relative_wiki_path(path)
+            .map_err(|e| DuDuClawError::Memory(format!("invalid page path: {e}")))?;
         if !path.ends_with(".md") {
             return Err(DuDuClawError::Memory("page path must end with .md".into()));
         }
@@ -1611,19 +1624,11 @@ impl WikiStore {
                 filename
             )));
         }
-        // Component-level check — reject any ParentDir or RootDir components
-        for component in Path::new(path).components() {
-            if matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir) {
-                return Err(DuDuClawError::Memory("path component traversal not allowed".into()));
-            }
-        }
-        // Canonicalize check — verify resolved path stays within wiki_dir
-        let full = self.wiki_dir.join(path);
-        if full.exists()
-            && let (Ok(canon_full), Ok(canon_wiki)) = (full.canonicalize(), self.wiki_dir.canonicalize())
-                && !canon_full.starts_with(&canon_wiki) {
-                    return Err(DuDuClawError::Memory("resolved path escapes wiki directory".into()));
-                }
+        // Containment — the nearest existing ancestor (or the page) must
+        // resolve inside the wiki directory. Fail closed: an unresolvable
+        // wiki dir, a dangling link or any metadata error denies.
+        crate::wiki_path::ensure_within_wiki_dir(&self.wiki_dir, &self.wiki_dir.join(path))
+            .map_err(|e| DuDuClawError::Memory(format!("page path refused: {e}")))?;
         Ok(())
     }
 
@@ -1641,7 +1646,7 @@ impl WikiStore {
         // Advisory lock — blocks until acquired
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
-        let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+        let existing = self.read_index_nofollow()?;
         let now = Utc::now().format("%Y-%m-%d").to_string();
         // Escape title chars that break markdown link syntax
         let safe_title = title.replace('[', "\\[").replace(']', "\\]");
@@ -1662,15 +1667,9 @@ impl WikiStore {
         }
 
         // Atomic write: temp + rename under lock
-        let tmp_path = index_path.with_extension("md.idx_tmp");
         let content = lines.join("\n") + "\n";
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| format!("write index tmp: {e}"))?;
-        std::fs::rename(&tmp_path, &index_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("rename index: {e}")
-            })?;
+        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+            .map_err(|e| format!("write index: {e}"))?;
 
         // Lock released when lock_file is dropped
         Ok(())
@@ -1688,7 +1687,7 @@ impl WikiStore {
             .map_err(|e| format!("open lock: {e}"))?;
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
-        let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+        let existing = self.read_index_nofollow()?;
         let link_pattern = format!("]({})", page_path);
 
         let lines: Vec<&str> = existing
@@ -1696,15 +1695,20 @@ impl WikiStore {
             .filter(|line| !line.contains(&link_pattern))
             .collect();
 
-        let tmp_path = index_path.with_extension("md.idx_tmp");
         let content = lines.join("\n") + "\n";
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| format!("write index tmp: {e}"))?;
-        std::fs::rename(&tmp_path, &index_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("rename index: {e}")
-            })
+        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+            .map_err(|e| format!("write index: {e}"))
+    }
+
+    /// `_index.md` without following a symlink. Missing means empty; a link
+    /// or other non-regular file is an error, so the index is never rebuilt
+    /// from (or written over) a file outside the wiki.
+    fn read_index_nofollow(&self) -> std::result::Result<String, String> {
+        match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, "_index.md") {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("read index: {e}")),
+        }
     }
 
     fn append_log(&self, action: &str, page_path: &str) -> std::result::Result<(), String> {
@@ -1720,9 +1724,22 @@ impl WikiStore {
         };
 
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        // Never append through a symlink planted at `_log.md`: refuse a link
+        // up front (Windows) and let `O_NOFOLLOW` fail the open (unix).
+        match std::fs::symlink_metadata(&log_path) {
+            Ok(m) if !m.is_file() => return Err("open log: _log.md is not a regular file".to_string()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("open log: {e}")),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut f = options
             .open(&log_path)
             .map_err(|e| format!("open log: {e}"))?;
         f.write_all(entry.as_bytes())
@@ -1743,25 +1760,15 @@ impl WikiStore {
 
         let _fence = self.delivery_fence().exclusive_for_write()?;
 
-        let full = self.wiki_dir.join(path);
+        // Validate and confine before creating any directory, then write
+        // through an O_EXCL temp file (never through a planted link).
+        let full = crate::wiki_path::prepare_wiki_write_target(&self.wiki_dir, path)
+            .map_err(|e| DuDuClawError::Memory(format!("page path refused: {e}")))?;
 
-        // Ensure parent directory
-        if let Some(parent) = full.parent()
-            && !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| DuDuClawError::Memory(format!("create dir: {e}")))?;
-            }
+        let is_new = std::fs::symlink_metadata(&full).is_err();
 
-        let is_new = !full.exists();
-
-        // Atomic write
-        let tmp = full.with_extension("md.tmp");
-        std::fs::write(&tmp, content)
-            .map_err(|e| DuDuClawError::Memory(format!("write temp: {e}")))?;
-        std::fs::rename(&tmp, &full).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            DuDuClawError::Memory(format!("rename temp: {e}"))
-        })?;
+        crate::wiki_path::atomic_write_nofollow(&full, content)
+            .map_err(|e| DuDuClawError::Memory(format!("write page: {e}")))?;
 
         // Update index
         let title = extract_title(content).unwrap_or_else(|| path.to_string());
@@ -2671,7 +2678,13 @@ impl WikiStore {
             let mut frontier = vec![center_path.to_string()];
             visited.insert(center_path.to_string());
 
-            for _ in 0..depth {
+            // Bounded twice: the depth is capped, and the walk stops as soon
+            // as a hop finds nothing new (a caller-supplied depth near
+            // u64::MAX used to spin here with an empty frontier).
+            for _ in 0..depth.min(MAX_GRAPH_DEPTH) {
+                if frontier.is_empty() {
+                    break;
+                }
                 let mut next_frontier = Vec::new();
                 for node in &frontier {
                     for (a, b) in &edges {
@@ -2919,6 +2932,118 @@ This is the body of the page.
         assert!(store.write_page("/etc/passwd", "bad").is_err());
         assert!(store.write_page("_index.md", "bad").is_err());
         assert!(store.write_page("_log.md", "bad").is_err());
+    }
+
+    #[test]
+    fn test_windows_and_nul_forms_blocked_and_read_raw_requires_md() {
+        let tmp = TempDir::new().unwrap();
+        let store = WikiStore::new(tmp.path().join("wiki"));
+        store.ensure_scaffold().unwrap();
+        for bad in ["C:\\x.md", "C:x.md", "a\0b.md", "\\\\srv\\x.md", "a/../b.md"] {
+            assert!(store.write_page(bad, "bad").is_err(), "{bad:?}");
+            assert!(store.read_raw(bad).is_err(), "{bad:?}");
+        }
+        std::fs::write(tmp.path().join("wiki/notes.txt"), "not a page").unwrap();
+        assert!(store.read_raw("notes.txt").is_err());
+        // Reserved files stay readable through read_raw (dashboard index view).
+        assert!(store.read_raw("_index.md").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_escapes_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), "---\ntitle: s\n---\nsecret").unwrap();
+        let store = WikiStore::new(wiki.clone());
+        store.ensure_scaffold().unwrap();
+        symlink(&outside, wiki.join("linked")).unwrap();
+        symlink(outside.join("secret.md"), wiki.join("concepts/alias.md")).unwrap();
+        symlink(tmp.path().join("missing.md"), wiki.join("concepts/dangling.md")).unwrap();
+
+        // Reads through a symlinked dir, a page link, or a dangling link.
+        assert!(store.read_raw("linked/secret.md").is_err());
+        assert!(store.read_raw("concepts/alias.md").is_err());
+        assert!(store.read_page("concepts/alias.md").is_err());
+        assert!(store.read_page("concepts/dangling.md").is_err());
+        // Writes through a symlinked dir create nothing outside.
+        assert!(store.write_page("linked/new/x.md", "x").is_err());
+        assert!(!outside.join("new").exists());
+        // Deleting through a symlinked dir removes nothing outside.
+        assert!(store.delete_page("linked/secret.md").is_err());
+        assert!(outside.join("secret.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reserved_file_symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let outside_log = tmp.path().join("outside-log.md");
+        let outside_index = tmp.path().join("outside-index.md");
+        std::fs::write(&outside_log, "OUTSIDE LOG\n").unwrap();
+        std::fs::write(&outside_index, "OUTSIDE INDEX\n").unwrap();
+        let store = WikiStore::new(wiki.clone());
+        store.ensure_scaffold().unwrap();
+        std::fs::remove_file(wiki.join("_log.md")).unwrap();
+        std::fs::remove_file(wiki.join("_index.md")).unwrap();
+        symlink(&outside_log, wiki.join("_log.md")).unwrap();
+        symlink(&outside_index, wiki.join("_index.md")).unwrap();
+
+        // write_page logs and indexes: neither may write through the links.
+        store.write_page("concepts/a.md", "---\ntitle: A\n---\nbody").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside_log).unwrap(), "OUTSIDE LOG\n");
+        assert_eq!(std::fs::read_to_string(&outside_index).unwrap(), "OUTSIDE INDEX\n");
+
+        // Export must not copy the outside files into the vault.
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        assert!(store.export_obsidian(&vault).is_err());
+        assert!(!vault.join("_index.md").exists());
+
+        // rebuild_index replaces the link with a regular file, target untouched.
+        store.rebuild_index().unwrap();
+        assert_eq!(std::fs::read_to_string(&outside_index).unwrap(), "OUTSIDE INDEX\n");
+        assert!(!std::fs::symlink_metadata(wiki.join("_index.md")).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_search_expand_ignores_related_outside_the_wiki() {
+        let tmp = TempDir::new().unwrap();
+        let wiki = tmp.path().join("wiki");
+        std::fs::write(
+            tmp.path().join("leak.md"),
+            "---\ntitle: LEAKED\n---\nsecret body",
+        )
+        .unwrap();
+        let store = WikiStore::new(wiki);
+        store.ensure_scaffold().unwrap();
+        store
+            .write_page(
+                "concepts/a.md",
+                "---\ntitle: Alpha\nrelated: [../leak.md]\n---\nalpha needle",
+            )
+            .unwrap();
+        let hits = store.search_filtered("needle", 10, None, None, true).unwrap();
+        assert!(hits.iter().all(|h| h.title != "LEAKED" && !h.path.contains("leak")));
+    }
+
+    #[test]
+    fn test_mermaid_depth_is_capped_and_stops_on_empty_frontier() {
+        let tmp = TempDir::new().unwrap();
+        let store = WikiStore::new(tmp.path().join("wiki"));
+        store.ensure_scaffold().unwrap();
+        store.write_page("a.md", "---\ntitle: A\nrelated: [b.md]\n---\n").unwrap();
+        store.write_page("b.md", "---\ntitle: B\n---\n").unwrap();
+        let started = std::time::Instant::now();
+        let out = store.export_mermaid(Some("a.md"), usize::MAX).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(out.contains("\"A\"") && out.contains("\"B\""));
     }
 
     #[test]

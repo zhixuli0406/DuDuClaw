@@ -798,8 +798,10 @@ const APPROVAL_PAGE_HTML: &str = r##"<!DOCTYPE html>
 <script nonce="__CSP_NONCE__" src="https://telegram.org/js/telegram-web-app.js"></script>
 <style nonce="__CSP_NONCE__">
 :root{
-  --bg:#fafaf9; --fg:#1c1917; --hint:#78716c; --card:#ffffff;
-  --line:#e7e5e4; --accent:#f59e0b; --accent-fg:#ffffff; --danger:#e11d48;
+  /* C1 palette outside Telegram (Telegram's themeParams override these):
+     cream page, navy text, navy primary button with cream label. */
+  --bg:#F5F4F0; --fg:#102B48; --hint:#5B6470; --card:#ffffff;
+  --line:#D4D7D8; --accent:#102B48; --accent-fg:#F5F4F0; --danger:#e11d48;
 }
 *{box-sizing:border-box}
 body{

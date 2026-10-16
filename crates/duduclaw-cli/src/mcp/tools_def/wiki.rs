@@ -190,7 +190,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "depth",
-                description: "Max hops from center (default 2; ignored without center)",
+                description: "Max hops from center (default 2, capped at 10; ignored without center)",
                 required: false,
             },
         ],

@@ -35,21 +35,45 @@
   --color-stone-900: oklch(19.4% 0.017 263);
   --color-stone-950: oklch(14.5% 0.016 265);
 
-  /* Brand amber — kept as the single signature accent over graphite. */
-  --color-primary-50: #fffbeb;
-  --color-primary-100: #fef3c7;
-  --color-primary-200: #fde68a;
-  --color-primary-300: #fcd34d;
-  --color-primary-400: #fbbf24;
-  --color-primary-500: #f59e0b;
-  --color-primary-600: #d97706;
-  --color-primary-700: #b45309;
-  --color-primary-800: #92400e;
-  --color-primary-900: #78350f;
-  --color-primary-950: #451a03;
+  /* Brand navy ramp (DuDuClaw C1 identity, 2026-10). 900 = Navy #102B48 (the
+     mark's ink), 950 = the dark-theme page navy #0B1E33. Kept for any
+     `*-primary-<n>` utility; the semantic `--primary` / `--brand` tokens in the
+     MULTICA block below are the ones pages actually use. */
+  --color-primary-50: oklch(0.97 0.01 252);
+  --color-primary-100: oklch(0.93 0.02 252);
+  --color-primary-200: oklch(0.86 0.035 252);
+  --color-primary-300: oklch(0.75 0.05 252);
+  --color-primary-400: oklch(0.62 0.06 252);
+  --color-primary-500: oklch(0.5 0.065 252);
+  --color-primary-600: oklch(0.42 0.065 252);
+  --color-primary-700: oklch(0.36 0.064 252);
+  --color-primary-800: oklch(0.32 0.064 252);
+  --color-primary-900: #102b48;
+  --color-primary-950: #0b1e33;
 
-  --color-accent-400: #fb923c;
-  --color-accent-500: #f97316;
+  /* DuDuClaw accent = C1 Amber #CC8B2D (decorative). 400 doubles as the
+     dark-theme accent text colour (#E0A54F). */
+  --color-accent-400: #e0a54f;
+  --color-accent-500: #cc8b2d;
+
+  /* Tailwind `amber-*` re-based on C1 Amber so every existing amber utility
+     (brand touches and warning states alike) renders in the new palette
+     without per-file edits. Warning call-sites stay amber-hued, so they still
+     read as warnings. Anchors: 500 = #CC8B2D (fills, icons, decoration only;
+     2.9:1 on white), 700 = #8A5A10 (light-theme text, 5.9:1 on white),
+     400 = #E0A54F (dark-theme text, 8.7:1 on the dark canvas). 600 is darkened
+     to pass AA as text (5.2:1 on white) because `text-amber-600` is common. */
+  --color-amber-50: oklch(0.975 0.02 80);
+  --color-amber-100: oklch(0.945 0.045 78);
+  --color-amber-200: oklch(0.895 0.075 76);
+  --color-amber-300: oklch(0.83 0.105 75);
+  --color-amber-400: #e0a54f;
+  --color-amber-500: #cc8b2d;
+  --color-amber-600: oklch(0.54 0.112 71.5);
+  --color-amber-700: #8a5a10;
+  --color-amber-800: oklch(0.43 0.088 70);
+  --color-amber-900: oklch(0.36 0.072 68);
+  --color-amber-950: oklch(0.26 0.052 66);
 
   --radius-lg: 1rem;
   --radius-sm: 0.5rem;
@@ -124,11 +148,11 @@
   --status-task-icon-failed: oklch(50% 0.13 25);
   --status-task-icon-cancelled: oklch(55% 0.015 255);
 
-  /* 10 warm agent gradient pairs (amber/coral/sage/sky/violet families) — the
+  /* 10 agent gradient pairs (amber/denim/sage/sky/violet families) — the
      one visual identity source: avatar backs, org nodes, world sprite tints.
      Theme-agnostic (chosen to read on both light and dark surfaces). */
-  --agent-1a: oklch(80% 0.13 75);  --agent-1b: oklch(72% 0.15 55);   /* amber   */
-  --agent-2a: oklch(75% 0.14 35);  --agent-2b: oklch(68% 0.16 20);   /* coral   */
+  --agent-1a: oklch(82% 0.10 75);  --agent-1b: oklch(73% 0.125 71);  /* C1 amber */
+  --agent-2a: oklch(76% 0.055 256); --agent-2b: oklch(67% 0.075 258); /* C1 navy, lifted to a denim tint */
   --agent-3a: oklch(78% 0.09 150); --agent-3b: oklch(70% 0.11 165);  /* sage    */
   --agent-4a: oklch(78% 0.10 235); --agent-4b: oklch(70% 0.13 255);  /* sky     */
   --agent-5a: oklch(74% 0.12 300); --agent-5b: oklch(66% 0.15 295);  /* violet  */
@@ -143,12 +167,16 @@
   --coin: oklch(66% 0.15 70);
 
   /* Character system (§3.2) — the ink for eyes/mouth reads on every agent tint
-     (all agent gradients are light oklch ~72–82%), so it stays dark in both
-     themes. The emote bubble body is a drawn near-white pill. */
-  --character-ink: oklch(34% 0.02 60);
-  --character-ink-soft: oklch(52% 0.02 60);
-  --character-bubble: oklch(99% 0.005 80);
-  --character-bubble-border: oklch(88% 0.01 80);
+     (all agent gradients are light oklch ~67–82%), so it stays dark in both
+     themes: C1 Navy #102B48, soft ink = muted #5B6470. The emote bubble body is
+     a drawn C1 Cream pill. Cheeks use the C1 amber accent. */
+  --character-ink: oklch(0.285 0.063 252.3);
+  --character-ink-soft: oklch(0.5 0.022 255.6);
+  --character-bubble: oklch(0.967 0.005 95.1);
+  /* Toe beans on the cat paw: Cream in both themes so they read on the Navy paw. */
+  --character-paw-bean: oklch(0.967 0.005 95.1);
+  --character-bubble-border: oklch(0.877 0.004 219.5);
+  --character-blush: oklch(0.687 0.131 71.5);
 }
 
 .dark {
@@ -201,8 +229,9 @@
 
   /* Character system — bubble body goes dark; ink stays dark (agent tints are
      light in both themes, so eyes read as dark on the face either way). */
-  --character-bubble: oklch(32% 0.012 260);
-  --character-bubble-border: oklch(44% 0.014 260);
+  --character-bubble: oklch(0.32 0.04 252);
+  --character-paw-bean: oklch(0.967 0.005 95.1);
+  --character-bubble-border: oklch(0.44 0.05 252);
 }
 
 /* The legacy Calm Glass surface utilities (glass-card / glass-card-hover /
@@ -233,7 +262,7 @@ h1, h2, h3 {
 }
 
 ::selection {
-  background: oklch(82% 0.14 80 / 0.45);
+  background: oklch(0.762 0.124 74.2 / 0.4); /* C1 amber (#E0A54F) */
 }
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -391,8 +420,9 @@ h1, h2, h3 {
   --card-foreground: oklch(0.141 0.005 285.823);
   --popover: var(--surface-raised);
   --popover-foreground: oklch(0.141 0.005 285.823);
-  --primary: oklch(0.21 0.006 285.885);
-  --primary-foreground: oklch(0.985 0 0);
+  /* Primary button = C1 Navy fill + Cream text (web design spec §2). */
+  --primary: oklch(0.285 0.063 252.3);
+  --primary-foreground: oklch(0.967 0.005 95.1);
   --secondary: oklch(0.967 0.001 286.375);
   --secondary-foreground: oklch(0.21 0.006 285.885);
   --muted: oklch(0.967 0.001 286.375);
@@ -403,10 +433,11 @@ h1, h2, h3 {
   --border: oklch(0.945 0.003 286.32);
   --input: oklch(0.92 0.004 286.32);
   --ring: oklch(0.705 0.015 286.067);
-  /* Brand = Multica blue (hue 255). Swap `--brand` back to amber later to
-     re-skin without touching any other layer; chart hues follow brand. */
-  --brand: oklch(0.55 0.16 255);
-  --brand-foreground: oklch(0.985 0 0);
+  /* Brand = DuDuClaw C1 Navy #102B48 (2026-10 identity). Amber #CC8B2D is the
+     decorative accent: `--logo-accent` / the re-based `amber-*` scale. Chart
+     hues follow brand. */
+  --brand: oklch(0.285 0.063 252.3);
+  --brand-foreground: oklch(0.967 0.005 95.1);
   --success: oklch(0.55 0.16 145);
   --warning: oklch(0.75 0.16 85);
   --info: oklch(0.55 0.18 250);
@@ -414,18 +445,24 @@ h1, h2, h3 {
   /* ── Sidebar (§1.3) ── */
   --sidebar: var(--app-shell);
   --sidebar-foreground: oklch(0.141 0.005 285.823);
-  --sidebar-primary: oklch(0.21 0.006 285.885);
+  --sidebar-primary: oklch(0.285 0.063 252.3);
   --sidebar-accent: oklch(0.935 0.003 286.375);
   --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
   --sidebar-border: oklch(0.92 0.004 286.32);
   --sidebar-ring: oklch(0.705 0.015 286.067);
 
-  /* ── Chart (§1.4): chart-1 = brand, main → tertiary ramp, hue 255 ── */
-  --chart-1: oklch(0.55 0.16 255);
-  --chart-2: oklch(0.66 0.13 255);
-  --chart-3: oklch(0.76 0.1 255);
-  --chart-4: oklch(0.85 0.06 255);
-  --chart-5: oklch(0.92 0.03 255);
+  /* ── Chart (§1.4): chart-1 = brand navy, main → tertiary ramp, hue 252 ── */
+  --chart-1: oklch(0.285 0.063 252.3);
+  --chart-2: oklch(0.45 0.07 252);
+  --chart-3: oklch(0.6 0.065 252);
+  --chart-4: oklch(0.75 0.05 252);
+  --chart-5: oklch(0.88 0.025 252);
+
+  /* ── Brand mark (C1 logo rules): ink follows the theme, accent never changes.
+     `--logo-face` is the mascot's eye/mouth colour (the inverse of the ink). ── */
+  --logo-ink: oklch(0.285 0.063 252.3);   /* Navy #102B48 */
+  --logo-accent: oklch(0.687 0.131 71.5); /* Amber #CC8B2D */
+  --logo-face: oklch(0.967 0.005 95.1);   /* Cream #F5F4F0 */
 
   /* ── Elevation (§1.5) — three layers ── */
   --surface-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 1px rgb(15 23 42 / 0.03);
@@ -454,8 +491,9 @@ h1, h2, h3 {
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.235 0.007 285.885);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.92 0.004 286.32);
-  --primary-foreground: oklch(0.21 0.006 285.885);
+  /* Dark primary button = Cream fill + Navy text (web design spec §2). */
+  --primary: oklch(0.967 0.005 95.1);
+  --primary-foreground: oklch(0.285 0.063 252.3);
   --secondary: oklch(0.274 0.006 286.033);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.274 0.006 286.033);
@@ -466,26 +504,33 @@ h1, h2, h3 {
   --border: oklch(1 0 0 / 6%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.552 0.016 285.938);
-  --brand: oklch(0.65 0.16 255);
-  --brand-foreground: oklch(0.985 0 0);
+  /* Navy cannot sit on the dark canvas (1.3:1), so dark brand is a pale navy
+     tint (#BED4EB, 12.4:1 on the canvas) with Navy text on top (9.5:1). */
+  --brand: oklch(0.86 0.04 250);
+  --brand-foreground: oklch(0.285 0.063 252.3);
   --success: oklch(0.65 0.15 145);
   --warning: oklch(0.7 0.16 85);
   --info: oklch(0.65 0.18 250);
 
   --sidebar: oklch(0.21 0.006 285.885);
   --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary: oklch(0.967 0.005 95.1);
   --sidebar-accent: oklch(0.274 0.006 286.033);
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.552 0.016 285.938);
 
-  /* Chart — brightness inverted (most important = brightest) */
-  --chart-1: oklch(0.72 0.16 255);
-  --chart-2: oklch(0.62 0.13 255);
-  --chart-3: oklch(0.52 0.1 255);
-  --chart-4: oklch(0.42 0.06 255);
-  --chart-5: oklch(0.32 0.03 255);
+  /* Chart — brightness inverted (most important = brightest), navy hue */
+  --chart-1: oklch(0.86 0.04 250);
+  --chart-2: oklch(0.72 0.06 252);
+  --chart-3: oklch(0.58 0.07 252);
+  --chart-4: oklch(0.45 0.065 252);
+  --chart-5: oklch(0.34 0.05 252);
+
+  /* Brand mark on dark: Cream ink, accent unchanged (C1 logo rules). */
+  --logo-ink: oklch(0.967 0.005 95.1);    /* Cream #F5F4F0 */
+  --logo-accent: oklch(0.687 0.131 71.5); /* Amber #CC8B2D */
+  --logo-face: oklch(0.285 0.063 252.3);  /* Navy #102B48 */
 
   --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 1px 1px rgb(0 0 0 / 0.16);
   --menu-shadow: 0 10px 28px rgb(0 0 0 / 0.3), 0 2px 8px rgb(0 0 0 / 0.18);

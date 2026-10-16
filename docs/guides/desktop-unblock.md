@@ -34,8 +34,9 @@ cargo tauri --version   # should print tauri-cli 2.x
 ### A.2 Generate the app icon (one-time)
 ```bash
 cd src-tauri
-# Prepare a square PNG ≥1024×1024 (🐾 on an amber background), e.g. save it to web/public/paw-1024.png
-cargo tauri icon ../web/public/paw-1024.png
+# The committed master is icons/source/duduclaw-1024.png (C1 cat mark on cream);
+# rebuild it with scripts/desktop/make-icon-master.py if the brand avatar changes
+cargo tauri icon icons/source/duduclaw-1024.png
 # Produces icons/32x32.png, 128x128.png, 128x128@2x.png, icon.icns, icon.ico
 ```
 

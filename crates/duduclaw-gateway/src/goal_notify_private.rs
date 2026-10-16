@@ -33,10 +33,10 @@ pub(crate) fn private_progress_body(task: &TaskRow, progress: &GoalProgress) -> 
     let what = match progress {
         GoalProgress::Dispatched { iter, cap, retry } => {
             let verb = if *retry { "重試" } else { "開始執行" };
-            format!("🐾 目標 #{short} {verb}（第 {iter}/{cap} 輪）。")
+            format!("🎯 目標 #{short} {verb}（第 {iter}/{cap} 輪）。")
         }
         GoalProgress::TeamDispatched { minutes } => {
-            format!("🐾 目標 #{short} 已交給團隊，預計 {minutes} 分鐘回報。")
+            format!("🎯 目標 #{short} 已交給團隊，預計 {minutes} 分鐘回報。")
         }
         GoalProgress::Reviewing => format!("🔍 目標 #{short} 已產出結果，驗收中。"),
         GoalProgress::Rejected { iter, cap } => {

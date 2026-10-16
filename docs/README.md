@@ -210,6 +210,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 ```
 docs/                                  # L1 PUBLIC — product & developer documentation
 ├── README.md                          # This index
+├── assets/brand/                      # C1 brand mark, icons, banner (© Dudu Technology Ltd.; see its README)
 ├── architecture/                      # System architecture & engine design (+ ja-JP, zh-TW)
 │   ├── overview.md                    #   Architecture overview
 │   └── evolution-engine.md            #   Evolution Engine spec (legacy GVU + v3 AEE/Playbook)

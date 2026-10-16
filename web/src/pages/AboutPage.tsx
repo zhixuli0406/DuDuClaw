@@ -3,20 +3,20 @@ import { useIntl } from 'react-intl';
 import { Info, Globe } from 'lucide-react';
 import { Card, CardContent } from '@/components/mds';
 import { api, type AboutResponse, type SoftwareVendor } from '@/lib/api';
-import { useEffectiveName, useEffectiveLogo } from '@/lib/product-identity';
+import { useEffectiveName } from '@/lib/product-identity';
+import { BrandMark } from '@/components/brand/BrandMark';
 import { tierLabel } from '@/lib/license-labels';
 
 /** Hard-coded fallback mirroring the backend `UPSTREAM_VENDOR_*` consts. */
 const VENDOR_FALLBACK: SoftwareVendor = {
   name_zh: '嘟嘟數位科技有限公司',
-  name_en: 'DuDu Digital Technology Co., Ltd.',
+  name_en: 'Dudu Technology Ltd.',
   url: 'https://duduclaw.dudustudio.monster',
 };
 
 export function AboutPage() {
   const intl = useIntl();
   const brandName = useEffectiveName();
-  const brandLogo = useEffectiveLogo();
   const [about, setAbout] = useState<AboutResponse | null>(null);
 
   useEffect(() => {
@@ -51,21 +51,7 @@ export function AboutPage() {
       <Card>
         <CardContent>
           <div className="flex items-start gap-4">
-            {brandLogo.isImage ? (
-              <img
-                src={brandLogo.value}
-                alt={brandName}
-                className="h-16 w-16 shrink-0 rounded-2xl object-cover"
-              />
-            ) : (
-              <span
-                className="grid h-16 w-16 shrink-0 place-items-center rounded-2xl bg-brand/12 text-3xl text-brand ring-1 ring-inset ring-brand/20"
-                role="img"
-                aria-label={brandName}
-              >
-                {brandLogo.value}
-              </span>
-            )}
+            <BrandMark size={64} title={brandName} />
             <div className="min-w-0 flex-1">
               <h2 className="text-xl font-semibold tracking-tight text-foreground">{brandName}</h2>
             </div>

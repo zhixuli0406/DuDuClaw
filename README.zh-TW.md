@@ -1,4 +1,8 @@
-# DuDuClaw 🐾
+# DuDuClaw
+
+<p align="center">
+  <img src="docs/assets/brand/duduclaw-readme-banner.png" width="100%" alt="DuDuClaw by Dudu Technology Ltd. Bring AI coding tools into your team's chat. Review results. Track costs. Keep context.">
+</p>
 
 <div align="center">
 
@@ -286,5 +290,5 @@ Open Core 模式:核心程式碼採 [Apache License 2.0](LICENSE),自由使用�
 商用授權、企業導入、培訓與支援由授權總經銷 [未來企業股份有限公司](https://www.futurecorp.tw/) 提供，原廠不直接販售。
 
 <p align="center">
-  🐾 Built with louis.li
+  Built with louis.li
 </p>

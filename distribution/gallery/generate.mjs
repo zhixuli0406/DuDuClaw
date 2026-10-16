@@ -53,20 +53,20 @@ const shell = (title, desc, canonical, body) => `<!DOCTYPE html>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, -apple-system, "PingFang TC", sans-serif; max-width: 720px;
-         margin: 0 auto; padding: 32px 20px; line-height: 1.75; color: #1c1917; background: #fafaf9; }
-  @media (prefers-color-scheme: dark) { body { color: #fafaf9; background: #1c1917; } }
-  a { color: #d97706; }
-  .card { border: 1px solid rgba(120,113,108,.35); border-radius: 14px; padding: 18px 20px; margin: 14px 0; }
-  .tag { display: inline-block; font-size: 12px; border: 1px solid rgba(120,113,108,.4);
+         margin: 0 auto; padding: 32px 20px; line-height: 1.75; color: #102B48; background: #F5F4F0; }
+  a { color: #8A5A10; }
+  @media (prefers-color-scheme: dark) { body { color: #F5F4F0; background: #0B1E33; } a { color: #E0A54F; } }
+  .card { border: 1px solid rgba(91,100,112,.35); border-radius: 14px; padding: 18px 20px; margin: 14px 0; }
+  .tag { display: inline-block; font-size: 12px; border: 1px solid rgba(91,100,112,.4);
          border-radius: 999px; padding: 1px 10px; margin-right: 6px; opacity: .8; }
-  pre { background: rgba(120,113,108,.12); padding: 12px 14px; border-radius: 10px; overflow-x: auto; }
+  pre { background: rgba(91,100,112,.12); padding: 12px 14px; border-radius: 10px; overflow-x: auto; }
   footer { margin-top: 40px; font-size: 13px; opacity: .65; }
   h1 { line-height: 1.3; }
 </style>
 </head>
 <body>
 ${body}
-<footer>🐾 <a href="https://github.com/zhixuli0406/DuDuClaw">DuDuClaw</a> — 自架的 AI 員工平台。LINE 一對一回覆走 Reply API 不計費。</footer>
+<footer><a href="https://github.com/zhixuli0406/DuDuClaw">DuDuClaw</a> — 自架的 AI 員工平台。LINE 一對一回覆走 Reply API 不計費。</footer>
 </body>
 </html>`;
 

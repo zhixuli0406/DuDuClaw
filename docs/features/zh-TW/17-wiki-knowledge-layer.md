@@ -156,7 +156,7 @@ graph LR
   C --> E[context: blocker-analysis]
   B --> F[core: team-roster]
 
-  classDef id fill:#f59e0b
+  classDef id fill:#CC8B2D
   classDef core fill:#fb923c
 ```
 

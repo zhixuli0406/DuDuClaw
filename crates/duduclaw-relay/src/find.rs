@@ -82,14 +82,14 @@ fn render_find_page(client_ip: &str, devices: &[DeviceSummary]) -> String {
 <title>DuDuClaw 裝置探索</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
- body {{ font-family: -apple-system, "Noto Sans TC", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; color: #1c1917; background: #fafaf9; }}
+ body {{ font-family: -apple-system, "Noto Sans TC", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; color: #102B48; background: #F5F4F0; }}
  h1 {{ font-size: 1.25rem; }}
  .devices {{ list-style: none; padding: 0; }}
- .devices li {{ display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem; margin-bottom: 0.5rem; background: #fff; border-radius: 0.75rem; border: 1px solid #e7e5e4; }}
- .devices a {{ color: #b45309; text-decoration: none; font-weight: 600; }}
- .ip {{ color: #78716c; font-size: 0.875rem; }}
- .empty {{ color: #78716c; }}
- .meta {{ color: #a8a29e; font-size: 0.75rem; margin-top: 2rem; }}
+ .devices li {{ display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem; margin-bottom: 0.5rem; background: #fff; border-radius: 0.75rem; border: 1px solid #D4D7D8; }}
+ .devices a {{ color: #8A5A10; text-decoration: none; font-weight: 600; }}
+ .ip {{ color: #5B6470; font-size: 0.875rem; }}
+ .empty {{ color: #5B6470; }}
+ .meta {{ color: #5B6470; font-size: 0.75rem; margin-top: 2rem; }}
 </style>
 </head>
 <body>

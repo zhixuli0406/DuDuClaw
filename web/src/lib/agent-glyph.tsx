@@ -1,4 +1,5 @@
 import type { ComponentType } from 'react';
+import { DEFAULT_AGENT_GLYPH } from '@/lib/product-identity';
 import {
   Briefcase, Bot, Brain, Headset, Phone, Mail, Calculator, Code, Megaphone,
   Palette, Wrench, Book, BookOpen, Users, User, Building, Building2, Store,
@@ -117,13 +118,14 @@ export function glyphText(icon: string | null | undefined, fallback = '🤖'): s
 
 /**
  * Render an agent icon string. Emoji renders as text; a known lucide token
- * renders the icon; anything else falls back to `fallback` (a brand emoji).
+ * renders the icon; anything else falls back to `fallback` (the default agent
+ * avatar emoji, `DEFAULT_AGENT_GLYPH`).
  */
 export function AgentGlyph({
   icon,
   className,
   iconClassName = 'size-5',
-  fallback = '🐾',
+  fallback = DEFAULT_AGENT_GLYPH,
 }: {
   icon: string | null | undefined;
   /** Applied to the emoji/fallback `<span>`. */

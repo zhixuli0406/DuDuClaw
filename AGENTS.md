@@ -190,16 +190,16 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** for individual developers and 
 ### Brand Personality
 **Professional · Efficient · Precise** — with a warm, approachable surface.
 
-Like a skilled engineer who happens to be your close friend: reliable, sharp, but never cold. The paw print (🐾) icon reflects a pet-like companionship — the AI is loyal, attentive, and delightful to interact with.
+Like a skilled engineer who happens to be your close friend: reliable, sharp, but never cold. The brand mark is the C1 poised sitting cat (navy body, amber tail; source assets in `docs/assets/brand/`, rules in `web/DESIGN.md` §1.2.1). 🐾 is no longer a product logo; it survives only as the default avatar emoji for an AI staff member without its own icon.
 
 ### Aesthetic Direction
 - **Primary references**: Codex.ai (warm sand/beige tones, generous whitespace, soft typography) + Raycast (macOS-native polish, frosted glass effects, refined dark theme)
 - **Anti-references**: Grafana (too dense), Discord (too playful), enterprise dashboards (too cold)
 - **Color palette**:
-  - Primary: warm amber (`amber-500` / `#f59e0b`) — evokes warmth and trust
-  - Accent: soft orange (`orange-400` / `#fb923c`) — for highlights and CTAs
-  - Surface light: warm stone (`stone-50` / `#fafaf9`) with subtle warm undertones
-  - Surface dark: deep stone (`stone-900` / `#1c1917`) — warm dark, not cold blue-black
+  - Primary / brand ink: navy `#102B48` (light theme; cream `#F5F4F0` ink on dark surfaces)
+  - Accent: amber `#CC8B2D`, decorative only on light surfaces (2.61:1); amber text uses `#8A5A10` on light and `#E0A54F` on dark
+  - Surfaces (page canvas, cards, sidebar) keep the existing neutral tokens; only brand/primary/accent tokens moved to C1 (2026-10-16 decision: product UI swaps logo + brand colors, no layout or surface redesign). The marketing sites use the full C1 cream/navy surfaces.
+  - Full token list and dark-mode mapping: `web/DESIGN.md` (C1 identity, Dudu Technology Ltd.)
   - Success: emerald, Warning: amber, Error: rose — standard semantic colors
 - **Theme**: Follow system preference (auto dark/light), with manual toggle
 - **Typography**: System font stack for performance; generous line-height; larger body text (16px base)

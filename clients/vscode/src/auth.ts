@@ -36,7 +36,7 @@ export async function doLogin(context: vscode.ExtensionContext): Promise<boolean
   }
   await context.secrets.store(SECRET_ACCESS, data.access_token);
   if (data.refresh_token) await context.secrets.store(SECRET_REFRESH, data.refresh_token);
-  vscode.window.showInformationMessage('DuDuClaw：登入成功 🐾');
+  vscode.window.showInformationMessage('DuDuClaw：登入成功');
   return true;
 }
 

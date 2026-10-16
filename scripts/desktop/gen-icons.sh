@@ -6,20 +6,22 @@
 # generate the PNGs and the .icns; the .ico still needs ImageMagick / the Tauri
 # CLI, so the fallback warns instead of pretending it's complete.
 #
-# Source: a square >=1024x1024 PNG of the brand paw mark.
+# Source: a square >=1024x1024 PNG of the app icon (C1 cat mark on a cream
+# rounded square, built by scripts/desktop/make-icon-master.py).
 #   ./gen-icons.sh [path/to/source-1024.png]
-# Defaults to web/public/paw-1024.png.
+# Defaults to src-tauri/icons/source/duduclaw-1024.png.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-SRC="${1:-web/public/paw-1024.png}"
+SRC="${1:-src-tauri/icons/source/duduclaw-1024.png}"
 OUT="src-tauri/icons"
 
 if [[ ! -f "$SRC" ]]; then
   echo "Source icon not found: $SRC" >&2
-  echo "Provide a square >=1024x1024 PNG of the paw mark (brand amber background)." >&2
+  echo "Provide a square >=1024x1024 PNG of the app icon, or rebuild the master:" >&2
+  echo "  python3 scripts/desktop/make-icon-master.py" >&2
   exit 1
 fi
 mkdir -p "$OUT"

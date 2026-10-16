@@ -496,14 +496,51 @@ fn filter_scope(requested: &str) -> String {
         .join(" ")
 }
 
+/// The C1 brand cat mark (navy ink + amber tail), inlined into the OAuth pages
+/// so they render with no extra request. The file is a copy of
+/// `docs/assets/brand/duduclaw-mark.svg` kept inside the crate because the
+/// Docker build contexts copy `crates/` but not `docs/assets/`;
+/// `brand_mark_matches_brand_kit` fails if the two copies drift apart.
+const BRAND_MARK_SVG: &str = include_str!("../assets/duduclaw-mark.svg");
+
+/// Shared head + page chrome for the OAuth pages: C1 palette (cream page, navy
+/// text, navy primary button) and a heading row of mark + title. `title` is
+/// trusted static text; callers escape anything user-supplied in `body`.
+fn oauth_page(title: &str, heading: &str, body: &str) -> String {
+    format!(
+        "<!doctype html><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>{title}</title>\
+<style>\
+body{{font-family:\"Avenir Next\",\"Nunito Sans\",system-ui,-apple-system,\"PingFang TC\",sans-serif;\
+max-width:34rem;margin:4rem auto;padding:0 1rem;line-height:1.6;background:#F5F4F0;color:#102B48}}\
+.brand{{display:flex;align-items:center;gap:.75rem;margin-bottom:1rem}}\
+.brand svg{{width:40px;height:40px;flex:none}}\
+.brand h2{{margin:0;font-weight:600;letter-spacing:-.01em}}\
+code{{background:#FFFFFF;border:1px solid #D4D7D8;border-radius:4px;padding:0 .25rem}}\
+input{{border:1px solid #D4D7D8;border-radius:8px;background:#FFFFFF;color:#102B48}}\
+button{{border-radius:8px;font:inherit;cursor:pointer}}\
+.primary{{background:#102B48;color:#F5F4F0;border:1px solid #102B48}}\
+.secondary{{background:transparent;color:#102B48;border:1px solid #102B48}}\
+:focus-visible{{outline:2px solid #CC8B2D;outline-offset:2px}}\
+.note{{color:#5B6470;font-size:.85rem}}\
+</style>\
+<body><div class=\"brand\">{mark}<h2>{heading}</h2></div>{body}</body>",
+        mark = BRAND_MARK_SVG.trim().replacen(
+            "<svg ",
+            "<svg aria-hidden=\"true\" focusable=\"false\" ",
+            1
+        ),
+    )
+}
+
 fn html_error(status: StatusCode, msg: &str) -> Response {
     (
         status,
-        Html(format!(
-            "<!doctype html><meta charset=\"utf-8\"><title>DuDuClaw OAuth</title>\
-             <body style=\"font-family:system-ui;max-width:32rem;margin:4rem auto\">\
-             <h2>🐾 DuDuClaw</h2><p>{}</p></body>",
-            escape_html(msg)
+        Html(oauth_page(
+            "DuDuClaw OAuth",
+            "DuDuClaw",
+            &format!("<p>{}</p>", escape_html(msg)),
         )),
     )
         .into_response()
@@ -563,11 +600,8 @@ pub(crate) async fn authorize_handler(
         format!("基本工具面＋<code>{}</code>", escape_html(&scope))
     };
 
-    let page = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>DuDuClaw 授權</title>\
-<body style=\"font-family:system-ui;max-width:34rem;margin:4rem auto;line-height:1.6\">\
-<h2>🐾 DuDuClaw 連線授權</h2>\
-<p>應用程式 <b>{name}</b> 想連接你的 DuDuClaw（remote MCP）。</p>\
+    let body = format!(
+        "<p>應用程式 <b>{name}</b> 想連接你的 DuDuClaw（remote MCP）。</p>\
 <p>授權範圍：{scope_note}</p>\
 <p>貼上一把<b>內部 MCP API key</b>（<code>config.toml [mcp_keys]</code> 中 \
 <code>is_external = false</code> 的 key）以確認你是操作者本人：</p>\
@@ -579,12 +613,11 @@ pub(crate) async fn authorize_handler(
 <input type=\"hidden\" name=\"scope\" value=\"{scope}\">\
 <p><input type=\"password\" name=\"operator_key\" placeholder=\"ddc_…\" \
 style=\"width:100%;padding:.5rem\" autocomplete=\"off\" required></p>\
-<p><button name=\"action\" value=\"approve\" style=\"padding:.5rem 1.5rem\">同意連線</button> \
-<button name=\"action\" value=\"deny\" style=\"padding:.5rem 1.5rem\">拒絕</button></p>\
+<p><button class=\"primary\" name=\"action\" value=\"approve\" style=\"padding:.5rem 1.5rem\">同意連線</button> \
+<button class=\"secondary\" name=\"action\" value=\"deny\" style=\"padding:.5rem 1.5rem\">拒絕</button></p>\
 </form>\
-<p style=\"color:#888;font-size:.85rem\">OAuth 簽發的存取權杖永遠是「外部客戶端」等級：\
-只能使用基礎工具面與你在 key 簽發時明示授與的範圍，連接器／執行類／管理工具永不開放。</p>\
-</body>",
+<p class=\"note\">OAuth 簽發的存取權杖永遠是「外部客戶端」等級：\
+只能使用基礎工具面與你在 key 簽發時明示授與的範圍，連接器／執行類／管理工具永不開放。</p>",
         name = escape_html(&client.client_name),
         scope_note = scope_note,
         client_id = escape_html(client_id),
@@ -593,7 +626,7 @@ style=\"width:100%;padding:.5rem\" autocomplete=\"off\" required></p>\
         challenge = escape_html(&challenge),
         scope = escape_html(&scope),
     );
-    Html(page).into_response()
+    Html(oauth_page("DuDuClaw 授權", "DuDuClaw 連線授權", &body)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -843,6 +876,21 @@ pub(crate) async fn token_handler(
 mod tests {
     use super::*;
 
+    /// The crate-local mark must stay byte-identical to the brand kit copy.
+    /// Skipped when the brand kit is absent (e.g. a source tree without docs/).
+    #[test]
+    fn brand_mark_matches_brand_kit() {
+        let kit = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/assets/brand/duduclaw-mark.svg");
+        let Ok(kit_svg) = std::fs::read_to_string(&kit) else {
+            return;
+        };
+        assert_eq!(
+            BRAND_MARK_SVG, kit_svg,
+            "crates/duduclaw-cli/assets/duduclaw-mark.svg drifted from docs/assets/brand/duduclaw-mark.svg"
+        );
+    }
+
     #[test]
     fn cimd_ids_and_documents_are_validated() {
         assert!(cimd::is_cimd_client_id("https://chatgpt.com/oauth/client.json"));
@@ -965,5 +1013,22 @@ mod tests {
         assert_eq!(escape_html("Evil<script>"), "Evil&lt;script&gt;");
         assert_eq!(sanitize_client_name(None), "Unnamed MCP client");
         assert_eq!(sanitize_client_name(Some("   ")), "Unnamed MCP client");
+    }
+
+    #[test]
+    fn oauth_pages_carry_the_inline_brand_mark() {
+        let page = oauth_page("DuDuClaw 授權", "DuDuClaw 連線授權", "<p>x</p>");
+        // Mark is inlined (both color layers), decorative, and precedes the heading.
+        assert!(page.contains("<svg aria-hidden=\"true\" focusable=\"false\" "));
+        assert!(page.contains("class=\"ink\" fill=\"#102B48\""));
+        assert!(page.contains("class=\"accent\" fill=\"#CC8B2D\""));
+        let mark_at = page.find("<svg").unwrap();
+        let heading_at = page.find("<h2>DuDuClaw 連線授權</h2>").unwrap();
+        assert!(mark_at < heading_at);
+        // The retired paw glyph is gone from both pages.
+        assert!(!page.contains('🐾'));
+        let err = oauth_page("DuDuClaw OAuth", "DuDuClaw", "<p>missing client_id</p>");
+        assert!(!err.contains('🐾'));
+        assert!(err.contains("<h2>DuDuClaw</h2>"));
     }
 }

@@ -34,8 +34,9 @@ cargo tauri --version   # tauri-cli 2.xと表示されるはず
 ### A.2 アプリアイコンの生成（一度だけ）
 ```bash
 cd src-tauri
-# 1024×1024以上の正方形PNGを用意する(🐾＋amber背景)。例えばweb/public/paw-1024.pngに置く
-cargo tauri icon ../web/public/paw-1024.png
+# コミット済みのソースはicons/source/duduclaw-1024.png(C1の猫マーク＋クリーム背景)
+# ブランドavatarを変えたらscripts/desktop/make-icon-master.pyで再生成する
+cargo tauri icon icons/source/duduclaw-1024.png
 # icons/32x32.png、128x128.png、128x128@2x.png、icon.icns、icon.icoが出力される
 ```
 

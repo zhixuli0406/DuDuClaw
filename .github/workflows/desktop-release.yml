@@ -76,12 +76,13 @@ jobs:
 
       # App icons are gitignored (regenerated from the source PNG, §D0), so CI
       # must regenerate them before the bundle step or tauri build fails on a
-      # missing icon. The source paw mark is committed at web/public/paw-1024.png.
+      # missing icon. The source master is committed at
+      # src-tauri/icons/source/duduclaw-1024.png (scripts/desktop/make-icon-master.py).
       - name: Generate app icons
         shell: bash
         run: |
           cargo install tauri-cli --version "^2" --locked
-          cd src-tauri && cargo tauri icon ../web/public/paw-1024.png
+          cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 
       - name: Build & stage gateway sidecar
         shell: bash

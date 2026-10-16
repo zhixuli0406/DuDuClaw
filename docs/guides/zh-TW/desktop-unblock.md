@@ -34,8 +34,9 @@ cargo tauri --version   # 應印出 tauri-cli 2.x
 ### A.2 產生 App 圖示（一次性）
 ```bash
 cd src-tauri
-# 準備一張 ≥1024×1024 的方形 PNG(🐾 + amber 底),例如放到 web/public/paw-1024.png
-cargo tauri icon ../web/public/paw-1024.png
+# 已提交的來源圖是 icons/source/duduclaw-1024.png(C1 貓 mark + 米白底);
+# 品牌 avatar 改版時用 scripts/desktop/make-icon-master.py 重產
+cargo tauri icon icons/source/duduclaw-1024.png
 # 產出 icons/32x32.png、128x128.png、128x128@2x.png、icon.icns、icon.ico
 ```
 

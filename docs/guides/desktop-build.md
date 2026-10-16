@@ -18,13 +18,13 @@ cargo install tauri-cli --version "^2"
 # macOS: Xcode CLT;  Linux: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 ```
 
-Generate the app icons once. The brand source `web/public/paw-1024.png` is
-committed; the generated icon set under `src-tauri/icons/` is gitignored
+Generate the app icons once. The brand source
+`src-tauri/icons/source/duduclaw-1024.png` is committed; the generated icon set under `src-tauri/icons/` is gitignored
 (regenerate, don't commit):
 
 ```bash
 scripts/desktop/gen-icons.sh           # cargo tauri icon, with a macOS sips fallback
-# or directly:  cd src-tauri && cargo tauri icon ../web/public/paw-1024.png
+# or directly:  cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 ```
 
 ## Dev (hot-reload UI)
@@ -128,8 +128,9 @@ Ordered roughly by when you hit them. All are resolved in the repo; this is the
 
 9. **Icon shows a white fringe.** The source must have clean transparent corners
    (don't rasterize an SVG via `qlmanage`, which mattes onto white). Regenerated
-   `paw-1024.png` is a full-bleed amber square with a supersampled rounded alpha
-   mask. `build.rs` emits `rerun-if-changed=icons`, so a regenerated icon set is
+   `src-tauri/icons/source/duduclaw-1024.png` (built by
+   `scripts/desktop/make-icon-master.py`) is a full-bleed cream square with the
+   cat mark and a supersampled rounded alpha mask. `build.rs` emits `rerun-if-changed=icons`, so a regenerated icon set is
    re-embedded on the next build (otherwise the old icon stays baked in — and
    macOS may still cache it: `sudo rm -rf /Library/Caches/com.apple.iconservices.store && killall Dock`).
 

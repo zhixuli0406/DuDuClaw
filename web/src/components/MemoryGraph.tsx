@@ -31,7 +31,7 @@ type Tier = 'high' | 'medium' | 'low';
 
 const TIER_COLOR: Record<Tier, string> = {
   high: '#10b981', // emerald-500 — trusted source
-  medium: '#f59e0b', // amber-500 — ordinary source
+  medium: '#cc8b2d', // amber-500 — ordinary source
   low: '#ef4444', // red-500 — low trust / quarantined
 };
 

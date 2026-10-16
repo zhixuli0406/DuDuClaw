@@ -136,8 +136,8 @@ impl RichMessage {
 
 // ── Discord formatting ─────────────────────────────────────────
 
-/// Brand color for DuDuClaw embeds (warm amber).
-const DUDUCLAW_COLOR: u32 = 0xF59E0B;
+/// Brand color for DuDuClaw embeds (C1 amber `#CC8B2D`).
+pub(crate) const DUDUCLAW_COLOR: u32 = 0xCC8B2D;
 /// Error embed color.
 const ERROR_COLOR: u32 = 0xFF4444;
 

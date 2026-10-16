@@ -18,6 +18,9 @@ mod product_footer_tests {
     fn footer_is_fixed_and_skips_empty_and_internal_replies() {
         let out = append_product_footer("好的，已完成".into(), "line:U1");
         assert!(out.ends_with(PRODUCT_FOOTER));
+        // Plain-text attribution; the retired 🐾 brand glyph is not appended.
+        assert_eq!(PRODUCT_FOOTER, "— Powered by DuDuClaw");
+        assert_eq!(out, "好的，已完成\n\n— Powered by DuDuClaw");
         assert!(append_product_footer(String::new(), "line:U1").is_empty());
         assert_eq!(append_product_footer("hi".into(), "webchat:c#a"), "hi");
     }

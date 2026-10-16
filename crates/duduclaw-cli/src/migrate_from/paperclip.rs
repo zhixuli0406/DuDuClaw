@@ -245,10 +245,7 @@ pub(super) fn map_role_title(title: Option<&str>) -> &'static str {
 pub(super) fn print_export_help() {
     use console::style;
     println!();
-    println!(
-        "  {} paperclip 轉移需要官方匯出目錄（不直連資料庫）。",
-        style("🐾").cyan()
-    );
+    println!("  paperclip 轉移需要官方匯出目錄（不直連資料庫）。");
     println!();
     println!("  請先在 paperclip 端執行：");
     println!(

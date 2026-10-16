@@ -714,7 +714,7 @@ pub fn reason_prefix(source: DecisionSource) -> &'static str {
         DecisionSource::Approval => "⚠️ 高風險動作需要你同意",
         DecisionSource::Install => "📦 安裝申請",
         DecisionSource::Autopilot => "🔁 自動規則已暫停",
-        DecisionSource::Digest => "🐾 你不在的時候",
+        DecisionSource::Digest => "📬 你不在的時候",
     }
 }
 
@@ -929,6 +929,7 @@ mod tests {
             DecisionSource::Approval,
             DecisionSource::Install,
             DecisionSource::Autopilot,
+            DecisionSource::Digest,
         ];
         let mut seen = std::collections::HashSet::new();
         for s in all {
@@ -954,6 +955,7 @@ mod tests {
             reason_prefix(DecisionSource::Autopilot),
             "🔁 自動規則已暫停"
         );
+        assert_eq!(reason_prefix(DecisionSource::Digest), "📬 你不在的時候");
     }
 
     // ── escalation level (W2-4) ────────────────────────────

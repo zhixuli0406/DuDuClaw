@@ -146,8 +146,9 @@ pub(crate) async fn handle_shared_wiki_read(args: &Value, home_dir: &Path, calle
         None => return tool_error("Missing required parameter: page_path"),
     };
 
-    if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
-        return tool_error("Path traversal is not allowed");
+    // Shared validator (same as wiki_read), before any disk access.
+    if let Err(e) = validate_wiki_read_path(page_path) {
+        return tool_error(&e);
     }
 
     // WP7 / F4: an agent may only read its own department's pages (company
@@ -161,23 +162,12 @@ pub(crate) async fn handle_shared_wiki_read(args: &Value, home_dir: &Path, calle
     }
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
-    let full_path = wiki_dir.join(page_path);
 
-    // Symlink protection
-    if full_path.exists()
-        && let (Ok(canon_wiki), Ok(canon_page)) =
-            (wiki_dir.canonicalize(), full_path.canonicalize())
-        && !canon_page.starts_with(&canon_wiki)
-    {
-        return tool_error("Path escapes shared wiki directory");
-    }
-
-    match std::fs::read_to_string(&full_path) {
+    // Fail-closed, no-follow read (a canonicalize failure used to skip the
+    // escape check, and the read followed a link swapped in after it).
+    match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path) {
         Ok(content) => tool_text(&content),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tool_error(&format!("Page not found: {}", page_path))
-        }
-        Err(e) => tool_error(&format!("Failed to read page: {e}")),
+        Err(e) => tool_error(&wiki_read_error(page_path, &e)),
     }
 }
 
@@ -263,11 +253,11 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
         return tool_error(&e);
     }
 
-    // P2-B H-4: record where this write came from (host env only).
-    let stamped = match crate::mcp_memory_handlers::host_wiki_stamp(
-        content,
-        std::fs::read_to_string(wiki_dir.join(page_path)).ok().as_deref(),
-    ) {
+    // P2-B H-4: record where this write came from (host env only). The
+    // previous version is read without following a symlink, so a link planted
+    // at the page path cannot feed an outside file into the stamp.
+    let existing = duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path).ok();
+    let stamped = match crate::mcp_memory_handlers::host_wiki_stamp(content, existing.as_deref()) {
         Ok(s) => s,
         Err(e) => return tool_error(&e),
     };

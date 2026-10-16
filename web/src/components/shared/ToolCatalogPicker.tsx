@@ -177,7 +177,7 @@ export function ToolCatalogPicker({ triggerLabel, selected, onChange, valueKey =
                       <span
                         className={cn(
                           'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border',
-                          isSel ? 'border-brand bg-brand text-white' : 'border-input',
+                          isSel ? 'border-brand bg-brand text-brand-foreground' : 'border-input',
                         )}
                       >
                         {isSel && <Check className="h-3 w-3" />}

@@ -75,4 +75,17 @@ describe('DuDu', () => {
     const { getByRole } = render(<DuDu face={face} idPrefix="a11y" />);
     expect(getByRole('img').getAttribute('aria-label')).toBe('DuDu, celebrating');
   });
+  it('draws the C1 mark silhouette: ink body + amber tail', () => {
+    const { container } = render(<DuDu face="idle" idPrefix="mark" />);
+    const html = container.innerHTML;
+    expect(html).toContain('var(--logo-ink)');
+    expect(html).toContain('var(--logo-accent)');
+  });
+
+  it('raises a front paw only for presets with an arm pose', () => {
+    const { container: idle } = render(<DuDu face="idle" idPrefix="paw-idle" />);
+    expect(idle.querySelector('[data-paw]')).toBeNull();
+    const { container: wave } = render(<DuDu face="waving" idPrefix="paw-wave" />);
+    expect(wave.querySelector('[data-paw="wave"]')).not.toBeNull();
+  });
 });

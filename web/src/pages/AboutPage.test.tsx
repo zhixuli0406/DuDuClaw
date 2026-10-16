@@ -21,7 +21,7 @@ describe('<AboutPage>', () => {
     aboutGet.mockResolvedValue({
       vendor: {
         name_zh: '嘟嘟數位科技有限公司',
-        name_en: 'DuDu Digital Technology Co., Ltd.',
+        name_en: 'Dudu Technology Ltd.',
         url: 'https://duduclaw.dudustudio.monster',
       },
       branding: {},
@@ -35,7 +35,7 @@ describe('<AboutPage>', () => {
 
     // Fixed vendor attribution (both language forms) is always present.
     expect(await screen.findByText('嘟嘟數位科技有限公司')).toBeInTheDocument();
-    expect(screen.getByText(/DuDu Digital Technology Co\., Ltd\./)).toBeInTheDocument();
+    expect(screen.getByText(/Dudu Technology Ltd\./)).toBeInTheDocument();
     // Version surfaced from the response.
     expect(screen.getByText('1.42.0')).toBeInTheDocument();
     expect(screen.getByText('Distributor License')).toBeInTheDocument();
@@ -45,7 +45,7 @@ describe('<AboutPage>', () => {
     aboutGet.mockResolvedValue({
       vendor: {
         name_zh: '嘟嘟數位科技有限公司',
-        name_en: 'DuDu Digital Technology Co., Ltd.',
+        name_en: 'Dudu Technology Ltd.',
         url: 'https://duduclaw.dudustudio.monster',
       },
       // Extra arbitrary fields are ignored, even if a response includes them.

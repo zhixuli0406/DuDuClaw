@@ -96,6 +96,22 @@ describe('WebChatPage', () => {
     await waitFor(() => expect(listSpy.mock.calls.length).toBeGreaterThan(before));
   });
 
+  it('draws the product mark, not the 🐾 placeholder, when no agent icon is set', () => {
+    useChatStore.setState({ agentIcon: '', selectedAgentId: null });
+    renderWithProviders(<WebChatPage />);
+
+    expect(document.querySelector('[data-brand-mark]')).not.toBeNull();
+    expect(screen.queryByText('🐾')).toBeNull();
+  });
+
+  it('draws the agent icon when the server sends one', () => {
+    useChatStore.setState({ agentIcon: '🦊', selectedAgentId: null });
+    renderWithProviders(<WebChatPage />);
+
+    expect(screen.getByText('🦊')).toBeInTheDocument();
+    expect(document.querySelector('[data-brand-mark]')).toBeNull();
+  });
+
   it('allows typing a message into the composer', () => {
     renderWithProviders(<WebChatPage />);
 

@@ -61,6 +61,7 @@ async fn about_uses_fixed_product_metadata_without_local_brand_overrides() {
         } => {
             assert_eq!(result["product_name"], "DuDuClaw");
             assert_eq!(result["vendor"]["name_zh"], "嘟嘟數位科技有限公司");
+            assert_eq!(result["vendor"]["name_en"], "Dudu Technology Ltd.");
             assert!(result.get("version").is_some());
             assert!(result.get("tier").is_some());
             for removed in [

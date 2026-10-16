@@ -542,7 +542,7 @@ pub fn render_text_for(
     title_visible: &dyn Fn(&str) -> bool,
     buttons: bool,
 ) -> String {
-    let mut s = format!("🐾 你不在的時候（{}）\n", d.date);
+    let mut s = format!("📬 你不在的時候（{}）\n", d.date);
     if d.agents.is_empty() {
         s.push_str("這段時間沒有新的完成項目、待決定事項或花費。\n");
     }
@@ -1312,6 +1312,7 @@ mod digest_tests {
         assert!(matches!(target_by_no(&dg, 3), Some(DigestTarget::Artifact(_))));
         assert_eq!(target_by_no(&dg, 9), None);
         let text = render_text_for(&dg, Some("http://x/"), &|_| true, true);
+        assert!(text.starts_with("📬 你不在的時候（2026-10-08）"), "{text}");
         assert!(text.contains("[1] 報告 t1") && text.contains("📎") && text.contains("交付 2 個檔案"), "{text}");
         assert!(text.contains("第 1–3 項"), "{text}");
         // A channel the task's audience does not admit gets no title.

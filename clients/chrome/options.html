@@ -3,23 +3,32 @@
 <head>
 <meta charset="UTF-8">
 <style>
-  :root { color-scheme: light dark; }
+  /* C1 brand tokens (DuDuClaw): navy ink, cream page, amber accent. */
+  :root { color-scheme: light dark;
+          --bg: #F5F4F0; --surface: #FFFFFF; --text: #102B48; --muted: #5B6470;
+          --rule: #D4D7D8; --accent: #CC8B2D; --btn-bg: #102B48; --btn-fg: #F5F4F0;
+          --user-bg: #F3E7D3; --bot-bg: #FFFFFF; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0B1E33; --surface: #102B48; --text: #F5F4F0; --muted: #B7BDC4;
+            --rule: #24405F; --btn-bg: #F5F4F0; --btn-fg: #102B48;
+            --user-bg: #24405F; --bot-bg: #102B48; } }
   body { font-family: system-ui, -apple-system, "PingFang TC", sans-serif; max-width: 560px;
          margin: 32px auto; padding: 0 16px; font-size: 14px; line-height: 1.6;
-         background: #fafaf9; color: #1c1917; }
-  @media (prefers-color-scheme: dark) { body { background: #1c1917; color: #fafaf9; } }
+         background: var(--bg); color: var(--text); }
+  h2 { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  h2 img { width: 32px; height: 32px; }
   label { display: block; margin-top: 14px; font-weight: 600; }
-  input { width: 100%; padding: 8px; border: 1px solid #d6d3d1; border-radius: 8px;
+  input { width: 100%; padding: 8px; border: 1px solid var(--rule); border-radius: 8px;
           background: inherit; color: inherit; box-sizing: border-box; }
-  button { background: #f59e0b; color: #fff; border: 0; border-radius: 8px;
+  button { background: var(--btn-bg); color: var(--btn-fg); border: 0; border-radius: 8px;
            padding: 8px 16px; cursor: pointer; margin-top: 16px; }
-  code { background: rgba(120,113,108,.15); padding: 2px 6px; border-radius: 4px; }
-  .note { font-size: 13px; opacity: .8; border-left: 3px solid #f59e0b; padding-left: 10px; margin-top: 20px; }
+  code { background: rgba(91,100,112,.15); padding: 2px 6px; border-radius: 4px; }
+  .note { font-size: 13px; color: var(--muted); border-left: 4px solid var(--accent); padding-left: 10px; margin-top: 20px; }
   #msg { margin-top: 12px; }
 </style>
 </head>
 <body>
-<h2>🐾 DuDuClaw 設定</h2>
+<h2><img src="icons/128.png" alt="">DuDuClaw 設定</h2>
 <label>Gateway 位址</label>
 <input id="gateway" placeholder="http://127.0.0.1:18789">
 <label>Email</label>
