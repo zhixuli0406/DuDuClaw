@@ -44,6 +44,9 @@ pub mod product_profile;
 pub mod relay_protocol;
 pub mod runtime_catalog;
 pub mod sandbox_image;
+// Credential redaction shared by the gateway and duduclaw-maint-logs
+// (moved from duduclaw-gateway, 2026-10 maintenance SSH P-2).
+pub mod secret_redact;
 pub mod sensitivity;
 pub mod spawn_admission;
 pub mod spawn_env;
