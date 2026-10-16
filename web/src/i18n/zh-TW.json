@@ -7621,7 +7621,7 @@
   "subscriptionRisk.policy": "Anthropic 的規範寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求；開發者也不得收集、儲存或中介 Claude.ai 的憑證或 session token。官方允許的是你本人用自己的訂閱，登入未經修改的 Claude Code。Pro 和 Max 的用量上限，以一般使用為前提。",
   "subscriptionRisk.conflicts": "在 DuDuClaw 裡，這幾種用法和規範衝突：讓一份訂閱替其他人服務（例如 AI 員工在 LINE、Telegram 等頻道回覆客戶）；輪替好幾個訂閱帳號來避開用量上限；讓 DuDuClaw 保存你的 token（連接訂閱帳號、貼上 OAuth Token，都會把 token 加密存進設定檔）。Anthropic 的消費者條款也規定，帳號不得提供給其他人使用。",
   "subscriptionRisk.enforcement": "Anthropic 表示可以不事先通知就執行這些限制。也有媒體和使用者回報帳號因此被停權（這些是外部回報，非 Anthropic 官方聲明）。",
-  "subscriptionRisk.others": "Google 的 Gemini CLI 與 Antigravity 條款寫明：用第三方軟體透過 Gemini CLI 或 Antigravity 的 OAuth 存取其服務屬於違規，可能導致帳號被停權或終止。OpenAI 和 xAI 對第三方產品代為操作訂閱登入的立場目前不明。",
+  "subscriptionRisk.others": "Google 的 Gemini CLI 與 Antigravity 條款寫明：用第三方軟體透過 Gemini CLI 或 Antigravity 的 OAuth 存取其服務屬於違規，可能導致帳號被停權或終止。OpenAI 有官方的 Sign in with ChatGPT 計畫，在第三方應用程式使用 ChatGPT 方案開放給開源合作夥伴與 OpenAI 選定的商業合作夥伴，商業產品要先取得 OpenAI 同意。xAI 對第三方產品代為操作訂閱登入的立場目前不明。",
   "subscriptionRisk.recommendation": "Anthropic 為產品記載的做法是使用 Claude Console 的 API 金鑰，建議優先用它。若仍要用訂閱帳號登入，帳號被限制或停權的風險由你自行承擔。",
   "subscriptionRisk.link": "Anthropic 法律與合規說明（英文原文）",
   "subscriptionRisk.short": "Anthropic 的規範不允許第三方產品經手訂閱帳號的憑證，或用訂閱替其他人轉送請求，可能不經通知就執行限制。",
@@ -7635,9 +7635,9 @@
   "subscriptionRisk.vendor.antigravity.link": "Google Antigravity 條款（英文原文）",
   "subscriptionRisk.vendor.antigravity.policy": "Google 的 Antigravity 條款第 6 節寫明：用第三方軟體、工具或服務存取該服務（例如透過 Antigravity 的 OAuth）屬於違約，可能導致你的 Antigravity 和 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 agy，但這種用法算不算在內，由 Google 判斷。",
   "subscriptionRisk.vendor.gemini.link": "Gemini CLI 服務條款與隱私聲明（英文原文）",
-  "subscriptionRisk.vendor.gemini.policy": "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務直接存取 Gemini CLI 背後的服務（例如透過 Gemini CLI 的 OAuth）屬於違規，可能導致帳號被停權或終止。DuDuClaw 執行的是原版 Gemini CLI，但這種用法算不算在內，由 Google 判斷。",
-  "subscriptionRisk.vendor.openai.link": "OpenAI 使用條款（英文原文）",
-  "subscriptionRisk.vendor.openai.policy": "OpenAI 對第三方產品代為操作 ChatGPT 訂閱登入（Codex）的立場不明：我們沒有找到 OpenAI 允許或禁止這種用法的說明。訂閱帳號仍受 OpenAI 使用條款約束。",
+  "subscriptionRisk.vendor.gemini.policy": "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務直接存取 Gemini CLI 背後的服務（例如透過 Gemini CLI 的 OAuth）屬於違規，可能導致帳號被停權或終止。DuDuClaw 執行的是原版 Gemini CLI，但這種用法算不算在內，由 Google 判斷。Google 的停用公告也寫明，自 2026 年 6 月 18 日起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API 金鑰（Gemini API 或企業方案）仍可使用。",
+  "subscriptionRisk.vendor.openai.link": "OpenAI Sign in with ChatGPT 條款",
+  "subscriptionRisk.vendor.openai.policy": "OpenAI 有官方的 Sign in with ChatGPT 計畫。開發者文件與說明中心寫明，在其他應用程式使用 ChatGPT 方案開放給開源合作夥伴與 OpenAI 選定的商業合作夥伴，商業產品要向 OpenAI 申請並獲得核准。計畫條款規定驗證 token 只能存在使用者自己掌控的本機，不能放在遠端或託管環境，違反時可能被停用 Sign in with ChatGPT。DuDuClaw 跑在遠端伺服器或容器裡時，Codex 的 token 也存在那裡。ChatGPT 帳號另外受 OpenAI 使用條款約束。",
   "welcome.backend.claudeSub.risk": "注意：Anthropic 的規範不允許第三方產品經手訂閱憑證，帳號可能不經通知就被限制。",
   "settings.doctor.check.subscription_login_risk": "訂閱帳號政策風險"
 }

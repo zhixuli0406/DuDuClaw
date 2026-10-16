@@ -40,13 +40,38 @@ pub const GEMINI_CLI_TERMS_URL: &str = "https://geminicli.com/docs/resources/tos
 /// by Google as abuse.
 pub const ANTIGRAVITY_TERMS_URL: &str = "https://antigravity.google/terms";
 
-/// OpenAI Terms of Use. The page answers 403 to scripted clients, so its text
-/// was not fetched here; the notice only says the terms apply and that OpenAI's
-/// position on third-party products driving a ChatGPT login is unclear.
+/// Google's "Gemini Code Assist for individuals" deprecation notice (last
+/// updated 2026-10-09, read 2026-10-16). It says that starting 2026-06-18 the
+/// IDE extensions stopped serving the Gemini Code Assist for individuals,
+/// Google AI Pro and Google AI Ultra tiers, that this also applies to Gemini
+/// CLI, and that the Login with Google option can no longer be used for the IDE
+/// extensions or Gemini CLI. Paid API keys (Gemini API, enterprise) still work.
+pub const GEMINI_CLI_INDIVIDUALS_DEPRECATION_URL: &str =
+    "https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals";
+
+/// OpenAI Terms of Use (apply to every ChatGPT account).
 pub const OPENAI_TERMS_URL: &str = "https://openai.com/policies/terms-of-use/";
 
-/// xAI consumer Terms of Service (covers Grok subscriptions). Same 403 caveat
-/// as [`OPENAI_TERMS_URL`]; the notice makes no claim about its content.
+/// OpenAI "Sign in with ChatGPT" terms (dated 2026-09-29, read 2026-10-16).
+/// This is the link a Codex / OpenAI subscription notice points at. Sources
+/// for the notice:
+/// - these terms: users must be able to use their ChatGPT plan without paying
+///   the partner or upgrading; any persistent storage of auth tokens must be
+///   local and user-controlled, not in remote or managed environments; no
+///   general API access for other tools or unrelated requests; violations may
+///   lead to suspension of Sign in with ChatGPT access;
+/// - developers.openai.com/siwc/quickstart: "Sign in with ChatGPT is currently
+///   available to selected commercial partners through a limited trial." and
+///   "ChatGPT plan usage is available to all open-source partners and selected
+///   private clients.";
+/// - help.openai.com article 20001542: supported open-source tools remain
+///   available; commercial partners apply through an interest form.
+/// The notice does not say whether DuDuClaw is an approved partner.
+pub const OPENAI_SIWC_TERMS_URL: &str = "https://openai.com/policies/sign-in-with-chatgpt-terms/";
+
+/// xAI consumer Terms of Service (covers Grok subscriptions). The page answers
+/// 403 to scripted clients, so its text was not fetched; the notice makes no
+/// claim about its content.
 pub const XAI_TERMS_URL: &str = "https://x.ai/legal/terms-of-service";
 
 /// GitHub terms for additional products (has a GitHub Copilot section).
@@ -102,15 +127,19 @@ pub fn vendor_policy(id: &str) -> VendorPolicy {
         "" | "claude" | "anthropic" => ANTHROPIC_POLICY,
         "codex" | "openai" => VendorPolicy {
             vendor: "openai",
-            notice_zh: "OpenAI 對第三方產品代為操作 ChatGPT 訂閱登入（Codex）的立場不明；\
-                 訂閱帳號仍受 OpenAI 使用條款約束，帳號被限制的風險由你自行承擔。要長期穩定使用，請改用 OpenAI API 金鑰。",
-            url: Some(OPENAI_TERMS_URL),
+            notice_zh: "OpenAI 有官方的 Sign in with ChatGPT 計畫：在第三方應用程式使用 ChatGPT 方案額度，\
+                 開放給開源合作夥伴與 OpenAI 選定的商業合作夥伴，商業產品要先取得 OpenAI 同意。\
+                 計畫條款要求驗證 token 只能存在使用者自己掌控的本機，不能放在遠端或託管環境，違反時可能被停用這項登入。\
+                 帳號被限制的風險由你自行承擔；要長期穩定使用，請改用 OpenAI API 金鑰。",
+            url: Some(OPENAI_SIWC_TERMS_URL),
         },
         "gemini" | "google" => VendorPolicy {
             vendor: "google-gemini-cli",
             notice_zh: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth \
                  直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。DuDuClaw 執行的是原版 Gemini CLI，\
-                 但是否落在這條範圍內由 Google 判斷。要長期穩定使用，請改用 Gemini API 金鑰。",
+                 但是否落在這條範圍內由 Google 判斷。另外，Google 的停用公告寫明自 2026-06-18 起，\
+                 Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，\
+                 付費 API 金鑰（Gemini API 或企業方案）仍可使用。要長期穩定使用，請改用 Gemini API 金鑰。",
             url: Some(GEMINI_CLI_TERMS_URL),
         },
         "antigravity" | "agy" => VendorPolicy {
@@ -157,7 +186,7 @@ mod tests {
     fn every_login_runtime_gets_its_own_vendor_terms() {
         assert_eq!(vendor_policy("claude").url, Some(ANTHROPIC_LEGAL_URL));
         assert_eq!(vendor_policy("").vendor, "anthropic");
-        assert_eq!(vendor_policy("codex").url, Some(OPENAI_TERMS_URL));
+        assert_eq!(vendor_policy("codex").url, Some(OPENAI_SIWC_TERMS_URL));
         assert_eq!(vendor_policy("openai").vendor, "openai");
         assert_eq!(vendor_policy("gemini").url, Some(GEMINI_CLI_TERMS_URL));
         assert_eq!(vendor_policy("antigravity").url, Some(ANTIGRAVITY_TERMS_URL));
@@ -208,6 +237,29 @@ mod tests {
                 assert!(!text.contains(word), "{name} contains banned vendor claim {word:?}");
             }
         }
+    }
+
+    /// OpenAI publishes a Sign in with ChatGPT program (terms dated
+    /// 2026-09-29), so "unclear" is no longer true; the notice cites it and
+    /// still recommends an API key. xAI stays "unclear" (not researched).
+    #[test]
+    fn openai_notice_cites_the_sign_in_with_chatgpt_program() {
+        let p = vendor_policy("codex");
+        assert_eq!(p.url, Some(OPENAI_SIWC_TERMS_URL));
+        assert!(p.notice_zh.contains("Sign in with ChatGPT"), "{}", p.notice_zh);
+        assert!(p.notice_zh.contains("API 金鑰"), "{}", p.notice_zh);
+        for banned in ["不明", "不清楚"] {
+            assert!(!p.notice_zh.contains(banned), "openai notice must not say {banned:?}");
+        }
+        assert!(vendor_policy("grok").notice_zh.contains("不明"));
+    }
+
+    #[test]
+    fn gemini_notice_names_the_login_with_google_shutdown() {
+        let n = vendor_policy("gemini").notice_zh;
+        assert!(n.contains("2026-06-18"), "{n}");
+        assert!(n.contains("Login with Google"), "{n}");
+        assert!(n.contains("API 金鑰"), "{n}");
     }
 
     #[test]

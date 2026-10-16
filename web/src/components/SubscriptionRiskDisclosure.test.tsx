@@ -29,8 +29,8 @@ describe('SubscriptionRiskDisclosure', () => {
   });
 
   it.each([
-    ['openai', /OpenAI Terms of Use/, 'https://openai.com/policies/terms-of-use/', /ChatGPT sign-in for Codex is unclear/],
-    ['gemini', /Gemini CLI terms of service/, 'https://geminicli.com/docs/resources/tos-privacy/', /violates its terms/],
+    ['openai', /Sign in with ChatGPT terms/, 'https://openai.com/policies/sign-in-with-chatgpt-terms/', /official Sign in with ChatGPT program/],
+    ['gemini', /Gemini CLI terms of service/, 'https://geminicli.com/docs/resources/tos-privacy/', /no longer accepts Login with Google/],
     ['antigravity', /Google Antigravity terms/, 'https://antigravity.google/terms', /breach of the agreement/],
     ['xai', /xAI Terms of Service/, 'https://x.ai/legal/terms-of-service', /SuperGrok or X Premium\+ subscription is unclear/],
   ] as const)('shows %s its own vendor terms, not Anthropic text', (vendor, linkName, href, policy) => {
@@ -91,6 +91,20 @@ describe('subscription risk copy', () => {
 
   it.each(Object.keys(catalogs))('%s policy copy drops "individual" (the source says ordinary use)', (loc) => {
     expect(catalogs[loc]['subscriptionRisk.policy']).not.toMatch(/individual|個人/i);
+  });
+
+  // 2026-10-16: OpenAI publishes a Sign in with ChatGPT program, so its copy
+  // no longer says "unclear"; xAI was not researched and still does.
+  it.each(Object.keys(catalogs))('%s cites the OpenAI program and the Gemini CLI login shutdown', (loc) => {
+    const cat = catalogs[loc];
+    for (const key of ['subscriptionRisk.vendor.openai.policy', 'subscriptionRisk.others']) {
+      expect(cat[key], `${loc} ${key}`).toMatch(/Sign in with ChatGPT/);
+      expect(cat[key], `${loc} ${key}`).not.toMatch(/OpenAI('s| and xAI's)? (position|policy)[^.]*unclear|OpenAI 對[^。]*不明|OpenAI 和 xAI|OpenAI と xAI/);
+    }
+    expect(cat['subscriptionRisk.vendor.openai.policy']).not.toMatch(/unclear|不明/);
+    expect(cat['subscriptionRisk.vendor.xai.policy']).toMatch(/unclear|不明/);
+    expect(cat['subscriptionRisk.vendor.gemini.policy']).toMatch(/Login with Google/);
+    expect(cat['subscriptionRisk.vendor.gemini.policy']).toMatch(/2026/);
   });
 
   it('drops the old notice key everywhere', () => {
