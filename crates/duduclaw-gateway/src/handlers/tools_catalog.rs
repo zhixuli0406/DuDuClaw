@@ -176,9 +176,9 @@ impl MethodHandler {
                     { "name": "device.timedate_set", "description": "Set timezone and/or enable/disable NTP (admin, appliance-only, audited)" },
                     { "name": "network.wired_status", "description": "Wired (Ethernet) link state, IP info, and the persisted desired static config, if any (admin, appliance-only)" },
                     { "name": "network.wired_config", "description": "Set the wired interface to DHCP or a static IPv4 config (admin, appliance-only, audited)" },
-                    { "name": "maintenance.enable", "description": "Turn on maintenance mode for a bounded TTL (unlocks SSH and/or full raw diagnostic detail) (admin, appliance-only, destructive: requires confirm + re-auth)" },
+                    { "name": "maintenance.enable", "description": "Turn on maintenance mode for a bounded TTL (unlocks SSH for the maintenance account with one technician public key, and/or full raw diagnostic detail) (admin, appliance-only, destructive: requires confirm + re-auth; 5 wrong passwords lock it for 15 minutes)" },
                     { "name": "maintenance.disable", "description": "Turn off maintenance mode immediately (admin, appliance-only, audited)" },
-                    { "name": "maintenance.status", "description": "Whether maintenance mode is currently active, remaining time, and which sub-capabilities are unlocked (admin, appliance-only, read-only)" },
+                    { "name": "maintenance.status", "description": "Whether maintenance mode is currently active, remaining time, which sub-capabilities are unlocked, and what the device reports about the SSH window (key and host fingerprints, sessions, failed sign-ins, unconfirmed close) (admin, appliance-only, read-only)" },
                     { "name": "maintenance.history", "description": "Paginated maintenance-mode audit history (admin, appliance-only, read-only)" },
                 ]
             }),

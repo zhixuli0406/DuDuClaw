@@ -396,26 +396,10 @@ impl SysdDeviceOps {
         .await
     }
 
-    /// Maintenance-mode Entry A (`commercial/docs/specs/DESIGN-maintenance-mode-2026-08.md`
-    /// §2.6): start the image's SSH server and open its port in the OS
-    /// firewall (`duduclaw_sysd::SSH_UNITS`; sysd picks the unit). Not part of the `DeviceOps`
-    /// trait — same reasoning as `set_hostname` above: this is a verb
-    /// specific to the `maintenance.*` RPC surface (see `maintenance.rs`),
-    /// not a shape every `DeviceOps` implementor needs to answer for
-    /// (`SystemDeviceOps` has no privileged systemctl path at all).
-    pub async fn ssh_start(&self) -> OpResult {
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::SshServiceStart).await
-    }
-
-    /// The close side of [`Self::ssh_start`]: stop the SSH server, end its
-    /// sessions and close the firewall port. Idempotent (closing what was
-    /// never opened is still `success: true`), which the TTL sweep /
-    /// gateway-restart reassert-closed path in
-    /// `maintenance.rs` relies on: it always calls this, whether or not SSH
-    /// was actually running.
-    pub async fn ssh_stop(&self) -> OpResult {
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::SshServiceStop).await
-    }
+    // The maintenance SSH verbs are not here: since 2026-10 the gateway opens
+    // SSH only with a key (`ssh_maint_open`) and never with the port-only
+    // `ssh_service_start`; `maintenance::sysd_port` owns the three verbs it
+    // uses (`DESIGN-maintenance-ssh-account-2026-10.md` §8.2).
 
     /// Verified install (`SysupdateStageApply`): sysd re-checks the signed
     /// release in the download directory, stages it as root and runs
@@ -652,7 +636,7 @@ pub const OLD_SYSD_UPDATE_REFUSAL: &str =
 /// sysd refused the request because it does not know the verb (it is older
 /// than this gateway): the server answers `bad_request` with `malformed
 /// request: unknown variant …`.
-fn is_unknown_verb_rejection(e: &duduclaw_sysd::SysdClientError) -> bool {
+pub(crate) fn is_unknown_verb_rejection(e: &duduclaw_sysd::SysdClientError) -> bool {
     matches!(e, duduclaw_sysd::SysdClientError::Rejected { kind, message }
         if kind == "bad_request" && message.starts_with("malformed request") && message.contains("unknown variant"))
 }

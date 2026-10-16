@@ -11,6 +11,14 @@
   - sysd 每 15 秒自己從 journal 讀登入與登出（只認 journald 自己填的欄位），寫進只有 root 能存取的 `/data/system/maint-ssh-audit.log`，不靠閘道輪詢。每個視窗前 50 筆登入逐筆記錄、之後只計數；稽核檔超過 1 MiB 輪替，保留 5 份舊檔，並把開窗紀錄重寫到新檔開頭。稽核檔寫不進去（例如鎖被佔住）時不會開窗；關窗時則回報問題，把紀錄與還沒讀到的事件留著重試，寫完之前不接受新的開窗。開窗每小時最多 12 次、間隔至少 5 秒。視窗狀態與 journal 讀取位置存在 `/data/system/maint-ssh/`（重開機後仍在），視窗期間重開機的話，下次開機會補記登入並以「重開機」關窗；視窗開著時若防火牆的維修出站規則不見了，會立即關窗。
   - 映像有就緒標記 `/usr/lib/duduclaw/maint-ssh.ready` 時，舊的只開埠 `ssh_service_start` 會被拒絕；`ssh_service_stop` 另外負責刪金鑰、撤計時器、補記事件與寫關窗紀錄。兩個新指令都不開放給 `os_*` MCP 工具經閘道內部路由呼叫。
   - 尚未驗證（要等 OS 映像在 QEMU 上跑活測）：systemd、nftables、dropbear、journald 的真實輸出格式，systemd-run 同時帶單調與絕對時間的計時器，sysd 單次重啟時 dropbear 是否保持運作。
+- 維修模式 SSH 的閘道端（同一條線的第二部分；儀表板畫面在後續 PR）。一樣要等 DuDuClaw OS 出貨 `duduclaw-maint` 帳號才看得到效果：
+  - `maintenance.enable` 勾 SSH 時要在同一個請求帶 `ssh_public_key`，和輸入確認字、重新輸入密碼一起送出。閘道先用 sysd 同一套解析器檢查金鑰（只送 `<類型> <base64>` 給 sysd，註解只留作顯示標籤），先寫一筆 `opening` 的視窗紀錄再請 sysd 開啟，成功改成 `open`、失敗記 `open_failed`。不再有只開 22 埠的做法：舊版 OS 或只更新一部分的映像一律回「不支援」。
+  - 重新輸入密碼連續錯 5 次，這個帳號 15 分鐘內不能開啟維修模式，並推播給所有管理員；鎖定期間完全不驗證密碼。次數存在 `maintenance.db`，重啟不會歸零。
+  - 開啟成功後推播給所有管理員，內容有開啟者、到期時間、技術人員的金鑰指紋與本機主機指紋。`maintenance.status` 多了 `push_channel_available`，讓儀表板在沒有推播通道時改用別的核對說明。
+  - 拒絕時錯誤改成 `{code, message}`，代碼有 `ssh_key_required`、`ssh_key_invalid`（附 `reason`）、`reauth_failed`（附 `remaining_attempts`）、`reauth_locked`（附 `retry_after_seconds`）、`already_active`、`ssh_unsupported`、`ssh_unreachable`、`ssh_busy`（附 `reason`）、`ssh_rate_limited`、`ssh_open_failed` 等。sysd 回 `busy` 時不會送關閉去收回別人的視窗，只記 `open_failed` 並對帳一次。
+  - TTL 到期改由閘道開機就啟動的獨立背景工作處理，不再跟著派工引擎（`[dispatch] enabled = false` 時也照常到期）。它開機時每 2 秒問一次 sysd、最多等 60 秒，關掉 sysd 手上沒有對應視窗的金鑰（記 `ssh_orphan_closed`）；之後每 30 秒問一次 sysd，把登入、登出、驗證失敗（依來源彙總）、選單操作抄進 `maintenance_audit.jsonl`（字串截長、去控制字元，當資料看），並在 sysd 自己收掉視窗時記 `ssh_closed_by_os`。
+  - 在設備上關閉視窗時連不到 sysd，一律記成 `close_error` 並推播，不再當成「沒有東西要關」；`maintenance.status` 每次都問 sysd，回傳金鑰與本機指紋、到期秒數、目前連線、驗證失敗次數、`pending_cleanup`、`problems`，sysd 不可達時 `ssh_observed_active` 為 `null`，關閉沒被確認時 `close_unconfirmed` 為 true。
+  - 尚未驗證：只用模擬的 sysd 測過，還沒有接上真的 sysd 與 OS 映像（要等 OS 的 PR 備妥後在 QEMU 活測）；推播只測了文字內容，沒有實際送到通道。
 
 ### Changed
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。

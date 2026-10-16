@@ -442,7 +442,7 @@ impl MethodHandler {
             "maintenance.status" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_maintenance_status().await
+                self.handle_maintenance_status(ctx).await
             }
             "maintenance.history" => {
                 require_admin!();
