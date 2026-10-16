@@ -28,7 +28,8 @@ import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
-import { useEffectiveName, useEffectiveLogo } from '@/lib/product-identity';
+import { useEffectiveName } from '@/lib/product-identity';
+import { BrandMark } from '@/components/brand/BrandMark';
 import {
   SidebarHeader,
   SidebarContent,
@@ -325,24 +326,19 @@ function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
   // the `local_auto_login` switch, explained in account settings.
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const brandName = useEffectiveName();
-  const brandLogo = useEffectiveLogo();
   const locale = useLocaleStore((s) => s.locale);
   const setLocale = useLocaleStore((s) => s.setLocale);
 
-  const logoNode = brandLogo.isImage ? (
-    <img src={brandLogo.value} alt={brandName} className="size-6 shrink-0 rounded-md object-cover" />
-  ) : (
-    <span className="grid size-6 shrink-0 place-items-center rounded-md bg-sidebar-accent text-sm" role="img" aria-label={brandName}>
-      {brandLogo.value}
-    </span>
-  );
+  // C1 mark at nav size (28 px); no chip behind it (logo usage rules).
+  const logoNode = <BrandMark size={28} title={brandName} />;
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
         className={cn(
           'flex w-full items-center gap-2 rounded-md p-1.5 text-left outline-none transition-colors hover:bg-sidebar-accent/70 focus-visible:ring-2 focus-visible:ring-sidebar-ring',
-          collapsed && 'justify-center',
+          // Collapsed, the trigger is a 32 px square: tighter padding fits the 28 px mark.
+          collapsed && 'justify-center p-0.5',
         )}
         aria-label={intl.formatMessage({ id: 'sidebar.workspace' })}
       >

@@ -6620,10 +6620,10 @@ var StatusAction = class extends (_a3 = SingletonAction) {
     const refresh = async () => {
       try {
         const res = await gateway.rpc("approvals.list", {});
-        await ev.action.setTitle(`\u{1F43E} DuDuClaw
+        await ev.action.setTitle(`DuDuClaw
 \u5F85\u5BE9 ${res.approvals?.length ?? 0}`);
       } catch {
-        await ev.action.setTitle("\u{1F43E} DuDuClaw\n\u672A\u9023\u7DDA");
+        await ev.action.setTitle("DuDuClaw\n\u672A\u9023\u7DDA");
       }
     };
     await refresh();

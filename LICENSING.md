@@ -53,7 +53,7 @@ Apache 2.0 授權條款本身不限制使用方式。以下是執行檔依授權
 | `premium_templates` | 安裝付費產業包與付費團隊劇本。studio、business、partner、personal_pro_self_host、self_host_pro、oem 方案可用 |
 | `white_label` | 修改產品名稱、logo 等品牌設定。只有 oem 方案可用 |
 | `industry_evolution_params` | 列在方案功能表中（business、partner、self_host_pro、oem）；本 repo 的程式碼沒有功能檢查這一項 |
-| 通道回覆尾註 | opensource 與 hobby 方案（以及沒有授權檔的安裝）在外部通道的回覆後附上「— Powered by DuDuClaw 🐾」；其他方案可用 `config.toml [branding] reply_footer = false` 關閉 |
+| 通道回覆尾註 | opensource 與 hobby 方案（以及沒有授權檔的安裝）在外部通道的回覆後附上「— Powered by DuDuClaw」；其他方案可用 `config.toml [branding] reply_footer = false` 關閉 |
 | AI 員工數上限 | 雲端方案（hobby、solo 各 1 個，studio 3 個）在雲端部署時生效；授權金鑰若帶有簽章的 `max_agents`，自架部署也會套用。其他情況不限數量 |
 
 方案功能表中的其他布林值（客服管道、修補時效等服務承諾）只用於顯示，不會開關任何程式功能。

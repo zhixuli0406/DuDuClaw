@@ -2969,7 +2969,7 @@ async fn handle_slash_command(
                 "embeds": [{
                     "title": format!("{product} Status"),
                     "description": status_text,
-                    "color": 0xF59E0B,
+                    "color": crate::channel_format::DUDUCLAW_COLOR,
                     "footer": { "text": product }
                 }]
             });

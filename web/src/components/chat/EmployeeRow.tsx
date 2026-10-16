@@ -13,7 +13,7 @@ export interface EmployeeRowAgent {
 /**
  * EmployeeRow — the top staff strip on the conversation page (V7 / T7.2). A
  * horizontal row of CharacterAvatars; tapping one picks it as the conversation
- * partner (visual identity swap). The leading paw chip returns to DuDu, the
+ * partner (visual identity swap). The leading DuDu chip returns to DuDu, the
  * office assistant (the default, `selectedId === null`).
  */
 export function EmployeeRow({

@@ -3099,7 +3099,7 @@ async fn handle_otp_request(
             );
             tokio::spawn(async move {
                 let text =
-                    format!("🐾 DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
+                    format!("DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
                 match deliverer.deliver(&channel, &chat_id, &text).await {
                     Ok(()) => {
                         let _ = user_db.log_action(
@@ -16246,10 +16246,10 @@ async fn handle_mcp_oauth_callback(
     axum::response::Html(
         "<html><body style=\"font-family: system-ui, sans-serif; display: flex; \
          justify-content: center; align-items: center; height: 100vh; margin: 0; \
-         background: #fafaf9;\">\
+         background: #F5F4F0;\">\
          <div style=\"text-align: center;\">\
-         <h2 style=\"color: #1c1917;\">Authentication Successful</h2>\
-         <p style=\"color: #78716c;\">You can close this window and return to the dashboard.</p>\
+         <h2 style=\"color: #102B48;\">Authentication Successful</h2>\
+         <p style=\"color: #5B6470;\">You can close this window and return to the dashboard.</p>\
          </div></body></html>"
             .to_string(),
     )
@@ -16279,16 +16279,16 @@ fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::
     let title = if ok { "Connected" } else { "Sign-in did not complete" };
     let link = match back {
         Some(origin) => format!(
-            "<p><a href=\"{}\" style=\"color:#b45309\">Back to the dashboard</a></p>",
+            "<p><a href=\"{}\" style=\"color:#8A5A10\">Back to the dashboard</a></p>",
             html_escape(&format!("{origin}/manage/integrations?tab=mcp&mcp_tab=remote"))
         ),
-        None => "<p style=\"color:#78716c\">You can close this window.</p>".to_string(),
+        None => "<p style=\"color:#5B6470\">You can close this window.</p>".to_string(),
     };
     let body = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
          <title>DuDuClaw</title></head><body style=\"font-family:system-ui,sans-serif;display:flex;justify-content:center;\
-         align-items:center;min-height:100vh;margin:0;background:#fafaf9;color:#1c1917\"><div style=\"max-width:32rem;padding:1.5rem;text-align:center\">\
-         <h2>{}</h2><p style=\"color:#57534e\">{}</p>{link}</div></body></html>",
+         align-items:center;min-height:100vh;margin:0;background:#F5F4F0;color:#102B48\"><div style=\"max-width:32rem;padding:1.5rem;text-align:center\">\
+         <h2>{}</h2><p style=\"color:#5B6470\">{}</p>{link}</div></body></html>",
         html_escape(title),
         html_escape(message),
     );

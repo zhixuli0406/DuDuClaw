@@ -47,7 +47,7 @@ $('loginBtn').addEventListener('click', async () => {
       refreshToken: data.refresh_token || null,
     });
     $('password').value = '';
-    show('登入成功 🐾 可以回側邊欄開始對話了', true);
+    show('登入成功，可以回側邊欄開始對話了', true);
   } catch (e) {
     show('連不上 gateway：' + e, false);
   }

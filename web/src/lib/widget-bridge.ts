@@ -205,9 +205,10 @@ const WIDGET_SHIM = `
 })();
 `;
 
-/** Calm Glass base tokens so widgets inherit the dashboard look by default. */
+/** Calm Glass base tokens so widgets inherit the dashboard look by default.
+ *  `--accent` is the DuDuClaw C1 amber (fills / decoration). */
 const WIDGET_BASE_CSS = `
-:root { color-scheme: light; --bg: transparent; --fg: #1c1917; --muted: #78716c; --accent: #f59e0b; --card: #fafaf9; --border: #e7e5e4; }
+:root { color-scheme: light; --bg: transparent; --fg: #1c1917; --muted: #78716c; --accent: #cc8b2d; --card: #fafaf9; --border: #e7e5e4; }
 :root[data-theme="dark"] { color-scheme: dark; --fg: #fafaf9; --muted: #a8a29e; --card: #292524; --border: #44403c; }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; line-height: 1.6; }

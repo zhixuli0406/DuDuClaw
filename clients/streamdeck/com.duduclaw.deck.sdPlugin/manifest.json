@@ -2,7 +2,7 @@
   "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
   "Name": "DuDuClaw",
   "Version": "0.1.0.0",
-  "Author": "DuDu Digital",
+  "Author": "Dudu Technology Ltd.",
   "Description": "Physical HITL for your self-hosted DuDuClaw AI employees: see the pending approval on the key, approve or deny with a press. Connects only to the gateway you configure — no telemetry.",
   "Category": "DuDuClaw",
   "CategoryIcon": "imgs/icon",

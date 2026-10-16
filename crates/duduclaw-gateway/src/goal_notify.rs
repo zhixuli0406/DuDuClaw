@@ -386,10 +386,10 @@ fn progress_body(task: &TaskRow, progress: &GoalProgress) -> String {
     match progress {
         GoalProgress::Dispatched { iter, cap, retry } => {
             let verb = if *retry { "重試" } else { "開始執行" };
-            format!("🐾 目標 #{short} {verb}（第 {iter}/{cap} 輪）：{title}")
+            format!("🎯 目標 #{short} {verb}（第 {iter}/{cap} 輪）：{title}")
         }
         GoalProgress::TeamDispatched { minutes } => {
-            format!("🐾 目標 #{short} 已交給團隊，預計 {minutes} 分鐘回報：{title}")
+            format!("🎯 目標 #{short} 已交給團隊，預計 {minutes} 分鐘回報：{title}")
         }
         GoalProgress::Reviewing => {
             format!("🔍 目標 #{short} 已產出結果，驗收中…")
@@ -1433,7 +1433,7 @@ fn spawn_goal_task_collapse(
         let decider =
             crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
         let summary = format!(
-            "🐾 目標任務：{}",
+            "🎯 目標任務：{}",
             duduclaw_core::truncate_chars(&task_title, 60)
         );
         let home = home_dir.clone();
@@ -1479,7 +1479,7 @@ pub(crate) fn spawn_dashboard_collapse(
         };
         let http = reqwest::Client::new();
         let summary = format!(
-            "🐾 目標任務：{}",
+            "🎯 目標任務：{}",
             duduclaw_core::truncate_chars(&task_title, 60)
         );
         let home = home_dir.clone();
@@ -1923,8 +1923,13 @@ mod tests {
         );
         assert!(dispatched.contains("#abcdef01"), "short id (8 chars)");
         assert!(dispatched.contains("第 1/8 輪"));
+        assert!(
+            dispatched.starts_with("🎯 目標 #"),
+            "goal emoji, not the retired 🐾 logo"
+        );
         let team = progress_body(&t, &GoalProgress::TeamDispatched { minutes: 30 });
         assert!(team.contains("已交給團隊，預計 30 分鐘回報"));
+        assert!(team.starts_with("🎯 目標 #"));
         for internal in ["planner", "executor", "slot", "tier"] {
             assert!(!team.contains(internal));
         }

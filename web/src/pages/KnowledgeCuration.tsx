@@ -105,7 +105,7 @@ export function KnowledgeCuration({ agentId }: { agentId: string }) {
 
 const TIER_SWATCH: Record<'high' | 'medium' | 'low', string> = {
   high: '#10b981',
-  medium: '#f59e0b',
+  medium: '#cc8b2d',
   low: '#ef4444',
 };
 

@@ -345,7 +345,7 @@ fn render_manifest(
     expert.insert("name".into(), Value::String(slug.to_string()));
     expert.insert("description".into(), Value::String(description.to_string()));
     expert.insert("version".into(), Value::String("1.0.0".into()));
-    expert.insert("author".into(), Value::String("嘟嘟數位".into()));
+    expert.insert("author".into(), Value::String("Dudu Technology Ltd.".into()));
     expert.insert("license".into(), Value::String("Commercial".into()));
     expert.insert(
         "tags".into(),

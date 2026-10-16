@@ -579,7 +579,7 @@ function LineQrDialog({ open, onClose }: { open: boolean; onClose: () => void })
 </style></head><body>
 <h1>${title}</h1><div class="id">LINE ID：${idLine}</div>
 <div class="qr">${svg}</div><div class="scan">${scanLine}</div>
-<div class="brand">Powered by DuDuClaw 🐾</div>
+<div class="brand">Powered by DuDuClaw</div>
 </body></html>`);
     w.document.close();
     w.focus();

@@ -85,7 +85,7 @@ const FEATURES: &[&str] = &[
 /// from the matching template.
 pub async fn cmd_wizard(home: &Path) -> Result<()> {
     duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?;
-    println!("\n  {} DuDuClaw Agent Setup Wizard\n", style("🐾").bold(),);
+    println!("\n  {}\n", style("DuDuClaw Agent Setup Wizard").bold());
 
     // 1. Select industry
     //

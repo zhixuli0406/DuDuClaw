@@ -1144,14 +1144,14 @@ impl WikiStore {
              <meta charset=\"utf-8\">\n\
              <title>Wiki Export</title>\n\
              <style>\n\
-             body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; color: #1c1917; }\n\
-             h1 { border-bottom: 2px solid #f59e0b; padding-bottom: 0.5rem; }\n\
-             h2 { color: #78716c; margin-top: 2rem; }\n\
-             .page { border: 1px solid #e7e5e4; border-radius: 12px; padding: 1.5rem; margin: 1rem 0; }\n\
-             .page h3 { margin-top: 0; color: #1c1917; }\n\
-             .meta { font-size: 0.8rem; color: #a8a29e; margin-bottom: 0.5rem; }\n\
-             .tags span { background: #fef3c7; color: #92400e; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; margin-right: 4px; }\n\
-             pre { background: #fafaf9; padding: 1rem; border-radius: 8px; overflow-x: auto; }\n\
+             body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; color: #102B48; background: #F5F4F0; }\n\
+             h1 { border-bottom: 2px solid #CC8B2D; padding-bottom: 0.5rem; }\n\
+             h2 { color: #5B6470; margin-top: 2rem; }\n\
+             .page { background: #FFFFFF; border: 1px solid #D4D7D8; border-radius: 10px; padding: 1.5rem; margin: 1rem 0; }\n\
+             .page h3 { margin-top: 0; color: #102B48; }\n\
+             .meta { font-size: 0.8rem; color: #5B6470; margin-bottom: 0.5rem; }\n\
+             .tags span { background: #F3E7D3; color: #8A5A10; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; margin-right: 4px; }\n\
+             pre { background: #102B48; color: #F5F4F0; padding: 1rem; border-radius: 8px; overflow-x: auto; }\n\
              </style>\n</head>\n<body>\n\
              <h1>Wiki Knowledge Base</h1>\n"
         );

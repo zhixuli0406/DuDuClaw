@@ -677,7 +677,7 @@ pub(crate) async fn handle_tools_call(
         // (google:read / google:write) are enforced upstream in mcp_dispatch;
         // these handlers consume the OAuth vault token directly.
         // Whole group sits behind the integration gate (hidden from tools/list
-        // too) until DuDu Studio's OAuth app clears Google verification.
+        // too) until Dudu Technology Ltd.'s OAuth app clears Google verification.
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name)
             && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
         {

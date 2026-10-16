@@ -7141,8 +7141,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     // ── Welcome ──────────────────────────────────────────────
     println!();
     println!(
-        "  {} {}",
-        style("🐾").bold(),
+        "  {}",
         style(format!(
             "歡迎使用 DuDuClaw v{}",
             duduclaw_gateway::updater::current_version()
@@ -8455,13 +8454,13 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     if !home.join("config.toml").exists() {
         duduclaw_core::write_minimal_config(&home, &bind, port)?;
         println!(
-            "🐾 First run — created {}",
+            "First run — created {}",
             home.join("config.toml").display()
         );
         println!("   Finish setup in the dashboard: http://localhost:{port}\n");
     }
 
-    println!("🐾 DuDuClaw Server Starting...");
+    println!("DuDuClaw Server Starting...");
     println!("   Gateway: http://{bind}:{port}");
     println!("   Dashboard: http://localhost:{port}");
     println!(

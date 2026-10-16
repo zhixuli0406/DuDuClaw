@@ -21,11 +21,25 @@
 - 三語 README 的 PyPI badge 換成 Glama 分數 badge（badge 維持 5 個），PyPI 連結移到「Python SDK」段落。
 - 公開文件跟上 DuDuClaw OS v0.4.0（2026-10-16 發布，內嵌平台 v1.73.4）：三語 README 的 OS 段落與功能表、`docs/features/05`、`50`、`52`，以及 `docs/guides/task-sandbox.md`、`mcp-tools.md`、`appliance-build.md`（皆含 zh-TW／ja-JP）原本寫「下一版 OS 映像、尚未發版」的閘道去 root、rootless Podman、SSH 預設關閉、基礎版防火牆、`/api/internal/sysd` 與回退下限，改寫成從 v0.4.0 起提供；v0.3.0 以前的映像仍以 root 執行閘道與 Docker、內嵌較舊的平台。新增寫明：升級到 v0.4.0 是單向的（sysd 的回退下限加上第一次開機被標記成功後刪掉舊開機項目，成功開機過的裝置回不去 v0.3.0 以前）。測試範圍照 OS 的發版說明寫：QEMU 機型桌面版測試映像在建置主機的無頭 QEMU（TCG）跑兩輪驗證，第二輪 36 項過 35 項（沒過的是 doctor 標題，已在下方修正）；整碟映像通過發版前開機煙霧測試（約 65 秒到登入畫面）。仍未驗證：從 v0.3.0 經 A/B 更新升級、需要 LLM 憑證的任務沙箱／電腦操作／Discovery 完整流程、Windows VM、真機、genericx86-64 開機。SSH 目前還沒有能登入的帳號；Secure Boot、dm-verity、TPM2 在發布映像上仍未啟用。
 - 舊世代 `initialize` 改成真的協商：stdio 原本不管用戶端要什麼一律回 `2024-11-05`，HTTP 最高只到 `2025-06-18`。現在兩者共用同一段邏輯，支援 2025-11-25、2025-06-18、2025-03-26、2024-11-05，要哪個回哪個，不認得的版本回 2025-11-25。
+- 品牌識別換成 C1：坐姿貓 mark（海軍藍 `#102B48` 身體、琥珀 `#CC8B2D` 尾巴、米白 `#F5F4F0` 底），取代琥珀方塊＋🐾 爪印。素材放在 `docs/assets/brand/`（彩色與單色 SVG、README 橫幅、app icon 用的 avatar），權利聲明見該目錄的 README。這一筆不含 web 儀表板。
+- 桌面版圖示改由 `src-tauri/icons/source/duduclaw-1024.png` 產生（`scripts/desktop/make-icon-master.py` 從品牌 avatar 切圓角），`gen-icons.sh`、`desktop-release.yml` 與 `src-tauri/icons/README.md` 都改指這個檔；`cargo tauri icon` 另外產出的 `android/`、`ios/` 已加入 gitignore。DMG 背景改用海軍藍底、米白貓 mark 與 Avenir Next 字標，拿掉光暈。
+- 外部通道回覆尾註從「— Powered by DuDuClaw 🐾」改為「— Powered by DuDuClaw」。
+- 拿掉當成品牌圖示用的 🐾：CLI 啟動歡迎行、「DuDuClaw Server Starting...」與首次執行訊息、`duduclaw wizard` 標題、`duduclaw migrate` 報告標題與 paperclip 匯出說明、通道登入驗證碼訊息、Google Chat 加入空間的歡迎訊息。
+- 目標任務的進度訊息（開始執行、重試、已交給團隊）與決定卡收合後的摘要「目標任務：…」，開頭從 🐾 改成 🎯，跟 `/goal` 指令其他訊息一致；「你不在的時候」摘要與決定類型前綴從 🐾 改成 📬。
+- MCP OAuth 授權頁與錯誤頁改用內嵌的貓 mark、米白底、海軍藍按鈕。
+- Discord embed 顏色改成 `#CC8B2D`；Telegram 審批 mini app 在 Telegram 外開啟時的預設配色、Wiki 匯出 HTML、relay 裝置探索頁、遠端 MCP 登入結果頁與 GitHub 授權成功頁改用 C1 色票（連結 `#8A5A10`）。
+- 沒有任何 AI 員工時，WebChat 的 `session_info` 改送空的 `agent_icon`（原本是 🐾），儀表板 WebChat 標頭收到空值時畫產品 mark（連線前的初始狀態也一樣）。AI 員工的預設圖示仍是 🐾，沒有改。
+- 外掛與發行素材換新圖示：Chrome 擴充（32／64／128 圖示、設定頁與側邊欄配色）、VS Code（`media/icon.png`；側欄容器改用單色貓 `media/duduclaw-mark.svg`，取代 `media/paw.svg`）、Stream Deck（`imgs/icon.png`，狀態鍵標題拿掉 🐾）、Obsidian（以 `addIcon` 註冊單色貓 `duduclaw-cat`，取代 lucide 的 `paw-print`）、WordPress 聊天元件（浮動按鈕改成海軍藍底加貓 mark、配色更新、尾註拿掉 🐾）、ACP registry 的 16×16 單色 `icon.svg`、板模畫廊、官網 demo 嵌入片段、Odoo 連線測試訊息、問題回報頁。
+- 三語 README 標題改為 `# DuDuClaw`，下方加上品牌橫幅；press kit 的 `paw-transparent.*` 換成 `marketing/press-kit/logos/`（mark SVG、512／1024 PNG、avatar、橫式 logo）。
+- 公司英文名稱統一為 Dudu Technology Ltd.：About 頁與 `about.get` 回傳的 `vendor.name_en`、README 維護者欄、三語白標指南，以及外掛與發行套件的作者欄位（Obsidian、Stream Deck、WordPress 外掛、Claude marketplace、Odoo、ACP registry、Umbrel、六個入門 pack 與 `expert team-convert` 產出的 `author`）。中文登記名稱「嘟嘟數位科技有限公司」不變。
 - `os_doctor_repair` 的效果分類從 `read` 改成 `admin`：它除了回報，還會在全新安裝時建立、在過期時輪替閘道內部用的 MCP 金鑰，並啟動一個 `mcp-server` 子行程。MCP 的 `readOnlyHint` 因此變成 `false`，探索模式與只放行 `read` 的 `action_rules` 不再允許它。`odoo_connect` 檢查後維持 `read`：它只重讀已設定的 Odoo 連線並重新登入自己的連線槽，不寫檔也不改 Odoo 資料，而且所有 Odoo 讀取工具都要先呼叫它。
 - `wiki_export` 的 `destructiveHint` 改為 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault。`idempotentHint` 維持 `true`。
 
 ### Deprecated
 - Gemini CLI runtime（`gemini`）的移除再延到 **v1.75.0**（原訂 v1.74.0）：移除的前提是用真的 Gemini API key 重新驗證 Antigravity，這件事還沒做。執行期警告、儀表板與 `docs/guides/deprecations.md`（三語）同步改成 v1.75.0。Gemini API provider 不受影響。
+
+### Removed
+- `web/public/paw-source.svg` 與 `paw-1024.png`（舊 🐾 app icon 來源，已沒有任何地方引用）。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）

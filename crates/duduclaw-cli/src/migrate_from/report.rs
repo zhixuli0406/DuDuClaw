@@ -138,8 +138,7 @@ impl Report {
         };
         println!();
         println!(
-            "  {} 從 {} 轉移到 DuDuClaw — {}",
-            style("🐾").cyan(),
+            "  從 {} 轉移到 DuDuClaw — {}",
             style(&self.platform).bold(),
             style(mode).dim()
         );

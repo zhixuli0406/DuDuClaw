@@ -1,7 +1,8 @@
 import { useIntl } from 'react-intl';
 import { useTourStore } from '@/stores/tour-store';
 import { Button } from '@/components/mds';
-import { PawPrint, X } from 'lucide-react';
+import { X } from 'lucide-react';
+import { DuDu } from '@/components/mascot';
 
 /**
  * TourPrompt — the gentle "要不要帶你逛一圈?" card shown bottom-right right after
@@ -25,9 +26,7 @@ export function TourPrompt() {
     <div className="fixed bottom-28 right-5 z-[90] w-80 max-w-[calc(100vw-2.5rem)]">
       <div className="space-y-3 rounded-xl border border-surface-border bg-surface p-4 shadow-[var(--menu-shadow)]">
         <div className="flex items-start gap-3">
-          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-brand/10 text-brand ring-1 ring-inset ring-brand/20">
-            <PawPrint className="h-5 w-5" />
-          </span>
+          <DuDu face="waving" size={36} label="DuDu" className="shrink-0" />
           <div className="min-w-0 flex-1">
             <h3 className="text-sm font-semibold text-foreground">
               {intl.formatMessage({ id: 'tour.prompt.title' })}

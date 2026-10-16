@@ -13,10 +13,10 @@ import { REST_SMILE_PATH } from './visemes';
  * - `happy`      — short post-turn acknowledgement before falling back to idle.
  * - `concerned`  — error / disconnect / failed path.
  * - `curious`    — interested; something needs a look (pending approval).
- * - `proud`      — a meaningful task finished; both paws up.
+ * - `proud`      — a meaningful task finished; paw raised high.
  * - `celebrating`— success burst (inbox zero, achievement).
- * - `writing`    — agent is editing / creating (paws typing).
- * - `reading`    — agent is browsing / reading (paws holding a book).
+ * - `writing`    — agent is editing / creating (paw on a keyboard).
+ * - `reading`    — agent is browsing / reading (paw holding a book).
  * - `waving`     — greeting; one paw raised.
  *
  * Kept free of React so the mapping from mood → face stays a pure import for

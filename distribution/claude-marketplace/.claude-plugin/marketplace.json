@@ -1,7 +1,7 @@
 {
   "name": "duduclaw",
   "owner": {
-    "name": "DuDu Digital",
+    "name": "Dudu Technology Ltd.",
     "url": "https://github.com/zhixuli0406"
   },
   "metadata": {
@@ -14,7 +14,7 @@
       "source": "./plugins/duduclaw-connect",
       "description": "Wire Claude Code to a local DuDuClaw gateway: 249 MCP tools (memory, wiki, tasks, channels) + a usage skill.",
       "version": "0.1.0",
-      "author": { "name": "DuDu Digital" },
+      "author": { "name": "Dudu Technology Ltd." },
       "homepage": "https://github.com/zhixuli0406/DuDuClaw",
       "license": "Apache-2.0",
       "keywords": ["ai-agents", "memory", "mcp", "line", "self-hosted"],

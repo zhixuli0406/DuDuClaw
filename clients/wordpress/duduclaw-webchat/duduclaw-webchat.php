@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/zhixuli0406/DuDuClaw
  * Description: 在你的網站加一顆聊天泡泡，訪客直接跟你自架 DuDuClaw gateway 上的 AI 員工對話。只連你自己設定的 gateway，無任何第三方服務、無遙測。
  * Version:     0.1.0
- * Author:      DuDu Digital (嘟嘟數位)
+ * Author:      Dudu Technology Ltd.
  * Author URI:  https://github.com/zhixuli0406
  * License:     GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html

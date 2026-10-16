@@ -15,11 +15,11 @@ cargo install tauri-cli --version "^2"
 # macOS: Xcode CLT;  Linux: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 ```
 
-先產生一次 app 圖示。品牌來源圖 `web/public/paw-1024.png` 已提交進版控；`src-tauri/icons/` 底下產生的圖示集則被 gitignore（要重新產生，不要提交）：
+先產生一次 app 圖示。品牌來源圖 `src-tauri/icons/source/duduclaw-1024.png` 已提交進版控；`src-tauri/icons/` 底下產生的圖示集則被 gitignore（要重新產生，不要提交）：
 
 ```bash
 scripts/desktop/gen-icons.sh           # cargo tauri icon, with a macOS sips fallback
-# or directly:  cd src-tauri && cargo tauri icon ../web/public/paw-1024.png
+# or directly:  cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 ```
 
 ## Dev (hot-reload UI)
@@ -92,7 +92,7 @@ cd src-tauri && cargo tauri build
    現在也會複製一份進 `target/{debug,release}/`，不只是 `binaries/`。跑過 `cargo clean` 之後要記得重新執行一次 `stage-sidecar.sh`。
 
 9. **圖示出現白邊。** 來源圖必須有乾淨的透明邊角（不要用 `qlmanage` 把 SVG 轉點陣，它會把透明部分貼上白底）。重新產生的
-   `paw-1024.png` 是滿版的琥珀色正方形，帶超取樣過的圓角 alpha 遮罩。`build.rs` 會發出
+   `src-tauri/icons/source/duduclaw-1024.png`（由 `scripts/desktop/make-icon-master.py` 產生）是滿版的米白正方形加貓 mark，帶超取樣過的圓角 alpha 遮罩。`build.rs` 會發出
    `rerun-if-changed=icons`，所以重新產生的圖示集會在下一次建置時重新內嵌（否則舊圖示會一直被烤在裡面，且 macOS 也可能還快取著舊的：`sudo rm -rf /Library/Caches/com.apple.iconservices.store && killall Dock`）。
 
 10. **`cargo tauri build` 最後出現「A public key has been found, but no private
