@@ -60,6 +60,7 @@ import {
   DialogFooter,
 } from '@/components/mds';
 import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
+import { reachableIpv4 } from '@/lib/maintenance-ssh';
 import { MaintenanceModeCard } from '@/components/settings/MaintenanceModeCard';
 import { useMaintenanceStore, showDetailsUnlocked } from '@/stores/maintenance-store';
 
@@ -1042,7 +1043,7 @@ export function DevicePage() {
           </Panel>
 
           {/* ⑥ 維修模式（Entry A，DESIGN-maintenance-mode-2026-08.md §2） */}
-          <MaintenanceModeCard />
+          <MaintenanceModeCard addresses={reachableIpv4(status?.network_interfaces)} />
 
           {/* ⑦ 危險區 */}
           <DangerZone title={t('device.section.danger')} description={t('device.section.danger.desc')}>

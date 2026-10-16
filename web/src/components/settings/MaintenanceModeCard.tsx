@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { Wrench, ShieldAlert } from 'lucide-react';
+import { Wrench } from 'lucide-react';
 import {
   Card,
   CardHeader,
@@ -15,27 +15,42 @@ import {
 import { ConfirmDialog, OptionSelect } from '@/components/settings/controls';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
+import {
+  closeTriggerMessageId,
+  enableErrorMessage,
+  asMaintenanceError,
+  looksLikePrivateKey,
+  minutesUntil,
+  precheckPublicKey,
+  sshAvailability,
+  unsupportedMessageId,
+} from '@/lib/maintenance-ssh';
 import { useMaintenanceStore } from '@/stores/maintenance-store';
+import { MaintenanceSshPanel } from '@/components/settings/maintenance/MaintenanceSshPanel';
+import { MaintenanceHistory } from '@/components/settings/maintenance/MaintenanceHistory';
+import { SshKeyField } from '@/components/settings/maintenance/SshKeyField';
+import { Notice } from '@/components/settings/maintenance/Notice';
 
 /**
- * Maintenance Mode — Entry A (`DESIGN-maintenance-mode-2026-08.md` §2).
+ * Maintenance Mode — Entry A (`DESIGN-maintenance-mode-2026-08.md` §2), with
+ * the keyed SSH window of `DESIGN-maintenance-ssh-account-2026-10.md` §7.
  *
  * A dashboard software switch, Admin-only + appliance-only server-side, that
  * temporarily unlocks two sub-capabilities beyond the appliance's normal
- * "no Linux surface" posture: remote technical-support access (SSH) and
- * full raw diagnostic detail for `device.*` operation results. Always
- * bounded by a hard TTL (max 24h, no extension) and force-closes on its own
- * if the gateway process restarts — there is no way to leave it open by
- * accident past those two backstops.
+ * "no Linux surface" posture: remote technical-support access (SSH, with the
+ * technician's one public key) and full raw diagnostic detail for `device.*`
+ * operation results. Always bounded by a hard TTL (max 24h, no extension)
+ * and force-closes on its own if the gateway process restarts.
  *
- * Copy is deliberately end-user-facing (no "systemd"/"service"/"Linux" —
- * `technical-terms.test.ts` enforces this mechanically): "遠端連線
- * （SSH）技術支援" rather than naming the unit being started, "完整診斷紀錄"
- * rather than "raw stdout/stderr".
+ * The key pre-check here is a hint; the gateway and the device's system
+ * helper parse the key again and are the only authority. Copy is end-user
+ * facing (no unit names or paths; `technical-terms.test.ts` enforces it).
  */
 const TTL_OPTIONS = [1, 4, 12, 24] as const;
 
-export function MaintenanceModeCard() {
+type Msg = { id: string; values?: Record<string, string | number> } | { text: string };
+
+export function MaintenanceModeCard({ addresses = [] }: { addresses?: readonly string[] } = {}) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
 
@@ -47,51 +62,119 @@ export function MaintenanceModeCard() {
   const [ttlHours, setTtlHours] = useState<string>('4');
   const [wantSsh, setWantSsh] = useState(false);
   const [wantShowDetails, setWantShowDetails] = useState(true);
+  const [sshKey, setSshKey] = useState('');
+  const [keyTouched, setKeyTouched] = useState(false);
+  const [privateKeyCleared, setPrivateKeyCleared] = useState(false);
   const [reauthPassword, setReauthPassword] = useState('');
   const [disableReason, setDisableReason] = useState('');
   const [busy, setBusy] = useState(false);
+  const [dialogError, setDialogError] = useState<Msg | null>(null);
+  const [lockUntilMs, setLockUntilMs] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     void fetchStatus();
-    // §2.7 fallback poll: TTL expiry / gateway-restart force-close don't
-    // currently push a `maintenance.status_changed` event (see
-    // `maintenance-store.ts`'s doc comment) — a 30s poll is the honest
-    // backstop until that gap is closed.
+    // Fallback poll: a TTL expiry or a close by the device itself is only
+    // seen on the next status call.
     const id = window.setInterval(() => void fetchStatus(), 30_000);
     return () => window.clearInterval(id);
   }, [fetchStatus]);
 
-  // Live remaining-time countdown between polls — purely cosmetic (the
-  // server, not this timer, is the source of truth for actual expiry).
+  // The re-auth lock comes back as "seconds from now"; pin it to a clock time.
   useEffect(() => {
-    if (!status?.active) return;
+    const r = status?.reauth;
+    if (r?.locked && typeof r.retry_after_seconds === 'number') {
+      const observedAt = Date.now();
+      setNow(observedAt);
+      setLockUntilMs(observedAt + r.retry_after_seconds * 1000);
+    } else if (r && !r.locked) {
+      setLockUntilMs(null);
+    }
+  }, [status?.reauth]);
+
+  const lockRemainingS = lockUntilMs !== null ? Math.max(0, Math.ceil((lockUntilMs - now) / 1000)) : 0;
+  const lockUnknown = status?.reauth?.locked === true && status.reauth.retry_after_seconds === null;
+  const locked = lockRemainingS > 0 || lockUnknown;
+
+  // Cosmetic one-second clock for the countdowns; the server decides expiry.
+  const ticking = Boolean(status?.active) || lockUntilMs !== null;
+  useEffect(() => {
+    if (!ticking) return;
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, [status?.active]);
+  }, [ticking]);
+
+  useEffect(() => {
+    if (lockUntilMs !== null && lockRemainingS === 0) {
+      setLockUntilMs(null);
+      void fetchStatus();
+    }
+  }, [lockUntilMs, lockRemainingS, fetchStatus]);
 
   const remainingLabel = useMemo(() => {
     const win = status?.window;
     if (!win) return null;
+    const expiresMs = Date.parse(win.expires_at);
     const enabledAtMs = Date.parse(win.enabled_at);
-    const elapsedSecs = Number.isFinite(enabledAtMs) ? Math.floor((now - enabledAtMs) / 1000) : 0;
-    const remaining = Math.max(0, win.ttl_seconds - elapsedSecs);
+    const remaining = Number.isFinite(expiresMs)
+      ? Math.max(0, Math.floor((expiresMs - now) / 1000))
+      : Math.max(0, win.ttl_seconds - (Number.isFinite(enabledAtMs) ? Math.floor((now - enabledAtMs) / 1000) : 0));
     const h = Math.floor(remaining / 3600);
     const m = Math.floor((remaining % 3600) / 60);
-    return t('device.maintenance.remaining', { h, m });
-  }, [status, now, t]);
+    return intl.formatMessage({ id: 'device.maintenance.remaining' }, { h, m });
+  }, [status, now, intl]);
 
-  const sshMismatch = status != null && !status.active && status.ssh_observed_active === true;
+  const availability = sshAvailability(status?.ssh);
+  const sshAllowed = availability === 'available';
+  const keyHint = privateKeyCleared ? 'private_key' : precheckPublicKey(sshKey);
+  const closeUnconfirmed = status?.close_unconfirmed === true;
+  const sshMismatch = !closeUnconfirmed && status != null && !status.active && status.ssh_observed_active === true;
 
   function resetEnableForm() {
     setTtlHours('4');
     setWantSsh(false);
     setWantShowDetails(true);
+    setSshKey('');
+    setKeyTouched(false);
+    setPrivateKeyCleared(false);
     setReauthPassword('');
+    setDialogError(null);
+  }
+
+  function handleKeyChange(next: string) {
+    setKeyTouched(true);
+    setDialogError(null);
+    if (looksLikePrivateKey(next)) {
+      // Never keep (or send) a private key: clear it on the spot (§7.1).
+      setSshKey('');
+      setPrivateKeyCleared(true);
+      return;
+    }
+    setPrivateKeyCleared(false);
+    setSshKey(next);
+  }
+
+  function showEnableError(e: unknown) {
+    const err = asMaintenanceError(e);
+    if (err?.code === 'reauth_failed') setReauthPassword('');
+    if (err?.code === 'reauth_locked') {
+      setReauthPassword('');
+      setLockUntilMs(Date.now() + minutesUntil(err.retry_after_seconds) * 60_000);
+      if (typeof err.retry_after_seconds === 'number') {
+        setLockUntilMs(Date.now() + err.retry_after_seconds * 1000);
+      }
+    }
+    if (err?.code === 'ssh_key_invalid' && err.reason === 'private_key') {
+      setSshKey('');
+      setPrivateKeyCleared(true);
+    }
+    const ref = enableErrorMessage(e);
+    setDialogError(ref ?? { text: formatError(e) });
   }
 
   async function handleEnable() {
     setBusy(true);
+    setDialogError(null);
     try {
       const subCapabilities = [
         ...(wantSsh ? ['ssh'] : []),
@@ -102,13 +185,15 @@ export function MaintenanceModeCard() {
         subCapabilities,
         confirmText: 'MAINTENANCE',
         reauthPassword,
+        ...(wantSsh ? { sshPublicKey: sshKey.trim() } : {}),
       });
       toast.success(t('device.maintenance.enabled'));
       setEnableDialogOpen(false);
       resetEnableForm();
       await fetchStatus();
     } catch (e) {
-      toast.error(formatError(e));
+      showEnableError(e);
+      void fetchStatus();
     } finally {
       setBusy(false);
     }
@@ -117,33 +202,53 @@ export function MaintenanceModeCard() {
   async function handleDisable() {
     setBusy(true);
     try {
-      await api.maintenance.disable(disableReason.trim() || undefined);
-      toast.success(t('device.maintenance.disabled'));
+      const res = await api.maintenance.disable(disableReason.trim() || undefined);
+      if (res.window?.close_error) {
+        toast.error(t('device.maintenance.ssh.closeUnconfirmed'));
+      } else {
+        toast.success(t('device.maintenance.disabled'));
+      }
       setDisableDialogOpen(false);
       setDisableReason('');
       await fetchStatus();
     } catch (e) {
-      toast.error(formatError(e));
+      const ref = enableErrorMessage(e);
+      toast.error(ref ? t(ref.id, ref.values) : formatError(e));
     } finally {
       setBusy(false);
     }
   }
 
   const active = status?.active ?? false;
+  const opening = status?.window?.state === 'opening';
   const subCaps = status?.window?.sub_capabilities ?? [];
+  const lastClose = status?.ssh?.last_close ?? null;
+  const lockMessage = lockUnknown
+    ? t('device.maintenance.ssh.lockedUnknown')
+    : t('device.maintenance.ssh.locked', { m: minutesUntil(lockRemainingS) });
+  const confirmDisabled =
+    locked ||
+    (!wantSsh && !wantShowDetails) ||
+    (wantSsh && (!sshAllowed || keyHint !== null));
+  const sshUnavailableHint =
+    availability === 'unsupported'
+      ? t(unsupportedMessageId(status?.ssh?.reason))
+      : availability === 'unknown'
+        ? t('device.maintenance.ssh.unknownSupport')
+        : null;
 
   return (
     <Card>
       <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
         <div className="min-w-0 space-y-1">
           <CardTitle className="flex items-center gap-2 text-sm font-medium">
-            <Wrench className="size-4 text-muted-foreground" />
+            <Wrench className="size-4 text-muted-foreground" aria-hidden="true" />
             {t('device.maintenance.title')}
             <Badge
               variant="secondary"
-              className={active ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400' : undefined}
+              className={active || opening ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400' : undefined}
             >
-              {active ? t('device.maintenance.status.active') : t('device.maintenance.status.inactive')}
+              {active || opening ? t('device.maintenance.status.active') : t('device.maintenance.status.inactive')}
             </Badge>
           </CardTitle>
           <CardDescription>{t('device.maintenance.desc')}</CardDescription>
@@ -153,16 +258,33 @@ export function MaintenanceModeCard() {
             {t('device.maintenance.disableCta')}
           </Button>
         ) : (
-          <Button variant="brand" size="sm" onClick={() => setEnableDialogOpen(true)}>
+          <Button
+            variant="brand"
+            size="sm"
+            onClick={() => setEnableDialogOpen(true)}
+            disabled={locked || opening}
+            aria-describedby={locked ? 'maintenance-lock-notice' : undefined}
+          >
             {t('device.maintenance.enableCta')}
           </Button>
         )}
       </CardHeader>
       <CardContent className="space-y-3">
+        {closeUnconfirmed && (
+          <Notice tone="danger">
+            <p>{t('device.maintenance.ssh.closeUnconfirmed')}</p>
+          </Notice>
+        )}
         {sshMismatch && (
-          <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5 text-sm text-destructive">
-            <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-            <span>{t('device.maintenance.sshMismatchWarning')}</span>
+          <Notice tone="danger">
+            <p>{t('device.maintenance.sshMismatchWarning')}</p>
+          </Notice>
+        )}
+        {locked && !active && (
+          <div id="maintenance-lock-notice">
+            <Notice tone="warning">
+              <p>{lockMessage}</p>
+            </Notice>
           </div>
         )}
         {active && status?.window && (
@@ -181,12 +303,34 @@ export function MaintenanceModeCard() {
             </div>
           </div>
         )}
-        {!active && (
-          <p className="text-xs text-muted-foreground">{t('device.maintenance.inactiveHint')}</p>
+        {(active || opening) && status?.window && subCaps.includes('ssh') && (
+          <MaintenanceSshPanel status={status} addresses={addresses} />
         )}
+        {!active && !opening && (
+          <>
+            {lastClose && (
+              <Notice tone="info">
+                <p>{t('device.maintenance.ssh.lastClose', { reason: t(closeTriggerMessageId(lastClose.trigger)) })}</p>
+                {lastClose.events_lost && <p>{t('device.maintenance.ssh.eventsLost')}</p>}
+              </Notice>
+            )}
+            {status?.ssh?.pending_cleanup && (
+              <Notice tone="info">
+                <p>{t('device.maintenance.ssh.pendingCleanup')}</p>
+              </Notice>
+            )}
+            {status?.ssh?.pending_audit && (
+              <Notice tone="info">
+                <p>{t('device.maintenance.ssh.pendingAudit')}</p>
+              </Notice>
+            )}
+            <p className="text-xs text-muted-foreground">{t('device.maintenance.inactiveHint')}</p>
+          </>
+        )}
+        <MaintenanceHistory />
       </CardContent>
 
-      {/* 開啟維修模式：二次確認（輸入固定字串）+ 重新輸入密碼 + 期限 + 子能力 */}
+      {/* 開啟維修模式：二次確認（輸入固定字串）+ 重新輸入密碼 + 期限 + 子能力 + 公開金鑰 */}
       <ConfirmDialog
         open={enableDialogOpen}
         onClose={() => {
@@ -200,8 +344,14 @@ export function MaintenanceModeCard() {
         requireText="MAINTENANCE"
         requireTextHint={t('device.maintenance.confirmHint')}
         busy={busy}
+        confirmDisabled={confirmDisabled}
       >
-        <div className="space-y-3">
+        <div className="max-h-[50vh] space-y-3 overflow-y-auto pr-1">
+          {locked && (
+            <Notice tone="warning">
+              <p>{lockMessage}</p>
+            </Notice>
+          )}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground" htmlFor="maintenance-ttl">
               {t('device.maintenance.ttlLabel')}
@@ -219,12 +369,26 @@ export function MaintenanceModeCard() {
           </div>
           <div className="space-y-2">
             <label className="flex items-start gap-2 text-sm text-foreground">
-              <Checkbox className="mt-0.5" checked={wantSsh} onCheckedChange={(v) => setWantSsh(v === true)} />
+              <Checkbox
+                className="mt-0.5"
+                checked={wantSsh}
+                disabled={!sshAllowed && !wantSsh}
+                aria-describedby="maintenance-ssh-option-hint"
+                onCheckedChange={(v) => {
+                  setWantSsh(v === true);
+                  setDialogError(null);
+                }}
+              />
               <span>
                 <span className="block">{t('device.maintenance.capability.ssh')}</span>
-                <span className="block text-xs text-muted-foreground">{t('device.maintenance.capability.sshHint')}</span>
+                <span id="maintenance-ssh-option-hint" className="block text-xs text-muted-foreground">
+                  {sshUnavailableHint ?? t('device.maintenance.capability.sshHint')}
+                </span>
               </span>
             </label>
+            {wantSsh && sshAllowed && (
+              <SshKeyField value={sshKey} onChange={handleKeyChange} hint={keyHint} showEmptyHint={keyTouched} />
+            )}
             <label className="flex items-start gap-2 text-sm text-foreground">
               <Checkbox
                 className="mt-0.5"
@@ -251,6 +415,11 @@ export function MaintenanceModeCard() {
               autoComplete="current-password"
             />
           </div>
+          {dialogError && (
+            <Notice tone="danger">
+              <p>{'text' in dialogError ? dialogError.text : t(dialogError.id, dialogError.values)}</p>
+            </Notice>
+          )}
         </div>
       </ConfirmDialog>
 

@@ -311,3 +311,34 @@ We commit to:
 - Not pursuing legal action against good-faith security researchers
 - Crediting researchers in security advisories
 - Keeping researchers informed of fix progress
+
+## Maintenance SSH (unreleased)
+
+The dashboard opens a maintenance SSH window only for an Admin after typed
+confirmation and password re-entry. One technician public key is required;
+the gateway and the privileged helper independently validate it. A pasted
+private key is cleared by the dashboard before any request is sent. Five
+wrong passwords lock opening for 15 minutes. The window lasts at most
+24 hours, cannot be extended, and closes when the gateway restarts.
+
+This requires a complete OS image with the dedicated `duduclaw-maint`
+account, restricted menu, firewall protections and ready marker. The new
+gateway refuses old and partially updated images instead of using the old
+port-only operation. The menu offers status, selected diagnostic logs,
+resources, network information, and local-model or gateway restarts; no
+arbitrary shell, file transfer or forwarding is offered. Port 22 accepts
+private/link-local sources and VPN CGNAT `100.64.0.0/10`, not global IPv6.
+Those address ranges do not establish that a source is trustworthy.
+
+Admins receive the technician key and device fingerprints when a window
+opens. Compare both fingerprints through that separate channel. Without a
+notification channel, the dashboard directs the operator to the device's
+local screen; the dashboard alone cannot authenticate the device. A channel
+being configured does not prove a notification was delivered. An
+unconfirmed SSH close is displayed as a warning; it is never reported as
+confirmed merely because the gateway's window ended.
+
+The UI has automated tests; the assembled OS account, menu, SSH transport,
+firewall, backup deadline and notification delivery have not yet passed
+real-image end-to-end verification. See [OS appliance security](docs/features/50-duduclaw-os-appliance.md)
+for the released-image behavior and the unreleased integration boundary.
