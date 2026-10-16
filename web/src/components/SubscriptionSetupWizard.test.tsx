@@ -35,7 +35,7 @@ function mockCall(handlers: Record<string, (params?: unknown) => unknown>) {
  * gate before it can assert on the flow that used to start automatically.
  */
 async function acknowledgeRiskAndContinue(user: ReturnType<typeof userEvent.setup>) {
-  const checkbox = await screen.findByRole('checkbox', { name: /understand the risk/i });
+  const checkbox = await screen.findByRole('checkbox', { name: /read the policy and risks/i });
   await user.click(checkbox);
   await user.click(screen.getByRole('button', { name: /^continue$/i }));
 }
@@ -56,13 +56,13 @@ describe('SubscriptionSetupWizard', () => {
 
     // The disclosure gate is up; nothing has been called yet, and Continue
     // is disabled until the box is ticked.
-    expect(screen.getByText(/consumer-subscription/i)).toBeInTheDocument();
+    expect(screen.getByText(/route requests through Free, Pro, or Max/i)).toBeInTheDocument();
     const continueBtn = screen.getByRole('button', { name: /^continue$/i });
     expect(continueBtn).toBeDisabled();
-    expect(mockWsClient.call).not.toHaveBeenCalledWith('accounts.setup_token_start');
+    expect(mockWsClient.call.mock.calls.map((c) => c[0])).not.toContain('accounts.setup_token_start');
 
     await acknowledgeRiskAndContinue(user);
-    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('accounts.setup_token_start'));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('accounts.setup_token_start', { accept_subscription_risk: true }));
   });
 
   it('starts the flow after acknowledgment and shows the authorize link + QR code', async () => {
@@ -79,7 +79,7 @@ describe('SubscriptionSetupWizard', () => {
     renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
     await acknowledgeRiskAndContinue(user);
 
-    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('accounts.setup_token_start'));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('accounts.setup_token_start', { accept_subscription_risk: true }));
     const link = await screen.findByRole('link', { name: /open authorization page/i });
     expect(link).toHaveAttribute('href', 'https://claude.com/cai/oauth/authorize?code=true&state=abc');
     // Code input is ready for paste-back.
@@ -168,6 +168,22 @@ describe('SubscriptionSetupWizard', () => {
       await screen.findByText("That code is wrong or has expired — start over and try again."),
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /start over/i })).toBeInTheDocument();
+  });
+
+  it('maps the gateway subscription-risk refusal to its i18n copy', async () => {
+    const user = userEvent.setup();
+    mockCall({
+      'accounts.setup_token_start': () =>
+        Promise.reject({ code: 'subscription_risk_not_accepted', message: 'raw backend text' }),
+    });
+
+    renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
+    await acknowledgeRiskAndContinue(user);
+
+    expect(
+      await screen.findByText('Read the subscription risk notice and tick the box before continuing.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('raw backend text')).not.toBeInTheDocument();
   });
 
   it('cancels the in-flight session when closed before completion', async () => {

@@ -2345,9 +2345,11 @@ enum MaintenanceCommands {
     /// polls until you approve in the browser, then stores the seat credential
     /// (AES-256-GCM encrypted) into `config.toml [[accounts]]`. The seat then
     /// rotates like any account and can be re-exported via `duduclaw proxy`.
+    /// It prints the subscription-risk notice first and stops unless
+    /// `--accept-subscription-risk` is given (v1.74.0).
     ///
     /// Example:
-    ///     duduclaw auth device --provider copilot
+    ///     duduclaw auth device --provider copilot --accept-subscription-risk
     #[command(subcommand)]
     Auth(AuthCommands),
 
@@ -3785,6 +3787,11 @@ enum AuthCommands {
         /// also settable via `config.toml [auth.<provider>] client_id`).
         #[arg(long)]
         client_id: Option<String>,
+        /// Required acknowledgement (v1.74.0): this login stores a
+        /// subscription seat credential. Without it the command prints the
+        /// risk notice and stops.
+        #[arg(long)]
+        accept_subscription_risk: bool,
     },
 }
 
@@ -5515,7 +5522,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Maintenance(MaintenanceCommands::Auth(AuthCommands::Device {
             provider,
             client_id,
-        })) => auth_device::run(&provider, client_id, &duduclaw_home()).await,
+            accept_subscription_risk,
+        })) => auth_device::run(&provider, client_id, accept_subscription_risk, &duduclaw_home()).await,
         Commands::Maintenance(MaintenanceCommands::Evolution(ev_cmd)) => cmd_evolution(ev_cmd, &duduclaw_home()).await,
         Commands::Maintenance(MaintenanceCommands::Os(os_cmd)) => cmd_os(os_cmd, &duduclaw_home()).await,
         Commands::Maintenance(MaintenanceCommands::Lifecycle(lc_cmd)) => cmd_lifecycle(lc_cmd, &duduclaw_home()).await,
@@ -7384,6 +7392,13 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                 "  {} 偵測到 Claude {} 登入 — 自動使用，無需額外設定",
                 console::style("✓").green(),
                 style(sub_label).cyan().bold()
+            );
+            // Owner decision 2026-10-16: keep host-login adoption, but say
+            // the policy risk where the user first meets it.
+            println!(
+                "  {} {}",
+                style("!").yellow(),
+                style(duduclaw_core::subscription_risk::subscription_risk_line_zh()).yellow()
             );
             if !env_key.is_empty() {
                 println!(
@@ -9779,6 +9794,12 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
             CheckStatus::Warn
         };
         checks.push(("憑證來源體檢".into(), status, audit.summary()));
+    }
+
+    // Check 2e (2026-10-16): subscription (OAuth) accounts configured. Shared
+    // with the dashboard `system.doctor` card `subscription_login_risk`.
+    if let Some(message) = duduclaw_gateway::doctor_probes::subscription_risk_notice(&home) {
+        checks.push(("訂閱帳號政策風險".into(), CheckStatus::Warn, message));
     }
 
     // Check 3: Claude Code CLI

@@ -25,6 +25,7 @@ import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { AccountPoolSelect } from '@/components/shared/AccountPoolSelect';
+import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
 import { ToolCatalogPicker } from '@/components/shared/ToolCatalogPicker';
 import { CapabilityToggles } from '@/components/shared/CapabilityToggles';
 import {
@@ -1505,7 +1506,7 @@ export function EditAgentPage() {
               <ModelSelect value={form.fallback ?? ''} onChange={(v) => updateField('fallback', v)} models={availableModels} loading={modelsLoading} error={modelsError} discoveredAt={modelsDiscoveredAt} refreshing={modelsRefreshing} onRefresh={modelsRefresh} ariaLabel={t('agents.edit.fallbackModel')} />
             </FieldBlock>
             <SettingsCard>
-              <RowSelect label={t('agents.edit.apiMode')} description={t('agents.edit.apiMode.help')} value={form.api_mode ?? 'cli'} onChange={(v) => updateField('api_mode', v as 'cli' | 'direct' | 'auto')} options={apiModeOptions} />
+              <RowSelect label={t('agents.edit.apiMode')} description={(form.api_mode ?? 'cli') === 'cli' ? (<><span>{t('agents.edit.apiMode.help')}</span><SubscriptionRiskNote className="mt-1" /></>) : t('agents.edit.apiMode.help')} value={form.api_mode ?? 'cli'} onChange={(v) => updateField('api_mode', v as 'cli' | 'direct' | 'auto')} options={apiModeOptions} />
               <RowSelect label={t('agents.v168.effort')} description={t('agents.v168.effort.help')} value={v168.effort} onChange={(v) => updateV('effort', v as AgentEffort)} options={effortOptions} />
             </SettingsCard>
           </SettingsSection>

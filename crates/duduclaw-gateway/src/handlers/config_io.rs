@@ -171,6 +171,16 @@ impl MethodHandler {
             }));
         }
 
+        // Subscription (OAuth) accounts configured: the policy risk line.
+        if let Some(message) = crate::doctor_probes::subscription_risk_notice(&self.home_dir) {
+            checks.push(json!({
+                "name": "subscription_login_risk",
+                "status": "warn",
+                "message": message,
+                "can_repair": false,
+            }));
+        }
+
         checks
     }
 }

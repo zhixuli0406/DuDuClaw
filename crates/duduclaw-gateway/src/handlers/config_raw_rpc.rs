@@ -29,6 +29,26 @@ use toml_edit::{DocumentMut, Item, Table as EditTable, Value as EditValue};
 
 use super::config_commit::{RAW_SECRET_MASK, commit_text_locked, content_hash, read_text_or_empty, write_backup};
 
+/// Why a `config.raw.set` call failed: a plain message (validation, stale
+/// hash, write error) or a ready structured frame (the subscription-risk
+/// refusal, which carries its own `code`).
+enum RawSetError {
+    Message(String),
+    Frame(WsFrame),
+}
+
+impl From<String> for RawSetError {
+    fn from(e: String) -> Self {
+        Self::Message(e)
+    }
+}
+
+impl From<&str> for RawSetError {
+    fn from(e: &str) -> Self {
+        Self::Message(e.to_string())
+    }
+}
+
 /// Largest raw file the editor accepts (the real files are a few KB).
 const MAX_RAW_BYTES: usize = 1024 * 1024;
 
@@ -768,18 +788,19 @@ impl MethodHandler {
     pub(crate) async fn handle_config_raw_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
         match self.config_raw_set_inner(&params, ctx).await {
             Ok(v) => WsFrame::ok_response("", v),
-            Err(e) => WsFrame::error_response("", &e),
+            Err(RawSetError::Message(e)) => WsFrame::error_response("", &e),
+            Err(RawSetError::Frame(frame)) => frame,
         }
     }
 
-    async fn config_raw_set_inner(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
+    async fn config_raw_set_inner(&self, params: &Value, ctx: &UserContext) -> Result<Value, RawSetError> {
         let file = params.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let submitted = params
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or("`content` (the TOML text) is required")?;
         if submitted.len() > MAX_RAW_BYTES {
-            return Err(format!("content is larger than {MAX_RAW_BYTES} bytes"));
+            return Err(format!("content is larger than {MAX_RAW_BYTES} bytes").into());
         }
         let (kind, path) = self.resolve_raw_file(file)?;
         let stored = read_text_or_empty(&path)?;
@@ -791,7 +812,7 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .ok_or("`base_hash` (the `hash` returned by config.raw.get) is required")?;
         if base != stored_hash {
-            return Err(format!("{file} changed since it was opened — reload and try again"));
+            return Err(format!("{file} changed since it was opened — reload and try again").into());
         }
         let mut rctx = RestoreCtx::default();
         let mut new_text = restore_raw_toml_ctx(submitted, &stored, &mut rctx)?;
@@ -806,7 +827,7 @@ impl MethodHandler {
         if let RawFile::Agent(id) = &kind {
             let name_before = super::config_commit::toml_at(&before, "agent.name");
             if name_before.is_some() && name_before != super::config_commit::toml_at(&after, "agent.name") {
-                return Err(format!("[agent] name cannot be changed here (it is the employee id `{id}`)"));
+                return Err(format!("[agent] name cannot be changed here (it is the employee id `{id}`)").into());
             }
         }
         let sections = changed_sections(&before, &after);
@@ -825,6 +846,19 @@ impl MethodHandler {
                 "backup": null,
                 "hash": stored_hash,
             }));
+        }
+        // A raw edit that adds a subscription (oauth) account needs the same
+        // risk acknowledgment as `accounts.add` type `oauth`
+        // (`subscription_risk_gate`). Checked before anything is written.
+        if matches!(kind, RawFile::Config) {
+            let added = crate::subscription_risk_gate::new_oauth_accounts(&before, &after);
+            crate::subscription_risk_gate::require_acceptance_for_new_accounts(
+                &self.home_dir,
+                params,
+                ctx,
+                &added,
+            )
+            .map_err(RawSetError::Frame)?;
         }
         let protected = protected_changed(&kind, &before, &after, &sections);
 

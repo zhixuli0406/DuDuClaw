@@ -21,6 +21,41 @@ How each surface signals a deprecation while the window is open:
 
 ---
 
+## Changed without a deprecation window (v1.74.0)
+
+These changes break existing callers and get no two-version window,
+because they close a gap rather than rename something.
+
+### `accept_subscription_risk` on subscription-login RPCs
+
+Custom WebSocket / RPC clients must send `accept_subscription_risk: true`
+(a JSON boolean) on these calls, or the gateway refuses them with error code
+`subscription_risk_not_accepted`:
+
+- `auth.cli_login.start`
+- `accounts.setup_token_start`
+- `accounts.add` with `type = "oauth"`
+- `config.raw.set` when the submitted `config.toml` adds an `[[accounts]]`
+  entry with `type = "oauth"` that the stored file does not have
+
+Send it only after the person has read the subscription-login risk notice.
+API-key accounts and other raw edits are unchanged, and the dashboard already
+sends the flag after its checkbox. The operator command
+`duduclaw auth device --provider copilot` now needs
+`--accept-subscription-risk`; scripts that call it must add the flag.
+
+The DuDuClaw OS first-run setup (OOBE) also calls `auth.cli_login.start`.
+OS images up to v0.4.0 embed platform v1.73.4 and are unaffected; the OS shell
+sends the flag from [DuDuClaw-OS #21](https://github.com/zhixuli0406/DuDuClaw-OS/pull/21), which must ship before an
+OS image embeds platform v1.74.0 or later.
+
+`config.raw.set` asks only when a new account id appears. Editing an existing
+`oauth` account in the raw editor (a new token, or a different `provider`) is
+not asked again. Details:
+[Subscription-Login Risk Disclosure](../features/13-multi-runtime.md#subscription-login-risk-disclosure).
+
+---
+
 ## Removed in v1.69.0
 
 ### MCP tools

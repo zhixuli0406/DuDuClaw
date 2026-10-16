@@ -15,7 +15,10 @@ services:
       - duduclaw-grok:/home/duduclaw/.grok
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # Claude: OAuth token (preferred — from `claude setup-token`) or API key fallback
+      # Claude: API key, or an OAuth token from `claude setup-token`. The OAuth token is a
+      # subscription credential; Anthropic's policy does not permit third-party products to
+      # store or route requests through it and may enforce this without notice:
+      # https://code.claude.com/docs/en/legal-and-compliance
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # Codex (OpenAI): API key fallback — ChatGPT Plus/Pro OAuth lives in duduclaw-codex volume

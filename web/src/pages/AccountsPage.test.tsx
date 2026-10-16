@@ -192,3 +192,61 @@ describe('AccountsPage (MDS)', () => {
 
 // This suite exercises the standard installation catalog.
 beforeEach(setStandardProductPolicyFixture);
+
+// 2026-10-16 risk disclosure: the OAuth-token path stores a subscription
+// credential, so it carries the same disclosure + acknowledgment as the
+// one-click logins, and only then sends `accept_subscription_risk`.
+describe('AccountsPage subscription risk disclosure', () => {
+  async function openAddDialog(user: ReturnType<typeof userEvent.setup>) {
+    renderWithProviders(<AccountsPage />);
+    await user.click(screen.getByRole('button', { name: /Add account/i }));
+    return screen.findByRole('dialog');
+  }
+
+  it('gates the OAuth token path of Add account behind the risk disclosure', async () => {
+    const user = userEvent.setup();
+    const dialog = await openAddDialog(user);
+
+    // API key (default): no disclosure.
+    expect(within(dialog).queryByTestId('subscription-risk-disclosure')).not.toBeInTheDocument();
+
+    await user.click(within(dialog).getAllByRole('combobox')[1]);
+    await user.click(await screen.findByRole('option', { name: 'OAuth Token' }));
+    expect(within(dialog).getByTestId('subscription-risk-disclosure')).toBeInTheDocument();
+    expect(within(dialog).getByRole('link', { name: /legal and compliance/i })).toHaveAttribute(
+      'href',
+      'https://code.claude.com/docs/en/legal-and-compliance',
+    );
+
+    await user.type(within(dialog).getByPlaceholderText(/e\.g\. main/i), 'sub-1');
+    await user.type(within(dialog).getByPlaceholderText('oauth-token-...'), 'sk-ant-oat01-x');
+    const submit = within(dialog).getByRole('button', { name: /^Add Account$/ });
+    expect(submit).toBeDisabled();
+
+    await user.click(within(dialog).getByRole('checkbox', { name: /read the policy and risks/i }));
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+
+    expect(mockWsClient.call).toHaveBeenCalledWith(
+      'accounts.add',
+      expect.objectContaining({ id: 'sub-1', type: 'oauth', accept_subscription_risk: true }),
+    );
+  });
+
+  it('sends no risk flag for an API key account', async () => {
+    const user = userEvent.setup();
+    const dialog = await openAddDialog(user);
+    await user.type(within(dialog).getByPlaceholderText(/e\.g\. main/i), 'key-1');
+    await user.type(within(dialog).getByPlaceholderText(/sk-ant/i), 'sk-ant-api03-x');
+    await user.click(within(dialog).getByRole('button', { name: /^Add Account$/ }));
+
+    const call = mockWsClient.call.mock.calls.find((c) => c[0] === 'accounts.add');
+    expect(call?.[1]).toMatchObject({ id: 'key-1', type: 'api_key' });
+    expect(call?.[1]).not.toHaveProperty('accept_subscription_risk');
+  });
+
+  it('shows the policy note on the subscription hero card', async () => {
+    renderWithProviders(<AccountsPage />);
+    expect((await screen.findAllByTestId('subscription-risk-note')).length).toBeGreaterThan(0);
+  });
+});

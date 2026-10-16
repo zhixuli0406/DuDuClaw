@@ -11,6 +11,7 @@ import { client } from '@/lib/ws-client';
 import { Button, Card } from '@/components/mds';
 import { CliLoginModal } from '@/components/CliLoginModal';
 import { SubscriptionSetupWizard } from '@/components/SubscriptionSetupWizard';
+import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
 
 /**
  * WP2 / D16 — the onboarding wizard's "get this CLI working" card.
@@ -277,6 +278,9 @@ export function RuntimeSetupCard({ provider, installed, loggedIn, onDetect, dete
           <p className="text-sm text-muted-foreground">
             {intl.formatMessage({ id: 'welcome.runtime.notLoggedIn' }, { cli: provider })}
           </p>
+          {/* The login dialog shows the full disclosure first; Claude's
+              policy line is also shown here, before the button. */}
+          {provider === 'claude' && <SubscriptionRiskNote />}
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="brand" onClick={() => setLoginOpen(true)}>
               <LogIn />

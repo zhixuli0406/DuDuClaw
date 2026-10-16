@@ -254,6 +254,132 @@ fn bind_is_loopback(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── Subscription accounts (2026-10-16 risk disclosure) ──────────
+//
+// Owner decision: subscription logins stay supported, but every surface that
+// configures one must say the policy risk. `doctor` is where an operator who
+// set the account up long ago (or by hand in config.toml) still sees it.
+
+/// Ids of Claude subscription accounts: `[[accounts]]` entries with
+/// `type = "oauth"` whose `provider` is `anthropic` or unset (the rotator's
+/// default), in file order. Other providers' oauth entries (a GitHub Copilot
+/// seat from `duduclaw auth device`, say) are left out: the line below quotes
+/// Anthropic's policy, which does not cover them. Entries with no id are
+/// counted as `"(未命名)"` so the count stays honest.
+pub fn subscription_account_ids_of(table: &toml::Table) -> Vec<String> {
+    table
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.as_table())
+                .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("oauth"))
+                .filter(|t| {
+                    matches!(
+                        t.get("provider").and_then(|v| v.as_str()),
+                        None | Some("anthropic")
+                    )
+                })
+                .map(|t| {
+                    t.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(未命名)")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// zh-TW doctor line for a deployment with at least one subscription
+/// account configured; `None` when there is none (or config is unreadable,
+/// which another check already reports).
+pub fn subscription_risk_notice_of(table: &toml::Table) -> Option<String> {
+    let ids = subscription_account_ids_of(table);
+    if ids.is_empty() {
+        return None;
+    }
+    let rotation = if ids.len() > 1 {
+        "用輪替多個訂閱帳號來避開用量上限，和 Pro / Max 以一般使用為前提的用量規定衝突。"
+    } else {
+        ""
+    };
+    Some(format!(
+        "已設定 {} 個 Claude 訂閱（OAuth）帳號：{}。{}{}",
+        ids.len(),
+        ids.join("、"),
+        rotation,
+        duduclaw_core::subscription_risk::subscription_risk_line_zh()
+    ))
+}
+
+/// [`subscription_risk_notice_of`] for the live home's `config.toml`.
+pub fn subscription_risk_notice(home: &Path) -> Option<String> {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .and_then(|t| subscription_risk_notice_of(&t))
+}
+
+#[cfg(test)]
+mod subscription_risk_notice_tests {
+    use super::*;
+
+    fn table(s: &str) -> toml::Table {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn no_oauth_account_means_no_line() {
+        assert!(subscription_risk_notice_of(&table("")).is_none());
+        assert!(
+            subscription_risk_notice_of(&table(
+                "[[accounts]]\nid='k'\ntype='api_key'\nanthropic_api_key_enc='x'\n"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn one_oauth_account_is_named_with_the_policy_link() {
+        let msg = subscription_risk_notice_of(&table(
+            "[[accounts]]\nid='sub'\ntype='oauth'\noauth_token_enc='x'\n",
+        ))
+        .unwrap();
+        assert!(msg.contains("1 個"), "{msg}");
+        assert!(msg.contains("sub"), "{msg}");
+        assert!(msg.contains(duduclaw_core::subscription_risk::ANTHROPIC_LEGAL_URL));
+        assert!(!msg.contains("輪替"), "{msg}");
+    }
+
+    #[test]
+    fn other_providers_oauth_accounts_are_not_counted() {
+        assert!(
+            subscription_risk_notice_of(&table(
+                "[[accounts]]\nid='seat'\ntype='oauth'\nprovider='github'\n[[accounts]]\nid='c'\ntype='oauth'\nprovider='openai'\n"
+            ))
+            .is_none()
+        );
+        let msg = subscription_risk_notice_of(&table(
+            "[[accounts]]\nid='seat'\ntype='oauth'\nprovider='github'\n[[accounts]]\nid='claude'\ntype='oauth'\nprovider='anthropic'\n",
+        ))
+        .unwrap();
+        assert!(msg.contains("1 個"), "{msg}");
+        assert!(msg.contains("claude") && !msg.contains("seat"), "{msg}");
+    }
+
+    #[test]
+    fn several_oauth_accounts_mention_rotation() {
+        let msg = subscription_risk_notice_of(&table(
+            "[[accounts]]\nid='a'\ntype='oauth'\n[[accounts]]\nid='b'\ntype='oauth'\n[[accounts]]\nid='k'\ntype='api_key'\n",
+        ))
+        .unwrap();
+        assert!(msg.contains("2 個"), "{msg}");
+        assert!(msg.contains("a、b"), "{msg}");
+        assert!(msg.contains("輪替"), "{msg}");
+    }
+}
+
 // ── Credentials (WP-H1 P1) ──────────────────────────────────────
 //
 // The design doc's §3 P1 line: "`duduclaw doctor` 加憑證體檢（列出每個 ref 的

@@ -92,7 +92,7 @@ Rust workspace 由 24 個 crate 組成:核心地基 `duduclaw-core`、服務層 
 
 DuDuClaw 本身不含 LLM,需要一個 AI 大腦。三選一(之後也能在瀏覽器引導中設定):
 
-- 裝好一個支援的 AI CLI,例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex) 或 Antigravity(完整清單見 [multi-runtime](docs/features/zh-TW/13-multi-runtime.md);[Gemini CLI](https://github.com/google-gemini/gemini-cli) 已棄用,v1.75.0 移除),並給它一把 API key。Anthropic 與 Google 會封鎖第三方產品使用的消費者訂閱 token,也有帳號因此被停權,所以請用 API key
+- 裝好一個支援的 AI CLI,例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex) 或 Antigravity(完整清單見 [multi-runtime](docs/features/zh-TW/13-multi-runtime.md);[Gemini CLI](https://github.com/google-gemini/gemini-cli) 已棄用,v1.75.0 移除),並給它一把 API key。Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)不允許第三方產品提供 Claude.ai 登入、用 Free/Pro/Max 方案的憑證替使用者轉送請求,或保存這些憑證,而且可能不經通知就執行(有使用者回報帳號被停權)。Google 的 [Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)與 [Antigravity 條款](https://antigravity.google/terms)第 6 節寫明,用第三方軟體透過訂閱的 OAuth 登入存取服務,可能導致帳號被停權或終止。請用 API key;訂閱登入仍可使用,但要先勾選同意風險說明
 - 準備一把 API key,走任何 OpenAI 相容供應商
 - 或把本地模型掛在 OpenAI 相容伺服器後面(llama-server、Ollama、vLLM、llamafile),不需要任何雲端帳號
 
@@ -189,7 +189,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
 | 自我進化 | 預測驅動(設計上多數對話不需呼叫 LLM)、AEE playbook 進化(SOUL.md 對 agent 唯讀;學到的是一條條連結 eval 案例的小規則,不輸目前的 playbook 才提交,24 小時後逐條結算,退步只撤那一條)、MistakeNotebook 跨回合記憶 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱(逐 agent 開啟,預設關)、容器沙箱(任務沙箱只支援 Docker,預設關;腳本沙箱用 Docker,Windows 先試 WSL2)、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
-| 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析。每次呼叫都以新行程執行官方 CLI(PTY 連線池已於 2026-09 移除;需要終端機的 CLI,例如 Grok,改用一次性偽終端)。Anthropic 與 Google 會封鎖第三方產品使用的消費者訂閱 token,請用 API key([multi-runtime](docs/features/zh-TW/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
+| 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析。每次呼叫都以新行程執行官方 CLI(PTY 連線池已於 2026-09 移除;需要終端機的 CLI,例如 Grok,改用一次性偽終端)。Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)不允許第三方產品用 Claude 訂閱憑證轉送請求,Google 的 Gemini CLI 與 Antigravity 條款也寫明第三方軟體透過訂閱 OAuth 存取可能導致帳號停權或終止,請用 API key;訂閱登入仍可使用,但需明確同意風險說明([multi-runtime](docs/features/zh-TW/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
 | 本地推論 | 指向任一 OpenAI 相容本地伺服器(llama-server / Ollama / vLLM / SGLang)或 llamafile,三層信心路由自動分流 | [docs/features](docs/features/README.md) |
 | 微調與後訓練 | 從本機對話、任務結果與審批決定建構 SFT / DPO 資料集(ShareGPT / Alpaca),送到自有 GPU 主機(SSH + LLaMA-Factory)或 Together 雲端訓練,GGUF / LoRA 匯回本地模型目錄;本機不做訓練(內顯跑不動),資料離機需明確確認 | [docs/features/54](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉;v1.67.0 請勿在 Windows 開啟,見 CHANGELOG) | [docs/rfc](docs/rfc) |

@@ -5,6 +5,7 @@ import { api, type AccountInfo } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/mds';
 import { ChipEditor } from './ChipEditor';
+import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
 
 interface AccountPoolSelectProps {
   /** Currently-picked account ids (immutable — parent owns state). */
@@ -60,6 +61,16 @@ export function AccountPoolSelect({ values, onChange }: AccountPoolSelectProps) 
   const knownIds = useMemo(() => new Set((accounts ?? []).map((a) => a.id)), [accounts]);
   // Stored ids with no live account behind them — surfaced, never dropped.
   const orphans = useMemo(() => values.filter((v) => !knownIds.has(v)), [values, knownIds]);
+
+  // Subscription (OAuth) accounts in this employee's pool: show the policy
+  // line. Two or more is the "rotate subscriptions past the limit" pattern.
+  const pickedOauth = useMemo(
+    () =>
+      (accounts ?? []).filter(
+        (a) => selectedSet.has(a.id) && (a.auth_method ?? a.account_type) !== 'apikey',
+      ).length,
+    [accounts, selectedSet],
+  );
 
   const toggle = (id: string) => {
     if (selectedSet.has(id)) {
@@ -183,6 +194,8 @@ export function AccountPoolSelect({ values, onChange }: AccountPoolSelectProps) 
       {orphans.length > 0 && (
         <p className="text-xs text-warning">{t('agentForm.brain.accountPool.missing')}</p>
       )}
+
+      {pickedOauth > 0 && <SubscriptionRiskNote />}
     </div>
   );
 }

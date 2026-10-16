@@ -72,3 +72,5 @@ mod responsibilities_rpc_tests;
 mod reseller_boundary_tests;
 
 mod product_policy_tests;
+
+mod subscription_risk_gate_tests;

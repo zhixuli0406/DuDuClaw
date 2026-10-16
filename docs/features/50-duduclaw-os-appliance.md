@@ -49,8 +49,14 @@ account credentials.
    `claude setup-token` on the box and shows you a link (and a QR code) —
    you approve it in your own browser, paste the short code back, and the
    box makes one real API call before it saves anything, so a bad or
-   expired token is never mistaken for a working one. Pasting an API key
-   directly works too, with no OAuth step at all. For chat channels:
+   expired token is never mistaken for a working one. Before it starts, the
+   wizard shows a subscription risk notice you have to accept: Anthropic's
+   [policy](https://code.claude.com/docs/en/legal-and-compliance) does not permit
+   third-party products to collect or store Claude.ai credentials or route
+   requests through Free/Pro/Max plan credentials on their users' behalf,
+   and Anthropic may enforce this without notice. Pasting an API key
+   directly works too, with no OAuth step at all, and is the path Anthropic
+   documents for products. For chat channels:
    Telegram, Discord, Slack, and the web chat connect directly outbound —
    just paste a token. LINE and the other webhook-style channels can't
    receive anything on a box sitting behind a home router's NAT, so those

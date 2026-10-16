@@ -32,6 +32,8 @@ import {
 } from '@/components/mds';
 import { CliLoginModal, type LoginRuntime } from '@/components/CliLoginModal';
 import { SubscriptionSetupWizard } from '@/components/SubscriptionSetupWizard';
+import { SubscriptionRiskDisclosure, SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
+import { isSubscriptionRiskRefusal, subscriptionVendorFor } from '@/lib/subscription-risk';
 import {
   Wallet,
   Plus,
@@ -283,6 +285,7 @@ export function AccountsPage() {
           <p className="mt-0.5 text-xs text-muted-foreground">
             {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroDesc' })}
           </p>
+          <SubscriptionRiskNote className="mt-1.5" />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="brand" onClick={() => setSubscriptionWizardOpen(true)}>
@@ -325,6 +328,7 @@ export function AccountsPage() {
           <p className="text-xs text-muted-foreground">
             {intl.formatMessage({ id: 'accounts.cliLogin.pickHint' })}
           </p>
+          <SubscriptionRiskNote />
         </DialogContent>
       </Dialog>
 
@@ -412,6 +416,7 @@ export function AccountsPage() {
             <p className="text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'accounts.cliCreds.desc' })}
             </p>
+            <SubscriptionRiskNote className="mt-1" />
           </div>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {cliCreds.filter(c => policy.allows('runtimes', c.runtime)).map((c) => (
@@ -489,13 +494,27 @@ function AddAccountDialog({
   const [priority, setPriority] = useState('1');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // An OAuth token is a consumer-subscription credential DuDuClaw would
+  // store: same disclosure + acknowledgment as the one-click logins, and the
+  // gateway refuses `accounts.add` type `oauth` without the flag.
+  const [riskAck, setRiskAck] = useState(false);
+  const isOauth = accountType === 'oauth';
 
   const providerEntry = findProviderEntry(provider);
+
+  // Every open starts unacknowledged; so does every switch to OAuth.
+  useEffect(() => {
+    if (open) setRiskAck(false);
+  }, [open, accountType]);
 
   const handleSubmit = async () => {
     if (!name.trim()) return;
     if (!apiKey.trim()) {
       setError(intl.formatMessage({ id: 'accounts.provider.keyRequired' }));
+      return;
+    }
+    if (isOauth && !riskAck) {
+      setError(intl.formatMessage({ id: 'subscriptionRisk.error.notAccepted' }));
       return;
     }
     setSubmitting(true);
@@ -508,6 +527,7 @@ function AddAccountDialog({
         key: apiKey.trim(),
         monthly_budget_cents: Math.round(Number(budget) * 100),
         priority: Number(priority),
+        ...(isOauth ? { accept_subscription_risk: riskAck } : {}),
       });
       onCreated();
       onClose();
@@ -528,7 +548,11 @@ function AddAccountDialog({
       // formatError() passes short CJK server sentences through verbatim
       // (sanitized) instead of the generic 加入失敗 clause that used to
       // swallow them here (this catch previously discarded `e` entirely).
-      setError(formatError(e));
+      setError(
+        isSubscriptionRiskRefusal(e)
+          ? intl.formatMessage({ id: 'subscriptionRisk.error.notAccepted' })
+          : formatError(e),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -542,7 +566,9 @@ function AddAccountDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
+      {/* The OAuth path adds the full risk disclosure; keep the dialog
+          inside short viewports and scroll instead of clipping. */}
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{intl.formatMessage({ id: 'accounts.add' })}</DialogTitle>
         </DialogHeader>
@@ -612,12 +638,24 @@ function AddAccountDialog({
             </Field>
           </div>
 
+          {isOauth && (
+            <SubscriptionRiskDisclosure
+              checked={riskAck}
+              onCheckedChange={setRiskAck}
+              vendor={subscriptionVendorFor(provider)}
+            />
+          )}
+
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
 
         <DialogFooter>
           <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'common.cancel' })}</Button>} />
-          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !name.trim()}>
+          <Button
+            variant="brand"
+            onClick={handleSubmit}
+            disabled={submitting || !name.trim() || (isOauth && !riskAck)}
+          >
             {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'accounts.add' })}
           </Button>
         </DialogFooter>

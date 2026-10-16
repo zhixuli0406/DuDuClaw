@@ -303,9 +303,9 @@ pub struct AuthSpec {
     /// first. Presence + mtime only are ever read; content never is.
     pub credential_paths: &'static [&'static str],
     /// Vendor terms-of-service caveat the dashboard must show BEFORE a
-    /// subscription login (decision §1-1: consumer-subscription tokens used
-    /// by third-party products are server-side blocked by some vendors and
-    /// have gotten accounts suspended). `None` ⇒ nothing special to say.
+    /// subscription login (decision §1-1, corrected 2026-10-16: cite only
+    /// what the vendor's own terms say, e.g. third-party access may get the
+    /// account suspended or terminated). `None` ⇒ nothing special to say.
     pub tos_note: Option<LocaleText>,
     /// Short zh-TW/en/ja instruction shown next to the login button.
     pub login_hint: Option<LocaleText>,
@@ -429,9 +429,12 @@ pub const CATALOG: &[RuntimeSpec] = &[
             },
             credential_paths: &[".claude/.credentials.json"],
             tos_note: Some(LocaleText {
-                en: "Anthropic blocks consumer Claude Pro/Max subscription tokens used by third-party products server-side (since 2026-03); accounts have been suspended. The API key path is the supported one.",
-                zh_tw: "Anthropic 自 2026-03 起在伺服器端封鎖第三方產品使用消費者 Claude Pro/Max 訂閱 token，已有帳號被停權。建議走 API key。",
-                ja_jp: "Anthropic は 2026-03 以降、サードパーティ製品による消費者向け Claude Pro/Max のサブスクリプション トークン利用をサーバー側でブロックしています（アカウント停止の事例あり）。API キーの利用を推奨します。",
+                // Policy wording, not a technical claim: OAuth `claude -p`
+                // still works (CHANGELOG v1.66.0). Source and rationale:
+                // `crate::subscription_risk`.
+                en: "Anthropic's policy does not permit third-party products to collect, store or route requests through Claude Free/Pro/Max subscription credentials, and Anthropic may enforce this without notice; users have reported suspended accounts. The API key path is the supported one.",
+                zh_tw: "Anthropic 的規範不允許第三方產品收集、保存 Claude Free/Pro/Max 訂閱憑證，或用它轉送請求，可能不經通知就執行；有使用者回報帳號被停權。建議走 API key。",
+                ja_jp: "Anthropic の規約では、サードパーティ製品が Claude Free/Pro/Max のサブスクリプション認証情報を収集・保存したり、それでリクエストを中継したりすることは認められておらず、予告なく執行される場合があります（アカウント停止の報告あり）。API キーの利用を推奨します。",
             }),
             login_hint: Some(LocaleText {
                 en: "Approve at the opened URL, then paste the verification code below and press Enter.",
@@ -525,9 +528,11 @@ pub const CATALOG: &[RuntimeSpec] = &[
             },
             credential_paths: &[".gemini/oauth_creds.json"],
             tos_note: Some(LocaleText {
-                en: "Google blocks consumer subscription tokens used by third-party products server-side (since 2026-03). The API key path is the supported one.",
-                zh_tw: "Google 自 2026-03 起在伺服器端封鎖第三方產品使用消費者訂閱 token，建議走 API key。",
-                ja_jp: "Google は 2026-03 以降、サードパーティ製品による消費者向けサブスクリプション トークンの利用をサーバー側でブロックしています。API キーの利用を推奨します。",
+                // Cited terms only (geminicli.com/docs/resources/tos-privacy,
+                // fetched 2026-10-16); see `crate::subscription_risk`.
+                en: "Google's Gemini CLI terms say directly accessing the services behind Gemini CLI with third-party software, tools or services through Gemini CLI OAuth violates its terms and may lead to suspension or termination of the account (geminicli.com/docs/resources/tos-privacy). Use an API key for anything long-running.",
+                zh_tw: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止（geminicli.com/docs/resources/tos-privacy）。要長期使用請走 API key。",
+                ja_jp: "Google の Gemini CLI 規約では、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反とされ、アカウントの停止または終了の理由になり得ます（geminicli.com/docs/resources/tos-privacy）。継続的に使う場合は API キーをご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Complete the Google sign-in in a browser on this machine (localhost callback).",
@@ -594,9 +599,11 @@ pub const CATALOG: &[RuntimeSpec] = &[
             // skipped for this runtime.
             credential_paths: &[],
             tos_note: Some(LocaleText {
-                en: "Same Google consumer-subscription restriction as Gemini CLI. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
-                zh_tw: "與 Gemini CLI 相同的 Google 消費者訂閱限制。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
-                ja_jp: "Gemini CLI と同じ Google の消費者向けサブスクリプション制限が適用されます。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
+                // Cited terms only (antigravity.google/terms §6, fetched
+                // 2026-10-16); see `crate::subscription_risk`.
+                en: "Google's Antigravity terms (antigravity.google/terms, section 6) say using third-party software, tools or services to access the service is a breach that may lead to suspension or termination of the Antigravity and/or Gemini CLI accounts; the same section also lists using the service in connection with products not provided by Google as abuse. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
+                zh_tw: "Google 的 Antigravity 條款（antigravity.google/terms 第 6 節）寫明：用第三方軟體、工具或服務存取該服務屬於違約，可能導致 Antigravity 和／或 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
+                ja_jp: "Google の Antigravity 規約（antigravity.google/terms 第 6 条）では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすることは契約違反とされ、Antigravity や Gemini CLI のアカウントの停止または終了の理由になり得ます。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Sign in by running `agy` in a terminal on this machine and following the prompts. For remote or container deployments use API-key mode: config.toml [antigravity] auth = \"api_key\" plus a Gemini API key.",

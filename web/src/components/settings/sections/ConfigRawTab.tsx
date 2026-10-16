@@ -10,6 +10,12 @@ import { useRestartRequiredStore } from '@/stores/restart-required-store';
 import { Button, SettingsCard, SettingsSection, Textarea } from '@/components/mds';
 import { ConfirmDialog, type SelectOption } from '@/components/settings/controls';
 import { RowSelect } from '@/pages/agent-form/form-rows';
+import { SubscriptionRiskDisclosure } from '@/components/SubscriptionRiskDisclosure';
+import {
+  isSubscriptionRiskRefusal,
+  subscriptionVendorFor,
+  type SubscriptionVendor,
+} from '@/lib/subscription-risk';
 
 /** What the gateway writes in place of a stored secret in `config.raw.get`. */
 export const RAW_SECRET_MASK = '«set»';
@@ -67,6 +73,10 @@ export function ConfigRawTab() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<{ line?: number; column?: number; message: string } | null>(null);
   const [result, setResult] = useState<{ restart: string[]; backup?: string } | null>(null);
+  // Set when the gateway refused a save because it adds a subscription
+  // (oauth) account: the user must accept the risk notice, then save again.
+  const [riskVendor, setRiskVendor] = useState<SubscriptionVendor | null>(null);
+  const [riskAck, setRiskAck] = useState(false);
 
   useEffect(() => {
     fetchAgents();
@@ -117,7 +127,9 @@ export function ConfigRawTab() {
     setSaveError(null);
     setResult(null);
     try {
-      const res = await api.configRaw.set(file, text, baseHash);
+      const res = await api.configRaw.set(file, text, baseHash, riskVendor !== null && riskAck);
+      setRiskVendor(null);
+      setRiskAck(false);
       const restart = normalizeRestartRequired(res?.restart_required, file);
       if (restart.length > 0) addRestart(restart);
       setResult({ restart, backup: typeof res?.backup === 'string' ? res.backup : undefined });
@@ -132,6 +144,12 @@ export function ConfigRawTab() {
         setLoadedText(text);
       }
     } catch (e) {
+      if (isSubscriptionRiskRefusal(e)) {
+        const provider = (e as { provider?: unknown }).provider;
+        setRiskVendor(subscriptionVendorFor(typeof provider === 'string' ? provider : ''));
+        setRiskAck(false);
+        return;
+      }
       setSaveError(parseRawError(e));
     } finally {
       setSaving(false);
@@ -189,7 +207,12 @@ export function ConfigRawTab() {
         <>
           <Textarea
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              // A changed file needs a fresh check by the gateway.
+              setRiskVendor(null);
+              setRiskAck(false);
+            }}
             rows={28}
             spellCheck={false}
             autoComplete="off"
@@ -211,6 +234,12 @@ export function ConfigRawTab() {
               <p className="break-words text-xs">{saveError.message}</p>
             </div>
           )}
+          {riskVendor && (
+            <div className="space-y-2" data-testid="config-raw-subscription-risk">
+              <p className="text-sm text-warning">{t('settings.configRaw.subscriptionRisk')}</p>
+              <SubscriptionRiskDisclosure checked={riskAck} onCheckedChange={setRiskAck} vendor={riskVendor} />
+            </div>
+          )}
           {result && (
             <div role="status" className="space-y-1 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-sm">
               <p>
@@ -229,7 +258,12 @@ export function ConfigRawTab() {
             <Button variant="outline" size="sm" onClick={() => loadedText !== null && setText(loadedText)} disabled={!dirty || saving}>
               {t('settings.configRaw.revert')}
             </Button>
-            <Button variant="brand" size="sm" onClick={() => void onSave()} disabled={saving || loading || !dirty}>
+            <Button
+              variant="brand"
+              size="sm"
+              onClick={() => void onSave()}
+              disabled={saving || loading || !dirty || (riskVendor !== null && !riskAck)}
+            >
               {saving ? t('common.saving') : t('settings.configRaw.save')}
             </Button>
           </div>

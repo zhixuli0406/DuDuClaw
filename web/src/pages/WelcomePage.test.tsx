@@ -1,6 +1,6 @@
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@/test/mocks';
 import { mockWsClient } from '@/test/mocks';
@@ -160,6 +160,32 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
     expect(await screen.findByText(/signed in to claude \(plan: Max\)/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install it for me/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /sign in now/i })).not.toBeInTheDocument();
+  });
+
+  it('shows a risk line on the Claude subscription card and keeps it recommended', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<WelcomePage />);
+    await gotoBackendStep(user);
+
+    const card = await screen.findByRole('button', { name: /i have a claude subscription/i });
+    expect(within(card).getByTestId('claude-sub-risk')).toHaveTextContent(
+      /doesn't permit third-party products to handle subscription credentials/i,
+    );
+    expect(within(card).getByText('Recommended')).toBeInTheDocument();
+  });
+
+  it('shows the policy note with its link when an existing host login is adopted', async () => {
+    const user = userEvent.setup();
+    mockDetect({ claude_cli: true, claude_oauth: true, claude_subscription: 'Max' });
+    renderWithProviders(<WelcomePage />);
+    await gotoBackendStep(user);
+
+    await user.click(await screen.findByRole('button', { name: /i have a claude subscription/i }));
+    expect(await screen.findByTestId('subscription-risk-note')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /read the policy/i })).toHaveAttribute(
+      'href',
+      'https://code.claude.com/docs/en/legal-and-compliance',
+    );
   });
 
   it('surfaces sign-in for the picked "other CLI" too', async () => {

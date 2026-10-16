@@ -90,7 +90,7 @@ open http://localhost:18789
 
 | 変数 | 用途 | 備考 |
 |------|------|------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Codeの長期有効token | `claude setup-token` で生成、**推奨**。ブラウザのないコンテナ環境に適している |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Codeの長期有効token | `claude setup-token` で生成。ブラウザのないコンテナ環境に適している。サブスクリプションの認証情報なので、先に第6節のリスク説明を読むこと |
 | `ANTHROPIC_API_KEY` | Claude APIキー | Fallback、従量課金 |
 | `OPENAI_API_KEY` | Codex / OpenAI-compat APIキー | Fallback。ChatGPT Plus/Pro OAuthはvolume経由 |
 | `GEMINI_API_KEY` | Gemini APIキー | Fallback。Google OAuthはvolume経由 |
@@ -218,11 +218,11 @@ docker compose up -d
 
 つまり、**一度ログインすればコンテナを再構築してもログインし直す必要はありません**。
 
-> **サブスクリプションでのログインにはアカウントのリスクがあります。** 2026-03 以降、Anthropic と Google はサードパーティ製品で使われる個人向けサブスクリプションのトークンをサーバー側でブロックしており、停止されたアカウントもあります。OpenAI がサードパーティ製品による ChatGPT サブスクリプションのログインをどう扱うかは明確ではありません。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインです。API キーの利用を推奨します。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
+> **サブスクリプションでのログインにはアカウントのリスクがあります。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。1 つのサブスクリプションでチャネルの顧客に返信すること、複数のサブスクリプションをローテーションして利用上限を避けること、トークンを DuDuClaw に保存することは、いずれもこの規約と衝突します。Google の [Gemini CLI 規約](https://geminicli.com/docs/resources/tos-privacy/)と [Antigravity 規約](https://antigravity.google/terms)には、サードパーティのソフトウェアから Gemini CLI や Antigravity の OAuth を使ってサービスにアクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。OpenAI がサードパーティ製品による ChatGPT サブスクリプションのログインをどう扱うかは明確ではありません。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインで、引き続き使えますが、API キーの利用を推奨します。ダッシュボードのログインフローでは、先にこの説明への同意を求めます。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
 
 ### 6.1 Claude Code CLI
 
-#### 方法A：Setup Token（推奨）
+#### 方法A：Setup Token（ブラウザ不要）
 
 Claude Codeは自動化シナリオ向けに、ブラウザのコールバックを必要としない長期有効tokenを提供しており、
 コンテナ / CI / headless serverに適しています。

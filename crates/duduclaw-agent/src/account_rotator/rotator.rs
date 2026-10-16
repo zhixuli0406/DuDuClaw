@@ -217,6 +217,7 @@ impl AccountRotator {
                 .ok()
                 .flatten();
             if let Some(creds) = detected {
+                warn_host_login_adopted_once();
                 loaded.push(creds);
             }
         }
@@ -323,4 +324,24 @@ impl AccountRotator {
         self.inherit_host_credentials.store(inherit_host_credentials, Ordering::Relaxed);
         Ok(count)
     }
+}
+
+/// Process-wide latch for [`warn_host_login_adopted_once`]. The rotator is
+/// rebuilt on every config change, so the warning would repeat without it.
+static HOST_LOGIN_RISK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One WARN per process when the rotator adopts the host's own Claude
+/// subscription login (`[account_loading] inherit_host_credentials`, default
+/// on). Behavior is unchanged; this only makes the policy risk visible in the
+/// gateway log. Wording: `duduclaw_core::subscription_risk`.
+fn warn_host_login_adopted_once() {
+    if HOST_LOGIN_RISK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    warn!(
+        policy_url = duduclaw_core::subscription_risk::ANTHROPIC_LEGAL_URL,
+        "adopted the host's Claude subscription login (inherit_host_credentials) — {}",
+        duduclaw_core::subscription_risk::subscription_risk_line_zh()
+    );
 }

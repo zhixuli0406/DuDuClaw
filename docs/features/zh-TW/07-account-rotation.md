@@ -27,6 +27,8 @@ DuDuClaw 的帳號輪替對 API 認證資料做的是同一件事——自動、
 
 **OAuth Session** — 連結到訂閱方案（Pro、Team、Max）。通常包含月度免費 API 呼叫配額。它們是「回饋卡」（優先使用）。
 
+> **政策風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，也不得收集、儲存或中介這些憑證；Pro 和 Max 的用量上限以一般使用為前提。Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。輪替多個訂閱帳號來避開用量上限，或讓訂閱替其他人服務（例如回覆頻道上的客戶），都和這份規範衝突。輪替功能本身照舊；Anthropic 為產品記載的做法是 API 金鑰帳號。只要設定了 Claude 的 OAuth 帳號，`duduclaw doctor` 就會印出提醒。
+
 **API Key** — 按 token 付費。沒有配額限制，但每次呼叫都有成本。它們是「緊急卡」，可靠但昂貴。
 
 ### 四種策略

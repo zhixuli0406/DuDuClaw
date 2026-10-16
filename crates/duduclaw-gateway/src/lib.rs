@@ -239,6 +239,7 @@ pub mod rule_induction;
 pub mod secaudit_reports;
 pub mod security_posture;
 pub mod setup_token_wizard;
+pub mod subscription_risk_gate;
 pub mod situation_classifier;
 // WP5c — conversation → knowledge-base semantic routing.
 pub mod auto_wiki_page;

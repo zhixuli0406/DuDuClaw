@@ -74,6 +74,25 @@ impl MethodHandler {
             }
             "accounts.add" => {
                 require_admin!();
+                // Subscription-risk gate: an `oauth` account is a consumer-
+                // subscription token DuDuClaw would store. API keys pass.
+                if params.get("type").and_then(|v| v.as_str()) == Some("oauth") {
+                    let provider = params
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("anthropic");
+                    let account_id = params.get("id").and_then(|v| v.as_str());
+                    if let Err(frame) = crate::subscription_risk_gate::require_acceptance(
+                        &self.home_dir,
+                        &params,
+                        ctx,
+                        crate::subscription_risk_gate::Surface::AccountsAddOauth,
+                        provider,
+                        account_id,
+                    ) {
+                        return frame;
+                    }
+                }
                 self.handle_accounts_add(params).await
             }
             "accounts.update_budget" => {
@@ -88,6 +107,30 @@ impl MethodHandler {
             // native login in a PTY and streams it to the dashboard.
             "auth.cli_login.start" => {
                 require_admin!();
+                // Subscription-risk gate: every runtime with a scriptable
+                // login signs in a consumer account. Unknown runtimes and
+                // runtimes without a login fall through to the handler's own
+                // refusal. See `subscription_risk_gate`.
+                let runtime = params
+                    .get("runtime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let has_login = duduclaw_core::types::RuntimeType::parse(&runtime)
+                    .and_then(crate::cli_auth::spec_for)
+                    .is_some();
+                if has_login
+                    && let Err(frame) = crate::subscription_risk_gate::require_acceptance(
+                        &self.home_dir,
+                        &params,
+                        ctx,
+                        crate::subscription_risk_gate::Surface::CliLoginStart,
+                        &runtime,
+                        None,
+                    )
+                {
+                    return frame;
+                }
                 self.handle_cli_login_start(params).await
             }
             "auth.cli_login.input" => {
@@ -113,6 +156,18 @@ impl MethodHandler {
             // desktop too. See `setup_token_wizard.rs`.
             "accounts.setup_token_start" => {
                 require_admin!();
+                // Subscription-risk gate: this wizard captures a Claude
+                // subscription token. See `subscription_risk_gate`.
+                if let Err(frame) = crate::subscription_risk_gate::require_acceptance(
+                    &self.home_dir,
+                    &params,
+                    ctx,
+                    crate::subscription_risk_gate::Surface::SetupTokenStart,
+                    "anthropic",
+                    None,
+                ) {
+                    return frame;
+                }
                 self.handle_accounts_setup_token_start().await
             }
             "accounts.setup_token_submit" => {
