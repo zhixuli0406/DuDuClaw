@@ -135,6 +135,16 @@ impl FromStr for ToolEffect {
 ///   employee (`send`); `create_agent`, `spawn_ephemeral` create one (`admin`).
 /// - `calendar_create_event` notifies attendees (`send`).
 /// - `os_notify` shows a desktop notification to a person (`send`).
+/// - `odoo_connect` stays `read`: it re-reads the operator's `[odoo]` config,
+///   replaces only the caller's own pooled connection and authenticates with
+///   credentials already configured. It writes no file and no Odoo record,
+///   and every Odoo read tool needs it first, so a `read`-only lane or rule
+///   that allows Odoo reads must allow it too.
+/// - `os_doctor_repair` is `admin`, not `read`: besides reporting, its MCP
+///   cold-start probe mints the `gateway-internal` MCP key on a fresh home
+///   and rotates it once it is past its age limit (the same provisioning as
+///   gateway boot), and spawns an `mcp-server` child. Rotating a credential
+///   is host operation.
 pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
     use ToolEffect::*;
     let effect = match tool_name {
@@ -161,7 +171,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "odoo_payment_status" | "odoo_report" | "odoo_sale_orders" | "odoo_schema_fields"
         | "odoo_search" | "odoo_status" | "os_audio_get" | "os_backup_list"
         | "os_boot_assessment" | "os_calendar_today" | "os_check_update" | "os_device_status"
-        | "os_display_get" | "os_doctor_repair" | "os_frontmost" | "os_network_info"
+        | "os_display_get" | "os_frontmost" | "os_network_info"
         | "os_spotlight_search" | "os_system_status" | "os_watch_status" | "os_wifi_scan"
         | "os_wifi_status" | "plan_get" | "reliability_summary" | "responsibility_get"
         | "route_query" | "session_restore_context" | "shared_skill_list" | "sheets_read"
@@ -215,7 +225,8 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
         | "codrive_run" | "create_agent" | "evolution_toggle" | "execute_program"
         | "llamafile_start" | "llamafile_stop" | "model_download" | "model_load"
-        | "model_unload" | "odoo_execute" | "os_apply_update" | "os_factory_reset"
+        | "model_unload" | "odoo_execute" | "os_apply_update" | "os_doctor_repair"
+        | "os_factory_reset"
         | "os_power" | "os_update_rollback" | "os_wifi_connect" | "pairing_manage"
         | "shared_skill_adopt" | "skill_graduate" | "skill_hub_install"
         | "skill_synthesis_run" | "spawn_ephemeral" => Admin,
@@ -864,6 +875,10 @@ mod tests {
         assert_eq!(effect_of_builtin("wiki_write"), Some(ToolEffect::Modify));
         assert_eq!(effect_of_builtin("mail_send"), Some(ToolEffect::Send));
         assert_eq!(effect_of_builtin("wiki_share"), Some(ToolEffect::Publish));
+        // Rotates the gateway-internal MCP key when it is old: not read-only.
+        assert_eq!(effect_of_builtin("os_doctor_repair"), Some(ToolEffect::Admin));
+        // Connection handshake only; every Odoo read depends on it.
+        assert_eq!(effect_of_builtin("odoo_connect"), Some(ToolEffect::Read));
         assert_eq!(effect_of_builtin("agent_remove"), Some(ToolEffect::Delete));
         assert_eq!(effect_of_builtin("memory_search_x"), None);
         assert_eq!(effect_of_builtin("memory"), None);

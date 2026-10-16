@@ -84,14 +84,14 @@ pub(crate) async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, cal
     }
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
-    let full_path = wiki_dir.join(page_path);
 
-    if !full_path.exists() {
-        return tool_error(&format!("Page not found: {}", page_path));
-    }
-
-    // ACL: only author or main agent can delete
-    let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+    // ACL: only author or main agent can delete. The page is read without
+    // following a symlink and must resolve inside the shared wiki; any read
+    // failure other than "not found" refuses the delete (fail closed).
+    let content = match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path) {
+        Ok(c) => c,
+        Err(e) => return tool_error(&wiki_read_error(page_path, &e)),
+    };
     let page_author = extract_frontmatter_field(&content, "author").unwrap_or_default();
 
     // Check if caller is the main agent. Must parse the typed [agent] role —
@@ -378,21 +378,30 @@ pub(crate) async fn handle_wiki_share(args: &Value, home_dir: &Path, caller_agen
         Err(e) => return tool_error(&e),
     };
 
-    // Same guard as `wiki_read`, checked before the path touches the disk:
-    // without it `../..` or an absolute path published the first 500
-    // characters of any file the process can read into the shared wiki.
-    if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
-        return tool_error("Path traversal is not allowed");
+    // Shared validator, checked before the path touches the disk (no
+    // existence probing outside the wiki): without it `../..` or an absolute
+    // path published the first 500 characters of any file the process can
+    // read into the shared wiki. Reserved files (`_index.md`, `_log.md`,
+    // `_schema.md`) are not pages and are not shared.
+    if let Err(e) = validate_wiki_page_path(page_path) {
+        return tool_error(&e);
     }
-    if !wiki_dir.join(page_path).is_file() {
-        return tool_error(&format!("Page not found in your wiki: {}", page_path));
+    // No-follow read; the page must resolve inside the caller's wiki.
+    let source_content =
+        match duduclaw_memory::wiki_path::read_wiki_file_nofollow(&wiki_dir, page_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return tool_error(&format!("Page not found in your wiki: {}", page_path));
+            }
+            Err(e) => return tool_error(&wiki_read_error(page_path, &e)),
+        };
+    // Publishing must not bypass what `wiki_read` withholds (quarantined,
+    // do_not_inject or low-trust pages).
+    if let Some(reason) =
+        wiki_page_withheld(home_dir, &wiki_dir, caller_agent, page_path, &source_content)
+    {
+        return tool_error(&format!("Cannot share: {reason}"));
     }
-    // `read_raw` repeats the string checks and refuses a symlink that
-    // resolves outside the wiki directory.
-    let source_content = match duduclaw_memory::WikiStore::new(wiki_dir.clone()).read_raw(page_path) {
-        Ok(c) => c,
-        Err(e) => return tool_error(&format!("Failed to read source page: {e}")),
-    };
 
     let source_title =
         extract_frontmatter_title(&source_content).unwrap_or_else(|| page_path.to_string());

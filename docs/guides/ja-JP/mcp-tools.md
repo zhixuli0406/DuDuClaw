@@ -97,7 +97,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 | `read` | `true` | （付けない） |
 | `draft`・`send` | `false` | `false` |
 | `publish` | `false` | `true`（公開は他者が読んでいる内容を置き換えうる） |
-| `modify` | `false` | `true`。ただし追加・再生成だけの `memory_store`・`user_profile_record`・`wiki_export`・`wiki_rebuild_fts` は `false` |
+| `modify` | `false` | `true`。ただし追加・再生成だけの `memory_store`・`user_profile_record`・`wiki_rebuild_fts` は `false`。`wiki_export` は前回のエクスポート（人が編集したかもしれない Obsidian vault を含む）を上書きするため `true` のまま |
 | `delete`・`purchase`・`admin` と表にない名前 | `false` | `true` |
 
 メモリ・wiki・ユーザープロファイル・`code_map` のツールは `openWorldHint: false` も付きます。`memory_alias_add`・`wiki_export`・`wiki_rebuild_fts` は `idempotentHint: true` です。これらのリストは `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs` にあります。

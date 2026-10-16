@@ -52,7 +52,11 @@ pub(crate) async fn handle_wiki_graph(args: &Value, home_dir: &Path, default_age
     }
 
     let center = args.get("center").and_then(|v| v.as_str());
-    let depth: usize = crate::mcp_args::arg_u64(args, "depth").map_or(2, |n| n as usize);
+    // Clamped to `MAX_GRAPH_DEPTH` (10 hops): an uncapped caller value such
+    // as 10^19 used to keep the BFS spinning and pinned the mcp-server CPU.
+    let depth: usize = crate::mcp_args::arg_u64(args, "depth")
+        .map_or(2, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        .min(duduclaw_memory::wiki::MAX_GRAPH_DEPTH);
 
     let store = duduclaw_memory::WikiStore::new(wiki_dir);
     match store.export_mermaid(center, depth) {
@@ -162,13 +166,7 @@ pub(crate) async fn handle_wiki_trust_history(args: &Value, home_dir: &Path, def
     // (review MED R2 N-2) Defence in depth: bad page_path can't reach SQL
     // injection (parameterised queries) but might leak via audit log strings
     // or future filesystem ops. Reject traversal / NUL / non-md paths.
-    if page_path.len() > 512
-        || page_path.contains("..")
-        || page_path.starts_with('/')
-        || page_path.starts_with('\\')
-        || page_path.contains('\0')
-        || !page_path.ends_with(".md")
-    {
+    if page_path.len() > 512 || validate_wiki_read_path(page_path).is_err() {
         return tool_error("Invalid page_path format");
     }
 

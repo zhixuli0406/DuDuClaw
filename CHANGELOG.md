@@ -36,14 +36,27 @@
 
 ### Removed
 - `web/public/paw-source.svg` 與 `paw-1024.png`（舊 🐾 app icon 來源，已沒有任何地方引用）。
+- `os_doctor_repair` 的效果分類從 `read` 改成 `admin`：它除了回報，還會在全新安裝時建立、在過期時輪替閘道內部用的 MCP 金鑰，並啟動一個 `mcp-server` 子行程。MCP 的 `readOnlyHint` 因此變成 `false`，探索模式與只放行 `read` 的 `action_rules` 不再允許它。`odoo_connect` 檢查後維持 `read`：它只重讀已設定的 Odoo 連線並重新登入自己的連線槽，不寫檔也不改 Odoo 資料，而且所有 Odoo 讀取工具都要先呼叫它。
+- `wiki_export` 的 `destructiveHint` 改為 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault。`idempotentHint` 維持 `true`。
+
+### Deprecated
+- Gemini CLI runtime（`gemini`）的移除再延到 **v1.75.0**（原訂 v1.74.0）：移除的前提是用真的 Gemini API key 重新驗證 Antigravity，這件事還沒做。執行期警告、儀表板與 `docs/guides/deprecations.md`（三語）同步改成 v1.75.0。Gemini API provider 不受影響。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
 - schema 與處理程式對參數型別的認知不一致，照 schema 傳值的用戶端會被拒或被默默忽略：`memory_fetch_batch` 收到字串形式的 `ids` 直接報錯；`include_metadata: "true"`、`max_files: "5"`、`origin_trust: "0.4"` 這類字串會被忽略並改用預設值；反過來，`wiki_search` 的 `limit: 5`、`expand: true`，`wiki_graph` 的 `depth: 3` 與 `wiki_write` 的 `update_index: false` 以原生 JSON 型別傳入時也會被忽略（`update_index: false` 照樣寫進 `_index.md`）。
 - stdio server 會回應不認得的 JSON-RPC 通知（例如 `notifications/cancelled`），送出一筆沒有 id 的錯誤，違反 JSON-RPC 規定；現在通知一律不回。stdio 也補上舊版規格要求的 `ping`，原本回「找不到方法」。
+- 整數參數（例如 `wiki_graph` 的 `depth`、`wiki_search` 的 `limit`）收到 `10.0` 這種整數值的浮點數時被當成沒填、改用預設值。現在視為 10；有小數、負數或超出範圍的值仍當成沒填。
 
 ### Security
 - `wiki_share` 沒有檢查頁面路徑：`../`、絕對路徑或指向 wiki 外的符號連結都能讓它讀取員工自己 wiki 以外、行程讀得到的任何檔案，並把前 500 個字元（或呼叫者給的摘要）公開到所有員工都讀得到的共用 wiki，唯一的擋點是機密字樣掃描。現在跟 `wiki_read` 用同一道檢查，讀取時另外拒絕解析到 wiki 目錄外的連結。
+- 所有 wiki 工具（`wiki_read`、`wiki_write`、`wiki_share`、共用 wiki 的讀、寫、刪除，以及儀表板的 wiki 讀取）改用同一個頁面路徑檢查：除了 `..` 與絕對路徑，也拒絕 NUL 字元、Windows 磁碟機路徑（`C:\x`、`C:x.md`）與路徑元件中的根目錄或前綴。檢查一律在碰磁碟之前做，`wiki_share` 不再先判斷檔案存不存在（原本可用來探測 wiki 外的檔案是否存在）。
+- `wiki_write` 原本先建立上層目錄才檢查有沒有跑出 wiki，經由 wiki 裡指向外面的符號連結目錄，可以在 wiki 外建立目錄。現在先確認最近一層已存在的上層目錄解析後仍在 wiki 內，才建立任何東西；暫存檔改用獨佔建立，預先放好的同名連結不會被寫穿。
+- 檢查頁面是否跑出 wiki 目錄時，若路徑無法解析（例如懸空的符號連結），原本會直接略過檢查。現在一律拒絕。讀取頁面改成不跟隨符號連結（`O_NOFOLLOW`，開檔後再確認是一般檔案），檢查完到讀取之間把頁面換成連結也讀不到外面的檔案。wiki 列表與共用 wiki 的列表、統計、檢查報告也不再跟隨符號連結。
+- 頁面 `related` 欄位裡指向 wiki 外的路徑（如 `../../secret.md`），不會再被 `wiki_search` 的展開結果讀進來。
+- `wiki_share` 拒絕分享保留檔（`_index.md`、`_log.md`、`_schema.md`），也不分享 `wiki_read` 會扣住的頁面（隔離中、`do_not_inject` 或信任分數低於 0.1）。儀表板讀 wiki 與共用 wiki 的讀取（`wiki_read` 帶 `scope="shared"`）只接受 `.md` 檔，原本讀得到 `.scope.toml` 這類非頁面檔案。
+- 寫入 `_index.md`、追加 `_log.md` 與 Obsidian 匯出原本會跟隨符號連結：wiki 裡若有人把 `_log.md` 換成指向外面的連結，之後每次寫頁面都會往那個外部檔案追加一行，匯出時也會把外部檔案的內容複製出去。現在索引改用獨佔建立的暫存檔加 rename，`_log.md` 不跟隨連結開檔，匯出改用不跟隨連結的讀取；保留檔是連結時寫入記錄失敗、匯出直接報錯。
+- `wiki_graph` 的 `depth` 沒有上限，傳 `1e19` 這類數字會讓 `mcp-server` 的 CPU 一直滿載。現在上限 10 層，而且某一層沒有新頁面就提早結束。
 
 ## [1.73.4] - 2026-10-15 — DuDuClaw OS 閘道去 root 的平台端：sysd 加固、驗證過的更新、Podman 相容
 

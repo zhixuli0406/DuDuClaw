@@ -181,7 +181,7 @@ effect table the dispatch gate and `action_rules` use
 | `read` | `true` | (omitted) |
 | `draft`, `send` | `false` | `false` |
 | `publish` | `false` | `true` (a publish can replace what others already read) |
-| `modify` | `false` | `true`, except `memory_store`, `user_profile_record`, `wiki_export`, `wiki_rebuild_fts` (they only add or regenerate) |
+| `modify` | `false` | `true`, except `memory_store`, `user_profile_record`, `wiki_rebuild_fts` (they only add or regenerate). `wiki_export` stays `true`: it overwrites the previous export, including an Obsidian vault someone may have edited |
 | `delete`, `purchase`, `admin`, and any unknown name | `false` | `true` |
 
 Memory, wiki, user-profile and `code_map` tools also say `openWorldHint: false`;
