@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.74.0] - 2026-10-16 — 訂閱登入的伺服器端同意關卡、MCP 2026-07-28 協定、C1 品牌識別、wiki 路徑加固
+
 ### Added
 - MCP `tools/list` 的每個工具都帶 `annotations`（`readOnlyHint`、`destructiveHint`，部分工具另有 `idempotentHint`、`openWorldHint`），由派工閘門同一張效果分類表推導，不另立一套分類。這是給 MCP 用戶端的提示，不是授權，DuDuClaw 的閘門照常檢查。用戶端可能因此對唯讀工具少問一次確認。對照表見 `docs/guides/mcp-tools.md`。
 - `memory_search` 的 schema 補上處理程式本來就接受的 `limit`（預設 10、上限 100）與 `tags`（只回帶有其中任一標籤的項目）。
