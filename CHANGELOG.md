@@ -22,6 +22,9 @@
 - 公開文件跟上 DuDuClaw OS v0.4.0（2026-10-16 發布，內嵌平台 v1.73.4）：三語 README 的 OS 段落與功能表、`docs/features/05`、`50`、`52`，以及 `docs/guides/task-sandbox.md`、`mcp-tools.md`、`appliance-build.md`（皆含 zh-TW／ja-JP）原本寫「下一版 OS 映像、尚未發版」的閘道去 root、rootless Podman、SSH 預設關閉、基礎版防火牆、`/api/internal/sysd` 與回退下限，改寫成從 v0.4.0 起提供；v0.3.0 以前的映像仍以 root 執行閘道與 Docker、內嵌較舊的平台。新增寫明：升級到 v0.4.0 是單向的（sysd 的回退下限加上第一次開機被標記成功後刪掉舊開機項目，成功開機過的裝置回不去 v0.3.0 以前）。測試範圍照 OS 的發版說明寫：QEMU 機型桌面版測試映像在建置主機的無頭 QEMU（TCG）跑兩輪驗證，第二輪 36 項過 35 項（沒過的是 doctor 標題，已在下方修正）；整碟映像通過發版前開機煙霧測試（約 65 秒到登入畫面）。仍未驗證：從 v0.3.0 經 A/B 更新升級、需要 LLM 憑證的任務沙箱／電腦操作／Discovery 完整流程、Windows VM、真機、genericx86-64 開機。SSH 目前還沒有能登入的帳號；Secure Boot、dm-verity、TPM2 在發布映像上仍未啟用。
 - 舊世代 `initialize` 改成真的協商：stdio 原本不管用戶端要什麼一律回 `2024-11-05`，HTTP 最高只到 `2025-06-18`。現在兩者共用同一段邏輯，支援 2025-11-25、2025-06-18、2025-03-26、2024-11-05，要哪個回哪個，不認得的版本回 2025-11-25。
 
+### Deprecated
+- Gemini CLI runtime（`gemini`）的移除再延到 **v1.75.0**（原訂 v1.74.0）：移除的前提是用真的 Gemini API key 重新驗證 Antigravity，這件事還沒做。執行期警告、儀表板與 `docs/guides/deprecations.md`（三語）同步改成 v1.75.0。Gemini API provider 不受影響。
+
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
 - schema 與處理程式對參數型別的認知不一致，照 schema 傳值的用戶端會被拒或被默默忽略：`memory_fetch_batch` 收到字串形式的 `ids` 直接報錯；`include_metadata: "true"`、`max_files: "5"`、`origin_trust: "0.4"` 這類字串會被忽略並改用預設值；反過來，`wiki_search` 的 `limit: 5`、`expand: true`，`wiki_graph` 的 `depth: 3` 與 `wiki_write` 的 `update_index: false` 以原生 JSON 型別傳入時也會被忽略（`update_index: false` 照樣寫進 `_index.md`）。
