@@ -3289,9 +3289,11 @@ export interface WifiScanResult {
   scanning: boolean;
 }
 
-/** One `maintenance_windows` row (`DESIGN-maintenance-mode-2026-08.md` §2.4).
+/** One `maintenance_windows` row (`DESIGN-maintenance-mode-2026-08.md` §2.4,
+ *  SSH fields from `DESIGN-maintenance-ssh-account-2026-10.md` §4.1).
  *  `remaining_seconds` is `null` once revoked — mirrors the Rust
- *  `MaintenanceWindow::remaining_seconds` contract. */
+ *  `MaintenanceWindow::remaining_seconds` contract. `state` is `opening`
+ *  while sysd has not yet confirmed the SSH open. */
 export interface MaintenanceWindow {
   id: string;
   enabled_by: string;
@@ -3301,6 +3303,56 @@ export interface MaintenanceWindow {
   expires_at: string;
   sub_capabilities: string[];
   remaining_seconds: number | null;
+  state?: 'opening' | 'open' | 'open_failed' | 'closed';
+  ssh_key_type?: string | null;
+  ssh_key_fingerprint?: string | null;
+  ssh_key_label?: string | null;
+  host_key_fingerprints?: string[];
+  /** Only on a `maintenance.disable` reply: the SSH close was not confirmed. */
+  close_error?: string | null;
+}
+
+/** One SSH session sysd currently sees. */
+export interface MaintenanceSshSession {
+  source: string | null;
+  key_fingerprint: string | null;
+  since_unix: number;
+}
+
+/** sysd's report of the last window it closed. `trigger` is one of
+ *  `reboot` / `firewall_changed` / `deadline` / `fallback_timer` /
+ *  `startup_cleanup` / `stop` / `other` / `unknown`. */
+export interface MaintenanceSshLastClose {
+  window_id: string | null;
+  trigger: string;
+  events_complete: boolean | null;
+  events_lost: boolean;
+}
+
+/** `maintenance.status.ssh`: what sysd reports, asked on every status call.
+ *  `supported` is `null` when it can't be told right now (sysd unreachable or
+ *  its answer unreadable). `reason` is `off_appliance`, `sysd_unreachable`,
+ *  `status_unreadable`, `status_failed`, `sysd_too_old`, `image_not_ready` or
+ *  `null`. */
+export interface MaintenanceSshStatus {
+  supported: boolean | null;
+  reachable: boolean;
+  reason: string | null;
+  ready?: boolean | null;
+  key_installed: boolean | null;
+  key_fingerprint: string | null;
+  window_id: string | null;
+  expires_in_s: number | null;
+  fallback_timer_active: boolean | null;
+  active_sessions: number;
+  sessions: MaintenanceSshSession[];
+  auth_failures: number | null;
+  event_overflow: number;
+  pending_cleanup: boolean;
+  pending_audit: boolean;
+  problems: string[];
+  host_key_fingerprints: string[];
+  last_close: MaintenanceSshLastClose | null;
 }
 
 /** `maintenance.status` payload. `ssh_observed_active` is a LIVE probe
@@ -3308,18 +3360,23 @@ export interface MaintenanceWindow {
  *  `window`'s ledger state — a mismatch (e.g. `active: false` but
  *  `ssh_observed_active: true`) means a close action failed and SSH is
  *  still actually reachable; see §6 fail-closed principle #2. `null` = no
- *  live signal available (off-appliance, or the probe itself failed). */
+ *  live signal available (off-appliance, sysd unreachable, or the probe
+ *  itself failed). The SSH fields are optional so an older gateway's payload
+ *  still type-checks. */
 export interface MaintenanceStatus {
   active: boolean;
   window: MaintenanceWindow | null;
   ssh_observed_active: boolean | null;
+  ssh?: MaintenanceSshStatus;
+  close_unconfirmed?: boolean;
+  push_channel_available?: boolean;
+  reauth?: { locked: boolean; retry_after_seconds: number | null };
 }
 
 /** One line from `maintenance_audit.jsonl`, surfaced via `maintenance.history`.
- *  `kind` is one of: `enabled` / `disabled` / `ttl_expired` /
- *  `gateway_restart_revoked` / `reminder_sent` / `access_view_detail` /
- *  `enable_failed` / `enable_race_rolled_back`. Extra fields vary by kind, so
- *  this is intentionally loose beyond the two always-present columns. */
+ *  `kind` is listed in `KNOWN_AUDIT_KINDS` (`lib/maintenance-ssh.ts`). Extra
+ *  fields vary by kind, so this is intentionally loose beyond the two
+ *  always-present columns. */
 export interface MaintenanceAuditEvent {
   ts_ms: number;
   kind: string;
@@ -7949,12 +8006,15 @@ export const api = {
       subCapabilities: string[];
       confirmText: string;
       reauthPassword: string;
+      /** Required with the `ssh` sub-capability, refused without it. */
+      sshPublicKey?: string;
     }) =>
       client.call('maintenance.enable', {
         ttl_hours: params.ttlHours,
         sub_capabilities: params.subCapabilities,
         confirm_text: params.confirmText,
         reauth_password: params.reauthPassword,
+        ...(params.sshPublicKey !== undefined ? { ssh_public_key: params.sshPublicKey } : {}),
       }) as Promise<{ window: MaintenanceWindow }>,
     disable: (reason?: string) =>
       client.call('maintenance.disable', { reason }) as Promise<{ window: MaintenanceWindow | null }>,

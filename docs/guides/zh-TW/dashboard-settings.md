@@ -105,3 +105,25 @@
 - **備份：**寫入前備份成 `<檔名>.bak-<Unix 時間>`（權限 0600），保留最近 5 份。
 - **稽核：**每次寫入記 `config_raw_edited`。改到 `[delegation]`、`[acp]`，或員工的 `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時等級為 Warning。
 - **重啟清單：**存檔後列出需要重啟的部分。`config.toml` 的 `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` 只在開機時讀；`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart` 也要重啟；日誌等級、常駐感知、去識別化能立即套用時就不列。`inference.toml` 存檔後一律立即重設推理引擎。員工檔案只有 `heartbeat.max_concurrent_runs` 需要重啟。
+
+## 維修 SSH 儀表板（尚未發版）
+
+到「裝置 → 維修模式」，由管理員選期限與功能、重新輸入密碼，
+再輸入 `MAINTENANCE`。勾選 SSH 還需要貼上一把技術人員的 OpenSSH
+公開金鑰。畫面先檢查格式；誤貼私鑰會立即清空，不會送出。閘道與
+裝置輔助程式仍會各自驗證。RSA 須為 3072–8192 位元。無法確認支援、
+舊版或更新不完整的映像會停用 SSH 選項，診斷詳情仍可使用。
+密碼連錯 5 次後，15 分鐘內不能開啟。
+
+視窗開啟後會顯示 `ssh duduclaw-maint@duduclaw.local`、可用的私有
+IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗次數。
+登入前請核對管理員推播中的兩個指紋；沒有推播通道時，到裝置本機
+螢幕核對，無法只靠此儀表板確認裝置身分。已設定通道不代表推播
+已送達。22 埠只接受私有／連結本機來源與 VPN CGNAT `100.64.0.0/10`，
+不接受全域 IPv6；來源位址符合範圍不代表可信。維修選單可查指定
+診斷資料、重啟本地模型或閘道；重啟閘道會關窗並中斷 SSH。
+
+關閉未獲裝置確認時會持續顯示警告。展開「維修紀錄」可查最近的
+視窗金鑰指紋與連線事件。畫面每 30 秒讀取一次狀態，到期或裝置
+自行關閉可能要等下次讀取才顯示。完整 OS 映像、真實 SSH 與推播
+流程尚未驗證；這是尚未發版的介面，不代表整機已驗收。

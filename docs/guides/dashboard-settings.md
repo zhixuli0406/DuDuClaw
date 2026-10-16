@@ -105,3 +105,29 @@ Location: Settings → Advanced → Advanced config editor. Admins only; RPCs `c
 - **Backup:** before writing, the file is copied to `<file>.bak-<unix time>` (mode 0600); the newest five are kept.
 - **Audit:** every write records `config_raw_edited`, at Warning level when it touches `[delegation]`, `[acp]`, or an employee's `[agent]`, `[capabilities]`, `sandbox_enabled`, `network_access` or `can_modify_own_soul`.
 - **Restart list:** after saving, the editor lists what needs a restart. In `config.toml`, `[gateway]`, `[server]`, `[telemetry]`, `[logging]`, `[channels]`, `[wiki]`, `[relay]` and `[decision]` are read only at boot; `general.name`, `rotation.health_check_interval_seconds` and `goal_loop.resume_on_restart` also need a restart; the log level, live data feeds and redaction are not listed when they could be applied live. Saving `inference.toml` always resets the inference engine immediately. For an employee file only `heartbeat.max_concurrent_runs` needs a restart.
+
+## Maintenance SSH dashboard (unreleased)
+
+In Device → Maintenance mode, an Admin selects the duration and capabilities,
+re-enters their password and types `MAINTENANCE`. Selecting SSH also requires
+one technician public key in OpenSSH format. The dashboard checks the input
+and immediately clears a pasted private key; the gateway and device helper
+remain the authority. RSA keys must be 3072–8192 bits. Unknown support or an
+old/partly updated image disables SSH, while diagnostic details remain
+available. Five wrong passwords lock opening for 15 minutes.
+
+An open window shows `ssh duduclaw-maint@duduclaw.local`, available private
+IPv4 addresses, the technician and device fingerprints, expiry, connections
+and failed sign-ins. Compare both fingerprints with the Admin notification.
+If no notification channel is available, use the local device screen; this
+dashboard alone cannot authenticate the device. A configured channel does
+not prove delivery. Port 22 accepts private/link-local and VPN CGNAT
+`100.64.0.0/10` sources, not global IPv6; a matching range does not establish
+trust. The menu permits selected diagnostics and restarting the local model
+or gateway. Restarting the gateway closes the window and disconnects SSH.
+
+An unconfirmed close stays visible as a warning. Expand Maintenance history
+for recent window fingerprints and connection events. The UI polls every
+30 seconds, so an expiry or device-side close may appear on the next poll.
+The complete OS image and real SSH/notification flow are not yet verified;
+this is an unreleased interface, not acceptance of the assembled device.

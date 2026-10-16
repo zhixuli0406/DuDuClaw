@@ -31,6 +31,7 @@ export function ConfirmDialog({
   requireText,
   requireTextHint,
   busy,
+  confirmDisabled,
   children,
 }: {
   open: boolean;
@@ -44,6 +45,9 @@ export function ConfirmDialog({
   requireText?: string;
   requireTextHint?: string;
   busy?: boolean;
+  /** Extra condition that keeps the confirm button disabled (e.g. a required
+   *  field in `children` is still empty). Additive; defaults to false. */
+  confirmDisabled?: boolean;
   /** Optional extra controls rendered between the message and the
    *  type-to-confirm input (e.g. a checkbox for a destructive action's
    *  optional side effect). Additive — every existing caller that doesn't
@@ -58,7 +62,7 @@ export function ConfirmDialog({
     if (open) setTyped('');
   }, [open]);
 
-  const canConfirm = !busy && (!requireText || typed.trim() === requireText.trim());
+  const canConfirm = !busy && !confirmDisabled && (!requireText || typed.trim() === requireText.trim());
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) onClose(); }}>

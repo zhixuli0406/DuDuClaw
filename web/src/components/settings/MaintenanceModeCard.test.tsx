@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { act, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { MaintenanceModeCard } from './MaintenanceModeCard';
@@ -117,4 +117,96 @@ describe('<MaintenanceModeCard>', () => {
     await user.click(dialogConfirm);
     await waitFor(() => expect(disable).toHaveBeenCalledTimes(1));
   });
+});
+
+const SSH_STATUS: MaintenanceStatus = {
+  ...INACTIVE_STATUS,
+  ssh: {
+    supported: true, reachable: true, reason: null, ready: true, key_installed: false,
+    key_fingerprint: null, window_id: null, expires_in_s: null, fallback_timer_active: false,
+    active_sessions: 0, sessions: [], auth_failures: 0, event_overflow: 0,
+    pending_cleanup: false, pending_audit: false, problems: [], host_key_fingerprints: [], last_close: null,
+  },
+};
+describe('keyed SSH window', () => {
+  it('clears pasted private keys immediately and never sends them', async () => {
+    vi.spyOn(api.maintenance, 'status').mockResolvedValue(SSH_STATUS);
+    const enable = vi.spyOn(api.maintenance, 'enable');
+    const user = userEvent.setup();
+    renderWithProviders(<MaintenanceModeCard />);
+    await user.click(await screen.findByRole('button', { name: /turn on maintenance mode/i }));
+    await user.click(screen.getByRole('checkbox', { name: /remote technical support/i }));
+    const field = screen.getByLabelText('Technician public key');
+    await user.click(field);
+    await user.paste('-----BEGIN OPENSSH PRIVATE KEY-----\nsecret');
+    expect(field).toHaveValue('');
+    expect(screen.getByText(/private key was cleared/i)).toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText('MAINTENANCE'), 'MAINTENANCE');
+    expect(screen.getAllByRole('button', { name: /turn on maintenance mode/i }).at(-1)).toBeDisabled();
+    expect(enable).not.toHaveBeenCalled();
+  });
+  it('disables unknown SSH support', async () => {
+    vi.spyOn(api.maintenance, 'status').mockResolvedValue(INACTIVE_STATUS);
+    const user = userEvent.setup();
+    renderWithProviders(<MaintenanceModeCard />);
+    await user.click(await screen.findByRole('button', { name: /turn on maintenance mode/i }));
+    expect(screen.getByRole('checkbox', { name: /remote technical support/i })).toHaveAttribute('aria-disabled', 'true');
+  });
+  it('lets an Admin deselect SSH when support becomes unknown while the dialog is open', async () => {
+    vi.spyOn(api.maintenance, 'status').mockResolvedValue(SSH_STATUS);
+    const enable = vi.spyOn(api.maintenance, 'enable').mockResolvedValue({ window: ACTIVE_STATUS.window! });
+    const user = userEvent.setup();
+    renderWithProviders(<MaintenanceModeCard />);
+    await user.click(await screen.findByRole('button', { name: /turn on maintenance mode/i }));
+    const ssh = screen.getByRole('checkbox', { name: /remote technical support/i });
+    await user.click(ssh);
+    await user.type(screen.getByPlaceholderText('MAINTENANCE'), 'MAINTENANCE');
+    act(() => useMaintenanceStore.setState({ status: INACTIVE_STATUS }));
+    expect(ssh).toBeChecked();
+    expect(ssh).not.toHaveAttribute('aria-disabled', 'true');
+    await user.click(ssh);
+    expect(ssh).not.toBeChecked();
+    expect(ssh).toHaveAttribute('aria-disabled', 'true');
+    await user.click(screen.getAllByRole('button', { name: /turn on maintenance mode/i }).at(-1)!);
+    await waitFor(() => expect(enable).toHaveBeenCalledWith(expect.objectContaining({ subCapabilities: ['show_details'] })));
+    expect(enable.mock.calls[0][0]).not.toHaveProperty('sshPublicKey');
+  });
+  it('honors the server reauthentication lock', async () => {
+    vi.spyOn(api.maintenance, 'status').mockResolvedValue({ ...SSH_STATUS, reauth: { locked: true, retry_after_seconds: 900 } });
+    renderWithProviders(<MaintenanceModeCard />);
+    expect(await screen.findByText(/Try again in 15 minutes/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /turn on maintenance mode/i })).toBeDisabled();
+  });
+  it.each([true, false])('uses the correct verification advice for push=%s', async (push) => {
+    vi.spyOn(api.maintenance, 'status').mockResolvedValue({ ...SSH_STATUS, ...ACTIVE_STATUS, push_channel_available: push });
+    renderWithProviders(<MaintenanceModeCard addresses={['192.168.1.2']} />);
+    expect(await screen.findByText('ssh duduclaw-maint@192.168.1.2')).toBeInTheDocument();
+    expect(screen.getByText(push ? /Compare both fingerprints with the Admin notification/ : /This dashboard alone cannot verify/)).toBeInTheDocument();
+    expect(screen.getByText(/100.64.0.0\/10/)).toBeInTheDocument();
+  });
+  it('warns about an unconfirmed SSH close', async () => {
+    vi.spyOn(api.maintenance, 'status').mockResolvedValue({ ...SSH_STATUS, close_unconfirmed: true });
+    renderWithProviders(<MaintenanceModeCard />);
+    expect(await screen.findByText(/SSH closure could not be confirmed/)).toBeInTheDocument();
+  });
+});
+
+it('sends only the selected public key and displays a server refusal without closing the dialog', async () => {
+  vi.spyOn(api.maintenance, 'status').mockResolvedValue(SSH_STATUS);
+  const enable = vi.spyOn(api.maintenance, 'enable').mockRejectedValue({ code: 'gateway_not_owner' });
+  const user = userEvent.setup();
+  renderWithProviders(<MaintenanceModeCard />);
+  await user.click(await screen.findByRole('button', { name: /turn on maintenance mode/i }));
+  await user.click(screen.getByRole('checkbox', { name: /remote technical support/i }));
+  // A complete wire-format Ed25519 public key (the server remains authoritative).
+  const type = 'ssh-ed25519';
+  const bytes = String.fromCharCode(0, 0, 0, type.length) + type + String.fromCharCode(0, 0, 0, 32) + 'x'.repeat(32);
+  const key = `ssh-ed25519 ${btoa(bytes)}`;
+  await user.click(screen.getByLabelText('Technician public key'));
+  await user.paste(key);
+  await user.type(screen.getByPlaceholderText('MAINTENANCE'), 'MAINTENANCE');
+  await user.click(screen.getAllByRole('button', { name: /turn on maintenance mode/i }).at(-1)!);
+  await waitFor(() => expect(enable).toHaveBeenCalledWith(expect.objectContaining({ sshPublicKey: key, subCapabilities: ['ssh', 'show_details'] })));
+  expect(await screen.findByText(/Another gateway process owns this device/)).toBeInTheDocument();
+  expect(screen.getByRole('dialog')).toBeInTheDocument();
 });
