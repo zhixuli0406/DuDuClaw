@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- 新 crate `duduclaw-maint-tools`，給 DuDuClaw OS 維修 SSH 帳號 `duduclaw-maint`（uid 4800）用的兩個程式。要等 OS 映像裝上這個帳號才用得到，平台發行檔不打包，由 OS recipe 建置；說明見 `crates/duduclaw-maint-tools/README.md`。
+  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會先提醒這會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。`SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。兩個重啟不在選單裡執行，而是請 helper 代做。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
+  - `duduclaw-maint-helper`：以 root 執行、每條連線一個實例的小服務，socket 是 `/run/duduclaw-maint-helper.sock`。對端 uid 由 `SO_PEERCRED` 取得，不是 4800 就拒絕；只收六個字：`gateway`、`gateway-follow`、`model`、`model-follow`、`restart-gateway`、`restart-model`。
+    - 紀錄：以 `journalctl -o json` 依 `_SYSTEMD_UNIT` 與 `_UID=1000` 篩選。`MESSAGE` 任一行去掉前置空白後以 `password:` 開頭（不分大小寫）的整筆丟掉，這是 gateway 首次開機印出的一次性密碼；其餘去控制字元、遮罩憑證、截成 4 KiB 後輸出。非 follow 最多 1000 行，超過 64 KiB 的紀錄跳過；請求要在 10 秒內送完，用戶端 30 秒不讀就斷線，follow 在用戶端斷線時立刻停止。
+    - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；目錄要是 root 擁有的 0700、狀態檔要是 root 擁有的 0600 單一連結一般檔，不符或讀寫失敗就拒絕；狀態檔時間在未來時改寫成現在並記一筆警告，不會卡到重開機）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
 - 維修模式的 SSH 改用專用帳號加臨時金鑰，這次先做完 OS 端輔助程式 `duduclaw-sysd` 的部分（閘道與儀表板在後續 PR）。要等 DuDuClaw OS 出貨 `duduclaw-maint` 帳號後才會生效，在那之前使用者看不到任何改變。內容：
   - 新指令 `ssh_maint_open`、`ssh_maint_status`（sysd 指令從 18 個變 20 個）。開窗時只收一把公鑰：Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元的 RSA（指數為奇數、不超過 64 位元）。輔助程式自己解碼並逐欄檢查，拒絕金鑰前的選項、憑證、私鑰、PuTTY 與 RFC 4716 區塊、一次多把；寫進檔案的只有固定選項（禁止轉送埠、agent、X11）加上解碼後的原始金鑰。
   - 金鑰檔放在重開機就清空的 `/run/duduclaw-maint-ssh/`，寫入時不跟隨符號連結，已有金鑰時不覆蓋（回 `busy`），寫完讀回比對。
@@ -16,6 +21,7 @@
 - npm 包裝補上安裝、獨立 MCP 模式與文件入口的 README；六個 npm manifest 的 repository URL 改為 npm 標準的 `git+https` 格式。既有 1.74.0 不會因此改變，須隨下一次 npm 發布上線。
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。
+- 憑證遮罩 `secret_redact`（`redact_secrets`、`mask_secret`、`redact_opt`）從 `duduclaw-gateway` 搬到 `duduclaw-core`，讓紀錄服務不必連結 gateway。`duduclaw_gateway::secret_redact` 改成轉出同一份實作，呼叫端不用改，行為不變（原有 14 個測試隨程式碼搬到 core，照常通過）。
 - 訂閱登入風險說明裡的 OpenAI 段落不再寫「立場不明」。OpenAI 已有官方的 Sign in with ChatGPT 計畫（[條款](https://openai.com/policies/sign-in-with-chatgpt-terms/) 2026-09-29 版、[快速入門](https://developers.openai.com/siwc/quickstart)、[說明文章](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)，2026-10-16 查閱）：在第三方應用程式使用 ChatGPT 方案開放給開源合作夥伴與選定的商業合作夥伴，商業產品要先取得 OpenAI 同意，驗證 token 只能存在使用者自己掌控的本機。Codex 登入彈窗、gateway 拒絕訊息與稽核列的 `policy_url` 改連到這份條款（原為 OpenAI 使用條款）；`runtime_catalog.rs` 的 Codex `tos_note`、三語 `docs/features/13-multi-runtime.md` 與 `docs/guides/docker.md` 的 Codex 段落同步改寫，Docker 的 ChatGPT 登入方法另註明 token 存在容器 volume、伺服器部署請優先用 API key。建議仍是 API key。xAI 沒有重新查證，維持「立場不明」。
 - Gemini CLI 的條款提示（`tos_note`、風險說明、三語文件）補上 Google [停用公告](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）的內容：自 2026-06-18 起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API key（Gemini API 或企業方案）仍可使用。Gemini CLI runtime 的棄用時程不變（v1.75.0 移除）。
 

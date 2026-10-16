@@ -1,0 +1,34 @@
+[package]
+name = "duduclaw-maint-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Fixed command menu and root helper (filtered journal, two fixed restarts) for the DuDuClaw OS maintenance SSH account (duduclaw-maint, uid 4800). Built by the OS image, not shipped in platform release artifacts."
+
+[[bin]]
+name = "duduclaw-maint-shell"
+path = "src/bin/maint_shell.rs"
+
+[[bin]]
+name = "duduclaw-maint-helper"
+path = "src/bin/maint_helper.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# `secret_redact::redact_secrets` and `text_utils::truncate_bytes`. Nothing
+# else from core is used; the linker drops the rest.
+duduclaw-core = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
