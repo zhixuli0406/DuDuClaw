@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/zhixuli0406/DuDuClaw.git",
+    "url": "git+https://github.com/zhixuli0406/DuDuClaw.git",
     "directory": "npm/duduclaw"
   },
   "homepage": "https://github.com/zhixuli0406/DuDuClaw#readme",

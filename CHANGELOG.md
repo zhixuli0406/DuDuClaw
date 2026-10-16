@@ -13,6 +13,7 @@
   - 尚未驗證（要等 OS 映像在 QEMU 上跑活測）：systemd、nftables、dropbear、journald 的真實輸出格式，systemd-run 同時帶單調與絕對時間的計時器，sysd 單次重啟時 dropbear 是否保持運作。
 
 ### Changed
+- npm 包裝補上安裝、獨立 MCP 模式與文件入口的 README；六個 npm manifest 的 repository URL 改為 npm 標準的 `git+https` 格式。既有 1.74.0 不會因此改變，須隨下一次 npm 發布上線。
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。
 - 訂閱登入風險說明裡的 OpenAI 段落不再寫「立場不明」。OpenAI 已有官方的 Sign in with ChatGPT 計畫（[條款](https://openai.com/policies/sign-in-with-chatgpt-terms/) 2026-09-29 版、[快速入門](https://developers.openai.com/siwc/quickstart)、[說明文章](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)，2026-10-16 查閱）：在第三方應用程式使用 ChatGPT 方案開放給開源合作夥伴與選定的商業合作夥伴，商業產品要先取得 OpenAI 同意，驗證 token 只能存在使用者自己掌控的本機。Codex 登入彈窗、gateway 拒絕訊息與稽核列的 `policy_url` 改連到這份條款（原為 OpenAI 使用條款）；`runtime_catalog.rs` 的 Codex `tos_note`、三語 `docs/features/13-multi-runtime.md` 與 `docs/guides/docker.md` 的 Codex 段落同步改寫，Docker 的 ChatGPT 登入方法另註明 token 存在容器 volume、伺服器部署請優先用 API key。建議仍是 API key。xAI 沒有重新查證，維持「立場不明」。
