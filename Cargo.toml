@@ -38,6 +38,7 @@ members = [
     "crates/duduclaw-relay",
     "crates/duduclaw-sysd",
     "crates/duduclaw-db",
+    "crates/duduclaw-maint-tools",
 ]
 
 [workspace.package]
