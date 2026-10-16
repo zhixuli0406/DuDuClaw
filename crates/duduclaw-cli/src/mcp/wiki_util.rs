@@ -306,20 +306,13 @@ pub(crate) fn validate_wiki_frontmatter(content: &str) -> std::result::Result<()
     Ok(())
 }
 
-/// Validate a wiki page path: no traversal, must end with .md, not reserved.
+/// Validate a wiki page path for a write, delete or share: the shared
+/// string-level validator (`duduclaw_memory::wiki_path`, also used by
+/// `WikiStore`: relative only, no NUL / `..` / encoded separators / Windows
+/// drive prefix / Prefix, RootDir or ParentDir component), plus `.md` and not
+/// a reserved file.
 pub(crate) fn validate_wiki_page_path(page_path: &str) -> std::result::Result<(), String> {
-    if page_path.is_empty() {
-        return Err("page_path is required".to_string());
-    }
-    if page_path.contains("..") {
-        return Err("Path traversal (..) is not allowed".to_string());
-    }
-    if page_path.starts_with('/') || page_path.starts_with('\\') {
-        return Err("Absolute paths are not allowed".to_string());
-    }
-    if !page_path.ends_with(".md") {
-        return Err("Page path must end with .md".to_string());
-    }
+    validate_wiki_read_path(page_path)?;
     // Check reserved filenames
     let filename = std::path::Path::new(page_path)
         .file_name()
@@ -332,6 +325,28 @@ pub(crate) fn validate_wiki_page_path(page_path: &str) -> std::result::Result<()
         ));
     }
     Ok(())
+}
+
+/// Validate a wiki page path for a read: the same shared validator and the
+/// `.md` suffix, but reserved files (`_index.md`, `_schema.md`, `_log.md`)
+/// may be read. Runs before the path touches the disk.
+pub(crate) fn validate_wiki_read_path(page_path: &str) -> std::result::Result<(), String> {
+    duduclaw_memory::wiki_path::validate_relative_wiki_path(page_path)?;
+    if !page_path.ends_with(".md") {
+        return Err("Page path must end with .md".to_string());
+    }
+    Ok(())
+}
+
+/// Map a no-follow read error to the tool message. `NotFound` keeps the
+/// "page not found" wording; every other failure (symlink, escape, not a
+/// regular file, unreadable) is a refusal and does not reveal which.
+pub(crate) fn wiki_read_error(page_path: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!("Page not found: {page_path}"),
+        std::io::ErrorKind::InvalidInput => format!("Invalid page path: {e}"),
+        _ => "Page path refused: it must be a regular file inside the wiki directory".to_string(),
+    }
 }
 
 /// Extract title from YAML frontmatter (best-effort, no YAML parser dependency).
@@ -440,10 +455,17 @@ pub(crate) fn collect_md_files(base: &Path, dir: &Path) -> Vec<std::path::PathBu
         Err(_) => return result,
     };
     for entry in entries.flatten() {
+        // `DirEntry::file_type` does not follow symlinks: a link to a
+        // directory or file outside the wiki is skipped, never listed or read
+        // (same rule as `WikiStore`'s own scan).
+        let Ok(ftype) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if ftype.is_dir() {
             result.extend(collect_md_files(base, &path));
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md")
+        } else if ftype.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some("md")
             && let Ok(rel) = path.strip_prefix(base)
         {
             // Skip reserved files

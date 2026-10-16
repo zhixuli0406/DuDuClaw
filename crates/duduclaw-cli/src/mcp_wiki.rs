@@ -180,6 +180,12 @@ pub fn validate_wiki_path(path: &str) -> Result<(), WikiError> {
         });
     }
 
+    // The validator every wiki surface shares (NUL, drive prefixes, Prefix /
+    // RootDir / ParentDir components, encoded separators).
+    if let Err(reason) = duduclaw_memory::wiki_path::validate_relative_wiki_path(path) {
+        return Err(WikiError::InvalidPath { reason });
+    }
+
     if path.contains("..") {
         return Err(WikiError::InvalidPath {
             reason: "path traversal ('..') is not allowed".to_string(),

@@ -58,13 +58,15 @@ pub(crate) const CLOSED_WORLD_TOOLS: &[&str] = &[
 
 /// `modify`-class tools that only add or regenerate: they never overwrite or
 /// remove anything a person wrote (`memory_store` inserts, a profile fact is
-/// superseded with its history kept, an export or FTS index is derived
-/// data). They advertise `destructiveHint: false`. `memory_alias_add` is not
-/// here: it upserts, so re-adding an alias re-points it.
+/// superseded with its history kept, the FTS index is derived data nobody
+/// edits). They advertise `destructiveHint: false`. `memory_alias_add` is not
+/// here: it upserts, so re-adding an alias re-points it. `wiki_export` is not
+/// here either: it overwrites the previous `exports/<agent>-wiki.html` or the
+/// files of the Obsidian vault in place, and a person may have edited that
+/// vault since the last export.
 pub(crate) const ADDITIVE_MODIFY_TOOLS: &[&str] = &[
     "memory_store",
     "user_profile_record",
-    "wiki_export",
     "wiki_rebuild_fts",
 ];
 
@@ -175,6 +177,17 @@ mod tests {
         assert_eq!(a["destructiveHint"], true);
         assert!(a.get("idempotentHint").is_none());
         assert_eq!(tool_annotations("wiki_share")["destructiveHint"], true);
+
+        // Overwrites the previous export (an Obsidian vault a person may
+        // have edited): destructive, but repeating it gives the same files.
+        let a = tool_annotations("wiki_export");
+        assert_eq!(a["destructiveHint"], true);
+        assert_eq!(a["idempotentHint"], true);
+
+        // Rotates the internal MCP key when old: admin, not read-only.
+        let a = tool_annotations("os_doctor_repair");
+        assert_eq!(a["readOnlyHint"], false);
+        assert_eq!(a["destructiveHint"], true);
 
         // A tool that reaches outside keeps the open-world default.
         assert!(
