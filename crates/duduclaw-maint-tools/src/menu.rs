@@ -821,15 +821,18 @@ mod tests {
 
     #[test]
     fn resources_and_network_use_fixed_argv() {
+        // The mock resolves paths with Path::join, whose separator is native
+        // to the test host; the fixed command arguments stay byte-for-byte.
+        let program = |name: &str| Path::new("/usr/bin").join(name).display().to_string();
         let mut r = Recorder::default();
         run_command_mode("resources", &mut r);
         assert_eq!(
             r.runs,
             vec![
-                vec!["/usr/bin/uptime".to_string()],
-                vec!["/usr/bin/free".into(), "-m".into()],
+                vec![program("uptime")],
+                vec![program("free"), "-m".into()],
                 vec![
-                    "/usr/bin/df".into(),
+                    program("df"),
                     "-h".into(),
                     "/".into(),
                     "/data".into()
@@ -848,8 +851,8 @@ mod tests {
         assert_eq!(
             r.runs,
             vec![
-                vec!["/usr/bin/ip".to_string(), "-brief".into(), "address".into()],
-                vec!["/usr/bin/ip".into(), "route".into()],
+                vec![program("ip"), "-brief".into(), "address".into()],
+                vec![program("ip"), "route".into()],
             ]
         );
     }
