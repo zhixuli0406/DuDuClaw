@@ -272,7 +272,7 @@ mod tests {
     fn refusal_names_the_vendor_of_the_call() {
         use duduclaw_core::subscription_risk as sr;
         for (provider, url) in [
-            ("codex", sr::OPENAI_TERMS_URL),
+            ("codex", sr::OPENAI_SIWC_TERMS_URL),
             ("gemini", sr::GEMINI_CLI_TERMS_URL),
             ("antigravity", sr::ANTIGRAVITY_TERMS_URL),
             ("grok", sr::XAI_TERMS_URL),
@@ -303,7 +303,7 @@ mod tests {
         let rows = duduclaw_security::audit::read_recent_events(home.path(), 10);
         assert_eq!(
             rows[0].details["policy_url"],
-            duduclaw_core::subscription_risk::OPENAI_TERMS_URL
+            duduclaw_core::subscription_risk::OPENAI_SIWC_TERMS_URL
         );
     }
 
