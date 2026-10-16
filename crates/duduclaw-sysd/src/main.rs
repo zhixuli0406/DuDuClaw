@@ -98,6 +98,14 @@ async fn main() -> anyhow::Result<()> {
         info!(floor = ?floor, "sysd: rollback floor");
         duduclaw_sysd::rollback_floor::set_floor(floor);
     }
+    // Maintenance SSH: take SSH_LOCK before the socket accepts anything, so
+    // the startup cleanup of a window left by a previous run (R5) happens
+    // before any SSH verb; the same task then runs the 15 s tick (R4).
+    #[cfg(unix)]
+    {
+        let first = duduclaw_sysd::maint_ssh::SSH_LOCK.lock().await;
+        tokio::spawn(duduclaw_sysd::maint_ssh::run_supervisor(first));
+    }
     info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, require_main_pid_of = ?require_main_pid_of, "sysd: starting");
     let listener = bind(&socket_path, allowed_uid)?;
     info!(socket = %socket_path.display(), "sysd: listening");

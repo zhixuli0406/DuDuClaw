@@ -107,7 +107,7 @@ compositor 與 shell，附鎖定畫面、首次啟動精靈，還有一個能從
 - **需要 root 的操作走一個指令清單固定的小 helper。** 需要 root 權限的
   操作（重開機、關機、套用或回滾 OS 更新、恢復原廠設定、網路與時間設定）
   交給獨立的 helper `duduclaw-sysd` 處理。它只透過本機 Unix socket 接受
-  18 個固定指令，動手之前先檢查呼叫端的使用者 id；沒有設定允許的呼叫端
+  20 個固定指令（平台 v1.74.0 以前是 18 個），動手之前先檢查呼叫端的使用者 id；沒有設定允許的呼叫端
   時，所有請求一律拒絕。從 DuDuClaw OS v0.4.0（內嵌平台 v1.73.4）起，
   gateway 以自己的非 root 帳號（`duduclaw`，uid 1000）執行，helper 只接
   受 gateway 主行程的請求，安裝 OS 更新前自己驗證簽章、雜湊與版本，也拒
@@ -125,6 +125,11 @@ compositor 與 shell，附鎖定畫面、首次啟動精靈，還有一個能從
   `maintenance_tcp_ports` 集合；維護視窗關閉時停掉 dropbear、結束所有連
   線行程並移除 22 埠。目前映像上還沒有能經由 SSH 登入的帳號（root 已鎖
   定，dropbear 也禁止 root 登入），所以這個開關目前只能控制連接埠。
+  尚未發版的平台程式碼（CHANGELOG `[Unreleased]`）加入維修登入的
+  helper 端：專用帳號 `duduclaw-maint`（uid 4800）加上每個視窗一把公鑰，
+  由 helper 檢查、安裝，視窗關閉時移除，並有自己的期限與稽核檔（見
+  [安全防禦](05-security-defense.md)）。要等 OS 映像帶上這個帳號才會
+  生效；在那樣的映像上，helper 會拒絕舊的只開埠開關。
   v0.3.0 以前的映像，dropbear 開機就在 22 埠監聽。桌面版防火牆沒有放行
   它，從網路連不到 SSH；基礎版沒有防火牆，dropbear 與儀表板連接埠在區網
   上都連得到。這些映像內嵌平台 v1.73.1 以前的版本，而平台 v1.73.2 以前

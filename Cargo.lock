@@ -2234,7 +2234,9 @@ name = "duduclaw-sysd"
 version = "1.74.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
+ "duduclaw-core",
  "libc",
  "minisign",
  "minisign-verify",
