@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zhixuli0406/DuDuClaw.git",
+    "url": "git+https://github.com/zhixuli0406/DuDuClaw.git",
     "directory": "npm/darwin-x64"
   },
   "os": [
