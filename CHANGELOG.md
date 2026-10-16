@@ -33,14 +33,14 @@
 - 外掛與發行素材換新圖示：Chrome 擴充（32／64／128 圖示、設定頁與側邊欄配色）、VS Code（`media/icon.png`；側欄容器改用單色貓 `media/duduclaw-mark.svg`，取代 `media/paw.svg`）、Stream Deck（`imgs/icon.png`，狀態鍵標題拿掉 🐾）、Obsidian（以 `addIcon` 註冊單色貓 `duduclaw-cat`，取代 lucide 的 `paw-print`）、WordPress 聊天元件（浮動按鈕改成海軍藍底加貓 mark、配色更新、尾註拿掉 🐾）、ACP registry 的 16×16 單色 `icon.svg`、板模畫廊、官網 demo 嵌入片段、Odoo 連線測試訊息、問題回報頁。
 - 三語 README 標題改為 `# DuDuClaw`，下方加上品牌橫幅；press kit 的 `paw-transparent.*` 換成 `marketing/press-kit/logos/`（mark SVG、512／1024 PNG、avatar、橫式 logo）。
 - 公司英文名稱統一為 Dudu Technology Ltd.：About 頁與 `about.get` 回傳的 `vendor.name_en`、README 維護者欄、三語白標指南，以及外掛與發行套件的作者欄位（Obsidian、Stream Deck、WordPress 外掛、Claude marketplace、Odoo、ACP registry、Umbrel、六個入門 pack 與 `expert team-convert` 產出的 `author`）。中文登記名稱「嘟嘟數位科技有限公司」不變。
-
-### Removed
-- `web/public/paw-source.svg` 與 `paw-1024.png`（舊 🐾 app icon 來源，已沒有任何地方引用）。
 - `os_doctor_repair` 的效果分類從 `read` 改成 `admin`：它除了回報，還會在全新安裝時建立、在過期時輪替閘道內部用的 MCP 金鑰，並啟動一個 `mcp-server` 子行程。MCP 的 `readOnlyHint` 因此變成 `false`，探索模式與只放行 `read` 的 `action_rules` 不再允許它。`odoo_connect` 檢查後維持 `read`：它只重讀已設定的 Odoo 連線並重新登入自己的連線槽，不寫檔也不改 Odoo 資料，而且所有 Odoo 讀取工具都要先呼叫它。
 - `wiki_export` 的 `destructiveHint` 改為 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault。`idempotentHint` 維持 `true`。
 
 ### Deprecated
 - Gemini CLI runtime（`gemini`）的移除再延到 **v1.75.0**（原訂 v1.74.0）：移除的前提是用真的 Gemini API key 重新驗證 Antigravity，這件事還沒做。執行期警告、儀表板與 `docs/guides/deprecations.md`（三語）同步改成 v1.75.0。Gemini API provider 不受影響。
+
+### Removed
+- `web/public/paw-source.svg` 與 `paw-1024.png`（舊 🐾 app icon 來源，已沒有任何地方引用）。
 
 ### Fixed
 - `duduclaw doctor` 的「任務沙箱」與「電腦操作」在容器引擎沒有套用資源上限時，標題仍顯示 PASS（細節卻寫容器功能停用），只有已有員工開啟該功能時才變成警告。現在上限檢查失敗就一律警告：引擎忽略上限是主機或映像的問題，跟有沒有人在用無關。（DuDuClaw OS 0.4.0 實機驗證發現）
