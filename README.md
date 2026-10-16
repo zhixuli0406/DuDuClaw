@@ -14,6 +14,11 @@ DuDuClaw turns AI command-line tools such as Claude Code, Codex and Antigravity 
 
 All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain between twelve CLI backends (Claude Code, Codex, Antigravity, Grok and others; Gemini CLI is deprecated) or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
+<p align="center">
+  <img src="docs/assets/screenshots/dashboard-task-board-en.png" width="100%" alt="DuDuClaw v1.74.0 web dashboard, task board in list view: seven demo tasks grouped as To Do, In Progress, In Review, Done and Stuck, each with an ID, a tag such as support or marketing, and a priority">
+  <br><sub>The task board in the v1.74.0 dashboard. The staff and tasks are demo data.</sub>
+</p>
+
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.74.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
