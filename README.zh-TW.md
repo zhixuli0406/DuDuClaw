@@ -14,6 +14,11 @@ DuDuClaw 把 Claude Code、Codex、Antigravity 這類 AI 指令列工具，變�
 
 你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦可以在十二種 CLI 後端(Claude Code、Codex、Antigravity、Grok 等;Gemini CLI 已棄用)與任何 OpenAI 相容 API 之間隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
+<p align="center">
+  <img src="docs/assets/screenshots/dashboard-task-board-zh-TW.png" width="100%" alt="DuDuClaw v1.74.0 網頁管理後台的任務看板清單檢視：七件示範任務依待處理、進行中、驗收中、完成、卡住了分組，每件都有編號、客服或行銷等標籤與優先度">
+  <br><sub>v1.74.0 管理後台的任務看板，裡面的員工與任務是示範資料。</sub>
+</p>
+
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.74.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)

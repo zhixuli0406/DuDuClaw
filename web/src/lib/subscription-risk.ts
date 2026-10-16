@@ -21,7 +21,9 @@ export type SubscriptionVendor = 'anthropic' | 'openai' | 'gemini' | 'antigravit
  *  Mirrors the `*_URL` constants in `duduclaw_core::subscription_risk`. */
 export const VENDOR_TERMS_URL: Record<SubscriptionVendor, string | null> = {
   anthropic: ANTHROPIC_LEGAL_URL,
-  openai: 'https://openai.com/policies/terms-of-use/',
+  // Sign in with ChatGPT terms (2026-09-29): the program that governs ChatGPT
+  // plan use in third-party apps. Mirrors `OPENAI_SIWC_TERMS_URL`.
+  openai: 'https://openai.com/policies/sign-in-with-chatgpt-terms/',
   gemini: 'https://geminicli.com/docs/resources/tos-privacy/',
   antigravity: 'https://antigravity.google/terms',
   xai: 'https://x.ai/legal/terms-of-service',

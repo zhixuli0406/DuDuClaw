@@ -14,6 +14,11 @@ DuDuClaw は、Claude Code・Codex・Antigravity などの AI コマンドライ
 
 必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は 12 種類の CLI バックエンド(Claude Code・Codex・Antigravity・Grok など。Gemini CLI は非推奨)と任意の OpenAI 互換 API の間でいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
+<p align="center">
+  <img src="docs/assets/screenshots/dashboard-task-board-en.png" width="100%" alt="DuDuClaw v1.74.0 の Web ダッシュボード（英語表示）。タスクボードのリスト表示で、7 件のデモタスクが To Do、In Progress、In Review、Done、Stuck に分かれて並んでいる">
+  <br><sub>v1.74.0 ダッシュボードのタスクボード（英語表示）。AI社員とタスクはデモデータです。</sub>
+</p>
+
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.74.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)

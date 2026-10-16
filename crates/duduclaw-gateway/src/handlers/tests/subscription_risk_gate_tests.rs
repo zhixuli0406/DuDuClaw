@@ -290,7 +290,7 @@ async fn raw_config_adding_an_oauth_account_needs_the_flag() {
         .await;
     assert_refused(&res);
     assert!(
-        error_text(&res).contains(duduclaw_core::subscription_risk::OPENAI_TERMS_URL),
+        error_text(&res).contains(duduclaw_core::subscription_risk::OPENAI_SIWC_TERMS_URL),
         "{}",
         error_text(&res)
     );

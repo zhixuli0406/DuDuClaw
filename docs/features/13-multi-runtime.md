@@ -84,15 +84,38 @@ Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
   lists using the service in connection with products not provided by Google
   as abuse. DuDuClaw runs the
   unmodified CLIs; whether that falls under these clauses is Google's call.
-  Use an API key.
+  Google's [Gemini Code Assist for individuals deprecation notice](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)
+  (last updated 2026-10-09) adds that since 2026-06-18 Gemini CLI no longer
+  accepts Login with Google for Gemini Code Assist for individuals, Google AI
+  Pro and Google AI Ultra accounts; a paid API key (Gemini API or enterprise)
+  still works. Use an API key.
 - **Qwen** — the free OAuth tier was discontinued 2026-04-15. API key
   (ModelStudio / DashScope) only.
 - **OpenCode** — MIT with no restriction of its own, but it removed its
   Anthropic subscription plugin in 1.3.0 for the reason above. Use provider API
   keys.
-- **OpenAI** — policy on third-party products driving a ChatGPT subscription
-  login is unclear; the [Terms of Use](https://openai.com/policies/terms-of-use/)
-  still apply. API key is the supported path.
+- **OpenAI** — OpenAI runs an official Sign in with ChatGPT program
+  ([terms](https://openai.com/policies/sign-in-with-chatgpt-terms/), dated
+  2026-09-29). The [quickstart](https://developers.openai.com/siwc/quickstart)
+  says "Sign in with ChatGPT is currently available to selected commercial
+  partners through a limited trial." and "ChatGPT plan usage is available to
+  all open-source partners and selected private clients."; the
+  [help article](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)
+  says supported open-source tools remain available and commercial partners
+  apply through an interest form. A commercial product therefore needs
+  OpenAI's approval. The terms also say users must be able to use their
+  ChatGPT plan without paying the partner or upgrading, any persistent storage
+  of auth tokens must be local and user-controlled (not in remote or managed
+  environments), the login must not provide general API access for other tools
+  or unrelated requests, and violations may lead to suspension of Sign in with
+  ChatGPT access. OpenAI's Codex lead
+  [posted](https://x.com/thsottiaux/status/2097131394199896166) on 2026-09-08,
+  about a third-party app: "Sorry, but this is not an approved use of Sign in
+  With ChatGPT. We support pure OSS clients and others we have partnerships
+  with, but you need to reach out and talk to us for that." When DuDuClaw runs
+  on a remote host or in a container, the Codex token (`~/.codex/auth.json`)
+  is stored there. The [Terms of Use](https://openai.com/policies/terms-of-use/)
+  still apply. An API key is the path to rely on.
 - **xAI** — no published position on third-party products driving a
   SuperGrok / X Premium+ subscription was found; the
   [Terms of Service](https://x.ai/legal/terms-of-service) still apply.
@@ -587,7 +610,7 @@ Owner decision 2026-10-16: the subscription-login features stay as they are (set
 
 **What the notice says.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens. Signing in to the unmodified Claude Code binary with your own subscription is allowed, and Pro/Max usage limits assume ordinary usage. The Consumer Terms add that you may not make your account available to anyone else. Anthropic may enforce this without prior notice; account suspensions have been reported by press and users (reports, not an Anthropic statement). The notice names the DuDuClaw uses that conflict with the policy: one subscription serving other people (channel customers), rotating several subscriptions past the limits, and DuDuClaw storing the token. The notice never says the token is "blocked": `claude -p` with an OAuth token still works technically (v1.66.0).
 
-**Per vendor.** The full notice above is what Claude logins and Claude accounts show. Codex, Gemini CLI, Antigravity and Grok logins (and Add account's OAuth path with a non-Anthropic provider) show that vendor's own text and terms link instead, with the same checkbox: Google's Gemini CLI and Antigravity clauses quoted above; for OpenAI and xAI, that their position is unclear and their terms apply. An unknown provider gets a vendor-neutral notice with no link. Every sentence points at a vendor page; the earlier "Google has blocked server-side since 2026-03" sentence had no primary source and was removed. The vendor table lives in `duduclaw_core::subscription_risk::vendor_policy` (gateway, CLI) and `web/src/lib/subscription-risk.ts` (dashboard).
+**Per vendor.** The full notice above is what Claude logins and Claude accounts show. Codex, Gemini CLI, Antigravity and Grok logins (and Add account's OAuth path with a non-Anthropic provider) show that vendor's own text and terms link instead, with the same checkbox: Google's Gemini CLI and Antigravity clauses quoted above (the Gemini CLI text also names the 2026-06-18 end of Login with Google for individual, AI Pro and AI Ultra accounts); for OpenAI, the Sign in with ChatGPT program summarised above (open-source and approved commercial partners, tokens kept local) with a link to its terms; for xAI, that its position is unclear and its terms apply. An unknown provider gets a vendor-neutral notice with no link. Every sentence points at a vendor page; the earlier "Google has blocked server-side since 2026-03" sentence had no primary source and was removed. The vendor table lives in `duduclaw_core::subscription_risk::vendor_policy` (gateway, CLI) and `web/src/lib/subscription-risk.ts` (dashboard).
 
 **Where it shows.** The full disclosure with a checkbox opens before any credential step in the CLI login modal, the guided QR-code setup wizard, and the OAuth Token path of Add account. A one-line note with a link to the policy sits on the Welcome page's Claude subscription card (and on its "already signed in" card, the host-login adoption case), the runtime setup card's sign-in row, the Accounts page's subscription hero card, the one-click CLI picker, the CLI credentials list, the agent editor's API mode row when it is set to the subscription CLI, and the account pool picker when a subscription account is in the pool.
 

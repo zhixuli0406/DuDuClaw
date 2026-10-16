@@ -18,7 +18,7 @@ const ANTHROPIC = 'https://code.claude.com/docs/en/legal-and-compliance';
 describe('<CliLoginModal> risk disclosure', () => {
   it.each([
     ['claude', ANTHROPIC],
-    ['codex', 'https://openai.com/policies/terms-of-use/'],
+    ['codex', 'https://openai.com/policies/sign-in-with-chatgpt-terms/'],
     ['gemini', 'https://geminicli.com/docs/resources/tos-privacy/'],
     ['antigravity', 'https://antigravity.google/terms'],
     ['grok', 'https://x.ai/legal/terms-of-service'],
