@@ -535,7 +535,10 @@ pub enum SysdRequest {
     /// `expires_in_s`, `fallback_timer_active`, `ssh_active`, `sessions`,
     /// `events` (at most 200; logins and logouts kept first),
     /// `event_overflow`, `auth_failures`, `host_key_fingerprints`,
-    /// `pending_cleanup` and `problems`.
+    /// `pending_cleanup`, `pending_audit`, `last_close` (`null` or
+    /// `{"window_id": string|null, "trigger": "stop"|"deadline"|"startup_cleanup"|"reboot"|"firewall_changed"|"fallback_timer", "events_complete": bool, "events_lost": bool, "ts": unix-seconds}`),
+    /// `audit_backlog_lost` (`null` or `{"ts": unix-seconds}` when such a
+    /// record was written in the current boot) and `problems`.
     SshMaintStatus,
     /// `systemctl stop|restart duduclaw-llama-server.service`: the
     /// appliance's local model service, which the gateway (no longer root)

@@ -952,3 +952,102 @@ async fn logouts_written_while_dropbear_stops_are_still_recorded() {
     assert!(out.success, "{}", out.stderr);
     assert_eq!(e.audit_events(), ["open", "login", "logout", "close"]);
 }
+
+async fn status_json(state: &mut MaintState, host: &FakeHost, e: &Env) -> Value {
+    serde_json::from_str(&status(state, host, &e.cfg).await.unwrap().stdout).unwrap()
+}
+
+#[tokio::test]
+async fn status_reports_the_last_close() {
+    let e = env();
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    assert_eq!(status_json(&mut state, &host, &e).await["last_close"], Value::Null);
+    open_default(&mut state, &host, &e).await.unwrap();
+    assert!(close(&mut state, &host, &e.cfg, CloseTrigger::Stop).await.success);
+    let s = status_json(&mut state, &host, &e).await;
+    assert_eq!(
+        s["last_close"],
+        serde_json::json!({"window_id":"w-1","trigger":"stop","events_complete":true,"events_lost":false,"ts":1_760_600_000u64})
+    );
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(e.cfg.state_dir.join(LAST_CLOSE_FILE)).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(s["audit_backlog_lost"], Value::Null);
+}
+
+#[tokio::test]
+async fn last_close_follows_a_held_back_close_record() {
+    let e = env();
+    let host = FakeHost::new();
+    let mut state = MaintState::new();
+    open_default(&mut state, &host, &e).await.unwrap();
+    host.fail_journal.store(true, Ordering::SeqCst);
+    close(&mut state, &host, &e.cfg, CloseTrigger::Deadline).await;
+    host.fail_journal.store(false, Ordering::SeqCst);
+    let s = status_json(&mut state, &host, &e).await;
+    assert_eq!(s["last_close"]["trigger"], "deadline");
+    assert_eq!(s["last_close"]["events_complete"], false);
+    tick(&mut state, &host, &e.cfg).await;
+    let s = status_json(&mut state, &host, &e).await;
+    assert_eq!(s["last_close"]["events_complete"], true);
+    assert_eq!(s["last_close"]["events_lost"], false);
+}
+
+#[tokio::test]
+async fn a_fallback_timer_close_keeps_its_reason_through_the_startup_cleanup() {
+    let e = env();
+    let host = FakeHost::new();
+    let mut before = MaintState::new();
+    open_default(&mut before, &host, &e).await.unwrap();
+    // The OS script ran: key gone, its own last-close written.
+    std::fs::remove_file(e.key_path()).unwrap();
+    let p = e.cfg.state_dir.join(LAST_CLOSE_FILE);
+    std::fs::write(&p, br#"{"window_id":null,"trigger":"fallback_timer","events_complete":false,"events_lost":false,"ts":1760603700}"#).unwrap();
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let mut after = MaintState::new();
+    startup_cleanup(&mut after, &host, &e.cfg).await;
+    let s = status_json(&mut after, &host, &e).await;
+    assert_eq!(s["last_close"]["trigger"], "fallback_timer");
+    assert_eq!(s["last_close"]["window_id"], "w-1");
+    assert_eq!(s["last_close"]["events_complete"], true);
+}
+
+#[tokio::test]
+async fn a_bad_last_close_file_is_not_reported() {
+    let e = env();
+    let host = FakeHost::new();
+    std::fs::create_dir_all(&e.cfg.state_dir).unwrap();
+    std::fs::set_permissions(&e.cfg.state_dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let p = e.cfg.state_dir.join(LAST_CLOSE_FILE);
+    std::fs::write(&p, br#"{"window_id":"w x","trigger":"<script>","events_complete":true,"events_lost":false,"ts":1}"#).unwrap();
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let mut state = MaintState::new();
+    let s = status_json(&mut state, &host, &e).await;
+    assert_eq!(s["last_close"], Value::Null);
+    assert!(s["problems"][0].as_str().unwrap().contains("unknown trigger"));
+    // A known trigger with a malformed window id: the id is dropped.
+    std::fs::write(&p, br#"{"window_id":"w x","trigger":"stop","events_complete":true,"events_lost":false,"ts":1}"#).unwrap();
+    let s = status_json(&mut state, &host, &e).await;
+    assert_eq!(s["last_close"]["window_id"], Value::Null);
+    assert_eq!(s["last_close"]["trigger"], "stop");
+    // World-readable files are refused.
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    assert_eq!(status_json(&mut state, &host, &e).await["last_close"], Value::Null);
+}
+
+#[tokio::test]
+async fn status_reports_a_backlog_lost_in_this_boot_only() {
+    let e = env();
+    let host = FakeHost::new();
+    std::fs::create_dir_all(&e.cfg.state_dir).unwrap();
+    std::fs::set_permissions(&e.cfg.state_dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let p = e.cfg.state_dir.join(PENDING_FILE);
+    std::fs::write(&p, b"{broken").unwrap();
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let mut state = MaintState::new();
+    startup_cleanup(&mut state, &host, &e.cfg).await;
+    let s = status_json(&mut state, &host, &e).await;
+    assert_eq!(s["audit_backlog_lost"], serde_json::json!({"ts": 1_760_600_000u64}));
+    *host.boot_id.lock().unwrap() = "11111111-2222-4333-8444-555555555555".to_string();
+    assert_eq!(status_json(&mut state, &host, &e).await["audit_backlog_lost"], Value::Null);
+}

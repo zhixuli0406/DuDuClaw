@@ -212,6 +212,10 @@ pub(super) async fn load_pending<H: MaintHost>(host: &H, cfg: &MaintConfig) -> O
             match cfg.audit.append(vec![lost], None).await {
                 Ok(()) => {
                     let _ = dir.remove(PENDING_FILE);
+                    let mark = BacklogLost { ts, boot_id: host.boot_id().unwrap_or_default() };
+                    if let Err(e) = write_state_json(cfg, BACKLOG_LOST_FILE, &mark) {
+                        warn!(error = %e, "sysd: could not save the backlog-lost marker");
+                    }
                 }
                 Err(w) => warn!(error = %w, "sysd: could not record the lost maintenance SSH audit backlog"),
             }
@@ -245,6 +249,7 @@ async fn flush_pending_inner<H: MaintHost>(state: &mut MaintState, host: &H, cfg
         match replay {
             Ok(read) if read.complete => {
                 complete_close_records(&mut state.pending.records, &read.next, true, false);
+                update_last_close(cfg, &read.next.window_id, true, false);
                 state.pending.backfill = None;
             }
             Ok(read) => {
@@ -259,6 +264,7 @@ async fn flush_pending_inner<H: MaintHost>(state: &mut MaintState, host: &H, cfg
                 }
                 warn!(error = %e, "sysd: giving up on the remaining events of a closed maintenance SSH window");
                 complete_close_records(&mut state.pending.records, &bf.window, false, true);
+                update_last_close(cfg, &bf.window.window_id, false, true);
                 state.pending.backfill = None;
             }
         }
@@ -270,6 +276,48 @@ async fn flush_pending_inner<H: MaintHost>(state: &mut MaintState, host: &H, cfg
     }
     state.pending.reopen = None;
     Ok(())
+}
+
+/// Write a small JSON state file (root 0600) in [`STATE_DIR`].
+pub(super) fn write_state_json<T: Serialize>(cfg: &MaintConfig, name: &str, value: &T) -> Result<(), String> {
+    let dir = state_dir(cfg, true)?.ok_or_else(|| format!("{} is missing", cfg.state_dir.display()))?;
+    let body = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    dir.write_atomic(name, &body, cfg.state_owner, false).map_err(|e| e.to_string())
+}
+
+/// Read a small JSON state file; `Ok(None)` when it (or the directory) does
+/// not exist.
+pub(super) fn read_state_json<T: serde::de::DeserializeOwned>(cfg: &MaintConfig, name: &str) -> Result<Option<T>, String> {
+    let Some(dir) = state_dir(cfg, false)? else { return Ok(None) };
+    if !dir.exists(name).map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let raw = dir.read(name, cfg.state_owner, 4096).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&raw).map(Some).map_err(|e| format!("{name}: {e}"))
+}
+
+/// Validate a `last-close.json` read back (the OS script may write it too):
+/// a known trigger and a well-formed window id, or nothing.
+pub(super) fn sanitize_last_close(raw: LastClose) -> Result<LastClose, String> {
+    if !CLOSE_TRIGGERS.contains(&raw.trigger.as_str()) {
+        return Err(format!("{LAST_CLOSE_FILE} has an unknown trigger"));
+    }
+    let window_id = raw.window_id.filter(|id| validate_window_id(id).is_ok());
+    Ok(LastClose { window_id, ..raw })
+}
+
+/// After a held-back close record was finally written: bring `last_close`
+/// up to date if it is that window's.
+fn update_last_close(cfg: &MaintConfig, window_id: &str, events_complete: bool, events_lost: bool) {
+    let Ok(Some(mut last)) = read_state_json::<LastClose>(cfg, LAST_CLOSE_FILE) else { return };
+    if last.window_id.as_deref() != Some(window_id) {
+        return;
+    }
+    last.events_complete = events_complete;
+    last.events_lost = events_lost;
+    if let Err(e) = write_state_json(cfg, LAST_CLOSE_FILE, &last) {
+        warn!(error = %e, "sysd: could not update the last close");
+    }
 }
 
 fn complete_close_records(records: &mut [Value], w: &WindowFile, events_complete: bool, events_lost: bool) {

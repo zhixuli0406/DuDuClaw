@@ -3,7 +3,8 @@
 //! [`SSH_LOCK`] (or to own the state outright in tests).
 
 use super::events::{
-    fill_close_counters, flush_pending, ingest, load_pending, load_window, persist_pending, persist_window, remove_window_file, state_dir,
+    fill_close_counters, flush_pending, ingest, load_pending, load_window, persist_pending, persist_window, read_state_json, remove_window_file,
+    sanitize_last_close, state_dir, write_state_json,
 };
 use super::*;
 
@@ -344,6 +345,27 @@ pub async fn close<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintCo
         if let Err(e) = persist_pending(cfg, &state.pending) {
             problems.push(format!("saving pending audit work: {e}"));
         }
+        // A startup cleanup after the OS fallback timer already closed this
+        // window keeps the script's `fallback_timer` as the reason.
+        let ts = close_usec / 1_000_000;
+        let mut reason = trigger.as_str().to_string();
+        if matches!(trigger, CloseTrigger::StartupCleanup | CloseTrigger::Reboot) {
+            if let (Ok(Some(prev)), Some(w)) = (read_state_json::<LastClose>(cfg, LAST_CLOSE_FILE), w) {
+                if prev.trigger == "fallback_timer" && prev.ts >= w.opened_at_unix {
+                    reason = prev.trigger;
+                }
+            }
+        }
+        let last = LastClose {
+            window_id: w.map(|w| w.window_id.clone()),
+            trigger: reason,
+            events_complete,
+            events_lost: false,
+            ts,
+        };
+        if let Err(e) = write_state_json(cfg, LAST_CLOSE_FILE, &last) {
+            problems.push(format!("saving the last close: {e}"));
+        }
         info!(trigger = trigger.as_str(), problems = problems.len(), "sysd: maintenance SSH window closed");
     }
     // The window state goes last: until the pending work is saved it is the
@@ -409,6 +431,21 @@ pub async fn status<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintC
         .await
         .ok()
         .map(|o| o.stdout.trim() == "active");
+    let last_close = match read_state_json::<LastClose>(cfg, LAST_CLOSE_FILE).and_then(|o| o.map(sanitize_last_close).transpose()) {
+        Ok(l) => l,
+        Err(e) => {
+            problems.push(format!("last close unreadable: {e}"));
+            None
+        }
+    };
+    let audit_backlog_lost = match (read_state_json::<BacklogLost>(cfg, BACKLOG_LOST_FILE), host.boot_id()) {
+        (Ok(Some(b)), Ok(now)) if b.boot_id == now => Some(json!({ "ts": b.ts })),
+        (Err(e), _) => {
+            problems.push(format!("backlog marker unreadable: {e}"));
+            None
+        }
+        _ => None,
+    };
     let mut sessions: Vec<&Session> = state.sessions.values().collect();
     sessions.extend(state.unkeyed_sessions.iter());
     let w = state.window.as_ref();
@@ -427,6 +464,8 @@ pub async fn status<H: MaintHost>(state: &mut MaintState, host: &H, cfg: &MaintC
         "host_key_fingerprints": w.map(|w| w.host_key_fingerprints.clone()).unwrap_or_default(),
         "pending_cleanup": state.pending_cleanup,
         "pending_audit": !state.pending.is_empty(),
+        "last_close": last_close,
+        "audit_backlog_lost": audit_backlog_lost,
         "problems": problems,
     });
     Ok(SysdOpOutput { success: true, stdout: body.to_string(), stderr: String::new() })
