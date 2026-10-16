@@ -18,6 +18,7 @@
   - 拒絕時錯誤改成 `{code, message}`，代碼有 `ssh_key_required`、`ssh_key_invalid`（附 `reason`）、`reauth_failed`（附 `remaining_attempts`）、`reauth_locked`（附 `retry_after_seconds`）、`already_active`、`ssh_unsupported`、`ssh_unreachable`、`ssh_busy`（附 `reason`）、`ssh_rate_limited`、`ssh_open_failed` 等。sysd 回 `busy` 時不會送關閉去收回別人的視窗，只記 `open_failed` 並對帳一次。
   - TTL 到期改由閘道開機就啟動的獨立背景工作處理，不再跟著派工引擎（`[dispatch] enabled = false` 時也照常到期）。它開機時每 2 秒問一次 sysd、最多等 60 秒，關掉 sysd 手上沒有對應視窗的金鑰（記 `ssh_orphan_closed`）；之後每 30 秒問一次 sysd，把登入、登出、驗證失敗（依來源彙總）、選單操作抄進 `maintenance_audit.jsonl`（字串截長、去控制字元，當資料看），並在 sysd 自己收掉視窗時記 `ssh_closed_by_os`。
   - 在設備上關閉視窗時連不到 sysd，一律記成 `close_error` 並推播，不再當成「沒有東西要關」；`maintenance.status` 每次都問 sysd，回傳金鑰與本機指紋、到期秒數、目前連線、驗證失敗次數、`pending_cleanup`、`problems`，sysd 不可達時 `ssh_observed_active` 為 `null`，關閉沒被確認時 `close_unconfirmed` 為 true。
+  - sysd 若在狀態裡回報上一次關窗的原因（例如重開機 `reboot`、防火牆規則被改 `firewall_changed`、登入紀錄是否遺失），閘道會照抄一次進維修歷史（`ssh_os_close_record`），並放進 `maintenance.status` 的 `ssh.last_close`；目前的 sysd 還沒有回報這一欄，所以暫時看不到。重開機後 sysd 已自行收掉舊視窗時，閘道不會把它當成孤兒金鑰。
   - 尚未驗證：只用模擬的 sysd 測過，還沒有接上真的 sysd 與 OS 映像（要等 OS 的 PR 備妥後在 QEMU 活測）；推播只測了文字內容，沒有實際送到通道。
 
 ### Changed

@@ -972,6 +972,61 @@ async fn boot_closes_a_completed_window_as_a_restart_not_an_orphan() {
 }
 
 #[tokio::test]
+async fn after_a_reboot_sysd_reports_the_old_window_closed_by_reboot() {
+    let h = harness(Mode::Available);
+    let w = open_ssh_window(&h).await;
+    // sysd's startup cleanup already closed the window across the reboot.
+    let st = json!({"ready": true, "key_installed": false, "window_id": null, "ssh_active": false,
+        "last_close": {"window_id": w.id, "trigger": "reboot", "events_complete": false, "events_lost": true}});
+    h.sysd.set_status(ok(st.to_string()));
+    let revoked = revoke_on_boot(h.home.path()).await;
+    boot_reconcile(&h.env, revoked).await;
+    let all = events(h.home.path());
+    assert!(!all.iter().any(|e| e["kind"] == "ssh_orphan_closed"));
+    let rec: Vec<_> = all
+        .iter()
+        .filter(|e| e["kind"] == "ssh_os_close_record")
+        .collect();
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0]["trigger"], "reboot");
+    assert_eq!(rec[0]["events_lost"], true);
+    let restart = all
+        .iter()
+        .find(|e| e["kind"] == "gateway_restart_revoked")
+        .unwrap();
+    assert!(restart["close_error"].is_null());
+    // Seen again by the poll and by a later window: recorded only once.
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        events(h.home.path())
+            .iter()
+            .filter(|e| e["kind"] == "ssh_os_close_record")
+            .count(),
+        1
+    );
+    let s = status_json(&h.env, None).await.unwrap();
+    assert_eq!(s["ssh"]["last_close"]["trigger"], "reboot");
+    assert_eq!(s["close_unconfirmed"], false);
+}
+
+#[tokio::test]
+async fn an_os_close_carries_sysds_trigger() {
+    let h = harness(Mode::Available);
+    let w = open_ssh_window(&h).await;
+    h.sysd.set_status(ok(
+        json!({"ready": true, "key_installed": false, "window_id": null, "ssh_active": false,
+        "last_close": {"window_id": w.id, "trigger": "firewall_changed", "events_complete": true}})
+        .to_string(),
+    ));
+    poll_sysd(&h.env).await;
+    let line = events(h.home.path())
+        .into_iter()
+        .find(|e| e["kind"] == "ssh_closed_by_os")
+        .unwrap();
+    assert_eq!(line["os_trigger"], "firewall_changed");
+}
+
+#[tokio::test]
 async fn boot_off_the_appliance_only_closes_the_ledger() {
     let h = harness(Mode::Off);
     let store = MaintenanceStore::open(h.home.path()).unwrap();

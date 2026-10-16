@@ -253,8 +253,52 @@ pub struct StatusReply {
     /// event backfill); it refuses new opens with `busy` until it is written.
     #[serde(default)]
     pub pending_audit: bool,
+    /// The most recent close sysd recorded, when this sysd reports it
+    /// (optional: P-1 status does not carry it yet; the gateway shows it when
+    /// present).
+    #[serde(default)]
+    pub last_close: Option<LastClose>,
     #[serde(default)]
     pub problems: Vec<String>,
+}
+
+/// sysd's last close record, as far as the gateway uses it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LastClose {
+    #[serde(default)]
+    pub window_id: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub events_complete: Option<bool>,
+    #[serde(default)]
+    pub events_lost: Option<bool>,
+}
+
+impl LastClose {
+    /// The close trigger as one of the known tokens; anything else is
+    /// `other` (sysd text never reaches the dashboard as-is).
+    pub fn trigger_token(&self) -> &'static str {
+        match self.trigger.as_deref() {
+            Some("stop") => "stop",
+            Some("deadline") => "deadline",
+            Some("startup_cleanup") => "startup_cleanup",
+            Some("fallback_timer") => "fallback_timer",
+            Some("reboot") => "reboot",
+            Some("firewall_changed") => "firewall_changed",
+            None => "unknown",
+            Some(_) => "other",
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "window_id": sanitize_opt(&self.window_id),
+            "trigger": self.trigger_token(),
+            "events_complete": self.events_complete,
+            "events_lost": self.events_lost.unwrap_or(false),
+        })
+    }
 }
 
 impl StatusReply {
@@ -377,6 +421,18 @@ mod tests {
         assert!(closed.definitely_closed());
         assert_eq!(closed.observed_active(), Some(false));
         // key_installed unknown (null) is neither open nor definitely closed.
+        let rebooted = StatusReply::parse(
+            r#"{"key_installed":false,"last_close":{"window_id":"w0","trigger":"reboot","events_complete":false,"events_lost":true}}"#,
+        )
+        .unwrap();
+        let lc = rebooted.last_close.unwrap();
+        assert_eq!(lc.trigger_token(), "reboot");
+        assert_eq!(lc.to_json()["events_lost"], true);
+        let odd = LastClose {
+            trigger: Some("\u{1b}weird".into()),
+            ..Default::default()
+        };
+        assert_eq!(odd.trigger_token(), "other");
         let unknown = StatusReply::parse(r#"{"key_installed":null}"#).unwrap();
         assert!(!unknown.has_window() && !unknown.definitely_closed());
     }

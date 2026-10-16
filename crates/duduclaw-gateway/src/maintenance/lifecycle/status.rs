@@ -75,6 +75,7 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
             "event_overflow": 0,
             "pending_cleanup": false,
             "pending_audit": false,
+            "last_close": null,
             "problems": [],
             "host_key_fingerprints": [],
         })
@@ -157,6 +158,7 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
         "event_overflow": st.event_overflow,
         "pending_cleanup": st.pending_cleanup,
         "pending_audit": st.pending_audit,
+        "last_close": st.last_close.as_ref().map(|lc| lc.to_json()),
         "problems": st.problems.iter().map(|p| sanitize(p, PROBLEM_TEXT_MAX_CHARS)).collect::<Vec<_>>(),
         "host_key_fingerprints": st.host_key_fingerprints.iter().map(|f| sanitize(f, EVENT_TEXT_MAX_CHARS)).collect::<Vec<_>>(),
     });

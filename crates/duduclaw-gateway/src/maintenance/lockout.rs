@@ -122,7 +122,8 @@ impl MaintenanceStore {
     pub async fn forget_ssh_events_except(&self, keep: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "DELETE FROM maintenance_ssh_events WHERE ?1 IS NULL OR window_id <> ?1",
+            "DELETE FROM maintenance_ssh_events
+              WHERE (?1 IS NULL OR window_id <> ?1) AND window_id <> '__closes__'",
             params![keep],
         )
         .map_err(|e| format!("prune mirrored SSH events: {e}"))?;

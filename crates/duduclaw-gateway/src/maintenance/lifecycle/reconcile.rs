@@ -320,6 +320,11 @@ async fn revoke_if_closed_by_os(
         return;
     }
     let clean = !st.pending_cleanup && st.observed_active() == Some(false);
+    let os_trigger = st
+        .last_close
+        .as_ref()
+        .filter(|lc| lc.window_id.as_deref() == Some(row.id.as_str()))
+        .map(|lc| lc.trigger_token());
     let close_err = if clean { None } else { stop_ssh(sysd).await };
     match store.revoke_closed_by_os(&row.id).await {
         Ok(Some(w)) => {
@@ -329,7 +334,7 @@ async fn revoke_if_closed_by_os(
             }
             audit.record(
                 "ssh_closed_by_os",
-                json!({ "window_id": w.id, "key_fingerprint": w.ssh_key_fingerprint, "os_close_clean": clean, "close_error": close_err }),
+                json!({ "window_id": w.id, "key_fingerprint": w.ssh_key_fingerprint, "os_trigger": os_trigger, "os_close_clean": clean, "close_error": close_err }),
             );
             let _ = store.forget_ssh_events_except(None).await;
             info!(window_id = %w.id, clean, "maintenance: the OS closed the SSH window; ledger updated");
@@ -339,9 +344,42 @@ async fn revoke_if_closed_by_os(
     }
 }
 
+/// Dedup key space for sysd close records (one row per closed window, kept
+/// across windows by `forget_ssh_events_except`).
+const CLOSES_KEY: &str = "__closes__";
+
+/// Record sysd's last close once (trigger such as `reboot` or
+/// `firewall_changed`, and whether login records were lost), when sysd
+/// reports it.
+async fn mirror_last_close(
+    store: &MaintenanceStore,
+    audit: &MaintenanceAuditLog,
+    st: &StatusReply,
+) {
+    let Some(lc) = &st.last_close else { return };
+    let Some(window_id) = sanitize_opt(&lc.window_id) else {
+        return;
+    };
+    if !valid_cursor(&window_id) {
+        return;
+    }
+    match store.mark_ssh_event_seen(CLOSES_KEY, &window_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn!(error = %e, "maintenance: close-record dedup unavailable");
+            return;
+        }
+    }
+    let mut fields = lc.to_json();
+    fields["window_id"] = json!(window_id);
+    audit.record("ssh_os_close_record", fields);
+}
+
 /// Mirror new sysd events into `maintenance_audit.jsonl`, deduplicated by
 /// journal cursor per window. Every string is sanitised again here.
 async fn mirror_events(store: &MaintenanceStore, audit: &MaintenanceAuditLog, st: &StatusReply) {
+    mirror_last_close(store, audit, st).await;
     let Some(window_id) = st
         .window_id
         .as_deref()
@@ -392,4 +430,3 @@ async fn mirror_events(store: &MaintenanceStore, audit: &MaintenanceAuditLog, st
         );
     }
 }
-
