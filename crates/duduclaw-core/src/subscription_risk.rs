@@ -190,6 +190,26 @@ mod tests {
 
     /// The notice states policy, not a technical block (owner decision
     /// 2026-10-16: OAuth `claude -p` still works, so "blocked" would be false).
+    /// The READMEs repeat the vendor notes outside the code; hold them to
+    /// the same rule so the unsourced "blocks" claim cannot come back there.
+    #[test]
+    fn readmes_never_claim_a_vendor_blocks_subscriptions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let banned = [
+            "封鎖", "伺服器端", "遮断", "ブロック", "サーバー側", "2026-03 起",
+            "march 2026", "blocks consumer", "blocks third-party", "blocked server",
+            "server-side block",
+        ];
+        for name in ["README.md", "README.zh-TW.md", "README.ja.md"] {
+            let text = std::fs::read_to_string(root.join(name))
+                .unwrap_or_else(|e| panic!("{name} must be readable from the repo root: {e}"))
+                .to_lowercase();
+            for word in banned {
+                assert!(!text.contains(word), "{name} contains banned vendor claim {word:?}");
+            }
+        }
+    }
+
     #[test]
     fn notice_never_claims_a_technical_block() {
         for banned in ["封鎖", "blocked", "伺服器端"] {

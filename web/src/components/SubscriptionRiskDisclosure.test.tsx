@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -89,13 +87,6 @@ describe('subscription risk copy', () => {
       expect(text, `${loc} ${key}`).toBeTruthy();
       expect(text).not.toMatch(/封鎖|伺服器端|blocked|server side|server-side|ブロック|サーバー側|2026-03|2026 年 3 月|2026年3月|March 2026/i);
     }
-  });
-
-  // The READMEs repeat the vendor notes outside i18n; hold them to the same
-  // rule so the unsourced "blocks" claim cannot come back there either.
-  it.each(['README.md', 'README.zh-TW.md', 'README.ja.md'])('%s never claims a vendor blocks it', (name) => {
-    const text = readFileSync(resolve(__dirname, '../../..', name), 'utf8');
-    expect(text).not.toMatch(/封鎖|伺服器端|blocks consumer|blocked server|server-side block|ブロック|サーバー側|2026-03 起|March 2026/i);
   });
 
   it.each(Object.keys(catalogs))('%s policy copy drops "individual" (the source says ordinary use)', (loc) => {
