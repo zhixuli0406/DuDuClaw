@@ -82,6 +82,34 @@ pub const WINDOW_FILE: &str = "window.json";
 /// Audit work still owed after a close (root 0600) in [`STATE_DIR`], see
 /// [`PendingAudit`].
 pub const PENDING_FILE: &str = "audit-pending.json";
+/// The most recent close (root 0600) in [`STATE_DIR`], reported by
+/// `ssh_maint_status` as `last_close` (see [`LastClose`]). The OS fallback
+/// script may write it too, with trigger `fallback_timer`.
+pub const LAST_CLOSE_FILE: &str = "last-close.json";
+/// When an `audit_backlog_lost` record was written, and in which boot
+/// (root 0600) in [`STATE_DIR`].
+pub const BACKLOG_LOST_FILE: &str = "backlog-lost.json";
+/// Every `trigger` a close record can carry (sysd's own plus the OS fallback
+/// script's `fallback_timer`).
+pub const CLOSE_TRIGGERS: [&str; 6] = ["stop", "deadline", "startup_cleanup", "reboot", "firewall_changed", "fallback_timer"];
+
+/// `last_close` in `ssh_maint_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastClose {
+    pub window_id: Option<String>,
+    pub trigger: String,
+    pub events_complete: bool,
+    pub events_lost: bool,
+    /// Unix seconds, UTC.
+    pub ts: u64,
+}
+
+/// `backlog-lost.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BacklogLost {
+    pub ts: u64,
+    pub boot_id: String,
+}
 
 /// Root audit file.
 pub const AUDIT_LOG: &str = "/data/system/maint-ssh-audit.log";

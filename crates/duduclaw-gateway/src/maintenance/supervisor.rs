@@ -13,19 +13,27 @@ use futures_util::FutureExt;
 use tracing::error;
 
 use super::MaintenanceWindow;
-use super::lifecycle::{MaintEnv, SysdSupport, boot_reconcile, poll_sysd, sweep_expired};
+use super::lifecycle::{
+    MaintEnv, SysdSupport, boot_reconcile_guard, boot_reconcile_guarded, poll_sysd, sweep_expired,
+};
 
 /// Start the supervisor. `boot_revoked` are the rows
 /// [`super::lifecycle::revoke_on_boot`] closed in the ledger before the
 /// dashboard came up; their close actions run here once sysd answers.
-pub fn spawn(
+/// Acquire the writer lock before returning to the server: the dashboard
+/// must not open a fresh window before this task first runs.
+pub async fn spawn(
     env: Arc<MaintEnv>,
     boot_revoked: Vec<MaintenanceWindow>,
 ) -> tokio::task::JoinHandle<()> {
+    let guard = boot_reconcile_guard().await;
     tokio::spawn(async move {
-        let mut support = guarded("boot reconciliation", boot_reconcile(&env, boot_revoked))
-            .await
-            .unwrap_or(SysdSupport::Current);
+        let mut support = guarded(
+            "boot reconciliation",
+            boot_reconcile_guarded(&env, boot_revoked, guard),
+        )
+        .await
+        .unwrap_or(SysdSupport::Current);
         loop {
             tokio::time::sleep(env.tick_interval).await;
             support = tick(&env, support).await;

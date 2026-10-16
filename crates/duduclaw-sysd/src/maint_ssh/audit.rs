@@ -46,6 +46,10 @@
 //!     `trigger` is `stop`, `deadline` or `startup_cleanup` from sysd. The
 //!     script writes `{"event":"close","ts","trigger":"fallback_timer", …}`
 //!     with whatever of these fields it knows (`window_id` may be `null`);
+//!     It should also replace `/data/system/maint-ssh/last-close.json`
+//!     (root 0600, written to a temp file under `umask 077` then renamed) with
+//!     `{"window_id":null,"trigger":"fallback_timer","events_complete":false,"events_lost":false,"ts":<unix seconds>}`;
+//!     sysd keeps that reason when it later cleans the window up.
 //!     sysd's next startup cleanup replays the journal from
 //!     `/data/system/maint-ssh/window.json`. After a reboot that cleanup
 //!     writes the close record with `"trigger": "reboot"`.

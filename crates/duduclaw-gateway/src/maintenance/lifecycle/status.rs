@@ -12,13 +12,10 @@ pub async fn status_json(env: &MaintEnv, caller: Option<&str>) -> Result<Value, 
     let row = store.current_row().await?;
     let shown = row.filter(|w| w.is_active(now) || w.state == WindowState::Opening);
     let active = shown.as_ref().is_some_and(|w| w.is_active(now));
-    let latest = store.latest_window().await?;
+    let unresolved_close = store.has_unconfirmed_close().await?;
 
     let (ssh, observed, confirmed_closed, pending_cleanup) = ssh_status(env).await;
-    let close_unconfirmed = pending_cleanup
-        || latest.as_ref().is_some_and(|w| {
-            w.revoked_at.is_some() && w.close_error.is_some() && !confirmed_closed
-        });
+    let close_unconfirmed = pending_cleanup || (unresolved_close && !confirmed_closed);
 
     let mut body = json!({
         "active": active,
