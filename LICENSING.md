@@ -72,7 +72,7 @@ Apache 2.0 授權條款本身不限制使用方式。以下是執行檔依授權
 
 ### 我可以拿去開 SaaS 嗎？
 
-**可以。** Apache 2.0 不限制託管服務。但「DuDuClaw」名稱及爪印 Logo 為商標，不可冒用。
+**可以。** Apache 2.0 不限制託管服務。但「DuDuClaw」名稱及 Logo（C1 坐姿貓標誌，素材與使用規範見 [`docs/assets/brand/`](docs/assets/brand/README.md)）為商標，不可冒用。
 
 ### 我 Fork 後改名字商業化，可以嗎？
 

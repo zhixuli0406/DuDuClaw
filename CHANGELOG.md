@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。
+
 ## [1.74.0] - 2026-10-16 — 訂閱登入的伺服器端同意關卡、MCP 2026-07-28 協定、C1 品牌識別、wiki 路徑加固
 
 ### Added
