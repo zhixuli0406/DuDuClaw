@@ -135,7 +135,8 @@ gateway, not by the desktop.
   list.** Operations that need root privileges (reboot, shutdown, applying
   or rolling back an OS update, factory reset, network and time settings)
   are handled by a separate helper, `duduclaw-sysd`, that accepts exactly
-  18 fixed commands over a local Unix socket and checks the caller's user
+  20 fixed commands (18 up to platform v1.74.0) over a local Unix socket
+  and checks the caller's user
   id before doing anything. If no allowed caller is configured, it refuses
   every request. From DuDuClaw OS v0.4.0 (embeds platform v1.73.4) the
   gateway runs as its own non-root user (`duduclaw`, uid 1000), and the
@@ -159,7 +160,14 @@ gateway, not by the desktop.
   stops dropbear, ends every session process and removes the port. No
   account on the images can log in over SSH yet (root is locked and
   dropbear refuses root logins), so for now the switch only controls the
-  port.
+  port. Unreleased platform code (CHANGELOG `[Unreleased]`) adds the
+  helper side of a dedicated maintenance login: an account
+  `duduclaw-maint` (uid 4800) and one public key per window, which the
+  helper checks, installs and removes when the window closes, with its
+  own deadline and audit file (see
+  [Security defense](05-security-defense.md)). It does nothing until an
+  OS image ships the account; on such an image the helper refuses the
+  old port-only switch.
   On v0.3.0 and earlier images dropbear listens on port 22 from boot. The
   desktop edition's firewall has no rule for it, so SSH cannot be reached
   from the network there, but the base edition has no firewall, so on it

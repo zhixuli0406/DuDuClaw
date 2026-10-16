@@ -10,7 +10,7 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape that crate's protocol used)
-//! — the entire caller-reachable surface is eighteen fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is twenty fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
@@ -62,6 +62,14 @@
 //!   that same listing, never a path built by joining caller text onto a
 //!   base directory (see `dispatch::dispatch_clear_exhausted_update_target`
 //!   for the H3d §11.7 bug this closes).
+//!
+//! - [`SysdRequest::SshMaintOpen`] `{ public_key, ttl_seconds, window_id }`
+//!   never lets caller text near argv or a path: `window_id` passes a
+//!   `[A-Za-z0-9-]{1,64}` whitelist and is only recorded, `ttl_seconds` is a
+//!   bounded number, and `public_key` is decoded and checked field by field
+//!   by `ssh_key::parse` (one white-listed key type, exact sizes, minimal
+//!   integers); the file sysd writes holds fixed options plus the canonical
+//!   base64 of the decoded bytes, never the caller's string.
 //!
 //! - [`SysdRequest::LocalModelService`] `{ action }` and
 //!   [`SysdRequest::FactoryResetV2`] `{ clear_network }` use the
@@ -466,7 +474,7 @@ pub enum SysdRequest {
     /// comment above for why that is enough to keep this verb out of the
     /// argv/path-injection hazard the rest of this file documents.
     ClearExhaustedUpdateTarget { version: String },
-    /// Start the image's SSH server ([`SSH_UNITS`]: `dropbear.socket` on the
+    /// The legacy keyless open: start the image's SSH server ([`SSH_UNITS`]: `dropbear.socket` on the
     /// Yocto line, `ssh.service` on the Debian line) and add [`SSH_PORT`] to
     /// the OS firewall's maintenance port set when the image has a firewall.
     /// Fieldless — the unit is picked from a closed list of literals, never a
@@ -481,6 +489,12 @@ pub enum SysdRequest {
     /// TTL. This daemon has no opinion about TTL/authorization policy at all
     /// — it only ever runs the literal command; the gateway decides when to
     /// send it.
+    ///
+    /// Refused as `unsupported` on an image that ships the maintenance SSH
+    /// account (readiness marker `/usr/lib/duduclaw/maint-ssh.ready`, or a
+    /// marker that cannot be read): there the only way in is
+    /// [`SysdRequest::SshMaintOpen`]. Images without the marker keep the old
+    /// behaviour. Serialised with the other SSH verbs.
     SshServiceStart,
     /// The close side of [`SysdRequest::SshServiceStart`]: stop the SSH unit,
     /// end its open sessions, and remove [`SSH_PORT`] from the firewall's
@@ -489,7 +503,43 @@ pub enum SysdRequest {
     /// maintenance-mode TTL sweep / gateway-restart reassert-closed path
     /// relies on. It reports `success: false` when a session or the port is
     /// still open afterwards, so the window's close error is not papered over.
+    ///
+    /// Since the maintenance SSH account (2026-10) it is also the close side
+    /// of [`SysdRequest::SshMaintOpen`]: it first writes the window's pending
+    /// login/logout events to the root audit file, then removes the key and
+    /// `window.json`, drops sysd's deadline, cancels the PID 1 fallback timer,
+    /// runs the steps above, and writes the close record. A failure in any of
+    /// these is listed in `stderr` and makes `success` false. No `window_id`:
+    /// there is only ever one key.
     SshServiceStop,
+    /// Open a maintenance SSH window for the `duduclaw-maint` account with one
+    /// public key (the `maint_ssh` module, design §8.1). In order: verify the OS is
+    /// set up for it (readiness marker, account uid/gid 4800, dropbear's
+    /// merged `ExecStart` token for token, `BindsTo=duduclaw-sysd.service`,
+    /// the nft egress rule and jump, the port-22 source sets, the host key;
+    /// any miss is `unsupported`), validate `window_id` and `ttl_seconds`
+    /// (60–86400) and parse `public_key` strictly (`bad_request`, message
+    /// `ssh_key:<code>`), write the key without replacing one already there
+    /// (`busy`), save the window state, start sysd's own `CLOCK_BOOTTIME`
+    /// deadline, arm the PID 1 fallback timer, run the
+    /// [`SysdRequest::SshServiceStart`] steps and write the open record. Any
+    /// failure undoes the earlier steps. Every attempt counts against a rate
+    /// limit checked before anything else runs (at least 5 s apart, at most
+    /// 12 per rolling hour; `rate_limited`), and an open is refused as `busy` while a previous
+    /// window's audit records are still owed. On success `stdout` is one JSON line:
+    /// `{"login_user","window_id","key_type","key_fingerprint","expires_in_s","host_key_fingerprints"}`.
+    SshMaintOpen { public_key: String, ttl_seconds: u64, window_id: String },
+    /// Read-only view of the maintenance SSH window (after writing any new
+    /// journal events to the audit file): `stdout` is one JSON object with
+    /// `ready`, `key_installed`, `key_fingerprint`, `window_id`,
+    /// `expires_in_s`, `fallback_timer_active`, `ssh_active`, `sessions`,
+    /// `events` (at most 200; logins and logouts kept first),
+    /// `event_overflow`, `auth_failures`, `host_key_fingerprints`,
+    /// `pending_cleanup`, `pending_audit`, `last_close` (`null` or
+    /// `{"window_id": string|null, "trigger": "stop"|"deadline"|"startup_cleanup"|"reboot"|"firewall_changed"|"fallback_timer", "events_complete": bool, "events_lost": bool, "ts": unix-seconds}`),
+    /// `audit_backlog_lost` (`null` or `{"ts": unix-seconds}` when such a
+    /// record was written in the current boot) and `problems`.
+    SshMaintStatus,
     /// `systemctl stop|restart duduclaw-llama-server.service`: the
     /// appliance's local model service, which the gateway (no longer root)
     /// cannot control itself. `action` is a closed enum; the unit is the
@@ -520,6 +570,8 @@ impl SysdRequest {
             SysdRequest::ClearExhaustedUpdateTarget { .. } => "clear_exhausted_update_target",
             SysdRequest::SshServiceStart => "ssh_service_start",
             SysdRequest::SshServiceStop => "ssh_service_stop",
+            SysdRequest::SshMaintOpen { .. } => "ssh_maint_open",
+            SysdRequest::SshMaintStatus => "ssh_maint_status",
             SysdRequest::LocalModelService { .. } => "local_model_service",
         }
     }
@@ -604,6 +656,7 @@ mod tests {
             SysdRequest::SshServiceStart,
             SysdRequest::SshServiceStop,
             SysdRequest::SysupdateStageApply,
+            SysdRequest::SshMaintStatus,
         ] {
             let s = serde_json::to_string(&req).unwrap();
             let back: SysdRequest = serde_json::from_str(&s).unwrap();
@@ -620,6 +673,52 @@ mod tests {
         let s = serde_json::to_string(&SysdRequest::SshServiceStop).unwrap();
         assert_eq!(s, r#"{"verb":"ssh_service_stop"}"#);
         assert_eq!(SysdRequest::SshServiceStop.verb_name(), "ssh_service_stop");
+    }
+
+    #[test]
+    fn ssh_maint_verbs_have_the_documented_wire_shape() {
+        let req = SysdRequest::SshMaintOpen {
+            public_key: "ssh-ed25519 AAAA".into(),
+            ttl_seconds: 14_400,
+            window_id: "w-1".into(),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            s,
+            r#"{"verb":"ssh_maint_open","params":{"public_key":"ssh-ed25519 AAAA","ttl_seconds":14400,"window_id":"w-1"}}"#
+        );
+        assert_eq!(serde_json::from_str::<SysdRequest>(&s).unwrap(), req);
+        assert_eq!(req.verb_name(), "ssh_maint_open");
+        assert_eq!(serde_json::to_string(&SysdRequest::SshMaintStatus).unwrap(), r#"{"verb":"ssh_maint_status"}"#);
+        assert_eq!(SysdRequest::SshMaintStatus.verb_name(), "ssh_maint_status");
+        for raw in [
+            r#"{"verb":"ssh_maint_open","params":{"public_key":"k","ttl_seconds":60,"window_id":"w","comment":"x"}}"#,
+            r#"{"verb":"ssh_maint_open","params":{"public_key":"k","ttl_seconds":60}}"#,
+            r#"{"verb":"ssh_maint_open","params":{"public_key":"k","ttl_seconds":-1,"window_id":"w"}}"#,
+            r#"{"verb":"ssh_maint_open","params":{"public_key":"k","ttl_seconds":"60","window_id":"w"}}"#,
+            r#"{"verb":"ssh_maint_status","params":{}}"#,
+            r#"{"verb":"ssh_maint_status","window_id":"w"}"#,
+        ] {
+            assert!(serde_json::from_str::<SysdRequest>(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_largest_ssh_maint_open_fits_in_one_request_line() {
+        // An 8192-bit RSA key without its comment, the longest window id.
+        let key = include_str!("../tests/fixtures/ssh_keys/rsa8192.pub");
+        let mut fields = key.split_ascii_whitespace();
+        let wire = format!("{} {}", fields.next().unwrap(), fields.next().unwrap());
+        let req = SysdRequest::SshMaintOpen { public_key: wire, ttl_seconds: 86_400, window_id: "a".repeat(64) };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.len() < MAX_REQUEST_LINE_BYTES, "{} bytes", line.len());
+        // The parser's own cap also fits, with JSON escaping of nothing (ASCII).
+        let worst = SysdRequest::SshMaintOpen {
+            public_key: "A".repeat(crate::ssh_key::MAX_INPUT_BYTES),
+            ttl_seconds: 86_400,
+            window_id: "a".repeat(64),
+        };
+        assert!(serde_json::to_string(&worst).unwrap().len() < MAX_REQUEST_LINE_BYTES);
     }
 
     #[test]

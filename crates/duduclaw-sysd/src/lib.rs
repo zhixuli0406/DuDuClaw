@@ -34,10 +34,18 @@
 //! - [`server`] — UDS bind + accept loop + per-connection peer-cred check
 //!   + audit tracing. Runs as root in production (see `main.rs`).
 //! - [`client`] — the gateway-side (or test-side) caller SDK.
+//! - [`ssh_key`] — the strict parser for the one public key a maintenance
+//!   SSH window accepts (shared with the gateway's early check).
+//! - `maint_ssh` (Unix) — the maintenance SSH window: OS checks, key file,
+//!   deadline, PID 1 fallback timer, journal events into the root audit file,
+//!   and the `SSH_LOCK` every SSH verb, the tick and the startup cleanup
+//!   share.
 
 pub mod client;
 #[cfg(unix)]
 pub mod dispatch;
+#[cfg(unix)]
+pub mod maint_ssh;
 pub mod release;
 #[cfg(unix)]
 pub mod rollback_floor;
@@ -46,6 +54,7 @@ pub mod staged_update;
 pub mod protocol;
 #[cfg(unix)]
 pub mod server;
+pub mod ssh_key;
 
 /// Non-unix stand-in for [`server`] — `duduclaw-sysd` is a Linux-appliance
 /// root daemon (UDS + `SO_PEERCRED`), so on other targets the server surface

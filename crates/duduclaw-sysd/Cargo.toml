@@ -14,6 +14,8 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+# No path dependencies: the DuDuClaw-OS recipe vendors this crate on its own
+# (registry crates only). Small helpers are copied in instead.
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,6 +30,9 @@ libc = "0.2"
 # staged payloads as root (same crates and versions the gateway uses).
 minisign-verify = "0.2"
 sha2 = "0.10"
+# ssh_key.rs: strict base64 decoding / canonical re-encoding of the
+# maintenance SSH public key.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1678,7 +1678,7 @@ async fn end_ssh_sessions(cgroup: &Path) -> Result<(), String> {
 /// Open the firewall port first, then start the unit, so a firewall that
 /// cannot be opened never leaves a listening server the operator cannot
 /// reach. A failed unit start takes the port back out.
-async fn dispatch_ssh_start() -> DispatchResult {
+pub(crate) async fn dispatch_ssh_start() -> DispatchResult {
     let mut chosen = None;
     for candidate in SSH_UNITS {
         match unit_load_state(candidate.unit).await {
@@ -1738,7 +1738,7 @@ async fn dispatch_ssh_start() -> DispatchResult {
 /// Stop every loaded SSH unit, end its sessions, close the firewall port,
 /// then check what is actually left. Each step runs even if an earlier one
 /// failed; anything unclear counts as a problem, never as "closed".
-async fn dispatch_ssh_stop() -> DispatchResult {
+pub(crate) async fn dispatch_ssh_stop() -> DispatchResult {
     let mut problems: Vec<String> = Vec::new();
     let mut done: Vec<String> = Vec::new();
 
@@ -1870,8 +1870,26 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
             let _guard = begin_update_op(&UPDATE_LOCK)?;
             dispatch_clear_exhausted_update_target(version).await
         }
-        SysdRequest::SshServiceStart => dispatch_ssh_start().await,
-        SysdRequest::SshServiceStop => dispatch_ssh_stop().await,
+        SysdRequest::SshServiceStart => {
+            let _state = crate::maint_ssh::SSH_LOCK.lock().await;
+            crate::maint_ssh::legacy_start_allowed(Path::new(crate::maint_ssh::READY_MARKER))?;
+            dispatch_ssh_start().await
+        }
+        SysdRequest::SshServiceStop => {
+            let mut state = crate::maint_ssh::SSH_LOCK.lock().await;
+            let cfg = crate::maint_ssh::MaintConfig::system();
+            Ok(crate::maint_ssh::close(&mut state, &crate::maint_ssh::host::SystemHost, &cfg, crate::maint_ssh::CloseTrigger::Stop).await)
+        }
+        SysdRequest::SshMaintOpen { public_key, ttl_seconds, window_id } => {
+            let mut state = crate::maint_ssh::SSH_LOCK.lock().await;
+            let cfg = crate::maint_ssh::MaintConfig::system();
+            crate::maint_ssh::open(&mut state, &crate::maint_ssh::host::SystemHost, &cfg, public_key, *ttl_seconds, window_id).await
+        }
+        SysdRequest::SshMaintStatus => {
+            let mut state = crate::maint_ssh::SSH_LOCK.lock().await;
+            let cfg = crate::maint_ssh::MaintConfig::system();
+            crate::maint_ssh::status(&mut state, &crate::maint_ssh::host::SystemHost, &cfg).await
+        }
         SysdRequest::LocalModelService { action } => dispatch_local_model_service(*action).await,
     }
 }
