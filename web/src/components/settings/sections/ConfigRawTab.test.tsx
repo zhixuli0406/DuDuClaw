@@ -68,7 +68,7 @@ describe('<ConfigRawTab>', () => {
     const save = screen.getByRole('button', { name: 'Check and save' });
     fireEvent.click(save);
     expect(await screen.findByTestId('config-raw-subscription-risk')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /OpenAI Terms of Use/ })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /OpenAI Sign in with ChatGPT terms/ })).toHaveAttribute('href', 'https://openai.com/policies/sign-in-with-chatgpt-terms/');
     expect(screen.queryByText(/Problem at line/)).toBeNull();
     expect(save).toBeDisabled();
     fireEvent.click(screen.getByRole('checkbox', { name: /read the policy and risks/i }));

@@ -477,9 +477,12 @@ pub const CATALOG: &[RuntimeSpec] = &[
             login: LoginMethod::BrowserOauth { args: &["login"] },
             credential_paths: &[".codex/auth.json"],
             tos_note: Some(LocaleText {
-                en: "OpenAI's policy on third-party products driving a ChatGPT subscription login is unclear (TODO 2026-09 §1-1). The API key path is the supported one.",
-                zh_tw: "OpenAI 對「第三方產品驅動 ChatGPT 訂閱登入」的政策不明（TODO 2026-09 §1-1），建議走 API key。",
-                ja_jp: "サードパーティ製品が ChatGPT サブスクリプションのログインを利用することについて、OpenAI の方針は不明です（TODO 2026-09 §1-1）。API キーの利用を推奨します。",
+                // Cited terms only (openai.com/policies/sign-in-with-chatgpt-terms,
+                // developers.openai.com/siwc/quickstart, read 2026-10-16); see
+                // `crate::subscription_risk::OPENAI_SIWC_TERMS_URL`.
+                en: "OpenAI runs an official Sign in with ChatGPT program: using a ChatGPT plan in third-party apps is offered to open-source partners and to selected commercial partners, and a commercial product needs OpenAI's approval. Its terms require auth tokens to stay local and under the user's control, not in remote or managed environments (openai.com/policies/sign-in-with-chatgpt-terms). Use an API key for anything you rely on.",
+                zh_tw: "OpenAI 有官方的 Sign in with ChatGPT 計畫：在第三方應用程式使用 ChatGPT 方案，開放給開源合作夥伴與 OpenAI 選定的商業合作夥伴，商業產品要先取得 OpenAI 同意。條款要求驗證 token 只存在使用者自己掌控的本機，不能放在遠端或託管環境（openai.com/policies/sign-in-with-chatgpt-terms）。要穩定使用請走 API key。",
+                ja_jp: "OpenAI には公式の Sign in with ChatGPT プログラムがあります。サードパーティのアプリで ChatGPT プランを使えるのはオープンソースのパートナーと OpenAI が選んだ商用パートナーで、商用製品には OpenAI の承認が必要です。規約では、認証トークンはユーザーが管理するローカル環境に保存し、リモートやマネージド環境には置かないこととされています（openai.com/policies/sign-in-with-chatgpt-terms）。安定して使う場合は API キーをご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Complete the OpenAI sign-in in a browser on this machine (localhost callback). Use an API key when remote.",
@@ -529,10 +532,12 @@ pub const CATALOG: &[RuntimeSpec] = &[
             credential_paths: &[".gemini/oauth_creds.json"],
             tos_note: Some(LocaleText {
                 // Cited terms only (geminicli.com/docs/resources/tos-privacy,
-                // fetched 2026-10-16); see `crate::subscription_risk`.
-                en: "Google's Gemini CLI terms say directly accessing the services behind Gemini CLI with third-party software, tools or services through Gemini CLI OAuth violates its terms and may lead to suspension or termination of the account (geminicli.com/docs/resources/tos-privacy). Use an API key for anything long-running.",
-                zh_tw: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止（geminicli.com/docs/resources/tos-privacy）。要長期使用請走 API key。",
-                ja_jp: "Google の Gemini CLI 規約では、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反とされ、アカウントの停止または終了の理由になり得ます（geminicli.com/docs/resources/tos-privacy）。継続的に使う場合は API キーをご利用ください。",
+                // fetched 2026-10-16; the Code Assist for individuals
+                // deprecation notice, last updated 2026-10-09); see
+                // `crate::subscription_risk`.
+                en: "Google's Gemini CLI terms say directly accessing the services behind Gemini CLI with third-party software, tools or services through Gemini CLI OAuth violates its terms and may lead to suspension or termination of the account (geminicli.com/docs/resources/tos-privacy). Google's deprecation notice (developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals) says that since 2026-06-18 Gemini CLI no longer accepts Login with Google for Gemini Code Assist for individuals, Google AI Pro and Google AI Ultra accounts; it still works with a paid API key (Gemini API or enterprise). Use an API key.",
+                zh_tw: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止（geminicli.com/docs/resources/tos-privacy）。Google 的停用公告（developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals）寫明，自 2026-06-18 起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API key（Gemini API 或企業方案）仍可使用。請走 API key。",
+                ja_jp: "Google の Gemini CLI 規約では、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反とされ、アカウントの停止または終了の理由になり得ます（geminicli.com/docs/resources/tos-privacy）。Google の廃止のお知らせ（developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals）によると、2026-06-18 以降、Gemini Code Assist for individuals、Google AI Pro、Google AI Ultra のアカウントでは Gemini CLI の Login with Google を使えません。有料の API キー（Gemini API またはエンタープライズ）は引き続き使えます。API キーをご利用ください。",
             }),
             login_hint: Some(LocaleText {
                 en: "Complete the Google sign-in in a browser on this machine (localhost callback).",
@@ -550,8 +555,9 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://github.com/google-gemini/gemini-cli",
         verified: true,
-        // R1 (2026-10): Google stopped serving personal accounts through the
-        // Gemini CLI on 2026-06-18; Antigravity (`agy`) takes over. The value
+        // R1 (2026-10): Google stopped serving the Code Assist for
+        // individuals, AI Pro and AI Ultra tiers through Gemini CLI on
+        // 2026-06-18; Antigravity (`agy`) takes over. The value
         // keeps parsing and running for the deprecation window.
         deprecation: Some(RuntimeDeprecation {
             since: "v1.67.0",
@@ -1589,6 +1595,32 @@ mod tests {
         }
         let hint = spec.auth.login_hint.unwrap();
         assert!(hint.zh_tw.contains("`agy`"), "{}", hint.zh_tw);
+    }
+
+    /// 2026-10-16 vendor facts: OpenAI publishes a Sign in with ChatGPT
+    /// program (no longer "unclear"), and Gemini CLI stopped accepting Login
+    /// with Google for individual / AI Pro / AI Ultra accounts on 2026-06-18.
+    #[test]
+    fn codex_and_gemini_tos_notes_cite_current_vendor_pages() {
+        let codex = spec_for("codex").unwrap().auth.tos_note.unwrap();
+        for t in [codex.en, codex.zh_tw, codex.ja_jp] {
+            assert!(t.contains("Sign in with ChatGPT"), "{t}");
+            let terms = crate::subscription_risk::OPENAI_SIWC_TERMS_URL
+                .trim_start_matches("https://")
+                .trim_end_matches('/');
+            assert!(t.contains(terms), "{t}");
+            for stale in ["unclear", "不明"] {
+                assert!(!t.contains(stale), "stale wording {stale:?} in {t}");
+            }
+        }
+        let gemini = spec_for("gemini").unwrap().auth.tos_note.unwrap();
+        for t in [gemini.en, gemini.zh_tw, gemini.ja_jp] {
+            assert!(t.contains("2026-06-18"), "{t}");
+            assert!(t.contains("Login with Google"), "{t}");
+            assert!(t.contains("geminicli.com/docs/resources/tos-privacy"), "{t}");
+            let notice = crate::subscription_risk::GEMINI_CLI_INDIVIDUALS_DEPRECATION_URL;
+            assert!(t.contains(notice.trim_start_matches("https://")), "{t}");
+        }
     }
 
     /// R1 (2026-10): only the Gemini CLI carries a deprecation window, and it
