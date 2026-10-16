@@ -2064,6 +2064,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-maint-tools"
+version = "1.74.0"
+dependencies = [
+ "chrono",
+ "duduclaw-core",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "duduclaw-memory"
 version = "1.74.0"
 dependencies = [

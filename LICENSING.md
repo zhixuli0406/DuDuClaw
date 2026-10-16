@@ -38,6 +38,7 @@ DuDuClaw 採用 **Apache License 2.0** 開源授權。
 | `duduclaw-pets` | 照片轉桌面寵物 |
 | `duduclaw-relay` | 雲端 webhook 中繼與區網裝置探索 |
 | `duduclaw-sysd` | 值班機映像的特權系統服務 |
+| `duduclaw-maint-tools` | DuDuClaw OS 維修 SSH 帳號的固定選單與紀錄篩選服務（由 OS 映像建置） |
 | `web/` | React 19 Dashboard |
 | `python/` | Python SDK（`pip install duduclaw`） |
 | `npm/` | npm 安裝包裝 |
