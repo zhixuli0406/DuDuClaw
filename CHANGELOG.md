@@ -19,7 +19,7 @@
   - TTL 到期改由閘道開機就啟動的獨立背景工作處理，不再跟著派工引擎（`[dispatch] enabled = false` 時也照常到期）。它開機時每 2 秒問一次 sysd、最多等 60 秒，關掉 sysd 手上沒有對應視窗的金鑰（記 `ssh_orphan_closed`）；之後每 30 秒問一次 sysd，把登入、登出、驗證失敗（依來源彙總）、選單操作抄進 `maintenance_audit.jsonl`（字串截長、去控制字元，當資料看），並在 sysd 自己收掉視窗時記 `ssh_closed_by_os`。
   - 在設備上關閉視窗時連不到 sysd，一律記成 `close_error` 並推播，不再當成「沒有東西要關」；`maintenance.status` 每次都問 sysd，回傳金鑰與本機指紋、到期秒數、目前連線、驗證失敗次數、`pending_cleanup`、`problems`，sysd 不可達時 `ssh_observed_active` 為 `null`，關閉沒被確認時 `close_unconfirmed` 為 true。
   - sysd 在狀態裡回報上一次關窗的原因（例如重開機 `reboot`、防火牆規則被改 `firewall_changed`、登入紀錄是否遺失），閘道會照抄一次進維修歷史（`ssh_os_close_record`），並放進 `maintenance.status` 的 `ssh.last_close`；真實 OS 映像上的回報仍待活測。重開機後 sysd 已自行收掉舊視窗時，閘道不會把它當成孤兒金鑰。
-  - 尚未驗證：只用模擬的 sysd 測過，還沒有接上真的 sysd 與 OS 映像（要等 OS 的 PR 備妥後在 QEMU 活測）；推播只測了文字內容，沒有實際送到通道。
+  - 驗證範圍：生命週期 mock 測試之外，增加原生 Unix socket 整合測試，由真正的 `SocketMaintSysd`／`SysdClient` 連到隔離的模擬 daemon，涵蓋開啟、狀態、關閉、`busy` 不回滾與舊版 verb 拒絕；macOS 本地與 Linux 原生 CI 跑同一組。尚未接上真的 sysd 與 OS 映像（要等 OS 的 PR 備妥後在 QEMU 活測）；推播只測了文字內容，沒有實際送到通道。
 
 ### Fixed
 - 閘道重啟後，先完成維修 SSH 的舊視窗清理，再接受新的開啟請求，避免背景清理誤關剛開好的視窗；等待期間仍可查詢狀態。只有取得該資料目錄執行鎖的閘道能開啟或關閉維修模式，第二個閘道只能讀取狀態。
