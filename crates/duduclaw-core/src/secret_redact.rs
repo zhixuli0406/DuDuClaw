@@ -12,7 +12,7 @@
 //!   `channels.status_changed`), `~/.duduclaw/channel_status.json` (the
 //!   out-of-process snapshot the `channel_status` MCP tool reads), and the
 //!   gateway log.
-//! - **`duduclaw-maint-logs`** (crate `duduclaw-maint-tools`), the root
+//! - **`duduclaw-maint-helper`** (crate `duduclaw-maint-tools`), the root
 //!   service that hands the maintenance SSH account a filtered view of the
 //!   gateway and local-model journal. Every `MESSAGE` it returns goes through
 //!   [`redact_secrets`].

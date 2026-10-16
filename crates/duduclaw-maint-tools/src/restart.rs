@@ -19,7 +19,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -75,6 +75,12 @@ pub struct RestartLimiter {
     pub min_interval_secs: u64,
     /// Seconds on a clock that does not follow wall-clock changes.
     pub now: fn() -> io::Result<u64>,
+    /// Required owner of the state directory and stamp files (root in
+    /// production).
+    pub owner_uid: u32,
+    /// Where anomalies worth an operator's attention are reported (the
+    /// journal in production).
+    pub on_note: fn(&str),
 }
 
 /// Holds the stamp file's exclusive lock until dropped (i.e. until the
@@ -92,6 +98,8 @@ impl RestartLimiter {
             dir: PathBuf::from(crate::protocol::HELPER_STATE_DIR),
             min_interval_secs: RESTART_MIN_INTERVAL_SECS,
             now: boottime_secs,
+            owner_uid: 0,
+            on_note: note_to_journal,
         }
     }
 
@@ -100,6 +108,22 @@ impl RestartLimiter {
     pub fn acquire(&self, target: RestartTarget) -> Result<RestartSlot, RestartResult> {
         let unavailable =
             |what: &str, e: io::Error| RestartResult::Unavailable(format!("{what}: {e}"));
+        // The directory must be what systemd's RuntimeDirectory= made: a real
+        // directory (not a symlink), owned by root, mode 0700. Otherwise the
+        // stamps cannot be trusted, so refuse.
+        let dir_meta = std::fs::symlink_metadata(&self.dir)
+            .map_err(|e| unavailable("stat state directory", e))?;
+        if !dir_meta.file_type().is_dir()
+            || dir_meta.uid() != self.owner_uid
+            || dir_meta.mode() & 0o7777 != 0o700
+        {
+            return Err(RestartResult::Unavailable(format!(
+                "state directory must be a {}-owned 0700 directory (uid {}, mode {:o})",
+                self.owner_uid,
+                dir_meta.uid(),
+                dir_meta.mode() & 0o7777
+            )));
+        }
         let path = self.dir.join(format!("restart-{}.stamp", target.key()));
         let mut file = OpenOptions::new()
             .read(true)
@@ -113,10 +137,22 @@ impl RestartLimiter {
         let meta = file
             .metadata()
             .map_err(|e| unavailable("stat restart stamp", e))?;
-        if !meta.is_file() {
-            return Err(RestartResult::Unavailable(
-                "restart stamp is not a regular file".into(),
-            ));
+        // A regular file with one link, owned by root, mode 0600: anything
+        // else (a hard link to some other file, a file someone else made)
+        // is not trusted.
+        if !meta.is_file()
+            || meta.uid() != self.owner_uid
+            || meta.mode() & 0o7777 != 0o600
+            || meta.nlink() != 1
+        {
+            return Err(RestartResult::Unavailable(format!(
+                "restart stamp must be a single-link {}-owned 0600 regular file \
+                 (uid {}, mode {:o}, links {})",
+                self.owner_uid,
+                meta.uid(),
+                meta.mode() & 0o7777,
+                meta.nlink()
+            )));
         }
         lock_exclusive(&file).map_err(|e| unavailable("lock restart stamp", e))?;
 
@@ -134,24 +170,47 @@ impl RestartLimiter {
                 })?),
             };
         if let Some(last) = last {
-            // A stamp from the future (should not happen: /run and the boot
-            // clock reset together) counts as "just now".
-            let elapsed = now.saturating_sub(last);
+            if last > now {
+                // Should not happen (/run and the boot clock reset together).
+                // Clamp it once: rewrite the stamp to now and treat this
+                // request as coming right after a restart, so a bogus value
+                // cannot block restarts until the next reboot.
+                (self.on_note)(&format!(
+                    "maint-helper: restart stamp for {} was in the future ({last} > {now}); clamped to now",
+                    target.key()
+                ));
+                write_stamp(&mut file, now).map_err(|e| unavailable("write restart stamp", e))?;
+                return Err(RestartResult::RateLimited {
+                    retry_after_secs: self.min_interval_secs,
+                });
+            }
+            let elapsed = now - last;
             if elapsed < self.min_interval_secs {
                 return Err(RestartResult::RateLimited {
                     retry_after_secs: self.min_interval_secs - elapsed,
                 });
             }
         }
-        file.set_len(0)
-            .map_err(|e| unavailable("truncate restart stamp", e))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| unavailable("seek restart stamp", e))?;
-        file.write_all(now.to_string().as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|e| unavailable("write restart stamp", e))?;
+        write_stamp(&mut file, now).map_err(|e| unavailable("write restart stamp", e))?;
         Ok(RestartSlot { _file: file })
     }
+}
+
+fn write_stamp(file: &mut File, now: u64) -> io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(now.to_string().as_bytes())?;
+    file.sync_all()
+}
+
+/// Production `on_note`: a warning in the journal.
+fn note_to_journal(message: &str) {
+    let _ = crate::journal::send(&crate::journal::entry_payload(
+        crate::journal::HELPER_IDENTIFIER,
+        crate::journal::PRIORITY_WARNING,
+        message,
+        &[],
+    ));
 }
 
 fn lock_exclusive(file: &File) -> io::Result<()> {
@@ -239,18 +298,46 @@ mod tests {
         Ok(FAKE_NOW.load(Ordering::SeqCst))
     }
 
+    static NOTES: AtomicU64 = AtomicU64::new(0);
+
+    fn count_note(_: &str) {
+        NOTES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn my_uid() -> u32 {
+        // SAFETY: getuid has no preconditions.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::getuid()
+        }
+    }
+
     fn limiter(dir: &std::path::Path) -> RestartLimiter {
         RestartLimiter {
             dir: dir.to_path_buf(),
             min_interval_secs: 60,
             now: fake_now,
+            owner_uid: my_uid(),
+            on_note: count_note,
         }
+    }
+
+    /// A state directory shaped like systemd's RuntimeDirectory= (0700).
+    fn state_dir() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        mode(d.path(), 0o700);
+        d
+    }
+
+    fn mode(path: &std::path::Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap();
     }
 
     // One test drives the shared fake clock, so the steps stay in order.
     #[test]
     fn per_unit_minimum_interval() {
-        let d = tempfile::tempdir().unwrap();
+        let d = state_dir();
         let l = limiter(d.path());
         FAKE_NOW.store(1_000, Ordering::SeqCst);
 
@@ -284,19 +371,26 @@ mod tests {
                 retry_after_secs: 59
             })
         ));
-        // A stamp from the future counts as just now.
-        std::fs::write(d.path().join("restart-gateway.stamp"), "999999").unwrap();
+        // A stamp from the future is clamped once: refused now, rewritten to
+        // now, noted, and the next attempt after the interval passes.
+        let stamp = d.path().join("restart-gateway.stamp");
+        std::fs::write(&stamp, "999999").unwrap();
+        let notes = NOTES.load(Ordering::SeqCst);
         assert!(matches!(
             l.acquire(RestartTarget::Gateway),
             Err(RestartResult::RateLimited {
                 retry_after_secs: 60
             })
         ));
+        assert_eq!(std::fs::read_to_string(&stamp).unwrap(), "1061");
+        assert_eq!(NOTES.load(Ordering::SeqCst), notes + 1);
+        FAKE_NOW.store(1_121, Ordering::SeqCst);
+        drop(l.acquire(RestartTarget::Gateway).unwrap());
     }
 
     #[test]
     fn unusable_state_fails_closed() {
-        let d = tempfile::tempdir().unwrap();
+        let d = state_dir();
         // Missing directory.
         let l = limiter(&d.path().join("missing"));
         assert!(matches!(
@@ -306,6 +400,7 @@ mod tests {
         // Garbage in the stamp.
         let l = limiter(d.path());
         std::fs::write(d.path().join("restart-model.stamp"), "not-a-number").unwrap();
+        mode(&d.path().join("restart-model.stamp"), 0o600);
         assert!(matches!(
             l.acquire(RestartTarget::Model),
             Err(RestartResult::Unavailable(_))
@@ -319,6 +414,56 @@ mod tests {
             Err(RestartResult::Unavailable(_))
         ));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+    }
+
+    #[test]
+    fn untrusted_directory_or_stamp_fails_closed() {
+        // Directory too open.
+        let d = state_dir();
+        mode(d.path(), 0o755);
+        assert!(matches!(
+            limiter(d.path()).acquire(RestartTarget::Model),
+            Err(RestartResult::Unavailable(_))
+        ));
+        mode(d.path(), 0o700);
+        // Directory owned by someone else.
+        let mut l = limiter(d.path());
+        l.owner_uid = my_uid().wrapping_add(1);
+        assert!(matches!(
+            l.acquire(RestartTarget::Model),
+            Err(RestartResult::Unavailable(_))
+        ));
+        // Directory reached through a symlink.
+        let link = d.path().join("dirlink");
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        mode(&real, 0o700);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(
+            limiter(&link).acquire(RestartTarget::Model),
+            Err(RestartResult::Unavailable(_))
+        ));
+        assert!(limiter(&real).acquire(RestartTarget::Model).is_ok());
+        // Stamp with the wrong mode.
+        let l = limiter(d.path());
+        let stamp = d.path().join("restart-model.stamp");
+        std::fs::write(&stamp, "").unwrap();
+        mode(&stamp, 0o644);
+        assert!(matches!(
+            l.acquire(RestartTarget::Model),
+            Err(RestartResult::Unavailable(_))
+        ));
+        mode(&stamp, 0o600);
+        assert!(l.acquire(RestartTarget::Model).is_ok());
+        // Stamp with a second hard link.
+        let gw = d.path().join("restart-gateway.stamp");
+        std::fs::write(&gw, "").unwrap();
+        mode(&gw, 0o600);
+        std::fs::hard_link(&gw, d.path().join("other-name")).unwrap();
+        assert!(matches!(
+            l.acquire(RestartTarget::Gateway),
+            Err(RestartResult::Unavailable(_))
+        ));
     }
 
     #[test]
