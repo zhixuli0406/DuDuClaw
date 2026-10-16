@@ -253,9 +253,8 @@ pub struct StatusReply {
     /// event backfill); it refuses new opens with `busy` until it is written.
     #[serde(default)]
     pub pending_audit: bool,
-    /// The most recent close sysd recorded, when this sysd reports it
-    /// (optional: P-1 status does not carry it yet; the gateway shows it when
-    /// present).
+    /// The most recent close sysd recorded. Current sysd persists and reports
+    /// this; it remains optional for older sysd versions and a fresh install.
     #[serde(default)]
     pub last_close: Option<LastClose>,
     #[serde(default)]
