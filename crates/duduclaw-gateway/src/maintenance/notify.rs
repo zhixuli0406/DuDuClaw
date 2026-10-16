@@ -14,8 +14,13 @@ use async_trait::async_trait;
 use duduclaw_auth::{UserDb, UserRole, UserStatus};
 use tracing::{info, warn};
 
+mod fanout;
+
 /// Per-request timeout of one notice send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Includes token lookup and every fallback attempt for one verified link.
+/// This stays below the lifecycle's 30 s overall safety limit.
+const TARGET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Where maintenance notices go.
 #[async_trait]
@@ -87,32 +92,35 @@ impl AdminNotifier for UserDbAdminNotifier {
             .timeout(SEND_TIMEOUT)
             .build()
             .unwrap_or_default();
-        let mut delivered = 0;
-        for (channel, chat_id) in self.admin_targets() {
-            let candidates =
-                crate::config_crypto::channel_dm_token_candidates(&self.home_dir, &channel).await;
-            let mut sent = false;
-            for token in &candidates {
-                if crate::channel_sender::send_plain_text(
-                    &self.home_dir,
-                    &http,
-                    &channel,
-                    token,
-                    &chat_id,
-                    text,
-                )
-                .await
-                {
-                    sent = true;
-                    break;
+        let delivered = fanout::send_to_targets(
+            self.admin_targets(),
+            TARGET_TIMEOUT,
+            |(channel, chat_id)| {
+                let http = &http;
+                async move {
+                    let candidates =
+                        crate::config_crypto::channel_dm_token_candidates(&self.home_dir, &channel)
+                            .await;
+                    for token in &candidates {
+                        if crate::channel_sender::send_plain_text(
+                            &self.home_dir,
+                            http,
+                            &channel,
+                            token,
+                            &chat_id,
+                            text,
+                        )
+                        .await
+                        {
+                            return true;
+                        }
+                    }
+                    warn!(%channel, "maintenance notice: not delivered on this link");
+                    false
                 }
-            }
-            if sent {
-                delivered += 1;
-            } else {
-                warn!(%channel, "maintenance notice: not delivered on this link");
-            }
-        }
+            },
+        )
+        .await;
         info!(delivered, "maintenance notice pushed to admins");
         delivered
     }
