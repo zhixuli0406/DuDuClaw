@@ -43,7 +43,8 @@ enum Reach {
 }
 
 /// Retry `ssh_maint_status` every `reconcile_retry` until it answers or
-/// `reconcile_deadline` passes (R3, R2-L6). Holds no lock while waiting.
+/// `reconcile_deadline` passes (R3, R2-L6). The caller keeps the window writer
+/// lock: no new key may open before restart cleanup finishes.
 async fn wait_for_sysd(env: &MaintEnv) -> Reach {
     let start = Instant::now();
     loop {
@@ -86,6 +87,23 @@ async fn wait_for_sysd(env: &MaintEnv) -> Reach {
 /// the rows [`revoke_on_boot`] revoked. Returns [`SysdSupport::Old`] when sysd
 /// predates the maintenance verbs, so the supervisor stops polling it.
 pub async fn boot_reconcile(env: &MaintEnv, revoked: Vec<MaintenanceWindow>) -> SysdSupport {
+    let guard = boot_reconcile_guard().await;
+    boot_reconcile_guarded(env, revoked, guard).await
+}
+
+/// Acquire before spawning the supervisor, so even an enable dispatched
+/// before that task's first poll must wait for the boot cleanup.
+pub(in crate::maintenance) async fn boot_reconcile_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    WINDOW_LOCK.lock().await
+}
+
+/// Run R3 with the writer reservation acquired before the supervisor spawn.
+/// Release it before pushing notices, which may wait on external channels.
+pub(in crate::maintenance) async fn boot_reconcile_guarded(
+    env: &MaintEnv,
+    revoked: Vec<MaintenanceWindow>,
+    guard: tokio::sync::MutexGuard<'static, ()>,
+) -> SysdSupport {
     let reach = wait_for_sysd(env).await;
     let support = if matches!(reach, Reach::OldSysd) {
         SysdSupport::Old
@@ -101,7 +119,6 @@ pub async fn boot_reconcile(env: &MaintEnv, revoked: Vec<MaintenanceWindow>) -> 
     };
     let mut notices = Vec::new();
     {
-        let _guard = WINDOW_LOCK.lock().await;
         match &reach {
             Reach::Status(sysd, st) => {
                 // An `opening` row never completed: its key counts as an
@@ -148,6 +165,7 @@ pub async fn boot_reconcile(env: &MaintEnv, revoked: Vec<MaintenanceWindow>) -> 
             let _ = store.forget_ssh_events_except(None).await;
         }
     }
+    drop(guard);
     env.send(notices).await;
     support
 }
@@ -289,6 +307,11 @@ pub async fn poll_sysd(env: &MaintEnv) -> SysdSupport {
         .await;
         if st.definitely_closed() {
             revoke_if_closed_by_os(&store, &audit, sysd.as_ref(), &st, &mut notices).await;
+            if !st.pending_cleanup && st.observed_active() == Some(false) {
+                if let Err(e) = store.confirm_ssh_closed().await {
+                    warn!(error = %e, "maintenance: could not persist a confirmed SSH close");
+                }
+            }
         }
     }
     env.send(notices).await;

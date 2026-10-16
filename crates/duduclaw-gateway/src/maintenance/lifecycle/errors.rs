@@ -10,6 +10,7 @@ use tracing::error;
 pub mod error_code {
     pub const CONFIRM_TEXT_MISMATCH: &str = "confirm_text_mismatch";
     pub const USER_SYSTEM_UNAVAILABLE: &str = "user_system_unavailable";
+    pub const GATEWAY_NOT_OWNER: &str = "gateway_not_owner";
     pub const INVALID_REQUEST: &str = "invalid_request";
     pub const SSH_KEY_REQUIRED: &str = "ssh_key_required";
     pub const SSH_KEY_UNEXPECTED: &str = "ssh_key_unexpected";

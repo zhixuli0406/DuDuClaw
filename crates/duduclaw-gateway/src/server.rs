@@ -1917,7 +1917,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             );
         }
         let env = crate::maintenance::MaintEnv::system(&home_dir, Some(user_db.clone()));
-        crate::maintenance::supervisor::spawn(Arc::new(env), boot_revoked);
+        // Reserve the window writer lock before serving RPCs, even if the
+        // spawned supervisor has not been polled yet. Status stays readable.
+        crate::maintenance::supervisor::spawn(Arc::new(env), boot_revoked).await;
     } else {
         error!("another gateway holds this data directory: the maintenance supervisor does not run in this process");
     }

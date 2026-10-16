@@ -29,6 +29,9 @@ impl MethodHandler {
     pub(crate) async fn handle_maintenance_enable(&self, params: Value, ctx: &UserContext) -> WsFrame {
         use crate::maintenance::{EnableRequest, MaintError, error_code};
 
+        if let Err(e) = require_maintenance_writer(self.home_dir()) {
+            return maintenance_error(&e);
+        }
         let confirm_text = params
             .get("confirm_text")
             .and_then(Value::as_str)
@@ -111,6 +114,9 @@ impl MethodHandler {
     /// confirmation). The returned window carries `close_error` when the SSH
     /// close could not be confirmed.
     pub(crate) async fn handle_maintenance_disable(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(e) = require_maintenance_writer(self.home_dir()) {
+            return maintenance_error(&e);
+        }
         let reason = params.get("reason").and_then(Value::as_str);
         let env = self.maintenance_env().await;
         match crate::maintenance::disable(&env, &ctx.user_id, reason).await {
@@ -177,6 +183,52 @@ impl MethodHandler {
             Ok(()) => WsFrame::ok_response("", json!({"logged": true})),
             Err(e) => WsFrame::error_response("", &e),
         }
+    }
+}
+
+/// Only the gateway running this home's supervisor can mutate its windows.
+/// A second gateway may still serve status, but its process-local window
+/// mutex cannot serialise writes with the owner process.
+fn require_maintenance_writer(home: &std::path::Path) -> Result<(), crate::maintenance::MaintError> {
+    if duduclaw_core::gateway_instance::held(home) {
+        return Ok(());
+    }
+    Err(crate::maintenance::MaintError::new(
+        crate::maintenance::error_code::GATEWAY_NOT_OWNER,
+        "這個閘道目前無法變更維修模式，請使用正在運作的閘道。",
+    ))
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use fs2::FileExt;
+
+    #[test]
+    fn maintenance_writer_requires_the_real_lock_for_its_own_home() {
+        let owner_home = tempfile::tempdir().unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        assert!(require_maintenance_writer(owner_home.path()).is_err());
+        duduclaw_core::gateway_instance::acquire(owner_home.path()).unwrap();
+        assert!(require_maintenance_writer(owner_home.path()).is_ok());
+        assert!(require_maintenance_writer(other_home.path()).is_err());
+
+        // An independently held OS lock stands in for the other gateway.
+        std::fs::create_dir_all(other_home.path().join("locks")).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(duduclaw_core::gateway_instance::lock_path(other_home.path()))
+            .unwrap();
+        other.try_lock_exclusive().unwrap();
+        assert!(duduclaw_core::gateway_instance::acquire(other_home.path()).is_err());
+        assert_eq!(
+            require_maintenance_writer(other_home.path()).unwrap_err().code,
+            crate::maintenance::error_code::GATEWAY_NOT_OWNER
+        );
+        assert!(require_maintenance_writer(owner_home.path()).is_ok());
     }
 }
 

@@ -63,6 +63,7 @@ struct MockSysd {
     default_status: StdMutex<Option<SysdCallResult>>,
     stop_reply: StdMutex<Option<SysdCallResult>>,
     open_delay: Duration,
+    status_delay: Duration,
     calls: StdMutex<Vec<String>>,
     opened_with: StdMutex<Vec<(String, u64, String)>>,
 }
@@ -113,6 +114,9 @@ impl MaintSysd for MockSysd {
 
     async fn ssh_maint_status(&self) -> SysdCallResult {
         self.calls.lock().unwrap().push("status".into());
+        if !self.status_delay.is_zero() {
+            tokio::time::sleep(self.status_delay).await;
+        }
         if let Some(r) = self.status_replies.lock().unwrap().pop_front() {
             return r;
         }
@@ -142,6 +146,7 @@ enum Mode {
 
 struct MockProvider {
     mode: StdMutex<Mode>,
+    access_calls: AtomicUsize,
     /// `access()` answers Unreachable this many more times before `mode`.
     unreachable_for: AtomicUsize,
     sysd: Arc<MockSysd>,
@@ -151,6 +156,7 @@ impl MockProvider {
     fn new(mode: Mode, sysd: Arc<MockSysd>) -> Arc<Self> {
         Arc::new(Self {
             mode: StdMutex::new(mode),
+            access_calls: AtomicUsize::new(0),
             unreachable_for: AtomicUsize::new(0),
             sysd,
         })
@@ -162,6 +168,7 @@ impl MockProvider {
 
 impl SysdProvider for MockProvider {
     fn access(&self) -> SysdAccess {
+        self.access_calls.fetch_add(1, Ordering::SeqCst);
         if self.unreachable_for.load(Ordering::SeqCst) > 0 {
             self.unreachable_for.fetch_sub(1, Ordering::SeqCst);
             return SysdAccess::Unreachable("socket missing (test)".into());
@@ -786,6 +793,60 @@ async fn a_right_password_resets_the_failure_run() {
 // ── Close paths ─────────────────────────────────────────────
 
 #[tokio::test]
+async fn details_windows_cannot_hide_an_unconfirmed_ssh_close() {
+    let h = harness(Mode::Available);
+    let old = open_ssh_window(&h).await;
+    h.provider.set_mode(Mode::Unreachable);
+    disable(&h.env, "u1", None).await.unwrap();
+    let details = caps(&["show_details"]);
+    let fresh = enable(
+        &h.env,
+        &request(&details, None, PASSWORD),
+        &CountingVerifier::new(),
+    )
+    .await
+    .unwrap();
+    let status = status_json(&h.env, None).await.unwrap();
+    assert_eq!(status["window"]["id"], fresh.id);
+    assert_eq!(status["close_unconfirmed"], true);
+
+    // A positive closed status removes the warning immediately; the writer
+    // poll persists that confirmation without deleting the historical error.
+    h.provider.set_mode(Mode::Available);
+    let mut pending: Value = serde_json::from_str(&closed_status()).unwrap();
+    pending["pending_cleanup"] = json!(true);
+    h.sysd.set_status(ok(pending.to_string()));
+    poll_sysd(&h.env).await;
+    assert!(
+        MaintenanceStore::open(h.home.path())
+            .unwrap()
+            .has_unconfirmed_close()
+            .await
+            .unwrap(),
+        "a pending cleanup cannot acknowledge the earlier close error"
+    );
+    h.sysd.set_status(ok(closed_status()));
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    poll_sysd(&h.env).await;
+    h.provider.set_mode(Mode::Unreachable);
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false,
+        "an already confirmed old close must not reappear on a later outage"
+    );
+    let store = MaintenanceStore::open(h.home.path()).unwrap();
+    assert!(
+        store.recent_windows(10).await.unwrap().iter().any(|w| {
+            w.id == old.id && w.close_error.is_some()
+        }),
+        "retain the original failure for history"
+    );
+}
+
+#[tokio::test]
 async fn disable_with_sysd_unreachable_on_an_appliance_is_a_close_error() {
     let h = harness(Mode::Available);
     open_ssh_window(&h).await;
@@ -956,6 +1017,74 @@ async fn boot_counts_a_key_from_an_unfinished_open_as_an_orphan() {
         .find(|e| e["kind"] == "gateway_restart_revoked")
         .unwrap();
     assert!(line["close_error"].is_null());
+}
+
+#[tokio::test]
+async fn boot_reconciliation_finishes_old_cleanup_before_a_new_enable() {
+    let h = harness_with(
+        Mode::Available,
+        MockSysd {
+            status_delay: Duration::from_millis(25),
+            ..Default::default()
+        },
+        false,
+    );
+    let old = open_ssh_window(&h).await;
+    let revoked = revoke_on_boot(h.home.path()).await;
+    let ((), fresh) = tokio::join!(
+        async {
+            boot_reconcile(&h.env, revoked).await;
+        },
+        async {
+            // Join polls boot first: its status call is already in flight.
+            while h.sysd.calls("status") == 0 {
+                tokio::task::yield_now().await;
+            }
+            open_ssh_window(&h).await
+        }
+    );
+    assert_ne!(old.id, fresh.id);
+    assert_eq!(
+        *h.sysd.calls.lock().unwrap(),
+        vec!["open", "status", "stop", "open"],
+        "boot's unscoped stop must finish before a new key is opened"
+    );
+    assert_eq!(
+        MaintenanceStore::open(h.home.path())
+            .unwrap()
+            .active_window()
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        fresh.id
+    );
+}
+
+#[tokio::test]
+async fn status_remains_available_during_the_boot_readiness_wait() {
+    let h = harness(Mode::Unreachable);
+    let ((), ()) = tokio::join!(
+        async {
+            boot_reconcile(&h.env, Vec::new()).await;
+        },
+        async {
+            // boot is waiting for sysd's readiness, not serialising readers.
+            while h.provider.access_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            let status = tokio::time::timeout(
+                Duration::from_millis(50),
+                status_json(&h.env, None),
+            )
+            .await
+            .expect("status must not wait for boot reconciliation")
+            .unwrap();
+            assert_eq!(status["active"], false);
+            assert_eq!(status["ssh"]["reason"], "sysd_unreachable");
+            h.provider.set_mode(Mode::Available);
+        }
+    );
 }
 
 #[tokio::test]
@@ -1166,6 +1295,41 @@ async fn the_poll_closes_an_orphan_key() {
 // ── Supervisor ──────────────────────────────────────────────
 
 #[tokio::test]
+async fn supervisor_reserves_boot_cleanup_before_its_first_poll() {
+    let h = harness(Mode::Available);
+    open_ssh_window(&h).await;
+    let revoked = revoke_on_boot(h.home.path()).await;
+    let env = Arc::new(MaintEnv {
+        home_dir: h.home.path().to_path_buf(),
+        sysd: h.provider.clone(),
+        notifier: h.notifier.clone(),
+        reconcile_retry: h.env.reconcile_retry,
+        reconcile_deadline: h.env.reconcile_deadline,
+        tick_interval: Duration::from_secs(60),
+    });
+    let task = supervisor::spawn(env, revoked).await;
+    // The current-thread test runtime has not polled the spawned task yet.
+    assert_eq!(h.sysd.calls("status"), 0);
+    let fresh = open_ssh_window(&h).await;
+    task.abort();
+    assert_eq!(
+        *h.sysd.calls.lock().unwrap(),
+        vec!["open", "status", "stop", "open"],
+        "a new enable must wait even before the supervisor's first poll"
+    );
+    assert_eq!(
+        MaintenanceStore::open(h.home.path())
+            .unwrap()
+            .active_window()
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        fresh.id
+    );
+}
+
+#[tokio::test]
 async fn the_supervisor_expires_windows_with_no_dispatch_engine_running() {
     // No dispatch engine exists in this test at all: the supervisor alone
     // must sweep the TTL.
@@ -1184,7 +1348,7 @@ async fn the_supervisor_expires_windows_with_no_dispatch_engine_running() {
         reconcile_deadline: Duration::from_millis(50),
         tick_interval: Duration::from_millis(20),
     });
-    let task = supervisor::spawn(env, Vec::new());
+    let task = supervisor::spawn(env, Vec::new()).await;
     let mut swept = false;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(20)).await;

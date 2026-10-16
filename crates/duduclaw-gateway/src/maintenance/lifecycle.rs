@@ -729,4 +729,5 @@ use errors::{key_error, locked_error, unreachable_error, unsupported_error};
 use reconcile::reconcile_with;
 
 pub use reconcile::{SysdSupport, boot_reconcile, poll_sysd, revoke_on_boot};
+pub(super) use reconcile::{boot_reconcile_guard, boot_reconcile_guarded};
 pub use status::status_json;

@@ -299,6 +299,7 @@ const WINDOW_COLUMNS_2026_10: &[(&str, &str)] = &[
     ("ssh_key_label", "TEXT"),
     ("host_key_fingerprints", "TEXT"),
     ("open_error", "TEXT"),
+    ("close_confirmed_at", "TEXT"),
 ];
 
 // ── Store ───────────────────────────────────────────────────
@@ -664,11 +665,37 @@ impl MaintenanceStore {
     pub async fn set_close_error(&self, id: &str, message: &str) {
         let conn = self.conn.lock().await;
         if let Err(e) = conn.execute(
-            "UPDATE maintenance_windows SET close_error = ?1 WHERE id = ?2",
+            "UPDATE maintenance_windows SET close_error = ?1, close_confirmed_at = NULL WHERE id = ?2",
             params![message, id],
         ) {
             warn!(error = %e, window_id = id, "failed to record maintenance close_error note");
         }
+    }
+
+    /// An unresolved SSH close stays visible across later show-details
+    /// windows. Keep the original error for history when sysd confirms it.
+    pub async fn has_unconfirmed_close(&self) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_windows
+             WHERE close_error IS NOT NULL AND close_confirmed_at IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("read unconfirmed maintenance closes: {e}"))
+    }
+
+    /// Called under the writer lock only after a fresh positive sysd status
+    /// confirms no key, window, socket, session or cleanup remains.
+    pub async fn confirm_ssh_closed(&self) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE maintenance_windows SET close_confirmed_at = ?1
+             WHERE close_error IS NOT NULL AND close_confirmed_at IS NULL",
+            params![now_rfc3339()],
+        )
+        .map_err(|e| format!("confirm maintenance SSH closes: {e}"))?;
+        Ok(())
     }
 
     /// `maintenance.history`-adjacent: recent windows (lifecycle rows), newest
