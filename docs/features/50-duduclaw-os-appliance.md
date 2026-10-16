@@ -168,6 +168,17 @@ gateway, not by the desktop.
   [Security defense](05-security-defense.md)). It does nothing until an
   OS image ships the account; on such an image the helper refuses the
   old port-only switch.
+  The unreleased gateway side asks for the technician's public key in the
+  same request as the typed confirmation and the password re-entry
+  (five wrong passwords in a row lock opening for 15 minutes), records the
+  window before asking the helper, and never falls back to the port-only
+  switch: with a v0.4.0 or older image, or a partly updated one, the SSH
+  option is reported as unsupported. A separate background task started
+  with the gateway closes windows at their TTL, closes any key the helper
+  holds without a matching window, copies the helper's sign-in records
+  into the maintenance history, and tells every Admin the key and device
+  fingerprints when a window opens. If the helper cannot be reached when a
+  window closes, the close is recorded as unconfirmed, never as done.
   On v0.3.0 and earlier images dropbear listens on port 22 from boot. The
   desktop edition's firewall has no rule for it, so SSH cannot be reached
   from the network there, but the base edition has no firewall, so on it

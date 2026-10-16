@@ -3,11 +3,6 @@
 ## [Unreleased]
 
 ### Added
-- 新 crate `duduclaw-maint-tools`，給 DuDuClaw OS 維修 SSH 帳號 `duduclaw-maint`（uid 4800）用的兩個程式。要等 OS 映像裝上這個帳號才用得到，平台發行檔不打包，由 OS recipe 建置；說明見 `crates/duduclaw-maint-tools/README.md`。
-  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會先提醒這會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。`SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。兩個重啟不在選單裡執行，而是請 helper 代做。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
-  - `duduclaw-maint-helper`：以 root 執行、每條連線一個實例的小服務，socket 是 `/run/duduclaw-maint-helper.sock`。對端 uid 由 `SO_PEERCRED` 取得，不是 4800 就拒絕；只收六個字：`gateway`、`gateway-follow`、`model`、`model-follow`、`restart-gateway`、`restart-model`。
-    - 紀錄：以 `journalctl -o json` 依 `_SYSTEMD_UNIT` 與 `_UID=1000` 篩選。`MESSAGE` 任一行去掉前置空白後以 `password:` 開頭（不分大小寫）的整筆丟掉，這是 gateway 首次開機印出的一次性密碼；其餘去控制字元、遮罩憑證、截成 4 KiB 後輸出。非 follow 最多 1000 行，超過 64 KiB 的紀錄跳過；請求要在 10 秒內送完，用戶端 30 秒不讀就斷線，follow 在用戶端斷線時立刻停止。
-    - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；目錄要是 root 擁有的 0700、狀態檔要是 root 擁有的 0600 單一連結一般檔，不符或讀寫失敗就拒絕；狀態檔時間在未來時改寫成現在並記一筆警告，不會卡到重開機）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
 - 維修模式的 SSH 改用專用帳號加臨時金鑰，這次先做完 OS 端輔助程式 `duduclaw-sysd` 的部分（閘道與儀表板在後續 PR）。要等 DuDuClaw OS 出貨 `duduclaw-maint` 帳號後才會生效，在那之前使用者看不到任何改變。內容：
   - 新指令 `ssh_maint_open`、`ssh_maint_status`（sysd 指令從 18 個變 20 個）。開窗時只收一把公鑰：Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元的 RSA（指數為奇數、不超過 64 位元）。輔助程式自己解碼並逐欄檢查，拒絕金鑰前的選項、憑證、私鑰、PuTTY 與 RFC 4716 區塊、一次多把；寫進檔案的只有固定選項（禁止轉送埠、agent、X11）加上解碼後的原始金鑰。
   - 金鑰檔放在重開機就清空的 `/run/duduclaw-maint-ssh/`，寫入時不跟隨符號連結，已有金鑰時不覆蓋（回 `busy`），寫完讀回比對。
@@ -16,6 +11,25 @@
   - sysd 每 15 秒自己從 journal 讀登入與登出（只認 journald 自己填的欄位），寫進只有 root 能存取的 `/data/system/maint-ssh-audit.log`，不靠閘道輪詢。每個視窗前 50 筆登入逐筆記錄、之後只計數；稽核檔超過 1 MiB 輪替，保留 5 份舊檔，並把開窗紀錄重寫到新檔開頭。稽核檔寫不進去（例如鎖被佔住）時不會開窗；關窗時則回報問題，把紀錄與還沒讀到的事件留著重試，寫完之前不接受新的開窗。開窗每小時最多 12 次、間隔至少 5 秒。視窗狀態與 journal 讀取位置存在 `/data/system/maint-ssh/`（重開機後仍在），視窗期間重開機的話，下次開機會補記登入並以「重開機」關窗；視窗開著時若防火牆的維修出站規則不見了，會立即關窗。
   - 映像有就緒標記 `/usr/lib/duduclaw/maint-ssh.ready` 時，舊的只開埠 `ssh_service_start` 會被拒絕；`ssh_service_stop` 另外負責刪金鑰、撤計時器、補記事件與寫關窗紀錄。兩個新指令都不開放給 `os_*` MCP 工具經閘道內部路由呼叫。
   - 尚未驗證（要等 OS 映像在 QEMU 上跑活測）：systemd、nftables、dropbear、journald 的真實輸出格式，systemd-run 同時帶單調與絕對時間的計時器，sysd 單次重啟時 dropbear 是否保持運作。
+- 維修模式 SSH 的閘道端（同一條線的第二部分；儀表板畫面在後續 PR）。一樣要等 DuDuClaw OS 出貨 `duduclaw-maint` 帳號才看得到效果：
+  - `maintenance.enable` 勾 SSH 時要在同一個請求帶 `ssh_public_key`，和輸入確認字、重新輸入密碼一起送出。閘道先用 sysd 同一套解析器檢查金鑰（只送 `<類型> <base64>` 給 sysd，註解只留作顯示標籤），先寫一筆 `opening` 的視窗紀錄再請 sysd 開啟，成功改成 `open`、失敗記 `open_failed`。不再有只開 22 埠的做法：舊版 OS 或只更新一部分的映像一律回「不支援」。
+  - 重新輸入密碼連續錯 5 次，這個帳號 15 分鐘內不能開啟維修模式，並推播給所有管理員；鎖定期間完全不驗證密碼。次數存在 `maintenance.db`，重啟不會歸零。
+  - 開啟成功後推播給所有管理員，內容有開啟者、到期時間、技術人員的金鑰指紋與本機主機指紋。`maintenance.status` 多了 `push_channel_available`，讓儀表板在沒有推播通道時改用別的核對說明。
+  - 拒絕時錯誤改成 `{code, message}`，代碼有 `ssh_key_required`、`ssh_key_invalid`（附 `reason`）、`reauth_failed`（附 `remaining_attempts`）、`reauth_locked`（附 `retry_after_seconds`）、`already_active`、`ssh_unsupported`、`ssh_unreachable`、`ssh_busy`（附 `reason`）、`ssh_rate_limited`、`ssh_open_failed` 等。sysd 回 `busy` 時不會送關閉去收回別人的視窗，只記 `open_failed` 並對帳一次。
+  - TTL 到期改由閘道開機就啟動的獨立背景工作處理，不再跟著派工引擎（`[dispatch] enabled = false` 時也照常到期）。它開機時每 2 秒問一次 sysd、最多等 60 秒，關掉 sysd 手上沒有對應視窗的金鑰（記 `ssh_orphan_closed`）；之後每 30 秒問一次 sysd，把登入、登出、驗證失敗（依來源彙總）、選單操作抄進 `maintenance_audit.jsonl`（字串截長、去控制字元，當資料看），並在 sysd 自己收掉視窗時記 `ssh_closed_by_os`。
+  - 在設備上關閉視窗時連不到 sysd，一律記成 `close_error` 並推播，不再當成「沒有東西要關」；`maintenance.status` 每次都問 sysd，回傳金鑰與本機指紋、到期秒數、目前連線、驗證失敗次數、`pending_cleanup`、`problems`，sysd 不可達時 `ssh_observed_active` 為 `null`，關閉沒被確認時 `close_unconfirmed` 為 true。
+  - sysd 在狀態裡回報上一次關窗的原因（例如重開機 `reboot`、防火牆規則被改 `firewall_changed`、登入紀錄是否遺失），閘道會照抄一次進維修歷史（`ssh_os_close_record`），並放進 `maintenance.status` 的 `ssh.last_close`；真實 OS 映像上的回報仍待活測。重開機後 sysd 已自行收掉舊視窗時，閘道不會把它當成孤兒金鑰。
+  - 驗證範圍：生命週期 mock 測試之外，增加原生 Unix socket 整合測試，由真正的 `SocketMaintSysd`／`SysdClient` 連到隔離的模擬 daemon，涵蓋開啟、狀態、關閉、`busy` 不回滾與舊版 verb 拒絕；macOS 本地與 Linux 原生 CI 跑同一組。尚未接上真的 sysd 與 OS 映像（要等 OS 的 PR 備妥後在 QEMU 活測）；推播只測了文字內容，沒有實際送到通道。
+- 新 crate `duduclaw-maint-tools`，給 DuDuClaw OS 維修 SSH 帳號 `duduclaw-maint`（uid 4800）用的兩個程式。要等 OS 映像裝上這個帳號才用得到，平台發行檔不打包，由 OS recipe 建置；說明見 `crates/duduclaw-maint-tools/README.md`。
+  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會先提醒這會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。`SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。兩個重啟不在選單裡執行，而是請 helper 代做。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
+  - `duduclaw-maint-helper`：以 root 執行、每條連線一個實例的小服務，socket 是 `/run/duduclaw-maint-helper.sock`。對端 uid 由 `SO_PEERCRED` 取得，不是 4800 就拒絕；只收六個字：`gateway`、`gateway-follow`、`model`、`model-follow`、`restart-gateway`、`restart-model`。
+    - 紀錄：以 `journalctl -o json` 依 `_SYSTEMD_UNIT` 與 `_UID=1000` 篩選。`MESSAGE` 任一行去掉前置空白後以 `password:` 開頭（不分大小寫）的整筆丟掉，這是 gateway 首次開機印出的一次性密碼；其餘去控制字元、遮罩憑證、截成 4 KiB 後輸出。非 follow 最多 1000 行，超過 64 KiB 的紀錄跳過；請求要在 10 秒內送完，用戶端 30 秒不讀就斷線，follow 在用戶端斷線時立刻停止。
+    - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；目錄要是 root 擁有的 0700、狀態檔要是 root 擁有的 0600 單一連結一般檔，不符或讀寫失敗就拒絕；狀態檔時間在未來時改寫成現在並記一筆警告，不會卡到重開機）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
+
+### Fixed
+- 維修模式通知改為同時嘗試所有管理員的已驗證通道。每條通道有獨立的 20 秒上限，單次 HTTP 請求仍是 10 秒，整體 30 秒保留作最後防線；一條通道卡住不會阻止其他通道開始送出，成功數只計回報傳送成功的通道。
+- 閘道重啟後，先完成維修 SSH 的舊視窗清理，再接受新的開啟請求，避免背景清理誤關剛開好的視窗；等待期間仍可查詢狀態。只有取得該資料目錄執行鎖的閘道能開啟或關閉維修模式，第二個閘道只能讀取狀態。
+- SSH 關閉未確認的警示會保留到系統服務確認關閉；新開的診斷詳情視窗不會遮掉警示。確認結果另外記錄，原先的關閉錯誤仍保留在歷史裡。
 
 ### Changed
 - npm 包裝補上安裝、獨立 MCP 模式與文件入口的 README；六個 npm manifest 的 repository URL 改為 npm 標準的 `git+https` 格式。既有 1.74.0 不會因此改變，須隨下一次 npm 發布上線。

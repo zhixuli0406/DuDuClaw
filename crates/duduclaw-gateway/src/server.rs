@@ -1894,20 +1894,34 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         );
     }
 
-    // ── Maintenance Mode — Entry A: boot-time-only reassert-closed ────
+    // ── Maintenance Mode — Entry A: boot reassert-closed + supervisor ────
     // `DESIGN-maintenance-mode-2026-08.md` §2.4: a gateway process restart
     // force-closes any in-flight maintenance window, unconditionally (even
     // with TTL time left) — stricter than `resume_on_restart=pause` above,
     // which still offers an `auto` mode; maintenance mode has no such
-    // option at all. Called exactly once, here, at boot — never from a hot
-    // reload path, mirroring `pause_inflight_goal_tasks_on_restart`'s own
-    // contract. Runs unconditionally (no feature gate): a stale open window
-    // surviving an in-memory-state wipe is exactly the orphan-window
-    // scenario this call exists to close.
-    if crate::maintenance::reassert_closed_on_boot(&home_dir).await > 0 {
-        warn!(
-            "maintenance mode was open before this restart — force-closed (revoke_reason=gateway_restart)"
-        );
+    // option at all. The ledger part runs here, before the dashboard serves
+    // anything. Then the maintenance supervisor starts as its own task
+    // (`DESIGN-maintenance-ssh-account-2026-10.md` M9, R3): it waits for sysd
+    // (every 2 s, up to 60 s), closes an orphan SSH key, runs the revoked
+    // windows' close actions, and from then on every 30 s does the TTL sweep,
+    // the sysd poll and the audit mirror. No feature gate and no dependency
+    // on `[dispatch] enabled`: a window must expire whatever else is off.
+    // Only the process holding `<home>/locks/gateway.lock` runs it: a second
+    // gateway on the same home must not revoke or stop the first one's window
+    // (its `WINDOW_LOCK` cannot see the other process's `opening` row).
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        let boot_revoked = crate::maintenance::revoke_on_boot(&home_dir).await;
+        if !boot_revoked.is_empty() {
+            warn!(
+                "maintenance mode was open before this restart — force-closed (revoke_reason=gateway_restart)"
+            );
+        }
+        let env = crate::maintenance::MaintEnv::system(&home_dir, Some(user_db.clone()));
+        // Reserve the window writer lock before serving RPCs, even if the
+        // spawned supervisor has not been polled yet. Status stays readable.
+        crate::maintenance::supervisor::spawn(Arc::new(env), boot_revoked).await;
+    } else {
+        error!("another gateway holds this data directory: the maintenance supervisor does not run in this process");
     }
 
     // ── D5: semi-automatic topology evolution (human-gated) ───

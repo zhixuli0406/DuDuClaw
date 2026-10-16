@@ -33,15 +33,27 @@
 //!   already active (§2.2 "沒有累加式的隱性延長入口").
 //! - A gateway process restart force-closes any in-flight window
 //!   (`revoke_reason = "gateway_restart"`), even if its TTL had not expired
-//!   — see [`reassert_closed_on_boot`] and §2.4's "reassert closed" design
+//!   — see [`lifecycle::revoke_on_boot`] and §2.4's "reassert closed" design
 //!   decision. This is the SAME `resume_on_restart=pause` lineage as
 //!   `goal_loop.rs`, but stricter: there is no `auto` option here at all.
-//! - A close action (stopping the SSH server through `duduclaw-sysd`) failing never gets
-//!   papered over: [`MaintenanceWindow::close_error`] is a distinct column,
-//!   surfaced by `status()` alongside a LIVE observed probe
-//!   ([`ssh_service_observed_active`]) so the dashboard reports what the
-//!   system actually looks like, not just what the ledger optimistically
-//!   claims (§6 fail-closed principle #2).
+//! - A close action (stopping the SSH server through `duduclaw-sysd`) failing
+//!   never gets papered over: [`MaintenanceWindow::close_error`] is a distinct
+//!   column, and on an appliance an unreachable sysd is a close error, never
+//!   "nothing to close". `maintenance.status` reports what sysd actually says
+//!   (`close_unconfirmed`, `ssh_observed_active`), not what the ledger claims
+//!   (§6 fail-closed principle #2).
+//!
+//! ## SSH key windows (2026-10)
+//!
+//! Authority for the `ssh` sub-capability since 2026-10:
+//! `commercial/docs/specs/DESIGN-maintenance-ssh-account-2026-10.md`. SSH opens
+//! only for the `duduclaw-maint` account with one public key that sysd checks
+//! and writes; there is no port-only open any more. Submodules:
+//! [`lifecycle`] (enable/disable/sweep/boot reconciliation/poll/status),
+//! [`supervisor`] (the boot-started task that runs them),
+//! [`sysd_port`] (the three sysd verbs behind a mockable trait),
+//! [`lockout`] (password re-entry lockout, event dedup), [`notify`] (Admin
+//! notices).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
@@ -52,7 +64,20 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+
+pub mod lifecycle;
+pub mod lockout;
+pub mod notify;
+pub mod supervisor;
+pub mod sysd_port;
+#[cfg(test)]
+mod tests_ssh;
+
+pub use lifecycle::{
+    EnableRequest, MaintEnv, MaintError, ReauthVerifier, disable, enable, error_code, revoke_on_boot,
+    run_close_actions, status_json, sweep_expired,
+};
 
 // ── Constants ───────────────────────────────────────────────
 
@@ -72,6 +97,13 @@ pub const CONFIRM_TEXT: &str = "MAINTENANCE";
 pub const REVOKE_REASON_ADMIN: &str = "admin_disabled";
 pub const REVOKE_REASON_TTL: &str = "ttl_expired";
 pub const REVOKE_REASON_RESTART: &str = "gateway_restart";
+/// The SSH open never completed (sysd refused or failed it); the row is kept
+/// as a record of the attempt, closed at the moment of the failure.
+pub const REVOKE_REASON_OPEN_FAILED: &str = "open_failed";
+/// The OS side closed the SSH window by itself (sysd's own deadline, the PID 1
+/// fallback timer, or sysd's startup cleanup) and the supervisor saw the key
+/// gone.
+pub const REVOKE_REASON_OS: &str = "closed_by_os";
 
 /// §2.6: the closed set of sub-capabilities Entry A may unlock. Deliberately
 /// NOT an open string — every value that reaches [`MaintenanceStore::enable`]
@@ -133,6 +165,50 @@ pub struct MaintenanceWindow {
     /// record a revoke that a human/TTL sweep already decided on), but keeps
     /// the discrepancy visible to forensics and to `status()`.
     pub close_error: Option<String>,
+    /// Lifecycle of the open itself (`opening` → `open` | `open_failed`, then
+    /// `closed` once revoked). Only an `open` row counts as active.
+    pub state: WindowState,
+    /// The one SSH key this window installed (SSH windows only).
+    pub ssh_key_type: Option<String>,
+    pub ssh_key_fingerprint: Option<String>,
+    /// Display-only label from the key comment (`[A-Za-z0-9@._+-]`, ≤ 64).
+    pub ssh_key_label: Option<String>,
+    /// The device's SSH host key fingerprints as sysd reported them on open.
+    pub host_key_fingerprints: Vec<String>,
+    /// Why the open failed (`open_failed` rows only).
+    pub open_error: Option<String>,
+}
+
+/// [`MaintenanceWindow::state`]. Stored as its `as_str()` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowState {
+    /// Row written, sysd not yet confirmed the SSH open.
+    Opening,
+    Open,
+    OpenFailed,
+    Closed,
+}
+
+impl WindowState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowState::Opening => "opening",
+            WindowState::Open => "open",
+            WindowState::OpenFailed => "open_failed",
+            WindowState::Closed => "closed",
+        }
+    }
+
+    /// Unknown text fails closed to `Closed` (never counted as active).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "opening" => WindowState::Opening,
+            "open" => WindowState::Open,
+            "open_failed" => WindowState::OpenFailed,
+            _ => WindowState::Closed,
+        }
+    }
 }
 
 impl MaintenanceWindow {
@@ -145,7 +221,7 @@ impl MaintenanceWindow {
     /// True when this row is currently open: not revoked and not past its
     /// TTL. An unparseable `expires_at` fails closed (treated as expired).
     pub fn is_active(&self, now: DateTime<Utc>) -> bool {
-        if self.revoked_at.is_some() {
+        if self.revoked_at.is_some() || self.state != WindowState::Open {
             return false;
         }
         match self.expires_at_dt() {
@@ -198,13 +274,46 @@ fn row_to_window(row: &rusqlite::Row) -> rusqlite::Result<MaintenanceWindow> {
         revoke_reason: row.get(8)?,
         reminded_at: row.get(9)?,
         close_error: row.get(10)?,
+        state: WindowState::parse(&row.get::<_, String>(11)?),
+        ssh_key_type: row.get(12)?,
+        ssh_key_fingerprint: row.get(13)?,
+        ssh_key_label: row.get(14)?,
+        host_key_fingerprints: row
+            .get::<_, Option<String>>(15)?
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default(),
+        open_error: row.get(16)?,
     })
 }
 
 const SELECT_COLUMNS: &str = "id, enabled_by, enabled_by_email, enabled_at, ttl_seconds, \
-     expires_at, sub_capabilities, revoked_at, revoke_reason, reminded_at, close_error";
+     expires_at, sub_capabilities, revoked_at, revoke_reason, reminded_at, close_error, \
+     state, ssh_key_type, ssh_key_fingerprint, ssh_key_label, host_key_fingerprints, open_error";
+
+/// Columns added for the maintenance SSH key windows (2026-10). Added with
+/// `ALTER TABLE` to a `maintenance.db` an older gateway created.
+const WINDOW_COLUMNS_2026_10: &[(&str, &str)] = &[
+    ("state", "TEXT NOT NULL DEFAULT 'open'"),
+    ("ssh_key_type", "TEXT"),
+    ("ssh_key_fingerprint", "TEXT"),
+    ("ssh_key_label", "TEXT"),
+    ("host_key_fingerprints", "TEXT"),
+    ("open_error", "TEXT"),
+    ("close_confirmed_at", "TEXT"),
+];
 
 // ── Store ───────────────────────────────────────────────────
+
+/// Arguments of [`MaintenanceStore::insert`].
+pub struct NewWindow<'a> {
+    pub enabled_by: &'a str,
+    pub enabled_by_email: &'a str,
+    pub ttl_hours: i64,
+    pub sub_capabilities: &'a [String],
+    pub state: WindowState,
+    /// The parsed key of an SSH window (fingerprint, type and label are stored).
+    pub ssh_key: Option<&'a duduclaw_sysd::ssh_key::ParsedKey>,
+}
 
 /// SQLite-backed state machine. Mirrors the `ApprovalStore` /
 /// `CapabilityGrantStore` idioms: `Mutex<Connection>`, WAL, self-healing
@@ -222,7 +331,7 @@ impl MaintenanceStore {
         let conn =
             Connection::open(&db_path).map_err(|e| format!("open maintenance store: {e}"))?;
         Self::init_schema(&conn)?;
-        info!(?db_path, "MaintenanceStore initialized");
+        tracing::debug!(?db_path, "MaintenanceStore opened");
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -255,9 +364,56 @@ impl MaintenanceStore {
                  close_error      TEXT
              );
 
-             CREATE INDEX IF NOT EXISTS idx_maint_revoked ON maintenance_windows(revoked_at);",
+             CREATE INDEX IF NOT EXISTS idx_maint_revoked ON maintenance_windows(revoked_at);
+
+             CREATE TABLE IF NOT EXISTS maintenance_reauth (
+                 user_id              TEXT PRIMARY KEY,
+                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                 locked_until         TEXT
+             );
+
+             CREATE TABLE IF NOT EXISTS maintenance_ssh_events (
+                 window_id TEXT NOT NULL,
+                 cursor    TEXT NOT NULL,
+                 PRIMARY KEY (window_id, cursor)
+             );",
         )
         .map_err(|e| format!("init maintenance_windows schema: {e}"))?;
+        Self::migrate_window_columns(conn)
+    }
+
+    /// Add the 2026-10 columns to an older table. A row that was already
+    /// revoked before the `state` column existed becomes `closed`; an
+    /// unrevoked one stays `open` (it was opened by the old flow, which only
+    /// wrote rows after a successful open).
+    fn migrate_window_columns(conn: &Connection) -> Result<(), String> {
+        let existing: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(maintenance_windows)")
+                .map_err(|e| format!("read maintenance_windows columns: {e}"))?;
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| format!("read maintenance_windows columns: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read maintenance_windows columns: {e}"))?
+        };
+        for (name, decl) in WINDOW_COLUMNS_2026_10 {
+            if existing.iter().any(|c| c == name) {
+                continue;
+            }
+            match conn.execute(&format!("ALTER TABLE maintenance_windows ADD COLUMN {name} {decl}"), []) {
+                Ok(_) => {}
+                // Another connection added it between the read and the ALTER.
+                Err(e) if e.to_string().contains("duplicate column name") => continue,
+                Err(e) => return Err(format!("add maintenance_windows.{name}: {e}")),
+            }
+            if *name == "state" {
+                conn.execute(
+                    "UPDATE maintenance_windows SET state = 'closed' WHERE revoked_at IS NOT NULL",
+                    [],
+                )
+                .map_err(|e| format!("backfill maintenance_windows.state: {e}"))?;
+            }
+        }
         Ok(())
     }
 
@@ -291,11 +447,11 @@ impl MaintenanceStore {
         Ok(row.filter(|w| w.is_active(Utc::now())))
     }
 
-    /// Enable a new window. Refuses (§2.2, no accumulation) when a window is
-    /// already unrevoked, whether or not it has technically expired yet — a
-    /// caller who wants a fresh window after expiry must wait for the sweep
-    /// (or call `disable` first), never silently stack a second one.
-    #[allow(clippy::too_many_arguments)]
+    /// Enable a new window that is open right away (no SSH key involved).
+    /// Refuses (§2.2, no accumulation) when a window is already unrevoked,
+    /// whether or not it has technically expired yet — a caller who wants a
+    /// fresh window after expiry must wait for the sweep (or call `disable`
+    /// first), never silently stack a second one.
     pub async fn enable(
         &self,
         enabled_by: &str,
@@ -303,50 +459,134 @@ impl MaintenanceStore {
         ttl_hours: i64,
         sub_capabilities: &[String],
     ) -> Result<MaintenanceWindow, String> {
+        self.insert(NewWindow {
+            enabled_by,
+            enabled_by_email,
+            ttl_hours,
+            sub_capabilities,
+            state: WindowState::Open,
+            ssh_key: None,
+        })
+        .await
+    }
+
+    /// Insert a window row in `new.state` (`Open`, or `Opening` for an SSH
+    /// window whose sysd open has not answered yet). Same refusal as
+    /// [`Self::enable`]: any unrevoked row, `opening` included, blocks it.
+    pub async fn insert(&self, new: NewWindow<'_>) -> Result<MaintenanceWindow, String> {
         if self.unrevoked_row().await?.is_some() {
             return Err("maintenance mode is already active".to_string());
         }
-        if ttl_hours <= 0 || ttl_hours > MAX_TTL_HOURS {
+        if new.ttl_hours <= 0 || new.ttl_hours > MAX_TTL_HOURS {
             return Err(format!("ttl_hours must be in 1..={MAX_TTL_HOURS}"));
         }
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
-        let ttl_seconds = ttl_hours.saturating_mul(3600);
+        let ttl_seconds = new.ttl_hours.saturating_mul(3600);
         let expires_at = (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339();
-        let sub_caps_json = serde_json::to_string(sub_capabilities)
+        let sub_caps_json = serde_json::to_string(new.sub_capabilities)
             .map_err(|e| format!("serialize sub_capabilities: {e}"))?;
+        let key_type = new.ssh_key.map(|k| k.key_type.name().to_string());
+        let key_fingerprint = new.ssh_key.map(|k| k.fingerprint.clone());
+        let key_label = new.ssh_key.map(|k| k.label.clone()).filter(|l| !l.is_empty());
 
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO maintenance_windows
                 (id, enabled_by, enabled_by_email, enabled_at, ttl_seconds,
-                 expires_at, sub_capabilities)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 expires_at, sub_capabilities, state, ssh_key_type,
+                 ssh_key_fingerprint, ssh_key_label)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
-                enabled_by,
-                enabled_by_email,
+                new.enabled_by,
+                new.enabled_by_email,
                 now.to_rfc3339(),
                 ttl_seconds,
                 expires_at,
                 sub_caps_json,
+                new.state.as_str(),
+                key_type,
+                key_fingerprint,
+                key_label,
             ],
         )
         .map_err(|e| format!("insert maintenance window: {e}"))?;
 
         Ok(MaintenanceWindow {
             id,
-            enabled_by: enabled_by.to_string(),
-            enabled_by_email: enabled_by_email.to_string(),
+            enabled_by: new.enabled_by.to_string(),
+            enabled_by_email: new.enabled_by_email.to_string(),
             enabled_at: now.to_rfc3339(),
             ttl_seconds,
             expires_at,
-            sub_capabilities: sub_capabilities.to_vec(),
+            sub_capabilities: new.sub_capabilities.to_vec(),
             revoked_at: None,
             revoke_reason: None,
             reminded_at: None,
             close_error: None,
+            state: new.state,
+            ssh_key_type: key_type,
+            ssh_key_fingerprint: key_fingerprint,
+            ssh_key_label: key_label,
+            host_key_fingerprints: Vec::new(),
+            open_error: None,
         })
+    }
+
+    /// `opening` → `open` once sysd confirmed the SSH open. Only touches a row
+    /// that is still unrevoked and `opening`; `Ok(false)` otherwise (the
+    /// caller then closes what sysd just opened).
+    pub async fn mark_open(&self, id: &str, host_key_fingerprints: &[String]) -> Result<bool, String> {
+        let fps = serde_json::to_string(host_key_fingerprints)
+            .map_err(|e| format!("serialize host key fingerprints: {e}"))?;
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE maintenance_windows SET state = 'open', host_key_fingerprints = ?1
+                 WHERE id = ?2 AND revoked_at IS NULL AND state = 'opening'",
+                params![fps, id],
+            )
+            .map_err(|e| format!("mark maintenance window open: {e}"))?;
+        Ok(n == 1)
+    }
+
+    /// The SSH open failed: the row becomes `open_failed` and is closed at
+    /// once (`revoke_reason = open_failed`), with the rollback's close error
+    /// when there was one.
+    pub async fn mark_open_failed(
+        &self,
+        id: &str,
+        open_error: &str,
+        close_error: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE maintenance_windows
+                SET state = 'open_failed', open_error = ?1, close_error = ?2,
+                    revoked_at = ?3, revoke_reason = ?4
+              WHERE id = ?5",
+            params![open_error, close_error, now_rfc3339(), REVOKE_REASON_OPEN_FAILED, id],
+        )
+        .map_err(|e| format!("mark maintenance window open_failed: {e}"))?;
+        Ok(())
+    }
+
+    /// The most recently enabled row, revoked or not.
+    pub async fn latest_window(&self) -> Result<Option<MaintenanceWindow>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            &format!("SELECT {SELECT_COLUMNS} FROM maintenance_windows ORDER BY enabled_at DESC LIMIT 1"),
+            [],
+            row_to_window,
+        )
+        .optional()
+        .map_err(|e| format!("query latest window: {e}"))
+    }
+
+    /// The unrevoked row (open, opening, or past TTL but unswept), if any.
+    pub async fn current_row(&self) -> Result<Option<MaintenanceWindow>, String> {
+        self.unrevoked_row().await
     }
 
     /// Revoke whatever is currently unrevoked (active or already
@@ -362,7 +602,7 @@ impl MaintenanceStore {
         };
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE maintenance_windows SET revoked_at = ?1, revoke_reason = ?2 WHERE id = ?3",
+            "UPDATE maintenance_windows SET revoked_at = ?1, revoke_reason = ?2, state = 'closed' WHERE id = ?3",
             params![now_rfc3339(), revoke_reason, window.id],
         )
         .map_err(|e| format!("revoke maintenance window: {e}"))?;
@@ -398,6 +638,15 @@ impl MaintenanceStore {
         self.revoke_unrevoked(REVOKE_REASON_RESTART).await
     }
 
+    /// The OS closed the SSH window itself: revoke the unrevoked row with
+    /// [`REVOKE_REASON_OS`], but only when it is still the row `id`.
+    pub async fn revoke_closed_by_os(&self, id: &str) -> Result<Option<MaintenanceWindow>, String> {
+        match self.unrevoked_row().await? {
+            Some(w) if w.id == id => self.revoke_unrevoked(REVOKE_REASON_OS).await,
+            _ => Ok(None),
+        }
+    }
+
     /// WP20-style once-only reminder guard.
     pub async fn mark_reminded(&self, id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
@@ -416,11 +665,37 @@ impl MaintenanceStore {
     pub async fn set_close_error(&self, id: &str, message: &str) {
         let conn = self.conn.lock().await;
         if let Err(e) = conn.execute(
-            "UPDATE maintenance_windows SET close_error = ?1 WHERE id = ?2",
+            "UPDATE maintenance_windows SET close_error = ?1, close_confirmed_at = NULL WHERE id = ?2",
             params![message, id],
         ) {
             warn!(error = %e, window_id = id, "failed to record maintenance close_error note");
         }
+    }
+
+    /// An unresolved SSH close stays visible across later show-details
+    /// windows. Keep the original error for history when sysd confirms it.
+    pub async fn has_unconfirmed_close(&self) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_windows
+             WHERE close_error IS NOT NULL AND close_confirmed_at IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("read unconfirmed maintenance closes: {e}"))
+    }
+
+    /// Called under the writer lock only after a fresh positive sysd status
+    /// confirms no key, window, socket, session or cleanup remains.
+    pub async fn confirm_ssh_closed(&self) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE maintenance_windows SET close_confirmed_at = ?1
+             WHERE close_error IS NOT NULL AND close_confirmed_at IS NULL",
+            params![now_rfc3339()],
+        )
+        .map_err(|e| format!("confirm maintenance SSH closes: {e}"))?;
+        Ok(())
     }
 
     /// `maintenance.history`-adjacent: recent windows (lifecycle rows), newest
@@ -620,270 +895,7 @@ fn cgroup_has_processes(dir: &std::path::Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
-// ── Orchestration (store + audit + device actions, one call each) ──
-
-/// Run the close action(s) for a window's `sub_capabilities`. Best-effort per
-/// capability — one failing does not skip the others. `None` when every
-/// action succeeded (or there was nothing to close); `Some(message)`
-/// otherwise, for [`MaintenanceStore::set_close_error`] + the audit line.
-async fn run_close_actions(sub_capabilities: &[String]) -> Option<String> {
-    let mut errors: Vec<String> = Vec::new();
-    if sub_capabilities.iter().any(|c| c == SUB_CAPABILITY_SSH) {
-        match crate::device_ops::select_sysd_ops() {
-            Some(ops) => match ops.ssh_stop().await {
-                Ok(out) if !out.success => {
-                    errors.push(format!("ssh_stop exited non-zero: {}", out.stderr.trim()))
-                }
-                Ok(_) => {}
-                Err(e) => errors.push(format!("ssh_stop: {e}")),
-            },
-            // Off-appliance / no sysd socket reachable: nothing could have
-            // been opened in the first place (see `run_open_actions` — "ssh"
-            // can never succeed to open without a reachable sysd), so there
-            // is nothing to close. Not an error.
-            None => {}
-        }
-    }
-    // SUB_CAPABILITY_SHOW_DETAILS needs no system action — it is a pure
-    // read-side flag consulted by `maintenance.status()`/the dashboard, so
-    // "closing" it is exactly "the flag now reads false", which the revoke
-    // itself already accomplished.
-    if errors.is_empty() {
-        None
-    } else {
-        Some(errors.join("; "))
-    }
-}
-
-/// Run the open action(s) for a window's `sub_capabilities`. Fail-closed:
-/// returns `Err` on the first failure. Deliberately called BEFORE
-/// [`MaintenanceStore::enable`] persists anything (see [`enable`] below) so a
-/// failure here never leaves a ledger row describing a window that was never
-/// actually open.
-async fn run_open_actions(sub_capabilities: &[String]) -> Result<(), String> {
-    if sub_capabilities.iter().any(|c| c == SUB_CAPABILITY_SSH) {
-        let ops = crate::device_ops::select_sysd_ops().ok_or_else(|| {
-            "SSH sub-capability requires the appliance's privileged daemon, which is not reachable on this host".to_string()
-        })?;
-        let out = ops
-            .ssh_start()
-            .await
-            .map_err(|e| format!("ssh_start: {e}"))?;
-        if !out.success {
-            return Err(format!("ssh_start exited non-zero: {}", out.stderr.trim()));
-        }
-    }
-    Ok(())
-}
-
-/// §2.8 `maintenance.enable`. Ordering is deliberate: sub-capabilities are
-/// validated, then OPENED, and only once that succeeds is the window
-/// persisted — never the other way around, so there is no window in the
-/// audit trail that claims to be open while its actual unlock failed. A
-/// narrow TOCTOU (something else raced the ledger insert after the open
-/// action already ran) is closed by rolling the just-opened action back
-/// before returning the error.
-#[allow(clippy::too_many_arguments)]
-pub async fn enable(
-    home_dir: &Path,
-    enabled_by: &str,
-    enabled_by_email: &str,
-    ttl_hours: i64,
-    requested_sub_capabilities: &[String],
-) -> Result<MaintenanceWindow, String> {
-    let sub_caps = validate_sub_capabilities(requested_sub_capabilities)?;
-    if !(1..=MAX_TTL_HOURS).contains(&ttl_hours) {
-        return Err(format!("ttl_hours must be in 1..={MAX_TTL_HOURS}"));
-    }
-    let store = MaintenanceStore::open(home_dir)?;
-    let audit = MaintenanceAuditLog::open(home_dir)
-        .map_err(|e| format!("open maintenance audit log: {e}"))?;
-
-    if store.active_window().await?.is_some() {
-        return Err("maintenance mode is already active".to_string());
-    }
-
-    if let Err(open_err) = run_open_actions(&sub_caps).await {
-        // The open may have taken effect even though it reported failure
-        // (e.g. sysd finished but the reply was lost). No window is recorded
-        // and no TTL would ever close it, so close now; closing is idempotent.
-        let rollback_error = run_close_actions(&sub_caps).await;
-        if let Some(close_err) = &rollback_error {
-            warn!(error = %close_err, "maintenance: rollback close after failed open failed");
-        }
-        audit.record(
-            "enable_failed",
-            json!({
-                "enabled_by": enabled_by,
-                "enabled_by_email": enabled_by_email,
-                "sub_capabilities": sub_caps,
-                "error": open_err,
-                "rollback_error": rollback_error,
-            }),
-        );
-        return Err(format!(
-            "could not open the requested sub-capabilities: {open_err}"
-        ));
-    }
-
-    match store
-        .enable(enabled_by, enabled_by_email, ttl_hours, &sub_caps)
-        .await
-    {
-        Ok(window) => {
-            audit.record(
-                "enabled",
-                json!({
-                    "window_id": window.id,
-                    "enabled_by": enabled_by,
-                    "enabled_by_email": enabled_by_email,
-                    "ttl_hours": ttl_hours,
-                    "sub_capabilities": sub_caps,
-                }),
-            );
-            info!(window_id = %window.id, %enabled_by_email, ttl_hours, "maintenance mode ENABLED");
-            Ok(window)
-        }
-        Err(e) => {
-            if let Some(close_err) = run_close_actions(&sub_caps).await {
-                warn!(error = %close_err, "maintenance: rollback close after enable race failed");
-            }
-            audit.record(
-                "enable_race_rolled_back",
-                json!({ "enabled_by": enabled_by, "sub_capabilities": sub_caps, "error": e }),
-            );
-            Err(e)
-        }
-    }
-}
-
-/// §2.8 `maintenance.disable` — an admin explicitly turning it off.
-/// `reason` is the RPC's optional free-text operator note; it is audited
-/// verbatim but never changes `revoke_reason`, which stays the fixed
-/// [`REVOKE_REASON_ADMIN`] token (§2.3/§2.4's closed three-value set).
-pub async fn disable(
-    home_dir: &Path,
-    disabled_by: &str,
-    reason: Option<&str>,
-) -> Result<Option<MaintenanceWindow>, String> {
-    let store = MaintenanceStore::open(home_dir)?;
-    let audit = MaintenanceAuditLog::open(home_dir)
-        .map_err(|e| format!("open maintenance audit log: {e}"))?;
-    let Some(window) = store.disable().await? else {
-        return Ok(None);
-    };
-    let close_err = run_close_actions(&window.sub_capabilities).await;
-    if let Some(ref err) = close_err {
-        store.set_close_error(&window.id, err).await;
-        error!(window_id = %window.id, error = %err, "maintenance: close action failed on manual disable");
-    }
-    audit.record(
-        "disabled",
-        json!({
-            "window_id": window.id,
-            "disabled_by": disabled_by,
-            "revoke_reason": REVOKE_REASON_ADMIN,
-            "sub_capabilities": window.sub_capabilities,
-            "close_error": close_err,
-            "note": reason,
-        }),
-    );
-    info!(window_id = %window.id, %disabled_by, "maintenance mode disabled by admin");
-    Ok(Some(window))
-}
-
-/// Called from `dispatch_engine.rs`'s 30s tick (§2.4). No-op when nothing is
-/// past its TTL.
-pub async fn sweep_expired_maintenance_window(home_dir: &Path) {
-    let store = match MaintenanceStore::open(home_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "maintenance: store open failed for TTL sweep");
-            return;
-        }
-    };
-    // WP20-style reminder check runs every tick regardless of whether
-    // anything happens to be expiring this exact tick.
-    if let Ok(Some(active)) = store.active_window().await {
-        if active.reminder_due(Utc::now()) {
-            let _ = store.mark_reminded(&active.id).await;
-            if let Ok(audit) = MaintenanceAuditLog::open(home_dir) {
-                audit.record(
-                    "reminder_sent",
-                    json!({
-                        "window_id": active.id,
-                        "remaining_seconds": active.remaining_seconds(Utc::now()),
-                    }),
-                );
-            }
-        }
-    }
-
-    let swept = match store.expire_stale().await {
-        Ok(Some(w)) => w,
-        Ok(None) => return,
-        Err(e) => {
-            warn!(error = %e, "maintenance: expire_stale failed");
-            return;
-        }
-    };
-    let close_err = run_close_actions(&swept.sub_capabilities).await;
-    if let Some(ref err) = close_err {
-        store.set_close_error(&swept.id, err).await;
-        error!(window_id = %swept.id, error = %err, "maintenance: close action failed on TTL expiry");
-    }
-    match MaintenanceAuditLog::open(home_dir) {
-        Ok(audit) => audit.record(
-            "ttl_expired",
-            json!({ "window_id": swept.id, "sub_capabilities": swept.sub_capabilities, "close_error": close_err }),
-        ),
-        Err(e) => warn!(error = %e, "maintenance: audit log open failed for ttl_expired event"),
-    }
-    info!(window_id = %swept.id, "maintenance mode auto-closed: TTL expired");
-}
-
-/// §2.4 boot-time reconciliation — called ONLY from the gateway boot path
-/// (mirrors `goal_loop::pause_inflight_on_restart`'s own "never from hot
-/// reload" contract). Returns the number of windows force-closed (0 or 1 by
-/// construction, but the caller only needs "did anything happen").
-pub async fn reassert_closed_on_boot(home_dir: &Path) -> usize {
-    let store = match MaintenanceStore::open(home_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                error = %e,
-                "maintenance: store open failed for boot reassert-closed — cannot verify no orphan window is open"
-            );
-            return 0;
-        }
-    };
-    let window = match store.reassert_closed_on_boot().await {
-        Ok(Some(w)) => w,
-        Ok(None) => return 0,
-        Err(e) => {
-            error!(error = %e, "maintenance: reassert_closed_on_boot query failed");
-            return 0;
-        }
-    };
-
-    let close_err = run_close_actions(&window.sub_capabilities).await;
-    if let Some(ref err) = close_err {
-        store.set_close_error(&window.id, err).await;
-        error!(
-            window_id = %window.id, error = %err,
-            "maintenance: close action failed during boot reassert-closed — a sub-capability may still be open"
-        );
-    }
-    match MaintenanceAuditLog::open(home_dir) {
-        Ok(audit) => audit.record(
-            "gateway_restart_revoked",
-            json!({ "window_id": window.id, "sub_capabilities": window.sub_capabilities, "close_error": close_err }),
-        ),
-        Err(e) => warn!(error = %e, "maintenance: audit log open failed for gateway_restart_revoked event"),
-    }
-    warn!(window_id = %window.id, "maintenance mode force-closed: gateway restarted while a window was open");
-    1
-}
+// ── Orchestration lives in `lifecycle` (enable/disable/sweep/boot/status) ──
 
 /// §2.3 fine-grained access log: one call per "顯示詳情" full-text reveal (or
 /// any future `show_details`-gated action). Refuses (rather than silently
@@ -916,30 +928,6 @@ pub async fn log_access(
     fields.insert("viewed_by_email".to_string(), json!(viewed_by_email));
     audit.record(kind, Value::Object(fields));
     Ok(())
-}
-
-/// Assembles the `maintenance.status()` RPC payload — active state, the
-/// active window's public fields (never `close_error`, an internal forensic
-/// note), and the live SSH probe (§6 principle #2).
-pub async fn status_json(home_dir: &Path) -> Result<Value, String> {
-    let store = MaintenanceStore::open(home_dir)?;
-    let active = store.active_window().await?;
-    let ssh_observed = ssh_service_observed_active().await;
-    let now = Utc::now();
-    Ok(json!({
-        "active": active.is_some(),
-        "window": active.as_ref().map(|w| json!({
-            "id": w.id,
-            "enabled_by": w.enabled_by,
-            "enabled_by_email": w.enabled_by_email,
-            "enabled_at": w.enabled_at,
-            "ttl_seconds": w.ttl_seconds,
-            "expires_at": w.expires_at,
-            "sub_capabilities": w.sub_capabilities,
-            "remaining_seconds": w.remaining_seconds(now),
-        })),
-        "ssh_observed_active": ssh_observed,
-    }))
 }
 
 /// Assembles the `maintenance.history()` RPC payload from the JSONL audit
@@ -1274,221 +1262,6 @@ mod tests {
         assert_eq!(ssh_service_observed_active().await, None);
     }
 
-    // ── Orchestration-level tests (enable/disable/sweep/reassert/log_access/
-    // status_json/history_json) — use SUB_CAPABILITY_SHOW_DETAILS only, since
-    // it needs no system action and so behaves identically on and off the
-    // appliance (this dev/CI host is never the appliance — SSH-gated
-    // orchestration paths are covered indirectly by the "requires sysd, off-
-    // appliance rejects" assertion below, mirroring `device_ops.rs`'s own
-    // "authorization outcome, not underlying command" test discipline). ────
-
-    #[tokio::test]
-    async fn enable_and_disable_orchestration_round_trip_with_audit() {
-        let home = tempfile::tempdir().unwrap();
-        let window = enable(
-            home.path(),
-            "u1",
-            "admin@local",
-            4,
-            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
-        )
-        .await
-        .unwrap();
-
-        let status = status_json(home.path()).await.unwrap();
-        assert_eq!(status["active"], true);
-        assert_eq!(status["window"]["id"], window.id);
-
-        let disabled = disable(home.path(), "u1", Some("done for the day"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(disabled.id, window.id);
-
-        let status = status_json(home.path()).await.unwrap();
-        assert_eq!(status["active"], false);
-
-        let history = history_json(home.path(), 10, 0).unwrap();
-        let events = history["events"].as_array().unwrap();
-        assert_eq!(events[0]["kind"], "disabled");
-        assert_eq!(events[1]["kind"], "enabled");
-    }
-
-    #[tokio::test]
-    async fn enable_ssh_off_appliance_fails_closed_without_persisting_a_window() {
-        let home = tempfile::tempdir().unwrap();
-        let result = enable(
-            home.path(),
-            "u1",
-            "admin@local",
-            4,
-            &[SUB_CAPABILITY_SSH.to_string()],
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "SSH cannot open without a reachable sysd daemon"
-        );
-
-        // The failed open must never have left a window on record.
-        let status = status_json(home.path()).await.unwrap();
-        assert_eq!(status["active"], false);
-        let history = history_json(home.path(), 10, 0).unwrap();
-        assert_eq!(history["events"][0]["kind"], "enable_failed");
-    }
-
-    #[tokio::test]
-    async fn enable_refuses_double_enable_through_the_orchestration_layer() {
-        let home = tempfile::tempdir().unwrap();
-        enable(
-            home.path(),
-            "u1",
-            "a@b",
-            4,
-            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
-        )
-        .await
-        .unwrap();
-        let second = enable(
-            home.path(),
-            "u1",
-            "a@b",
-            4,
-            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
-        )
-        .await;
-        assert!(second.is_err());
-    }
-
-    #[tokio::test]
-    async fn sweep_expired_maintenance_window_closes_and_audits() {
-        let home = tempfile::tempdir().unwrap();
-        let window = enable(
-            home.path(),
-            "u1",
-            "a@b",
-            4,
-            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
-        )
-        .await
-        .unwrap();
-
-        // Force expiry directly on the store, same technique as the
-        // store-level test above.
-        let store = MaintenanceStore::open(home.path()).unwrap();
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE maintenance_windows SET expires_at = ?1 WHERE id = ?2",
-                params![
-                    (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
-                    window.id
-                ],
-            )
-            .unwrap();
-        }
-        drop(store);
-
-        sweep_expired_maintenance_window(home.path()).await;
-
-        let status = status_json(home.path()).await.unwrap();
-        assert_eq!(status["active"], false);
-        let history = history_json(home.path(), 10, 0).unwrap();
-        assert_eq!(history["events"][0]["kind"], "ttl_expired");
-
-        // Idempotent: a second sweep with nothing left to expire is silent.
-        sweep_expired_maintenance_window(home.path()).await;
-        let history_after = history_json(home.path(), 10, 0).unwrap();
-        assert_eq!(
-            history["events"].as_array().unwrap().len(),
-            history_after["events"].as_array().unwrap().len(),
-            "a no-op sweep must not add a second ttl_expired line"
-        );
-    }
-
-    #[tokio::test]
-    async fn reassert_closed_on_boot_orchestration_force_closes_and_audits() {
-        let home = tempfile::tempdir().unwrap();
-        enable(
-            home.path(),
-            "u1",
-            "a@b",
-            24,
-            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
-        )
-        .await
-        .unwrap();
-
-        let closed = reassert_closed_on_boot(home.path()).await;
-        assert_eq!(closed, 1);
-
-        let status = status_json(home.path()).await.unwrap();
-        assert_eq!(status["active"], false);
-        let history = history_json(home.path(), 10, 0).unwrap();
-        assert_eq!(history["events"][0]["kind"], "gateway_restart_revoked");
-
-        // A clean boot (nothing was open) is a silent no-op.
-        assert_eq!(reassert_closed_on_boot(home.path()).await, 0);
-    }
-
-    #[tokio::test]
-    async fn log_access_requires_an_active_window_with_show_details_unlocked() {
-        let home = tempfile::tempdir().unwrap();
-
-        // No window open at all ⇒ refused.
-        let mut fields = serde_json::Map::new();
-        fields.insert("operation".to_string(), json!("device.update_apply"));
-        assert!(
-            log_access(
-                home.path(),
-                "u1",
-                "a@b",
-                "access_view_detail",
-                fields.clone()
-            )
-            .await
-            .is_err()
-        );
-
-        // Window open but WITHOUT show_details ⇒ still refused. Opened via the
-        // low-level store directly (not the `enable()` orchestration, which
-        // would try to actually start SSH and fail off-appliance) purely to
-        // get a "window active, show_details NOT among its capabilities"
-        // fixture state.
-        let store = MaintenanceStore::open(home.path()).unwrap();
-        store
-            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
-            .await
-            .unwrap();
-        assert!(
-            log_access(
-                home.path(),
-                "u1",
-                "a@b",
-                "access_view_detail",
-                fields.clone()
-            )
-            .await
-            .is_err()
-        );
-        store.disable().await.unwrap();
-
-        // Window open WITH show_details ⇒ succeeds and is auditable.
-        enable(
-            home.path(),
-            "u1",
-            "a@b",
-            4,
-            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
-        )
-        .await
-        .unwrap();
-        log_access(home.path(), "u1", "a@b", "access_view_detail", fields)
-            .await
-            .unwrap();
-        let history = history_json(home.path(), 10, 0).unwrap();
-        assert_eq!(history["events"][0]["kind"], "access_view_detail");
-        assert_eq!(history["events"][0]["operation"], "device.update_apply");
-        assert_eq!(history["events"][0]["viewed_by_email"], "a@b");
-    }
+    // Orchestration tests (enable/disable/sweep/boot/status/log_access with a
+    // mocked sysd) live in `maintenance/tests_ssh.rs`.
 }
