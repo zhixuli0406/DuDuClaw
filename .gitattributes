@@ -1,0 +1,3 @@
+# Preserve checksum-pinned upstream crate bytes across Git checkouts.
+/vendor/calamine/** -text
+/src-tauri/vendor/tauri-plugin-updater/** -text

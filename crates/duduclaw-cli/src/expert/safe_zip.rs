@@ -73,7 +73,9 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<()> {
             None => {
                 return Err(cfg_err(format!(
                     "拒絕不安全的 zip 條目（zip-slip）：{}",
-                    entry.name()
+                    entry
+                        .name()
+                        .map_err(|e| cfg_err(format!("zip 條目 {i} 名稱讀取失敗: {e}")))?
                 )));
             }
         };
@@ -166,8 +168,8 @@ pub fn pack_dir(src_dir: &Path, out_path: &Path) -> Result<u64> {
     let file = std::fs::File::create(out_path)
         .map_err(|e| io_err(format!("建立 {} 失敗: {e}", out_path.display())))?;
     let mut zw = zip::ZipWriter::new(file);
-    let opts: zip::write::FileOptions<'_, ()> =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files(src_dir, &mut files)?;
@@ -276,7 +278,7 @@ mod tests {
         {
             let f = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
             // `..` traversal — the reader must refuse this.
             zw.start_file("../escaped.txt", opts).unwrap();
             zw.write_all(b"pwned").unwrap();
@@ -303,7 +305,7 @@ mod tests {
         {
             let f = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zw.start_file("payload.bin", opts).unwrap();
             zw.write_all(&vec![0u8; 4 * 1024 * 1024]).unwrap();

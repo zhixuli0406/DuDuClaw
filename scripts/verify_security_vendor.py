@@ -12,10 +12,14 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 PROVENANCE_SHA256 = {
+    "tauri-plugin-updater": "8f9f0d81eb924cccfb1a5176bed5828acbd88108d776123fa1bfe725a153b415",
+    "calamine": "6c379343020964af247b59a5314de5295198044c5f14f98ca2516275c1f8e26b",
     "glib": "de7a59cce6352ea2913ae5c1be1306909b592b019c5cbf911a78c8790dd66ed4",
     "serenity": "3c1726725fd45dc5cdb389ff93b535b14a5df69cd573977936d0aa25d5fbeb13",
 }
 PACKAGES = {
+    "tauri-plugin-updater": (ROOT / "src-tauri/vendor/tauri-plugin-updater", "2.10.1", "806d9dac662c2e4594ff03c647a552f2c9bd544e7d0f683ec58f872f952ce4af"),
+    "calamine": (ROOT / "vendor/calamine", "0.36.1", "5fa68281b1a76b54a62156474adb06bb380a67e07dd60656e3217152b42183f3"),
     "glib": (ROOT / "src-tauri/vendor/glib", "0.18.5", "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5"),
     "serenity": (ROOT / "vendor/serenity", "0.12.5", "9bde37f42765dfdc34e2a039e0c84afbf79a3101c1941763b0beb816c2f17541"),
 }

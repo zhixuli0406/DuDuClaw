@@ -1257,7 +1257,10 @@ fn extract_from_zip(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, Strin
             .by_index(i)
             .map_err(|e| format!("Zip entry error: {e}"))?;
 
-        let name = file.name().to_string();
+        let name = file
+            .name()
+            .map_err(|e| format!("Zip entry name error: {e}"))?
+            .into_owned();
 
         // [R2:NH3] Reject path traversal and absolute paths
         if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {

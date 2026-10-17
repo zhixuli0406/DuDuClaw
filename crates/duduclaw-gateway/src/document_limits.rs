@@ -392,7 +392,10 @@ fn scan_one<R: Read + Seek>(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|_| LimitViolation::Malformed)?
+            .into_owned();
         let size = entry.size();
         let packed = entry.compressed_size();
 
@@ -574,15 +577,15 @@ fn skip_past_cdata(buf: &[u8], from: usize) -> usize {
 mod tests {
     use super::*;
     use std::io::Write;
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions;
 
     /// Build a zip in memory. `entries` are `(name, contents)`.
     fn build_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut cursor);
-            let opts: FileOptions<'_, ()> =
-                FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, body) in entries {
                 zw.start_file(*name, opts).unwrap();
                 zw.write_all(body).unwrap();
