@@ -8,6 +8,8 @@ They belong to the maintenance SSH account `duduclaw-maint` (uid/gid 4800). The 
 
 `duduclaw-maint-shell` is both the account's login shell and dropbear's forced command. With no command it shows a numbered menu (zh-TW / English); with a command (`ssh duduclaw-maint@duduclaw.local logs gateway`) the command must be one of these, word for word:
 
+For a shell request, Dropbear's global forced command sets `SSH_ORIGINAL_COMMAND` to an empty string. The entry point treats that and an absent variable as interactive mode. Every nonempty value, including whitespace-only or non-UTF-8 input, still goes through the command allowlist.
+
 | Command | Runs |
 |---|---|
 | `status` | `systemctl --failed`, then `systemctl status -n 0` for the gateway, sysd, local model, kiosk, firewall and dropbear socket (each only if installed) |

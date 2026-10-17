@@ -7,7 +7,7 @@
 //!   on ASCII whitespace, must equal one of [`Action::command`] word for word;
 //!   anything else (`/bin/sh`, `sh -c id`, `scp -t .`, the sftp server path,
 //!   `status; id`, `logs gateway --all`) exits with code 2 and the usage text.
-//! - **Interactive mode** — no `SSH_ORIGINAL_COMMAND`: a numbered,
+//! - **Interactive mode** — missing or empty `SSH_ORIGINAL_COMMAND`: a numbered,
 //!   bilingual menu read line by line from stdin. Works without a terminal
 //!   and never looks at `TERM`.
 //!
@@ -831,12 +831,7 @@ mod tests {
             vec![
                 vec![program("uptime")],
                 vec![program("free"), "-m".into()],
-                vec![
-                    program("df"),
-                    "-h".into(),
-                    "/".into(),
-                    "/data".into()
-                ],
+                vec![program("df"), "-h".into(), "/".into(), "/data".into()],
             ]
         );
         let mut r = Recorder {
