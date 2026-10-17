@@ -9,6 +9,7 @@ authors = ["DuDuClaw Contributors"]
 # Detached from the Rust workspace on purpose (see root Cargo.toml `exclude`):
 # the desktop shell carries heavy GUI deps and its own lockfile.
 [workspace]
+exclude = ["vendor/tauri-plugin-updater"]
 members = ["vendor/glib"]
 
 # Desktop-only: a plain binary crate (src/main.rs). No `[lib]` — the mobile-ready
@@ -76,4 +77,6 @@ custom-protocol = ["tauri/custom-protocol"]
 # GTK3 requires glib 0.18. Backport the upstream mutability fix without changing
 # its version or disabling Linux desktop functionality (gtk-rs-core PR #1343).
 [patch.crates-io]
+# Manifest-only security patch: use fixed ZIP extraction in the Windows updater.
+tauri-plugin-updater = { path = "vendor/tauri-plugin-updater" }
 glib = { path = "vendor/glib" }

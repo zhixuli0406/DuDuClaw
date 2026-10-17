@@ -1,0 +1,66 @@
+{
+  "base_version": "0.36.1",
+  "base_crate_sha256": "5fa68281b1a76b54a62156474adb06bb380a67e07dd60656e3217152b42183f3",
+  "upstream_repository": "https://github.com/tafia/calamine",
+  "security_dependency": "zip >=9.0.4 (RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369)",
+  "patched_files": [
+    "Cargo.toml",
+    "src/utils.rs",
+    "src/xlsx/mod.rs",
+    "src/xlsb/mod.rs",
+    "src/ods.rs"
+  ],
+  "scanner_note": "Calamine retains its true 0.36.1 version. The normalized ZIP requirement is upgraded, fallible ZIP 9 file-name iteration is propagated through existing ZIP error variants, and picture paths use the same fallible name API. Original manifests, licenses and all other upstream files remain unchanged. Remove the compatibility patch after a compatible official release uses zip >=9.",
+  "replacements": {
+    "Cargo.toml": [
+      [
+        "[dependencies.zip]\nversion = \"8.6\"",
+        "[dependencies.zip]\nversion = \"9.0.4\""
+      ]
+    ],
+    "src/utils.rs": [
+      [
+        "pub fn build_zip_path_cache<RS: Read + Seek>(zip: &ZipArchive<RS>) -> HashMap<String, String> {\n",
+        "pub fn build_zip_path_cache<RS: Read + Seek>(\n    zip: &ZipArchive<RS>,\n) -> zip::result::ZipResult<HashMap<String, String>> {\n"
+      ],
+      [
+        "    for zip_path in zip.file_names() {\n        let normalized = zip_path.replace('\\\\', \"/\").to_ascii_lowercase();\n",
+        "    for zip_path in zip.file_names() {\n        let zip_path = zip_path?;\n        let normalized = zip_path.replace('\\\\', \"/\").to_ascii_lowercase();\n"
+      ],
+      [
+        "    cache\n",
+        "    Ok(cache)\n"
+      ]
+    ],
+    "src/xlsx/mod.rs": [
+      [
+        "            let zname = zfile.name();\n",
+        "            let zname = zfile.name()?;\n"
+      ],
+      [
+        "        let zip = ZipArchive::new(reader)?;\n        let zip_path_cache = build_zip_path_cache(&zip);\n        let mut xlsx = Xlsx {\n",
+        "        let zip = ZipArchive::new(reader)?;\n        let zip_path_cache = build_zip_path_cache(&zip)?;\n        let mut xlsx = Xlsx {\n"
+      ],
+      [
+        "        let zip = ZipArchive::new(std::io::Cursor::new(&buf[..zip_size])).unwrap();\n        let zip_path_cache = build_zip_path_cache(&zip);\n        let mut xlsx = Xlsx {\n",
+        "        let zip = ZipArchive::new(std::io::Cursor::new(&buf[..zip_size])).unwrap();\n        let zip_path_cache = build_zip_path_cache(&zip).unwrap();\n        let mut xlsx = Xlsx {\n"
+      ]
+    ],
+    "src/xlsb/mod.rs": [
+      [
+        "            let zname = zfile.name();\n",
+        "            let zname = zfile.name()?;\n"
+      ],
+      [
+        "        let zip_path_cache = build_zip_path_cache(&zip);\n",
+        "        let zip_path_cache = build_zip_path_cache(&zip)?;\n"
+      ]
+    ],
+    "src/ods.rs": [
+      [
+        "        let zname = zfile.name();\n",
+        "        let zname = zfile.name()?;\n"
+      ]
+    ]
+  }
+}
