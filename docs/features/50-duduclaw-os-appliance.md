@@ -319,7 +319,8 @@ dashboard alone cannot authenticate the device. A configured channel does
 not prove delivery. Port 22 accepts private/link-local and VPN CGNAT
 `100.64.0.0/10` sources, not global IPv6; a matching range does not establish
 trust. The menu permits selected diagnostics and restarting the local model
-or gateway. Restarting the gateway closes the window and disconnects SSH.
+or gateway. Connecting without a command opens the numbered menu; enter `0`
+to exit. Restarting the gateway closes the window and disconnects SSH.
 
 An unconfirmed close stays visible as a warning. Expand Maintenance history
 for recent window fingerprints and connection events. The UI polls every
