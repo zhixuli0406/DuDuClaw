@@ -15438,6 +15438,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // authentication path leaves it false, so `RpcConnInfo::pre_auth` (and
     // with it the dispatch-top allowlist) is opt-in, never a fallback.
     let mut pre_auth = false;
+    let mut legacy_admin_authenticated = false;
 
     // --- Authentication gate ---
     // Resolve a UserContext from the first "connect" message.
@@ -15573,6 +15574,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     params.get("token").and_then(|v| v.as_str()).unwrap_or("");
                                 match state.auth.validate(token) {
                                     Ok(()) => {
+                                        legacy_admin_authenticated = true;
                                         let ok = WsFrame::ok_response(
                                             &id,
                                             serde_json::json!({"status": "authenticated"}),
@@ -15648,7 +15650,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // Transport facts for this connection, resolved once and carried on every
     // RPC it makes: the real TCP peer (the sole basis for "is this caller
     // sitting at the machine") and whether the handshake was credential-less.
-    let conn_info = crate::power_local::RpcConnInfo::from_ws(peer, pre_auth);
+    let mut conn_info = crate::power_local::RpcConnInfo::from_ws(peer, pre_auth);
+    if legacy_admin_authenticated {
+        conn_info = conn_info.with_legacy_admin_authenticated();
+    }
 
     // Split the socket so we can drive sending and receiving concurrently.
     let (mut sink, mut stream) = socket.split();

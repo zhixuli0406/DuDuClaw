@@ -110,12 +110,19 @@ impl MethodHandler {
                 // `system` also names the credential-less bootstrap context.
                 // Resolve it through the authority store so a bootstrap
                 // connection loses Admin as soon as the first user is added.
-                let live = match crate::review_evidence::audience::trusted_dashboard_principal(
-                    &self.home_dir,
-                    &ctx.user_id,
-                ) {
-                    Ok(live) => live,
-                    Err(_) => return WsFrame::error_response("", "permission denied"),
+                let live = if ctx.user_id == "system" && conn.legacy_admin_authenticated {
+                    // A valid legacy token remains an Admin credential even
+                    // when users.db has rows. The transport flag is set only
+                    // after token validation during the WS handshake.
+                    ctx.clone()
+                } else {
+                    match crate::review_evidence::audience::trusted_dashboard_principal(
+                        &self.home_dir,
+                        &ctx.user_id,
+                    ) {
+                        Ok(live) => live,
+                        Err(_) => return WsFrame::error_response("", "permission denied"),
+                    }
                 };
                 if let Err(e) = acl::require_role(&live, UserRole::Admin) {
                     return WsFrame::error_response("", &e);

@@ -499,6 +499,21 @@ async fn remove_account_revokes_bootstrap_context_after_first_user() {
         "{after:?}"
     );
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+
+    let token_connection = crate::power_local::RpcConnInfo::internal()
+        .with_legacy_admin_authenticated();
+    let token_result = handler
+        .handle_conn(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+            token_connection,
+        )
+        .await;
+    assert!(
+        matches!(token_result, WsFrame::Response { ok: true, .. }),
+        "{token_result:?}"
+    );
 }
 
 // ── WP-A: `accounts.add` provider param, end-to-end via the RPC ─────
