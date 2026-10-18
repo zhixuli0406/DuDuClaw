@@ -28,6 +28,8 @@
     - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；目錄要是 root 擁有的 0700、狀態檔要是 root 擁有的 0600 單一連結一般檔，不符或讀寫失敗就拒絕；狀態檔時間在未來時改寫成現在並記一筆警告，不會卡到重開機）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
 
 ### Fixed
+- Docker／遠端 Dashboard 的 Codex 一鍵登入改用 `codex login --device-auth`：使用者在瀏覽器輸入 CLI 顯示的裝置碼，等待 CLI 完成，不再依賴容器內 `127.0.0.1:1455` 回呼，也不需把 callback URL 的 `code` 貼進 Dashboard。帳號頁的 API Token 卡片新增刪除動作，確認帳號 id 後移除 DuDuClaw 儲存的那筆帳號。這不會撤銷供應商端的金鑰。
+- 一鍵登入選單加入 Kimi、Copilot、Kiro 與 OpenCode，Grok 的訂閱說明改為獨立一行，避免窄版選單換行錯位。Cursor 的瀏覽器回呼無法可靠地從遠端 Dashboard 完成，因此保留 runtime 支援但不提供一鍵登入；Antigravity 沒有可腳本化的登入指令，Qwen／Mistral Vibe 使用 API key。
 - 維修模式通知改為同時嘗試所有管理員的已驗證通道。每條通道有獨立的 20 秒上限，單次 HTTP 請求仍是 10 秒，整體 30 秒保留作最後防線；一條通道卡住不會阻止其他通道開始送出，成功數只計回報傳送成功的通道。
 - 閘道重啟後，先完成維修 SSH 的舊視窗清理，再接受新的開啟請求，避免背景清理誤關剛開好的視窗；等待期間仍可查詢狀態。只有取得該資料目錄執行鎖的閘道能開啟或關閉維修模式，第二個閘道只能讀取狀態。
 - SSH 關閉未確認的警示會保留到系統服務確認關閉；新開的診斷詳情視窗不會遮掉警示。確認結果另外記錄，原先的關閉錯誤仍保留在歷史裡。
@@ -36,6 +38,7 @@
 - 將 HTML 清理依賴 ammonia 固定在修補版 4.1.8，排除 RUSTSEC-2026-0373 的 CSS `URL()` 大小寫繞過；加入帶引號 URL 的回歸測試。
 
 ### Changed
+- Gemini CLI `gemini` runtime 已從 runtime 目錄、執行路徑、Dashboard 選項與 Docker 安裝中移除；舊的員工／judge／團隊 runtime 設定需改成 `antigravity`。Gemini API provider、`GEMINI_API_KEY` 與 Antigravity 的 `~/.gemini/antigravity-cli/` 設定繼續支援。先前版本的延期紀錄保留在下方。
 - npm 包裝補上安裝、獨立 MCP 模式與文件入口的 README；六個 npm manifest 的 repository URL 改為 npm 標準的 `git+https` 格式。既有 1.74.0 不會因此改變，須隨下一次 npm 發布上線。
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。

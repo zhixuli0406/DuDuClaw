@@ -214,10 +214,10 @@ async fn missing_image_is_unavailable_and_creates_nothing() {
 #[tokio::test]
 async fn no_usable_account_is_unavailable() {
     let fx = fixture(&[], "exit 0", true);
-    // An Anthropic account exists but the agent runs Gemini.
-    let err = go(&fx, RuntimeType::Gemini, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
+    // An Anthropic account exists but the agent runs Antigravity.
+    let err = go(&fx, RuntimeType::Antigravity, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
     let SandboxError::Unavailable(Unavailable::NoAccount { runtime, accepted }) = err else { panic!("{err:?}") };
-    assert_eq!(runtime, "gemini");
+    assert_eq!(runtime, "antigravity");
     assert!(accepted.contains("Gemini API key"));
     assert!(fx.read("create.args").is_empty());
 }

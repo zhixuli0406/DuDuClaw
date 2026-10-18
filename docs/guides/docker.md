@@ -3,7 +3,7 @@
 > Applies to: v1.8.23+
 > Last updated: 2026-04-22
 
-This guide covers the full process of deploying the DuDuClaw server with Docker Compose — port configuration, authentication for all three CLIs (Claude / Codex / Gemini), data persistence, channel webhooks, and auto-updates.
+This guide covers Docker Compose deployment, including Codex device-code login, API keys, credential volumes, channel webhooks, and updates.
 
 If you just want to try DuDuClaw on your own machine, read the native installation steps in
 [docs/deployment-guide.md §1](deployment-guide.md#1-local-development) first; native installation usually starts faster and is easier to debug.
@@ -24,7 +24,7 @@ The DuDuClaw Docker image is built from `container/Dockerfile.server` using a th
 The final image ships with:
 
 - The `duduclaw` main binary (Rust, includes the dashboard)
-- `@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli` (installed via `npm i -g`)
+- `@anthropic-ai/claude-code`, `@openai/codex` (installed via `npm i -g`)
 - The `docker.io` CLI (a client for the Docker daemon behind the mounted socket; used by the task sandbox when it is enabled)
 - (Optional) Python 3.12: only needed for the LLMLingua-2 prompt compressor (requires `llmlingua`); skill security scanning and channel replies are already Rust-native and no longer depend on Python
 
@@ -89,7 +89,7 @@ On first boot, `server-entrypoint.sh` detects that `~/.duduclaw/config.toml` doe
 | `GEMINI_API_KEY` | Gemini API key | Fallback; Google OAuth goes through a volume instead |
 
 At least one of these needs to be available. DuDuClaw decides which one to use based on `agent.toml [runtime]` and `[model] api_mode`. See
-[§6 Authenticating the three CLIs](#6-authenticating-the-three-clis) for details.
+[§6 CLI authentication](#6-cli-authentication) for details.
 
 ### 4.2 Channel tokens
 
@@ -188,21 +188,29 @@ Remember to also change `container_name` (default `duduclaw-server`) to avoid a 
 
 ---
 
-## 6. Authenticating the three CLIs
+## 6. CLI authentication
 
-Each of the three runtimes supports two authentication paths: **OAuth** (no extra cost, runs on your subscription plan) or an **API key** (usage-billed fallback). In practice, set up OAuth first and keep an API key as a backup.
+The image includes Claude, Codex, Antigravity and Grok. Their login methods differ. Codex uses device authorization, so the browser never needs to reach a callback listener inside Docker. Keep an API key available for provider billing and fallback.
 
-Each of the three OAuth state directories inside the container has its own named volume:
+The standard Compose file mounts these credential and settings directories:
 
 | Path | Volume | CLI |
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
-| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Gemini |
+| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Antigravity settings |
+| `/home/duduclaw/.grok` | `duduclaw-grok` | Grok |
+| `/home/duduclaw/.kimi-code` | `duduclaw-kimi` | Kimi Code |
+| `/home/duduclaw/.copilot` | `duduclaw-copilot` | GitHub Copilot CLI |
+| `/home/duduclaw/.kiro` | `duduclaw-kiro` | Kiro CLI |
+| `/home/duduclaw/.cursor` | `duduclaw-cursor` | Cursor CLI |
+| `/home/duduclaw/.local/share/opencode` | `duduclaw-opencode` | OpenCode |
 
-This means **you only need to log in once — rebuilding the container doesn't require logging in again**.
+Persistent volumes keep CLI state across container replacement. A custom Compose file must mount the relevant directory as well.
 
-> **Subscription logins carry account risk.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens; Anthropic may enforce this without prior notice, and users have reported suspended accounts. Letting one subscription answer channel customers, rotating several subscriptions past the usage limits, and storing the token in DuDuClaw all conflict with it. Google's [Gemini CLI terms](https://geminicli.com/docs/resources/tos-privacy/) and [Antigravity terms](https://antigravity.google/terms) say that accessing their services with third-party software through Gemini CLI or Antigravity OAuth violates those terms and may lead to suspension or termination of the account. OpenAI runs an official [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) program: ChatGPT plan use in third-party apps is offered to open-source partners and selected commercial partners, a commercial product needs OpenAI's approval, and auth tokens must stay local and user-controlled, not in remote or managed environments. The setup-token, interactive-login and ChatGPT methods below are subscription logins and stay available; an API key is the supported path. The dashboard's login flows ask you to accept this notice first. See [features/13-multi-runtime.md](../features/13-multi-runtime.md).
+The five additional volumes preserve credentials if those CLIs are installed separately. They are not bundled in this image. An uninstalled CLI cannot be logged in from the Dashboard. Cursor browser login still needs a browser callback reachable by the CLI; use API-key authentication on a remote host if that callback cannot be reached.
+
+> **Subscription logins carry account risk.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens; Anthropic may enforce this without prior notice, and users have reported suspended accounts. Letting one subscription answer channel customers, rotating several subscriptions past the usage limits, and storing the token in DuDuClaw all conflict with it. Google's [Antigravity terms](https://antigravity.google/terms) say that accessing its service with third-party software through Antigravity OAuth violates those terms and may lead to suspension or termination of the account. OpenAI runs an official [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) program: ChatGPT plan use in third-party apps is offered to open-source partners and selected commercial partners, a commercial product needs OpenAI's approval, and auth tokens must stay local and user-controlled, not in remote or managed environments. The setup-token, interactive-login and ChatGPT methods below are subscription logins and stay available; an API key is the supported path. The dashboard's login flows ask you to accept this notice first. See [features/13-multi-runtime.md](../features/13-multi-runtime.md).
 
 ### 6.1 Claude Code CLI
 
@@ -270,8 +278,9 @@ This path is **billed by usage** and works as a backup once your subscription qu
 
 ```bash
 docker compose exec duduclaw bash
-codex login
-# Enter your ChatGPT credentials or follow the browser flow
+codex login --device-auth
+# Open the verification URL shown by Codex in a browser and enter its device code.
+# Wait for the CLI to report success; do not paste a callback URL into the dashboard.
 # State is written to /home/duduclaw/.codex/, i.e. the duduclaw-codex volume
 exit
 ```
@@ -288,31 +297,14 @@ OPENAI_API_KEY=sk-proj-...
 
 Billed by usage, at OpenAI API pricing.
 
-### 6.3 Gemini (Google) CLI (deprecated)
+### 6.3 Antigravity (Google) API-key mode
 
-> **Deprecated in v1.67.0, removed in v1.75.0.** Google stopped serving free, Google AI Pro and Google AI Ultra individual accounts through Gemini CLI on 2026-06-18, so a personal Google login no longer works with it. API-key and enterprise (Gemini Code Assist) use is unaffected. The image keeps shipping the Gemini CLI until removal. Use the Antigravity runtime (`antigravity`, binary `agy`) instead; see [Deprecations](deprecations.md#gemini-cli-runtime).
->
-> Signing in to Antigravity through `agy` needs a terminal and an OS keyring, which a container does not have, so containers use API-key mode: set `config.toml [antigravity] auth = "api_key"` and supply the same Gemini API key (a `gemini` provider account, or `GEMINI_API_KEY` below). Antigravity keeps its settings under `~/.gemini` as well, so the `duduclaw-gemini` volume below stays in place.
-
-#### Method A: Google OAuth (Gemini Code Assist / enterprise accounts only)
-
-```bash
-docker compose exec duduclaw bash
-gemini auth
-# Follow the prompts to complete Google login in your local browser
-# State is written to /home/duduclaw/.gemini/, i.e. the duduclaw-gemini volume
-exit
-```
-
-#### Method B: API key fallback
-
-`.env`:
-
-```bash
-GEMINI_API_KEY=AIza...
-```
-
-Billed at Google AI Studio pricing.
+The Docker image no longer installs Gemini CLI. Antigravity (`agy`) remains
+supported, as does the Gemini API provider. `agy` subscription sign-in needs
+an OS keyring, so use its API-key mode in a container: set
+`config.toml [antigravity] auth = "api_key"` and supply a `gemini` provider
+account or `GEMINI_API_KEY` in `.env`. Antigravity settings are stored under
+`~/.gemini/antigravity-cli/`; keep the `duduclaw-gemini` volume for them.
 
 ### 6.4 Per-agent runtime selection
 
@@ -322,7 +314,7 @@ Each agent can specify which runtime to use in its own `agent.toml`:
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-provider = "claude"       # primary runtime: claude / codex / antigravity / openai-compat … (gemini is deprecated)
+provider = "claude"       # primary runtime: claude / codex / antigravity / openai-compat …
 fallback = "antigravity"  # automatically switches over when Claude is unavailable
 ```
 
@@ -330,15 +322,14 @@ See [features/13-multi-runtime.md](../features/13-multi-runtime.md) for a full e
 
 If `provider` is not set, the agent runs on Claude.
 
-### 6.5 Verify all three CLIs are detected
+### 6.5 Verify installed CLIs are detected
 
 ```bash
 docker compose exec duduclaw bash
 
-# All three should print a version
+# Installed CLIs should print a version
 claude --version
 codex --version
-gemini --version
 
 # Claude login state
 claude auth status
@@ -348,14 +339,20 @@ claude auth status
 
 ## 7. Data persistence (volumes)
 
-`docker-compose.yml` declares four named volumes:
+`docker-compose.yml` declares ten named volumes:
 
 | Volume | Contents | Backup recommendation |
 |--------|------|---------|
 | `duduclaw-data` | Main application data: config, agents, memory SQLite, logs, bus_queue.jsonl | **Most important**, back up daily |
 | `duduclaw-claude` | Claude CLI OAuth state | Moderate — losing it just means running `claude auth login` again |
 | `duduclaw-codex`  | Codex OAuth state | Moderate |
-| `duduclaw-gemini` | Gemini OAuth state | Moderate |
+| `duduclaw-gemini` | Antigravity settings under `~/.gemini` | Moderate |
+| `duduclaw-grok` | Grok CLI credentials | Moderate |
+| `duduclaw-kimi` | Kimi Code credentials | Moderate |
+| `duduclaw-copilot` | Copilot CLI credentials | Moderate |
+| `duduclaw-kiro` | Kiro CLI credentials | Moderate |
+| `duduclaw-cursor` | Cursor CLI credentials | Moderate |
+| `duduclaw-opencode` | OpenCode credentials | Moderate |
 
 Plus a mounted host path:
 
@@ -395,13 +392,19 @@ If you'd rather browse the data directly, you can swap named volumes for bind mo
       - ./data/claude:/home/duduclaw/.claude
       - ./data/codex:/home/duduclaw/.codex
       - ./data/gemini:/home/duduclaw/.gemini
+      - ./data/grok:/home/duduclaw/.grok
+      - ./data/kimi:/home/duduclaw/.kimi-code
+      - ./data/copilot:/home/duduclaw/.copilot
+      - ./data/kiro:/home/duduclaw/.kiro
+      - ./data/cursor:/home/duduclaw/.cursor
+      - ./data/opencode:/home/duduclaw/.local/share/opencode
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 Note that the host directories **must be owned by UID 1000** (the `duduclaw` user inside the container):
 
 ```bash
-mkdir -p data/{duduclaw,claude,codex,gemini}
+mkdir -p data/{duduclaw,claude,codex,gemini,grok,kimi,copilot,kiro,cursor,opencode}
 sudo chown -R 1000:1000 data/
 ```
 
@@ -648,7 +651,7 @@ docker volume ls | grep duduclaw
 # duduclaw_duduclaw-gemini
 ```
 
-If one is missing, the compose file was changed or someone ran `docker compose down -v` at some point — just run `claude auth login` / `codex login` / `gemini auth` again.
+If one is missing, the compose file was changed or someone ran `docker compose down -v` at some point — just run `claude auth login` / `codex login --device-auth` again.
 
 ---
 

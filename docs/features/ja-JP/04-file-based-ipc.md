@@ -219,7 +219,7 @@ TaskSpec：
 - **タスクサンドボックス**：エージェントが `agent.toml [container] sandbox_enabled = true` の場合、ディスパッチャーはタスクの AI CLI をホスト上ではなく施錠された Docker コンテナ内で実行し、サンドボックスが使えないときはタスクを失敗させます。[タスクサンドボックスガイド](../../guides/ja-JP/task-sandbox.md)を参照。
 - **DelegationEnvelope**：複雑なマルチエージェントハンドオフに構造化されたコンテキストを提供。
 - **TaskSpec**：依存関係を考慮したマルチステップワークフローを、リトライとリプラン付きで実現。
-- **Multi-Runtime**：ディスパッチャーは各エージェントのランタイム設定に基づき、適切なCLIバックエンド（Claude/Codex/Gemini）を起動。
+- **Multi-Runtime**：ディスパッチャーは各エージェントのランタイム設定に基づき、適切なCLIバックエンド（Claude/Codex/Antigravity）を起動。
 - **監査ログ**：ディスパッチされたすべてのタスクがJSONL監査証跡に記録。
 
 ---

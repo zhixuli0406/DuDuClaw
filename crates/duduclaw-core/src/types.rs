@@ -676,8 +676,7 @@ pub fn cascade_unbound_roles(
 /// `openai_compat`) are **not** allowed yet — not because they cannot answer,
 /// but because a role that silently loses its tools produces confident
 /// tool-free narration, which the verifier cannot distinguish from work.
-pub const TEAM_ROLE_RUNTIME_ALLOWLIST: &[&str] =
-    &["claude", "codex", "gemini", "antigravity", "grok"];
+pub const TEAM_ROLE_RUNTIME_ALLOWLIST: &[&str] = &["claude", "codex", "antigravity", "grok"];
 
 /// `"low, medium, high, xhigh, max"` — built from [`crate::effort::Effort::ALL`]
 /// so a new level never has to be remembered in an error message here.
@@ -932,10 +931,7 @@ impl ResolvedTeam {
 /// * without a model, the family is whichever catalog entry claims the
 ///   runtime's *own* first declared prefix.
 ///
-/// The second rule is what makes `antigravity` and `gemini` collapse onto one
-/// family, which is correct and load-bearing: both serve `gemini-*` models,
-/// so pairing them as executor and verifier would buy zero decorrelation
-/// while looking, in the config, like two different vendors.
+/// Antigravity claims Gemini model ids; the Gemini CLI runtime is removed.
 ///
 /// Falls back to the runtime id for a runtime that claims no family at all
 /// (none of the allowlisted five do today; this keeps the function total).
@@ -1100,11 +1096,8 @@ fn resolve_role(
         (Some(rt), None) => (rt, None),
         // Both: the model's family must be one this runtime serves.
         //
-        // Checked against the runtime's OWN declared prefixes rather than
-        // `runtime_for_model(model).id == rt.id`, because catalog order
-        // breaks the `gemini` prefix tie in favour of the Gemini CLI — so the
-        // strict identity check would reject the perfectly legal
-        // `runtime = "antigravity", model = "gemini-3.7-flash"`.
+        // Checked against the runtime's own declared prefixes so a runtime
+        // serving multiple model families can use each supported model.
         (Some(rt), Some(model)) => {
             let lower = model.to_ascii_lowercase();
             let bare = lower.rsplit('/').next().unwrap_or(&lower).to_string();
@@ -1181,9 +1174,8 @@ runtime_types! {
     #[default]
     Claude => "claude",
     Codex => "codex",
-    Gemini => "gemini",
     /// Google Antigravity CLI (`agy`) — the 2026-06-18 successor to the
-    /// personal-tier Gemini CLI. Same model lineage, distinct binary/flags.
+    /// Gemini CLI. Same model lineage, distinct binary/flags.
     Antigravity => "antigravity",
     /// xAI Grok CLI ("Grok Build", beta 2026-05) — terminal coding agent driving
     /// `grok-build-0.1` behind a SuperGrok / X Premium+ subscription. MCP-native,
@@ -1243,7 +1235,7 @@ impl RuntimeType {
         crate::runtime_catalog::spec_for(s).and_then(|spec| Self::from_id(spec.id))
     }
 
-    /// `claude|codex|gemini|…` — the accepted-values list for an error
+    /// `claude|codex|antigravity|…` — the accepted-values list for an error
     /// message, built from the catalog so it can never go stale.
     pub fn valid_values() -> String {
         crate::runtime_catalog::id_list_pipe()
@@ -4807,7 +4799,7 @@ model = "gpt-5.5"
 effort = "medium"
 
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 model = "gemini-3.7-flash"
 effort = "low"
 
@@ -4886,7 +4878,7 @@ model = "claude-haiku-4-5"
         assert_eq!(c.roles.planner.model.as_deref(), Some("claude-fable-5-1"));
         assert_eq!(c.roles.planner.effort.as_deref(), Some("high"));
         assert_eq!(c.roles.executor.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(c.roles.verifier.runtime.as_deref(), Some("gemini"));
+        assert_eq!(c.roles.verifier.runtime.as_deref(), Some("antigravity"));
         assert_eq!(c.roles.utility.model.as_deref(), Some("claude-haiku-4-5"));
         assert!(c.roles.utility.effort.is_none());
     }
@@ -5088,13 +5080,13 @@ model = "gpt-5.5"
 [roles.executor]
 effort = "high"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         let (cfg, cascaded) = cascade_unbound_roles(&c, Some("claude"), Some("claude-sonnet-4-6"));
         assert_eq!(cascaded, vec![Role::Executor]);
         assert_eq!(cfg.roles.executor.effort.as_deref(), Some("high"));
-        let r = validate_team(&cfg).expect("claude executor + gemini verifier decorrelates");
+        let r = validate_team(&cfg).expect("claude executor + Antigravity verifier decorrelates");
         assert_eq!(r.executor.effort, Some(crate::effort::Effort::High));
     }
 
@@ -5107,7 +5099,7 @@ runtime = "gemini"
 runtime = "codex"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 model = "gemini-3-pro-preview"
 "#,
         );
@@ -5136,8 +5128,8 @@ model = "gemini-3-pro-preview"
         assert_eq!(resolved.executor.family, "codex");
         assert_eq!(resolved.executor.effort, Some(Effort::Medium));
 
-        assert_eq!(resolved.verifier.runtime, "gemini");
-        assert_eq!(resolved.verifier.family, "gemini");
+        assert_eq!(resolved.verifier.runtime, "antigravity");
+        assert_eq!(resolved.verifier.family, "antigravity");
 
         let utility = resolved.utility.as_ref().unwrap();
         assert_eq!(utility.model.as_deref(), Some("claude-haiku-4-5"));
@@ -5156,16 +5148,16 @@ model = "gemini-3-pro-preview"
 runtime = "codex"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         let r = validate_team(&c).unwrap();
         assert!(r.planner.is_none(), "planner cascades to [model] preferred");
         assert!(r.utility.is_none());
         // A verifier with only a runtime still resolves; its model cascades.
-        assert_eq!(r.verifier.runtime, "gemini");
+        assert_eq!(r.verifier.runtime, "antigravity");
         assert!(r.verifier.model.is_none());
-        assert_eq!(r.verifier.family, "gemini");
+        assert_eq!(r.verifier.family, "antigravity");
     }
 
     #[test]
@@ -5203,7 +5195,7 @@ model = "claude-sonnet-4-6"
 [roles.executor]
 model = "deepseek-v3.2"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         assert_eq!(
@@ -5217,10 +5209,9 @@ runtime = "gemini"
     }
 
     #[test]
-    fn antigravity_may_declare_a_gemini_model_despite_the_catalog_tie() {
-        // `runtime_for_model("gemini-…")` resolves to the Gemini CLI because
-        // catalog order breaks the tie — so a strict identity check would
-        // reject this perfectly legal pairing.
+    fn antigravity_may_declare_a_gemini_model() {
+        // Antigravity continues to claim Gemini model ids after the Gemini
+        // CLI runtime has been removed from the catalog.
         let c = team(
             r#"
 [roles.executor]
@@ -5233,9 +5224,8 @@ model = "gemini-3.1-pro"
         );
         let r = validate_team(&c).unwrap();
         assert_eq!(r.verifier.runtime, "antigravity");
-        // …and its FAMILY still collapses onto gemini, which is what the
-        // decorrelation rule must see.
-        assert_eq!(r.verifier.family, "gemini");
+        // Its family follows the active Antigravity runtime.
+        assert_eq!(r.verifier.family, "antigravity");
     }
 
     // ── validation: refusals ────────────────────────────────────────────
@@ -5248,7 +5238,7 @@ model = "gemini-3.1-pro"
 [roles.executor]
 runtime = "{runtime}"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#
             ));
             assert_eq!(
@@ -5263,7 +5253,7 @@ runtime = "gemini"
         // The allowlist is exactly decision D.
         assert_eq!(
             TEAM_ROLE_RUNTIME_ALLOWLIST,
-            &["claude", "codex", "gemini", "antigravity", "grok"]
+            &["claude", "codex", "antigravity", "grok"]
         );
     }
 
@@ -5277,7 +5267,7 @@ runtime = "gemini"
 runtime = "claude"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         assert_eq!(
@@ -5303,13 +5293,13 @@ runtime = "gemini"
                 "claude-haiku-4-5",
                 "claude",
             ),
-            // two runtimes, one family: antigravity also serves gemini-*
+            // the same runtime serves multiple Gemini models
             (
-                "gemini",
+                "antigravity",
                 "gemini-3.7-flash",
                 "antigravity",
                 "gemini-3.1-pro",
-                "gemini",
+                "antigravity",
             ),
         ];
         for (e_rt, e_model, v_rt, v_model, family) in same_family {
@@ -5362,7 +5352,7 @@ runtime = "codex"
 runtime = "   "
 model = ""
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         assert_eq!(
@@ -5381,7 +5371,7 @@ runtime = "gemini"
 runtime = "codex"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         validate_team(&base).expect("the base spec is valid before the effort typo");
@@ -5417,7 +5407,7 @@ enabled = false
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5432,7 +5422,7 @@ runtime = "gemini"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#;
         for (written, applied) in [(0i64, 1u8), (-4, 1), (1, 1), (3, 3), (9, 3), (999, 3)] {
             let c = team(&format!("executor_fanout = {written}\n{base}"));
@@ -5462,7 +5452,7 @@ gate = "always-team-ish"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5482,7 +5472,7 @@ gate = "always_solo"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5500,7 +5490,7 @@ effort = "high"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5575,11 +5565,10 @@ runtime = "gemini"
         assert_eq!(ncodes.len(), n);
     }
 
-    /// R1 (2026-10): a role on the deprecated Gemini CLI still validates and
-    /// leaves `notes` untouched; the deprecation surfaces only through the
-    /// derived `deprecation_notes()`.
+    /// A removed runtime must be rejected, while Antigravity remains valid
+    /// for Gemini models.
     #[test]
-    fn a_gemini_role_resolves_unchanged_and_yields_a_derived_deprecation_note() {
+    fn removed_gemini_runtime_is_refused_and_antigravity_stays_valid() {
         let c = team(
             r#"
 [roles.executor]
@@ -5588,20 +5577,13 @@ runtime = "codex"
 runtime = "gemini"
 "#,
         );
-        let r = validate_team(&c).unwrap();
-        assert_eq!(r.verifier.runtime, "gemini");
-        assert!(r.notes.is_empty(), "deprecation must not alter notes");
-        let dn = r.deprecation_notes();
         assert_eq!(
-            dn,
-            vec![TeamNote::DeprecatedRuntime {
+            validate_team(&c).unwrap_err(),
+            TeamConfigError::RuntimeNotAllowed {
                 role: Role::Verifier,
-                runtime: "gemini"
-            }]
+                runtime: "gemini".to_string(),
+            }
         );
-        assert_eq!(dn[0].code(), "deprecated_runtime");
-        let text = dn[0].to_string();
-        assert!(text.contains("antigravity") && text.contains("v1.75.0"), "{text}");
 
         let c = team(
             r#"
@@ -5609,9 +5591,12 @@ runtime = "gemini"
 runtime = "codex"
 [roles.verifier]
 runtime = "antigravity"
+model = "gemini-3.1-pro"
 "#,
         );
-        assert!(validate_team(&c).unwrap().deprecation_notes().is_empty());
+        let resolved = validate_team(&c).unwrap();
+        assert_eq!(resolved.verifier.family, "antigravity");
+        assert!(resolved.deprecation_notes().is_empty());
     }
 
     // ── agent.toml round-trip ───────────────────────────────────────────
@@ -5677,7 +5662,7 @@ max_active_skills = 2
         let with_team = format!(
             "{base}\n[team]\nenabled = true\nexecutor_fanout = 2\n\
              [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
-             [team.roles.verifier]\nruntime = \"gemini\"\n"
+             [team.roles.verifier]\nruntime = \"antigravity\"\n"
         );
         let cfg: AgentConfig = toml::from_str(&with_team).expect("parses with [team]");
         assert_eq!(cfg.team.enabled, Some(true));

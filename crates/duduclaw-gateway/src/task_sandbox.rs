@@ -49,15 +49,16 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 use crate::discovery::agent_spawn::{
-    MAX_UNPARSABLE_LINES, SUPERVISOR_SETUP_FAILED, UNPARSABLE_STREAM, auth_failure, call_cost_for, parse_stream,
-    rate_limit_error_envelope, rate_limit_message,
+    MAX_UNPARSABLE_LINES, SUPERVISOR_SETUP_FAILED, UNPARSABLE_STREAM, auth_failure, call_cost_for,
+    parse_stream, rate_limit_error_envelope, rate_limit_message,
 };
 use crate::discovery::attempt_adapter::{self as adapter, RuntimeFamily, StreamAdapter};
 use crate::discovery::attempt_guard::{GuardVerdict, StreamGuard};
 use settings::{SandboxSettings, WhenUnavailable};
 
 pub use coverage::{
-    AUDIT_TASK_SANDBOX_NOT_APPLIED, HostAction, HostPath, note_not_applied, sandbox_enabled_in_registry,
+    AUDIT_TASK_SANDBOX_NOT_APPLIED, HostAction, HostPath, note_not_applied,
+    sandbox_enabled_in_registry,
 };
 
 /// Why the sandbox cannot run this task. `code()` is a closed set used in
@@ -74,7 +75,10 @@ pub enum Unavailable {
     /// The engine runs rootless and does not enforce the container's memory /
     /// pids limits (`container::resource_limits`): fail closed.
     ResourceLimits(duduclaw_core::container_engine::LimitVerdict),
-    NoAccount { runtime: &'static str, accepted: String },
+    NoAccount {
+        runtime: &'static str,
+        accepted: String,
+    },
 }
 
 impl Unavailable {
@@ -96,14 +100,21 @@ impl Unavailable {
         let text = match self {
             Self::InvalidConfig(why) => format!("the sandbox configuration is invalid: {why}"),
             Self::UnsupportedRuntime(runtime) => format!(
-                "runtime `{runtime}` cannot run in the task sandbox (supported: claude, codex, gemini, antigravity, grok, openai_compat)"
+                "runtime `{runtime}` cannot run in the task sandbox (supported: claude, codex, antigravity, grok, openai_compat)"
             ),
-            Self::NetworkDisabled => "the AI inside the sandbox must reach its model provider, but this agent has \
+            Self::NetworkDisabled => {
+                "the AI inside the sandbox must reach its model provider, but this agent has \
                 [container] network_access = false; set network_access = true to use the sandbox"
-                .to_string(),
-            Self::RootUser => "the gateway runs as root (uid 0); the sandbox refuses to start containers as root".into(),
+                    .to_string()
+            }
+            Self::RootUser => {
+                "the gateway runs as root (uid 0); the sandbox refuses to start containers as root"
+                    .into()
+            }
             Self::UnsupportedPlatform => "the task sandbox needs a unix host with Docker".into(),
-            Self::DockerUnreachable => "Docker is not reachable (is the Docker daemon running?)".into(),
+            Self::DockerUnreachable => {
+                "Docker is not reachable (is the Docker daemon running?)".into()
+            }
             Self::ImageMissing(image) => {
                 format!(
                     "the sandbox image is not on this machine; run `docker pull {image}` (it is never pulled automatically; {})",
@@ -145,6 +156,7 @@ pub struct SandboxFailure {
 /// Reason codes of failures after the sandbox started working on a task.
 pub mod failure_code {
     pub const PRODUCT_POLICY_REFUSED: &str = "product_policy_refused";
+    pub const REMOVED_RUNTIME: &str = "removed_runtime";
     pub const AGENT_NOT_FOUND: &str = "agent_not_found";
     pub const WORKSPACE_FAILED: &str = "workspace_failed";
     pub const AGENT_DIR_UNMOUNTABLE: &str = "agent_dir_unmountable";
@@ -179,7 +191,10 @@ impl SandboxFailure {
     pub fn with_detail(self, detail: impl Into<String>) -> Self {
         let detail = detail.into();
         let detail = detail.trim();
-        Self { detail: (!detail.is_empty()).then(|| detail.to_string()), ..self }
+        Self {
+            detail: (!detail.is_empty()).then(|| detail.to_string()),
+            ..self
+        }
     }
 
     /// Message plus detail, for the host log and the local queue record.
@@ -209,7 +224,8 @@ impl From<&Unavailable> for SandboxFailure {
         Self {
             unavailable: true,
             code: reason.code(),
-            message: duduclaw_core::truncate_chars(&reason.message(), MESSAGE_MAX_CHARS).to_string(),
+            message: duduclaw_core::truncate_chars(&reason.message(), MESSAGE_MAX_CHARS)
+                .to_string(),
             detail: None,
         }
     }
@@ -263,7 +279,6 @@ pub fn family_for(runtime: RuntimeType) -> Option<RuntimeFamily> {
     match runtime {
         RuntimeType::Claude => Some(RuntimeFamily::Claude),
         RuntimeType::Codex => Some(RuntimeFamily::Codex),
-        RuntimeType::Gemini => Some(RuntimeFamily::Gemini),
         RuntimeType::Antigravity => Some(RuntimeFamily::Antigravity),
         RuntimeType::Grok => Some(RuntimeFamily::Grok),
         RuntimeType::OpenAiCompat => Some(RuntimeFamily::OpenAiCompat),
@@ -274,12 +289,18 @@ pub fn family_for(runtime: RuntimeType) -> Option<RuntimeFamily> {
 /// Credential kinds that work inside the sandbox, per family (user-facing).
 pub fn accepted_credentials(family: RuntimeFamily, provider: &str) -> String {
     match family {
-        RuntimeFamily::Claude => "an Anthropic API key, or an OAuth account with a stored token (`claude setup-token`); \
+        RuntimeFamily::Claude => {
+            "an Anthropic API key, or an OAuth account with a stored token (`claude setup-token`); \
             an account that only lives in the host keychain cannot enter the container"
-            .into(),
-        RuntimeFamily::Codex => "an OpenAI API key, or an OAuth account whose secret is a Codex auth.json".into(),
-        RuntimeFamily::Gemini | RuntimeFamily::Antigravity => "a Gemini API key".into(),
-        RuntimeFamily::Grok => "an xAI API key, or an OAuth account whose secret is a Grok auth.json".into(),
+                .into()
+        }
+        RuntimeFamily::Codex => {
+            "an OpenAI API key, or an OAuth account whose secret is a Codex auth.json".into()
+        }
+        RuntimeFamily::Antigravity => "a Gemini API key".into(),
+        RuntimeFamily::Grok => {
+            "an xAI API key, or an OAuth account whose secret is a Grok auth.json".into()
+        }
         RuntimeFamily::OpenAiCompat => format!("an API key account of provider `{provider}`"),
     }
 }
@@ -289,11 +310,14 @@ pub fn accepted_credentials(family: RuntimeFamily, provider: &str) -> String {
 pub fn openai_compat_target(model: &str) -> Result<(String, String, String), Unavailable> {
     let (provider, wire) = duduclaw_llm::split_model_id(model);
     let provider = provider.unwrap_or("openai");
-    let preset = crate::runtime::openai_compat::PROVIDERS.iter().find(|p| p.name == provider).ok_or_else(|| {
-        Unavailable::InvalidConfig(format!(
-            "openai_compat model `{model}` must be `<provider>/<model>` with a known provider"
-        ))
-    })?;
+    let preset = crate::runtime::openai_compat::PROVIDERS
+        .iter()
+        .find(|p| p.name == provider)
+        .ok_or_else(|| {
+            Unavailable::InvalidConfig(format!(
+                "openai_compat model `{model}` must be `<provider>/<model>` with a known provider"
+            ))
+        })?;
     let base = adapter::compatible_endpoint(preset.base_url)
         .map_err(|_| Unavailable::InvalidConfig("provider endpoint is not an https URL".into()))?;
     Ok((preset.name.to_string(), base, wire.to_string()))
@@ -347,14 +371,19 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
 pub fn redact(text: &str, secrets: &[String]) -> String {
     static GOOGLE_KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let mut out = text.to_string();
-    let mut ordered: Vec<&str> = secrets.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let mut ordered: Vec<&str> = secrets
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
     for secret in ordered {
         if out.contains(secret) {
             out = out.replace(secret, "<redacted>");
         }
     }
-    let re = GOOGLE_KEY.get_or_init(|| regex::Regex::new(r"AIza[0-9A-Za-z_\-]{30,}").expect("static regex"));
+    let re = GOOGLE_KEY
+        .get_or_init(|| regex::Regex::new(r"AIza[0-9A-Za-z_\-]{30,}").expect("static regex"));
     if re.is_match(&out) {
         out = re.replace_all(&out, "<redacted>").into_owned();
     }
@@ -367,7 +396,12 @@ const DETAIL_MAX_CHARS: usize = 600;
 fn audit(home: &Path, kind: &str, agent_id: &str, details: Value) {
     crate::security_autopilot::audit_and_emit(
         home,
-        &duduclaw_security::audit::AuditEvent::new(kind, agent_id, duduclaw_security::audit::Severity::Warning, details),
+        &duduclaw_security::audit::AuditEvent::new(
+            kind,
+            agent_id,
+            duduclaw_security::audit::Severity::Warning,
+            details,
+        ),
     );
 }
 
@@ -380,9 +414,16 @@ pub async fn dispatch(
 ) -> SandboxDispatch {
     let spec = {
         let reg = registry.read().await;
-        let agent = if agent_id == "default" { reg.main_agent() } else { reg.get(agent_id) };
+        let agent = if agent_id == "default" {
+            reg.main_agent()
+        } else {
+            reg.get(agent_id)
+        };
         let Some(agent) = agent else {
-            let failure = SandboxFailure::failed(failure_code::AGENT_NOT_FOUND, "the agent is not registered");
+            let failure = SandboxFailure::failed(
+                failure_code::AGENT_NOT_FOUND,
+                "the agent is not registered",
+            );
             failure.log(agent_id);
             return SandboxDispatch::Completed(Err(failure));
         };
@@ -394,7 +435,11 @@ pub async fn dispatch(
             parts.push(format!("# Identity\n{identity}"));
         }
         TaskSpec {
-            agent_id: if agent_id == "default" { agent.config.agent.name.clone() } else { agent_id.to_string() },
+            agent_id: if agent_id == "default" {
+                agent.config.agent.name.clone()
+            } else {
+                agent_id.to_string()
+            },
             agent_dir: agent.dir.clone(),
             runtime: RuntimeType::Claude,
             model: agent.config.model.preferred.clone(),
@@ -407,6 +452,12 @@ pub async fn dispatch(
             account_pool: agent.config.model.account_pool.clone(),
         }
     };
+    if crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir).is_err() {
+        return SandboxDispatch::Completed(Err(SandboxFailure::failed(
+            failure_code::REMOVED_RUNTIME,
+            "agent.toml selects the removed Gemini CLI runtime; choose a supported runtime and model",
+        )));
+    }
     let runtime_settings = crate::runtime_config::load_runtime_settings(&spec.agent_dir);
     // O1 confidence-aware delegation routing applies to Claude runtimes only
     // (tier models are Claude ids); identical to the unsandboxed path.
@@ -419,19 +470,32 @@ pub async fn dispatch(
         &runtime_settings.utility_model,
         runtime_settings.non_claude_provider().is_none(),
     );
-    let spec = TaskSpec { runtime: runtime_settings.provider, model, ..spec };
+    let spec = TaskSpec {
+        runtime: runtime_settings.provider,
+        model,
+        ..spec
+    };
     if let Err(message) = crate::product_policy::load(home).and_then(|policy| {
         policy.require_runtime(spec.runtime.as_str())?;
         crate::product_policy::require_model(policy, &spec.model)
     }) {
-        return SandboxDispatch::Completed(Err(SandboxFailure::failed(failure_code::PRODUCT_POLICY_REFUSED, message)));
+        return SandboxDispatch::Completed(Err(SandboxFailure::failed(
+            failure_code::PRODUCT_POLICY_REFUSED,
+            message,
+        )));
     }
     let (loaded, when_unavailable) = settings::load(home);
     let result = match loaded {
         Err(why) => Err(SandboxError::Unavailable(Unavailable::InvalidConfig(why))),
         Ok(settings) => {
             let rotator = crate::claude_runner::get_rotator_cached(home).await;
-            run(home, &settings, &spec, rotator.as_deref().map_err(String::clone)).await
+            run(
+                home,
+                &settings,
+                &spec,
+                rotator.as_deref().map_err(String::clone),
+            )
+            .await
         }
     };
     settle(home, &spec, when_unavailable, result)
@@ -452,10 +516,15 @@ pub fn settle(
             SandboxDispatch::Completed(Err(failure))
         }
         Err(SandboxError::Unavailable(reason)) => {
-            audit(home, "task_sandbox_unavailable", &spec.agent_id, json!({
-                "reason": reason.code(), "runtime": spec.runtime.as_str(),
-                "when_unavailable": when_unavailable.as_str(),
-            }));
+            audit(
+                home,
+                "task_sandbox_unavailable",
+                &spec.agent_id,
+                json!({
+                    "reason": reason.code(), "runtime": spec.runtime.as_str(),
+                    "when_unavailable": when_unavailable.as_str(),
+                }),
+            );
             match when_unavailable {
                 WhenUnavailable::Fail => {
                     let failure = SandboxFailure::from(&reason);
@@ -465,9 +534,14 @@ pub fn settle(
                 WhenUnavailable::RunUnsandboxed => {
                     tracing::warn!(agent = %spec.agent_id, reason = reason.code(),
                         "task sandbox unavailable; running UNSANDBOXED (when_unavailable = run_unsandboxed)");
-                    audit(home, "task_sandbox_bypassed", &spec.agent_id, json!({
-                        "reason": reason.code(), "runtime": spec.runtime.as_str(),
-                    }));
+                    audit(
+                        home,
+                        "task_sandbox_bypassed",
+                        &spec.agent_id,
+                        json!({
+                            "reason": reason.code(), "runtime": spec.runtime.as_str(),
+                        }),
+                    );
                     SandboxDispatch::RunUnsandboxed
                 }
             }
@@ -476,8 +550,12 @@ pub fn settle(
 }
 
 /// Checks that need no Docker and no account, in spec order.
-pub fn preflight(settings: &SandboxSettings, spec: &TaskSpec) -> Result<RuntimeFamily, Unavailable> {
-    let family = family_for(spec.runtime).ok_or_else(|| Unavailable::UnsupportedRuntime(spec.runtime.as_str().into()))?;
+pub fn preflight(
+    settings: &SandboxSettings,
+    spec: &TaskSpec,
+) -> Result<RuntimeFamily, Unavailable> {
+    let family = family_for(spec.runtime)
+        .ok_or_else(|| Unavailable::UnsupportedRuntime(spec.runtime.as_str().into()))?;
     if !spec.network_access {
         return Err(Unavailable::NetworkDisabled);
     }
@@ -488,13 +566,21 @@ pub fn preflight(settings: &SandboxSettings, spec: &TaskSpec) -> Result<RuntimeF
     #[cfg(not(unix))]
     return Err(Unavailable::UnsupportedPlatform);
     if spec.model.trim().is_empty() {
-        return Err(Unavailable::InvalidConfig("the agent has no [model] preferred".into()));
+        return Err(Unavailable::InvalidConfig(
+            "the agent has no [model] preferred".into(),
+        ));
     }
     if spec.timeout.is_zero() {
-        return Err(Unavailable::InvalidConfig("the agent's [container] timeout_ms is 0".into()));
+        return Err(Unavailable::InvalidConfig(
+            "the agent's [container] timeout_ms is 0".into(),
+        ));
     }
-    if !settings::valid_image(&settings.image) || !settings::valid_executable(settings.executable(family)) {
-        return Err(Unavailable::InvalidConfig("invalid image or executable".into()));
+    if !settings::valid_image(&settings.image)
+        || !settings::valid_executable(settings.executable(family))
+    {
+        return Err(Unavailable::InvalidConfig(
+            "invalid image or executable".into(),
+        ));
     }
     if family == RuntimeFamily::OpenAiCompat {
         openai_compat_target(&spec.model)?;
@@ -520,7 +606,9 @@ async fn select_account(
 ) -> Option<Selected> {
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..8 {
-        let account = rotator.select_for_provider_with_pool(provider, pool).await?;
+        let account = rotator
+            .select_for_provider_with_pool(provider, pool)
+            .await?;
         if !seen.insert(account.id.clone()) {
             break;
         }
@@ -536,7 +624,10 @@ async fn select_account(
         if let Some(url) = base_url {
             env.insert("DUDU_ATTEMPT_BASE_URL".into(), url.to_string());
         }
-        let Ok(document) = adapter::credential_document(family, account.seat_token.as_deref()) else { continue };
+        let Ok(document) = adapter::credential_document(family, account.seat_token.as_deref())
+        else {
+            continue;
+        };
         if !adapter::has_credentials(family, &env, document.as_deref()) {
             continue;
         }
@@ -544,7 +635,10 @@ async fn select_account(
             env.insert(adapter::CREDENTIAL_DOC_ENV.into(), doc);
             env.insert(adapter::CREDENTIAL_DEST_ENV.into(), dest.into());
         }
-        return Some(Selected { account_id: account.id, env });
+        return Some(Selected {
+            account_id: account.id,
+            env,
+        });
     }
     None
 }
@@ -557,17 +651,26 @@ pub async fn run(
     spec: &TaskSpec,
     rotator: Result<&AccountRotator, String>,
 ) -> Result<String, SandboxError> {
-    crate::product_policy::load(home).and_then(|policy| {
-        policy.require_runtime(spec.runtime.as_str())?;
-        crate::product_policy::require_model(policy, &spec.model)
-    }).map_err(|message| SandboxError::Failed(SandboxFailure::failed(failure_code::PRODUCT_POLICY_REFUSED, message)))?;
+    crate::product_policy::load(home)
+        .and_then(|policy| {
+            policy.require_runtime(spec.runtime.as_str())?;
+            crate::product_policy::require_model(policy, &spec.model)
+        })
+        .map_err(|message| {
+            SandboxError::Failed(SandboxFailure::failed(
+                failure_code::PRODUCT_POLICY_REFUSED,
+                message,
+            ))
+        })?;
     let unavailable = SandboxError::Unavailable;
     let family = preflight(settings, spec).map_err(unavailable)?;
     if !container::docker_reachable().await {
         return Err(unavailable(Unavailable::DockerUnreachable));
     }
     if !container::image_present(&settings.image).await {
-        return Err(unavailable(Unavailable::ImageMissing(settings.image.clone())));
+        return Err(unavailable(Unavailable::ImageMissing(
+            settings.image.clone(),
+        )));
     }
     if let Err(verdict) = container::resource_limits(&settings.image).await {
         return Err(unavailable(Unavailable::ResourceLimits(verdict)));
@@ -578,28 +681,42 @@ pub async fn run(
     } else {
         (family.provider().to_string(), None, spec.model.clone())
     };
-    let no_account = || unavailable(Unavailable::NoAccount {
-        runtime: family.name(),
-        accepted: accepted_credentials(family, &provider),
-    });
+    let no_account = || {
+        unavailable(Unavailable::NoAccount {
+            runtime: family.name(),
+            accepted: accepted_credentials(family, &provider),
+        })
+    };
     let rotator = rotator.map_err(|why| {
         tracing::warn!(error = %why, "task sandbox: account rotator unavailable");
         no_account()
     })?;
-    let selected = select_account(rotator, family, &provider, &spec.account_pool, base_url.as_deref())
-        .await
-        .ok_or_else(no_account)?;
+    let selected = select_account(
+        rotator,
+        family,
+        &provider,
+        &spec.account_pool,
+        base_url.as_deref(),
+    )
+    .await
+    .ok_or_else(no_account)?;
     if family != RuntimeFamily::Claude && !spec.explicit_denied_tools.is_empty() {
         tracing::warn!(agent = %spec.agent_id, runtime = family.name(),
             "denied_tools has no matching flag on this runtime; the sandbox tool allowlist and the container are the boundary");
     }
     let mut dir = container::TaskDir::create(home).map_err(|e| {
         SandboxError::Failed(
-            SandboxFailure::failed(failure_code::WORKSPACE_FAILED, "the sandbox workspace could not be created")
-                .with_detail(e.to_string()),
+            SandboxFailure::failed(
+                failure_code::WORKSPACE_FAILED,
+                "the sandbox workspace could not be created",
+            )
+            .with_detail(e.to_string()),
         )
     })?;
-    let result = execute(home, settings, spec, family, &model, rotator, &selected, &dir).await;
+    let result = execute(
+        home, settings, spec, family, &model, rotator, &selected, &dir,
+    )
+    .await;
     if let Err(error) = dir.remove() {
         tracing::warn!(dir = %dir.root().display(), %error, "task sandbox directory could not be removed");
     }
@@ -612,7 +729,11 @@ fn claude_disallowed(tools: &[String]) -> Option<String> {
     let kept: Vec<&str> = tools
         .iter()
         .map(|t| t.trim())
-        .filter(|t| !t.is_empty() && !t.starts_with('-') && !t.bytes().any(|c| matches!(c, b',' | b'\n' | b'\r' | 0)))
+        .filter(|t| {
+            !t.is_empty()
+                && !t.starts_with('-')
+                && !t.bytes().any(|c| matches!(c, b',' | b'\n' | b'\r' | 0))
+        })
         .collect();
     (!kept.is_empty()).then(|| kept.join(","))
 }
@@ -640,7 +761,8 @@ async fn execute(
     selected: &Selected,
     dir: &container::TaskDir,
 ) -> Result<String, SandboxError> {
-    let failed = |code: &'static str, m: String| SandboxError::Failed(SandboxFailure::failed(code, m));
+    let failed =
+        |code: &'static str, m: String| SandboxError::Failed(SandboxFailure::failed(code, m));
     let failed_with = |code: &'static str, m: String, detail: String| {
         SandboxError::Failed(SandboxFailure::failed(code, m).with_detail(detail))
     };
@@ -654,13 +776,20 @@ async fn execute(
         argv.extend(["--disallowedTools".into(), denied]);
     }
     let files = adapter::runtime_files(family, workspace, settings.max_turns, &prompt);
-    container::write_config(&dir.config, settings.max_turns, &files)
-        .map_err(|e| {
-            failed_with(failure_code::WORKSPACE_FAILED, "the sandbox configuration could not be written".into(), e.to_string())
-        })?;
+    container::write_config(&dir.config, settings.max_turns, &files).map_err(|e| {
+        failed_with(
+            failure_code::WORKSPACE_FAILED,
+            "the sandbox configuration could not be written".into(),
+            e.to_string(),
+        )
+    })?;
     // These errors can name host paths: the detail stays on the host.
     let unmountable = |e: String| {
-        failed_with(failure_code::AGENT_DIR_UNMOUNTABLE, "the agent directory cannot be mounted".into(), e)
+        failed_with(
+            failure_code::AGENT_DIR_UNMOUNTABLE,
+            "the agent directory cannot be mounted".into(),
+            e,
+        )
     };
     let agent_dir = crate::discovery::workspace::canonical_real_directory(&spec.agent_dir)
         .map_err(|e| unmountable(e.to_string()))?;
@@ -668,20 +797,43 @@ async fn execute(
     let home_label = crate::discovery::workspace::canonical_real_directory(home)
         .map(|h| container::home_label(&h))
         .map_err(|e| {
-            failed_with(failure_code::WORKSPACE_FAILED, "the gateway home cannot be resolved".into(), e.to_string())
+            failed_with(
+                failure_code::WORKSPACE_FAILED,
+                "the gateway home cannot be resolved".into(),
+                e.to_string(),
+            )
         })?;
     #[cfg(unix)]
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     #[cfg(not(unix))]
     let (uid, gid) = (0u32, 0u32);
-    let label_agent: String = spec.agent_id.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
+    let label_agent: String = spec
+        .agent_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
     let plan = container::ContainerPlan {
-        image: &settings.image, executable: settings.executable(family), argv: &argv, env: &selected.env,
-        agent_files: &agent_files, config_dir: &dir.config,
-        memory_bytes: settings.memory_bytes, pids: settings.pids, cpu_millis: settings.cpu_millis,
-        tmp_bytes: settings.tmp_bytes, workspace_bytes: settings.workspace_bytes, home_label: &home_label,
-        uid, gid, run_id: &dir.run_id,
-        agent_id: if label_agent.is_empty() { "unknown" } else { &label_agent }, timeout: spec.timeout,
+        image: &settings.image,
+        executable: settings.executable(family),
+        argv: &argv,
+        env: &selected.env,
+        agent_files: &agent_files,
+        config_dir: &dir.config,
+        memory_bytes: settings.memory_bytes,
+        pids: settings.pids,
+        cpu_millis: settings.cpu_millis,
+        tmp_bytes: settings.tmp_bytes,
+        workspace_bytes: settings.workspace_bytes,
+        home_label: &home_label,
+        uid,
+        gid,
+        run_id: &dir.run_id,
+        agent_id: if label_agent.is_empty() {
+            "unknown"
+        } else {
+            &label_agent
+        },
+        timeout: spec.timeout,
     };
     // `build_create` refusals are fixed text ("sandbox container refused: …").
     let (create, name) = container::build_create(&plan)
@@ -752,9 +904,14 @@ async fn execute(
     let summary = parse_stream(&transcript);
     record_usage(spec, family, model, &summary).await;
     if let Some(StopCause::ToolViolation(tool)) = &stop {
-        audit(home, "task_sandbox_tool_violation", &spec.agent_id, json!({
-            "runtime": family.name(), "tool": tool,
-        }));
+        audit(
+            home,
+            "task_sandbox_tool_violation",
+            &spec.agent_id,
+            json!({
+                "runtime": family.name(), "tool": tool,
+            }),
+        );
     }
     let output = match launched {
         Ok(output) => output,
@@ -763,10 +920,15 @@ async fn execute(
             // environment: record it (reason code only) so the operator
             // sees it; the periodic sweep removes it once it has stopped
             // or passed its deadline.
-            audit(home, "task_sandbox_cleanup_failed", &spec.agent_id, json!({
-                "reason": sweep::SweepFailure::ContainerRemoveFailed.code(), "count": 1,
-                "runtime": family.name(),
-            }));
+            audit(
+                home,
+                "task_sandbox_cleanup_failed",
+                &spec.agent_id,
+                json!({
+                    "reason": sweep::SweepFailure::ContainerRemoveFailed.code(), "count": 1,
+                    "runtime": family.name(),
+                }),
+            );
             return Err(failed_with(
                 failure_code::CLEANUP_FAILED,
                 "the sandbox container could not be removed; the periodic sweep removes it once it has stopped".into(),
@@ -799,17 +961,28 @@ async fn execute(
         ));
     }
     let failed_run = !output.status.success() || summary.is_error;
-    if matches!(stop, Some(StopCause::RateLimited)) || (failed_run && rate_limit_message(&output.stderr)) {
+    if matches!(stop, Some(StopCause::RateLimited))
+        || (failed_run && rate_limit_message(&output.stderr))
+    {
         return Err(failed_with(
             failure_code::RATE_LIMITED,
-            format!("the {} provider rate-limited or rejected the request for quota", family.name()),
+            format!(
+                "the {} provider rate-limited or rejected the request for quota",
+                family.name()
+            ),
             detail(&output.stderr, &transcript, &secrets),
         ));
     }
     if matches!(stop, Some(StopCause::TranscriptOverflow)) {
-        return Err(failed(failure_code::OUTPUT_OVERFLOW, "the sandbox output exceeded 1 MiB and was stopped".into()));
+        return Err(failed(
+            failure_code::OUTPUT_OVERFLOW,
+            "the sandbox output exceeded 1 MiB and was stopped".into(),
+        ));
     }
-    if output.status.code() == Some(SUPERVISOR_SETUP_FAILED) && transcript.is_empty() && unparsable == 0 {
+    if output.status.code() == Some(SUPERVISOR_SETUP_FAILED)
+        && transcript.is_empty()
+        && unparsable == 0
+    {
         return Err(failed_with(
             failure_code::SUPERVISOR_REFUSED,
             "the sandbox supervisor refused its setup".into(),
@@ -829,7 +1002,11 @@ async fn execute(
             detail(&output.stderr, &transcript, &secrets),
         ));
     }
-    let reply = summary.final_text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+    let reply = summary
+        .final_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
         .map(str::to_string)
         .or_else(|| (!last_text.trim().is_empty()).then(|| last_text.trim().to_string()));
     let step_limit = matches!(stop, Some(StopCause::StepLimit)) || max_turns_result(&transcript);
@@ -838,23 +1015,36 @@ async fn execute(
             Some(text) => Ok(redact(&text, &secrets)),
             None => Err(failed(
                 failure_code::STEP_LIMIT,
-                format!("the AI reached the sandbox step limit ({}) before writing a reply", settings.max_turns),
+                format!(
+                    "the AI reached the sandbox step limit ({}) before writing a reply",
+                    settings.max_turns
+                ),
             )),
         };
     }
     if output.timed_out {
         return Err(failed(
             failure_code::TIMEOUT,
-            format!("the sandbox task timed out after {} s", spec.timeout.as_secs()),
+            format!(
+                "the sandbox task timed out after {} s",
+                spec.timeout.as_secs()
+            ),
         ));
     }
     if output.stopped {
-        return Err(failed(failure_code::STOPPED, "the sandbox run was stopped".into()));
+        return Err(failed(
+            failure_code::STOPPED,
+            "the sandbox run was stopped".into(),
+        ));
     }
     match reply {
         Some(text) if !failed_run => {
             let cost = call_cost_for(family, summary.model.as_deref().unwrap_or(model), &summary);
-            let cents = if cost.usd.is_finite() && cost.usd >= 0.0 { (cost.usd * 100.0).ceil() as u64 } else { 0 };
+            let cents = if cost.usd.is_finite() && cost.usd >= 0.0 {
+                (cost.usd * 100.0).ceil() as u64
+            } else {
+                0
+            };
             rotator.on_success(&selected.account_id, cents).await;
             Ok(redact(&text, &secrets))
         }
@@ -863,7 +1053,10 @@ async fn execute(
             format!(
                 "the {} CLI in the sandbox ended without a reply (exit {})",
                 family.name(),
-                output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string())
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string())
             ),
             detail(&output.stderr, &transcript, &secrets),
         )),
@@ -878,7 +1071,11 @@ fn tool_label(tool: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
         .collect();
     let kept = duduclaw_core::truncate_chars(&kept, 64).to_string();
-    if kept.is_empty() { "unnamed tool".into() } else { kept }
+    if kept.is_empty() {
+        "unnamed tool".into()
+    } else {
+        kept
+    }
 }
 
 /// The text of a normalised assistant event, when it has any.
@@ -900,12 +1097,17 @@ fn assistant_text(event: &Value) -> Option<String> {
 /// assistant event with a `tool_use` content block): a run that worked
 /// cannot have been rejected for its credential.
 fn used_a_tool(transcript: &str) -> bool {
-    transcript.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).any(|e| {
-        e["type"].as_str() == Some("assistant")
-            && e["message"]["content"]
-                .as_array()
-                .is_some_and(|blocks| blocks.iter().any(|b| b["type"].as_str() == Some("tool_use")))
-    })
+    transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .any(|e| {
+            e["type"].as_str() == Some("assistant")
+                && e["message"]["content"].as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b["type"].as_str() == Some("tool_use"))
+                })
+        })
 }
 
 /// A native `--max-turns` stop (Claude / Grok `error_max_turns`).
@@ -913,16 +1115,23 @@ fn max_turns_result(transcript: &str) -> bool {
     transcript
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .any(|e| e["type"].as_str() == Some("result") && e["subtype"].as_str() == Some("error_max_turns"))
+        .any(|e| {
+            e["type"].as_str() == Some("result") && e["subtype"].as_str() == Some("error_max_turns")
+        })
 }
 
 /// Readable diagnostic: the CLI's own error fields plus the stderr tail,
 /// redacted first, then bounded.
 pub fn detail(stderr: &str, transcript: &str, secrets: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for event in transcript.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+    for event in transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    {
         let fields: &[&str] = match event["type"].as_str() {
-            Some("result") if event["is_error"].as_bool() == Some(true) => &["result", "error", "errors"],
+            Some("result") if event["is_error"].as_bool() == Some(true) => {
+                &["result", "error", "errors"]
+            }
             Some("error") => &["error", "message"],
             _ => continue,
         };
@@ -949,11 +1158,21 @@ pub fn detail(stderr: &str, transcript: &str, secrets: &[String]) -> String {
     duduclaw_core::truncate_chars(&joined, DETAIL_MAX_CHARS).to_string()
 }
 
-async fn record_usage(spec: &TaskSpec, _family: RuntimeFamily, model: &str, summary: &crate::discovery::agent_spawn::StreamSummary) {
+async fn record_usage(
+    spec: &TaskSpec,
+    _family: RuntimeFamily,
+    model: &str,
+    summary: &crate::discovery::agent_spawn::StreamSummary,
+) {
     let Some(usage) = &summary.usage else { return };
     if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
         telemetry
-            .record(&spec.agent_id, crate::cost_telemetry::RequestType::Dispatch, summary.model.as_deref().unwrap_or(model), usage)
+            .record(
+                &spec.agent_id,
+                crate::cost_telemetry::RequestType::Dispatch,
+                summary.model.as_deref().unwrap_or(model),
+                usage,
+            )
             .await;
     }
 }
@@ -961,6 +1180,6 @@ async fn record_usage(spec: &TaskSpec, _family: RuntimeFamily, model: &str, summ
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, unix))]
-mod tests_runner;
-#[cfg(all(test, unix))]
 mod tests_docker;
+#[cfg(all(test, unix))]
+mod tests_runner;

@@ -136,8 +136,8 @@ pub fn vendor_policy(id: &str) -> VendorPolicy {
         "gemini" | "google" => VendorPolicy {
             vendor: "google-gemini-cli",
             notice_zh: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth \
-                 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。DuDuClaw 執行的是原版 Gemini CLI，\
-                 但是否落在這條範圍內由 Google 判斷。另外，Google 的停用公告寫明自 2026-06-18 起，\
+                 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。DuDuClaw 已移除 Gemini CLI 執行環境。\
+                 Google 的停用公告另寫明自 2026-06-18 起，\
                  Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，\
                  付費 API 金鑰（Gemini API 或企業方案）仍可使用。要長期穩定使用，請改用 Gemini API 金鑰。",
             url: Some(GEMINI_CLI_TERMS_URL),

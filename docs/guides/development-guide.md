@@ -65,7 +65,7 @@ when the primary one is unavailable.
 
 ```toml
 [runtime]
-provider = "antigravity"   # claude | codex | gemini (deprecated) | antigravity | openai_compat
+provider = "antigravity"   # claude | codex | antigravity | openai_compat
 fallback = "claude"        # backend to fall back to when detection fails
 ```
 
@@ -73,7 +73,6 @@ fallback = "claude"        # backend to fall back to when detection fails
 |----------|-----------|------|------|
 | `claude` | `claude` (always available, core) | OAuth / API key rotation | Default backend |
 | `codex` | `codex` | OpenAI | — |
-| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **Deprecated in v1.67.0, removed in v1.75.0** (see [Deprecations](deprecations.md#gemini-cli-runtime)). Personal-edition OAuth was retired on 2026-06-18; paid API keys still work |
 | `antigravity` | `agy` (`~/.local/bin/agy`) | Google sign-in (`agy` in a terminal) / `GEMINI_API_KEY` | Official successor to the Gemini CLI; multi-model (Gemini 3.x + Claude + GPT-OSS) |
 | `openai_compat` | HTTP (no CLI) | per-provider key | OpenAI-compatible endpoints such as Exo / llamafile / vLLM |
 

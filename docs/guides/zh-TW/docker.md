@@ -3,9 +3,7 @@
 > 適用版本：v1.8.23+
 > 最後更新：2026-04-22
 
-本指南涵蓋以 Docker Compose 部署 DuDuClaw 伺服器的完整流程 ——
-從 port 設定、三大 CLI（Claude / Codex / Gemini）的驗證方式，
-到資料持久化、channel webhook 與自動更新。
+本指南涵蓋 Docker Compose 部署、Codex 裝置碼登入、API key、憑證 volume、channel webhook 與更新。
 
 若只是想在本機試跑，請先參考
 [docs/deployment-guide.md §1](deployment-guide.md#1-local-development)
@@ -27,7 +25,7 @@ DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段
 最終映像內建：
 
 - `duduclaw` 主程式（Rust，含 dashboard）
-- `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（透過 `npm i -g`）
+- `@anthropic-ai/claude-code`、`@openai/codex`（透過 `npm i -g`）
 - `docker.io` CLI（掛載 socket 後面那個 Docker daemon 的用戶端；啟用任務沙箱時才會用到）
 - （選用）Python 3.12：僅 LLMLingua-2 提示壓縮器（需 `llmlingua`）才需要；Skill 安全掃描與通道回覆已是 Rust-native，不再依賴 Python
 
@@ -97,7 +95,7 @@ open http://localhost:18789
 
 至少需要其中一組可用。DuDuClaw 會依 `agent.toml [runtime]` 與
 `[model] api_mode` 決定使用哪一個。詳見
-[§6 三大 CLI 驗證設定](#6-三大-cli-驗證設定)。
+[§6 CLI 認證設定](#6-cli-認證設定)。
 
 ### 4.2 Channel Tokens
 
@@ -203,23 +201,29 @@ docker compose up -d
 
 ---
 
-## 6. 三大 CLI 驗證設定
+## 6. CLI 認證設定
 
-三個 runtime 各有兩條認證路徑：**OAuth**（免額外費用，走訂閱方案）
-或 **API Key**（按量付費 fallback）。實務建議「至少裝 OAuth，
-並留一把 API Key 當保險」。
+image 包含 Claude、Codex、Antigravity 與 Grok，登入方法各有不同。Codex 使用裝置碼，瀏覽器不必連到容器內的 callback listener。建議備妥 API key 作為計費與備援方式。
 
-容器內三個 OAuth 狀態目錄都有獨立 named volume：
+標準 Compose 檔掛載下列憑證與設定目錄：
 
 | 路徑 | Volume | CLI |
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
-| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Gemini |
+| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Antigravity 設定 |
+| `/home/duduclaw/.grok` | `duduclaw-grok` | Grok |
+| `/home/duduclaw/.kimi-code` | `duduclaw-kimi` | Kimi Code |
+| `/home/duduclaw/.copilot` | `duduclaw-copilot` | GitHub Copilot CLI |
+| `/home/duduclaw/.kiro` | `duduclaw-kiro` | Kiro CLI |
+| `/home/duduclaw/.cursor` | `duduclaw-cursor` | Cursor CLI |
+| `/home/duduclaw/.local/share/opencode` | `duduclaw-opencode` | OpenCode |
 
-這代表 **登入一次後即使容器重建也不需重登**。
+持久化 volume 可讓 CLI 狀態在容器重建後保留。自訂 Compose 檔也要掛載對應目錄。
 
-> **訂閱登入有帳號風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token；Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。讓一份訂閱回覆頻道上的客戶、輪替多個訂閱帳號來避開用量上限、把 token 存在 DuDuClaw，都和這份規範衝突。Google 的 [Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)與 [Antigravity 條款](https://antigravity.google/terms)寫明，用第三方軟體透過 Gemini CLI 或 Antigravity 的 OAuth 存取其服務屬於違規，可能導致帳號被停權或終止；OpenAI 有官方的 [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) 計畫：在第三方應用程式使用 ChatGPT 方案，開放給開源合作夥伴與選定的商業合作夥伴，商業產品要先取得 OpenAI 同意，驗證 token 也必須留在使用者自己掌控的本機，不能放在遠端或託管環境。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，功能照常可用，但建議使用 API key；dashboard 的登入流程會先要求你勾選同意這段說明。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
+新增的五個 volume 只負責保留憑證；這些 CLI 不隨此 image 安裝，須另行安裝後 Dashboard 才能啟動登入。Cursor 的瀏覽器登入仍需要 CLI 可收到本機 callback；遠端主機若無法接收，請改用 API key。
+
+> **訂閱登入有帳號風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token；Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。讓一份訂閱回覆頻道上的客戶、輪替多個訂閱帳號來避開用量上限、把 token 存在 DuDuClaw，都和這份規範衝突。Google 的 [Antigravity 條款](https://antigravity.google/terms)寫明，用第三方軟體透過 Antigravity 的 OAuth 存取其服務屬於違規，可能導致帳號被停權或終止；OpenAI 有官方的 [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) 計畫：在第三方應用程式使用 ChatGPT 方案，開放給開源合作夥伴與選定的商業合作夥伴，商業產品要先取得 OpenAI 同意，驗證 token 也必須留在使用者自己掌控的本機，不能放在遠端或託管環境。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，功能照常可用，但建議使用 API key；dashboard 的登入流程會先要求你勾選同意這段說明。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
 
 ### 6.1 Claude Code CLI
 
@@ -291,8 +295,9 @@ DuDuClaw 的 AccountRotator 會自動在多個帳號間輪替，詳見
 
 ```bash
 docker compose exec duduclaw bash
-codex login
-# 輸入 ChatGPT 帳號密碼或跟著瀏覽器流程走
+codex login --device-auth
+# 在瀏覽器開啟 Codex 顯示的驗證網址，輸入裝置碼。
+# 等待 CLI 顯示完成；不需將 callback URL 貼回 Dashboard。
 # 狀態寫入 /home/duduclaw/.codex/ ── 即 duduclaw-codex volume
 exit
 ```
@@ -309,31 +314,13 @@ OPENAI_API_KEY=sk-proj-...
 
 按量計費（OpenAI API 定價）。
 
-### 6.3 Gemini（Google）CLI（已棄用）
+### 6.3 Antigravity（Google）API key 模式
 
-> **v1.67.0 棄用，v1.75.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務免費、Google AI Pro 與 Google AI Ultra 的個人帳號，所以個人 Google 登入已經無法搭配它使用。API key 與企業（Gemini Code Assist）用法不受影響。image 在移除前仍內含 Gemini CLI。請改用 Antigravity runtime（`antigravity`，執行檔 `agy`），詳見[已棄用名稱](deprecations.md#gemini-cli-runtime)。
->
-> 透過 `agy` 登入 Antigravity 需要終端機與 OS keyring，容器裡兩者都沒有，所以容器請用 API key 模式：設定 `config.toml [antigravity] auth = "api_key"`，並提供同一把 Gemini API key（`gemini` provider 帳號，或下方的 `GEMINI_API_KEY`）。Antigravity 的設定同樣存在 `~/.gemini` 底下，所以下方的 `duduclaw-gemini` volume 要保留。
-
-#### 方法 A：Google OAuth（僅限 Gemini Code Assist／企業帳號）
-
-```bash
-docker compose exec duduclaw bash
-gemini auth
-# 依提示在本機瀏覽器完成 Google 登入
-# 狀態寫入 /home/duduclaw/.gemini/ ── 即 duduclaw-gemini volume
-exit
-```
-
-#### 方法 B：API Key Fallback
-
-`.env`：
-
-```bash
-GEMINI_API_KEY=AIza...
-```
-
-按 Google AI Studio 定價計費。
+Docker image 不再安裝 Gemini CLI。Antigravity（`agy`）與 Gemini API provider
+仍受支援。`agy` 訂閱登入需要 OS keyring，容器請使用 API key 模式：設定
+`config.toml [antigravity] auth = "api_key"`，並提供 `gemini` provider 帳號
+或 `.env` 的 `GEMINI_API_KEY`。Antigravity 設定存在
+`~/.gemini/antigravity-cli/`，所以 `duduclaw-gemini` volume 仍需保留。
 
 ### 6.4 Per-Agent 指定 Runtime
 
@@ -343,7 +330,7 @@ GEMINI_API_KEY=AIza...
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-provider = "claude"       # 主 runtime：claude / codex / antigravity / openai-compat …（gemini 已棄用）
+provider = "claude"       # 主 runtime：claude / codex / antigravity / openai-compat …
 fallback = "antigravity"  # Claude 不可用時自動切換
 ```
 
@@ -352,15 +339,14 @@ fallback = "antigravity"  # Claude 不可用時自動切換
 
 沒有設定 `provider` 時，agent 使用 Claude。
 
-### 6.5 驗證三個 CLI 都認得出來
+### 6.5 驗證已安裝的 CLI
 
 ```bash
 docker compose exec duduclaw bash
 
-# 三個都應該印出版本
+# 已安裝的 CLI 應印出版本
 claude --version
 codex --version
-gemini --version
 
 # Claude 登入狀態
 claude auth status
@@ -370,14 +356,20 @@ claude auth status
 
 ## 7. 資料持久化（Volumes）
 
-`docker-compose.yml` 宣告了四個 named volume：
+`docker-compose.yml` 宣告了十個 named volume：
 
 | Volume | 內容 | 備份建議 |
 |--------|------|---------|
 | `duduclaw-data` | 主程式資料：config、agents、memory SQLite、logs、bus_queue.jsonl | **最重要**，建議每日備份 |
 | `duduclaw-claude` | Claude CLI OAuth state | 中等，遺失需重新 `claude auth login` |
 | `duduclaw-codex`  | Codex OAuth state | 中等 |
-| `duduclaw-gemini` | Gemini OAuth state | 中等 |
+| `duduclaw-gemini` | Antigravity 的 `~/.gemini` 設定 | 中等 |
+| `duduclaw-grok` | Grok CLI 憑證 | 中等 |
+| `duduclaw-kimi` | Kimi Code 憑證 | 中等 |
+| `duduclaw-copilot` | Copilot CLI 憑證 | 中等 |
+| `duduclaw-kiro` | Kiro CLI 憑證 | 中等 |
+| `duduclaw-cursor` | Cursor CLI 憑證 | 中等 |
+| `duduclaw-opencode` | OpenCode 憑證 | 中等 |
 
 以及掛入的宿主機路徑：
 
@@ -417,13 +409,19 @@ docker run --rm \
       - ./data/claude:/home/duduclaw/.claude
       - ./data/codex:/home/duduclaw/.codex
       - ./data/gemini:/home/duduclaw/.gemini
+      - ./data/grok:/home/duduclaw/.grok
+      - ./data/kimi:/home/duduclaw/.kimi-code
+      - ./data/copilot:/home/duduclaw/.copilot
+      - ./data/kiro:/home/duduclaw/.kiro
+      - ./data/cursor:/home/duduclaw/.cursor
+      - ./data/opencode:/home/duduclaw/.local/share/opencode
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 注意宿主機目錄的 **owner 必須是 UID 1000**（容器內 `duduclaw` 使用者）：
 
 ```bash
-mkdir -p data/{duduclaw,claude,codex,gemini}
+mkdir -p data/{duduclaw,claude,codex,gemini,grok,kimi,copilot,kiro,cursor,opencode}
 sudo chown -R 1000:1000 data/
 ```
 
@@ -687,7 +685,7 @@ docker volume ls | grep duduclaw
 ```
 
 若缺了某個，表示 compose 檔被改過或曾 `docker compose down -v`，
-重新 `claude auth login` / `codex login` / `gemini auth` 即可。
+重新 `claude auth login` / `codex login --device-auth` 即可。
 
 ---
 

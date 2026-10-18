@@ -12,7 +12,7 @@
 
 DuDuClaw turns AI command-line tools such as Claude Code, Codex and Antigravity into AI employees who actually deliver: they staff eleven messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
 
-All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain between twelve CLI backends (Claude Code, Codex, Antigravity, Grok and others; Gemini CLI is deprecated) or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
+All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain between eleven CLI backends (Claude Code, Codex, Antigravity, Grok and others) or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
 <p align="center">
   <img src="docs/assets/screenshots/dashboard-task-board-en.png" width="100%" alt="DuDuClaw v1.74.0 web dashboard, task board in list view: seven demo tasks grouped as To Do, In Progress, In Review, Done and Stuck, each with an ID, a tag such as support or marketing, and a priority">
@@ -58,7 +58,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | 247 MCP tools written once, reachable from the Claude, Codex, Gemini, Antigravity, Grok and OpenAI-compatible runtimes |
+| Tools shared across LLMs | Rewrite per vendor | 247 MCP tools written once, reachable from the Claude, Codex, Antigravity, Grok and OpenAI-compatible runtimes |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 | A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + read-only root, plug in and go; a desktop shared by a person and the AI without getting in each other's way |
 
@@ -69,12 +69,12 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Antigravity / Grok / … (12 CLIs) / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Antigravity / Grok / … (11 CLIs) / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
-  ├─ Multi-Runtime — 13 runtime ids (12 CLIs + OpenAI-compat), auto-detected, per agent
+  ├─ Multi-Runtime — 12 runtime ids (11 CLIs + OpenAI-compat), auto-detected, per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
   ├─ MCP Server — 247 tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — prediction-driven + AEE playbook rules + MistakeNotebook
@@ -96,9 +96,11 @@ The same gateway + dashboard also ships as a whole machine: [DuDuClaw OS](https:
 
 DuDuClaw doesn't ship its own LLM — you need an AI brain first. Pick one (you can also set this up later in the browser wizard):
 
-- Install one of the supported AI CLIs, such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex) or Antigravity (the full list is in [multi-runtime](docs/features/13-multi-runtime.md); [Gemini CLI](https://github.com/google-gemini/gemini-cli) is deprecated and removed in v1.75.0), and give it an API key. Anthropic's [policy](https://code.claude.com/docs/en/legal-and-compliance) does not permit third-party products to offer Claude.ai login, route requests through Free/Pro/Max plan credentials on their users' behalf, or store those credentials, and Anthropic may enforce this without notice (users have reported suspended accounts). Google's [Gemini CLI terms](https://geminicli.com/docs/resources/tos-privacy/) and [Antigravity terms](https://antigravity.google/terms) (section 6) say that accessing their services from third-party software through a subscription OAuth login may get the account suspended or terminated. An API key is the supported path; subscription sign-in stays available behind a risk notice you have to accept
+- Install one of the supported AI CLIs, such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex) or Antigravity (the full list is in [multi-runtime](docs/features/13-multi-runtime.md)); Gemini CLI is no longer a DuDuClaw runtime. Anthropic's [policy](https://code.claude.com/docs/en/legal-and-compliance) does not permit third-party products to offer Claude.ai login, route requests through Free/Pro/Max plan credentials on their users' behalf, or store those credentials, and Anthropic may enforce this without notice (users have reported suspended accounts). Google's [Antigravity terms](https://antigravity.google/terms) (section 6) say that accessing its service from third-party software may get the account suspended or terminated. An API key is the supported path; subscription sign-in stays available behind a risk notice you have to accept
 - Bring an API key for any OpenAI-compatible provider
 - Or run a local model behind an OpenAI-compatible server (llama-server, Ollama, vLLM, llamafile) — no cloud account needed
+
+In the Dashboard, one-click login supports Claude, Codex, Grok, Kimi, Copilot, Kiro and OpenCode when the CLI is installed. Codex uses `codex login --device-auth`: open the verification page shown by the CLI, enter its device code, and wait for completion. The browser does not need access to a Docker callback port, and pasting a callback URL `code` into the Dashboard does not authenticate. On the Accounts page, the API Token card can delete a saved account after you confirm its account id; revoke the key separately at its provider if needed.
 
 <a id="install"></a>
 
@@ -187,13 +189,13 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Area | What's built in | Read more |
 |------|-----------------|-----------|
 | Channels | 11 channels (Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards; Telegram voice messages are transcribed through the OpenAI Whisper API. Discord voice channels are a non-default build feature and are not in the release binaries | [docs/features](docs/features/README.md) |
-| Multi-runtime | 13 runtime ids: Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI (deprecated, removed in v1.75.0) plus OpenAI-compat; auto-detected, per-agent config, context survives backend switches | [docs/features/13](docs/features/13-multi-runtime.md) |
+| Multi-runtime | 12 runtime ids: Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode plus OpenAI-compat; auto-detected, per-agent config, context survives backend switches | [docs/features/13](docs/features/13-multi-runtime.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP server | 247 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports; an external client key gets a 7-tool baseline unless the operator grants it memory, wiki or messaging scopes, and connector, execution and admin tools are never exposed externally | [docs/api](docs/api/README.md) |
 | Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
 | Self-evolution | Prediction-driven (by design most conversations end without an LLM call) + AEE playbook evolution: SOUL.md is read-only for agents, learned behavior is small rules that each link an eval case, a rule is committed only if it matches or beats the current playbook and is settled on its own after 24h; MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox (per agent, off by default), container sandboxes (task sandbox: Docker only, off by default; script sandbox: Docker, with WSL2 tried first on Windows), secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
-| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics. Each call runs the official CLI as a fresh process (the PTY session pool was removed in 2026-09; a one-shot pseudo-terminal remains for CLIs that require a TTY, such as Grok). Anthropic's [policy](https://code.claude.com/docs/en/legal-and-compliance) does not permit third-party products to route requests through Claude subscription credentials, and Google's Gemini CLI and Antigravity terms say third-party access through a subscription OAuth login may get the account suspended or terminated, so use API keys; subscription sign-in stays available behind an explicit risk acknowledgment ([multi-runtime](docs/features/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
+| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics. Each call runs the official CLI as a fresh process (the PTY session pool was removed in 2026-09; a one-shot pseudo-terminal remains for CLIs that require a TTY, such as Grok). Anthropic's [policy](https://code.claude.com/docs/en/legal-and-compliance) does not permit third-party products to route requests through Claude subscription credentials, and Google's Antigravity terms say third-party access through a subscription OAuth login may get the account suspended or terminated, so use API keys; subscription sign-in stays available behind an explicit risk acknowledgment ([multi-runtime](docs/features/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
 | Local inference | Any OpenAI-compatible local server (llama-server / Ollama / vLLM / SGLang) or llamafile, with three-tier confidence routing | [docs/features](docs/features/README.md) |
 | Fine-tuning | Build SFT / DPO datasets (ShareGPT / Alpaca) from this machine's conversations, task results and approval decisions, train them on your own GPU host (SSH + LLaMA-Factory) or Together's cloud, then import the GGUF / LoRA back into the local models directory. No local training — integrated graphics cannot train — and data leaving the machine requires an explicit acknowledgement | [docs/features/54](docs/features/54-finetune.md) |
 | Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default; in v1.67.0 do not enable it on Windows, see CHANGELOG) | [docs/rfc](docs/rfc) |
@@ -265,7 +267,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 |---|---|---|---|---|
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 11 | 25+ | 8 | 0 (API) |
-| Multi-runtime | 13 runtime ids (12 CLIs + OpenAI-compat) | single | single | multi-LLM |
+| Multi-runtime | 12 runtime ids (11 CLIs + OpenAI-compat) | single | single | multi-LLM |
 | MCP server | 247 tools | no | no | no |
 | Self-evolution engine | AEE playbook rules (prediction-driven) | no | no | no |
 | Local inference | OpenAI-compatible local server / llamafile + confidence routing | no | no | no |

@@ -302,9 +302,9 @@ describe('EditAgentPage', () => {
   // spawned CLI subprocess the operator's own SSH/GPG identity, so the
   // dashboard switch must go through the same danger-confirm gate as
   // computer_use / browser_via_bash / recording, default unchecked.
-  // Gemini CLI runtime deprecation: no longer offered, but a saved value stays
+  // Gemini CLI runtime removal: no longer offered, but a saved value stays
   // visible and labelled; Antigravity is offered instead.
-  describe('runtime pickers — Gemini CLI deprecation', () => {
+  describe('runtime pickers — Gemini CLI removal', () => {
     it('offers Antigravity and not Gemini when the saved provider is claude', async () => {
       const user = userEvent.setup();
       renderAt('/agents/my-bot/edit?tab=brain');
@@ -314,31 +314,31 @@ describe('EditAgentPage', () => {
       expect(screen.queryByRole('option', { name: /Gemini/ })).not.toBeInTheDocument();
     });
 
-    it('keeps a saved gemini provider visible, labelled deprecated', async () => {
+    it('keeps a saved gemini provider visible, labelled removed', async () => {
       const user = userEvent.setup();
       mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'gemini', fallback: '' } });
       renderAt('/agents/my-bot/edit?tab=brain');
 
       const picker = await screen.findByRole('combobox', { name: 'AI Backend (Provider)' });
       await waitFor(() => {
-        expect(picker).toHaveTextContent('Gemini (deprecated)');
+        expect(picker).toHaveTextContent('Gemini (removed)');
       });
       await user.click(picker);
-      expect(await screen.findByRole('option', { name: 'Gemini (deprecated)' })).toBeInTheDocument();
+      expect(await screen.findByRole('option', { name: 'Gemini (removed)' })).toBeInTheDocument();
       expect(screen.getByRole('option', { name: 'Antigravity (Google)' })).toBeInTheDocument();
     });
 
-    it('keeps a saved gemini fallback visible, labelled deprecated', async () => {
+    it('keeps a saved gemini fallback visible, labelled removed', async () => {
       const user = userEvent.setup();
       mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'claude', fallback: 'gemini' } });
       renderAt('/agents/my-bot/edit?tab=brain');
 
       const picker = await screen.findByRole('combobox', { name: 'Fallback Backend' });
       await waitFor(() => {
-        expect(picker).toHaveTextContent('Gemini (deprecated)');
+        expect(picker).toHaveTextContent('Gemini (removed)');
       });
       await user.click(picker);
-      expect(await screen.findByRole('option', { name: 'Gemini (deprecated)' })).toBeInTheDocument();
+      expect(await screen.findByRole('option', { name: 'Gemini (removed)' })).toBeInTheDocument();
     });
   });
 
@@ -378,7 +378,7 @@ describe('EditAgentPage', () => {
   describe('saved gemini provider survives an unrelated runtime edit', () => {
     // v1.68 partial writes: an untouched provider is not sent at all, so the
     // saved gemini value cannot be replaced by the picker.
-    it('sends only the fallback when only the fallback changes, keeping gemini labelled deprecated', async () => {
+    it('sends only the fallback when only the fallback changes, keeping gemini labelled removed', async () => {
       const user = userEvent.setup();
       const updateAgent = vi.fn().mockResolvedValue(undefined);
       useAgentsStore.setState({ updateAgent } as never);
@@ -386,7 +386,7 @@ describe('EditAgentPage', () => {
       renderAt('/agents/my-bot/edit?tab=brain');
 
       const provider = await screen.findByRole('combobox', { name: 'AI Backend (Provider)' });
-      await waitFor(() => expect(provider).toHaveTextContent('Gemini (deprecated)'));
+      await waitFor(() => expect(provider).toHaveTextContent('Gemini (removed)'));
 
       await user.click(await screen.findByRole('combobox', { name: 'Fallback Backend' }));
       await user.click(await screen.findByRole('option', { name: 'Antigravity (Google)' }));
@@ -402,7 +402,7 @@ describe('EditAgentPage', () => {
         },
         { timeout: 3000 },
       );
-      expect(screen.getByRole('combobox', { name: 'AI Backend (Provider)' })).toHaveTextContent('Gemini (deprecated)');
+      expect(screen.getByRole('combobox', { name: 'AI Backend (Provider)' })).toHaveTextContent('Gemini (removed)');
     });
   });
 

@@ -75,6 +75,29 @@ fn file_mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+/// Kiro settings are not a credential signal. Check the CLI's documented
+/// authenticated-user command, without allowing an API key to satisfy it.
+fn kiro_session_verified(program: &str) -> bool {
+    let child = std::process::Command::new(program)
+        .args(["whoami", "--format", "json"])
+        .env_remove("KIRO_API_KEY")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
 /// Strip ANSI/VT escape sequences, preserving every non-escape character (case
 /// included). Correctly consumes:
 ///   - CSI: ESC `[` (params 0x30-0x3F)* (intermediates 0x20-0x2F)* final 0x40-0x7E
@@ -244,21 +267,6 @@ pub fn extract_auth_url(raw: &str) -> Option<String> {
     pool.into_iter().max_by_key(|u| u.len())
 }
 
-/// Redact token-like runs (e.g. `sk-ant-oat01-…`) from normalized PTY text
-/// before it is logged. The success screen may echo the long-lived token.
-fn redact_for_log(s: &str) -> String {
-    let mut out = s.to_string();
-    while let Some(i) = out.find("sk-ant") {
-        let tail = &out[i + 6..];
-        let n = tail
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .count();
-        out.replace_range(i..i + 6 + n, "<redacted-token>");
-    }
-    out
-}
-
 /// Login spec for a runtime, or `None` for runtimes with no interactive login
 /// (OpenAI-compat is API-key only; Qwen Code and Mistral Vibe are API-key only
 /// too — their sign-in lives inside an interactive TUI dialog that cannot be
@@ -291,7 +299,13 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             .map(|h| h.zh_tw)
             .unwrap_or("依畫面提示完成登入。"),
         // Most authoritative credential path; `None` ⇒ marker-only detection.
-        success_file: spec.auth.credential_paths.first().copied(),
+        // Kiro's documented settings file is not evidence of a completed
+        // login; it may be rewritten before authentication succeeds.
+        success_file: if runtime == RuntimeType::Kiro {
+            None
+        } else {
+            spec.auth.credential_paths.first().copied()
+        },
     })
 }
 
@@ -538,6 +552,7 @@ pub struct AuthSession {
     pub program: String,
     status: Arc<AtomicU8>,
     output_tx: broadcast::Sender<Vec<u8>>,
+    output_snapshot: Arc<Mutex<Vec<u8>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     // Master is retained so the PTY stays open for the session's lifetime.
@@ -609,6 +624,11 @@ impl AuthSession {
             .map_err(|e| AuthError::Pty(e.to_string()))?;
 
         let (output_tx, _rx) = broadcast::channel::<Vec<u8>>(1024);
+        let output_snapshot = Arc::new(Mutex::new(Vec::new()));
+        let replay_device_output = matches!(
+            runtime.spec().auth.login,
+            duduclaw_core::runtime_catalog::LoginMethod::DeviceCode { .. }
+        );
         let status = Arc::new(AtomicU8::new(ST_RUNNING));
         let token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -643,19 +663,31 @@ impl AuthSession {
         // tail (scan_outcome normalizes ANSI/whitespace before matching markers).
         {
             let tx = output_tx.clone();
+            let snapshot = output_snapshot.clone();
+            let replay_device_output = replay_device_output;
             let status = status.clone();
             let spec = spec.clone();
             let log_id = id.clone();
             let token_store = token.clone();
             let url_store = url.clone();
+            let verifier_program = program.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 let mut tail = String::new();
+                let mut kiro_success_seen = false;
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
                             let chunk = &buf[..n];
+                            if replay_device_output {
+                                let mut output = snapshot.lock().unwrap();
+                                output.extend_from_slice(chunk);
+                                if output.len() > 20_000 {
+                                    let excess = output.len() - 20_000;
+                                    output.drain(..excess);
+                                }
+                            }
                             let _ = tx.send(chunk.to_vec());
                             tail.push_str(&String::from_utf8_lossy(chunk));
                             if tail.len() > 16384 {
@@ -672,22 +704,16 @@ impl AuthSession {
                             if let Some(u) = extract_auth_url(&tail) {
                                 *url_store.lock().unwrap() = Some(u);
                             }
-                            // Diagnostic: log a redacted, normalized snapshot of the
-                            // tail end so the live transcript is inspectable from the
-                            // gateway log when a login gets stuck.
-                            let snap = normalize_for_match(&String::from_utf8_lossy(chunk));
-                            let snap: String = snap
-                                .chars()
-                                .rev()
-                                .take(160)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .collect();
-                            tracing::info!(target: "cli_auth", session = %log_id, bytes = n, snap = %redact_for_log(&snap), "pty output");
+                            // Device authorization codes and callback URLs can
+                            // appear anywhere in this chunk. Log its size only.
+                            tracing::info!(target: "cli_auth", session = %log_id, bytes = n, "pty output");
                             if status.load(Ordering::Relaxed) == ST_RUNNING {
                                 if let Some(o) = scan_outcome(&tail, &spec) {
                                     let code = match o {
+                                        AuthStatus::Succeeded if runtime == RuntimeType::Kiro => {
+                                            kiro_success_seen = true;
+                                            if kiro_session_verified(&verifier_program) { ST_SUCCEEDED } else { ST_RUNNING }
+                                        }
                                         AuthStatus::Succeeded => ST_SUCCEEDED,
                                         AuthStatus::Failed => ST_FAILED,
                                         _ => ST_RUNNING,
@@ -702,7 +728,11 @@ impl AuthSession {
                 }
                 // Process closed the PTY. If no marker was seen, mark Exited.
                 if status.load(Ordering::Relaxed) == ST_RUNNING {
-                    status.store(ST_EXITED, Ordering::Relaxed);
+                    let code = if runtime == RuntimeType::Kiro
+                        && kiro_success_seen
+                        && kiro_session_verified(&verifier_program)
+                    { ST_SUCCEEDED } else { ST_EXITED };
+                    status.store(code, Ordering::Relaxed);
                 }
                 tracing::info!(target: "cli_auth", session = %log_id, final_status = ?AuthStatus::from_u8(status.load(Ordering::Relaxed)), "pty reader exited");
             });
@@ -715,6 +745,7 @@ impl AuthSession {
             program,
             status,
             output_tx,
+            output_snapshot,
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             _master: Mutex::new(pair.master),
@@ -737,6 +768,14 @@ impl AuthSession {
     /// Subscribe to the raw output byte stream.
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output_tx.subscribe()
+    }
+
+    /// A bounded transcript for clients that attach after the first PTY chunk.
+    pub fn output_snapshot(&self) -> String {
+        if self.status().is_terminal() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&self.output_snapshot.lock().unwrap()).into_owned()
     }
 
     /// Write user input to the login process (e.g. a pasted code + `\r`).
@@ -764,6 +803,21 @@ impl AuthSession {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn kiro_whoami_requires_a_successful_session_without_api_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("kiro-fixture");
+        std::fs::write(&program, "#!/bin/sh\n[ \"$1\" = whoami ] && [ -z \"$KIRO_API_KEY\" ]\n").unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).unwrap();
+        assert!(kiro_session_verified(program.to_str().unwrap()));
+        std::fs::write(&program, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(!kiro_session_verified(program.to_str().unwrap()));
+    }
+
     #[test]
     fn every_cli_has_a_login_spec_except_openai_compat() {
         // Antigravity is NOT in this list: agy has no login subcommand (1.2.14,
@@ -771,8 +825,12 @@ mod tests {
         for rt in [
             RuntimeType::Claude,
             RuntimeType::Codex,
-            RuntimeType::Gemini,
             RuntimeType::Grok,
+            RuntimeType::Kimi,
+            RuntimeType::Copilot,
+            RuntimeType::Kiro,
+            RuntimeType::Cursor,
+            RuntimeType::OpenCode,
         ] {
             let spec = spec_for(rt).unwrap_or_else(|| panic!("{rt:?} must have a login spec"));
             assert!(!spec.login_args.is_empty(), "{rt:?} login_args empty");
@@ -787,15 +845,22 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_grok_are_remote_safe_others_are_not() {
+    fn device_code_logins_are_remote_safe() {
         // setup-token / device-code are both paste-back-free (or paste-back-only)
         // flows the user completes in their own browser → remote ok; the rest use
         // localhost callbacks that only work when the dashboard and browser share
         // a machine.
         assert!(spec_for(RuntimeType::Claude).unwrap().remote_safe);
         assert!(spec_for(RuntimeType::Grok).unwrap().remote_safe);
-        assert!(!spec_for(RuntimeType::Codex).unwrap().remote_safe);
-        assert!(!spec_for(RuntimeType::Gemini).unwrap().remote_safe);
+        assert!(spec_for(RuntimeType::Codex).unwrap().remote_safe);
+        assert_eq!(
+            spec_for(RuntimeType::Codex).unwrap().login_args,
+            vec!["login", "--device-auth"]
+        );
+        for rt in [RuntimeType::Kimi, RuntimeType::Copilot, RuntimeType::Kiro] {
+            assert!(spec_for(rt).unwrap().remote_safe, "{rt:?}");
+        }
+        assert!(!spec_for(RuntimeType::Cursor).unwrap().remote_safe);
     }
 
     #[test]
@@ -1001,7 +1066,6 @@ mod tests {
             runtimes,
             vec![
                 RuntimeType::Codex,
-                RuntimeType::Gemini,
                 RuntimeType::Grok,
                 RuntimeType::Kimi,
                 RuntimeType::Copilot,

@@ -3,7 +3,7 @@ import { screen } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 
 vi.mock('@/lib/api', () => ({
-  api: { auth: { cliLoginStart: vi.fn(), cliLoginCancel: vi.fn(), cliLoginInput: vi.fn() } },
+  api: { auth: { cliLoginStart: vi.fn(), cliLoginStatus: vi.fn(), cliLoginCancel: vi.fn(), cliLoginInput: vi.fn() } },
 }));
 vi.mock('@/lib/ws-client', () => ({
   client: { subscribe: () => () => {}, call: vi.fn() },
@@ -19,7 +19,6 @@ describe('<CliLoginModal> risk disclosure', () => {
   it.each([
     ['claude', ANTHROPIC],
     ['codex', 'https://openai.com/policies/sign-in-with-chatgpt-terms/'],
-    ['gemini', 'https://geminicli.com/docs/resources/tos-privacy/'],
     ['antigravity', 'https://antigravity.google/terms'],
     ['grok', 'https://x.ai/legal/terms-of-service'],
   ] as const)('%s links %s', (runtime, href) => {

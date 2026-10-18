@@ -638,7 +638,7 @@ fn unpriced_models_are_unknown_outside_claude() {
     assert!(summary.complete);
     let claude=call_cost_for(RuntimeFamily::Claude,"unpriced-model-x",&summary);
     assert_eq!(claude.source,CostSource::Estimated);assert!(claude.usd>0.0);
-    for family in [RuntimeFamily::Codex,RuntimeFamily::Gemini,RuntimeFamily::Antigravity,RuntimeFamily::Grok,RuntimeFamily::OpenAiCompat] {
+    for family in [RuntimeFamily::Codex,RuntimeFamily::Antigravity,RuntimeFamily::Grok,RuntimeFamily::OpenAiCompat] {
         let cost=call_cost_for(family,"unpriced-model-x",&summary);
         assert_eq!(cost.source,CostSource::Unknown,"{family:?}");assert!(cost.usd.is_nan());
     }

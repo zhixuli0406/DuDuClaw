@@ -16,13 +16,14 @@ fn restricted_tools_and_selected_credentials_are_not_ambient() {
 #[test]
 fn every_family_parses_with_aliases_and_unknown_names_are_refused() {
     for (name, family, provider) in [("claude",RuntimeFamily::Claude,"anthropic"),("codex",RuntimeFamily::Codex,"openai"),
-        ("gemini",RuntimeFamily::Gemini,"gemini"),("antigravity",RuntimeFamily::Antigravity,"gemini"),("agy",RuntimeFamily::Antigravity,"gemini"),
+("antigravity",RuntimeFamily::Antigravity,"gemini"),("agy",RuntimeFamily::Antigravity,"gemini"),
         ("grok",RuntimeFamily::Grok,"xai"),("openai-compat",RuntimeFamily::OpenAiCompat,"openai"),("openai_compat",RuntimeFamily::OpenAiCompat,"openai")] {
         let parsed=RuntimeFamily::parse(name).unwrap();
         assert_eq!(parsed,family);assert_eq!(parsed.provider(),provider);
         assert_eq!(RuntimeFamily::parse(parsed.name()).unwrap(),family,"canonical name round-trips");
     }
     assert!(matches!(RuntimeFamily::parse("Grok"),Err(AttemptInfraError::RuntimeUnsupported(_))));
+    assert!(matches!(RuntimeFamily::parse("gemini"),Err(AttemptInfraError::RuntimeUnsupported(_))));
     assert!(matches!(RuntimeFamily::parse("cursor"),Err(AttemptInfraError::RuntimeUnsupported(_))));
 }
 
@@ -58,7 +59,7 @@ fn stdin_and_runtime_files_per_family() {
     assert_eq!(line.last(),Some(&b'\n'));assert_eq!(line.iter().filter(|b|**b==b'\n').count(),1,"exactly one JSON line");
     let parsed:Value=serde_json::from_slice(&line).unwrap();
     assert_eq!(parsed,json!({"event":"user","message":{"content":prompt}}));
-    for family in [RuntimeFamily::Claude,RuntimeFamily::Codex,RuntimeFamily::Gemini,RuntimeFamily::OpenAiCompat] {
+    for family in [RuntimeFamily::Claude,RuntimeFamily::Codex,RuntimeFamily::OpenAiCompat] {
         assert_eq!(stdin_payload(family,prompt),prompt.as_bytes());
         assert!(runtime_files(family,Path::new("/w"),1,prompt).is_empty());
     }
@@ -101,8 +102,8 @@ fn credentials_do_not_cross_families_and_codex_gets_both_key_names() {
     let all=selected(&[("OPENAI_API_KEY","o"),("ANTHROPIC_API_KEY","a"),("CLAUDE_CODE_OAUTH_TOKEN","t"),("GEMINI_API_KEY","g"),
         ("GOOGLE_API_KEY","gg"),("XAI_API_KEY","x"),("CODEX_API_KEY","ambient"),("GROK_HOME","/host/.grok")]);
     let secrets=["OPENAI_API_KEY","CODEX_API_KEY","ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN","GEMINI_API_KEY","GOOGLE_API_KEY","XAI_API_KEY"];
-    let expect:[(RuntimeFamily,&[&str]);6]=[(RuntimeFamily::Claude,&["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"]),
-        (RuntimeFamily::Codex,&["CODEX_API_KEY","OPENAI_API_KEY"]),(RuntimeFamily::Gemini,&["GEMINI_API_KEY","GOOGLE_API_KEY"]),
+    let expect:[(RuntimeFamily,&[&str]);5]=[(RuntimeFamily::Claude,&["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"]),
+        (RuntimeFamily::Codex,&["CODEX_API_KEY","OPENAI_API_KEY"]),
         (RuntimeFamily::Antigravity,&["GEMINI_API_KEY","GOOGLE_API_KEY"]),(RuntimeFamily::Grok,&["XAI_API_KEY"]),(RuntimeFamily::OpenAiCompat,&["OPENAI_API_KEY"])];
     for (family,keys) in expect {
         let env=environment(family,&all);
@@ -125,7 +126,7 @@ fn credential_document_is_validated_and_only_for_codex_and_grok() {
     let line=credential_document(RuntimeFamily::Codex,Some(doc)).unwrap().unwrap();
     assert!(!line.contains('\n'));assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["auth_mode"],"chatgpt");
     assert!(credential_document(RuntimeFamily::Grok,Some(doc)).unwrap().is_some());
-    for family in [RuntimeFamily::Claude,RuntimeFamily::Gemini,RuntimeFamily::Antigravity,RuntimeFamily::OpenAiCompat] {
+    for family in [RuntimeFamily::Claude,RuntimeFamily::Antigravity,RuntimeFamily::OpenAiCompat] {
         assert_eq!(credential_document(family,Some(doc)),Ok(None));assert_eq!(credential_destination(family),None);
         assert!(!has_credentials(family,&BTreeMap::new(),Some(&line)),"a document is not a credential for {family:?}");
     }

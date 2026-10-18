@@ -209,7 +209,7 @@ mod tests {
         for r in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
             assert!(runtime_supported(r), "{r:?}");
         }
-        for r in [RuntimeType::Gemini, RuntimeType::Antigravity, RuntimeType::Grok] {
+        for r in [RuntimeType::Antigravity, RuntimeType::Grok] {
             assert!(!runtime_supported(r), "{r:?}");
         }
         let args = codex_sandbox_args();

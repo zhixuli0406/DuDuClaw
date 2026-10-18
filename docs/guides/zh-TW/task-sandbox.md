@@ -16,7 +16,7 @@
 
   `<版本>` 換成你的 gateway 版本（標籤前面有 `v`，例如 `v1.67.0`），或改用自己的 image（見下方設定表）。
 - 容器內的 AI 能用的帳號（見[各 runtime 的憑證](#各-runtime-的憑證)）。
-- 支援的 runtime：Claude、Codex、Gemini（已棄用）、Antigravity、Grok、OpenAI 相容。
+- 支援的 runtime：Claude、Codex、Antigravity、Grok、OpenAI 相容。
 
 ## 為單一員工開啟
 
@@ -69,7 +69,7 @@ timeout_ms = 600000     # 單一任務的時間上限（選填）
 | 鍵 | 預設 | 說明 |
 |---|---|---|
 | `image` | `ghcr.io/zhixuli0406/duduclaw:v<目前版本>` | 要執行的 image，必須已在本機。 |
-| `[container.sandbox.executables]` | `claude`、`codex`、`gemini`：`/usr/bin/<名稱>`；`antigravity`：`/usr/local/bin/agy`；`grok`：`/usr/local/bin/grok`；`openai-compat`：`/usr/local/bin/python3` | 各 runtime 在 image 內的執行檔絕對路徑，鍵名為 `claude`、`codex`、`gemini`、`antigravity`、`grok`、`openai-compat`。只有自訂 image 才需要改。 |
+| `[container.sandbox.executables]` | `claude`、`codex`：`/usr/bin/<名稱>`；`antigravity`：`/usr/local/bin/agy`；`grok`：`/usr/local/bin/grok`；`openai-compat`：`/usr/local/bin/python3` | 各 runtime 在 image 內的執行檔絕對路徑，鍵名為 `claude`、`codex`、`antigravity`、`grok`、`openai-compat`。只有自訂 image 才需要改。 |
 | `memory_bytes` | `4294967296`（4 GiB） | 記憶體上限（swap 與記憶體相同）。最多 64 GiB。 |
 | `pids` | `128` | 行程數上限。 |
 | `cpu_millis` | `1000` | CPU 上限，單位是千分之一核。 |
@@ -100,7 +100,7 @@ when_unavailable = "fail"
 | Claude | API key，或帶 token 的 OAuth 帳號（用 `claude setup-token` 建立）。只存在於主機鑰匙圈的登入狀態進不了容器。 |
 | Codex | API key，或憑證文件：OAuth 帳號所存的密鑰內容是 CLI 的 `auth.json`。 |
 | Grok | API key，或憑證文件（CLI 的 `auth.json`）。 |
-| Gemini / Antigravity | Gemini API key。 |
+| Antigravity | Gemini API key。 |
 | OpenAI 相容 | 該 provider 的 API key。 |
 
 沒有合適的帳號時任務會失敗，錯誤訊息會指出這個 runtime 需要哪一種憑證。

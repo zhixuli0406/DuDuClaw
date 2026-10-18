@@ -38,7 +38,7 @@ import {
 // ---------------------------------------------------------------------------
 
 type Backend = 'claudeSub' | 'claudeApi' | 'genericApi' | 'local' | 'otherCli';
-type OtherCli = 'codex' | 'gemini' | 'antigravity';
+type OtherCli = 'codex' | 'antigravity';
 
 interface BackendDef {
   readonly id: Backend;
@@ -54,8 +54,6 @@ const BACKENDS: ReadonlyArray<BackendDef> = [
   { id: 'otherCli', icon: Terminal },
 ] as const;
 
-// Gemini CLI is deprecated (replaced by Antigravity): `OtherCli` keeps the
-// id for callers that still pass it, but the wizard no longer offers it.
 const OTHER_CLIS: ReadonlyArray<OtherCli> = ['codex', 'antigravity'] as const;
 
 const DEFAULT_LOCAL_MODEL = 'qwen3-8b-q4_k_m';
@@ -919,11 +917,7 @@ export function WelcomePage() {
                 <RuntimeSetupCard
                   provider={state.otherCli}
                   installed={
-                    state.otherCli === 'codex'
-                      ? detect.codex
-                      : state.otherCli === 'gemini'
-                        ? detect.gemini
-                        : detect.antigravity
+                    state.otherCli === 'codex' ? detect.codex : detect.antigravity
                   }
                   // Antigravity keeps no observable credential file, so its
                   // sign-in state stays unknown and the login row is hidden.

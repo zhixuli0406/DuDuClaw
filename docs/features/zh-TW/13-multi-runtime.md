@@ -1,6 +1,6 @@
 # Multi-Runtime Agent 執行
 
-> 一個平台，十三個 runtime id：十二個 CLI 後端（Claude、Codex、Gemini、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode），加上以 HTTP 連接任何 OpenAI 相容端點的 `openai_compat`。
+> 一個平台，十二個 runtime id：十一個 CLI 後端（Claude、Codex、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode），加上以 HTTP 連接任何 OpenAI 相容端點的 `openai_compat`。
 
 ---
 
@@ -27,7 +27,7 @@ AgentRuntime trait:
   fn health_check() → Status
 ```
 
-每個後端（Claude、Codex、Gemini 或任何 OpenAI 相容端點）都實作相同的介面。系統的其餘部分不需要知道、也不在乎是哪個後端在處理特定請求。
+每個後端（Claude、Codex、Antigravity 或任何 OpenAI 相容端點）都實作相同的介面。系統的其餘部分不需要知道、也不在乎是哪個後端在處理特定請求。
 
 ### Runtime 目錄（Runtime Catalog）
 
@@ -36,8 +36,7 @@ AgentRuntime trait:
 | Runtime | 執行檔 | 安裝管道 | Headless 呼叫 | 輸出 | 登入方式 | 憑證位置 |
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（貼回驗證碼） | `~/.claude/.credentials.json` |
-| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login`（localhost 回呼） | `~/.codex/auth.json` |
-| Gemini CLI（v1.67.0 棄用，v1.75.0 移除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost 回呼） | `~/.gemini/oauth_creds.json` |
+| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login --device-auth`（裝置碼，適用 Docker／遠端） | `~/.codex/auth.json` |
 | Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json（v1.2.10） | 在終端機執行 `agy` 完成 Google 登入（沒有 `login` 子指令），或 API key 模式 | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | 無（僅 API key） | `~/.qwen/.env` |
@@ -49,13 +48,17 @@ AgentRuntime trait:
 | OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
 | OpenAI 相容端點 | *(HTTP)* | — | — | json | 無（僅 API key） | — |
 
+**Dashboard 一鍵登入**提供 Claude、Codex、Grok、Kimi、Copilot、Kiro 和 OpenCode。Codex 改用裝置碼登入：在瀏覽器開啟 CLI 顯示的驗證頁並輸入裝置碼，等待 CLI 完成；不需要把 OAuth callback URL 的 `code` 貼回 Dashboard。Cursor 仍可作為 runtime，但瀏覽器回呼無法可靠地從遠端 Dashboard 完成，因此不列入一鍵登入選單。Antigravity 沒有腳本化登入子指令，Qwen 與 Mistral Vibe 走 API key。帳號頁 API Token 卡片現在可用「刪除」移除，須確認帳號 id；刪除的是 DuDuClaw 儲存的該筆帳號，不會撤銷供應商端的金鑰。
+
+Gemini CLI 已從 DuDuClaw runtime 與 Docker 套件移除。既有 `runtime = "gemini"` 設定須遷移到 Antigravity；獨立的 Gemini API provider 仍受支援。見[移除與遷移說明](../../guides/zh-TW/deprecations.md)。
+
 模型選擇每家寫法不同，目錄一併記下是哪一種：獨立旗標（`--model <id>`）、Copilot 文件寫的等號式（`--model=<id>`）、完全沒有旗標時改用環境變數（Mistral Vibe 的 `VIBE_ACTIVE_MODEL`），或是沒有（Kiro 的模型走 `kiro-cli settings`，不是每次呼叫指定）。
 
 **啟用 runtime 前該讀的廠商條款：**
 
 - **Kiro**：AWS FAQ 明文寫著：不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面。用 DuDuClaw 驅動 Kiro 正屬此類；自行在 CI 直接呼叫 `kiro-cli` 則被允許。所以 Kiro 的安裝管道是手動的：這個決定要由你自己明確做出。
 - **Anthropic**：[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明，第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code；Pro 和 Max 的用量上限以一般使用為前提。Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。Anthropic 為產品記載的做法是 Claude Console 的 API key。
-- **Google**：[Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)寫明，用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。[Antigravity 條款](https://antigravity.google/terms)第 6 節對第三方軟體存取 Antigravity 也有同樣規定，可能停權或終止 Antigravity 和／或 Gemini CLI 帳號；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 CLI，算不算在條款範圍內由 Google 判斷。Google 的 [Gemini Code Assist 個人版停用公告](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）另外寫明，自 2026-06-18 起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API key（Gemini API 或企業方案）仍可使用。請走 API key。
+- **Google**：[Gemini CLI 條款](https://geminicli.com/docs/resources/tos-privacy/)寫明，用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止。[Antigravity 條款](https://antigravity.google/terms)第 6 節對第三方軟體存取 Antigravity 也有同樣規定，可能停權或終止 Antigravity 和／或 Gemini CLI 帳號；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 Antigravity CLI，算不算在條款範圍內由 Google 判斷。Google 的 [Gemini Code Assist 個人版停用公告](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）另外寫明，自 2026-06-18 起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API key（Gemini API 或企業方案）仍可使用。請走 API key。
 - **Qwen**：免費 OAuth 方案已於 2026-04-15 停用，只剩 API key（ModelStudio／DashScope）。
 - **OpenCode**：MIT 授權、本身無限制，但它在 1.3.0 移除 Anthropic 訂閱 plugin，理由同上。請用各供應商的 API key。
 - **OpenAI**：OpenAI 有官方的 Sign in with ChatGPT 計畫（[條款](https://openai.com/policies/sign-in-with-chatgpt-terms/)，2026-09-29 版）。[快速入門](https://developers.openai.com/siwc/quickstart)寫明，Sign in with ChatGPT 目前以有限試行的方式開放給選定的商業合作夥伴，ChatGPT 方案額度開放給所有開源合作夥伴與選定的私人客戶；[說明文章](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)寫明受支援的開源工具照常可用，商業合作夥伴要填表申請。也就是說，商業產品要先取得 OpenAI 同意。條款還要求：使用者不必付費給合作夥伴或升級方案就能使用自己的 ChatGPT 方案；驗證 token 若要長期保存，只能存在使用者自己掌控的本機，不能放在遠端或託管環境；不得藉這個登入提供給其他工具或無關請求使用的通用 API；違反時可能被停用 Sign in with ChatGPT。OpenAI 的 Codex 負責人在 2026-09-08 [發文](https://x.com/thsottiaux/status/2097131394199896166)回應某個第三方應用程式：「Sorry, but this is not an approved use of Sign in With ChatGPT. We support pure OSS clients and others we have partnerships with, but you need to reach out and talk to us for that.」DuDuClaw 跑在遠端主機或容器裡時，Codex 的 token（`~/.codex/auth.json`）也存在那裡。[使用條款](https://openai.com/policies/terms-of-use/)仍然適用。要穩定使用請走 API key。
@@ -65,11 +68,11 @@ Dashboard 會顯示對應的條款提示，要求勾選同意後才開始或儲�
 
 ### 後端怎麼被驅動
 
-五個 CLI 後端（`claude`、`codex`、`gemini`、`antigravity`、`grok`；見 `runtime/mod.rs` 的 `BESPOKE_RUNTIME_IDS`）有各自的 runtime 模組，因為它們各有無法共用的廠商專屬接線，包括帳號輪替（Claude）、以該 CLI 自己的格式注入 MCP 設定、能力→sandbox 旗標的轉譯、空輸出時的 PTY 補救。其餘全部由**同一支**通用 print-mode runtime（`runtime/generic_cli.rs`）直接依目錄項目驅動：用模板 argv 啟動執行檔，把 prompt 以參數或 stdin 送進去，把 text／JSON／JSONL 解析回最終回覆文字，並把非零離開碼或「需要登入」的訊號對應成 failover 鏈看得懂的具名錯誤。其餘七個 CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）都走這支通用 runtime。`openai_compat` 不是 CLI，它有自己的 HTTP 模組（`runtime/openai_compat.rs`）。所以手寫模組一共六個。
+四個 CLI 後端（`claude`、`codex`、`antigravity`、`grok`；見 `runtime/mod.rs` 的 `BESPOKE_RUNTIME_IDS`）有各自的 runtime 模組，因為它們各有無法共用的廠商專屬接線，包括帳號輪替（Claude）、以該 CLI 自己的格式注入 MCP 設定、能力→sandbox 旗標的轉譯、空輸出時的 PTY 補救。其餘全部由**同一支**通用 print-mode runtime（`runtime/generic_cli.rs`）直接依目錄項目驅動：用模板 argv 啟動執行檔，把 prompt 以參數或 stdin 送進去，把 text／JSON／JSONL 解析回最終回覆文字，並把非零離開碼或「需要登入」的訊號對應成 failover 鏈看得懂的具名錯誤。其餘七個 CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）都走這支通用 runtime。`openai_compat` 不是 CLI，它有自己的 HTTP 模組（`runtime/openai_compat.rs`）。所以手寫模組一共五個。
 
-### 原本的四種後端
+### 主要後端
 
-下面是 DuDuClaw 最早出貨的四種後端。另外兩個有專屬模組的 CLI，Antigravity 與 Grok，在後面各自的段落說明。
+下面介紹 Claude、Codex 與 OpenAI 相容端點。Antigravity 與 Grok 在後面各自說明。
 
 **Claude Runtime** — 呼叫 Claude Code CLI（`claude`），採用 JSONL 串流輸出。這是功能最完整的後端，內建 MCP 工具支援、bash 執行、web search 和檔案操作。
 
@@ -96,23 +99,6 @@ Agent 設定：runtime = "codex"
      |
      v
 解析 JSONL STDOUT 事件
-     |
-     v
-擷取回應
-```
-
-**Gemini Runtime** — 呼叫 Google Gemini CLI，使用 `--output-format stream-json` 取得結構化輸出。
-
-> **v1.67.0 棄用，v1.75.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務個人帳號（免費、AI Pro、AI Ultra），請改用 Antigravity runtime。移除前仍可照常使用。Gemini API provider 不受影響。遷移步驟見[已棄用名稱](../../guides/zh-TW/deprecations.md#gemini-cli-runtime)。
-
-```
-Agent 設定：runtime = "gemini"
-     |
-     v
-啟動：gemini --output-format stream-json ...
-     |
-     v
-解析串流 JSON 事件
      |
      v
 擷取回應
@@ -206,20 +192,19 @@ effort    = "high"          # low | medium | high | xhigh | max
 | `codex` | 0.156.1 | `-c model_reasoning_effort=<v>`（設定覆寫，沒有專用旗標） | `low` `medium` `high` `xhigh` |
 | `antigravity`（`agy`） | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
 | `grok` | 1.0.41 | `--reasoning-effort <v>`（別名 `--effort`） | *`--help` 未列舉* |
-| `gemini` | — | **沒有這個旗標**，只記 debug 紀錄並忽略 | — |
 | `openai_compat` | — | 請求內文的 `reasoning_effort` | `low` `medium` `high` |
 
 ### 降階對照表
 
 各家接受的集合不同，所以你的設定會**向下**降到目標 runtime 吃得下的值。不會被靜默丟掉，也不會送出 CLI 會拒絕的值：
 
-| 你設定的值 | claude | codex | antigravity | grok | openai_compat | gemini |
+| 你設定的值 | claude | codex | antigravity | grok | openai_compat |
 |---|---|---|---|---|---|---|
-| `low` | `low` | `low` | `low` | `low` | `low` | — |
-| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` | — |
-| `high` | `high` | `high` | `high` | `high` | `high` | — |
-| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** | — |
-| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** | — |
+| `low` | `low` | `low` | `low` | `low` | `low` |
+| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` |
+| `high` | `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** |
 
 Grok 刻意上限在 `high`：它的 `--help` 提到這個旗標卻沒列出可用的值，轉送 `xhigh`/`max` 可能換來一個「unexpected value」而讓整次 spawn 失敗。`openai_compat` 的八個異質 preset 也基於同一個理由設上限。兩個上限都集中在同一處（`duduclaw-core/src/effort.rs`），等實際跑過確認可用的值之後可以調高。
 
@@ -437,7 +422,7 @@ api_key_enc = "..."          # anthropic 維持舊有的 anthropic_api_key_enc �
 
 **告知內容。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token。允許的是你本人用自己的訂閱登入未經修改的 Claude Code，Pro 和 Max 的用量上限以一般使用為前提。消費者條款另外規定帳號不得提供給其他人使用。Anthropic 可以不事先通知就執行；帳號停權是媒體與使用者的回報，非 Anthropic 官方聲明。告知會直接點出 DuDuClaw 裡和規範衝突的用法：一份訂閱替其他人服務（頻道上的客戶）、輪替多個訂閱帳號避開上限、讓 DuDuClaw 保存 token。告知不說 token「被封鎖」，因為 OAuth token 跑 `claude -p` 在技術上仍可用（v1.66.0）。
 
-**依廠商顯示。** 上面的完整告知用在 Claude 登入與 Claude 帳號。Codex、Gemini CLI、Antigravity、Grok 的登入（以及新增帳號選了非 Anthropic provider 的 OAuth 路徑）改顯示該廠商自己的說明與條款連結，勾選框相同：Google 的 Gemini CLI 與 Antigravity 條文如上（Gemini CLI 的說明另外寫出個人版、AI Pro、AI Ultra 帳號自 2026-06-18 起不能用 Login with Google）；OpenAI 顯示上面整理的 Sign in with ChatGPT 計畫（開源與經核准的商業合作夥伴、token 留在本機）並連到計畫條款；xAI 則寫明立場不明、條款仍適用。不認得的 provider 顯示不指名廠商、沒有連結的提醒。每一句都對應到廠商頁面；舊的「Google 自 2026-03 起在伺服器端封鎖」找不到原始出處，已移除。廠商對照表在 `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）與 `web/src/lib/subscription-risk.ts`（dashboard）。
+**依廠商顯示。** 上面的完整告知用在 Claude 登入與 Claude 帳號。Codex、Antigravity、Grok 的登入（以及新增帳號選了非 Anthropic provider 的 OAuth 路徑）改顯示該廠商自己的說明與條款連結，勾選框相同：Google 的 Antigravity 條文如上；OpenAI 顯示上面整理的 Sign in with ChatGPT 計畫（開源與經核准的商業合作夥伴、token 留在本機）並連到計畫條款；xAI 則寫明立場不明、條款仍適用。不認得的 provider 顯示不指名廠商、沒有連結的提醒。每一句都對應到廠商頁面；舊的「Google 自 2026-03 起在伺服器端封鎖」找不到原始出處，已移除。廠商對照表在 `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）與 `web/src/lib/subscription-risk.ts`（dashboard）。
 
 **出現在哪裡。** CLI 登入彈窗、引導式 QR code 設定精靈、新增帳號的 OAuth Token 路徑，在任何憑證步驟之前都會先顯示完整告知與勾選框。歡迎頁的 Claude 訂閱卡片（以及「已登入」卡片，也就是自動沿用主機登入的情況）、runtime 設定卡片的登入列、帳號頁的訂閱主卡片、CLI 一鍵登入選單、CLI 憑證清單、員工編輯頁 API 模式選「訂閱帳號（CLI）」時，以及帳號池選了訂閱帳號時，都會顯示一行提醒和規範連結。
 
@@ -449,4 +434,4 @@ api_key_enc = "..."          # anthropic 維持舊有的 anthropic_api_key_enc �
 
 ## 總結
 
-AI 領域是多供應商的。只基於單一 CLI 構建就像只為單一作業系統寫軟體：能用，直到不能用。`AgentRuntime` trait 抽象化了差異，讓 DuDuClaw 將 Claude、Codex、Gemini 和任何 OpenAI 相容端點視為可互換的後端。你的 Agent 每次都能取得最佳可用的大腦。
+AI 領域是多供應商的。只基於單一 CLI 構建就像只為單一作業系統寫軟體：能用，直到不能用。`AgentRuntime` trait 抽象化了差異，讓 DuDuClaw 將 Claude、Codex、Antigravity 和任何 OpenAI 相容端點視為可互換的後端。你的 Agent 每次都能取得最佳可用的大腦。

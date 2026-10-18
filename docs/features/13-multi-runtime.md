@@ -1,6 +1,6 @@
 # Multi-Runtime Agent Execution
 
-> One platform, thirteen runtime ids: twelve CLI backends (Claude, Codex, Gemini, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
+> One platform, twelve runtime ids: eleven CLI backends (Claude, Codex, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
 
 ---
 
@@ -27,7 +27,7 @@ AgentRuntime trait:
   fn health_check() → Status
 ```
 
-Every backend — Claude, Codex, Gemini, or any OpenAI-compatible endpoint — implements this same interface. The rest of the system doesn't know or care which backend is handling a particular request.
+Every backend — Claude, Codex, Antigravity, or any OpenAI-compatible endpoint — implements this same interface. The rest of the system doesn't know or care which backend is handling a particular request.
 
 ### The Runtime Catalog
 
@@ -40,8 +40,7 @@ unloggable-into.
 | Runtime | Binary | Install channel | Headless invocation | Output | Login | Credential store |
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token` (paste-back) | `~/.claude/.credentials.json` |
-| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login` (localhost callback) | `~/.codex/auth.json` |
-| Gemini CLI (deprecated in v1.67.0, removed in v1.75.0) | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
+| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login --device-auth` (device code; Docker/remote safe) | `~/.codex/auth.json` |
 | Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json (v1.2.10) | Google sign-in via `agy` in a terminal (no `login` subcommand), or API-key mode | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh` (manual) | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | none (API key only) | `~/.qwen/.env` |
@@ -52,6 +51,10 @@ unloggable-into.
 | Mistral Vibe | `vibe` | PyPI `mistral-vibe` | `-p <prompt> --yolo --trust --output json` | json | none (API key only) | `~/.vibe/.env` |
 | OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
 | OpenAI-compatible | *(HTTP)* | — | — | json | none (API key only) | — |
+
+**Dashboard one-click login** supports Claude, Codex, Grok, Kimi, Copilot, Kiro and OpenCode. Codex uses device authorization: open the verification page shown by the CLI, enter its code, and wait for the CLI to finish. Pasting the OAuth callback URL `code` into the dashboard does not complete login. Cursor remains a runtime, but its browser callback cannot reliably finish from a remote dashboard, so it is not in the one-click picker. Antigravity has no scripted login subcommand; Qwen and Mistral Vibe use API keys. The Accounts page API Token card can now delete a saved account after confirming its account id; this does not revoke the key at its provider.
+
+Gemini CLI is no longer a DuDuClaw runtime or Docker package. Existing `runtime = "gemini"` settings need migration to Antigravity; the separate Gemini API provider remains supported. See [removal and migration](../guides/deprecations.md).
 
 Model selection differs per vendor and the catalog records which form each one
 takes: a separate flag (`--model <id>`), the joined form Copilot documents
@@ -83,7 +86,7 @@ Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
   terminate the Antigravity and/or Gemini CLI accounts; the same section also
   lists using the service in connection with products not provided by Google
   as abuse. DuDuClaw runs the
-  unmodified CLIs; whether that falls under these clauses is Google's call.
+  unmodified Antigravity CLI; whether that falls under these clauses is Google's call.
   Google's [Gemini Code Assist for individuals deprecation notice](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)
   (last updated 2026-10-09) adds that since 2026-06-18 Gemini CLI no longer
   accepts Login with Google for Gemini Code Assist for individuals, Google AI
@@ -126,7 +129,7 @@ call without it (see [Subscription-Login Risk Disclosure](#subscription-login-ri
 
 ### How Backends Are Driven
 
-Five CLI backends (`claude`, `codex`, `gemini`, `antigravity`, `grok`;
+Four CLI backends (`claude`, `codex`, `antigravity`, `grok`;
 `BESPOKE_RUNTIME_IDS` in `runtime/mod.rs`) have bespoke runtime modules, because each has real per-vendor
 wiring that is not shareable — account rotation (Claude), MCP config injection
 in the CLI's own format, capability→sandbox-flag translation, PTY recovery for
@@ -138,12 +141,12 @@ non-zero exit or an auth-required marker to a typed failure the failover chain
 understands. The seven other CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI,
 Kiro, Cursor, Mistral Vibe, OpenCode) go through that generic runtime.
 `openai_compat` is not a CLI: it has its own HTTP module
-(`runtime/openai_compat.rs`). That makes six hand-written modules in total.
+(`runtime/openai_compat.rs`). That makes five hand-written modules in total.
 
-### The Original Four Backends
+### Main Backends
 
-These are the four backends DuDuClaw shipped first. Antigravity and Grok, the
-other two bespoke CLI modules, are covered in their own sections further down.
+Claude, Codex and OpenAI-compatible endpoints are described here. Antigravity and
+Grok are covered in their own sections further down.
 
 **Claude Runtime** — Calls the Claude Code CLI (`claude`) with JSONL streaming output. This is the most feature-rich backend, with native MCP tool support, bash execution, web search, and file operations built in.
 
@@ -170,23 +173,6 @@ Spawn: codex --json ...
      |
      v
 Parse JSONL STDOUT events
-     |
-     v
-Extract response
-```
-
-**Gemini Runtime** — Calls the Google Gemini CLI with `--output-format stream-json` for structured output.
-
-> **Deprecated in v1.67.0, removed in v1.75.0.** Google stopped serving individual (free, AI Pro, AI Ultra) accounts through Gemini CLI on 2026-06-18; use the Antigravity runtime instead. It keeps working until removal. The Gemini API provider is not affected. Migration steps: [Deprecations](../guides/deprecations.md#gemini-cli-runtime).
-
-```
-Agent config: runtime = "gemini"
-     |
-     v
-Spawn: gemini --output-format stream-json ...
-     |
-     v
-Parse streaming JSON events
      |
      v
 Extract response
@@ -282,20 +268,19 @@ Probed against the installed binaries on 2026-09-24 (`research/multi-model-routi
 | `codex` | 0.156.1 | `-c model_reasoning_effort=<v>` (config override, no dedicated flag) | `low` `medium` `high` `xhigh` |
 | `antigravity` (`agy`) | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
 | `grok` | 1.0.41 | `--reasoning-effort <v>` (alias `--effort`) | *not enumerated by `--help`* |
-| `gemini` | — | **no flag exists** — logged at debug and ignored | — |
 | `openai_compat` | — | `reasoning_effort` in the request body | `low` `medium` `high` |
 
 ### The clamp table
 
 Because the accepted sets differ, your setting is clamped **down** to what the target runtime will take. It is never dropped silently, and never sent as a value the CLI would reject:
 
-| You set | claude | codex | antigravity | grok | openai_compat | gemini |
+| You set | claude | codex | antigravity | grok | openai_compat |
 |---|---|---|---|---|---|---|
-| `low` | `low` | `low` | `low` | `low` | `low` | — |
-| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` | — |
-| `high` | `high` | `high` | `high` | `high` | `high` | — |
-| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** | — |
-| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** | — |
+| `low` | `low` | `low` | `low` | `low` | `low` |
+| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` |
+| `high` | `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** |
 
 Grok is capped at `high` deliberately: its `--help` names the flag but does not list the values, so forwarding `xhigh`/`max` risks an "unexpected value" that takes the whole spawn down. `openai_compat` is capped for the same reason across its eight heterogeneous presets. Both ceilings live in one place (`duduclaw-core/src/effort.rs`) and can be raised once the values are confirmed against a live run.
 
@@ -610,7 +595,7 @@ Owner decision 2026-10-16: the subscription-login features stay as they are (set
 
 **What the notice says.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens. Signing in to the unmodified Claude Code binary with your own subscription is allowed, and Pro/Max usage limits assume ordinary usage. The Consumer Terms add that you may not make your account available to anyone else. Anthropic may enforce this without prior notice; account suspensions have been reported by press and users (reports, not an Anthropic statement). The notice names the DuDuClaw uses that conflict with the policy: one subscription serving other people (channel customers), rotating several subscriptions past the limits, and DuDuClaw storing the token. The notice never says the token is "blocked": `claude -p` with an OAuth token still works technically (v1.66.0).
 
-**Per vendor.** The full notice above is what Claude logins and Claude accounts show. Codex, Gemini CLI, Antigravity and Grok logins (and Add account's OAuth path with a non-Anthropic provider) show that vendor's own text and terms link instead, with the same checkbox: Google's Gemini CLI and Antigravity clauses quoted above (the Gemini CLI text also names the 2026-06-18 end of Login with Google for individual, AI Pro and AI Ultra accounts); for OpenAI, the Sign in with ChatGPT program summarised above (open-source and approved commercial partners, tokens kept local) with a link to its terms; for xAI, that its position is unclear and its terms apply. An unknown provider gets a vendor-neutral notice with no link. Every sentence points at a vendor page; the earlier "Google has blocked server-side since 2026-03" sentence had no primary source and was removed. The vendor table lives in `duduclaw_core::subscription_risk::vendor_policy` (gateway, CLI) and `web/src/lib/subscription-risk.ts` (dashboard).
+**Per vendor.** The full notice above is what Claude logins and Claude accounts show. Codex, Antigravity and Grok logins (and Add account's OAuth path with a non-Anthropic provider) show that vendor's own text and terms link instead, with the same checkbox: Google's Antigravity clause quoted above; for OpenAI, the Sign in with ChatGPT program summarised above (open-source and approved commercial partners, tokens kept local) with a link to its terms; for xAI, that its position is unclear and its terms apply. An unknown provider gets a vendor-neutral notice with no link. Every sentence points at a vendor page; the earlier "Google has blocked server-side since 2026-03" sentence had no primary source and was removed. The vendor table lives in `duduclaw_core::subscription_risk::vendor_policy` (gateway, CLI) and `web/src/lib/subscription-risk.ts` (dashboard).
 
 **Where it shows.** The full disclosure with a checkbox opens before any credential step in the CLI login modal, the guided QR-code setup wizard, and the OAuth Token path of Add account. A one-line note with a link to the policy sits on the Welcome page's Claude subscription card (and on its "already signed in" card, the host-login adoption case), the runtime setup card's sign-in row, the Accounts page's subscription hero card, the one-click CLI picker, the CLI credentials list, the agent editor's API mode row when it is set to the subscription CLI, and the account pool picker when a subscription account is in the pool.
 
@@ -622,4 +607,4 @@ Owner decision 2026-10-16: the subscription-login features stay as they are (set
 
 ## The Takeaway
 
-The AI market is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, Gemini, and any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.
+The AI market is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, Antigravity, and any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.

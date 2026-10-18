@@ -13,6 +13,11 @@ services:
       - duduclaw-codex:/home/duduclaw/.codex
       - duduclaw-gemini:/home/duduclaw/.gemini
       - duduclaw-grok:/home/duduclaw/.grok
+      - duduclaw-kimi:/home/duduclaw/.kimi-code
+      - duduclaw-copilot:/home/duduclaw/.copilot
+      - duduclaw-kiro:/home/duduclaw/.kiro
+      - duduclaw-cursor:/home/duduclaw/.cursor
+      - duduclaw-opencode:/home/duduclaw/.local/share/opencode
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Claude: API key, or an OAuth token from `claude setup-token`. The OAuth token is a
@@ -23,7 +28,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # Codex (OpenAI): API key fallback — ChatGPT Plus/Pro OAuth lives in duduclaw-codex volume
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      # Gemini (Google): API key fallback — Google OAuth lives in duduclaw-gemini volume
+      # Antigravity's Gemini API key mode uses this key. Its settings live in the shared .gemini volume.
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       # Grok (xAI): API key — deployment-key/OIDC login lives in duduclaw-grok volume
       - XAI_API_KEY=${XAI_API_KEY:-}
@@ -71,4 +76,9 @@ volumes:
   duduclaw-codex:
   duduclaw-gemini:
   duduclaw-grok:
+  duduclaw-kimi:
+  duduclaw-copilot:
+  duduclaw-kiro:
+  duduclaw-cursor:
+  duduclaw-opencode:
   tailscale-state:

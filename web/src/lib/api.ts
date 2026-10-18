@@ -187,7 +187,7 @@ export interface ChannelAccessSettings {
 }
 
 export interface CliCredentialInfo {
-  runtime: 'codex' | 'gemini' | 'grok';
+  runtime: 'codex' | 'grok' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode';
   /** Display path of the credential store, e.g. "~/.grok/auth.json". */
   store: string;
   installed: boolean;
@@ -2863,7 +2863,7 @@ export interface AgentOdooOverride {
 // ── RT: per-agent [runtime] ─────────────────────────────────────
 
 export type RuntimeProvider =
-  | 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok' | 'openai_compat'
+  | 'claude' | 'codex' | 'antigravity' | 'grok' | 'openai_compat'
   // v1.68 W1 — generic command-line runtimes from `runtime_catalog.rs`.
   | 'qwen' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'vibe' | 'opencode';
 
@@ -2996,7 +2996,6 @@ export interface AgentDetailV168 {
 export interface RuntimeDetect {
   claude_cli: boolean;
   codex: boolean;
-  gemini: boolean;
   antigravity: boolean;
   /** Present since the R4 Grok runtime; older gateways omit it. */
   grok?: boolean;
@@ -3012,7 +3011,7 @@ export interface RuntimeDetect {
 }
 
 /** Providers `runtime.install` knows how to install (hard-coded gateway whitelist). */
-export type InstallableProvider = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok';
+export type InstallableProvider = 'claude' | 'codex' | 'antigravity' | 'grok';
 
 /**
  * Result of `runtime.install`. A decline is a normal answer, not an error: the
@@ -5990,7 +5989,7 @@ export const api = {
      *  `SubscriptionRiskDisclosure`); the gateway refuses with
      *  `subscription_risk_not_accepted` otherwise. */
     cliLoginStart: (
-      runtime: 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok',
+      runtime: 'claude' | 'codex' | 'antigravity' | 'grok' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode',
       acceptSubscriptionRisk: boolean,
     ) =>
       client.call('auth.cli_login.start', {
@@ -6003,6 +6002,7 @@ export const api = {
         remote_safe: boolean;
         hint: string;
         status: string;
+        output?: string;
       }>,
     cliLoginInput: (sessionId: string, data: string) =>
       client.call('auth.cli_login.input', { session_id: sessionId, data }) as Promise<{
@@ -6012,6 +6012,7 @@ export const api = {
       client.call('auth.cli_login.status', { session_id: sessionId }) as Promise<{
         session_id: string;
         status: 'running' | 'succeeded' | 'failed' | 'exited';
+        output?: string;
       }>,
     cliLoginCancel: (sessionId: string) =>
       client.call('auth.cli_login.cancel', { session_id: sessionId }) as Promise<{
@@ -6117,6 +6118,11 @@ export const api = {
       monthly_budget_cents?: number;
     }) =>
       client.call('accounts.update', params) as Promise<{ success: boolean; changes: string[] }>,
+    remove: (accountId: string) =>
+      client.call('accounts.remove', { account_id: accountId }) as Promise<{
+        success: boolean;
+        account_id: string;
+      }>,
   },
   memory: {
     /**

@@ -3,6 +3,21 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn account_table_for_edit(path: &Path) -> Result<(toml::Table, String), String> {
+    let text = super::config_commit::read_text_or_empty(path)?;
+    let table = if text.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        text.parse::<toml::Table>()
+            .map_err(|e| format!("Invalid config.toml; refusing account edit: {e}"))?
+    };
+    Ok((table, super::config_commit::content_hash(&text)))
+}
+
+async fn commit_account_edit(path: &Path, hash: String, table: &toml::Table) -> Result<(), String> {
+    super::config_commit::commit_table_locked(path, hash, table).await
+}
+
 impl MethodHandler {
     /// Add a new account to config.toml [[accounts]] array.
     ///
@@ -75,7 +90,10 @@ impl MethodHandler {
         let priority = params.get("priority").and_then(|v| v.as_u64()).unwrap_or(1);
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         // Ensure [[accounts]] array exists
         let accounts = table
@@ -192,14 +210,8 @@ impl MethodHandler {
         }
         arr.push(toml::Value::Table(entry.table));
 
-        // Atomic write
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+            return WsFrame::error_response("", &e);
         }
 
         // Credentials doctrine P2 (WP-8A): invalidate-on-write, not the old
@@ -240,7 +252,10 @@ impl MethodHandler {
         };
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         // Find the target account in [[accounts]] array
         let accounts = match table.get_mut("accounts").and_then(|v| v.as_array_mut()) {
@@ -268,14 +283,8 @@ impl MethodHandler {
             }
         }
 
-        // Atomic write
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+            return WsFrame::error_response("", &e);
         }
 
         // Credentials doctrine P2 (WP-8A): the cached rotator holds the whole
@@ -306,7 +315,10 @@ impl MethodHandler {
         };
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         let accounts = match table.get_mut("accounts").and_then(|v| v.as_array_mut()) {
             Some(arr) => arr,
@@ -362,7 +374,7 @@ impl MethodHandler {
             );
         }
 
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
             return WsFrame::error_response("", &e);
         }
 
@@ -376,5 +388,47 @@ impl MethodHandler {
             "",
             json!({ "success": true, "account_id": account_id, "changes": changes }),
         )
+    }
+
+    /// Remove one configured account and its stored credential. The CLI's own
+    /// credential store is separate and is not affected by this RPC.
+    pub(crate) async fn handle_accounts_remove(&self, params: Value) -> WsFrame {
+        let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id,
+            _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
+        };
+        let config_path = self.home_dir.join("config.toml");
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let Some(accounts) = table
+            .get_mut("accounts")
+            .and_then(toml::Value::as_array_mut)
+        else {
+            return WsFrame::error_response("", "No [[accounts]] section in config.toml");
+        };
+        let matches: Vec<usize> = accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                (account.as_table()?.get("id")?.as_str()? == account_id).then_some(index)
+            })
+            .collect();
+        if matches.len() != 1 {
+            let message = if matches.is_empty() {
+                format!("Account not found: {account_id}")
+            } else {
+                "Duplicate account id in config.toml; resolve it before deleting".to_string()
+            };
+            return WsFrame::error_response("", &message);
+        }
+        accounts.remove(matches[0]);
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        crate::claude_runner::invalidate_rotator_cache().await;
+        info!(account_id, "accounts.remove completed");
+        WsFrame::ok_response("", json!({ "success": true, "account_id": account_id }))
     }
 }

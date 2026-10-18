@@ -119,7 +119,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait：`runtime_catalog.rs` 中有 13 個 runtime id，包含十二個 CLI 後端（Claude、Codex、Gemini（已棄用）、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）與 OpenAI-compat HTTP，支援自動偵測（[13-multi-runtime.md](13-multi-runtime.md)） |
+| Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait：`runtime_catalog.rs` 中有 12 個 runtime id，包含十一個 CLI 後端（Claude、Codex、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）與 OpenAI-compat HTTP，支援自動偵測（[13-multi-runtime.md](13-multi-runtime.md)） |
 | MCP Server（JSON-RPC 2.0） | 透過 stdin/stdout 向 AI Runtime 暴露 249 個工具（v1.67.0；`tools/list` 只列出呼叫者可呼叫的工具）；註冊於 `<agent>/.mcp.json`（v1.8.5，Claude CLI `-p` 僅讀取專案層級），gateway 啟動時自動建立／修復 |
 | ACP/A2A Server | 兩個指令：`duduclaw acp`（= `duduclaw acp client`），IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流，未設定時回 `AUTH_REQUIRED`）；`duduclaw acp server`（原 `acp-server`，已在 v1.69.0 移除），A2A 協定（`agent/discover` / `message/send` / `tasks/*`，`/.well-known/agent-card.json` Agent Card，另有 legacy `/agent.json` 別名） |
 | Agent 目錄結構 | `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` |
@@ -137,7 +137,6 @@
 |------|------|
 | Claude Runtime | Claude Code SDK（`claude` CLI）+ JSONL streaming + `--resume` 多輪 |
 | Codex Runtime | OpenAI Codex CLI + `--json` streaming 事件，以 `AGENTS.md` 檔案傳遞 system prompt |
-| Gemini Runtime（v1.67.0 棄用，v1.75.0 移除；請改用 Antigravity） | Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，approval mode 依該 agent 的 capabilities 推導（預設 `auto_edit`，唯讀 agent 另加 `--sandbox`，只有完整存取的 agent 才用 `yolo`）。Google 於 2026-06-18 退役個人版 Gemini CLI 後，保留給付費 `GEMINI_API_KEY` 用戶 |
 | Antigravity Runtime（v1.24.0） | Google Antigravity CLI（`agy`，2026-06-18 Gemini CLI 後繼者），走 oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`。二進位自動解析（PATH → `~/.local/bin/agy`）；無 `--system` 旗標，故 system prompt + 歷史內嵌進 prompt（CJK-safe）；認證用 Google 登入（在主機終端機執行 `agy`）或 API key 模式（`config.toml [antigravity] auth = "api_key"` + Gemini API key）；MCP 工具註冊在各 agent 工作區的 `.agents/mcp_config.json`；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示；token 用量為估算（print 模式無統計） |
 | Grok Runtime（R4） | xAI Grok CLI（「Grok Build」），走 oneshot `grok -p`（2026-07-13 對照 docs.x.ai 驗證）。二進位 `grok`（curl 安裝；第三方 `grok-cli` 作為備援探測）；`--model` 選模型；`--tools`/`--disallowed-tools` 限縮（+ `native_sandbox` 硬閘）；system prompt + 歷史內嵌進 prompt（CJK-safe）；duduclaw MCP server 以 `[mcp_servers.duduclaw]` TOML 寫入各 agent 的 `<agent_dir>/.grok/config.toml`（+ agent 身分經 spawn env 轉送）；以 `XAI_API_KEY` env 認證；token 用量為估算（純 stdout）。**殘餘項**（需實機 CLI）：`--tools` 清單分隔符、`mcp_servers` 的專案本地 `config.toml` 探索、真實用量的 `--output-format json` schema，以及完整 `--model` 清單（`grok models`），文件僅確認 `grok-4.5` / `grok-build-0.1` |
 | OpenAI-compat Runtime | HTTP 端點（MiniMax / DeepSeek 等）REST API |

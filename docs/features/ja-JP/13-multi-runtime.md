@@ -1,6 +1,6 @@
 # マルチランタイムエージェント実行
 
-> 1つのプラットフォームに 13 のランタイム ID：12 の CLI バックエンド（Claude、Codex、Gemini、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
+> 1つのプラットフォームに 12 のランタイム ID：11 の CLI バックエンド（Claude、Codex、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
 
 ---
 
@@ -27,7 +27,7 @@ AgentRuntime trait:
   fn health_check() → Status
 ```
 
-すべてのバックエンド——Claude、Codex、Gemini、またはOpenAI互換エンドポイント——は同じインターフェースを実装します。システムの残りの部分は、どのバックエンドが特定のリクエストを処理しているか知る必要も、気にする必要もありません。
+すべてのバックエンド——Claude、Codex、Antigravity、またはOpenAI互換エンドポイント——は同じインターフェースを実装します。システムの残りの部分は、どのバックエンドが特定のリクエストを処理しているか知る必要も、気にする必要もありません。
 
 ### ランタイムカタログ
 
@@ -36,8 +36,7 @@ AgentRuntime trait:
 | ランタイム | バイナリ | インストール経路 | ヘッドレス呼び出し | 出力 | ログイン | 認証情報の保存先 |
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（コード貼り付け） | `~/.claude/.credentials.json` |
-| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login`（localhost コールバック） | `~/.codex/auth.json` |
-| Gemini CLI（v1.67.0 で非推奨、v1.75.0 で削除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost コールバック） | `~/.gemini/oauth_creds.json` |
+| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login --device-auth`（デバイスコード。Docker／リモート対応） | `~/.codex/auth.json` |
 | Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json（v1.2.10） | ターミナルで `agy` を実行して Google サインイン（`login` サブコマンドなし）、または API キーモード | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | なし（API キーのみ） | `~/.qwen/.env` |
@@ -49,13 +48,17 @@ AgentRuntime trait:
 | OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
 | OpenAI 互換エンドポイント | *(HTTP)* | — | — | json | なし（API キーのみ） | — |
 
+**ダッシュボードのワンクリックログイン**は Claude、Codex、Grok、Kimi、Copilot、Kiro、OpenCode に対応します。Codex はデバイスコード方式です。CLI に表示される認証ページとコードをブラウザで使い、CLI の完了を待ってください。OAuth コールバック URL の `code` をダッシュボードに貼り付ける必要はありません。Cursor はランタイムとして残りますが、ブラウザコールバックをリモートのダッシュボードから確実に完了できないため、ワンクリックログインには表示しません。Antigravity にはスクリプト化されたログインコマンドがなく、Qwen と Mistral Vibe は API キーを使います。アカウントページの API Token カードから、アカウント id を確認して保存済みアカウントを削除できます。プロバイダー側のキーは失効しません。
+
+Gemini CLI は DuDuClaw のランタイムと Docker パッケージから削除されました。既存の `runtime = "gemini"` 設定は Antigravity に移行してください。別の Gemini API プロバイダーは引き続きサポートします。[削除と移行](../../guides/ja-JP/deprecations.md)を参照してください。
+
 モデル指定の書き方はベンダーごとに異なり、カタログはどの形式かも記録します：独立したフラグ（`--model <id>`）、Copilot が文書化している等号形式（`--model=<id>`）、フラグを持たない CLI 向けの環境変数（Mistral Vibe の `VIBE_ACTIVE_MODEL`）、あるいは無し（Kiro は呼び出しごとではなく `kiro-cli settings` でモデルを選びます）。
 
 **ランタイムを有効化する前に読むべきベンダー規約：**
 
 - **Kiro**——AWS の FAQ には、Kiro のネイティブ インターフェース以外へリクエストを流すサードパーティ製自動化ハーネス経由の利用は許可されないと明記されています。DuDuClaw から Kiro を駆動することはこれに該当します。自身の CI から `kiro-cli` を直接呼び出すことは許可されています。Kiro のインストール経路が手動なのはこのためです——判断はあなたが明示的に行ってください。
 - **Anthropic**——[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。認められているのは、自分のサブスクリプションで改変されていない Claude Code にサインインすることで、Pro と Max の利用上限は通常の利用を前提としています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。製品向けに案内されているのは Claude Console の API キーです。
-- **Google**——[Gemini CLI の規約](https://geminicli.com/docs/resources/tos-privacy/)には、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。[Antigravity の規約](https://antigravity.google/terms)第 6 条も、サードパーティのソフトウェアによる Antigravity へのアクセスについて同じ趣旨で、Antigravity や Gemini CLI のアカウントが停止または終了される場合があるとしています。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。DuDuClaw は改変されていない CLI を実行しますが、これが該当するかどうかは Google が判断します。Google の [Gemini Code Assist for individuals 廃止のお知らせ](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）によると、2026-06-18 以降、Gemini Code Assist for individuals、Google AI Pro、Google AI Ultra のアカウントでは Gemini CLI の Login with Google を使えません。有料の API キー（Gemini API またはエンタープライズ）は引き続き使えます。API キーをご利用ください。
+- **Google**——[Gemini CLI の規約](https://geminicli.com/docs/resources/tos-privacy/)には、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。[Antigravity の規約](https://antigravity.google/terms)第 6 条も、サードパーティのソフトウェアによる Antigravity へのアクセスについて同じ趣旨で、Antigravity や Gemini CLI のアカウントが停止または終了される場合があるとしています。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。DuDuClaw は改変されていない Antigravity CLI を実行しますが、これが該当するかどうかは Google が判断します。Google の [Gemini Code Assist for individuals 廃止のお知らせ](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）によると、2026-06-18 以降、Gemini Code Assist for individuals、Google AI Pro、Google AI Ultra のアカウントでは Gemini CLI の Login with Google を使えません。有料の API キー（Gemini API またはエンタープライズ）は引き続き使えます。API キーをご利用ください。
 - **Qwen**——無料 OAuth ティアは 2026-04-15 に終了しました。API キー（ModelStudio / DashScope）のみです。
 - **OpenCode**——MIT で独自の制限はありませんが、上記の理由により 1.3.0 で Anthropic サブスクリプション プラグインを削除しました。プロバイダーの API キーをご利用ください。
 - **OpenAI**——OpenAI には公式の Sign in with ChatGPT プログラムがあります（[規約](https://openai.com/policies/sign-in-with-chatgpt-terms/)、2026-09-29 版）。[クイックスタート](https://developers.openai.com/siwc/quickstart)には、Sign in with ChatGPT は現在、限定トライアルとして選ばれた商用パートナーに提供されていること、ChatGPT プランの利用はすべてのオープンソースのパートナーと選ばれたプライベートクライアントに提供されていることが書かれています。[ヘルプ記事](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)では、サポート対象のオープンソースツールは引き続き使え、商用パートナーは申請フォームから申し込むとしています。つまり商用製品には OpenAI の承認が必要です。規約ではさらに、ユーザーがパートナーへの支払いやプランのアップグレードなしに自分の ChatGPT プランを使えること、認証トークンを永続的に保存する場合はユーザーが管理するローカル環境に限り、リモートやマネージド環境には置かないこと、ほかのツールや無関係なリクエストのための汎用 API アクセスを提供しないことを求め、違反すると Sign in with ChatGPT の利用を停止される場合があるとしています。OpenAI の Codex 責任者は 2026-09-08 に、あるサードパーティのアプリについて「Sorry, but this is not an approved use of Sign in With ChatGPT. We support pure OSS clients and others we have partnerships with, but you need to reach out and talk to us for that.」と[投稿](https://x.com/thsottiaux/status/2097131394199896166)しています。DuDuClaw をリモートのホストやコンテナで動かす場合、Codex のトークン（`~/.codex/auth.json`）もそこに保存されます。[利用規約](https://openai.com/policies/terms-of-use/)は引き続き適用されます。安定して使うなら API キーです。
@@ -65,11 +68,11 @@ AgentRuntime trait:
 
 ### バックエンドの駆動方法
 
-5 つの CLI バックエンド（`claude`、`codex`、`gemini`、`antigravity`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換、出力が空だった場合の PTY リカバリ——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 6 つです。
+4 つの CLI バックエンド（`claude`、`codex`、`antigravity`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換、出力が空だった場合の PTY リカバリ——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 5 つです。
 
-### 当初の 4 つのバックエンド
+### 主なバックエンド
 
-以下は DuDuClaw が最初に出荷した 4 つのバックエンドです。専用モジュールを持つ残り 2 つの CLI、Antigravity と Grok は、後の各セクションで説明します。
+以下では Claude、Codex、OpenAI 互換エンドポイントを説明します。Antigravity と Grok は後のセクションで説明します。
 
 **Claude Runtime** — Claude Code CLI（`claude`）をJSONLストリーミング出力で呼び出します。ネイティブMCPツールサポート、bash実行、Web検索、ファイル操作が組み込まれた最も機能豊富なバックエンドです。
 
@@ -96,23 +99,6 @@ Agent設定：runtime = "codex"
      |
      v
 JSONL STDOUTイベントを解析
-     |
-     v
-レスポンスを抽出
-```
-
-**Gemini Runtime** — Google Gemini CLIを`--output-format stream-json`で呼び出し、構造化出力を取得します。
-
-> **v1.67.0 で非推奨、v1.75.0 で削除予定。** Google は 2026-06-18 に、個人アカウント（無料、AI Pro、AI Ultra）に対する Gemini CLI での提供を停止しました。Antigravity ランタイムをご利用ください。削除までは従来どおり動作します。Gemini API プロバイダーは影響を受けません。移行手順は[非推奨となった名称](../../guides/ja-JP/deprecations.md#gemini-cli-ランタイム)を参照してください。
-
-```
-Agent設定：runtime = "gemini"
-     |
-     v
-起動：gemini --output-format stream-json ...
-     |
-     v
-ストリーミングJSONイベントを解析
      |
      v
 レスポンスを抽出
@@ -206,20 +192,19 @@ effort    = "high"          # low | medium | high | xhigh | max
 | `codex` | 0.156.1 | `-c model_reasoning_effort=<v>`（設定オーバーライド、専用フラグなし） | `low` `medium` `high` `xhigh` |
 | `antigravity`（`agy`） | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
 | `grok` | 1.0.41 | `--reasoning-effort <v>`（別名 `--effort`） | *`--help` では列挙されていません* |
-| `gemini` | — | **フラグが存在しません**。debug ログに記録して無視します | — |
 | `openai_compat` | — | リクエストボディの `reasoning_effort` | `low` `medium` `high` |
 
 ### クランプ表
 
 受け付ける値の集合が異なるため、設定値は対象ランタイムが受け付ける値まで**下方向に**クランプされます。黙って捨てられることも、CLI が拒否する値が送られることもありません。
 
-| 設定値 | claude | codex | antigravity | grok | openai_compat | gemini |
+| 設定値 | claude | codex | antigravity | grok | openai_compat |
 |---|---|---|---|---|---|---|
-| `low` | `low` | `low` | `low` | `low` | `low` | — |
-| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` | — |
-| `high` | `high` | `high` | `high` | `high` | `high` | — |
-| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** | — |
-| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** | — |
+| `low` | `low` | `low` | `low` | `low` | `low` |
+| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` |
+| `high` | `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** |
 
 Grok を意図的に `high` で頭打ちにしているのは、`--help` がフラグ名には触れていても値を列挙していないためです。`xhigh`/`max` を渡すと "unexpected value" で spawn 全体が落ちるおそれがあります。`openai_compat` も、8 つの異質なプリセットにまたがるため同じ理由で上限を設けています。どちらの上限も 1 か所（`duduclaw-core/src/effort.rs`）にあり、実機での動作確認が取れた時点で引き上げられます。
 
@@ -437,7 +422,7 @@ api_key_enc = "..."          # anthropic は従来通り anthropic_api_key_enc �
 
 **通知の内容。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。認められているのは、自分のサブスクリプションで改変されていない Claude Code にサインインすることで、Pro/Max の利用上限は通常の利用を前提としています。消費者向け利用規約では、アカウントを他人に利用させることも禁止されています。Anthropic は事前の通知なく執行できるとしています。アカウント停止は報道やユーザーからの報告で、Anthropic の公式発表ではありません。通知は、規約と衝突する DuDuClaw での使い方を具体的に挙げます。1 つのサブスクリプションで他の人（チャネルの顧客）に対応すること、複数のサブスクリプションをローテーションして上限を避けること、DuDuClaw にトークンを保存させることです。OAuth トークンでの `claude -p` は技術的にはまだ動くため（v1.66.0）、通知は「ブロック」とは書きません。
 
-**ベンダーごとの表示。** 上の全文は Claude のログインと Claude のアカウントで表示します。Codex、Gemini CLI、Antigravity、Grok のログイン（およびアカウント追加で Anthropic 以外の provider を選んだ OAuth の経路）では、同じチェックボックスとともに、そのベンダー自身の説明と規約へのリンクを表示します。Google は上記の Gemini CLI と Antigravity の条項（Gemini CLI では、個人向け、AI Pro、AI Ultra のアカウントが 2026-06-18 以降 Login with Google を使えないことも示します）、OpenAI は上記の Sign in with ChatGPT プログラムの要点（オープンソースと承認を受けた商用パートナー、トークンはローカルに保存）とその規約へのリンク、xAI は立場が不明で規約が適用されることを示します。不明な provider には、ベンダー名もリンクもない注意を表示します。どの文もベンダーのページに対応しており、一次情報が見つからなかった以前の「Google は 2026-03 以降サーバー側でブロック」の文は削除しました。ベンダーの対応表は `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）と `web/src/lib/subscription-risk.ts`（ダッシュボード）にあります。
+**ベンダーごとの表示。** 上の全文は Claude のログインと Claude のアカウントで表示します。Codex、Antigravity、Grok のログイン（およびアカウント追加で Anthropic 以外の provider を選んだ OAuth の経路）では、同じチェックボックスとともに、そのベンダー自身の説明と規約へのリンクを表示します。Google は上記の Antigravity の条項、OpenAI は上記の Sign in with ChatGPT プログラムの要点（オープンソースと承認を受けた商用パートナー、トークンはローカルに保存）とその規約へのリンク、xAI は立場が不明で規約が適用されることを示します。不明な provider には、ベンダー名もリンクもない注意を表示します。どの文もベンダーのページに対応しており、一次情報が見つからなかった以前の「Google は 2026-03 以降サーバー側でブロック」の文は削除しました。ベンダーの対応表は `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）と `web/src/lib/subscription-risk.ts`（ダッシュボード）にあります。
 
 **表示される場所。** CLI ログインモーダル、案内付き QR コード設定ウィザード、アカウント追加の OAuth Token の経路では、認証情報を扱う前にチェックボックス付きの全文を表示します。ようこそページの Claude サブスクリプションのカード（「サインイン済み」カード、つまりホストログインの自動採用の場合も含む）、runtime 設定カードのサインイン行、アカウントページのサブスクリプション用カード、ワンクリック CLI の選択画面、CLI 認証情報の一覧、エージェント編集の API モードがサブスクリプション CLI のとき、アカウントプールにサブスクリプションアカウントが入っているときには、規約へのリンク付きの 1 行の注意を表示します。
 
@@ -449,4 +434,4 @@ api_key_enc = "..."          # anthropic は従来通り anthropic_api_key_enc �
 
 ## まとめ
 
-AI領域はマルチプロバイダーです。単一CLIの上に構築するのは、単一OSのためだけにソフトウェアを書くようなもの——動くけど、いつか動かなくなります。`AgentRuntime` traitが差異を抽象化し、DuDuClawがClaude、Codex、Gemini、そしてOpenAI互換エンドポイントを交換可能なバックエンドとして扱えるようにします。エージェントは常に、利用可能な最良の頭脳を得られます。
+AI領域はマルチプロバイダーです。単一CLIの上に構築するのは、単一OSのためだけにソフトウェアを書くようなもの——動くけど、いつか動かなくなります。`AgentRuntime` traitが差異を抽象化し、DuDuClawがClaude、Codex、Antigravity、そしてOpenAI互換エンドポイントを交換可能なバックエンドとして扱えるようにします。エージェントは常に、利用可能な最良の頭脳を得られます。

@@ -103,6 +103,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_accounts_update(params).await
             }
+            "accounts.remove" => {
+                require_admin!();
+                self.handle_accounts_remove(params).await
+            }
             // Interactive CLI login ("Dashboard 一鍵登入") — drives the CLI's
             // native login in a PTY and streams it to the dashboard.
             "auth.cli_login.start" => {

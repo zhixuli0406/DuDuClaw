@@ -90,31 +90,31 @@ describe('RuntimeSetupCard — install flow', () => {
     const onDetect = vi.fn();
     vi.spyOn(api.runtime, 'install').mockResolvedValue({
       started: true,
-      provider: 'gemini',
+      provider: 'codex',
       session_id: 'sess-2',
-      command: 'npm install -g @google/gemini-cli',
-      docs_url: 'https://github.com/google-gemini/gemini-cli',
+      command: 'npm install -g @openai/codex',
+      docs_url: 'https://github.com/openai/codex',
       timeout_secs: 300,
     });
 
     renderWithProviders(
-      <RuntimeSetupCard provider="gemini" installed={false} onDetect={onDetect} />,
+      <RuntimeSetupCard provider="codex" installed={false} onDetect={onDetect} />,
     );
     await user.click(screen.getByRole('button', { name: /install it for me/i }));
     await waitFor(() => expect(screen.getByTestId('runtime-install-output')).toBeInTheDocument());
 
     eventHandler('runtime.install.status')({
       session_id: 'sess-2',
-      provider: 'gemini',
+      provider: 'codex',
       status: 'succeeded',
       exit_code: 0,
       detected: false,
-      command: 'npm install -g @google/gemini-cli',
-      docs_url: 'https://github.com/google-gemini/gemini-cli',
+      command: 'npm install -g @openai/codex',
+      docs_url: 'https://github.com/openai/codex',
     });
 
     // Falls back to the copyable command rather than turning the wizard green.
-    expect(await screen.findByText('npm install -g @google/gemini-cli')).toBeInTheDocument();
+    expect(await screen.findByText('npm install -g @openai/codex')).toBeInTheDocument();
     expect(onDetect).not.toHaveBeenCalled();
   });
 
@@ -337,7 +337,7 @@ describe('RuntimeSetupCard — login + re-detect', () => {
     const user = userEvent.setup();
     const onDetect = vi.fn();
     renderWithProviders(
-      <RuntimeSetupCard provider="gemini" installed={false} onDetect={onDetect} />,
+      <RuntimeSetupCard provider="codex" installed={false} onDetect={onDetect} />,
     );
     await user.click(screen.getByRole('button', { name: /check again/i }));
     expect(onDetect).toHaveBeenCalledTimes(1);

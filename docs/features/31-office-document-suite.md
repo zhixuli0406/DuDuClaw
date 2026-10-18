@@ -28,7 +28,7 @@ A reply with no marker is returned byte-for-byte — the common case stays promp
 
 ## Why a Marker Instead of Guessing
 
-The reply text is the one hand-off point every runtime shares — Claude CLI, Codex, Gemini, direct API. A marker in the reply lets the *model* declare intent while the *gateway* keeps authority over what actually leaves the sandbox. The alternative — the gateway inferring deliverables from prose — is exactly the failure mode the protocol exists to avoid.
+The reply text is the one hand-off point every runtime shares — Claude CLI, Codex, Antigravity, direct API. A marker in the reply lets the *model* declare intent while the *gateway* keeps authority over what actually leaves the sandbox. The alternative — the gateway inferring deliverables from prose — is exactly the failure mode the protocol exists to avoid.
 
 The protocol originally lived only in the office skills' SKILL.md files, and a live incident (2026-07-28) showed the gap: an agent produced a real `.docx`, wrote it to `~/Desktop`, and never emitted the marker. The user got prose claiming the file existed; the gateway had nothing to send or archive. Two fixes landed:
 

@@ -394,15 +394,20 @@ fn reopen_tree(path: &Path) {
     let _ = path;
 }
 
-/// Write the read-only `/dudu-runtime` files: the empty MCP config, the
-/// Gemini system settings, and the family's own files (validated names,
+/// Write the read-only `/dudu-runtime` files: the empty MCP config and the
+/// family's own files (validated names,
 /// no links followed, created fresh with mode 0600).
-pub(super) fn write_config(config: &Path, max_turns: u32, files: &[(String, Vec<u8>)]) -> io::Result<()> {
-    let gemini = crate::discovery::attempt_adapter::gemini_settings(max_turns).to_string();
-    let fixed = [
-        ("empty-mcp.json".to_string(), crate::discovery::agent_spawn::EMPTY_MCP_CONFIG.as_bytes().to_vec()),
-        ("gemini.json".to_string(), gemini.into_bytes()),
-    ];
+pub(super) fn write_config(
+    config: &Path,
+    _max_turns: u32,
+    files: &[(String, Vec<u8>)],
+) -> io::Result<()> {
+    let fixed = [(
+        "empty-mcp.json".to_string(),
+        crate::discovery::agent_spawn::EMPTY_MCP_CONFIG
+            .as_bytes()
+            .to_vec(),
+    )];
     for (path, _) in files {
         if !valid_runtime_file(path) {
             return Err(io::Error::other("invalid sandbox runtime file name"));

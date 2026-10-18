@@ -219,7 +219,7 @@ TaskSpec：
 - **任務沙箱**：員工的 `agent.toml [container] sandbox_enabled = true` 時，調度器把任務的 AI CLI 放進上鎖的 Docker 容器執行，而不是直接在主機上跑；沙箱不能用時任務會失敗。見[任務沙箱指南](../../guides/zh-TW/task-sandbox.md)。
 - **DelegationEnvelope**：為複雜的多 Agent 交接提供結構化背景資訊。
 - **TaskSpec**：讓多步驟工作流具備依賴感知，支援重試與重新規劃。
-- **Multi-Runtime**：調度器依每個 Agent 的 runtime 設定，啟動對應的 CLI 後端（Claude/Codex/Gemini）。
+- **Multi-Runtime**：調度器依每個 Agent 的 runtime 設定，啟動對應的 CLI 後端（Claude/Codex/Antigravity）。
 - **審計日誌**：所有已調度任務記錄在 JSONL 審計紀錄中。
 
 ---

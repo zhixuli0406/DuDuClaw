@@ -1,6 +1,6 @@
 # 多帳號輪替與跨供應商容錯
 
-> 跨 Claude、Codex、Gemini 的智慧認證資料排程：永遠不再碰到限速。
+> 跨 Claude、Codex、Antigravity 的智慧認證資料排程：永遠不再碰到限速。
 
 ---
 
@@ -230,7 +230,7 @@ LeastCost 策略確保免費配額（來自訂閱）優先消耗。付費 API �
 
 ## 跨供應商容錯
 
-搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Antigravity / OpenAI-compat；Gemini CLI runtime 於 v1.67.0 棄用、v1.75.0 移除），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
+搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Antigravity / OpenAI-compat），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
 
 ```
 主要供應商（Claude）被限速
@@ -299,7 +299,7 @@ DuDuClaw 以系統服務方式執行（透過 `duduclaw service install`），�
 
 ## 與其他系統的互動
 
-- **Multi-Runtime**：帳號輪替橫跨 Claude、Codex、Gemini 與 OpenAI-compat 供應商運作。
+- **Multi-Runtime**：帳號輪替橫跨 Claude、Codex、Antigravity 與 OpenAI-compat 供應商運作。
 - **信心路由器**：路由到本地推論的查詢不消耗任何 API 帳號，延長配額使用期限。
 - **CostTelemetry**：提供支持預算執行和快取效率回饋的數據。
 - **FailoverManager**：協調跨供應商的健康追蹤與容錯決策。

@@ -96,6 +96,7 @@ impl MethodHandler {
                     { "name": "system.autostart.set", "description": "Enable/disable gateway autostart at login/boot (admin)" },
                     { "name": "accounts.add", "description": "Add a new account (provider defaults to anthropic). Since v1.74.0, type=oauth needs accept_subscription_risk: true (else error code subscription_risk_not_accepted); the same parameter is required by auth.cli_login.start and accounts.setup_token_start" },
                     { "name": "accounts.update_budget", "description": "Update account monthly budget" },
+                    { "name": "accounts.remove", "description": "Remove one configured account and its stored credential (Admin)" },
                     { "name": "system.version", "description": "Version info" },
                     { "name": "system.check_update", "description": "Check for available updates" },
                     { "name": "system.apply_update", "description": "Download and apply update" },

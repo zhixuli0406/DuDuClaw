@@ -52,6 +52,37 @@ fn read_sections(agent_dir: &Path) -> AgentTomlSections {
     agent_toml::load(agent_dir)
 }
 
+/// Legacy Gemini CLI providers must be fixed by the operator before dispatch.
+/// Silently defaulting them to Claude would run a different vendor and model.
+pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
+    if read_sections(agent_dir)
+        .runtime
+        .provider
+        .as_deref()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("gemini"))
+    {
+        return Err(format!(
+            "{} still selects the removed Gemini CLI runtime; choose a supported runtime and model in agent.toml",
+            agent_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+pub fn ensure_active_utility_provider(home_dir: &Path) -> Result<(), String> {
+    let removed = read_global_config(home_dir)
+        .as_ref()
+        .and_then(|v| v.get("runtime"))
+        .and_then(|v| v.get("utility_provider"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("gemini"));
+    if removed {
+        Err("config.toml [runtime] utility_provider still selects the removed Gemini CLI runtime; choose a supported runtime and model".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// All per-agent runtime/model settings from a single `agent.toml` read (RFC-25 L7).
 ///
 /// Callers that need more than one field (the choke-point reads provider +
@@ -734,82 +765,37 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_agent_toml(
             dir.path(),
-            "[runtime]\nprovider = \"gemini\"\nfallback = \"claude\"\n",
+            "[runtime]\nprovider = \"antigravity\"\nfallback = \"claude\"\n",
         );
-        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Gemini);
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Antigravity);
         assert_eq!(
             agent_runtime_fallback(dir.path()),
             Some(RuntimeType::Claude)
         );
     }
 
-    /// R1 (2026-10): a deprecated runtime parses exactly as before; the
-    /// notice is emitted once per (runtime, source) and never for a live one.
+    /// Legacy Gemini settings are rejected by the dispatch gates.
     #[test]
-    fn deprecated_runtime_notice_is_first_sighting_only_and_value_unchanged() {
-        let mut seen = std::collections::HashSet::new();
-        let first = deprecated_runtime_first_notice(
-            &mut seen,
-            RuntimeType::Gemini,
-            DeprecatedRuntimeSource::AgentProvider,
-            Some("writer"),
-        )
-        .expect("first sighting warns");
-        assert!(first.contains("(agent `writer`)"), "{first}");
-        assert!(first.contains("agent.toml [runtime] provider"), "{first}");
-        assert!(first.contains("antigravity"), "{first}");
-        assert!(first.contains("v1.75.0"), "{first}");
-        assert!(first.contains("docs/guides/deprecations.md"), "{first}");
-        assert!(deprecated_runtime_first_notice(
-            &mut seen,
-            RuntimeType::Gemini,
-            DeprecatedRuntimeSource::AgentProvider,
-            Some("another-agent"),
-        )
-        .is_none());
-        // Different source kind ⇒ its own one-time notice.
-        for src in [
-            DeprecatedRuntimeSource::AgentFallback,
-            DeprecatedRuntimeSource::UtilityProvider,
-            DeprecatedRuntimeSource::JudgeProvider,
-            DeprecatedRuntimeSource::TeamRole,
-            DeprecatedRuntimeSource::DiscoveryAttempt,
-        ] {
-            let notice = deprecated_runtime_first_notice(&mut seen, RuntimeType::Gemini, src, None);
-            assert!(notice.as_deref().is_some_and(|n| !n.contains("(agent")), "{notice:?}");
-            assert!(deprecated_runtime_first_notice(&mut seen, RuntimeType::Gemini, src, None).is_none());
-        }
-        for rt in [RuntimeType::Antigravity, RuntimeType::Claude, RuntimeType::Codex] {
-            assert!(deprecated_runtime_first_notice(
-                &mut seen,
-                rt,
-                DeprecatedRuntimeSource::AgentProvider,
-                None,
-            )
-            .is_none());
-        }
-        assert!(!warn_once_if_deprecated_runtime(
-            RuntimeType::Antigravity,
-            DeprecatedRuntimeSource::AgentProvider
-        ));
-
-        // Parsing is unchanged: provider, fallback and utility_provider all
-        // still resolve to the Gemini CLI.
+    fn removed_gemini_runtime_in_config_is_not_selected() {
         let dir = TempDir::new().unwrap();
         write_agent_toml(
             dir.path(),
             "[runtime]\nprovider = \"gemini\"\nfallback = \"gemini\"\n",
         );
         let s = load_runtime_settings(dir.path());
-        assert_eq!(s.provider, RuntimeType::Gemini);
-        assert_eq!(s.fallback, Some(RuntimeType::Gemini));
+        assert!(ensure_active_agent_provider(dir.path()).is_err());
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \" Gemini \"\n");
+        assert!(ensure_active_agent_provider(dir.path()).is_err());
+        assert_eq!(s.provider, RuntimeType::Claude);
+        assert_eq!(s.fallback, None);
         let home = TempDir::new().unwrap();
         std::fs::write(
             home.path().join("config.toml"),
             "[runtime]\nutility_provider = \"gemini\"\n",
         )
         .unwrap();
-        assert_eq!(global_utility_provider(home.path()), RuntimeType::Gemini);
+        assert!(ensure_active_utility_provider(home.path()).is_err());
+        assert_eq!(global_utility_provider(home.path()), RuntimeType::Claude);
     }
 
     #[test]
@@ -932,8 +918,11 @@ mod tests {
         // No config → Claude → None.
         assert_eq!(agent_uses_non_claude(dir.path()), None);
         // Explicit non-Claude → Some(provider).
-        write_agent_toml(dir.path(), "[runtime]\nprovider = \"gemini\"\n");
-        assert_eq!(agent_uses_non_claude(dir.path()), Some(RuntimeType::Gemini));
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"antigravity\"\n");
+        assert_eq!(
+            agent_uses_non_claude(dir.path()),
+            Some(RuntimeType::Antigravity)
+        );
     }
 
     #[test]
@@ -966,9 +955,12 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_global_config(
             home.path(),
-            "[runtime]\nutility_provider = \"gemini\"\nutility_model = \"gemini-2.5-flash\"\n",
+            "[runtime]\nutility_provider = \"antigravity\"\nutility_model = \"gemini-2.5-flash\"\n",
         );
-        assert_eq!(global_utility_provider(home.path()), RuntimeType::Gemini);
+        assert_eq!(
+            global_utility_provider(home.path()),
+            RuntimeType::Antigravity
+        );
         assert_eq!(global_utility_model(home.path()), "gemini-2.5-flash");
     }
 
@@ -983,8 +975,11 @@ mod tests {
     fn resolve_utility_with_agent_dir_uses_agent_config() {
         let home = TempDir::new().unwrap();
         let agent = TempDir::new().unwrap();
-        // Global says gemini; agent says codex — agent_dir present must win.
-        write_global_config(home.path(), "[runtime]\nutility_provider = \"gemini\"\n");
+        // Global says Antigravity; agent says Codex — agent_dir present must win.
+        write_global_config(
+            home.path(),
+            "[runtime]\nutility_provider = \"antigravity\"\n",
+        );
         write_agent_toml(
             agent.path(),
             "[runtime]\nprovider = \"codex\"\n[model]\nutility = \"o4-mini\"\n",
@@ -999,10 +994,10 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_global_config(
             home.path(),
-            "[runtime]\nutility_provider = \"gemini\"\nutility_model = \"gemini-2.5-flash\"\n",
+            "[runtime]\nutility_provider = \"antigravity\"\nutility_model = \"gemini-2.5-flash\"\n",
         );
         let spec = resolve_utility(home.path(), None);
-        assert_eq!(spec.provider, RuntimeType::Gemini);
+        assert_eq!(spec.provider, RuntimeType::Antigravity);
         assert_eq!(spec.model, "gemini-2.5-flash");
     }
 
@@ -1088,7 +1083,7 @@ mod tests {
         // fallback, never a different family and never Claude.
         for (model, family) in [
             ("grok-4.5", Grok),
-            ("gemini-3.1-pro", Gemini),
+            ("gemini-3.1-pro", Antigravity),
             ("gpt-5.4", Codex),
             ("xai/grok-4.5", Grok), // qualified provider/model form
         ] {
@@ -1197,7 +1192,7 @@ mod tests {
         assert!(!model_matches_provider("gpt-5", Claude));
         assert!(!model_matches_provider("gemini-3.1-pro", Claude));
         assert!(!model_matches_provider("claude-sonnet-4-6", Codex));
-        assert!(!model_matches_provider("gpt-5.4", Gemini));
+        assert!(!model_matches_provider("gpt-5.4", Antigravity));
         // R4: grok models reject other providers; foreign models reject Grok.
         assert!(!model_matches_provider("grok-build-0.1", Claude));
         assert!(!model_matches_provider("claude-sonnet-4-6", Grok));
@@ -1392,31 +1387,29 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_agent_toml(dir.path(), "[runtime]\nprovider = \"codex\"\n");
         assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Codex);
-        write_agent_toml(dir.path(), "[runtime]\nprovider = \"gemini\"\n");
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"antigravity\"\n");
         assert_eq!(
             agent_runtime_provider(dir.path()),
-            RuntimeType::Gemini,
+            RuntimeType::Antigravity,
             "a live agent.toml edit must be visible on the next call"
         );
     }
 
-    /// R1 follow-up: the agent-scoped notices name the agent directory.
+    /// Antigravity stays an active runtime for Gemini models.
     #[test]
-    fn agent_provider_notice_names_the_agent() {
+    fn antigravity_provider_is_not_deprecated() {
         let root = TempDir::new().unwrap();
         let dir = root.path().join("sales-helper");
         std::fs::create_dir_all(&dir).unwrap();
-        write_agent_toml(&dir, "[runtime]\nprovider = \"gemini\"\nfallback = \"gemini\"\n");
+        write_agent_toml(
+            &dir,
+            "[runtime]\nprovider = \"antigravity\"\nfallback = \"antigravity\"\n",
+        );
         CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
         let s = load_runtime_settings(&dir);
-        assert_eq!(s.provider, RuntimeType::Gemini);
+        assert_eq!(s.provider, RuntimeType::Antigravity);
+        assert_eq!(s.fallback, Some(RuntimeType::Antigravity));
         let consulted = CONSULTED_NOTICES.with(|n| n.borrow().clone());
-        assert_eq!(
-            consulted,
-            vec![
-                ("gemini", DeprecatedRuntimeSource::AgentProvider, Some("sales-helper".to_string())),
-                ("gemini", DeprecatedRuntimeSource::AgentFallback, Some("sales-helper".to_string())),
-            ]
-        );
+        assert!(consulted.is_empty());
     }
 }

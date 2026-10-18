@@ -18,7 +18,7 @@ use duduclaw_core::types::RuntimeType;
 /// - **Claude**: every current cloud Claude model (`claude-*` — 3.x, 4.x, Fable)
 ///   supports vision. A non-`claude-` id (e.g. a local GGUF) is treated as no
 ///   vision.
-/// - **Gemini**: Gemini models are multimodal.
+/// - **Antigravity**: Gemini and Claude models are multimodal.
 /// - **Codex (OpenAI)**: only the known vision-capable families
 ///   (`gpt-4o`, `gpt-5`, `o1`/`o3`/`o4`, `gpt-4-*vision*`).
 /// - **OpenAI-compat**: custom/local endpoints — unknown, fail closed.
@@ -26,7 +26,6 @@ pub fn supports_vision(provider: RuntimeType, model_id: &str) -> bool {
     let m = model_id.trim().to_ascii_lowercase();
     match provider {
         RuntimeType::Claude => m.starts_with("claude"),
-        RuntimeType::Gemini => m.starts_with("gemini"),
         // Antigravity (`agy`) multiplexes Gemini + Claude models; both families
         // are multimodal. GPT-OSS / other text-only ids fail closed.
         RuntimeType::Antigravity => m.starts_with("gemini") || m.starts_with("claude"),
@@ -83,9 +82,12 @@ mod tests {
     }
 
     #[test]
-    fn gemini_supports_vision() {
-        assert!(supports_vision(RuntimeType::Gemini, "gemini-2.0-flash"));
-        assert!(!supports_vision(RuntimeType::Gemini, "not-gemini"));
+    fn antigravity_gemini_models_support_vision() {
+        assert!(supports_vision(
+            RuntimeType::Antigravity,
+            "gemini-2.0-flash"
+        ));
+        assert!(!supports_vision(RuntimeType::Antigravity, "not-gemini"));
     }
 
     #[test]

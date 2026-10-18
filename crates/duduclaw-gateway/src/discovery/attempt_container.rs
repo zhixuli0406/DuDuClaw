@@ -155,7 +155,7 @@ pub fn prepare(home:&Path, request:&AttemptRequest, settings:&AttemptSettings, q
 }
 
 /// Fixed names the host always writes into `/dudu-runtime`.
-const RESERVED_RUNTIME_FILES: &[&str] = &["empty-mcp.json","gemini.json"];
+const RESERVED_RUNTIME_FILES: &[&str] = &["empty-mcp.json"];
 /// Host-generated `/dudu-runtime` file paths: relative, `[A-Za-z0-9._-]`
 /// components separated by `/`, no empty, `.` or `..` component, at most
 /// eight levels, never one of the reserved names. Anything else is refused.
@@ -216,9 +216,8 @@ pub fn prepare_with_files(home:&Path, request:&AttemptRequest, settings:&Attempt
         sources.push((source,guard));
         if Instant::now()>=deadline {return Err(AttemptInfraError::BudgetExhausted);}
     }
-    let gemini=super::attempt_adapter::gemini_settings(request.max_turns).to_string();
     let expected=total.checked_add(super::agent_spawn::EMPTY_MCP_CONFIG.len() as u64)
-        .and_then(|n|n.checked_add(gemini.len() as u64)).and_then(|n|n.checked_add(extra)).ok_or(AttemptInfraError::IsolationUnavailable)?;
+        .and_then(|n|n.checked_add(extra)).ok_or(AttemptInfraError::IsolationUnavailable)?;
     check_quota(&discovery,&request.run_id,quota,expected).map_err(failure)?;
     let snapshot_parent=discovery.join("attempt-snapshots").join(&request.run_id);
     super::workspace::create_private_directory(&snapshot_parent).map_err(failure)?;
@@ -240,7 +239,6 @@ pub fn prepare_with_files(home:&Path, request:&AttemptRequest, settings:&Attempt
     // The agent cannot rewrite trusted system settings through its shell.
     let config=private_root.join("config");super::workspace::create_private_directory(&config).map_err(failure)?;
     std::fs::write(config.join("empty-mcp.json"),super::agent_spawn::EMPTY_MCP_CONFIG).map_err(failure)?;
-    std::fs::write(config.join("gemini.json"),gemini).map_err(failure)?;
     for (path,bytes) in files {
         let target=config.join(path);
         let mut parent=config.clone();

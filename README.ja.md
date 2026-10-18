@@ -12,7 +12,7 @@
 
 DuDuClaw は、Claude Code・Codex・Antigravity などの AI コマンドラインツールを、Telegram・LINE・Discord をはじめとする 11 のメッセージングアプリに常駐し、納品前には独立した判定役の検証を通過し、使った費用を一円単位で記録する AI社員に変えます。
 
-必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は 12 種類の CLI バックエンド(Claude Code・Codex・Antigravity・Grok など。Gemini CLI は非推奨)と任意の OpenAI 互換 API の間でいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
+必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は 11 種類の CLI バックエンド(Claude Code・Codex・Antigravity・Grok など)と任意の OpenAI 互換 API の間でいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
 <p align="center">
   <img src="docs/assets/screenshots/dashboard-task-board-en.png" width="100%" alt="DuDuClaw v1.74.0 の Web ダッシュボード（英語表示）。タスクボードのリスト表示で、7 件のデモタスクが To Do、In Progress、In Review、Done、Stuck に分かれて並んでいる">
@@ -69,12 +69,12 @@ duduclaw run                  # 起動後 http://localhost:18789 を開く
 AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます。頭脳は差し替え可能、配管はそのまま:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Antigravity / Grok / … (12 CLIs) / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Antigravity / Grok / … (11 CLIs) / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
-  ├─ Multi-Runtime — 13 のランタイム ID(12 CLI + OpenAI-compat)、自動検出、エージェントごとに設定
+  ├─ Multi-Runtime — 12 のランタイム ID(11 CLI + OpenAI-compat)、自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
   ├─ MCP Server — 247 ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
   ├─ Evolution Engine — 予測駆動 + AEE playbook ルール + MistakeNotebook
@@ -96,9 +96,11 @@ Rust ワークスペースは 24 crate 構成:基盤の `duduclaw-core`、サー
 
 DuDuClaw 自体には LLM が含まれません。まず AI の頭脳を用意してください(ブラウザのセットアップウィザードで後から設定することも可能です):
 
-- 対応する AI CLI を 1 つ入れて API キーを設定する。例:[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity(全一覧は [multi-runtime](docs/features/ja-JP/13-multi-runtime.md)。[Gemini CLI](https://github.com/google-gemini/gemini-cli) は非推奨で v1.75.0 で削除)。Anthropic の[規約](https://code.claude.com/docs/en/legal-and-compliance)では、サードパーティ製品が Claude.ai ログインを提供すること、Free/Pro/Max プランの認証情報でユーザーの代わりにリクエストを中継すること、その認証情報を保存することは認められておらず、予告なく執行される場合があります(アカウント停止の報告もあります)。Google の [Gemini CLI の規約](https://geminicli.com/docs/resources/tos-privacy/)と [Antigravity の規約](https://antigravity.google/terms)第 6 条には、サードパーティのソフトウェアからサブスクリプションの OAuth ログインでサービスにアクセスすると、アカウントの停止または終了の理由になり得ると書かれています。API キーを使ってください。サブスクリプションでのログインは、リスク説明に同意すれば引き続き使えます
+- 対応する AI CLI を 1 つ入れて API キーを設定する。例:[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity(全一覧は [multi-runtime](docs/features/ja-JP/13-multi-runtime.md)。Gemini CLI は DuDuClaw のランタイムから削除済み)。Anthropic の[規約](https://code.claude.com/docs/en/legal-and-compliance)では、サードパーティ製品が Claude.ai ログインを提供すること、Free/Pro/Max プランの認証情報でユーザーの代わりにリクエストを中継すること、その認証情報を保存することは認められておらず、予告なく執行される場合があります(アカウント停止の報告もあります)。Google の [Antigravity の規約](https://antigravity.google/terms)第 6 条には、サードパーティのソフトウェアからサブスクリプションの OAuth ログインでサービスにアクセスすると、アカウントの停止または終了の理由になり得ると書かれています。API キーを使ってください。サブスクリプションでのログインは、リスク説明に同意すれば引き続き使えます
 - 任意の OpenAI 互換プロバイダの API キーを用意する
 - あるいはローカルモデルを OpenAI 互換サーバー(llama-server、Ollama、vLLM、llamafile)の背後で動かす(クラウドアカウント不要)
+
+ダッシュボードのワンクリックログインは、インストール済みの Claude、Codex、Grok、Kimi、Copilot、Kiro、OpenCode に対応します。Codex は `codex login --device-auth` を使います。CLI が表示する認証ページをブラウザで開き、デバイスコードを入力して完了を待ちます。ブラウザから Docker 内のコールバックポートに接続する必要はなく、コールバック URL の `code` をダッシュボードに貼り付けても認証されません。アカウントページの API Token カードでは、アカウント id を確認して保存済みアカウントを削除できます。キーを無効にする場合は、プロバイダー側でも失効させてください。
 
 <a id="install"></a>
 
@@ -187,13 +189,13 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | 領域 | 内蔵機能 | 詳細 |
 |------|----------|------|
 | チャネル | 11 チャネル(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード。Telegram の音声メッセージは OpenAI Whisper API で文字起こし。Discord のボイスチャンネルは既定外のビルド機能で、リリース版バイナリには含まれない | [docs/features](docs/features/README.md) |
-| マルチランタイム | 13 のランタイム ID:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI(非推奨、v1.75.0 で削除)と OpenAI-compat。自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [docs/features/13](docs/features/ja-JP/13-multi-runtime.md) |
+| マルチランタイム | 12 のランタイム ID:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode と OpenAI-compat。自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [docs/features/13](docs/features/ja-JP/13-multi-runtime.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP サーバー | 247 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート。外部クライアントのキーは既定で 7 つの基本ツールのみ使え、オペレーターがメモリ・wiki・メッセージ系のスコープを追加付与できる。コネクタ・実行系・管理系のツールは外部に公開しない | [docs/api](docs/api/README.md) |
 | メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
 | 自己進化 | 予測駆動(設計上、多くの会話は LLM を呼ばずに終わる)+ AEE playbook 進化:SOUL.md はエージェントに対して読み取り専用。学習するのは各々 eval ケースに紐づく小さなルールで、現在の playbook 以上の場合のみコミットされ、24 時間後にルールごとに清算される。MistakeNotebook のターン横断メモリ | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス(エージェントごと、既定オフ)、コンテナサンドボックス(タスクサンドボックスは Docker のみで既定オフ、スクリプトサンドボックスは Docker で Windows では WSL2 を先に試行)、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
-| アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ。呼び出しごとに公式 CLI を新しいプロセスで実行(PTY セッションプールは 2026-09 に削除。Grok など TTY が必要な CLI には単発の疑似端末を使う)。Anthropic の[規約](https://code.claude.com/docs/en/legal-and-compliance)ではサードパーティ製品が Claude サブスクリプションの認証情報でリクエストを中継することは認められておらず、Google の Gemini CLI と Antigravity の規約でもサードパーティからサブスクリプションの OAuth でアクセスするとアカウントの停止または終了の理由になり得るとされているため、API キーを使ってください。サブスクリプションでのログインはリスクへの明示的な同意のうえで引き続き使えます([multi-runtime](docs/features/ja-JP/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
+| アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ。呼び出しごとに公式 CLI を新しいプロセスで実行(PTY セッションプールは 2026-09 に削除。Grok など TTY が必要な CLI には単発の疑似端末を使う)。Anthropic の[規約](https://code.claude.com/docs/en/legal-and-compliance)ではサードパーティ製品が Claude サブスクリプションの認証情報でリクエストを中継することは認められておらず、Google の Antigravity の規約でもサードパーティからサブスクリプションの OAuth でアクセスするとアカウントの停止または終了の理由になり得るとされているため、API キーを使ってください。サブスクリプションでのログインはリスクへの明示的な同意のうえで引き続き使えます([multi-runtime](docs/features/ja-JP/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
 | ローカル推論 | OpenAI 互換のローカルサーバー(llama-server / Ollama / vLLM / SGLang)または llamafile、3 段階の信頼度ルーティング | [docs/features](docs/features/README.md) |
 | ファインチューニング | この機械の会話・仕事の成果・承認判断から SFT / DPO データセット(ShareGPT / Alpaca)を構築し、自前の GPU 機(SSH + LLaMA-Factory)または Together のクラウドで学習、GGUF / LoRA をローカルモデルディレクトリへ取り込み。ローカル学習は行わず(内蔵グラフィックスでは不可)、データが機械を出るときは明示的な同意が必要 | [docs/features/54](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:進行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write 隔離、AI ジャッジが勝者を選んでマージ(デフォルト無効。v1.67.0 では Windows で有効にしないこと、CHANGELOG 参照) | [docs/rfc](docs/rfc) |
@@ -265,7 +267,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 |---|---|---|---|---|
 | 言語 | Rust | TypeScript | Rust | Python |
 | チャネル | 11 | 25+ | 8 | 0(API)|
-| マルチランタイム | 13 のランタイム ID(12 CLI + OpenAI-compat) | 単一 | 単一 | マルチ LLM |
+| マルチランタイム | 12 のランタイム ID(11 CLI + OpenAI-compat) | 単一 | 単一 | マルチ LLM |
 | MCP サーバー | 247 ツール | なし | なし | なし |
 | 自己進化エンジン | AEE playbook ルール(予測駆動) | なし | なし | なし |
 | ローカル推論 | OpenAI 互換ローカルサーバー / llamafile + 信頼度ルーティング | なし | なし | なし |

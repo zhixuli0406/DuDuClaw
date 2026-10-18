@@ -20,7 +20,7 @@
 | 10 | [認知メモリシステム](10-cognitive-memory.md) | 忘却曲線を備えた人間型記憶 |
 | 11 | [プロンプト予算の強制](11-token-compression.md) | 見積もり、3段階、それでも駄目なら拒否 |
 | 12 | [業種テンプレートとOdoo ERP連携](12-industry-templates.md) | すぐに使えるビジネスインテリジェンス |
-| 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI互換など複数バックエンドを統一（Gemini CLI は非推奨） |
+| 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI互換など複数バックエンドを統一（Gemini CLI は削除済み） |
 | 14 | [音声パイプライン](14-voice-pipeline.md) | 別々に配線された2つの STT/TTS 経路：fail-closed な HTTP と、ハードコードされた Telegram ハンドラ |
 | 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 6段階の自動スキル抽出・管理 |
 | 16 | [セッションメモリスタック](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |

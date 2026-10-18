@@ -48,6 +48,12 @@ impl MethodHandler {
                 return WsFrame::error_response("", &no_login_message(runtime_str, runtime.spec()));
             }
         };
+        if !spec.remote_safe {
+            return WsFrame::error_response(
+                "",
+                "此 CLI 登入需要 localhost callback，Dashboard 無法可靠完成；請在 CLI 所在電腦的終端登入，或改用該 CLI 的 API key。",
+            );
+        }
 
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let session = match crate::cli_auth::AuthSession::spawn(
@@ -122,6 +128,7 @@ impl MethodHandler {
                 "remote_safe": spec.remote_safe,
                 "hint": spec.hint,
                 "status": "running",
+                "output": session.output_snapshot(),
             }),
         )
     }
@@ -198,6 +205,7 @@ impl MethodHandler {
             json!({
                 "session_id": sid,
                 "status": session.status().as_str(),
+                "output": session.output_snapshot(),
             }),
         )
     }

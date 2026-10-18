@@ -39,8 +39,8 @@
   ウント、いくつかの設定を行います。liveインストーラーISOもグラフィカ
   ルなウィザード形式です。
 - **AI ランタイムの認証**——ウィザードの 1 ステップで、イメージがランタ
-  イムを同梱している AI サービスを一覧します(Claude Code、Codex、
-  Gemini CLI（非推奨）、Grok、Qwen、Kimi、Copilot、Cursor、Mistral Vibe、
+  イムを同梱している AI サービスを一覧します(Claude Code、Codex、Antigravity、
+  Grok、Qwen、Kimi、Copilot、Cursor、Mistral Vibe、
   OpenCode、および API キーのみの各社。Kiro はサポート対象のランタイムで
   すが、imageには意図的に同梱されていません)。各行には未設定 / キー保存済み /
   ログイン済みのいずれかが表示されます。API キーを貼り付ける(管理画面と
@@ -49,7 +49,7 @@
   グインを実行し、デバイスコードとログイン URL を画面に表示して、マシン
   のブラウザで開くボタンも用意します。消費者向けサブスクリプションでロ
   グインする場合は事前にリスクを表示し、同意にチェックするまで開始しま
-  せん。Anthropic の規約と Google の Gemini CLI・Antigravity の規約は、
+  せん。Anthropic の規約と Google の Antigravity の規約は、
   第三者製品がサブスクリプションの資格情報を使うことを制限しており、ア
   カウントが制限・停止・終了される場合があるとしているため、API キーの
   利用を推奨します（各ベンダーの出典は[マルチランタイム](13-multi-runtime.md#サブスクリプションログインのリスク開示)を参照）。このステップは

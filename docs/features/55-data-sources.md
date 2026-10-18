@@ -67,7 +67,7 @@ Everything else — `initialize`, `tools/list`, notifications, upstream-initiate
 
 - **HTTP/SSE MCP servers.** There's no child process to wrap, so the rewrite leaves them untouched and logs a warning — their tool results reach the model unredacted.
 - *(No longer a gap: the PTY session pool was removed in 2026-09, so every Claude spawn is a per-call spawn the rewrite already hooks.)*
-- **codex / gemini / antigravity.** Their own MCP registration is not routed through the proxy at all yet.
+- **codex / antigravity.** Their own MCP registration is not routed through the proxy at all yet.
 
 ---
 
@@ -505,7 +505,7 @@ A channel attachment needs no `db_sources` grant and no connection string — th
 
 ## Boundaries
 
-- **Three gaps remain, honestly enumerated.** HTTP/SSE MCP servers (no child process to wrap; a warning is logged). The codex / gemini / antigravity runtimes — their own MCP registration doesn't route through the proxy at all. And the local-inference tool loop (`local_llm.rs`) — a locally-hosted model's tool calls reach neither the proxy nor the `ToolInterceptor`. Channel replies (fresh spawn and one-shot PTY) and dispatch / cron / heartbeat / goal-loop turns are covered; these three are not. (A fourth gap, the PTY session pool, disappeared when that pool was removed in 2026-09.)
+- **Three gaps remain, honestly enumerated.** HTTP/SSE MCP servers (no child process to wrap; a warning is logged). The codex / antigravity runtimes — their own MCP registration doesn't route through the proxy at all. And the local-inference tool loop (`local_llm.rs`) — a locally-hosted model's tool calls reach neither the proxy nor the `ToolInterceptor`. Channel replies (fresh spawn and one-shot PTY) and dispatch / cron / heartbeat / goal-loop turns are covered; these three are not. (A fourth gap, the PTY session pool, disappeared when that pool was removed in 2026-09.)
 - **The registry describes shape, not semantics.** A `record_paths` or `table_arg` typo doesn't quietly under-protect a column — a wrong entry either fails to load (fail-closed) or matches nothing, which `試跑` will show you as zero hits.
 - **`db_query` only exists where an operator explicitly said `allowed_tables = ["*"]`.** There is no partial or best-effort enforcement of an allowlist against arbitrary SQL — the design refuses the whole tool rather than pretend to filter it.
 - **A pool is opened per call**, not cached — the right trade for a tool an agent calls a handful of times per turn, and it means a credential rotation or a config edit takes effect immediately, with no gateway restart.

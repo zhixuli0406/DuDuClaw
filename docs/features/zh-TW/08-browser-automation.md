@@ -182,7 +182,7 @@ allowed_domains = []        # computer_navigate 可開啟的網站；空白 = �
 
 - `computer_use = false`（預設）時，gateway 不會替該員工啟動電腦操作 session，八個 `computer_*` 工具會從 `tools/list` 隱藏，直接呼叫也會被拒絕，且是 fail-closed 檢查：檔案不存在、TOML 壞掉、鍵的型別不對，三者一律拒絕。gateway 在 session 期間會重新讀取這個設定；關閉後，session 在下一個操作時結束。
 - `denied_tools` 會以 `--disallowedTools` 傳給 CLI，**同時**在 MCP 分派總門強制。
-- `browser_via_bash` 已不再設任何環境旗標。過去讀 `DUDUCLAW_BROWSER_VIA_BASH` 的 `bash-gate.sh` 白名單，已隨其他 shell hook 一起在 `ba015a48` 移除。這個 capability 仍然有效：它餵給 `disallowed_tools()` 與 `CapabilitiesConfig::sandbox_level()`，後者是 codex 與 gemini runtime 決定 `ReadOnly` 還是 `WorkspaceWrite` 沙盒的依據。
+- `browser_via_bash` 已不再設任何環境旗標。過去讀 `DUDUCLAW_BROWSER_VIA_BASH` 的 `bash-gate.sh` 白名單，已隨其他 shell hook 一起在 `ba015a48` 移除。這個 capability 仍然有效：它餵給 `disallowed_tools()` 與 `CapabilitiesConfig::sandbox_level()`，runtime 藉它決定 `ReadOnly` 還是 `WorkspaceWrite` 沙盒的依據。
 - 只存在於那個死路由器欄位上的限制（信任／封鎖網域、每 session 頁數上限）從未以那種形式實作。現在有的是：逐員工網站白名單（上面的 `allowed_domains`）、session 動作額度、聊天中的高風險確認，以及透過 `ApprovalBroker` 與 `agent.toml [capabilities] approval_required_tools`／`irreversible_tools`／`maybe_irreversible_tools` 的審批閘，這個審批閘對 `computer_*` 工具和其他工具一視同仁。截圖稽核不是開關：一律會寫（見下方稽核日誌一項）。
 
 ---

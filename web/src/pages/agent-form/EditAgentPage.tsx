@@ -102,7 +102,7 @@ import {
 import { ToolNameListField, TypedKvTable } from './v168-controls';
 import { ActionRulesEditor } from './ActionRulesEditor';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
-import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
 
 /**
@@ -920,14 +920,13 @@ export function EditAgentPage() {
   ];
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
   const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
-  // A saved deprecated runtime (e.g. gemini) is no longer offered, but stays
-  // visible and labelled so the current value is shown and can be kept.
-  const withSavedDeprecated = (opts: SelectOption[], saved: string | undefined): SelectOption[] =>
-    saved && isDeprecatedRuntime(saved) && !opts.some((o) => o.value === saved)
-      ? [...opts, { value: saved, label: `${intl.formatMessage({ id: `agents.runtime.provider.${saved}` })} (${intl.formatMessage({ id: 'common.deprecated' })})`, raw: saved }]
+  // Show an old saved runtime for migration without offering it as a new choice.
+  const withSavedRemoved = (opts: SelectOption[], saved: string | undefined): SelectOption[] =>
+    saved && isRemovedRuntime(saved) && !opts.some((o) => o.value === saved)
+      ? [...opts, { value: saved, label: `${intl.formatMessage({ id: `agents.runtime.provider.${saved}` })} (${intl.formatMessage({ id: 'common.removed' })})`, raw: saved }]
       : opts;
-  const providerPickerOptions = withSavedDeprecated(providerOptions, runtime.provider);
-  const fallbackProviderOptions: SelectOption[] = withSavedDeprecated([
+  const providerPickerOptions = withSavedRemoved(providerOptions, runtime.provider);
+  const fallbackProviderOptions: SelectOption[] = withSavedRemoved([
     { value: '', label: intl.formatMessage({ id: 'agents.runtime.fallback.none' }), raw: '' },
     ...providerOptions,
   ], runtime.fallback);

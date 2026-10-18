@@ -8939,18 +8939,21 @@ async fn computer_workspaces_check(home: &std::path::Path) -> (String, CheckStat
     ("電腦操作工作區".to_string(), status, message)
 }
 
-/// Pure half of [`deprecated_runtime_check`]: one finding per agent field
-/// (`provider` / `fallback`) whose value is a deprecated runtime. Input rows
-/// are `(agent name, [runtime] provider, [runtime] fallback)` as written.
-/// Unknown values are not this check's business (the runtime reader already
-/// logs them loudly) and are skipped.
-fn deprecated_runtime_findings(
-    agents: &[(String, Option<String>, Option<String>)],
-) -> Vec<String> {
+/// One finding per removed or deprecated runtime value in an agent config.
+fn deprecated_runtime_findings(agents: &[(String, Option<String>, Option<String>)]) -> Vec<String> {
     use duduclaw_core::types::RuntimeType;
     let mut out = Vec::new();
     for (name, provider, fallback) in agents {
         for (field, value) in [("provider", provider), ("fallback", fallback)] {
+            if value
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("gemini"))
+            {
+                out.push(format!(
+                    "{name}: [runtime] {field} = \"gemini\" 已移除；請改成 \"antigravity\" 並確認模型可用"
+                ));
+                continue;
+            }
             let Some(rt) = value.as_deref().and_then(RuntimeType::parse) else {
                 continue;
             };
@@ -8967,12 +8970,16 @@ fn deprecated_runtime_findings(
     out
 }
 
-/// `duduclaw doctor` row (R1, 2026-10): agents whose `[runtime] provider` or
-/// `fallback` names a deprecated runtime. Reports, never rewrites — the value
-/// still works until the removal version.
+/// `duduclaw doctor` row for removed or deprecated agent runtime values.
 async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatus, String) {
-    let name = "已棄用的 runtime".to_string();
-    let pass = || (name.clone(), CheckStatus::Pass, "沒有員工使用已棄用的 runtime".to_string());
+    let name = "已移除或棄用的 runtime".to_string();
+    let pass = || {
+        (
+            name.clone(),
+            CheckStatus::Pass,
+            "沒有員工使用已移除或棄用的 runtime".to_string(),
+        )
+    };
     // No agents directory at all is an empty roster (nothing can be
     // deprecated); any other problem reading it stays a warning.
     match std::fs::symlink_metadata(home.join("agents")) {
@@ -9001,7 +9008,7 @@ async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatu
     }
     let mut lines = findings;
     lines.push(format!(
-        "設定仍可運作，移除版本前請遷移，步驟見 {}",
+        "請先修正設定，再確認實際使用的執行環境；遷移步驟見 {}",
         duduclaw_core::runtime_catalog::DEPRECATIONS_DOC
     ));
     (name, CheckStatus::Warn, lines.join("\n         "))
@@ -10217,15 +10224,13 @@ fn runtime_deprecation_notice(provider: duduclaw_core::types::RuntimeType) -> Op
 ///
 /// CLAUDE.md is always scaffolded (Claude Code compatibility is a project
 /// invariant, and `agy` shares the Claude-context lineage); Codex reads the
-/// AGENTS.md convention and Gemini CLI reads GEMINI.md, so those providers
-/// get the same content under their own filename.
+/// AGENTS.md convention, so it gets the same content under that filename.
 fn provider_context_filenames(
     provider: duduclaw_core::types::RuntimeType,
 ) -> &'static [&'static str] {
     use duduclaw_core::types::RuntimeType;
     match provider {
         RuntimeType::Codex => &["CLAUDE.md", "AGENTS.md"],
-        RuntimeType::Gemini => &["CLAUDE.md", "GEMINI.md"],
         // UNVERIFIED (R4): Grok CLI's context-file convention is unconfirmed;
         // scaffold the cross-CLI `AGENTS.md` alongside `CLAUDE.md` as the most
         // likely file the agent reads. GrokRuntime also embeds the system prompt
@@ -12549,14 +12554,14 @@ mod docker_doctor_row_tests {
     }
 }
 
-/// R1 (2026-10) — `duduclaw doctor`'s deprecated-runtime row and the
-/// `agent create --runtime gemini` notice.
+/// `duduclaw doctor` reports removed Gemini CLI configuration and
+/// `agent create --runtime gemini` refuses the removed runtime.
 #[cfg(test)]
 mod deprecated_runtime_doctor_tests {
     use super::*;
 
     #[test]
-    fn doctor_findings_list_only_deprecated_provider_and_fallback() {
+    fn doctor_findings_list_only_removed_provider_and_fallback() {
         let rows = vec![
             ("a".to_string(), Some("gemini".to_string()), None),
             ("b".to_string(), Some("claude".to_string()), Some("gemini".to_string())),
@@ -12566,16 +12571,25 @@ mod deprecated_runtime_doctor_tests {
         ];
         let f = deprecated_runtime_findings(&rows);
         assert_eq!(f.len(), 2, "{f:?}");
-        assert!(f[0].starts_with("a: [runtime] provider = \"gemini\""), "{f:?}");
-        assert!(f[1].starts_with("b: [runtime] fallback = \"gemini\""), "{f:?}");
-        assert!(f.iter().all(|l| l.contains("antigravity") && l.contains("v1.75.0")));
+        assert!(
+            f[0].starts_with("a: [runtime] provider = \"gemini\""),
+            "{f:?}"
+        );
+        assert!(
+            f[1].starts_with("b: [runtime] fallback = \"gemini\""),
+            "{f:?}"
+        );
+        assert!(
+            f.iter()
+                .all(|l| l.contains("已移除") && l.contains("antigravity"))
+        );
     }
 
     #[tokio::test]
     async fn doctor_deprecated_runtime_row_passes_on_an_empty_home() {
         let tmp = tempfile::tempdir().unwrap();
         let (name, status, detail) = deprecated_runtime_check(tmp.path()).await;
-        assert_eq!(name, "已棄用的 runtime");
+        assert_eq!(name, "已移除或棄用的 runtime");
         assert_eq!(status, CheckStatus::Pass, "{detail}");
     }
 
@@ -12596,14 +12610,11 @@ mod deprecated_runtime_doctor_tests {
     }
 
     #[test]
-    fn agent_create_notice_only_for_deprecated_runtimes() {
+    fn removed_gemini_runtime_is_rejected_by_agent_create() {
         use duduclaw_core::types::RuntimeType;
-        let n = runtime_deprecation_notice(RuntimeType::Gemini).expect("gemini warns");
-        assert!(n.contains("antigravity") && n.contains("v1.75.0"), "{n}");
         assert!(runtime_deprecation_notice(RuntimeType::Antigravity).is_none());
         assert!(runtime_deprecation_notice(RuntimeType::Claude).is_none());
-        // Still accepted by the strict parser.
-        assert_eq!(parse_runtime_provider_strict("gemini").unwrap(), RuntimeType::Gemini);
+        assert!(parse_runtime_provider_strict("gemini").is_err());
     }
 }
 
@@ -12865,10 +12876,6 @@ mod agent_scaffold_tests {
             provider_context_filenames(RuntimeType::Codex),
             &["CLAUDE.md", "AGENTS.md"]
         );
-        assert_eq!(
-            provider_context_filenames(RuntimeType::Gemini),
-            &["CLAUDE.md", "GEMINI.md"]
-        );
         // agy reads the Claude-context lineage — no extra file.
         assert_eq!(
             provider_context_filenames(RuntimeType::Antigravity),
@@ -12891,10 +12898,7 @@ mod agent_scaffold_tests {
             parse_runtime_provider_strict("codex").unwrap(),
             RuntimeType::Codex
         );
-        assert_eq!(
-            parse_runtime_provider_strict("Gemini").unwrap(),
-            RuntimeType::Gemini
-        );
+        assert!(parse_runtime_provider_strict("Gemini").is_err());
         assert_eq!(
             parse_runtime_provider_strict("agy").unwrap(),
             RuntimeType::Antigravity

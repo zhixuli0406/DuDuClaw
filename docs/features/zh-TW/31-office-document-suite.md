@@ -28,7 +28,7 @@ DuDuClaw 的 agent 能產出真正的辦公檔案:Word(`.docx`)、Excel(`.xlsx`)
 
 ## 為什麼用 marker,不用猜的
 
-回覆文字是所有 runtime 共用的唯一交接點:Claude CLI、Codex、Gemini、direct API。在回覆裡放 marker,讓*模型*宣告意圖,而*gateway* 保有「什麼東西真的離開沙盒」的最終權威。另一條路(由 gateway 從散文推斷交付物)正是這套協議要避免的失效模式。
+回覆文字是所有 runtime 共用的唯一交接點:Claude CLI、Codex、Antigravity、direct API。在回覆裡放 marker,讓*模型*宣告意圖,而*gateway* 保有「什麼東西真的離開沙盒」的最終權威。另一條路(由 gateway 從散文推斷交付物)正是這套協議要避免的失效模式。
 
 這套協議原本只寫在 office skill 的 SKILL.md 裡,一次真實事故(2026-07-28)暴露了缺口:agent 產出了真正的 `.docx`,寫到 `~/Desktop`,卻始終沒有輸出 marker。使用者收到一段聲稱檔案存在的文字;gateway 沒有東西可送、可歸檔。於是落地了兩個修法:
 

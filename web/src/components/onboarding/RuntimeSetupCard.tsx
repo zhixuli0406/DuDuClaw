@@ -60,7 +60,6 @@ const MAX_OUTPUT = 8000;
 const PROVIDER_DOCS: Record<RuntimeSetupProvider, string> = {
   claude: 'https://docs.anthropic.com/en/docs/claude-code',
   codex: 'https://github.com/openai/codex',
-  gemini: 'https://github.com/google-gemini/gemini-cli',
   antigravity: 'https://antigravity.google/docs/cli',
   grok: 'https://docs.x.ai/build/cli',
 };
