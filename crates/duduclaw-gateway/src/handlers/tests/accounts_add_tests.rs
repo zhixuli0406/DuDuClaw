@@ -392,7 +392,7 @@ async fn remove_account_deletes_only_its_configured_credential() {
     assert_eq!(accounts[0]["id"].as_str(), Some("second"));
     assert_eq!(accounts[0]["api_key_enc"].as_str(), Some("cipher-second"));
     assert!(!after.contains("cipher-first"));
-    assert!(after.contains("# Preserve this comment"));
+    assert_eq!(after.matches("# Preserve this comment").count(), 1);
 }
 
 #[tokio::test]

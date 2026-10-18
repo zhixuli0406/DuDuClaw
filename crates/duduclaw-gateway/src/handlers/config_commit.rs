@@ -278,7 +278,14 @@ pub(crate) fn render_preserving(original_text: &str, new_table: &toml::Table) ->
     let mut doc: toml_edit::DocumentMut =
         original_text.parse().map_err(|e: toml_edit::TomlError| unparsable(&e))?;
     sync_table(doc.as_table_mut(), &old, new_table, false);
-    let rendered = doc.to_string();
+    let mut rendered = doc.to_string();
+    // toml_edit attaches a document's opening comments to its first item.
+    // Removing that item (for example, the first [[accounts]] entry) would
+    // otherwise discard the document header along with it.
+    let header = leading_comment_header(original_text);
+    if !header.is_empty() && !rendered.starts_with(header) {
+        rendered.insert_str(0, header);
+    }
     match rendered.parse::<toml::Table>() {
         Ok(back) if &back == new_table => Ok(rendered),
         _ => {
@@ -286,6 +293,19 @@ pub(crate) fn render_preserving(original_text: &str, new_table: &toml::Table) ->
             pretty()
         }
     }
+}
+
+fn leading_comment_header(text: &str) -> &str {
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.trim().is_empty() || trimmed.starts_with('#') {
+            end += line.len();
+        } else {
+            break;
+        }
+    }
+    &text[..end]
 }
 
 /// Bring `dst` (whose current content is `old`) to `new`, touching only the
@@ -680,6 +700,18 @@ name = "oa1"
             );
         });
         assert_eq!(tweaked, FIXTURE.replace("https://example.com", "https://example.org"));
+    }
+
+    #[test]
+    fn removing_first_array_table_keeps_document_header_once() {
+        let original = "# Config header\n\n[[accounts]]\nid = 'first'\n\n[[accounts]]\nid = 'second'\n";
+        let mut table: toml::Table = original.parse().unwrap();
+        table.get_mut("accounts").unwrap().as_array_mut().unwrap().remove(0);
+        let out = render_preserving(original, &table).unwrap();
+        assert!(out.starts_with("# Config header\n\n"), "{out}");
+        assert_eq!(out.matches("# Config header").count(), 1);
+        assert!(!out.contains("id = 'first'"));
+        assert_eq!(out.parse::<toml::Table>().unwrap(), table);
     }
 
     #[test]
