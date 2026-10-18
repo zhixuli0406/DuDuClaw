@@ -207,6 +207,15 @@ pub(super) async fn reconcile_with(
             return None;
         }
     };
+    if st.observation_unavailable() {
+        warn!(
+            context,
+            "maintenance: reconciliation got an incomplete status"
+        );
+        // Known pending-cleanup/audit facts may explain a busy reply, but
+        // incomplete observations cannot authorize orphan cleanup.
+        return Some(st);
+    }
     let explained = explained_by_open_row(store, &st).await;
     reconcile_reply(store, audit, sysd, &st, explained, context, notices).await;
     Some(st)
@@ -261,9 +270,6 @@ async fn reconcile_reply(
 /// revoke a window the OS already closed (sysd deadline, PID 1 timer, sysd
 /// restart cleanup).
 pub async fn poll_sysd(env: &MaintEnv) -> SysdSupport {
-    let SysdAccess::Available(sysd) = env.sysd.access() else {
-        return SysdSupport::Current;
-    };
     let (store, audit) = match (env.store(), env.audit()) {
         (Ok(s), Ok(a)) => (s, a),
         (Err(e), _) | (_, Err(e)) => {
@@ -272,50 +278,119 @@ pub async fn poll_sysd(env: &MaintEnv) -> SysdSupport {
         }
     };
     let mut notices = Vec::new();
-    {
+    let support = {
         // The status call runs under the lock: an answer taken before an
         // enable finished could otherwise revoke the window it just opened.
         let _guard = WINDOW_LOCK.lock().await;
-        let st = match sysd.ssh_maint_status().await {
-            Ok(out) if out.success => match StatusReply::parse(&out.stdout) {
-                Ok(st) => st,
-                Err(e) => {
-                    warn!(error = %e, "maintenance: unreadable ssh_maint_status");
-                    return SysdSupport::Current;
-                }
-            },
-            Ok(out) => {
-                warn!(stderr = %out.stderr.trim(), "maintenance: ssh_maint_status failed");
-                return SysdSupport::Current;
-            }
-            Err(SysdCallError::UnknownVerb) => return SysdSupport::Old,
+        poll_sysd_guarded(env, &store, &audit, &mut notices).await
+    };
+    env.send(notices).await;
+    support
+}
+
+/// The caller holds WINDOW_LOCK through the observation and its ledger
+/// transition. Notices are delivered only after that reservation is released.
+async fn poll_sysd_guarded(
+    env: &MaintEnv,
+    store: &MaintenanceStore,
+    audit: &MaintenanceAuditLog,
+    notices: &mut Vec<String>,
+) -> SysdSupport {
+    let sysd = match env.sysd.access() {
+        SysdAccess::OffAppliance => return SysdSupport::Current,
+        SysdAccess::Unreachable(_) => {
+            mark_status_unconfirmed(store, audit, notices).await;
+            return SysdSupport::Current;
+        }
+        SysdAccess::Available(sysd) => sysd,
+    };
+    let st = match sysd.ssh_maint_status().await {
+        Ok(out) if out.success => match StatusReply::parse(&out.stdout) {
+            Ok(st) => st,
             Err(e) => {
-                warn!(error = %e, "maintenance: ssh_maint_status unavailable");
+                warn!(error = %e, "maintenance: unreadable ssh_maint_status");
+                mark_status_unconfirmed(store, audit, notices).await;
                 return SysdSupport::Current;
             }
-        };
-        let explained = explained_by_open_row(&store, &st).await;
-        reconcile_reply(
-            &store,
-            &audit,
-            sysd.as_ref(),
-            &st,
-            explained,
-            "poll",
-            &mut notices,
-        )
-        .await;
-        if st.definitely_closed() {
-            revoke_if_closed_by_os(&store, &audit, sysd.as_ref(), &st, &mut notices).await;
-            if !st.pending_cleanup && st.observed_active() == Some(false) {
-                if let Err(e) = store.confirm_ssh_closed().await {
-                    warn!(error = %e, "maintenance: could not persist a confirmed SSH close");
+        },
+        Ok(out) => {
+            warn!(stderr = %out.stderr.trim(), "maintenance: ssh_maint_status failed");
+            mark_status_unconfirmed(store, audit, notices).await;
+            return SysdSupport::Current;
+        }
+        Err(SysdCallError::UnknownVerb) => return SysdSupport::Old,
+        Err(e) => {
+            warn!(error = %e, "maintenance: ssh_maint_status unavailable");
+            mark_status_unconfirmed(store, audit, notices).await;
+            return SysdSupport::Current;
+        }
+    };
+    if st.observation_unavailable() {
+        mark_status_unconfirmed(store, audit, notices).await;
+        return SysdSupport::Current;
+    }
+    let explained = explained_by_open_row(store, &st).await;
+    // A running SSH server alone is not recovery: it must be the same
+    // completed window and key, with a reliable active observation.
+    if st.ready
+        && st.key_installed == Some(true)
+        && st.observed_active() == Some(true)
+        && !st.pending_cleanup
+    {
+        if let Ok(Some(row)) = store.current_row().await {
+            if row.is_keyed_ssh_window()
+                && st.window_id.as_deref() == Some(row.id.as_str())
+                && st.key_fingerprint == row.ssh_key_fingerprint
+            {
+                if let Err(e) = store.confirm_ssh_status_recovered(&row.id).await {
+                    warn!(error = %e, "maintenance: could not persist SSH status recovery");
                 }
             }
         }
     }
-    env.send(notices).await;
+    reconcile_reply(store, audit, sysd.as_ref(), &st, explained, "poll", notices).await;
+    if st.definitely_closed() {
+        revoke_if_closed_by_os(store, audit, sysd.as_ref(), &st, notices).await;
+        if !st.pending_cleanup && st.observed_active() == Some(false) {
+            if let Err(e) = store.confirm_ssh_closed().await {
+                warn!(error = %e, "maintenance: could not persist a confirmed SSH close");
+            }
+        }
+    }
     SysdSupport::Current
+}
+
+/// Persist the notice reservation before delivery, so repeated polls and
+/// reopened connections cannot flood Admins during the same outage. Never
+/// infer an OS close or change window authority from a missing observation.
+async fn mark_status_unconfirmed(
+    store: &MaintenanceStore,
+    audit: &MaintenanceAuditLog,
+    notices: &mut Vec<String>,
+) {
+    let row = match store.current_row().await {
+        Ok(Some(row)) if row.is_keyed_ssh_window() => row,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(error = %e, "maintenance: could not read SSH window during sysd outage");
+            return;
+        }
+    };
+    match store.mark_ssh_status_unconfirmed(&row.id).await {
+        Ok(true) => {
+            audit.record(
+                "ssh_reconcile_unconfirmed",
+                json!({
+                    "context": "poll", "window_id": row.id,
+                    "key_fingerprint": row.ssh_key_fingerprint,
+                    "reason": "sysd_status_unavailable",
+                }),
+            );
+            notices.push(notify::close_unconfirmed_text(&row.id));
+        }
+        Ok(false) => {}
+        Err(e) => warn!(error = %e, "maintenance: could not persist unconfirmed SSH status"),
+    }
 }
 
 /// The key is gone on the sysd side. When sysd's own close left something

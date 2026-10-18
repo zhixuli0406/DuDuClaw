@@ -10,12 +10,17 @@ pub async fn status_json(env: &MaintEnv, caller: Option<&str>) -> Result<Value, 
     let store = MaintenanceStore::open(&env.home_dir)?;
     let now = Utc::now();
     let row = store.current_row().await?;
+    let keyed_ssh_window = row
+        .as_ref()
+        .is_some_and(MaintenanceWindow::is_keyed_ssh_window);
     let shown = row.filter(|w| w.is_active(now) || w.state == WindowState::Opening);
     let active = shown.as_ref().is_some_and(|w| w.is_active(now));
     let unresolved_close = store.has_unconfirmed_close().await?;
 
-    let (ssh, observed, confirmed_closed, pending_cleanup) = ssh_status(env).await;
-    let close_unconfirmed = pending_cleanup || (unresolved_close && !confirmed_closed);
+    let (ssh, observed, confirmed_closed, pending_cleanup, unavailable) = ssh_status(env).await;
+    let close_unconfirmed = pending_cleanup
+        || (unresolved_close && !confirmed_closed)
+        || (keyed_ssh_window && unavailable);
 
     let mut body = json!({
         "active": active,
@@ -53,8 +58,9 @@ pub async fn status_json(env: &MaintEnv, caller: Option<&str>) -> Result<Value, 
     Ok(body)
 }
 
-/// `(ssh object, ssh_observed_active, sysd confirmed nothing is open, pending_cleanup)`.
-async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
+/// `(ssh object, observed active, confirmed closed, pending cleanup, unavailable)`.
+/// Unsupported/off-appliance is not an unavailable keyed-window observation.
+async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool, bool) {
     let base = |supported: Value, reachable: bool, reason: &str| {
         json!({
             "supported": supported,
@@ -84,6 +90,7 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
                 None,
                 true,
                 false,
+                false,
             );
         }
         SysdAccess::Unreachable(_) => {
@@ -92,6 +99,7 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
                 None,
                 false,
                 false,
+                true,
             );
         }
         SysdAccess::Available(s) => s,
@@ -105,13 +113,14 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
                     None,
                     false,
                     false,
+                    true,
                 );
             }
         },
         Ok(out) => {
             let mut v = base(Value::Null, true, "status_failed");
             v["problems"] = json!([sanitize(&out.stderr, PROBLEM_TEXT_MAX_CHARS)]);
-            return (v, None, false, false);
+            return (v, None, false, false, true);
         }
         // Old sysd: no keyed windows exist; the legacy probe still reports
         // whether an SSH server happens to run.
@@ -119,6 +128,7 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
             return (
                 base(json!(false), true, "sysd_too_old"),
                 ssh_service_observed_active().await,
+                false,
                 false,
                 false,
             );
@@ -129,10 +139,12 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
                 None,
                 false,
                 false,
+                true,
             );
         }
     };
     let observed = st.observed_active();
+    let unavailable = st.observation_unavailable();
     let confirmed_closed = st.definitely_closed() && observed == Some(false);
     let sessions: Vec<Value> = st
         .sessions
@@ -159,5 +171,11 @@ async fn ssh_status(env: &MaintEnv) -> (Value, Option<bool>, bool, bool) {
         "problems": st.problems.iter().map(|p| sanitize(p, PROBLEM_TEXT_MAX_CHARS)).collect::<Vec<_>>(),
         "host_key_fingerprints": st.host_key_fingerprints.iter().map(|f| sanitize(f, EVENT_TEXT_MAX_CHARS)).collect::<Vec<_>>(),
     });
-    (ssh, observed, confirmed_closed, st.pending_cleanup)
+    (
+        ssh,
+        observed,
+        confirmed_closed,
+        st.pending_cleanup,
+        unavailable,
+    )
 }
