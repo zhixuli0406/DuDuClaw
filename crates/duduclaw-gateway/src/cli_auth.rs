@@ -1,6 +1,6 @@
 //! Interactive CLI authentication — **"Dashboard 一鍵登入" for every AI CLI**.
 //!
-//! Each AI CLI (Claude / Codex / Gemini / Grok …) ships its own native
+//! Supported AI CLIs (Claude / Codex / Grok and others) ship their own native
 //! login command (Antigravity does not — `agy` signs in through its interactive
 //! TUI, so its catalog login method is `None`). This module drives that
 //! command inside a PTY, streams its output to the dashboard, and relays the

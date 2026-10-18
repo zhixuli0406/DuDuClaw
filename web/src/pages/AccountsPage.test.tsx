@@ -48,7 +48,7 @@ describe('AccountsPage (MDS)', () => {
     expect(screen.queryByRole('button', { name: /Antigravity/i })).not.toBeInTheDocument();
   });
 
-  it('does not offer Gemini in the one-click-login CLI picker (the Gemini CLI is deprecated)', async () => {
+  it('does not offer the removed Gemini CLI in the one-click-login picker', async () => {
     const user = userEvent.setup();
     renderWithProviders(<AccountsPage />);
 
