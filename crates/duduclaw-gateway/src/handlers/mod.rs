@@ -420,6 +420,16 @@ impl MethodHandler {
             return login_required_reject_frame();
         }
 
+        // Bootstrap and legacy token connections share user_id "system".
+        // Interactive login can print a long-lived provider token, so real
+        // WebSocket sessions need an individually identified Dashboard user.
+        if ctx.user_id == "system" && conn.peer.is_some()
+            && (method.starts_with("auth.cli_login.")
+                || method.starts_with("accounts.setup_token_"))
+        {
+            return WsFrame::error_response("", "請使用 Dashboard 帳號登入後再連接 CLI。");
+        }
+
         // ── Forced password-change gate ─────────────────────────────────
         // Runs FIRST — before the edition gate, before the plugin extension
         // dispatch, before the method match. Which features exist has no

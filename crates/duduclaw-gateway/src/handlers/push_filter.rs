@@ -185,7 +185,8 @@ impl PushGate {
         // PTY output can contain a long-lived provider token. Even another
         // Admin must never receive a login transcript they did not start.
         if is_login_transcript
-            && (!live.is_admin()
+            && (live.user_id == "system"
+                || !live.is_admin()
                 || payload.get("owner_user_id").and_then(Value::as_str)
                     != Some(live.user_id.as_str()))
         {
