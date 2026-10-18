@@ -250,7 +250,7 @@ pub struct MethodHandler {
     edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
-    cli_auth_sessions: RwLock<std::collections::HashMap<String, Arc<crate::cli_auth::AuthSession>>>,
+    cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
     /// WP-D: single global "訂閱帳號" setup-token wizard slot. Unlike
     /// `cli_auth_sessions` (many concurrent sessions, one per runtime login),
     /// this wizard is deliberately single-flight — a second `start` cancels

@@ -192,6 +192,26 @@ pub(crate) async fn commit_table_locked(path: &Path, expected_hash: String, tabl
     .map_err(|e| format!("config write task failed: {e}"))?
 }
 
+/// As above, but re-check an authorization condition inside the file lock,
+/// immediately before rendering and replacing a credential-bearing config.
+pub(crate) async fn commit_table_locked_with_guard(
+    path: &Path,
+    expected_hash: String,
+    table: &toml::Table,
+    guard: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let table = table.clone();
+    tokio::task::spawn_blocking(move || {
+        commit_rendered_locked(&path, &expected_hash, |current| {
+            guard()?;
+            render_preserving(current, &table)
+        })
+    })
+    .await
+    .map_err(|e| format!("config write task failed: {e}"))?
+}
+
 /// [`commit_text_locked`] with the new content computed from the current
 /// file text while the lock is held (and after the hash compare), so the
 /// render and the write see the same bytes.

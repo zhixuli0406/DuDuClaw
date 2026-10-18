@@ -15661,7 +15661,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     let mut event_rx = state.event_tx.subscribe();
     // Per-connection gate for broadcast events (task gate, employee binding,
     // admin-only kinds, lock screen); see `handlers/push_filter.rs`.
-    let mut push_gate = crate::handlers::PushGate::new(&state.home_dir, &user_ctx, pre_auth);
+    let mut push_gate = crate::handlers::PushGate::new_with_legacy(
+        &state.home_dir, &user_ctx, pre_auth, conn_info.legacy_admin_authenticated,
+    );
     let mut logs_subscribed = false;
 
     // ── P4-3+: OS-native live event tail (opt-in, admin-gated) ────────────

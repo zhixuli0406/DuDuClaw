@@ -11,7 +11,7 @@ impl MethodHandler {
     // setup-token`'s paste-back flow). See `setup_token_wizard.rs` for the
     // orchestration + the real-CLI-output findings behind its design.
 
-    pub(crate) async fn handle_accounts_setup_token_start(&self) -> WsFrame {
+    pub(crate) async fn handle_accounts_setup_token_start(&self, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, "claude") {
             return WsFrame::error_response("", &e);
         }
@@ -24,23 +24,24 @@ impl MethodHandler {
             );
         };
 
-        // Single concurrency: a second `start` cancels whatever is currently
-        // in progress (WP-D spec) rather than erroring — the previous flow's
-        // browser tab, if any, was abandoned anyway.
-        {
-            let mut guard = self.setup_token_session.write().await;
-            if let Some(old) = guard.take() {
-                info!(
-                    target: "setup_token_wizard",
-                    old_session = %old.session_id,
-                    "start: cancelling previous setup-token session"
-                );
-                old.session.kill();
-            }
-        }
-
         let session_id = uuid::Uuid::new_v4().simple().to_string();
-        let slot = match crate::setup_token_wizard::spawn_session(session_id.clone()) {
+        // Reserve the single slot under one lock. The same admin may restart;
+        // another admin cannot cancel or replace this person's login.
+        let mut guard = self.setup_token_session.write().await;
+        if super::accounts_add_rpc::CredentialWriteGuard::new(&self.home_dir, ctx, conn).verify_admin().is_err() {
+            return WsFrame::error_response("", "permission denied");
+        }
+        if guard.as_ref().is_some_and(|s| {
+            s.owner_user_id != ctx.user_id
+                && !s.is_expired()
+                && !s.session.status().is_terminal()
+        }) {
+            return WsFrame::error_response("", "另一位管理員正在連接訂閱帳號，請稍後再試。");
+        }
+        if let Some(old) = guard.take() {
+            old.session.kill();
+        }
+        let slot = match crate::setup_token_wizard::spawn_session(session_id.clone(), ctx.user_id.clone()) {
             Ok(s) => s,
             Err(crate::cli_auth::AuthError::NotInstalled) => {
                 return setup_token_error_frame(
@@ -57,12 +58,17 @@ impl MethodHandler {
             }
         };
 
+        *guard = Some(slot.clone());
+        drop(guard);
+
         // Bounded wait so the RPC returns the URL synchronously in the
         // common case; the dashboard falls back to polling `status` if the
         // CLI hasn't printed it yet.
         let auth_url = crate::setup_token_wizard::wait_for_auth_url(&slot.session).await;
 
-        *self.setup_token_session.write().await = Some(slot.clone());
+        if !self.setup_token_session.read().await.as_ref().is_some_and(|s| s.session_id == session_id) {
+            return setup_token_error_frame(crate::setup_token_wizard::SetupTokenErrorCode::NoActiveSession, "此連接流程已被取代，請重新開始。");
+        }
 
         WsFrame::ok_response(
             "",
@@ -75,13 +81,13 @@ impl MethodHandler {
         )
     }
 
-    pub(crate) async fn handle_accounts_setup_token_status(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_accounts_setup_token_status(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let session_id = params
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let guard = self.setup_token_session.read().await;
-        let Some(slot) = guard.as_ref().filter(|s| s.session_id == session_id) else {
+        let Some(slot) = guard.as_ref().filter(|s| s.session_id == session_id && s.owner_user_id == ctx.user_id) else {
             return setup_token_error_frame(
                 crate::setup_token_wizard::SetupTokenErrorCode::NoActiveSession,
                 "找不到這個連接流程，請重新開始。",
@@ -109,12 +115,20 @@ impl MethodHandler {
         )
     }
 
-    pub(crate) async fn handle_accounts_setup_token_cancel(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_accounts_setup_token_cancel(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let session_id = params
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if let Some(slot) = self.clear_setup_token_slot(session_id).await {
+        let slot = {
+            let mut guard = self.setup_token_session.write().await;
+            if guard.as_ref().is_some_and(|s| s.session_id == session_id && s.owner_user_id == ctx.user_id) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(slot) = slot {
             slot.session.kill();
         }
         WsFrame::ok_response("", json!({"success": true}))
@@ -140,7 +154,7 @@ impl MethodHandler {
     /// BEFORE persisting it via the existing `accounts.add` path. The token
     /// itself never appears in the response or in any log line here (see
     /// `setup_token_wizard.rs` module doc).
-    pub(crate) async fn handle_accounts_setup_token_submit(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_accounts_setup_token_submit(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, "claude") {
             return WsFrame::error_response("", &e);
         }
@@ -160,7 +174,7 @@ impl MethodHandler {
 
         let slot = {
             let guard = self.setup_token_session.read().await;
-            match guard.as_ref().filter(|s| s.session_id == session_id) {
+            match guard.as_ref().filter(|s| s.session_id == session_id && s.owner_user_id == ctx.user_id) {
                 Some(s) => s.clone(),
                 None => {
                     return setup_token_error_frame(
@@ -203,7 +217,23 @@ impl MethodHandler {
         // Every outcome (success or failure) retires this slot — a fresh
         // `start` is required to try again, matching the CLI's own terminal
         // status semantics (see `SetupTokenSlot::try_begin_submit` doc).
-        self.clear_setup_token_slot(&slot.session_id).await;
+        let still_current = {
+            let mut guard = self.setup_token_session.write().await;
+            if guard.as_ref().is_some_and(|s| s.session_id == slot.session_id && s.owner_user_id == ctx.user_id) {
+                guard.take();
+                true
+            } else {
+                false
+            }
+        };
+        if !still_current {
+            return setup_token_error_frame(crate::setup_token_wizard::SetupTokenErrorCode::NoActiveSession, "此連接流程已被取消或取代，請重新開始。");
+        }
+
+        let write_guard = super::accounts_add_rpc::CredentialWriteGuard::new(&self.home_dir, ctx, conn);
+        if write_guard.verify_admin().is_err() {
+            return WsFrame::error_response("", "permission denied");
+        }
 
         match outcome {
             crate::setup_token_wizard::SubmitOutcome::Validated(token) => {
@@ -219,7 +249,7 @@ impl MethodHandler {
                     "priority": 1,
                     "monthly_budget_cents": 0,
                 });
-                let res = self.handle_accounts_add(add).await;
+                let res = self.handle_accounts_add_authorized(add, ctx, conn).await;
                 crate::claude_runner::invalidate_rotator_cache().await;
                 match res {
                     WsFrame::Response { ok: true, .. } => {

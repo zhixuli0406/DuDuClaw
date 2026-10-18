@@ -14,8 +14,43 @@ fn account_table_for_edit(path: &Path) -> Result<(toml::Table, String), String> 
     Ok((table, super::config_commit::content_hash(&text)))
 }
 
-async fn commit_account_edit(path: &Path, hash: String, table: &toml::Table) -> Result<(), String> {
-    super::config_commit::commit_table_locked(path, hash, table).await
+#[derive(Clone)]
+pub(crate) struct CredentialWriteGuard {
+    home: PathBuf,
+    user_id: String,
+    legacy_admin_authenticated: bool,
+}
+
+impl CredentialWriteGuard {
+    pub(crate) fn new(home: &Path, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            user_id: ctx.user_id.clone(),
+            legacy_admin_authenticated: conn.legacy_admin_authenticated,
+        }
+    }
+
+    pub(crate) fn verify_admin(&self) -> Result<(), String> {
+        if self.user_id == "system" && self.legacy_admin_authenticated {
+            return Ok(());
+        }
+        let live = crate::review_evidence::audience::trusted_dashboard_principal(&self.home, &self.user_id)
+            .map_err(|_| "permission denied".to_string())?;
+        if live.is_admin() { Ok(()) } else { Err("permission denied".to_string()) }
+    }
+}
+
+async fn commit_account_edit(
+    path: &Path,
+    hash: String,
+    table: &toml::Table,
+    guard: Option<CredentialWriteGuard>,
+) -> Result<(), String> {
+    if let Some(guard) = guard {
+        super::config_commit::commit_table_locked_with_guard(path, hash, table, move || guard.verify_admin()).await
+    } else {
+        super::config_commit::commit_table_locked(path, hash, table).await
+    }
 }
 
 impl MethodHandler {
@@ -30,11 +65,25 @@ impl MethodHandler {
     /// `resolve_env_key`/`select_for_provider` would otherwise treat it as a
     /// pool nothing ever selects, a confusing way to fail.
     pub(crate) async fn handle_accounts_add(&self, params: Value) -> WsFrame {
-        self.handle_accounts_add_with_probe_base(
+        self.handle_accounts_add_with_probe_base_guard(
             params,
             duduclaw_agent::credential_probe::ANTHROPIC_API_BASE,
+            None,
         )
         .await
+    }
+
+    pub(crate) async fn handle_accounts_add_authorized(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+        conn: crate::power_local::RpcConnInfo,
+    ) -> WsFrame {
+        self.handle_accounts_add_with_probe_base_guard(
+            params,
+            duduclaw_agent::credential_probe::ANTHROPIC_API_BASE,
+            Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn)),
+        ).await
     }
 
     /// `accounts.add` with an injectable probe base URL (D6).
@@ -48,6 +97,15 @@ impl MethodHandler {
         &self,
         params: Value,
         probe_base: &str,
+    ) -> WsFrame {
+        self.handle_accounts_add_with_probe_base_guard(params, probe_base, None).await
+    }
+
+    pub(crate) async fn handle_accounts_add_with_probe_base_guard(
+        &self,
+        params: Value,
+        probe_base: &str,
+        guard: Option<CredentialWriteGuard>,
     ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
@@ -210,7 +268,7 @@ impl MethodHandler {
         }
         arr.push(toml::Value::Table(entry.table));
 
-        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
             return WsFrame::error_response("", &e);
         }
 
@@ -237,6 +295,14 @@ impl MethodHandler {
 
     /// Update the monthly budget for a specific account in config.toml.
     pub(crate) async fn handle_accounts_update_budget(&self, params: Value) -> WsFrame {
+        self.handle_accounts_update_budget_guard(params, None).await
+    }
+
+    pub(crate) async fn handle_accounts_update_budget_authorized(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
+        self.handle_accounts_update_budget_guard(params, Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn))).await
+    }
+
+    async fn handle_accounts_update_budget_guard(&self, params: Value, guard: Option<CredentialWriteGuard>) -> WsFrame {
         let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
             _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
@@ -283,7 +349,7 @@ impl MethodHandler {
             }
         }
 
-        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
             return WsFrame::error_response("", &e);
         }
 
@@ -309,6 +375,14 @@ impl MethodHandler {
     /// subscription?, label?, monthly_budget_cents? }`. Does NOT touch the
     /// account secret (use `accounts.add` to (re)set keys). Atomic write.
     pub(crate) async fn handle_accounts_update(&self, params: Value) -> WsFrame {
+        self.handle_accounts_update_guard(params, None).await
+    }
+
+    pub(crate) async fn handle_accounts_update_authorized(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
+        self.handle_accounts_update_guard(params, Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn))).await
+    }
+
+    async fn handle_accounts_update_guard(&self, params: Value, guard: Option<CredentialWriteGuard>) -> WsFrame {
         let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
@@ -374,7 +448,7 @@ impl MethodHandler {
             );
         }
 
-        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
             return WsFrame::error_response("", &e);
         }
 
@@ -393,6 +467,14 @@ impl MethodHandler {
     /// Remove one configured account and its stored credential. The CLI's own
     /// credential store is separate and is not affected by this RPC.
     pub(crate) async fn handle_accounts_remove(&self, params: Value) -> WsFrame {
+        self.handle_accounts_remove_guard(params, None).await
+    }
+
+    pub(crate) async fn handle_accounts_remove_authorized(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
+        self.handle_accounts_remove_guard(params, Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn))).await
+    }
+
+    async fn handle_accounts_remove_guard(&self, params: Value, guard: Option<CredentialWriteGuard>) -> WsFrame {
         let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
             _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
@@ -424,7 +506,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &message);
         }
         accounts.remove(matches[0]);
-        if let Err(e) = commit_account_edit(&config_path, config_hash, &table).await {
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
             return WsFrame::error_response("", &e);
         }
         crate::claude_runner::invalidate_rotator_cache().await;

@@ -41,13 +41,13 @@ async fn restricted_rejects_configuration_and_host_setup_before_side_effects() {
     );
     assert_refused(
         handler
-            .handle_cli_login_start(json!({"runtime":"claude"}))
+            .handle_cli_login_start(json!({"runtime":"claude"}), &UserContext::admin_fallback(), crate::power_local::RpcConnInfo::internal())
             .await,
     );
-    assert_refused(handler.handle_accounts_setup_token_start().await);
+    assert_refused(handler.handle_accounts_setup_token_start(&UserContext::admin_fallback(), crate::power_local::RpcConnInfo::internal()).await);
     assert_refused(
         handler
-            .handle_accounts_setup_token_submit(json!({"session_id":"none", "code":"none"}))
+            .handle_accounts_setup_token_submit(json!({"session_id":"none", "code":"none"}), &UserContext::admin_fallback(), crate::power_local::RpcConnInfo::internal())
             .await,
     );
     assert_refused(

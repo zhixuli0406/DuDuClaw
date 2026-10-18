@@ -140,6 +140,7 @@ impl SetupTokenErrorCode {
 #[derive(Clone)]
 pub struct SetupTokenSlot {
     pub session_id: String,
+    pub owner_user_id: String,
     pub session: Arc<AuthSession>,
     pub created_at: Instant,
     /// CAS guard so two concurrent `submit` calls on the same session can't
@@ -176,7 +177,7 @@ impl SetupTokenSlot {
 /// for installing it as the server's single active session (replacing /
 /// killing any prior one first — that single-concurrency policy lives in the
 /// RPC handler, not here, since it needs the server's lock).
-pub fn spawn_session(session_id: String) -> Result<SetupTokenSlot, AuthError> {
+pub fn spawn_session(session_id: String, owner_user_id: String) -> Result<SetupTokenSlot, AuthError> {
     let session = AuthSession::spawn(
         session_id.clone(),
         RuntimeType::Claude,
@@ -204,6 +205,7 @@ pub fn spawn_session(session_id: String) -> Result<SetupTokenSlot, AuthError> {
 
     Ok(SetupTokenSlot {
         session_id,
+        owner_user_id,
         session,
         created_at: Instant::now(),
         submitting: Arc::new(AtomicBool::new(false)),
@@ -440,7 +442,7 @@ mod tests {
     #[ignore = "live: runs real `claude setup-token`; needs claude installed"]
     async fn live_spawn_session_and_wait_for_auth_url() {
         let slot =
-            spawn_session("live-wizard-test".to_string()).expect("spawn setup-token session");
+            spawn_session("live-wizard-test".to_string(), "test-user".to_string()).expect("spawn setup-token session");
         assert!(!slot.is_expired());
         assert!(slot.expires_in_seconds() > 0);
 
