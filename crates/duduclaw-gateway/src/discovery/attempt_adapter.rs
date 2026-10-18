@@ -92,7 +92,7 @@ const AGY_GUARD_TEMPLATE: &str = include_str!("python/agy_tool_guard.py");
 const AGY_ALLOWLIST_SLOT: &str = "__DUDU_ALLOWED_TOOLS_JSON__";
 
 /// Host-written files for the read-only `/dudu-runtime` directory, beyond
-/// `empty-mcp.json` and `gemini.json`. Paths are relative to that directory.
+/// `empty-mcp.json`. Paths are relative to that directory.
 pub fn runtime_files(family: RuntimeFamily, node: &Path, _turns: u32, prompt: &str) -> Vec<(String, Vec<u8>)> {
     match family {
         RuntimeFamily::Grok => vec![("prompt.txt".into(), prompt.as_bytes().to_vec())],
