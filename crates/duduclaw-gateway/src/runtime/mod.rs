@@ -130,7 +130,7 @@ pub enum RuntimeChunk {
 /// T10 consumer-side fold (design §9's "消費端": "AgentRuntime execute 路徑
 /// 把 chunks 中的工具事件彙整成與 WP-A4 同形態的收集結果上浮"): pair each
 /// `ToolUse` chunk with the [`RuntimeChunk::ToolResult`] that follows it (in
-/// emission order — codex/gemini both emit a tool's use and its result as
+/// emission order — Codex emits a tool's use and its result as
 /// adjacent chunks, never interleaved with a different tool's pair, so
 /// positional pairing is sufficient here — unlike claude_runner.rs's WP-A4
 /// collector, which needs id-based pairing because Claude CAN interleave
@@ -138,15 +138,16 @@ pub enum RuntimeChunk {
 /// `ToolUse` with no following `ToolResult` (stream ended mid-call) is still
 /// recorded, success = true (provisional — an attempted call is still
 /// evidence, same convention as every other producer in this module). This
-/// is what keeps `runtime/codex.rs` and `runtime/gemini.rs` from having to
-/// duplicate `NativeToolEvent`-building logic, and what keeps
+/// is what keeps `runtime/codex.rs` from having to duplicate
+/// `NativeToolEvent`-building logic. Antigravity collects its native events
+/// directly. The fold also keeps
 /// `prediction::task_observe` from needing any runtime-specific code (design
 /// §8.2's stated purpose for routing through `RuntimeChunk` here).
 ///
 /// R1: also lifts `ToolUse.input`/`ToolResult.output` into
 /// `NativeToolEvent::input_text`/`result_text` (masked + capped via
 /// [`native_event_input_text_from_value`]/[`native_event_result_text`]) when
-/// the producer populated them — `codex.rs`/`gemini.rs` (T10) now do for at
+/// the producer populated them — `codex.rs` now does for at
 /// least some event shapes; a producer that still emits the pre-R1
 /// placeholders (`input: Value::Null`, `output: String::new()`) yields `None`
 /// for both, byte-identical to before.
@@ -415,9 +416,9 @@ pub fn spawn_work_dir_override() -> Option<PathBuf> {
 /// Single resolution point for every runtime module, for two reasons found in
 /// the 2026-09-28 review:
 ///
-/// * only `runtime/codex.rs` read the override at all — `gemini.rs`,
-///   `antigravity.rs` and `grok.rs` used `context.agent_dir` unconditionally,
-///   so a team role member on any of those three ran in its own throwaway
+/// * only `runtime/codex.rs` read the override at all — the former Gemini
+///   runtime, `antigravity.rs` and `grok.rs` used `context.agent_dir`
+///   unconditionally, so a team role member on any of them ran in its own throwaway
 ///   scaffold and its files were deleted by the immediate GC at
 ///   `finish_role_member` (design §4.3 E3, the exact defect the override was
 ///   introduced to fix — it was simply never wired past codex);

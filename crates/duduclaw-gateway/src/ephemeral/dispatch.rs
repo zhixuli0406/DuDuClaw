@@ -40,7 +40,7 @@ pub fn read_meta(dir: &Path) -> Option<EphemeralMeta> {
 /// applies [`tier_model`]. Multi-model doctrine: when the resolved runtime
 /// provider is NOT Claude, the tier is ignored and the preferred model is
 /// returned unchanged (tier models are Claude ids; they must never leak into
-/// a codex/gemini runtime).
+/// a codex/antigravity runtime).
 ///
 /// **Role members: raw wins over tier.** A scaffold carrying a `[team_member]`
 /// section had its `[model] preferred` written by the composer from a validated

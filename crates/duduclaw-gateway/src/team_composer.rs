@@ -4732,22 +4732,15 @@ mod tests {
     use super::*;
     use duduclaw_core::task_packet::{Constraint, Finding, OutputFormat};
 
-    /// R1 (2026-10): an explicitly bound Gemini role is reported; the same
-    /// role cascaded from the employee is not (its provider read reports it).
+    /// A removed Gemini CLI role is rejected before it can be frozen.
     #[test]
-    fn team_role_deprecation_is_reported_only_for_explicit_bindings() {
+    fn removed_gemini_cli_team_role_is_rejected() {
         let cfg = TeamConfig::from_toml_value(
             &"[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = \"gemini\"\n"
                 .parse::<toml::Value>()
                 .unwrap(),
         );
-        let resolved = validate_team(&cfg).unwrap();
-        assert_eq!(resolved.verifier.runtime, "gemini");
-        assert_eq!(
-            log_team_runtime_deprecations(&resolved, &[]),
-            vec![Role::Verifier]
-        );
-        assert!(log_team_runtime_deprecations(&resolved, &[Role::Verifier]).is_empty());
+        assert!(matches!(validate_team(&cfg), Err(duduclaw_core::types::TeamConfigError::RuntimeNotAllowed { role: Role::Verifier, .. })));
     }
 
     #[tokio::test]
@@ -4890,10 +4883,10 @@ skill_security_scan = false
                 family: "codex".into(),
             },
             verifier: FrozenRole {
-                runtime: "gemini".into(),
+                runtime: "antigravity".into(),
                 model: Some("gemini-3.7-flash".into()),
                 effort: None,
-                family: "gemini".into(),
+                family: "antigravity".into(),
             },
             utility: None,
         }
@@ -5459,7 +5452,7 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "gemini",
+                "antigravity",
                 "gemini-3-pro-preview",
                 10,
                 0.70,
@@ -5468,7 +5461,7 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "gemini",
+                "antigravity",
                 "gemini-3.7-flash",
                 10,
                 0.70,
@@ -5476,7 +5469,7 @@ skill_security_scan = false
             ),
         ]);
         assert_eq!(
-            matrix_prior_model(&tie, Role::Verifier, "gemini"),
+            matrix_prior_model(&tie, Role::Verifier, "antigravity"),
             None,
             "a tie is a matrix saying the two are the same, not a preference"
         );
@@ -5562,7 +5555,7 @@ skill_security_scan = false
         use duduclaw_core::role_model_matrix::{MatrixRole, MatrixVerdict};
         // `antigravity` serves `gemini-*`, so a cell naming a claude model on
         // it resolves to the claude family — different from the role's frozen
-        // `gemini` family.
+        // `antigravity` family.
         matrix_with(vec![cell(
             "hr",
             MatrixRole::Verifier,
@@ -5578,7 +5571,7 @@ skill_security_scan = false
             runtime: "antigravity".into(),
             model: None,
             effort: None,
-            family: "gemini".into(),
+            family: "antigravity".into(),
         };
         assert_eq!(
             matrix_prior_for_role(home, Role::Verifier, &unbound),
@@ -5758,7 +5751,7 @@ skill_security_scan = false
                 Role::Verifier,
                 "antigravity",
                 "gemini-3.7-flash",
-                "gemini"
+                "antigravity"
             ),
             None,
             "a cross-family winner must not be reported as a gap"
@@ -6655,7 +6648,7 @@ skill_security_scan = false
             "[team]\nenabled = true\nexecutor_fanout = 2\n\
              [team.roles.planner]\nruntime = \"claude\"\nmodel = \"claude-fable-5-1\"\n\
              [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
-             [team.roles.verifier]\nruntime = \"gemini\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();
@@ -6665,7 +6658,7 @@ skill_security_scan = false
             panic!("expected Frozen, got {first:?}");
         };
         assert_eq!(spec.executor.runtime, "codex");
-        assert_eq!(spec.verifier.runtime, "gemini");
+        assert_eq!(spec.verifier.runtime, "antigravity");
         assert_eq!(spec.executor_fanout, 2);
 
         // Freeze-once: a second call never rewrites.
@@ -6684,7 +6677,7 @@ skill_security_scan = false
         write_team_config(
             home,
             "[team]\nenabled = true\n\
-             [team.roles.executor]\nruntime = \"gemini\"\nmodel = \"gemini-3.7-pro\"\n\
+             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
              [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
         );
         let store = store_in(home);
@@ -7139,8 +7132,8 @@ skill_security_scan = false
         write_team_config(
             home,
             "[team]\nenabled = false\n\
-             [team.roles.executor]\nruntime = \"gemini\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"gemini\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
+             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();

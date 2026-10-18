@@ -2077,7 +2077,7 @@ enum ToolingCommands {
         cluster_by: String,
 
         /// P2 — which runtime backend runs every case (`claude` | `codex` |
-        /// `gemini` | `antigravity` | `grok` | `openai_compat` | any other
+        /// `antigravity` | `grok` | `openai_compat` | any other
         /// catalog runtime id). Omit for `claude`, which takes the same direct
         /// CLI path every pre-P2 run took. Non-Claude runtimes go through the
         /// gateway's runtime abstraction and their transcript is synthesized
@@ -2675,10 +2675,10 @@ enum AgentCommands {
         trigger: Option<String>,
 
         /// AI runtime provider for this agent: `claude` (default), `codex`,
-        /// `gemini`, `antigravity`, or `openai_compat`. Written to
+        /// `antigravity`, or `openai_compat`. Written to
         /// `agent.toml [runtime] provider` and used to scaffold the
-        /// provider's context file (AGENTS.md for codex, GEMINI.md for
-        /// gemini; CLAUDE.md is always written for compatibility).
+        /// provider's context file (AGENTS.md for codex; CLAUDE.md is always
+        /// written for compatibility).
         #[arg(long)]
         runtime: Option<String>,
 
@@ -10463,7 +10463,7 @@ skill_security_scan = true
     // Provider context files — one template, rendered under each filename the
     // configured runtime's CLI reads (W3): CLAUDE.md always (Claude Code
     // compatibility invariant; agy shares the lineage), plus AGENTS.md for
-    // codex and GEMINI.md for gemini.
+    // codex.
     let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
     let context_md = format!(
         "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n\n{}\n",

@@ -169,7 +169,7 @@ async fn an_invalid_enabled_team_runs_solo_and_freezes_nothing() {
     std::fs::write(
         dir.path().join("config.toml"),
         "[team]\nenabled = true\n\
-             [team.roles.executor]\nruntime = \"gemini\"\nmodel = \"gemini-3.7-pro\"\n\
+             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
              [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
     )
     .unwrap();

@@ -116,7 +116,7 @@ const ANTHROPIC_POLICY: VendorPolicy = VendorPolicy {
     url: Some(ANTHROPIC_LEGAL_URL),
 };
 
-/// Vendor terms for a runtime id (`claude`, `codex`, `gemini`, `antigravity`,
+/// Vendor terms for a runtime id (`claude`, `codex`, `antigravity`,
 /// `grok`) or an `[[accounts]] provider` value (`anthropic`, `openai`,
 /// `gemini`/`google`, `xai`, `github`). An empty id means Anthropic (the
 /// default provider of an `[[accounts]]` entry). Anything else gets a

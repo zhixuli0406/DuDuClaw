@@ -722,12 +722,6 @@ impl AttemptRunnerFactory {
             }
             _=>{},
         }
-        // R1 (2026-10): a configured `gemini` attempt runtime still runs;
-        // warn once per process where it is resolved (create/catalog/run),
-        // not in `RuntimeFamily::parse`, which write paths share.
-        if let Some(rt)=duduclaw_core::types::RuntimeType::from_id(family.name()) {
-            crate::runtime_config::warn_once_if_deprecated_runtime(rt,crate::runtime_config::DeprecatedRuntimeSource::DiscoveryAttempt);
-        }
         Ok(family)
     }
     pub fn for_runtime(&self, runtime: &str) -> Result<Box<dyn AttemptRunner>, AttemptInfraError> {

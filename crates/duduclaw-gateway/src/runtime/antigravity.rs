@@ -541,7 +541,7 @@ impl AgentRuntime for AntigravityRuntime {
         // P0-3: agy DOES expose `--sandbox` (verified via real `agy --help`,
         // 2026-07-06 — the old v1.0.12 "no sandbox flags" claim is obsolete).
         // Derive the confinement flags from the agent's CapabilitiesConfig so
-        // this runtime enforces SandboxLevel just like codex/gemini, instead of
+        // this runtime enforces SandboxLevel just like codex, instead of
         // unconditionally auto-approving every tool call.
         let sb_args = sandbox_args(context.capabilities.as_ref());
         info!(

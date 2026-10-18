@@ -824,7 +824,7 @@ impl McpDispatcher {
         // ── 1.5 Injection scan (complete mediation — every runtime's MCP call) ──
         // Reference-monitor invariant I3: all runtime tool calls flow through
         // this one choke point, so scanning the tool arguments here covers
-        // Claude / codex / gemini / antigravity uniformly. Fail-closed (I5):
+        // Claude / codex / antigravity uniformly. Fail-closed (I5):
         // an argument value that cannot even be serialized is treated as
         // blocked rather than being waved through.
         {

@@ -94,11 +94,13 @@ fn unsupported_runtime_refused() {
         operator_identity: true, budget: None, account_rotator: None, extra_read_paths: vec![], max_concurrency: 2,
     };
     // The operator-only host experiment stays Claude-only (design §9.1).
-    for runtime in ["codex","gemini","antigravity","agy","grok","openai-compat"] {
+    for runtime in ["codex","antigravity","agy","grok","openai-compat"] {
         assert!(matches!(f.for_runtime(runtime),
             Err(AttemptInfraError::CapabilityUnsupported{capability,..}) if capability=="unconfined operator experiment"),"{runtime}");
     }
-    assert!(matches!(f.for_runtime("cursor"),Err(AttemptInfraError::RuntimeUnsupported(_))));
+    for runtime in ["cursor", "gemini"] {
+        assert!(matches!(f.for_runtime(runtime),Err(AttemptInfraError::RuntimeUnsupported(_))), "{runtime}");
+    }
     assert!(f.for_runtime("claude").is_ok());
 }
 
@@ -611,7 +613,7 @@ printf '%s\n' '{"type":"result","result":"done","total_cost_usd":0.01}'
 #[test]
 fn every_family_runs_in_a_container_under_the_host_contract() {
     let mut attempt=AttemptSettings::default();
-    for name in ["claude","codex","gemini","antigravity","grok","openai-compat"] {
+    for name in ["claude","codex","antigravity","grok","openai-compat"] {
         attempt.runtimes.insert(name.into(),super::super::config::AttemptRuntimeConfig {
             image:format!("test@sha256:{}","a".repeat(64)),executable:format!("/opt/{name}").into(),base_url:None,provider:None,
         });
@@ -619,9 +621,10 @@ fn every_family_runs_in_a_container_under_the_host_contract() {
     let factory=AttemptRunnerFactory {home_dir:"/private/host".into(),attempt:attempt.clone(),
         quota:crate::discovery::attempt_container::QuotaLimits::default(),allow_unconfined:false,operator_identity:false,
         budget:None,account_rotator:None,extra_read_paths:vec![],max_concurrency:1};
-    for runtime in ["claude","codex","gemini","antigravity","agy","grok","openai-compat","openai_compat"] {
+    for runtime in ["claude","codex","antigravity","agy","grok","openai-compat","openai_compat"] {
         assert!(factory.for_runtime(runtime).is_ok(),"{runtime} must be accepted under the host-side contract");
     }
+    assert!(matches!(factory.for_runtime("gemini"), Err(AttemptInfraError::RuntimeUnsupported(_))));
     // An unconfigured image still fails closed; strict dollar ceilings stay refused for everyone.
     attempt.runtimes.remove("grok");
     assert_eq!(AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").err(),Some(AttemptInfraError::IsolationUnavailable));
@@ -910,22 +913,16 @@ async fn antigravity_forbidden_tool_still_active_at_stream_end_is_a_violation() 
     assert_eq!(runner.run_attempt(&request).await.err(),Some(AttemptInfraError::ToolSurfaceViolation {runtime:"antigravity".into(),tool:"search_web".into()}));
 }
 
-/// R1 (2026-10): resolving a configured `gemini` attempt runtime still works
-/// and consults the Discovery read-side deprecation notice; a live runtime
-/// does not.
+/// A configured legacy Gemini CLI attempt cannot run after runtime removal.
 #[test]
-fn discovery_gemini_attempt_runtime_consults_the_deprecation_notice() {
-    use crate::runtime_config::{CONSULTED_NOTICES,DeprecatedRuntimeSource};
+fn discovery_gemini_attempt_runtime_is_refused() {
     let mut attempt=AttemptSettings {sandbox:AttemptSandbox::Container,..Default::default()};
     for name in ["gemini","codex"] {
         attempt.runtimes.insert(name.into(),super::super::config::AttemptRuntimeConfig {
             image:format!("test@sha256:{}","a".repeat(64)),executable:format!("/opt/{name}").into(),base_url:None,provider:None,
         });
     }
-    CONSULTED_NOTICES.with(|n|n.borrow_mut().clear());
     assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").is_ok());
-    assert!(CONSULTED_NOTICES.with(|n|n.borrow().is_empty()));
-    assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"gemini").is_ok());
-    let consulted=CONSULTED_NOTICES.with(|n|n.borrow().clone());
-    assert_eq!(consulted,vec![("gemini",DeprecatedRuntimeSource::DiscoveryAttempt,None)]);
+    assert!(matches!(AttemptRunnerFactory::check_runtime_capability(&attempt,"gemini"),
+        Err(AttemptInfraError::RuntimeUnsupported(_))));
 }

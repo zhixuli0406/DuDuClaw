@@ -621,7 +621,7 @@ fn build_eval_cli_args(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// P2: the runtime-abstraction path (codex / gemini / antigravity / grok /
+// P2: the runtime-abstraction path (codex / antigravity / grok /
 // openai_compat / every generic print-mode CLI)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1206,9 +1206,9 @@ mod tests {
     /// The report header must name what actually ran, not the default.
     #[test]
     fn run_facts_report_the_case_pinned_runtime() {
-        let c = case("runtime = \"gemini\"\nmodel = \"gemini-3.7-flash\"\n");
+        let c = case("runtime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n");
         let facts = RunFacts::requested(&RunOverrides::default(), &c);
-        assert_eq!(facts.runtime, "gemini");
+        assert_eq!(facts.runtime, "antigravity");
         assert_eq!(facts.model, "gemini-3.7-flash");
     }
 
@@ -1303,7 +1303,7 @@ mod tests {
 
     #[test]
     fn synthesized_transcript_with_no_tool_events_is_still_valid() {
-        let raw = synthesize_stream_json("gemini", "gemini-2.5-flash", "hello", &[]);
+        let raw = synthesize_stream_json("antigravity", "gemini-2.5-flash", "hello", &[]);
         let t = parse_stream_json(&raw).expect("parses");
         assert_eq!(t.final_text, "hello");
         assert!(t.tool_uses.is_empty());
