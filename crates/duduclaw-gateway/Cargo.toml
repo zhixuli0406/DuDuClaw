@@ -74,7 +74,7 @@ hmac = "0.12"
 sha2 = "0.10"
 csv = "1.3"
 # Native XLSX output (MIT OR Apache-2.0), pinned to the reviewed writer API.
-rust_xlsxwriter = "=0.99.1"
+rust_xlsxwriter = "=0.100.0"
 # WeCom (企業微信) callback crypto — SHA1 msg_signature + AES-256-CBC message
 # envelope (wecom.rs). Both crates are already in Cargo.lock as transitive
 # deps (sha1 via ring-adjacent stacks, aes via aes-gcm), so no new units.
@@ -118,7 +118,7 @@ openssl-sys = { version = "0.9", optional = true }
 # promoted to a normal cross-platform dependency so `artifact_gate.rs` can
 # validate on macOS/Linux too — same crate/version/features, just no longer
 # target-gated.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 
 # OpenTelemetry GenAI tracing + OTLP export (feature "otel", default OFF —
 # zero deps / zero overhead when disabled; spans are plain `tracing` either

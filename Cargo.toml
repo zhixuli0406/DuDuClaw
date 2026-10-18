@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 exclude = [
+    "vendor/calamine",
     "vendor/serenity",
     "tools/license-keygen",
     "commercial/duduclaw-license",
@@ -152,4 +153,7 @@ opt-level = 3
 # Keep Songbird's Serenity bridge while moving its TLS transport onto the
 # workspace's maintained rustls 0.23 stack. The vendored SDK retains its version.
 [patch.crates-io]
+# Official calamine 0.36.1, with only its zip requirement raised past the
+# RustSec extraction fixes. scripts/verify_security_vendor.py pins the patch.
+calamine = { path = "vendor/calamine" }
 serenity = { path = "vendor/serenity" }

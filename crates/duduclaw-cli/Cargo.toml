@@ -81,7 +81,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 async-trait = { workspace = true }
 # WP2.1/WP2.2: expert-pack install/pack (zip read + write). deflate only —
 # matches the gateway's updater dependency; no zip-bomb-prone extra codecs.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 # RFC-23 §14.2 (WP-F2): local data-file MCP tools (`csv_read` / `xlsx_read`).
 # `csv` is already a workspace-wide dependency (duduclaw-memory); `calamine`
 # is new — pure Rust, MIT, no C toolchain, reads xlsx/xlsm/xls/ods. Pinned

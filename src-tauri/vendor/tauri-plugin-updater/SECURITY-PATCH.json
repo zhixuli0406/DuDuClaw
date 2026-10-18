@@ -1,0 +1,18 @@
+{
+  "base_version": "2.10.1",
+  "base_crate_sha256": "806d9dac662c2e4594ff03c647a552f2c9bd544e7d0f683ec58f872f952ce4af",
+  "upstream_repository": "https://github.com/tauri-apps/plugins-workspace",
+  "security_dependency": "zip >=9.0.4 (RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369)",
+  "patched_files": [
+    "Cargo.toml"
+  ],
+  "scanner_note": "The Windows updater uses ZipArchive::extract. The true updater 2.10.1 version is retained; only its Windows ZIP requirement changes, with all upstream source, build script, licenses and original manifest preserved. Remove this patch after a compatible official release requires zip >=9.",
+  "replacements": {
+    "Cargo.toml": [
+      [
+        "[target.'cfg(target_os = \"windows\")'.dependencies.zip]\nversion = \"4\"",
+        "[target.'cfg(target_os = \"windows\")'.dependencies.zip]\nversion = \"9.0.4\""
+      ]
+    ]
+  }
+}
