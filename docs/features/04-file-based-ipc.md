@@ -219,7 +219,7 @@ Continue  Replan (up to 2x)
 - **Task sandbox**: For an agent with `agent.toml [container] sandbox_enabled = true`, the dispatcher runs the task's AI CLI inside a locked-down Docker container instead of directly on the host, and fails the task if the sandbox cannot run. See the [Task sandbox guide](../guides/task-sandbox.md).
 - **DelegationEnvelope**: Provides structured context for complex multi-agent handoffs.
 - **TaskSpec**: Enables dependency-aware multi-step workflows with retry and replan.
-- **Multi-Runtime**: The dispatcher spawns the appropriate CLI backend (Claude/Codex/Gemini) based on each agent's runtime configuration.
+- **Multi-Runtime**: The dispatcher spawns the appropriate CLI backend (Claude/Codex/Antigravity) based on each agent's runtime configuration.
 - **Audit Log**: All dispatched tasks are recorded in the JSONL audit trail.
 
 ---

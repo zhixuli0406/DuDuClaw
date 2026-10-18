@@ -144,7 +144,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 
 1. **排入佇列**：將傳入的任務排入 Agent 既有的任務系統（`TaskSpec`、`tasks/` 目錄）。
 2. **追蹤**狀態轉換（queued → running → completed/failed/cancelled）。
-3. **路由**任務執行至 Agent 的正常 runtime（Claude / Codex / Antigravity / Grok / OpenAI-compat 或其他目錄內 runtime；Gemini CLI runtime 已棄用）。
+3. **路由**任務執行至 Agent 的正常 runtime（Claude / Codex / Antigravity / Grok / OpenAI-compat 或其他目錄內 runtime）。
 4. **暴露**任務封套中的結果，讓客戶端能輪詢取得。
 
 這代表透過 ACP 提交的任務，會流經與透過頻道或 MCP 工具提交的任務**相同**的管線，這是單一事實來源，在 Logs/Activity dashboard 中統一可觀測。
@@ -190,7 +190,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 |----------|---------|-----------|---------|
 | **MCP** | 將 DuDuClaw 的工具（channel、memory、agent、wiki、task……）暴露給 AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
 | **ACP/A2A** | 讓外部客戶端（IDE、pipeline、其他 Agent）向 DuDuClaw 發送任務 | IDE → DuDuClaw | `duduclaw acp server` |
-| **Runtime stdio** | DuDuClaw 衍生一個 runtime（Claude/Codex/Antigravity/Grok，棄用期間仍含 Gemini）子行程並透過 stdio JSON 與它對話 | DuDuClaw → Runtime | *內部* |
+| **Runtime stdio** | DuDuClaw 衍生一個 runtime（Claude/Codex/Antigravity/Grok）子行程並透過 stdio JSON 與它對話 | DuDuClaw → Runtime | *內部* |
 
 它們是三場各自獨立的對話，全都在 stdio 上，全都與 JSON-RPC 相鄰。同一個 Agent 在執行期同時參與這三者。
 
@@ -236,7 +236,7 @@ ACP 與 MCP 一樣，繼承 DuDuClaw 的安全邊界：
 ## 與其他系統的互動
 
 - **Task Board**：經由 ACP 提交的任務流經與經由頻道提交者相同的 `TaskStore`。兩者都會顯示在 Dashboard Activity Feed 中。
-- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Antigravity/Grok/OpenAI-compat；Gemini CLI 自 v1.67.0 起棄用）處理 ACP 任務，相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
+- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Antigravity/Grok/OpenAI-compat）處理 ACP 任務，相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
 - **演化**：ACP 任務在關鍵事實萃取與預測錯誤校準上，計為「實質性輪次」。
 - **稽核日誌**：所有 ACP 請求都以 source=`acp` 記錄，與其他四個稽核來源（security / tool_calls / channel_failures / feedback）並列。
 

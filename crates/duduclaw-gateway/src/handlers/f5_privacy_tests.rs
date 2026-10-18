@@ -2,6 +2,7 @@
 //! per-connection push table, and a removed source task under an activated
 //! workflow.
 use super::task_privacy_tests::{Fixture, OPEN, PRIVATE, admin, denied, fixture, ok, payload};
+use super::accounts_add_rpc::CredentialWriteGuard;
 use super::*;
 
 #[tokio::test]
@@ -222,7 +223,7 @@ async fn push_table_by_event_kind() {
     );
     let login = event(
         "auth.cli_login.output",
-        json!({"session_id": "s", "data": "code"}),
+        json!({"session_id": "s", "owner_user_id": root.user_id, "data": "secret-token"}),
     );
     let status = event("system.status_changed", json!({}));
     let unknown = event("brand.new.event", json!({}));
@@ -238,6 +239,20 @@ async fn push_table_by_event_kind() {
     for line in [&other_reply, &session, &failed, &login, &unknown] {
         assert!(check(&root, false, line), "admin: {line}");
     }
+    let other_user = f.db.create_user("other-admin@test.invalid", "Other", "isolated-test-password", UserRole::Admin).unwrap();
+    let mut other_admin = UserContext::admin_fallback();
+    other_admin.user_id = other_user.id;
+    assert_ne!(other_admin.user_id, root.user_id);
+    assert!(!check(&other_admin, false, &login), "another admin cannot read a login transcript");
+    let unscoped_login = event("auth.cli_login.output", json!({"session_id":"s", "data":"secret-token"}));
+    assert!(!check(&root, false, &unscoped_login), "missing owner fails closed");
+    let login_status = event("auth.cli_login.status", json!({"session_id":"s", "owner_user_id":root.user_id, "status":"succeeded"}));
+    assert!(check(&root, false, &login_status));
+    assert!(!check(&other_admin, false, &login_status));
+    let mut live_login_gate = PushGate::new(&f.home, &root, false);
+    assert!(live_login_gate.filter(&login).is_some());
+    f.db.update_user(&root.user_id, None, Some(UserRole::Employee), None).unwrap();
+    assert!(live_login_gate.filter(&login).is_none(), "revocation applies to the next PTY chunk");
     // Lock screen: system status only.
     let lock = UserContext {
         user_id: "lockscreen".into(),
@@ -359,4 +374,68 @@ async fn log_tail_follows_the_live_role() {
     f.db.update_user(&f.bob.user_id, None, Some(UserRole::Employee), None)
         .unwrap();
     assert!(!PushGate::new(&f.home, &f.bob, false).allows_log_tail());
+}
+
+#[tokio::test]
+async fn credential_rpcs_follow_the_live_admin_role() {
+    let f = fixture().await;
+    let root = admin(&f);
+    let params = json!({"session_id": "missing"});
+    let before = f.handler.handle("auth.cli_login.status", params.clone(), &root).await;
+    assert!(format!("{before:?}").contains("login session not found"));
+
+    f.db.update_user(&root.user_id, None, Some(UserRole::Employee), None).unwrap();
+    let after = f.handler.handle("auth.cli_login.status", params, &root).await;
+    assert!(format!("{after:?}").contains("permission denied"));
+    let add = f.handler.handle("accounts.add", json!({"id":"revoked", "type":"api_key", "key":"test"}), &root).await;
+    assert!(format!("{add:?}").contains("permission denied"));
+}
+
+#[tokio::test]
+async fn shared_system_admin_connections_cannot_open_or_read_cli_login_sessions() {
+    let f = fixture().await;
+    let system = UserContext::admin_fallback();
+    let ws = crate::power_local::RpcConnInfo::from_ws("127.0.0.1:12345".parse().unwrap(), false);
+    for conn in [ws, ws.with_legacy_admin_authenticated()] {
+        for method in [
+            "auth.cli_login.start",
+            "auth.cli_login.status",
+            "accounts.setup_token_start",
+            "accounts.setup_token_status",
+        ] {
+            let response = f.handler.handle_conn(method, json!({"session_id":"shared"}), &system, conn).await;
+            assert!(format!("{response:?}").contains("Dashboard 帳號"), "{method}: {response:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn account_commit_rechecks_role_after_the_request_started() {
+    let f = fixture().await;
+    let root = admin(&f);
+    let guard = CredentialWriteGuard::new(&f.home, &root, crate::power_local::RpcConnInfo::internal());
+    f.db.update_user(&root.user_id, None, Some(UserRole::Employee), None).unwrap();
+    let result = f.handler.handle_accounts_add_with_probe_base_guard(
+        json!({"id":"late-write", "provider":"openai", "type":"api_key", "key":"synthetic-test-key"}),
+        "http://127.0.0.1:1",
+        Some(guard),
+    ).await;
+    assert!(format!("{result:?}").contains("permission denied"));
+    assert!(!f.home.join("config.toml").exists());
+}
+
+#[test]
+fn bootstrap_login_transcript_stops_when_the_first_user_is_created() {
+    let home = tempfile::tempdir().unwrap();
+    let bootstrap = UserContext::admin_fallback();
+    let transcript = event("auth.cli_login.output", json!({
+        "session_id":"bootstrap-login", "owner_user_id":"system", "data":"secret-token"
+    }));
+    let mut gate = PushGate::new(home.path(), &bootstrap, false);
+    let mut legacy_gate = PushGate::new_with_legacy(home.path(), &bootstrap, false, true);
+    assert!(gate.filter(&transcript).is_none());
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    db.create_user("first@test.invalid", "First", "isolated-test-password", UserRole::Admin).unwrap();
+    assert!(gate.filter(&transcript).is_none());
+    assert!(legacy_gate.filter(&transcript).is_none());
 }

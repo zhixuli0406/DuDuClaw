@@ -702,7 +702,7 @@ fn gen_ai_system_for(provider: duduclaw_core::types::RuntimeType) -> &'static st
     match provider {
         R::Claude => "anthropic",
         R::Codex | R::OpenAiCompat => "openai",
-        R::Gemini | R::Antigravity => "gcp.gemini",
+        R::Antigravity => "gcp.gemini",
         R::Grok => "xai",
         R::Qwen => "alibaba",
         R::Kimi => "moonshot",
@@ -911,6 +911,7 @@ async fn call_claude_for_agent_impl(
     // local/hybrid path below. This makes sub-agent delegation respect the
     // responding agent's runtime — and is the foundation A2A (Phase 3) builds on.
     // Parse agent.toml once for the routing decision and the choke-point (L7 followup).
+    crate::runtime_config::ensure_active_agent_provider(&agent_dir)?;
     let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
 
     // OTel (WP-B): stamp the ACTUAL runtime on the `invoke_agent` span, now

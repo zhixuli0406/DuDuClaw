@@ -52,7 +52,6 @@ pub fn parse_policy(text: &str, format: &str) -> Result<PolicyManifest, &'static
     const RUNTIME_IDS: &[&str] = &[
         "claude",
         "codex",
-        "gemini",
         "antigravity",
         "grok",
         "qwen",

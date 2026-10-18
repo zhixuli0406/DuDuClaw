@@ -250,7 +250,7 @@ pub struct MethodHandler {
     edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
-    cli_auth_sessions: RwLock<std::collections::HashMap<String, Arc<crate::cli_auth::AuthSession>>>,
+    cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
     /// WP-D: single global "訂閱帳號" setup-token wizard slot. Unlike
     /// `cli_auth_sessions` (many concurrent sessions, one per runtime login),
     /// this wizard is deliberately single-flight — a second `start` cancels
@@ -418,6 +418,16 @@ impl MethodHandler {
         // why a login-free power control is the right call on a lock screen.
         if conn.pre_auth && !crate::power_local::is_pre_auth_allowlisted(method) {
             return login_required_reject_frame();
+        }
+
+        // Bootstrap and legacy token connections share user_id "system".
+        // Interactive login can print a long-lived provider token, so real
+        // WebSocket sessions need an individually identified Dashboard user.
+        if ctx.user_id == "system" && conn.peer.is_some()
+            && (method.starts_with("auth.cli_login.")
+                || method.starts_with("accounts.setup_token_"))
+        {
+            return WsFrame::error_response("", "請使用 Dashboard 帳號登入後再連接 CLI。");
         }
 
         // ── Forced password-change gate ─────────────────────────────────

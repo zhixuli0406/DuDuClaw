@@ -174,6 +174,30 @@ warning that the check could not be made.
 
 ---
 
+## Gemini CLI runtime removed (unreleased)
+
+The `gemini` agent runtime was deprecated in v1.67.0 and is removed in this
+change. The announced removal moved through v1.69.0–v1.75.0; the older
+announcements remain in the changelog. Existing `gemini` runtime settings now
+need migration before the gateway starts those agents. The Docker image no
+longer installs `@google/gemini-cli`, and the dashboard no longer offers its
+runtime or login.
+
+| Old setting | Replace with |
+|---|---|
+| `agent.toml [runtime] provider = "gemini"` or `fallback = "gemini"` | `"antigravity"` |
+| `config.toml [runtime] utility_provider = "gemini"` | `"antigravity"` |
+| `config.toml [dispatch] judge_provider = "gemini"` | `"antigravity"` |
+| `[team.roles.*] runtime = "gemini"` | `"antigravity"` |
+| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+
+For Google sign-in, run `agy` in a terminal on the host. For API-key mode, set
+`config.toml [antigravity] auth = "api_key"` and keep the same Gemini API key
+(`gemini` provider account or `GEMINI_API_KEY`). Use model names from
+`agy models`; Gemini CLI model ids may differ. Antigravity's Docker settings
+still use `~/.gemini/antigravity-cli/`, so the `.gemini` volume remains useful.
+The Gemini API provider (`gemini`, `generateContent`) remains supported.
+
 ## Still deprecated
 
 ### Pack legacy formats
@@ -198,76 +222,6 @@ pack, the old formats cannot be taken away. See
 | `team.toml`, industry pack directories | Deprecated, still read verbatim, no disk migration |
 | `pack.toml` with `kind = "preset"` | Current format for job presets |
 | `pack.toml` with `kind = "team"` or `"template"` | Can be read and inspected (`pack inspect`), cannot be installed yet |
-
-### Gemini CLI runtime
-
-The **Gemini CLI agent runtime** (runtime id `gemini`, binary `gemini`, npm
-package `@google/gemini-cli`) was deprecated in **v1.67.0**. Its removal moved
-from v1.69.0 to v1.70.0, on 2026-10-06 to v1.71.0, and on 2026-10-07 to v1.72.0, and on 2026-10-09 to v1.73.0, on 2026-10-13 to v1.74.0, and on 2026-10-16 to **v1.75.0** (the repeat verification of Antigravity with a real Gemini key after v1.69.1 has not been done yet; the removal waits for it). Its replacement is the **Antigravity CLI runtime**
-(`antigravity`, binary `agy`).
-
-| Old | New |
-|---|---|
-| `agent.toml [runtime] provider = "gemini"` | `provider = "antigravity"` |
-| `agent.toml [runtime] fallback = "gemini"` | `fallback = "antigravity"` |
-| `config.toml [runtime] utility_provider = "gemini"` | `utility_provider = "antigravity"` |
-| `config.toml [dispatch] judge_provider = "gemini"` | `judge_provider = "antigravity"` |
-| `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
-| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
-
-**Why the date moved.** The announced precondition for removal was to verify
-Antigravity's API-key mode with a real Gemini API key. That verification found
-that an Antigravity employee at the default permission level is refused by the
-Antigravity CLI itself when it calls a platform tool. The fix ships in v1.69.1: the gateway adds two allow rules for the `duduclaw`
-MCP server to the operator's `~/.gemini/antigravity-cli/settings.json`
-(details: [multi-runtime](../features/13-multi-runtime.md)). The removal stays
-scheduled for v1.70.0 (since 2026-10-06: v1.71.0; since 2026-10-07: v1.72.0; since 2026-10-09: v1.73.0; since 2026-10-13: v1.74.0; since 2026-10-16: v1.75.0), on the condition that Antigravity is verified again with
-a real Gemini API key after that fix has shipped. That repeat verification has
-not been done yet.
-
-**What still works.** Every old value above keeps parsing and running exactly
-as before. Reading one logs a warning once per process; setting it through the
-dashboard (`agents.create` / `agents.update`) also records a
-`runtime_provider_deprecated` audit event. The dashboard no longer offers
-Gemini but shows a saved `gemini` value labelled 已棄用, and the agent edit
-page's runtime picker offers Antigravity. The "align the runtime with the
-chosen model" step no longer writes a deprecated runtime. The setup wizard's
-default is Antigravity. The Docker image keeps shipping the Gemini CLI, and
-`duduclaw doctor` lists agents whose `provider` or `fallback` is a deprecated
-runtime.
-
-**Not deprecated.** The **Gemini API provider** (provider id `gemini`,
-`GEMINI_API_KEY`, the `generateContent` protocol in the LLM layer, a `gemini`
-provider account) is unaffected. Antigravity's API-key mode uses it too.
-
-**Why Gemini CLI is being retired.** Google stopped serving free, Google AI Pro
-and Google AI Ultra individual accounts through Gemini CLI on 2026-06-18 and
-directs them to Antigravity CLI. API-key and enterprise (Gemini Code Assist)
-users are unaffected, and Gemini CLI is still maintained (source: the
-maintainers'
-[announcement](https://github.com/google-gemini/gemini-cli/discussions/28017);
-Google's [migration guide](https://antigravity.google/docs/cli/gcli-migration/)).
-Gemini CLI has not been shut down.
-
-**Migrating.**
-
-1. In `agent.toml`, change `[runtime] provider = "gemini"` (and
-   `fallback = "gemini"`) to `"antigravity"`.
-2. Authentication. For Google sign-in, run `agy` in a terminal on the host and
-   complete the login. If you authenticated Gemini CLI with an API key, set
-   `config.toml [antigravity] auth = "api_key"` and keep using the same Gemini
-   API key (a `gemini` provider account, or `GEMINI_API_KEY`).
-3. Model names. Use the names `agy models` lists; an id copied from a Gemini CLI
-   setup may not select the same model.
-4. Run `duduclaw doctor`; it lists agents whose `provider` or `fallback` is a
-   deprecated runtime.
-
-Before the removal in v1.75.0, check every `agent.toml` for
-`provider = "gemini"` and `fallback = "gemini"`, and check `config.toml` for
-`utility_provider`, `[dispatch] judge_provider`, `[team.roles.*] runtime` and
-`[discovery.attempt.runtimes.gemini]` set to `gemini`.
-
----
 
 ## Names withdrawn from the deprecation list
 

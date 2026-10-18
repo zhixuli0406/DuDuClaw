@@ -1,12 +1,13 @@
 import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
-import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary, type CliCredentialInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import { PROVIDER_CATALOG, DEFAULT_PROVIDER_ID, findProviderEntry, providerDisplayName } from '@/lib/provider-catalog';
 import {
@@ -46,6 +47,7 @@ import {
   Pencil,
   QrCode as QrCodeIcon,
   Settings2,
+  Trash2,
   TrendingUp,
   PiggyBank,
 } from 'lucide-react';
@@ -107,13 +109,21 @@ const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string, string?]> = [
   ['claude', 'Claude'],
   ['codex', 'Codex'],
   ['grok', 'Grok', 'cliLogin.runtime.grok.suffix'],
+  ['kimi', 'Kimi Code'],
+  ['copilot', 'GitHub Copilot'],
+  ['kiro', 'Kiro CLI'],
+  ['opencode', 'OpenCode'],
 ];
 
 /** Card titles for the CLI-store credential section. */
 const CLI_CRED_LABELS: Record<string, string> = {
   codex: 'Codex CLI',
-  gemini: 'Gemini CLI',
   grok: 'Grok CLI',
+  kimi: 'Kimi Code',
+  copilot: 'GitHub Copilot CLI',
+  kiro: 'Kiro CLI',
+  cursor: 'Cursor CLI',
+  opencode: 'OpenCode',
 };
 
 /** One AI staff member that names a given account in its `[model] account_pool`. */
@@ -189,11 +199,11 @@ export function AccountsPage() {
     } finally {
       setLoading(false);
     }
-    // CLI-store credentials (grok/codex/gemini) live outside the rotator —
+    // CLI-store credentials live outside the rotator —
     // fetched separately, and a failure here never blocks the budget view.
     try {
       const r = await api.accounts.cliCredentials();
-      setCliCreds(r.credentials.filter((c) => c.installed || c.present));
+      setCliCreds(r.credentials.filter((c) => String(c.runtime) !== 'gemini' && (c.installed || c.present)));
     } catch {
       setCliCreds([]);
     }
@@ -242,6 +252,8 @@ export function AccountsPage() {
   const totalBudget = budget?.total_budget_cents ?? 0;
   const totalSpent = budget?.total_spent_cents ?? 0;
   const usagePercent = totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
+  const availableCliOptions = CLI_OPTIONS.filter(([rt]) => policy.allows('runtimes', rt));
+  const claudeLoginAllowed = policy.allows('runtimes', 'claude');
 
   return (
     <div className="space-y-6">
@@ -276,23 +288,25 @@ export function AccountsPage() {
       */}
       <div className="flex flex-wrap items-center gap-4 rounded-xl border border-brand/30 bg-brand/8 p-4">
         <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-brand/15 text-brand">
-          <QrCodeIcon className="size-5" />
+          {claudeLoginAllowed ? <QrCodeIcon className="size-5" /> : <LogIn className="size-5" />}
         </span>
         <div className="min-w-56 flex-1">
           <p className="text-sm font-medium text-foreground">
-            {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroTitle' })}
+            {intl.formatMessage({ id: claudeLoginAllowed ? 'accounts.subscriptionSetup.heroTitle' : 'accounts.cliLogin' })}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroDesc' })}
+            {intl.formatMessage({ id: claudeLoginAllowed ? 'accounts.subscriptionSetup.heroDesc' : policy.error ? 'productPolicy.error' : policy.loading ? 'productPolicy.loading' : 'accounts.cliLogin.pickHint' })}
           </p>
-          <SubscriptionRiskNote className="mt-1.5" />
+          {claudeLoginAllowed && <SubscriptionRiskNote className="mt-1.5" />}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="brand" onClick={() => setSubscriptionWizardOpen(true)}>
-            <QrCodeIcon />
-            {intl.formatMessage({ id: 'accounts.subscriptionSetup' })}
-          </Button>
-          <Button variant="outline" onClick={() => setPickerOpen(true)}>
+          {claudeLoginAllowed && (
+            <Button variant="brand" onClick={() => setSubscriptionWizardOpen(true)}>
+              <QrCodeIcon />
+              {intl.formatMessage({ id: 'accounts.subscriptionSetup' })}
+            </Button>
+          )}
+          <Button variant="outline" disabled={availableCliOptions.length === 0} onClick={() => setPickerOpen(true)}>
             <LogIn />
             {intl.formatMessage({ id: 'accounts.cliLogin' })}
           </Button>
@@ -300,7 +314,7 @@ export function AccountsPage() {
       </div>
 
       <SubscriptionSetupWizard
-        open={subscriptionWizardOpen}
+        open={subscriptionWizardOpen && claudeLoginAllowed}
         onClose={() => setSubscriptionWizardOpen(false)}
         onSuccess={fetchBudget}
       />
@@ -312,16 +326,18 @@ export function AccountsPage() {
             <DialogTitle>{intl.formatMessage({ id: 'accounts.cliLogin.pick' })}</DialogTitle>
           </DialogHeader>
           <div className="grid grid-cols-2 gap-2">
-            {CLI_OPTIONS.map(([rt, label, suffixKey]) => (
+            {availableCliOptions.map(([rt, label, suffixKey]) => (
               <Button
                 key={rt}
                 variant="outline"
+                className="h-auto min-h-11 flex-col gap-0.5 py-2 text-center"
                 onClick={() => {
                   setPickerOpen(false);
                   setLoginRuntime(rt);
                 }}
               >
-                {suffixKey ? `${label}${intl.formatMessage({ id: suffixKey })}` : label}
+                <span>{label}</span>
+                {suffixKey && <span className="text-[11px] font-normal text-muted-foreground">{intl.formatMessage({ id: suffixKey })}</span>}
               </Button>
             ))}
           </div>
@@ -404,7 +420,7 @@ export function AccountsPage() {
         <Empty icon={Wallet} title={intl.formatMessage({ id: 'common.noData' })} variant="dashed" />
       ) : null}
 
-      {/* CLI subscription credentials — grok/codex/gemini keep their login in
+      {/* CLI subscription credentials keep their login in
           the CLI's own store (never a rotator account), surfaced here so a
           successful one-click login is visible on this page. */}
       {cliCreds.length > 0 && (
@@ -431,7 +447,7 @@ export function AccountsPage() {
                         <p className="font-medium text-foreground">
                           {CLI_CRED_LABELS[c.runtime] ?? c.runtime}
                           {c.runtime === 'grok' && intl.formatMessage({ id: 'cliLogin.runtime.grok.suffix' })}
-                          {isDeprecatedRuntime(c.runtime) && ` (${intl.formatMessage({ id: 'common.deprecated' })})`}
+                          {isRemovedRuntime(c.runtime) && ` (${intl.formatMessage({ id: 'common.removed' })})`}
                         </p>
                         <p className="font-mono text-xs text-muted-foreground">{c.store}</p>
                       </div>
@@ -679,6 +695,8 @@ function AccountCard({
   const navigate = useNavigate();
   const [editing, setEditing] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [budgetInput, setBudgetInput] = useState(String(account.monthly_budget_cents / 100));
   const [saving, setSaving] = useState(false);
 
@@ -697,6 +715,19 @@ function AccountCard({
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      await api.accounts.remove(account.id);
+      setConfirmDelete(false);
+      onBudgetUpdated();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -732,6 +763,16 @@ function AccountCard({
           >
             <Settings2 />
           </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-destructive"
+            onClick={() => setConfirmDelete(true)}
+            title={intl.formatMessage({ id: 'accounts.remove' })}
+            aria-label={intl.formatMessage({ id: 'accounts.remove' })}
+          >
+            <Trash2 />
+          </Button>
           <CredentialStateBadge state={account.credential_state} detail={account.credential_detail} intl={intl} />
           {account.is_healthy ? (
             <Badge variant="secondary" className="bg-success/15 text-success">
@@ -753,6 +794,16 @@ function AccountCard({
           setShowDetails(false);
           onBudgetUpdated();
         }}
+      />
+      <ConfirmDialog
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        onConfirm={() => void handleDelete()}
+        title={intl.formatMessage({ id: 'accounts.remove' })}
+        message={intl.formatMessage({ id: 'accounts.remove.confirm' }, { id: account.id })}
+        requireText={account.id}
+        requireTextHint={intl.formatMessage({ id: 'accounts.remove.typeId' })}
+        busy={deleting}
       />
 
       <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">

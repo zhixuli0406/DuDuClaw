@@ -16,7 +16,6 @@
 //! | codex | 0.156.1 | `-c model_reasoning_effort=<v>` | `low medium high xhigh` |
 //! | antigravity (`agy`) | 1.2.10 | `--effort <v>` | `low medium high` |
 //! | grok | 1.0.41 | `--reasoning-effort <v>` (alias `--effort`) | *not enumerated by `--help`* |
-//! | gemini | — | **no flag exists** | — |
 //!
 //! ## Cache note
 //!
@@ -64,8 +63,7 @@ impl Effort {
     ];
 
     /// The strongest effort `runtime` is known to accept, or `None` when the
-    /// runtime has no effort knob at all (gemini, and every runtime driven
-    /// through the generic print-mode path).
+    /// runtime has no effort knob at all (for example, generic print-mode CLIs).
     ///
     /// Grok is deliberately capped at [`Effort::High`]: `grok --help` names the
     /// flag (`--reasoning-effort <EFFORT>`) but does **not** enumerate its
@@ -83,10 +81,8 @@ impl Effort {
             // `low|medium|high` is the set they broadly agree on, so cap there
             // rather than 400-ing a preset with `xhigh`/`max`.
             RuntimeType::OpenAiCompat => Some(Effort::High),
-            // Gemini CLI has no thinking/reasoning flag (probe §2: the full
-            // 25-flag reference lists none), and the generic print-mode
-            // runtimes (qwen/kimi/copilot/…) were never probed. Both ignore
-            // effort rather than guessing a flag.
+            // Generic print-mode runtimes (qwen/kimi/copilot/…) were never
+            // probed. Ignore effort rather than guessing a flag.
             _ => None,
         }
     }
@@ -202,8 +198,6 @@ mod tests {
 
     #[test]
     fn runtimes_without_an_effort_knob_report_unsupported() {
-        assert!(!Effort::is_supported_by(RuntimeType::Gemini));
-        assert!(Effort::ceiling_for(RuntimeType::Gemini).is_none());
         for rt in [
             RuntimeType::Claude,
             RuntimeType::Codex,

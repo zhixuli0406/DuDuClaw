@@ -157,6 +157,29 @@ DuDuClaw OS の初回セットアップ（OOBE）も `auth.cli_login.start` を�
 
 ---
 
+## Gemini CLI ランタイムを削除（未リリース）
+
+`gemini` エージェントランタイムは v1.67.0 で非推奨となり、この変更で削除されました。
+削除予定は v1.69.0 から v1.75.0 まで延期されていました。過去の発表は CHANGELOG
+に残します。更新前に `gemini` を使う設定を移行してください。Docker イメージから
+`@google/gemini-cli` のインストールを削除し、ダッシュボードからもランタイムと
+ログイン項目を削除しました。
+
+| 旧設定 | 変更後 |
+|---|---|
+| `agent.toml [runtime] provider = "gemini"` または `fallback = "gemini"` | `"antigravity"` |
+| `config.toml [runtime] utility_provider = "gemini"` | `"antigravity"` |
+| `config.toml [dispatch] judge_provider = "gemini"` | `"antigravity"` |
+| `[team.roles.*] runtime = "gemini"` | `[team.roles.*] runtime = "antigravity"` |
+| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+
+Google サインインにはホストのターミナルで `agy` を実行します。API キー方式では
+`config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー
+（`gemini` プロバイダーアカウントまたは `GEMINI_API_KEY`）を使います。
+モデル名は `agy models` で確認してください。Antigravity の Docker 設定は引き続き
+`~/.gemini/antigravity-cli/` にあるため `.gemini` volume には用途があります。
+Gemini API プロバイダー（`gemini`、`generateContent`）は引き続きサポートします。
+
 ## 引き続き非推奨
 
 ### パックの旧形式
@@ -180,73 +203,6 @@ DuDuClaw OS の初回セットアップ（OOBE）も `auth.cli_login.start` を�
 | `team.toml`、業種パックのディレクトリ | 非推奨。そのまま読み込まれる。ディスク上の移行は行わない |
 | `pack.toml` で `kind = "preset"` | 職務プリセットの現行形式 |
 | `pack.toml` で `kind = "team"` または `"template"` | 読み取りと確認（`pack inspect`）はできる。まだインストールはできない |
-
-### Gemini CLI ランタイム
-
-**Gemini CLI エージェントランタイム**（ランタイム id `gemini`、実行ファイル `gemini`、
-npm パッケージ `@google/gemini-cli`）は **v1.67.0** で非推奨になりました。削除は
-v1.69.0 から v1.70.0 に、2026-10-06 に v1.71.0 に、さらに 2026-10-07 に v1.72.0 に、さらに 2026-10-09 に v1.73.0 に、さらに 2026-10-13 に v1.74.0 に、さらに 2026-10-16 に **v1.75.0** に延期されました（v1.69.1 以降、実際の Gemini キーによる Antigravity の再検証がまだ行われていないため）。後継は **Antigravity CLI ランタイム**
-（`antigravity`、実行ファイル `agy`）です。
-
-| 旧 | 新 |
-|---|---|
-| `agent.toml [runtime] provider = "gemini"` | `provider = "antigravity"` |
-| `agent.toml [runtime] fallback = "gemini"` | `fallback = "antigravity"` |
-| `config.toml [runtime] utility_provider = "gemini"` | `utility_provider = "antigravity"` |
-| `config.toml [dispatch] judge_provider = "gemini"` | `judge_provider = "antigravity"` |
-| `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
-| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
-
-**延期の理由**: 当初告知した削除の前提条件は、Antigravity の API キーモードを実際の
-Gemini API キーで検証することでした。その検証で、既定の権限レベルの Antigravity 従業員
-がプラットフォームのツールを呼び出すと、Antigravity CLI 自身に拒否されることが分かり
-ました。修正は v1.69.1 に含まれます。gateway が、オペレーターの
-`~/.gemini/antigravity-cli/settings.json` に、`duduclaw` MCP サーバーを許可する 2 つの
-ルールを追加します（詳細は[マルチランタイム](../../features/ja-JP/13-multi-runtime.md)）。
-削除は引き続き v1.70.0（2026-10-06 以降は v1.71.0、2026-10-07 以降は v1.72.0、2026-10-09 以降は v1.73.0、2026-10-13 以降は v1.74.0、2026-10-16 以降は v1.75.0）の予定で、その条件は、この修正の出荷後に実際の Gemini API キーで
-Antigravity を再検証することです。再検証はまだ行っていません。
-
-**まだ使えるもの**: 上記の旧い値は、これまでどおり解析・実行されます。読み込み時には
-プロセスごとに警告を 1 回記録し、ダッシュボード（`agents.create` / `agents.update`）
-経由で書き込むと監査イベント `runtime_provider_deprecated` も残ります。ダッシュボード
-は Gemini を提示しなくなりますが、保存済みの `gemini` は「非推奨」ラベル付きで表示され
-ます。エージェント編集ページのランタイム選択肢には Antigravity があります。「選択した
-モデルに合わせてランタイムを揃える」処理は、非推奨のランタイムを書き込まなくなりま
-した。初回セットアップウィザードの既定値は Antigravity です。Docker イメージは引き続き
-Gemini CLI を同梱し、`duduclaw doctor` は `provider` または `fallback` が非推奨ランタイム
-のエージェントを一覧表示します。
-
-**非推奨ではないもの**: **Gemini API プロバイダー**（プロバイダー id `gemini`、
-`GEMINI_API_KEY`、LLM 層の `generateContent` プロトコル、`gemini` プロバイダーアカウ
-ント）は影響を受けません。Antigravity の API キーモードもこれを使います。
-
-**Gemini CLI を廃止する理由**: Google は 2026-06-18 に、無料、Google AI Pro、Google AI
-Ultra の個人アカウントに対する Gemini CLI での提供を停止し、Antigravity CLI への移行を
-案内しています。API キーとエンタープライズ（Gemini Code Assist）のユーザーは影響を受け
-ず、Gemini CLI 自体は引き続きメンテナンスされています（出典: メンテナーの
-[告知](https://github.com/google-gemini/gemini-cli/discussions/28017)、Google の
-[移行ガイド](https://antigravity.google/docs/cli/gcli-migration/)）。Gemini CLI が終了
-したわけではありません。
-
-**移行手順**:
-
-1. `agent.toml` で `[runtime] provider = "gemini"`（および `fallback = "gemini"`）を
-   `"antigravity"` に変更する。
-2. 認証: Google アカウントでサインインする場合は、ホストのターミナルで `agy` を実行して
-   ログインを完了する。Gemini CLI を API キーで認証していた場合は
-   `config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー
-   （`gemini` プロバイダーアカウント、または `GEMINI_API_KEY`）を使い続ける。
-3. モデル名: `agy models` が一覧表示する名前を使う。Gemini CLI の設定からコピーした id
-   では同じモデルが選ばれないことがある。
-4. `duduclaw doctor` を実行すると、`provider` または `fallback` が非推奨ランタイムの
-   エージェントが一覧表示される。
-
-v1.75.0 での削除の前に、すべての `agent.toml` で `provider = "gemini"` と
-`fallback = "gemini"` を確認し、`config.toml` の `utility_provider`、
-`[dispatch] judge_provider`、`[team.roles.*] runtime`、
-`[discovery.attempt.runtimes.gemini]` が `gemini` のままでないかも確認してください。
-
----
 
 ## 非推奨リストから外した名称
 

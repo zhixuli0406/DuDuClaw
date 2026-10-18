@@ -566,9 +566,8 @@ pub(super) fn scaffold_with(
 ///    distinguish from work).
 /// 2. `model`'s family must be one this runtime actually serves, checked
 ///    against the runtime's own `model_prefixes` (not
-///    `runtime_for_model(model).id == runtime.id`: catalog order breaks the
-///    `gemini-` prefix tie in favour of the Gemini CLI, which would reject the
-///    perfectly legal `runtime = "antigravity", model = "gemini-3.7-flash"`).
+///    `runtime_for_model(model).id == runtime.id`: provider families can be
+///    served by more than one runtime, and Antigravity accepts Gemini models.
 ///    An unknown family is an error, never a guess (goose#10731).
 pub(super) fn validate_role_runtime_model(
     role: Role,

@@ -141,7 +141,7 @@ cascade 是**逐欄**的，分三層：
 
 可用值：`low`、`medium`、`high`、`xhigh`、`max`（不分大小寫）。列舉本身、各 runtime 的上限，以及各廠商拼法不同的 CLI 旗標，全都集中在一處（`duduclaw-core::effort`）。`[team]` 只把這個鍵當作原始字串，交給那裡解析，因此 crate 不會對同一個旋鈕留有兩種拼法。無法解析的值會拒絕成團（`invalid_effort`）。
 
-第一批五個 runtime 中有四個支援逐次呼叫指定 effort（2026-09-24 以真實 binary 探測）：Claude Code `--effort`、Codex `-c model_reasoning_effort=`、Antigravity `--effort`、Grok `--reasoning-effort`。Gemini CLI 沒有文件記載的對應項，跑在 `gemini` 上的角色仍可宣告 effort，由 spawn 層讓它成為空操作。在設定階段就拒絕，會讓同一份設定無法跨 runtime 移植，卻沒有換到任何安全性。
+第一批仍支援的四個 runtime 都支援逐次呼叫指定 effort（2026-09-24 以真實 binary 探測）：Claude Code `--effort`、Codex `-c model_reasoning_effort=`、Antigravity `--effort`、Grok `--reasoning-effort`。
 
 宣告在既不綁 runtime 也不綁 model 的角色上的 effort 是無效的（該角色會 cascade 到員工的模型，而員工的模型帶的是員工的 effort）。這種情況會被回報，而不是靜默丟棄。
 
@@ -167,15 +167,15 @@ Goose 的 Lead/Worker 功能儲存的角色設定只有模型名稱，結果 `qw
 
 ### 2. 只限第一批 runtime
 
-`claude`、`codex`、`gemini`（v1.67.0 起棄用，v1.75.0 移除：請改用 `antigravity`）、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
+`claude`、`codex`、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
 
-原因在工具，與能力無關：這五個 runtime 原生註冊 DuDuClaw 的 MCP server，所以跑在上面的角色拿得到完整的工具面。角色若靜默失去工具，會產生自信滿滿、沒有任何工具呼叫的敘述，審核者分不出它與真正做完的工作。
+原因在工具，與能力無關：這四個 runtime 原生註冊 DuDuClaw 的 MCP server，所以跑在上面的角色拿得到完整的工具面。角色若靜默失去工具，會產生自信滿滿、沒有任何工具呼叫的敘述，審核者分不出它與真正做完的工作。
 
 ### 3. 審核者不得與執行者同模型家族
 
 同家族 ⇒ 拒絕成團（`verifier_same_family`），這是拒絕，不是警告。去相關就是整個機制（arXiv:2607.13918：相關的審核者讓失敗率只以多項式速度衰減，關鍵槓桿是獨立性，而不是疊更多判官）。
 
-家族由 runtime 目錄推導，所以 `antigravity` 與 `gemini` 會合併為同一個家族：兩者都服務 `gemini-*` 模型，把它們配對在設定上看起來像兩家廠商，實際上買不到任何獨立性。
+家族由 runtime 目錄推導。執行者與審核者應選真正不同的模型家族。
 
 一項相關發現值得直接講：在 VP-CONTROL（arXiv:2609.10969）中，**共用證據**的跨模型投票仍放行了 62.9% 的不安全提案，而**獨立證據來源**把這個比例降到 22.9%。證據獨立性的貢獻是 40.9 個百分點，模型多樣性只有 11.3。因此審核者讀的是凍結的合約、封包與工具活動摘要，而不是執行者對自己工作的描述。
 
@@ -269,7 +269,7 @@ composer 以數字順序讀回相同的槽位，先是規範檔，再是 `.01`�
 
 移動工作目錄帶來第二個問題：Claude CLI 從 `<cwd>/.mcp.json` 探索它的 MCP server，所以待在員工目錄中的成員會以**員工的**身分啟動 duduclaw MCP server，每個工具呼叫、每次交接、每一列稽核都會被歸到父層。所以身分改為明確指名，而非探索：Claude 成員以 `--mcp-config <member_dir>/.mcp.json --strict-mcp-config` 啟動（第二個旗標用來阻止 CLI 同時合併環境中的設定）。Codex 成員拿到 `--cd <employee_dir>`，而它的 `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID=…` 覆寫帶著成員 id，兩者在結構上互相獨立。若成員的 `.mcp.json` 不存在，該階段會被拒絕（`member_mcp_config_missing`），而不是帶著父層身分派工。
 
-**成員目前尚不支援：gemini、antigravity、grok，以及一般的 print-mode CLI。** 這些 runtime 從工作目錄*裡面*的檔案讀取它們的 MCP 註冊（`.gemini/settings.json`、`.grok/config.toml`……），所以移動 cwd 會讓身分跟著移動。在這些 runtime 上的成員仍以自己的骨架為工作目錄，它的檔案同樣不會活過該輪。在這個缺口補上之前，需要寫檔的角色請用 claude 或 codex。
+**成員目前尚不支援：antigravity、grok，以及一般的 print-mode CLI。** 這些 runtime 從工作目錄*裡面*的檔案讀取它們的 MCP 註冊（`.agents/mcp_config.json`、`.grok/config.toml`……），所以移動 cwd 會讓身分跟著移動。在這些 runtime 上的成員仍以自己的骨架為工作目錄，它的檔案同樣不會活過該輪。在這個缺口補上之前，需要寫檔的角色請用 claude 或 codex。
 
 **另一個後果必須補上，而不是只寫進文件。** 共用員工的工作目錄，也代表共用其中的 `.claude/settings.json`，而註冊在那裡的檔案保護 hook 把*員工*當作呼叫者，所以 hook 把角色成員的寫檔讀成員工在寫自己的檔案，直接放行。成員因此可以編輯員工 `agent.toml [capabilities]`：翻轉 `os_native` / `computer_use`、放寬 `allowed_tools`、清空 `denied_tools`、替自己授予 `db_sources` 條目，而下一輪的子集檢查會承認被放寬的包絡。平台對「角色成員永遠不能持有員工沒有的工具」的承諾，正是從那個檔案讀出來的，而一個可能是第三方的模型可以改寫它。
 
@@ -523,7 +523,7 @@ runtime 沒有回報用量時，用量欄位會整個省略。寫 `0` 等於宣�
 誠實的清單，讓這裡沒有任何東西讀起來比實際更完整：
 
 - **被接受的一輪只是單一煙霧結果。** 第 14 輪通過了既有的驗收判官，但這不能證明它在正式環境勝過 Solo。角色×模型矩陣的四案例煙霧測試無法解析宣告的 MDE。
-- **會寫檔的角色只限 claude 與 codex。** gemini / antigravity / grok / 一般 CLI 的成員以自己的骨架為工作目錄，所以它們的檔案活不過該輪。
+- **會寫檔的角色只限 claude 與 codex。** antigravity / grok / 一般 CLI 的成員以自己的骨架為工作目錄，所以它們的檔案活不過該輪。
 - 角色×模型能力矩陣現在由 composer 當作先驗讀取（見上），但**只在角色沒設定模型時**，且只來自沒有 `unresolved` 的格。自 2026-09-29 起，同一個檔案也回答閘的能力差距訊號：矩陣中該執行者 `(role, runtime)` 的勝出模型，與該角色今天實際運行的模型之間，以 `n` 加權的距離（百分點），並與矩陣標頭自己宣告的 MDE 配對，所以低於雜訊底線的差距不會觸發。這項比較的兩邊都需要 resolved 的格，所以**在每一份出貨的矩陣上，這個訊號仍然是暗的**：四個格全是 `unresolved`，使閘維持原狀（四個訊號中兩個可量測，而成團需要三個）。它會在操作者第一次量出能 resolve 的矩陣時啟用，在那之前不會。會讓檔案保持新鮮的線上 bandit 仍是 P5。P2b 全團隊產生器完成了一次三案例、12 臂的實機管線探測，有真實的審核判定與交接。四個模型格全是 `unresolved`；來自單一 domain 的三個合成案例不滿足正式矩陣的驗收門檻，這在實務上代表今天出貨的矩陣完全選不出任何東西。
 - **預設開啟的翻轉尚未以預設值實機測試。** 它在未設定安裝上產生的行為由單元測試涵蓋（安靜的 Solo、無稽核列、派工逐位元組相同）；尚未執行的是這樣一個機群：已設定 `[team.roles]` *並且*依賴 `enabled` 關閉來維持 Solo。這樣的部署現在會成團，`enabled = false` 是一行的還原。
 - **審核格只有在重新錄製的 suite 上才量得到東西。** 出貨的 premium suite 的逐字稿給出單一類別的 gold，所以其上的格誠實地是 `degenerate_gold`；煙霧測試 3 顯示，用混合 gold 重新錄製四個案例能產生真實分數，所以修法已知，只是還沒套用到 18 個出貨的 suite。
@@ -538,7 +538,7 @@ runtime 沒有回報用量時，用量欄位會整個省略。寫 `0` 等於宣�
 - **`role_turns.jsonl` 把審核者的一列算進 `plan_round` 沒有規劃到的 spawn 預算。** 審核者是輔助呼叫，但它的帳本列帶 `member_id = "team-verifier"`，而 `spawns_used_for_task` 計入每一列有成員 id 的列，所以每一輪都比計畫預估的多花一個 spawn。
 - `cost.by_role` 現在回報依角色與模型的實測團隊階段花費，可選擇以任務 id（`episode_id`）收窄。沒有角色的舊列仍未歸屬。v1.68.0 起團隊設定已能在儀表板修改（見「設定角色」），封包／工具下鑽仍待接上。
 - 審核者的 token 用量在其 runtime 提供 usage 區塊時擷取；否則它的 `usage_*` 欄位缺席，而不是零。同一規則適用於規劃者與執行者的用量。實機探測的角色成本帳本不完整，不能當作 provider 帳單。
-- **結構化判官輸出只限 codex。** `--output-schema` 是唯一接上的結構化輸出旗標；gemini 或 openai-compat 判官仍得靠 prompt 說服。團隊審核者現在共用離線審核者的 schema，接受嚴格 JSON 與首 token 散文；以 codex 做團隊審核仍需要一次實機一輪。
+- **結構化判官輸出只限 codex。** `--output-schema` 是唯一接上的結構化輸出旗標；antigravity 或 openai-compat 判官仍得靠 prompt 說服。團隊審核者現在共用離線審核者的 schema，接受嚴格 JSON 與首 token 散文；以 codex 做團隊審核仍需要一次實機一輪。
 - **產物收據只涵蓋封包宣告的路徑。** 成員寫了卻沒列在 `artifacts[]` 的檔案，有它的原生工具列作為證據，但沒有雜湊。掃描工作區找出未宣告的變更是未來的工作。
 - 脫離的 composer 現在在存活骨架上限達到時，會等待一張 FIFO 准入票券。過期、遺失或無法讀取的票券會讓該階段明確失敗；被取消的等待會移除自己的票券。佇列狀態與骨架釋放的測試通過；仍需要一次有負載的實機一輪測試。
 

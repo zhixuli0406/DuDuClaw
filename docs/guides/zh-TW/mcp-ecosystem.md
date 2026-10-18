@@ -156,7 +156,7 @@ action_rules = [
 
 **儀表板**：`MCP → 遠端伺服器 →「第三方工具與其動作類型」` 依員工顯示每個伺服器最近一次經 proxy 或橋接列出的工具（`<home>/mcp_tool_effects/<員工>/<伺服器>.json`），類型與決定依目前設定重新計算。伺服器要在某次工作階段經 DuDuClaw 列出工具後才會出現。這份快照只用於顯示；管制一律依當下的清單。
 
-**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）。Codex、Gemini、Antigravity、Grok 員工只登記 DuDuClaw 自己的伺服器，openai-compat 工具迴圈也只啟動 `duduclaw mcp-server`，沒有第三方伺服器可管。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以受管制的 spawn（有 `action_rules` 或在唯讀通道）會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
+**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）。Codex、Antigravity、Grok 員工只登記 DuDuClaw 自己的伺服器，openai-compat 工具迴圈也只啟動 `duduclaw mcp-server`，沒有第三方伺服器可管。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以受管制的 spawn（有 `action_rules` 或在唯讀通道）會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
 
 ## 5. 遠端伺服器的事件（MCP Events）
 
@@ -183,7 +183,7 @@ action_rules = [
 - **自動化規則**：觸發 `mcp_event`（欄位 `server`、`name`、`agent_id`、`lane`、`suspicious` 與 `data.*`），由它產生的提示開頭有固定的安全提醒。
 - **持續責任**：事件來源 `mcp.event`，屬於訂閱的員工。
 
-**預設唯讀。** 事件啟動的工作（自動化規則的 `delegate` 或 `run_skill`）在唯讀通道執行：佇列訊息帶 `lane = "explore"`，Claude CLI 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw 工具只剩 `read`、`draft`）、內建工具只有 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`，第三方伺服器經過管制的 proxy（第 4 節）。這與[唯讀持續任務](continuous-responsibilities.md)是同一條通道、同一個旗標，規則也相同：OpenAI 相容執行環境的員工可以執行，DuDuClaw 工具同樣受限，且不掛載 `agent.toml [mcp.external]` 伺服器；Codex 員工以 `-s read-only` 與 `approval_policy=never` 執行（作業系統層的唯讀沙箱，不論員工自己的等級；Codex 在這個模式下拒絕所有 MCP 呼叫，所以沒有工具可呼叫）；使用其他 runtime（Gemini CLI、Antigravity、Grok）或任務沙箱的員工在開始前就被拒絕（`explore_lane_unsupported`），MoA 模型與純本機推論也被拒絕（混合模式的本機分流略過）。訂閱時開啟「允許一般模式」，事件就能以員工平常的權限啟動工作；只有這種訂閱會喚醒持續責任（occurrence 是一般的目標任務），唯讀訂閱的事件在那裡記為 `dropped(explore_lane)`。
+**預設唯讀。** 事件啟動的工作（自動化規則的 `delegate` 或 `run_skill`）在唯讀通道執行：佇列訊息帶 `lane = "explore"`，Claude CLI 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw 工具只剩 `read`、`draft`）、內建工具只有 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`，第三方伺服器經過管制的 proxy（第 4 節）。這與[唯讀持續任務](continuous-responsibilities.md)是同一條通道、同一個旗標，規則也相同：OpenAI 相容執行環境的員工可以執行，DuDuClaw 工具同樣受限，且不掛載 `agent.toml [mcp.external]` 伺服器；Codex 員工以 `-s read-only` 與 `approval_policy=never` 執行（作業系統層的唯讀沙箱，不論員工自己的等級；Codex 在這個模式下拒絕所有 MCP 呼叫，所以沒有工具可呼叫）；使用其他 runtime（Antigravity、Grok）或任務沙箱的員工在開始前就被拒絕（`explore_lane_unsupported`），MoA 模型與純本機推論也被拒絕（混合模式的本機分流略過）。訂閱時開啟「允許一般模式」，事件就能以員工平常的權限啟動工作；只有這種訂閱會喚醒持續責任（occurrence 是一般的目標任務），唯讀訂閱的事件在那裡記為 `dropped(explore_lane)`。
 
 **金鑰**：以 Gateway 金鑰檔加密存在 `<home>/mcp_events/subscriptions.json`（0600）。「更換簽章金鑰」會在更新訂閱時把新的送給伺服器，舊的 15 分鐘內仍接受。「取消訂閱」先刪除本機訂閱（回呼位址立即回 `404`），再盡力呼叫 `events/unsubscribe`。稽核：`mcp_event_subscription_created`／`_rotated`／`_revoked`／`_refresh_failed`、`mcp_event_delivered`、`mcp_event_delivery_rejected`、`mcp_event_control`（只有 id、名稱與數量）。
 

@@ -33,9 +33,11 @@ fn defaults_when_the_section_is_missing() {
     assert_eq!(s.workspace_bytes, 512 << 20);
     assert_eq!(s.when_unavailable, WhenUnavailable::Fail);
     for (family, path) in [
-        (RuntimeFamily::Claude, "/usr/bin/claude"), (RuntimeFamily::Codex, "/usr/bin/codex"),
-        (RuntimeFamily::Gemini, "/usr/bin/gemini"), (RuntimeFamily::Antigravity, "/usr/local/bin/agy"),
-        (RuntimeFamily::Grok, "/usr/local/bin/grok"), (RuntimeFamily::OpenAiCompat, "/usr/local/bin/python3"),
+        (RuntimeFamily::Claude, "/usr/bin/claude"),
+        (RuntimeFamily::Codex, "/usr/bin/codex"),
+        (RuntimeFamily::Antigravity, "/usr/local/bin/agy"),
+        (RuntimeFamily::Grok, "/usr/local/bin/grok"),
+        (RuntimeFamily::OpenAiCompat, "/usr/local/bin/python3"),
     ] {
         assert_eq!(s.executable(family), Path::new(path), "{family:?}");
     }
@@ -206,7 +208,12 @@ fn generic_cli_runtimes_are_unsupported() {
         let err = preflight(&SandboxSettings::default(), &spec(runtime)).unwrap_err();
         assert_eq!(err.code(), "unsupported_runtime", "{runtime:?}");
     }
-    for runtime in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::Gemini, RuntimeType::Antigravity, RuntimeType::Grok] {
+    for runtime in [
+        RuntimeType::Claude,
+        RuntimeType::Codex,
+        RuntimeType::Antigravity,
+        RuntimeType::Grok,
+    ] {
         let result = preflight(&SandboxSettings::default(), &spec(runtime));
         #[cfg(unix)]
         assert!(result.is_ok(), "{runtime:?}");

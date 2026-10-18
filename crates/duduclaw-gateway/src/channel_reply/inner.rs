@@ -1323,6 +1323,11 @@ pub(super) async fn build_reply_with_session_inner(
     // Parse agent.toml once (L7 followup): the routing decision and the
     // choke-point both need it, so load here and thread the settings through
     // `AgentPrompt.runtime_settings` instead of re-reading inside the choke-point.
+    if let Some(dir) = agent_dir.as_deref() {
+        if let Err(e) = crate::runtime_config::ensure_active_agent_provider(dir) {
+            return format!("⚠️ {e}");
+        }
+    }
     let runtime_settings = agent_dir
         .as_deref()
         .map(crate::runtime_config::load_runtime_settings);

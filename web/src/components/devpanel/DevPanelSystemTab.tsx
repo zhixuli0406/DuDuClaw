@@ -15,12 +15,11 @@ const TAKEOVER_POLL_MS = 15000;
  *  convention as `agents.runtime.provider.*` for the four that overlap it —
  *  `antigravity` has no entry there yet, so it's a literal here too). */
 const RUNTIME_PROVIDERS: ReadonlyArray<{
-  readonly key: keyof Pick<RuntimeDetect, 'claude_cli' | 'codex' | 'gemini' | 'antigravity' | 'grok'>;
+  readonly key: keyof Pick<RuntimeDetect, 'claude_cli' | 'codex' | 'antigravity' | 'grok'>;
   readonly label: string;
 }> = [
   { key: 'claude_cli', label: 'Claude' },
   { key: 'codex', label: 'Codex' },
-  { key: 'gemini', label: 'Gemini' },
   { key: 'antigravity', label: 'Antigravity' },
   { key: 'grok', label: 'Grok' },
 ];

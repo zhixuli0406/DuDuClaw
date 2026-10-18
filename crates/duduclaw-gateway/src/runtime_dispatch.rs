@@ -137,6 +137,9 @@ pub struct AgentPrompt<'a> {
     )
 )]
 pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
+    if let Some(dir) = req.agent_dir {
+        crate::runtime_config::ensure_active_agent_provider(dir)?;
+    }
     // Reuse caller-provided settings when present (RFC-25 L7 followup — avoids a
     // second agent.toml read on paths that already parsed it to decide routing);
     // otherwise read once here.
@@ -600,6 +603,10 @@ pub async fn run_utility_prompt_with_hint(
 ) -> Result<String, String> {
     #[cfg(test)]
     crate::model_call_probe::record("run_utility_prompt");
+    match agent_dir {
+        Some(dir) => crate::runtime_config::ensure_active_agent_provider(dir)?,
+        None => crate::runtime_config::ensure_active_utility_provider(home_dir)?,
+    }
     let base = crate::runtime_config::resolve_utility(home_dir, agent_dir);
     let spec = apply_utility_hint(base, hint)?;
     // A hinted utility call is, by construction, the judge/evaluator path — so
@@ -888,29 +895,29 @@ mod hint_tests {
         let got = apply_utility_hint(
             base(),
             Some(&UtilityModelHint {
-                provider: Some(RuntimeType::Gemini),
+                provider: Some(RuntimeType::Antigravity),
                 model: Some("gemini-3-pro-preview".into()),
                 effort: None,
                 output_schema: None,
             }),
         )
         .unwrap();
-        assert_eq!(got.provider, RuntimeType::Gemini);
+        assert_eq!(got.provider, RuntimeType::Antigravity);
         assert_eq!(got.model, "gemini-3-pro-preview");
 
         // Provider-only: the resolved model rides along, and is validated
-        // against the NEW provider (claude-* on Gemini is a mismatch).
+        // against the NEW provider (claude-* on Codex is a mismatch).
         let err = apply_utility_hint(
             base(),
             Some(&UtilityModelHint {
-                provider: Some(RuntimeType::Gemini),
+                provider: Some(RuntimeType::Codex),
                 model: None,
                 effort: None,
                 output_schema: None,
             }),
         )
         .unwrap_err();
-        assert!(err.contains("does not belong to runtime gemini"), "{err}");
+        assert!(err.contains("does not belong to runtime codex"), "{err}");
     }
 
     #[test]
@@ -969,7 +976,7 @@ mod hint_tests {
             apply_utility_hint(
                 base(),
                 Some(&UtilityModelHint {
-                    provider: Some(RuntimeType::Gemini),
+                    provider: Some(RuntimeType::Antigravity),
                     model: Some("some-unreleased-id".into()),
                     effort: None,
                     output_schema: None,
@@ -986,7 +993,7 @@ mod hint_tests {
         // different family behind the operator's back (the live-test hole).
         assert!(hint_opts_out_of_cross_family_failover(Some(
             &UtilityModelHint {
-                provider: Some(RuntimeType::Gemini),
+                provider: Some(RuntimeType::Antigravity),
                 model: Some("gemini-3-pro-preview".into()),
                 effort: None,
                 output_schema: None,
@@ -1049,7 +1056,7 @@ mod hint_tests {
         );
         assert!(
             !UtilityModelHint {
-                provider: Some(RuntimeType::Gemini),
+                provider: Some(RuntimeType::Antigravity),
                 model: None,
                 effort: None,
                 output_schema: None,

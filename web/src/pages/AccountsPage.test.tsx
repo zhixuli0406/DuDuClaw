@@ -1,4 +1,5 @@
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
+import { useProductPolicyStore } from '@/lib/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -35,7 +36,7 @@ describe('AccountsPage (MDS)', () => {
       await screen.findByText(/Sign in to Grok \(SuperGrok subscription\)/i),
     ).toBeInTheDocument();
     expect(
-      await screen.findByText(/duduclaw-grok volume/),
+      await screen.findByText(/container's ~\/.grok/),
     ).toBeInTheDocument();
   });
 
@@ -48,13 +49,87 @@ describe('AccountsPage (MDS)', () => {
     expect(screen.queryByRole('button', { name: /Antigravity/i })).not.toBeInTheDocument();
   });
 
-  it('does not offer Gemini in the one-click-login CLI picker (the Gemini CLI is deprecated)', async () => {
+  it('does not offer the removed Gemini CLI in the one-click-login picker', async () => {
     const user = userEvent.setup();
     renderWithProviders(<AccountsPage />);
 
     await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
     expect(await screen.findByRole('button', { name: /Grok/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Gemini/i })).not.toBeInTheDocument();
+  });
+
+  it('offers every scriptable CLI login and keeps the Grok qualifier on a separate line', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<AccountsPage />);
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    for (const name of ['Claude', 'Codex', 'Grok', 'Kimi Code', 'GitHub Copilot', 'Kiro CLI', 'OpenCode']) {
+      expect(screen.getByRole('button', { name: new RegExp(name) })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole('button', { name: /Cursor CLI/ })).not.toBeInTheDocument();
+    const grok = screen.getByRole('button', { name: /Grok/ });
+    expect(grok.querySelectorAll('span')).toHaveLength(2);
+    expect(grok).toHaveClass('flex-col');
+  });
+
+  it('hides CLI logins disabled by the installation policy', async () => {
+    const user = userEvent.setup();
+    useProductPolicyStore.setState({
+      policy: { profile: 'restricted', blocked_channels: [], blocked_runtimes: ['kimi'], blocked_providers: [] },
+      loading: false,
+      error: false,
+    });
+    renderWithProviders(<AccountsPage />);
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    expect(screen.queryByRole('button', { name: /Kimi Code/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Codex/i })).toBeInTheDocument();
+  });
+
+  it('hides the Claude subscription wizard when its runtime is blocked', async () => {
+    const user = userEvent.setup();
+    useProductPolicyStore.setState({
+      policy: { profile: 'restricted', blocked_channels: [], blocked_runtimes: ['claude'], blocked_providers: [] },
+      loading: false,
+      error: false,
+    });
+    renderWithProviders(<AccountsPage />);
+    expect(screen.queryByRole('button', { name: 'Connect subscription account' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Codex' })).toBeInTheDocument();
+  });
+
+  it.each([
+    ['loading', { policy: null, loading: true, error: false }],
+    ['failed', { policy: null, loading: false, error: true }],
+  ] as const)('keeps CLI login closed while installation policy is %s', (_status, state) => {
+    useProductPolicyStore.setState(state);
+    renderWithProviders(<AccountsPage />);
+    expect(screen.queryByRole('button', { name: 'Connect subscription account' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /One-click sign-in/i })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument();
+  });
+
+  it('requires the account ID before deleting a stored API token', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'accounts.budget_summary') {
+        return Promise.resolve({ total_budget_cents: 1000, total_spent_cents: 0, accounts: [
+          { id: 'old-token', auth_method: 'apikey', provider: 'openai', priority: 1,
+            is_healthy: true, spent_this_month: 0, monthly_budget_cents: 1000 },
+        ] });
+      }
+      return Promise.resolve({});
+    });
+    renderWithProviders(<AccountsPage />);
+    const card = await screen.findByText('old-token');
+    const cardRoot = card.closest('.rounded-xl') as HTMLElement;
+    await user.click(within(cardRoot).getByRole('button', { name: 'Delete account' }));
+    const confirm = screen.getByRole('button', { name: 'Delete' });
+    expect(confirm).toBeDisabled();
+    await user.type(screen.getByPlaceholderText('old-token'), 'old-token');
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    expect(mockWsClient.call).toHaveBeenCalledWith('accounts.remove', { account_id: 'old-token' });
   });
 
   // WP-C (§2-2): the page used to have zero links to any AI staff member, so an

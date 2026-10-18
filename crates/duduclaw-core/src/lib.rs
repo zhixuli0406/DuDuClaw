@@ -239,7 +239,7 @@ pub fn set_internal_mcp_api_key(key: String) {
 /// The env vars every spawned `duduclaw mcp-server` child needs forwarded
 /// from the current process, as `(name, value)` pairs (present + non-empty
 /// only). Single source of truth for ALL MCP env assembly points — the
-/// per-runtime config writers (grok/codex/gemini/antigravity), the Claude
+/// per-runtime config writers (grok/codex/antigravity), the Claude
 /// `.mcp.json` template, and the direct tool-loop client. `DUDUCLAW_AGENT_ID`
 /// is intentionally NOT included (it is per-call, not process-wide).
 ///
@@ -1035,16 +1035,6 @@ pub fn which_codex() -> Option<String> {
 /// Resolve the `codex` CLI from a specific HOME. See [`which_cli_in_home`].
 pub fn which_codex_in_home(home: &std::path::Path) -> Option<String> {
     which_cli_in_home(home, "codex")
-}
-
-/// Resolve the `gemini` CLI binary. See [`which_cli`].
-pub fn which_gemini() -> Option<String> {
-    which_cli("gemini")
-}
-
-/// Resolve the `gemini` CLI from a specific HOME. See [`which_cli_in_home`].
-pub fn which_gemini_in_home(home: &std::path::Path) -> Option<String> {
-    which_cli_in_home(home, "gemini")
 }
 
 /// Resolve the Antigravity `agy` CLI binary. See [`which_cli`].

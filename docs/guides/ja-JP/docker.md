@@ -3,9 +3,7 @@
 > 対応バージョン：v1.8.23+
 > 最終更新：2026-04-22
 
-本ガイドはDocker ComposeでDuDuClawサーバーをデプロイする一連の流れをカバーします——
-port設定、三大CLI（Claude / Codex / Gemini）の認証方式から、
-データ永続化、channel webhook、自動更新までを扱います。
+本ガイドでは Docker Compose のデプロイ、Codex のデバイスコードログイン、API キー、認証情報の volume、channel webhook、更新を説明します。
 
 ローカルで試すだけなら、まず
 [docs/deployment-guide.md §1](deployment-guide.md#1-local-development)
@@ -27,7 +25,7 @@ DuDuClawのDockerイメージは `container/Dockerfile.server` で構築され�
 最終イメージには以下が組み込まれています。
 
 - `duduclaw` メインプログラム（Rust製、dashboard込み）
-- `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（`npm i -g` でインストール）
+- `@anthropic-ai/claude-code`、`@openai/codex`（`npm i -g` でインストール）
 - `docker.io` CLI（マウントしたソケットの先にある Docker daemon のクライアント。タスクサンドボックスを有効にした場合に使用）
 - （任意）Python 3.12：LLMLingua-2 のプロンプト圧縮（`llmlingua` が必要）にのみ必要。Skillのセキュリティスキャンとchannel返信はすでにRustネイティブ実装で、Pythonには依存しません
 
@@ -97,7 +95,7 @@ open http://localhost:18789
 
 最低いずれか1組が利用可能である必要があります。DuDuClawは `agent.toml [runtime]` と
 `[model] api_mode` に基づいてどれを使うか決定します。詳細は
-[§6 三大CLIの認証設定](#6-三大cliの認証設定)を参照してください。
+[§6 CLI の認証設定](#6-cli-の認証設定)を参照してください。
 
 ### 4.2 Channel Tokens
 
@@ -202,23 +200,27 @@ docker compose up -d
 
 ---
 
-## 6. 三大CLIの認証設定
+## 6. CLI の認証設定
 
-3つのruntimeにはそれぞれ2種類の認証経路があります。**OAuth**（追加費用なし、サブスクリプションプランを使用）
-と **APIキー**（従量課金のfallback）です。実務上は「まずOAuthを設定し、
-保険としてAPIキーも1つ用意しておく」ことをお勧めします。
+イメージには Claude、Codex、Antigravity、Grok が含まれます。ログイン方法は CLI ごとに異なります。Codex はデバイスコードを使うため、ブラウザからコンテナ内のコールバックリスナーに接続する必要はありません。課金と予備のために API キーも用意してください。
 
-コンテナ内の3つのOAuth状態ディレクトリには、それぞれ独立したnamed volumeがあります。
+標準の Compose ファイルは以下の認証情報・設定ディレクトリをマウントします。
 
 | パス | Volume | CLI |
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
-| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Gemini |
+| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Antigravity 設定 |
+| `/home/duduclaw/.grok` | `duduclaw-grok` | Grok |
+| `/home/duduclaw/.kimi-code` | `duduclaw-kimi` | Kimi Code |
+| `/home/duduclaw/.copilot` | `duduclaw-copilot` | GitHub Copilot CLI |
+| `/home/duduclaw/.kiro` | `duduclaw-kiro` | Kiro CLI |
+| `/home/duduclaw/.cursor` | `duduclaw-cursor` | Cursor CLI |
+| `/home/duduclaw/.local/share/opencode` | `duduclaw-opencode` | OpenCode |
 
 つまり、**一度ログインすればコンテナを再構築してもログインし直す必要はありません**。
 
-> **サブスクリプションでのログインにはアカウントのリスクがあります。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。1 つのサブスクリプションでチャネルの顧客に返信すること、複数のサブスクリプションをローテーションして利用上限を避けること、トークンを DuDuClaw に保存することは、いずれもこの規約と衝突します。Google の [Gemini CLI 規約](https://geminicli.com/docs/resources/tos-privacy/)と [Antigravity 規約](https://antigravity.google/terms)には、サードパーティのソフトウェアから Gemini CLI や Antigravity の OAuth を使ってサービスにアクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。OpenAI には公式の [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) プログラムがあり、サードパーティのアプリで ChatGPT プランを使えるのはオープンソースのパートナーと選ばれた商用パートナーで、商用製品には OpenAI の承認が必要です。認証トークンはユーザーが管理するローカル環境に置き、リモートやマネージド環境には置かないこととされています。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインで、引き続き使えますが、API キーの利用を推奨します。ダッシュボードのログインフローでは、先にこの説明への同意を求めます。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
+> **サブスクリプションでのログインにはアカウントのリスクがあります。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。1 つのサブスクリプションでチャネルの顧客に返信すること、複数のサブスクリプションをローテーションして利用上限を避けること、トークンを DuDuClaw に保存することは、いずれもこの規約と衝突します。Google の [Antigravity 規約](https://antigravity.google/terms)には、サードパーティのソフトウェアから Antigravity の OAuth を使ってサービスにアクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。OpenAI には公式の [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) プログラムがあり、サードパーティのアプリで ChatGPT プランを使えるのはオープンソースのパートナーと選ばれた商用パートナーで、商用製品には OpenAI の承認が必要です。認証トークンはユーザーが管理するローカル環境に置き、リモートやマネージド環境には置かないこととされています。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインで、引き続き使えますが、API キーの利用を推奨します。ダッシュボードのログインフローでは、先にこの説明への同意を求めます。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
 
 ### 6.1 Claude Code CLI
 
@@ -289,8 +291,9 @@ DuDuClawのAccountRotatorが複数アカウント間で自動的にローテー�
 
 ```bash
 docker compose exec duduclaw bash
-codex login
-# ChatGPTアカウントのパスワードを入力するか、ブラウザの案内に従う
+codex login --device-auth
+# Codex が表示する認証ページをブラウザで開き、デバイスコードを入力する。
+# CLI の完了表示を待つ。コールバック URL をダッシュボードに貼り付ける必要はない。
 # 状態は /home/duduclaw/.codex/ に書き込まれる（duduclaw-codex volume）
 exit
 ```
@@ -307,31 +310,15 @@ OPENAI_API_KEY=sk-proj-...
 
 従量課金（OpenAI APIの料金体系）です。
 
-### 6.3 Gemini（Google）CLI（非推奨）
+### 6.3 Antigravity（Google）の API キーモード
 
-> **v1.67.0 で非推奨、v1.75.0 で削除予定。** Google は 2026-06-18 に、無料、Google AI Pro、Google AI Ultra の個人アカウントに対する Gemini CLI での提供を停止したため、個人の Google ログインではもう使えません。API キーとエンタープライズ（Gemini Code Assist）での利用は影響を受けません。イメージは削除まで Gemini CLI を同梱し続けます。代わりに Antigravity ランタイム（`antigravity`、実行ファイル `agy`）を使ってください。詳細は[非推奨となった名称](deprecations.md)を参照してください。
->
-> `agy` 経由の Antigravity サインインにはターミナルと OS キーリングが必要ですが、コンテナにはどちらもありません。コンテナでは API キーモードを使います。`config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー（`gemini` プロバイダーアカウント、または下記の `GEMINI_API_KEY`）を用意してください。Antigravity も設定を `~/.gemini` 配下に保存するため、下記の `duduclaw-gemini` volume は残します。
-
-#### 方法A：Google OAuth（Gemini Code Assist／エンタープライズアカウントのみ）
-
-```bash
-docker compose exec duduclaw bash
-gemini auth
-# 画面の指示に従いローカルのブラウザでGoogleログインを完了する
-# 状態は /home/duduclaw/.gemini/ に書き込まれる（duduclaw-gemini volume）
-exit
-```
-
-#### 方法B：APIキーFallback
-
-`.env`：
-
-```bash
-GEMINI_API_KEY=AIza...
-```
-
-Google AI Studioの料金体系で課金されます。
+Docker イメージに Gemini CLI は含まれなくなりました。Antigravity（`agy`）と
+Gemini API プロバイダーは引き続きサポートします。`agy` のサブスクリプション
+サインインには OS キーリングが必要です。コンテナでは
+`config.toml [antigravity] auth = "api_key"` を設定し、`gemini` プロバイダー
+アカウントまたは `.env` の `GEMINI_API_KEY` を使ってください。
+Antigravity の設定は `~/.gemini/antigravity-cli/` にあるため、
+`duduclaw-gemini` volume は残します。
 
 ### 6.4 Agent単位でのRuntime指定
 
@@ -341,7 +328,7 @@ Google AI Studioの料金体系で課金されます。
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-provider = "claude"       # メインruntime：claude / codex / antigravity / openai-compat …（geminiは非推奨）
+provider = "claude"       # メインruntime：claude / codex / antigravity / openai-compat …
 fallback = "antigravity"  # Claudeが利用不可の際に自動切り替え
 ```
 
@@ -350,15 +337,14 @@ fallback = "antigravity"  # Claudeが利用不可の際に自動切り替え
 
 `provider` を指定しない場合、エージェントは Claude で動作します。
 
-### 6.5 3つのCLIがすべて認識されているか確認
+### 6.5 インストール済み CLI の確認
 
 ```bash
 docker compose exec duduclaw bash
 
-# 3つともバージョンが表示されるはず
+# インストール済み CLI のバージョンを表示
 claude --version
 codex --version
-gemini --version
 
 # Claudeのログイン状態
 claude auth status
@@ -368,14 +354,20 @@ claude auth status
 
 ## 7. データ永続化（Volumes）
 
-`docker-compose.yml` は4つのnamed volumeを宣言しています。
+`docker-compose.yml` は 10 個の named volume を宣言しています。
 
 | Volume | 内容 | バックアップの推奨度 |
 |--------|------|---------|
 | `duduclaw-data` | メインデータ：config、agents、memory SQLite、logs、bus_queue.jsonl | **最重要**。毎日バックアップ推奨 |
 | `duduclaw-claude` | Claude CLI OAuth状態 | 中程度。失っても `claude auth login` をやり直せばよい |
 | `duduclaw-codex`  | Codex OAuth状態 | 中程度 |
-| `duduclaw-gemini` | Gemini OAuth状態 | 中程度 |
+| `duduclaw-gemini` | Antigravity の `~/.gemini` 設定 | 中程度 |
+| `duduclaw-grok` | Grok CLI の認証情報 | 中程度 |
+| `duduclaw-kimi` | Kimi Code の認証情報 | 中程度 |
+| `duduclaw-copilot` | Copilot CLI の認証情報 | 中程度 |
+| `duduclaw-kiro` | Kiro CLI の認証情報 | 中程度 |
+| `duduclaw-cursor` | Cursor CLI の認証情報 | 中程度 |
+| `duduclaw-opencode` | OpenCode の認証情報 | 中程度 |
 
 さらにホスト側からマウントするパスがあります。
 
@@ -415,13 +407,19 @@ docker run --rm \
       - ./data/claude:/home/duduclaw/.claude
       - ./data/codex:/home/duduclaw/.codex
       - ./data/gemini:/home/duduclaw/.gemini
+      - ./data/grok:/home/duduclaw/.grok
+      - ./data/kimi:/home/duduclaw/.kimi-code
+      - ./data/copilot:/home/duduclaw/.copilot
+      - ./data/kiro:/home/duduclaw/.kiro
+      - ./data/cursor:/home/duduclaw/.cursor
+      - ./data/opencode:/home/duduclaw/.local/share/opencode
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 ホスト側ディレクトリの**ownerはUID 1000でなければならない**点に注意してください（コンテナ内の `duduclaw` ユーザー）。
 
 ```bash
-mkdir -p data/{duduclaw,claude,codex,gemini}
+mkdir -p data/{duduclaw,claude,codex,gemini,grok,kimi,copilot,kiro,cursor,opencode}
 sudo chown -R 1000:1000 data/
 ```
 
@@ -688,7 +686,7 @@ docker volume ls | grep duduclaw
 ```
 
 もしどれかが欠けていれば、composeファイルが変更されたか、過去に `docker compose down -v` が実行されたことを意味します。
-`claude auth login` / `codex login` / `gemini auth` を再度実行してください。
+`claude auth login` / `codex login --device-auth` を再度実行してください。
 
 ---
 

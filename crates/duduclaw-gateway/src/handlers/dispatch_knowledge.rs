@@ -10,6 +10,25 @@ impl MethodHandler {
         ctx: &UserContext,
         conn: crate::power_local::RpcConnInfo,
     ) -> WsFrame {
+        // Credentials and login sessions are security-sensitive. The WebSocket
+        // handshake context can outlive a role change or account deletion, so
+        // resolve these methods against the current authority on every call.
+        let live_ctx = if method.starts_with("accounts.") || method.starts_with("auth.cli_login.") {
+            if ctx.user_id == "system" && conn.legacy_admin_authenticated {
+                Some(ctx.clone())
+            } else {
+                match crate::review_evidence::audience::trusted_dashboard_principal(
+                    &self.home_dir,
+                    &ctx.user_id,
+                ) {
+                    Ok(live) => Some(live),
+                    Err(_) => return WsFrame::error_response("", "permission denied"),
+                }
+            }
+        } else {
+            None
+        };
+        let ctx = live_ctx.as_ref().unwrap_or(ctx);
         // ── ACL macros ───────────────────────────────────────
         // Helper: require minimum role, return error frame on failure.
         macro_rules! require_admin {
@@ -93,15 +112,19 @@ impl MethodHandler {
                         return frame;
                     }
                 }
-                self.handle_accounts_add(params).await
+                self.handle_accounts_add_authorized(params, ctx, conn).await
             }
             "accounts.update_budget" => {
                 require_admin!();
-                self.handle_accounts_update_budget(params).await
+                self.handle_accounts_update_budget_authorized(params, ctx, conn).await
             }
             "accounts.update" => {
                 require_admin!();
-                self.handle_accounts_update(params).await
+                self.handle_accounts_update_authorized(params, ctx, conn).await
+            }
+            "accounts.remove" => {
+                require_admin!();
+                self.handle_accounts_remove_authorized(params, ctx, conn).await
             }
             // Interactive CLI login ("Dashboard 一鍵登入") — drives the CLI's
             // native login in a PTY and streams it to the dashboard.
@@ -131,23 +154,23 @@ impl MethodHandler {
                 {
                     return frame;
                 }
-                self.handle_cli_login_start(params).await
+                self.handle_cli_login_start(params, ctx, conn).await
             }
             "auth.cli_login.input" => {
                 require_admin!();
-                self.handle_cli_login_input(params).await
+                self.handle_cli_login_input(params, ctx, conn).await
             }
             "auth.cli_login.status" => {
                 require_admin!();
-                self.handle_cli_login_status(params).await
+                self.handle_cli_login_status(params, ctx).await
             }
             "auth.cli_login.cancel" => {
                 require_admin!();
-                self.handle_cli_login_cancel(params).await
+                self.handle_cli_login_cancel(params, ctx).await
             }
             "auth.cli_login.finalize" => {
                 require_admin!();
-                self.handle_cli_login_finalize(params).await
+                self.handle_cli_login_finalize(params, ctx, conn).await
             }
             // WP-D: "訂閱帳號" device-code-style setup wizard — a guided,
             // single-flight, pre-validated specialization of the generic
@@ -168,19 +191,19 @@ impl MethodHandler {
                 ) {
                     return frame;
                 }
-                self.handle_accounts_setup_token_start().await
+                self.handle_accounts_setup_token_start(ctx, conn).await
             }
             "accounts.setup_token_submit" => {
                 require_admin!();
-                self.handle_accounts_setup_token_submit(params).await
+                self.handle_accounts_setup_token_submit(params, ctx, conn).await
             }
             "accounts.setup_token_status" => {
                 require_admin!();
-                self.handle_accounts_setup_token_status(params).await
+                self.handle_accounts_setup_token_status(params, ctx).await
             }
             "accounts.setup_token_cancel" => {
                 require_admin!();
-                self.handle_accounts_setup_token_cancel(params).await
+                self.handle_accounts_setup_token_cancel(params, ctx).await
             }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────

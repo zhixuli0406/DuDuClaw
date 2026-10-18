@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
   AlertTriangle,
@@ -42,15 +42,20 @@ function stripAnsi(s: string): string {
 }
 /* eslint-enable no-control-regex */
 
-export type LoginRuntime = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok';
+export type LoginRuntime = 'claude' | 'codex' | 'antigravity' | 'grok'
+  | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode';
 
 /** Product names — verbatim. Grok's subscription qualifier is appended from i18n. */
 const RUNTIME_LABELS: Record<LoginRuntime, string> = {
   claude: 'Claude',
   codex: 'Codex',
-  gemini: 'Gemini',
   antigravity: 'Antigravity (agy)',
   grok: 'Grok',
+  kimi: 'Kimi Code',
+  copilot: 'GitHub Copilot',
+  kiro: 'Kiro CLI',
+  cursor: 'Cursor CLI',
+  opencode: 'OpenCode',
 };
 
 interface Props {
@@ -85,10 +90,43 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   const [started, setStarted] = useState(false);
   const outRef = useRef<HTMLPreElement>(null);
   const sidRef = useRef<string | null>(null);
+  const finalizedRef = useRef(false);
 
   // Derive a readable transcript + the one-click auth URL from the raw stream.
   const clean = useMemo(() => stripAnsi(output), [output]);
   const authUrl = useMemo(() => extractAuthUrl(clean), [clean]);
+
+  const handleTerminalStatus = useCallback((sid: string, next: 'succeeded' | 'failed' | 'exited') => {
+    if (sid !== sidRef.current) return;
+    setStatus(next);
+    if (next !== 'succeeded' || finalizedRef.current) return;
+    finalizedRef.current = true;
+    api.auth
+      .cliLoginFinalize(sid)
+      .then((r) =>
+        setRegisterMsg(
+          r.registered
+            ? intl.formatMessage({ id: 'cliLogin.registered' })
+            : r.reason === 'cli_store'
+              ? intl.formatMessage(
+                  { id: 'cliLogin.registered.cliStore' },
+                  { store: r.store ?? intl.formatMessage({ id: 'cliLogin.registered.cliStore.fallback' }) },
+                )
+              : r.reason
+                ? intl.formatMessage({ id: 'cliLogin.registered.noneReason' }, { reason: r.reason })
+                : intl.formatMessage({ id: 'cliLogin.registered.none' }),
+        ),
+      )
+      .catch((e: unknown) =>
+        setRegisterMsg(
+          intl.formatMessage(
+            { id: 'cliLogin.registerFailed' },
+            { message: e instanceof Error ? e.message : String(e) },
+          ),
+        ),
+      )
+      .finally(() => onSuccess?.());
+  }, [intl, onSuccess]);
 
   // Start the login session once the modal is open AND the risk disclosure
   // has been acknowledged (`started`) — never on open alone.
@@ -101,16 +139,29 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     setRegisterMsg(null);
     setInput('');
     sidRef.current = null;
+    finalizedRef.current = false;
     api.auth
       // Only reached after the disclosure checkbox (`started` requires
       // `riskAck`); the gateway refuses the call without this flag.
       .cliLoginStart(runtime, riskAck)
       .then((r) => {
-        if (cancelled) return;
+        if (cancelled) {
+          // The user can close the dialog before the start RPC returns. The
+          // gateway has already spawned the login process, so stop it now.
+          void api.auth.cliLoginCancel(r.session_id).catch(() => {});
+          return;
+        }
         sidRef.current = r.session_id;
+        setOutput(r.output ?? '');
         setRemoteSafe(r.remote_safe);
         setHint(r.hint);
         setProgram(r.program);
+        void api.auth.cliLoginStatus(r.session_id).then((snapshot) => {
+          const buffered = snapshot.output;
+          if (cancelled) return;
+          if (buffered) setOutput((current) => buffered.length > current.length ? buffered : current);
+          if (snapshot.status !== 'running') handleTerminalStatus(r.session_id, snapshot.status);
+        }).catch(() => {});
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -124,7 +175,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [open, runtime, started, riskAck]);
+  }, [open, runtime, started, riskAck, handleTerminalStatus, intl]);
 
   // Stream output + terminal status from the gateway event bus.
   useEffect(() => {
@@ -136,48 +187,13 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     });
     const offStatus = client.subscribe('auth.cli_login.status', (p) => {
       const pl = p as { session_id: string; status: 'succeeded' | 'failed' | 'exited' };
-      if (pl.session_id !== sidRef.current) return;
-      setStatus(pl.status);
-      if (pl.status === 'succeeded') {
-        const sid = sidRef.current;
-        // Register the account the login produced (the CLI only PRINTS its token),
-        // then refresh the parent so it appears in the account list.
-        if (sid) {
-          api.auth
-            .cliLoginFinalize(sid)
-            .then((r) =>
-              setRegisterMsg(
-                r.registered
-                  ? intl.formatMessage({ id: 'cliLogin.registered' })
-                  : r.reason === 'cli_store'
-                    ? intl.formatMessage(
-                        { id: 'cliLogin.registered.cliStore' },
-                        { store: r.store ?? intl.formatMessage({ id: 'cliLogin.registered.cliStore.fallback' }) },
-                      )
-                    : r.reason
-                      ? intl.formatMessage({ id: 'cliLogin.registered.noneReason' }, { reason: r.reason })
-                      : intl.formatMessage({ id: 'cliLogin.registered.none' }),
-              ),
-            )
-            .catch((e: unknown) =>
-              setRegisterMsg(
-                intl.formatMessage(
-                  { id: 'cliLogin.registerFailed' },
-                  { message: e instanceof Error ? e.message : String(e) },
-                ),
-              ),
-            )
-            .finally(() => onSuccess?.());
-        } else {
-          onSuccess?.();
-        }
-      }
+      handleTerminalStatus(pl.session_id, pl.status);
     });
     return () => {
       offOut();
       offStatus();
     };
-  }, [open, onSuccess, intl]);
+  }, [open, handleTerminalStatus]);
 
   // Auto-scroll the terminal.
   useEffect(() => {
@@ -315,7 +331,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             {clean.trim() || intl.formatMessage({ id: 'cliLogin.starting' })}
           </pre>
 
-          <div className="flex items-center gap-2">
+          {runtime !== 'codex' && <div className="flex items-center gap-2">
             <Input
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -339,7 +355,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             >
               <SendHorizonal className="h-4 w-4" />
             </Button>
-          </div>
+          </div>}
 
           {registerMsg && status === 'succeeded' && (
             <p className="text-xs text-muted-foreground">{registerMsg}</p>

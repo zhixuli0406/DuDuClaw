@@ -58,7 +58,6 @@ import { WelcomePage } from './WelcomePage';
 const DETECT_ABSENT: RuntimeDetect = {
   claude_cli: false,
   codex: false,
-  gemini: false,
   antigravity: false,
   grok: false,
   claude_oauth: false,

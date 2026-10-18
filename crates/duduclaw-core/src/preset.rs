@@ -133,7 +133,7 @@ pub fn bindings_history_path(home: &Path) -> PathBuf {
 /// outside every agent's cwd. A `workspace-write` sandbox scopes writes to
 /// the agent's own directory (and the project it's working in), so a
 /// sibling-of-`agents/` path is out of reach by construction, for every
-/// runtime (Claude/codex/gemini/antigravity/openai-compat alike — unlike a
+/// runtime (Claude/codex/antigravity/openai-compat alike — unlike a
 /// `PreToolUse` hook, which only exists for the Claude runtime).
 pub fn agent_resolved_path(home: &Path, agent_id: &str) -> PathBuf {
     home.join(AGENT_RESOLVED_DIR).join(format!("{agent_id}.toml"))

@@ -28,14 +28,19 @@
     - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；目錄要是 root 擁有的 0700、狀態檔要是 root 擁有的 0600 單一連結一般檔，不符或讀寫失敗就拒絕；狀態檔時間在未來時改寫成現在並記一筆警告，不會卡到重開機）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
 
 ### Fixed
+- Docker／遠端 Dashboard 的 Codex 一鍵登入改用 `codex login --device-auth`：使用者在瀏覽器輸入 CLI 顯示的裝置碼，等待 CLI 完成，不再依賴容器內 `127.0.0.1:1455` 回呼，也不需把 callback URL 的 `code` 貼進 Dashboard。帳號頁的 API Token 卡片新增刪除動作，確認帳號 id 後移除 DuDuClaw 儲存的那筆帳號。這不會撤銷供應商端的金鑰。
+- 一鍵登入選單加入 Kimi、Copilot、Kiro 與 OpenCode，Grok 的訂閱說明改為獨立一行，避免窄版選單換行錯位。Cursor 的瀏覽器回呼無法可靠地從遠端 Dashboard 完成，因此保留 runtime 支援但不提供一鍵登入；Antigravity 沒有可腳本化的登入指令，Qwen／Mistral Vibe 使用 API key。
+- CLI 一鍵登入的輸出與工作階段操作限定啟動該流程的管理員；初始化階段與共用的舊式管理 token 無法使用互動登入，須先建立並以個別 Dashboard 帳號登入。憑證相關 RPC 每次重新確認目前權限，管理員遭降權或停用後，既有 WebSocket 不能繼續操作帳號與登入流程。
 - 維修模式通知改為同時嘗試所有管理員的已驗證通道。每條通道有獨立的 20 秒上限，單次 HTTP 請求仍是 10 秒，整體 30 秒保留作最後防線；一條通道卡住不會阻止其他通道開始送出，成功數只計回報傳送成功的通道。
 - 閘道重啟後，先完成維修 SSH 的舊視窗清理，再接受新的開啟請求，避免背景清理誤關剛開好的視窗；等待期間仍可查詢狀態。只有取得該資料目錄執行鎖的閘道能開啟或關閉維修模式，第二個閘道只能讀取狀態。
 - SSH 關閉未確認的警示會保留到系統服務確認關閉；新開的診斷詳情視窗不會遮掉警示。確認結果另外記錄，原先的關閉錯誤仍保留在歷史裡。
 
 ### Security
 - 將 HTML 清理依賴 ammonia 固定在修補版 4.1.8，排除 RUSTSEC-2026-0373 的 CSS `URL()` 大小寫繞過；加入帶引號 URL 的回歸測試。
+- 將 ZIP 讀寫依賴統一升至修補版 9.0.4，移除 RUSTSEC-2026-0367、0368、0369 所影響的 2.x／8.x。XLSX 輸出使用正式版 rust_xlsxwriter 0.100.0；calamine 0.36.1 暫以調整 ZIP 版本約束及名稱讀取錯誤傳遞的原始碼副本銜接，Windows 桌面更新器 tauri-plugin-updater 2.10.1 也以相同方式升級 ZIP 解壓依賴。CI 逐檔核對兩份官方 crate 與明列的修補內容。
 
 ### Changed
+- Gemini CLI `gemini` runtime 已從 runtime 目錄、執行路徑、Dashboard 選項與 Docker 安裝中移除；舊的員工／judge／團隊 runtime 設定需改成 `antigravity`。Gemini API provider、`GEMINI_API_KEY` 與 Antigravity 的 `~/.gemini/antigravity-cli/` 設定繼續支援。先前版本的延期紀錄保留在下方。
 - npm 包裝補上安裝、獨立 MCP 模式與文件入口的 README；六個 npm manifest 的 repository URL 改為 npm 標準的 `git+https` 格式。既有 1.74.0 不會因此改變，須隨下一次 npm 發布上線。
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
 - `LICENSING.md` 的商標說明由「爪印 Logo」改為 C1 坐姿貓標誌，並指向 `docs/assets/brand/` 的素材與使用規範；爪印自 v1.74.0 起已不是產品標誌。
@@ -97,7 +102,6 @@
 - 整數參數（例如 `wiki_graph` 的 `depth`、`wiki_search` 的 `limit`）收到 `10.0` 這種整數值的浮點數時被當成沒填、改用預設值。現在視為 10；有小數、負數或超出範圍的值仍當成沒填。
 
 ### Security
-- 將 ZIP 讀寫依賴統一升至修補版 9.0.4，移除 RUSTSEC-2026-0367、0368、0369 所影響的 2.x／8.x。XLSX 輸出使用正式版 rust_xlsxwriter 0.100.0；calamine 0.36.1 暫以調整 ZIP 版本約束及名稱讀取錯誤傳遞的原始碼副本銜接，Windows 桌面更新器 tauri-plugin-updater 2.10.1 也以相同方式升級 ZIP 解壓依賴。CI 逐檔核對兩份官方 crate 與明列的修補內容。
 - `wiki_share` 沒有檢查頁面路徑：`../`、絕對路徑或指向 wiki 外的符號連結都能讓它讀取員工自己 wiki 以外、行程讀得到的任何檔案，並把前 500 個字元（或呼叫者給的摘要）公開到所有員工都讀得到的共用 wiki，唯一的擋點是機密字樣掃描。現在跟 `wiki_read` 用同一道檢查，讀取時另外拒絕解析到 wiki 目錄外的連結。
 - **BREAKING**（預定隨 v1.74.0 發布，minor 版）：自己寫的 WebSocket／RPC 用戶端呼叫下列方法時必須帶 `accept_subscription_risk: true`，否則會被拒絕（錯誤碼 `subscription_risk_not_accepted`）：`auth.cli_login.start`（所有有腳本化登入的 runtime：Claude、Codex、Gemini、Grok）、`accounts.setup_token_start`、`type = "oauth"` 的 `accounts.add`，以及新增 `type = "oauth"` 帳號的 `config.raw.set`。dashboard 只在使用者勾選風險說明後才送出這個參數，不受影響。操作者指令 `duduclaw auth device --provider copilot` 同樣要加 `--accept-subscription-risk` 才會執行。DuDuClaw OS 的首次設定也呼叫 `auth.cli_login.start`：v0.4.0 以前的映像內嵌 v1.73.4 不受影響，OS shell 的對應修改（DuDuClaw-OS #21）要在 OS 映像內嵌 v1.74.0 之前出貨。升級說明見 `docs/guides/deprecations.md`。
 - 訂閱帳號憑證改由 gateway 把關：上面四個 RPC 缺少同意旗標就拒絕，回傳結構化錯誤 `{code, message, param, provider, policy_url}`，dashboard 依語系顯示。之前只有 dashboard 的勾選框在擋，自己寫的 WebSocket 用戶端可以跳過。拒絕訊息與稽核紀錄的條款連結依 runtime／provider 選擇：Claude 帳號是 Anthropic 的法律與合規說明，Codex 是 OpenAI 使用條款，Gemini CLI 與 Antigravity 是 Google 各自的條款頁，Grok 是 xAI 服務條款。每次同意在 `security_audit.jsonl` 寫一筆 `subscription_risk_accepted`（時間、方法、provider、帳號 id、操作的使用者與 email、`policy_url`、`outcome = "acknowledged"`），`note` 欄位寫明這筆代表已同意，不代表登入或儲存成功。`auth.cli_login.finalize` 與 `accounts.setup_token_submit` 內部重用 `accounts.add` 時不再問一次；API 金鑰帳號不受影響。關卡在 dispatch 層，程式在 `crates/duduclaw-gateway/src/subscription_risk_gate.rs`。

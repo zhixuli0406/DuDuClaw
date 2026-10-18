@@ -3975,7 +3975,7 @@ mod tests {
     async fn bus_delegation_lane_is_honoured_and_never_coalesced_away() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
-        for (name, extra) in [("reader", ""), ("coder", "[runtime]\nprovider = \"gemini\"\n")] {
+        for (name, extra) in [("reader", ""), ("coder", "[runtime]\nprovider = \"antigravity\"\n")] {
             let dir = home.join("agents").join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -5548,14 +5548,14 @@ bot_token = "{token}"
             "[agent]\nname = \"compat\"\n[runtime]\nprovider = \"openai-compat\"\n",
         );
         write("codex", "[agent]\nname = \"codex\"\n[runtime]\nprovider = \"codex\"\n");
-        write("gemini", "[agent]\nname = \"gemini\"\n[runtime]\nprovider = \"gemini\"\n");
+        write("antigravity", "[agent]\nname = \"antigravity\"\n[runtime]\nprovider = \"antigravity\"\n");
         write(
             "boxed",
             "[agent]\nname = \"boxed\"\n[container]\nsandbox_enabled = true\n",
         );
 
         // Neither source ⇒ normal lane, whatever the runtime.
-        assert_eq!(resolve_dispatch_lane(home, "gemini", Ok(false), None), Ok(false));
+        assert_eq!(resolve_dispatch_lane(home, "antigravity", Ok(false), None), Ok(false));
         // Each source alone puts a supported runtime in the lane.
         for agent in ["claude", "compat", "codex"] {
             assert_eq!(resolve_dispatch_lane(home, agent, Ok(true), None), Ok(true));
@@ -5565,7 +5565,7 @@ bot_token = "{token}"
             );
         }
         // Each source refuses an unsupported runtime and a sandboxed employee.
-        for agent in ["gemini", "boxed"] {
+        for agent in ["antigravity", "boxed"] {
             for (resp, lane) in [(Ok(true), None), (Ok(false), Some("explore"))] {
                 let err = resolve_dispatch_lane(home, agent, resp, lane).unwrap_err();
                 assert!(err.starts_with("explore_lane_unsupported"), "{agent}: {err}");
@@ -5582,7 +5582,7 @@ bot_token = "{token}"
                     (
                         crate::explore_lane::in_explore(),
                         crate::explore_lane::lane_env().is_some(),
-                        crate::explore_lane::refuse_unsupported_runtime("gemini").is_err(),
+                        crate::explore_lane::refuse_unsupported_runtime("antigravity").is_err(),
                     )
                 })
                 .await;

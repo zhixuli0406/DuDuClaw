@@ -11,7 +11,7 @@ impl MethodHandler {
     // reports terminal status. See `cli_auth.rs` for the per-CLI registry and
     // the local-callback-vs-remote feasibility constraint.
 
-    pub(crate) async fn handle_cli_login_start(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_cli_login_start(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
         let runtime_str = params.get("runtime").and_then(|v| v.as_str()).unwrap_or("");
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, runtime_str) {
             return WsFrame::error_response("", &e);
@@ -48,6 +48,12 @@ impl MethodHandler {
                 return WsFrame::error_response("", &no_login_message(runtime_str, runtime.spec()));
             }
         };
+        if !spec.remote_safe {
+            return WsFrame::error_response(
+                "",
+                "此 CLI 登入需要 localhost callback，Dashboard 無法可靠完成；請在 CLI 所在電腦的終端登入，或改用該 CLI 的 API key。",
+            );
+        }
 
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let session = match crate::cli_auth::AuthSession::spawn(
@@ -65,17 +71,24 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("failed to start login: {e}")),
         };
         let program = session.program.clone();
+        let write_guard = super::accounts_add_rpc::CredentialWriteGuard::new(&self.home_dir, ctx, conn);
+        if write_guard.verify_admin().is_err() {
+            session.kill();
+            return WsFrame::error_response("", "permission denied");
+        }
 
         self.cli_auth_sessions
             .write()
             .await
-            .insert(session_id.clone(), session.clone());
+            .insert(session_id.clone(), (ctx.user_id.clone(), session.clone()));
 
         // Forward PTY output + terminal status to the dashboard event stream.
         if let Some(tx) = self.event_tx.read().await.clone() {
             let mut rx = session.subscribe();
             let sess = session.clone();
             let sid = session_id.clone();
+            let owner_user_id = ctx.user_id.clone();
+            let write_guard = write_guard.clone();
             tokio::spawn(async move {
                 use tokio::sync::broadcast::error::RecvError;
                 let emit = |event: &str, payload: Value| {
@@ -88,6 +101,10 @@ impl MethodHandler {
                     let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
                 };
                 loop {
+                    if write_guard.verify_admin().is_err() {
+                        sess.kill();
+                        break;
+                    }
                     match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
                         .await
                     {
@@ -95,7 +112,7 @@ impl MethodHandler {
                             let data = String::from_utf8_lossy(&bytes).to_string();
                             emit(
                                 "auth.cli_login.output",
-                                json!({"session_id": sid, "data": data}),
+                                json!({"session_id": sid, "owner_user_id": owner_user_id, "data": data}),
                             );
                         }
                         Ok(Err(RecvError::Lagged(_))) => continue,
@@ -105,7 +122,7 @@ impl MethodHandler {
                     if sess.status().is_terminal() {
                         emit(
                             "auth.cli_login.status",
-                            json!({"session_id": sid, "status": sess.status().as_str()}),
+                            json!({"session_id": sid, "owner_user_id": owner_user_id, "status": sess.status().as_str()}),
                         );
                         break;
                     }
@@ -122,11 +139,12 @@ impl MethodHandler {
                 "remote_safe": spec.remote_safe,
                 "hint": spec.hint,
                 "status": "running",
+                "output": session.output_snapshot(),
             }),
         )
     }
 
-    pub(crate) async fn handle_cli_login_input(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_cli_login_input(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
         let sid = params
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -137,8 +155,9 @@ impl MethodHandler {
         let session = {
             let sessions = self.cli_auth_sessions.read().await;
             match sessions.get(sid) {
-                Some(s) => s.clone(),
+                Some((owner, session)) if owner == &ctx.user_id => session.clone(),
                 None => return WsFrame::error_response("", "login session not found"),
+                Some(_) => return WsFrame::error_response("", "login session not found"),
             }
         };
         tracing::info!(
@@ -162,6 +181,10 @@ impl MethodHandler {
             Some(body) => Some((body, "\r")),
             None => None,
         };
+        let write_guard = super::accounts_add_rpc::CredentialWriteGuard::new(&self.home_dir, ctx, conn);
+        if write_guard.verify_admin().is_err() {
+            return WsFrame::error_response("", "permission denied");
+        }
         let write_res = match body_and_term {
             Some((body, term)) => {
                 let r1 = if body.is_empty() {
@@ -171,6 +194,10 @@ impl MethodHandler {
                 };
                 if r1.is_ok() {
                     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                    if write_guard.verify_admin().is_err() {
+                        session.kill();
+                        return WsFrame::error_response("", "permission denied");
+                    }
                     session.write_input(term.as_bytes())
                 } else {
                     r1
@@ -184,13 +211,13 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_cli_login_status(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_cli_login_status(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let sid = params
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let sessions = self.cli_auth_sessions.read().await;
-        let Some(session) = sessions.get(sid) else {
+        let Some((owner, session)) = sessions.get(sid).filter(|(owner, _)| owner == &ctx.user_id) else {
             return WsFrame::error_response("", "login session not found");
         };
         WsFrame::ok_response(
@@ -198,16 +225,19 @@ impl MethodHandler {
             json!({
                 "session_id": sid,
                 "status": session.status().as_str(),
+                "output": session.output_snapshot(),
             }),
         )
     }
 
-    pub(crate) async fn handle_cli_login_cancel(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_cli_login_cancel(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let sid = params
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if let Some(session) = self.cli_auth_sessions.write().await.remove(sid) {
+        let mut sessions = self.cli_auth_sessions.write().await;
+        if sessions.get(sid).is_some_and(|(owner, _)| owner == &ctx.user_id)
+            && let Some((_, session)) = sessions.remove(sid) {
             session.kill();
         }
         WsFrame::ok_response("", json!({"success": true}))
@@ -219,7 +249,7 @@ impl MethodHandler {
     /// entry and refreshes the rotator so it shows up immediately. Idempotent-ish:
     /// each call makes a uniquely-named account. No-op (not an error) when the
     /// session didn't succeed or no token was captured.
-    pub(crate) async fn handle_cli_login_finalize(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_cli_login_finalize(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
         let sid = params
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -227,8 +257,9 @@ impl MethodHandler {
         let session = {
             let sessions = self.cli_auth_sessions.read().await;
             match sessions.get(sid) {
-                Some(s) => s.clone(),
+                Some((owner, session)) if owner == &ctx.user_id => session.clone(),
                 None => return WsFrame::error_response("", "login session not found"),
+                Some(_) => return WsFrame::error_response("", "login session not found"),
             }
         };
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, session.runtime.as_str()) {
@@ -279,7 +310,7 @@ impl MethodHandler {
             "priority": 1,
             "monthly_budget_cents": 0,
         });
-        let res = self.handle_accounts_add(add).await;
+        let res = self.handle_accounts_add_authorized(add, ctx, conn).await;
         // Drop the cached rotator so accounts.list / budget_summary rebuild from
         // the just-written config and surface the new account immediately.
         crate::claude_runner::invalidate_rotator_cache().await;

@@ -892,7 +892,7 @@ impl MethodHandler {
                         && !crate::runtime_config::model_matches_provider(&model, provider)
                     {
                         let inferred = crate::runtime_config::infer_provider_for_model(&model);
-                        let (inferred, skipped) = auto_align_target(inferred);
+                        let (inferred, skipped) = auto_align_target(inferred, &model);
                         if let Some(reason) = skipped {
                             // Reported through the response field only: a
                             // skip is not a change, so it must not satisfy
@@ -900,7 +900,7 @@ impl MethodHandler {
                             tracing::info!(
                                 model = %model,
                                 reason,
-                                "runtime.provider not auto-aligned: the matching runtime is deprecated"
+                                "runtime.provider not auto-aligned: inferred runtime cannot safely use this model spelling"
                             );
                             if let Ok(mut slot) = align_skipped_for_closure.lock() {
                                 *slot = Some(reason);
@@ -1130,16 +1130,22 @@ impl MethodHandler {
     }
 }
 
-/// R1 (2026-10): the save-time auto-align never writes a deprecated runtime.
-/// Returns the runtime to align to (unchanged when not deprecated) and, when
-/// the inferred runtime is deprecated, `None` plus the reason token surfaced
-/// as `runtime_provider_align_skipped`. Deliberately does not retarget to the
-/// replacement: Antigravity's `--model` takes display names, so handing it a
-/// Gemini CLI model id could silently pick a different model.
+/// Auto-align only when the inferred runtime accepts the model spelling.
+/// Antigravity's `--model` takes display names, so a `gemini-*` model id must
+/// never silently switch a Claude agent to Antigravity.
 pub(crate) fn auto_align_target(
     inferred: Option<duduclaw_core::types::RuntimeType>,
-) -> (Option<duduclaw_core::types::RuntimeType>, Option<&'static str>) {
+    model: &str,
+) -> (
+    Option<duduclaw_core::types::RuntimeType>,
+    Option<&'static str>,
+) {
     match inferred {
+        Some(duduclaw_core::types::RuntimeType::Antigravity)
+            if model.to_ascii_lowercase().starts_with("gemini-") =>
+        {
+            (None, Some("model_id_requires_display_name"))
+        }
         Some(rt) if rt.is_deprecated() => (None, Some("deprecated_runtime")),
         other => (other, None),
     }

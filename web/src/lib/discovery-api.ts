@@ -1,14 +1,14 @@
 import { client } from '@/lib/ws-client';
-import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 
 // Brand names are not translated; only `openai-compat` takes a localized label when a formatter is supplied.
-const RUNTIME_NAMES: Record<string, string> = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', grok: 'Grok', 'openai-compat': 'OpenAI-compatible' };
+const RUNTIME_NAMES: Record<string, string> = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini CLI', antigravity: 'Antigravity', grok: 'Grok', 'openai-compat': 'OpenAI-compatible' };
 export function runtimeLabel(id: string, intl?: { messages: Record<string, unknown>; formatMessage: (d: { id: string }) => string }): string {
   if (typeof id !== 'string' || id === '') return id ?? '';
   if (id === 'openai-compat' && intl && 'discovery.runtime.openaiCompat' in intl.messages) return intl.formatMessage({ id: 'discovery.runtime.openaiCompat' });
   const name = Object.prototype.hasOwnProperty.call(RUNTIME_NAMES, id) ? RUNTIME_NAMES[id] : id;
-  // A deprecated runtime stays displayable but carries the localized marker.
-  if (isDeprecatedRuntime(id) && intl) return `${name} (${intl.formatMessage({ id: 'common.deprecated' })})`;
+  // An old saved runtime stays displayable with its removal marker.
+  if (isRemovedRuntime(id) && intl) return `${name} (${intl.formatMessage({ id: 'common.removed' })})`;
   return name;
 }
 /** Public DTOs contain opaque approved IDs and never host workspace paths. */

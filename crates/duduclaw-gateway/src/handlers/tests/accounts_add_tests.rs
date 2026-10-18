@@ -185,8 +185,7 @@ fn openai_provider_writes_the_api_key_field_and_provider_value() {
 /// Same shape, plaintext fallback path (no writable keyfile).
 #[test]
 fn deepseek_provider_plaintext_fallback_uses_api_key_field() {
-    let entry =
-        build_account_entry("acct-ds", "api_key", "deepseek", 5000, 1, "sk-ds-key", None);
+    let entry = build_account_entry("acct-ds", "api_key", "deepseek", 5000, 1, "sk-ds-key", None);
     assert!(entry.plaintext_fallback);
     assert_eq!(entry.key_field, "api_key");
     assert_eq!(
@@ -248,8 +247,7 @@ async fn probe_server(response: &'static str) -> (String, tokio::task::JoinHandl
 const PROBE_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
 const PROBE_401: &str =
     "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const PROBE_403: &str =
-    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const PROBE_403: &str = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// Add an account through the RPC with the D6 probe pointed at a local
 /// listener that answers 200 — i.e. "the credential authenticates", which
@@ -366,6 +364,155 @@ async fn duplicate_id_is_rejected_without_touching_the_existing_entry() {
     assert_eq!(
         raw_before, raw_after,
         "a rejected duplicate must not touch config.toml"
+    );
+}
+
+#[tokio::test]
+async fn remove_account_deletes_only_its_configured_credential() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "# Preserve this comment\n[[accounts]]\nid = 'first'\napi_key_enc = 'cipher-first'\n\n[[accounts]]\nid = 'second'\napi_key_enc = 'cipher-second'\n",
+    )
+    .unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let result = handler
+        .handle_accounts_remove(json!({ "account_id": "first" }))
+        .await;
+    assert!(
+        matches!(result, WsFrame::Response { ok: true, .. }),
+        "{result:?}"
+    );
+
+    let after = std::fs::read_to_string(&config_path).unwrap();
+    let table: toml::Table = after.parse().unwrap();
+    let accounts = table["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["id"].as_str(), Some("second"));
+    assert_eq!(accounts[0]["api_key_enc"].as_str(), Some("cipher-second"));
+    assert!(!after.contains("cipher-first"));
+    assert_eq!(after.matches("# Preserve this comment").count(), 1);
+}
+
+#[tokio::test]
+async fn remove_account_refuses_unknown_or_unparseable_config_without_writing() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    let original = "[[accounts]]\nid = 'first'\napi_key_enc = 'cipher-first'\n";
+    std::fs::write(&config_path, original).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let unknown = handler
+        .handle_accounts_remove(json!({ "account_id": "missing" }))
+        .await;
+    assert!(matches!(unknown, WsFrame::Response { ok: false, .. }));
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+
+    std::fs::write(&config_path, "[[accounts]\n").unwrap();
+    let malformed = handler
+        .handle_accounts_remove(json!({ "account_id": "first" }))
+        .await;
+    assert!(matches!(malformed, WsFrame::Response { ok: false, .. }));
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "[[accounts]\n"
+    );
+}
+
+#[tokio::test]
+async fn remove_account_rechecks_admin_role_on_an_open_connection() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    let original = "[[accounts]]\nid = 'existing'\napi_key_enc = 'cipher'\n";
+    std::fs::write(&config_path, original).unwrap();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db
+        .create_user(
+            "admin@test.invalid",
+            "Admin",
+            "isolated-test-password",
+            UserRole::Admin,
+        )
+        .unwrap();
+    let cached = UserContext {
+        user_id: user.id.clone(),
+        email: user.email,
+        role: UserRole::Admin,
+        agent_access: std::collections::HashMap::new(),
+        must_change_password: false,
+    };
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    db.update_user(&user.id, None, Some(UserRole::Manager), None)
+        .unwrap();
+    let result = handler
+        .handle(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+        )
+        .await;
+    assert!(
+        matches!(result, WsFrame::Response { ok: false, .. }),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn remove_account_revokes_bootstrap_context_after_first_user() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    let original = "[[accounts]]\nid = 'existing'\napi_key_enc = 'cipher'\n";
+    std::fs::write(&config_path, original).unwrap();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let cached = UserContext::admin_fallback();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let before = handler
+        .handle(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+        )
+        .await;
+    assert!(
+        matches!(before, WsFrame::Response { ok: true, .. }),
+        "{before:?}"
+    );
+
+    std::fs::write(&config_path, original).unwrap();
+    db.create_user(
+        "first-admin@test.invalid",
+        "Admin",
+        "isolated-test-password",
+        UserRole::Admin,
+    )
+    .unwrap();
+    let after = handler
+        .handle(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+        )
+        .await;
+    assert!(
+        matches!(after, WsFrame::Response { ok: false, .. }),
+        "{after:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+
+    let token_connection = crate::power_local::RpcConnInfo::internal()
+        .with_legacy_admin_authenticated();
+    let token_result = handler
+        .handle_conn(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+            token_connection,
+        )
+        .await;
+    assert!(
+        matches!(token_result, WsFrame::Response { ok: true, .. }),
+        "{token_result:?}"
     );
 }
 
@@ -771,4 +918,19 @@ async fn accounts_add_does_not_probe_foreign_providers() {
     assert!(matches!(res, WsFrame::Response { ok: true, .. }), "{res:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert_eq!(frame_payload(&res)["verified"], json!(null));
+}
+
+#[tokio::test]
+async fn stale_config_writer_cannot_restore_deleted_account() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let path = home.path().join("config.toml");
+    std::fs::write(&path, "[[accounts]]\nid = \"old-token\"\n").unwrap();
+    let stale: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let removed = handler.handle_accounts_remove(json!({"account_id": "old-token"})).await;
+    assert!(matches!(removed, WsFrame::Response { ok: true, .. }), "{removed:?}");
+    let result = handler.atomic_write_toml(&path, &stale).await;
+    assert!(result.is_err());
+    let current: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert!(current["accounts"].as_array().unwrap().is_empty());
 }

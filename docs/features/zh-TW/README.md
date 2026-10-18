@@ -20,7 +20,7 @@
 | 10 | [認知記憶系統](10-cognitive-memory.md) | 仿人腦記憶設計，具備遺忘曲線 |
 | 11 | [Prompt 預算強制](11-token-compression.md) | 估算 prompt、走三個階段，不然就拒絕 |
 | 12 | [產業模板與 Odoo ERP 橋接](12-industry-templates.md) | 開箱即用的商業智慧 |
-| 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI-compat 等多種後端統一（Gemini CLI 已棄用） |
+| 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI-compat 等多種後端統一（Gemini CLI 已移除） |
 | 14 | [語音管線](14-voice-pipeline.md) | 兩條分開接線的 STT／TTS 路徑：fail-closed 的 HTTP 端點與寫死供應商的 Telegram handler |
 | 15 | [Skill 生命週期引擎](15-skill-lifecycle.md) | 6 階段自動化技能萃取與管理 |
 | 16 | [Session 記憶堆疊](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |

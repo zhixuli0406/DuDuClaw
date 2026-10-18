@@ -6,8 +6,7 @@
 //! `~/.gemini/antigravity-cli/`) and exposes Gemini 3.x plus Claude / GPT-OSS
 //! models behind one terminal agent. This runtime drives that binary.
 //!
-//! Differences from [`super::gemini::GeminiRuntime`] (the legacy backend, kept for
-//! paid `GEMINI_API_KEY` users whose access continues past the shutdown):
+//! Differences from the removed Gemini CLI backend:
 //!   - binary `agy` (installed to `~/.local/bin/agy`), not `gemini`
 //!   - model flag `--model <id>`, not `-m <id>`
 //!   - permission bypass `--dangerously-skip-permissions`, not `--approval-mode yolo`
@@ -542,7 +541,7 @@ impl AgentRuntime for AntigravityRuntime {
         // P0-3: agy DOES expose `--sandbox` (verified via real `agy --help`,
         // 2026-07-06 — the old v1.0.12 "no sandbox flags" claim is obsolete).
         // Derive the confinement flags from the agent's CapabilitiesConfig so
-        // this runtime enforces SandboxLevel just like codex/gemini, instead of
+        // this runtime enforces SandboxLevel just like codex, instead of
         // unconditionally auto-approving every tool call.
         let sb_args = sandbox_args(context.capabilities.as_ref());
         info!(

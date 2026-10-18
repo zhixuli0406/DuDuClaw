@@ -79,6 +79,10 @@ pub struct RpcConnInfo {
     /// credential at all (the appliance lock-screen path). Such a connection
     /// is restricted to [`is_pre_auth_allowlisted`] methods.
     pub pre_auth: bool,
+    /// The handshake verified the configured legacy Dashboard token. This
+    /// distinguishes it from the credential-less bootstrap Admin context;
+    /// both use `UserContext::admin_fallback()`.
+    pub legacy_admin_authenticated: bool,
 }
 
 impl RpcConnInfo {
@@ -89,6 +93,7 @@ impl RpcConnInfo {
         Self {
             peer: None,
             pre_auth: false,
+            legacy_admin_authenticated: false,
         }
     }
 
@@ -97,7 +102,13 @@ impl RpcConnInfo {
         Self {
             peer: Some(peer),
             pre_auth,
+            legacy_admin_authenticated: false,
         }
+    }
+
+    pub fn with_legacy_admin_authenticated(mut self) -> Self {
+        self.legacy_admin_authenticated = true;
+        self
     }
 
     /// Did this call arrive from the machine itself? `None` peer ⇒ `false`.

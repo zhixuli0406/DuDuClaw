@@ -3,7 +3,6 @@
 //! real event captures in commercial/research/release-live-validation-2026-10-01-evidence/runtime-parity;
 //! https://code.claude.com/docs/en/cli-reference
 //! https://developers.openai.com/codex/config-reference
-//! https://geminicli.com/docs/reference/configuration/
 //! Design: commercial/docs/specs/DESIGN-discovery-runtime-parity-2026-10.md (§2, §5, §6, §7).
 use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 use serde_json::{Value, json};
@@ -11,12 +10,19 @@ use super::contracts::AttemptInfraError;
 use super::attempt_guard::{ANTIGRAVITY_TOOLS, GROK_DISALLOWED_TOOLS, GROK_TOOLS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeFamily { Claude, Codex, Gemini, Antigravity, Grok, OpenAiCompat }
+pub enum RuntimeFamily {
+    Claude,
+    Codex,
+    Antigravity,
+    Grok,
+    OpenAiCompat,
+}
 impl RuntimeFamily {
     pub fn parse(name: &str) -> Result<Self, AttemptInfraError> {
         match name {
-            "claude" => Ok(Self::Claude), "codex" => Ok(Self::Codex),
-            "gemini" => Ok(Self::Gemini), "openai-compat" | "openai_compat" => Ok(Self::OpenAiCompat),
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "openai-compat" | "openai_compat" => Ok(Self::OpenAiCompat),
             // Tool surface and step ceiling are enforced on the host
             // (attempt_guard); agy's hook is the second line.
             "antigravity" | "agy" => Ok(Self::Antigravity), "grok" => Ok(Self::Grok),
@@ -24,12 +30,21 @@ impl RuntimeFamily {
         }
     }
     pub fn name(self) -> &'static str {
-        match self { Self::Claude=>"claude", Self::Codex=>"codex", Self::Gemini=>"gemini",
-            Self::Antigravity=>"antigravity", Self::Grok=>"grok", Self::OpenAiCompat=>"openai-compat" }
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::Grok => "grok",
+            Self::OpenAiCompat => "openai-compat",
+        }
     }
     pub fn provider(self) -> &'static str {
-        match self { Self::Claude=>"anthropic", Self::Codex|Self::OpenAiCompat=>"openai",
-            Self::Gemini|Self::Antigravity=>"gemini", Self::Grok=>"xai" }
+        match self {
+            Self::Claude => "anthropic",
+            Self::Codex | Self::OpenAiCompat => "openai",
+            Self::Antigravity => "gemini",
+            Self::Grok => "xai",
+        }
     }
     /// True when no native step ceiling exists and the host counts steps.
     pub fn host_counted_steps(self) -> bool { matches!(self, Self::Codex|Self::Antigravity) }
@@ -54,8 +69,6 @@ impl RuntimeFamily {
                 }
                 argv.push("-".into()); argv
             }
-            Self::Gemini => vec!["--prompt".into(),String::new(),"--model".into(),model.into(),
-                "--output-format".into(),"stream-json".into(),"--approval-mode".into(),"yolo".into()],
             // Headless grok does not read stdin; no --trust, so workspace hooks/settings stay unloaded.
             Self::Grok => vec!["--prompt-file".into(),"/dudu-runtime/prompt.txt".into(),
                 "--output-format".into(),"streaming-messages-json".into(),"--cwd".into(),node.to_string_lossy().into_owned(),
@@ -73,25 +86,13 @@ impl RuntimeFamily {
     }
 }
 
-/// Gemini CLI core tools; the host guard checks against the same list.
-/// gemini-cli 0.61 names its grep tool `grep_search`; older CLIs used `search_file_content`.
-pub const GEMINI_TOOLS: &[&str] = &["read_file","read_many_files","write_file","replace","list_directory","glob","grep_search","search_file_content","run_shell_command"];
-
-pub fn gemini_settings(turns: u32) -> Value {
-    json!({"model":{"maxSessionTurns":turns},"context":{"fileName":[]},
-        "tools":{"core":GEMINI_TOOLS,
-            "exclude":["web_fetch","google_web_search","save_memory","write_todos"]},
-        "mcpServers":{},"admin":{"mcp":{"enabled":false},"extensions":{"enabled":false},"skills":{"enabled":false}},
-        "experimental":{"enableAgents":false},"security":{"enablePermanentToolApproval":false}})
-}
-
 /// Fixed in-container paths. HOME is a private tmpfs directory.
 pub const PRIVATE_HOME: &str = "/tmp/dudu-private/home";
 const AGY_GUARD_TEMPLATE: &str = include_str!("python/agy_tool_guard.py");
 const AGY_ALLOWLIST_SLOT: &str = "__DUDU_ALLOWED_TOOLS_JSON__";
 
 /// Host-written files for the read-only `/dudu-runtime` directory, beyond
-/// `empty-mcp.json` and `gemini.json`. Paths are relative to that directory.
+/// `empty-mcp.json`. Paths are relative to that directory.
 pub fn runtime_files(family: RuntimeFamily, node: &Path, _turns: u32, prompt: &str) -> Vec<(String, Vec<u8>)> {
     match family {
         RuntimeFamily::Grok => vec![("prompt.txt".into(), prompt.as_bytes().to_vec())],
@@ -126,25 +127,32 @@ pub fn stdin_payload(family: RuntimeFamily, prompt: &str) -> Vec<u8> {
 
 fn credential_keys(family: RuntimeFamily) -> &'static [&'static str] {
     match family {
-        RuntimeFamily::Claude=>&["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"],
-        RuntimeFamily::Codex|RuntimeFamily::OpenAiCompat=>&["OPENAI_API_KEY"],
-        RuntimeFamily::Gemini|RuntimeFamily::Antigravity=>&["GEMINI_API_KEY","GOOGLE_API_KEY"],
-        RuntimeFamily::Grok=>&["XAI_API_KEY"],
+        RuntimeFamily::Claude => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+        RuntimeFamily::Codex | RuntimeFamily::OpenAiCompat => &["OPENAI_API_KEY"],
+        RuntimeFamily::Antigravity => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        RuntimeFamily::Grok => &["XAI_API_KEY"],
     }
 }
 
 /// Only selected credentials enter the image; HOME/config paths are fresh.
-pub fn environment(family: RuntimeFamily, selected: &std::collections::HashMap<String,String>) -> BTreeMap<String,String> {
-    let mut out=BTreeMap::from([
-        ("PATH".into(),"/usr/local/bin:/usr/bin:/bin".into()),
-        ("HOME".into(),PRIVATE_HOME.into()),("TMPDIR".into(),"/tmp/dudu-private/tmp".into()),
-        ("LANG".into(),"C.UTF-8".into()),("TZ".into(),"UTC".into()),
-        ("DISABLE_AUTOUPDATER".into(),"1".into()),("PYTHONDONTWRITEBYTECODE".into(),"1".into()),
-        ("CLAUDE_CONFIG_DIR".into(),"/tmp/dudu-private/home/.claude".into()),
-        ("CLAUDE_CODE_TMPDIR".into(),"/tmp/dudu-private/tmp".into()),
-        ("CODEX_HOME".into(),"/tmp/dudu-private/home/.codex".into()),
-        ("GEMINI_CLI_SYSTEM_SETTINGS_PATH".into(),"/dudu-runtime/gemini.json".into()),
-        ("GEMINI_CLI_SYSTEM_DEFAULTS_PATH".into(),"/dudu-runtime/gemini.json".into()),
+pub fn environment(
+    family: RuntimeFamily,
+    selected: &std::collections::HashMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::from([
+        ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+        ("HOME".into(), PRIVATE_HOME.into()),
+        ("TMPDIR".into(), "/tmp/dudu-private/tmp".into()),
+        ("LANG".into(), "C.UTF-8".into()),
+        ("TZ".into(), "UTC".into()),
+        ("DISABLE_AUTOUPDATER".into(), "1".into()),
+        ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+        (
+            "CLAUDE_CONFIG_DIR".into(),
+            "/tmp/dudu-private/home/.claude".into(),
+        ),
+        ("CLAUDE_CODE_TMPDIR".into(), "/tmp/dudu-private/tmp".into()),
+        ("CODEX_HOME".into(), "/tmp/dudu-private/home/.codex".into()),
     ]);
     if family==RuntimeFamily::Grok {
         for (key,value) in [("GROK_HOME","/tmp/dudu-private/home/.grok"),("GROK_DISABLE_AUTOUPDATER","1"),
@@ -164,9 +172,17 @@ pub fn environment(family: RuntimeFamily, selected: &std::collections::HashMap<S
 /// keys, the derived `CODEX_API_KEY` and the credential document. They reach
 /// the container by name only (never as argv text).
 pub fn is_secret_env(key: &str) -> bool {
-    key == "CODEX_API_KEY" || key == CREDENTIAL_DOC_ENV
-        || [RuntimeFamily::Claude,RuntimeFamily::Codex,RuntimeFamily::Gemini,RuntimeFamily::Antigravity,RuntimeFamily::Grok,RuntimeFamily::OpenAiCompat]
-            .into_iter().any(|family|credential_keys(family).contains(&key))
+    key == "CODEX_API_KEY"
+        || key == CREDENTIAL_DOC_ENV
+        || [
+            RuntimeFamily::Claude,
+            RuntimeFamily::Codex,
+            RuntimeFamily::Antigravity,
+            RuntimeFamily::Grok,
+            RuntimeFamily::OpenAiCompat,
+        ]
+        .into_iter()
+        .any(|family| credential_keys(family).contains(&key))
 }
 
 /// Environment names of the credential document handed to the trusted PID 1.
@@ -264,24 +280,6 @@ impl StreamAdapter {
                     json!({"type":"result","result":self.text,"usage":usage,"is_error":false})
                 }
                 Some("turn.failed")|Some("error")=>json!({"type":"result","is_error":true,"error":event["error"],"errors":event["message"]}),
-                _=>json!({"type":"system"}),
-            },
-            RuntimeFamily::Gemini=>match event["type"].as_str() {
-                Some("message") if event["role"].as_str()==Some("assistant")=>{
-                    self.text.push_str(event["content"].as_str().unwrap_or(""));
-                    json!({"type":"assistant","message":{"content":[{"type":"text","text":self.text}]}})
-                }
-                Some("tool_use")=>json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":event["tool_name"]}]}}),
-                Some("result")=>{
-                    let stats=&event["stats"];
-                    let input=stats["input_tokens"].as_u64().or_else(||stats["inputTokens"].as_u64());
-                    let output=stats["output_tokens"].as_u64().or_else(||stats["outputTokens"].as_u64());
-                    let cached=stats["cached"].as_u64().or_else(||stats["cached_tokens"].as_u64()).unwrap_or(0);
-                    let usage=input.zip(output).filter(|(i,_)|cached<=*i).map(|(i,o)|json!({"input_tokens":i-cached,"output_tokens":o,"cache_read_input_tokens":cached}));
-                    json!({"type":"result","result":self.text,"usage":usage,
-                        "is_error":event["status"].as_str()==Some("error"),"error":event["error"]})
-                }
-                Some("error")=>json!({"type":"error","error":event["error"],"message":event["message"]}),
                 _=>json!({"type":"system"}),
             },
         }

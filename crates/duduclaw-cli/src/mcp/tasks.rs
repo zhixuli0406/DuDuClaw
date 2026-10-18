@@ -959,8 +959,8 @@ fn round_value_well_formed(v: &str) -> bool {
 /// The parent a new task gets (P2-A H-2 / S-M2, third review M3-4 / H3-1).
 ///
 /// - `round_env` is the gateway's round information. Absent (`None`): no
-///   round is known (no goal round, a Bash-started server, the Grok and
-///   Gemini runtimes) and the old rule applies. Present but empty or
+///   round is known (no goal round, a Bash-started server, or the Grok
+///   runtime) and the old rule applies. Present but empty or
 ///   malformed: refused — a damaged value is not read as "no round".
 /// - Present and naming a task the caller works on (assignee or claimer)
 ///   that belongs to a continuous-responsibility run's tree: that task is the

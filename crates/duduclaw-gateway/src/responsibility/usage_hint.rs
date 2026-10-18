@@ -29,11 +29,11 @@ pub enum UsageReporting {
 }
 
 /// Classification per runtime. Antigravity (no `usage` block in some agy
-/// results) and the Gemini CLI (no `stats` block in some results) can leave
-/// a round with zero tokens; Grok reports nothing and is estimated.
+/// results) can leave a round with zero tokens; Grok reports nothing and is
+/// estimated.
 pub fn usage_reporting(rt: RuntimeType) -> UsageReporting {
     match rt {
-        RuntimeType::Antigravity | RuntimeType::Gemini => UsageReporting::MayBeMissing,
+        RuntimeType::Antigravity => UsageReporting::MayBeMissing,
         RuntimeType::Grok => UsageReporting::Estimated,
         _ => UsageReporting::Reported,
     }
@@ -42,7 +42,6 @@ pub fn usage_reporting(rt: RuntimeType) -> UsageReporting {
 fn runtime_label(rt: RuntimeType) -> &'static str {
     match rt {
         RuntimeType::Antigravity => "Antigravity",
-        RuntimeType::Gemini => "Gemini CLI",
         RuntimeType::Grok => "Grok",
         RuntimeType::Codex => "Codex",
         RuntimeType::OpenAiCompat => "OpenAI 相容服務",
@@ -116,10 +115,10 @@ mod tests {
             w[0].contains("Antigravity") && w[0].contains("全額"),
             "{w:?}"
         );
-        let w = warnings_for(RuntimeType::Claude, RuntimeType::Gemini);
+        let w = warnings_for(RuntimeType::Claude, RuntimeType::Antigravity);
         assert_eq!(w.len(), 1);
         assert!(
-            w[0].contains("驗收判官") && w[0].contains("Gemini"),
+            w[0].contains("驗收判官") && w[0].contains("Antigravity"),
             "{w:?}"
         );
         assert_eq!(
@@ -154,12 +153,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[dispatch]\njudge_provider = \"gemini\"\n",
+            "[dispatch]\njudge_provider = \"antigravity\"\njudge_model = \"gemini-3-pro\"\n",
         )
         .unwrap();
         let (employee, judge) = run_runtimes(dir.path(), "worker");
         assert_eq!(employee, RuntimeType::Antigravity);
-        assert_eq!(judge, RuntimeType::Gemini);
+        assert_eq!(judge, RuntimeType::Antigravity);
         assert_eq!(usage_warnings(dir.path(), "worker").len(), 2);
     }
 }

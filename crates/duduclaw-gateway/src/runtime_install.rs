@@ -608,7 +608,6 @@ mod tests {
         let cases = [
             ("claude", "npm install -g @anthropic-ai/claude-code"),
             ("codex", "npm install -g @openai/codex"),
-            ("gemini", "npm install -g @google/gemini-cli"),
             (
                 "antigravity",
                 "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -631,6 +630,7 @@ mod tests {
                 "{provider} docs url"
             );
         }
+        assert!(spec_for("gemini").is_none(), "removed Gemini CLI must not be installable");
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn npm_channels_are_auto_installable_everywhere() {
-        for p in ["claude", "codex", "gemini"] {
+        for p in ["claude", "codex", "kimi", "copilot"] {
             let spec = spec_for(p).unwrap();
             assert!(auto_installable(spec, false), "{p} unix");
             assert!(auto_installable(spec, true), "{p} windows");

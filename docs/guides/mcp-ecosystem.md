@@ -322,7 +322,7 @@ session listed its tools through DuDuClaw. The snapshot is display only; the
 gate always uses the live listing.
 
 **Runtimes covered**: the Claude CLI (it starts `.mcp.json` servers; the
-spawn hands it the rewritten config). Codex, Gemini, Antigravity and Grok
+spawn hands it the rewritten config). Codex, Antigravity and Grok
 employees are registered with DuDuClaw's own server only, and the
 openai-compat tool loop starts only `duduclaw mcp-server`, so they have no
 third-party servers to gate. `url` / `type` entries in `.mcp.json` (the CLI
@@ -442,7 +442,7 @@ the same way and no `agent.toml [mcp.external]` server mounted; an employee on
 a Codex employee runs it with `-s read-only` and `approval_policy=never`
 (an operating-system read-only sandbox whatever the employee's own level; Codex
 rejects every MCP call in that mode, so no tool is callable); an employee on
-another runtime (Gemini CLI, Antigravity, Grok) or in the task sandbox is refused before the task starts
+another runtime (Antigravity, Grok) or in the task sandbox is refused before the task starts
 (`explore_lane_unsupported`), and a MoA model or local-only inference is
 refused (the hybrid local offload is skipped). Turn on **Allow normal mode** when subscribing to let events start
 work with the employee's usual permissions; only such subscriptions wake a

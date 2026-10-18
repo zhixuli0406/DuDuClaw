@@ -3,6 +3,56 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn account_table_for_edit(path: &Path) -> Result<(toml::Table, String), String> {
+    let text = super::config_commit::read_text_or_empty(path)?;
+    let table = if text.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        text.parse::<toml::Table>()
+            .map_err(|e| format!("Invalid config.toml; refusing account edit: {e}"))?
+    };
+    Ok((table, super::config_commit::content_hash(&text)))
+}
+
+#[derive(Clone)]
+pub(crate) struct CredentialWriteGuard {
+    home: PathBuf,
+    user_id: String,
+    legacy_admin_authenticated: bool,
+}
+
+impl CredentialWriteGuard {
+    pub(crate) fn new(home: &Path, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            user_id: ctx.user_id.clone(),
+            legacy_admin_authenticated: conn.legacy_admin_authenticated,
+        }
+    }
+
+    pub(crate) fn verify_admin(&self) -> Result<(), String> {
+        if self.user_id == "system" && self.legacy_admin_authenticated {
+            return Ok(());
+        }
+        let live = crate::review_evidence::audience::trusted_dashboard_principal(&self.home, &self.user_id)
+            .map_err(|_| "permission denied".to_string())?;
+        if live.is_admin() { Ok(()) } else { Err("permission denied".to_string()) }
+    }
+}
+
+async fn commit_account_edit(
+    path: &Path,
+    hash: String,
+    table: &toml::Table,
+    guard: Option<CredentialWriteGuard>,
+) -> Result<(), String> {
+    if let Some(guard) = guard {
+        super::config_commit::commit_table_locked_with_guard(path, hash, table, move || guard.verify_admin()).await
+    } else {
+        super::config_commit::commit_table_locked(path, hash, table).await
+    }
+}
+
 impl MethodHandler {
     /// Add a new account to config.toml [[accounts]] array.
     ///
@@ -15,11 +65,25 @@ impl MethodHandler {
     /// `resolve_env_key`/`select_for_provider` would otherwise treat it as a
     /// pool nothing ever selects, a confusing way to fail.
     pub(crate) async fn handle_accounts_add(&self, params: Value) -> WsFrame {
-        self.handle_accounts_add_with_probe_base(
+        self.handle_accounts_add_with_probe_base_guard(
             params,
             duduclaw_agent::credential_probe::ANTHROPIC_API_BASE,
+            None,
         )
         .await
+    }
+
+    pub(crate) async fn handle_accounts_add_authorized(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+        conn: crate::power_local::RpcConnInfo,
+    ) -> WsFrame {
+        self.handle_accounts_add_with_probe_base_guard(
+            params,
+            duduclaw_agent::credential_probe::ANTHROPIC_API_BASE,
+            Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn)),
+        ).await
     }
 
     /// `accounts.add` with an injectable probe base URL (D6).
@@ -33,6 +97,15 @@ impl MethodHandler {
         &self,
         params: Value,
         probe_base: &str,
+    ) -> WsFrame {
+        self.handle_accounts_add_with_probe_base_guard(params, probe_base, None).await
+    }
+
+    pub(crate) async fn handle_accounts_add_with_probe_base_guard(
+        &self,
+        params: Value,
+        probe_base: &str,
+        guard: Option<CredentialWriteGuard>,
     ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
@@ -75,7 +148,10 @@ impl MethodHandler {
         let priority = params.get("priority").and_then(|v| v.as_u64()).unwrap_or(1);
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         // Ensure [[accounts]] array exists
         let accounts = table
@@ -192,14 +268,8 @@ impl MethodHandler {
         }
         arr.push(toml::Value::Table(entry.table));
 
-        // Atomic write
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
+            return WsFrame::error_response("", &e);
         }
 
         // Credentials doctrine P2 (WP-8A): invalidate-on-write, not the old
@@ -225,6 +295,14 @@ impl MethodHandler {
 
     /// Update the monthly budget for a specific account in config.toml.
     pub(crate) async fn handle_accounts_update_budget(&self, params: Value) -> WsFrame {
+        self.handle_accounts_update_budget_guard(params, None).await
+    }
+
+    pub(crate) async fn handle_accounts_update_budget_authorized(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
+        self.handle_accounts_update_budget_guard(params, Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn))).await
+    }
+
+    async fn handle_accounts_update_budget_guard(&self, params: Value, guard: Option<CredentialWriteGuard>) -> WsFrame {
         let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
             _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
@@ -240,7 +318,10 @@ impl MethodHandler {
         };
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         // Find the target account in [[accounts]] array
         let accounts = match table.get_mut("accounts").and_then(|v| v.as_array_mut()) {
@@ -268,14 +349,8 @@ impl MethodHandler {
             }
         }
 
-        // Atomic write
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
+            return WsFrame::error_response("", &e);
         }
 
         // Credentials doctrine P2 (WP-8A): the cached rotator holds the whole
@@ -300,13 +375,24 @@ impl MethodHandler {
     /// subscription?, label?, monthly_budget_cents? }`. Does NOT touch the
     /// account secret (use `accounts.add` to (re)set keys). Atomic write.
     pub(crate) async fn handle_accounts_update(&self, params: Value) -> WsFrame {
+        self.handle_accounts_update_guard(params, None).await
+    }
+
+    pub(crate) async fn handle_accounts_update_authorized(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
+        self.handle_accounts_update_guard(params, Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn))).await
+    }
+
+    async fn handle_accounts_update_guard(&self, params: Value, guard: Option<CredentialWriteGuard>) -> WsFrame {
         let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
         };
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         let accounts = match table.get_mut("accounts").and_then(|v| v.as_array_mut()) {
             Some(arr) => arr,
@@ -362,7 +448,7 @@ impl MethodHandler {
             );
         }
 
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
             return WsFrame::error_response("", &e);
         }
 
@@ -376,5 +462,55 @@ impl MethodHandler {
             "",
             json!({ "success": true, "account_id": account_id, "changes": changes }),
         )
+    }
+
+    /// Remove one configured account and its stored credential. The CLI's own
+    /// credential store is separate and is not affected by this RPC.
+    pub(crate) async fn handle_accounts_remove(&self, params: Value) -> WsFrame {
+        self.handle_accounts_remove_guard(params, None).await
+    }
+
+    pub(crate) async fn handle_accounts_remove_authorized(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
+        self.handle_accounts_remove_guard(params, Some(CredentialWriteGuard::new(&self.home_dir, ctx, conn))).await
+    }
+
+    async fn handle_accounts_remove_guard(&self, params: Value, guard: Option<CredentialWriteGuard>) -> WsFrame {
+        let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id,
+            _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
+        };
+        let config_path = self.home_dir.join("config.toml");
+        let (mut table, config_hash) = match account_table_for_edit(&config_path) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let Some(accounts) = table
+            .get_mut("accounts")
+            .and_then(toml::Value::as_array_mut)
+        else {
+            return WsFrame::error_response("", "No [[accounts]] section in config.toml");
+        };
+        let matches: Vec<usize> = accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                (account.as_table()?.get("id")?.as_str()? == account_id).then_some(index)
+            })
+            .collect();
+        if matches.len() != 1 {
+            let message = if matches.is_empty() {
+                format!("Account not found: {account_id}")
+            } else {
+                "Duplicate account id in config.toml; resolve it before deleting".to_string()
+            };
+            return WsFrame::error_response("", &message);
+        }
+        accounts.remove(matches[0]);
+        if let Err(e) = commit_account_edit(&config_path, config_hash, &table, guard).await {
+            return WsFrame::error_response("", &e);
+        }
+        crate::claude_runner::invalidate_rotator_cache().await;
+        info!(account_id, "accounts.remove completed");
+        WsFrame::ok_response("", json!({ "success": true, "account_id": account_id }))
     }
 }

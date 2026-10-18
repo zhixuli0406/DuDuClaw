@@ -118,8 +118,7 @@ listed for every caller and check the relationship per call:
   wrote it unchecked; `kind="goal"` accepts `parent_task_id`, which v1.69
   ignored; and a task can hold at most 200 unfinished sub-tasks created by AI
   employees (a `schedule`, routine or reminder, is not a sub-task). The round is
-  not passed to a server started from Bash, or under the Grok and Gemini CLI
-  runtimes; a task created there is not placed under a run unless the employee
+  not passed to a server started from Bash, or under the Grok runtime; a task created there is not placed under a run unless the employee
   names the run, and is not counted toward its spending. Correct placement
   also relies on the employee not being able to rewrite the `duduclaw` entry of
   its own `.mcp.json`, a separate platform fix that must ship first.

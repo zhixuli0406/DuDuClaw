@@ -66,6 +66,7 @@ pub struct PushGate {
     home: PathBuf,
     ctx: UserContext,
     pre_auth: bool,
+    legacy_admin_authenticated: bool,
     live: Option<(Instant, Option<UserContext>)>,
     tasks: HashMap<String, (Instant, Option<String>, TaskAudience)>,
     dropped: u64,
@@ -73,10 +74,20 @@ pub struct PushGate {
 
 impl PushGate {
     pub fn new(home: &Path, ctx: &UserContext, pre_auth: bool) -> Self {
+        Self::new_with_legacy(home, ctx, pre_auth, false)
+    }
+
+    pub fn new_with_legacy(
+        home: &Path,
+        ctx: &UserContext,
+        pre_auth: bool,
+        legacy_admin_authenticated: bool,
+    ) -> Self {
         Self {
             home: home.to_path_buf(),
             ctx: ctx.clone(),
             pre_auth,
+            legacy_admin_authenticated,
             live: None,
             tasks: HashMap::new(),
             dropped: 0,
@@ -151,11 +162,36 @@ impl PushGate {
         if self.pre_auth {
             return self.drop_event(&event, "lock screen");
         }
-        let Some(live) = self.live() else {
+        let is_login_transcript = matches!(event.as_str(), "auth.cli_login.output" | "auth.cli_login.status");
+        // Sensitive transcripts bypass the two-second push cache so role
+        // revocation takes effect on the very next PTY chunk.
+        let live = if is_login_transcript {
+            if self.ctx.user_id == "system" && self.legacy_admin_authenticated {
+                Some(self.ctx.clone())
+            } else {
+                crate::review_evidence::audience::trusted_dashboard_principal(
+                    &self.home,
+                    &self.ctx.user_id,
+                ).ok()
+            }
+        } else {
+            self.live()
+        };
+        let Some(live) = live else {
             tracing::warn!(event, "push event withheld: identity could not be re-read");
             return self.drop_event(&event, "identity unavailable");
         };
         let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+        // PTY output can contain a long-lived provider token. Even another
+        // Admin must never receive a login transcript they did not start.
+        if is_login_transcript
+            && (live.user_id == "system"
+                || !live.is_admin()
+                || payload.get("owner_user_id").and_then(Value::as_str)
+                    != Some(live.user_id.as_str()))
+        {
+            return self.drop_event(&event, "login session belongs to another user");
+        }
         match rule {
             PushRule::System | PushRule::Authenticated => Some(line.to_string()),
             PushRule::Admin => {

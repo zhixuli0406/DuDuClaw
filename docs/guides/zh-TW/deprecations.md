@@ -142,6 +142,27 @@ DuDuClaw OS 的首次設定（OOBE）也會呼叫 `auth.cli_login.start`。v0.4.
 
 ---
 
+## Gemini CLI runtime 已移除（未發版）
+
+`gemini` 員工 runtime 從 v1.67.0 開始棄用，已在本次變更移除。先前公告曾把移除
+時間從 v1.69.0 延到 v1.75.0；歷史紀錄保留在 CHANGELOG。升級前應先修改仍使用
+`gemini` 的設定；Docker image 不再安裝 `@google/gemini-cli`，Dashboard 也不再
+提供它的 runtime 與登入入口。
+
+| 舊設定 | 改成 |
+|---|---|
+| `agent.toml [runtime] provider = "gemini"` 或 `fallback = "gemini"` | `"antigravity"` |
+| `config.toml [runtime] utility_provider = "gemini"` | `"antigravity"` |
+| `config.toml [dispatch] judge_provider = "gemini"` | `"antigravity"` |
+| `[team.roles.*] runtime = "gemini"` | `"antigravity"` |
+| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+
+Google 登入請在主機終端機執行 `agy`。API key 模式設定
+`config.toml [antigravity] auth = "api_key"`，繼續使用 Gemini API key（`gemini`
+provider 帳號或 `GEMINI_API_KEY`）。模型名稱以 `agy models` 為準。
+Antigravity 的 Docker 設定仍使用 `~/.gemini/antigravity-cli/`，因此 `.gemini`
+volume 仍有用途。Gemini API provider（`gemini`、`generateContent`）仍受支援。
+
 ## 仍在棄用期
 
 ### 板模包的舊格式
@@ -162,67 +183,6 @@ DuDuClaw OS 的首次設定（OOBE）也會呼叫 `auth.cli_login.start`。v0.4.
 | `team.toml`、產業包目錄 | 已棄用，照原樣讀取，不做磁碟遷移 |
 | `pack.toml` 且 `kind = "preset"` | 職務 preset 的現行格式 |
 | `pack.toml` 且 `kind = "team"` 或 `"template"` | 可以讀取與檢視（`pack inspect`），目前還不能安裝 |
-
-### Gemini CLI runtime
-
-**Gemini CLI agent runtime**（runtime id `gemini`、執行檔 `gemini`、npm 套件
-`@google/gemini-cli`）在 **v1.67.0** 標為棄用。移除時間由 v1.69.0 改到 v1.70.0，2026-10-06 改到 v1.71.0，2026-10-07 再改到 v1.72.0，2026-10-09 再改到 v1.73.0，2026-10-13 再改到 v1.74.0，2026-10-16 再改到 **v1.75.0**（v1.69.1 之後用真的 Gemini 金鑰重驗 Antigravity 還沒做，移除等它）。
-接手的是 **Antigravity CLI runtime**（`antigravity`，執行檔 `agy`）。
-
-| 舊 | 新 |
-|---|---|
-| `agent.toml [runtime] provider = "gemini"` | `provider = "antigravity"` |
-| `agent.toml [runtime] fallback = "gemini"` | `fallback = "antigravity"` |
-| `config.toml [runtime] utility_provider = "gemini"` | `utility_provider = "antigravity"` |
-| `config.toml [dispatch] judge_provider = "gemini"` | `judge_provider = "antigravity"` |
-| `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
-| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
-
-**為什麼延後**：原先公告的移除前提，是用真的 Gemini API key 驗證 Antigravity 的 API
-key 模式。驗證時發現，預設權限等級的 Antigravity 員工呼叫平台工具時，會被 Antigravity
-CLI 自己拒絕。修正隨 v1.69.1 出貨：閘道會在操作者的
-`~/.gemini/antigravity-cli/settings.json` 補上兩條放行 `duduclaw` MCP 伺服器的規則
-（細節見[多 runtime](../../features/zh-TW/13-multi-runtime.md)）。移除仍排在
-v1.70.0（2026-10-06 起改為 v1.71.0，2026-10-07 起改為 v1.72.0，2026-10-09 起改為 v1.73.0，2026-10-13 起改為 v1.74.0，2026-10-16 起改為 v1.75.0），前提是這個修正出貨後，再用真的 Gemini API key 重新驗證 Antigravity。重新
-驗證尚未進行。
-
-**還能用的部分**：上面每個舊值照樣解析、照樣執行。讀到時每個行程記一次警告；經儀表板
-（`agents.create`／`agents.update`）寫入時，另記一筆 `runtime_provider_deprecated`
-審計事件。儀表板不再提供 Gemini，但已存的 `gemini` 照樣顯示並標「已棄用」；員工編輯頁
-的 runtime 選單有 Antigravity。「依所選模型自動對齊 runtime」的步驟不會再寫入已棄用的
-runtime。首次設定精靈的預設值是 Antigravity。Docker image 仍內含 Gemini CLI，
-`duduclaw doctor` 會列出 `provider` 或 `fallback` 用到已棄用 runtime 的員工。
-
-**不在棄用範圍**：**Gemini API provider**（provider id `gemini`、`GEMINI_API_KEY`、
-LLM 層的 `generateContent` 協定、`gemini` provider 帳號）不受影響，Antigravity 的
-API key 模式也會用到它。
-
-**為什麼要淘汰 Gemini CLI**：Google 在 2026-06-18 停止以 Gemini CLI 服務免費、
-Google AI Pro 與 Google AI Ultra 的個人帳號，並引導這些使用者改用 Antigravity CLI。
-API key 與企業（Gemini Code Assist）使用者不受影響，Gemini CLI 本身仍在維護（來源：
-維護者的
-[公告](https://github.com/google-gemini/gemini-cli/discussions/28017)；Google 的
-[遷移指南](https://antigravity.google/docs/cli/gcli-migration/)）。Gemini CLI 並沒有
-被關閉。
-
-**遷移步驟**：
-
-1. 在 `agent.toml` 把 `[runtime] provider = "gemini"`（以及 `fallback = "gemini"`）
-   改成 `"antigravity"`。
-2. 驗證方式：用 Google 帳號登入的人，在主機的終端機執行 `agy` 完成登入。原本用 API
-   key 驗證 Gemini CLI 的人，設定 `config.toml [antigravity] auth = "api_key"`，繼續
-   用同一把 Gemini API key（`gemini` provider 帳號，或 `GEMINI_API_KEY`）。
-3. 模型名稱：以 `agy models` 列出的名稱為準；從 Gemini CLI 設定抄過來的 id 不一定會
-   選到同一個模型。
-4. 執行 `duduclaw doctor`，它會列出 `provider` 或 `fallback` 用到已棄用 runtime 的
-   員工。
-
-在 v1.75.0 移除之前，請檢查每個 `agent.toml` 有沒有 `provider = "gemini"` 與
-`fallback = "gemini"`，也檢查 `config.toml` 的 `utility_provider`、
-`[dispatch] judge_provider`、`[team.roles.*] runtime` 與
-`[discovery.attempt.runtimes.gemini]` 有沒有還設成 `gemini`。
-
----
 
 ## 撤下的棄用項目
 

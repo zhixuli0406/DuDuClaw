@@ -173,12 +173,12 @@ fn role_member_scaffold_writes_the_three_overrides() {
         "[capabilities]\nallowed_tools = [\"Read\", \"Grep\"]\n",
     );
 
-    let mut spec = role_spec("boss", Role::Verifier, "gemini", "gemini-3-pro-preview");
+    let mut spec = role_spec("boss", Role::Verifier, "antigravity", "gemini-3-pro-preview");
     spec.effort = Some(Effort::High);
     let result = scaffold_role_member(home, &spec).unwrap();
 
     let t = member_toml(&result.dir);
-    assert_eq!(t["runtime"]["provider"].as_str(), Some("gemini"));
+    assert_eq!(t["runtime"]["provider"].as_str(), Some("antigravity"));
     assert_eq!(
         t["model"]["preferred"].as_str(),
         Some("gemini-3-pro-preview")
@@ -241,10 +241,10 @@ fn role_member_scaffold_drops_an_inherited_runtime_fallback() {
         "boss",
         "[runtime]\nprovider = \"claude\"\nfallback = \"codex\"\n",
     );
-    let spec = role_spec("boss", Role::Verifier, "gemini", "gemini-3-pro-preview");
+    let spec = role_spec("boss", Role::Verifier, "antigravity", "gemini-3-pro-preview");
     let result = scaffold_role_member(home, &spec).unwrap();
     let t = member_toml(&result.dir);
-    assert_eq!(t["runtime"]["provider"].as_str(), Some("gemini"));
+    assert_eq!(t["runtime"]["provider"].as_str(), Some("antigravity"));
     assert!(
         t["runtime"].get("fallback").is_none(),
         "a fallback would silently move the verifier back onto another family"

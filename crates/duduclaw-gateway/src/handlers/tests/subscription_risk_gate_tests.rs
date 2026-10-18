@@ -170,7 +170,7 @@ async fn accounts_add_api_key_is_not_gated() {
 async fn cli_login_start_without_flag_is_refused_for_every_login_runtime() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    for runtime in ["claude", "codex", "gemini", "grok"] {
+    for runtime in ["claude", "codex", "grok", "kimi", "copilot", "kiro", "opencode"] {
         let res = handler
             .handle(
                 "auth.cli_login.start",

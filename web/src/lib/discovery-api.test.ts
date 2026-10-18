@@ -19,13 +19,13 @@ describe('discoveryApi', () => {
 
 import { artifactBlob, runtimeLabel } from './discovery-api';
 describe('runtimeLabel',()=>{
-  it('maps the six known runtime ids to product names',()=>{
-    expect(['claude','codex','gemini','antigravity','grok','openai-compat'].map(id=>runtimeLabel(id))).toEqual(['Claude','Codex','Gemini','Antigravity','Grok','OpenAI-compatible']);
+  it('maps supported runtimes and an old saved id to product names',()=>{
+    expect(['claude','codex','gemini','antigravity','grok','openai-compat'].map(id=>runtimeLabel(id))).toEqual(['Claude','Codex','Gemini CLI','Antigravity','Grok','OpenAI-compatible']);
   });
-  it('marks a deprecated runtime (gemini) with the localized marker only when intl is given',()=>{
-    const intl={messages:{},formatMessage:({id}:{id:string})=>id==='common.deprecated'?'已棄用':id};
-    expect(runtimeLabel('gemini',intl)).toBe('Gemini (已棄用)');
-    expect(runtimeLabel('gemini')).toBe('Gemini');
+  it('marks a removed runtime (gemini) with the localized marker only when intl is given',()=>{
+    const intl={messages:{},formatMessage:({id}:{id:string})=>id==='common.removed'?'已移除':id};
+    expect(runtimeLabel('gemini',intl)).toBe('Gemini CLI (已移除)');
+    expect(runtimeLabel('gemini')).toBe('Gemini CLI');
     expect(runtimeLabel('antigravity',intl)).toBe('Antigravity');
   });
   it('passes unknown ids through and never returns empty for a non-empty id',()=>{

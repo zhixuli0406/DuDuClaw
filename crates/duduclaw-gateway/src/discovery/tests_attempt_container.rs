@@ -281,7 +281,7 @@ fn runtime_files_are_validated_quota_counted_and_integrity_guarded() {
     assert!(prepared.guards.iter().try_for_each(IntegrityGuard::verify).is_err(),"runtime files are covered by the integrity guard");
     drop(prepared);
     let deep=format!("{}x","d/".repeat(8));
-    for bad in ["../escape","/abs","a//b","./x","a/../b","gemini.json","empty-mcp.json","sp ace","a\\b","",deep.as_str()] {
+    for bad in ["../escape","/abs","a//b","./x","a/../b","empty-mcp.json","sp ace","a\\b","",deep.as_str()] {
         let files=vec![(bad.to_string(),b"x".to_vec())];
         assert!(prepare_with_files(home.path(),&request,&settings,QuotaLimits::default(),&runtime,&[],&BTreeMap::new(),&files,Duration::from_secs(5)).is_err(),"{bad:?}");
     }

@@ -5,7 +5,7 @@
 //! A CLI's own restriction flags stay on as a second line; this is authoritative.
 use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
-use super::attempt_adapter::{RuntimeFamily, GEMINI_TOOLS};
+use super::attempt_adapter::RuntimeFamily;
 
 /// Codex item types that are tool executions (`codex exec --json`).
 pub const CODEX_TOOL_ITEMS: &[&str] = &["command_execution", "file_change"];
@@ -72,13 +72,6 @@ impl StreamGuard {
                 }
                 assistant_blocks(native, &|name| GROK_TOOLS.contains(&name))
             }
-            RuntimeFamily::Gemini => match native["type"].as_str() {
-                Some("tool_use") => {
-                    let name = native["tool_name"].as_str().unwrap_or("");
-                    if GEMINI_TOOLS.contains(&name) { GuardVerdict::Continue } else { violation(name) }
-                }
-                _ => GuardVerdict::Continue,
-            },
             RuntimeFamily::Codex => self.codex(native),
             RuntimeFamily::Antigravity => self.antigravity(native),
             RuntimeFamily::OpenAiCompat => GuardVerdict::Continue,
@@ -219,16 +212,6 @@ mod tests {
         for item in CODEX_NON_TOOL_ITEMS { assert_eq!(run(RuntimeFamily::Codex, 0, &[codex_item("item.completed", "x", item)]), vec![GuardVerdict::Continue]); }
         // Unknown top-level event types are not tools.
         assert_eq!(run(RuntimeFamily::Codex, 0, &[json!({"type":"future.event","item":{"type":"mcp_tool_call"}})]), vec![GuardVerdict::Continue]);
-    }
-
-    #[test]
-    fn gemini_uses_the_settings_core_list() {
-        let ok = json!({"type":"tool_use","tool_name":"run_shell_command","tool_id":"1","parameters":{}});
-        let bad = json!({"type":"tool_use","tool_name":"google_web_search","tool_id":"2","parameters":{}});
-        assert_eq!(run(RuntimeFamily::Gemini, 1, &[ok, bad]), vec![GuardVerdict::Continue, GuardVerdict::ToolViolation { tool: "google_web_search".into() }]);
-        let settings = super::super::attempt_adapter::gemini_settings(3);
-        let core = settings["tools"]["core"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
-        assert_eq!(core, GEMINI_TOOLS);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! `claude` 2.1.220 — the test fixtures below are byte-for-byte excerpts of a
 //! real PTY capture). `duduclaw-cli-runtime`'s chrome filter already drops
 //! *some* of them, but its marker lists are enumerated per TUI release and lag
-//! behind new notice lines; and every other runtime (codex / gemini /
+//! behind new notice lines; and every other runtime (codex / antigravity /
 //! antigravity) paints its own chrome.
 //!
 //! So this module is the **last line of defence at the shared reply-assembly

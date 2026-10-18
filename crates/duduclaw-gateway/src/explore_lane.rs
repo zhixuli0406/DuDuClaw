@@ -209,7 +209,7 @@ mod tests {
         for r in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
             assert!(runtime_supported(r), "{r:?}");
         }
-        for r in [RuntimeType::Gemini, RuntimeType::Antigravity, RuntimeType::Grok] {
+        for r in [RuntimeType::Antigravity, RuntimeType::Grok] {
             assert!(!runtime_supported(r), "{r:?}");
         }
         let args = codex_sandbox_args();
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn sandboxed_or_gemini_employee_is_refused() {
+    fn sandboxed_or_antigravity_employee_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("agents").join("a");
         std::fs::create_dir_all(&a).unwrap();
@@ -232,7 +232,7 @@ mod tests {
         assert!(dispatch_refusal(dir.path(), "a").is_some());
         std::fs::write(
             a.join("agent.toml"),
-            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"gemini\"\n",
+            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"antigravity\"\n",
         )
         .unwrap();
         assert!(dispatch_refusal(dir.path(), "a")
@@ -251,7 +251,7 @@ mod tests {
         let caps = CapabilitiesConfig::default();
         assert!(claude_tools(&caps).is_none());
         assert!(lane_env().is_none());
-        assert!(refuse_unsupported_runtime("gemini").is_ok());
+        assert!(refuse_unsupported_runtime("antigravity").is_ok());
         EXPLORE
             .scope(true, async {
                 let (tools, allowed) = claude_tools(&caps).unwrap();
@@ -265,7 +265,7 @@ mod tests {
                     lane_env(),
                     Some(("DUDUCLAW_LANE".to_string(), "explore".to_string()))
                 );
-                assert!(refuse_unsupported_runtime("gemini").is_err());
+                assert!(refuse_unsupported_runtime("antigravity").is_err());
                 // An explicit allowlist only narrows: Bash and other servers drop out.
                 let mut narrow = CapabilitiesConfig::default();
                 narrow.allowed_tools = vec!["Bash".into(), "Read".into(), "mcp__notion__*".into()];

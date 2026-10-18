@@ -322,7 +322,8 @@ async fn discover_claude(home_dir: &Path) -> ProviderModels {
     }
 }
 
-/// Generic codex/gemini/agy discovery: best-effort CLI probe, else fallback.
+/// Generic catalog CLI discovery (excluding Claude and Antigravity):
+/// best-effort CLI probe, else fallback.
 async fn discover_generic(
     provider: &str,
     bin: &str,

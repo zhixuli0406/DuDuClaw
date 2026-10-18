@@ -1544,10 +1544,10 @@ mod tests {
     #[test]
     fn judge_model_hint_reads_both_keys() {
         let h = parse_judge_model_hint(&dispatch_table(
-            "judge_provider = \"gemini\"\njudge_model = \"gemini-3-pro-preview\"",
+            "judge_provider = \"antigravity\"\njudge_model = \"gemini-3-pro-preview\"",
         ))
         .unwrap();
-        assert_eq!(h.provider, Some(RuntimeType::Gemini));
+        assert_eq!(h.provider, Some(RuntimeType::Antigravity));
         assert_eq!(h.model.as_deref(), Some("gemini-3-pro-preview"));
         assert!(!h.is_empty());
 
@@ -1583,6 +1583,12 @@ mod tests {
             )),
             None
         );
+        assert_eq!(
+            parse_judge_model_hint(&dispatch_table(
+                "judge_provider = \"gemini\"\njudge_model = \"gemini-3-pro-preview\""
+            )),
+            None
+        );
     }
 
     #[test]
@@ -1593,11 +1599,11 @@ mod tests {
 
         std::fs::write(
             dir.path().join("config.toml"),
-            "[dispatch]\njudge = \"mav\"\njudge_provider = \"gemini\"\njudge_model = \"gemini-3-pro-preview\"\n",
+            "[dispatch]\njudge = \"mav\"\njudge_provider = \"antigravity\"\njudge_model = \"gemini-3-pro-preview\"\n",
         )
         .unwrap();
         let h = judge_model_hint_from_home(Some(dir.path())).unwrap();
-        assert_eq!(h.provider, Some(RuntimeType::Gemini));
+        assert_eq!(h.provider, Some(RuntimeType::Antigravity));
         assert_eq!(h.model.as_deref(), Some("gemini-3-pro-preview"));
 
         // Malformed TOML / no [dispatch] table ⇒ no hint.
@@ -2046,30 +2052,12 @@ mod tests {
         assert!(j.judge("c", "t", "r").await.is_err());
     }
 
-    /// R1 (2026-10): a `gemini` judge provider keeps judging (the hint is
-    /// unchanged) and its deprecation notice fires once per process — every
-    /// parse consults it, the de-duplication lets exactly one through.
     #[test]
-    fn judge_provider_deprecation_notice_fires_once() {
-        use crate::runtime_config::{CONSULTED_NOTICES, DeprecatedRuntimeSource, deprecated_runtime_first_notice};
+    fn removed_gemini_judge_provider_is_ignored_without_deprecation_notice() {
+        use crate::runtime_config::CONSULTED_NOTICES;
         CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
-        for _ in 0..3 {
-            let h = parse_judge_model_hint(&dispatch_table("judge_provider = \"gemini\"")).unwrap();
-            assert_eq!(h.provider, Some(RuntimeType::Gemini));
-        }
-        let consulted = CONSULTED_NOTICES.with(|n| n.borrow().clone());
-        assert_eq!(consulted.len(), 3, "{consulted:?}");
-        assert!(consulted.iter().all(|(rt, src, agent)| *rt == "gemini"
-            && *src == DeprecatedRuntimeSource::JudgeProvider && agent.is_none()));
-        let mut seen = std::collections::HashSet::new();
-        let fired: Vec<String> = consulted
-            .iter()
-            .filter_map(|(_, src, agent)| deprecated_runtime_first_notice(&mut seen, RuntimeType::Gemini, *src, agent.as_deref()))
-            .collect();
-        assert_eq!(fired.len(), 1, "{fired:?}");
-        assert!(fired[0].starts_with("config.toml [dispatch] judge_provider"), "{fired:?}");
-        // A live judge provider consults nothing.
-        CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
+        assert!(parse_judge_model_hint(&dispatch_table("judge_provider = \"gemini\"")).is_none());
+        assert!(CONSULTED_NOTICES.with(|n| n.borrow().is_empty()));
         parse_judge_model_hint(&dispatch_table("judge_provider = \"codex\"")).unwrap();
         assert!(CONSULTED_NOTICES.with(|n| n.borrow().is_empty()));
     }

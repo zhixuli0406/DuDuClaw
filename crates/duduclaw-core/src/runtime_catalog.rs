@@ -474,7 +474,9 @@ pub const CATALOG: &[RuntimeSpec] = &[
         },
         auth: AuthSpec {
             api_key_env: Some("OPENAI_API_KEY"),
-            login: LoginMethod::BrowserOauth { args: &["login"] },
+            login: LoginMethod::DeviceCode {
+                args: &["login", "--device-auth"],
+            },
             credential_paths: &[".codex/auth.json"],
             tos_note: Some(LocaleText {
                 // Cited terms only (openai.com/policies/sign-in-with-chatgpt-terms,
@@ -485,9 +487,9 @@ pub const CATALOG: &[RuntimeSpec] = &[
                 ja_jp: "OpenAI には公式の Sign in with ChatGPT プログラムがあります。サードパーティのアプリで ChatGPT プランを使えるのはオープンソースのパートナーと OpenAI が選んだ商用パートナーで、商用製品には OpenAI の承認が必要です。規約では、認証トークンはユーザーが管理するローカル環境に保存し、リモートやマネージド環境には置かないこととされています（openai.com/policies/sign-in-with-chatgpt-terms）。安定して使う場合は API キーをご利用ください。",
             }),
             login_hint: Some(LocaleText {
-                en: "Complete the OpenAI sign-in in a browser on this machine (localhost callback). Use an API key when remote.",
-                zh_tw: "於同機瀏覽器完成 OpenAI 登入（localhost 回呼）。遠端請改用 API key。",
-                ja_jp: "同一マシンのブラウザで OpenAI にサインインしてください（localhost コールバック）。リモートの場合は API キーをご利用ください。",
+                en: "Open the displayed device authorization URL and enter its code in your browser. An API key is also available.",
+                zh_tw: "在瀏覽器開啟畫面上的裝置授權網址並輸入驗證碼；也可使用 API key。",
+                ja_jp: "表示されたデバイス認証 URL をブラウザで開き、コードを入力してください。API キーも利用できます。",
             }),
         },
         mcp: true,
@@ -504,66 +506,6 @@ pub const CATALOG: &[RuntimeSpec] = &[
         vendor_url: "https://github.com/openai/codex",
         verified: true,
         deprecation: None,
-    },
-    // ── Google Gemini CLI ────────────────────────────────────────────────
-    RuntimeSpec {
-        id: "gemini",
-        display_name: "Gemini CLI",
-        binary: "gemini",
-        aliases: &[],
-        binary_aliases: &[],
-        install: InstallChannel::Npm {
-            package: "@google/gemini-cli",
-        },
-        headless: HeadlessSpec {
-            // Verified in `runtime/gemini.rs` (live-tested): `gemini -p
-            // --output-format stream-json <prompt>`, model via `-m`.
-            args_template: &["-p", "--output-format", "stream-json", "{prompt}"],
-            output: OutputFormat::Jsonl,
-            model_flag: Some("-m"),
-            model_env: None,
-            extra_env: &[],
-        },
-        auth: AuthSpec {
-            api_key_env: Some("GEMINI_API_KEY"),
-            login: LoginMethod::BrowserOauth {
-                args: &["auth", "login"],
-            },
-            credential_paths: &[".gemini/oauth_creds.json"],
-            tos_note: Some(LocaleText {
-                // Cited terms only (geminicli.com/docs/resources/tos-privacy,
-                // fetched 2026-10-16; the Code Assist for individuals
-                // deprecation notice, last updated 2026-10-09); see
-                // `crate::subscription_risk`.
-                en: "Google's Gemini CLI terms say directly accessing the services behind Gemini CLI with third-party software, tools or services through Gemini CLI OAuth violates its terms and may lead to suspension or termination of the account (geminicli.com/docs/resources/tos-privacy). Google's deprecation notice (developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals) says that since 2026-06-18 Gemini CLI no longer accepts Login with Google for Gemini Code Assist for individuals, Google AI Pro and Google AI Ultra accounts; it still works with a paid API key (Gemini API or enterprise). Use an API key.",
-                zh_tw: "Google 的 Gemini CLI 條款寫明：用第三方軟體、工具或服務透過 Gemini CLI 的 OAuth 直接存取其背後的服務屬於違規，可能導致帳號被停權或終止（geminicli.com/docs/resources/tos-privacy）。Google 的停用公告（developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals）寫明，自 2026-06-18 起，Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，付費 API key（Gemini API 或企業方案）仍可使用。請走 API key。",
-                ja_jp: "Google の Gemini CLI 規約では、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反とされ、アカウントの停止または終了の理由になり得ます（geminicli.com/docs/resources/tos-privacy）。Google の廃止のお知らせ（developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals）によると、2026-06-18 以降、Gemini Code Assist for individuals、Google AI Pro、Google AI Ultra のアカウントでは Gemini CLI の Login with Google を使えません。有料の API キー（Gemini API またはエンタープライズ）は引き続き使えます。API キーをご利用ください。",
-            }),
-            login_hint: Some(LocaleText {
-                en: "Complete the Google sign-in in a browser on this machine (localhost callback).",
-                zh_tw: "於同機瀏覽器完成 Google 登入（localhost 回呼）。",
-                ja_jp: "同一マシンのブラウザで Google にサインインしてください（localhost コールバック）。",
-            }),
-        },
-        mcp: true,
-        model_prefixes: &["gemini"],
-        fallback_models: &[
-            ("gemini-3-pro-preview", "Gemini 3 Pro"),
-            ("gemini-3-flash-preview", "Gemini 3 Flash"),
-            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-            ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-        ],
-        vendor_url: "https://github.com/google-gemini/gemini-cli",
-        verified: true,
-        // R1 (2026-10): Google stopped serving the Code Assist for
-        // individuals, AI Pro and AI Ultra tiers through Gemini CLI on
-        // 2026-06-18; Antigravity (`agy`) takes over. The value
-        // keeps parsing and running for the deprecation window.
-        deprecation: Some(RuntimeDeprecation {
-            since: "v1.67.0",
-            remove_in: "v1.75.0",
-            replacement: "antigravity",
-        }),
     },
     // ── Google Antigravity (`agy`) ───────────────────────────────────────
     RuntimeSpec {
@@ -921,10 +863,10 @@ pub const CATALOG: &[RuntimeSpec] = &[
             login: LoginMethod::DeviceCode {
                 args: &["login", "--use-device-flow"],
             },
-            // The settings paths are documented; where the token itself lands
-            // is not, so only the directory that certainly exists after a
-            // login is listed.
-            credential_paths: &[".kiro/settings/cli.json"],
+            // The documented settings file is not proof of authentication.
+            // Verify with `kiro-cli whoami` instead of exposing a false
+            // credential-present signal.
+            credential_paths: &[],
             tos_note: Some(LocaleText {
                 en: "BLOCKING: Kiro's FAQ states that use through third-party automation harnesses that route requests outside Kiro's native interfaces is not permitted. Driving Kiro from DuDuClaw is exactly that. Calling kiro-cli directly from your own CI is allowed. Verify the current terms before enabling this runtime.",
                 zh_tw: "阻礙事項：Kiro FAQ 明文寫著「不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面」。用 DuDuClaw 驅動 Kiro 正屬此類。自行在 CI 直接呼叫 kiro-cli 則被允許。啟用本 runtime 前請自行確認最新條款。",
@@ -1245,9 +1187,8 @@ pub fn cli_specs() -> impl Iterator<Item = &'static RuntimeSpec> {
 ///   * **Longest prefix wins.** `codex` and `gpt-` both belong to the codex
 ///     entry, but an entry claiming a longer, more specific prefix must beat a
 ///     broad one.
-///   * **On an equal-length tie, the FIRST catalog entry wins.** `gemini` and
-///     `antigravity` both serve `gemini-*`; catalog order is preference order,
-///     so `gemini-3-pro` resolves to the Gemini CLI, not to `agy`.
+///   * **On an equal-length tie, the FIRST catalog entry wins.** Catalog order
+///     is preference order for any future overlap.
 pub fn runtime_for_model(model: &str) -> Option<&'static RuntimeSpec> {
     let lower = model.trim().to_ascii_lowercase();
     // Accept the qualified `provider/model` form — take the model part.
@@ -1519,11 +1460,15 @@ mod tests {
 
     #[test]
     fn equal_length_prefix_ties_go_to_the_earlier_catalog_entry() {
-        // `gemini` and `antigravity` both declare the `gemini` prefix. Catalog
-        // order is preference order, so the Gemini CLI wins — otherwise every
-        // `gemini-*` model would auto-align onto `agy`.
-        assert_eq!(runtime_for_model("gemini-3-pro-preview").unwrap().id, "gemini");
-        assert_eq!(runtime_for_model("gemini-2.5-flash").unwrap().id, "gemini");
+        // Gemini model ids now resolve to Antigravity after Gemini CLI removal.
+        assert_eq!(
+            runtime_for_model("gemini-3-pro-preview").unwrap().id,
+            "antigravity"
+        );
+        assert_eq!(
+            runtime_for_model("gemini-2.5-flash").unwrap().id,
+            "antigravity"
+        );
     }
 
     #[test]
@@ -1597,11 +1542,9 @@ mod tests {
         assert!(hint.zh_tw.contains("`agy`"), "{}", hint.zh_tw);
     }
 
-    /// 2026-10-16 vendor facts: OpenAI publishes a Sign in with ChatGPT
-    /// program (no longer "unclear"), and Gemini CLI stopped accepting Login
-    /// with Google for individual / AI Pro / AI Ultra accounts on 2026-06-18.
+    /// OpenAI publishes a Sign in with ChatGPT program.
     #[test]
-    fn codex_and_gemini_tos_notes_cite_current_vendor_pages() {
+    fn codex_tos_note_cites_current_vendor_page() {
         let codex = spec_for("codex").unwrap().auth.tos_note.unwrap();
         for t in [codex.en, codex.zh_tw, codex.ja_jp] {
             assert!(t.contains("Sign in with ChatGPT"), "{t}");
@@ -1613,58 +1556,29 @@ mod tests {
                 assert!(!t.contains(stale), "stale wording {stale:?} in {t}");
             }
         }
-        let gemini = spec_for("gemini").unwrap().auth.tos_note.unwrap();
-        for t in [gemini.en, gemini.zh_tw, gemini.ja_jp] {
-            assert!(t.contains("2026-06-18"), "{t}");
-            assert!(t.contains("Login with Google"), "{t}");
-            assert!(t.contains("geminicli.com/docs/resources/tos-privacy"), "{t}");
-            let notice = crate::subscription_risk::GEMINI_CLI_INDIVIDUALS_DEPRECATION_URL;
-            assert!(t.contains(notice.trim_start_matches("https://")), "{t}");
-        }
     }
 
-    /// R1 (2026-10): only the Gemini CLI carries a deprecation window, and it
-    /// points at a real, non-deprecated replacement.
+    /// No active runtime is currently deprecated.
     #[test]
-    fn only_gemini_is_deprecated_and_its_replacement_is_live() {
+    fn no_active_runtime_is_deprecated() {
         for spec in CATALOG {
-            if spec.id == "gemini" {
-                let dep = spec.deprecation.expect("gemini is deprecated");
-                assert_eq!(dep.since, "v1.67.0");
-                assert_eq!(dep.remove_in, "v1.75.0");
-                assert_eq!(dep.replacement, "antigravity");
-                let repl = spec_for(dep.replacement).expect("replacement is a catalog id");
-                assert!(repl.deprecation.is_none(), "replacement must not itself be deprecated");
-            } else {
-                assert!(spec.deprecation.is_none(), "{} unexpectedly deprecated", spec.id);
-            }
+            assert!(
+                spec.deprecation.is_none(),
+                "{} unexpectedly deprecated",
+                spec.id
+            );
         }
     }
 
     #[test]
-    fn deprecation_notice_names_replacement_version_and_doc() {
-        let dep = spec_for("gemini").unwrap().deprecation.unwrap();
-        let n = dep.notice("gemini");
-        assert!(n.contains("\"gemini\""), "{n}");
-        assert!(n.contains("\"antigravity\""), "{n}");
-        assert!(n.contains("v1.75.0"), "{n}");
-        assert!(n.contains(DEPRECATIONS_DOC), "{n}");
-    }
-
-    /// Deprecation changes nothing about resolution: order, model tie-break
-    /// and alias lookup are exactly what they were.
-    #[test]
-    fn deprecation_does_not_change_resolution() {
-        assert_eq!(runtime_for_model("gemini-3-pro-preview").unwrap().id, "gemini");
-        assert_eq!(spec_for("gemini").unwrap().id, "gemini");
-        assert!(all_ids().any(|id| id == "gemini"));
+    fn removed_gemini_runtime_is_not_selectable() {
+        assert!(spec_for("gemini").is_none());
+        assert!(crate::types::RuntimeType::parse("gemini").is_none());
+        assert!(!all_ids().any(|id| id == "gemini"));
         assert_eq!(
-            crate::types::RuntimeType::parse("gemini"),
-            Some(crate::types::RuntimeType::Gemini)
+            runtime_for_model("gemini-3-pro-preview").unwrap().id,
+            "antigravity"
         );
-        assert!(crate::types::RuntimeType::Gemini.is_deprecated());
-        assert!(!crate::types::RuntimeType::Antigravity.is_deprecated());
-        assert!(!crate::types::RuntimeType::Claude.is_deprecated());
     }
 }
 
