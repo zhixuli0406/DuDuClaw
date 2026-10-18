@@ -1052,10 +1052,10 @@ mod tests {
     }
 
     /// The accounts-page credential surface covers exactly the non-Claude
-    /// store-persisting runtimes, with display paths and consistent flags
+    /// file-backed runtimes, with display paths and consistent flags
     /// (mtime only when the file is present).
     #[test]
-    fn cli_credential_statuses_cover_store_persisting_runtimes() {
+    fn cli_credential_statuses_cover_file_backed_runtimes() {
         let statuses = cli_credential_statuses();
         let runtimes: Vec<RuntimeType> = statuses.iter().map(|s| s.runtime).collect();
         // WP-B: derived from the catalog — every non-Claude runtime that HAS a
@@ -1069,7 +1069,6 @@ mod tests {
                 RuntimeType::Grok,
                 RuntimeType::Kimi,
                 RuntimeType::Copilot,
-                RuntimeType::Kiro,
                 RuntimeType::Cursor,
                 RuntimeType::OpenCode,
             ]
@@ -1077,11 +1076,13 @@ mod tests {
         // Excluded, each for a structural reason:
         //   claude       — already surfaces as a rotator account
         //   antigravity  — no documented single credential file
+        //   kiro         — settings file is not proof of login; whoami verifies it
         //   qwen / vibe  — API-key only, no login flow to report on
         //   openai_compat— not a CLI
         for excluded in [
             RuntimeType::Claude,
             RuntimeType::Antigravity,
+            RuntimeType::Kiro,
             RuntimeType::Qwen,
             RuntimeType::Vibe,
             RuntimeType::OpenAiCompat,
