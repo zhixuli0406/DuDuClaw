@@ -104,7 +104,22 @@ impl MethodHandler {
                 self.handle_accounts_update(params).await
             }
             "accounts.remove" => {
-                require_admin!();
+                // The WebSocket context was captured at handshake time. A
+                // revoked admin must not be able to delete credentials using
+                // an already-open dashboard connection.
+                // `system` also names the credential-less bootstrap context.
+                // Resolve it through the authority store so a bootstrap
+                // connection loses Admin as soon as the first user is added.
+                let live = match crate::review_evidence::audience::trusted_dashboard_principal(
+                    &self.home_dir,
+                    &ctx.user_id,
+                ) {
+                    Ok(live) => live,
+                    Err(_) => return WsFrame::error_response("", "permission denied"),
+                };
+                if let Err(e) = acl::require_role(&live, UserRole::Admin) {
+                    return WsFrame::error_response("", &e);
+                }
                 self.handle_accounts_remove(params).await
             }
             // Interactive CLI login ("Dashboard 一鍵登入") — drives the CLI's

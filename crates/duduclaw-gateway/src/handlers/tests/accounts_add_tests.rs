@@ -419,6 +419,88 @@ async fn remove_account_refuses_unknown_or_unparseable_config_without_writing() 
     );
 }
 
+#[tokio::test]
+async fn remove_account_rechecks_admin_role_on_an_open_connection() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    let original = "[[accounts]]\nid = 'existing'\napi_key_enc = 'cipher'\n";
+    std::fs::write(&config_path, original).unwrap();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db
+        .create_user(
+            "admin@test.invalid",
+            "Admin",
+            "isolated-test-password",
+            UserRole::Admin,
+        )
+        .unwrap();
+    let cached = UserContext {
+        user_id: user.id.clone(),
+        email: user.email,
+        role: UserRole::Admin,
+        agent_access: std::collections::HashMap::new(),
+        must_change_password: false,
+    };
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    db.update_user(&user.id, None, Some(UserRole::Manager), None)
+        .unwrap();
+    let result = handler
+        .handle(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+        )
+        .await;
+    assert!(
+        matches!(result, WsFrame::Response { ok: false, .. }),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn remove_account_revokes_bootstrap_context_after_first_user() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    let original = "[[accounts]]\nid = 'existing'\napi_key_enc = 'cipher'\n";
+    std::fs::write(&config_path, original).unwrap();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let cached = UserContext::admin_fallback();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let before = handler
+        .handle(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+        )
+        .await;
+    assert!(
+        matches!(before, WsFrame::Response { ok: true, .. }),
+        "{before:?}"
+    );
+
+    std::fs::write(&config_path, original).unwrap();
+    db.create_user(
+        "first-admin@test.invalid",
+        "Admin",
+        "isolated-test-password",
+        UserRole::Admin,
+    )
+    .unwrap();
+    let after = handler
+        .handle(
+            "accounts.remove",
+            json!({"account_id": "existing"}),
+            &cached,
+        )
+        .await;
+    assert!(
+        matches!(after, WsFrame::Response { ok: false, .. }),
+        "{after:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+}
+
 // ── WP-A: `accounts.add` provider param, end-to-end via the RPC ─────
 
 fn frame_payload(f: &WsFrame) -> Value {

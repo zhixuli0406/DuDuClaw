@@ -145,7 +145,12 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
       // `riskAck`); the gateway refuses the call without this flag.
       .cliLoginStart(runtime, riskAck)
       .then((r) => {
-        if (cancelled) return;
+        if (cancelled) {
+          // The user can close the dialog before the start RPC returns. The
+          // gateway has already spawned the login process, so stop it now.
+          void api.auth.cliLoginCancel(r.session_id).catch(() => {});
+          return;
+        }
         sidRef.current = r.session_id;
         setOutput(r.output ?? '');
         setRemoteSafe(r.remote_safe);
