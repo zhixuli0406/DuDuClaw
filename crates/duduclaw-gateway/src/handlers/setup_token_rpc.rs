@@ -12,6 +12,9 @@ impl MethodHandler {
     // orchestration + the real-CLI-output findings behind its design.
 
     pub(crate) async fn handle_accounts_setup_token_start(&self) -> WsFrame {
+        if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, "claude") {
+            return WsFrame::error_response("", &e);
+        }
         let Some(claude_bin) =
             crate::cli_auth::resolve_program(duduclaw_core::types::RuntimeType::Claude)
         else {
@@ -138,6 +141,9 @@ impl MethodHandler {
     /// itself never appears in the response or in any log line here (see
     /// `setup_token_wizard.rs` module doc).
     pub(crate) async fn handle_accounts_setup_token_submit(&self, params: Value) -> WsFrame {
+        if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, "claude") {
+            return WsFrame::error_response("", &e);
+        }
         let session_id = params
             .get("session_id")
             .and_then(|v| v.as_str())

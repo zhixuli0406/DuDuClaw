@@ -252,6 +252,8 @@ export function AccountsPage() {
   const totalBudget = budget?.total_budget_cents ?? 0;
   const totalSpent = budget?.total_spent_cents ?? 0;
   const usagePercent = totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
+  const availableCliOptions = CLI_OPTIONS.filter(([rt]) => policy.allows('runtimes', rt));
+  const claudeLoginAllowed = policy.allows('runtimes', 'claude');
 
   return (
     <div className="space-y-6">
@@ -286,23 +288,25 @@ export function AccountsPage() {
       */}
       <div className="flex flex-wrap items-center gap-4 rounded-xl border border-brand/30 bg-brand/8 p-4">
         <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-brand/15 text-brand">
-          <QrCodeIcon className="size-5" />
+          {claudeLoginAllowed ? <QrCodeIcon className="size-5" /> : <LogIn className="size-5" />}
         </span>
         <div className="min-w-56 flex-1">
           <p className="text-sm font-medium text-foreground">
-            {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroTitle' })}
+            {intl.formatMessage({ id: claudeLoginAllowed ? 'accounts.subscriptionSetup.heroTitle' : 'accounts.cliLogin' })}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroDesc' })}
+            {intl.formatMessage({ id: claudeLoginAllowed ? 'accounts.subscriptionSetup.heroDesc' : policy.error ? 'productPolicy.error' : policy.loading ? 'productPolicy.loading' : 'accounts.cliLogin.pickHint' })}
           </p>
-          <SubscriptionRiskNote className="mt-1.5" />
+          {claudeLoginAllowed && <SubscriptionRiskNote className="mt-1.5" />}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="brand" onClick={() => setSubscriptionWizardOpen(true)}>
-            <QrCodeIcon />
-            {intl.formatMessage({ id: 'accounts.subscriptionSetup' })}
-          </Button>
-          <Button variant="outline" onClick={() => setPickerOpen(true)}>
+          {claudeLoginAllowed && (
+            <Button variant="brand" onClick={() => setSubscriptionWizardOpen(true)}>
+              <QrCodeIcon />
+              {intl.formatMessage({ id: 'accounts.subscriptionSetup' })}
+            </Button>
+          )}
+          <Button variant="outline" disabled={availableCliOptions.length === 0} onClick={() => setPickerOpen(true)}>
             <LogIn />
             {intl.formatMessage({ id: 'accounts.cliLogin' })}
           </Button>
@@ -310,7 +314,7 @@ export function AccountsPage() {
       </div>
 
       <SubscriptionSetupWizard
-        open={subscriptionWizardOpen}
+        open={subscriptionWizardOpen && claudeLoginAllowed}
         onClose={() => setSubscriptionWizardOpen(false)}
         onSuccess={fetchBudget}
       />
@@ -322,7 +326,7 @@ export function AccountsPage() {
             <DialogTitle>{intl.formatMessage({ id: 'accounts.cliLogin.pick' })}</DialogTitle>
           </DialogHeader>
           <div className="grid grid-cols-2 gap-2">
-            {CLI_OPTIONS.filter(([rt]) => policy.allows('runtimes', rt)).map(([rt, label, suffixKey]) => (
+            {availableCliOptions.map(([rt, label, suffixKey]) => (
               <Button
                 key={rt}
                 variant="outline"

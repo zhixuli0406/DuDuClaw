@@ -84,6 +84,31 @@ describe('AccountsPage (MDS)', () => {
     expect(screen.getByRole('button', { name: /Codex/i })).toBeInTheDocument();
   });
 
+  it('hides the Claude subscription wizard when its runtime is blocked', async () => {
+    const user = userEvent.setup();
+    useProductPolicyStore.setState({
+      policy: { profile: 'restricted', blocked_channels: [], blocked_runtimes: ['claude'], blocked_providers: [] },
+      loading: false,
+      error: false,
+    });
+    renderWithProviders(<AccountsPage />);
+    expect(screen.queryByRole('button', { name: 'Connect subscription account' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Codex' })).toBeInTheDocument();
+  });
+
+  it.each([
+    ['loading', { policy: null, loading: true, error: false }],
+    ['failed', { policy: null, loading: false, error: true }],
+  ] as const)('keeps CLI login closed while installation policy is %s', (_status, state) => {
+    useProductPolicyStore.setState(state);
+    renderWithProviders(<AccountsPage />);
+    expect(screen.queryByRole('button', { name: 'Connect subscription account' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /One-click sign-in/i })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument();
+  });
+
   it('requires the account ID before deleting a stored API token', async () => {
     const user = userEvent.setup();
     mockWsClient.call.mockImplementation((method: string) => {

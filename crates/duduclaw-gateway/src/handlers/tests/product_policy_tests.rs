@@ -44,6 +44,12 @@ async fn restricted_rejects_configuration_and_host_setup_before_side_effects() {
             .handle_cli_login_start(json!({"runtime":"claude"}))
             .await,
     );
+    assert_refused(handler.handle_accounts_setup_token_start().await);
+    assert_refused(
+        handler
+            .handle_accounts_setup_token_submit(json!({"session_id":"none", "code":"none"}))
+            .await,
+    );
     assert_refused(
         handler
             .handle_agents_create(json!({"name":"policy-test", "runtime":{"provider":"claude"}}))
