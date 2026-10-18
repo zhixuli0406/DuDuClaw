@@ -32,6 +32,9 @@
 - 閘道重啟後，先完成維修 SSH 的舊視窗清理，再接受新的開啟請求，避免背景清理誤關剛開好的視窗；等待期間仍可查詢狀態。只有取得該資料目錄執行鎖的閘道能開啟或關閉維修模式，第二個閘道只能讀取狀態。
 - SSH 關閉未確認的警示會保留到系統服務確認關閉；新開的診斷詳情視窗不會遮掉警示。確認結果另外記錄，原先的關閉錯誤仍保留在歷史裡。
 
+### Security
+- 將 HTML 清理依賴 ammonia 固定在修補版 4.1.8，排除 RUSTSEC-2026-0373 的 CSS `URL()` 大小寫繞過；加入帶引號 URL 的回歸測試。
+
 ### Changed
 - npm 包裝補上安裝、獨立 MCP 模式與文件入口的 README；六個 npm manifest 的 repository URL 改為 npm 標準的 `git+https` 格式。既有 1.74.0 不會因此改變，須隨下一次 npm 發布上線。
 - 三語 README 的開頭說明下方加上一張 v1.74.0 管理後台任務看板的截圖（示範資料）：`README.zh-TW.md` 用中文介面，`README.md` 與 `README.ja.md` 用英文介面。圖片放在 `docs/assets/screenshots/`。
