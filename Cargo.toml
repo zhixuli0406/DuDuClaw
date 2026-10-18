@@ -92,8 +92,9 @@ ring = "0.17"
 base64 = "0.22"
 
 # HTML sanitization (white-label About block) — servo ecosystem standard,
-# allowlist-based; security review low. Pinned to the 4.x line.
-ammonia = "4"
+# allowlist-based; security review low. Exact patched version avoids selecting
+# vulnerable 4.2.0-4.2.3 releases under a caret requirement.
+ammonia = "=4.1.8"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
