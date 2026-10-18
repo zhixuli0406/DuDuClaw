@@ -126,7 +126,12 @@ not prove delivery. Port 22 accepts private/link-local and VPN CGNAT
 trust. The menu permits selected diagnostics and restarting the local model
 or gateway. Restarting the gateway closes the window and disconnects SSH.
 
-An unconfirmed close stays visible as a warning. Expand Maintenance history
+An unconfirmed close stays visible as a warning. If the system service becomes
+unavailable or its reply is incomplete or cannot be read during a keyed SSH window, the same
+warning appears. The supervisor attempts one Admin notification per outage.
+Only a reliable report of the same window and key still running, or a confirmed
+complete close, clears that outage warning; other close errors remain recorded.
+Expand Maintenance history
 for recent window fingerprints and connection events. The UI polls every
 30 seconds, so an expiry or device-side close may appear on the next poll.
 The complete OS image and real SSH/notification flow are not yet verified;

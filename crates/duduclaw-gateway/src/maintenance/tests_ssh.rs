@@ -839,9 +839,12 @@ async fn details_windows_cannot_hide_an_unconfirmed_ssh_close() {
     );
     let store = MaintenanceStore::open(h.home.path()).unwrap();
     assert!(
-        store.recent_windows(10).await.unwrap().iter().any(|w| {
-            w.id == old.id && w.close_error.is_some()
-        }),
+        store
+            .recent_windows(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| { w.id == old.id && w.close_error.is_some() }),
         "retain the original failure for history"
     );
 }
@@ -1073,13 +1076,10 @@ async fn status_remains_available_during_the_boot_readiness_wait() {
             while h.provider.access_calls.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
-            let status = tokio::time::timeout(
-                Duration::from_millis(50),
-                status_json(&h.env, None),
-            )
-            .await
-            .expect("status must not wait for boot reconciliation")
-            .unwrap();
+            let status = tokio::time::timeout(Duration::from_millis(50), status_json(&h.env, None))
+                .await
+                .expect("status must not wait for boot reconciliation")
+                .unwrap();
             assert_eq!(status["active"], false);
             assert_eq!(status["ssh"]["reason"], "sysd_unreachable");
             h.provider.set_mode(Mode::Available);
@@ -1398,6 +1398,331 @@ fn the_dispatch_tick_no_longer_sweeps_maintenance() {
 }
 
 // ── Status ──────────────────────────────────────────────────
+
+fn unconfirmed_notices(h: &Harness) -> usize {
+    h.notifier
+        .sent()
+        .iter()
+        .filter(|t| t.contains("無法確認遠端連線已關閉"))
+        .count()
+}
+
+#[tokio::test]
+async fn live_keyed_window_losing_sysd_is_unconfirmed_before_the_next_poll() {
+    let h = harness(Mode::Available);
+    let w = open_ssh_window(&h).await;
+    h.provider.set_mode(Mode::Unreachable);
+    let status = status_json(&h.env, None).await.unwrap();
+    assert_eq!(status["window"]["id"], w.id);
+    assert_eq!(
+        status["active"], true,
+        "ledger authority does not imply observed SSH state"
+    );
+    assert_eq!(status["ssh_observed_active"], Value::Null);
+    assert_eq!(status["close_unconfirmed"], true);
+    assert_eq!(
+        unconfirmed_notices(&h),
+        0,
+        "status reads never push notices"
+    );
+}
+
+#[tokio::test]
+async fn lost_sysd_poll_persists_one_notice_until_a_reliable_same_window_recovery() {
+    let h = harness(Mode::Available);
+    let w = open_ssh_window(&h).await;
+    h.provider.set_mode(Mode::Unreachable);
+    poll_sysd(&h.env).await;
+    poll_sysd(&h.env).await;
+    assert_eq!(unconfirmed_notices(&h), 1);
+    assert!(
+        MaintenanceStore::open(h.home.path())
+            .unwrap()
+            .has_unconfirmed_close()
+            .await
+            .unwrap()
+    );
+    assert!(
+        MaintenanceStore::open(h.home.path())
+            .unwrap()
+            .current_row()
+            .await
+            .unwrap()
+            .unwrap()
+            .close_error
+            .is_none()
+    );
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        true
+    );
+    assert_eq!(unconfirmed_notices(&h), 1);
+
+    h.provider.set_mode(Mode::Available);
+    h.sysd.set_status(ok(open_status(&w.id, json!([]))));
+    poll_sysd(&h.env).await;
+    assert!(
+        !MaintenanceStore::open(h.home.path())
+            .unwrap()
+            .has_unconfirmed_close()
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    h.provider.set_mode(Mode::Unreachable);
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        unconfirmed_notices(&h),
+        2,
+        "a later loss after proven recovery is a new episode"
+    );
+
+    h.provider.set_mode(Mode::Available);
+    h.sysd.set_status(ok(closed_status()));
+    poll_sysd(&h.env).await;
+    let store = MaintenanceStore::open(h.home.path()).unwrap();
+    assert!(store.current_row().await.unwrap().is_none());
+    assert!(!store.has_unconfirmed_close().await.unwrap());
+    h.provider.set_mode(Mode::Unreachable);
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        unconfirmed_notices(&h),
+        2,
+        "a revoked window cannot become uncertain again"
+    );
+}
+
+#[tokio::test]
+async fn failed_unreadable_and_transport_statuses_share_the_persistent_loss_episode() {
+    let h = harness(Mode::Available);
+    open_ssh_window(&h).await;
+    for reply in [
+        Err(SysdCallError::Transport("reply cut off".into())),
+        ok("not JSON"),
+        Ok(SysdOpOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "refused".into(),
+        }),
+    ] {
+        h.sysd.set_status(reply);
+        assert_eq!(
+            status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+            true
+        );
+        poll_sysd(&h.env).await;
+    }
+    assert_eq!(unconfirmed_notices(&h), 1);
+    assert_eq!(
+        h.sysd.calls("stop"),
+        0,
+        "an unavailable observation is not proof of an orphan"
+    );
+}
+
+#[tokio::test]
+async fn missing_legacy_non_ssh_and_off_appliance_windows_do_not_create_loss_notices() {
+    let h = harness(Mode::Unreachable);
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    let details = caps(&["show_details"]);
+    enable(
+        &h.env,
+        &request(&details, None, PASSWORD),
+        &CountingVerifier::new(),
+    )
+    .await
+    .unwrap();
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    disable(&h.env, "u1", None).await.unwrap();
+    MaintenanceStore::open(h.home.path())
+        .unwrap()
+        .enable("u1", "admin@local", 1, &caps(&["ssh"]))
+        .await
+        .unwrap();
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    assert_eq!(unconfirmed_notices(&h), 0);
+
+    let keyed = harness(Mode::Available);
+    open_ssh_window(&keyed).await;
+    keyed.sysd.set_status(Err(SysdCallError::UnknownVerb));
+    assert_eq!(
+        poll_sysd(&keyed.env).await,
+        super::lifecycle::SysdSupport::Old
+    );
+    assert_eq!(
+        status_json(&keyed.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    keyed.provider.set_mode(Mode::Off);
+    poll_sysd(&keyed.env).await;
+    assert_eq!(
+        status_json(&keyed.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+    assert_eq!(unconfirmed_notices(&keyed), 0);
+}
+
+#[tokio::test]
+async fn incomplete_json_cannot_hide_the_loss_of_a_keyed_window_observation() {
+    for missing in [
+        "all",
+        "key_installed",
+        "ssh_active",
+        "window_id",
+        "key_fingerprint",
+    ] {
+        let h = harness(Mode::Available);
+        let w = open_ssh_window(&h).await;
+        let mut body: Value = serde_json::from_str(&open_status(&w.id, json!([]))).unwrap();
+        if missing == "all" {
+            body = json!({});
+        } else {
+            body.as_object_mut().unwrap().remove(missing);
+        }
+        h.sysd.set_status(ok(body.to_string()));
+        assert_eq!(
+            status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+            true,
+            "missing {missing} is unknown, even when it is valid JSON"
+        );
+        poll_sysd(&h.env).await;
+        poll_sysd(&h.env).await;
+        assert_eq!(unconfirmed_notices(&h), 1, "missing {missing}");
+        let store = MaintenanceStore::open(h.home.path()).unwrap();
+        assert!(store.has_unconfirmed_close().await.unwrap());
+        let row = store.current_row().await.unwrap().unwrap();
+        assert_eq!(row.id, w.id);
+        assert_eq!(row.state, WindowState::Open);
+        assert_eq!(
+            h.sysd.calls("stop"),
+            0,
+            "missing {missing} is not proof of an orphan key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_recovery_does_not_acknowledge_other_close_errors_or_a_different_key() {
+    let h = harness(Mode::Available);
+    let w = open_ssh_window(&h).await;
+    h.provider.set_mode(Mode::Unreachable);
+    poll_sysd(&h.env).await;
+    h.provider.set_mode(Mode::Available);
+    let mut different_key: Value = serde_json::from_str(&open_status(&w.id, json!([]))).unwrap();
+    different_key["key_fingerprint"] = json!("SHA256:different-key");
+    h.sysd.set_status(ok(different_key.to_string()));
+    poll_sysd(&h.env).await;
+    let store = MaintenanceStore::open(h.home.path()).unwrap();
+    assert!(store.has_unconfirmed_close().await.unwrap());
+
+    store
+        .set_close_error(&w.id, "an independent failed close")
+        .await;
+    h.sysd.set_status(ok(open_status(&w.id, json!([]))));
+    poll_sysd(&h.env).await;
+    assert!(store.has_unconfirmed_close().await.unwrap());
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        true
+    );
+    h.provider.set_mode(Mode::Unreachable);
+    poll_sysd(&h.env).await;
+    assert_eq!(
+        unconfirmed_notices(&h),
+        2,
+        "matching recovery ended only the prior observation outage"
+    );
+    h.provider.set_mode(Mode::Available);
+    h.sysd.set_status(ok(closed_status()));
+    poll_sysd(&h.env).await;
+    assert!(!store.has_unconfirmed_close().await.unwrap());
+    assert_eq!(
+        store
+            .latest_window()
+            .await
+            .unwrap()
+            .unwrap()
+            .close_error
+            .as_deref(),
+        Some("an independent failed close")
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_poll_waits_for_enable_to_commit_its_window() {
+    let h = harness_with(
+        Mode::Available,
+        MockSysd {
+            open_delay: Duration::from_millis(25),
+            ..Default::default()
+        },
+        true,
+    );
+    h.sysd
+        .set_status(Err(SysdCallError::Transport("lost status".into())));
+    let ssh = caps(&["ssh"]);
+    let req = request(&ssh, Some(KEY_LINE), PASSWORD);
+    let verifier = CountingVerifier::new();
+    let poll = async {
+        for _ in 0..1000 {
+            if h.sysd.calls("open") != 0 {
+                return poll_sysd(&h.env).await;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("enable never reached sysd");
+    };
+    let (opened, _) = tokio::join!(enable(&h.env, &req, &verifier), poll);
+    let w = opened.unwrap();
+    let store = MaintenanceStore::open(h.home.path()).unwrap();
+    let row = store.current_row().await.unwrap().unwrap();
+    assert_eq!(row.id, w.id);
+    assert_eq!(row.state, WindowState::Open);
+    assert!(store.has_unconfirmed_close().await.unwrap());
+    assert_eq!(unconfirmed_notices(&h), 1);
+    assert_eq!(h.sysd.calls("stop"), 0);
+}
+
+#[tokio::test]
+async fn an_uncommitted_opening_row_does_not_reserve_a_loss_notice() {
+    let h = harness(Mode::Unreachable);
+    let key = duduclaw_sysd::ssh_key::parse(KEY_LINE).unwrap();
+    let ssh = caps(&["ssh"]);
+    let store = MaintenanceStore::open(h.home.path()).unwrap();
+    store
+        .insert(NewWindow {
+            enabled_by: "u1",
+            enabled_by_email: "a@b",
+            ttl_hours: 1,
+            sub_capabilities: &ssh,
+            state: WindowState::Opening,
+            ssh_key: Some(&key),
+        })
+        .await
+        .unwrap();
+    poll_sysd(&h.env).await;
+    assert!(!store.has_unconfirmed_close().await.unwrap());
+    assert_eq!(unconfirmed_notices(&h), 0);
+    assert_eq!(
+        status_json(&h.env, None).await.unwrap()["close_unconfirmed"],
+        false
+    );
+}
 
 #[tokio::test]
 async fn status_always_asks_sysd_and_reports_what_it_says() {

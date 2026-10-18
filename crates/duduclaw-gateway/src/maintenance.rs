@@ -212,6 +212,19 @@ impl WindowState {
 }
 
 impl MaintenanceWindow {
+    /// Only a completed keyed SSH window needs live sysd supervision.
+    /// Legacy port-only and diagnostic-only windows do not establish that
+    /// sysd supports keyed windows.
+    fn is_keyed_ssh_window(&self) -> bool {
+        self.state == WindowState::Open
+            && self.revoked_at.is_none()
+            && self.ssh_key_fingerprint.is_some()
+            && self
+                .sub_capabilities
+                .iter()
+                .any(|c| c == SUB_CAPABILITY_SSH)
+    }
+
     fn expires_at_dt(&self) -> Option<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(&self.expires_at)
             .ok()
@@ -300,6 +313,7 @@ const WINDOW_COLUMNS_2026_10: &[(&str, &str)] = &[
     ("host_key_fingerprints", "TEXT"),
     ("open_error", "TEXT"),
     ("close_confirmed_at", "TEXT"),
+    ("ssh_status_unconfirmed_at", "TEXT"),
 ];
 
 // ── Store ───────────────────────────────────────────────────
@@ -400,7 +414,10 @@ impl MaintenanceStore {
             if existing.iter().any(|c| c == name) {
                 continue;
             }
-            match conn.execute(&format!("ALTER TABLE maintenance_windows ADD COLUMN {name} {decl}"), []) {
+            match conn.execute(
+                &format!("ALTER TABLE maintenance_windows ADD COLUMN {name} {decl}"),
+                [],
+            ) {
                 Ok(_) => {}
                 // Another connection added it between the read and the ALTER.
                 Err(e) if e.to_string().contains("duplicate column name") => continue,
@@ -537,7 +554,11 @@ impl MaintenanceStore {
     /// `opening` → `open` once sysd confirmed the SSH open. Only touches a row
     /// that is still unrevoked and `opening`; `Ok(false)` otherwise (the
     /// caller then closes what sysd just opened).
-    pub async fn mark_open(&self, id: &str, host_key_fingerprints: &[String]) -> Result<bool, String> {
+    pub async fn mark_open(
+        &self,
+        id: &str,
+        host_key_fingerprints: &[String],
+    ) -> Result<bool, String> {
         let fps = serde_json::to_string(host_key_fingerprints)
             .map_err(|e| format!("serialize host key fingerprints: {e}"))?;
         let conn = self.conn.lock().await;
@@ -673,16 +694,47 @@ impl MaintenanceStore {
     }
 
     /// An unresolved SSH close stays visible across later show-details
-    /// windows. Keep the original error for history when sysd confirms it.
+    /// windows, as does a lost-supervision warning. Keep the original close
+    /// error for history when sysd confirms it.
     pub async fn has_unconfirmed_close(&self) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM maintenance_windows
-             WHERE close_error IS NOT NULL AND close_confirmed_at IS NULL)",
+             WHERE (close_error IS NOT NULL AND close_confirmed_at IS NULL)
+                OR ssh_status_unconfirmed_at IS NOT NULL)",
             [],
             |row| row.get(0),
         )
         .map_err(|e| format!("read unconfirmed maintenance closes: {e}"))
+    }
+
+    /// Reserve one notice attempt for an outage of this open window. The
+    /// caller holds the lifecycle writer lock and has checked its SSH key.
+    /// Keep this separate from close_error: observing a loss is not a failed
+    /// close action, and recovery must not erase another close failure.
+    async fn mark_ssh_status_unconfirmed(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE maintenance_windows SET ssh_status_unconfirmed_at = ?1
+             WHERE id = ?2 AND revoked_at IS NULL AND state = 'open'
+               AND ssh_key_fingerprint IS NOT NULL AND ssh_status_unconfirmed_at IS NULL",
+                params![now_rfc3339(), id],
+            )
+            .map_err(|e| format!("record unavailable maintenance SSH status: {e}"))?;
+        Ok(changed == 1)
+    }
+
+    /// A reliable same-window/key observation ended this outage. This does
+    /// not acknowledge close_error or change the window's authority/TTL.
+    async fn confirm_ssh_status_recovered(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE maintenance_windows SET ssh_status_unconfirmed_at = NULL WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("confirm maintenance SSH status recovery: {e}"))?;
+        Ok(())
     }
 
     /// Called under the writer lock only after a fresh positive sysd status
@@ -690,8 +742,9 @@ impl MaintenanceStore {
     pub async fn confirm_ssh_closed(&self) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE maintenance_windows SET close_confirmed_at = ?1
-             WHERE close_error IS NOT NULL AND close_confirmed_at IS NULL",
+            "UPDATE maintenance_windows SET close_confirmed_at = ?1, ssh_status_unconfirmed_at = NULL
+             WHERE (close_error IS NOT NULL AND close_confirmed_at IS NULL)
+                OR ssh_status_unconfirmed_at IS NOT NULL",
             params![now_rfc3339()],
         )
         .map_err(|e| format!("confirm maintenance SSH closes: {e}"))?;
@@ -873,7 +926,10 @@ async fn systemctl_output(args: &[&str]) -> Option<(bool, String)> {
         .output()
         .await
         .ok()?;
-    Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned()))
+    Some((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
 }
 
 /// Whether any process lives anywhere under a cgroup v2 directory (session
