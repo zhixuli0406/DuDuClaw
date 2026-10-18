@@ -322,7 +322,7 @@ export function AccountsPage() {
             <DialogTitle>{intl.formatMessage({ id: 'accounts.cliLogin.pick' })}</DialogTitle>
           </DialogHeader>
           <div className="grid grid-cols-2 gap-2">
-            {CLI_OPTIONS.map(([rt, label, suffixKey]) => (
+            {CLI_OPTIONS.filter(([rt]) => policy.allows('runtimes', rt)).map(([rt, label, suffixKey]) => (
               <Button
                 key={rt}
                 variant="outline"

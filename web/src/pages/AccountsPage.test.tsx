@@ -1,4 +1,5 @@
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
+import { useProductPolicyStore } from '@/lib/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -68,6 +69,19 @@ describe('AccountsPage (MDS)', () => {
     const grok = screen.getByRole('button', { name: /Grok/ });
     expect(grok.querySelectorAll('span')).toHaveLength(2);
     expect(grok).toHaveClass('flex-col');
+  });
+
+  it('hides CLI logins disabled by the installation policy', async () => {
+    const user = userEvent.setup();
+    useProductPolicyStore.setState({
+      policy: { profile: 'restricted', blocked_channels: [], blocked_runtimes: ['kimi'], blocked_providers: [] },
+      loading: false,
+      error: false,
+    });
+    renderWithProviders(<AccountsPage />);
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    expect(screen.queryByRole('button', { name: /Kimi Code/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Codex/i })).toBeInTheDocument();
   });
 
   it('requires the account ID before deleting a stored API token', async () => {
