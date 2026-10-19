@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 維修 SSH 沒有指定指令時可正常顯示互動選單：相容 Dropbear 強制指令傳入的空 `SSH_ORIGINAL_COMMAND`。純空白、未知指令與 shell 字串仍會拒絕；這是平台程式修復，OS 映像更新後仍需重新建置與活測。
+
 ## [1.75.0] - 2026-10-19 — 登入修復與 CLI 更新
 
 ### Added
@@ -24,7 +27,7 @@
   - sysd 在狀態裡回報上一次關窗的原因（例如重開機 `reboot`、防火牆規則被改 `firewall_changed`、登入紀錄是否遺失），閘道會照抄一次進維修歷史（`ssh_os_close_record`），並放進 `maintenance.status` 的 `ssh.last_close`；真實 OS 映像上的回報仍待活測。重開機後 sysd 已自行收掉舊視窗時，閘道不會把它當成孤兒金鑰。
   - 驗證範圍：生命週期 mock 測試之外，增加原生 Unix socket 整合測試，由真正的 `SocketMaintSysd`／`SysdClient` 連到隔離的模擬 daemon，涵蓋開啟、狀態、關閉、`busy` 不回滾與舊版 verb 拒絕；macOS 本地與 Linux 原生 CI 跑同一組。尚未接上真的 sysd 與 OS 映像（要等 OS 的 PR 備妥後在 QEMU 活測）；推播只測了文字內容，沒有實際送到通道。
 - 新 crate `duduclaw-maint-tools`，給 DuDuClaw OS 維修 SSH 帳號 `duduclaw-maint`（uid 4800）用的兩個程式。要等 OS 映像裝上這個帳號才用得到，平台發行檔不打包，由 OS recipe 建置；說明見 `crates/duduclaw-maint-tools/README.md`。
-  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會先提醒這會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。非空的 `SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。兩個重啟不在選單裡執行，而是請 helper 代做。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
+  - `duduclaw-maint-shell`：帳號的登入 shell 兼 dropbear 強制指令。只有固定選單：狀態、gateway 紀錄、本地模型紀錄、資源、網路、重啟本地模型、重啟 gateway（`restart gateway confirm`，會先提醒這會結束維修視窗，互動模式要再輸入 `yes`）。沒有重開機、沒有一般 shell。`SSH_ORIGINAL_COMMAND` 以空白切開後要跟清單逐字相同，否則印出清單並以代碼 2 結束；用戶端輸入只用來選動作，不會變成子程式的參數。所有 `systemctl` 都帶 `--no-pager --no-ask-password`，子程式環境清空後只給固定變數，不讀 `TERM`；子程式的輸出（例如 uid 1000 經 `sd_notify` 設定的 `Status:` 文字）先去掉控制字元、UTF-8 編碼的 C1 控制字元與 bidi 字元才顯示，上限 4 MiB；Ctrl-C 回到選單。兩個重啟不在選單裡執行，而是請 helper 代做。每個動作以 `SYSLOG_IDENTIFIER=duduclaw-maint` 記進 journal，被拒的指令只記長度。
   - `duduclaw-maint-helper`：以 root 執行、每條連線一個實例的小服務，socket 是 `/run/duduclaw-maint-helper.sock`。對端 uid 由 `SO_PEERCRED` 取得，不是 4800 就拒絕；只收六個字：`gateway`、`gateway-follow`、`model`、`model-follow`、`restart-gateway`、`restart-model`。
     - 紀錄：以 `journalctl -o json` 依 `_SYSTEMD_UNIT` 與 `_UID=1000` 篩選。`MESSAGE` 任一行去掉前置空白後以 `password:` 開頭（不分大小寫）的整筆丟掉，這是 gateway 首次開機印出的一次性密碼；其餘去控制字元、遮罩憑證、截成 4 KiB 後輸出。非 follow 最多 1000 行，超過 64 KiB 的紀錄跳過；請求要在 10 秒內送完，用戶端 30 秒不讀就斷線，follow 在用戶端斷線時立刻停止。
     - 重啟：以固定參數執行 `systemctl --no-ask-password restart`，只有 `duduclaw-gateway.service` 與 `duduclaw-llama-server.service` 兩個 unit，回一行結果並記進 journal。同一個 unit 60 秒內只能重啟一次（上次時間記在 `/run/duduclaw-maint-helper/` 的狀態檔，以開機後時間計算，改系統時鐘不影響；目錄要是 root 擁有的 0700、狀態檔要是 root 擁有的 0600 單一連結一般檔，不符或讀寫失敗就拒絕；狀態檔時間在未來時改寫成現在並記一筆警告，不會卡到重開機）。owner 2026-10-16 決定兩個版本都不裝 polkit（基礎版加裝 polkit 可能讓既有系統帳號換號），所以重啟改由這個 root 服務執行。
@@ -33,7 +36,6 @@
 - Docker／遠端 Dashboard 的 Codex 一鍵登入改用 `codex login --device-auth`：使用者在瀏覽器輸入 CLI 顯示的裝置碼，等待 CLI 完成，不再依賴容器內 `127.0.0.1:1455` 回呼，也不需把 callback URL 的 `code` 貼進 Dashboard。帳號頁的 API Token 卡片新增刪除動作，確認帳號 id 後移除 DuDuClaw 儲存的那筆帳號。這不會撤銷供應商端的金鑰。
 - 一鍵登入選單加入 Kimi、Copilot、Kiro 與 OpenCode，Grok 的訂閱說明改為獨立一行，避免窄版選單換行錯位。Cursor 的瀏覽器回呼無法可靠地從遠端 Dashboard 完成，因此保留 runtime 支援但不提供一鍵登入；Antigravity 沒有可腳本化的登入指令，Qwen／Mistral Vibe 使用 API key。
 - CLI 一鍵登入的輸出與工作階段操作限定啟動該流程的管理員；初始化階段與共用的舊式管理 token 無法使用互動登入，須先建立並以個別 Dashboard 帳號登入。憑證相關 RPC 每次重新確認目前權限，管理員遭降權或停用後，既有 WebSocket 不能繼續操作帳號與登入流程。
-- 維修 SSH 沒有指定指令時可正常顯示互動選單：相容 Dropbear 強制指令傳入的空 `SSH_ORIGINAL_COMMAND`。純空白、未知指令與 shell 字串仍會拒絕；這是平台程式修復，OS 映像更新後仍需重新建置與活測。
 - 維修模式通知改為同時嘗試所有管理員的已驗證通道。每條通道有獨立的 20 秒上限，單次 HTTP 請求仍是 10 秒，整體 30 秒保留作最後防線；一條通道卡住不會阻止其他通道開始送出，成功數只計回報傳送成功的通道。
 - 閘道重啟後，先完成維修 SSH 的舊視窗清理，再接受新的開啟請求，避免背景清理誤關剛開好的視窗；等待期間仍可查詢狀態。只有取得該資料目錄執行鎖的閘道能開啟或關閉維修模式，第二個閘道只能讀取狀態。
 - SSH 關閉未確認的警示會保留到系統服務確認關閉；新開的診斷詳情視窗不會遮掉警示。確認結果另外記錄，原先的關閉錯誤仍保留在歷史裡。
