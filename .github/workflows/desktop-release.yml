@@ -19,6 +19,11 @@ on:
         description: Desktop release tag (desktop-vX.Y.Z)
         required: true
         type: string
+      rebuild_v1750_desktop:
+        description: Rebuild desktop-v1.75.0 with the merged PR #153 Tauri path fix
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   delivery-gate:
@@ -28,8 +33,74 @@ jobs:
     permissions:
       contents: read
 
-  build:
+  build-source:
     needs: delivery-gate
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.select.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify desktop build source
+        id: select
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          SIGNED_SOURCE: ${{ needs.delivery-gate.outputs.commit }}
+          REBUILD_V1750: ${{ inputs.rebuild_v1750_desktop && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ "$REBUILD_V1750" != true ]]; then
+            echo "commit=$SIGNED_SOURCE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The v1.75.0 delivery assertion remains bound to its original tag.
+          # The only permitted desktop packaging change is merged PR #153.
+          [[ "$RELEASE_TAG" == desktop-v1.75.0 ]]
+          [[ "$SIGNED_SOURCE" == b80df7f423f7bc2179f1ffb60f66d757aec5d323 ]]
+          BUILD_SOURCE=a182caf0ba42ac62b76af462f7fe0389599e97fd
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git cat-file -e "$BUILD_SOURCE^{commit}"
+          git merge-base --is-ancestor "$SIGNED_SOURCE" "$BUILD_SOURCE"
+          git merge-base --is-ancestor "$BUILD_SOURCE" origin/main
+          python3 - "$SIGNED_SOURCE" "$BUILD_SOURCE" <<'PY'
+          import subprocess
+          import sys
+
+          signed, build = sys.argv[1:]
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", signed, build], text=True
+          ).splitlines()
+          if changed != ["src-tauri/tauri.conf.json"]:
+              raise SystemExit(f"unexpected desktop source changes: {changed}")
+
+          def show(revision):
+              return subprocess.check_output(
+                  ["git", "show", f"{revision}:src-tauri/tauri.conf.json"]
+              )
+
+          original = show(signed)
+          expected = original
+          for before, after in (
+              (b'"beforeDevCommand": "cd web && npm run dev"',
+               b'"beforeDevCommand": "cd ../web && npm run dev"'),
+              (b'"beforeBuildCommand": "cd web && npm run build"',
+               b'"beforeBuildCommand": "cd ../web && npm run build"'),
+          ):
+              if expected.count(before) != 1:
+                  raise SystemExit("signed desktop config has unexpected commands")
+              expected = expected.replace(before, after)
+          if show(build) != expected:
+              raise SystemExit("desktop build source is not exactly PR #153's path fix")
+          PY
+          echo "commit=$BUILD_SOURCE" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [delivery-gate, build-source]
     permissions:
       contents: write
     strategy:
@@ -54,7 +125,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.delivery-gate.outputs.commit }}
+          ref: ${{ needs.build-source.outputs.commit }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -163,7 +234,7 @@ jobs:
   # latest.json and the updater check would 404 forever. After all platform
   # builds land, republish the merged latest.json under the fixed tag.
   updater-manifest:
-    needs: build
+    needs: [build, build-source]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -183,6 +254,23 @@ jobs:
               --notes "Moving pointer for the desktop auto-updater. latest.json here always describes the newest desktop release; installers live on the desktop-v* releases."
           fi
           gh release upload desktop-updater latest.json --repo "${{ github.repository }}" --clobber
+
+      - name: Record desktop v1.75.0 rebuild provenance
+        if: inputs.rebuild_v1750_desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+          BUILD_SOURCE: ${{ needs.build-source.outputs.commit }}
+        run: |
+          cat > desktop-release-notes.md <<EOF
+          Desktop installers for DuDuClaw v1.75.0.
+
+          Signed delivery tag: \`desktop-v1.75.0\` (source \`b80df7f423f7bc2179f1ffb60f66d757aec5d323\`).
+          Desktop build source: \`$BUILD_SOURCE\` ([PR #153](https://github.com/${{ github.repository }}/pull/153)).
+          The build source differs from the signed tag only in Tauri's two web command paths. The signed tag and CLI release were not moved.
+          EOF
+          gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" \
+            --notes-file desktop-release-notes.md
 
       # A desktop-v* release publishes minutes AFTER its paired CLI v* release,
       # so it steals the repo's "Latest" marker — /releases/latest then returns
