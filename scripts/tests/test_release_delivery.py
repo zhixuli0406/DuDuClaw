@@ -221,7 +221,9 @@ class DeliveryTests(unittest.TestCase):
                 self.assertIn("ref: ${{ needs.build-source.outputs.commit }}", body)
                 self.assertIn("[[ \"$RELEASE_TAG\" == desktop-v1.75.0 ]]", body)
                 self.assertIn("[[ \"$SIGNED_SOURCE\" == b80df7f423f7bc2179f1ffb60f66d757aec5d323 ]]", body)
-                self.assertIn("BUILD_SOURCE=a182caf0ba42ac62b76af462f7fe0389599e97fd", body)
+                self.assertIn("BUILD_SOURCE=5e1af525409efed098c631b9c41dbb805b92ba0c", body)
+                self.assertIn("TAURIGNORE_BLOB=06f7acd184a03ae8f723bfae0c63bf0d936b97fa", body)
+                self.assertIn('[[ "$changed" != src-tauri/.taurignore ]]', body)
             else:
                 self.assertIn("  build:\n    needs: delivery-gate", body)
                 self.assertIn("ref: ${{ needs.delivery-gate.outputs.commit }}", body)
