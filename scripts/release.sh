@@ -895,8 +895,12 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
             echo "  WARNING: could not determine a darwin-arm64/darwin-x64 host triple via"
             echo "           'rustc -vV' — skipping darwin binary asset (fail-closed)."
         else
-            echo "  [$DARWIN_PLATFORM_LABEL] cargo build --release --bin duduclaw-pro..."
-            if ( cd commercial/duduclaw-pro-gateway && cargo build --release --bin duduclaw-pro ); then
+            echo "  [$DARWIN_PLATFORM_LABEL] validating policy and building duduclaw-pro..."
+            if ( cd commercial/duduclaw-pro-gateway &&
+                 python3 build-policy.py --check &&
+                 DUDUCLAW_INSTALLATION_POLICY_PATH="$PWD/installation-policy.json" \
+                     cargo build --release --locked --bin duduclaw-pro &&
+                 ../../target/release/duduclaw-pro --version >/dev/null ); then
                 mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
                 if cp target/release/duduclaw-pro "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then
                     if package_and_upload_pro_bin "$DARWIN_PLATFORM_LABEL" "$PRO_BIN_TMP" "$NEW_VERSION"; then
