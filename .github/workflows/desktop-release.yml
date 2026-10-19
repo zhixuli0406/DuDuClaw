@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       rebuild_v1750_desktop:
-        description: Rebuild desktop-v1.75.0 with the merged PR #153 Tauri path fix
+        description: Rebuild desktop-v1.75.0 from the signed source plus src-tauri/.taurignore
         required: false
         default: false
         type: boolean
@@ -59,44 +59,24 @@ jobs:
           fi
 
           # The v1.75.0 delivery assertion remains bound to its original tag.
-          # The only permitted desktop packaging change is merged PR #153.
+          # The only permitted desktop packaging change is one commit directly
+          # on the signed source that adds src-tauri/.taurignore, so Tauri stops
+          # resolving the vendored tauri-plugin-updater as the frontend
+          # directory. (PR #153's `cd ../web` change did not fix that.)
           [[ "$RELEASE_TAG" == desktop-v1.75.0 ]]
           [[ "$SIGNED_SOURCE" == b80df7f423f7bc2179f1ffb60f66d757aec5d323 ]]
-          BUILD_SOURCE=a182caf0ba42ac62b76af462f7fe0389599e97fd
+          BUILD_SOURCE=5e1af525409efed098c631b9c41dbb805b92ba0c
+          TAURIGNORE_BLOB=06f7acd184a03ae8f723bfae0c63bf0d936b97fa
           git fetch --no-tags origin main:refs/remotes/origin/main
           git cat-file -e "$BUILD_SOURCE^{commit}"
-          git merge-base --is-ancestor "$SIGNED_SOURCE" "$BUILD_SOURCE"
+          [[ "$(git rev-parse "$BUILD_SOURCE^@")" == "$SIGNED_SOURCE" ]]
           git merge-base --is-ancestor "$BUILD_SOURCE" origin/main
-          python3 - "$SIGNED_SOURCE" "$BUILD_SOURCE" <<'PY'
-          import subprocess
-          import sys
-
-          signed, build = sys.argv[1:]
-          changed = subprocess.check_output(
-              ["git", "diff", "--name-only", signed, build], text=True
-          ).splitlines()
-          if changed != ["src-tauri/tauri.conf.json"]:
-              raise SystemExit(f"unexpected desktop source changes: {changed}")
-
-          def show(revision):
-              return subprocess.check_output(
-                  ["git", "show", f"{revision}:src-tauri/tauri.conf.json"]
-              )
-
-          original = show(signed)
-          expected = original
-          for before, after in (
-              (b'"beforeDevCommand": "cd web && npm run dev"',
-               b'"beforeDevCommand": "cd ../web && npm run dev"'),
-              (b'"beforeBuildCommand": "cd web && npm run build"',
-               b'"beforeBuildCommand": "cd ../web && npm run build"'),
-          ):
-              if expected.count(before) != 1:
-                  raise SystemExit("signed desktop config has unexpected commands")
-              expected = expected.replace(before, after)
-          if show(build) != expected:
-              raise SystemExit("desktop build source is not exactly PR #153's path fix")
-          PY
+          changed="$(git diff --name-only "$SIGNED_SOURCE" "$BUILD_SOURCE")"
+          if [[ "$changed" != src-tauri/.taurignore ]]; then
+            echo "unexpected desktop source changes: $changed" >&2
+            exit 1
+          fi
+          [[ "$(git rev-parse "$BUILD_SOURCE:src-tauri/.taurignore")" == "$TAURIGNORE_BLOB" ]]
           echo "commit=$BUILD_SOURCE" >> "$GITHUB_OUTPUT"
 
   build:
@@ -266,8 +246,8 @@ jobs:
           Desktop installers for DuDuClaw v1.75.0.
 
           Signed delivery tag: \`desktop-v1.75.0\` (source \`b80df7f423f7bc2179f1ffb60f66d757aec5d323\`).
-          Desktop build source: \`$BUILD_SOURCE\` ([PR #153](https://github.com/${{ github.repository }}/pull/153)).
-          The build source differs from the signed tag only in Tauri's two web command paths. The signed tag and CLI release were not moved.
+          Desktop build source: \`$BUILD_SOURCE\` (the signed source plus \`src-tauri/.taurignore\`).
+          The build source differs from the signed tag only by that one file, which keeps the vendored updater crate out of Tauri's frontend lookup. The signed tag and CLI release were not moved.
           EOF
           gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" \
             --notes-file desktop-release-notes.md
