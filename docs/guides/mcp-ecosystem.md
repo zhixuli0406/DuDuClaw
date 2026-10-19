@@ -322,10 +322,15 @@ session listed its tools through DuDuClaw. The snapshot is display only; the
 gate always uses the live listing.
 
 **Runtimes covered**: the Claude CLI (it starts `.mcp.json` servers; the
-spawn hands it the rewritten config). Codex, Antigravity and Grok
-employees are registered with DuDuClaw's own server only, and the
-openai-compat tool loop starts only `duduclaw mcp-server`, so they have no
-third-party servers to gate. `url` / `type` entries in `.mcp.json` (the CLI
+spawn hands it the rewritten config) and Codex (each
+third-party stdio server in `.mcp.json` is registered for the spawn behind
+`duduclaw mcp-proxy`, always, because Codex auto-approves the servers it is
+given; remote bridges are registered as they are, since they gate
+themselves; the proxy's own credentials stay in a per-spawn owner-only file
+rather than on the command line). Antigravity and Grok employees are
+registered with DuDuClaw's own server only, and the openai-compat tool loop
+starts only `duduclaw mcp-server`, so their other `.mcp.json` servers are
+not started there at all. `url` / `type` entries in `.mcp.json` (the CLI
 talks to them directly) cannot be gated, so a spawn that is gated (an
 `action_rules` key, or the read-only lane) removes them from the config it
 hands the CLI (audit `third_party_remote_entry_dropped`; `duduclaw doctor`

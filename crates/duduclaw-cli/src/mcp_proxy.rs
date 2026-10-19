@@ -81,12 +81,20 @@ use duduclaw_gateway::third_party_tools::ThirdPartyGate;
 /// Written by the gateway's config rewrite, consumed (and removed) here.
 pub const PROXY_UPSTREAM_ENV_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV";
 
+/// Env var naming an owner-only file holding the same JSON map, read only
+/// when [`PROXY_UPSTREAM_ENV_VAR`] is absent. The Codex runtime uses it
+/// because its server definitions travel as `-c` overrides in `argv`
+/// (2026-10-19). Must match
+/// `duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_FILE_VAR`.
+pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
+
 /// DuDuClaw-internal names the rewritten `.mcp.json` entry sets **for the
 /// proxy process** and which must not be handed down to the third-party
 /// upstream server. Everything else is inherited, so the upstream sees the
 /// same environment the Claude CLI would have given it.
 pub const PROXY_PRIVATE_ENV: &[&str] = &[
     PROXY_UPSTREAM_ENV_VAR,
+    PROXY_UPSTREAM_ENV_FILE_VAR,
     "DUDUCLAW_HOME",
     "DUDUCLAW_PORT",
     "DUDUCLAW_INSTANCE",
@@ -234,6 +242,32 @@ pub fn upstream_env(
         }
     }
     out
+}
+
+/// The upstream env blob: the inline [`PROXY_UPSTREAM_ENV_VAR`] value when
+/// set, otherwise the contents of the file [`PROXY_UPSTREAM_ENV_FILE_VAR`]
+/// names. An unreadable file contributes nothing (logged), like a malformed
+/// blob in [`upstream_env`].
+pub fn upstream_env_blob(
+    inline: Option<String>,
+    file: Option<String>,
+    server: &str,
+) -> Option<String> {
+    if inline.is_some() {
+        return inline;
+    }
+    let path = file.filter(|p| !p.trim().is_empty())?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Some(raw),
+        Err(e) => {
+            tracing::warn!(
+                server = %server,
+                error = %e,
+                "mcp-proxy: upstream env file unreadable — the upstream starts without its declared env"
+            );
+            None
+        }
+    }
 }
 
 // ── The proxy loop ──────────────────────────────────────────────────────────
@@ -627,7 +661,11 @@ pub async fn run_mcp_proxy(
         Arc::new(ThirdPartyGate::new(home_dir, &default_agent, server, "proxy"))
     });
 
-    let env_blob = std::env::var(PROXY_UPSTREAM_ENV_VAR).ok();
+    let env_blob = upstream_env_blob(
+        std::env::var(PROXY_UPSTREAM_ENV_VAR).ok(),
+        std::env::var(PROXY_UPSTREAM_ENV_FILE_VAR).ok(),
+        server,
+    );
     let env_pairs = upstream_env(std::env::vars(), env_blob.as_deref());
 
     let mut cmd = duduclaw_core::platform::async_command_for(command);
@@ -795,6 +833,45 @@ mod tests {
             REDACTION_FAILED_PLACEHOLDER,
             duduclaw_gateway::redaction_proxy::REDACTION_FAILED_PLACEHOLDER
         );
+        assert_eq!(
+            PROXY_UPSTREAM_ENV_FILE_VAR,
+            duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_FILE_VAR
+        );
+    }
+
+    // ── upstream env file (Codex, 2026-10-19) ───────────────────────
+
+    #[test]
+    fn upstream_env_blob_prefers_the_inline_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("env.json");
+        std::fs::write(&file, r#"{"A":"file"}"#).unwrap();
+        let got = upstream_env_blob(
+            Some(r#"{"A":"inline"}"#.to_string()),
+            Some(file.to_string_lossy().into_owned()),
+            "s",
+        );
+        assert_eq!(got.as_deref(), Some(r#"{"A":"inline"}"#));
+    }
+
+    #[test]
+    fn upstream_env_blob_reads_the_file_when_no_inline_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("env.json");
+        std::fs::write(&file, r#"{"PGPASSWORD":"from-file"}"#).unwrap();
+        let blob = upstream_env_blob(None, Some(file.to_string_lossy().into_owned()), "s");
+        let map: HashMap<_, _> = upstream_env(Vec::new(), blob.as_deref()).into_iter().collect();
+        assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some("from-file"));
+        // A missing file contributes nothing rather than aborting.
+        assert!(upstream_env_blob(None, Some("/nonexistent/x.json".into()), "s").is_none());
+        assert!(upstream_env_blob(None, None, "s").is_none());
+    }
+
+    #[test]
+    fn the_env_file_name_never_reaches_the_upstream() {
+        let inherited = vec![(PROXY_UPSTREAM_ENV_FILE_VAR.to_string(), "/tmp/x".to_string())];
+        let map: HashMap<_, _> = upstream_env(inherited, None).into_iter().collect();
+        assert!(!map.contains_key(PROXY_UPSTREAM_ENV_FILE_VAR));
     }
 
     // ── upstream env ────────────────────────────────────────────────

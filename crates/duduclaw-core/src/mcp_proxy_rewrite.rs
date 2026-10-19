@@ -26,6 +26,14 @@ use serde_json::{Map, Value, json};
 /// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_VAR`.
 pub const PROXY_UPSTREAM_ENV_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV";
 
+/// Env var naming a file that holds the same JSON map as
+/// [`PROXY_UPSTREAM_ENV_VAR`]; read by the proxy only when that variable is
+/// absent. Used where the server definition travels on a command line (Codex
+/// `-c` overrides): the upstream server's own credentials then sit in an
+/// owner-only per-spawn file, not in `argv`. Must match
+/// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_FILE_VAR`.
+pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
+
 /// Env names copied from the `.mcp.json` `duduclaw` entry onto every
 /// rewritten proxy entry, so the proxy process resolves the same home, the
 /// same agent identity and the same MCP credential the built-in server does.

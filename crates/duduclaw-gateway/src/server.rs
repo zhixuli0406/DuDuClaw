@@ -1484,6 +1484,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 "Fixed/created .mcp.json for agent MCP server discovery"
             );
         }
+        // Codex third-party MCP servers: per-spawn upstream-env files a
+        // stopped gateway may have left behind (they hold credentials).
+        let swept = crate::runtime::codex::third_party::sweep_stale_env_files(&home_dir);
+        if swept > 0 {
+            info!(count = swept, "Removed stale Codex MCP proxy env files");
+        }
     }
 
     // Initialize SQLite message queue (Phase 3 Hybrid TaskPipeline)
