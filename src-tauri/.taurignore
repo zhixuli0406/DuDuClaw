@@ -1,0 +1,5 @@
+# Vendored crates (e.g. tauri-plugin-updater) ship their own package.json.
+# Tauri CLI resolves the frontend directory by searching for package.json up
+# to three levels below src-tauri, so without this it picks
+# vendor/tauri-plugin-updater and runs beforeBuildCommand there.
+vendor/
