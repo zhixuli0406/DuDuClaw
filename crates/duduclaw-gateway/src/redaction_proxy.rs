@@ -307,12 +307,65 @@ pub fn gated_mcp_config_for_runtime(
     self_exe: &Path,
     explore_lane: bool,
 ) -> Result<Option<Value>, String> {
-    let agent_id = mcp_json
+    let agent_id = agent_id_of(mcp_json);
+    let Some(mut parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
+        return Ok(None);
+    };
+    let servers = parsed
+        .get_mut("mcpServers")
+        .and_then(|s| s.as_object_mut())
+        .expect("read_mcp_json_for_runtime normalises mcpServers to an object");
+    servers.retain(|name, _| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name));
+    servers.insert("duduclaw".to_string(), own_server.clone());
+
+    let purpose = ProxyPurpose {
+        redaction: redaction_active_for_spawn(home_dir),
+        tool_gate: true,
+    };
+    let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose);
+    audit_dropped_remote_entries(home_dir, &agent_id, &rewrite.dropped_remote, explore_lane);
+    Ok(Some(rewrite.config))
+}
+
+/// Does the employee's `.mcp.json` list any server that is not DuDuClaw's
+/// own? Read-only (nothing is written). A runtime that registers servers
+/// itself (Codex) runs the `.mcp.json` spawn gate and the gated rewrite only
+/// when this is `true`, so an employee with no third-party server keeps the
+/// spawn it had before 2026-10-19.
+///
+/// No file ⇒ `Ok(false)`. Unreadable or malformed file ⇒ the same audited
+/// spawn-gate `Err` as [`gated_mcp_config_for_runtime`].
+pub fn mcp_json_lists_third_party_servers(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+) -> Result<bool, String> {
+    let Some(parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
+        return Ok(false);
+    };
+    Ok(parsed["mcpServers"]
+        .as_object()
+        .is_some_and(|m| m.keys().any(|n| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(n))))
+}
+
+fn agent_id_of(mcp_json: &Path) -> String {
+    mcp_json
         .parent()
         .and_then(|d| d.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
-        .to_string();
+        .to_string()
+}
+
+/// Read and parse `.mcp.json`; `mcpServers` is guaranteed to be an object in
+/// the result (absent ⇒ empty). No file ⇒ `Ok(None)`; anything else that
+/// cannot be used ⇒ audited spawn-gate `Err`.
+fn read_mcp_json_for_runtime(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+) -> Result<Option<Value>, String> {
+    let agent_id = agent_id_of(mcp_json);
     let refuse = |e: &str| refuse_gate_config_unavailable(home_dir, &agent_id, e, explore_lane);
     let raw = match std::fs::read_to_string(mcp_json) {
         Ok(raw) => raw,
@@ -327,19 +380,10 @@ pub fn gated_mcp_config_for_runtime(
     let servers = root
         .entry("mcpServers")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let Some(servers) = servers.as_object_mut() else {
+    if !servers.is_object() {
         return Err(refuse("malformed .mcp.json: mcpServers is not an object"));
-    };
-    servers.retain(|name, _| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name));
-    servers.insert("duduclaw".to_string(), own_server.clone());
-
-    let purpose = ProxyPurpose {
-        redaction: redaction_active_for_spawn(home_dir),
-        tool_gate: true,
-    };
-    let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose);
-    audit_dropped_remote_entries(home_dir, &agent_id, &rewrite.dropped_remote, explore_lane);
-    Ok(Some(rewrite.config))
+    }
+    Ok(Some(parsed))
 }
 
 fn audit_spawn_config(home_dir: &Path, event: &str, agent_id: &str, details: Value) {

@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
-- 用 Codex 的 AI 員工現在看得到自己 `.mcp.json` 裡的其他 MCP 伺服器（例如券商連線）。之前 Codex 每次啟動只登記 DuDuClaw 自己的伺服器，其他伺服器整個消失。現在每個第三方伺服器都經過 `duduclaw mcp-proxy` 啟動，和 Claude 員工用同一套第三方工具管制（依工具標註分類、`action_rules`、唯讀通道、需要核准的工具走核准流程）；遠端橋接照原樣登記，直接連網址的項目會被移除並記稽核。`.mcp.json` 讀不到或格式壞掉時這次不啟動；名稱和 `duduclaw` 撞名的項目不能取代內建伺服器；第三方伺服器的憑證放在這次啟動專用、只有擁有者能讀的暫存檔，不出現在命令列。已在隔離環境用替身 codex 跑過實際啟動流程，再用 codex 0.163 的 `codex mcp list` 確認兩個伺服器都登記、第三方那個經 `duduclaw mcp-proxy` 啟動。尚未驗證：真實 Codex 對話實際呼叫第三方工具、需要核准的工具在 Codex 單次 120 秒時限內能否等到核准。Antigravity、Grok 與 OpenAI 相容 runtime 仍只登記 DuDuClaw 自己的伺服器。
+- 用 Codex 的 AI 員工現在看得到自己 `.mcp.json` 裡的其他 MCP 伺服器（例如券商連線）。之前 Codex 每次啟動只登記 DuDuClaw 自己的伺服器，其他伺服器整個消失。現在每個第三方伺服器都經過 `duduclaw mcp-proxy` 啟動，和 Claude 員工用同一套第三方工具管制（依工具標註分類、`action_rules`、唯讀通道、需要核准的工具走核准流程）；遠端橋接照原樣登記，直接連網址的項目會被移除並記稽核。名稱和 `duduclaw` 撞名的項目不能取代內建伺服器。第三方伺服器的憑證放在 `<home>/tmp/mcp-proxy-env/`（只有擁有者能進的目錄）裡這次啟動專用的暫存檔，不出現在命令列，也不寫進 `.codex/config.toml`；gateway 啟動時會清掉當機殘留、超過 15 分鐘的暫存檔。`.codex/config.toml` 改成一開始就以只有擁有者能讀的權限寫入，已存在的檔案也會重設成這個權限。摘要、分類、裁判這類輔助呼叫不會拿到員工的第三方伺服器（和 Claude 一樣）。沒有第三方伺服器的員工（包括團隊角色成員）啟動流程和以前相同，不多跑 `.mcp.json` 檢查也不改寫該檔。**行為變更**：Codex 員工的 `.mcp.json` 讀不到或格式壞掉時，這次啟動會被拒絕（以前 Codex 根本不讀這個檔，所以不受影響）；有第三方伺服器時會先跑 `.mcp.json` 檢查，檢查不過同樣不啟動，檢查通過時可能改寫檔案裡 DuDuClaw 自己那一項（其他項目原樣保留，和 Claude 員工每次啟動、gateway 每次開機時做的修復相同）。已在隔離環境用替身 codex 跑過實際啟動流程，再用 codex 0.163 的 `codex mcp list` 確認兩個伺服器都登記、第三方那個經 `duduclaw mcp-proxy` 啟動。尚未驗證：真實 Codex 對話實際呼叫第三方工具、需要核准的工具在 Codex 單次 120 秒時限內能否等到核准。Antigravity、Grok 與 OpenAI 相容 runtime 仍只登記 DuDuClaw 自己的伺服器。
 
 ## [1.75.0] - 2026-10-19 — 登入修復與 CLI 更新
 

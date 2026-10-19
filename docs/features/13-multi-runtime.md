@@ -451,8 +451,16 @@ overrides (and in `<agent_dir>/.codex/config.toml`). Before that the spawn
 registered duduclaw alone, and a server such as a broker connection listed in
 `.mcp.json` was missing on Codex. The rules:
 
-- The `.mcp.json` spawn gate runs first, as for a Claude spawn. A refusal, or
-  a `.mcp.json` that cannot be read or parsed, stops the spawn.
+- A `.mcp.json` that cannot be read or parsed stops the spawn (a behavior
+  change: Codex did not read the file before). No file, or a file listing
+  only DuDuClaw's own server (team role scaffolds write exactly that), keeps
+  the old spawn: no gate, no write. Utility calls on the employee's runtime
+  (summaries, classifiers, judges) never get the employee's servers, as on
+  the Claude utility path.
+- When third-party servers are listed, the `.mcp.json` spawn gate runs first,
+  as for a Claude spawn; a refusal stops the spawn and writes nothing. When
+  it passes it may rewrite the file's DuDuClaw entries (other entries are
+  kept), the same repair every Claude spawn and gateway boot does.
 - Each third-party stdio server is registered as `duduclaw mcp-proxy
   --server <name> -- <command> …`, always (not only with `action_rules` or
   in the read-only lane, as for Claude), because Codex runs with
@@ -465,8 +473,14 @@ registered duduclaw alone, and a server such as a broker connection listed in
 - A `.mcp.json` entry with a DuDuClaw name (`duduclaw`, `duduclaw-pro`,
   `duduclaw-<instance>`) never replaces the server the gateway builds.
 - The upstream server's own environment (its credentials) goes to a per-spawn
-  owner-only temp file named by `DUDUCLAW_MCP_PROXY_ENV_FILE`, not to `argv`.
-  `DUDUCLAW_MCP_API_KEY` follows the table above (`env_vars` on 0.157+).
+  owner-only file in `<home>/tmp/mcp-proxy-env/` (a 0700 directory) named by
+  `DUDUCLAW_MCP_PROXY_ENV_FILE`, not to `argv` and not to
+  `.codex/config.toml`; the gateway removes files older than 15 minutes when
+  it starts. A manual `codex` run from `.codex/config.toml` alone therefore
+  starts these servers without their declared env. `.codex/config.toml` is
+  written owner-only from creation (temp file + rename), and an existing one
+  is reset to owner-only. `DUDUCLAW_MCP_API_KEY` follows the table above (`env_vars`
+  on 0.157+).
 - Codex clears an MCP child's environment, so the explore lane is passed to
   each third-party server as `env.DUDUCLAW_LANE`.
 

@@ -324,10 +324,11 @@ Codex の spawn は、呼び出しごとの `-c` 設定オーバーライドで 
 
 Codex は `.mcp.json` を読まないため、Codex の spawn は duduclaw と同じ方法で従業員のその他のサーバーを登録します。`-c mcp_servers.<name>.…` のオーバーライドです（`<agent_dir>/.codex/config.toml` にも書きます）。以前は duduclaw だけが登録され、`.mcp.json` にある証券会社接続のようなサーバーは Codex では使えませんでした。ルール：
 
-- Claude の spawn と同じく、まず `.mcp.json` の spawn ゲートを実行します。拒否された場合、または `.mcp.json` を読めない・解析できない場合、その spawn は止まります。
+- `.mcp.json` を読めない・解析できない場合、その spawn は止まります（動作の変更：以前の Codex はこのファイルを読みませんでした）。ファイルがない、または DuDuClaw 自身のサーバーだけが載っている場合（チームの役割メンバーのスキャフォールドはまさにこの形）、従来どおり起動し、ゲートの実行も書き込みもしません。従業員のランタイムで動く補助呼び出し（要約、分類、判定）は、Claude の補助呼び出しと同じく従業員のサーバーを受け取りません。
+- サードパーティサーバーがある場合は、Claude の spawn と同じくまず `.mcp.json` の spawn ゲートを実行します。拒否されると止まり、何も書き込みません。通過した場合はファイル内の DuDuClaw 自身の項目を書き換えることがあります（他の項目はそのまま）。Claude の毎回の spawn や gateway 起動時の修復と同じ処理です。
 - サードパーティの stdio サーバーはすべて `duduclaw mcp-proxy --server <name> -- <command> …` として登録されます。常にそうします（Claude では `action_rules` があるときか読み取り専用レーンのときだけ）。Codex は `approval_policy=never` で動き、これらのサーバーは `default_tools_approval_mode = "auto"` で登録されるため、判断するのは proxy のサードパーティツールゲートです。リモートブリッジはそのまま登録します（自身で制御します）。直接の `url`／`type` 項目は取り除かれ、監査 `third_party_remote_entry_dropped` が記録されます。書き換えで包めない項目や、名前が素の TOML キーでない項目は登録されません。
 - `.mcp.json` で DuDuClaw の名前（`duduclaw`、`duduclaw-pro`、`duduclaw-<instance>`）を使う項目が、gateway が作るサーバーを置き換えることはありません。
-- サードパーティサーバー自身の環境変数（認証情報）は `argv` ではなく、その spawn 専用で所有者だけが読める一時ファイルに置かれ、`DUDUCLAW_MCP_PROXY_ENV_FILE` がそれを指します。`DUDUCLAW_MCP_API_KEY` は上の表のとおりです（0.157 以上は `env_vars`）。
+- サードパーティサーバー自身の環境変数（認証情報）は `argv` にも `.codex/config.toml` にも書かず、`<home>/tmp/mcp-proxy-env/`（0700 のディレクトリ）内のその spawn 専用で所有者だけが読めるファイルに置き、`DUDUCLAW_MCP_PROXY_ENV_FILE` がそれを指します。gateway は起動時に 15 分より古いファイルを削除します。そのため `.codex/config.toml` だけで手動で `codex` を実行すると、これらのサーバーは宣言された環境変数なしで起動します。`.codex/config.toml` は作成時点から所有者だけが読める状態で書かれ（一時ファイル＋リネーム）、既存のファイルもその権限に戻されます。`DUDUCLAW_MCP_API_KEY` は上の表のとおりです（0.157 以上は `env_vars`）。
 - Codex は MCP 子プロセスの環境をクリアするため、読み取り専用レーンは `env.DUDUCLAW_LANE` として各サードパーティサーバーに渡されます。
 
 ### 作業ディレクトリのオーバーライドはすべての CLI バックエンドに届く（2026-09-28）

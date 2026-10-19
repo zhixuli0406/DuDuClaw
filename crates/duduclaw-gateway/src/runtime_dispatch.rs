@@ -526,6 +526,19 @@ tokio::task_local! {
     /// independent of channel replies; absent scope leaves legacy CLI calls
     /// unchanged, and the enclosing goal scope supplies episode/round.
     pub(crate) static CLAUDE_UTILITY_AGENT_ID: String;
+
+    /// Set for the non-Claude half of [`run_utility_prompt_with_hint`]. A
+    /// utility call (summaries, classifiers, judges) runs on the employee's
+    /// runtime but is not the employee's own turn: the Claude utility path
+    /// never hands it the employee's `.mcp.json`, so the Codex runtime does
+    /// not register the employee's third-party servers for it either
+    /// (2026-10-19). Read with [`in_utility_call`].
+    pub(crate) static UTILITY_CALL: ();
+}
+
+/// Is the current call a utility call ([`run_utility_prompt_with_hint`])?
+pub fn in_utility_call() -> bool {
+    UTILITY_CALL.try_with(|_| ()).is_ok()
 }
 
 pub(crate) fn is_claude_utility_call() -> bool {
@@ -677,6 +690,7 @@ pub async fn run_utility_prompt_with_hint(
             effort: hint.and_then(|h| h.effort),
             allow_cross_family_failover,
         });
+        let fut = UTILITY_CALL.scope((), fut);
         match schema {
             Some(schema) => OUTPUT_SCHEMA.scope(std::sync::Arc::new(schema), fut).await,
             None => fut.await,

@@ -1053,6 +1053,7 @@ impl AgentRuntime for CodexRuntime {
             supports_env_vars,
             crate::explore_lane::lane_env().as_ref(),
             &mcp_overrides.process_env,
+            &context.home_dir,
         )
         .map_err(|e| {
             duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
@@ -1303,24 +1304,28 @@ impl CodexRuntime {
     /// (`<agent_dir>/.codex/config.toml`). Idempotent: skips the write when the
     /// file already holds exactly the desired content. Returns `Ok(true)` when
     /// written, `Ok(false)` when already up to date.
+    ///
+    /// The file carries `DUDUCLAW_AGENT_TOKEN` in plaintext, so it is written
+    /// atomically through an owner-only temp file (0600 from the first byte,
+    /// then renamed over the old file — no window in which it is readable by
+    /// others), and an up-to-date file is still reset to owner-only. Only a
+    /// regular file counts as up to date: a symbolic link there is replaced,
+    /// never followed.
     pub fn write_mcp_config(
         agent_dir: &std::path::Path,
         servers: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bool, String> {
         let config_path = agent_dir.join(".codex").join("config.toml");
         let content = Self::render_mcp_toml(servers);
-        if let Ok(existing) = std::fs::read_to_string(&config_path) {
-            if existing == content {
-                return Ok(false);
-            }
+        let is_regular = std::fs::symlink_metadata(&config_path).is_ok_and(|m| m.file_type().is_file());
+        if is_regular && std::fs::read_to_string(&config_path).is_ok_and(|e| e == content) {
+            duduclaw_core::platform::set_owner_only(&config_path).map_err(|e| e.to_string())?;
+            return Ok(false);
         }
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
-        // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning
-        // OS user (0600 on Unix; no-op on Windows).
-        duduclaw_core::platform::set_owner_only(&config_path).ok();
+        duduclaw_agent::mcp_template::write_mcp_config_atomic(&config_path, content.as_bytes())?;
         Ok(true)
     }
 

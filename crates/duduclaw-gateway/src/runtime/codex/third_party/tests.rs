@@ -99,8 +99,65 @@ fn config_toml_holds_duduclaw_and_the_proxied_third_party_server() {
         table["masterlink"]["default_tools_approval_mode"].as_str(),
         Some("auto")
     );
+    // M2: the persistent file never carries the upstream credentials.
+    let raw = std::fs::read_to_string(dir.join(".codex").join("config.toml")).unwrap();
+    assert!(!raw.contains("broker-secret-pw"), "{raw}");
+    assert!(!raw.contains(PROXY_UPSTREAM_ENV_VAR), "{raw}");
     // Idempotent on the second spawn.
     assert!(!CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
+}
+
+/// M2: written owner-only from creation, and an up-to-date file that lost
+/// its owner-only mode is reset to it.
+#[cfg(unix)]
+#[test]
+fn config_toml_is_owner_only_new_and_existing() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, dir) = employee(Some(masterlink_mcp_json().as_str()));
+    let own = own_server(home.path());
+    let servers = gated_servers(&dir, home.path(), &own, false).unwrap();
+    let path = dir.join(".codex").join("config.toml");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    assert!(CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
+    assert_eq!(mode(&path), 0o600);
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
+    assert_eq!(
+        mode(&path),
+        0o600,
+        "an up-to-date file is reset to owner-only"
+    );
+
+    // A stale file with wider permissions is replaced, not edited in place.
+    std::fs::write(&path, "stale").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
+    assert_eq!(mode(&path), 0o600);
+    // No temp file is left next to it.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.join(".codex"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name() != "config.toml")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// M2: a symbolic link at config.toml is replaced, never followed.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_config_toml_is_replaced_not_followed() {
+    let (home, dir) = employee(None);
+    let own = own_server(home.path());
+    let outside = home.path().join("outside.toml");
+    std::fs::write(&outside, "untouched").unwrap();
+    std::fs::create_dir_all(dir.join(".codex")).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join(".codex").join("config.toml")).unwrap();
+    CodexRuntime::write_spawn_mcp_config(&dir, &own, &BTreeMap::new()).unwrap();
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+    let meta = std::fs::symlink_metadata(dir.join(".codex").join("config.toml")).unwrap();
+    assert!(meta.file_type().is_file());
 }
 
 #[test]
@@ -125,7 +182,7 @@ fn an_employee_without_third_party_servers_is_unchanged() {
         let own = own_server(home.path());
         let servers = gated_servers(&dir, home.path(), &own, false).unwrap();
         assert!(servers.is_empty(), "{body:?}");
-        let ov = override_args(&servers, true, None, &[]).unwrap();
+        let ov = override_args(&servers, true, None, &[], home.path()).unwrap();
         assert!(ov.args.is_empty() && ov.process_env.is_empty() && ov.temp_files.is_empty());
 
         // Same file the duduclaw-only writer produced before this change.
@@ -199,7 +256,7 @@ fn overrides_keep_upstream_credentials_out_of_argv() {
     let own = own_server(home.path());
     let servers = gated_servers(&dir, home.path(), &own, false).unwrap();
     let taken = vec![("DUDUCLAW_MCP_API_KEY".to_string(), API_KEY.to_string())];
-    let ov = override_args(&servers, true, None, &taken).unwrap();
+    let ov = override_args(&servers, true, None, &taken, home.path()).unwrap();
 
     let argv = ov.args.join(" ");
     assert!(!argv.contains("broker-secret-pw"), "{argv}");
@@ -218,6 +275,16 @@ fn overrides_keep_upstream_credentials_out_of_argv() {
     assert!(ov.process_env.is_empty());
 
     assert_eq!(ov.temp_files.len(), 1);
+    // L1: the env file lives in the DuDuClaw home, in an owner-only dir.
+    let env_dir = home.path().join("tmp").join(ENV_FILE_DIR);
+    assert_eq!(ov.temp_files[0].parent(), Some(env_dir.as_path()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&env_dir), 0o700);
+        assert_eq!(mode(&ov.temp_files[0]), 0o600);
+    }
     let file = ov.temp_files[0].to_string_lossy().into_owned();
     let pair = format!(
         "mcp_servers.masterlink.env.{PROXY_UPSTREAM_ENV_FILE_VAR}={}",
@@ -242,7 +309,7 @@ fn overrides_keep_upstream_credentials_out_of_argv() {
 fn old_codex_keeps_credentials_in_the_env_table() {
     let (home, dir) = employee(Some(masterlink_mcp_json().as_str()));
     let servers = gated_servers(&dir, home.path(), &own_server(home.path()), false).unwrap();
-    let ov = override_args(&servers, false, None, &[]).unwrap();
+    let ov = override_args(&servers, false, None, &[], home.path()).unwrap();
     assert!(!ov.args.iter().any(|a| a.contains("env_vars")));
     assert!(ov.process_env.is_empty());
     assert!(
@@ -260,7 +327,7 @@ fn the_explore_lane_reaches_every_third_party_server() {
         duduclaw_core::ENV_LANE.to_string(),
         duduclaw_core::LANE_EXPLORE.to_string(),
     );
-    let ov = override_args(&servers, true, Some(&lane), &[]).unwrap();
+    let ov = override_args(&servers, true, Some(&lane), &[], home.path()).unwrap();
     let want = format!(
         "mcp_servers.masterlink.env.{}={}",
         lane.0,
@@ -271,6 +338,216 @@ fn the_explore_lane_reaches_every_third_party_server() {
     CodexRuntime::write_spawn_mcp_config(&dir, &own_server(home.path()), &servers).unwrap();
     let raw = std::fs::read_to_string(dir.join(".codex").join("config.toml")).unwrap();
     assert!(!raw.contains(&lane.0));
+}
+
+// ── M1: spawns that have no third-party server keep their old path ──────
+
+fn file_bytes(dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(dir.join(".mcp.json")).ok()
+}
+
+#[tokio::test]
+async fn no_third_party_server_means_no_gate_and_no_write() {
+    let only_own =
+        json!({ "mcpServers": { "duduclaw": { "command": "relative-duduclaw", "args": [] } } })
+            .to_string();
+    for body in [None, Some(only_own), Some("{}".to_string())] {
+        let (home, dir) = employee(body.as_deref());
+        let before = file_bytes(&dir);
+        let servers = gated_servers_for_spawn(&dir, home.path(), &own_server(home.path()), false)
+            .await
+            .unwrap();
+        assert!(servers.is_empty(), "{body:?}");
+        assert_eq!(
+            file_bytes(&dir),
+            before,
+            "no gate ran, nothing was written: {body:?}"
+        );
+    }
+}
+
+/// A directory the gate cannot place (an `agent.toml` outside
+/// `<home>/agents/`) still spawns as before when it lists no third-party
+/// server, and is refused, unmodified, when it does.
+#[tokio::test]
+async fn an_unplaceable_directory_only_fails_when_it_lists_third_party_servers() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("elsewhere").join("judge");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"judge\"\n").unwrap();
+    let own = own_server(home.path());
+
+    let only_own =
+        json!({ "mcpServers": { "duduclaw": { "command": EXE, "args": ["mcp-server"] } } })
+            .to_string();
+    std::fs::write(dir.join(".mcp.json"), &only_own).unwrap();
+    assert!(
+        gated_servers_for_spawn(&dir, home.path(), &own, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    std::fs::write(dir.join(".mcp.json"), masterlink_mcp_json()).unwrap();
+    let before = file_bytes(&dir);
+    let err = gated_servers_for_spawn(&dir, home.path(), &own, false)
+        .await
+        .expect_err("the gate cannot confirm this directory");
+    assert!(
+        duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+        "{err}"
+    );
+    assert_eq!(file_bytes(&dir), before, "a refused gate writes nothing");
+}
+
+#[tokio::test]
+async fn a_malformed_mcp_json_refuses_the_spawn_without_touching_it() {
+    let (home, dir) = employee(Some("{ not json"));
+    let err = gated_servers_for_spawn(&dir, home.path(), &own_server(home.path()), false)
+        .await
+        .expect_err("fail closed");
+    assert!(
+        duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+        "{err}"
+    );
+    assert_eq!(file_bytes(&dir).as_deref(), Some(b"{ not json".as_slice()));
+}
+
+/// Utility calls (summaries, classifiers, judges on the employee's runtime)
+/// never get the employee's servers and never read `.mcp.json` — even a
+/// broken one — like the Claude utility path.
+#[tokio::test]
+async fn a_utility_call_never_gets_third_party_servers() {
+    for body in [masterlink_mcp_json(), "{ not json".to_string()] {
+        let (home, dir) = employee(Some(body.as_str()));
+        let own = own_server(home.path());
+        let got = crate::runtime_dispatch::UTILITY_CALL
+            .scope((), gated_servers_for_spawn(&dir, home.path(), &own, false))
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+    assert!(!crate::runtime_dispatch::in_utility_call());
+}
+
+/// A team role member's scaffold writes a `.mcp.json` with only the
+/// duduclaw server, so a member spawn keeps its old path (no gate run, file
+/// unchanged).
+#[tokio::test]
+async fn a_team_role_member_scaffold_keeps_its_old_spawn_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let parent = home.join("agents").join("boss");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::write(
+        parent.join("agent.toml"),
+        r#"
+[agent]
+name = "boss"
+display_name = "Boss"
+role = "specialist"
+status = "active"
+trigger = "@boss"
+reports_to = ""
+icon = "X"
+
+[model]
+preferred = "claude-opus-5"
+fallback = ""
+account_pool = []
+utility = "claude-opus-5"
+standard = "claude-opus-5"
+
+[budget]
+monthly_limit_cents = 1000
+warn_threshold_percent = 80
+hard_stop = false
+
+[container]
+sandbox_enabled = false
+network_access = false
+timeout_ms = 60000
+max_concurrent = 2
+readonly_project = false
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 300
+max_concurrent_runs = 1
+cron = ""
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = false
+"#,
+    )
+    .unwrap();
+    // The parent itself has a third-party server; the member must not
+    // inherit it through this path.
+    std::fs::write(parent.join(".mcp.json"), masterlink_mcp_json()).unwrap();
+    let spec = crate::ephemeral::RoleMemberSpec {
+        parent_agent: "boss".into(),
+        task_id: "task-1".into(),
+        round: 1,
+        role: duduclaw_core::types::Role::Executor,
+        runtime: "claude".into(),
+        model: "claude-opus-5".into(),
+        effort: None,
+        instruction: "do work".into(),
+        tools: vec!["team_handoff".into()],
+    };
+    let member = crate::ephemeral::scaffold_role_member(home, &spec).unwrap();
+    let before = file_bytes(&member.dir);
+    assert!(
+        before.is_some(),
+        "the scaffold writes the member's .mcp.json"
+    );
+    let servers = gated_servers_for_spawn(&member.dir, home, &own_server(home), false)
+        .await
+        .unwrap();
+    assert!(servers.is_empty());
+    assert_eq!(file_bytes(&member.dir), before);
+}
+
+// ── L1: stale env files are swept at gateway start ──────────────────────
+
+#[test]
+fn sweep_removes_only_old_env_files() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = env_file_dir(home.path()).unwrap();
+    std::fs::write(dir.join(format!("{ENV_FILE_PREFIX}abc.json")), "{}").unwrap();
+    std::fs::write(dir.join("unrelated.json"), "{}").unwrap();
+    // Fresh files survive the real threshold…
+    assert_eq!(sweep_stale_env_files(home.path()), 0);
+    // …and only prefixed files go once they are old enough.
+    assert_eq!(
+        sweep_env_files_older_than(home.path(), std::time::Duration::ZERO),
+        1
+    );
+    assert!(dir.join("unrelated.json").exists());
+    // No directory ⇒ nothing to do.
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(sweep_stale_env_files(empty.path()), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_env_dir_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("tmp")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), home.path().join("tmp").join(ENV_FILE_DIR))
+        .unwrap();
+    assert!(env_file_dir(home.path()).is_err());
 }
 
 /// Live check (manual, `--ignored`): drive the real `CodexRuntime::execute`

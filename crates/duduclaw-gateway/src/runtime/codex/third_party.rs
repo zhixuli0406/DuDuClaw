@@ -78,15 +78,40 @@ pub(crate) fn gated_servers(
     Ok(extract_gated(&config, self_exe, own_server))
 }
 
-/// The spawn-time half: the `.mcp.json` spawn gate first (the file's
-/// DuDuClaw entry is confirmed or the spawn is refused, exactly as for a
-/// Claude CLI spawn), then [`gated_servers`].
+/// The spawn-time half. Nothing changes for a spawn that has no third-party
+/// server to register:
+///
+/// - a utility call ([`crate::runtime_dispatch::in_utility_call`]: summaries,
+///   classifiers, judges on the employee's runtime) never gets the
+///   employee's servers, as on the Claude utility path, and does not read
+///   `.mcp.json` at all;
+/// - no `.mcp.json`, or one listing only DuDuClaw's own server (team role
+///   scaffolds write exactly that) ⇒ no spawn gate, no write, the pre-change
+///   spawn;
+/// - an unreadable or malformed `.mcp.json` ⇒ refused (fail closed; before
+///   2026-10-19 Codex did not read the file at all).
+///
+/// Only when third-party servers are listed does the `.mcp.json` spawn gate
+/// run (as for a Claude CLI spawn), then [`gated_servers`]. The gate writes
+/// nothing when it fails; when it succeeds it may rewrite only the file's
+/// DuDuClaw entries (atomically, owner-only, other entries kept as they are),
+/// the same repair every Claude spawn and every gateway boot performs.
 pub(crate) async fn gated_servers_for_spawn(
     agent_dir: &Path,
     home_dir: &Path,
     own_server: &Value,
     explore: bool,
 ) -> Result<BTreeMap<String, GatedServer>, String> {
+    if crate::runtime_dispatch::in_utility_call() {
+        return Ok(BTreeMap::new());
+    }
+    if !crate::redaction_proxy::mcp_json_lists_third_party_servers(
+        home_dir,
+        &agent_dir.join(".mcp.json"),
+        explore,
+    )? {
+        return Ok(BTreeMap::new());
+    }
     let dir_owned = agent_dir.to_path_buf();
     match tokio::task::spawn_blocking(move || {
         duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir_owned)
@@ -182,24 +207,112 @@ fn string_env(def: &Value) -> BTreeMap<String, String> {
 }
 
 /// The `config.toml` form of each server (rendered by
-/// `CodexRuntime::render_mcp_toml`). The upstream env stays inline: the
-/// file is owner-only, like the `.mcp.json` it comes from. The explore lane
-/// is per spawn and travels only in the `-c` overrides.
+/// `CodexRuntime::render_mcp_toml`). The upstream server's own env
+/// ([`PROXY_UPSTREAM_ENV_VAR`], its credentials) is **not** written to this
+/// persistent file: a spawn supplies it through the per-spawn file named in
+/// the `-c` overrides, which Codex merges over this table. A manual `codex`
+/// run from this file alone starts the server without its declared env. The
+/// explore lane is per spawn and also travels only in the `-c` overrides.
 pub(crate) fn file_entries(servers: &BTreeMap<String, GatedServer>) -> HashMap<String, Value> {
     servers
         .iter()
         .map(|(name, s)| {
+            let env: BTreeMap<&String, &String> = s
+                .env
+                .iter()
+                .filter(|(k, _)| k.as_str() != PROXY_UPSTREAM_ENV_VAR)
+                .collect();
             (
                 name.clone(),
                 serde_json::json!({
                     "command": s.command,
                     "args": s.args,
-                    "env": s.env,
+                    "env": env,
                     "default_tools_approval_mode": "auto",
                 }),
             )
         })
         .collect()
+}
+
+/// Directory under the DuDuClaw home holding the per-spawn upstream-env files.
+pub(crate) const ENV_FILE_DIR: &str = "mcp-proxy-env";
+/// Name prefix of a per-spawn upstream-env file.
+const ENV_FILE_PREFIX: &str = "duduclaw-mcp-env-";
+/// A file older than this at gateway start belongs to no running spawn (a
+/// Codex run is cut off after two minutes).
+pub(crate) const ENV_FILE_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
+/// `<home>/tmp/mcp-proxy-env`, created owner-only (0700 on Unix). A symbolic
+/// link or a non-directory there is refused rather than followed.
+fn env_file_dir(home_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let dir = home_dir.join("tmp").join(ENV_FILE_DIR);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a plain directory", dir.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return env_file_dir(home_dir);
+                }
+                Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
+            }
+        }
+        Err(e) => return Err(format!("cannot inspect {}: {e}", dir.display())),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot restrict {}: {e}", dir.display()))?;
+    }
+    Ok(dir)
+}
+
+/// Remove upstream-env files left behind by a gateway that stopped while a
+/// Codex spawn was running (a dropped guard normally deletes them). Called
+/// once at gateway start; only files with this module's prefix and older
+/// than [`ENV_FILE_STALE_AFTER`] are removed. Returns how many.
+pub fn sweep_stale_env_files(home_dir: &Path) -> usize {
+    sweep_env_files_older_than(home_dir, ENV_FILE_STALE_AFTER)
+}
+
+fn sweep_env_files_older_than(home_dir: &Path, max_age: std::time::Duration) -> usize {
+    let dir = home_dir.join("tmp").join(ENV_FILE_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(ENV_FILE_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if old && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// What one spawn needs to register the third-party servers.
@@ -229,6 +342,9 @@ pub(crate) struct ThirdPartyOverrides {
 ///   an MCP child only the variables it is told to, and the proxy reads the
 ///   lane from its own environment.
 ///
+/// The env files live in `<home_dir>/tmp/mcp-proxy-env` (0700), swept at
+/// gateway start ([`sweep_stale_env_files`]) in case a crash left one behind.
+///
 /// `Err` when a temp file cannot be written; the caller refuses the spawn
 /// rather than start a server without its credentials.
 pub(crate) fn override_args(
@@ -236,8 +352,13 @@ pub(crate) fn override_args(
     supports_env_vars: bool,
     lane: Option<&(String, String)>,
     taken: &[(String, String)],
+    home_dir: &Path,
 ) -> Result<ThirdPartyOverrides, String> {
     let mut out = ThirdPartyOverrides::default();
+    if servers.is_empty() {
+        return Ok(out);
+    }
+    let env_dir = env_file_dir(home_dir)?;
     let mut process_env: Vec<(String, String)> = taken.to_vec();
     for (name, s) in servers {
         let key = format!("mcp_servers.{name}");
@@ -268,7 +389,7 @@ pub(crate) fn override_args(
                 continue;
             }
             if k == PROXY_UPSTREAM_ENV_VAR {
-                let path = write_env_file(v)?;
+                let path = write_env_file(&env_dir, v)?;
                 let rendered = path.to_string_lossy().into_owned();
                 push_env(&mut out.args, &key, PROXY_UPSTREAM_ENV_FILE_VAR, &rendered);
                 out.temp_files.push(path);
@@ -332,13 +453,14 @@ fn push_env(args: &mut Vec<String>, server_key: &str, name: &str, value: &str) {
     );
 }
 
-/// Write one proxy's upstream env JSON to an owner-only temp file.
-fn write_env_file(body: &str) -> Result<tempfile::TempPath, String> {
+/// Write one proxy's upstream env JSON to an owner-only temp file in `dir`
+/// (`tempfile` creates it 0600 before anything is written).
+fn write_env_file(dir: &Path, body: &str) -> Result<tempfile::TempPath, String> {
     use std::io::Write;
     let mut file = tempfile::Builder::new()
-        .prefix("duduclaw-mcp-env-")
+        .prefix(ENV_FILE_PREFIX)
         .suffix(".json")
-        .tempfile()
+        .tempfile_in(dir)
         .map_err(|e| format!("temp file creation failed: {e}"))?;
     file.write_all(body.as_bytes())
         .and_then(|_| file.flush())
