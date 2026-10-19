@@ -215,8 +215,16 @@ class DeliveryTests(unittest.TestCase):
         for name in ("release.yml", "desktop-release.yml", "docker-image.yml", "computer-use-image.yml"):
             body = (ROOT / ".github/workflows" / name).read_text()
             self.assertIn("uses: ./.github/workflows/release-delivery-gate.yml", body)
-            self.assertIn("  build:\n    needs: delivery-gate", body)
-            self.assertIn("ref: ${{ needs.delivery-gate.outputs.commit }}", body)
+            if name == "desktop-release.yml":
+                self.assertIn("  build-source:\n    needs: delivery-gate", body)
+                self.assertIn("  build:\n    needs: [delivery-gate, build-source]", body)
+                self.assertIn("ref: ${{ needs.build-source.outputs.commit }}", body)
+                self.assertIn("[[ \"$RELEASE_TAG\" == desktop-v1.75.0 ]]", body)
+                self.assertIn("[[ \"$SIGNED_SOURCE\" == b80df7f423f7bc2179f1ffb60f66d757aec5d323 ]]", body)
+                self.assertIn("BUILD_SOURCE=a182caf0ba42ac62b76af462f7fe0389599e97fd", body)
+            else:
+                self.assertIn("  build:\n    needs: delivery-gate", body)
+                self.assertIn("ref: ${{ needs.delivery-gate.outputs.commit }}", body)
 
     def test_install_exact_verified_bytes(self):
         raw, sig = self.sign()
