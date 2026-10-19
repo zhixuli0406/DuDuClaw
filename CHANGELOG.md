@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 維修 SSH 沒有指定指令時可正常顯示互動選單：相容 Dropbear 強制指令傳入的空 `SSH_ORIGINAL_COMMAND`。純空白、未知指令與 shell 字串仍會拒絕；這是平台程式修復，OS 映像更新後仍需重新建置與活測。
+
 ## [1.75.0] - 2026-10-19 — 登入修復與 CLI 更新
 
 ### Added
