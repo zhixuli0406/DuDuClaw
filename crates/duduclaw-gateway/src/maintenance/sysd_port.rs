@@ -323,6 +323,17 @@ impl StatusReply {
         }
         self.ssh_active
     }
+
+    /// A decoded JSON object is not necessarily a usable observation.
+    /// Optional fields keep older replies readable, but an already keyed
+    /// window must not mistake absent facts for confirmation of its state.
+    pub fn observation_unavailable(&self) -> bool {
+        self.key_installed.is_none()
+            || self.observed_active().is_none()
+            || (self.key_installed == Some(true)
+                && (self.window_id.as_deref().is_none_or(str::is_empty)
+                    || self.key_fingerprint.as_deref().is_none_or(str::is_empty)))
+    }
 }
 
 // ── Strings from sysd are data ──────────────────────────────
