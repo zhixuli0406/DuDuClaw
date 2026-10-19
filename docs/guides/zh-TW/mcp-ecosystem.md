@@ -156,7 +156,7 @@ action_rules = [
 
 **儀表板**：`MCP → 遠端伺服器 →「第三方工具與其動作類型」` 依員工顯示每個伺服器最近一次經 proxy 或橋接列出的工具（`<home>/mcp_tool_effects/<員工>/<伺服器>.json`），類型與決定依目前設定重新計算。伺服器要在某次工作階段經 DuDuClaw 列出工具後才會出現。這份快照只用於顯示；管制一律依當下的清單。
 
-**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）。Codex、Antigravity、Grok 員工只登記 DuDuClaw 自己的伺服器，openai-compat 工具迴圈也只啟動 `duduclaw mcp-server`，沒有第三方伺服器可管。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以受管制的 spawn（有 `action_rules` 或在唯讀通道）會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
+**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）與 Codex（`.mcp.json` 裡每個第三方 stdio 伺服器都會在這次 spawn 登記成經過 `duduclaw mcp-proxy` 啟動，而且一律如此，因為 Codex 會自動核准登記給它的伺服器；遠端橋接項目照原樣登記，它們自己會管制；proxy 用到的第三方憑證放在這次 spawn 專用、只有擁有者能讀的暫存檔，不放在命令列）。Antigravity、Grok 員工只登記 DuDuClaw 自己的伺服器，openai-compat 工具迴圈也只啟動 `duduclaw mcp-server`，所以員工 `.mcp.json` 裡的其他伺服器在這些 runtime 根本不會啟動。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以受管制的 spawn（有 `action_rules` 或在唯讀通道）會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
 
 ## 5. 遠端伺服器的事件（MCP Events）
 

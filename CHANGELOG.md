@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 用 Codex 的 AI 員工現在看得到自己 `.mcp.json` 裡的其他 MCP 伺服器（例如券商連線）。之前 Codex 每次啟動只登記 DuDuClaw 自己的伺服器，其他伺服器整個消失。現在每個第三方伺服器都經過 `duduclaw mcp-proxy` 啟動，和 Claude 員工用同一套第三方工具管制（依工具標註分類、`action_rules`、唯讀通道、需要核准的工具走核准流程）；遠端橋接照原樣登記，直接連網址的項目會被移除並記稽核。`.mcp.json` 讀不到或格式壞掉時這次不啟動；名稱和 `duduclaw` 撞名的項目不能取代內建伺服器；第三方伺服器的憑證放在這次啟動專用、只有擁有者能讀的暫存檔，不出現在命令列。已在隔離環境用替身 codex 跑過實際啟動流程，再用 codex 0.163 的 `codex mcp list` 確認兩個伺服器都登記、第三方那個經 `duduclaw mcp-proxy` 啟動。尚未驗證：真實 Codex 對話實際呼叫第三方工具、需要核准的工具在 Codex 單次 120 秒時限內能否等到核准。Antigravity、Grok 與 OpenAI 相容 runtime 仍只登記 DuDuClaw 自己的伺服器。
+
 ## [1.75.0] - 2026-10-19 — 登入修復與 CLI 更新
 
 ### Added

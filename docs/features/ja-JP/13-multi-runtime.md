@@ -320,6 +320,16 @@ Codex の spawn は、呼び出しごとの `-c` 設定オーバーライドで 
 
 **両方の経路に共通する緩和策。** `argv` に載せてよい env キーの集合は、既知の `DUDUCLAW_*` のブロックにテストで固定されており、新しい機密が黙って加わることはありません。すべてのキーは、展開前に素の TOML キーであることを検証され（`env_vars` 配列内の名前も含む）、すべての値は TOML のクォートが施されます。
 
+### Codex：従業員のその他の MCP サーバー（2026-10-19）
+
+Codex は `.mcp.json` を読まないため、Codex の spawn は duduclaw と同じ方法で従業員のその他のサーバーを登録します。`-c mcp_servers.<name>.…` のオーバーライドです（`<agent_dir>/.codex/config.toml` にも書きます）。以前は duduclaw だけが登録され、`.mcp.json` にある証券会社接続のようなサーバーは Codex では使えませんでした。ルール：
+
+- Claude の spawn と同じく、まず `.mcp.json` の spawn ゲートを実行します。拒否された場合、または `.mcp.json` を読めない・解析できない場合、その spawn は止まります。
+- サードパーティの stdio サーバーはすべて `duduclaw mcp-proxy --server <name> -- <command> …` として登録されます。常にそうします（Claude では `action_rules` があるときか読み取り専用レーンのときだけ）。Codex は `approval_policy=never` で動き、これらのサーバーは `default_tools_approval_mode = "auto"` で登録されるため、判断するのは proxy のサードパーティツールゲートです。リモートブリッジはそのまま登録します（自身で制御します）。直接の `url`／`type` 項目は取り除かれ、監査 `third_party_remote_entry_dropped` が記録されます。書き換えで包めない項目や、名前が素の TOML キーでない項目は登録されません。
+- `.mcp.json` で DuDuClaw の名前（`duduclaw`、`duduclaw-pro`、`duduclaw-<instance>`）を使う項目が、gateway が作るサーバーを置き換えることはありません。
+- サードパーティサーバー自身の環境変数（認証情報）は `argv` ではなく、その spawn 専用で所有者だけが読める一時ファイルに置かれ、`DUDUCLAW_MCP_PROXY_ENV_FILE` がそれを指します。`DUDUCLAW_MCP_API_KEY` は上の表のとおりです（0.157 以上は `env_vars`）。
+- Codex は MCP 子プロセスの環境をクリアするため、読み取り専用レーンは `env.DUDUCLAW_LANE` として各サードパーティサーバーに渡されます。
+
 ### 作業ディレクトリのオーバーライドはすべての CLI バックエンドに届く（2026-09-28）
 
 呼び出し側は、ある spawn をエージェント自身のディレクトリ以外の場所で実行するよう求められます。現在の呼び出し側はチームコンポーザー（team composer）だけで、ロールメンバーを従業員のワークスペースに置きます。こうすると、使い捨ての scaffold がメンバーの終了と同時にガベージコレクトされても、メンバーが書いたファイルは残ります。

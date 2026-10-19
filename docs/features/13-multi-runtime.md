@@ -443,6 +443,33 @@ silently; every key is validated to be a bare TOML key before interpolation
 (including the names inside the `env_vars` array); and every value is
 TOML-quoted.
 
+### Codex: the employee's other MCP servers (2026-10-19)
+
+Codex never reads `.mcp.json`, so a Codex spawn registers the employee's
+other servers the same way it registers duduclaw: as `-c mcp_servers.<name>.…`
+overrides (and in `<agent_dir>/.codex/config.toml`). Before that the spawn
+registered duduclaw alone, and a server such as a broker connection listed in
+`.mcp.json` was missing on Codex. The rules:
+
+- The `.mcp.json` spawn gate runs first, as for a Claude spawn. A refusal, or
+  a `.mcp.json` that cannot be read or parsed, stops the spawn.
+- Each third-party stdio server is registered as `duduclaw mcp-proxy
+  --server <name> -- <command> …`, always (not only with `action_rules` or
+  in the read-only lane, as for Claude), because Codex runs with
+  `approval_policy=never` and these servers are registered with
+  `default_tools_approval_mode = "auto"`: the proxy's third-party tool gate is
+  what decides. Remote bridges are registered as they are (they gate
+  themselves); direct `url` / `type` entries are removed and audited
+  `third_party_remote_entry_dropped`. An entry the rewrite cannot wrap, or
+  whose name is not a bare TOML key, is not registered.
+- A `.mcp.json` entry with a DuDuClaw name (`duduclaw`, `duduclaw-pro`,
+  `duduclaw-<instance>`) never replaces the server the gateway builds.
+- The upstream server's own environment (its credentials) goes to a per-spawn
+  owner-only temp file named by `DUDUCLAW_MCP_PROXY_ENV_FILE`, not to `argv`.
+  `DUDUCLAW_MCP_API_KEY` follows the table above (`env_vars` on 0.157+).
+- Codex clears an MCP child's environment, so the explore lane is passed to
+  each third-party server as `env.DUDUCLAW_LANE`.
+
 ### The working-directory override reaches every CLI backend (2026-09-28)
 
 A caller can ask for one spawn to run somewhere other than the agent's own

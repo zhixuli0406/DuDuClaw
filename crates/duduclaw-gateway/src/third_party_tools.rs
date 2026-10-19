@@ -9,6 +9,8 @@
 //! - `duduclaw mcp-proxy` (stdio servers, `duduclaw-cli/src/mcp_proxy.rs`),
 //!   put in the path by the spawn-time rewrite when redaction is active, when
 //!   the employee has `[capabilities] action_rules`, or in the explore lane;
+//!   for Codex always (2026-10-19, `runtime/codex/third_party.rs`), because
+//!   Codex auto-approves the servers it is given;
 //! - `duduclaw mcp-remote-bridge` (remote servers,
 //!   [`crate::remote_mcp::bridge`]), always in the path for them.
 //!
@@ -27,10 +29,11 @@
 //!
 //! Not covered: Claude Code built-in tools; `url` / `type` entries in
 //! `.mcp.json` (the CLI talks to them directly, no proxy in the path);
-//! runtimes other than the Claude CLI that start `.mcp.json` servers
-//! themselves (Codex, Gemini, Antigravity, Grok register only DuDuClaw's own
-//! server, and the openai-compat tool loop starts only `duduclaw
-//! mcp-server`).
+//! Gemini, Antigravity and Grok, which register only DuDuClaw's own server
+//! (the employee's other `.mcp.json` servers are not started there at all),
+//! and the openai-compat tool loop, which starts only `duduclaw mcp-server`.
+//! Codex registers the third-party servers through this gate since
+//! 2026-10-19.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

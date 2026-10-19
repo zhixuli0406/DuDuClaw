@@ -976,15 +976,29 @@ impl AgentRuntime for CodexRuntime {
             }
         }
 
-        // W2 (MCP wiring): register the duduclaw MCP server before spawning.
+        // W2 (MCP wiring): register the duduclaw MCP server before spawning,
+        // plus (2026-10-19) the employee's third-party `.mcp.json` servers,
+        // each behind `duduclaw mcp-proxy` (see `third_party`).
         // 1) Per-invocation `-c` overrides — effective regardless of CODEX_HOME.
         // 2) Best-effort per-agent `.codex/config.toml` for operators who run
         //    codex manually in the agent dir with CODEX_HOME pointed there.
-        //    Warn-not-fatal: MCP registration failing must not block the reply.
+        //    Warn-not-fatal: writing that file must not block the reply.
+        // The `.mcp.json` spawn gate runs first and its refusal (or an
+        // unreadable / malformed `.mcp.json`) stops this spawn: fail closed.
+        let own_mcp =
+            super::duduclaw_mcp_server_json_for_home(&context.agent_id, &context.home_dir);
+        let third_party_servers = match (context.agent_dir.as_deref(), own_mcp.as_ref()) {
+            (Some(dir), Some(own)) => {
+                third_party::gated_servers_for_spawn(dir, &context.home_dir, own, explore).await?
+            }
+            _ => std::collections::BTreeMap::new(),
+        };
         if let Some(ref dir) = context.agent_dir {
-            if let Err(e) =
-                Self::ensure_duduclaw_mcp_config(dir, &context.agent_id, &context.home_dir)
-            {
+            let written = match own_mcp.as_ref() {
+                Some(own) => Self::write_spawn_mcp_config(dir, own, &third_party_servers),
+                None => Err("duduclaw binary did not resolve to an absolute path".to_string()),
+            };
+            if let Err(e) = written {
                 warn!(
                     runtime = "codex",
                     agent = %context.agent_id,
@@ -1032,6 +1046,24 @@ impl AgentRuntime for CodexRuntime {
             cmd.env(k, v);
         }
         cmd.args(&mcp_overrides.args);
+        // Third-party servers (2026-10-19). `_third_party_env_files` holds
+        // each proxy's upstream-env temp file until Codex has exited.
+        let third_party_overrides = third_party::override_args(
+            &third_party_servers,
+            supports_env_vars,
+            crate::explore_lane::lane_env().as_ref(),
+            &mcp_overrides.process_env,
+        )
+        .map_err(|e| {
+            duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                "第三方 MCP 伺服器的啟動設定無法產生（{e}），這次不啟動。"
+            ))
+        })?;
+        for (k, v) in &third_party_overrides.process_env {
+            cmd.env(k, v);
+        }
+        cmd.args(&third_party_overrides.args);
+        let _third_party_env_files = third_party_overrides.temp_files;
         // P2-B N4: this turn's or run's source identity for the duduclaw MCP
         // server, so what the employee stores there can be forgotten by its
         // conversation. Per-spawn `-c` overrides, never a persisted config.
@@ -1292,23 +1324,24 @@ impl CodexRuntime {
         Ok(true)
     }
 
-    /// W2: ensure the duduclaw MCP server (absolute binary + `mcp-server` arg +
-    /// `DUDUCLAW_AGENT_ID` env) is registered in the agent's codex config.
-    /// Called from [`AgentRuntime::execute`] before every spawn — cheap
-    /// check-before-write keeps it idempotent.
-    pub fn ensure_duduclaw_mcp_config(
+    /// W2: write the agent's codex config with the duduclaw MCP server
+    /// (`own`: absolute binary + `mcp-server` arg + identity env) and, since
+    /// 2026-10-19, the employee's gated third-party servers. Called from
+    /// [`AgentRuntime::execute`] before every spawn — cheap check-before-write
+    /// keeps it idempotent. `own` always holds the `duduclaw` key: a
+    /// third-party entry cannot take it (they never carry a DuDuClaw name).
+    pub(crate) fn write_spawn_mcp_config(
         agent_dir: &std::path::Path,
-        agent_id: &str,
-        home_dir: &std::path::Path,
+        own: &serde_json::Value,
+        third_party: &std::collections::BTreeMap<String, third_party::GatedServer>,
     ) -> Result<bool, String> {
-        let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
-            return Err("duduclaw binary did not resolve to an absolute path".to_string());
-        };
-        let mut servers = std::collections::HashMap::new();
-        servers.insert("duduclaw".to_string(), def);
+        let mut servers = third_party::file_entries(third_party);
+        servers.insert("duduclaw".to_string(), own.clone());
         Self::write_mcp_config(agent_dir, &servers)
     }
 }
+
+pub(crate) mod third_party;
 
 // ── Tests ───────────────────────────────────────────────────────
 

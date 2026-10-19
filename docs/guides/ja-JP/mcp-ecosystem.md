@@ -156,7 +156,7 @@ action_rules = [
 
 **ダッシュボード**：`MCP → リモートサーバー →「サードパーティのツールと動作の種類」` で、従業員ごとに各サーバーがプロキシまたはブリッジ経由で最後に一覧化したツール（`<home>/mcp_tool_effects/<従業員>/<サーバー>.json`）を、現在の設定で再計算した種類と判断付きで表示します。セッションが DuDuClaw 経由で一覧化した後にだけ表示されます。スナップショットは表示専用で、制御は常にその時点の一覧に従います。
 
-**対象ランタイム**：Claude CLI（`.mcp.json` のサーバーを起動し、spawn は書き換えた設定を渡します）。Codex、Antigravity、Grok の従業員には DuDuClaw 自身のサーバーだけが登録され、openai-compat のツールループも `duduclaw mcp-server` しか起動しないため、制御すべきサードパーティサーバーはありません。`.mcp.json` の `url`／`type` 項目（CLI が直接接続）は制御できないため、制御付きの spawn（`action_rules` がある、または読み取り専用レーン）では CLI に渡す設定から取り除かれます（監査 `third_party_remote_entry_dropped`、`duduclaw doctor` も案内します）。リモートサーバーとして接続してください。制御用の `.mcp.json` コピーを作れない場合、その spawn は拒否され（監査 `third_party_gate_config_unavailable`）、制御なしでは起動しません。
+**対象ランタイム**：Claude CLI（`.mcp.json` のサーバーを起動し、spawn は書き換えた設定を渡します）と Codex（`.mcp.json` の各サードパーティ stdio サーバーは、その spawn で必ず `duduclaw mcp-proxy` 経由として登録されます。Codex は渡されたサーバーを自動承認するためです。リモートブリッジの項目は自身で制御するのでそのまま登録されます。proxy が使うサードパーティの認証情報はコマンドラインではなく、その spawn 専用で所有者だけが読める一時ファイルに置かれます）。Antigravity、Grok の従業員には DuDuClaw 自身のサーバーだけが登録され、openai-compat のツールループも `duduclaw mcp-server` しか起動しないため、`.mcp.json` のそれ以外のサーバーはこれらのランタイムでは起動されません。`.mcp.json` の `url`／`type` 項目（CLI が直接接続）は制御できないため、制御付きの spawn（`action_rules` がある、または読み取り専用レーン）では CLI に渡す設定から取り除かれます（監査 `third_party_remote_entry_dropped`、`duduclaw doctor` も案内します）。リモートサーバーとして接続してください。制御用の `.mcp.json` コピーを作れない場合、その spawn は拒否され（監査 `third_party_gate_config_unavailable`）、制御なしでは起動しません。
 
 ## 5. リモートサーバーからのイベント（MCP Events）
 

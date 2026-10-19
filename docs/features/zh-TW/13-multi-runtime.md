@@ -320,6 +320,16 @@ Codex spawn 透過每次呼叫的 `-c` 設定覆寫來註冊 duduclaw MCP server
 
 **兩條路徑共通的緩解。** 允許進入 `argv` 的 env 鍵集合由測試鎖定在已知的 `DUDUCLAW_*` 區塊，新增機密無法悄悄加入；每個鍵在插入前都驗證為單純的 TOML 鍵（包含 `env_vars` 陣列內的名稱）；每個值都經過 TOML 引號處理。
 
+### Codex：員工的其他 MCP 伺服器（2026-10-19）
+
+Codex 不讀 `.mcp.json`，所以 Codex spawn 用登記 duduclaw 的同一種方式登記員工的其他伺服器：`-c mcp_servers.<name>.…` 覆寫（也寫進 `<agent_dir>/.codex/config.toml`）。之前 spawn 只登記 duduclaw，`.mcp.json` 裡像券商連線這類伺服器在 Codex 上會消失。規則如下：
+
+- 先跑 `.mcp.json` spawn 閘門，和 Claude spawn 一樣。閘門拒絕，或 `.mcp.json` 讀不到、解析失敗，這次 spawn 就停止。
+- 每個第三方 stdio 伺服器都登記成 `duduclaw mcp-proxy --server <name> -- <command> …`，一律如此（Claude 只在有 `action_rules` 或唯讀通道時才這樣做），因為 Codex 以 `approval_policy=never` 執行，這些伺服器又以 `default_tools_approval_mode = "auto"` 登記，真正做決定的是 proxy 的第三方工具閘門。遠端橋接照原樣登記（它們自己管制）；直接的 `url`／`type` 項目會被移除，並記稽核 `third_party_remote_entry_dropped`。無法包裝的項目、名稱不是單純 TOML 鍵的項目，不會登記。
+- `.mcp.json` 裡用 DuDuClaw 名稱（`duduclaw`、`duduclaw-pro`、`duduclaw-<instance>`）的項目，永遠取代不了 gateway 自己產生的伺服器。
+- 第三方伺服器自己的環境變數（它的憑證）放進這次 spawn 專用、只有擁有者能讀的暫存檔，由 `DUDUCLAW_MCP_PROXY_ENV_FILE` 指向，不放進 `argv`。`DUDUCLAW_MCP_API_KEY` 照上表處理（0.157 以上走 `env_vars`）。
+- Codex 會清空 MCP 子行程的環境，所以唯讀通道以 `env.DUDUCLAW_LANE` 傳給每個第三方伺服器。
+
 ### 工作目錄覆寫涵蓋每個 CLI 後端（2026-09-28）
 
 呼叫端可以要求某一次 spawn 在 agent 自己目錄以外的地方執行。目前唯一的呼叫端是團隊組成器（team composer），它把角色成員放進員工的工作區，這樣成員寫出的檔案才不會在用完即丟的 scaffold 於成員結束的瞬間被回收時一起消失。
