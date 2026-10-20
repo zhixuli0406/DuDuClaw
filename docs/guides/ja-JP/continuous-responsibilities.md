@@ -220,9 +220,9 @@ v1.70.0 の次のリリースから、すでに変わった状態に対して出
 | ランタイム | 動作 |
 |---|---|
 | Claude CLI | 起動時に `DUDUCLAW_LANE=explore`（継承した DuDuClaw MCP サーバーは `read`／`draft` ツールだけを一覧・実行）、`--tools` は `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（`denied_tools` を除く）だけ、`--allowedTools` は DuDuClaw MCP ツールとそれらの組み込みツールだけ（従業員自身の許可リストより広くならず、`.mcp.json` の他のサーバーのツールは自動承認されません）。`.mcp.json` の他の stdio サーバーは制御付きプロキシを通り、`read` ツールだけを一覧します |
-| OpenAI 互換ランタイム | 組み込みツールなし。DuDuClaw MCP 子プロセスに `DUDUCLAW_LANE=explore` が渡ります。lane 内では `agent.toml [mcp.external]` のサーバーをマウントせず、このランタイムは `.mcp.json` のサーバーを起動しません |
+| OpenAI 互換ランタイム | 組み込みツールなし。DuDuClaw MCP 子プロセスに `DUDUCLAW_LANE=explore` が渡ります。lane 内では `agent.toml [mcp.external]` のサーバーをマウントしません（制御するものがないため）。2026-10-20 以降、従業員の `.mcp.json` にあるその他のサーバーは制御付きの proxy 経由で `DUDUCLAW_LANE=explore` 付きでマウントされ、`read` ツールだけが一覧に出ます |
 | MoA モデル、`inference_mode = "local"` | 拒否（`explore_lane_unsupported`）。lane 内ではハイブリッドのローカル振り分けを使いません |
-| Codex | 従業員自身の権限レベルにかかわらず `-s read-only` と `approval_policy=never` で実行（書き込みとネットワークを遮断し、設定ファイルの許可リストを無視する OS レベルのサンドボックス）。DuDuClaw MCP サーバーは `DUDUCLAW_LANE=explore` 付きで登録し、サードパーティサーバーは追加しません。Codex 0.156.1 は `-s read-only` ではすべての MCP 呼び出しを拒否するため、呼び出せるツールはありません（2026-09-24 に 0.156.1 で確認、今回は再実行していません） |
+| Codex | 従業員自身の権限レベルにかかわらず `-s read-only` と `approval_policy=never` で実行（書き込みとネットワークを遮断し、設定ファイルの許可リストを無視する OS レベルのサンドボックス）。DuDuClaw MCP サーバーは `DUDUCLAW_LANE=explore` 付きで登録し、2026-10-19 以降は従業員のサードパーティサーバーも制御付きの proxy 経由で同じ変数付きで登録します。Codex 0.156.1 は `-s read-only` ではすべての MCP 呼び出しを拒否するため、呼び出せるツールはありません（2026-09-24 に 0.156.1 で確認、今回は再実行していません） |
 | Antigravity、Grok、汎用 CLI | 拒否：そのラウンドはディスパッチ前に失敗し（`explore_lane_unsupported`）、フェイルオーバーで到達した場合に備えて各ランタイムの `execute` にも同じ拒否があります。Antigravity には読み取り専用モードがありません（`agy --sandbox` はターミナルを制限するだけで、ユーザーレベルの `permissions.allow` は同じ OS ユーザーのすべての従業員で共有されます）。Grok と汎用 CLI には読み取り専用と示せる仕組みがありません |
 | タスクサンドボックス（`[container] sandbox_enabled`） | ディスパッチ前に拒否（サンドボックスでは従業員がシェルを使えるため） |
 

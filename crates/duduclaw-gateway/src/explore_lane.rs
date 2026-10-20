@@ -29,17 +29,19 @@
 //!   `mcp__duduclaw__*` + those built-ins, an explicit allowlist only
 //!   narrowing ([`claude_tools`]); third-party stdio `.mcp.json` servers go
 //!   through the gated proxy.
-//! - **OpenAI-compatible runtime**: has no built-in tools and never starts
-//!   `.mcp.json` servers; its tool loop (`claude_runner::build_mcp_tool_registry`)
-//!   starts the DuDuClaw MCP server with the lane variable ([`lane_env`]) and,
-//!   in the lane, mounts no `agent.toml [mcp.external]` server (those would
-//!   run ungated).
+//! - **OpenAI-compatible runtime**: has no built-in tools; its tool loop
+//!   (`claude_runner::build_mcp_tool_registry`) starts the DuDuClaw MCP server
+//!   with the lane variable ([`lane_env`]), in the lane mounts no `agent.toml
+//!   [mcp.external]` server (those would run ungated), and since 2026-10-20
+//!   mounts the employee's `.mcp.json` servers behind `duduclaw mcp-proxy`
+//!   with the lane variable too (`runtime::third_party_mcp::tool_loop`).
 //! - **Codex** (`runtime::codex`): `-s read-only` + `approval_policy=never`
 //!   ([`codex_sandbox_args`]) whatever the employee's capability level (the
 //!   lane only narrows; the OS sandbox ignores config allow lists and blocks
 //!   writes and network), the DuDuClaw server registered with
-//!   `DUDUCLAW_LANE=explore` in its `-c` env overrides, and no third-party
-//!   server added by the gateway. Codex 0.156.1 rejects every MCP call under
+//!   `DUDUCLAW_LANE=explore` in its `-c` env overrides, and the employee's
+//!   third-party servers behind `duduclaw mcp-proxy` with the same variable
+//!   (2026-10-19, `runtime/codex/third_party.rs`). Codex 0.156.1 rejects every MCP call under
 //!   `-s read-only` (live-verified 2026-09-24), so no MCP tool, DuDuClaw or
 //!   third-party, is callable in the lane; servers in the operator's own
 //!   `~/.codex/config.toml` may still be started by Codex but cannot be used.
