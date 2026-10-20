@@ -166,6 +166,61 @@ mod tests {
         assert!(!mounted_by_externals("broker", &proxied, &[]));
     }
 
+    fn employee_with_broker() -> (tempfile::TempDir, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("trader");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": {
+                "duduclaw": { "command": "duduclaw", "args": ["mcp-server"] },
+                "masterlink": { "command": "python3", "args": ["-m", "m"], "env": { "ML_PASSWORD": "pw" } }
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        (home, dir)
+    }
+
+    /// The read-only lane reaches the proxy's environment, so it lists and
+    /// runs only read-only tools.
+    #[tokio::test]
+    async fn the_explore_lane_reaches_the_child_env() {
+        let (home, dir) = employee_with_broker();
+        let lane = |servers: &[ToolLoopServer]| {
+            servers[0]
+                .env
+                .iter()
+                .any(|(k, v)| k == duduclaw_core::ENV_LANE && v == duduclaw_core::LANE_EXPLORE)
+        };
+        let normal = servers_for_tool_loop("trader", home.path(), &dir, &[])
+            .await
+            .unwrap();
+        assert_eq!(normal.len(), 1);
+        assert!(!lane(&normal));
+        let explore = crate::explore_lane::EXPLORE
+            .scope(
+                true,
+                servers_for_tool_loop("trader", home.path(), &dir, &[]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explore[0].args[0], "mcp-proxy");
+        assert!(lane(&explore), "{:?}", explore[0].env);
+        // The upstream env rides inline in the child env, never on argv.
+        assert!(!explore[0].args.iter().any(|a| a.contains("pw")));
+    }
+
+    #[tokio::test]
+    async fn a_utility_call_mounts_nothing() {
+        let (home, dir) = employee_with_broker();
+        let got = crate::runtime_dispatch::UTILITY_CALL
+            .scope((), servers_for_tool_loop("trader", home.path(), &dir, &[]))
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
     #[test]
     fn upstream_of_a_bridge_is_not_compared() {
         let bridge = gated(&["mcp-remote-bridge", "--agent", "a", "--server", "zap"]);

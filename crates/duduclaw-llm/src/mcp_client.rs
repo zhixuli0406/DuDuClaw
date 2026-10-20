@@ -1251,6 +1251,32 @@ impl ToolExecutor for ToolRegistry {
 mod tests {
     use super::*;
 
+    /// `connect_scrubbed` starts the child from the allowlist, not this
+    /// process's environment (cargo sets `CARGO_MANIFEST_DIR` on the test
+    /// process; it is not on the allowlist). The stub dumps its env and exits
+    /// before the handshake, so the connect itself fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_scrubbed_does_not_inherit_the_parent_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("env.txt");
+        let script = format!("env > '{}'", out.display());
+        let res = McpClient::connect_scrubbed(
+            "/bin/sh",
+            &["-c".to_string(), script],
+            &[("EXPLICIT_VAR".to_string(), "given".to_string())],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(res.is_err(), "the stub never answers the handshake");
+        let env = std::fs::read_to_string(&out).unwrap();
+        assert!(env.lines().any(|l| l == "EXPLICIT_VAR=given"), "{env}");
+        assert!(env.lines().any(|l| l.starts_with("PATH=")) || std::env::var_os("PATH").is_none());
+        if std::env::var_os("CARGO_MANIFEST_DIR").is_some() {
+            assert!(!env.contains("CARGO_MANIFEST_DIR="), "{env}");
+        }
+    }
+
     #[test]
     fn http_endpoint_host_is_compared_exactly_not_by_prefix() {
         // Remote hosts that merely start with a local-looking string.
