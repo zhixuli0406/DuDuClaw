@@ -101,6 +101,23 @@ const COMPAT_HOOK_SOURCES_OFF: [(&str, &str); 2] = [
     ("GROK_CLAUDE_HOOKS_ENABLED", "false"),
     ("GROK_CURSOR_HOOKS_ENABLED", "false"),
 ];
+/// Spawn env turning off Grok's Claude- and Cursor-compat rules, skills and
+/// agents scanning (same reference). Without them an employee's turn gets the
+/// OS user's `~/.claude/CLAUDE.md`, `~/.claude/rules/`, `~/.claude/skills/`
+/// and `~/.cursor/skills/`, plus the working directory's `.claude/rules/` and
+/// `.claude/skills/`. Verified with `grok inspect`: those show as disabled,
+/// while the working directory's own `AGENTS.md` / `CLAUDE.md` are
+/// Grok-native and keep loading. The Cursor rules and both agents cells are
+/// set for completeness: 1.0.62's `grok inspect` lists no `.cursor/rules/`
+/// file either way, and still lists `~/.claude/agents/` with the cell off.
+const COMPAT_CONTEXT_SOURCES_OFF: [(&str, &str); 6] = [
+    ("GROK_CLAUDE_RULES_ENABLED", "false"),
+    ("GROK_CLAUDE_SKILLS_ENABLED", "false"),
+    ("GROK_CLAUDE_AGENTS_ENABLED", "false"),
+    ("GROK_CURSOR_RULES_ENABLED", "false"),
+    ("GROK_CURSOR_SKILLS_ENABLED", "false"),
+    ("GROK_CURSOR_AGENTS_ENABLED", "false"),
+];
 
 // ── Environment integrity & auth diagnostics ────────────────────
 //
@@ -519,6 +536,12 @@ impl AgentRuntime for GrokRuntime {
         // Likewise no Claude/Cursor-compat hooks; DuDuClaw's own guards were
         // written above as Grok project hooks.
         for (k, v) in COMPAT_HOOK_SOURCES_OFF {
+            home_env.push((k.to_string(), v.to_string()));
+        }
+        // Nor the OS user's Claude/Cursor instructions, rules and skills; the
+        // employee's own instructions come from the system prompt and the
+        // working directory's AGENTS.md / CLAUDE.md, which Grok reads natively.
+        for (k, v) in COMPAT_CONTEXT_SOURCES_OFF {
             home_env.push((k.to_string(), v.to_string()));
         }
 
@@ -1348,6 +1371,17 @@ mod tests {
         let map: std::collections::HashMap<_, _> = COMPAT_HOOK_SOURCES_OFF.into_iter().collect();
         assert_eq!(map.get("GROK_CLAUDE_HOOKS_ENABLED"), Some(&"false"));
         assert_eq!(map.get("GROK_CURSOR_HOOKS_ENABLED"), Some(&"false"));
+    }
+
+    #[test]
+    fn compat_context_sources_are_switched_off() {
+        let map: std::collections::HashMap<_, _> = COMPAT_CONTEXT_SOURCES_OFF.into_iter().collect();
+        for vendor in ["CLAUDE", "CURSOR"] {
+            for surface in ["RULES", "SKILLS", "AGENTS"] {
+                let key = format!("GROK_{vendor}_{surface}_ENABLED");
+                assert_eq!(map.get(key.as_str()), Some(&"false"), "{key}");
+            }
+        }
     }
 
     // ── Auth-failure classification ─────────────────────────────
