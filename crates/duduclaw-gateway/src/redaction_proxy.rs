@@ -348,6 +348,29 @@ pub fn mcp_json_lists_third_party_servers(
         .is_some_and(|m| m.keys().any(|n| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(n))))
 }
 
+/// Every server name the `.mcp.json` at `mcp_json` lists, DuDuClaw's own
+/// included (sorted). Read-only. Used by the Grok runtime, whose CLI
+/// also loads the `.mcp.json` of its working directory by itself: every name
+/// there must be shadowed in `.grok/config.toml` (2026-10-20).
+///
+/// No file ⇒ `Ok(None)`. Unreadable or malformed file ⇒ the same audited
+/// spawn-gate `Err` as [`gated_mcp_config_for_runtime`].
+pub fn mcp_json_server_names(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parsed["mcpServers"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+    ))
+}
+
 fn agent_id_of(mcp_json: &Path) -> String {
     mcp_json
         .parent()

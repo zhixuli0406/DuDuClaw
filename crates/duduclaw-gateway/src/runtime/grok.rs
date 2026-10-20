@@ -325,12 +325,39 @@ impl AgentRuntime for GrokRuntime {
         crate::explore_lane::refuse_unsupported_runtime("grok")?;
         info!(agent = %context.agent_id, "GrokRuntime: executing via grok -p");
 
+        // Working directory: `agent_dir`, unless a caller overrode it (see the
+        // `SPAWN_OVERRIDE` note further down). Resolved here because Grok
+        // reads both its MCP config and the directory's `.mcp.json` from it.
+        let work_root: Option<std::path::PathBuf> =
+            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+
+        // Third-party `.mcp.json` servers (2026-10-20, `third_party`): Grok
+        // loads the working directory's `.mcp.json` by itself, so when it
+        // lists anything besides DuDuClaw's own server the config is written
+        // with every server behind a spawn-scoped `duduclaw mcp-proxy` and a
+        // disabled shadow for each name that cannot be gated. Fails closed
+        // (`SPAWN_GATE_ERROR_PREFIX`). `_third_party_env_dir` holds this
+        // spawn's upstream-env directory until Grok (and its PTY retry) exits.
+        let third_party = third_party::prepare(
+            context.agent_dir.as_deref(),
+            work_root.as_deref(),
+            &context.agent_id,
+            &context.home_dir,
+            crate::explore_lane::in_explore(),
+        )
+        .await?;
+        let third_party_env = third_party.env_dir.as_ref().map(|d| d.env_pair());
+        let _third_party_env_dir = third_party.env_dir;
+
         // MCP wiring: register the duduclaw MCP server before spawning. Grok is
         // MCP-native; the config format is verified (`[mcp_servers.duduclaw]`
         // TOML) but per-agent project-local discovery is the one residual — so we
         // ALSO forward the agent identity via spawn env below. Warn-not-fatal.
+        // Skipped when `third_party::prepare` already wrote the config.
         if let Some(ref dir) = context.agent_dir {
-            if let Err(e) =
+            if third_party.managed {
+                // Written (with `duduclaw`) by `third_party::prepare`.
+            } else if let Err(e) =
                 Self::ensure_duduclaw_mcp_config(dir, &context.agent_id, &context.home_dir).await
             {
                 warn!(
@@ -465,8 +492,6 @@ impl AgentRuntime for GrokRuntime {
         // otherwise the member would spawn with zero MCP tools and an
         // unresolvable sandbox profile name. Identity still travels
         // independently through the spawn env below.
-        let work_root: Option<std::path::PathBuf> =
-            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
         let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
         if cwd_overridden {
             if let Some(ref root) = work_root {
@@ -477,7 +502,9 @@ impl AgentRuntime for GrokRuntime {
                 // between members, and the per-process identity below is what
                 // the MCP child actually authenticates with, so the blast
                 // radius is the declared block only.
-                if let Err(e) =
+                if third_party.managed {
+                    // Written (with `duduclaw`) by `third_party::prepare`.
+                } else if let Err(e) =
                     Self::ensure_duduclaw_mcp_config(root, &context.agent_id, &context.home_dir)
                         .await
                 {
@@ -536,6 +563,15 @@ impl AgentRuntime for GrokRuntime {
         // P2-A H-2: only reaches the MCP child if Grok passes its own env on
         // (its declared per-agent block is persistent and never carries it).
         if let Some((k, v)) = super::round_task_env() {
+            cmd.env(k, v);
+        }
+        // This spawn's third-party upstream-env directory: Grok expands it
+        // into each spawn-scoped proxy's env (`${DUDUCLAW_MCP_PROXY_ENV_DIR:-}`
+        // in `.grok/config.toml`). Removed first so an ambient value can never
+        // stand in for it; absent for a spawn without third-party servers and
+        // for a utility call, whose proxies then start nothing.
+        cmd.env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
+        if let Some((k, v)) = &third_party_env {
             cmd.env(k, v);
         }
 
@@ -609,7 +645,14 @@ impl AgentRuntime for GrokRuntime {
                 crate::pty_runtime::is_pty_retry_disabled() || native_sandbox_active;
             if should_pty_retry_empty(true, true, is_auth, retry_disabled) {
                 match self
-                    .pty_retry(&args, &home_env, &api_key, context, work_root.as_deref())
+                    .pty_retry(
+                        &args,
+                        &home_env,
+                        &api_key,
+                        context,
+                        work_root.as_deref(),
+                        third_party_env.as_ref(),
+                    )
                     .await
                 {
                     Ok(text) if !text.trim().is_empty() => {
@@ -730,8 +773,14 @@ impl GrokRuntime {
         // than re-derived so the retry can never land in a different directory
         // than the attempt it is retrying.
         work_root: Option<&std::path::Path>,
+        // The primary spawn's third-party upstream-env directory, if any
+        // (still alive: the caller holds it until this retry returns).
+        third_party_env: Option<&(String, String)>,
     ) -> Result<String, String> {
         let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
+        if let Some((k, v)) = third_party_env {
+            env.insert(k.clone(), v.clone());
+        }
         if !api_key.is_empty() {
             env.insert("XAI_API_KEY".to_string(), api_key.to_string());
         }
@@ -1004,6 +1053,8 @@ impl GrokRuntime {
         Self::write_mcp_config(agent_dir, &servers).await
     }
 }
+
+pub(crate) mod third_party;
 
 // ── Tests ───────────────────────────────────────────────────────
 
