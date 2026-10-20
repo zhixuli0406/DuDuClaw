@@ -41,6 +41,7 @@ use duduclaw_core::mcp_proxy_rewrite::{
 };
 
 pub(crate) mod env_files;
+pub(crate) mod tool_loop;
 
 /// One gated third-party server as a runtime receives it.
 #[derive(Debug, Clone, PartialEq, Eq)]

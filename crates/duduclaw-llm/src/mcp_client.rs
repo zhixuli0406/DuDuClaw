@@ -366,7 +366,51 @@ impl McpClient {
         timeout: Duration,
         stderr: std::process::Stdio,
     ) -> Result<Self, McpError> {
+        Self::spawn_and_handshake(command, args, envs, timeout, stderr, false).await
+    }
+
+    /// [`connect`](Self::connect) for a server that must not inherit this
+    /// process's environment (a third-party MCP server behind `duduclaw
+    /// mcp-proxy`, 2026-10-20): the child starts from the agent-CLI spawn
+    /// allowlist (`duduclaw_core::spawn_env::agent_cli_spawn_env_pairs`:
+    /// PATH, HOME, locale, proxy, temp dir; never a secret-shaped name) plus
+    /// `envs`, the same base environment a server started by the Claude CLI
+    /// sees. Without it every vendor key in the gateway's environment would
+    /// reach the server.
+    pub async fn connect_scrubbed(
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let mut all: Vec<(String, String)> = duduclaw_core::spawn_env::agent_cli_spawn_env_pairs()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        all.extend(envs.iter().cloned());
+        Self::spawn_and_handshake(
+            command,
+            args,
+            &all,
+            timeout,
+            std::process::Stdio::null(),
+            true,
+        )
+        .await
+    }
+
+    async fn spawn_and_handshake(
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        timeout: Duration,
+        stderr: std::process::Stdio,
+        clear_env: bool,
+    ) -> Result<Self, McpError> {
         let mut cmd = Command::new(command);
+        if clear_env {
+            cmd.env_clear();
+        }
         let workflow_home = if envs
             .iter()
             .any(|(key, _)| key == "DUDUCLAW_WORKFLOW_SESSION_ID")

@@ -1706,10 +1706,32 @@ fn finish_mcp_tool_registry(
 }
 
 pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_llm::ToolRegistry> {
+    match build_mcp_tool_registry_checked(agent_id).await {
+        Ok(registry) => registry,
+        // The employee's `.mcp.json` could not be gated (malformed, or the
+        // spawn gate refused). These callers (Direct-API reply, local
+        // inference) degrade to a tools-less answer: no tool at all, rather
+        // than an ungated server or a silently partial tool set.
+        Err(e) => {
+            warn!(agent = %agent_id, error = %e, "MCP tool loop disabled — the employee's third-party MCP servers could not be gated");
+            None
+        }
+    }
+}
+
+/// [`build_mcp_tool_registry`] that reports a third-party gate refusal
+/// (2026-10-20: the employee's `.mcp.json` servers are mounted through
+/// `duduclaw mcp-proxy`, `runtime::third_party_mcp::tool_loop`). `Err` is
+/// spawn-gate prefixed (`SPAWN_GATE_ERROR_PREFIX`); the openai-compat
+/// runtime refuses the reply with it, like Codex refuses its spawn.
+/// `Ok(None)` keeps its old meaning (no reachable tools: degrade).
+pub(crate) async fn build_mcp_tool_registry_checked(
+    agent_id: &str,
+) -> Result<Option<duduclaw_llm::ToolRegistry>, String> {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {
         warn!("MCP tool loop disabled — duduclaw binary did not resolve to an absolute path");
-        return None;
+        return Ok(None);
     }
 
     // Connect the internal duduclaw MCP server (always client 0 → wins name
@@ -1727,7 +1749,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "MCP server spawn failed — Direct-API reply will be tools-less");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -1743,12 +1765,23 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
     } else {
         crate::mcp_external::load_external_mcp_servers_resolved(&agent_dir, &home_dir).await
     };
+    // The employee's `.mcp.json` third-party servers, each behind `duduclaw
+    // mcp-proxy` (or its remote bridge), skipping any `agent.toml` already
+    // mounts. Mounted in the explore lane too: the proxy carries the lane.
+    // None for a utility call. A refusal is returned (fail closed).
+    let dot_mcp = crate::runtime::third_party_mcp::tool_loop::servers_for_tool_loop(
+        agent_id,
+        &home_dir,
+        &agent_dir,
+        &externals,
+    )
+    .await?;
 
     // RFC-23 §13.6: server names are recorded so `ToolExecutor::server_of`
     // can give a `ToolInterceptor` the `<server>.<tool>` namespace the
     // redaction rules match on — the same namespace `duduclaw mcp-proxy`
     // applies on the CLI path. Routing/collision behaviour is unchanged.
-    if externals.is_empty() {
+    if externals.is_empty() && dot_mcp.is_empty() {
         let registry = match duduclaw_llm::ToolRegistry::from_clients_named(
             vec![("duduclaw".to_string(), internal)],
             Vec::new(),
@@ -1761,7 +1794,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
                 None
             }
         };
-        return finish_mcp_tool_registry(agent_id, &home_dir, registry);
+        return Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry));
     }
 
     let mut clients = vec![("duduclaw".to_string(), internal)];
@@ -1802,6 +1835,28 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
             }
         }
     }
+    for server in dot_mcp {
+        // A child of the agent-CLI allowlisted environment, not the
+        // gateway's: a third-party server never sees the operator's other
+        // vendor keys (same base env as under the Claude CLI).
+        match duduclaw_llm::McpClient::connect_scrubbed(
+            &server.command,
+            &server.args,
+            &server.env,
+            duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+        )
+        .await
+        {
+            Ok(c) => {
+                info!(server = %server.name, "third-party .mcp.json server mounted behind duduclaw mcp-proxy");
+                clients.push((server.name, c));
+                filters.push(duduclaw_llm::ToolFilter::default());
+            }
+            Err(e) => {
+                warn!(server = %server.name, error = %e, "third-party .mcp.json server connect failed — skipping")
+            }
+        }
+    }
 
     let registry = match duduclaw_llm::ToolRegistry::from_clients_named(clients, filters).await {
         Ok(reg) => Some(reg),
@@ -1809,7 +1864,9 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
             // A misbehaving external server can fail the combined tools/list.
             // Degrade to internal-only rather than losing all tools.
             warn!(error = %e, "combined MCP registry build failed — retrying internal-only");
-            let internal = connect_internal().await.ok()?;
+            let Ok(internal) = connect_internal().await else {
+                return Ok(None);
+            };
             duduclaw_llm::ToolRegistry::from_clients_named(
                 vec![("duduclaw".to_string(), internal)],
                 Vec::new(),
@@ -1818,7 +1875,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
             .ok()
         }
     };
-    finish_mcp_tool_registry(agent_id, &home_dir, registry)
+    Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry))
 }
 
 /// Where a direct-API key came from — the pure output of [`choose_key_source`].
