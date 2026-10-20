@@ -685,7 +685,13 @@ impl AgentRuntime for AntigravityRuntime {
             let prune = third_party.self_exe.as_deref().filter(|_| own_root);
             let entries = third_party.entries();
             if let Err(e) = self
-                .ensure_duduclaw_mcp_config(root, &context.home_dir, &entries, prune)
+                .ensure_duduclaw_mcp_config(
+                    root,
+                    &context.home_dir,
+                    &entries,
+                    prune,
+                    &context.agent_id,
+                )
                 .await
             {
                 if !entries.is_empty() {
@@ -991,6 +997,7 @@ impl AntigravityRuntime {
         duduclaw_home: &std::path::Path,
         third_party: &[(String, serde_json::Value)],
         prune: Option<&std::path::Path>,
+        agent_id: &str,
     ) -> Result<bool, String> {
         let (command, args) = self.mcp_command();
         let Some(def) = setup::mcp_server_entry(&command, &args) else {
@@ -1008,12 +1015,25 @@ impl AntigravityRuntime {
         let root = work_root.to_path_buf();
         let home = duduclaw_home.to_path_buf();
         let prune = prune.map(std::path::Path::to_path_buf);
-        tokio::task::spawn_blocking(move || {
+        let (wrote, unmanaged) = tokio::task::spawn_blocking(move || {
             setup::write_mcp_config_pruning(&root, &home, &list, prune.as_deref())
         })
         .await
         .map_err(|e| format!("mcp_config write task join failed: {e}"))?
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        // Every spawn: an entry DuDuClaw did not write is started by agy as
+        // written, without the third-party tool gate. Kept (the operator's
+        // file), but said out loud.
+        for server in unmanaged {
+            tracing::warn!(
+                runtime = "antigravity",
+                agent = %agent_id,
+                server = %server,
+                ".agents/mcp_config.json holds an MCP server DuDuClaw did not write — agy \
+                 starts it as written, without duduclaw mcp-proxy (no third-party tool gate)"
+            );
+        }
+        Ok(wrote)
     }
 }
 

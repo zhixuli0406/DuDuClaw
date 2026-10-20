@@ -46,12 +46,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use duduclaw_core::mcp_proxy_rewrite::{
-    PROXY_SPAWN_SCOPED_FLAG, PROXY_UPSTREAM_ENV_DIR_VAR,
-};
+use duduclaw_core::mcp_proxy_rewrite::{PROXY_SPAWN_SCOPED_FLAG, PROXY_UPSTREAM_ENV_DIR_VAR};
 
 use crate::runtime::third_party_mcp::env_files::{SpawnEnvDir, write_spawn_env_dir};
-use crate::runtime::third_party_mcp::{ScopedServer, gated_servers_checked, spawn_scoped};
+use crate::runtime::third_party_mcp::{
+    ScopedServer, gated_servers_and_names_checked, spawn_scoped,
+};
+
+mod sources;
 
 /// The value Grok expands into each proxy's env at load time.
 fn env_dir_reference() -> String {
@@ -88,29 +90,36 @@ pub(crate) async fn prepare(
             targets.push(d.to_path_buf());
         }
     }
-    // Names Grok would load from each directory's `.mcp.json` by itself.
-    let mut listed: Vec<(PathBuf, Vec<String>)> = Vec::new();
-    for dir in &targets {
-        let names = crate::redaction_proxy::mcp_json_server_names(
-            home_dir,
-            &dir.join(".mcp.json"),
-            explore,
-        )?
-        .unwrap_or_default();
-        listed.push((dir.clone(), names));
-    }
-    let any_third_party = listed
-        .iter()
-        .any(|(_, names)| names.iter().any(|n| n != "duduclaw"));
-    if !any_third_party {
-        return Ok(Prepared::default());
-    }
-
     let refuse = |what: &str| {
         duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
             "Grok 員工的第三方 MCP 伺服器無法安全登記（{what}），這次不啟動。"
         ))
     };
+    // Names Grok would load from each directory by itself: its `.mcp.json`
+    // (decision read only; the employee's own list is taken again below from
+    // the read the gate uses), `.cursor/mcp.json`, and the `.mcp.json` /
+    // `.cursor/mcp.json` / `.grok/config.toml` of every directory up to the
+    // git root (`sources`).
+    let mut other: Vec<(PathBuf, Vec<String>, Vec<String>)> = Vec::new();
+    let mut any_third_party = false;
+    for dir in &targets {
+        let own_names = crate::redaction_proxy::mcp_json_server_names(
+            home_dir,
+            &dir.join(".mcp.json"),
+            explore,
+        )?
+        .unwrap_or_default();
+        let names = sources::other_source_names(dir).map_err(|e| refuse(&e))?;
+        any_third_party |= own_names.iter().chain(&names).any(|n| n != "duduclaw");
+        other.push((dir.clone(), own_names, names));
+    }
+    if !any_third_party {
+        for dir in &targets {
+            warn_unmanaged(dir, agent_id, &duduclaw_core::resolve_duduclaw_bin());
+        }
+        return Ok(Prepared::default());
+    }
+
     let own = super::super::duduclaw_mcp_server_json_for_home(agent_id, home_dir)
         .ok_or_else(|| refuse("duduclaw binary did not resolve to an absolute path"))?;
     let own_toml = super::GrokRuntime::duduclaw_server_toml(agent_id, home_dir)
@@ -119,21 +128,33 @@ pub(crate) async fn prepare(
 
     // The same set for a utility call as for the employee's own turn, so
     // concurrent spawns write identical content; a utility call simply gets
-    // no env directory below.
-    let gated = match agent_dir {
-        Some(dir) => gated_servers_checked(dir, home_dir, &own, explore).await?,
-        None => BTreeMap::new(),
+    // no env directory below. The gated servers and the employee's own
+    // `.mcp.json` names come from one read of the file, after the gate.
+    let (gated, agent_names) = match agent_dir {
+        Some(dir) => gated_servers_and_names_checked(dir, home_dir, &own, explore).await?,
+        None => (BTreeMap::new(), Vec::new()),
     };
     let scoped = spawn_scoped(&gated);
 
-    for (dir, names) in &listed {
+    for (dir, dir_names, other_names) in &other {
         let own_dir = Some(dir.as_path()) == agent_dir;
+        // The employee's own list from the gated read; a borrowed root's from
+        // its single read above (nothing there is gated).
+        let mut names = if own_dir {
+            agent_names.clone()
+        } else {
+            dir_names.clone()
+        };
+        names.extend(other_names.iter().cloned());
+        names.sort();
+        names.dedup();
         let desired = Desired {
             duduclaw: &own_toml,
             live: &scoped,
-            shadow_names: names,
+            shadow_names: &names,
             own_dir,
             self_exe: &self_exe,
+            agent_id,
         };
         write_config(dir, home_dir, &desired).map_err(|e| refuse(&e))?;
     }
@@ -149,6 +170,41 @@ pub(crate) async fn prepare(
     })
 }
 
+/// Warn (every spawn) about each `.grok/config.toml` entry in `dir` that is
+/// neither `duduclaw` nor written by DuDuClaw: Grok starts it as written,
+/// without `duduclaw mcp-proxy`. Read-only; an unreadable or malformed file
+/// is skipped here (the managed path refuses it when it has to write).
+fn warn_unmanaged(dir: &Path, agent_id: &str, self_exe: &Path) {
+    let Ok(raw) = std::fs::read_to_string(dir.join(".grok").join("config.toml")) else {
+        return;
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
+        return;
+    };
+    if let Some(map) = doc.get("mcp_servers").and_then(|m| m.as_table()) {
+        for name in unmanaged_names(map, self_exe) {
+            log_unmanaged(agent_id, &name);
+        }
+    }
+}
+
+fn unmanaged_names(map: &toml::map::Map<String, toml::Value>, self_exe: &Path) -> Vec<String> {
+    map.iter()
+        .filter(|(name, def)| name.as_str() != "duduclaw" && !is_managed(def, self_exe))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn log_unmanaged(agent_id: &str, server: &str) {
+    tracing::warn!(
+        runtime = "grok",
+        agent = %agent_id,
+        server = %server,
+        "grok .grok/config.toml holds an MCP server DuDuClaw did not write — Grok starts it as \
+         written, without duduclaw mcp-proxy (no third-party tool gate)"
+    );
+}
+
 /// What one directory's `[mcp_servers]` should hold.
 pub(crate) struct Desired<'a> {
     pub duduclaw: &'a toml::Value,
@@ -159,6 +215,8 @@ pub(crate) struct Desired<'a> {
     /// in a borrowed work root they are left for their owner).
     pub own_dir: bool,
     pub self_exe: &'a Path,
+    /// For the unmanaged-entry warning.
+    pub agent_id: &'a str,
 }
 
 /// The TOML table of a live spawn-scoped proxy.
@@ -266,23 +324,17 @@ pub(crate) fn merge_servers(
         if name == "duduclaw" || desired.live.contains_key(name.as_str()) {
             continue;
         }
-        match map.get(name.as_str()) {
-            None => {
-                map.insert(name.clone(), shadow_entry(desired.self_exe));
-                changed = true;
-            }
-            // An entry DuDuClaw did not write (an operator's own) outranks
-            // `.mcp.json` too, and Grok starts it as written, unproxied. It
-            // is the operator's file, so it is kept, but said out loud.
-            Some(def) if !is_managed(def, desired.self_exe) => {
-                tracing::warn!(
-                    server = %name,
-                    "grok .grok/config.toml has its own entry for a .mcp.json server name — \
-                     kept as written, so Grok starts it without duduclaw mcp-proxy"
-                );
-            }
-            Some(_) => {}
+        if !map.contains_key(name.as_str()) {
+            map.insert(name.clone(), shadow_entry(desired.self_exe));
+            changed = true;
         }
+    }
+    // Any entry DuDuClaw did not write (an operator's own, same name as a
+    // `.mcp.json` server or not) outranks `.mcp.json` and is started by Grok
+    // as written, unproxied. It is the operator's file, so it is kept, but
+    // said out loud on every spawn.
+    for name in unmanaged_names(map, desired.self_exe) {
+        log_unmanaged(desired.agent_id, &name);
     }
     changed
 }

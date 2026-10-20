@@ -166,6 +166,23 @@ fn stale_managed_entries_are_pruned_and_others_kept() {
     );
 }
 
+#[test]
+fn unmanaged_entries_are_listed_for_the_warning() {
+    let exe = Path::new("/opt/duduclaw");
+    let existing = json!({ "mcpServers": {
+        "duduclaw": { "command": "/opt/duduclaw", "args": ["mcp-server"] },
+        "ours": { "command": "/opt/duduclaw", "args": ["mcp-proxy", "--spawn-scoped", "--server", "ours", "--", "x"] },
+        "handmade": { "command": "npx", "args": [] }
+    }})
+    .to_string();
+    assert_eq!(
+        setup::unmanaged_mcp_entries(Some(&existing), exe),
+        vec!["handmade"]
+    );
+    assert!(setup::unmanaged_mcp_entries(None, exe).is_empty());
+    assert!(setup::unmanaged_mcp_entries(Some("{ broken"), exe).is_empty());
+}
+
 // ── Live: the real agy (temp HOME, fake key, stub upstream) ─────────────
 //
 // Needs a `duduclaw` binary built from this tree (the proxy) in

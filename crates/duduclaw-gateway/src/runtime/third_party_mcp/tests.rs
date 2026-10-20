@@ -280,3 +280,27 @@ async fn a_utility_call_reads_nothing() {
         "{err}"
     );
 }
+
+#[test]
+fn case_fold_collisions_are_detected_and_refused() {
+    let names = [
+        "Broker".to_string(),
+        "other".to_string(),
+        "broker".to_string(),
+    ];
+    let (a, b) = super::env_files::case_fold_collision(names.iter()).unwrap();
+    assert_eq!((a.as_str(), b.as_str()), ("Broker", "broker"));
+    assert!(
+        super::env_files::case_fold_collision(["a".to_string(), "b".to_string()].iter()).is_none()
+    );
+    let s = ScopedServer {
+        command: EXE.into(),
+        args: Vec::new(),
+        proxy_env: BTreeMap::new(),
+        upstream_env: "{}".into(),
+    };
+    let servers = BTreeMap::from([("Foo".to_string(), s.clone()), ("foo".to_string(), s)]);
+    let home = tempfile::tempdir().unwrap();
+    let err = write_spawn_env_dir(home.path(), &servers).unwrap_err();
+    assert!(err.contains("letter case"), "{err}");
+}

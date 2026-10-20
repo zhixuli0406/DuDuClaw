@@ -162,8 +162,127 @@ async fn duduclaw_named_extras_alone_are_shadowed() {
     let p = prepare_for(&dir, home.path()).await.unwrap();
     assert!(p.managed && p.env_dir.is_none());
     let (raw, cfg) = config(&dir);
-    assert_eq!(cfg["mcp_servers"]["duduclaw-pro"]["enabled"].as_bool(), Some(false));
+    assert_eq!(
+        cfg["mcp_servers"]["duduclaw-pro"]["enabled"].as_bool(),
+        Some(false)
+    );
     assert!(!raw.contains("/tmp/evil"), "{raw}");
+}
+
+/// An env directory that cannot be written refuses the spawn: a server
+/// must never start without its credentials, nor Grok without its shadows.
+#[tokio::test]
+async fn an_env_dir_that_cannot_be_written_refuses_the_spawn() {
+    let (home, dir) = employee(Some(broker_mcp_json().as_str()));
+    std::fs::create_dir_all(home.path().join("tmp")).unwrap();
+    std::fs::write(home.path().join("tmp").join("mcp-proxy-env"), "not a dir").unwrap();
+    let err = prepare_for(&dir, home.path()).await.unwrap_err();
+    assert!(
+        duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+        "{err}"
+    );
+}
+
+/// `Foo.json` and `foo.json` are one file on a case-insensitive disk.
+#[tokio::test]
+async fn names_differing_only_in_case_refuse_the_spawn() {
+    let body = json!({ "mcpServers": {
+        "Broker": { "command": "python3", "args": ["-m", "a"], "env": { "K": "a" } },
+        "broker": { "command": "python3", "args": ["-m", "b"], "env": { "K": "b" } }
+    }})
+    .to_string();
+    let (home, dir) = employee(Some(body.as_str()));
+    let err = prepare_for(&dir, home.path()).await.unwrap_err();
+    assert!(
+        duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+        "{err}"
+    );
+    assert!(err.contains("letter case"), "{err}");
+}
+
+/// Grok also loads `<cwd>/.cursor/mcp.json` by itself: its names are
+/// shadowed even when `.mcp.json` lists nothing but DuDuClaw.
+#[tokio::test]
+async fn cursor_mcp_json_names_are_shadowed() {
+    let only_own =
+        json!({ "mcpServers": { "duduclaw": { "command": "duduclaw", "args": [] } } }).to_string();
+    let (home, dir) = employee(Some(only_own.as_str()));
+    std::fs::create_dir_all(dir.join(".cursor")).unwrap();
+    std::fs::write(
+        dir.join(".cursor").join("mcp.json"),
+        json!({ "mcpServers": { "cursor_srv": { "command": "/tmp/evil", "args": [] } } })
+            .to_string(),
+    )
+    .unwrap();
+    let p = prepare_for(&dir, home.path()).await.unwrap();
+    assert!(p.managed);
+    let (raw, cfg) = config(&dir);
+    assert_eq!(
+        cfg["mcp_servers"]["cursor_srv"]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert!(!raw.contains("/tmp/evil"));
+
+    std::fs::write(dir.join(".cursor").join("mcp.json"), "{ broken").unwrap();
+    let err = prepare_for(&dir, home.path()).await.unwrap_err();
+    assert!(
+        duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+        "{err}"
+    );
+}
+
+/// Inside a git repository Grok reads `.mcp.json` and `.grok/config.toml`
+/// of every directory up to the root; those names are shadowed in the
+/// working directory's config. Outside one it reads the working directory
+/// only.
+#[tokio::test]
+async fn ancestor_sources_up_to_the_git_root_are_shadowed() {
+    let (home, dir) = employee(None);
+    let agents = dir.parent().unwrap();
+    std::fs::write(
+        agents.join(".mcp.json"),
+        json!({ "mcpServers": { "up_one": { "command": "npx", "args": [] } } }).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+    std::fs::write(
+        home.path().join(".grok").join("config.toml"),
+        "[mcp_servers.up_two]\ncommand = \"npx\"\nargs = []\n",
+    )
+    .unwrap();
+    // No repository: nothing above the working directory is read.
+    assert!(sources::ancestors_to_git_root(&dir).is_empty());
+    let p = prepare_for(&dir, home.path()).await.unwrap();
+    assert!(!p.managed);
+
+    std::fs::create_dir_all(home.path().join(".git")).unwrap();
+    let ancestors = sources::ancestors_to_git_root(&dir);
+    assert_eq!(ancestors.len(), 2, "{ancestors:?}");
+    let p = prepare_for(&dir, home.path()).await.unwrap();
+    assert!(p.managed);
+    let (_, cfg) = config(&dir);
+    assert_eq!(
+        cfg["mcp_servers"]["up_one"]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        cfg["mcp_servers"]["up_two"]["enabled"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn unmanaged_entries_are_listed_for_the_warning() {
+    let exe = Path::new("/opt/duduclaw");
+    let doc: toml::Value = toml::from_str(&format!(
+        "[mcp_servers.duduclaw]\ncommand = \"/opt/duduclaw\"\nargs = [\"mcp-server\"]\n\
+         [mcp_servers.handmade]\ncommand = \"npx\"\nargs = []\n\
+         [mcp_servers.shadowed]\n{}",
+        toml::to_string(&shadow_entry(exe)).unwrap()
+    ))
+    .unwrap();
+    let map = doc["mcp_servers"].as_table().unwrap();
+    assert_eq!(unmanaged_names(map, exe), vec!["handmade"]);
 }
 
 #[tokio::test]

@@ -125,21 +125,53 @@ pub(crate) async fn gated_servers_checked(
     )? {
         return Ok(BTreeMap::new());
     }
+    run_spawn_gate(agent_dir).await?;
+    gated_servers(agent_dir, home_dir, own_server, explore)
+}
+
+/// [`gated_servers_checked`] that also returns every server name the
+/// employee's `.mcp.json` lists (sorted, DuDuClaw's own included), from the
+/// same read of the file the gated servers come from, taken after the spawn
+/// gate (which may rewrite the file's DuDuClaw entries). The Grok runtime
+/// shadows those names. No file ⇒ both empty.
+pub(crate) async fn gated_servers_and_names_checked(
+    agent_dir: &Path,
+    home_dir: &Path,
+    own_server: &Value,
+    explore: bool,
+) -> Result<(BTreeMap<String, GatedServer>, Vec<String>), String> {
+    let mcp_json = agent_dir.join(".mcp.json");
+    let lists =
+        crate::redaction_proxy::mcp_json_lists_third_party_servers(home_dir, &mcp_json, explore)?;
+    if lists {
+        run_spawn_gate(agent_dir).await?;
+    }
+    let Some(self_exe) = own_server.get("command").and_then(|c| c.as_str()) else {
+        return Ok((BTreeMap::new(), Vec::new()));
+    };
+    let self_exe = Path::new(self_exe);
+    let Some((config, names)) = crate::redaction_proxy::gated_mcp_config_with_names(
+        home_dir, &mcp_json, own_server, self_exe, explore,
+    )?
+    else {
+        return Ok((BTreeMap::new(), Vec::new()));
+    };
+    Ok((extract_gated(&config, self_exe, own_server), names))
+}
+
+async fn run_spawn_gate(agent_dir: &Path) -> Result<(), String> {
     let dir_owned = agent_dir.to_path_buf();
     match tokio::task::spawn_blocking(move || {
         duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir_owned)
     })
     .await
     {
-        Ok(Ok(_)) => {}
-        Ok(Err(msg)) => return Err(msg),
-        Err(e) => {
-            return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
-                "MCP 設定檢查無法執行：{e}"
-            )));
-        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(msg)) => Err(msg),
+        Err(e) => Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+            "MCP 設定檢查無法執行：{e}"
+        ))),
     }
-    gated_servers(agent_dir, home_dir, own_server, explore)
 }
 
 /// Pick the gated third-party entries out of a rewritten config. An entry is

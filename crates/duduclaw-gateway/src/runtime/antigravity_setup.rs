@@ -694,16 +694,36 @@ pub(crate) fn write_mcp_config(
     duduclaw_home: &Path,
     servers: &[(String, Value)],
 ) -> std::io::Result<bool> {
-    write_mcp_config_pruning(work_root, duduclaw_home, servers, None)
+    write_mcp_config_pruning(work_root, duduclaw_home, servers, None).map(|(wrote, _)| wrote)
 }
 
-/// [`write_mcp_config`] with [`merge_mcp_config_pruning`]'s `prune`.
+/// The names of entries in `existing` that are neither `duduclaw` nor a
+/// spawn-scoped proxy of `self_exe`: agy starts them as written, without
+/// `duduclaw mcp-proxy`. Unparseable content ⇒ empty.
+pub(crate) fn unmanaged_mcp_entries(existing: Option<&str>, self_exe: &Path) -> Vec<String> {
+    existing
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("mcpServers").and_then(Value::as_object).cloned())
+        .map(|m| {
+            m.iter()
+                .filter(|(name, def)| {
+                    name.as_str() != MCP_SERVER_NAME && !is_managed_json_entry(def, self_exe)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`write_mcp_config`] with [`merge_mcp_config_pruning`]'s `prune`. Also
+/// returns [`unmanaged_mcp_entries`] of the file as read (judged against
+/// `prune`, or this binary).
 pub(crate) fn write_mcp_config_pruning(
     work_root: &Path,
     duduclaw_home: &Path,
     servers: &[(String, Value)],
     prune: Option<&Path>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<(bool, Vec<String>)> {
     use crate::fs_safe::SafeDir;
     let root = SafeDir::open_root(work_root)?;
     let lock = mcp_lock_path(duduclaw_home, work_root);
@@ -715,9 +735,15 @@ pub(crate) fn write_mcp_config_pruning(
             .child_dir(AGENTS_DIR, true)?
             .ok_or_else(|| std::io::Error::other(".agents could not be created"))?;
         let existing = agents.read_file(MCP_CONFIG_FILE)?;
+        let self_exe = prune
+            .map(Path::to_path_buf)
+            .unwrap_or_else(duduclaw_core::resolve_duduclaw_bin);
+        let unmanaged = unmanaged_mcp_entries(existing.as_deref(), &self_exe);
         match merge_mcp_config_pruning(existing.as_deref(), servers, prune) {
-            Ok(None) => Ok(false),
-            Ok(Some(out)) => agents.write_file_atomic(MCP_CONFIG_FILE, &out).map(|()| true),
+            Ok(None) => Ok((false, unmanaged)),
+            Ok(Some(out)) => agents
+                .write_file_atomic(MCP_CONFIG_FILE, &out)
+                .map(|()| (true, unmanaged)),
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         }
     })

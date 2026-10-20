@@ -38,6 +38,7 @@ pub(crate) fn env_file_dir(home_dir: &Path) -> Result<PathBuf, String> {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {
@@ -160,6 +161,14 @@ pub(crate) fn write_spawn_env_dir(
     if servers.is_empty() {
         return Ok(None);
     }
+    // `Foo.json` and `foo.json` are one file on a case-insensitive file
+    // system (macOS, Windows): refuse rather than hand one server the other's
+    // credentials.
+    if let Some((a, b)) = case_fold_collision(servers.keys()) {
+        return Err(format!(
+            "MCP server names {a:?} and {b:?} differ only in letter case"
+        ));
+    }
     let parent = env_file_dir(home_dir)?;
     let dir = tempfile::Builder::new()
         .prefix(ENV_FILE_PREFIX)
@@ -177,6 +186,19 @@ pub(crate) fn write_spawn_env_dir(
         write_new_owner_only(&dir.path().join(file), server.upstream_env.as_bytes())?;
     }
     Ok(Some(SpawnEnvDir { dir }))
+}
+
+/// The first two names that are equal ignoring ASCII case, if any.
+pub(crate) fn case_fold_collision<'a>(
+    names: impl Iterator<Item = &'a String>,
+) -> Option<(String, String)> {
+    let mut seen: BTreeMap<String, &String> = BTreeMap::new();
+    for name in names {
+        if let Some(prev) = seen.insert(name.to_ascii_lowercase(), name) {
+            return Some((prev.clone(), name.clone()));
+        }
+    }
+    None
 }
 
 fn write_new_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
