@@ -72,9 +72,9 @@ const STRICT_EXTRA_PATTERNS: &[&str] = &[
 /// The other runtimes' configuration directories (`.agents/` holds the
 /// Antigravity MCP file, `.codex/`, `.gemini/`, `.grok/`) and `.claude.json`
 /// are excluded at the root for the same reason (N3): the CLI loads them at
-/// the next spawn.
+/// the next spawn. `.cursor/` too (2026-10-20): Grok loads its `mcp.json`.
 const AGENT_DIR_EXTRA_ROOT_ENTRIES: &[&str] =
-    &[".claude", ".claude.json", ".agents", ".codex", ".gemini", ".grok"];
+    &[".claude", ".claude.json", ".agents", ".codex", ".gemini", ".grok", ".cursor"];
 
 /// Names never promoted into an employee directory at **any** depth (N2/N3):
 /// a project cloned inside the employee directory is a place the CLI starts
@@ -776,7 +776,7 @@ mod tests {
     fn promotion_never_carries_cli_configuration_into_an_agent_directory() {
         let (home, agent, _) = home_layout();
         let branch = tempfile::tempdir().unwrap();
-        for dir in [".agents", ".codex", ".gemini", ".grok", "project/.claude/commands", "a/b/.claude"] {
+        for dir in [".agents", ".codex", ".gemini", ".grok", ".cursor", "project/.claude/commands", "a/b/.claude"] {
             fs::create_dir_all(branch.path().join(dir)).unwrap();
         }
         for file in [
@@ -784,6 +784,7 @@ mod tests {
             ".codex/config.toml",
             ".gemini/settings.json",
             ".grok/config.toml",
+            ".cursor/mcp.json",
             ".claude.json",
             ".CLAUDE.JSON",
             "project/.claude/commands/x.md",
@@ -798,7 +799,7 @@ mod tests {
         assert_eq!(policy, CopyPolicy::promote_default());
         policy.copy_tree(branch.path(), &agent).unwrap();
         for gone in [
-            ".agents", ".codex", ".gemini", ".grok", ".claude.json", ".CLAUDE.JSON",
+            ".agents", ".codex", ".gemini", ".grok", ".cursor", ".claude.json", ".CLAUDE.JSON",
             "project/.claude", "project/.mcp.json", "project/.claude.json", "a/b/.claude",
         ] {
             assert!(!agent.join(gone).exists(), "{gone}");

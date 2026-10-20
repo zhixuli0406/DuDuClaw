@@ -494,7 +494,7 @@ fn mcp_env_override_args(env: &serde_json::Map<String, serde_json::Value>) -> Ve
 /// for a value with no environment-variable meaning (array / object / null).
 /// See [`mcp_env_override_args`] for why non-string scalars are stringified
 /// rather than skipped.
-fn env_value_as_string(v: &serde_json::Value) -> Option<String> {
+pub(super) fn env_value_as_string(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -520,7 +520,7 @@ fn env_value_as_string(v: &serde_json::Value) -> Option<String> {
 /// `.` is deliberately **excluded** even though it is legal inside a dotted
 /// config path — here the segment is a single env-var name, and a dot in it
 /// would silently create a nested table instead of an env entry.
-fn is_safe_config_key_segment(k: &str) -> bool {
+pub(super) fn is_safe_config_key_segment(k: &str) -> bool {
     !k.is_empty()
         && k.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')

@@ -88,6 +88,11 @@ pub const PROXY_UPSTREAM_ENV_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV";
 /// `duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_FILE_VAR`.
 pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
 
+/// Env var naming the per-spawn directory a `--spawn-scoped` proxy reads its
+/// upstream env from (Grok, Antigravity; 2026-10-20). See
+/// [`crate::mcp_proxy_spawn_env`].
+pub use crate::mcp_proxy_spawn_env::PROXY_UPSTREAM_ENV_DIR_VAR;
+
 /// DuDuClaw-internal names the rewritten `.mcp.json` entry sets **for the
 /// proxy process** and which must not be handed down to the third-party
 /// upstream server. Everything else is inherited, so the upstream sees the
@@ -95,6 +100,7 @@ pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
 pub const PROXY_PRIVATE_ENV: &[&str] = &[
     PROXY_UPSTREAM_ENV_VAR,
     PROXY_UPSTREAM_ENV_FILE_VAR,
+    PROXY_UPSTREAM_ENV_DIR_VAR,
     "DUDUCLAW_HOME",
     "DUDUCLAW_PORT",
     "DUDUCLAW_INSTANCE",
@@ -607,6 +613,47 @@ pub async fn run_mcp_proxy(
     command: &str,
     args: &[String],
 ) -> Result<i32> {
+    run_mcp_proxy_scoped(home_dir, server, command, args, false).await
+}
+
+/// The inherited half of a spawn-scoped upstream's environment: the
+/// agent-CLI allowlist only.
+pub fn scoped_inherited_env() -> Vec<(String, String)> {
+    duduclaw_core::spawn_env::agent_cli_spawn_env_pairs()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+/// [`run_mcp_proxy`] for an entry that may be `spawn_scoped` (written into a
+/// persistent CLI config by the Grok and Antigravity runtimes): its upstream
+/// env comes only from the per-spawn directory, and without one the proxy
+/// refuses before starting anything ([`crate::mcp_proxy_spawn_env`]).
+pub async fn run_mcp_proxy_scoped(
+    home_dir: &Path,
+    server: &str,
+    command: &str,
+    args: &[String],
+    spawn_scoped: bool,
+) -> Result<i32> {
+    // Checked before anything else starts: a refused spawn-scoped proxy
+    // launches no upstream and initialises nothing.
+    let scoped_blob = if spawn_scoped {
+        match crate::mcp_proxy_spawn_env::scoped_env_blob(
+            std::env::var_os(PROXY_UPSTREAM_ENV_DIR_VAR),
+            server,
+        ) {
+            Ok(blob) => Some(blob),
+            Err(why) => {
+                tracing::warn!(server = %server, reason = %why, "mcp-proxy: spawn-scoped entry not registered for this spawn — not starting the upstream");
+                return Err(DuDuClawError::Gateway(format!(
+                    "mcp-proxy: MCP server '{server}' is not available here ({why})"
+                )));
+            }
+        }
+    } else {
+        None
+    };
     if server.trim().is_empty() {
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: --server must be a non-empty server name".to_string(),
@@ -661,12 +708,26 @@ pub async fn run_mcp_proxy(
         Arc::new(ThirdPartyGate::new(home_dir, &default_agent, server, "proxy"))
     });
 
-    let env_blob = upstream_env_blob(
-        std::env::var(PROXY_UPSTREAM_ENV_VAR).ok(),
-        std::env::var(PROXY_UPSTREAM_ENV_FILE_VAR).ok(),
-        server,
-    );
-    let env_pairs = upstream_env(std::env::vars(), env_blob.as_deref());
+    let env_blob = match scoped_blob {
+        Some(blob) => Some(blob),
+        None => upstream_env_blob(
+            std::env::var(PROXY_UPSTREAM_ENV_VAR).ok(),
+            std::env::var(PROXY_UPSTREAM_ENV_FILE_VAR).ok(),
+            server,
+        ),
+    };
+    // A spawn-scoped proxy runs under a CLI (Grok, Antigravity) that hands
+    // its MCP children its own environment, vendor keys included
+    // (`XAI_API_KEY`, `GEMINI_API_KEY`). Its upstream starts from the
+    // agent-CLI allowlist instead (PATH, HOME, locale, proxy, temp dir; never
+    // a secret-shaped name) plus the declared env, the same base a server
+    // gets under the Claude CLI or the tool loop.
+    let inherited: Vec<(String, String)> = if spawn_scoped {
+        scoped_inherited_env()
+    } else {
+        std::env::vars().collect()
+    };
+    let env_pairs = upstream_env(inherited, env_blob.as_deref());
 
     let mut cmd = duduclaw_core::platform::async_command_for(command);
     cmd.args(args);
@@ -837,6 +898,56 @@ mod tests {
             PROXY_UPSTREAM_ENV_FILE_VAR,
             duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_FILE_VAR
         );
+    }
+
+    /// Vendor keys the CLI holds never reach a spawn-scoped upstream; only
+    /// allowlisted names (and the declared env) do.
+    #[test]
+    fn a_spawn_scoped_upstream_starts_from_the_allowlist() {
+        let inherited = scoped_inherited_env();
+        for (k, _) in &inherited {
+            assert!(
+                duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&k.as_str())
+                    || duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_MACOS.contains(&k.as_str())
+                    || duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS.contains(&k.as_str()),
+                "{k}"
+            );
+            assert!(!k.ends_with("_API_KEY"), "{k}");
+        }
+        let map: HashMap<_, _> = upstream_env(inherited, Some(r#"{"ML_PASSWORD":"pw"}"#))
+            .into_iter()
+            .collect();
+        assert_eq!(map.get("ML_PASSWORD").map(String::as_str), Some("pw"));
+        assert!(!map.contains_key("XAI_API_KEY") && !map.contains_key("GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn the_env_dir_name_never_reaches_the_upstream() {
+        let inherited = vec![(PROXY_UPSTREAM_ENV_DIR_VAR.to_string(), "/tmp/x".to_string())];
+        let map: HashMap<_, _> = upstream_env(inherited, None).into_iter().collect();
+        assert!(!map.contains_key(PROXY_UPSTREAM_ENV_DIR_VAR));
+    }
+
+    /// A spawn-scoped proxy with no per-spawn directory starts nothing: the
+    /// upstream command here would leave a marker file if it ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawn_scoped_proxy_without_its_env_file_starts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let script = format!("touch {}", marker.display());
+        // No DUDUCLAW_MCP_PROXY_ENV_DIR in this test process.
+        assert!(std::env::var_os(PROXY_UPSTREAM_ENV_DIR_VAR).is_none());
+        let res = run_mcp_proxy_scoped(
+            tmp.path(),
+            "masterlink",
+            "/bin/sh",
+            &["-c".to_string(), script],
+            true,
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(!marker.exists(), "the upstream must not have been started");
     }
 
     // ── upstream env file (Codex, 2026-10-19) ───────────────────────

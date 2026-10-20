@@ -10,6 +10,7 @@ pub mod codex;
 pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;
+pub(crate) mod third_party_mcp;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

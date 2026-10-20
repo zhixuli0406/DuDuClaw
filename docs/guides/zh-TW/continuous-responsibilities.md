@@ -220,9 +220,9 @@ v1.70.0 之後的版本起，等待中的請求如果是在已經改變的狀態
 | 執行環境 | 行為 |
 |---|---|
 | Claude CLI | 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw MCP 伺服器繼承後只列出、只執行 `read`／`draft` 工具）；`--tools` 只剩 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（扣掉 `denied_tools`）；`--allowedTools` 只剩 DuDuClaw MCP 工具與這些內建工具（不會比員工自己的允許清單寬；`.mcp.json` 其他伺服器的工具不自動核准）；`.mcp.json` 其他 stdio 伺服器經過管制的 proxy，只列出 `read` 工具 |
-| OpenAI 相容執行環境 | 沒有內建工具；DuDuClaw MCP 子程序拿到 `DUDUCLAW_LANE=explore`；lane 內不掛載 `agent.toml [mcp.external]` 伺服器，這個執行環境也從不啟動 `.mcp.json` 的伺服器 |
+| OpenAI 相容執行環境 | 沒有內建工具；DuDuClaw MCP 子程序拿到 `DUDUCLAW_LANE=explore`；lane 內不掛載 `agent.toml [mcp.external]` 伺服器（沒有東西管制它們）；2026-10-20 起，員工 `.mcp.json` 裡的其他伺服器經過管制的 proxy 掛載並帶 `DUDUCLAW_LANE=explore`，只列出 `read` 工具 |
 | MoA 模型、`inference_mode = "local"` | 拒絕（`explore_lane_unsupported`）；lane 內略過混合模式的本機分流 |
-| Codex | 以 `-s read-only` 與 `approval_policy=never` 執行，不論員工自己的權限等級（作業系統層沙箱，擋寫入與網路，不理會設定檔的允許清單），DuDuClaw MCP server 帶 `DUDUCLAW_LANE=explore` 登記，不加入第三方伺服器；Codex 0.156.1 在 `-s read-only` 下拒絕所有 MCP 呼叫，所以沒有工具可呼叫（2026-09-24 在 0.156.1 驗證過，這次沒有重跑） |
+| Codex | 以 `-s read-only` 與 `approval_policy=never` 執行，不論員工自己的權限等級（作業系統層沙箱，擋寫入與網路，不理會設定檔的允許清單），DuDuClaw MCP server 帶 `DUDUCLAW_LANE=explore` 登記，2026-10-19 起員工的第三方伺服器也經過管制的 proxy 帶同一個變數登記；Codex 0.156.1 在 `-s read-only` 下拒絕所有 MCP 呼叫，所以沒有工具可呼叫（2026-09-24 在 0.156.1 驗證過，這次沒有重跑） |
 | Antigravity、Grok、通用 CLI | 拒絕：這一輪在派工前失敗（`explore_lane_unsupported`），而且這些執行環境的 `execute` 裡也有同樣的拒絕，以防備援切換到它們。Antigravity 沒有唯讀模式（`agy --sandbox` 只限制終端機，且它使用者層級的 `permissions.allow` 由同一系統使用者的所有員工共用）；Grok 與通用 CLI 沒有可證明唯讀的機制 |
 | 任務沙箱（`[container] sandbox_enabled`） | 派工前拒絕（沙箱給員工一個 shell） |
 

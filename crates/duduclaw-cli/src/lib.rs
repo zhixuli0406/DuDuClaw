@@ -54,6 +54,7 @@ pub mod mcp_oauth_server; // WP3.1-T2: OAuth 2.1 issuance for remote MCP clients
 pub(crate) mod mcp_os_ops; // O-0: device.*/system.* → agent-facing os_* MCP tool bridge
 pub mod mcp_planner; // RFC-26 P6.1: clarify-first Plan Mode
 pub mod mcp_proxy; // §13.6 WP-P: redacting stdio JSON-RPC proxy for external MCP servers
+pub mod mcp_proxy_spawn_env; // per-spawn upstream env for `mcp-proxy --spawn-scoped` (Grok, Antigravity)
 pub mod mcp_rate_limit;
 pub mod mcp_recording; // WP3.3 R1/R3: browser + desktop recording capture
 pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill_from_recording
@@ -1888,6 +1889,11 @@ enum ToolingCommands {
         /// `<server>.<tool>` for rule matching.
         #[arg(long)]
         server: String,
+        /// The entry lives in a persistent CLI config (Grok, Antigravity):
+        /// start the upstream only when `DUDUCLAW_MCP_PROXY_ENV_DIR` holds
+        /// this server's file for the current spawn, otherwise start nothing.
+        #[arg(long)]
+        spawn_scoped: bool,
         /// The upstream command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         upstream: Vec<String>,
@@ -5315,7 +5321,11 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Tooling(ToolingCommands::Discover { command }) => {
             discover_cli::execute(command, &duduclaw_home(), agent_session_identity().as_deref()).await
         }
-        Commands::Tooling(ToolingCommands::McpProxy { server, upstream }) => {
+        Commands::Tooling(ToolingCommands::McpProxy {
+            server,
+            spawn_scoped,
+            upstream,
+        }) => {
             // stdout is the JSON-RPC channel (CLI-H7) — tracing already goes
             // to stderr from `entry_point`, same as `mcp-server`.
             let home = duduclaw_home();
@@ -5324,7 +5334,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                     "mcp-proxy: missing upstream command after `--`".to_string(),
                 )
             })?;
-            let code = mcp_proxy::run_mcp_proxy(&home, &server, cmd, args).await?;
+            let code =
+                mcp_proxy::run_mcp_proxy_scoped(&home, &server, cmd, args, spawn_scoped).await?;
             std::process::exit(code);
         }
         Commands::Tooling(ToolingCommands::McpRemoteBridge { agent, server }) => {

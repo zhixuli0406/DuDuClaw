@@ -327,10 +327,17 @@ third-party stdio server in `.mcp.json` is registered for the spawn behind
 `duduclaw mcp-proxy`, always, because Codex auto-approves the servers it is
 given; remote bridges are registered as they are, since they gate
 themselves; the proxy's own credentials stay in a per-spawn owner-only file
-rather than on the command line). Antigravity and Grok employees are
-registered with DuDuClaw's own server only, and the openai-compat tool loop
-starts only `duduclaw mcp-server`, so their other `.mcp.json` servers are
-not started there at all. `url` / `type` entries in `.mcp.json` (the CLI
+rather than on the command line), and since 2026-10-20 Grok, Antigravity
+and the in-process tool loop of the openai-compat runtime, the Direct-API
+reply and local inference, all with the gate always on. Grok and Antigravity
+keep their MCP registration in a persistent file, so their entries are
+`duduclaw mcp-proxy --spawn-scoped …`: the upstream credentials sit in a
+per-spawn owner-only directory, and outside the spawn that registered the
+server (a utility call, a manual CLI run) the proxy starts nothing. Grok also
+reads the working directory's `.mcp.json` by itself; every name there is
+now overridden in `.grok/config.toml` (gated, or disabled), where before
+Grok started those servers ungated. Details: `docs/features/13-multi-runtime.md`.
+`url` / `type` entries in `.mcp.json` (the CLI
 talks to them directly) cannot be gated, so a spawn that is gated (an
 `action_rules` key, or the read-only lane) removes them from the config it
 hands the CLI (audit `third_party_remote_entry_dropped`; `duduclaw doctor`

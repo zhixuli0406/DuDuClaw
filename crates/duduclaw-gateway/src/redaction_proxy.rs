@@ -307,10 +307,31 @@ pub fn gated_mcp_config_for_runtime(
     self_exe: &Path,
     explore_lane: bool,
 ) -> Result<Option<Value>, String> {
+    Ok(
+        gated_mcp_config_with_names(home_dir, mcp_json, own_server, self_exe, explore_lane)?
+            .map(|(config, _)| config),
+    )
+}
+
+/// [`gated_mcp_config_for_runtime`] plus every server name the file listed
+/// (sorted, DuDuClaw's own included), both from the **same** read of the
+/// file. The Grok runtime shadows those names, so the shadow list and the
+/// gated servers can never come from two different versions of the file.
+pub fn gated_mcp_config_with_names(
+    home_dir: &Path,
+    mcp_json: &Path,
+    own_server: &Value,
+    self_exe: &Path,
+    explore_lane: bool,
+) -> Result<Option<(Value, Vec<String>)>, String> {
     let agent_id = agent_id_of(mcp_json);
     let Some(mut parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
         return Ok(None);
     };
+    let names: Vec<String> = parsed["mcpServers"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
     let servers = parsed
         .get_mut("mcpServers")
         .and_then(|s| s.as_object_mut())
@@ -324,7 +345,7 @@ pub fn gated_mcp_config_for_runtime(
     };
     let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose);
     audit_dropped_remote_entries(home_dir, &agent_id, &rewrite.dropped_remote, explore_lane);
-    Ok(Some(rewrite.config))
+    Ok(Some((rewrite.config, names)))
 }
 
 /// Does the employee's `.mcp.json` list any server that is not DuDuClaw's
@@ -346,6 +367,29 @@ pub fn mcp_json_lists_third_party_servers(
     Ok(parsed["mcpServers"]
         .as_object()
         .is_some_and(|m| m.keys().any(|n| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(n))))
+}
+
+/// Every server name the `.mcp.json` at `mcp_json` lists, DuDuClaw's own
+/// included (sorted). Read-only. Used by the Grok runtime, whose CLI
+/// also loads the `.mcp.json` of its working directory by itself: every name
+/// there must be shadowed in `.grok/config.toml` (2026-10-20).
+///
+/// No file ⇒ `Ok(None)`. Unreadable or malformed file ⇒ the same audited
+/// spawn-gate `Err` as [`gated_mcp_config_for_runtime`].
+pub fn mcp_json_server_names(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parsed["mcpServers"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+    ))
 }
 
 fn agent_id_of(mcp_json: &Path) -> String {

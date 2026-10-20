@@ -333,7 +333,11 @@ impl OpenAiCompatRuntime {
     ) -> Result<Option<RuntimeResponse>, String> {
         // Phase A — MCP tool registry (fail-safe: any spawn/handshake/list
         // failure logs a warn and yields None ⇒ plain-messages degrade).
-        let Some(registry) = crate::claude_runner::build_mcp_tool_registry(&context.agent_id).await
+        // `Err` (2026-10-20): the employee's `.mcp.json` third-party servers
+        // could not be gated — refuse (spawn-gate prefixed, stops failover),
+        // as the Codex runtime refuses its spawn.
+        let Some(registry) =
+            crate::claude_runner::build_mcp_tool_registry_checked(&context.agent_id).await?
         else {
             warn!(
                 agent = %context.agent_id,

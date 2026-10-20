@@ -1484,11 +1484,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 "Fixed/created .mcp.json for agent MCP server discovery"
             );
         }
-        // Codex third-party MCP servers: per-spawn upstream-env files a
-        // stopped gateway may have left behind (they hold credentials).
-        let swept = crate::runtime::codex::third_party::sweep_stale_env_files(&home_dir);
+        // Third-party MCP servers (Codex, Grok, Antigravity): per-spawn
+        // upstream-env files and directories a stopped gateway may have left
+        // behind (they hold credentials).
+        let swept = crate::runtime::third_party_mcp::env_files::sweep_stale_env_files(&home_dir);
         if swept > 0 {
-            info!(count = swept, "Removed stale Codex MCP proxy env files");
+            info!(count = swept, "Removed stale MCP proxy env files");
         }
     }
 

@@ -331,6 +331,24 @@ Codex 不讀 `.mcp.json`，所以 Codex spawn 用登記 duduclaw 的同一種方
 - 第三方伺服器自己的環境變數（它的憑證）放進 `<home>/tmp/mcp-proxy-env/`（0700 目錄）裡這次 spawn 專用、只有擁有者能讀的檔案，由 `DUDUCLAW_MCP_PROXY_ENV_FILE` 指向，不放進 `argv`，也不寫進 `.codex/config.toml`；gateway 啟動時會刪掉超過 15 分鐘的舊檔。所以只靠 `.codex/config.toml` 手動跑 `codex` 時，這些伺服器啟動時不會帶它們宣告的環境變數。`.codex/config.toml` 從建立那一刻起就是只有擁有者能讀（先寫暫存檔再改名），已存在的檔案也會重設成這個權限。`DUDUCLAW_MCP_API_KEY` 照上表處理（0.157 以上走 `env_vars`）。
 - Codex 會清空 MCP 子行程的環境，所以唯讀通道以 `env.DUDUCLAW_LANE` 傳給每個第三方伺服器。
 
+### Grok、Antigravity 與工具迴圈：員工的其他 MCP 伺服器（2026-10-20）
+
+其他自己登記 MCP 伺服器的 runtime 也有同樣的缺口，Grok 上的情況比少一台伺服器更糟。現在它們都和 Codex 走同一套管制改寫：stdio 伺服器經過 `duduclaw mcp-proxy`，遠端橋接照原樣，直接的 `url`／`type` 項目會被移除並記稽核，用 DuDuClaw 名稱的項目取代不了 gateway 自己的伺服器，名稱含英數字、`_`、`-` 以外字元（或超過 64 字）的項目不登記。
+
+**Grok。** Grok 1.0.62 會自己讀工作目錄的 `.mcp.json`（`grok inspect` 把它列為來源，內附文件也這樣寫）。對員工來說就是 `<agent_dir>/.mcp.json`，所以員工的其他伺服器其實一直由 Grok 直接啟動，沒有經過 proxy，也就沒有 `action_rules`、核准流程或唯讀通道的限制，`url` 項目也是直接連線。Grok 的 `.grok/config.toml` 優先於 `.mcp.json`，Grok 讀的不只這個（`grok inspect` 實測，內附的 `07-mcp-servers.md`、`05-configuration.md` 也這樣寫）：還有 `<cwd>/.cursor/mcp.json`（Cursor 相容，預設開啟），以及目錄在 git repository 裡時，一路到 repository 根目錄每一層的 `.mcp.json` 與 `.grok/config.toml`。它不讀 `<cwd>/.claude.json`，也不讀 `.claude/settings*.json` 的 `mcpServers`。這些來源的優先順序都低於工作目錄的 `.grok/config.toml`，所以 runtime 現在把它們列出的每個名稱都寫進這個檔：員工自己 `.mcp.json` 裡通過管制的伺服器寫成 spawn 範圍的 proxy（見下），其他的（包括 `duduclaw-pro` 這類 DuDuClaw 名稱的多餘項目）寫成停用項目，把原本那一項蓋掉。來源存在卻解析不了時拒絕 spawn。員工已經不再列出的伺服器，runtime 先前寫的項目會被移除；管理者手動加的項目不動，每次 spawn 記一次警告。員工目錄裡的 `.cursor/` 現在和 `.grok/` 一樣，員工不能改。
+
+**Antigravity。** agy 只讀 `.agents/mcp_config.json`（1.4.2 實測：`.mcp.json` 裡的伺服器從不啟動），所以這些伺服器之前就是不存在。現在每個通過管制的伺服器都登記在那裡，只寫 `command` 和 `args`，並在 `~/.gemini/antigravity-cli/settings.json` 加上 `mcp(<伺服器>/*)` 規則和它 schema 目錄的讀取規則；少了這兩條，agy 的 print 模式會拒絕呼叫。真正做決定的是 proxy，和 Codex 的 `default_tools_approval_mode = "auto"` 相同。
+
+**spawn 範圍的 proxy（Grok 與 Antigravity）。** 這兩個檔案都長期存在，同一個目錄的每次 spawn 共用，兩個 CLI 也都沒有單次執行的 MCP 覆寫，所以檔案裡不放任何單次 spawn 的東西，也不放上游憑證。每個伺服器登記成 `duduclaw mcp-proxy --spawn-scoped --server <名稱> -- …`。spawn 會把上游伺服器的環境變數寫進 `<home>/tmp/mcp-proxy-env/` 底下一個新的、只有擁有者能進的目錄，並用 `DUDUCLAW_MCP_PROXY_ENV_DIR` 指向它：agy 會把自己的環境交給它啟動的 MCP 子行程，Grok 則在載入時展開項目 `env` 裡的 `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}`。CLI 結束時目錄就刪掉，gateway 啟動時也會清掉超過 15 分鐘的殘留。spawn 範圍的 proxy 找不到目錄、或目錄裡沒有自己伺服器的檔案時，什麼都不啟動。所以這兩個 runtime 上的輔助呼叫拿不到員工的伺服器，管理者在該目錄手動執行 `grok` 或 `agy` 也拿不到。同一位員工同時跑兩次 spawn 時，寫進檔案的內容相同，各自有自己的目錄。Grok 的項目還放了 proxy 自己的身分（agent id、home，以及同一個檔案裡 `duduclaw` 項目本來就有的 MCP 憑證），不放 agent token。上游伺服器從 agent CLI 的允許清單環境加上它宣告的環境變數起跑，CLI 自己的廠商金鑰（`XAI_API_KEY`、`GEMINI_API_KEY`）不會給它。
+
+已知限制：agy 的權限規則加在作業系統使用者的設定檔裡，之後不會移除（管理者手動使用的工作區若出現同名伺服器，也會被自動放行）；`.grok/config.toml` 或 `.agents/mcp_config.json` 裡任何不是 DuDuClaw 寫的項目（`duduclaw` 除外）都照原樣保留，每次 spawn 記一次警告，CLI 會不經 proxy 啟動它；借用的工作根目錄裡，兩位員工若有同名伺服器會共用同一個項目，實際執行的那次 spawn 用自己的環境檔；spawn 讀完之後、Grok 自己讀之前才改動的 `.mcp.json`（或 `.cursor/mcp.json`）不在保護範圍內；兩個只差大小寫的伺服器名稱會拒絕 spawn（在不分大小寫的磁碟上會共用同一個環境檔）；Grok 使用者層級的 `~/.grok/config.toml` 在員工目錄之外，不會被覆蓋。Grok 的 Claude／Cursor 相容 MCP 讀取（`~/.claude.json`、`~/.cursor/mcp.json`、`<cwd>/.cursor/mcp.json`）在 DuDuClaw 啟動的每次 spawn 都以 `GROK_CLAUDE_MCPS_ENABLED=false`、`GROK_CURSOR_MCPS_ENABLED=false` 關閉（2026-10-20 owner 拍板；`grok inspect` 會把這些伺服器標成 `[disabled]`）。
+
+**openai-compat、Direct API 與本地推論。** 這三條路徑共用一個工具迴圈的建構函式（`claude_runner::build_mcp_tool_registry`），之前只掛載 DuDuClaw 的伺服器和 `agent.toml [[mcp.external]]`。現在也會掛載 `.mcp.json` 的伺服器，每個都照管制改寫的結果啟動，而且從 agent CLI 的允許清單環境起跑，不繼承 gateway 的環境，所以 gateway 環境裡其他廠商的金鑰不會流到第三方伺服器。這條路徑不寫任何檔案。唯讀通道裡它們照樣掛載，但帶 `DUDUCLAW_LANE=explore`，只有唯讀工具能通過 proxy，和 Claude 在唯讀通道的 spawn 相同；`agent.toml` 的外部伺服器在唯讀通道仍然不掛載，因為沒有東西管制它們。兩個檔案都宣告的同一台伺服器（同名，或指令與參數相同）只掛載一次，用 `agent.toml` 那一份，它帶著工具允許清單和 `secret://` 參照。
+
+**失敗時拒絕。** 有第三方伺服器時，`.mcp.json` 讀不到或解析失敗、或 spawn 閘門拒絕，這次執行就以 spawn 閘門錯誤停止，容錯切換也會停。openai-compat runtime 拒絕這次回覆；Direct API 與本地推論的工具迴圈改成不帶工具回答。Grok 的設定寫不進去時也會拒絕 spawn（少了停用項目，Grok 就會自己啟動沒有管制的伺服器）；`.mcp.json` 格式壞掉時，Grok 的輔助呼叫現在也會被拒絕，因為 Grok 自己會去讀那個檔。Antigravity 有第三方伺服器而登記失敗時拒絕 spawn。沒有任何第三方伺服器時，這些 spawn 都和以前一樣。Grok 和 Antigravity 在這些步驟之前就會拒絕唯讀通道。
+
+**尚未驗證。** 真正的 `grok -p` 對話（需要已登入的 Grok；設定是在暫時的 `HOME` 下用 `grok mcp doctor` 與 `grok inspect` 檢查的）；任何一個 runtime 的真實模型實際呼叫第三方工具；需要核准的第三方工具能否在 CLI 的時限內等到核准。
+
 ### 工作目錄覆寫涵蓋每個 CLI 後端（2026-09-28）
 
 呼叫端可以要求某一次 spawn 在 agent 自己目錄以外的地方執行。目前唯一的呼叫端是團隊組成器（team composer），它把角色成員放進員工的工作區，這樣成員寫出的檔案才不會在用完即丟的 scaffold 於成員結束的瞬間被回收時一起消失。

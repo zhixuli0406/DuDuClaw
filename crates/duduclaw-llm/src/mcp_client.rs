@@ -366,7 +366,51 @@ impl McpClient {
         timeout: Duration,
         stderr: std::process::Stdio,
     ) -> Result<Self, McpError> {
+        Self::spawn_and_handshake(command, args, envs, timeout, stderr, false).await
+    }
+
+    /// [`connect`](Self::connect) for a server that must not inherit this
+    /// process's environment (a third-party MCP server behind `duduclaw
+    /// mcp-proxy`, 2026-10-20): the child starts from the agent-CLI spawn
+    /// allowlist (`duduclaw_core::spawn_env::agent_cli_spawn_env_pairs`:
+    /// PATH, HOME, locale, proxy, temp dir; never a secret-shaped name) plus
+    /// `envs`, the same base environment a server started by the Claude CLI
+    /// sees. Without it every vendor key in the gateway's environment would
+    /// reach the server.
+    pub async fn connect_scrubbed(
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let mut all: Vec<(String, String)> = duduclaw_core::spawn_env::agent_cli_spawn_env_pairs()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        all.extend(envs.iter().cloned());
+        Self::spawn_and_handshake(
+            command,
+            args,
+            &all,
+            timeout,
+            std::process::Stdio::null(),
+            true,
+        )
+        .await
+    }
+
+    async fn spawn_and_handshake(
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        timeout: Duration,
+        stderr: std::process::Stdio,
+        clear_env: bool,
+    ) -> Result<Self, McpError> {
         let mut cmd = Command::new(command);
+        if clear_env {
+            cmd.env_clear();
+        }
         let workflow_home = if envs
             .iter()
             .any(|(key, _)| key == "DUDUCLAW_WORKFLOW_SESSION_ID")
@@ -1206,6 +1250,32 @@ impl ToolExecutor for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `connect_scrubbed` starts the child from the allowlist, not this
+    /// process's environment (cargo sets `CARGO_MANIFEST_DIR` on the test
+    /// process; it is not on the allowlist). The stub dumps its env and exits
+    /// before the handshake, so the connect itself fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_scrubbed_does_not_inherit_the_parent_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("env.txt");
+        let script = format!("env > '{}'", out.display());
+        let res = McpClient::connect_scrubbed(
+            "/bin/sh",
+            &["-c".to_string(), script],
+            &[("EXPLICIT_VAR".to_string(), "given".to_string())],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(res.is_err(), "the stub never answers the handshake");
+        let env = std::fs::read_to_string(&out).unwrap();
+        assert!(env.lines().any(|l| l == "EXPLICIT_VAR=given"), "{env}");
+        assert!(env.lines().any(|l| l.starts_with("PATH=")) || std::env::var_os("PATH").is_none());
+        if std::env::var_os("CARGO_MANIFEST_DIR").is_some() {
+            assert!(!env.contains("CARGO_MANIFEST_DIR="), "{env}");
+        }
+    }
 
     #[test]
     fn http_endpoint_host_is_compared_exactly_not_by_prefix() {

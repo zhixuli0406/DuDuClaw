@@ -484,6 +484,113 @@ registered duduclaw alone, and a server such as a broker connection listed in
 - Codex clears an MCP child's environment, so the explore lane is passed to
   each third-party server as `env.DUDUCLAW_LANE`.
 
+### Grok, Antigravity and the tool loop: the employee's other MCP servers (2026-10-20)
+
+The other runtimes that register MCP servers themselves had the same gap, and
+on Grok it was worse than a missing server. All of them now take the
+employee's `.mcp.json` servers through the same gated rewrite as Codex: stdio
+servers behind `duduclaw mcp-proxy`, remote bridges as they are, direct
+`url` / `type` entries removed and audited, DuDuClaw-named entries never
+replacing the gateway's own server, and a name made of anything other than
+letters, digits, `_` and `-` (at most 64) not registered.
+
+**Grok.** Grok 1.0.62 loads the `.mcp.json` of its working directory by
+itself (`grok inspect` lists it as a source and its bundled docs say so). For
+an employee that is `<agent_dir>/.mcp.json`, so its other servers were
+already being started by Grok without the proxy, which means without
+`action_rules`, approvals or the read-only lane, and `url` entries were
+connected directly. Grok reads more than that from the working directory
+(measured with `grok inspect`, and in its bundled `07-mcp-servers.md` /
+`05-configuration.md`): `<cwd>/.cursor/mcp.json` (Cursor compatibility, on by
+default), and, when the directory is inside a git repository, the `.mcp.json`
+and `.grok/config.toml` of every directory up to the repository root. It does
+not read `<cwd>/.claude.json` or the `mcpServers` of `.claude/settings*.json`.
+Every one of these ranks below the working directory's `.grok/config.toml`,
+so the runtime now writes every name found in them into that file: gated
+servers from the employee's own `.mcp.json` as spawn-scoped proxies (below),
+everything else as a disabled entry that hides the original (DuDuClaw-named
+extras such as `duduclaw-pro` included). A source that exists but cannot be
+parsed refuses the spawn. An entry the runtime wrote for a server the employee
+no longer lists is removed; entries an operator added by hand are left alone
+and logged on every spawn. `.cursor/` in an employee directory is now frozen
+for the employee like `.grok/`.
+
+**Antigravity.** agy reads `.agents/mcp_config.json` only (on 1.4.2 a
+`.mcp.json` server is never started), so these servers were simply missing.
+Each gated server is now registered there with `command` and `args` only,
+and gets an `mcp(<server>/*)` rule plus a read rule on its schema directory
+in `~/.gemini/antigravity-cli/settings.json`. Without those rules agy's
+print mode refuses the calls. The proxy decides, as with Codex's
+`default_tools_approval_mode = "auto"`.
+
+**Spawn-scoped proxies (Grok and Antigravity).** Both files are persistent,
+every spawn in the directory shares them, and neither CLI takes a per-run MCP
+override, so the file holds nothing per spawn and no upstream credential.
+Each server is registered as `duduclaw mcp-proxy --spawn-scoped --server
+<name> -- …`. The spawn writes the upstream servers' env into a new
+owner-only directory under `<home>/tmp/mcp-proxy-env/` and names it in
+`DUDUCLAW_MCP_PROXY_ENV_DIR`: agy hands its environment to the MCP children
+it starts, and Grok expands `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}` in the entry's
+`env`. The directory is deleted when the CLI exits; the gateway removes
+leftovers older than 15 minutes when it starts. A spawn-scoped proxy that
+finds no directory, or no file for its server, starts nothing. That is why a
+utility call on these runtimes gets none of the employee's servers, and why
+an operator running `grok` or `agy` by hand in the directory gets none
+either. Two spawns of the same employee write the same file content and each
+get their own directory. The Grok entry also holds the proxy's own identity
+(agent id, home, and the MCP credential the `duduclaw` entry of the same file
+already holds), never the agent token. The upstream server starts from the
+agent-CLI allowlisted environment plus its declared env, so the CLI's own
+vendor key (`XAI_API_KEY`, `GEMINI_API_KEY`) does not reach it.
+
+Known limits: the agy permission rules are added to the OS user's settings and
+never removed (a later server of the same name in a workspace an operator
+uses by hand is auto-approved there too); any entry in `.grok/config.toml` or
+`.agents/mcp_config.json` that DuDuClaw did not write (other than `duduclaw`)
+is kept as written and logged as a warning on every spawn, and the CLI starts
+it without the proxy; in a borrowed work root two employees with a server of
+the same name share one entry, and the spawn that runs uses its own env file
+for it; a `.mcp.json` (or `.cursor/mcp.json`) changed between the spawn's read
+and Grok's own read is not covered; two server names that differ only in
+letter case refuse the spawn (they would share one env file on a
+case-insensitive disk); Grok's user-level `~/.grok/config.toml` is outside
+the employee directory and not shadowed. Grok's Claude- and Cursor-compat MCP
+scanning (`~/.claude.json`, `~/.cursor/mcp.json`, `<cwd>/.cursor/mcp.json`) is
+switched off for every DuDuClaw spawn with `GROK_CLAUDE_MCPS_ENABLED=false` and
+`GROK_CURSOR_MCPS_ENABLED=false` (owner decision 2026-10-20; `grok inspect`
+then lists those servers as `[disabled]`).
+
+**openai-compat, Direct API and local inference.** These three share one
+tool-loop builder (`claude_runner::build_mcp_tool_registry`), which mounted
+DuDuClaw's server and `agent.toml [[mcp.external]]` only. It now also mounts
+the `.mcp.json` servers, each started as the gated rewrite produced it and
+from the agent-CLI allowlisted environment instead of the gateway's, so no
+other vendor key in the gateway's environment reaches a third-party server.
+Nothing is written to disk on this path. In the read-only lane they are
+mounted with `DUDUCLAW_LANE=explore`, so only read-only tools pass the
+proxy, as on a Claude spawn in the lane; `agent.toml` externals stay
+unmounted in the lane because nothing gates them. A server declared in both
+files (same name, or the same command and arguments) is mounted once, from
+`agent.toml`, which carries the tool allowlist and `secret://` references.
+
+**Failing closed.** When third-party servers are listed, a `.mcp.json` that
+cannot be read or parsed, or a spawn-gate refusal, stops the run with the
+spawn-gate error, which also stops failover. The openai-compat runtime
+refuses the reply; the Direct-API and local-inference loops answer without
+tools. On Grok a config that cannot be written also refuses the spawn (a
+missing shadow would let Grok start a server ungated), and a malformed
+`.mcp.json` now refuses Grok utility calls too, because Grok would read that
+file itself. On Antigravity a failed registration refuses the spawn when
+third-party servers are listed. With no third-party server listed every one
+of these spawns is the old one. Grok and Antigravity refuse the read-only
+lane before any of this runs.
+
+**Not verified.** A real `grok -p` turn (it needs a signed-in Grok; the
+config was checked with `grok mcp doctor` and `grok inspect` under a
+temporary `HOME`); a real model on any of these runtimes calling a
+third-party tool; an approval-gated third-party tool inside the CLIs' time
+limits.
+
 ### The working-directory override reaches every CLI backend (2026-09-28)
 
 A caller can ask for one spawn to run somewhere other than the agent's own

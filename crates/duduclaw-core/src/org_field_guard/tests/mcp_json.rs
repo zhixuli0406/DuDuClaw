@@ -131,6 +131,9 @@ fn cli_configuration_under_the_employee_directory_is_frozen_for_employees() {
         "agents/agnes/.gemini/settings.json",
         "agents/agnes/.grok/config.toml",
         "agents/agnes/.agents/mcp_config.json",
+        // Grok loads `<cwd>/.cursor/mcp.json` itself (2026-10-20).
+        "agents/agnes/.cursor/mcp.json",
+        "agents/agnes/.CURSOR/mcp.json",
         "agents/.ephemeral/eph-1/.claude/commands/x.md",
     ] {
         let p = h.join(rel);

@@ -52,7 +52,23 @@ pub(crate) const MCP_TOOL_GRANT: &str = "mcp(duduclaw/*)";
 /// A spelling that [`schema_read_grant`] refuses is left out with a `warn!`
 /// (the MCP grant is still returned): a broken or wider rule is worse than a
 /// missing one.
+#[cfg(test)]
 pub(crate) fn tool_grants(user_home: &Path) -> Vec<String> {
+    tool_grants_for(user_home, &[])
+}
+
+/// [`tool_grants`] plus the same two rules for each of `third_party` (the
+/// employee's third-party servers registered as spawn-scoped `duduclaw
+/// mcp-proxy` entries, 2026-10-20): `mcp(<server>/*)` and the read rule on
+/// that server's schema directory. Without them agy's print mode soft-denies
+/// every call to those servers, the same failure the duduclaw grant fixed.
+/// The proxy in front of each server is the gate (`action_rules`, the tool's
+/// annotations, approvals), as with Codex's `default_tools_approval_mode =
+/// "auto"`. A name that is not a plain name ([`is_portable_server_name`])
+/// gets no rule (such a server is never registered either).
+///
+/// [`is_portable_server_name`]: duduclaw_core::mcp_proxy_rewrite::is_portable_server_name
+pub(crate) fn tool_grants_for(user_home: &Path, third_party: &[String]) -> Vec<String> {
     let mut grants = vec![MCP_TOOL_GRANT.to_string()];
     let mut spellings = vec![user_home.to_path_buf()];
     if let Ok(canon) = user_home.canonicalize() {
@@ -60,19 +76,37 @@ pub(crate) fn tool_grants(user_home: &Path) -> Vec<String> {
             spellings.push(canon);
         }
     }
-    for home in spellings {
-        match schema_read_grant(&home) {
-            Ok(rule) => {
-                if !grants.contains(&rule) {
-                    grants.push(rule);
+    let servers: Vec<&str> = std::iter::once(MCP_SERVER_NAME)
+        .chain(
+            third_party
+                .iter()
+                .map(String::as_str)
+                .filter(|n| duduclaw_core::mcp_proxy_rewrite::is_portable_server_name(n))
+                .filter(|n| *n != MCP_SERVER_NAME),
+        )
+        .collect();
+    for server in &servers[1..] {
+        let rule = format!("mcp({server}/*)");
+        if !grants.contains(&rule) {
+            grants.push(rule);
+        }
+    }
+    for server in &servers {
+        for home in &spellings {
+            match schema_read_grant_for(home, server) {
+                Ok(rule) => {
+                    if !grants.contains(&rule) {
+                        grants.push(rule);
+                    }
                 }
+                Err(reason) => tracing::warn!(
+                    runtime = "antigravity",
+                    server = %server,
+                    reason = %reason,
+                    "not adding the agy read rule for an MCP schema directory; \
+                     agy may refuse to read tool schemas in print mode"
+                ),
             }
-            Err(reason) => tracing::warn!(
-                runtime = "antigravity",
-                reason = %reason,
-                "not adding the agy read rule for the duduclaw MCP schema directory; \
-                 agy may refuse to read tool schemas in print mode"
-            ),
         }
     }
     grants
@@ -82,12 +116,18 @@ pub(crate) fn tool_grants(user_home: &Path) -> Vec<String> {
 /// written. Refused: a path that is not valid UTF-8, or that contains `(`,
 /// `)`, `,`, `*`, CR or LF — agy's parsing of those characters inside a rule
 /// is not known, so such a rule could be broken or match more than intended.
+#[cfg(test)]
 pub(crate) fn schema_read_grant(home: &Path) -> Result<String, String> {
+    schema_read_grant_for(home, MCP_SERVER_NAME)
+}
+
+/// [`schema_read_grant`] for the schema directory of `server`.
+pub(crate) fn schema_read_grant_for(home: &Path, server: &str) -> Result<String, String> {
     let dir = home
         .join(".gemini")
         .join("antigravity-cli")
         .join("mcp")
-        .join(MCP_SERVER_NAME);
+        .join(server);
     let Some(text) = dir.to_str() else {
         return Err("the user home path is not valid UTF-8".to_string());
     };
@@ -441,10 +481,22 @@ pub(crate) struct SettingsOutcome {
 /// A symlinked settings file (dotfile managers) is written through to its
 /// resolved target rather than replaced by a plain file. A newly created file
 /// is 0600; an existing one keeps its mode.
+#[cfg(test)]
 pub(crate) fn ensure_user_settings(
     user_home: &Path,
     trusted_dir: Option<&Path>,
     auth: AntigravityAuth,
+) -> std::io::Result<SettingsOutcome> {
+    ensure_user_settings_for(user_home, trusted_dir, auth, &[])
+}
+
+/// [`ensure_user_settings`] that also grants the employee's third-party
+/// servers ([`tool_grants_for`]).
+pub(crate) fn ensure_user_settings_for(
+    user_home: &Path,
+    trusted_dir: Option<&Path>,
+    auth: AntigravityAuth,
+    third_party: &[String],
 ) -> std::io::Result<SettingsOutcome> {
     // Canonicalize so the stored path matches what agy compares against.
     let trusted = trusted_dir.map(|d| {
@@ -474,7 +526,7 @@ pub(crate) fn ensure_user_settings(
         let target = resolve_write_target(&path)?;
         let existing = read_optional(&target)?;
         let had_gemini_provider = had_gemini(existing.as_deref());
-        let grants = tool_grants(user_home);
+        let grants = tool_grants_for(user_home, third_party);
         match merge_user_settings(existing.as_deref(), trusted.as_deref(), auth, &grants) {
             Ok(MergedSettings {
                 content: None,
@@ -557,9 +609,22 @@ pub(crate) fn mcp_server_entry(command: &Path, args: &[String]) -> Option<Value>
 /// Pure merge of `servers` into an existing `mcp_config.json`, per server name.
 /// Other servers and unrelated keys are preserved; `Ok(None)` when every entry
 /// already matches. Content that is not a JSON object is refused.
+#[cfg(test)]
 pub(crate) fn merge_mcp_config(
     existing: Option<&str>,
     servers: &[(String, Value)],
+) -> Result<Option<String>, String> {
+    merge_mcp_config_pruning(existing, servers, None)
+}
+
+/// [`merge_mcp_config`] that also removes every entry `prune` recognises as
+/// managed by DuDuClaw (a spawn-scoped `duduclaw mcp-proxy`, see
+/// `runtime::third_party_mcp::is_managed_entry`) and not among `servers`:
+/// a third-party server the employee no longer lists. `None` ⇒ no pruning.
+pub(crate) fn merge_mcp_config_pruning(
+    existing: Option<&str>,
+    servers: &[(String, Value)],
+    prune: Option<&Path>,
 ) -> Result<Option<String>, String> {
     let mut cfg: Value = match existing.map(str::trim) {
         None | Some("") => serde_json::json!({}),
@@ -585,6 +650,19 @@ pub(crate) fn merge_mcp_config(
             changed = true;
         }
     }
+    if let Some(self_exe) = prune {
+        let stale: Vec<String> = map
+            .iter()
+            .filter(|(name, def)| {
+                !servers.iter().any(|(n, _)| n == *name) && is_managed_json_entry(def, self_exe)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in stale {
+            map.remove(&name);
+            changed = true;
+        }
+    }
     if !changed {
         return Ok(None);
     }
@@ -601,11 +679,51 @@ pub(crate) fn merge_mcp_config(
 /// a symlinked or non-regular `mcp_config.json`, and a planted temp name are
 /// all refused or bypassed, and nothing outside the work root is created,
 /// read or modified. The lock lives under `duduclaw_home` ([`mcp_lock_path`]).
+fn is_managed_json_entry(def: &Value, self_exe: &Path) -> bool {
+    let command = def.get("command").and_then(Value::as_str).unwrap_or("");
+    let args: Vec<String> = def
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    crate::runtime::third_party_mcp::is_managed_entry(command, &args, self_exe)
+}
+
 pub(crate) fn write_mcp_config(
     work_root: &Path,
     duduclaw_home: &Path,
     servers: &[(String, Value)],
 ) -> std::io::Result<bool> {
+    write_mcp_config_pruning(work_root, duduclaw_home, servers, None).map(|(wrote, _)| wrote)
+}
+
+/// The names of entries in `existing` that are neither `duduclaw` nor a
+/// spawn-scoped proxy of `self_exe`: agy starts them as written, without
+/// `duduclaw mcp-proxy`. Unparseable content ⇒ empty.
+pub(crate) fn unmanaged_mcp_entries(existing: Option<&str>, self_exe: &Path) -> Vec<String> {
+    existing
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("mcpServers").and_then(Value::as_object).cloned())
+        .map(|m| {
+            m.iter()
+                .filter(|(name, def)| {
+                    name.as_str() != MCP_SERVER_NAME && !is_managed_json_entry(def, self_exe)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`write_mcp_config`] with [`merge_mcp_config_pruning`]'s `prune`. Also
+/// returns [`unmanaged_mcp_entries`] of the file as read (judged against
+/// `prune`, or this binary).
+pub(crate) fn write_mcp_config_pruning(
+    work_root: &Path,
+    duduclaw_home: &Path,
+    servers: &[(String, Value)],
+    prune: Option<&Path>,
+) -> std::io::Result<(bool, Vec<String>)> {
     use crate::fs_safe::SafeDir;
     let root = SafeDir::open_root(work_root)?;
     let lock = mcp_lock_path(duduclaw_home, work_root);
@@ -617,9 +735,15 @@ pub(crate) fn write_mcp_config(
             .child_dir(AGENTS_DIR, true)?
             .ok_or_else(|| std::io::Error::other(".agents could not be created"))?;
         let existing = agents.read_file(MCP_CONFIG_FILE)?;
-        match merge_mcp_config(existing.as_deref(), servers) {
-            Ok(None) => Ok(false),
-            Ok(Some(out)) => agents.write_file_atomic(MCP_CONFIG_FILE, &out).map(|()| true),
+        let self_exe = prune
+            .map(Path::to_path_buf)
+            .unwrap_or_else(duduclaw_core::resolve_duduclaw_bin);
+        let unmanaged = unmanaged_mcp_entries(existing.as_deref(), &self_exe);
+        match merge_mcp_config_pruning(existing.as_deref(), servers, prune) {
+            Ok(None) => Ok((false, unmanaged)),
+            Ok(Some(out)) => agents
+                .write_file_atomic(MCP_CONFIG_FILE, &out)
+                .map(|()| (true, unmanaged)),
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         }
     })
