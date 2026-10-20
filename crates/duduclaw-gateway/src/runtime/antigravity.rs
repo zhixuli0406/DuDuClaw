@@ -573,6 +573,20 @@ impl AgentRuntime for AntigravityRuntime {
         let work_root: Option<std::path::PathBuf> =
             super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
 
+        // Third-party `.mcp.json` servers (2026-10-20, `third_party`): gated,
+        // registered as spawn-scoped `duduclaw mcp-proxy` entries, their
+        // upstream env in this spawn's own directory. A malformed
+        // `.mcp.json`, a spawn-gate refusal or an env directory that cannot
+        // be written refuses the spawn (`SPAWN_GATE_ERROR_PREFIX`). Empty for
+        // a utility call. `_third_party_env_dir` lives until agy has exited.
+        let third_party = third_party::prepare(
+            context.agent_dir.as_deref(),
+            &context.agent_id,
+            &context.home_dir,
+        )
+        .await?;
+        let third_party_names = third_party.names();
+
         // User settings, ONE locked read-merge-write:
         //   * trust the working root — agy shows an *interactive* "trust this
         //     workspace?" prompt for any dir not in `trustedWorkspaces`, which
@@ -588,8 +602,9 @@ impl AgentRuntime for AntigravityRuntime {
         match self.user_home() {
             Some(home) => {
                 let trusted = work_root.clone();
+                let names = third_party_names.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
-                    setup::ensure_user_settings(&home, trusted.as_deref(), auth)
+                    setup::ensure_user_settings_for(&home, trusted.as_deref(), auth, &names)
                 })
                 .await;
                 let failure = match outcome {
@@ -657,11 +672,27 @@ impl AgentRuntime for AntigravityRuntime {
             None => {}
         }
 
-        // MCP wiring: register the duduclaw MCP server in the workspace agy
-        // actually opens. Idempotent merge; warn-not-fatal — registration
-        // failing must not block the reply.
+        // MCP wiring: register the duduclaw MCP server (and the employee's
+        // third-party servers) in the workspace agy actually opens.
+        // Idempotent merge. Warn-not-fatal for the duduclaw entry alone —
+        // registration failing must not block the reply; with third-party
+        // servers a failed write refuses the spawn, so the employee never
+        // answers without the tools it was given. Entries this runtime wrote
+        // for servers no longer listed are pruned from the employee's own
+        // workspace only (a borrowed work root keeps its owner's entries).
         if let Some(ref root) = work_root {
-            if let Err(e) = self.ensure_duduclaw_mcp_config(root, &context.home_dir).await {
+            let own_root = context.agent_dir.as_deref() == Some(root.as_path());
+            let prune = third_party.self_exe.as_deref().filter(|_| own_root);
+            let entries = third_party.entries();
+            if let Err(e) = self
+                .ensure_duduclaw_mcp_config(root, &context.home_dir, &entries, prune)
+                .await
+            {
+                if !entries.is_empty() {
+                    return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                        "第三方 MCP 伺服器無法登記到 .agents/mcp_config.json（{e}），這次不啟動。"
+                    )));
+                }
                 tracing::warn!(
                     runtime = "antigravity",
                     agent = %context.agent_id,
@@ -670,6 +701,8 @@ impl AgentRuntime for AntigravityRuntime {
                 );
             }
         }
+        let third_party_env = third_party.env_dir.as_ref().map(|d| d.env_pair());
+        let _third_party_env_dir = third_party.env_dir;
         // The pre-2026-10 per-agent settings file was never read by agy and
         // holds a plaintext agent token: remove it when that is all it holds.
         if let Some(ref dir) = context.agent_dir {
@@ -750,6 +783,13 @@ impl AgentRuntime for AntigravityRuntime {
             cmd.env(k, v);
         }
         if let Some((k, v)) = super::round_task_env() {
+            cmd.env(k, v);
+        }
+        // This spawn's third-party upstream-env directory, inherited by each
+        // spawn-scoped proxy agy starts. Removed first so an ambient value
+        // can never stand in for it.
+        cmd.env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
+        if let Some((k, v)) = &third_party_env {
             cmd.env(k, v);
         }
         match auth {
@@ -941,21 +981,43 @@ impl AntigravityRuntime {
     }
 
     /// Ensure the duduclaw MCP server (absolute binary + `mcp-server`, no env)
-    /// is registered in `work_root`. Called before every spawn; idempotent.
+    /// is registered in `work_root`, with `third_party` (spawn-scoped proxy
+    /// entries, also env-free) next to it and, when `prune` names the
+    /// DuDuClaw binary, stale entries of that kind removed. Called before
+    /// every spawn; idempotent.
     async fn ensure_duduclaw_mcp_config(
         &self,
         work_root: &std::path::Path,
         duduclaw_home: &std::path::Path,
+        third_party: &[(String, serde_json::Value)],
+        prune: Option<&std::path::Path>,
     ) -> Result<bool, String> {
         let (command, args) = self.mcp_command();
         let Some(def) = setup::mcp_server_entry(&command, &args) else {
             return Err("duduclaw binary did not resolve to an absolute path".to_string());
         };
-        let mut servers = std::collections::HashMap::new();
-        servers.insert(setup::MCP_SERVER_NAME.to_string(), def);
-        Self::write_mcp_config(work_root, duduclaw_home, &servers).await
+        let mut list: Vec<(String, serde_json::Value)> =
+            vec![(setup::MCP_SERVER_NAME.to_string(), def)];
+        list.extend(
+            third_party
+                .iter()
+                .filter(|(name, _)| name != setup::MCP_SERVER_NAME)
+                .cloned(),
+        );
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        let root = work_root.to_path_buf();
+        let home = duduclaw_home.to_path_buf();
+        let prune = prune.map(std::path::Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            setup::write_mcp_config_pruning(&root, &home, &list, prune.as_deref())
+        })
+        .await
+        .map_err(|e| format!("mcp_config write task join failed: {e}"))?
+        .map_err(|e| e.to_string())
     }
 }
+
+pub(crate) mod third_party;
 
 // ── Tests ───────────────────────────────────────────────────────
 
