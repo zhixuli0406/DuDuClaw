@@ -493,7 +493,7 @@ const MCP_JSON_EMPLOYEE_REFUSAL: &str = "AI 員工不能修改自己目錄裡的
 
 /// Why an employee may not write its CLI configuration directories.
 const RUNTIME_CONFIG_EMPLOYEE_REFUSAL: &str = "AI 員工不能修改自己目錄下的 CLI 設定（任何一層的 \
-    .claude/、.claude.json、.mcp.json，以及最上層的 .codex/、.gemini/、.grok/、.agents/）：\
+    .claude/、.claude.json、.mcp.json，以及最上層的 .codex/、.gemini/、.grok/、.agents/、.cursor/）：\
     裡面的設定、hook、自訂指令與子代理會在 CLI 於該目錄啟動時被載入，等同可以執行指令。\
     放在員工目錄裡的專案也一樣：專案的 .claude/ 可以讀，不能寫。需要調整請找管理者。";
 
