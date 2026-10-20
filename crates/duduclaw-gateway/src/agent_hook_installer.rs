@@ -173,6 +173,87 @@ pub async fn ensure_agent_hook_settings(
     Ok(())
 }
 
+/// Grok project hook file holding DuDuClaw's guards, for an agent directory
+/// whose name is not a valid agent id (its command carries no `--agent`).
+pub(crate) const GROK_GUARD_HOOKS_FILE: &str = "duduclaw-guards.json";
+
+/// Distinguishes the temp files of concurrent writers in one process.
+static GROK_HOOKS_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `duduclaw-guards-<agent id>.json`: one file per employee, so employees
+/// sharing one working root never replace each other's identity. Grok loads
+/// every file there, and a deny from any guard wins, so a member also running
+/// another member's guard is only ever stricter.
+pub(crate) fn grok_guard_hooks_file_name(agent_dir: &Path) -> String {
+    match agent_dir.file_name().and_then(|n| n.to_str()) {
+        Some(id) if duduclaw_core::is_valid_agent_id(id) => format!("duduclaw-guards-{id}.json"),
+        _ => GROK_GUARD_HOOKS_FILE.to_string(),
+    }
+}
+
+/// The agent-file-guard and data-file-guard entries as a standalone hook
+/// document (`{"hooks": {"PreToolUse": [...]}}`) for the employee at
+/// `agent_dir`: the same descriptors [`ensure_agent_hook_settings`] merges
+/// into `.claude/settings.json`, identity and `--home` included.
+pub(crate) fn guard_hooks_document(agent_dir: &Path, duduclaw_bin: &Path) -> Value {
+    let agent_id = agent_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let home = home_of_agent_dir(agent_dir);
+    let mut root = json!({});
+    merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
+    merge_data_file_guard_hook(&mut root, duduclaw_bin);
+    root
+}
+
+/// Write [`guard_hooks_document`] to `<work_root>/.grok/hooks/`
+/// ([`grok_guard_hooks_file_name`]), Grok's own project hook directory
+/// (2026-10-20). Grok spawns turn its Claude-compat hook scanning off, which
+/// also stops it reading `<agent_dir>/.claude/settings.json`, so the guards
+/// are handed over in Grok's native format instead. Grok maps the Claude
+/// tool names in the matchers to its own and sends hooks the Claude
+/// `tool_name` / `tool_input` keys, so the subcommands read the same input.
+///
+/// `work_root` is the spawn's working directory (where Grok looks for project
+/// hooks); `agent_dir` decides the identity baked into the command. An
+/// up-to-date file is left alone; otherwise it is replaced through a temp
+/// file unique to this writer, so concurrent spawns never read half a file.
+pub(crate) async fn write_grok_guard_hooks(
+    work_root: &Path,
+    agent_dir: &Path,
+    duduclaw_bin: &Path,
+) -> std::io::Result<()> {
+    let dir = work_root.join(".grok").join("hooks");
+    let file_name = grok_guard_hooks_file_name(agent_dir);
+    let path = dir.join(&file_name);
+    let body = serde_json::to_string_pretty(&guard_hooks_document(agent_dir, duduclaw_bin))
+        .map_err(std::io::Error::other)?;
+    if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(&dir).await?;
+    let seq = GROK_HOOKS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+    tokio::fs::write(&tmp, &body).await?;
+    // Windows refuses to replace a file another process holds open (Grok
+    // reading it at startup); that clears within moments, so retry briefly.
+    let mut attempt = 0;
+    loop {
+        match tokio::fs::rename(&tmp, &path).await {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 4 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25 * attempt)).await;
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Delete a leftover pre-H10 `data-file-guard.sh` (and the now-empty
 /// `.claude/hooks/` directory, if we emptied it).
 ///
@@ -810,4 +891,116 @@ mod tests {
     // The guard's own behaviour (modes, extensions, CJK names, fail-open on a
     // malformed envelope) lives with the decision function it now shares with
     // the CLI subcommand: `duduclaw_core::data_file_guard`.
+
+    // ── Grok project hooks ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn grok_guard_hooks_carry_the_same_entries_as_the_claude_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("trader");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        let claude: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(agent_dir.join(".claude/settings.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        write_grok_guard_hooks(&agent_dir, &agent_dir, &fake_bin())
+            .await
+            .unwrap();
+        let path = agent_dir.join(".grok/hooks/duduclaw-guards-trader.json");
+        let grok: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_eq!(grok["hooks"], claude["hooks"]);
+        let cmd = grok["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("--agent \"trader\""), "{cmd}");
+        // Quoting of the home differs per platform (`\\` in a Windows path).
+        assert!(cmd.contains(" --home "), "{cmd}");
+    }
+
+    #[tokio::test]
+    async fn grok_guard_hooks_in_another_work_root_keep_the_employee_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("trader");
+        let root = tmp.path().join("shared-workspace");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        write_grok_guard_hooks(&root, &agent_dir, &fake_bin())
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(root.join(".grok/hooks/duduclaw-guards-trader.json"))
+            .await
+            .unwrap();
+        assert!(body.contains("--agent \\\"trader\\\""), "{body}");
+        assert!(!agent_dir.join(".grok").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_guard_hooks_rewrite_a_stale_file_and_leave_no_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("trader");
+        let hooks_dir = agent_dir.join(".grok/hooks");
+        tokio::fs::create_dir_all(&hooks_dir).await.unwrap();
+        let path = hooks_dir.join("duduclaw-guards-trader.json");
+        tokio::fs::write(&path, "{}").await.unwrap();
+        for _ in 0..2 {
+            write_grok_guard_hooks(&agent_dir, &agent_dir, &fake_bin())
+                .await
+                .unwrap();
+        }
+        let expected =
+            serde_json::to_string_pretty(&guard_hooks_document(&agent_dir, &fake_bin())).unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), expected);
+        let mut names = Vec::new();
+        let mut rd = tokio::fs::read_dir(&hooks_dir).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().to_string());
+        }
+        assert_eq!(names, vec!["duduclaw-guards-trader.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn grok_guard_hooks_of_employees_sharing_a_root_live_side_by_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("shared-workspace");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        for id in ["planner", "executor"] {
+            let agent_dir = tmp.path().join("agents").join(id);
+            tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+            write_grok_guard_hooks(&root, &agent_dir, &fake_bin())
+                .await
+                .unwrap();
+        }
+        for id in ["planner", "executor"] {
+            let body =
+                tokio::fs::read_to_string(root.join(format!(".grok/hooks/duduclaw-guards-{id}.json")))
+                    .await
+                    .unwrap();
+            assert!(body.contains(&format!("--agent \\\"{id}\\\"")), "{body}");
+        }
+        assert_eq!(
+            grok_guard_hooks_file_name(Path::new("/x/agents/bad name")),
+            GROK_GUARD_HOOKS_FILE
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_guard_hooks_report_a_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("trader");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        // `.grok` is a file, so the hook directory cannot be created.
+        tokio::fs::write(agent_dir.join(".grok"), "not a directory")
+            .await
+            .unwrap();
+        assert!(
+            write_grok_guard_hooks(&agent_dir, &agent_dir, &fake_bin())
+                .await
+                .is_err()
+        );
+    }
 }

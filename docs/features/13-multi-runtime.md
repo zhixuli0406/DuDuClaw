@@ -558,7 +558,16 @@ the employee directory and not shadowed. Grok's Claude- and Cursor-compat MCP
 scanning (`~/.claude.json`, `~/.cursor/mcp.json`, `<cwd>/.cursor/mcp.json`) is
 switched off for every DuDuClaw spawn with `GROK_CLAUDE_MCPS_ENABLED=false` and
 `GROK_CURSOR_MCPS_ENABLED=false` (owner decision 2026-10-20; `grok inspect`
-then lists those servers as `[disabled]`).
+then lists those servers as `[disabled]`). Grok's Claude- and Cursor-compat
+hook scanning is switched off the same way (`GROK_CLAUDE_HOOKS_ENABLED=false`,
+`GROK_CURSOR_HOOKS_ENABLED=false`), so the OS user's `~/.claude/settings.json`
+and `~/.cursor/hooks.json` hooks never run in an employee's turn. That also
+stops Grok reading the employee's `.claude/settings.json`, so DuDuClaw's
+`agent-file-guard` and `data-file-guard` are written before every spawn as a
+Grok project hook file, `<cwd>/.grok/hooks/duduclaw-guards-<agent>.json`, with the same
+matchers and commands; a spawn whose file cannot be written is refused. Other
+hooks an operator added to the employee's `.claude/settings.json` no longer run
+for Grok, and Grok's own global hooks in `~/.grok/hooks/` still do.
 
 **openai-compat, Direct API and local inference.** These three share one
 tool-loop builder (`claude_runner::build_mcp_tool_registry`), which mounted

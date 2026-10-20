@@ -92,6 +92,15 @@ const COMPAT_MCP_SOURCES_OFF: [(&str, &str); 2] = [
     ("GROK_CLAUDE_MCPS_ENABLED", "false"),
     ("GROK_CURSOR_MCPS_ENABLED", "false"),
 ];
+/// Spawn env turning off Grok's Claude- and Cursor-compat hook scanning
+/// (`[compat.claude] hooks` / `[compat.cursor] hooks`, both on by default;
+/// same reference). Without them an employee's turn runs the hooks of the OS
+/// user's `~/.claude/settings.json` and `~/.cursor/hooks.json`. Grok's Codex
+/// cells are reserved and read nothing in 1.0.62, so they are not set.
+const COMPAT_HOOK_SOURCES_OFF: [(&str, &str); 2] = [
+    ("GROK_CLAUDE_HOOKS_ENABLED", "false"),
+    ("GROK_CURSOR_HOOKS_ENABLED", "false"),
+];
 
 // ── Environment integrity & auth diagnostics ────────────────────
 //
@@ -358,6 +367,30 @@ impl AgentRuntime for GrokRuntime {
         let third_party_env = third_party.env_dir.as_ref().map(|d| d.env_pair());
         let _third_party_env_dir = third_party.env_dir;
 
+        // Guard hooks (2026-10-20): `COMPAT_HOOK_SOURCES_OFF` stops Grok
+        // running the OS user's Claude and Cursor hooks, and with them the
+        // employee's own `.claude/settings.json`, where DuDuClaw's file guards
+        // live. The same guards are written as Grok project hooks in the
+        // working directory. Fails closed: no employee turn (one with an
+        // agent directory) runs with the compat hooks off and its guards
+        // missing. Without an agent directory there was no guard file to
+        // lose. A borrowed root keeps one file per employee.
+        if let (Some(agent_dir), Some(root)) = (context.agent_dir.as_deref(), work_root.as_deref())
+        {
+            crate::agent_hook_installer::write_grok_guard_hooks(
+                root,
+                agent_dir,
+                &duduclaw_core::resolve_duduclaw_bin(),
+            )
+            .await
+            .map_err(|e| {
+                duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                    "could not write the Grok guard hooks under {}: {e}",
+                    root.display()
+                ))
+            })?;
+        }
+
         // MCP wiring: register the duduclaw MCP server before spawning. Grok is
         // MCP-native; the config format is verified (`[mcp_servers.duduclaw]`
         // TOML) but per-agent project-local discovery is the one residual — so we
@@ -481,6 +514,11 @@ impl AgentRuntime for GrokRuntime {
         // and `~/.cursor/mcp.json` itself, unproxied; the employee's own
         // servers reach it only through the gated `.grok/config.toml`.
         for (k, v) in COMPAT_MCP_SOURCES_OFF {
+            home_env.push((k.to_string(), v.to_string()));
+        }
+        // Likewise no Claude/Cursor-compat hooks; DuDuClaw's own guards were
+        // written above as Grok project hooks.
+        for (k, v) in COMPAT_HOOK_SOURCES_OFF {
             home_env.push((k.to_string(), v.to_string()));
         }
 
@@ -1071,6 +1109,8 @@ impl GrokRuntime {
 }
 
 pub(crate) mod third_party;
+#[cfg(all(test, unix))]
+mod hooks_live_tests;
 
 // ── Tests ───────────────────────────────────────────────────────
 
@@ -1301,6 +1341,13 @@ mod tests {
         let map: std::collections::HashMap<_, _> = COMPAT_MCP_SOURCES_OFF.into_iter().collect();
         assert_eq!(map.get("GROK_CLAUDE_MCPS_ENABLED"), Some(&"false"));
         assert_eq!(map.get("GROK_CURSOR_MCPS_ENABLED"), Some(&"false"));
+    }
+
+    #[test]
+    fn compat_hook_sources_are_switched_off() {
+        let map: std::collections::HashMap<_, _> = COMPAT_HOOK_SOURCES_OFF.into_iter().collect();
+        assert_eq!(map.get("GROK_CLAUDE_HOOKS_ENABLED"), Some(&"false"));
+        assert_eq!(map.get("GROK_CURSOR_HOOKS_ENABLED"), Some(&"false"));
     }
 
     // ── Auth-failure classification ─────────────────────────────
