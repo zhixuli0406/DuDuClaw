@@ -125,11 +125,14 @@ fn grants_cover_each_registered_server_and_nothing_else() {
     );
     assert!(grants.contains(&"mcp(duduclaw/*)".to_string()));
     assert!(grants.contains(&"mcp(masterlink/*)".to_string()));
-    assert!(
-        grants
-            .iter()
-            .any(|g| g.starts_with("read_file(") && g.ends_with("/mcp/masterlink)"))
-    );
+    // Built with `Path::join` so the separator matches the platform (`\` on Windows).
+    let schema_dir = home
+        .path()
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("mcp")
+        .join("masterlink");
+    assert!(grants.contains(&format!("read_file({})", schema_dir.to_string_lossy())));
     assert!(!grants.iter().any(|g| g.contains("bad name")));
     assert_eq!(grants.iter().filter(|g| *g == "mcp(duduclaw/*)").count(), 1);
     // No third-party server ⇒ exactly the old rules.
