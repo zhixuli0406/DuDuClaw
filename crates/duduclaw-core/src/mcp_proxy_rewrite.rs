@@ -34,6 +34,47 @@ pub const PROXY_UPSTREAM_ENV_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV";
 /// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_FILE_VAR`.
 pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
 
+/// Env var naming a per-spawn, owner-only **directory** that holds one
+/// `<server>.json` per third-party server ([`spawn_env_file_name`]), each the
+/// same JSON map as [`PROXY_UPSTREAM_ENV_VAR`]. Used by runtimes whose MCP
+/// registration is a persistent file shared by every spawn of the employee
+/// (Grok `.grok/config.toml`, Antigravity `.agents/mcp_config.json`,
+/// 2026-10-20): the file names only this variable (or nothing, when the CLI
+/// hands its own environment to MCP children), the spawn sets it. Read by a
+/// proxy started with [`PROXY_SPAWN_SCOPED_FLAG`]. Must match
+/// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_DIR_VAR`.
+pub const PROXY_UPSTREAM_ENV_DIR_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_DIR";
+
+/// `duduclaw mcp-proxy` flag for an entry that lives in a persistent CLI
+/// config: the proxy starts its upstream only when [`PROXY_UPSTREAM_ENV_DIR_VAR`]
+/// names a directory holding this server's file, and otherwise exits without
+/// starting anything. So the persistent entry is inert outside a DuDuClaw
+/// spawn that registered the server (a utility call, a manual CLI run, a spawn
+/// of another employee in the same directory).
+pub const PROXY_SPAWN_SCOPED_FLAG: &str = "--spawn-scoped";
+
+/// Longest third-party server name a runtime registers (same bound as
+/// `mcp_scan::is_valid_mcp_server_name`).
+pub const MAX_PORTABLE_SERVER_NAME_LEN: usize = 64;
+
+/// Is `name` usable as-is in every CLI config format DuDuClaw writes (a bare
+/// TOML key, a JSON key, an Antigravity permission rule) and as a file name?
+/// ASCII letters, digits, `_` and `-`, 1–64 characters.
+pub fn is_portable_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PORTABLE_SERVER_NAME_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The file name of `server`'s upstream env inside the
+/// [`PROXY_UPSTREAM_ENV_DIR_VAR`] directory, or `None` when the name is not
+/// [`is_portable_server_name`] (never a path separator, never `..`).
+pub fn spawn_env_file_name(server: &str) -> Option<String> {
+    is_portable_server_name(server).then(|| format!("{server}.json"))
+}
+
 /// Env names copied from the `.mcp.json` `duduclaw` entry onto every
 /// rewritten proxy entry, so the proxy process resolves the same home, the
 /// same agent identity and the same MCP credential the built-in server does.
@@ -287,6 +328,17 @@ mod tests {
         let r = rewrite_mcp_config_for_gate(&c, Path::new(exe), ProxyPurpose { redaction: true, tool_gate: false });
         assert!(r.dropped_remote.is_empty());
         assert_eq!(r.config["mcpServers"]["web"], c["mcpServers"]["web"]);
+    }
+
+    #[test]
+    fn spawn_env_file_names_are_plain_components() {
+        assert_eq!(spawn_env_file_name("masterlink").as_deref(), Some("masterlink.json"));
+        assert_eq!(spawn_env_file_name("a-b_C9").as_deref(), Some("a-b_C9.json"));
+        for bad in ["", "..", "a/b", "a\\b", "bad name", "dotted.name", "名稱", &"x".repeat(65)] {
+            assert!(spawn_env_file_name(bad).is_none(), "{bad:?}");
+            assert!(!is_portable_server_name(bad), "{bad:?}");
+        }
+        assert!(is_portable_server_name(&"x".repeat(64)));
     }
 
     #[test]
