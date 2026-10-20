@@ -83,6 +83,15 @@ const PROBE_TIMEOUT_SECS: u64 = 5;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
 /// Wall-clock cap for the single PTY one-shot retry (see [`GrokRuntime::pty_retry`]).
 const PTY_RETRY_TIMEOUT_SECS: u64 = 90;
+/// Spawn env turning off Grok's Claude- and Cursor-compat MCP scanning
+/// (`[compat.claude] mcps` / `[compat.cursor] mcps`, both on by default;
+/// env names from Grok 1.0.62's `26-config-reference.md`). Without them Grok
+/// starts the servers of `~/.claude.json`, `~/.cursor/mcp.json` and
+/// `<cwd>/.cursor/mcp.json` itself, with no proxy in the path.
+const COMPAT_MCP_SOURCES_OFF: [(&str, &str); 2] = [
+    ("GROK_CLAUDE_MCPS_ENABLED", "false"),
+    ("GROK_CURSOR_MCPS_ENABLED", "false"),
+];
 
 // ── Environment integrity & auth diagnostics ────────────────────
 //
@@ -467,6 +476,13 @@ impl AgentRuntime for GrokRuntime {
         // only via the documented `GROK_FOLDER_TRUST=0` env. Shared with the
         // PTY retry through `home_env` so both spawns behave identically.
         home_env.push(("GROK_FOLDER_TRUST".to_string(), "0".to_string()));
+        // Owner decision 2026-10-20: no Claude/Cursor-compat MCP sources.
+        // Grok otherwise starts the servers in the OS user's `~/.claude.json`
+        // and `~/.cursor/mcp.json` itself, unproxied; the employee's own
+        // servers reach it only through the gated `.grok/config.toml`.
+        for (k, v) in COMPAT_MCP_SOURCES_OFF {
+            home_env.push((k.to_string(), v.to_string()));
+        }
 
         // Auth: forward `XAI_API_KEY` when set (verified var — NOT GROK_API_KEY).
         // Interactive `grok login` sessions are honoured by the CLI itself.
@@ -1278,6 +1294,13 @@ mod tests {
         // Blank override is ignored.
         let env2 = build_home_env(std::path::Path::new("/Users/sam"), Some("  "));
         assert!(!env2.iter().any(|(k, _)| k == "GROK_HOME"));
+    }
+
+    #[test]
+    fn compat_mcp_sources_are_switched_off() {
+        let map: std::collections::HashMap<_, _> = COMPAT_MCP_SOURCES_OFF.into_iter().collect();
+        assert_eq!(map.get("GROK_CLAUDE_MCPS_ENABLED"), Some(&"false"));
+        assert_eq!(map.get("GROK_CURSOR_MCPS_ENABLED"), Some(&"false"));
     }
 
     // ── Auth-failure classification ─────────────────────────────

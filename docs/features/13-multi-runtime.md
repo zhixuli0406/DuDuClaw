@@ -553,9 +553,12 @@ the same name share one entry, and the spawn that runs uses its own env file
 for it; a `.mcp.json` (or `.cursor/mcp.json`) changed between the spawn's read
 and Grok's own read is not covered; two server names that differ only in
 letter case refuse the spawn (they would share one env file on a
-case-insensitive disk); Grok's user-level sources (`~/.claude.json`,
-`~/.cursor/mcp.json`, `~/.grok/config.toml`) are outside the employee
-directory and not shadowed.
+case-insensitive disk); Grok's user-level `~/.grok/config.toml` is outside
+the employee directory and not shadowed. Grok's Claude- and Cursor-compat MCP
+scanning (`~/.claude.json`, `~/.cursor/mcp.json`, `<cwd>/.cursor/mcp.json`) is
+switched off for every DuDuClaw spawn with `GROK_CLAUDE_MCPS_ENABLED=false` and
+`GROK_CURSOR_MCPS_ENABLED=false` (owner decision 2026-10-20; `grok inspect`
+then lists those servers as `[disabled]`).
 
 **openai-compat, Direct API and local inference.** These three share one
 tool-loop builder (`claude_runner::build_mcp_tool_registry`), which mounted

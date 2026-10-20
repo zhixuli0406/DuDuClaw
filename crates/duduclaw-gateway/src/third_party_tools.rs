@@ -35,9 +35,11 @@
 //! directly, no proxy in the path; a gated spawn and every other runtime
 //! remove them); `agent.toml [[mcp.external]]` servers of the tool loop
 //! (mounted directly, unmounted in the explore lane); servers an operator
-//! configured for a CLI outside DuDuClaw (Grok also reads `~/.claude.json`,
-//! `~/.cursor/mcp.json` and `~/.grok/config.toml` of the OS user,
-//! Antigravity `~/.gemini/config/mcp_config.json`); entries in an employee's
+//! configured for a CLI outside DuDuClaw (Grok also reads the OS user's
+//! `~/.grok/config.toml`, Antigravity `~/.gemini/config/mcp_config.json`;
+//! Grok's Claude/Cursor-compat sources `~/.claude.json` and
+//! `~/.cursor/mcp.json` are switched off per spawn, `runtime/grok.rs`
+//! `COMPAT_MCP_SOURCES_OFF`); entries in an employee's
 //! `.grok/config.toml` / `.agents/mcp_config.json` that DuDuClaw did not
 //! write (kept, warned on every spawn); a `.mcp.json` changed between the
 //! spawn's read and the CLI's own. Grok's project-level sources (`.mcp.json`
