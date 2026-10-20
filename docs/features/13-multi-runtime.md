@@ -567,7 +567,22 @@ stops Grok reading the employee's `.claude/settings.json`, so DuDuClaw's
 Grok project hook file, `<cwd>/.grok/hooks/duduclaw-guards-<agent>.json`, with the same
 matchers and commands; a spawn whose file cannot be written is refused. Other
 hooks an operator added to the employee's `.claude/settings.json` no longer run
-for Grok, and Grok's own global hooks in `~/.grok/hooks/` still do.
+for Grok, and Grok's own global hooks in `~/.grok/hooks/` still do. The
+Claude- and Cursor-compat rules, skills and agents cells are off too
+(`GROK_CLAUDE_RULES_ENABLED`, `GROK_CLAUDE_SKILLS_ENABLED`,
+`GROK_CLAUDE_AGENTS_ENABLED` and the three `GROK_CURSOR_*` twins, all `false`),
+so the OS user's `~/.claude/CLAUDE.md`, `~/.claude/rules/`, `~/.claude/skills/`
+and `~/.cursor/skills/` do not reach an employee's turn. The working
+directory's own `AGENTS.md` and `CLAUDE.md` are Grok-native and keep loading
+(with no git repository above the employee directory, Grok reads no parent
+directory's `AGENTS.md` or `CLAUDE.md`); rules and skills an operator put in
+the employee's `.claude/rules/` or `.claude/skills/` no longer load for Grok
+(DuDuClaw's own skills live in `SKILLS/` and are not affected). Known limits in
+Grok 1.0.62: `grok inspect` still lists `~/.claude/agents/` subagent
+definitions with the agents cell off; it lists no `.cursor/rules/` file whether
+the Cursor rules cell is on or off, so that cell is set without a verified
+effect; and Grok's native user sources (`~/.grok/`, `~/.agents/skills/`) are
+not compat cells and still load.
 
 **openai-compat, Direct API and local inference.** These three share one
 tool-loop builder (`claude_runner::build_mcp_tool_registry`), which mounted
