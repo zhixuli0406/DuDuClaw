@@ -499,13 +499,21 @@ itself (`grok inspect` lists it as a source and its bundled docs say so). For
 an employee that is `<agent_dir>/.mcp.json`, so its other servers were
 already being started by Grok without the proxy, which means without
 `action_rules`, approvals or the read-only lane, and `url` entries were
-connected directly. Grok ranks `.grok/config.toml` above `.mcp.json`, so the
-runtime now writes every name from `.mcp.json` into `.grok/config.toml`:
-gated servers as spawn-scoped proxies (below), everything else as a disabled
-entry that hides the `.mcp.json` one (DuDuClaw-named extras such as
-`duduclaw-pro` included). An entry the runtime wrote for a server
-the employee no longer lists is removed; entries an operator added by hand
-are left alone.
+connected directly. Grok reads more than that from the working directory
+(measured with `grok inspect`, and in its bundled `07-mcp-servers.md` /
+`05-configuration.md`): `<cwd>/.cursor/mcp.json` (Cursor compatibility, on by
+default), and, when the directory is inside a git repository, the `.mcp.json`
+and `.grok/config.toml` of every directory up to the repository root. It does
+not read `<cwd>/.claude.json` or the `mcpServers` of `.claude/settings*.json`.
+Every one of these ranks below the working directory's `.grok/config.toml`,
+so the runtime now writes every name found in them into that file: gated
+servers from the employee's own `.mcp.json` as spawn-scoped proxies (below),
+everything else as a disabled entry that hides the original (DuDuClaw-named
+extras such as `duduclaw-pro` included). A source that exists but cannot be
+parsed refuses the spawn. An entry the runtime wrote for a server the employee
+no longer lists is removed; entries an operator added by hand are left alone
+and logged on every spawn. `.cursor/` in an employee directory is now frozen
+for the employee like `.grok/`.
 
 **Antigravity.** agy reads `.agents/mcp_config.json` only (on 1.4.2 a
 `.mcp.json` server is never started), so these servers were simply missing.
@@ -537,11 +545,17 @@ vendor key (`XAI_API_KEY`, `GEMINI_API_KEY`) does not reach it.
 
 Known limits: the agy permission rules are added to the OS user's settings and
 never removed (a later server of the same name in a workspace an operator
-uses by hand is auto-approved there too); an entry an operator wrote by hand
-in `.grok/config.toml` under a `.mcp.json` name is kept as written and
-logged, so Grok starts it without the proxy; in a borrowed work root two
-employees with a server of the same name share one entry, and the spawn that
-runs uses its own env file for it.
+uses by hand is auto-approved there too); any entry in `.grok/config.toml` or
+`.agents/mcp_config.json` that DuDuClaw did not write (other than `duduclaw`)
+is kept as written and logged as a warning on every spawn, and the CLI starts
+it without the proxy; in a borrowed work root two employees with a server of
+the same name share one entry, and the spawn that runs uses its own env file
+for it; a `.mcp.json` (or `.cursor/mcp.json`) changed between the spawn's read
+and Grok's own read is not covered; two server names that differ only in
+letter case refuse the spawn (they would share one env file on a
+case-insensitive disk); Grok's user-level sources (`~/.claude.json`,
+`~/.cursor/mcp.json`, `~/.grok/config.toml`) are outside the employee
+directory and not shadowed.
 
 **openai-compat, Direct API and local inference.** These three share one
 tool-loop builder (`claude_runner::build_mcp_tool_registry`), which mounted
