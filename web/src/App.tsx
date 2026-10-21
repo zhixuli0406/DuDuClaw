@@ -311,7 +311,7 @@ export function App() {
                   redirect stand-in. Role gates are copied byte-for-byte from
                   where each page used to sit: `license` was the one
                   manager-level surface among them (`manageAdvancedNav`'s
-                  `personalHidden` license row), the other five were
+                  license row, visible on every edition), the other five were
                   admin-level (the P4-3 `/device` block below used to gate
                   `device`; the former `/manage` admin block gated the rest).
                   The bare index is admin-gated too — it matches the app's own
@@ -407,7 +407,7 @@ export function App() {
                       these on a Personal instance; `EditionGuard` closes the URL
                       too, so a bookmark or a typed path can't reach a console
                       whose feature that edition doesn't have. `personalHidden`
-                      surfaces (可靠性 / 授權 — 安全 / 日誌 dropped this gate
+                      surfaces (可靠性 — 授權 dropped it on 2026-10-21, 安全 / 日誌 dropped this gate
                       under D9) stay reachable on purpose — see the guard's own
                       note. */}
                   <Route element={<EditionGuard enterprise />}>

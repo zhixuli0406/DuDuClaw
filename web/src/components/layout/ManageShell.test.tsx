@@ -131,6 +131,15 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
     expect(screen.getByRole('link', { name: en['manage.inference'] })).toBeInTheDocument();
   });
 
+  // 2026-10-21: 授權 is the upgrade path itself — the edition is derived from
+  // the license tier, so hiding it on Personal left no way to activate an
+  // Enterprise key from the UI.
+  it('shows 授權 on the personal edition (upgrade path)', () => {
+    useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+    renderManage('/manage/billing');
+    expect(screen.getByRole('link', { name: en['manage.license'] })).toBeInTheDocument();
+  });
+
   // D9 (09-edition-split-features.md §4, 2026-08-12) revises the 2026-08-04
   // call: 安全 and 日誌 are no longer `personalHidden` — a single operator
   // still needs an emergency brake and a way to see what happened, so both
