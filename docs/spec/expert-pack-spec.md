@@ -24,6 +24,7 @@ The expert pack occupies the remaining slot: **the whole employee, installable**
 ├── expert.toml                     # manifest (normative, §3)
 ├── agents/<name>/soul.md           # persona (identity / duties / boundaries)
 ├── agents/<name>/agent.partial.toml# optional config fragment, deep-merged
+├── agents/<name>/CONTRACT.toml     # optional red lines; only [boundaries] is installed
 ├── skills/<name>/SKILL.md          # optional bundled skills (Agent Skills format)
 ├── wiki/<namespace>/*.md           # optional shared-knowledge pages
 ├── hooks/                          # optional lifecycle hooks (see §4 security)
@@ -78,7 +79,8 @@ Rules: unknown keys are ignored (forward compatibility); missing required keys f
 3. **Deep-merge, never clobber**: `agent.partial.toml` merges into generated config; existing same-name assets are a conflict (rename is an explicit flag, not a default).
 4. **Hooks are quarantined**: imported hooks land DISABLED and require an explicit operator trust action. A pack must function without its hooks enabled.
 5. **Scan foreign content**: personas/skills pass the host's content scanning before activation.
-6. **Removal is scoped**: uninstall removes pack-owned assets only; pre-existing assets are untouched.
+6. **Contracts are re-rendered, never copied**: an agent's `CONTRACT.toml` is scanned like any persona, parsed with the runtime contract parser, and written back with only `[boundaries]`; an existing contract on the target agent is a conflict, never overwritten. `must_not` rules also filter channel replies verbatim (see [contract-toml-spec](contract-toml-spec.md)), so packs should write them as descriptive sentences, not keywords.
+7. **Removal is scoped**: uninstall removes pack-owned assets only; pre-existing assets are untouched.
 
 ## 5. Interop mappings
 

@@ -60,7 +60,21 @@ The dashboard catalog surfaces the 22 premium industry team playbooks (clinic, p
 
 ## LLM-Guided Authoring
 
-No pack for your business? Describe one. The guided flow takes an industry hint, a free-text description (2,000 chars max), a team size (1–8), and suggested channels. The model emits a **strict JSON design** — it never writes files; the gateway materializes the design into a draft pack, validates it with a mirror of the manifest validator, and shows a preview. Up to 5 generate/revise rounds per draft; drafts expire after 24 hours.
+No pack for your business? Describe one. The guided flow takes an industry hint, a free-text description (2,000 chars max), a team size (1–8), and suggested channels. The model emits **strict JSON designs** — it never writes files; the gateway materializes them into a draft pack, validates it with a mirror of the manifest validator, and shows a preview. Up to 5 generate/revise rounds per draft; drafts expire after 24 hours.
+
+Generation runs in stages, so a team is no longer squeezed into one model reply:
+
+1. **Roster** — members, roles, responsibilities, reporting lines.
+2. **One call per member** — the member's role description (SOUL) with required sections (who I am, scope, workflow steps, at least two example answers, red lines each with a reason, when to hand over to a human, tone), the member's own skill(s) (when to use, steps, an output template, a worked example), and CONTRACT rules restated from the SOUL's red lines. Every worker gets at least one skill of its own; the front desk gets the routing skill.
+3. **Knowledge base** — at least four shared wiki pages: process SOP, glossary, compliance notes and FAQ. The compliance page always opens with a notice that law names, article numbers and figures need a human check; the prompt forbids inventing them.
+
+Stages 2 and 3 run two model calls at a time. Each stage checks its JSON and gets one retry with the problems fed back. A member that still fails keeps a stand-in role description built from the roster and no skills, and the preview says which member fell back (a *partial* draft); only a roster failure, or every member failing, fails the run. The dashboard starts the run in the background and polls its progress per stage; cancelling stops the model calls and keeps the previous round of the draft. The prompts carry a built-in worked example (one SOUL, one skill, one wiki page), plus an installed industry pack's manifest when one is cached, so a fresh install gets the same quality bar. Generated members no longer carry model-written `agent.partial.toml` settings.
+
+An optional switch lets the knowledge-base stage use web search (Claude CLI's `WebSearch`, which runs on the vendor side). Every other tool stays off, including `WebFetch`; the Direct API fallback has no tools.
+
+**Red lines in CONTRACT.toml are also an output filter.** `must_not` rules are matched word for word against every channel reply, and a match blocks the reply. Generated rules are therefore sanitized: wildcard characters are removed and rules shorter than 10 characters are dropped, so a single keyword such as "refund" can never block every reply that mentions refunds. Review the red lines in the preview before installing.
+
+The preview lists each member's skills and red lines, the knowledge-base pages, any partial-generation notes, and what the installer is predicted to skip (an AI staff member or wiki page with the same name already exists, or content that fails the safety scan). After install, the dashboard reports what actually landed per member (skills, CONTRACT.toml) and per wiki page; an existing same-name page is never overwritten and is reported instead.
 
 Two hard rules keep self-authoring safe: generated packs may **never contain hooks** (blocked in the prompt and post-validated, fail-closed), and installing a draft goes through the full CLI security pipeline above — LLM output is treated as external content, same as a stranger's zip.
 
@@ -79,6 +93,10 @@ Imported hooks are arbitrary commands wired into an agent runtime — a supply-c
 | Archive size (zip / download) | 50 MB |
 | Generated team size | 1–8 agents |
 | Generation rounds per draft | 5 |
+| Model calls in flight during generation | 2 |
+| One generation run | 25 min (then stopped) |
+| Knowledge-base pages per generated team | 4–10 |
+| Skills per generated member | 1–3 |
 | Draft lifetime | 24 h |
 | Hooks in generated packs | none (fail-closed) |
 | Export formats | `claude-plugin` (P0) |

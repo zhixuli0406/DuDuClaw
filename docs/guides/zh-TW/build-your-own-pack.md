@@ -15,11 +15,14 @@ my-first-pack/
 ├── agents/
 │   └── helper/
 │       ├── soul.md              # 員工 persona（身份/職責/邊界）
-│       └── agent.partial.toml   # 選填：deep-merge 進 agent.toml 的片段
+│       ├── agent.partial.toml   # 選填：deep-merge 進 agent.toml 的片段
+│       └── CONTRACT.toml        # 選填：紅線，只安裝 [boundaries]
 └── skills/
     └── greeting/
         └── SKILL.md             # 選填：隨包技能
 ```
+
+`CONTRACT.toml` 的格式見 [CONTRACT.toml 規格](../../spec/contract-toml-spec.md)。每條 `must_not` 也會逐字比對這位員工的通道回覆，回覆含有該字句就會被擋下，所以請寫成完整描述禁止行為的句子，不要只寫單一關鍵字。
 
 `expert.toml` 最小內容（欄位以 [features/32](../../features/zh-TW/32-expert-packs.md) 為準）：
 
