@@ -259,10 +259,14 @@ impl OpenAiCompatRuntime {
             .map_err(|e| format!("Failed to parse response: {e}"))?;
 
         let first_choice = parsed.choices.first();
-        let content = first_choice
-            .and_then(|c| c.message.as_ref())
-            .and_then(|m| m.content.clone())
-            .unwrap_or_default();
+        // Open models often inline their reasoning as a leading
+        // `<think>…</think>` block — never part of the answer.
+        let content = duduclaw_core::think_tags::strip_leading_think_block(
+            &first_choice
+                .and_then(|c| c.message.as_ref())
+                .and_then(|m| m.content.clone())
+                .unwrap_or_default(),
+        );
 
         // Empty content is an ERROR, never a success. Reasoning models (Grok,
         // DeepSeek R1) can burn the whole `max_tokens` budget on
@@ -547,7 +551,8 @@ fn build_tool_chat_request(
 /// round never reaches here — the loop only returns on a non-`ToolUse` stop or
 /// iteration-cap exhaustion.
 fn classify_final_text(resp: &ChatResponse, model: &str) -> Result<String, String> {
-    let text = resp.text();
+    // A leading inline `<think>` block is the model's reasoning, not answer.
+    let text = duduclaw_core::think_tags::strip_leading_think_block(&resp.text());
     if text.trim().is_empty() {
         return Err(format!(
             "Empty response from OpenAI-compat tool loop (model={model} stop={:?}); \
@@ -913,7 +918,8 @@ impl OpenAiCompatRuntime {
         }
 
         Ok(super::RuntimeResponse {
-            content,
+            // Same leading-`<think>` rule as the non-streaming path.
+            content: duduclaw_core::think_tags::strip_leading_think_block(&content),
             input_tokens,
             output_tokens,
             cache_read_tokens: 0,
@@ -1096,6 +1102,29 @@ mod tests {
         };
         let err = classify_final_text(&no_text, "deepseek-chat").unwrap_err();
         assert!(err.contains("Empty response"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_final_text_drops_a_leading_inline_think_block() {
+        let resp = |text: &str| ChatResponse {
+            parts: vec![ContentPart::Text(text.into())],
+            stop: StopReason::EndTurn,
+            usage: NormalizedUsage::default(),
+            model_used: "m".into(),
+            provider: "vllm".into(),
+        };
+        assert_eq!(
+            classify_final_text(&resp("<think>\n先算一下\n</think>\n\n答案是 4"), "qwen3").unwrap(),
+            "答案是 4"
+        );
+        // Only thinking, no answer: an empty response (failover), not "".
+        let err = classify_final_text(&resp("<think>still going"), "qwen3").unwrap_err();
+        assert!(err.contains("Empty response"), "got: {err}");
+        // A tag later in the answer is ordinary text.
+        assert_eq!(
+            classify_final_text(&resp("Use <think> tags"), "qwen3").unwrap(),
+            "Use <think> tags"
+        );
     }
 
     // ── capability filtering (deny-by-default; allow = intersection) ────────

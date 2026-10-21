@@ -2783,7 +2783,7 @@ pub async fn try_local_inference(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    call_local_inference(
+    let reply = call_local_inference(
         home_dir,
         prompt,
         system_prompt,
@@ -2791,7 +2791,15 @@ pub async fn try_local_inference(
         agent_id,
         capabilities,
     )
-    .await
+    .await?;
+    // Local reasoning models inline their thinking as a leading
+    // `<think>…</think>` block; it must not reach the user. A reply that
+    // was nothing but thinking is an empty answer (the caller falls back).
+    let answer = duduclaw_core::think_tags::strip_leading_think_block(&reply);
+    if answer.trim().is_empty() && !reply.trim().is_empty() {
+        return Err("local model returned only a <think> block and no answer".to_string());
+    }
+    Ok(answer)
 }
 
 async fn call_local_inference(
