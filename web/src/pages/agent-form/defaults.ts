@@ -213,8 +213,10 @@ export const DEFAULT_ADVANCED: {
 };
 
 /** v1.68 W1 — sections the advanced editor suggests (all have a reader). */
+// `prompt` and `budget` are no longer editable here (admin-only knobs with
+// their own handling server-side; see KV_REFUSED_SECTIONS).
 export const KV_SECTION_SUGGESTIONS: ReadonlyArray<string> = [
-  'prompt', 'fork', 'night_engine', 'evolution', 'budget', 'planner', 'goal_intent', 'skills',
+  'evolution', 'fork', 'night_engine', 'planner', 'goal_intent', 'skills',
 ];
 
 export const EFFORT_LEVELS: ReadonlyArray<Exclude<AgentEffort, ''>> = ['low', 'medium', 'high', 'xhigh', 'max'];

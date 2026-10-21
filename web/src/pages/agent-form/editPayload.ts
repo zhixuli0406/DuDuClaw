@@ -77,6 +77,7 @@ const KV_KEY_RE = /^[a-z0-9_]+$/;
  *  dedicated controls, are protected, or have no reader). */
 export const KV_REFUSED_SECTIONS: ReadonlySet<string> = new Set([
   'ptc', 'cultural_context', 'sticker', 'agent', 'capabilities', 'container', 'permissions', 'channels', 'odoo', 'mcp', 'runtime',
+  'prompt', 'os_watch', 'budget',
 ]);
 
 export type KvRowError = 'section' | 'key' | 'value';
@@ -168,18 +169,44 @@ const COMPUTER_USE_CONFIG_KEYS: ReadonlyArray<keyof ComputerUseConfig> = [
   'auto_confirm_trusted', 'keep_alive_minutes', 'takeover_idle_minutes',
 ];
 
+/** Built-in fallback for the admin-only dirty paths, used when the gateway
+ *  does not send `agents.inspect.admin_only_fields` (older gateway). Equals
+ *  the `kind: "change"` form paths of the shared authority table
+ *  (`__fixtures__/authority-fields.json`); an entry ending in "." is a
+ *  prefix. Budget raises (`loosen`) and role "main" (`role_main`) are judged
+ *  by the server only, so those paths are never listed here. */
+export const ADMIN_ONLY_FORM_PATHS_FALLBACK: ReadonlyArray<string> = [
+  'form.reports_to',
+  'form.department',
+  'caps.',
+  'form.sandbox_enabled',
+  'form.network_access',
+  'form.can_modify_own_soul',
+  'form.can_create_agents',
+  'form.can_send_cross_agent',
+  'form.can_schedule_tasks',
+  'form.can_modify_own_skills',
+  'v.guardrails_enabled',
+  'v.guardrails_block_secrets',
+  'v.public_trigger',
+  'odoo.',
+  'runtime.provider',
+  'runtime.fallback',
+  'osWatch.',
+  'adv.account_pool',
+];
+
+function matchesAdminPath(path: string, entry: string): boolean {
+  return entry.endsWith('.') ? path.startsWith(entry) : path === entry;
+}
+
 /** Dirty paths that touch the admin-only surface (backend refuses + audits
- *  them for non-admins). Used to drop them client-side for non-admin users. */
-export function isAdminOnlyPath(path: string): boolean {
-  return (
-    path === 'form.reports_to' ||
-    path === 'form.department' ||
-    path === 'form.can_modify_own_soul' ||
-    path === 'form.sandbox_enabled' ||
-    path === 'form.network_access' ||
-    path === 'v.public_trigger' ||
-    path.startsWith('caps.')
-  );
+ *  them for non-admins). Used to drop them client-side for non-admin users.
+ *  `serverList` is `agents.inspect.admin_only_fields`; when it is missing or
+ *  empty the built-in fallback applies. */
+export function isAdminOnlyPath(path: string, serverList?: ReadonlyArray<string> | null): boolean {
+  const list = serverList && serverList.length > 0 ? serverList : ADMIN_ONLY_FORM_PATHS_FALLBACK;
+  return list.some((entry) => matchesAdminPath(path, entry));
 }
 
 function has(dirty: ReadonlySet<string>, path: string): boolean {

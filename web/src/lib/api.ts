@@ -18,6 +18,17 @@ import {
   type PartialFanOut,
 } from './agent-fanout';
 import { migrateScanArgs, migrateApplyArgs } from './migrate';
+import type {
+  AgentFileDiffResponse,
+  AgentFileGetResponse,
+  AgentFileHistoryResponse,
+  AgentFileKey,
+  AgentFileListResponse,
+  AgentFilePendingResponse,
+  AgentFileSaveParams,
+  AgentFileSaveResponse,
+  ContractReviewFollowUp,
+} from './agent-files-types';
 import type { RunDetail, RunSummary } from './run-transcript';
 import type {
   AutopilotRule,
@@ -2944,6 +2955,10 @@ export interface AgentUpdateParamsV168 {
 
 /** v1.68 `agents.inspect` additions. Older gateways omit them. */
 export interface AgentDetailV168 {
+  /** Dashboard form dirty paths only an admin may change (entries ending in
+   *  "." are prefixes). Older gateways omit it; the page then uses
+   *  `ADMIN_ONLY_FORM_PATHS_FALLBACK`. */
+  admin_only_fields?: string[];
   heartbeat?: {
     cron?: string;
     cron_timezone?: string;
@@ -7606,14 +7621,56 @@ export const api = {
       client.call('skills.adopt', { skill_name: skillName, target_agent_id: targetAgentId }) as Promise<{ success: boolean }>,
   },
   contract: {
+    /** Viewer+ (the editor stays read-only unless the caller owns the
+     *  employee or is an admin). `hash` is the next `base_hash`. */
     get: (agentId: string) =>
       client.call('contract.get', { agent_id: agentId }) as Promise<
-        ContractConfig & { agent_id: string }
+        ContractConfig & { agent_id: string; hash?: string }
       >,
-    update: (agentId: string, fields: ContractConfig) =>
-      client.call('contract.update', { agent_id: agentId, ...fields }) as Promise<
-        ContractConfig & { success: boolean; agent_id: string; message: string }
+    /** The employee's owner or an admin. Answers with the shared save
+     *  envelope (`status` applied / needs_confirmation / blocked / …); a
+     *  follow-up confirm or review request resends the SAME contract with
+     *  `followUp` (action + analysis_id + reason). */
+    update: (agentId: string, fields: ContractConfig, followUp?: ContractReviewFollowUp) =>
+      client.call('contract.update', { agent_id: agentId, ...fields, ...(followUp ?? {}) }) as Promise<
+        AgentFileSaveResponse & Partial<ContractConfig> & { success?: boolean }
       >,
+  },
+  /** People editing an AI employee's profile files (SOUL / IDENTITY /
+   *  INSTRUCTIONS / CONTRACT; agent.toml read-only). Wire types live in
+   *  `./agent-files-types`. */
+  agentFiles: {
+    list: (agentId: string) =>
+      client.call('agent_files.list', { agent_id: agentId }) as Promise<AgentFileListResponse>,
+    get: (agentId: string, file: AgentFileKey, versionId?: string) =>
+      client.call('agent_files.get', {
+        agent_id: agentId,
+        file,
+        ...(versionId ? { version_id: versionId } : {}),
+      }) as Promise<AgentFileGetResponse>,
+    /** Compare `content` (or a stored `version_id`) against the current file
+     *  (or `against`, another version id). */
+    diff: (
+      agentId: string,
+      file: AgentFileKey,
+      source: { content?: string; version_id?: string; against?: string },
+    ) =>
+      client.call('agent_files.diff', { agent_id: agentId, file, ...source }) as Promise<AgentFileDiffResponse>,
+    history: (agentId: string, file: AgentFileKey) =>
+      client.call('agent_files.history', { agent_id: agentId, file }) as Promise<AgentFileHistoryResponse>,
+    save: (params: AgentFileSaveParams) =>
+      client.call('agent_files.save', { ...params }) as Promise<AgentFileSaveResponse>,
+    rollback: (
+      params: { agent_id: string; file: AgentFileKey; version_id: string; base_hash: string } & Omit<
+        ContractReviewFollowUp,
+        'base_hash'
+      >,
+    ) => client.call('agent_files.rollback', { ...params }) as Promise<AgentFileSaveResponse>,
+    withdraw: (approvalId: string) =>
+      client.call('agent_files.withdraw', { approval_id: approvalId }) as Promise<{ withdrawn: boolean }>,
+    /** Admins: what an `agent_file_change` approval asks for. */
+    pendingGet: (approvalId: string) =>
+      client.call('agent_files.pending_get', { approval_id: approvalId }) as Promise<AgentFilePendingResponse>,
   },
   redaction: {
     get: () => client.call('redaction.get') as Promise<RedactionConfig>,
