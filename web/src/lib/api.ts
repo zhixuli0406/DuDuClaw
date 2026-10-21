@@ -3516,6 +3516,32 @@ export interface GalleryCard {
   lead_agent_name?: string | null;
 }
 
+/** One roster member in a generated draft preview. */
+export interface ExpertDraftAgent {
+  name: string;
+  role: string;
+  display_name: string;
+  reports_to: string;
+  soul_excerpt: string;
+  /** Length of the member's role description (characters). */
+  soul_chars?: number;
+  /** true ⇒ this member's content failed and a stand-in was used. */
+  placeholder?: boolean;
+  /** Skills installed on THIS member. */
+  skills?: Array<{ name: string; description: string }>;
+  /** Behaviour red lines (also filter replies verbatim). */
+  red_lines?: string[];
+  must_always?: string[];
+}
+
+/** Something the installer is predicted to skip (`install_warnings`). */
+export interface ExpertInstallWarning {
+  kind: 'agent' | 'skill' | 'wiki' | 'contract' | 'name' | 'trigger';
+  name: string;
+  reason: 'conflict' | 'blocked';
+  detail: string;
+}
+
 /** Preview of an LLM-generated expert-pack draft (`experts.generate`). */
 export interface ExpertDraftPreview {
   slug: string;
@@ -3524,23 +3550,70 @@ export interface ExpertDraftPreview {
   version: string;
   prompts: string[];
   channels: string[];
-  agents: Array<{
-    name: string;
-    role: string;
-    display_name: string;
-    reports_to: string;
-    soul_excerpt: string;
-  }>;
+  agents: ExpertDraftAgent[];
   skills: string[];
   wiki_titles: string[];
+  wiki_pages?: Array<{
+    file: string;
+    title: string;
+    chars: number;
+    /** Written with web search available: must be reviewed before install. */
+    web_research?: boolean;
+    /** Page text, sent only for pages that need review. */
+    content?: string | null;
+  }>;
+  /** Partial-generation notes (members / knowledge base that fell back). */
+  notes?: string[];
+  install_warnings?: ExpertInstallWarning[];
 }
 
-/** `experts.generate` / `experts.generate_revise` result envelope. */
-export interface ExpertDraftResult {
+export type ExpertJobStatus = 'running' | 'done' | 'partial' | 'failed' | 'cancelled';
+export type ExpertStepStatus = 'pending' | 'running' | 'done' | 'failed';
+
+/** Background generation job progress (`experts.generate_status`). */
+export interface ExpertGenerationJob {
+  status: ExpertJobStatus;
+  kind: string;
+  progress: {
+    roster: ExpertStepStatus;
+    members: Array<{ name: string; display_name: string; status: ExpertStepStatus; error?: string }>;
+    wiki: ExpertStepStatus;
+    assemble: ExpertStepStatus;
+  };
+  error?: string;
+  notes?: string[];
+  started_at: string;
+  updated_at: string;
+}
+
+/** `experts.generate_status` (and the background start) envelope. The draft
+ *  fields are present once the job finished with a usable draft. */
+export interface ExpertDraftStatus {
   draft_id: string;
-  rounds: number;
-  rounds_left: number;
-  preview: ExpertDraftPreview;
+  status: ExpertJobStatus;
+  job?: ExpertGenerationJob | null;
+  rounds?: number;
+  rounds_left?: number;
+  notes?: string[];
+  preview?: ExpertDraftPreview;
+}
+
+/** What `experts.install_draft` actually placed. */
+export interface ExpertInstallPlacement {
+  agents: Array<{
+    name: string;
+    /** Installed agent id (the whole team may be renamed on collision). */
+    id?: string;
+    display_name: string;
+    /** The display name was changed to avoid another employee's name. */
+    renamed?: boolean;
+    installed: boolean;
+    skills: Array<{ name: string; installed: boolean }>;
+    /** null ⇒ the draft had no red lines for this member. */
+    contract: boolean | null;
+  }>;
+  wiki: Array<{ file: string; status: 'installed' | 'conflict' | 'blocked' | 'skipped' }>;
+  complete: boolean;
 }
 
 // ── EVO: per-agent advanced [evolution] ─────────────────────────
@@ -5821,31 +5894,49 @@ export const api = {
         slug: string;
         output: string;
       }>,
-    /** LLM-generate a custom expert-pack draft from the guided form. */
+    /** Start a staged LLM generation of a custom expert-pack draft in the
+     *  background; poll `generateStatus` for progress and the preview. */
     generate: (req: {
       industry_hint?: string;
       description: string;
       team_size?: number;
       channels?: string[];
-    }) => client.call('experts.generate', req, false, 320000) as Promise<ExpertDraftResult>,
-    /** Regenerate a draft with feedback (max 5 total rounds). */
+      research?: boolean;
+    }) =>
+      client.call('experts.generate', { ...req, background: true }) as Promise<ExpertDraftStatus>,
+    /** Regenerate a draft with feedback in the background (max 5 total rounds). */
     generateRevise: (draftId: string, feedback: string) =>
-      client.call(
-        'experts.generate_revise',
-        { draft_id: draftId, feedback },
-        false,
-        320000,
-      ) as Promise<ExpertDraftResult>,
-    /** Install a generated draft via the full security-scanned pipeline. */
-    installDraft: (draftId: string, attachUnder?: string) =>
+      client.call('experts.generate_revise', {
+        draft_id: draftId,
+        feedback,
+        background: true,
+      }) as Promise<ExpertDraftStatus>,
+    /** Progress of the draft's latest generation job (+ preview once done). */
+    generateStatus: (draftId: string) =>
+      client.call('experts.generate_status', { draft_id: draftId }) as Promise<ExpertDraftStatus>,
+    /** Stop the draft's running generation job. */
+    generateCancel: (draftId: string) =>
+      client.call('experts.generate_cancel', { draft_id: draftId }) as Promise<{
+        cancelled: boolean;
+        state: 'cancelled' | 'installing' | 'not_running';
+      }>,
+    /** Install a generated draft via the full security-scanned pipeline.
+     *  `reviewedWebPages` confirms the admin read the web-search pages (the
+     *  gateway refuses such drafts without it). */
+    installDraft: (draftId: string, attachUnder?: string, reviewedWebPages?: boolean) =>
       client.call(
         'experts.install_draft',
-        { draft_id: draftId, ...(attachUnder ? { attach_under: attachUnder } : {}) },
+        {
+          draft_id: draftId,
+          ...(attachUnder ? { attach_under: attachUnder } : {}),
+          ...(reviewedWebPages ? { reviewed_web_pages: true } : {}),
+        },
         false,
         320000,
       ) as Promise<{
         success: boolean;
         output: string;
+        placement?: ExpertInstallPlacement;
       }>,
   },
   gallery: {

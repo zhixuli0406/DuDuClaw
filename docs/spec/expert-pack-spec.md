@@ -24,6 +24,7 @@ The expert pack occupies the remaining slot: **the whole employee, installable**
 ├── expert.toml                     # manifest (normative, §3)
 ├── agents/<name>/soul.md           # persona (identity / duties / boundaries)
 ├── agents/<name>/agent.partial.toml# optional config fragment, deep-merged
+├── agents/<name>/CONTRACT.toml     # optional red lines; only [boundaries] is installed
 ├── skills/<name>/SKILL.md          # optional bundled skills (Agent Skills format)
 ├── wiki/<namespace>/*.md           # optional shared-knowledge pages
 ├── hooks/                          # optional lifecycle hooks (see §4 security)
@@ -75,10 +76,11 @@ Rules: unknown keys are ignored (forward compatibility); missing required keys f
 
 1. **Fence the archive**: reject path traversal (zip-slip), cap unpacked size.
 2. **Topological order**: create agents parents-before-children per `reports_to`.
-3. **Deep-merge, never clobber**: `agent.partial.toml` merges into generated config; existing same-name assets are a conflict (rename is an explicit flag, not a default).
+3. **Deep-merge, never clobber**: `agent.partial.toml` merges into generated config; existing same-name assets are never overwritten. When an agent id is taken, the DuDuClaw installer renames the whole team with one suffix (`-2`, …; `-imported` first with `--rename`) so `reports_to` stays inside the team, and a display name or trigger another employee already answers to becomes 「name（id）」. Both are reported.
 4. **Hooks are quarantined**: imported hooks land DISABLED and require an explicit operator trust action. A pack must function without its hooks enabled.
 5. **Scan foreign content**: personas/skills pass the host's content scanning before activation.
-6. **Removal is scoped**: uninstall removes pack-owned assets only; pre-existing assets are untouched.
+6. **Contracts are re-rendered, never copied**: an agent's `CONTRACT.toml` is scanned like any persona, parsed with the runtime contract parser, sanitized (wildcards removed; `must_not` rules under 10 characters or repeating the persona's own handoff/example wording dropped and reported), and written back with only `[boundaries]`; an existing contract on the target agent is a conflict, never overwritten. `must_not` rules also filter channel replies verbatim (see [contract-toml-spec](contract-toml-spec.md)), so packs should write them as descriptive sentences, not keywords.
+7. **Removal is scoped**: uninstall removes pack-owned assets only; pre-existing assets are untouched.
 
 ## 5. Interop mappings
 
