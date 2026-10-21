@@ -162,7 +162,7 @@ where
                 }
                 raw.push_str(text);
             }
-            ContentPart::Reasoning { .. } => {}
+            ContentPart::Reasoning { .. } | ContentPart::RedactedReasoning { .. } => {}
             _ => return Err(CausalExtractionError::InvalidResponse),
         }
     }

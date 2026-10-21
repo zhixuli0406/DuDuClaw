@@ -347,7 +347,7 @@ fn proposer_request(req: &ChatRequest, max_tokens_cap: u32) -> ChatRequest {
                     ContentPart::ToolResult { content, .. } => {
                         Some(ContentPart::Text(content.clone()))
                     }
-                    ContentPart::Reasoning { .. } => None,
+                    ContentPart::Reasoning { .. } | ContentPart::RedactedReasoning { .. } => None,
                 })
                 .collect();
             if parts.is_empty() {

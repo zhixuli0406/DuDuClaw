@@ -260,7 +260,9 @@ pub fn build_request_body_with(
                         // Tool calls never appear in user messages; reasoning
                         // is never replayed to compat providers (DeepSeek
                         // rejects echoed reasoning_content).
-                        ContentPart::ToolCall { .. } | ContentPart::Reasoning { .. } => {}
+                        ContentPart::ToolCall { .. }
+                        | ContentPart::Reasoning { .. }
+                        | ContentPart::RedactedReasoning { .. } => {}
                     }
                 }
                 if has_image {

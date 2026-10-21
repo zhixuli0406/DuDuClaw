@@ -21,7 +21,7 @@ use crate::http::{http_client, retry_after_of};
 use crate::provider::{ApiAuth, ChatProvider, split_model_id};
 use crate::sse::{SseParser, drive_sse, sse_data};
 use crate::types::{
-    CacheHint, ChatRequest, ChatResponse, ContentPart, NormalizedUsage, ReasoningHint, Role,
+    CacheHint, ChatRequest, ChatResponse, ContentPart, NormalizedUsage, Role,
     StopReason, StreamEvent, ToolChoice,
 };
 
@@ -80,6 +80,10 @@ fn part_to_block(part: &ContentPart) -> Value {
         ContentPart::Reasoning { text, signature } => json!({
             "type": "thinking", "thinking": text,
             "signature": signature.clone().unwrap_or_default()
+        }),
+        // Encrypted thinking goes back byte-for-byte, like the signature.
+        ContentPart::RedactedReasoning { data } => json!({
+            "type": "redacted_thinking", "data": data
         }),
     }
 }
@@ -161,11 +165,9 @@ pub(crate) fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
             ToolChoice::Tool(name) => json!({"type": "tool", "name": name}),
         };
     }
-    if req.reasoning != ReasoningHint::Off {
-        if let Some(budget) = req.reasoning.budget_tokens() {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-        }
-    }
+    // Per model family: legacy `budget_tokens`, adaptive + effort, and
+    // `display` only where the model thinks anyway. Never `disabled`.
+    super::anthropic_thinking::apply_thinking(&mut body, req, bare_model);
     // P1/WP-3: native per-call effort. `output_config.effort` is GA on the
     // Messages API (no beta header) and takes low|medium|high|xhigh|max —
     // verified against the bundled `claude-api` skill reference, 2026-09-24.
@@ -248,7 +250,14 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
                     .and_then(Value::as_str)
                     .map(String::from),
             }),
-            // redacted_thinking and unknown block types are skipped.
+            Some("redacted_thinking") => parts.push(ContentPart::RedactedReasoning {
+                data: block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            // Unknown block types are skipped.
             _ => {}
         }
     }
@@ -323,6 +332,14 @@ impl AnthropicSse {
                     Some("thinking") => self.parts.push(ContentPart::Reasoning {
                         text: String::new(),
                         signature: None,
+                    }),
+                    // Arrives whole in the start event; no deltas follow.
+                    Some("redacted_thinking") => self.parts.push(ContentPart::RedactedReasoning {
+                        data: block
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                     }),
                     _ => {}
                 }
@@ -459,11 +476,15 @@ impl SseParser for AnthropicSse {
 impl AnthropicProvider {
     async fn send(&self, req: &ChatRequest, stream: bool) -> Result<reqwest::Response, LlmError> {
         let body = build_request_body(req, stream);
-        let response = http_client()
+        let mut http = http_client()
             .post(self.messages_url())
             .header("x-api-key", &self.auth.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(beta) = super::anthropic_thinking::thinking_beta_header(&body) {
+            http = http.header("anthropic-beta", beta);
+        }
+        let response = http
             .json(&body)
             .send()
             .await
@@ -509,7 +530,7 @@ impl ChatProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatMessage, SystemBlock, ToolDef};
+    use crate::types::{ChatMessage, ReasoningHint, SystemBlock, ToolDef};
 
     fn req_with_history(n: usize) -> ChatRequest {
         let mut req = ChatRequest::new("anthropic/claude-sonnet-5");
@@ -703,15 +724,24 @@ mod tests {
 
     #[test]
     fn build_reasoning_hint_and_response_format() {
+        // Sonnet 5 is adaptive: the hint becomes adaptive + effort, never a
+        // `budget_tokens` (which the API rejects with a 400 there).
         let mut req = ChatRequest::new("anthropic/claude-sonnet-5");
         req.reasoning = ReasoningHint::Medium;
         req.response_format = Some(json!({"type": "object"}));
+        let body = build_request_body(&req, false);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert_eq!(body["output_format"]["type"], "json_schema");
+        // A legacy model keeps the budget shape.
+        let mut req = ChatRequest::new("anthropic/claude-haiku-4-5");
+        req.reasoning = ReasoningHint::Medium;
         let body = build_request_body(&req, false);
         assert_eq!(
             body["thinking"],
             json!({"type": "enabled", "budget_tokens": 8192})
         );
-        assert_eq!(body["output_format"]["type"], "json_schema");
+        assert!(body.get("output_config").is_none(), "{body}");
         // Off → field absent.
         let body = build_request_body(&ChatRequest::new("anthropic/m"), false);
         assert!(body.get("thinking").is_none());
@@ -828,6 +858,58 @@ mod tests {
         };
         assert!(matches!(&resp.parts[0],
             ContentPart::Reasoning { text, signature } if text == "step 1" && signature.as_deref() == Some("sigX")));
+    }
+
+    #[test]
+    fn redacted_thinking_round_trips_verbatim() {
+        // Non-streaming parse keeps the ciphertext …
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "s1"},
+                {"type": "redacted_thinking", "data": "EncRypTed=="},
+                {"type": "tool_use", "id": "tu_1", "name": "run", "input": {}}
+            ]
+        });
+        let resp = parse_response(&body).expect("parse");
+        assert_eq!(
+            resp.parts[1],
+            ContentPart::RedactedReasoning {
+                data: "EncRypTed==".into()
+            }
+        );
+        // … and the next request echoes every block unchanged, in order.
+        let mut req = ChatRequest::new("anthropic/claude-sonnet-4-5");
+        req.messages.push(ChatMessage::user("go"));
+        req.messages.push(ChatMessage {
+            role: Role::Assistant,
+            parts: resp.parts.clone(),
+        });
+        let out = build_request_body(&req, false);
+        let asst = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(asst[0], json!({"type": "thinking", "thinking": "plan", "signature": "s1"}));
+        assert_eq!(asst[1], json!({"type": "redacted_thinking", "data": "EncRypTed=="}));
+        assert_eq!(asst[2]["type"], "tool_use");
+
+        // Streaming: the block arrives whole in content_block_start.
+        let mut p = AnthropicSse::default();
+        let mut events = Vec::new();
+        for line in [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"Xyz=="}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ] {
+            p.on_line(line, &mut events);
+        }
+        assert!(events.is_empty(), "ciphertext must not surface as a delta");
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            resp.parts,
+            vec![ContentPart::RedactedReasoning { data: "Xyz==".into() }]
+        );
     }
 
     #[test]

@@ -94,6 +94,11 @@ pub enum ContentPart {
         text: String,
         signature: Option<String>,
     },
+    /// An encrypted reasoning block the provider will not show (Anthropic
+    /// `redacted_thinking`). `data` is opaque: it MUST be sent back unchanged
+    /// on the next request of the same tool loop and must never be displayed
+    /// or logged.
+    RedactedReasoning { data: String },
 }
 
 /// One conversation message: a role plus typed parts.
@@ -175,6 +180,38 @@ impl ReasoningHint {
     }
 }
 
+/// How a provider should return the model's thinking to the caller.
+///
+/// Display only: it never changes how much the model thinks or what it costs
+/// (that is [`ChatRequest::reasoning`] / [`ChatRequest::reasoning_effort`]).
+/// Each provider maps it to its own knob and silently ignores it where none
+/// exists:
+///
+/// - Anthropic: `thinking.display` (`summarized` / `omitted`; `updates` is a
+///   beta sent only to the models that accept it, others fall back to
+///   `summarized`).
+/// - OpenAI Responses: `reasoning.summary = "auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkingDisplay {
+    /// A readable summary of the reasoning.
+    Summarized,
+    /// Thinking blocks come back with empty text (the new-model default).
+    Omitted,
+    /// Short between-tool progress notes (Anthropic beta, a few models).
+    Updates,
+}
+
+impl ThinkingDisplay {
+    /// Wire value of Anthropic `thinking.display`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingDisplay::Summarized => "summarized",
+            ThinkingDisplay::Omitted => "omitted",
+            ThinkingDisplay::Updates => "updates",
+        }
+    }
+}
+
 /// A normalized chat completion request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -233,6 +270,11 @@ pub struct ChatRequest {
     /// key absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u8>,
+    /// Ask the provider to return thinking in this form (see
+    /// [`ThinkingDisplay`]). `None` (the default) ⇒ every provider's request
+    /// body is byte-identical to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<ThinkingDisplay>,
 }
 
 impl ChatRequest {
@@ -252,6 +294,7 @@ impl ChatRequest {
             stop: Vec::new(),
             logprobs: None,
             top_logprobs: None,
+            thinking_display: None,
         }
     }
 
@@ -284,6 +327,8 @@ impl ChatRequest {
                     ContentPart::ToolCall { args, .. } => estimate_tokens(&args.to_string()) + 16,
                     ContentPart::ToolResult { content, .. } => estimate_tokens(content) + 16,
                     ContentPart::Reasoning { text, .. } => estimate_tokens(text),
+                    // Opaque ciphertext; billed like the thinking it replaces.
+                    ContentPart::RedactedReasoning { data } => estimate_tokens(data),
                 };
             }
         }
