@@ -1,3 +1,5 @@
 # Preserve checksum-pinned upstream crate bytes across Git checkouts.
 /vendor/calamine/** -text
 /src-tauri/vendor/tauri-plugin-updater/** -text
+# Byte-pinned (SHA-256) test vectors shared with the license console; keep LF on every checkout.
+/crates/duduclaw-gateway/src/distributor_notice/vectors.json -text

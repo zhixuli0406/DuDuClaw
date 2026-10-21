@@ -6,6 +6,7 @@ import { api, type AboutResponse, type SoftwareVendor } from '@/lib/api';
 import { useEffectiveName } from '@/lib/product-identity';
 import { BrandMark } from '@/components/brand/BrandMark';
 import { tierLabel } from '@/lib/license-labels';
+import { DistributorNoticeCard } from '@/components/about/DistributorNoticeCard';
 
 /** Hard-coded fallback mirroring the backend `UPSTREAM_VENDOR_*` consts. */
 const VENDOR_FALLBACK: SoftwareVendor = {
@@ -59,6 +60,12 @@ export function AboutPage() {
 
         </CardContent>
       </Card>
+
+      {/* Distributor information — only present in a distributor build; the
+          HTML is a build input, sanitized server-side and sandboxed here. */}
+      {typeof about?.distributor_notice === 'string' && about.distributor_notice.length > 0 && (
+        <DistributorNoticeCard html={about.distributor_notice} />
+      )}
 
       {/* Lower — fixed upstream-vendor block (never overwritable) */}
       <Card>
