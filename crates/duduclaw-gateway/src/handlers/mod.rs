@@ -97,6 +97,7 @@ mod distributor_rpc;
 mod cli_login_rpc;
 mod setup_token_rpc;
 mod system_status;
+mod experts_generate_rpc;
 mod experts_rpc;
 mod system_config_rpc;
 mod audit_rpc;

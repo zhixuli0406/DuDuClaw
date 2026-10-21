@@ -393,6 +393,14 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_experts_generate_revise(params).await
             }
+            "experts.generate_status" => {
+                require_admin!();
+                self.handle_experts_generate_status(params).await
+            }
+            "experts.generate_cancel" => {
+                require_admin!();
+                self.handle_experts_generate_cancel(params).await
+            }
             "experts.install_draft" => {
                 require_admin!();
                 self.handle_experts_install_draft(params).await

@@ -444,6 +444,14 @@ async fn install_one_agent(
         }
         // Report referenced skills in plan mode too.
         plan_agent_skills(pack_dir, agent, report);
+        if pack_dir
+            .join("agents")
+            .join(&agent.name)
+            .join("CONTRACT.toml")
+            .is_file()
+        {
+            report.imported("contract", &final_id);
+        }
         return Ok(Some(final_id));
     }
 
@@ -562,7 +570,62 @@ async fn install_one_agent(
     // Install referenced skills into this agent's SKILLS/.
     install_agent_skills(ctx, pack_dir, agent, &final_id, report).await;
 
+    // CONTRACT.toml (behavioural red lines).
+    install_agent_contract(ctx, pack_dir, agent, &final_id, report);
+
     Ok(Some(final_id))
+}
+
+/// Install a pack agent's `CONTRACT.toml`: scanned like any pack text, parsed
+/// with the runtime parser, and re-rendered so only `[boundaries]` lands
+/// (unknown sections are dropped rather than carried). A freshly scaffolded
+/// agent has no contract, so an existing file is a conflict, never
+/// overwritten.
+fn install_agent_contract(
+    ctx: &InstallCtx,
+    pack_dir: &Path,
+    agent: &manifest::ExpertAgent,
+    final_id: &str,
+    report: &mut Report,
+) {
+    let src = pack_dir
+        .join("agents")
+        .join(&agent.name)
+        .join("CONTRACT.toml");
+    let Ok(raw) = std::fs::read_to_string(&src) else {
+        return; // no contract in the pack — nothing to do
+    };
+    if let ScanVerdict::Blocked(reason) = scan_external(&raw) {
+        report.skipped("contract", final_id, format!("security: {reason}"));
+        return;
+    }
+    let contract: duduclaw_agent::contract::Contract = match toml::from_str(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            report.skipped("contract", final_id, format!("解析失敗: {e}"));
+            return;
+        }
+    };
+    let body = match toml::to_string_pretty(&contract) {
+        Ok(b) => b,
+        Err(e) => {
+            report.skipped("contract", final_id, format!("序列化失敗: {e}"));
+            return;
+        }
+    };
+    let dest = ctx
+        .home
+        .join("agents")
+        .join(final_id)
+        .join("CONTRACT.toml");
+    if dest.exists() {
+        report.conflict("contract", final_id, "已有 CONTRACT.toml，不覆蓋");
+        return;
+    }
+    match std::fs::write(&dest, format!("# Installed from an expert pack.\n{body}")) {
+        Ok(()) => report.imported("contract", final_id),
+        Err(e) => report.skipped("contract", final_id, format!("寫入失敗: {e}")),
+    }
 }
 
 /// Copy each referenced pack skill into `<home>/agents/<id>/SKILLS/<name>`

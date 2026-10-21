@@ -197,6 +197,7 @@ pub mod ephemeral;
 pub mod events_store;
 pub mod expert_admin;
 pub mod expert_generate;
+pub mod expert_generate_staged;
 pub mod external_factors;
 pub mod footprint_distill;
 pub mod foresight;
