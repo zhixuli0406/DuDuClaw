@@ -745,6 +745,41 @@ fn own_contract_at(file_path: &Path, home: &Path, caller_id: &String) -> GuardDe
     }
 }
 
+/// Instructions lock — block an agent-identified caller from writing its OWN
+/// `INSTRUCTIONS.md` via Write/Edit/MultiEdit. Same shape and reasoning as
+/// [`check_own_contract_write`]: the file is operator-managed instructions
+/// that every prompt loads, so there is no opt-in flag.
+pub fn check_own_instructions_write(
+    file_path: &Path,
+    home: &Path,
+    caller: &HookCaller,
+) -> GuardDecision {
+    let HookCaller::Agent(caller_id) = caller else {
+        return GuardDecision::NotAgentFile;
+    };
+    with_real_path(file_path, home, |p, h| own_instructions_at(p, h, caller_id))
+}
+
+fn own_instructions_at(file_path: &Path, home: &Path, caller_id: &str) -> GuardDecision {
+    match file_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.eq_ignore_ascii_case("INSTRUCTIONS.md") => {}
+        _ => return GuardDecision::NotAgentFile,
+    }
+    let normalized = lexical_normalize(file_path);
+    let Some(owner) = owning_agent_dir(&normalized, home) else {
+        return GuardDecision::NotAgentFile;
+    };
+    if owner.eq_ignore_ascii_case(caller_id) {
+        GuardDecision::BlockedOwnInstructionsWrite {
+            caller: caller_id.to_string(),
+            attempted_path: normalized,
+        }
+    } else {
+        // A foreign agent's file is already blocked by `check_caller_scope`.
+        GuardDecision::NotAgentFile
+    }
+}
+
 /// Bash-side companion: block obviously write-shaped shell commands that
 /// mention a delegation-authority file.
 ///

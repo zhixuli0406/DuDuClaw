@@ -80,6 +80,7 @@ pub(super) async fn experts_rpcs_deny_non_admin() {
         "experts.install",
         "experts.remove",
         "experts.hooks_apply",
+        "experts.skills_apply",
         "experts.catalog",
         "experts.install_builtin",
         "experts.generate",
@@ -557,6 +558,7 @@ pub(super) async fn experts_list_and_remove_round_trip() {
         global_skills: vec![],
         wiki_files: vec![],
         installed_at: crate::expert_admin::now_iso(),
+        source_format: String::new(),
     };
     crate::expert_admin::write_record(home.path(), &rec).unwrap();
     crate::expert_admin::write_hooks_state(
@@ -630,6 +632,35 @@ pub(super) async fn experts_install_rejects_missing_and_non_zip_sources() {
         )
         .await;
     assert!(!frame_ok(&frame));
+    // A real pack directory outside the upload staging area is refused too:
+    // agent formats are recognised by common file names, so an arbitrary
+    // server path must never be importable over the RPC.
+    let repo = home.path().join("some-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "rules").unwrap();
+    let frame = handler
+        .handle("experts.install", json!({ "path": repo.to_string_lossy() }), &ctx)
+        .await;
+    assert!(!frame_ok(&frame));
+    // A real zip outside the staging area, and a link inside the staging
+    // area pointing at it, are both refused before anything spawns.
+    let outside = home.path().join("pack.zip");
+    std::fs::write(&outside, b"PK\x03\x04").unwrap();
+    let frame = handler
+        .handle("experts.install", json!({ "path": outside.to_string_lossy() }), &ctx)
+        .await;
+    assert!(!frame_ok(&frame));
+    #[cfg(unix)]
+    {
+        let staged = crate::expert_admin::upload_dir(home.path());
+        std::fs::create_dir_all(&staged).unwrap();
+        let link = staged.join("link.zip");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let frame = handler
+            .handle("experts.install", json!({ "path": link.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!frame_ok(&frame), "a staged link to an outside file must be refused");
+    }
 }
 
 #[tokio::test]

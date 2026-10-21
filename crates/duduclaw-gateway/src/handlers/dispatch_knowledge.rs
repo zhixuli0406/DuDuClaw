@@ -377,6 +377,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_experts_hooks_apply(params).await
             }
+            "experts.skills_apply" => {
+                require_admin!();
+                self.handle_experts_skills_apply(params).await
+            }
             "experts.catalog" => {
                 require_admin!();
                 self.handle_experts_catalog().await

@@ -48,6 +48,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     Option<serde_json::Value>,
     Option<Vec<duduclaw_llm::CcrDeliveryGuards>>,
     Arc<CcrTurnDelivery>,
+    Option<crate::trigger_route::AnsweredBy>,
 ) {
     // P10: one model-free status line if this turn stays silent too long
     // (off by default; external channel sessions only).
@@ -69,6 +70,8 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // message and schedules distillation BEFORE the lease is rechecked, so
     // both register here and are rolled back / never started on a refusal.
     let delivery = Arc::new(CcrTurnDelivery::default());
+    let answered: Arc<std::sync::Mutex<Option<crate::trigger_route::AnsweredBy>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // Keep the authenticated channel caller and exact conversation in scope
     // for the whole turn. CCR history validation runs before the native tool
     // loop, and handle persistence runs after it; scoping only `cli_future`
@@ -86,13 +89,16 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                     ccr_collector,
                     crate::runtime::NATIVE_TOOL_COLLECTOR.scope(
                         collector.clone(),
-                        build_reply_with_session_inner(
-                            text,
-                            ctx,
-                            agent_override,
-                            session_id,
-                            user_id,
-                            on_progress,
+                        crate::trigger_route::ANSWERED_BY.scope(
+                            answered.clone(),
+                            build_reply_with_session_inner(
+                                text,
+                                ctx,
+                                agent_override,
+                                session_id,
+                                user_id,
+                                on_progress,
+                            ),
                         ),
                     ),
                 ),
@@ -111,7 +117,8 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         .lock()
         .ok()
         .map(|mut held| std::mem::take(&mut *held));
-    (raw, operator_result_artifact, guards, delivery)
+    let answered_by = answered.lock().ok().and_then(|mut a| a.take());
+    (raw, operator_result_artifact, guards, delivery, answered_by)
 }
 
 pub(crate) async fn reply_identity_scope<T>(
@@ -136,7 +143,7 @@ pub async fn build_guarded_reply_for_agent(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
-    let (raw, operator_result_artifact, guards, delivery) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by) =
         build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -153,8 +160,12 @@ pub async fn build_guarded_reply_for_agent(
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
-    let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
-    let enforced = enforce_contract(restored, &ctx.home_dir, agent_name).await;
+    let (agent_id, turn_session) = match &answered_by {
+        Some(who) => restore_target(who),
+        None => (agent_name.to_string(), session_id.to_string()),
+    };
+    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
+    let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
     // The "rules changed / model switched" FYI is for the operator; a public
     // website visitor must not see it (it stays pending for the next
     // operator-facing reply).
@@ -163,7 +174,9 @@ pub async fn build_guarded_reply_for_agent(
     } else {
         append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
     };
-    attach_turn_rollback(final_text, artifact, guards, delivery, ctx).await
+    attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
+        .await
+        .with_answered_by(answered_by)
 }
 
 /// Hand the turn's rollback handle to the reply when (and only when) the
@@ -204,7 +217,7 @@ pub async fn build_guarded_reply_with_session(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
-    let (raw, operator_result_artifact, guards, delivery) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by) =
         build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -225,12 +238,26 @@ pub async fn build_guarded_reply_with_session(
     // Placed here so every channel that funnels through `build_reply_*` is
     // covered, not just the one that reported the leak. See `cli_noise`.
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
-    let agent_id = resolve_agent_for_restore(ctx, session_id).await;
-    let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
+    // Restore and contract-check as the employee that actually answered (an
+    // `@`-called employee, not the default one).
+    let (agent_id, turn_session) = match &answered_by {
+        Some(who) => restore_target(who),
+        None => (resolve_agent_for_restore(ctx, session_id).await, session_id.to_string()),
+    };
+    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
     let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
-    let final_text = append_product_footer(with_notice, session_id);
-    attach_turn_rollback(final_text, artifact, guards, delivery, ctx).await
+    // Messaging apps: label replies from a called (non-default) employee.
+    let labelled = match &answered_by {
+        Some(who) if who.via_trigger && footer_applies_to_session(session_id) => {
+            crate::trigger_route::with_reply_prefix(with_notice, &who.display_name)
+        }
+        _ => with_notice,
+    };
+    let final_text = append_product_footer(labelled, session_id);
+    attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
+        .await
+        .with_answered_by(answered_by)
 }
 
 /// Fixed product attribution on external messaging replies. Internal sessions,
@@ -264,4 +291,16 @@ pub(super) fn append_product_footer(reply: String, session_id: &str) -> String {
         return reply;
     }
     format!("{reply}\n\n{PRODUCT_FOOTER}")
+}
+
+/// The employee and session a reply's secrets are restored and its contract
+/// checked with: those of the turn that produced it (a called employee runs
+/// in its own session bucket).
+pub(super) fn restore_target(who: &crate::trigger_route::AnsweredBy) -> (String, String) {
+    (who.id.clone(), who.session_id.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn restore_target_for_test(who: &crate::trigger_route::AnsweredBy) -> (String, String) {
+    restore_target(who)
 }

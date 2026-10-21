@@ -35,7 +35,9 @@ Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）�
 - Agent 寫入、搬移或刪除 **`agents/_trash/`** 底下的任何東西（被移除的員工存放在那裡；Bash 以啟發式判斷）；
 - Agent 在 Bash 執行 **`duduclaw agent create <name>`**，而該名稱因為曾有員工被移除而處於保留狀態（見[委派隔離](37-delegation-isolation.md#被移除員工的名稱仍被保留)）；拒絕會以稽核事件 `agent_name_reserved` 記錄，`path_kind` 為 `cli_bash_agent_create`。
 
-在 Bash 上，「自己的 `SOUL.md`」與「自己的 `CONTRACT.toml`」兩條規則是啟發式判斷：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/…`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。身分驗證失敗的呼叫者，寫入形態的指令只要點名 `agents/` 底下任何位置就擋，與 Write／Edit 一致。
+- Agent 寫**自己的 `INSTRUCTIONS.md`**（判定 `BlockedOwnInstructionsWrite`）。這個檔案放的是操作者從其他平台匯入的工作規則（[匯入 AI 員工](../../guides/zh-TW/agent-config-import.md)），每次對話都會帶入，所以和契約一樣沒有開放旗標。它也列在 agent 結構檔清單裡，位置守衛與 `office_script` 對它的處理和 `SOUL.md` 相同。
+
+在 Bash 上，「自己的 `SOUL.md`」、「自己的 `CONTRACT.toml`」與「自己的 `INSTRUCTIONS.md`」三條規則是啟發式判斷：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/…`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。身分驗證失敗的呼叫者，寫入形態的指令只要點名 `agents/` 底下任何位置就擋，與 Write／Edit 一致。
 
 **Bash 與資料目錄允許清單。** Bash 通道用同一份允許清單判斷指令文字。以下說的「受保護的資料目錄目標」，指資料目錄裡自己的員工目錄與 `attachments/` 以外的位置、別的員工的目錄，以及被移除員工的存放區；身分驗證失敗的呼叫者，連自己的目錄也算。
 
@@ -190,6 +192,10 @@ action_rules = [
 
 2026-10-08 收尾起，另外三條需要人核准的路徑也一律這樣綁定（不只 `send`／`purchase`）：MCP 派工閘的 PolicyKernel `ask`、OS 動作工具的情境閘（`anomaly`／`sensitive`，或動作審查的 `ask`），以及 gateway 電腦操作路由中 `computer_*`／`computer_workspace_*` 的核准清單。電腦工具綁定的是 gateway 自己組出的操作快照（輸入的文字與網址只留雜湊，所以卡片只顯示字數或驗證過的主機，不顯示原文），而且 gateway 在消耗核准後會重跑工具閘。聊天中的電腦操作高風險確認本來就是單次且綁定的（`ExecutionBinding` 綁動作雜湊、截圖雜湊、政策版本與決定情境，以 `claim_operation`／`begin_execution` 只認領一次，並和新的截圖重新比對）。workflow 保留自己的綁定：需要人的步驟只能透過帶綁定的請求核准，請求的 payload 與 `ExecutionBinding` 必須等於該步驟的呼叫，操作在 fence 之下認領，所以本來就只涵蓋那一步。安裝核准不變。未涵蓋：指紋算的是核准閘當下的參數，這時 PolicyKernel 改寫與機密還原已經發生；能存取資料庫的人可以同時改掉存下的內容與卡片。目前只有單元與 broker 測試。
 
+## 用 @ 呼叫員工依發話者權限判斷（v1.76）
+
+v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的子字串比對：只綁定一位員工的 WebChat 帳號打別人的觸發詞就能叫到別人，任何 LINE 好友也一樣。現在先解析發話的真人（WebChat 用 dashboard 帳號；通訊軟體用**已驗證**的 `channel_identities`，沒有就視為未綁定），只在這個人叫得到的員工裡比對：管理員全部；每個人都叫得到這個對話的預設員工，以及 `[channels] public_trigger = true` 的員工（只有管理員能改，員工自己改不了）；dashboard 帳號與綁定了帳號的通訊軟體使用者另外加上綁定的員工。叫其他員工會在呼叫模型前被拒絕，並以 `trigger_route_refused` 記進 `security_audit.jsonl`（記帳號，或以這台機器的金鑰 `trigger_audit.key` 算出的平台 ID HMAC）。停用中的帳號，綁定不再算數。任何查詢失敗都當成未綁定處理。被叫來的員工在自己的 session 回答，對話紀錄與機密不會在員工之間混用；但在群組裡，回答仍是所有成員都看得到。細節見[用 @ 呼叫 AI 員工](62-calling-ai-staff.md)。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。
@@ -228,7 +234,7 @@ action_rules = [
 - **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
 - **只有 Claude runtime 會跑這些 hook。** Codex、Antigravity 與其他 runtime 靠各自的沙箱旗標。
-- **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
+- **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）
 - **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在才視為 `GREEN`；檔案存在卻讀不到，或內容不是 `GREEN`／`YELLOW`／`RED` 其中之一，間隔 50 毫秒再讀兩次後仍是如此，就視為 `RED`（fail closed）；開頭的 UTF-8 BOM 與前後空白會略過。
 - *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在——每次 Claude spawn 都是單次 spawn，正好就是改寫掛鉤的地方。

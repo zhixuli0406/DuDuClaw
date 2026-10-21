@@ -19,7 +19,7 @@
 
 名冊裡每個成員帶 `name`、`role`、`reports_to`(包內主管)、`department`、`rank`、一個觸發關鍵詞,以及一份 skill 清單。`duduclaw expert pack` 在打包前嚴格驗證(slug 形狀、重複名稱、以 topological sort 檢查 `reports_to` 循環、缺 `soul.md`、SKILL.md frontmatter 的 name 必須等於其目錄名);`install` 則寬鬆,只回報問題,不猜著修。`[expert.requires]` 以 doctor 風格列出環境變數與二進位:缺了會警告,絕不擋下安裝。
 
-兩種外來格式走同一個指令安裝:Claude Code plugin(`.claude-plugin/plugin.json`)與單一 Agent Skill(`SKILL.md`)。格式偵測 fail-closed,認不出的佈局會被拒絕並列出實際找到的內容,絕不半吊子匯入。
+外來格式走同一個指令安裝:Claude Code plugin(`.claude-plugin/plugin.json`)、單一 Agent Skill(`SKILL.md`),以及其他平台的 AI 員工定義(豆包夥伴安裝包、OpenClaw、Hermes、`AGENTS.md`／`CLAUDE.md`／`GEMINI.md`、Claude Code／Copilot 子代理、Dify 應用匯出檔,見[從其他平台匯入 AI 員工](../../guides/zh-TW/agent-config-import.md))。格式偵測 fail-closed,認不出的佈局會被拒絕並列出實際找到的內容,絕不半吊子匯入。
 
 ## 一種格式,一個入口
 

@@ -105,6 +105,38 @@ impl IngressStore {
     }
 }
 
+impl IngressStore {
+    /// The employee this event was routed to when its snapshot was first
+    /// taken, and whether that came from a one-shot addressee (`None` before
+    /// that, or for events accepted before v1.76).
+    pub(crate) async fn route_agent(&self, id: &str) -> Result<Option<(String, bool)>, String> {
+        use rusqlite::OptionalExtension;
+        self.connection()
+            .lock()
+            .await
+            .query_row(
+                "SELECT agent,one_shot FROM ingress_routes WHERE id=?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record the employee an event was routed to. The first record wins.
+    pub(crate) async fn store_route_agent(&self, id: &str, agent: &str, one_shot: bool) -> Result<(), String> {
+        self.connection()
+            .lock()
+            .await
+            .execute(
+                "INSERT OR IGNORE INTO ingress_routes(id,agent,one_shot) VALUES(?1,?2,?3)",
+                params![id, agent, one_shot as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

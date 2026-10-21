@@ -103,6 +103,19 @@ impl Report {
         self.push(category, name, Status::Partial(reason.into()));
     }
 
+    /// Absorb one line from the shared agent-import slot writer.
+    pub fn absorb(&mut self, o: &crate::expert::agent_config::outcome::Outcome) {
+        use crate::expert::agent_config::outcome::Status as S;
+        match o.status {
+            S::Imported => {
+                let name = if o.detail.is_empty() { o.name.clone() } else { format!("{} {}", o.name, o.detail) };
+                self.imported(o.kind, &name)
+            }
+            S::Skipped => self.skipped(o.kind, &o.name, o.detail.clone()),
+            S::Warning => self.partial(o.kind, &o.name, o.detail.clone()),
+        }
+    }
+
     pub fn note(&mut self, note: impl Into<String>) {
         self.notes.push(note.into());
     }

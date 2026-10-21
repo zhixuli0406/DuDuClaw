@@ -19,7 +19,7 @@
 
 各ロスターエントリは`name`、`role`、`reports_to`(パック内の上司)、`department`、`rank`、トリガーキーワード、スキルリストを持ちます。`duduclaw expert pack`はzip化の前に厳格に検証します(slugの形式、名前の重複、トポロジカルソートによる`reports_to`の循環検出、`soul.md`の欠落、SKILL.mdのfrontmatterのnameがディレクトリ名と一致すること)。`install`は寛容で、修正を推測する代わりに問題を報告します。`[expert.requires]`はdoctor形式でenv変数とバイナリを列挙します——不足していれば警告しますが、決してブロックはしません。
 
-2つの外部フォーマットも同じコマンドでインストールできます:Claude Codeプラグイン(`.claude-plugin/plugin.json`)と単体のAgent Skill(`SKILL.md`)。フォーマット検出はフェイルクローズです——認識できないレイアウトは、見つかったものの一覧とともに拒否され、中途半端にインポートされることは決してありません。
+外部フォーマットも同じコマンドでインストールできます:Claude Codeプラグイン(`.claude-plugin/plugin.json`)、単体のAgent Skill(`SKILL.md`)、そして他のプラットフォームのエージェント定義(Doubao パートナーパッケージ、OpenClaw、Hermes、`AGENTS.md`／`CLAUDE.md`／`GEMINI.md`、Claude Code／Copilot サブエージェント、Dify アプリのエクスポート。[他のプラットフォームから AI スタッフを取り込む](../../guides/ja-JP/agent-config-import.md) を参照)。フォーマット検出はフェイルクローズです——認識できないレイアウトは、見つかったものの一覧とともに拒否され、中途半端にインポートされることは決してありません。
 
 ## 1つのフォーマット、1つの入口
 

@@ -66,6 +66,7 @@ pub(crate) fn zh_action_kind(kind: &str) -> &str {
         "skill_activation" => "啟用技能",
         "knowledge_quarantine" => "寫入待審知識",
         "expert_hooks_enable" => "啟用專家包自動化",
+        "expert_skills_enable" => "啟用匯入的技能",
         "autopilot_action" => "執行自動化規則動作",
         "topology_reroute" => "調整團隊分工",
         "induced_rule" => "新增自動化規則",
@@ -190,6 +191,7 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
+        || kind == crate::expert_skills::SKILLS_ACTION_KIND
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 
@@ -201,6 +203,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這則知識審核已逾期，已自動捨棄，無法再核准。"
     } else if kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
+    } else if kind == crate::expert_skills::SKILLS_ACTION_KIND {
+        "這則技能啟用審核已逾期，匯入的技能維持停用；要啟用請重新匯入。"
     } else if let Some(spec) = crate::approval::operator_cli_gate::spec_for(kind) {
         spec.expired_text
     } else {

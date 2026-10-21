@@ -152,6 +152,13 @@ pub enum ChatMessage {
         /// see `channel_reply::build_guarded_reply_with_session`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<serde_json::Value>,
+        /// The employee that answered (id). May differ from the selected
+        /// employee when the message called someone else by `@`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// That employee's display name, for the reply label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -164,6 +171,9 @@ pub enum ChatMessage {
         /// clients that only ever read `message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
+        /// `mention_choices` only: the `@name` texts the user can pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choices: Option<Vec<String>>,
     },
     /// Server → Client: session info (sent on connect).
     #[serde(rename = "session_info")]
@@ -194,6 +204,7 @@ impl ChatMessage {
         ChatMessage::Error {
             message: message.into(),
             code: None,
+            choices: None,
         }
     }
 
@@ -204,9 +215,21 @@ impl ChatMessage {
         ChatMessage::Error {
             message: message.into(),
             code: Some(code.to_string()),
+            choices: None,
+        }
+    }
+
+    /// An error frame with a code and the `@name` choices to offer.
+    fn error_choices(message: impl Into<String>, code: &'static str, choices: Vec<String>) -> Self {
+        ChatMessage::Error {
+            message: message.into(),
+            code: Some(code.to_string()),
+            choices: Some(choices),
         }
     }
 }
+
+mod route;
 
 /// A file attachment uploaded through the WebChat socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,14 +326,21 @@ fn webchat_command_admin(user_db: &UserDb, auth_user: &str) -> bool {
 /// DB round-trip `WebChatState::agent_access_allowed` performs on a cache
 /// miss.
 fn load_acl_snapshot(user_db: &UserDb, user_id: &str) -> Result<AclSnapshot, String> {
-    let user = user_db
-        .get_user(user_id)?
-        .ok_or_else(|| "user not found".to_string())?;
-    let bindings = user_db.get_user_agents(user_id)?;
-    Ok(AclSnapshot {
-        role: user.role,
-        bound_agents: bindings.into_iter().map(|b| b.agent_name).collect(),
-    })
+    // An unknown account fails closed; an inactive one keeps no bindings and
+    // is never Admin (the JWT may outlive a suspension).
+    if user_db.get_user(user_id)?.is_none() {
+        return Err("user not found".to_string());
+    }
+    match crate::trigger_route::access::load_account(user_db, user_id)? {
+        Some((role, bound)) => Ok(AclSnapshot {
+            role,
+            bound_agents: bound.into_iter().collect(),
+        }),
+        None => Ok(AclSnapshot {
+            role: duduclaw_auth::UserRole::Employee,
+            bound_agents: std::collections::HashSet::new(),
+        }),
+    }
 }
 
 /// Shared state for WebChat connections.
@@ -366,27 +396,11 @@ impl WebChatState {
     /// the cache — a transient DB hiccup should not poison a good decision
     /// for `ACL_CACHE_TTL`, and should not cache a bad one either.
     async fn agent_access_allowed(&self, user_id: &str, agent_name: &str) -> bool {
-        let now = std::time::Instant::now();
-        {
-            let cache = self.acl_cache.lock().await;
-            if let Some((snapshot, at)) = cache.get(user_id) {
-                if now.duration_since(*at) < ACL_CACHE_TTL {
-                    return acl_allows_agent(snapshot, agent_name);
-                }
-            }
+        let lookup = self.acl_snapshot(user_id).await;
+        if let Err(e) = &lookup {
+            warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
         }
-        let lookup = load_acl_snapshot(&self.user_db, user_id);
-        let allowed = resolve_agent_acl(&lookup, agent_name);
-        match lookup {
-            Ok(snapshot) => {
-                let mut cache = self.acl_cache.lock().await;
-                cache.insert(user_id.to_string(), (snapshot, now));
-            }
-            Err(e) => {
-                warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
-            }
-        }
-        allowed
+        resolve_agent_acl(&lookup, agent_name)
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {
@@ -982,9 +996,53 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     sid = &sid_owned;
                                 }
 
+                                // ── `@` routing (D6): a message may call another
+                                // employee the account may use, for this message
+                                // only; a forbidden call is refused here, before
+                                // any model call. The
+                                // default employee stays reachable by everyone.
+                                // Chat commands keep the selected employee.
+                                let routed = if crate::chat_commands::is_command(&content) {
+                                    route::WebRoute { agent: effective_agent.clone(), switched: false }
+                                } else {
+                                    match route::decide_webchat_route(
+                                        &state,
+                                        &auth_user,
+                                        &content,
+                                        effective_agent.as_deref(),
+                                        &agent_id,
+                                        sid,
+                                        &user_id,
+                                    ).await {
+                                        Ok(routed) => routed,
+                                        Err(frame) => {
+                                            if let Ok(json) = serde_json::to_string(&*frame) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                };
+                                // A call to another employee answers in that
+                                // employee's own session bucket (the session id is
+                                // the isolation boundary), never in the selected
+                                // employee's history.
+                                let sid_rerouted;
+                                let sid: &str = if routed.switched {
+                                    sid_rerouted = compose_session_id(
+                                        session_id.as_str(),
+                                        routed.agent.as_deref().filter(|a| *a != agent_id),
+                                        conv_nonce.as_deref(),
+                                    );
+                                    &sid_rerouted
+                                } else {
+                                    sid
+                                };
+                                let effective_agent: Option<String> = routed.agent;
+
                                 // The agent id used for chat-command handling /
                                 // contract enforcement — the routed agent when one
-                                // was selected/adopted, else the default main agent.
+                                // was selected/adopted/called, else the default main agent.
                                 let effective_agent_id: &str = effective_agent.as_deref().unwrap_or(&agent_id);
 
                                 // Persist any uploaded files and append path references
@@ -1031,6 +1089,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             // `build_reply_*` / O-4 at all — no marker
                                             // can exist on this path.
                                             artifact: None,
+                                            agent: None,
+                                            agent_name: None,
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1134,6 +1194,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let guarded = reply;
                                 let reply = guarded.text.clone();
                                 let operator_artifact = guarded.artifact.clone();
+                                let answered_by = guarded.answered_by.clone();
 
                                 // WP1.3 + live-verification fix (2026-08-15):
                                 // 📎DELIVER: handling. WebChat has no in-band
@@ -1249,6 +1310,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     conv: conv_nonce.clone(),
                                     model: actual_model,
                                     artifact: operator_artifact,
+                                    agent: answered_by.as_ref().map(|a| a.id.clone()),
+                                    agent_name: answered_by.map(|a| a.display_name),
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if !guarded.still_valid().await {
@@ -1740,6 +1803,8 @@ mod tests {
             conv: Some("c-42".into()),
             model: Some("claude-sonnet-4-6".into()),
             artifact: None,
+            agent: Some("finance".into()),
+            agent_name: Some("財務小幫手".into()),
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(
@@ -1750,6 +1815,10 @@ mod tests {
             json.contains(r#""model":"claude-sonnet-4-6""#),
             "actual model must be on the wire: {json}"
         );
+        assert!(
+            json.contains(r#""agent":"finance""#) && json.contains("財務小幫手"),
+            "the answering employee must be on the wire: {json}"
+        );
 
         // Without a nonce, `conv` is omitted entirely (old-client compatible).
         let without = ChatMessage::AssistantDone {
@@ -1758,6 +1827,8 @@ mod tests {
             conv: None,
             model: None,
             artifact: None,
+            agent: None,
+            agent_name: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(
@@ -1790,6 +1861,8 @@ mod tests {
             conv: None,
             model: None,
             artifact: Some(artifact.clone()),
+            agent: None,
+            agent_name: None,
         };
         let json = serde_json::to_string(&done).expect("serialize");
         assert!(

@@ -31,7 +31,8 @@ export interface Gated {
    * Hidden on the Personal edition (2026-07-29 client feedback): unlike
    * `enterprise` (an enterprise-only *feature*), this marks a surface that
    * exists in Personal but is deliberately kept out of its simplified IA
-   * (AI 員工 roster, 公司/org chart, 授權). The route stays URL-reachable.
+   * (AI 員工 roster, 可靠性). 授權 was here until 2026-10-21; it is the upgrade
+   * path and must stay visible on every edition. The route stays URL-reachable.
    */
   readonly personalHidden?: boolean;
   /**
