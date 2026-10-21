@@ -1,21 +1,10 @@
-# 白牌品牌設定與經銷商控制台
+# 經銷商金鑰控制台（白牌功能已移除）
 
-取得授權的經銷商可以透過 DuDuClaw 重新品牌化 dashboard，包括產品名稱、logo、副標題與公司資訊；但上游原廠的標示(嘟嘟數位科技有限公司 / Dudu Technology Ltd.)永遠會顯示在 About 頁面上。這個標示是每次回應時從編譯進二進位檔的常數組出來的：它不會從設定檔讀取，也無法透過任何 RPC 寫入。
+> **白牌功能已在 1.72.2 移除。** 產品名稱、logo、副標題、主題色、公司欄位、About HTML 區塊、簽章品牌包與 `branding.*` RPC 都不存在了，`branding.json`／`branding.bundle.json` 會被忽略。每個 dashboard 一律顯示 DuDuClaw 的產品識別與固定的上游原廠標示（嘟嘟數位科技有限公司 / Dudu Technology Ltd.），這個標示編譯在執行檔裡，設定檔和 RPC 都改不了。
+>
+> 總經銷專用 build 可以在關於頁多一塊總經銷資訊。它是建置輸入，不是 dashboard 設定，請見 [distributor-notice.md](distributor-notice.md)。
 
-## 給經銷商：白牌品牌設定
-
-門檻：授權方案要包含 `white_label` 功能，且已經在該實例上啟用（`duduclaw license activate <blob>`）。
-
-1. 以管理員身分打開 **設定 → 品牌設定 (Branding)**。沒有白牌授權的話，這個分頁會唯讀，並顯示升級提示。
-2. 填入產品名稱、副標題、公司名稱、網站、支援信箱、描述。
-3. 上傳 logo：支援 PNG、JPEG、WebP，上限 512 KB。SVG 會被拒絕（因為有 script 注入風險）。圖片會以 base64 data URI 的形式存進 `~/.duduclaw/branding.json`，不會經過任何外部託管。
-4. 可以選填**主題色**（`#rrggbb`）：dashboard 會用這一個十六進位色碼推導出整組 primary／accent CSS 色階；留空就維持原本的琥珀色。
-5. 可以選填**About HTML 區塊**：一段顯示在 About 頁面上、關於經銷商的完整介紹。這段內容會在伺服器端用保守的允許清單（`ammonia`）過濾：只留一小組排版標籤，`<a>` 連結一律強制加上 `rel="nofollow noopener noreferrer" target="_blank"`，`<img>` 也限制成跟 logo 一樣的 `data:image/png|jpeg|webp` 規則（上限 512 KB，並檢查 magic byte）。`style`／`class`／`id`／`on*` 以及 `<script>` 都會被剝除。編輯器透過 `branding.preview` RPC 精準預覽最終會存下來的內容。超過 64 KB 會被拒絕。
-6. 儲存後，側邊欄標誌、登入頁、瀏覽器標題、favicon、主題色、About 區塊都會立即更新。**重設**會還原成 DuDuClaw 的預設值。
-
-**About** 頁面（`/about`）上半部顯示你的品牌設定，下半部則是固定的「軟體開發｜嘟嘟數位科技有限公司」區塊，加上版本號與授權方案。
-
-驗證邏輯是 fail-closed：未知欄位一律拒絕，文字欄位有 CJK-safe 的長度上限，logo 必須符合宣告的 magic byte，而且授權快照沒有 `white_label` 的話，`branding.set`／`branding.reset` 會直接被拒絕。
+這一頁現在只說明原廠端的經銷商金鑰控制台。
 
 ## 給原廠：經銷商控制台
 
@@ -85,32 +74,12 @@ public_url      = "https://your-gateway.example.com"
 
 設定好之後，`distributor.issue` 就會把這個網址內嵌進金鑰，變成金鑰自帶的 `control_url`。經銷商的實例解析控制平面的順序是：`DUDUCLAW_CONTROL_URL` 環境變數 → 金鑰裡的 `control_url` → 內建預設值。所以只要簽發時有設定 `public_url`，這把金鑰就能**零客戶端設定**完成 phone-home 與更新，`duduclaw license refresh` 也不需要任何環境變數就能動。`control_url` 不是簽章 payload 的一部分（要竄改它需要本機對 0600 權限的 `license.json` 有寫入權，而且每次更新回應本身都會做簽章驗證，最壞情況就是「網址連不到」，跟現在一樣）。更新時會保留原本的 `control_url`。
 
-### 把品牌散發給你的客戶
-
-經銷商通常希望自己的品牌能出現在*客戶*的實例上，但客戶端並沒有白牌授權。**簽章品牌包**解決了這個問題：品牌設定由原廠的簽發金鑰簽章，任何實例只要在 `~/.duduclaw/branding.bundle.json` 找到一份驗證得過的品牌包就會自動套用，*顯示*不需要授權（要*編輯*還是得有白牌授權）。上游原廠的標示永遠疊在最上層，品牌包無法把它蓋掉。
-
-**產生品牌包**
-
-- *自助（線上）*：在經銷商自己那台白牌實例上，點**產生散發用品牌包**（RPC `branding.bundle.create`）。gateway 會把 `subscription_id`、機器指紋、目前的品牌設定送到原廠 gateway 的 `POST /v1/branding/sign`（同樣以簽發金鑰自我把關，並依 IP 做 10 次／分鐘的速率限制），對方會重新檢查訂閱狀態（要有效且指紋相符，跟更新端點用同一套把關規則；已撤銷或已過期一律拒絕），用權威版邏輯再消毒一次品牌內容、簽章，然後回傳可下載的品牌包。
-- *原廠協同簽章（離線）*：當經銷商的實例連不到原廠時，原廠的 **/manage/distributors** 頁面有一個**協同簽章品牌包**對話框（RPC `distributor.bundle.sign`）：貼上經銷商的品牌設定 JSON，原廠就能在本機用簽發金鑰簽好。
-
-**散發與套用**
-
-把產生出來的 `branding.bundle.json` 放進客戶的 `~/.duduclaw/`（例如包進你自己的產品安裝程式裡）。gateway 啟動時會依下面的順序解析品牌設定：
-
-1. 本機的 `branding.json`（透過授權過的編輯器設定）：如果存在就優先採用；
-2. 簽章能對上內建簽發公鑰的 `branding.bundle.json`；
-3. DuDuClaw 內建的預設值。
-
-目前使用中的來源會透過頂層 `source` 欄位回報給 dashboard（`local`／`bundle`／`default`）。簽章、schema 或欄位驗證任何一項沒過的品牌包會被忽略並留一則警告（fail-closed，退回預設值），而且品牌包內容在讀取時還會再消毒一次，就算有人手動改過檔案，也夾帶不了不安全的 HTML 繞過原廠的簽章檢查。
-
 ## RPC 介面
 
 | 方法 | 存取權限 |
 |---|---|
-| `branding.get`、`about.get` | 任何已登入使用者都能呼叫（回應內容帶 `source`、`about_html`、`accent_color`） |
-| `branding.set`、`branding.reset`、`branding.preview`、`branding.bundle.create` | 需要管理員身分，且授權要有 `white_label` 功能（fail-closed） |
-| `distributor.status/list/add/update/remove/issue/revoke`、`distributor.bundle.sign` | 需要管理員身分 |
+| `about.get` | 任何已登入使用者都能呼叫（固定的產品與原廠欄位、版本、授權方案；只有總經銷專用 build 才帶 `distributor_notice`） |
+| `distributor.status/list/add/update/remove/issue/revoke/upgrade` | 需要管理員身分 |
 
 ## HTTP 控制平面介面（原廠 gateway，以簽發金鑰把關）
 
@@ -118,4 +87,3 @@ public_url      = "https://your-gateway.example.com"
 |---|---|
 | `POST /v1/license/refresh` | 重新簽署授權（phone-home）。 |
 | `GET /v1/license/crl` | 簽章過的撤銷清單。 |
-| `POST /v1/branding/sign` | 為符合資格的訂閱簽署品牌包（速率限制 10 次／分鐘／IP）。 |
