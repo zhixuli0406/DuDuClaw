@@ -90,11 +90,25 @@
 | 自動化 → 夜間整理 | `[night_engine] enabled` |
 | 通道與整合 → 讓外部聯絡人用 @ 呼叫（v1.76） | `[channels] public_trigger`（只限管理員；見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)） |
 | 自動化 → 記憶 → 決策延續、決定保留天數 | `[memory] decision_continuity`、`decision_ttl_days`（1 到 3650） |
-| 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime` 區段不能在這裡改 |
+| 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` 區段不能在這裡改（未發布：新增 `prompt`、`os_watch`、`budget`，裡面有只限管理員的設定，例如 `prompt.cli_bare_mode`，管理員改用設定檔進階編輯修改） |
 
-**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[channels] public_trigger`（v1.76），`[container] sandbox_enabled`、`network_access`，以及 `[permissions] can_modify_own_soul`：非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。
+**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`），`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（未發布）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
+
+**誰能存檔（未發布，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔未發布)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
 **權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
+
+## 設定檔（未發布）
+
+RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯）。上限：Markdown 每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
+
+- **誰能做什麼：** 綁定這位員工的人都能看檔案；Operator 以上能看版本與差異；員工的負責人與管理員能存檔。每次呼叫都重讀帳號資料庫，不看登入時的快照。審核只有管理員能決定。
+- **每次存檔都檢查：** 先跑固定規則（大小、控制字元、嚴格解析 `CONTRACT.toml`、隱藏或看不見的內容、這次新增的文字或新的 `must_always` 裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪改 `must_not`／`must_always` 或調高／取消工具次數上限），再請部署的輔助模型看一次差異（`[runtime] utility_provider`／`utility_model`，可用 `[agent_files] review_provider`／`review_model` 指定；費用記在部署的 `agent-file-review`，不扣員工預算）。模型只能讓結果更嚴。結果：`pass` 直接套用；`warn` 要寫理由（至少 4 個字）或送管理員審核；`block` 非管理員只能送審，管理員要寫理由並勾「我了解風險」才能套用（稽核記為 Critical）。檢查沒完成時（沒有輔助模型、逾時、回答無法使用、達到 `[agent_files] review_daily_limit`，預設每天 200 次），結果至少是 `warn`，設 `[agent_files] on_analysis_failure = "block"` 則是 `block`；不會默默放行，也不能關掉。確認時不再跑一次模型；確認必須是同一人、同一檔、同一個起始版本與同樣內容，並在 15 分鐘內。
+- **存檔：** 在檔案鎖內比對編輯器讀到的雜湊（`base_hash`），期間被別人改過就當作衝突拒絕。新內容從員工的下一則對話開始生效，通道的下一則回覆會附一行提示。
+- **版本：** 存在員工資料夾外的 `<home>/agent_file_history/<員工>/<檔案>/`（只有擁有者能讀），每檔預設保留 20 份（`[agent_files] history_keep`，5–100）。第一次修改也會留下修改前的內容。還原版本會跑同樣的檢查。
+- **核可基準：** 存 SOUL.md 或 INSTRUCTIONS.md 會更新核可指紋（INSTRUCTIONS.md 現在也有，heartbeat 以 `_instructions_integrity_drift` 回報）。在系統外被改過的檔案會標示出來，可以還原到上次核可版本，或檢查後接受目前內容。員工改名會同步 SOUL.md／IDENTITY.md 裡的名字，原本核可的 SOUL 維持核可，原本已在系統外被改過的 SOUL 仍然標示。
+- **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
+- **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
 ## 設定檔進階編輯
 
