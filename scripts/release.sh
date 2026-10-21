@@ -896,9 +896,16 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
             echo "           'rustc -vV' — skipping darwin binary asset (fail-closed)."
         else
             echo "  [$DARWIN_PLATFORM_LABEL] validating policy and building duduclaw-pro..."
+            # The distributor build also embeds the About-page distributor
+            # notice when the private checkout has exported one
+            # (distributor-notice.html, validated by build-policy.py --check).
             if ( cd commercial/duduclaw-pro-gateway &&
                  python3 build-policy.py --check &&
-                 DUDUCLAW_INSTALLATION_POLICY_PATH="$PWD/installation-policy.json" \
+                 notice_env=() &&
+                 { [[ ! -f distributor-notice.html ]] ||
+                   notice_env=("DUDUCLAW_DISTRIBUTOR_NOTICE_PATH=$PWD/distributor-notice.html"); } &&
+                 env ${notice_env[@]+"${notice_env[@]}"} \
+                     DUDUCLAW_INSTALLATION_POLICY_PATH="$PWD/installation-policy.json" \
                      cargo build --release --locked --bin duduclaw-pro &&
                  ../../target/release/duduclaw-pro --version >/dev/null ); then
                 mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
