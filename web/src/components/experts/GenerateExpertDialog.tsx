@@ -1,7 +1,13 @@
 import { useProductPolicy } from '@/lib/product-policy';
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type ExpertDraftPreview } from '@/lib/api';
+import {
+  api,
+  type ExpertDraftPreview,
+  type ExpertDraftStatus,
+  type ExpertGenerationJob,
+  type ExpertInstallPlacement,
+} from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   Dialog,
@@ -11,7 +17,6 @@ import {
   DialogDescription,
   DialogFooter,
   Button,
-  Badge,
   Input,
   Textarea,
   Checkbox,
@@ -22,9 +27,12 @@ import {
   SelectItem,
   Spinner,
 } from '@/components/mds';
-import { Sparkles, Users, Puzzle, BookOpen, RefreshCw } from 'lucide-react';
+import { Sparkles, RefreshCw } from 'lucide-react';
 import { AttachUnderSelect } from './AttachUnderSelect';
 import { ThinkingOrbIndicator } from '@/components/chat/ThinkingOrbIndicator';
+import { GenerationProgress } from './GenerationProgress';
+import { DraftPreview } from './DraftPreview';
+import { InstallResult } from './InstallResult';
 
 /** Channels a generated pack may suggest (mirrors the gateway allowlist). */
 const CHANNEL_OPTIONS = [
@@ -41,13 +49,22 @@ const CHANNEL_OPTIONS = [
 
 const TEAM_SIZES = [1, 2, 3, 4, 5, 6, 7, 8];
 
-type Step = 'form' | 'generating' | 'preview' | 'installing';
+/** How often the dialog polls a running generation job. */
+export const POLL_INTERVAL_MS = 2000;
+/** Consecutive status-poll failures tolerated before giving up. */
+const MAX_POLL_ERRORS = 3;
+
+type Step = 'form' | 'generating' | 'preview' | 'installing' | 'installed';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * GenerateExpertDialog — the LLM-guided "build your own expert pack" flow:
- * ① industry + description + team size + channels → ② generate (cancelable)
- * → ③ preview (roster / skills / SOPs) + feedback loop (max 5 rounds)
- * → ④ install through the full security-scanned pipeline.
+ * GenerateExpertDialog — the LLM-guided "build your own AI team" flow:
+ * ① industry + description + team size + channels → ② staged background
+ * generation with per-stage progress (cancelable) → ③ preview (members with
+ * their skills and red lines, knowledge-base pages, predicted install skips)
+ * + feedback loop (max 5 rounds) → ④ install through the full
+ * security-scanned pipeline, then a summary of anything that was not placed.
  */
 export function GenerateExpertDialog({
   open,
@@ -70,23 +87,50 @@ export function GenerateExpertDialog({
   const [description, setDescription] = useState('');
   const [teamSize, setTeamSize] = useState(3);
   const [channels, setChannels] = useState<string[]>(['line']);
+  const [research, setResearch] = useState(false);
   const [draftId, setDraftId] = useState<string | null>(null);
   const [preview, setPreview] = useState<ExpertDraftPreview | null>(null);
+  const [job, setJob] = useState<ExpertGenerationJob | null>(null);
   const [roundsLeft, setRoundsLeft] = useState(0);
   const [feedback, setFeedback] = useState('');
-  const [revising, setRevising] = useState(false);
+  const [placement, setPlacement] = useState<ExpertInstallPlacement | null>(null);
   // WP-ORG — org placement for the installed pack root (empty = independent).
   const [attachUnder, setAttachUnder] = useState('');
-  /** Bumped on cancel so an in-flight generation's late result is ignored. */
+  /** Bumped on cancel/close so an in-flight poll loop stops and its late
+   *  result is ignored. */
   const generationToken = useRef(0);
+  /** Draft whose job is running right now (for cancel-on-close). */
+  const runningDraft = useRef<string | null>(null);
+
+  useEffect(
+    () => () => {
+      generationToken.current += 1;
+      // Leaving the page must not leave a model job running unseen.
+      const id = runningDraft.current;
+      runningDraft.current = null;
+      if (id) api.experts.generateCancel(id).catch(() => undefined);
+    },
+    [],
+  );
 
   const reset = () => {
     setStep('form');
     setDraftId(null);
     setPreview(null);
+    setJob(null);
     setFeedback('');
-    setRevising(false);
+    setPlacement(null);
     setAttachUnder('');
+  };
+
+  const stopRunningJob = () => {
+    const id = runningDraft.current;
+    runningDraft.current = null;
+    if (id) {
+      api.experts.generateCancel(id).catch(() => {
+        // Best effort: the gateway also stops a job at its own deadline.
+      });
+    }
   };
 
   const close = (next: boolean, eventDetails?: { reason?: string }) => {
@@ -94,15 +138,12 @@ export function GenerateExpertDialog({
     // disabled at the Dialog level (`disablePointerDismissal`), and Escape is
     // ignored while a generation/installation is running or a draft preview
     // is on screen. Closing then requires an explicit control (X / 取消).
-    if (
-      !next &&
-      eventDetails?.reason === 'escape-key' &&
-      step !== 'form'
-    ) {
+    if (!next && eventDetails?.reason === 'escape-key' && step !== 'form') {
       return;
     }
     if (!next) {
-      generationToken.current += 1; // drop any in-flight result
+      generationToken.current += 1; // stop polling, drop any in-flight result
+      stopRunningJob();
       reset();
     }
     onOpenChange(next);
@@ -114,31 +155,79 @@ export function GenerateExpertDialog({
     );
   };
 
+  /** Poll a draft's job until it finishes; returns the terminal status, or
+   *  null when the dialog cancelled the wait. */
+  const waitForJob = async (id: string, token: number): Promise<ExpertDraftStatus | null> => {
+    let errors = 0;
+    for (;;) {
+      await sleep(POLL_INTERVAL_MS);
+      if (generationToken.current !== token) return null;
+      let res: ExpertDraftStatus;
+      try {
+        res = await api.experts.generateStatus(id);
+        errors = 0;
+      } catch (e) {
+        // A transient disconnect should not abandon a running job.
+        errors += 1;
+        if (errors >= MAX_POLL_ERRORS) throw e;
+        continue;
+      }
+      if (generationToken.current !== token) return null;
+      setJob(res.job ?? null);
+      if (res.status !== 'running') return res;
+    }
+  };
+
+  /** Shared tail of generate + revise: wait, then show the outcome. */
+  const runJob = async (start: () => Promise<ExpertDraftStatus>, backTo: Step) => {
+    const token = ++generationToken.current;
+    setJob(null);
+    setStep('generating');
+    try {
+      const started = await start();
+      if (generationToken.current !== token) return;
+      setDraftId(started.draft_id);
+      setJob(started.job ?? null);
+      runningDraft.current = started.draft_id;
+      const res = await waitForJob(started.draft_id, token);
+      if (!res) return; // cancelled or closed
+      runningDraft.current = null;
+      if ((res.status === 'done' || res.status === 'partial') && res.preview) {
+        setPreview(res.preview);
+        setRoundsLeft(res.rounds_left ?? 0);
+        setFeedback('');
+        setStep('preview');
+        if (res.status === 'partial') toast.info(t('experts.generate.partialToast'));
+        return;
+      }
+      const message =
+        res.status === 'cancelled' ? t('experts.generate.cancelled') : res.job?.error || '';
+      toast.error(intl.formatMessage({ id: 'experts.generate.failed' }, { message }));
+      setStep(backTo);
+    } catch (e) {
+      if (generationToken.current !== token) return;
+      stopRunningJob(); // we can no longer follow it, so stop it
+      toast.error(intl.formatMessage({ id: 'experts.generate.failed' }, { message: formatError(e) }));
+      setStep(backTo);
+    }
+  };
+
   const handleGenerate = async () => {
     if (!description.trim()) {
       toast.error(t('experts.generate.needDescription'));
       return;
     }
-    const token = ++generationToken.current;
-    setStep('generating');
-    try {
-      const res = await api.experts.generate({
-        industry_hint: industryHint.trim(),
-        description: description.trim(),
-        team_size: teamSize,
-        channels,
-      });
-      if (generationToken.current !== token) return; // cancelled
-      setDraftId(res.draft_id);
-      setPreview(res.preview);
-      setRoundsLeft(res.rounds_left);
-      setFeedback('');
-      setStep('preview');
-    } catch (e) {
-      if (generationToken.current !== token) return;
-      toast.error(intl.formatMessage({ id: 'experts.generate.failed' }, { message: formatError(e) }));
-      setStep('form');
-    }
+    await runJob(
+      () =>
+        api.experts.generate({
+          industry_hint: industryHint.trim(),
+          description: description.trim(),
+          team_size: teamSize,
+          channels,
+          research,
+        }),
+      'form',
+    );
   };
 
   const handleRevise = async () => {
@@ -147,31 +236,23 @@ export function GenerateExpertDialog({
       toast.error(t('experts.generate.needFeedback'));
       return;
     }
-    const token = ++generationToken.current;
-    setRevising(true);
-    try {
-      const res = await api.experts.generateRevise(draftId, feedback.trim());
-      if (generationToken.current !== token) return;
-      setPreview(res.preview);
-      setRoundsLeft(res.rounds_left);
-      setFeedback('');
-    } catch (e) {
-      if (generationToken.current !== token) return;
-      toast.error(intl.formatMessage({ id: 'experts.generate.failed' }, { message: formatError(e) }));
-    } finally {
-      if (generationToken.current === token) setRevising(false);
-    }
+    await runJob(() => api.experts.generateRevise(draftId, feedback.trim()), 'preview');
   };
 
   const handleInstall = async () => {
     if (!draftId) return;
     setStep('installing');
     try {
-      await api.experts.installDraft(draftId, attachUnder || undefined);
+      const res = await api.experts.installDraft(draftId, attachUnder || undefined);
+      onInstalled();
+      if (res.placement && !res.placement.complete) {
+        setPlacement(res.placement);
+        setStep('installed');
+        return;
+      }
       toast.success(t('experts.install.success'));
       reset();
       onOpenChange(false);
-      onInstalled();
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: formatError(e) }));
       setStep('preview');
@@ -180,7 +261,8 @@ export function GenerateExpertDialog({
 
   const cancelGeneration = () => {
     generationToken.current += 1;
-    setStep(draftId ? 'preview' : 'form');
+    stopRunningJob();
+    setStep(preview ? 'preview' : 'form');
   };
 
   return (
@@ -243,7 +325,7 @@ export function GenerateExpertDialog({
             <div className="space-y-1.5">
               <span className="text-sm font-medium">{t('experts.generate.channels')}</span>
               <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3">
-                {CHANNEL_OPTIONS.filter(ch => policy.allows('channels', ch.value)).map((ch) => (
+                {CHANNEL_OPTIONS.filter((ch) => policy.allows('channels', ch.value)).map((ch) => (
                   <label
                     key={ch.value}
                     className="flex items-center gap-2 text-sm text-muted-foreground"
@@ -257,99 +339,50 @@ export function GenerateExpertDialog({
                 ))}
               </div>
             </div>
+            <label className="flex items-start gap-2 text-sm">
+              <Checkbox
+                checked={research}
+                onCheckedChange={(v) => setResearch(v === true)}
+                className="mt-0.5"
+              />
+              <span>
+                {t('experts.generate.research')}
+                <span className="block text-xs text-muted-foreground">
+                  {t('experts.generate.researchHint')}
+                </span>
+              </span>
+            </label>
           </div>
         )}
 
-        {(step === 'generating' || step === 'installing') && (
-          <div className="flex flex-col items-center gap-3 py-10">
-            {step === 'generating' ? (
-              // AI is generating the expert team spec — big center-stage
-              // "thinking" moment; `decorative` since the paragraph below
-              // already announces the same state as text.
-              <ThinkingOrbIndicator state="waiting" decorative />
-            ) : (
-              <Spinner className="size-6" />
-            )}
-            <p className="text-sm text-muted-foreground">
-              {step === 'generating'
-                ? t('experts.generate.generating')
-                : t('experts.installing')}
-            </p>
-            {step === 'generating' && (
-              <Button variant="ghost" size="sm" onClick={cancelGeneration}>
-                {t('common.cancel')}
-              </Button>
-            )}
+        {step === 'generating' && (
+          <div className="flex flex-col items-center gap-4 py-6">
+            {/* `decorative`: the progress list below announces the state. */}
+            <ThinkingOrbIndicator state="waiting" decorative />
+            <p className="text-sm text-muted-foreground">{t('experts.generate.generating')}</p>
+            <GenerationProgress job={job} />
+            <Button variant="ghost" size="sm" onClick={cancelGeneration}>
+              {t('common.cancel')}
+            </Button>
           </div>
+        )}
+
+        {step === 'installing' && (
+          <div className="flex flex-col items-center gap-3 py-10">
+            <Spinner className="size-6" />
+            <p className="text-sm text-muted-foreground">{t('experts.installing')}</p>
+          </div>
+        )}
+
+        {step === 'installed' && placement && (
+          <InstallResult placement={placement} preview={preview} />
         )}
 
         {step === 'preview' && preview && (
           <div className="space-y-4">
-            <div className="rounded-lg border border-surface-border bg-muted/40 p-3">
-              <div className="flex items-center gap-2">
-                <h3 className="text-sm font-medium">{preview.display_name || preview.slug}</h3>
-                <span className="font-mono text-xs text-muted-foreground">{preview.slug}</span>
-              </div>
-              {preview.description && (
-                <p className="mt-1 text-xs text-muted-foreground">{preview.description}</p>
-              )}
-              <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-                <span className="inline-flex items-center gap-1">
-                  <Users className="size-3.5" />
-                  {intl.formatMessage({ id: 'experts.card.agents' }, { count: preview.agents.length })}
-                </span>
-                <span className="inline-flex items-center gap-1">
-                  <Puzzle className="size-3.5" />
-                  {intl.formatMessage({ id: 'experts.card.skills' }, { count: preview.skills.length })}
-                </span>
-                <span className="inline-flex items-center gap-1">
-                  <BookOpen className="size-3.5" />
-                  {intl.formatMessage({ id: 'experts.card.wiki' }, { count: preview.wiki_titles.length })}
-                </span>
-              </div>
-            </div>
+            <DraftPreview preview={preview} />
 
-            <div className="space-y-2">
-              <span className="text-sm font-medium">{t('experts.generate.roster')}</span>
-              <ul className="space-y-2">
-                {preview.agents.map((a) => (
-                  <li key={a.name} className="rounded-lg border border-surface-border p-2.5">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium">{a.display_name || a.name}</span>
-                      <Badge variant={a.role === 'front_desk' ? 'secondary' : 'ghost'}>
-                        {a.role === 'front_desk'
-                          ? t('experts.generate.roleFrontDesk')
-                          : t('experts.generate.roleWorker')}
-                      </Badge>
-                    </div>
-                    {a.soul_excerpt && (
-                      <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                        {a.soul_excerpt}
-                      </p>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </div>
-
-            {(preview.skills.length > 0 || preview.wiki_titles.length > 0) && (
-              <div className="flex flex-wrap gap-1.5 text-xs">
-                {preview.skills.map((s) => (
-                  <Badge key={`s-${s}`} variant="secondary">
-                    <Puzzle />
-                    {s}
-                  </Badge>
-                ))}
-                {preview.wiki_titles.map((w) => (
-                  <Badge key={`w-${w}`} variant="ghost">
-                    <BookOpen />
-                    {w}
-                  </Badge>
-                ))}
-              </div>
-            )}
-
-            <AttachUnderSelect value={attachUnder} onChange={setAttachUnder} disabled={revising} />
+            <AttachUnderSelect value={attachUnder} onChange={setAttachUnder} />
 
             <div className="space-y-1.5">
               <label className="text-sm font-medium" htmlFor="expert-gen-feedback">
@@ -367,10 +400,10 @@ export function GenerateExpertDialog({
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={revising || roundsLeft <= 0 || !feedback.trim()}
+                  disabled={roundsLeft <= 0 || !feedback.trim()}
                   onClick={handleRevise}
                 >
-                  {revising ? <Spinner className="size-3.5" /> : <RefreshCw />}
+                  <RefreshCw />
                   {t('experts.generate.revise')}
                 </Button>
                 <span className="text-xs text-muted-foreground">
@@ -397,13 +430,18 @@ export function GenerateExpertDialog({
           )}
           {step === 'preview' && (
             <>
-              <Button variant="outline" size="sm" onClick={() => close(false)} disabled={revising}>
+              <Button variant="outline" size="sm" onClick={() => close(false)}>
                 {t('common.cancel')}
               </Button>
-              <Button variant="brand" size="sm" onClick={handleInstall} disabled={revising}>
+              <Button variant="brand" size="sm" onClick={handleInstall}>
                 {t('experts.generate.install')}
               </Button>
             </>
+          )}
+          {step === 'installed' && (
+            <Button variant="brand" size="sm" onClick={() => close(false)}>
+              {t('experts.install.result.done')}
+            </Button>
           )}
         </DialogFooter>
       </DialogContent>
