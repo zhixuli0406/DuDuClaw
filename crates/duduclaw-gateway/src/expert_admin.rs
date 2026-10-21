@@ -30,6 +30,9 @@ pub enum PackKind {
     Native,
     ClaudePlugin,
     Skill,
+    /// Another platform's agent definition (豆包, OpenClaw, Hermes, Dify,
+    /// AGENTS.md family, Claude/Copilot subagents).
+    AgentImport,
 }
 
 impl PackKind {
@@ -38,6 +41,7 @@ impl PackKind {
             PackKind::Native => "expert.toml",
             PackKind::ClaudePlugin => "claude-plugin",
             PackKind::Skill => "agent-skill",
+            PackKind::AgentImport => "agent-import",
         }
     }
 }
@@ -69,6 +73,10 @@ pub struct InstallRecord {
     pub wiki_files: Vec<String>,
     #[serde(default)]
     pub installed_at: String,
+    /// Source format code of an agent import (`doubao`, `openclaw`, …);
+    /// empty for every other pack kind.
+    #[serde(default)]
+    pub source_format: String,
 }
 
 /// `<home>/experts`
@@ -483,6 +491,20 @@ pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, Str
         }
     }
 
+    // An agent import keeps its original under `<home>/imported/<slug>/`.
+    if rec.kind == PackKind::AgentImport && duduclaw_core::is_valid_agent_id(slug) {
+        let archive = home.join("imported").join(slug);
+        if archive.exists() {
+            let removed = std::fs::remove_dir_all(&archive).is_ok();
+            items.push(RemoveItem {
+                status: if removed { "removed" } else { "skipped" },
+                kind: "archive",
+                name: format!("imported/{slug}"),
+                detail: if removed { String::new() } else { "刪除失敗".into() },
+            });
+        }
+    }
+
     // The record dir itself.
     let rec_dir = experts_dir(home).join(slug);
     let _ = std::fs::remove_dir_all(&rec_dir);
@@ -500,9 +522,23 @@ pub fn upload_dir(home: &Path) -> PathBuf {
     home.join("tmp").join("expert-uploads")
 }
 
+/// Upload extensions the importer accepts: a zip, or a single-file agent
+/// definition (subagent / instructions `.md`, Dify `.yml` / `.yaml`).
+pub const UPLOAD_EXTENSIONS: &[&str] = &["zip", "md", "yml", "yaml"];
+
+/// The accepted extension of `name` (lowercase), if any.
+pub fn upload_extension(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    UPLOAD_EXTENSIONS
+        .iter()
+        .copied()
+        .find(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
 /// Sanitize a client-supplied filename into a safe basename: strips any
 /// directory components (zip-slip via `../evil.zip` or absolute paths),
-/// keeps only `[A-Za-z0-9._-]`, and guarantees a non-empty `.zip` name.
+/// keeps only `[A-Za-z0-9._-]`, and guarantees a non-empty name with an
+/// accepted extension (`.zip` when the client's is not one).
 pub fn sanitize_upload_name(raw: &str) -> String {
     // Take the last path component under BOTH separator conventions —
     // a Windows client may send `C:\dir\pack.zip`.
@@ -523,9 +559,10 @@ pub fn sanitize_upload_name(raw: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim_matches('.').to_string();
-    if cleaned.is_empty() || cleaned == ".zip" {
+    let bare_ext = UPLOAD_EXTENSIONS.iter().any(|e| cleaned.eq_ignore_ascii_case(&format!(".{e}")));
+    if cleaned.is_empty() || bare_ext {
         "pack.zip".to_string()
-    } else if cleaned.to_ascii_lowercase().ends_with(".zip") {
+    } else if upload_extension(&cleaned).is_some() {
         cleaned
     } else {
         format!("{cleaned}.zip")
@@ -555,6 +592,7 @@ mod tests {
             global_skills: vec![],
             wiki_files: vec![],
             installed_at: now_iso(),
+            source_format: String::new(),
         }
     }
 
@@ -796,6 +834,11 @@ mod tests {
         assert_eq!(sanitize_upload_name(""), "pack.zip");
         assert_eq!(sanitize_upload_name("...."), "pack.zip");
         assert_eq!(sanitize_upload_name("含中文 名.zip"), "_____.zip");
+        // Single-file agent definitions keep their extension.
+        assert_eq!(sanitize_upload_name("reviewer.agent.md"), "reviewer.agent.md");
+        assert_eq!(sanitize_upload_name("客服.yml"), "__.yml");
+        assert_eq!(sanitize_upload_name("evil.sh"), "evil.sh.zip");
+        assert_eq!(sanitize_upload_name(".md"), "md.zip");
         // No separators can survive.
         for bad in ["a/../b.zip", "a\\b\\c.zip", "../x"] {
             let out = sanitize_upload_name(bad);

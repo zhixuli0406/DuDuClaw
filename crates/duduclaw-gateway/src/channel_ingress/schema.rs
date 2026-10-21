@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Schema version written to `PRAGMA user_version` after migration.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 const BASE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ingress (
       seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
@@ -95,6 +95,13 @@ const V3_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ingress_alert_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, reason TEXT NOT NULL,
       subject TEXT NOT NULL, at INTEGER NOT NULL);";
 
+/// Version 4 (v1.76 `@` routing): the employee an event was routed to when
+/// its snapshot was first taken, so recomputing the route (before running,
+/// before each send, on an operator retry) reuses it instead of deriving the
+/// one-shot addressee again.
+const V4_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ingress_routes (
+      id TEXT PRIMARY KEY, agent TEXT NOT NULL, one_shot INTEGER NOT NULL DEFAULT 0);";
+
 fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(BASE_SCHEMA).map_err(|e| e.to_string())?;
     add_missing(
@@ -143,6 +150,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     conn.execute_batch(V2_SCHEMA).map_err(|e| e.to_string())?;
     conn.execute_batch(V3_SCHEMA).map_err(|e| e.to_string())?;
+    conn.execute_batch(V4_SCHEMA).map_err(|e| e.to_string())?;
     // Before F2 every `failed` row had crossed the dispatch boundary
     // (reply rejected, expired, authority changed before delivery): it is
     // "executed, not delivered", never a plain retry.

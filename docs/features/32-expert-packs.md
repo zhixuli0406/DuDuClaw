@@ -19,7 +19,7 @@ An expert pack is a portable bundle of a team: one or more agents in a `reports_
 
 Each roster entry carries `name`, `role`, `reports_to` (in-pack supervisor), `department`, `rank`, a trigger keyword, and a skill list. `duduclaw expert pack` validates strictly before zipping (slug shape, duplicate names, `reports_to` cycles via topological sort, missing `soul.md`, SKILL.md frontmatter name must equal its directory name); `install` is lenient and reports problems instead of guessing fixes. `[expert.requires]` lists env vars and binaries doctor-style — missing ones warn, never block.
 
-Two foreign formats install through the same command: a Claude Code plugin (`.claude-plugin/plugin.json`) and a single Agent Skill (`SKILL.md`). Format detection is fail-closed — an unrecognised layout is rejected with a listing of what was found, never half-imported.
+Foreign formats install through the same command: a Claude Code plugin (`.claude-plugin/plugin.json`), a single Agent Skill (`SKILL.md`), and agent definitions from other platforms (Doubao partner packages, OpenClaw, Hermes, `AGENTS.md` / `CLAUDE.md` / `GEMINI.md`, Claude Code / Copilot subagents, Dify app exports; see [Importing AI staff from other platforms](../guides/agent-config-import.md)). Format detection is fail-closed — an unrecognised layout is rejected with a listing of what was found, never half-imported.
 
 ## One Format, One Front Door
 

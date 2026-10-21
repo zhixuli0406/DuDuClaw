@@ -84,6 +84,10 @@ pub enum PackCommands {
         /// Preset packs: overwrite an existing preset of the same id.
         #[arg(long)]
         force: bool,
+        /// Write the machine-readable import report to this file (used by
+        /// the dashboard upload).
+        #[arg(long, hide = true)]
+        report_json: Option<PathBuf>,
     },
 }
 
@@ -104,6 +108,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
             trust_hooks,
             attach_under,
             force,
+            report_json,
         } => {
             install_pack(
                 &home,
@@ -114,6 +119,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
                     trust_hooks,
                     attach_under,
                     force,
+                    report_json,
                 },
             )
             .await
@@ -133,6 +139,7 @@ pub(crate) struct InstallOptions {
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
     pub force: bool,
+    pub report_json: Option<PathBuf>,
 }
 
 /// **The** pack install front door.
@@ -144,11 +151,20 @@ pub(crate) struct InstallOptions {
 /// falls through to the expert pipeline unchanged — those importers are the
 /// reason the detection there stays fail-closed and is not duplicated here.
 pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions) -> Result<()> {
+    refuse_in_ai_session(&crate::ai_session_guard::markers())?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
-    let dir = crate::expert::resolve_pack_source(source, &staging).await?;
-    let root = crate::expert::resolve_pack_root(&dir);
+    let resolved = crate::expert::resolve_pack_source_full(source, &staging).await?;
+    let root = crate::expert::resolve_pack_root(&resolved.dir);
+    let pipeline = crate::expert::PipelineOpts {
+        dry_run: opts.dry_run,
+        rename: opts.rename,
+        trust_hooks: opts.trust_hooks,
+        attach_under: opts.attach_under.clone(),
+        report_json: opts.report_json.clone(),
+        zip_summary: resolved.zip,
+    };
 
     match load_pack_dir(&root) {
         Ok(pack) => {
@@ -161,34 +177,36 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
                     install_preset_pack(home, &pack, Some(&root), opts.force, opts.dry_run)
                 }
                 PackKind::Team | PackKind::Template => {
-                    crate::expert::install_via_expert_pipeline(
-                        home,
-                        &root.to_string_lossy(),
-                        opts.dry_run,
-                        opts.rename,
-                        opts.trust_hooks,
-                        opts.attach_under,
-                    )
-                    .await
+                    crate::expert::install_via_expert_pipeline_with(home, &root.to_string_lossy(), pipeline)
+                        .await
                 }
             }
         }
-        // Not a pack dialect (plugin / single skill / unrecognised): the
-        // expert pipeline owns those, including the fail-closed rejection
-        // message for an unrecognised layout.
+        // Not a pack dialect (plugin / single skill / another platform's
+        // agent definition / unrecognised): the expert pipeline owns those,
+        // including the fail-closed rejection message for an unrecognised
+        // layout.
         Err(PackError::NotFound(_)) => {
-            crate::expert::install_via_expert_pipeline(
-                home,
-                &root.to_string_lossy(),
-                opts.dry_run,
-                opts.rename,
-                opts.trust_hooks,
-                opts.attach_under,
-            )
-            .await
+            crate::expert::install_via_expert_pipeline_with(home, &root.to_string_lossy(), pipeline).await
         }
         Err(e) => Err(cfg_err(e.to_string())),
     }
+}
+
+/// Installing a pack creates employees, writes their persona and prompt
+/// files and files approval requests — an operator action. Refused inside an
+/// AI employee's process (any DuDuClaw session marker present), like the
+/// other operator commands that change state (`ai_session_guard`). A first
+/// line only: the dashboard RPC spawns this command from the gateway, whose
+/// environment carries no employee markers.
+pub(crate) fn refuse_in_ai_session(markers: &[&str]) -> Result<()> {
+    if markers.is_empty() {
+        return Ok(());
+    }
+    Err(cfg_err(format!(
+        "AI 員工不能安裝或匯入 AI 團隊，請由管理者在儀表板或自己的終端機操作（偵測到 {}）",
+        markers.join("、")
+    )))
 }
 
 /// Install a job preset into `<home>/presets/<id>/preset.toml`.
@@ -1229,4 +1247,14 @@ reports_to = "front"
         let err = install_preset_pack(home.path(), &pack, None, true, false).unwrap_err();
         assert!(err.to_string().contains("非合法 slug"), "{err}");
     }
+
+#[cfg(test)]
+mod ai_session_tests {
+    #[test]
+    fn pack_install_is_refused_inside_an_ai_session() {
+        assert!(super::refuse_in_ai_session(&[]).is_ok());
+        let err = super::refuse_in_ai_session(&["DUDUCLAW_AGENT_ID"]).unwrap_err();
+        assert!(format!("{err}").contains("AI 員工不能安裝"), "{err}");
+    }
+}
 }

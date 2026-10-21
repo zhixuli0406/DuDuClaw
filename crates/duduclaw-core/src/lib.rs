@@ -63,7 +63,9 @@ pub mod traits;
 pub mod types;
 pub mod zh_variant;
 
-pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
+pub use agent_guard::{
+    check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES, INSTRUCTIONS_FILE,
+};
 pub use agent_rename::{rename_in_markdown, synced_trigger};
 pub use appliance::{appliance_default_bind, appliance_flag, is_appliance, pick_default_bind, APPLIANCE_ENV};
 pub use concurrency_gate::{
@@ -116,7 +118,7 @@ pub use org_field_guard::{
     check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
     check_identity_surface_write, check_identity_surface_write_as, resolve_real_path,
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
-    MCP_KEY_COMMANDS, check_own_contract_write, check_own_soul_write, check_protected_toml_write,
+    MCP_KEY_COMMANDS, check_own_contract_write, check_own_instructions_write, check_own_soul_write, check_protected_toml_write,
     check_protected_toml_write_as, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
     AGENT_CAPABILITY_SECTION, AGENT_EDITABLE_SECTIONS, AGENT_ORG_FIELDS, AGENT_SECURITY_KEYS,

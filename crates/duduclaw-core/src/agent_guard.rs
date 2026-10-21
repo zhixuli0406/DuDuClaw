@@ -10,6 +10,11 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// File name of the per-agent operating-instructions slot (imported
+/// AGENTS.md / CLAUDE.md / GEMINI.md, rules, subagent bodies). Loaded into
+/// every prompt after SOUL.md / IDENTITY.md; employees cannot write it.
+pub const INSTRUCTIONS_FILE: &str = "INSTRUCTIONS.md";
+
 /// Filenames that indicate an agent-structure file.
 ///
 /// Writes to these filenames are only allowed under `<home>/agents/<name>/`
@@ -24,6 +29,11 @@ pub const AGENT_STRUCTURE_FILES: &[&str] = &[
     "MEMORY.md",
     ".mcp.json",
     "CONTRACT.toml",
+    // Operating instructions imported from AGENTS.md / CLAUDE.md / GEMINI.md
+    // and similar files. Loaded into every prompt like SOUL.md, so it is
+    // just as off-limits to the employee itself (see
+    // `GuardDecision::BlockedOwnInstructionsWrite`).
+    "INSTRUCTIONS.md",
 ];
 
 /// Outcome of the guard check.
@@ -154,6 +164,18 @@ pub enum GuardDecision {
     /// RPC, which never runs through this hook. Another agent's contract is
     /// refused earlier by [`Self::BlockedForeignAgentDir`].
     BlockedOwnContractWrite {
+        caller: String,
+        attempted_path: PathBuf,
+    },
+    /// Instructions lock: an agent-identified caller tried to write
+    /// `INSTRUCTIONS.md` inside its OWN agent directory via
+    /// Write/Edit/MultiEdit/Bash. The file holds the operating instructions
+    /// an operator imported (AGENTS.md / CLAUDE.md / GEMINI.md, rules,
+    /// subagent bodies) and is loaded into every prompt, so — like the
+    /// contract — there is no opt-in flag; only an operator changes it.
+    /// Another agent's file is refused earlier by
+    /// [`Self::BlockedForeignAgentDir`].
+    BlockedOwnInstructionsWrite {
         caller: String,
         attempted_path: PathBuf,
     },
@@ -334,6 +356,14 @@ impl GuardDecision {
                  檔案：{}\n\
                  你的身分：{}\n\
                  如果需要調整界線，請告知管理者，由管理者在儀表板修改這份契約。",
+                attempted_path.display(),
+                caller
+            )),
+            Self::BlockedOwnInstructionsWrite { caller, attempted_path } => Some(format!(
+                "已封鎖：INSTRUCTIONS.md 是管理者為 AI 員工設定的工作規則，AI 員工不可直接改寫（即使是自己的）。\n\
+                 檔案：{}\n\
+                 你的身分：{}\n\
+                 如果需要調整工作規則，請告知管理者，由管理者處理。",
                 attempted_path.display(),
                 caller
             )),

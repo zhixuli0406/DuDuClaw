@@ -9,7 +9,17 @@ import { AttachmentChip } from './AttachmentChip';
  *  assistant's sits left on `bg-surface`, a system notice is destructive-toned.
  *  `leading` renders a small avatar to the left of an assistant/system bubble
  *  (the conversation partner's identity). */
-export function MessageBubble({ message, leading }: { message: ChatMessage; leading?: ReactNode }) {
+export function MessageBubble({
+  message,
+  leading,
+  label,
+}: {
+  message: ChatMessage;
+  leading?: ReactNode;
+  /** Small caption above an assistant bubble, e.g. who answered when a
+   *  message called another AI staff member by `@`. */
+  label?: string;
+}) {
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -26,6 +36,7 @@ export function MessageBubble({ message, leading }: { message: ChatMessage; lead
               : 'bg-surface text-surface-foreground ring-1 ring-surface-border',
         )}
       >
+        {label && !isUser && <div className="mb-1 text-xs font-medium text-muted-foreground">{label}</div>}
         {message.attachments && message.attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5">
             {message.attachments.map((a, i) => (

@@ -1777,6 +1777,7 @@ reason = "本店未設帳務職"
             global_skills: vec![],
             wiki_files: vec![],
             installed_at: crate::expert_admin::now_iso(),
+            source_format: String::new(),
         }];
         let v = builtin_catalog(Some(tmp.path()), &installed);
         assert_eq!(v["deployed"], true);
@@ -1913,6 +1914,7 @@ reason = "本店未設帳務職"
             global_skills: vec![],
             wiki_files: vec![],
             installed_at: crate::expert_admin::now_iso(),
+            source_format: String::new(),
         }];
         let v = gallery_cards(Some(tmp.path()), &installed);
         let cards = v["cards"].as_array().unwrap();
@@ -2060,6 +2062,7 @@ department = "設計"
             global_skills: vec![],
             wiki_files: vec![],
             installed_at: crate::expert_admin::now_iso(),
+            source_format: String::new(),
         }];
         let v = builtin_catalog(Some(tmp.path()), &installed);
         assert_eq!(v["packs"][1]["lead_agent_name"], "drafter");

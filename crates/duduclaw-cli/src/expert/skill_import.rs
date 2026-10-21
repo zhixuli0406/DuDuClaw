@@ -76,6 +76,7 @@ pub(super) async fn install(
         global_skills: Vec::new(),
         wiki_files: Vec::new(),
         installed_at: now_iso(),
+        source_format: String::new(),
     };
 
     // The scan + copy + record all happen in the shared primitive (which uses

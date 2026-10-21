@@ -23,6 +23,7 @@ use console::style;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
+pub(crate) mod agent_config;
 pub mod detect;
 pub mod hooks;
 mod install;
@@ -31,8 +32,11 @@ mod plugin;
 pub mod registry;
 mod safe_zip;
 mod skill_import;
+mod skills_cmd;
+mod source;
 mod team_convert;
 pub mod topo;
+mod zip_names;
 
 #[cfg(test)]
 mod tests;
@@ -47,8 +51,12 @@ const UI_LOCALE: &str = "zh-TW";
 // packs back to the pipeline below. These three re-exports are that handoff —
 // the pipeline itself is unchanged, which is what keeps "the installed result
 // is byte-identical to the old path" true rather than merely hoped for.
+#[cfg(test)]
 pub(crate) use install::cmd_install as install_via_expert_pipeline;
-pub(crate) use install::resolve_source as resolve_pack_source;
+pub(crate) use install::cmd_install_with as install_via_expert_pipeline_with;
+pub(crate) use source::resolve_source as resolve_pack_source;
+pub(crate) use source::resolve_source_full as resolve_pack_source_full;
+pub(crate) use install::PipelineOpts;
 pub(crate) use detect::resolve_root as resolve_pack_root;
 
 #[derive(Subcommand)]
@@ -117,6 +125,15 @@ pub enum ExpertCommands {
         slug: String,
     },
 
+    /// Apply the approval decision for the skills an agent import left
+    /// disabled (they ship scripts or need another vendor's tools):
+    /// approved → copied into the employee's skills; denied / expired →
+    /// stay disabled.
+    Skills {
+        /// Import slug (see `expert list`).
+        slug: String,
+    },
+
     /// Batch-convert legacy team playbooks (`teams/<industry>-team/`) into
     /// native expert packs (`expert.toml` + agents + skills + wiki SOP).
     /// Idempotent: output is deterministic from the sources; re-running
@@ -149,6 +166,7 @@ pub async fn run(cmd: ExpertCommands) -> Result<()> {
             install::cmd_export(&home, &slug, &format, out.as_deref()).await
         }
         ExpertCommands::Hooks { slug } => hooks::cmd_hooks(&home, &slug).await,
+        ExpertCommands::Skills { slug } => skills_cmd::cmd_skills(&home, &slug).await,
         ExpertCommands::ConvertTeams { teams_dir, out } => {
             team_convert::cmd_convert_teams(&teams_dir, out.as_deref())
         }
@@ -173,82 +191,8 @@ pub fn write_record(home: &Path, rec: &InstallRecord) -> Result<()> {
     duduclaw_gateway::expert_admin::write_record(home, rec).map_err(cfg_err)
 }
 
-// ─────────────────────────── Report ───────────────────────────
-
-/// Status of one planned/applied item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ItemStatus {
-    Imported,
-    Skipped,
-    Conflict,
-    Warning,
-    Ignored,
-}
-
-#[derive(Debug, Clone)]
-struct Item {
-    status: ItemStatus,
-    kind: String,
-    name: String,
-    detail: String,
-}
-
-/// A running import report — honest, never silently drops.
-#[derive(Debug, Default)]
-struct Report {
-    items: Vec<Item>,
-}
-
-impl Report {
-    fn add(&mut self, status: ItemStatus, kind: &str, name: &str, detail: impl Into<String>) {
-        self.items.push(Item {
-            status,
-            kind: kind.to_string(),
-            name: name.to_string(),
-            detail: detail.into(),
-        });
-    }
-    fn imported(&mut self, kind: &str, name: &str) {
-        self.add(ItemStatus::Imported, kind, name, "");
-    }
-    fn skipped(&mut self, kind: &str, name: &str, detail: impl Into<String>) {
-        self.add(ItemStatus::Skipped, kind, name, detail);
-    }
-    fn conflict(&mut self, kind: &str, name: &str, detail: impl Into<String>) {
-        self.add(ItemStatus::Conflict, kind, name, detail);
-    }
-    fn warning(&mut self, kind: &str, name: &str, detail: impl Into<String>) {
-        self.add(ItemStatus::Warning, kind, name, detail);
-    }
-    fn ignored(&mut self, kind: &str, name: &str, detail: impl Into<String>) {
-        self.add(ItemStatus::Ignored, kind, name, detail);
-    }
-
-    fn render_console(&self, dry_run: bool) {
-        let header = if dry_run {
-            "安裝計畫（--dry-run，未寫入）"
-        } else {
-            "安裝結果"
-        };
-        println!("\n  {}\n", style(header).bold());
-        for it in &self.items {
-            let (mark, tag) = match it.status {
-                ItemStatus::Imported => (style("✓").green(), style("匯入").green()),
-                ItemStatus::Skipped => (style("–").yellow(), style("略過").yellow()),
-                ItemStatus::Conflict => (style("!").red(), style("衝突").red()),
-                ItemStatus::Warning => (style("⚠").yellow(), style("警告").yellow()),
-                ItemStatus::Ignored => (style("·").dim(), style("忽略").dim()),
-            };
-            let detail = if it.detail.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", it.detail)
-            };
-            println!("  {mark} [{tag}] {}: {}{detail}", it.kind, it.name);
-        }
-        println!();
-    }
-}
+mod report;
+use report::Report;
 
 // ─────────────────────────── Security ───────────────────────────
 

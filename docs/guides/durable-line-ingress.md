@@ -61,7 +61,7 @@ A first run's `run_id` equals the `ingress_id`. An explicit `retry` or `rerun` s
 
 Before dispatch, before the reply and before every progress notice, the snapshot is computed again and compared with the one stored with the event. It covers only "who handles this message, with which rights":
 
-- Route: the resolved employee, its trigger/role/status, `[channels]`, `allowed_channels`, `default_agent`, and this user's employee binding.
+- Route: the resolved employee (after `@` routing for this sender, including a one-shot addressee the event claimed; the employee is decided once, when the first snapshot is taken, and stored in `ingress_routes` — later snapshots reuse it and only re-check that the sender may still call that employee; an event that can no longer go there is quarantined and the user gets a short "please send it again" reply; see [Calling AI staff with `@`](../features/62-calling-ai-staff.md)), its trigger/role/status, `[channels]`, `allowed_channels`, `default_agent`, and this user's employee binding.
 - Authority: the LINE credentials digest; the routed employee's effective configuration (`agent_resolved/<id>.toml` for an employee bound to a job preset, otherwise `agent.toml`): identity fields, capabilities, permissions, budget, container sandbox/network; this conversation's and the global allowlist, blocklist, pairing, admin, mention-only and binding settings; this user's pairing state.
 
 Adding an employee or editing an unrelated employee does not change the snapshot. Prompt text, SOUL, heartbeat and statistics do not either.

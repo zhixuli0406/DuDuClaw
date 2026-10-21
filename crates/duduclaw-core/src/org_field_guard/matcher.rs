@@ -379,6 +379,13 @@ pub(super) fn mentions_own_contract_toml(normalized_command: &str, caller_id: &s
     mentions_own_agent_file(normalized_command, caller_id, "contract.toml")
 }
 
+/// Instructions-lock companion of [`mentions_own_soul_md`]: whether
+/// `normalized_command` (already lowercased) targets `caller_id`'s OWN
+/// `INSTRUCTIONS.md` via Bash. Same per-token rules, same caveats.
+pub(super) fn mentions_own_instructions_md(normalized_command: &str, caller_id: &str) -> bool {
+    mentions_own_agent_file(normalized_command, caller_id, "instructions.md")
+}
+
 /// Shared body of the "own file" Bash matchers. `basename_lower` must be
 /// lowercase, matching the already-lowercased command.
 fn mentions_own_agent_file(normalized_command: &str, caller_id: &str, basename_lower: &str) -> bool {

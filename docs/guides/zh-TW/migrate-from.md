@@ -50,7 +50,10 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 會讀取 `openclaw.json`（JSON5），並匯入：
 
 - **Agents**：`agents.list[]`（或預設單一 `main`），連同各自的 workspace persona
-  （`SOUL.md`）與記憶（`MEMORY.md` / `USER.md` / `memory/*.md` 的條列）。
+  檔案照[匯入 AI 員工](agent-config-import.md#每個檔案的去處)的對應放置：`SOUL.md` →
+  SOUL、`IDENTITY.md` → IDENTITY（另寫入名稱與 emoji）、`AGENTS.md` → `INSTRUCTIONS.md`、
+  `USER.md`／`TOOLS.md`／`HEARTBEAT.md` → 知識頁、`MEMORY.md` 與 `memory/*.md` → 記憶（記下來源檔）。
+  1.76 之前這些人格檔被複製到 `agents/<id>/memory/`，沒有任何地方會讀。
 - **通道 token**：`channels.telegram.botToken`、`channels.discord.token`、
   `channels.slack.botToken` + `appToken`（加密寫入 config.toml）。WhatsApp 為
   linked-device，技術上不可轉移，故 `SKIPPED`。
@@ -74,7 +77,7 @@ Hermes 是單一 agent 平台，會產生一個 DuDuClaw agent（id `hermes`）�
 - **模型**：`config.yaml` 的 `model.default`。
 - **通道 token**（來自 `.env`）：`TELEGRAM_BOT_TOKEN`、`DISCORD_BOT_TOKEN`、
   `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`。`EMAIL_*` 通道 v1 尚未支援 → `SKIPPED`。
-- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`、`memories/USER.md`。
+- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`（記憶，依 `§` 分條）、`memories/USER.md`（知識頁「服務對象」）。
 - **Cron**：`cron/jobs.json`（防禦性解析）。
 - 只轉移 **active profile**；其餘 profile 會列為 `SKIPPED`，並提示用 `--source` 逐一轉。
 
