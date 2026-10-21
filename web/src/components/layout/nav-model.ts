@@ -419,8 +419,9 @@ export const navGroups: NavGroup[] = [
 // Personal gets a deliberately minimal sidebar: the daily row plus a handful
 // of primary surfaces, with every power-user page folded into a collapsed
 // 「進階」 group at the bottom (below 設定, which also starts collapsed).
-// Hidden entirely on Personal: AI 員工 LIVE staff zone, 授權 (see
-// `personalHidden` gates above / in `manageNav`). 公司 org chart is no longer
+// Hidden entirely on Personal: AI 員工 LIVE staff zone (see
+// `personalHidden` gates above / in `manageNav`). 授權 is shown on every
+// edition since 2026-10-21 — it is the upgrade path itself. 公司 org chart is no longer
 // unconditionally hidden (D6) — it lives in 進階 and progressively discloses
 // itself once the roster is ≥3 (`requiresData: 'org'`). 桌寵工作室 is
 // desktop-app-only everywhere (`desktopOnly`). Enterprise keeps the original
@@ -618,11 +619,13 @@ export const manageNav: NavItem[] = [
 export const manageAdvancedNav: NavItem[] = [
   // ── 1. 錢（客戶排序鐵律：帳務 → 授權 → 經銷，其餘一律排在後面）
   { to: '/manage/billing', icon: CreditCard, label: 'manage.billing', desc: 'manage.billing.desc', minRole: 'manager' },
-  // 授權 hidden on Personal (2026-07-29 client feedback). The page stays
-  // URL-reachable and ⌘K still finds it on other editions. N-3 (2026-08,
+  // 授權 is visible on every edition (2026-10-21). It was hidden on Personal
+  // (2026-07-29 client feedback), which made upgrading impossible: the edition
+  // is derived from the license tier, so a Personal user had to activate an
+  // Enterprise key on a page the Personal sidebar never offered. N-3 (2026-08,
   // `DESIGN-agent-os-native-apps-2026-08.md` §5): relocated out of
   // `/manage/*` into the 系統設定 app; `/manage/license` now redirects here.
-  { to: '/app/system/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
+  { to: '/app/system/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager' },
   // 經銷商管理 signs real, machine-fingerprint-bound OEM licences — an
   // Enterprise-only capability that a Personal instance has no counterpart for.
   // It was the one such surface missing its gate (10-ia-scatter-audit D8), so a
