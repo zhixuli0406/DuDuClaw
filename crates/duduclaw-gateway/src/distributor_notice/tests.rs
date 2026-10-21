@@ -160,8 +160,13 @@ fn compiled_notice_matches_the_build_input() {
 fn build_input_path_rules() {
     assert!(validate_notice_path("").is_err());
     assert!(validate_notice_path("relative/notice.html").is_err());
-    assert!(validate_notice_path("/tmp/a\nb.html").is_err());
-    assert!(validate_notice_path("/tmp/notice.html").is_ok());
+    // Build absolute paths for the host platform: `/tmp/…` is not absolute on
+    // Windows, where a drive or UNC prefix is required.
+    let base = std::env::temp_dir();
+    let newline = format!("{}", base.join("a\nb.html").display());
+    let good = format!("{}", base.join("notice.html").display());
+    assert!(validate_notice_path(&newline).is_err());
+    assert!(validate_notice_path(&good).is_ok());
 }
 
 #[test]
