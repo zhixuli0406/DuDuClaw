@@ -22,6 +22,11 @@ struct Item {
     kind: String,
     name: String,
     detail: String,
+    /// Stable message code + parameters the dashboard renders in the
+    /// viewer's language (`experts.report.msg.<code>`); `detail` stays the
+    /// zh-TW console text and the fallback.
+    code: Option<&'static str>,
+    params: serde_json::Value,
 }
 
 /// A running import report — honest, never silently drops.
@@ -70,6 +75,8 @@ impl Report {
                 "kind": i.kind,
                 "name": i.name,
                 "detail": i.detail,
+                "code": i.code,
+                "params": i.params,
             })).collect::<Vec<_>>(),
         })
     }
@@ -80,7 +87,17 @@ impl Report {
             kind: kind.to_string(),
             name: name.to_string(),
             detail: detail.into(),
+            code: None,
+            params: serde_json::Value::Null,
         });
+    }
+
+    /// Attach a message code and its parameters to the line just added.
+    pub(super) fn tag(&mut self, code: &'static str, params: serde_json::Value) {
+        if let Some(last) = self.items.last_mut() {
+            last.code = Some(code);
+            last.params = params;
+        }
     }
     pub(super) fn imported(&mut self, kind: &str, name: &str) {
         self.add(ItemStatus::Imported, kind, name, "");

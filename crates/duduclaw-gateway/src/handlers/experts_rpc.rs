@@ -65,14 +65,13 @@ impl MethodHandler {
         if !staged {
             return WsFrame::error_response("", "安裝來源必須是透過儀表板上傳的檔案（請重新上傳）");
         }
-        let accepted_file = src.is_file()
-            && src
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(crate::expert_admin::upload_extension)
-                .is_some();
-        if !src.is_dir() && !accepted_file {
-            return WsFrame::error_response("", "安裝來源必須是資料夾，或 .zip / .md / .yml 檔");
+        let accepted_ext = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::expert_admin::upload_extension)
+            .is_some();
+        if !accepted_ext {
+            return WsFrame::error_response("", "安裝來源必須是 .zip、.md 或 .yml 檔");
         }
         let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -104,6 +103,12 @@ impl MethodHandler {
             Ok(output) => WsFrame::ok_response(
                 "",
                 json!({ "success": true, "dry_run": dry_run, "output": output, "report": report }),
+            ),
+            // A failed run still wrote its report (what was detected, what was
+            // refused and why): hand it back so the dashboard can show it.
+            Err(e) if report.is_some() => WsFrame::ok_response(
+                "",
+                json!({ "success": false, "dry_run": dry_run, "error": e, "report": report }),
             ),
             Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
         }

@@ -199,8 +199,19 @@ fn plan_entries(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<ExtractP
     summary.legacy_encoding = decoded.legacy;
 
     let mut entries = Vec::with_capacity(kept.len());
+    // Two entries that land on the same path on a case-insensitive file
+    // system (macOS, Windows) would silently overwrite each other; refuse
+    // the archive instead of guessing which one wins.
+    let mut seen = std::collections::BTreeSet::new();
     for (i, name) in kept.into_iter().zip(decoded.names) {
         let rel = decoded_rel_path(&name)?;
+        let key = rel.to_string_lossy().to_lowercase();
+        if !seen.insert(key) {
+            return Err(cfg_err(format!(
+                "壓縮檔內有兩個項目的路徑相同（只差大小寫）：{}，無法判斷要用哪一個，已停止匯入",
+                rel.display()
+            )));
+        }
         entries.push((i, rel));
     }
     Ok(ExtractPlan { entries, summary })
@@ -219,7 +230,7 @@ fn decoded_rel_path(name: &str) -> Result<PathBuf> {
     if parts.is_empty() {
         return Err(refuse());
     }
-    if parts.contains(&"..") || is_drive_prefix(parts[0]) {
+    if parts.contains(&"..") || parts.iter().any(|p| !is_portable_component(p)) {
         return Err(refuse());
     }
     let rel: PathBuf = parts.iter().collect();
@@ -229,10 +240,23 @@ fn decoded_rel_path(name: &str) -> Result<PathBuf> {
     Ok(rel)
 }
 
-/// `C:` / `c:` — a Windows drive prefix as the first component.
-fn is_drive_prefix(first: &str) -> bool {
-    let b = first.as_bytes();
-    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+/// A path component that means the same thing on every platform the
+/// gateway runs on. Refused everywhere (not only on Windows), so an archive
+/// cannot behave differently depending on the host:
+/// - `:` (drive prefixes, NTFS alternate data streams `a.md:stream`);
+/// - a trailing `.` or space (Windows strips them, so `x.md.` aliases `x.md`);
+/// - the reserved device names `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+///   `LPT1`–`LPT9`, case-insensitive, with or without an extension.
+fn is_portable_component(c: &str) -> bool {
+    if c.contains(':') || c.ends_with('.') || c.ends_with(' ') {
+        return false;
+    }
+    let stem = c.split('.').next().unwrap_or(c).trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    !reserved
 }
 
 /// A relative path is safe iff it contains only `Normal` components (no `..`,
@@ -518,6 +542,52 @@ mod tests {
         assert!(decoded_rel_path("C:/Windows/x").is_err());
         assert!(decoded_rel_path("/etc/passwd").is_err());
         assert_eq!(decoded_rel_path("a\\b.md").unwrap(), PathBuf::from("a").join("b.md"));
-        assert_eq!(decoded_rel_path("時間:10.md").unwrap(), PathBuf::from("時間:10.md"));
+        // Portable names only: colons, trailing dots/spaces and Windows
+        // device names are refused on every platform.
+        for bad in ["時間:10.md", "a/b.md:stream", "x.md.", "x.md ", "CON", "aux.txt", "dir/Com1.md", "lpt9"] {
+            assert!(decoded_rel_path(bad).is_err(), "{bad}");
+        }
+        for ok in ["console.md", "com10.md", "lpt.md", "a.b/c.md", "時間-10.md"] {
+            assert!(decoded_rel_path(ok).is_ok(), "{ok}");
+        }
+    }
+
+    /// L1: two entries differing only in case are refused (fail closed).
+    #[test]
+    fn case_only_duplicate_paths_refuse_the_archive() {
+        let entries = vec![
+            (b"pack/SKILL.md".to_vec(), &b"a"[..]),
+            (b"pack/skill.md".to_vec(), &b"b"[..]),
+        ];
+        let (_tmp, res) = extract_bytes(&zip_with_raw_names(&entries));
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("大小寫"), "{err}");
+    }
+
+    /// Traversal hidden inside a legacy-encoded name: `..` and an absolute
+    /// path survive decoding as ASCII and are refused; a Big5 character whose
+    /// second byte is 0x5C (`\`) decodes to the character, not a separator.
+    #[test]
+    fn gbk_and_big5_names_cannot_traverse() {
+        for (enc, text) in [
+            (encoding_rs::GBK, "战略/../../逃逸.md"),
+            (encoding_rs::BIG5, "戰略/../../逃逸.md"),
+            (encoding_rs::BIG5, "/絕對路徑.md"),
+        ] {
+            let (raw, _, err) = enc.encode(text);
+            assert!(!err);
+            let entries = vec![(raw.into_owned(), &b"x"[..])];
+            let (tmp, res) = extract_bytes(&zip_with_raw_names(&entries));
+            assert!(res.is_err(), "{text} must be refused");
+            assert!(!tmp.path().join("逃逸.md").exists());
+        }
+        // 「許」in Big5 is 0xB3 0x5C: the trail byte is a backslash.
+        let (raw, _, err) = encoding_rs::BIG5.encode("許功蓋/說明.md");
+        assert!(!err);
+        assert!(raw.contains(&b'\\'));
+        let entries = vec![(raw.into_owned(), &b"x"[..])];
+        let (tmp, res) = extract_bytes(&zip_with_raw_names(&entries));
+        res.unwrap();
+        assert!(tmp.path().join("out").join("許功蓋").join("說明.md").is_file());
     }
 }

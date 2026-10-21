@@ -188,7 +188,12 @@ pub async fn request_enable(
         "slug": slug,
         "action": "enable_imported_skills",
         "skills": skills.iter().map(|s| format!("{}/{}", s.agent, s.name)).collect::<Vec<_>>(),
-        "digests": skills.iter().map(|s| s.digest.clone()).collect::<Vec<_>>(),
+        // What the administrator approves: each skill with the fingerprint
+        // of the exact files that were quarantined.
+        "entries": skills
+            .iter()
+            .map(|s| serde_json::json!({ "agent": s.agent, "name": s.name, "digest": s.digest }))
+            .collect::<Vec<_>>(),
     });
     let filed = match ApprovalBroker::open(home) {
         Ok(broker) => broker
@@ -262,7 +267,22 @@ pub async fn apply_skills_decision(home: &Path, slug: &str) -> Result<SkillsAppl
             let broker = ApprovalBroker::open(home)?;
             match broker.poll(&ApprovalId::from(id.clone())).await? {
                 ApprovalStatus::Approved => {
-                    let not_enabled = promote_all(home, slug, &state.skills);
+                    // The decided record must be this import's skills request;
+                    // its payload is what the administrator saw.
+                    let record = broker.get(&ApprovalId::from(id.clone())).await?;
+                    let Some(approved) = record.as_ref().and_then(|r| approved_digests(r, slug)) else {
+                        write_skills_state(
+                            home,
+                            slug,
+                            &SkillsState {
+                                status: SkillsStatus::Disabled,
+                                updated_at: now_iso(),
+                                ..state
+                            },
+                        )?;
+                        return Err("審核紀錄與這次匯入不符，技能維持停用".into());
+                    };
+                    let not_enabled = promote_all(home, slug, &state.skills, &approved);
                     let count = state.skills.len() - not_enabled.len();
                     write_skills_state(
                         home,
@@ -303,7 +323,32 @@ pub async fn apply_skills_decision(home: &Path, slug: &str) -> Result<SkillsAppl
 /// Copy each quarantined skill into its employee's `SKILLS/`. Returns the
 /// `agent/skill` entries that were not enabled (employee gone, name
 /// already taken, unsafe name, copy failure) — never overwrites.
-fn promote_all(home: &Path, slug: &str, skills: &[QuarantinedSkill]) -> Vec<String> {
+/// `agent/name → digest` from an approved record, only when it is a skills
+/// request for `slug`.
+fn approved_digests(
+    record: &crate::approval::ApprovalRecord,
+    slug: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    if record.action_kind != SKILLS_ACTION_KIND
+        || record.payload.get("slug").and_then(|v| v.as_str()) != Some(slug)
+    {
+        return None;
+    }
+    let entries = record.payload.get("entries")?.as_array()?;
+    let mut out = std::collections::BTreeMap::new();
+    for e in entries {
+        let s = |k: &str| e.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        out.insert(format!("{}/{}", s("agent")?, s("name")?), s("digest")?);
+    }
+    Some(out)
+}
+
+fn promote_all(
+    home: &Path,
+    slug: &str,
+    skills: &[QuarantinedSkill],
+    approved: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
     let mut not_enabled = Vec::new();
     for s in skills {
         let key = format!("{}/{}", s.agent, s.name);
@@ -316,16 +361,24 @@ fn promote_all(home: &Path, slug: &str, skills: &[QuarantinedSkill]) -> Vec<Stri
             not_enabled.push(key);
             continue;
         }
-        // The copy that takes effect must be the one that was approved.
-        let unchanged =
-            !s.digest.is_empty() && tree_digest(&src).map(|d| d == s.digest).unwrap_or(false);
-        if !unchanged {
-            tracing::warn!(slug, skill = %key, "quarantined skill changed after the approval request — not enabled");
+        // The copy that takes effect must be the one that was approved:
+        // copy into a hidden temp dir (outside the loader's view), digest
+        // that copy, and only then rename it into place — no window between
+        // checking and copying.
+        let Some(want) = approved.get(&key).filter(|d| !d.is_empty() && **d == s.digest) else {
             not_enabled.push(key);
             continue;
-        }
-        if copy_dir(&src, &dest).is_err() {
-            let _ = std::fs::remove_dir_all(&dest);
+        };
+        let tmp = agent_dir
+            .join("SKILLS")
+            .join(format!(".{}.importing-{}", s.name, uuid::Uuid::new_v4()));
+        let ok = copy_dir(&src, &tmp).is_ok()
+            && tree_digest(&tmp).map(|d| &d == want).unwrap_or(false)
+            && !dest.exists()
+            && std::fs::rename(&tmp, &dest).is_ok();
+        if !ok {
+            let _ = std::fs::remove_dir_all(&tmp);
+            tracing::warn!(slug, skill = %key, "imported skill differs from the approved files (or could not be copied) — not enabled");
             not_enabled.push(key);
         }
     }
@@ -441,5 +494,34 @@ mod tests {
             }
         );
         assert!(!h.join("agents/doubao-a1/SKILLS/swapped").exists());
+    }
+
+    #[test]
+    fn skills_approvals_are_dashboard_only() {
+        assert!(crate::approval_notify::is_dashboard_only_kind(SKILLS_ACTION_KIND));
+    }
+
+    /// An approved record of another kind or for another import never
+    /// enables anything.
+    #[tokio::test]
+    async fn approval_for_another_slug_or_kind_does_not_enable() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let mut s = skill("doubao-a1", "wrongkind");
+        seed(h, "pack4", &mut s);
+        request_enable(h, "pack4", vec![s.clone()]).await.unwrap();
+        // Point the state at an approved request of a different kind.
+        let broker = ApprovalBroker::open(h).unwrap();
+        let other = broker
+            .request("pack4", "expert_hooks_enable", "x", serde_json::json!({"slug": "pack4"}), 60)
+            .await
+            .unwrap();
+        broker.decide(&other, true, "admin").await.unwrap();
+        let mut st = read_skills_state(h, "pack4").unwrap();
+        st.approval_id = Some(other.to_string());
+        write_skills_state(h, "pack4", &st).unwrap();
+        assert!(apply_skills_decision(h, "pack4").await.is_err());
+        assert!(!h.join("agents/doubao-a1/SKILLS/wrongkind").exists());
+        assert_eq!(read_skills_state(h, "pack4").unwrap().status, SkillsStatus::Disabled);
     }
 }

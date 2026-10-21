@@ -427,16 +427,6 @@ pub async fn dispatch(
             failure.log(agent_id);
             return SandboxDispatch::Completed(Err(failure));
         };
-        let mut parts = Vec::new();
-        if let Some(soul) = &agent.soul {
-            parts.push(format!("# Soul\n{soul}"));
-        }
-        if let Some(identity) = &agent.identity {
-            parts.push(format!("# Identity\n{identity}"));
-        }
-        if let Some(s) = duduclaw_agent::instructions::render_section(agent.instructions.as_deref()) {
-            parts.push(s);
-        }
         TaskSpec {
             agent_id: if agent_id == "default" {
                 agent.config.agent.name.clone()
@@ -446,7 +436,7 @@ pub async fn dispatch(
             agent_dir: agent.dir.clone(),
             runtime: RuntimeType::Claude,
             model: agent.config.model.preferred.clone(),
-            system_prompt: parts.join("\n\n---\n\n"),
+            system_prompt: sandbox_system_prompt(agent),
             prompt: prompt.to_string(),
             network_access: agent.config.container.network_access,
             timeout: Duration::from_millis(agent.config.container.timeout_ms),
@@ -1186,3 +1176,41 @@ mod tests;
 mod tests_docker;
 #[cfg(all(test, unix))]
 mod tests_runner;
+
+/// The sandboxed task's system prompt: SOUL, IDENTITY and INSTRUCTIONS.
+fn sandbox_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
+    let mut parts = Vec::new();
+    if let Some(soul) = &agent.soul {
+        parts.push(format!("# Soul\n{soul}"));
+    }
+    if let Some(identity) = &agent.identity {
+        parts.push(format!("# Identity\n{identity}"));
+    }
+    if let Some(s) = duduclaw_agent::instructions::render_section(agent.instructions.as_deref()) {
+        parts.push(s);
+    }
+    parts.join("\n\n---\n\n")
+}
+
+#[cfg(test)]
+mod instructions_slot_tests {
+    #[tokio::test]
+    async fn sandbox_prompt_carries_instructions_after_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents").join("advisor");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[agent]\nname = \"advisor\"\ndisplay_name = \"A\"\nrole = \"worker\"\nstatus = \"active\"\ntrigger = \"@a\"\nreports_to = \"\"\nicon = \"x\"\n\n[model]\npreferred = \"claude-sonnet-4-6\"\nfallback = \"claude-haiku-4-5\"\naccount_pool = []\n\n[container]\ntimeout_ms = 60000\nmax_concurrent = 1\nreadonly_project = true\n\n[heartbeat]\nenabled = false\ninterval_seconds = 3600\nmax_concurrent_runs = 1\ncron = \"\"\n\n[budget]\nmonthly_limit_cents = 500\nwarn_threshold_percent = 80\nhard_stop = false\n\n[permissions]\ncan_create_agents = false\ncan_send_cross_agent = true\ncan_modify_own_skills = false\ncan_modify_own_soul = false\ncan_schedule_tasks = false\nallowed_channels = []\n\n[evolution]\nskill_auto_activate = false\nskill_security_scan = true\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("SOUL.md"), "SOUL-BODY").unwrap();
+        std::fs::write(dir.join("IDENTITY.md"), "IDENTITY-BODY").unwrap();
+        std::fs::write(dir.join("INSTRUCTIONS.md"), "INSTRUCTIONS-BODY").unwrap();
+        let agent = duduclaw_agent::registry::AgentRegistry::load_agent(&dir).await.unwrap();
+        let p = super::sandbox_system_prompt(&agent);
+        let ident = p.find("IDENTITY-BODY").unwrap();
+        let instr = p.find("# Instructions\nINSTRUCTIONS-BODY").expect("instructions injected");
+        assert!(p.find("SOUL-BODY").unwrap() < ident && ident < instr, "{p}");
+    }
+}

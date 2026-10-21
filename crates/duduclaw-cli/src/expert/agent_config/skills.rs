@@ -21,9 +21,11 @@ use super::vendor::{self, Need};
 use crate::expert::{ScanVerdict, scan_external};
 
 /// File extensions treated as executable scripts.
+/// `svg` and `html` count too: both can carry script that runs when opened.
 const SCRIPT_EXTS: &[&str] = &[
-    "py", "sh", "bash", "zsh", "js", "mjs", "cjs", "ts", "rb", "pl", "php", "lua", "ps1", "bat",
-    "cmd",
+    "py", "sh", "bash", "zsh", "fish", "js", "mjs", "cjs", "ts", "rb", "pl", "php", "lua", "ps1",
+    "psm1", "bat", "cmd", "vbs", "vbe", "wsf", "wsh", "hta", "command", "applescript", "scpt",
+    "svg", "html", "htm", "jar",
 ];
 
 /// Where a prepared skill goes.
@@ -47,6 +49,8 @@ pub struct PreparedSkill {
     pub verdict: Verdict,
     /// The name was changed from what the source used.
     pub renamed_from: Option<String>,
+    /// Files left out of the copy: credentials, hidden files, links.
+    pub dropped: Vec<String>,
 }
 
 /// Valid Agent Skills `name`.
@@ -169,6 +173,7 @@ pub fn prepare(
         needs: Vec::new(),
         verdict: Verdict::Enable,
         renamed_from,
+        dropped: Vec::new(),
     };
     if raw.trim().is_empty() {
         out.verdict = Verdict::Blocked("SKILL.md 無法讀取或是空的".into());
@@ -187,7 +192,7 @@ pub fn prepare(
         out.verdict = Verdict::Blocked(format!("內容安全檢查未通過：{reason}"));
         return out;
     }
-    if let Err(e) = crate::expert::copy_dir(&draft.dir, &staged_dir)
+    if let Err(e) = copy_skill_tree(&draft.dir, &staged_dir, "", &mut out.dropped)
         .and_then(|_| std::fs::write(staged_dir.join("SKILL.md"), &new_md))
     {
         out.verdict = Verdict::Blocked(format!("複製失敗：{e}"));
@@ -289,7 +294,33 @@ fn render_skill_md(
 }
 
 /// Binary formats that are plainly inert data inside a skill (images, PDFs).
-const INERT_BINARY_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"];
+const INERT_BINARY_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
+
+/// Copy a skill directory, leaving out credential files and folders
+/// (`.env`, `token.json`, `*.pem`, `credentials/` …), hidden entries and
+/// links. Left-out paths (relative, `/`-separated) go to `dropped` so the
+/// report can name them.
+fn copy_skill_tree(src: &Path, dest: &Path, rel: &str, dropped: &mut Vec<String>) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let mut entries: Vec<_> = std::fs::read_dir(src)?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let ft = e.file_type()?;
+        let secret = super::adapters::is_secret_file(&name) || (ft.is_dir() && super::adapters::is_secret_dir(&name));
+        if ft.is_symlink() || name.starts_with('.') || secret {
+            dropped.push(child_rel);
+            continue;
+        }
+        if ft.is_dir() {
+            copy_skill_tree(&e.path(), &dest.join(&name), &child_rel, dropped)?;
+        } else if ft.is_file() {
+            std::fs::copy(e.path(), dest.join(&name))?;
+        }
+    }
+    Ok(())
+}
 
 /// Anything that could run: a script extension, an executable bit, a `#!`
 /// line, or binary content that is not a known inert format (compiled
@@ -484,6 +515,45 @@ mod tests {
             &mut taken,
         );
         assert!(matches!(p.verdict, Verdict::Blocked(_)), "{:?}", p.verdict);
+    }
+
+    /// M1: credentials and hidden files never travel with a skill.
+    #[test]
+    fn secret_and_hidden_files_are_left_out_and_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("leaky");
+        std::fs::create_dir_all(src.join("credentials")).unwrap();
+        std::fs::create_dir_all(src.join("refs")).unwrap();
+        std::fs::write(src.join("SKILL.md"), "---\nname: leaky\ndescription: d\n---\nok\n").unwrap();
+        std::fs::write(src.join(".env"), "API_KEY=sk-1").unwrap();
+        std::fs::write(src.join("token.json"), "{}").unwrap();
+        std::fs::write(src.join("refs/server.pem"), "-----BEGIN").unwrap();
+        std::fs::write(src.join("credentials/creds.json"), "{}").unwrap();
+        std::fs::write(src.join(".hidden.md"), "x").unwrap();
+        std::fs::write(src.join("refs/guide.md"), "# ok").unwrap();
+        let mut taken = BTreeSet::new();
+        let p = prepare(&draft(&src, None), &tmp.path().join("stage"), "doubao", &mut taken);
+        assert_eq!(p.verdict, Verdict::Enable, "{:?}", p.verdict);
+        for gone in [".env", "token.json", "refs/server.pem", "credentials", ".hidden.md"] {
+            assert!(!p.staged_dir.join(gone).exists(), "{gone} copied");
+            assert!(p.dropped.iter().any(|d| d == gone), "{gone} not reported: {:?}", p.dropped);
+        }
+        assert!(p.staged_dir.join("refs/guide.md").is_file());
+    }
+
+    /// L6: `.vbs`, `.wsf`, `.command` and `.svg` are treated as active content.
+    #[test]
+    fn windows_and_macos_script_types_and_svg_quarantine() {
+        for f in ["run.vbs", "job.wsf", "open.command", "chart.svg"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("s");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("SKILL.md"), "---\nname: s\ndescription: d\n---\nok\n").unwrap();
+            std::fs::write(src.join(f), "text").unwrap();
+            let mut taken = BTreeSet::new();
+            let p = prepare(&draft(&src, None), &tmp.path().join("stage"), "doubao", &mut taken);
+            assert!(matches!(p.verdict, Verdict::Quarantine(_)), "{f}: {:?}", p.verdict);
+        }
     }
 
     #[test]

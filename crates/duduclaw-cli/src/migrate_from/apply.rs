@@ -445,11 +445,13 @@ pub(super) async fn write_persona_slots(
     draft: &crate::expert::agent_config::ir::AgentDraft,
     source_root: &Path,
 ) {
+    // Lineage on the original files: forget-source accepts `import:<path>`.
+    let prefix = format!("{}/", source_root.display());
     let slot_ctx = crate::expert::agent_config::slots::SlotCtx {
         home: &ctx.home,
         agent_id,
         dry_run: !ctx.apply,
-        lineage_base: source_root,
+        lineage_prefix: &prefix,
         format_code: ctx.platform.as_str(),
         apply_identity_fields: true,
     };

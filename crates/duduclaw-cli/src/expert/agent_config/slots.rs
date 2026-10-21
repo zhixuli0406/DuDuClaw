@@ -25,14 +25,16 @@ use super::md;
 use super::outcome::Outcome;
 use crate::expert::{ScanVerdict, scan_external};
 
-/// Where memory lineage points: `<base>/<doc.source>` is the canonical id of
+/// Where memory lineage points: `<prefix><doc.source>` is the source id of
 /// each imported memory file, so `duduclaw memory forget-source --session
-/// import:<that path>` revokes everything one file contributed.
+/// "import:<that id>"` revokes everything one file contributed. The pack
+/// importer uses `agent-import:<slug>/` (no host path ever reaches a report
+/// or the dashboard); `migrate from` uses the absolute source folder.
 pub struct SlotCtx<'a> {
     pub home: &'a Path,
     pub agent_id: &'a str,
     pub dry_run: bool,
-    pub lineage_base: &'a Path,
+    pub lineage_prefix: &'a str,
     /// Short source code for wiki paths and tags (`doubao`, `openclaw`, …).
     pub format_code: &'a str,
     /// Patch `agent.toml` display name / icon from IDENTITY.md.
@@ -65,11 +67,14 @@ pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> 
             &mut out,
         );
         if len > 20_000 {
-            out.push(Outcome::warning(
-                "instructions",
-                &doc.source,
-                format!("工作規則有 {len} 字，較長；精簡模式只會放入前段"),
-            ));
+            out.push(
+                Outcome::warning(
+                    "instructions",
+                    &doc.source,
+                    format!("工作規則有 {len} 字，較長；精簡模式只會放入前段"),
+                )
+                .with("slot.instructions_long", serde_json::json!({ "chars": len })),
+            );
         }
     }
     let pages = [
@@ -158,25 +163,24 @@ fn write_file_slot(
     out: &mut Vec<Outcome>,
 ) {
     if let ScanVerdict::Blocked(reason) = scan_external(&doc.text) {
-        out.push(Outcome::skipped(
-            kind,
-            &doc.source,
-            format!("內容安全檢查未通過，未寫入：{reason}"),
-        ));
+        out.push(
+            Outcome::skipped(kind, &doc.source, format!("內容安全檢查未通過，未寫入：{reason}"))
+                .with("slot.blocked", serde_json::json!({ "slot": kind })),
+        );
         return;
     }
+    let done = |o: Outcome| o.with("slot.written", serde_json::json!({ "slot": kind }));
     if ctx.dry_run {
-        out.push(Outcome::imported(kind, &doc.source, format!("→ {label}")));
+        out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}"))));
         return;
     }
     let path = ctx.home.join("agents").join(ctx.agent_id).join(file);
     match std::fs::write(&path, &doc.text) {
-        Ok(()) => out.push(Outcome::imported(kind, &doc.source, format!("→ {label}"))),
-        Err(e) => out.push(Outcome::skipped(
-            kind,
-            &doc.source,
-            format!("寫入失敗：{e}"),
-        )),
+        Ok(()) => out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}")))),
+        Err(e) => out.push(
+            Outcome::skipped(kind, &doc.source, format!("寫入失敗：{e}"))
+                .with("slot.failed", serde_json::json!({ "slot": kind })),
+        ),
     }
 }
 
@@ -205,11 +209,10 @@ fn patch_identity_fields(ctx: &SlotCtx<'_>, draft: &AgentDraft, out: &mut Vec<Ou
         }
     });
     if let Err(e) = res {
-        out.push(Outcome::warning(
-            "identity",
-            ctx.agent_id,
-            format!("名稱／圖示未套用：{e}"),
-        ));
+        out.push(
+            Outcome::warning("identity", ctx.agent_id, format!("名稱／圖示未套用：{e}"))
+                .with("slot.failed", serde_json::json!({ "slot": "identity" })),
+        );
     }
 }
 
@@ -255,29 +258,29 @@ fn write_wiki(
         duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
     );
     if scan.blocked {
-        out.push(Outcome::skipped(
-            kind,
-            &doc.source,
-            format!(
-                "偵測到提示注入風險（規則 {}），未寫入",
-                scan.matched_rules.join("/")
-            ),
-        ));
+        out.push(
+            Outcome::skipped(
+                kind,
+                &doc.source,
+                format!("偵測到提示注入風險（規則 {}），未寫入", scan.matched_rules.join("/")),
+            )
+            .with("slot.blocked", serde_json::json!({ "slot": kind })),
+        );
         return;
     }
     let where_ = format!("→ 知識頁「{title}」");
+    let done = |o: Outcome| o.with("slot.wiki", serde_json::json!({ "slot": kind, "title": title }));
     if ctx.dry_run {
-        out.push(Outcome::imported(kind, &doc.source, where_));
+        out.push(done(Outcome::imported(kind, &doc.source, where_)));
         return;
     }
     let store =
         duduclaw_memory::WikiStore::new(ctx.home.join("agents").join(ctx.agent_id).join("wiki"));
     if let Err(e) = store.ensure_scaffold() {
-        out.push(Outcome::skipped(
-            kind,
-            &doc.source,
-            format!("建立知識庫失敗：{e}"),
-        ));
+        out.push(
+            Outcome::skipped(kind, &doc.source, format!("建立知識庫失敗：{e}"))
+                .with("slot.failed", serde_json::json!({ "slot": kind })),
+        );
         return;
     }
     let now = chrono::Utc::now();
@@ -303,12 +306,11 @@ fn write_wiki(
     };
     let content = duduclaw_memory::serialize_page(&page);
     match store.write_page_with_author(rel_path, &content, "import") {
-        Ok(()) => out.push(Outcome::imported(kind, &doc.source, where_)),
-        Err(e) => out.push(Outcome::skipped(
-            kind,
-            &doc.source,
-            format!("寫入失敗：{e}"),
-        )),
+        Ok(()) => out.push(done(Outcome::imported(kind, &doc.source, where_))),
+        Err(e) => out.push(
+            Outcome::skipped(kind, &doc.source, format!("寫入失敗：{e}"))
+                .with("slot.failed", serde_json::json!({ "slot": kind })),
+        ),
     }
 }
 
@@ -316,14 +318,15 @@ async fn write_memory(ctx: &SlotCtx<'_>, docs: &[Doc], out: &mut Vec<Outcome>) {
     let engine = if ctx.dry_run {
         None
     } else {
-        match duduclaw_memory::SqliteMemoryEngine::new(&ctx.home.join("memory.db")) {
+        // Same construction as every gateway write path, so the
+        // supersession trust guard and the novelty gate apply to imports too.
+        match duduclaw_gateway::memory_factory::build_memory_engine(&ctx.home.join("memory.db"), ctx.home) {
             Ok(e) => Some(e),
             Err(e) => {
-                out.push(Outcome::skipped(
-                    "memory",
-                    ctx.agent_id,
-                    format!("開啟記憶資料庫失敗：{e}"),
-                ));
+                out.push(
+                    Outcome::skipped("memory", ctx.agent_id, format!("開啟記憶資料庫失敗：{e}"))
+                        .with("slot.failed", serde_json::json!({ "slot": "memory" })),
+                );
                 return;
             }
         }
@@ -331,12 +334,16 @@ async fn write_memory(ctx: &SlotCtx<'_>, docs: &[Doc], out: &mut Vec<Outcome>) {
     for doc in docs {
         let facts = md::extract_facts(&doc.text);
         if facts.is_empty() {
-            out.push(Outcome::skipped("memory", &doc.source, "沒有可匯入的條目"));
+            out.push(
+                Outcome::skipped("memory", &doc.source, "沒有可匯入的條目")
+                    .with("slot.memory_empty", serde_json::json!({})),
+            );
             continue;
         }
-        let source_id = duduclaw_memory::lineage::canonical_import_id(
-            &ctx.lineage_base.join(&doc.source).to_string_lossy(),
-        );
+        let source_id = duduclaw_memory::lineage::canonical_import_id(&format!(
+            "{}{}",
+            ctx.lineage_prefix, doc.source
+        ));
         let (mut stored, mut blocked, mut kept) = (0usize, 0usize, 0usize);
         for fact in &facts {
             let scan = duduclaw_security::input_guard::scan_input(
@@ -367,10 +374,11 @@ async fn write_memory(ctx: &SlotCtx<'_>, docs: &[Doc], out: &mut Vec<Outcome>) {
         if !ctx.dry_run {
             detail.push_str(&format!("；撤回指令：duduclaw memory forget-source --agent {} --session \"import:{source_id}\"", ctx.agent_id));
         }
+        let params = serde_json::json!({ "stored": stored, "blocked": blocked, "kept": kept });
         out.push(if stored > 0 {
-            Outcome::imported("memory", &doc.source, detail)
+            Outcome::imported("memory", &doc.source, detail).with("slot.memory", params)
         } else {
-            Outcome::skipped("memory", &doc.source, detail)
+            Outcome::skipped("memory", &doc.source, detail).with("slot.memory_none", params)
         });
     }
 }

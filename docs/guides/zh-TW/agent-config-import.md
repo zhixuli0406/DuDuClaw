@@ -48,13 +48,13 @@ duduclaw pack install ~/.openclaw                     # 資料夾也可以
 | `skills/<名稱>/SKILL.md` | 員工的技能 | 見下面「技能」。 |
 | 子代理裡的 MCP 伺服器 | 不匯入 | 伺服器是 DuDuClaw 會執行或連線的東西，匯入不會自動加上。報告會逐一列出，信得過的再到儀表板自行設定。 |
 | `model` | `[model] preferred` | 只接受 Claude 模型代號。其他模型（`doubao-*`、`gpt-*` 等）會在報告註明，改用預設模型。 |
-| `tools`／`disallowedTools` | `allowed_tools`／`denied_tools` | 只會收窄。DuDuClaw 不認得的名稱會丟掉並列出。來源有限制工具、但名稱一個都對不上時，會關閉執行指令、寫檔與抓網頁，不會變成全部開放。 |
+| `tools`／`disallowedTools` | `allowed_tools`／`denied_tools` | 只會收窄。DuDuClaw 不認得的名稱會丟掉並列出。允許清單一律保留 DuDuClaw 自己的工具（`mcp__duduclaw__*`：知識庫、記憶、任務、委派）。來源有限制工具、但名稱一個都對不上時，會關閉執行指令、寫檔與抓網頁，不會變成全部開放。 |
 | `BOOTSTRAP.md`、`CLAUDE.local.md` | 略過 | 一次性設定與個人檔案。 |
 | 其他檔案 | 保存在 `<home>/imported/<代號>/source/` | 報告會列出。只保存匯入讀過或列出的檔案；金鑰檔、平台設定檔（`openclaw.json`、Hermes `config.yaml`）、對話紀錄與隱藏資料夾不保存。 |
 
 同時有好幾個操作指令檔時，照這個順序取第一個，其餘列為略過：`AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md` → `.github/copilot-instructions.md`。內容只有 `@AGENTS.md` 這一行的檔案，會直接讀它指向的檔。
 
-員工代號取來源名稱的英數字形式。名稱沒有英數字（例如中文的夥伴名稱）時，代號是「格式-ref」，例如 `doubao-a1`；顯示名稱仍是中文。
+員工代號取來源名稱的英數字形式。名稱沒有英數字（例如中文的夥伴名稱）時，代號是「格式-ref」，例如 `doubao-a1`；顯示名稱仍是中文。通道裡用「@顯示名稱」和「@代號」呼叫員工，所以新員工不會用到團隊裡別人已經在用的名稱、呼叫詞或代號：撞到時代號加上 `-imported`、顯示名稱加上「（代號）」，報告裡會註明。
 
 ## 技能
 
@@ -62,7 +62,7 @@ duduclaw pack install ~/.openclaw                     # 資料夾也可以
 
 以下技能會**先停用**，等管理者核准：
 
-- 附有可執行腳本或程式（`.py`、`.sh`、`.js` 等、`#!` 開頭的檔、可執行檔，或圖片與 PDF 以外的二進位內容）；
+- 附有可執行腳本或程式（`.py`、`.sh`、`.js` 等、`#!` 開頭的檔、可執行檔，或圖片與 PDF 以外的二進位內容；`.svg`、`.html`、`.vbs`、`.wsf`、`.command` 也算）；
 - 依賴 DuDuClaw 沒有的工具：飛書文件與 API、豆包內建工具（例如「構建網頁應用」）、扣子外掛、Microsoft 365 Graph。
 
 這些技能放在員工資料夾外面等待，匯入時會在儀表板「待辦」送出一筆審核，並記下每個技能的內容指紋；送審後內容被改過的技能不會啟用。核准後在 AI 團隊卡片按「套用」（或執行 `duduclaw expert skills <代號>`），技能才會加到員工身上，已有同名技能時不覆蓋。拒絕或逾期就維持停用。只是零星提到這些工具的技能會照常安裝，報告裡會提醒。
@@ -74,15 +74,17 @@ SKILL.md 沒通過內容安全檢查，或任何文字附件沒通過提示注�
 - 員工之後不能改 SOUL 與 INSTRUCTIONS，所以匯入當下是唯一的檢查點。這兩份和其他所有匯入的文字都會經過提示注入檢查；SOUL 與 INSTRUCTIONS 另外再過技能安全掃描。SOUL 沒通過，那位員工就不匯入；操作指令檔沒通過，就不寫入並在報告註明。
 - 金鑰一律不匯入：`.env`、`auth.json`、`auth-profiles.json` 等檔案不讀也不保存，`openclaw.json` 裡的通道金鑰在這裡不處理，Dify 的機密變數直接丟掉。
 - OpenClaw 工作區路徑指到上傳資料夾以外時，不會去讀。
-- 壓縮檔：略過 `__MACOSX/`、`._*`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。檔名先當 UTF-8 讀（有標記，或像 macOS 那樣沒標記），中文 Windows 做的壓縮檔再試 GBK 或 Big5。都對不上，或 GBK 與 Big5 一樣可能時，會拒絕上傳並在訊息裡顯示原始位元組，不會寫出亂碼檔名。符號連結不解開。專家包的大小、項目數與壓縮比上限一樣適用。
+- 壓縮檔：略過 `__MACOSX/`、`._*`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。檔名先當 UTF-8 讀（有標記，或像 macOS 那樣沒標記），中文 Windows 做的壓縮檔再試 GBK 或 Big5。都對不上，或 GBK 與 Big5 一樣可能時，會拒絕上傳並在訊息裡顯示原始位元組，不會寫出亂碼檔名。符號連結不解開。檔名在每種系統上都要代表同一件事，所以含 `:`、結尾是句點或空白、Windows 裝置名稱（`CON`、`NUL`、`COM1` 等），以及只差大小寫的兩個項目，都會拒絕。專家包的大小、項目數與壓縮比上限一樣適用。
+- 技能裡的金鑰檔與隱藏檔（`.env`、`token.json`、`*.pem`、`credentials/`、點開頭的檔案）不會複製，並在報告列出。
+- AI 員工不能執行匯入：`duduclaw pack install` 與 `duduclaw expert skills` 在員工的工作階段裡會拒絕執行。
 - 員工不能用 Write、Edit、MultiEdit、Bash 或 `office_script` 改自己的 `INSTRUCTIONS.md`，和 SOUL.md、CONTRACT.toml 同樣的保護。
 
 ## 復原
 
-在 AI 團隊頁移除這次匯入（或 `duduclaw expert remove <代號>`），會刪掉它建立的員工、等待中的技能，以及 `<home>/imported/<代號>/` 的原始檔。匯入的記憶存在共用的記憶庫，用報告裡印出的指令撤回：
+在 AI 團隊頁移除這次匯入（或 `duduclaw expert remove <代號>`），會刪掉它建立的員工、等待中的技能，以及 `<home>/imported/<代號>/` 的原始檔。匯入的記憶存在共用的記憶庫，用報告「詳細」裡列出的指令撤回（來源代號不含電腦上的路徑）：
 
 ```bash
-duduclaw memory forget-source --agent <代號> --session "import:<home>/imported/<代號>/source/MEMORY.md"
+duduclaw memory forget-source --agent <代號> --session "import:agent-import:<import id>/MEMORY.md"
 ```
 
 ## 已知限制
@@ -90,4 +92,4 @@ duduclaw memory forget-source --agent <代號> --session "import:<home>/imported
 - 豆包安裝包沒有公開規格，匯入器照手上唯一的真實樣本實作；遇到不認得的 manifest 欄位與單元類型會列在報告，不會猜。
 - Dify 的工作流程圖不會轉換，只取第一個 LLM 節點的系統提示詞，流程請在 DuDuClaw 重建。Dify 知識庫的內容不在匯出檔裡，要重新上傳。
 - 規則資料夾（`.cursor/rules`、`.claude/rules`、`.agents/rules`、Windsurf、Cline、Kiro）只會列出，還不會套用。
-- 報告的說明文字在每一種儀表板語言下都是繁體中文。
+- 報告每一行都依儀表板語言顯示；「詳細」裡匯入器自己的技術說明（檔名、原平台的原因）仍是繁體中文。

@@ -8,7 +8,7 @@ pub enum Status {
     Warning,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub status: Status,
     /// Machine kind (`instructions`, `user-profile`, `memory`, …) — the
@@ -17,6 +17,10 @@ pub struct Outcome {
     pub name: String,
     /// zh-TW detail.
     pub detail: String,
+    /// Stable message code + parameters for the dashboard (see
+    /// `Report::tag`); `None` for lines that only carry free text.
+    pub code: Option<&'static str>,
+    pub params: serde_json::Value,
 }
 
 impl Outcome {
@@ -31,7 +35,16 @@ impl Outcome {
             kind,
             name: name.into(),
             detail: detail.into(),
+            code: None,
+            params: serde_json::Value::Null,
         }
+    }
+
+    /// Attach a message code and parameters.
+    pub fn with(mut self, code: &'static str, params: serde_json::Value) -> Self {
+        self.code = Some(code);
+        self.params = params;
+        self
     }
     pub fn imported(
         kind: &'static str,

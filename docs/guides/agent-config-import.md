@@ -48,13 +48,13 @@ Expert packs (`expert.toml`), Claude Code plugins and single Agent Skills keep w
 | `skills/<name>/SKILL.md` | the staff member's skills | See "Skills" below. |
 | MCP servers in a subagent | not imported | A server is something DuDuClaw would run or connect to, so an import never adds one. Each one is listed; add the ones you trust in the dashboard. |
 | `model` | `[model] preferred` | Claude ids only. Any other model (`doubao-*`, `gpt-*`, …) is reported and the default model is used. |
-| `tools` / `disallowedTools` | `allowed_tools` / `denied_tools` | Narrowing only. Names DuDuClaw does not know are dropped and listed. If a source restricted tools but none of the names map, running commands, writing files and fetching web pages are switched off rather than left open. |
+| `tools` / `disallowedTools` | `allowed_tools` / `denied_tools` | Narrowing only. Names DuDuClaw does not know are dropped and listed. An allowlist always keeps DuDuClaw's own tools (`mcp__duduclaw__*`: knowledge, memory, tasks, delegation). If a source restricted tools but none of the names map, running commands, writing files and fetching web pages are switched off rather than left open. |
 | `BOOTSTRAP.md`, `CLAUDE.local.md` | skipped | One-time setup and personal files. |
 | anything else | kept under `<home>/imported/<id>/source/` | Listed in the report. Only the files the import read or listed are kept; credential files, vendor config files (`openclaw.json`, Hermes `config.yaml`), session logs and hidden folders are not. |
 
 When several instruction files are present, the first one in this order wins and the rest are listed as skipped: `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md` → `.github/copilot-instructions.md`. A file whose only content is `@AGENTS.md` is read through to that file.
 
-The staff member's id is the ASCII form of the source name. When the name has no ASCII form (a Chinese partner name), the id is `<format>-<ref>`, for example `doubao-a1`; the display name stays Chinese.
+The staff member's id is the ASCII form of the source name. When the name has no ASCII form (a Chinese partner name), the id is `<format>-<ref>`, for example `doubao-a1`; the display name stays Chinese. Channels call staff by `@display name` and `@id`, so a new staff member never takes a name, trigger or id someone on the team already answers to: the id gets `-imported` and the display name gets `（<id>）`, and the report says so.
 
 ## Skills
 
@@ -62,7 +62,7 @@ Every skill is rewritten into a valid Agent Skill: the name becomes lowercase le
 
 A skill stays **off** until an administrator approves it when it
 
-- ships runnable scripts or programs (`.py`, `.sh`, `.js`, …, a `#!` file, an executable file, or binary content other than images and PDFs), or
+- ships runnable scripts or programs (`.py`, `.sh`, `.js`, …, a `#!` file, an executable file, or binary content other than images and PDFs; `.svg`, `.html`, `.vbs`, `.wsf` and `.command` count as runnable too), or
 - depends on tools DuDuClaw does not have: Feishu / Lark documents and APIs, Doubao built-ins such as 「構建網頁應用」, Coze plugins, Microsoft 365 Graph.
 
 Those skills wait outside the staff member's folder. The import files one approval request in the dashboard inbox, tied to a fingerprint of each waiting skill: a skill whose files change before it is applied is not enabled. After approving it, press **Apply** on the AI team card (or run `duduclaw expert skills <id>`); the skills are copied in, never overwriting a skill of the same name. Denied or expired requests keep them off. A skill that only mentions such a tool a few times is installed and the report says so.
@@ -74,15 +74,17 @@ A skill is not installed at all when its SKILL.md fails the content scanners or 
 - The import is the only review point for SOUL and INSTRUCTIONS, because staff members cannot edit them afterwards. Both, and every other imported text, go through the prompt-injection guard; SOUL and INSTRUCTIONS also go through the skill security scanner. A refused SOUL skips that staff member; a refused instruction file is left out and reported.
 - Credentials are never imported: `.env`, `auth.json`, `auth-profiles.json` and similar files are not read or kept, channel tokens in `openclaw.json` are ignored here, and Dify secret variables are dropped.
 - An OpenClaw workspace path that points outside the uploaded folder is not followed.
-- Zip files: `__MACOSX/`, `._*`, `.DS_Store`, `Thumbs.db` and `desktop.ini` are skipped. File names are read as UTF-8 (flagged, or unflagged as macOS writes them), then GBK or Big5 for archives made on Chinese Windows. If no encoding fits, or GBK and Big5 are equally likely, the upload is refused with the raw bytes in the message rather than written with garbled names. Symbolic links are not extracted. The size, entry-count and compression-ratio limits of expert packs apply.
+- Zip files: `__MACOSX/`, `._*`, `.DS_Store`, `Thumbs.db` and `desktop.ini` are skipped. File names are read as UTF-8 (flagged, or unflagged as macOS writes them), then GBK or Big5 for archives made on Chinese Windows. If no encoding fits, or GBK and Big5 are equally likely, the upload is refused with the raw bytes in the message rather than written with garbled names. Symbolic links are not extracted. Names must mean the same thing on every system, so a `:` in a name, a trailing dot or space, Windows device names (`CON`, `NUL`, `COM1`, …) and two entries that differ only in upper/lower case are refused. The size, entry-count and compression-ratio limits of expert packs apply.
+- Credential and hidden files inside a skill (`.env`, `token.json`, `*.pem`, `credentials/`, dot files) are left out of the copy and listed.
+- An AI staff member cannot run the import: `duduclaw pack install` and `duduclaw expert skills` refuse to run inside an employee's session.
 - Staff members cannot write their own `INSTRUCTIONS.md` through Write, Edit, MultiEdit, Bash or `office_script`, the same protection SOUL.md and CONTRACT.toml have.
 
 ## Undo
 
-Remove the import from the AI team page (or `duduclaw expert remove <id>`). That deletes the staff members it created, the waiting skills, and the kept original under `<home>/imported/<id>/`. Imported memory facts live in the shared memory store; withdraw them with the command printed in the report:
+Remove the import from the AI team page (or `duduclaw expert remove <id>`). That deletes the staff members it created, the waiting skills, and the kept original under `<home>/imported/<id>/`. Imported memory facts live in the shared memory store; withdraw them with the command shown under "Details" in the report (the source id never contains a path on your machine):
 
 ```bash
-duduclaw memory forget-source --agent <id> --session "import:<home>/imported/<id>/source/MEMORY.md"
+duduclaw memory forget-source --agent <id> --session "import:agent-import:<import id>/MEMORY.md"
 ```
 
 ## Known limits
@@ -90,4 +92,4 @@ duduclaw memory forget-source --agent <id> --session "import:<home>/imported/<id
 - Doubao packages have no public specification. The importer follows the one real sample it was built from and reports unknown manifest fields and unit types instead of guessing.
 - Dify workflow graphs are not converted. Only the first LLM node's system prompt is taken; rebuild the flow in DuDuClaw. Dify knowledge bases are not part of the export, so their contents must be uploaded again.
 - Rules folders (`.cursor/rules`, `.claude/rules`, `.agents/rules`, Windsurf, Cline, Kiro) are listed but not applied yet.
-- Detail lines in the report are written in Traditional Chinese in every dashboard language.
+- Report lines are shown in the dashboard's language. The importer's own technical notes under "Details" (file names, reasons quoted from the source) stay in Traditional Chinese.

@@ -638,6 +638,25 @@ pub(super) async fn experts_install_rejects_missing_and_non_zip_sources() {
         .handle("experts.install", json!({ "path": repo.to_string_lossy() }), &ctx)
         .await;
     assert!(!frame_ok(&frame));
+    // A real zip outside the staging area, and a link inside the staging
+    // area pointing at it, are both refused before anything spawns.
+    let outside = home.path().join("pack.zip");
+    std::fs::write(&outside, b"PK\x03\x04").unwrap();
+    let frame = handler
+        .handle("experts.install", json!({ "path": outside.to_string_lossy() }), &ctx)
+        .await;
+    assert!(!frame_ok(&frame));
+    #[cfg(unix)]
+    {
+        let staged = crate::expert_admin::upload_dir(home.path());
+        std::fs::create_dir_all(&staged).unwrap();
+        let link = staged.join("link.zip");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let frame = handler
+            .handle("experts.install", json!({ "path": link.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!frame_ok(&frame), "a staged link to an outside file must be refused");
+    }
 }
 
 #[tokio::test]

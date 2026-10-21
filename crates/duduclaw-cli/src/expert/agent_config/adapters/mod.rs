@@ -36,6 +36,10 @@ pub fn read(kind: ConfigKind, root: &Path) -> Result<ImportBundle, String> {
 /// keys up again inside DuDuClaw.
 pub const SECRET_FILE_NAMES: &[&str] = &[
     ".env",
+    // Platform configs that carry channel tokens and API keys.
+    "openclaw.json",
+    "moltbot.json",
+    "clawdbot.json",
     "auth.json",
     "auth-profiles.json",
     "credentials.json",

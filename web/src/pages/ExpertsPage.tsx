@@ -82,6 +82,7 @@ export function ExpertsPage() {
     phase: 'plan' | 'done';
     path: string;
     report: ExpertImportReport | null;
+    error?: string;
   } | null>(null);
   const [importBusy, setImportBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -184,7 +185,12 @@ export function ExpertsPage() {
       setUploadPct(null); // upload done — now the scan / plan phase
       // Dry run first: show where every file goes before anything is written.
       const plan = await api.experts.install(path, undefined, true);
-      setImportFlow({ phase: 'plan', path, report: plan.report ?? null });
+      // A refused plan still comes with its report: show what was found.
+      setImportFlow(
+        plan.success
+          ? { phase: 'plan', path, report: plan.report ?? null }
+          : { phase: 'done', path, report: plan.report ?? null, error: plan.error },
+      );
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
     } finally {
@@ -199,8 +205,12 @@ export function ExpertsPage() {
     setImportBusy(true);
     try {
       const res = await api.experts.install(importFlow.path);
-      setImportFlow({ phase: 'done', path: importFlow.path, report: res.report ?? null });
-      toast.success(t('experts.install.success'));
+      setImportFlow({ phase: 'done', path: importFlow.path, report: res.report ?? null, error: res.success ? undefined : res.error });
+      if (res.success) {
+        toast.success(t('experts.install.success'));
+      } else {
+        toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: res.error ?? '' }));
+      }
       await load();
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
@@ -480,6 +490,7 @@ export function ExpertsPage() {
         open={importFlow !== null}
         phase={importFlow?.phase ?? 'plan'}
         report={importFlow?.report ?? null}
+        error={importFlow?.error}
         busy={importBusy}
         onConfirm={handleConfirmImport}
         onClose={() => setImportFlow(null)}

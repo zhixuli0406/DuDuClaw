@@ -66,7 +66,50 @@ pub async fn cmd_install(
 }
 
 /// [`cmd_install`] with the full option set.
+///
+/// With `report_json`, the machine-readable report is written on success
+/// (after the install record) and on failure (with `meta.error`), so the
+/// dashboard can always show what happened. The file must be a new `.json`
+/// path: an existing file is never overwritten.
 pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOpts) -> Result<()> {
+    let mut report_file = match &opts.report_json {
+        Some(p) => Some(open_report_file(p)?),
+        None => None,
+    };
+    let mut report = Report::default();
+    let outcome = install_inner(home, source, &opts, &mut report).await;
+    if let Err(e) = &outcome {
+        report.meta("error", &e.to_string());
+    }
+    if let Some(file) = report_file.as_mut() {
+        use std::io::Write;
+        let body = serde_json::to_string_pretty(&report.to_json(opts.dry_run))
+            .map_err(|e| cfg_err(format!("序列化匯入報告失敗：{e}")))?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| io_err(format!("寫入匯入報告失敗：{e}")))?;
+    }
+    outcome
+}
+
+/// A fresh `.json` file for the report (`create_new`: never follows or
+/// replaces an existing file).
+fn open_report_file(path: &Path) -> Result<std::fs::File> {
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Err(cfg_err("--report-json 必須是 .json 檔".into()));
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| io_err(format!("無法建立匯入報告 {}（檔案不能已存在）：{e}", path.display())))
+}
+
+async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &mut Report) -> Result<()> {
     let dry_run = opts.dry_run;
     // ── 1. Resolve the source to an on-disk directory (download / unzip). ──
     // A throwaway staging dir under the system temp; cleaned at the end.
@@ -90,6 +133,7 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
             eprintln!("    - {c}");
         }
         eprintln!();
+        report.meta("unrecognized_contents", &contents.join("\n"));
         drop(cleanup);
         return Err(cfg_err("未識別格式，拒絕安裝".into()));
     };
@@ -120,18 +164,17 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
         trust_hooks: opts.trust_hooks,
         attach_under,
     };
-    let mut report = Report::default();
     if let Some(z) = &zip_summary {
-        report_zip_summary(z, &mut report);
+        report_zip_summary(z, report);
     }
 
     // ── 3. Dispatch. ──
     let record = match format {
-        Format::Native => install_native(&ctx, &root, &mut report).await?,
-        Format::ClaudePlugin => super::plugin::install(&ctx, &root, &mut report).await?,
-        Format::Skill => super::skill_import::install(&ctx, &root, &mut report).await?,
+        Format::Native => install_native(&ctx, &root, report).await?,
+        Format::ClaudePlugin => super::plugin::install(&ctx, &root, report).await?,
+        Format::Skill => super::skill_import::install(&ctx, &root, report).await?,
         Format::AgentConfig(kind) => {
-            super::agent_config::install(&ctx, &root, kind, &mut report).await?
+            super::agent_config::install(&ctx, &root, kind, report).await?
         }
     };
 
@@ -140,11 +183,6 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
     report.meta("display_name", &record.display_name);
     report.meta("pack_format", format_label(format));
     report.meta("agents", &record.agents.join(","));
-    if let Some(path) = &opts.report_json {
-        let body = serde_json::to_string_pretty(&report.to_json(dry_run))
-            .map_err(|e| cfg_err(format!("序列化匯入報告失敗：{e}")))?;
-        std::fs::write(path, body).map_err(|e| io_err(format!("寫入匯入報告失敗：{e}")))?;
-    }
 
     // ── 4. Persist the install record (real runs only). ──
     if !dry_run {
@@ -174,12 +212,19 @@ fn report_zip_summary(z: &safe_zip::ExtractSummary, report: &mut Report) {
             "",
             format!("已略過 {} 個系統暫存檔（__MACOSX、.DS_Store 等）", z.junk_skipped),
         );
+        report.tag("zip.junk", serde_json::json!({ "count": z.junk_skipped }));
     }
     if let Some(enc) = z.legacy_encoding {
         report.warning("zip", "", format!("壓縮檔的中文檔名使用 {}，已自動轉換", enc.label()));
+        let code = match enc {
+            super::zip_names::LegacyEncoding::Gbk => "gbk",
+            super::zip_names::LegacyEncoding::Big5 => "big5",
+        };
+        report.tag("zip.legacy", serde_json::json!({ "encoding": code }));
     }
     for link in &z.links_skipped {
         report.skipped("zip", link, "壓縮檔內的捷徑（符號連結）不會解開");
+        report.tag("zip.link", serde_json::json!({}));
     }
 }
 

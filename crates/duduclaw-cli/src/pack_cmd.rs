@@ -151,6 +151,7 @@ pub(crate) struct InstallOptions {
 /// falls through to the expert pipeline unchanged — those importers are the
 /// reason the detection there stays fail-closed and is not duplicated here.
 pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions) -> Result<()> {
+    refuse_in_ai_session(&crate::ai_session_guard::markers())?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
@@ -190,6 +191,22 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
         }
         Err(e) => Err(cfg_err(e.to_string())),
     }
+}
+
+/// Installing a pack creates employees, writes their persona and prompt
+/// files and files approval requests — an operator action. Refused inside an
+/// AI employee's process (any DuDuClaw session marker present), like the
+/// other operator commands that change state (`ai_session_guard`). A first
+/// line only: the dashboard RPC spawns this command from the gateway, whose
+/// environment carries no employee markers.
+pub(crate) fn refuse_in_ai_session(markers: &[&str]) -> Result<()> {
+    if markers.is_empty() {
+        return Ok(());
+    }
+    Err(cfg_err(format!(
+        "AI 員工不能安裝或匯入 AI 團隊，請由管理者在儀表板或自己的終端機操作（偵測到 {}）",
+        markers.join("、")
+    )))
 }
 
 /// Install a job preset into `<home>/presets/<id>/preset.toml`.
@@ -1230,4 +1247,14 @@ reports_to = "front"
         let err = install_preset_pack(home.path(), &pack, None, true, false).unwrap_err();
         assert!(err.to_string().contains("非合法 slug"), "{err}");
     }
+
+#[cfg(test)]
+mod ai_session_tests {
+    #[test]
+    fn pack_install_is_refused_inside_an_ai_session() {
+        assert!(super::refuse_in_ai_session(&[]).is_ok());
+        let err = super::refuse_in_ai_session(&["DUDUCLAW_AGENT_ID"]).unwrap_err();
+        assert!(format!("{err}").contains("AI 員工不能安裝"), "{err}");
+    }
+}
 }

@@ -3089,8 +3089,14 @@ export interface ExpertPack {
 export interface ExpertImportItem {
   status: 'imported' | 'skipped' | 'conflict' | 'warning' | 'ignored';
   kind: string;
+  /** Technical name (source file, skill id) — shown under "details". */
   name: string;
+  /** zh-TW console text; the fallback when `code` is absent. */
   detail: string;
+  /** Message code rendered in the viewer's language
+   *  (`experts.report.msg.<code>`), with its parameters. */
+  code?: string | null;
+  params?: Record<string, unknown> | null;
 }
 
 /** The machine-readable report `duduclaw pack install --report-json` writes. */
@@ -5739,8 +5745,10 @@ export const api = {
         false,
         320000,
       ) as Promise<{
+        /** false ⇒ the run failed; `error` says why and `report` shows how far it got. */
         success: boolean;
-        output: string;
+        output?: string;
+        error?: string;
         dry_run?: boolean;
         /** Present for every install the pipeline completed (plan or real). */
         report?: ExpertImportReport | null;

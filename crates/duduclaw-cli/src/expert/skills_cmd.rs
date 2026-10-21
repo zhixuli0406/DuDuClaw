@@ -15,6 +15,7 @@ use duduclaw_gateway::expert_skills::{self, SkillsApplyOutcome};
 use super::cfg_err;
 
 pub async fn cmd_skills(home: &Path, slug: &str) -> Result<()> {
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;
     if !crate::is_valid_agent_id(slug) {
         return Err(cfg_err(format!(
             "'{}' 不是合法的匯入代號",
