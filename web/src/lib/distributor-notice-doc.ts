@@ -1,30 +1,47 @@
 /**
  * About page — srcdoc builder for the distributor-information iframe.
  *
- * Security contract (same layering as the Live Canvas in canvas-doc.ts):
+ * Security contract (layered like the Live Canvas in canvas-doc.ts):
  * 1. The notice is a build input of the distributor build; the gateway
  *    sanitized it with an ammonia allowlist at build time and again before
  *    serving it from `about.get` (no scripts, event handlers, styles, forms,
  *    frames; links http(s)/mailto only; images PNG/JPEG/WebP data URIs only).
  * 2. The dashboard never injects it into its own DOM. It renders only inside
- *    `<iframe srcdoc sandbox="allow-popups allow-popups-to-escape-sandbox">`:
- *    no allow-scripts, no allow-same-origin (opaque origin), no forms, no top
- *    navigation. Popups are allowed so the distributor's links (forced to
- *    `target="_blank"`) open in a normal new tab.
+ *    `<iframe srcdoc sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox">`.
+ *    There is no `allow-scripts`, so no script, inline handler or
+ *    `javascript:` URL can run in the frame at all. `allow-same-origin` is
+ *    granted only so the dashboard can read the rendered height and size
+ *    the card to its content; with scripting disabled the frame itself has
+ *    no way to use that origin. No forms, no top navigation. Popups are
+ *    allowed so the distributor's links (forced to `target="_blank"` and
+ *    `rel="noopener noreferrer"`) open in a normal new tab without an opener.
+ *    Never add `allow-scripts`: together with `allow-same-origin` it would let
+ *    the frame remove its own sandbox.
  * 3. A self-contained CSP inside the document denies every network fetch.
  *
- * Height: a script-less, opaque-origin frame cannot report its content height
- * and the parent cannot measure it, so the frame uses a fixed height and the
- * document scrolls internally when the notice is longer.
+ * Height: the card measures the document and clamps it to
+ * [DISTRIBUTOR_NOTICE_MIN_HEIGHT_PX, DISTRIBUTOR_NOTICE_MAX_HEIGHT_PX];
+ * longer notices scroll inside the frame.
  */
 
 export type NoticeMode = 'light' | 'dark';
 
 /** Exact sandbox value. Unit-tested so nobody adds allow-scripts quietly. */
-export const DISTRIBUTOR_NOTICE_SANDBOX = 'allow-popups allow-popups-to-escape-sandbox';
+export const DISTRIBUTOR_NOTICE_SANDBOX =
+  'allow-same-origin allow-popups allow-popups-to-escape-sandbox';
 
-/** Fixed frame height in CSS pixels (content scrolls inside beyond this). */
-export const DISTRIBUTOR_NOTICE_HEIGHT_PX = 280;
+/** Frame height bounds in CSS pixels. */
+export const DISTRIBUTOR_NOTICE_MIN_HEIGHT_PX = 64;
+export const DISTRIBUTOR_NOTICE_MAX_HEIGHT_PX = 600;
+
+/** Clamp a measured content height to the frame bounds (whole pixels). */
+export function clampNoticeHeight(measured: number): number {
+  if (!Number.isFinite(measured) || measured <= 0) return DISTRIBUTOR_NOTICE_MIN_HEIGHT_PX;
+  return Math.min(
+    DISTRIBUTOR_NOTICE_MAX_HEIGHT_PX,
+    Math.max(DISTRIBUTOR_NOTICE_MIN_HEIGHT_PX, Math.ceil(measured)),
+  );
+}
 
 const NOTICE_CSP =
   "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
@@ -61,7 +78,7 @@ function baseStyle(mode: NoticeMode): string {
   * { box-sizing: border-box; }
   html, body { margin: 0; background: ${t.bg}; }
   body {
-    padding: 4px 2px 12px;
+    padding: 2px;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang TC", "Noto Sans TC", sans-serif;
     font-size: 14px;
     line-height: 1.65;
@@ -72,6 +89,8 @@ function baseStyle(mode: NoticeMode): string {
   h1, h2, h3, h4 { margin: 0.6em 0 0.3em; line-height: 1.3; }
   h1 { font-size: 1.25rem; } h2 { font-size: 1.125rem; } h3, h4 { font-size: 1rem; }
   p, ul, ol, blockquote, pre, table { margin: 0 0 0.75em; }
+  body > :first-child { margin-top: 0; }
+  body > :last-child { margin-bottom: 0; }
   img { max-width: 100%; height: auto; }
   a { color: ${t.link}; }
   hr { border: 0; border-top: 1px solid ${t.border}; }

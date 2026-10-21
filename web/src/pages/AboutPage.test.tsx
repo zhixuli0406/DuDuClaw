@@ -78,7 +78,7 @@ describe('<AboutPage>', () => {
     expect(screen.queryByText('Authorised distributor')).not.toBeInTheDocument();
   });
 
-  it('renders a compiled distributor notice only inside a popups-only sandboxed iframe', async () => {
+  it('renders a compiled distributor notice only inside a script-less sandboxed iframe', async () => {
     aboutGet.mockResolvedValue({
       vendor: {
         name_zh: '嘟嘟數位科技有限公司',
@@ -97,9 +97,12 @@ describe('<AboutPage>', () => {
     expect(screen.getByText('Provided by the authorised distributor')).toBeInTheDocument();
     const frame = document.querySelector('iframe');
     expect(frame).not.toBeNull();
-    expect(frame!.getAttribute('sandbox')).toBe('allow-popups allow-popups-to-escape-sandbox');
+    expect(frame!.getAttribute('sandbox')!.split(' ').sort()).toEqual([
+      'allow-popups',
+      'allow-popups-to-escape-sandbox',
+      'allow-same-origin',
+    ]);
     expect(frame!.getAttribute('sandbox')).not.toContain('allow-scripts');
-    expect(frame!.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(frame!.getAttribute('srcdoc')).toContain('<h2>Example Partner Co.</h2><p>Support line</p>');
     // The notice is never injected into the dashboard DOM itself.
     expect(screen.queryByText('Example Partner Co.')).not.toBeInTheDocument();

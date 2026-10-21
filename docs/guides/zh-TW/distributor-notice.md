@@ -34,8 +34,9 @@ gateway 第一次送出時會再消毒一次編譯進來的 HTML。如果第二�
 ## dashboard 怎麼顯示
 
 - 原廠區塊上方一張卡片，固定標題「總經銷資訊」和說明「由授權總經銷提供」（英文、日文介面有對應翻譯）。標題是產品文字，不屬於總經銷內容。
-- 內容只在 `sandbox="allow-popups allow-popups-to-escape-sandbox"` 的 iframe 裡顯示：不能執行 script、來源是不透明的、不能送表單、不能換掉整個頁面。連結會開在新分頁。iframe 內另有內容安全政策擋掉所有網路請求，所以圖片要用 data URI 內嵌。
-- iframe 高度固定 280 px，內容比較長時在裡面捲動。沒有 script 的 iframe 回報不了內容高度，所以高度只能固定。
+- 內容只在 `sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"` 的 iframe 裡顯示：不能執行 script、不能送表單、不能換掉整個頁面。連結會開在新分頁。iframe 內另有內容安全政策擋掉所有網路請求，所以圖片要用 data URI 內嵌。
+- 為什麼這裡可以給 `allow-same-origin`：沒有 `allow-scripts`，iframe 裡任何東西都執行不了（`<script>`、行內事件、`javascript:` 網址都不會跑），所以它沒辦法利用 dashboard 的來源；這個權限只是讓 dashboard 讀得到內容高度、把卡片調成剛好的大小。絕對不能再加 `allow-scripts`：兩者同時存在時，iframe 可以自己拿掉 sandbox。
+- iframe 高度跟著內容走（載入時、內容尺寸變動時、圖片載入後都會重新量），介於 64 px 與 600 px 之間，超過 600 px 就在框內捲動。高度變化有短暫動畫，系統設定減少動態時不播。
 - iframe 跟著 dashboard 的淺色或深色主題。總經銷內容自己的樣式會被移除，套用的是 dashboard 的基本樣式。
 
 ## 確認 build

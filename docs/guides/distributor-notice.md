@@ -65,13 +65,20 @@ a warning.
   caption 「由授權總經銷提供」 (localized in English and Japanese). The heading
   is product copy, not part of the notice.
 - The notice renders only inside an iframe with
-  `sandbox="allow-popups allow-popups-to-escape-sandbox"`: no scripts, an
-  opaque origin, no forms, no top-level navigation. Links open in a new tab.
+  `sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"`:
+  no scripts, no forms, no top-level navigation. Links open in a new tab.
+- Why `allow-same-origin` is safe here: without `allow-scripts` nothing in
+  the frame can execute (no `<script>`, no inline handlers, no `javascript:`
+  URLs), so the frame cannot use the dashboard origin. The token only lets
+  the dashboard read the rendered height to size the card. `allow-scripts`
+  must never be added: combined with `allow-same-origin` it would let the
+  frame lift its own sandbox.
   A content security policy inside the frame blocks every network request, so
   images must be embedded as data URIs.
-- The frame is 280 px high and the notice scrolls inside it when longer. A
-  frame without scripts cannot report its content height, so the height is
-  fixed.
+- The frame sizes itself to the notice (measured on load, when the frame
+  body resizes and when an image loads), between 64 px and 600 px; a longer
+  notice scrolls inside the frame. The height change animates briefly unless
+  the system asks for reduced motion.
 - The frame follows the dashboard's light or dark theme. The notice's own
   styles are removed, so the dashboard's base styles apply.
 

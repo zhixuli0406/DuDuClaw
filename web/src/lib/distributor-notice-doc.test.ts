@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DISTRIBUTOR_NOTICE_HEIGHT_PX,
+  DISTRIBUTOR_NOTICE_MAX_HEIGHT_PX,
+  DISTRIBUTOR_NOTICE_MIN_HEIGHT_PX,
   DISTRIBUTOR_NOTICE_SANDBOX,
+  clampNoticeHeight,
   distributorNoticeSrcDoc,
 } from './distributor-notice-doc';
 
@@ -33,17 +35,23 @@ describe('distributorNoticeSrcDoc', () => {
     );
   });
 
-  // Security tripwire: popups only, never scripts or same-origin.
-  it('sandbox value is exactly popups-only', () => {
-    expect(DISTRIBUTOR_NOTICE_SANDBOX).toBe('allow-popups allow-popups-to-escape-sandbox');
-    expect(DISTRIBUTOR_NOTICE_SANDBOX).not.toContain('allow-scripts');
-    expect(DISTRIBUTOR_NOTICE_SANDBOX).not.toContain('allow-same-origin');
-    expect(DISTRIBUTOR_NOTICE_SANDBOX).not.toContain('allow-top-navigation');
-    expect(DISTRIBUTOR_NOTICE_SANDBOX).not.toContain('allow-forms');
+  // Security tripwire: exactly these three tokens; never scripts.
+  it('sandbox tokens are exactly same-origin + popups, never scripts', () => {
+    const tokens = DISTRIBUTOR_NOTICE_SANDBOX.split(/\s+/).sort();
+    expect(tokens).toEqual(['allow-popups', 'allow-popups-to-escape-sandbox', 'allow-same-origin']);
+    for (const forbidden of ['allow-scripts', 'allow-top-navigation', 'allow-forms', 'allow-modals']) {
+      expect(DISTRIBUTOR_NOTICE_SANDBOX).not.toContain(forbidden);
+    }
   });
 
-  it('uses a fixed, bounded frame height', () => {
-    expect(DISTRIBUTOR_NOTICE_HEIGHT_PX).toBeGreaterThanOrEqual(160);
-    expect(DISTRIBUTOR_NOTICE_HEIGHT_PX).toBeLessThanOrEqual(480);
+  it('clamps the measured height to 64–600 px', () => {
+    expect(DISTRIBUTOR_NOTICE_MIN_HEIGHT_PX).toBe(64);
+    expect(DISTRIBUTOR_NOTICE_MAX_HEIGHT_PX).toBe(600);
+    expect(clampNoticeHeight(10)).toBe(64);
+    expect(clampNoticeHeight(0)).toBe(64);
+    expect(clampNoticeHeight(Number.NaN)).toBe(64);
+    expect(clampNoticeHeight(180.2)).toBe(181);
+    expect(clampNoticeHeight(600)).toBe(600);
+    expect(clampNoticeHeight(5000)).toBe(600);
   });
 });
