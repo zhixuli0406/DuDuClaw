@@ -38,7 +38,11 @@ pub fn extract(
     sheet: &str,
     budget: &mut Budget,
 ) -> Result<Vec<RawSegment>, ExtractError> {
-    let text = decode_text(bytes)?;
+    // Excel and most Windows tools write CRLF. The csv reader counts a bare
+    // `\r` as a line of its own in `Position::line`, which doubled every row
+    // number on CRLF files (and broke the row a citation points at), so
+    // unify line endings before parsing.
+    let text = decode_text(bytes)?.replace("\r\n", "\n").replace('\r', "\n");
     budget.take(&text)?;
     let mut reader = ::csv::ReaderBuilder::new()
         .has_headers(false)
@@ -65,6 +69,19 @@ pub fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crlf_csv_rows_keep_their_line_numbers() {
+        // A CRLF file (Excel, most Windows tools) must cite the same rows and
+        // produce the same text as the LF version of the same sheet.
+        let lf = extract(b"a,b\nx,1\n,,\ny,2\n", "", &mut Budget::new(1 << 20)).unwrap();
+        let crlf =
+            extract(b"a,b\r\nx,1\r\n,,\r\ny,2\r\n", "", &mut Budget::new(1 << 20)).unwrap();
+        assert_eq!(crlf[0].line_rows, lf[0].line_rows);
+        assert_eq!(crlf[0].line_rows.as_deref(), Some(&[1, 2, 4][..]));
+        assert_eq!(crlf[0].text, lf[0].text);
+        assert!(!crlf[0].text.contains('\r'));
+    }
 
     #[test]
     fn big5_csv_rows_keep_numbers() {
