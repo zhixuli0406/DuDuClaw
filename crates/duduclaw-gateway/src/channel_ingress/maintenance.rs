@@ -157,6 +157,8 @@ impl IngressStore {
             .map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM ingress_resolutions WHERE ingress_id=?1", [id])
                 .map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM ingress_routes WHERE id=?1", [id])
+                .map_err(|e| e.to_string())?;
         }
         tx.execute("DELETE FROM ingress_alerts WHERE at<?1", [cutoff])
             .map_err(|e| e.to_string())?;

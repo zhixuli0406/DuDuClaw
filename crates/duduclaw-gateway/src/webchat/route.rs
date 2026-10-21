@@ -7,7 +7,7 @@
 //! - calling an employee the account may not call is refused (error frame,
 //!   no model call, audited);
 //! - a message that calls nobody goes to the selected employee, else the
-//!   default one, but only if the account may use the default employee;
+//!   default one (reachable by every signed-in account, as before);
 //! - a lone `@` or a partial name answers with the callable list.
 //!
 //! A public web-widget visitor is treated like an unmapped messaging-app
@@ -17,9 +17,10 @@ use crate::trigger_route::{self, SenderAccess, TriggerRoute};
 
 use super::{AclSnapshot, ChatMessage, WebChatState, load_acl_snapshot};
 
-/// Error code on a refused `@` call or default-employee refusal.
-pub(super) const AGENT_FORBIDDEN_CODE: &str = "agent_forbidden";
-/// Error code on a `@` list / ambiguous name answer.
+/// Error code on a refused `@` call (the dashboard renders its own text).
+pub(super) const AGENT_FORBIDDEN_CODE: &str = "mention_forbidden";
+/// Error code on a `@` list / ambiguous name answer; `choices` carries the
+/// `@name` texts (the dashboard renders the heading).
 pub(super) const MENTION_CHOICES_CODE: &str = "mention_choices";
 
 impl WebChatState {
@@ -49,21 +50,12 @@ impl WebChatState {
             return SenderAccess::unmapped();
         }
         match self.acl_snapshot(auth_user).await {
-            Ok(s) => SenderAccess::from_role(
-                auth_user,
-                s.role,
-                s.bound_agents.iter().cloned().collect(),
-                false,
-            ),
+            Ok(s) => {
+                SenderAccess::from_role(auth_user, s.role, s.bound_agents.iter().cloned().collect())
+            }
             Err(e) => {
-                tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — no employee callable: {e}");
-                SenderAccess {
-                    sender: trigger_route::Sender::Account {
-                        user_id: auth_user.to_string(),
-                        bound: Default::default(),
-                    },
-                    channel: false,
-                }
+                tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — only the default employee is callable: {e}");
+                SenderAccess::no_bindings(auth_user)
             }
         }
     }
@@ -84,12 +76,13 @@ pub(super) struct WebRoute {
 /// `sid`/`user_id` the turn's session and connection ids (they decide the
 /// conversation's real default employee, which may be a channel-bound or
 /// `allowed_channels` employee rather than the main one).
-/// `agent: None` = the default path, used only when the default employee IS the
-/// main one and nothing was selected (the reply pipeline then resolves the
-/// same employee); `agent: Some(id)` = answer as `id`, so the employee checked
-/// here is the employee that answers; `Err(frame)` = send that frame and
-/// stop (no model call). An empty `text` runs only the default-employee
-/// check (used before chat commands).
+///
+/// The default employee stays reachable by every signed-in account, exactly
+/// as before `@` routing (the C-ACL decision on `resume_needs_acl_check`);
+/// only calling *another* employee by `@` needs a binding.
+/// `agent: None` = the default path (the main employee, nothing selected);
+/// `agent: Some(id)` = answer as `id`; `Err(frame)` = send that frame and
+/// stop (no model call).
 pub(super) async fn decide_webchat_route(
     state: &WebChatState,
     auth_user: &str,
@@ -105,52 +98,60 @@ pub(super) async fn decide_webchat_route(
         .await
         .map(|a| a.config.agent.name.clone())
         .unwrap_or_else(|| main_id.to_string());
-    let fallback: String = selected
+    let current: String = selected
         .map(str::to_string)
         .unwrap_or_else(|| default_id.clone());
-    let route = trigger_route::decide(&reg, text, &access, Some(&fallback));
+    let route = trigger_route::decide(&reg, text, &access, Some(&default_id));
+    Ok(
+        match route_outcome(state, &reg, &access, auth_user, route)? {
+            None => WebRoute {
+                agent: selected
+                    .map(str::to_string)
+                    .or_else(|| (default_id != main_id).then(|| default_id.clone())),
+                switched: false,
+            },
+            Some(id) => WebRoute {
+                switched: id != current,
+                agent: (selected.is_some() || id != main_id).then_some(id),
+            },
+        },
+    )
+}
+
+/// `Ok(None)` = calls nobody; `Ok(Some(id))` = calls `id` (allowed);
+/// `Err(frame)` = refusal or list.
+fn route_outcome(
+    state: &WebChatState,
+    reg: &duduclaw_agent::registry::AgentRegistry,
+    access: &SenderAccess,
+    auth_user: &str,
+    route: TriggerRoute,
+) -> Result<Option<String>, Box<ChatMessage>> {
     let home = &state.ctx.home_dir;
-    let answer_as = |id: String| WebRoute {
-        switched: id != fallback,
-        agent: (selected.is_some() || id != main_id).then_some(id),
-    };
     match route {
-        TriggerRoute::None => {
-            if let Some(sel) = selected {
-                return Ok(WebRoute {
-                    agent: Some(sel.to_string()),
-                    switched: false,
-                });
-            }
-            let default_ok = reg
-                .get(&default_id)
-                .is_some_and(|a| access.may_call(a, Some(&default_id)));
-            if !default_ok {
-                trigger_route::audit(home, "webchat", &access, auth_user, &default_id, "refused");
-                return Err(Box::new(ChatMessage::error_coded(
-                    trigger_route::DEFAULT_FORBIDDEN_TEXT,
-                    AGENT_FORBIDDEN_CODE,
-                )));
-            }
-            Ok(answer_as(default_id))
-        }
+        TriggerRoute::None => Ok(None),
         TriggerRoute::Routed { agent, .. } => {
-            trigger_route::audit(home, "webchat", &access, auth_user, &agent, "allowed");
-            Ok(answer_as(agent))
+            trigger_route::audit(home, "webchat", access, auth_user, &agent, "allowed");
+            Ok(Some(agent))
         }
         TriggerRoute::Forbidden { agent } => {
-            trigger_route::audit(home, "webchat", &access, auth_user, &agent, "refused");
+            trigger_route::audit(home, "webchat", access, auth_user, &agent, "refused");
             Err(Box::new(ChatMessage::error_coded(
                 trigger_route::FORBIDDEN_TEXT,
                 AGENT_FORBIDDEN_CODE,
             )))
         }
         TriggerRoute::List { candidates, .. } => {
-            let agents = trigger_route::list::callable_agents(&reg, &candidates);
-            Err(Box::new(ChatMessage::error_coded(
-                trigger_route::list::text_list(&agents),
+            let agents = trigger_route::list::callable_agents(reg, &candidates);
+            Err(Box::new(ChatMessage::error_choices(
+                trigger_route::list::text_list(&agents, trigger_route::texts::Lang::ZhTw),
                 MENTION_CHOICES_CODE,
+                agents.into_iter().map(|a| a.call_text).collect(),
             )))
         }
     }
 }
+
+#[cfg(test)]
+#[path = "route_tests.rs"]
+mod tests;

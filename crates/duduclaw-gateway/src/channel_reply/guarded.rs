@@ -160,8 +160,12 @@ pub async fn build_guarded_reply_for_agent(
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
-    let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
-    let enforced = enforce_contract(restored, &ctx.home_dir, agent_name).await;
+    let (agent_id, turn_session) = match &answered_by {
+        Some(who) => restore_target(who),
+        None => (agent_name.to_string(), session_id.to_string()),
+    };
+    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
+    let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
     // The "rules changed / model switched" FYI is for the operator; a public
     // website visitor must not see it (it stays pending for the next
     // operator-facing reply).
@@ -236,11 +240,11 @@ pub async fn build_guarded_reply_with_session(
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     // Restore and contract-check as the employee that actually answered (an
     // `@`-called employee, not the default one).
-    let agent_id = match &answered_by {
-        Some(who) => who.id.clone(),
-        None => resolve_agent_for_restore(ctx, session_id).await,
+    let (agent_id, turn_session) = match &answered_by {
+        Some(who) => restore_target(who),
+        None => (resolve_agent_for_restore(ctx, session_id).await, session_id.to_string()),
     };
-    let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
+    let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
     let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
     // Messaging apps: label replies from a called (non-default) employee.
@@ -287,4 +291,16 @@ pub(super) fn append_product_footer(reply: String, session_id: &str) -> String {
         return reply;
     }
     format!("{reply}\n\n{PRODUCT_FOOTER}")
+}
+
+/// The employee and session a reply's secrets are restored and its contract
+/// checked with: those of the turn that produced it (a called employee runs
+/// in its own session bucket).
+pub(super) fn restore_target(who: &crate::trigger_route::AnsweredBy) -> (String, String) {
+    (who.id.clone(), who.session_id.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn restore_target_for_test(who: &crate::trigger_route::AnsweredBy) -> (String, String) {
+    restore_target(who)
 }

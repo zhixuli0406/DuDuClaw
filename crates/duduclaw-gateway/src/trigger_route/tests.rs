@@ -109,17 +109,16 @@ pub(crate) async fn registry(public_sales: bool) -> (tempfile::TempDir, AgentReg
     (tmp, reg)
 }
 
-fn account(bound: &[&str], channel: bool) -> SenderAccess {
+fn account(bound: &[&str], _channel: bool) -> SenderAccess {
     SenderAccess::from_role(
         "u1",
         UserRole::Employee,
         bound.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
-        channel,
     )
 }
 
 fn admin() -> SenderAccess {
-    SenderAccess::from_role("a1", UserRole::Admin, BTreeSet::new(), false)
+    SenderAccess::from_role("a1", UserRole::Admin, BTreeSet::new())
 }
 
 #[tokio::test]
@@ -139,12 +138,13 @@ async fn webchat_account_bound_to_finance_cannot_reach_sales_by_trigger() {
             bare: false
         }
     );
-    // The default employee is not callable for a WebChat account without a
-    // binding to it.
+    // The default employee stays callable without a binding (owner
+    // decision: it is reachable by every signed-in account).
     assert_eq!(
         decide(&reg, "@嘟嘟總機 你好", &acc, Some("dudu")),
-        TriggerRoute::Forbidden {
-            agent: "dudu".into()
+        TriggerRoute::Routed {
+            agent: "dudu".into(),
+            bare: false
         }
     );
 }
@@ -205,10 +205,12 @@ async fn mapped_channel_account_keeps_default_and_adds_bindings() {
         callable_ids(&reg, &acc, Some("dudu")),
         vec!["dudu".to_string(), "finance".to_string()]
     );
+    // WebChat accounts get the same set (the default employee stays
+    // reachable by everyone).
     let webchat = account(&["finance"], false);
     assert_eq!(
         callable_ids(&reg, &webchat, Some("dudu")),
-        vec!["finance".to_string()]
+        vec!["dudu".to_string(), "finance".to_string()]
     );
 }
 
@@ -329,6 +331,7 @@ async fn bare_mention_arms_and_next_message_goes_to_that_employee_only() {
         event,
         seq,
         quiet: false,
+        pending: turn::PendingPolicy::Live,
     };
     // An admin-shaped access stands in for a mapped account here.
     let acc = admin();
@@ -343,7 +346,7 @@ async fn bare_mention_arms_and_next_message_goes_to_that_employee_only() {
         },
     );
     match first {
-        TurnDecision::Reply { text, list } => {
+        TurnDecision::Reply { text, list, .. } => {
             assert!(text.contains("財務小幫手"));
             assert!(list.is_none());
         }
@@ -383,6 +386,7 @@ async fn pending_for_a_default_employee_routes_without_label() {
         event,
         seq,
         quiet: false,
+        pending: turn::PendingPolicy::Live,
     };
     let acc = SenderAccess::unmapped();
     let _ = decision_for_route(
@@ -425,6 +429,7 @@ async fn forbidden_turn_answers_without_a_model_call_and_is_audited() {
             event: "e",
             seq: 1,
             quiet: false,
+            pending: turn::PendingPolicy::Live,
         },
         &SenderAccess::unmapped(),
         TriggerRoute::Forbidden {
@@ -435,7 +440,8 @@ async fn forbidden_turn_answers_without_a_model_call_and_is_audited() {
         d,
         TurnDecision::Reply {
             text: FORBIDDEN_TEXT.into(),
-            list: None
+            list: None,
+            kind: turn::ReplyKind::Refusal,
         }
     );
     let audit = std::fs::read_to_string(t.path().join("security_audit.jsonl")).unwrap();
@@ -456,7 +462,7 @@ async fn line_quick_reply_payload_is_capped_and_paginated() {
             call_text: format!("@員工{i}號"),
         })
         .collect();
-    let first = list::line_list_message(&agents, 0);
+    let first = list::line_list_message(&agents, 0, super::texts::Lang::ZhTw);
     let items = first["quickReply"]["items"].as_array().unwrap();
     assert_eq!(items.len(), list::LINE_QUICK_REPLY_MAX);
     assert_eq!(items[0]["action"]["type"], "message");
@@ -475,7 +481,7 @@ async fn line_quick_reply_payload_is_capped_and_paginated() {
         list::parse_line_page(more["data"].as_str().unwrap()),
         Some(1)
     );
-    let second = list::line_list_message(&agents, 1);
+    let second = list::line_list_message(&agents, 1, super::texts::Lang::ZhTw);
     let items = second["quickReply"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 8, "the remaining 8 fit without another 更多");
     assert_eq!(items[0]["action"]["text"], "@員工12號");
@@ -486,7 +492,7 @@ async fn line_list_for_three_uses_message_actions_with_call_text() {
     let (_t, reg) = registry(true).await;
     let ids = callable_ids(&reg, &SenderAccess::unmapped(), Some("dudu"));
     let agents = list::callable_agents(&reg, &ids);
-    let msg = list::line_list_message(&agents, 0);
+    let msg = list::line_list_message(&agents, 0, super::texts::Lang::ZhTw);
     let texts: Vec<&str> = msg["quickReply"]["items"]
         .as_array()
         .unwrap()
@@ -532,15 +538,38 @@ fn reply_prefix_skips_empty_replies() {
 
 #[test]
 fn unmapped_audit_label_does_not_carry_the_platform_id() {
-    let label = SenderAccess::unmapped().audit_label("line", "Uabcdef123");
+    let home = tempfile::TempDir::new().unwrap();
+    let label = SenderAccess::unmapped().audit_label(home.path(), "line", "Uabcdef123");
     assert!(label.starts_with("unmapped:line:"));
     assert!(!label.contains("Uabcdef123"));
+    let digest = label.trim_start_matches("unmapped:line:");
+    assert_eq!(digest.len(), 16, "16 hex characters of an HMAC");
+    // Stable within one home (same key), different under another home's key.
+    assert_eq!(
+        SenderAccess::unmapped().audit_label(home.path(), "line", "Uabcdef123"),
+        label
+    );
+    let other = tempfile::TempDir::new().unwrap();
+    assert_ne!(
+        SenderAccess::unmapped().audit_label(other.path(), "line", "Uabcdef123"),
+        label
+    );
+    // The key file is created once, owner-only.
+    let key = home.path().join("trigger_audit.key");
+    assert_eq!(std::fs::read(&key).unwrap().len(), 32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     assert_eq!(
         SenderAccess {
-            sender: Sender::Admin,
-            channel: true
+            sender: Sender::Admin
         }
-        .audit_label("line", "x"),
+        .audit_label(home.path(), "line", "x"),
         "admin"
     );
 }
@@ -576,7 +605,6 @@ async fn channel_sender_maps_only_through_a_verified_identity() {
         Sender::Account { bound, .. } => assert!(bound.contains("finance")),
         other => panic!("expected a mapped account, got {other:?}"),
     }
-    assert!(mapped.channel);
 }
 
 #[tokio::test]
@@ -602,6 +630,7 @@ async fn mapped_sender_one_shot_goes_to_the_called_employee_then_back() {
         event,
         seq,
         quiet: false,
+        pending: turn::PendingPolicy::Live,
     };
     let d = turn::decide_channel_turn(t.path(), &reg, mk("@財務小幫手", "m1", pending::next_seq()));
     assert!(matches!(d, TurnDecision::Reply { .. }), "{d:?}");
@@ -663,6 +692,7 @@ async fn picking_from_the_list_rechecks_access() {
         event: "pick-1",
         seq: pending::next_seq(),
         quiet: false,
+        pending: turn::PendingPolicy::Live,
     };
     // Unmapped presser: finance is not open to them.
     assert_eq!(
@@ -684,4 +714,108 @@ async fn picking_from_the_list_rechecks_access() {
         "777",
         pending::next_seq()
     ));
+}
+
+#[test]
+fn a_claim_survives_a_later_arm_for_the_same_event() {
+    let k = key("rearm");
+    pending::arm(&k, "finance", "e1", 10);
+    assert_eq!(pending::claim(&k, "e2", 11), Some("finance".into()));
+    // The sender arms someone else while e2 is still running.
+    pending::arm(&k, "sales-rep", "e3", 12);
+    // Recomputing e2's route keeps its addressee...
+    assert_eq!(pending::claim(&k, "e2", 11), Some("finance".into()));
+    // ...and the new arm is still there for the next message.
+    assert_eq!(pending::claim(&k, "e4", 13), Some("sales-rep".into()));
+}
+
+#[test]
+fn group_members_never_share_a_one_shot() {
+    let conv = format!("line:G{}", uuid::Uuid::new_v4());
+    let alice = PendingKey::new("line", &conv, "Ualice");
+    let bob = PendingKey::new("line", &conv, "Ubob");
+    pending::arm(&alice, "finance", "a1", 10);
+    assert_eq!(pending::claim(&bob, "b1", 11), None);
+    assert_eq!(pending::claim(&alice, "a2", 12), Some("finance".into()));
+}
+
+async fn reply_ctx(public_sales: bool) -> (tempfile::TempDir, crate::channel_reply::ReplyContext) {
+    let (tmp, reg) = registry(public_sales).await;
+    let sessions = std::sync::Arc::new(
+        crate::session::SessionManager::new(&tmp.path().join("sessions.db")).unwrap(),
+    );
+    let (event_tx, _) = tokio::sync::broadcast::channel(16);
+    let channel_status =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let ctx = crate::channel_reply::ReplyContext::new(
+        std::sync::Arc::new(tokio::sync::RwLock::new(reg)),
+        tmp.path().to_path_buf(),
+        sessions,
+        channel_status,
+        event_tx,
+    );
+    (tmp, ctx)
+}
+
+/// Goes through the same entry Discord, Slack, WhatsApp and the other
+/// shared-pipeline channels use. Fails if the `@` gate in the reply pipeline
+/// were removed (the message would reach the model as finance).
+#[tokio::test]
+async fn the_shared_channel_pipeline_refuses_a_forbidden_call_without_a_model_call() {
+    let (_t, ctx) = reply_ctx(false).await;
+    let session = format!("discord:{}", uuid::Uuid::new_v4().simple());
+    let reply = crate::channel_reply::build_guarded_reply_with_session(
+        "@財務小幫手 幫我算帳",
+        &ctx,
+        &session,
+        "discord-user-1",
+        None,
+    )
+    .await;
+    assert!(reply.text.starts_with(FORBIDDEN_TEXT), "{}", reply.text);
+    assert!(reply.answered_by.is_none(), "no employee answered");
+    // The list comes back the same way, and a repeat within the window is
+    // silence (quota throttle).
+    let session = format!("discord:{}", uuid::Uuid::new_v4().simple());
+    let list =
+        crate::channel_reply::build_guarded_reply_with_session("@", &ctx, &session, "u2", None)
+            .await;
+    assert!(list.text.contains("@嘟嘟總機"), "{}", list.text);
+    let again =
+        crate::channel_reply::build_guarded_reply_with_session("@", &ctx, &session, "u2", None)
+            .await;
+    assert!(
+        again.text.trim().is_empty() || !again.text.contains("@嘟嘟總機"),
+        "{}",
+        again.text
+    );
+}
+
+#[test]
+fn a_called_employee_runs_and_restores_in_its_own_session() {
+    assert_eq!(
+        called_session("line:U1", "finance"),
+        "line:U1#agent:finance"
+    );
+    let who = AnsweredBy {
+        id: "finance".into(),
+        display_name: "財務小幫手".into(),
+        via_trigger: true,
+        session_id: called_session("telegram:42", "finance"),
+    };
+    assert_eq!(
+        crate::channel_reply::restore_target_for_test(&who),
+        (
+            "finance".to_string(),
+            "telegram:42#agent:finance".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_called_turn_marker_is_scoped_to_its_future() {
+    assert!(!in_called_turn());
+    assert!(as_called_turn(true, async { in_called_turn() }).await);
+    assert!(!as_called_turn(false, async { in_called_turn() }).await);
+    assert!(!in_called_turn());
 }

@@ -1,7 +1,7 @@
 //! The channel-agnostic turn decision: given one incoming message, answer it
 //! directly (list, refusal, "say the task"), run it as a called employee, or
-//! leave it to normal routing. Used by the shared channel reply pipeline and
-//! by adapters that render the `@` list with buttons (Telegram).
+//! leave it to normal routing. Used by the shared channel reply pipeline, by
+//! the Telegram shared bot and by LINE's durable ingress.
 
 use std::path::Path;
 
@@ -10,7 +10,22 @@ use duduclaw_agent::registry::AgentRegistry;
 use super::access::{self, SenderAccess};
 use super::list::{self, CallableAgent};
 use super::pending::{self, PendingKey};
+use super::texts::{self, Lang};
 use super::{TriggerRoute, audit, decide};
+
+/// What a decision may do with the one-shot addressee store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingPolicy<'a> {
+    /// Arm, claim and cancel (the one pass that owns the event).
+    Live,
+    /// Read only: what `Live` would decide, without changing anything (gates
+    /// that run before the message is accepted).
+    Peek,
+    /// Recompute an event whose addressee was already resolved and stored
+    /// (LINE durable ingress): never touch the store; a message that calls
+    /// nobody goes to the stored addressee, re-checked against the sender.
+    Replay(Option<&'a str>),
+}
 
 /// One incoming channel message.
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +37,7 @@ pub struct ChannelTurn<'a> {
     /// The sender's platform user id; empty when unknown (no one-shot state
     /// can be kept for an unknown sender).
     pub sender: &'a str,
+    /// The text to match (native person mentions already blanked).
     pub text: &'a str,
     /// The conversation's default employee.
     pub fallback: Option<&'a str>,
@@ -29,9 +45,20 @@ pub struct ChannelTurn<'a> {
     pub event: &'a str,
     /// Order key, increasing with arrival order.
     pub seq: i64,
-    /// Skip logging/audit (a route recomputed for a durable-ingress
-    /// snapshot; the run that answers the event logs it once).
+    /// Skip logging/audit.
     pub quiet: bool,
+    pub pending: PendingPolicy<'a>,
+}
+
+/// Why the bot answers directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReplyKind {
+    /// The `@` list (or the choice for a partial / shared name).
+    List,
+    /// Calling an employee the sender may not call.
+    Refusal,
+    /// "Say the task" after `@name` alone.
+    AskTask,
 }
 
 /// What to do with the message.
@@ -40,7 +67,8 @@ pub enum TurnDecision {
     /// Normal routing: the default employee answers.
     Default,
     /// Run the model as this employee. `via_trigger` = chosen by `@` or a
-    /// one-shot addressee (the reply is labelled with the employee's name).
+    /// one-shot addressee (the reply is labelled and runs in the employee's
+    /// own session, [`super::called_session`]).
     Agent { id: String, via_trigger: bool },
     /// Answer with `text` and no model call. `list` carries the callable
     /// employees when the answer is the `@` list (adapters may render
@@ -48,7 +76,15 @@ pub enum TurnDecision {
     Reply {
         text: String,
         list: Option<Vec<CallableAgent>>,
+        kind: ReplyKind,
     },
+}
+
+impl TurnDecision {
+    /// The message addresses the bot (for "mention only" group modes).
+    pub fn addresses_bot(&self) -> bool {
+        !matches!(self, TurnDecision::Default)
+    }
 }
 
 /// Decide one message. Identity is looked up only when the text can mention
@@ -68,8 +104,7 @@ pub fn decide_channel_turn(
 }
 
 /// Turn a [`TriggerRoute`] into a [`TurnDecision`], applying the one-shot
-/// addressee rules. Split out so adapters that already computed the route
-/// (LINE, inside its durable-ingress snapshot) share the same wording.
+/// addressee rules of `turn.pending`.
 pub fn decision_for_route(
     home: &Path,
     reg: &AgentRegistry,
@@ -78,31 +113,32 @@ pub fn decision_for_route(
     route: TriggerRoute,
 ) -> TurnDecision {
     let key = PendingKey::new(turn.channel, turn.conversation, turn.sender);
+    let lang = texts::lang_for(home);
     match route {
-        TriggerRoute::None => {
-            if turn.sender.is_empty() {
-                return TurnDecision::Default;
-            }
-            match claim_valid(home, reg, &key, turn) {
-                Some(id) => TurnDecision::Agent {
-                    via_trigger: turn.fallback != Some(id.as_str()),
-                    id,
-                },
-                None => TurnDecision::Default,
-            }
-        }
+        TriggerRoute::None => match addressee(home, reg, &key, turn) {
+            Some(id) => TurnDecision::Agent {
+                via_trigger: turn.fallback != Some(id.as_str()),
+                id,
+            },
+            None => TurnDecision::Default,
+        },
         TriggerRoute::Routed { agent, bare } => {
             if !turn.quiet {
                 audit(home, turn.channel, access, turn.sender, &agent, "allowed");
             }
             if bare && !turn.sender.is_empty() {
-                pending::arm(&key, &agent, turn.event, turn.seq);
+                if turn.pending == PendingPolicy::Live {
+                    pending::arm(&key, &agent, turn.event, turn.seq);
+                }
                 return TurnDecision::Reply {
-                    text: super::ask_for_task_text(&super::display_name(reg, &agent)),
+                    text: super::ask_for_task_text(lang, &super::display_name(reg, &agent)),
                     list: None,
+                    kind: ReplyKind::AskTask,
                 };
             }
-            pending::cancel(&key, turn.event, turn.seq);
+            if turn.pending == PendingPolicy::Live {
+                pending::cancel(&key, turn.event, turn.seq);
+            }
             TurnDecision::Agent {
                 via_trigger: turn.fallback != Some(agent.as_str()),
                 id: agent,
@@ -113,29 +149,42 @@ pub fn decision_for_route(
                 audit(home, turn.channel, access, turn.sender, &agent, "refused");
             }
             TurnDecision::Reply {
-                text: super::FORBIDDEN_TEXT.to_string(),
+                text: texts::forbidden(lang).to_string(),
                 list: None,
+                kind: ReplyKind::Refusal,
             }
         }
         TriggerRoute::List { candidates, .. } => {
             let agents = list::callable_agents(reg, &candidates);
             TurnDecision::Reply {
-                text: list::text_list(&agents),
+                text: list::text_list(&agents, lang),
                 list: Some(agents),
+                kind: ReplyKind::List,
             }
         }
     }
 }
 
-/// Claim the one-shot addressee for this event, re-checking that the sender
-/// may still call that employee (a binding can be revoked while it waits).
-fn claim_valid(
+/// The one-shot addressee for a message that calls nobody, per the turn's
+/// [`PendingPolicy`], re-checked against the sender's current access (a
+/// binding can be revoked while it waits).
+fn addressee(
     home: &Path,
     reg: &AgentRegistry,
     key: &PendingKey,
     turn: ChannelTurn<'_>,
 ) -> Option<String> {
-    let id = pending::claim(key, turn.event, turn.seq)?;
+    if turn.sender.is_empty() {
+        return None;
+    }
+    let id = match turn.pending {
+        PendingPolicy::Live => pending::claim(key, turn.event, turn.seq)?,
+        PendingPolicy::Peek => pending::peek(key, turn.seq)?,
+        PendingPolicy::Replay(stored) => stored?.to_string(),
+    };
+    if turn.fallback == Some(id.as_str()) {
+        return Some(id);
+    }
     let agent = reg
         .get(&id)
         .filter(|a| a.config.agent.status.is_operational())?;
@@ -166,8 +215,9 @@ pub fn pick_from_list(
     turn: ChannelTurn<'_>,
     agent: &str,
 ) -> String {
+    let lang = texts::lang_for(home);
     if turn.sender.is_empty() {
-        return super::FORBIDDEN_TEXT.to_string();
+        return texts::forbidden(lang).to_string();
     }
     let access = access::for_channel_sender(home, turn.channel, turn.sender);
     let callable = reg
@@ -176,12 +226,12 @@ pub fn pick_from_list(
         .is_some_and(|a| access.may_call(a, turn.fallback));
     if !callable {
         audit(home, turn.channel, &access, turn.sender, agent, "refused");
-        return super::FORBIDDEN_TEXT.to_string();
+        return texts::forbidden(lang).to_string();
     }
     audit(home, turn.channel, &access, turn.sender, agent, "allowed");
     let key = PendingKey::new(turn.channel, turn.conversation, turn.sender);
     pending::arm(&key, agent, turn.event, turn.seq);
-    super::ask_for_task_text(&super::display_name(reg, agent))
+    super::ask_for_task_text(lang, &super::display_name(reg, agent))
 }
 
 /// Whether `text` calls any employee at all (or asks for the list),
@@ -190,7 +240,12 @@ pub fn pick_from_list(
 pub fn calls_anyone(reg: &AgentRegistry, text: &str) -> bool {
     let everyone = SenderAccess {
         sender: super::Sender::Admin,
-        channel: true,
     };
     super::decide(reg, text, &everyone, None).addresses_bot()
+}
+
+/// Whether this reply language is used for `home` (re-exported for adapters
+/// building their own direct replies).
+pub fn lang(home: &Path) -> Lang {
+    texts::lang_for(home)
 }

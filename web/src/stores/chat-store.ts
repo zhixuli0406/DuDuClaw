@@ -5,6 +5,7 @@ import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
 import { effectiveName } from '@/lib/product-identity';
 import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
+import { mentionErrorText } from '@/lib/mention';
 
 export interface ChatAttachmentMeta {
   readonly name: string;
@@ -686,7 +687,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 {
                   id: nextId(),
                   role: 'system',
-                  content: data.message,
+                  // `@` refusals and choices arrive as codes and are worded
+                  // in the viewer's language here.
+                  content: mentionErrorText(data) ?? data.message,
                   timestamp: Date.now(),
                 },
               ],

@@ -230,11 +230,45 @@ fn duplicate_names_offer_a_choice() {
         MentionScan::Partial { candidates, .. } => assert_eq!(candidates.len(), 2),
         other => panic!("expected a choice, got {other:?}"),
     }
+    // Only one of the two is callable: still a choice, never a silent route
+    // to the callable one.
     let only_a2 = |id: &str| id == "a2";
+    match scan_mentions("@助理 幫我", &t, &only_a2) {
+        MentionScan::Partial { candidates, .. } => assert_eq!(candidates, vec!["a2".to_string()]),
+        other => panic!("expected a choice, got {other:?}"),
+    }
+    // Neither callable: refused.
+    let none = |_: &str| false;
+    assert!(matches!(
+        scan_mentions("@助理 幫我", &t, &none),
+        MentionScan::Forbidden(_)
+    ));
+}
+
+#[test]
+fn an_id_beats_a_trigger_beats_a_display_name() {
+    // "sales" is one employee's id and another's display name.
+    let t = vec![
+        MentionTarget::new("sales", "業務部", "@業務"),
+        MentionTarget::new("rep2", "sales", "@rep2"),
+    ];
     assert_eq!(
-        hit_id(&scan_mentions("@助理 幫我", &t, &only_a2)),
-        Some("a2")
+        hit_id(&scan_mentions("@sales 報價", &t, &all)),
+        Some("sales")
     );
+    // "@ops" is a trigger of one and the display name of another.
+    let t = vec![
+        MentionTarget::new("a1", "Alpha", "@ops"),
+        MentionTarget::new("a2", "ops", "@a2"),
+    ];
+    assert_eq!(hit_id(&scan_mentions("@ops 看一下", &t, &all)), Some("a1"));
+    // The winning tier is not callable: refused, never downgraded to the
+    // callable display-name match.
+    let only_a2 = |id: &str| id == "a2";
+    assert!(matches!(
+        scan_mentions("@ops 看一下", &t, &only_a2),
+        MentionScan::Forbidden(_)
+    ));
 }
 
 #[test]

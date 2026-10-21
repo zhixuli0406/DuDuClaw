@@ -611,6 +611,9 @@ export function WebChatPage() {
               onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
               onBlur={() => setMentionDismissed(true)}
               onFocus={() => setMentionDismissed(false)}
+              role="combobox"
+              aria-expanded={mentionOpen && mentionCandidates.length > 0}
+              aria-haspopup="listbox"
               aria-autocomplete="list"
               aria-controls={mentionOpen && mentionCandidates.length > 0 ? MENTION_LISTBOX_ID : undefined}
               aria-activedescendant={

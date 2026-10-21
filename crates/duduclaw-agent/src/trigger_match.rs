@@ -11,7 +11,10 @@
 //!   `ann@example.com` is never a mention.
 //! - After the `@` the longest employee name (trigger without its `@`,
 //!   display name, or employee id) that matches case-insensitively wins, so
-//!   `@財務小幫手` beats `@財務` when both exist.
+//!   `@財務小幫手` beats `@財務` when both exist. At equal length an id beats
+//!   a trigger and a trigger beats a display name; a name still shared by
+//!   several employees asks for the list (or is refused when none of them is
+//!   callable), never routes to the one callable employee among them.
 //! - A name must end at a boundary: end of text, or any character unless both
 //!   the name's last character and the next one are ASCII word characters.
 //!   A CJK name may be followed directly by text (`@財務小幫手幫我算帳`); an
@@ -22,6 +25,16 @@
 //! - `@` alone, or `@` plus the start of one or more callable names, is a
 //!   request for the list; a partial name never routes silently.
 
+/// Which kind of name matched. When one token names several employees, the
+/// most specific kind wins: an employee id beats a trigger, a trigger beats
+/// a display name (display names are free text and may be duplicated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameTier {
+    Id,
+    Trigger,
+    Display,
+}
+
 /// An employee a mention may name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MentionTarget {
@@ -29,23 +42,32 @@ pub struct MentionTarget {
     pub id: String,
     /// Names that call this employee, without a leading `@`.
     pub names: Vec<String>,
+    /// The kind of each entry in `names` (same order).
+    pub tiers: Vec<NameTier>,
 }
 
 impl MentionTarget {
     /// Build a target from an employee's id, display name and trigger. Empty
-    /// names are dropped, a leading `@`/`＠` is removed from each, and
-    /// duplicates are removed.
+    /// names are dropped, a leading `@`/`＠` is removed from each, and a
+    /// duplicate keeps its most specific kind.
     pub fn new(id: &str, display_name: &str, trigger: &str) -> Self {
         let mut names: Vec<String> = Vec::new();
-        for raw in [trigger, display_name, id] {
+        let mut tiers: Vec<NameTier> = Vec::new();
+        for (raw, tier) in [
+            (id, NameTier::Id),
+            (trigger, NameTier::Trigger),
+            (display_name, NameTier::Display),
+        ] {
             let name = strip_at(raw.trim()).trim();
             if !name.is_empty() && !names.iter().any(|n| eq_ci(n, name)) {
                 names.push(name.to_string());
+                tiers.push(tier);
             }
         }
         Self {
             id: id.to_string(),
             names,
+            tiers,
         }
     }
 }
@@ -97,15 +119,15 @@ pub fn scan_mentions(
             Some((len, ids)) => {
                 let end = after + len;
                 let callable: Vec<&String> = ids.iter().filter(|id| may_call(id)).collect();
-                match callable.as_slice() {
-                    [one] => {
+                match (ids.len(), callable.as_slice()) {
+                    (1, [one]) => {
                         return MentionScan::Hit(MentionHit {
                             id: (*one).clone(),
                             start: at,
                             end,
                         });
                     }
-                    [] => {
+                    (_, []) => {
                         if forbidden.is_none() {
                             forbidden = Some(MentionHit {
                                 id: ids[0].clone(),
@@ -114,13 +136,15 @@ pub fn scan_mentions(
                             });
                         }
                     }
-                    many => {
-                        // Several callable employees share this exact name:
-                        // never guess, offer the choice.
+                    (_, some) => {
+                        // The same name, at the same specificity, belongs to
+                        // several employees: never guess, and never pick the
+                        // one callable employee among names someone else
+                        // also answers to. Offer the callable ones.
                         if partial.is_none() {
                             partial = Some(MentionScan::Partial {
                                 token: rest[..len].to_string(),
-                                candidates: many.iter().map(|s| (*s).clone()).collect(),
+                                candidates: some.iter().map(|s| (*s).clone()).collect(),
                             });
                         }
                     }
@@ -246,24 +270,30 @@ fn match_name_at(rest: &str, name: &str) -> Option<usize> {
     }
 }
 
-/// The longest name matching at the start of `rest`, with every employee id
-/// that has a name of that length matching there.
+/// The longest name matching at the start of `rest`, and every employee id
+/// that matches there with that length at the most specific [`NameTier`].
 fn longest_names_at(rest: &str, targets: &[MentionTarget]) -> Option<(usize, Vec<String>)> {
-    let mut best: Option<(usize, Vec<String>)> = None;
+    // (length, tier, ids)
+    let mut best: Option<(usize, NameTier, Vec<String>)> = None;
     for t in targets {
-        let longest = t.names.iter().filter_map(|n| match_name_at(rest, n)).max();
-        let Some(len) = longest else { continue };
+        let own = t
+            .names
+            .iter()
+            .zip(&t.tiers)
+            .filter_map(|(n, tier)| match_name_at(rest, n).map(|len| (len, *tier)))
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let Some((len, tier)) = own else { continue };
         match &mut best {
-            Some((b, ids)) if *b == len => {
+            Some((b, bt, ids)) if *b == len && *bt == tier => {
                 if !ids.contains(&t.id) {
                     ids.push(t.id.clone());
                 }
             }
-            Some((b, _)) if *b > len => {}
-            _ => best = Some((len, vec![t.id.clone()])),
+            Some((b, bt, _)) if *b > len || (*b == len && *bt < tier) => {}
+            _ => best = Some((len, tier, vec![t.id.clone()])),
         }
     }
-    best
+    best.map(|(len, _, ids)| (len, ids))
 }
 
 /// What followed a bare `@`, up to a space or punctuation, capped.

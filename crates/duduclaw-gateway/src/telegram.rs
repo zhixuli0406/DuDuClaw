@@ -886,7 +886,8 @@ async fn process_telegram_message(
         };
         let from = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
         let reg = ctx.registry.read().await;
-        crate::trigger_route::turn::calls_anyone(&reg, text_content)
+        let routing = telegram_routing_text(&msg, &bot_username).unwrap_or_default();
+        crate::trigger_route::turn::calls_anyone(&reg, &routing)
             || crate::trigger_route::turn::has_pending(
                 "telegram",
                 &conversation,
@@ -1289,18 +1290,19 @@ async fn process_telegram_message(
         Some(id) => format!("{session_id}#{id}"),
         None => format!("{session_id}#{}", uuid::Uuid::new_v4()),
     };
-    // First pass `quiet`: nothing is logged or audited before the access
-    // gate. The second pass (same event key) gives the same decision.
-    let mut trigger_decision = match &bound_for_route {
+    // Person mentions (`@alice`, text mentions) are blanked before matching.
+    let routing_text = telegram_routing_text(&msg, &bot_username).unwrap_or_else(|| input_text.clone());
+    // First pass reads only (no one-shot change, no log): the access gate and
+    // takeover checks run before anything is armed, claimed or audited.
+    let peek = match &bound_for_route {
         Some(bound) => Some(
-            telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, bound.as_deref(), &event_key, true)
+            telegram_trigger_decision(&ctx, &session_id, &user_id, &routing_text, bound.as_deref(), &event_key, false)
                 .await,
         ),
         None => None,
     };
-    if matches!(trigger_decision, Some(crate::trigger_route::turn::TurnDecision::Reply { .. })) {
-        // Same access gate and human-takeover checks as the AI path: a
-        // blocked user gets nothing, a held conversation stays quiet.
+    let addressed = peek.as_ref().is_some_and(|d| d.addresses_bot());
+    if addressed {
         if let Some(gate) =
             crate::channel_reply::gate_direct_reply(&ctx, &session_id, &user_id, &input_text).await
         {
@@ -1310,21 +1312,24 @@ async fn process_telegram_message(
             return;
         }
     }
-    if trigger_decision
-        .as_ref()
-        .is_some_and(|d| !matches!(d, crate::trigger_route::turn::TurnDecision::Default))
-    {
-        if let Some(bound) = &bound_for_route {
-            trigger_decision = Some(
-                telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, bound.as_deref(), &event_key, false)
-                    .await,
-            );
+    let trigger_decision = match (&bound_for_route, addressed) {
+        (Some(bound), true) => Some(
+            telegram_trigger_decision(&ctx, &session_id, &user_id, &routing_text, bound.as_deref(), &event_key, true)
+                .await,
+        ),
+        _ => peek,
+    };
+    if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list, kind }) = &trigger_decision {
+        // Lists and refusals at most once per sender every few seconds.
+        let allowed = *kind == crate::trigger_route::turn::ReplyKind::AskTask
+            || crate::trigger_route::allow_direct_reply("telegram", &session_id, &user_id, *kind);
+        if !allowed {
+            return;
         }
-    }
-    if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) = &trigger_decision {
+        let lang = crate::trigger_route::texts::lang_for(&ctx.home_dir);
         let (body, markup) = match list {
             Some(agents) => match crate::trigger_route::list::telegram_keyboard(agents) {
-                Some(kb) => (crate::trigger_route::list::list_intro(agents), Some(kb)),
+                Some(kb) => (crate::trigger_route::list::list_intro(agents, lang), Some(kb)),
                 None => (text.clone(), None),
             },
             None => (text.clone(), None),
@@ -1340,16 +1345,20 @@ async fn process_telegram_message(
     };
 
     let (reply, guarded) = crate::approval::scope_trusted_reply(target, async {
-        if let Some((ref called_agent, _)) = called {
+        if let Some((ref called_agent, via_trigger)) = called {
             // Called by `@` (or the one message a tapped employee was
-            // waiting for): this message only.
-            let guard = build_guarded_reply_for_agent(
-                &input_text,
-                &ctx,
-                called_agent,
-                &session_id,
-                &user_id,
-                Some(on_progress),
+            // waiting for): this message only, in that employee's own
+            // session bucket.
+            let guard = crate::trigger_route::as_called_turn(
+                via_trigger,
+                build_guarded_reply_for_agent(
+                    &input_text,
+                    &ctx,
+                    called_agent,
+                    &session_id,
+                    &user_id,
+                    Some(on_progress),
+                ),
             )
             .await;
             effective_agent = Some(called_agent.clone());
@@ -2191,6 +2200,30 @@ async fn handle_command(
 
 // ── WP9: shared-bot user→agent binding ──────────────────────
 
+/// The text `@` matching sees: the message text with Telegram person
+/// mentions (`mention` entities other than this bot, and `text_mention`)
+/// blanked, so `@alice` never asks for the employee list. `None` when the
+/// message has no text (voice, caption-only).
+fn telegram_routing_text(msg: &TgMessage, bot_username: &str) -> Option<String> {
+    let text = msg.text.as_deref()?;
+    let spans: Vec<(usize, usize)> = msg
+        .entities
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|e| match e.entity_type.as_str() {
+            "text_mention" => true,
+            "mention" => !utf16_slice(text, e.offset, e.length).is_some_and(|m| {
+                !bot_username.is_empty()
+                    && m.trim_start_matches('@').eq_ignore_ascii_case(bot_username)
+            }),
+            _ => false,
+        })
+        .map(|e| (e.offset, e.length))
+        .collect();
+    Some(crate::trigger_route::spans::blank_utf16_spans(text, &spans))
+}
+
 /// The `@` routing decision for one shared-bot message. `bound` is the
 /// user's bound employee (their default), else the channel default.
 async fn telegram_trigger_decision(
@@ -2200,7 +2233,7 @@ async fn telegram_trigger_decision(
     text: &str,
     bound: Option<&str>,
     event: &str,
-    quiet: bool,
+    live: bool,
 ) -> crate::trigger_route::turn::TurnDecision {
     let reg = ctx.registry.read().await;
     let fallback = match bound {
@@ -2220,7 +2253,12 @@ async fn telegram_trigger_decision(
             fallback: fallback.as_deref(),
             event,
             seq: crate::trigger_route::pending::next_seq(),
-            quiet,
+            quiet: !live,
+            pending: if live {
+                crate::trigger_route::turn::PendingPolicy::Live
+            } else {
+                crate::trigger_route::turn::PendingPolicy::Peek
+            },
         },
     )
 }
@@ -2251,6 +2289,7 @@ async fn telegram_pick(ctx: &Arc<ReplyContext>, session_id: &str, presser: &str,
             event: &event,
             seq: crate::trigger_route::pending::next_seq(),
             quiet: false,
+            pending: crate::trigger_route::turn::PendingPolicy::Live,
         },
         agent,
     )
@@ -4063,3 +4102,45 @@ mod transformed_decision_acl_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/telegram.rs"]
 mod f4_decision_route_tests;
+
+#[cfg(test)]
+mod routing_text_tests {
+    use super::*;
+
+    fn message(text: &str, entities: serde_json::Value) -> TgMessage {
+        serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "chat": {"id": -100, "type": "supergroup"},
+            "from": {"id": 42, "is_bot": false, "first_name": "Ann"},
+            "text": text,
+            "entities": entities
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn person_mentions_are_blanked_with_utf16_offsets() {
+        // 😀 is two UTF-16 units: "@alice" starts at unit 3.
+        let msg = message(
+            "😀 @alice 和 @sales-rep 報價",
+            serde_json::json!([{"type": "mention", "offset": 3, "length": 6}]),
+        );
+        let text = telegram_routing_text(&msg, "dudu_bot").unwrap();
+        assert!(!text.contains("@alice"));
+        assert!(text.contains("@sales-rep 報價"));
+    }
+
+    #[test]
+    fn the_bots_own_mention_and_unknown_entities_are_kept() {
+        let msg = message(
+            "@DuDu_Bot @財務小幫手",
+            serde_json::json!([{"type": "mention", "offset": 0, "length": 9}, {"type": "bold", "offset": 10, "length": 6}]),
+        );
+        assert_eq!(telegram_routing_text(&msg, "dudu_bot").unwrap(), "@DuDu_Bot @財務小幫手");
+        let msg = message(
+            "嗨 @財務小幫手",
+            serde_json::json!([{"type": "text_mention", "offset": 2, "length": 6, "user": {"id": 7, "is_bot": false, "first_name": "X"}}]),
+        );
+        assert_eq!(telegram_routing_text(&msg, "dudu_bot").unwrap().trim(), "嗨");
+    }
+}

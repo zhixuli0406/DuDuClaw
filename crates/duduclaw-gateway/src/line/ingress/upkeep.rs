@@ -15,7 +15,7 @@
 //!   alerts, and flushing the alert queue into summarized Activity rows.
 
 use super::super::*;
-use super::revision::{RevisionError, line_revision};
+use super::revision::{RevisionError, line_revision_with};
 use crate::channel_ingress::alerts::{self, AlertKind};
 use crate::channel_ingress::config::IngressConfig;
 use crate::channel_ingress::{Deferred, IngressRow, IngressStore, PENDING_REVISION};
@@ -76,8 +76,34 @@ async fn snapshot_one(state: &LineState, store: &IngressStore, row: &IngressRow,
         row.authorization_revision
             .strip_prefix(&format!("{PENDING_REVISION}:"))
     };
-    match line_revision(state, &event, expected).await {
+    // The first snapshot resolves the one-shot addressee and stores the
+    // route; a retry's snapshot reuses the stored route (never re-arms).
+    let stored_route = match store.route_agent(&row.id).await {
+        Ok(r) => r.map(|(agent, one_shot)| super::super::trigger::StoredRoute { agent, one_shot }),
+        Err(_) => {
+            if store.defer_snapshot(row, "route_unreadable", now).await == Ok(Deferred::Quarantined) {
+                alerts::record(store, AlertKind::Quarantined, &row.id, SNAPSHOT_UNAVAILABLE).await;
+            }
+            return;
+        }
+    };
+    let mode = match &stored_route {
+        Some(s) => super::super::trigger::RouteMode::Replay(Some(s)),
+        None => super::super::trigger::RouteMode::Admission,
+    };
+    match line_revision_with(state, &event, expected, mode).await {
         Ok(rev) => {
+            if stored_route.is_none()
+                && store
+                    .store_route_agent(&row.id, &rev.stored.agent, rev.stored.one_shot)
+                    .await
+                    .is_err()
+            {
+                if store.defer_snapshot(row, "route_unwritable", now).await == Ok(Deferred::Quarantined) {
+                    alerts::record(store, AlertKind::Quarantined, &row.id, SNAPSHOT_UNAVAILABLE).await;
+                }
+                return;
+            }
             let stored = store
                 .store_snapshot(
                     &row.id,

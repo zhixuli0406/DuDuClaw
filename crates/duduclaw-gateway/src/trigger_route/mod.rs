@@ -26,6 +26,8 @@
 pub mod access;
 pub mod list;
 pub mod pending;
+pub mod spans;
+pub mod texts;
 pub mod turn;
 
 #[cfg(test)]
@@ -149,31 +151,74 @@ pub fn with_reply_prefix(reply: String, display_name: &str) -> String {
     format!("{}\n{reply}", reply_prefix(display_name))
 }
 
-/// The refusal for calling an employee the sender may not call. It does not
-/// name the employee; it does confirm that the name belongs to one (a name
-/// that matches nobody is ordinary text for the default employee).
+/// The refusal for calling an employee the sender may not call (zh-TW; the
+/// channel paths use [`texts::forbidden`] in the configured language). It
+/// does not name the employee; it does confirm that the name belongs to one
+/// (owner decision: an explicit refusal beats silently answering as the
+/// default employee).
 pub const FORBIDDEN_TEXT: &str =
     "你沒有呼叫這位 AI 員工的權限，這則訊息沒有送出。輸入「@」可以查看你能呼叫的 AI 員工。";
 
-/// The refusal when a WebChat account may not use the default employee.
-pub const DEFAULT_FORBIDDEN_TEXT: &str =
-    "你沒有與預設 AI 員工對話的權限。請選擇你可以使用的 AI 員工，或輸入「@」呼叫。";
-
-/// Shown when nobody is callable (empty `@` list).
-pub const NOBODY_CALLABLE_TEXT: &str = "目前沒有你可以呼叫的 AI 員工。";
-
 /// The prompt after `@name` with no task.
-pub fn ask_for_task_text(display_name: &str) -> String {
-    format!(
-        "請說要交給「{display_name}」的事，你的下一則訊息會直接交給他（{} 分鐘內有效）。",
-        pending::PENDING_TTL.as_secs() / 60
-    )
+pub fn ask_for_task_text(lang: texts::Lang, display_name: &str) -> String {
+    texts::ask_for_task(lang, display_name, pending::PENDING_TTL.as_secs() / 60)
+}
+
+/// The session a called employee answers in: its own bucket inside the
+/// conversation, so history, secret restoration and pending goal state never
+/// mix between the default employee and the one called by `@`.
+pub fn called_session(session_id: &str, agent: &str) -> String {
+    format!("{session_id}#agent:{agent}")
+}
+
+/// At most one `@` list and one refusal per sender per conversation every
+/// [`DIRECT_REPLY_INTERVAL`]; repeats inside the window are answered with
+/// silence (saves the platform's message quota under spam).
+pub const DIRECT_REPLY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `true` when a list/refusal may be sent to this sender now.
+pub fn allow_direct_reply(
+    channel: &str,
+    conversation: &str,
+    sender: &str,
+    kind: turn::ReplyKind,
+) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    const MAX: usize = 4_096;
+    type Key = (String, String, String, turn::ReplyKind);
+    static LAST: OnceLock<Mutex<HashMap<Key, Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if last.len() >= MAX {
+        last.retain(|_, t| now.saturating_duration_since(*t) < DIRECT_REPLY_INTERVAL);
+        if last.len() >= MAX {
+            last.clear();
+        }
+    }
+    let key = (
+        channel.to_string(),
+        conversation.to_string(),
+        sender.to_string(),
+        kind,
+    );
+    match last.get(&key) {
+        Some(t) if now.saturating_duration_since(*t) < DIRECT_REPLY_INTERVAL => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
 }
 
 /// Log a trigger-routing decision. Allowed switches log at info; refusals
 /// also go to `security_audit.jsonl` so they can be reviewed later. The
-/// sender is recorded as the dashboard account when mapped, else as a short
-/// digest of the channel id (never the raw platform id).
+/// sender is recorded as the dashboard account when mapped, else as an HMAC
+/// of the channel id under a per-home key (never the raw platform id).
 pub fn audit(
     home: &std::path::Path,
     channel: &str,
@@ -182,7 +227,7 @@ pub fn audit(
     agent: &str,
     outcome: &'static str,
 ) {
-    let who = access.audit_label(channel, channel_sender);
+    let who = access.audit_label(home, channel, channel_sender);
     tracing::info!(channel, sender = %who, agent, outcome, "trigger routing decision");
     if outcome == "refused" && !recently_audited(&who, agent) {
         let event = duduclaw_security::audit::AuditEvent::new(
@@ -203,6 +248,31 @@ pub struct AnsweredBy {
     /// Chosen by `@` (or a one-shot addressee) rather than being the
     /// conversation's default employee.
     pub via_trigger: bool,
+    /// The session the turn ran in ([`called_session`] for a called
+    /// employee); secret restoration must use the same one.
+    pub session_id: String,
+}
+
+tokio::task_local! {
+    /// Set by a channel adapter around a reply built for an employee called
+    /// by `@` (or a one-shot addressee): the reply pipeline then runs the
+    /// turn in that employee's own session bucket ([`called_session`]) after
+    /// the access gate and takeover checks ran on the conversation itself.
+    pub static CALLED_TURN: ();
+}
+
+/// Run `fut` as a called-employee turn when `called` is true.
+pub async fn as_called_turn<F: std::future::Future>(called: bool, fut: F) -> F::Output {
+    if called {
+        CALLED_TURN.scope((), fut).await
+    } else {
+        fut.await
+    }
+}
+
+/// Whether the current reply is a called-employee turn.
+pub fn in_called_turn() -> bool {
+    CALLED_TURN.try_with(|_| ()).is_ok()
 }
 
 tokio::task_local! {

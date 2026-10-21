@@ -140,6 +140,7 @@ describe('WebChatPage', () => {
     fireEvent.change(input, { target: { value: '@財', selectionStart: 2 } });
     const list = screen.getByRole('listbox');
     expect(list).toBeInTheDocument();
+    expect(screen.getByRole('combobox')).toHaveAttribute('aria-expanded', 'true');
     const options = screen.getAllByRole('option');
     expect(options).toHaveLength(1);
     expect(options[0]).toHaveTextContent('財務小幫手');

@@ -171,6 +171,9 @@ pub enum ChatMessage {
         /// clients that only ever read `message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
+        /// `mention_choices` only: the `@name` texts the user can pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choices: Option<Vec<String>>,
     },
     /// Server → Client: session info (sent on connect).
     #[serde(rename = "session_info")]
@@ -201,6 +204,7 @@ impl ChatMessage {
         ChatMessage::Error {
             message: message.into(),
             code: None,
+            choices: None,
         }
     }
 
@@ -211,6 +215,16 @@ impl ChatMessage {
         ChatMessage::Error {
             message: message.into(),
             code: Some(code.to_string()),
+            choices: None,
+        }
+    }
+
+    /// An error frame with a code and the `@name` choices to offer.
+    fn error_choices(message: impl Into<String>, code: &'static str, choices: Vec<String>) -> Self {
+        ChatMessage::Error {
+            message: message.into(),
+            code: Some(code.to_string()),
+            choices: Some(choices),
         }
     }
 }
@@ -312,14 +326,21 @@ fn webchat_command_admin(user_db: &UserDb, auth_user: &str) -> bool {
 /// DB round-trip `WebChatState::agent_access_allowed` performs on a cache
 /// miss.
 fn load_acl_snapshot(user_db: &UserDb, user_id: &str) -> Result<AclSnapshot, String> {
-    let user = user_db
-        .get_user(user_id)?
-        .ok_or_else(|| "user not found".to_string())?;
-    let bindings = user_db.get_user_agents(user_id)?;
-    Ok(AclSnapshot {
-        role: user.role,
-        bound_agents: bindings.into_iter().map(|b| b.agent_name).collect(),
-    })
+    // An unknown account fails closed; an inactive one keeps no bindings and
+    // is never Admin (the JWT may outlive a suspension).
+    if user_db.get_user(user_id)?.is_none() {
+        return Err("user not found".to_string());
+    }
+    match crate::trigger_route::access::load_account(user_db, user_id)? {
+        Some((role, bound)) => Ok(AclSnapshot {
+            role,
+            bound_agents: bound.into_iter().collect(),
+        }),
+        None => Ok(AclSnapshot {
+            role: duduclaw_auth::UserRole::Employee,
+            bound_agents: std::collections::HashSet::new(),
+        }),
+    }
 }
 
 /// Shared state for WebChat connections.
@@ -977,27 +998,29 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                                 // ── `@` routing (D6): a message may call another
                                 // employee the account may use, for this message
-                                // only; a forbidden call or a forbidden default
-                                // employee is refused here, before any model call.
-                                // Chat commands keep the selected employee but get
-                                // the same default-employee check (an empty text
-                                // calls nobody).
-                                let is_cmd = crate::chat_commands::is_command(&content);
-                                let routed = match route::decide_webchat_route(
-                                    &state,
-                                    &auth_user,
-                                    if is_cmd { "" } else { &content },
-                                    effective_agent.as_deref(),
-                                    &agent_id,
-                                    sid,
-                                    &user_id,
-                                ).await {
-                                    Ok(routed) => routed,
-                                    Err(frame) => {
-                                        if let Ok(json) = serde_json::to_string(&*frame) {
-                                            let _ = sink.send(Message::Text(json.into())).await;
+                                // only; a forbidden call is refused here, before
+                                // any model call. The
+                                // default employee stays reachable by everyone.
+                                // Chat commands keep the selected employee.
+                                let routed = if crate::chat_commands::is_command(&content) {
+                                    route::WebRoute { agent: effective_agent.clone(), switched: false }
+                                } else {
+                                    match route::decide_webchat_route(
+                                        &state,
+                                        &auth_user,
+                                        &content,
+                                        effective_agent.as_deref(),
+                                        &agent_id,
+                                        sid,
+                                        &user_id,
+                                    ).await {
+                                        Ok(routed) => routed,
+                                        Err(frame) => {
+                                            if let Ok(json) = serde_json::to_string(&*frame) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
                                         }
-                                        continue;
                                     }
                                 };
                                 // A call to another employee answers in that

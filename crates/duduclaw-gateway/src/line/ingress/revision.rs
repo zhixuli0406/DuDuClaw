@@ -28,6 +28,8 @@ pub(crate) struct Revision {
     pub authority: String,
     /// The resolved employee's name (routing key).
     pub agent: String,
+    /// What to store for the event after its first snapshot.
+    pub stored: super::super::trigger::StoredRoute,
 }
 
 /// Channel-setting keys that change who may talk to the bot or who answers.
@@ -91,12 +93,26 @@ async fn effective_agent_text(agent_dir: &Path) -> Result<String, RevisionError>
         })
 }
 
-/// Compute the snapshot. `expected_credentials` binds a freshly accepted
-/// event to the credentials its signature was checked with.
+/// Compute the snapshot without one-shot state (no stored route), for tests
+/// that have no event row at hand.
+#[cfg(test)]
 pub(crate) async fn line_revision(
     state: &LineState,
     event: &LineEvent,
     expected_credentials: Option<&str>,
+) -> Result<Revision, RevisionError> {
+    line_revision_with(state, event, expected_credentials, super::super::trigger::RouteMode::Replay(None)).await
+}
+
+/// Compute the snapshot. `expected_credentials` binds a freshly accepted
+/// event to the credentials its signature was checked with; `mode` says
+/// whether this is the event's first snapshot (one-shot addressee resolved
+/// now) or a recomputation (the stored route is reused).
+pub(crate) async fn line_revision_with(
+    state: &LineState,
+    event: &LineEvent,
+    expected_credentials: Option<&str>,
+    mode: super::super::trigger::RouteMode<'_>,
 ) -> Result<Revision, RevisionError> {
     let text = tokio::fs::read_to_string(state.home_dir.join("config.toml"))
         .await
@@ -116,17 +132,25 @@ pub(crate) async fn line_revision(
     let conversation = line_conversation(event);
     let session = format!("line:{conversation}");
     // Who handles the event: `@` routing for this sender, else the default
-    // employee. Recomputed with `quiet` so a snapshot never logs or audits;
-    // idempotent per event (see `line::trigger`).
-    let (agent_name, agent_dir) = {
-        let route = super::super::trigger::line_route(state, event, true)
+    // employee. Computed `quiet` (a snapshot never logs or audits); the
+    // one-shot addressee is resolved only on the first snapshot and reused
+    // afterwards (see `line::trigger`).
+    let (agent_name, agent_dir, stored) = {
+        let route = super::super::trigger::line_route(state, event, mode, true)
             .await
             .ok_or(RevisionError::Changed("no_resolved_agent"))?;
+        // A stored addressee the sender may no longer call: the event can no
+        // longer go where it was accepted.
+        if let super::super::trigger::RouteMode::Replay(Some(s)) = mode {
+            if s.one_shot && !route.one_shot {
+                return Err(RevisionError::Changed("addressee_no_longer_callable"));
+            }
+        }
         let reg = state.ctx.registry.read().await;
         let agent = reg
             .get(route.agent())
             .ok_or(RevisionError::Changed("no_resolved_agent"))?;
-        (agent.config.agent.name.clone(), agent.dir.clone())
+        (agent.config.agent.name.clone(), agent.dir.clone(), route.stored())
     };
     let raw = effective_agent_text(&agent_dir).await?;
     let _: duduclaw_core::types::AgentConfig =
@@ -195,5 +219,6 @@ pub(crate) async fn line_revision(
         route: crate::channel_ingress::digest(&[&route.to_string()]),
         authority: crate::channel_ingress::digest(&[&authority.to_string()]),
         agent: agent_name,
+        stored,
     })
 }

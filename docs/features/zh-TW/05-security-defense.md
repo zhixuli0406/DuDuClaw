@@ -192,7 +192,7 @@ action_rules = [
 
 ## 用 @ 呼叫員工依發話者權限判斷（v1.76）
 
-v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的子字串比對：只綁定一位員工的 WebChat 帳號打別人的觸發詞就能叫到別人，任何 LINE 好友也一樣。現在先解析發話的真人（WebChat 用 dashboard 帳號；通訊軟體用**已驗證**的 `channel_identities`，沒有就視為未綁定），只在這個人叫得到的員工裡比對：管理員全部；dashboard 帳號是綁定的員工；通訊軟體的發話者另外加上這個對話的預設員工，以及 `[channels] public_trigger = true` 的員工（只有管理員能改，員工自己改不了）。叫其他員工會在呼叫模型前被拒絕，並以 `trigger_route_refused` 記進 `security_audit.jsonl`（記帳號，或平台 ID 的雜湊）。沒有綁定預設員工的 WebChat 帳號，也不再預設交給預設員工。任何查詢失敗都當成未綁定處理。細節見[用 @ 呼叫 AI 員工](62-calling-ai-staff.md)。
+v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的子字串比對：只綁定一位員工的 WebChat 帳號打別人的觸發詞就能叫到別人，任何 LINE 好友也一樣。現在先解析發話的真人（WebChat 用 dashboard 帳號；通訊軟體用**已驗證**的 `channel_identities`，沒有就視為未綁定），只在這個人叫得到的員工裡比對：管理員全部；每個人都叫得到這個對話的預設員工，以及 `[channels] public_trigger = true` 的員工（只有管理員能改，員工自己改不了）；dashboard 帳號與綁定了帳號的通訊軟體使用者另外加上綁定的員工。叫其他員工會在呼叫模型前被拒絕，並以 `trigger_route_refused` 記進 `security_audit.jsonl`（記帳號，或以這台機器的金鑰 `trigger_audit.key` 算出的平台 ID HMAC）。停用中的帳號，綁定不再算數。任何查詢失敗都當成未綁定處理。被叫來的員工在自己的 session 回答，對話紀錄與機密不會在員工之間混用；但在群組裡，回答仍是所有成員都看得到。細節見[用 @ 呼叫 AI 員工](62-calling-ai-staff.md)。
 
 ## 支撐層
 

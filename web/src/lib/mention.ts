@@ -8,6 +8,8 @@
  * inserted name is the display name when it is unique, else the staff id.
  */
 
+import { defaultLocale, messages, useLocaleStore } from '@/i18n';
+
 export interface MentionAgent {
   readonly name: string;
   readonly display_name: string;
@@ -91,4 +93,28 @@ export function applyMention(text: string, mention: ActiveMention, call: string)
   const after = text.slice(mention.end).replace(/^\s+/, '');
   const inserted = `${call} `;
   return { text: `${before}${inserted}${after}`, caret: before.length + inserted.length };
+}
+
+/** Server error codes for `@` calls (see `webchat/route.rs`). */
+export const MENTION_FORBIDDEN_CODE = 'mention_forbidden';
+export const MENTION_CHOICES_CODE = 'mention_choices';
+
+/** The viewer-language text for an `@` error frame, or `null` when the
+ *  frame is not one (the caller then shows the server's message). */
+export function mentionErrorText(
+  frame: { readonly code?: unknown; readonly choices?: unknown },
+  locale?: string,
+): string | null {
+  const lang = locale ?? useLocaleStore.getState().locale;
+  const catalogue = messages[lang] ?? messages[defaultLocale];
+  if (frame.code === MENTION_FORBIDDEN_CODE) {
+    return catalogue['webchat.mention.forbidden'] ?? null;
+  }
+  if (frame.code === MENTION_CHOICES_CODE && Array.isArray(frame.choices)) {
+    const names = frame.choices.filter((c): c is string => typeof c === 'string');
+    if (names.length === 0) return catalogue['webchat.mention.none'] ?? null;
+    const heading = catalogue['webchat.mention.choices'] ?? '';
+    return [heading, ...names.map((n) => `• ${n}`)].join('\n');
+  }
+  return null;
 }

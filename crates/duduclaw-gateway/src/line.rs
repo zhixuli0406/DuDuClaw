@@ -114,6 +114,26 @@ struct LineMessage {
     /// Content provider info (for image/video/audio).
     #[serde(rename = "contentProvider")]
     content_provider: Option<LineContentProvider>,
+    /// Native @-mentions in a text message (people, or the bot itself).
+    #[serde(default)]
+    mention: Option<LineMention>,
+}
+
+/// `message.mention` of a LINE text message.
+#[derive(Debug, Deserialize, Default)]
+struct LineMention {
+    #[serde(default)]
+    mentionees: Vec<LineMentionee>,
+}
+
+/// One mentioned user. `index` / `length` are UTF-16 code units.
+#[derive(Debug, Deserialize)]
+struct LineMentionee {
+    index: usize,
+    length: usize,
+    /// True when the mentioned user is this bot.
+    #[serde(rename = "isSelf", default)]
+    is_self: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,6 +638,7 @@ async fn process_line_events(
     token: &str,
     agent_id: &str,
     _account_id: &str,
+    stored: Option<&trigger::StoredRoute>,
 ) {
     async {
         for event in events {
@@ -713,17 +734,18 @@ async fn process_line_events(
                 }
 
                 // ── `@` routing (D6): who answers this event, or a direct
-                // answer (list / refusal / "say the task"). Same computation
-                // as the route snapshot, so it agrees with `agent_id`.
-                // Computed `quiet`: nothing is logged or audited until the
-                // access gate has passed (below).
-                let route = trigger::line_route(state, &event, true).await;
+                // answer (list / refusal / "say the task"). Replays the route
+                // stored with the event's snapshot, so it agrees with
+                // `agent_id` and never touches the one-shot store. Computed
+                // `quiet`: nothing is logged or audited until the access gate
+                // has passed (below).
+                let route = trigger::line_route(state, &event, trigger::RouteMode::Replay(stored), true).await;
 
                 // ── Mention-only mode (group chats only) ──
-                // LINE bots get no native @mention, so "mentioned" means the
-                // message calls an employee by `@` (or asks for the `@` list),
-                // or is the one message a tapped/called employee was waiting
-                // for. Everything else in the group is ignored.
+                // "Mentioned" means: a LINE native mention of the bot, a
+                // message that calls an employee by `@` (or asks for the `@`
+                // list), or the one message a tapped/called employee was
+                // waiting for. Everything else in the group is ignored.
                 let mention_only = state
                     .ctx
                     .channel_settings
@@ -938,15 +960,20 @@ async fn process_line_events(
                     }
                 }
                 let route = if route.as_ref().is_some_and(|r| r.addresses_bot()) {
-                    trigger::line_route(state, &event, false).await
+                    trigger::line_route(state, &event, trigger::RouteMode::Replay(stored), false).await
                 } else {
                     route
                 };
-                if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) =
+                if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list, kind }) =
                     route.as_ref().map(|r| &r.decision)
                 {
-                    let messages = trigger::direct_reply_messages(text, list.as_deref());
-                    let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                    // Lists and refusals at most once per sender every few
+                    // seconds (saves the official account's message quota).
+                    if trigger::direct_reply_allowed(*kind, &event) {
+                        let lang = crate::trigger_route::texts::lang_for(&state.home_dir);
+                        let messages = trigger::direct_reply_messages(text, list.as_deref(), lang);
+                        let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                    }
                     continue;
                 }
 
@@ -1014,13 +1041,24 @@ async fn process_line_events(
                 // one shared retrieval scope.
                 // `reply_principal_for_sender` yields "" there, which turns
                 // CCR off for the turn (fail-closed).
-                let guarded = build_guarded_reply_for_agent(
-                    &input_text,
-                    &state.ctx,
-                    agent_id,
-                    &session_id,
-                    crate::ccr_runtime::reply_principal_for_sender(sender),
-                    on_progress,
+                // A called employee runs in its own session bucket (the
+                // reply pipeline switches after the access/takeover checks).
+                let called = route.as_ref().is_some_and(|r| r.labelled());
+                let turn_session = if called {
+                    crate::trigger_route::called_session(&session_id, agent_id)
+                } else {
+                    session_id.clone()
+                };
+                let guarded = crate::trigger_route::as_called_turn(
+                    called,
+                    build_guarded_reply_for_agent(
+                        &input_text,
+                        &state.ctx,
+                        agent_id,
+                        &session_id,
+                        crate::ccr_runtime::reply_principal_for_sender(sender),
+                        on_progress,
+                    ),
                 )
                 .await;
                 drop(loading_guard);
@@ -1091,7 +1129,7 @@ async fn process_line_events(
                 if let Some(last) = messages.last_mut() {
                     last["quickReply"] = if crate::goal_intent::reply_has_confirmation_menu(&reply)
                     {
-                        crate::goal_intent::pending_button_nonce(&session_id)
+                        crate::goal_intent::pending_button_nonce(&turn_session)
                             .map(|nonce| channel_format::line_gintent_quick_reply(&nonce))
                             .unwrap_or_else(channel_format::line_quick_reply)
                     } else {

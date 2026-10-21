@@ -146,21 +146,61 @@ pub fn arm(key: &PendingKey, agent: &str, origin: &str, seq: i64) {
     );
 }
 
+/// How long the result of a claim is remembered for its event, so an event
+/// whose route is recomputed while it runs keeps its addressee even when the
+/// sender armed someone else in the meantime.
+const CLAIM_TTL: Duration = Duration::from_secs(75 * 60);
+/// Upper bound on remembered claim results (memory guard).
+const MAX_CLAIMS: usize = 10_000;
+
+type ClaimMap = HashMap<(PendingKey, String), (String, Instant)>;
+
+fn claims() -> std::sync::MutexGuard<'static, ClaimMap> {
+    static CLAIMS: OnceLock<Mutex<ClaimMap>> = OnceLock::new();
+    CLAIMS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn remember_claim(key: &PendingKey, event: &str, agent: &str, now: Instant) {
+    let mut map = claims();
+    if map.len() >= MAX_CLAIMS {
+        map.retain(|_, (_, at)| now.saturating_duration_since(*at) < CLAIM_TTL);
+        if map.len() >= MAX_CLAIMS {
+            let mut by_age: Vec<((PendingKey, String), Instant)> =
+                map.iter().map(|(k, (_, at))| (k.clone(), *at)).collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            for (k, _) in by_age.into_iter().take(map.len() + 1 - MAX_CLAIMS) {
+                map.remove(&k);
+            }
+        }
+    }
+    map.insert((key.clone(), event.to_string()), (agent.to_string(), now));
+}
+
 /// The addressee for `event`, consuming it on first use. Returns the same
-/// addressee again when `event` already claimed it. `None` when nothing is
-/// armed, it expired, or it belongs to an earlier/other event.
+/// addressee again for the same event (kept for [`CLAIM_TTL`], independent
+/// of later arms). `None` when nothing is armed, it expired, or it belongs
+/// to an earlier/other event.
 pub fn claim(key: &PendingKey, event: &str, seq: i64) -> Option<String> {
     let now = Instant::now();
-    let mut map = lock();
-    let e = map.get_mut(key)?;
-    match &e.state {
-        State::Claimed(by) if by == event => Some(e.agent.clone()),
-        State::Open if seq > e.seq && !expired(e, now) => {
-            e.state = State::Claimed(event.to_string());
-            Some(e.agent.clone())
+    if let Some((agent, at)) = claims().get(&(key.clone(), event.to_string())) {
+        if now.saturating_duration_since(*at) < CLAIM_TTL {
+            return Some(agent.clone());
         }
-        _ => None,
     }
+    let agent = {
+        let mut map = lock();
+        let e = map.get_mut(key)?;
+        if !(e.state == State::Open && seq > e.seq && !expired(e, now)) {
+            return None;
+        }
+        e.state = State::Claimed(event.to_string());
+        e.agent.clone()
+    };
+    remember_claim(key, event, &agent, now);
+    Some(agent)
 }
 
 /// Whether `claim` would succeed for a new event at `seq`, without using it

@@ -3,6 +3,8 @@
 use duduclaw_agent::registry::AgentRegistry;
 use serde_json::{Value, json};
 
+use super::texts::{self, Lang};
+
 /// One callable employee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallableAgent {
@@ -64,13 +66,11 @@ pub fn callable_agents(reg: &AgentRegistry, ids: &[String]) -> Vec<CallableAgent
 }
 
 /// Plain-text list, for channels without buttons.
-pub fn text_list(agents: &[CallableAgent]) -> String {
+pub fn text_list(agents: &[CallableAgent], lang: Lang) -> String {
     if agents.is_empty() {
-        return super::NOBODY_CALLABLE_TEXT.to_string();
+        return texts::nobody_callable(lang).to_string();
     }
-    let mut out = String::from("你可以呼叫的 AI 員工（輸入名稱前加 @，例如「");
-    out.push_str(&agents[0].call_text);
-    out.push_str(" 幫我…」）：");
+    let mut out = texts::list_heading(lang, &agents[0].call_text);
     for a in agents {
         out.push_str("\n• ");
         out.push_str(&a.call_text);
@@ -79,18 +79,27 @@ pub fn text_list(agents: &[CallableAgent]) -> String {
 }
 
 /// Intro line shown above a button list.
-pub fn list_intro(agents: &[CallableAgent]) -> String {
+pub fn list_intro(agents: &[CallableAgent], lang: Lang) -> String {
     if agents.is_empty() {
-        super::NOBODY_CALLABLE_TEXT.to_string()
+        texts::nobody_callable(lang).to_string()
     } else {
-        "要交給哪位 AI 員工？點一下名字，再說要做的事。".to_string()
+        texts::list_intro(lang).to_string()
+    }
+}
+
+/// The "more" button label.
+fn more_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhTw => "更多",
+        Lang::En => "More",
+        Lang::Ja => "もっと見る",
     }
 }
 
 /// LINE text message with the `page`-th (0-based) page of quick-reply
 /// buttons. Each button sends `@name` as the user. When the list does not
 /// fit, the last button is "更多" (a postback for the next page).
-pub fn line_list_message(agents: &[CallableAgent], page: usize) -> Value {
+pub fn line_list_message(agents: &[CallableAgent], page: usize, lang: Lang) -> Value {
     let per_page = LINE_QUICK_REPLY_MAX - 1;
     let start = page.saturating_mul(per_page).min(agents.len());
     let remaining = &agents[start..];
@@ -117,13 +126,13 @@ pub fn line_list_message(agents: &[CallableAgent], page: usize) -> Value {
             "type": "action",
             "action": {
                 "type": "postback",
-                "label": "更多",
+                "label": more_label(lang),
                 "data": format!("{LINE_PAGE_POSTBACK}{}", page + 1),
-                "displayText": "更多",
+                "displayText": more_label(lang),
             }
         }));
     }
-    let mut msg = json!({ "type": "text", "text": list_intro(agents) });
+    let mut msg = json!({ "type": "text", "text": list_intro(agents, lang) });
     if !items.is_empty() {
         msg["quickReply"] = json!({ "items": items });
     }

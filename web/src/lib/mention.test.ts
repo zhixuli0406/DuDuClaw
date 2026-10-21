@@ -3,6 +3,7 @@ import {
   applyMention,
   filterMentionCandidates,
   findActiveMention,
+  mentionErrorText,
   mentionText,
   type MentionAgent,
 } from './mention';
@@ -61,5 +62,17 @@ describe('mentionText / applyMention', () => {
     const out = applyMention(text, m, '@財務小幫手');
     expect(out.text).toBe('請 @財務小幫手 幫我');
     expect(out.caret).toBe('請 @財務小幫手 '.length);
+  });
+});
+
+describe('mentionErrorText', () => {
+  it('words the refusal and the choices in the viewer language', () => {
+    expect(mentionErrorText({ code: 'mention_forbidden' }, 'en')).toMatch(/permission/);
+    expect(mentionErrorText({ code: 'mention_forbidden' }, 'zh-TW')).toMatch(/權限/);
+    const text = mentionErrorText({ code: 'mention_choices', choices: ['@財務小幫手', '@業務專員'] }, 'ja-JP');
+    expect(text).toContain('• @財務小幫手');
+    expect(text).toContain('• @業務專員');
+    expect(mentionErrorText({ code: 'agent_forbidden' }, 'en')).toBeNull();
+    expect(mentionErrorText({}, 'en')).toBeNull();
   });
 });

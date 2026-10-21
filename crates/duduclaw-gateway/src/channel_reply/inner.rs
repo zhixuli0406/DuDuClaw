@@ -129,7 +129,9 @@ pub(super) async fn build_reply_with_session_inner(
     let mut via_trigger = false;
     let agent = if let Some(name) = agent_override {
         // Explicit agent name (per-agent bot, WebChat selection, LINE route
-        // snapshot — those callers already applied `@` routing themselves).
+        // snapshot — those callers already applied `@` routing themselves
+        // and mark a called employee with `trigger_route::as_called_turn`).
+        via_trigger = crate::trigger_route::in_called_turn();
         reg.get(name).or_else(|| reg.main_agent())
     } else {
         let fallback = resolve_fallback_agent(ctx, &reg, session_id, user_id).await;
@@ -158,6 +160,7 @@ pub(super) async fn build_reply_with_session_inner(
                     event: &turn_id,
                     seq: crate::trigger_route::pending::next_seq(),
                     quiet: false,
+                    pending: crate::trigger_route::turn::PendingPolicy::Live,
                 },
             );
             match decision {
@@ -168,15 +171,33 @@ pub(super) async fn build_reply_with_session_inner(
                 }
                 // List / refusal / "say the task": answered here, no model
                 // call. Runs after the access gate and takeover checks above.
-                crate::trigger_route::turn::TurnDecision::Reply { text, .. } => return text,
+                // Lists and refusals are throttled per sender (silence
+                // inside the window).
+                crate::trigger_route::turn::TurnDecision::Reply { text, kind, .. } => {
+                    let throttled = kind != crate::trigger_route::turn::ReplyKind::AskTask
+                        && !crate::trigger_route::allow_direct_reply(channel, session_id, user_id, kind);
+                    return if throttled { String::new() } else { text };
+                }
             }
         }
+    };
+    // A called employee answers in its own session bucket of this
+    // conversation (history, redaction vault, pending goal state); the
+    // access gate and takeover above ran on the conversation itself.
+    let called_sid;
+    let session_id: &str = match agent {
+        Some(a) if via_trigger => {
+            called_sid = crate::trigger_route::called_session(session_id, &a.config.agent.name);
+            &called_sid
+        }
+        _ => session_id,
     };
     if let Some(a) = agent {
         crate::trigger_route::record_answered_by(crate::trigger_route::AnsweredBy {
             id: a.config.agent.name.clone(),
             display_name: crate::trigger_route::display_name(&reg, &a.config.agent.name),
             via_trigger,
+            session_id: session_id.to_string(),
         });
     }
 
