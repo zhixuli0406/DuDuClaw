@@ -140,11 +140,17 @@ fn fts_list(conn: &Connection, allowed: &AllowedSet, expr: &str) -> KbResult<Vec
           ORDER BY bm25(chunks_fts, 1.0, 0.5), c.id
           LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![expr, allowed.json(), LIST_LIMIT as i64], |r| r.get(0))?;
+    let rows = stmt.query_map(params![expr, allowed.json(), LIST_LIMIT as i64], |r| {
+        r.get(0)
+    })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-fn like_list(conn: &Connection, allowed: &AllowedSet, terms: &[String]) -> KbResult<(Vec<i64>, bool)> {
+fn like_list(
+    conn: &Connection,
+    allowed: &AllowedSet,
+    terms: &[String],
+) -> KbResult<(Vec<i64>, bool)> {
     if terms.is_empty() {
         return Ok((Vec::new(), false));
     }
@@ -164,24 +170,29 @@ fn like_list(conn: &Connection, allowed: &AllowedSet, terms: &[String]) -> KbRes
     let conds: Vec<String> = (0..terms.len())
         .map(|i| {
             format!(
-                "text LIKE ?{n} ESCAPE '\\' OR heading_path LIKE ?{n} ESCAPE '\\'",
+                "match_text LIKE ?{n} ESCAPE '\\' OR match_heading LIKE ?{n} ESCAPE '\\'",
                 n = i + 3
             )
         })
         .collect();
     let sql = format!(
-        "SELECT id, text, heading_path FROM (
-           SELECT c.id, c.text, c.heading_path FROM chunks c JOIN sources s ON s.id = c.source_id
+        "SELECT id, match_text, match_heading FROM (
+           SELECT c.id, c.match_text, c.match_heading FROM chunks c JOIN sources s ON s.id = c.source_id
             WHERE c.collection_id IN (SELECT value FROM json_each(?1)) AND s.status IN ('embedding','ready')
             ORDER BY c.id DESC LIMIT ?2)
           WHERE {}",
         conds.join(" OR ")
     );
-    let mut values: Vec<rusqlite::types::Value> = vec![allowed.json().into(), (MAX_LIKE_SCAN as i64).into()];
+    let mut values: Vec<rusqlite::types::Value> =
+        vec![allowed.json().into(), (MAX_LIKE_SCAN as i64).into()];
     values.extend(terms.iter().map(|t| like_pattern(t).into()));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })?;
     let mut scored: Vec<(usize, i64)> = Vec::new();
     for row in rows {
@@ -192,7 +203,14 @@ fn like_list(conn: &Connection, allowed: &AllowedSet, terms: &[String]) -> KbRes
         scored.push((n, id));
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    Ok((scored.into_iter().take(LIST_LIMIT).map(|(_, id)| id).collect(), capped))
+    Ok((
+        scored
+            .into_iter()
+            .take(LIST_LIMIT)
+            .map(|(_, id)| id)
+            .collect(),
+        capped,
+    ))
 }
 
 /// Search `allowed` for `query`, returning at most `limit` hits.
@@ -236,7 +254,10 @@ pub fn search(
             }
         }
     }
-    let source_of: HashMap<i64, String> = rows.iter().map(|(id, r)| (*id, r.source_id.clone())).collect();
+    let source_of: HashMap<i64, String> = rows
+        .iter()
+        .map(|(id, r)| (*id, r.source_id.clone()))
+        .collect();
     let kept = cap_per_source(fused, &source_of, limit);
     let hits = kept
         .into_iter()
@@ -334,10 +355,17 @@ mod tests {
         let set = allowed(&conn, "hr");
         let r = search(&conn, &set, "第一年特休幾天", 5, &NoEmbedder).unwrap();
         assert_eq!(r.mode, RetrievalMode::KeywordOnly);
-        assert_eq!(r.vector_unavailable.as_deref(), Some(crate::embed::KEYWORD_ONLY_REASON));
+        assert_eq!(
+            r.vector_unavailable.as_deref(),
+            Some(crate::embed::KEYWORD_ONLY_REASON)
+        );
         assert!(r.hits[0].text.contains("特休假為七日"));
         // Short pages join the next page's first chunk: 「第 1–3 頁」.
-        assert!(r.hits[0].locator_text.starts_with("第 1"), "{}", r.hits[0].locator_text);
+        assert!(
+            r.hits[0].locator_text.starts_with("第 1"),
+            "{}",
+            r.hits[0].locator_text
+        );
         let r = search(&conn, &set, "請假", 5, &NoEmbedder).unwrap();
         assert!(r.hits[0].text.contains("請假需於三日前"));
         assert_eq!(r.hits[0].like_rank, Some(1));
@@ -384,8 +412,46 @@ mod tests {
     fn fts_syntax_in_query_is_harmless() {
         let (conn, _, _) = setup();
         let set = allowed(&conn, "hr");
-        for q in ["\"", "NEAR(特休 請假)", "特休*", "-請假", "text:特休", "a OR b AND"] {
+        for q in [
+            "\"",
+            "NEAR(特休 請假)",
+            "特休*",
+            "-請假",
+            "text:特休",
+            "a OR b AND",
+        ] {
             search(&conn, &set, q, 5, &NoEmbedder).unwrap();
+        }
+    }
+
+    #[test]
+    fn display_keeps_full_width_and_matching_folds_it() {
+        let mut conn = crate::schema::open_in_memory().unwrap();
+        let cfg = KnowledgeConfig::default();
+        let c = create_collection(
+            &mut conn,
+            &NewCollection {
+                name: "型錄".into(),
+                ..Default::default()
+            },
+            "u",
+            &cfg,
+        )
+        .unwrap();
+        indexed_source(
+            &mut conn,
+            &c.id,
+            "型錄.pdf",
+            &["產品Ａ－１２３４，單價⼀千元！ＨＲ部門負責。"],
+        );
+        let set = allowed(&conn, "u");
+        for q in ["A-1234", "ａ－１２３４", "hr", "一千元"] {
+            let r = search(&conn, &set, q, 5, &NoEmbedder).unwrap();
+            let hit = r.hits.first().unwrap_or_else(|| panic!("{q} not found"));
+            assert_eq!(
+                hit.text, "產品Ａ－１２３４，單價⼀千元！ＨＲ部門負責。",
+                "display text is the original"
+            );
         }
     }
 

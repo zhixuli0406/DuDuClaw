@@ -223,12 +223,12 @@ Since the 2026-10-08 close-out three more human-approval paths are bound the sam
 The [document knowledge base](63-knowledge-base.md) adds collections of uploaded documents that AI employees can search. Its guards:
 
 - **Default-deny permissions per collection**, decided in one function and in SQL: a read needs a grant to the employee (or its department) and to the person the turn is for, and group conversations exclude `personal` and `restricted` collections. A grant that cannot be read counts as none; a missing passage and a forbidden one get the same `permission denied`.
-- **Parsing out of process**: every document is read by `duduclaw knowledge-extract` with a time limit, a CPU limit, an address-space limit on Linux and a no-write, no-network sandbox on macOS and Linux; Office files pass the zip-bomb checks first. A parser crash only ends that child.
-- **Document text is data**: passages are scanned for injection wording when indexed and marked; tool results label them as document content. Only people with an editor role add sources in this release.
+- **Parsing out of process**: every document is read by `duduclaw knowledge-extract` with a time limit, a CPU limit, an address-space limit on Linux and a sandbox on macOS and Linux that allows no writes, no network and reads only of the file, the extractor and the system libraries; without a sandbox the file is refused unless the operator opts in. Office files pass the zip-bomb checks first, `.xlsx` cells are streamed with a ceiling. A parser crash only ends that child.
+- **Document text is data**: passages are scanned for injection wording when indexed and marked; tool results put them in a marked block where every line starts with `│ `, so a document cannot forge a result header. A tool call whose turn the gateway did not register reads nothing. Only people with an editor role add sources in this release.
 - **Web pages by URL** go through the public-page fetch rules (no internal addresses, no userinfo, no redirects, 5 MB).
 - **Audit**: every read is written to the knowledge access log; collection, permission and deletion changes also go to `security_audit.jsonl`.
 
-Not covered yet: Windows has no extraction sandbox or memory limit; the gateway does not yet resolve which signed-in person a WebChat or channel turn is for, so such tool calls only get channel grants.
+Not covered yet: Windows has no extraction sandbox (files are refused there by default) or memory limit; the gateway does not yet resolve which signed-in person a WebChat or channel turn is for, so such tool calls only get channel grants.
 
 ## What these guards do not cover
 

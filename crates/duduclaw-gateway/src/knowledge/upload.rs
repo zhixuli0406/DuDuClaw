@@ -42,8 +42,12 @@ fn err(status: StatusCode, msg: &str) -> Response {
 
 fn file_result(name: &str, outcome: Result<(String, bool), (String, String)>) -> Value {
     match outcome {
-        Ok((source_id, duplicate)) => json!({"name": name, "ok": true, "source_id": source_id, "duplicate": duplicate}),
-        Err((code, message)) => json!({"name": name, "ok": false, "error_code": code, "message": message}),
+        Ok((source_id, duplicate)) => {
+            json!({"name": name, "ok": true, "source_id": source_id, "duplicate": duplicate})
+        }
+        Err((code, message)) => {
+            json!({"name": name, "ok": false, "error_code": code, "message": message})
+        }
     }
 }
 
@@ -83,7 +87,10 @@ async fn stage_field(
                 hasher.update(&chunk);
                 if file.write_all(&chunk).await.is_err() {
                     let _ = tokio::fs::remove_file(&staging).await;
-                    return Err(("upload_failed".into(), "暫存上傳檔案失敗，請稍後再試。".into()));
+                    return Err((
+                        "upload_failed".into(),
+                        "暫存上傳檔案失敗，請稍後再試。".into(),
+                    ));
                 }
             }
             Ok(None) => break,
@@ -98,7 +105,10 @@ async fn stage_field(
     }
     if file.flush().await.is_err() {
         let _ = tokio::fs::remove_file(&staging).await;
-        return Err(("upload_failed".into(), "暫存上傳檔案失敗，請稍後再試。".into()));
+        return Err((
+            "upload_failed".into(),
+            "暫存上傳檔案失敗，請稍後再試。".into(),
+        ));
     }
     Ok((staging, hex::encode(hasher.finalize()), total))
 }
@@ -140,17 +150,13 @@ async fn register_file(
             origin: json!({"uploaded_by": user.user_id, "via": "dashboard_upload"}),
             created_by: user.user_id.clone(),
         };
-        let added = duduclaw_knowledge::sources::add_source(&mut conn, &new, &cfg);
-        let refs: i64 = conn.query_row("SELECT COUNT(*) FROM sources WHERE blob_sha256 = ?1", [&sha], |r| {
-            r.get(0)
-        })?;
-        if refs == 0 {
-            let _ = store.remove(&sha);
-        }
-        let (source, duplicate) = match added? {
-            Added::New(s) => (s, false),
-            Added::Duplicate(s) => (s, true),
-        };
+        // A refused file stays as an unreferenced blob until the GC sweep
+        // (removing it here could race an upload of the same bytes).
+        let (source, duplicate) =
+            match duduclaw_knowledge::sources::add_source(&mut conn, &new, &cfg)? {
+                Added::New(s) => (s, false),
+                Added::Duplicate(s) => (s, true),
+            };
         let mut entry = AccessEntry {
             op: "add_source".into(),
             collection_id: Some(cid),
@@ -186,7 +192,12 @@ pub async fn handle_upload(
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(_) => return err(StatusCode::BAD_REQUEST, "上傳內容格式不正確或超過大小上限。"),
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "上傳內容格式不正確或超過大小上限。",
+                );
+            }
         };
         match field.name().unwrap_or("") {
             "collection_id" => {
@@ -211,7 +222,10 @@ pub async fn handle_upload(
             }
             "file" => {
                 let Some(cid) = collection_id.clone() else {
-                    return err(StatusCode::BAD_REQUEST, "collection_id 欄位必須放在檔案之前。");
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "collection_id 欄位必須放在檔案之前。",
+                    );
                 };
                 if results.len() >= MAX_FILES_PER_UPLOAD {
                     return err(
@@ -219,7 +233,8 @@ pub async fn handle_upload(
                         &format!("一次最多上傳 {MAX_FILES_PER_UPLOAD} 個檔案。"),
                     );
                 }
-                let name = duduclaw_knowledge::sources::clean_title(field.file_name().unwrap_or("未命名"));
+                let name =
+                    duduclaw_knowledge::sources::clean_title(field.file_name().unwrap_or("未命名"));
                 let format = match Format::from_file_name(&name) {
                     Ok(f) => f,
                     Err(e) => {
@@ -229,7 +244,9 @@ pub async fn handle_upload(
                     }
                 };
                 let outcome = match stage_field(&mut field, &store, cfg.max_source_bytes).await {
-                    Ok(staged) => register_file(home, &cfg, &user, &cid, &name, format, staged).await,
+                    Ok(staged) => {
+                        register_file(home, &cfg, &user, &cid, &name, format, staged).await
+                    }
                     Err(e) => Err(e),
                 };
                 results.push(file_result(&name, outcome));
@@ -277,7 +294,12 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Handle an authenticated original-file download.
-pub async fn handle_original(home: &Path, ctx: &UserContext, users: Option<Arc<UserDb>>, source_id: &str) -> Response {
+pub async fn handle_original(
+    home: &Path,
+    ctx: &UserContext,
+    users: Option<Arc<UserDb>>,
+    source_id: &str,
+) -> Response {
     if !super::enabled(home) {
         return err(StatusCode::FORBIDDEN, "文件知識庫已由管理員關閉。");
     }
@@ -337,12 +359,22 @@ pub async fn handle_original(home: &Path, ctx: &UserContext, users: Option<Arc<U
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     if let Ok(v) = HeaderValue::from_str(&disposition) {
         h.insert(header::CONTENT_DISPOSITION, v);
     } else {
-        h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+        h.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
     }
     resp
 }
+
+#[cfg(test)]
+#[path = "upload_tests.rs"]
+mod tests;

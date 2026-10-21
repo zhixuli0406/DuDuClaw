@@ -199,13 +199,19 @@ impl ExtractError {
     }
 
     pub fn encrypted() -> Self {
-        Self::new("encrypted", "檔案有密碼保護，無法讀取。請移除密碼後再上傳。")
+        Self::new(
+            "encrypted",
+            "檔案有密碼保護，無法讀取。請移除密碼後再上傳。",
+        )
     }
 
     pub fn corrupt(format: Format) -> Self {
         Self::new(
             "unsupported_format",
-            &format!("無法讀取這個 {} 檔，檔案可能已損毀或不是這種格式。", format.as_str()),
+            &format!(
+                "無法讀取這個 {} 檔，檔案可能已損毀或不是這種格式。",
+                format.as_str()
+            ),
         )
     }
 }
@@ -239,7 +245,11 @@ pub(crate) fn is_cfb(bytes: &[u8]) -> bool {
 }
 
 /// Extract `bytes` of `format`. `max_chars` bounds the extracted text.
-pub fn extract(format: Format, bytes: &[u8], max_chars: usize) -> Result<ExtractOutput, ExtractError> {
+pub fn extract(
+    format: Format,
+    bytes: &[u8],
+    max_chars: usize,
+) -> Result<ExtractOutput, ExtractError> {
     if format.is_ooxml() && is_cfb(bytes) {
         // An OOXML file stored as a compound file is an encrypted package.
         return Err(ExtractError::encrypted());
@@ -283,32 +293,46 @@ mod tests {
     fn file_names_map_to_formats() {
         assert_eq!(Format::from_file_name("員工手冊.PDF").unwrap(), Format::Pdf);
         assert_eq!(Format::from_file_name("a.b.xlsx").unwrap(), Format::Xlsx);
-        assert_eq!(Format::from_file_name("old.doc").unwrap_err().code, "legacy_office");
+        assert_eq!(
+            Format::from_file_name("old.doc").unwrap_err().code,
+            "legacy_office"
+        );
         assert_eq!(
             Format::from_file_name("photo.png").unwrap_err().code,
             "unsupported_format"
         );
-        assert_eq!(Format::from_file_name("noext").unwrap_err().code, "unsupported_format");
+        assert_eq!(
+            Format::from_file_name("noext").unwrap_err().code,
+            "unsupported_format"
+        );
     }
 
     #[test]
     fn encrypted_ooxml_is_refused() {
         let mut bytes = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
         bytes.extend_from_slice(&[0; 64]);
-        assert_eq!(extract(Format::Docx, &bytes, 1000).unwrap_err().code, "encrypted");
+        assert_eq!(
+            extract(Format::Docx, &bytes, 1000).unwrap_err().code,
+            "encrypted"
+        );
     }
 
     #[test]
     fn budget_refuses_whole_document() {
         let text = "字".repeat(2000);
         assert_eq!(
-            extract(Format::Txt, text.as_bytes(), 1000).unwrap_err().code,
+            extract(Format::Txt, text.as_bytes(), 1000)
+                .unwrap_err()
+                .code,
             "too_many_chars"
         );
     }
 
     #[test]
     fn empty_text_is_refused() {
-        assert_eq!(extract(Format::Txt, b"   \n\n ", 1000).unwrap_err().code, "empty_text");
+        assert_eq!(
+            extract(Format::Txt, b"   \n\n ", 1000).unwrap_err().code,
+            "empty_text"
+        );
     }
 }

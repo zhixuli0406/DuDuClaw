@@ -104,7 +104,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 - **競合：**開いたときに内容のハッシュを受け取り、保存時に送り返します。その間にファイルが変わっていれば拒否されるので、再読み込みしてから編集してください。
 - **バックアップ：**書き込み前に `<ファイル名>.bak-<Unix 時刻>`（権限 0600）へコピーし、新しい 5 つを残します。
 - **監査：**書き込みごとに `config_raw_edited` を記録します。`[delegation]`、`[acp]`、または社員の `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` に触れた場合は Warning です。
-- **ドキュメントナレッジベース：**`[knowledge]` にはまだ設定ページがありません（ダッシュボード画面は今後のリリース）。各キー（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`）はここで型を検査します。社員の `[knowledge] collections` はその社員の `agent.toml` で編集します。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)。
+- **ドキュメントナレッジベース：**`[knowledge]` にはまだ設定ページがありません（ダッシュボード画面は今後のリリース）。各キー（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`、`extract_when_unavailable` = `refuse`／`run_unsandboxed`）はここで型を検査します。社員の `[knowledge] collections` はその社員の `agent.toml` で編集します。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)。
 - **再起動の一覧：**保存後に再起動が必要な部分を表示します。`config.toml` の `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` は起動時にだけ読まれます。`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（アップロードルートのサイズ上限を決める）も再起動が必要です。ログレベル、常駐センシング、秘匿化はその場で反映できた場合は一覧に出ません。`inference.toml` の保存は常にその場で推論エンジンをリセットします。社員ファイルで再起動が必要なのは `heartbeat.max_concurrent_runs` だけです。
 
 ## メンテナンス SSH 画面（未リリース）

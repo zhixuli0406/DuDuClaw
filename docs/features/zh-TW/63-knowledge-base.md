@@ -37,13 +37,13 @@ AI 員工替某人回答時，取下列條件的交集：
 
    沒有 `[knowledge]` 段落代表所有已授權給它的集合。不認得的代號會被忽略。gateway 解析不了這個段落時當作 `[]`。員工不能自己修改這個段落。
 
-2. **人這一側**：這個 turn 在替誰回答。已登入的使用者帶入自己與部門的授權；身分不明的通訊軟體發話者只帶入 `channel` 授權；沒有人的 turn（排程、心跳、派工）可以用授權給員工、敏感度為 public 或 internal 的集合。
+2. **人這一側**：這個 turn 在替誰回答。已登入的使用者帶入自己與部門的授權；身分不明的通訊軟體發話者只帶入 `channel` 授權；gateway 登記為沒有人的 turn（排程、心跳、派工）可以用授權給員工、敏感度為 public 或 internal 的集合；gateway 沒有登記的呼叫（沒有 turn id 或對不上的 id）什麼都讀不到。
 
 3. **敏感度**：集合分 `public`、`internal`（預設）、`personal`、`restricted`。不是一對一的對話（群組，以及所有無法證明是私聊的情況）會排除 `personal` 與 `restricted`。
 
 4. **縮小範圍**：`knowledge_search` 的 `collections` 參數只能讓範圍變小。
 
-這一版 gateway 還不知道 WebChat 或通道的 turn 是哪位已登入的人（這要等觸發詞路由那一部分上線）。在那之前，正在進行的通道或 WebChat turn 裡的工具呼叫，一律當作該聊天室裡身分不明的發話者（只有 `channel` 授權）；沒有進行中的 turn 時當作沒有人的 turn。這比最終行為更窄，不會更寬。
+這一版 gateway 還不知道 WebChat 或通道的 turn 是哪位已登入的人（這要等觸發詞路由那一部分上線），排程、心跳、派工的 turn 也還沒有登記。在那之前，正在進行的通道或 WebChat turn 裡的工具呼叫（不論哪一種 runtime）一律當作該聊天室裡身分不明的發話者（只有 `channel` 授權），其他呼叫什麼都讀不到。這比最終行為更窄，不會更寬。
 
 ## 加入文件
 
@@ -51,7 +51,7 @@ AI 員工替某人回答時，取下列條件的交集：
 |---|---|---|
 | `POST /api/knowledge/upload` | 編輯者 | multipart：先放 `collection_id` 欄位，再放 1 到 20 個 `file`；使用儀表板使用者的 Bearer token |
 | `knowledge.sources.add` `{kind: "paste"}` | 編輯者 | 貼上的文字，存成 `.txt` 來源 |
-| `knowledge.sources.add` `{kind: "url"}` | 編輯者 | 公開的 `http`／`https` 網頁，處理時才抓取，不使用快取 |
+| `knowledge.sources.add` `{kind: "url"}` | 編輯者 | 公開的 `http`／`https` 網頁，處理時才抓取，不使用快取；依網頁宣告的編碼（Big5、GBK 等）解碼；網址會先正規化（去掉 `#` 片段、網域轉小寫、去掉結尾 `/`），同一頁不會重複加入 |
 
 支援格式：有文字層的 PDF、Word `.docx`、Excel `.xlsx`／`.xls`、PowerPoint `.pptx`、CSV、純文字、Markdown；網址來源支援網頁。舊版 `.doc`／`.ppt`、有密碼的檔案、圖片與音訊會被拒收，訊息會說明怎麼轉檔。掃描版 PDF 沒有文字層會被拒收（目前沒有 OCR）；可讀的 PDF 裡沒有文字的頁面會列在警告中。
 
@@ -62,11 +62,12 @@ AI 員工替某人回答時，取下列條件的交集：
 | 代碼 | 意思 |
 |---|---|
 | `too_large`、`too_many_chars` | 超過 `max_source_bytes` 或 `max_source_chars`；整份拒收，不會截斷 |
-| `quota_sources`、`quota_chunks`、`quota_collections` | 達到設定的上限 |
+| `quota_sources`、`quota_chunks`、`quota_collections`、`quota_bytes` | 達到設定的上限 |
 | `unsupported_format`、`legacy_office`、`encrypted`、`no_text_layer`、`empty_text`、`encoding_unknown` | 檔案無法讀成文字 |
 | `document_limits` | Office 檔沒通過壓縮炸彈與巢狀深度檢查 |
 | `extract_timeout`、`extract_crashed`、`extract_oom` | 解析程序逾時、當掉或記憶體不足 |
 | `url_blocked`、`url_fetch_failed`、`url_too_large` | 網址是內部位址、連不上、不是 HTML 或純文字，或超過 5 MB |
+| `sandbox_unavailable` | 這台主機無法使用解析用的作業系統沙箱（見下方） |
 | `retry_exhausted` | 處理途中 gateway 中斷三次 |
 
 重建失敗時，舊的索引仍可搜尋，錯誤會顯示在旁邊。
@@ -77,13 +78,13 @@ AI 員工替某人回答時，取下列條件的交集：
 
 - 牆鐘時間上限（`extract_timeout_secs`，預設 180 秒），超過就結束整個程序群組；
 - macOS 與 Linux 有 CPU 時間上限、不產生 core dump，Linux 另有位址空間上限（`extract_memory_mb`，預設 2048）；
-- macOS（Seatbelt）與 Linux（Landlock）用作業系統沙箱，禁止任何寫入與網路；
+- macOS（Seatbelt）與 Linux（Landlock）用作業系統沙箱，禁止任何寫入與網路，讀取只限該檔案本身、解析程式與系統函式庫目錄；
 - Office 檔先通過既有的壓縮炸彈與 XML 深度檢查；
 - 輸出超過 `max_source_chars × 4` bytes 就中止並拒收。
 
-Windows 沒有沙箱也沒有記憶體上限，只有時間上限；這類來源會帶 `extract_unsandboxed` 警告。同一時間只跑一個解析。
+沒有沙箱可用時（Windows，或套用沙箱失敗）會以 `sandbox_unavailable` 拒收。願意承擔風險的管理員可以設 `extract_when_unavailable = "run_unsandboxed"`，這時仍有時間上限（macOS 與 Windows 沒有記憶體上限），來源會帶 `extract_unsandboxed` 警告。`.xlsx` 工作表逐格讀取，非空白儲存格上限 200 萬格，宣告超大範圍的工作表耗不光記憶體。同一時間只跑一個解析。
 
-文字先做 NFKC 正規化（全形英數字與標點轉成半形），再切成約 500 字、彼此略有重疊的段落：PDF 不跨頁（頁尾太短的殘段併到下一頁的第一段），工作表只在列與列之間切開，每一段都附上表頭列。每一段都會檢查是否像提示注入的文字，命中的段落會被標記並顯示警告。
+段落保留文件原本的字元（全形標點仍是全形）。只為了比對，每一段另外存一份 NFKC 加小寫的版本（全形英數字、PDF 字型裡的康熙部首都會轉成一般字），所以「ＨＲ」和「HR」互相找得到。文字切成約 500 字、彼此略有重疊的段落：PDF 不跨頁（頁尾太短的殘段併到下一頁的第一段），工作表只在列與列之間切開，每一段都附上表頭列。每一段都會檢查是否像提示注入的文字，命中的段落會被標記並顯示警告。
 
 ## 搜尋
 
@@ -106,13 +107,13 @@ Windows 沒有沙箱也沒有記憶體上限，只有時間上限；這類來源
 | `knowledge_get_passage` | `chunk_id`、`context`（0–2） | 該段落與前後文 |
 | `knowledge_list_collections` | — | 這個 turn 可讀的集合、來源數與段落數 |
 
-只要知識庫啟用、員工的 `[knowledge]` 沒有關閉，就會列出這三支工具。沒有任何授權的員工也看得到，呼叫時會被告知沒有可讀的集合。工具透過 gateway 的簽章本機路由查詢；gateway 沒在執行時會回報原因，絕不直接讀資料庫。
+只有在知識庫啟用、且員工這一側至少有一個集合（授權給它或它的部門，再依 `[knowledge]` 縮小）時，這三支工具才存在；列出與呼叫用同一個判斷，授權或撤銷集合後，進行中的對話也會更新（`notifications/tools/list_changed`）。結果裡的每一段內容、集合名稱與說明都放在有標記的區塊內，每行以 `│ ` 開頭，文件裡的文字無法偽裝成結果標題或提早結束區塊。工具透過 gateway 的簽章本機路由查詢；gateway 沒在執行時會回報原因，絕不直接讀資料庫。
 
 ## 稽核
 
-- 每次搜尋、讀段落、列清單、下載原檔都寫一筆到 `knowledge.db` 的存取紀錄：誰（儀表板使用者、員工、通道）、查詢內容（前 500 字）、可讀的集合、結果的 id，不存段落內文。超過 `access_log_retention_days` 的紀錄每小時清理一次。
+- 每次搜尋、讀段落、列清單、下載原檔都寫一筆到 `knowledge.db` 的存取紀錄：誰（儀表板使用者、員工、通道）、查詢內容（前 500 字）、可讀的集合、結果的 id，不存段落內文。超過 `access_log_retention_days` 的紀錄每十分鐘清理一次。
 - 建立、修改、刪除集合，修改權限，刪除來源，同時寫進 `security_audit.jsonl`。
-- 集合擁有者可以用 `knowledge.access_log.list` 查看存取紀錄。
+- 集合擁有者可以用 `knowledge.access_log.list` 查看存取紀錄：誰、何時、哪位員工或哪個通道、拿到幾段，以及問題的短雜湊。問題原文只有管理員與提問者本人看得到。
 
 ## 設定（`config.toml`）
 
@@ -127,6 +128,9 @@ max_chunks_total = 200000
 extract_timeout_secs = 180
 extract_memory_mb = 2048         # 只在 Linux 生效
 access_log_retention_days = 180
+max_collection_bytes = 2147483648 # 每個集合原檔總量 2 GB
+max_total_bytes = 21474836480     # 全部合計 20 GB
+extract_when_unavailable = "refuse"  # 或 "run_unsandboxed"
 ```
 
 超出範圍的值會被調回邊界。`enabled = false` 時工具不列出，所有 RPC 與上傳都會被拒絕。
@@ -148,7 +152,7 @@ gold 也可以寫 `page`、`slide`、`sheet`、`row`。repo 裡的 `crates/duduc
 
 ## 資料與刪除
 
-所有資料都在 `<home>/knowledge/`：`knowledge.db`，以及 `blobs/` 底下以 SHA-256 命名的原檔。刪除來源時，段落、索引與向量在同一個交易內刪除，沒有其他集合使用的原檔也一併刪除；資料庫開啟 `secure_delete`。刪除集合必須輸入集合名稱確認。
+所有資料都在 `<home>/knowledge/`：`knowledge.db`，以及 `blobs/` 底下以 SHA-256 命名的原檔。刪除來源時，段落、索引與向量在同一個交易內刪除，沒有其他集合使用的原檔也一併刪除（十分鐘內才上傳的檔案改由下一次清理刪除，最晚約二十分鐘，因為同一份檔案可能正在上傳）；資料庫開啟 `secure_delete`。刪除集合必須輸入集合名稱確認。
 
 ## 相關文件
 

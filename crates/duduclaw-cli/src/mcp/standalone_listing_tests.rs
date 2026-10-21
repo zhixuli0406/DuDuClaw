@@ -179,10 +179,10 @@ async fn employee_and_internal_listings_are_unchanged() {
     )
     .await;
     // Pinned at 1.70.1 (CLAUDE.md: "a scaffold employee's tools/list is 167
-    // tools"); 170 since the three read-only `knowledge_*` tools (listed
-    // while `[knowledge] enabled`, the default). Moves only with a
+    // tools"). The three `knowledge_*` tools are not in it: a scaffold
+    // employee has no knowledge collection granted. Moves only with a
     // deliberate CHANGELOG entry.
-    assert_eq!(per_agent.len(), 170, "{per_agent:?}");
+    assert_eq!(per_agent.len(), 167, "{per_agent:?}");
 
     // The gateway-internal key acting for the same employee.
     let internal = principal(

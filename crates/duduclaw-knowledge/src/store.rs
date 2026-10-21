@@ -109,7 +109,9 @@ fn derive_slug(name: &str) -> String {
         }
     }
     let s = s.trim_matches('-');
-    let s = duduclaw_core::truncate_bytes(s, 48).trim_end_matches('-').to_string();
+    let s = duduclaw_core::truncate_bytes(s, 48)
+        .trim_end_matches('-')
+        .to_string();
     if s.is_empty() {
         format!("kb-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
     } else {
@@ -148,7 +150,11 @@ fn clean_sensitivity(s: Option<&str>) -> KbResult<String> {
         None => Ok("internal".to_string()),
         Some(s) => duduclaw_core::sensitivity::Sensitivity::parse(s)
             .map(|v| v.as_str().to_string())
-            .ok_or_else(|| KbError::Invalid("敏感度只能是 public、internal、personal 或 restricted。".to_string())),
+            .ok_or_else(|| {
+                KbError::Invalid(
+                    "敏感度只能是 public、internal、personal 或 restricted。".to_string(),
+                )
+            }),
     }
 }
 
@@ -167,12 +173,13 @@ pub fn create_collection(
         Some(s) if valid_slug(s) => s.to_string(),
         Some(_) => {
             return Err(KbError::Invalid(
-                "代號只能用小寫英文字母、數字與連字號（-），最多 64 字，且開頭不能是連字號。".to_string(),
+                "代號只能用小寫英文字母、數字與連字號（-），最多 64 字，且開頭不能是連字號。"
+                    .to_string(),
             ));
         }
         None => derive_slug(&name),
     };
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let count: i64 = tx.query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0))?;
     if count as usize >= cfg.max_collections {
         return Err(KbError::Rejected {
@@ -181,10 +188,16 @@ pub fn create_collection(
         });
     }
     let taken: Option<i64> = tx
-        .query_row("SELECT 1 FROM collections WHERE slug = ?1", params![slug], |r| r.get(0))
+        .query_row(
+            "SELECT 1 FROM collections WHERE slug = ?1",
+            params![slug],
+            |r| r.get(0),
+        )
         .optional()?;
     if taken.is_some() {
-        return Err(KbError::Invalid(format!("代號「{slug}」已被使用，請換一個。")));
+        return Err(KbError::Invalid(format!(
+            "代號「{slug}」已被使用，請換一個。"
+        )));
     }
     let id = format!("col_{}", uuid::Uuid::new_v4().simple());
     let now = crate::now_rfc3339();
@@ -222,7 +235,11 @@ fn counts(conn: &Connection, id: &str) -> KbResult<(i64, i64, i64)> {
     )?)
 }
 
-fn summarize(conn: &Connection, c: Collection, my_role: Option<Role>) -> KbResult<CollectionSummary> {
+fn summarize(
+    conn: &Connection,
+    c: Collection,
+    my_role: Option<Role>,
+) -> KbResult<CollectionSummary> {
     let (source_count, ready_count, chunk_count) = counts(conn, &c.id)?;
     Ok(CollectionSummary {
         collection: c,
@@ -241,7 +258,9 @@ pub fn list_for_user(
     is_admin: bool,
 ) -> KbResult<Vec<CollectionSummary>> {
     let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM collections ORDER BY name, id"))?;
-    let all: Vec<Collection> = stmt.query_map([], row_to_collection)?.collect::<Result<_, _>>()?;
+    let all: Vec<Collection> = stmt
+        .query_map([], row_to_collection)?
+        .collect::<Result<_, _>>()?;
     let mut out = Vec::new();
     for c in all {
         let role = crate::acl::user_role(conn, &c.id, user_id, department, is_admin)?;
@@ -295,7 +314,11 @@ pub fn update_collection(
     };
     let embedding_policy = match patch.embedding_policy.as_deref() {
         Some(p @ ("inherit" | "local_only")) => p.to_string(),
-        Some(_) => return Err(KbError::Invalid("向量政策只能是 inherit 或 local_only。".to_string())),
+        Some(_) => {
+            return Err(KbError::Invalid(
+                "向量政策只能是 inherit 或 local_only。".to_string(),
+            ));
+        }
         None => current.embedding_policy.clone(),
     };
     let now = crate::now_rfc3339();
@@ -315,15 +338,23 @@ pub fn update_collection(
 /// Delete a collection after the caller typed its exact name. Returns the
 /// blob hashes no other source references any more (the caller removes the
 /// files after commit).
-pub fn delete_collection(conn: &mut Connection, id: &str, confirm_name: &str) -> KbResult<Vec<String>> {
+pub fn delete_collection(
+    conn: &mut Connection,
+    id: &str,
+    confirm_name: &str,
+) -> KbResult<Vec<String>> {
     let current = get_collection(conn, id)?.ok_or(KbError::PermissionDenied)?;
     if current.name != confirm_name {
-        return Err(KbError::Invalid("輸入的名稱與集合名稱不符，未刪除。".to_string()));
+        return Err(KbError::Invalid(
+            "輸入的名稱與集合名稱不符，未刪除。".to_string(),
+        ));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let shas: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT DISTINCT blob_sha256 FROM sources WHERE collection_id = ?1")?;
-        stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<_, _>>()?
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT blob_sha256 FROM sources WHERE collection_id = ?1")?;
+        stmt.query_map(params![id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
     };
     // Chunks first so the FTS delete trigger runs for every row.
     tx.execute("DELETE FROM chunks WHERE collection_id = ?1", params![id])?;
@@ -412,7 +443,8 @@ mod tests {
     #[test]
     fn update_is_optimistic_and_delete_needs_name() {
         let mut conn = crate::schema::open_in_memory().unwrap();
-        let c = create_collection(&mut conn, &new("產品FAQ"), "u", &KnowledgeConfig::default()).unwrap();
+        let c = create_collection(&mut conn, &new("產品FAQ"), "u", &KnowledgeConfig::default())
+            .unwrap();
         let patch = CollectionPatch {
             description: Some("常見問題".into()),
             ..Default::default()

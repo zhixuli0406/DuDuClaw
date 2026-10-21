@@ -36,7 +36,8 @@ pub struct Passage {
 }
 
 fn neighbour(conn: &Connection, source_id: &str, ord: i64, delta: i64) -> KbResult<Option<i64>> {
-    let mut stmt = conn.prepare_cached("SELECT id FROM chunks WHERE source_id = ?1 AND ord = ?2")?;
+    let mut stmt =
+        conn.prepare_cached("SELECT id FROM chunks WHERE source_id = ?1 AND ord = ?2")?;
     let mut rows = stmt.query(params![source_id, ord + delta])?;
     Ok(match rows.next()? {
         Some(r) => Some(r.get(0)?),
@@ -45,7 +46,12 @@ fn neighbour(conn: &Connection, source_id: &str, ord: i64, delta: i64) -> KbResu
 }
 
 /// The passage `chunk_id` with up to `context_chars` on each side.
-pub fn get_passage(conn: &Connection, chunk_id: i64, allowed: &AllowedSet, context_chars: usize) -> KbResult<Passage> {
+pub fn get_passage(
+    conn: &Connection,
+    chunk_id: i64,
+    allowed: &AllowedSet,
+    context_chars: usize,
+) -> KbResult<Passage> {
     let row = load_chunk(conn, chunk_id)?.ok_or(KbError::PermissionDenied)?;
     if !allowed.contains(&row.collection_id) {
         return Err(KbError::PermissionDenied);
@@ -125,17 +131,25 @@ mod tests {
         .unwrap();
         let mut ns = crate::sources::test_support::new_source(&c.id, &"5".repeat(64));
         ns.format = Format::Txt;
-        let crate::sources::Added::New(s) = crate::sources::add_source(&mut conn, &ns, &cfg).unwrap() else {
+        let crate::sources::Added::New(s) =
+            crate::sources::add_source(&mut conn, &ns, &cfg).unwrap()
+        else {
             panic!()
         };
         let text = (0..80)
             .map(|i| format!("第{i}條規定內容在這裡說明。"))
             .collect::<String>();
-        let prepared = crate::chunk::prepare(Format::Txt, vec![RawSegment::new(SegmentKind::Text, text.clone())]);
+        let prepared = crate::chunk::prepare(
+            Format::Txt,
+            vec![RawSegment::new(SegmentKind::Text, text.clone())],
+        );
         crate::index::write_index(&mut conn, &s.id, &prepared, &[], "t", &|_| false, &cfg).unwrap();
         let ids: Vec<i64> = {
             let mut st = conn.prepare("SELECT id FROM chunks ORDER BY ord").unwrap();
-            st.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
         };
         assert!(ids.len() >= 2);
         let set = effective_collections(

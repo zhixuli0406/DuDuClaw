@@ -52,7 +52,8 @@ pub struct Job {
 }
 
 fn at(offset: Duration) -> String {
-    let t = chrono::Utc::now() + chrono::Duration::from_std(offset).unwrap_or(chrono::Duration::zero());
+    let t =
+        chrono::Utc::now() + chrono::Duration::from_std(offset).unwrap_or(chrono::Duration::zero());
     t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -114,7 +115,11 @@ pub fn set_progress(conn: &Connection, id: i64, done: i64, total: i64) -> KbResu
 /// Whether the job is still running (not cancelled by a delete).
 pub fn is_running(conn: &Connection, id: i64) -> KbResult<bool> {
     let state: Option<String> = conn
-        .query_row("SELECT state FROM ingest_jobs WHERE id = ?1", params![id], |r| r.get(0))
+        .query_row(
+            "SELECT state FROM ingest_jobs WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(state.as_deref() == Some("running"))
 }
@@ -140,7 +145,7 @@ pub fn fail(conn: &Connection, id: i64, code: &str, message: &str) -> KbResult<(
 /// (and so do their sources). Returns `(requeued, exhausted source ids)`.
 pub fn requeue_expired(conn: &mut Connection) -> KbResult<(usize, Vec<String>)> {
     let now = crate::now_rfc3339();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let exhausted: Vec<(i64, String)> = {
         let mut stmt = tx.prepare(
             "SELECT id, source_id FROM ingest_jobs WHERE state = 'running' AND lease_until < ?1 AND attempts >= ?2",
@@ -185,7 +190,9 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        let Added::New(s) = add_source(&mut conn, &new_source(&c.id, &"9".repeat(64)), &cfg).unwrap() else {
+        let Added::New(s) =
+            add_source(&mut conn, &new_source(&c.id, &"9".repeat(64)), &cfg).unwrap()
+        else {
             panic!()
         };
         (conn, s.id)
@@ -198,7 +205,10 @@ mod tests {
         assert_eq!(job.source_id, sid);
         assert_eq!(job.kind, JobKind::Ingest);
         assert_eq!(job.attempts, 1);
-        assert!(claim_next(&conn, LEASE).unwrap().is_none(), "one job, claimed once");
+        assert!(
+            claim_next(&conn, LEASE).unwrap().is_none(),
+            "one job, claimed once"
+        );
         assert!(is_running(&conn, job.id).unwrap());
         complete(&conn, job.id).unwrap();
         assert!(!is_running(&conn, job.id).unwrap());

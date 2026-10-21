@@ -33,7 +33,10 @@ fn heading_level(line: &str) -> Option<(usize, &str)> {
 }
 
 /// A Markdown file: sections by heading.
-pub fn extract_markdown(bytes: &[u8], budget: &mut Budget) -> Result<Vec<RawSegment>, ExtractError> {
+pub fn extract_markdown(
+    bytes: &[u8],
+    budget: &mut Budget,
+) -> Result<Vec<RawSegment>, ExtractError> {
     let text = decode_text(bytes)?;
     budget.take(&text)?;
     let mut segments = Vec::new();
@@ -46,7 +49,11 @@ pub fn extract_markdown(bytes: &[u8], budget: &mut Budget) -> Result<Vec<RawSegm
             return;
         }
         let mut seg = RawSegment::new(SegmentKind::Section, std::mem::take(body));
-        let label = path.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > ");
+        let label = path
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" > ");
         seg.label = (!label.is_empty()).then_some(label);
         segments.push(seg);
     };

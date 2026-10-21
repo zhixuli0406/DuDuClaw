@@ -44,6 +44,42 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, ExtractError> {
     accept(text.into_owned())
 }
 
+/// The `charset=` value of a `Content-Type` header or of an HTML `<meta>`
+/// tag in the first 4 KiB of `bytes`.
+fn charset_label(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
+    let find = |hay: &str| -> Option<String> {
+        let lower = hay.to_ascii_lowercase();
+        let i = lower.find("charset=")? + "charset=".len();
+        let rest = &lower[i..];
+        let rest = rest.trim_start_matches(['"', '\'', ' ']);
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        (end > 0).then(|| rest[..end].to_string())
+    };
+    if let Some(label) = content_type.and_then(find) {
+        return Some(label);
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    // `<meta charset=…>` and `<meta http-equiv … content="…; charset=…">`
+    // are ASCII in every encoding a page can declare this way.
+    find(&String::from_utf8_lossy(head))
+}
+
+/// Decode a fetched web page: the declared charset (header, then `<meta>`)
+/// when encoding_rs knows it, else the same detection as files.
+pub fn decode_web_page(bytes: &[u8], content_type: Option<&str>) -> Result<String, ExtractError> {
+    match charset_label(content_type, bytes)
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+    {
+        Some(enc) => {
+            let (text, _, _) = enc.decode(bytes);
+            accept(text.into_owned())
+        }
+        None => decode_text(bytes),
+    }
+}
+
 fn accept(text: String) -> Result<String, ExtractError> {
     if replacement_ratio(&text) > MAX_REPLACEMENT_RATIO {
         Err(unknown())
@@ -74,6 +110,23 @@ mod tests {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
         assert_eq!(decode_text(&bytes).unwrap(), "請假");
+    }
+
+    #[test]
+    fn web_pages_use_their_declared_charset() {
+        let (big5, _, _) = encoding_rs::BIG5
+            .encode("<html><head><meta charset=\"big5\"></head><body>退貨政策</body></html>");
+        assert!(
+            decode_web_page(&big5, Some("text/html"))
+                .unwrap()
+                .contains("退貨政策")
+        );
+        let (gbk, _, _) = encoding_rs::GBK.encode("退货政策说明");
+        assert_eq!(
+            decode_web_page(&gbk, Some("text/html; charset=GBK")).unwrap(),
+            "退货政策说明"
+        );
+        assert_eq!(decode_web_page("一般".as_bytes(), None).unwrap(), "一般");
     }
 
     #[test]

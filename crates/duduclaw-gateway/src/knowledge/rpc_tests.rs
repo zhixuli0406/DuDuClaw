@@ -15,7 +15,12 @@ fn ctx(id: &str, role: UserRole) -> UserContext {
     }
 }
 
-async fn call(home: &Path, who: &UserContext, method: &str, params: Value) -> Result<Value, String> {
+async fn call(
+    home: &Path,
+    who: &UserContext,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     handle(home, method, &params, who, None)
         .await
         .expect("knowledge method")
@@ -75,7 +80,10 @@ async fn fixture() -> Fixture {
     )
     .await
     .unwrap();
-    Fixture { collection: id, ..f }
+    Fixture {
+        collection: id,
+        ..f
+    }
 }
 
 #[tokio::test]
@@ -107,22 +115,35 @@ async fn listing_follows_grants() {
     let f = fixture().await;
     let n = |v: Value| v["collections"].as_array().unwrap().len();
     assert_eq!(
-        n(
-            call(f.home.path(), &f.stranger, "knowledge.collections.list", json!({}))
-                .await
-                .unwrap()
-        ),
+        n(call(
+            f.home.path(),
+            &f.stranger,
+            "knowledge.collections.list",
+            json!({})
+        )
+        .await
+        .unwrap()),
         0
     );
-    let v = call(f.home.path(), &f.viewer, "knowledge.collections.list", json!({}))
-        .await
-        .unwrap();
+    let v = call(
+        f.home.path(),
+        &f.viewer,
+        "knowledge.collections.list",
+        json!({}),
+    )
+    .await
+    .unwrap();
     assert_eq!(v["collections"][0]["my_role"], "viewer");
     assert_eq!(v["can_create"], false);
     assert_eq!(
-        n(call(f.home.path(), &f.admin, "knowledge.collections.list", json!({}))
-            .await
-            .unwrap()),
+        n(call(
+            f.home.path(),
+            &f.admin,
+            "knowledge.collections.list",
+            json!({})
+        )
+        .await
+        .unwrap()),
         1
     );
     assert!(denied(
@@ -150,14 +171,31 @@ async fn editing_needs_editor_and_settings_need_owner() {
     let f = fixture().await;
     let paste = json!({"collection_id": f.collection, "kind": "paste", "title": "請假規定", "text": "員工請假需提前三日申請。"});
     assert!(denied(
-        call(f.home.path(), &f.viewer, "knowledge.sources.add", paste.clone()).await
+        call(
+            f.home.path(),
+            &f.viewer,
+            "knowledge.sources.add",
+            paste.clone()
+        )
+        .await
     ));
     assert!(denied(
-        call(f.home.path(), &f.stranger, "knowledge.sources.add", paste.clone()).await
-    ));
-    let added = call(f.home.path(), &f.editor, "knowledge.sources.add", paste.clone())
+        call(
+            f.home.path(),
+            &f.stranger,
+            "knowledge.sources.add",
+            paste.clone()
+        )
         .await
-        .unwrap();
+    ));
+    let added = call(
+        f.home.path(),
+        &f.editor,
+        "knowledge.sources.add",
+        paste.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(added["duplicate"], false);
     let again = call(f.home.path(), &f.editor, "knowledge.sources.add", paste)
         .await
@@ -194,7 +232,10 @@ async fn editing_needs_editor_and_settings_need_owner() {
     ));
     for (method, params) in [
         ("knowledge.acl.get", json!({"collection_id": f.collection})),
-        ("knowledge.access_log.list", json!({"collection_id": f.collection})),
+        (
+            "knowledge.access_log.list",
+            json!({"collection_id": f.collection}),
+        ),
         (
             "knowledge.collections.update",
             json!({"id": f.collection, "expected_updated_at": "x", "description": "d"}),
@@ -209,7 +250,8 @@ async fn editing_needs_editor_and_settings_need_owner() {
             "{method}"
         );
         assert!(
-            call(f.home.path(), &f.admin, method, params).await.is_ok() || method == "knowledge.collections.update",
+            call(f.home.path(), &f.admin, method, params).await.is_ok()
+                || method == "knowledge.collections.update",
             "{method}"
         );
     }
@@ -229,6 +271,11 @@ async fn delete_source_removes_unreferenced_blob() {
     let sha = added["source"]["blob_sha256"].as_str().unwrap().to_string();
     let path = BlobStore::for_home(f.home.path()).path_for(&sha).unwrap();
     assert!(path.exists());
+    // A file inside the GC grace period is kept (an upload of the same bytes
+    // may be in flight); an older one goes with its last source.
+    let f2 = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f2.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
     let sid = added["source"]["id"].as_str().unwrap();
     call(
         f.home.path(),
@@ -253,7 +300,10 @@ async fn delete_source_removes_unreferenced_blob() {
         .iter()
         .filter_map(|e| e["op"].as_str())
         .collect();
-    assert!(ops.contains(&"delete_source") && ops.contains(&"add_source"), "{ops:?}");
+    assert!(
+        ops.contains(&"delete_source") && ops.contains(&"add_source"),
+        "{ops:?}"
+    );
     let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
     assert!(audit.contains("knowledge_source_deleted") && audit.contains("knowledge_acl_changed"));
 }
@@ -277,7 +327,8 @@ async fn search_and_passage_use_the_human_side_only() {
             origin: json!({}),
             created_by: "mgr".into(),
         };
-        let Added::New(s) = duduclaw_knowledge::sources::add_source(&mut conn, &new, &KnowledgeConfig::default())?
+        let Added::New(s) =
+            duduclaw_knowledge::sources::add_source(&mut conn, &new, &KnowledgeConfig::default())?
         else {
             panic!()
         };
@@ -299,9 +350,14 @@ async fn search_and_passage_use_the_human_side_only() {
     })
     .await
     .unwrap();
-    let found = call(f.home.path(), &f.viewer, "knowledge.search", json!({"query": "特休假"}))
-        .await
-        .unwrap();
+    let found = call(
+        f.home.path(),
+        &f.viewer,
+        "knowledge.search",
+        json!({"query": "特休假"}),
+    )
+    .await
+    .unwrap();
     let chunk_id = found["hits"][0]["chunk_id"].as_i64().unwrap();
     assert_eq!(found["mode"], "keyword_only");
     let none = call(
@@ -344,8 +400,18 @@ async fn acl_conflicts_and_disabled_switch() {
     )
     .await;
     assert!(matches!(stale, Err(ref m) if m.contains("重新載入")));
-    std::fs::write(f.home.path().join("config.toml"), "[knowledge]\nenabled = false\n").unwrap();
-    let off = call(f.home.path(), &f.admin, "knowledge.collections.list", json!({})).await;
+    std::fs::write(
+        f.home.path().join("config.toml"),
+        "[knowledge]\nenabled = false\n",
+    )
+    .unwrap();
+    let off = call(
+        f.home.path(),
+        &f.admin,
+        "knowledge.collections.list",
+        json!({}),
+    )
+    .await;
     assert!(matches!(off, Err(ref m) if m.contains("關閉")));
     assert!(
         handle(f.home.path(), "wiki.list", &json!({}), &f.admin, None)

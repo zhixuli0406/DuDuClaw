@@ -4,15 +4,16 @@
 
 ### Added
 - 文件知識庫（第一階段：後端、上傳、關鍵字搜尋、AI 員工唯讀工具）。公司文件依「集合」存放，每個集合各自設定誰能讀：使用者、部門、AI 員工、通道（整個通道或單一聊天室），角色分檢視者、編輯者、擁有者，預設只有建立者看得到。主管以上能建立集合；管理員等於所有集合的擁有者。
-  - 加入文件：`POST /api/knowledge/upload`（一次最多 20 個檔）、貼上文字、公開網址。支援有文字層的 PDF、Word、Excel（xlsx／xls）、PowerPoint、CSV、純文字、Markdown；舊版 .doc／.ppt、有密碼的檔、掃描版 PDF 會被拒收並說明原因。同一個集合重複上傳同一份檔案會回「已存在」。單檔預設上限 100 MB、50 萬字，超過整份拒收。
-  - 解析一律在獨立子程序 `duduclaw knowledge-extract` 裡做，有時間上限與 CPU 上限，Linux 另有記憶體上限，macOS 與 Linux 加上禁止寫入、禁止連網的沙箱；Office 檔先過既有的壓縮炸彈檢查。解析器當掉不會影響 gateway。
+  - 加入文件：`POST /api/knowledge/upload`（一次最多 20 個檔）、貼上文字、公開網址（依網頁宣告的編碼解碼，網址正規化後去重）。支援有文字層的 PDF、Word、Excel（xlsx／xls）、PowerPoint、CSV、純文字、Markdown；舊版 .doc／.ppt、有密碼的檔、掃描版 PDF 會被拒收並說明原因。同一個集合重複上傳同一份檔案會回「已存在」。單檔預設上限 100 MB、50 萬字，超過整份拒收；另有每個集合 2 GB、全部 20 GB 的原檔總量上限。
+  - 解析一律在獨立子程序 `duduclaw knowledge-extract` 裡做，有時間上限與 CPU 上限，Linux 另有記憶體上限，macOS 與 Linux 加上禁止寫入、禁止連網、讀取只限該檔案與系統函式庫的沙箱；沒有沙箱可用的主機（例如 Windows）預設拒收，管理員可設 `[knowledge] extract_when_unavailable = "run_unsandboxed"` 改為只靠時間與資源上限。Office 檔先過既有的壓縮炸彈檢查，`.xlsx` 逐格讀取，非空白儲存格上限 200 萬格。解析器當掉不會影響 gateway；背景工作本身出錯會自動重啟並寫稽核。
+  - 段落顯示文件原本的文字（全形標點不會被改成半形）；比對另用 NFKC 加小寫的版本，所以「ＨＲ」與「HR」互相找得到。
   - 搜尋：三字以上的詞用 trigram 全文索引，兩字的詞（「請假」、`HR`）用有上限的子字串比對，中文問句會在「的、了、嗎」這類助詞處斷開。結果標出頁碼、投影片或工作表列號，並說明目前只有關鍵字比對。
-  - 三支唯讀 MCP 工具 `knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections`（scope `knowledge:read`，外部金鑰不能取得）。員工能讀的範圍是「授權給它或它部門的集合」與「這個 turn 所服務的人能讀的集合」的交集，群組對話排除 personal 與 restricted；員工可用 `agent.toml [knowledge] collections` 再縮小，`collections = []` 關閉工具。工具透過 gateway 的簽章本機路由查詢，不會直接讀資料庫。
-  - 每次讀取寫入知識庫存取紀錄（不存段落內文，預設保留 180 天）；集合、權限、刪除來源另外寫進 `security_audit.jsonl`。
+  - 三支唯讀 MCP 工具 `knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections`（scope `knowledge:read`，外部金鑰不能取得）。員工能讀的範圍是「授權給它或它部門的集合」與「這個 turn 所服務的人能讀的集合」的交集，群組對話排除 personal 與 restricted；員工可用 `agent.toml [knowledge] collections` 再縮小。員工這一側沒有任何集合時，這三支工具不列出也不能呼叫；授權或撤銷集合後，進行中的對話會收到工具清單更新。gateway 沒有登記的 turn（沒有 turn id 或對不上）什麼都讀不到，通道與 WebChat 的 turn（所有 runtime）只讀得到 `channel` 授權的集合。工具結果把文件內容放在每行以 `│ ` 開頭的區塊裡，文件無法偽造結果標題。工具透過 gateway 的簽章本機路由查詢，不會直接讀資料庫。
+  - 每次讀取寫入知識庫存取紀錄（不存段落內文，預設保留 180 天）；集合擁有者看得到誰、何時、幾段與問題的短雜湊，問題原文只給管理員與提問者本人。集合、權限、刪除來源另外寫進 `security_audit.jsonl`。刪除來源時原檔一併刪除，十分鐘內才上傳的檔案改由下一次清理刪除（最晚約二十分鐘）。
   - `duduclaw knowledge eval`：用自己的文件與 JSONL 題目，在一次性的資料庫裡量 Recall@1／5／10 與 MRR@10。
   - 設定在 `config.toml [knowledge]`；儀表板頁面、向量搜尋、通道回覆自動帶入段落與引用頁尾會在之後的版本提供。
-  - **行為變更**：知識庫預設開啟，所有 AI 員工的工具清單多出上述三支唯讀工具（新建員工從 167 支變 170 支）。不想要的話設 `[knowledge] enabled = false`，或在員工的 `agent.toml` 設 `[knowledge] collections = []`。
-  - 已驗證：各模組單元測試；隔離環境的 gateway 實測（建立集合、設定權限與 revision 衝突、上傳 docx／xlsx／pdf／txt、重複上傳、.doc 拒收、搜尋、讀段落、下載原檔、未授權的使用者被拒、重建、刪除後原檔與搜尋結果一起消失、存取紀錄與稽核紀錄），`mcp-probe.sh` 以兩位員工呼叫三支工具（部門授權讀得到、沒授權的段落回 permission denied、`collections = []` 時工具不列出）；虛構繁中題組關鍵字 Recall@5 為 0.92（12 題中 11 題，漏掉的是同義詞問法）。尚未驗證：Windows 與 Linux 的解析子程序（沙箱與記憶體上限只在 macOS 實際跑過）、使用 CID 字型的繁中 PDF（只測過一份 macOS 產生的檔）、大量文件時的搜尋速度、網址來源只測過 example.com。WebChat 與通道的 turn 目前還無法辨識是哪位已登入的人，工具呼叫只能用 `channel` 授權的集合，待觸發詞路由合併後接上。
+  - **行為變更**：知識庫預設開啟。有集合授權給它（或它部門）的 AI 員工，工具清單會多出上述三支唯讀工具；沒有授權的員工不變（新建員工仍是 167 支）。不想要的話設 `[knowledge] enabled = false`，或在員工的 `agent.toml` 設 `[knowledge] collections = []`。
+  - 已驗證：各模組單元測試；隔離環境的 gateway 實測（建立集合、設定權限與 revision 衝突、上傳 docx／xlsx／pdf／txt 與一份全形標點文件並在縮小讀取範圍的沙箱裡解析完成、重複上傳、.doc 拒收、搜尋「ＨＲ」與「HR」互相找得到而段落仍顯示全形標點、讀段落、下載原檔、未授權的使用者被拒、集合擁有者只看到問題雜湊、網址正規化後重複加入回「已存在」、刪除後搜尋不到、存取紀錄與稽核紀錄），`mcp-probe.sh`：沒有集合授權的員工看不到三支工具（167 支），授權後出現（170 支）；沒有 turn id 的呼叫讀不到任何集合（含員工部門授權的 internal 集合）、讀段落回 permission denied。虛構繁中題組關鍵字 Recall@5 為 0.92（12 題中 11 題，漏掉的是同義詞問法）。尚未驗證：Windows 與 Linux 的解析子程序（縮小讀取範圍的沙箱與記憶體上限只在 macOS 實際跑過；Linux Landlock 需要的系統路徑只依讀碼列出）、使用 CID 字型的繁中 PDF（只測過一份 macOS 產生的檔）、大量文件時的搜尋速度、Big5／GBK 網頁只有單元測試（實測只抓過 example.com）、真實通道 turn 透過 MCP 讀到 `channel` 授權集合（只在 HTTP 層測試驗證）。WebChat 與通道的 turn 目前還無法辨識是哪位已登入的人，排程與派工的 turn 也還沒有登記，待觸發詞路由合併後接上。
 - 新增公開文件「個人版與企業版」（`docs/guides/editions.md`，另有 zh-TW、ja-JP 版）：對照 AI 員工數、同時執行的目標任務、OS 原生感知席位、成員／部門／角色、經銷商管理等管理介面、本機免登入、付費板模，說明版本由已安裝的授權決定與升級步驟。表中每一列都對過程式碼（版本推導、並行上限、OS 原生席位、企業版專用 RPC、授權方案表）。純文件變更，未動程式。升級步驟寫的選單路徑是「管理 → 進階設定 → 授權」，以授權頁回到個人版選單（同版另一項修正）為前提。
 
 ### Fixed

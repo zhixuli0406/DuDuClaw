@@ -62,7 +62,12 @@ fn access(op: &str, user: &ResolvedUser, collection_id: Option<&str>) -> AccessE
     }
 }
 
-fn role_on(conn: &Connection, collection_id: &str, user: &ResolvedUser, min: Role) -> KbResult<Role> {
+fn role_on(
+    conn: &Connection,
+    collection_id: &str,
+    user: &ResolvedUser,
+    min: Role,
+) -> KbResult<Role> {
     acl::require_role(
         conn,
         collection_id,
@@ -73,7 +78,10 @@ fn role_on(conn: &Connection, collection_id: &str, user: &ResolvedUser, min: Rol
     )
 }
 
-fn source_collection(conn: &Connection, source_id: &str) -> KbResult<duduclaw_knowledge::sources::Source> {
+fn source_collection(
+    conn: &Connection,
+    source_id: &str,
+) -> KbResult<duduclaw_knowledge::sources::Source> {
     duduclaw_knowledge::sources::get_source(conn, source_id)?.ok_or(KbError::PermissionDenied)
 }
 
@@ -133,7 +141,8 @@ fn dispatch(call: Call) -> KbResult<Value> {
     let u = &call.user;
     match call.method.as_str() {
         "knowledge.collections.list" => {
-            let list = store::list_for_user(&conn, &u.user_id, u.department.as_deref(), u.is_admin)?;
+            let list =
+                store::list_for_user(&conn, &u.user_id, u.department.as_deref(), u.is_admin)?;
             Ok(json!({ "collections": list, "can_create": call.can_create }))
         }
         "knowledge.collections.get" => {
@@ -148,8 +157,8 @@ fn dispatch(call: Call) -> KbResult<Value> {
             if !call.can_create {
                 return Err(KbError::PermissionDenied);
             }
-            let new: NewCollection =
-                serde_json::from_value(p.clone()).map_err(|_| KbError::Invalid("集合資料格式不正確。".to_string()))?;
+            let new: NewCollection = serde_json::from_value(p.clone())
+                .map_err(|_| KbError::Invalid("集合資料格式不正確。".to_string()))?;
             let c = store::create_collection(&mut conn, &new, &u.user_id, &call.cfg)?;
             log_access(&conn, &access("collection_change", u, Some(&c.id)))?;
             audit_admin(
@@ -163,9 +172,10 @@ fn dispatch(call: Call) -> KbResult<Value> {
         "knowledge.collections.update" => {
             let id = req(p, "id")?;
             role_on(&conn, id, u, Role::Owner)?;
-            let patch: CollectionPatch =
-                serde_json::from_value(p.clone()).map_err(|_| KbError::Invalid("集合資料格式不正確。".to_string()))?;
-            let c = store::update_collection(&mut conn, id, &patch, req(p, "expected_updated_at")?)?;
+            let patch: CollectionPatch = serde_json::from_value(p.clone())
+                .map_err(|_| KbError::Invalid("集合資料格式不正確。".to_string()))?;
+            let c =
+                store::update_collection(&mut conn, id, &patch, req(p, "expected_updated_at")?)?;
             log_access(&conn, &access("collection_change", u, Some(id)))?;
             audit_admin(
                 &call.home,
@@ -183,7 +193,7 @@ fn dispatch(call: Call) -> KbResult<Value> {
                 &id,
                 p.get("confirm_name").and_then(Value::as_str).unwrap_or(""),
             )?;
-            remove_blobs(&call.home, &orphans);
+            remove_blobs(&call.home, &mut conn, &orphans);
             log_access(&conn, &access("collection_change", u, Some(&id)))?;
             audit_admin(
                 &call.home,
@@ -214,7 +224,7 @@ fn dispatch(call: Call) -> KbResult<Value> {
             let src = source_collection(&conn, req(p, "source_id")?)?;
             role_on(&conn, &src.collection_id, u, Role::Editor)?;
             if let Some(sha) = duduclaw_knowledge::sources::delete_source(&mut conn, &src.id)? {
-                remove_blobs(&call.home, &[sha]);
+                remove_blobs(&call.home, &mut conn, &[sha]);
             }
             let mut entry = access("delete_source", u, Some(&src.collection_id));
             entry.results = vec![json!({"source_id": src.id})];
@@ -245,6 +255,10 @@ fn dispatch(call: Call) -> KbResult<Value> {
                 .collect();
             let rows = duduclaw_knowledge::audit::list_for_collection(
                 &conn,
+                duduclaw_knowledge::audit::Viewer {
+                    user_id: &u.user_id,
+                    is_admin: u.is_admin,
+                },
                 id,
                 &source_ids,
                 p.get("before_id").and_then(Value::as_i64),
@@ -263,17 +277,14 @@ fn dispatch(call: Call) -> KbResult<Value> {
     }
 }
 
-fn blob_referenced(conn: &Connection, sha: &str) -> KbResult<bool> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM sources WHERE blob_sha256 = ?1", [sha], |r| {
-        r.get(0)
-    })?;
-    Ok(n > 0)
-}
-
-fn remove_blobs(home: &Path, shas: &[String]) {
+/// Remove original files nothing references any more. A file written
+/// within the GC grace period stays until the worker's sweep (an upload of
+/// the same bytes may be in flight; see `duduclaw_knowledge::blob`).
+fn remove_blobs(home: &Path, conn: &mut Connection, shas: &[String]) {
     let store = BlobStore::for_home(home);
     for sha in shas {
-        if let Err(e) = store.remove(sha) {
+        if let Err(e) = store.remove_if_unreferenced(conn, sha, duduclaw_knowledge::blob::GC_GRACE)
+        {
             tracing::warn!(error = %e, "knowledge: could not remove blob file");
         }
     }
@@ -293,7 +304,10 @@ fn acl_set(conn: &mut Connection, call: &Call) -> KbResult<Value> {
         .ok_or_else(|| KbError::Invalid("缺少參數 entries。".to_string()))?;
     let mut entries = Vec::with_capacity(raw.len());
     for e in raw {
-        let kind = e.get("kind").and_then(Value::as_str).and_then(PrincipalKind::parse);
+        let kind = e
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(PrincipalKind::parse);
         let role = e.get("role").and_then(Value::as_str).and_then(Role::parse);
         let pid = e.get("id").and_then(Value::as_str).map(str::trim);
         match (kind, pid, role) {
@@ -325,10 +339,12 @@ fn acl_set(conn: &mut Connection, call: &Call) -> KbResult<Value> {
 
 fn narrowing(p: &Value) -> Narrowing {
     Narrowing {
-        only: p
-            .get("collections")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()),
+        only: p.get("collections").and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
     }
 }
 
@@ -338,7 +354,13 @@ fn search(conn: &Connection, call: &Call) -> KbResult<Value> {
     let human = dashboard_human(&call.user);
     let allowed = acl::effective_collections(conn, &human, None, &narrowing(p))?;
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-    let r = duduclaw_knowledge::search::search(conn, &allowed, query, limit, &duduclaw_knowledge::embed::NoEmbedder)?;
+    let r = duduclaw_knowledge::search::search(
+        conn,
+        &allowed,
+        query,
+        limit,
+        &duduclaw_knowledge::embed::NoEmbedder,
+    )?;
     let mut entry = access("search", &call.user, None);
     entry.query = Some(query.to_string());
     entry.allowed = allowed.ids().to_vec();
@@ -366,7 +388,10 @@ fn passage(conn: &Connection, call: &Call) -> KbResult<Value> {
         .ok_or_else(|| KbError::Invalid("缺少參數 chunk_id。".to_string()))?;
     let human = dashboard_human(&call.user);
     let allowed = acl::effective_collections(conn, &human, None, &Narrowing::default())?;
-    let ctx = p.get("context_chars").and_then(Value::as_u64).unwrap_or(600) as usize;
+    let ctx = p
+        .get("context_chars")
+        .and_then(Value::as_u64)
+        .unwrap_or(600) as usize;
     let mut entry = access("get_passage", &call.user, None);
     entry.allowed = allowed.ids().to_vec();
     let result = duduclaw_knowledge::passage::get_passage(conn, chunk_id, &allowed, ctx);
@@ -408,11 +433,14 @@ async fn add_source(call: Call) -> KbResult<Value> {
             )
         }
         "url" => {
-            let url = super::url_ingest::validate(req(&p, "url")?).map_err(|e| KbError::Rejected {
-                code: "url_blocked",
-                message: e.message,
-            })?;
-            let title = s(&p, "title").map(str::to_string).unwrap_or_else(|| url.clone());
+            let url =
+                super::url_ingest::validate(req(&p, "url")?).map_err(|e| KbError::Rejected {
+                    code: "url_blocked",
+                    message: e.message,
+                })?;
+            let title = s(&p, "title")
+                .map(str::to_string)
+                .unwrap_or_else(|| url.clone());
             (SourceKind::Url, Format::Html, title, Some(url), None)
         }
         _ => {
@@ -428,7 +456,10 @@ async fn add_source(call: Call) -> KbResult<Value> {
         let store = BlobStore::for_home(&home);
         let (sha, size) = match &bytes {
             Some(b) => (store.put(b)?, b.len() as u64),
-            None => (duduclaw_knowledge::blob::url_identity(url.as_deref().unwrap_or("")), 0),
+            None => (
+                duduclaw_knowledge::blob::url_identity(url.as_deref().unwrap_or("")),
+                0,
+            ),
         };
         let new = NewSource {
             collection_id: collection_id.clone(),
@@ -442,16 +473,8 @@ async fn add_source(call: Call) -> KbResult<Value> {
             origin: json!({"added_by": call.user.user_id, "via": "dashboard"}),
             created_by: call.user.user_id.clone(),
         };
-        let added = match duduclaw_knowledge::sources::add_source(&mut conn, &new, &call.cfg) {
-            Ok(a) => a,
-            Err(e) => {
-                // A refused paste must not leave an unreferenced blob behind.
-                if bytes.is_some() && !blob_referenced(&conn, &new.blob_sha256)? {
-                    let _ = store.remove(&new.blob_sha256);
-                }
-                return Err(e);
-            }
-        };
+        // A refused paste leaves an unreferenced blob for the GC sweep.
+        let added = duduclaw_knowledge::sources::add_source(&mut conn, &new, &call.cfg)?;
         let mut entry = access("add_source", &call.user, Some(&collection_id));
         let (duplicate, source) = match added {
             Added::New(s) => (false, s),

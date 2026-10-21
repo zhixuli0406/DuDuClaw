@@ -71,7 +71,8 @@ fn synthetic_zh_tw_keyword_baseline() {
         )
         .unwrap();
     }
-    let questions = parse_questions(&std::fs::read_to_string(root.join("questions.jsonl")).unwrap()).unwrap();
+    let questions =
+        parse_questions(&std::fs::read_to_string(root.join("questions.jsonl")).unwrap()).unwrap();
     let allowed = effective_collections(
         &conn,
         &HumanCtx::dashboard("eval", None, false),

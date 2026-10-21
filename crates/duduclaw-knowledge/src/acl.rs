@@ -209,7 +209,10 @@ pub fn ids_for_slugs(conn: &Connection, slugs: &[String]) -> KbResult<(Vec<Strin
     let mut unknown = Vec::new();
     let mut stmt = conn.prepare("SELECT id FROM collections WHERE slug = ?1")?;
     for slug in slugs {
-        match stmt.query_row(params![slug], |r| r.get::<_, String>(0)).optional()? {
+        match stmt
+            .query_row(params![slug], |r| r.get::<_, String>(0))
+            .optional()?
+        {
             Some(id) => ids.push(id),
             None => unknown.push(slug.clone()),
         }
@@ -260,7 +263,9 @@ pub fn effective_collections(
         HumanMode::InternalOnly => "internal_only",
     };
     let agent_id = agent.map(|a| a.agent_id.as_str());
-    let agent_dept = agent.and_then(|a| a.department.as_deref()).filter(|d| !d.is_empty());
+    let agent_dept = agent
+        .and_then(|a| a.department.as_deref())
+        .filter(|d| !d.is_empty());
     let mut stmt = conn.prepare_cached(EFFECTIVE_SQL)?;
     let rows = stmt.query_map(
         params![
@@ -299,6 +304,29 @@ pub fn effective_collections(
     Ok(AllowedSet::from_ids(ids))
 }
 
+/// The employee side alone: collections granted to the employee or its
+/// department, narrowed by its `[knowledge] collections`. Decides whether the
+/// knowledge tools exist for the employee at all (listed and callable iff
+/// non-empty); every read still goes through [`effective_collections`].
+pub fn agent_side_collections(conn: &Connection, agent: &AgentCtx) -> KbResult<AllowedSet> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT collection_id FROM collection_acl
+          WHERE (principal_kind = 'agent' AND principal_id = ?1 AND role = 'viewer')
+             OR (principal_kind = 'department' AND ?2 IS NOT NULL AND principal_id = ?2
+                 AND role IN ('viewer','editor'))
+          ORDER BY collection_id",
+    )?;
+    let dept = agent.department.as_deref().filter(|d| !d.is_empty());
+    let mut ids: Vec<String> = stmt
+        .query_map(params![agent.agent_id, dept], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if let AgentNarrowing::Only(slugs) = &agent.narrowing {
+        let (allowed, _) = ids_for_slugs(conn, slugs)?;
+        ids.retain(|id| allowed.contains(id));
+    }
+    Ok(AllowedSet::from_ids(ids))
+}
+
 /// The role a dashboard user holds on a collection (Admin ⇒ owner of all).
 /// Malformed rows are ignored, never upgraded.
 pub fn user_role(
@@ -309,9 +337,11 @@ pub fn user_role(
     is_admin: bool,
 ) -> KbResult<Option<Role>> {
     let exists: Option<i64> = conn
-        .query_row("SELECT 1 FROM collections WHERE id = ?1", params![collection_id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT 1 FROM collections WHERE id = ?1",
+            params![collection_id],
+            |r| r.get(0),
+        )
         .optional()?;
     if exists.is_none() {
         return Ok(None);
@@ -407,7 +437,8 @@ fn valid_channel_principal(id: &str) -> bool {
         && channel
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    let chat_ok = chat.is_none_or(|c| !c.is_empty() && c.len() <= 256 && !c.chars().any(char::is_control));
+    let chat_ok =
+        chat.is_none_or(|c| !c.is_empty() && c.len() <= 256 && !c.chars().any(char::is_control));
     channel_ok && chat_ok
 }
 
@@ -420,7 +451,9 @@ pub fn validate_entry(kind: PrincipalKind, id: &str, role: Role) -> KbResult<()>
         }));
     }
     let ok = match kind {
-        PrincipalKind::User => !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control),
+        PrincipalKind::User => {
+            !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+        }
         PrincipalKind::Agent => duduclaw_core::is_valid_agent_id(id),
         PrincipalKind::Department => duduclaw_core::department::is_valid_department(id),
         PrincipalKind::Channel => valid_channel_principal(id),
@@ -456,7 +489,7 @@ pub fn set_acl(
     {
         return Err(KbError::Invalid("至少要保留一位擁有者。".to_string()));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let revision: i64 = tx
         .query_row(
             "SELECT acl_revision FROM collections WHERE id = ?1",

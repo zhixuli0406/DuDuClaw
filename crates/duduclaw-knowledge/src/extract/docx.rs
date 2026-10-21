@@ -64,7 +64,10 @@ struct State {
     cells: Vec<String>,
 }
 
-fn collect_lines(doc_xml: &str, styles: &HashMap<String, usize>) -> Result<Vec<Line>, ExtractError> {
+fn collect_lines(
+    doc_xml: &str,
+    styles: &HashMap<String, usize>,
+) -> Result<Vec<Line>, ExtractError> {
     let mut st = State::default();
     let mut lines = Vec::new();
     for ev in events(doc_xml)? {
@@ -91,7 +94,12 @@ fn collect_lines(doc_xml: &str, styles: &HashMap<String, usize>) -> Result<Vec<L
     Ok(lines)
 }
 
-fn on_open(st: &mut State, name: &str, attrs: &[(String, String)], styles: &HashMap<String, usize>) {
+fn on_open(
+    st: &mut State,
+    name: &str,
+    attrs: &[(String, String)],
+    styles: &HashMap<String, usize>,
+) {
     match name {
         "tbl" => st.table_depth += 1,
         "tc" if st.table_depth == 1 => st.cell.clear(),
@@ -142,7 +150,10 @@ fn on_close(st: &mut State, name: &str, lines: &mut Vec<Line>) {
             let row = super::csv::row_line(st.cells.iter().map(String::as_str));
             st.cells.clear();
             if row.chars().any(|c| !c.is_whitespace() && c != '|') {
-                lines.push(Line { text: row, level: None });
+                lines.push(Line {
+                    text: row,
+                    level: None,
+                });
             }
         }
         "tbl" => st.table_depth = st.table_depth.saturating_sub(1),
@@ -160,7 +171,11 @@ fn sections(lines: Vec<Line>) -> Vec<RawSegment> {
             return;
         }
         let mut seg = RawSegment::new(SegmentKind::Section, body.join("\n"));
-        let label = path.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > ");
+        let label = path
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" > ");
         seg.label = (!label.is_empty()).then_some(label);
         out.push(seg);
         body.clear();
@@ -180,7 +195,8 @@ fn sections(lines: Vec<Line>) -> Vec<RawSegment> {
 /// Extract a `.docx`.
 pub fn extract(bytes: &[u8], budget: &mut Budget) -> Result<Vec<RawSegment>, ExtractError> {
     let mut zip = open_zip(bytes)?;
-    let doc = read_part(&mut zip, "word/document.xml")?.ok_or_else(|| ExtractError::corrupt(super::Format::Docx))?;
+    let doc = read_part(&mut zip, "word/document.xml")?
+        .ok_or_else(|| ExtractError::corrupt(super::Format::Docx))?;
     let styles = match read_part(&mut zip, "word/styles.xml")? {
         Some(xml) => heading_styles(&xml)?,
         None => HashMap::new(),

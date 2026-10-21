@@ -1,20 +1,26 @@
 //! Text normalisation for indexing and querying.
 //!
-//! Index side ([`normalize_text`]): NFKC (full-width ASCII → half-width,
-//! compatibility forms folded), every line break becomes `\n`, tabs become a
-//! space, other control characters are dropped, trailing spaces are trimmed
-//! per line and runs of more than one blank line collapse to one. Offsets
-//! everywhere else are counted in Unicode scalar values of this output.
+//! Two forms of the same text:
 //!
-//! Query side ([`query_terms`]): NFKC, lower case, then split into CJK runs
+//! - **Display** ([`clean_text`]): what people read. Characters are kept as
+//!   written (full-width punctuation stays full-width); only structure is
+//!   cleaned: every line break becomes `\n`, tabs become a space, control
+//!   and zero-width characters are dropped, trailing spaces are trimmed per
+//!   line and runs of blank lines collapse to one. Every offset is counted in
+//!   Unicode scalar values of this form.
+//! - **Matching** ([`match_form`]): NFKC (full-width ASCII → half-width,
+//!   Kangxi radicals → ideographs, compatibility forms folded) and lower
+//!   case. Stored next to the display text and the only form the index and
+//!   the substring scan look at; never shown.
+//!
+//! Query side ([`query_terms`]): the matching form, then split into CJK runs
 //! and Latin/digit runs (`A-1234`, `hr`).
 
 use unicode_normalization::UnicodeNormalization;
 
-/// Normalise extracted document text.
-pub fn normalize_text(raw: &str) -> String {
-    let nfkc: String = raw.nfkc().collect();
-    let unified = nfkc.replace("\r\n", "\n").replace('\r', "\n");
+/// Clean extracted document text for display (no NFKC).
+pub fn clean_text(raw: &str) -> String {
+    let unified = raw.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = String::with_capacity(unified.len());
     let mut blank_run = 0usize;
     for line in unified.split('\n') {
@@ -42,6 +48,11 @@ pub fn normalize_text(raw: &str) -> String {
     }
     // Leading / trailing blank lines carry nothing.
     out.trim_matches('\n').to_string()
+}
+
+/// The matching form of `text`: NFKC, then lower case.
+pub fn match_form(text: &str) -> String {
+    text.nfkc().collect::<String>().to_lowercase()
 }
 
 /// Whether `c` belongs to a CJK script run (Han, kana, Hangul, CJK
@@ -92,7 +103,7 @@ fn is_latin_part(c: char) -> bool {
 /// Split a query into terms after NFKC + lower-casing. Joiners are kept only
 /// between two Latin characters (`a-1234` stays one term, `-x` does not).
 pub fn query_terms(query: &str) -> Vec<Term> {
-    let norm: String = query.nfkc().collect::<String>().to_lowercase();
+    let norm = match_form(query);
     let chars: Vec<char> = norm.chars().collect();
     let mut terms = Vec::new();
     let mut i = 0;
@@ -108,7 +119,9 @@ pub fn query_terms(query: &str) -> Vec<Term> {
             let start = i;
             while i < chars.len() {
                 let ch = chars[i];
-                let joiner = matches!(ch, '-' | '_' | '.' | '/') && i + 1 < chars.len() && is_latin_part(chars[i + 1]);
+                let joiner = matches!(ch, '-' | '_' | '.' | '/')
+                    && i + 1 < chars.len()
+                    && is_latin_part(chars[i + 1]);
                 if !is_latin_part(ch) && !joiner {
                     break;
                 }
@@ -127,14 +140,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nfkc_and_whitespace() {
-        let t = normalize_text("ＡＢＣ１２３\r\n\r\n\r\n第二段\t結尾   \u{200B}\n");
-        assert_eq!(t, "ABC123\n\n第二段 結尾");
+    fn display_keeps_characters_and_cleans_structure() {
+        let t = clean_text("ＡＢＣ１２３，\r\n\r\n\r\n第二段\t結尾！   \u{200B}\n");
+        assert_eq!(t, "ＡＢＣ１２３，\n\n第二段 結尾！");
+    }
+
+    #[test]
+    fn matching_form_folds_width_case_and_radicals() {
+        assert_eq!(match_form("ＡＢＣ１２３，⼀年"), "abc123,一年");
     }
 
     #[test]
     fn control_characters_are_removed() {
-        assert_eq!(normalize_text("a\u{0007}b\u{0000}c"), "abc");
+        assert_eq!(clean_text("a\u{0007}b\u{0000}c"), "abc");
     }
 
     #[test]

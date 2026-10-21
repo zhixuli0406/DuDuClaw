@@ -10,7 +10,8 @@ use super::encoding::decode_text;
 use super::{Budget, ExtractError, RawSegment, SegmentKind};
 
 const SKIP: &[&str] = &[
-    "script", "style", "nav", "footer", "header", "noscript", "template", "svg", "form", "aside", "head",
+    "script", "style", "nav", "footer", "header", "noscript", "template", "svg", "form", "aside",
+    "head",
 ];
 const BLOCK: &[&str] = &[
     "p",
@@ -134,7 +135,8 @@ pub fn extract(bytes: &[u8], budget: &mut Budget) -> Result<Vec<RawSegment>, Ext
                         && let Some((level, title)) = b.heading.take()
                     {
                         b.path.retain(|(l, _)| *l < level);
-                        b.path.push((level, duduclaw_core::truncate_chars(title.trim(), 80)));
+                        b.path
+                            .push((level, duduclaw_core::truncate_chars(title.trim(), 80)));
                     }
                     if BLOCK.contains(&name) {
                         b.newline();

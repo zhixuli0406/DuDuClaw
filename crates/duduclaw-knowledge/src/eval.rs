@@ -59,9 +59,14 @@ pub fn parse_questions(text: &str) -> Result<Vec<Question>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let q: Question = serde_json::from_str(line).map_err(|e| format!("第 {} 行格式錯誤：{e}", i + 1))?;
+        let q: Question =
+            serde_json::from_str(line).map_err(|e| format!("第 {} 行格式錯誤：{e}", i + 1))?;
         if q.answerable && q.gold.is_empty() {
-            return Err(format!("第 {} 行（{}）標為可回答但沒有 gold。", i + 1, q.id));
+            return Err(format!(
+                "第 {} 行（{}）標為可回答但沒有 gold。",
+                i + 1,
+                q.id
+            ));
         }
         out.push(q);
     }

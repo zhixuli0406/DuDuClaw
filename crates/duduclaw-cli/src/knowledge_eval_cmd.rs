@@ -49,8 +49,14 @@ struct Ingest {
     seconds: f64,
 }
 
-async fn ingest(home: &Path, docs: &Path, collection_id: &str, cfg: &KnowledgeConfig) -> Result<Ingest> {
-    let extractor = ExtractorCmd::current_exe().map_err(|e| err(format!("找不到 duduclaw 執行檔：{e}")))?;
+async fn ingest(
+    home: &Path,
+    docs: &Path,
+    collection_id: &str,
+    cfg: &KnowledgeConfig,
+) -> Result<Ingest> {
+    let extractor =
+        ExtractorCmd::current_exe().map_err(|e| err(format!("找不到 duduclaw 執行檔：{e}")))?;
     let store = BlobStore::for_home(home);
     let mut entries: Vec<PathBuf> = std::fs::read_dir(docs)
         .map_err(|e| err(format!("無法讀取文件資料夾 {}：{e}", docs.display())))?
@@ -62,7 +68,11 @@ async fn ingest(home: &Path, docs: &Path, collection_id: &str, cfg: &KnowledgeCo
     let started = Instant::now();
     let (mut n, mut chunks, mut skipped) = (0usize, 0usize, Vec::new());
     for path in entries {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         let format = match Format::from_file_name(&name) {
             Ok(f) => f,
             Err(e) => {
@@ -72,7 +82,8 @@ async fn ingest(home: &Path, docs: &Path, collection_id: &str, cfg: &KnowledgeCo
         };
         let bytes = std::fs::read(&path).map_err(|e| err(format!("無法讀取 {name}：{e}")))?;
         let sha = store.put(&bytes).map_err(|e| err(e.to_string()))?;
-        let mut conn = duduclaw_knowledge::schema::open_home(home).map_err(|e| err(e.to_string()))?;
+        let mut conn =
+            duduclaw_knowledge::schema::open_home(home).map_err(|e| err(e.to_string()))?;
         let new = NewSource {
             collection_id: collection_id.to_string(),
             kind: SourceKind::File,
@@ -142,9 +153,11 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .collect();
-    let questions =
-        parse_questions(&std::fs::read_to_string(&args.questions).map_err(|e| err(format!("無法讀取題目檔：{e}")))?)
-            .map_err(err)?;
+    let questions = parse_questions(
+        &std::fs::read_to_string(&args.questions)
+            .map_err(|e| err(format!("無法讀取題目檔：{e}")))?,
+    )
+    .map_err(err)?;
     let (work, temp) = match &args.work_dir {
         Some(dir) => (dir.clone(), None),
         None => {
@@ -162,7 +175,8 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
     }
     let cfg = KnowledgeConfig::default();
     let collection = {
-        let mut conn = duduclaw_knowledge::schema::open_home(&home).map_err(|e| err(e.to_string()))?;
+        let mut conn =
+            duduclaw_knowledge::schema::open_home(&home).map_err(|e| err(e.to_string()))?;
         create_collection(
             &mut conn,
             &NewCollection {
@@ -188,15 +202,22 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
     let mut unavailable = Vec::new();
     for mode in &modes {
         if mode != "keyword" {
-            unavailable.push(json!({"mode": mode, "reason": "向量檢索尚未提供（這個版本只有關鍵字比對）"}));
+            unavailable.push(
+                json!({"mode": mode, "reason": "向量檢索尚未提供（這個版本只有關鍵字比對）"}),
+            );
             continue;
         }
         let report = evaluate("keyword", &questions, |q| {
             let started = Instant::now();
-            let hits =
-                duduclaw_knowledge::search::search(&conn, &allowed, q, 10, &duduclaw_knowledge::embed::NoEmbedder)
-                    .map(|r| r.hits)
-                    .unwrap_or_default();
+            let hits = duduclaw_knowledge::search::search(
+                &conn,
+                &allowed,
+                q,
+                10,
+                &duduclaw_knowledge::embed::NoEmbedder,
+            )
+            .map(|r| r.hits)
+            .unwrap_or_default();
             (hits, started.elapsed())
         });
         reports.push(report);
@@ -256,8 +277,11 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         );
     }
     if let Some(path) = &args.report {
-        std::fs::write(path, serde_json::to_string_pretty(&report).unwrap_or_default())
-            .map_err(|e| err(format!("無法寫入報表：{e}")))?;
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        )
+        .map_err(|e| err(format!("無法寫入報表：{e}")))?;
         println!("報表已寫入 {}", path.display());
     }
     drop(temp);
