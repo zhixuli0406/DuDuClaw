@@ -4625,6 +4625,8 @@
   "about.softwareBy": "軟體開發",
   "about.version": "版本",
   "about.edition": "版本類型",
+  "about.distributor.title": "總經銷資訊",
+  "about.distributor.caption": "由授權總經銷提供",
   "distributor.title": "經銷商",
   "distributor.scopeNote": "此頁供原廠管理總經銷授權的簽發與撤銷。產品販售與客戶報價由授權總經銷未來企業辦理。",
   "distributor.add": "新增經銷商",

@@ -8,16 +8,30 @@ impl MethodHandler {
         };
         WsFrame::ok_response(
             "",
-            json!({
-                "product_name": "DuDuClaw",
-                "vendor": {
-                    "name_zh": "嘟嘟數位科技有限公司",
-                    "name_en": "Dudu Technology Ltd.",
-                    "url": "https://duduclaw.dudustudio.monster",
-                },
-                "version": env!("CARGO_PKG_VERSION"),
-                "tier": tier.to_string(),
-            }),
+            about_payload(
+                &tier.to_string(),
+                crate::distributor_notice::distributor_notice(),
+            ),
         )
     }
+}
+
+/// `about.get` body. The vendor block and product name are fixed; the only
+/// optional part is `distributor_notice`, the sanitized HTML compiled into a
+/// distributor build. The key is omitted entirely when no notice is compiled in.
+pub(crate) fn about_payload(tier: &str, distributor_notice: Option<String>) -> Value {
+    let mut payload = json!({
+        "product_name": "DuDuClaw",
+        "vendor": {
+            "name_zh": "嘟嘟數位科技有限公司",
+            "name_en": "Dudu Technology Ltd.",
+            "url": "https://duduclaw.dudustudio.monster",
+        },
+        "version": env!("CARGO_PKG_VERSION"),
+        "tier": tier,
+    });
+    if let Some(html) = distributor_notice {
+        payload["distributor_notice"] = Value::String(html);
+    }
+    payload
 }
