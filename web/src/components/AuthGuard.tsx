@@ -156,7 +156,7 @@ export function RoleGuard({ minRole }: { minRole: UserRole }) {
  *
  * Deliberately narrower than `isVisible`: it gates ONLY `enterprise` surfaces
  * — features a Personal instance genuinely does not have. `personalHidden`
- * surfaces (可靠性 / 授權 — 安全 / 日誌 dropped this gate under D9,
+ * surfaces (可靠性 — 授權 dropped it on 2026-10-21, 安全 / 日誌 dropped this gate under D9,
  * 09-edition-split-features.md §4) exist on every edition and are merely
  * kept out of the simplified IA; `ManageShell` documents that those stay
  * URL-reachable on purpose, and this guard does not change that.

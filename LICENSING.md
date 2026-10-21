@@ -47,6 +47,8 @@ DuDuClaw 採用 **Apache License 2.0** 開源授權。
 
 ## 授權金鑰控管的項目
 
+個人版與企業版的差異對照見 [docs/guides/editions.md](docs/guides/editions.md)。
+
 Apache 2.0 授權條款本身不限制使用方式。以下是執行檔依授權金鑰方案改變行為的地方（方案定義見 `crates/duduclaw-license/features.toml`）：
 
 | 項目 | 行為 |
