@@ -504,11 +504,21 @@ fn telegram_keyboard_buttons_carry_the_pick_callback() {
         icon: String::new(),
         call_text: "@財務小幫手".into(),
     }];
-    let kb = list::telegram_keyboard(&agents);
+    let kb = list::telegram_keyboard(&agents).expect("a button fits");
     let data = kb["inline_keyboard"][0][0]["callback_data"]
         .as_str()
         .unwrap();
     assert_eq!(list::parse_telegram_pick(data), Some("finance"));
+    let long = vec![list::CallableAgent {
+        id: "x".repeat(80),
+        display_name: "長代號".into(),
+        icon: String::new(),
+        call_text: "@長代號".into(),
+    }];
+    assert!(
+        list::telegram_keyboard(&long).is_none(),
+        "falls back to the text list"
+    );
 }
 
 #[test]

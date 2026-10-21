@@ -139,7 +139,10 @@ pub(super) async fn build_reply_with_session_inner(
         let webchat = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
             .try_with(|_| ())
             .is_ok();
-        if webchat {
+        // Only messaging-app conversations take part: an internal caller
+        // (`build_reply`'s "default" session, prediction, …) has no human
+        // sender to authorize, so its text is never read as a call.
+        if webchat || !footer_applies_to_session(session_id) {
             fallback
         } else {
             let channel = session_id.split(':').next().unwrap_or("unknown");

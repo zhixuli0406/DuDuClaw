@@ -93,7 +93,18 @@ pub(crate) async fn line_route(state: &LineState, event: &LineEvent, quiet: bool
         crate::trigger_route::SenderAccess::unmapped()
     };
     let route = crate::trigger_route::decide(&reg, text, &access, Some(&fallback));
-    let event_id = event.webhook_event_id.as_deref().unwrap_or("");
+    // LINE always sends `webhookEventId` (the durable ingress refuses events
+    // without one); fall back to a digest of what identifies the message so
+    // two id-less events never share one-shot state.
+    let event_id = match event.webhook_event_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => crate::channel_ingress::digest(&[
+            &session,
+            sender,
+            &event.timestamp.unwrap_or_default().to_string(),
+            event.message.as_ref().and_then(|m| m.id.as_deref()).unwrap_or(""),
+        ]),
+    };
     let decision = decision_for_route(
         &state.home_dir,
         &reg,
@@ -103,7 +114,7 @@ pub(crate) async fn line_route(state: &LineState, event: &LineEvent, quiet: bool
             sender,
             text,
             fallback: Some(&fallback),
-            event: event_id,
+            event: &event_id,
             seq: event
                 .timestamp
                 .unwrap_or_else(crate::trigger_route::pending::next_seq),

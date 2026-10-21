@@ -97,13 +97,22 @@ fn expired(e: &Entry, now: Instant) -> bool {
     }
 }
 
+/// Below this size the store is not scanned at all on `arm`.
+const PURGE_THRESHOLD: usize = 1_024;
+
 fn purge(map: &mut HashMap<PendingKey, Entry>, now: Instant) {
+    if map.len() < PURGE_THRESHOLD {
+        return;
+    }
     map.retain(|_, e| {
         let age = now.saturating_duration_since(e.armed);
         age < PENDING_TTL + TOMBSTONE_TTL
     });
     if map.len() >= MAX_ENTRIES {
-        // Oldest first.
+        // Under pressure, drop used/cancelled entries first, then the oldest.
+        map.retain(|_, e| e.state == State::Open);
+    }
+    if map.len() >= MAX_ENTRIES {
         let mut keys: Vec<(Instant, PendingKey)> =
             map.iter().map(|(k, e)| (e.armed, k.clone())).collect();
         keys.sort_by_key(|(t, _)| *t);

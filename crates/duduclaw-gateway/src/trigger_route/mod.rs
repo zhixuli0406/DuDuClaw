@@ -149,8 +149,9 @@ pub fn with_reply_prefix(reply: String, display_name: &str) -> String {
     format!("{}\n{reply}", reply_prefix(display_name))
 }
 
-/// The refusal for calling an employee the sender may not call. Generic on
-/// purpose: it does not say whether that employee exists.
+/// The refusal for calling an employee the sender may not call. It does not
+/// name the employee; it does confirm that the name belongs to one (a name
+/// that matches nobody is ordinary text for the default employee).
 pub const FORBIDDEN_TEXT: &str =
     "你沒有呼叫這位 AI 員工的權限，這則訊息沒有送出。輸入「@」可以查看你能呼叫的 AI 員工。";
 
@@ -183,7 +184,7 @@ pub fn audit(
 ) {
     let who = access.audit_label(channel, channel_sender);
     tracing::info!(channel, sender = %who, agent, outcome, "trigger routing decision");
-    if outcome == "refused" {
+    if outcome == "refused" && !recently_audited(&who, agent) {
         let event = duduclaw_security::audit::AuditEvent::new(
             "trigger_route_refused",
             agent,
@@ -218,4 +219,34 @@ pub fn record_answered_by(who: AnsweredBy) {
             *s = Some(who);
         }
     });
+}
+
+/// One audit row per (sender, employee) per minute: a sender repeating a
+/// refused call cannot grow `security_audit.jsonl` without bound.
+fn recently_audited(who: &str, agent: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    const WINDOW: Duration = Duration::from_secs(60);
+    const MAX: usize = 4_096;
+    static SEEN: OnceLock<Mutex<HashMap<(String, String), Instant>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if seen.len() >= MAX {
+        seen.retain(|_, t| now.saturating_duration_since(*t) < WINDOW);
+        if seen.len() >= MAX {
+            seen.clear();
+        }
+    }
+    let key = (who.to_string(), agent.to_string());
+    match seen.get(&key) {
+        Some(t) if now.saturating_duration_since(*t) < WINDOW => true,
+        _ => {
+            seen.insert(key, now);
+            false
+        }
+    }
 }

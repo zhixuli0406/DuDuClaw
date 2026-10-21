@@ -69,46 +69,74 @@ impl WebChatState {
     }
 }
 
+/// Who answers one WebChat message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WebRoute {
+    /// `None` = the default path (the main employee, nothing selected).
+    pub agent: Option<String>,
+    /// The message called someone other than the selected / default
+    /// employee: the reply goes to that employee's own session bucket.
+    pub switched: bool,
+}
+
 /// Decide which employee answers `text`. `selected` is the employee the
-/// browser addressed (already ACL-checked), `default_id` the default one.
-/// `Ok(None)` = the default path; `Ok(Some(id))` = answer as `id`;
-/// `Err(frame)` = send that frame and stop (no model call).
+/// browser addressed (already ACL-checked), `main_id` the main employee,
+/// `sid`/`user_id` the turn's session and connection ids (they decide the
+/// conversation's real default employee, which may be a channel-bound or
+/// `allowed_channels` employee rather than the main one).
+/// `agent: None` = the default path, used only when the default employee IS the
+/// main one and nothing was selected (the reply pipeline then resolves the
+/// same employee); `agent: Some(id)` = answer as `id`, so the employee checked
+/// here is the employee that answers; `Err(frame)` = send that frame and
+/// stop (no model call). An empty `text` runs only the default-employee
+/// check (used before chat commands).
 pub(super) async fn decide_webchat_route(
     state: &WebChatState,
     auth_user: &str,
     text: &str,
     selected: Option<&str>,
-    default_id: &str,
-) -> Result<Option<String>, Box<ChatMessage>> {
+    main_id: &str,
+    sid: &str,
+    user_id: &str,
+) -> Result<WebRoute, Box<ChatMessage>> {
     let access = state.sender_access(auth_user).await;
     let reg = state.ctx.registry.read().await;
-    let fallback = selected.unwrap_or(default_id);
-    let route = trigger_route::decide(&reg, text, &access, Some(fallback));
+    let default_id = crate::channel_reply::resolve_fallback_agent(&state.ctx, &reg, sid, user_id)
+        .await
+        .map(|a| a.config.agent.name.clone())
+        .unwrap_or_else(|| main_id.to_string());
+    let fallback: String = selected
+        .map(str::to_string)
+        .unwrap_or_else(|| default_id.clone());
+    let route = trigger_route::decide(&reg, text, &access, Some(&fallback));
     let home = &state.ctx.home_dir;
+    let answer_as = |id: String| WebRoute {
+        switched: id != fallback,
+        agent: (selected.is_some() || id != main_id).then_some(id),
+    };
     match route {
         TriggerRoute::None => {
-            if selected.is_none() {
-                let default_ok = reg
-                    .get(default_id)
-                    .is_some_and(|a| access.may_call(a, Some(default_id)));
-                if !default_ok {
-                    trigger_route::audit(
-                        home, "webchat", &access, auth_user, default_id, "refused",
-                    );
-                    return Err(Box::new(ChatMessage::error_coded(
-                        trigger_route::DEFAULT_FORBIDDEN_TEXT,
-                        AGENT_FORBIDDEN_CODE,
-                    )));
-                }
+            if let Some(sel) = selected {
+                return Ok(WebRoute {
+                    agent: Some(sel.to_string()),
+                    switched: false,
+                });
             }
-            Ok(selected.map(str::to_string))
+            let default_ok = reg
+                .get(&default_id)
+                .is_some_and(|a| access.may_call(a, Some(&default_id)));
+            if !default_ok {
+                trigger_route::audit(home, "webchat", &access, auth_user, &default_id, "refused");
+                return Err(Box::new(ChatMessage::error_coded(
+                    trigger_route::DEFAULT_FORBIDDEN_TEXT,
+                    AGENT_FORBIDDEN_CODE,
+                )));
+            }
+            Ok(answer_as(default_id))
         }
         TriggerRoute::Routed { agent, .. } => {
             trigger_route::audit(home, "webchat", &access, auth_user, &agent, "allowed");
-            if selected.is_none() && agent == default_id {
-                return Ok(None);
-            }
-            Ok(Some(agent))
+            Ok(answer_as(agent))
         }
         TriggerRoute::Forbidden { agent } => {
             trigger_route::audit(home, "webchat", &access, auth_user, &agent, "refused");

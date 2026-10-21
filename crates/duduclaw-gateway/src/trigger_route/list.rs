@@ -137,8 +137,9 @@ pub fn parse_line_page(data: &str) -> Option<usize> {
 
 /// Telegram inline keyboard (two buttons per row). Pressing one arms the
 /// one-shot addressee; employees whose id does not fit `callback_data` are
-/// left out of the buttons (they stay callable by typing).
-pub fn telegram_keyboard(agents: &[CallableAgent]) -> Value {
+/// left out of the buttons (they stay callable by typing). `None` when no
+/// button fits: the caller sends the text list instead.
+pub fn telegram_keyboard(agents: &[CallableAgent]) -> Option<Value> {
     let buttons: Vec<Value> = agents
         .iter()
         .filter_map(|a| {
@@ -155,7 +156,10 @@ pub fn telegram_keyboard(agents: &[CallableAgent]) -> Value {
         .chunks(2)
         .map(|c| Value::Array(c.to_vec()))
         .collect();
-    json!({ "inline_keyboard": rows })
+    if rows.is_empty() {
+        return None;
+    }
+    Some(json!({ "inline_keyboard": rows }))
 }
 
 /// Parse a Telegram pick callback into the employee id.

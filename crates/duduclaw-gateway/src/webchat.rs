@@ -979,22 +979,43 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // employee the account may use, for this message
                                 // only; a forbidden call or a forbidden default
                                 // employee is refused here, before any model call.
-                                // Chat commands keep the selected employee.
-                                let effective_agent: Option<String> = if crate::chat_commands::is_command(&content) {
-                                    effective_agent
-                                } else {
-                                    match route::decide_webchat_route(
-                                        &state, &auth_user, &content, effective_agent.as_deref(), &agent_id,
-                                    ).await {
-                                        Ok(routed) => routed,
-                                        Err(frame) => {
-                                            if let Ok(json) = serde_json::to_string(&frame) {
-                                                let _ = sink.send(Message::Text(json.into())).await;
-                                            }
-                                            continue;
+                                // Chat commands keep the selected employee but get
+                                // the same default-employee check (an empty text
+                                // calls nobody).
+                                let is_cmd = crate::chat_commands::is_command(&content);
+                                let routed = match route::decide_webchat_route(
+                                    &state,
+                                    &auth_user,
+                                    if is_cmd { "" } else { &content },
+                                    effective_agent.as_deref(),
+                                    &agent_id,
+                                    sid,
+                                    &user_id,
+                                ).await {
+                                    Ok(routed) => routed,
+                                    Err(frame) => {
+                                        if let Ok(json) = serde_json::to_string(&*frame) {
+                                            let _ = sink.send(Message::Text(json.into())).await;
                                         }
+                                        continue;
                                     }
                                 };
+                                // A call to another employee answers in that
+                                // employee's own session bucket (the session id is
+                                // the isolation boundary), never in the selected
+                                // employee's history.
+                                let sid_rerouted;
+                                let sid: &str = if routed.switched {
+                                    sid_rerouted = compose_session_id(
+                                        session_id.as_str(),
+                                        routed.agent.as_deref().filter(|a| *a != agent_id),
+                                        conv_nonce.as_deref(),
+                                    );
+                                    &sid_rerouted
+                                } else {
+                                    sid
+                                };
+                                let effective_agent: Option<String> = routed.agent;
 
                                 // The agent id used for chat-command handling /
                                 // contract enforcement — the routed agent when one

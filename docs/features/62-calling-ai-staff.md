@@ -22,9 +22,11 @@ People talk to one AI employee by default and can hand a single message to anoth
 
 An employee is opened to outside contacts on its edit page (**Callable by outside contacts**, `[channels] public_trigger = true` in `agent.toml`). It is off by default, only an Admin can change it, and employees cannot change it themselves.
 
-Calling an employee you may not call is refused before any model call: the reply says you have no permission to call that employee, without saying whether it exists. The refusal is written to the security audit log (`trigger_route_refused`) with the dashboard account, or a short digest for an unlinked sender, never the raw platform id. Allowed switches are logged at info level.
+Calling an employee you may not call is refused before any model call: the reply says you have no permission to call that employee. It does not name the employee, but it does tell you the name belongs to one (a name that matches nobody is just text for the default employee). The refusal is written to the security audit log (`trigger_route_refused`) with the dashboard account, or a short digest for an unlinked sender, never the raw platform id. Allowed switches are logged at info level.
 
-A WebChat account that is not bound to the default employee is refused when it sends a message that calls nobody, and is asked to pick an employee or type `@`.
+A WebChat account that is not bound to the default employee is refused when it sends a message or chat command (`/goal`, `/status` …) that calls nobody, and is asked to pick an employee or type `@`. In WebChat, an answer from a called employee is kept in that employee's own conversation history, not in the selected employee's.
+
+Repeated refusals from the same sender for the same employee are audited once a minute.
 
 ## The `@` list
 
@@ -32,6 +34,8 @@ A WebChat account that is not bound to the default employee is refused when it s
 - **LINE**: send `@` alone (or `@` with part of a name) and the bot answers with the list as quick-reply buttons, at most 13 at a time; a longer list ends with a **更多** button for the next page. Tapping a name sends `@name`.
 - **Telegram** (shared bot): the same list comes as inline buttons.
 - Other channels answer with a text list.
+
+The list, the refusal and the "say the task" prompt go out only after the same access gate (blocklist, pairing) and human-takeover checks as an AI reply.
 
 ## Calling an employee and then saying the task
 

@@ -1280,31 +1280,54 @@ async fn process_telegram_message(
         Some(_) => None,
         None => Some(resolve_shared_route(&ctx, &user_id).await),
     };
-    let trigger_decision = match &shared_route {
-        Some(SharedRoute::Bound(bound)) => {
-            Some(telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, Some(bound)).await)
-        }
-        Some(SharedRoute::Unbound) => {
-            Some(telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, None).await)
-        }
+    let bound_for_route: Option<Option<String>> = match &shared_route {
+        Some(SharedRoute::Bound(bound)) => Some(Some(bound.clone())),
+        Some(SharedRoute::Unbound) => Some(None),
         _ => None,
     };
-    if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) = &trigger_decision {
-        // Same access gate as the AI path: a blocked user gets nothing.
+    let event_key = match msg_id {
+        Some(id) => format!("{session_id}#{id}"),
+        None => format!("{session_id}#{}", uuid::Uuid::new_v4()),
+    };
+    // First pass `quiet`: nothing is logged or audited before the access
+    // gate. The second pass (same event key) gives the same decision.
+    let mut trigger_decision = match &bound_for_route {
+        Some(bound) => Some(
+            telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, bound.as_deref(), &event_key, true)
+                .await,
+        ),
+        None => None,
+    };
+    if matches!(trigger_decision, Some(crate::trigger_route::turn::TurnDecision::Reply { .. })) {
+        // Same access gate and human-takeover checks as the AI path: a
+        // blocked user gets nothing, a held conversation stays quiet.
         if let Some(gate) =
-            crate::channel_reply::check_user_access_gate(&ctx, &session_id, &user_id, &input_text).await
+            crate::channel_reply::gate_direct_reply(&ctx, &session_id, &user_id, &input_text).await
         {
             if !gate.is_empty() {
                 send_reply(&client, &api_base, chat_id, &gate, thread_id, msg_id, None).await;
             }
             return;
         }
+    }
+    if trigger_decision
+        .as_ref()
+        .is_some_and(|d| !matches!(d, crate::trigger_route::turn::TurnDecision::Default))
+    {
+        if let Some(bound) = &bound_for_route {
+            trigger_decision = Some(
+                telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, bound.as_deref(), &event_key, false)
+                    .await,
+            );
+        }
+    }
+    if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) = &trigger_decision {
         let (body, markup) = match list {
-            Some(agents) if !agents.is_empty() => (
-                crate::trigger_route::list::list_intro(agents),
-                Some(crate::trigger_route::list::telegram_keyboard(agents)),
-            ),
-            _ => (text.clone(), None),
+            Some(agents) => match crate::trigger_route::list::telegram_keyboard(agents) {
+                Some(kb) => (crate::trigger_route::list::list_intro(agents), Some(kb)),
+                None => (text.clone(), None),
+            },
+            None => (text.clone(), None),
         };
         send_reply(&client, &api_base, chat_id, &body, thread_id, msg_id, markup).await;
         return;
@@ -2176,6 +2199,8 @@ async fn telegram_trigger_decision(
     user_id: &str,
     text: &str,
     bound: Option<&str>,
+    event: &str,
+    quiet: bool,
 ) -> crate::trigger_route::turn::TurnDecision {
     let reg = ctx.registry.read().await;
     let fallback = match bound {
@@ -2184,7 +2209,6 @@ async fn telegram_trigger_decision(
             .await
             .map(|a| a.config.agent.name.clone()),
     };
-    let event = format!("{session_id}#{}", uuid::Uuid::new_v4());
     crate::trigger_route::turn::decide_channel_turn(
         &ctx.home_dir,
         &reg,
@@ -2194,9 +2218,9 @@ async fn telegram_trigger_decision(
             sender: user_id,
             text,
             fallback: fallback.as_deref(),
-            event: &event,
+            event,
             seq: crate::trigger_route::pending::next_seq(),
-            quiet: false,
+            quiet,
         },
     )
 }

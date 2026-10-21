@@ -715,7 +715,9 @@ async fn process_line_events(
                 // ── `@` routing (D6): who answers this event, or a direct
                 // answer (list / refusal / "say the task"). Same computation
                 // as the route snapshot, so it agrees with `agent_id`.
-                let route = trigger::line_route(state, &event, false).await;
+                // Computed `quiet`: nothing is logged or audited until the
+                // access gate has passed (below).
+                let route = trigger::line_route(state, &event, true).await;
 
                 // ── Mention-only mode (group chats only) ──
                 // LINE bots get no native @mention, so "mentioned" means the
@@ -910,16 +912,19 @@ async fn process_line_events(
                 }
 
                 // ── Direct `@` answers (no model call) ──
-                // Same access gate as the AI path and commands: a blocked or
-                // unpaired user gets nothing, not the employee list.
-                if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) =
+                // They pass the same access gate and human-takeover checks as
+                // the AI path: a blocked user gets nothing, a held
+                // conversation stays quiet. Only then is the route recomputed
+                // with logging/audit (same result: idempotent per event).
+                let session_for_route = format!("line:{}", ingress::line_conversation(&event));
+                let principal = crate::ccr_runtime::reply_principal_for_sender(sender);
+                if let Some(crate::trigger_route::turn::TurnDecision::Reply { .. }) =
                     route.as_ref().map(|r| &r.decision)
                 {
-                    let session_id = format!("line:{}", ingress::line_conversation(&event));
-                    if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                    if let Some(gate_reply) = crate::channel_reply::gate_direct_reply(
                         &state.ctx,
-                        &session_id,
-                        sender,
+                        &session_for_route,
+                        principal,
                         &input_text,
                     )
                     .await
@@ -931,6 +936,15 @@ async fn process_line_events(
                         }
                         continue;
                     }
+                }
+                let route = if route.as_ref().is_some_and(|r| r.addresses_bot()) {
+                    trigger::line_route(state, &event, false).await
+                } else {
+                    route
+                };
+                if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) =
+                    route.as_ref().map(|r| &r.decision)
+                {
                     let messages = trigger::direct_reply_messages(text, list.as_deref());
                     let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
                     continue;
