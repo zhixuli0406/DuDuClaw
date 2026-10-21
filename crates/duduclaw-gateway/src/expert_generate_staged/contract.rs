@@ -12,44 +12,37 @@
 //! - rules shorter than [`MIN_MUST_NOT_CHARS`] are dropped;
 //! - length, count and duplicates are capped.
 
-use std::collections::BTreeSet;
+use duduclaw_agent::contract::Boundaries;
+use duduclaw_agent::contract_sanitize::sanitize_boundaries;
 
 use crate::expert_generate::GeneratedContract;
 
-/// Shortest `must_not` rule kept (chars). Shorter rules are keyword-like and
-/// would false-positive on ordinary replies.
-pub const MIN_MUST_NOT_CHARS: usize = 10;
-const MAX_RULE_CHARS: usize = 160;
-const MIN_MUST_ALWAYS_CHARS: usize = 4;
-const MAX_RULES: usize = 8;
+/// Shortest `must_not` rule kept (re-exported from the shared sanitizer).
+pub use duduclaw_agent::contract_sanitize::MIN_MUST_NOT_CHARS;
 
-fn normalize_rule(raw: &str) -> String {
-    let flat: String = raw
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|c| !matches!(c, '*' | '?' | '[' | ']'))
-        .collect();
-    let collapsed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
-    duduclaw_core::truncate_chars(collapsed.trim(), MAX_RULE_CHARS)
-}
-
-fn sanitize_list(rules: &[String], min_chars: usize) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    rules
-        .iter()
-        .map(|r| normalize_rule(r))
-        .filter(|r| r.chars().count() >= min_chars)
-        .filter(|r| seen.insert(r.clone()))
-        .take(MAX_RULES)
-        .collect()
-}
-
-/// Return a sanitized copy (never mutates the input).
-pub fn sanitize_contract(c: &GeneratedContract) -> GeneratedContract {
-    GeneratedContract {
-        must_not: sanitize_list(&c.must_not, MIN_MUST_NOT_CHARS),
-        must_always: sanitize_list(&c.must_always, MIN_MUST_ALWAYS_CHARS),
+fn to_boundaries(c: &GeneratedContract) -> Boundaries {
+    Boundaries {
+        must_not: c.must_not.clone(),
+        must_always: c.must_always.clone(),
+        max_tool_calls_per_turn: 0,
     }
+}
+
+/// Return a sanitized copy (never mutates the input). `soul` enables the
+/// "matches the member's own wording" check (see
+/// `duduclaw_agent::contract_sanitize`); the same function runs again at
+/// install time for any pack, generated or not.
+pub fn sanitize_contract_for(c: &GeneratedContract, soul: Option<&str>) -> GeneratedContract {
+    let out = sanitize_boundaries(&to_boundaries(c), soul).boundaries;
+    GeneratedContract {
+        must_not: out.must_not,
+        must_always: out.must_always,
+    }
+}
+
+/// [`sanitize_contract_for`] without a persona.
+pub fn sanitize_contract(c: &GeneratedContract) -> GeneratedContract {
+    sanitize_contract_for(c, None)
 }
 
 /// Render a CONTRACT.toml body, or `None` when the sanitized contract has no

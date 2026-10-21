@@ -557,6 +557,8 @@ pub(super) async fn experts_list_and_remove_round_trip() {
         agents: vec!["sales-lead".into()],
         global_skills: vec![],
         wiki_files: vec![],
+        agent_skills: Vec::new(),
+        agent_ids: Default::default(),
         installed_at: crate::expert_admin::now_iso(),
         source_format: String::new(),
     };

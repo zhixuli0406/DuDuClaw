@@ -95,6 +95,7 @@ pub fn roster_prompt(
 規劃規則：
 - 恰好一位 front_desk，放在 members 第一位，reports_to 為空字串；其餘 worker 的 reports_to 都是它的 name。
 - members 人數必須等於使用者指定的團隊規模。
+- 每位成員的 name 都以 slug 去掉結尾 -team 的部分開頭（slug 是 flowershop-team 時寫 flowershop-orders），最多 54 個字元；display_name 彼此不可重複。
 - 每位 worker 的職責不可重疊；凡涉及金流、法律／醫療等專業判斷、不可逆操作，都寫成「整理後交給真人」，不交給 AI 決定。
 
 {COMMON_RULES}"#

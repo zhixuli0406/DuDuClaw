@@ -14,7 +14,7 @@ use crate::expert_generate::{
 };
 use crate::premium_templates::is_safe_slug;
 
-use super::contract::sanitize_contract;
+use super::contract::sanitize_contract_for;
 
 /// Minimum SOUL length (chars). The bundled industry packs run 1.5–4 k chars
 /// per member; below this a SOUL cannot carry the required sections with any
@@ -26,6 +26,9 @@ pub const MIN_SKILL_CHARS: usize = 500;
 pub const MIN_WIKI_PAGE_CHARS: usize = 500;
 /// Upper bound on wiki pages one team may ship (keeps install + review sane).
 pub const MAX_WIKI_PAGES: usize = 10;
+/// Longest member id: leaves room under the 64-char agent-id limit for the
+/// installer's team-wide `-N` / `-imported` rename suffix.
+pub const MAX_MEMBER_ID_LEN: usize = 54;
 /// Upper bound on skills per member.
 pub const MAX_SKILLS_PER_MEMBER: usize = 3;
 
@@ -143,6 +146,45 @@ pub fn validate_roster(plan: &RosterPlan, team_size: usize) -> Vec<String> {
     problems
 }
 
+/// The prefix every member id of a team must carry: the team slug without a
+/// trailing `-team` (`flowershop-team` → `flowershop`).
+pub fn member_prefix(slug: &str) -> &str {
+    slug.strip_suffix("-team").unwrap_or(slug)
+}
+
+/// Prefix member names (and the `reports_to` that point at them) with the
+/// team stem, so ids from two generated teams cannot collide. Names that
+/// already carry the prefix are kept. An unsafe slug is left untouched (the
+/// validator rejects it).
+pub fn prefix_member_names(plan: RosterPlan) -> RosterPlan {
+    if !is_safe_slug(&plan.slug) {
+        return plan;
+    }
+    let stem = member_prefix(&plan.slug).to_string();
+    let fix = |name: &str| -> String {
+        let n = name.trim();
+        if n.is_empty() || n == stem || n.starts_with(&format!("{stem}-")) {
+            n.to_string()
+        } else {
+            format!("{stem}-{n}")
+        }
+    };
+    let members = plan
+        .members
+        .iter()
+        .map(|m| RosterMember {
+            name: fix(&m.name),
+            reports_to: if m.reports_to.trim().is_empty() {
+                String::new()
+            } else {
+                fix(&m.reports_to)
+            },
+            ..m.clone()
+        })
+        .collect();
+    RosterPlan { members, ..plan }
+}
+
 fn validate_members(members: &[RosterMember]) -> Vec<String> {
     let mut problems = Vec::new();
     let Some(first) = members.first() else {
@@ -167,6 +209,8 @@ fn validate_members(members: &[RosterMember]) -> Vec<String> {
     for m in members {
         if !is_safe_slug(&m.name) {
             problems.push(format!("成員 name '{}' 非法", m.name.escape_debug()));
+        } else if m.name.len() > MAX_MEMBER_ID_LEN {
+            problems.push(format!("成員 name '{}' 太長（最多 {MAX_MEMBER_ID_LEN} 字元）", m.name));
         }
         let rt = m.reports_to.trim();
         if !m.is_front_desk() && rt != first.name {
@@ -251,7 +295,9 @@ pub fn validate_member(member: &RosterMember, mc: MemberContent) -> Result<Membe
     for s in &mc.skills {
         problems.extend(validate_skill(s));
     }
-    let contract = sanitize_contract(&mc.contract);
+    // Rules that repeat the member's own handoff / example wording would
+    // block its own replies; they are dropped like keyword rules.
+    let contract = sanitize_contract_for(&mc.contract, Some(soul));
     if contract.must_not.is_empty() {
         problems.push("contract.must_not 至少 1 條（每條 10 字以上的完整描述）".to_string());
     }
@@ -408,6 +454,7 @@ fn assign_wiki_files(pages: &[WikiPageDraft]) -> Vec<GeneratedWiki> {
                 title: p.title.trim().to_string(),
                 content,
                 kind: kind.to_string(),
+                web_research: false,
             }
         })
         .collect()

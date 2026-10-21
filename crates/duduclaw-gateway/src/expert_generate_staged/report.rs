@@ -29,6 +29,7 @@ struct ManifestAgent {
     role: String,
     display_name: String,
     reports_to: String,
+    trigger: String,
     skills: Vec<String>,
 }
 
@@ -61,6 +62,7 @@ fn manifest_agents(expert: Option<&toml::Table>) -> Vec<ManifestAgent> {
                     role: str_of(t, "role").to_string(),
                     display_name: str_of(t, "display_name").to_string(),
                     reports_to: str_of(t, "reports_to").to_string(),
+                    trigger: str_of(t, "trigger").to_string(),
                     skills: str_list(t.get("skills")),
                 })
                 .collect()
@@ -136,13 +138,45 @@ fn agent_preview(pack_dir: &Path, a: &ManifestAgent) -> Value {
     })
 }
 
+/// Longest page body sent to the preview for review (chars).
+const REVIEW_CONTENT_CHARS: usize = 6000;
+
+fn is_web_research_page(content: &str) -> bool {
+    content
+        .lines()
+        .take(6)
+        .any(|l| l.trim() == crate::expert_generate::WEB_RESEARCH_MARKER)
+}
+
+/// Does the materialized draft carry any page written with web search?
+pub fn has_web_research_pages(pack_dir: &Path) -> bool {
+    wiki_files(pack_dir).iter().any(|rel| {
+        std::fs::read_to_string(pack_dir.join("wiki").join(rel))
+            .map(|c| is_web_research_page(&c))
+            .unwrap_or(false)
+    })
+}
+
 fn wiki_pages(pack_dir: &Path) -> Vec<Value> {
     wiki_files(pack_dir)
         .into_iter()
         .map(|rel| {
             let content = std::fs::read_to_string(pack_dir.join("wiki").join(&rel)).unwrap_or_default();
             let title = first_heading(&content).unwrap_or_else(|| rel.clone());
-            json!({ "file": rel, "title": title, "chars": content.chars().count() })
+            let web = is_web_research_page(&content);
+            json!({
+                "file": rel,
+                "title": title,
+                "chars": content.chars().count(),
+                "web_research": web,
+                // Pages that need review ship their text so the operator can
+                // read them in the preview.
+                "content": if web {
+                    Value::String(duduclaw_core::truncate_chars(&content, REVIEW_CONTENT_CHARS))
+                } else {
+                    Value::Null
+                },
+            })
         })
         .collect()
 }
@@ -201,9 +235,19 @@ pub fn install_precheck(home: &Path, pack_dir: &Path) -> Vec<Value> {
     let manifest = manifest_table(pack_dir);
     let agents = manifest_agents(manifest.get("expert").and_then(|v| v.as_table()));
     let mut out = Vec::new();
+    let book = duduclaw_core::agent_names::NameBook::load(home);
     for a in &agents {
         if home.join("agents").join(&a.name).exists() {
-            out.push(warning("agent", &a.name, "conflict", "已有同名 AI 員工，這位不會安裝"));
+            out.push(warning("agent", &a.name, "conflict", "代號已被使用，安裝時整組會改用新代號"));
+        }
+        let display = if a.display_name.trim().is_empty() { &a.name } else { &a.display_name };
+        if book.is_taken(display) {
+            out.push(warning("name", display, "conflict", "已被其他員工使用，安裝時會改名"));
+        }
+        let trigger = a.trigger.trim();
+        let same = duduclaw_core::agent_names::norm(trigger) == duduclaw_core::agent_names::norm(display);
+        if !trigger.is_empty() && !same && book.is_taken(trigger) {
+            out.push(warning("trigger", trigger, "conflict", "已被其他員工使用，安裝時會改用顯示名稱"));
         }
         let agent_dir = pack_dir.join("agents").join(&a.name);
         for (file, kind) in [("soul.md", "agent"), ("CONTRACT.toml", "contract")] {
@@ -234,6 +278,19 @@ pub fn install_precheck(home: &Path, pack_dir: &Path) -> Vec<Value> {
     out
 }
 
+/// The display name the installer actually wrote (it may have renamed the
+/// member to avoid a name another employee answers to).
+fn installed_display_name(agent_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(agent_dir.join("agent.toml"))
+        .ok()?
+        .parse::<toml::Table>()
+        .ok()?
+        .get("agent")?
+        .get("display_name")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Wiki targets that already exist BEFORE install (snapshot for
 /// [`placement_report`]: a page missing after install that was already
 /// there is a conflict, not a scan block).
@@ -250,17 +307,23 @@ pub fn existing_wiki_targets(home: &Path, pack_dir: &Path) -> BTreeSet<String> {
 pub fn placement_report(
     home: &Path,
     pack_dir: &Path,
-    installed_agents: &[String],
-    installed_wiki: &[String],
+    record: Option<&crate::expert_admin::InstallRecord>,
     preexisting_wiki: &BTreeSet<String>,
 ) -> Value {
+    let installed_agents: &[String] = record.map(|r| r.agents.as_slice()).unwrap_or(&[]);
+    let installed_wiki: &[String] = record.map(|r| r.wiki_files.as_slice()).unwrap_or(&[]);
     let manifest = manifest_table(pack_dir);
     let agents = manifest_agents(manifest.get("expert").and_then(|v| v.as_table()));
     let agent_rows: Vec<Value> = agents
         .iter()
         .map(|a| {
-            let installed = installed_agents.iter().any(|x| x == &a.name);
-            let home_agent: PathBuf = home.join("agents").join(&a.name);
+            // The installer may rename the whole team; the record maps names.
+            let id = record
+                .and_then(|r| r.agent_ids.get(&a.name))
+                .cloned()
+                .unwrap_or_else(|| a.name.clone());
+            let installed = installed_agents.iter().any(|x| x == &id);
+            let home_agent: PathBuf = home.join("agents").join(&id);
             let skills: Vec<Value> = a
                 .skills
                 .iter()
@@ -270,9 +333,16 @@ pub fn placement_report(
                 })
                 .collect();
             let wants_contract = pack_dir.join("agents").join(&a.name).join("CONTRACT.toml").is_file();
+            let display_name = if installed {
+                installed_display_name(&home_agent).unwrap_or_else(|| a.display_name.clone())
+            } else {
+                a.display_name.clone()
+            };
             json!({
                 "name": a.name,
-                "display_name": a.display_name,
+                "id": id,
+                "display_name": display_name,
+                "renamed": installed && display_name != a.display_name,
                 "installed": installed,
                 "skills": skills,
                 "contract": if wants_contract {

@@ -228,6 +228,8 @@ async fn install_native(
         agents: Vec::new(),
         global_skills: Vec::new(),
         wiki_files: Vec::new(),
+        agent_skills: Vec::new(),
+        agent_ids: Default::default(),
         installed_at: now_iso(),
         source_format: String::new(),
     };
@@ -280,6 +282,16 @@ async fn install_native(
         }
     };
 
+    // One id decision for the whole team: when any member's id is taken,
+    // every member gets the same suffix, so the team stays recognisable and
+    // `reports_to` keeps pointing inside it (instead of skipping members and
+    // leaving their subordinates top-level).
+    let suffix = team_id_suffix(ctx, &e.agents, report);
+    // Names (ids, display names, triggers) current employees answer to:
+    // channel routing calls `@display` and `@id`, so no new member may
+    // share one.
+    let mut book = duduclaw_core::agent_names::NameBook::load(&ctx.home);
+
     // in-pack name → final (possibly renamed) agent id.
     let mut id_map: BTreeMap<String, String> = BTreeMap::new();
     let by_name: BTreeMap<&str, &manifest::ExpertAgent> =
@@ -299,12 +311,23 @@ async fn install_native(
                 .cloned()
                 .unwrap_or_default()
         };
+        let placement = Placement {
+            reports_to: &parent_final,
+            suffix: &suffix,
+        };
         if let Some(final_id) =
-            install_one_agent(ctx, dir, agent, &parent_final, report, &mut record).await?
+            install_one_agent(ctx, dir, agent, &placement, &mut book, report, &mut record).await?
         {
             id_map.insert(name.clone(), final_id);
+        } else if e.agents.iter().any(|a| a.reports_to.trim() == name.as_str()) {
+            report.warning(
+                "agents",
+                name,
+                "這位沒有安裝，原本向他回報的成員會變成最上層",
+            );
         }
     }
+    record.agent_ids = id_map.clone();
 
     // ── wiki ──
     let wiki_dir = dir.join("wiki");
@@ -318,40 +341,70 @@ async fn install_native(
     Ok(record)
 }
 
+/// Where one agent lands: its final supervisor and the team-wide id suffix.
+struct Placement<'a> {
+    reports_to: &'a str,
+    suffix: &'a str,
+}
+
+/// The id suffix applied to EVERY member of the pack: `""` when no member's
+/// id is taken; otherwise `-imported` (with `--rename`) or the first free
+/// `-2`, `-3`, … for which no member collides. Reported once.
+fn team_id_suffix(
+    ctx: &InstallCtx,
+    agents: &[manifest::ExpertAgent],
+    report: &mut Report,
+) -> String {
+    let bases: Vec<String> = agents
+        .iter()
+        .map(|a| crate::sanitize_agent_id(&a.name))
+        .filter(|b| crate::is_valid_agent_id(b))
+        .collect();
+    let free = |suffix: &str| {
+        bases.iter().all(|b| {
+            let id = crate::sanitize_agent_id(&format!("{b}{suffix}"));
+            crate::is_valid_agent_id(&id) && !ctx.home.join("agents").join(&id).exists()
+        })
+    };
+    if free("") {
+        return String::new();
+    }
+    let candidates = (if ctx.rename { vec!["-imported".to_string()] } else { Vec::new() })
+        .into_iter()
+        .chain((2..100).map(|n| format!("-{n}")));
+    for suffix in candidates {
+        if free(&suffix) {
+            report.warning(
+                "agents",
+                "id",
+                format!("有成員代號已被使用，整組代號改加「{suffix}」"),
+            );
+            return suffix;
+        }
+    }
+    String::new() // nothing free: per-member conflicts are reported below
+}
+
 /// Scaffold one native pack agent (soul + partial merge + skills).
 async fn install_one_agent(
     ctx: &InstallCtx,
     pack_dir: &Path,
     agent: &manifest::ExpertAgent,
-    reports_to_final: &str,
+    placement: &Placement<'_>,
+    book: &mut duduclaw_core::agent_names::NameBook,
     report: &mut Report,
     record: &mut InstallRecord,
 ) -> Result<Option<String>> {
+    let reports_to_final = placement.reports_to;
     let base = crate::sanitize_agent_id(&agent.name);
     if !crate::is_valid_agent_id(&base) {
         report.skipped("agent", &agent.name, "無法轉為合法 agent id");
         return Ok(None);
     }
-
-    // Conflict / rename resolution.
-    let mut final_id = base.clone();
-    if ctx.home.join("agents").join(&final_id).exists() {
-        if ctx.rename {
-            final_id = crate::sanitize_agent_id(&format!("{base}-imported"));
-            if !crate::is_valid_agent_id(&final_id)
-                || ctx.home.join("agents").join(&final_id).exists()
-            {
-                report.conflict("agent", &base, "重新命名後仍衝突");
-                return Ok(None);
-            }
-        } else {
-            report.conflict(
-                "agent",
-                &base,
-                "同名 agent 已存在（--rename 以 -imported 匯入）",
-            );
-            return Ok(None);
-        }
+    let final_id = crate::sanitize_agent_id(&format!("{base}{}", placement.suffix));
+    if !crate::is_valid_agent_id(&final_id) || ctx.home.join("agents").join(&final_id).exists() {
+        report.conflict("agent", &final_id, "代號已被使用，這位沒有安裝");
+        return Ok(None);
     }
 
     // Persona (DATA) → scan.
@@ -367,11 +420,21 @@ async fn install_one_agent(
         Err(_) => None, // no soul → scaffold default persona
     };
 
-    let display = if agent.display_name.trim().is_empty() {
+    let wanted_display = if agent.display_name.trim().is_empty() {
         agent.name.clone()
     } else {
         agent.display_name.clone()
     };
+    // `@display` and `@id` both route: never reuse a name another employee
+    // answers to.
+    let (display, renamed) = book.unique_display(&wanted_display, &final_id);
+    if renamed {
+        report.warning(
+            "agent-name",
+            &final_id,
+            format!("「{wanted_display}」已被其他員工使用，改叫「{display}」"),
+        );
+    }
     // Normalize to the canonical role string — the roster may use pack-side
     // names (`front_desk`) or free-form casing; writing an unparseable role
     // into agent.toml would brick the agent at registry load. Unknown → worker
@@ -390,11 +453,24 @@ async fn install_one_agent(
             }
         },
     };
-    let trigger = if agent.trigger.trim().is_empty() {
+    let wanted_trigger = if agent.trigger.trim().is_empty() || renamed {
         format!("@{display}")
     } else {
         agent.trigger.clone()
     };
+    let same_as_display =
+        duduclaw_core::agent_names::norm(&wanted_trigger) == duduclaw_core::agent_names::norm(&display);
+    let trigger = if !same_as_display && book.is_taken(&wanted_trigger) {
+        report.warning(
+            "agent-trigger",
+            &final_id,
+            format!("觸發詞「{wanted_trigger}」已被其他員工使用，改用「@{display}」"),
+        );
+        format!("@{display}")
+    } else {
+        wanted_trigger
+    };
+    book.reserve(&trigger);
 
     if ctx.dry_run {
         report.imported("agent", &final_id);
@@ -530,7 +606,7 @@ async fn install_one_agent(
     }
 
     // Install referenced skills into this agent's SKILLS/.
-    install_agent_skills(ctx, pack_dir, agent, &final_id, report).await;
+    install_agent_skills(ctx, pack_dir, agent, &final_id, report, record).await;
 
     // CONTRACT.toml (behavioural red lines).
     install_agent_contract(ctx, pack_dir, agent, &final_id, report);
@@ -561,13 +637,38 @@ fn install_agent_contract(
         report.skipped("contract", final_id, format!("security: {reason}"));
         return;
     }
-    let contract: duduclaw_agent::contract::Contract = match toml::from_str(&raw) {
+    let parsed: duduclaw_agent::contract::Contract = match toml::from_str(&raw) {
         Ok(c) => c,
         Err(e) => {
             report.skipped("contract", final_id, format!("解析失敗: {e}"));
             return;
         }
     };
+    // Same sanitizer as AI-generated teams: `must_not` also blocks channel
+    // replies verbatim, so wildcard / keyword rules and rules that repeat the
+    // employee's own handoff wording are dropped — and reported, not silent.
+    let soul = std::fs::read_to_string(pack_dir.join("agents").join(&agent.name).join("soul.md")).ok();
+    let sanitized =
+        duduclaw_agent::contract_sanitize::sanitize_boundaries(&parsed.boundaries, soul.as_deref());
+    if !sanitized.dropped.is_empty() {
+        let list: Vec<String> = sanitized
+            .dropped
+            .iter()
+            .map(|(rule, why)| format!("「{}」（{}）", truncate(rule, 40), why.zh()))
+            .collect();
+        report.warning(
+            "contract",
+            final_id,
+            format!("略過 {} 條紅線：{}", list.len(), list.join("、")),
+        );
+    }
+    let contract = duduclaw_agent::contract::Contract {
+        boundaries: sanitized.boundaries,
+    };
+    if contract.boundaries.must_not.is_empty() && contract.boundaries.must_always.is_empty() {
+        report.skipped("contract", final_id, "整理後沒有可用的紅線");
+        return;
+    }
     let body = match toml::to_string_pretty(&contract) {
         Ok(b) => b,
         Err(e) => {
@@ -598,6 +699,7 @@ async fn install_agent_skills(
     agent: &manifest::ExpertAgent,
     final_id: &str,
     report: &mut Report,
+    record: &mut InstallRecord,
 ) {
     for skill in &agent.skills {
         let src = pack_dir.join("skills").join(skill);
@@ -621,7 +723,10 @@ async fn install_agent_skills(
             .join("SKILLS")
             .join(skill);
         match copy_dir(&src, &dest) {
-            Ok(()) => report.imported("skill", &format!("{skill} → {final_id}")),
+            Ok(()) => {
+                report.imported("skill", &format!("{skill} → {final_id}"));
+                record.agent_skills.push(format!("{final_id}/{skill}"));
+            }
             Err(err) => report.skipped("skill", skill, format!("複製失敗: {err}")),
         }
     }

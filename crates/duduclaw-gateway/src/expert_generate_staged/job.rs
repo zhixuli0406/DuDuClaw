@@ -174,11 +174,20 @@ impl ProgressSink {
 
 // ─────────────────────────── Registry ───────────────────────────
 
-/// Jobs (generation or install) allowed at once across all drafts — a cost
-/// breaker: one generation is up to ~10 model calls.
+/// Generation jobs allowed at once across all drafts — a cost breaker: one
+/// generation is up to ~10 model calls. Installs hold a slot too (so a
+/// revise cannot swap the pack mid-install) but do not count here.
 pub const MAX_CONCURRENT_JOBS: usize = if cfg!(test) { 64 } else { 3 };
 
+/// What holds a draft's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    Generate,
+    Install,
+}
+
 struct Entry {
+    kind: SlotKind,
     token: u64,
     handle: Option<tokio::task::AbortHandle>,
     cancelled: bool,
@@ -279,19 +288,21 @@ impl Drop for Slot {
 }
 
 /// Reserve the slot for `draft_id`.
-pub fn reserve(draft_id: &str) -> Result<Slot, ReserveError> {
+pub fn reserve(draft_id: &str, kind: SlotKind) -> Result<Slot, ReserveError> {
     static TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     with_registry(|m| {
         if m.contains_key(draft_id) {
             return Err(ReserveError::Busy);
         }
-        if m.len() >= MAX_CONCURRENT_JOBS {
+        let generating = m.values().filter(|e| e.kind == SlotKind::Generate).count();
+        if kind == SlotKind::Generate && generating >= MAX_CONCURRENT_JOBS {
             return Err(ReserveError::TooMany);
         }
         let token = TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         m.insert(
             draft_id.to_string(),
             Entry {
+                kind,
                 token,
                 handle: None,
                 cancelled: false,
@@ -309,19 +320,28 @@ pub fn is_registered(draft_id: &str) -> bool {
     with_registry(|m| m.contains_key(draft_id))
 }
 
-/// Request cancellation of a running job. `false` ⇒ nothing was running in
-/// this process. The job's [`Slot`] records the `cancelled` status when the
-/// aborted task is dropped.
-pub fn abort(draft_id: &str) -> bool {
+/// What [`abort`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortOutcome {
+    Cancelled,
+    /// The draft is being installed; installs are not cancellable.
+    Installing,
+    NotRunning,
+}
+
+/// Request cancellation of a running generation. The job's [`Slot`] records
+/// the `cancelled` status when the aborted task is dropped.
+pub fn abort(draft_id: &str) -> AbortOutcome {
     with_registry(|m| match m.get_mut(draft_id) {
+        Some(e) if e.kind == SlotKind::Install => AbortOutcome::Installing,
         Some(e) => {
             e.cancelled = true;
             if let Some(h) = &e.handle {
                 h.abort();
             }
-            true
+            AbortOutcome::Cancelled
         }
-        None => false,
+        None => AbortOutcome::NotRunning,
     })
 }
 
@@ -346,12 +366,12 @@ mod tests {
     #[test]
     fn registry_reserve_is_exclusive_and_drop_frees() {
         let id = format!("test-{}", uuid::Uuid::new_v4());
-        let slot = reserve(&id).unwrap();
-        assert_eq!(reserve(&id).err(), Some(ReserveError::Busy));
+        let slot = reserve(&id, SlotKind::Generate).unwrap();
+        assert_eq!(reserve(&id, SlotKind::Generate).err(), Some(ReserveError::Busy));
         assert!(is_registered(&id));
         drop(slot);
         assert!(!is_registered(&id));
-        assert!(!abort(&id), "nothing to abort after release");
+        assert_eq!(abort(&id), AbortOutcome::NotRunning, "nothing to abort after release");
     }
 
     #[test]
@@ -359,26 +379,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = format!("test-{}", uuid::Uuid::new_v4());
         write_job(dir.path(), &JobRecord::new("generate")).unwrap();
-        let slot = reserve(&id).unwrap().finalize_record_in(dir.path().to_path_buf());
-        assert!(abort(&id));
+        let slot = reserve(&id, SlotKind::Generate).unwrap().finalize_record_in(dir.path().to_path_buf());
+        assert_eq!(abort(&id), AbortOutcome::Cancelled);
         drop(slot);
         assert_eq!(read_job(dir.path()).unwrap().status, JobStatus::Cancelled);
 
         // Not cancelled (e.g. a panic) ⇒ failed; a finished record is kept.
         write_job(dir.path(), &JobRecord::new("revise")).unwrap();
-        drop(reserve(&id).unwrap().finalize_record_in(dir.path().to_path_buf()));
+        drop(reserve(&id, SlotKind::Generate).unwrap().finalize_record_in(dir.path().to_path_buf()));
         assert_eq!(read_job(dir.path()).unwrap().status, JobStatus::Failed);
         let done = JobRecord { status: JobStatus::Done, ..JobRecord::new("revise") };
         write_job(dir.path(), &done).unwrap();
-        drop(reserve(&id).unwrap().finalize_record_in(dir.path().to_path_buf()));
+        drop(reserve(&id, SlotKind::Generate).unwrap().finalize_record_in(dir.path().to_path_buf()));
         assert_eq!(read_job(dir.path()).unwrap().status, JobStatus::Done);
+    }
+
+    #[test]
+    fn installs_are_not_cancellable_and_not_counted_as_generations() {
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        let slot = reserve(&id, SlotKind::Install).unwrap();
+        assert_eq!(abort(&id), AbortOutcome::Installing);
+        assert!(is_registered(&id), "install keeps its slot");
+        drop(slot);
     }
 
     #[tokio::test]
     async fn cancel_before_attach_still_aborts_the_task() {
         let id = format!("test-{}", uuid::Uuid::new_v4());
-        let slot = reserve(&id).unwrap();
-        assert!(abort(&id));
+        let slot = reserve(&id, SlotKind::Generate).unwrap();
+        assert_eq!(abort(&id), AbortOutcome::Cancelled);
         let task = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(30)).await });
         slot.attach(task.abort_handle());
         assert!(task.await.unwrap_err().is_cancelled());
@@ -393,7 +422,7 @@ mod tests {
         assert_eq!(rec.status, JobStatus::Failed);
         assert!(rec.error.contains("中斷"));
         // While registered it still reads as running.
-        let slot = reserve(&id).unwrap();
+        let slot = reserve(&id, SlotKind::Generate).unwrap();
         assert_eq!(effective_job(dir.path(), &id).unwrap().status, JobStatus::Running);
         drop(slot);
     }

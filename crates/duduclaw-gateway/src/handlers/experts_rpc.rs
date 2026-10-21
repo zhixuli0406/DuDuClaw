@@ -27,7 +27,7 @@ impl MethodHandler {
                     "version": r.version,
                     "description": r.description,
                     "agents": r.agents,
-                    "skills_count": r.global_skills.len(),
+                    "skills_count": r.skills_count(),
                     "wiki_count": r.wiki_files.len(),
                     "installed_at": r.installed_at,
                     // null ⇒ the pack ships no managed hooks.

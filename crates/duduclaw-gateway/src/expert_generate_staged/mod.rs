@@ -25,6 +25,7 @@ pub mod example;
 pub mod job;
 pub mod prompts;
 pub mod report;
+pub mod runner;
 pub mod schema;
 
 #[cfg(test)]
@@ -67,13 +68,34 @@ impl Stage {
     }
 }
 
+/// One model reply and how it was produced.
+#[derive(Debug, Clone)]
+pub struct StageReply {
+    pub text: String,
+    /// The call ran with `WebSearch` available (knowledge-base research).
+    pub web_search: bool,
+    /// The Claude CLI failed and the tool-less Direct API answered.
+    pub fallback: bool,
+}
+
+impl StageReply {
+    /// A plain reply (tests, tool-less paths).
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            web_search: false,
+            fallback: false,
+        }
+    }
+}
+
 /// One model call. Implementations: the rotated Claude CLI with Direct API
-/// fallback (`handlers::experts_rpc`), and canned replies in tests.
+/// fallback (`runner::RotatedStageLlm`), and canned replies in tests.
 // `async_trait` expands to a boxed future the lint already treats as must-use.
 #[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait StageLlm: Send + Sync {
-    async fn complete(&self, stage: Stage, system: &str, user: &str) -> Result<String, String>;
+    async fn complete(&self, stage: Stage, system: &str, user: &str) -> Result<StageReply, String>;
 }
 
 /// Inputs for one staged run.
@@ -178,8 +200,12 @@ async fn run_roster(
             let raw = llm
                 .complete(Stage::Roster, &system, &user)
                 .await
-                .map_err(AttemptError::Transport)?;
+                .map_err(AttemptError::Transport)?
+                .text;
             let plan = schema::parse_roster(&raw).map_err(|e| AttemptError::Invalid(vec![e]))?;
+            // Member ids are prefixed with the team slug so two generated
+            // teams never reuse each other's ids.
+            let plan = schema::prefix_member_names(plan);
             let problems = schema::validate_roster(&plan, input.req.team_size);
             if problems.is_empty() {
                 Ok(plan)
@@ -216,7 +242,8 @@ async fn run_member(
             let raw = llm
                 .complete(Stage::Member, &system, &user)
                 .await
-                .map_err(AttemptError::Transport)?;
+                .map_err(AttemptError::Transport)?
+                .text;
             let mc = schema::parse_member(&raw).map_err(|e| AttemptError::Invalid(vec![e]))?;
             schema::validate_member(member, mc).map_err(AttemptError::Invalid)
         }
@@ -224,11 +251,18 @@ async fn run_member(
     .await
 }
 
+/// The knowledge base plus how the accepted reply was produced.
+struct WikiOutcome {
+    pages: Vec<GeneratedWiki>,
+    web_search: bool,
+    fallback: bool,
+}
+
 async fn run_wiki(
     llm: &dyn StageLlm,
     input: &StagedRequest<'_>,
     plan: &RosterPlan,
-) -> Result<Vec<GeneratedWiki>, String> {
+) -> Result<WikiOutcome, String> {
     let prior = input.prior.map(|p| prompts::prior_wiki_digest(&p.wiki));
     twice(|errors| {
         let (system, user) = prompts::wiki_prompt(
@@ -240,12 +274,27 @@ async fn run_wiki(
             input.req.research,
         );
         async move {
-            let raw = llm
+            let reply = llm
                 .complete(Stage::Wiki, &system, &user)
                 .await
                 .map_err(AttemptError::Transport)?;
-            let bundle = schema::parse_wiki(&raw).map_err(|e| AttemptError::Invalid(vec![e]))?;
-            schema::validate_wiki(&bundle).map_err(AttemptError::Invalid)
+            let bundle =
+                schema::parse_wiki(&reply.text).map_err(|e| AttemptError::Invalid(vec![e]))?;
+            let pages = schema::validate_wiki(&bundle).map_err(AttemptError::Invalid)?;
+            // Pages written with web search available are marked so the
+            // operator must review them before install.
+            let pages = pages
+                .into_iter()
+                .map(|p| GeneratedWiki {
+                    web_research: reply.web_search,
+                    ..p
+                })
+                .collect();
+            Ok(WikiOutcome {
+                pages,
+                web_search: reply.web_search,
+                fallback: reply.fallback,
+            })
         }
     })
     .await
@@ -253,7 +302,7 @@ async fn run_wiki(
 
 enum ContentOutcome {
     Member(usize, Result<MemberContent, String>),
-    Wiki(Result<Vec<GeneratedWiki>, String>),
+    Wiki(Result<WikiOutcome, String>),
 }
 
 type ContentFuture<'a> = Pin<Box<dyn Future<Output = ContentOutcome> + Send + 'a>>;
@@ -312,14 +361,18 @@ pub async fn run_staged(
         .collect()
         .await;
 
-    assemble(&plan, outcomes)
+    assemble(&plan, outcomes, input.req.research)
 }
 
 /// Merge stage outcomes into one pack (pure).
-fn assemble(plan: &RosterPlan, outcomes: Vec<ContentOutcome>) -> Result<StagedResult, String> {
+fn assemble(
+    plan: &RosterPlan,
+    outcomes: Vec<ContentOutcome>,
+    research: bool,
+) -> Result<StagedResult, String> {
     let mut contents: Vec<Option<Result<MemberContent, String>>> =
         (0..plan.members.len()).map(|_| None).collect();
-    let mut wiki: Result<Vec<GeneratedWiki>, String> = Err("未執行".to_string());
+    let mut wiki: Result<WikiOutcome, String> = Err("未執行".to_string());
     for o in outcomes {
         match o {
             ContentOutcome::Member(i, r) => {
@@ -362,13 +415,25 @@ fn assemble(plan: &RosterPlan, outcomes: Vec<ContentOutcome>) -> Result<StagedRe
             duduclaw_core::truncate_chars(&notes.join("；"), 600)
         ));
     }
-    let wiki = wiki.unwrap_or_else(|e| {
-        notes.push(format!(
-            "知識庫生成失敗（{}），這版草稿沒有知識庫頁面，建議重新生成",
-            duduclaw_core::truncate_chars(&e, 160)
-        ));
-        Vec::new()
-    });
+    let wiki = match wiki {
+        Ok(w) => {
+            if research && w.fallback {
+                notes.push(
+                    "知識庫改由備援模型撰寫，這次沒有上網搜尋，內容只來自模型既有知識".to_string(),
+                );
+            } else if research && w.web_search {
+                notes.push("知識庫用到網路搜尋，安裝前請先看過標示的頁面".to_string());
+            }
+            w.pages
+        }
+        Err(e) => {
+            notes.push(format!(
+                "知識庫生成失敗（{}），這版草稿沒有知識庫頁面，建議重新生成",
+                duduclaw_core::truncate_chars(&e, 160)
+            ));
+            Vec::new()
+        }
+    };
 
     Ok(StagedResult {
         pack: GeneratedPack {
@@ -394,7 +459,9 @@ const MAX_SUMMARY_CHARS: usize = 200;
 /// messages. `@` + the display name without whitespace, like the built-in
 /// team converter.
 fn derive_trigger(display_name: &str, name: &str) -> String {
-    let base: String = display_name.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect();
+    // Letters and digits only (CJK included): no leading `@`, punctuation or
+    // symbols, so a model display name like 「@@all」 cannot become `@@all`.
+    let base: String = display_name.chars().filter(|c| c.is_alphanumeric()).collect();
     let base = if base.is_empty() { name.to_string() } else { base };
     format!("@{base}")
 }

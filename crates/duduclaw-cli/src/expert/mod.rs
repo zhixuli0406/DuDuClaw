@@ -544,7 +544,7 @@ fn cmd_list(home: &Path, json: bool) -> Result<()> {
         println!(
             "      agents: {} · skills: {} · wiki: {}",
             r.agents.len(),
-            r.global_skills.len(),
+            r.skills_count(),
             r.wiki_files.len()
         );
     }

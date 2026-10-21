@@ -424,6 +424,89 @@ reports_to = "shop-front"
     assert!(!agents.join("shop-front/CONTRACT.toml").exists());
 }
 
+/// A pack whose ids, display names and triggers collide with an existing
+/// team: the whole new team moves to `-2` ids with `reports_to` intact,
+/// colliding display names become 「名稱（代號）」 and the trigger follows,
+/// third-party keyword / wildcard red lines are dropped (reported), and the
+/// record maps names to ids and counts per-employee skills.
+#[tokio::test]
+async fn colliding_team_is_renamed_consistently_and_red_lines_sanitized() {
+    let home = TempTree::new("home");
+    // An existing team already owns the ids, the display name and a trigger.
+    for (id, display, trigger) in [("shop-front", "總機", "@總機"), ("shop-returns", "退貨", "@退貨")] {
+        write(
+            &home.path().join(format!("agents/{id}/agent.toml")),
+            &format!("[agent]\nname = \"{id}\"\ndisplay_name = \"{display}\"\ntrigger = \"{trigger}\"\n"),
+        );
+    }
+    let pack = TempTree::new("team2");
+    let dir = pack.path();
+    write(
+        &dir.join("expert.toml"),
+        r#"
+[expert]
+name = "shop2-team"
+description = "第二個商店團隊"
+version = "0.1.0"
+
+[[expert.agents]]
+name = "shop-front"
+role = "front_desk"
+display_name = "總機"
+skills = ["shop-dispatch"]
+
+[[expert.agents]]
+name = "shop-returns"
+role = "worker"
+display_name = "退換貨"
+trigger = "@退貨"
+reports_to = "shop-front"
+skills = ["shop-returns-intake"]
+"#,
+    );
+    for agent in ["shop-front", "shop-returns"] {
+        write(&dir.join(format!("agents/{agent}/soul.md")), "# 員工\n\n## 升級真人\n我會說：這部分需要轉給店長確認後回覆您。\n");
+    }
+    write(
+        &dir.join("agents/shop-returns/CONTRACT.toml"),
+        "[boundaries]\nmust_not = [\"*\", \"退款\", \"這部分需要轉給店長確認後回覆您\", \"替客戶決定要不要退費或承諾退費金額\"]\n",
+    );
+    write(&dir.join("agents/shop-front/CONTRACT.toml"), "[boundaries]\nmust_not = [\"*\", \"錢\"]\n");
+    for skill in ["shop-dispatch", "shop-returns-intake"] {
+        write(
+            &dir.join(format!("skills/{skill}/SKILL.md")),
+            &format!("---\nname: {skill}\ndescription: 作業\n---\n\n1. 確認資料\n"),
+        );
+    }
+
+    cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None)
+        .await
+        .expect("install should succeed");
+
+    let agents = home.path().join("agents");
+    // Whole team suffixed; the old team untouched.
+    assert!(agents.join("shop-front-2/agent.toml").is_file());
+    assert!(agents.join("shop-returns-2/agent.toml").is_file());
+    let returns = std::fs::read_to_string(agents.join("shop-returns-2/agent.toml")).unwrap();
+    assert!(returns.contains("reports_to = \"shop-front-2\""), "{returns}");
+    // Collisions renamed; the trigger never shares a name with another employee.
+    let front = std::fs::read_to_string(agents.join("shop-front-2/agent.toml")).unwrap();
+    assert!(front.contains("display_name = \"總機（shop-front-2）\""), "{front}");
+    assert!(front.contains("trigger = \"@總機（shop-front-2）\""), "{front}");
+    assert!(returns.contains("display_name = \"退換貨\""));
+    assert!(returns.contains("trigger = \"@退換貨\""), "{returns}");
+    // Red lines sanitized: wildcard, keyword and own-handoff wording dropped.
+    let c = duduclaw_agent::contract::load_contract(&agents.join("shop-returns-2"));
+    assert_eq!(c.boundaries.must_not, vec!["替客戶決定要不要退費或承諾退費金額".to_string()]);
+    // Nothing usable left → no contract at all (not an empty one).
+    assert!(!agents.join("shop-front-2/CONTRACT.toml").exists());
+    // Record: name → id map and per-employee skills.
+    let rec = list_records(home.path()).into_iter().find(|r| r.slug == "shop2-team").unwrap();
+    assert_eq!(rec.agent_ids.get("shop-front").map(String::as_str), Some("shop-front-2"));
+    assert_eq!(rec.agent_skills.len(), 2);
+    assert_eq!(rec.skills_count(), 2);
+}
+
 // ─────────────────── hooks ApprovalBroker lifecycle ───────────────────
 
 /// Build a minimal Claude-plugin pack carrying one hook.

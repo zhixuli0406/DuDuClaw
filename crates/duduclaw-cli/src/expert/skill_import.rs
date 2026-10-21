@@ -75,6 +75,8 @@ pub(super) async fn install(
         agents: Vec::new(),
         global_skills: Vec::new(),
         wiki_files: Vec::new(),
+        agent_skills: Vec::new(),
+        agent_ids: Default::default(),
         installed_at: now_iso(),
         source_format: String::new(),
     };

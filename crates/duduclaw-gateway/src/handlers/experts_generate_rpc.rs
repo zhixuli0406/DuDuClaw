@@ -13,197 +13,15 @@
 use super::*;
 
 use crate::expert_generate as eg;
-use crate::expert_generate_staged::{self as staged, Stage, StageLlm, job};
+use crate::expert_generate_staged::{self as staged, job};
 
-/// Whole-job deadline (all stages). A circuit breaker, not an expectation:
-/// a full 8-member team at concurrency 2 is ~5 waves of model calls.
-const JOB_DEADLINE_SECS: u64 = 25 * 60;
-/// Direct API per-request deadline for the long content stages.
-const STAGE_HTTP_TIMEOUT_SECS: u64 = 300;
-
-/// Rotated Claude CLI (subscription first) → Direct API fallback, per stage.
-/// Zero tools, except the knowledge-base stage may use `WebSearch` when the
-/// operator opted in (`research`).
-struct RotatedStageLlm {
-    home_dir: std::path::PathBuf,
-    research: bool,
-}
-
-#[async_trait::async_trait]
-impl StageLlm for RotatedStageLlm {
-    async fn complete(&self, stage: Stage, system: &str, user: &str) -> Result<String, String> {
-        let caps = if self.research && stage == Stage::Wiki {
-            crate::night_llm::research_capabilities()
-        } else {
-            crate::night_llm::night_capabilities()
-        };
-        let model = eg::GENERATE_MODEL;
-        let cli_err = match crate::channel_reply::call_claude_cli_rotated(
-            user,
-            model,
-            system,
-            &self.home_dir,
-            None,
-            None,
-            Some(&caps),
-            None,
-            &[],
-            // System-level utility call, not an agent turn — no account pool.
-            &[],
-            None,
-        )
-        .await
-        {
-            Ok(text) if !text.trim().is_empty() => return Ok(text),
-            Ok(_) => "empty CLI response".to_string(),
-            Err(e) => duduclaw_core::truncate_chars(&e, 200),
-        };
-        let api_key = crate::claude_runner::get_api_key_from_home(&self.home_dir).await;
-        if api_key.is_empty() {
-            return Err(format!("（{cli_err}），且未設定 API key 可作備援"));
-        }
-        let limits = crate::direct_api::RequestLimits {
-            max_tokens: stage.max_tokens(),
-            timeout: Some(std::time::Duration::from_secs(STAGE_HTTP_TIMEOUT_SECS)),
-        };
-        match crate::direct_api::call_direct_api_with_limits(&api_key, model, system, user, limits)
-            .await
-        {
-            Ok(resp) if !resp.text.trim().is_empty() => Ok(resp.text),
-            Ok(_) => Err("模型回傳空內容".into()),
-            Err(e) => Err(duduclaw_core::truncate_chars(&e, 200)),
-        }
-    }
-}
-
-/// Everything one background job needs (owned: it outlives the RPC).
-struct JobSpec {
-    home_dir: std::path::PathBuf,
-    draft_id: String,
-    kind: &'static str,
-    req: eg::GenerateRequest,
-    /// `Some` on revise: the state the new round builds on.
-    prior_state: Option<eg::DraftState>,
-    prior_pack: Option<eg::GeneratedPack>,
-    feedback: Option<String>,
-}
-
-/// Materialize into `<draft>/pack-next`, validate, then swap it in — a
-/// failed or cancelled round never destroys the previous draft pack.
-fn materialize_and_swap(home: &std::path::Path, draft_id: &str, pack: &eg::GeneratedPack) -> Result<(), String> {
-    let draft_dir = eg::draft_dir(home, draft_id)?;
-    let next = draft_dir.join("pack-next");
-    eg::materialize_draft(&next, pack)?;
-    let problems = eg::validate_draft_pack(&next);
-    if !problems.is_empty() {
-        let _ = std::fs::remove_dir_all(&next);
-        return Err(format!(
-            "草稿未通過驗證：{}",
-            duduclaw_core::truncate_chars(&problems.join("；"), 600)
-        ));
-    }
-    let live = eg::draft_pack_dir(home, draft_id)?;
-    let prev = draft_dir.join("pack-prev");
-    if prev.exists() {
-        std::fs::remove_dir_all(&prev).map_err(|e| format!("替換草稿失敗: {e}"))?;
-    }
-    let had_live = live.exists();
-    if had_live {
-        std::fs::rename(&live, &prev).map_err(|e| format!("替換草稿失敗: {e}"))?;
-    }
-    if let Err(e) = std::fs::rename(&next, &live) {
-        // Roll back so the previous round stays installable.
-        if had_live {
-            let _ = std::fs::rename(&prev, &live);
-        }
-        return Err(format!("替換草稿失敗: {e}"));
-    }
-    if had_live && let Err(e) = std::fs::remove_dir_all(&prev) {
-        warn!(error = %e, "expert draft: could not remove the previous round");
-    }
-    Ok(())
-}
-
-/// Result payload shared by the generate/revise/status responses.
-fn draft_payload(home: &std::path::Path, state: &eg::DraftState, status: job::JobStatus) -> Value {
-    json!({
-        "draft_id": state.draft_id,
-        "status": status,
-        "rounds": state.rounds,
-        "rounds_left": state.rounds_left(),
-        "notes": state.notes,
-        "preview": eg::draft_preview_json(home, state),
-    })
-}
-
-async fn run_job(spec: JobSpec, llm: &dyn StageLlm) -> Result<Value, String> {
-    let draft_dir = eg::draft_dir(&spec.home_dir, &spec.draft_id)?;
-    let sink = job::ProgressSink::new(draft_dir, job::JobRecord::new(spec.kind));
-    sink.update(|_| {});
-    let input = staged::StagedRequest {
-        req: &spec.req,
-        installed_example: eg::example_pack_snippet(&spec.home_dir),
-        prior: spec.prior_pack.as_ref(),
-        feedback: spec.feedback.as_deref(),
-    };
-    let deadline = std::time::Duration::from_secs(JOB_DEADLINE_SECS);
-    let outcome = match tokio::time::timeout(deadline, staged::run_staged(llm, &input, &sink)).await {
-        Ok(r) => r,
-        Err(_) => Err(format!("生成逾時（超過 {} 分鐘），已停止", JOB_DEADLINE_SECS / 60)),
-    };
-    let finished = outcome.and_then(|res| {
-        sink.update(|r| r.progress.assemble = job::StepStatus::Running);
-        materialize_and_swap(&spec.home_dir, &spec.draft_id, &res.pack)?;
-        let now = crate::expert_admin::now_iso();
-        let state = match spec.prior_state.clone() {
-            Some(prev) => eg::DraftState {
-                rounds: prev.rounds + 1,
-                updated_at: now,
-                last_generation: serde_json::to_string(&res.pack).unwrap_or_default(),
-                notes: res.notes.clone(),
-                ..prev
-            },
-            None => eg::DraftState {
-                draft_id: spec.draft_id.clone(),
-                request: spec.req.clone(),
-                rounds: 1,
-                created_at: now.clone(),
-                updated_at: now,
-                last_generation: serde_json::to_string(&res.pack).unwrap_or_default(),
-                notes: res.notes.clone(),
-            },
-        };
-        eg::write_draft_state(&spec.home_dir, &state)?;
-        Ok(state)
-    });
-    match finished {
-        Ok(state) => {
-            let status = if state.notes.is_empty() {
-                job::JobStatus::Done
-            } else {
-                job::JobStatus::Partial
-            };
-            sink.update(|r| {
-                r.progress.assemble = job::StepStatus::Done;
-                r.status = status;
-                r.notes = state.notes.clone();
-            });
-            Ok(draft_payload(&spec.home_dir, &state, status))
-        }
-        Err(e) => {
-            sink.update(|r| {
-                if r.progress.assemble == job::StepStatus::Running {
-                    r.progress.assemble = job::StepStatus::Failed;
-                }
-                r.status = job::JobStatus::Failed;
-                r.error = duduclaw_core::truncate_chars(&e, 800);
-            });
-            Err(e)
-        }
-    }
-}
+use staged::runner::{JobSpec, RotatedStageLlm, draft_payload, run_job};
 
 impl MethodHandler {
+    fn generation_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(staged::runner::deadline_minutes(&self.home_dir) * 60)
+    }
+
     /// Spawn one job (slot already reserved by the caller), then either
     /// return at once (`background`) or wait for it.
     async fn start_generation_job(
@@ -272,7 +90,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
         let draft_id = uuid::Uuid::new_v4().to_string();
-        let slot = match job::reserve(&draft_id) {
+        let slot = match job::reserve(&draft_id, job::SlotKind::Generate) {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", e.message()),
         };
@@ -284,6 +102,7 @@ impl MethodHandler {
             prior_state: None,
             prior_pack: None,
             feedback: None,
+            deadline: self.generation_deadline(),
         };
         self.start_generation_job(slot, spec, background, "專家包生成失敗").await
     }
@@ -306,7 +125,7 @@ impl MethodHandler {
         }
         // Reserve first, then read: a round that finished in between can
         // never be built on stale state (round counter, prior content).
-        let slot = match job::reserve(draft_id) {
+        let slot = match job::reserve(draft_id, job::SlotKind::Generate) {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", e.message()),
         };
@@ -331,6 +150,7 @@ impl MethodHandler {
             prior_state: Some(state),
             prior_pack,
             feedback: Some(feedback.to_string()),
+            deadline: self.generation_deadline(),
         };
         self.start_generation_job(slot, spec, background, "重新生成失敗").await
     }
@@ -381,8 +201,20 @@ impl MethodHandler {
         }
         // The job's own slot records `cancelled` when the aborted task is
         // dropped; this handler never writes the record itself.
-        let cancelled = job::abort(draft_id);
-        WsFrame::ok_response("", json!({ "cancelled": cancelled }))
+        let outcome = job::abort(draft_id);
+        WsFrame::ok_response(
+            "",
+            json!({
+                "cancelled": outcome == job::AbortOutcome::Cancelled,
+                // `installing`: installs cannot be cancelled; `not_running`:
+                // nothing was running in this gateway process.
+                "state": match outcome {
+                    job::AbortOutcome::Cancelled => "cancelled",
+                    job::AbortOutcome::Installing => "installing",
+                    job::AbortOutcome::NotRunning => "not_running",
+                },
+            }),
+        )
     }
 
     /// `experts.install_draft` — install a generated draft through the FULL
@@ -398,7 +230,7 @@ impl MethodHandler {
         };
         // Hold the draft's slot for the whole install, so a revise cannot
         // swap the pack while the installer is reading it.
-        let _slot = match job::reserve(draft_id) {
+        let _slot = match job::reserve(draft_id, job::SlotKind::Install) {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", e.message()),
         };
@@ -419,6 +251,16 @@ impl MethodHandler {
         if let Err(e) = eg::ensure_no_hooks(pack_dir) {
             return WsFrame::error_response("", &e);
         }
+        // Pages written with web search may carry outside content: the
+        // operator must confirm they reviewed them (fail closed).
+        if staged::report::has_web_research_pages(pack_dir)
+            && params.get("reviewed_web_pages").and_then(|v| v.as_bool()) != Some(true)
+        {
+            return WsFrame::error_response(
+                "",
+                "這份草稿有用網路搜尋寫的知識庫頁面，請先在預覽中看過並勾選確認後再安裝",
+            );
+        }
         let mut args = vec!["install".into(), pack_dir.as_os_str().to_os_string()];
         match Self::attach_under_args(params) {
             Ok(extra) => args.extend(extra),
@@ -438,14 +280,10 @@ impl MethodHandler {
         match self.spawn_pack_cli(&args, 300).await {
             Ok(output) => {
                 let record = slug.and_then(|s| crate::expert_admin::read_record(&self.home_dir, &s));
-                let (agents, wiki) = record
-                    .map(|r| (r.agents, r.wiki_files))
-                    .unwrap_or_default();
                 let placement = staged::report::placement_report(
                     &self.home_dir,
                     pack_dir,
-                    &agents,
-                    &wiki,
+                    record.as_ref(),
                     &preexisting,
                 );
                 if let Ok(dir) = eg::draft_dir(&self.home_dir, draft_id) {

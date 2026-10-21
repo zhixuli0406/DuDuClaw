@@ -48,6 +48,10 @@ pub const MAX_DESCRIPTION_CHARS: usize = 2000;
 /// convention as `tmp/expert-uploads`).
 pub const DRAFT_TTL_SECS: u64 = 24 * 3600;
 
+/// Grace period before a first round that failed / was cancelled (no draft,
+/// only its progress record) is swept.
+pub const FAILED_DRAFT_GRACE_SECS: u64 = 10 * 60;
+
 /// Roster size bounds for a generated team.
 pub const MIN_TEAM_SIZE: usize = 1;
 pub const MAX_TEAM_SIZE: usize = 8;
@@ -563,13 +567,20 @@ pub fn cleanup_expired_drafts(home: &Path) -> usize {
         return 0;
     };
     for entry in rd.flatten() {
-        let stale = entry
+        let age = entry
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .map(|d| d.as_secs() > DRAFT_TTL_SECS)
-            .unwrap_or(false);
+            .map(|d| d.as_secs());
+        // A first round that failed or was cancelled left no draft — only
+        // its progress record. It is swept after a short grace period (long
+        // enough for the dashboard to read the final status), not after 24 h.
+        let failed_shell = !entry.path().join("draft.json").exists()
+            && crate::expert_generate_staged::job::read_job(&entry.path())
+                .is_some_and(|r| r.status.is_terminal());
+        let ttl = if failed_shell { FAILED_DRAFT_GRACE_SECS } else { DRAFT_TTL_SECS };
+        let stale = age.is_some_and(|a| a > ttl);
         // Never sweep a draft whose job (generation or install) is live.
         let live = entry
             .file_name()
@@ -715,7 +726,17 @@ pub struct GeneratedWiki {
     /// `sop` / `glossary` / `compliance` / `faq` / `other` (informational).
     #[serde(default)]
     pub kind: String,
+    /// Written while web search was available: the page carries
+    /// [`WEB_RESEARCH_MARKER`] and install requires the operator to confirm
+    /// they reviewed it.
+    #[serde(default)]
+    pub web_research: bool,
 }
+
+/// First line under the title of a page written with web search available.
+/// The preview and install read the marker from the materialized page.
+pub const WEB_RESEARCH_MARKER: &str =
+    "> 本頁撰寫時有使用網路搜尋，內容可能來自外部網站，安裝前請先核對。";
 
 /// Reduce a model response to the JSON object it should contain: strip a
 /// markdown fence, then cut prose before the first `{` / after the last `}`
@@ -927,6 +948,10 @@ pub fn materialize_draft(pack_dir: &Path, gp: &GeneratedPack) -> Result<(), Stri
         // `## ` sections still gets its title heading.
         if !title.is_empty() && !page.content.trim_start().starts_with("# ") {
             content.push_str(&format!("# {title}\n\n"));
+        }
+        if page.web_research {
+            content.push_str(WEB_RESEARCH_MARKER);
+            content.push_str("\n\n");
         }
         content.push_str(page.content.trim());
         content.push('\n');
@@ -1372,6 +1397,7 @@ mod tests {
                 title: "接單 SOP".into(),
                 content: "1. 確認品項\n2. 出處：https://law.moj.gov.tw/x.aspx?pcode=A1\n".into(),
                 kind: "sop".into(),
+                web_research: false,
             }],
         }
     }
@@ -1648,6 +1674,28 @@ mod tests {
         assert!(fresh.exists(), "fresh draft survives");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_first_rounds_are_swept_after_a_short_grace() {
+        use crate::expert_generate_staged::job::{JobRecord, JobStatus, write_job};
+        let home = tempfile::tempdir().unwrap();
+        let backdate = |dir: &Path| {
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(FAILED_DRAFT_GRACE_SECS + 60);
+            std::fs::File::open(dir).unwrap().set_modified(t).unwrap();
+        };
+        let failed = drafts_dir(home.path()).join("failed-shell");
+        let rec = JobRecord { status: JobStatus::Failed, ..JobRecord::new("generate") };
+        write_job(&failed, &rec).unwrap();
+        backdate(&failed);
+        let kept = drafts_dir(home.path()).join("real-draft");
+        write_job(&kept, &rec).unwrap();
+        std::fs::write(kept.join("draft.json"), "{}").unwrap();
+        backdate(&kept);
+        assert_eq!(cleanup_expired_drafts(home.path()), 1);
+        assert!(!failed.exists(), "failed shell swept");
+        assert!(kept.exists(), "a draft with content keeps its 24 h");
+    }
+
     // ── catalog ──
 
     /// Minimal premium fixture: one team + kit + pack (mirrors the
@@ -1715,6 +1763,8 @@ reason = "本店未設帳務職"
             agents: vec!["foo-assistant".into(), "foo-docs".into()],
             global_skills: vec![],
             wiki_files: vec![],
+            agent_skills: Vec::new(),
+            agent_ids: Default::default(),
             installed_at: crate::expert_admin::now_iso(),
             source_format: String::new(),
         }];
@@ -1852,6 +1902,8 @@ reason = "本店未設帳務職"
             agents: vec!["foo-assistant".into(), "foo-docs".into()],
             global_skills: vec![],
             wiki_files: vec![],
+            agent_skills: Vec::new(),
+            agent_ids: Default::default(),
             installed_at: crate::expert_admin::now_iso(),
             source_format: String::new(),
         }];
@@ -2000,6 +2052,8 @@ department = "設計"
             agents: vec!["drafter".into()],
             global_skills: vec![],
             wiki_files: vec![],
+            agent_skills: Vec::new(),
+            agent_ids: Default::default(),
             installed_at: crate::expert_admin::now_iso(),
             source_format: String::new(),
         }];

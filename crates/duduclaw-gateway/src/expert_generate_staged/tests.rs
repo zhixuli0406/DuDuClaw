@@ -99,6 +99,9 @@ struct Canned {
     calls: Mutex<Vec<(Stage, String)>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    /// Simulate how the wiki reply was produced.
+    wiki_web_search: bool,
+    wiki_fallback: bool,
 }
 
 impl Canned {
@@ -135,7 +138,7 @@ impl Canned {
 
 #[async_trait::async_trait]
 impl StageLlm for Canned {
-    async fn complete(&self, stage: Stage, _system: &str, user: &str) -> Result<String, String> {
+    async fn complete(&self, stage: Stage, _system: &str, user: &str) -> Result<StageReply, String> {
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         self.calls.lock().unwrap().push((stage, user.to_string()));
@@ -150,12 +153,19 @@ impl StageLlm for Canned {
             }
         };
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        out
+        out.map(|text| StageReply {
+            text,
+            web_search: stage == Stage::Wiki && self.wiki_web_search,
+            fallback: stage == Stage::Wiki && self.wiki_fallback,
+        })
     }
 }
 
 async fn run(llm: &Canned, size: usize) -> (Result<StagedResult, String>, ProgressSink) {
-    let req = request(size);
+    run_with(llm, request(size)).await
+}
+
+async fn run_with(llm: &Canned, req: GenerateRequest) -> (Result<StagedResult, String>, ProgressSink) {
     let input = StagedRequest {
         req: &req,
         installed_example: None,
@@ -345,6 +355,103 @@ fn skill_descriptions_cannot_break_frontmatter() {
     assert_eq!(meta.description, "分派: 規則 name: evil");
 }
 
+#[tokio::test]
+async fn research_pages_are_marked_and_fallback_is_noted() {
+    let mut req = request(2);
+    req.research = true;
+    let llm = Canned { wiki_web_search: true, ..Canned::happy(2) };
+    let (res, _) = run_with(&llm, req.clone()).await;
+    let res = res.unwrap();
+    assert!(res.pack.wiki.iter().all(|w| w.web_research));
+    assert!(res.notes.iter().any(|n| n.contains("網路搜尋")), "{:?}", res.notes);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("pack");
+    eg::materialize_draft(&dir, &res.pack).unwrap();
+    assert!(report::has_web_research_pages(&dir));
+
+    // CLI failed → tool-less Direct API wrote the wiki: no marking, a note.
+    let llm = Canned { wiki_fallback: true, ..Canned::happy(2) };
+    let (res, _) = run_with(&llm, req).await;
+    let res = res.unwrap();
+    assert!(res.pack.wiki.iter().all(|w| !w.web_research));
+    assert!(res.notes.iter().any(|n| n.contains("備援")), "{:?}", res.notes);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("pack");
+    eg::materialize_draft(&dir, &res.pack).unwrap();
+    assert!(!report::has_web_research_pages(&dir));
+}
+
+#[test]
+fn member_ids_are_prefixed_with_the_team_slug() {
+    let plan: schema::RosterPlan = serde_json::from_value(json!({
+        "slug": "flowershop-team", "display_name": "花店", "description": "d",
+        "members": [
+            { "name": "front", "role": "front_desk", "display_name": "總機", "responsibilities": ["a", "b"] },
+            { "name": "flowershop-care", "role": "worker", "display_name": "售後", "reports_to": "front", "responsibilities": ["a", "b"] }
+        ]
+    }))
+    .unwrap();
+    let plan = schema::prefix_member_names(plan);
+    let names: Vec<&str> = plan.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["flowershop-front", "flowershop-care"]);
+    assert_eq!(plan.members[1].reports_to, "flowershop-front");
+    assert!(schema::validate_roster(&plan, 2).is_empty(), "{:?}", schema::validate_roster(&plan, 2));
+}
+
+#[test]
+fn traversal_shaped_slugs_and_member_names_are_rejected() {
+    let bad: schema::RosterPlan = serde_json::from_value(json!({
+        "slug": "../etc", "display_name": "x", "description": "d",
+        "members": [
+            { "name": "../evil", "role": "front_desk", "display_name": "總機", "responsibilities": ["a", "b"] }
+        ]
+    }))
+    .unwrap();
+    let bad = schema::prefix_member_names(bad);
+    let problems = schema::validate_roster(&bad, 1).join("\n");
+    assert!(problems.contains("slug") && problems.contains("../evil"), "{problems}");
+    // A safe slug never prefixes its way into a traversal either.
+    let mut ok_slug: schema::RosterPlan = serde_json::from_value(json!({
+        "slug": "shop-team", "display_name": "x", "description": "d",
+        "members": [{ "name": "a/../b", "role": "front_desk", "display_name": "總機", "responsibilities": ["a", "b"] }]
+    }))
+    .unwrap();
+    ok_slug = schema::prefix_member_names(ok_slug);
+    assert!(!schema::validate_roster(&ok_slug, 1).is_empty());
+}
+
+#[test]
+fn derived_triggers_drop_at_signs_and_punctuation() {
+    let member: schema::RosterMember = serde_json::from_value(json!({
+        "name": "shop-x", "role": "worker", "display_name": "@@all!"
+    }))
+    .unwrap();
+    let a = super::agent_from(&member, String::new(), Default::default());
+    assert_eq!(a.trigger, "@all");
+}
+
+#[tokio::test]
+async fn precheck_warns_about_names_other_employees_answer_to() {
+    let llm = Canned::happy(2);
+    let (res, _) = run(&llm, 2).await;
+    let pack = res.unwrap().pack;
+    let home = tempfile::tempdir().unwrap();
+    let other = home.path().join("agents/other-team-front");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("agent.toml"),
+        "[agent]\nname = \"other-team-front\"\ndisplay_name = \"總機\"\ntrigger = \"@總機\"\n",
+    )
+    .unwrap();
+    let dir = eg::draft_pack_dir(home.path(), "abc-names").unwrap();
+    eg::materialize_draft(&dir, &pack).unwrap();
+    let warnings = report::install_precheck(home.path(), &dir);
+    assert!(
+        warnings.iter().any(|w| w["kind"] == "name" && w["name"] == "總機"),
+        "{warnings:?}"
+    );
+}
+
 // ─────────────────────────── validators ───────────────────────────
 
 #[test]
@@ -452,7 +559,21 @@ async fn preview_and_precheck_surface_skills_red_lines_and_conflicts() {
         .filter(|w| w.file != "faq.md")
         .map(|w| format!("shop-team/{}", w.file))
         .collect();
-    let placement = report::placement_report(home.path(), &dir, &agents, &wiki, &pre);
+    let record = crate::expert_admin::InstallRecord {
+        slug: "shop-team".into(),
+        kind: crate::expert_admin::PackKind::Native,
+        display_name: String::new(),
+        version: String::new(),
+        description: String::new(),
+        agents,
+        global_skills: vec![],
+        wiki_files: wiki,
+        agent_skills: vec![],
+        agent_ids: Default::default(),
+        installed_at: String::new(),
+        source_format: String::new(),
+    };
+    let placement = report::placement_report(home.path(), &dir, Some(&record), &pre);
     assert_eq!(placement["complete"], false);
     let faq = placement["wiki"]
         .as_array()
