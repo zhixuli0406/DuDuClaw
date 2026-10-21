@@ -149,6 +149,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/reviewable-workflow-drafts.md](guides/reviewable-workflow-drafts.md) | 審查證據與工作流程草稿（擷取快照、接受最新快照、五種試跑與負面案例規則、送審與管理者核准、私有任務的可見對象與通知、啟用後的執行與暫停；另有 [zh-TW](guides/zh-TW/reviewable-workflow-drafts.md)、[ja-JP](guides/ja-JP/reviewable-workflow-drafts.md)） | Current |
 | [guides/topology-evolution.md](guides/topology-evolution.md) | 半自動拓撲演化（D5，human-gated 路由改派提案、`[topology_evolution]` 設定、觀察期自動回滾、`topology.list` RPC） | Current |
 | [guides/line-touch-nfc.md](guides/line-touch-nfc.md) | 實體觸點：QR 桌牌列印、自製 NFC 桌牌（NTAG213 寫入/鎖定）、LINE Touch readiness 檢查清單（藍盾認證＋OA Shop 標籤時程） | Current |
+| [guides/agent-config-import.md](guides/agent-config-import.md) | 從其他平台匯入 AI 員工（豆包夥伴安裝包、OpenClaw、Hermes、AGENTS.md／CLAUDE.md／GEMINI.md、Claude Code／Copilot 子代理、Dify 應用 .yml）：支援格式、每個檔案的去處、技能停用與核准、安全措施、復原；另有 [zh-TW](guides/zh-TW/agent-config-import.md)、[ja-JP](guides/ja-JP/agent-config-import.md) | Current |
 | [guides/build-your-own-pack.md](guides/build-your-own-pack.md) | Expert pack 創作教學（最小可用包 10 分鐘、本機測試迴路、團隊/wiki/requires 進階、convert-teams/claude-plugin 轉出、品質建議） | Current |
 | [guides/shortcuts-and-wearables.md](guides/shortcuts-and-wearables.md) | 手腕與穿戴：Apple Watch 捷徑打 HTTP API、Bee=外部 MCP 純設定、Omi/Plaud webhook→`/ingest/transcript` 直灌記憶 | Current |
 | [guides/remote-mcp.md](guides/remote-mcp.md) | Remote MCP：claude.ai 自訂連接器直連自家 DuDuClaw（標準 `/mcp` 端點＋OAuth 2.1 流程、scope 收斂模型、tunnel 部署與撤銷） | Current |

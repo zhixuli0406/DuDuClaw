@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { api, type ExpertPack, type ExpertCatalogEntry } from '@/lib/api';
+import { api, type ExpertPack, type ExpertCatalogEntry, type ExpertImportReport } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast } from '@/lib/toast';
 import {
@@ -39,7 +39,12 @@ import {
 } from 'lucide-react';
 import { GenerateExpertDialog } from '@/components/experts/GenerateExpertDialog';
 import { AttachUnderSelect } from '@/components/experts/AttachUnderSelect';
+import { ImportReportDialog } from '@/components/experts/ImportReportDialog';
 import { AutonomyNote } from '@/components/AutonomyNote';
+
+/** Upload types the importer accepts: a zip (any supported layout), or a
+ *  single-file agent definition (subagent / instructions `.md`, Dify `.yml`). */
+const UPLOAD_EXTENSIONS = ['.zip', '.md', '.yml', '.yaml'] as const;
 
 /** WP-ORG — catalog section order (mirrors `duduclaw_core::org::CATALOG_CATEGORIES`). */
 const CATEGORY_ORDER = ['health', 'professional', 'retail', 'lifestyle', 'education', 'other'] as const;
@@ -71,6 +76,14 @@ export function ExpertsPage() {
   const [removeTarget, setRemoveTarget] = useState<ExpertPack | null>(null);
   const [removing, setRemoving] = useState(false);
   const [applyingHooks, setApplyingHooks] = useState<string | null>(null);
+  const [applyingSkills, setApplyingSkills] = useState<string | null>(null);
+  // Upload → plan (dry run) → confirm → result, all in one report dialog.
+  const [importFlow, setImportFlow] = useState<{
+    phase: 'plan' | 'done';
+    path: string;
+    report: ExpertImportReport | null;
+  } | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [catalog, setCatalog] = useState<{
     deployed: boolean;
@@ -155,8 +168,9 @@ export function ExpertsPage() {
 
   const handleFilePicked = async (file: File | null) => {
     if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.zip')) {
-      toast.error(t('experts.upload.notZip'));
+    const lower = file.name.toLowerCase();
+    if (!UPLOAD_EXTENSIONS.some((ext) => lower.endsWith(ext))) {
+      toast.error(t('experts.upload.unsupported'));
       return;
     }
     if (file.size > 50 * 1024 * 1024) {
@@ -167,16 +181,51 @@ export function ExpertsPage() {
     setUploadPct(0);
     try {
       const path = await uploadZip(file);
-      setUploadPct(null); // upload done — now the install/scan phase
-      await api.experts.install(path);
-      toast.success(t('experts.install.success'));
-      await load();
+      setUploadPct(null); // upload done — now the scan / plan phase
+      // Dry run first: show where every file goes before anything is written.
+      const plan = await api.experts.install(path, undefined, true);
+      setImportFlow({ phase: 'plan', path, report: plan.report ?? null });
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
     } finally {
       setInstalling(false);
       setUploadPct(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleConfirmImport = async () => {
+    if (!importFlow) return;
+    setImportBusy(true);
+    try {
+      const res = await api.experts.install(importFlow.path);
+      setImportFlow({ phase: 'done', path: importFlow.path, report: res.report ?? null });
+      toast.success(t('experts.install.success'));
+      await load();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
+      setImportFlow(null);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const handleApplySkills = async (slug: string) => {
+    setApplyingSkills(slug);
+    try {
+      const res = await api.experts.skillsApply(slug);
+      if (res.status === 'enabled') {
+        toast.success(intl.formatMessage({ id: 'experts.skills.applied' }, { count: res.count ?? 0 }));
+      } else if (res.status === 'pending_approval') {
+        toast.info(t('experts.hooks.stillPending'));
+      } else {
+        toast.info(t('experts.skills.keptDisabled'));
+      }
+      await load();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
+    } finally {
+      setApplyingSkills(null);
     }
   };
 
@@ -307,7 +356,7 @@ export function ExpertsPage() {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".zip"
+        accept={UPLOAD_EXTENSIONS.join(',')}
         className="hidden"
         onChange={(e) => handleFilePicked(e.target.files?.[0] ?? null)}
       />
@@ -391,6 +440,27 @@ export function ExpertsPage() {
                     </div>
                   )}
 
+                  {p.skills_status === 'pending_approval' && (
+                    <div className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs">
+                      <p>{intl.formatMessage({ id: 'experts.skills.pendingHint' }, { count: p.skills_disabled ?? 0 })}</p>
+                      <div className="flex items-center gap-2">
+                        <Button variant="outline" size="sm" onClick={() => navigate('/inbox')}>
+                          {t('experts.hooks.goApprove')}
+                          <ArrowRight />
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={applyingSkills === p.slug}
+                          onClick={() => handleApplySkills(p.slug)}
+                        >
+                          {applyingSkills === p.slug && <Spinner className="size-3.5" />}
+                          {t('experts.hooks.apply')}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex items-center justify-end">
                     <Button variant="ghost" size="sm" onClick={() => setRemoveTarget(p)}>
                       <Trash2 />
@@ -405,6 +475,15 @@ export function ExpertsPage() {
           </>
         )}
       </div>
+
+      <ImportReportDialog
+        open={importFlow !== null}
+        phase={importFlow?.phase ?? 'plan'}
+        report={importFlow?.report ?? null}
+        busy={importBusy}
+        onConfirm={handleConfirmImport}
+        onClose={() => setImportFlow(null)}
+      />
 
       <GenerateExpertDialog
         open={generateOpen}

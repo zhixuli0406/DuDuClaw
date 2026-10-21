@@ -52,8 +52,11 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 Reads `openclaw.json` (JSON5) and imports:
 
 - **Agents**: `agents.list[]` (or a single default `main`), each with its workspace
-  persona (`SOUL.md`) and memory (`MEMORY.md` / `USER.md` / bullet entries from
-  `memory/*.md`).
+  files placed as in [agent-config import](agent-config-import.md#where-each-file-goes):
+  `SOUL.md` → SOUL, `IDENTITY.md` → IDENTITY (+ name and emoji), `AGENTS.md` →
+  `INSTRUCTIONS.md`, `USER.md` / `TOOLS.md` / `HEARTBEAT.md` → knowledge pages,
+  `MEMORY.md` + `memory/*.md` → memory facts with their source recorded. Before
+  1.76 the persona files were copied into `agents/<id>/memory/`, where nothing reads them.
 - **Channel tokens**: `channels.telegram.botToken`, `channels.discord.token`,
   `channels.slack.botToken` + `appToken` (written encrypted into config.toml). WhatsApp
   is a linked device and technically cannot be transferred, so it is `SKIPPED`.
@@ -82,7 +85,8 @@ Imports:
 - **Channel tokens** (from `.env`): `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`,
   `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`. `EMAIL_*` channels are not yet supported in v1
   and are `SKIPPED`.
-- **Persona / memory**: `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md`.
+- **Persona / memory**: `SOUL.md`, `memories/MEMORY.md` (memory facts, entries split
+  on `§`), `memories/USER.md` (knowledge page "服務對象").
 - **Cron**: `cron/jobs.json` (parsed defensively).
 - Only the **active profile** is migrated; other profiles are listed as `SKIPPED`, with
   a prompt to migrate each one individually via `--source`.

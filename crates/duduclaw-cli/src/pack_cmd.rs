@@ -84,6 +84,10 @@ pub enum PackCommands {
         /// Preset packs: overwrite an existing preset of the same id.
         #[arg(long)]
         force: bool,
+        /// Write the machine-readable import report to this file (used by
+        /// the dashboard upload).
+        #[arg(long, hide = true)]
+        report_json: Option<PathBuf>,
     },
 }
 
@@ -104,6 +108,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
             trust_hooks,
             attach_under,
             force,
+            report_json,
         } => {
             install_pack(
                 &home,
@@ -114,6 +119,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
                     trust_hooks,
                     attach_under,
                     force,
+                    report_json,
                 },
             )
             .await
@@ -133,6 +139,7 @@ pub(crate) struct InstallOptions {
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
     pub force: bool,
+    pub report_json: Option<PathBuf>,
 }
 
 /// **The** pack install front door.
@@ -147,8 +154,16 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
-    let dir = crate::expert::resolve_pack_source(source, &staging).await?;
-    let root = crate::expert::resolve_pack_root(&dir);
+    let resolved = crate::expert::resolve_pack_source_full(source, &staging).await?;
+    let root = crate::expert::resolve_pack_root(&resolved.dir);
+    let pipeline = crate::expert::PipelineOpts {
+        dry_run: opts.dry_run,
+        rename: opts.rename,
+        trust_hooks: opts.trust_hooks,
+        attach_under: opts.attach_under.clone(),
+        report_json: opts.report_json.clone(),
+        zip_summary: resolved.zip,
+    };
 
     match load_pack_dir(&root) {
         Ok(pack) => {
@@ -161,31 +176,17 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
                     install_preset_pack(home, &pack, Some(&root), opts.force, opts.dry_run)
                 }
                 PackKind::Team | PackKind::Template => {
-                    crate::expert::install_via_expert_pipeline(
-                        home,
-                        &root.to_string_lossy(),
-                        opts.dry_run,
-                        opts.rename,
-                        opts.trust_hooks,
-                        opts.attach_under,
-                    )
-                    .await
+                    crate::expert::install_via_expert_pipeline_with(home, &root.to_string_lossy(), pipeline)
+                        .await
                 }
             }
         }
-        // Not a pack dialect (plugin / single skill / unrecognised): the
-        // expert pipeline owns those, including the fail-closed rejection
-        // message for an unrecognised layout.
+        // Not a pack dialect (plugin / single skill / another platform's
+        // agent definition / unrecognised): the expert pipeline owns those,
+        // including the fail-closed rejection message for an unrecognised
+        // layout.
         Err(PackError::NotFound(_)) => {
-            crate::expert::install_via_expert_pipeline(
-                home,
-                &root.to_string_lossy(),
-                opts.dry_run,
-                opts.rename,
-                opts.trust_hooks,
-                opts.attach_under,
-            )
-            .await
+            crate::expert::install_via_expert_pipeline_with(home, &root.to_string_lossy(), pipeline).await
         }
         Err(e) => Err(cfg_err(e.to_string())),
     }

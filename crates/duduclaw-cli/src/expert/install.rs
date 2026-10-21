@@ -30,7 +30,23 @@ pub(super) struct InstallCtx {
     pub attach_under: Option<String>,
 }
 
-/// Entry for `duduclaw pack install` once it hands a roster-shaped pack over.
+/// Options of one pipeline run beyond the source itself.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PipelineOpts {
+    pub dry_run: bool,
+    pub rename: bool,
+    pub trust_hooks: bool,
+    pub attach_under: Option<String>,
+    /// Write the machine-readable report here (dashboard upload).
+    pub report_json: Option<PathBuf>,
+    /// What the front door's zip extraction left out (when it already
+    /// extracted the source before handing a directory over).
+    pub zip_summary: Option<safe_zip::ExtractSummary>,
+}
+
+/// Entry for `duduclaw pack install` once it hands a roster-shaped pack over
+/// (default options; the front door itself calls [`cmd_install_with`]).
+#[cfg(test)]
 pub async fn cmd_install(
     home: &Path,
     source: &str,
@@ -39,19 +55,34 @@ pub async fn cmd_install(
     trust_hooks: bool,
     attach_under: Option<String>,
 ) -> Result<()> {
+    let opts = PipelineOpts {
+        dry_run,
+        rename,
+        trust_hooks,
+        attach_under,
+        ..Default::default()
+    };
+    cmd_install_with(home, source, opts).await
+}
+
+/// [`cmd_install`] with the full option set.
+pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOpts) -> Result<()> {
+    let dry_run = opts.dry_run;
     // ── 1. Resolve the source to an on-disk directory (download / unzip). ──
     // A throwaway staging dir under the system temp; cleaned at the end.
     let staging = std::env::temp_dir().join(format!("duduclaw-expert-{}", uuid::Uuid::new_v4()));
     let cleanup = Cleanup(staging.clone());
 
-    let dir = resolve_source(source, &staging).await?;
-    let root = detect::resolve_root(&dir);
+    let resolved = super::source::resolve_source_full(source, &staging).await?;
+    let root = detect::resolve_root(&resolved.dir);
+    let zip_summary = resolved.zip.or(opts.zip_summary.clone());
 
     // ── 2. Detect format (fail-closed). ──
     let Some(format) = detect::detect(&root) else {
         let contents = detect::list_contents(&root);
         eprintln!(
-            "\n  {} 無法識別的專家包格式（缺 expert.toml / .claude-plugin/plugin.json / SKILL.md）\n",
+            "\n  {} 無法識別的格式。支援：DuDuClaw 專家包（expert.toml）、Claude Code 外掛、單一技能（SKILL.md）、\
+             豆包夥伴安裝包、OpenClaw、Hermes、AGENTS.md／CLAUDE.md／GEMINI.md、Claude Code／Copilot 子代理、Dify 應用匯出檔。\n",
             style("✗").red().bold()
         );
         eprintln!("  目錄內容:");
@@ -65,7 +96,7 @@ pub async fn cmd_install(
 
     // ── attach-under: validate the target exists BEFORE anything installs
     //    (fail-closed — a typo'd supervisor must not half-install a pack). ──
-    let attach_under = match attach_under.as_deref().map(str::trim) {
+    let attach_under = match opts.attach_under.as_deref().map(str::trim) {
         Some("") | None => None,
         Some(id) => {
             if !crate::is_valid_agent_id(id) {
@@ -85,20 +116,35 @@ pub async fn cmd_install(
     let ctx = InstallCtx {
         home: home.to_path_buf(),
         dry_run,
-        rename,
-        trust_hooks,
+        rename: opts.rename,
+        trust_hooks: opts.trust_hooks,
         attach_under,
     };
     let mut report = Report::default();
+    if let Some(z) = &zip_summary {
+        report_zip_summary(z, &mut report);
+    }
 
     // ── 3. Dispatch. ──
     let record = match format {
         Format::Native => install_native(&ctx, &root, &mut report).await?,
         Format::ClaudePlugin => super::plugin::install(&ctx, &root, &mut report).await?,
         Format::Skill => super::skill_import::install(&ctx, &root, &mut report).await?,
+        Format::AgentConfig(kind) => {
+            super::agent_config::install(&ctx, &root, kind, &mut report).await?
+        }
     };
 
     report.render_console(dry_run);
+    report.meta("slug", &record.slug);
+    report.meta("display_name", &record.display_name);
+    report.meta("pack_format", format_label(format));
+    report.meta("agents", &record.agents.join(","));
+    if let Some(path) = &opts.report_json {
+        let body = serde_json::to_string_pretty(&report.to_json(dry_run))
+            .map_err(|e| cfg_err(format!("序列化匯入報告失敗：{e}")))?;
+        std::fs::write(path, body).map_err(|e| io_err(format!("寫入匯入報告失敗：{e}")))?;
+    }
 
     // ── 4. Persist the install record (real runs only). ──
     if !dry_run {
@@ -121,118 +167,29 @@ pub async fn cmd_install(
     Ok(())
 }
 
+fn report_zip_summary(z: &safe_zip::ExtractSummary, report: &mut Report) {
+    if z.junk_skipped > 0 {
+        report.ignored(
+            "zip",
+            "",
+            format!("已略過 {} 個系統暫存檔（__MACOSX、.DS_Store 等）", z.junk_skipped),
+        );
+    }
+    if let Some(enc) = z.legacy_encoding {
+        report.warning("zip", "", format!("壓縮檔的中文檔名使用 {}，已自動轉換", enc.label()));
+    }
+    for link in &z.links_skipped {
+        report.skipped("zip", link, "壓縮檔內的捷徑（符號連結）不會解開");
+    }
+}
+
 fn format_label(f: Format) -> &'static str {
     match f {
         Format::Native => "expert.toml",
         Format::ClaudePlugin => "claude-plugin",
         Format::Skill => "agent-skill",
+        Format::AgentConfig(k) => k.code(),
     }
-}
-
-/// Resolve `source` to a directory containing the pack. Handles a plain
-/// directory, a local `.zip`, and an `http(s)` URL to a `.zip`.
-///
-/// `pub(crate)` so the unified `duduclaw pack` front door
-/// ([`crate::pack_cmd::install_pack`]) resolves a source through this exact
-/// fenced path (zip-slip guard, size cap, registry sha256 + minisign,
-/// `github:` side-door warning) instead of growing a second resolver.
-pub(crate) async fn resolve_source(source: &str, staging: &Path) -> Result<PathBuf> {
-    // WP2.5: BRAT-style side door — `github:user/repo[@branch]` installs the
-    // repo's default-branch archive directly. Unregistered and unreviewed;
-    // say so honestly, then let the normal fences (zip fence, content scan,
-    // hook quarantine) do their job.
-    if let Some(spec) = source.strip_prefix("github:") {
-        let (url, label) = super::registry::github_archive_url(spec.trim())?;
-        println!(
-            "  ⚠ 側門安裝 {label}：未經 registry 驗證，來源風險自負（掃描與 hooks 隔離照常生效）"
-        );
-        std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
-        let zip_path = staging.join("download.zip");
-        download_zip(&url, &zip_path).await?;
-        let unpack = staging.join("unpacked");
-        safe_zip::extract_to(&zip_path, &unpack)?;
-        return Ok(descend_single_dir(unpack));
-    }
-    // WP2.2 R2/R3: `registry:<slug>` — resolve via the pack registry with
-    // client-side sha256 (always) + minisign (code lane) verification.
-    if let Some(slug) = source.strip_prefix("registry:") {
-        let (_entry, archive) = super::registry::fetch_verified_archive(slug.trim()).await?;
-        std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
-        let zip_path = staging.join("download.zip");
-        std::fs::write(&zip_path, &archive).map_err(|e| io_err(format!("寫入下載檔失敗: {e}")))?;
-        let unpack = staging.join("unpacked");
-        safe_zip::extract_to(&zip_path, &unpack)?;
-        return Ok(unpack);
-    }
-    if source.starts_with("http://") || source.starts_with("https://") {
-        std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
-        let zip_path = staging.join("download.zip");
-        download_zip(source, &zip_path).await?;
-        let unpack = staging.join("unpacked");
-        safe_zip::extract_to(&zip_path, &unpack)?;
-        return Ok(unpack);
-    }
-
-    let path = PathBuf::from(source);
-    if !path.exists() {
-        return Err(cfg_err(format!("來源不存在: {source}")));
-    }
-    if path.is_dir() {
-        return Ok(path);
-    }
-    // A file → must be a zip.
-    let is_zip = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("zip"))
-        .unwrap_or(false);
-    if !is_zip {
-        return Err(cfg_err(format!("來源檔不是目錄也不是 .zip: {source}")));
-    }
-    std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
-    let unpack = staging.join("unpacked");
-    safe_zip::extract_to(&path, &unpack)?;
-    Ok(unpack)
-}
-
-/// GitHub source archives wrap everything in a `<repo>-<branch>/` top dir —
-/// when the extraction root has exactly one directory and no manifest of its
-/// own, descend into it so format detection sees the real pack root.
-fn descend_single_dir(root: PathBuf) -> PathBuf {
-    if root.join("expert.toml").is_file() || root.join(".claude-plugin").is_dir() {
-        return root;
-    }
-    let entries: Vec<_> = std::fs::read_dir(&root)
-        .map(|it| it.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    let dirs: Vec<_> = entries.iter().filter(|p| p.is_dir()).collect();
-    if dirs.len() == 1 && entries.len() == 1 {
-        return dirs[0].clone();
-    }
-    root
-}
-
-/// Download a URL to `dest`, capped at [`safe_zip::MAX_UNPACK_BYTES`].
-async fn download_zip(url: &str, dest: &Path) -> Result<()> {
-    let resp = reqwest::get(url)
-        .await
-        .map_err(|e| io_err(format!("下載失敗: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(io_err(format!("下載失敗 HTTP {}", resp.status())));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| io_err(format!("讀取回應失敗: {e}")))?;
-    if bytes.len() as u64 > safe_zip::MAX_UNPACK_BYTES {
-        return Err(cfg_err(format!(
-            "下載內容過大（{} bytes > 上限 {}）",
-            bytes.len(),
-            safe_zip::MAX_UNPACK_BYTES
-        )));
-    }
-    std::fs::write(dest, &bytes).map_err(|e| io_err(format!("寫入下載檔失敗: {e}")))?;
-    Ok(())
 }
 
 // ─────────────────────────── Native importer ───────────────────────────
@@ -268,6 +225,7 @@ async fn install_native(
         global_skills: Vec::new(),
         wiki_files: Vec::new(),
         installed_at: now_iso(),
+        source_format: String::new(),
     };
 
     // ── requires: doctor-style, warn only ──

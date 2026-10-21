@@ -15,22 +15,6 @@ use duduclaw_memory::SqliteMemoryEngine;
 use super::report::Report;
 use super::*;
 
-fn build_semantic_entry(agent_id: &str, content: &str, platform: Platform) -> MemoryEntry {
-    MemoryEntry {
-        id: uuid::Uuid::new_v4().to_string(),
-        agent_id: agent_id.to_string(),
-        content: content.to_string(),
-        timestamp: chrono::Utc::now(),
-        tags: vec![format!("imported-from-{}", platform.as_str())],
-        embedding: None,
-        layer: MemoryLayer::Semantic,
-        importance: 5.0,
-        access_count: 0,
-        last_accessed: None,
-        source_event: format!("migrate-from-{}", platform.as_str()),
-    }
-}
-
 /// Open the shared memory engine (only meaningful in `--apply` mode).
 pub(super) fn open_memory(ctx: &Ctx) -> Option<SqliteMemoryEngine> {
     if !ctx.apply {
@@ -39,61 +23,8 @@ pub(super) fn open_memory(ctx: &Ctx) -> Option<SqliteMemoryEngine> {
     SqliteMemoryEngine::new(&ctx.home.join("memory.db")).ok()
 }
 
-/// Import a set of `facts` as Semantic memory entries for `agent_id`.
-/// Reports one roll-up line per source label.
-pub(super) async fn import_facts(
-    engine: Option<&SqliteMemoryEngine>,
-    ctx: &Ctx,
-    report: &mut Report,
-    agent_id: &str,
-    label: &str,
-    facts: &[String],
-    source_id: &str,
-) {
-    if facts.is_empty() {
-        return;
-    }
-    if !ctx.apply {
-        report.imported("memory", &format!("{label} ({} 筆)", facts.len()));
-        return;
-    }
-    let Some(eng) = engine else {
-        report.skipped("memory", label, "開啟 memory.db 失敗");
-        return;
-    };
-    let mut ok = 0usize;
-    let now = chrono::Utc::now();
-    // H-3 / N8: the file is identified by its canonical path and each record
-    // by its content, so the same file re-imported (reordered, touched) stays
-    // forgotten. A copy at another path is a different source.
-    let canonical_id = duduclaw_memory::lineage::canonical_import_id(source_id);
-    for f in facts.iter() {
-        let entry = build_semantic_entry(agent_id, f, ctx.platform);
-        // WP1: migrated facts carry the `import` origin (ceiling 0.7).
-        let meta = duduclaw_memory::TemporalMeta {
-            origin: Some("import".to_string()),
-            ..Default::default()
-        };
-        // P2-B: an imported record's source is its file and its content.
-        let prov = duduclaw_memory::lineage::Provenance::source(
-            duduclaw_memory::SourceRef::import_item(&canonical_id, f.as_bytes(), now),
-        );
-        if eng.store_temporal(agent_id, entry, meta, prov).await.is_ok() {
-            ok += 1;
-        }
-    }
-    if ok == facts.len() {
-        report.imported("memory", &format!("{label} ({ok} 筆)"));
-    } else if ok > 0 {
-        report.partial("memory", label, format!("{ok}/{} 筆寫入成功", facts.len()));
-    } else {
-        report.skipped("memory", label, "全部寫入失敗");
-    }
-}
-
 /// Store one SPO-tagged Semantic memory fact with full temporal metadata
-/// (WP-9A — `claude-code` memory-shard / session-summary imports; the plain
-/// `import_facts` bag-of-strings helper above has no room for a triple).
+/// (WP-9A — `claude-code` memory-shard / session-summary imports).
 ///
 /// Two invariants are enforced here, not left to the caller:
 /// - `meta.origin` is unconditionally forced to `"import"` (ceiling 0.7) —
@@ -501,18 +432,53 @@ pub(super) fn archive_raw(ctx: &Ctx, report: &mut Report, entries: &[(String, Pa
     }
 }
 
-/// Copy `src` file(s) into the agent's `memory/` dir for fidelity.
-pub(super) fn copy_into_agent_memory(ctx: &Ctx, agent_id: &str, src: &Path) -> std::io::Result<()> {
-    if !ctx.apply || !src.exists() {
-        return Ok(());
+/// Fill IDENTITY.md / INSTRUCTIONS.md / the wiki pages (USER, TOOLS,
+/// HEARTBEAT) / memory facts of a freshly scaffolded agent through the same
+/// slot writer `duduclaw pack install` uses. Before this, the persona files
+/// were copied into `agents/<id>/memory/`, where nothing reads them.
+/// Memory lineage points at the original files under `source_root`, so
+/// `duduclaw memory forget-source --session import:<file>` revokes them.
+pub(super) async fn write_persona_slots(
+    ctx: &Ctx,
+    report: &mut Report,
+    agent_id: &str,
+    draft: &crate::expert::agent_config::ir::AgentDraft,
+    source_root: &Path,
+) {
+    let slot_ctx = crate::expert::agent_config::slots::SlotCtx {
+        home: &ctx.home,
+        agent_id,
+        dry_run: !ctx.apply,
+        lineage_base: source_root,
+        format_code: ctx.platform.as_str(),
+        apply_identity_fields: true,
+    };
+    for o in crate::expert::agent_config::slots::write_slots(&slot_ctx, draft).await {
+        report.absorb(&o);
     }
-    let name = src
-        .file_name()
-        .map(|n| n.to_owned())
-        .unwrap_or_else(|| std::ffi::OsString::from("imported.md"));
-    let dest_dir = ctx.home.join("agents").join(agent_id).join("memory");
-    std::fs::create_dir_all(&dest_dir)?;
-    std::fs::copy(src, dest_dir.join(name)).map(|_| ())
+}
+
+/// SOUL.md text after the fail-closed injection scan: `None` (default
+/// persona) and a SKIPPED line when it is refused.
+pub(super) fn scanned_soul(report: &mut Report, agent: &str, soul: Option<String>) -> Option<String> {
+    let soul = soul?;
+    let scan = duduclaw_security::input_guard::scan_input(
+        &soul,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    );
+    if scan.blocked {
+        report.skipped(
+            "soul",
+            agent,
+            format!(
+                "security: 偵測到注入風險 (risk {}, 規則 {})，改用預設人格",
+                scan.risk_score,
+                scan.matched_rules.join("/")
+            ),
+        );
+        return None;
+    }
+    Some(soul)
 }
 
 /// Recursively copy a directory tree.

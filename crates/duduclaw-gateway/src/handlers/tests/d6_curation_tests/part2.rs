@@ -80,6 +80,7 @@ pub(super) async fn experts_rpcs_deny_non_admin() {
         "experts.install",
         "experts.remove",
         "experts.hooks_apply",
+        "experts.skills_apply",
         "experts.catalog",
         "experts.install_builtin",
         "experts.generate",
@@ -553,6 +554,7 @@ pub(super) async fn experts_list_and_remove_round_trip() {
         global_skills: vec![],
         wiki_files: vec![],
         installed_at: crate::expert_admin::now_iso(),
+        source_format: String::new(),
     };
     crate::expert_admin::write_record(home.path(), &rec).unwrap();
     crate::expert_admin::write_hooks_state(
@@ -624,6 +626,16 @@ pub(super) async fn experts_install_rejects_missing_and_non_zip_sources() {
             json!({ "path": txt.to_string_lossy() }),
             &ctx,
         )
+        .await;
+    assert!(!frame_ok(&frame));
+    // A real pack directory outside the upload staging area is refused too:
+    // agent formats are recognised by common file names, so an arbitrary
+    // server path must never be importable over the RPC.
+    let repo = home.path().join("some-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "rules").unwrap();
+    let frame = handler
+        .handle("experts.install", json!({ "path": repo.to_string_lossy() }), &ctx)
         .await;
     assert!(!frame_ok(&frame));
 }
