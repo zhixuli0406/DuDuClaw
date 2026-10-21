@@ -66,6 +66,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 59 | [Local Proxy](59-local-proxy.md) | `duduclaw proxy` — an OpenAI-compatible localhost endpoint so Aider / Cline / Codex can borrow the account pool; Bearer-gated, loopback by default, honest about OAuth seats not being forwardable |
 | 60 | [Discovery](60-discovery.md) | Approved-workspace exploration, budgeted tree records, verified artifacts and zero-LLM held-out policy comparisons; integration validation in progress |
 | 61 | [Odoo website live chat](61-odoo-livechat.md) | AI employees answer Odoo Live Chat visitors as an operator; audience rules pick the employee per visitor; human takeover and handoff |
+| 62 | [Calling AI staff with `@`](62-calling-ai-staff.md) | Hand one message to another AI employee by `@name`, limited to the employees the sender may call; `@` list in WebChat, LINE and Telegram; one-shot call; mention-only groups |
 
 ---
 

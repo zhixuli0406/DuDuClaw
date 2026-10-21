@@ -2,8 +2,14 @@ use duduclaw_core::types::Message;
 
 use crate::registry::{AgentRegistry, LoadedAgent};
 
-/// Routes incoming messages to the appropriate agent based on trigger words,
-/// channel bindings, and fallback rules.
+/// Routes incoming messages to the appropriate agent based on channel
+/// bindings and fallback rules.
+///
+/// Calling an employee by `@name` is NOT handled here: who may call whom
+/// depends on the sender, so trigger routing lives in the gateway
+/// (`trigger_route`, built on [`crate::trigger_match`]) and runs before this
+/// resolver. This type only answers "who handles a message that names
+/// nobody".
 pub struct AgentResolver<'a> {
     registry: &'a AgentRegistry,
 }
@@ -14,19 +20,21 @@ impl<'a> AgentResolver<'a> {
         Self { registry }
     }
 
-    /// Resolve which agent should handle the given message.
+    /// Resolve which agent handles a message that calls no employee.
     ///
     /// Resolution order:
-    /// 1. Trigger word match (e.g. `@DuDu` at the start of the message text).
-    /// 2. **Channel/Thread binding** (RFC-22 Decision 3-D, Phase 3 W3) —
+    /// 1. **Channel/Thread binding** (RFC-22 Decision 3-D, Phase 3 W3) —
     ///    `[[channels.discord.bindings]]` entries in `agent.toml`. Resolves
     ///    `discord:thread:<id>` and `discord:<channel_id>` directly to the
     ///    bound agent so sub-agents receive channel messages without
     ///    going through the root agent first (which previously caused
     ///    14-day SOUL stagnation for 16 of 17 sub-agents).
-    /// 3. Coarse permission grant — the message channel name (e.g. "discord")
+    /// 2. Coarse permission grant — the message channel name (e.g. "discord")
     ///    is in the agent's `permissions.allowed_channels` list.
-    /// 4. Fall back to the main agent (role = Main).
+    /// 3. Fall back to the main agent (role = Main).
+    ///
+    /// Before 1.76 a step 0 matched `[agent] trigger` with an unanchored,
+    /// sender-blind `contains`; that let anyone reach any employee.
     pub fn resolve(&self, message: &Message) -> Option<&'a LoadedAgent> {
         // `registry.list()` is backed by a HashMap, so its iteration order is
         // non-deterministic. Sort by agent name so that when multiple agents
@@ -34,20 +42,12 @@ impl<'a> AgentResolver<'a> {
         let mut agents = self.registry.list();
         agents.sort_by(|a, b| a.config.agent.name.cmp(&b.config.agent.name));
 
-        // 1. Trigger word match
-        for agent in &agents {
-            let trigger = &agent.config.agent.trigger;
-            if !trigger.is_empty() && self.match_trigger(&message.text, trigger) {
-                return Some(agent);
-            }
-        }
-
-        // 2. Channel/Thread binding (RFC-22 Decision 3-D)
+        // 1. Channel/Thread binding (RFC-22 Decision 3-D)
         if let Some(agent) = self.match_channel_binding(message, &agents) {
             return Some(agent);
         }
 
-        // 3. Coarse permission grant
+        // 2. Coarse permission grant
         for agent in &agents {
             let allowed = &agent.config.permissions.allowed_channels;
             if allowed.iter().any(|ch| ch == &message.channel) {
@@ -55,13 +55,8 @@ impl<'a> AgentResolver<'a> {
             }
         }
 
-        // 4. Fall back to main agent
+        // 3. Fall back to main agent
         self.registry.main_agent()
-    }
-
-    /// Check whether `text` contains the trigger word (case-insensitive).
-    fn match_trigger(&self, text: &str, trigger: &str) -> bool {
-        text.to_lowercase().contains(&trigger.to_lowercase())
     }
 
     /// RFC-22 Decision 3-D: walk every agent's `[[channels.discord.bindings]]`

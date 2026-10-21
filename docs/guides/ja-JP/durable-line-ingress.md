@@ -61,7 +61,7 @@ LINE Messaging API のリファレンスによると、reply token は 1 回し�
 
 処理開始前、返信送信前、進捗通知のたびに、スナップショットを計算し直してイベントに保存されたものと比較します。対象は「このメッセージを誰が、どの権限で処理するか」だけです：
 
-- ルート：解決されたエージェント、その trigger／role／status、`[channels]`、`allowed_channels`、`default_agent`、このユーザーのエージェントバインディング。
+- ルート：解決されたエージェント（この送信者の @ 呼び出し、このイベントが受け取った「次の 1 件だけ」の指名を含む。渡す相手は最初のスナップショットで 1 度だけ決めて `ingress_routes` に保存し、以降のスナップショットはそれを再利用して送信者がまだ呼び出せるかだけを確認する。渡せなくなったイベントは隔離し、ユーザーに再送を短く案内する。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照）、その trigger／role／status、`[channels]`、`allowed_channels`、`default_agent`、このユーザーのエージェントバインディング。
 - 権限：LINE 認証情報のダイジェスト。ルーティング先のエージェントの実効設定（職務プリセットに紐づくエージェントは `agent_resolved/<id>.toml`、それ以外は `agent.toml`）のうち身元フィールド、capabilities、permissions、budget、container の sandbox／network。この会話とグローバルの allowlist、blocklist、pairing、admin、mention-only、binding 設定。このユーザーのペアリング状態。
 
 エージェントを追加したり、関係のないエージェントの設定を変えたりしても、スナップショットは変わりません。プロンプト文、SOUL、ハートビート、統計も影響しません。
