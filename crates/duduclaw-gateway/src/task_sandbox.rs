@@ -434,6 +434,9 @@ pub async fn dispatch(
         if let Some(identity) = &agent.identity {
             parts.push(format!("# Identity\n{identity}"));
         }
+        if let Some(s) = duduclaw_agent::instructions::render_section(agent.instructions.as_deref()) {
+            parts.push(s);
+        }
         TaskSpec {
             agent_id: if agent_id == "default" {
                 agent.config.agent.name.clone()

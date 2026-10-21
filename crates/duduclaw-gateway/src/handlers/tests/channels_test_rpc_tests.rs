@@ -236,6 +236,7 @@ fn agent_has_own_channel_token_true_only_for_configured_platform() {
         config: cfg,
         soul: None,
         identity: None,
+        instructions: None,
         memory: None,
         skills: vec![],
         contract: Default::default(),

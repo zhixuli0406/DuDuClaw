@@ -6,6 +6,7 @@ pub mod contract;
 /// Zero-cost Anthropic credential probing (2026-09 account-hardening D1).
 pub mod credential_probe;
 pub mod heartbeat;
+pub mod instructions;
 pub mod ipc;
 pub mod mcp_spawn_gate;
 pub mod mcp_template;

@@ -35,7 +35,9 @@ Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）�
 - Agent 寫入、搬移或刪除 **`agents/_trash/`** 底下的任何東西（被移除的員工存放在那裡；Bash 以啟發式判斷）；
 - Agent 在 Bash 執行 **`duduclaw agent create <name>`**，而該名稱因為曾有員工被移除而處於保留狀態（見[委派隔離](37-delegation-isolation.md#被移除員工的名稱仍被保留)）；拒絕會以稽核事件 `agent_name_reserved` 記錄，`path_kind` 為 `cli_bash_agent_create`。
 
-在 Bash 上，「自己的 `SOUL.md`」與「自己的 `CONTRACT.toml`」兩條規則是啟發式判斷：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/…`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。身分驗證失敗的呼叫者，寫入形態的指令只要點名 `agents/` 底下任何位置就擋，與 Write／Edit 一致。
+- Agent 寫**自己的 `INSTRUCTIONS.md`**（判定 `BlockedOwnInstructionsWrite`）。這個檔案放的是操作者從其他平台匯入的工作規則（[匯入 AI 員工](../../guides/zh-TW/agent-config-import.md)），每次對話都會帶入，所以和契約一樣沒有開放旗標。它也列在 agent 結構檔清單裡，位置守衛與 `office_script` 對它的處理和 `SOUL.md` 相同。
+
+在 Bash 上，「自己的 `SOUL.md`」、「自己的 `CONTRACT.toml`」與「自己的 `INSTRUCTIONS.md`」三條規則是啟發式判斷：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/…`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。身分驗證失敗的呼叫者，寫入形態的指令只要點名 `agents/` 底下任何位置就擋，與 Write／Edit 一致。
 
 **Bash 與資料目錄允許清單。** Bash 通道用同一份允許清單判斷指令文字。以下說的「受保護的資料目錄目標」，指資料目錄裡自己的員工目錄與 `attachments/` 以外的位置、別的員工的目錄，以及被移除員工的存放區；身分驗證失敗的呼叫者，連自己的目錄也算。
 
@@ -228,7 +230,7 @@ action_rules = [
 - **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
 - **只有 Claude runtime 會跑這些 hook。** Codex、Antigravity 與其他 runtime 靠各自的沙箱旗標。
-- **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
+- **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）
 - **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在才視為 `GREEN`；檔案存在卻讀不到，或內容不是 `GREEN`／`YELLOW`／`RED` 其中之一，間隔 50 毫秒再讀兩次後仍是如此，就視為 `RED`（fail closed）；開頭的 UTF-8 BOM 與前後空白會略過。
 - *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在——每次 Claude spawn 都是單次 spawn，正好就是改寫掛鉤的地方。

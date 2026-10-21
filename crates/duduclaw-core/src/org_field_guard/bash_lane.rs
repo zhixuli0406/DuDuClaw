@@ -12,7 +12,8 @@ use super::bash_parse::{refused_targets, Ctx};
 use super::matcher::{write_verb, HomeTarget};
 use super::rules::HOOK_SETTINGS_FILES;
 use super::matcher::{
-    agents_dir_segments, mentions_other_agent_dir, mentions_own_contract_toml, mentions_own_soul_md,
+    agents_dir_segments, mentions_other_agent_dir, mentions_own_contract_toml,
+    mentions_own_instructions_md, mentions_own_soul_md,
     mentions_removed_agent_area,
 };
 use super::HookCaller;
@@ -163,7 +164,8 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
         let names_agents_area = mentions_removed_agent_area(normalized)
             || !agents_dir_segments(normalized).is_empty()
             || mentions_own_soul_md(normalized, claimed)
-            || mentions_own_contract_toml(normalized, claimed);
+            || mentions_own_contract_toml(normalized, claimed)
+            || mentions_own_instructions_md(normalized, claimed);
         if names_agents_area && write_verb(normalized).is_some() {
             return GuardDecision::BlockedUntrustedCaller {
                 caller: claimed.clone(),
@@ -221,6 +223,14 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
             return GuardDecision::BlockedOwnContractWrite {
                 caller: caller_id.clone(),
                 attempted_path: home.join("agents").join(caller_id).join("CONTRACT.toml"),
+            };
+        }
+
+        // Instructions lock — identical matcher, own `INSTRUCTIONS.md`.
+        if mentions_own_instructions_md(normalized, caller_id) && write_verb(normalized).is_some() {
+            return GuardDecision::BlockedOwnInstructionsWrite {
+                caller: caller_id.clone(),
+                attempted_path: home.join("agents").join(caller_id).join("INSTRUCTIONS.md"),
             };
         }
     }

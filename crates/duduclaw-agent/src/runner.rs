@@ -207,6 +207,12 @@ fn build_system_prompt(agent: &LoadedAgent) -> SystemPromptSnapshot {
             identity_parts.push_str("# Identity\n");
             identity_parts.push_str(identity.trim_end());
         }
+        if let Some(section) = crate::instructions::render_section(agent.instructions.as_deref()) {
+            if !identity_parts.is_empty() {
+                identity_parts.push_str("\n\n---\n\n");
+            }
+            identity_parts.push_str(&section);
+        }
         if !identity_parts.is_empty() {
             append_module!("IDENTITY", &identity_parts);
         }
