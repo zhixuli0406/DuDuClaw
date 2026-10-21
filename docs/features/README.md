@@ -66,6 +66,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 59 | [Local Proxy](59-local-proxy.md) | `duduclaw proxy` — an OpenAI-compatible localhost endpoint so Aider / Cline / Codex can borrow the account pool; Bearer-gated, loopback by default, honest about OAuth seats not being forwardable |
 | 60 | [Discovery](60-discovery.md) | Approved-workspace exploration, budgeted tree records, verified artifacts and zero-LLM held-out policy comparisons; integration validation in progress |
 | 61 | [Odoo website live chat](61-odoo-livechat.md) | AI employees answer Odoo Live Chat visitors as an operator; audience rules pick the employee per visitor; human takeover and handoff |
+| 63 | [Document knowledge base](63-knowledge-base.md) | Collections of company documents with per-collection permissions (users, departments, AI employees, channels), sandboxed extraction, keyword search with page / row locations, read-only `knowledge_*` MCP tools, `duduclaw knowledge eval` |
 
 ---
 

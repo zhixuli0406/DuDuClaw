@@ -1,0 +1,45 @@
+[package]
+name = "duduclaw-knowledge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Document knowledge base (collections of uploaded files with collection-level
+# permissions). Storage, extraction, chunking, keyword retrieval and the ACL
+# live here; the gateway owns writes, the background worker and the routes.
+#
+# Document parsers are pinned exactly (`=`): every one of them reads files a
+# customer uploads, so the version that was reviewed is the version that
+# ships. They only ever run inside the `duduclaw knowledge-extract` child
+# process, never in the gateway.
+
+[lints]
+workspace = true
+
+[dependencies]
+duduclaw-core = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+unicode-normalization = "0.1.25"
+# Office containers: deflate only, same as the rest of the workspace.
+zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+quick-xml = "=0.41.0"
+calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
+csv = "1"
+encoding_rs = "0.8"
+scraper = "0.22"
+# scraper's own tree type (already in the lockfile through scraper).
+ego-tree = "0.10"
+# PDF text layer (MIT). Pulls lopdf (MIT) with default features off.
+pdf-extract = "=0.12.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -110,6 +110,8 @@ pub const AGENT_SECURITY_SECTIONS: &[&str] = &[
     "night_engine",
     "os_watch",
     "team",
+    // Which knowledge collections the employee uses (narrowing only).
+    "knowledge",
 ];
 
 /// The only `agent.toml` sections the agent may still edit with Write/Edit

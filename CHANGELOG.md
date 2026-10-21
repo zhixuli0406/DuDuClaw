@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- 文件知識庫（第一階段：後端、上傳、關鍵字搜尋、AI 員工唯讀工具）。公司文件依「集合」存放，每個集合各自設定誰能讀：使用者、部門、AI 員工、通道（整個通道或單一聊天室），角色分檢視者、編輯者、擁有者，預設只有建立者看得到。主管以上能建立集合；管理員等於所有集合的擁有者。
+  - 加入文件：`POST /api/knowledge/upload`（一次最多 20 個檔）、貼上文字、公開網址。支援有文字層的 PDF、Word、Excel（xlsx／xls）、PowerPoint、CSV、純文字、Markdown；舊版 .doc／.ppt、有密碼的檔、掃描版 PDF 會被拒收並說明原因。同一個集合重複上傳同一份檔案會回「已存在」。單檔預設上限 100 MB、50 萬字，超過整份拒收。
+  - 解析一律在獨立子程序 `duduclaw knowledge-extract` 裡做，有時間上限與 CPU 上限，Linux 另有記憶體上限，macOS 與 Linux 加上禁止寫入、禁止連網的沙箱；Office 檔先過既有的壓縮炸彈檢查。解析器當掉不會影響 gateway。
+  - 搜尋：三字以上的詞用 trigram 全文索引，兩字的詞（「請假」、`HR`）用有上限的子字串比對，中文問句會在「的、了、嗎」這類助詞處斷開。結果標出頁碼、投影片或工作表列號，並說明目前只有關鍵字比對。
+  - 三支唯讀 MCP 工具 `knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections`（scope `knowledge:read`，外部金鑰不能取得）。員工能讀的範圍是「授權給它或它部門的集合」與「這個 turn 所服務的人能讀的集合」的交集，群組對話排除 personal 與 restricted；員工可用 `agent.toml [knowledge] collections` 再縮小，`collections = []` 關閉工具。工具透過 gateway 的簽章本機路由查詢，不會直接讀資料庫。
+  - 每次讀取寫入知識庫存取紀錄（不存段落內文，預設保留 180 天）；集合、權限、刪除來源另外寫進 `security_audit.jsonl`。
+  - `duduclaw knowledge eval`：用自己的文件與 JSONL 題目，在一次性的資料庫裡量 Recall@1／5／10 與 MRR@10。
+  - 設定在 `config.toml [knowledge]`；儀表板頁面、向量搜尋、通道回覆自動帶入段落與引用頁尾會在之後的版本提供。
+  - **行為變更**：知識庫預設開啟，所有 AI 員工的工具清單多出上述三支唯讀工具（新建員工從 167 支變 170 支）。不想要的話設 `[knowledge] enabled = false`，或在員工的 `agent.toml` 設 `[knowledge] collections = []`。
+  - 已驗證：各模組單元測試；隔離環境的 gateway 實測（建立集合、設定權限與 revision 衝突、上傳 docx／xlsx／pdf／txt、重複上傳、.doc 拒收、搜尋、讀段落、下載原檔、未授權的使用者被拒、重建、刪除後原檔與搜尋結果一起消失、存取紀錄與稽核紀錄），`mcp-probe.sh` 以兩位員工呼叫三支工具（部門授權讀得到、沒授權的段落回 permission denied、`collections = []` 時工具不列出）；虛構繁中題組關鍵字 Recall@5 為 0.92（12 題中 11 題，漏掉的是同義詞問法）。尚未驗證：Windows 與 Linux 的解析子程序（沙箱與記憶體上限只在 macOS 實際跑過）、使用 CID 字型的繁中 PDF（只測過一份 macOS 產生的檔）、大量文件時的搜尋速度、網址來源只測過 example.com。WebChat 與通道的 turn 目前還無法辨識是哪位已登入的人，工具呼叫只能用 `channel` 授權的集合，待觸發詞路由合併後接上。
+
 ### Fixed
 - 用 Codex 的 AI 員工現在看得到自己 `.mcp.json` 裡的其他 MCP 伺服器（例如券商連線）。之前 Codex 每次啟動只登記 DuDuClaw 自己的伺服器，其他伺服器整個消失。現在每個第三方伺服器都經過 `duduclaw mcp-proxy` 啟動，和 Claude 員工用同一套第三方工具管制（依工具標註分類、`action_rules`、唯讀通道、需要核准的工具走核准流程）；遠端橋接照原樣登記，直接連網址的項目會被移除並記稽核。名稱和 `duduclaw` 撞名的項目不能取代內建伺服器。第三方伺服器的憑證放在 `<home>/tmp/mcp-proxy-env/`（只有擁有者能進的目錄）裡這次啟動專用的暫存檔，不出現在命令列，也不寫進 `.codex/config.toml`；gateway 啟動時會清掉當機殘留、超過 15 分鐘的暫存檔。`.codex/config.toml` 改成一開始就以只有擁有者能讀的權限寫入，已存在的檔案也會重設成這個權限。摘要、分類、裁判這類輔助呼叫不會拿到員工的第三方伺服器（和 Claude 一樣）。沒有第三方伺服器的員工（包括團隊角色成員）啟動流程和以前相同，不多跑 `.mcp.json` 檢查也不改寫該檔。**行為變更**：Codex 員工的 `.mcp.json` 讀不到或格式壞掉時，這次啟動會被拒絕（以前 Codex 根本不讀這個檔，所以不受影響）；有第三方伺服器時會先跑 `.mcp.json` 檢查，檢查不過同樣不啟動，檢查通過時可能改寫檔案裡 DuDuClaw 自己那一項（其他項目原樣保留，和 Claude 員工每次啟動、gateway 每次開機時做的修復相同）。已在隔離環境用替身 codex 跑過實際啟動流程，再用 codex 0.163 的 `codex mcp list` 確認兩個伺服器都登記、第三方那個經 `duduclaw mcp-proxy` 啟動。尚未驗證：真實 Codex 對話實際呼叫第三方工具、需要核准的工具在 Codex 單次 120 秒時限內能否等到核准。
 - 用 Antigravity 和 OpenAI 相容 runtime 的 AI 員工，現在也看得到自己 `.mcp.json` 裡的其他 MCP 伺服器。Direct API 回覆與本地推論的工具迴圈和 OpenAI 相容 runtime 共用同一段程式，一起補上。每個伺服器都經過 `duduclaw mcp-proxy`，和 Claude、Codex 員工用同一套第三方工具管制；直接連網址的項目會被移除並記稽核，名稱只能用英數字、`_`、`-`。

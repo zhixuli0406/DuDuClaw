@@ -89,6 +89,8 @@ zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 # so the version that was reviewed is the version that ships.
 csv = "1"
 calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
+# Document knowledge base: `knowledge-extract` child, `knowledge eval`.
+duduclaw-knowledge = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]

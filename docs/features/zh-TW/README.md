@@ -66,6 +66,7 @@
 | 59 | [本機 proxy](59-local-proxy.md) | `duduclaw proxy`：OpenAI 相容的 localhost 端點，讓 Aider／Cline／Codex 借用帳號池；強制 Bearer、預設綁 loopback，並誠實揭露訂閱制 OAuth 席次無法轉發 |
 | 60 | [Discovery 探索](60-discovery.md) | 核准工作區探索、預算與樹狀帳本、雜湊驗證成品、零 LLM held-out 策略比較；整合驗證中 |
 | 61 | [Odoo 網站線上客服](61-odoo-livechat.md) | AI 員工以客服人員身分回覆 Odoo 線上客服訪客；分眾規則決定每位訪客由誰回覆；真人接手與轉接 |
+| 63 | [文件知識庫](63-knowledge-base.md) | 公司文件依集合存放、各集合自訂權限（使用者、部門、AI 員工、通道）；沙箱內解析、可標出頁碼與列號的關鍵字搜尋、唯讀 `knowledge_*` MCP 工具、`duduclaw knowledge eval` |
 
 ---
 

@@ -29,6 +29,8 @@ mod decision_cmd; // Local, read-only support-decision replay
 mod docs_cmd; // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval; // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod eval_scaffold; // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
+mod knowledge_eval_cmd; // `duduclaw knowledge eval` — retrieval Recall@k on a throw-away knowledge.db
+mod knowledge_extract_cmd; // hidden `duduclaw knowledge-extract` — the document-extraction child
 pub mod expert; // WP2.1/WP2.2: expert-pack install/pack/list/remove/export
 pub mod license; // M1: license activate/status/refresh/export/import/deactivate
 mod mcp;
@@ -1865,6 +1867,38 @@ enum OpsCommands {
 }
 
 #[derive(Subcommand)]
+enum KnowledgeCommands {
+    /// Measure retrieval quality (Recall@1/5/10, MRR@10) on your own
+    /// documents and a JSONL question file, in a throw-away database.
+    Eval {
+        /// Folder of documents to ingest (pdf, docx, xlsx, xls, pptx, csv, txt, md).
+        #[arg(long)]
+        docs: PathBuf,
+        /// JSONL questions: {"id","question","type","answerable","gold":[{"source","page"|"sheet"+"row"|"slide","contains"}]}.
+        #[arg(long)]
+        questions: PathBuf,
+        /// Embedding model. This release: `none` (keyword retrieval only).
+        #[arg(long, default_value = "none")]
+        model: String,
+        /// Comma-separated modes. This release evaluates `keyword`.
+        #[arg(long, default_value = "keyword")]
+        modes: String,
+        /// k for the pass/fail threshold (1, 5 or 10).
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+        /// Exit 1 when Recall@k is below this value.
+        #[arg(long)]
+        min_recall: Option<f64>,
+        /// Write the full JSON report here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Keep the evaluation database in this (empty) folder instead of a temp dir.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ToolingCommands {
     /// Operator-only experimental exploration runner.
     #[command(hide = true)]
@@ -1914,6 +1948,23 @@ enum ToolingCommands {
         #[arg(long)]
         server: String,
     },
+
+    /// (internal) Document-extraction child of the knowledge-base ingest
+    /// worker: reads one file, prints its text segments as one JSON line.
+    /// Spawned by the gateway under a timeout and OS limits. Hidden.
+    #[command(hide = true, name = "knowledge-extract")]
+    KnowledgeExtract {
+        #[arg(long)]
+        format: String,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = duduclaw_knowledge::limits::DEFAULT_MAX_SOURCE_CHARS)]
+        max_chars: usize,
+    },
+
+    /// Document knowledge base tools.
+    #[command(subcommand)]
+    Knowledge(KnowledgeCommands),
 
     /// (internal) Desktop recording worker loop — spawned detached by the
     /// `desktop_record_start` MCP tool (WP3.3 R3). Hidden from help.
@@ -3877,6 +3928,11 @@ pub fn entry_point_blocking() {
 
 pub async fn entry_point() {
     let cli = Cli::parse();
+    // The extraction child: no logger, no TLS, no home directory — it runs
+    // with an empty environment under an OS sandbox that denies writes.
+    if let Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) = &cli.command {
+        knowledge_extract_cmd::run(format, input, *max_chars);
+    }
     if is_read_only_survival_command(&cli.command) {
         // Analysis must reach neither persistent logging/OTLP initialization
         // nor the persistent redaction override path before dispatch.
@@ -5318,6 +5374,32 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Ops(OpsCommands::Security) => cmd_security_posture().await,
         Commands::Ops(OpsCommands::Import { file, force }) => cmd_import_data(file, force).await,
         Commands::Tooling(ToolingCommands::McpServer) => cmd_mcp_server().await,
+        Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) => {
+            knowledge_extract_cmd::run(&format, &input, max_chars)
+        }
+        Commands::Tooling(ToolingCommands::Knowledge(KnowledgeCommands::Eval {
+            docs,
+            questions,
+            model,
+            modes,
+            k,
+            min_recall,
+            report,
+            work_dir,
+        })) => {
+            let code = knowledge_eval_cmd::run(knowledge_eval_cmd::EvalArgs {
+                docs,
+                questions,
+                model,
+                modes,
+                k,
+                min_recall,
+                report,
+                work_dir,
+            })
+            .await?;
+            std::process::exit(code);
+        }
         Commands::Tooling(ToolingCommands::Discover { command }) => {
             discover_cli::execute(command, &duduclaw_home(), agent_session_identity().as_deref()).await
         }

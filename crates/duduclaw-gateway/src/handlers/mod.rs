@@ -174,6 +174,7 @@ mod device_timedate_rpc;
 mod maintenance_rpc;
 mod device_backup;
 mod dispatch_core;
+mod dispatch_kb;
 mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
@@ -461,6 +462,9 @@ impl MethodHandler {
             .handle_method(method, params.clone(), ctx)
             .await
         {
+            return frame;
+        }
+        if let Some(frame) = self.dispatch_kb(method, &params, ctx).await {
             return frame;
         }
         self.dispatch_core(method, params, ctx, conn).await

@@ -116,6 +116,11 @@ pub enum Scope {
     TeamHandoff,
     /// Internal discovery requests and ACL-bound queries; never externally grantable.
     DiscoveryExecute,
+    /// Document knowledge base reads (`knowledge_search`,
+    /// `knowledge_get_passage`, `knowledge_list_collections`). Not in
+    /// [`EXTERNALLY_GRANTABLE_SCOPES`]: the gateway resolves who a call is for
+    /// from the employee's live turn, which an external client does not have.
+    KnowledgeRead,
     Admin,
 }
 
@@ -147,6 +152,7 @@ impl std::fmt::Display for Scope {
             Scope::FilesRead => "files:read",
             Scope::TeamHandoff => "team:handoff",
             Scope::DiscoveryExecute => "discovery:execute",
+            Scope::KnowledgeRead => "knowledge:read",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -186,6 +192,7 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "team:handoff" => Scope::TeamHandoff,
         "recording" => Scope::Recording,
         "discovery:execute" => Scope::DiscoveryExecute,
+        "knowledge:read" => Scope::KnowledgeRead,
         "admin" => Scope::Admin,
         _ => return None,
     })
@@ -224,6 +231,8 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
 pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
     match tool_name {
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" => Some(Scope::DiscoveryExecute),
+        // Document knowledge base — read-only, ACL enforced by the gateway.
+        "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections" => Some(Scope::KnowledgeRead),
         // ── Memory: read family ──────────────────────────────────────────
         "memory_search"
         | "memory_read"
