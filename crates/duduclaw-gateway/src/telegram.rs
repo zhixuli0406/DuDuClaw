@@ -876,7 +876,32 @@ async fn process_telegram_message(
     // Check for bot commands (always process, even in mention-only mode)
     let is_command = text_content.starts_with('/');
 
-    if is_group && mention_only && !bot_mentioned && !is_command && !replied_to_bot {
+    // The shared bot also counts a message that calls an AI employee by `@`
+    // (or asks for the `@` list), or the one message a tapped employee is
+    // waiting for, as addressed. Per-agent bots keep their own @username rule.
+    let calls_employee = agent_name.is_none() && is_group && mention_only && {
+        let conversation = match thread_id {
+            Some(tid) => format!("telegram:{chat_id}:{tid}"),
+            None => format!("telegram:{chat_id}"),
+        };
+        let from = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+        let reg = ctx.registry.read().await;
+        crate::trigger_route::turn::calls_anyone(&reg, text_content)
+            || crate::trigger_route::turn::has_pending(
+                "telegram",
+                &conversation,
+                &from,
+                crate::trigger_route::pending::next_seq(),
+            )
+    };
+
+    if is_group
+        && mention_only
+        && !bot_mentioned
+        && !is_command
+        && !replied_to_bot
+        && !calls_employee
+    {
         return;
     }
 
@@ -1248,8 +1273,65 @@ async fn process_telegram_message(
         drop(typing_guard);
         return;
     }
+    // ── `@` routing for the shared bot (D6) ──
+    // Decided before the reply builder so the `@` list can carry an inline
+    // keyboard; the binding guidance (`Guide`) keeps priority.
+    let shared_route = match agent_name {
+        Some(_) => None,
+        None => Some(resolve_shared_route(&ctx, &user_id).await),
+    };
+    let trigger_decision = match &shared_route {
+        Some(SharedRoute::Bound(bound)) => {
+            Some(telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, Some(bound)).await)
+        }
+        Some(SharedRoute::Unbound) => {
+            Some(telegram_trigger_decision(&ctx, &session_id, &user_id, &input_text, None).await)
+        }
+        _ => None,
+    };
+    if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) = &trigger_decision {
+        // Same access gate as the AI path: a blocked user gets nothing.
+        if let Some(gate) =
+            crate::channel_reply::check_user_access_gate(&ctx, &session_id, &user_id, &input_text).await
+        {
+            if !gate.is_empty() {
+                send_reply(&client, &api_base, chat_id, &gate, thread_id, msg_id, None).await;
+            }
+            return;
+        }
+        let (body, markup) = match list {
+            Some(agents) if !agents.is_empty() => (
+                crate::trigger_route::list::list_intro(agents),
+                Some(crate::trigger_route::list::telegram_keyboard(agents)),
+            ),
+            _ => (text.clone(), None),
+        };
+        send_reply(&client, &api_base, chat_id, &body, thread_id, msg_id, markup).await;
+        return;
+    }
+    let called = match &trigger_decision {
+        Some(crate::trigger_route::turn::TurnDecision::Agent { id, via_trigger }) => {
+            Some((id.clone(), *via_trigger))
+        }
+        _ => None,
+    };
+
     let (reply, guarded) = crate::approval::scope_trusted_reply(target, async {
-        if let Some(ref agent) = agent_name {
+        if let Some((ref called_agent, _)) = called {
+            // Called by `@` (or the one message a tapped employee was
+            // waiting for): this message only.
+            let guard = build_guarded_reply_for_agent(
+                &input_text,
+                &ctx,
+                called_agent,
+                &session_id,
+                &user_id,
+                Some(on_progress),
+            )
+            .await;
+            effective_agent = Some(called_agent.clone());
+            (guard.text.clone(), Some(guard))
+        } else if let Some(ref agent) = agent_name {
             // Per-agent bot: unchanged deterministic routing to its owner.
             let guard = build_guarded_reply_for_agent(
                 &input_text,
@@ -1263,7 +1345,7 @@ async fn process_telegram_message(
             (guard.text.clone(), Some(guard))
         } else {
             // Global/shared bot: route by the user→agent binding (WP9).
-            match resolve_shared_route(&ctx, &user_id).await {
+            match shared_route.unwrap_or(SharedRoute::Unbound) {
                 SharedRoute::Bound(bound_agent) => {
                     let guard = build_guarded_reply_for_agent(
                         &input_text,
@@ -1294,6 +1376,15 @@ async fn process_telegram_message(
     })
     .await;
     drop(typing_guard);
+
+    // A called (non-default) employee's reply starts with its name.
+    let reply = match &called {
+        Some((id, true)) => {
+            let name = crate::trigger_route::display_name(&*ctx.registry.read().await, id);
+            crate::trigger_route::with_reply_prefix(reply, &name)
+        }
+        _ => reply,
+    };
 
     // WP1.3: 📎DELIVER: outbound — send any generated files back to
     // Telegram (sendDocument) and strip the marker from the text.
@@ -1641,6 +1732,26 @@ async fn handle_callback_query(
             )
             .await;
         });
+        return;
+    }
+
+    // A name tapped in the shared bot's `@` list: the presser's next message
+    // goes to that employee (one-shot), after re-checking their access.
+    if let Some(picked) = crate::trigger_route::list::parse_telegram_pick(data) {
+        answer_callback_query(client, api_base, &cb.id, "").await;
+        let session_id = match thread_id {
+            Some(tid) => format!("telegram:{chat_id}:{tid}"),
+            None => format!("telegram:{chat_id}"),
+        };
+        let presser = cb.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+        if crate::channel_reply::check_user_access_gate(ctx, &session_id, &presser, "")
+            .await
+            .is_some()
+        {
+            return;
+        }
+        let text = telegram_pick(ctx, &session_id, &presser, picked).await;
+        send_reply(client, api_base, chat_id, &text, thread_id, None, None).await;
         return;
     }
 
@@ -2056,6 +2167,70 @@ async fn handle_command(
 }
 
 // ── WP9: shared-bot user→agent binding ──────────────────────
+
+/// The `@` routing decision for one shared-bot message. `bound` is the
+/// user's bound employee (their default), else the channel default.
+async fn telegram_trigger_decision(
+    ctx: &Arc<ReplyContext>,
+    session_id: &str,
+    user_id: &str,
+    text: &str,
+    bound: Option<&str>,
+) -> crate::trigger_route::turn::TurnDecision {
+    let reg = ctx.registry.read().await;
+    let fallback = match bound {
+        Some(b) => Some(b.to_string()),
+        None => crate::channel_reply::resolve_fallback_agent(ctx, &reg, session_id, user_id)
+            .await
+            .map(|a| a.config.agent.name.clone()),
+    };
+    let event = format!("{session_id}#{}", uuid::Uuid::new_v4());
+    crate::trigger_route::turn::decide_channel_turn(
+        &ctx.home_dir,
+        &reg,
+        crate::trigger_route::turn::ChannelTurn {
+            channel: "telegram",
+            conversation: session_id,
+            sender: user_id,
+            text,
+            fallback: fallback.as_deref(),
+            event: &event,
+            seq: crate::trigger_route::pending::next_seq(),
+            quiet: false,
+        },
+    )
+}
+
+/// A tap on the shared bot's `@` list.
+async fn telegram_pick(ctx: &Arc<ReplyContext>, session_id: &str, presser: &str, agent: &str) -> String {
+    let bound = match resolve_shared_route(ctx, presser).await {
+        SharedRoute::Bound(b) => Some(b),
+        _ => None,
+    };
+    let reg = ctx.registry.read().await;
+    let fallback = match bound {
+        Some(b) => Some(b),
+        None => crate::channel_reply::resolve_fallback_agent(ctx, &reg, session_id, presser)
+            .await
+            .map(|a| a.config.agent.name.clone()),
+    };
+    let event = format!("pick:{session_id}#{}", uuid::Uuid::new_v4());
+    crate::trigger_route::turn::pick_from_list(
+        &ctx.home_dir,
+        &reg,
+        crate::trigger_route::turn::ChannelTurn {
+            channel: "telegram",
+            conversation: session_id,
+            sender: presser,
+            text: "",
+            fallback: fallback.as_deref(),
+            event: &event,
+            seq: crate::trigger_route::pending::next_seq(),
+            quiet: false,
+        },
+        agent,
+    )
+}
 
 /// How the shared (global) Telegram bot should route one user's message.
 enum SharedRoute {

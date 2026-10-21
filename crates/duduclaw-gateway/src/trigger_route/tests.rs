@@ -1,0 +1,677 @@
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::time::Duration;
+
+use duduclaw_agent::registry::AgentRegistry;
+use duduclaw_auth::UserRole;
+
+use super::access::{Sender, SenderAccess};
+use super::list;
+use super::pending::{self, PendingKey};
+use super::turn::{ChannelTurn, TurnDecision, decision_for_route};
+use super::*;
+
+pub(crate) fn write_agent(
+    root: &Path,
+    id: &str,
+    display: &str,
+    trigger: &str,
+    role: &str,
+    extra: &str,
+) {
+    let toml = format!(
+        r#"[agent]
+name = "{id}"
+display_name = "{display}"
+role = "{role}"
+status = "active"
+trigger = "{trigger}"
+reports_to = ""
+icon = "🐾"
+
+[model]
+preferred = "claude-haiku-4-5"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+api_mode = "cli"
+
+[container]
+timeout_ms = 60000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 500
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = false
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+gvu_enabled = false
+cognitive_memory = false
+max_silence_hours = 168.0
+max_gvu_generations = 0
+observation_period_hours = 24.0
+skill_token_budget = 500
+max_active_skills = 2
+{extra}
+"#
+    );
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.toml"), toml).unwrap();
+}
+
+pub(crate) async fn registry(public_sales: bool) -> (tempfile::TempDir, AgentRegistry) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let agents = tmp.path().join("agents");
+    write_agent(&agents, "dudu", "嘟嘟總機", "@嘟嘟總機", "main", "");
+    write_agent(
+        &agents,
+        "finance",
+        "財務小幫手",
+        "@財務小幫手",
+        "specialist",
+        "",
+    );
+    let extra = if public_sales {
+        "\n[channels]\npublic_trigger = true\n"
+    } else {
+        ""
+    };
+    write_agent(
+        &agents,
+        "sales-rep",
+        "業務專員",
+        "@sales-rep",
+        "specialist",
+        extra,
+    );
+    let mut reg = AgentRegistry::new(agents);
+    reg.scan().await.unwrap();
+    assert_eq!(reg.list().len(), 3);
+    (tmp, reg)
+}
+
+fn account(bound: &[&str], channel: bool) -> SenderAccess {
+    SenderAccess::from_role(
+        "u1",
+        UserRole::Employee,
+        bound.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+        channel,
+    )
+}
+
+fn admin() -> SenderAccess {
+    SenderAccess::from_role("a1", UserRole::Admin, BTreeSet::new(), false)
+}
+
+#[tokio::test]
+async fn webchat_account_bound_to_finance_cannot_reach_sales_by_trigger() {
+    let (_t, reg) = registry(false).await;
+    let acc = account(&["finance"], false);
+    assert_eq!(
+        decide(&reg, "@sales-rep 報價", &acc, Some("dudu")),
+        TriggerRoute::Forbidden {
+            agent: "sales-rep".into()
+        }
+    );
+    assert_eq!(
+        decide(&reg, "@財務小幫手 幫我算帳", &acc, Some("dudu")),
+        TriggerRoute::Routed {
+            agent: "finance".into(),
+            bare: false
+        }
+    );
+    // The default employee is not callable for a WebChat account without a
+    // binding to it.
+    assert_eq!(
+        decide(&reg, "@嘟嘟總機 你好", &acc, Some("dudu")),
+        TriggerRoute::Forbidden {
+            agent: "dudu".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn admin_may_call_everyone() {
+    let (_t, reg) = registry(false).await;
+    for (text, id) in [
+        ("@sales-rep x", "sales-rep"),
+        ("@業務專員 x", "sales-rep"),
+        ("@嘟嘟總機 x", "dudu"),
+    ] {
+        assert_eq!(
+            decide(&reg, text, &admin(), Some("dudu")),
+            TriggerRoute::Routed {
+                agent: id.into(),
+                bare: false
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn unmapped_channel_sender_reaches_only_default_and_public_employees() {
+    let (_t, reg) = registry(false).await;
+    let u = SenderAccess::unmapped();
+    assert!(matches!(
+        decide(&reg, "@財務小幫手 幫我", &u, Some("dudu")),
+        TriggerRoute::Forbidden { .. }
+    ));
+    assert_eq!(
+        decide(&reg, "@嘟嘟總機 你好", &u, Some("dudu")),
+        TriggerRoute::Routed {
+            agent: "dudu".into(),
+            bare: false
+        }
+    );
+    let (_t2, reg_pub) = registry(true).await;
+    assert_eq!(
+        decide(&reg_pub, "@sales-rep 報價", &u, Some("dudu")),
+        TriggerRoute::Routed {
+            agent: "sales-rep".into(),
+            bare: false
+        }
+    );
+    // The list shows exactly what may be called.
+    assert_eq!(
+        callable_ids(&reg_pub, &u, Some("dudu")),
+        vec!["dudu".to_string(), "sales-rep".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn mapped_channel_account_keeps_default_and_adds_bindings() {
+    let (_t, reg) = registry(false).await;
+    let acc = account(&["finance"], true);
+    assert_eq!(
+        callable_ids(&reg, &acc, Some("dudu")),
+        vec!["dudu".to_string(), "finance".to_string()]
+    );
+    let webchat = account(&["finance"], false);
+    assert_eq!(
+        callable_ids(&reg, &webchat, Some("dudu")),
+        vec!["finance".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn bare_mention_and_list_requests() {
+    let (_t, reg) = registry(false).await;
+    assert_eq!(
+        decide(&reg, "@財務小幫手", &admin(), Some("dudu")),
+        TriggerRoute::Routed {
+            agent: "finance".into(),
+            bare: true
+        }
+    );
+    match decide(&reg, "@", &account(&["finance"], true), Some("dudu")) {
+        TriggerRoute::List { candidates, .. } => {
+            assert_eq!(candidates, vec!["dudu".to_string(), "finance".to_string()])
+        }
+        other => panic!("expected list, got {other:?}"),
+    }
+    match decide(&reg, "@財務 幫我", &admin(), Some("dudu")) {
+        TriggerRoute::List { candidates, .. } => {
+            assert_eq!(candidates, vec!["finance".to_string()])
+        }
+        other => panic!("expected list, got {other:?}"),
+    }
+    assert_eq!(
+        decide(&reg, "財務小幫手 幫我", &admin(), Some("dudu")),
+        TriggerRoute::None
+    );
+}
+
+#[tokio::test]
+async fn paused_employee_cannot_be_called() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let agents = tmp.path().join("agents");
+    write_agent(&agents, "dudu", "嘟嘟總機", "@嘟嘟總機", "main", "");
+    write_agent(
+        &agents,
+        "finance",
+        "財務小幫手",
+        "@財務小幫手",
+        "specialist",
+        "",
+    );
+    let p = agents.join("finance").join("agent.toml");
+    let body = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("status = \"active\"", "status = \"paused\"");
+    std::fs::write(&p, body).unwrap();
+    let mut reg = AgentRegistry::new(agents);
+    reg.scan().await.unwrap();
+    assert_eq!(
+        decide(&reg, "@財務小幫手 x", &admin(), Some("dudu")),
+        TriggerRoute::None
+    );
+}
+
+fn key(tag: &str) -> PendingKey {
+    PendingKey::new(
+        "test",
+        &format!("conv-{tag}-{}", uuid::Uuid::new_v4()),
+        "sender",
+    )
+}
+
+#[test]
+fn pending_addressee_is_used_once() {
+    let k = key("once");
+    pending::arm(&k, "finance", "e1", 10);
+    assert_eq!(pending::peek(&k, 11), Some("finance".into()));
+    assert_eq!(pending::claim(&k, "e2", 11), Some("finance".into()));
+    // Same event recomputing its route keeps the answer (durable ingress).
+    assert_eq!(pending::claim(&k, "e2", 11), Some("finance".into()));
+    // The message after that is back to normal.
+    assert_eq!(pending::claim(&k, "e3", 12), None);
+    assert_eq!(pending::peek(&k, 12), None);
+}
+
+#[test]
+fn pending_addressee_expires() {
+    let k = key("ttl");
+    pending::arm(&k, "finance", "e1", 10);
+    pending::age_for_test(&k, pending::PENDING_TTL + Duration::from_secs(1));
+    assert_eq!(pending::claim(&k, "e2", 11), None);
+}
+
+#[test]
+fn an_older_event_never_consumes_or_rearms() {
+    let k = key("order");
+    pending::arm(&k, "finance", "e5", 50);
+    // An event that arrived before the arming one, recomputed late.
+    assert_eq!(pending::claim(&k, "e4", 40), None);
+    pending::arm(&k, "sales-rep", "e3", 30);
+    assert_eq!(pending::claim(&k, "e6", 60), Some("finance".into()));
+    // Re-arming from the same origin after use changes nothing.
+    pending::arm(&k, "finance", "e5", 50);
+    assert_eq!(pending::claim(&k, "e7", 70), None);
+}
+
+#[test]
+fn a_newer_explicit_mention_cancels() {
+    let k = key("cancel");
+    pending::arm(&k, "finance", "e1", 10);
+    pending::cancel(&k, "e2", 20);
+    assert_eq!(pending::claim(&k, "e3", 30), None);
+}
+
+#[tokio::test]
+async fn bare_mention_arms_and_next_message_goes_to_that_employee_only() {
+    let (t, reg) = registry(false).await;
+    let conv = format!("telegram:{}", uuid::Uuid::new_v4());
+    let turn = |text: &'static str, event: &'static str, seq: i64| ChannelTurn {
+        channel: "telegram",
+        conversation: Box::leak(conv.clone().into_boxed_str()),
+        sender: "42",
+        text,
+        fallback: Some("dudu"),
+        event,
+        seq,
+        quiet: false,
+    };
+    // An admin-shaped access stands in for a mapped account here.
+    let acc = admin();
+    let first = decision_for_route(
+        t.path(),
+        &reg,
+        turn("@財務小幫手", "m1", 1),
+        &acc,
+        TriggerRoute::Routed {
+            agent: "finance".into(),
+            bare: true,
+        },
+    );
+    match first {
+        TurnDecision::Reply { text, list } => {
+            assert!(text.contains("財務小幫手"));
+            assert!(list.is_none());
+        }
+        other => panic!("expected the task prompt, got {other:?}"),
+    }
+    // The pending addressee is re-checked against the sender's access when
+    // used; an unmapped sender (no users.db in this home) may not call
+    // finance, so it falls back to the default employee and is consumed.
+    let second = decision_for_route(
+        t.path(),
+        &reg,
+        turn("幫我算帳", "m2", 2),
+        &acc,
+        TriggerRoute::None,
+    );
+    assert_eq!(second, TurnDecision::Default);
+    let third = decision_for_route(
+        t.path(),
+        &reg,
+        turn("再一次", "m3", 3),
+        &acc,
+        TriggerRoute::None,
+    );
+    assert_eq!(third, TurnDecision::Default);
+}
+
+#[tokio::test]
+async fn pending_for_a_default_employee_routes_without_label() {
+    let (t, reg) = registry(false).await;
+    let conv = format!("telegram:{}", uuid::Uuid::new_v4());
+    let mk = |text: &'static str, event: &'static str, seq: i64| ChannelTurn {
+        channel: "telegram",
+        conversation: Box::leak(conv.clone().into_boxed_str()),
+        sender: "42",
+        text,
+        fallback: Some("dudu"),
+        event,
+        seq,
+        quiet: false,
+    };
+    let acc = SenderAccess::unmapped();
+    let _ = decision_for_route(
+        t.path(),
+        &reg,
+        mk("@嘟嘟總機", "m1", 1),
+        &acc,
+        TriggerRoute::Routed {
+            agent: "dudu".into(),
+            bare: true,
+        },
+    );
+    assert_eq!(
+        decision_for_route(
+            t.path(),
+            &reg,
+            mk("你好", "m2", 2),
+            &acc,
+            TriggerRoute::None
+        ),
+        TurnDecision::Agent {
+            id: "dudu".into(),
+            via_trigger: false
+        }
+    );
+}
+
+#[tokio::test]
+async fn forbidden_turn_answers_without_a_model_call_and_is_audited() {
+    let (t, reg) = registry(false).await;
+    let d = decision_for_route(
+        t.path(),
+        &reg,
+        ChannelTurn {
+            channel: "line",
+            conversation: "line:U1",
+            sender: "U1",
+            text: "@財務小幫手 x",
+            fallback: Some("dudu"),
+            event: "e",
+            seq: 1,
+            quiet: false,
+        },
+        &SenderAccess::unmapped(),
+        TriggerRoute::Forbidden {
+            agent: "finance".into(),
+        },
+    );
+    assert_eq!(
+        d,
+        TurnDecision::Reply {
+            text: FORBIDDEN_TEXT.into(),
+            list: None
+        }
+    );
+    let audit = std::fs::read_to_string(t.path().join("security_audit.jsonl")).unwrap();
+    assert!(audit.contains("trigger_route_refused"));
+    assert!(
+        !audit.contains("\"U1\""),
+        "raw platform id must not be logged"
+    );
+}
+
+#[tokio::test]
+async fn line_quick_reply_payload_is_capped_and_paginated() {
+    let agents: Vec<list::CallableAgent> = (0..20)
+        .map(|i| list::CallableAgent {
+            id: format!("a{i}"),
+            display_name: format!("員工{i}號，名字很長很長很長很長很長很長"),
+            icon: String::new(),
+            call_text: format!("@員工{i}號"),
+        })
+        .collect();
+    let first = list::line_list_message(&agents, 0);
+    let items = first["quickReply"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), list::LINE_QUICK_REPLY_MAX);
+    assert_eq!(items[0]["action"]["type"], "message");
+    assert_eq!(items[0]["action"]["text"], "@員工0號");
+    assert!(
+        items[0]["action"]["label"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 20
+    );
+    let more = &items[12]["action"];
+    assert_eq!(more["type"], "postback");
+    assert_eq!(
+        list::parse_line_page(more["data"].as_str().unwrap()),
+        Some(1)
+    );
+    let second = list::line_list_message(&agents, 1);
+    let items = second["quickReply"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 8, "the remaining 8 fit without another 更多");
+    assert_eq!(items[0]["action"]["text"], "@員工12號");
+}
+
+#[tokio::test]
+async fn line_list_for_three_uses_message_actions_with_call_text() {
+    let (_t, reg) = registry(true).await;
+    let ids = callable_ids(&reg, &SenderAccess::unmapped(), Some("dudu"));
+    let agents = list::callable_agents(&reg, &ids);
+    let msg = list::line_list_message(&agents, 0);
+    let texts: Vec<&str> = msg["quickReply"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["action"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, vec!["@嘟嘟總機", "@業務專員"]);
+}
+
+#[test]
+fn telegram_keyboard_buttons_carry_the_pick_callback() {
+    let agents = vec![list::CallableAgent {
+        id: "finance".into(),
+        display_name: "財務小幫手".into(),
+        icon: String::new(),
+        call_text: "@財務小幫手".into(),
+    }];
+    let kb = list::telegram_keyboard(&agents);
+    let data = kb["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap();
+    assert_eq!(list::parse_telegram_pick(data), Some("finance"));
+}
+
+#[test]
+fn reply_prefix_skips_empty_replies() {
+    assert_eq!(with_reply_prefix(String::new(), "財務小幫手"), "");
+    assert_eq!(
+        with_reply_prefix("好".into(), "財務小幫手"),
+        "【財務小幫手】\n好"
+    );
+}
+
+#[test]
+fn unmapped_audit_label_does_not_carry_the_platform_id() {
+    let label = SenderAccess::unmapped().audit_label("line", "Uabcdef123");
+    assert!(label.starts_with("unmapped:line:"));
+    assert!(!label.contains("Uabcdef123"));
+    assert_eq!(
+        SenderAccess {
+            sender: Sender::Admin,
+            channel: true
+        }
+        .audit_label("line", "x"),
+        "admin"
+    );
+}
+
+#[tokio::test]
+async fn channel_sender_without_identity_store_is_unmapped() {
+    let t = tempfile::TempDir::new().unwrap();
+    assert_eq!(
+        access::for_channel_sender(t.path(), "line", "U1"),
+        SenderAccess::unmapped()
+    );
+}
+
+#[tokio::test]
+async fn channel_sender_maps_only_through_a_verified_identity() {
+    let t = tempfile::TempDir::new().unwrap();
+    let db = duduclaw_auth::UserDb::new(&t.path().join("users.db")).unwrap();
+    let user = db
+        .create_user("emp@test.local", "Emp", "EmpPass-12345", UserRole::Employee)
+        .unwrap();
+    db.bind_agent(&user.id, "finance", duduclaw_auth::AccessLevel::Operator)
+        .unwrap();
+    db.bind_channel_identity(&user.id, "line", "U-unverified", false)
+        .unwrap();
+    db.bind_channel_identity(&user.id, "line", "U-verified", true)
+        .unwrap();
+    assert_eq!(
+        access::for_channel_sender(t.path(), "line", "U-unverified"),
+        SenderAccess::unmapped()
+    );
+    let mapped = access::for_channel_sender(t.path(), "line", "U-verified");
+    match mapped.sender {
+        Sender::Account { bound, .. } => assert!(bound.contains("finance")),
+        other => panic!("expected a mapped account, got {other:?}"),
+    }
+    assert!(mapped.channel);
+}
+
+#[tokio::test]
+async fn mapped_sender_one_shot_goes_to_the_called_employee_then_back() {
+    let (t, reg) = registry(false).await;
+    let db = duduclaw_auth::UserDb::new(&t.path().join("users.db")).unwrap();
+    let user = db
+        .create_user("emp@test.local", "Emp", "EmpPass-12345", UserRole::Employee)
+        .unwrap();
+    db.bind_agent(&user.id, "finance", duduclaw_auth::AccessLevel::Operator)
+        .unwrap();
+    db.bind_channel_identity(&user.id, "telegram", "42", true)
+        .unwrap();
+    drop(db);
+    let conv: &'static str =
+        Box::leak(format!("telegram:{}", uuid::Uuid::new_v4()).into_boxed_str());
+    let mk = |text: &'static str, event: &'static str, seq: i64| ChannelTurn {
+        channel: "telegram",
+        conversation: conv,
+        sender: "42",
+        text,
+        fallback: Some("dudu"),
+        event,
+        seq,
+        quiet: false,
+    };
+    let d = turn::decide_channel_turn(t.path(), &reg, mk("@財務小幫手", "m1", pending::next_seq()));
+    assert!(matches!(d, TurnDecision::Reply { .. }), "{d:?}");
+    let d = turn::decide_channel_turn(t.path(), &reg, mk("幫我算帳", "m2", pending::next_seq()));
+    assert_eq!(
+        d,
+        TurnDecision::Agent {
+            id: "finance".into(),
+            via_trigger: true
+        }
+    );
+    let d = turn::decide_channel_turn(
+        t.path(),
+        &reg,
+        mk("那上個月呢？", "m3", pending::next_seq()),
+    );
+    assert_eq!(d, TurnDecision::Default, "no stickiness after the one-shot");
+    // The mapped account still may not call sales.
+    let d = turn::decide_channel_turn(
+        t.path(),
+        &reg,
+        mk("@sales-rep 報價", "m4", pending::next_seq()),
+    );
+    assert!(matches!(d, TurnDecision::Reply { ref text, .. } if text == FORBIDDEN_TEXT));
+    // `@` lists default + bound employees.
+    let d = turn::decide_channel_turn(t.path(), &reg, mk("@", "m5", pending::next_seq()));
+    match d {
+        TurnDecision::Reply {
+            list: Some(agents), ..
+        } => {
+            let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+            assert_eq!(ids, vec!["dudu", "finance"]);
+        }
+        other => panic!("expected the list, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn calls_anyone_ignores_plain_text_and_counts_any_employee() {
+    let (_t, reg) = registry(false).await;
+    assert!(turn::calls_anyone(&reg, "@sales-rep 報價"));
+    assert!(turn::calls_anyone(&reg, "@"));
+    assert!(turn::calls_anyone(&reg, "請 @財務小幫手 看一下"));
+    assert!(!turn::calls_anyone(&reg, "大家早安"));
+    assert!(!turn::calls_anyone(&reg, "mail a@b.com"));
+}
+
+#[tokio::test]
+async fn picking_from_the_list_rechecks_access() {
+    let (t, reg) = registry(false).await;
+    let conv: &'static str =
+        Box::leak(format!("telegram:{}", uuid::Uuid::new_v4()).into_boxed_str());
+    let turn = ChannelTurn {
+        channel: "telegram",
+        conversation: conv,
+        sender: "777",
+        text: "",
+        fallback: Some("dudu"),
+        event: "pick-1",
+        seq: pending::next_seq(),
+        quiet: false,
+    };
+    // Unmapped presser: finance is not open to them.
+    assert_eq!(
+        turn::pick_from_list(t.path(), &reg, turn, "finance"),
+        FORBIDDEN_TEXT
+    );
+    assert!(!turn::has_pending(
+        "telegram",
+        conv,
+        "777",
+        pending::next_seq()
+    ));
+    // The default employee is.
+    let text = turn::pick_from_list(t.path(), &reg, turn, "dudu");
+    assert!(text.contains("嘟嘟總機"));
+    assert!(turn::has_pending(
+        "telegram",
+        conv,
+        "777",
+        pending::next_seq()
+    ));
+}

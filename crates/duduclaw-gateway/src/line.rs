@@ -26,6 +26,7 @@ use crate::channel_reply::{
 use crate::channel_settings::keys;
 
 mod ingress;
+mod trigger;
 pub(crate) use ingress::durable_line_enabled;
 use ingress::{drain_line_ingress, line_conversation, record_reply_failure};
 
@@ -711,13 +712,25 @@ async fn process_line_events(
                     }
                 }
 
-                // ── Mention-only mode (group chats only, LINE has no native @mention) ──
+                // ── `@` routing (D6): who answers this event, or a direct
+                // answer (list / refusal / "say the task"). Same computation
+                // as the route snapshot, so it agrees with `agent_id`.
+                let route = trigger::line_route(state, &event, false).await;
+
+                // ── Mention-only mode (group chats only) ──
+                // LINE bots get no native @mention, so "mentioned" means the
+                // message calls an employee by `@` (or asks for the `@` list),
+                // or is the one message a tapped/called employee was waiting
+                // for. Everything else in the group is ignored.
                 let mention_only = state
                     .ctx
                     .channel_settings
                     .get_bool("line", scope_id, keys::MENTION_ONLY, false)
                     .await;
-                if is_group && mention_only {
+                if is_group
+                    && mention_only
+                    && !route.as_ref().is_some_and(|r| r.addresses_bot())
+                {
                     continue;
                 }
 
@@ -896,6 +909,33 @@ async fn process_line_events(
                     }
                 }
 
+                // ── Direct `@` answers (no model call) ──
+                // Same access gate as the AI path and commands: a blocked or
+                // unpaired user gets nothing, not the employee list.
+                if let Some(crate::trigger_route::turn::TurnDecision::Reply { text, list }) =
+                    route.as_ref().map(|r| &r.decision)
+                {
+                    let session_id = format!("line:{}", ingress::line_conversation(&event));
+                    if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                        &state.ctx,
+                        &session_id,
+                        sender,
+                        &input_text,
+                    )
+                    .await
+                    {
+                        if !gate_reply.is_empty() {
+                            let messages =
+                                vec![serde_json::json!({ "type": "text", "text": gate_reply })];
+                            let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                        }
+                        continue;
+                    }
+                    let messages = trigger::direct_reply_messages(text, list.as_deref());
+                    let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                    continue;
+                }
+
                 let on_progress = ingress::line_progress_callback(&state, &event, token);
 
                 // Build session ID scoped to group/room or user DM
@@ -1005,11 +1045,21 @@ async fn process_line_events(
                     continue;
                 }
 
-                // Use Flex Message for long replies, plain text for short ones
+                // Use Flex Message for long replies, plain text for short ones.
+                // The header names the employee that answered (it used to
+                // always name the main agent).
                 let agent_name = {
                     let reg = state.ctx.registry.read().await;
-                    reg.main_agent()
-                        .map(|a| a.config.agent.display_name.clone())
+                    reg.get(agent_id)
+                        .or_else(|| reg.main_agent())
+                        .map(|a| crate::trigger_route::display_name(&reg, &a.config.agent.name))
+                };
+                // A called (non-default) employee's reply starts with its name.
+                let reply = match (&route, &agent_name) {
+                    (Some(r), Some(name)) if r.labelled() => {
+                        crate::trigger_route::with_reply_prefix(reply, name)
+                    }
+                    _ => reply,
                 };
                 // M25: segment long replies. A single Flex bubble has tight text
                 // limits, so an over-limit reply would be rejected and silently
@@ -1129,6 +1179,20 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
             let _ = send_reply_rich(&state.http, token, reply_token, messages.clone()).await;
             return;
         }
+    }
+
+    // "更多" on the `@` list: the next page, filtered for this presser.
+    if let Some(page) = crate::trigger_route::list::parse_line_page(data) {
+        let session_id = format!("line:{}", ingress::line_conversation(event));
+        if crate::channel_reply::check_user_access_gate(&state.ctx, &session_id, sender, "")
+            .await
+            .is_some()
+        {
+            return;
+        }
+        let messages = trigger::list_page_messages(state, event, page).await;
+        let _ = send_reply_rich(&state.http, token, reply_token, messages).await;
+        return;
     }
 
     let answer = match data {

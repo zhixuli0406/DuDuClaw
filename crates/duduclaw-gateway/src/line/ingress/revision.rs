@@ -11,8 +11,6 @@
 //! caller): the first backs off, the second quarantines (I-HIGH-3).
 
 use super::super::*;
-use duduclaw_agent::resolver::AgentResolver;
-use duduclaw_core::types::{Message, MessageType};
 
 /// Why a snapshot could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,25 +115,16 @@ pub(crate) async fn line_revision(
         .unwrap_or("");
     let conversation = line_conversation(event);
     let session = format!("line:{conversation}");
-    let message = Message {
-        id: String::new(),
-        message_type: MessageType::Incoming,
-        channel: "line".into(),
-        chat_id: session.clone(),
-        sender: sender.into(),
-        text: event
-            .message
-            .as_ref()
-            .and_then(|m| m.text.as_deref())
-            .unwrap_or("")
-            .into(),
-        timestamp: chrono::Utc::now(),
-        agent_id: None,
-    };
+    // Who handles the event: `@` routing for this sender, else the default
+    // employee. Recomputed with `quiet` so a snapshot never logs or audits;
+    // idempotent per event (see `line::trigger`).
     let (agent_name, agent_dir) = {
+        let route = super::super::trigger::line_route(state, event, true)
+            .await
+            .ok_or(RevisionError::Changed("no_resolved_agent"))?;
         let reg = state.ctx.registry.read().await;
-        let agent = AgentResolver::new(&reg)
-            .resolve(&message)
+        let agent = reg
+            .get(route.agent())
             .ok_or(RevisionError::Changed("no_resolved_agent"))?;
         (agent.config.agent.name.clone(), agent.dir.clone())
     };

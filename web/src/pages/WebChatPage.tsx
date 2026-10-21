@@ -17,6 +17,9 @@ import {
 import {
   AttachmentChip,
   MessageBubble,
+  MentionPopup,
+  MENTION_LISTBOX_ID,
+  mentionOptionId,
   TypingIndicator,
   TaskInsights,
   EmployeeRow,
@@ -34,6 +37,13 @@ import { AgentGlyph } from '@/lib/agent-glyph';
 import { BrandMark } from '@/components/brand';
 import { DuDu } from '@/components/mascot';
 import { isImageMime, readAttachment } from '@/lib/attachments';
+import {
+  applyMention,
+  filterMentionCandidates,
+  findActiveMention,
+  mentionText,
+  type MentionAgent,
+} from '@/lib/mention';
 
 export function WebChatPage() {
   const intl = useIntl();
@@ -70,6 +80,11 @@ export function WebChatPage() {
   const [, setAgentParam] = useUrlStateNullable('agent');
   const navigate = useNavigate();
   const [input, setInput] = useState('');
+  // `@` autocomplete: caret position, highlighted row, and whether Escape
+  // closed the popup for the mention being typed.
+  const [caret, setCaret] = useState(0);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionDismissed, setMentionDismissed] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [pttCapturing, setPttCapturing] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -182,6 +197,26 @@ export function WebChatPage() {
     <DuDu face="idle" size={24} animated={false} label="DuDu" />
   );
 
+  // A reply from a different staff member than the current partner (the
+  // message called them by `@`) shows who answered.
+  const otherAnswerer = (msg: { agentId?: string }) =>
+    msg.agentId && msg.agentId !== historyAgentId ? msg.agentId : null;
+  const assistantAvatar = (msg: { agentId?: string; agentName?: string }) => {
+    const other = otherAnswerer(msg);
+    return other ? (
+      <CharacterAvatar agentId={other} name={msg.agentName ?? other} size={26} variant="avatar" animated={false} />
+    ) : (
+      leadingAvatar
+    );
+  };
+  const answeredByLabel = (msg: { agentId?: string; agentName?: string; role: string }) =>
+    msg.role === 'assistant' && otherAnswerer(msg)
+      ? intl.formatMessage(
+          { id: 'webchat.mention.answeredBy', defaultMessage: '{name} 回覆' },
+          { name: msg.agentName ?? msg.agentId },
+        )
+      : undefined;
+
   // Split off a still-streaming assistant bubble so the step tree can sit above it.
   const last = messages[messages.length - 1];
   const streamingAssistant = isStreaming && last?.role === 'assistant' && last.tokens == null ? last : null;
@@ -191,6 +226,30 @@ export function WebChatPage() {
 
   const newConversation = () => {
     startNewConversation();
+  };
+
+  // `@` list: only the staff this account may call — `agents.list` is
+  // already filtered to them by the gateway, which also re-checks every send.
+  const activeMention = useMemo(() => findActiveMention(input, caret), [input, caret]);
+  const mentionCandidates = useMemo(
+    () => (activeMention ? filterMentionCandidates(agents as readonly MentionAgent[], activeMention.query) : []),
+    [activeMention, agents],
+  );
+  const mentionOpen = activeMention !== null && !mentionDismissed && agentsLoaded;
+  const safeMentionIndex = mentionCandidates.length ? Math.min(mentionIndex, mentionCandidates.length - 1) : 0;
+
+  const pickMention = (agent: MentionAgent) => {
+    if (!activeMention) return;
+    const next = applyMention(input, activeMention, mentionText(agent, agents as readonly MentionAgent[]));
+    setInput(next.text);
+    setCaret(next.caret);
+    setMentionIndex(0);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.caret, next.caret);
+    });
   };
 
   const handleSend = () => {
@@ -203,6 +262,26 @@ export function WebChatPage() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionOpen && !isImeComposing(e)) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionDismissed(true);
+        return;
+      }
+      if (mentionCandidates.length > 0) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          const step = e.key === 'ArrowDown' ? 1 : -1;
+          setMentionIndex((safeMentionIndex + step + mentionCandidates.length) % mentionCandidates.length);
+          return;
+        }
+        if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+          e.preventDefault();
+          pickMention(mentionCandidates[safeMentionIndex]);
+          return;
+        }
+      }
+    }
     // Ignore Enter while a CJK IME is composing (注音/拼音): the first Enter
     // confirms candidate selection, not send — otherwise a half-composed message
     // is dispatched. See `isImeComposing`.
@@ -425,7 +504,12 @@ export function WebChatPage() {
           ) : (
             <>
               {priorMessages.map((msg) => (
-                <MessageBubble key={msg.id} message={msg} leading={msg.role === 'assistant' ? leadingAvatar : undefined} />
+                <MessageBubble
+                  key={msg.id}
+                  message={msg}
+                  leading={msg.role === 'assistant' ? assistantAvatar(msg) : undefined}
+                  label={answeredByLabel(msg)}
+                />
               ))}
 
               {insightsVisible && <TaskInsights tree={stepTree} todos={steps} streaming={isStreaming} />}
@@ -498,20 +582,51 @@ export function WebChatPage() {
               onCapturingChange={setPttCapturing}
             />
             <TalkModeButton handle={talk} disabled={connectionState !== 'connected' || pttCapturing} />
+            <div className="relative flex-1">
+            {mentionOpen && (
+              <MentionPopup
+                candidates={mentionCandidates}
+                activeIndex={safeMentionIndex}
+                onPick={pickMention}
+                onHover={setMentionIndex}
+              />
+            )}
+            <span className="sr-only" aria-live="polite">
+              {mentionOpen
+                ? intl.formatMessage(
+                    { id: 'webchat.mention.count', defaultMessage: '{count} 位可以呼叫的 AI 員工' },
+                    { count: mentionCandidates.length },
+                  )
+                : ''}
+            </span>
             <textarea
               ref={inputRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                setCaret(e.target.selectionStart ?? e.target.value.length);
+                setMentionDismissed(false);
+                setMentionIndex(0);
+              }}
+              onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+              onBlur={() => setMentionDismissed(true)}
+              onFocus={() => setMentionDismissed(false)}
+              aria-autocomplete="list"
+              aria-controls={mentionOpen && mentionCandidates.length > 0 ? MENTION_LISTBOX_ID : undefined}
+              aria-activedescendant={
+                mentionOpen && mentionCandidates.length > 0 ? mentionOptionId(safeMentionIndex) : undefined
+              }
               onKeyDown={handleKeyDown}
               placeholder={intl.formatMessage({ id: 'webchat.placeholder', defaultMessage: 'Type a message…' })}
               rows={1}
               className={cn(
-                'min-h-8 flex-1 resize-none rounded-lg border border-input bg-transparent px-3 py-1.5 text-sm',
+                'min-h-8 w-full resize-none rounded-lg border border-input bg-transparent px-3 py-1.5 text-sm',
                 'placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
                 'dark:bg-input/30',
               )}
               disabled={connectionState !== 'connected'}
             />
+            </div>
             <SubmitButton
               state={isStreaming ? 'submitting' : 'idle'}
               onClick={handleSend}

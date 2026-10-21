@@ -190,6 +190,10 @@ action_rules = [
 
 2026-10-08 收尾起，另外三條需要人核准的路徑也一律這樣綁定（不只 `send`／`purchase`）：MCP 派工閘的 PolicyKernel `ask`、OS 動作工具的情境閘（`anomaly`／`sensitive`，或動作審查的 `ask`），以及 gateway 電腦操作路由中 `computer_*`／`computer_workspace_*` 的核准清單。電腦工具綁定的是 gateway 自己組出的操作快照（輸入的文字與網址只留雜湊，所以卡片只顯示字數或驗證過的主機，不顯示原文），而且 gateway 在消耗核准後會重跑工具閘。聊天中的電腦操作高風險確認本來就是單次且綁定的（`ExecutionBinding` 綁動作雜湊、截圖雜湊、政策版本與決定情境，以 `claim_operation`／`begin_execution` 只認領一次，並和新的截圖重新比對）。workflow 保留自己的綁定：需要人的步驟只能透過帶綁定的請求核准，請求的 payload 與 `ExecutionBinding` 必須等於該步驟的呼叫，操作在 fence 之下認領，所以本來就只涵蓋那一步。安裝核准不變。未涵蓋：指紋算的是核准閘當下的參數，這時 PolicyKernel 改寫與機密還原已經發生；能存取資料庫的人可以同時改掉存下的內容與卡片。目前只有單元與 broker 測試。
 
+## 用 @ 呼叫員工依發話者權限判斷（v1.76）
+
+v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的子字串比對：只綁定一位員工的 WebChat 帳號打別人的觸發詞就能叫到別人，任何 LINE 好友也一樣。現在先解析發話的真人（WebChat 用 dashboard 帳號；通訊軟體用**已驗證**的 `channel_identities`，沒有就視為未綁定），只在這個人叫得到的員工裡比對：管理員全部；dashboard 帳號是綁定的員工；通訊軟體的發話者另外加上這個對話的預設員工，以及 `[channels] public_trigger = true` 的員工（只有管理員能改，員工自己改不了）。叫其他員工會在呼叫模型前被拒絕，並以 `trigger_route_refused` 記進 `security_audit.jsonl`（記帳號，或平台 ID 的雜湊）。沒有綁定預設員工的 WebChat 帳號，也不再預設交給預設員工。任何查詢失敗都當成未綁定處理。細節見[用 @ 呼叫 AI 員工](62-calling-ai-staff.md)。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。

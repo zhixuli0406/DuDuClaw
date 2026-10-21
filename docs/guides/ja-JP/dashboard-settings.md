@@ -48,6 +48,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 
 ## チャネル管理
 
+- グループの「メンションのみ」（`mention_only`、グループごと）：v1.76 から、LINE グループでオンにすると、`@` で AI スタッフを呼ぶメッセージ（または @ 一覧の要求）と、呼ばれたスタッフが待っている 1 件にだけ返信します。以前はグループ全体が無反応になっていました。Telegram の共有 bot もスタッフ名を受け付けます。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照。
 - Web サイト用チャットウィジェット：公開の切り替えは `[webchat] public_widget`、ウィジェットキーは `[webchat] widget_key` に書き込みます（可視 ASCII 16〜256 文字、生成ボタンあり。公開するにはキーが必要。キーは応答に含まれません）。即時反映。ウィジェットキーは `config.toml` に平文で保存されます。Web サイトのページソースに現れる公開キーなので、シークレットとしては扱いません。
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
 
@@ -87,10 +88,11 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | 頭脳とエンジン → 起動内容の簡素化 | `[runtime] minimal_context` |
 | 頭脳とエンジン → 1人の社員に4つの役割 | `[team] enabled`、`[team.roles.<役割>]` |
 | 自動化 → 夜間の整理 | `[night_engine] enabled` |
+| チャネルと連携 → 外部の連絡先から @ で呼び出し（v1.76） | `[channels] public_trigger`（管理者のみ。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照） |
 | 自動化 → 記憶 → 決定の継続、決定の保持日数 | `[memory] decision_continuity`、`decision_ttl_days`（1〜3650） |
 | 詳細設定 → モデル詳細設定 → 詳細キー／値 | 任意の `[セクション] キー`。各行に型（文字列、整数、小数、真偽値、文字列配列）を指定。書き込み前に `AgentConfig` 全体として解析し、失敗すると全体を拒否。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime` セクションはここでは編集できません |
 
-**管理者だけが変更できる項目。** `[agent] reports_to`、`department`、`name`、`[capabilities]` 全体、`[container] sandbox_enabled`、`network_access`、`[permissions] can_modify_own_soul`。管理者以外からの変更は拒否され、管理者による変更が成功すると監査イベント `agent_authority_changed` が、拒否された試みには `agent_authority_refused` が記録されます。`org.toml` は `reports_to` か `department` が実際に変わったときだけ更新されます。
+**管理者だけが変更できる項目。** `[agent] reports_to`、`department`、`name`、`[capabilities]` 全体、`[container] sandbox_enabled`、`network_access`、`[permissions] can_modify_own_soul`、（v1.76）`[channels] public_trigger`。管理者以外からの変更は拒否され、管理者による変更が成功すると監査イベント `agent_authority_changed` が、拒否された試みには `agent_authority_refused` が記録されます。`org.toml` は `reports_to` か `department` が実際に変わったときだけ更新されます。
 
 **権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
 

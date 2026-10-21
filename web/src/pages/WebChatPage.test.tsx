@@ -6,6 +6,7 @@ import { WebChatPage } from './WebChatPage';
 import { useChatStore } from '@/stores/chat-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { api } from '@/lib/api';
+import { useAgentsStore } from '@/stores/agents-store';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -122,5 +123,53 @@ describe('WebChatPage', () => {
     fireEvent.change(input, { target: { value: 'Test message' } });
 
     expect(input).toHaveValue('Test message');
+  });
+
+  it('typing @ lists the callable AI staff and Enter inserts the picked name', () => {
+    const send = vi.fn();
+    useChatStore.setState({ send: send as never, isStreaming: false, connectionState: 'connected' as never });
+    useAgentsStore.setState({
+      loaded: true,
+      agents: [
+        { name: 'dudu', display_name: '嘟嘟總機', role: 'main', status: 'active', trigger: '@嘟嘟總機', icon: '', reports_to: '' },
+        { name: 'finance', display_name: '財務小幫手', role: 'specialist', status: 'active', trigger: '@財務小幫手', icon: '', reports_to: '' },
+      ] as never,
+    });
+    renderWithProviders(<WebChatPage />);
+    const input = screen.getByPlaceholderText(/message/i) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '@財', selectionStart: 2 } });
+    const list = screen.getByRole('listbox');
+    expect(list).toBeInTheDocument();
+    const options = screen.getAllByRole('option');
+    expect(options).toHaveLength(1);
+    expect(options[0]).toHaveTextContent('財務小幫手');
+    expect(input).toHaveAttribute('aria-activedescendant', options[0].id);
+
+    // Enter picks instead of sending.
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(send).not.toHaveBeenCalled();
+    expect(input.value).toBe('@財務小幫手 ');
+    expect(screen.queryByRole('listbox')).toBeNull();
+
+    // Escape closes the list for a bare @.
+    fireEvent.change(input, { target: { value: '@', selectionStart: 1 } });
+    expect(screen.getAllByRole('option')).toHaveLength(2);
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(screen.queryByRole('listbox')).toBeNull();
+  });
+
+  it('labels a reply that another AI staff member answered', () => {
+    useChatStore.setState({
+      selectedAgentId: null,
+      messages: [
+        { id: '1', role: 'assistant', content: '本月支出 3 萬', timestamp: Date.now(), agentId: 'finance', agentName: '財務小幫手' },
+      ],
+    });
+    useAgentsStore.setState({
+      loaded: true,
+      agents: [{ name: 'dudu', display_name: '嘟嘟總機', role: 'main', status: 'active', trigger: '', icon: '', reports_to: '' }] as never,
+    });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByText(/財務小幫手/)).toBeInTheDocument();
   });
 });

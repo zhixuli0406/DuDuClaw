@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- 用 `@` 呼叫 AI 員工的名單（比照通訊軟體 @ 人）：WebChat 輸入框打 `@` 會跳出你叫得到的員工（頭像、名字、部門），邊打邊篩選，方向鍵與 Enter／Tab 插入 `@名字 `，Esc 關閉，支援螢幕閱讀器。LINE 單獨傳 `@`（或 `@` 加部分名字）會回快速回覆按鈕名單（一次最多 13 個，超過有「更多」換頁）；Telegram 共用 bot 回按鈕名單；其他通道回文字名單。名單只列發話者叫得到的員工。
+- 先點名再交辦：在通訊軟體只傳 `@員工`，或在 LINE／Telegram 名單點一位員工，bot 回「請說要交給「○○」的事」，10 分鐘內只有這位發話者在這個對話的**下一則**訊息交給那位員工，之後恢復正常判斷（D6：不黏著）。等待狀態只存在記憶體，閘道重啟就忘了。
+- 員工編輯頁新增「讓外部聯絡人用 @ 呼叫」（`[channels] public_trigger`，預設關閉、只有管理員能改、變更記稽核）。開啟後，沒有綁定 dashboard 帳號的 LINE 好友、Telegram 使用者與網站訪客也能用 `@` 叫這位員工。
+- 回覆標示是誰回答：WebChat 的 `assistant_done` 帶 `agent`、`agent_name`，畫面上不是目前對話員工的回覆會標「○○ 回覆」；LINE、Telegram 上不是預設員工的回覆開頭加 `【名字】`，LINE 泡泡標題改寫實際回答的員工。
+- 已驗證：單元測試（比對器 19 項、權限與一次性指名 23 項、LINE 4 項、WebChat 介面 2 項、`agents.update` 1 項）；隔離環境以 1.76 開發版 binary 和假模型實測 WebChat 15 個情境、LINE 一對一 16 則、LINE 群組 12 則（含只回提及開與關）。尚未驗證：Telegram、Discord、Slack 實機；LINE 快速回覆按鈕在真的 LINE 上的顯示（假 token 送不出去，只驗證了組出來的內容）；WebChat 名單沒有用瀏覽器實際操作，只有元件測試。
+
+### Changed
+- **行為變更**：`@` 呼叫的比對規則（每則訊息各自判斷，D6）。`@觸發詞`、`@顯示名稱`、`@代號` 都能叫，不分大小寫，名字後面直接接中文也認得（`@財務小幫手幫我算帳`），全形 `＠` 也可以；沒打 `@` 不切換；電子郵件地址不算呼叫；好幾個名字對得上取最長；提到好幾位時取最先出現、叫得到的那位（以前取員工代號字母序第一位）；只打部分名字或同名時回名單，不會默默交給某一位。以前觸發詞要一字不差，只認觸發詞本身，而且 `@財務小幫手` 寫在句子任何地方都會被子字串比到。
+- **行為變更**：dashboard WebChat 已選某位員工時，打別位叫得到的員工會把這一則交給那位員工並標示是誰回答；叫不到的員工會被拒絕。以前一律交給已選的員工，觸發詞被默默忽略。
+- **行為變更**：LINE 群組的「只回提及」改成「只回應用 `@` 叫員工（或要 @ 名單）的訊息，以及被點名員工正在等的那一則」。以前開了會整個群組完全沒有回應。LINE 不告訴 bot 被引用的是不是它自己的訊息，所以引用 bot 不算。Telegram 共用 bot 在只回提及的群組也接受員工名字；各員工專屬 bot 仍只認自己的 `@帳號`。已在隔離環境實測：開啟時「大家早安」「午餐吃什麼」沒有回應，`@財務小幫手`、`@嘟嘟總機`、`@sales-rep`、點名後的下一則都有回應；關閉時一般訊息照常交給主員工。
+
 ### Fixed
 - 用 Codex 的 AI 員工現在看得到自己 `.mcp.json` 裡的其他 MCP 伺服器（例如券商連線）。之前 Codex 每次啟動只登記 DuDuClaw 自己的伺服器，其他伺服器整個消失。現在每個第三方伺服器都經過 `duduclaw mcp-proxy` 啟動，和 Claude 員工用同一套第三方工具管制（依工具標註分類、`action_rules`、唯讀通道、需要核准的工具走核准流程）；遠端橋接照原樣登記，直接連網址的項目會被移除並記稽核。名稱和 `duduclaw` 撞名的項目不能取代內建伺服器。第三方伺服器的憑證放在 `<home>/tmp/mcp-proxy-env/`（只有擁有者能進的目錄）裡這次啟動專用的暫存檔，不出現在命令列，也不寫進 `.codex/config.toml`；gateway 啟動時會清掉當機殘留、超過 15 分鐘的暫存檔。`.codex/config.toml` 改成一開始就以只有擁有者能讀的權限寫入，已存在的檔案也會重設成這個權限。摘要、分類、裁判這類輔助呼叫不會拿到員工的第三方伺服器（和 Claude 一樣）。沒有第三方伺服器的員工（包括團隊角色成員）啟動流程和以前相同，不多跑 `.mcp.json` 檢查也不改寫該檔。**行為變更**：Codex 員工的 `.mcp.json` 讀不到或格式壞掉時，這次啟動會被拒絕（以前 Codex 根本不讀這個檔，所以不受影響）；有第三方伺服器時會先跑 `.mcp.json` 檢查，檢查不過同樣不啟動，檢查通過時可能改寫檔案裡 DuDuClaw 自己那一項（其他項目原樣保留，和 Claude 員工每次啟動、gateway 每次開機時做的修復相同）。已在隔離環境用替身 codex 跑過實際啟動流程，再用 codex 0.163 的 `codex mcp list` 確認兩個伺服器都登記、第三方那個經 `duduclaw mcp-proxy` 啟動。尚未驗證：真實 Codex 對話實際呼叫第三方工具、需要核准的工具在 Codex 單次 120 秒時限內能否等到核准。
 - 用 Antigravity 和 OpenAI 相容 runtime 的 AI 員工，現在也看得到自己 `.mcp.json` 裡的其他 MCP 伺服器。Direct API 回覆與本地推論的工具迴圈和 OpenAI 相容 runtime 共用同一段程式，一起補上。每個伺服器都經過 `duduclaw mcp-proxy`，和 Claude、Codex 員工用同一套第三方工具管制；直接連網址的項目會被移除並記稽核，名稱只能用英數字、`_`、`-`。
@@ -13,6 +25,8 @@
   - 已用真的 agy（暫時的 HOME、假金鑰、替身伺服器）確認第三方伺服器經 proxy 啟動、憑證送到、輔助呼叫不會啟動它。尚未驗證：真實模型實際呼叫第三方工具、需要核准的工具能否在 CLI 時限內等到核准。
 
 ### Security
+- 用觸發詞叫 AI 員工不看發話者是誰：只綁定財務的 WebChat 帳號不選員工、直接打 `@sales-rep` 就拿到業務的回覆，沒綁定的主員工也照樣能對話；任何加了 LINE 官方帳號好友的人也能用觸發詞叫到任何員工。觸發詞比對還是不分邊界的子字串比對（`contains`）。現在先認出發話的人（WebChat 用 dashboard 帳號；通訊軟體用已驗證的通道身分，沒有就視為未綁定），只在他叫得到的員工裡比對：管理員全部；dashboard 帳號是綁定的員工（任何權限等級）；通訊軟體的發話者另外加上這個對話的預設員工與開了「讓外部聯絡人用 @ 呼叫」的員工。叫其他員工會在呼叫模型前被拒絕，記進 `security_audit.jsonl`（`trigger_route_refused`，記帳號或平台 ID 的雜湊）。比對改成 `@` 開頭、有邊界、取最長名字；回覆後的機密還原與行為契約檢查改用實際回答的員工（以前一律用預設員工）。**行為變更**：WebChat 帳號沒有綁定預設員工時，不選員工直接傳訊息會被拒絕並提示選員工或打 `@`；沒綁帳號的 LINE／Telegram 使用者叫非預設員工會被拒絕，要管理員先開放那位員工。已用隔離環境實測：員工帳號打 `@sales-rep` 改成被拒、沒有呼叫模型。
+
 - Grok 員工 `.mcp.json` 裡的第三方 MCP 伺服器之前沒有經過任何管制就被啟動：Grok 1.0.62 會自己讀工作目錄（也就是員工目錄）的 `.mcp.json`，所以這些伺服器由 Grok 直接啟動，`action_rules`、核准流程、唯讀通道都不適用，直接連網址的項目也照連，而 DuDuClaw 以自動核准模式執行 Grok。現在 `.mcp.json` 裡每個名稱都會在 `.grok/config.toml` 被覆蓋（Grok 以這個檔為優先）：能管制的伺服器改成經過 `duduclaw mcp-proxy` 啟動（第三方伺服器不再拿到 Grok 的 `XAI_API_KEY`），其他的（包括 `duduclaw-pro` 這類多餘項目）寫成停用。Grok 還會自己讀工作目錄的 `.cursor/mcp.json`，目錄在 git repository 裡時也會讀一路到根目錄每一層的 `.mcp.json` 和 `.grok/config.toml`，這些來源的名稱一樣會被覆蓋；任何一個來源解析不了就拒絕啟動。員工目錄的 `.cursor/` 現在和 `.grok/` 一樣不能由員工修改，live fork 採用回員工目錄時也不會帶回。`.grok/config.toml` 裡任何不是 DuDuClaw 寫的項目都照原樣保留，每次啟動記一次警告。兩個只差大小寫的伺服器名稱會拒絕啟動。這個檔案長期存在、所有啟動共用，所以裡面不放第三方憑證，也不放這次啟動才有的值：憑證放在這次啟動專用的目錄，由 Grok 在載入時展開 `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}` 取得；不是登記這台伺服器的那次啟動（輔助呼叫、管理者手動執行 `grok`）時，proxy 什麼都不啟動。員工不再列出的伺服器，DuDuClaw 先前寫入的項目會被移除，管理者手動加的項目不動。**行為變更**：`.mcp.json` 有第三方伺服器而讀不到、格式壞掉、檢查不過，或 `.grok/config.toml` 寫不進去時，這次啟動會被拒絕，輔助呼叫也一樣。已用 `grok mcp doctor` 在暫時的 HOME 下確認覆蓋、停用與展開都照預期；真正的 `grok -p` 對話需要登入，尚未驗證。Grok 另外會依 Claude／Cursor 相容設定讀作業系統使用者的 `~/.claude.json` 與 `~/.cursor/mcp.json`，同樣不經管制就啟動；DuDuClaw 啟動 Grok 時現在一律帶 `GROK_CLAUDE_MCPS_ENABLED=false`、`GROK_CURSOR_MCPS_ENABLED=false` 關掉這兩種相容讀取（已用 `grok inspect` 在暫時的 HOME 下確認兩者都變成停用）。使用者層級的 `~/.grok/config.toml` 仍會被讀，不在這次修正範圍內。
 
 - 用 Grok 的 AI 員工，每次對話都會連作業系統使用者自己的 Claude／Cursor hooks 一起執行：Grok 1.0.62 預設依相容設定讀 `~/.claude/settings.json` 與 `~/.cursor/hooks.json` 的 hooks，管理者電腦上自己設的 hook 指令因此會在員工的回合裡跑。DuDuClaw 啟動 Grok 時現在一律帶 `GROK_CLAUDE_HOOKS_ENABLED=false`、`GROK_CURSOR_HOOKS_ENABLED=false`。這兩個開關也讓 Grok 不再讀員工目錄的 `.claude/settings.json`，而 DuDuClaw 的檔案守門（`agent-file-guard`）與資料檔守門（`data-file-guard`）就登記在那裡，所以每次啟動前會把這兩個守門寫成 Grok 自己的專案 hook：工作目錄的 `.grok/hooks/duduclaw-guards-<員工>.json`，比對規則與指令和 `.claude/settings.json` 那份相同（Grok 會把 `Write`、`Bash` 這類名稱對應到自己的工具）。**行為變更**：這個檔寫不進去時，這次啟動會被拒絕；員工目錄 `.claude/settings.json` 裡管理者另外加的 hook，Grok 員工不再執行。已經由 Grok runtime 的實際啟動流程，用真的 `grok inspect`（暫時的 HOME）確認：使用者層級與員工目錄的 Claude hook 都標成停用，生效的只剩 `.grok/hooks/` 的兩個守門。尚未驗證：真正的 `grok -p` 對話中守門實際擋下寫入（需要登入）。作業系統使用者的 `~/.grok/hooks/`（Grok 原生的全域 hook）仍會執行，不在這次修正範圍內。

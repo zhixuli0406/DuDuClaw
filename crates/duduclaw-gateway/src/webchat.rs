@@ -152,6 +152,13 @@ pub enum ChatMessage {
         /// see `channel_reply::build_guarded_reply_with_session`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<serde_json::Value>,
+        /// The employee that answered (id). May differ from the selected
+        /// employee when the message called someone else by `@`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// That employee's display name, for the reply label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -207,6 +214,8 @@ impl ChatMessage {
         }
     }
 }
+
+mod route;
 
 /// A file attachment uploaded through the WebChat socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,27 +375,11 @@ impl WebChatState {
     /// the cache — a transient DB hiccup should not poison a good decision
     /// for `ACL_CACHE_TTL`, and should not cache a bad one either.
     async fn agent_access_allowed(&self, user_id: &str, agent_name: &str) -> bool {
-        let now = std::time::Instant::now();
-        {
-            let cache = self.acl_cache.lock().await;
-            if let Some((snapshot, at)) = cache.get(user_id) {
-                if now.duration_since(*at) < ACL_CACHE_TTL {
-                    return acl_allows_agent(snapshot, agent_name);
-                }
-            }
+        let lookup = self.acl_snapshot(user_id).await;
+        if let Err(e) = &lookup {
+            warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
         }
-        let lookup = load_acl_snapshot(&self.user_db, user_id);
-        let allowed = resolve_agent_acl(&lookup, agent_name);
-        match lookup {
-            Ok(snapshot) => {
-                let mut cache = self.acl_cache.lock().await;
-                cache.insert(user_id.to_string(), (snapshot, now));
-            }
-            Err(e) => {
-                warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
-            }
-        }
-        allowed
+        resolve_agent_acl(&lookup, agent_name)
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {
@@ -982,9 +975,30 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     sid = &sid_owned;
                                 }
 
+                                // ── `@` routing (D6): a message may call another
+                                // employee the account may use, for this message
+                                // only; a forbidden call or a forbidden default
+                                // employee is refused here, before any model call.
+                                // Chat commands keep the selected employee.
+                                let effective_agent: Option<String> = if crate::chat_commands::is_command(&content) {
+                                    effective_agent
+                                } else {
+                                    match route::decide_webchat_route(
+                                        &state, &auth_user, &content, effective_agent.as_deref(), &agent_id,
+                                    ).await {
+                                        Ok(routed) => routed,
+                                        Err(frame) => {
+                                            if let Ok(json) = serde_json::to_string(&frame) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                };
+
                                 // The agent id used for chat-command handling /
                                 // contract enforcement — the routed agent when one
-                                // was selected/adopted, else the default main agent.
+                                // was selected/adopted/called, else the default main agent.
                                 let effective_agent_id: &str = effective_agent.as_deref().unwrap_or(&agent_id);
 
                                 // Persist any uploaded files and append path references
@@ -1031,6 +1045,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             // `build_reply_*` / O-4 at all — no marker
                                             // can exist on this path.
                                             artifact: None,
+                                            agent: None,
+                                            agent_name: None,
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1134,6 +1150,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let guarded = reply;
                                 let reply = guarded.text.clone();
                                 let operator_artifact = guarded.artifact.clone();
+                                let answered_by = guarded.answered_by.clone();
 
                                 // WP1.3 + live-verification fix (2026-08-15):
                                 // 📎DELIVER: handling. WebChat has no in-band
@@ -1249,6 +1266,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     conv: conv_nonce.clone(),
                                     model: actual_model,
                                     artifact: operator_artifact,
+                                    agent: answered_by.as_ref().map(|a| a.id.clone()),
+                                    agent_name: answered_by.map(|a| a.display_name),
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if !guarded.still_valid().await {
@@ -1740,6 +1759,8 @@ mod tests {
             conv: Some("c-42".into()),
             model: Some("claude-sonnet-4-6".into()),
             artifact: None,
+            agent: Some("finance".into()),
+            agent_name: Some("財務小幫手".into()),
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(
@@ -1750,6 +1771,10 @@ mod tests {
             json.contains(r#""model":"claude-sonnet-4-6""#),
             "actual model must be on the wire: {json}"
         );
+        assert!(
+            json.contains(r#""agent":"finance""#) && json.contains("財務小幫手"),
+            "the answering employee must be on the wire: {json}"
+        );
 
         // Without a nonce, `conv` is omitted entirely (old-client compatible).
         let without = ChatMessage::AssistantDone {
@@ -1758,6 +1783,8 @@ mod tests {
             conv: None,
             model: None,
             artifact: None,
+            agent: None,
+            agent_name: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(
@@ -1790,6 +1817,8 @@ mod tests {
             conv: None,
             model: None,
             artifact: Some(artifact.clone()),
+            agent: None,
+            agent_name: None,
         };
         let json = serde_json::to_string(&done).expect("serialize");
         assert!(
