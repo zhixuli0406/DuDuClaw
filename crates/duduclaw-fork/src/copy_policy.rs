@@ -50,6 +50,7 @@ const STRICT_EXTRA_PATTERNS: &[&str] = &[
     ".mcp.json",
     ".claude",
     "SOUL.md",
+    "INSTRUCTIONS.md",
     "CLAUDE.md",
     "agent.toml",
     "secrets",
@@ -682,6 +683,7 @@ mod tests {
         let s = CopyPolicy::strict();
         assert!(s.is_excluded(OsStr::new(".git")));
         assert!(s.is_excluded(OsStr::new("SOUL.md")));
+        assert!(s.is_excluded(OsStr::new("INSTRUCTIONS.md")));
         assert!(s.is_excluded(OsStr::new("secrets")));
         assert!(s.is_excluded(OsStr::new(".netrc")));
         let p = CopyPolicy::promote_default();

@@ -304,25 +304,6 @@ pub(super) fn parse_frontmatter(content: &str) -> (Option<serde_yaml::Value>, St
     (parsed, body_lines.join("\n"))
 }
 
-/// Extract Markdown bullet lines (`-`, `*`, `+`) as individual facts.
-pub(super) fn extract_bullets(content: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let t = line.trim();
-        let stripped = t
-            .strip_prefix("- ")
-            .or_else(|| t.strip_prefix("* "))
-            .or_else(|| t.strip_prefix("+ "));
-        if let Some(s) = stripped {
-            let s = s.trim();
-            if !s.is_empty() {
-                out.push(s.to_string());
-            }
-        }
-    }
-    out
-}
-
 /// A defensively-parsed cron job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CronJob {

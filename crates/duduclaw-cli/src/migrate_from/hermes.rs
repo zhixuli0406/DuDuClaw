@@ -166,7 +166,11 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
     }
 
     // ── Single agent (Hermes is a single-agent platform) ──
-    let soul_body = std::fs::read_to_string(profile_root.join("SOUL.md")).ok();
+    let soul_body = scanned_soul(
+        &mut report,
+        "hermes",
+        std::fs::read_to_string(profile_root.join("SOUL.md")).ok(),
+    );
     let (preferred, needs_review) = match &model_default {
         Some(m) => {
             let (p, r) = map_model(m);
@@ -175,7 +179,6 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         None => (None, false),
     };
 
-    let engine = open_memory(ctx);
     if let Some(agent_id) = scaffold_agent(
         ctx,
         &mut report,
@@ -196,26 +199,21 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
             );
         }
 
-        // Memory: memories/MEMORY.md + memories/USER.md bullets.
-        let mut facts = Vec::new();
-        for file in ["MEMORY.md", "USER.md"] {
-            if let Ok(c) = std::fs::read_to_string(profile_root.join("memories").join(file)) {
-                facts.extend(extract_bullets(&c));
+        // Persona files → their slots: memories/MEMORY.md → facts (entries
+        // split on `§`), memories/USER.md → the「服務對象」wiki page.
+        match crate::expert::agent_config::adapters::read(
+            crate::expert::agent_config::ConfigKind::Hermes,
+            &profile_root,
+        ) {
+            Ok(bundle) => {
+                if let Some(draft) = bundle.agents.first() {
+                    let mut draft = draft.clone();
+                    // SOUL.md is already written by the scaffold above.
+                    draft.soul = None;
+                    write_persona_slots(ctx, &mut report, &agent_id, &draft, &profile_root).await;
+                }
             }
-        }
-        import_facts(
-            engine.as_ref(),
-            ctx,
-            &mut report,
-            &agent_id,
-            "memories",
-            &facts,
-            &profile_root.display().to_string(),
-        )
-        .await;
-        for file in ["MEMORY.md", "USER.md"] {
-            let _ =
-                copy_into_agent_memory(ctx, &agent_id, &profile_root.join("memories").join(file));
+            Err(e) => report.skipped("persona", "hermes", e),
         }
 
         // Skills.

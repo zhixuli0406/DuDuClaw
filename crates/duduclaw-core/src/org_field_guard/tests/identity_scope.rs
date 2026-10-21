@@ -913,3 +913,50 @@ fn bash_relative_spellings_that_leave_the_agent_dir_are_not_own() {
         GuardDecision::NotAgentFile
     );
 }
+
+// ── Instructions lock: INSTRUCTIONS.md self-write guard ─────────
+
+#[test]
+fn own_instructions_write_is_blocked_on_both_lanes() {
+    let p = home().join("agents/sales-rep/INSTRUCTIONS.md");
+    match check_own_instructions_write(&p, &home(), &agent("sales-rep")) {
+        GuardDecision::BlockedOwnInstructionsWrite { caller, attempted_path } => {
+            assert_eq!(caller, "sales-rep");
+            assert_eq!(attempted_path, p);
+        }
+        other => panic!("expected BlockedOwnInstructionsWrite, got {other:?}"),
+    }
+    let mixed = PathBuf::from("/users/ALICE/.duduclaw/agents/Sales-Rep/x/../instructions.MD");
+    assert!(matches!(
+        check_own_instructions_write(&mixed, &home(), &agent("sales-rep")),
+        GuardDecision::BlockedOwnInstructionsWrite { .. }
+    ));
+    for cmd in ["echo '' > INSTRUCTIONS.md", "rm instructions.md", "mv INSTRUCTIONS.md /tmp/x"] {
+        assert!(
+            matches!(
+                check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+                GuardDecision::BlockedOwnInstructionsWrite { .. }
+            ),
+            "not blocked: {cmd}"
+        );
+    }
+    assert_eq!(
+        check_bash_protected_write("cat INSTRUCTIONS.md", &home(), &agent("sales-rep")),
+        GuardDecision::NotAgentFile
+    );
+    // Operator, other files and project paths are not this rule's business.
+    assert_eq!(
+        check_own_instructions_write(&p, &home(), &HookCaller::Absent),
+        GuardDecision::NotAgentFile
+    );
+    assert_eq!(
+        check_own_instructions_write(
+            &PathBuf::from("/Users/alice/Project/app/INSTRUCTIONS.md"),
+            &home(),
+            &agent("sales-rep")
+        ),
+        GuardDecision::NotAgentFile
+    );
+    // The location guard knows the file as an agent-structure file.
+    assert!(crate::AGENT_STRUCTURE_FILES.contains(&"INSTRUCTIONS.md"));
+}

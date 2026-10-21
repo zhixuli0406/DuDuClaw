@@ -193,6 +193,10 @@ pub(super) fn build_system_prompt(
             ));
             parts.push(identity.clone());
         }
+        if let Some(s) = duduclaw_agent::instructions::render_section(a.instructions.as_deref()) {
+            audit.push(crate::prompt_audit::PromptSection::new("instructions", &s));
+            parts.push(s);
+        }
 
         // RFC-22 P1-9a / P1-8: inject CONTRACT.toml boundaries (must_not /
         // must_always) into the channel system prompt. runner.rs already

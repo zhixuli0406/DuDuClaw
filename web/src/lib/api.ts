@@ -3079,6 +3079,36 @@ export interface ExpertPack {
   /** null ⇒ the pack ships no managed hooks. */
   hooks_status: 'disabled' | 'pending_approval' | 'enabled' | null;
   hooks_files: number;
+  /** Imported skills held back for approval (scripts / another vendor's
+   *  tools). null ⇒ none. */
+  skills_status?: 'disabled' | 'pending_approval' | 'enabled' | null;
+  skills_disabled?: number;
+  /** Agent imports: source format code (`doubao`, `openclaw`, …). */
+  source_format?: string;
+}
+
+/** One line of an import report (`experts.install` → `report.items`).
+ *  `kind` / `status` are stable codes the UI translates; `name` / `detail`
+ *  arrive human-readable (zh-TW). */
+export interface ExpertImportItem {
+  status: 'imported' | 'skipped' | 'conflict' | 'warning' | 'ignored';
+  kind: string;
+  /** Technical name (source file, skill id) — shown under "details". */
+  name: string;
+  /** zh-TW console text; the fallback when `code` is absent. */
+  detail: string;
+  /** Message code rendered in the viewer's language
+   *  (`experts.report.msg.<code>`), with its parameters. */
+  code?: string | null;
+  params?: Record<string, unknown> | null;
+}
+
+/** The machine-readable report `duduclaw pack install --report-json` writes. */
+export interface ExpertImportReport {
+  dry_run: boolean;
+  meta: Record<string, string>;
+  counts: Record<ExpertImportItem['status'], number>;
+  items: ExpertImportItem[];
 }
 
 /** One AI-team roster member (`experts.catalog` `members[]`, team entries
@@ -5708,15 +5738,24 @@ export const api = {
     /** Install from a server-local path (use `POST /api/experts/upload` to
      *  stage a .zip first — see ExpertsPage). Long-running: security scans run
      *  inside the install pipeline. */
-    install: (path: string, attachUnder?: string) =>
+    install: (path: string, attachUnder?: string, dryRun?: boolean) =>
       client.call(
         'experts.install',
-        { path, ...(attachUnder ? { attach_under: attachUnder } : {}) },
+        {
+          path,
+          ...(attachUnder ? { attach_under: attachUnder } : {}),
+          ...(dryRun ? { dry_run: true } : {}),
+        },
         false,
         320000,
       ) as Promise<{
+        /** false ⇒ the run failed; `error` says why and `report` shows how far it got. */
         success: boolean;
-        output: string;
+        output?: string;
+        error?: string;
+        dry_run?: boolean;
+        /** Present for every install the pipeline completed (plan or real). */
+        report?: ExpertImportReport | null;
       }>,
     remove: (slug: string) =>
       client.call('experts.remove', { slug }) as Promise<{
@@ -5725,6 +5764,14 @@ export const api = {
       }>,
     /** Apply the approval-center decision for a pack's hooks (approve → enable;
      *  deny/expire → stay disabled). */
+    /** Apply the approval-center decision for an import's disabled skills. */
+    skillsApply: (slug: string) =>
+      client.call('experts.skills_apply', { slug }) as Promise<{
+        status: 'enabled' | 'disabled' | 'pending_approval' | 'denied' | 'expired';
+        count?: number;
+        not_enabled?: string[];
+        approval_id?: string;
+      }>,
     hooksApply: (slug: string) =>
       client.call('experts.hooks_apply', { slug }) as Promise<{
         status: 'enabled' | 'disabled' | 'pending_approval' | 'denied' | 'expired';

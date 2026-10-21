@@ -492,3 +492,47 @@ mod channel_status_redaction_tests {
         assert_eq!(stored.as_deref(), Some("not configured"));
     }
 }
+
+/// Agent-config import: the channel reply prompt carries INSTRUCTIONS.md
+/// right after SOUL / IDENTITY (full mode) and capped in minimal mode.
+#[cfg(test)]
+mod instructions_slot_tests {
+    use super::*;
+
+    const AGENT_TOML: &str = "[agent]\nname = \"advisor\"\ndisplay_name = \"顧問\"\nrole = \"worker\"\nstatus = \"active\"\ntrigger = \"@advisor\"\nreports_to = \"\"\nicon = \"x\"\n\n[model]\npreferred = \"claude-sonnet-4-6\"\nfallback = \"claude-haiku-4-5\"\naccount_pool = []\n\n[container]\ntimeout_ms = 60000\nmax_concurrent = 1\nreadonly_project = true\n\n[heartbeat]\nenabled = false\ninterval_seconds = 3600\nmax_concurrent_runs = 1\ncron = \"\"\n\n[budget]\nmonthly_limit_cents = 500\nwarn_threshold_percent = 80\nhard_stop = false\n\n[permissions]\ncan_create_agents = false\ncan_send_cross_agent = true\ncan_modify_own_skills = false\ncan_modify_own_soul = false\ncan_schedule_tasks = false\nallowed_channels = []\n\n[evolution]\nskill_auto_activate = false\nskill_security_scan = true\n";
+
+    async fn agent_with(extra_toml: &str) -> (tempfile::TempDir, duduclaw_agent::LoadedAgent) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents").join("advisor");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("{AGENT_TOML}{extra_toml}")).unwrap();
+        std::fs::write(dir.join("SOUL.md"), "SOUL-BODY").unwrap();
+        std::fs::write(dir.join("IDENTITY.md"), "IDENTITY-BODY").unwrap();
+        std::fs::write(dir.join("INSTRUCTIONS.md"), "INSTRUCTIONS-BODY 先讀 USER.md").unwrap();
+        let agent = duduclaw_agent::registry::AgentRegistry::load_agent(&dir).await.unwrap();
+        (tmp, agent)
+    }
+
+    fn prompt_for(agent: &duduclaw_agent::LoadedAgent) -> String {
+        build_system_prompt(
+            Some(agent), None, None, None, 0, None, "", None, "", false, None,
+        )
+    }
+
+    #[tokio::test]
+    async fn full_mode_injects_instructions_after_identity() {
+        let (_tmp, agent) = agent_with("").await;
+        let p = prompt_for(&agent);
+        let soul = p.find("SOUL-BODY").unwrap();
+        let ident = p.find("IDENTITY-BODY").unwrap();
+        let instr = p.find("# Instructions\nINSTRUCTIONS-BODY").expect("instructions injected");
+        assert!(soul < ident && ident < instr, "{p}");
+    }
+
+    #[tokio::test]
+    async fn minimal_mode_injects_instructions_too() {
+        let (_tmp, agent) = agent_with("\n[prompt]\nmode = \"minimal\"\n").await;
+        let p = prompt_for(&agent);
+        assert!(p.contains("# Instructions\nINSTRUCTIONS-BODY"), "{p}");
+    }
+}
