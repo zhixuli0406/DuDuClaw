@@ -16,11 +16,14 @@ export interface PickedPrincipal {
 export function principalLabels(p: KbPrincipals | null): Map<string, string> {
   const m = new Map<string, string>();
   if (!p) return m;
-  for (const u of p.users) m.set(`user:${u.id}`, u.display_name || u.id);
+  for (const u of [...(p.resolved_users ?? []), ...p.users]) m.set(`user:${u.id}`, u.display_name || u.id);
   for (const a of p.agents) m.set(`agent:${a.id}`, a.display_name || a.id);
   for (const d of p.departments) m.set(`department:${d}`, d);
   return m;
 }
+
+/** People are searched, never listed: the gateway needs this many characters. */
+export const MIN_PEOPLE_QUERY = 2;
 
 const KIND_ICON = { user: User, department: Building2, agent: User, channel: MessageSquare } as const;
 
@@ -152,6 +155,8 @@ export function PrincipalPicker({
           </div>
         ) : failed ? (
           <p className="px-3 py-4 text-center text-xs text-destructive">{t('kb.principal.loadError')}</p>
+        ) : kind === 'user' && Array.from(debounced).length < MIN_PEOPLE_QUERY ? (
+          <p className="px-3 py-4 text-center text-xs text-muted-foreground">{t('kb.principal.peopleHint')}</p>
         ) : options.length === 0 ? (
           <p className="px-3 py-4 text-center text-xs text-muted-foreground">{t('kb.principal.none')}</p>
         ) : (

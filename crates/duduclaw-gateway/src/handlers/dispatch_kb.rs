@@ -13,6 +13,7 @@ const REGISTRY_METHODS: &[&str] = &[
     "knowledge.principals.search",
     "knowledge.agent.collections",
     "knowledge.access_log.denied",
+    "knowledge.limits",
 ];
 
 impl MethodHandler {
@@ -90,6 +91,8 @@ impl MethodHandler {
                 .await
             }
             "knowledge.agent.collections" => self.kb_agent_collections(params, ctx, &dir).await,
+            // Signed in is enough: these are the route's public limits.
+            "knowledge.limits" => Ok(Some(crate::knowledge::upload_limits::describe(&self.home_dir))),
             "knowledge.access_log.denied" => {
                 if !ctx.is_admin() {
                     Err(duduclaw_knowledge::KbError::PermissionDenied)

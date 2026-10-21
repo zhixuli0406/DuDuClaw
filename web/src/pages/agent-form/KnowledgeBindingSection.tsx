@@ -142,7 +142,6 @@ export function KnowledgeBindingSection({ agentId }: { agentId: string }) {
               />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm text-foreground">{c.name}</span>
-                {c.description && <span className="block truncate text-xs text-muted-foreground">{c.description}</span>}
               </span>
               <SensitivityBadge value={c.sensitivity} />
             </label>

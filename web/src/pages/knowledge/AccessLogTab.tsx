@@ -28,6 +28,8 @@ export function requesterText(intl: Intl, r: RequesterLike, labels?: Map<string,
       }
       case 'channel_unbound':
         return t('kb.log.who.unbound', { channel: r.channel ? t(`kb.channel.${r.channel}`) : '' });
+      case 'unknown':
+        return t('kb.log.who.unknown');
       default:
         return t('kb.log.who.system');
     }
@@ -76,13 +78,22 @@ export function AccessLogTab({ collectionId }: { collectionId: string }) {
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  // Names for the people in these rows (only people on the collection's
+  // list resolve for an owner; others keep a short id).
+  const userIds = Array.from(
+    new Set((rows ?? []).filter((r) => r.requester_id && r.requester_kind !== 'channel_unbound').map((r) => r.requester_id as string)),
+  ).join('\u0000');
+  useEffect(() => {
+    const ids = userIds ? userIds.split('\u0000') : [];
     knowledgeApi
-      .searchPrincipals(collectionId, '')
+      .searchPrincipals(collectionId, '', ids)
       .then((p) => setLabels(principalLabels(p)))
       .catch(() => {
         /* Names are a nicety; ids still show. */
       });
-  }, [collectionId, load]);
+  }, [collectionId, userIds]);
 
   if (error != null && rows === null) return <ErrorState error={error} onRetry={() => void load()} />;
   if (rows === null) {
@@ -127,8 +138,11 @@ export function AccessLogTab({ collectionId }: { collectionId: string }) {
                     </Badge>
                   )}
                 </td>
-                <td className="max-w-64 truncate px-3 py-2 text-muted-foreground" title={r.query ?? ''}>
-                  {r.query ?? '—'}
+                <td
+                  className="max-w-64 truncate px-3 py-2 text-muted-foreground"
+                  title={r.query ?? (r.query_hash ? t('kb.log.hashOnly') : '')}
+                >
+                  {r.query ?? (r.query_hash ? <span className="font-mono text-xs">#{r.query_hash}</span> : '—')}
                 </td>
                 <td className="px-3 py-2 text-right font-mono text-xs tabular-nums">{r.result_count}</td>
               </tr>

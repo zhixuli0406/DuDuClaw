@@ -65,7 +65,12 @@ mod tests {
     #[test]
     fn lists_only_denied_rows_newest_first() {
         let conn = schema::open_in_memory().unwrap();
-        for (op, outcome) in [("search", "ok"), ("get_passage", "denied"), ("search", "no_match"), ("get_passage", "denied")] {
+        for (op, outcome) in [
+            ("search", "ok"),
+            ("get_passage", "denied"),
+            ("search", "no_match"),
+            ("get_passage", "denied"),
+        ] {
             let e = AccessEntry {
                 op: op.into(),
                 requester_kind: "channel_unbound".into(),

@@ -8051,5 +8051,13 @@
   "kb.channel.teams": "Microsoft Teams",
   "kb.channel.wecom": "企業微信",
   "kb.channel.dingtalk": "釘釘",
-  "kb.channel.webchat": "網頁對話"
+  "kb.channel.webchat": "網頁對話",
+  "kb.add.sizeLimit": "單檔上限 {mb} MB。",
+  "kb.add.skipped": "沒有加入的檔案",
+  "kb.add.skip.type": "不支援這種檔案格式，沒有加入。",
+  "kb.add.skip.size": "超過單檔 {mb} MB 上限，沒有加入。",
+  "kb.add.skip.count": "一次最多 {max} 個檔案，這個沒有加入。",
+  "kb.principal.peopleHint": "輸入至少 2 個字搜尋同事。",
+  "kb.log.who.unknown": "無法確認身分的請求",
+  "kb.log.hashOnly": "問題內容只有管理員與提問者本人看得到；相同的問題會有相同的代碼。"
 }

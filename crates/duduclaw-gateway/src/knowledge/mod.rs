@@ -16,6 +16,8 @@
 //! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
 //!   employee edit page (`agents.update`).
 //! - [`denied`]: the admin-wide list of refused reads.
+//! - [`upload_limits`]: `knowledge.limits`, the upload limits the dashboard
+//!   checks before sending a file.
 //!
 //! Writes happen only here. Every read goes through
 //! `duduclaw_knowledge::acl::effective_collections`.
@@ -29,6 +31,7 @@ pub mod route;
 pub mod rpc;
 pub mod turn_requesters;
 pub mod upload;
+pub mod upload_limits;
 pub mod url_ingest;
 pub mod worker;
 

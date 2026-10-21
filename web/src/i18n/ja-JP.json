@@ -8051,5 +8051,13 @@
   "kb.channel.teams": "Microsoft Teams",
   "kb.channel.wecom": "WeCom（企業微信）",
   "kb.channel.dingtalk": "DingTalk（釘釘）",
-  "kb.channel.webchat": "Web チャット"
+  "kb.channel.webchat": "Web チャット",
+  "kb.add.sizeLimit": "1 ファイル {mb} MB まで。",
+  "kb.add.skipped": "追加しなかったファイル",
+  "kb.add.skip.type": "この形式には対応していないため追加しませんでした。",
+  "kb.add.skip.size": "{mb} MB の上限を超えているため追加しませんでした。",
+  "kb.add.skip.count": "一度に {max} 件までのため追加しませんでした。",
+  "kb.principal.peopleHint": "2 文字以上入力してメンバーを検索してください。",
+  "kb.log.who.unknown": "送信者を確認できなかった要求",
+  "kb.log.hashOnly": "質問の本文は管理者と質問した本人だけが見られます。同じ質問には同じコードが付きます。"
 }

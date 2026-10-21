@@ -133,7 +133,10 @@ export interface KbAccessRow {
   requester_kind: string;
   requester_id: string | null;
   channel: string | null;
+  /** The question text: only for an admin and for the person who asked. */
   query: string | null;
+  /** A short hash of the question, shown to every owner. */
+  query_hash?: string | null;
   result_count: number;
   mode: string | null;
   outcome: 'ok' | 'denied' | 'error' | 'no_match';
@@ -161,7 +164,10 @@ export interface KbPersonRef {
 export interface KbPrincipals {
   edition: 'personal' | 'enterprise';
   kinds: KbPrincipalKind[];
+  /** People matching a search of at least 2 characters (at most 20). */
   users: KbPersonRef[];
+  /** Names for the ids sent in `resolve` that are on this collection's list. */
+  resolved_users?: KbPersonRef[];
   departments: string[];
   agents: KbPersonRef[];
   channels: string[];
@@ -180,14 +186,19 @@ export interface KbAgentCollections {
     id: string;
     slug: string;
     name: string;
-    description: string;
     sensitivity: KbSensitivity;
-    source_count: number;
   }>;
   /** `null` = every granted collection. */
   bound: string[] | null;
   /** The employee's settings file could not be read: treated as none. */
   unreadable: boolean;
+}
+
+export interface KbLimits {
+  max_source_bytes: number;
+  max_files_per_upload: number;
+  /** Lowercase extensions without the dot. */
+  extensions: string[];
 }
 
 export interface KbUploadFileResult {
@@ -241,8 +252,14 @@ export const knowledgeApi = {
       expected_revision: expectedRevision,
       entries: entries.map(({ kind, id, role }) => ({ kind, id, role })),
     }),
-  searchPrincipals: (collectionId: string, query: string) =>
-    call<KbPrincipals>('knowledge.principals.search', { collection_id: collectionId, query }),
+  /** `resolve`: user ids whose names the editor needs (only ids already on
+   *  this collection's list come back; admins may resolve any id). */
+  searchPrincipals: (collectionId: string, query: string, resolve?: string[]) =>
+    call<KbPrincipals>('knowledge.principals.search', {
+      collection_id: collectionId,
+      query,
+      ...(resolve && resolve.length > 0 ? { resolve } : {}),
+    }),
 
   listSources: (collectionId: string) =>
     call<{ sources: KbSource[] }>('knowledge.sources.list', { collection_id: collectionId }),
@@ -279,6 +296,7 @@ export const knowledgeApi = {
       ...(beforeId !== undefined ? { before_id: beforeId } : {}),
     }),
   embeddingStatus: () => call<KbEmbeddingStatus>('knowledge.embedding.status'),
+  limits: () => call<KbLimits>('knowledge.limits'),
 
   agentCollections: (agentId: string) =>
     call<KbAgentCollections>('knowledge.agent.collections', { agent_id: agentId }),
@@ -360,6 +378,9 @@ export function uploadSources(
   return { promise, abort: () => xhr.abort() };
 }
 
+/** How long a downloaded file's object URL stays valid. */
+export const REVOKE_DELAY_MS = 10_000;
+
 /** Download a source's original file through the browser. */
 export async function downloadOriginal(source: Pick<KbSource, 'id' | 'title' | 'original_name' | 'format'>): Promise<void> {
   const res = await fetch(`/api/knowledge/sources/${encodeURIComponent(source.id)}/original`, {
@@ -368,16 +389,25 @@ export async function downloadOriginal(source: Pick<KbSource, 'id' | 'title' | '
   if (!res.ok) throw parseError(res.status, await res.text());
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
-  try {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = source.original_name || `${source.title}.${source.format}`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = source.original_name || `${source.title}.${source.format}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Some browsers start reading the blob only after click() returns;
+  // revoking at once can cancel the download.
+  setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
+}
+
+/** Why a chosen file will not be sent, or `null` when it may be. */
+export function precheckFile(file: Pick<File, 'name' | 'size'>, limits: KbLimits | null): 'type' | 'size' | null {
+  if (!limits) return null;
+  const dot = file.name.lastIndexOf('.');
+  const ext = dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : '';
+  if (!limits.extensions.includes(ext)) return 'type';
+  if (file.size > limits.max_source_bytes) return 'size';
+  return null;
 }
 
 /** File types the upload route accepts (by extension). */

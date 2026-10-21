@@ -44,4 +44,11 @@ describe('<Tabs>', () => {
     expect(tabA).toHaveAttribute('data-active');
     expect(tabA.className).toContain('data-[active]:after:bg-foreground');
   });
+
+  it('the default variant also styles the current tab', () => {
+    renderWithProviders(<Fixture />);
+    const tabA = screen.getByRole('tab', { name: 'A' });
+    expect(tabA).toHaveAttribute('data-active');
+    expect(tabA.className).toContain('data-[active]:bg-background');
+  });
 });

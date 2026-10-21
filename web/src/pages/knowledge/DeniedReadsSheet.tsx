@@ -44,15 +44,22 @@ export function DeniedReadsSheet({ open, onClose }: { open: boolean; onClose: ()
   }, []);
 
   useEffect(() => {
-    if (!open) return;
-    void load();
+    if (open) void load();
+  }, [open, load]);
+
+  // Admins resolve the people in these rows by id.
+  const userIds = Array.from(
+    new Set((rows ?? []).filter((r) => r.requester_id && r.requester_kind !== 'channel_unbound').map((r) => r.requester_id as string)),
+  ).join('\u0000');
+  useEffect(() => {
+    if (!open || !userIds) return;
     knowledgeApi
-      .searchPrincipals('', '')
+      .searchPrincipals('', '', userIds.split('\u0000'))
       .then((p) => setLabels(principalLabels(p)))
       .catch(() => {
         /* Names are a nicety; ids still show. */
       });
-  }, [open, load]);
+  }, [open, userIds]);
 
   return (
     <Sheet open={open} onOpenChange={(o) => !o && onClose()}>

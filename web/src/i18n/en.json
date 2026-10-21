@@ -8051,5 +8051,13 @@
   "kb.channel.teams": "Microsoft Teams",
   "kb.channel.wecom": "WeCom",
   "kb.channel.dingtalk": "DingTalk",
-  "kb.channel.webchat": "Web chat"
+  "kb.channel.webchat": "Web chat",
+  "kb.add.sizeLimit": "Each file up to {mb} MB.",
+  "kb.add.skipped": "Files not added",
+  "kb.add.skip.type": "this file type is not supported, so it was not added.",
+  "kb.add.skip.size": "larger than the {mb} MB limit, so it was not added.",
+  "kb.add.skip.count": "only {max} files at a time, so this one was not added.",
+  "kb.principal.peopleHint": "Type at least 2 characters to find a colleague.",
+  "kb.log.who.unknown": "A request whose sender could not be confirmed",
+  "kb.log.hashOnly": "Only admins and the person who asked see the question; the same question always gets the same code."
 }

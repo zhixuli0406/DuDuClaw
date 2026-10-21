@@ -61,7 +61,12 @@ describe('PrincipalPicker', () => {
     expect(await screen.findByRole('button', { name: 'Add Helper' })).toBeDisabled();
 
     await user.click(screen.getByRole('radio', { name: 'People' }));
-    await user.click(screen.getByRole('button', { name: 'Add Amy Chen' }));
+    // People are searched, never listed.
+    expect(screen.getByText('Type at least 2 characters to find a colleague.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add Amy Chen' })).toBeNull();
+    await user.type(screen.getByRole('textbox', { name: 'Search by name' }), 'am');
+    await user.click(await screen.findByRole('button', { name: 'Add Amy Chen' }));
+    await user.clear(screen.getByRole('textbox', { name: 'Search by name' }));
     expect(onPick).toHaveBeenCalledWith({ kind: 'user', id: 'u2', label: 'Amy Chen' });
 
     await user.click(screen.getByRole('radio', { name: 'Channels' }));
@@ -89,6 +94,7 @@ describe('PrincipalPicker', () => {
     expect(m.get('user:u2')).toBe('Amy Chen');
     expect(m.get('agent:helper')).toBe('Helper');
     expect(m.get('department:sales')).toBe('sales');
+    expect(principalLabels({ ...ENTERPRISE, users: [], resolved_users: [{ id: 'u7', display_name: 'Owner', department: null }] }).get('user:u7')).toBe('Owner');
   });
 });
 

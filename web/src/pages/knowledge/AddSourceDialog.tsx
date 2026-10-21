@@ -1,4 +1,4 @@
-import { useRef, useState, type DragEvent } from 'react';
+import { useEffect, useRef, useState, type DragEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { CheckCircle2, Copy, FileUp, X, XCircle } from 'lucide-react';
 import {
@@ -18,8 +18,10 @@ import {
   KB_MAX_FILES_PER_UPLOAD,
   KB_UPLOAD_ACCEPT,
   knowledgeApi,
+  precheckFile,
   uploadSources,
   type KbCollection,
+  type KbLimits,
   type KbUploadFileResult,
 } from '@/lib/knowledge-api';
 import { formatBytes } from './labels';
@@ -62,20 +64,44 @@ export function AddSourceDialog({
   const [text, setText] = useState('');
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
+  const [limits, setLimits] = useState<KbLimits | null>(null);
+  const [skipped, setSkipped] = useState<Array<{ name: string; reason: 'type' | 'size' | 'count' }>>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // The gateway's own limits, so a file it would refuse is not sent at all.
+  // Without them (older gateway, error) every file is sent and the gateway
+  // still decides.
+  useEffect(() => {
+    let alive = true;
+    knowledgeApi
+      .limits()
+      .then((l) => alive && setLimits(l))
+      .catch(() => {
+        /* Fall back to sending and letting the gateway refuse. */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const maxFiles = limits?.max_files_per_upload ?? KB_MAX_FILES_PER_UPLOAD;
+  const accept = limits ? limits.extensions.map((e) => `.${e}`).join(',') : KB_UPLOAD_ACCEPT;
   const abortRef = useRef<(() => void) | null>(null);
 
   const addFiles = (list: FileList | null) => {
     if (!list) return;
     setResults(null);
     setUploadError(null);
-    setFiles((prev) => {
-      const merged = [...prev];
-      for (const f of Array.from(list)) {
-        if (!merged.some((m) => m.name === f.name && m.size === f.size)) merged.push(f);
-      }
-      return merged.slice(0, KB_MAX_FILES_PER_UPLOAD);
-    });
+    const refused: Array<{ name: string; reason: 'type' | 'size' | 'count' }> = [];
+    const merged = [...files];
+    for (const f of Array.from(list)) {
+      const reason = precheckFile(f, limits);
+      if (reason) refused.push({ name: f.name, reason });
+      else if (merged.some((m) => m.name === f.name && m.size === f.size)) continue;
+      else if (merged.length >= maxFiles) refused.push({ name: f.name, reason: 'count' });
+      else merged.push(f);
+    }
+    setFiles(merged);
+    setSkipped(refused);
   };
 
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
@@ -169,7 +195,7 @@ export function AddSourceDialog({
                 ref={inputRef}
                 type="file"
                 multiple
-                accept={KB_UPLOAD_ACCEPT}
+                accept={accept}
                 className="sr-only"
                 tabIndex={-1}
                 aria-label={t('kb.add.choose')}
@@ -178,7 +204,12 @@ export function AddSourceDialog({
                   e.target.value = '';
                 }}
               />
-              <p className="text-xs text-muted-foreground">{t('kb.add.formats', { max: KB_MAX_FILES_PER_UPLOAD })}</p>
+              <p className="text-xs text-muted-foreground">{t('kb.add.formats', { max: maxFiles })}</p>
+              {limits && (
+                <p className="text-xs text-muted-foreground">
+                  {t('kb.add.sizeLimit', { mb: Math.floor(limits.max_source_bytes / (1024 * 1024)) })}
+                </p>
+              )}
             </div>
 
             {files.length > 0 && (
@@ -198,6 +229,19 @@ export function AddSourceDialog({
                     >
                       <X />
                     </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {skipped.length > 0 && (
+              <ul role="alert" className="space-y-1 text-sm text-destructive" aria-label={t('kb.add.skipped')}>
+                {skipped.map((x, i) => (
+                  <li key={`${x.name}-${i}`} className="break-all">
+                    {x.name} — {t(`kb.add.skip.${x.reason}`, {
+                      max: maxFiles,
+                      mb: limits ? Math.floor(limits.max_source_bytes / (1024 * 1024)) : 0,
+                    })}
                   </li>
                 ))}
               </ul>

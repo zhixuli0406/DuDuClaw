@@ -64,9 +64,11 @@ describe('PermissionsTab', () => {
     await screen.findByRole('combobox', { name: 'Role for Me' });
 
     await user.click(await screen.findByRole('radio', { name: 'People' }));
+    await user.type(screen.getByRole('textbox', { name: 'Search by name' }), 'amy');
     await user.click(await screen.findByRole('button', { name: 'Add Amy Chen' }));
     await user.selectOptions(screen.getByRole('combobox', { name: 'Role for Amy Chen' }), 'editor');
 
+    await user.clear(screen.getByRole('textbox', { name: 'Search by name' }));
     await user.click(screen.getByRole('radio', { name: 'Channels' }));
     await user.click(await screen.findByRole('button', { name: 'Add LINE' }));
     expect(screen.getByRole('alert')).toHaveTextContent(/including strangers/);
@@ -114,5 +116,15 @@ describe('PermissionsTab', () => {
     expect(ownerCount([{ kind: 'user', id: 'a', role: 'owner' }, { kind: 'department', id: 'd', role: 'editor' }])).toBe(1);
     expect(isWholeChannel({ kind: 'channel', id: 'line' })).toBe(true);
     expect(isWholeChannel({ kind: 'channel', id: 'line:C1' })).toBe(false);
+  });
+
+  it('looks up names for the people already on the list by id', async () => {
+    setup([
+      { kind: 'user', id: 'u1', role: 'owner' },
+      { kind: 'user', id: 'u2', role: 'viewer' },
+    ]);
+    renderAt(<PermissionsTab collection={collection()} isOwner onChanged={vi.fn()} />);
+    await screen.findByRole('combobox', { name: 'Role for Amy Chen' });
+    expect(callsOf('knowledge.principals.search').some((p) => JSON.stringify(p.resolve) === JSON.stringify(['u1', 'u2']))).toBe(true);
   });
 });

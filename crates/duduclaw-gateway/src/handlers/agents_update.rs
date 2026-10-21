@@ -718,7 +718,7 @@ impl MethodHandler {
 
             // ── [knowledge] collections (validated above) ──
             if let Some(binding) = knowledge_binding.as_ref() {
-                changes.extend(crate::knowledge::agent_binding::apply_to_table(table, binding));
+                changes.extend(crate::knowledge::agent_binding::apply_to_table(table, binding)?);
             }
 
             // ── Per-agent scattered fields (G.8) ──

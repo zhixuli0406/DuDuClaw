@@ -68,4 +68,16 @@ describe('AccessLogTab', () => {
     expect(requesterText(intl, { requester_kind: 'dashboard_user', requester_id: 'abcdef123456', agent_id: null, channel: null })).toBe('User abcdef12');
     expect(requesterText(intl, { requester_kind: 'system', requester_id: null, agent_id: null, channel: null })).toBe('Scheduled work');
   });
+
+  it('shows only a code for a question the viewer may not read, and names unknown senders', async () => {
+    mockRpc({
+      'knowledge.access_log.list': () => ({
+        entries: [row(3, { query: null, query_hash: 'a1b2c3', requester_kind: 'unknown', requester_id: null })],
+      }),
+      'knowledge.principals.search': () => PRINCIPALS,
+    });
+    renderAt(<AccessLogTab collectionId="col_1" />);
+    expect(await screen.findByText('#a1b2c3')).toBeInTheDocument();
+    expect(screen.getByText('A request whose sender could not be confirmed')).toBeInTheDocument();
+  });
 });

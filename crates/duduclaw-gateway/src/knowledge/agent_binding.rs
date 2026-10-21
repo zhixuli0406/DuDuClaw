@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use duduclaw_core::knowledge_agent::{KnowledgeScope, knowledge_scope};
-use duduclaw_knowledge::acl::{self, AgentCtx, AgentNarrowing, HumanCtx, Narrowing};
+use duduclaw_knowledge::acl::{self, AgentCtx, AgentNarrowing};
 use duduclaw_knowledge::store::{self, CollectionSummary};
 use duduclaw_knowledge::{KbResult, schema};
 use serde_json::{Value, json};
@@ -33,21 +33,23 @@ pub enum Binding {
     Only(Vec<String>),
 }
 
-/// Collections granted to the employee, ignoring its own binding.
+/// Collections granted to the employee, ignoring its own binding (the
+/// employee side alone, as `acl::agent_side_collections` computes it).
 pub fn granted_collections(home: &Path, agent: &AgentRef) -> KbResult<Vec<CollectionSummary>> {
     let conn = schema::open_home(home)?;
-    // Human side "admin, 1:1": only the employee side decides.
-    let human = HumanCtx::dashboard("", None, true);
     let agent_ctx = AgentCtx {
         agent_id: agent.id.clone(),
         department: agent.department.clone(),
         narrowing: AgentNarrowing::All,
     };
-    let allowed = acl::effective_collections(&conn, &human, Some(&agent_ctx), &Narrowing::default())?;
+    let allowed = acl::agent_side_collections(&conn, &agent_ctx)?;
     store::list_by_ids(&conn, allowed.ids())
 }
 
-/// `knowledge.agent.collections` answer.
+/// `knowledge.agent.collections` answer. The caller owns the employee but
+/// is not necessarily a reader of these collections, so only what the
+/// binding editor needs goes out: id, code, name and sensitivity label —
+/// no description and no counts.
 pub fn describe(home: &Path, agent: &AgentRef, agent_dir: &Path) -> KbResult<Value> {
     let granted = granted_collections(home, agent)?;
     let (bound, unreadable) = match knowledge_scope(agent_dir) {
@@ -62,9 +64,7 @@ pub fn describe(home: &Path, agent: &AgentRef, agent_dir: &Path) -> KbResult<Val
                 "id": c.collection.id,
                 "slug": c.collection.slug,
                 "name": c.collection.name,
-                "description": c.collection.description,
                 "sensitivity": c.collection.sensitivity,
-                "source_count": c.source_count,
             })
         })
         .collect();
@@ -72,9 +72,9 @@ pub fn describe(home: &Path, agent: &AgentRef, agent_dir: &Path) -> KbResult<Val
 }
 
 fn parse_slugs(raw: &Value) -> Result<Option<Vec<String>>, String> {
-    let obj = raw
-        .as_object()
-        .ok_or_else(|| "knowledge 必須是物件，例如 {\"collections\": [\"hr-handbook\"]}。".to_string())?;
+    let obj = raw.as_object().ok_or_else(|| {
+        "knowledge 必須是物件，例如 {\"collections\": [\"hr-handbook\"]}。".to_string()
+    })?;
     let Some(list) = obj.get("collections") else {
         return Err("knowledge 缺少 collections。".to_string());
     };
@@ -85,7 +85,9 @@ fn parse_slugs(raw: &Value) -> Result<Option<Vec<String>>, String> {
         .as_array()
         .ok_or_else(|| "collections 必須是集合代號的清單，或 null。".to_string())?;
     if items.len() > MAX_BOUND_COLLECTIONS {
-        return Err(format!("一位 AI 員工最多綁定 {MAX_BOUND_COLLECTIONS} 個集合。"));
+        return Err(format!(
+            "一位 AI 員工最多綁定 {MAX_BOUND_COLLECTIONS} 個集合。"
+        ));
     }
     let mut out: Vec<String> = Vec::with_capacity(items.len());
     for item in items {
@@ -94,7 +96,10 @@ fn parse_slugs(raw: &Value) -> Result<Option<Vec<String>>, String> {
             .map(str::trim)
             .ok_or_else(|| "collections 只能放集合代號（文字）。".to_string())?;
         if !store::valid_slug(slug) {
-            return Err(format!("集合代號「{}」格式不正確。", duduclaw_core::truncate_chars(slug, 64)));
+            return Err(format!(
+                "集合代號「{}」格式不正確。",
+                duduclaw_core::truncate_chars(slug, 64)
+            ));
         }
         if !out.iter().any(|s| s == slug) {
             out.push(slug.to_string());
@@ -128,32 +133,33 @@ pub fn validate(home: &Path, agent: &AgentRef, raw: &Value) -> Result<Binding, S
 
 /// Write the binding into an `agent.toml` table, keeping any other
 /// `[knowledge]` keys. Returns the change lines.
-pub fn apply_to_table(table: &mut toml::Table, binding: &Binding) -> Vec<String> {
+/// `Err` when `knowledge` exists but is not a table: the file is left for
+/// a person to repair rather than overwritten.
+pub fn apply_to_table(table: &mut toml::Table, binding: &Binding) -> Result<Vec<String>, String> {
+    let not_table = || "agent.toml 的 [knowledge] 不是設定段落，請先修正這個檔案。".to_string();
     match binding {
         Binding::AllGranted => {
-            let Some(section) = table.get_mut("knowledge").and_then(toml::Value::as_table_mut) else {
-                return vec!["knowledge.collections cleared".to_string()];
+            let Some(value) = table.get_mut("knowledge") else {
+                return Ok(vec!["knowledge.collections cleared".to_string()]);
             };
+            let section = value.as_table_mut().ok_or_else(not_table)?;
             section.remove("collections");
             if section.is_empty() {
                 table.remove("knowledge");
             }
-            vec!["knowledge.collections cleared".to_string()]
+            Ok(vec!["knowledge.collections cleared".to_string()])
         }
         Binding::Only(slugs) => {
             let section = table
                 .entry("knowledge")
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-            if !section.is_table() {
-                *section = toml::Value::Table(toml::map::Map::new());
-            }
-            if let Some(t) = section.as_table_mut() {
-                t.insert(
-                    "collections".into(),
-                    toml::Value::Array(slugs.iter().cloned().map(toml::Value::String).collect()),
-                );
-            }
-            vec![format!("knowledge.collections = {slugs:?}")]
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or_else(not_table)?;
+            section.insert(
+                "collections".into(),
+                toml::Value::Array(slugs.iter().cloned().map(toml::Value::String).collect()),
+            );
+            Ok(vec![format!("knowledge.collections = {slugs:?}")])
         }
     }
 }

@@ -79,13 +79,22 @@ export function PermissionsTab({
   useEffect(() => {
     if (!isOwner) return;
     void load();
+  }, [isOwner, collection.id, load]);
+
+  // Names for the people already on the list (the picker never lists
+  // people in bulk, so they are looked up by id).
+  const savedUserIds = (saved ?? []).filter((e) => e.kind === 'user').map((e) => e.id).join('\u0000');
+  useEffect(() => {
+    if (!isOwner || saved === null) return;
+    const ids = savedUserIds ? savedUserIds.split('\u0000') : [];
     knowledgeApi
-      .searchPrincipals(collection.id, '')
-      .then((p) => setLabels(principalLabels(p)))
+      .searchPrincipals(collection.id, '', ids)
+      .then((p) => setLabels((m) => new Map([...m, ...principalLabels(p)])))
       .catch(() => {
         /* Names are a nicety; ids still show. */
       });
-  }, [isOwner, collection.id, load]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOwner, collection.id, savedUserIds]);
 
   const dirty = saved !== null && !sameEntries(saved, draft);
   const owners = ownerCount(draft);

@@ -137,4 +137,22 @@ describe('AddSourceDialog', () => {
     expect(looksLikeWebAddress('ftp://a.example')).toBe(false);
     expect(looksLikeWebAddress('not a url')).toBe(false);
   });
+
+  it('refuses unsupported and oversized files before sending, using the gateway limits', async () => {
+    const user = userEvent.setup();
+    mockRpc({ 'knowledge.limits': () => ({ max_source_bytes: 1024 * 1024, max_files_per_upload: 2, extensions: ['pdf', 'md'] }) });
+    renderAt(<AddSourceDialog collection={collection()} onClose={vi.fn()} onAdded={vi.fn()} />);
+    await waitFor(() => expect(callsOf('knowledge.limits')).toHaveLength(1));
+    expect(await screen.findByText(/Each file up to 1 MB/)).toBeInTheDocument();
+    fireEvent.drop(screen.getByTestId('kb-dropzone'), {
+      dataTransfer: { files: [file('a.pdf'), file('old.doc'), file('big.pdf', 2 * 1024 * 1024), file('b.md'), file('c.md')] },
+    });
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('old.doc — this file type is not supported');
+    expect(alert).toHaveTextContent('big.pdf — larger than the 1 MB limit');
+    expect(alert).toHaveTextContent('c.md — only 2 files at a time');
+    await user.click(screen.getByRole('button', { name: 'Upload 2 files' }));
+    const names = Array.from(FakeXhr.last!.body!.getAll('file')).map((f) => (f as File).name);
+    expect(names).toEqual(['a.pdf', 'b.md']);
+  });
 });
