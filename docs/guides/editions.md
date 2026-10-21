@@ -30,7 +30,7 @@ The edition follows the installed license. With no license key you run Personal.
 ## Upgrading
 
 1. Get a license key from your authorised distributor (commercial licensing is not sold directly by the maintainers; see [LICENSING.md](../../LICENSING.md)).
-2. Open the dashboard, go to the System settings app and open the License page. You can also open `/app/system/license` directly.
+2. Open the dashboard and go to **Manage → Advanced → License** (the command palette, ⌘K, finds it too). You can also open `/app/system/license` directly.
 3. Paste the key and activate it. The page shows the plan, and the edition changes right away.
 
 If an item on the Personal side shows a notice that it is available on the Enterprise edition, the same License page is where the upgrade happens.
