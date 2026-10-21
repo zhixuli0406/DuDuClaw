@@ -140,6 +140,9 @@ pub enum ChatMessage {
     /// - `kind`: `summary` | `raw` | `progress` | `redacted` | `omitted`.
     /// - `duration_ms` on `end` only; `raw_needs_redaction` when raw
     ///   reasoning was withheld because redaction is off.
+    /// - A `redacted` frame for a block that already showed text means the
+    ///   outbound checks refused it: the client must drop the text it shows
+    ///   for that block (later blocks of the turn arrive as `redacted` too).
     #[serde(rename = "thinking")]
     Thinking {
         phase: String,

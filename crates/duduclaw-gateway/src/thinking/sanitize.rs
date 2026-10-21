@@ -16,15 +16,15 @@
 //! 4. Control characters and stray `<think>` tags are removed, runs of blank
 //!    lines collapsed.
 //! 5. The outbound guardrail + CONTRACT checks
-//!    (`channel_reply::check_outbound_text`) run on the result; a refusal is
+//!    (`channel_reply::check_outbound_with`) run on the result; a refusal is
 //!    returned to the caller, which withholds the text.
 //! 6. Truncation by chars (CJK safe).
 
-use std::path::Path;
+use std::sync::Arc;
 
 use duduclaw_redaction::RuleEngine;
 
-use crate::channel_reply::{OutboundBlock, OutboundVerdict, check_outbound_text};
+use crate::channel_reply::{OutboundBlock, OutboundRules, OutboundVerdict, check_outbound_with};
 
 /// Placeholder for a credential-shaped word.
 pub const SECRET_PLACEHOLDER: &str = "〔已遮蔽·secret〕";
@@ -33,8 +33,9 @@ pub const LINE_CHARS: usize = 80;
 
 /// What the masking needs to know about the turn.
 pub struct SanitizeCtx<'a> {
-    pub home: &'a Path,
-    pub agent_id: &'a str,
+    /// The answering employee's guardrail + CONTRACT rules (loaded once per
+    /// turn by the sink).
+    pub rules: Arc<OutboundRules>,
     /// The operator's rule engine — `Some` only when redaction is enabled.
     pub engine: Option<&'a RuleEngine>,
 }
@@ -42,9 +43,12 @@ pub struct SanitizeCtx<'a> {
 /// Result of [`sanitize_for_display`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sanitized {
+    /// `line` is the last non-empty line of the whole masked text (before
+    /// truncation), so it keeps following a long block's latest progress.
     Text {
         text: String,
         truncated: bool,
+        line: Option<String>,
     },
     /// The outbound checks refused the text; show none of it.
     Blocked(OutboundBlock),
@@ -53,7 +57,7 @@ pub enum Sanitized {
 /// Steps 1–6 (see the module docs). `cap_chars` is the truncation budget.
 pub fn sanitize_for_display(text: &str, ctx: &SanitizeCtx<'_>, cap_chars: usize) -> Sanitized {
     let masked = mask_text(text, ctx.engine);
-    match check_outbound_text(&masked, ctx.home, ctx.agent_id) {
+    match check_outbound_with(&masked, &ctx.rules) {
         OutboundVerdict::Blocked(block) => Sanitized::Blocked(block),
         OutboundVerdict::Allow => truncate(masked, cap_chars),
         OutboundVerdict::Redacted(t) => truncate(t, cap_chars),
@@ -72,13 +76,18 @@ pub fn mask_text(text: &str, engine: Option<&RuleEngine>) -> String {
 }
 
 fn truncate(text: String, cap_chars: usize) -> Sanitized {
+    let line = last_line(&text);
     let truncated = text.chars().count() > cap_chars;
     let text = if truncated {
         duduclaw_core::truncate_chars(&text, cap_chars).to_string()
     } else {
         text
     };
-    Sanitized::Text { text, truncated }
+    Sanitized::Text {
+        text,
+        truncated,
+        line,
+    }
 }
 
 /// Step 2: replace every rule-engine span with its category placeholder.
@@ -235,11 +244,16 @@ pub fn last_line(text: &str) -> Option<String> {
         .map(|l| duduclaw_core::truncate_chars(l, LINE_CHARS).to_string())
 }
 
+/// Longest tail held back when the cut would split an ASCII word.
+pub const MAX_WORD_HOLD_BACK_CHARS: usize = 512;
+
 /// Split a growing block into the part that is safe to show now and a tail
 /// held back until the block ends: everything after the last whitespace,
 /// but at most `max_tail_chars` (so whitespace-free CJK text still flows).
 /// A secret still being streamed sits in the tail, where a half-written key
-/// cannot slip past the shape checks.
+/// cannot slip past the shape checks. If the `max_tail_chars` cut would land
+/// inside an ASCII word (a long key or JWT with no whitespace), the whole
+/// word is held back, up to [`MAX_WORD_HOLD_BACK_CHARS`].
 pub fn split_hold_back(text: &str, max_tail_chars: usize) -> (&str, &str) {
     let ws_cut = text
         .char_indices()
@@ -256,8 +270,35 @@ pub fn split_hold_back(text: &str, max_tail_chars: usize) -> (&str, &str) {
     } else {
         0
     };
-    let cut = ws_cut.max(cap_cut);
+    let cut = if cap_cut > ws_cut {
+        word_start_before(
+            text,
+            cap_cut,
+            MAX_WORD_HOLD_BACK_CHARS.saturating_sub(max_tail_chars),
+        )
+    } else {
+        ws_cut
+    };
     text.split_at(cut)
+}
+
+/// Move `cut` back to the start of the ASCII word it splits, by at most
+/// `max_back` chars. A cut between two non-ASCII chars (CJK) stays.
+fn word_start_before(text: &str, cut: usize, max_back: usize) -> usize {
+    let is_word = |c: char| c.is_ascii() && !c.is_whitespace();
+    let splits_word = text[cut..].chars().next().is_some_and(is_word)
+        && text[..cut].chars().next_back().is_some_and(is_word);
+    if !splits_word {
+        return cut;
+    }
+    let mut start = cut;
+    for (moved, (i, c)) in text[..cut].char_indices().rev().enumerate() {
+        if !is_word(c) || moved >= max_back {
+            break;
+        }
+        start = i;
+    }
+    start
 }
 
 #[cfg(test)]

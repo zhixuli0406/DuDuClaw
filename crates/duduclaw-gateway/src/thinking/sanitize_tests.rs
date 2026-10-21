@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 use std::sync::Arc;
 
 use duduclaw_redaction::RedactionManager;
@@ -15,15 +16,16 @@ fn manager(home: &Path, tables: &str) -> Arc<RedactionManager> {
 
 fn ctx<'a>(home: &'a Path, engine: Option<&'a RuleEngine>) -> SanitizeCtx<'a> {
     SanitizeCtx {
-        home,
-        agent_id: "agnes",
+        rules: std::sync::Arc::new(crate::channel_reply::OutboundRules::load(home, "agnes")),
         engine,
     }
 }
 
 fn text_of(s: Sanitized) -> (String, bool) {
     match s {
-        Sanitized::Text { text, truncated } => (text, truncated),
+        Sanitized::Text {
+            text, truncated, ..
+        } => (text, truncated),
         Sanitized::Blocked(b) => panic!("unexpected block: {b:?}"),
     }
 }
@@ -155,6 +157,17 @@ fn hold_back_keeps_the_unfinished_tail() {
     let (shown, tail) = split_hold_back(&cjk, 64);
     assert_eq!(shown.chars().count(), 36);
     assert_eq!(tail.chars().count(), 64);
+    // A long whitespace-free ASCII word (a key mid-stream) is held whole,
+    // even past the 64-char window, so no head of it is shown.
+    let long_key = format!("token: {}", "A1b2C3d4".repeat(12)); // 96-char word
+    let (shown, tail) = split_hold_back(&long_key, 64);
+    assert_eq!(shown, "token: ");
+    assert_eq!(tail.len(), 96);
+    // …but CJK right before it still flows.
+    let mixed = format!("{}{}", "字".repeat(10), "Z".repeat(70));
+    let (shown, tail) = split_hold_back(&mixed, 64);
+    assert_eq!(shown, "字".repeat(10));
+    assert_eq!(tail, "Z".repeat(70));
     // Short text: everything waits until whitespace or the end.
     assert_eq!(split_hold_back("abc", 64), ("", "abc"));
     assert_eq!(split_hold_back("", 64), ("", ""));

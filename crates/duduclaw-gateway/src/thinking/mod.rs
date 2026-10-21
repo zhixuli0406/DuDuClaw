@@ -149,6 +149,8 @@ pub struct ThinkingSink {
     forward: Option<Arc<ProgressCallback>>,
     ctx: SinkCtx,
     state: Mutex<SinkState>,
+    /// Per-turn cache of outbound rules by employee id.
+    rules: Mutex<HashMap<String, Arc<crate::channel_reply::OutboundRules>>>,
 }
 
 impl ThinkingSink {
@@ -166,6 +168,7 @@ impl ThinkingSink {
             policy,
             forward,
             ctx,
+            rules: Mutex::new(HashMap::new()),
         }
     }
 
@@ -183,8 +186,7 @@ impl ThinkingSink {
             .unwrap_or_else(|| self.ctx.agent_id.clone());
         let engine = self.ctx.redaction.as_ref().map(|m| m.engine().as_ref());
         let sanitize_ctx = sanitize::SanitizeCtx {
-            home: &self.ctx.home,
-            agent_id: &agent_id,
+            rules: self.rules_for(&agent_id),
             engine,
         };
         let out = {
@@ -208,6 +210,21 @@ impl ThinkingSink {
                 cb(ProgressEvent::Thinking(e));
             }
         }
+    }
+
+    /// The employee's outbound rules, read from disk once per turn and only
+    /// when text can be shown (the other levels never run the checks).
+    fn rules_for(&self, agent_id: &str) -> Arc<crate::channel_reply::OutboundRules> {
+        if self.policy.level != SinkLevel::Summary {
+            return Arc::default();
+        }
+        let mut cache = self.rules.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(cache.entry(agent_id.to_string()).or_insert_with(|| {
+            Arc::new(crate::channel_reply::OutboundRules::load(
+                &self.ctx.home,
+                agent_id,
+            ))
+        }))
     }
 
     /// Did this turn report any thinking?

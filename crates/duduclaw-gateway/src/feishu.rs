@@ -810,7 +810,6 @@ fn verify_feishu_signature(
 
 // ── Tests ───────────────────────────────────────────────────────
 
-
 /// Progress-callback filter: only events a text channel can render
 /// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would
 /// otherwise reach the customer as an empty or unintended message).

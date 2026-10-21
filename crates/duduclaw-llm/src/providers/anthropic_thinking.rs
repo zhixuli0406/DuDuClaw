@@ -85,7 +85,7 @@ pub fn thinking_family(model: &str) -> ThinkingFamily {
     let t: Vec<&str> = tokens.iter().map(String::as_str).collect();
     match t.as_slice() {
         ["3", ..] => ThinkingFamily::LegacyBudget,
-        ["opus" | "sonnet", "4"]
+        ["opus" | "sonnet" | "haiku", "4"]
         | ["opus" | "sonnet", "4", "0"]
         | ["opus", "4", "1"]
         | ["opus" | "sonnet" | "haiku", "4", "5"] => ThinkingFamily::LegacyBudget,

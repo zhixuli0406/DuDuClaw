@@ -140,6 +140,24 @@ pub(crate) enum OutboundVerdict {
     Blocked(OutboundBlock),
 }
 
+/// One employee's outbound rules, loaded once (the guardrail section of
+/// `agent.toml` and `CONTRACT.toml`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OutboundRules {
+    guard: crate::guardrail::GuardrailConfig,
+    contract: duduclaw_agent::contract::Contract,
+}
+
+impl OutboundRules {
+    pub(crate) fn load(home_dir: &std::path::Path, agent_id: &str) -> Self {
+        let agent_dir = home_dir.join("agents").join(agent_id);
+        Self {
+            guard: crate::guardrail::load_guardrail_config(&agent_dir),
+            contract: duduclaw_agent::contract::load_contract(&agent_dir),
+        }
+    }
+}
+
 /// The outbound checks with no side effects: the opt-in output guardrail
 /// first, then CONTRACT.toml `must_not` on the (possibly guardrail-redacted)
 /// text. No logging, no audit, no events — the caller decides what a refusal
@@ -150,10 +168,14 @@ pub(crate) fn check_outbound_text(
     home_dir: &std::path::Path,
     agent_id: &str,
 ) -> OutboundVerdict {
-    let agent_dir = home_dir.join("agents").join(agent_id);
-    let guard_cfg = crate::guardrail::load_guardrail_config(&agent_dir);
+    check_outbound_with(text, &OutboundRules::load(home_dir, agent_id))
+}
+
+/// [`check_outbound_text`] against already-loaded rules.
+pub(crate) fn check_outbound_with(text: &str, rules: &OutboundRules) -> OutboundVerdict {
+    let guard_cfg = &rules.guard;
     let redacted = if guard_cfg.enabled {
-        match crate::guardrail::scan_output(text, &guard_cfg) {
+        match crate::guardrail::scan_output(text, guard_cfg) {
             crate::guardrail::GuardrailAction::Allow => None,
             crate::guardrail::GuardrailAction::Redacted(t) => Some(t),
             crate::guardrail::GuardrailAction::Blocked(reason) => {
@@ -163,10 +185,10 @@ pub(crate) fn check_outbound_text(
     } else {
         None
     };
-    let contract = duduclaw_agent::contract::load_contract(&agent_dir);
+    let contract = &rules.contract;
     if !contract.boundaries.must_not.is_empty() {
         let checked = redacted.as_deref().unwrap_or(text);
-        let result = duduclaw_agent::contract::validate_response(&contract, checked);
+        let result = duduclaw_agent::contract::validate_response(contract, checked);
         if !result.passed {
             let rules = result.violations.iter().map(|v| v.rule.clone()).collect();
             return OutboundVerdict::Blocked(OutboundBlock::Contract(rules));

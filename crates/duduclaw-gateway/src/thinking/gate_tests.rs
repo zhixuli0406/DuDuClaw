@@ -12,8 +12,7 @@ fn ev(block: &str, phase: ThinkingPhase, kind: ThinkingKind, text: Option<&str>)
 
 fn ctx(home: &Path) -> SanitizeCtx<'_> {
     SanitizeCtx {
-        home,
-        agent_id: "agnes",
+        rules: std::sync::Arc::new(crate::channel_reply::OutboundRules::load(home, "agnes")),
         engine: None,
     }
 }
@@ -372,4 +371,52 @@ fn turn_usage_passes_without_text() {
     assert_eq!(got.len(), 1);
     assert!(got[0].text.is_none());
     assert_eq!(got[0].tokens, Some(1_240));
+}
+
+#[test]
+fn runaway_blocks_are_bounded_and_the_line_follows_the_latest_text() {
+    let home = tempfile::tempdir().unwrap();
+    let mut gate = Gate::new(SinkLevel::Summary, 4_000, true);
+    let chunk = "思".repeat(1_000);
+    for i in 0..12u64 {
+        gate.process(
+            ev(
+                "t0",
+                ThinkingPhase::Update,
+                ThinkingKind::Summary,
+                Some(&chunk),
+            ),
+            i * 1_000,
+            &ctx(home.path()),
+        );
+    }
+    let state = gate.blocks.get("t0").unwrap();
+    assert_eq!(state.raw.chars().count(), MAX_RAW_CHARS);
+    assert!(state.overflowed);
+    let got = gate
+        .process(
+            ev("t0", ThinkingPhase::End, ThinkingKind::Summary, None),
+            20_000,
+            &ctx(home.path()),
+        )
+        .events;
+    assert!(got[0].truncated);
+    assert_eq!(
+        got[0].text.as_ref().unwrap().chars().count(),
+        BLOCK_CAP_CHARS
+    );
+
+    // The progress line is the latest line of the whole block, not of the
+    // truncated prefix.
+    let mut gate = Gate::new(SinkLevel::Summary, 4_000, true);
+    let long = format!("{}\n最後一步：核對總額", "前".repeat(2_000));
+    let got = gate
+        .process(
+            ev("t1", ThinkingPhase::End, ThinkingKind::Summary, Some(&long)),
+            0,
+            &ctx(home.path()),
+        )
+        .events;
+    assert!(got[0].truncated);
+    assert_eq!(got[0].line.as_deref(), Some("最後一步：核對總額"));
 }

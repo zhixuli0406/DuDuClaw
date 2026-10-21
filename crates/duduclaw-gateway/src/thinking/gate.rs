@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use super::event::{ThinkingEvent, ThinkingKind, ThinkingPhase};
 use super::policy::SinkLevel;
-use super::sanitize::{SanitizeCtx, Sanitized, last_line, sanitize_for_display, split_hold_back};
+use super::sanitize::{SanitizeCtx, Sanitized, sanitize_for_display, split_hold_back};
 use crate::channel_reply::OutboundBlock;
 
 /// Text cap for one block (chars).
@@ -32,12 +32,34 @@ pub const RAW_BLOCK_CAP_CHARS: usize = 1_200;
 pub const UPDATE_THROTTLE_MS: u64 = 400;
 /// Longest tail held back from a growing block.
 pub const HOLD_BACK_TAIL_CHARS: usize = 64;
+/// Most text kept per block before masking (chars). Display is capped far
+/// lower; this bounds memory and per-flush masking work for runaway blocks.
+pub const MAX_RAW_CHARS: usize = 4 * BLOCK_CAP_CHARS;
 
 #[derive(Debug, Default)]
 struct BlockState {
     raw: String,
+    raw_chars: usize,
+    /// More text arrived than [`MAX_RAW_CHARS`] keeps.
+    overflowed: bool,
     started_at: Option<u64>,
     last_update_ms: Option<u64>,
+}
+
+impl BlockState {
+    fn push(&mut self, delta: &str) {
+        let room = MAX_RAW_CHARS.saturating_sub(self.raw_chars);
+        let n = delta.chars().count();
+        if n <= room {
+            self.raw.push_str(delta);
+            self.raw_chars += n;
+        } else {
+            self.raw
+                .push_str(&duduclaw_core::truncate_chars(delta, room));
+            self.raw_chars = MAX_RAW_CHARS;
+            self.overflowed = true;
+        }
+    }
 }
 
 /// What one [`Gate::process`] call produced.
@@ -128,13 +150,14 @@ impl Gate {
         }
         // Accumulate first, so a throttled delta still counts toward the
         // next snapshot.
-        if ev.phase == ThinkingPhase::Update {
+        let will_show =
+            !self.sticky_redacted && !(ev.kind == ThinkingKind::Raw && !self.redaction_on);
+        if ev.phase == ThinkingPhase::Update && will_show {
             if let Some(delta) = ev.text.as_deref() {
                 self.blocks
                     .entry(ev.block_id.clone())
                     .or_default()
-                    .raw
-                    .push_str(delta);
+                    .push(delta);
             }
         }
         if !self.admit(&ev, now_ms) {
@@ -162,11 +185,20 @@ impl Gate {
                 Some(split_hold_back(raw, HOLD_BACK_TAIL_CHARS).0.to_string())
             }
             ThinkingPhase::End => {
-                let full = ev.text.clone().filter(|t| !t.trim().is_empty());
+                let full = ev
+                    .text
+                    .as_deref()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| duduclaw_core::truncate_chars(t, MAX_RAW_CHARS).to_string());
                 let acc = self.blocks.get(&ev.block_id).map(|s| s.raw.clone());
                 full.or(acc)
             }
         };
+        let overflowed = self.blocks.get(&ev.block_id).is_some_and(|s| s.overflowed)
+            || ev
+                .text
+                .as_deref()
+                .is_some_and(|t| t.chars().count() > MAX_RAW_CHARS);
         let is_end = ev.phase == ThinkingPhase::End;
         let ev = ev.without_text();
         let Some(shown) = shown.filter(|t| !t.trim().is_empty()) else {
@@ -193,15 +225,18 @@ impl Gate {
                 out.newly_blocked = Some(block);
                 out.events.push(redacted(ev));
             }
-            Sanitized::Text { text, truncated } => {
+            Sanitized::Text {
+                text,
+                truncated,
+                line,
+            } => {
                 if is_end {
                     self.used_chars += text.chars().count();
                 }
-                let line = last_line(&text);
                 out.events.push(ThinkingEvent {
                     text: (!text.is_empty()).then_some(text),
                     line,
-                    truncated,
+                    truncated: truncated || overflowed,
                     ..ev
                 });
             }
