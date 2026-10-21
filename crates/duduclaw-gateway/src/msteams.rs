@@ -787,13 +787,9 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             .unwrap_or_else(std::time::Instant::now),
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        // Step / ModelInfo events are dashboard-only signals — never rendered
-        // as channel text (would be an empty message).
-        if matches!(
-            event,
-            crate::channel_reply::ProgressEvent::Step { .. }
-                | crate::channel_reply::ProgressEvent::ModelInfo { .. }
-        ) {
+        // Allowlist: dashboard-only events (Step / ModelInfo / Thinking) never
+        // reach the channel — and never consume the progress throttle.
+        if !forwards_progress(&event) {
             return;
         }
         let is_todo = matches!(
@@ -1091,6 +1087,14 @@ async fn delete_activity(creds: &TeamsCreds, target: &TeamsTarget, activity_id: 
         target.service_url, target.conversation_id, activity_id
     );
     let _ = creds.http.delete(&url).bearer_auth(&token).send().await;
+}
+
+
+/// Progress-callback filter: only events a text channel can render
+/// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would
+/// otherwise reach the customer as an empty or unintended message).
+pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
+    event.is_channel_text()
 }
 
 #[cfg(test)]

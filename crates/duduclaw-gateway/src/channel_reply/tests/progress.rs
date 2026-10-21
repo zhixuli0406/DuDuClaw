@@ -317,3 +317,125 @@ mod step_tracker_tests {
     }
 }
 
+
+#[cfg(test)]
+mod channel_allowlist_tests {
+    use super::*;
+
+    fn every_variant() -> Vec<ProgressEvent> {
+        vec![
+            ProgressEvent::Keepalive,
+            ProgressEvent::ToolUse {
+                tool: "Read".into(),
+                detail: Some("a.txt".into()),
+            },
+            ProgressEvent::TodoUpdate {
+                todos: vec![TodoItem {
+                    content: "x".into(),
+                    status: "pending".into(),
+                    active_form: None,
+                }],
+            },
+            ProgressEvent::Step(StepEvent {
+                phase: StepPhase::Start,
+                tool: "Bash".into(),
+                summary: None,
+                depth: 0,
+                ts_ms: 1,
+            }),
+            ProgressEvent::ModelInfo { model: "m".into() },
+            ProgressEvent::Interim {
+                text: "⏳ 已收到".into(),
+            },
+            ProgressEvent::Thinking(crate::thinking::ThinkingEvent {
+                text: Some("a masked summary".into()),
+                ..crate::thinking::ThinkingEvent::new(
+                    "t0",
+                    crate::thinking::ThinkingPhase::Update,
+                    crate::thinking::ThinkingKind::Summary,
+                    "claude_cli",
+                )
+            }),
+        ]
+    }
+
+    fn name(ev: &ProgressEvent) -> &'static str {
+        match ev {
+            ProgressEvent::Keepalive => "keepalive",
+            ProgressEvent::ToolUse { .. } => "tool_use",
+            ProgressEvent::TodoUpdate { .. } => "todo",
+            ProgressEvent::Step(_) => "step",
+            ProgressEvent::ModelInfo { .. } => "model_info",
+            ProgressEvent::Interim { .. } => "interim",
+            ProgressEvent::Thinking(_) => "thinking",
+        }
+    }
+
+    #[test]
+    fn is_channel_text_table() {
+        let got: Vec<(&str, bool)> = every_variant()
+            .iter()
+            .map(|e| (name(e), e.is_channel_text()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("keepalive", true),
+                ("tool_use", true),
+                ("todo", true),
+                ("step", false),
+                ("model_info", false),
+                ("interim", true),
+                ("thinking", false),
+            ]
+        );
+        // Dashboard-only variants render no channel text at all.
+        for e in every_variant().iter().filter(|e| !e.is_channel_text()) {
+            assert!(e.to_display().is_empty(), "{}", name(e));
+        }
+    }
+
+    /// Every text channel's progress filter, by channel.
+    fn channel_filters() -> Vec<(&'static str, fn(&ProgressEvent) -> bool)> {
+        vec![
+            ("telegram", crate::telegram::forwards_progress),
+            ("slack", crate::slack::forwards_progress),
+            ("discord", crate::discord::forwards_progress),
+            ("line", crate::line::should_forward_line_progress_event),
+            ("whatsapp", crate::whatsapp::forwards_progress),
+            ("feishu", crate::feishu::forwards_progress),
+            ("googlechat", crate::googlechat::forwards_progress),
+            ("teams", crate::msteams::forwards_progress),
+            ("wecom", crate::wecom::forwards_progress),
+            ("dingtalk", crate::dingtalk::forwards_progress),
+        ]
+    }
+
+    #[test]
+    fn every_channel_drops_thinking_step_and_model_info() {
+        let filters = channel_filters();
+        // One filter per external channel the footer/interim logic knows.
+        assert_eq!(filters.len(), super::super::super::guarded::FOOTER_CHANNELS.len());
+        for (channel, forwards) in &filters {
+            for ev in every_variant() {
+                if !ev.is_channel_text() {
+                    assert!(!forwards(&ev), "{channel} must drop {}", name(&ev));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn channels_keep_forwarding_what_they_forwarded_before() {
+        for (channel, forwards) in channel_filters() {
+            for ev in every_variant().into_iter().filter(ProgressEvent::is_channel_text) {
+                let want = match channel {
+                    // WhatsApp only ever forwarded the todo board.
+                    "whatsapp" => matches!(ev, ProgressEvent::TodoUpdate { .. }),
+                    _ => true,
+                };
+                assert_eq!(forwards(&ev), want, "{channel} / {}", name(&ev));
+            }
+        }
+    }
+}

@@ -449,13 +449,9 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
             .unwrap_or_else(std::time::Instant::now),
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        // Step / ModelInfo events are dashboard-only signals — never rendered
-        // as channel text (would be an empty message).
-        if matches!(
-            event,
-            crate::channel_reply::ProgressEvent::Step { .. }
-                | crate::channel_reply::ProgressEvent::ModelInfo { .. }
-        ) {
+        // Allowlist: dashboard-only events (Step / ModelInfo / Thinking) never
+        // reach the channel — and never consume the progress throttle.
+        if !forwards_progress(&event) {
             return;
         }
         let is_todo = matches!(
@@ -813,6 +809,14 @@ fn verify_feishu_signature(
 }
 
 // ── Tests ───────────────────────────────────────────────────────
+
+
+/// Progress-callback filter: only events a text channel can render
+/// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would
+/// otherwise reach the customer as an empty or unintended message).
+pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
+    event.is_channel_text()
+}
 
 #[cfg(test)]
 mod tests {

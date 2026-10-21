@@ -565,3 +565,7 @@ pub mod team_composer;
 
 pub mod product_policy;
 pub mod data_exports;
+
+/// Thinking display: the normalised `ThinkingEvent`, the per-turn sink and
+/// gate (masking, truncation, CONTRACT checks) and the display policy.
+pub mod thinking;

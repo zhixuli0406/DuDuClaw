@@ -511,10 +511,7 @@ async fn receive_webhook(
                     ));
                     let on_progress: crate::channel_reply::ProgressCallback =
                         Box::new(move |event| {
-                            if !matches!(
-                                event,
-                                crate::channel_reply::ProgressEvent::TodoUpdate { .. }
-                            ) {
+                            if !forwards_progress(&event) {
                                 return;
                             }
                             {
@@ -815,4 +812,12 @@ mod tests {
         let body = b"{\"entry\":[]}";
         assert!(!webhook_signature_ok("test_app_secret", None, body));
     }
+}
+
+/// Progress-callback filter. WhatsApp has no message-edit API and every
+/// progress text costs conversation quota, so only the TodoUpdate board is
+/// forwarded — narrower than the shared allowlist, and still a subset of it.
+pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
+    event.is_channel_text()
+        && matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. })
 }

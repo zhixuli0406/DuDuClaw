@@ -125,6 +125,43 @@ pub enum ChatMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conv: Option<String>,
     },
+    /// Server → Client: the employee is thinking (see `crate::thinking`).
+    /// Purely additive — older clients ignore unknown frame types. Never
+    /// sent to a public-widget visitor. `text` / `line` are already masked
+    /// and truncated, and only present when the viewer may see a summary.
+    ///
+    /// ```json
+    /// {"type":"thinking","phase":"update","block":"t0","kind":"summary",
+    ///  "text":"…","line":"正在比對兩份報表…","started_at":1729500000123,
+    ///  "tokens":1240,"truncated":false,"conv":"c1"}
+    /// ```
+    /// - `phase`: `start` | `update` | `end`; `block`: `t0`, `t1`, … or `turn`
+    ///   (whole-turn token usage).
+    /// - `kind`: `summary` | `raw` | `progress` | `redacted` | `omitted`.
+    /// - `duration_ms` on `end` only; `raw_needs_redaction` when raw
+    ///   reasoning was withheld because redaction is off.
+    #[serde(rename = "thinking")]
+    Thinking {
+        phase: String,
+        block: String,
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        started_at: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        raw_needs_redaction: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conv: Option<String>,
+    },
     /// Server → Client: assistant finished responding.
     #[serde(rename = "assistant_done")]
     AssistantDone {
@@ -306,13 +343,47 @@ fn resume_needs_acl_check(stored_agent: &str, default_agent: &str) -> bool {
     stored_agent != default_agent
 }
 
+/// Principal prefix of a public-widget visitor (set by the widget-key login).
+pub(crate) const WIDGET_VISITOR_PREFIX: &str = "widget-visitor:";
+
+/// Is this WebChat principal a public-widget visitor (not a dashboard
+/// account)? Anchored prefix on the server-minted principal.
+pub(crate) fn is_widget_visitor(auth_user: &str) -> bool {
+    auth_user.starts_with(WIDGET_VISITOR_PREFIX)
+}
+
+/// The `thinking` frame for one gated event, or `None` for a public-widget
+/// visitor (they never see that the employee is thinking, not even timing).
+pub(crate) fn thinking_frame(
+    ev: crate::thinking::ThinkingEvent,
+    conv: Option<String>,
+    widget_visitor: bool,
+) -> Option<ChatMessage> {
+    if widget_visitor {
+        return None;
+    }
+    Some(ChatMessage::Thinking {
+        phase: ev.phase.as_str().to_string(),
+        block: ev.block_id,
+        kind: ev.kind.as_str().to_string(),
+        text: ev.text,
+        line: ev.line,
+        started_at: ev.started_at,
+        duration_ms: ev.duration_ms,
+        tokens: ev.tokens,
+        truncated: ev.truncated,
+        raw_needs_redaction: ev.raw_needs_redaction,
+        conv,
+    })
+}
+
 /// Whether a WebChat caller may run admin-gated chat commands. Mirrors the
 /// other channels' `admin_users` gate (an explicit admin list, no manager
 /// tier): only an **active dashboard account with the Admin role**. A
 /// public-widget visitor (`widget-visitor:…`) is never an admin, and any
 /// lookup failure denies (fail closed).
 fn webchat_command_admin(user_db: &UserDb, auth_user: &str) -> bool {
-    if auth_user.starts_with("widget-visitor:") {
+    if is_widget_visitor(auth_user) {
         return false;
     }
     matches!(
@@ -457,7 +528,7 @@ fn widget_authenticate(home_dir: &std::path::Path, presented: &str) -> Result<St
     if !crate::auth::constant_time_eq(key.as_bytes(), presented.as_bytes()) {
         return Err("invalid widget key".to_string());
     }
-    Ok(format!("widget-visitor:{}", uuid::Uuid::new_v4()))
+    Ok(format!("{WIDGET_VISITOR_PREFIX}{}", uuid::Uuid::new_v4()))
 }
 
 /// Stable, id-safe owner tag for an authenticated user.
@@ -1171,6 +1242,19 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                     content, kind: Some("status".into()), tool: None, detail: None,
                                                     conv: conv_nonce.clone(),
                                                 },
+                                                // Already gated (masked / truncated) by the
+                                                // turn's thinking sink; widget visitors get
+                                                // nothing at all.
+                                                ProgressEvent::Thinking(t) => {
+                                                    match thinking_frame(
+                                                        t,
+                                                        conv_nonce.clone(),
+                                                        is_widget_visitor(&auth_user),
+                                                    ) {
+                                                        Some(frame) => frame,
+                                                        None => continue,
+                                                    }
+                                                }
                                                 // C-P1: structured step boundary → dedicated `step` frame.
                                                 ProgressEvent::Step(step) => ChatMessage::Step {
                                                     phase: step.phase.as_str().to_string(),
@@ -1791,6 +1875,49 @@ mod tests {
             ChatMessage::UserMessage { conv, .. } => assert_eq!(conv, None),
             other => panic!("expected UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn thinking_frame_shape_and_widget_visitors_get_nothing() {
+        use crate::thinking::{ThinkingEvent, ThinkingKind, ThinkingPhase};
+        let ev = ThinkingEvent {
+            text: Some("正在比對兩份報表".into()),
+            line: Some("正在比對兩份報表".into()),
+            started_at: Some(1_729_500_000_123),
+            duration_ms: Some(8_123),
+            tokens: Some(1_240),
+            ..ThinkingEvent::new("t0", ThinkingPhase::End, ThinkingKind::Summary, "claude_cli")
+        };
+        let frame = thinking_frame(ev.clone(), Some("c1".into()), false).unwrap();
+        let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "thinking", "phase": "end", "block": "t0", "kind": "summary",
+                "text": "正在比對兩份報表", "line": "正在比對兩份報表",
+                "started_at": 1_729_500_000_123u64, "duration_ms": 8_123, "tokens": 1_240,
+                "conv": "c1"
+            })
+        );
+        // Optional fields stay off the wire; flags appear only when set.
+        let bare = ThinkingEvent {
+            raw_needs_redaction: true,
+            truncated: true,
+            ..ThinkingEvent::new("t1", ThinkingPhase::Start, ThinkingKind::Raw, "openai_compat")
+        };
+        let json = serde_json::to_value(thinking_frame(bare, None, false).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "thinking", "phase": "start", "block": "t1", "kind": "raw",
+                "truncated": true, "raw_needs_redaction": true
+            })
+        );
+        // Public-widget visitors: no frame at all, not even timing.
+        assert!(thinking_frame(ev, Some("c1".into()), true).is_none());
+        assert!(is_widget_visitor("widget-visitor:1234"));
+        assert!(!is_widget_visitor("alice"));
+        assert!(!is_widget_visitor("alice-widget-visitor:1"));
     }
 
     #[test]

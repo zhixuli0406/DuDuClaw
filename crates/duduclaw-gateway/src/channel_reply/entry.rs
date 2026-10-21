@@ -110,59 +110,116 @@ pub(super) async fn restore_for_channel(
 /// violating content.
 pub(super) const CONTRACT_BLOCK_MESSAGE: &str = "⚠️ 這則回覆因違反行為契約邊界而被攔截，未送出。";
 
+/// Why [`check_outbound_text`] refused a text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OutboundBlock {
+    /// The opt-in `[guardrails]` output scan (short reason, never content).
+    Guardrail(String),
+    /// CONTRACT.toml `must_not` rules that matched (rule names only).
+    Contract(Vec<String>),
+}
+
+impl OutboundBlock {
+    /// Audit lines for `security_audit.jsonl` (names/reasons only).
+    pub(crate) fn audit_rules(&self) -> Vec<String> {
+        match self {
+            OutboundBlock::Guardrail(reason) => vec![format!("guardrail: {reason}")],
+            OutboundBlock::Contract(rules) => rules.clone(),
+        }
+    }
+}
+
+/// Outcome of the outbound content checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OutboundVerdict {
+    /// Send as-is.
+    Allow,
+    /// Send this guardrail-redacted text instead (it passed the contract).
+    Redacted(String),
+    /// Do not send.
+    Blocked(OutboundBlock),
+}
+
+/// The outbound checks with no side effects: the opt-in output guardrail
+/// first, then CONTRACT.toml `must_not` on the (possibly guardrail-redacted)
+/// text. No logging, no audit, no events — the caller decides what a refusal
+/// means for its own surface (a channel reply is replaced; a thinking
+/// summary is withheld while the reply goes on).
+pub(crate) fn check_outbound_text(
+    text: &str,
+    home_dir: &std::path::Path,
+    agent_id: &str,
+) -> OutboundVerdict {
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let guard_cfg = crate::guardrail::load_guardrail_config(&agent_dir);
+    let redacted = if guard_cfg.enabled {
+        match crate::guardrail::scan_output(text, &guard_cfg) {
+            crate::guardrail::GuardrailAction::Allow => None,
+            crate::guardrail::GuardrailAction::Redacted(t) => Some(t),
+            crate::guardrail::GuardrailAction::Blocked(reason) => {
+                return OutboundVerdict::Blocked(OutboundBlock::Guardrail(reason));
+            }
+        }
+    } else {
+        None
+    };
+    let contract = duduclaw_agent::contract::load_contract(&agent_dir);
+    if !contract.boundaries.must_not.is_empty() {
+        let checked = redacted.as_deref().unwrap_or(text);
+        let result = duduclaw_agent::contract::validate_response(&contract, checked);
+        if !result.passed {
+            let rules = result.violations.iter().map(|v| v.rule.clone()).collect();
+            return OutboundVerdict::Blocked(OutboundBlock::Contract(rules));
+        }
+    }
+    match redacted {
+        Some(t) => OutboundVerdict::Redacted(t),
+        None => OutboundVerdict::Allow,
+    }
+}
+
 /// P2-3: enforce CONTRACT.toml `must_not` boundaries on the FINAL user-facing
 /// bytes (I9 — validate the artifact that actually takes effect, i.e. AFTER
 /// secret restoration in `restore_for_channel`). D-6 = block: a violating reply
 /// is replaced with a safe refusal and audited to `security_audit.jsonl`, never
 /// sent. Empty `must_not` (or no CONTRACT.toml) → passthrough (no overhead).
+/// The output guardrail (opt-in `[guardrails]`) runs first. The checks
+/// themselves live in [`check_outbound_text`]; this wrapper adds the logs,
+/// the audit row, the security event and the canned replacement.
 pub(super) async fn enforce_contract(
     final_text: String,
     home_dir: &std::path::Path,
     agent_id: &str,
 ) -> String {
-    let agent_dir = home_dir.join("agents").join(agent_id);
-
-    // ── Output guardrail (opt-in `[guardrails]`) — content-safety last mile ──
-    // Runs before the CONTRACT check; scans the outbound reply for leaked
-    // secrets, injection echoes, and deny phrases. Disabled by default ⇒ no-op.
-    let guard_cfg = crate::guardrail::load_guardrail_config(&agent_dir);
-    let final_text = if guard_cfg.enabled {
-        match crate::guardrail::scan_output(&final_text, &guard_cfg) {
-            crate::guardrail::GuardrailAction::Allow => final_text,
-            crate::guardrail::GuardrailAction::Redacted(t) => {
-                warn!(agent = %agent_id, "guardrail redacted PII in outgoing reply");
-                t
+    match check_outbound_text(&final_text, home_dir, agent_id) {
+        OutboundVerdict::Allow => final_text,
+        OutboundVerdict::Redacted(t) => {
+            warn!(agent = %agent_id, "guardrail redacted PII in outgoing reply");
+            t
+        }
+        OutboundVerdict::Blocked(block) => {
+            match &block {
+                OutboundBlock::Guardrail(reason) => {
+                    warn!(agent = %agent_id, %reason, "guardrail BLOCKED outgoing reply")
+                }
+                OutboundBlock::Contract(rules) => warn!(
+                    agent = %agent_id, ?rules,
+                    "CONTRACT must_not violation — blocking outgoing reply"
+                ),
             }
-            crate::guardrail::GuardrailAction::Blocked(reason) => {
-                warn!(agent = %agent_id, %reason, "guardrail BLOCKED outgoing reply");
-                duduclaw_security::audit::log_contract_violation(
-                    home_dir,
-                    agent_id,
-                    &[format!("guardrail: {reason}")],
-                );
-                // C1 producer 甲 companion — see `security_autopilot.rs`.
-                crate::security_autopilot::emit_contract_violation(agent_id);
-                return crate::guardrail::blocked_reply();
+            duduclaw_security::audit::log_contract_violation(
+                home_dir,
+                agent_id,
+                &block.audit_rules(),
+            );
+            // C1 producer 甲 companion — see `security_autopilot.rs`.
+            crate::security_autopilot::emit_contract_violation(agent_id);
+            match block {
+                OutboundBlock::Guardrail(_) => crate::guardrail::blocked_reply(),
+                OutboundBlock::Contract(_) => CONTRACT_BLOCK_MESSAGE.to_string(),
             }
         }
-    } else {
-        final_text
-    };
-
-    let contract = duduclaw_agent::contract::load_contract(&agent_dir);
-    if contract.boundaries.must_not.is_empty() {
-        return final_text;
     }
-    let result = duduclaw_agent::contract::validate_response(&contract, &final_text);
-    if result.passed {
-        return final_text;
-    }
-    let rules: Vec<String> = result.violations.iter().map(|v| v.rule.clone()).collect();
-    warn!(agent = %agent_id, ?rules, "CONTRACT must_not violation — blocking outgoing reply");
-    duduclaw_security::audit::log_contract_violation(home_dir, agent_id, &rules);
-    // C1 producer 甲 companion — see `security_autopilot.rs`.
-    crate::security_autopilot::emit_contract_violation(agent_id);
-    CONTRACT_BLOCK_MESSAGE.to_string()
 }
 
 /// Best-effort agent-id resolution for outer restore wrappers — mirrors
