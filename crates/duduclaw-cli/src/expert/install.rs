@@ -73,7 +73,7 @@ pub async fn cmd_install(
 /// path: an existing file is never overwritten.
 pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOpts) -> Result<()> {
     let mut report_file = match &opts.report_json {
-        Some(p) => Some(open_report_file(p)?),
+        Some(p) => Some(super::report::open_report_file(p)?),
         None => None,
     };
     let mut report = Report::default();
@@ -89,24 +89,6 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
             .map_err(|e| io_err(format!("寫入匯入報告失敗：{e}")))?;
     }
     outcome
-}
-
-/// A fresh `.json` file for the report (`create_new`: never follows or
-/// replaces an existing file).
-fn open_report_file(path: &Path) -> Result<std::fs::File> {
-    let is_json = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-    if !is_json {
-        return Err(cfg_err("--report-json 必須是 .json 檔".into()));
-    }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| io_err(format!("無法建立匯入報告 {}（檔案不能已存在）：{e}", path.display())))
 }
 
 async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &mut Report) -> Result<()> {
@@ -165,7 +147,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         attach_under,
     };
     if let Some(z) = &zip_summary {
-        report_zip_summary(z, report);
+        super::report::report_zip_summary(z, report);
     }
 
     // ── 3. Dispatch. ──
@@ -203,29 +185,6 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
 
     drop(cleanup);
     Ok(())
-}
-
-fn report_zip_summary(z: &safe_zip::ExtractSummary, report: &mut Report) {
-    if z.junk_skipped > 0 {
-        report.ignored(
-            "zip",
-            "",
-            format!("已略過 {} 個系統暫存檔（__MACOSX、.DS_Store 等）", z.junk_skipped),
-        );
-        report.tag("zip.junk", serde_json::json!({ "count": z.junk_skipped }));
-    }
-    if let Some(enc) = z.legacy_encoding {
-        report.warning("zip", "", format!("壓縮檔的中文檔名使用 {}，已自動轉換", enc.label()));
-        let code = match enc {
-            super::zip_names::LegacyEncoding::Gbk => "gbk",
-            super::zip_names::LegacyEncoding::Big5 => "big5",
-        };
-        report.tag("zip.legacy", serde_json::json!({ "encoding": code }));
-    }
-    for link in &z.links_skipped {
-        report.skipped("zip", link, "壓縮檔內的捷徑（符號連結）不會解開");
-        report.tag("zip.link", serde_json::json!({}));
-    }
 }
 
 fn format_label(f: Format) -> &'static str {

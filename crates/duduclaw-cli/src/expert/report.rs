@@ -2,7 +2,13 @@
 //! rendered on the console and, for the dashboard, as JSON
 //! (`pack install --report-json`). Split out of `mod.rs` (file-size ceiling).
 
+use std::path::Path;
+
 use console::style;
+
+use duduclaw_core::error::Result;
+
+use super::{cfg_err, io_err};
 
 // ─────────────────────────── Report ───────────────────────────
 
@@ -138,6 +144,49 @@ impl Report {
             println!("  {mark} [{tag}] {}: {}{detail}", it.kind, it.name);
         }
         println!();
+    }
+}
+
+
+/// A fresh `.json` file for the report (`create_new`: never follows or
+/// replaces an existing file).
+pub(super) fn open_report_file(path: &Path) -> Result<std::fs::File> {
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Err(cfg_err("--report-json 必須是 .json 檔".into()));
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| io_err(format!("無法建立匯入報告 {}（檔案不能已存在）：{e}", path.display())))
+}
+
+
+pub(super) fn report_zip_summary(z: &super::safe_zip::ExtractSummary, report: &mut Report) {
+    if z.junk_skipped > 0 {
+        report.ignored(
+            "zip",
+            "",
+            format!("已略過 {} 個系統暫存檔（__MACOSX、.DS_Store 等）", z.junk_skipped),
+        );
+        report.tag("zip.junk", serde_json::json!({ "count": z.junk_skipped }));
+    }
+    if let Some(enc) = z.legacy_encoding {
+        report.warning("zip", "", format!("壓縮檔的中文檔名使用 {}，已自動轉換", enc.label()));
+        let code = match enc {
+            super::zip_names::LegacyEncoding::Gbk => "gbk",
+            super::zip_names::LegacyEncoding::Big5 => "big5",
+        };
+        report.tag("zip.legacy", serde_json::json!({ "encoding": code }));
+    }
+    for link in &z.links_skipped {
+        report.skipped("zip", link, "壓縮檔內的捷徑（符號連結）不會解開");
+        report.tag("zip.link", serde_json::json!({}));
     }
 }
 
