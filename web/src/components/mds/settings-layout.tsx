@@ -78,7 +78,7 @@ export function SettingsShell({
                 className={cn(
                   'flex h-8 shrink-0 items-center gap-2 rounded-md px-2 text-sm whitespace-nowrap text-muted-foreground outline-none transition-colors',
                   'hover:bg-sidebar-accent/70 focus-visible:ring-2 focus-visible:ring-ring/50',
-                  'data-[selected]:bg-sidebar-accent data-[selected]:font-medium data-[selected]:text-sidebar-accent-foreground',
+                  'data-[active]:bg-sidebar-accent data-[active]:font-medium data-[active]:text-sidebar-accent-foreground',
                   "[&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4"
                 )}
               >
