@@ -2937,6 +2937,8 @@ export interface AgentUpdateParamsV168 {
   guardrails?: AgentGuardrailsSection;
   memory?: AgentMemorySection;
   night_engine?: { enabled?: boolean };
+  /** v1.76 — `[channels] public_trigger` (admin-only). */
+  channels?: { public_trigger?: boolean };
   advanced_kv?: AgentKvEntry[];
 }
 
@@ -2958,6 +2960,8 @@ export interface AgentDetailV168 {
   guardrails?: AgentGuardrailsSection;
   memory?: AgentMemorySection;
   night_engine?: { enabled?: boolean };
+  /** v1.76 — `[channels] public_trigger`. Older gateways omit it. */
+  channels?: { public_trigger?: boolean };
   evolution?: {
     max_active_skills?: number;
     skill_token_budget?: number;

@@ -11,7 +11,7 @@ use super::super::*;
 use super::delivery::{
     ProgressLedger, RunReceipt, final_status, is_redelivery, reply_token_deadline,
 };
-use super::revision::{RevisionError, line_revision};
+use super::revision::{RevisionError, line_revision_with};
 use super::upkeep::{maintenance_loop, snapshot_loop};
 use super::{Binding, INGRESS_BINDING, PROGRESS, RUN};
 use crate::channel_ingress::alerts::{self, AlertKind};
@@ -141,7 +141,18 @@ async fn admit(
     row: &IngressRow,
     event: &LineEvent,
 ) -> Option<(String, String, String)> {
-    match line_revision(state, event, None).await {
+    let stored = match store.route_agent(&row.id).await {
+        Ok(r) => r.map(|(agent, one_shot)| super::super::trigger::StoredRoute { agent, one_shot }),
+        Err(_) => {
+            let now = chrono::Utc::now().timestamp();
+            if store.defer_unavailable(row, "route_unreadable", now).await == Ok(Deferred::Quarantined) {
+                alert(store, AlertKind::Quarantined, row, "revalidation_unavailable").await;
+            }
+            return None;
+        }
+    };
+    let mode = super::super::trigger::RouteMode::Replay(stored.as_ref());
+    match line_revision_with(state, event, None, mode).await {
         Err(RevisionError::Unavailable(reason)) => {
             let now = chrono::Utc::now().timestamp();
             if store.defer_unavailable(row, reason, now).await == Ok(Deferred::Quarantined) {
@@ -164,6 +175,7 @@ async fn admit(
                 cause,
             )
             .await;
+            notify_resend(state, event).await;
             None
         }
         Ok(rev) if rev.route == row.revision && rev.authority == row.authorization_revision => {
@@ -178,9 +190,39 @@ async fn admit(
                 "snapshot_changed",
             )
             .await;
+            notify_resend(state, event).await;
             None
         }
     }
+}
+
+/// A user's message that was accepted but can no longer run where it was
+/// accepted (for example its called employee changed): ask them to send it
+/// again instead of leaving them without any answer. Best effort, reply
+/// token only (no Push quota); the event itself stays quarantined.
+async fn notify_resend(state: &LineState, event: &LineEvent) {
+    if event.event_type != "message" || is_redelivery(event) {
+        return;
+    }
+    let Some(reply_token) = event.reply_token.as_deref() else {
+        return;
+    };
+    let Some(token) = read_line_config(&state.home_dir)
+        .await
+        .map(|(t, _)| t)
+        .filter(|t| !t.is_empty())
+    else {
+        return;
+    };
+    let lang = crate::trigger_route::texts::lang_for(&state.home_dir);
+    let text = crate::trigger_route::texts::please_resend(lang);
+    let _ = super::super::send_reply_rich(
+        &state.http,
+        &token,
+        reply_token,
+        vec![serde_json::json!({ "type": "text", "text": text })],
+    )
+    .await;
 }
 
 async fn process_claimed(
@@ -403,8 +445,18 @@ async fn dispatch(
                         if row.decision_fastlane {
                             process_line_decision(event, state, &token).await;
                         } else {
-                            process_line_events(vec![event], state, &token, &resolved, &account_id)
-                                .await;
+                            let stored = store.route_agent(&row.id).await.ok().flatten().map(
+                                |(agent, one_shot)| super::super::trigger::StoredRoute { agent, one_shot },
+                            );
+                            process_line_events(
+                                vec![event],
+                                state,
+                                &token,
+                                &resolved,
+                                &account_id,
+                                stored.as_ref(),
+                            )
+                            .await;
                         }
                     }),
                 ),

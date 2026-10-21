@@ -20,6 +20,8 @@ pub mod skill_hub;
 pub mod skill_loader;
 pub mod skill_recommend;
 pub mod skill_registry;
+/// `@`-mention matching for calling an AI employee by name.
+pub mod trigger_match;
 pub mod trust_tier;
 
 pub use budget::{BudgetManager, BudgetStatus};

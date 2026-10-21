@@ -171,6 +171,9 @@ impl std::fmt::Debug for TurnRollback {
 pub struct GuardedReply {
     pub text: String,
     pub artifact: Option<serde_json::Value>,
+    /// The employee that answered (absent when the turn never resolved one,
+    /// e.g. a refused delivery).
+    pub answered_by: Option<crate::trigger_route::AnsweredBy>,
     pub(super) guards: Vec<duduclaw_llm::CcrDeliveryGuards>,
     /// True when the lease was already lost when this value was built, so the
     /// turn's persisted side effects must be rolled back.
@@ -192,6 +195,7 @@ impl GuardedReply {
         let reply = Self {
             text,
             artifact,
+            answered_by: None,
             guards,
             refused: false,
             rollback,
@@ -206,10 +210,17 @@ impl GuardedReply {
         Self::refused()
     }
 
+    /// Attach the answering employee.
+    pub(super) fn with_answered_by(mut self, who: Option<crate::trigger_route::AnsweredBy>) -> Self {
+        self.answered_by = who;
+        self
+    }
+
     pub(super) fn refused() -> Self {
         Self {
             text: CCR_DELIVERY_REFUSED_TEXT.to_string(),
             artifact: None,
+            answered_by: None,
             guards: Vec::new(),
             refused: true,
             rollback: None,

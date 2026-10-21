@@ -4,6 +4,7 @@
  */
 export { AttachmentChip } from './AttachmentChip';
 export { MessageBubble } from './MessageBubble';
+export { MentionPopup, MENTION_LISTBOX_ID, mentionOptionId } from './MentionPopup';
 export { TypingIndicator } from './TypingIndicator';
 export { ThinkingOrbIndicator, type ThinkingState } from './ThinkingOrbIndicator';
 export { TaskInsights } from './TaskInsights';

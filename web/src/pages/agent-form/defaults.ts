@@ -240,6 +240,7 @@ export const DEFAULT_V168: {
   decision_continuity: boolean;
   decision_ttl_days: number;
   night_engine_enabled: boolean;
+  public_trigger: boolean;
 } = {
   daily_cap_cents: 0,
   effort: '',
@@ -260,4 +261,5 @@ export const DEFAULT_V168: {
   decision_continuity: false,
   decision_ttl_days: 7,
   night_engine_enabled: false,
+  public_trigger: false,
 };

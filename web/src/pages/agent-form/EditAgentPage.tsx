@@ -619,6 +619,7 @@ export function EditAgentPage() {
       decision_continuity: agent.memory?.decision_continuity ?? DEFAULT_V168.decision_continuity,
       decision_ttl_days: agent.memory?.decision_ttl_days ?? DEFAULT_V168.decision_ttl_days,
       night_engine_enabled: agent.night_engine?.enabled ?? DEFAULT_V168.night_engine_enabled,
+      public_trigger: agent.channels?.public_trigger ?? DEFAULT_V168.public_trigger,
     });
   }, [agent]);
 
@@ -1383,6 +1384,21 @@ export function EditAgentPage() {
               <RowSwitch label={t('odoo.agent.clearSecret')} checked={odoo.clear_api_key} onChange={(v) => updateOdoo('clear_api_key', v)} />
               <RowText label={t('agents.odoo.password')} description={t('agents.odoo.secret.hint')} type="password" autoComplete="off" value={odoo.password} onChange={(v) => updateOdoo('password', v)} />
               <RowSwitch label={t('odoo.agent.clearSecret')} checked={odoo.clear_password} onChange={(v) => updateOdoo('clear_password', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          {/* v1.76 — [channels] public_trigger (admin-only: it widens who can
+              reach this employee from LINE / Telegram / the web widget). */}
+          <SettingsSection title={t('agents.publicTrigger.title')} description={t('agents.publicTrigger.desc')}>
+            <SettingsCard>
+              <fieldset disabled={!isAdmin} className="contents">
+                <RowSwitch
+                  label={t('agents.publicTrigger.enabled')}
+                  description={t('agents.publicTrigger.enabled.help')}
+                  checked={v168.public_trigger}
+                  onChange={(v) => updateV('public_trigger', v)}
+                />
+              </fieldset>
             </SettingsCard>
           </SettingsSection>
 
