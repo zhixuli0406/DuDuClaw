@@ -55,6 +55,7 @@ pub fn build_minimal_system_prompt(
         default_language,
         soul: agent.soul.as_deref(),
         identity: agent.identity.as_deref(),
+        instructions: agent.instructions.as_deref(),
         contract: &contract_prompt,
         sender_block,
         pinned_instructions,
@@ -70,6 +71,8 @@ pub(crate) struct MinimalInput<'a> {
     pub default_language: Option<&'a str>,
     pub soul: Option<&'a str>,
     pub identity: Option<&'a str>,
+    /// INSTRUCTIONS.md — capped like SOUL.md (`minimal_core_kb`).
+    pub instructions: Option<&'a str>,
     pub contract: &'a str,
     pub sender_block: &'a str,
     pub pinned_instructions: &'a str,
@@ -114,6 +117,16 @@ pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
         let trimmed = truncate_to_byte_budget(identity, IDENTITY_MAX_BYTES);
         audit.push(crate::prompt_audit::PromptSection::new("identity", trimmed));
         parts.push(trimmed.to_string());
+    }
+
+    // 2b. INSTRUCTIONS.md — operator-imported operating instructions, cut to
+    //     the same `minimal_core_kb` budget SOUL gets above.
+    if let Some(s) = duduclaw_agent::instructions::render_section_capped(
+        input.instructions,
+        (input.minimal_core_kb as usize) * 1024,
+    ) {
+        audit.push(crate::prompt_audit::PromptSection::new("instructions", &s));
+        parts.push(s);
     }
 
     // 3. CONTRACT — keep verbatim, it's the safety guard
@@ -222,6 +235,7 @@ mod tests {
             default_language: None,
             soul,
             identity,
+            instructions: None,
             contract: "",
             sender_block: sender,
             pinned_instructions: pinned,
@@ -363,6 +377,7 @@ mod tests {
             default_language: Some("zh-TW"),
             soul: Some("Be friendly."),
             identity: None,
+            instructions: None,
             contract: "",
             sender_block: "",
             pinned_instructions: "",
@@ -376,5 +391,30 @@ mod tests {
             name_pos < soul_pos,
             "identity directive must precede SOUL content"
         );
+    }
+
+    /// Agent-config import: INSTRUCTIONS.md reaches the minimal prompt, after
+    /// SOUL/IDENTITY, cut to the same `minimal_core_kb` budget as SOUL.
+    #[test]
+    fn minimal_prompt_injects_instructions_capped_like_soul() {
+        let long = "工作規則。".repeat(2000); // ~30 KB
+        let prompt = build_minimal_inner(MinimalInput {
+            agent_name: "test",
+            display_name: "Alice",
+            default_language: None,
+            soul: Some("SOUL-BODY"),
+            identity: Some("IDENTITY-BODY"),
+            instructions: Some(&long),
+            contract: "",
+            sender_block: "",
+            pinned_instructions: "",
+            minimal_core_kb: 2,
+        });
+        let at = prompt.find("# Instructions").expect("instructions injected");
+        assert!(prompt.find("IDENTITY-BODY").unwrap() < at);
+        let section = &prompt[at..];
+        let section = section.split("\n\n---\n\n").next().unwrap();
+        assert!(section.contains("[truncated for minimal mode]"));
+        assert!(section.len() < 2 * 1024 + 200, "{} bytes", section.len());
     }
 }

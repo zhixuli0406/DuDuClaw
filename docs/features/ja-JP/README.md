@@ -66,6 +66,7 @@
 | 59 | [ローカルプロキシ](59-local-proxy.md) | `duduclaw proxy` — Aider / Cline / Codex がアカウントプールを借りられる OpenAI 互換の localhost エンドポイント。Bearer 必須、既定は loopback、OAuth シートを転送できないことも明記 |
 | 60 | [Discovery](60-discovery.md) | 承認済み workspace の探索、予算とツリー台帳、hash 検証済み成果、ゼロ LLM held-out ポリシー比較。統合検証中 |
 | 61 | [Odoo Web サイトのライブチャット](61-odoo-livechat.md) | AI 社員が担当者として Odoo ライブチャットの訪問者に返信。オーディエンスルールで担当を振り分け、有人対応への切り替え |
+| 62 | [@ で AI スタッフを呼び出す](62-calling-ai-staff.md) | `@名前` でメッセージを 1 件だけ別の AI スタッフに渡す。呼び出せるのは権限のあるスタッフのみ。WebChat・LINE・Telegram の @ 一覧、先に呼ぶ方式、メンションのみのグループ |
 | 63 | [ドキュメントナレッジベース](63-knowledge-base.md) | 社内文書をコレクション単位で保存し、コレクションごとに権限（ユーザー、部門、AI 社員、チャネル）を設定。サンドボックス内の解析、ページ・行番号付きのキーワード検索、読み取り専用の `knowledge_*` MCP ツール、`duduclaw knowledge eval` |
 
 ---

@@ -14,7 +14,10 @@ use duduclaw_knowledge::extract::{ExtractError, Format, extract};
 const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 fn fail(e: &ExtractError) -> ! {
-    eprintln!("{}", serde_json::to_string(e).unwrap_or_else(|_| "{}".to_string()));
+    eprintln!(
+        "{}",
+        serde_json::to_string(e).unwrap_or_else(|_| "{}".to_string())
+    );
     std::process::exit(2)
 }
 
@@ -22,7 +25,10 @@ fn fail(e: &ExtractError) -> ! {
 pub fn run(format: &str, input: &Path, max_chars: usize) -> ! {
     std::panic::set_hook(Box::new(|_| eprintln!("knowledge-extract: panic")));
     let Some(format) = Format::parse(format) else {
-        fail(&ExtractError::new("unsupported_format", "不支援這種檔案格式。"));
+        fail(&ExtractError::new(
+            "unsupported_format",
+            "不支援這種檔案格式。",
+        ));
     };
     let too_big = std::fs::metadata(input)
         .map(|m| m.len() > MAX_INPUT_BYTES)
@@ -32,7 +38,10 @@ pub fn run(format: &str, input: &Path, max_chars: usize) -> ! {
     }
     let bytes = match std::fs::read(input) {
         Ok(b) => b,
-        Err(_) => fail(&ExtractError::new("extract_crashed", "無法讀取文件原始檔。")),
+        Err(_) => fail(&ExtractError::new(
+            "extract_crashed",
+            "無法讀取文件原始檔。",
+        )),
     };
     match extract(format, &bytes, max_chars) {
         Ok(out) => {

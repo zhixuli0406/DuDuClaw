@@ -19,6 +19,7 @@ impl MethodHandler {
             .into_iter()
             .map(|r| {
                 let hooks = crate::expert_admin::read_hooks_state(&self.home_dir, &r.slug);
+                let skills = crate::expert_skills::read_skills_state(&self.home_dir, &r.slug);
                 json!({
                     "slug": r.slug,
                     "kind": r.kind.label(),
@@ -32,6 +33,10 @@ impl MethodHandler {
                     // null ⇒ the pack ships no managed hooks.
                     "hooks_status": hooks.as_ref().map(|h| h.status.as_str()),
                     "hooks_files": hooks.map(|h| h.files.len()).unwrap_or(0),
+                    // null ⇒ no imported skill is waiting for approval.
+                    "skills_status": skills.as_ref().map(|s| s.status.as_str()),
+                    "skills_disabled": skills.map(|s| s.skills.len()).unwrap_or(0),
+                    "source_format": r.source_format,
                 })
             })
             .collect();
@@ -46,27 +51,91 @@ impl MethodHandler {
         if !src.exists() {
             return WsFrame::error_response("", "安裝來源不存在（請重新上傳）");
         }
-        let is_zip = src.is_file()
-            && src
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("zip"))
-                .unwrap_or(false);
-        if !src.is_dir() && !is_zip {
-            return WsFrame::error_response("", "安裝來源必須是資料夾或 .zip 檔");
+        // Only what `POST /api/experts/upload` staged: since agent-definition
+        // formats are recognised by common file names (`AGENTS.md`,
+        // `SOUL.md`), an arbitrary server path (a home directory, a repo)
+        // would otherwise qualify. Directory installs stay a CLI action.
+        let staged = match (
+            src.canonicalize(),
+            crate::expert_admin::upload_dir(&self.home_dir).canonicalize(),
+        ) {
+            (Ok(s), Ok(dir)) => s.starts_with(&dir) && s.is_file(),
+            _ => false,
+        };
+        if !staged {
+            return WsFrame::error_response("", "安裝來源必須是透過儀表板上傳的檔案（請重新上傳）");
         }
+        let accepted_ext = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::expert_admin::upload_extension)
+            .is_some();
+        if !accepted_ext {
+            return WsFrame::error_response("", "安裝來源必須是 .zip、.md 或 .yml 檔");
+        }
+        let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Reuse the full CLI install pipeline via our own binary. Hooks are
         // NEVER auto-trusted from the dashboard — they land disabled with an
         // approval request (fail-closed), decided in the approval center.
+        // The machine-readable report comes back through a private temp file.
+        let report_path = crate::expert_admin::upload_dir(&self.home_dir)
+            .join(format!("report-{}.json", uuid::Uuid::new_v4()));
+        if let Some(parent) = report_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let mut args = vec!["install".into(), src.as_os_str().to_os_string()];
+        if dry_run {
+            args.push("--dry-run".into());
+        }
+        args.push("--report-json".into());
+        args.push(report_path.as_os_str().to_os_string());
         match Self::attach_under_args(&params) {
             Ok(extra) => args.extend(extra),
             Err(frame) => return frame,
         }
-        match self.spawn_pack_cli(&args, 300).await {
-            Ok(output) => WsFrame::ok_response("", json!({ "success": true, "output": output })),
+        let result = self.spawn_pack_cli(&args, 300).await;
+        let report = std::fs::read_to_string(&report_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        let _ = std::fs::remove_file(&report_path);
+        match result {
+            Ok(output) => WsFrame::ok_response(
+                "",
+                json!({ "success": true, "dry_run": dry_run, "output": output, "report": report }),
+            ),
+            // A failed run still wrote its report (what was detected, what was
+            // refused and why): hand it back so the dashboard can show it.
+            Err(e) if report.is_some() => WsFrame::ok_response(
+                "",
+                json!({ "success": false, "dry_run": dry_run, "error": e, "report": report }),
+            ),
             Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+        }
+    }
+
+    /// `experts.skills_apply` — apply the approval-center decision for an
+    /// import's disabled skills (approve → enable; deny / expire → stay off).
+    pub(crate) async fn handle_experts_skills_apply(&self, params: Value) -> WsFrame {
+        let Some(slug) = params.get("slug").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "slug parameter is required");
+        };
+        if !duduclaw_core::is_valid_agent_id(slug) {
+            return WsFrame::error_response("", "slug 不合法");
+        }
+        use crate::expert_skills::SkillsApplyOutcome as O;
+        match crate::expert_skills::apply_skills_decision(&self.home_dir, slug).await {
+            Ok(O::Enabled { count, not_enabled }) => WsFrame::ok_response(
+                "",
+                json!({ "status": "enabled", "count": count, "not_enabled": not_enabled }),
+            ),
+            Ok(O::Disabled) => WsFrame::ok_response("", json!({ "status": "disabled" })),
+            Ok(O::StillPending { approval_id }) => WsFrame::ok_response(
+                "",
+                json!({ "status": "pending_approval", "approval_id": approval_id }),
+            ),
+            Ok(O::DeniedOrExpired { status }) => WsFrame::ok_response("", json!({ "status": status })),
+            Err(e) => WsFrame::error_response("", &e),
         }
     }
 

@@ -29,7 +29,25 @@ pub struct KnowledgeConfig {
     pub extract_timeout_secs: u64,
     pub extract_memory_mb: u64,
     pub access_log_retention_days: u32,
+    /// Original bytes one collection may hold.
+    pub max_collection_bytes: u64,
+    /// Original bytes the whole knowledge base may hold.
+    pub max_total_bytes: u64,
+    /// What to do where the OS extraction sandbox is unavailable (Windows,
+    /// or a failed confinement): refuse (default) or run with the timeout
+    /// and limits only (`"run_unsandboxed"`).
+    pub extract_when_unavailable: UnsandboxedPolicy,
 }
+
+/// `[knowledge] extract_when_unavailable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsandboxedPolicy {
+    Refuse,
+    RunUnsandboxed,
+}
+
+/// Accepted values of `extract_when_unavailable`.
+pub const EXTRACT_WHEN_UNAVAILABLE_VALUES: &[&str] = &["refuse", "run_unsandboxed"];
 
 impl Default for KnowledgeConfig {
     fn default() -> Self {
@@ -43,6 +61,9 @@ impl Default for KnowledgeConfig {
             extract_timeout_secs: 180,
             extract_memory_mb: 2048,
             access_log_retention_days: 180,
+            max_collection_bytes: 2 * 1024 * 1024 * 1024,
+            max_total_bytes: 20 * 1024 * 1024 * 1024,
+            extract_when_unavailable: UnsandboxedPolicy::Refuse,
         }
     }
 }
@@ -77,32 +98,78 @@ impl KnowledgeConfig {
             return d;
         };
         Self {
-            enabled: t.get("enabled").and_then(toml::Value::as_bool).unwrap_or(d.enabled),
+            enabled: t
+                .get("enabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(d.enabled),
             max_source_bytes: clamp_u64(
                 int(t, "max_source_bytes"),
                 d.max_source_bytes,
                 MIN_MAX_SOURCE_BYTES,
                 MAX_MAX_SOURCE_BYTES,
             ),
-            max_source_chars: clamp_u64(int(t, "max_source_chars"), d.max_source_chars as u64, 1_000, 2_000_000)
-                as usize,
+            max_source_chars: clamp_u64(
+                int(t, "max_source_chars"),
+                d.max_source_chars as u64,
+                1_000,
+                2_000_000,
+            ) as usize,
             max_sources_per_collection: clamp_u64(
                 int(t, "max_sources_per_collection"),
                 d.max_sources_per_collection as u64,
                 1,
                 10_000,
             ) as usize,
-            max_collections: clamp_u64(int(t, "max_collections"), d.max_collections as u64, 1, 10_000) as usize,
-            max_chunks_total: clamp_u64(int(t, "max_chunks_total"), d.max_chunks_total as u64, 1_000, 2_000_000)
-                as usize,
-            extract_timeout_secs: clamp_u64(int(t, "extract_timeout_secs"), d.extract_timeout_secs, 10, 1_800),
-            extract_memory_mb: clamp_u64(int(t, "extract_memory_mb"), d.extract_memory_mb, 256, 16_384),
+            max_collections: clamp_u64(
+                int(t, "max_collections"),
+                d.max_collections as u64,
+                1,
+                10_000,
+            ) as usize,
+            max_chunks_total: clamp_u64(
+                int(t, "max_chunks_total"),
+                d.max_chunks_total as u64,
+                1_000,
+                2_000_000,
+            ) as usize,
+            extract_timeout_secs: clamp_u64(
+                int(t, "extract_timeout_secs"),
+                d.extract_timeout_secs,
+                10,
+                1_800,
+            ),
+            extract_memory_mb: clamp_u64(
+                int(t, "extract_memory_mb"),
+                d.extract_memory_mb,
+                256,
+                16_384,
+            ),
             access_log_retention_days: clamp_u64(
                 int(t, "access_log_retention_days"),
                 d.access_log_retention_days as u64,
                 1,
                 3_650,
             ) as u32,
+            max_collection_bytes: clamp_u64(
+                int(t, "max_collection_bytes"),
+                d.max_collection_bytes,
+                10 * 1024 * 1024,
+                1 << 40,
+            ),
+            max_total_bytes: clamp_u64(
+                int(t, "max_total_bytes"),
+                d.max_total_bytes,
+                10 * 1024 * 1024,
+                1 << 42,
+            ),
+            // Anything but the exact opt-in refuses (fail closed).
+            extract_when_unavailable: match t
+                .get("extract_when_unavailable")
+                .and_then(toml::Value::as_str)
+            {
+                Some("run_unsandboxed") => UnsandboxedPolicy::RunUnsandboxed,
+                _ => UnsandboxedPolicy::Refuse,
+            },
         }
     }
 
@@ -121,8 +188,14 @@ mod tests {
 
     #[test]
     fn missing_section_is_default() {
-        assert_eq!(KnowledgeConfig::from_toml_str(""), KnowledgeConfig::default());
-        assert_eq!(KnowledgeConfig::from_toml_str("not toml ["), KnowledgeConfig::default());
+        assert_eq!(
+            KnowledgeConfig::from_toml_str(""),
+            KnowledgeConfig::default()
+        );
+        assert_eq!(
+            KnowledgeConfig::from_toml_str("not toml ["),
+            KnowledgeConfig::default()
+        );
     }
 
     #[test]
@@ -136,5 +209,15 @@ mod tests {
         assert_eq!(c.extract_timeout_secs, 1_800);
         let c = KnowledgeConfig::from_toml_str("[knowledge]\nmax_source_bytes = 0\n");
         assert_eq!(c.max_source_bytes, DEFAULT_MAX_SOURCE_BYTES);
+        assert_eq!(c.extract_when_unavailable, UnsandboxedPolicy::Refuse);
+        let c = KnowledgeConfig::from_toml_str(
+            "[knowledge]\nextract_when_unavailable = \"run_unsandboxed\"\n",
+        );
+        assert_eq!(
+            c.extract_when_unavailable,
+            UnsandboxedPolicy::RunUnsandboxed
+        );
+        let c = KnowledgeConfig::from_toml_str("[knowledge]\nextract_when_unavailable = \"yes\"\n");
+        assert_eq!(c.extract_when_unavailable, UnsandboxedPolicy::Refuse);
     }
 }

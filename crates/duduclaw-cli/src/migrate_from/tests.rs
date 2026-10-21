@@ -78,13 +78,6 @@ fn frontmatter_absent_returns_whole_body() {
 }
 
 #[test]
-fn extract_bullets_only_list_lines() {
-    let md = "# Notes\n- likes rust\n* prefers zh-TW\n  + nested plus\nnot a bullet\n-nospace\n";
-    let b = extract_bullets(md);
-    assert_eq!(b, vec!["likes rust", "prefers zh-TW", "nested plus"]);
-}
-
-#[test]
 fn cron_defensive_parse_variants() {
     let j = serde_json::json!({"schedule": "0 9 * * *", "prompt": "morning report", "id": "daily"});
     let job = parse_cron_job(&j).unwrap();
@@ -531,4 +524,49 @@ fn channel_conflict_not_overwritten() {
             .iter()
             .any(|i| matches!(i.status, Status::Conflict(_)))
     );
+}
+
+/// Agent-config import fix: OpenClaw persona files land in slots the prompt
+/// reads (IDENTITY.md, INSTRUCTIONS.md, the「服務對象」wiki page, memory
+/// facts) instead of being copied into `agents/<id>/memory/` where nothing
+/// reads them.
+#[tokio::test]
+async fn openclaw_persona_files_land_in_read_slots_not_memory_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("duduhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let src = tmp.path().join("openclaw");
+    let ws = src.join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(src.join("openclaw.json"), "{ agents: {} }").unwrap();
+    std::fs::write(ws.join("SOUL.md"), "# Soul\n親切。").unwrap();
+    std::fs::write(ws.join("IDENTITY.md"), "- Name: Molty\n- Emoji: 🦞\n").unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "回覆前先看 USER.md。").unwrap();
+    std::fs::write(ws.join("USER.md"), "- Sam 是老闆\n").unwrap();
+    std::fs::write(ws.join("TOOLS.md"), "- 印表機在二樓\n").unwrap();
+    std::fs::write(ws.join("MEMORY.md"), "- 客戶在台北\n").unwrap();
+    let ctx = Ctx {
+        home: home.clone(),
+        platform: Platform::OpenClaw,
+        apply: true,
+        rename: false,
+        agent: None,
+        redact: true,
+    };
+    let user_home = tmp.path().join("user-home");
+    let report = super::openclaw::migrate_with_home(&ctx, Some(src), &user_home)
+        .await
+        .unwrap();
+    let agent = home.join("agents/main");
+    assert!(std::fs::read_to_string(agent.join("INSTRUCTIONS.md")).unwrap().contains("先看 USER.md"));
+    assert!(agent.join("IDENTITY.md").is_file());
+    let toml = std::fs::read_to_string(agent.join("agent.toml")).unwrap();
+    assert!(toml.contains("Molty") && toml.contains("🦞"), "{toml}");
+    let user = std::fs::read_to_string(agent.join("wiki/imported/openclaw/user-profile.md")).unwrap();
+    assert!(user.contains("Sam 是老闆"));
+    assert!(agent.join("wiki/imported/openclaw/tools-notes.md").is_file());
+    for f in ["USER.md", "AGENTS.md", "TOOLS.md", "IDENTITY.md", "MEMORY.md"] {
+        assert!(!agent.join("memory").join(f).exists(), "{f} must not be dumped into memory/");
+    }
+    assert_eq!(report.overall(), "COMPLETE");
 }

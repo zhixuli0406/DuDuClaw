@@ -68,7 +68,14 @@ fn default_deny_only_owner_sees_new_collection() {
         vec![id.clone()]
     );
     assert!(eff(&conn, &HumanCtx::dashboard("other", None, false), None).is_empty());
-    assert!(eff(&conn, &system(), Some(&agent("bot", None, KnowledgeScope::All))).is_empty());
+    assert!(
+        eff(
+            &conn,
+            &system(),
+            Some(&agent("bot", None, KnowledgeScope::All))
+        )
+        .is_empty()
+    );
     assert!(
         eff(
             &conn,
@@ -98,20 +105,47 @@ fn user_and_department_grants() {
         vec![id.clone()]
     );
     assert_eq!(
-        eff(&conn, &HumanCtx::dashboard("bob", Some("人資"), false), None),
+        eff(
+            &conn,
+            &HumanCtx::dashboard("bob", Some("人資"), false),
+            None
+        ),
         vec![id.clone()]
     );
-    assert!(eff(&conn, &HumanCtx::dashboard("carol", Some("業務"), false), None).is_empty());
+    assert!(
+        eff(
+            &conn,
+            &HumanCtx::dashboard("carol", Some("業務"), false),
+            None
+        )
+        .is_empty()
+    );
     // Exact match only: no prefix / substring.
-    assert!(eff(&conn, &HumanCtx::dashboard("dave", Some("人資部"), false), None).is_empty());
+    assert!(
+        eff(
+            &conn,
+            &HumanCtx::dashboard("dave", Some("人資部"), false),
+            None
+        )
+        .is_empty()
+    );
     assert!(eff(&conn, &HumanCtx::dashboard("alic", None, false), None).is_empty());
-    assert_eq!(user_role(&conn, &id, "alice", None, false).unwrap(), Some(Role::Viewer));
+    assert_eq!(
+        user_role(&conn, &id, "alice", None, false).unwrap(),
+        Some(Role::Viewer)
+    );
     assert_eq!(
         user_role(&conn, &id, "bob", Some("人資"), false).unwrap(),
         Some(Role::Editor)
     );
-    assert_eq!(user_role(&conn, &id, "carol", Some("業務"), false).unwrap(), None);
-    assert_eq!(user_role(&conn, &id, "root", None, true).unwrap(), Some(Role::Owner));
+    assert_eq!(
+        user_role(&conn, &id, "carol", Some("業務"), false).unwrap(),
+        None
+    );
+    assert_eq!(
+        user_role(&conn, &id, "root", None, true).unwrap(),
+        Some(Role::Owner)
+    );
     assert!(require_role(&conn, &id, "alice", None, false, Role::Editor).is_err());
     assert!(require_role(&conn, "col_missing", "root", None, true, Role::Viewer).is_err());
 }
@@ -145,17 +179,35 @@ fn agent_side_needs_its_own_grant_and_intersects_human_side() {
     assert_eq!(eff(&conn, &system(), Some(&hr_bot)), vec![hr.clone()]);
     assert_eq!(eff(&conn, &system(), Some(&sales_bot)), vec![faq.clone()]);
     // A person who may read hr talking to sales-bot still gets no hr.
-    assert!(eff(&conn, &HumanCtx::dashboard("alice", None, false), Some(&sales_bot)).is_empty());
+    assert!(
+        eff(
+            &conn,
+            &HumanCtx::dashboard("alice", None, false),
+            Some(&sales_bot)
+        )
+        .is_empty()
+    );
     assert_eq!(
-        eff(&conn, &HumanCtx::dashboard("alice", None, false), Some(&hr_bot)),
+        eff(
+            &conn,
+            &HumanCtx::dashboard("alice", None, false),
+            Some(&hr_bot)
+        ),
         vec![hr.clone()]
     );
     // Admin is all on the human side, never on the agent side.
     assert_eq!(
-        eff(&conn, &HumanCtx::dashboard("root", None, true), Some(&sales_bot)),
+        eff(
+            &conn,
+            &HumanCtx::dashboard("root", None, true),
+            Some(&sales_bot)
+        ),
         vec![faq.clone()]
     );
-    assert_eq!(eff(&conn, &HumanCtx::dashboard("root", None, true), None).len(), 2);
+    assert_eq!(
+        eff(&conn, &HumanCtx::dashboard("root", None, true), None).len(),
+        2
+    );
 }
 
 #[test]
@@ -185,7 +237,10 @@ fn channel_grants_reach_unbound_senders_only_for_their_chat() {
     let mut both = vec![faq.clone(), vip.clone()];
     both.sort();
     assert_eq!(eff(&conn, &unbound("line", "C123"), Some(&bot)), both);
-    assert_eq!(eff(&conn, &unbound("line", "C999"), Some(&bot)), vec![faq.clone()]);
+    assert_eq!(
+        eff(&conn, &unbound("line", "C999"), Some(&bot)),
+        vec![faq.clone()]
+    );
     assert!(eff(&conn, &unbound("telegram", "C123"), Some(&bot)).is_empty());
     // A dashboard user does not inherit channel grants.
     assert!(eff(&conn, &HumanCtx::dashboard("someone", None, false), None).is_empty());
@@ -209,7 +264,12 @@ fn group_sessions_and_system_exclude_personal_and_restricted() {
     }
     let bot = agent("bot", None, KnowledgeScope::All);
     assert_eq!(
-        eff(&conn, &HumanCtx::dashboard("alice", None, false), Some(&bot)).len(),
+        eff(
+            &conn,
+            &HumanCtx::dashboard("alice", None, false),
+            Some(&bot)
+        )
+        .len(),
         2,
         "1:1 dashboard"
     );
@@ -240,7 +300,12 @@ fn narrowing_only_shrinks() {
     let b = coll(&mut conn, "b", "owner", "internal");
     let c = coll(&mut conn, "c", "owner", "internal");
     for id in [&a, &b] {
-        grant(&mut conn, id, &[(PrincipalKind::Agent, "bot", Role::Viewer)], "owner");
+        grant(
+            &mut conn,
+            id,
+            &[(PrincipalKind::Agent, "bot", Role::Viewer)],
+            "owner",
+        );
     }
     let only_a = agent(
         "bot",
@@ -260,7 +325,14 @@ fn narrowing_only_shrinks() {
         )
         .is_empty()
     );
-    assert!(eff(&conn, &system(), Some(&agent("bot", None, KnowledgeScope::Unreadable))).is_empty());
+    assert!(
+        eff(
+            &conn,
+            &system(),
+            Some(&agent("bot", None, KnowledgeScope::Unreadable))
+        )
+        .is_empty()
+    );
     let all = agent("bot", None, KnowledgeScope::All);
     let narrowed = effective_collections(
         &conn,
@@ -272,7 +344,13 @@ fn narrowing_only_shrinks() {
     )
     .unwrap();
     assert_eq!(narrowed.ids(), std::slice::from_ref(&b));
-    let none = effective_collections(&conn, &system(), Some(&all), &Narrowing { only: Some(vec![]) }).unwrap();
+    let none = effective_collections(
+        &conn,
+        &system(),
+        Some(&all),
+        &Narrowing { only: Some(vec![]) },
+    )
+    .unwrap();
     assert!(none.is_empty());
 }
 
@@ -280,7 +358,8 @@ fn narrowing_only_shrinks() {
 fn malformed_acl_rows_never_grant() {
     let mut conn = crate::schema::open_in_memory().unwrap();
     let id = coll(&mut conn, "hr", "owner", "internal");
-    conn.execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .unwrap();
     for (kind, pid, role) in [
         ("user", "mallory", "superuser"),
         ("agent", "bot", "owner"),
@@ -293,10 +372,18 @@ fn malformed_acl_rows_never_grant() {
         )
         .unwrap();
     }
-    conn.execute_batch("PRAGMA ignore_check_constraints = OFF;").unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+        .unwrap();
     assert!(eff(&conn, &HumanCtx::dashboard("mallory", None, false), None).is_empty());
     assert_eq!(user_role(&conn, &id, "mallory", None, false).unwrap(), None);
-    assert!(eff(&conn, &system(), Some(&agent("bot", None, KnowledgeScope::All))).is_empty());
+    assert!(
+        eff(
+            &conn,
+            &system(),
+            Some(&agent("bot", None, KnowledgeScope::All))
+        )
+        .is_empty()
+    );
     assert!(
         eff(
             &conn,
@@ -305,7 +392,10 @@ fn malformed_acl_rows_never_grant() {
         )
         .is_empty()
     );
-    assert_eq!(user_role(&conn, &id, "d", Some("人資"), false).unwrap(), None);
+    assert_eq!(
+        user_role(&conn, &id, "d", Some("人資"), false).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -362,7 +452,11 @@ fn set_acl_rules() {
         set_acl(&mut conn, &id, &[owner.clone(), owner.clone()], 1, "owner").is_err(),
         "duplicate"
     );
-    assert_eq!(get_acl(&conn, &id).unwrap().1, 1, "failed writes changed nothing");
+    assert_eq!(
+        get_acl(&conn, &id).unwrap().1,
+        1,
+        "failed writes changed nothing"
+    );
 }
 
 #[test]
@@ -389,7 +483,10 @@ fn requester_resolution_fails_closed() {
             on_behalf_of: Some("broken".into()),
         },
     ] {
-        assert!(eff(&conn, &human_ctx(&req, &dir), None).is_empty(), "{req:?}");
+        assert!(
+            eff(&conn, &human_ctx(&req, &dir), None).is_empty(),
+            "{req:?}"
+        );
     }
     let bound = human_ctx(
         &RequesterIdentity::ChannelUser {
@@ -409,4 +506,53 @@ fn requester_resolution_fails_closed() {
         &dir,
     );
     assert_eq!(eff(&conn, &behalf, None), vec![id]);
+}
+
+#[test]
+fn agent_side_alone_decides_whether_the_tools_exist() {
+    let mut conn = crate::schema::open_in_memory().unwrap();
+    let a = coll(&mut conn, "a", "owner", "personal");
+    let b = coll(&mut conn, "b", "owner", "internal");
+    grant(
+        &mut conn,
+        &a,
+        &[(PrincipalKind::Agent, "bot", Role::Viewer)],
+        "owner",
+    );
+    grant(
+        &mut conn,
+        &b,
+        &[
+            (PrincipalKind::Department, "人資", Role::Editor),
+            (PrincipalKind::User, "x", Role::Viewer),
+        ],
+        "owner",
+    );
+    let side = |ag: &AgentCtx| agent_side_collections(&conn, ag).unwrap().ids().to_vec();
+    let mut both = vec![a.clone(), b.clone()];
+    both.sort();
+    assert_eq!(
+        side(&agent("bot", Some("人資"), KnowledgeScope::All)),
+        both,
+        "sensitivity is not part of the agent side"
+    );
+    assert_eq!(
+        side(&agent("bot", None, KnowledgeScope::Only(vec!["b".into()]))),
+        Vec::<String>::new()
+    );
+    assert!(
+        side(&agent("other", None, KnowledgeScope::All)).is_empty(),
+        "user grants do not count"
+    );
+    assert!(side(&agent("bot", None, KnowledgeScope::Unreadable)).is_empty());
+    // Unknown requester serves nobody even with agent grants.
+    let unknown = human_ctx(&RequesterIdentity::Unknown, &users(&[]));
+    assert!(
+        eff(
+            &conn,
+            &unknown,
+            Some(&agent("bot", Some("人資"), KnowledgeScope::All))
+        )
+        .is_empty()
+    );
 }

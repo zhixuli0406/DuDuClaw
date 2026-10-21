@@ -140,6 +140,12 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
     if let Some(dir) = req.agent_dir {
         crate::runtime_config::ensure_active_agent_provider(dir)?;
     }
+    // Knowledge-base tool calls made during this call learn who the turn is
+    // for from the gateway's own record (every runtime, not just Claude).
+    // Nothing is registered outside a channel turn; dropped on return.
+    let _knowledge_turn = (!req.agent_id.is_empty())
+        .then(|| crate::knowledge::turn_requesters::register_current_turn(req.agent_id))
+        .flatten();
     // Reuse caller-provided settings when present (RFC-25 L7 followup — avoids a
     // second agent.toml read on paths that already parsed it to decide routing);
     // otherwise read once here.

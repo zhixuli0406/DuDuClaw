@@ -15,7 +15,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use super::{Budget, ExtractError, RawSegment, SegmentKind, Warning};
 
 /// Extract a PDF.
-pub fn extract(bytes: &[u8], budget: &mut Budget) -> Result<(Vec<RawSegment>, Vec<Warning>), ExtractError> {
+pub fn extract(
+    bytes: &[u8],
+    budget: &mut Budget,
+) -> Result<(Vec<RawSegment>, Vec<Warning>), ExtractError> {
     let mut doc = match catch_unwind(|| pdf_extract::Document::load_mem(bytes)) {
         Ok(Ok(doc)) => doc,
         _ => return Err(ExtractError::corrupt(super::Format::Pdf)),

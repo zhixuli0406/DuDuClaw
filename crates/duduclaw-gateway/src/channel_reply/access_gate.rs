@@ -256,3 +256,27 @@ pub(crate) async fn is_channel_admin(
         .await;
     admin_list_contains(raw.as_deref(), identities)
 }
+
+/// The checks a channel reply that skips the model (the `@` list, an `@`
+/// refusal, "say the task") must still pass, in the order the reply pipeline
+/// applies them: the user access gate, the `/takeover` lifecycle command and
+/// human takeover. `Some(text)` = send `text` instead (empty = send nothing);
+/// `None` = the direct reply may go out.
+pub(crate) async fn gate_direct_reply(
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    text: &str,
+) -> Option<String> {
+    if let Some(reply) = check_user_access_gate(ctx, session_id, user_id, text).await {
+        return Some(reply);
+    }
+    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+        return None;
+    }
+    match crate::takeover::intercept(ctx, session_id, user_id, text).await {
+        Some(crate::takeover::Intercepted::Announce(msg)) => Some(msg),
+        Some(crate::takeover::Intercepted::Silent) => Some(String::new()),
+        None => None,
+    }
+}

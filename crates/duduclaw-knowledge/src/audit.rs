@@ -62,8 +62,8 @@ pub fn log_access(conn: &Connection, e: &AccessEntry) -> KbResult<()> {
 
 /// Delete rows older than `days`.
 pub fn prune(conn: &Connection, days: u32) -> KbResult<usize> {
-    let cutoff =
-        (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     Ok(conn.execute("DELETE FROM access_log WHERE at < ?1", params![cutoff])?)
 }
 
@@ -77,17 +77,30 @@ pub struct AccessRow {
     pub requester_kind: String,
     pub requester_id: Option<String>,
     pub channel: Option<String>,
+    /// The query text: only for an Admin and for the person who asked.
     pub query: Option<String>,
+    /// A short hash of the query (same question ⇒ same hash), for everyone.
+    pub query_hash: Option<String>,
     /// Results that came from the listed collection.
     pub result_count: i64,
     pub mode: Option<String>,
     pub outcome: String,
 }
 
+/// Who is reading the access log.
+#[derive(Debug, Clone, Copy)]
+pub struct Viewer<'a> {
+    pub user_id: &'a str,
+    pub is_admin: bool,
+}
+
 /// Rows touching `collection_id` (named directly, or in the allowed set of a
-/// search), newest first, paged by `before_id`.
+/// search), newest first, paged by `before_id`. A collection owner sees who,
+/// when, how many results and a query hash; the query text itself only for
+/// an Admin or for rows the viewer asked.
 pub fn list_for_collection(
     conn: &Connection,
+    viewer: Viewer<'_>,
     collection_id: &str,
     source_ids: &[String],
     before_id: Option<i64>,
@@ -100,24 +113,39 @@ pub fn list_for_collection(
             AND (?2 IS NULL OR id < ?2)
           ORDER BY id DESC LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![collection_id, before_id, limit.clamp(1, 200) as i64], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, Option<String>>(5)?,
-            r.get::<_, Option<String>>(6)?,
-            r.get::<_, Option<String>>(7)?,
-            r.get::<_, String>(8)?,
-            r.get::<_, Option<String>>(9)?,
-            r.get::<_, String>(10)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        params![collection_id, before_id, limit.clamp(1, 200) as i64],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
+            ))
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, at, op, agent_id, requester_kind, requester_id, channel, query, results, mode, outcome) = row?;
+        let (
+            id,
+            at,
+            op,
+            agent_id,
+            requester_kind,
+            requester_id,
+            channel,
+            query,
+            results,
+            mode,
+            outcome,
+        ) = row?;
         let results: Vec<Value> = serde_json::from_str(&results).unwrap_or_default();
         // Count only this collection's results; other collections' ids stay hidden.
         let result_count = results
@@ -128,6 +156,11 @@ pub fn list_for_collection(
                     .is_some_and(|s| source_ids.iter().any(|x| x == s))
             })
             .count() as i64;
+        let query_hash = query
+            .as_deref()
+            .map(|q| crate::sha256_hex(q.as_bytes())[..12].to_string());
+        let own = requester_id.as_deref() == Some(viewer.user_id);
+        let query = if viewer.is_admin || own { query } else { None };
         out.push(AccessRow {
             id,
             at,
@@ -137,6 +170,7 @@ pub fn list_for_collection(
             requester_id,
             channel,
             query,
+            query_hash,
             result_count,
             mode,
             outcome,
@@ -167,11 +201,41 @@ mod tests {
             ..Default::default()
         };
         log_access(&conn, &entry).unwrap();
-        let rows = list_for_collection(&conn, "col_a", &["src_a".into()], None, 50).unwrap();
+        let owner = Viewer {
+            user_id: "owner",
+            is_admin: false,
+        };
+        let rows = list_for_collection(&conn, owner, "col_a", &["src_a".into()], None, 50).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].result_count, 1);
-        assert_eq!(rows[0].query.as_ref().unwrap().chars().count(), MAX_QUERY_CHARS);
-        assert!(list_for_collection(&conn, "col_c", &[], None, 50).unwrap().is_empty());
+        assert!(
+            rows[0].query.is_none(),
+            "another person's question is not shown to an owner"
+        );
+        assert_eq!(rows[0].query_hash.as_ref().unwrap().len(), 12);
+        let asker = Viewer {
+            user_id: "u",
+            is_admin: false,
+        };
+        let rows = list_for_collection(&conn, asker, "col_a", &["src_a".into()], None, 50).unwrap();
+        assert_eq!(
+            rows[0].query.as_ref().unwrap().chars().count(),
+            MAX_QUERY_CHARS
+        );
+        let admin = Viewer {
+            user_id: "root",
+            is_admin: true,
+        };
+        assert!(
+            list_for_collection(&conn, admin, "col_a", &[], None, 50).unwrap()[0]
+                .query
+                .is_some()
+        );
+        assert!(
+            list_for_collection(&conn, admin, "col_c", &[], None, 50)
+                .unwrap()
+                .is_empty()
+        );
         conn.execute("UPDATE access_log SET at = '2000-01-01T00:00:00.000Z'", [])
             .unwrap();
         assert_eq!(prune(&conn, 180).unwrap(), 1);

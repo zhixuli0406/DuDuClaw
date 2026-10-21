@@ -52,8 +52,10 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 `openclaw.json`（JSON5）を読み込み、以下をインポートします。
 
 - **Agents**：`agents.list[]`（未指定の場合は単一の `main`）。それぞれの workspace
-  persona（`SOUL.md`）と記憶（`MEMORY.md` / `USER.md` / `memory/*.md` の箇条書き）も
-  含む。
+  ファイルは [AI スタッフの取り込み](agent-config-import.md#各ファイルの取り込み先) と同じ配置になる：
+  `SOUL.md` → SOUL、`IDENTITY.md` → IDENTITY（名前と絵文字も）、`AGENTS.md` → `INSTRUCTIONS.md`、
+  `USER.md`／`TOOLS.md`／`HEARTBEAT.md` → ナレッジページ、`MEMORY.md` と `memory/*.md` → 記憶（元ファイルを記録）。
+  1.76 より前はペルソナファイルが `agents/<id>/memory/` にコピーされるだけで、どこからも読まれていなかった。
 - **チャンネルトークン**：`channels.telegram.botToken`、`channels.discord.token`、
   `channels.slack.botToken` + `appToken`（暗号化して config.toml に書き込み）。
   WhatsApp は linked-device のため技術的に移行不可能で `SKIPPED`。
@@ -82,7 +84,7 @@ Hermes はシングル agent プラットフォームなので、DuDuClaw agent 
 - **チャンネルトークン**（`.env` から）：`TELEGRAM_BOT_TOKEN`、`DISCORD_BOT_TOKEN`、
   `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`。`EMAIL_*` チャンネルは v1 では未対応のため
   `SKIPPED`。
-- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`、`memories/USER.md`。
+- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`（記憶。`§` で項目を分割）、`memories/USER.md`（ナレッジページ「服務對象」）。
 - **Cron**：`cron/jobs.json`（防御的にパース）。
 - 移行対象は **active な profile のみ**。それ以外の profile は `SKIPPED` として一覧
   表示され、`--source` を使って個別に移行するよう案内されます。

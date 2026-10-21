@@ -217,6 +217,7 @@ fn agent_has_own_channel_token_true_only_for_configured_platform() {
     use duduclaw_core::types::{ChannelsConfig, DiscordChannelConfig};
     let mut cfg = base_agent_config_for_test();
     cfg.channels = Some(ChannelsConfig {
+        public_trigger: false,
         discord: Some(DiscordChannelConfig {
             bot_token: "tok".to_string(),
             bot_token_enc: None,
@@ -236,6 +237,7 @@ fn agent_has_own_channel_token_true_only_for_configured_platform() {
         config: cfg,
         soul: None,
         identity: None,
+        instructions: None,
         memory: None,
         skills: vec![],
         contract: Default::default(),

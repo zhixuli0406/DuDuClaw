@@ -35,12 +35,20 @@ pub fn rrf(lists: &[Vec<i64>]) -> Vec<Fused> {
         }
     }
     let mut out: Vec<Fused> = by_id.into_values().collect();
-    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.chunk_id.cmp(&b.chunk_id)));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.chunk_id.cmp(&b.chunk_id))
+    });
     out
 }
 
 /// Keep at most [`PER_SOURCE_CAP`] per source, then the first `limit`.
-pub fn cap_per_source(fused: Vec<Fused>, source_of: &HashMap<i64, String>, limit: usize) -> Vec<Fused> {
+pub fn cap_per_source(
+    fused: Vec<Fused>,
+    source_of: &HashMap<i64, String>,
+    limit: usize,
+) -> Vec<Fused> {
     let mut per: HashMap<&str, usize> = HashMap::new();
     let mut out = Vec::new();
     for f in fused {
@@ -82,7 +90,10 @@ mod tests {
             .into_iter()
             .map(|(i, s)| (i, s.to_string()))
             .collect();
-        let kept: Vec<i64> = cap_per_source(fused, &src, 10).iter().map(|f| f.chunk_id).collect();
+        let kept: Vec<i64> = cap_per_source(fused, &src, 10)
+            .iter()
+            .map(|f| f.chunk_id)
+            .collect();
         assert_eq!(kept, vec![1, 2, 3, 5]);
     }
 }

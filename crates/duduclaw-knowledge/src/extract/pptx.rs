@@ -74,7 +74,9 @@ fn slide_order(zip: &mut Zip<'_>) -> Result<Vec<String>, ExtractError> {
                     .filter(|(k, _)| k == "id")
                     .map(|(_, v)| v.as_str())
                     .find(|v| !v.chars().all(|c| c.is_ascii_digit()));
-                if let Some((_, _, target)) = rid.and_then(|rid| rels.iter().find(|(id, _, _)| id == rid)) {
+                if let Some((_, _, target)) =
+                    rid.and_then(|rid| rels.iter().find(|(id, _, _)| id == rid))
+                {
                     order.push(resolve_target("ppt/presentation.xml", target));
                 }
             }
@@ -149,7 +151,10 @@ mod tests {
 
     #[test]
     fn slides_in_order_with_notes() {
-        let bytes = fixtures::pptx(&[("產品介紹", Some("講者提醒：先講價格")), ("第二張：售後服務", None)]);
+        let bytes = fixtures::pptx(&[
+            ("產品介紹", Some("講者提醒：先講價格")),
+            ("第二張：售後服務", None),
+        ]);
         let segs = extract(&bytes, &mut Budget::new(10_000)).unwrap();
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].page, Some(1));

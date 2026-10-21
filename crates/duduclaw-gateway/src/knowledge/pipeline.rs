@@ -25,7 +25,11 @@ pub struct PipelineCtx {
 
 /// Is `text` instruction-like (prompt injection)? Index-time flag only.
 pub fn is_suspect(text: &str) -> bool {
-    duduclaw_security::input_guard::scan_input(text, duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD).blocked
+    duduclaw_security::input_guard::scan_input(
+        text,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    )
+    .blocked
 }
 
 /// Gate and extract a file on disk. `display_name` only appears in messages.
@@ -40,19 +44,29 @@ pub async fn extract_file(
     let size = tokio::fs::metadata(path)
         .await
         .map(|m| m.len())
-        .map_err(|_| ExtractError::new("extract_crashed", "找不到這份文件的原始檔，請刪除後重新上傳。"))?;
+        .map_err(|_| {
+            ExtractError::new(
+                "extract_crashed",
+                "找不到這份文件的原始檔，請刪除後重新上傳。",
+            )
+        })?;
     if size > cfg.max_source_bytes {
         return Err(ExtractError::new(
             "too_large",
-            &format!("檔案超過 {} MB 上限。", cfg.max_source_bytes / (1024 * 1024)),
+            &format!(
+                "檔案超過 {} MB 上限。",
+                cfg.max_source_bytes / (1024 * 1024)
+            ),
         ));
     }
     if format.is_ooxml() {
         let limits = crate::document_limits::DocumentLimits::from_home(home);
         let p = path.to_path_buf();
-        let guard = tokio::task::spawn_blocking(move || crate::document_limits::guard_document_path(&p, &limits))
-            .await
-            .map_err(|_| ExtractError::new("extract_crashed", "檢查文件時發生錯誤。"))?;
+        let guard = tokio::task::spawn_blocking(move || {
+            crate::document_limits::guard_document_path(&p, &limits)
+        })
+        .await
+        .map_err(|_| ExtractError::new("extract_crashed", "檢查文件時發生錯誤。"))?;
         if let Err(v) = guard {
             return Err(ExtractError {
                 code: "document_limits".into(),
@@ -64,6 +78,8 @@ pub async fn extract_file(
         timeout: Duration::from_secs(cfg.extract_timeout_secs),
         memory_mb: cfg.extract_memory_mb,
         max_chars: cfg.max_source_chars,
+        allow_unsandboxed: cfg.extract_when_unavailable
+            == duduclaw_knowledge::limits::UnsandboxedPolicy::RunUnsandboxed,
     };
     let spawned = super::extract_spawn::run(extractor, format, path, limits).await?;
     Ok((spawned.output, spawned.sandboxed))
@@ -111,7 +127,12 @@ pub async fn process_job(ctx: &PipelineCtx, job: Job) {
         }
     };
     let Some(format) = Format::parse(&src.format) else {
-        fail(&ctx.home, &job, "unsupported_format", "不支援這種檔案格式。");
+        fail(
+            &ctx.home,
+            &job,
+            "unsupported_format",
+            "不支援這種檔案格式。",
+        );
         return;
     };
     let store = BlobStore::for_home(&ctx.home);
@@ -143,7 +164,16 @@ pub async fn process_job(ctx: &PipelineCtx, job: Job) {
             return;
         }
     };
-    let (output, sandboxed) = match extract_file(&ctx.home, &ctx.cfg, &ctx.extractor, format, &path, &src.title).await {
+    let (output, sandboxed) = match extract_file(
+        &ctx.home,
+        &ctx.cfg,
+        &ctx.extractor,
+        format,
+        &path,
+        &src.title,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             fail(&ctx.home, &job, &e.code, &e.message);
@@ -187,10 +217,14 @@ pub async fn process_job(ctx: &PipelineCtx, job: Job) {
         Ok(Some(o)) => {
             tracing::info!(source = %src.id, chunks = o.chunks, suspect = o.suspect, "knowledge: source indexed")
         }
-        Ok(None) => tracing::info!(source = %src.id, "knowledge: ingest cancelled (source deleted)"),
+        Ok(None) => {
+            tracing::info!(source = %src.id, "knowledge: ingest cancelled (source deleted)")
+        }
         Err(e) => {
             let (code, message) = match &e {
-                duduclaw_knowledge::KbError::Rejected { code, message } => (code.to_string(), message.clone()),
+                duduclaw_knowledge::KbError::Rejected { code, message } => {
+                    (code.to_string(), message.clone())
+                }
                 other => {
                     tracing::error!(error = %other, source = %src.id, "knowledge: indexing failed");
                     ("extract_crashed".to_string(), other.public_message())

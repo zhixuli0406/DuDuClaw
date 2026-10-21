@@ -93,7 +93,12 @@ pub fn knowledge_scope(agent_dir: &Path) -> KnowledgeScope {
 /// `[agent] department`, when it is a valid department name.
 pub fn parse_department(text: &str) -> Option<String> {
     let root = text.parse::<toml::Table>().ok()?;
-    let dept = root.get("agent")?.as_table()?.get("department")?.as_str()?.trim();
+    let dept = root
+        .get("agent")?
+        .as_table()?
+        .get("department")?
+        .as_str()?
+        .trim();
     crate::department::is_valid_department(dept).then(|| dept.to_string())
 }
 
@@ -144,7 +149,14 @@ mod tests {
     fn missing_file_is_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(knowledge_scope(dir.path()), KnowledgeScope::Unreadable);
-        std::fs::write(dir.path().join("agent.toml"), "[knowledge]\ncollections=['a']\n").unwrap();
-        assert_eq!(knowledge_scope(dir.path()), KnowledgeScope::Only(vec!["a".into()]));
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[knowledge]\ncollections=['a']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge_scope(dir.path()),
+            KnowledgeScope::Only(vec!["a".into()])
+        );
     }
 }

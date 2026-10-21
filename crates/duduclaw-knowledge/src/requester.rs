@@ -9,7 +9,8 @@
 //! | `ChannelUser` with a verified binding | user, department, channel | per session |
 //! | `ChannelUser` without binding | channel only | per session |
 //! | `System` on behalf of a user | that user's, group rules | no |
-//! | `System` (cron, heartbeat, dispatch) | public / internal collections granted to the employee | no |
+//! | `System` (cron, heartbeat, dispatch), registered by the gateway | public / internal collections granted to the employee | no |
+//! | `Unknown` (no registered turn) | none | — |
 //!
 //! Anything that cannot be resolved (an unknown or disabled user, a lookup
 //! error) serves nobody: user-scoped collections are denied.
@@ -27,8 +28,14 @@ pub enum RequesterIdentity {
         sender: String,
         user_id: Option<String>,
     },
-    /// No person in the loop.
-    System { kind: String, on_behalf_of: Option<String> },
+    /// No person in the loop, as registered by the gateway (cron,
+    /// heartbeat, dispatch).
+    System {
+        kind: String,
+        on_behalf_of: Option<String>,
+    },
+    /// Nothing the gateway registered matches: serves nobody.
+    Unknown,
 }
 
 impl RequesterIdentity {
@@ -36,9 +43,12 @@ impl RequesterIdentity {
     pub fn kind(&self) -> &'static str {
         match self {
             RequesterIdentity::DashboardUser { .. } => "dashboard_user",
-            RequesterIdentity::ChannelUser { user_id: Some(_), .. } => "channel_user",
+            RequesterIdentity::ChannelUser {
+                user_id: Some(_), ..
+            } => "channel_user",
             RequesterIdentity::ChannelUser { user_id: None, .. } => "channel_unbound",
             RequesterIdentity::System { .. } => "system",
+            RequesterIdentity::Unknown => "unknown",
         }
     }
 
@@ -47,7 +57,9 @@ impl RequesterIdentity {
     pub fn audit_id(&self) -> Option<String> {
         match self {
             RequesterIdentity::DashboardUser { user_id } => Some(user_id.clone()),
-            RequesterIdentity::ChannelUser { user_id: Some(u), .. } => Some(u.clone()),
+            RequesterIdentity::ChannelUser {
+                user_id: Some(u), ..
+            } => Some(u.clone()),
             RequesterIdentity::ChannelUser {
                 channel,
                 sender,
@@ -60,6 +72,7 @@ impl RequesterIdentity {
                 )
             }),
             RequesterIdentity::System { on_behalf_of, .. } => on_behalf_of.clone(),
+            RequesterIdentity::Unknown => None,
         }
     }
 
@@ -135,7 +148,10 @@ pub fn human_ctx(req: &RequesterIdentity, dir: &dyn UserDirectory) -> HumanCtx {
             },
             None => HumanCtx::nobody(),
         },
-        RequesterIdentity::System { on_behalf_of: None, .. } => HumanCtx {
+        RequesterIdentity::Unknown => HumanCtx::nobody(),
+        RequesterIdentity::System {
+            on_behalf_of: None, ..
+        } => HumanCtx {
             mode: HumanMode::InternalOnly,
             ..HumanCtx::nobody()
         },

@@ -21,7 +21,11 @@ pub(crate) fn sheet_segment(sheet: &str, rows: Vec<(u32, String)>) -> Option<Raw
     if rows.is_empty() {
         return None;
     }
-    let text = rows.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+    let text = rows
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut seg = RawSegment::new(SegmentKind::Sheet, text);
     seg.sheet = Some(sheet.to_string());
     seg.line_rows = Some(rows.iter().map(|(n, _)| *n).collect());
@@ -29,7 +33,11 @@ pub(crate) fn sheet_segment(sheet: &str, rows: Vec<(u32, String)>) -> Option<Raw
 }
 
 /// Parse CSV `bytes`; `sheet` names the segment (the file name).
-pub fn extract(bytes: &[u8], sheet: &str, budget: &mut Budget) -> Result<Vec<RawSegment>, ExtractError> {
+pub fn extract(
+    bytes: &[u8],
+    sheet: &str,
+    budget: &mut Budget,
+) -> Result<Vec<RawSegment>, ExtractError> {
     let text = decode_text(bytes)?;
     budget.take(&text)?;
     let mut reader = ::csv::ReaderBuilder::new()
@@ -38,10 +46,17 @@ pub fn extract(bytes: &[u8], sheet: &str, budget: &mut Budget) -> Result<Vec<Raw
         .from_reader(text.as_bytes());
     let mut rows = Vec::new();
     for (i, record) in reader.records().enumerate() {
-        let record = record
-            .map_err(|_| ExtractError::new("unsupported_format", "CSV 格式有誤（引號不成對或欄位無法解析）。"))?;
+        let record = record.map_err(|_| {
+            ExtractError::new(
+                "unsupported_format",
+                "CSV 格式有誤（引號不成對或欄位無法解析）。",
+            )
+        })?;
         // The reader skips blank lines, so the record index is not the line.
-        let line = record.position().map(|p| p.line() as u32).unwrap_or((i + 1) as u32);
+        let line = record
+            .position()
+            .map(|p| p.line() as u32)
+            .unwrap_or((i + 1) as u32);
         rows.push((line, row_line(record.iter())));
     }
     Ok(sheet_segment(sheet, rows).into_iter().collect())
@@ -53,7 +68,8 @@ mod tests {
 
     #[test]
     fn big5_csv_rows_keep_numbers() {
-        let (bytes, _, _) = encoding_rs::BIG5.encode("品號,品名,單價\nA-1234,螺絲,\"1,200\"\n\n,,\nB-9,墊片,30\n");
+        let (bytes, _, _) =
+            encoding_rs::BIG5.encode("品號,品名,單價\nA-1234,螺絲,\"1,200\"\n\n,,\nB-9,墊片,30\n");
         let segs = extract(&bytes, "報價.csv", &mut Budget::new(10_000)).unwrap();
         assert_eq!(segs.len(), 1);
         assert_eq!(

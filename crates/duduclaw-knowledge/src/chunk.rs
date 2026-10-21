@@ -1,7 +1,7 @@
 //! Normalise extracted segments and cut them into chunks.
 //!
-//! - The source's full text is its normalised segments joined by a blank
-//!   line. Every segment and chunk records `char_start..char_end` in that
+//! - The source's full text is its cleaned segments (display form, see
+//!   [`crate::normalize`]) joined by a blank line. Every segment and chunk records `char_start..char_end` in that
 //!   text, counted in Unicode scalar values, and a chunk's text is exactly
 //!   that slice (never a byte slice, so CJK cannot split).
 //! - Chunks never cross a segment, with one exception: a PDF page ending in
@@ -12,10 +12,12 @@
 //!   [`OVERLAP`] characters of overlap.
 //! - Spreadsheet segments are cut at row boundaries; the header row goes
 //!   into every chunk's `heading_path` instead of being copied into the text.
+//! - Each chunk also carries its matching form (`match_text`,
+//!   `match_heading`): what the index and the substring scan look at.
 
 use crate::extract::{Format, RawSegment, SegmentKind};
 use crate::locator::{Locator, LocatorKind};
-use crate::normalize::normalize_text;
+use crate::normalize::{clean_text, match_form};
 
 pub const TARGET: usize = 500;
 pub const MIN: usize = 200;
@@ -50,6 +52,10 @@ pub struct ChunkDraft {
     pub char_end: usize,
     pub segment_ord: u32,
     pub text_sha256: String,
+    /// Matching form of `text` (NFKC, lower case).
+    pub match_text: String,
+    /// Matching form of `heading_path`.
+    pub match_heading: String,
 }
 
 /// Everything the indexer writes for one source.
@@ -66,7 +72,7 @@ pub struct Prepared {
 /// line → row-number mapping survives.
 fn normalize_rows(text: &str) -> String {
     text.split('\n')
-        .map(|l| normalize_text(l).replace('\n', " "))
+        .map(|l| clean_text(l).replace('\n', " "))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -76,8 +82,8 @@ fn is_boundary_char(chars: &[char], i: usize) -> bool {
     let c = chars[i - 1];
     match c {
         '。' | '！' | '？' | '；' | '\n' => true,
-        // NFKC turns full-width ！？； into ASCII, so after those a CJK
-        // character also ends the sentence; `.` needs whitespace (3.5, a.b).
+        // Half-width marks in CJK text are followed by a CJK character, not a
+        // space; `.` needs whitespace (3.5, a.b).
         '!' | '?' | ';' => chars
             .get(i)
             .is_none_or(|n| n.is_whitespace() || !n.is_ascii_alphanumeric()),
@@ -136,7 +142,7 @@ fn layout(raw: Vec<RawSegment>) -> (Vec<Segment>, Vec<Option<Vec<u32>>>, String)
         let text = if seg.kind == SegmentKind::Sheet {
             normalize_rows(&seg.text)
         } else {
-            normalize_text(&seg.text)
+            clean_text(&seg.text)
         };
         if text.trim().is_empty() {
             continue;
@@ -146,11 +152,13 @@ fn layout(raw: Vec<RawSegment>) -> (Vec<Segment>, Vec<Option<Vec<u32>>>, String)
             pos += SEPARATOR.chars().count();
         }
         let n = text.chars().count();
-        let line_rows = seg.line_rows.filter(|r| r.len() == text.split('\n').count());
+        let line_rows = seg
+            .line_rows
+            .filter(|r| r.len() == text.split('\n').count());
         segments.push(Segment {
             ord: segments.len() as u32,
             kind: seg.kind,
-            label: seg.label.map(|l| normalize_text(&l)).filter(|l| !l.is_empty()),
+            label: seg.label.map(|l| clean_text(&l)).filter(|l| !l.is_empty()),
             page: seg.page,
             sheet: seg.sheet,
             row_start: line_rows.as_ref().and_then(|r| r.first().copied()),
@@ -179,11 +187,22 @@ impl Builder<'_> {
         idx.max(1) as u32
     }
 
-    fn push(&mut self, start: usize, end: usize, heading: String, locator: Locator, segment_ord: u32) {
+    fn push(
+        &mut self,
+        start: usize,
+        end: usize,
+        heading: String,
+        locator: Locator,
+        segment_ord: u32,
+    ) {
         let text: String = self.full[start..end].iter().collect();
         let text_sha256 = crate::sha256_hex(text.as_bytes());
+        let match_text = match_form(&text);
+        let match_heading = match_form(&heading);
         self.chunks.push(ChunkDraft {
             ord: self.chunks.len() as u32,
+            match_text,
+            match_heading,
             text,
             heading_path: heading,
             locator,
@@ -237,7 +256,13 @@ fn sheet_chunks(b: &mut Builder<'_>, seg: &Segment, rows: Option<&Vec<u32>>) {
         l
     };
     if lines.len() == 1 {
-        b.push(seg.char_start, seg.char_end, heading, locator(0, 0), seg.ord);
+        b.push(
+            seg.char_start,
+            seg.char_end,
+            heading,
+            locator(0, 0),
+            seg.ord,
+        );
         return;
     }
     let mut group: Option<(usize, usize)> = None; // line indices
@@ -331,7 +356,9 @@ pub fn prepare(format: Format, raw: Vec<RawSegment>) -> Prepared {
             SegmentKind::Page => {
                 let chars = &full[seg.char_start..seg.char_end];
                 let mut ranges = pack(chars);
-                let next_is_page = segments.get(i + 1).is_some_and(|n| n.kind == SegmentKind::Page);
+                let next_is_page = segments
+                    .get(i + 1)
+                    .is_some_and(|n| n.kind == SegmentKind::Page);
                 let tail = ranges
                     .last()
                     .copied()
@@ -363,7 +390,13 @@ pub fn prepare(format: Format, raw: Vec<RawSegment>) -> Prepared {
                 let chars = &full[seg.char_start..seg.char_end];
                 for (a, z) in pack(chars) {
                     let (locator, heading) = text_locator(format, seg, &b, seg.char_start + a);
-                    b.push(seg.char_start + a, seg.char_start + z, heading, locator, seg.ord);
+                    b.push(
+                        seg.char_start + a,
+                        seg.char_start + z,
+                        heading,
+                        locator,
+                        seg.ord,
+                    );
                 }
             }
         }
@@ -433,8 +466,15 @@ mod tests {
         assert!(p.chunks.len() > 2);
         assert_exact_slices(&p);
         for w in p.chunks.windows(2) {
-            assert!(w[1].char_start < w[0].char_end, "consecutive chunks overlap");
-            assert!(w[0].text.ends_with('。'), "cut at a sentence end: {}", w[0].text);
+            assert!(
+                w[1].char_start < w[0].char_end,
+                "consecutive chunks overlap"
+            );
+            assert!(
+                w[0].text.ends_with('。'),
+                "cut at a sentence end: {}",
+                w[0].text
+            );
         }
         for c in &p.chunks {
             let n = c.text.chars().count();
@@ -443,13 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn full_width_marks_still_end_sentences_after_nfkc() {
+    fn full_width_marks_end_sentences_and_display_keeps_them() {
         let text = "請問特休怎麼算？依年資計算！".repeat(80);
         let p = prepare(Format::Txt, vec![seg(SegmentKind::Text, &text)]);
         assert_exact_slices(&p);
         assert!(p.chunks.len() > 1);
         for c in &p.chunks[..p.chunks.len() - 1] {
-            assert!(c.text.ends_with('?') || c.text.ends_with('!'), "{}", c.text);
+            assert!(
+                c.text.ends_with('？') || c.text.ends_with('！'),
+                "{}",
+                c.text
+            );
+            assert!(
+                c.match_text.ends_with('?') || c.match_text.ends_with('!'),
+                "{}",
+                c.match_text
+            );
         }
     }
 
@@ -482,7 +531,10 @@ mod tests {
 
     #[test]
     fn sheet_rows_map_to_row_numbers_and_header_goes_to_heading() {
-        let mut s = seg(SegmentKind::Sheet, "品號 | 單價\nA-1 | 10\nA-2 | 20\nA-3 | 30");
+        let mut s = seg(
+            SegmentKind::Sheet,
+            "品號 | 單價\nA-1 | 10\nA-2 | 20\nA-3 | 30",
+        );
         s.sheet = Some("報價".into());
         s.line_rows = Some(vec![1, 3, 4, 9]);
         let p = prepare(Format::Xlsx, vec![s]);
@@ -530,7 +582,10 @@ mod tests {
     fn empty_segments_are_dropped_and_hash_is_stable() {
         let p1 = prepare(
             Format::Txt,
-            vec![seg(SegmentKind::Text, "  \n"), seg(SegmentKind::Text, "內容")],
+            vec![
+                seg(SegmentKind::Text, "  \n"),
+                seg(SegmentKind::Text, "內容"),
+            ],
         );
         let p2 = prepare(Format::Txt, vec![seg(SegmentKind::Text, "內容")]);
         assert_eq!(p1.segments.len(), 1);

@@ -7,7 +7,8 @@ fn zip_of(parts: &[(&str, String)]) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut w = zip::ZipWriter::new(&mut buf);
-        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         for (name, body) in parts {
             w.start_file(*name, opts).unwrap();
             w.write_all(body.as_bytes()).unwrap();
@@ -18,7 +19,9 @@ fn zip_of(parts: &[(&str, String)]) -> Vec<u8> {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub(crate) enum DocxBlock<'a> {
@@ -124,7 +127,10 @@ pub(crate) fn xlsx(sheets: &[(&str, &[&[&str]])]) -> Vec<u8> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for (i, (name, rows)) in sheets.iter().enumerate() {
         let n = i + 1;
-        sheet_list.push_str(&format!(r#"<sheet name="{}" sheetId="{n}" r:id="rId{n}"/>"#, esc(name)));
+        sheet_list.push_str(&format!(
+            r#"<sheet name="{}" sheetId="{n}" r:id="rId{n}"/>"#,
+            esc(name)
+        ));
         rels.push_str(&format!(
             r#"<Relationship Id="rId{n}" Type="{rel_ns}/worksheet" Target="worksheets/sheet{n}.xml"/>"#
         ));
@@ -175,6 +181,27 @@ pub(crate) fn xlsx(sheets: &[(&str, &[&[&str]])]) -> Vec<u8> {
     zip_of(&refs)
 }
 
+/// An `.xlsx` with one sheet whose `<worksheet>` body is `body`.
+pub(crate) fn xlsx_raw_sheet(body: &str) -> Vec<u8> {
+    let base = xlsx(&[("S", &[&["x"]])]);
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(base)).unwrap();
+    let mut parts: Vec<(String, String)> = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut f, &mut text).unwrap();
+        let name = f.name().unwrap().to_string();
+        if name == "xl/worksheets/sheet1.xml" {
+            text = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{body}</worksheet>"#
+            );
+        }
+        parts.push((name, text));
+    }
+    let refs: Vec<(&str, String)> = parts.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+    zip_of(&refs)
+}
+
 /// A PDF with one page per entry (ASCII text, Courier). An empty entry makes
 /// a page with no text operators, like a scanned page.
 pub(crate) fn pdf(pages: &[&str]) -> Vec<u8> {
@@ -200,7 +227,10 @@ pub(crate) fn pdf(pages: &[&str]) -> Vec<u8> {
         } else {
             vec![
                 Operation::new("BT", vec![]),
-                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Integer(12)]),
+                Operation::new(
+                    "Tf",
+                    vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+                ),
                 Operation::new("Td", vec![Object::Integer(72), Object::Integer(720)]),
                 Operation::new("Tj", vec![Object::string_literal(text.as_bytes().to_vec())]),
                 Operation::new("ET", vec![]),

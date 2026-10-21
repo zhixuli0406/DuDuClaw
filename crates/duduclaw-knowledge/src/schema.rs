@@ -4,6 +4,9 @@
 //! segments, chunks, embeddings and jobs), `secure_delete=ON` (deleted text
 //! does not linger in free pages), WAL and a 5 s busy timeout. The schema is
 //! created idempotently and versioned in `kb_meta.schema_version`.
+//!
+//! `chunks.text` is the display text; the FTS index is built over the
+//! matching form (`match_text`, `match_heading`, see [`crate::normalize`]).
 
 use std::path::{Path, PathBuf};
 
@@ -120,6 +123,8 @@ CREATE TABLE IF NOT EXISTS chunks (
   char_end      INTEGER NOT NULL,
   segment_ord   INTEGER NOT NULL,
   text_sha256   TEXT NOT NULL,
+  match_text    TEXT NOT NULL,
+  match_heading TEXT NOT NULL DEFAULT '',
   flags         INTEGER NOT NULL DEFAULT 0,
   UNIQUE (source_id, ord)
 );
@@ -127,22 +132,22 @@ CREATE INDEX IF NOT EXISTS idx_chunks_collection ON chunks(collection_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_textsha ON chunks(text_sha256);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  text, heading_path,
+  match_text, match_heading,
   content='chunks', content_rowid='id',
   tokenize='trigram remove_diacritics 1'
 );
 
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-  INSERT INTO chunks_fts(rowid, text, heading_path) VALUES (new.id, new.text, new.heading_path);
+  INSERT INTO chunks_fts(rowid, match_text, match_heading) VALUES (new.id, new.match_text, new.match_heading);
 END;
 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_path)
-    VALUES ('delete', old.id, old.text, old.heading_path);
+  INSERT INTO chunks_fts(chunks_fts, rowid, match_text, match_heading)
+    VALUES ('delete', old.id, old.match_text, old.match_heading);
 END;
 CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_path)
-    VALUES ('delete', old.id, old.text, old.heading_path);
-  INSERT INTO chunks_fts(rowid, text, heading_path) VALUES (new.id, new.text, new.heading_path);
+  INSERT INTO chunks_fts(chunks_fts, rowid, match_text, match_heading)
+    VALUES ('delete', old.id, old.match_text, old.match_heading);
+  INSERT INTO chunks_fts(rowid, match_text, match_heading) VALUES (new.id, new.match_text, new.match_heading);
 END;
 
 CREATE TABLE IF NOT EXISTS embeddings (
@@ -180,7 +185,7 @@ CREATE TABLE IF NOT EXISTS access_log (
   collection_id TEXT,
   agent_id TEXT,
   requester_kind TEXT NOT NULL CHECK (requester_kind IN
-    ('dashboard_user','channel_user','channel_unbound','system')),
+    ('dashboard_user','channel_user','channel_unbound','system','unknown')),
   requester_id TEXT,
   channel TEXT,
   session_digest TEXT,
@@ -213,6 +218,22 @@ pub fn open_home(home: &Path) -> KbResult<Connection> {
     open(&db_path(home))
 }
 
+/// Open the database under `<home>` read-only, without creating or
+/// migrating anything. `Ok(None)` when it does not exist yet. For processes
+/// that only decide visibility (the MCP server's tool listing).
+pub fn open_read_only(home: &Path) -> KbResult<Option<Connection>> {
+    let path = db_path(home);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    Ok(Some(conn))
+}
+
 /// An in-memory database with the full schema (tests and the eval tool).
 pub fn open_in_memory() -> KbResult<Connection> {
     let conn = Connection::open_in_memory()?;
@@ -225,7 +246,9 @@ fn configure(conn: &Connection) -> KbResult<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     // `journal_mode` answers with a row; in-memory databases report "memory".
     let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
-    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=NORMAL;")?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=NORMAL;",
+    )?;
     Ok(())
 }
 
@@ -233,7 +256,11 @@ fn configure(conn: &Connection) -> KbResult<()> {
 pub fn migrate(conn: &Connection) -> KbResult<()> {
     conn.execute_batch(DDL)?;
     let current: Option<String> = conn
-        .query_row("SELECT value FROM kb_meta WHERE key='schema_version'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
         .optional()?;
     match current.and_then(|v| v.parse::<i64>().ok()) {
         Some(v) if v > SCHEMA_VERSION => {
@@ -268,7 +295,11 @@ pub fn bump_generation(conn: &Connection) -> KbResult<()> {
 
 /// Current generation counter.
 pub fn generation(conn: &Connection) -> KbResult<i64> {
-    let v: String = conn.query_row("SELECT value FROM kb_meta WHERE key='generation'", [], |r| r.get(0))?;
+    let v: String = conn.query_row(
+        "SELECT value FROM kb_meta WHERE key='generation'",
+        [],
+        |r| r.get(0),
+    )?;
     Ok(v.parse().unwrap_or(0))
 }
 
@@ -284,21 +315,34 @@ mod tests {
         let conn = open(&path).unwrap();
         migrate(&conn).unwrap();
         let v: String = conn
-            .query_row("SELECT value FROM kb_meta WHERE key='schema_version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM kb_meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(fk, 1);
-        let sd: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0)).unwrap();
+        let sd: i64 = conn
+            .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(sd, 1);
     }
 
     #[test]
     fn bundled_sqlite_supports_trigram_with_remove_diacritics() {
         let conn = open_in_memory().unwrap();
-        let version: String = conn.query_row("SELECT sqlite_version()", [], |r| r.get(0)).unwrap();
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .unwrap();
         let parts: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
-        assert!(parts.len() >= 2 && (parts[0], parts[1]) >= (3, 45), "sqlite {version}");
+        assert!(
+            parts.len() >= 2 && (parts[0], parts[1]) >= (3, 45),
+            "sqlite {version}"
+        );
         // The virtual table above was created with the tokenizer options, so
         // reaching here proves they parse; a match proves trigram works on CJK.
         conn.execute_batch(
@@ -308,7 +352,11 @@ mod tests {
         )
         .unwrap();
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM t WHERE t MATCH '\"特休天\"'", [], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM t WHERE t MATCH '\"特休天\"'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
     }
@@ -316,8 +364,11 @@ mod tests {
     #[test]
     fn newer_schema_is_refused() {
         let conn = open_in_memory().unwrap();
-        conn.execute("UPDATE kb_meta SET value='99' WHERE key='schema_version'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE kb_meta SET value='99' WHERE key='schema_version'",
+            [],
+        )
+        .unwrap();
         assert!(migrate(&conn).is_err());
     }
 

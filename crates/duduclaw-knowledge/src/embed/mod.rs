@@ -76,8 +76,14 @@ mod tests {
     #[test]
     fn no_embedder_is_unavailable() {
         let e = NoEmbedder;
-        assert!(matches!(e.embed_query("x"), Err(EmbedError::Unavailable(_))));
-        assert!(matches!(e.embed_passages(&["x"]), Err(EmbedError::Unavailable(_))));
+        assert!(matches!(
+            e.embed_query("x"),
+            Err(EmbedError::Unavailable(_))
+        ));
+        assert!(matches!(
+            e.embed_passages(&["x"]),
+            Err(EmbedError::Unavailable(_))
+        ));
         assert_eq!(e.egress(), Egress::Local);
     }
 }

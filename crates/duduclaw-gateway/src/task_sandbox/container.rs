@@ -47,6 +47,7 @@ pub const WORKSPACE: &str = "/workspace";
 pub const AGENT_ALLOWLIST: &[(&str, bool)] = &[
     ("SOUL.md", false),
     ("IDENTITY.md", false),
+    ("INSTRUCTIONS.md", false),
     ("CLAUDE.md", false),
     ("AGENTS.md", false),
     ("GEMINI.md", false),

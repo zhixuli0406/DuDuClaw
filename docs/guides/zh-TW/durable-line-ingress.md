@@ -61,7 +61,7 @@ LINE Messaging API 文件寫明：reply token 只能用一次，而且要在收�
 
 派工前、送出回覆前和每次進度通知前，都重新計算快照並與事件保存的比對。快照只包含「這則訊息會交給誰、用什麼權限處理」：
 
-- 路由：解析出的員工、它的 trigger／role／status、`[channels]`、`allowed_channels`、`default_agent`、這位使用者的員工綁定。
+- 路由：解析出的員工（已套用這位發話者的 @ 呼叫，包括這個事件領走的「下一則交給某員工」；交給哪位員工在第一次補快照時決定一次並存進 `ingress_routes`，之後的快照沿用，只再確認發話者還叫得到那位員工；已經不能交給他時事件被隔離，並回使用者一句「請重新傳送」；見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)）、它的 trigger／role／status、`[channels]`、`allowed_channels`、`default_agent`、這位使用者的員工綁定。
 - 授權：LINE 憑證摘要；被路由員工實際生效的設定（綁了職務組合 preset 的員工讀 `agent_resolved/<id>.toml`，否則讀 `agent.toml`）中的身分欄位、capabilities、permissions、budget、container sandbox／network；這個對話與 global 的 allowlist、blocklist、pairing、admin、mention-only、binding 設定；這位使用者的配對狀態。
 
 新增一位員工、修改無關員工的設定，不會改變快照。提示文字、SOUL、心跳與統計也不影響。

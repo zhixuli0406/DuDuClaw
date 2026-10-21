@@ -71,9 +71,12 @@ pub(crate) fn events(xml: &str) -> Result<Vec<XEvent>, ExtractError> {
     let mut reader = Reader::from_str(xml);
     let mut out = Vec::new();
     loop {
-        let ev = reader
-            .read_event()
-            .map_err(|_| ExtractError::new("unsupported_format", "文件內容的 XML 格式有誤，檔案可能已損毀。"))?;
+        let ev = reader.read_event().map_err(|_| {
+            ExtractError::new(
+                "unsupported_format",
+                "文件內容的 XML 格式有誤，檔案可能已損毀。",
+            )
+        })?;
         match ev {
             Event::Start(e) => out.push(XEvent::Start {
                 name: local(e.name().as_ref()),
@@ -114,13 +117,22 @@ pub(crate) fn events(xml: &str) -> Result<Vec<XEvent>, ExtractError> {
 
 /// Value of attribute `name` (local part).
 pub(crate) fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    attrs
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
 }
 
 /// Open an archive.
-pub(crate) fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<std::io::Cursor<&[u8]>>, ExtractError> {
-    zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|_| ExtractError::new("unsupported_format", "無法開啟這個 Office 檔，檔案可能已損毀。"))
+pub(crate) fn open_zip(
+    bytes: &[u8],
+) -> Result<zip::ZipArchive<std::io::Cursor<&[u8]>>, ExtractError> {
+    zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| {
+        ExtractError::new(
+            "unsupported_format",
+            "無法開啟這個 Office 檔，檔案可能已損毀。",
+        )
+    })
 }
 
 /// Read one archive part as UTF-8 text; `Ok(None)` when it does not exist.
@@ -142,7 +154,12 @@ pub(crate) fn read_part(
     entry
         .take(MAX_PART_BYTES + 1)
         .read_to_end(&mut buf)
-        .map_err(|_| ExtractError::new("unsupported_format", "Office 檔內容無法讀取，檔案可能已損毀。"))?;
+        .map_err(|_| {
+            ExtractError::new(
+                "unsupported_format",
+                "Office 檔內容無法讀取，檔案可能已損毀。",
+            )
+        })?;
     if buf.len() as u64 > MAX_PART_BYTES {
         return Err(ExtractError::new(
             "document_limits",
@@ -177,11 +194,15 @@ pub(crate) fn relationships(xml: &str) -> Result<Vec<(String, String, String)>, 
     Ok(events(xml)?
         .into_iter()
         .filter_map(|e| match e {
-            XEvent::Start { name, attrs } | XEvent::Empty { name, attrs } if name == "Relationship" => Some((
-                attr(&attrs, "Id")?.to_string(),
-                attr(&attrs, "Type").unwrap_or("").to_string(),
-                attr(&attrs, "Target")?.to_string(),
-            )),
+            XEvent::Start { name, attrs } | XEvent::Empty { name, attrs }
+                if name == "Relationship" =>
+            {
+                Some((
+                    attr(&attrs, "Id")?.to_string(),
+                    attr(&attrs, "Type").unwrap_or("").to_string(),
+                    attr(&attrs, "Target")?.to_string(),
+                ))
+            }
             _ => None,
         })
         .collect())

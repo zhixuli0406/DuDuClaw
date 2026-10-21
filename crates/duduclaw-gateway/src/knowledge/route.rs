@@ -12,7 +12,9 @@
 //! | `get_passage` | `chunk_id`, `context?` (0–2) | passage with `before` / `match` / `after` |
 //! | `list_collections` | — | the turn's effective collections with counts |
 //!
-//! Permissions per call: the employee side (its own or its department's
+//! The tools exist for an employee only while its own side (grants to it or
+//! its department, narrowed by `[knowledge] collections`) is non-empty —
+//! the same predicate the MCP listing uses. Permissions per call: the employee side (its own or its department's
 //! grants, narrowed by its `[knowledge] collections`) ∩ the human side of the
 //! turn ([`super::turn_requesters::resolve`]) ∩ the sensitivity filter. The
 //! MCP side never reads the database itself, so it cannot skip this.
@@ -108,7 +110,11 @@ pub fn router(state: Arc<KnowledgeRouteState>) -> Router {
 }
 
 fn refuse(status: StatusCode, code: &str, message: &str) -> Response {
-    (status, Json(json!({"ok": false, "code": code, "message": message}))).into_response()
+    (
+        status,
+        Json(json!({"ok": false, "code": code, "message": message})),
+    )
+        .into_response()
 }
 
 fn unauthorized() -> Response {
@@ -161,7 +167,11 @@ async fn handle(
         return unauthorized();
     }
     let Ok(request) = serde_json::from_slice::<Request>(&body) else {
-        return refuse(StatusCode::BAD_REQUEST, "bad_request", "知識庫請求格式不正確。");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "知識庫請求格式不正確。",
+        );
     };
     if !super::enabled(&state.home) {
         return refuse(
@@ -191,20 +201,27 @@ struct Refusal(StatusCode, &'static str, String);
 impl From<KbError> for Refusal {
     fn from(e: KbError) -> Self {
         match e {
-            KbError::PermissionDenied => {
-                Refusal(StatusCode::FORBIDDEN, "permission_denied", "permission denied".into())
-            }
+            KbError::PermissionDenied => Refusal(
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+                "permission denied".into(),
+            ),
             KbError::Invalid(m) => Refusal(StatusCode::BAD_REQUEST, "bad_request", m),
             other => {
                 tracing::error!(error = %other, "knowledge route failed");
-                Refusal(StatusCode::INTERNAL_SERVER_ERROR, "error", other.public_message())
+                Refusal(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "error",
+                    other.public_message(),
+                )
             }
         }
     }
 }
 
 fn agent_dir(home: &std::path::Path, agent: &str) -> PathBuf {
-    crate::ephemeral::resolve_agent_dir(home, agent).unwrap_or_else(|| home.join("agents").join(agent))
+    crate::ephemeral::resolve_agent_dir(home, agent)
+        .unwrap_or_else(|| home.join("agents").join(agent))
 }
 
 fn serve(
@@ -213,7 +230,8 @@ fn serve(
     requester: RequesterIdentity,
     request: Request,
 ) -> Result<Value, Refusal> {
-    let (scope, department) = duduclaw_core::knowledge_agent::load_agent_knowledge(&agent_dir(&st.home, agent));
+    let (scope, department) =
+        duduclaw_core::knowledge_agent::load_agent_knowledge(&agent_dir(&st.home, agent));
     if scope.is_off() {
         return Err(Refusal(
             StatusCode::FORBIDDEN,
@@ -222,16 +240,28 @@ fn serve(
         ));
     }
     let conn = schema::open_home(&st.home)?;
+    let agent_side = agent_ctx(agent, department.as_deref(), &scope);
+    // Same predicate as the MCP listing: no collection on the employee side
+    // means the tools do not exist for this employee.
+    if duduclaw_knowledge::acl::agent_side_collections(&conn, &agent_side)?.is_empty() {
+        return Err(Refusal(
+            StatusCode::FORBIDDEN,
+            "knowledge_off",
+            "這位 AI 員工沒有可用的知識集合（需要先把集合授權給它或它的部門）。".into(),
+        ));
+    }
     let directory: Box<dyn UserDirectory> = match &st.users {
         Some(db) => Box::new(super::UserDbDirectory(db.clone())),
         None => Box::new(super::NoUsers),
     };
     let human = human_ctx(&requester, directory.as_ref());
-    let agent_side = agent_ctx(agent, department.as_deref(), &scope);
     let narrowing = match &request {
         Request::Search {
-            collections: Some(c), ..
-        } => Narrowing { only: Some(c.clone()) },
+            collections: Some(c),
+            ..
+        } => Narrowing {
+            only: Some(c.clone()),
+        },
         _ => Narrowing::default(),
     };
     let mut entry = AccessEntry {
@@ -239,7 +269,9 @@ fn serve(
         requester_kind: requester.kind().to_string(),
         requester_id: requester.audit_id(),
         channel: requester.channel().map(str::to_string),
-        turn_id: request.turn_id().map(|t| duduclaw_core::truncate_chars(t, 128)),
+        turn_id: request
+            .turn_id()
+            .map(|t| duduclaw_core::truncate_chars(t, 128)),
         outcome: "ok".into(),
         ..Default::default()
     };
@@ -310,7 +342,9 @@ fn run_op(
                 "collections": collections,
             }))
         }
-        Request::GetPassage { chunk_id, context, .. } => {
+        Request::GetPassage {
+            chunk_id, context, ..
+        } => {
             entry.op = "get_passage".into();
             let ctx = context.unwrap_or(1).min(2) as usize * CONTEXT_STEP_CHARS;
             let p = duduclaw_knowledge::passage::get_passage(conn, *chunk_id, allowed, ctx)?;

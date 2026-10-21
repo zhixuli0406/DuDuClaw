@@ -126,55 +126,80 @@ pub(super) async fn build_reply_with_session_inner(
 
     // Determine which agent to use
     let reg = ctx.registry.read().await;
+    let mut via_trigger = false;
     let agent = if let Some(name) = agent_override {
-        // Explicit agent name (per-agent Discord bot)
+        // Explicit agent name (per-agent bot, WebChat selection, LINE route
+        // snapshot — those callers already applied `@` routing themselves
+        // and mark a called employee with `trigger_route::as_called_turn`).
+        via_trigger = crate::trigger_route::in_called_turn();
         reg.get(name).or_else(|| reg.main_agent())
     } else {
-        // Resolve via AgentResolver: trigger word → channel binding → default_agent → main_agent
-        let channel = session_id
-            .split(':')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
-        let msg = Message {
-            id: String::new(),
-            message_type: MessageType::Incoming,
-            channel,
-            chat_id: session_id.to_string(),
-            sender: user_id.to_string(),
-            text: text.to_string(),
-            timestamp: chrono::Utc::now(),
-            agent_id: None,
-        };
-        let resolver = AgentResolver::new(&reg);
-        if let Some(resolved) = resolver.resolve(&msg) {
-            Some(resolved)
+        let fallback = resolve_fallback_agent(ctx, &reg, session_id, user_id).await;
+        // WebChat decides `@` routing itself (it knows the dashboard account
+        // and must tell the browser who answers); every other caller of this
+        // path is a messaging-app adapter.
+        let webchat = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+            .try_with(|_| ())
+            .is_ok();
+        // Only messaging-app conversations take part: an internal caller
+        // (`build_reply`'s "default" session, prediction, …) has no human
+        // sender to authorize, so its text is never read as a call.
+        if webchat || !footer_applies_to_session(session_id) {
+            fallback
         } else {
-            // Fallback: config.toml default_agent → main_agent()
-            let default_agent_name = get_default_agent(&ctx.home_dir).await;
-            if let Some(name) = &default_agent_name {
-                match reg.get(name) {
-                    Some(a) => Some(a),
-                    None => {
-                        // A dangling `default_agent` (renamed/removed agent) is
-                        // the classic cause of "identity mixing": routing
-                        // silently falls back to an arbitrary main agent, so the
-                        // wrong agent answers. Warn loudly per turn so it's
-                        // visible in logs until config.toml is fixed.
-                        warn!(
-                            "default_agent '{name}' is not a loaded agent — \
-                             routing fell back to the main agent; replies may \
-                             come from the wrong agent. Fix `default_agent` in \
-                             config.toml or remove it."
-                        );
-                        reg.main_agent()
-                    }
+            let channel = session_id.split(':').next().unwrap_or("unknown");
+            let decision = crate::trigger_route::turn::decide_channel_turn(
+                &ctx.home_dir,
+                &reg,
+                crate::trigger_route::turn::ChannelTurn {
+                    channel,
+                    conversation: session_id,
+                    sender: user_id,
+                    text,
+                    fallback: fallback.map(|a| a.config.agent.name.as_str()),
+                    event: &turn_id,
+                    seq: crate::trigger_route::pending::next_seq(),
+                    quiet: false,
+                    pending: crate::trigger_route::turn::PendingPolicy::Live,
+                },
+            );
+            match decision {
+                crate::trigger_route::turn::TurnDecision::Default => fallback,
+                crate::trigger_route::turn::TurnDecision::Agent { id, via_trigger: v } => {
+                    via_trigger = v;
+                    reg.get(&id).or(fallback)
                 }
-            } else {
-                reg.main_agent()
+                // List / refusal / "say the task": answered here, no model
+                // call. Runs after the access gate and takeover checks above.
+                // Lists and refusals are throttled per sender (silence
+                // inside the window).
+                crate::trigger_route::turn::TurnDecision::Reply { text, kind, .. } => {
+                    let throttled = kind != crate::trigger_route::turn::ReplyKind::AskTask
+                        && !crate::trigger_route::allow_direct_reply(channel, session_id, user_id, kind);
+                    return if throttled { String::new() } else { text };
+                }
             }
         }
     };
+    // A called employee answers in its own session bucket of this
+    // conversation (history, redaction vault, pending goal state); the
+    // access gate and takeover above ran on the conversation itself.
+    let called_sid;
+    let session_id: &str = match agent {
+        Some(a) if via_trigger => {
+            called_sid = crate::trigger_route::called_session(session_id, &a.config.agent.name);
+            &called_sid
+        }
+        _ => session_id,
+    };
+    if let Some(a) = agent {
+        crate::trigger_route::record_answered_by(crate::trigger_route::AnsweredBy {
+            id: a.config.agent.name.clone(),
+            display_name: crate::trigger_route::display_name(&reg, &a.config.agent.name),
+            via_trigger,
+            session_id: session_id.to_string(),
+        });
+    }
 
     if let Some(a) = agent {
         info!(
@@ -3858,6 +3883,56 @@ mod f4_verb_only_tests {
                 assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
             }
             assert_native_pending(&fixture, &id).await;
+        }
+    }
+}
+
+/// Who answers a message that calls nobody: `AgentResolver` (channel
+/// binding → `allowed_channels` → main), else `config.toml` `default_agent`,
+/// else the main agent.
+pub(crate) async fn resolve_fallback_agent<'r>(
+    ctx: &ReplyContext,
+    reg: &'r AgentRegistry,
+    session_id: &str,
+    user_id: &str,
+) -> Option<&'r duduclaw_agent::registry::LoadedAgent> {
+    let channel = session_id
+        .split(':')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+    let msg = Message {
+        id: String::new(),
+        message_type: MessageType::Incoming,
+        channel,
+        chat_id: session_id.to_string(),
+        sender: user_id.to_string(),
+        text: String::new(),
+        timestamp: chrono::Utc::now(),
+        agent_id: None,
+    };
+    if let Some(resolved) = AgentResolver::new(reg).resolve(&msg) {
+        return Some(resolved);
+    }
+    // Fallback: config.toml default_agent → main_agent()
+    let Some(name) = get_default_agent(&ctx.home_dir).await else {
+        return reg.main_agent();
+    };
+    match reg.get(&name) {
+        Some(a) => Some(a),
+        None => {
+            // A dangling `default_agent` (renamed/removed agent) is the
+            // classic cause of "identity mixing": routing silently falls back
+            // to an arbitrary main agent, so the wrong agent answers. Warn
+            // loudly per turn so it's visible in logs until config.toml is
+            // fixed.
+            warn!(
+                "default_agent '{name}' is not a loaded agent — \
+                 routing fell back to the main agent; replies may \
+                 come from the wrong agent. Fix `default_agent` in \
+                 config.toml or remove it."
+            );
+            reg.main_agent()
         }
     }
 }

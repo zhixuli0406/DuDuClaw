@@ -17,7 +17,12 @@ const REGISTRY_METHODS: &[&str] = &[
 
 impl MethodHandler {
     /// `Some(frame)` for a `knowledge.*` method, `None` otherwise.
-    pub(crate) async fn dispatch_kb(&self, method: &str, params: &Value, ctx: &UserContext) -> Option<WsFrame> {
+    pub(crate) async fn dispatch_kb(
+        &self,
+        method: &str,
+        params: &Value,
+        ctx: &UserContext,
+    ) -> Option<WsFrame> {
         if !crate::knowledge::rpc::is_knowledge_method(method) {
             return None;
         }

@@ -79,6 +79,7 @@ pub(super) async fn install(
         global_skills: Vec::new(),
         wiki_files: Vec::new(),
         installed_at: now_iso(),
+        source_format: String::new(),
     };
 
     // Optional plugin `.mcp.json` (merged into every created agent).
