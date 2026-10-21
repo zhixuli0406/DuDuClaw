@@ -132,6 +132,7 @@ pub mod cron_scheduler;
 pub mod cron_store;
 pub mod cron_templates;
 pub mod departments;
+pub mod distributor_notice;
 pub mod distributor_store;
 pub mod license_runtime;
 pub mod license_seed;

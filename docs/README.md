@@ -193,7 +193,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
 | [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate from`，預設 dry-run） | Current |
-| [guides/white-label.md](guides/white-label.md) | White-label branding (reseller logo/name) + distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`) | Current |
+| [guides/white-label.md](guides/white-label.md) | Distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`); notes that white-label branding was removed in 1.72.2 (also in `zh-TW/` and `ja-JP/`) | Current |
+| [guides/distributor-notice.md](guides/distributor-notice.md) | Distributor information on the About page — a build input of the distributor build (`DUDUCLAW_DISTRIBUTOR_NOTICE_PATH`), the HTML allowlist, the sandboxed iframe, how to check `about.get` (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/recording-to-skill.md](guides/recording-to-skill.md) | 錄製 → 技能：瀏覽器/桌面示範錄製、HAR 脫敏、蒸餾成 SKILL.md 草稿＋審批安裝（`[capabilities] recording`） | Current |
 | [guides/feedback-page.md](guides/feedback-page.md) | 問題回報與建議網頁（GitHub Pages 表單 → issue 預填 → Actions + Haiku 自動分類/格式化/上標籤） | Current |
 | [guides/appliance-build.md](guides/appliance-build.md) | Getting / building the DuDuClaw OS image — entry point to the standalone DuDuClaw-OS repo (signed releases, `kas` build pipeline); the Debian/mkosi line is frozen there | Current |

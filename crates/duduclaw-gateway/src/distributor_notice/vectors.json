@@ -1,0 +1,155 @@
+{
+  "comment": "Shared sanitizer test vectors for the distributor notice. Keep this file byte-identical in the public gateway and the license console; both test suites assert every expected output.",
+  "vectors": [
+    {
+      "expected": "<h2>Authorised partner</h2>\n<p>Hello <strong>there</strong> <em>friend</em></p>",
+      "input": "<h2>Authorised partner</h2>\n<p>Hello <strong>there</strong> <em>friend</em></p>",
+      "name": "plain_markup"
+    },
+    {
+      "expected": "<p>總經銷：範例科技股份有限公司</p>",
+      "input": "<p>總經銷：範例科技股份有限公司</p>",
+      "name": "cjk_text"
+    },
+    {
+      "expected": "<p>Hi</p>",
+      "input": "<p>Hi</p><script>alert(1)</script>",
+      "name": "script_element_and_content"
+    },
+    {
+      "expected": "<p>x</p>",
+      "input": "<p onclick=\"alert(1)\" onmouseover=\"x()\">x</p>",
+      "name": "event_handler_attribute"
+    },
+    {
+      "expected": "<div>x</div>",
+      "input": "<div style=\"color:red;background:url(https://evil.example/b)\" class=\"c\" id=\"i\">x</div>",
+      "name": "generic_attributes"
+    },
+    {
+      "expected": "<a target=\"_blank\" rel=\"nofollow noopener noreferrer\">x</a>",
+      "input": "<a href=\"javascript:alert(1)\">x</a>",
+      "name": "javascript_href"
+    },
+    {
+      "expected": "<a target=\"_blank\" rel=\"nofollow noopener noreferrer\">x</a>",
+      "input": "<a href=\"&#106;avascript:alert(1)\">x</a>",
+      "name": "entity_encoded_javascript_href"
+    },
+    {
+      "expected": "<a target=\"_blank\" rel=\"nofollow noopener noreferrer\">x</a>",
+      "input": "<a href=\" java\tscript:alert(1)\">x</a>",
+      "name": "whitespace_obfuscated_javascript_href"
+    },
+    {
+      "expected": "<a rel=\"nofollow noopener noreferrer\" target=\"_blank\">x</a>",
+      "input": "<a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">x</a>",
+      "name": "data_html_href"
+    },
+    {
+      "expected": "<a target=\"_blank\" rel=\"nofollow noopener noreferrer\">x</a>",
+      "input": "<a href=\"/admin\">x</a>",
+      "name": "relative_href"
+    },
+    {
+      "expected": "<a href=\"https://example.com/contact\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">Contact</a>",
+      "input": "<a href=\"https://example.com/contact\">Contact</a>",
+      "name": "https_link"
+    },
+    {
+      "expected": "<a href=\"http://example.com/\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">Site</a>",
+      "input": "<a href=\"http://example.com\">Site</a>",
+      "name": "http_link"
+    },
+    {
+      "expected": "<a href=\"mailto:sales@example.com\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">Mail</a>",
+      "input": "<a href=\"mailto:sales@example.com\">Mail</a>",
+      "name": "mailto_link"
+    },
+    {
+      "expected": "<a href=\"https://example.com/\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">x</a>",
+      "input": "<a href=\"https://example.com\" target=\"_self\" rel=\"opener\">x</a>",
+      "name": "link_target_and_rel_overridden"
+    },
+    {
+      "expected": "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\" alt=\"logo\">",
+      "input": "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\" alt=\"logo\">",
+      "name": "png_image"
+    },
+    {
+      "expected": "<img src=\"data:image/jpeg;base64,/9j/4AAQSkZJRgA=\">",
+      "input": "<img src=\"data:image/jpeg;base64,/9j/4AAQSkZJRgA=\">",
+      "name": "jpeg_image"
+    },
+    {
+      "expected": "<img src=\"data:image/webp;base64,UklGRhoAAABXRUJQVlA4IA==\">",
+      "input": "<img src=\"data:image/webp;base64,UklGRhoAAABXRUJQVlA4IA==\">",
+      "name": "webp_image"
+    },
+    {
+      "expected": "<img>",
+      "input": "<img src=\"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=\">",
+      "name": "svg_data_image"
+    },
+    {
+      "expected": "<img>",
+      "input": "<img src=\"data:image/png;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=\">",
+      "name": "png_declared_svg_bytes"
+    },
+    {
+      "expected": "<img>",
+      "input": "<img src=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">",
+      "name": "data_html_image"
+    },
+    {
+      "expected": "<img>",
+      "input": "<img src=\"https://example.com/a.png\">",
+      "name": "remote_image"
+    },
+    {
+      "expected": "<img>",
+      "input": "<img src=\"x\" onerror=\"alert(1)\">",
+      "name": "img_event_handler"
+    },
+    {
+      "expected": "<p>ok</p>",
+      "input": "<iframe src=\"https://example.com\"></iframe><object data=\"x\"></object><form action=\"https://example.com\"><input name=\"q\"></form><p>ok</p>",
+      "name": "embedding_elements"
+    },
+    {
+      "expected": "<p>ok</p>",
+      "input": "<style>body{display:none}</style><p>ok</p>",
+      "name": "style_element"
+    },
+    {
+      "expected": "<p>ok</p>",
+      "input": "<svg><script>alert(1)</script><circle r=\"5\"></circle></svg><p>ok</p>",
+      "name": "svg_script"
+    },
+    {
+      "expected": "<p>ok</p>",
+      "input": "<!-- internal note --><p>ok</p>",
+      "name": "comment"
+    },
+    {
+      "expected": "<table><thead><tr><th>Region</th></tr></thead><tbody><tr><td>North</td></tr></tbody></table>",
+      "input": "<table><thead><tr><th>Region</th></tr></thead><tbody><tr><td>North</td></tr></tbody></table>",
+      "name": "table"
+    },
+    {
+      "expected": "<ul><li>a</li></ul><ol><li>b</li></ol><blockquote>q</blockquote><pre><code>x &lt; y</code></pre><hr>",
+      "input": "<ul><li>a</li></ul><ol><li>b</li></ol><blockquote>q</blockquote><pre><code>x &lt; y</code></pre><hr>",
+      "name": "lists_and_code"
+    },
+    {
+      "expected": null,
+      "input": "<script>alert(1)</script>",
+      "name": "only_script_is_empty"
+    },
+    {
+      "expected": null,
+      "input": "   \n  ",
+      "name": "whitespace_only_is_empty"
+    }
+  ]
+}

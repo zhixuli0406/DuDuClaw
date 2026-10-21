@@ -4671,6 +4671,8 @@
   "about.softwareBy": "Software by",
   "about.version": "Version",
   "about.edition": "Edition",
+  "about.distributor.title": "Authorised distributor",
+  "about.distributor.caption": "Provided by the authorised distributor",
   "distributor.title": "Distributors",
   "distributor.scopeNote": "This internal console issues and revokes general distributor licenses. Product sales and customer quotes are handled by the authorized general distributor, Future Corp.",
   "distributor.add": "Add distributor",
