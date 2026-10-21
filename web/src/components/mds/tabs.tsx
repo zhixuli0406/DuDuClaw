@@ -68,8 +68,8 @@ export const TabsTab = forwardRef<
         'data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
         "[&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4",
         variant === 'default'
-          ? 'data-[selected]:bg-background data-[selected]:text-foreground data-[selected]:shadow-sm'
-          : "data-[selected]:text-foreground data-[selected]:after:absolute data-[selected]:after:inset-x-0 data-[selected]:after:bottom-[-5px] data-[selected]:after:h-0.5 data-[selected]:after:bg-foreground data-[selected]:after:content-['']",
+          ? 'data-[active]:bg-background data-[active]:text-foreground data-[active]:shadow-sm'
+          : "data-[active]:text-foreground data-[active]:after:absolute data-[active]:after:inset-x-0 data-[active]:after:bottom-[-5px] data-[active]:after:h-0.5 data-[active]:after:bg-foreground data-[active]:after:content-['']",
         className
       )}
       {...props}
