@@ -18,7 +18,7 @@ DUDUCLAW_DISTRIBUTOR_NOTICE_PATH=/absolute/path/to/notice.html \
 - 未設定：総代理店情報なし（すべての公開ビルド）。
 - 設定あり：通常ファイルを指す絶対パス（シンボリックリンクは拒否）、UTF-8（先頭の BOM は除去）、**埋め込み画像を含めて** 64 KB 以下である必要があります。変数が空文字列、ファイルが存在しない、その他の規則違反の場合は、理由を示してビルドが失敗します。
 - ファイルまたは変数が変わると cargo が再ビルドします。
-- HTML はビルド時にサニタイズされます（規則は下記）。除去された内容は cargo の出力に `warning: distributor notice: …` として列挙されます。表示できる内容が何も残らない場合、ビルドは失敗します。
+- HTML はビルド時にサニタイズされます（規則は下記）。除去された内容は cargo の出力に `warning: distributor notice: …` として列挙されます。表示できる内容が何も残らない場合、またはサニタイズ後に 64 KB を超えた場合（各リンクに `rel` と `target` が付きます）、ビルドは失敗します。
 
 この入力は `DUDUCLAW_INSTALLATION_POLICY_PATH` とは別です。インストールポリシーはチャネル・runtime・プロバイダのブロックにのみ使い、識別情報を含めてはいけません。
 
@@ -26,7 +26,7 @@ DUDUCLAW_DISTRIBUTOR_NOTICE_PATH=/absolute/path/to/notice.html \
 
 - 要素：`p`、`br`、`h1`–`h4`、`ul`、`ol`、`li`、`strong`、`em`、`u`、`s`、`a`、`blockquote`、`code`、`pre`、`hr`、`img`、`div`、`span`、`table`、`thead`、`tbody`、`tr`、`th`、`td`。`<script>` と `<style>` は中身ごと除去され、それ以外の要素はタグを除去してテキストを残します。
 - 属性：`a[href]`、`img[src]`、`img[alt]` のみ。`style`、`class`、`id`、すべての `on*` ハンドラは除去されます。コメントも除去されます。
-- リンク：絶対 URL の `http://`、`https://`、`mailto:` のみ。すべてのリンクに `rel="nofollow noopener noreferrer" target="_blank"` が付きます。
+- リンク：絶対 URL の `http://`、`https://`、`mailto:` のみで、`ユーザー:パスワード@` を含まないもの。すべてのリンクに `rel="nofollow noopener noreferrer" target="_blank"` が付きます。
 - 画像：`data:image/png`、`data:image/jpeg`、`data:image/webp` の base64 URI のみで、中身が宣言した形式と一致し、1 枚 512 KB 以下（通常は文書全体の 64 KB 上限が先に効きます）。SVG と外部画像は除去されます。
 
 gateway は組み込まれた HTML を最初に返す前にもう一度サニタイズします。2 回目で拒否された場合、`about.get` はこのフィールドを含めず、gateway が警告を記録します。

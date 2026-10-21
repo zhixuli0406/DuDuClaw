@@ -31,7 +31,8 @@ DUDUCLAW_DISTRIBUTOR_NOTICE_PATH=/absolute/path/to/notice.html \
 - Cargo rebuilds when the file or the variable changes.
 - The HTML is sanitized during the build (rules below). Anything the sanitizer
   removed is listed as `warning: distributor notice: …` lines in the cargo
-  output. If nothing displayable remains, the build fails.
+  output. If nothing displayable remains, or the sanitized HTML grows past
+  64 KB (every link gains `rel` and `target`), the build fails.
 
 This input is separate from `DUDUCLAW_INSTALLATION_POLICY_PATH`. The
 installation policy only blocks channels, runtimes and providers and must not
@@ -46,7 +47,8 @@ carry identities.
   kept.
 - Attributes: only `a[href]` and `img[src]`, `img[alt]`. `style`, `class`,
   `id` and every `on*` handler are removed. Comments are removed.
-- Links: absolute `http://`, `https://` or `mailto:` only. Every link gets
+- Links: absolute `http://`, `https://` or `mailto:` only, without a
+  `user:password@` part. Every link gets
   `rel="nofollow noopener noreferrer" target="_blank"`.
 - Images: only `data:image/png`, `data:image/jpeg` or `data:image/webp`
   base64 URIs whose bytes match the declared type, at most 512 KB each (the

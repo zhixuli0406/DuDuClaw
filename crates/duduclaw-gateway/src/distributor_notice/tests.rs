@@ -7,11 +7,20 @@ use super::{distributor_notice, is_compiled_in, resanitize};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 const VECTORS: &str = include_str!("vectors.json");
+/// SHA-256 of `vectors.json`. The license console keeps a byte-identical copy
+/// and asserts the same value; change the vectors in both places together.
+const VECTORS_SHA256: &str = "8a08aa2c8a1bc6839e811118d7f66edbda364ec921d72b402159f93458d55471";
 const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 fn vectors() -> Vec<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(VECTORS).expect("vectors.json parses");
     parsed["vectors"].as_array().expect("vectors array").clone()
+}
+
+#[test]
+fn shared_vector_file_is_the_pinned_revision() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(hex::encode(Sha256::digest(VECTORS.as_bytes())), VECTORS_SHA256);
 }
 
 #[test]
@@ -78,6 +87,18 @@ fn oversize_documents_are_refused_not_truncated() {
 }
 
 #[test]
+fn output_that_grows_past_the_limit_is_refused_at_build_time() {
+    // Each bare link gains rel/target during sanitization (~60 bytes).
+    let link = r#"<a href="https://e.co">x</a>"#;
+    let raw = link.repeat(MAX_NOTICE_BYTES / link.len());
+    assert!(raw.len() <= MAX_NOTICE_BYTES);
+    match sanitize_notice_html(&raw) {
+        Err(NoticeError::TooLargeAfterSanitizing { bytes }) => assert!(bytes > MAX_NOTICE_BYTES),
+        other => panic!("expected TooLargeAfterSanitizing, got {other:?}"),
+    }
+}
+
+#[test]
 fn image_policy_checks_magic_bytes_and_decoded_size() {
     assert!(notice_image_ok(&format!("data:image/png;base64,{PNG_1X1}")));
     let mut big = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -97,7 +118,7 @@ fn link_policy_allows_only_absolute_http_https_and_mailto() {
     assert_eq!(notice_link("https://example.com/a").as_deref(), Some("https://example.com/a"));
     assert_eq!(notice_link("HTTP://Example.com").as_deref(), Some("http://example.com/"));
     assert_eq!(notice_link("mailto:a@example.com").as_deref(), Some("mailto:a@example.com"));
-    for refused in ["javascript:alert(1)", " java\tscript:alert(1)", "data:text/html,x", "/relative", "//example.com", "vbscript:x", "file:///etc/passwd", "mailto:", "https://"] {
+    for refused in ["https://user:pass@example.com/", "https://user@example.com/", "javascript:alert(1)", " java\tscript:alert(1)", "data:text/html,x", "/relative", "//example.com", "vbscript:x", "file:///etc/passwd", "mailto:", "https://"] {
         assert_eq!(notice_link(refused), None, "{refused}");
     }
 }
@@ -117,6 +138,9 @@ fn report_lists_what_the_allowlist_removed() {
 
     let clean = sanitize_notice("<p>plain</p>").unwrap();
     assert!(!clean.has_removals());
+    // Re-sanitizing output (a console export) reports nothing removed.
+    let again = sanitize_notice(&sanitize_notice_html(raw).unwrap()).unwrap();
+    assert!(!again.has_removals(), "{again:?}");
 }
 
 #[test]

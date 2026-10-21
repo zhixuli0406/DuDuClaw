@@ -8,7 +8,9 @@
 //!
 //! Policy (the About-page notice is rendered inside a script-less sandboxed
 //! iframe as a second layer):
-//! - Raw input over [`MAX_NOTICE_BYTES`] is refused, never truncated.
+//! - Raw input over [`MAX_NOTICE_BYTES`] is refused, never truncated. The
+//!   sanitized output must also fit (sanitizing adds `rel`/`target` and may
+//!   grow), so the runtime pass over build-time output can never refuse it.
 //! - Only [`ALLOWED_TAGS`] survive; `<script>` / `<style>` lose their content.
 //! - No generic attributes (`style`, `class`, `id`, `on*` are all dropped).
 //! - `a[href]` must parse as an absolute `http`, `https` or `mailto` URL and
@@ -44,6 +46,9 @@ const ALLOWED_ATTRIBUTES: &[(&str, &[&str])] = &[("a", &["href"]), ("img", &["sr
 pub enum NoticeError {
     /// The raw document exceeds [`MAX_NOTICE_BYTES`].
     TooLarge { bytes: usize },
+    /// The sanitized output exceeds [`MAX_NOTICE_BYTES`] (links gain `rel`
+    /// and `target`, so output can be larger than the input).
+    TooLargeAfterSanitizing { bytes: usize },
     /// Nothing displayable remains after sanitization.
     Empty,
 }
@@ -54,6 +59,11 @@ impl fmt::Display for NoticeError {
             Self::TooLarge { bytes } => write!(
                 f,
                 "distributor notice is {bytes} bytes; the limit is {} KB",
+                MAX_NOTICE_BYTES / 1024
+            ),
+            Self::TooLargeAfterSanitizing { bytes } => write!(
+                f,
+                "distributor notice grows to {bytes} bytes after sanitization; the limit is {} KB",
                 MAX_NOTICE_BYTES / 1024
             ),
             Self::Empty => write!(f, "distributor notice has no content left after sanitization"),
@@ -98,6 +108,9 @@ pub fn sanitize_notice(raw: &str) -> Result<NoticeReport, NoticeError> {
     if html.is_empty() {
         return Err(NoticeError::Empty);
     }
+    if html.len() > MAX_NOTICE_BYTES {
+        return Err(NoticeError::TooLargeAfterSanitizing { bytes: html.len() });
+    }
     let (removed_elements, removed_attributes, rejected_urls) = removal_summary(raw);
     Ok(NoticeReport {
         html: html.to_string(),
@@ -107,10 +120,14 @@ pub fn sanitize_notice(raw: &str) -> Result<NoticeReport, NoticeError> {
     })
 }
 
-/// Accept an `a[href]`: an absolute http(s) URL with a host, or `mailto:`.
-/// Returns the normalized URL so browser-side parsing cannot differ.
+/// Accept an `a[href]`: an absolute http(s) URL with a host and no embedded
+/// credentials, or `mailto:`. Returns the normalized URL so browser-side
+/// parsing cannot differ.
 pub fn notice_link(value: &str) -> Option<String> {
     let url = url::Url::parse(value.trim()).ok()?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
     let allowed = match url.scheme() {
         "http" | "https" => url.host_str().is_some_and(|host| !host.is_empty()),
         "mailto" => !url.path().is_empty(),
@@ -163,6 +180,11 @@ fn describe_rejected(tag: &str, attr: &str, value: &str) -> String {
 }
 
 fn allowed_attribute(tag: &str, attribute: &str) -> bool {
+    // `a[rel]` / `a[target]` are always rewritten to the forced values, so an
+    // already-sanitized notice (e.g. a console export) is not reported as lossy.
+    if tag == "a" && (attribute == "rel" || attribute == "target") {
+        return true;
+    }
     ALLOWED_ATTRIBUTES
         .iter()
         .any(|(t, attrs)| *t == tag && attrs.contains(&attribute))
