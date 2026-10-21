@@ -599,6 +599,9 @@ async fn execute_heartbeat(
     // No automatic recovery — that's a policy decision that needs human input
     // (was the change intentional? rollback or accept?).
     check_soul_integrity_with_audit(home_dir, agent_id).await;
+    // INSTRUCTIONS.md reaches every prompt too: same baseline, same audit
+    // shape (`_instructions_integrity_drift`); the first check establishes it.
+    check_instructions_integrity_with_audit(home_dir, agent_id).await;
 
     // ── Proactive check (new) ──
     execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals, host_run_notice)
@@ -656,6 +659,43 @@ async fn check_soul_integrity_with_audit(home_dir: &Path, agent_id: &str) {
             "drift: current={}, expected={}, msg={}",
             &result.current_hash.chars().take(16).collect::<String>(),
             &result.expected_hash.chars().take(16).collect::<String>(),
+            result.message,
+        ),
+        false,
+    );
+}
+
+/// [`check_soul_integrity_with_audit`] for `INSTRUCTIONS.md`.
+async fn check_instructions_integrity_with_audit(home_dir: &Path, agent_id: &str) {
+    use duduclaw_security::soul_guard::{ProtectedDoc, check_doc_integrity};
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if !agent_dir.join(ProtectedDoc::Instructions.file_name()).exists() {
+        return;
+    }
+    let id = agent_id.to_string();
+    let result = match tokio::task::spawn_blocking(move || {
+        check_doc_integrity(ProtectedDoc::Instructions, &id, &agent_dir)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(agent = agent_id, "INSTRUCTIONS integrity check task panicked: {e}");
+            return;
+        }
+    };
+    if result.intact {
+        return;
+    }
+    warn!(agent = agent_id, "INSTRUCTIONS.md integrity drift detected: {}", result.message);
+    duduclaw_security::audit::append_tool_call(
+        home_dir,
+        agent_id,
+        "_instructions_integrity_drift",
+        &format!(
+            "drift: current={}, expected={}, msg={}",
+            result.current_hash.chars().take(16).collect::<String>(),
+            result.expected_hash.chars().take(16).collect::<String>(),
             result.message,
         ),
         false,
