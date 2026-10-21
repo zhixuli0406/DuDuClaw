@@ -161,6 +161,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/desktop-release.md](guides/desktop-release.md) | Desktop app — release, signing and auto-update pipeline | Current |
 | [guides/desktop-unblock.md](guides/desktop-unblock.md) | Desktop app — what the remaining blocked items need (toolchain, credentials, a second machine) | Current |
 | [guides/workforce-analytics.md](guides/workforce-analytics.md) | Workforce analytics — per-user and per-channel AI usage and cost | Current |
+| [guides/editions.md](guides/editions.md) | Personal vs Enterprise edition comparison (limits, management surfaces, what decides the edition, how to upgrade; [zh-TW](guides/zh-TW/editions.md), [ja-JP](guides/ja-JP/editions.md)) | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |

@@ -435,6 +435,8 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 
 ## 10. Enterprise LAN deployment (employee desktops → company gateway)
 
+See [Personal and Enterprise editions](editions.md) for what the Enterprise edition adds.
+
 A common enterprise setup: run one gateway on a shared server and have each
 employee's **desktop app** connect to it over the office network. The desktop
 app ships a **Gateway picker** (shown before login) that finds gateways on the
