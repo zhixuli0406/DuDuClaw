@@ -527,6 +527,7 @@ pub(crate) async fn handle_agent_status(params: &Value, home_dir: &Path, caller:
     // Check for SOUL.md, skills, memory
     let has_soul = agent_dir.join("SOUL.md").exists();
     let has_identity = agent_dir.join("IDENTITY.md").exists();
+    let has_instructions = agent_dir.join(duduclaw_core::INSTRUCTIONS_FILE).exists();
     let skill_count = match tokio::fs::read_dir(agent_dir.join("SKILLS")).await {
         Ok(mut entries) => {
             let mut count = 0u32;
@@ -552,6 +553,7 @@ pub(crate) async fn handle_agent_status(params: &Value, home_dir: &Path, caller:
          Files:\n\
          - SOUL.md: {}\n\
          - IDENTITY.md: {}\n\
+         - INSTRUCTIONS.md: {}\n\
          - Skills: {} file(s)\n\
          - Directory: {}\n\
          \n\
@@ -580,6 +582,7 @@ pub(crate) async fn handle_agent_status(params: &Value, home_dir: &Path, caller:
         config.agent.trigger,
         if has_soul { "yes" } else { "no" },
         if has_identity { "yes" } else { "no" },
+        if has_instructions { "yes" } else { "no" },
         skill_count,
         agent_dir.display(),
         config.permissions.can_create_agents,

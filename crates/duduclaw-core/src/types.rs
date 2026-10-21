@@ -3064,6 +3064,15 @@ pub struct ExternalFactorsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct ChannelsConfig {
+    /// Whether a messaging-app sender with no verified dashboard identity
+    /// (any LINE friend, any Telegram user, a public web-widget visitor) may
+    /// call this employee by `@name`. Default `false`: such senders reach only
+    /// the conversation's default employee, and calling anyone else is
+    /// refused. Senders mapped to a dashboard account follow that account's
+    /// employee bindings instead. Lives in `[channels]`, which employees
+    /// cannot edit themselves (`org_field_guard`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub public_trigger: bool,
     pub discord: Option<DiscordChannelConfig>,
     pub telegram: Option<TelegramChannelConfig>,
     pub line: Option<LineChannelConfig>,

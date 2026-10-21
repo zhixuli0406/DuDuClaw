@@ -6346,10 +6346,15 @@ fn agent_file_guard_decision(
                 // Contract lock — CONTRACT.toml likewise, with no opt-in.
                 let own_contract =
                     duduclaw_core::check_own_contract_write(&file_path, &home, caller);
+                // Instructions lock — INSTRUCTIONS.md likewise, no opt-in.
+                let own_instructions =
+                    duduclaw_core::check_own_instructions_write(&file_path, &home, caller);
                 if !own_soul.is_allowed() {
                     own_soul
                 } else if !own_contract.is_allowed() {
                     own_contract
+                } else if !own_instructions.is_allowed() {
+                    own_instructions
                 } else {
                     // Stages 1–3 on the literal path, then — when a link
                     // makes the real target a different file — on the real
@@ -8919,6 +8924,10 @@ async fn cmd_agent_inspect(name: &str) -> duduclaw_core::error::Result<()> {
         } else {
             "no"
         }
+    );
+    println!(
+        "  INSTRUCTIONS.md: {}",
+        if agent.instructions.is_some() { "yes" } else { "no" }
     );
     println!(
         "  MEMORY.md:   {}",
@@ -13864,6 +13873,41 @@ mod contract_lock_hook_tests {
         }
         let env = json!({"tool_name": "Bash", "tool_input": {"command": "echo x > CONTRACT.toml"}});
         assert!(decide("Bash", &env, &HookCaller::Absent).is_allowed());
+    }
+
+    /// Agent-config import: INSTRUCTIONS.md is loaded into every prompt and
+    /// is protected exactly like SOUL.md / CONTRACT.toml — the employee can
+    /// read it but not write it, through any lane.
+    #[test]
+    fn own_instructions_write_is_blocked_for_write_edit_multiedit_and_bash() {
+        let path = home().join("agents/sales-rep/INSTRUCTIONS.md");
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let d = decide(tool, &file_envelope(tool, &path), &agent("sales-rep"));
+            assert!(
+                matches!(d, GuardDecision::BlockedOwnInstructionsWrite { ref caller, .. } if caller == "sales-rep"),
+                "{tool}: {d:?}"
+            );
+            assert!(d.block_message().unwrap().contains("INSTRUCTIONS.md"));
+        }
+        for cmd in [
+            "echo '' > INSTRUCTIONS.md",
+            "rm ./instructions.md",
+            "sed -i '' 's/a/b/' INSTRUCTIONS.md",
+            "cat x > /Users/alice/.duduclaw/agents/sales-rep/INSTRUCTIONS.md",
+        ] {
+            let env = json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+            let d = decide("Bash", &env, &agent("sales-rep"));
+            assert!(matches!(d, GuardDecision::BlockedOwnInstructionsWrite { .. }), "{cmd}: {d:?}");
+        }
+        let env = json!({"tool_name": "Bash", "tool_input": {"command": "cat INSTRUCTIONS.md"}});
+        assert!(decide("Bash", &env, &agent("sales-rep")).is_allowed());
+        // Another employee's file: the cross-agent rule answers first.
+        let foreign = home().join("agents/ceo/INSTRUCTIONS.md");
+        let d = decide("Write", &file_envelope("Write", &foreign), &agent("sales-rep"));
+        assert!(matches!(d, GuardDecision::BlockedForeignAgentDir { .. }), "{d:?}");
+        // The operator's own terminal is unaffected.
+        let d = decide("Write", &file_envelope("Write", &path), &HookCaller::Absent);
+        assert!(d.is_allowed(), "{d:?}");
     }
 
     #[test]

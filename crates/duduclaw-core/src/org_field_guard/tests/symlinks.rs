@@ -130,3 +130,14 @@ fn link_loop_is_refused() {
     let d = check_caller_scope(&h.root.join("agents/me/a/x.md"), &h.root, &me());
     assert!(!d.is_allowed(), "{d:?}");
 }
+
+/// A link named anything (`rules.md`) pointing at the own INSTRUCTIONS.md is
+/// judged on its target, like SOUL.md and CONTRACT.toml.
+#[test]
+fn link_to_own_instructions_is_refused() {
+    let h = fixture();
+    std::fs::write(h.root.join("agents/me/INSTRUCTIONS.md"), "rules").unwrap();
+    symlink(h.root.join("agents/me/INSTRUCTIONS.md"), h.root.join("agents/me/rules.md")).unwrap();
+    let d = check_own_instructions_write(&h.root.join("agents/me/rules.md"), &h.root, &me());
+    assert!(matches!(d, GuardDecision::BlockedOwnInstructionsWrite { .. }), "{d:?}");
+}

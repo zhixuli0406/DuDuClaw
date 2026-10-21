@@ -14598,7 +14598,9 @@ async fn handle_knowledge_original(
     }
 }
 
-/// POST /api/experts/upload — stage an expert-pack `.zip` for installation.
+/// POST /api/experts/upload — stage an expert-pack `.zip` (or a single-file
+/// agent definition: `.md` subagent / instructions, Dify `.yml`) for
+/// installation.
 ///
 /// Multipart body with a `file` (or `pack`) part, ≤50 MiB. Admin-only
 /// (Bearer JWT + role check — fail-closed). The upload is staged under
@@ -14701,12 +14703,22 @@ async fn handle_expert_upload(
         )
             .into_response();
     };
-    // Light sanity: a zip starts with the "PK" local-file signature. The real
-    // fence (zip-slip, per-entry caps) runs inside the install pipeline.
-    if data.len() < 4 || &data[..2] != b"PK" {
+    // Light sanity per type. A zip starts with the "PK" local-file
+    // signature; a single-file agent definition (.md / .yml) must be UTF-8
+    // text. The real fences (zip-slip, per-entry caps, content scanning) run
+    // inside the install pipeline.
+    let ext = crate::expert_admin::upload_extension(&crate::expert_admin::sanitize_upload_name(&client_name))
+        .unwrap_or("zip");
+    let looks_right = if ext == "zip" {
+        data.len() >= 4 && data.starts_with(b"PK")
+    } else {
+        std::str::from_utf8(&data).is_ok()
+    };
+    if !looks_right {
+        let msg = if ext == "zip" { "不是有效的 .zip 檔" } else { "檔案不是 UTF-8 文字檔" };
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "不是有效的 .zip 檔" })),
+            Json(serde_json::json!({ "error": msg })),
         )
             .into_response();
     }

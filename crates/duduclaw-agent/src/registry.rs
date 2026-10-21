@@ -21,6 +21,11 @@ pub struct LoadedAgent {
     pub soul: Option<String>,
     /// Content of IDENTITY.md (optional).
     pub identity: Option<String>,
+    /// Content of INSTRUCTIONS.md (optional) — operating instructions an
+    /// operator imported from AGENTS.md / CLAUDE.md / GEMINI.md, rules or a
+    /// subagent body. Loaded into every prompt right after SOUL / IDENTITY,
+    /// and read-only to the employee like SOUL.md.
+    pub instructions: Option<String>,
     /// Content of MEMORY.md (optional).
     pub memory: Option<String>,
     /// Skill files loaded from SKILLS/*.md.
@@ -258,6 +263,8 @@ impl AgentRegistry {
 
         let soul = Self::load_optional_md(&dir.join("SOUL.md")).await;
         let identity = Self::load_optional_md(&dir.join("IDENTITY.md")).await;
+        let instructions =
+            Self::load_optional_md(&dir.join(duduclaw_core::INSTRUCTIONS_FILE)).await;
         let memory = Self::load_optional_md(&dir.join("MEMORY.md")).await;
         let skills = Self::load_skills(&dir.join("SKILLS")).await;
         let contract = crate::contract::load_contract(dir);
@@ -266,6 +273,7 @@ impl AgentRegistry {
             config,
             soul,
             identity,
+            instructions,
             memory,
             skills,
             contract,
@@ -1058,6 +1066,19 @@ max_concurrent = 2
 allowed_tools = []
 denied_tools = []
 "#;
+
+    /// Agent-config import: INSTRUCTIONS.md is read next to SOUL/IDENTITY.
+    #[tokio::test]
+    async fn instructions_md_is_loaded_into_the_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
+        let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+        assert!(loaded.instructions.is_none());
+        std::fs::write(dir.join("INSTRUCTIONS.md"), "# 工作規則\n先讀 SOUL.md。\n").unwrap();
+        let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+        assert_eq!(loaded.instructions.as_deref(), Some("# 工作規則\n先讀 SOUL.md。\n"));
+    }
 
     /// R1.2: an agent with no `[preset]` binding must load byte-identical to
     /// a direct `toml::from_str::<AgentConfig>` of its own file — proven by

@@ -275,11 +275,11 @@ pub(super) async fn migrate_with_home(
     }
 
     // ── Agents + workspace persona / memory / skills ──
-    let engine = open_memory(ctx);
     let single = cfg.agents.len() == 1;
     for spec in &cfg.agents {
         let ws = workspace_dir(&src, spec, single);
-        let soul_body = std::fs::read_to_string(ws.join("SOUL.md")).ok();
+        let soul_body =
+            scanned_soul(&mut report, &spec.id, std::fs::read_to_string(ws.join("SOUL.md")).ok());
         let model_raw = spec.model.clone().or_else(|| cfg.default_model.clone());
         let (preferred, needs_review) = match &model_raw {
             Some(m) => {
@@ -312,44 +312,18 @@ pub(super) async fn migrate_with_home(
             );
         }
 
-        // Memory: bullets from MEMORY.md + memory/*.md + USER.md.
-        let mut facts = Vec::new();
-        for file in ["MEMORY.md", "USER.md"] {
-            if let Ok(c) = std::fs::read_to_string(ws.join(file)) {
-                facts.extend(extract_bullets(&c));
-            }
-        }
-        if let Ok(rd) = std::fs::read_dir(ws.join("memory")) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("md")
-                    && let Ok(c) = std::fs::read_to_string(&p)
-                {
-                    facts.extend(extract_bullets(&c));
-                }
-            }
-        }
-        import_facts(
-            engine.as_ref(),
-            ctx,
-            &mut report,
-            &agent_id,
-            "workspace memory",
-            &facts,
-            &ws.display().to_string(),
-        )
-        .await;
-
-        // Copy persona files verbatim into the agent's memory dir (fidelity).
-        for file in [
-            "IDENTITY.md",
-            "USER.md",
-            "AGENTS.md",
-            "TOOLS.md",
-            "MEMORY.md",
-        ] {
-            let _ = copy_into_agent_memory(ctx, &agent_id, &ws.join(file));
-        }
+        // Persona files → their DuDuClaw slots (IDENTITY.md, INSTRUCTIONS.md,
+        // USER/TOOLS/HEARTBEAT wiki pages, MEMORY + memory/*.md → facts).
+        let mut secrets = Vec::new();
+        let mut hidden = Vec::new();
+        let draft = crate::expert::agent_config::adapters::read_workspace(
+            &ws,
+            &src,
+            &spec.id,
+            &mut secrets,
+            &mut hidden,
+        );
+        write_persona_slots(ctx, &mut report, &agent_id, &draft, &src).await;
 
         // Skills (scanned + installed).
         let skills = skill_dirs(&src, &ws, home);

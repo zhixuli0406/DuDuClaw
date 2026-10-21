@@ -148,6 +148,7 @@ pub mod premium_templates;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
+pub mod trigger_route;
 pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
 /// Discovery attempt-container blocks.
@@ -197,6 +198,7 @@ pub mod ephemeral;
 pub mod events_store;
 pub mod expert_admin;
 pub mod expert_generate;
+pub mod expert_skills;
 pub mod external_factors;
 pub mod footprint_distill;
 pub mod foresight;

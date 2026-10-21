@@ -5,6 +5,7 @@ import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
 import { effectiveName } from '@/lib/product-identity';
 import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
+import { mentionErrorText } from '@/lib/mention';
 
 export interface ChatAttachmentMeta {
   readonly name: string;
@@ -35,6 +36,11 @@ export interface ChatMessage {
    * marker tag or a silently-missing card.
    */
   readonly artifact?: ChatArtifact;
+  /** The AI staff member that answered (from `assistant_done.agent`). Differs
+   *  from the selected partner when the message called someone else by `@`. */
+  readonly agentId?: string;
+  /** That staff member's display name (`assistant_done.agent_name`). */
+  readonly agentName?: string;
 }
 
 /** A file selected for upload, already read into base64. */
@@ -606,6 +612,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
             // `undefined` for the overwhelming majority of replies (anything
             // that never went through O-4's pending-op path on the backend).
             const artifact = parseChatArtifact(data.artifact);
+            const answeredBy = {
+              ...(typeof data.agent === 'string' && data.agent ? { agentId: data.agent } : {}),
+              ...(typeof data.agent_name === 'string' && data.agent_name ? { agentName: data.agent_name } : {}),
+            };
             set((state) => {
               const msgs = [...state.messages];
               const last = msgs[msgs.length - 1];
@@ -616,6 +626,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   content: data.content,
                   tokens: data.tokens_used,
                   ...(artifact ? { artifact } : {}),
+                  ...answeredBy,
                 };
               } else {
                 msgs.push({
@@ -625,6 +636,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   timestamp: Date.now(),
                   tokens: data.tokens_used,
                   ...(artifact ? { artifact } : {}),
+                  ...answeredBy,
                 });
               }
               return {
@@ -675,7 +687,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 {
                   id: nextId(),
                   role: 'system',
-                  content: data.message,
+                  // `@` refusals and choices arrive as codes and are worded
+                  // in the viewer's language here.
+                  content: mentionErrorText(data) ?? data.message,
                   timestamp: Date.now(),
                 },
               ],

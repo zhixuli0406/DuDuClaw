@@ -42,6 +42,8 @@ pub(crate) const AUTHORITY_KEYS: &[&str] = &[
     "permissions.can_modify_own_skills",
     "guardrails.enabled",
     "guardrails.block_secrets",
+    // v1.76: opens the employee to `@` calls from unmapped channel senders.
+    "channels.public_trigger",
 ];
 
 /// The effective value of an authority key: an absent key reads as the
@@ -55,7 +57,7 @@ fn effective_authority_value(table: &toml::Table, key: &str) -> Value {
             v => v,
         },
         "container.sandbox_enabled" | "container.network_access" | "permissions.can_modify_own_soul"
-        | "guardrails.enabled" => match raw {
+        | "guardrails.enabled" | "channels.public_trigger" => match raw {
             Value::Null => Value::Bool(false),
             v => v,
         },
@@ -181,6 +183,18 @@ pub(crate) fn apply_agent_v168_keys(table: &mut toml::Table, params: &Value, is_
             table_at_mut(table, &[section])?.insert(key.into(), toml::Value::Boolean(v));
             changes.push(format!("{path} = {v}"));
         }
+    }
+    // v1.76 — `[channels] public_trigger`: may messaging-app senders without
+    // a verified dashboard identity call this employee by `@`? Admin-only
+    // (it widens who can reach the employee; see `AUTHORITY_KEYS`).
+    if let Some(v) = bool_param(params, "channels.public_trigger")? {
+        let channels = table_at_mut(table, &["channels"])?;
+        if v {
+            channels.insert("public_trigger".into(), toml::Value::Boolean(true));
+        } else {
+            channels.remove("public_trigger");
+        }
+        changes.push(format!("channels.public_trigger = {v}"));
     }
     if let Some(v) = u64_param(params, "memory.decision_ttl_days", 1, 3650)? {
         table_at_mut(table, &["memory"])?.insert("decision_ttl_days".into(), toml::Value::Integer(v as i64));
@@ -398,6 +412,7 @@ pub(crate) fn agent_settings_json(raw: &toml::Table) -> Value {
         "guardrails": pick(raw, "guardrails", &["enabled", "block_secrets", "block_injection_echo", "redact_pii", "deny_phrases"]),
         "memory": pick(raw, "memory", &["decision_continuity", "decision_ttl_days"]),
         "night_engine": pick(raw, "night_engine", &["enabled"]),
+        "channels": pick(raw, "channels", &["public_trigger"]),
         "evolution": evolution,
         "container": pick(
             raw,
@@ -657,6 +672,25 @@ skill_security_scan = true
         assert!(authority_diff(&before, &g).iter().any(|c| c.key == "guardrails.block_secrets"));
         let details = audit_details(&diff);
         assert_eq!(details[1]["key"], "capabilities.git_credentials");
+    }
+
+    #[test]
+    fn public_trigger_is_written_parsed_and_an_authority_change() {
+        let before = table();
+        let mut after = before.clone();
+        let changes = apply_agent_v168_keys(&mut after, &json!({"channels": {"public_trigger": true}}), true).unwrap();
+        assert_eq!(changes, vec!["channels.public_trigger = true".to_string()]);
+        agent_config_check(&after).unwrap();
+        let text = toml::to_string(&after).unwrap();
+        let cfg: duduclaw_core::types::AgentConfig = toml::from_str(&text).unwrap();
+        assert!(cfg.channels.is_some_and(|c| c.public_trigger));
+        // Opening the employee to outside senders needs an admin.
+        let diff = authority_diff(&before, &after);
+        assert!(diff.iter().any(|c| c.key == "channels.public_trigger"));
+        // Writing the default over an absent key is not a change.
+        let mut off = before.clone();
+        apply_agent_v168_keys(&mut off, &json!({"channels": {"public_trigger": false}}), false).unwrap();
+        assert!(authority_diff(&before, &off).is_empty());
     }
 
     #[test]

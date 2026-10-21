@@ -13,7 +13,7 @@
 //! pushed regardless of `line_late_reply`.
 
 use super::super::*;
-use super::revision::{RevisionError, line_revision};
+use super::revision::{RevisionError, line_revision_with};
 use super::{Binding, INGRESS_BINDING, PROGRESS, RUN, record_reply_failure};
 use crate::channel_ingress::REPLY_TOKEN_SECONDS;
 use crate::channel_ingress::config::LateReply;
@@ -160,7 +160,14 @@ pub(crate) async fn binding_validity(binding: &Binding) -> Validity {
             .await;
         let read = match lease {
             Ok(false) => return Validity::Changed,
-            Ok(true) => line_revision(state, &event, None).await,
+            Ok(true) => match store.route_agent(&binding.row.id).await {
+                Ok(stored) => {
+                    let stored = stored.map(|(agent, one_shot)| super::super::trigger::StoredRoute { agent, one_shot });
+                    let mode = super::super::trigger::RouteMode::Replay(stored.as_ref());
+                    line_revision_with(state, &event, None, mode).await
+                }
+                Err(_) => Err(RevisionError::Unavailable("route_unreadable")),
+            },
             Err(_) => Err(RevisionError::Unavailable("lease_unreadable")),
         };
         match read {

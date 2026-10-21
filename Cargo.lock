@@ -1749,6 +1749,7 @@ dependencies = [
  "duduclaw-os",
  "duduclaw-redaction",
  "duduclaw-security",
+ "encoding_rs",
  "flate2",
  "futures-util",
  "hex",

@@ -177,6 +177,7 @@ export function isAdminOnlyPath(path: string): boolean {
     path === 'form.can_modify_own_soul' ||
     path === 'form.sandbox_enabled' ||
     path === 'form.network_access' ||
+    path === 'v.public_trigger' ||
     path.startsWith('caps.')
   );
 }
@@ -342,6 +343,7 @@ export function buildUpdatePayload(
   if (has(dirty, 'v.effort')) put('model', { effort: s.v.effort as AgentEffort });
   if (has(dirty, 'v.fork_enabled')) put('fork', { enabled: s.v.fork_enabled });
   if (has(dirty, 'v.night_engine_enabled')) put('night_engine', { enabled: s.v.night_engine_enabled });
+  if (has(dirty, 'v.public_trigger')) put('channels', { public_trigger: s.v.public_trigger });
 
   const mem: Record<string, unknown> = {};
   if (has(dirty, 'v.decision_continuity')) mem.decision_continuity = s.v.decision_continuity;
