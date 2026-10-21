@@ -220,6 +220,62 @@ pub async fn call_direct_api_attributed(
     user_prompt: &str,
     conversation_history: &[(String, String)],
 ) -> Result<DirectApiResponse, String> {
+    call_direct_api_inner(
+        scope,
+        api_key,
+        model,
+        system_prompt,
+        dynamic_system_suffix,
+        user_prompt,
+        conversation_history,
+        RequestLimits::default(),
+    )
+    .await
+}
+
+/// Per-call output budget and HTTP deadline. The default (4096 tokens, the
+/// shared client's 120 s timeout) is what every other caller uses; only
+/// callers that knowingly need a long reply pass something larger.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLimits {
+    pub max_tokens: u32,
+    /// Overrides the shared client's 120 s timeout for this request only.
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            max_tokens: DEFAULT_MAX_TOKENS,
+            timeout: None,
+        }
+    }
+}
+
+/// [`call_direct_api`] with an explicit output budget / deadline — used by
+/// the staged expert-team generator, whose replies (a full SOUL + skills, or
+/// four wiki pages) do not fit the 4096-token default.
+pub async fn call_direct_api_with_limits(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    limits: RequestLimits,
+) -> Result<DirectApiResponse, String> {
+    call_direct_api_inner(None, api_key, model, system_prompt, None, user_prompt, &[], limits).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_direct_api_inner(
+    scope: Option<&str>,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
+    user_prompt: &str,
+    conversation_history: &[(String, String)],
+    limits: RequestLimits,
+) -> Result<DirectApiResponse, String> {
     let client = http_client();
 
     // Build system blocks: cached segments (split on CACHE_SPLIT_MARKER),
@@ -282,14 +338,17 @@ pub async fn call_direct_api_attributed(
 
     let body = MessagesRequest {
         model: model.to_string(),
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens: limits.max_tokens,
         system,
         messages,
         stream: None,
     };
 
-    let response = client
-        .post(API_BASE)
+    let mut request = client.post(API_BASE);
+    if let Some(timeout) = limits.timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request
         .header("x-api-key", api_key)
         .header("anthropic-version", API_VERSION)
         .header("anthropic-beta", "prompt-caching-2024-07-31")

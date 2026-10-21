@@ -1,4 +1,5 @@
 pub mod agent_guard;
+pub mod agent_names;
 pub mod agent_rename;
 pub mod agent_trash;
 pub mod agent_toml;
