@@ -6,7 +6,7 @@ import zh from '@/i18n/zh-TW.json';
 import ja from '@/i18n/ja-JP.json';
 import type { ExpertDraftPreview, ExpertGenerationJob, ExpertInstallPlacement } from '@/lib/api';
 import { aggregateStatus, GenerationProgress } from './GenerationProgress';
-import { DraftPreview } from './DraftPreview';
+import { DraftPreview, warningText } from './DraftPreview';
 import { placementProblems } from './InstallResult';
 
 const preview: ExpertDraftPreview = {
@@ -43,6 +43,7 @@ const preview: ExpertDraftPreview = {
   wiki_pages: [
     { file: 'shop-team/sop.md', title: 'SOP', chars: 900 },
     { file: 'shop-team/faq.md', title: 'FAQ', chars: 900 },
+    { file: 'shop-team/glossary.md', title: 'Glossary', chars: 900, web_research: true, content: '# Glossary\nfrom the web' },
   ],
   notes: ['Returns could not be written'],
   install_warnings: [
@@ -111,6 +112,29 @@ describe('DraftPreview', () => {
     // The skip names the page title, never the internal file path.
     expect(screen.getByText(/already has a page named "FAQ"/)).toBeInTheDocument();
     expect(screen.queryByText(/shop-team\/faq\.md/)).toBeNull();
+    // Web-search pages are listed for review with their text.
+    expect(screen.getByText(en['experts.generate.webPagesTitle'])).toBeInTheDocument();
+    expect(screen.getByText(/from the web/)).toBeInTheDocument();
+  });
+});
+
+describe('warningText', () => {
+  it('falls back to a generic line for unknown warning kinds', () => {
+    const has = (id: string) => id in (en as Record<string, string>);
+    const known = warningText(
+      { kind: 'name', name: 'Front desk', reason: 'conflict', detail: '' },
+      preview,
+      t,
+      has,
+    );
+    expect(known).toContain('Front desk');
+    const unknown = warningText(
+      { kind: 'wiki', name: 'shop-team/faq.md', reason: 'mystery' as 'blocked', detail: '' },
+      preview,
+      t,
+      has,
+    );
+    expect(unknown).toBe(t('experts.generate.warn.generic', { name: 'FAQ' }));
   });
 });
 
@@ -124,6 +148,7 @@ describe('placementProblems', () => {
           installed: true,
           skills: [{ name: 'shop-dispatch', installed: false }],
           contract: false,
+          renamed: true,
         },
         { name: 'shop-returns', display_name: 'Returns', installed: false, skills: [], contract: null },
       ],
@@ -134,7 +159,7 @@ describe('placementProblems', () => {
       complete: false,
     };
     const lines = placementProblems(placement, preview, t);
-    expect(lines).toHaveLength(4);
+    expect(lines).toHaveLength(5);
     expect(lines.join('\n')).toContain('Routes requests to staff');
     expect(lines.join('\n')).toContain('"FAQ"');
     expect(lines.join('\n')).toContain('"Returns" was not installed');

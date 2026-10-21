@@ -11,6 +11,10 @@ export function placementProblems(
   const lines: string[] = [];
   for (const a of placement.agents) {
     const name = a.display_name || a.name;
+    if (a.installed && a.renamed) {
+      const wanted = preview?.agents.find((p) => p.name === a.name)?.display_name || a.name;
+      lines.push(t('experts.install.result.renamed', { from: wanted, to: name }));
+    }
     if (!a.installed) {
       lines.push(t('experts.install.result.agentMissing', { name }));
       continue;

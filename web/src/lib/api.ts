@@ -3521,7 +3521,7 @@ export interface ExpertDraftAgent {
 
 /** Something the installer is predicted to skip (`install_warnings`). */
 export interface ExpertInstallWarning {
-  kind: 'agent' | 'skill' | 'wiki' | 'contract';
+  kind: 'agent' | 'skill' | 'wiki' | 'contract' | 'name' | 'trigger';
   name: string;
   reason: 'conflict' | 'blocked';
   detail: string;
@@ -3538,7 +3538,15 @@ export interface ExpertDraftPreview {
   agents: ExpertDraftAgent[];
   skills: string[];
   wiki_titles: string[];
-  wiki_pages?: Array<{ file: string; title: string; chars: number }>;
+  wiki_pages?: Array<{
+    file: string;
+    title: string;
+    chars: number;
+    /** Written with web search available: must be reviewed before install. */
+    web_research?: boolean;
+    /** Page text, sent only for pages that need review. */
+    content?: string | null;
+  }>;
   /** Partial-generation notes (members / knowledge base that fell back). */
   notes?: string[];
   install_warnings?: ExpertInstallWarning[];
@@ -3579,7 +3587,11 @@ export interface ExpertDraftStatus {
 export interface ExpertInstallPlacement {
   agents: Array<{
     name: string;
+    /** Installed agent id (the whole team may be renamed on collision). */
+    id?: string;
     display_name: string;
+    /** The display name was changed to avoid another employee's name. */
+    renamed?: boolean;
     installed: boolean;
     skills: Array<{ name: string; installed: boolean }>;
     /** null ⇒ the draft had no red lines for this member. */
@@ -5885,12 +5897,19 @@ export const api = {
     generateCancel: (draftId: string) =>
       client.call('experts.generate_cancel', { draft_id: draftId }) as Promise<{
         cancelled: boolean;
+        state: 'cancelled' | 'installing' | 'not_running';
       }>,
-    /** Install a generated draft via the full security-scanned pipeline. */
-    installDraft: (draftId: string, attachUnder?: string) =>
+    /** Install a generated draft via the full security-scanned pipeline.
+     *  `reviewedWebPages` confirms the admin read the web-search pages (the
+     *  gateway refuses such drafts without it). */
+    installDraft: (draftId: string, attachUnder?: string, reviewedWebPages?: boolean) =>
       client.call(
         'experts.install_draft',
-        { draft_id: draftId, ...(attachUnder ? { attach_under: attachUnder } : {}) },
+        {
+          draft_id: draftId,
+          ...(attachUnder ? { attach_under: attachUnder } : {}),
+          ...(reviewedWebPages ? { reviewed_web_pages: true } : {}),
+        },
         false,
         320000,
       ) as Promise<{

@@ -94,6 +94,8 @@ export function GenerateExpertDialog({
   const [roundsLeft, setRoundsLeft] = useState(0);
   const [feedback, setFeedback] = useState('');
   const [placement, setPlacement] = useState<ExpertInstallPlacement | null>(null);
+  /** The admin confirmed reading the pages written with web search. */
+  const [reviewedWeb, setReviewedWeb] = useState(false);
   // WP-ORG — org placement for the installed pack root (empty = independent).
   const [attachUnder, setAttachUnder] = useState('');
   /** Bumped on cancel/close so an in-flight poll loop stops and its late
@@ -120,6 +122,7 @@ export function GenerateExpertDialog({
     setJob(null);
     setFeedback('');
     setPlacement(null);
+    setReviewedWeb(false);
     setAttachUnder('');
   };
 
@@ -185,7 +188,12 @@ export function GenerateExpertDialog({
     setStep('generating');
     try {
       const started = await start();
-      if (generationToken.current !== token) return;
+      if (generationToken.current !== token) {
+        // Cancelled or closed while the start call was in flight: the job
+        // exists on the gateway now, so stop it instead of orphaning it.
+        api.experts.generateCancel(started.draft_id).catch(() => undefined);
+        return;
+      }
       setDraftId(started.draft_id);
       setJob(started.job ?? null);
       runningDraft.current = started.draft_id;
@@ -194,6 +202,7 @@ export function GenerateExpertDialog({
       runningDraft.current = null;
       if ((res.status === 'done' || res.status === 'partial') && res.preview) {
         setPreview(res.preview);
+        setReviewedWeb(false);
         setRoundsLeft(res.rounds_left ?? 0);
         setFeedback('');
         setStep('preview');
@@ -243,9 +252,12 @@ export function GenerateExpertDialog({
     if (!draftId) return;
     setStep('installing');
     try {
-      const res = await api.experts.installDraft(draftId, attachUnder || undefined);
+      const res = await api.experts.installDraft(draftId, attachUnder || undefined, reviewedWeb);
       onInstalled();
-      if (res.placement && !res.placement.complete) {
+      if (
+        res.placement &&
+        (!res.placement.complete || res.placement.agents.some((a) => a.renamed))
+      ) {
         setPlacement(res.placement);
         setStep('installed');
         return;
@@ -258,6 +270,11 @@ export function GenerateExpertDialog({
       setStep('preview');
     }
   };
+
+  const needsWebReview = preview?.wiki_pages?.some((p) => p.web_research) ?? false;
+  // Every revise rewrites the whole team: roster + one call per member +
+  // knowledge base (retries can add up to the same again).
+  const reviseCalls = (preview?.agents.length ?? 0) + 2;
 
   const cancelGeneration = () => {
     generationToken.current += 1;
@@ -382,6 +399,17 @@ export function GenerateExpertDialog({
           <div className="space-y-4">
             <DraftPreview preview={preview} />
 
+            {needsWebReview && (
+              <label className="flex items-start gap-2 text-sm">
+                <Checkbox
+                  checked={reviewedWeb}
+                  onCheckedChange={(v) => setReviewedWeb(v === true)}
+                  className="mt-0.5"
+                />
+                <span>{t('experts.generate.webPagesConfirm')}</span>
+              </label>
+            )}
+
             <AttachUnderSelect value={attachUnder} onChange={setAttachUnder} />
 
             <div className="space-y-1.5">
@@ -412,6 +440,9 @@ export function GenerateExpertDialog({
                     : t('experts.generate.roundsExhausted')}
                 </span>
               </div>
+              <p className="text-xs text-muted-foreground">
+                {t('experts.generate.reviseCost', { count: reviseCalls })}
+              </p>
             </div>
           </div>
         )}
@@ -433,7 +464,12 @@ export function GenerateExpertDialog({
               <Button variant="outline" size="sm" onClick={() => close(false)}>
                 {t('common.cancel')}
               </Button>
-              <Button variant="brand" size="sm" onClick={handleInstall}>
+              <Button
+                variant="brand"
+                size="sm"
+                onClick={handleInstall}
+                disabled={needsWebReview && !reviewedWeb}
+              >
                 {t('experts.generate.install')}
               </Button>
             </>
