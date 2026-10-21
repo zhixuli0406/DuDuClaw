@@ -22,7 +22,7 @@ my-first-pack/
         └── SKILL.md             # 任意:パックに同梱されるスキル
 ```
 
-`CONTRACT.toml` の形式は [CONTRACT.toml 仕様](../../spec/contract-toml-spec.md) を参照してください。各 `must_not` はこのスタッフのチャネル返信とも文字どおり照合され、その文言を含む返信はブロックされます。単語1つではなく、禁止する行動を説明する文として書いてください。
+`CONTRACT.toml` の形式は [CONTRACT.toml 仕様](../../spec/contract-toml-spec.md) を参照してください。各 `must_not` はこのスタッフのチャネル返信とも文字どおり照合され、その文言を含む返信はブロックされます。単語1つではなく、禁止する行動を説明する文として書いてください。導入時には、ワイルドカードのルール、10文字未満のルール、ペルソナ自身の引き継ぎの言い回しと同じルールを削除し、削除した内容を表示します。
 
 `expert.toml`の最小内容(フィールドは[features/32](../../features/ja-JP/32-expert-packs.md)を正としてください):
 

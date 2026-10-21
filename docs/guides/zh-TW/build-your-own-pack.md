@@ -22,7 +22,7 @@ my-first-pack/
         └── SKILL.md             # 選填：隨包技能
 ```
 
-`CONTRACT.toml` 的格式見 [CONTRACT.toml 規格](../../spec/contract-toml-spec.md)。每條 `must_not` 也會逐字比對這位員工的通道回覆，回覆含有該字句就會被擋下，所以請寫成完整描述禁止行為的句子，不要只寫單一關鍵字。
+`CONTRACT.toml` 的格式見 [CONTRACT.toml 規格](../../spec/contract-toml-spec.md)。每條 `must_not` 也會逐字比對這位員工的通道回覆，回覆含有該字句就會被擋下，所以請寫成完整描述禁止行為的句子，不要只寫單一關鍵字。安裝時會刪掉萬用字元規則、少於 10 個字的規則，以及和 persona 自己轉交真人說法相同的規則，並列出刪了哪些。
 
 `expert.toml` 最小內容（欄位以 [features/32](../../features/zh-TW/32-expert-packs.md) 為準）：
 

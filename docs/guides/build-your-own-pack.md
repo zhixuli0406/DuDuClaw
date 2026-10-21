@@ -22,7 +22,7 @@ my-first-pack/
         └── SKILL.md             # optional: a skill bundled with the pack
 ```
 
-`CONTRACT.toml` uses the [CONTRACT.toml format](../spec/contract-toml-spec.md). Each `must_not` rule is also matched word for word against the agent's channel replies and blocks a reply that contains it, so write rules as full descriptions of the forbidden behaviour, not single keywords.
+`CONTRACT.toml` uses the [CONTRACT.toml format](../spec/contract-toml-spec.md). Each `must_not` rule is also matched word for word against the agent's channel replies and blocks a reply that contains it, so write rules as full descriptions of the forbidden behaviour, not single keywords. The installer drops wildcard rules, rules under 10 characters, and rules that repeat the persona's own handoff wording, and lists what it dropped.
 
 Minimum `expert.toml` content (fields follow [features/32](../features/32-expert-packs.md) as the source of truth):
 
