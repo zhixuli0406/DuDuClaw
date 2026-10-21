@@ -37,4 +37,11 @@ describe('<Tabs>', () => {
     expect(list).toHaveClass('bg-transparent');
     expect(list).not.toHaveClass('bg-muted');
   });
+
+  it('styles the attribute base-ui puts on the current tab', () => {
+    renderWithProviders(<Fixture variant="line" />);
+    const tabA = screen.getByRole('tab', { name: 'A' });
+    expect(tabA).toHaveAttribute('data-active');
+    expect(tabA.className).toContain('data-[active]:after:bg-foreground');
+  });
 });

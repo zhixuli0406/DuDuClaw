@@ -11,12 +11,20 @@
 //! - [`route`]: `POST /api/internal/knowledge`, the signed loopback route
 //!   behind the read-only `knowledge_*` MCP tools.
 //! - [`turn_requesters`]: who a live turn is for.
+//! - [`principals`]: who a collection owner may grant to (the permission
+//!   picker and the check before `knowledge.acl.set`).
+//! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
+//!   employee edit page (`agents.update`).
+//! - [`denied`]: the admin-wide list of refused reads.
 //!
 //! Writes happen only here. Every read goes through
 //! `duduclaw_knowledge::acl::effective_collections`.
 
+pub mod agent_binding;
+pub mod denied;
 pub mod extract_spawn;
 pub mod pipeline;
+pub mod principals;
 pub mod route;
 pub mod rpc;
 pub mod turn_requesters;

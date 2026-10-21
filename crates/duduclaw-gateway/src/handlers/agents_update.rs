@@ -64,6 +64,31 @@ impl MethodHandler {
             return WsFrame::error_response("", &msg);
         }
 
+        // ── [knowledge] collections (document knowledge base) ────────────
+        // Narrowing only: the list may name only collections granted to this
+        // employee (or its department), `null` clears the key and `[]` turns
+        // knowledge off. Validated against the knowledge database BEFORE any
+        // write; an unreadable database refuses every non-empty list.
+        let knowledge_binding = match params.get("knowledge") {
+            None => None,
+            Some(raw) => {
+                let Some(agent_ref) = self.knowledge_agent_ref(&agent_id).await else {
+                    return WsFrame::error_response("", "Agent not found");
+                };
+                let home = self.home_dir.clone();
+                let raw = raw.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::knowledge::agent_binding::validate(&home, &agent_ref, &raw)
+                })
+                .await
+                {
+                    Ok(Ok(b)) => Some(b),
+                    Ok(Err(msg)) => return WsFrame::error_response("", &msg),
+                    Err(_) => return WsFrame::error_response("", "暫時無法確認這位 AI 員工可用的知識集合，請稍後再試。"),
+                }
+            }
+        };
+
         // If promoting to main, demote the current main agent first
         if let Some("main") = params.get("role").and_then(|v| v.as_str()) {
             if let Err(e) = self.demote_current_main(&agent_id).await {
@@ -690,6 +715,11 @@ impl MethodHandler {
             // the encryption + validation are unit-testable.
             let odoo_changes = apply_odoo_to_table(table, &params_clone, &home_for_update)?;
             changes.extend(odoo_changes);
+
+            // ── [knowledge] collections (validated above) ──
+            if let Some(binding) = knowledge_binding.as_ref() {
+                changes.extend(crate::knowledge::agent_binding::apply_to_table(table, binding));
+            }
 
             // ── Per-agent scattered fields (G.8) ──
             // These extend existing sections WITHOUT duplicating fields already
