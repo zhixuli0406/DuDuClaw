@@ -72,8 +72,33 @@ async fn about_uses_fixed_product_metadata_without_local_brand_overrides() {
             ] {
                 assert!(result.get(removed).is_none(), "{removed} must be absent");
             }
+            // A local branding.json can never inject a distributor notice: the
+            // field exists only when one was compiled into the binary.
+            match crate::distributor_notice::distributor_notice() {
+                None => assert!(
+                    result.get("distributor_notice").is_none(),
+                    "distributor_notice must be absent when not compiled in"
+                ),
+                Some(html) => assert_eq!(result["distributor_notice"], html),
+            }
         }
         other => panic!("about must remain readable: {other:?}"),
+    }
+}
+
+#[test]
+fn about_payload_carries_only_a_compiled_distributor_notice() {
+    let without = crate::handlers::about_rpc::about_payload("oem", None);
+    assert!(without.get("distributor_notice").is_none());
+    assert_eq!(without["product_name"], "DuDuClaw");
+
+    let with = crate::handlers::about_rpc::about_payload("oem", Some("<p>notice</p>".into()));
+    assert_eq!(with["distributor_notice"], "<p>notice</p>");
+    // The fixed vendor block and tier are unchanged by a notice.
+    assert_eq!(with["vendor"], without["vendor"]);
+    assert_eq!(with["tier"], "oem");
+    for removed in ["branding", "source", "white_label_active", "editable_fields"] {
+        assert!(with.get(removed).is_none(), "{removed} must be absent");
     }
 }
 

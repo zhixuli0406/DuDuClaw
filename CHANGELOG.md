@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- 總經銷專用 build 可以在 dashboard 的「關於」頁顯示一塊總經銷資訊，放在固定的原廠區塊上方，標題固定為「總經銷資訊」、說明「由授權總經銷提供」（英文、日文介面有對應翻譯）。內容是建置時的輸入（`DUDUCLAW_DISTRIBUTOR_NOTICE_PATH` 指向一份 HTML 檔，上限 64 KB），編譯進執行檔；裝好的系統上沒有任何設定或 RPC 能改它，所以客戶換不掉，內容要更新就得出新 build。HTML 在建置時和 gateway 送出前各消毒一次：只留基本排版標籤，`style`／`class`／`id`／`on*` 全部移除，連結只收 `http(s)` 與 `mailto` 並一律開新分頁，圖片只收內容相符的 PNG／JPEG／WebP data URI；建置時被拿掉的東西會列成 cargo 警告，消毒後沒剩內容就建置失敗。畫面上只放在不能執行 script 的 sandbox iframe 裡（只開放彈出新分頁），iframe 內另擋所有網路請求，高度固定 280 px、內容較長時在框內捲動，跟著淺色／深色主題。`about.get` 只有在編進內容時才多一個 `distributor_notice` 欄位。公開版不設定這個變數，關於頁和 `about.get` 都和以前一樣。白牌功能（產品名稱、logo、顏色、品牌包）仍然是移除狀態，舊的 `branding.about_html` 依然不會顯示；`docs/guides/white-label.md`（三語）改寫成「已移除」並只保留經銷商金鑰控制台，新增 `docs/guides/distributor-notice.md`（三語）。已驗證：消毒器單元測試與共用測試向量（含 script、事件屬性、`javascript:` 連結、SVG 與偽裝成 PNG 的圖片、超過大小）、`about.get` 有無內容兩種回應、關於頁元件測試（iframe 的 sandbox 值完全相符、不含 `allow-scripts`）、有範例檔與沒有範例檔各建置一次並用隔離的 gateway 實際呼叫 `about.get`。尚未驗證：桌面版（Tauri）殼裡的顯示、私有映像管線實際產出的總經銷 build。
 - 新增公開文件「個人版與企業版」（`docs/guides/editions.md`，另有 zh-TW、ja-JP 版）：對照 AI 員工數、同時執行的目標任務、OS 原生感知席位、成員／部門／角色、經銷商管理等管理介面、本機免登入、付費板模，說明版本由已安裝的授權決定與升級步驟。表中每一列都對過程式碼（版本推導、並行上限、OS 原生席位、企業版專用 RPC、授權方案表）。純文件變更，未動程式。升級步驟寫的選單路徑是「管理 → 進階設定 → 授權」，以授權頁回到個人版選單（同版另一項修正）為前提。
 
 ### Fixed

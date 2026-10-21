@@ -4508,6 +4508,8 @@
   "about.softwareBy": "ソフトウェア開発",
   "about.version": "バージョン",
   "about.edition": "エディション",
+  "about.distributor.title": "総代理店情報",
+  "about.distributor.caption": "正規総代理店による提供",
   "distributor.title": "販売代理店",
   "distributor.scopeNote": "この内部ページでは総代理店ライセンスを発行・失効します。製品販売と顧客への見積もりは正規総代理店の未來企業が担当します。",
   "distributor.add": "代理店を追加",

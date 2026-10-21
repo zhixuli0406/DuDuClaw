@@ -205,6 +205,14 @@ otel = [
     "dep:tonic",
 ]
 
+# build.rs compiles the optional distributor notice with the same sanitizer
+# module the library uses (src/distributor_notice/sanitize.rs). All three are
+# already normal dependencies above, so Cargo.lock does not change.
+[build-dependencies]
+ammonia = { workspace = true }
+base64 = { workspace = true }
+url = "2"
+
 [dev-dependencies]
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
 calamine = "0.36.1"

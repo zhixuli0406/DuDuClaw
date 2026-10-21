@@ -5042,6 +5042,12 @@ export interface AboutResponse {
   product_name: 'DuDuClaw';
   version: string;
   tier: string;
+  /**
+   * Sanitized distributor-information HTML compiled into a distributor build.
+   * Absent on public builds. Render only through DistributorNoticeCard
+   * (sandboxed iframe), never into the dashboard DOM.
+   */
+  distributor_notice?: string;
 }
 
 // ── Distributor license management (owner-only) ──
