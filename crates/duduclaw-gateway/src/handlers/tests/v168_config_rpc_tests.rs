@@ -55,7 +55,22 @@ async fn handler_with_agent() -> (tempfile::TempDir, MethodHandler) {
     ok(&handler
         .handle_agents_create_as(json!({ "name": "a1", "display_name": "A1" }), Some(&admin()))
         .await);
+    register_accounts(home.path());
     (home, handler)
+}
+
+/// `agents.update` re-reads the caller from `users.db` (owner decision D7),
+/// so the contexts above exist there with the same ids, roles and binding.
+fn register_accounts(home: &Path) {
+    let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+    for (id, role) in [("admin-1", UserRole::Admin), ("owner-7", UserRole::Employee)] {
+        let u = db.create_user(&format!("{id}@example.invalid"), id, "isolated-test-password", role).unwrap();
+        rusqlite::Connection::open(home.join("users.db"))
+            .unwrap()
+            .execute("UPDATE users SET id=?1 WHERE id=?2", rusqlite::params![id, u.id])
+            .unwrap();
+    }
+    db.bind_agent("owner-7", "a1", AccessLevel::Owner).unwrap();
 }
 
 // ── system.update_config ─────────────────────────────────────────────────────
@@ -382,7 +397,9 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
                 "night_engine": { "enabled": true },
                 "runtime": { "fallback": "qwen", "minimal_context": false },
                 "utility": "",
-                "advanced_kv": [{ "section": "prompt", "key": "cli_bare_mode", "value": true, "type": "boolean" }],
+                // `[prompt]` left the key/value editor (it holds the admin-only
+                // `cli_bare_mode`); the typed `prompt` object still writes it.
+                "prompt": { "cli_bare_mode": true },
             }),
             &admin(),
         )
@@ -410,13 +427,13 @@ async fn kv_type_mismatch_is_refused_and_the_employee_keeps_loading() {
     let e = err(&handler
         .handle(
             "agents.update",
-            json!({ "agent_id": "a1", "advanced_kv": [{ "section": "prompt", "key": "cli_bare_mode", "value": "true", "type": "string" }] }),
+            json!({ "agent_id": "a1", "advanced_kv": [{ "section": "heartbeat", "key": "enabled", "value": "true", "type": "string" }] }),
             &admin(),
         )
         .await);
     assert!(e.contains("line") && e.contains("agent.toml"), "{e}");
     let raw = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap();
-    assert!(!raw.contains("cli_bare_mode"));
+    assert!(!raw.contains("enabled = \"true\""));
 }
 
 // ── inference.update ─────────────────────────────────────────────────────────

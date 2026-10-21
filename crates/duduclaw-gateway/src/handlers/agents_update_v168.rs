@@ -26,76 +26,10 @@ use super::*;
 use super::config_commit::{bool_param, is_plain_text, param_at, str_array_param, str_param, table_at_mut, toml_at, toml_at_json, u64_param};
 use super::system_update_config_v168::{ProtectedChange, V168Outcome, apply_team_roles};
 
-/// Keys an admin-only change protects. `capabilities` is compared whole.
-pub(crate) const AUTHORITY_KEYS: &[&str] = &[
-    "agent.reports_to",
-    "agent.department",
-    "agent.name",
-    "capabilities",
-    "container.sandbox_enabled",
-    "container.network_access",
-    "permissions.can_modify_own_soul",
-    // v1.68: enforced at the MCP gate, so they are authority too.
-    "permissions.can_create_agents",
-    "permissions.can_send_cross_agent",
-    "permissions.can_schedule_tasks",
-    "permissions.can_modify_own_skills",
-    "guardrails.enabled",
-    "guardrails.block_secrets",
-    // v1.76: opens the employee to `@` calls from unmapped channel senders.
-    "channels.public_trigger",
-];
-
-/// The effective value of an authority key: an absent key reads as the
-/// value the loader would use (`""` / `false` / the capability defaults), so
-/// writing an explicit default over an absent key is not a change.
-fn effective_authority_value(table: &toml::Table, key: &str) -> Value {
-    let raw = toml_at_json(table, key);
-    match key {
-        "agent.reports_to" | "agent.department" | "agent.name" => match raw {
-            Value::Null => Value::String(String::new()),
-            v => v,
-        },
-        "container.sandbox_enabled" | "container.network_access" | "permissions.can_modify_own_soul"
-        | "guardrails.enabled" | "channels.public_trigger" => match raw {
-            Value::Null => Value::Bool(false),
-            v => v,
-        },
-        // Absent ⇒ allowed (the gate refuses only an explicit `false`);
-        // `block_secrets` defaults on.
-        "permissions.can_create_agents"
-        | "permissions.can_send_cross_agent"
-        | "permissions.can_schedule_tasks"
-        | "permissions.can_modify_own_skills"
-        | "guardrails.block_secrets" => match raw {
-            Value::Null => Value::Bool(true),
-            v => v,
-        },
-        "capabilities" => {
-            let defaults = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
-                .unwrap_or_else(|_| json!({}));
-            let mut obj = raw.as_object().cloned().unwrap_or_default();
-            obj.retain(|k, v| {
-                let is_default = defaults.get(k) == Some(v);
-                let is_empty = v.as_array().is_some_and(|a| a.is_empty())
-                    || v.as_object().is_some_and(|o| o.is_empty());
-                !(is_default || (is_empty && defaults.get(k).is_none()))
-            });
-            Value::Object(obj)
-        }
-        _ => raw,
-    }
-}
-
-/// Before/after of every authority key whose effective value differs.
+/// Before/after of every admin-only key whose change needs an admin. The
+/// table lives in `agent_authority` (shared with the dashboard fixture).
 pub(crate) fn authority_diff(before: &toml::Table, after: &toml::Table) -> Vec<ProtectedChange> {
-    AUTHORITY_KEYS
-        .iter()
-        .filter_map(|k| {
-            let (b, a) = (effective_authority_value(before, k), effective_authority_value(after, k));
-            (b != a).then(|| ProtectedChange { key: (*k).to_string(), before: b, after: a })
-        })
-        .collect()
+    super::agent_authority::authority_diff(before, after)
 }
 
 /// The `[capabilities]` diff, reduced to the changed sub-keys (audit rows
@@ -230,12 +164,15 @@ pub(crate) fn apply_agent_v168_keys(table: &mut toml::Table, params: &Value, is_
 
 /// Sections the advanced editor may not touch: each has dedicated, validated
 /// controls (and most are authority or credential sections).
-const KV_DENIED_SECTIONS: &[&str] = &[
-    "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime",
+/// `prompt` (holds `cli_bare_mode`), `os_watch` and `budget` hold admin-only
+/// keys (`agent_authority`), so they are edited through their own fields only.
+pub(crate) const KV_DENIED_SECTIONS: &[&str] = &[
+    "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt",
+    "os_watch", "budget",
 ];
 
 /// Sections with no reader (v1.68 audit): writing them changes nothing.
-const KV_DEAD_SECTIONS: &[&str] = &["ptc", "cultural_context", "sticker"];
+pub(crate) const KV_DEAD_SECTIONS: &[&str] = &["ptc", "cultural_context", "sticker"];
 
 fn is_ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
@@ -614,25 +551,25 @@ skill_security_scan = true
         apply_agent_v168_keys(
             &mut t,
             &json!({ "advanced_kv": [
-                { "section": "prompt", "key": "cli_bare_mode", "value": true, "type": "boolean" },
-                { "section": "prompt", "key": "minimal_core_kb", "value": 4, "type": "integer" },
+                { "section": "memory", "key": "decision_continuity", "value": true, "type": "boolean" },
+                { "section": "memory", "key": "decision_ttl_days", "value": 4, "type": "integer" },
                 { "section": "model", "key": "fallbacks", "value": ["a", "b"], "type": "string_array" },
             ]}),
             true,
         )
         .unwrap();
-        assert_eq!(toml_at(&t, "prompt.cli_bare_mode").unwrap().as_bool(), Some(true));
+        assert_eq!(toml_at(&t, "memory.decision_continuity").unwrap().as_bool(), Some(true));
         agent_config_check(&t).unwrap();
 
         // Wrong JSON type for the declared type.
         assert!(apply_advanced_kv(&mut table(), &json!({ "advanced_kv": [
-            { "section": "prompt", "key": "cli_bare_mode", "value": "true", "type": "boolean" }
+            { "section": "memory", "key": "decision_continuity", "value": "true", "type": "boolean" }
         ]}), true).is_err());
         // Declared type consistent but not what the loader accepts: caught
         // by the final AgentConfig check, with a location.
         let mut bad = table();
         apply_advanced_kv(&mut bad, &json!({ "advanced_kv": [
-            { "section": "prompt", "key": "cli_bare_mode", "value": "yes", "type": "string" }
+            { "section": "heartbeat", "key": "enabled", "value": "yes", "type": "string" }
         ]}), true)
         .unwrap();
         let err = agent_config_check(&bad).unwrap_err();
@@ -643,10 +580,19 @@ skill_security_scan = true
             let err = apply_advanced_kv(&mut table(), &row, false).unwrap_err();
             assert!(err.contains("administrator"), "{err}");
         }
-        // Authority sections are refused.
-        assert!(apply_advanced_kv(&mut table(), &json!({ "advanced_kv": [
-            { "section": "capabilities", "key": "git_credentials", "value": true, "type": "boolean" }
-        ]}), true).is_err());
+        // Authority sections are refused, for an admin too (they have their
+        // own fields): `prompt.cli_bare_mode` skips the hooks.
+        for (section, key, value) in [
+            ("capabilities", "git_credentials", json!(true)),
+            ("prompt", "cli_bare_mode", json!(true)),
+            ("os_watch", "paths", json!(["/"])),
+            ("budget", "hard_stop", json!(false)),
+        ] {
+            let ty = if value.is_boolean() { "boolean" } else { "string_array" };
+            let row = json!({ "advanced_kv": [{ "section": section, "key": key, "value": value, "type": ty }] });
+            assert!(apply_advanced_kv(&mut table(), &row, true).is_err(), "[{section}] {key}");
+            assert!(apply_advanced_kv(&mut table(), &row, false).is_err(), "[{section}] {key}");
+        }
     }
 
     #[test]

@@ -58,6 +58,17 @@ fn enterprise_surfaces_are_listed() {
 #[test]
 fn personal_surfaces_are_untouched() {
     for method in [
+        // 設定檔編輯 (agent_files.*) — a Personal owner edits their own employees too
+        "agent_files.list",
+        "agent_files.get",
+        "agent_files.diff",
+        "agent_files.history",
+        "agent_files.save",
+        "agent_files.rollback",
+        "agent_files.withdraw",
+        "agent_files.pending_get",
+        "contract.get",
+        "contract.update",
         // Self-service account management (§1.6 帳號與密碼 ✅)
         "users.me",
         "users.change_password",

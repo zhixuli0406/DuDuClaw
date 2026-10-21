@@ -86,8 +86,13 @@ impl MethodHandler {
                 self.handle_agents_resume(params).await
             }
             "agents.update" => {
-                let _ = check_agent!(AccessLevel::Owner);
-                self.handle_agents_update_as(params, Some(ctx)).await
+                // First a quick check against the session; then (D7) the
+                // binding is re-read from users.db for the write itself.
+                let agent_id = check_agent!(AccessLevel::Owner);
+                match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Owner) {
+                    Ok(live) => Box::pin(self.handle_agents_update_live(params, &live, ctx)).await,
+                    Err(e) => WsFrame::error_response("", &e),
+                }
             }
             "agents.remove" => {
                 require_admin!();
@@ -152,12 +157,51 @@ impl MethodHandler {
 
             // ── Behavioral contract (per-agent CONTRACT.toml, CON.1–CON.3) ──
             "contract.get" => {
-                require_admin!();
+                let agent_id = check_agent!(AccessLevel::Viewer);
+                if let Err(e) = crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Viewer) {
+                    return WsFrame::error_response("", &e);
+                }
                 self.handle_contract_get(params).await
             }
+            // The employee's Owner or an admin; the whole strict check runs
+            // (loosening a boundary needs an admin's approval).
             "contract.update" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                Box::pin(self.handle_contract_update_live(params, ctx)).await
+            }
+
+            // ── Profile files (SOUL / IDENTITY / INSTRUCTIONS / CONTRACT,
+            //    agent.toml read-only). Every handler re-reads the caller
+            //    from users.db; the session check here is the quick first
+            //    filter only. ──
+            "agent_files.list" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                Box::pin(self.handle_agent_files_list(params, ctx)).await
+            }
+            "agent_files.get" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                Box::pin(self.handle_agent_files_get(params, ctx)).await
+            }
+            "agent_files.diff" => {
+                let _ = check_agent!(AccessLevel::Operator);
+                Box::pin(self.handle_agent_files_diff(params, ctx)).await
+            }
+            "agent_files.history" => {
+                let _ = check_agent!(AccessLevel::Operator);
+                Box::pin(self.handle_agent_files_history(params, ctx)).await
+            }
+            "agent_files.save" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                Box::pin(self.handle_agent_files_save(params, ctx)).await
+            }
+            "agent_files.rollback" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                Box::pin(self.handle_agent_files_rollback(params, ctx)).await
+            }
+            "agent_files.withdraw" => Box::pin(self.handle_agent_files_withdraw(params, ctx)).await,
+            "agent_files.pending_get" => {
                 require_admin!();
-                self.handle_contract_update(params).await
+                Box::pin(self.handle_agent_files_pending_get(params, ctx)).await
             }
 
             // ── Redaction / privacy (global config.toml [redaction], RED.1–RED.4) ──

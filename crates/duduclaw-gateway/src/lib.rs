@@ -351,6 +351,7 @@ pub mod session_titler_task;
 pub mod skill_approval;
 pub mod skill_gap_digest;
 pub mod skill_lifecycle;
+pub(crate) mod agent_files;
 pub mod slack;
 pub mod stt;
 pub mod task_spec;

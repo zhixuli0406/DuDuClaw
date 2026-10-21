@@ -867,7 +867,26 @@ impl MethodHandler {
         } else {
             Some(write_backup(&path, &stored, chrono::Utc::now().timestamp())?)
         };
-        {
+        if let RawFile::Agent(id) = &kind {
+            // agent.toml goes through the profile file writer (version kept
+            // outside the employee directory, `agent_file_changed` audit).
+            let text = new_text.clone();
+            crate::agent_files::writer::commit(
+                &self.registry,
+                crate::agent_files::writer::Commit {
+                    home: &self.home_dir,
+                    agent_id: id,
+                    key: crate::agent_files::FileKey::AgentToml,
+                    expected_hash: Some(&stored_hash),
+                    meta: crate::agent_files::writer::CommitMeta::new(&ctx.user_id, "config.raw"),
+                    baseline: crate::agent_files::writer::Baseline::Accept,
+                },
+                move |_| Ok(text),
+                || Ok(()),
+            )
+            .await
+            .map_err(|e| rctx.scrub(&e.message()))?;
+        } else {
             let (p, h, t) = (path.clone(), stored_hash.clone(), new_text.clone());
             tokio::task::spawn_blocking(move || commit_text_locked(&p, &h, &t))
                 .await

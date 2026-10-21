@@ -625,24 +625,42 @@ pub(crate) async fn handle_agent_update(
         let new_display_name = &config.agent.display_name;
         for fname in ["SOUL.md", "IDENTITY.md"] {
             let path = agent_dir.join(fname);
-            let content = match tokio::fs::read_to_string(&path).await {
-                Ok(c) => c,
-                Err(_) => continue, // file doesn't exist — nothing to sync
-            };
-            let (new_content, changed) =
-                duduclaw_core::rename_in_markdown(&content, &old_display_name, new_display_name);
-            if !changed {
-                continue;
+            if !path.exists() {
+                continue; // file doesn't exist — nothing to sync
             }
-            let tmp_path = path.with_extension("md.tmp");
-            if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
-                tracing::warn!(agent_id, file = fname, error = %e, "Failed to write identity-rename tmp file");
-                continue;
-            }
-            if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                tracing::warn!(agent_id, file = fname, error = %e, "Failed to commit identity-rename");
-                continue;
+            // Under the same cross-process lock the gateway's profile file
+            // writer takes, and the SOUL baseline follows only when the file
+            // was the approved version before the rename (a rename must not
+            // bless an out-of-band edit, nor leave a legitimate one drifted).
+            let synced = duduclaw_core::with_file_lock(&path, || {
+                let content = std::fs::read_to_string(&path)?;
+                let (new_content, changed) =
+                    duduclaw_core::rename_in_markdown(&content, &old_display_name, new_display_name);
+                if !changed {
+                    return Ok(false);
+                }
+                let pre_hash = duduclaw_security::soul_guard::hash_bytes(content.as_bytes());
+                let tmp_path = path.with_extension("md.tmp");
+                std::fs::write(&tmp_path, &new_content)?;
+                if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                if fname == "SOUL.md" {
+                    use duduclaw_security::soul_guard::{ProtectedDoc, accept_if_was_intact};
+                    if let Err(e) = accept_if_was_intact(ProtectedDoc::Soul, agent_id, &agent_dir, &pre_hash) {
+                        tracing::warn!(agent_id, error = %e, "SOUL baseline not updated after the rename sync");
+                    }
+                }
+                Ok(true)
+            });
+            match synced {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(agent_id, file = fname, error = %e, "Failed to commit identity-rename");
+                    continue;
+                }
             }
             soul_sync_changes.push(format!(
                 "{fname} self-name synced \"{old_display_name}\" -> \"{new_display_name}\""

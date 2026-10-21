@@ -23,6 +23,28 @@ impl MethodHandler {
         params: Value,
         caller: Option<&UserContext>,
     ) -> WsFrame {
+        self.agents_update_inner(params, caller, None).await
+    }
+
+    /// `agents.update` from the dashboard: `live` is the caller re-read from
+    /// `users.db` for this request (owner decision D7: bindings are checked
+    /// live, never from the session token), and `session` is re-checked the
+    /// same way inside the file lock right before the write.
+    pub(crate) async fn handle_agents_update_live(
+        &self,
+        params: Value,
+        live: &UserContext,
+        session: &UserContext,
+    ) -> WsFrame {
+        self.agents_update_inner(params, Some(live), Some(session)).await
+    }
+
+    async fn agents_update_inner(
+        &self,
+        params: Value,
+        caller: Option<&UserContext>,
+        session: Option<&UserContext>,
+    ) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
@@ -62,6 +84,40 @@ impl MethodHandler {
                 crate::db_source_grants::validate_capability_grants(&self.home_dir, raw).await
         {
             return WsFrame::error_response("", &msg);
+        }
+
+        // `role = "main"` is an authority change (`agent_authority`): refuse a
+        // non-admin BEFORE the current main is demoted below.
+        let caller_is_admin = caller.is_some_and(|c| c.is_admin());
+        if let Some(role) = params.get("role").and_then(|v| v.as_str())
+            && !caller_is_admin
+        {
+            let current_is_main = self
+                .registry
+                .read()
+                .await
+                .get(&agent_id)
+                .is_some_and(|a| a.config.agent.role == duduclaw_core::types::AgentRole::Main);
+            if (role == "main") != current_is_main {
+                crate::security_autopilot::audit_and_emit(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "agent_authority_refused",
+                        agent_id.as_str(),
+                        duduclaw_security::audit::Severity::Warning,
+                        json!({
+                            "agent_id": agent_id,
+                            "keys": ["agent.role"],
+                            "user_id": caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
+                            "source": "agents.update",
+                        }),
+                    ),
+                );
+                return WsFrame::error_response(
+                    "",
+                    "Only an administrator can change agent.role to or from \"main\" — ask an admin, or leave it as it is",
+                );
+            }
         }
 
         // If promoting to main, demote the current main agent first
@@ -151,7 +207,6 @@ impl MethodHandler {
         // admin; `agents.update` itself stays Owner-level so non-admin owners
         // keep every other field. `None` (no identity) is treated as
         // non-admin: fail closed.
-        let caller_is_admin = caller.is_some_and(|c| c.is_admin());
         let authority_changes: std::sync::Arc<
             std::sync::Mutex<Vec<super::system_update_config_v168::ProtectedChange>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -179,7 +234,7 @@ impl MethodHandler {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let align_skipped_for_closure = align_skipped.clone();
 
-        let result = self.update_agent_toml(&agent_id, move |table| {
+        let result = self.update_agent_toml_as(&agent_id, "agents.update", caller, session, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
             // check (only enforced when the file parsed before this write, so
             // an already-broken file can still be repaired through here).
@@ -940,6 +995,24 @@ impl MethodHandler {
             let authority = super::agents_update_v168::authority_diff(&table_before, table);
             if !authority.is_empty() && !caller_is_admin {
                 let keys: Vec<&str> = authority.iter().map(|c| c.key.as_str()).collect();
+                // The model↔provider auto-align above is what moved the
+                // runtime: say so, instead of naming a field the caller
+                // never sent.
+                let aligned = aligned_for_closure.lock().ok().and_then(|s| s.clone());
+                if let Some(rt) = aligned.filter(|_| keys.contains(&"runtime.provider")) {
+                    crate::security_autopilot::audit_and_emit(
+                        &home_for_update,
+                        &duduclaw_security::audit::AuditEvent::new(
+                            "agent_authority_refused",
+                            audit_agent_id.as_str(),
+                            duduclaw_security::audit::Severity::Warning,
+                            json!({ "agent_id": audit_agent_id, "keys": keys, "user_id": audit_user_id, "source": "agents.update" }),
+                        ),
+                    );
+                    return Err(format!(
+                        "This model runs on a different runtime (\"{rt}\"), and only an administrator can switch the runtime — ask an admin, or pick a model the current runtime supports"
+                    ));
+                }
                 crate::security_autopilot::audit_and_emit(
                     &home_for_update,
                     &duduclaw_security::audit::AuditEvent::new(
@@ -1031,38 +1104,27 @@ impl MethodHandler {
 
                 // WP: sync SOUL.md / IDENTITY.md self-introduction text to
                 // the new display_name (see comment above the capture site).
-                // Best-effort: a missing file is skipped, an IO error is
-                // logged but does not fail the already-committed agent.toml
-                // write.
+                // Through the profile file writer (lock, version, audit,
+                // registry rescan afterwards). The SOUL baseline follows only
+                // when the file was the approved version before the rename:
+                // a rename never blesses an out-of-band edit, and never
+                // leaves a legitimate file reported as drifted (P1).
+                // Best-effort: a failure is logged but does not fail the
+                // already-committed agent.toml write.
                 let mut soul_sync_changes: Vec<String> = Vec::new();
-                if let (Some(new_name), Some(old_name), Some(dir)) =
+                if let (Some(new_name), Some(old_name), Some(_)) =
                     (&new_display_name, &old_display_name, &agent_dir_for_rename)
                 {
                     if old_name != new_name && !old_name.is_empty() {
-                        for fname in ["SOUL.md", "IDENTITY.md"] {
-                            let path = dir.join(fname);
-                            let content = match tokio::fs::read_to_string(&path).await {
-                                Ok(c) => c,
-                                Err(_) => continue, // file doesn't exist — nothing to sync
-                            };
-                            let (new_content, changed) =
-                                duduclaw_core::rename_in_markdown(&content, old_name, new_name);
-                            if !changed {
-                                continue;
+                        for key in [crate::agent_files::FileKey::Soul, crate::agent_files::FileKey::Identity] {
+                            match self.sync_renamed_profile_file(&agent_id, key, old_name, new_name, caller).await {
+                                Ok(true) => soul_sync_changes.push(format!(
+                                    "{} self-name synced \"{old_name}\" -> \"{new_name}\"",
+                                    key.file_name()
+                                )),
+                                Ok(false) => {}
+                                Err(e) => warn!(agent_id = agent_id.as_str(), file = key.file_name(), error = %e, "Failed to sync the new name into a profile file"),
                             }
-                            let tmp_path = path.with_extension("md.tmp");
-                            if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
-                                warn!(agent_id = agent_id.as_str(), file = fname, error = %e, "Failed to write identity-rename tmp file");
-                                continue;
-                            }
-                            if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
-                                let _ = tokio::fs::remove_file(&tmp_path).await;
-                                warn!(agent_id = agent_id.as_str(), file = fname, error = %e, "Failed to commit identity-rename");
-                                continue;
-                            }
-                            soul_sync_changes.push(format!(
-                                "{fname} self-name synced \"{old_name}\" -> \"{new_name}\""
-                            ));
                         }
                     }
                 }
@@ -1120,13 +1182,50 @@ impl MethodHandler {
                         "message": if hot_reloaded {
                             "Agent updated successfully"
                         } else {
-                            "Agent updated successfully — registry hot reload deferred to next periodic sync (≤5min)"
+                            "已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務"
                         },
                     }),
                 )
             }
             Err(e) => WsFrame::error_response("", &e),
         }
+    }
+}
+
+impl MethodHandler {
+    /// Rename sync for one profile file through the writer (source
+    /// `rename`, no AI review). `Ok(false)` when the file is absent or the
+    /// old name does not appear.
+    async fn sync_renamed_profile_file(
+        &self,
+        agent_id: &str,
+        key: crate::agent_files::FileKey,
+        old_name: &str,
+        new_name: &str,
+        caller: Option<&UserContext>,
+    ) -> Result<bool, String> {
+        use crate::agent_files::writer::{Baseline, Commit, CommitMeta, commit};
+        let path = crate::agent_files::file_path(&self.home_dir, agent_id, key)?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let (old, new) = (old_name.to_string(), new_name.to_string());
+        let outcome = commit(
+            &self.registry,
+            Commit {
+                home: &self.home_dir,
+                agent_id,
+                key,
+                expected_hash: None,
+                meta: CommitMeta::new(caller.map(|c| c.user_id.as_str()).unwrap_or("system"), "rename"),
+                baseline: Baseline::AcceptIfWasIntact,
+            },
+            move |current| Ok(duduclaw_core::rename_in_markdown(current, &old, &new).0),
+            || Ok(()),
+        )
+        .await
+        .map_err(|e| e.message())?;
+        Ok(!outcome.unchanged)
     }
 }
 

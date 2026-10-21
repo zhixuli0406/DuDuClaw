@@ -64,47 +64,12 @@ impl MethodHandler {
         let mut resp = contract_table_to_response(&table);
         if let Some(obj) = resp.as_object_mut() {
             obj.insert("agent_id".into(), json!(agent_id));
+            // Send back as `base_hash` on `contract.update`.
+            let text = crate::agent_files::read_or_empty(&path).unwrap_or_default();
+            obj.insert("hash".into(), json!(crate::agent_files::hash_of(&text)));
         }
         WsFrame::ok_response("", resp)
     }
-
-    /// `contract.update` — atomic write of `agents/<id>/CONTRACT.toml`.
-    /// Params: `{ agent_id, must_not[], must_always[], max_tool_calls_per_turn }`.
-    /// Response: `{ success, agent_id, must_not[], must_always[], max_tool_calls_per_turn }`.
-    pub(crate) async fn handle_contract_update(&self, params: Value) -> WsFrame {
-        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
-        };
-        let dir = match self.resolve_agent_dir(&agent_id).await {
-            Ok(d) => d,
-            Err(e) => return WsFrame::error_response("", &e),
-        };
-        let table = match build_contract_table(&params) {
-            Ok(t) => t,
-            Err(e) => return WsFrame::error_response("", &e),
-        };
-        let path = dir.join("CONTRACT.toml");
-        if let Err(e) = self.atomic_write_toml(&path, &table).await {
-            return WsFrame::error_response("", &e);
-        }
-        info!(agent_id = agent_id.as_str(), "contract.update completed");
-        // The channel-side FYI — the boundary changed but only applies
-        // starting the agent's next turn (see the `message` field below), so
-        // mark it pending; the channel reply pipeline appends a one-line
-        // notice once, then clears it (`pending_agent_notice`).
-        crate::pending_agent_notice::mark_contract_changed(&self.home_dir, &agent_id);
-        let mut resp = contract_table_to_response(&table);
-        if let Some(obj) = resp.as_object_mut() {
-            obj.insert("success".into(), json!(true));
-            obj.insert("agent_id".into(), json!(agent_id));
-            // The contract is loaded per-invocation from disk by the agent
-            // runner, so the next turn picks up the new boundaries automatically.
-            obj.insert(
-                "message".into(),
-                json!("Contract updated — applies on the agent's next turn"),
-            );
-        }
-        WsFrame::ok_response("", resp)
-    }
+    // `contract.update` lives in `agent_files_rpc.rs` (the profile file writer
+    // and the strict check).
 }
