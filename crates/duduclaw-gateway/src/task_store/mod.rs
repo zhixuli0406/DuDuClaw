@@ -58,6 +58,7 @@ mod schema;
 mod steering;
 mod stop;
 mod tasks;
+mod team_counts;
 
 #[cfg(test)]
 mod tests;

@@ -125,6 +125,7 @@ mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
 mod users_org;
+mod team_rpc;
 pub(crate) mod live_context;
 mod marketplace_rpc;
 mod mcp_manifest;

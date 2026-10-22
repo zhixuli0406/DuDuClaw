@@ -96,6 +96,12 @@ impl MethodHandler {
                 require_manager!();
                 self.handle_users_subordinates(ctx).await
             }
+            // 我的團隊: the caller's reporting tree and the employees they may
+            // call through it. Enterprise-only through the `users` family gate.
+            "users.my_team" => {
+                require_manager!();
+                self.handle_users_my_team(ctx).await
+            }
             // ── Departments (org structure for agent create/edit) ──
             "departments.list" => {
                 require_manager!();

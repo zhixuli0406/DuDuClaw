@@ -20,6 +20,7 @@ fn enterprise_surfaces_are_listed() {
         "users.unbind_agent",
         "users.offboard",
         "users.subordinates",
+        "users.my_team",
         "users.audit_log",
         // 部門
         "departments.list",

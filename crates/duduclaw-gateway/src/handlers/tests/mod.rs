@@ -12,6 +12,7 @@ mod must_change_password_gate_tests;
 mod users_change_email_tests;
 mod live_acl_tests;
 mod team_callable_rpc_tests;
+mod team_rpc_tests;
 mod data_file_guard_field_tests;
 mod evolution_v3_dashboard_tests;
 mod goal_task_settle_verb_tests;
