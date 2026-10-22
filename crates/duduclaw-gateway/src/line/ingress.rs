@@ -7,6 +7,7 @@
 use super::*;
 
 mod delivery;
+mod merge;
 mod revision;
 mod upkeep;
 mod worker;
@@ -111,6 +112,8 @@ mod durable_ingress_tests;
 mod f2_tests;
 #[cfg(test)]
 mod f5_tests;
+#[cfg(test)]
+mod merge_e2e_tests;
 #[cfg(test)]
 mod native_fastlane_tests;
 

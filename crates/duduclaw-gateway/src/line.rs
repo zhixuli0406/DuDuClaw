@@ -32,11 +32,35 @@ use ingress::{drain_line_ingress, line_conversation, record_reply_failure};
 
 const LINE_API: &str = "https://api.line.me/v2/bot";
 fn line_provider_url(_token: &str, path: &str) -> String {
-    let url = format!("{LINE_API}{path}");
+    let url = format!("{}{path}", line_api_base());
     #[cfg(test)]
     return crate::test_channel_provider::url(_token, &url);
     #[cfg(not(test))]
     url
+}
+
+/// The Messaging API base for replies and pushes. Debug builds only:
+/// `DUDUCLAW_LINE_API_BASE` may point it at a local fake LINE API (loopback
+/// `http://127.0.0.1:<port>` / `http://localhost:<port>` only) for live
+/// tests; release builds always use the real API.
+fn line_api_base() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(base) = std::env::var("DUDUCLAW_LINE_API_BASE")
+        .ok()
+        .and_then(|b| debug_loopback_base(&b))
+    {
+        return base;
+    }
+    LINE_API.to_string()
+}
+
+/// `base` + `/v2/bot` when `base` is a plain loopback http origin.
+#[cfg(debug_assertions)]
+fn debug_loopback_base(base: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base.trim()).ok()?;
+    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost"));
+    (url.scheme() == "http" && loopback && url.path() == "/")
+        .then(|| format!("{}/v2/bot", base.trim().trim_end_matches('/')))
 }
 
 type HmacSha256 = Hmac<Sha256>;

@@ -85,6 +85,7 @@ LINE Messaging API 文件寫明：reply token 只能用一次，而且要在收�
 | `uncertain` | 回合可能已執行，沒有送達回執（處理中行程消失、送出時連線中斷） | 是 | `close`、`rerun` |
 | `quarantined` | 路由／授權已變、多次讀不到設定或快照、payload 過期，或從備份還原 | 是 | `close`；原因為 `revalidation_unavailable` 或 `snapshot_unavailable` 時另可 `retry`，為 `restored_from_backup` 時另可 `rerun` |
 | `closed` | 管理者已結案，或保存期限到後由系統結案（`retention_closed`） | 否 | |
+| `merged` | 和同對話前一則訊息在同一個回合一起回覆（見下方「連續傳的訊息一起回覆」）；內容已併入那一則 | 否 | （處理那一則即可） |
 
 收件匣在 v1.69 之前沒有出貨過。預覽版建立的資料庫升級時：`failed` 改成 `undelivered`（那些事件都已執行過）；用舊格式快照保存的 `ready` 事件升級後會被隔離成 `account_route_authorization_changed`，只能結案。
 
@@ -140,7 +141,9 @@ v1.70.0 之後的版本起，所有操作者指令共用同一套核准規則（
 
 ## 操作者該知道的事
 
-**順序規則。** 同一個帳號、同一個對話裡，一則一般訊息只要前面還有處於 `ready`、`claimed`、`dispatching`、`uncertain` 或 `quarantined` 的訊息，就會等著不處理（退避中的 `ready` 也算）。`completed`、`closed`、`undelivered`、`failed_before_dispatch` 不擋後面的訊息，所以一則訊息變成 `undelivered` 或 `failed_before_dispatch` 之後，同對話後面的訊息會繼續處理。`retry`／`rerun` 會讓事件以原本的收件順序回到 `ready`：它排在同對話所有還沒開始的訊息前面，但已經處理完的後續訊息不會重來，因此重新執行的回覆可能比後面訊息的回覆晚到。`uncertain` 和 `quarantined` 期間後面的訊息都在等，對這兩種事件 `rerun`／`retry` 後順序仍然正確；決策快線（核准、拒絕、回答）不排隊也不擋人，不同對話互不影響。
+**順序規則。** 同一個帳號、同一個對話裡，一則一般訊息只要前面還有處於 `ready`、`claimed`、`dispatching`、`uncertain` 或 `quarantined` 的訊息，就會等著不處理（退避中的 `ready` 也算）。`completed`、`closed`、`merged`、`undelivered`、`failed_before_dispatch` 不擋後面的訊息，所以一則訊息變成 `undelivered` 或 `failed_before_dispatch` 之後，同對話後面的訊息會繼續處理。`retry`／`rerun` 會讓事件以原本的收件順序回到 `ready`：它排在同對話所有還沒開始的訊息前面，但已經處理完的後續訊息不會重來，因此重新執行的回覆可能比後面訊息的回覆晚到。`uncertain` 和 `quarantined` 期間後面的訊息都在等，對這兩種事件 `rerun`／`retry` 後順序仍然正確；決策快線（核准、拒絕、回答）不排隊也不擋人，不同對話互不影響。
+
+**連續傳的訊息一起回覆。** 一對一聊天裡，使用者在上一則還沒回覆完時又傳了幾則，這些訊息會在下一個回合一起回答，不再一則一則各跑一個回合。以前第三、四則常常排到 reply token 的一分鐘期限之後，只能改用 Push；Push 用的是官方帳號的訊息額度，免費或輕用量方案用完後 LINE 回 429，那幾則就收不到回覆。現在回合開始時，排在它後面、仍在 `ready` 的訊息會併進來（連同它自己最多 5 則），模型收到的是依序編號的全部訊息，加上一行「使用者在收到回覆前連續傳了 N 則訊息，請一次回覆每一則」，回覆用最新那則的 reply token 送出。併進來的訊息狀態變成 `merged`（不擋後面的訊息，也不需要人工處理），內容搬進領頭那則的 payload（`merged` 陣列），所以領頭那則若被 `retry`／`rerun`，全部訊息會一起重跑。只合併這種訊息：一對一聊天的純文字、不是聊天命令、沒有 `@`、不是引用回覆、不是重送的 webhook，而且路由與授權快照和領頭那則完全相同；遇到第一則不符合的就停，順序不會亂。群組、聊天室、圖片與檔案照舊一則一則處理。決策快線不受影響。
 
 **從備份還原。** 裝置備份（`device.backup_create`、排程備份、`duduclaw export`）都會把 `channel_ingress.db` 一起打包。原裝置在備份之後可能已經處理過其中排隊中的訊息，所以裝置還原（`device.backup_restore`）**在搬動任何資料之前**先寫一個一次性標記；標記寫不進去，還原就中止並說明原因，資料不會換入。閘道下次開啟收件匣時，在任何 worker 取件之前，把備份當時處於 `ready`、`claimed`、`failed_before_dispatch`，或因可重試的原因（`revalidation_unavailable`、`snapshot_unavailable`）處於 `quarantined` 的事件全部改成 `quarantined`（原因 `restored_from_backup`），然後刪掉標記。這些事件在這台機器上從未執行過，但可能已在原裝置處理或重試過，所以不能用 `retry`，只能結案，或確認重複風險後 `rerun`。暫停時會寫一筆 Activity Feed（`channel_ingress_restored_held`）並通知管理者，告訴你暫停了幾則。備份當時處於 `dispatching` 的事件會變成 `uncertain`，同樣不會自動重跑。用 `duduclaw export` 打包、再手動解壓到新機器的做法不會留下標記，這種情況請先停用 LINE（`line_enabled = false`），檢查後再開啟。
 
@@ -154,7 +157,7 @@ v1.70.0 之後的版本起，所有操作者指令共用同一套核准規則（
 
 原始單一事件 JSON（含 reply token）存在獨立的 `ingress_payload` 表，最多保存 24 小時；事件 `completed` 或被 `close` 時立即刪除。仍在等待的事件 payload 過期後改成 `quarantined`（`payload_retention_expired`），只能結案。`undelivered` 與 `failed_before_dispatch` 事件的 payload 同樣 24 小時後刪除，之後就不能 `retry` 或 `rerun`，只能結案。
 
-已結束（`completed`、`closed`）的事件，連同嘗試、回執、重新授權與人工處理紀錄，在 `retention_days`（預設 90 天）後刪除。`undelivered` 與 `failed_before_dispatch` 不擋任何訊息，超過 `retention_days` 後由系統結案（原因 `retention_closed`）並一起刪除。LINE 的重送發生在數小時內，90 天後刪除不影響去重。會擋住對話的 `uncertain` 與 `quarantined` 不會自動刪除。資料庫＋WAL 超過 `capacity_alert_mb` 時每天告警一次。容量用盡時來源得到 503，不會刪除仍需去重的紀錄。
+已結束（`completed`、`closed`、`merged`）的事件，連同嘗試、回執、重新授權與人工處理紀錄，在 `retention_days`（預設 90 天）後刪除。`undelivered` 與 `failed_before_dispatch` 不擋任何訊息，超過 `retention_days` 後由系統結案（原因 `retention_closed`）並一起刪除。LINE 的重送發生在數小時內，90 天後刪除不影響去重。會擋住對話的 `uncertain` 與 `quarantined` 不會自動刪除。資料庫＋WAL 超過 `capacity_alert_mb` 時每天告警一次。容量用盡時來源得到 503，不會刪除仍需去重的紀錄。
 
 資料庫檔權限為 0600；開啟時拒絕符號連結，且不會對既有資料庫檔做「開啟再關閉」（那會讓本行程在該檔的 POSIX 鎖失效）。SQLite `secure_delete` 與 WAL checkpoint 清除 live database 中已刪內容，不承諾刪除備份或外部副本。
 
