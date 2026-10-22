@@ -96,6 +96,19 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 
 **Permission flags are enforced (behaviour change).** `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` had no reader before. Since v1.68.0 a flag written as `false` blocks the matching tools at the MCP dispatch gate (`create_agent`; `send_to_agent`, `spawn_agent`; `create_reminder`, `tasks_create` with a `schedule`; `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording`); an absent or wrongly typed flag allows. Older templates often wrote these flags as `false`, so the first boot after the upgrade migrates every employee once: in a `[permissions]` table without the marker `permissions_enforced_since`, each of the four flags that is `false` becomes `true` and `permissions_enforced_since = "1.68.0"` is added; each reset writes the audit event `permission_flags_reset`. A `false` written afterwards on this page or in the Advanced config editor counts as an operator decision. Ephemeral role members (`agents/.ephemeral/`) are not migrated and keep least privilege.
 
+## Thinking display
+
+No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.
+
+| File | Key | Values |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary` (default: timer, tokens and masked thinking text in WebChat), `status` (timer and tokens only), `off` (no thinking frames; WebChat still shows its own timer) |
+| `config.toml` | `[thinking] max_chars` | thinking text per turn, default 4000, clamped to 200–20000 |
+| `config.toml` | `[thinking] anthropic_display` | `summarized` (default) or `updates` (beta, only some Claude models) |
+| `agent.toml` | `[model] show_thinking` | `summary` / `status` / `off`; unset follows `[thinking] display`. The stricter of the two wins |
+
+A `config.toml` that cannot be read or parsed, or an unknown `display` value, counts as `status`. Only signed-in dashboard users in WebChat can see thinking text; messaging apps never do. Details: [Thinking display](../features/64-thinking-display.md).
+
 ## Advanced config editor
 
 Location: Settings → Advanced → Advanced config editor. Admins only; RPCs `config.raw.get` / `config.raw.set`.
@@ -103,7 +116,7 @@ Location: Settings → Advanced → Advanced config editor. Admins only; RPCs `c
 - **Files:** system settings (`config.toml`), inference settings (`inference.toml`) and each AI employee's `agent.toml` (a real directory under `agents/`, no symbolic links).
 - **Secret masking:** values whose key ends in `_enc`, is `key` or ends in `_key`, or contains token, secret, password, passwd, api_key, apikey, widget_key, private_key, credential or service_account_json, every value in `headers`, `otlp_headers` and `env` tables, and URLs carrying a password are shown as `«set»`. Leaving `«set»` in place keeps the stored value; `«set»` where nothing is stored is refused. `[mcp_keys]` is not shown at all.
 - **Validation:** TOML syntax first, with the line and column of an error; then the typed check (the section validators for `config.toml`, `InferenceConfig`, `AgentConfig`). Nothing is written on failure. An employee's `[agent] name` cannot be changed here.
-- **Document knowledge base:** `[knowledge]` has no page yet (the dashboard pages come in a later release); its keys (`enabled`, `max_source_bytes`, `max_source_chars`, `max_sources_per_collection`, `max_collections`, `max_chunks_total`, `extract_timeout_secs`, `extract_memory_mb`, `access_log_retention_days`, `max_collection_bytes`, `max_total_bytes`, `extract_when_unavailable` = `refuse` / `run_unsandboxed`, `auto_retrieve`, `inject_budget_chars_max`) are type-checked here. An employee's `[knowledge]` section (`collections`, `auto_retrieve`, `answer_mode` = `assist` / `kb_only`, `top_k`, `inject_budget_chars`) is edited in that employee's `agent.toml`. See [the knowledge base page](../features/63-knowledge-base.md#settings-configtoml).
+- **Document knowledge base:** collections, documents, sharing and the access record are managed under Company → Document library in the sidebar; the global `[knowledge]` limits have no page yet, and their keys (`enabled`, `max_source_bytes`, `max_source_chars`, `max_sources_per_collection`, `max_collections`, `max_chunks_total`, `extract_timeout_secs`, `extract_memory_mb`, `access_log_retention_days`, `max_collection_bytes`, `max_total_bytes`, `extract_when_unavailable` = `refuse` / `run_unsandboxed`, `auto_retrieve`, `inject_budget_chars_max`) are type-checked here. An employee's `[knowledge] collections` is set under Agents → Edit Settings → Tools & permissions → Document library (only collections shared with it can be picked), or directly in that employee's `agent.toml`, which also holds the reply keys `auto_retrieve`, `answer_mode` = `assist` / `kb_only`, `top_k` and `inject_budget_chars`. See [the knowledge base page](../features/63-knowledge-base.md#settings-configtoml).
 - **Conflicts:** opening a file returns a hash of its content, which the save sends back. If the file changed in between, the save is refused; reload and edit again.
 - **Backup:** before writing, the file is copied to `<file>.bak-<unix time>` (mode 0600); the newest five are kept.
 - **Audit:** every write records `config_raw_edited`, at Warning level when it touches `[delegation]`, `[acp]`, or an employee's `[agent]`, `[capabilities]`, `sandbox_enabled`, `network_access` or `can_modify_own_soul`.

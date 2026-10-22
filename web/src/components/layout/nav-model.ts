@@ -52,6 +52,7 @@ import {
   Bot,
   GitBranch,
   Database,
+  Library,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -364,6 +365,13 @@ export const navGroups: NavGroup[] = [
       // surfaces in two different orders.
       { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
       { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc', ownScope: true },
+      // 文件知識庫 (document knowledge base, 1.76.0) — shared collections of
+      // uploaded documents that AI employees answer from. Right after 記憶,
+      // its closest neighbour. No `minRole`: every collection is filtered by
+      // its own grants server-side, so a person with nothing shared simply
+      // sees an empty list. The old `/knowledge` route still lands on the
+      // wiki tab of 記憶 (App.tsx) — this page lives at `/knowledge-base`.
+      { to: '/knowledge-base', icon: Library, label: 'nav.knowledgeBase', desc: 'nav.knowledgeBase.desc', newIn: '1.76.0' },
       staffEntry,
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
       // 成長 lifted above the occasional rows (WP-NAV, 2026-08-12): the matrix
@@ -464,6 +472,9 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   '/foresight',
   '/skills',
   '/memory',
+  // 文件知識庫 (1.76.0) — same slot as the Enterprise 公司 group: right after
+  // 記憶. Registered here too because the Personal rail is its own list.
+  '/knowledge-base',
   // AI 員工 back on the primary rail for Personal too (2026-08-04, D11).
   '/agents',
   '/world',

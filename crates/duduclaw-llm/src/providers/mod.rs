@@ -10,6 +10,7 @@
 //! | `openai_compat` | legacy chat/completions    | real SSE              |
 
 pub mod anthropic;
+pub mod anthropic_thinking;
 pub mod gemini;
 pub mod openai;
 pub mod openai_compat;

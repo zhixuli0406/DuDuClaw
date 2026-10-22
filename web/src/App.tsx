@@ -33,6 +33,8 @@ const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'Skill
 const ExpertsPage = lazyPage(() => import('./pages/ExpertsPage'), 'ExpertsPage');
 const GalleryPage = lazyPage(() => import('./pages/GalleryPage'), 'GalleryPage');
 const MailPage = lazyPage(() => import('./pages/MailPage'), 'MailPage');
+const KnowledgeBasePage = lazyPage(() => import('./pages/KnowledgeBasePage'), 'KnowledgeBasePage');
+const CollectionDetailPage = lazyPage(() => import('./pages/knowledge/CollectionDetailPage'), 'CollectionDetailPage');
 const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
 const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
@@ -297,6 +299,10 @@ export function App() {
                   (bookmarks, the guided tour, docs) land on the knowledge tab
                   instead of a dead route. */}
               <Route path="knowledge" element={<Navigate to="/memory?tab=wiki" replace />} />
+              {/* 文件知識庫 (1.76.0) — shared document collections. Open to every
+                  signed-in role: each collection is filtered by its own grants. */}
+              <Route path="knowledge-base" element={<KnowledgeBasePage />} />
+              <Route path="knowledge-base/:id" element={<CollectionDetailPage />} />
               {/* 關於 — open to every authenticated user (all instances). */}
               <Route path="about" element={<AboutPage />} />
               {/* N-1 launcher (§2 L3 + §5 WP N-1) — app grid, open to every

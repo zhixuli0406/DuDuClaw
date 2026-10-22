@@ -4,7 +4,7 @@ import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
 import { CitedText, CitationSourceList } from './CitationChips';
-import { CitationPassageDrawer } from './CitationPassageDrawer';
+import { PassageDrawer } from '@/components/knowledge/PassageDrawer';
 
 /** A single chat turn rendered as a left/right-aligned bubble (Multica plain
  *  style, spec §5.6): the user's turn sits right on `bg-secondary`, the
@@ -26,7 +26,7 @@ export function MessageBubble({
   const isSystem = message.role === 'system';
   const citations = !isUser && !isSystem ? message.citations : undefined;
   const hasCitations = !!citations && citations.length > 0;
-  const [open, setOpen] = useState<{ chunkId: number; trigger: HTMLElement | null } | null>(null);
+  const [openChunk, setOpenChunk] = useState<number | null>(null);
 
   return (
     <div className={cn('flex w-full items-end gap-2', isUser ? 'justify-end' : 'justify-start')}>
@@ -57,7 +57,7 @@ export function MessageBubble({
                 <CitedText
                   text={message.content}
                   citations={citations}
-                  onOpen={(chunkId, trigger) => setOpen({ chunkId, trigger })}
+                  onOpen={(chunkId) => setOpenChunk(chunkId)}
                 />
               ) : (
                 message.content
@@ -68,20 +68,16 @@ export function MessageBubble({
         {hasCitations && (
           <CitationSourceList
             citations={citations}
-            onOpen={(chunkId, trigger) => setOpen({ chunkId, trigger })}
+            onOpen={(chunkId) => setOpenChunk(chunkId)}
           />
         )}
         {message.tokens != null && message.tokens > 0 && (
           <div className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">{message.tokens} tokens</div>
         )}
       </div>
-      {open && (
-        <CitationPassageDrawer
-          chunkId={open.chunkId}
-          returnFocusTo={open.trigger}
-          onClose={() => setOpen(null)}
-        />
-      )}
+      {/* The document library's passage drawer: permissions are re-checked
+          by the gateway on every open; the sheet returns focus on close. */}
+      {hasCitations && <PassageDrawer chunkId={openChunk} onClose={() => setOpenChunk(null)} />}
     </div>
   );
 }

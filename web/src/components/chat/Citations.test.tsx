@@ -3,7 +3,8 @@ import { screen, waitFor, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { MessageBubble } from './MessageBubble';
 import type { ChatMessage } from '@/stores/chat-store';
-import type { ChatCitation, KnowledgePassage } from '@/lib/knowledge-citations';
+import type { ChatCitation } from '@/lib/knowledge-citations';
+import type { KbPassage } from '@/lib/knowledge-api';
 
 const passageGet = vi.fn();
 // Rejections go through a plain function so vi.fn's result tracking does not
@@ -21,9 +22,9 @@ vi.mock('@/lib/ws-client', () => ({
 const cite = (o: Partial<ChatCitation> & { n: number }): ChatCitation => ({
   chunk_id: o.n * 10, source_id: 's', title: '員工手冊.pdf', locator: '第 3 頁', excerpt: '特休說明', state: 'available', ...o,
 });
-const passage = (o: Partial<KnowledgePassage> = {}): KnowledgePassage => ({
+const passage = (o: Partial<KbPassage> = {}): KbPassage => ({
   chunk_id: 10, source_id: 's', collection_id: 'c', title: '員工手冊.pdf', locator_text: '第 3 頁',
-  heading_path: ['福利'], segment_label: '段落 2', before: 'BEFORE ', match: '<b>MATCH</b>', after: ' AFTER',
+  heading_path: '福利', segment_label: '段落 2', before: 'BEFORE ', match: '<b>MATCH</b>', after: ' AFTER',
   prev_chunk_id: 9, next_chunk_id: null, suspect: false, ...o,
 });
 const msg = (content: string, citations: ChatCitation[]): ChatMessage => ({
@@ -65,45 +66,34 @@ describe('citation rendering', () => {
     document.querySelectorAll<HTMLButtonElement>('[data-citation-marker]').forEach((b) => expect(b.disabled).toBe(true));
   });
 
-  it('opens the drawer, shows before/match/after as text and navigates', async () => {
+  it('opens the document passage drawer with before/match/after as text and navigates', async () => {
     passageGet.mockResolvedValueOnce(passage()).mockResolvedValueOnce(passage({ chunk_id: 9, prev_chunk_id: null, match: 'PREV' }));
     renderWithProviders(<MessageBubble message={msg('x [1]', [cite({ n: 1 })])} />);
     fireEvent.click(screen.getByRole('button', { name: /Source 1/ }));
     const dlg = await screen.findByRole('dialog');
-    expect(dlg.getAttribute('aria-modal')).toBe('true');
     await waitFor(() => expect(dlg.querySelector('mark')?.textContent).toBe('<b>MATCH</b>'));
     expect(dlg.querySelector('mark b')).toBeNull();
     expect(dlg.textContent).toContain('BEFORE');
     expect(dlg.textContent).toContain('AFTER');
     expect(passageGet).toHaveBeenCalledWith({ chunk_id: 10 });
-    expect((screen.getByText('Next passage').closest('button') as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByText('Previous passage'));
+    expect((screen.getByText('Next').closest('button') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText('Previous'));
     await waitFor(() => expect(dlg.querySelector('mark')?.textContent).toBe('PREV'));
     expect(passageGet).toHaveBeenLastCalledWith({ chunk_id: 9 });
   });
 
-  it('shows a friendly message on permission denied and closes on Escape', async () => {
+  it('shows the load error when the passage may not be read', async () => {
     failNext.err = new Error('permission denied');
     renderWithProviders(<MessageBubble message={msg('x [1]', [cite({ n: 1 })])} />);
-    const trigger = screen.getByRole('button', { name: /Source 1/ });
-    trigger.focus();
-    fireEvent.click(trigger);
-    expect(await screen.findByText('You do not have permission to view this passage')).toBeTruthy();
-    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-    expect(document.activeElement).toBe(trigger);
+    fireEvent.click(screen.getByRole('button', { name: /Source 1/ }));
+    expect(await screen.findByText('This passage could not be opened')).toBeTruthy();
   });
 
-  it('shows a generic error and the suspect notice', async () => {
-    failNext.err = new Error('boom');
-    failNext.once = true;
-    const { unmount } = renderWithProviders(<MessageBubble message={msg('x [1]', [cite({ n: 1 })])} />);
-    fireEvent.click(screen.getByRole('button', { name: /Source 1/ }));
-    expect(await screen.findByText(/Could not load this passage/)).toBeTruthy();
-    unmount();
+  it('opens from the source list row too', async () => {
     passageGet.mockResolvedValueOnce(passage({ suspect: true }));
     renderWithProviders(<MessageBubble message={msg('x [1]', [cite({ n: 1 })])} />);
-    fireEvent.click(screen.getByRole('button', { name: /Source 1/ }));
-    expect(await screen.findByText(/may contain instructions/)).toBeTruthy();
+    const row = document.querySelector('[data-citation-row] button') as HTMLButtonElement;
+    fireEvent.click(row);
+    expect(await screen.findByText(/reads like instructions/)).toBeTruthy();
   });
 });

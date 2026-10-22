@@ -658,11 +658,9 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
             .unwrap_or_else(std::time::Instant::now),
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        if matches!(
-            event,
-            crate::channel_reply::ProgressEvent::Step { .. }
-                | crate::channel_reply::ProgressEvent::ModelInfo { .. }
-        ) {
+        // Allowlist: dashboard-only events (Step / ModelInfo / Thinking) never
+        // reach the channel — and never consume the progress throttle.
+        if !forwards_progress(&event) {
             return;
         }
         let is_todo = matches!(
@@ -1243,4 +1241,11 @@ mod tests {
             "a removed credential set must read as unconfigured on the very next call"
         );
     }
+}
+
+/// Progress-callback filter: only events a text channel can render
+/// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would
+/// otherwise reach the customer as an empty or unintended message).
+pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
+    event.is_channel_text()
 }

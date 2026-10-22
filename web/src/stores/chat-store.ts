@@ -4,9 +4,22 @@ import type { VisemeShape } from '@/components/mascot';
 import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
 import { effectiveName } from '@/lib/product-identity';
-import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
+import type { ChatArtifact } from '@/components/console/artifact-types';
 import { mentionErrorText } from '@/lib/mention';
 import { attachHistoryCitations, parseChatCitations, type ChatCitation, type SessionCitationRow } from '@/lib/knowledge-citations';
+import {
+  applyThinking,
+  finishTurnThinking,
+  parseThinkingDoneMeta,
+  startTurnThinking,
+  type ThinkingFrame,
+  type TurnThinking,
+} from './chat-thinking';
+
+import { IN_TURN_FRAME_TYPES, parseChatArtifact, shouldRenderFrame } from './chat-frames';
+
+export * from './chat-thinking';
+export * from './chat-frames';
 
 export interface ChatAttachmentMeta {
   readonly name: string;
@@ -25,7 +38,7 @@ export interface ChatMessage {
    * A structured result/confirmation card (O-3) an assistant reply carries
    * alongside its plain text — see `@/components/console/artifact-types.ts`
    * for the full contract. Populated from `assistant_done`'s optional
-   * `artifact` field (validated by `parseChatArtifact` below) when the
+   * `artifact` field (validated by `parseChatArtifact` in `chat-frames.ts`) when the
    * backend's O-4 pending-op marker maps to one (`confirm_action` for a
    * pending restart/shutdown/factory-reset, `update_confirm` for a pending
    * `os_apply_update` — see `os_operator::marker_to_artifact` on the
@@ -46,6 +59,9 @@ export interface ChatMessage {
   readonly agentId?: string;
   /** That staff member's display name (`assistant_done.agent_name`). */
   readonly agentName?: string;
+  /** The turn's thinking (wall time, tokens, masked blocks) — in memory only,
+   *  never part of the stored history. */
+  readonly thinking?: TurnThinking;
 }
 
 /** A file selected for upload, already read into base64. */
@@ -156,6 +172,9 @@ interface ChatStore {
   readonly steps: readonly ChatStep[];
   /** Live tool step tree for the current turn (folded from `step` frames). */
   readonly stepTree: readonly StepNode[];
+  /** The current turn's thinking, from send until its reply lands (then it
+   *  moves onto that assistant message). Null between turns. */
+  readonly thinking: TurnThinking | null;
   readonly isStreaming: boolean;
   /** Fine-grained turn phase for the companion face (thinking/speaking/…). */
   readonly phase: ChatPhase;
@@ -349,62 +368,6 @@ export function isResumeNotFound(message: string | null | undefined): boolean {
   return /conversation not found/i.test(String(message ?? ''));
 }
 
-/**
- * Decide whether a reply frame belongs to the conversation currently open, so a
- * long task started in conversation A doesn't render into a conversation B the
- * user switched to while it ran. Pure — exported for tests.
- *
- *  - An untagged frame (`conv` absent — legacy gateway) is always accepted.
- *  - A tagged frame is accepted only when its `conv` equals `currentConvId`;
- *    otherwise it belongs to another conversation and is dropped from the view
- *    (the gateway has already persisted it to that conversation's own history).
- */
-export function frameBelongsToConversation(frameConv: unknown, currentConvId: string): boolean {
-  if (typeof frameConv !== 'string' || frameConv.length === 0) return true;
-  return frameConv === currentConvId;
-}
-
-/** Every `ChatArtifactType` enumerated as a runtime value — `artifact-types.ts`
- *  is intentionally a pure type module with zero runtime code (see its own
- *  doc comment), so the guard below needs its own copy. Keep in sync by hand;
- *  `ChatArtifactCard`'s exhaustive switch (a `never` compile check) still
- *  catches a genuinely new artifact type being added without this list being
- *  updated — it just fails at the render call site instead of here. */
-const KNOWN_ARTIFACT_TYPES: ReadonlySet<ChatArtifactType> = new Set([
-  'device_status',
-  'update_status',
-  'backup_result',
-  'network_info',
-  'confirm_action',
-  'update_confirm',
-  'approval_request',
-  'wifi_password_request',
-]);
-
-/**
- * O-4→O-3 wiring: type guard for `assistant_done`'s optional `artifact`
- * field. The gateway sends a plain JSON value (see `webchat.rs`'s
- * `ChatMessage::AssistantDone.artifact` doc comment) — this validates it into
- * a real `ChatArtifact` before it ever reaches state, so an unknown `type` or
- * a missing/malformed `payload` (an older/newer gateway build, a hand-crafted
- * frame) degrades to "no card" instead of rendering garbage or throwing.
- * Deliberately shallow: it checks `type` is one of the known artifact types
- * and `payload` is present as an object, then trusts the rest — each card
- * component in `@/components/console` already renders defensively against
- * partially-missing nested fields (the same trust boundary O-3's own fixtures
- * exercise). Pure — exported for tests.
- */
-export function parseChatArtifact(raw: unknown): ChatArtifact | undefined {
-  if (raw === null || typeof raw !== 'object') return undefined;
-  const type = (raw as { type?: unknown }).type;
-  if (typeof type !== 'string' || !KNOWN_ARTIFACT_TYPES.has(type as ChatArtifactType)) {
-    return undefined;
-  }
-  const payload = (raw as { payload?: unknown }).payload;
-  if (payload === null || typeof payload !== 'object') return undefined;
-  return raw as ChatArtifact;
-}
-
 // Module-level WebSocket reference — kept outside Zustand to avoid
 // serialization issues and enable reconnection logic.
 let wsRef: WebSocket | null = null;
@@ -482,30 +445,20 @@ export const useChatStore = create<ChatStore>((set, get) => {
         // list so the conversation becomes resumable right away.
         if (data.type === 'assistant_done') {
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
-        } else if (
-          awaitingFirstServerFrame &&
-          (data.type === 'assistant_chunk' ||
-            data.type === 'step' ||
-            data.type === 'progress')
-        ) {
+        } else if (awaitingFirstServerFrame && IN_TURN_FRAME_TYPES.has(data.type)) {
           // First server frame after a send: the user message is now
           // persisted server-side — refresh the list once (persistence-
           // confirmed complement to the optimistic bump in `send`).
           awaitingFirstServerFrame = false;
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
         }
-        // Attribution guard: drop reply frames (chunk/step/progress/done) that
-        // belong to a conversation the user has since left. `session_info` and
-        // `error` are connection-level (untagged) and pass through. Without this,
-        // a long task from conversation A would render into conversation B when it
-        // finishes after the user opened B — the reported bug.
-        if (
-          (data.type === 'assistant_chunk' ||
-            data.type === 'step' ||
-            data.type === 'progress' ||
-            data.type === 'assistant_done') &&
-          !frameBelongsToConversation(data.conv, get().convId)
-        ) {
+        // Attribution guard: drop reply frames (chunk/step/progress/thinking/
+        // done) that belong to a conversation the user has since left.
+        // `session_info` and `error` are connection-level (untagged) and pass
+        // through. Without this, a long task from conversation A would render
+        // into conversation B when it finishes after the user opened B — the
+        // reported bug.
+        if (!shouldRenderFrame(data.type, data.conv, get().convId)) {
           return;
         }
         switch (data.type) {
@@ -595,6 +548,15 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }));
             break;
 
+          case 'thinking':
+            // Already masked and truncated by the gateway; `applyThinking`
+            // validates every field. Only folded while a turn is open — a
+            // straggler after the reply has nowhere to go.
+            set((state) =>
+              state.thinking ? { thinking: applyThinking(state.thinking, data as ThinkingFrame) } : {},
+            );
+            break;
+
           case 'progress': {
             // Live task-board insights. Keepalives are just "still working"
             // heartbeats. Tool activity now arrives via the richer `step` frame,
@@ -628,9 +590,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ...(typeof data.agent === 'string' && data.agent ? { agentId: data.agent } : {}),
               ...(typeof data.agent_name === 'string' && data.agent_name ? { agentName: data.agent_name } : {}),
             };
+            const thinkingMeta = parseThinkingDoneMeta(data.thinking);
             set((state) => {
               const msgs = [...state.messages];
               const last = msgs[msgs.length - 1];
+              // The turn's thinking moves onto its reply; the wall time ends now.
+              const thinking = state.thinking
+                ? { thinking: finishTurnThinking(state.thinking, Date.now(), thinkingMeta) }
+                : {};
               if (last && last.role === 'assistant') {
                 // Update with full content + tokens
                 msgs[msgs.length - 1] = {
@@ -640,6 +607,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...(artifact ? { artifact } : {}),
                   ...(citations ? { citations } : {}),
                   ...answeredBy,
+                  ...thinking,
                 };
               } else {
                 msgs.push({
@@ -651,10 +619,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...(artifact ? { artifact } : {}),
                   ...(citations ? { citations } : {}),
                   ...answeredBy,
+                  ...thinking,
                 });
               }
               return {
                 messages: msgs,
+                thinking: null,
                 isStreaming: false,
                 phase: 'done' as ChatPhase,
                 viseme: REST_VISEME,
@@ -688,6 +658,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 sessionId: get().ownSessionId,
                 steps: [],
                 stepTree: [],
+                thinking: null,
                 isStreaming: false,
                 phase: 'idle' as ChatPhase,
                 viseme: REST_VISEME,
@@ -707,6 +678,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   timestamp: Date.now(),
                 },
               ],
+              thinking: null,
               isStreaming: false,
               phase: 'error' as ChatPhase,
               viseme: REST_VISEME,
@@ -734,6 +706,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     messages: [],
     steps: [],
     stepTree: [],
+    thinking: null,
     isStreaming: false,
     phase: 'idle',
     viseme: REST_VISEME,
@@ -775,6 +748,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         messages: [],
         steps: [],
         stepTree: [],
+        thinking: null,
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,
@@ -806,6 +780,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         messages: [...messages],
         steps: [],
         stepTree: [],
+        thinking: null,
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,
@@ -850,6 +825,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
         ],
         steps: [], // fresh task-insight timeline for this turn
         stepTree: [], // fresh tool step tree for this turn
+        // The timer starts now, for every runtime — it never waits on the
+        // provider reporting thinking.
+        thinking: startTurnThinking(Date.now()),
         isStreaming: true,
         phase: 'thinking' as ChatPhase,
         viseme: REST_VISEME,
@@ -897,6 +875,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         messages: [],
         steps: [],
         stepTree: [],
+        thinking: null,
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,

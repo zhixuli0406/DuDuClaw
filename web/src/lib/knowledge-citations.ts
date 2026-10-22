@@ -21,23 +21,6 @@ export interface SessionCitationRow extends ChatCitation {
   readonly assistant_message_id: number | null;
 }
 
-/** Result of `knowledge.passage.get` (server already cut before/match/after). */
-export interface KnowledgePassage {
-  readonly chunk_id: number;
-  readonly source_id: string;
-  readonly collection_id: string;
-  readonly title: string;
-  readonly locator_text: string;
-  readonly heading_path: string[];
-  readonly segment_label: string;
-  readonly before: string;
-  readonly match: string;
-  readonly after: string;
-  readonly prev_chunk_id: number | null;
-  readonly next_chunk_id: number | null;
-  readonly suspect: boolean;
-}
-
 export const MAX_CITATIONS = 30;
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
@@ -130,8 +113,6 @@ export function attachHistoryCitations<
 }
 
 export const knowledgeCitationsApi = {
-  passageGet: (chunkId: number) =>
-    client.call('knowledge.passage.get', { chunk_id: chunkId }) as Promise<KnowledgePassage>,
   forSession: (sessionId: string) =>
     client.call('knowledge.citations.for_session', {
       session_id: sessionId,

@@ -19,18 +19,28 @@
 //! - [`add_source_approval`], [`chat_add`]: proposals to add a source (MCP
 //!   tool, chat command), always decided in the dashboard.
 //! - [`forget`]: forget-by-source plans for turns that cited a source.
+//! - [`principals`]: who a collection owner may grant to (the permission
+//!   picker and the check before `knowledge.acl.set`).
+//! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
+//!   employee edit page (`agents.update`).
+//! - [`denied`]: the admin-wide list of refused reads.
+//! - [`upload_limits`]: `knowledge.limits`, the upload limits the dashboard
+//!   checks before sending a file.
 //!
 //! Writes happen only here. Every read goes through
 //! `duduclaw_knowledge::acl::effective_collections`.
 
 pub mod add_source_approval;
+pub mod agent_binding;
 pub mod auto_retrieve;
 pub mod chat_add;
 pub mod cite_turn;
+pub mod denied;
 pub mod extract_spawn;
 pub mod forget;
 pub mod ledger;
 pub mod pipeline;
+pub mod principals;
 pub mod requester_map;
 pub mod route;
 mod route_add;
@@ -40,6 +50,7 @@ pub mod turn_requesters;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod upload;
+pub mod upload_limits;
 pub mod url_ingest;
 pub mod worker;
 
