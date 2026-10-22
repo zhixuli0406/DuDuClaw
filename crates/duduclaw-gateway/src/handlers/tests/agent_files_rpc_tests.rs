@@ -44,6 +44,8 @@ fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext 
         role,
         agent_access: access.iter().map(|(a, l)| (a.to_string(), *l)).collect(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

@@ -39,6 +39,8 @@ fn user(id: &str, agents: &[(&str, AccessLevel)]) -> UserContext {
         role: duduclaw_auth::models::UserRole::Employee,
         agent_access: agents.iter().map(|(a, l)| (a.to_string(), *l)).collect(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 
