@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { api, type ExpertPack, type ExpertCatalogEntry, type ExpertImportReport } from '@/lib/api';
+import {
+  api,
+  type ExpertPack,
+  type ExpertCatalogEntry,
+  type ExpertImportReport,
+  type ExpertInstallResult,
+  type ExpertReimport,
+} from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast } from '@/lib/toast';
 import {
@@ -40,6 +47,8 @@ import {
 import { GenerateExpertDialog } from '@/components/experts/GenerateExpertDialog';
 import { AttachUnderSelect } from '@/components/experts/AttachUnderSelect';
 import { ImportReportDialog } from '@/components/experts/ImportReportDialog';
+import type { ImportFailure } from '@/components/experts/ImportErrorPanel';
+import { UploadError, uploadErrorKey } from '@/components/experts/upload-errors';
 import { AutonomyNote } from '@/components/AutonomyNote';
 
 /** Upload types the importer accepts: a zip (any supported layout), or a
@@ -78,12 +87,18 @@ export function ExpertsPage() {
   const [applyingHooks, setApplyingHooks] = useState<string | null>(null);
   const [applyingSkills, setApplyingSkills] = useState<string | null>(null);
   // Upload → plan (dry run) → confirm → result, all in one report dialog.
+  // `reimport` is the operator's choice when the upload was imported before.
   const [importFlow, setImportFlow] = useState<{
     phase: 'plan' | 'done';
     path: string;
     report: ExpertImportReport | null;
-    error?: string;
+    failure?: ImportFailure | null;
+    reimport?: ExpertReimport | null;
   } | null>(null);
+  // The gateway refuses every experts.* call for non-admins; the page says
+  // so up front instead of failing on the first click.
+  const role = useAuthStore((s) => s.user?.role);
+  const isAdmin = role === 'admin';
   const [importBusy, setImportBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [catalog, setCatalog] = useState<{
@@ -118,7 +133,9 @@ export function ExpertsPage() {
     }
   }, [intl]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (isAdmin) load();
+  }, [load, isAdmin]);
 
   const handleInstallBuiltin = async () => {
     if (!installTarget) return;
@@ -155,13 +172,13 @@ export function ExpertsPage() {
           if (xhr.status >= 200 && xhr.status < 300 && typeof body.path === 'string') {
             resolve(body.path);
           } else {
-            reject(new Error(typeof body.error === 'string' ? body.error : `HTTP ${xhr.status}`));
+            reject(new UploadError(typeof body.code === 'string' ? body.code : '', xhr.status));
           }
         } catch {
-          reject(new Error(`HTTP ${xhr.status}`));
+          reject(new UploadError('', xhr.status));
         }
       };
-      xhr.onerror = () => reject(new Error('network error'));
+      xhr.onerror = () => reject(new UploadError('upload.network', 0));
       const form = new FormData();
       form.append('file', file, file.name);
       xhr.send(form);
@@ -180,17 +197,19 @@ export function ExpertsPage() {
     }
     setInstalling(true);
     setUploadPct(0);
+    let path: string;
     try {
-      const path = await uploadZip(file);
+      path = await uploadZip(file);
+    } catch (e) {
+      toast.error(t(uploadErrorKey(e)));
+      setInstalling(false);
+      setUploadPct(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+    try {
       setUploadPct(null); // upload done — now the scan / plan phase
-      // Dry run first: show where every file goes before anything is written.
-      const plan = await api.experts.install(path, undefined, true);
-      // A refused plan still comes with its report: show what was found.
-      setImportFlow(
-        plan.success
-          ? { phase: 'plan', path, report: plan.report ?? null }
-          : { phase: 'done', path, report: plan.report ?? null, error: plan.error },
-      );
+      await runPlan(path, null);
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
     } finally {
@@ -200,16 +219,49 @@ export function ExpertsPage() {
     }
   };
 
-  const handleConfirmImport = async () => {
+  /** Dry run first: show where every file goes before anything is written.
+   *  A refused plan still comes with its report and its failure code. */
+  const runPlan = async (path: string, reimport: ExpertReimport | null) => {
+    const plan = await api.experts.install(path, undefined, true, reimport ?? undefined);
+    setImportFlow(
+      plan.success
+        ? { phase: 'plan', path, report: plan.report ?? null, reimport }
+        : { phase: 'done', path, report: plan.report ?? null, failure: failureOf(plan), reimport },
+    );
+  };
+
+  const handleReimport = async (choice: ExpertReimport) => {
     if (!importFlow) return;
     setImportBusy(true);
     try {
-      const res = await api.experts.install(importFlow.path);
-      setImportFlow({ phase: 'done', path: importFlow.path, report: res.report ?? null, error: res.success ? undefined : res.error });
+      await runPlan(importFlow.path, choice);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: errorText(e) }));
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const handleConfirmImport = async (opts?: { acceptEdits?: boolean }) => {
+    if (!importFlow) return;
+    setImportBusy(true);
+    const reimport =
+      importFlow.reimport?.mode === 'replace'
+        ? { ...importFlow.reimport, acceptEdits: Boolean(opts?.acceptEdits) }
+        : importFlow.reimport ?? undefined;
+    try {
+      const res = await api.experts.install(importFlow.path, undefined, false, reimport);
+      setImportFlow({
+        phase: 'done',
+        path: importFlow.path,
+        report: res.report ?? null,
+        failure: res.success ? null : failureOf(res),
+        reimport: importFlow.reimport ?? null,
+      });
       if (res.success) {
         toast.success(t('experts.install.success'));
       } else {
-        toast.error(intl.formatMessage({ id: 'experts.install.failed' }, { message: res.error ?? '' }));
+        toast.error(t('experts.report.failedTitle'));
       }
       await load();
     } catch (e) {
@@ -361,6 +413,25 @@ export function ExpertsPage() {
     </section>
   );
 
+  if (!isAdmin) {
+    return (
+      <div className="flex h-full flex-col">
+        <CollectionPageHeader icon={Package} title={t('experts.title')} description={t('experts.subtitle')} />
+        <div className="flex-1 overflow-y-auto p-5">
+          <div role="note" className="mx-auto max-w-xl space-y-2 rounded-xl border border-surface-border px-5 py-6 text-center">
+            <ShieldCheck className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
+            <h2 className="text-sm font-medium">{t('experts.adminOnly.title')}</h2>
+            <p className="text-sm text-muted-foreground">{t('experts.adminOnly.desc')}</p>
+            <Button variant="outline" size="sm" disabled>
+              <Upload />
+              {t('experts.upload')}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
       <input
@@ -490,9 +561,11 @@ export function ExpertsPage() {
         open={importFlow !== null}
         phase={importFlow?.phase ?? 'plan'}
         report={importFlow?.report ?? null}
-        error={importFlow?.error}
+        failure={importFlow?.failure ?? null}
+        reimport={importFlow?.reimport ?? null}
         busy={importBusy}
         onConfirm={handleConfirmImport}
+        onReimport={handleReimport}
         onClose={() => setImportFlow(null)}
       />
 
@@ -724,4 +797,13 @@ function BuiltinCatalogCard({
       </CardContent>
     </Card>
   );
+}
+
+/** The coded failure of an `experts.install` result. */
+function failureOf(res: ExpertInstallResult): ImportFailure {
+  return {
+    code: res.error_code ?? res.report?.error?.code ?? 'import.unknown',
+    params: res.error_params ?? res.report?.error?.params ?? null,
+    text: res.error,
+  };
 }

@@ -352,6 +352,12 @@ export function App() {
                 <Route path="mail" element={<MailPage />} />
               </Route>
 
+              {/* AI 團隊 — every role reaches the page (the nav shows it to
+                  everyone); non-admins see that importing needs an admin.
+                  experts.* RPCs and the upload stay require_admin!-gated
+                  server-side, which is the real gate. */}
+              <Route path="experts" element={<ExpertsPage />} />
+
               {/* P4-3 — OS-native fleet report + settings. All five os.* RPCs
                   are `require_admin!`-gated server-side; this mirrors that. */}
               <Route element={<RoleGuard minRole="admin" />}>
@@ -365,9 +371,6 @@ export function App() {
                     bookmarks/links redirect there — same admin gate, query
                     string preserved. */}
                 <Route path="device" element={<LegacyRouteRedirect to="/app/system/device" />} />
-                {/* 專家包 — expert-pack management; experts.* RPCs are
-                    require_admin!-gated server-side, this mirrors that. */}
-                <Route path="experts" element={<ExpertsPage />} />
                 {/* 靈感畫廊 (P2-b) — curated "做同款" showcase; gallery.list
                     reads the same license-gated premium tree as
                     experts.catalog, require_admin!-gated the same way. */}

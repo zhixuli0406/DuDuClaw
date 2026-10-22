@@ -3122,8 +3122,58 @@ export interface ExpertImportItem {
 export interface ExpertImportReport {
   dry_run: boolean;
   meta: Record<string, string>;
+  /** Structured extras: `replace` (what a replace moves away), `replaced`. */
+  details?: { replace?: ExpertReplaceInfo; replaced?: { agents: string[] } } | null;
+  /** Set when the run failed. */
+  error?: { code: string; params?: Record<string, unknown> | null; message?: string } | null;
   counts: Record<ExpertImportItem['status'], number>;
   items: ExpertImportItem[];
+}
+
+/** One file of an imported employee that changed since the import. */
+export interface ExpertFileChange {
+  path: string;
+  change: 'modified' | 'added' | 'removed' | 'changed_after_import' | 'unknown';
+}
+
+/** What changed on one employee since it was imported. */
+export interface ExpertAgentEdits {
+  agent: string;
+  display: string;
+  /** `import`: compared with the import-time snapshot; `time`: older import, by modification time. */
+  baseline: 'import' | 'time';
+  changes: ExpertFileChange[];
+  more: number;
+}
+
+/** The earlier import a re-import would replace. */
+export interface ExpertReplaceInfo {
+  slug: string;
+  name: string;
+  agents: string[];
+  edited: boolean;
+  edits: ExpertAgentEdits[];
+  installed_at?: string;
+}
+
+/** How a re-import treats the earlier import (`experts.install` params). */
+export type ExpertReimport =
+  | { mode: 'replace'; slug: string; acceptEdits?: boolean }
+  | { mode: 'copy' };
+
+/** `experts.install` result. */
+export interface ExpertInstallResult {
+  /** false ⇒ the run failed; `error_code` says why and `report` shows how far it got. */
+  success: boolean;
+  output?: string;
+  /** Plain zh-TW text (fallback only — render from `error_code`). */
+  error?: string;
+  /** Stable failure code (`import.unrecognized`, `import.timeout`, …). */
+  error_code?: string;
+  error_params?: Record<string, unknown> | null;
+  dry_run?: boolean;
+  /** Present for every install the pipeline completed (plan or real). */
+  report?: ExpertImportReport | null;
 }
 
 /** One AI-team roster member (`experts.catalog` `members[]`, team entries
@@ -5834,25 +5884,21 @@ export const api = {
     /** Install from a server-local path (use `POST /api/experts/upload` to
      *  stage a .zip first — see ExpertsPage). Long-running: security scans run
      *  inside the install pipeline. */
-    install: (path: string, attachUnder?: string, dryRun?: boolean) =>
+    install: (path: string, attachUnder?: string, dryRun?: boolean, reimport?: ExpertReimport) =>
       client.call(
         'experts.install',
         {
           path,
           ...(attachUnder ? { attach_under: attachUnder } : {}),
           ...(dryRun ? { dry_run: true } : {}),
+          ...(reimport?.mode === 'copy' ? { reimport: 'copy' } : {}),
+          ...(reimport?.mode === 'replace'
+            ? { reimport: 'replace', replace_slug: reimport.slug, ...(reimport.acceptEdits ? { accept_edits: true } : {}) }
+            : {}),
         },
         false,
         320000,
-      ) as Promise<{
-        /** false ⇒ the run failed; `error` says why and `report` shows how far it got. */
-        success: boolean;
-        output?: string;
-        error?: string;
-        dry_run?: boolean;
-        /** Present for every install the pipeline completed (plan or real). */
-        report?: ExpertImportReport | null;
-      }>,
+      ) as Promise<ExpertInstallResult>,
     remove: (slug: string) =>
       client.call('experts.remove', { slug }) as Promise<{
         success: boolean;
