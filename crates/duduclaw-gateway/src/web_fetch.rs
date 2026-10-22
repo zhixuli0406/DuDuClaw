@@ -445,6 +445,42 @@ async fn web_fetch_inner(
     }
 
     // 3. Live fetch.
+    let (status, content_type, bytes) = fetch_live(url, validated, workflow).await?;
+
+    let body = if workflow {
+        String::from_utf8(bytes)
+            .map_err(|_| FetchError::IoError("workflow page body is not UTF-8".into()))?
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
+    let result = FetchResult {
+        url: url.to_string(),
+        status_code: status,
+        content_type,
+        body,
+        cached: false,
+        fetched_at: Utc::now(),
+    };
+
+    // 4. Persist to cache (best-effort).
+    if !workflow {
+        if let Err(e) = save_cache(&result, cache_dir) {
+            warn!(%e,"failed to save web_fetch cache");
+        }
+    }
+
+    Ok(result)
+}
+
+
+/// Live GET of a validated URL: DNS-pinned, redirect-checked, size-capped.
+/// Returns `(status, content type, body bytes)`; non-2xx is an error.
+async fn fetch_live(
+    url: &str,
+    validated: reqwest::Url,
+    workflow: bool,
+) -> Result<(u16, String, Vec<u8>), FetchError> {
     info!(url, "web_fetch cache miss — fetching");
 
     // DNS rebinding defence: resolve the hostname now, verify the IP is not
@@ -587,30 +623,16 @@ async fn web_fetch_inner(
         ));
     }
 
-    let body = if workflow {
-        String::from_utf8(bytes)
-            .map_err(|_| FetchError::IoError("workflow page body is not UTF-8".into()))?
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
+    Ok((status, content_type, bytes))
+}
 
-    let result = FetchResult {
-        url: url.to_string(),
-        status_code: status,
-        content_type,
-        body,
-        cached: false,
-        fetched_at: Utc::now(),
-    };
-
-    // 4. Persist to cache (best-effort).
-    if !workflow {
-        if let Err(e) = save_cache(&result, cache_dir) {
-            warn!(%e,"failed to save web_fetch cache");
-        }
-    }
-
-    Ok(result)
+/// Public-page read that returns the raw body bytes (for callers that
+/// decode the charset themselves): the workflow rules — no userinfo, no
+/// redirects, no cache, internal addresses refused, DNS pinned, 5 MB.
+pub async fn web_fetch_public_bytes(url: &str) -> Result<(String, Vec<u8>), FetchError> {
+    let validated = validate_workflow_public_url(url)?;
+    let (_, content_type, bytes) = fetch_live(url, validated, true).await?;
+    Ok((content_type, bytes))
 }
 
 // ---------------------------------------------------------------------------

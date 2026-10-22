@@ -416,6 +416,14 @@ pub(crate) async fn visible_tools_in_lane(
     let allow_db_sources = gated_caller && !member_invalid && !caps.db_sources.is_empty();
     // P2-A: the responsibility tools refuse every call while the feature is
     // off, and only an employee identity can use them — hidden otherwise.
+    // Document knowledge base: listed while the feature is on and at least
+    // one collection is on the employee side (granted to it or its
+    // department, narrowed by `[knowledge] collections`) — the same predicate
+    // the call path and the gateway route check
+    // (`knowledge_client::available_for`). A grant change moves the set, so
+    // the watcher sends `list_changed`.
+    let allow_knowledge =
+        gated_caller && !member_invalid && super::knowledge_client::available_for(home_dir, effective_agent);
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
@@ -506,6 +514,7 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_computer_use || !COMPUTER_USE_TOOLS.contains(&t.name))
         .filter(|t| allow_cu_workspace || !COMPUTER_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| allow_fork || !FORK_TOOLS.contains(&t.name))
+        .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| {
             allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name)
         })

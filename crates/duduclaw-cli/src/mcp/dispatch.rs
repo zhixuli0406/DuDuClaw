@@ -525,6 +525,14 @@ pub(crate) async fn handle_tools_call(
             // as readable text naming the remedy), ownership and every action.
             handle_computer_use_tool(tool_name, &arguments, home_dir, default_agent).await
         }
+        // Document knowledge base (read-only). `Scope::KnowledgeRead` is
+        // enforced upstream; the feature switch and the employee's
+        // `[knowledge]` section are checked in the client with the same
+        // predicate `tools/list` uses; every permission decision is the
+        // gateway's (`POST /api/internal/knowledge`).
+        "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections" => {
+            handle_knowledge_tool(tool_name, &arguments, home_dir, default_agent).await
+        }
         // RFC-26: Live Run Forking tools (gated by Scope::ForkExecute + per-agent
         // [fork] enabled toggle checked inside each handler).
         "fork_run" => crate::mcp_fork::handle_fork_run(&arguments, home_dir, default_agent).await,

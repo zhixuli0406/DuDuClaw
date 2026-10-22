@@ -91,6 +91,8 @@ encoding_rs = "0.8.35"
 # so the version that was reviewed is the version that ships.
 csv = "1"
 calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
+# Document knowledge base: `knowledge-extract` child, `knowledge eval`.
+duduclaw-knowledge = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
