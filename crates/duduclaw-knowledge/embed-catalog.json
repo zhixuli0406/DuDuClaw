@@ -1,0 +1,69 @@
+{
+  "_comment": "Pinned local embedding models. Every file is named with its exact size and SHA-256 (Hugging Face LFS oid at the pinned commit, re-hashed after download on 2026-10-22). Read by crates/duduclaw-knowledge/src/embed/catalog.rs and scripts/kb-model-bundle.sh. A revision bump is a code change.",
+  "models": [
+    {
+      "id": "multilingual-e5-small",
+      "display_name": "multilingual-e5-small (int8)",
+      "repo": "intfloat/multilingual-e5-small",
+      "revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+      "license": "MIT",
+      "license_source": "model card front matter (license: mit) of intfloat/multilingual-e5-small",
+      "dim": 384,
+      "native_dim": 384,
+      "max_tokens": 512,
+      "pooling": "mean",
+      "query_prefix": "query: ",
+      "passage_prefix": "passage: ",
+      "model_file": "onnx/model_qint8_avx512_vnni.onnx",
+      "tokenizer_file": "onnx/tokenizer.json",
+      "kv_heads": 0,
+      "head_dim": 0,
+      "speed": "fast",
+      "batch_limit": 64,
+      "files": [
+        {
+          "path": "onnx/model_qint8_avx512_vnni.onnx",
+          "size": 118346824,
+          "sha256": "dd476dd0c2514e9b9be83aeb3853fac0763e0bdf4a71645407587d77c48a2d88"
+        },
+        {
+          "path": "onnx/tokenizer.json",
+          "size": 17082730,
+          "sha256": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-embedding-0.6b",
+      "display_name": "Qwen3-Embedding-0.6B (int8)",
+      "repo": "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+      "revision": "c25a394dd583836952667c12f008335071b3f43d",
+      "license": "Apache-2.0",
+      "license_source": "base model Qwen/Qwen3-Embedding-0.6B (license: apache-2.0, commit 97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3); the onnx-community conversion repo declares no license of its own",
+      "dim": 512,
+      "native_dim": 1024,
+      "max_tokens": 1024,
+      "pooling": "last_token",
+      "query_prefix": "Instruct: Given a question, retrieve passages from company documents that answer the question\nQuery:",
+      "passage_prefix": "",
+      "model_file": "onnx/model_int8.onnx",
+      "tokenizer_file": "tokenizer.json",
+      "kv_heads": 8,
+      "head_dim": 128,
+      "speed": "slow",
+      "batch_limit": 1,
+      "files": [
+        {
+          "path": "onnx/model_int8.onnx",
+          "size": 613527539,
+          "sha256": "6d0ea863f78b4a84afa3c7fcba1ec341572b5e28121aef77b7092b1dfdf679c7"
+        },
+        {
+          "path": "tokenizer.json",
+          "size": 11423705,
+          "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+        }
+      ]
+    }
+  ]
+}

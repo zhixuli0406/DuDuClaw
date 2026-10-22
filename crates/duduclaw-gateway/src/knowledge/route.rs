@@ -183,7 +183,12 @@ async fn handle(
     let requester = super::turn_requesters::resolve(&caller.agent_id, request.turn_id());
     let st = state.clone();
     let agent = caller.agent_id.clone();
-    let result = tokio::task::spawn_blocking(move || serve(&st, &agent, requester, request)).await;
+    let embedder = match &request {
+        Request::GetPassage { .. } => None,
+        _ => Some(super::embedding::resolve(&state.home).await),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || serve_with(&st, &agent, requester, request, embedder)).await;
     match result {
         Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
         Ok(Err(Refusal(status, code, msg))) => refuse(status, code, &msg),
@@ -224,11 +229,25 @@ fn agent_dir(home: &std::path::Path, agent: &str) -> PathBuf {
         .unwrap_or_else(|| home.join("agents").join(agent))
 }
 
+type SharedEmbedder = Option<std::sync::Arc<dyn duduclaw_knowledge::embed::Embedder>>;
+
+/// Keyword-only `serve_with` (tests).
+#[cfg(test)]
 fn serve(
     st: &KnowledgeRouteState,
     agent: &str,
     requester: RequesterIdentity,
     request: Request,
+) -> Result<Value, Refusal> {
+    serve_with(st, agent, requester, request, None)
+}
+
+fn serve_with(
+    st: &KnowledgeRouteState,
+    agent: &str,
+    requester: RequesterIdentity,
+    request: Request,
+    embedder: SharedEmbedder,
 ) -> Result<Value, Refusal> {
     let (scope, department) =
         duduclaw_core::knowledge_agent::load_agent_knowledge(&agent_dir(&st.home, agent));
@@ -285,7 +304,11 @@ fn serve(
         }
     };
     entry.allowed = allowed.ids().to_vec();
-    let result = run_op(&conn, &allowed, &request, &mut entry);
+    let vectors = Vectors {
+        embedder: embedder.unwrap_or_else(|| std::sync::Arc::new(duduclaw_knowledge::embed::NoEmbedder)),
+        cache: super::embedding::cache(&st.home),
+    };
+    let result = run_op(&conn, &allowed, &request, &mut entry, &vectors);
     if result.is_err() && entry.outcome == "ok" {
         entry.outcome = "denied".into();
     }
@@ -295,11 +318,18 @@ fn serve(
     result
 }
 
+/// The vector side of a request: the embedder in effect and the cache.
+struct Vectors {
+    embedder: std::sync::Arc<dyn duduclaw_knowledge::embed::Embedder>,
+    cache: std::sync::Arc<duduclaw_knowledge::embed::vector_cache::VectorCache>,
+}
+
 fn run_op(
     conn: &rusqlite::Connection,
     allowed: &AllowedSet,
     request: &Request,
     entry: &mut AccessEntry,
+    vectors: &Vectors,
 ) -> Result<Value, Refusal> {
     match request {
         Request::Search { query, limit, .. } => {
@@ -319,8 +349,12 @@ fn run_op(
                 allowed,
                 &query,
                 limit,
-                &duduclaw_knowledge::embed::NoEmbedder,
+                vectors.embedder.as_ref(),
+                &vectors.cache,
             )?;
+            if let Some(reason) = &r.vector_unavailable {
+                super::embedding::warn_keyword_only(reason);
+            }
             entry.mode = Some(r.mode.as_str().to_string());
             entry.results = r
                 .hits
@@ -338,6 +372,7 @@ fn run_op(
                 "hits": r.hits,
                 "mode": r.mode,
                 "vector_unavailable": r.vector_unavailable,
+                "coverage": r.coverage,
                 "scan_capped": r.scan_capped,
                 "collections": collections,
             }))
@@ -359,21 +394,51 @@ fn run_op(
         Request::ListCollections { .. } => {
             entry.op = "list".into();
             let list = duduclaw_knowledge::store::list_by_ids(conn, allowed.ids())?;
-            let items: Vec<Value> = list
-                .iter()
-                .map(|c| {
-                    json!({
-                        "slug": c.collection.slug,
-                        "name": c.collection.name,
-                        "description": c.collection.description,
-                        "sensitivity": c.collection.sensitivity,
-                        "sources": c.ready_count,
-                        "chunks": c.chunk_count,
-                        "vector_coverage": 0.0,
-                    })
-                })
-                .collect();
-            Ok(json!({"ok": true, "collections": items, "mode": "keyword_only"}))
+            let e = vectors.embedder.as_ref();
+            let available = duduclaw_knowledge::embed::is_available(e);
+            let excluded = match e.egress() {
+                duduclaw_knowledge::embed::Egress::Cloud { .. } => {
+                    duduclaw_knowledge::embed::vectors::cloud_excluded_collections(conn)?
+                }
+                duduclaw_knowledge::embed::Egress::Local => Default::default(),
+            };
+            let mut items: Vec<Value> = Vec::with_capacity(list.len());
+            for c in &list {
+                let coverage = if available {
+                    let (have, total) = duduclaw_knowledge::embed::vectors::coverage(
+                        conn,
+                        e.model_id(),
+                        Some(std::slice::from_ref(&c.collection.id)),
+                        &excluded,
+                    )?;
+                    if total > 0 { have as f64 / total as f64 } else { 0.0 }
+                } else {
+                    0.0
+                };
+                items.push(json!({
+                    "slug": c.collection.slug,
+                    "name": c.collection.name,
+                    "description": c.collection.description,
+                    "sensitivity": c.collection.sensitivity,
+                    "sources": c.ready_count,
+                    "chunks": c.chunk_count,
+                    "vector_coverage": coverage,
+                }));
+            }
+            let reason = if available {
+                None
+            } else {
+                match e.embed_query("") {
+                    Err(duduclaw_knowledge::embed::EmbedError::Unavailable(r) | duduclaw_knowledge::embed::EmbedError::Failed(r)) => Some(r),
+                    Ok(_) => None,
+                }
+            };
+            Ok(json!({
+                "ok": true,
+                "collections": items,
+                "mode": if available { "hybrid" } else { "keyword_only" },
+                "vector_unavailable": reason,
+            }))
         }
     }
 }

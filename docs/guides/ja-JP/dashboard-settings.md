@@ -98,6 +98,21 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 
 **権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
 
+## システム設定 → 詳細設定 → ナレッジベース検索
+
+管理者のみ（1.76.0 で追加）。ドキュメントナレッジベースが意味で検索しているか、キーワード一致のみかを表示します。キーワードのみの場合はその理由と、すでにベクトルを持つ段落の割合も表示します。
+
+| コントロール | 書き込み | 効果 |
+|---|---|---|
+| 計算方法：このコンピューター／OpenAI／Google Gemini／オフ | `[knowledge.embedding] provider`（クラウドは `cloud_model`、`cloud_account` も） | 次の検索から反映。クラウドプロバイダーを選ぶと、段落を受け取るベンダーとホストを示すダイアログが開きます。チェックボックスにチェックするまで **{vendor} を使う** は無効のままで、同意の記録は `cloud_disclosure_ack` として保存されます。匿名化が無効のときはダイアログで警告します（その間は何も送信されません）。それ以外を選ぶと同意の記録は削除されます。 |
+| インストール（サイズ） | `models/embedding/<model>/` と `lib/onnxruntime/` にダウンロード | 進捗付きのバックグラウンドダウンロード。**キャンセル**後に再開でき、完了するとすべての段落のベクトル作成が待ち行列に入ります。 |
+| 再確認（オフラインインストール） | — | オフラインパッケージ（`.tar` と `.tar.minisig`、展開せずに `models/embedding/` に置く）の署名をリリース鍵で確認してから展開し、各ファイルのハッシュを照合してモデルをインストール済みにします。 |
+| このモデルを使う | `local_model` | ローカルモデルを切り替えます。段落にはバックグラウンドで新しいモデルのベクトルが作られます（前のモデルのベクトルは残りますが比較には使われません）。 |
+| 削除 | モデルファイルを削除 | 理由を表示したうえで検索はキーワードのみになります。ランタイムライブラリは残ります。 |
+| 未作成の検索データを補う | — | まだベクトルのないすべてのソースを待ち行列に入れます。 |
+
+詳細：[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md#ベクトルモデル)。
+
 ## 設定ファイル（未リリース）
 
 RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`。社員編集ページの「行動の境界」も同じ仕組みを使います（`contract.update`）。対象：人格設定（`SOUL.md`）、自己紹介（`IDENTITY.md`）、作業ルール（`INSTRUCTIONS.md`）、行動の境界（`CONTRACT.toml`）、基本設定（`agent.toml`。ここでは閲覧のみでシークレットはマスク。変更は編集ページ、管理者は設定ファイルの詳細編集でも可）。上限：Markdown は 1 ファイル 64 KB、`CONTRACT.toml` は 32 KB、`must_not` と `must_always` はそれぞれ最大 100 項目・各 500 文字。
@@ -133,7 +148,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **競合：**開いたときに内容のハッシュを受け取り、保存時に送り返します。その間にファイルが変わっていれば拒否されるので、再読み込みしてから編集してください。
 - **バックアップ：**書き込み前に `<ファイル名>.bak-<Unix 時刻>`（権限 0600）へコピーし、新しい 5 つを残します。
 - **監査：**書き込みごとに `config_raw_edited` を記録します。`[delegation]`、`[acp]`、または社員の `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` に触れた場合は Warning です。
-- **ドキュメントナレッジベース：**コレクション、資料、共有、閲覧記録はサイドバーの「会社 → ドキュメントライブラリ」で管理します。全体の上限 `[knowledge]` にはまだ設定ページがなく、各キー（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`、`extract_when_unavailable` = `refuse`／`run_unsandboxed`）はここで型を検査します。社員の `[knowledge] collections` は「Agent 管理 → 設定を編集 → ツールと権限 → ドキュメントライブラリ」で設定します（共有されたコレクションだけ選べます）。その社員の `agent.toml` を直接編集することもできます。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)。
+- **ドキュメントナレッジベース：**コレクション、資料、共有、閲覧記録はサイドバーの「会社 → ドキュメントライブラリ」で管理します。全体の上限 `[knowledge]` にはまだ設定ページがなく、各キー（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`、`extract_when_unavailable` = `refuse`／`run_unsandboxed`）はここで型を検査します。`[knowledge.embedding]` の各キー（`provider` = `local`／`openai`／`gemini`／`none`、`local_model`、`cloud_model`、`cloud_account`、`cloud_base_url`、`allow_private_endpoint`、`batch_size`、`threads`、`max_vector_rows`、`idle_unload_minutes`）も同様です。開示の確認記録 `cloud_disclosure_ack` はここでは変更できず（保存は拒否されます）、「ナレッジベース検索」の開示ダイアログからのみ書き込まれます。社員の `[knowledge] collections` は「Agent 管理 → 設定を編集 → ツールと権限 → ドキュメントライブラリ」で設定します（共有されたコレクションだけ選べます）。その社員の `agent.toml` を直接編集することもできます。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)。
 - **再起動の一覧：**保存後に再起動が必要な部分を表示します。`config.toml` の `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` は起動時にだけ読まれます。`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（アップロードルートのサイズ上限を決める）も再起動が必要です。ログレベル、常駐センシング、秘匿化はその場で反映できた場合は一覧に出ません。`inference.toml` の保存は常にその場で推論エンジンをリセットします。社員ファイルで再起動が必要なのは `heartbeat.max_concurrent_runs` だけです。
 
 ## メンテナンス SSH 画面（未リリース）
