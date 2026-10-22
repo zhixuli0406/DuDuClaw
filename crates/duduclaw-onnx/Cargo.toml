@@ -1,0 +1,59 @@
+[package]
+name = "duduclaw-onnx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Shared ONNX Runtime plumbing for every feature that runs a local model
+# (redaction NER, knowledge-base embeddings).
+#
+# ONNX Runtime may be initialised only once per process, so the features
+# that use it must share one `init_ort` (one `OnceLock`) and one install
+# directory, `<home>/lib/onnxruntime/<ORT_VERSION>/`. This crate owns both,
+# plus the pinned ORT release manifest and the generic verified-download
+# code (streamed, `Range`-resumable, SHA-256 checked, renamed into place).
+#
+# Features:
+# - (none)   the pinned manifest only; no network, no ORT.
+# - install  verified downloads and ORT archive extraction.
+# - runtime  `init_ort` (links the `ort` crate with `load-dynamic`); checks
+#            the library against its pin right before loading it.
+#
+# The `ort` features below must stay identical to `duduclaw-redaction`'s:
+# cargo unifies them into one `ort` build, and `load-dynamic` keeps the
+# release binary free of ONNX Runtime itself.
+
+[lints]
+workspace = true
+
+[dependencies]
+duduclaw-core = { workspace = true }
+thiserror = { workspace = true }
+
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
+
+reqwest = { version = "0.12", optional = true, features = ["json", "stream"] }
+futures-util = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
+zip = { version = "9.0.4", optional = true, default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+install = [
+    "dep:reqwest",
+    "dep:futures-util",
+    "dep:sha2",
+    "dep:tar",
+    "dep:flate2",
+    "dep:zip",
+]
+# The loader verifies the library against its pin before loading it, so
+# it needs the hashing code of `install`.
+runtime = ["dep:ort", "install"]
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }

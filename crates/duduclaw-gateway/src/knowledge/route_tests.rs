@@ -504,3 +504,54 @@ async fn http_route_rate_limit_and_switch() {
     .await;
     assert_eq!((s, v["code"].as_str()), (403, Some("knowledge_disabled")));
 }
+
+/// One fixed axis: every text maps to the same unit vector, so the vector
+/// list always has a candidate. Enough to see what the tool output says.
+struct OneAxis;
+
+impl duduclaw_knowledge::embed::Embedder for OneAxis {
+    fn model_id(&self) -> &str {
+        "test/one@2"
+    }
+    fn dim(&self) -> usize {
+        2
+    }
+    fn max_input_tokens(&self) -> usize {
+        8
+    }
+    fn embed_passages(&self, t: &[&str]) -> Result<Vec<Vec<f32>>, duduclaw_knowledge::embed::EmbedError> {
+        Ok(t.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+    fn embed_query(&self, _: &str) -> Result<Vec<f32>, duduclaw_knowledge::embed::EmbedError> {
+        Ok(vec![1.0, 0.0])
+    }
+    fn egress(&self) -> duduclaw_knowledge::embed::Egress {
+        duduclaw_knowledge::embed::Egress::Local
+    }
+}
+
+#[test]
+fn tool_output_reports_hybrid_mode_and_coverage_with_vectors() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    agent(h, "hr-bot", "[agent]\nname='hr-bot'\n");
+    let chunk = collection(h, "hr", "internal", &[(PrincipalKind::Agent, "hr-bot")], "新進員工第一年特休為七日。");
+    let st = KnowledgeRouteState::new(h.to_path_buf(), None);
+    // Without vectors: keyword-only, with the reason in the output.
+    let e: std::sync::Arc<dyn duduclaw_knowledge::embed::Embedder> = std::sync::Arc::new(OneAxis);
+    let v = serve_with(&st, "hr-bot", system(), search("放假"), Some(e.clone())).unwrap();
+    assert_eq!(v["mode"], "keyword_only", "{v}");
+    assert!(v["vector_unavailable"].as_str().is_some_and(|r| r.contains("向量尚未建立")), "{v}");
+    {
+        let mut conn = schema::open_home(h).unwrap();
+        duduclaw_knowledge::embed::vectors::store(&mut conn, "test/one@2", &[(chunk, vec![1.0, 0.0])]).unwrap();
+    }
+    // A paraphrase with no shared term comes back through the vector list.
+    let v = serve_with(&st, "hr-bot", system(), search("可以放幾天"), Some(e.clone())).unwrap();
+    assert_eq!(v["mode"], "hybrid", "{v}");
+    assert_eq!(v["coverage"], 1.0);
+    assert_eq!(v["hits"][0]["vec_rank"], 1, "{v}");
+    let list = serve_with(&st, "hr-bot", system(), Request::ListCollections { turn_id: None }, Some(e)).unwrap();
+    assert_eq!(list["mode"], "hybrid");
+    assert_eq!(list["collections"][0]["vector_coverage"], 1.0);
+}

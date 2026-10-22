@@ -698,6 +698,24 @@ pub(crate) fn changed_sections(before: &toml::Table, after: &toml::Table) -> Vec
     keys.into_iter().filter(|k| before.get(*k) != after.get(*k)).cloned().collect()
 }
 
+/// The cloud-embedding disclosure record is written only by the disclosure
+/// dialog (`knowledge.embedding.select` with `acknowledge_disclosure`), so it
+/// always names who agreed to which vendor and host. The raw editor may
+/// remove it (that only narrows: cloud embedding stops), never add or
+/// change it.
+pub(crate) const DISCLOSURE_ACK_PATH: &str = "knowledge.embedding.cloud_disclosure_ack";
+
+pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    let new = super::config_commit::toml_at(after, DISCLOSURE_ACK_PATH);
+    if new.is_some() && new != super::config_commit::toml_at(before, DISCLOSURE_ACK_PATH) {
+        return Err(
+            "[knowledge.embedding] cloud_disclosure_ack cannot be edited here; choose the cloud provider in Settings → Knowledge base search, which records the acknowledgement"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn key_changed(before: &toml::Table, after: &toml::Table, path: &str) -> bool {
     super::config_commit::toml_at(before, path) != super::config_commit::toml_at(after, path)
 }
@@ -829,6 +847,9 @@ impl MethodHandler {
             if name_before.is_some() && name_before != super::config_commit::toml_at(&after, "agent.name") {
                 return Err(format!("[agent] name cannot be changed here (it is the employee id `{id}`)").into());
             }
+        }
+        if matches!(kind, RawFile::Config) {
+            refuse_disclosure_ack_edit(&before, &after)?;
         }
         let sections = changed_sections(&before, &after);
         // A submission whose parsed content equals the stored file is a true

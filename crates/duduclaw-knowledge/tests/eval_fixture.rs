@@ -82,7 +82,7 @@ fn synthetic_zh_tw_keyword_baseline() {
     .unwrap();
     let report = evaluate("keyword", &questions, |q| {
         let t = Instant::now();
-        let hits = duduclaw_knowledge::search::search(&conn, &allowed, q, 10, &NoEmbedder)
+        let hits = duduclaw_knowledge::search::search(&conn, &allowed, q, 10, &NoEmbedder, &duduclaw_knowledge::embed::vector_cache::VectorCache::default())
             .unwrap()
             .hits;
         (hits, t.elapsed())

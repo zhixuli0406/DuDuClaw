@@ -41,6 +41,7 @@ members = [
     "crates/duduclaw-db",
     "crates/duduclaw-maint-tools",
     "crates/duduclaw-knowledge",
+    "crates/duduclaw-onnx",
 ]
 
 [workspace.package]
@@ -143,6 +144,7 @@ duduclaw-relay = { path = "crates/duduclaw-relay" }
 duduclaw-sysd = { path = "crates/duduclaw-sysd" }
 duduclaw-db = { path = "crates/duduclaw-db" }
 duduclaw-knowledge = { path = "crates/duduclaw-knowledge" }
+duduclaw-onnx = { path = "crates/duduclaw-onnx", default-features = false }
 
 # Debug builds only (the release profile is untouched). The workflow MCP path
 # hashes the whole running CLI binary (~336 MB in a debug build) with SHA-256
