@@ -1,6 +1,8 @@
 import type { IntlShape } from 'react-intl';
 import type {
+  AgentFileFixedKey,
   AgentFileKey,
+  AgentFileSkillKey,
   AgentFileReason,
   AgentFileReasonCategory,
   AgentFileReview,
@@ -13,10 +15,12 @@ import type {
  * ever rendered as React text nodes.
  */
 
-export const AGENT_FILE_KEYS: ReadonlyArray<AgentFileKey> = ['soul', 'identity', 'instructions', 'contract', 'agent_toml'];
+export const AGENT_FILE_KEYS: ReadonlyArray<AgentFileFixedKey> = ['soul', 'identity', 'instructions', 'contract', 'agent_toml'];
+
+const SKILL_PREFIX = 'skill:';
 
 /** On-disk file names, shown small and grey next to the plain name. */
-export const AGENT_FILE_NAMES: Readonly<Record<AgentFileKey, string>> = {
+export const AGENT_FILE_NAMES: Readonly<Record<AgentFileFixedKey, string>> = {
   soul: 'SOUL.md',
   identity: 'IDENTITY.md',
   instructions: 'INSTRUCTIONS.md',
@@ -36,15 +40,41 @@ const CATEGORIES: ReadonlySet<string> = new Set<AgentFileReasonCategory>([
   'format',
   'analysis_unavailable',
   'outside_change',
+  'risky_action',
+  'existing_risk',
 ]);
 
-export function isAgentFileKey(v: unknown): v is AgentFileKey {
+export function isFixedAgentFileKey(v: unknown): v is AgentFileFixedKey {
   return typeof v === 'string' && (AGENT_FILE_KEYS as readonly string[]).includes(v);
 }
 
-/** Plain-language file name (`人格設定`); unknown keys come back as-is. */
+/** `skill:<path>` with a non-empty path. */
+export function isSkillKey(v: unknown): v is AgentFileSkillKey {
+  return typeof v === 'string' && v.startsWith(SKILL_PREFIX) && v.length > SKILL_PREFIX.length;
+}
+
+export function isAgentFileKey(v: unknown): v is AgentFileKey {
+  return isFixedAgentFileKey(v) || isSkillKey(v);
+}
+
+/** The skill's name as the employee knows it: the folder of a `SKILL.md`,
+ *  otherwise the file name without `.md`. */
+export function skillNameOf(file: AgentFileSkillKey): string {
+  const parts = file.slice(SKILL_PREFIX.length).split('/');
+  const last = parts[parts.length - 1] ?? '';
+  if (last.toLowerCase() === 'skill.md' && parts.length > 1) return parts[parts.length - 2] ?? last;
+  return last.replace(/\.md$/i, '');
+}
+
+/** The on-disk name shown small and grey (`SOUL.md`, `SKILLS/quote/SKILL.md`). */
+export function agentFileName(file: AgentFileKey): string {
+  return isSkillKey(file) ? `SKILLS/${file.slice(SKILL_PREFIX.length)}` : AGENT_FILE_NAMES[file];
+}
+
+/** Plain-language file name (`人格設定`, `技能：quote`); unknown keys come back as-is. */
 export function agentFileLabel(intl: IntlShape, file: string): string {
-  return isAgentFileKey(file) ? intl.formatMessage({ id: `agentFiles.file.${file}` }) : file;
+  if (isSkillKey(file)) return intl.formatMessage({ id: 'agentFiles.file.skillNamed' }, { name: skillNameOf(file) });
+  return isFixedAgentFileKey(file) ? intl.formatMessage({ id: `agentFiles.file.${file}` }) : file;
 }
 
 /** Localized text for a reason category. An unknown (newer) category falls
