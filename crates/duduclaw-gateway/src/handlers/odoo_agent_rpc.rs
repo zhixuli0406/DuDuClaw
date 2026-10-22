@@ -214,10 +214,16 @@ impl MethodHandler {
         // Same merge function the runtime connector pool uses, so this test
         // can never pass for a config the runtime would not dial. An override
         // that fails url/db validation is reported, never silently ignored.
-        if let Some(over) = duduclaw_odoo::AgentOdooConfig::from_table(&agent_table)
-            && let Err(msg) = over.apply_to(&mut cfg)
-        {
-            return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
+        match duduclaw_odoo::AgentOdooConfig::from_table(&agent_table) {
+            Ok(Some(over)) => {
+                if let Err(msg) = over.apply_to(&mut cfg) {
+                    return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
+                }
+            }
+            Ok(None) => {}
+            Err(msg) => {
+                return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
+            }
         }
         // v1.68.0: JSON-RPC only, same rule as `odoo.configure` — whether
         // `xmlrpc` came from the agent override or the global config.

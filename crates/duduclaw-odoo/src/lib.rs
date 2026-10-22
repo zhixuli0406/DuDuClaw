@@ -12,7 +12,7 @@ pub mod url_guard;
 /// X1 方案 4 — Odoo Helpdesk / Project as a decision-twin support queue.
 pub mod support_export;
 
-pub use agent_config::{AgentOdooConfig, OdooConfigResolver};
+pub use agent_config::{AgentOdooConfig, OdooConfigResolver, ODOO_UNREADABLE};
 pub use config::OdooConfig;
 pub use connector::{
     check_blocklist, is_introspection_noise, AccessKind, BlockDenial, OdooConnector, OdooStatus,

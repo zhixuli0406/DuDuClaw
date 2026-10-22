@@ -90,7 +90,7 @@ async fn connect_for_agent(
     let agent_toml_path =
         crate::outcome_spec::agent_work_dir(home_dir, agent_id).join("agent.toml");
     let agent_raw = std::fs::read_to_string(&agent_toml_path).unwrap_or_default();
-    let agent_override = AgentOdooConfig::from_agent_toml(&agent_raw);
+    let agent_override = AgentOdooConfig::parse_agent_toml(&agent_raw)?;
     if let (Some(requested), Some(cfg)) = (profile, agent_override.as_ref()) {
         // An explicit `--profile` must name the agent's actual profile; it is
         // an assertion by the caller, not a selector that silently falls back

@@ -28,6 +28,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::OdooConfig;
 
+/// Error text when an agent's `[odoo]` settings cannot be read.
+pub const ODOO_UNREADABLE: &str =
+    "這位員工的 Odoo 設定讀不到，請管理員檢查 agent.toml 的 [odoo] 區塊";
+
 /// Per-agent override block parsed from `agent.toml [odoo]`.
 ///
 /// Every field is optional — present fields override the global default;
@@ -134,11 +138,26 @@ impl AgentOdooConfig {
         if cfg.is_empty() { None } else { Some(cfg) }
     }
 
-    /// Parse from an already-parsed `agent.toml` table (same rules as
-    /// [`Self::from_agent_toml`]: absent, vacuous or malformed `[odoo]` ⇒ `None`).
-    pub fn from_table(table: &toml::Table) -> Option<Self> {
-        let cfg: Self = table.get("odoo")?.clone().try_into().ok()?;
-        if cfg.is_empty() { None } else { Some(cfg) }
+    /// Strict parse of an already-parsed `agent.toml` table, for every path
+    /// that connects to Odoo (fail closed).
+    ///
+    /// * no `[odoo]` block, or a vacuous one ⇒ `Ok(None)` (use the global config);
+    /// * a block that does not parse ⇒ `Err` (refuse to connect — a half-read
+    ///   override must not silently send the agent to the global server).
+    pub fn from_table(table: &toml::Table) -> Result<Option<Self>, String> {
+        let Some(section) = table.get("odoo") else {
+            return Ok(None);
+        };
+        let cfg: Self = section.clone().try_into().map_err(|_| ODOO_UNREADABLE.to_string())?;
+        Ok(if cfg.is_empty() { None } else { Some(cfg) })
+    }
+
+    /// Strict parse from raw `agent.toml` text; see [`Self::from_table`]. A
+    /// file that is not valid TOML is also an `Err`, because it is then
+    /// unknowable whether an `[odoo]` override was meant to apply.
+    pub fn parse_agent_toml(raw: &str) -> Result<Option<Self>, String> {
+        let table: toml::Table = raw.parse().map_err(|_| ODOO_UNREADABLE.to_string())?;
+        Self::from_table(&table)
     }
 
     /// The single merge of this override over the global `[odoo]` block.
@@ -506,10 +525,29 @@ mod tests {
         let raw = "[odoo]\nurl = \"https://alpha.example.com\"\ndb = \"alpha_db\"\nusername = \"a\"\n";
         let table: toml::Table = raw.parse().unwrap();
         let (mut a, mut b) = (global_cfg(), global_cfg());
-        AgentOdooConfig::from_table(&table).unwrap().apply_to(&mut a).unwrap();
-        AgentOdooConfig::from_agent_toml(raw).unwrap().apply_to(&mut b).unwrap();
+        AgentOdooConfig::from_table(&table).unwrap().unwrap().apply_to(&mut a).unwrap();
+        AgentOdooConfig::parse_agent_toml(raw).unwrap().unwrap().apply_to(&mut b).unwrap();
         assert_eq!((a.url, a.db, a.username), (b.url, b.db, b.username));
-        assert!(AgentOdooConfig::from_table(&"[agent]\nname=\"x\"".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn strict_parse_absent_block_means_global() {
+        for raw in ["", "[agent]\nname = \"x\"\n", "[odoo]\n"] {
+            assert!(AgentOdooConfig::parse_agent_toml(raw).unwrap().is_none(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn strict_parse_unreadable_block_is_refused_not_global() {
+        for raw in [
+            "[odoo]\nallowed_models = 42\n",
+            "[odoo]\nurl = 5\n",
+            "odoo = 1\n",
+            "not toml [[[",
+        ] {
+            let err = AgentOdooConfig::parse_agent_toml(raw).unwrap_err();
+            assert!(err.contains("Odoo 設定讀不到"), "{raw:?}: {err}");
+        }
     }
 
     #[test]
