@@ -477,11 +477,40 @@ export interface SharedWikiStats {
 
 export interface SkillInfo {
   name: string;
-  agent_id?: string;
+  agent_id?: string | null;
   content: string;
   /** Which layer the skill came from: company-wide / department / this staffer. */
   scope?: 'global' | 'department' | 'agent';
   security_status?: 'pass' | 'warn' | 'fail';
+  /** B8: localised name / description and tags from the frontmatter (search). */
+  display_name?: string;
+  description?: string;
+  tags?: string[];
+  /** B8: false when switched off for this employee (not loaded). */
+  enabled?: boolean;
+  /** B8: times the system activated it for this employee, and the latest. */
+  use_count?: number;
+  last_used_at?: string | null;
+  /** B8: file modification time, Unix seconds. */
+  modified_at?: number | null;
+  /** B8 aggregate view, company-wide rows: employees that have it. */
+  holders?: SkillHolder[];
+  enabled_count?: number;
+}
+
+/** B8: one employee holding a company-wide skill. */
+export interface SkillHolder {
+  agent_id: string;
+  display_name?: string;
+  enabled: boolean;
+  use_count: number;
+  last_used_at?: string | null;
+}
+
+/** B8: whether an employee's skill switch file could be read. */
+export interface SkillStateStatus {
+  ok: boolean;
+  error?: string;
 }
 
 /**
@@ -501,8 +530,26 @@ export interface SkillScanPath {
 /** Aggregate (`skills.list` with no `agent_id`) — every layer, every staffer. */
 export interface SkillsListAll {
   global_skills: SkillInfo[];
-  agents: Array<{ agent_id: string; display_name?: string; skills: SkillInfo[] }>;
+  agents: Array<{
+    agent_id: string;
+    display_name?: string;
+    skills: SkillInfo[];
+    skill_state?: SkillStateStatus;
+    can_manage?: boolean;
+  }>;
   scanned?: SkillScanPath[];
+  /** Set when activation counts could not be read. */
+  usage_error?: string | null;
+}
+
+/** `skills.list {agent_id}`. */
+export interface SkillsListOne {
+  agent_id?: string;
+  skills: SkillInfo[];
+  scanned?: SkillScanPath[];
+  skill_state?: SkillStateStatus;
+  can_manage?: boolean;
+  usage_error?: string | null;
 }
 
 export interface HeartbeatInfo {
@@ -6444,10 +6491,7 @@ export const api = {
   },
   skills: {
     list: (agentId: string) =>
-      client.call('skills.list', { agent_id: agentId }) as Promise<{
-        skills: SkillInfo[];
-        scanned?: SkillScanPath[];
-      }>,
+      client.call('skills.list', { agent_id: agentId }) as Promise<SkillsListOne>,
     /** Aggregate across every layer and every staffer (no `agent_id`). */
     listAll: () => client.call('skills.list', {}) as Promise<SkillsListAll>,
     content: (agentId: string, skillName: string) =>
