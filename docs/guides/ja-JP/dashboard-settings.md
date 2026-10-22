@@ -96,6 +96,19 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 
 **権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
 
+## 思考の表示
+
+専用の項目はまだないため、下の設定ファイルの詳細編集で設定します。どちらのファイルも毎ターン読み直すので、変更は次の返信から有効です。
+
+| ファイル | キー | 値 |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary`（既定：WebChat でタイマー、トークン、伏せ字処理済みの思考の文章）、`status`（タイマーとトークンのみ）、`off`（思考フレームを送らない。WebChat 自身のタイマーは残る） |
+| `config.toml` | `[thinking] max_chars` | 1 ターンの思考の文章の上限。既定 4000、200–20000 に収める |
+| `config.toml` | `[thinking] anthropic_display` | `summarized`（既定）または `updates`（ベータ、一部の Claude モデルのみ） |
+| `agent.toml` | `[model] show_thinking` | `summary`／`status`／`off`。未設定なら `[thinking] display` に従う。厳しい方が適用される |
+
+読めない・解析できない `config.toml`、または解釈できない `display` の値は `status` として扱います。思考の文章が見えるのはダッシュボードにサインインした WebChat 利用者だけで、メッセージアプリには届きません。詳細は[思考の表示](../../features/ja-JP/64-thinking-display.md)。
+
 ## 設定ファイルの詳細編集
 
 場所：システム設定 → 詳細設定 → 設定ファイルの詳細編集。管理者だけに表示され、RPC は `config.raw.get` / `config.raw.set` です。

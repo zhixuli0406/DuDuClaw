@@ -19,6 +19,7 @@
 //! Nothing here stores thinking text. At the end of the turn the sink writes
 //! at most one `run_steps` row with the seconds and token count only.
 
+pub mod done_meta;
 pub mod event;
 pub mod gate;
 pub mod policy;
@@ -29,6 +30,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+pub use done_meta::{DoneMeta, DoneMetaBuilder};
 pub use event::{ThinkingEvent, ThinkingKind, ThinkingPhase};
 pub use policy::{SinkLevel, ThinkingPolicy};
 pub use recorder::Recorder;

@@ -67,6 +67,7 @@
 | 60 | [Discovery 探索](60-discovery.md) | 核准工作區探索、預算與樹狀帳本、雜湊驗證成品、零 LLM held-out 策略比較；整合驗證中 |
 | 61 | [Odoo 網站線上客服](61-odoo-livechat.md) | AI 員工以客服人員身分回覆 Odoo 線上客服訪客；分眾規則決定每位訪客由誰回覆；真人接手與轉接 |
 | 62 | [用 @ 呼叫 AI 員工](62-calling-ai-staff.md) | 用 `@名字` 把一則訊息交給別位 AI 員工，只叫得到有權限的員工；WebChat、LINE、Telegram 的 @ 名單；先點名再交辦；只回提及的群組 |
+| 64 | [思考過程顯示](64-thinking-display.md) | WebChat 對每個 runtime 都顯示即時思考計時；登入的 dashboard 使用者可看遮蔽、截短後的思考摘要；通訊軟體永遠收不到 |
 
 ---
 

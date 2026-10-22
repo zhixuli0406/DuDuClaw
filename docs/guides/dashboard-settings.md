@@ -96,6 +96,19 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 
 **Permission flags are enforced (behaviour change).** `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` had no reader before. Since v1.68.0 a flag written as `false` blocks the matching tools at the MCP dispatch gate (`create_agent`; `send_to_agent`, `spawn_agent`; `create_reminder`, `tasks_create` with a `schedule`; `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording`); an absent or wrongly typed flag allows. Older templates often wrote these flags as `false`, so the first boot after the upgrade migrates every employee once: in a `[permissions]` table without the marker `permissions_enforced_since`, each of the four flags that is `false` becomes `true` and `permissions_enforced_since = "1.68.0"` is added; each reset writes the audit event `permission_flags_reset`. A `false` written afterwards on this page or in the Advanced config editor counts as an operator decision. Ephemeral role members (`agents/.ephemeral/`) are not migrated and keep least privilege.
 
+## Thinking display
+
+No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.
+
+| File | Key | Values |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary` (default: timer, tokens and masked thinking text in WebChat), `status` (timer and tokens only), `off` (no thinking frames; WebChat still shows its own timer) |
+| `config.toml` | `[thinking] max_chars` | thinking text per turn, default 4000, clamped to 200–20000 |
+| `config.toml` | `[thinking] anthropic_display` | `summarized` (default) or `updates` (beta, only some Claude models) |
+| `agent.toml` | `[model] show_thinking` | `summary` / `status` / `off`; unset follows `[thinking] display`. The stricter of the two wins |
+
+A `config.toml` that cannot be read or parsed, or an unknown `display` value, counts as `status`. Only signed-in dashboard users in WebChat can see thinking text; messaging apps never do. Details: [Thinking display](../features/64-thinking-display.md).
+
 ## Advanced config editor
 
 Location: Settings → Advanced → Advanced config editor. Admins only; RPCs `config.raw.get` / `config.raw.set`.
