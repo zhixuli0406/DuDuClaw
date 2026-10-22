@@ -2,7 +2,7 @@
 
 > **白牌功能已在 1.72.2 移除。** 產品名稱、logo、副標題、主題色、公司欄位、About HTML 區塊、簽章品牌包與 `branding.*` RPC 都不存在了，`branding.json`／`branding.bundle.json` 會被忽略。每個 dashboard 一律顯示 DuDuClaw 的產品識別與固定的上游原廠標示（嘟嘟數位科技有限公司 / Dudu Technology Ltd.），這個標示編譯在執行檔裡，設定檔和 RPC 都改不了。
 >
-> 總經銷專用 build 可以在關於頁多一塊總經銷資訊。它是建置輸入，不是 dashboard 設定，請見 [distributor-notice.md](distributor-notice.md)。
+> 總經銷專用 build 可以在關於頁多一塊總經銷資訊。內容由總經銷在授權 console 維護，不是 dashboard 設定，請見 [distributor-notice.md](distributor-notice.md)。
 
 這一頁現在只說明原廠端的經銷商金鑰控制台。
 
@@ -78,7 +78,7 @@ public_url      = "https://your-gateway.example.com"
 
 | 方法 | 存取權限 |
 |---|---|
-| `about.get` | 任何已登入使用者都能呼叫（固定的產品與原廠欄位、版本、授權方案；只有總經銷專用 build 才帶 `distributor_notice`） |
+| `about.get` | 任何已登入使用者都能呼叫（固定的產品與原廠欄位、版本、授權方案；只有總經銷專用 build，或總經銷發的授權取得簽章內容時，才帶 `distributor_notice`） |
 | `distributor.status/list/add/update/remove/issue/revoke/upgrade` | 需要管理員身分 |
 
 ## HTTP 控制平面介面（原廠 gateway，以簽發金鑰把關）
