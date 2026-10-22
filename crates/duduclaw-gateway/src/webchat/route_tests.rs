@@ -153,3 +153,54 @@ async fn a_suspended_account_loses_its_bindings() {
     let refused = route(&f, "@財務小幫手 幫我算帳", None).await.unwrap_err();
     assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
 }
+
+async fn route_as(f: &Fixture, user: &str, text: &str) -> Result<WebRoute, Box<ChatMessage>> {
+    decide_webchat_route(&f.state, user, text, None, "dudu", "webchat:x", "webchat:u").await
+}
+
+/// mgr (Manager) → lead (Manager) → emp1 (Employee, sales-rep Owner); the
+/// fixture's `emp` (finance Operator) reports to nobody.
+fn team(f: &Fixture) -> (String, String) {
+    let db = &f.state.user_db;
+    let mk = |email: &str, role| db.create_user(email, email, "EmpPass-12345", role).unwrap().id;
+    let mgr = mk("mgr@test.local", UserRole::Manager);
+    let lead = mk("lead@test.local", UserRole::Manager);
+    let emp1 = mk("emp1@test.local", UserRole::Employee);
+    db.set_manager(&lead, Some(&mgr)).unwrap();
+    db.set_manager(&emp1, Some(&lead)).unwrap();
+    db.bind_agent(&emp1, "sales-rep", AccessLevel::Owner).unwrap();
+    (mgr, lead)
+}
+
+#[tokio::test]
+async fn a_manager_calls_a_reports_employee_but_not_a_peers() {
+    let f = fixture().await;
+    let (mgr, _lead) = team(&f);
+    let r = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap();
+    assert_eq!(r.agent.as_deref(), Some("sales-rep"));
+    assert!(r.switched);
+    let refused = route_as(&f, &mgr, "@財務小幫手 幫我算帳").await.unwrap_err();
+    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    match *route_as(&f, &mgr, "@").await.unwrap_err() {
+        ChatMessage::Error { choices, .. } => assert_eq!(
+            choices.unwrap(),
+            vec!["@嘟嘟總機".to_string(), "@業務專員".to_string()]
+        ),
+        other => panic!("expected choices, got {other:?}"),
+    }
+    // Explicit selection follows the same set.
+    assert!(f.state.agent_access_allowed(&mgr, "sales-rep").await);
+    assert!(!f.state.agent_access_allowed(&mgr, "finance").await);
+}
+
+#[tokio::test]
+async fn cutting_the_reporting_line_takes_effect_on_the_next_message() {
+    let f = fixture().await;
+    let (mgr, lead) = team(&f);
+    // Warm the ACL cache, then change the org: no TTL wait.
+    assert!(route_as(&f, &mgr, "@sales-rep 報價").await.is_ok());
+    f.state.user_db.set_manager(&lead, None).unwrap();
+    let refused = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap_err();
+    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert!(!f.state.agent_access_allowed(&mgr, "sales-rep").await);
+}

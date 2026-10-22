@@ -3896,6 +3896,17 @@ pub(crate) async fn resolve_fallback_agent<'r>(
     session_id: &str,
     user_id: &str,
 ) -> Option<&'r duduclaw_agent::registry::LoadedAgent> {
+    resolve_fallback_agent_in(&ctx.home_dir, reg, session_id, user_id).await
+}
+
+/// [`resolve_fallback_agent`] for callers without a [`ReplyContext`] (the
+/// `agents.callable` RPC resolves WebChat's default employee with it).
+pub(crate) async fn resolve_fallback_agent_in<'r>(
+    home_dir: &std::path::Path,
+    reg: &'r AgentRegistry,
+    session_id: &str,
+    user_id: &str,
+) -> Option<&'r duduclaw_agent::registry::LoadedAgent> {
     let channel = session_id
         .split(':')
         .next()
@@ -3915,7 +3926,7 @@ pub(crate) async fn resolve_fallback_agent<'r>(
         return Some(resolved);
     }
     // Fallback: config.toml default_agent → main_agent()
-    let Some(name) = get_default_agent(&ctx.home_dir).await else {
+    let Some(name) = get_default_agent(home_dir).await else {
         return reg.main_agent();
     };
     match reg.get(&name) {

@@ -84,6 +84,37 @@ export interface AgentEvolution {
   max_silence_hours: number;
 }
 
+/** Where the right to call an AI staff member comes from (`agents.callable`). */
+export type CallableVia = 'admin' | 'binding' | 'team' | 'default' | 'public';
+
+/** One AI staff member the signed-in account may call from the chat: the
+ *  WebChat `@` list and staff picker. Computed on the server with the same
+ *  check every message goes through, so everything listed can be called. */
+export interface CallableAgent {
+  name: string;
+  display_name: string;
+  /** The exact `@…` text that calls this staff member. */
+  call_text: string;
+  department?: string;
+  icon?: string;
+  has_avatar?: boolean;
+  trigger?: string;
+  role?: string;
+  status?: string;
+  via: CallableVia;
+  /** `team` only: the report whose AI staff this is. */
+  via_user?: string;
+  via_user_name?: string;
+  depth?: number;
+  /** Access the grant carries; `null` for the default / public staff. */
+  level: 'owner' | 'operator' | 'viewer' | null;
+  /** May hand this staff member a task. */
+  assignable: boolean;
+  /** May be picked as the conversation partner (the default staff member is
+   *  reached by picking nobody; public staff only by `@`). */
+  selectable: boolean;
+}
+
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
@@ -5623,6 +5654,10 @@ export const api = {
      *  (hidden by default). */
     list: (params?: { include_archived?: boolean }) =>
       client.call('agents.list', params ?? {}) as Promise<{ agents: AgentDetail[] }>,
+    /** AI staff the caller may call from the chat (own, team, default,
+     *  public), with where each right comes from. */
+    callable: () =>
+      client.call('agents.callable', {}) as Promise<{ agents: CallableAgent[]; default_agent: string | null }>,
     status: (agentId: string) =>
       client.call('agents.status', { agent_id: agentId }) as Promise<AgentDetail>,
     create: (params: {

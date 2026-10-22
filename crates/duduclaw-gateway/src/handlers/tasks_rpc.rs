@@ -57,6 +57,28 @@ impl MethodHandler {
         Ok(reader)
     }
 
+    /// [`Self::task_list_reader`] for the task board (`tasks.list`,
+    /// `tasks.list_page`): a Manager may also list an employee they may
+    /// assign to through a report. Content stays behind
+    /// `TaskReader::can_read` (direct Viewer and the task's audience), so a
+    /// team-only reader gets board cards.
+    pub(crate) fn task_board_reader(
+        &self,
+        ctx: &UserContext,
+        agent_id: Option<&str>,
+    ) -> Result<TaskReader<'_>, WsFrame> {
+        let reader = TaskReader::new(&self.home_dir, ctx)?;
+        let live = reader.live();
+        let allowed = live.is_admin()
+            || agent_id.is_some_and(|a| {
+                live.has_agent_access(a, AccessLevel::Viewer) || live.can_assign_to(a)
+            });
+        if !allowed {
+            return Err(WsFrame::error_response("", PERMISSION_DENIED));
+        }
+        Ok(reader)
+    }
+
     pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
@@ -64,7 +86,7 @@ impl MethodHandler {
         };
         let status = params.get("status").and_then(|v| v.as_str());
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
-        let reader = match self.task_list_reader(ctx, agent_id) {
+        let reader = match self.task_board_reader(ctx, agent_id) {
             Ok(r) => r,
             Err(f) => return f,
         };
@@ -260,13 +282,12 @@ impl MethodHandler {
             // Unknown task → only admins may probe; others get a generic denial.
             return WsFrame::error_response("", "permission denied");
         }
-        // If re-assigning to a different agent, the caller must also be bound
-        // (Operator) to the destination agent.
+        // If re-assigning to a different agent, the caller must also be
+        // allowed to hand that agent work: Operator on it, or a team grant
+        // that derived Operator (`can_assign_to`, on the live identity).
         if let Some(dest) = params.get("assigned_to").and_then(|v| v.as_str()) {
-            if !dest.is_empty() {
-                if let Err(e) = acl::require_agent_access(ctx, dest, AccessLevel::Operator) {
-                    return WsFrame::error_response("", &e);
-                }
+            if !dest.is_empty() && !ctx.can_assign_to(dest) {
+                return WsFrame::error_response("", PERMISSION_DENIED);
             }
         }
         // HIGH-1 parity with the MCP layer: a depends_on rewire must reference
@@ -563,7 +584,7 @@ impl MethodHandler {
         };
         let status = params.get("status").and_then(|v| v.as_str());
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
-        let reader = match self.task_list_reader(ctx, agent_id) {
+        let reader = match self.task_board_reader(ctx, agent_id) {
             Ok(r) => r,
             Err(f) => return f,
         };

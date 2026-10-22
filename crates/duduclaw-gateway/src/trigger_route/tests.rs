@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use duduclaw_agent::registry::AgentRegistry;
@@ -109,16 +110,25 @@ pub(crate) async fn registry(public_sales: bool) -> (tempfile::TempDir, AgentReg
     (tmp, reg)
 }
 
+fn effective(role: UserRole, bound: &[&str]) -> duduclaw_auth::EffectiveAccess {
+    duduclaw_auth::EffectiveAccess {
+        user_id: if role == UserRole::Admin { "a1" } else { "u1" }.into(),
+        role,
+        direct: bound
+            .iter()
+            .map(|s| (s.to_string(), duduclaw_auth::AccessLevel::Operator))
+            .collect(),
+        team: BTreeMap::new(),
+        generation: 1,
+    }
+}
+
 fn account(bound: &[&str], _channel: bool) -> SenderAccess {
-    SenderAccess::from_role(
-        "u1",
-        UserRole::Employee,
-        bound.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
-    )
+    SenderAccess::from_effective(Arc::new(effective(UserRole::Employee, bound)))
 }
 
 fn admin() -> SenderAccess {
-    SenderAccess::from_role("a1", UserRole::Admin, BTreeSet::new())
+    SenderAccess::from_effective(Arc::new(effective(UserRole::Admin, &[])))
 }
 
 #[tokio::test]
@@ -567,11 +577,13 @@ fn unmapped_audit_label_does_not_carry_the_platform_id() {
     }
     assert_eq!(
         SenderAccess {
-            sender: Sender::Admin
+            sender: Sender::Admin { user_id: None }
         }
         .audit_label(home.path(), "line", "x"),
         "admin"
     );
+    // A real Admin account is recorded as that account.
+    assert_eq!(admin().audit_label(home.path(), "line", "x"), "user:a1");
 }
 
 #[tokio::test]
@@ -602,7 +614,7 @@ async fn channel_sender_maps_only_through_a_verified_identity() {
     );
     let mapped = access::for_channel_sender(t.path(), "line", "U-verified");
     match mapped.sender {
-        Sender::Account { bound, .. } => assert!(bound.contains("finance")),
+        Sender::Account { access, .. } => assert!(access.may_call("finance")),
         other => panic!("expected a mapped account, got {other:?}"),
     }
 }
