@@ -11,12 +11,21 @@
 //! - [`route`]: `POST /api/internal/knowledge`, the signed loopback route
 //!   behind the read-only `knowledge_*` MCP tools.
 //! - [`turn_requesters`]: who a live turn is for.
+//! - [`embedding`]: the embedder in effect (`[knowledge.embedding]`), embed
+//!   job scheduling; [`embed_job`] runs one; [`embedding_rpc`] is
+//!   `knowledge.embedding.*`; [`redaction_adapter`] de-identifies text
+//!   before a cloud embedding call.
 //!
 //! Writes happen only here. Every read goes through
 //! `duduclaw_knowledge::acl::effective_collections`.
 
+pub mod embed_job;
+pub mod embedding;
+pub mod embedding_rpc;
+pub mod embedding_select;
 pub mod extract_spawn;
 pub mod pipeline;
+pub mod redaction_adapter;
 pub mod route;
 pub mod rpc;
 pub mod turn_requesters;

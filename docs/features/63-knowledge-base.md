@@ -2,7 +2,7 @@
 
 Upload company documents (handbooks, price lists, product FAQs) into **collections**, decide per collection who may read them, and let AI employees search them with citations to the page, slide or spreadsheet rows they came from.
 
-Status in this release: storage, ingestion, keyword search, the `knowledge.*` RPCs, the upload route, the three read-only MCP tools and the `duduclaw knowledge eval` command. The dashboard pages, vector (semantic) search, automatic injection into channel replies and citation footers come in later releases. The existing wikis are not touched.
+Status in this release: storage, ingestion, keyword search, meaning-based (vector) search with a local model or an optional cloud provider, the `knowledge.*` RPCs, the upload route, the three read-only MCP tools and the `duduclaw knowledge eval` command. Automatic injection into channel replies and citation footers come in later releases. The existing wikis are not touched.
 
 ---
 
@@ -57,7 +57,7 @@ Formats: PDF with a text layer, Word `.docx`, Excel `.xlsx` / `.xls`, PowerPoint
 
 The same file uploaded twice to one collection answers `duplicate` and returns the existing source. Different collections can hold the same file.
 
-A source moves `queued → extracting → indexing → ready`. While there is no vector model, `ready` carries `status_detail = "keyword_only"`. Failures keep a closed-set code and a message for the uploader:
+A source moves `queued → extracting → indexing → ready`, and then through `embedding` back to `ready` while its vectors are computed (it is searchable by keywords the whole time). `status_detail` says what search covers it: `hybrid` (vectors done), `keyword_only` (no usable model, or vectors failed; the source then carries an `embedding_failed` warning and is retried by the next backfill) or `vector_limit` (`max_vector_rows` reached). Failures keep a closed-set code and a message for the uploader:
 
 | Code | Meaning |
 |---|---|
@@ -88,14 +88,36 @@ Passages keep the document's own characters (full-width punctuation stays full-w
 
 ## Search
 
-Keyword search only in this release:
+Three ranked lists, each filtered to the collections the caller may read before anything is ranked, merged with reciprocal rank fusion (`Σ 1/(60 + rank)`, ties by passage id, at most three passages per source):
 
-- Terms of three or more characters go through a SQLite FTS5 trigram index. Chinese queries are split at particles such as 的、了、嗎 so 「請假的規定」 still finds 「請假規定」.
-- Two-character terms (「請假」, `HR`) use a bounded substring scan of up to 20,000 passages; the result says `scan_capped` when the scan hit the ceiling.
-- When the trigram list finds fewer than three passages, the two-character pieces of longer words join the substring scan.
-- The lists are merged with reciprocal rank fusion, at most three passages per source.
+- **Trigram**: terms of three or more characters go through a SQLite FTS5 trigram index. Chinese queries are split at particles such as 的、了、嗎 so 「請假的規定」 still finds 「請假規定」.
+- **Short terms**: two-character terms (「請假」, `HR`) use a bounded substring scan of up to 20,000 passages; the result says `scan_capped` when the scan hit the ceiling. When the trigram list finds fewer than three passages, the two-character pieces of longer words join the scan.
+- **Vectors** (meaning-based): the question is embedded with the same model as the passages and compared by cosine similarity with every passage of the allowed collections (brute force over an in-memory copy, reloaded whenever passages or vectors change). This is what finds 「小孩生病要在家顧可以請什麼假」 in a passage about 家庭照顧假.
 
-Every result says the search mode and why vector search is off. Queries phrased differently from the document (「薪水」 for 「薪資」) are missed until vector search arrives.
+Every result says the mode (`hybrid`, `keyword_only`, `vector_only`), the share of searched passages that have vectors (`coverage`) and, when vectors were not used, why (`vector_unavailable`): no model installed, model files that fail their check, an unsupported platform, a cloud provider without the disclosure acknowledgement, redaction switched off, a missing API key, a cloud error, or every allowed collection being kept off the cloud. Search then runs on keywords only; it never switches to another provider on its own. The gateway also logs the reason (at most once an hour per reason).
+
+### Embedding models
+
+| | multilingual-e5-small (default) | Qwen3-Embedding-0.6B (optional) |
+|---|---|---|
+| Runs | on this machine (ONNX Runtime 1.24.2) | on this machine (ONNX Runtime 1.24.2) |
+| Files | `intfloat/multilingual-e5-small` @ `614241f6`: int8 ONNX 118 MB + tokenizer 17 MB | `onnx-community/Qwen3-Embedding-0.6B-ONNX` @ `c25a394d`: int8 ONNX 614 MB + tokenizer 11 MB |
+| Licence | MIT | Apache-2.0 (base model `Qwen/Qwen3-Embedding-0.6B`; the conversion repository declares none of its own) |
+| Vector | 384 dimensions, mean pooling, `query: ` / `passage: ` prefixes | first 512 of 1,024 dimensions, last-token pooling, an English instruction before the question |
+| Speed (Apple M4, 5 threads) | about 1,200–2,500 passages per minute | about 150–340 passages per minute |
+
+Every file is pinned to one commit with its size and SHA-256; nothing resolves "latest". Models are not part of the binary: an Admin installs one from **Settings → Knowledge base search** (the ONNX Runtime library, about 30 MB, is installed with it when missing, shared with the AI detection of redaction). After an install every passage gets a vector in the background; a re-indexed source keeps the vectors of passages whose text did not change. A model unused for `idle_unload_minutes` is unloaded. Models with a non-commercial licence (jina-embeddings v3 / v5) are not offered. macOS on Intel has no ONNX Runtime build at this version and shows "unsupported".
+
+**Offline machines**: each release carries `duduclaw-kb-model-multilingual-e5-small-<platform>.tar` (model files plus the runtime archive; `scripts/kb-model-bundle.sh <platform> <model> <dir>` builds one for any catalog model). Unpack it into the DuDuClaw folder (`tar -xf … -C ~/.duduclaw`) and press **Check again (offline install)**: every file is hashed against the same pins before the model counts as installed.
+
+### Cloud providers
+
+`provider = "openai"` (`text-embedding-3-small`, 1,536 dimensions) or `"gemini"` (`gemini-embedding-001`, 768 dimensions) computes vectors at the provider instead. Rules:
+
+- An Admin chooses it in the dashboard and must tick that passages (after de-identification) go to that vendor and host. The acknowledgement (who, when, provider, host, model) is stored in `config.toml`; changing the provider, endpoint or model needs a new one, and choosing anything else removes it.
+- Every passage and every question goes through the operator's `[redaction]` rules first; each hit becomes a marker such as `[EMAIL]` and nothing is restored. Redaction switched off or force-disabled, rules that do not compile, or no rule at all: nothing is sent, search stays keyword-only. Rule-based redaction does not catch every name; turn on AI detection if names must not leave.
+- `restricted` collections and collections with `embedding_policy = "local_only"` are never sent; under a cloud provider they are searched by keywords only.
+- The API key comes from the account list (`cloud_account` narrows it to one account) or the provider's environment variable. A cloud error makes that search keyword-only, and the affected source keeps an `embedding_failed` warning until the next backfill succeeds.
 
 ## For AI employees
 
@@ -131,24 +153,40 @@ access_log_retention_days = 180
 max_collection_bytes = 2147483648 # 2 GB of original files per collection
 max_total_bytes = 21474836480     # 20 GB in total
 extract_when_unavailable = "refuse"  # or "run_unsandboxed"
+
+[knowledge.embedding]
+provider = "local"                     # local | openai | gemini | none
+local_model = "multilingual-e5-small"  # or "qwen3-embedding-0.6b"
+cloud_model = ""                       # empty = the provider's default
+cloud_account = ""                     # account id; empty = any account of that provider, then the env var
+cloud_base_url = ""                    # empty = the official endpoint; https only (http only to 127.0.0.1)
+batch_size = 16
+threads = 0                            # 0 = half the cores
+max_vector_rows = 200000
+idle_unload_minutes = 10
+# cloud_disclosure_ack is written by the dashboard
 ```
 
-Out-of-range values are clamped. `enabled = false` hides the tools and refuses every RPC and upload.
+Out-of-range values are clamped. `enabled = false` hides the tools and refuses every RPC and upload. An unknown `provider` value means keyword-only search, shown with the reason.
+
+RPCs: `knowledge.embedding.status` (any signed-in user) and, Admin only, `.install {model}`, `.cancel`, `.remove {model}`, `.verify_offline {model}`, `.select {provider, local_model?, cloud_model?, cloud_account?, acknowledge_disclosure?}`, `.rebuild`. Installing, removing and changing the provider are written to `security_audit.jsonl`.
 
 ## Checking retrieval quality
 
 ```
-duduclaw knowledge eval --docs <folder> --questions <questions.jsonl> [--k 5] [--min-recall 0.85] [--report out.json]
+duduclaw knowledge eval --docs <folder> --questions <questions.jsonl>
+  [--model none|local:multilingual-e5-small|local:qwen3-embedding-0.6b] [--model-home <dir>]
+  [--modes keyword,vector,hybrid] [--k 5] [--min-recall 0.85] [--report out.json] [--work-dir <empty dir>]
 ```
 
-Builds a throw-away database in a temporary folder, ingests the folder with the same extraction process and indexing the gateway uses, and reports Recall@1/5/10 and MRR@10 per question type, how often unanswerable questions get no result, and query latency. Exit code 1 when Recall@k is below `--min-recall`. Question lines look like:
+Builds a throw-away database in a temporary folder, ingests the folder with the same extraction process and indexing the gateway uses, and reports Recall@1/5/10 and MRR@10 per question type, how often unanswerable questions get no result, and query latency. With a `local:` model (installed under the DuDuClaw home or `--model-home`) every passage is embedded once and the report adds passages per minute, the vector size and peak memory, plus the `vector` (model only) and `hybrid` modes. Exit code 1 when Recall@k is below `--min-recall`. Question lines look like:
 
 ```json
 {"id":"q01","question":"到職滿一年的特休有幾天？","type":"factoid","gold":[{"source":"員工手冊.md","contains":"特別休假七日"}]}
 {"id":"q13","question":"公司有員工宿舍嗎？","type":"unanswerable","answerable":false}
 ```
 
-A gold entry can also name `page`, `slide`, `sheet` and `row`. A small fictional set lives in `crates/duduclaw-knowledge/tests/fixtures/eval/`; keep real customer documents and questions out of the repository.
+A gold entry can also name `page`, `slide`, `sheet` and `row`. Two fictional sets live in the repository: `crates/duduclaw-knowledge/tests/fixtures/eval/` (14 questions) and `eval-zh50/` (5 documents, 50 questions including 8 paraphrases with no shared terms). On `eval-zh50` (Apple M4, 2026-10-22), Recall@5 was 0.78 for keywords, 0.96 hybrid with multilingual-e5-small and 0.93 hybrid with Qwen3-Embedding-0.6B, which is why e5 stays the default. Keep real customer documents and questions out of the repository.
 
 ## Data and deletion
 

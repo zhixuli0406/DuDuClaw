@@ -41,5 +41,17 @@ ego-tree = "0.10"
 # PDF text layer (MIT). Pulls lopdf (MIT) with default features off.
 pdf-extract = "=0.12.1"
 
+# Vector retrieval (local embedding models). ONNX Runtime is loaded at
+# runtime from `<home>/lib/onnxruntime/<ver>/` through the shared
+# `duduclaw-onnx` init (one per process, shared with redaction NER); the
+# `ort` features must stay identical to duduclaw-redaction's.
+duduclaw-onnx = { workspace = true, features = ["install", "runtime"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# Model download (async, through duduclaw-onnx) and the cloud embedding
+# providers (blocking client; only ever called off the async runtime).
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }

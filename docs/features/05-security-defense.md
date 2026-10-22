@@ -233,8 +233,11 @@ The [document knowledge base](63-knowledge-base.md) adds collections of uploaded
 - **Document text is data**: passages are scanned for injection wording when indexed and marked; tool results put them in a marked block where every line starts with `│ `, so a document cannot forge a result header. A tool call whose turn the gateway did not register reads nothing. Only people with an editor role add sources in this release.
 - **Web pages by URL** go through the public-page fetch rules (no internal addresses, no userinfo, no redirects, 5 MB).
 - **Audit**: every read is written to the knowledge access log; collection, permission and deletion changes also go to `security_audit.jsonl`.
+- **Vectors respect the same permissions**: the vector list is filtered to the allowed collections before any similarity is computed, so a forbidden collection cannot take a top-k slot.
+- **Embedding models are pinned**: each model file and the ONNX Runtime archive are named with size and SHA-256 at one commit; a download or an offline bundle that does not match is refused, and only a fully verified install counts. Local models keep document text on the machine.
+- **Cloud embeddings are opt-in and fail closed**: an Admin must acknowledge which vendor and host receive passages (bound to provider, host and model; any change needs a new acknowledgement). Passages and questions go through the `[redaction]` rules first, hits replaced by category markers; with redaction off, rules failing to compile or no rules, nothing is sent and search stays keyword-only. `restricted` and `local_only` collections are never sent. Endpoints must be `https` (plain `http` only to `127.0.0.1`), redirects are not followed and provider error text is cut to 200 characters. Installing, removing and switching providers are written to `security_audit.jsonl`.
 
-Not covered yet: Windows has no extraction sandbox (files are refused there by default) or memory limit; the gateway does not yet resolve which signed-in person a WebChat or channel turn is for, so such tool calls only get channel grants.
+Not covered yet: Windows has no extraction sandbox (files are refused there by default) or memory limit; the gateway does not yet resolve which signed-in person a WebChat or channel turn is for, so such tool calls only get channel grants. Rule-based redaction does not recognise every personal name in passages sent to a cloud embedding provider (the AI detection model does better, not perfectly).
 
 ## What these guards do not cover
 

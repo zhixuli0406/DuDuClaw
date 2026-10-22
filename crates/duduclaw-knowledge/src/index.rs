@@ -1,7 +1,10 @@
 //! Write a prepared source (segments + chunks) in one transaction.
 //!
 //! Re-indexing replaces the old rows inside the same transaction, so the
-//! previous index stays searchable until the new one commits. Every chunk is
+//! previous index stays searchable until the new one commits. Vectors of
+//! the old chunks are carried over to new chunks with the same
+//! `text_sha256` (same text, same vector) so an unchanged passage is never
+//! re-embedded. Every chunk is
 //! passed through the caller's injection check; a hit sets `flags` bit 0
 //! (the passage is still searchable by tools, marked suspect, and is never
 //! auto-injected into a prompt).
@@ -82,6 +85,16 @@ pub fn write_index(
             ),
         });
     }
+    // Keep the old vectors by passage hash before the cascade drops them.
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS kb_carry(text_sha256 TEXT, model_id TEXT, dim INTEGER, vec BLOB);
+         DELETE FROM kb_carry;",
+    )?;
+    tx.execute(
+        "INSERT INTO kb_carry SELECT c.text_sha256, e.model_id, e.dim, e.vec
+           FROM chunks c JOIN embeddings e ON e.chunk_id = c.id WHERE c.source_id = ?1",
+        params![source_id],
+    )?;
     tx.execute(
         "DELETE FROM chunks WHERE source_id = ?1",
         params![source_id],
@@ -140,6 +153,16 @@ pub fn write_index(
                 c.match_heading,
             ])?;
         }
+    }
+    let carried = tx.execute(
+        "INSERT OR IGNORE INTO embeddings(chunk_id, model_id, dim, vec, created_at)
+         SELECT c.id, k.model_id, k.dim, k.vec, ?2 FROM chunks c JOIN kb_carry k ON k.text_sha256 = c.text_sha256
+          WHERE c.source_id = ?1",
+        params![source_id, crate::now_rfc3339()],
+    )?;
+    tx.execute("DELETE FROM kb_carry", [])?;
+    if carried > 0 {
+        tracing::debug!(source = %source_id, carried, "knowledge: vectors carried over on reindex");
     }
     let mut all_warnings: Vec<serde_json::Value> = warnings
         .iter()
@@ -313,6 +336,62 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn reindex_keeps_vectors_of_unchanged_passages() {
+        let mut conn = crate::schema::open_in_memory().unwrap();
+        let cfg = KnowledgeConfig::default();
+        let c = create_collection(
+            &mut conn,
+            &NewCollection {
+                name: "HR".into(),
+                ..Default::default()
+            },
+            "u",
+            &cfg,
+        )
+        .unwrap();
+        let sid = indexed_source(&mut conn, &c.id, "手冊", &["不變的段落內容。", "會被改掉的段落。"]);
+        let ids: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare("SELECT id, text FROM chunks WHERE source_id = ?1 ORDER BY ord").unwrap();
+            stmt.query_map(params![sid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        assert!(!ids.is_empty());
+        let rows: Vec<(i64, Vec<f32>)> = ids.iter().map(|(id, _)| (*id, vec![1.0, 0.0])).collect();
+        crate::embed::vectors::store(&mut conn, "m", &rows).unwrap();
+        // Re-extract: the first page unchanged, the second edited.
+        let raw = vec![
+            {
+                let mut s = crate::extract::RawSegment::new(crate::extract::SegmentKind::Page, "不變的段落內容。".into());
+                s.page = Some(1);
+                s
+            },
+            {
+                let mut s = crate::extract::RawSegment::new(crate::extract::SegmentKind::Page, "改寫後的新段落。".into());
+                s.page = Some(2);
+                s
+            },
+        ];
+        let prepared = crate::chunk::prepare(crate::extract::Format::Pdf, raw);
+        let old_shas: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("SELECT text_sha256 FROM chunks WHERE source_id = ?1").unwrap();
+            stmt.query_map(params![sid], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        write_index(&mut conn, &sid, &prepared, &[], "test", &|_| false, &cfg).unwrap();
+        let after: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.text_sha256, (SELECT COUNT(*) FROM embeddings e WHERE e.chunk_id = c.id) FROM chunks c WHERE c.source_id = ?1",
+                )
+                .unwrap();
+            stmt.query_map(params![sid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        for (sha, n) in &after {
+            let expect = if old_shas.contains(sha) { 1 } else { 0 };
+            assert_eq!(*n, expect, "chunk {sha}: unchanged text keeps its vector, new text has none");
+        }
+        assert!(after.iter().any(|(_, n)| *n == 0), "the edited passage needs a new vector");
     }
 
     #[test]
