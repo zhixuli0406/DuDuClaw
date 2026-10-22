@@ -116,11 +116,18 @@ pub fn skip_query(text: &str) -> bool {
     t.chars().count() < MIN_QUERY_CHARS && plan_query(t).is_empty()
 }
 
+/// Cosine similarity a vector-only hit needs to count as relevant. An
+/// estimate for the default multilingual model, to be tuned with
+/// `duduclaw knowledge eval`.
+pub const VECTOR_MIN_SCORE: f32 = 0.80;
+
 /// The relevance gate for automatic injection and `kb_only`: the hit came
-/// from the keyword lists (FTS or the short-term scan). Vector-only hits
-/// will need their own similarity floor when vector retrieval exists.
+/// from the keyword lists (FTS or the short-term scan), or its cosine
+/// similarity reaches [`VECTOR_MIN_SCORE`].
 pub fn passes_threshold(hit: &Hit) -> bool {
-    hit.fts_rank.is_some() || hit.like_rank.is_some()
+    hit.fts_rank.is_some()
+        || hit.like_rank.is_some()
+        || hit.vec_score.is_some_and(|s| s >= VECTOR_MIN_SCORE)
 }
 
 /// Pick the passages to inject from ranked `hits`: only when the best hit
@@ -216,6 +223,7 @@ mod tests {
             fts_rank: fts.then_some(1),
             like_rank: None,
             vec_rank: None,
+            vec_score: None,
             suspect: false,
         }
     }
@@ -252,6 +260,12 @@ mod tests {
         let hits = vec![hit(1, "內容", false)];
         assert!(select(&hits, 5, 6000).is_empty());
         assert!(select(&[], 5, 6000).is_empty());
+        // Vector-only hits need the similarity floor.
+        let mut weak = hit(2, "語意相近", false);
+        weak.vec_score = Some(VECTOR_MIN_SCORE - 0.05);
+        assert!(select(std::slice::from_ref(&weak), 5, 6000).is_empty());
+        weak.vec_score = Some(VECTOR_MIN_SCORE + 0.01);
+        assert_eq!(select(&[weak], 5, 6000).len(), 1);
     }
 
     #[test]

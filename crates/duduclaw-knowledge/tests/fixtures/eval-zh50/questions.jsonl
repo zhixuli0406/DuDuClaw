@@ -1,0 +1,51 @@
+# Synthetic zh-TW retrieval eval set (fictional company, no real data)
+{"id": "q01", "question": "在公司做滿一年但不到兩年的員工，特休有幾天？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "滿一年未滿二年者，給七日"}]}
+{"id": "q02", "question": "員工自己結婚可以請幾天婚假？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "給予婚假八日"}]}
+{"id": "q03", "question": "薪水是每個月幾號發放？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "每月薪資於次月五日發放"}]}
+{"id": "q04", "question": "平日加班的前兩個小時，加班費是平日時薪的幾倍？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "工資額的 1.34 倍"}]}
+{"id": "q05", "question": "每週最多可以在家遠距工作幾天？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "最多可在家遠距工作兩天"}]}
+{"id": "q06", "question": "教育訓練補助每年最高可以申請多少錢？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "最高新台幣二萬四千元"}]}
+{"id": "q07", "question": "國內出差搭高鐵可以坐商務車廂嗎？", "type": "factoid", "answerable": true, "gold": [{"source": "差旅與報帳辦法.md", "contains": "不得搭乘商務車廂"}]}
+{"id": "q08", "question": "出差回來後多久之內要完成報帳？", "type": "factoid", "answerable": true, "gold": [{"source": "差旅與報帳辦法.md", "contains": "十個工作天內須完成報帳"}]}
+{"id": "q09", "question": "公司帳號的密碼長度最少要幾個字元？", "type": "factoid", "answerable": true, "gold": [{"source": "資訊安全政策.txt", "contains": "密碼長度至少十四個字元"}]}
+{"id": "q10", "question": "資安事件通報專線的分機號碼是多少？", "type": "factoid", "answerable": true, "gold": [{"source": "資訊安全政策.txt", "contains": "分機 8800"}]}
+{"id": "q11", "question": "智慧門鎖 QL-200 的保固期有多久？", "type": "factoid", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "二十四個月的原廠保固"}]}
+{"id": "q12", "question": "錯誤代碼 E-42 代表什麼問題？", "type": "factoid", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "E-42 代表鎖舌卡住"}]}
+{"id": "q13", "question": "客服專線平日的服務時間是幾點到幾點？", "type": "factoid", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "上午九點至下午六點"}]}
+{"id": "q14", "question": "父母過世時可以請幾天喪假？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "給予喪假八日"}]}
+{"id": "q15", "question": "女性員工生產可以請多久的產假？", "type": "factoid", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "給予產假八週"}]}
+{"id": "q16", "question": "QL-200 智慧門鎖的單價是多少？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "6980", "row": 2}]}
+{"id": "q17", "question": "防水版的環境感測器最小訂購量是多少？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "1190 | 10 | 10", "row": 6}]}
+{"id": "q18", "question": "QS-320 的交期要幾個工作天？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "2380 | 5 | 14", "row": 7}]}
+{"id": "q19", "question": "漏水感測器一個多少錢？最少要買幾個？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "650 | 20 | 7", "row": 8}]}
+{"id": "q20", "question": "PoE 版的閘道器售價是多少？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "3480", "row": 10}]}
+{"id": "q21", "question": "進階閘道器下單後要等幾個工作天？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "4680 | 1 | 10", "row": 11}]}
+{"id": "q22", "question": "北北桃地區的現場安裝服務，每把門鎖收費多少？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "1500", "row": 22}]}
+{"id": "q23", "question": "企業部署顧問每人天的費用是多少？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "18000", "row": 26}]}
+{"id": "q24", "question": "門鎖防盜擋板的最小訂購量和交期是多少？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "680 | 5 | 7", "row": 20}]}
+{"id": "q25", "question": "飯店客房組的交期是幾個工作天？", "type": "table", "answerable": true, "gold": [{"source": "價目表.csv", "contains": "36500 | 1 | 21", "row": 31}]}
+{"id": "q26", "question": "小孩生病要在家顧，可以請什麼假？", "type": "paraphrase", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "家庭照顧假一年內合計七日"}]}
+{"id": "q27", "question": "太太生寶寶的時候，老公可以放幾天假？", "type": "paraphrase", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "陪產假，合計七日"}]}
+{"id": "q28", "question": "想辭職的話，在公司待超過三年的人至少要早多久跟公司說？", "type": "paraphrase", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "滿三年以上者，提前三十日"}]}
+{"id": "q29", "question": "考到專業認證，公司會另外發紅包獎勵嗎？", "type": "paraphrase", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "證照獎勵金新台幣三千元"}]}
+{"id": "q30", "question": "筆電被偷或帳號被盜，要找誰處理？", "type": "paraphrase", "answerable": true, "gold": [{"source": "資訊安全政策.txt", "contains": "立即撥打資安專線"}]}
+{"id": "q31", "question": "小攤販只給我一張手寫單據，能不能拿來報帳？", "type": "paraphrase", "answerable": true, "gold": [{"source": "差旅與報帳辦法.md", "contains": "收據以新台幣一千元為限"}]}
+{"id": "q32", "question": "鎖具電力完全用光，人在門外要怎麼進去？", "type": "paraphrase", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "以行動電源臨時供電"}]}
+{"id": "q33", "question": "女生肚子痛，每個月能不能休一天？", "type": "paraphrase", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "每月得請生理假一日"}]}
+{"id": "q34", "question": "婚假", "type": "short", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "給予婚假八日"}]}
+{"id": "q35", "question": "E-17", "type": "short", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "E-17 表示門鎖"}]}
+{"id": "q36", "question": "VPN", "type": "short", "answerable": true, "gold": [{"source": "資訊安全政策.txt", "contains": "透過公司虛擬私有網路連線"}]}
+{"id": "q37", "question": "QG-50 保固", "type": "short", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "QG-50 保固十二個月"}]}
+{"id": "q38", "question": "特休", "type": "short", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "給特休三日"}]}
+{"id": "q39", "question": "生日禮金", "type": "short", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "生日禮金新台幣一千二百元"}]}
+{"id": "q40", "question": "團保", "type": "short", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "定期壽險新台幣一百萬元"}]}
+{"id": "q41", "question": "加班可以換補休嗎？補休最晚什麼時候要休完？", "type": "multi", "answerable": true, "gold": [{"source": "員工手冊.md", "contains": "加班後六個月內休畢"}]}
+{"id": "q42", "question": "出差時搭高鐵和計程車的規定，哪些情況計程車可以報支？", "type": "multi", "answerable": true, "gold": [{"source": "差旅與報帳辦法.md", "contains": "計程車僅限下列情況報支"}]}
+{"id": "q43", "question": "筆電遺失又擔心資料外洩，多久內要通報？", "type": "multi", "answerable": true, "gold": [{"source": "資訊安全政策.txt", "contains": "發現後一小時內通報"}]}
+{"id": "q44", "question": "QL-200 電池可以撐多久，電量不足時會怎麼提醒？", "type": "multi", "answerable": true, "gold": [{"source": "產品FAQ.txt", "contains": "續航約為十二個月"}]}
+{"id": "q45", "question": "去東京出差，住宿一晚上限多少，要不要附收據？", "type": "multi", "answerable": true, "gold": [{"source": "差旅與報帳辦法.md", "contains": "每晚上限新台幣六千五百元"}]}
+{"id": "q46", "question": "公司有提供員工宿舍嗎？", "type": "unanswerable", "answerable": false, "gold": []}
+{"id": "q47", "question": "可以帶寵物狗到辦公室上班嗎？", "type": "unanswerable", "answerable": false, "gold": []}
+{"id": "q48", "question": "公司有員工認股權或股票選擇權的制度嗎？", "type": "unanswerable", "answerable": false, "gold": []}
+{"id": "q49", "question": "健身房會員費公司有補助嗎？", "type": "unanswerable", "answerable": false, "gold": []}
+{"id": "q50", "question": "QL-200 可以接入 Apple HomeKit 嗎？", "type": "unanswerable", "answerable": false, "gold": []}

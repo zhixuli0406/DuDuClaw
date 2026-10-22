@@ -53,7 +53,23 @@ pub async fn prepare(input: TurnInput) -> TurnKnowledge {
     if input.agent_id.is_empty() || !super::enabled(&input.home) {
         return TurnKnowledge::default();
     }
-    match super::blocking(move || prepare_blocking(&input)).await {
+    let (home, agent, dir) = (
+        input.home.clone(),
+        input.agent_id.clone(),
+        input.agent_dir.clone(),
+    );
+    match super::blocking(move || has_agent_side(&home, &agent, &dir)).await {
+        Ok(true) => {}
+        Ok(false) => return TurnKnowledge::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "knowledge: automatic retrieval failed; none this turn");
+            return TurnKnowledge::default();
+        }
+    }
+    // Resolved only for an employee with collections: a local model load or
+    // a cloud call happens only when there is something to search.
+    let embedder = super::embedding::resolve(&input.home).await;
+    match super::blocking(move || prepare_blocking(&input, embedder.as_ref())).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "knowledge: automatic retrieval failed; none this turn");
@@ -72,7 +88,34 @@ fn injectable(conn: &Connection, allowed: &AllowedSet) -> KbResult<AllowedSet> {
     Ok(allowed.filtered(|id| !restricted.iter().any(|r| r == id)))
 }
 
-pub(crate) fn prepare_blocking(input: &TurnInput) -> KbResult<TurnKnowledge> {
+/// Whether the employee has at least one collection on its own side.
+fn has_agent_side(
+    home: &std::path::Path,
+    agent_id: &str,
+    agent_dir: &std::path::Path,
+) -> KbResult<bool> {
+    if !schema::db_path(home).exists() {
+        return Ok(false);
+    }
+    let (scope, department) = duduclaw_core::knowledge_agent::load_agent_knowledge(agent_dir);
+    if scope.is_off() {
+        return Ok(false);
+    }
+    let conn = schema::open_home(home)?;
+    let agent = agent_ctx(agent_id, department.as_deref(), &scope);
+    Ok(!agent_side_collections(&conn, &agent)?.is_empty())
+}
+
+/// The embedder and vector cache a lookup uses.
+struct Vectors<'a> {
+    embedder: &'a dyn duduclaw_knowledge::embed::Embedder,
+    cache: &'a duduclaw_knowledge::embed::vector_cache::VectorCache,
+}
+
+pub(crate) fn prepare_blocking(
+    input: &TurnInput,
+    embedder: &dyn duduclaw_knowledge::embed::Embedder,
+) -> KbResult<TurnKnowledge> {
     if !schema::db_path(&input.home).exists() {
         return Ok(TurnKnowledge::default());
     }
@@ -114,12 +157,17 @@ pub(crate) fn prepare_blocking(input: &TurnInput) -> KbResult<TurnKnowledge> {
     {
         return Ok(out);
     }
+    let cache = super::embedding::cache(&input.home);
+    let vectors = Vectors {
+        embedder,
+        cache: cache.as_ref(),
+    };
     let picked = search(
         &conn,
         &allowed,
         &input.query,
-        &global,
-        &settings,
+        (&global, &settings),
+        &vectors,
         &mut entry,
     )?;
     if picked.is_empty() {
@@ -160,8 +208,8 @@ fn search(
     conn: &Connection,
     allowed: &AllowedSet,
     query: &str,
-    global: &ChannelSettings,
-    settings: &RetrievalSettings,
+    (global, settings): (&ChannelSettings, &RetrievalSettings),
+    vectors: &Vectors<'_>,
     entry: &mut AccessEntry,
 ) -> KbResult<Vec<duduclaw_knowledge::search::Hit>> {
     let query = duduclaw_core::truncate_chars(query.trim(), super::route::MAX_QUERY_CHARS);
@@ -175,7 +223,8 @@ fn search(
         allowed,
         &query,
         settings.top_k.max(1) * 2,
-        &duduclaw_knowledge::embed::NoEmbedder,
+        vectors.embedder,
+        vectors.cache,
     )?;
     entry.mode = Some(r.mode.as_str().to_string());
     Ok(inject::select(

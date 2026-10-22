@@ -13,11 +13,11 @@
 //! - Document parsing ([`extract`]) only ever runs inside the
 //!   `duduclaw knowledge-extract` child process. The gateway owns the worker
 //!   that spawns it, the routes and every write.
-//! - Retrieval ([`search`]) is keyword-only in this release: FTS5 trigram for
-//!   terms of three or more characters, a bounded `LIKE` scan for two-char
-//!   terms (「請假」, `HR`), merged with reciprocal rank fusion. The
-//!   [`embed::Embedder`] trait is the seam for vector retrieval later; the
-//!   only implementation here is [`embed::NoEmbedder`].
+//! - Retrieval ([`search`]) is hybrid: FTS5 trigram for terms of three or
+//!   more characters, a bounded `LIKE` scan for two-char terms (「請假」,
+//!   `HR`) and, when an [`embed::Embedder`] is usable, brute-force cosine
+//!   over the allowed collections' vectors, merged with reciprocal rank
+//!   fusion. Without a usable embedder it is keyword-only and says why.
 //!
 //! Document text is data, never instructions: chunks are scanned for
 //! injection-like text at index time (`flags` bit 0) and callers render

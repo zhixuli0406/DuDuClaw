@@ -18,6 +18,7 @@ import {
   Share2,
   Gauge,
   FileCode,
+  BookSearch,
 } from 'lucide-react';
 import {
   SettingsShell,
@@ -30,6 +31,7 @@ import { isNewFeature } from '@/apps/registry';
 
 /** v1.68 (W2): 設定檔進階編輯 tab — new-feature chip. */
 const CONFIG_RAW_NEW_IN = '1.68.0';
+const KNOWLEDGE_SEARCH_NEW_IN = '1.76.0';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
 import { SystemTab } from '@/components/settings/sections/SystemTab';
@@ -40,6 +42,7 @@ import { ProactiveTab } from '@/components/settings/sections/ProactiveTab';
 import { AutopilotTab } from '@/components/settings/sections/AutopilotTab';
 import { SkillSynthesisTab } from '@/components/settings/sections/SkillSynthesisTab';
 import { RedactionTab } from '@/components/settings/sections/RedactionTab';
+import { EmbeddingSettingsCard } from '@/components/knowledge/EmbeddingSettingsCard';
 import { DoctorTab } from '@/components/settings/sections/DoctorTab';
 import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 import { AutomationTab } from '@/components/settings/sections/AutomationTab';
@@ -53,6 +56,8 @@ import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBann
 const VALID_TABS = [
   'general', 'account', 'system', 'container', 'heartbeat', 'voice',
   'proactive', 'automation', 'delegation', 'calibration', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
+  // 1.76: knowledge-base meaning-based search (embedding models), admin-only.
+  'knowledgeSearch',
   // v1.68 (W2): raw config.toml / inference.toml / agent.toml editor, admin-only.
   'configRaw',
 ] as const;
@@ -90,7 +95,7 @@ export function SettingsPage() {
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const version = useSystemStore((s) => s.status?.version ?? null);
 
-  const ADMIN_ONLY_TABS = ['delegation', 'calibration', 'configRaw'];
+  const ADMIN_ONLY_TABS = ['delegation', 'calibration', 'configRaw', 'knowledgeSearch'];
   const tabAllowed = (tab: string) =>
     (VALID_TABS as readonly string[]).includes(tab) && (!ADMIN_ONLY_TABS.includes(tab) || isAdmin);
   const activeTab: TabId = tabAllowed(tabParam ?? '') ? (tabParam as TabId) : 'general';
@@ -131,6 +136,20 @@ export function SettingsPage() {
         { value: 'autopilot', label: t('settings.autopilot'), icon: Workflow },
         { value: 'skillSynthesis', label: t('settings.skillSynthesis'), icon: Sparkles },
         { value: 'redaction', label: t('settings.redaction'), icon: EyeOff },
+        ...(isAdmin
+          ? [{
+              value: 'knowledgeSearch',
+              label: isNewFeature(KNOWLEDGE_SEARCH_NEW_IN, version) ? (
+                <span className="flex items-center gap-1.5">
+                  {t('settings.knowledgeSearch')}
+                  <span className="rounded border border-surface-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    {t('nav.badge.new')}
+                  </span>
+                </span>
+              ) : t('settings.knowledgeSearch'),
+              icon: BookSearch,
+            }]
+          : []),
         { value: 'doctor', label: t('settings.doctor'), icon: Stethoscope },
         { value: 'browser', label: t('settings.browser'), icon: Globe },
         ...(isAdmin
@@ -211,6 +230,11 @@ export function SettingsPage() {
         <SettingsTab value="redaction" title={t('settings.redaction')}>
           <RedactionTab />
         </SettingsTab>
+        {isAdmin && (
+          <SettingsTab value="knowledgeSearch" title={t('settings.knowledgeSearch')} description={t('settings.knowledgeSearch.desc')}>
+            <EmbeddingSettingsCard />
+          </SettingsTab>
+        )}
         <SettingsTab value="doctor" title={t('settings.doctor')} description={t('settings.doctor.desc')}>
           <DoctorTab />
         </SettingsTab>

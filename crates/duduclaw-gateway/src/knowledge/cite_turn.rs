@@ -168,6 +168,7 @@ mod tests {
             fts_rank: Some(1),
             like_rank: None,
             vec_rank: None,
+            vec_score: None,
             suspect: false,
         }
     }

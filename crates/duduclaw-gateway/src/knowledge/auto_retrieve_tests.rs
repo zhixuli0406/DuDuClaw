@@ -104,15 +104,18 @@ fn run(
     query: &str,
     turn: &str,
 ) -> TurnKnowledge {
-    prepare_blocking(&TurnInput {
-        home: h.dir.path().to_path_buf(),
-        users: Some(h.users.clone()),
-        agent_id: agent_id.into(),
-        agent_dir: agent_dir_for(h.dir.path(), agent_id),
-        requester,
-        query: query.into(),
-        turn_id: turn.into(),
-    })
+    prepare_blocking(
+        &TurnInput {
+            home: h.dir.path().to_path_buf(),
+            users: Some(h.users.clone()),
+            agent_id: agent_id.into(),
+            agent_dir: agent_dir_for(h.dir.path(), agent_id),
+            requester,
+            query: query.into(),
+            turn_id: turn.into(),
+        },
+        &duduclaw_knowledge::embed::NoEmbedder,
+    )
     .unwrap()
 }
 

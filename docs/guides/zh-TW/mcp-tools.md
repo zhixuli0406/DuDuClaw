@@ -223,6 +223,8 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 `knowledge_add_source`（scope `knowledge:write`，同樣不能授權給外部金鑰）替員工這一側的某個集合送審一份文件：`collection`，加上 `path`（員工 `attachments/` 或 `<home>/attachments/` 裡的檔案）、`url`、`text` 三選一，`title` 選填。它本身不會加入任何東西，只開一張 `knowledge_add_source` 審批單，由管理員或該集合的編輯者在儀表板決定，回傳審批單編號。不論誰呼叫都沒有豁免。
 
+`knowledge_search` 與 `knowledge_list_collections` 的回應第一行會說明檢索模式（混合＝關鍵字加語意向量，或只用關鍵字），沒有用到向量時附上原因（尚未安裝模型、雲端供應者未經確認、去識別化未啟用、雲端出錯等）；`knowledge_list_collections` 另外列出每個集合的向量覆蓋率。向量只會在這次呼叫能讀的集合裡排序段落。
+
 ## 已棄用的別名仍會列出
 
 已棄用的工具名稱仍會出現在 `tools/list`，說明前面加 `[deprecated → …]` 前綴——因為隱藏它等於讓它叫不動，那和棄用緩衝期的用意正好相反。完整的舊 → 新對照表在 [deprecations.md](../deprecations.md)。目前沒有任何 MCP 工具處於棄用狀態：v1.66.0 那一批別名已在 v1.69.0 移除。

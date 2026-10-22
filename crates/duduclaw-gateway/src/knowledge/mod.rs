@@ -19,6 +19,10 @@
 //! - [`add_source_approval`], [`chat_add`]: proposals to add a source (MCP
 //!   tool, chat command), always decided in the dashboard.
 //! - [`forget`]: forget-by-source plans for turns that cited a source.
+//! - [`embedding`]: the embedder in effect (`[knowledge.embedding]`), embed
+//!   job scheduling; [`embed_job`] runs one; [`embedding_rpc`] is
+//!   `knowledge.embedding.*`; [`redaction_adapter`] de-identifies text
+//!   before a cloud embedding call.
 //! - [`principals`]: who a collection owner may grant to (the permission
 //!   picker and the check before `knowledge.acl.set`).
 //! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
@@ -36,11 +40,16 @@ pub mod auto_retrieve;
 pub mod chat_add;
 pub mod cite_turn;
 pub mod denied;
+pub mod embed_job;
+pub mod embedding;
+pub mod embedding_rpc;
+pub mod embedding_select;
 pub mod extract_spawn;
 pub mod forget;
 pub mod ledger;
 pub mod pipeline;
 pub mod principals;
+pub mod redaction_adapter;
 pub mod requester_map;
 pub mod route;
 mod route_add;
