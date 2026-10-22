@@ -98,6 +98,29 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 
 **Permission flags are enforced (behaviour change).** `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` had no reader before. Since v1.68.0 a flag written as `false` blocks the matching tools at the MCP dispatch gate (`create_agent`; `send_to_agent`, `spawn_agent`; `create_reminder`, `tasks_create` with a `schedule`; `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording`); an absent or wrongly typed flag allows. Older templates often wrote these flags as `false`, so the first boot after the upgrade migrates every employee once: in a `[permissions]` table without the marker `permissions_enforced_since`, each of the four flags that is `false` becomes `true` and `permissions_enforced_since = "1.68.0"` is added; each reset writes the audit event `permission_flags_reset`. A `false` written afterwards on this page or in the Advanced config editor counts as an operator decision. Ephemeral role members (`agents/.ephemeral/`) are not migrated and keep least privilege.
 
+## Manage → Members: direct manager and org chart (Enterprise, 1.76.0)
+
+Admins only. The Personal edition has no such page.
+
+| Control | Writes | Effect |
+|---|---|---|
+| Create / edit member → Direct manager | `manager_user_id` on `users.create` / `users.update` (choosing "None" clears it) | The next message and the next dashboard action follow the new reporting line. The list offers only active people whose role is Manager or Admin, minus the person and everyone below them; the gateway checks again and, when it refuses, says why in plain words: the line would loop, it would go past 8 levels, the manager's role is too low, or (when you change someone with reports to Employee) they still have direct reports. |
+| List → Role column | — | Shows "Manager: …". |
+| List / Org chart | — | Display only. The org chart draws the reporting lines from the direct manager, with each person's bound AI staff next to them; people with no manager and no reports are listed under "No manager set". Offboarded people are left out; suspended people are shown and marked. Click a name to edit. |
+
+What a manager gets through their reports: see [Calling AI staff with @](../features/62-calling-ai-staff.md#managers-reach-their-teams-employees).
+
+## Organization → My team (Enterprise, 1.76.0)
+
+Only people whose role is Manager or Admin see it (sidebar group "Organization"). The page lists the people who report to you (down to 8 levels; suspended people included, offboarded people not) and the AI staff you can reach through each of them:
+
+- Tag "Can assign work" or "Chat only": when the report's binding is Owner or Operator you get Operator and may assign work; when it is Viewer you may only chat.
+- "N open tasks": tasks assigned to that employee that are not done, cancelled or failed.
+- **Chat** opens WebChat with `@name ` already typed. Disabled while the employee is not active.
+- **Assign** asks what should be done (and, optionally, how you will know it is done), creates a goal task (`tasks.create` with `kind = "goal"`) and takes you to that task on the Goals page.
+
+The data comes from the RPC `users.my_team`, computed with the same rules every call and assignment uses, so everything listed can be reached. It is refused in the Personal edition and for the Employee role.
+
 ## Settings → Advanced → Knowledge base search
 
 Admin only (new in 1.76.0). Shows whether the document knowledge base searches by meaning or by keywords only, and why not when it does not, with the share of passages that already have vectors.

@@ -140,6 +140,23 @@ describe('App routes — Enterprise-only pages are closed on Personal (WP-A D8/D
       expect(screen.getByTestId('loc')).toHaveTextContent('/manage/distributors'),
     );
   });
+
+  it('closes 我的團隊 (/team) on Personal, even for the owner', async () => {
+    setEdition('personal');
+    await expectLandsOn('/team', '/');
+  });
+
+  it('closes /team to an Employee on Enterprise (manager+, like users.my_team)', async () => {
+    setRole('employee');
+    await expectLandsOn('/team', '/');
+  });
+
+  it('opens /team to a manager on Enterprise', async () => {
+    setRole('manager');
+    renderAppAt('/team');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/team'));
+    expect(await screen.findByRole('heading', { name: 'My team' })).toBeInTheDocument();
+  });
 });
 
 // N-1 (`DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-1, §2 L2): the new

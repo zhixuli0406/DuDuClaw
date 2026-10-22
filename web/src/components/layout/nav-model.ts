@@ -53,6 +53,7 @@ import {
   GitBranch,
   Database,
   Library,
+  UsersRound,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -131,7 +132,10 @@ export type NavGroup = {
  *   3. a LIVE 員工 zone — dynamic, sourced from the agents store, not static
  *      nav items (see AppSidebar). `staffEntry` is its "全部員工 →" link.
  *   4. the `公司` group (`navGroups[1]`) — collapsible.
- *      (2-4 are Enterprise-only; Personal's equivalents are the flat row.)
+ *   4b. the `組織` group (`navGroups[3]`, 1.76.0) — collapsible, people-side
+ *      pages (我的團隊). Appended last in the array so the indices above keep
+ *      their meaning; rendered right after 公司.
+ *      (2-4b are Enterprise-only; Personal's equivalents are the flat row.)
  *   5. the `對話紀錄` zone — dynamic, sourced from `useConversationsStore`.
  *      Moved here from directly under 新對話 on 2026-08-04 (WP18-B): the
  *      annotated primary order 新對話 → 例行工作 → 技能庫 → 記憶 → AI 員工 →
@@ -418,6 +422,19 @@ export const navGroups: NavGroup[] = [
       manageEntry,
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
+    ],
+  },
+  {
+    // 組織 (1.76.0) — the human side of the company: who reports to whom.
+    // 我的團隊 lists the people below the viewer and the AI employees the
+    // viewer can call or hand work to through them (`users.my_team`).
+    // Enterprise-only and manager+, both mirrored server-side (the `users`
+    // family gate and `require_manager!`); the Personal edition never sees
+    // this group (`navGroupsForEdition` leaves it out, and the item carries
+    // `enterprise: true` for every other consumer).
+    label: 'navGroup.org',
+    items: [
+      { to: '/team', icon: UsersRound, label: 'nav.myTeam', desc: 'nav.myTeam.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
     ],
   },
 ];

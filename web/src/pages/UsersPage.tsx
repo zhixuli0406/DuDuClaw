@@ -7,6 +7,9 @@ import { useAuthStore } from '@/stores/auth-store';
 import type { UserRole } from '@/stores/auth-store';
 import { ROLE_LEVELS } from '@/lib/roles';
 import { ConfirmDialog } from '@/components/settings/controls';
+import { orgErrorMessageId } from '@/lib/org-tree';
+import { ManagerSelect } from './users/ManagerSelect';
+import { OrgChartView } from './users/OrgChartView';
 import {
   listChannelIdentities,
   bindChannelIdentity,
@@ -37,6 +40,7 @@ import {
   ListGridCell,
   ActorAvatar,
   Empty,
+  Segmented,
   type BadgeProps,
 } from '@/components/mds';
 import {
@@ -158,6 +162,16 @@ function DialogField({
   );
 }
 
+/** The message for a refused create / update: a reporting-line rule in
+ *  plain words when the gateway sent one of its codes, else the error text. */
+function userWriteError(e: unknown, intl: ReturnType<typeof useIntl>): string {
+  const id = orgErrorMessageId(e);
+  if (id) return intl.formatMessage({ id });
+  return e instanceof Error ? e.message : formatError(e);
+}
+
+type UsersView = 'list' | 'org';
+
 function roleBadgeProps(role: string): { variant: BadgeProps['variant']; className?: string } {
   if (role === 'admin') return { variant: 'destructive' };
   if (role === 'manager') return { variant: 'secondary' };
@@ -194,6 +208,8 @@ export function UsersPage() {
   // failed; a missing key means "not fetched yet".
   const [identities, setIdentities] = useState<Record<string, ChannelIdentity[] | 'error'>>({});
   const [showIdentityBind, setShowIdentityBind] = useState<string | null>(null);
+  const [view, setView] = useState<UsersView>('list');
+  const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -263,12 +279,26 @@ export function UsersPage() {
         </div>
       )}
 
+      {!loading && users.length > 0 && (
+        <Segmented<UsersView>
+          value={view}
+          onValueChange={setView}
+          aria-label={intl.formatMessage({ id: 'users.view.label' })}
+          options={[
+            { value: 'list', label: intl.formatMessage({ id: 'users.view.list' }) },
+            { value: 'org', label: intl.formatMessage({ id: 'users.view.org' }) },
+          ]}
+        />
+      )}
+
       {loading ? (
         <div className="flex items-center justify-center py-16">
           <Loader2 className="size-6 animate-spin text-muted-foreground" />
         </div>
       ) : users.length === 0 ? (
         <Empty icon={Users} title={intl.formatMessage({ id: 'users.title' })} />
+      ) : view === 'org' ? (
+        <OrgChartView users={users} onEdit={setShowEdit} />
       ) : (
         <div className="overflow-hidden rounded-xl border border-surface-border">
           <ListGridContainer
@@ -302,6 +332,11 @@ export function UsersPage() {
                     {user.department && (
                       <span className="truncate text-xs text-muted-foreground">
                         {intl.formatMessage({ id: 'users.dept.prefix' })}{user.department}
+                      </span>
+                    )}
+                    {nameOf(user.manager_user_id) && (
+                      <span className="truncate text-xs text-muted-foreground">
+                        {intl.formatMessage({ id: 'users.manager.prefix' })}{nameOf(user.manager_user_id)}
                       </span>
                     )}
                   </ListGridCell>
@@ -423,6 +458,7 @@ export function UsersPage() {
       {/* Create User Dialog */}
       {showCreate && (
         <CreateUserDialog
+          users={users}
           onClose={() => setShowCreate(false)}
           onCreated={() => {
             setShowCreate(false);
@@ -435,6 +471,7 @@ export function UsersPage() {
       {showEdit && (
         <EditUserDialog
           user={showEdit}
+          users={users}
           onClose={() => setShowEdit(null)}
           onUpdated={() => {
             setShowEdit(null);
@@ -552,9 +589,11 @@ function RemoveUserDialog({
 // ── Sub-dialogs ──────────────────────────────────────────────
 
 function CreateUserDialog({
+  users,
   onClose,
   onCreated,
 }: {
+  users: UserDetail[];
   onClose: () => void;
   onCreated: () => void;
 }) {
@@ -564,6 +603,7 @@ function CreateUserDialog({
   const [password, setPassword] = useState('');
   const [userRole, setUserRole] = useState('employee');
   const [department, setDepartment] = useState('');
+  const [managerId, setManagerId] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const deptOptions = useDepartmentNames();
@@ -588,10 +628,11 @@ function CreateUserDialog({
       await api.users.create({
         email, display_name: displayName, password, role: userRole,
         ...(department.trim() ? { department: department.trim() } : {}),
+        ...(managerId ? { manager_user_id: managerId } : {}),
       });
       onCreated();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create user');
+      setError(userWriteError(e, intl));
     } finally {
       setSubmitting(false);
     }
@@ -648,6 +689,12 @@ function CreateUserDialog({
           >
             <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
           </DialogField>
+          <DialogField
+            label={intl.formatMessage({ id: 'users.manager.label' })}
+            help={intl.formatMessage({ id: 'users.manager.hint' })}
+          >
+            <ManagerSelect users={users} userId={null} value={managerId} onChange={setManagerId} />
+          </DialogField>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>
@@ -668,10 +715,12 @@ function CreateUserDialog({
 
 function EditUserDialog({
   user,
+  users,
   onClose,
   onUpdated,
 }: {
   user: UserDetail;
+  users: UserDetail[];
   onClose: () => void;
   onUpdated: () => void;
 }) {
@@ -679,6 +728,7 @@ function EditUserDialog({
   const [displayName, setDisplayName] = useState(user.display_name);
   const [userRole, setUserRole] = useState<string>(user.role);
   const [department, setDepartment] = useState(user.department ?? '');
+  const [managerId, setManagerId] = useState(user.manager_user_id ?? '');
   const [newPassword, setNewPassword] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -697,16 +747,19 @@ function EditUserDialog({
     try {
       // Send department only when it changed. An empty string clears it.
       const deptChanged = department.trim() !== (user.department ?? '').trim();
+      // Same for the direct manager; `null` clears it.
+      const managerChanged = managerId !== (user.manager_user_id ?? '');
       await api.users.update({
         user_id: user.id,
         display_name: displayName !== user.display_name ? displayName : undefined,
         role: userRole !== user.role ? userRole : undefined,
         password: newPassword || undefined,
         ...(deptChanged ? { department: department.trim() } : {}),
+        ...(managerChanged ? { manager_user_id: managerId || null } : {}),
       });
       onUpdated();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(userWriteError(e, intl));
     } finally {
       setSubmitting(false);
     }
@@ -742,6 +795,12 @@ function EditUserDialog({
             help={intl.formatMessage({ id: 'users.field.departmentHint' })}
           >
             <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
+          </DialogField>
+          <DialogField
+            label={intl.formatMessage({ id: 'users.manager.label' })}
+            help={intl.formatMessage({ id: 'users.manager.hint' })}
+          >
+            <ManagerSelect users={users} userId={user.id} value={managerId} onChange={setManagerId} />
           </DialogField>
           <DialogField label={intl.formatMessage({ id: 'users.field.new_password' })}>
             <Input
