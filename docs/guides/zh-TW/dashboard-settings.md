@@ -103,10 +103,11 @@
 - **可編輯的檔案：**系統設定（`config.toml`）、推理設定（`inference.toml`），以及每位 AI 員工的 `agent.toml`（必須是 `agents/` 底下的實際目錄，不接受符號連結）。
 - **密鑰遮罩：**鍵名以 `_enc` 結尾、名為 `key` 或以 `_key` 結尾、或含 token、secret、password、passwd、api_key、apikey、widget_key、private_key、credential、service_account_json 的值，以及 `headers`、`otlp_headers`、`env` 表格裡的每個值、帶密碼的網址，都顯示成 `«set»`。存檔時原樣保留 `«set»` 就保留原值；原本沒有值卻寫 `«set»` 會被拒絕。`[mcp_keys]` 整段不顯示。
 - **驗證：**先檢查 TOML 語法，錯誤會指出第幾行第幾欄；再用對應的型別（系統設定的各區段驗證、`InferenceConfig`、`AgentConfig`）檢查，失敗就不寫入。不能在這裡改員工的 `[agent] name`。
+- **文件知識庫：**`[knowledge]` 目前還沒有設定頁（儀表板頁面在之後的版本提供），它的各個鍵（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`，以及 `extract_when_unavailable` = `refuse`／`run_unsandboxed`）在這裡會檢查型別。員工的 `[knowledge] collections` 在該員工的 `agent.toml` 編輯。詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。
 - **衝突：**開啟時取得檔案內容的雜湊值，存檔時帶回。檔案在這段時間被改過就拒絕，請重新載入再改。
 - **備份：**寫入前備份成 `<檔名>.bak-<Unix 時間>`（權限 0600），保留最近 5 份。
 - **稽核：**每次寫入記 `config_raw_edited`。改到 `[delegation]`、`[acp]`，或員工的 `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時等級為 Warning。
-- **重啟清單：**存檔後列出需要重啟的部分。`config.toml` 的 `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` 只在開機時讀；`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart` 也要重啟；日誌等級、常駐感知、去識別化能立即套用時就不列。`inference.toml` 存檔後一律立即重設推理引擎。員工檔案只有 `heartbeat.max_concurrent_runs` 需要重啟。
+- **重啟清單：**存檔後列出需要重啟的部分。`config.toml` 的 `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` 只在開機時讀；`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（上傳路由的大小上限依它決定）也要重啟；日誌等級、常駐感知、去識別化能立即套用時就不列。`inference.toml` 存檔後一律立即重設推理引擎。員工檔案只有 `heartbeat.max_concurrent_runs` 需要重啟。
 
 ## 維修 SSH 儀表板（尚未發版）
 

@@ -160,6 +160,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search"
         | "goals_list" | "google_status" | "gtasks_list" | "gtasks_lists" | "hardware_info"
         | "identity_resolve" | "inference_mode" | "inference_status" | "inspect_branches"
+        | "knowledge_get_passage" | "knowledge_list_collections" | "knowledge_search"
         | "list_agents" | "list_cron_tasks" | "list_reminders" | "llamafile_list" | "mail_list"
         | "mail_read" | "memory_alias_list" | "memory_consolidation_status"
         | "memory_episodic_pressure" | "memory_fetch_batch" | "memory_get_at"

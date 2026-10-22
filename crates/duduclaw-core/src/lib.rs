@@ -28,6 +28,7 @@ pub mod fs_lock;
 pub mod grounding;
 pub mod identity_token;
 pub mod keychain;
+pub mod knowledge_agent;
 pub mod lenient;
 pub mod llm_contract;
 pub mod match_utils;
