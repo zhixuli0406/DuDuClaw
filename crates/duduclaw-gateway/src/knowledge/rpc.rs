@@ -455,7 +455,7 @@ async fn delete_and_forget(call: Call) -> KbResult<Value> {
         super::rpc_channels::editable_source_title(&call.home, &source_id, &call.user).await?;
     let summary =
         super::forget::plan_for_source(&call.home, &source_id, &title, &call.user.user_id).await;
-    let mut deleted = blocking(move || dispatch(call)).await?;
+    let mut deleted = blocking(move || dispatch(call, None)).await?;
     if let Some(m) = deleted.as_object_mut() {
         m.insert("forget".into(), serde_json::to_value(&summary).unwrap_or(Value::Null));
     }
