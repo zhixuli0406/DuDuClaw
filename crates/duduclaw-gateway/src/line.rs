@@ -1391,15 +1391,13 @@ async fn send_reply_rich(
 /// already used by the telegram/slack progress callbacks, plus a
 /// defense-in-depth empty-string check so a future dashboard-only variant
 /// added without updating this match still can't reach the API.
-fn should_forward_line_progress_event(event: &crate::channel_reply::ProgressEvent) -> bool {
-    if matches!(
-        event,
-        crate::channel_reply::ProgressEvent::Step { .. }
-            | crate::channel_reply::ProgressEvent::ModelInfo { .. }
-    ) {
-        return false;
-    }
-    !event.to_display().is_empty()
+/// Thinking display (2026-10): the variant check is now the shared allowlist
+/// ([`crate::channel_reply::ProgressEvent::is_channel_text`]), which also
+/// drops `Thinking`.
+pub(crate) fn should_forward_line_progress_event(
+    event: &crate::channel_reply::ProgressEvent,
+) -> bool {
+    event.is_channel_text() && !event.to_display().is_empty()
 }
 
 async fn line_credentials_for_table(

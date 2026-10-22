@@ -39,6 +39,13 @@ pub enum ProgressEvent {
     /// when the reply has shown nothing for `[channel_reply]
     /// interim_status_secs` ([`super::interim`]).
     Interim { text: String },
+    /// The employee is thinking ([`crate::thinking`]). Already passed through
+    /// the turn's thinking gate: text, if any, is masked and truncated, and
+    /// is only present for a dashboard WebChat viewer allowed to see it.
+    /// **Never channel text** — renders as an empty string and every text
+    /// channel drops it via [`ProgressEvent::is_channel_text`]; the interim
+    /// watcher uses it only to say "thinking" instead of "processing".
+    Thinking(crate::thinking::ThinkingEvent),
 }
 
 /// Phase of a tool step in the agentic task tree.
@@ -407,6 +414,21 @@ impl ProgressEvent {
             // Dashboard-only metadata — same contract as `Step`.
             Self::ModelInfo { .. } => String::new(),
             Self::Interim { text } => text.clone(),
+            // Dashboard-only — same contract as `Step`.
+            Self::Thinking(_) => String::new(),
+        }
+    }
+
+    /// Whether a text channel (Telegram, LINE, Slack, …) may render this
+    /// event as a message. An allowlist on purpose: a new variant must be
+    /// classified here (the match has no `_` arm), so a dashboard-only event
+    /// can never reach an external customer by default.
+    pub fn is_channel_text(&self) -> bool {
+        match self {
+            Self::Keepalive | Self::ToolUse { .. } | Self::TodoUpdate { .. } | Self::Interim { .. } => {
+                true
+            }
+            Self::Step(_) | Self::ModelInfo { .. } | Self::Thinking(_) => false,
         }
     }
 }

@@ -452,13 +452,14 @@ impl MethodHandler {
                 "events": events,
                 // Honest provenance: which store produced which event kind,
                 // and which live-stream kinds are NOT persisted anywhere.
-                // Thinking summaries are still only counted (never captured)
-                // by the stream parser, so they remain unpersisted.
+                // Thinking keeps one row per turn with seconds and tokens
+                // only; the summary text itself is never stored.
                 "event_sources": {
                     "text": "sessions.db",
                     "tool_use": "tool_calls.jsonl (MCP audit)",
                     "tool_step": "run_steps.db",
                     "todo_update": "run_steps.db",
+                    "thinking": "run_steps.db (seconds and tokens only)",
                 },
                 "not_persisted": ["thinking_summaries"],
             }),

@@ -125,6 +125,8 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
                             parts.push(p);
                         }
                     }
+                    // Anthropic-only ciphertext: meaningless to Gemini.
+                    ContentPart::RedactedReasoning { .. } => {}
                 }
             }
             // Orphaned signature (no following functionCall): attach to a

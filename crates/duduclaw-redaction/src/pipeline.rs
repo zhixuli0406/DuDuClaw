@@ -513,15 +513,19 @@ impl RedactionPipeline {
     }
 }
 
-/// Token-level rewrite. Used internally by [`RedactionPipeline::restore`].
-enum TokenAction {
+/// Token-level rewrite. Used by [`RedactionPipeline::restore`] and
+/// [`crate::token::mask_tokens_for_display`].
+pub(crate) enum TokenAction {
     /// Keep the raw `<REDACT:...>` text.
     Keep,
     /// Replace the token with this string.
     Replace(String),
 }
 
-fn rewrite_tokens(text: &str, mut decide: impl FnMut(&Token) -> TokenAction) -> String {
+pub(crate) fn rewrite_tokens(
+    text: &str,
+    mut decide: impl FnMut(&Token) -> TokenAction,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find(TOKEN_PREFIX) {

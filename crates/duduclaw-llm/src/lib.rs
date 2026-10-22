@@ -78,6 +78,7 @@ pub use mcp_client::{
 };
 pub use types::{
     CACHE_SPLIT_MARKER, CacheHint, ChatMessage, ChatRequest, ChatResponse, ContentPart,
-    NormalizedUsage, ReasoningHint, Role, StopReason, StreamEvent, SystemBlock, ToolChoice,
+    NormalizedUsage, ReasoningHint, Role, StopReason, StreamEvent, SystemBlock, ThinkingDisplay,
+    ToolChoice,
     ToolDef, estimate_tokens,
 };
