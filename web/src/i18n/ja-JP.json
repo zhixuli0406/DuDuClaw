@@ -8353,5 +8353,6 @@
   "skills.manage.stateError": "{agent} のスキル設定を読み込めないため、この社員は今スキルを一切読み込みません。設定ファイルを修復または削除してから再読み込みしてください。",
   "skills.manage.archived": "削除したスキル",
   "skills.manage.restore": "元に戻す",
-  "skills.manage.openAgent": "社員のスキル設定"
+  "skills.manage.openAgent": "社員のスキル設定",
+  "skills.manage.editFiles": "スキルファイルを編集"
 }

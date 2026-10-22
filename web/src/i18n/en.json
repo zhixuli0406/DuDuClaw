@@ -8353,5 +8353,6 @@
   "skills.manage.stateError": "{agent}'s skill switches cannot be read, so this staffer loads no skills for now. Repair or delete the switch file, then reload.",
   "skills.manage.archived": "Removed skills",
   "skills.manage.restore": "Restore",
-  "skills.manage.openAgent": "Staffer's skill settings"
+  "skills.manage.openAgent": "Staffer's skill settings",
+  "skills.manage.editFiles": "Edit skill files"
 }

@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
-import { Archive, RotateCcw } from 'lucide-react';
+import { Link } from 'react-router';
+import { Archive, RotateCcw, FileText } from 'lucide-react';
 import { api, type SkillInfo, type SkillStateStatus } from '@/lib/api';
 import { skillsManageApi, type ArchivedSkill, type SkillTarget } from '@/lib/api-skills-manage';
 import { sortSkills } from '@/lib/skill-library';
 import { toast, formatError } from '@/lib/toast';
-import { Badge, Button, Switch } from '@/components/mds';
+import { Badge, Button, Switch, buttonVariants } from '@/components/mds';
 import { useSkillActions } from './use-skill-actions';
 import { useLastUsedLabel } from './SkillUsageDialog';
 import { RemoveSkillsDialog } from './RemoveSkillsDialog';
@@ -76,7 +77,17 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'skills.manage.panelHint' })}</p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <p className="min-w-0 flex-1 text-xs text-muted-foreground">{intl.formatMessage({ id: 'skills.manage.panelHint' })}</p>
+        {/* Editing a skill's text lives on the employee's profile files tab. */}
+        <Link
+          to={`/agents/${encodeURIComponent(agentId)}/files`}
+          className={buttonVariants({ variant: 'outline', size: 'sm' })}
+        >
+          <FileText />
+          {intl.formatMessage({ id: 'skills.manage.editFiles' })}
+        </Link>
+      </div>
       {state && <SkillStateErrors states={{ [agentId]: state }} nameOf={() => agentName} />}
       {sorted.length === 0 ? (
         <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'skills.my.empty' })}</p>

@@ -8353,5 +8353,6 @@
   "skills.manage.stateError": "{agent} 的技能開關讀不到，這位員工目前不載入任何技能。請修復或刪除開關檔後重新整理。",
   "skills.manage.archived": "已移除的技能",
   "skills.manage.restore": "復原",
-  "skills.manage.openAgent": "員工的技能設定"
+  "skills.manage.openAgent": "員工的技能設定",
+  "skills.manage.editFiles": "編輯技能檔"
 }
