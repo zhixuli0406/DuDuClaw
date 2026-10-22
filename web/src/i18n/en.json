@@ -7921,6 +7921,7 @@
   "agentFiles.category.size": "The content is too long",
   "agentFiles.category.format": "The format is not valid",
   "agentFiles.category.analysis_unavailable": "The automatic check could not finish this time, so please check the content yourself",
+  "agentFiles.category.outside_change": "The file had been changed outside the dashboard, so the whole file was checked",
   "agentFiles.verdict.pass": "No problems found",
   "agentFiles.verdict.warn": "A few things need attention",
   "agentFiles.verdict.block": "High risk",

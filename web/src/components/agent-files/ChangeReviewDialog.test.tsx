@@ -146,6 +146,39 @@ describe('<ChangeReviewDialog>', () => {
     expect(screen.queryByText(en['agentFiles.category.analysis_unavailable'])).not.toBeInTheDocument();
   });
 
+  it('incomplete review: a member can only send it', () => {
+    const incomplete = review({
+      basis: 'rules+ai_unavailable',
+      can_confirm: false,
+      reasons: [{ category: 'analysis_unavailable', severity: 'medium', message: '', evidence: '' }],
+    });
+    renderDialog(res('needs_confirmation', { review: incomplete }));
+    expect(screen.queryByRole('button', { name: confirmName })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: requestName })).toBeInTheDocument();
+  });
+
+  it('incomplete review: the admin confirm sends acknowledge_risk', async () => {
+    const user = userEvent.setup();
+    const h = renderDialog(res('needs_confirmation', { review: review({
+      basis: 'rules+ai_unavailable',
+      can_confirm: true,
+      reasons: [{ category: 'analysis_unavailable', severity: 'medium', message: '', evidence: '' }],
+    }) }), true);
+    await user.type(screen.getByLabelText(en['agentFiles.review.reasonLabel']), 'checked by hand');
+    const confirm = screen.getByRole('button', { name: confirmName });
+    expect(confirm).toBeDisabled();
+    await user.click(screen.getByRole('checkbox'));
+    await user.click(confirm);
+    expect(h.onConfirm).toHaveBeenCalledWith('checked by hand', true);
+  });
+
+  it('shows the outside-change reason in plain words', () => {
+    renderDialog(res('needs_confirmation', { review: review({
+      reasons: [{ category: 'outside_change', severity: 'medium', message: '', evidence: '' }],
+    }) }));
+    expect(screen.getByText(en['agentFiles.category.outside_change'])).toBeInTheDocument();
+  });
+
   it('rejected: only the list of things to fix and a close button', async () => {
     const user = userEvent.setup();
     const h = renderDialog(res('rejected', { review: review({ verdict: 'block', can_confirm: false, can_request_approval: false, reasons: [

@@ -27,7 +27,9 @@ export type AgentFileReasonCategory =
   | 'secret_in_text'
   | 'size'
   | 'format'
-  | 'analysis_unavailable';
+  | 'analysis_unavailable'
+  /** The file had been changed outside the dashboard; checked as a whole. */
+  | 'outside_change';
 
 export interface AgentFileReason {
   category: AgentFileReasonCategory;

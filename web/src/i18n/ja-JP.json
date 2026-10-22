@@ -7921,6 +7921,7 @@
   "agentFiles.category.size": "内容が長すぎます",
   "agentFiles.category.format": "形式が正しくありません",
   "agentFiles.category.analysis_unavailable": "今回は自動チェックを完了できませんでした。内容をご自身で確認してください",
+  "agentFiles.category.outside_change": "このファイルはダッシュボード外で変更されていたため、全体をチェックしました",
   "agentFiles.verdict.pass": "問題は見つかりませんでした",
   "agentFiles.verdict.warn": "注意が必要な点があります",
   "agentFiles.verdict.block": "リスクが高い変更です",

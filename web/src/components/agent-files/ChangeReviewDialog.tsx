@@ -145,7 +145,9 @@ export function ChangeReviewDialog({
       ? isAdmin && (review?.can_confirm ?? true)
       : false;
   const canRequest = (isWarn || isBlock) && !isAdmin && (review?.can_request_approval ?? true);
-  const needsAck = isBlock && isAdmin;
+  // A block, or a review that did not cover the whole change, needs the
+  // admin to acknowledge the risk (the gateway refuses without it).
+  const needsAck = isAdmin && (isBlock || (isWarn && unavailable));
 
   let tone: Tone = 'neutral';
   let Icon = Info;

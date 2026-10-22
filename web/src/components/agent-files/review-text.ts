@@ -35,6 +35,7 @@ const CATEGORIES: ReadonlySet<string> = new Set<AgentFileReasonCategory>([
   'size',
   'format',
   'analysis_unavailable',
+  'outside_change',
 ]);
 
 export function isAgentFileKey(v: unknown): v is AgentFileKey {

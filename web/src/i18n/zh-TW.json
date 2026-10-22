@@ -7921,6 +7921,7 @@
   "agentFiles.category.size": "內容太長",
   "agentFiles.category.format": "格式不正確",
   "agentFiles.category.analysis_unavailable": "這次沒能完成自動檢查，請自己確認內容",
+  "agentFiles.category.outside_change": "這個檔案在系統外被改過，這次整份重新檢查",
   "agentFiles.verdict.pass": "沒有發現問題",
   "agentFiles.verdict.warn": "有幾點需要注意",
   "agentFiles.verdict.block": "風險很高",
