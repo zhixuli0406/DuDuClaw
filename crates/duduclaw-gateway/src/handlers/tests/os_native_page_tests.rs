@@ -81,15 +81,16 @@ fn error_code(f: &WsFrame) -> Option<String> {
 
 #[tokio::test]
 async fn personal_quota_rejects_second_os_native_agent() {
-    // SAFETY: single-threaded test; ensure Personal edition regardless of
-    // the ambient env so the quota is a deterministic 1.
-    unsafe {
-        std::env::set_var("DUDUCLAW_EDITION", "personal");
-    }
     let home = tempfile::tempdir().unwrap();
     seed_agent(home.path(), "alpha", true); // already OS-native
     seed_agent(home.path(), "bravo", false);
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    // Personal through the handler override, not `DUDUCLAW_EDITION`: the env
+    // var is process-global, and setting it raced with tests that pin
+    // Enterprise via the override (env outranks the override).
+    handler
+        .set_edition_override(Some(duduclaw_core::EditionProfile::Personal))
+        .await;
 
     // Turning bravo os_native ON would make 2 > quota(1) → structured reject.
     let frame = handler
@@ -109,19 +110,19 @@ async fn personal_quota_rejects_second_os_native_agent() {
         std::fs::read_to_string(home.path().join("agents").join("bravo").join("agent.toml"))
             .unwrap();
     assert!(!toml.contains("os_native = true"));
-    unsafe {
-        std::env::remove_var("DUDUCLAW_EDITION");
-    }
 }
 
 #[tokio::test]
 async fn re_saving_already_os_native_agent_is_allowed_under_quota() {
-    unsafe {
-        std::env::set_var("DUDUCLAW_EDITION", "personal");
-    }
     let home = tempfile::tempdir().unwrap();
     seed_agent(home.path(), "alpha", true);
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    // Personal through the handler override, not `DUDUCLAW_EDITION`: the env
+    // var is process-global, and setting it raced with tests that pin
+    // Enterprise via the override (env outranks the override).
+    handler
+        .set_edition_override(Some(duduclaw_core::EditionProfile::Personal))
+        .await;
 
     // Re-saving alpha (already the one OS-native seat) must not be blocked.
     let frame = handler
@@ -135,9 +136,6 @@ async fn re_saving_already_os_native_agent_is_allowed_under_quota() {
         Some(OS_NATIVE_QUOTA_ERROR_CODE),
         "idempotent re-save must not hit the quota gate: {frame:?}"
     );
-    unsafe {
-        std::env::remove_var("DUDUCLAW_EDITION");
-    }
 }
 
 /// `agents.update` persists the `[proactive]` notify target
@@ -363,13 +361,16 @@ async fn unified_log_renders_channel_recovered_as_an_info_row_not_a_blank_warnin
 
 #[tokio::test]
 async fn os_status_reports_quota_edition_and_agents() {
-    unsafe {
-        std::env::set_var("DUDUCLAW_EDITION", "personal");
-    }
     let home = tempfile::tempdir().unwrap();
     seed_agent(home.path(), "alpha", true);
     seed_agent(home.path(), "bravo", false);
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    // Personal through the handler override, not `DUDUCLAW_EDITION`: the env
+    // var is process-global, and setting it raced with tests that pin
+    // Enterprise via the override (env outranks the override).
+    handler
+        .set_edition_override(Some(duduclaw_core::EditionProfile::Personal))
+        .await;
 
     let frame = handler.handle_os_status().await;
     let payload = match frame {
@@ -392,9 +393,6 @@ async fn os_status_reports_quota_edition_and_agents() {
     assert!(agents[0].get("frontmost").is_some());
     assert_eq!(agents[1]["agent_id"].as_str(), Some("bravo"));
     assert_eq!(agents[1]["os_native"].as_bool(), Some(false));
-    unsafe {
-        std::env::remove_var("DUDUCLAW_EDITION");
-    }
 }
 
 #[tokio::test]
