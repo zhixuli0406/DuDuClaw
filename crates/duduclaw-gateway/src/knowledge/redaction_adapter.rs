@@ -38,6 +38,31 @@ impl TextRedactor for EngineRedactor {
     }
 }
 
+/// Re-checks the force-disable flag before every text, so switching
+/// redaction off in an emergency stops cloud sends at once even while a
+/// built embedder is cached.
+struct Guarded {
+    home: std::path::PathBuf,
+    inner: Arc<dyn TextRedactor>,
+}
+
+impl TextRedactor for Guarded {
+    fn redact(&self, text: &str) -> Result<String, String> {
+        if force_disable_active(&self.home) {
+            return Err("去識別化目前被強制關閉".to_string());
+        }
+        self.inner.redact(text)
+    }
+}
+
+/// Wrap `inner` with the per-text force-disable check.
+pub fn guarded(home: &Path, inner: Arc<dyn TextRedactor>) -> Arc<dyn TextRedactor> {
+    Arc::new(Guarded {
+        home: home.to_path_buf(),
+        inner,
+    })
+}
+
 /// Build the redactor for `home`, or say why there is none.
 pub fn build(home: &Path) -> Result<Arc<dyn TextRedactor>, String> {
     if force_disable_active(home) {
@@ -97,6 +122,16 @@ mod tests {
         std::fs::create_dir_all(h.path().join("redaction")).unwrap();
         std::fs::write(h.path().join("redaction/override.flag"), "1").unwrap();
         assert!(build(h.path()).err().unwrap().contains("強制關閉"));
+    }
+
+    #[test]
+    fn force_disable_after_build_stops_the_next_text() {
+        let h = home_with("[redaction]\nenabled = true\nprofiles = [\"general\"]\n");
+        let r = guarded(h.path(), build(h.path()).unwrap());
+        assert!(r.redact("a@b.tw").is_ok());
+        std::fs::create_dir_all(h.path().join("redaction")).unwrap();
+        std::fs::write(h.path().join("redaction/override.flag"), "1").unwrap();
+        assert!(r.redact("a@b.tw").is_err());
     }
 
     #[test]

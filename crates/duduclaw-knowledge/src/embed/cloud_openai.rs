@@ -44,9 +44,11 @@ pub fn parse(resp: &Value, n: usize) -> Result<Vec<Vec<f32>>, String> {
         .collect()
 }
 
+/// A JSON number array as finite `f32`s; anything else (including values
+/// that overflow `f32`) is `None`.
 pub(crate) fn floats(v: Option<&Value>) -> Option<Vec<f32>> {
     v?.as_array()?
         .iter()
-        .map(|x| x.as_f64().map(|f| f as f32))
+        .map(|x| x.as_f64().map(|f| f as f32).filter(|f| f.is_finite()))
         .collect()
 }

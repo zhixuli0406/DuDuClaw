@@ -30,6 +30,14 @@ fn finish(
     }
 }
 
+/// Same model, same destination, still usable.
+fn same_embedder(
+    a: &dyn duduclaw_knowledge::embed::Embedder,
+    b: &dyn duduclaw_knowledge::embed::Embedder,
+) -> bool {
+    is_available(a) && a.model_id() == b.model_id() && a.egress() == b.egress()
+}
+
 /// Run one claimed `embed` job. Never panics; every outcome is written.
 pub async fn process(home: &Path, lease: Duration, job: Job) {
     let embedder = super::embedding::resolve(home).await;
@@ -50,6 +58,9 @@ pub async fn process(home: &Path, lease: Duration, job: Job) {
     let cfg = EmbeddingConfig::from_home(home);
     let (h, j) = (home.to_path_buf(), job.clone());
     let started = std::time::Instant::now();
+    let runtime = tokio::runtime::Handle::current();
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let superseded_flag = superseded.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut conn = duduclaw_knowledge::schema::open_home(&h)
             .map_err(|e| Box::new(EmbedJobError::Db(e)))?;
@@ -61,6 +72,14 @@ pub async fn process(home: &Path, lease: Duration, job: Job) {
             cfg.max_vector_rows,
             |c, done, total| {
                 if !jobs::is_running(c, j.id)? {
+                    return Ok(false);
+                }
+                // The provider, endpoint, model, acknowledgement or redaction
+                // may change while a long job runs: re-resolve before every
+                // batch and stop when it is no longer the same embedder.
+                let now = runtime.block_on(super::embedding::resolve(&h));
+                if !same_embedder(now.as_ref(), embedder.as_ref()) {
+                    superseded_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     return Ok(false);
                 }
                 jobs::renew(c, j.id, lease)?;
@@ -84,6 +103,19 @@ pub async fn process(home: &Path, lease: Duration, job: Job) {
             }
         }
         Ok(Err(e)) => match *e {
+            EmbedJobError::Cancelled if superseded.load(std::sync::atomic::Ordering::SeqCst) => {
+                tracing::info!(source = %job.source_id, "knowledge: embedding stopped (embedding settings changed)");
+                finish(
+                    home,
+                    &job,
+                    "keyword_only",
+                    None,
+                    Some((
+                        "embedding_superseded",
+                        "向量設定已變更，改由新的設定重新計算",
+                    )),
+                );
+            }
             EmbedJobError::Cancelled => {
                 tracing::info!(source = %job.source_id, "knowledge: embedding cancelled (source deleted or job stopped)");
             }
@@ -119,5 +151,55 @@ pub async fn process(home: &Path, lease: Duration, job: Job) {
                 Some(("embedding_failed", "向量計算時發生內部錯誤")),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duduclaw_knowledge::embed::{Egress, Embedder, UnavailableEmbedder};
+
+    struct E(&'static str, Egress);
+    impl Embedder for E {
+        fn model_id(&self) -> &str {
+            self.0
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+        fn max_input_tokens(&self) -> usize {
+            8
+        }
+        fn embed_passages(&self, t: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(t.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+        fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, 0.0])
+        }
+        fn egress(&self) -> Egress {
+            self.1.clone()
+        }
+    }
+
+    #[test]
+    fn a_changed_or_revoked_embedder_is_not_the_same() {
+        let cloud = |host: &str| Egress::Cloud {
+            provider: "openai".into(),
+            host: host.into(),
+        };
+        let a = E("openai/m@1536", cloud("api.openai.com"));
+        assert!(same_embedder(
+            &E("openai/m@1536", cloud("api.openai.com")),
+            &a
+        ));
+        assert!(!same_embedder(
+            &E("openai/m@1536", cloud("proxy.example.com")),
+            &a
+        ));
+        assert!(!same_embedder(
+            &E("gemini/m@768", cloud("api.openai.com")),
+            &a
+        ));
+        assert!(!same_embedder(&UnavailableEmbedder::new("revoked"), &a));
     }
 }

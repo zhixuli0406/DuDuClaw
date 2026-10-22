@@ -154,11 +154,27 @@ mod tests {
         assert_eq!(models()[0].id, DEFAULT_MODEL);
         for m in models() {
             assert_eq!(m.revision.len(), 40, "{} must pin a full commit", m.id);
+            assert!(
+                m.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+                    && !m.id.contains(".."),
+                "{} is used as a directory name",
+                m.id
+            );
             assert!(m.revision.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(m.dim > 0 && m.dim <= m.native_dim);
             assert!(m.files.iter().any(|f| f.path == m.model_file));
             assert!(m.files.iter().any(|f| f.path == m.tokenizer_file));
             for f in &m.files {
+                assert!(
+                    !f.path.starts_with('/')
+                        && !f.path.contains('\\')
+                        && f.path
+                            .split('/')
+                            .all(|seg| !seg.is_empty() && seg != "." && seg != ".."),
+                    "unsafe catalog path {}",
+                    f.path
+                );
                 assert_eq!(f.sha256.len(), 64, "{}", f.path);
                 assert!(
                     f.sha256

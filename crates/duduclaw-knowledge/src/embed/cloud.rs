@@ -114,6 +114,9 @@ pub trait JsonTransport: Send + Sync {
     ) -> Result<Value, String>;
 }
 
+/// Largest response body accepted from a provider.
+const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// The real transport: blocking reqwest with a 60 s timeout.
 ///
 /// A `reqwest::blocking::Client` owns a small runtime and panics when it is
@@ -167,13 +170,23 @@ impl JsonTransport for HttpTransport {
             .send()
             .map_err(|e| format!("連線失敗：{}", e.without_url()))?;
         let status = resp.status();
-        let text = resp.text().unwrap_or_default();
         if !status.is_success() {
-            // Provider error bodies can echo input; keep only a short head.
-            let head = duduclaw_core::truncate_chars(&text, 200);
-            return Err(format!("HTTP {}：{head}", status.as_u16()));
+            // Provider error bodies can echo input or part of the key; only
+            // the status code is kept (it lands in logs and job errors).
+            return Err(format!("HTTP {}", status.as_u16()));
         }
-        serde_json::from_str(&text).map_err(|_| "雲端回應不是 JSON".to_string())
+        // A misbehaving endpoint must not exhaust memory: 32 MB is about ten
+        // times the largest batch we request.
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(resp, MAX_RESPONSE_BYTES + 1),
+            &mut body,
+        )
+        .map_err(|e| format!("讀取回應失敗：{e}"))?;
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err("雲端回應過大".to_string());
+        }
+        serde_json::from_slice(&body).map_err(|_| "雲端回應不是 JSON".to_string())
     }
 }
 

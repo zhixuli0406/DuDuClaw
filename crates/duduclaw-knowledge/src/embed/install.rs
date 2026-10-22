@@ -83,8 +83,9 @@ pub fn installed_problem(spec: &ModelSpec, home: &Path) -> Option<String> {
             Err(_) => return Some(format!("向量模型檔 {} 不存在，請重新安裝", f.path)),
         }
     }
-    if !onnx_install::ort_installed(&ort_root(home)) {
-        return Some("ONNX Runtime 執行庫尚未安裝".to_string());
+    // Checked against its pin before anything may load it.
+    if let Err(problem) = onnx_install::verify_ort_lib(&ort_root(home)) {
+        return Some(problem);
     }
     None
 }
@@ -316,14 +317,18 @@ mod tests {
         let err = verify_offline(&spec, home.path()).unwrap_err();
         assert!(err.contains("ONNX Runtime"), "{err}");
         assert!(read_marker(&spec, home.path()).is_none());
-        // With the library already present the marker is written.
+        // A library dropped in by hand (not the pinned build) is never
+        // trusted: no marker, and it is reported instead of loaded.
         std::fs::create_dir_all(&lib_dir).unwrap();
         let lib = ort_lib(home.path()).unwrap();
         std::fs::write(&lib, b"lib").unwrap();
-        verify_offline(&spec, home.path()).unwrap();
-        assert_eq!(read_marker(&spec, home.path()).unwrap().via, "offline");
-        assert!(installed_problem(&spec, home.path()).is_none());
-        // Removing the model reads as not installed; ORT stays.
+        let err = verify_offline(&spec, home.path()).unwrap_err();
+        assert!(err.contains("無法驗證"), "{err}");
+        assert!(read_marker(&spec, home.path()).is_none());
+        write_marker(&spec, home.path(), "offline").unwrap();
+        let problem = installed_problem(&spec, home.path()).unwrap();
+        assert!(problem.contains("不符"), "{problem}");
+        // Removing the model reads as not installed; the library stays.
         remove(&spec, home.path()).unwrap();
         assert_eq!(
             installed_problem(&spec, home.path()).as_deref(),

@@ -171,8 +171,15 @@ pub async fn fetch_verified(
                 return Err(OnnxError::msg("下載已取消"));
             }
             let chunk = chunk.map_err(|e| OnnxError::msg(format!("下載中斷：{e}")))?;
-            file.write_all(&chunk)?;
             written += chunk.len() as u64;
+            if written > expect_size {
+                drop(file);
+                let _ = std::fs::remove_file(&part);
+                return Err(OnnxError::msg(format!(
+                    "下載檔超過預期大小（{expect_size} 位元組），已刪除"
+                )));
+            }
+            file.write_all(&chunk)?;
             on_bytes(written);
         }
         file.flush()?;
@@ -258,14 +265,73 @@ pub fn ort_archive_path(ort_lib_root: &Path, archive: &OrtArchive) -> PathBuf {
     ))
 }
 
-/// Whether the ORT shared library for this platform is present.
+/// Whether the ORT shared library for this platform is present (not
+/// verified; see [`verify_ort_lib`]).
 pub fn ort_installed(ort_lib_root: &Path) -> bool {
     manifest::ort_lib_path(ort_lib_root).is_some_and(|p| p.exists())
 }
 
+/// Check the installed library against its pin before anything loads it.
+/// The full hash runs once per (path, size, mtime) per process.
+pub fn verify_ort_lib(ort_lib_root: &Path) -> Result<(), String> {
+    let target = manifest::current_target();
+    let (Some(lib), Some(pin)) = (
+        manifest::ort_lib_path(ort_lib_root),
+        manifest::ort_lib_pin(target),
+    ) else {
+        return Err(format!("這個平台（{target}）沒有可用的 ONNX Runtime"));
+    };
+    verify_lib_at(&lib, pin)
+}
+
+fn verify_lib_at(lib: &Path, (size, sha): (u64, &str)) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static OK: OnceLock<Mutex<HashSet<(PathBuf, u64, std::time::SystemTime)>>> = OnceLock::new();
+    let meta =
+        std::fs::symlink_metadata(lib).map_err(|_| "ONNX Runtime 執行庫尚未安裝".to_string())?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err("ONNX Runtime 執行庫不是一般檔案，拒絕載入".to_string());
+    }
+    let key = (
+        lib.to_path_buf(),
+        meta.len(),
+        meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+    );
+    let cache = OK.get_or_init(Default::default);
+    if cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&key)
+    {
+        return Ok(());
+    }
+    match verify_path(lib, "onnxruntime", size, sha) {
+        FileState::Verified => {
+            cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+            Ok(())
+        }
+        FileState::Missing => Err("ONNX Runtime 執行庫尚未安裝".to_string()),
+        FileState::Corrupt(_) => Err(
+            "ONNX Runtime 執行庫與這個 DuDuClaw 的版本紀錄不符，拒絕載入；請移除後重新安裝"
+                .to_string(),
+        ),
+    }
+}
+
+fn lib_pin(archive: &OrtArchive) -> OnnxResult<(u64, &'static str)> {
+    manifest::ort_lib_pin(archive.target).ok_or_else(|| {
+        OnnxError::msg(format!(
+            "{} 沒有 ONNX Runtime 執行庫的版本紀錄",
+            archive.target
+        ))
+    })
+}
+
 /// Download, verify and extract the ORT library for `archive` into
-/// `<ort_lib_root>/<ver>/`. Already present ⇒ no-op. `on_bytes` gets bytes
-/// of the archive moved so far.
+/// `<ort_lib_root>/<ver>/`. A library already there that matches its pin is
+/// kept; one that does not is replaced. `on_bytes` gets bytes of the archive
+/// moved so far. Holds the install lock of the library directory.
 pub async fn install_ort(
     client: &reqwest::Client,
     ort_lib_root: &Path,
@@ -273,13 +339,15 @@ pub async fn install_ort(
     cancel: &Arc<AtomicBool>,
     on_bytes: BytesFn<'_>,
 ) -> OnnxResult<()> {
+    let pin = lib_pin(archive)?;
     let lib_dir = manifest::ort_lib_dir(ort_lib_root);
     let lib_path = lib_dir.join(archive.lib_file);
-    if lib_path.exists() {
+    if verify_lib_at(&lib_path, pin).is_ok() {
         on_bytes(archive.size);
         return Ok(());
     }
     std::fs::create_dir_all(&lib_dir)?;
+    let _lock = InstallLock::acquire(&lib_dir)?;
     let tmp_archive = ort_archive_path(ort_lib_root, archive);
     fetch_verified(
         client,
@@ -291,27 +359,53 @@ pub async fn install_ort(
         on_bytes,
     )
     .await?;
-    extract_member(&tmp_archive, archive, &lib_path)?;
+    extract_verified(&tmp_archive, archive, &lib_path, pin)?;
     let _ = std::fs::remove_file(&tmp_archive);
     Ok(())
 }
 
-/// Offline install: an ORT archive already placed at
-/// [`ort_archive_path`] (from an offline bundle) is verified against its pin
-/// and the library extracted. Already installed ⇒ no-op.
+/// Extract the member, then check it against its pin (a mismatch removes it).
+fn extract_verified(
+    archive_path: &Path,
+    archive: &OrtArchive,
+    lib_path: &Path,
+    pin: (u64, &str),
+) -> OnnxResult<()> {
+    let _ = std::fs::remove_file(lib_path);
+    extract_member(archive_path, archive, lib_path)?;
+    if let Err(e) = verify_lib_at(lib_path, pin) {
+        let _ = std::fs::remove_file(lib_path);
+        return Err(OnnxError::msg(e));
+    }
+    Ok(())
+}
+
+/// Offline install: an ORT archive placed at [`ort_archive_path`] (from an
+/// offline bundle) is verified against its pin and the library extracted
+/// and verified. A library already there must match its own pin, otherwise
+/// the bundled archive replaces it (and without one the install is
+/// refused): a library dropped into place by hand is never trusted.
 pub fn install_ort_from_local_archive(ort_lib_root: &Path, archive: &OrtArchive) -> OnnxResult<()> {
-    let lib_path = manifest::ort_lib_dir(ort_lib_root).join(archive.lib_file);
+    install_ort_from_local_archive_with(ort_lib_root, archive, lib_pin(archive)?)
+}
+
+fn install_ort_from_local_archive_with(
+    ort_lib_root: &Path,
+    archive: &OrtArchive,
+    pin: (u64, &str),
+) -> OnnxResult<()> {
+    let lib_dir = manifest::ort_lib_dir(ort_lib_root);
+    let lib_path = lib_dir.join(archive.lib_file);
     let path = ort_archive_path(ort_lib_root, archive);
-    if lib_path.exists() {
-        // A bundle unpacked over an existing install: the archive is spare.
-        let _ = std::fs::remove_file(&path);
+    let archive_present = path.exists();
+    if verify_lib_at(&lib_path, pin).is_ok() && !archive_present {
         return Ok(());
     }
     match verify_path(&path, "onnxruntime", archive.size, archive.sha256) {
         FileState::Verified => {}
         FileState::Missing => {
             return Err(OnnxError::msg(format!(
-                "找不到 ONNX Runtime 壓縮檔 {}",
+                "找不到 ONNX Runtime 壓縮檔 {}（現有的執行庫無法驗證）",
                 path.display()
             )));
         }
@@ -321,7 +415,9 @@ pub fn install_ort_from_local_archive(ort_lib_root: &Path, archive: &OrtArchive)
             )));
         }
     }
-    extract_member(&path, archive, &lib_path)?;
+    std::fs::create_dir_all(&lib_dir)?;
+    let _lock = InstallLock::acquire(&lib_dir)?;
+    extract_verified(&path, archive, &lib_path, pin)?;
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -438,18 +534,33 @@ mod tests {
             member: "pkg/lib/libx.so",
             lib_file: "libx.so",
         };
+        let pin = (
+            3u64,
+            Box::leak(hex_lower(&Sha256::digest(b"ELF")).into_boxed_str()) as &str,
+        );
+        let lib = manifest::ort_lib_dir(&root).join("libx.so");
         // Missing archive: refused.
-        assert!(install_ort_from_local_archive(&root, &archive).is_err());
+        assert!(install_ort_from_local_archive_with(&root, &archive, pin).is_err());
         // Tampered archive: refused, nothing extracted.
         std::fs::write(ort_archive_path(&root, &archive), b"tampered").unwrap();
-        assert!(install_ort_from_local_archive(&root, &archive).is_err());
-        let lib = manifest::ort_lib_dir(&root).join("libx.so");
+        assert!(install_ort_from_local_archive_with(&root, &archive, pin).is_err());
         assert!(!lib.exists());
-        // The real archive: extracted, archive removed.
+        // A library dropped in by hand that does not match its pin, and no
+        // archive: refused.
+        std::fs::remove_file(ort_archive_path(&root, &archive)).unwrap();
+        std::fs::write(&lib, b"EVIL").unwrap();
+        assert!(install_ort_from_local_archive_with(&root, &archive, pin).is_err());
+        // The real archive replaces it: extracted, verified, archive removed.
         std::fs::write(ort_archive_path(&root, &archive), &bytes).unwrap();
-        install_ort_from_local_archive(&root, &archive).unwrap();
+        install_ort_from_local_archive_with(&root, &archive, pin).unwrap();
         assert_eq!(std::fs::read(&lib).unwrap(), b"ELF");
         assert!(!ort_archive_path(&root, &archive).exists());
+        assert!(verify_lib_at(&lib, pin).is_ok());
+        // An archive whose member does not match the library pin is refused.
+        let wrong_pin = (3u64, "0".repeat(64).leak() as &str);
+        std::fs::write(ort_archive_path(&root, &archive), &bytes).unwrap();
+        assert!(install_ort_from_local_archive_with(&root, &archive, wrong_pin).is_err());
+        assert!(!lib.exists(), "a mismatching library is removed");
     }
 
     #[tokio::test]
@@ -473,6 +584,11 @@ mod tests {
         let client = http_client("test").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let url = format!("http://{addr}/f");
+        // More bytes than announced are refused while streaming.
+        let err = fetch_verified(&client, &url, &dest, 3, &"0".repeat(64), &cancel, &|_| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("超過"), "{err}");
         let bad = "0".repeat(64);
         let err = fetch_verified(&client, &url, &dest, 5, &bad, &cancel, &|_| {})
             .await

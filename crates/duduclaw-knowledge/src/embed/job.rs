@@ -46,10 +46,17 @@ pub fn embed_source(
     mut keep_going: impl FnMut(&Connection, usize, usize) -> KbResult<bool>,
 ) -> Result<EmbedOutcome, EmbedJobError> {
     let model = embedder.model_id().to_string();
-    let excluded = match embedder.egress() {
-        Egress::Cloud { .. } => vectors::cloud_excluded_collections(conn)?,
-        Egress::Local => Default::default(),
+    let cloud = matches!(embedder.egress(), Egress::Cloud { .. });
+    // Re-read before every batch: a collection made `restricted` or
+    // `local_only` mid-job stops being sent from the next batch on.
+    let excluded_now = |conn: &Connection| -> KbResult<std::collections::HashSet<String>> {
+        if cloud {
+            vectors::cloud_excluded_collections(conn)
+        } else {
+            Ok(Default::default())
+        }
     };
+    let excluded = excluded_now(conn)?;
     let mut out = EmbedOutcome {
         reused: vectors::reuse_by_sha(conn, source_id, &model, &excluded)?,
         ..Default::default()
@@ -66,6 +73,7 @@ pub fn embed_source(
             break;
         }
         let take = batch.min(max_rows - rows);
+        let excluded = excluded_now(conn)?;
         let pending = vectors::pending(conn, source_id, &model, &excluded, take)?;
         if pending.is_empty() {
             break;
@@ -77,6 +85,11 @@ pub fn embed_source(
         if vecs.len() != pending.len() || vecs.iter().any(|v| v.len() != embedder.dim()) {
             return Err(EmbedJobError::Embed(EmbedError::Failed(
                 "向量數量或維度不符".to_string(),
+            )));
+        }
+        if vecs.iter().flatten().any(|x| !x.is_finite()) {
+            return Err(EmbedJobError::Embed(EmbedError::Failed(
+                "向量含有無效數值".to_string(),
             )));
         }
         let rows: Vec<(i64, Vec<f32>)> = pending.iter().map(|(id, _)| *id).zip(vecs).collect();
@@ -143,6 +156,81 @@ mod tests {
             "identical text is reused, not re-embedded: {o2:?}"
         );
         assert!(o2.reused >= 1);
+    }
+
+    #[test]
+    fn a_collection_made_local_only_mid_job_stops_being_sent() {
+        struct Cloud;
+        impl Embedder for Cloud {
+            fn model_id(&self) -> &str {
+                "cloud"
+            }
+            fn dim(&self) -> usize {
+                2
+            }
+            fn max_input_tokens(&self) -> usize {
+                10
+            }
+            fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+            }
+            fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbedError> {
+                Ok(vec![1.0, 0.0])
+            }
+            fn egress(&self) -> Egress {
+                Egress::Cloud {
+                    provider: "openai".into(),
+                    host: "api.openai.com".into(),
+                }
+            }
+        }
+        let mut conn = crate::schema::open_in_memory().unwrap();
+        let long = "段落內容。".repeat(120);
+        let s = source(&mut conn, "a", &[&long, &long, &long]);
+        let mut batches = 0;
+        let o = embed_source(&mut conn, &s, &Cloud, 1, 1000, |c, _, _| {
+            batches += 1;
+            if batches == 2 {
+                c.execute("UPDATE collections SET embedding_policy = 'local_only'", [])?;
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(
+            o.embedded, 1,
+            "only the batch before the change was sent: {o:?}"
+        );
+    }
+
+    #[test]
+    fn non_finite_vectors_are_refused() {
+        struct Nan;
+        impl Embedder for Nan {
+            fn model_id(&self) -> &str {
+                "nan"
+            }
+            fn dim(&self) -> usize {
+                2
+            }
+            fn max_input_tokens(&self) -> usize {
+                10
+            }
+            fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(texts.iter().map(|_| vec![f32::NAN, 0.0]).collect())
+            }
+            fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbedError> {
+                Ok(vec![0.0, 0.0])
+            }
+            fn egress(&self) -> Egress {
+                Egress::Local
+            }
+        }
+        let mut conn = crate::schema::open_in_memory().unwrap();
+        let s = source(&mut conn, "a", &["一。"]);
+        assert!(matches!(
+            embed_source(&mut conn, &s, &Nan, 1, 1000, |_, _, _| Ok(true)),
+            Err(EmbedJobError::Embed(_))
+        ));
     }
 
     #[test]

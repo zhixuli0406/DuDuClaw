@@ -29,12 +29,6 @@ fn text(p: &Value, key: &str, max: usize) -> Result<Option<String>, String> {
     }
 }
 
-/// Model ids are plain: letters, digits, `.`, `-`, `_`.
-fn plain_id(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-}
-
 fn embedding_table(root: &mut toml::Table) -> &mut toml::Table {
     let k = root
         .entry("knowledge")
@@ -70,7 +64,8 @@ pub(crate) fn apply(
     }
     let cloud_model = text(p, "cloud_model", 64)?;
     if let Some(m) = &cloud_model
-        && !plain_id(m)
+        && !m.is_empty()
+        && !duduclaw_knowledge::embed::config::valid_model_id(m)
     {
         return Err("雲端模型名稱只能包含英數字、點、連字號與底線。".to_string());
     }
@@ -80,18 +75,35 @@ pub(crate) fn apply(
         super::embedding_rpc::base_url_ok(u)?;
     }
     let t = embedding_table(root);
+    let previous = t
+        .get("provider")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
+    let provider_changed = previous.as_deref().unwrap_or("local") != provider.as_str();
     t.insert(
         "provider".into(),
         toml::Value::String(provider.as_str().into()),
     );
+    if let Some(v) = &local_model {
+        t.insert("local_model".into(), toml::Value::String(v.clone()));
+    }
+    // Cloud settings belong to one provider: a different provider starts
+    // from its own defaults unless the request names them, so an endpoint or
+    // model chosen for one vendor never carries over to another (and the
+    // acknowledged host is the one that is really used).
     for (key, v) in [
-        ("local_model", &local_model),
         ("cloud_model", &cloud_model),
         ("cloud_account", &cloud_account),
         ("cloud_base_url", &cloud_base_url),
     ] {
-        if let Some(v) = v {
-            t.insert(key.into(), toml::Value::String(v.clone()));
+        match v {
+            Some(v) => {
+                t.insert(key.into(), toml::Value::String(v.clone()));
+            }
+            None if provider_changed => {
+                t.insert(key.into(), toml::Value::String(String::new()));
+            }
+            None => {}
         }
     }
     // Resolve what is now in effect from the edited table itself.
@@ -202,6 +214,29 @@ mod tests {
         let cfg2 = EmbeddingConfig::from_toml_str(&toml::to_string(&root2).unwrap());
         assert!(cfg2.ack.is_none());
         assert_eq!(cfg2.provider, ProviderKind::Local);
+    }
+
+    #[test]
+    fn switching_provider_resets_the_previous_endpoint_and_model() {
+        let start = "[knowledge.embedding]\nprovider = \"openai\"\ncloud_base_url = \"https://proxy.corp.example\"\ncloud_model = \"text-embedding-3-large\"\n";
+        let (root, v) = run(
+            start,
+            json!({"provider": "gemini", "acknowledge_disclosure": true}),
+        )
+        .unwrap();
+        assert_eq!(v["host"], "generativelanguage.googleapis.com", "{v}");
+        assert_eq!(v["model"], "gemini-embedding-001");
+        assert_eq!(
+            root["knowledge"]["embedding"]["cloud_base_url"].as_str(),
+            Some("")
+        );
+        // Same provider again: the configured endpoint is kept.
+        let (_, v) = run(
+            start,
+            json!({"provider": "openai", "acknowledge_disclosure": true}),
+        )
+        .unwrap();
+        assert_eq!(v["host"], "proxy.corp.example");
     }
 
     #[test]

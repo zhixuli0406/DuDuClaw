@@ -204,9 +204,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           KB_BUNDLE_CACHE: ${{ runner.temp }}/kb-cache
+          # Through env, never interpolated into the script text.
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           mkdir -p "$KB_BUNDLE_CACHE" dist-kb
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             ./scripts/kb-model-bundle.sh "$target" multilingual-e5-small dist-kb

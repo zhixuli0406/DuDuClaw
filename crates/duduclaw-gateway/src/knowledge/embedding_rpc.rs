@@ -150,7 +150,8 @@ async fn status(home: &Path, is_admin: bool) -> Value {
             "model": g.model,
             "state": if g.running { "downloading" } else if g.error.is_some() { "error" } else { "idle" },
             "progress": g.progress,
-            "error": g.error,
+            // Install errors can name local paths: Admins only.
+            "error": if is_admin { g.error.clone() } else { None },
         })
     };
     let models: Vec<Value> = catalog::models()
@@ -175,6 +176,9 @@ async fn status(home: &Path, is_admin: bool) -> Value {
         })
         .collect();
     let cloud_info = match cfg.cloud_target() {
+        // Others only learn which vendor computes the vectors.
+        Some(Ok(t)) if !is_admin => json!({ "vendor": t.provider.vendor() }),
+        Some(Err(_)) if !is_admin => Value::Null,
         Some(Ok(t)) => json!({
             "provider": t.provider.as_str(),
             "vendor": t.provider.vendor(),
@@ -185,9 +189,15 @@ async fn status(home: &Path, is_admin: bool) -> Value {
         Some(Err(e)) => json!({ "error": e }),
         None => Value::Null,
     };
-    let redaction = match super::redaction_adapter::build(home) {
-        Ok(_) => json!({ "ready": true }),
-        Err(e) => json!({ "ready": false, "reason": e }),
+    // Compiling the rules is not free (it may load the AI detection model):
+    // only for the Admin who can act on the answer.
+    let redaction = if !is_admin {
+        Value::Null
+    } else {
+        match super::redaction_adapter::build(home) {
+            Ok(_) => json!({ "ready": true }),
+            Err(e) => json!({ "ready": false, "reason": e }),
+        }
     };
     json!({
         // Fields the knowledge-base page reads.
@@ -215,7 +225,7 @@ async fn status(home: &Path, is_admin: bool) -> Value {
             {"id": "gemini", "vendor": CloudProvider::Gemini.vendor(), "default_model": CloudProvider::Gemini.default_model(), "host": "generativelanguage.googleapis.com"},
         ],
         "acknowledgement": if is_admin { cfg.ack.as_ref().map(|a| json!(a)) } else { None },
-        "redaction": if is_admin { redaction } else { Value::Null },
+        "redaction": redaction,
         "is_admin": is_admin,
     })
 }

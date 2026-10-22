@@ -132,6 +132,17 @@ fn n(t: &toml::Table, k: &str, default: u64, lo: u64, hi: u64) -> u64 {
     }
 }
 
+/// A cloud model id that is safe inside a URL path: 1–64 of `[A-Za-z0-9._-]`,
+/// not starting with `.` and without `..`.
+pub fn valid_model_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('.')
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
 /// The resolved cloud target: provider, model, base URL and host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudTarget {
@@ -214,6 +225,11 @@ impl EmbeddingConfig {
         } else {
             self.cloud_model.clone()
         };
+        if !valid_model_id(&model) {
+            return Some(Err(
+                "雲端模型名稱只能包含英數字、點、連字號與底線".to_string()
+            ));
+        }
         Some(
             validate_base_url(&base).map(|(base_url, host)| CloudTarget {
                 provider,
@@ -283,6 +299,18 @@ cloud_disclosure_ack = { by = "admin", at = "2026-10-22T00:00:00Z", provider = "
             "[knowledge.embedding]\nprovider = \"gemini\"\ncloud_base_url = \"http://evil.example.com\"\n",
         );
         assert!(bad.cloud_target().unwrap().is_err());
+    }
+
+    #[test]
+    fn hand_edited_model_ids_cannot_reach_the_url_path() {
+        for bad in ["../v1/x", "a/b", "m?key=1", ".hidden", "x..y", ""] {
+            assert!(!valid_model_id(bad), "{bad}");
+        }
+        assert!(valid_model_id("text-embedding-3-small"));
+        let c = EmbeddingConfig::from_toml_str(
+            "[knowledge.embedding]\nprovider = \"gemini\"\ncloud_model = \"../evil\"\n",
+        );
+        assert!(c.cloud_target().unwrap().is_err());
     }
 
     #[test]

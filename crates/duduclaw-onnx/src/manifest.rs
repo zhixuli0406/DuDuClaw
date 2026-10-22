@@ -115,6 +115,46 @@ pub const ORT_ARCHIVES: &[OrtArchive] = &[
     },
 ];
 
+/// Size and SHA-256 of the shared library each archive's `member` extracts
+/// to, so an installed library is checked before it is loaded (a library
+/// that was dropped into place by hand, or swapped later, is refused).
+/// Hashed from the pinned archives on 2026-10-22.
+pub const ORT_LIB_PINS: &[(&str, u64, &str)] = &[
+    (
+        "aarch64-apple-darwin",
+        35_361_512,
+        "87df6f94dd559ea958748adc80fd4c46d91c52bc025771f513291d155539590a",
+    ),
+    (
+        "x86_64-unknown-linux-gnu",
+        22_065_056,
+        "ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad",
+    ),
+    (
+        "aarch64-unknown-linux-gnu",
+        18_559_840,
+        "e18fe095919d8613ead3a31ff78212bde4fad929418a9b48f49d61c829ed5c82",
+    ),
+    (
+        "x86_64-pc-windows-msvc",
+        14_148_680,
+        "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c",
+    ),
+    (
+        "aarch64-pc-windows-msvc",
+        14_161_952,
+        "d4c4d939c8bd1e93a86bc5a45b37a1fdd08dce34d8231db014a7e4a023923f5a",
+    ),
+];
+
+/// `(size, sha256)` of the extracted library for `target`.
+pub fn ort_lib_pin(target: &str) -> Option<(u64, &'static str)> {
+    ORT_LIB_PINS
+        .iter()
+        .find(|(t, _, _)| *t == target)
+        .map(|(_, size, sha)| (*size, *sha))
+}
+
 /// The Rust target triple this binary was built for, as the manifest spells
 /// it. Windows MSVC and GNU (mingw) toolchains consume the same DLL, so both
 /// map onto the `-msvc` entry.
@@ -189,6 +229,16 @@ mod tests {
             assert!(a.member.contains(ORT_VERSION) || a.member.ends_with(".dll"));
             assert!(a.size > 1_000_000);
         }
+    }
+
+    #[test]
+    fn every_archive_has_a_library_pin() {
+        assert_eq!(ORT_LIB_PINS.len(), ORT_ARCHIVES.len());
+        for a in ORT_ARCHIVES {
+            let (size, sha) = ort_lib_pin(a.target).unwrap();
+            assert!(size > 1_000_000 && sha.len() == 64, "{}", a.target);
+        }
+        assert!(ort_lib_pin("x86_64-apple-darwin").is_none());
     }
 
     #[test]

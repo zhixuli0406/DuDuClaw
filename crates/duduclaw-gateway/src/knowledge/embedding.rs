@@ -27,7 +27,10 @@ use duduclaw_knowledge::embed::{
 /// zh-TW reasons.
 pub const REASON_DISABLED: &str = "向量檢索已關閉（設定為只用關鍵字）";
 pub const REASON_NO_ACK: &str = "雲端向量服務尚未由管理員確認資料揭露，目前只用關鍵字";
-const CLOUD_TTL: Duration = Duration::from_secs(300);
+/// How long a built cloud embedder (and its compiled redaction rules) is
+/// reused. Config changes rebuild at once (the fingerprint has the
+/// config.toml hash); the force-disable flag is checked on every text.
+const CLOUD_TTL: Duration = Duration::from_secs(60);
 
 type LocalKey = (PathBuf, String, usize, usize);
 
@@ -164,7 +167,7 @@ async fn cloud(home: &Path, cfg: &EmbeddingConfig) -> Arc<dyn Embedder> {
         }
     }
     let redactor = match super::redaction_adapter::build(home) {
-        Ok(r) => r,
+        Ok(r) => super::redaction_adapter::guarded(home, r),
         Err(e) => return unavailable(format!("{e}，文件內容不會送到雲端，目前只用關鍵字")),
     };
     let Some(key) = resolve_key(home, &target, &cfg.cloud_account).await else {
