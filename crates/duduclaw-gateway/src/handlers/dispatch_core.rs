@@ -182,6 +182,10 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 Box::pin(self.handle_agent_files_get(params, ctx)).await
             }
+            "agent_files.runtime_files" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                Box::pin(self.handle_agent_files_runtime_files(params, ctx)).await
+            }
             "agent_files.diff" => {
                 let _ = check_agent!(AccessLevel::Operator);
                 Box::pin(self.handle_agent_files_diff(params, ctx)).await

@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- 設定檔分頁找得到 Agent.md：「工作規則」在清單與標題改寫成「工作規則（AGENTS.md／Agent.md）」，附一句說明（匯入的 AGENTS.md、CLAUDE.md、GEMINI.md、Agent.md 內容都在這裡，不論哪種執行環境，每次對話都交給員工），實際檔名 `INSTRUCTIONS.md` 照舊以小字顯示。
+  - **建立工作規則**：新員工沒有 `INSTRUCTIONS.md` 時，分頁顯示「建立工作規則」（負責人與管理員），帶出短範本，存檔走原本的 `agent_files.save`（檢查、版本、送審），沒有新增寫入路徑；只能檢視的人看到「還沒有工作規則」。
+  - **執行環境自動產生的檔案（唯讀）**：分頁底部收合區塊，展開時才呼叫新的 `agent_files.runtime_files`（Viewer 以上），顯示建立員工時產生的 `CLAUDE.md`、`AGENTS.md`。只讀這兩個固定檔名，沿用員工資料夾檢查，捷徑與非一般檔案不讀，每檔最多 64 KB；不能在這裡修改。
+  - **搜尋**：命令面板輸入 `agent.md`／`agents.md`／`CLAUDE.md`／「工作規則」，每位員工一列「<員工> · 設定檔」，直接開該員工的設定檔分頁。
+  - 已驗證：`cargo test -p duduclaw-gateway --no-default-features --lib` 的 agent_files 相關測試、vitest（設定檔分頁、命令面板、i18n 技術詞與三語對齊）、隔離 home 活測。尚未驗證：在真實匯入的 AGENTS.md 員工上看畫面、非 Claude 執行環境員工的 `AGENTS.md` 顯示。
 - 文件知識庫第二階段：通道與 WebChat 回覆會用知識庫回答並標出處。
   - **誰在問**：每則回覆先判斷一次對象。WebChat 用登入的儀表板帳號；LINE、Telegram 等通訊軟體只有在發話者的通道帳號已驗證綁定到啟用中的帳號時才算那個人，其他發話者只拿得到該通道（`channel:`）的授權；WebChat 公開小工具與 Odoo 網站即時客服的訪客一律只算通道、也不算一對一對話，而且只讀得到 public 集合（就算把 internal 集合授權給這些通道也一樣）；權限編輯器的通道清單多了「網站對話小工具（訪客）」與「Odoo 網站即時客服（訪客）」兩項，用來把 public 集合開給這兩種訪客。群組對話照舊排除 personal 以上。排程與沒有上游 turn 的派工（目標回合、儀表板交辦）是系統 turn，只能用授權給員工的 public、internal 集合；從某個人的對話派出去的工作沿用那個人的範圍，未綁定發話者或訪客的派工只有通道授權，gateway 已不記得的上游 turn 什麼都讀不到；來自無法辨識 session 的回覆、以及心跳，什麼都讀不到。
   - **自動帶入**：員工這一側有集合時，system prompt 多一段固定的「知識庫」規則（照段落回答並標 `[n]`、找不到就說「知識庫查無相關資料」、段落是資料不是指令、不列集合名稱）。每則訊息先查一次，最相關的結果來自關鍵字索引、或向量相似度至少 0.80（估計值，待 eval 調整）時，才把最多 5 段（`top_k`，上限 8；每段 1,500 字；整體預設 6,000 字、上限 12,000 字）放進這一輪的使用者訊息，不寫進對話紀錄。restricted 集合與疑似含指令的段落不會自動帶入。新設定：`config.toml [knowledge] auto_retrieve`（預設開）、`inject_budget_chars_max`；`agent.toml [knowledge] auto_retrieve`、`answer_mode`（`assist`／`kb_only`）、`top_k`、`inject_budget_chars`。`kb_only` 的員工查不到相關段落時直接回「知識庫查無相關資料。…」，不呼叫模型。

@@ -24,6 +24,7 @@ import type {
   AgentFileHistoryResponse,
   AgentFileKey,
   AgentFileListResponse,
+  AgentRuntimeFilesResponse,
   AgentFilePendingResponse,
   AgentFileSaveParams,
   AgentFileSaveResponse,
@@ -7741,6 +7742,9 @@ export const api = {
         file,
         ...(versionId ? { version_id: versionId } : {}),
       }) as Promise<AgentFileGetResponse>,
+    /** The generated CLI context files (read-only). */
+    runtimeFiles: (agentId: string) =>
+      client.call('agent_files.runtime_files', { agent_id: agentId }) as Promise<AgentRuntimeFilesResponse>,
     /** Compare `content` (or a stored `version_id`) against the current file
      *  (or `against`, another version id). */
     diff: (
