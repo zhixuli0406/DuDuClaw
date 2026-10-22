@@ -14,6 +14,7 @@
 
 mod assertions;
 mod case;
+mod cites;
 mod judge;
 // P2 (Team-as-Agent): the role→model capability matrix and its verifier cells.
 mod matrix;

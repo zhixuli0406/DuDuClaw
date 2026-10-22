@@ -328,6 +328,13 @@ pub(super) async fn spawn_claude_cli_with_env(
         .ok()
         .filter(|id| !id.is_empty())
         .and_then(|agent| crate::computer_use_sessions::turns::register_current_turn(&agent));
+    // Knowledge-base tool calls of this turn learn who it is for (the
+    // person the reply pipeline resolved), for as long as this CLI runs.
+    let _knowledge_turn = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .try_with(|id| id.clone())
+        .ok()
+        .filter(|id| !id.is_empty())
+        .and_then(|agent| crate::knowledge::turn_requesters::register_current_turn(&agent));
 
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");

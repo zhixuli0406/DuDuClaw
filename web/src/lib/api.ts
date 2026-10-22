@@ -5285,6 +5285,8 @@ export interface ChatSessionMessage {
   /** RFC3339 timestamp. */
   timestamp: string;
   tokens: number;
+  /** Stored message row id (newer gateways). */
+  id?: number;
 }
 
 export interface ChatSessionHistory {

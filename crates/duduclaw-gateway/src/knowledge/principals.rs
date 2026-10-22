@@ -72,11 +72,14 @@ pub struct Directory {
 }
 
 /// Chat channels a `channel:` grant may name (WebChat callers are dashboard
-/// users and are granted as users).
+/// users and are granted as users), plus the public-visitor channels
+/// (website widget, Odoo website Live Chat). A visitor reads only the
+/// `public` collections granted to its channel; the ACL query enforces that.
 pub fn grantable_channels() -> Vec<&'static str> {
     crate::channel_capabilities::all_channels()
         .map(|c| c.channel)
         .filter(|c| *c != "webchat")
+        .chain(duduclaw_knowledge::requester::PUBLIC_VISITOR_CHANNELS.iter().copied())
         .collect()
 }
 

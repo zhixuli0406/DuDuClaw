@@ -195,7 +195,11 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "calendar_create_event" | "os_notify" => Send,
 
         // ── publish ─────────────────────────────────────────────────────
-        "wiki_share" | "github_issue_comment" | "shared_skill_share" => Publish,
+        // `knowledge_add_source` only files a proposal; a person decides in
+        // the dashboard. Classified as publishing to a shared store.
+        "wiki_share" | "github_issue_comment" | "shared_skill_share" | "knowledge_add_source" => {
+            Publish
+        }
 
         // ── purchase ────────────────────────────────────────────────────
         "odoo_sale_confirm" => Purchase,
@@ -876,6 +880,7 @@ mod tests {
         assert_eq!(effect_of_builtin("wiki_write"), Some(ToolEffect::Modify));
         assert_eq!(effect_of_builtin("mail_send"), Some(ToolEffect::Send));
         assert_eq!(effect_of_builtin("wiki_share"), Some(ToolEffect::Publish));
+        assert_eq!(effect_of_builtin("knowledge_add_source"), Some(ToolEffect::Publish));
         // Rotates the gateway-internal MCP key when it is old: not read-only.
         assert_eq!(effect_of_builtin("os_doctor_repair"), Some(ToolEffect::Admin));
         // Connection handshake only; every Odoo read depends on it.

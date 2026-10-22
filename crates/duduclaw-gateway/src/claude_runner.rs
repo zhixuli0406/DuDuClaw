@@ -499,6 +499,11 @@ where
     // below share one source.
     let run_session = format!("{}:{agent_id}", request_type.as_str());
     let run_key = crate::memory_provenance::new_dispatch_run_key();
+    // Knowledge-base reads during the run: no person is in the loop, so the
+    // run is a system turn (public / internal collections granted to the
+    // employee), keyed by the run id every runtime hands to its MCP server.
+    let _knowledge_run =
+        crate::knowledge::turn_requesters::register_run(agent_id, &run_key, request_type.as_str());
     let fut = crate::memory_provenance::DISPATCH_RUN
         .scope(Some((run_session.clone(), run_key.clone())), fut);
     // Native-tool collection: REUSE an outer scope when the goal loop already
@@ -3934,6 +3939,9 @@ pub(crate) struct ClaudeCmdGuards {
     /// `(agent, turn) → reply channel` registration for the computer-use
     /// route's confirmations; lives as long as the spawned CLI.
     turn: Option<crate::computer_use_sessions::turns::TurnGuard>,
+    /// `(agent, turn) → person` for the knowledge route, inside a channel
+    /// reply turn; lives as long as the spawned CLI.
+    knowledge: Option<crate::knowledge::turn_requesters::RequesterGuard>,
 }
 
 fn prepare_claude_cmd(
@@ -4257,10 +4265,11 @@ fn prepare_claude_cmd(
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only
     // while the guards live, i.e. while the CLI runs.
-    let turn = config_dir
+    let spawned = config_dir
         .and_then(|d| d.file_name())
-        .and_then(|n| n.to_str())
-        .and_then(crate::computer_use_sessions::turns::register_current_turn);
+        .and_then(|n| n.to_str());
+    let turn = spawned.and_then(crate::computer_use_sessions::turns::register_current_turn);
+    let knowledge = spawned.and_then(crate::knowledge::turn_requesters::register_current_turn);
 
     Ok((
         cmd,
@@ -4268,6 +4277,7 @@ fn prepare_claude_cmd(
             prompt: prompt_guard,
             mcp_proxy: mcp_proxy_guard,
             turn,
+            knowledge,
         },
     ))
 }
