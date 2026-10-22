@@ -96,6 +96,19 @@
 
 **權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
+## 思考過程顯示
+
+目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。
+
+| 檔案 | 設定鍵 | 值 |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary`（預設：WebChat 顯示計時、token 與遮蔽後的思考文字）、`status`（只有計時與 token）、`off`（不送思考訊框；WebChat 自己的計時仍在） |
+| `config.toml` | `[thinking] max_chars` | 每輪思考文字上限，預設 4000，限制在 200–20000 |
+| `config.toml` | `[thinking] anthropic_display` | `summarized`（預設）或 `updates`（beta，只有部分 Claude 模型支援） |
+| `agent.toml` | `[model] show_thinking` | `summary`／`status`／`off`；不設定就跟隨 `[thinking] display`。兩者取較嚴格的 |
+
+`config.toml` 讀不到、解析失敗，或 `display` 值看不懂，都當成 `status`。只有登入 dashboard 的 WebChat 使用者看得到思考文字，通訊軟體永遠看不到。細節見[思考過程顯示](../../features/zh-TW/64-thinking-display.md)。
+
 ## 設定檔進階編輯
 
 位置：系統設定 → 進階設定 → 設定檔進階編輯。只有管理員看得到，RPC 是 `config.raw.get` / `config.raw.set`。

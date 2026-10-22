@@ -20,8 +20,10 @@ import {
   MentionPopup,
   MENTION_LISTBOX_ID,
   mentionOptionId,
-  TypingIndicator,
+  ThinkingStatus,
+  ThinkingSection,
   TaskInsights,
+  splitTurnMessages,
   EmployeeRow,
   useChatFace,
   MicButton,
@@ -51,6 +53,7 @@ export function WebChatPage() {
     messages,
     steps,
     stepTree,
+    thinking,
     isStreaming,
     phase,
     viseme,
@@ -217,11 +220,10 @@ export function WebChatPage() {
         )
       : undefined;
 
-  // Split off a still-streaming assistant bubble so the step tree can sit above it.
-  const last = messages[messages.length - 1];
-  const streamingAssistant = isStreaming && last?.role === 'assistant' && last.tokens == null ? last : null;
-  const priorMessages = streamingAssistant ? messages.slice(0, -1) : messages;
-  const insightsVisible = stepTree.length > 0 || steps.length > 0;
+  // Split off the current turn's reply (still streaming, or just finished with
+  // its thinking) so the step tree and thinking line can sit above it.
+  const { prior: priorMessages, streamingAssistant, turnReply } = splitTurnMessages(messages, isStreaming);
+  const insightsVisible = stepTree.length > 0 || steps.length > 0 || turnReply !== null;
   const empty = messages.length === 0;
 
   const newConversation = () => {
@@ -504,19 +506,40 @@ export function WebChatPage() {
           ) : (
             <>
               {priorMessages.map((msg) => (
-                <MessageBubble
-                  key={msg.id}
-                  message={msg}
-                  leading={msg.role === 'assistant' ? assistantAvatar(msg) : undefined}
-                  label={answeredByLabel(msg)}
-                />
+                <div key={msg.id} className="space-y-1">
+                  {msg.role === 'assistant' && msg.thinking && (
+                    <div className="pl-[34px]">
+                      <ThinkingSection thinking={msg.thinking} compact />
+                    </div>
+                  )}
+                  <MessageBubble
+                    message={msg}
+                    leading={msg.role === 'assistant' ? assistantAvatar(msg) : undefined}
+                    label={answeredByLabel(msg)}
+                  />
+                </div>
               ))}
 
-              {insightsVisible && <TaskInsights tree={stepTree} todos={steps} streaming={isStreaming} />}
+              {insightsVisible && (
+                <TaskInsights
+                  tree={stepTree}
+                  todos={steps}
+                  streaming={isStreaming}
+                  thinking={turnReply?.thinking ?? null}
+                />
+              )}
 
               {streamingAssistant && <MessageBubble message={streamingAssistant} leading={leadingAvatar} />}
 
-              {isStreaming && !streamingAssistant && <TypingIndicator />}
+              {turnReply && (
+                <MessageBubble
+                  message={turnReply}
+                  leading={assistantAvatar(turnReply)}
+                  label={answeredByLabel(turnReply)}
+                />
+              )}
+
+              {isStreaming && !streamingAssistant && <ThinkingStatus thinking={thinking} stepTree={stepTree} />}
             </>
           )}
 
