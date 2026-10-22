@@ -31,12 +31,17 @@ cost_limit_usd = 50.0
 [circuit_breaker]
 # Sliding window for frequency anomaly detection (seconds).
 frequency_window_secs = 10
-# Max replies in the frequency window before tripping.
+# Max messages per conversation in the frequency window. A message over the
+# limit waits until the window has room (at most 30 s) and is then answered;
+# it no longer trips the breaker or gets dropped.
 frequency_max_replies = 5
-# Content similarity threshold (0.0-1.0) for repetition detection.
+# Content similarity threshold (0.0-1.0) for repetition detection: three
+# near-identical inbound messages in a row trip the breaker. Messages shorter
+# than 20 characters never count (a person repeating "在嗎？" is not a loop).
 # 1.0 = exact match only, 0.95 = near-duplicate detection.
 similarity_threshold = 0.95
-# Token count multiplier over rolling average to detect explosion.
+# Token count multiplier over the rolling average of our replies. A reply over
+# it is logged as a warning only; it does not drop the next message.
 token_explosion_multiplier = 3.0
 # Cooldown after tripping (seconds) before probing half-open.
 cooldown_secs = 60

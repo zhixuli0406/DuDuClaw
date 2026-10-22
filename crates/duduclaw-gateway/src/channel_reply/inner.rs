@@ -582,9 +582,10 @@ pub(super) async fn build_reply_with_session_inner(
     // ── L2: Circuit breaker check ──
     let mut breaker_state = duduclaw_security::circuit_breaker::BreakerState::Closed;
     if let Some(ref cb_registry) = ctx.circuit_breakers {
-        let decision = cb_registry.check_inbound(session_id, text).await;
+        let decision = super::breaker_wait::check_inbound_waiting(cb_registry, session_id, text).await;
         match decision {
-            duduclaw_security::circuit_breaker::BreakerDecision::Allow => {}
+            duduclaw_security::circuit_breaker::BreakerDecision::Allow
+            | duduclaw_security::circuit_breaker::BreakerDecision::Wait(_) => {}
             duduclaw_security::circuit_breaker::BreakerDecision::Throttle => {
                 breaker_state = duduclaw_security::circuit_breaker::BreakerState::HalfOpen;
                 // Allow through but mark for defensive prompt injection later

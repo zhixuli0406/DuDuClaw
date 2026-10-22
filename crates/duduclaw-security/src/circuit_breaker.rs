@@ -66,11 +66,19 @@ pub enum BreakerDecision {
     Allow,
     /// Request is allowed but should be throttled (half-open probing).
     Throttle,
+    /// Too many messages in the frequency window: run this one after the
+    /// given wait instead of dropping it (B10). Nothing was recorded; check
+    /// again after waiting.
+    Wait(Duration),
     /// Request is denied — breaker is open.
     Deny(BreakerState),
     /// Breaker just tripped — escalate to failsafe.
     Trip(TripReason),
 }
+
+/// Inbound messages shorter than this (in characters, trimmed) are never
+/// treated as content repetition. See check 3 in [`CircuitBreaker::check_inbound`].
+pub const REPETITION_MIN_CHARS: usize = 20;
 
 /// Compute a fast hash of a string for similarity comparison.
 fn text_hash(text: &str) -> u64 {
@@ -185,7 +193,13 @@ impl CircuitBreaker {
     }
 
     /// Record an outbound (bot reply) message for echo detection.
-    pub fn record_outbound(&mut self, text: &str, token_count: usize) {
+    ///
+    /// Returns [`TripReason::TokenExplosion`] when this reply is far longer
+    /// than the recent ones. That is reported (logged by the registry), not
+    /// enforced: a long answer is a property of our own output, and gating
+    /// the person's *next* message on it dropped ordinary follow-up questions
+    /// after any detailed answer (B10, 2026-10). It never opens the breaker.
+    pub fn record_outbound(&mut self, text: &str, token_count: usize) -> Option<TripReason> {
         self.last_outbound_hash = Some(text_hash(text));
         // Store a prefix (up to 200 chars) for secondary echo verification,
         // avoiding false positives from hash collisions.
@@ -194,6 +208,23 @@ impl CircuitBreaker {
         if self.recent_token_counts.len() > 32 {
             self.recent_token_counts.pop_front();
         }
+        self.token_explosion()
+    }
+
+    /// The last reply's token count against the rolling average (only once
+    /// there are at least five replies).
+    fn token_explosion(&self) -> Option<TripReason> {
+        if self.recent_token_counts.len() < 5 {
+            return None;
+        }
+        let avg = self.recent_token_counts.iter().sum::<usize>() / self.recent_token_counts.len();
+        let last = *self.recent_token_counts.back()?;
+        (avg > 0 && last as f64 > avg as f64 * self.config.token_explosion_multiplier).then_some(
+            TripReason::TokenExplosion {
+                current: last,
+                average: avg,
+            },
+        )
     }
 
     /// Check an inbound message and return the breaker's decision.
@@ -252,7 +283,6 @@ impl CircuitBreaker {
 
         // ── Closed state: run anomaly detection ──
 
-        self.record_inbound_internal(text, now);
         let hash = text_hash(text);
 
         // Check 1: Echo detection (highest priority, immediate trip)
@@ -273,21 +303,30 @@ impl CircuitBreaker {
                 }
             }
 
-        // Check 2: Frequency anomaly
-        let window = Duration::from_secs(self.config.frequency_window_secs);
-        let cutoff = now - window;
-        self.inbound_timestamps.retain(|t| *t > cutoff);
-        if self.inbound_timestamps.len() > self.config.frequency_max_replies as usize {
-            let reason = TripReason::FrequencyAnomaly {
-                count: self.inbound_timestamps.len() as u32,
-                window_secs: self.config.frequency_window_secs,
-            };
-            self.trip(reason.clone());
-            return BreakerDecision::Trip(reason);
+        // Check 2: Frequency. More than `frequency_max_replies` messages in
+        // the window used to trip the breaker and drop every message for the
+        // cooldown — a person typing a question in several short messages
+        // lost the answers (B10). The extra message now waits until the
+        // window has room, so the reply rate stays bounded and nothing is
+        // dropped. Bot loops are still stopped by checks 1 and 3.
+        if let Some(wait) = self.frequency_wait(now) {
+            return BreakerDecision::Wait(wait);
         }
+        self.record_inbound_internal(text, now);
 
-        // Check 3: Content repetition
-        if self.recent_inbound_texts.len() >= 3 {
+        // Check 3: Content repetition. Short messages never count: a person
+        // repeating 「在嗎？」 or 「好」 while waiting for an answer is not a
+        // bot loop, and tripping on it silenced exactly the people who were
+        // already waiting (B10, 2026-10). Bot-loop templates are long; an
+        // exact echo of our own reply is caught by check 1 at any length.
+        let repeat_candidates = self
+            .recent_inbound_texts
+            .iter()
+            .rev()
+            .take(3)
+            .filter(|t| t.trim().chars().count() >= REPETITION_MIN_CHARS)
+            .count();
+        if self.recent_inbound_texts.len() >= 3 && repeat_candidates == 3 {
             let texts: Vec<&str> = self.recent_inbound_texts.iter().map(|s| s.as_str()).collect();
             let len = texts.len();
             // Compare last 3 messages pairwise
@@ -313,24 +352,28 @@ impl CircuitBreaker {
             }
         }
 
-        // Check 4: Token explosion (only if we have enough history)
-        if self.recent_token_counts.len() >= 5 {
-            let avg: usize =
-                self.recent_token_counts.iter().sum::<usize>() / self.recent_token_counts.len();
-            if let Some(&last) = self.recent_token_counts.back()
-                && avg > 0
-                    && last as f64 > avg as f64 * self.config.token_explosion_multiplier
-                {
-                    let reason = TripReason::TokenExplosion {
-                        current: last,
-                        average: avg,
-                    };
-                    self.trip(reason.clone());
-                    return BreakerDecision::Trip(reason);
-                }
-        }
+        // Token explosion is not checked here: it describes our previous
+        // reply, so it is reported by `record_outbound` instead of dropping
+        // the person's next message.
 
         BreakerDecision::Allow
+    }
+
+    /// How long the next message must wait so that at most
+    /// `frequency_max_replies` messages fall inside the window, or `None`
+    /// when it may run now. Prunes timestamps older than the window.
+    fn frequency_wait(&mut self, now: Instant) -> Option<Duration> {
+        let window = Duration::from_secs(self.config.frequency_window_secs);
+        let cutoff = now.checked_sub(window);
+        self.inbound_timestamps
+            .retain(|t| cutoff.is_none_or(|c| *t > c));
+        let max = self.config.frequency_max_replies.max(1) as usize;
+        if self.inbound_timestamps.len() < max {
+            return None;
+        }
+        // The window has room again once the oldest kept message ages out.
+        let oldest = self.inbound_timestamps[self.inbound_timestamps.len() - max];
+        Some((oldest + window).saturating_duration_since(now).max(Duration::from_millis(10)))
     }
 
     /// Trip the circuit breaker (Closed → Open).
@@ -407,11 +450,18 @@ impl CircuitBreakerRegistry {
     }
 
     /// Record an outbound message for echo detection.
-    pub async fn record_outbound(&self, scope: &str, text: &str, token_count: usize) {
+    /// A token explosion (see [`CircuitBreaker::record_outbound`]) is logged
+    /// and returned; it does not change the breaker state.
+    pub async fn record_outbound(
+        &self,
+        scope: &str,
+        text: &str,
+        token_count: usize,
+    ) -> Option<TripReason> {
         let mut map = self.breakers.write().await;
-        if let Some(breaker) = map.get_mut(scope) {
-            breaker.record_outbound(text, token_count);
-        }
+        let reason = map.get_mut(scope)?.record_outbound(text, token_count)?;
+        warn!(scope, %reason, "Reply far longer than recent replies (reported, not enforced)");
+        Some(reason)
     }
 
     /// Force-reset a specific scope's breaker.
@@ -477,16 +527,26 @@ mod tests {
         assert!(matches!(cb.check_inbound("test"), BreakerDecision::Allow));
     }
 
+    /// B10: a burst over the frequency limit waits instead of tripping, and
+    /// the waiting message is not counted until it actually runs.
     #[test]
-    fn trips_on_frequency() {
+    fn frequency_over_limit_waits_instead_of_tripping() {
         let mut cb = CircuitBreaker::new(test_config());
-        cb.check_inbound("a");
-        cb.check_inbound("b");
-        cb.check_inbound("c");
-        // 4th message exceeds limit of 3
-        let decision = cb.check_inbound("d");
-        assert!(matches!(decision, BreakerDecision::Trip(TripReason::FrequencyAnomaly { .. })));
-        assert_eq!(cb.state(), BreakerState::Open);
+        for text in ["a", "b", "c"] {
+            assert!(matches!(cb.check_inbound(text), BreakerDecision::Allow));
+        }
+        // 4th message exceeds the limit of 3 in 10 s: wait, never drop.
+        match cb.check_inbound("d") {
+            BreakerDecision::Wait(d) => {
+                assert!(d <= Duration::from_secs(10) && d >= Duration::from_secs(9), "{d:?}")
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+        assert_eq!(cb.state(), BreakerState::Closed);
+        assert_eq!(cb.inbound_timestamps.len(), 3, "a waiting message is not counted");
+        // Once the window has room the message runs.
+        let later = Instant::now() + Duration::from_secs(11);
+        assert_eq!(cb.frequency_wait(later), None);
     }
 
     #[test]
@@ -502,13 +562,30 @@ mod tests {
         let mut config = test_config();
         config.frequency_max_replies = 100; // don't trip on frequency
         let mut cb = CircuitBreaker::new(config);
-        cb.check_inbound("same message");
-        cb.check_inbound("same message");
-        let decision = cb.check_inbound("same message");
+        let template = "Automated notice: your request has been queued for processing.";
+        cb.check_inbound(template);
+        cb.check_inbound(template);
+        let decision = cb.check_inbound(template);
         assert!(matches!(
             decision,
             BreakerDecision::Trip(TripReason::ContentRepetition { .. })
         ));
+    }
+
+    /// B10: a person repeating a short message while waiting ("在嗎？" ×3,
+    /// "好" ×3) is not a bot loop and must not silence the conversation.
+    #[test]
+    fn short_repeated_messages_do_not_trip() {
+        let mut config = test_config();
+        config.frequency_max_replies = 100;
+        let mut cb = CircuitBreaker::new(config);
+        for text in ["在嗎？", "在嗎？", "在嗎？", "在嗎？", "好", "好", "好", "same message"] {
+            assert!(
+                matches!(cb.check_inbound(text), BreakerDecision::Allow),
+                "{text} tripped the breaker"
+            );
+        }
+        assert_eq!(cb.state(), BreakerState::Closed);
     }
 
     #[test]
@@ -518,17 +595,20 @@ mod tests {
         let mut cb = CircuitBreaker::new(config);
         // Build up a baseline of small token counts
         for i in 0..6 {
-            cb.record_outbound(&format!("msg{i}"), 100);
+            assert!(cb.record_outbound(&format!("msg{i}"), 100).is_none());
             cb.check_inbound(&format!("input{i}"));
         }
-        // Now record a huge token count
-        cb.record_outbound("huge reply", 1000);
-        // Next inbound should detect the explosion
-        let decision = cb.check_inbound("trigger");
+        // A huge reply is reported...
         assert!(matches!(
-            decision,
-            BreakerDecision::Trip(TripReason::TokenExplosion { .. })
+            cb.record_outbound("huge reply", 1000),
+            Some(TripReason::TokenExplosion { current: 1000, .. })
         ));
+        // ...but the person's follow-up questions still go through (B10:
+        // gating them on our own reply length dropped them silently).
+        for follow_up in ["thanks, and one more question", "what about tomorrow?", "ok"] {
+            assert!(matches!(cb.check_inbound(follow_up), BreakerDecision::Allow));
+        }
+        assert_eq!(cb.state(), BreakerState::Closed);
     }
 
     #[test]
@@ -671,9 +751,9 @@ mod tests {
         reg.check_inbound("s1", "a").await;
         reg.check_inbound("s1", "b").await;
         reg.check_inbound("s1", "c").await;
-        // s1 should trip
+        // s1 is over its frequency limit: the next message waits
         let d1 = reg.check_inbound("s1", "d").await;
-        assert!(matches!(d1, BreakerDecision::Trip(_)));
+        assert!(matches!(d1, BreakerDecision::Wait(_)));
         // s2 should still be fine
         let d2 = reg.check_inbound("s2", "hello").await;
         assert!(matches!(d2, BreakerDecision::Allow));

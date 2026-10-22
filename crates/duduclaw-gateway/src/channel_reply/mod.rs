@@ -215,6 +215,7 @@ pub use crate::runtime::ConversationTurn;
 // re-exports below.
 
 mod access_gate;
+mod breaker_wait;
 mod ccr_delivery;
 mod cli_env;
 mod cli_spawn;
