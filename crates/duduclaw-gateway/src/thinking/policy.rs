@@ -27,8 +27,9 @@ pub const DEFAULT_MAX_CHARS: usize = 4_000;
 const MIN_MAX_CHARS: usize = 200;
 const MAX_MAX_CHARS: usize = 20_000;
 
-/// What the turn's sink forwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the turn's sink forwards. Ordered from strictest, so `a.min(b)` is
+/// the stricter level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SinkLevel {
     /// Nothing reaches the callback (WebChat with display `off`).
     Off,
@@ -206,7 +207,7 @@ pub fn resolve(
 ) -> Option<ThinkingPolicy> {
     let cfg = ThinkingConfig::from_home(home);
     let agent = if is_webchat_session(session_id) && !widget_visitor {
-        agent_dir.and_then(duduclaw_core::show_thinking::read_agent_show_thinking)
+        Some(agent_dir.map_or(ShowThinking::Status, agent_ceiling))
     } else {
         None
     };
@@ -218,10 +219,95 @@ pub fn resolve(
     })
 }
 
+/// The most one employee allows to be shown, failing closed: a missing
+/// agent directory, an `agent.toml` or `CONTRACT.toml` that exists but
+/// cannot be read or parsed, or an unknown `show_thinking` value all mean
+/// `status` (timing only — the CONTRACT check on thinking text could not
+/// run reliably). No `show_thinking` key ⇒ no narrowing (`summary`).
+pub fn agent_ceiling(agent_dir: &Path) -> ShowThinking {
+    if !agent_dir.is_dir() {
+        return ShowThinking::Status;
+    }
+    let parse = |name: &str| -> Result<Option<toml::Table>, ()> {
+        match std::fs::read_to_string(agent_dir.join(name)) {
+            Ok(text) => text.parse::<toml::Table>().map(Some).map_err(|_| ()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        }
+    };
+    let (Ok(agent), Ok(_contract)) = (parse("agent.toml"), parse("CONTRACT.toml")) else {
+        warn!(agent_dir = %agent_dir.display(), "agent.toml / CONTRACT.toml unreadable — thinking text off");
+        return ShowThinking::Status;
+    };
+    let Some(value) = agent
+        .as_ref()
+        .and_then(|t| t.get("model"))
+        .and_then(|m| m.get("show_thinking"))
+    else {
+        return ShowThinking::Summary;
+    };
+    match value.as_str().and_then(|s| s.parse::<ShowThinking>().ok()) {
+        Some(level) => level,
+        None => {
+            warn!(value = %value, "[model] show_thinking is not summary/status/off — using status");
+            ShowThinking::Status
+        }
+    }
+}
+
+/// The sink level one employee's ceiling allows.
+pub fn level_for(show: ShowThinking) -> SinkLevel {
+    match show {
+        ShowThinking::Off => SinkLevel::Off,
+        ShowThinking::Status => SinkLevel::Status,
+        ShowThinking::Summary => SinkLevel::Summary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ShowThinking::*;
+
+    #[test]
+    fn agent_ceiling_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("a");
+        // Missing directory.
+        assert_eq!(agent_ceiling(&dir), Status);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Directory with no files: no narrowing.
+        assert_eq!(agent_ceiling(&dir), Summary);
+        for (agent, contract, want) in [
+            (Some("[model]\nshow_thinking = \"off\"\n"), None, Off),
+            (Some("[model]\npreferred = \"x\"\n"), None, Summary),
+            (Some("[model]\nshow_thinking = \"loud\"\n"), None, Status),
+            (Some("not = [valid"), None, Status),
+            (Some("[model]\n"), Some("[boundaries\nmust_not = 1"), Status),
+            (None, Some("[boundaries]\nmust_not = [\"x\"]\n"), Summary),
+        ] {
+            let _ = std::fs::remove_file(dir.join("agent.toml"));
+            let _ = std::fs::remove_file(dir.join("CONTRACT.toml"));
+            if let Some(a) = agent {
+                std::fs::write(dir.join("agent.toml"), a).unwrap();
+            }
+            if let Some(c) = contract {
+                std::fs::write(dir.join("CONTRACT.toml"), c).unwrap();
+            }
+            assert_eq!(agent_ceiling(&dir), want, "{agent:?} / {contract:?}");
+        }
+        assert!(SinkLevel::Off < SinkLevel::Status && SinkLevel::Status < SinkLevel::Summary);
+    }
+
+    #[test]
+    fn missing_agent_dir_means_no_text_for_webchat() {
+        let home = tempfile::tempdir().unwrap();
+        let ghost = home.path().join("agents").join("ghost");
+        let p = resolve(home.path(), Some(&ghost), "webchat:x:1", false).unwrap();
+        assert_eq!(p.level, SinkLevel::Status);
+        let p = resolve(home.path(), None, "webchat:x:1", false).unwrap();
+        assert_eq!(p.level, SinkLevel::Status);
+    }
 
     #[test]
     fn config_defaults_and_fail_closed_reads() {

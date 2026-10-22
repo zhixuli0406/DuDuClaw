@@ -186,7 +186,7 @@ async fn finish_writes_one_textless_run_steps_row_inside_the_turn() {
         rec.turn_usage(1_240);
     })
     .await;
-    sink.finish("agnes", "webchat:x:1");
+    sink.finish("agnes", "webchat:x:1").await;
     let store = crate::run_steps::shared_store(home.path()).unwrap();
     let rows = store.recent_for_session("webchat:x:1", 10).unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -213,11 +213,78 @@ async fn finish_writes_one_textless_run_steps_row_inside_the_turn() {
     let (_inner, quiet) = install(Some(summary_policy()), None, sink_ctx(home.path()));
     let quiet = quiet.unwrap();
     assert!(!quiet.saw_any());
-    quiet.finish("agnes", "webchat:x:2");
+    quiet.finish("agnes", "webchat:x:2").await;
     assert!(
         store
             .recent_for_session("webchat:x:2", 10)
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn an_at_called_employee_with_show_thinking_off_shows_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    for (id, toml) in [
+        ("agnes", "[model]\nshow_thinking = \"summary\"\n"),
+        ("quiet", "[model]\nshow_thinking = \"off\"\n"),
+    ] {
+        let dir = home.path().join("agents").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), toml).unwrap();
+    }
+    let (cb, got) = capture();
+    let (_inner, sink) = install(Some(summary_policy()), Some(cb), sink_ctx(home.path()));
+    let sink = sink.unwrap();
+    // The default employee (agnes) answers: text flows.
+    scope_turn(Some(Arc::clone(&sink)), async {
+        Recorder::new("claude_cli").oneshot(ThinkingKind::Summary, Some("agnes plan"), None);
+    })
+    .await;
+    // The `@`-called employee answers inside the same turn.
+    scope_turn(Some(Arc::clone(&sink)), async {
+        crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+            .scope("quiet".to_string(), async {
+                assert!(!policy().wants_text(), "producers see the narrowed policy");
+                Recorder::new("claude_cli").oneshot(
+                    ThinkingKind::Summary,
+                    Some("quiet plan"),
+                    None,
+                );
+            })
+            .await;
+    })
+    .await;
+    let got = got.lock().unwrap();
+    let texts: Vec<&str> = got
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::Thinking(t) => t.text.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["agnes plan"], "{got:?}");
+}
+
+#[tokio::test]
+async fn an_answering_employee_without_a_directory_shows_no_text() {
+    let home = tempfile::tempdir().unwrap();
+    let (cb, got) = capture();
+    let (_inner, sink) = install(Some(summary_policy()), Some(cb), sink_ctx(home.path()));
+    scope_turn(sink, async {
+        crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+            .scope("ghost".to_string(), async {
+                Recorder::new("claude_cli").oneshot(ThinkingKind::Summary, Some("x"), None);
+            })
+            .await;
+    })
+    .await;
+    let got = got.lock().unwrap();
+    assert!(!got.is_empty());
+    for e in got.iter() {
+        let ProgressEvent::Thinking(t) = e else {
+            panic!()
+        };
+        assert!(t.text.is_none(), "{t:?}");
+    }
 }

@@ -116,6 +116,8 @@ impl MethodHandler {
                     { "name": "experts.install_builtin", "description": "Convert + install a built-in industry expert pack (admin)" },
                     { "name": "experts.generate", "description": "LLM-generate a custom expert-pack draft from a guided form (admin)" },
                     { "name": "experts.generate_revise", "description": "Regenerate an expert-pack draft with feedback (admin, max 5 rounds)" },
+                    { "name": "experts.generate_status", "description": "Progress of a background expert-pack generation job, plus the draft preview once done (admin)" },
+                    { "name": "experts.generate_cancel", "description": "Stop a running expert-pack generation job (admin)" },
                     { "name": "experts.install_draft", "description": "Install a generated expert-pack draft via the full security pipeline (admin)" },
                     { "name": "gallery.list", "description": "List curated inspiration-gallery cards (team task examples) for one-click remake (admin)" },
                     { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },

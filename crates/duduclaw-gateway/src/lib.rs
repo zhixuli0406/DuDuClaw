@@ -199,7 +199,9 @@ pub mod ephemeral;
 pub mod events_store;
 pub mod expert_admin;
 pub mod expert_generate;
+pub mod expert_generate_staged;
 pub mod expert_skills;
+pub mod process_group;
 pub mod external_factors;
 pub mod footprint_distill;
 pub mod foresight;
@@ -211,6 +213,7 @@ pub mod handlers;
 // `identity_resolve` MCP tool (the latter two used to hard-code wiki-cache).
 pub mod identity_provider;
 pub mod interruptibility;
+pub mod knowledge;
 pub mod knowledge_guard;
 pub(crate) mod local_session;
 pub mod maintenance;

@@ -30,6 +30,9 @@ use serde_json::Value;
 /// `openWorldHint: false`; every other tool keeps the MCP default (`true`).
 pub(crate) const CLOSED_WORLD_TOOLS: &[&str] = &[
     "code_map",
+    "knowledge_get_passage",
+    "knowledge_list_collections",
+    "knowledge_search",
     "memory_alias_add",
     "memory_alias_list",
     "memory_fetch_batch",

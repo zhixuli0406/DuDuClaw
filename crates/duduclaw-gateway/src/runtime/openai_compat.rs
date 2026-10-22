@@ -550,6 +550,20 @@ fn build_tool_chat_request(
 /// (mirrors the plain path's empty-content⇒Err). A tool-only intermediate
 /// round never reaches here — the loop only returns on a non-`ToolUse` stop or
 /// iteration-cap exhaustion.
+/// The streamed answer with the same rules as the other two paths: a
+/// leading inline `<think>` block is removed, and nothing left is an error
+/// (failover), never an empty `Ok` that a channel would silently drop.
+fn sse_final_content(content: &str, model: &str) -> Result<String, String> {
+    let text = duduclaw_core::think_tags::strip_leading_think_block(content);
+    if text.trim().is_empty() {
+        return Err(format!(
+            "Empty response from OpenAI-compat SSE stream (model={model}); \
+             the stream carried no answer text"
+        ));
+    }
+    Ok(text)
+}
+
 fn classify_final_text(resp: &ChatResponse, model: &str) -> Result<String, String> {
     // A leading inline `<think>` block is the model's reasoning, not answer.
     let text = duduclaw_core::think_tags::strip_leading_think_block(&resp.text());
@@ -918,8 +932,7 @@ impl OpenAiCompatRuntime {
         }
 
         Ok(super::RuntimeResponse {
-            // Same leading-`<think>` rule as the non-streaming path.
-            content: duduclaw_core::think_tags::strip_leading_think_block(&content),
+            content: sse_final_content(&content, &context.model)?,
             input_tokens,
             output_tokens,
             cache_read_tokens: 0,
@@ -1102,6 +1115,19 @@ mod tests {
         };
         let err = classify_final_text(&no_text, "deepseek-chat").unwrap_err();
         assert!(err.contains("Empty response"), "got: {err}");
+    }
+
+    #[test]
+    fn sse_final_content_strips_think_and_rejects_empty() {
+        assert_eq!(
+            sse_final_content("<think>x</think> 答案", "qwen3").unwrap(),
+            "答案"
+        );
+        assert_eq!(sse_final_content("plain", "qwen3").unwrap(), "plain");
+        for empty in ["", "  ", "<think>never closed", "<think>a</think>\n"] {
+            let err = sse_final_content(empty, "qwen3").unwrap_err();
+            assert!(err.contains("Empty response"), "{empty:?}: {err}");
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod budget;
 /// RFC-26 P6.3: the bundled SKILL.md set every new AI staffer is seeded with.
 pub mod builtin_skills;
 pub mod contract;
+pub mod contract_sanitize;
 /// Zero-cost Anthropic credential probing (2026-09 account-hardening D1).
 pub mod credential_probe;
 pub mod heartbeat;

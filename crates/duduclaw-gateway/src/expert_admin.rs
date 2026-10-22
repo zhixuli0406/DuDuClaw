@@ -71,12 +71,29 @@ pub struct InstallRecord {
     /// install (removed on uninstall).
     #[serde(default)]
     pub wiki_files: Vec<String>,
+    /// Per-employee skills this install placed, as `<agent id>/<skill>`
+    /// (under `<home>/agents/<id>/SKILLS/`). Counted in list UIs and removed
+    /// on uninstall. Empty for records written before this field existed.
+    #[serde(default)]
+    pub agent_skills: Vec<String>,
+    /// In-pack agent name → the agent id it was installed as (differs when
+    /// the whole team was renamed to avoid an existing id).
+    #[serde(default)]
+    pub agent_ids: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub installed_at: String,
     /// Source format code of an agent import (`doubao`, `openclaw`, …);
     /// empty for every other pack kind.
     #[serde(default)]
     pub source_format: String,
+}
+
+impl InstallRecord {
+    /// Skills this install placed: global skills plus every per-employee
+    /// skill (`<id>/<skill>`). Shown as the pack's skill count.
+    pub fn skills_count(&self) -> usize {
+        self.global_skills.len() + self.agent_skills.len()
+    }
 }
 
 /// `<home>/experts`
@@ -397,6 +414,30 @@ pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, Str
         }
     }
 
+    // Per-employee skills. Normally gone with their agent directory above;
+    // this covers an agent dir that survived (e.g. a failed removal).
+    for entry in &rec.agent_skills {
+        let Some((agent, skill)) = entry.split_once('/') else { continue };
+        if !duduclaw_core::is_valid_agent_id(agent)
+            || !duduclaw_agent::skill_loader::is_safe_skill_name(skill)
+        {
+            continue;
+        }
+        let dir = home.join("agents").join(agent).join("SKILLS").join(skill);
+        if dir.is_dir() {
+            let status = match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => "removed",
+                Err(_) => "skipped",
+            };
+            items.push(RemoveItem {
+                status,
+                kind: "skill",
+                name: entry.clone(),
+                detail: String::new(),
+            });
+        }
+    }
+
     // Pack-owned global skills.
     for skill in &rec.global_skills {
         if !duduclaw_agent::skill_loader::is_safe_skill_name(skill) {
@@ -591,6 +632,8 @@ mod tests {
             agents: vec![],
             global_skills: vec![],
             wiki_files: vec![],
+            agent_skills: Vec::new(),
+            agent_ids: Default::default(),
             installed_at: now_iso(),
             source_format: String::new(),
         }

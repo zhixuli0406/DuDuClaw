@@ -2783,7 +2783,46 @@ pub async fn try_local_inference(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    let reply = call_local_inference(
+    call_local_inference(
+        home_dir,
+        prompt,
+        system_prompt,
+        model_id,
+        agent_id,
+        capabilities,
+    )
+    .await
+}
+
+/// Error returned when a local model's answer was nothing but a leading
+/// `<think>` block.
+pub(crate) const LOCAL_THINK_ONLY_ERR: &str =
+    "local model returned only a <think> block and no answer";
+
+/// Local reasoning models inline their thinking as a leading
+/// `<think>…</think>` block; it must not reach the user. A reply that was
+/// nothing but thinking is an error, so every caller takes its existing
+/// failure path (fallback to the CLI, or the local-only error message).
+pub(crate) fn finish_local_reply(reply: String) -> Result<String, String> {
+    let answer = duduclaw_core::think_tags::strip_leading_think_block(&reply);
+    if answer.trim().is_empty() && !reply.trim().is_empty() {
+        return Err(LOCAL_THINK_ONLY_ERR.to_string());
+    }
+    Ok(answer)
+}
+
+/// Every local-inference entry point (`inference_mode = "local"`, per-agent
+/// `prefer_local` / router offload, the channel-reply local-first path)
+/// goes through here, so the `<think>` rule applies to all of them.
+async fn call_local_inference(
+    home_dir: &std::path::Path,
+    prompt: &str,
+    system_prompt: &str,
+    model_id: Option<&str>,
+    agent_id: Option<&str>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Result<String, String> {
+    let raw = call_local_inference_raw(
         home_dir,
         prompt,
         system_prompt,
@@ -2792,17 +2831,10 @@ pub async fn try_local_inference(
         capabilities,
     )
     .await?;
-    // Local reasoning models inline their thinking as a leading
-    // `<think>…</think>` block; it must not reach the user. A reply that
-    // was nothing but thinking is an empty answer (the caller falls back).
-    let answer = duduclaw_core::think_tags::strip_leading_think_block(&reply);
-    if answer.trim().is_empty() && !reply.trim().is_empty() {
-        return Err("local model returned only a <think> block and no answer".to_string());
-    }
-    Ok(answer)
+    finish_local_reply(raw)
 }
 
-async fn call_local_inference(
+async fn call_local_inference_raw(
     home_dir: &std::path::Path,
     prompt: &str,
     system_prompt: &str,
@@ -5502,5 +5534,25 @@ mod instructions_slot_tests {
         let ident = p.find("IDENTITY-BODY").unwrap();
         let instr = p.find("# Instructions\nINSTRUCTIONS-BODY").expect("instructions injected");
         assert!(p.find("SOUL-BODY").unwrap() < ident && ident < instr, "{p}");
+    }
+}
+
+#[cfg(test)]
+mod local_think_tests {
+    use super::*;
+
+    #[test]
+    fn local_replies_lose_a_leading_think_block_and_think_only_is_an_error() {
+        assert_eq!(
+            finish_local_reply("<think>先想想</think>\n\n答案".into()).unwrap(),
+            "答案"
+        );
+        assert_eq!(finish_local_reply("plain".into()).unwrap(), "plain");
+        assert_eq!(
+            finish_local_reply("<think>only thinking".into()).unwrap_err(),
+            LOCAL_THINK_ONLY_ERR
+        );
+        // A genuinely empty reply keeps its existing meaning (not this error).
+        assert_eq!(finish_local_reply(String::new()).unwrap(), "");
     }
 }

@@ -963,6 +963,10 @@ impl MethodHandler {
                 if key_changed(before, after, "goal_loop.resume_on_restart") {
                     restart.push("goal_loop.resume_on_restart".into());
                 }
+                // The upload route's body cap is sized from it at boot.
+                if key_changed(before, after, "knowledge.max_source_bytes") {
+                    restart.push("knowledge.max_source_bytes".into());
+                }
                 if has("rotation") || has("accounts") || has("account_loading") || has("api") {
                     crate::claude_runner::invalidate_rotator_cache().await;
                     hot.push("rotation".into());

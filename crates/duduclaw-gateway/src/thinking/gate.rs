@@ -16,12 +16,22 @@
 //!   is dropped and the event says so (`raw_needs_redaction`). Once the
 //!   outbound checks refuse any text, that block and every later block of
 //!   the turn become `Redacted` with no text (sticky).
+//! - With redaction enabled, an `Update` additionally stops at the last line
+//!   or sentence end (`\n。！？.!?`), so a rule-engine match that spans
+//!   whitespace (a spaced phone number) is never shown half-masked. Each
+//!   `Update` / `End` carries the whole block so far: the viewer replaces the
+//!   block's text with the latest snapshot (never appends).
+//! - The per-turn budget counts what every block currently shows (open and
+//!   finished), so many blocks at once cannot exceed `max_chars`. A finished
+//!   block's buffer is dropped.
 
 use std::collections::HashMap;
 
 use super::event::{ThinkingEvent, ThinkingKind, ThinkingPhase};
 use super::policy::SinkLevel;
-use super::sanitize::{SanitizeCtx, Sanitized, sanitize_for_display, split_hold_back};
+use super::sanitize::{
+    SanitizeCtx, Sanitized, sanitize_for_display, split_at_sentence, split_hold_back,
+};
 use crate::channel_reply::OutboundBlock;
 
 /// Text cap for one block (chars).
@@ -44,6 +54,8 @@ struct BlockState {
     overflowed: bool,
     started_at: Option<u64>,
     last_update_ms: Option<u64>,
+    /// Chars of the largest snapshot shown for this block so far.
+    shown_chars: usize,
 }
 
 impl BlockState {
@@ -80,7 +92,8 @@ pub struct Gate {
     redaction_on: bool,
     blocks: HashMap<String, BlockState>,
     sticky_redacted: bool,
-    used_chars: usize,
+    /// Chars shown by blocks that already ended.
+    closed_chars: usize,
 }
 
 impl Gate {
@@ -91,17 +104,36 @@ impl Gate {
             redaction_on,
             blocks: HashMap::new(),
             sticky_redacted: false,
-            used_chars: 0,
+            closed_chars: 0,
         }
     }
 
     /// Process one producer event at gateway time `now_ms`.
     pub fn process(&mut self, ev: ThinkingEvent, now_ms: u64, ctx: &SanitizeCtx<'_>) -> GateOutput {
-        match self.level {
+        self.process_capped(ev, now_ms, ctx, SinkLevel::Summary)
+    }
+
+    /// [`Self::process`] with a further cap for this event — the stricter of
+    /// the turn's level and `cap` applies (e.g. the employee that actually
+    /// answers allows less than the one the turn started with).
+    pub fn process_capped(
+        &mut self,
+        ev: ThinkingEvent,
+        now_ms: u64,
+        ctx: &SanitizeCtx<'_>,
+        cap: SinkLevel,
+    ) -> GateOutput {
+        let out = match self.level.min(cap) {
             SinkLevel::Off => GateOutput::default(),
-            SinkLevel::Signal | SinkLevel::Status => self.textless(ev, now_ms),
-            SinkLevel::Summary => self.summary(ev, now_ms, ctx),
+            SinkLevel::Signal | SinkLevel::Status => self.textless(&ev, now_ms),
+            SinkLevel::Summary => self.summary(&ev, now_ms, ctx),
+        };
+        if ev.phase == ThinkingPhase::End && !ev.is_turn_usage() {
+            if let Some(done) = self.blocks.remove(&ev.block_id) {
+                self.closed_chars += done.shown_chars;
+            }
         }
+        out
     }
 
     /// Track the block and apply the `Update` throttle. `false` ⇒ drop.
@@ -122,7 +154,8 @@ impl Gate {
         due
     }
 
-    fn with_duration(&self, mut ev: ThinkingEvent, now_ms: u64) -> ThinkingEvent {
+    fn with_duration(&self, ev: &ThinkingEvent, now_ms: u64) -> ThinkingEvent {
+        let mut ev = ev.clone();
         let started = self.blocks.get(&ev.block_id).and_then(|s| s.started_at);
         if ev.started_at.is_none() {
             ev.started_at = started;
@@ -133,48 +166,30 @@ impl Gate {
         ev
     }
 
-    fn textless(&mut self, ev: ThinkingEvent, now_ms: u64) -> GateOutput {
+    fn textless(&mut self, ev: &ThinkingEvent, now_ms: u64) -> GateOutput {
         let mut out = GateOutput::default();
-        if self.admit(&ev, now_ms) {
-            let ev = self.with_duration(ev, now_ms).without_text();
-            out.events.push(ev);
+        if self.admit(ev, now_ms) {
+            out.events
+                .push(self.with_duration(ev, now_ms).without_text());
         }
         out
     }
 
-    fn summary(&mut self, ev: ThinkingEvent, now_ms: u64, ctx: &SanitizeCtx<'_>) -> GateOutput {
-        let mut out = GateOutput::default();
-        if ev.is_turn_usage() {
-            out.events.push(ev.without_text());
-            return out;
-        }
-        // Accumulate first, so a throttled delta still counts toward the
-        // next snapshot.
-        let will_show =
-            !self.sticky_redacted && !(ev.kind == ThinkingKind::Raw && !self.redaction_on);
-        if ev.phase == ThinkingPhase::Update && will_show {
-            if let Some(delta) = ev.text.as_deref() {
-                self.blocks
-                    .entry(ev.block_id.clone())
-                    .or_default()
-                    .push(delta);
-            }
-        }
-        if !self.admit(&ev, now_ms) {
-            return out;
-        }
-        let ev = self.with_duration(ev, now_ms);
-        if self.sticky_redacted {
-            out.events.push(redacted(ev));
-            return out;
-        }
-        if ev.kind == ThinkingKind::Raw && !self.redaction_on {
-            let mut ev = ev.without_text();
-            ev.raw_needs_redaction = true;
-            out.events.push(ev);
-            return out;
-        }
-        let shown = match ev.phase {
+    /// Chars still available to `block` this turn.
+    fn budget_for(&self, block: &str) -> usize {
+        let others: usize = self
+            .blocks
+            .iter()
+            .filter(|(id, _)| id.as_str() != block)
+            .map(|(_, s)| s.shown_chars)
+            .sum();
+        self.max_turn_chars
+            .saturating_sub(self.closed_chars + others)
+    }
+
+    /// The raw text this event may show, before masking.
+    fn candidate_text(&self, ev: &ThinkingEvent) -> Option<String> {
+        match ev.phase {
             ThinkingPhase::Start => None,
             ThinkingPhase::Update => {
                 let raw = self
@@ -182,7 +197,13 @@ impl Gate {
                     .get(&ev.block_id)
                     .map(|s| s.raw.as_str())
                     .unwrap_or("");
-                Some(split_hold_back(raw, HOLD_BACK_TAIL_CHARS).0.to_string())
+                let held = split_hold_back(raw, HOLD_BACK_TAIL_CHARS).0;
+                let shown = if self.redaction_on {
+                    split_at_sentence(held).0
+                } else {
+                    held
+                };
+                Some(shown.to_string())
             }
             ThinkingPhase::End => {
                 let full = ev
@@ -193,29 +214,66 @@ impl Gate {
                 let acc = self.blocks.get(&ev.block_id).map(|s| s.raw.clone());
                 full.or(acc)
             }
-        };
-        let overflowed = self.blocks.get(&ev.block_id).is_some_and(|s| s.overflowed)
-            || ev
+        }
+    }
+
+    fn summary(&mut self, ev: &ThinkingEvent, now_ms: u64, ctx: &SanitizeCtx<'_>) -> GateOutput {
+        let mut out = GateOutput::default();
+        if ev.is_turn_usage() {
+            out.events.push(ev.clone().without_text());
+            return out;
+        }
+        // Accumulate first, so a throttled delta still counts toward the
+        // next snapshot — but only when the text could ever be shown.
+        let will_show =
+            !self.sticky_redacted && !(ev.kind == ThinkingKind::Raw && !self.redaction_on);
+        if ev.phase == ThinkingPhase::Update && will_show {
+            if let Some(delta) = ev.text.as_deref() {
+                self.blocks
+                    .entry(ev.block_id.clone())
+                    .or_default()
+                    .push(delta);
+            }
+        }
+        if !self.admit(ev, now_ms) {
+            return out;
+        }
+        let timed = self.with_duration(ev, now_ms);
+        if self.sticky_redacted {
+            out.events.push(redacted(timed));
+            return out;
+        }
+        if timed.kind == ThinkingKind::Raw && !self.redaction_on {
+            let mut e = timed.without_text();
+            e.raw_needs_redaction = true;
+            out.events.push(e);
+            return out;
+        }
+        let shown = self.candidate_text(&timed);
+        let overflowed = self
+            .blocks
+            .get(&timed.block_id)
+            .is_some_and(|s| s.overflowed)
+            || timed
                 .text
                 .as_deref()
                 .is_some_and(|t| t.chars().count() > MAX_RAW_CHARS);
-        let is_end = ev.phase == ThinkingPhase::End;
-        let ev = ev.without_text();
+        let block_id = timed.block_id.clone();
+        let bare = timed.without_text();
         let Some(shown) = shown.filter(|t| !t.trim().is_empty()) else {
-            out.events.push(ev);
+            out.events.push(bare);
             return out;
         };
-        let block_cap = if ev.kind == ThinkingKind::Raw {
+        let block_cap = if bare.kind == ThinkingKind::Raw {
             RAW_BLOCK_CAP_CHARS
         } else {
             BLOCK_CAP_CHARS
         };
-        let remaining = self.max_turn_chars.saturating_sub(self.used_chars);
-        let cap = block_cap.min(remaining);
+        let cap = block_cap.min(self.budget_for(&block_id));
         if cap == 0 {
             out.events.push(ThinkingEvent {
                 truncated: true,
-                ..ev
+                ..bare
             });
             return out;
         }
@@ -223,21 +281,21 @@ impl Gate {
             Sanitized::Blocked(block) => {
                 self.sticky_redacted = true;
                 out.newly_blocked = Some(block);
-                out.events.push(redacted(ev));
+                out.events.push(redacted(bare));
             }
             Sanitized::Text {
                 text,
                 truncated,
                 line,
             } => {
-                if is_end {
-                    self.used_chars += text.chars().count();
+                if let Some(state) = self.blocks.get_mut(&block_id) {
+                    state.shown_chars = state.shown_chars.max(text.chars().count());
                 }
                 out.events.push(ThinkingEvent {
                     text: (!text.is_empty()).then_some(text),
                     line,
                     truncated: truncated || overflowed,
-                    ..ev
+                    ..bare
                 });
             }
         }

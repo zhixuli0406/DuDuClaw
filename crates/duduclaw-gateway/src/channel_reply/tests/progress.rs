@@ -439,3 +439,66 @@ mod channel_allowlist_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod channel_callback_source_tests {
+    /// Every channel's progress closure, by source file, and the filter it
+    /// must call first. A source-level check: the closures capture live
+    /// HTTP clients and tokens, so they cannot be built in a unit test.
+    const CALLBACKS: &[(&str, &str, &str)] = &[
+        ("telegram", include_str!("../../telegram.rs"), "forwards_progress(&event)"),
+        ("slack", include_str!("../../slack.rs"), "forwards_progress(&event)"),
+        ("discord", include_str!("../../discord.rs"), "forwards_progress(&event)"),
+        ("whatsapp", include_str!("../../whatsapp.rs"), "forwards_progress(&event)"),
+        ("feishu", include_str!("../../feishu.rs"), "forwards_progress(&event)"),
+        ("googlechat", include_str!("../../googlechat.rs"), "forwards_progress(&event)"),
+        ("teams", include_str!("../../msteams.rs"), "forwards_progress(&event)"),
+        ("wecom", include_str!("../../wecom.rs"), "forwards_progress(&event)"),
+        ("dingtalk", include_str!("../../dingtalk.rs"), "forwards_progress(&event)"),
+        (
+            "line ingress",
+            include_str!("../../line/ingress/delivery.rs"),
+            "should_forward_line_progress_event(&event)",
+        ),
+    ];
+
+    /// Chars after a closure opens within which the filter must appear.
+    const WINDOW: usize = 400;
+
+    #[test]
+    fn every_channel_progress_closure_starts_with_the_shared_allowlist() {
+        for (channel, src, filter) in CALLBACKS {
+            let opens: Vec<usize> = src
+                .match_indices("Box::new(move |event|")
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!opens.is_empty(), "{channel}: no progress closure found");
+            for start in opens {
+                let window: String = src[start..].chars().take(WINDOW).collect();
+                assert!(
+                    window.contains(filter),
+                    "{channel}: progress closure does not call `{filter}` first"
+                );
+            }
+            // The old exclusion list must not come back.
+            assert!(
+                !src.contains("ProgressEvent::Step { .. }"),
+                "{channel}: exclusion-list progress filter is back"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shared_filters_are_the_allowlist() {
+        let line = include_str!("../../line.rs");
+        assert!(line.contains("event.is_channel_text() && !event.to_display().is_empty()"));
+        for (channel, src, filter) in CALLBACKS {
+            if filter.starts_with("forwards_progress") {
+                assert!(
+                    src.contains("pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {\n    event.is_channel_text()"),
+                    "{channel}: forwards_progress must start from is_channel_text()"
+                );
+            }
+        }
+    }
+}

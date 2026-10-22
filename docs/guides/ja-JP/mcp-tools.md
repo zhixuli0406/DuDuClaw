@@ -31,6 +31,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | `computer_use` | `agent.toml [capabilities]` | `computer_*` 8 ツールを非表示（下の [`computer_*`](#computer_--gateway-が実行するセッション) を参照） |
 | `db_sources` | `agent.toml [capabilities]` | `db_*` 4 ツールを非表示 |
 | `[fork] enabled` | `agent.toml` | 分岐系 6 ツールを非表示 |
+| `[knowledge] enabled` とコレクションの付与 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | ナレッジベースが有効で、社員またはその部門に（`[knowledge] collections` で絞り込んだ後も）1 つ以上のコレクションが付与されていない限り `knowledge_*` 3 ツールを非表示。付与の変更で `list_changed` を送信（下の [`knowledge_*`](#knowledge_ドキュメントナレッジベース) を参照） |
 | `[responsibilities] enabled` | `config.toml` | `responsibility_*` 3 ツールを非表示（下の[継続タスクのツール](#responsibility_get--responsibility_followup--responsibility_ask--継続タスクのツール)を参照） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
 
@@ -213,6 +214,12 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 1 つの継続タスクで AI従業員が予約した待機中の起床は同時に 1 つだけなので、待機中の `responsibility_followup` と `responsibility_ask` は両立しません。運用者キーはこの 2 つの起床ツールを使えません（従業員になりすますことになるため）。固定のエラーコード：`not_found`、`not_active`、`no_open_occurrence`、`invalid_due_at`、`period_occurrence_limit`、`agent_followup_limit`、`epoch_changed`、`invalid_question`。
 
 継続タスクを作成・変更・再開・再有効化するツールはなく、指示を送るツールもありません。
+
+### `knowledge_*`：ドキュメントナレッジベース
+
+`knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections` は[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)を読みます。スコープは `knowledge:read` で、外部 MCP キーには付与できません。呼び出しはすべて署名付きローカルルート `POST /api/internal/knowledge` でゲートウェイに渡され、ゲートウェイが読めるコレクション（社員本人と部門への付与を `agent.toml [knowledge] collections` で絞り込み、ターンの相手と機密度ルールとの共通部分）を決め、アクセスログを 1 行書きます。ゲートウェイが動いていないときはその旨を返し、データベースを直接読むことはありません。
+
+結果は文書の内容であることを明示します。各段落（およびコレクション名と説明）は印の付いたブロックに入り、各行は `│ ` で始まります。タイトルと位置は 1 行にまとめ `[` `]` を置き換えるため、文書が結果の見出しを偽造したりブロックを閉じたりできません。`knowledge_search` は段落を `[n] タイトル · 位置（コレクション） chunk_id=…` と番号付けし、返信で引用できます。取り込み時に指示らしい文と判定された段落には警告行が付きます。`collections` は絞り込みのみです。`knowledge_get_passage` は毎回権限を再確認し、存在しない段落と権限のない段落に同じ応答（`permission denied`）を返します。
 
 ## 非推奨エイリアスは引き続き掲載されます
 

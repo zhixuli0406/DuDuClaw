@@ -4107,6 +4107,10 @@ effect = "forbid"
         "inference_mode",
         "inference_status",
         "inspect_branches",
+        // Read-only; collection permissions are enforced by the gateway.
+        "knowledge_get_passage",
+        "knowledge_list_collections",
+        "knowledge_search",
         "list_agents",
         "list_cron_tasks",
         "list_reminders",
@@ -4271,7 +4275,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            247,
+            250,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

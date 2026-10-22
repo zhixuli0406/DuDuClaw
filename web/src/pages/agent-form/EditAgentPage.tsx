@@ -90,6 +90,7 @@ import {
   DEFAULT_ODOO,
   DEFAULT_ADVANCED,
 } from './defaults';
+import { KnowledgeBindingSection } from './KnowledgeBindingSection';
 import { ToolPolicyEditor } from './editors';
 import {
   buildUpdatePayload,
@@ -1168,6 +1169,10 @@ export function EditAgentPage() {
               </SettingsSection>
             );
           })()}
+
+          {/* KB — which shared document collections this employee uses
+              (narrowing only; the grants live on the collection itself). */}
+          {id && <KnowledgeBindingSection agentId={id} />}
 
           <SettingsSection title={t('agents.edit.capabilities')} description={t('agents.cap.desc')}>
             <button

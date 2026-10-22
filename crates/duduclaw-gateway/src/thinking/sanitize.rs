@@ -244,6 +244,19 @@ pub fn last_line(text: &str) -> Option<String> {
         .map(|l| duduclaw_core::truncate_chars(l, LINE_CHARS).to_string())
 }
 
+/// Split at the end of the last complete line or sentence (`\n`, `。`,
+/// `！`, `？`, `.`, `!`, `?`), keeping the terminator on the shown side.
+/// No terminator ⇒ nothing is shown yet.
+pub fn split_at_sentence(text: &str) -> (&str, &str) {
+    let cut = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| matches!(c, '\n' | '。' | '！' | '？' | '.' | '!' | '?'))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    text.split_at(cut)
+}
+
 /// Longest tail held back when the cut would split an ASCII word.
 pub const MAX_WORD_HOLD_BACK_CHARS: usize = 512;
 

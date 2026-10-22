@@ -1,4 +1,5 @@
 pub mod agent_guard;
+pub mod agent_names;
 pub mod agent_rename;
 pub mod agent_trash;
 pub mod agent_toml;
@@ -27,6 +28,7 @@ pub mod fs_lock;
 pub mod grounding;
 pub mod identity_token;
 pub mod keychain;
+pub mod knowledge_agent;
 pub mod lenient;
 pub mod llm_contract;
 pub mod match_utils;

@@ -61,7 +61,7 @@ pub fn emit(ev: ThinkingEvent) {
 /// The current turn's policy, or [`ThinkingPolicy::INACTIVE`] outside one.
 pub fn policy() -> ThinkingPolicy {
     THINKING_SINK
-        .try_with(|sink| sink.policy)
+        .try_with(|sink| sink.policy())
         .unwrap_or(ThinkingPolicy::INACTIVE)
 }
 
@@ -153,6 +153,28 @@ pub struct ThinkingSink {
     state: Mutex<SinkState>,
     /// Per-turn cache of outbound rules by employee id.
     rules: Mutex<HashMap<String, Arc<crate::channel_reply::OutboundRules>>>,
+    /// Per-turn cache of display ceilings by employee id.
+    ceilings: Mutex<HashMap<String, SinkLevel>>,
+}
+
+/// The employee that is actually answering right now: the reply pipeline's
+/// task-local agent id, else the turn's recorded answerer.
+fn answering_agent() -> Option<String> {
+    crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .try_with(|a| a.clone())
+        .ok()
+        .filter(|a| !a.is_empty())
+        .or_else(|| {
+            crate::trigger_route::ANSWERED_BY
+                .try_with(|slot| {
+                    slot.lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|who| who.id.clone()))
+                })
+                .ok()
+                .flatten()
+        })
+        .filter(|a| !a.is_empty())
 }
 
 impl ThinkingSink {
@@ -171,21 +193,41 @@ impl ThinkingSink {
             forward,
             ctx,
             rules: Mutex::new(HashMap::new()),
+            ceilings: Mutex::new(HashMap::new()),
         }
     }
 
+    /// The turn's policy, narrowed to what the employee answering right now
+    /// allows (an `@`-called employee with `show_thinking = "off"` shows
+    /// nothing, whatever the conversation's default employee allows).
     pub fn policy(&self) -> ThinkingPolicy {
-        self.policy
+        let agent = answering_agent().unwrap_or_else(|| self.ctx.agent_id.clone());
+        ThinkingPolicy {
+            level: self.policy.level.min(self.cap_for(&agent)),
+            ..self.policy
+        }
+    }
+
+    /// The display ceiling of `agent_id`. Only WebChat turns (levels other
+    /// than `Signal`) are narrowed; the employee the turn was resolved for
+    /// was already applied at install. Read once per turn, failing closed.
+    fn cap_for(&self, agent_id: &str) -> SinkLevel {
+        if self.policy.level == SinkLevel::Signal || agent_id == self.ctx.agent_id {
+            return SinkLevel::Summary;
+        }
+        let mut cache = self.ceilings.lock().unwrap_or_else(|p| p.into_inner());
+        *cache.entry(agent_id.to_string()).or_insert_with(|| {
+            policy::level_for(policy::agent_ceiling(
+                &self.ctx.home.join("agents").join(agent_id),
+            ))
+        })
     }
 
     /// Gate one producer event and forward what survives.
     pub fn accept(&self, ev: ThinkingEvent) {
         let now = now_ms();
-        let agent_id = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
-            .try_with(|a| a.clone())
-            .ok()
-            .filter(|a| !a.is_empty())
-            .unwrap_or_else(|| self.ctx.agent_id.clone());
+        let agent_id = answering_agent().unwrap_or_else(|| self.ctx.agent_id.clone());
+        let cap = self.cap_for(&agent_id);
         let engine = self.ctx.redaction.as_ref().map(|m| m.engine().as_ref());
         let sanitize_ctx = sanitize::SanitizeCtx {
             rules: self.rules_for(&agent_id),
@@ -194,7 +236,7 @@ impl ThinkingSink {
         let out = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.stats.observe(&ev, now);
-            state.gate.process(ev, now, &sanitize_ctx)
+            state.gate.process_capped(ev, now, &sanitize_ctx, cap)
         };
         if let Some(block) = out.newly_blocked {
             // Rule names only — never the thinking text. Unlike a blocked
@@ -217,7 +259,7 @@ impl ThinkingSink {
     /// The employee's outbound rules, read from disk once per turn and only
     /// when text can be shown (the other levels never run the checks).
     fn rules_for(&self, agent_id: &str) -> Arc<crate::channel_reply::OutboundRules> {
-        if self.policy.level != SinkLevel::Summary {
+        if self.policy.level.min(self.cap_for(agent_id)) != SinkLevel::Summary {
             return Arc::default();
         }
         let mut cache = self.rules.lock().unwrap_or_else(|p| p.into_inner());
@@ -246,27 +288,36 @@ impl ThinkingSink {
     /// End of turn: write at most one `run_steps` row (seconds and tokens
     /// only), stamped when the thinking began so it lands inside the run's
     /// window. Best effort, like every `run_steps` write.
-    pub fn finish(&self, agent_id: &str, session_key: &str) {
+    pub async fn finish(&self, agent_id: &str, session_key: &str) {
         let (Some(preview), Some(first_ms)) = (
             self.preview(),
             self.state.lock().ok().and_then(|s| s.stats.first_ms),
         ) else {
             return;
         };
-        let Some(store) = crate::run_steps::shared_store(&self.ctx.home) else {
-            return;
-        };
         let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(first_ms as i64)
             .unwrap_or_else(chrono::Utc::now);
-        store.append_at_best_effort(
-            agent_id,
-            session_key,
-            crate::run_steps::KIND_THINKING,
-            "thinking",
-            &preview,
-            0,
-            ts,
-        );
+        let home = self.ctx.home.clone();
+        let agent_id = agent_id.to_string();
+        let session_key = session_key.to_string();
+        // SQLite I/O off the async worker.
+        let write = tokio::task::spawn_blocking(move || {
+            let Some(store) = crate::run_steps::shared_store(&home) else {
+                return;
+            };
+            store.append_at_best_effort(
+                &agent_id,
+                &session_key,
+                crate::run_steps::KIND_THINKING,
+                "thinking",
+                &preview,
+                0,
+                ts,
+            );
+        });
+        if let Err(e) = write.await {
+            tracing::debug!(error = %e, "thinking run_steps write task failed (dropped)");
+        }
     }
 }
 

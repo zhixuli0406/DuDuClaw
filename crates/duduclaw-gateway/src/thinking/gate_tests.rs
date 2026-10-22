@@ -167,7 +167,7 @@ fn summary_holds_back_a_key_that_is_still_streaming() {
 #[test]
 fn summary_updates_are_throttled_per_block_but_accumulate() {
     let home = tempfile::tempdir().unwrap();
-    let mut gate = Gate::new(SinkLevel::Summary, 4_000, true);
+    let mut gate = Gate::new(SinkLevel::Summary, 4_000, false);
     let got = run(
         &mut gate,
         home.path(),
@@ -419,4 +419,151 @@ fn runaway_blocks_are_bounded_and_the_line_follows_the_latest_text() {
         .events;
     assert!(got[0].truncated);
     assert_eq!(got[0].line.as_deref(), Some("最後一步：核對總額"));
+}
+
+#[test]
+fn with_redaction_updates_stop_at_the_last_sentence() {
+    let home = tempfile::tempdir().unwrap();
+    let mut gate = Gate::new(SinkLevel::Summary, 4_000, true);
+    let got = run(
+        &mut gate,
+        home.path(),
+        vec![
+            (
+                0,
+                ev(
+                    "t0",
+                    ThinkingPhase::Update,
+                    ThinkingKind::Summary,
+                    Some("先核對電話 0912 "),
+                ),
+            ),
+            (
+                500,
+                ev(
+                    "t0",
+                    ThinkingPhase::Update,
+                    ThinkingKind::Summary,
+                    Some("345 678。接著寫信 "),
+                ),
+            ),
+            (
+                1_000,
+                ev("t0", ThinkingPhase::End, ThinkingKind::Summary, None),
+            ),
+        ],
+    );
+    // No sentence end yet: nothing shown; then only the finished sentence.
+    assert!(got[0].text.is_none(), "{got:?}");
+    assert_eq!(got[1].text.as_deref(), Some("先核對電話 0912 345 678。"));
+    assert_eq!(
+        got[2].text.as_deref(),
+        Some("先核對電話 0912 345 678。接著寫信")
+    );
+    // A finished block's buffer is dropped.
+    assert!(gate.blocks.is_empty());
+}
+
+#[test]
+fn concurrent_blocks_share_the_turn_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let mut gate = Gate::new(SinkLevel::Summary, 100, false);
+    let sixty = format!("{}。 ", "字".repeat(59));
+    let mut shown = std::collections::HashMap::new();
+    for (i, id) in ["t0", "t1", "t2", "t3"].iter().enumerate() {
+        let got = gate
+            .process(
+                ev(
+                    id,
+                    ThinkingPhase::Update,
+                    ThinkingKind::Summary,
+                    Some(&sixty),
+                ),
+                i as u64,
+                &ctx(home.path()),
+            )
+            .events;
+        let n = got[0].text.as_ref().map_or(0, |t| t.chars().count());
+        shown.insert(*id, n);
+    }
+    let total: usize = shown.values().sum();
+    assert!(total <= 100, "{shown:?}");
+    assert_eq!(shown["t0"], 60);
+    // Ending blocks keeps the accounting: a fifth block still fits nothing.
+    for id in ["t0", "t1", "t2", "t3"] {
+        gate.process(
+            ev(id, ThinkingPhase::End, ThinkingKind::Summary, None),
+            10,
+            &ctx(home.path()),
+        );
+    }
+    assert!(gate.blocks.is_empty());
+    let got = gate
+        .process(
+            ev(
+                "t4",
+                ThinkingPhase::End,
+                ThinkingKind::Summary,
+                Some("more"),
+            ),
+            20,
+            &ctx(home.path()),
+        )
+        .events;
+    assert!(got[0].text.is_none() && got[0].truncated);
+}
+
+#[test]
+fn a_per_event_cap_narrows_the_turn_level() {
+    let home = tempfile::tempdir().unwrap();
+    let mut gate = Gate::new(SinkLevel::Summary, 4_000, false);
+    let e = ev(
+        "t0",
+        ThinkingPhase::End,
+        ThinkingKind::Summary,
+        Some("plan"),
+    );
+    let off = gate.process_capped(e.clone(), 0, &ctx(home.path()), SinkLevel::Off);
+    assert!(off.events.is_empty());
+    let status = gate.process_capped(e.clone(), 0, &ctx(home.path()), SinkLevel::Status);
+    assert!(status.events[0].text.is_none());
+    let full = gate.process_capped(e, 0, &ctx(home.path()), SinkLevel::Summary);
+    assert_eq!(full.events[0].text.as_deref(), Some("plan"));
+}
+
+#[test]
+fn summaries_go_through_the_operator_rule_engine() {
+    let home = tempfile::tempdir().unwrap();
+    let src = "enabled = true\nprofiles = [\"general\"]\n[rules.order_no]\ntype = \"regex\"\npattern = 'ORD-[0-9]{6}'\ncategory = \"ORDER\"\npriority = 60\n";
+    let cfg: duduclaw_redaction::RedactionConfig = toml::from_str(src).unwrap();
+    let m = duduclaw_redaction::RedactionManager::open(
+        cfg,
+        duduclaw_redaction::ManagerPaths::under_home(home.path()),
+    )
+    .unwrap();
+    let c = SanitizeCtx {
+        rules: std::sync::Arc::new(crate::channel_reply::OutboundRules::load(
+            home.path(),
+            "agnes",
+        )),
+        engine: Some(m.engine()),
+    };
+    let mut gate = Gate::new(SinkLevel::Summary, 4_000, true);
+    let got = gate
+        .process(
+            ev(
+                "t0",
+                ThinkingPhase::End,
+                ThinkingKind::Summary,
+                Some("查訂單 ORD-123456 的狀態"),
+            ),
+            0,
+            &c,
+        )
+        .events;
+    let text = got[0].text.as_deref().unwrap();
+    assert!(
+        text.contains("〔已遮蔽·ORDER〕") && !text.contains("ORD-123456"),
+        "{text}"
+    );
 }

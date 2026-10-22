@@ -144,3 +144,25 @@ describe('nav-model — P2-d /mail addition', () => {
     expect(item?.desc).toBe('nav.mail.desc');
   });
 });
+
+// 1.76.0 文件知識庫 (document knowledge base): a new page, so it carries
+// `newIn` and sits in BOTH editions' lists, right after 記憶.
+describe('nav-model — 1.76.0 /knowledge-base addition', () => {
+  it('follows /memory in the Enterprise 公司 group and the Personal primary rail', () => {
+    const company = navGroups[1].items.map((i) => i.to);
+    expect(company.indexOf('/knowledge-base')).toBe(company.indexOf('/memory') + 1);
+    const personal = personalPrimaryItems.map((i) => i.to);
+    expect(personal.indexOf('/knowledge-base')).toBe(personal.indexOf('/memory') + 1);
+  });
+
+  it('appears exactly once per edition, tagged newIn 1.76.0, open to every role', () => {
+    for (const isPersonal of [true, false]) {
+      const all = [...primaryItemsForEdition(isPersonal), ...navGroupsForEdition(isPersonal).flatMap((g) => g.items)];
+      const rows = all.filter((i) => i.to === '/knowledge-base');
+      expect(rows).toHaveLength(1);
+      expect(rows[0].newIn).toBe('1.76.0');
+      expect(rows[0].minRole).toBeUndefined();
+      expect(rows[0].desc).toBe(`${rows[0].label}.desc`);
+    }
+  });
+});
