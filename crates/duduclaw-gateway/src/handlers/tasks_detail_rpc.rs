@@ -440,6 +440,11 @@ impl MethodHandler {
                 .unwrap_or(false),
             parent_task_id: None,
             source_label: "儀表板".to_string(),
+            on_behalf_of: crate::trigger_route::assign::principal_for_user(&ctx.user_id),
+            created_via: Some("dashboard".to_string()),
+            source: None,
+            task_id: None,
+            grant_via: crate::trigger_route::assign::dashboard_grant_via(ctx, agent_id),
         };
         let created = match crate::goal_create_core::create_goal_task(
             &self.home_dir,

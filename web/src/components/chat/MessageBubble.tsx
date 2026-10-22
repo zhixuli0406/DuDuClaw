@@ -3,6 +3,7 @@ import { AlertTriangle } from 'lucide-react';
 import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
+import { AssignedTaskCard } from './AssignedTaskCard';
 
 /** A single chat turn rendered as a left/right-aligned bubble (Multica plain
  *  style, spec §5.6): the user's turn sits right on `bg-secondary`, the
@@ -50,6 +51,7 @@ export function MessageBubble({
             <span>{message.content}</span>
           </div>
         )}
+        {message.task && !isUser && <AssignedTaskCard task={message.task} />}
         {message.tokens != null && message.tokens > 0 && (
           <div className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">{message.tokens} tokens</div>
         )}

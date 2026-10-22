@@ -69,6 +69,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 62 | [Calling AI staff with `@`](62-calling-ai-staff.md) | Hand one message to another AI employee by `@name`, limited to the employees the sender may call; `@` list in WebChat, LINE and Telegram; one-shot call; mention-only groups |
 | 63 | [Document knowledge base](63-knowledge-base.md) | Collections of company documents with per-collection permissions (users, departments, AI employees, channels), sandboxed extraction, keyword search with page / row locations, read-only `knowledge_*` MCP tools, `duduclaw knowledge eval` |
 | 64 | [Thinking display](64-thinking-display.md) | Live thinking timer in WebChat for every runtime; masked, shortened thinking summaries for signed-in dashboard users; never sent to messaging apps |
+| 67 | [Assigning tasks from a chat](67-assigning-tasks.md) | `/交辦 @employee task` (`/assign`) creates a goal task on the sender's behalf, limited to employees they may assign to; progress back to the chat; `/交辦 狀態`; "Assigned by me" on the Goals page |
 
 ---
 

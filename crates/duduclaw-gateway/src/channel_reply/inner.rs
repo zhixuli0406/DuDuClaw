@@ -178,6 +178,25 @@ pub(super) async fn build_reply_with_session_inner(
                         && !crate::trigger_route::allow_direct_reply(channel, session_id, user_id, kind);
                     return if throttled { String::new() } else { text };
                 }
+                // The message an armed `/交辦 @name` was waiting for: it
+                // becomes the task (rights re-checked), no model call.
+                crate::trigger_route::turn::TurnDecision::Assign { id } => {
+                    let fallback_id = fallback.map(|a| a.config.agent.name.clone());
+                    drop(reg);
+                    let caller = crate::trigger_route::assign::AssignCaller {
+                        home: &ctx.home_dir,
+                        channel,
+                        conversation: session_id,
+                        sender: user_id,
+                        event: None,
+                        seq: crate::trigger_route::pending::next_seq(),
+                        fallback: fallback_id.as_deref(),
+                        access: crate::trigger_route::access::for_channel_sender(&ctx.home_dir, channel, user_id),
+                    };
+                    return crate::trigger_route::assign::run_pending(ctx, &id, text, &caller)
+                        .await
+                        .text;
+                }
             }
         }
     };

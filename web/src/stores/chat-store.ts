@@ -54,9 +54,26 @@ export interface ChatMessage {
   readonly agentId?: string;
   /** That staff member's display name (`assistant_done.agent_name`). */
   readonly agentName?: string;
+  /** A task this reply created (`/交辦`, from `assistant_done.task`). */
+  readonly task?: AssignedTaskRef;
   /** The turn's thinking (wall time, tokens, masked blocks) — in memory only,
    *  never part of the stored history. */
   readonly thinking?: TurnThinking;
+}
+
+/** A task created from the chat, as `assistant_done.task` carries it. */
+export interface AssignedTaskRef {
+  readonly id: string;
+  readonly agent: string;
+}
+
+/** Validate `assistant_done.task`: both fields non-empty strings, else
+ *  `undefined` (an older or hand-crafted frame shows no card). Pure. */
+export function parseAssignedTask(raw: unknown): AssignedTaskRef | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined;
+  const { id, agent } = raw as { id?: unknown; agent?: unknown };
+  if (typeof id !== 'string' || !id || typeof agent !== 'string' || !agent) return undefined;
+  return { id, agent };
 }
 
 /** A file selected for upload, already read into base64. */
@@ -579,6 +596,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ...(typeof data.agent_name === 'string' && data.agent_name ? { agentName: data.agent_name } : {}),
             };
             const thinkingMeta = parseThinkingDoneMeta(data.thinking);
+            const assignedTask = parseAssignedTask(data.task);
+            const taskField = assignedTask ? { task: assignedTask } : {};
             set((state) => {
               const msgs = [...state.messages];
               const last = msgs[msgs.length - 1];
@@ -595,6 +614,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...(artifact ? { artifact } : {}),
                   ...answeredBy,
                   ...thinking,
+                  ...taskField,
                 };
               } else {
                 msgs.push({
@@ -606,6 +626,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...(artifact ? { artifact } : {}),
                   ...answeredBy,
                   ...thinking,
+                  ...taskField,
                 });
               }
               return {

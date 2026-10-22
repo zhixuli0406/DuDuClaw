@@ -632,7 +632,7 @@ pub(crate) async fn send_with_markup(
                 "messages": [{ "type": "text", "text": text, "quickReply": markup }],
             });
             let resp = http
-                .post("https://api.line.me/v2/bot/message/push")
+                .post(crate::line::line_api_url("/message/push"))
                 .bearer_auth(token)
                 .json(&body)
                 .send()
@@ -1009,7 +1009,7 @@ impl ChannelSender for LineSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
         let resp = self
             .http
-            .post("https://api.line.me/v2/bot/message/push")
+            .post(crate::line::line_api_url("/message/push"))
             .bearer_auth(&self.access_token)
             .json(&serde_json::json!({
                 "to": self.user_id,
@@ -1045,7 +1045,7 @@ impl ChannelSender for LineSender {
                 if !content_url.is_empty() {
                     // Send as image message with the uploaded URL
                     self.http
-                        .post("https://api.line.me/v2/bot/message/push")
+                        .post(crate::line::line_api_url("/message/push"))
                         .bearer_auth(&self.access_token)
                         .json(&serde_json::json!({
                             "to": self.user_id,
@@ -1100,7 +1100,7 @@ impl ChannelSender for LineSender {
         });
 
         self.http
-            .post("https://api.line.me/v2/bot/message/push")
+            .post(crate::line::line_api_url("/message/push"))
             .bearer_auth(&self.access_token)
             .json(&serde_json::json!({
                 "to": self.user_id,

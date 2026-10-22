@@ -149,10 +149,29 @@ impl<'a> TaskReader<'a> {
         }
     }
 
+    /// [`Self::can_read`] for a whole row: also the person the task was
+    /// handed over for (`on_behalf_of = user:<reader>`, written by the
+    /// gateway from the assigner's own identity) while they may still call
+    /// its employee and its audience admits them. A Manager who assigned
+    /// work to a report's employee can follow what they asked for without
+    /// gaining that employee's other tasks.
+    pub(crate) fn can_read_row(&self, row: &TaskRow) -> bool {
+        self.can_read(&row.id, &row.assigned_to) || self.assigned_by_reader(row)
+    }
+
+    fn assigned_by_reader(&self, row: &TaskRow) -> bool {
+        let Some(me) = crate::trigger_route::assign::principal_for_user(&self.live.user_id) else {
+            return false;
+        };
+        row.on_behalf_of.as_deref() == Some(me.as_str())
+            && self.live.can_call_agent(&row.assigned_to)
+            && task_audience_allows(self.home, &self.live, &row.id)
+    }
+
     /// Full row when readable, the board card otherwise.
     pub(crate) fn task_json(&self, row: &TaskRow) -> Value {
         let full = task_row_to_json(row);
-        if self.can_read(&row.id, &row.assigned_to) {
+        if self.can_read_row(row) {
             full
         } else {
             restricted_task_json(&full)

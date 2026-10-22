@@ -218,6 +218,73 @@ fn route_outcome(
     }
 }
 
+/// When an armed `/交辦 @name` is waiting for this account's next message
+/// in this conversation and `text` calls nobody, turn `text` into that task
+/// and return the reply frame. A message that calls someone cancels the
+/// wait (it is the next message, and it was not the task). `None` = normal
+/// routing.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn pending_assign_reply(
+    state: &WebChatState,
+    auth_user: &str,
+    text: &str,
+    selected: Option<&str>,
+    main_id: &str,
+    sid: &str,
+    user_id: &str,
+    conv: Option<String>,
+) -> Option<ChatMessage> {
+    use crate::trigger_route::pending::{self, PendingKey, PendingKind};
+    if super::is_widget_visitor(auth_user) {
+        return None;
+    }
+    let key = PendingKey::new("webchat", sid, auth_user);
+    let seq = pending::next_seq();
+    let event = uuid::Uuid::new_v4().to_string();
+    if !matches!(pending::peek_kind(&key, seq), Some((_, PendingKind::Assign))) {
+        return None;
+    }
+    let access = state.sender_access(auth_user).await;
+    let (route, default_id) = {
+        let reg = state.ctx.registry.read().await;
+        let default_id = crate::channel_reply::resolve_fallback_agent(&state.ctx, &reg, sid, user_id)
+            .await
+            .map(|a| a.config.agent.name.clone())
+            .unwrap_or_else(|| main_id.to_string());
+        (trigger_route::decide(&reg, text, &access, Some(&default_id)), default_id)
+    };
+    if route != TriggerRoute::None {
+        pending::cancel(&key, &event, seq);
+        return None;
+    }
+    let agent = pending::claim_kind(&key, &event, seq, PendingKind::Assign)?;
+    let fallback = selected.unwrap_or(&default_id);
+    let caller = crate::trigger_route::assign::AssignCaller {
+        home: &state.ctx.home_dir,
+        channel: "webchat",
+        conversation: sid,
+        sender: auth_user,
+        event: None,
+        seq,
+        fallback: Some(fallback),
+        access,
+    };
+    let reply = crate::trigger_route::assign::run_pending(&state.ctx, &agent, text, &caller).await;
+    Some(ChatMessage::AssistantDone {
+        content: reply.text,
+        tokens_used: 0,
+        conv,
+        model: None,
+        artifact: None,
+        agent: None,
+        agent_name: None,
+        thinking: None,
+        task: reply
+            .task
+            .map(|t| serde_json::json!({ "id": t.id, "agent": t.agent })),
+    })
+}
+
 #[cfg(test)]
 #[path = "route_tests.rs"]
 mod tests;

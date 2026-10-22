@@ -4,6 +4,7 @@ import {
   frameBelongsToConversation,
   historyToMessages,
   isResumeNotFound,
+  parseAssignedTask,
   parseChatArtifact,
   sessionIdAfterHello,
   useChatStore,
@@ -335,5 +336,15 @@ describe('sessionIdAfterHello (resume-before-connect guard)', () => {
     useChatStore.getState().resumeSession('webchat:past-42', []);
     useChatStore.getState().selectAgent('sales-bot');
     expect(useChatStore.getState().resumedExplicitly).toBe(false);
+  });
+});
+
+describe('parseAssignedTask (/交辦 task card)', () => {
+  it('keeps a well-formed task and drops anything else', () => {
+    expect(parseAssignedTask({ id: 't-1', agent: 'sales-rep' })).toEqual({ id: 't-1', agent: 'sales-rep' });
+    expect(parseAssignedTask(null)).toBeUndefined();
+    expect(parseAssignedTask({ id: '', agent: 'x' })).toBeUndefined();
+    expect(parseAssignedTask({ id: 't', agent: 3 })).toBeUndefined();
+    expect(parseAssignedTask('t-1')).toBeUndefined();
   });
 });

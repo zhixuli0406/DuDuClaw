@@ -204,6 +204,10 @@ pub enum ChatMessage {
         /// was sent this turn — always for a public-widget visitor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<crate::thinking::DoneMeta>,
+        /// A task this reply created (`/交辦`): `{ "id", "agent" }`, so the
+        /// dashboard can show a card that links to it. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<serde_json::Value>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -1104,6 +1108,19 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // any model call. The
                                 // default employee stays reachable by everyone.
                                 // Chat commands keep the selected employee.
+                                // The message an armed `/交辦 @name` was waiting
+                                // for becomes that task (rights checked again).
+                                if !crate::chat_commands::is_command(&content) {
+                                    if let Some(frame) = route::pending_assign_reply(
+                                        &state, &auth_user, &content, effective_agent.as_deref(),
+                                        &agent_id, sid, &user_id, conv_nonce.clone(),
+                                    ).await {
+                                        if let Ok(json) = serde_json::to_string(&frame) {
+                                            let _ = sink.send(Message::Text(json.into())).await;
+                                        }
+                                        continue;
+                                    }
+                                }
                                 let routed = if crate::chat_commands::is_command(&content) {
                                     route::WebRoute { agent: effective_agent.clone(), switched: false }
                                 } else {
@@ -1179,9 +1196,35 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         // dashboard Admin account — never a
                                         // public-widget visitor (was hardcoded `true`).
                                         let is_admin = webchat_command_admin(&state.user_db, &auth_user);
-                                        let reply = crate::chat_commands::handle_command(
-                                            &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
-                                        ).await;
+                                        let caller = crate::chat_commands::CommandCaller {
+                                            channel: "webchat",
+                                            channel_user_id: if is_widget_visitor(&auth_user) { "" } else { &auth_user },
+                                            access: state.sender_access(&auth_user).await,
+                                            event: None,
+                                            seq: crate::trigger_route::pending::next_seq(),
+                                        };
+                                        // `/交辦` keeps the task for a card; every other
+                                        // command answers with text only. `/rules off`
+                                        // still sees no channel identity here.
+                                        let (reply, task) = match &cmd {
+                                            crate::chat_commands::ChatCommand::Assign(assign_cmd) => {
+                                                let ac = caller.assign_caller(&state.ctx.home_dir, sid, Some(effective_agent_id));
+                                                let r = crate::trigger_route::assign::run(&state.ctx, assign_cmd, &ac).await;
+                                                (r.text, r.task)
+                                            }
+                                            crate::chat_commands::ChatCommand::Rules { .. } => (
+                                                crate::chat_commands::handle_command(
+                                                    &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
+                                                ).await,
+                                                None,
+                                            ),
+                                            _ => (
+                                                crate::chat_commands::handle_command_with_caller(
+                                                    &cmd, &state.ctx, sid, effective_agent_id, is_admin, &caller,
+                                                ).await,
+                                                None,
+                                            ),
+                                        };
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,
                                             tokens_used: 0,
@@ -1194,6 +1237,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             agent: None,
                                             agent_name: None,
                                             thinking: None,
+                                            task: task.map(|t| serde_json::json!({ "id": t.id, "agent": t.agent })),
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1432,6 +1476,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     agent: answered_by.as_ref().map(|a| a.id.clone()),
                                     agent_name: answered_by.map(|a| a.display_name),
                                     thinking: thinking_meta.build(),
+                                    task: None,
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if !guarded.still_valid().await {
@@ -1973,6 +2018,7 @@ mod tests {
                 blocks: 1,
                 kinds: vec!["summary".into()],
             }),
+            task: None,
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(
@@ -2002,6 +2048,7 @@ mod tests {
             agent: None,
             agent_name: None,
             thinking: None,
+            task: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(
@@ -2041,6 +2088,7 @@ mod tests {
             agent: None,
             agent_name: None,
             thinking: None,
+            task: None,
         };
         let json = serde_json::to_string(&done).expect("serialize");
         assert!(

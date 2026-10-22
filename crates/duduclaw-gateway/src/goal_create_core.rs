@@ -40,7 +40,7 @@ use crate::task_store::{TaskRow, TaskStore};
 /// Everything a caller must decide before a goal exists. Already-authorised:
 /// constructing one of these does not grant permission, it only describes the
 /// goal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GoalCreateRequest {
     /// Agent the goal is assigned to. Callers validate the id and their own
     /// right to assign to it before calling.
@@ -73,6 +73,21 @@ pub struct GoalCreateRequest {
     /// (e.g. `儀表板` / `AI 員工`). Empty ⇒ no prefix. Display only — never a
     /// permission or routing input.
     pub source_label: String,
+    /// The person the goal is handed over for (`user:<account id>`). The
+    /// caller derives it from the authenticated identity, never from request
+    /// input. `None` ⇒ not assigned by a person.
+    pub on_behalf_of: Option<String>,
+    /// Where that person assigned it (`line`, `webchat`, `dashboard`, …).
+    pub created_via: Option<String>,
+    /// The conversation progress notices go back to: `(channel, chat_id)`,
+    /// stamped as `source_channel` / `source_chat_id`.
+    pub source: Option<(String, String)>,
+    /// A caller-chosen task id (a chat assignment derives it from the event,
+    /// so a redelivered message creates nothing twice). `None` ⇒ random.
+    pub task_id: Option<String>,
+    /// Where the caller's right to assign came from (`binding`,
+    /// `team:<user>:<depth>`, `admin`), for the activity row's metadata.
+    pub grant_via: Option<String>,
 }
 
 /// The created goal plus the flags a caller needs to render its own response.
@@ -129,7 +144,11 @@ pub async fn create_goal_task(
         .filter(|s| !s.is_empty())
         .map(|s| duduclaw_core::truncate_chars(s, 2000));
 
-    let task_id = uuid::Uuid::new_v4().to_string();
+    let task_id = req
+        .task_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Title reflects the goal itself — computed from the base description
     // BEFORE the belief-declaration teaching paragraph is appended below, so
     // the 60-char truncation never crowds out the actual goal text with
@@ -180,6 +199,17 @@ pub async fn create_goal_task(
             Some((Utc::now() + ChronoDuration::minutes((hours * 60.0).round() as i64)).to_rfc3339());
     }
     task.risk_boundary = risk_boundary;
+    task.on_behalf_of = req.on_behalf_of.clone();
+    task.created_via = req.on_behalf_of.as_ref().and(req.created_via.clone());
+    if let Some((channel, chat_id)) = &req.source {
+        if !channel.is_empty() {
+            task.source_channel = Some(channel.clone());
+        }
+        task.source_chat_id = Some(chat_id.clone());
+        task.source_discord_guild_id = (channel == "discord")
+            .then(|| crate::discord::guild_id_for_channel(home_dir, chat_id))
+            .flatten();
+    }
 
     // I-1c "想一想": generate the plan and park the task `needs_human` instead
     // of `todo` — runs synchronously, so no dispatch-engine round (not even a
@@ -238,7 +268,14 @@ pub async fn create_goal_task(
                 )
             },
             timestamp: Utc::now().to_rfc3339(),
-            metadata: None,
+            metadata: req.on_behalf_of.as_ref().map(|who| {
+                serde_json::json!({
+                    "on_behalf_of": who,
+                    "created_via": req.created_via,
+                    "via": req.grant_via,
+                })
+                .to_string()
+            }),
         })
         .await;
 
@@ -266,6 +303,7 @@ mod tests {
             plan_first: false,
             parent_task_id: None,
             source_label: String::new(),
+            ..Default::default()
         }
     }
 

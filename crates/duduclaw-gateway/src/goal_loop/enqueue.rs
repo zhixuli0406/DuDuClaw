@@ -261,7 +261,8 @@ pub(crate) async fn enqueue_goal_work(
     iter: u32,
     state_text: &str,
 ) -> Result<String, String> {
-    let payload = build_goal_payload(task, iter, state_text);
+    let assigner = store.home_dir().and_then(|home| assigner_label(home, task));
+    let payload = build_goal_payload(task, iter, state_text, assigner.as_deref());
     let msg = goal_queue_message(uuid::Uuid::new_v4().to_string(), task, payload);
     let result = queue.enqueue(&msg).await.map(|()| msg.id.clone());
     // I-1c: the plan has now been injected into this round's payload —
@@ -292,7 +293,12 @@ pub(super) async fn clear_consumed_plan(store: &Arc<TaskStore>, task: &TaskRow) 
 
 /// The work payload of one goal round (P2-A: shared by the random-id rail
 /// above and the fixed-id durable rail, so the text is one implementation).
-pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) -> String {
+pub(super) fn build_goal_payload(
+    task: &TaskRow,
+    iter: u32,
+    state_text: &str,
+    assigner: Option<&str>,
+) -> String {
     let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
     // I-3a: a task continued from `done`/`failed`/`cancelled` via the
     // dashboard's "接著做" action stamps `judge_feedback` with
@@ -355,11 +361,16 @@ pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) ->
     // reads this the same way, and the self-report marker is parsed by
     // `goal_state::parse_state_update` regardless of which runtime
     // produced it.
+    // The person who handed the task over (chat `/交辦`, dashboard), by name
+    // only — never an account id.
+    let assigner_block = assigner
+        .map(|who| format!("\n• 交辦人: {who}"))
+        .unwrap_or_default();
     let payload = format!(
         "{marker} 你有一個自主目標任務要推進:\n\
              • Task ID: {}\n\
              • 標題: {}\n\
-             • 說明: {}{criteria_block}\n\n\
+             • 說明: {}{assigner_block}{criteria_block}\n\n\
              {state_text}\n\n\
              若你在推進過程中形成了新的『待驗證假設』,請在回覆最後附上下列標記(純文字,任何 \
              AI 執行環境皆可產出;省略此標記則系統會沿用上一輪的假設清單,絕不自行臆測):\n\
@@ -371,6 +382,31 @@ pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) ->
         task.id, task.title, task.description,
     );
     payload
+}
+
+/// "王小明（業務部）" for a task handed over by a dashboard account
+/// (`on_behalf_of = user:<id>`), read from `users.db`. `None` when the task
+/// names nobody or the account cannot be read (the prompt then has no
+/// assigner line; an id never stands in for the name).
+pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<String> {
+    let user_id = task.on_behalf_of.as_deref()?.strip_prefix("user:")?;
+    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
+    let user = db.get_user(user_id).ok().flatten()?;
+    // One line of plain text: control characters (a newline could start a
+    // fake instruction block) are dropped.
+    let clean = |s: &str| -> String {
+        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        duduclaw_core::truncate_chars(s.trim(), 40).to_string()
+    };
+    let name = clean(&user.display_name);
+    if name.is_empty() {
+        return None;
+    }
+    let dept = user.department.as_deref().map(clean).filter(|d| !d.is_empty());
+    Some(match dept {
+        Some(dept) => format!("{name}（{dept}）"),
+        None => name,
+    })
 }
 
 /// The queue row of one goal round with the given message id.

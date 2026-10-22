@@ -782,6 +782,10 @@ export interface TaskInfo {
   /** Set by the server when the reader may see only this card: the task's
    *  content is limited to an audience the reader is not in. */
   restricted?: boolean;
+  /** Who the task was handed over for (`user:<account id>`), when a person
+   *  assigned it; and where (`line`, `webchat`, `dashboard`, …). */
+  on_behalf_of?: string | null;
+  created_via?: string | null;
   /** Discovery is orchestrated separately from the ordinary goal worker. */
   kind?: 'task' | 'goal' | 'discovery';
   id: string;
@@ -7613,6 +7617,9 @@ export const api = {
       archived?: boolean;
       limit?: number;
       offset?: number;
+      /** `'me'`: only tasks the signed-in account handed over (chat
+       *  `/交辦`, the dashboard). No `agent_id` is needed then. */
+      on_behalf_of?: 'me';
     }) =>
       client.call('tasks.list_page', params) as Promise<{
         tasks: TaskInfo[];
