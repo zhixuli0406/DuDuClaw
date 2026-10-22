@@ -208,7 +208,9 @@ pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, Stri
     // Saving the file exactly as it is is a no-op, except for a file changed
     // outside the dashboard: then it is the request to check the current
     // text and accept it as the approved version.
-    if input.content == current && baseline.is_none() {
+    // (A skill has no approved fingerprint to accept, so an unchanged skill
+    // save stays a no-op.)
+    if input.content == current && (baseline.is_none() || input.key.is_skill()) {
         let mut m = base(&input, "unchanged");
         m.insert("hash".into(), json!(current_hash));
         return Ok(Value::Object(m));
@@ -230,7 +232,11 @@ pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, Stri
             reason: verdict::Reason::new(
                 verdict::category::OUTSIDE_CHANGE,
                 "medium",
-                "這個檔案在系統外被改過，這次以整份內容檢查，並和上次核可的版本比較",
+                if input.key.is_skill() {
+                    "這個技能在系統外被改過，這次以整份內容檢查，並和上次在這裡儲存的版本比較"
+                } else {
+                    "這個檔案在系統外被改過，這次以整份內容檢查，並和上次核可的版本比較"
+                },
                 "",
             ),
         });
@@ -262,6 +268,9 @@ struct Approved {
 }
 
 fn approved_baseline(home: &Path, agent_id: &str, key: &FileKey) -> Option<Approved> {
+    if key.is_skill() {
+        return skill_last_saved(home, agent_id, key);
+    }
     let doc = key.protected_doc()?;
     let dir = super::agent_dir(home, agent_id).ok()?;
     if duduclaw_security::soul_guard::doc_drift(doc, &dir) != duduclaw_security::soul_guard::DocDrift::Drifted {
@@ -271,6 +280,21 @@ fn approved_baseline(home: &Path, agent_id: &str, key: &FileKey) -> Option<Appro
         .and_then(|h| super::history::find_by_sha(home, agent_id, key, &h))
         .and_then(|v| super::history::read_version(home, agent_id, key, &v).ok())
         .unwrap_or_default();
+    Some(Approved { text })
+}
+
+/// A skill has no fingerprint baseline; its stand-in is the last version
+/// kept here. When the file on disk is not that version, it was changed
+/// outside the dashboard (the employee can write its own skills): `Some`
+/// with the last saved text. A skill never saved here has nothing to compare
+/// with (its high-risk lines are still reported, see `skill_rules`).
+fn skill_last_saved(home: &Path, agent_id: &str, key: &FileKey) -> Option<Approved> {
+    let last = super::history::last(home, agent_id, key)?;
+    let current = super::file_path(home, agent_id, key).ok().and_then(|p| super::read_or_empty(&p).ok())?;
+    if last.sha256 == super::hash_of(&current) {
+        return None;
+    }
+    let text = super::history::read_version(home, agent_id, key, &last.version_id).unwrap_or_default();
     Some(Approved { text })
 }
 

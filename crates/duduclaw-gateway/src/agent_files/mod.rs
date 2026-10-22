@@ -29,6 +29,7 @@ pub(crate) mod history;
 pub(crate) mod quota;
 pub(crate) mod review;
 pub(crate) mod rules;
+pub(crate) mod skill_rules;
 pub(crate) mod skills;
 pub(crate) mod verdict;
 pub(crate) mod writer;

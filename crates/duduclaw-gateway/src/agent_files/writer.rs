@@ -123,13 +123,16 @@ pub(crate) fn commit_locked(
 ) -> Result<Outcome, CommitError> {
     let path = super::file_path(c.home, c.agent_id, &c.key).map_err(CommitError::Refused)?;
     let keep = AgentFilesConfig::load(c.home).history_keep;
-    let result = duduclaw_core::with_file_lock(&path, || {
+    let result = duduclaw_core::with_file_lock(&lock_anchor(c, &path), || {
         // A skill is never created here, and its folder is writable by the
-        // employee: resolve it again under the lock and refuse anything that
-        // no longer is the same existing regular file.
-        if c.key.is_skill() && super::file_path(c.home, c.agent_id, &c.key).as_ref() != Ok(&path) {
-            return Ok(Locked::Err(CommitError::Refused("skill file not found".into())));
-        }
+        // employee: bind it again under the lock (same existing regular
+        // file, same folders) and check that binding once more right before
+        // the replace.
+        let bound = match skill_binding(c) {
+            Ok(b) if b.as_ref().is_none_or(|b| b.path() == path) => b,
+            Ok(_) => return Ok(Locked::Err(CommitError::Refused("skill file not found".into()))),
+            Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
+        };
         let current = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !c.key.is_skill() => String::new(),
@@ -186,6 +189,9 @@ pub(crate) fn commit_locked(
             Err(e) => return Ok(Locked::Err(CommitError::Failed(e))),
         };
         if !accept_current {
+            if bound.is_some() && skill_binding(c).ok() != Some(bound.clone()) {
+                return Ok(Locked::Err(CommitError::Refused("the skill folder changed while saving; nothing was written".into())));
+            }
             crate::handlers::config_commit::replace_owner_only(&path, &new)?;
         }
         update_baseline(c, &before_hash);
@@ -209,6 +215,24 @@ pub(crate) fn commit_locked(
         Ok(Locked::Err(e)) => Err(e),
         Err(e) => Err(CommitError::Failed(format!("cannot write {}: {e}", c.key.file_name()))),
     }
+}
+
+/// The advisory lock file's anchor. A skill's folder is writable by the
+/// employee, so its lock lives outside, next to its versions
+/// (`agent_file_history/<agent>/locks/<skill dir>.lock`). Writers that do
+/// not use this module (the custom-skill flow, the employee's own skill
+/// tools) do not take this lock.
+fn lock_anchor(c: &Commit<'_>, path: &Path) -> std::path::PathBuf {
+    if c.key.is_skill() {
+        return c.home.join("agent_file_history").join(c.agent_id).join("locks").join(c.key.history_dir());
+    }
+    path.to_path_buf()
+}
+
+/// `Some(binding)` for a skill, `None` for every other file.
+fn skill_binding(c: &Commit<'_>) -> Result<Option<super::skills::Binding>, String> {
+    let FileKey::Skill(p) = &c.key else { return Ok(None) };
+    super::skills::bind(&super::agent_dir(c.home, c.agent_id)?, p).map(Some)
 }
 
 /// Still under the file lock, so nobody can slip a write in between.

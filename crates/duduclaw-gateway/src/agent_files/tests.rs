@@ -149,6 +149,8 @@ fn skill_files_are_written_in_place_with_history_and_never_created() {
     assert_eq!(rows[0].file, "skill:quote/SKILL.md");
     assert_eq!(history::read_version(&home, "a1", &key, &rows[1].version_id).unwrap(), "---\nname: quote\n---\nv0");
     assert!(home.join("agent_file_history/a1").join(key.history_dir()).is_dir(), "kept outside the agent folder");
+    assert!(home.join("agent_file_history/a1/locks").join(format!("{}.lock", key.history_dir())).exists(), "the lock lives outside");
+    assert!(!skills.join("SKILL.md.lock").exists(), "no lock file in the employee's folder");
     // Leftovers the skill loader must never pick up as skills.
     let stray: Vec<String> = std::fs::read_dir(&skills)
         .unwrap()
@@ -177,4 +179,31 @@ fn skill_files_are_written_in_place_with_history_and_never_created() {
     for bad in ["skill:../SOUL.md", "skill:quote/../../SOUL.md", "skill:quote/run.py", "skill:", "skills:quote/SKILL.md"] {
         assert!(FileKey::parse(bad).is_err(), "{bad}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_skill_folder_swapped_for_a_symlink_while_saving_is_not_followed() {
+    let (_d, home) = home_with_agent();
+    let skills = home.join("agents/a1/SKILLS/quote");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(skills.join("SKILL.md"), "v0").unwrap();
+    let elsewhere = home.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("SKILL.md"), "v0").unwrap();
+    let key = FileKey::parse("skill:quote/SKILL.md").unwrap();
+    let (skills_dir, outside) = (home.join("agents/a1/SKILLS"), elsewhere.clone());
+    // The swap happens after the in-lock check, while the new text is rendered.
+    let r = commit_locked(
+        &commit(&home, key, Some(&hash_of("v0"))),
+        move |_| {
+            std::fs::rename(skills_dir.join("quote"), skills_dir.join("quote-old")).unwrap();
+            std::os::unix::fs::symlink(&outside, skills_dir.join("quote")).unwrap();
+            Ok("v1".into())
+        },
+        || Ok(()),
+    );
+    assert!(matches!(r, Err(CommitError::Refused(_))), "{r:?}");
+    assert_eq!(std::fs::read_to_string(elsewhere.join("SKILL.md")).unwrap(), "v0", "nothing written through the link");
+    assert!(!elsewhere.join("SKILL.md.tmp").exists());
 }

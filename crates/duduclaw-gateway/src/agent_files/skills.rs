@@ -41,7 +41,35 @@ fn valid_component(c: &str) -> bool {
     duduclaw_agent::skill_loader::is_safe_skill_name(c)
         && c.len() <= MAX_COMPONENT_BYTES
         && c.trim() == c
-        && !c.chars().any(|ch| ch.is_control() || matches!(ch, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        && !c.chars().any(|ch| ch.is_control() || is_invisible(ch) || matches!(ch, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+}
+
+/// Format characters that change how a name looks without being seen:
+/// zero-width, direction overrides / isolates / marks, invisible operators,
+/// variation selectors, tags, the BOM. Two names that differ only by these
+/// would look the same in the list, the history and the approval card.
+fn is_invisible(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+            | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFFB | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF
+    )
+}
+
+/// More than one name for the same file (a hard link) could point a skill
+/// at any file on the same disk; refused like a symlink.
+#[cfg(unix)]
+fn has_other_links(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    m.nlink() > 1
+}
+
+/// Windows: the link count is not exposed by the standard library on
+/// stable Rust; hard links under `SKILLS/` are not detected there.
+#[cfg(not(unix))]
+fn has_other_links(_m: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn is_md(name: &str) -> bool {
@@ -136,6 +164,9 @@ pub(crate) fn resolve(agent_dir: &Path, skill: &SkillPath) -> Result<PathBuf, St
         if (last && !m.is_file()) || (!last && !m.is_dir()) {
             return Err(NOT_FOUND.into());
         }
+        if last && has_other_links(&m) {
+            return Err("this skill file cannot be edited here".into());
+        }
     }
     let canon_root = std::fs::canonicalize(&root).map_err(|_| NOT_FOUND.to_string())?;
     let canon = std::fs::canonicalize(&at).map_err(|_| NOT_FOUND.to_string())?;
@@ -143,6 +174,53 @@ pub(crate) fn resolve(agent_dir: &Path, skill: &SkillPath) -> Result<PathBuf, St
         return Err("this skill file resolves outside the skills folder".into());
     }
     Ok(at)
+}
+
+/// What a resolved skill path is bound to: the identity (device and inode
+/// on unix, the canonical path elsewhere) of `SKILLS/` and of every level
+/// down to the file. Taken under the file lock and compared again right
+/// before the replace, so a folder swapped for a symlink in between is
+/// caught instead of followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Binding {
+    path: PathBuf,
+    ids: Vec<(u64, u64)>,
+    canonical: PathBuf,
+}
+
+impl Binding {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+fn identity(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+#[cfg(not(unix))]
+fn identity(_m: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// Resolve `skill` and record what it is bound to.
+pub(crate) fn bind(agent_dir: &Path, skill: &SkillPath) -> Result<Binding, String> {
+    let path = resolve(agent_dir, skill)?;
+    let mut at = skills_root(agent_dir)?;
+    let mut ids = Vec::new();
+    ids.push(identity(&std::fs::symlink_metadata(&at).map_err(|_| "skill file not found".to_string())?));
+    for part in skill.rel().split('/') {
+        at = at.join(part);
+        let m = std::fs::symlink_metadata(&at).map_err(|_| "skill file not found".to_string())?;
+        if m.file_type().is_symlink() {
+            return Err("this skill file cannot be edited here".into());
+        }
+        ids.push(identity(&m));
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|_| "skill file not found".to_string())?;
+    Ok(Binding { path, ids, canonical })
 }
 
 /// Every editable skill file of the employee, sorted, at most
@@ -169,6 +247,7 @@ pub(crate) fn list(agent_dir: &Path) -> Vec<SkillPath> {
             if ft.is_dir() && depth < MAX_COMPONENTS && valid_component(&name) {
                 queue.push_back((e.path(), rel, depth + 1));
             } else if ft.is_file()
+                && !e.metadata().is_ok_and(|m| has_other_links(&m))
                 && let Ok(p) = SkillPath::parse(&rel)
             {
                 out.push(p);
@@ -204,6 +283,10 @@ mod tests {
             "a:b.md",
             " notes.md",
             "no\u{7}tes.md",
+            "quote\u{202e}dm.md",
+            "quo\u{200b}te.md",
+            "quote\u{200d}/SKILL.md",
+            "\u{feff}quote.md",
             &format!("{}.md", "x".repeat(200)),
         ] {
             assert!(SkillPath::parse(bad).is_err(), "{bad:?}");
@@ -255,6 +338,12 @@ mod tests {
             assert!(resolve(&dir, &SkillPath::parse("linked/SKILL.md").unwrap()).is_err(), "symlinked folder");
             let rels: Vec<String> = list(&dir).iter().map(|p| p.rel().to_string()).collect();
             assert!(!rels.iter().any(|r| r.starts_with("link")), "{rels:?}");
+            // A hard link (a second name for any file on the disk) is refused.
+            let secret = t.path().join("config.md");
+            std::fs::write(&secret, "token = x").unwrap();
+            std::fs::hard_link(&secret, dir.join("SKILLS/hard.md")).unwrap();
+            assert!(resolve(&dir, &SkillPath::parse("hard.md").unwrap()).is_err(), "hard link");
+            assert!(!list(&dir).iter().any(|p| p.rel() == "hard.md"), "hard link not listed");
             // A symlinked SKILLS folder is refused as a whole.
             let other = t.path().join("a2");
             std::fs::create_dir_all(&other).unwrap();

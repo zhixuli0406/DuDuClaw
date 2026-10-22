@@ -69,6 +69,8 @@ pub(crate) mod category {
     pub const OUTSIDE_CHANGE: &str = "outside_change";
     /// A skill asks the employee to run something dangerous.
     pub const RISKY_ACTION: &str = "risky_action";
+    /// A skill already held suspicious lines this change did not touch.
+    pub const EXISTING_RISK: &str = "existing_risk";
 }
 
 /// One reason the check gave.
