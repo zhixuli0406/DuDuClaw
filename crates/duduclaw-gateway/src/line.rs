@@ -1131,11 +1131,7 @@ async fn process_line_events(
                 // dropped. `segment_line_reply` returns one Flex bubble for short
                 // replies, or several plain-text messages (each within LINE's
                 // 5000-char text limit, capped at 5 messages/request) for long ones.
-                let mut messages = crate::thinking::channel_presenter::line_messages_with_footer(
-                    segment_line_reply(&reply, agent_name.as_deref()),
-                    thinking_footer.as_ref(),
-                    ingress::answer_goes_by_reply(),
-                );
+                let mut messages = segment_line_reply(&reply, agent_name.as_deref());
 
                 // Attach quick-reply buttons to the LAST message (LINE only shows
                 // quickReply on the most recent message). Presses arrive as
@@ -1160,7 +1156,18 @@ async fn process_line_events(
                     send_ccr_revoked_reply(&state.http, &token, reply_token, sender).await;
                     continue;
                 }
-                let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                // The thinking footer rides only in the Reply call; delivery
+                // drops it when the answer ends up pushed.
+                let _ = ingress::deliver_with_reply_extra(
+                    &state.http,
+                    &token,
+                    reply_token,
+                    messages,
+                    thinking_footer
+                        .as_ref()
+                        .map(crate::thinking::channel_presenter::line_footer_message),
+                )
+                .await;
             }
         }
     }

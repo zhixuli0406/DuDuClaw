@@ -167,27 +167,28 @@ async fn abandon_deletes_the_status_message() {
 }
 
 #[tokio::test]
-async fn line_footer_rides_in_the_same_reply_and_never_exceeds_five() {
+async fn line_footer_message_goes_first_and_never_exceeds_five() {
     let p = ChannelThinking::new("line", false, Lang::ZhTw, None);
     p.set_show(ShowThinking::Status);
     p.observe(&ev("t0", ThinkingPhase::End, Some("hidden")));
     let footer = p.finish().await.unwrap();
+    let extra = line_footer_message(&footer);
+    assert_eq!(extra["text"], "💭 思考了 1 秒", "timer only for this audience");
     let answer = |n: usize| -> Vec<serde_json::Value> {
         (0..n).map(|i| serde_json::json!({"type": "text", "text": format!("a{i}")})).collect()
     };
-    let out = line_messages_with_footer(answer(1), Some(&footer), true);
+    let out = with_reply_extra(answer(1), Some(extra.clone()));
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0]["text"], "💭 思考了 1 秒", "timer only for this audience");
+    assert_eq!(out[0], extra);
     assert_eq!(out[1]["text"], "a0", "the answer stays last (quick replies attach there)");
     for n in 1..=6 {
-        let out = line_messages_with_footer(answer(n), Some(&footer), true);
-        assert!(out.len() <= LINE_MAX_MESSAGES.max(n), "{n}: {}", out.len());
+        let out = with_reply_extra(answer(n), Some(extra.clone()));
         if n >= LINE_MAX_MESSAGES {
             assert_eq!(out.len(), n, "a full reply gets no footer");
+        } else {
+            assert_eq!(out.len(), n + 1);
         }
     }
-    // Not going out by Reply (late push): no thinking message at all.
-    assert_eq!(line_messages_with_footer(answer(1), Some(&footer), false).len(), 1);
-    assert_eq!(line_messages_with_footer(answer(1), None, true).len(), 1);
-    assert!(line_messages_with_footer(vec![], Some(&footer), true).is_empty());
+    assert_eq!(with_reply_extra(answer(1), None).len(), 1);
+    assert!(with_reply_extra(vec![], Some(extra)).is_empty());
 }

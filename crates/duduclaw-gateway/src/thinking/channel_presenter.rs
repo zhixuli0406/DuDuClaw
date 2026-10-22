@@ -347,22 +347,25 @@ pub fn with_footer(reply: String, footer: Option<&Footer>) -> String {
 /// LINE's per-request message limit (reply and push alike).
 pub const LINE_MAX_MESSAGES: usize = 5;
 
-/// LINE: the thinking footer as one small text message placed before the
-/// answer, in the same Reply call. Skipped when the answer already uses all
-/// five slots, and when this answer will not go out through the Reply API
-/// (`via_reply = false`: no extra message is ever pushed for thinking).
-pub fn line_messages_with_footer(
+/// LINE: the thinking footer as one small text message.
+pub fn line_footer_message(footer: &Footer) -> serde_json::Value {
+    serde_json::json!({"type": "text", "text": footer.text()})
+}
+
+/// LINE Reply call: `extra` (the thinking message) placed before the answer,
+/// unless the answer already uses all [`LINE_MAX_MESSAGES`] slots or is
+/// empty. Only the Reply path calls this; a pushed answer never carries it.
+pub fn with_reply_extra(
     mut messages: Vec<serde_json::Value>,
-    footer: Option<&Footer>,
-    via_reply: bool,
+    extra: Option<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
-    let Some(footer) = footer else {
+    let Some(extra) = extra else {
         return messages;
     };
-    if !via_reply || messages.is_empty() || messages.len() >= LINE_MAX_MESSAGES {
+    if messages.is_empty() || messages.len() >= LINE_MAX_MESSAGES {
         return messages;
     }
-    messages.insert(0, serde_json::json!({"type": "text", "text": footer.text()}));
+    messages.insert(0, extra);
     messages
 }
 
