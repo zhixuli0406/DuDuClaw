@@ -441,6 +441,23 @@ mod tests {
         }
     }
 
+    /// Thinking display must never become a cost knob: the Claude CLI's own
+    /// thinking-budget / effort env vars stay off the allowlist, so a value
+    /// on the gateway process cannot silently change what an employee's turn
+    /// costs. `[model] effort` (passed as a flag) is the only effort control.
+    #[test]
+    fn thinking_budget_and_effort_env_are_never_inherited() {
+        for name in ["MAX_THINKING_TOKENS", "CLAUDE_CODE_EFFORT_LEVEL"] {
+            assert!(
+                !AGENT_CLI_ENV_ALLOWLIST.contains(&name),
+                "{name} must not be inherited by a spawned agent CLI"
+            );
+            assert!(!AGENT_CLI_ENV_ALLOWLIST_MACOS.contains(&name), "{name}");
+            assert!(!AGENT_CLI_ENV_ALLOWLIST_WINDOWS.contains(&name), "{name}");
+            assert!(!GIT_CREDENTIALS_ENV_ALLOWLIST.contains(&name), "{name}");
+        }
+    }
+
     // Serialize the few env-mutating tests so they don't race each other
     // (matches the idiom in `platform.rs::home_tests`).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

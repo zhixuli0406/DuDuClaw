@@ -15,21 +15,32 @@
 //!   job scheduling; [`embed_job`] runs one; [`embedding_rpc`] is
 //!   `knowledge.embedding.*`; [`redaction_adapter`] de-identifies text
 //!   before a cloud embedding call.
+//! - [`principals`]: who a collection owner may grant to (the permission
+//!   picker and the check before `knowledge.acl.set`).
+//! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
+//!   employee edit page (`agents.update`).
+//! - [`denied`]: the admin-wide list of refused reads.
+//! - [`upload_limits`]: `knowledge.limits`, the upload limits the dashboard
+//!   checks before sending a file.
 //!
 //! Writes happen only here. Every read goes through
 //! `duduclaw_knowledge::acl::effective_collections`.
 
+pub mod agent_binding;
+pub mod denied;
 pub mod embed_job;
 pub mod embedding;
 pub mod embedding_rpc;
 pub mod embedding_select;
 pub mod extract_spawn;
 pub mod pipeline;
+pub mod principals;
 pub mod redaction_adapter;
 pub mod route;
 pub mod rpc;
 pub mod turn_requesters;
 pub mod upload;
+pub mod upload_limits;
 pub mod url_ingest;
 pub mod worker;
 

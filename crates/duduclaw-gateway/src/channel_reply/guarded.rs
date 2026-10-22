@@ -62,6 +62,11 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         session_id,
         on_progress,
     );
+    // Thinking display: one sink per turn, installed AFTER the interim wrap
+    // so the watcher sees `Thinking` events (and can say "thinking"). No
+    // sink at all for public visitors.
+    let (on_progress, thinking_sink) =
+        arm_thinking(ctx, agent_override, session_id, on_progress).await;
     let collector: std::sync::Arc<std::sync::Mutex<Vec<crate::runtime::NativeToolEvent>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let ccr_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -91,13 +96,16 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                         collector.clone(),
                         crate::trigger_route::ANSWERED_BY.scope(
                             answered.clone(),
-                            build_reply_with_session_inner(
-                                text,
-                                ctx,
-                                agent_override,
-                                session_id,
-                                user_id,
-                                on_progress,
+                            crate::thinking::scope_turn(
+                                thinking_sink.clone(),
+                                build_reply_with_session_inner(
+                                    text,
+                                    ctx,
+                                    agent_override,
+                                    session_id,
+                                    user_id,
+                                    on_progress,
+                                ),
                             ),
                         ),
                     ),
@@ -118,7 +126,77 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         .ok()
         .map(|mut held| std::mem::take(&mut *held));
     let answered_by = answered.lock().ok().and_then(|mut a| a.take());
+    finish_thinking(thinking_sink.as_deref(), ctx, agent_override, session_id, &answered_by).await;
     (raw, operator_result_artifact, guards, delivery, answered_by)
+}
+
+/// Build this turn's thinking sink (see `crate::thinking`). The agent is only
+/// resolved for WebChat sessions — the only place its `show_thinking` and
+/// contract are consulted for text.
+async fn arm_thinking(
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> (
+    Option<ProgressCallback>,
+    Option<Arc<crate::thinking::ThinkingSink>>,
+) {
+    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+        return (on_progress, None);
+    }
+    let widget_visitor = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+        .try_with(|p| crate::webchat::is_widget_visitor(p))
+        .unwrap_or(false);
+    let agent_id = if crate::thinking::policy::is_webchat_session(session_id) && !widget_visitor {
+        match agent_override {
+            Some(a) => a.to_string(),
+            None => resolve_agent_for_restore(ctx, session_id).await,
+        }
+    } else {
+        String::new()
+    };
+    let agent_dir = (!agent_id.is_empty()).then(|| ctx.home_dir.join("agents").join(&agent_id));
+    let policy = crate::thinking::policy::resolve(
+        &ctx.home_dir,
+        agent_dir.as_deref(),
+        session_id,
+        widget_visitor,
+    );
+    let sink_ctx = crate::thinking::SinkCtx {
+        home: ctx.home_dir.clone(),
+        agent_id,
+        redaction: crate::thinking::redaction_for_display(
+            ctx.redaction_manager.as_ref(),
+            &ctx.home_dir,
+        ),
+    };
+    crate::thinking::install(policy, on_progress, sink_ctx)
+}
+
+/// End of turn: the per-turn `run_steps` thinking row (seconds and tokens),
+/// attributed like the reply itself (a called employee's own session).
+async fn finish_thinking(
+    sink: Option<&crate::thinking::ThinkingSink>,
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    answered_by: &Option<crate::trigger_route::AnsweredBy>,
+) {
+    let Some(sink) = sink.filter(|s| s.saw_any()) else {
+        return;
+    };
+    let (agent, session) = match answered_by {
+        Some(who) => restore_target(who),
+        None => match agent_override {
+            Some(a) => (a.to_string(), session_id.to_string()),
+            None => (
+                resolve_agent_for_restore(ctx, session_id).await,
+                session_id.to_string(),
+            ),
+        },
+    };
+    sink.finish(&agent, &session).await;
 }
 
 pub(crate) async fn reply_identity_scope<T>(

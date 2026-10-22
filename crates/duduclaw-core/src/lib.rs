@@ -1444,3 +1444,9 @@ pub mod workflow_mcp;
 
 /// Shared hash of computer-use workspace paths (gateway and MCP audits).
 pub mod workspace_path;
+
+/// Thinking display level (`agent.toml [model] show_thinking`).
+pub mod show_thinking;
+
+/// Strip a leading `<think>…</think>` block from open-model answers.
+pub mod think_tags;
