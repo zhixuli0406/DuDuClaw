@@ -5,20 +5,27 @@ use std::collections::HashMap;
 
 use super::*;
 
-/// Most employees counted in one call (a team page never shows more).
-const MAX_COUNTED_AGENTS: usize = 512;
+/// Most employees counted in one call. A caller with more must not report
+/// counts at all (a silently truncated list would read as zero open work).
+pub(crate) const MAX_COUNTED_AGENTS: usize = 512;
 
 impl TaskStore {
     /// Tasks and goals assigned to each of `agents` that are still open:
     /// not `done` / `cancelled` / `failed` and not archived (the same
     /// "open" the stop-tree and board listings use). Agents with no open
-    /// work are absent from the map. At most [`MAX_COUNTED_AGENTS`] names
-    /// are counted; the rest are ignored.
+    /// work are absent from the map. More than [`MAX_COUNTED_AGENTS`] names
+    /// is refused rather than truncated.
     pub async fn open_task_counts(
         &self,
         agents: &[String],
     ) -> Result<HashMap<String, i64>, String> {
-        let names: Vec<&String> = agents.iter().take(MAX_COUNTED_AGENTS).collect();
+        if agents.len() > MAX_COUNTED_AGENTS {
+            return Err(format!(
+                "too many agents to count ({} > {MAX_COUNTED_AGENTS})",
+                agents.len()
+            ));
+        }
+        let names: Vec<&String> = agents.iter().collect();
         if names.is_empty() {
             return Ok(HashMap::new());
         }
@@ -98,5 +105,10 @@ mod tests {
         assert_eq!(counts.get("nobody"), None);
         assert_eq!(counts.get("finance"), None, "only the agents asked about");
         assert!(store.open_task_counts(&[]).await.unwrap().is_empty());
+        let too_many: Vec<String> = (0..=MAX_COUNTED_AGENTS).map(|i| format!("a{i}")).collect();
+        assert!(
+            store.open_task_counts(&too_many).await.is_err(),
+            "refused, never truncated"
+        );
     }
 }

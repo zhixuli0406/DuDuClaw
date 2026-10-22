@@ -173,4 +173,18 @@ describe('TeamPage', () => {
     await waitFor(() => expect(container.querySelector('.text-destructive')).not.toBeNull());
     expect(screen.queryByText('No one reports to you yet')).not.toBeInTheDocument();
   });
+
+  it('clears the team it showed when a reload is refused', async () => {
+    const user = userEvent.setup();
+    const { container } = renderWithProviders(<TeamPage />);
+    const wang = await screen.findByRole('region', { name: 'Wang' });
+    // Assigning reloads the team on close; this time the gateway refuses.
+    await user.click(within(wang).getAllByRole('button', { name: 'Assign' })[0]);
+    const dialog = await screen.findByRole('dialog');
+    mockWsClient.call.mockRejectedValue({ code: 'enterprise_edition_required', message: 'refused' });
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(container.querySelector('.text-destructive')).not.toBeNull());
+    expect(screen.queryByText('Wang')).not.toBeInTheDocument();
+    expect(screen.queryByText('Sales Rep')).not.toBeInTheDocument();
+  });
 });

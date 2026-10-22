@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use super::MethodHandler;
 use crate::protocol::WsFrame;
+use crate::task_store::MAX_COUNTED_AGENTS;
 use crate::trigger_route;
 use duduclaw_agent::registry::AgentRegistry;
 
@@ -47,11 +48,16 @@ struct Member {
     bindings: Vec<UserAgentBinding>,
 }
 
-/// Read the tree and each member's bindings in one blocking task. Any read
-/// error refuses the whole call: a partial team would look complete.
-fn read_team(db: &UserDb, manager_id: &str) -> Result<Vec<Member>, String> {
-    let members = db.team_members(manager_id, MAX_ORG_DEPTH)?;
-    members
+/// The caller's own row and the tree with each member's bindings, read in
+/// one blocking task. Any read error refuses the whole call: a partial team
+/// would look complete.
+///
+/// One binding query per member (N+1): `UserDb` has no batch binding read
+/// yet, and the tree is bounded by the org depth and the size of a team.
+fn read_team(db: &UserDb, manager_id: &str) -> Result<(Option<User>, Vec<Member>), String> {
+    let me = db.get_user(manager_id)?;
+    let members = db
+        .team_members(manager_id, MAX_ORG_DEPTH)?
         .into_iter()
         .map(|(user, depth)| {
             let bindings = db.get_user_agents(&user.id)?;
@@ -61,20 +67,18 @@ fn read_team(db: &UserDb, manager_id: &str) -> Result<Vec<Member>, String> {
                 bindings,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((me, members))
 }
 
-/// The employee rows for one member: only employees that exist, are listed
-/// (not deleted or archived) and that `ctx` may call.
-fn agent_rows(
-    handler: &MethodHandler,
+/// The employees of one member that may be listed: they exist, are listed
+/// (not deleted or archived) and `ctx` may call them.
+fn listed_ids(
     reg: &AgentRegistry,
     ctx: &UserContext,
     bindings: &[UserAgentBinding],
-    open: &HashMap<String, i64>,
-    counts_known: bool,
-) -> Vec<Value> {
-    let ids: Vec<String> = bindings
+) -> Vec<String> {
+    bindings
         .iter()
         .filter(|b| ctx.can_call_agent(&b.agent_name))
         .filter(|b| {
@@ -82,8 +86,41 @@ fn agent_rows(
                 .is_some_and(|a| a.config.agent.status.is_listable(false))
         })
         .map(|b| b.agent_name.clone())
-        .collect();
-    let entries = trigger_route::list::callable_agents(reg, &ids);
+        .collect()
+}
+
+/// Open-task counts for exactly the employees shown, or `None` when they
+/// cannot be given honestly (no task store, a read error, or more
+/// employees than one count covers): the page then shows no number rather
+/// than a zero that only looks known.
+async fn open_counts(handler: &MethodHandler, agents: &[String]) -> Option<HashMap<String, i64>> {
+    if agents.len() > MAX_COUNTED_AGENTS {
+        tracing::warn!(
+            agents = agents.len(),
+            "users.my_team: too many employees to count open tasks"
+        );
+        return None;
+    }
+    let store = handler.task_store().await.ok()?;
+    match store.open_task_counts(agents).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "users.my_team: open task counts unreadable");
+            None
+        }
+    }
+}
+
+/// The employee rows for one member (`ids` from [`listed_ids`]).
+fn agent_rows(
+    handler: &MethodHandler,
+    reg: &AgentRegistry,
+    ctx: &UserContext,
+    bindings: &[UserAgentBinding],
+    ids: &[String],
+    open: Option<&HashMap<String, i64>>,
+) -> Vec<Value> {
+    let entries = trigger_route::list::callable_agents(reg, ids);
     entries
         .iter()
         .filter_map(|entry| {
@@ -100,11 +137,9 @@ fn agent_rows(
                 "operational": operational,
                 "level": level_name(derived_team_level(binding.access_level)),
                 "assignable": operational && ctx.can_assign_to(&entry.id),
-                "active_tasks": if counts_known {
-                    json!(open.get(&entry.id).copied().unwrap_or(0))
-                } else {
-                    Value::Null
-                },
+                "active_tasks": open
+                    .map(|c| json!(c.get(&entry.id).copied().unwrap_or(0)))
+                    .unwrap_or(Value::Null),
             }))
         })
         .collect()
@@ -115,14 +150,12 @@ impl MethodHandler {
         let Some(db) = self.user_db.read().await.clone() else {
             return WsFrame::error_response("", "user system not initialized");
         };
-        let manager_id = ctx.user_id.clone();
         let read = {
-            let db = db.clone();
-            let id = manager_id.clone();
+            let id = ctx.user_id.clone();
             tokio::task::spawn_blocking(move || read_team(&db, &id)).await
         };
-        let members = match read {
-            Ok(Ok(m)) => m,
+        let (me, members) = match read {
+            Ok(Ok(team)) => team,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "users.my_team: team unreadable");
                 return WsFrame::error_response("", TEAM_UNREADABLE);
@@ -133,27 +166,20 @@ impl MethodHandler {
             }
         };
 
-        // Open-task counts are a convenience: without a task store (or on a
-        // read error) the page shows the team without them.
-        let all_agents: Vec<String> = members
-            .iter()
-            .flat_map(|m| m.bindings.iter().map(|b| b.agent_name.clone()))
-            .collect();
-        let (open, counts_known) = match self.task_store().await {
-            Ok(store) => match store.open_task_counts(&all_agents).await {
-                Ok(c) => (c, true),
-                Err(e) => {
-                    tracing::warn!(error = %e, "users.my_team: open task counts unreadable");
-                    (HashMap::new(), false)
-                }
-            },
-            Err(_) => (HashMap::new(), false),
-        };
-
         let reg = self.registry.read().await;
+        let listed: Vec<Vec<String>> = members
+            .iter()
+            .map(|m| listed_ids(&reg, ctx, &m.bindings))
+            .collect();
+        let mut shown: Vec<String> = listed.iter().flatten().cloned().collect();
+        shown.sort();
+        shown.dedup();
+        let open = open_counts(self, &shown).await;
+
         let rows: Vec<Value> = members
             .iter()
-            .map(|m| {
+            .zip(listed.iter())
+            .map(|(m, ids)| {
                 json!({
                     "id": m.user.id,
                     "display_name": m.user.display_name,
@@ -162,15 +188,11 @@ impl MethodHandler {
                     "department": m.user.department,
                     "manager_user_id": m.user.manager_user_id,
                     "depth": m.depth,
-                    "agents": agent_rows(self, &reg, ctx, &m.bindings, &open, counts_known),
+                    "agents": agent_rows(self, &reg, ctx, &m.bindings, ids, open.as_ref()),
                 })
             })
             .collect();
-        let me = db
-            .get_user(&manager_id)
-            .ok()
-            .flatten()
-            .map(|u| json!({ "id": u.id, "display_name": u.display_name }));
+        let me = me.map(|u| json!({ "id": u.id, "display_name": u.display_name }));
         WsFrame::ok_response(
             "",
             json!({

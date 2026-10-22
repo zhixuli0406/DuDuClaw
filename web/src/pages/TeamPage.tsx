@@ -60,6 +60,9 @@ export function TeamPage() {
       setError(null);
       setTeam(await api.users.myTeam());
     } catch (e) {
+      // Drop what was shown before: a refusal after a role, edition or
+      // reporting-line change must not leave the old names on screen.
+      setTeam(null);
       setError(formatError(e));
     } finally {
       setLoading(false);
