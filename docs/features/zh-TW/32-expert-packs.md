@@ -50,6 +50,8 @@ duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢
 
 `--dry-run` 完整渲染安裝計畫,一個位元組都不寫。每個項目都會出現在誠實的報告裡(imported / skipped / conflict / warning)。沒有東西被靜默丟掉。`expert remove <slug>` 只刪安裝紀錄記載為該包建立的東西;先前就存在的資產保留。
 
+同一個包再裝一次時，加 `--replace <slug>` 取代舊版本(舊版本先移到備份，失敗時搬回)，或 `--as-copy` 另存一份；儀表板會讓你在這兩者之間選。安裝前會先數這次要新增幾位 AI 員工，超過授權上限就整包不裝。失敗時的錯誤代碼與處理方式見[從其他平台匯入 AI 員工](../../guides/zh-TW/agent-config-import.md)。
+
 ## 組織定位:部門 × 職級
 
 名冊成員帶 `department` 時,會寫入 `agent.toml` 的 `[agent] department`,安裝器並建立對應的共享 wiki 部門空間。新進成員立即出現在組織圖與部門頁上。職級(`executive` / `manager` / `staff`)是顯示用 metadata:manifest 未給時由 role 推導(`ceo` → executive;`main` / `front_desk` / `team_leader` / `product_manager` → manager;其餘為 staff)。職級是推導出來的,從不具權威,`reports_to` 樹仍是階層的唯一事實來源。

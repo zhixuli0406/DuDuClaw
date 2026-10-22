@@ -6,7 +6,7 @@ Also in [繁體中文](zh-TW/agent-config-import.md) and [日本語](ja-JP/agent
 
 ## Two ways in
 
-**Dashboard.** AI team page → **Upload**. Pick a `.zip`, or a single `.md` / `.yml` / `.yaml` file (50 MB at most). The dashboard installs only what was uploaded through this button; importing a folder on the server is a terminal command. DuDuClaw scans it and shows a plan: which staff will be created, where every file goes, which skills stay off and why. Nothing is written until you press **Import**. The result screen lists what really happened.
+**Dashboard.** AI team page → **Upload**. Pick a `.zip`, or a single `.md` / `.yml` / `.yaml` file (50 MB at most). The dashboard installs only what was uploaded through this button; importing a folder on the server is a terminal command. DuDuClaw scans it and shows a plan: which staff will be created, where every file goes, which skills stay off and why. Nothing is written until you press **Import**. The result screen lists what really happened. Only administrators can upload and import; other roles see a note saying so, with the upload button disabled.
 
 **Terminal.**
 
@@ -17,7 +17,7 @@ duduclaw pack install ./reviewer.agent.md            # a single file works too
 duduclaw pack install ~/.openclaw                     # a folder works too
 ```
 
-`--rename` imports under an `-imported` suffix when a staff member with the same id already exists (otherwise the clash is reported and that staff member is skipped). `duduclaw pack install` is the same command that installs expert packs; there is no separate import command. `duduclaw migrate from openclaw|hermes` still exists for moving a whole platform, including channel tokens and schedules (see [migrate-from.md](migrate-from.md)), and it now uses the same file mapping described below.
+`--rename` imports under an `-imported` suffix when a staff member with the same id already exists (otherwise the clash is reported and that staff member is skipped). When the same content was imported before, add `--replace <slug>` to replace the earlier version (plus `--accept-edits` when its staff were edited since), or `--as-copy` to keep both; see "Importing the same thing again" below. `duduclaw pack install` is the same command that installs expert packs; there is no separate import command. `duduclaw migrate from openclaw|hermes` still exists for moving a whole platform, including channel tokens and schedules (see [migrate-from.md](migrate-from.md)), and it now uses the same file mapping described below.
 
 ## Supported formats
 
@@ -86,6 +86,33 @@ Remove the import from the AI team page (or `duduclaw expert remove <id>`). That
 ```bash
 duduclaw memory forget-source --agent <id> --session "import:agent-import:<import id>/MEMORY.md"
 ```
+
+## Importing the same thing again
+
+When the same content (the same import name) was imported before, the dashboard does not just fail; it asks:
+
+- **Replace the earlier version**: the earlier version moves to a backup first, then the new one is imported under the same ids and names. Staff folders move to `<home>/agents/_trash/<id>_<time>` (the place removed staff go), and skills, knowledge pages, the original files and the import record move to `<home>/experts/_replaced/<import name>_<time>/`. If the new version fails part way, everything is moved back. Replaced staff that the new version does not bring back also lose their org record.
+- **Import as a copy**: the earlier version stays; this one is imported under a new name such as `<import name>-2`, and staff whose ids are taken get an `-imported` suffix.
+
+DuDuClaw records a content fingerprint of every file of every imported staff member. When you choose **Replace** and someone edited a staff member after the import (personality, working rules, knowledge pages, memory files, added files and so on), the dialog first lists what changed and asks you to press **I understand, replace anyway**; without that confirmation the server refuses. Files DuDuClaw maintains itself (`.mcp.json`, `.claude/`, lock files `*.lock`, the knowledge-base index and log) do not count as edits. Staff imported before this version have no fingerprint, so file modification time is used instead and the dialog says so.
+
+## When an import fails
+
+The dialog explains the reason in plain language, suggests what to do, and shows an error code (for example `import.unrecognized`). If you need help, send us that code. The common ones:
+
+| Error code | Meaning | What to do |
+|---|---|---|
+| `import.unrecognized` | The format was not recognised | The dialog lists the top level of the archive and any importable folder found deeper. The importer steps through at most two wrapper folders that hold nothing but one folder (`__MACOSX/` and `.DS_Store` do not count); for anything deeper, zip that folder directly. |
+| `import.already_imported` | Imported before | Choose **Replace** or **Import as a copy**. |
+| `import.replace_edited` | Staff to be replaced were edited after the import | Review the listed edits and confirm again. |
+| `import.nothing_imported` | No staff member was imported | The dialog gives each staff member's reason; for an id clash, use **Import as a copy**. |
+| `import.quota_exceeded` | Over the license's AI staff limit | Refused before anything is written. The limit is the same one used when creating AI staff. |
+| `import.too_large`, `import.zip_bomb`, `import.too_many_entries` | Too big, grows abnormally when unpacked, or too many files | The limit is 50 MB, unpacked size included. |
+| `import.name_encoding_ambiguous`, `import.name_encoding_unknown`, `import.case_duplicate`, `import.unsafe_path` | A file name problem | Re-zip with a tool that writes UTF-8 names, and rename files that differ only in case or are unsafe. |
+| `import.timeout` | Not finished within 300 seconds | Stopped with nothing changed. Try later or split it into smaller packages. |
+| `import.unknown` | Something unexpected | **Details** holds the importer's own message; send it with the code. |
+
+When the upload itself fails (over 50 MB, not a zip, not an administrator), the dialog explains that too.
 
 ## Known limits
 
