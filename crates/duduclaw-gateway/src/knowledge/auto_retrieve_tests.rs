@@ -292,6 +292,9 @@ fn threshold_and_kb_only() {
     // kb_only with a match answers through the model.
     let t = run(&h, "kb-bot", webchat(&h.hr_user), "特休假", "turn-t4");
     assert!(t.direct_reply.is_none() && t.block.is_some());
+    // Commands reach the pipeline in kb_only too.
+    let t = run(&h, "kb-bot", webchat(&h.hr_user), "/status", "turn-t6");
+    assert!(t.direct_reply.is_none() && t.block.is_none());
     // Slash commands are never looked up.
     let t = run(&h, "hr-bot", webchat(&h.hr_user), "/status", "turn-t5");
     assert!(t.block.is_none() && t.rules);

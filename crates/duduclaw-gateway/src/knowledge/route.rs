@@ -121,7 +121,7 @@ pub(crate) enum Request {
 }
 
 impl Request {
-    fn turn_id(&self) -> Option<&str> {
+    pub(crate) fn turn_id(&self) -> Option<&str> {
         match self {
             Request::Search { turn_id, .. }
             | Request::GetPassage { turn_id, .. }
@@ -130,7 +130,7 @@ impl Request {
         }
     }
 
-    fn run_id(&self) -> Option<&str> {
+    pub(crate) fn run_id(&self) -> Option<&str> {
         match self {
             Request::Search { run_id, .. }
             | Request::GetPassage { run_id, .. }

@@ -140,6 +140,11 @@ pub(crate) fn prepare_blocking(
         rules: true,
         ..Default::default()
     };
+    // Commands are never looked up and never answered with "not found",
+    // `kb_only` included: they go on to the normal pipeline.
+    if input.query.trim_start().starts_with('/') || crate::chat_commands::is_command(&input.query) {
+        return Ok(out);
+    }
     let kb_only = settings.answer_mode == AnswerMode::KbOnly;
     let mut entry = access_entry(input);
     entry.allowed = allowed.ids().to_vec();

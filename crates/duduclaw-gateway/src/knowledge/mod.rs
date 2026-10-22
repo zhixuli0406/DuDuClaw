@@ -35,9 +35,11 @@
 //! `duduclaw_knowledge::acl::effective_collections`.
 
 pub mod add_source_approval;
+pub mod add_source_guard;
 pub mod agent_binding;
 pub mod auto_retrieve;
 pub mod chat_add;
+pub mod chat_attachments;
 pub mod cite_turn;
 pub mod denied;
 pub mod embed_job;

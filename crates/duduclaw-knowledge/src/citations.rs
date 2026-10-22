@@ -129,6 +129,28 @@ pub fn turns_citing_source(conn: &Connection, source_id: &str) -> KbResult<Vec<T
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Blank the title, location and excerpt of every stored citation of
+/// `source_id` (on source deletion). Ids, numbers and the cited flag stay,
+/// so forget by source and turn counts still work; no document text is left
+/// behind. Returns the rows changed.
+pub fn scrub_source(conn: &Connection, source_id: &str) -> KbResult<usize> {
+    Ok(conn.execute(
+        "UPDATE turn_citations SET title = '', locator = '', excerpt = '', chunk_id = NULL
+          WHERE source_id = ?1",
+        params![source_id],
+    )?)
+}
+
+/// [`scrub_source`] for every source of `collection_id` (before the
+/// collection is deleted).
+pub fn scrub_collection(conn: &Connection, collection_id: &str) -> KbResult<usize> {
+    Ok(conn.execute(
+        "UPDATE turn_citations SET title = '', locator = '', excerpt = '', chunk_id = NULL
+          WHERE source_id IN (SELECT id FROM sources WHERE collection_id = ?1)",
+        params![collection_id],
+    )?)
+}
+
 /// How a stored citation may be shown now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +263,28 @@ mod tests {
         assert_eq!(rows[0].source_id, "src_a");
         assert_eq!(turns_citing_source(&conn, "src_a").unwrap().len(), 1);
         assert!(turns_citing_source(&conn, "src_b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn scrubbing_blanks_text_but_keeps_the_rows() {
+        let mut conn = crate::schema::open_in_memory().unwrap();
+        record_turn(
+            &mut conn,
+            &[tc("t1", 1, "src_a", true), tc("t2", 1, "src_b", true)],
+        )
+        .unwrap();
+        assert_eq!(scrub_source(&conn, "src_a").unwrap(), 1);
+        let rows = turns_citing_source(&conn, "src_a").unwrap();
+        assert_eq!(rows.len(), 1, "row kept for forget by source");
+        assert!(
+            rows[0].title.is_empty() && rows[0].excerpt.is_empty() && rows[0].locator.is_empty()
+        );
+        assert!(rows[0].chunk_id.is_none());
+        assert_eq!(rows[0].assistant_message_id, Some(11));
+        assert_eq!(
+            turns_citing_source(&conn, "src_b").unwrap()[0].title,
+            "員工手冊.pdf"
+        );
     }
 
     #[test]

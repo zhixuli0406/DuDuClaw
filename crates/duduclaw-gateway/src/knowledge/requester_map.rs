@@ -7,11 +7,12 @@
 //! | WebChat public widget visitor (`widget-visitor:…`) | `ChannelUser` of channel `widget`, unbound |
 //! | Odoo website Live Chat visitor (`odoolivechat:…`) | `ChannelUser` of channel `odoolivechat`, unbound |
 //! | messaging app (LINE, Telegram, …) | `ChannelUser`; `user_id` only from a **verified** `channel_identities` binding of an active account |
-//! | anything else (internal callers) | `System`, on behalf of nobody |
+//! | gateway-internal sessions (`cron:`, `dispatch:`, `heartbeat:` …, [`INTERNAL_SESSION_PREFIXES`]) | `System`, on behalf of nobody |
+//! | anything else | `Unknown` (reads nothing) |
 //!
-//! Public visitors are never mapped to an account, so they can read only
-//! collections opened to their channel, and never personal or restricted
-//! ones (their conversations are not treated as 1:1). A failed identity
+//! Public visitors are never mapped to an account and read only `public`
+//! collections opened to their channel (never internal, personal or
+//! restricted ones, whatever is granted). A failed identity
 //! lookup means unbound (the least a sender can have).
 
 use std::path::Path;
@@ -19,9 +20,9 @@ use std::path::Path;
 use duduclaw_knowledge::requester::RequesterIdentity;
 
 /// Channel name for public WebChat widget visitors.
-pub const WIDGET_CHANNEL: &str = "widget";
+pub const WIDGET_CHANNEL: &str = duduclaw_knowledge::requester::PUBLIC_VISITOR_CHANNELS[0];
 /// Channel name for Odoo website Live Chat visitors.
-pub const ODOO_LIVECHAT_CHANNEL: &str = "odoolivechat";
+pub const ODOO_LIVECHAT_CHANNEL: &str = duduclaw_knowledge::requester::PUBLIC_VISITOR_CHANNELS[1];
 const WIDGET_PRINCIPAL_PREFIX: &str = "widget-visitor:";
 
 /// Map one turn. `webchat_principal` is the authenticated WebChat account
@@ -45,17 +46,26 @@ pub fn map_requester(
             user_id: p.to_string(),
         };
     }
+    // A called employee's bucket (`<session>#agent:<id>`) is the same
+    // conversation: privacy and grants follow the base session.
+    let session_id = super::chat_attachments::base_session(session_id);
     let Some((channel, chat)) = session_id.split_once(':') else {
-        return system();
+        return RequesterIdentity::Unknown;
     };
     if chat.is_empty() || session_id.chars().any(char::is_control) {
-        return system();
+        return RequesterIdentity::Unknown;
     }
     if crate::odoo_livechat::is_public_visitor_session(session_id) {
         return unbound(ODOO_LIVECHAT_CHANNEL, chat, sender);
     }
     if !crate::channel_reply::is_messaging_session(session_id) {
-        return system();
+        // Only gateway-internal sessions are system turns; any other prefix
+        // (a channel added later, a test session) reads nothing.
+        return if INTERNAL_SESSION_PREFIXES.contains(&channel) {
+            system()
+        } else {
+            RequesterIdentity::Unknown
+        };
     }
     let user_id = (!sender.is_empty())
         .then(|| verified(channel, sender))
@@ -67,6 +77,18 @@ pub fn map_requester(
         user_id,
     }
 }
+
+/// Session prefixes the gateway itself uses for turns with no person in the
+/// loop (exact match).
+pub const INTERNAL_SESSION_PREFIXES: &[&str] = &[
+    "cron",
+    "dispatch",
+    "heartbeat",
+    "reminder",
+    "goal",
+    "autopilot",
+    "responsibility",
+];
 
 fn unbound(channel: &str, chat: &str, sender: &str) -> RequesterIdentity {
     RequesterIdentity::ChannelUser {
@@ -194,7 +216,7 @@ mod tests {
 
     #[test]
     fn internal_sessions_are_system_turns() {
-        for sid in ["default", "cron:bot", "dispatch:bot"] {
+        for sid in ["cron:bot", "dispatch:bot", "heartbeat:bot"] {
             let r = map_requester(sid, "", None, bound);
             assert!(
                 matches!(
@@ -208,5 +230,26 @@ mod tests {
             );
             assert_eq!(human_ctx(&r, &Dir).mode, HumanMode::InternalOnly);
         }
+    }
+
+    #[test]
+    fn unknown_sessions_read_nothing() {
+        for sid in ["default", "anonymous", "newchat:abc", "cronx:bot", "line"] {
+            assert_eq!(
+                map_requester(sid, "u", None, bound),
+                RequesterIdentity::Unknown,
+                "{sid}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_called_employee_in_a_one_to_one_chat_is_still_one_to_one() {
+        let r = map_requester("line:Ubound#agent:hr-bot", "Ubound", None, bound);
+        let h = human_ctx(&r, &Dir);
+        assert!(h.is_private);
+        assert_eq!(h.channel_chat.as_deref(), Some("line:Ubound"));
+        let r = map_requester("line:Cgroup1#agent:hr-bot", "Ubound", None, bound);
+        assert!(!human_ctx(&r, &Dir).is_private);
     }
 }

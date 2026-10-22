@@ -81,8 +81,10 @@ pub async fn citations_for_session(
 }
 
 /// `knowledge.proposals.list`: pending add-source cards the caller may
-/// decide (metadata only; the content never leaves the gateway).
+/// decide, with who asked and the text preview (binary files: name, type
+/// and size only). The waiting files themselves never leave the gateway.
 pub async fn proposals_list(home: &Path, user: ResolvedUser) -> KbResult<Value> {
+    super::add_source_guard::sweep_unreferenced(home).await;
     use super::add_source_approval::{ACTION_KIND, may_decide};
     let broker = crate::approval::ApprovalBroker::open(home)
         .map_err(|e| KbError::Io(std::io::Error::other(e)))?;
@@ -115,6 +117,9 @@ pub async fn proposals_list(home: &Path, user: ResolvedUser) -> KbResult<Value> 
                     "bytes": p["bytes"],
                     "url": p["url"],
                     "via": p["via"],
+                    "requester_kind": p["requester_kind"],
+                    "requester_channel": p["requester_channel"],
+                    "preview": p["preview"],
                     "proposed_by": p["proposed_by"],
                 })
             })
@@ -280,6 +285,8 @@ mod tests {
                 content: Content::Text("新的規定內容".into()),
                 proposed_by: "agent:bot".into(),
                 via: "mcp",
+                requester_kind: "system".into(),
+                requester_channel: None,
                 origin: None,
             },
         )
@@ -289,10 +296,11 @@ mod tests {
         let list = listed["proposals"].as_array().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["title"], "規定");
-        assert!(
-            !listed.to_string().contains("新的規定內容"),
-            "no content in the list"
+        assert_eq!(
+            list[0]["preview"], "新的規定內容",
+            "the approver reads what they approve"
         );
+        assert_eq!(list[0]["requester_kind"], "system");
         assert!(
             proposals_list(h, user("vw", false)).await.unwrap()["proposals"]
                 .as_array()

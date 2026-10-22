@@ -46,9 +46,15 @@ impl MethodHandler {
                     .iter()
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
-                    if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer)
-                        && !self.may_decide_knowledge_card(r, &fresh).await
-                    {
+                    // Add-source cards (title, collection, preview) only to
+                    // whoever may decide them: an Admin or an editor of
+                    // that collection, re-read now. Everything else keeps
+                    // the employee-access rule.
+                    if r.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
+                        if !self.may_decide_knowledge_card(r, &fresh).await {
+                            continue;
+                        }
+                    } else if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer) {
                         continue;
                     }
                     if self.authorize_workflow_activation_record(&r.payload,&fresh).await.is_err(){continue;}
@@ -258,8 +264,8 @@ impl MethodHandler {
 }
 
 impl MethodHandler {
-    /// A knowledge add-source card is also shown to whoever may decide it
-    /// (an editor of the collection without access to the employee).
+    /// Whether `fresh` may decide this knowledge add-source card (Admin or
+    /// an editor of its collection); `false` for every other kind.
     async fn may_decide_knowledge_card(
         &self,
         r: &crate::approval::ApprovalRecord,

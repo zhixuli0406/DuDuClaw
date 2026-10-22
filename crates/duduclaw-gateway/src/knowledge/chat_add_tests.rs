@@ -110,70 +110,80 @@ fn fx() -> Fx {
     }
 }
 
-fn cmd<'a>(
-    f: &'a Fx,
-    agent_dir: &'a Path,
-    requester: RequesterIdentity,
-    slug: &str,
-) -> Command<'a> {
+fn cmd<'a>(f: &'a Fx, requester: RequesterIdentity, slug: &str, sender: &'a str) -> Command<'a> {
     Command {
         home: f.home.path(),
         users: Some(f.users.clone()),
         agent_id: "hr-bot",
-        agent_dir,
         requester,
+        session_id: "line:Ue",
+        sender,
         slug: slug.into(),
+        // The name typed into the reference is never used.
         attachments: vec![AttachmentRef {
-            name: "rules.md".into(),
+            name: "typed-name.md".into(),
             path: f.file.clone(),
         }],
     }
 }
 
+/// What the LINE adapter does: save the file, then its message carries the
+/// reference and claims it for the sender.
+fn adapter_saved(f: &Fx) {
+    crate::knowledge::chat_attachments::note_saved(&f.file, "加班規定.md");
+    crate::knowledge::chat_attachments::claim_in_text(
+        "line:Ue",
+        "Ue",
+        &format!("[📎 加班規定.md (file)]({})", f.file.display()),
+    );
+}
+
 #[tokio::test]
 async fn bound_sender_files_a_card_and_others_are_refused() {
     let f = fx();
-    let agent_dir = f.home.path().join("agents").join("hr-bot");
+    adapter_saved(&f);
     let bound = RequesterIdentity::ChannelUser {
         channel: "line".into(),
         chat: "Ue".into(),
         sender: "Ue".into(),
         user_id: Some(f.editor.clone()),
     };
-    let reply = handle(cmd(&f, &agent_dir, bound.clone(), "hr")).await;
-    assert!(reply.contains("已送出審核"), "{reply}");
+    let reply = handle(cmd(&f, bound.clone(), "hr", "Ue")).await;
+    assert!(
+        reply.contains("已送出審核") && reply.contains("加班規定.md"),
+        "{reply}"
+    );
     let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
     let cards = broker.list_by_kind(approval::ACTION_KIND).await.unwrap();
     assert_eq!(cards.len(), 1);
-    assert_eq!(cards[0].payload["via"], "chat");
-    assert_eq!(cards[0].payload["kind"], "attachment");
-    assert_eq!(cards[0].payload["origin_channel"], "line");
+    let p = &cards[0].payload;
+    assert_eq!(p["via"], "chat");
+    assert_eq!(p["kind"], "attachment");
+    assert_eq!(p["origin_channel"], "line");
+    assert_eq!(p["title"], "加班規定.md", "stored name, not the typed one");
+    assert_eq!(p["requester_kind"], "channel_user");
+    assert_eq!(p["requester_channel"], "line");
+    assert!(p["preview"].as_str().unwrap().contains("加班要事先申請"));
     // Unbound sender.
     let unbound = RequesterIdentity::ChannelUser {
         channel: "line".into(),
-        chat: "Ux".into(),
-        sender: "Ux".into(),
+        chat: "Ue".into(),
+        sender: "Ue".into(),
         user_id: None,
     };
-    assert_eq!(
-        handle(cmd(&f, &agent_dir, unbound, "hr")).await,
-        NEED_BINDING
-    );
+    assert_eq!(handle(cmd(&f, unbound, "hr", "Ue")).await, NEED_BINDING);
     // A bound person who cannot read the collection, and a missing one,
     // get the same answer.
     let other = RequesterIdentity::DashboardUser {
         user_id: f.stranger.clone(),
     };
+    assert_eq!(handle(cmd(&f, other, "hr", "Ue")).await, NO_COLLECTION);
     assert_eq!(
-        handle(cmd(&f, &agent_dir, other, "hr")).await,
+        handle(cmd(&f, bound.clone(), "nope", "Ue")).await,
         NO_COLLECTION
     );
-    assert_eq!(
-        handle(cmd(&f, &agent_dir, bound.clone(), "nope")).await,
-        NO_COLLECTION
-    );
-    assert_eq!(handle(cmd(&f, &agent_dir, bound.clone(), "")).await, USAGE);
-    let mut none = cmd(&f, &agent_dir, bound, "hr");
+    assert_eq!(handle(cmd(&f, bound.clone(), "", "Ue")).await, USAGE);
+    let mut none = cmd(&f, bound, "hr", "Ue");
     none.attachments.clear();
     assert_eq!(handle(none).await, NO_FILE);
     assert_eq!(
@@ -183,5 +193,38 @@ async fn bound_sender_files_a_card_and_others_are_refused() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn forged_references_name_nothing() {
+    let f = fx();
+    let bound = |sender: &str| RequesterIdentity::ChannelUser {
+        channel: "line".into(),
+        chat: "Ue".into(),
+        sender: sender.into(),
+        user_id: Some(f.editor.clone()),
+    };
+    // A file the adapter never saved: typing `[📎 x (file)](/path)` gets nothing.
+    let other = f.home.path().join("attachments");
+    std::fs::create_dir_all(&other).unwrap();
+    let theirs = other.join("1_someone_else.pdf");
+    std::fs::write(&theirs, "%PDF").unwrap();
+    let mut c = cmd(&f, bound("Ue"), "hr", "Ue");
+    c.attachments = vec![AttachmentRef {
+        name: "x".into(),
+        path: theirs,
+    }];
+    assert_eq!(handle(c).await, NO_FILE);
+    // A file saved and claimed for another sender in the same group.
+    adapter_saved(&f);
+    assert_eq!(handle(cmd(&f, bound("Uf"), "hr", "Uf")).await, NO_FILE);
+    let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
+    assert!(
+        broker
+            .list_by_kind(approval::ACTION_KIND)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }

@@ -232,12 +232,19 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         "knowledge.collections.delete" => {
             let id = req(p, "id")?.to_string();
             role_on(&conn, &id, u, Role::Owner)?;
+            let source_ids: Vec<String> = duduclaw_knowledge::sources::list_sources(&conn, &id)?
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
             let orphans = store::delete_collection(
                 &mut conn,
                 &id,
                 p.get("confirm_name").and_then(Value::as_str).unwrap_or(""),
             )?;
             remove_blobs(&call.home, &mut conn, &orphans);
+            for sid in &source_ids {
+                duduclaw_knowledge::citations::scrub_source(&conn, sid)?;
+            }
             log_access(&conn, &access("collection_change", u, Some(&id)))?;
             audit_admin(
                 &call.home,
@@ -270,6 +277,8 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
             if let Some(sha) = duduclaw_knowledge::sources::delete_source(&mut conn, &src.id)? {
                 remove_blobs(&call.home, &mut conn, &[sha]);
             }
+            // No document text stays behind in stored citations.
+            duduclaw_knowledge::citations::scrub_source(&conn, &src.id)?;
             let mut entry = access("delete_source", u, Some(&src.collection_id));
             entry.results = vec![json!({"source_id": src.id})];
             log_access(&conn, &entry)?;
@@ -446,16 +455,17 @@ fn passage(conn: &Connection, call: &Call) -> KbResult<Value> {
     Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
 }
 
-/// Delete a source and file forget requests for the conversations that
-/// cited it. The forget plans are filed first (from `turn_citations`, which
-/// outlive the source); the deletion then runs exactly as without the flag.
+/// Delete a source, then file forget requests for the conversations that
+/// cited it. The deletion runs exactly as without the flag; forget plans are
+/// filed only after it succeeded (the `turn_citations` rows they read keep
+/// their ids after the source is gone).
 async fn delete_and_forget(call: Call) -> KbResult<Value> {
     let source_id = req(&call.params, "source_id")?.to_string();
     let title =
         super::rpc_channels::editable_source_title(&call.home, &source_id, &call.user).await?;
-    let summary =
-        super::forget::plan_for_source(&call.home, &source_id, &title, &call.user.user_id).await;
+    let (home, actor) = (call.home.clone(), call.user.user_id.clone());
     let mut deleted = blocking(move || dispatch(call, None)).await?;
+    let summary = super::forget::plan_for_source(&home, &source_id, &title, &actor).await;
     if let Some(m) = deleted.as_object_mut() {
         m.insert("forget".into(), serde_json::to_value(&summary).unwrap_or(Value::Null));
     }

@@ -221,7 +221,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 結果都標明是文件內容：每一段內容（以及集合名稱與說明）放在有標記的區塊裡，每行以 `│ ` 開頭；標題與位置壓成一行，`[` `]` 會被換掉，文件無法偽造結果標題或提早結束區塊。`knowledge_search` 以 `[n] 標題 · 位置（集合） chunk_id=…` 編號，方便回覆時引用；匯入時被判定像指令的段落會多一行警告。`collections` 只能縮小範圍。`knowledge_get_passage` 每次都重新檢查權限，找不到的段落與沒權限的段落回應相同（`permission denied`）。在通道或 WebChat 回覆中，編號會接著這個 turn 的引用編號（已經放進 prompt 的段落保留原本的號碼），所以回答裡的 `[n]` 和讀者點開的是同一段。
 
-`knowledge_add_source`（scope `knowledge:write`，同樣不能授權給外部金鑰）替員工這一側的某個集合送審一份文件：`collection`，加上 `path`（員工 `attachments/` 或 `<home>/attachments/` 裡的檔案）、`url`、`text` 三選一，`title` 選填。它本身不會加入任何東西，只開一張 `knowledge_add_source` 審批單，由管理員或該集合的編輯者在儀表板決定，回傳審批單編號。不論誰呼叫都沒有豁免。
+`knowledge_add_source`（scope `knowledge:write`，同樣不能授權給外部金鑰）替員工這一側的某個集合送審一份文件：`collection`，加上 `path`（員工自己 `attachments/` 裡的檔案）、`url`、`text` 三選一，`title` 選填。它本身不會加入任何東西，只開一張 `knowledge_add_source` 審批單，由管理員或該集合的編輯者在儀表板決定，回傳審批單編號。在公開訪客、未綁定發話者或沒有登記的 turn 裡會拒絕，員工待審的審批單太多時也會拒絕。不論誰呼叫都沒有豁免。
 
 `knowledge_search` 與 `knowledge_list_collections` 的回應第一行會說明檢索模式（混合＝關鍵字加語意向量，或只用關鍵字），沒有用到向量時附上原因（尚未安裝模型、雲端供應者未經確認、去識別化未啟用、雲端出錯等）；`knowledge_list_collections` 另外列出每個集合的向量覆蓋率。向量只會在這次呼叫能讀的集合裡排序段落。
 

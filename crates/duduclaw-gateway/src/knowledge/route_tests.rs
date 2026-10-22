@@ -587,3 +587,40 @@ fn tool_output_reports_hybrid_mode_and_coverage_with_vectors() {
     assert_eq!(list["mode"], "hybrid");
     assert_eq!(list["collections"][0]["vector_coverage"], 1.0);
 }
+
+#[test]
+fn a_run_delegated_from_an_unbound_sender_does_not_see_internal_collections() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    agent(h, "b-bot", "[agent]\nname='b-bot'\n");
+    collection(
+        h,
+        "b-internal",
+        "internal",
+        &[(PrincipalKind::Agent, "b-bot")],
+        "內部價格表：成本六成。",
+    );
+    super::super::turn_requesters::remember_turn_origin(
+        "line:Ustranger#t-route-del",
+        RequesterIdentity::ChannelUser {
+            channel: "line".into(),
+            chat: "Ustranger".into(),
+            sender: "Ustranger".into(),
+            user_id: None,
+        },
+    );
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let _g = rt
+        .block_on(duduclaw_memory::feedback::CURRENT_TURN_ID.scope(
+            Some("line:Ustranger#t-route-del".to_string()),
+            async { super::super::turn_requesters::register_run("b-bot", "runroutedel1", "dispatch") },
+        ))
+        .unwrap();
+    let who = super::super::turn_requesters::resolve_with_run("b-bot", None, Some("runroutedel1"));
+    let st = KnowledgeRouteState::new(h.to_path_buf(), None);
+    let v = serve(&st, "b-bot", who, search("內部價格表")).unwrap();
+    assert_eq!(hits(&v), 0, "{v}");
+    // The same employee in a cron run (no person) does see it.
+    let v = serve(&st, "b-bot", system(), search("內部價格表")).unwrap();
+    assert_eq!(hits(&v), 1);
+}

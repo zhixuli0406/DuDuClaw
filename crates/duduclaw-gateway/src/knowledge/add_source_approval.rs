@@ -3,9 +3,13 @@
 //! Every proposal waits for a human; there is no setting that skips it.
 //!
 //! - **Filing** ([`propose`]): the content is copied into a sidecar file
-//!   under `<home>/knowledge/proposals/` and the approval card stores only
-//!   metadata and the content's SHA-256 (never the content). A URL proposal
-//!   stores the URL; it is fetched only after approval.
+//!   under `<home>/knowledge/proposals/` (directory 0700, files 0600); the
+//!   approval card stores metadata, the content's SHA-256, who asked (kind
+//!   and channel) and, for text, a preview of the first 2,000 characters.
+//!   A URL proposal stores the URL; it is fetched only after approval.
+//!   Visitors, unbound senders and unregistered turns may not propose, and
+//!   each employee / proposer may have only a few cards waiting
+//!   ([`super::add_source_guard`]).
 //! - **Deciding** ([`decide`]): only in the dashboard
 //!   (`approval_notify::is_dashboard_only_kind`), only by an Admin or a
 //!   person who is editor or owner of the collection **at decision time**.
@@ -13,12 +17,12 @@
 //!   as denied. Approval queues a normal ingest job; denial deletes the
 //!   sidecar.
 //!
-//! Expired cards leave their sidecars behind; [`sweep_sidecars`] removes
-//! sidecars older than the card lifetime plus a day.
+//! Waiting files no pending card refers to are removed by
+//! [`super::add_source_guard::sweep_unreferenced`] (on every proposal, every
+//! proposal list and the worker's housekeeping).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use duduclaw_knowledge::acl::Role;
 use duduclaw_knowledge::blob::{BlobStore, url_identity};
@@ -62,6 +66,11 @@ pub struct Proposal {
     pub proposed_by: String,
     /// `mcp` or `chat`.
     pub via: &'static str,
+    /// `access_log` kind of the turn's person (`dashboard_user`,
+    /// `channel_user`, `system`, …), shown on the card.
+    pub requester_kind: String,
+    /// The channel the turn came from, when it came from one.
+    pub requester_channel: Option<String>,
     /// The conversation it came from (never notified about the card).
     pub origin: Option<(String, String)>,
 }
@@ -79,7 +88,7 @@ pub enum Proposed {
     },
 }
 
-fn sidecar_dir(home: &Path) -> PathBuf {
+pub(crate) fn sidecar_dir(home: &Path) -> PathBuf {
     schema::knowledge_dir(home).join("proposals")
 }
 
@@ -88,19 +97,28 @@ fn sidecar_path(home: &Path, staged: &str) -> Option<PathBuf> {
         .then(|| sidecar_dir(home).join(format!("{staged}.bin")))
 }
 
-/// `path` if it is a regular file inside `<agent_dir>/attachments` or
-/// `<home>/attachments` after resolving links; else `None`.
-pub fn attachment_path_allowed(home: &Path, agent_dir: &Path, path: &Path) -> Option<PathBuf> {
+/// `path` if it is a regular file inside the employee's own
+/// `<agent_dir>/attachments` after resolving links; else `None`. The shared
+/// `<home>/attachments` holds other people's files and is not accepted.
+pub fn own_attachment_path(agent_dir: &Path, path: &Path) -> Option<PathBuf> {
     let real = std::fs::canonicalize(path).ok()?;
     if !real.is_file() {
         return None;
     }
-    let roots = [agent_dir.join("attachments"), home.join("attachments")];
-    roots
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .any(|root| real.starts_with(&root))
-        .then_some(real)
+    let root = std::fs::canonicalize(agent_dir.join("attachments")).ok()?;
+    real.starts_with(&root).then_some(real)
+}
+
+/// Create the proposals directory owner-only.
+fn ensure_sidecar_dir(home: &Path) -> std::io::Result<PathBuf> {
+    let dir = sidecar_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
 }
 
 struct Staged {
@@ -112,13 +130,13 @@ struct Staged {
     bytes: u64,
     sha: String,
     staged: Option<String>,
+    preview: Option<String>,
 }
 
 fn stage(home: &Path, cfg: &KnowledgeConfig, p: &Proposal) -> KbResult<Staged> {
     let write_sidecar = |bytes: &[u8]| -> KbResult<String> {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let dir = sidecar_dir(home);
-        std::fs::create_dir_all(&dir)?;
+        let dir = ensure_sidecar_dir(home)?;
         let path = dir.join(format!("{id}.bin"));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -166,6 +184,7 @@ fn stage(home: &Path, cfg: &KnowledgeConfig, p: &Proposal) -> KbResult<Staged> {
                 url: None,
                 bytes: bytes.len() as u64,
                 sha: duduclaw_knowledge::sha256_hex(&bytes),
+                preview: super::add_source_guard::preview(format, &bytes),
                 staged: Some(write_sidecar(&bytes)?),
             })
         }
@@ -187,6 +206,7 @@ fn stage(home: &Path, cfg: &KnowledgeConfig, p: &Proposal) -> KbResult<Staged> {
                 url: None,
                 bytes: text.len() as u64,
                 sha: duduclaw_knowledge::sha256_hex(text.as_bytes()),
+                preview: super::add_source_guard::preview(Format::Txt, text.as_bytes()),
                 staged: Some(write_sidecar(text.as_bytes())?),
             })
         }
@@ -204,6 +224,7 @@ fn stage(home: &Path, cfg: &KnowledgeConfig, p: &Proposal) -> KbResult<Staged> {
                 url: Some(url),
                 bytes: 0,
                 staged: None,
+                preview: None,
             })
         }
     }
@@ -211,10 +232,11 @@ fn stage(home: &Path, cfg: &KnowledgeConfig, p: &Proposal) -> KbResult<Staged> {
 
 /// File a proposal. Blocking file and database work runs off the reactor.
 pub async fn propose(home: &Path, p: Proposal) -> KbResult<Proposed> {
+    super::add_source_guard::sweep_unreferenced(home).await;
+    super::add_source_guard::check_caps(home, &p.agent_id, &p.proposed_by).await?;
     let cfg = KnowledgeConfig::from_home(home);
     let h = home.to_path_buf();
     let (payload, title, summary, duplicate) = super::blocking(move || {
-        sweep_sidecars(&h);
         let conn = schema::open_home(&h)?;
         let coll = duduclaw_knowledge::store::get_collection(&conn, &p.collection_id)?
             .ok_or(KbError::PermissionDenied)?;
@@ -246,6 +268,9 @@ pub async fn propose(home: &Path, p: Proposal) -> KbResult<Proposed> {
             "content_sha256": staged.sha,
             "staged": staged.staged,
             "proposed_by": p.proposed_by,
+            "requester_kind": p.requester_kind,
+            "requester_channel": p.requester_channel,
+            "preview": staged.preview,
             "via": p.via,
             "agent_id": p.agent_id,
             "origin_channel": p.origin.as_ref().map(|o| o.0.clone()),
@@ -300,28 +325,6 @@ fn remove_sidecar(home: &Path, payload: &Value) {
     {
         let _ = std::fs::remove_file(path);
     }
-}
-
-/// Remove sidecars older than the card lifetime plus a day (expired or
-/// abandoned cards).
-pub fn sweep_sidecars(home: &Path) -> usize {
-    let max_age = Duration::from_secs(TTL_SECS as u64 + 24 * 3600);
-    let Ok(rd) = std::fs::read_dir(sidecar_dir(home)) else {
-        return 0;
-    };
-    let mut n = 0;
-    for e in rd.flatten() {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > max_age);
-        if old && std::fs::remove_file(e.path()).is_ok() {
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Whether `user` may decide `rec` now: Admin, or editor / owner of the

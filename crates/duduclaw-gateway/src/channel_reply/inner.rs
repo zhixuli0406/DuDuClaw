@@ -123,6 +123,12 @@ pub(super) async fn build_reply_with_session_inner(
     // to the next turn's prediction error. The session id is still used for
     // session manager / metrics; only the trust feedback path switches.
     let turn_id = format!("{session_id}#{}", uuid::Uuid::new_v4());
+    // Runs this turn dispatches (they carry its turn id) are limited to
+    // what this turn's person may read.
+    crate::knowledge::turn_requesters::remember_turn_origin(
+        &turn_id,
+        crate::knowledge::turn_requesters::current_requester(),
+    );
 
     // Determine which agent to use
     let reg = ctx.registry.read().await;
@@ -248,14 +254,11 @@ pub(super) async fn build_reply_with_session_inner(
     // Proposes this message's attachments (or the sender's recent ones) for
     // a collection. Every proposal waits for an Admin or the collection's
     // editor in the dashboard. Zero LLM cost; public visitors never reach it.
-    if let (Some(slug), Some(dir)) = (
-        crate::knowledge::chat_add::parse(text).filter(|_| !public_visitor),
-        agent_dir.as_deref(),
-    ) {
-        return crate::knowledge::chat_add::run_in_turn(
-            ctx, &agent_id, dir, session_id, user_id, text, slug,
-        )
-        .await;
+    if let Some(slug) = crate::knowledge::chat_add::parse(text)
+        .filter(|_| !public_visitor && agent.is_some())
+    {
+        return crate::knowledge::chat_add::run_in_turn(ctx, &agent_id, session_id, user_id, text, slug)
+            .await;
     }
     let capabilities = agent.map(|a| a.config.capabilities.clone());
     // Already-loaded registry config — no extra read on the per-message path.

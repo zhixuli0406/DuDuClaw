@@ -53,6 +53,8 @@ fn proposal(f: &Fx, content: Content) -> Proposal {
         content,
         proposed_by: "agent:hr-bot".into(),
         via: "mcp",
+        requester_kind: "system".into(),
+        requester_channel: None,
         origin: None,
     }
 }
@@ -82,7 +84,7 @@ fn sources(f: &Fx) -> usize {
 }
 
 #[tokio::test]
-async fn filing_stores_metadata_and_hash_only() {
+async fn filing_stores_metadata_hash_and_preview() {
     let f = fx();
     let (broker, id) = file_one(&f).await;
     let rec = broker.get(&id).await.unwrap().unwrap();
@@ -90,11 +92,10 @@ async fn filing_stores_metadata_and_hash_only() {
     assert!(crate::approval_notify::is_dashboard_only_kind(
         &rec.action_kind
     ));
-    let text = rec.payload.to_string();
-    assert!(
-        !text.contains("特休假依年資計算"),
-        "content must not be on the card"
-    );
+    // The full content waits in the sidecar; the card carries only a
+    // bounded preview for the approver (review decision on PR #181).
+    assert_eq!(rec.payload["preview"], "請假規定：特休假依年資計算。");
+    assert!(rec.payload.get("content").is_none());
     assert_eq!(
         rec.payload["content_sha256"],
         duduclaw_knowledge::sha256_hex("請假規定：特休假依年資計算。".as_bytes())
@@ -208,38 +209,82 @@ async fn text_and_url_proposals_and_duplicates() {
 }
 
 #[test]
-fn only_attachment_directories_are_allowed() {
+fn only_the_employees_own_attachments_are_allowed() {
     let f = fx();
     let h = f.home.path();
     let agent_dir = h.join("agents").join("hr-bot");
-    assert!(attachment_path_allowed(h, &agent_dir, &f.file).is_some());
+    assert!(own_attachment_path(&agent_dir, &f.file).is_some());
     let outside = h.join("secret.txt");
     std::fs::write(&outside, "x").unwrap();
-    assert!(attachment_path_allowed(h, &agent_dir, &outside).is_none());
+    assert!(own_attachment_path(&agent_dir, &outside).is_none());
     let traversal = agent_dir.join("attachments").join("..").join("agent.toml");
-    assert!(attachment_path_allowed(h, &agent_dir, &traversal).is_none());
+    assert!(own_attachment_path(&agent_dir, &traversal).is_none());
     #[cfg(unix)]
     {
         let link = agent_dir.join("attachments").join("link.txt");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
-        assert!(attachment_path_allowed(h, &agent_dir, &link).is_none());
+        assert!(own_attachment_path(&agent_dir, &link).is_none());
     }
+    // The shared attachments folder holds other people's files.
+    let shared = h.join("attachments");
+    std::fs::create_dir_all(&shared).unwrap();
+    let theirs = shared.join("a.txt");
+    std::fs::write(&theirs, "x").unwrap();
+    assert!(own_attachment_path(&agent_dir, &theirs).is_none());
     // Another employee's attachments are not this employee's.
     let other = h.join("agents").join("other").join("attachments");
     std::fs::create_dir_all(&other).unwrap();
     let theirs = other.join("a.txt");
     std::fs::write(&theirs, "x").unwrap();
-    assert!(attachment_path_allowed(h, &agent_dir, &theirs).is_none());
+    assert!(own_attachment_path(&agent_dir, &theirs).is_none());
 }
 
-#[test]
-fn old_sidecars_are_swept() {
+#[tokio::test]
+async fn cards_show_a_preview_and_waiting_files_are_cleaned() {
     let f = fx();
-    let dir = sidecar_dir(f.home.path());
-    std::fs::create_dir_all(&dir).unwrap();
-    let fresh = dir.join(format!("{}.bin", "a".repeat(32)));
-    std::fs::write(&fresh, "x").unwrap();
-    assert_eq!(sweep_sidecars(f.home.path()), 0);
-    assert!(fresh.exists());
+    let (broker, id) = file_one(&f).await;
+    let rec = broker.get(&id).await.unwrap().unwrap();
+    assert_eq!(rec.payload["preview"], "請假規定：特休假依年資計算。");
+    assert_eq!(rec.payload["requester_kind"], "system");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(sidecar_dir(f.home.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+    // A waiting file of a live card is kept; an orphan is removed once old.
+    let orphan = sidecar_dir(f.home.path()).join(format!("{}.bin", "a".repeat(32)));
+    std::fs::write(&orphan, "x").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&orphan)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    assert_eq!(
+        super::super::add_source_guard::sweep_unreferenced(f.home.path()).await,
+        1
+    );
+    let staged = rec.payload["staged"].as_str().unwrap();
+    assert!(sidecar_path(f.home.path(), staged).unwrap().exists());
     assert!(sidecar_path(f.home.path(), "../../etc").is_none());
+}
+
+#[tokio::test]
+async fn pending_cards_are_capped() {
+    let f = fx();
+    for i in 0..super::super::add_source_guard::MAX_PENDING_PER_PROPOSER {
+        let p = proposal(&f, Content::Text(format!("規定第 {i} 條")));
+        assert!(matches!(
+            propose(f.home.path(), p).await.unwrap(),
+            Proposed::Filed { .. }
+        ));
+    }
+    let p = proposal(&f, Content::Text("再一條".into()));
+    let err = propose(f.home.path(), p).await.unwrap_err();
+    assert_eq!(err.code(), "quota_proposals");
 }

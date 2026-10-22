@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 use duduclaw_memory::{ForgetSelector, PlanOptions, PlanOutcome, SqliteMemoryEngine};
 use serde::Serialize;
 
+/// Most forget requests one deletion files; the rest are reported as
+/// skipped (an Admin can plan them from the command line).
+pub const MAX_FORGET_CARDS: usize = 20;
+
 /// One filed plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FiledPlan {
@@ -36,6 +40,8 @@ pub struct ForgetSummary {
     pub nothing_to_forget: usize,
     /// zh-TW reasons for groups that could not be planned.
     pub failed: Vec<String>,
+    /// Conversations over [`MAX_FORGET_CARDS`], not planned.
+    pub skipped: usize,
 }
 
 /// The cited turns of `source_id`, grouped by (employee, session), as
@@ -106,6 +112,7 @@ pub async fn plan_for_source(
     };
     let mut out = ForgetSummary {
         conversations: groups.len(),
+        skipped: groups.len().saturating_sub(MAX_FORGET_CARDS),
         ..Default::default()
     };
     if groups.is_empty() {
@@ -118,7 +125,7 @@ pub async fn plan_for_source(
             return out;
         }
     };
-    for ((agent, session), keys) in groups {
+    for ((agent, session), keys) in groups.into_iter().take(MAX_FORGET_CARDS) {
         let selector = ForgetSelector {
             session: session.clone(),
             messages: keys,

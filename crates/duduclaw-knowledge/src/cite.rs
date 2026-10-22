@@ -90,8 +90,56 @@ pub fn normalize_markers(text: &str) -> String {
     out
 }
 
+/// Split `text` into `(is_code, part)` runs: fenced blocks (```` ``` ````)
+/// and inline code (`` `…` ``, within one line) are code.
+fn code_runs(text: &str) -> Vec<(bool, String)> {
+    let mut runs: Vec<(bool, String)> = Vec::new();
+    let push = |code: bool, c: char, runs: &mut Vec<(bool, String)>| match runs.last_mut() {
+        Some((k, s)) if *k == code => s.push(c),
+        _ => runs.push((code, c.to_string())),
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let (mut fence, mut inline_code) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' && chars.get(i + 1) == Some(&'`') && chars.get(i + 2) == Some(&'`') {
+            // The fence markers belong to the code run.
+            if !fence {
+                fence = true;
+                inline_code = false;
+                for _ in 0..3 {
+                    push(true, '`', &mut runs);
+                }
+            } else {
+                for _ in 0..3 {
+                    push(true, '`', &mut runs);
+                }
+                fence = false;
+            }
+            i += 3;
+            continue;
+        }
+        let c = chars[i];
+        if !fence && c == '`' {
+            inline_code = !inline_code;
+            push(true, c, &mut runs);
+            i += 1;
+            continue;
+        }
+        if c == '\n' {
+            inline_code = false;
+        }
+        push(fence || inline_code, c, &mut runs);
+        i += 1;
+    }
+    runs
+}
+
 /// Find citation markers. `offered` = the numbers this turn offered; empty
-/// ⇒ the text is returned unchanged (no knowledge was used).
+/// ⇒ the text is returned unchanged (no knowledge was used). Markers inside
+/// inline code or fenced blocks are never touched (`list[2]`). Outside code
+/// an offered number is cited, a number above the offered range (or 0) is
+/// removed, anything else is left as written.
 pub fn parse_citations(text: &str, offered: &[u32]) -> ParsedCitations {
     if offered.is_empty() {
         return ParsedCitations {
@@ -99,46 +147,66 @@ pub fn parse_citations(text: &str, offered: &[u32]) -> ParsedCitations {
             ..Default::default()
         };
     }
-    let norm = normalize_markers(text);
-    let chars: Vec<char> = norm.chars().collect();
-    let mut out = String::with_capacity(norm.len());
+    let max = offered.iter().copied().max().unwrap_or(0);
+    let mut out = String::with_capacity(text.len());
     let mut cited = Vec::new();
     let mut invalid = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '[' {
-            let mut j = i + 1;
-            while j < chars.len() && j - i <= 3 && chars[j].is_ascii_digit() {
-                j += 1;
-            }
-            let len = j - i - 1;
-            let is_link = chars.get(j + 1) == Some(&'(');
-            if (1..=2).contains(&len) && chars.get(j) == Some(&']') && !is_link {
-                let n: u32 = chars[i + 1..j]
-                    .iter()
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0);
-                if n >= 1 && offered.contains(&n) {
-                    if !cited.contains(&n) {
-                        cited.push(n);
-                    }
-                    out.push_str(&format!("[{n}]"));
-                } else if !invalid.contains(&n) {
-                    invalid.push(n);
-                }
-                i = j + 1;
-                continue;
-            }
+    for (code, run) in code_runs(text) {
+        if code {
+            out.push_str(&run);
+            continue;
         }
-        out.push(chars[i]);
-        i += 1;
+        let norm = normalize_markers(&run);
+        let chars: Vec<char> = norm.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '[' {
+                let mut j = i + 1;
+                while j < chars.len() && j - i <= 3 && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let len = j - i - 1;
+                let is_link = chars.get(j + 1) == Some(&'(');
+                if (1..=2).contains(&len) && chars.get(j) == Some(&']') && !is_link {
+                    let n: u32 = chars[i + 1..j]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(0);
+                    if offered.contains(&n) {
+                        if !cited.contains(&n) {
+                            cited.push(n);
+                        }
+                        out.push_str(&format!("[{n}]"));
+                        i = j + 1;
+                        continue;
+                    }
+                    if n == 0 || n > max {
+                        if !invalid.contains(&n) {
+                            invalid.push(n);
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
     }
     ParsedCitations {
-        text: tidy_spaces(&out),
+        text: tidy_spaces_outside_code(&out),
         cited,
         invalid,
     }
+}
+
+/// [`tidy_spaces`] on the prose runs only (code keeps its spacing).
+fn tidy_spaces_outside_code(s: &str) -> String {
+    code_runs(s)
+        .into_iter()
+        .map(|(code, run)| if code { run } else { tidy_spaces(&run) })
+        .collect()
 }
 
 /// Collapse the double spaces a removed marker can leave behind.
@@ -223,6 +291,21 @@ pub fn inline(s: &str, max: usize) -> String {
     }
 }
 
+/// [`inline`] for text a messaging app may parse as a mention or a link:
+/// `@` and `<` `>` become their full-width forms, so a document title like
+/// `@everyone`, `<!channel>` or `<@123>` is shown, never acted on.
+pub fn inline_for_channel(s: &str, max: usize) -> String {
+    inline(s, max)
+        .chars()
+        .map(|c| match c {
+            '@' => '＠',
+            '<' => '＜',
+            '>' => '＞',
+            c => c,
+        })
+        .collect()
+}
+
 /// Largest footer (characters) per messaging channel, leaving the platform's
 /// message limit to the answer itself (Discord 2 000, Telegram 4 096,
 /// LINE 5 000 per message).
@@ -247,10 +330,10 @@ pub fn render_footer(cited: &[CitationRef], cap: usize) -> Option<String> {
         let mut entry = format!(
             "\n[{}] {} {}",
             c.n,
-            inline(&c.title, 60),
-            inline(&c.locator, 40)
+            inline_for_channel(&c.title, 60),
+            inline_for_channel(&c.locator, 40)
         );
-        let ex = inline(&c.excerpt, EXCERPT_CHARS + 1);
+        let ex = inline_for_channel(&c.excerpt, EXCERPT_CHARS + 1);
         if !ex.is_empty() {
             entry.push_str(&format!("\n「{ex}」"));
         }
@@ -352,6 +435,34 @@ mod tests {
         let tiny = render_footer(&list, 40).unwrap_or_default();
         assert!(tiny.chars().count() <= 40);
         assert!(render_footer(&[], 1_000).is_none());
+    }
+
+    #[test]
+    fn code_is_never_touched() {
+        let p = parse_citations(
+            "用 `list[2]` 取值[1]，見[9]\n```\nlet a = b[3];\n```\n結尾 [3]",
+            &[1],
+        );
+        assert_eq!(
+            p.text,
+            "用 `list[2]` 取值[1]，見\n```\nlet a = b[3];\n```\n結尾 "
+        );
+        assert_eq!(p.cited, vec![1]);
+        assert_eq!(p.invalid, vec![9, 3]);
+        // A number inside the offered range that was not offered stays.
+        let p = parse_citations("見 [2] 與 [1]", &[1, 3]);
+        assert_eq!(p.text, "見 [2] 與 [1]");
+        assert!(p.invalid.is_empty());
+    }
+
+    #[test]
+    fn footer_titles_cannot_mention() {
+        let f = render_footer(&[cref(1, "@everyone <!channel> <@123>", "@here")], 1_000).unwrap();
+        assert!(
+            !f.contains('@') && !f.contains('<') && !f.contains('>'),
+            "{f}"
+        );
+        assert!(f.contains("＠everyone ＜!channel＞ ＜＠123＞"));
     }
 
     #[test]

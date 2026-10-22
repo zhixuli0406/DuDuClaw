@@ -161,6 +161,9 @@ pub async fn save_attachment_in_base(
     filename: &str,
 ) -> Result<std::path::PathBuf, String> {
     let path = save_attachment_in_base_untracked(base_dir, data, filename).await?;
+    // The 「加入知識庫」 chat command accepts only files saved here (an
+    // inbound adapter), claimed by the message that carries them.
+    crate::knowledge::chat_attachments::note_saved(&path, filename);
     crate::artifacts::record_saved(
         base_dir,
         &path,

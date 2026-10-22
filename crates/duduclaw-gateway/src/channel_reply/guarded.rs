@@ -78,8 +78,11 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     let delivery = Arc::new(CcrTurnDelivery::default());
     let answered: Arc<std::sync::Mutex<Option<crate::trigger_route::AnsweredBy>>> =
         Arc::new(std::sync::Mutex::new(None));
-    // Document knowledge base: the person this turn is for (resolved once,
-    // before any runtime call) and the sources the reply cites.
+    // Document knowledge base: attachments the adapter saved for this
+    // message belong to this conversation and sender (first claim wins);
+    // the person this turn is for (resolved once, before any runtime call)
+    // and the sources the reply cites.
+    crate::knowledge::chat_attachments::claim_in_text(session_id, user_id, text);
     let requester =
         crate::knowledge::requester_map::requester_for_reply(&ctx.home_dir, session_id, user_id)
             .await;

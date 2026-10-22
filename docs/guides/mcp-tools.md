@@ -460,8 +460,9 @@ theirs), so `[n]` in the answer points at the same passage the reader can open.
 
 `knowledge_add_source` (scope `knowledge:write`, also not grantable to external keys)
 proposes a document for a collection on the employee's own side: `collection` plus exactly
-one of `path` (a file in the employee's `attachments/` or `<home>/attachments/`), `url` or
-`text`, and an optional `title`. It never adds anything itself: it files a
+one of `path` (a file in the employee's own `attachments/`), `url` or `text`, and an
+optional `title`. It refuses in a public visitor's, an unbound sender's or an unregistered
+turn, and when too many of the employee's cards are waiting. It never adds anything itself: it files a
 `knowledge_add_source` card that only an Admin or the collection's editor can decide, in the
 dashboard, and answers with the card id. There is no exemption, for any caller.
 

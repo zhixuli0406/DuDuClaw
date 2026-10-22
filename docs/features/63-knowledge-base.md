@@ -59,9 +59,10 @@ For an AI employee answering someone, the intersection of:
    | WebChat, signed-in dashboard account | that account (never taken from the session id) | user, department, Admin: all |
    | messaging app (LINE, Telegram, …), sender with a **verified** channel binding to an active account | that account | user, department, plus the chat's `channel` grants |
    | messaging app, any other sender | nobody | `channel` grants only |
-   | public WebChat widget visitor, Odoo website Live Chat visitor | nobody | `channel:widget` / `channel:odoolivechat` grants only, never 1:1 |
-   | cron and dispatched runs (sub-employees, goal rounds) | nobody (system turn) | public and internal collections granted to the employee |
-   | a tool call whose turn and run the gateway did not register | nobody | none |
+   | public WebChat widget visitor, Odoo website Live Chat visitor | nobody | `public` collections granted to `channel:widget` / `channel:odoolivechat` only (an internal collection granted to these channels is still not readable), never 1:1 |
+   | cron runs, and dispatched runs with no upstream turn (goal rounds, dashboard work) | nobody (system turn) | public and internal collections granted to the employee |
+   | a run dispatched from a channel or WebChat turn (an employee asked another one) | the upstream turn's person | that person's grants outside a 1:1 conversation; for an unbound sender or visitor, that channel's grants only. Delegation never widens access; an upstream turn the gateway no longer remembers (restart, over 24 hours) reads nothing |
+   | a tool call whose turn and run the gateway did not register, or a reply turn from an unrecognised session | nobody | none |
 
 3. **Sensitivity.** Collections are `public`, `internal` (default), `personal` or `restricted`. Outside a 1:1 conversation (group chats, and every turn whose privacy cannot be proven) `personal` and `restricted` collections are excluded.
 
@@ -168,12 +169,14 @@ Every lookup writes an access-log row (`auto_inject`).
 
 ### Citations
 
-After the reply, `[n]` markers (full-width 【1】 and ［1］ are accepted) are matched against what the turn offered; a number that was never offered is removed. The stored reply has no footer; the cited sources are added only when the reply is sent:
+After the reply, `[n]` markers (full-width 【1】 and ［1］ are accepted) are matched against what the turn offered; a number above the offered range is removed. Markers inside inline code or code blocks (`list[2]`) are never touched. The stored reply has no footer; the cited sources are added only when the reply is sent:
 
 - **WebChat**: the `assistant_done` frame carries `citations: [{n, chunk_id, source_id, title, locator, excerpt}]`. Markers become buttons that open the passage with its surrounding text (permissions are checked again on every open), and a 「來源」 list sits under the message. Reopening a conversation restores them through `knowledge.citations.for_session`; a deleted source keeps its title and says so, a source the viewer may no longer read shows neither title nor excerpt.
 - **LINE, Telegram, Discord, Slack and other messaging apps**: a plain-text footer after the answer, at most five cited sources, each `[n] title location` plus a one-line excerpt (the sentence that best matches the question, 40 characters), kept within a per-channel length cap (Discord 600 characters, LINE / Telegram / Slack / WhatsApp 1,200, others 1,000). Long replies still go through the channel's normal splitting, so the footer ends up in the last message.
 
-Each turn's offered and cited passages are kept in `turn_citations` (title, location and a short excerpt; no passage text).
+Each turn's offered and cited passages are kept in `turn_citations` (title, location and a short excerpt; no passage text). Deleting a source (or its collection) blanks the title, location and excerpt of its rows; the ids stay for forget by source. Titles, locations and excerpts in footers have `@`, `<` and `>` replaced by their full-width forms, so a document named `@everyone` or `<!channel>` mentions nobody.
+
+In a group chat a bound sender's own and department collections can be quoted: the answer and its footer (title, location, one-line excerpt) are visible to everyone in that group. Personal and restricted collections are never used there.
 
 ## For AI employees
 
@@ -184,7 +187,7 @@ Four MCP tools. The three read-only ones use scope `knowledge:read`, `knowledge_
 | `knowledge_search` | `query`, `collections` (slugs, narrowing only), `limit` (1–20, default 5) | `[n] title · location (collection) chunk_id=…` with the passage text, marked as document content |
 | `knowledge_get_passage` | `chunk_id`, `context` (0–2) | the passage with the text before and after it |
 | `knowledge_list_collections` | — | the collections this turn may read, with source and passage counts |
-| `knowledge_add_source` | `collection` (slug), exactly one of `path` (a file in the employee's own `attachments/` or the shared `<home>/attachments/`), `url`, `text`; `title` | an approval card id; nothing is added until a person approves it |
+| `knowledge_add_source` | `collection` (slug), exactly one of `path` (a file in the employee's own `attachments/`), `url`, `text`; `title` | an approval card id; nothing is added until a person approves it |
 
 They exist for an employee only while at least one collection is on its side (granted to it or its department, narrowed by its `[knowledge]` section) and the knowledge base is enabled; the listing and the call use the same check, and granting or revoking a collection updates an open session (`notifications/tools/list_changed`). Results put every passage, collection name and description inside a marked block whose lines start with `│ `, so text inside a document cannot pass for a result header or end the block. The tools call the gateway over its signed loopback route; when the gateway is down they report that and never read the database directly.
 
@@ -192,14 +195,14 @@ They exist for an employee only while at least one collection is on its side (gr
 
 Two ways to add a document from outside the dashboard, both **always** approval-gated (there is no setting that skips it):
 
-- An employee calls `knowledge_add_source` for a collection on its own side.
-- A person types 「加入知識庫 <collection slug>」 in a chat. The files attached to that message are proposed, or, when it has none, the files the same sender attached in that conversation during the last 30 minutes (at most five). Only a signed-in WebChat account or a messaging-app sender with a verified binding who can read the collection may propose; a missing collection and one the person cannot read get the same answer.
+- An employee calls `knowledge_add_source` for a collection on its own side. `path` must be a file in that employee's own `attachments/` folder. The turn must be for a signed-in person, a sender with a verified binding, or a system run; in a visitor's, an unbound sender's or an unregistered turn the tool refuses.
+- A person types 「加入知識庫 <collection slug>」 in a chat. The files the channel adapter saved for that sender in that conversation are proposed: those attached to the message, or, when it has none, the ones the same sender attached there during the last 30 minutes (at most five). A file reference typed into a message names nothing, and the card uses the stored file name. After a gateway restart earlier attachments are not accepted; send the file again. Only a signed-in WebChat account or a messaging-app sender with a verified binding who can read the collection may propose; a missing collection and one the person cannot read get the same answer.
 
-The card (`knowledge_add_source`) is decided only in the dashboard, only by an Admin or a person who is editor or owner of that collection at the moment of the decision; channel buttons and replies are refused. The card carries the collection, title, size and the content's SHA-256, never the content: the content waits in a separate file under `<home>/knowledge/proposals/`. Approving re-hashes that file; if it changed since filing the card is closed as denied and nothing is ingested. An approved proposal becomes a normal ingest job; a denied or expired one deletes the waiting file. Cards expire after three days. Admins and Managers see these cards in the approvals inbox; any collection editor (an Employee included) can list and decide the cards of their collections with `knowledge.proposals.list` and `knowledge.proposals.decide {id, approve}` (the Document library pages do not show them yet; this is RPC only for now).
+The card (`knowledge_add_source`) is decided only in the dashboard, only by an Admin or a person who is editor or owner of that collection at the moment of the decision; channel buttons and replies are refused. The card carries the collection, title, size, the content's SHA-256, who asked (the turn's kind of person and channel) and, for plain text, Markdown, CSV and HTML, the first 2,000 characters as a preview (shown as text; binary files show name, type and size). The content waits in a separate owner-only file under `<home>/knowledge/proposals/`; files no pending card refers to are removed. At most 20 cards may wait per employee and 10 per proposer. Approving re-hashes that file; if it changed since filing the card is closed as denied and nothing is ingested. An approved proposal becomes a normal ingest job; a denied or expired one deletes the waiting file. Cards expire after three days. Admins and Managers see these cards in the approvals inbox; any collection editor (an Employee included) can list and decide the cards of their collections with `knowledge.proposals.list` and `knowledge.proposals.decide {id, approve}` (the Document library pages do not show them yet; this is RPC only for now). The approvals inbox shows these cards only to Admins and to editors of that collection. An editor may approve a card they proposed themselves from a chat; that is the same as uploading the file in the dashboard, and the card and the source keep who proposed and who approved.
 
 ## Forgetting what employees learned from a document
 
-`knowledge.sources.delete` with `also_forget_memories: true` looks up the conversations whose replies **cited** the source and files one forget-by-source plan per employee and conversation, covering those turns' messages. Each plan waits for the existing Admin-only dashboard approval and is applied afterwards with `duduclaw memory forget-source apply`. This is coarse on purpose: it forgets everything those turns taught the employee, not only what came from the document. Passages that were offered but not cited are not included.
+`knowledge.sources.delete` with `also_forget_memories: true` looks up the conversations whose replies **cited** the source and files one forget-by-source plan per employee and conversation (at most 20 per deletion; the rest are reported as skipped), covering those turns' messages. The plans are filed only after the deletion succeeded. Each plan waits for the existing Admin-only dashboard approval and is applied afterwards with `duduclaw memory forget-source apply`. This is coarse on purpose: it forgets everything those turns taught the employee, not only what came from the document. Passages that were offered but not cited are not included.
 
 ## Audit
 

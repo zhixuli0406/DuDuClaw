@@ -6,7 +6,9 @@
 //!
 //! Only a person the gateway can name may propose: a signed-in WebChat
 //! account or a messaging-app sender with a verified binding, who can at
-//! least read the collection. A missing collection and one the person may
+//! least read the collection. Only files the channel adapter itself saved
+//! for that sender in that conversation count; a file reference typed into
+//! a message names nothing, and the card shows the stored file name. A missing collection and one the person may
 //! not read get the same answer.
 
 use std::path::{Path, PathBuf};
@@ -112,8 +114,12 @@ pub struct Command<'a> {
     pub home: &'a Path,
     pub users: Option<std::sync::Arc<duduclaw_auth::db::UserDb>>,
     pub agent_id: &'a str,
-    pub agent_dir: &'a Path,
     pub requester: RequesterIdentity,
+    /// The conversation and the sender's platform id: only files the
+    /// channel adapter saved for this sender here are accepted
+    /// ([`super::chat_attachments`]).
+    pub session_id: &'a str,
+    pub sender: &'a str,
     pub slug: String,
     /// Attachments of this message, else recent ones of the same sender.
     pub attachments: Vec<AttachmentRef>,
@@ -127,7 +133,15 @@ pub async fn handle(cmd: Command<'_>) -> String {
     let Some(user_id) = account(&cmd.requester) else {
         return NEED_BINDING.to_string();
     };
-    if cmd.attachments.is_empty() {
+    // Only files the adapter saved for this sender in this conversation;
+    // a reference typed into a message names nothing.
+    let attachments: Vec<(std::path::PathBuf, String)> = cmd
+        .attachments
+        .iter()
+        .filter_map(|a| super::chat_attachments::owned(cmd.session_id, cmd.sender, &a.path))
+        .take(MAX_FILES)
+        .collect();
+    if attachments.is_empty() {
         return NO_FILE.to_string();
     }
     let (home, slug, users, uid) = (
@@ -169,21 +183,20 @@ pub async fn handle(cmd: Command<'_>) -> String {
         }
     };
     let mut lines = Vec::new();
-    for a in cmd.attachments.iter().take(MAX_FILES) {
-        let Some(real) = approval::attachment_path_allowed(cmd.home, cmd.agent_dir, &a.path) else {
-            lines.push(format!("「{}」：找不到這個附件檔案。", a.name));
-            continue;
-        };
+    for (real, name) in attachments {
         let proposal = Proposal {
             agent_id: cmd.agent_id.to_string(),
             collection_id: collection_id.clone(),
-            title: Some(a.name.clone()),
+            // The name the adapter stored, never text from the message.
+            title: Some(name.clone()),
             content: Content::File {
                 path: real,
-                name: a.name.clone(),
+                name: name.clone(),
             },
             proposed_by: format!("user:{user_id}"),
             via: "chat",
+            requester_kind: cmd.requester.kind().to_string(),
+            requester_channel: cmd.requester.channel().map(str::to_string),
             origin: origin(&cmd.requester),
         };
         lines.push(match approval::propose(cmd.home, proposal).await {
@@ -194,7 +207,7 @@ pub async fn handle(cmd: Command<'_>) -> String {
             Ok(Proposed::Duplicate { title }) => {
                 format!("「{title}」已經在「{collection_name}」裡，不需要再加入。")
             }
-            Err(e) => format!("「{}」沒有送出：{}", a.name, e.public_message()),
+            Err(e) => format!("「{name}」沒有送出：{}", e.public_message()),
         });
     }
     lines.join("\n")
@@ -205,7 +218,6 @@ pub async fn handle(cmd: Command<'_>) -> String {
 pub async fn run_in_turn(
     ctx: &crate::channel_reply::ReplyContext,
     agent_id: &str,
-    agent_dir: &Path,
     session_id: &str,
     sender: &str,
     text: &str,
@@ -221,8 +233,9 @@ pub async fn run_in_turn(
         home: &ctx.home_dir,
         users: None,
         agent_id,
-        agent_dir,
         requester: super::turn_requesters::current_requester(),
+        session_id,
+        sender,
         slug,
         attachments,
     })
