@@ -188,12 +188,13 @@ async fn stale_claims_never_widen_and_unknown_users_are_refused() {
 }
 
 #[tokio::test]
-async fn a_database_read_error_narrows_to_no_access() {
+async fn a_database_read_error_refuses_the_call_and_is_counted() {
     let f = fixture().await;
     let boss = person(&f.db, "boss", UserRole::Admin);
     f.db.bind_agent(&boss, "sales", AccessLevel::Owner).unwrap();
     let ctx = handshake_ctx(&boss, UserRole::Admin, &[("sales", AccessLevel::Owner)]);
     ok_payload(&f.handler.handle("users.list", json!({}), &ctx).await);
+    let (failures_before, _) = crate::handlers::live_context::read_failure_stats();
 
     // Break the bindings table behind the gateway's back.
     let raw = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
@@ -205,12 +206,19 @@ async fn a_database_read_error_narrows_to_no_access() {
     .unwrap();
     drop(raw);
 
-    assert_eq!(
-        error_of(&f.handler.handle("users.list", json!({}), &ctx).await),
-        json!("permission denied"),
-        "narrowed to Employee"
-    );
-    assert!(listed_agents(&f.handler.handle("agents.list", json!({}), &ctx).await).is_empty());
+    // Nothing from the token is reused: not the role, not the bindings, and
+    // not even the self-service allowlist (the store cannot prove the
+    // forced-password-change flag is clear).
+    for method in ["users.list", "agents.list", "users.me", "ping"] {
+        assert_eq!(
+            error_of(&f.handler.handle(method, json!({}), &ctx).await),
+            json!("authentication service unavailable"),
+            "{method}"
+        );
+    }
+    let (failures_after, last) = crate::handlers::live_context::read_failure_stats();
+    assert!(failures_after >= failures_before + 4, "{failures_before} → {failures_after}");
+    assert!(last > 0);
 }
 
 #[tokio::test]
@@ -288,11 +296,12 @@ fn the_cache_is_keyed_by_generation() {
     assert_eq!(fresh.acl_generation, db.acl_generation().unwrap());
 
     // An unreadable generation bypasses the cache instead of trusting it,
-    // and the read failure that follows narrows.
+    // and the read failure that follows refuses.
     raw.execute("DELETE FROM auth_meta", []).unwrap();
-    let narrowed = resolve_live_context(&db, &cache, &jwt).unwrap();
-    assert!(narrowed.agent_access.is_empty());
-    assert_eq!(narrowed.role, UserRole::Employee);
+    assert_eq!(
+        resolve_live_context(&db, &cache, &jwt).unwrap_err(),
+        "authentication service unavailable"
+    );
 }
 
 #[test]
@@ -401,6 +410,14 @@ async fn users_rpcs_return_coded_manager_errors() {
     );
     assert!(f.db.get_user_by_email("x@test.invalid").unwrap().is_none(), "no half-created account");
 
+    // A refused manager in a request that also renames: nothing applies.
+    let refused = f
+        .handler
+        .handle("users.update", json!({"user_id": mgr, "display_name": "renamed", "manager_user_id": lead}), &admin)
+        .await;
+    assert_eq!(error_of(&refused)["code"], json!("manager_cycle"));
+    assert_eq!(f.db.get_user(&mgr).unwrap().unwrap().display_name, "mgr");
+
     // Demotion with a direct report: refused, and nothing else in the
     // request applies.
     let refused = f
@@ -471,4 +488,98 @@ async fn manager_fields_stay_behind_the_edition_gate() {
     assert_eq!(error_of(&frame)["code"], json!(ENTERPRISE_ONLY_ERROR_CODE));
     // agents.list is not edition-gated and still answers (live) in Personal.
     ok_payload(&f.handler.handle("agents.list", json!({}), &admin).await);
+}
+
+// ── latency (H1): run with `--ignored --nocapture` ──────────────────
+
+fn percentile(sorted: &[std::time::Duration], p: f64) -> std::time::Duration {
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx]
+}
+
+/// N cheap RPCs (`ping`, which still pays the live identity read) on a
+/// two-worker runtime while two logins hash passwords in a loop. `inline`
+/// reproduces the old login handler (argon2 on a runtime worker); the other
+/// mode is the current one (blocking pool). Prints p50 / p95 / max.
+async fn rpc_latency_under_logins(mode: &str, rpcs: usize) -> (std::time::Duration, std::time::Duration, std::time::Duration) {
+    let f = fixture().await;
+    let emp = person(&f.db, "emp", UserRole::Employee);
+    f.db.bind_agent(&emp, "sales", AccessLevel::Owner).unwrap();
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut logins = Vec::new();
+    if mode != "none" {
+        for _ in 0..2 {
+            let db = f.db.clone();
+            let stop = stop.clone();
+            let inline = mode == "inline";
+            logins.push(tokio::spawn(async move {
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if inline {
+                        let _ = db.verify_password("emp@test.invalid", "isolated-test-password");
+                    } else {
+                        let db = db.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            db.verify_password("emp@test.invalid", "isolated-test-password")
+                        })
+                        .await;
+                    }
+                    n += 1;
+                    tokio::task::yield_now().await;
+                }
+                n
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // The RPC loop runs as a spawned task, i.e. on the same two runtime
+    // workers the login tasks use, and paces itself so the run overlaps many
+    // password hashes. Every 10th call follows a binding change, so it pays
+    // the full live rebuild instead of a cache hit.
+    let handler = Arc::new(f.handler);
+    let rpc_task = {
+        let handler = handler.clone();
+        let db = f.db.clone();
+        let emp = emp.clone();
+        tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(rpcs);
+            for i in 0..rpcs {
+                if i % 10 == 0 {
+                    let db = db.clone();
+                    let emp = emp.clone();
+                    tokio::task::spawn_blocking(move || db.bind_agent(&emp, "hr", AccessLevel::Viewer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                let t = std::time::Instant::now();
+                let frame = handler.handle("ping", json!({}), &ctx).await;
+                samples.push(t.elapsed());
+                ok_payload(&frame);
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            samples
+        })
+    };
+    let mut samples = rpc_task.await.unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut hashed = 0;
+    for l in logins {
+        hashed += l.await.unwrap();
+    }
+    samples.sort();
+    let (p50, p95, max) = (percentile(&samples, 0.5), percentile(&samples, 0.95), *samples.last().unwrap());
+    println!("mode={mode:<8} rpcs={rpcs} logins_hashed={hashed} p50={p50:?} p95={p95:?} max={max:?}");
+    (p50, p95, max)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "latency measurement; run explicitly"]
+async fn live_acl_latency_with_two_concurrent_logins() {
+    let n = 300;
+    rpc_latency_under_logins("none", n).await;
+    let (_, p95, _) = rpc_latency_under_logins("blocking", n).await;
+    rpc_latency_under_logins("inline", n).await;
+    assert!(p95 < std::time::Duration::from_millis(250), "p95 {p95:?} with logins on the blocking pool");
 }

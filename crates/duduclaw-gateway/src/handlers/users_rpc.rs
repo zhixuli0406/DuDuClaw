@@ -96,35 +96,34 @@ impl MethodHandler {
             }
         }
 
-        // Optional direct manager. Checked before the insert so a refused
-        // manager does not leave a half-created account behind;
-        // `set_manager` checks again inside its own transaction.
+        // Optional direct manager: created in the same transaction as the
+        // account, so a refused manager leaves no account behind.
         let manager = match parse_manager_change(&params) {
             Ok(change) => change.target().map(str::to_string),
             Err(frame) => return frame,
         };
-        if let Some(m) = &manager {
-            if let Err(e) = db.check_manager_for_new_user(m) {
-                return org_error_frame(&e);
-            }
-        }
 
-        match db.create_user(email, display_name, password, role) {
-            Ok(mut user) => {
-                if let Some(d) = department {
-                    if let Err(e) = db.set_department(&user.id, Some(d)) {
-                        return WsFrame::error_response(
-                            "",
-                            &format!("user created but setting department failed: {e}"),
-                        );
-                    }
-                    user.department = Some(d.to_string());
-                }
+        // Argon2 + SQLite: off the runtime workers.
+        let created = {
+            let db = db.clone();
+            let (email, display_name, password) =
+                (email.to_string(), display_name.to_string(), password.to_string());
+            let (department, manager) = (department.map(str::to_string), manager.clone());
+            tokio::task::spawn_blocking(move || {
+                db.create_user_with(&duduclaw_auth::NewUser {
+                    email: &email,
+                    display_name: &display_name,
+                    password: &password,
+                    role,
+                    department: department.as_deref(),
+                    manager: manager.as_deref(),
+                })
+            })
+            .await
+        };
+        match created {
+            Ok(Ok(user)) => {
                 if let Some(m) = &manager {
-                    if let Err(e) = db.set_manager(&user.id, Some(m)) {
-                        return org_error_frame(&e);
-                    }
-                    user.manager_user_id = Some(m.clone());
                     let _ = db.log_action(
                         Some(&ctx.user_id),
                         "user.set_manager",
@@ -142,7 +141,9 @@ impl MethodHandler {
                 );
                 WsFrame::ok_response("", json!({ "user": user }))
             }
-            Err(e) => WsFrame::error_response("", &format!("failed to create user: {e}")),
+            Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
+            Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => WsFrame::error_response("", &e),
+            Err(_) => WsFrame::error_response("", "failed to create user"),
         }
     }
 
@@ -200,46 +201,54 @@ impl MethodHandler {
             Ok(change) => change,
             Err(frame) => return frame,
         };
-        // Demotion guard first, so a refused demotion changes nothing else
-        // in this request (`update_user` checks again atomically).
-        if role == Some(UserRole::Employee) {
-            match db.manager_has_reports(user_id) {
-                Ok(false) => {}
-                Ok(true) => return org_error_frame(&duduclaw_auth::OrgError::HasReports),
-                Err(e) => return org_error_frame(&duduclaw_auth::OrgError::Db(e)),
-            }
-        }
-        if manager_change != ManagerChange::Unchanged {
-            let target = manager_change.target();
-            if let Err(e) = db.set_manager(user_id, target) {
-                return org_error_frame(&e);
-            }
-            let _ = db.log_action(
-                Some(&ctx.user_id),
-                "user.set_manager",
-                Some(user_id),
-                Some(&format!("manager={}", target.unwrap_or("none"))),
-                None,
-            );
-        }
 
-        match db.update_user(user_id, display_name, role, password) {
-            Err(e) if e == duduclaw_auth::org::MANAGER_HAS_REPORTS => {
-                org_error_frame(&duduclaw_auth::OrgError::HasReports)
-            }
-            Ok(()) => {
-                if let Some(dept) = department_change {
-                    if let Err(e) = db.set_department(user_id, dept.as_deref()) {
-                        return WsFrame::error_response(
-                            "",
-                            &format!("failed to update department: {e}"),
-                        );
-                    }
+        // Every field of this request commits together or not at all: a
+        // refused manager or demotion leaves the name, password and
+        // department as they were.
+        let applied = {
+            let db = db.clone();
+            let user_id = user_id.to_string();
+            let display_name = display_name.map(str::to_string);
+            let password = password.map(str::to_string);
+            let manager_change = manager_change.clone();
+            tokio::task::spawn_blocking(move || {
+                let manager = match &manager_change {
+                    ManagerChange::Unchanged => None,
+                    ManagerChange::Clear => Some(None),
+                    ManagerChange::Set(m) => Some(Some(m.as_str())),
+                };
+                db.apply_user_update(
+                    &user_id,
+                    &duduclaw_auth::UserUpdate {
+                        display_name: display_name.as_deref(),
+                        role,
+                        password: password.as_deref(),
+                        department: department_change.as_ref().map(|d| d.as_deref()),
+                        manager,
+                    },
+                )
+            })
+            .await
+        };
+        match applied {
+            Ok(Ok(())) => {
+                if manager_change != ManagerChange::Unchanged {
+                    let _ = db.log_action(
+                        Some(&ctx.user_id),
+                        "user.set_manager",
+                        Some(user_id),
+                        Some(&format!("manager={}", manager_change.target().unwrap_or("none"))),
+                        None,
+                    );
                 }
                 let _ = db.log_action(Some(&ctx.user_id), "user.update", Some(user_id), None, None);
                 WsFrame::ok_response("", json!({"status": "updated"}))
             }
-            Err(e) => WsFrame::error_response("", &format!("failed to update user: {e}")),
+            Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
+            Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => {
+                WsFrame::error_response("", &format!("failed to update user: {e}"))
+            }
+            Err(_) => WsFrame::error_response("", "failed to update user"),
         }
     }
 

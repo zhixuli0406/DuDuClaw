@@ -120,6 +120,24 @@ impl MethodHandler {
             checks.push(crate::os_ops::doctor_mcp_check(status, &message, true));
         }
 
+        // Live dashboard permissions (`live_context.rs`): shown only after a
+        // read of the account store failed, which refused that call. Silence
+        // here means every check since start-up read the store fine.
+        let (acl_failures, acl_last) = super::live_context::read_failure_stats();
+        if acl_failures > 0 {
+            let last = chrono::DateTime::from_timestamp(acl_last as i64, 0)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            checks.push(json!({
+                "name": "dashboard_permissions",
+                "status": "warn",
+                "message": format!(
+                    "閘道啟動後有 {acl_failures} 次讀不到帳號資料庫（最近一次 {last}），那幾次 dashboard 操作都被拒絕。請檢查磁碟空間與資料目錄的讀寫權限。"
+                ),
+                "can_repair": false,
+            }));
+        }
+
         // Grok CLI live probe — only when grok is installed (mirrors the CLI
         // doctor: absence is not a failure, the card is simply omitted).
         if let Some(g) = grok {

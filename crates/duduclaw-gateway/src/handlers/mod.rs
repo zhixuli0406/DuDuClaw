@@ -337,7 +337,7 @@ pub struct MethodHandler {
     tick_runtime: tokio::sync::Mutex<Option<tick_sources_rpc::TickRuntime>>,
     /// Live identity cache keyed by `(user_id, acl_generation)`; see
     /// `live_context.rs`.
-    live_ctx_cache: live_context::LiveContextCache,
+    live_ctx_cache: Arc<live_context::LiveContextCache>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]

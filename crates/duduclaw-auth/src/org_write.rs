@@ -87,7 +87,7 @@ fn subtree_height(conn: &Connection, user_id: &str) -> Result<u32, OrgError> {
 
 /// May `manager_id` become the manager of `user_id` (`None` = a person who
 /// does not exist yet and so has nobody below them)?
-fn validate_manager(conn: &Connection, user_id: Option<&str>, manager_id: &str) -> Result<(), OrgError> {
+pub(crate) fn validate_manager(conn: &Connection, user_id: Option<&str>, manager_id: &str) -> Result<(), OrgError> {
     if user_id == Some(manager_id) {
         return Err(OrgError::SelfManager);
     }
@@ -122,7 +122,7 @@ fn validate_manager(conn: &Connection, user_id: Option<&str>, manager_id: &str) 
     Ok(())
 }
 
-fn write_manager(conn: &Connection, user_id: &str, manager_id: Option<&str>) -> Result<(), OrgError> {
+pub(crate) fn write_manager(conn: &Connection, user_id: &str, manager_id: Option<&str>) -> Result<(), OrgError> {
     conn.execute(
         "UPDATE users SET manager_user_id = ?1, updated_at = ?2 WHERE id = ?3",
         params![manager_id, Utc::now().to_rfc3339(), user_id],
@@ -250,9 +250,9 @@ fn reparent_target(
     }
 }
 
-/// Move every binding of `from` to `to` at the same level (the pre-existing
-/// `users.offboard` transfer semantics: the moved level replaces any binding
-/// `to` already had for that agent).
+/// Move every binding of `from` to `to`. When `to` already has a binding
+/// for the same agent the higher of the two levels is kept, so a transfer
+/// never lowers what the recipient already had.
 fn move_bindings(conn: &Connection, from: &str, to: &str) -> Result<Vec<String>, OrgError> {
     let bindings: Vec<(String, String)> = {
         let mut stmt = conn
@@ -270,6 +270,19 @@ fn move_bindings(conn: &Connection, from: &str, to: &str) -> Result<Vec<String>,
         let level: AccessLevel = level
             .parse()
             .map_err(|e: String| OrgError::Db(format!("corrupt access_level in DB: {e}")))?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT access_level FROM user_agent_bindings WHERE user_id = ?1 AND agent_name = ?2",
+                params![to, agent],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        // An unreadable existing level is overwritten by the moved one.
+        let level = match existing.and_then(|l| l.parse::<AccessLevel>().ok()) {
+            Some(had) if had.level() > level.level() => had,
+            _ => level,
+        };
         conn.execute(
             "INSERT OR REPLACE INTO user_agent_bindings (user_id, agent_name, access_level, bound_at)
              VALUES (?1, ?2, ?3, ?4)",

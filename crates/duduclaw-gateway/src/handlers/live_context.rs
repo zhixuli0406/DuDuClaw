@@ -16,9 +16,11 @@
 //! Failure handling (fail closed):
 //! - user missing or not Active → the call is refused with
 //!   [`INACTIVE_ACCOUNT_ERROR`] (the handshake's own wording);
-//! - any read error → the caller continues as an Employee with no bindings
-//!   and no team ([`UserContext::narrowed`]), keeping a forced-password-change
-//!   flag it already had;
+//! - any read error → the call is refused with [`READ_FAILURE_ERROR`] (the
+//!   handshake's wording for the same situation). Nothing from the token is
+//!   reused: an unreadable store cannot prove the role, the bindings or that
+//!   the forced-password-change flag is clear. Each failure is logged and
+//!   counted ([`read_failure_stats`], shown by `system.doctor`);
 //! - the generation cannot be read → the cache is bypassed, never trusted.
 //!
 //! Consistency with `review_evidence::audience::fresh_dashboard_context`:
@@ -35,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use duduclaw_auth::{UserContext, UserDb};
 
@@ -43,6 +46,10 @@ use crate::protocol::WsFrame;
 
 /// Same text `server.rs::jwt_account_gate` uses at handshake.
 pub(crate) const INACTIVE_ACCOUNT_ERROR: &str = "account is suspended or offboarded";
+
+/// Same text `server.rs::authenticate_jwt` uses when the user store cannot
+/// be read at handshake.
+pub(crate) const READ_FAILURE_ERROR: &str = "authentication service unavailable";
 
 /// Most cached identities; beyond it stale generations are dropped first,
 /// then everything.
@@ -85,8 +92,8 @@ impl LiveContextCache {
     }
 }
 
-/// Rebuild `jwt_ctx` from the database. `Err` only for a missing or
-/// non-Active account; read errors narrow instead (see the module docs).
+/// Rebuild `jwt_ctx` from the database. `Err` for a missing or non-Active
+/// account and for any read error (see the module docs).
 pub(crate) fn resolve_live_context(
     db: &UserDb,
     cache: &LiveContextCache,
@@ -113,11 +120,32 @@ pub(crate) fn resolve_live_context(
             tracing::warn!(
                 user = %duduclaw_core::truncate_chars(&jwt_ctx.user_id, 12),
                 error = %e,
-                "live ACL read failed — continuing with no bindings"
+                "live ACL read failed — refusing the call"
             );
-            Ok(jwt_ctx.narrowed())
+            record_read_failure();
+            Err(READ_FAILURE_ERROR.to_string())
         }
     }
+}
+
+/// Live ACL reads that failed (and so refused a call) since the gateway started.
+static READ_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Unix seconds of the most recent failure (0 = never).
+static LAST_FAILURE_UNIX: AtomicU64 = AtomicU64::new(0);
+
+fn record_read_failure() {
+    READ_FAILURES.fetch_add(1, Ordering::Relaxed);
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    LAST_FAILURE_UNIX.store(now, Ordering::Relaxed);
+}
+
+/// `(failures since start, unix seconds of the last one or 0)`, reported by
+/// `system.doctor` so a broken identity store is visible, not just logged.
+pub(crate) fn read_failure_stats() -> (u64, u64) {
+    (
+        READ_FAILURES.load(Ordering::Relaxed),
+        LAST_FAILURE_UNIX.load(Ordering::Relaxed),
+    )
 }
 
 impl MethodHandler {
@@ -129,7 +157,61 @@ impl MethodHandler {
         let Some(db) = self.user_db.read().await.clone() else {
             return Ok(ctx.clone());
         };
-        resolve_live_context(&db, &self.live_ctx_cache, ctx)
-            .map_err(|e| WsFrame::error_response("", &e))
+        // SQLite reads are blocking; keep them off the runtime workers.
+        let cache = self.live_ctx_cache.clone();
+        let jwt_ctx = ctx.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolve_live_context(&db, &cache, &jwt_ctx)).await;
+        match resolved {
+            Ok(result) => result.map_err(|e| WsFrame::error_response("", &e)),
+            Err(join) => {
+                // The blocking task panicked or was cancelled: same as a
+                // failed read.
+                tracing::warn!(error = %join, "live ACL task failed — refusing the call");
+                record_read_failure();
+                Err(WsFrame::error_response("", READ_FAILURE_ERROR))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(id: &str, generation: u64) -> UserContext {
+        let mut c = UserContext::admin_fallback();
+        c.user_id = id.to_string();
+        c.acl_generation = generation;
+        c
+    }
+
+    #[test]
+    fn a_full_cache_drops_stale_generations_first_then_everything() {
+        let cache = LiveContextCache::default();
+        for i in 0..LIVE_CONTEXT_CACHE_CAP {
+            cache.put(&ctx(&format!("u{i}"), 1));
+        }
+        assert_eq!(cache.len(), LIVE_CONTEXT_CACHE_CAP);
+        // Re-putting a known user never evicts.
+        cache.put(&ctx("u0", 1));
+        assert_eq!(cache.len(), LIVE_CONTEXT_CACHE_CAP);
+
+        // A newcomer at a newer generation: every generation-1 entry is
+        // unreachable anyway and goes.
+        cache.put(&ctx("fresh", 2));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("fresh", 2).is_some());
+        assert!(cache.get("u1", 1).is_none());
+
+        // Full of current entries: a newcomer clears the map.
+        for i in 0..LIVE_CONTEXT_CACHE_CAP - 1 {
+            cache.put(&ctx(&format!("v{i}"), 2));
+        }
+        assert_eq!(cache.len(), LIVE_CONTEXT_CACHE_CAP);
+        cache.put(&ctx("newcomer", 2));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("newcomer", 2).is_some());
+        // A hit needs the same generation.
+        assert!(cache.get("newcomer", 3).is_none());
     }
 }

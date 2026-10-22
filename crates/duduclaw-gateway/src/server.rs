@@ -3036,8 +3036,17 @@ async fn handle_login(
             .into_response();
     }
 
-    // Verify credentials
-    let user = match state.user_db.verify_password(&body.email, &body.password) {
+    // Verify credentials. Argon2 is slow on purpose, so it runs on the
+    // blocking pool instead of stalling a runtime worker that other
+    // connections' RPCs share.
+    let verified = {
+        let db = state.user_db.clone();
+        let (email, password) = (body.email.clone(), body.password.clone());
+        tokio::task::spawn_blocking(move || db.verify_password(&email, &password))
+            .await
+            .unwrap_or_else(|_| Err("invalid email or password".to_string()))
+    };
+    let user = match verified {
         Ok(u) => u,
         Err(e) => {
             warn!(email = %body.email, "Login failed: {e}");

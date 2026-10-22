@@ -533,6 +533,10 @@ pub fn trusted_dashboard_principal(
         role: role.parse()?,
         agent_access: bindings,
         must_change_password: false,
+        // Deliberately empty: review evidence, workflow audiences and the
+        // knowledge base authorize on direct bindings only. When team grants
+        // start to drive routing (PR-B of the human-org design) revisit this
+        // read-only path, or build it with `UserContext::from_live`.
         team_access: Default::default(),
         acl_generation: 0,
     })

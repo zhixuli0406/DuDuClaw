@@ -479,3 +479,123 @@ fn a_missing_generation_row_is_an_error_and_a_write_recreates_it() {
     db.bind_agent(&u, "a", AccessLevel::Viewer).unwrap();
     assert!(db.acl_generation().unwrap() >= 2);
 }
+
+// ── review fixes: atomic combined writes, binding merge, races ───────
+
+#[test]
+fn a_refused_manager_leaves_the_rest_of_the_update_untouched() {
+    let (db, _t) = test_db();
+    let o = org(&db);
+    let before = generation(&db);
+    let refused = db.apply_user_update(
+        &o.mgr,
+        &crate::UserUpdate {
+            display_name: Some("renamed"),
+            password: Some("a-brand-new-password"),
+            department: Some(Some("sales")),
+            manager: Some(Some(&o.emp1)),
+            ..Default::default()
+        },
+    );
+    assert_eq!(refused, Err(crate::UserWriteError::Org(OrgError::ManagerRoleTooLow)));
+    let mgr = db.get_user(&o.mgr).unwrap().unwrap();
+    assert_eq!((mgr.display_name.as_str(), mgr.department.as_deref()), ("mgr", None));
+    assert!(db.verify_password("mgr@test.invalid", "isolated-test-password").is_ok());
+    assert_eq!(generation(&db), before);
+
+    // The same request with an acceptable manager applies every field.
+    let heir = person(&db, "heir", UserRole::Manager);
+    db.apply_user_update(
+        &o.mgr,
+        &crate::UserUpdate {
+            display_name: Some("renamed"),
+            department: Some(Some("sales")),
+            manager: Some(Some(&heir)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mgr = db.get_user(&o.mgr).unwrap().unwrap();
+    assert_eq!(mgr.display_name, "renamed");
+    assert_eq!(mgr.department.as_deref(), Some("sales"));
+    assert_eq!(mgr.manager_user_id, Some(heir));
+    assert!(generation(&db) > before);
+}
+
+#[test]
+fn create_with_a_refused_manager_creates_nothing() {
+    let (db, _t) = test_db();
+    let o = org(&db);
+    let new = |manager| crate::NewUser {
+        email: "new@test.invalid",
+        display_name: "new",
+        password: "new-password-1",
+        role: UserRole::Employee,
+        department: Some("sales"),
+        manager,
+    };
+    assert_eq!(
+        db.create_user_with(&new(Some(&o.emp1))).unwrap_err(),
+        crate::UserWriteError::Org(OrgError::ManagerRoleTooLow)
+    );
+    assert!(db.get_user_by_email("new@test.invalid").unwrap().is_none());
+    let created = db.create_user_with(&new(Some(&o.lead))).unwrap();
+    let stored = db.get_user(&created.id).unwrap().unwrap();
+    assert_eq!(stored, created);
+    assert_eq!(stored.manager_user_id, Some(o.lead.clone()));
+    assert!(matches!(
+        db.create_user_with(&new(None)),
+        Err(crate::UserWriteError::Other(_))
+    ), "duplicate email is not an org error");
+}
+
+#[test]
+fn offboard_transfer_keeps_the_higher_binding_level() {
+    let (db, _t) = test_db();
+    let leaver = person(&db, "leaver", UserRole::Employee);
+    let heir = person(&db, "heir", UserRole::Employee);
+    // Recipient already higher: kept.
+    db.bind_agent(&leaver, "a", AccessLevel::Operator).unwrap();
+    db.bind_agent(&heir, "a", AccessLevel::Owner).unwrap();
+    // Recipient lower: raised.
+    db.bind_agent(&leaver, "b", AccessLevel::Owner).unwrap();
+    db.bind_agent(&heir, "b", AccessLevel::Viewer).unwrap();
+    // Recipient had none: moved as is.
+    db.bind_agent(&leaver, "c", AccessLevel::Viewer).unwrap();
+    let out = db.offboard_user(&leaver, Some(&heir), None).unwrap();
+    assert_eq!(out.transferred_agents, vec!["a", "b", "c"]);
+    assert_eq!(db.check_agent_access(&heir, "a").unwrap(), Some(AccessLevel::Owner));
+    assert_eq!(db.check_agent_access(&heir, "b").unwrap(), Some(AccessLevel::Owner));
+    assert_eq!(db.check_agent_access(&heir, "c").unwrap(), Some(AccessLevel::Viewer));
+    assert!(db.get_user_agents(&leaver).unwrap().is_empty());
+}
+
+#[test]
+fn concurrent_opposite_assignments_cannot_both_win() {
+    let tmp = NamedTempFile::new().unwrap();
+    let setup = UserDb::new(tmp.path()).unwrap();
+    for round in 0..20 {
+        let a = person(&setup, &format!("a{round}"), UserRole::Manager);
+        let b = person(&setup, &format!("b{round}"), UserRole::Manager);
+        // Two independent pools on the same file, released together.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn = |who: String, boss: String| {
+            let path = tmp.path().to_path_buf();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = UserDb::new(&path).unwrap();
+                barrier.wait();
+                db.set_manager(&who, Some(&boss))
+            })
+        };
+        let t1 = spawn(a.clone(), b.clone());
+        let t2 = spawn(b.clone(), a.clone());
+        let results = [t1.join().unwrap(), t2.join().unwrap()];
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(wins, 1, "round {round}: {results:?}");
+        assert!(results.contains(&Err(OrgError::Cycle)), "round {round}: {results:?}");
+        let ma = setup.get_user(&a).unwrap().unwrap().manager_user_id;
+        let mb = setup.get_user(&b).unwrap().unwrap().manager_user_id;
+        assert!(ma.is_none() || mb.is_none(), "round {round}: no two-person loop");
+    }
+}

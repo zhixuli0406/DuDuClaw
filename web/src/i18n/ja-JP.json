@@ -4384,6 +4384,7 @@
   "settings.doctor.check.mcp_server": "MCP ツールサービス",
   "settings.doctor.check.grok_cli": "Grok CLI",
   "settings.doctor.check.local_auto_login_exposure": "ローカル自動ログインの露出",
+  "settings.doctor.check.dashboard_permissions": "ダッシュボードの権限確認",
   "settings.browser.desc": "AI 社員がブラウザや PC を操作する際の承認とログを管理します（詳細）。",
   "security.rbac.title": "ロール権限",
   "security.rbac.desc": "ロールに基づき、各 AI 社員の操作を制御します。",

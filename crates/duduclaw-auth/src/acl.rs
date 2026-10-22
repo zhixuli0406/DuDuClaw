@@ -69,21 +69,6 @@ impl UserContext {
         }
     }
 
-    /// The fail-closed context used when the live read fails: same identity,
-    /// Employee role, no bindings, no team. The forced-password-change flag
-    /// is kept, never cleared, by a failed read.
-    pub fn narrowed(&self) -> Self {
-        Self {
-            user_id: self.user_id.clone(),
-            email: self.email.clone(),
-            role: UserRole::Employee,
-            agent_access: HashMap::new(),
-            must_change_password: self.must_change_password,
-            team_access: HashMap::new(),
-            acl_generation: 0,
-        }
-    }
-
     /// Build from JWT claims.
     ///
     /// `must_change_password` is deliberately NOT part of the JWT claims
@@ -335,20 +320,6 @@ mod tests {
         assert!(ctx.can_call_agent("viewer-only"));
         assert!(!ctx.can_assign_to("viewer-only"));
         assert!(ctx.can_assign_to("my-agent"));
-    }
-
-    #[test]
-    fn narrowed_context_keeps_identity_and_password_flag_only() {
-        let mut ctx = employee_ctx();
-        ctx.role = UserRole::Admin;
-        ctx.must_change_password = true;
-        ctx.acl_generation = 9;
-        let n = ctx.narrowed();
-        assert_eq!(n.user_id, "u1");
-        assert_eq!(n.role, UserRole::Employee);
-        assert!(n.agent_access.is_empty() && n.team_access.is_empty());
-        assert!(n.requires_password_change());
-        assert_eq!(n.acl_generation, 0);
     }
 
     #[test]

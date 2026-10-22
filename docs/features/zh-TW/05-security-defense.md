@@ -198,9 +198,9 @@ v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的�
 
 ## dashboard 權限每次呼叫即時讀取（v1.76）
 
-v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角色與員工綁定，access token 又有 30 分鐘效期，所以拿掉綁定、降級或停權，要等對方下次登入才生效。現在 RPC 派送的單一入口每次呼叫都從 `users.db` 重建呼叫者的身分；token 只用來證明「是誰」。角色、直接綁定、必須改密碼的旗標，以及下面的主管關係推導，全部以資料庫為準。任何會改到這些的寫入（綁定、解綁、改角色或密碼、改狀態、改主管、通道身分、改 email、離職）都會在同一個交易裡把計數器（`auth_meta.acl_generation`）加一，每次呼叫的快取以這個計數器為鍵，所以快取的結果不會比最後一次這類寫入還舊。帳號不存在或不是在職狀態，回 `account is suspended or offboarded`；讀取失敗時以「員工、沒有任何綁定」繼續。閘道管理 token（`system`）與鎖定畫面連線不變。
+v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角色與員工綁定，access token 又有 30 分鐘效期，所以拿掉綁定、降級或停權，要等對方下次登入才生效。現在 RPC 派送的單一入口每次呼叫都從 `users.db` 重建呼叫者的身分；token 只用來證明「是誰」。角色、直接綁定、必須改密碼的旗標，以及下面的主管關係推導，全部以資料庫為準。任何會改到這些的寫入（綁定、解綁、改角色或密碼、改狀態、改主管、通道身分、改 email、離職）都會在同一個交易裡把計數器（`auth_meta.acl_generation`）加一，每次呼叫的快取以這個計數器為鍵，所以快取的結果不會比最後一次這類寫入還舊。帳號不存在或不是在職狀態，回 `account is suspended or offboarded`；讀不到資料庫時這次呼叫回 `authentication service unavailable`，不沿用 token 裡的任何東西，`system.doctor` 會顯示啟動後發生過幾次。資料庫讀取和登入的密碼檢查都在 blocking 執行緒池跑，一陣登入不會拖慢其他連線的呼叫。閘道管理 token（`system`）與鎖定畫面連線不變。
 
-帳號現在可以有一位直屬主管（`users.manager_user_id`，只有多人團隊版，經 `users.create`／`users.update` 設定）。寫入會擋下繞成一圈（`manager_cycle`）、超過 8 層（`manager_too_deep`）、主管角色低於主管或不在職（`manager_role`、`manager_inactive`）；還有直屬部屬的人不能降成員工（`manager_has_reports`）；離職時部屬改掛 `transfer_to` 或離職者的主管，每一筆以 `user.reparent` 記稽核。系統會算出主管可以碰到部屬綁定的員工（最高 Operator），但這一版還沒有任何地方用到：路由、`agents.list` 與 Operator 等級的 RPC（記憶、對話紀錄、設定）仍然只看直接綁定。
+帳號現在可以有一位直屬主管（`users.manager_user_id`，只有多人團隊版，經 `users.create`／`users.update` 設定）。同一次 `users.create`／`users.update` 的所有欄位在一個交易裡寫入，主管或降級被擋時，這次請求的其他修改也不會套用。寫入會擋下繞成一圈（`manager_cycle`）、一條主管鏈超過 8 個人（含最上層，`manager_too_deep`）、主管角色低於主管或不在職（`manager_role`、`manager_inactive`）；還有直屬部屬的人不能降成員工（`manager_has_reports`）；離職時部屬改掛 `transfer_to` 或離職者的主管，每一筆以 `user.reparent` 記稽核；轉給 `transfer_to` 的綁定，若對方原本就綁了同一位員工，保留兩者中較高的等級。系統會算出主管可以碰到部屬綁定的員工（最高 Operator），但這一版還沒有任何地方用到：路由、`agents.list` 與 Operator 等級的 RPC（記憶、對話紀錄、設定）仍然只看直接綁定。
 
 ## 支撐層
 

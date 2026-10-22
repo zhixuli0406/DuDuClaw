@@ -138,10 +138,8 @@ impl UserDb {
             )
             .optional()
             .map_err(|e| format!("bind lookup failed: {e}"))?;
-        if let Some((owner, ver)) = existing {
-            if ver != 0 && owner != user_id {
-                return Err("channel already bound to another user".to_string());
-            }
+        if matches!(&existing, Some((owner, ver)) if *ver != 0 && owner != user_id) {
+            return Err("channel already bound to another user".to_string());
         }
 
         tx.execute(
@@ -368,8 +366,13 @@ impl UserDb {
             return Err(OtpError::TooManyAttempts);
         }
 
-        // Always verify (uniform timing regardless of correctness).
-        if verify_password_hash(code, &code_hash).is_ok() {
+        // Always verify (uniform timing regardless of correctness). The
+        // pooled connection is released for the slow argon2 check; the
+        // consume below is a compare-and-swap, so nothing relies on holding it.
+        drop(conn);
+        let code_ok = verify_password_hash(code, &code_hash).is_ok();
+        let conn = self.conn();
+        if code_ok {
             // Atomic compare-and-swap consume (Haiku review #1): guard on
             // `consumed = 0` so two concurrent verifications on the pooled
             // connections cannot both succeed — exactly one UPDATE flips the row.
@@ -391,20 +394,24 @@ impl UserDb {
         // Record the wrong guess. On the Nth wrong guess (N = cap) the challenge
         // is invalidated and we report TooManyAttempts so the client stops
         // retrying; earlier wrong guesses report BadCode.
-        let next = attempts + 1;
+        // Increment in SQL (not from the value read above): the connection
+        // was released during the hash check, so a concurrent wrong guess
+        // must not be lost.
+        let next: i64 = conn
+            .query_row(
+                "UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ?1 RETURNING attempts",
+                params![challenge_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| OtpError::Internal)?;
         if next >= OTP_MAX_ATTEMPTS {
             conn.execute(
-                "UPDATE otp_challenges SET attempts = ?2, consumed = 1 WHERE id = ?1",
-                params![challenge_id, next],
+                "UPDATE otp_challenges SET consumed = 1 WHERE id = ?1",
+                params![challenge_id],
             )
             .map_err(|_| OtpError::Internal)?;
             return Err(OtpError::TooManyAttempts);
         }
-        conn.execute(
-            "UPDATE otp_challenges SET attempts = ?2 WHERE id = ?1",
-            params![challenge_id, next],
-        )
-        .map_err(|_| OtpError::Internal)?;
         Err(OtpError::BadCode)
     }
 

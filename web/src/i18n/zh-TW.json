@@ -4384,6 +4384,7 @@
   "settings.doctor.check.mcp_server": "MCP 工具服務",
   "settings.doctor.check.grok_cli": "Grok CLI",
   "settings.doctor.check.local_auto_login_exposure": "本機自動登入曝險",
+  "settings.doctor.check.dashboard_permissions": "dashboard 權限讀取",
   "settings.browser.desc": "管理 AI 員工操作瀏覽器與電腦時的審批與紀錄（進階）。",
   "security.rbac.title": "角色權限",
   "security.rbac.desc": "以角色為基礎，控管每位 AI 員工可用的操作。",

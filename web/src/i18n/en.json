@@ -4384,6 +4384,7 @@
   "settings.doctor.check.mcp_server": "MCP tool service",
   "settings.doctor.check.grok_cli": "Grok CLI",
   "settings.doctor.check.local_auto_login_exposure": "Local auto-login exposure",
+  "settings.doctor.check.dashboard_permissions": "Dashboard permission checks",
   "settings.browser.desc": "Manage approvals and logs for when AI employees drive a browser or computer (advanced).",
   "security.rbac.title": "Role permissions",
   "security.rbac.desc": "Role-based control over what each AI employee is allowed to do.",

@@ -9,7 +9,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::models::*;
-use crate::org_write::reports_count;
+use crate::org::OrgError;
+use crate::user_update::{UserUpdate, UserWriteError};
 use crate::user_row::{
     bump_acl_generation, has_column, load_user, user_from_row, USER_COLUMNS,
 };
@@ -237,12 +238,17 @@ impl UserDb {
             return Err("invalid email or password".to_string());
         }
 
-        let conn = self.conn();
-        let row_result = conn.query_row(
-            &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"),
-            params![email],
-            |row| Ok((user_from_row(row)?, row.get::<_, String>(11)?)),
-        );
+        // Fetch the row, then give the pooled connection back before the
+        // (deliberately slow) argon2 check: the pool has two connections and
+        // every RPC's live ACL read needs one.
+        let row_result = {
+            let conn = self.conn();
+            conn.query_row(
+                &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"),
+                params![email],
+                |row| Ok((user_from_row(row)?, row.get::<_, String>(11)?)),
+            )
+        };
 
         // A missing row and a corrupt role/status take the same path, so
         // neither is distinguishable from a wrong password.
@@ -301,13 +307,12 @@ impl UserDb {
             .map_err(|e| format!("row error: {e}"))
     }
 
-    /// Update a user's display_name, role and/or password.
-    ///
-    /// All changes commit together. A role or password change bumps the ACL
-    /// generation (role and the forced-change flag are part of the live
-    /// context). Demoting someone to Employee while they still have direct
-    /// reports is refused with [`crate::org::MANAGER_HAS_REPORTS`] and
-    /// changes nothing: an Employee cannot be a manager.
+    /// Update a user's display_name, role and/or password, all or nothing
+    /// (see [`Self::apply_user_update`], which also covers department and
+    /// manager). A role or password change bumps the ACL generation.
+    /// Demoting someone to Employee while they still have direct reports is
+    /// refused with [`crate::org::MANAGER_HAS_REPORTS`] and changes nothing:
+    /// an Employee cannot be a manager.
     pub fn update_user(
         &self,
         user_id: &str,
@@ -315,47 +320,17 @@ impl UserDb {
         role: Option<UserRole>,
         password: Option<&str>,
     ) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
-        // Hash before taking the write lock: argon2 is slow on purpose.
-        let password_hash = password.map(hash_password).transpose()?;
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("update error: {e}"))?;
-
-        if role == Some(UserRole::Employee) && reports_count(&tx, user_id)? > 0 {
-            return Err(crate::org::MANAGER_HAS_REPORTS.to_string());
-        }
-
-        if let Some(name) = display_name {
-            tx.execute(
-                "UPDATE users SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
-                params![name, now, user_id],
-            )
-            .map_err(|e| format!("update error: {e}"))?;
-        }
-
-        if let Some(r) = role {
-            tx.execute(
-                "UPDATE users SET role = ?1, updated_at = ?2 WHERE id = ?3",
-                params![r.to_string(), now, user_id],
-            )
-            .map_err(|e| format!("update error: {e}"))?;
-        }
-
-        if let Some(hash) = password_hash {
-            // Changing the password clears the forced-change flag (C1 fix).
-            tx.execute(
-                "UPDATE users SET password_hash = ?1, updated_at = ?2, must_change_password = 0 WHERE id = ?3",
-                params![hash, now, user_id],
-            )
-            .map_err(|e| format!("update error: {e}"))?;
-        }
-
-        if role.is_some() || password.is_some() {
-            bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
-        }
-        tx.commit().map_err(|e| format!("update error: {e}"))
+        let update = UserUpdate {
+            display_name,
+            role,
+            password,
+            ..UserUpdate::default()
+        };
+        self.apply_user_update(user_id, &update).map_err(|e| match e {
+            UserWriteError::Org(OrgError::HasReports) => crate::org::MANAGER_HAS_REPORTS.to_string(),
+            UserWriteError::Org(OrgError::UserNotFound) => "user not found".to_string(),
+            other => format!("update error: {other}"),
+        })
     }
 
     /// Change a user's login email. `email` must already have passed

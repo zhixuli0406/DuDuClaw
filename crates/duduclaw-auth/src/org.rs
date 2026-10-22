@@ -24,7 +24,11 @@ use crate::db::UserDb;
 use crate::models::{AccessLevel, User, UserRole, UserStatus};
 use crate::user_row::{read_acl_generation, user_from_row, USER_COLUMNS};
 
-/// Deepest reporting chain, counted in people from the top (Q14).
+/// Longest reporting chain, counted in people including the person at the
+/// top (Q14): a chain may hold at most 8 people, so someone can be at most 7
+/// levels below the top. Traversals below a manager stop after this many
+/// levels, which is more than any accepted tree needs and is what bounds a
+/// cycle written by hand.
 pub const MAX_ORG_DEPTH: u8 = 8;
 
 /// Stable error codes (the gateway passes them through; the dashboard keys
