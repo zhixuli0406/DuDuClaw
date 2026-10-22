@@ -69,6 +69,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 62 | [Calling AI staff with `@`](62-calling-ai-staff.md) | Hand one message to another AI employee by `@name`, limited to the employees the sender may call; `@` list in WebChat, LINE and Telegram; one-shot call; mention-only groups |
 | 63 | [Document knowledge base](63-knowledge-base.md) | Collections of company documents with per-collection permissions (users, departments, AI employees, channels), sandboxed extraction, keyword search with page / row locations, read-only `knowledge_*` MCP tools, `duduclaw knowledge eval` |
 | 64 | [Thinking display](64-thinking-display.md) | Live thinking timer in WebChat for every runtime; masked, shortened thinking summaries for signed-in dashboard users; never sent to messaging apps |
+| 65 | [Where thinking comes from](65-thinking-sources.md) | Which runtimes report thinking (Claude CLI, Codex, OpenAI-compatible APIs, Anthropic Direct API), what each shows, and when a request changes |
 
 ---
 

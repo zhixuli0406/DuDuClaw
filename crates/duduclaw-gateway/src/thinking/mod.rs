@@ -19,12 +19,16 @@
 //! Nothing here stores thinking text. At the end of the turn the sink writes
 //! at most one `run_steps` row with the seconds and token count only.
 
+pub mod claude_stream;
 pub mod done_meta;
 pub mod event;
 pub mod gate;
+pub mod llm_tap;
 pub mod policy;
+pub mod producers;
 pub mod recorder;
 pub mod sanitize;
+pub mod think_tags;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

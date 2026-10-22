@@ -69,6 +69,7 @@
 | 62 | [@ で AI スタッフを呼び出す](62-calling-ai-staff.md) | `@名前` でメッセージを 1 件だけ別の AI スタッフに渡す。呼び出せるのは権限のあるスタッフのみ。WebChat・LINE・Telegram の @ 一覧、先に呼ぶ方式、メンションのみのグループ |
 | 63 | [ドキュメントナレッジベース](63-knowledge-base.md) | 社内文書をコレクション単位で保存し、コレクションごとに権限（ユーザー、部門、AI 社員、チャネル）を設定。サンドボックス内の解析、ページ・行番号付きのキーワード検索、読み取り専用の `knowledge_*` MCP ツール、`duduclaw knowledge eval` |
 | 64 | [思考の表示](64-thinking-display.md) | どのランタイムでも WebChat に考え中のタイマーを表示。サインインしたダッシュボード利用者には伏せ字処理・短縮済みの思考の要約。メッセージアプリには送らない |
+| 65 | [思考はどこから来るか](65-thinking-sources.md) | 思考を報告する runtime（Claude CLI、Codex、OpenAI 互換 API、Anthropic Direct API）、それぞれの表示内容、リクエストが変わる条件 |
 
 ---
 

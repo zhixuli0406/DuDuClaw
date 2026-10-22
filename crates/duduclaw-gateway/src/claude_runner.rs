@@ -3522,6 +3522,8 @@ async fn call_claude_streaming(
     // `extend_native_tool_events`'s doc comment).
     let mut native_events: Vec<crate::runtime::NativeToolEvent> = Vec::new();
     let mut open_native_calls: Vec<(String, usize)> = Vec::new();
+    // Thinking display (no-op without a reply-turn sink in scope).
+    let mut thinking = crate::thinking::claude_stream::ClaudeStreamThinking::new();
 
     // Keepalive timer (90s) — only meaningful when on_progress is Some
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(
@@ -3547,6 +3549,13 @@ async fn call_claude_streaming(
                         if line.trim().is_empty() { continue; }
 
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                            // Partial `stream_event` lines stop here: never the
+                            // native-tool collector, never the answer text.
+                            if thinking.observe(&event)
+                                == crate::thinking::claude_stream::Flow::Consumed
+                            {
+                                continue;
+                            }
                             match event.get("type").and_then(|t| t.as_str()) {
                                 Some("result") => {
                                     // Terminal error from stream-json — promote to Err
@@ -3689,6 +3698,7 @@ async fn call_claude_streaming(
         }
     }
 
+    thinking.finish();
     let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
     // Any non-zero exit is now a hard failure. Previously we only errored
     // when result_text was empty, which would surface CLI error text as
@@ -4045,6 +4055,10 @@ fn prepare_claude_cmd(
         "--max-turns",
         "50",
     ]);
+    // Thinking display: `--include-partial-messages` only inside a reply turn
+    // whose viewer reads thinking text live; dispatch / cron / heartbeat have
+    // no sink in scope, so their argv is byte-identical to before.
+    cmd.args(crate::thinking::claude_stream::extra_args(&crate::thinking::policy()));
 
     // P1/WP-3: per-call reasoning effort. `--effort <low|medium|high|xhigh|max>`
     // verified on Claude Code 2.1.258 (`--help`), per-invocation only (the CLI

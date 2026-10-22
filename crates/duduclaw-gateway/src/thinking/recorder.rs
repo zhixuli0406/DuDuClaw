@@ -89,6 +89,20 @@ impl Recorder {
         });
     }
 
+    /// Close the open block as `kind` — a block opened before its text was
+    /// known (e.g. `Summary`) that ended with none is really `Omitted`.
+    pub fn end_as(&mut self, kind: ThinkingKind, full_text: Option<&str>, tokens: Option<u64>) {
+        if let Some((_, open_kind)) = self.open.as_mut() {
+            *open_kind = kind;
+        }
+        self.end(full_text, tokens);
+    }
+
+    /// Is a block open right now?
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
     /// A whole block known only after the fact (non-streaming runtimes).
     pub fn oneshot(&mut self, kind: ThinkingKind, text: Option<&str>, tokens: Option<u64>) {
         self.start(kind);

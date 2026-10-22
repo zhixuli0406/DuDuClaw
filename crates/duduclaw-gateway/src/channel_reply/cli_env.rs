@@ -102,6 +102,12 @@ pub(super) async fn spawn_claude_cli_with_env(
         "--max-turns",
         "50",
     ]);
+    // Thinking display: `--include-partial-messages` only when this turn's
+    // viewer reads thinking text live (`crate::thinking::policy`). Outside a
+    // reply turn, or for a channel / status-only viewer, nothing is added
+    // and the argv is byte-identical to before.
+    let thinking_policy = crate::thinking::policy();
+    cmd.args(crate::thinking::claude_stream::extra_args(&thinking_policy));
 
     // P1/WP-3: per-call reasoning effort. `--effort <low|medium|high|xhigh|max>`
     // verified on Claude Code 2.1.258 (`--help`); it is per-invocation only and
@@ -416,6 +422,9 @@ pub(super) async fn spawn_claude_cli_with_env(
     // start/end step events for the dashboard's agentic task tree. Runs
     // alongside the existing ToolUse/TodoUpdate progress emission below.
     let mut step_tracker = StepTracker::new();
+    // Thinking display: thinking blocks, `thinking_tokens` estimates and the
+    // partial `stream_event` lines (see `crate::thinking::claude_stream`).
+    let mut thinking = crate::thinking::claude_stream::ClaudeStreamThinking::new();
 
     // Task C (O-4 Guide-path result cards): only a `system_operator`-capable
     // agent's turn pays for this — everyone else's stream loop takes the
@@ -506,17 +515,24 @@ pub(super) async fn spawn_claude_cli_with_env(
                         }
 
                         lines_seen += 1;
+                        let parsed = serde_json::from_str::<serde_json::Value>(&line).ok();
+                        let partial_line = parsed
+                            .as_ref()
+                            .is_some_and(crate::thinking::claude_stream::is_stream_event);
                         // Keep only a truncated tail for diagnostics (full line
                         // can contain the user's prompt — we don't want it on disk).
                         // `rate_limit_event` frames are excluded: embedding one in a
                         // failure diagnostic made `is_rate_limit_error` classify a
                         // healthy account as rate-limited ("rateLimitType" ⊃
                         // "ratelimit" — TODO-rate-limit-warning-misread-as-failure).
-                        if !crate::rate_limit_watch::line_is_rate_limit_frame(&line) {
+                        // Partial `stream_event` lines are excluded too: they can
+                        // carry thinking text, which never goes into diagnostics.
+                        if !partial_line && !crate::rate_limit_watch::line_is_rate_limit_frame(&line) {
                             last_raw_line = line.chars().take(400).collect();
                         }
 
-                        // Optional raw-stream debug log.
+                        // Optional raw-stream debug log (`thinking_delta` lines
+                        // are written as a marker, never their text).
                         if let Some(ref p) = stream_debug_path {
                             if let Ok(mut f) = std::fs::OpenOptions::new()
                                 .create(true)
@@ -524,12 +540,25 @@ pub(super) async fn spawn_claude_cli_with_env(
                                 .open(p)
                             {
                                 use std::io::Write;
-                                let _ = writeln!(f, "{line}");
+                                let logged = crate::thinking::claude_stream::debug_log_line(
+                                    &line,
+                                    parsed.as_ref(),
+                                );
+                                let _ = writeln!(f, "{logged}");
                             }
                         }
 
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(event) = parsed {
                             events_parsed += 1;
+
+                            // Thinking display: a partial `stream_event` line is
+                            // handled there and never reaches foresight, the step
+                            // tracker, the operator collector or the answer text.
+                            if thinking.observe(&event)
+                                == crate::thinking::claude_stream::Flow::Consumed
+                            {
+                                continue;
+                            }
 
                             // R2: feed the foresight scorer the raw event (it
                             // extracts tool_use / tool_result / TodoWrite itself)
@@ -941,6 +970,9 @@ pub(super) async fn spawn_claude_cli_with_env(
         }
     }
 
+    // Close a thinking block the stream left open.
+    thinking.finish();
+
     // Wait for process to exit
     let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
     group_guard.disarm();
@@ -1063,3 +1095,7 @@ pub(super) async fn spawn_claude_cli_with_env(
 
     Ok(result_text)
 }
+
+#[cfg(test)]
+#[path = "cli_env_thinking_tests.rs"]
+mod thinking_tests;
