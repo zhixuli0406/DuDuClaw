@@ -48,7 +48,8 @@ pub fn is_private_host(host: &str) -> bool {
         return is_private_ip(ip);
     }
 
-    let lower = host.to_ascii_lowercase();
+    // A trailing dot is the same DNS name ("localhost." == "localhost").
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
     lower == "localhost"
         || lower.ends_with(".localhost")
         || lower == "metadata.google.internal"
@@ -59,6 +60,64 @@ pub fn is_private_host(host: &str) -> bool {
 /// ([`duduclaw_core::net_addr::is_public_ip`]).
 pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
     !duduclaw_core::net_addr::is_public_ip(&ip)
+}
+
+/// Host (no scheme, path, query or port) of a URL, for log lines that must
+/// not carry a query string. Falls back to a fixed placeholder.
+pub fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<invalid-url>".to_string())
+}
+
+/// Plain-HTTP strict-localhost URL (the only non-HTTPS shape the guard accepts).
+fn is_local_http(parsed: &url::Url) -> bool {
+    parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+}
+
+/// Every resolved address must be a public IP.
+pub fn check_resolved_addrs(addrs: &[std::net::SocketAddr]) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err("Odoo host did not resolve to any address".into());
+    }
+    if addrs.iter().any(|a| is_private_ip(a.ip())) {
+        return Err("Odoo host resolves to a private or reserved address; connection refused".into());
+    }
+    Ok(())
+}
+
+/// Resolve `host:port` and require every address to be public. Returns the
+/// checked addresses so the caller can pin them (no second lookup, which
+/// would reopen a DNS-rebinding window).
+pub async fn resolve_public(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port))
+        .await
+        .map_err(|_| "could not resolve the Odoo host".to_string())?
+        .collect();
+    check_resolved_addrs(&addrs)?;
+    Ok(addrs)
+}
+
+/// Resolved-address plan for dialing `url`: `Ok(None)` for strict-localhost
+/// HTTP (nothing to pin), `Ok(Some((host, addrs)))` for HTTPS after the
+/// literal check *and* a resolution check. Fail closed on anything else.
+pub async fn plan_connection(
+    url: &str,
+) -> Result<Option<(String, Vec<std::net::SocketAddr>)>, String> {
+    if !is_safe_odoo_url(url) {
+        return Err("Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host".into());
+    }
+    let parsed = url::Url::parse(url).map_err(|_| "Odoo URL is malformed".to_string())?;
+    if is_local_http(&parsed) {
+        return Ok(None);
+    }
+    let host = parsed.host_str().ok_or("Odoo URL has no host")?.to_string();
+    let port = parsed.port_or_known_default().ok_or("Odoo URL has no port")?;
+    let addrs = resolve_public(&host, port).await?;
+    Ok(Some((host.trim_start_matches('[').trim_end_matches(']').to_string(), addrs)))
 }
 
 /// Odoo database name: at most 63 characters of `[a-zA-Z0-9_-]`.
@@ -99,6 +158,49 @@ mod tests {
         ] {
             assert!(is_safe_odoo_url(url), "{url} must be accepted");
         }
+    }
+
+    #[test]
+    fn trailing_dot_hosts_do_not_bypass_the_name_list() {
+        for url in [
+            "https://localhost./",
+            "https://metadata.google.internal./",
+            "https://foo.localhost./",
+        ] {
+            assert!(!is_safe_odoo_url(url), "{url} must be refused");
+        }
+    }
+
+    #[test]
+    fn resolved_addresses_must_all_be_public() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert!(check_resolved_addrs(&[a("8.8.8.8:443")]).is_ok());
+        assert!(check_resolved_addrs(&[]).is_err());
+        assert!(check_resolved_addrs(&[a("127.0.0.1:443")]).is_err());
+        assert!(check_resolved_addrs(&[a("8.8.8.8:443"), a("10.0.0.1:443")]).is_err());
+        assert!(check_resolved_addrs(&[a("[::1]:443")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn name_resolving_to_loopback_is_refused() {
+        // A public-looking name whose lookup lands on 127.0.0.1 (the
+        // nip.io / rebinding shape). "localhost" resolves locally without
+        // network, so it exercises the resolution check on its own.
+        let err = resolve_public("localhost", 443).await.unwrap_err();
+        assert!(err.contains("private or reserved"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn plan_connection_refuses_literal_and_passes_local_http() {
+        assert!(plan_connection("https://10.0.0.1/").await.is_err());
+        assert!(plan_connection("http://example.com").await.is_err());
+        assert!(plan_connection("http://127.0.0.1:8069").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn host_of_drops_query_and_path() {
+        assert_eq!(host_of("https://erp.example.com/odoo?token=abc"), "erp.example.com");
+        assert_eq!(host_of("nonsense"), "<invalid-url>");
     }
 
     #[test]

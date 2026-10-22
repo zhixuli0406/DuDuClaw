@@ -743,7 +743,13 @@ pub(crate) async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, calle
                     return mcp_error(&msg);
                 }
             },
-            Err(_) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            // Present but unreadable (permissions, I/O): refuse, never fall
+            // back to the global server.
+            Err(_) => {
+                odoo.unregister_agent(caller_agent).await;
+                return mcp_error(duduclaw_odoo::ODOO_UNREADABLE);
+            }
         };
     match &override_cfg {
         Some(cfg) => odoo.register_agent(caller_agent, cfg.clone()).await,

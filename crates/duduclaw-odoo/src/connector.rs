@@ -264,9 +264,20 @@ impl OdooConnector {
         // URL, so following redirects would let a validated public host 302
         // to cloud-metadata (169.254.169.254) or internal addresses. Odoo
         // JSON-RPC never needs redirects, so disable them entirely.
-        let http = reqwest::Client::builder()
+        // DNS-rebinding / nip.io hardening: re-run the URL guard (global and
+        // per-agent urls alike), resolve the host ourselves, require every
+        // address to be public, and pin the client to exactly those addresses.
+        // `no_proxy` because a proxy would resolve the host itself and the pin
+        // would not hold.
+        let plan = crate::url_guard::plan_connection(&config.url).await?;
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if let Some((host, addrs)) = &plan {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
+        let http = builder
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
@@ -285,7 +296,7 @@ impl OdooConnector {
         }
         let uid = uid.unwrap();
 
-        info!(url = %config.url, db = %config.db, uid, "Odoo connected");
+        info!(host = %crate::url_guard::host_of(&config.url), db = %config.db, uid, "Odoo connected");
 
         let mut conn = Self {
             url: config.url.clone(),

@@ -89,7 +89,13 @@ async fn connect_for_agent(
 
     let agent_toml_path =
         crate::outcome_spec::agent_work_dir(home_dir, agent_id).join("agent.toml");
-    let agent_raw = std::fs::read_to_string(&agent_toml_path).unwrap_or_default();
+    // A missing agent.toml means "no override"; any other read failure must
+    // not silently send the agent to the global server.
+    let agent_raw = match std::fs::read_to_string(&agent_toml_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err(duduclaw_odoo::ODOO_UNREADABLE.to_string()),
+    };
     let agent_override = AgentOdooConfig::parse_agent_toml(&agent_raw)?;
     if let (Some(requested), Some(cfg)) = (profile, agent_override.as_ref()) {
         // An explicit `--profile` must name the agent's actual profile; it is
