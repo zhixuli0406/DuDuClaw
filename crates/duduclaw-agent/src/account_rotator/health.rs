@@ -108,12 +108,25 @@ impl AccountRotator {
         }
     }
 
+    /// Record a quota refusal (5-hour / weekly window, 429).
+    ///
+    /// A refusal is proof the credential authenticated, so the account is
+    /// booked as *healthy but cooling down*. That state matters (2026-10-22
+    /// incident): `probe_and_restore` only looks at unhealthy accounts, and a
+    /// `200` from `/v1/models` says nothing about subscription quota. An
+    /// account left unhealthy here (e.g. by earlier generic-error strikes) was
+    /// "restored" by the next probe tick and picked again within a minute.
     pub async fn on_rate_limited(&self, account_id: &str) {
         let mut accounts = self.accounts.write().await;
         if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
-            acc.cooldown_until = Some(
-                Utc::now() + chrono::Duration::seconds(self.cooldown_seconds as i64),
-            );
+            // Never resurrect a credential we could not decrypt.
+            if !acc.credential_state.is_blocking() {
+                acc.is_healthy = true;
+            }
+            acc.consecutive_errors = 0;
+            let until = Utc::now() + chrono::Duration::seconds(self.cooldown_seconds as i64);
+            // Never shorten an existing (e.g. 24 h billing) cooldown.
+            acc.cooldown_until = Some(acc.cooldown_until.map_or(until, |cur| cur.max(until)));
             warn!(account = account_id, cooldown = self.cooldown_seconds, "Account rate-limited");
         }
     }
