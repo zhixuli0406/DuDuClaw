@@ -115,6 +115,8 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("knowledge", "max_collection_bytes", UInt),
     ("knowledge", "max_total_bytes", UInt),
     ("knowledge", "extract_when_unavailable", OneOf(duduclaw_knowledge::limits::EXTRACT_WHEN_UNAVAILABLE_VALUES)),
+    ("knowledge", "auto_retrieve", Bool),
+    ("knowledge", "inject_budget_chars_max", UInt),
     ("knowledge", "embedding", Table),
     ("knowledge.embedding", "provider", OneOf(duduclaw_knowledge::embed::config::PROVIDER_VALUES)),
     ("knowledge.embedding", "local_model", Str),

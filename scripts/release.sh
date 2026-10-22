@@ -794,10 +794,14 @@ PRO_IMAGE_SCRIPT="commercial/duduclaw-pro-gateway/build-image.sh"
 # locally even if the AR push itself fails, but a skipped/failed build leaves
 # no local image to extract from).
 PRO_IMAGE_PUSHED=0
+# build-image.sh writes "<version> <tar sha256>" here after uploading the
+# offline tar; the control-plane sync below turns it into the delivery
+# manifest entry for this release.
+PRO_TAR_SHA_FILE="$(mktemp)"
 if [[ -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
     echo ""
     echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
-    if "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
+    if DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
         echo "  Enterprise image v$NEW_VERSION pushed."
         PRO_IMAGE_PUSHED=1
     else
@@ -987,13 +991,49 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
             echo ""
             echo "  WARNING: could not derive a version list from git tags — allowlist NOT synced."
         else
+            # --- General-distributor delivery manifest (same update) ---
+            # /v1/dist/versions offers only versions that are BOTH in the
+            # allowlist and in DUDUCLAW_GENERAL_DELIVERY_MANIFEST with the
+            # exact tar SHA. Until 2026-10-22 only the allowlist was synced
+            # here, so every release after v1.72.2 offered no download. The
+            # new entry is the tar build-image.sh just hashed; entries no
+            # longer in the allowlist are dropped.
+            CP_MANIFEST_SCRIPT="commercial/duduclaw-pro-gateway/delivery_manifest.py"
+            CP_MANIFEST=""
+            if [[ -f "$CP_MANIFEST_SCRIPT" ]]; then
+                # A failed read must not look like "no manifest yet": that would
+                # rewrite it with only the new release and drop every approved one.
+                CP_MANIFEST_READ=1
+                CP_CURRENT_MANIFEST="$(gcloud run services describe "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                    --format=json 2>/dev/null | python3 -c 'import json, sys
+env = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env", [])
+print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"), ""))')" || CP_MANIFEST_READ=0
+                CP_ADD=""
+                if [[ -s "$PRO_TAR_SHA_FILE" ]]; then
+                    read -r CP_TAR_VERSION CP_TAR_SHA < "$PRO_TAR_SHA_FILE" || true
+                    CP_ADD="${CP_TAR_VERSION}=${CP_TAR_SHA}"
+                fi
+                if [[ "$CP_MANIFEST_READ" != "1" ]]; then
+                    CP_MANIFEST=""
+                    echo "  WARNING: could not read the live delivery manifest — left unchanged."
+                elif ! CP_MANIFEST="$(python3 -I "$CP_MANIFEST_SCRIPT" --offered "$CP_VERSIONS" \
+                    --current "$CP_CURRENT_MANIFEST" ${CP_ADD:+--add "$CP_ADD"})"; then
+                    CP_MANIFEST=""
+                    echo "  WARNING: delivery manifest could not be computed — left unchanged."
+                fi
+                if [[ -z "$CP_ADD" ]]; then
+                    echo "  WARNING: no offline tar was uploaded for v$NEW_VERSION, so distributors"
+                    echo "           cannot download it from the console until build-image.sh succeeds"
+                    echo "           and the manifest gets its tar SHA."
+                fi
+            fi
             echo ""
             echo "Syncing control-plane version allowlist: DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS"
-            # ^:^ switches the pair delimiter to ':' so the comma-separated
-            # version list survives as ONE value (a bare comma would split it
-            # into bogus KEY=VALUE pairs and fail the update).
+            [[ -n "$CP_MANIFEST" ]] && echo "Syncing control-plane delivery manifest: $CP_MANIFEST"
+            # ^|^ switches the pair delimiter to '|' so the comma-separated
+            # version list and the JSON manifest each survive as ONE value.
             if gcloud run services update "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
-                --update-env-vars "^:^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}" >/dev/null 2>&1; then
+                --update-env-vars "^|^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}${CP_MANIFEST:+|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=${CP_MANIFEST}}" >/dev/null 2>&1; then
                 # A staged rollout (update-traffic --to-revisions) pins traffic to
                 # one revision, and `services update` then creates a revision that
                 # never serves (pinned 2026-10-12 to 10-14, so the v1.73.0 and
@@ -1006,11 +1046,20 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
 live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic", []) if t.get("percent")]
 print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
                 CP_SERVING_VERSIONS=""
+                CP_SERVING_MANIFEST=""
                 if [[ -n "$CP_SERVING_REV" ]]; then
-                    CP_SERVING_VERSIONS="$(gcloud run revisions describe "$CP_SERVING_REV" --project "$CP_PROJECT" --region "$CP_REGION" \
-                        --format=json 2>/dev/null | python3 -c 'import json, sys
+                    CP_SERVING_ENV="$(gcloud run revisions describe "$CP_SERVING_REV" --project "$CP_PROJECT" --region "$CP_REGION" \
+                        --format=json 2>/dev/null || true)"
+                    CP_SERVING_VERSIONS="$(printf '%s' "$CP_SERVING_ENV" | python3 -c 'import json, sys
 env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
 print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
+                    CP_SERVING_MANIFEST="$(printf '%s' "$CP_SERVING_ENV" | python3 -c 'import json, sys
+env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
+print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"), ""))' 2>/dev/null || true)"
+                fi
+                if [[ -n "$CP_MANIFEST" && "$CP_SERVING_MANIFEST" != "$CP_MANIFEST" ]]; then
+                    echo "  WARNING: delivery manifest was written but the serving revision"
+                    echo "           '${CP_SERVING_REV:-unknown}' does not carry it."
                 fi
                 if [[ "$CP_SERVING_VERSIONS" == "$CP_VERSIONS" ]]; then
                     echo "  Control-plane allowlist updated; serving revision $CP_SERVING_REV carries it."
@@ -1022,11 +1071,13 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIO
             else
                 echo "  WARNING: control-plane env update FAILED. Run manually:"
                 echo "    gcloud run services update $CP_SERVICE --region $CP_REGION \\"
-                echo "      --update-env-vars '^:^DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS'"
+                echo "      --update-env-vars '^|^DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS${CP_MANIFEST:+|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=$CP_MANIFEST}'"
             fi
         fi
     fi
 fi
+
+rm -f "${PRO_TAR_SHA_FILE:-}"
 
 echo ""
 echo "================================================"

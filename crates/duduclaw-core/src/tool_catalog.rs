@@ -1307,6 +1307,13 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "knowledge:read",
         "knowledge",
     ),
+    // Always approval-gated: a person decides in the dashboard.
+    (
+        "knowledge_add_source",
+        "Propose a document for a knowledge collection",
+        "knowledge:write",
+        "knowledge",
+    ),
     // ── Computer use actions (computer) ──────────────────────────────────
     // Additionally gated by `[capabilities] computer_use` at dispatch.
     (

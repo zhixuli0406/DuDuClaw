@@ -123,6 +123,12 @@ pub(super) async fn build_reply_with_session_inner(
     // to the next turn's prediction error. The session id is still used for
     // session manager / metrics; only the trust feedback path switches.
     let turn_id = format!("{session_id}#{}", uuid::Uuid::new_v4());
+    // Runs this turn dispatches (they carry its turn id) are limited to
+    // what this turn's person may read.
+    crate::knowledge::turn_requesters::remember_turn_origin(
+        &turn_id,
+        crate::knowledge::turn_requesters::current_requester(),
+    );
 
     // Determine which agent to use
     let reg = ctx.registry.read().await;
@@ -262,6 +268,17 @@ pub(super) async fn build_reply_with_session_inner(
         span.record(crate::otel::attrs::REQUEST_MODEL, model.as_str());
     }
     let agent_dir = agent.map(|a| a.dir.clone());
+
+    // ── 「加入知識庫 <集合>」 (document knowledge base) ──
+    // Proposes this message's attachments (or the sender's recent ones) for
+    // a collection. Every proposal waits for an Admin or the collection's
+    // editor in the dashboard. Zero LLM cost; public visitors never reach it.
+    if let Some(slug) = crate::knowledge::chat_add::parse(text)
+        .filter(|_| !public_visitor && agent.is_some())
+    {
+        return crate::knowledge::chat_add::run_in_turn(ctx, &agent_id, session_id, user_id, text, slug)
+            .await;
+    }
     let capabilities = agent.map(|a| a.config.capabilities.clone());
     // Already-loaded registry config — no extra read on the per-message path.
     let sandbox_enabled = agent
@@ -1332,10 +1349,47 @@ pub(super) async fn build_reply_with_session_inner(
     // Snowball Recap: prepend pinned instructions as <task_recap> to user message.
     // Placed in user message (U-shaped attention tail peak) rather than system
     // prompt to maximize LLM attention on the original task requirements.
+    //
+    // Document knowledge base: the turn's numbered passages go between the
+    // recap and the person's text (never the system prompt, never the
+    // stored history); the fixed rules section joins the system prompt
+    // whenever the employee has collections. `kb_only` with nothing
+    // relevant answers here without a model call.
+    let _knowledge_ledger = crate::knowledge::ledger::open(&agent_id, &turn_id);
+    let turn_knowledge = match agent_dir.as_ref() {
+        Some(dir) => {
+            crate::knowledge::auto_retrieve::prepare(crate::knowledge::auto_retrieve::TurnInput {
+                home: ctx.home_dir.clone(),
+                users: None,
+                agent_id: agent_id.clone(),
+                agent_dir: dir.clone(),
+                requester: crate::knowledge::turn_requesters::current_requester(),
+                query: text.to_string(),
+                turn_id: turn_id.clone(),
+            })
+            .await
+        }
+        None => Default::default(),
+    };
+    if let Some(direct) = turn_knowledge.direct_reply.clone() {
+        if let Err(e) = session_mgr
+            .append_message_with_id(session_id, "assistant", &direct, estimate_tokens(&direct))
+            .await
+        {
+            warn!("Failed to save assistant message to session: {e}");
+        }
+        return direct;
+    }
+    let full_system_prompt =
+        crate::knowledge::auto_retrieve::with_rules(full_system_prompt, turn_knowledge.rules);
+    let user_part = crate::knowledge::auto_retrieve::with_passages(
+        &sanitized_text,
+        turn_knowledge.block.as_deref(),
+    );
     let effective_message = if pinned.is_empty() || !has_history {
-        sanitized_text.clone()
+        user_part
     } else {
-        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{sanitized_text}")
+        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
     };
 
     // #12 glue (2026-05-12) — request-boundary budget enforcement.
@@ -1830,6 +1884,15 @@ pub(super) async fn build_reply_with_session_inner(
         .await;
 
     if let Some(mut reply) = reply {
+        // Document knowledge base: resolve `[n]` markers against what this
+        // turn offered (invalid ones removed) before anything is stored;
+        // the delivery step adds per-channel source footers.
+        let knowledge_cites =
+            crate::knowledge::cite_turn::finalize(&agent_id, &turn_id, session_id, &reply);
+        if !knowledge_cites.rows.is_empty() {
+            reply = knowledge_cites.text.clone();
+            crate::knowledge::cite_turn::publish(&knowledge_cites.cited);
+        }
         // ── Action-claim verifier (shadow mode) ─────────────────────
         //
         // Cross-reference factual assertions in `reply` against the
@@ -1945,6 +2008,13 @@ pub(super) async fn build_reply_with_session_inner(
         {
             Ok(message_id) => {
                 record_turn_assistant_message(session_id, message_id);
+                crate::knowledge::cite_turn::store(
+                    &ctx.home_dir,
+                    knowledge_cites.rows.clone(),
+                    user_message_id,
+                    Some(message_id),
+                )
+                .await;
                 turn_sources.assistant = Some(crate::memory_provenance::channel_message_source(
                     session_id,
                     message_id,

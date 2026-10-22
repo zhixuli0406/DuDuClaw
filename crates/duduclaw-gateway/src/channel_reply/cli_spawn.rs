@@ -123,13 +123,18 @@ pub(super) async fn call_claude_cli_lightweight(
         "", // Disable all built-in tools (pure text response)
         "-p",
         prompt,
-        "--model",
-        model,
         "--output-format",
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
     ]);
+    // An unset model (`[model] utility = ""`, a failover with no model) must
+    // leave the choice to the CLI. `--model ""` was sent verbatim before
+    // 2026-10-22; in that day's logs only those calls failed with
+    // `assistant error: unknown` (correlation, not yet reproduced).
+    if !model.trim().is_empty() {
+        cmd.args(["--model", model]);
+    }
 
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
@@ -511,9 +516,12 @@ where
     let max_attempts = account_count.max(1);
     let mut last_error = String::new();
     let mut retry_hint: Option<String> = None;
+    // One attempt per account (2026-10-22 incident): re-selecting from
+    // scratch let Priority hand back the same refusing account every time.
+    let mut tried: Vec<String> = Vec::new();
 
     for attempt in 0..max_attempts {
-        let Some(selected) = rotator.select_with_pool(account_pool).await else {
+        let Some(selected) = rotator.select_with_pool_excluding(account_pool, &tried).await else {
             // WP10: distinguish "accounts ARE configured but none is currently
             // available" (all cooling down / marked unhealthy) from "the last
             // attempt failed with <error>". Previously both collapsed into
@@ -541,6 +549,7 @@ where
             }
             break;
         };
+        tried.push(selected.id.clone());
         info!(account = %selected.id, attempt, "Channel CLI attempt");
 
         match spawn(selected.env_vars.clone(), retry_hint.clone()).await {

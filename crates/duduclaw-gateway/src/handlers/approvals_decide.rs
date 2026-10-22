@@ -101,6 +101,32 @@ impl MethodHandler {
                 );
             }
         }
+        // A proposal to add a source to a knowledge collection: decided only
+        // by an Admin or the collection's editor / owner (re-read now), side
+        // effect (hash check + ingest) first, decision after.
+        if let Some(rec) = &record {
+            if rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
+                let Ok(fresh) =
+                    crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)
+                else {
+                    return WsFrame::error_response("", PERMISSION_DENIED);
+                };
+                let users = self.user_db.read().await.clone();
+                let user = crate::knowledge::dashboard_user(&fresh, users.as_ref());
+                return match crate::knowledge::add_source_approval::decide(
+                    &self.home_dir,
+                    &broker,
+                    &approval_id,
+                    approve,
+                    &user,
+                )
+                .await
+                {
+                    Ok(v) => WsFrame::ok_response("", v),
+                    Err(e) => WsFrame::error_response("", &e),
+                };
+            }
+        }
         // R-M5: a knowledge review applies its side effect FIRST and records
         // the decision only after it succeeded — a failed side effect leaves
         // the approval pending (retryable) instead of terminal with the claim

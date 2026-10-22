@@ -134,6 +134,10 @@ pub fn run_assertions(expect: &ExpectSpec, t: &EvalTranscript) -> Vec<AssertionR
         out.push(run_grounded(spec, t));
     }
 
+    for spec in &expect.cites {
+        out.push(super::cites::run_cites(spec, t));
+    }
+
     out
 }
 

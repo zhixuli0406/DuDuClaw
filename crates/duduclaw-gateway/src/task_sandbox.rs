@@ -599,8 +599,12 @@ async fn select_account(
 ) -> Option<Selected> {
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..8 {
+        // Skip the accounts already walked: re-selecting from scratch handed
+        // back the same (unusable) account and ended the walk before an
+        // equal-priority spare was reached (2026-10-22 rotation fix).
+        let tried: Vec<String> = seen.iter().cloned().collect();
         let account = rotator
-            .select_for_provider_with_pool(provider, pool)
+            .select_for_provider_with_pool_excluding(provider, pool, &tried)
             .await?;
         if !seen.insert(account.id.clone()) {
             break;

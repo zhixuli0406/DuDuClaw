@@ -278,6 +278,7 @@ pub(super) async fn pending_assign_reply(
         artifact: None,
         agent: None,
         agent_name: None,
+        citations: None,
         thinking: None,
         task: reply
             .task

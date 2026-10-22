@@ -61,6 +61,33 @@ impl AccountRotator {
         provider: &str,
         pool: &[String],
     ) -> Option<AccountEnv> {
+        self.select_for_provider_with_pool_excluding(provider, pool, &[]).await
+    }
+
+    /// [`select_with_pool`](Self::select_with_pool) that skips the account ids
+    /// in `exclude` — the ones a retry loop already tried in this call.
+    ///
+    /// 2026-10-22 incident: the per-call retry loops ran "one attempt per
+    /// account" but re-selected from scratch each time, so Priority picked the
+    /// same refusing account on every attempt and a second, working account in
+    /// the pool was never reached. Returns `None` once every candidate has been
+    /// tried, which ends the loop.
+    pub async fn select_with_pool_excluding(
+        &self,
+        pool: &[String],
+        exclude: &[String],
+    ) -> Option<AccountEnv> {
+        self.select_for_provider_with_pool_excluding("anthropic", pool, exclude)
+            .await
+    }
+
+    /// Provider-scoped [`select_with_pool_excluding`](Self::select_with_pool_excluding).
+    pub async fn select_for_provider_with_pool_excluding(
+        &self,
+        provider: &str,
+        pool: &[String],
+        exclude: &[String],
+    ) -> Option<AccountEnv> {
         let accounts = self.accounts.read().await;
         let has_any_for_provider = accounts.iter().any(|a| a.provider == provider);
         let mut available: Vec<&Account> = accounts
@@ -91,12 +118,25 @@ impl AccountRotator {
             }
         }
 
+        // Exclusion runs AFTER pool narrowing: a pool member that was tried
+        // and failed is still *available*, so it must not trigger the
+        // fail-open above and hand the retry to an account outside the pool
+        // (e.g. a paid API key the operator kept away from this agent).
+        if !exclude.is_empty() {
+            available.retain(|a| !exclude.iter().any(|id| *id == a.id));
+        }
+
         if available.is_empty() {
             if !has_any_for_provider && self.inherit_host_credentials.load(Ordering::Relaxed) {
                 // Hold the accounts read lock through synchronous env lookup
                 // so a reload cannot publish a different inheritance policy
                 // between checking it and synthesizing an ambient account.
                 return env_fallback_account_env(provider);
+            }
+            if !exclude.is_empty() {
+                // A retry loop ran out of untried candidates; the caller
+                // reports the last real error.
+                return None;
             }
             warn!(provider, "No available accounts for rotation");
             return None;

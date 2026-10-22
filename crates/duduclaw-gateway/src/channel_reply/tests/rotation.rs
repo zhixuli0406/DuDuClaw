@@ -114,6 +114,54 @@ mod rotation_tests {
         );
     }
 
+    /// 2026-10-22 incident: two accounts at the SAME priority, the first one
+    /// weekly-capped. The CLI refuses with `assistant error: rate_limit`; the
+    /// second account must answer within the same call.
+    async fn run_equal_priority_pair(first_error: &'static str) -> (Result<String, String>, Vec<String>) {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("capped", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("spare", 1)).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_cloned = seen.clone();
+        let pool = vec!["capped".to_string(), "spare".to_string()];
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            &pool,
+            move |env_vars, _retry_hint| {
+                let token = env_vars.get("CLAUDE_CODE_OAUTH_TOKEN").cloned().unwrap_or_default();
+                seen_cloned.lock().unwrap().push(token.clone());
+                async move {
+                    if token == "tok_capped" {
+                        Err(first_error.to_string())
+                    } else {
+                        Ok("hello from spare".to_string())
+                    }
+                }
+            },
+            100,
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        (result, seen)
+    }
+
+    #[tokio::test]
+    async fn cli_rate_limit_code_moves_to_the_equal_priority_spare() {
+        let (result, seen) = run_equal_priority_pair("claude CLI assistant error: rate_limit").await;
+        assert_eq!(result.as_deref(), Ok("hello from spare"));
+        assert_eq!(seen, vec!["tok_capped", "tok_spare"]);
+    }
+
+    /// Generic errors are booked with strikes, not a cooldown, so the account
+    /// stays selectable; the retry loop must still not hand it back twice.
+    #[tokio::test]
+    async fn generic_error_does_not_retry_the_same_account() {
+        let (result, seen) = run_equal_priority_pair("claude CLI assistant error: unknown").await;
+        assert_eq!(result.as_deref(), Ok("hello from spare"));
+        assert_eq!(seen, vec!["tok_capped", "tok_spare"]);
+    }
+
     /// Scenario: summarized-failure retry (arXiv:2605.08563).
     ///
     /// First attempt hits a model-behavior failure (hard timeout); the retry

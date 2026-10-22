@@ -199,6 +199,12 @@ pub enum ChatMessage {
         /// That employee's display name, for the reply label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
+        /// Knowledge-base sources the reply cites (`[n]` in `content`):
+        /// `{n, chunk_id, source_id, title, locator, excerpt}`. The browser
+        /// opens a passage through `knowledge.passage.get`, which re-checks
+        /// permissions. Absent when nothing was cited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        citations: Option<Vec<duduclaw_knowledge::cite::CitationRef>>,
         /// What this turn's `thinking` frames amounted to (tokens, number of
         /// blocks, final kinds; never text). Absent when no `thinking` frame
         /// was sent this turn — always for a public-widget visitor.
@@ -1236,6 +1242,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             artifact: None,
                                             agent: None,
                                             agent_name: None,
+                                            citations: None,
                                             thinking: None,
                                             task: task.map(|t| serde_json::json!({ "id": t.id, "agent": t.agent })),
                                         };
@@ -1358,6 +1365,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let reply = guarded.text.clone();
                                 let operator_artifact = guarded.artifact.clone();
                                 let answered_by = guarded.answered_by.clone();
+                                let citations = (!guarded.citations.is_empty())
+                                    .then(|| guarded.citations.clone());
 
                                 // WP1.3 + live-verification fix (2026-08-15):
                                 // 📎DELIVER: handling. WebChat has no in-band
@@ -1475,6 +1484,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     artifact: operator_artifact,
                                     agent: answered_by.as_ref().map(|a| a.id.clone()),
                                     agent_name: answered_by.map(|a| a.display_name),
+                                    citations,
                                     thinking: thinking_meta.build(),
                                     task: None,
                                 };
@@ -2013,6 +2023,7 @@ mod tests {
             artifact: None,
             agent: Some("finance".into()),
             agent_name: Some("財務小幫手".into()),
+            citations: None,
             thinking: Some(crate::thinking::DoneMeta {
                 tokens: Some(1240),
                 blocks: 1,
@@ -2047,6 +2058,7 @@ mod tests {
             artifact: None,
             agent: None,
             agent_name: None,
+            citations: None,
             thinking: None,
             task: None,
         };
@@ -2067,6 +2079,38 @@ mod tests {
             !json.contains("thinking"),
             "absent thinking must not serialize: {json}"
         );
+        assert!(
+            !json.contains("citations"),
+            "absent citations must not serialize: {json}"
+        );
+    }
+
+    #[test]
+    fn assistant_done_carries_knowledge_citations() {
+        let done = ChatMessage::AssistantDone {
+            content: "滿一年給七日[1]".into(),
+            tokens_used: 3,
+            conv: None,
+            model: None,
+            artifact: None,
+            agent: None,
+            agent_name: None,
+            citations: Some(vec![duduclaw_knowledge::cite::CitationRef {
+                n: 1,
+                chunk_id: 42,
+                source_id: "src_a".into(),
+                title: "員工手冊.pdf".into(),
+                locator: "第 3 頁".into(),
+                excerpt: "特休假依年資計算".into(),
+            }]),
+            thinking: None,
+            task: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&done).expect("serialize");
+        assert_eq!(v["type"], "assistant_done");
+        assert_eq!(v["citations"][0]["n"], 1);
+        assert_eq!(v["citations"][0]["chunk_id"], 42);
+        assert_eq!(v["citations"][0]["locator"], "第 3 頁");
     }
 
     #[test]
@@ -2087,6 +2131,7 @@ mod tests {
             artifact: Some(artifact.clone()),
             agent: None,
             agent_name: None,
+            citations: None,
             thinking: None,
             task: None,
         };

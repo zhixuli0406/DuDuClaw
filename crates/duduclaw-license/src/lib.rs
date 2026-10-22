@@ -30,6 +30,7 @@ pub mod fingerprint;
 pub mod gate;
 pub mod key;
 pub mod license;
+pub mod notice;
 pub mod storage;
 pub mod tier;
 
@@ -43,6 +44,7 @@ pub use fingerprint::{
 pub use gate::{FeatureGate, SERVICE_COMMITMENTS, is_service_commitment};
 pub use key::{verify_license, PublicKeyRegistry};
 pub use license::{License, CURRENT_SCHEMA_VERSION};
+pub use notice::{notice_sha256, SignedDistributorNotice, NOTICE_KIND};
 pub use storage::{
     default_license_path, delete_default, license_dir, load_default, load_from, save_default,
     save_to,
