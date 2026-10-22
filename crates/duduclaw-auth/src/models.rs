@@ -89,7 +89,9 @@ pub enum AccessLevel {
     /// Operational — chat, view memory and profile file versions; cannot
     /// change settings or profile files.
     Operator,
-    /// Read-only — view status and memory only.
+    /// Read-only — view status and memory, and read the profile files
+    /// (persona, introduction, work rules, boundaries; basic settings with
+    /// secrets masked). No versions, no diffs, no changes.
     Viewer,
 }
 

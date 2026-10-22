@@ -183,6 +183,20 @@ pub fn accept_if_was_intact(
     Ok(true)
 }
 
+/// Whether a drift of `doc` whose current content hashes to `current_hash`
+/// should be reported now: once per distinct drifted content, so a file that
+/// stays changed does not write the same audit row on every heartbeat. The
+/// last reported hash is kept next to the baseline (`<agent>.<ext>.reported`);
+/// an unreadable marker reports (fail towards visibility).
+pub fn should_report_drift(doc: ProtectedDoc, agent_dir: &Path, current_hash: &str) -> bool {
+    let path = super::hash_path_with(agent_dir, &format!("{}.reported", doc.hash_ext()));
+    if std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == current_hash) {
+        return false;
+    }
+    let _ = std::fs::write(&path, current_hash);
+    true
+}
+
 /// Heartbeat-style integrity check: establishes the baseline on a genuine
 /// first run, reports drift otherwise. SOUL delegates to
 /// [`super::check_soul_integrity`] (content scan + ASI included).
@@ -281,6 +295,16 @@ mod tests {
         assert!(!check_doc_integrity(doc, "ins", &dir).intact);
         accept_doc_change(doc, "ins", &dir).unwrap();
         assert_eq!(doc_drift(doc, &dir), DocDrift::Intact);
+    }
+
+    #[test]
+    fn drift_is_reported_once_per_content() {
+        let (_t, dir) = agent("rep");
+        let doc = ProtectedDoc::Instructions;
+        assert!(should_report_drift(doc, &dir, "h1"));
+        assert!(!should_report_drift(doc, &dir, "h1"), "same drifted content: quiet");
+        assert!(should_report_drift(doc, &dir, "h2"), "changed again: report");
+        assert!(should_report_drift(ProtectedDoc::Soul, &dir, "h2"), "per file");
     }
 
     #[test]

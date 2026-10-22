@@ -147,9 +147,21 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
         });
     }
 
-    // Write back
-    let new_content = toml::to_string_pretty(&doc).unwrap_or_default();
-    if let Err(e) = tokio::fs::write(&toml_path, &new_content).await {
+    // Write back through the gateway's profile file writer: only
+    // `[evolution].<field>` changes (format kept), under the shared lock, with
+    // a version and the `agent_file_changed` audit row. The value validated
+    // above is re-applied to the file as read under the lock.
+    let value = doc["evolution"][field].clone();
+    let written = duduclaw_gateway::agent_files::external::edit_agent_toml(home_dir, agent_id, "mcp", "mcp", |t| {
+        let evo = t
+            .entry("evolution")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or("[evolution] is not a table")?;
+        evo.insert(field.to_string(), value);
+        Ok(())
+    });
+    if let Err(e) = written {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
             "isError": true
@@ -159,7 +171,7 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
     serde_json::json!({
         "content": [{"type": "text", "text": format!(
             "Evolution config updated: {agent_id}.evolution.{field} = {value_str}\n\
-             Changes take effect within 5 minutes (next heartbeat sync) or immediately on restart."
+             A running gateway may only pick it up after its next reload of the employee list (any dashboard save) or a restart."
         )}]
     })
 }

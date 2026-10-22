@@ -19,6 +19,10 @@ pub(crate) struct RuleInput<'a> {
     pub is_admin: bool,
     /// The employee's current `must_not` (for the secret / boundary scan).
     pub must_not: &'a [String],
+    /// Scan the whole new text for injection, not only the added lines (the
+    /// file had been changed outside the dashboard, so "unchanged" lines were
+    /// never reviewed).
+    pub full_scan: bool,
 }
 
 fn finding(level: RuleLevel, cat: &str, message: impl Into<String>, evidence: &str) -> RuleFinding {
@@ -115,6 +119,9 @@ fn markdown_rules(input: &RuleInput<'_>) -> Vec<RuleFinding> {
 
 /// The input filter, over the lines this change adds only.
 fn injection(input: &RuleInput<'_>) -> Vec<RuleFinding> {
+    if input.full_scan {
+        return scan_added(input.new.to_string());
+    }
     scan_added(super::diff::added_text(input.old, input.new))
 }
 
@@ -243,7 +250,7 @@ mod tests {
     use crate::agent_files::verdict::rule_level;
 
     fn run(key: FileKey, old: &str, new: &str, is_admin: bool) -> Vec<RuleFinding> {
-        check(&RuleInput { key, old, new, is_admin, must_not: &[] })
+        check(&RuleInput { key, old, new, is_admin, must_not: &[], full_scan: false })
     }
 
     #[test]
@@ -266,6 +273,10 @@ mod tests {
         // The same line already present and untouched: not flagged again.
         let f = run(FileKey::Instructions, bad, &format!("{bad}\n請用繁體中文回答"), false);
         assert!(!f.iter().any(|f| f.reason.category == "prompt_injection"), "{f:?}");
+        // …unless the file had drifted: then the whole text is scanned.
+        let new = format!("{bad}\n請用繁體中文回答");
+        let f = check(&RuleInput { key: FileKey::Instructions, old: bad, new: &new, is_admin: false, must_not: &[], full_scan: true });
+        assert!(f.iter().any(|f| f.reason.category == "prompt_injection"), "{f:?}");
     }
 
     #[test]

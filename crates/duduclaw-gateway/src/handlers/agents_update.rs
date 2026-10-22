@@ -86,6 +86,18 @@ impl MethodHandler {
             return WsFrame::error_response("", &msg);
         }
 
+        // The new name is written into SOUL.md / IDENTITY.md, which reach
+        // every prompt: plain text only.
+        if let Some(name) = params.get("display_name").and_then(|v| v.as_str()) {
+            if let Err(e) = duduclaw_core::validate_display_name(name) {
+                return WsFrame::error_response("", &e);
+            }
+            // The name also reaches team rosters in other employees' prompts.
+            if let Err(cats) = crate::agent_files::external::rename_is_safe("", name) {
+                return WsFrame::error_response("", &format!("display_name looks like an instruction to the AI ({cats}); choose a plain name"));
+            }
+        }
+
         // `role = "main"` is an authority change (`agent_authority`): refuse a
         // non-admin BEFORE the current main is demoted below.
         let caller_is_admin = caller.is_some_and(|c| c.is_admin());
@@ -1112,6 +1124,7 @@ impl MethodHandler {
                 // Best-effort: a failure is logged but does not fail the
                 // already-committed agent.toml write.
                 let mut soul_sync_changes: Vec<String> = Vec::new();
+                let mut soul_sync_skipped: Vec<String> = Vec::new();
                 if let (Some(new_name), Some(old_name), Some(_)) =
                     (&new_display_name, &old_display_name, &agent_dir_for_rename)
                 {
@@ -1123,7 +1136,10 @@ impl MethodHandler {
                                     key.file_name()
                                 )),
                                 Ok(false) => {}
-                                Err(e) => warn!(agent_id = agent_id.as_str(), file = key.file_name(), error = %e, "Failed to sync the new name into a profile file"),
+                                Err(e) => {
+                                    warn!(agent_id = agent_id.as_str(), file = key.file_name(), error = %e, "New name not synced into a profile file");
+                                    soul_sync_skipped.push(format!("{}: {e}", key.file_name()));
+                                }
                             }
                         }
                     }
@@ -1173,6 +1189,9 @@ impl MethodHandler {
                         "channels_restarted": restarted,
                         "os_watch_hot_reloaded": os_watch_hot_reloaded,
                         "identity_files_synced": soul_sync_changes,
+                        // Files the rename sync left alone because the result
+                        // tripped a fixed rule (edit them in the dashboard).
+                        "identity_files_skipped": soul_sync_skipped,
                         // Save-time model↔provider auto-align: the provider the
                         // gateway rewrote [runtime] to, or null when untouched.
                         "runtime_provider_aligned": aligned_provider.lock().ok().and_then(|s| s.clone()),
@@ -1220,7 +1239,14 @@ impl MethodHandler {
                 meta: CommitMeta::new(caller.map(|c| c.user_id.as_str()).unwrap_or("system"), "rename"),
                 baseline: Baseline::AcceptIfWasIntact,
             },
-            move |current| Ok(duduclaw_core::rename_in_markdown(current, &old, &new).0),
+            move |current| {
+                let renamed = duduclaw_core::rename_in_markdown(current, &old, &new).0;
+                // An automatic edit nobody reviews: write it only when the
+                // fixed rules find nothing in the result.
+                crate::agent_files::external::rename_is_safe(current, &renamed)
+                    .map_err(|cats| format!("not synced, the result needs a review ({cats})"))?;
+                Ok(renamed)
+            },
             || Ok(()),
         )
         .await

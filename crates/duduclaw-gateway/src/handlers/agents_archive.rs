@@ -40,6 +40,11 @@ impl MethodHandler {
         if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }
+        // The profile file history goes to `agent_file_history/_trash/`
+        // (kept, like the rest of the folder; archive keeps it in place).
+        if let Err(e) = crate::agent_files::history::retire(&self.home_dir, &agent_id) {
+            warn!(agent = %agent_id, error = %e, "profile file history not moved to _trash");
+        }
 
         crate::security_autopilot::audit_and_emit(
             &self.home_dir,

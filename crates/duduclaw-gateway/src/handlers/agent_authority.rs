@@ -76,6 +76,8 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("permissions.can_send_cross_agent", &["form.can_send_cross_agent"], Change),
     key("permissions.can_schedule_tasks", &["form.can_schedule_tasks"], Change),
     key("permissions.can_modify_own_skills", &["form.can_modify_own_skills"], Change),
+    // Which channels the employee may answer on.
+    key("permissions.allowed_channels", &[], Change),
     key("guardrails.enabled", &["v.guardrails_enabled"], Change),
     key("guardrails.block_secrets", &["v.guardrails_block_secrets"], Change),
     // v1.76: opens the employee to `@` calls from unmapped channel senders.
@@ -127,7 +129,7 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         | "permissions.can_schedule_tasks"
         | "permissions.can_modify_own_skills"
         | "guardrails.block_secrets" => or(Value::Bool(true)),
-        "model.account_pool" => or(json!([])),
+        "model.account_pool" | "permissions.allowed_channels" => or(json!([])),
         "budget.monthly_limit_cents" | "budget.daily_cap_cents" => or(json!(0)),
         "capabilities" => {
             let defaults = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
@@ -234,6 +236,7 @@ mod tests {
             ("[container]\nreadonly_project=false\n", "container.readonly_project"),
             ("[os_watch]\npaths=['/']\n", "os_watch"),
             ("[model]\naccount_pool=['acct']\n", "model.account_pool"),
+            ("[permissions]\nallowed_channels=['line']\n", "permissions.allowed_channels"),
         ] {
             let after = t(&format!("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n{frag}"));
             let diff = authority_diff(&before, &after);

@@ -22,8 +22,10 @@
 
 pub(crate) mod approval;
 pub(crate) mod diff;
+pub mod external;
 pub(crate) mod flow;
 pub(crate) mod history;
+pub(crate) mod quota;
 pub(crate) mod review;
 pub(crate) mod rules;
 pub(crate) mod verdict;
@@ -138,6 +140,12 @@ pub(crate) struct AgentFilesConfig {
     pub history_keep: usize,
     /// Reviews allowed per deployment per day; past it a review "fails".
     pub review_daily_limit: u32,
+    /// Reviews one person may start per day.
+    pub review_daily_limit_per_user: u32,
+    /// Reviews of one employee's files per day.
+    pub review_daily_limit_per_agent: u32,
+    /// Checks one person may start per minute.
+    pub checks_per_minute: u32,
     /// What a review that did not complete counts as (`warn` or `block`;
     /// there is deliberately no "off").
     pub on_analysis_failure: verdict::Verdict,
@@ -150,6 +158,9 @@ impl Default for AgentFilesConfig {
         Self {
             history_keep: 20,
             review_daily_limit: 200,
+            review_daily_limit_per_user: 40,
+            review_daily_limit_per_agent: 60,
+            checks_per_minute: 10,
             on_analysis_failure: verdict::Verdict::Warn,
             review_provider: None,
             review_model: None,
@@ -173,8 +184,18 @@ impl AgentFilesConfig {
         if let Some(n) = t.get("history_keep").and_then(|v| v.as_integer()) {
             c.history_keep = n.clamp(5, 100) as usize;
         }
-        if let Some(n) = t.get("review_daily_limit").and_then(|v| v.as_integer()) {
-            c.review_daily_limit = n.clamp(0, 100_000) as u32;
+        let int = |k: &str, max: i64| t.get(k).and_then(|v| v.as_integer()).map(|n| n.clamp(0, max) as u32);
+        if let Some(n) = int("review_daily_limit", 100_000) {
+            c.review_daily_limit = n;
+        }
+        if let Some(n) = int("review_daily_limit_per_user", 100_000) {
+            c.review_daily_limit_per_user = n;
+        }
+        if let Some(n) = int("review_daily_limit_per_agent", 100_000) {
+            c.review_daily_limit_per_agent = n;
+        }
+        if let Some(n) = int("checks_per_minute", 1_000) {
+            c.checks_per_minute = n.max(1);
         }
         // Only "block" changes anything; every other value keeps "warn".
         if t.get("on_analysis_failure").and_then(|v| v.as_str()) == Some("block") {

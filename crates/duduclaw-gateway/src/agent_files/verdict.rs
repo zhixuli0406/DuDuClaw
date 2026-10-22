@@ -65,6 +65,8 @@ pub(crate) mod category {
     pub const SIZE: &str = "size";
     pub const FORMAT: &str = "format";
     pub const ANALYSIS_UNAVAILABLE: &str = "analysis_unavailable";
+    /// The file had been changed outside the dashboard before this save.
+    pub const OUTSIDE_CHANGE: &str = "outside_change";
 }
 
 /// One reason the check gave.
@@ -115,7 +117,9 @@ pub(crate) fn rules_verdict(level: RuleLevel) -> Verdict {
 pub(crate) enum AiOutcome {
     /// Not run for this file or source.
     NotApplicable,
-    Done { verdict: Verdict, summary: String, reasons: Vec<Reason> },
+    /// `partial`: the reviewer only saw part of the change (the diff or the
+    /// text was cut to fit), so the result counts as at least a warning.
+    Done { verdict: Verdict, summary: String, reasons: Vec<Reason>, partial: bool },
     /// Timed out, unparseable, over quota, no utility model…
     Failed(String),
 }
@@ -126,7 +130,10 @@ pub(crate) fn merge(rule: RuleLevel, ai: &AiOutcome, on_failure: Verdict) -> Ver
     let r = rules_verdict(rule);
     match ai {
         AiOutcome::NotApplicable => r,
-        AiOutcome::Done { verdict, .. } => r.max(*verdict),
+        AiOutcome::Done { verdict, partial, .. } => {
+            let v = r.max(*verdict);
+            if *partial { v.max(Verdict::Warn) } else { v }
+        }
         AiOutcome::Failed(_) => r.max(on_failure.max(Verdict::Warn)),
     }
 }
@@ -149,6 +156,22 @@ pub(crate) fn unavailable_reason() -> Reason {
     )
 }
 
+/// The reason added when the reviewer only saw part of the change.
+pub(crate) fn partial_reason() -> Reason {
+    Reason::new(
+        category::ANALYSIS_UNAVAILABLE,
+        "medium",
+        "內容太長，自動檢查只看了一部分，請自己確認其餘內容",
+        "",
+    )
+}
+
+/// Whether the automatic review did not cover the whole change (failed or
+/// partial). A non-admin cannot confirm such a result themselves.
+pub(crate) fn incomplete(reasons: &[Reason]) -> bool {
+    reasons.iter().any(|r| r.category == category::ANALYSIS_UNAVAILABLE)
+}
+
 /// Category names, deduplicated, in first-seen order (for audit and history).
 pub(crate) fn categories(reasons: &[Reason]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -164,6 +187,8 @@ pub(crate) fn categories(reasons: &[Reason]) -> Vec<String> {
 
 /// How long a check result can be confirmed or sent for approval.
 pub(crate) const ANALYSIS_TTL: Duration = Duration::from_secs(15 * 60);
+/// At most this many check results are kept at once.
+const MAX_RECORDS: usize = 1000;
 
 /// What one check was about: a confirm or approval request must match every
 /// field (same person, employee, file, starting version and content).
@@ -200,6 +225,11 @@ pub(crate) fn remember(a: Analysis) -> String {
         Err(p) => p.into_inner(),
     };
     map.retain(|_, s| s.at.elapsed() < ANALYSIS_TTL);
+    // Bounded: past the cap the oldest records go first.
+    while map.len() >= MAX_RECORDS {
+        let Some(oldest) = map.iter().min_by_key(|(_, s)| s.at).map(|(k, _)| k.clone()) else { break };
+        map.remove(&oldest);
+    }
     map.insert(id.clone(), Stored { at: Instant::now(), analysis: a });
     id
 }
@@ -231,9 +261,11 @@ pub(crate) fn forget(id: &str) {
 
 /// The `review` object of the save envelope.
 pub(crate) fn review_json(analysis_id: Option<&str>, a: &Analysis, is_admin: bool) -> Value {
+    // An incomplete review (failed, over quota, or partial) cannot be
+    // confirmed by a non-admin: they can only send it to an admin.
     let can_confirm = match a.verdict {
         Verdict::Pass => false,
-        Verdict::Warn => true,
+        Verdict::Warn => is_admin || !incomplete(&a.reasons),
         Verdict::Block => is_admin,
     };
     json!({
@@ -253,7 +285,7 @@ mod tests {
 
     #[test]
     fn ai_only_makes_it_stricter_and_failure_is_never_a_pass() {
-        let done = |v| AiOutcome::Done { verdict: v, summary: String::new(), reasons: vec![] };
+        let done = |v| AiOutcome::Done { verdict: v, summary: String::new(), reasons: vec![], partial: false };
         assert_eq!(merge(RuleLevel::Escalate, &done(Verdict::Pass), Verdict::Warn), Verdict::Block);
         assert_eq!(merge(RuleLevel::None, &done(Verdict::Block), Verdict::Warn), Verdict::Block);
         assert_eq!(merge(RuleLevel::None, &done(Verdict::Pass), Verdict::Warn), Verdict::Pass);
@@ -263,6 +295,8 @@ mod tests {
         // Even a misconfigured "pass" on failure cannot make it a pass.
         assert_eq!(merge(RuleLevel::None, &failed, Verdict::Pass), Verdict::Warn);
         assert_eq!(merge(RuleLevel::Flag, &AiOutcome::NotApplicable, Verdict::Warn), Verdict::Warn);
+        let partial = AiOutcome::Done { verdict: Verdict::Pass, summary: String::new(), reasons: vec![], partial: true };
+        assert_eq!(merge(RuleLevel::None, &partial, Verdict::Warn), Verdict::Warn, "a partial review is at least a warning");
     }
 
     fn analysis() -> Analysis {
@@ -300,6 +334,9 @@ mod tests {
         let v = review_json(Some("x"), &a, false);
         assert_eq!(v["can_confirm"], true);
         assert_eq!(v["can_request_approval"], true);
+        a.reasons = vec![unavailable_reason()];
+        assert_eq!(review_json(None, &a, false)["can_confirm"], false, "incomplete: non-admins only send it");
+        assert_eq!(review_json(None, &a, true)["can_confirm"], true);
         a.verdict = Verdict::Block;
         assert_eq!(review_json(None, &a, false)["can_confirm"], false);
         assert_eq!(review_json(None, &a, true)["can_confirm"], true);

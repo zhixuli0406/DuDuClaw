@@ -21,6 +21,8 @@ use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus
 pub(crate) const ACTION_KIND: &str = "agent_file_change";
 /// Three days; expiry counts as a denial.
 pub(crate) const TTL_SECS: i64 = 3 * 24 * 3600;
+/// At most this many requests by one person may wait at once.
+pub(crate) const MAX_PENDING_PER_USER: usize = 20;
 
 /// The plain zh-TW name of a file (channel notices, summaries).
 pub(crate) fn plain_name(key: FileKey) -> &'static str {
@@ -91,12 +93,21 @@ pub(crate) async fn file_request(
     reason: &str,
 ) -> Result<String, String> {
     let broker = ApprovalBroker::open(home)?;
+    let mut waiting = 0usize;
     for rec in broker.list_by_kind(ACTION_KIND).await? {
         let mine = rec.payload.get("requested_by").and_then(Value::as_str) == Some(analysis.user_id.as_str());
-        if live_pending(&rec) && mine && target(&rec) == Some((analysis.agent_id.clone(), analysis.file)) {
+        if !(live_pending(&rec) && mine) {
+            continue;
+        }
+        if target(&rec) == Some((analysis.agent_id.clone(), analysis.file)) {
             broker.withdraw(&rec.id, "superseded").await?;
             remove_sidecar(home, rec.id.as_str());
+        } else {
+            waiting += 1;
         }
+    }
+    if waiting >= MAX_PENDING_PER_USER {
+        return Err(format!("你已有 {waiting} 份修改在等待審核，請等管理員處理或撤回一些再送出"));
     }
     let categories = super::verdict::categories(&analysis.reasons);
     let payload = json!({

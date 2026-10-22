@@ -1119,6 +1119,41 @@ client_id = "x"
         assert!(paths.contains(&"accounts[id=a2].api_key_enc".to_string()), "{paths:?}");
     }
 
+    /// What `agent_files.get` shows a Viewer of `agent.toml`: every
+    /// credential an employee file can hold is masked.
+    #[test]
+    fn agent_toml_secrets_are_masked() {
+        let agent = r#"
+[agent]
+name = "a1"
+
+[channels.discord]
+bot_token = "PLAIN-DISCORD-TOKEN"
+bot_token_enc = "ENC-DISCORD"
+
+[channels.telegram]
+bot_token_enc = "ENC-TELEGRAM"
+
+[channels.slack]
+app_token = "xapp-PLAIN"
+bot_token = "xoxb-PLAIN"
+
+[odoo]
+url = "https://user:odoo-pass@erp.example.com"
+api_key = "ODOO-API-KEY"
+password_enc = "ENC-ODOO-PW"
+username = "bot"
+
+[container.env]
+OPENAI_API_KEY = "sk-env-secret"
+"#;
+        let (masked, _, _) = mask_raw_toml(agent).unwrap();
+        for secret in ["PLAIN-DISCORD-TOKEN", "ENC-DISCORD", "ENC-TELEGRAM", "xapp-PLAIN", "xoxb-PLAIN", "odoo-pass", "ODOO-API-KEY", "ENC-ODOO-PW", "sk-env-secret"] {
+            assert!(!masked.contains(secret), "{secret} leaked:\n{masked}");
+        }
+        assert!(masked.contains("username = \"bot\""), "non-secret kept");
+    }
+
     #[test]
     fn round_trip_restores_secrets_even_when_entries_are_reordered() {
         let (masked, _, _) = mask_raw_toml(SAMPLE).unwrap();

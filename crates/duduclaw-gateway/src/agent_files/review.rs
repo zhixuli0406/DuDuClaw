@@ -73,6 +73,8 @@ pub(crate) fn review_output_schema() -> Value {
 /// Who the employee is and what changed.
 pub(crate) struct ReviewInput<'a> {
     pub home: &'a Path,
+    /// Who asked (per-person quota).
+    pub user_id: &'a str,
     pub agent_id: &'a str,
     pub display_name: &'a str,
     pub role: &'a str,
@@ -86,34 +88,43 @@ pub(crate) struct ReviewInput<'a> {
     pub flagged: &'a [String],
 }
 
-/// The review prompt. User text is stripped of hidden content and wrapped
-/// in tags carrying a random nonce, so text inside cannot fake a closing tag.
-pub(crate) fn build_prompt(input: &ReviewInput<'_>, nonce: &str) -> String {
+/// The review prompt and whether anything had to be cut to fit. Every
+/// value that comes from a person or the employee's files (names, role,
+/// department, boundaries, the diff, the text) is stripped of hidden content
+/// and wrapped in tags carrying a random nonce, so text inside cannot fake a
+/// closing tag or pose as an instruction.
+pub(crate) fn build_prompt(input: &ReviewInput<'_>, nonce: &str) -> (String, bool) {
     let clean = |s: &str| duduclaw_security::soul_scanner::strip_hidden_content(s);
+    let full_diff = super::diff::unified(&clean(input.old), &clean(input.new), 3, usize::MAX);
+    let diff_cut = full_diff.len() > MAX_DIFF_BYTES;
     let diff = super::diff::unified(&clean(input.old), &clean(input.new), 3, MAX_DIFF_BYTES);
     let after_full = clean(input.new);
-    let after = if after_full.len() > MAX_AFTER_BYTES {
+    let after_cut = after_full.len() > MAX_AFTER_BYTES;
+    let after = if after_cut {
         format!("{}\n…（全文過長，已截斷）", duduclaw_core::truncate_bytes(&after_full, MAX_AFTER_BYTES))
     } else {
         after_full
     };
-    let list = |v: &[String]| if v.is_empty() { "（無）".to_string() } else { v.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n") };
+    let list = |v: &[String]| if v.is_empty() { "（無）".to_string() } else { v.iter().map(|s| format!("- {}", clean(s))).collect::<Vec<_>>().join("\n") };
+    let dept = if input.department.is_empty() { "（無）".to_string() } else { clean(input.department) };
+    let profile = format!(
+        "名稱：{}\n角色：{}\n部門：{dept}\n行為界線 must_not：\n{}\nmust_always：\n{}",
+        clean(input.display_name),
+        clean(input.role),
+        list(input.must_not),
+        list(input.must_always),
+    );
     let prompt = format!(
-        "AI 員工：{name}（角色 {role}，部門 {dept}）\n檔案：{file}\n\
-         目前的行為界線 must_not：\n{mn}\nmust_always：\n{ma}\n\
-         固定規則已標記：{flags}\n\n\
+        "檔案：{file}\n固定規則已標記：{flags}\n\n\
+         <employee nonce=\"{nonce}\">\n{profile}\n</employee nonce=\"{nonce}\">\n\n\
          <change nonce=\"{nonce}\">\n{diff}</change nonce=\"{nonce}\">\n\n\
          <file_after nonce=\"{nonce}\">\n{after}\n</file_after nonce=\"{nonce}\">\n\n\
          只回覆 JSON。",
-        name = input.display_name,
-        role = input.role,
-        dept = if input.department.is_empty() { "（無）" } else { input.department },
         file = input.key.file_name(),
-        mn = list(input.must_not),
-        ma = list(input.must_always),
         flags = if input.flagged.is_empty() { "（無）".to_string() } else { input.flagged.join(", ") },
     );
-    duduclaw_core::truncate_bytes(&prompt, MAX_TOTAL_BYTES).to_string()
+    let total_cut = prompt.len() > MAX_TOTAL_BYTES;
+    (duduclaw_core::truncate_bytes(&prompt, MAX_TOTAL_BYTES).to_string(), diff_cut || after_cut || total_cut)
 }
 
 /// Parse the reply strictly (see the module doc).
@@ -163,22 +174,6 @@ pub(crate) fn parse_reply(raw: &str) -> Result<(Verdict, String, Vec<Reason>), S
     Ok((verdict, summary, reasons))
 }
 
-/// Count one review against today's deployment-wide limit. `false` = over.
-fn take_quota(home: &Path, limit: u32) -> bool {
-    let path = home.join("agent_files_review_usage.json");
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    duduclaw_core::with_file_lock(&path, || {
-        let state: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-        let count = if state["date"] == today.as_str() { state["count"].as_u64().unwrap_or(0) } else { 0 };
-        if count >= u64::from(limit) {
-            return Ok(false);
-        }
-        std::fs::write(&path, json!({ "date": today, "count": count + 1 }).to_string())?;
-        Ok(true)
-    })
-    .unwrap_or(false)
-}
-
 #[cfg_attr(test, allow(dead_code))]
 /// The utility hint: the review model override (degraded with a log line
 /// when it cannot be honoured) plus the reply schema.
@@ -219,30 +214,47 @@ async fn call_model(home: &Path, prompt: &str, cfg: &AgentFilesConfig) -> Result
 }
 
 /// Run the review. Never returns a pass for something it could not check.
+/// The same change checked again within 15 minutes reuses the result and
+/// spends no quota.
 pub(crate) async fn review(input: &ReviewInput<'_>, cfg: &AgentFilesConfig) -> AiOutcome {
-    let failed = |why: String| {
+    // The audit row names only the kind of failure; provider error text can
+    // echo the prompt and stays in the local log.
+    let failed = |kind: &'static str, detail: &str| {
         crate::security_autopilot::audit_and_emit(
             input.home,
             &duduclaw_security::audit::AuditEvent::new(
                 "agent_file_review_failed",
                 input.agent_id,
                 duduclaw_security::audit::Severity::Warning,
-                json!({ "agent_id": input.agent_id, "file": input.key.as_str(), "reason": duduclaw_core::truncate_chars(&why, 300) }),
+                json!({ "agent_id": input.agent_id, "file": input.key.as_str(), "user_id": input.user_id, "reason": kind }),
             ),
         );
-        tracing::warn!(agent = input.agent_id, file = input.key.as_str(), reason = %why, "agent file review failed");
-        AiOutcome::Failed(why)
+        tracing::warn!(agent = input.agent_id, file = input.key.as_str(), kind, detail = %duduclaw_core::truncate_chars(detail, 300), "agent file review failed");
+        AiOutcome::Failed(kind.to_string())
     };
-    if !take_quota(input.home, cfg.review_daily_limit) {
-        return failed("daily review limit reached".into());
+    let key = super::quota::cache_key(input.home, input.agent_id, input.key.as_str(), input.old, input.new);
+    if let Some(c) = super::quota::cached(&key) {
+        return AiOutcome::Done { verdict: c.verdict, summary: c.summary, reasons: c.reasons, partial: c.partial };
+    }
+    let limits = super::quota::Limits {
+        deployment: cfg.review_daily_limit,
+        per_user: cfg.review_daily_limit_per_user,
+        per_agent: cfg.review_daily_limit_per_agent,
+    };
+    if let Err(kind) = super::quota::take(input.home, input.user_id, input.agent_id, limits) {
+        return failed(kind, "daily review limit reached");
     }
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let prompt = build_prompt(input, &nonce);
+    let (prompt, partial) = build_prompt(input, &nonce);
     match call_model(input.home, &prompt, cfg).await {
-        Err(e) => failed(e),
+        Err(e) => failed(if e.contains("60 seconds") { "timeout" } else { "call_failed" }, &e),
         Ok(raw) => match parse_reply(&raw) {
-            Ok((verdict, summary, reasons)) => AiOutcome::Done { verdict, summary, reasons },
-            Err(e) => failed(format!("unusable review reply: {e}")),
+            Ok((verdict, summary, reasons)) => {
+                let c = super::quota::Cached { verdict, summary, reasons, partial };
+                super::quota::store(key, c.clone());
+                AiOutcome::Done { verdict: c.verdict, summary: c.summary, reasons: c.reasons, partial }
+            }
+            Err(e) => failed("unusable_reply", &e),
         },
     }
 }
@@ -311,6 +323,7 @@ mod tests {
     fn prompt_wraps_user_text_with_a_nonce_and_strips_hidden_content() {
         let input = ReviewInput {
             home: Path::new("/nonexistent"),
+            user_id: "u1",
             agent_id: "a1",
             display_name: "小助理",
             role: "specialist",
@@ -322,19 +335,18 @@ mod tests {
             must_always: &[],
             flagged: &[],
         };
-        let p = build_prompt(&input, "n0nce");
+        let (p, partial) = build_prompt(&input, "n0nce");
+        assert!(!partial);
         assert!(p.contains("<change nonce=\"n0nce\">") && p.contains("<file_after nonce=\"n0nce\">"));
+        // The employee's own fields sit inside the data tags too.
+        let emp = p.split("<employee nonce=\"n0nce\">").nth(1).unwrap();
+        assert!(emp.contains("小助理") && emp.contains("洩漏個資"), "{p}");
+        let long = "字".repeat(17 * 1024 / 3);
+        let input2 = ReviewInput { new: &long, old: "", ..input };
+        assert!(build_prompt(&input2, "n").1, "a cut diff is reported");
         assert!(!p.contains("<!-- hidden -->"), "{p}");
         assert!(p.contains("洩漏個資"));
         assert!(p.len() <= MAX_TOTAL_BYTES);
     }
 
-    #[test]
-    fn quota_counts_per_day() {
-        let home = tempfile::tempdir().unwrap();
-        assert!(take_quota(home.path(), 2));
-        assert!(take_quota(home.path(), 2));
-        assert!(!take_quota(home.path(), 2), "third call over a limit of 2");
-        assert!(!take_quota(tempfile::tempdir().unwrap().path(), 0), "a zero limit always fails");
-    }
 }

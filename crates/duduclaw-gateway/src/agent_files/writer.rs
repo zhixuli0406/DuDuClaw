@@ -263,6 +263,18 @@ pub(crate) async fn rescan_registry_reliably(registry: &Arc<RwLock<AgentRegistry
     false
 }
 
+/// Run the blocking part (the advisory file lock, `users.db`, file IO) off
+/// the async worker when the runtime allows it (`block_in_place` on a
+/// multi-threaded runtime); on a current-thread runtime it runs inline. The
+/// closures borrow from the caller, so `spawn_blocking` (which needs
+/// `'static`) is not an option here.
+pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// The whole write: per-file in-process lock, [`commit_locked`], then the
 /// registry rescan and the channel notice.
 pub(crate) async fn commit(
@@ -273,7 +285,7 @@ pub(crate) async fn commit(
 ) -> Result<Outcome, CommitError> {
     let lock = super::file_mutex(c.home, c.agent_id, c.key);
     let _held = lock.lock().await;
-    let mut out = commit_locked(&c, render, guard)?;
+    let mut out = run_blocking(|| commit_locked(&c, render, guard))?;
     if out.unchanged {
         return Ok(out);
     }

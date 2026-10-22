@@ -3,9 +3,15 @@
 //!
 //! `check` → rules → (AI review) → merged verdict → `pass` applies at once;
 //! `warn` / `block` return a short-lived `analysis_id`. `confirm` (a reason;
-//! for `block` a current admin who acknowledges the risk) or
-//! `request_approval` (non-admins) must match that record exactly and only
-//! re-run the rules, never the AI review.
+//! for `block` or an incomplete review a current admin who acknowledges the
+//! risk) or `request_approval` (non-admins) must match that record exactly.
+//! They re-run the fixed rules at the caller's CURRENT permission level, never
+//! the AI review; when the rules now come out stricter than the recorded
+//! result, the change has to be checked again.
+//!
+//! A file that had been changed outside the dashboard (drifted baseline) is
+//! checked as a whole: the injection scan reads the full text and the
+//! reviewer compares against the last approved version.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -203,23 +209,66 @@ pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, Stri
     }
     let is_admin = c.live.is_admin();
     let contract = current_contract(c.home, &input.agent_id);
-    let findings = rules::check(&RuleInput {
+    // Going back to exactly the approved version needs no outside-change
+    // treatment: that text was already approved.
+    let baseline = approved_baseline(c.home, &input.agent_id, input.key).filter(|b| b.text != input.content);
+    let compare_with = baseline.as_ref().map(|b| b.text.as_str()).unwrap_or(&current);
+    let mut findings = rules::check(&RuleInput {
         key: input.key,
-        old: &current,
+        old: compare_with,
         new: &input.content,
         is_admin,
         must_not: &contract.must_not,
+        full_scan: baseline.is_some(),
     });
+    if baseline.is_some() {
+        findings.push(verdict::RuleFinding {
+            level: RuleLevel::Flag,
+            reason: verdict::Reason::new(
+                verdict::category::OUTSIDE_CHANGE,
+                "medium",
+                "這個檔案在系統外被改過，這次以整份內容檢查，並和上次核可的版本比較",
+                "",
+            ),
+        });
+    }
     let level = verdict::rule_level(&findings);
     if level == RuleLevel::Reject {
         refused_audit(c.home, &input, &c.live.user_id, "content rejected by the fixed rules");
         return Ok(rejected(&input, &findings));
     }
     match input.action {
-        Action::Check => Box::pin(check(c, input, &current, findings, &contract)).await,
-        Action::Confirm => confirm(c, input).await,
-        Action::RequestApproval => request(c, input).await,
+        Action::Check => {
+            let cfg = AgentFilesConfig::load(c.home);
+            if !super::quota::allow_check(c.home, &c.live.user_id, cfg.checks_per_minute) {
+                return Err("檢查得太頻繁了，請稍等一分鐘再試".into());
+            }
+            Box::pin(check(c, input, compare_with, findings, &contract, &cfg)).await
+        }
+        Action::Confirm => confirm(c, input, level).await,
+        Action::RequestApproval => request(c, input, level).await,
     }
+}
+
+/// The last approved version of a SOUL / INSTRUCTIONS file that is
+/// currently drifted, or `None` when the file is intact (or has no baseline
+/// concept). An approved version no longer kept reads as empty, so the
+/// reviewer sees the whole file as new.
+struct Approved {
+    text: String,
+}
+
+fn approved_baseline(home: &Path, agent_id: &str, key: FileKey) -> Option<Approved> {
+    let doc = key.protected_doc()?;
+    let dir = super::agent_dir(home, agent_id).ok()?;
+    if duduclaw_security::soul_guard::doc_drift(doc, &dir) != duduclaw_security::soul_guard::DocDrift::Drifted {
+        return None;
+    }
+    let text = duduclaw_security::soul_guard::read_doc_hash(doc, &dir)
+        .and_then(|h| super::history::find_by_sha(home, agent_id, key, &h))
+        .and_then(|v| super::history::read_version(home, agent_id, key, &v).ok())
+        .unwrap_or_default();
+    Some(Approved { text })
 }
 
 async fn check(
@@ -228,8 +277,8 @@ async fn check(
     current: &str,
     findings: Vec<verdict::RuleFinding>,
     contract: &rules::ContractBounds,
+    cfg: &AgentFilesConfig,
 ) -> Result<Value, String> {
-    let cfg = AgentFilesConfig::load(c.home);
     let rule_reasons: Vec<verdict::Reason> = findings.iter().map(|f| f.reason.clone()).collect();
     let ai = if ai_applies(input.key, input.source) {
         let p = profile(c.home, &input.agent_id);
@@ -237,6 +286,7 @@ async fn check(
         Box::pin(super::review::review(
             &super::review::ReviewInput {
                 home: c.home,
+                user_id: &c.live.user_id,
                 agent_id: &input.agent_id,
                 display_name: &p.display_name,
                 role: &p.role,
@@ -248,7 +298,7 @@ async fn check(
                 must_always: &contract.must_always,
                 flagged: &flagged,
             },
-            &cfg,
+            cfg,
         ))
         .await
     } else {
@@ -259,9 +309,12 @@ async fn check(
     let mut reasons = rule_reasons;
     let mut summary = String::new();
     match &ai {
-        AiOutcome::Done { summary: s, reasons: r, .. } => {
+        AiOutcome::Done { summary: s, reasons: r, partial, .. } => {
             summary = s.clone();
             reasons.extend(r.iter().cloned());
+            if *partial {
+                reasons.push(verdict::partial_reason());
+            }
         }
         AiOutcome::Failed(why) => {
             tracing::info!(agent = %input.agent_id, file = input.key.as_str(), why = %why, "agent file review unavailable; counted as at least a warning");
@@ -282,7 +335,7 @@ async fn check(
         source: input.source,
     };
     if final_verdict == Verdict::Pass {
-        return apply(c, &input, &analysis, None, Severity::Info).await;
+        return apply(c, &input, &analysis, None, Severity::Info, false).await;
     }
     let id = verdict::remember(analysis.clone());
     let status = if final_verdict == Verdict::Block { "blocked" } else { "needs_confirmation" };
@@ -310,24 +363,48 @@ fn require_reason(input: &SaveInput) -> Result<(), String> {
     Ok(())
 }
 
-async fn confirm(c: &Caller<'_>, input: SaveInput) -> Result<Value, String> {
+/// The rules, re-run now at the caller's current permission level, may not
+/// be stricter than what was checked (a permission lost in between, or a
+/// rule that changed): then the change needs a new check.
+fn still_matches(c: &Caller<'_>, input: &SaveInput, analysis: &Analysis, level_now: RuleLevel) -> Result<(), String> {
+    if verdict::rules_verdict(level_now) > analysis.verdict {
+        refused_audit(c.home, input, &c.live.user_id, "rules stricter than at check time");
+        return Err("你的權限或規則和檢查時不同，請重新檢查".into());
+    }
+    Ok(())
+}
+
+async fn confirm(c: &Caller<'_>, input: SaveInput, level_now: RuleLevel) -> Result<Value, String> {
     let (id, analysis) = recall(c, &input)?;
+    still_matches(c, &input, &analysis, level_now)?;
     require_reason(&input)?;
-    let severity = match analysis.verdict {
-        Verdict::Pass | Verdict::Warn => Severity::Warning,
-        Verdict::Block if c.live.is_admin() && input.acknowledge_risk => Severity::Critical,
-        Verdict::Block if c.live.is_admin() => return Err("高風險的修改需要勾選「我了解風險」才能套用".into()),
-        Verdict::Block => {
-            refused_audit(c.home, &input, &c.live.user_id, "non-admin tried to confirm a block");
-            return Err("高風險的修改只能送給管理員審核".into());
-        }
-    };
-    let out = apply(c, &input, &analysis, Some(input.reason.clone()), severity).await;
+    let admin = c.live.is_admin();
+    let incomplete = verdict::incomplete(&analysis.reasons);
+    // A block or an incomplete review needs a CURRENT admin who acknowledges
+    // the risk; the admin check is repeated inside the file lock.
+    let need_admin = analysis.verdict == Verdict::Block || incomplete;
+    if need_admin && !admin {
+        refused_audit(c.home, &input, &c.live.user_id, "non-admin tried to confirm a block or an incomplete review");
+        return Err(if analysis.verdict == Verdict::Block {
+            "高風險的修改只能送給管理員審核".into()
+        } else {
+            "自動檢查這次沒有完整完成，只能送給管理員審核".into()
+        });
+    }
+    if need_admin && !input.acknowledge_risk {
+        return Err("這次修改需要勾選「我了解風險」才能套用".into());
+    }
+    let severity = if analysis.verdict == Verdict::Block { Severity::Critical } else { Severity::Warning };
+    let reason = duduclaw_core::truncate_chars(&input.reason, MAX_REASON_CHARS);
+    let out = apply(c, &input, &analysis, Some(reason), severity, need_admin).await;
     verdict::forget(&id);
     out
 }
 
-async fn request(c: &Caller<'_>, input: SaveInput) -> Result<Value, String> {
+/// Longest reason kept on a confirmation or an approval request.
+const MAX_REASON_CHARS: usize = 1000;
+
+async fn request(c: &Caller<'_>, input: SaveInput, level_now: RuleLevel) -> Result<Value, String> {
     let (id, analysis) = recall(c, &input)?;
     if c.live.is_admin() {
         return Err("管理員可以直接確認套用".into());
@@ -335,8 +412,10 @@ async fn request(c: &Caller<'_>, input: SaveInput) -> Result<Value, String> {
     if analysis.verdict == Verdict::Pass {
         return Err("這次修改不需要審核".into());
     }
+    still_matches(c, &input, &analysis, level_now)?;
     require_reason(&input)?;
-    let approval_id = super::approval::file_request(c.home, &analysis, &input.content, &c.live.email, &input.reason).await?;
+    let reason = duduclaw_core::truncate_chars(&input.reason, MAX_REASON_CHARS);
+    let approval_id = super::approval::file_request(c.home, &analysis, &input.content, &c.live.email, &reason).await?;
     verdict::forget(&id);
     let mut m = base(&input, "pending_approval");
     m.insert("approval_id".into(), json!(approval_id));
@@ -350,6 +429,7 @@ async fn apply(
     analysis: &Analysis,
     confirm_reason: Option<String>,
     severity: Severity,
+    need_admin: bool,
 ) -> Result<Value, String> {
     let mut meta = CommitMeta::new(&c.live.user_id, input.source);
     meta.verdict = Some(analysis.verdict);
@@ -372,7 +452,13 @@ async fn apply(
             baseline: Baseline::Accept,
         },
         move |_| Ok(content),
-        move || require_live_agent_access(&home, &session, &agent, AccessLevel::Owner).map(|_| ()),
+        move || {
+            let live = require_live_agent_access(&home, &session, &agent, AccessLevel::Owner)?;
+            if need_admin && !live.is_admin() {
+                return Err("permission denied".into());
+            }
+            Ok(())
+        },
     )
     .await;
     match result {

@@ -262,32 +262,23 @@ pub(crate) async fn handle_agent_update_soul(params: &Value, home_dir: &Path) ->
         });
     }
 
-    let soul_path = agent_dir.join("SOUL.md");
 
-    // Read, write and re-baseline under the same cross-process lock the
-    // gateway's profile file writer takes, so a dashboard save and this tool
-    // can never interleave.
-    let write = duduclaw_core::with_file_lock(&soul_path, || {
-        let old_content = std::fs::read_to_string(&soul_path).unwrap_or_default();
-        let tmp_path = soul_path.with_extension("md.tmp");
-        std::fs::write(&tmp_path, soul_content)?;
-        if let Err(e) = std::fs::rename(&tmp_path, &soul_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        // Refresh the soul_guard integrity hash (inside the lock). Without
-        // this, the next integrity check would flag every legitimate
-        // `agent_update_soul` call as tampering. A failure is logged, not
-        // fatal: the heartbeat drift warning is a recoverable signal.
-        if let Err(e) = duduclaw_security::soul_guard::accept_soul_change(agent_id, &agent_dir) {
-            tracing::warn!(
-                agent = %agent_id,
-                "Failed to refresh soul_guard hash after agent_update_soul: {e} — \
-                 next integrity check will flag drift until manually re-accepted"
-            );
-        }
-        Ok(old_content)
-    });
+    // Through the gateway's profile file writer: the same cross-process
+    // lock as a dashboard save, a version in `agent_file_history/`, the
+    // `agent_file_changed` audit row and the SOUL baseline update (inside the
+    // lock). The baseline must follow: otherwise every integrity check would
+    // flag this legitimate update as tampering.
+    let new_text = soul_content.to_string();
+    let write = duduclaw_gateway::agent_files::external::write_file(
+        home_dir,
+        agent_id,
+        duduclaw_gateway::agent_files::external::ExternalFile::Soul,
+        "mcp",
+        "mcp",
+        duduclaw_gateway::agent_files::external::ExternalBaseline::Accept,
+        move |_| Ok(new_text),
+    )
+    .map(|o| o.before);
     let old_content = match write {
         Ok(c) => c,
         Err(e) => {

@@ -158,6 +158,23 @@ pub(crate) fn ensure_initial(home: &Path, agent_id: &str, key: FileKey, before: 
     record(home, agent_id, key, before, &meta, keep).map(|_| ())
 }
 
+/// Move an employee's whole history to `agent_file_history/_trash/<id>-<unix
+/// ms>` (soft delete keeps the data, as the rest of the employee's folder is
+/// kept; a new employee that later gets the same id starts with no history).
+/// `Ok(None)` when there was nothing to move.
+pub(crate) fn retire(home: &Path, agent_id: &str) -> Result<Option<PathBuf>, String> {
+    let root = home.join("agent_file_history");
+    let dir = root.join(agent_id);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let trash = root.join("_trash");
+    ensure_private_dir(&trash)?;
+    let dest = trash.join(format!("{agent_id}-{}", chrono::Utc::now().timestamp_millis()));
+    std::fs::rename(&dir, &dest).map_err(|e| format!("cannot move the version history: {e}"))?;
+    Ok(Some(dest))
+}
+
 /// Every kept version, newest first.
 pub(crate) fn list(home: &Path, agent_id: &str, key: FileKey) -> Vec<VersionEntry> {
     let mut rows = read_index(&file_dir(home, agent_id, key));
@@ -231,6 +248,17 @@ mod tests {
             assert_eq!(std::fs::metadata(body).unwrap().permissions().mode() & 0o777, 0o600);
             assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn retired_history_is_not_seen_by_a_new_employee_with_the_same_id() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        record(h, "a1", FileKey::Soul, "old employee", &meta("dashboard"), 5).unwrap();
+        let moved = retire(h, "a1").unwrap().unwrap();
+        assert!(moved.starts_with(h.join("agent_file_history/_trash")));
+        assert!(list(h, "a1", FileKey::Soul).is_empty());
+        assert!(retire(h, "a1").unwrap().is_none());
     }
 
     #[test]

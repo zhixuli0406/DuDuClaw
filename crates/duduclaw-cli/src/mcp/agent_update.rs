@@ -271,11 +271,24 @@ pub(crate) async fn handle_agent_update(
     // rename left the agent introducing itself with its old name forever.
     let old_display_name = config.agent.display_name.clone();
     let old_trigger = config.agent.trigger.clone();
+    // The typed config as read, so only the keys this call changes are
+    // written back (format-preserving, see the write below).
+    let config_before = config.clone();
 
     let mut changes = Vec::new();
 
     // -- Agent identity fields --
     if let Some(v) = params.get("display_name").and_then(|v| v.as_str()) {
+        // Written into SOUL.md / IDENTITY.md by the rename sync: plain text only.
+        if let Err(e) = duduclaw_core::validate_display_name(v).and_then(|_| {
+            duduclaw_gateway::agent_files::external::rename_is_safe("", v)
+                .map_err(|cats| format!("display_name looks like an instruction to the AI ({cats}); choose a plain name"))
+        }) {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: {e}")}],
+                "isError": true
+            });
+        }
         config.agent.display_name = v.to_string();
         changes.push(format!("display_name = \"{v}\""));
 
@@ -590,28 +603,26 @@ pub(crate) async fn handle_agent_update(
         }
     }
 
-    // Serialize and write atomically (temp + rename)
-    let updated_toml = match toml::to_string_pretty(&config) {
-        Ok(s) => s,
-        Err(e) => {
-            return serde_json::json!({
-                "content": [{"type": "text", "text": format!("Error serializing agent.toml: {e}")}],
-                "isError": true
-            });
+    // Write through the gateway's profile file writer: under the shared
+    // cross-process lock, only the changed keys (comments and the keys the
+    // typed form does not know survive), a version and the
+    // `agent_file_changed` audit row.
+    let typed = |c: &duduclaw_core::types::AgentConfig| -> std::result::Result<toml::Table, String> {
+        toml::Table::try_from(c).map_err(|e| format!("Error serializing agent.toml: {e}"))
+    };
+    let (before_t, after_t) = match (typed(&config_before), typed(&config)) {
+        (Ok(b), Ok(a)) => (b, a),
+        (Err(e), _) | (_, Err(e)) => {
+            return serde_json::json!({ "content": [{"type": "text", "text": e}], "isError": true });
         }
     };
-
-    let tmp_path = toml_path.with_extension("toml.tmp");
-    if let Err(e) = tokio::fs::write(&tmp_path, &updated_toml).await {
+    let written = duduclaw_gateway::agent_files::external::edit_agent_toml(home_dir, agent_id, "mcp", caller, |raw| {
+        duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
+        Ok(())
+    });
+    if let Err(e) = written {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
-            "isError": true
-        });
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, &toml_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error committing agent.toml: {e}")}],
             "isError": true
         });
     }
@@ -623,42 +634,27 @@ pub(crate) async fn handle_agent_update(
     let mut soul_sync_changes: Vec<String> = Vec::new();
     if old_display_name != config.agent.display_name && !old_display_name.is_empty() {
         let new_display_name = &config.agent.display_name;
-        for fname in ["SOUL.md", "IDENTITY.md"] {
-            let path = agent_dir.join(fname);
-            if !path.exists() {
+        use duduclaw_gateway::agent_files::external::{ExternalBaseline, ExternalFile, rename_is_safe, write_file};
+        for (fname, file) in [("SOUL.md", ExternalFile::Soul), ("IDENTITY.md", ExternalFile::Identity)] {
+            if !agent_dir.join(fname).exists() {
                 continue; // file doesn't exist — nothing to sync
             }
-            // Under the same cross-process lock the gateway's profile file
-            // writer takes, and the SOUL baseline follows only when the file
-            // was the approved version before the rename (a rename must not
-            // bless an out-of-band edit, nor leave a legitimate one drifted).
-            let synced = duduclaw_core::with_file_lock(&path, || {
-                let content = std::fs::read_to_string(&path)?;
-                let (new_content, changed) =
-                    duduclaw_core::rename_in_markdown(&content, &old_display_name, new_display_name);
-                if !changed {
-                    return Ok(false);
-                }
-                let pre_hash = duduclaw_security::soul_guard::hash_bytes(content.as_bytes());
-                let tmp_path = path.with_extension("md.tmp");
-                std::fs::write(&tmp_path, &new_content)?;
-                if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return Err(e);
-                }
-                if fname == "SOUL.md" {
-                    use duduclaw_security::soul_guard::{ProtectedDoc, accept_if_was_intact};
-                    if let Err(e) = accept_if_was_intact(ProtectedDoc::Soul, agent_id, &agent_dir, &pre_hash) {
-                        tracing::warn!(agent_id, error = %e, "SOUL baseline not updated after the rename sync");
-                    }
-                }
-                Ok(true)
+            // Through the shared writer (lock, version, audit). The SOUL
+            // baseline follows only when the file was the approved version
+            // before the rename (a rename must not bless an out-of-band edit,
+            // nor leave a legitimate one drifted), and the renamed text must
+            // pass the fixed rules — nobody reviews an automatic edit.
+            let synced = write_file(home_dir, agent_id, file, "rename", caller, ExternalBaseline::AcceptIfWasIntact, |current| {
+                let renamed = duduclaw_core::rename_in_markdown(current, &old_display_name, new_display_name).0;
+                rename_is_safe(current, &renamed).map_err(|cats| format!("not synced, the result needs a review ({cats})"))?;
+                Ok(renamed)
             });
             match synced {
-                Ok(true) => {}
-                Ok(false) => continue,
+                Ok(o) if o.changed => {}
+                Ok(_) => continue,
                 Err(e) => {
-                    tracing::warn!(agent_id, file = fname, error = %e, "Failed to commit identity-rename");
+                    tracing::warn!(agent_id, file = fname, error = %e, "New name not synced into a profile file");
+                    changes.push(format!("{fname} not synced: {e}"));
                     continue;
                 }
             }

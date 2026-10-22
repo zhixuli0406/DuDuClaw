@@ -68,7 +68,7 @@ pub mod zh_variant;
 pub use agent_guard::{
     check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES, INSTRUCTIONS_FILE,
 };
-pub use agent_rename::{rename_in_markdown, synced_trigger};
+pub use agent_rename::{rename_in_markdown, synced_trigger, validate_display_name};
 pub use appliance::{appliance_default_bind, appliance_flag, is_appliance, pick_default_bind, APPLIANCE_ENV};
 pub use concurrency_gate::{
     active_count as concurrency_active_count, effective_limit as concurrency_effective_limit,
