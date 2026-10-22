@@ -30,6 +30,10 @@ pub(crate) enum Baseline {
     /// An automatic edit (rename sync): the baseline follows only when the
     /// content before the write was the approved one, so drift stays drift.
     AcceptIfWasIntact,
+    /// The person checked the file exactly as it is now (it had been changed
+    /// outside the dashboard) and accepts it: nothing is rewritten, but the
+    /// content is kept as a version and becomes the baseline.
+    AcceptCurrent,
 }
 
 /// Who and why, for the version index and the audit row.
@@ -117,12 +121,18 @@ pub(crate) fn commit_locked(
     render: impl FnOnce(&str) -> Result<String, String>,
     guard: impl FnOnce() -> Result<(), String>,
 ) -> Result<Outcome, CommitError> {
-    let path = super::file_path(c.home, c.agent_id, c.key).map_err(CommitError::Refused)?;
+    let path = super::file_path(c.home, c.agent_id, &c.key).map_err(CommitError::Refused)?;
     let keep = AgentFilesConfig::load(c.home).history_keep;
     let result = duduclaw_core::with_file_lock(&path, || {
+        // A skill is never created here, and its folder is writable by the
+        // employee: resolve it again under the lock and refuse anything that
+        // no longer is the same existing regular file.
+        if c.key.is_skill() && super::file_path(c.home, c.agent_id, &c.key).as_ref() != Ok(&path) {
+            return Ok(Locked::Err(CommitError::Refused("skill file not found".into())));
+        }
         let current = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !c.key.is_skill() => String::new(),
             Err(e) => return Ok(Locked::Err(CommitError::Failed(format!("cannot read {}: {e}", c.key.file_name())))),
         };
         let before_hash = super::hash_of(&current);
@@ -139,7 +149,8 @@ pub(crate) fn commit_locked(
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
         let hash = super::hash_of(&new);
-        if new == current {
+        let accept_current = new == current && c.baseline == Baseline::AcceptCurrent && c.key.protected_doc().is_some();
+        if new == current && !accept_current {
             return Ok(Locked::Done(Outcome {
                 before: current,
                 after: new,
@@ -168,13 +179,15 @@ pub(crate) fn commit_locked(
             approval_id: c.meta.approval_id.clone(),
             decided_by: c.meta.decided_by.clone(),
         };
-        let version_id = match history::ensure_initial(c.home, c.agent_id, c.key, &current, keep)
-            .and_then(|_| history::record(c.home, c.agent_id, c.key, &new, &meta, keep))
+        let version_id = match history::ensure_initial(c.home, c.agent_id, &c.key, &current, keep)
+            .and_then(|_| history::record(c.home, c.agent_id, &c.key, &new, &meta, keep))
         {
             Ok(id) => id,
             Err(e) => return Ok(Locked::Err(CommitError::Failed(e))),
         };
-        crate::handlers::config_commit::replace_owner_only(&path, &new)?;
+        if !accept_current {
+            crate::handlers::config_commit::replace_owner_only(&path, &new)?;
+        }
         update_baseline(c, &before_hash);
         Ok(Locked::Done(Outcome {
             before: current,
@@ -203,7 +216,7 @@ fn update_baseline(c: &Commit<'_>, before_hash: &str) {
     let Some(doc) = c.key.protected_doc() else { return };
     let Ok(dir) = super::agent_dir(c.home, c.agent_id) else { return };
     let result = match c.baseline {
-        Baseline::Accept => soul_guard::accept_doc_change(doc, c.agent_id, &dir).map(|_| true),
+        Baseline::Accept | Baseline::AcceptCurrent => soul_guard::accept_doc_change(doc, c.agent_id, &dir).map(|_| true),
         Baseline::AcceptIfWasIntact => soul_guard::accept_if_was_intact(doc, c.agent_id, &dir, before_hash),
     };
     if let Err(e) = result {
@@ -283,7 +296,7 @@ pub(crate) async fn commit(
     render: impl FnOnce(&str) -> Result<String, String>,
     guard: impl FnOnce() -> Result<(), String>,
 ) -> Result<Outcome, CommitError> {
-    let lock = super::file_mutex(c.home, c.agent_id, c.key);
+    let lock = super::file_mutex(c.home, c.agent_id, &c.key);
     let _held = lock.lock().await;
     let mut out = run_blocking(|| commit_locked(&c, render, guard))?;
     if out.unchanged {

@@ -121,7 +121,7 @@ pub fn apply_typed_changes(raw: &mut toml::Table, before: &toml::Table, after: &
 /// rules must find nothing at all in the result. `Err` names what they found.
 pub fn rename_is_safe(before: &str, after: &str) -> Result<(), String> {
     let findings = super::rules::check(&super::rules::RuleInput {
-        key: FileKey::Identity,
+        key: &FileKey::Identity,
         old: before,
         new: after,
         is_admin: false,
@@ -164,7 +164,7 @@ mod tests {
         let text = std::fs::read_to_string(home.join("agents/a1/agent.toml")).unwrap();
         assert!(text.starts_with("# keep me\n") && text.contains("icon = \"x\""), "{text}");
         assert!(std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap().contains("agent_file_changed"));
-        assert_eq!(super::super::history::list(&home, "a1", FileKey::AgentToml)[0].source, "mcp");
+        assert_eq!(super::super::history::list(&home, "a1", &FileKey::AgentToml)[0].source, "mcp");
     }
 
     #[test]

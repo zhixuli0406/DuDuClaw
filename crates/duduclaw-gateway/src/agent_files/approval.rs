@@ -25,13 +25,14 @@ pub(crate) const TTL_SECS: i64 = 3 * 24 * 3600;
 pub(crate) const MAX_PENDING_PER_USER: usize = 20;
 
 /// The plain zh-TW name of a file (channel notices, summaries).
-pub(crate) fn plain_name(key: FileKey) -> &'static str {
+pub(crate) fn plain_name(key: &FileKey) -> &'static str {
     match key {
         FileKey::Soul => "人格設定",
         FileKey::Identity => "自我介紹",
         FileKey::Instructions => "工作規則",
         FileKey::Contract => "行為界線",
         FileKey::AgentToml => "基本設定",
+        FileKey::Skill(_) => "技能",
     }
 }
 
@@ -99,7 +100,7 @@ pub(crate) async fn file_request(
         if !(live_pending(&rec) && mine) {
             continue;
         }
-        if target(&rec) == Some((analysis.agent_id.clone(), analysis.file)) {
+        if target(&rec) == Some((analysis.agent_id.clone(), analysis.file.clone())) {
             broker.withdraw(&rec.id, "superseded").await?;
             remove_sidecar(home, rec.id.as_str());
         } else {
@@ -125,7 +126,7 @@ pub(crate) async fn file_request(
         "{who} 想修改 AI 員工「{agent}」的{file}；自動檢查結果：{result}。",
         who = duduclaw_core::truncate_chars(requested_by_email, 80),
         agent = analysis.agent_id,
-        file = plain_name(analysis.file),
+        file = plain_name(&analysis.file),
         result = match analysis.verdict {
             Verdict::Block => "高風險",
             Verdict::Warn => "有疑慮",
@@ -159,14 +160,14 @@ pub(crate) async fn file_request(
 }
 
 /// The newest live request for (agent, file), if any.
-pub(crate) async fn pending_for(home: &Path, agent_id: &str, key: FileKey) -> Option<String> {
+pub(crate) async fn pending_for(home: &Path, agent_id: &str, key: &FileKey) -> Option<String> {
     let broker = ApprovalBroker::open(home).ok()?;
     broker
         .list_by_kind(ACTION_KIND)
         .await
         .ok()?
         .into_iter()
-        .filter(|r| live_pending(r) && target(r) == Some((agent_id.to_string(), key)))
+        .filter(|r| live_pending(r) && target(r).is_some_and(|(a, k)| a == agent_id && k == *key))
         .max_by(|a, b| a.created_at.cmp(&b.created_at))
         .map(|r| r.id.as_str().to_string())
 }
@@ -192,7 +193,7 @@ pub(crate) fn pending_json(home: &Path, rec: &ApprovalRecord) -> Result<Value, S
     let p = &rec.payload;
     let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let content = read_sidecar(home, rec.id.as_str()).ok();
-    let path = super::file_path(home, &agent_id, key)?;
+    let path = super::file_path(home, &agent_id, &key)?;
     let current = super::read_or_empty(&path)?;
     let current_hash = super::hash_of(&current);
     let content_ok = content.as_deref().is_some_and(|c| super::hash_of(c) == s("content_sha256"));

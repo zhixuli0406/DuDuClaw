@@ -1,7 +1,8 @@
 //! People editing an AI employee's profile files — one writer for all of them.
 //!
 //! Every human write to `SOUL.md`, `IDENTITY.md`, `INSTRUCTIONS.md`,
-//! `CONTRACT.toml` and `agent.toml` goes through [`writer`]: a per-file
+//! `CONTRACT.toml`, `agent.toml` and the employee's own skill files
+//! (`SKILLS/**.md`, [`skills`]) goes through [`writer`]: a per-file
 //! in-process lock plus the cross-process advisory lock, an optimistic
 //! `base_hash` compare, an owner-only atomic replace, a version history kept
 //! outside the employee's directory ([`history`]), an audit row, a registry
@@ -28,6 +29,7 @@ pub(crate) mod history;
 pub(crate) mod quota;
 pub(crate) mod review;
 pub(crate) mod rules;
+pub(crate) mod skills;
 pub(crate) mod verdict;
 pub(crate) mod writer;
 
@@ -38,7 +40,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Byte limit of SOUL / IDENTITY / INSTRUCTIONS.
+/// Byte limit of SOUL / IDENTITY / INSTRUCTIONS and of one skill file.
 pub(crate) const MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 /// Byte limit of CONTRACT.toml.
 pub(crate) const MAX_CONTRACT_BYTES: usize = 32 * 1024;
@@ -50,16 +52,19 @@ pub(crate) const MAX_CONTRACT_ENTRIES: usize = 100;
 pub(crate) const MAX_CONTRACT_ENTRY_CHARS: usize = 500;
 
 /// Which profile file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FileKey {
     Soul,
     Identity,
     Instructions,
     Contract,
     AgentToml,
+    /// One of the employee's own skill files (`SKILLS/<rel>`, `.md` only).
+    Skill(skills::SkillPath),
 }
 
 impl FileKey {
+    /// The fixed files (skills are listed per employee, see [`skills::list`]).
     pub(crate) const ALL: [FileKey; 5] =
         [Self::Soul, Self::Identity, Self::Instructions, Self::Contract, Self::AgentToml];
 
@@ -70,43 +75,64 @@ impl FileKey {
             "instructions" => Ok(Self::Instructions),
             "contract" => Ok(Self::Contract),
             "agent_toml" => Ok(Self::AgentToml),
-            _ => Err("file must be soul, identity, instructions, contract or agent_toml".into()),
+            _ => match s.strip_prefix(skills::KEY_PREFIX) {
+                Some(rel) => skills::SkillPath::parse(rel).map(Self::Skill),
+                None => Err("file must be soul, identity, instructions, contract, agent_toml or skill:<path>".into()),
+            },
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Soul => "soul",
             Self::Identity => "identity",
             Self::Instructions => "instructions",
             Self::Contract => "contract",
             Self::AgentToml => "agent_toml",
+            Self::Skill(p) => p.key(),
         }
     }
 
-    pub(crate) fn file_name(self) -> &'static str {
+    /// The file's name (a skill: its path inside `SKILLS/`).
+    pub(crate) fn file_name(&self) -> &str {
         match self {
             Self::Soul => "SOUL.md",
             Self::Identity => "IDENTITY.md",
             Self::Instructions => "INSTRUCTIONS.md",
             Self::Contract => "CONTRACT.toml",
             Self::AgentToml => "agent.toml",
+            Self::Skill(p) => p.rel(),
         }
     }
 
-    pub(crate) fn ext(self) -> &'static str {
+    pub(crate) fn ext(&self) -> &'static str {
         if self.is_markdown() { "md" } else { "toml" }
     }
 
-    pub(crate) fn label_key(self) -> String {
-        format!("agentFiles.file.{}", self.as_str())
+    pub(crate) fn label_key(&self) -> String {
+        match self {
+            Self::Skill(_) => "agentFiles.file.skill".to_string(),
+            _ => format!("agentFiles.file.{}", self.as_str()),
+        }
     }
 
-    pub(crate) fn is_markdown(self) -> bool {
-        matches!(self, Self::Soul | Self::Identity | Self::Instructions)
+    pub(crate) fn is_markdown(&self) -> bool {
+        matches!(self, Self::Soul | Self::Identity | Self::Instructions | Self::Skill(_))
     }
 
-    pub(crate) fn max_bytes(self) -> usize {
+    pub(crate) fn is_skill(&self) -> bool {
+        matches!(self, Self::Skill(_))
+    }
+
+    /// The folder of this file's versions under `agent_file_history/<id>/`.
+    pub(crate) fn history_dir(&self) -> String {
+        match self {
+            Self::Skill(p) => p.history_dir(),
+            _ => self.as_str().to_string(),
+        }
+    }
+
+    pub(crate) fn max_bytes(&self) -> usize {
         match self {
             Self::Contract => MAX_CONTRACT_BYTES,
             Self::AgentToml => MAX_AGENT_TOML_BYTES,
@@ -115,7 +141,7 @@ impl FileKey {
     }
 
     /// The baseline-protected files.
-    pub(crate) fn protected_doc(self) -> Option<duduclaw_security::soul_guard::ProtectedDoc> {
+    pub(crate) fn protected_doc(&self) -> Option<duduclaw_security::soul_guard::ProtectedDoc> {
         use duduclaw_security::soul_guard::ProtectedDoc;
         match self {
             Self::Soul => Some(ProtectedDoc::Soul),
@@ -128,8 +154,8 @@ impl FileKey {
     /// is read-only here: its fields go through the edit page
     /// (`agents.update`, authority-checked) and its raw text through the
     /// admin-only raw editor.
-    pub(crate) fn text_editable(self) -> bool {
-        self != Self::AgentToml
+    pub(crate) fn text_editable(&self) -> bool {
+        *self != Self::AgentToml
     }
 }
 
@@ -233,16 +259,21 @@ pub(crate) fn agent_dir(home: &Path, agent_id: &str) -> Result<PathBuf, String> 
 }
 
 /// The file's path. The file itself may be absent (a new INSTRUCTIONS.md),
-/// but when present it must be a regular file, not a symlink.
-pub(crate) fn file_path(home: &Path, agent_id: &str, key: FileKey) -> Result<PathBuf, String> {
-    let path = agent_dir(home, agent_id)?.join(key.file_name());
+/// but when present it must be a regular file, not a symlink. A skill file
+/// must already exist (see [`skills::resolve`]).
+pub(crate) fn file_path(home: &Path, agent_id: &str, key: &FileKey) -> Result<PathBuf, String> {
+    let dir = agent_dir(home, agent_id)?;
+    if let FileKey::Skill(p) = key {
+        return skills::resolve(&dir, p);
+    }
+    let path = dir.join(key.file_name());
     match std::fs::symlink_metadata(&path) {
         Ok(m) if m.file_type().is_symlink() || !m.is_file() => {
             Err(format!("{} cannot be edited here", key.file_name()))
         }
         Ok(_) => Ok(path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if key == FileKey::AgentToml {
+            if *key == FileKey::AgentToml {
                 Err(format!("agent `{agent_id}` not found"))
             } else {
                 Ok(path)
@@ -256,7 +287,7 @@ pub(crate) fn file_path(home: &Path, agent_id: &str, key: FileKey) -> Result<Pat
 /// AI review of one save can take seconds, and two saves must not interleave
 /// their hash compare and replace. Cross-process writers are serialised by
 /// `with_file_lock` inside the writer.
-pub(crate) fn file_mutex(home: &Path, agent_id: &str, key: FileKey) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn file_mutex(home: &Path, agent_id: &str, key: &FileKey) -> Arc<tokio::sync::Mutex<()>> {
     type Map = Mutex<HashMap<(PathBuf, String, FileKey), Arc<tokio::sync::Mutex<()>>>>;
     static LOCKS: OnceLock<Map> = OnceLock::new();
     let map = LOCKS.get_or_init(Default::default);
@@ -265,7 +296,7 @@ pub(crate) fn file_mutex(home: &Path, agent_id: &str, key: FileKey) -> Arc<tokio
         Err(poisoned) => poisoned.into_inner(),
     };
     guard
-        .entry((home.to_path_buf(), agent_id.to_string(), key))
+        .entry((home.to_path_buf(), agent_id.to_string(), key.clone()))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }

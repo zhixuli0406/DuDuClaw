@@ -139,7 +139,7 @@ struct Profile {
 }
 
 fn profile(home: &Path, agent_id: &str) -> Profile {
-    let t: toml::Table = super::file_path(home, agent_id, FileKey::AgentToml)
+    let t: toml::Table = super::file_path(home, agent_id, &FileKey::AgentToml)
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.parse().ok())
@@ -150,14 +150,14 @@ fn profile(home: &Path, agent_id: &str) -> Profile {
 
 /// The employee's current `[boundaries]` (lenient: an unreadable file has none).
 fn current_contract(home: &Path, agent_id: &str) -> rules::ContractBounds {
-    super::file_path(home, agent_id, FileKey::Contract)
+    super::file_path(home, agent_id, &FileKey::Contract)
         .ok()
         .and_then(|p| super::read_or_empty(&p).ok())
         .and_then(|t| rules::parse_contract(&t).ok())
         .unwrap_or_default()
 }
 
-fn ai_applies(key: FileKey, source: &str) -> bool {
+fn ai_applies(key: &FileKey, source: &str) -> bool {
     key.text_editable() && matches!(source, "dashboard" | "rollback" | "contract.update")
 }
 
@@ -193,7 +193,7 @@ pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, Stri
     if !input.key.text_editable() {
         return Err("基本設定請在員工的編輯頁修改".into());
     }
-    let path = super::file_path(c.home, &input.agent_id, input.key)?;
+    let path = super::file_path(c.home, &input.agent_id, &input.key)?;
     let current = super::read_or_empty(&path)?;
     let current_hash = super::hash_of(&current);
     if input.base_hash != current_hash {
@@ -202,19 +202,22 @@ pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, Stri
         m.insert("current_hash".into(), json!(current_hash));
         return Ok(Value::Object(m));
     }
-    if input.content == current {
+    // Going back to exactly the approved version needs no outside-change
+    // treatment: that text was already approved.
+    let baseline = approved_baseline(c.home, &input.agent_id, &input.key).filter(|b| b.text != input.content);
+    // Saving the file exactly as it is is a no-op, except for a file changed
+    // outside the dashboard: then it is the request to check the current
+    // text and accept it as the approved version.
+    if input.content == current && baseline.is_none() {
         let mut m = base(&input, "unchanged");
         m.insert("hash".into(), json!(current_hash));
         return Ok(Value::Object(m));
     }
     let is_admin = c.live.is_admin();
     let contract = current_contract(c.home, &input.agent_id);
-    // Going back to exactly the approved version needs no outside-change
-    // treatment: that text was already approved.
-    let baseline = approved_baseline(c.home, &input.agent_id, input.key).filter(|b| b.text != input.content);
     let compare_with = baseline.as_ref().map(|b| b.text.as_str()).unwrap_or(&current);
     let mut findings = rules::check(&RuleInput {
-        key: input.key,
+        key: &input.key,
         old: compare_with,
         new: &input.content,
         is_admin,
@@ -258,7 +261,7 @@ struct Approved {
     text: String,
 }
 
-fn approved_baseline(home: &Path, agent_id: &str, key: FileKey) -> Option<Approved> {
+fn approved_baseline(home: &Path, agent_id: &str, key: &FileKey) -> Option<Approved> {
     let doc = key.protected_doc()?;
     let dir = super::agent_dir(home, agent_id).ok()?;
     if duduclaw_security::soul_guard::doc_drift(doc, &dir) != duduclaw_security::soul_guard::DocDrift::Drifted {
@@ -280,7 +283,7 @@ async fn check(
     cfg: &AgentFilesConfig,
 ) -> Result<Value, String> {
     let rule_reasons: Vec<verdict::Reason> = findings.iter().map(|f| f.reason.clone()).collect();
-    let ai = if ai_applies(input.key, input.source) {
+    let ai = if ai_applies(&input.key, input.source) {
         let p = profile(c.home, &input.agent_id);
         let flagged = verdict::categories(&rule_reasons);
         Box::pin(super::review::review(
@@ -291,7 +294,7 @@ async fn check(
                 display_name: &p.display_name,
                 role: &p.role,
                 department: &p.department,
-                key: input.key,
+                key: &input.key,
                 old: current,
                 new: &input.content,
                 must_not: &contract.must_not,
@@ -325,7 +328,7 @@ async fn check(
     let analysis = Analysis {
         user_id: c.live.user_id.clone(),
         agent_id: input.agent_id.clone(),
-        file: input.key,
+        file: input.key.clone(),
         base_hash: input.base_hash.clone(),
         content_sha256: super::hash_of(&input.content),
         verdict: final_verdict,
@@ -347,7 +350,7 @@ async fn check(
 fn recall(c: &Caller<'_>, input: &SaveInput) -> Result<(String, Analysis), String> {
     let id = input.analysis_id.clone().ok_or("analysis_id is required")?;
     let sha = super::hash_of(&input.content);
-    match verdict::recall(&id, &c.live.user_id, &input.agent_id, input.key, &input.base_hash, &sha) {
+    match verdict::recall(&id, &c.live.user_id, &input.agent_id, &input.key, &input.base_hash, &sha) {
         Ok(a) => Ok((id, a)),
         Err(e) => {
             refused_audit(c.home, input, &c.live.user_id, "confirm record mismatch");
@@ -423,6 +426,12 @@ async fn request(c: &Caller<'_>, input: SaveInput, level_now: RuleLevel) -> Resu
     Ok(Value::Object(m))
 }
 
+/// Content equal to what the change was checked against (`base_hash`) is
+/// the accept-the-current-file case (only reachable for a drifted file).
+pub(crate) fn baseline_for(content: &str, base_hash: &str) -> Baseline {
+    if super::hash_of(content) == base_hash { Baseline::AcceptCurrent } else { Baseline::Accept }
+}
+
 async fn apply(
     c: &Caller<'_>,
     input: &SaveInput,
@@ -446,10 +455,10 @@ async fn apply(
         Commit {
             home: c.home,
             agent_id: &input.agent_id,
-            key: input.key,
+            key: input.key.clone(),
             expected_hash: Some(&input.base_hash),
             meta,
-            baseline: Baseline::Accept,
+            baseline: baseline_for(&input.content, &input.base_hash),
         },
         move |_| Ok(content),
         move || {
