@@ -4,6 +4,7 @@
 use super::*;
 
 mod known_mcp_scopes_tests;
+mod knowledge_dashboard_rpc_tests;
 mod has_api_key_configured_tests;
 mod doctor_repair_hint_tests;
 mod edition_rpc_gate_table_tests;
@@ -68,6 +69,7 @@ mod runtime_deprecation_tests;
 mod agents_inspect_sandbox_tests;
 mod knowledge_quarantine_decide_tests;
 mod v168_config_rpc_tests;
+mod agent_files_rpc_tests;
 mod responsibilities_rpc_tests;
 
 mod reseller_boundary_tests;

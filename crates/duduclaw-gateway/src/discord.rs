@@ -1859,6 +1859,13 @@ async fn handle_message_create(
         Arc::new(std::sync::Mutex::new(None));
     let progress_msg_id_cb = progress_msg_id.clone();
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+        // Allowlist (thinking display, 2026-10): Discord had no event filter
+        // at all, so dashboard-only events (Step / ModelInfo) were posted as
+        // EMPTY messages and used up the 30 s progress throttle. Filter
+        // before the throttle so they cannot delay a real progress line.
+        if !forwards_progress(&event) {
+            return;
+        }
         let mut last = match last_progress.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -4622,3 +4629,10 @@ mod normal_pairing_acl_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/discord.rs"]
 mod f4_decision_route_tests;
+
+/// Progress-callback filter: only events a text channel can render
+/// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would
+/// otherwise reach the customer as an empty or unintended message).
+pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
+    event.is_channel_text()
+}

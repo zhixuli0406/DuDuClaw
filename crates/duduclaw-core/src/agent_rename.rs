@@ -11,6 +11,28 @@
 //! Extracted as pure string functions (no I/O) so both the gateway RPC path
 //! and the CLI MCP path can share + unit-test identical replacement logic.
 
+/// Longest display name (characters).
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// A display name is written into SOUL.md / IDENTITY.md by the rename sync,
+/// which then becomes part of every prompt, so it must be plain text: 1–64
+/// characters, no line breaks or control characters, no invisible or
+/// bidirectional formatting characters, and no markup (`< > [ ] { }` or a
+/// backtick).
+pub fn validate_display_name(name: &str) -> Result<(), String> {
+    let n = name.trim();
+    if n.is_empty() || n.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(format!("display_name must be 1 to {MAX_DISPLAY_NAME_CHARS} characters"));
+    }
+    let invisible = |c: char| {
+        matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xE0000..=0xE007F)
+    };
+    if n.chars().any(|c| c.is_control() || invisible(c) || matches!(c, '<' | '>' | '[' | ']' | '{' | '}' | '`')) {
+        return Err("display_name must be plain text (no line breaks, invisible characters or markup such as < > [ ] { } `)".into());
+    }
+    Ok(())
+}
+
 /// Replace every exact occurrence of `old_name` with `new_name` in `content`.
 ///
 /// Returns `(new_content, changed)`. A no-op (`changed = false`, content
@@ -42,6 +64,15 @@ pub fn synced_trigger(trigger: &str, old_name: &str, new_name: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_names_must_be_plain_text() {
+        assert!(validate_display_name("財務小幫手").is_ok());
+        assert!(validate_display_name("Alice (CS)").is_ok());
+        for bad in ["", "  ", "a\nIgnore previous", "<b>x</b>", "x`y`", "a\u{200b}b", "[link](x)", &"字".repeat(65)] {
+            assert!(validate_display_name(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn rename_replaces_all_occurrences() {

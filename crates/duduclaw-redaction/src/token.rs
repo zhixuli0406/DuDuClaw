@@ -170,9 +170,45 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Replace every well-formed `<REDACT:CATEGORY:hash>` token in `text` with a
+/// human-readable placeholder `〔已遮蔽·CATEGORY〕`, **without** consulting the
+/// vault.
+///
+/// For text that is shown to a person but must never carry the original
+/// value — for example an employee's thinking summary in the dashboard chat.
+/// Unlike [`crate::RedactionPipeline::restore`] this never restores
+/// anything, whoever the viewer is; malformed look-alikes are left verbatim
+/// (they carry no vault key either way).
+pub fn mask_tokens_for_display(text: &str) -> String {
+    if !text.contains(TOKEN_PREFIX) {
+        return text.to_string();
+    }
+    crate::pipeline::rewrite_tokens(text, |tok| {
+        crate::pipeline::TokenAction::Replace(display_placeholder(tok.category()))
+    })
+}
+
+/// The placeholder [`mask_tokens_for_display`] uses for one category.
+pub fn display_placeholder(category: &str) -> String {
+    format!("〔已遮蔽·{category}〕")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_tokens_for_display_never_restores() {
+        let text = format!("寄給 <REDACT:EMAIL:{H32}> 與 <REDACT:PHONE:{H32}>，完成");
+        assert_eq!(
+            mask_tokens_for_display(&text),
+            "寄給 〔已遮蔽·EMAIL〕 與 〔已遮蔽·PHONE〕，完成"
+        );
+        // Untouched when there is nothing to mask, and malformed tokens stay.
+        assert_eq!(mask_tokens_for_display("plain 文字"), "plain 文字");
+        let bad = "<REDACT:EMAIL:short> and <REDACT:EMAIL:";
+        assert_eq!(mask_tokens_for_display(bad), bad);
+    }
 
     // A valid 32-hex-char hash literal for tests.
     const H32: &str = "a3f9b2c10123abcd0123abcda3f9b2c1";

@@ -117,7 +117,8 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
                 }
                 // OpenAI reasoning replay requires encrypted reasoning items
                 // we don't retain in v1 — skipped (server regenerates).
-                ContentPart::Reasoning { .. } => {}
+                // Anthropic-only ciphertext: meaningless to OpenAI.
+                ContentPart::Reasoning { .. } | ContentPart::RedactedReasoning { .. } => {}
             }
         }
         flush(&mut content, &mut input);
@@ -167,6 +168,13 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
     // the hint's three. `None` ⇒ untouched.
     if let Some(effort) = req.reasoning_effort.as_deref() {
         body["reasoning"] = json!({"effort": effort});
+    }
+    // Thinking display: ask for a reasoning summary. Only the caller knows
+    // whether the model reasons, so `None` (every caller today) leaves the
+    // body untouched; any `Some` maps to `summary: "auto"` (the Responses
+    // API has no "omitted" / "updates" equivalents).
+    if req.thinking_display.is_some() {
+        body["reasoning"]["summary"] = json!("auto");
     }
     if let Some(schema) = &req.response_format {
         body["text"] = json!({
@@ -602,6 +610,22 @@ mod tests {
         // An explicit per-call effort wins over the coarser ReasoningHint.
         req.reasoning = ReasoningHint::Low;
         assert_eq!(build_request_body(&req)["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn thinking_display_asks_for_a_reasoning_summary_and_keeps_effort() {
+        // None ⇒ untouched (byte-identical to before the field existed).
+        assert!(build_request_body(&ChatRequest::new("gpt-5")).get("reasoning").is_none());
+
+        let mut req = ChatRequest::new("gpt-5");
+        req.thinking_display = Some(crate::types::ThinkingDisplay::Summarized);
+        let body = build_request_body(&req);
+        assert_eq!(body["reasoning"], json!({"summary": "auto"}));
+
+        req.reasoning_effort = Some("high".to_string());
+        req.thinking_display = Some(crate::types::ThinkingDisplay::Updates);
+        let body = build_request_body(&req);
+        assert_eq!(body["reasoning"], json!({"effort": "high", "summary": "auto"}));
     }
 
     #[test]

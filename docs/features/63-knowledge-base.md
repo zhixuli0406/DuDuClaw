@@ -2,9 +2,24 @@
 
 Upload company documents (handbooks, price lists, product FAQs) into **collections**, decide per collection who may read them, and let AI employees search them with citations to the page, slide or spreadsheet rows they came from.
 
-Status in this release: storage, ingestion, keyword search, the `knowledge.*` RPCs, the upload route, the three read-only MCP tools and the `duduclaw knowledge eval` command. The dashboard pages, vector (semantic) search, automatic injection into channel replies and citation footers come in later releases. The existing wikis are not touched.
+Available now: storage, ingestion, keyword search, the `knowledge.*` RPCs, the upload route, the three read-only MCP tools, the `duduclaw knowledge eval` command, and the dashboard's Document library pages with the AI agent binding. Vector (semantic) search, automatic injection into channel replies and citation footers come in later releases. The existing wikis are not touched.
 
 ---
+
+## Using the dashboard
+
+**Document library** in the sidebar's Company group (on Personal, in the main list right after Memory) lists the collections you can see: name, sensitivity, your role, the number of documents and how many are still being read.
+
+1. **Create a collection**: managers and admins press "New collection" and give a name, description and sensitivity; the short code can be left empty and is generated (it is the code AI agent settings use). Only you can see a new collection.
+2. **Add sources**: on the collection's Sources tab press "Add source" to drop or choose files (up to 20 at a time; a file of an unsupported type or over the size limit is stopped before it is sent, with the reason; with an upload progress bar and then one line per file: added, already there, or why it was refused), paste text, or add a public web page. Each document carries its state: queued, reading, indexing, ready (word match), waiting for approval, failed (with the reason). While a document is still being read the list refreshes every 3 seconds. A document's menu downloads the original, reads it again or deletes it (the last two need the editor role).
+3. **Try a search**: type a question and see which passages of this collection come back, in order, with the page or section of each; a result opens the original text in a side drawer with the passage highlighted, and you can step to the previous or next passage.
+4. **Sharing** (owners only): the picker on the right has People, Departments, AI agents and Channels and lists only principals you may share with: People and Departments exist on Enterprise only, and people are found by a search of at least 2 characters (at most 20 shown, never the whole list); AI agents are the ones you own (admins: all; agents you can only view or operate do not count); a channel can be shared whole or limited to one chat by its ID. The role menu disables roles a kind of principal cannot hold, and the last owner cannot be removed. Sharing a whole channel shows a warning. "Save sharing" saves the list in one go and asks you to reload when someone else saved in between. The gateway applies the same rule when saving: a principal you add, or one whose role you raise (viewer to editor, for example), is refused when you may not share with it; existing principals kept at the same or a lower role are left alone.
+5. **Access record** (owners): when, who (a person, an AI agent acting for a person, someone without an account on a channel), what they did, what they asked and how many passages came back.
+6. **Settings** (owners): name, description, department label, sensitivity, "Process on this computer only" (later meaning-based search never sends this collection to an outside service), and deleting the collection after typing its name.
+
+Admins also get "Refused reads" at the top of the Document library page: every refused read across all collections.
+
+**Letting an AI agent use a collection**: share the collection with the agent (or its department) on the collection's Sharing tab, then open Agents → Edit Settings → Tools & permissions → Document library and choose: every collection shared with it, only the ticked ones, or none. This writes `agent.toml [knowledge] collections`; only collections shared with the agent can be ticked, so the setting can only narrow. The agent's owners and admins can change it.
 
 ## Collections and permissions
 
@@ -35,7 +50,7 @@ For an AI employee answering someone, the intersection of:
    collections = ["hr-handbook", "product-faq"]   # slugs; [] turns the tools off
    ```
 
-   No `[knowledge]` section means every collection granted to the employee. Unknown slugs are ignored. A section the gateway cannot parse counts as `[]`. Employees cannot edit this section themselves.
+   No `[knowledge]` section means every collection granted to the employee. Unknown slugs are ignored. A section the gateway cannot parse counts as `[]`. Employees cannot edit this section themselves; their owners and admins set it in the dashboard (see "Letting an AI agent use a collection" above).
 
 2. **The person side.** Who the turn is for: a signed-in user brings their user and department grants; an unidentified messaging-app sender brings only `channel` grants; a turn the gateway registered as having no person (cron, heartbeat, dispatch) may use public and internal collections granted to the employee; a call whose turn the gateway did not register (no turn id, an unknown one) may read nothing.
 
@@ -114,6 +129,8 @@ They exist for an employee only while at least one collection is on its side (gr
 - Every search, passage read, listing and download writes a row to `knowledge.db`'s access log: who (dashboard user, employee, channel), the query (first 500 characters), the allowed collections and the result ids, never the passage text. Rows older than `access_log_retention_days` are deleted every ten minutes.
 - Creating, changing and deleting collections, permission changes and source deletions are also written to `security_audit.jsonl`.
 - Collection owners read the access log with `knowledge.access_log.list`: who, when, which employee or channel, how many results, and a short hash of the question. The question text itself is shown only to Admins and to the person who asked.
+- Admins list refused reads across all collections with `knowledge.access_log.denied`.
+- The sharing picker uses `knowledge.principals.search` (display names and departments only, never e-mail addresses; people only for a search of at least 2 characters, at most 20; people already on the list are looked up by id through `resolve`); the upload pre-check uses `knowledge.limits`; the employee edit page reads the collections shared with an employee through `knowledge.agent.collections` (id, code, name and sensitivity only).
 
 ## Settings (`config.toml`)
 

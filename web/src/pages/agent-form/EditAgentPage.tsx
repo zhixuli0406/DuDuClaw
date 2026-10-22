@@ -90,11 +90,11 @@ import {
   DEFAULT_ODOO,
   DEFAULT_ADVANCED,
 } from './defaults';
+import { KnowledgeBindingSection } from './KnowledgeBindingSection';
 import { ToolPolicyEditor } from './editors';
 import {
   buildUpdatePayload,
   isAdminOnlyPath,
-  kvRowsFromTable,
   teamRolesShareVendor,
   type OdooFormState,
   clampInt,
@@ -104,6 +104,9 @@ import { ActionRulesEditor } from './ActionRulesEditor';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
 import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
+import { ChangeReviewDialog, type ChangeReviewState } from '@/components/agent-files/ChangeReviewDialog';
+import { analysisUnavailable, responseNeedsDialog } from '@/components/agent-files/review-text';
+import type { AgentFileSaveAction, AgentFileSaveResponse } from '@/lib/agent-files-types';
 
 /**
  * W2-8 — client-side mirror of the gateway's `notify_governance::QuietWindow::
@@ -378,6 +381,23 @@ export function EditAgentPage() {
   // CON — contract form, loaded lazily via contract.get on first tab open
   const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
   const [contractLoaded, setContractLoaded] = useState(false);
+  // The two list editors keep the raw text while someone types, so a space
+  // at the end of a line or a fresh empty line is not eaten by the parse.
+  // Reset to `null` whenever the contract is (re)loaded from the server.
+  const [contractDraft, setContractDraft] = useState<{ must_not: string; must_always: string } | null>(null);
+  // The contract save answers with the shared review envelope. A held answer
+  // (needs confirmation, blocked, conflict, rejected, sent for review) opens
+  // ChangeReviewDialog; the follow-up resends the SAME contract that was
+  // checked (`contractSentRef`), never whatever the editor holds by then.
+  const contractHashRef = useRef<string | undefined>(undefined);
+  const contractSentRef = useRef<ContractConfig | null>(null);
+  const [contractReview, setContractReview] = useState<ChangeReviewState | null>(null);
+  const contractReviewOpenRef = useRef(false);
+  useEffect(() => { contractReviewOpenRef.current = contractReview !== null; }, [contractReview]);
+  const [contractReviewBusy, setContractReviewBusy] = useState(false);
+  const [contractReviewError, setContractReviewError] = useState<string | null>(null);
+  // 'held': the last edit was not applied; 'pending': it waits for an admin.
+  const [contractHeld, setContractHeld] = useState<'held' | 'pending' | null>(null);
 
   // RT — runtime form ([runtime] provider / fallback).
   const [runtime, setRuntime] = useState<typeof DEFAULT_RUNTIME>(DEFAULT_RUNTIME);
@@ -405,6 +425,17 @@ export function EditAgentPage() {
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
   const isAdminRef = useRef(isAdmin);
   useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
+  // The gateway's own admin-only path list (`agents.inspect.admin_only_fields`);
+  // `isAdminOnlyPath` falls back to the built-in table when it is absent.
+  const adminOnlyFieldsRef = useRef<ReadonlyArray<string> | undefined>(undefined);
+  useEffect(() => { adminOnlyFieldsRef.current = agent?.admin_only_fields; }, [agent]);
+  // CON — the boundaries editor is writable for an admin or this employee's
+  // owner; everyone else who can open the page sees it read-only.
+  const bindings = useAuthStore((st) => st.bindings);
+  const canEditContract =
+    isAdmin || (bindings ?? []).some((b) => b.agent_name === id && b.access_level === 'owner');
+  const canEditContractRef = useRef(canEditContract);
+  useEffect(() => { canEditContractRef.current = canEditContract; }, [canEditContract]);
 
   // ── Channels (2026-08-13 unification) ──
   // The 整合 tab no longer keeps its own raw token fields — it shows this
@@ -542,7 +573,11 @@ export function EditAgentPage() {
       self_study_hour: agent.research?.self_study_hour ?? DEFAULT_RESEARCH.self_study_hour,
     });
     setContract({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
+    setContractDraft(null);
     setContractLoaded(false);
+    contractHashRef.current = undefined;
+    setContractReview(null);
+    setContractHeld(null);
 
     const rt = agent.runtime;
     setRuntime({
@@ -589,7 +624,9 @@ export function EditAgentPage() {
       // `ProactiveSettings.quiet_hours_own` for why saving THAT unchanged
       // would silently pin the deployment-wide default into this agent).
       proactive_quiet_hours: agent.proactive?.quiet_hours_own ?? '',
-      kv: kvRowsFromTable('prompt', agent.prompt),
+      // `[prompt]` is no longer editable through the typed key/value rows
+      // (the gateway refuses it), so the editor starts empty.
+      kv: [],
     });
 
     const roles = agent.team?.roles;
@@ -633,6 +670,8 @@ export function EditAgentPage() {
         must_always: res.must_always ?? [],
         max_tool_calls_per_turn: res.max_tool_calls_per_turn ?? 0,
       });
+      contractHashRef.current = res.hash || undefined;
+      setContractDraft(null);
       setContractLoaded(true);
     }).catch((e) => {
       console.warn('[api]', e);
@@ -674,10 +713,18 @@ export function EditAgentPage() {
     setCaps((prev) => ({ ...prev, computer_use_config: { ...prev.computer_use_config, [key]: value } }));
   }, [markDirty]);
 
+  // A non-admin editing an admin-only path is a no-op (the control is
+  // disabled too); the save path drops such paths as a second line.
+  const lockedPath = useCallback(
+    (path: string) => !isAdminRef.current && isAdminOnlyPath(path, adminOnlyFieldsRef.current),
+    [],
+  );
+
   const updateOsWatch = useCallback(<K extends keyof typeof DEFAULT_OS_WATCH>(key: K, value: (typeof DEFAULT_OS_WATCH)[K]) => {
+    if (lockedPath(`osWatch.${String(key)}`)) return;
     markDirty(`osWatch.${String(key)}`);
     setOsWatch((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty]);
+  }, [markDirty, lockedPath]);
 
   const updateResearch = useCallback(<K extends keyof typeof DEFAULT_RESEARCH>(key: K, value: (typeof DEFAULT_RESEARCH)[K]) => {
     markDirty(`research.${String(key)}`);
@@ -685,9 +732,10 @@ export function EditAgentPage() {
   }, [markDirty]);
 
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
+    if (lockedPath(`runtime.${String(key)}`)) return;
     markDirty(`runtime.${String(key)}`);
     setRuntime((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty]);
+  }, [markDirty, lockedPath]);
 
   const updateEvoAdv = useCallback(<K extends keyof typeof DEFAULT_EVOLUTION_ADVANCED>(key: K, value: (typeof DEFAULT_EVOLUTION_ADVANCED)[K]) => {
     markDirty(`evo.${String(key)}`);
@@ -700,27 +748,31 @@ export function EditAgentPage() {
   }, [markDirty]);
 
   const updateOdoo = useCallback(<K extends keyof OdooFormState>(key: K, value: OdooFormState[K]) => {
+    if (lockedPath(`odoo.${String(key)}`)) return;
     markDirty(`odoo.${String(key)}`);
     setOdoo((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty]);
+  }, [markDirty, lockedPath]);
 
   const updateAdv = useCallback(<K extends keyof typeof DEFAULT_ADVANCED>(key: K, value: (typeof DEFAULT_ADVANCED)[K]) => {
-    markDirty(key === 'kv' ? 'kv' : `adv.${String(key)}`);
+    const path = key === 'kv' ? 'kv' : `adv.${String(key)}`;
+    if (lockedPath(path)) return;
+    markDirty(path);
     setAdv((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty]);
+  }, [markDirty, lockedPath]);
 
   const updateField = useCallback(<K extends keyof AgentUpdateParams>(key: K, value: AgentUpdateParams[K]) => {
     const path = `form.${String(key)}`;
-    if (!isAdminRef.current && isAdminOnlyPath(path)) return;
+    if (lockedPath(path)) return;
     markDirty(path);
     setForm((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty]);
+  }, [markDirty, lockedPath]);
 
   // v1.68 W1 — new-control updaters.
   const updateV = useCallback(<K extends keyof typeof DEFAULT_V168>(key: K, value: (typeof DEFAULT_V168)[K]) => {
+    if (lockedPath(`v.${String(key)}`)) return;
     markDirty(`v.${String(key)}`);
     setV168((prev) => ({ ...prev, [key]: value }));
-  }, [markDirty]);
+  }, [markDirty, lockedPath]);
 
   const updateTeamRole = useCallback((role: AgentTeamRoleKey, field: 'runtime' | 'model' | 'effort', value: string) => {
     markDirty(`v.team_roles.${role}.${field}`);
@@ -733,9 +785,43 @@ export function EditAgentPage() {
   // CON — contract editor updater. Marks the contract gate (not the section gate)
   // so a contract-only edit debounces into a lone contract.update.
   const editContract = useCallback((updater: (prev: ContractConfig) => ContractConfig) => {
+    if (!canEditContractRef.current) return;
     markContractEdit();
     setContract(updater);
   }, [markContractEdit]);
+
+  const editContractList = useCallback((field: 'must_not' | 'must_always', raw: string) => {
+    if (!canEditContractRef.current) return;
+    setContractDraft((d) => ({
+      must_not: d?.must_not ?? contract.must_not.join('\n'),
+      must_always: d?.must_always ?? contract.must_always.join('\n'),
+      [field]: raw,
+    }));
+    editContract((p) => ({ ...p, [field]: raw.split('\n').map((x) => x.trim()).filter((x) => x !== '') }));
+  }, [contract, editContract]);
+
+  // CON — what a contract save answered. Returns true when the edit took
+  // effect (or there was nothing to change).
+  const takeContractAnswer = useCallback(
+    (res: (Partial<AgentFileSaveResponse> & { success?: boolean }) | null | undefined, sent: ContractConfig, fromFollowUp: boolean): boolean => {
+      // An older gateway answers `{ success: true }` without a status.
+      const status = res?.status ?? 'applied';
+      if (status === 'applied' || status === 'unchanged') {
+        if (res?.hash) contractHashRef.current = res.hash;
+        setContractHeld(null);
+      } else {
+        setContractHeld(status === 'pending_approval' ? 'pending' : 'held');
+      }
+      const full = { file: 'contract', agent_id: agent?.name ?? '', ...(res ?? {}), status } as AgentFileSaveResponse;
+      if (fromFollowUp ? status !== 'unchanged' : responseNeedsDialog(full)) {
+        contractSentRef.current = sent;
+        setContractReviewError(null);
+        setContractReview({ kind: 'response', response: full });
+      }
+      return status === 'applied' || status === 'unchanged';
+    },
+    [agent],
+  );
 
   // performSave — one autosave pass. Consumes the dirty map up front (so
   // edits landing mid-save start a fresh map for the trailing pass), sends
@@ -744,15 +830,17 @@ export function EditAgentPage() {
   const performSave = useCallback(async () => {
     if (!agent) return;
     const consumed = dirtyRef.current;
-    const doContract = contractDirtyRef.current;
+    // A contract answer waiting in the review dialog is never re-sent by the
+    // autosave; the dialog's own buttons carry the follow-up.
+    const doContract = contractDirtyRef.current && !contractReviewOpenRef.current;
     if (consumed.size === 0 && !doContract) return;
     dirtyRef.current = new Set();
-    contractDirtyRef.current = false;
+    if (doContract) contractDirtyRef.current = false;
     // Never send admin-only fields for a non-admin (the gateway would refuse
     // the whole save); the controls are disabled anyway.
     const dirty = isAdminRef.current
       ? consumed
-      : new Set([...consumed].filter((p) => !isAdminOnlyPath(p)));
+      : new Set([...consumed].filter((p) => !isAdminOnlyPath(p, agent.admin_only_fields)));
     const savedPref = agent.model?.preferred ?? '';
     const savedFb = agent.model?.fallback ?? '';
     const { payload, hasChanges, includesKv } = buildUpdatePayload(
@@ -773,6 +861,7 @@ export function EditAgentPage() {
     setSaveStatus('saving');
     setSaveError(null);
     let sectionsSaved = false;
+    let contractApplied = true;
     try {
       if (hasChanges) {
         // updateAgent re-fetches the roster internally. Autosave never
@@ -803,13 +892,24 @@ export function EditAgentPage() {
           );
         }
       }
-      // CON — a dirty contract writes through its own RPC.
+      // CON — a dirty contract writes through its own RPC, which checks the
+      // change first and may hold it for a confirmation or a review.
       if (doContract) {
-        await api.contract.update(agent.name, contract);
+        const sent = contract;
+        const baseHash = contractHashRef.current;
+        const res = baseHash
+          ? await api.contract.update(agent.name, sent, { base_hash: baseHash })
+          : await api.contract.update(agent.name, sent);
+        contractApplied = takeContractAnswer(res, sent, false);
       }
-      setSaveStatus('saved');
-      // Fade the 'saved' badge back to idle after ~2s.
-      savedResetTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2000);
+      if (contractApplied) {
+        setSaveStatus('saved');
+        // Fade the 'saved' badge back to idle after ~2s.
+        savedResetTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2000);
+      } else {
+        // Held for review: nothing to celebrate in the header.
+        setSaveStatus('idle');
+      }
     } catch (e) {
       // Re-arm the gates so the next edit's cycle retries the failed write.
       if (!sectionsSaved) {
@@ -826,8 +926,62 @@ export function EditAgentPage() {
     }
   }, [
     agent, form, availableModels, updateAgent, intl, errorText,
-    caps, osWatch, research, runtime, evoAdv, odoo, adv, v168, contract,
+    caps, osWatch, research, runtime, evoAdv, odoo, adv, v168, contract, takeContractAnswer,
   ]);
+
+  // CON — the review dialog's follow-up: resend the checked contract with
+  // the person's decision. The server does not run the check again.
+  const followUpContract = useCallback(
+    async (action: Extract<AgentFileSaveAction, 'confirm' | 'request_approval'>, reason: string, acknowledgeRisk: boolean) => {
+      const sent = contractSentRef.current;
+      const held = contractReview?.kind === 'response' ? contractReview.response : null;
+      if (!agent || !sent || !held) return;
+      setContractReviewBusy(true);
+      setContractReviewError(null);
+      try {
+        const analysisId = held.review?.analysis_id ?? undefined;
+        const res = await api.contract.update(agent.name, sent, {
+          action,
+          ...(analysisId ? { analysis_id: analysisId } : {}),
+          reason,
+          ...(acknowledgeRisk ? { acknowledge_risk: true } : {}),
+          ...(contractHashRef.current ? { base_hash: contractHashRef.current } : {}),
+        });
+        takeContractAnswer(res, sent, true);
+      } catch (e) {
+        setContractReviewError(errorText(e));
+      } finally {
+        setContractReviewBusy(false);
+      }
+    },
+    [agent, contractReview, takeContractAnswer, errorText],
+  );
+
+  // CON — someone else saved first: load what is there now.
+  const reloadContract = useCallback(async () => {
+    if (!agent) return;
+    try {
+      const res = await api.contract.get(agent.name);
+      setContract({
+        must_not: res.must_not ?? [],
+        must_always: res.must_always ?? [],
+        max_tool_calls_per_turn: res.max_tool_calls_per_turn ?? 0,
+      });
+      contractHashRef.current = res.hash || undefined;
+      setContractDraft(null);
+      contractDirtyRef.current = false;
+      setContractHeld(null);
+      setContractReview(null);
+    } catch (e) {
+      setContractReviewError(errorText(e));
+    }
+  }, [agent, errorText]);
+
+  const onContractApplied = useCallback((res: AgentFileSaveResponse) => {
+    toast.success(intl.formatMessage({ id: 'agentFiles.review.applied' }));
+    setContractHeld(null);
+    if (!analysisUnavailable(res.review)) setContractReview(null);
+  }, [intl]);
 
   // Keep the ref pointed at the latest closure so the debounce timer and the
   // unmount flush always call the current-state save.
@@ -979,6 +1133,9 @@ export function EditAgentPage() {
     new Set([...departmentsOf(agents), ...registryDepartments]),
   ).sort();
 
+  // Render-time twin of `lockedPath` (disables the control for a non-admin).
+  const locked = (path: string) => !isAdmin && isAdminOnlyPath(path, agent?.admin_only_fields);
+
   // v1.68 W1 — one quiet line under every admin-only control for non-admins.
   const adminHint = !isAdmin ? (
     <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
@@ -1043,7 +1200,7 @@ export function EditAgentPage() {
           <SettingsSection>
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
-              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? true} onChange={(v) => updateField('can_modify_own_skills', v)} />
+              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? true} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -1072,8 +1229,8 @@ export function EditAgentPage() {
           {adminHint}
           <SettingsSection title={t('agents.edit.section.permissions')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} />
-              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? true} onChange={(v) => updateField('can_schedule_tasks', v)} />
+              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} disabled={locked('form.can_send_cross_agent')} onChange={(v) => updateField('can_send_cross_agent', v)} />
+              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? true} disabled={locked('form.can_schedule_tasks')} onChange={(v) => updateField('can_schedule_tasks', v)} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1169,6 +1326,10 @@ export function EditAgentPage() {
             );
           })()}
 
+          {/* KB — which shared document collections this employee uses
+              (narrowing only; the grants live on the collection itself). */}
+          {id && <KnowledgeBindingSection agentId={id} />}
+
           <SettingsSection title={t('agents.edit.capabilities')} description={t('agents.cap.desc')}>
             <button
               type="button"
@@ -1235,8 +1396,8 @@ export function EditAgentPage() {
           {/* v1.68 W1 — [guardrails] outbound reply scanning. */}
           <SettingsSection title={t('agents.v168.guardrails.title')} description={t('agents.v168.guardrails.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.v168.guardrails.enabled')} checked={v168.guardrails_enabled} onChange={(v) => updateV('guardrails_enabled', v)} />
-              <RowSwitch label={t('agents.v168.guardrails.blockSecrets')} description={t('agents.v168.guardrails.blockSecrets.help')} checked={v168.guardrails_block_secrets} onChange={(v) => updateV('guardrails_block_secrets', v)} />
+              <RowSwitch label={t('agents.v168.guardrails.enabled')} checked={v168.guardrails_enabled} disabled={locked('v.guardrails_enabled')} onChange={(v) => updateV('guardrails_enabled', v)} />
+              <RowSwitch label={t('agents.v168.guardrails.blockSecrets')} description={t('agents.v168.guardrails.blockSecrets.help')} checked={v168.guardrails_block_secrets} disabled={locked('v.guardrails_block_secrets')} onChange={(v) => updateV('guardrails_block_secrets', v)} />
               <RowSwitch label={t('agents.v168.guardrails.blockInjectionEcho')} description={t('agents.v168.guardrails.blockInjectionEcho.help')} checked={v168.guardrails_block_injection_echo} onChange={(v) => updateV('guardrails_block_injection_echo', v)} />
               <RowSwitch label={t('agents.v168.guardrails.redactPii')} description={t('agents.v168.guardrails.redactPii.help')} checked={v168.guardrails_redact_pii} onChange={(v) => updateV('guardrails_redact_pii', v)} />
             </SettingsCard>
@@ -1252,11 +1413,20 @@ export function EditAgentPage() {
             {!contractLoaded ? (
               <p className="py-8 text-center text-sm text-muted-foreground">{t('common.loading')}</p>
             ) : (
-              <>
+              <fieldset disabled={!canEditContract} className="contents">
+                {!canEditContract && (
+                  <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">{t('agents.contract.readOnly')}</p>
+                )}
+                {contractHeld && (
+                  <p role="status" className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground">
+                    {t(contractHeld === 'pending' ? 'agentFiles.review.heldPending' : 'agentFiles.review.held')}
+                  </p>
+                )}
                 <FieldBlock label={t('agents.contract.mustNot')} description={t('agents.contract.mustNot.hint')}>
                   <Textarea
-                    value={contract.must_not.join('\n')}
-                    onChange={(e) => editContract((p) => ({ ...p, must_not: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
+                    aria-label={t('agents.contract.mustNot')}
+                    value={contractDraft?.must_not ?? contract.must_not.join('\n')}
+                    onChange={(e) => editContractList('must_not', e.target.value)}
                     rows={4}
                     placeholder={t('agents.contract.mustNot.placeholder')}
                     className="resize-none font-mono"
@@ -1264,8 +1434,9 @@ export function EditAgentPage() {
                 </FieldBlock>
                 <FieldBlock label={t('agents.contract.mustAlways')} description={t('agents.contract.mustAlways.hint')}>
                   <Textarea
-                    value={contract.must_always.join('\n')}
-                    onChange={(e) => editContract((p) => ({ ...p, must_always: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
+                    aria-label={t('agents.contract.mustAlways')}
+                    value={contractDraft?.must_always ?? contract.must_always.join('\n')}
+                    onChange={(e) => editContractList('must_always', e.target.value)}
                     rows={4}
                     placeholder={t('agents.contract.mustAlways.placeholder')}
                     className="resize-none font-mono"
@@ -1274,13 +1445,24 @@ export function EditAgentPage() {
                 <SettingsCard>
                   <RowNumber label={t('agents.contract.maxToolCalls')} description={t('agents.contract.maxToolCalls.hint')} value={contract.max_tool_calls_per_turn} min={0} max={1000} onChange={(v) => editContract((p) => ({ ...p, max_tool_calls_per_turn: v }))} />
                 </SettingsCard>
-              </>
+              </fieldset>
             )}
+            <ChangeReviewDialog
+              state={contractReview}
+              isAdmin={isAdmin}
+              busy={contractReviewBusy}
+              error={contractReviewError}
+              onConfirm={(reason, ack) => void followUpContract('confirm', reason, ack)}
+              onRequestApproval={(reason) => void followUpContract('request_approval', reason, false)}
+              onClose={() => { setContractReview(null); setContractReviewError(null); }}
+              onReload={() => void reloadContract()}
+              onApplied={onContractApplied}
+            />
           </SettingsSection>
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? true} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
+              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? true} disabled={locked('form.can_create_agents')} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
               <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} disabled={!isAdmin} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v), 'agents.edit.dangerConfirm.canModifySoul')} />
             </SettingsCard>
           </DangerZone>
@@ -1343,7 +1525,7 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.cap.osNative')} description={t('agents.cap.osNative.help')} checked={caps.os_native} disabled={!isAdmin} onChange={(v) => updateCap('os_native', v)} />
             </SettingsCard>
             {caps.os_native && (
-              <>
+              <fieldset disabled={locked('osWatch.paths')} className="contents">
                 <FieldBlock label={t('agents.osWatch.paths')} description={t('agents.osWatch.paths.help')}>
                   <ChipEditor values={osWatch.paths} onChange={(v) => updateOsWatch('paths', v)} placeholder="~/Downloads" addLabel={t('common.add')} />
                 </FieldBlock>
@@ -1355,7 +1537,7 @@ export function EditAgentPage() {
                   <RowNumber label={t('agents.osWatch.maxEventsPerMin')} description={t('agents.osWatch.maxEventsPerMin.help')} value={osWatch.max_events_per_min} min={1} max={1000000} onChange={(v) => updateOsWatch('max_events_per_min', v)} />
                 </SettingsCard>
                 <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">{t('agents.osWatch.hotReloadHint')}</p>
-              </>
+              </fieldset>
             )}
           </SettingsSection>
         </SettingsTab>
@@ -1363,6 +1545,8 @@ export function EditAgentPage() {
         {/* ── 整合 ─────────────────────────────────────────── */}
         <SettingsTab value="integration" title={t('agents.edit.nav.integration')} description={t('agents.edit.nav.integration.desc')}>
           <SettingsSection title="Odoo" description={t('agents.odoo.desc')}>
+            <fieldset disabled={locked('odoo.profile')} className="contents">
+            {locked('odoo.profile') && adminHint}
             <SettingsCard>
               <RowText label={t('agents.odoo.profile')} description={t('agents.odoo.profile.hint')} value={odoo.profile} placeholder="default" onChange={(v) => updateOdoo('profile', v)} />
             </SettingsCard>
@@ -1385,6 +1569,7 @@ export function EditAgentPage() {
               <RowText label={t('agents.odoo.password')} description={t('agents.odoo.secret.hint')} type="password" autoComplete="off" value={odoo.password} onChange={(v) => updateOdoo('password', v)} />
               <RowSwitch label={t('odoo.agent.clearSecret')} checked={odoo.clear_password} onChange={(v) => updateOdoo('clear_password', v)} />
             </SettingsCard>
+            </fieldset>
           </SettingsSection>
 
           {/* v1.76 — [channels] public_trigger (admin-only: it widens who can
@@ -1528,8 +1713,8 @@ export function EditAgentPage() {
 
           <SettingsSection title={t('agentForm.brain.section.engine')} description={t('agentForm.brain.section.engine.desc')}>
             <SettingsCard>
-              <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
-              <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+              <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
+              <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
             {usesGenericCli && (
@@ -1571,7 +1756,9 @@ export function EditAgentPage() {
               made the operator retype an id from another page. */}
           <SettingsSection title={t('agentForm.brain.section.accounts')} description={t('agentForm.brain.section.accounts.desc')}>
             <FieldBlock label={t('agents.adv.accountPool')} description={t('agentForm.brain.accountPool.hint')}>
-              <AccountPoolSelect values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} />
+              <fieldset disabled={locked('adv.account_pool')} className="contents">
+                <AccountPoolSelect values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} />
+              </fieldset>
             </FieldBlock>
             <CrossLink label={t('agentForm.brain.accountPool.manageLink')} onClick={() => navigate('/app/system/accounts')} />
           </SettingsSection>

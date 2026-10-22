@@ -11,6 +11,12 @@ use tracing::{info, warn};
 
 const MAX_HISTORY_VERSIONS: usize = 10;
 
+// The same baseline protection for every prompt-bearing profile file
+// (SOUL.md and INSTRUCTIONS.md): `ProtectedDoc` and its helpers.
+#[path = "soul_guard_docs.rs"]
+mod docs;
+pub use docs::*;
+
 /// Result of a SOUL.md integrity check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoulCheckResult {
@@ -49,6 +55,12 @@ pub fn fingerprint_soul(agent_dir: &Path) -> Option<String> {
 /// an attacker who compromises an agent directory cannot tamper with both
 /// SOUL.md and its hash simultaneously (MW-H4).
 fn hash_path(agent_dir: &Path) -> std::path::PathBuf {
+    hash_path_with(agent_dir, "hash")
+}
+
+/// `<home>/soul_hashes/<agent>.<ext>` (see [`hash_path`]); `ext` lets the
+/// generalised [`ProtectedDoc`] baselines live next to the SOUL one.
+fn hash_path_with(agent_dir: &Path, ext: &str) -> std::path::PathBuf {
     // Extract agent name from the directory path
     let agent_name = agent_dir
         .file_name()
@@ -63,7 +75,7 @@ fn hash_path(agent_dir: &Path) -> std::path::PathBuf {
         .unwrap_or_else(|| agent_dir.join(".soul_hashes"));
 
     let _ = std::fs::create_dir_all(&soul_hashes_dir);
-    soul_hashes_dir.join(format!("{agent_name}.hash"))
+    soul_hashes_dir.join(format!("{agent_name}.{ext}"))
 }
 
 /// Read the stored fingerprint from the soul_hashes directory.

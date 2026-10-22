@@ -31,6 +31,9 @@ use tracing::debug;
 /// kind-appropriately; anything else would be dishonest to claim.
 pub const KIND_TOOL_STEP: &str = "tool_step";
 pub const KIND_TODO_UPDATE: &str = "todo_update";
+/// One row per reply turn that thought: seconds and token count only
+/// (`思考 8 秒 · 1,240 token`). Thinking text is never stored.
+pub const KIND_THINKING: &str = "thinking";
 
 /// Days of history kept (time-based retention).
 pub const RETENTION_DAYS: i64 = 7;
@@ -92,7 +95,7 @@ pub struct RunStepRow {
     pub session_key: String,
     /// RFC3339 UTC.
     pub ts: String,
-    /// [`KIND_TOOL_STEP`] | [`KIND_TODO_UPDATE`].
+    /// [`KIND_TOOL_STEP`] | [`KIND_TODO_UPDATE`] | [`KIND_THINKING`].
     pub kind: String,
     /// Tool name for tool steps; "done/total" for todo boards.
     pub label: String,
@@ -217,7 +220,32 @@ impl RunStepStore {
         payload_preview: &str,
         seq: i64,
     ) -> Result<(), String> {
-        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.append_at(
+            agent_id,
+            session_key,
+            kind,
+            label,
+            payload_preview,
+            seq,
+            chrono::Utc::now(),
+        )
+    }
+
+    /// [`Self::append`] with an explicit event time — for a row written
+    /// after the fact that must still sort (and fall) inside its run's
+    /// window, e.g. the per-turn thinking summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_at(
+        &self,
+        agent_id: &str,
+        session_key: &str,
+        kind: &str,
+        label: &str,
+        payload_preview: &str,
+        seq: i64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        let ts = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let label = duduclaw_core::truncate_chars(&mask_secretish(label), LABEL_CHAR_CAP);
         let preview = duduclaw_core::truncate_chars(
             &mask_secretish(payload_preview),
@@ -254,6 +282,25 @@ impl RunStepStore {
         seq: i64,
     ) {
         if let Err(e) = self.append(agent_id, session_key, kind, label, payload_preview, seq) {
+            debug!(error = %e, kind, "run_steps append failed (dropped, best-effort)");
+        }
+    }
+
+    /// Best-effort [`Self::append_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_at_best_effort(
+        &self,
+        agent_id: &str,
+        session_key: &str,
+        kind: &str,
+        label: &str,
+        payload_preview: &str,
+        seq: i64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Err(e) =
+            self.append_at(agent_id, session_key, kind, label, payload_preview, seq, at)
+        {
             debug!(error = %e, kind, "run_steps append failed (dropped, best-effort)");
         }
     }

@@ -381,7 +381,10 @@ pub fn seed_default_ledger(req: &ChatRequest) -> ProvenanceLedger {
                 ContentPart::ToolResult { content, .. } => {
                     ledger.register(content, SourceKind::ToolResult)
                 }
-                ContentPart::ToolCall { .. } | ContentPart::Image { .. } => {}
+                // Ciphertext carries no readable instruction to trace.
+                ContentPart::ToolCall { .. }
+                | ContentPart::Image { .. }
+                | ContentPart::RedactedReasoning { .. } => {}
             }
         }
     }

@@ -82,11 +82,16 @@ impl std::str::FromStr for UserStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessLevel {
-    /// Full control — chat, train, modify SOUL.md, modify skills.
+    /// Chat with the employee and change its settings and profile files
+    /// (persona, introduction, work rules, boundaries) — the admin-only
+    /// (authority) settings excepted.
     Owner,
-    /// Operational — chat and view memory, cannot modify SOUL/skills.
+    /// Operational — chat, view memory and profile file versions; cannot
+    /// change settings or profile files.
     Operator,
-    /// Read-only — view status and memory only.
+    /// Read-only — view status and memory, and read the profile files
+    /// (persona, introduction, work rules, boundaries; basic settings with
+    /// secrets masked). No versions, no diffs, no changes.
     Viewer,
 }
 

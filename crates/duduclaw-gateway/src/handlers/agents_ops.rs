@@ -149,15 +149,15 @@ impl MethodHandler {
 
     /// Read-modify-write an agent's `agent.toml` using the provided mutation closure.
     ///
-    /// Uses atomic write (temp + rename) to prevent corruption on concurrent access.
-    /// After a successful write, attempts to trigger a registry re-scan for hot-reload.
+    /// The mutation runs on the file as read under the cross-process lock and
+    /// is written atomically through the profile file writer (version,
+    /// audit). After a successful write the registry is re-scanned, with
+    /// retries.
     ///
-    /// Returns `Ok(true)` if the registry was re-scanned in time (changes visible
-    /// immediately), `Ok(false)` if the re-scan was skipped due to lock contention
-    /// or scan error (changes will land on the next periodic sync, ≤ 5 min for
-    /// heartbeat-driven consumers; channel_reply / dispatcher always read fresh
-    /// from the lock-protected registry so they see the previous version until the
-    /// next scan).
+    /// Returns `Ok(true)` when the re-scan succeeded (changes visible
+    /// immediately) and `Ok(false)` when it failed three times: the change is
+    /// saved, but the gateway has no periodic re-scan, so it takes effect
+    /// after the next successful scan (any later edit, or a restart).
     /// Thin wrapper over [`crate::channel_reply::update_agent_toml_with`] — the
     /// single implementation of "edit agent.toml + hot-reload", shared with the
     /// chat-command path (`/model`) so the two can never drift on the atomic
@@ -167,6 +167,36 @@ impl MethodHandler {
         F: FnOnce(&mut toml::Table) -> Result<(), String>,
     {
         crate::channel_reply::update_agent_toml_with(&self.registry, agent_id, mutate).await
+    }
+
+    /// [`Self::update_agent_toml`] for a dashboard caller: the version and
+    /// audit row name them, and when `session` is given their access is
+    /// re-read from `users.db` inside the file lock (a binding revoked while
+    /// the request was in flight stops the write).
+    pub(crate) async fn update_agent_toml_as<F>(
+        &self,
+        agent_id: &str,
+        source: &'static str,
+        caller: Option<&UserContext>,
+        session: Option<&UserContext>,
+        mutate: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    {
+        let home = self.home_dir.clone();
+        let agent = agent_id.to_string();
+        let session = session.cloned();
+        let guard = move || match &session {
+            Some(s) => crate::agent_files::flow::require_live_agent_access(&home, s, &agent, AccessLevel::Owner).map(|_| ()),
+            None => Ok(()),
+        };
+        let edit = crate::channel_reply::AgentTomlEdit {
+            source,
+            user_id: caller.map(|c| c.user_id.as_str()).unwrap_or("system"),
+            guard,
+        };
+        crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, mutate).await
     }
 
     /// Convenience: update only the `status` field in an agent's `agent.toml`.

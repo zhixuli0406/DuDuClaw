@@ -259,16 +259,26 @@ fn changed_on_disk(path: &Path) -> String {
     )
 }
 
-/// Write `content` to `<path>.toml.tmp` (owner-only) and rename it over
-/// `path`. The caller holds the lock.
-fn replace_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("toml.tmp");
+/// Write `content` to `<file name>.tmp` next to `path` (owner-only) and
+/// rename it over `path`. The caller holds the lock. The temp name keeps the
+/// whole file name (`SOUL.md.tmp`, `agent.toml.tmp`); it used to swap the
+/// extension for `toml.tmp`, which named a Markdown file's temp copy
+/// `SOUL.toml.tmp`.
+pub(crate) fn replace_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = tmp_path_for(path);
     write_owner_only(&tmp, content)?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+/// `<dir>/<file name>.tmp` for `path`.
+pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 // ── Format-preserving render ────────────────────────────────────────────────
@@ -532,6 +542,23 @@ pub(crate) fn prune_backups(dir: &Path, name: &str, keep: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_copy_keeps_the_whole_file_name() {
+        assert_eq!(tmp_path_for(Path::new("/h/agents/a/SOUL.md")), Path::new("/h/agents/a/SOUL.md.tmp"));
+        assert_eq!(tmp_path_for(Path::new("/h/agents/a/agent.toml")), Path::new("/h/agents/a/agent.toml.tmp"));
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("SOUL.md");
+        std::fs::write(&md, "old").unwrap();
+        replace_owner_only(&md, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "new");
+        assert!(!dir.path().join("SOUL.toml.tmp").exists() && !dir.path().join("SOUL.md.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&md).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn param_at_accepts_nested_and_flat() {

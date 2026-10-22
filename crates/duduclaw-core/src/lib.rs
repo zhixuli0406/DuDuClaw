@@ -68,7 +68,7 @@ pub mod zh_variant;
 pub use agent_guard::{
     check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES, INSTRUCTIONS_FILE,
 };
-pub use agent_rename::{rename_in_markdown, synced_trigger};
+pub use agent_rename::{rename_in_markdown, synced_trigger, validate_display_name};
 pub use appliance::{appliance_default_bind, appliance_flag, is_appliance, pick_default_bind, APPLIANCE_ENV};
 pub use concurrency_gate::{
     active_count as concurrency_active_count, effective_limit as concurrency_effective_limit,
@@ -1444,3 +1444,9 @@ pub mod workflow_mcp;
 
 /// Shared hash of computer-use workspace paths (gateway and MCP audits).
 pub mod workspace_path;
+
+/// Thinking display level (`agent.toml [model] show_thinking`).
+pub mod show_thinking;
+
+/// Strip a leading `<think>…</think>` block from open-model answers.
+pub mod think_tags;

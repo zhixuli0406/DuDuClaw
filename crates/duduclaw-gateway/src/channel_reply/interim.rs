@@ -110,9 +110,10 @@ pub fn wanted(home: &Path, session_id: &str) -> bool {
     external_channel(session_id).is_some() && InterimConfig::from_home(home).delay.is_some()
 }
 
-/// Whether a progress event is something the channel user actually sees.
+/// Whether a progress event is something the channel user actually sees
+/// (the same allowlist every text channel applies).
 fn is_visible(ev: &ProgressEvent) -> bool {
-    !matches!(ev, ProgressEvent::Step(_) | ProgressEvent::ModelInfo { .. })
+    ev.is_channel_text()
 }
 
 /// What the employee is busy with on the task board, if anything.
@@ -124,9 +125,14 @@ pub struct BusyRun {
     pub title: Option<String>,
 }
 
-/// Compose the status line (model-free).
-pub fn status_line(waited_secs: u64, busy: Option<&BusyRun>) -> String {
-    let mut s = format!("⏳ 已收到，正在處理（已 {waited_secs} 秒）。");
+/// Compose the status line (model-free). `thinking` = the employee's model
+/// has reported thinking this turn (no thinking content is ever included).
+pub fn status_line(waited_secs: u64, busy: Option<&BusyRun>, thinking: bool) -> String {
+    let mut s = if thinking {
+        format!("💭 已收到，正在思考（已 {waited_secs} 秒）。")
+    } else {
+        format!("⏳ 已收到，正在處理（已 {waited_secs} 秒）。")
+    };
     if let Some(b) = busy {
         match &b.title {
             Some(t) => s.push_str(&format!(
@@ -199,11 +205,16 @@ pub fn arm(
     };
     let shared: Arc<ProgressCallback> = Arc::new(cb);
     let seen = Arc::new(AtomicBool::new(false));
+    let thinking_seen = Arc::new(AtomicBool::new(false));
     let inner_cb = Arc::clone(&shared);
     let inner_seen = Arc::clone(&seen);
+    let inner_thinking = Arc::clone(&thinking_seen);
     let wrapped: ProgressCallback = Box::new(move |ev| {
         if is_visible(&ev) {
             inner_seen.store(true, Ordering::SeqCst);
+        }
+        if matches!(ev, ProgressEvent::Thinking(_)) {
+            inner_thinking.store(true, Ordering::SeqCst);
         }
         inner_cb(ev);
     });
@@ -215,6 +226,7 @@ pub fn arm(
         show_task: cfg.show_task,
         cb: shared,
         seen,
+        thinking_seen,
     };
     (Some(wrapped), Some(watcher))
 }
@@ -227,6 +239,9 @@ pub struct Watcher {
     show_task: bool,
     cb: Arc<ProgressCallback>,
     seen: Arc<AtomicBool>,
+    /// A `Thinking` event arrived (text-less for channels) — the status line
+    /// then says "thinking" instead of "processing".
+    thinking_seen: Arc<AtomicBool>,
 }
 
 impl Watcher {
@@ -243,7 +258,11 @@ impl Watcher {
                 None => None,
             };
             (self.cb)(ProgressEvent::Interim {
-                text: status_line(self.delay.as_secs(), busy.as_ref()),
+                text: status_line(
+                    self.delay.as_secs(),
+                    busy.as_ref(),
+                    self.thinking_seen.load(Ordering::SeqCst),
+                ),
             });
         }
         turn.await
@@ -312,14 +331,61 @@ mod interim_tests {
             minutes: 12,
             title: None,
         };
-        let s = status_line(8, Some(&busy));
+        let s = status_line(8, Some(&busy), false);
         assert!(s.contains("8 秒") && s.contains("12 分鐘"), "{s}");
         let named = BusyRun {
             minutes: 3,
             title: Some("季報".into()),
         };
-        assert!(status_line(8, Some(&named)).contains("季報"));
-        assert!(!status_line(8, None).contains("分鐘"));
+        assert!(status_line(8, Some(&named), false).contains("季報"));
+        assert!(!status_line(8, None, false).contains("分鐘"));
+    }
+
+    #[test]
+    fn status_line_says_thinking_when_the_model_thought() {
+        assert_eq!(status_line(8, None, true), "💭 已收到，正在思考（已 8 秒）。");
+        assert_eq!(status_line(8, None, false), "⏳ 已收到，正在處理（已 8 秒）。");
+        let busy = BusyRun {
+            minutes: 2,
+            title: None,
+        };
+        let s = status_line(5, Some(&busy), true);
+        assert!(s.starts_with("💭") && s.contains("2 分鐘"), "{s}");
+    }
+
+    fn thinking_ev() -> ProgressEvent {
+        ProgressEvent::Thinking(crate::thinking::ThinkingEvent::new(
+            "t0",
+            crate::thinking::ThinkingPhase::Start,
+            crate::thinking::ThinkingKind::Omitted,
+            "claude_cli",
+        ))
+    }
+
+    #[tokio::test]
+    async fn thinking_keeps_the_turn_silent_but_changes_the_wording_once() {
+        let (dir, got, cb) =
+            rig("[channel_reply]\ninterim_status = true\ninterim_status_secs = 1\n");
+        let (wrapped, w) = arm(dir.path(), None, "telegram:1", Some(cb));
+        let wrapped = wrapped.unwrap();
+        w.unwrap()
+            .run(async {
+                // Thinking, steps and model info are not channel text: the
+                // turn still counts as silent.
+                wrapped(thinking_ev());
+                wrapped(thinking_ev());
+                wrapped(ProgressEvent::ModelInfo {
+                    model: "m".into(),
+                });
+                tokio::time::sleep(Duration::from_millis(1600)).await;
+            })
+            .await;
+        let got = got.lock().unwrap();
+        // The rig records every event's display text; channel-hidden events
+        // render as "" — exactly one real status line was posted.
+        let lines: Vec<&String> = got.iter().filter(|s| !s.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{got:?}");
+        assert!(lines[0].starts_with("💭 已收到，正在思考"), "{lines:?}");
     }
 
     fn rig(cfg: &str) -> (tempfile::TempDir, Arc<Mutex<Vec<String>>>, ProgressCallback) {

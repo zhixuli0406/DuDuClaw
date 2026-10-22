@@ -39,11 +39,14 @@ struct PendingNotice {
     contract_changed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_changed_at: Option<String>,
+    /// SOUL / IDENTITY / INSTRUCTIONS changed through the dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_changed_at: Option<String>,
 }
 
 impl PendingNotice {
     fn is_empty(&self) -> bool {
-        self.contract_changed_at.is_none() && self.model_changed_at.is_none()
+        self.contract_changed_at.is_none() && self.model_changed_at.is_none() && self.profile_changed_at.is_none()
     }
 }
 
@@ -76,27 +79,27 @@ fn save_state(home_dir: &Path, state: &NoticeState) -> std::io::Result<()> {
 /// succeeded by the time this runs; worst case is a missed FYI line, not a
 /// blocked config change.
 pub fn mark_contract_changed(home_dir: &Path, agent_id: &str) {
-    mark_changed(home_dir, agent_id, true, false);
+    mark(home_dir, agent_id, |e, now| e.contract_changed_at = Some(now));
 }
 
 /// Mark that `agent_id`'s `[model] preferred` just changed. Same best-effort
 /// posture as [`mark_contract_changed`].
 pub fn mark_model_changed(home_dir: &Path, agent_id: &str) {
-    mark_changed(home_dir, agent_id, false, true);
+    mark(home_dir, agent_id, |e, now| e.model_changed_at = Some(now));
 }
 
-fn mark_changed(home_dir: &Path, agent_id: &str, contract: bool, model: bool) {
+/// Mark that `agent_id`'s SOUL / IDENTITY / INSTRUCTIONS just changed (the
+/// dashboard's profile file editor). Same best-effort posture.
+pub fn mark_profile_changed(home_dir: &Path, agent_id: &str) {
+    mark(home_dir, agent_id, |e, now| e.profile_changed_at = Some(now));
+}
+
+fn mark(home_dir: &Path, agent_id: &str, set: impl FnOnce(&mut PendingNotice, String)) {
     let path = state_path(home_dir);
     let now = chrono::Utc::now().to_rfc3339();
     let _ = duduclaw_core::with_file_lock(&path, || {
         let mut state = load_state(home_dir);
-        let entry = state.agents.entry(agent_id.to_string()).or_default();
-        if contract {
-            entry.contract_changed_at = Some(now.clone());
-        }
-        if model {
-            entry.model_changed_at = Some(now.clone());
-        }
+        set(state.agents.entry(agent_id.to_string()).or_default(), now);
         save_state(home_dir, &state)
     });
 }
@@ -122,6 +125,9 @@ pub fn take_pending_notice_suffix(home_dir: &Path, agent_id: &str) -> Option<Str
             }
             if entry.model_changed_at.take().is_some() {
                 lines.push("（已切換至新模型）".to_string());
+            }
+            if let Some(ts) = entry.profile_changed_at.take() {
+                lines.push(format!("（設定已於 {} 更新）", format_local_mm_dd_hhmm(&ts)));
             }
             now_empty = entry.is_empty();
         }
@@ -195,6 +201,15 @@ mod tests {
         assert!(suffix.contains("已切換至新模型"));
         assert_eq!(suffix.lines().count(), 2);
 
+        assert_eq!(take_pending_notice_suffix(dir.path(), "agent-1"), None);
+    }
+
+    #[test]
+    fn profile_change_is_read_once_then_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_profile_changed(dir.path(), "agent-1");
+        let first = take_pending_notice_suffix(dir.path(), "agent-1").unwrap();
+        assert!(first.contains("設定已於") && first.contains("更新"), "{first}");
         assert_eq!(take_pending_notice_suffix(dir.path(), "agent-1"), None);
     }
 
