@@ -20,7 +20,7 @@ describe('knowledge-api helpers', () => {
     vi.useFakeTimers();
     const revoke = vi.fn();
     vi.stubGlobal('URL', { ...URL, createObjectURL: () => 'blob:x', revokeObjectURL: revoke });
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Blob(['x']), { status: 200 })));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([120]), { status: 200 })));
     await downloadOriginal({ id: 's1', title: 't', original_name: 'a.pdf', format: 'pdf' });
     expect(revoke).not.toHaveBeenCalled();
     vi.advanceTimersByTime(REVOKE_DELAY_MS);
