@@ -41,6 +41,7 @@ fn scope_enum_matches_canonical_list() {
         Scope::FilesRead,
         Scope::TeamHandoff,
         Scope::DiscoveryExecute,
+        Scope::KnowledgeRead,
         Scope::Admin,
     ];
 

@@ -43,6 +43,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `computer_use_config.workspace` | `agent.toml [capabilities.computer_use_config]` (with `computer_use`) | 3 `computer_workspace_*` tools hidden (see [`computer_workspace_*`](#computer_workspace_--durable-workspaces) below) |
 | `db_sources` | `agent.toml [capabilities]` | 4 `db_*` tools hidden |
 | `[fork] enabled` | `agent.toml` | 6 forking tools hidden |
+| `[knowledge] enabled` + collection grants | `config.toml` / `knowledge.db` / `agent.toml [knowledge] collections` | 3 `knowledge_*` tools hidden unless the knowledge base is on and at least one collection is granted to the employee or its department (after `[knowledge] collections` narrowing); a grant change sends `list_changed` (see [`knowledge_*`](#knowledge_--document-knowledge-base) below) |
 | `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
 
@@ -437,6 +438,23 @@ A memory write is refused with a tool error in two cases:
 A write that is derived from other memories and names a parent memory that does not exist is also refused. The memory, key fact and its source rows are written in one transaction, so a write either has its source recorded or does not happen.
 
 `wiki_write` (both scopes) adds a `host_sources` key to the page's frontmatter with the sources of that write, keeping the newest 20 across rewrites. A `host_sources` value the employee writes itself is dropped. The key is only read by forget by source, which lists such pages for human review and never deletes them. No MCP tool performs a forget: it is an operator command, refused in an employee's session.
+
+### `knowledge_*` — document knowledge base
+
+`knowledge_search`, `knowledge_get_passage` and `knowledge_list_collections` read the
+[document knowledge base](../features/63-knowledge-base.md). Scope `knowledge:read`, which
+cannot be granted to external MCP keys. Each call goes to the gateway over the signed
+loopback route `POST /api/internal/knowledge`; the gateway works out which collections the
+call may read (the employee's own and department grants, narrowed by `agent.toml
+[knowledge] collections`, intersected with the person the turn is for and the sensitivity
+rules) and writes an access-log row. When the gateway is not running the tools say so; they
+never read the database themselves.
+
+Results are labelled as document content: every passage (and every collection name and description) sits in a marked block whose lines start with `│ `, and titles and locations are flattened to one line with `[` `]` replaced, so a document cannot forge a result header or close the block. `knowledge_search` numbers its passages
+`[n] title · location (collection) chunk_id=…` so a reply can cite them; a passage flagged
+at index time as instruction-like text carries a warning line. `collections` only narrows.
+`knowledge_get_passage` re-checks permissions on every call and answers a missing chunk and
+a forbidden one the same way (`permission denied`).
 
 ## Deprecated aliases are still listed
 

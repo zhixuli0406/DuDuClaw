@@ -3,6 +3,9 @@
 #
 #   scripts/live-test/mcp-probe.sh <home> <agent-id> [tool ...]
 #
+# A tool may carry its arguments as `name=<json object>`, e.g.
+# `knowledge_search={"query":"特休"}`.
+#
 # Reads <home>/agents/<agent-id>/.mcp.json (the file the gateway writes at
 # boot, with DUDUCLAW_HOME, DUDUCLAW_AGENT_ID, the internal MCP key and, when
 # identity.key exists, DUDUCLAW_AGENT_TOKEN), starts the exact command and env
@@ -19,9 +22,10 @@
 # booted once on that home, so run `duduclaw run` there first (with
 # HOME=<home>/os-home, as make-home.sh prints).
 # Binary override: DUDUCLAW_BIN (only used when .mcp.json names no command).
+# PROBE_VERBOSE=1 also prints the first 400 characters of each ok result.
 set -euo pipefail
 
-[ $# -ge 2 ] || { sed -n 2,21p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 2 ] || { sed -n 2,25p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 HOME_DIR="$1"; AGENT="$2"; shift 2
 TOOLS=("$@")
 DEFAULTS=0
@@ -115,8 +119,13 @@ try:
     if not listed:
         failed.append("tools/list")
 
-    for t in tools:
-        r = rpc("tools/call", {"name": t, "arguments": DEFAULT_ARGS.get(t, {})})
+    for spec in tools:
+        t, _, raw_args = spec.partition("=")
+        try:
+            call_args = json.loads(raw_args) if raw_args else DEFAULT_ARGS.get(t, {})
+        except ValueError:
+            print(f"{t}  ERROR: arguments are not JSON"); failed.append(t); continue
+        r = rpc("tools/call", {"name": t, "arguments": call_args})
         if "error" in r:
             text = r["error"].get("message", "error")
         else:
@@ -127,6 +136,9 @@ try:
                 text = "isError with empty text"
         if text is None:
             print(f"{t}  ok")
+            if os.environ.get("PROBE_VERBOSE") == "1":
+                body = " ".join(c.get("text", "") for c in res.get("content", []) if isinstance(c, dict))
+                print("    " + " ".join(body.split())[:400])
         else:
             one = " ".join(text.split())[:200]
             refused = any(k in one.lower() for k in ("denied", "not allowed", "refus", "permission", "scope", "-32003", "forbidden", "unauthor", "allowed_tools", "允許清單", "拒絕"))

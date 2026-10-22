@@ -1,0 +1,15 @@
+# Synthetic zh-TW regression set for keyword retrieval (fictional documents).
+{"id":"q01","question":"到職滿一年的特休有幾天？","type":"factoid","gold":[{"source":"員工手冊.md","contains":"特別休假七日"}]}
+{"id":"q02","question":"病假一年最多可以請幾天","type":"factoid","gold":[{"source":"員工手冊.md","contains":"三十日"}]}
+{"id":"q03","question":"事假有薪水嗎","type":"factoid","gold":[{"source":"員工手冊.md","contains":"事假期間不給薪資"}]}
+{"id":"q04","question":"加班費怎麼算","type":"factoid","gold":[{"source":"員工手冊.md","contains":"三分之一"}]}
+{"id":"q05","question":"薪水幾號發","type":"factoid","gold":[{"source":"員工手冊.md","contains":"每月五日"}]}
+{"id":"q06","question":"A-1234 單價多少","type":"code","gold":[{"source":"報價單.csv","row":2,"contains":"A-1234"}]}
+{"id":"q07","question":"防滑安全鞋多少錢","type":"table","gold":[{"source":"報價單.csv","row":6}]}
+{"id":"q08","question":"B-9 最小訂購量","type":"code","gold":[{"source":"報價單.csv","row":4}]}
+{"id":"q09","question":"退貨","type":"short","gold":[{"source":"產品FAQ.txt","contains":"退貨"}]}
+{"id":"q10","question":"運費","type":"short","gold":[{"source":"產品FAQ.txt","contains":"免運費"}]}
+{"id":"q11","question":"安全鞋保固多久","type":"factoid","gold":[{"source":"產品FAQ.txt","contains":"一年保固"}]}
+{"id":"q12","question":"客服幾點下班","type":"factoid","gold":[{"source":"產品FAQ.txt","contains":"客服時間"}]}
+{"id":"q13","question":"公司有員工宿舍嗎？","type":"unanswerable","answerable":false}
+{"id":"q14","question":"可以帶寵物上班嗎","type":"unanswerable","answerable":false}

@@ -132,6 +132,12 @@ pub(crate) fn render_sbpl_profile(spec: &SandboxSpec) -> String {
             escape_sbpl_subpath(r)
         ));
     }
+    // A spec that narrows reads below `/` still has to let the dynamic
+    // loader read the root directory entry itself (not its subtree), or no
+    // process starts at all (`Abort trap: 6`).
+    if !spec.readable_paths.is_empty() && !spec.readable_paths.iter().any(|r| r == Path::new("/")) {
+        p.push_str("(allow file-read* (literal \"/\"))\n");
+    }
     for w in &spec.writable_paths {
         p.push_str(&format!(
             "(allow file-write* (subpath \"{}\"))\n",
@@ -347,6 +353,21 @@ mod tests {
             allow_network,
             unconfined: false,
         }
+    }
+
+    #[test]
+    fn narrowed_reads_still_allow_the_root_entry_only() {
+        let spec = SandboxSpec {
+            readable_paths: vec![PathBuf::from("/usr/lib")],
+            writable_paths: Vec::new(),
+            allow_network: false,
+            unconfined: false,
+        };
+        let p = render_sbpl_profile(&spec);
+        assert!(p.contains("(allow file-read* (literal \"/\"))"));
+        assert!(!p.contains("(subpath \"/\")"));
+        let full = render_sbpl_profile(&spec_with(&[], false));
+        assert!(!full.contains("(literal \"/\")"), "a spec that reads / needs no extra rule");
     }
 
     #[test]

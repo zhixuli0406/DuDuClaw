@@ -408,6 +408,18 @@ pub fn load(agent_dir: &Path) -> AgentTomlSections {
     }
 }
 
+/// The text [`load`] parses for `agent_dir`: the preset-resolved artifact
+/// when it exists and is readable, else `agent.toml`. Unlike [`load`] the
+/// error is returned, for fail-closed readers.
+pub fn read_effective_text(agent_dir: &Path) -> std::io::Result<String> {
+    if let Some(resolved) = resolved_override_path(agent_dir)
+        && let Ok(text) = std::fs::read_to_string(&resolved)
+    {
+        return Ok(text);
+    }
+    std::fs::read_to_string(agent_dir.join("agent.toml"))
+}
+
 /// `[capabilities] action_rules` for the agent at `agent_dir`, read from the
 /// same file [`load`] reads (the preset-resolved artifact when there is one).
 ///
