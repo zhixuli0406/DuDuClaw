@@ -93,6 +93,7 @@ const DESCRIBED_KINDS = new Set([
   'knowledge_quarantine',
   'workflow_activation',
   'memory_forget_source',
+  'knowledge_add_source',
   'channel_ingress_admin',
   'responsibility_operator_change',
   'computer_workspace_admin',

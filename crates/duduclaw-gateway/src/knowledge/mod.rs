@@ -10,16 +10,35 @@
 //! - [`upload`]: `POST /api/knowledge/upload` and the original-file download.
 //! - [`route`]: `POST /api/internal/knowledge`, the signed loopback route
 //!   behind the read-only `knowledge_*` MCP tools.
-//! - [`turn_requesters`]: who a live turn is for.
+//! - [`turn_requesters`]: who a live turn is for; [`requester_map`] maps a
+//!   channel reply turn to that person.
+//! - [`ledger`]: one citation numbering per live turn.
+//! - [`auto_retrieve`]: passages and rules for a channel reply's prompt.
+//! - [`cite_turn`]: citation parsing, `turn_citations` and per-channel
+//!   source footers after the reply.
+//! - [`add_source_approval`], [`chat_add`]: proposals to add a source (MCP
+//!   tool, chat command), always decided in the dashboard.
+//! - [`forget`]: forget-by-source plans for turns that cited a source.
 //!
 //! Writes happen only here. Every read goes through
 //! `duduclaw_knowledge::acl::effective_collections`.
 
+pub mod add_source_approval;
+pub mod auto_retrieve;
+pub mod chat_add;
+pub mod cite_turn;
 pub mod extract_spawn;
+pub mod forget;
+pub mod ledger;
 pub mod pipeline;
+pub mod requester_map;
 pub mod route;
+mod route_add;
 pub mod rpc;
+pub mod rpc_channels;
 pub mod turn_requesters;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod upload;
 pub mod url_ingest;
 pub mod worker;
@@ -46,6 +65,22 @@ impl UserDirectory for UserDbDirectory {
                 department: u.department.clone(),
                 user_id: u.id,
             }))
+    }
+}
+
+/// The account directory for `home`: `users` when the caller already holds
+/// the database, else `users.db` opened read-through (never created). No
+/// database, or one that cannot be opened, knows nobody (fail closed).
+pub fn user_directory(
+    home: &Path,
+    users: Option<&Arc<UserDb>>,
+) -> Box<dyn UserDirectory> {
+    match users {
+        Some(db) => Box::new(UserDbDirectory(db.clone())),
+        None => match crate::decision_notify::open_user_db(home) {
+            Ok(Some(db)) => Box::new(UserDbDirectory(Arc::new(db))),
+            _ => Box::new(NoUsers),
+        },
     }
 }
 

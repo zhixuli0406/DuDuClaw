@@ -90,6 +90,7 @@ fn search(q: &str) -> Request {
         collections: None,
         limit: None,
         turn_id: None,
+        run_id: None,
     }
 }
 
@@ -141,6 +142,7 @@ fn employee_side_grants_and_narrowing() {
             chunk_id: hr_chunk,
             context: None,
             turn_id: None,
+            run_id: None,
         },
     );
     assert!(matches!(
@@ -155,6 +157,7 @@ fn employee_side_grants_and_narrowing() {
             chunk_id: hr_chunk,
             context: Some(2),
             turn_id: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -173,7 +176,7 @@ fn employee_side_grants_and_narrowing() {
         &st,
         "sales-bot",
         system(),
-        Request::ListCollections { turn_id: None },
+        Request::ListCollections { turn_id: None, run_id: None },
     )
     .unwrap();
     assert_eq!(list["collections"][0]["slug"], "faq");
@@ -183,6 +186,7 @@ fn employee_side_grants_and_narrowing() {
         collections: Some(vec!["hr".into()]),
         limit: None,
         turn_id: None,
+        run_id: None,
     };
     assert_eq!(
         hits(&serve(&st, "sales-bot", system(), narrowed).unwrap()),
@@ -321,7 +325,7 @@ fn no_collection_on_the_employee_side_means_no_tools() {
                     &st,
                     who,
                     system(),
-                    Request::ListCollections { turn_id: None }
+                    Request::ListCollections { turn_id: None, run_id: None }
                 ),
                 Err(Refusal(_, "knowledge_off", _))
             ),
@@ -503,4 +507,32 @@ async fn http_route_rate_limit_and_switch() {
     )
     .await;
     assert_eq!((s, v["code"].as_str()), (403, Some("knowledge_disabled")));
+}
+
+#[test]
+fn search_inside_a_live_turn_shares_the_ledger_numbering() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    agent(h, "ledger-bot", "[agent]\nname='ledger-bot'\n");
+    collection(
+        h,
+        "faq",
+        "internal",
+        &[(PrincipalKind::Agent, "ledger-bot")],
+        "退貨請在七日內辦理。",
+    );
+    let st = KnowledgeRouteState::new(h.to_path_buf(), None);
+    let _ledger = super::super::ledger::open("ledger-bot", "turn-ld").unwrap();
+    let req = |q: &str| Request::Search {
+        query: q.into(),
+        collections: None,
+        limit: None,
+        turn_id: Some("turn-ld".into()),
+        run_id: None,
+    };
+    let v = serve(&st, "ledger-bot", system(), req("退貨")).unwrap();
+    assert_eq!(v["hits"][0]["n"], 1);
+    let again = serve(&st, "ledger-bot", system(), req("七日內辦理")).unwrap();
+    assert_eq!(again["hits"][0]["n"], 1, "same chunk keeps its number");
+    assert_eq!(super::super::ledger::entries("ledger-bot", "turn-ld").len(), 1);
 }

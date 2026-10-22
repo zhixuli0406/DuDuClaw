@@ -46,7 +46,9 @@ impl MethodHandler {
                     .iter()
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
-                    if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer) {
+                    if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer)
+                        && !self.may_decide_knowledge_card(r, &fresh).await
+                    {
                         continue;
                     }
                     if self.authorize_workflow_activation_record(&r.payload,&fresh).await.is_err(){continue;}
@@ -252,5 +254,27 @@ impl MethodHandler {
             })
             .collect();
         WsFrame::ok_response("", json!({ "count": items.len(), "items": items }))
+    }
+}
+
+impl MethodHandler {
+    /// A knowledge add-source card is also shown to whoever may decide it
+    /// (an editor of the collection without access to the employee).
+    async fn may_decide_knowledge_card(
+        &self,
+        r: &crate::approval::ApprovalRecord,
+        fresh: &UserContext,
+    ) -> bool {
+        if r.action_kind != crate::knowledge::add_source_approval::ACTION_KIND {
+            return false;
+        }
+        let users = self.user_db.read().await.clone();
+        let user = crate::knowledge::dashboard_user(fresh, users.as_ref());
+        let (home, rec) = (self.home_dir.clone(), r.clone());
+        crate::knowledge::blocking(move || {
+            crate::knowledge::add_source_approval::may_decide(&home, &rec, &user)
+        })
+        .await
+        .is_ok()
     }
 }

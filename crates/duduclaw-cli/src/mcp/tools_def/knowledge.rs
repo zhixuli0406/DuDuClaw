@@ -1,5 +1,6 @@
-//! Document knowledge base (read-only): search the collections this turn may
-//! read, open one passage with its context, list the collections.
+//! Document knowledge base: search the collections this turn may read, open
+//! one passage with its context, list the collections, and propose a
+//! document for a collection (always decided by a person in the dashboard).
 //!
 //! Part of the split `tools_def` registration face (O7); descriptions are
 //! bounded by `mcp::tools_list_budget_tests`. Long prose lives in
@@ -49,5 +50,36 @@ pub(super) const TOOLS: &[ToolDef] = &[
         name: "knowledge_list_collections",
         description: "List the document collections you may read in this conversation, with source and passage counts.",
         params: &[],
+    },
+    ToolDef {
+        name: "knowledge_add_source",
+        description: "Propose a file, URL or text for a knowledge collection. Never adds directly: a person approves it in the dashboard first.",
+        params: &[
+            ParamDef {
+                name: "collection",
+                description: "Collection slug (from knowledge_list_collections)",
+                required: true,
+            },
+            ParamDef {
+                name: "path",
+                description: "A file in your attachments/ folder (one of path, url, text)",
+                required: false,
+            },
+            ParamDef {
+                name: "url",
+                description: "A public web page (one of path, url, text)",
+                required: false,
+            },
+            ParamDef {
+                name: "text",
+                description: "Plain text to add (one of path, url, text)",
+                required: false,
+            },
+            ParamDef {
+                name: "title",
+                description: "Optional display title",
+                required: false,
+            },
+        ],
     },
 ];

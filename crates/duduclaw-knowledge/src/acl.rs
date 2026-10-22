@@ -195,6 +195,13 @@ impl AllowedSet {
         serde_json::to_string(&self.ids).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// The subset of this set whose ids satisfy `keep` (only ever smaller).
+    pub fn filtered(&self, keep: impl Fn(&str) -> bool) -> Self {
+        Self {
+            ids: self.ids.iter().filter(|id| keep(id)).cloned().collect(),
+        }
+    }
+
     pub(crate) fn from_ids(ids: impl IntoIterator<Item = String>) -> Self {
         let set: BTreeSet<String> = ids.into_iter().collect();
         Self {

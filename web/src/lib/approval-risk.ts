@@ -40,6 +40,7 @@ const BASE_RISK: Record<string, RiskLevel> = {
   skill_create: 'high', // installs code that runs later
   agent_hire: 'high', // spins up an autonomous worker that spends budget
   memory_forget_source: 'high', // deletes memory irreversibly (forget by source)
+  knowledge_add_source: 'medium', // adds a document every reader of the collection will see
 };
 
 /** Default when the kind is unrecognised — see BASE_RISK note. */

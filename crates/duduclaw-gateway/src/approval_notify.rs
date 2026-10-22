@@ -190,6 +190,10 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// press cannot establish that the presser is a current Admin.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
+        // Adding a document to a shared knowledge collection: the decider
+        // must be an Admin or the collection's editor at decision time, which
+        // a channel press cannot establish.
+        || kind == crate::knowledge::add_source_approval::ACTION_KIND
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         || kind == crate::expert_skills::SKILLS_ACTION_KIND
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
@@ -205,6 +209,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
     } else if kind == crate::expert_skills::SKILLS_ACTION_KIND {
         "這則技能啟用審核已逾期，匯入的技能維持停用；要啟用請重新匯入。"
+    } else if kind == crate::knowledge::add_source_approval::ACTION_KIND {
+        crate::knowledge::add_source_approval::EXPIRED_TEXT
     } else if let Some(spec) = crate::approval::operator_cli_gate::spec_for(kind) {
         spec.expired_text
     } else {
@@ -233,6 +239,9 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     }
     if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
         return (spec.notice)(rec, reminder, &deadline_phrase(rec));
+    }
+    if rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
+        return crate::knowledge::add_source_approval::notice_body(rec, reminder, &deadline_phrase(rec));
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"

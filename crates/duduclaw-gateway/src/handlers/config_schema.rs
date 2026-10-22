@@ -115,6 +115,8 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("knowledge", "max_collection_bytes", UInt),
     ("knowledge", "max_total_bytes", UInt),
     ("knowledge", "extract_when_unavailable", OneOf(duduclaw_knowledge::limits::EXTRACT_WHEN_UNAVAILABLE_VALUES)),
+    ("knowledge", "auto_retrieve", Bool),
+    ("knowledge", "inject_budget_chars_max", UInt),
     ("knowledge_guard", "enabled", Bool),
     ("knowledge_guard", "window_secs", UInt),
     ("knowledge_guard", "max_per_subject", UInt),
