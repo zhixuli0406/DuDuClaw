@@ -204,6 +204,7 @@ mod tests {
             last_login: None,
             must_change_password: false,
             department: None,
+            manager_user_id: None,
         }
     }
 

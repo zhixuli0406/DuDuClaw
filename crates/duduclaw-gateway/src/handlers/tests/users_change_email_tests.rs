@@ -37,6 +37,8 @@ async fn fixture(auto_login_off: bool) -> Fixture {
         role: UserRole::Admin,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     Fixture {
         handler,
@@ -149,6 +151,8 @@ async fn other_accounts_always_need_password() {
         role: UserRole::Admin,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &ctx).await);
     assert_eq!(me["email_setup"]["placeholder"], json!(false));

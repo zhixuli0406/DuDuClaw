@@ -533,6 +533,8 @@ pub fn trusted_dashboard_principal(
         role: role.parse()?,
         agent_access: bindings,
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     })
 }
 /// Artifact/review audience belongs to the human dashboard decision principal,

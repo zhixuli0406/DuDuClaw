@@ -33,6 +33,8 @@ fn owner_of_a1() -> UserContext {
         role: duduclaw_auth::models::UserRole::Employee,
         agent_access: [("a1".to_string(), AccessLevel::Owner)].into_iter().collect(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

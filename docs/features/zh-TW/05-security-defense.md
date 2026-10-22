@@ -196,6 +196,12 @@ action_rules = [
 
 v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的子字串比對：只綁定一位員工的 WebChat 帳號打別人的觸發詞就能叫到別人，任何 LINE 好友也一樣。現在先解析發話的真人（WebChat 用 dashboard 帳號；通訊軟體用**已驗證**的 `channel_identities`，沒有就視為未綁定），只在這個人叫得到的員工裡比對：管理員全部；每個人都叫得到這個對話的預設員工，以及 `[channels] public_trigger = true` 的員工（只有管理員能改，員工自己改不了）；dashboard 帳號與綁定了帳號的通訊軟體使用者另外加上綁定的員工。叫其他員工會在呼叫模型前被拒絕，並以 `trigger_route_refused` 記進 `security_audit.jsonl`（記帳號，或以這台機器的金鑰 `trigger_audit.key` 算出的平台 ID HMAC）。停用中的帳號，綁定不再算數。任何查詢失敗都當成未綁定處理。被叫來的員工在自己的 session 回答，對話紀錄與機密不會在員工之間混用；但在群組裡，回答仍是所有成員都看得到。細節見[用 @ 呼叫 AI 員工](62-calling-ai-staff.md)。
 
+## dashboard 權限每次呼叫即時讀取（v1.76）
+
+v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角色與員工綁定，access token 又有 30 分鐘效期，所以拿掉綁定、降級或停權，要等對方下次登入才生效。現在 RPC 派送的單一入口每次呼叫都從 `users.db` 重建呼叫者的身分；token 只用來證明「是誰」。角色、直接綁定、必須改密碼的旗標，以及下面的主管關係推導，全部以資料庫為準。任何會改到這些的寫入（綁定、解綁、改角色或密碼、改狀態、改主管、通道身分、改 email、離職）都會在同一個交易裡把計數器（`auth_meta.acl_generation`）加一，每次呼叫的快取以這個計數器為鍵，所以快取的結果不會比最後一次這類寫入還舊。帳號不存在或不是在職狀態，回 `account is suspended or offboarded`；讀取失敗時以「員工、沒有任何綁定」繼續。閘道管理 token（`system`）與鎖定畫面連線不變。
+
+帳號現在可以有一位直屬主管（`users.manager_user_id`，只有多人團隊版，經 `users.create`／`users.update` 設定）。寫入會擋下繞成一圈（`manager_cycle`）、超過 8 層（`manager_too_deep`）、主管角色低於主管或不在職（`manager_role`、`manager_inactive`）；還有直屬部屬的人不能降成員工（`manager_has_reports`）；離職時部屬改掛 `transfer_to` 或離職者的主管，每一筆以 `user.reparent` 記稽核。系統會算出主管可以碰到部屬綁定的員工（最高 Operator），但這一版還沒有任何地方用到：路由、`agents.list` 與 Operator 等級的 RPC（記憶、對話紀錄、設定）仍然只看直接綁定。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。

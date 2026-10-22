@@ -123,6 +123,8 @@ mod dashboard_layout;
 mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
+mod users_org;
+pub(crate) mod live_context;
 mod marketplace_rpc;
 mod mcp_manifest;
 mod mcp_import;
@@ -332,6 +334,9 @@ pub struct MethodHandler {
     /// `None` when the autopilot engine block never ran — then a `[tick]`
     /// edit reports `restart_required` instead.
     tick_runtime: tokio::sync::Mutex<Option<tick_sources_rpc::TickRuntime>>,
+    /// Live identity cache keyed by `(user_id, acl_generation)`; see
+    /// `live_context.rs`.
+    live_ctx_cache: live_context::LiveContextCache,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -430,6 +435,24 @@ impl MethodHandler {
         {
             return WsFrame::error_response("", "請使用 Dashboard 帳號登入後再連接 CLI。");
         }
+
+        // ── Live identity ───────────────────────────────────────────────
+        // The JWT proves who the caller is; what they may do is read from
+        // users.db now (`live_context.rs`), so an unbinding, a demotion or a
+        // suspension reaches an open connection on its very next call.
+        // Pre-auth connections have no identity to refresh.
+        let live_ctx;
+        let ctx = if conn.pre_auth {
+            ctx
+        } else {
+            match self.live_context(ctx).await {
+                Ok(live) => {
+                    live_ctx = live;
+                    &live_ctx
+                }
+                Err(frame) => return frame,
+            }
+        };
 
         // ── Forced password-change gate ─────────────────────────────────
         // Runs FIRST — before the edition gate, before the plugin extension

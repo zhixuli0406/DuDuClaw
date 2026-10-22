@@ -9,12 +9,13 @@
 //! `Ok(None)` when there is nothing to send, so timing/shape stays uniform.
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::{generate_password, hash_password, verify_password_hash, UserDb};
 use crate::models::{User, UserRole};
+use crate::user_row::bump_acl_generation;
 
 /// OTP validity window.
 pub const OTP_TTL_SECS: i64 = 300;
@@ -122,9 +123,14 @@ impl UserDb {
         verified: bool,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
+        let mut conn = self.conn();
+        // One write transaction: the takeover check, the upsert and the ACL
+        // generation bump (a channel sender's mapping is authorization input).
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("bind lookup failed: {e}"))?;
 
-        let existing: Option<(String, i64)> = conn
+        let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT user_id, verified FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
                 params![channel, channel_user_id],
@@ -138,7 +144,7 @@ impl UserDb {
             }
         }
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO channel_identities (user_id, channel, channel_user_id, verified, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(channel, channel_user_id)
@@ -146,18 +152,23 @@ impl UserDb {
             params![user_id, channel, channel_user_id, verified as i64, now],
         )
         .map_err(|e| format!("bind channel identity failed: {e}"))?;
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("bind channel identity failed: {e}"))?;
+        tx.commit().map_err(|e| format!("bind channel identity failed: {e}"))
     }
 
     /// Remove a channel identity binding.
     pub fn unbind_channel_identity(&self, channel: &str, channel_user_id: &str) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("unbind failed: {e}"))?;
+        tx.execute(
             "DELETE FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
             params![channel, channel_user_id],
         )
         .map_err(|e| format!("unbind failed: {e}"))?;
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("unbind failed: {e}"))?;
+        tx.commit().map_err(|e| format!("unbind failed: {e}"))
     }
 
     /// Reverse lookup: which user owns this channel DM identity (verified or not)?

@@ -101,6 +101,8 @@ pub(super) async fn accept_activation(
         role: duduclaw_auth::UserRole::Admin,
         agent_access: Default::default(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     broker
         .decide_bound_dashboard(&acceptance, &admin_ctx, true)

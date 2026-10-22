@@ -74,6 +74,8 @@ pub(super) async fn experts_rpcs_deny_non_admin() {
         role: UserRole::Manager,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     for method in [
         "experts.list",
@@ -130,6 +132,8 @@ pub(super) async fn gallery_list_denies_non_admin() {
         role: UserRole::Manager,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     let frame = handler.handle("gallery.list", json!({}), &ctx).await;
     assert!(
@@ -166,6 +170,8 @@ pub(super) async fn mail_rpcs_deny_a_plain_employee() {
         role: UserRole::Employee,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     for method in [
         "mail.status",

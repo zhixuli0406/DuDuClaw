@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::models::{AccessLevel, UserRole};
+use crate::models::{AccessLevel, User, UserRole};
+use crate::org::{EffectiveAccess, TeamGrant};
 
 /// Per-connection user context extracted from JWT claims.
 /// Carried through the entire WebSocket session for ACL checks.
@@ -22,6 +23,14 @@ pub struct UserContext {
     /// restricts the caller to a small self-service allowlist
     /// (`users.change_password` chief among them) until it clears.
     pub must_change_password: bool,
+    /// Agents reachable through subordinates' bindings (`org.rs`), each at
+    /// most Operator. Read only by [`Self::can_call_agent`] and
+    /// [`Self::can_assign_to`]; [`Self::has_agent_access`] ignores it, so the
+    /// Operator-level RPCs (memory, history, settings) do not widen.
+    pub team_access: HashMap<String, TeamGrant>,
+    /// `auth_meta.acl_generation` this context was built at; 0 for a context
+    /// built from JWT claims or a fallback.
+    pub acl_generation: u64,
 }
 
 impl UserContext {
@@ -40,6 +49,38 @@ impl UserContext {
             role: UserRole::Admin,
             agent_access: HashMap::new(),
             must_change_password: false,
+            team_access: HashMap::new(),
+            acl_generation: 0,
+        }
+    }
+
+    /// Build from a fresh database read (`UserDb::live_user_context`). The
+    /// JWT only proves who the caller is; role, bindings, team grants and the
+    /// forced-password-change flag all come from here.
+    pub fn from_live(user: &User, access: &EffectiveAccess) -> Self {
+        Self {
+            user_id: user.id.clone(),
+            email: user.email.clone(),
+            role: access.role,
+            agent_access: access.direct.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            must_change_password: user.must_change_password,
+            team_access: access.team.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            acl_generation: access.generation,
+        }
+    }
+
+    /// The fail-closed context used when the live read fails: same identity,
+    /// Employee role, no bindings, no team. The forced-password-change flag
+    /// is kept, never cleared, by a failed read.
+    pub fn narrowed(&self) -> Self {
+        Self {
+            user_id: self.user_id.clone(),
+            email: self.email.clone(),
+            role: UserRole::Employee,
+            agent_access: HashMap::new(),
+            must_change_password: self.must_change_password,
+            team_access: HashMap::new(),
+            acl_generation: 0,
         }
     }
 
@@ -68,6 +109,8 @@ impl UserContext {
             role,
             agent_access,
             must_change_password,
+            team_access: HashMap::new(),
+            acl_generation: 0,
         })
     }
 
@@ -108,6 +151,26 @@ impl UserContext {
             .get(agent_name)
             .map(|level| level.at_least(min_level))
             .unwrap_or(false)
+    }
+
+    /// May talk to `agent_name`: Admin, any direct binding, or a team grant.
+    /// Wider than [`Self::has_agent_access`] on purpose; use it only for
+    /// "who can I call", never for memory, history or settings.
+    pub fn can_call_agent(&self, agent_name: &str) -> bool {
+        self.is_admin()
+            || self.agent_access.contains_key(agent_name)
+            || self.team_access.contains_key(agent_name)
+    }
+
+    /// May hand `agent_name` a task: Admin, a direct binding of Operator or
+    /// above, or a team grant that derived Operator.
+    pub fn can_assign_to(&self, agent_name: &str) -> bool {
+        if self.is_admin() || self.has_agent_access(agent_name, AccessLevel::Operator) {
+            return true;
+        }
+        self.team_access
+            .get(agent_name)
+            .is_some_and(|g| g.level.at_least(AccessLevel::Operator))
     }
 
     /// List of agent names this user can see.
@@ -175,6 +238,8 @@ mod tests {
             role: UserRole::Employee,
             agent_access: access,
             must_change_password: false,
+            team_access: HashMap::new(),
+            acl_generation: 0,
         }
     }
 
@@ -241,6 +306,49 @@ mod tests {
         assert!(ctx.has_role(UserRole::Employee));
         assert!(!ctx.has_role(UserRole::Manager));
         assert!(!ctx.has_role(UserRole::Admin));
+    }
+
+    #[test]
+    fn team_grants_open_calling_and_assigning_but_not_agent_access() {
+        let mut ctx = employee_ctx();
+        ctx.role = UserRole::Manager;
+        ctx.team_access.insert(
+            "sales".to_string(),
+            TeamGrant { level: AccessLevel::Operator, via_user: "e1".into(), depth: 2 },
+        );
+        ctx.team_access.insert(
+            "hr".to_string(),
+            TeamGrant { level: AccessLevel::Viewer, via_user: "e2".into(), depth: 1 },
+        );
+        assert!(ctx.can_call_agent("sales"));
+        assert!(ctx.can_assign_to("sales"));
+        assert!(ctx.can_call_agent("hr"));
+        assert!(!ctx.can_assign_to("hr"), "a Viewer-derived grant can only talk");
+        assert!(!ctx.can_call_agent("finance"));
+        // has_agent_access is unchanged: team grants never reach the
+        // memory / history / settings RPCs.
+        assert!(!ctx.has_agent_access("sales", AccessLevel::Viewer));
+        assert!(!ctx.can_access_agent("sales"));
+        assert_eq!(ctx.visible_agents().unwrap(), vec!["my-agent"]);
+        // A direct Viewer binding does not allow assigning.
+        ctx.agent_access.insert("viewer-only".into(), AccessLevel::Viewer);
+        assert!(ctx.can_call_agent("viewer-only"));
+        assert!(!ctx.can_assign_to("viewer-only"));
+        assert!(ctx.can_assign_to("my-agent"));
+    }
+
+    #[test]
+    fn narrowed_context_keeps_identity_and_password_flag_only() {
+        let mut ctx = employee_ctx();
+        ctx.role = UserRole::Admin;
+        ctx.must_change_password = true;
+        ctx.acl_generation = 9;
+        let n = ctx.narrowed();
+        assert_eq!(n.user_id, "u1");
+        assert_eq!(n.role, UserRole::Employee);
+        assert!(n.agent_access.is_empty() && n.team_access.is_empty());
+        assert!(n.requires_password_change());
+        assert_eq!(n.acl_generation, 0);
     }
 
     #[test]

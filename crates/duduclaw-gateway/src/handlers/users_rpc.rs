@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::users_org::{ManagerChange, org_error_frame, parse_manager_change};
 
 impl MethodHandler {
     // ── User management handlers (admin only) ────────────────
@@ -23,6 +24,7 @@ impl MethodHandler {
                         "role": u.role,
                         "status": u.status,
                         "department": u.department,
+                        "manager_user_id": u.manager_user_id,
                         "created_at": u.created_at,
                         "updated_at": u.updated_at,
                         "last_login": u.last_login,
@@ -94,6 +96,19 @@ impl MethodHandler {
             }
         }
 
+        // Optional direct manager. Checked before the insert so a refused
+        // manager does not leave a half-created account behind;
+        // `set_manager` checks again inside its own transaction.
+        let manager = match parse_manager_change(&params) {
+            Ok(change) => change.target().map(str::to_string),
+            Err(frame) => return frame,
+        };
+        if let Some(m) = &manager {
+            if let Err(e) = db.check_manager_for_new_user(m) {
+                return org_error_frame(&e);
+            }
+        }
+
         match db.create_user(email, display_name, password, role) {
             Ok(mut user) => {
                 if let Some(d) = department {
@@ -104,6 +119,19 @@ impl MethodHandler {
                         );
                     }
                     user.department = Some(d.to_string());
+                }
+                if let Some(m) = &manager {
+                    if let Err(e) = db.set_manager(&user.id, Some(m)) {
+                        return org_error_frame(&e);
+                    }
+                    user.manager_user_id = Some(m.clone());
+                    let _ = db.log_action(
+                        Some(&ctx.user_id),
+                        "user.set_manager",
+                        Some(&user.id),
+                        Some(&format!("manager={m}")),
+                        None,
+                    );
                 }
                 let _ = db.log_action(
                     Some(&ctx.user_id),
@@ -168,7 +196,37 @@ impl MethodHandler {
             _ => None,
         };
 
+        let manager_change = match parse_manager_change(&params) {
+            Ok(change) => change,
+            Err(frame) => return frame,
+        };
+        // Demotion guard first, so a refused demotion changes nothing else
+        // in this request (`update_user` checks again atomically).
+        if role == Some(UserRole::Employee) {
+            match db.manager_has_reports(user_id) {
+                Ok(false) => {}
+                Ok(true) => return org_error_frame(&duduclaw_auth::OrgError::HasReports),
+                Err(e) => return org_error_frame(&duduclaw_auth::OrgError::Db(e)),
+            }
+        }
+        if manager_change != ManagerChange::Unchanged {
+            let target = manager_change.target();
+            if let Err(e) = db.set_manager(user_id, target) {
+                return org_error_frame(&e);
+            }
+            let _ = db.log_action(
+                Some(&ctx.user_id),
+                "user.set_manager",
+                Some(user_id),
+                Some(&format!("manager={}", target.unwrap_or("none"))),
+                None,
+            );
+        }
+
         match db.update_user(user_id, display_name, role, password) {
+            Err(e) if e == duduclaw_auth::org::MANAGER_HAS_REPORTS => {
+                org_error_frame(&duduclaw_auth::OrgError::HasReports)
+            }
             Ok(()) => {
                 if let Some(dept) = department_change {
                     if let Err(e) = db.set_department(user_id, dept.as_deref()) {
@@ -296,34 +354,36 @@ impl MethodHandler {
             Some(id) => id,
             None => return WsFrame::error_response("", "user_id is required"),
         };
-        let transfer_to = params.get("transfer_to").and_then(|v| v.as_str());
+        let transfer_to = params
+            .get("transfer_to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
 
-        // Get user's bound agents before offboarding
-        let bindings = db.get_user_agents(user_id).unwrap_or_default();
-
-        // Set user status to offboarded
-        if let Err(e) = db.set_user_status(user_id, duduclaw_auth::UserStatus::Offboarded) {
-            return WsFrame::error_response("", &format!("failed to offboard user: {e}"));
-        }
-
-        // Transfer agent ownership if specified
-        let mut transferred = Vec::new();
-        if let Some(new_owner_id) = transfer_to {
-            for binding in &bindings {
-                // Unbind from old user
-                let _ = db.unbind_agent(user_id, &binding.agent_name);
-                // Bind to new owner
-                let _ = db.bind_agent(new_owner_id, &binding.agent_name, binding.access_level);
-                transferred.push(binding.agent_name.clone());
+        // One transaction: status, the leaver's reports (moved to
+        // `transfer_to`, else to the leaver's manager, each re-checked and
+        // audited as `user.reparent`) and, with `transfer_to`, the bindings.
+        let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
+            Ok(outcome) => outcome,
+            Err(duduclaw_auth::OrgError::UserNotFound) => {
+                return WsFrame::error_response("", "failed to offboard user: user not found");
             }
-        }
+            Err(e) => return org_error_frame(&e),
+        };
+        let transferred = outcome.transferred_agents;
+        let reparented: Vec<Value> = outcome
+            .reparented
+            .iter()
+            .map(|r| json!({ "user_id": r.user_id, "manager_user_id": r.to }))
+            .collect();
 
         let _ = db.log_action(
             Some(&ctx.user_id),
             "user.offboard",
             Some(user_id),
             Some(&format!(
-                "transferred_agents={transferred:?}, transfer_to={transfer_to:?}"
+                "transferred_agents={transferred:?}, transfer_to={transfer_to:?}, reparented={}",
+                reparented.len()
             )),
             None,
         );
@@ -333,6 +393,7 @@ impl MethodHandler {
             json!({
                 "status": "offboarded",
                 "transferred_agents": transferred,
+                "reparented": reparented,
             }),
         )
     }

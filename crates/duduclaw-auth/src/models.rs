@@ -148,6 +148,12 @@ pub struct User {
     /// department; any manager may sign (graceful fallback).
     #[serde(default)]
     pub department: Option<String>,
+    /// Direct manager (another user's id). One manager per person; writes go
+    /// through [`crate::UserDb::set_manager`], which refuses cycles, chains
+    /// deeper than [`crate::org::MAX_ORG_DEPTH`] and managers below the
+    /// Manager role. `None` ⇒ top of the tree.
+    #[serde(default)]
+    pub manager_user_id: Option<String>,
 }
 
 /// A binding between a user and an agent.

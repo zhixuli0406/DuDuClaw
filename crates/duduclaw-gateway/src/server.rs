@@ -15440,6 +15440,8 @@ fn pre_auth_context() -> UserContext {
         role: duduclaw_auth::UserRole::Employee,
         agent_access: HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 
