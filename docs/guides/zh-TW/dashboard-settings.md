@@ -51,6 +51,7 @@
 - 群組「只回提及」（`mention_only`，每個群組各自設定）：v1.76 起，LINE 群組開啟後只回應用 `@` 叫 AI 員工（或要 @ 名單）的訊息，以及被點名員工正在等的那一則；以前開了會整個群組沒有回應。Telegram 共用 bot 也接受員工名字。見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)。
 - 網站聊天元件：「開放網站聊天元件」寫 `[webchat] public_widget`，「元件金鑰」寫 `[webchat] widget_key`（16 到 256 個可見 ASCII 字元，有「產生」按鈕；開啟元件時必須有金鑰；金鑰不會在回應中回傳）。立即生效。元件金鑰以明文存在 `config.toml`：它是公開的金鑰，會出現在網站的頁面原始碼裡，所以不當成密鑰處理。
 - WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘：六條 webhook 路由一律掛著。通道設定好之前回 404；設定好之後會驗證平台的簽章，簽章錯誤回 401。`channels.add` 不必重啟就會啟動通道，`channels.add` 回 `hot_started` 與 `restart_required: false`；憑證不完整時附 `not_started_reason`。個別員工的 Slack bot 也會在新增時直接啟動。
+- 通訊軟體的思考顯示（沒有專屬控制項，在設定檔進階編輯裡設定，每次回覆都重新讀取）：`[thinking] channel_audience` = `internal`（預設：通道身分已驗證、帳號啟用中，且是管理員或綁定回答員工的發話者看得到計時與遮蔽後的摘要，其他人只看計時）、`all`（一對一聊天的所有發話者都看得到摘要）或 `none`（都不顯示）；`[thinking] channel_group_display` = `status`（預設：群組聊天只顯示計時）、`summary` 或 `off`。`[thinking] display` 與回答員工的 `[model] show_thinking` 取較嚴格者，仍是兩者的上限。`config.toml` 讀不到或值不認得時都不顯示。網站訪客（Odoo 線上客服、WebChat 網站小工具）永遠看不到思考。詳見[通訊軟體的思考顯示](../../features/zh-TW/66-thinking-in-messaging-apps.md)。
 
 ## 整合 → Odoo → 網站線上客服
 
@@ -128,13 +129,14 @@
 
 ## 設定檔（未發布）
 
-RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯）。上限：Markdown 每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
+RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯），以及這位員工自己的技能（`SKILLS/` 底下已經存在的 `.md`，檔案代號 `skill:<路徑>`，例如 `skill:quote/SKILL.md`）。技能在這裡只能修改，不能新增或刪除（新增請用自建技能流程），旁邊的程式檔不會被碰到；路徑每一層都必須是單一名稱、不能有 `..`、不能有看不見的字元（零寬、方向控制等）、最多四層；捷徑（symlink）與硬連結一律拒絕，存檔時在檔案鎖內確認資料夾沒有被換掉才寫入（鎖檔放在員工資料夾外）。其他寫技能檔的途徑（自建技能、員工自己的技能工具、技能畢業）不經過這裡，沒有版本紀錄，也不拿同一把鎖。上限：Markdown 與技能每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
 
+- **設定檔分頁：** 員工詳情頁的「設定檔」分頁（`/agents/<員工>/files`）。左邊是白話的檔案清單，小字灰色是實際檔名，標記「等待審核」「在系統外被改過」「你只能檢視」；右邊先以唯讀方式顯示，負責人與管理員按「編輯」後可以修改，下方顯示大小與上限，按鈕有「檢視差異」「儲存並檢查」「捨棄修改」。檢查結果用同一個確認對話框。存檔時若別人剛存過，會並排顯示你的內容與目前內容，可以「複製我的內容」再「重新載入」。「版本紀錄」（Operator 以上）列出時間、修改人與來源，可以檢視、和目前內容比較或還原。還沒存的修改在切換檔案、切換分頁或關閉頁面前會先詢問（從側邊欄等其他連結離開時目前不會詢問）。只能檢視的人會看到「你可以檢視；只有這位員工的負責人或管理員可以修改。」
 - **誰能做什麼：** 綁定這位員工的人都能看檔案；Operator 以上能看版本與差異；員工的負責人與管理員能存檔。每次呼叫都重讀帳號資料庫，不看登入時的快照。審核只有管理員能決定。
-- **每次存檔都檢查：** 先跑固定規則（大小、控制字元、嚴格解析 `CONTRACT.toml`、隱藏或看不見的內容、這次新增的文字或新的 `must_always` 裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪改 `must_not`／`must_always` 或調高／取消工具次數上限），再請部署的輔助模型看一次差異（`[runtime] utility_provider`／`utility_model`，可用 `[agent_files] review_provider`／`review_model` 指定；費用記在部署的 `agent-file-review`，不扣員工預算）。模型只能讓結果更嚴。結果：`pass` 直接套用；`warn` 要寫理由（至少 4 個字）或送管理員審核；`block` 非管理員只能送審，管理員要寫理由並勾「我了解風險」才能套用（稽核記為 Critical）。檢查沒完成時（沒有輔助模型、逾時、回答無法使用、額度用完），或內容太長只檢查了一部分，結果至少是 `warn`（設 `[agent_files] on_analysis_failure = "block"` 則是 `block`），非管理員只能送管理員審核，管理員要勾「我了解風險」才能套用；不會默默放行，也不能關掉。每天的額度：整個部署 200 次、每人 40 次、每位員工 60 次（`review_daily_limit`、`review_daily_limit_per_user`、`review_daily_limit_per_agent`），另外每人每分鐘最多檢查 10 次（`checks_per_minute`）；同一份修改 15 分鐘內再檢查沿用上次結果。確認時不再跑一次模型；確認必須是同一人、同一檔、同一個起始版本與同樣內容，並在 15 分鐘內，固定規則用你現在的權限重跑（比檢查時嚴就要重新檢查），確認高風險的修改時會在檔案鎖內再確認一次你仍是管理員。在系統外被改過的 SOUL.md 或 INSTRUCTIONS.md 會整份重新檢查，並和上次核可的版本比較（原因「在系統外被改過」）。
+- **每次存檔都檢查：** 先跑固定規則（大小、控制字元、嚴格解析 `CONTRACT.toml`、隱藏或看不見的內容、這次新增的文字或新的 `must_always` 裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪改 `must_not`／`must_always` 或調高／取消工具次數上限；技能另外檢查：開頭的 `---` 設定區要能照技能載入器的格式讀出，`name` 必須是單一名稱，技能掃描器在這次新增的行上找到的執行指令、外送資料、注入句型會升級為高風險（以實際新增的行判斷，同類的第二行照樣算新的），裸露的網址與提到行為界線禁止的事項只標為需要注意；原本就在檔案裡的高風險內容會列為「這個技能裡原本就有可疑內容」；技能在上次儲存後被系統外改過時整份重新檢查，並和上次在這裡存的版本比較），再請部署的輔助模型看一次差異（`[runtime] utility_provider`／`utility_model`，可用 `[agent_files] review_provider`／`review_model` 指定；費用記在部署的 `agent-file-review`，不扣員工預算）。模型只能讓結果更嚴。結果：`pass` 直接套用；`warn` 要寫理由（至少 4 個字）或送管理員審核；`block` 非管理員只能送審，管理員要寫理由並勾「我了解風險」才能套用（稽核記為 Critical）。檢查沒完成時（沒有輔助模型、逾時、回答無法使用、額度用完），或內容太長只檢查了一部分，結果至少是 `warn`（設 `[agent_files] on_analysis_failure = "block"` 則是 `block`），非管理員只能送管理員審核，管理員要勾「我了解風險」才能套用；不會默默放行，也不能關掉。每天的額度：整個部署 200 次、每人 40 次、每位員工 60 次（`review_daily_limit`、`review_daily_limit_per_user`、`review_daily_limit_per_agent`），另外每人每分鐘最多檢查 10 次（`checks_per_minute`）；同一份修改 15 分鐘內再檢查沿用上次結果。確認時不再跑一次模型；確認必須是同一人、同一檔、同一個起始版本與同樣內容，並在 15 分鐘內，固定規則用你現在的權限重跑（比檢查時嚴就要重新檢查），確認高風險的修改時會在檔案鎖內再確認一次你仍是管理員。在系統外被改過的 SOUL.md 或 INSTRUCTIONS.md 會整份重新檢查，並和上次核可的版本比較（原因「在系統外被改過」）。
 - **存檔：** 在檔案鎖內比對編輯器讀到的雜湊（`base_hash`），期間被別人改過就當作衝突拒絕。新內容從員工的下一則對話開始生效，通道的下一則回覆會附一行提示。
 - **版本：** 存在員工資料夾外的 `<home>/agent_file_history/<員工>/<檔案>/`（只有擁有者能讀），每檔預設保留 20 份（`[agent_files] history_keep`，5–100）。第一次修改也會留下修改前的內容。還原版本會跑同樣的檢查。刪除員工時版本整份移到 `agent_file_history/_trash/`，之後同一個代號的新員工從零開始。
-- **核可基準：** 存 SOUL.md 或 INSTRUCTIONS.md 會更新核可指紋（INSTRUCTIONS.md 現在也有，heartbeat 以 `_instructions_integrity_drift` 回報）。在系統外被改過的檔案會標示出來，可以還原到上次核可版本，或檢查後接受目前內容。員工改名會同步 SOUL.md／IDENTITY.md 裡的名字，原本核可的 SOUL 維持核可，原本已在系統外被改過的 SOUL 仍然標示。名字必須是純文字（1–64 字，不能換行、不能有看不見的字元或 `< > [ ] { }`、反引號），改名後的內容若被固定規則標出問題就不同步（列在 `identity_files_skipped`）。
+- **核可基準：** 存 SOUL.md 或 INSTRUCTIONS.md 會更新核可指紋（INSTRUCTIONS.md 現在也有，heartbeat 以 `_instructions_integrity_drift` 回報）。在系統外被改過的檔案會標示出來，可以還原到上次核可版本，或檢查後接受目前內容（照原樣再存一次：整份重新檢查，至少要寫理由確認或送審，確認後不改寫檔案，只把目前內容記成一個版本並設為核可基準；沒有被改過的檔案照原樣存一次仍然是「沒有變動」）。員工改名會同步 SOUL.md／IDENTITY.md 裡的名字，原本核可的 SOUL 維持核可，原本已在系統外被改過的 SOUL 仍然標示。名字必須是純文字（1–64 字，不能換行、不能有看不見的字元或 `< > [ ] { }`、反引號），改名後的內容若被固定規則標出問題就不同步（列在 `identity_files_skipped`）。
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
@@ -149,7 +151,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 | `config.toml` | `[thinking] anthropic_display` | `summarized`（預設）或 `updates`（beta，只有部分 Claude 模型支援） |
 | `agent.toml` | `[model] show_thinking` | `summary`／`status`／`off`；不設定就跟隨 `[thinking] display`。兩者取較嚴格的 |
 
-`config.toml` 讀不到、解析失敗，或 `display` 值看不懂，都當成 `status`。只有登入 dashboard 的 WebChat 使用者看得到思考文字，通訊軟體永遠看不到。細節見[思考過程顯示](../../features/zh-TW/64-thinking-display.md)。
+`config.toml` 讀不到、解析失敗，或 `display` 值看不懂，都當成 `status`。思考文字只給登入 dashboard 的 WebChat 使用者，以及通訊軟體上 `[thinking] channel_audience` 允許的發話者（見「通道管理」段）。細節見[思考過程顯示](../../features/zh-TW/64-thinking-display.md)。
 
 ## 設定檔進階編輯
 

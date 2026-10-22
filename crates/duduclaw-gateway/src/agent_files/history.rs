@@ -49,8 +49,8 @@ pub(crate) struct VersionMeta {
     pub decided_by: Option<String>,
 }
 
-fn file_dir(home: &Path, agent_id: &str, key: FileKey) -> PathBuf {
-    home.join("agent_file_history").join(agent_id).join(key.as_str())
+fn file_dir(home: &Path, agent_id: &str, key: &FileKey) -> PathBuf {
+    home.join("agent_file_history").join(agent_id).join(key.history_dir())
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<(), String> {
@@ -89,7 +89,7 @@ fn read_index(dir: &Path) -> Vec<VersionEntry> {
 pub(crate) fn record(
     home: &Path,
     agent_id: &str,
-    key: FileKey,
+    key: &FileKey,
     content: &str,
     meta: &VersionMeta,
     keep: usize,
@@ -150,7 +150,7 @@ pub(crate) fn record(
 
 /// Before the first recorded change, keep what the file contained as an
 /// `initial` version (nothing when the file was empty or absent).
-pub(crate) fn ensure_initial(home: &Path, agent_id: &str, key: FileKey, before: &str, keep: usize) -> Result<(), String> {
+pub(crate) fn ensure_initial(home: &Path, agent_id: &str, key: &FileKey, before: &str, keep: usize) -> Result<(), String> {
     if before.is_empty() || !read_index(&file_dir(home, agent_id, key)).is_empty() {
         return Ok(());
     }
@@ -176,24 +176,24 @@ pub(crate) fn retire(home: &Path, agent_id: &str) -> Result<Option<PathBuf>, Str
 }
 
 /// Every kept version, newest first.
-pub(crate) fn list(home: &Path, agent_id: &str, key: FileKey) -> Vec<VersionEntry> {
+pub(crate) fn list(home: &Path, agent_id: &str, key: &FileKey) -> Vec<VersionEntry> {
     let mut rows = read_index(&file_dir(home, agent_id, key));
     rows.reverse();
     rows
 }
 
 /// The newest version, if any.
-pub(crate) fn last(home: &Path, agent_id: &str, key: FileKey) -> Option<VersionEntry> {
+pub(crate) fn last(home: &Path, agent_id: &str, key: &FileKey) -> Option<VersionEntry> {
     read_index(&file_dir(home, agent_id, key)).pop()
 }
 
 /// The newest version whose content hashes to `sha256`.
-pub(crate) fn find_by_sha(home: &Path, agent_id: &str, key: FileKey, sha256: &str) -> Option<String> {
+pub(crate) fn find_by_sha(home: &Path, agent_id: &str, key: &FileKey, sha256: &str) -> Option<String> {
     list(home, agent_id, key).into_iter().find(|v| v.sha256 == sha256).map(|v| v.version_id)
 }
 
 /// The content of one kept version.
-pub(crate) fn read_version(home: &Path, agent_id: &str, key: FileKey, version_id: &str) -> Result<String, String> {
+pub(crate) fn read_version(home: &Path, agent_id: &str, key: &FileKey, version_id: &str) -> Result<String, String> {
     if !is_valid_version_id(version_id) {
         return Err("invalid version id".into());
     }
@@ -217,24 +217,24 @@ mod tests {
     fn records_lists_reads_and_prunes() {
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
-        ensure_initial(h, "a1", FileKey::Soul, "", 5).unwrap();
-        assert!(list(h, "a1", FileKey::Soul).is_empty(), "nothing to keep for an empty file");
-        ensure_initial(h, "a1", FileKey::Soul, "v0", 5).unwrap();
+        ensure_initial(h, "a1", &FileKey::Soul, "", 5).unwrap();
+        assert!(list(h, "a1", &FileKey::Soul).is_empty(), "nothing to keep for an empty file");
+        ensure_initial(h, "a1", &FileKey::Soul, "v0", 5).unwrap();
         let mut ids = Vec::new();
         for i in 1..=6 {
-            ids.push(record(h, "a1", FileKey::Soul, &format!("v{i}"), &meta("dashboard"), 5).unwrap());
+            ids.push(record(h, "a1", &FileKey::Soul, &format!("v{i}"), &meta("dashboard"), 5).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        ensure_initial(h, "a1", FileKey::Soul, "again", 5).unwrap();
-        let rows = list(h, "a1", FileKey::Soul);
+        ensure_initial(h, "a1", &FileKey::Soul, "again", 5).unwrap();
+        let rows = list(h, "a1", &FileKey::Soul);
         assert_eq!(rows.len(), 5, "keeps the newest five");
         assert_eq!(rows[0].version_id, ids[5]);
         assert!(rows.iter().all(|r| r.source == "dashboard"), "initial pruned, not re-added");
-        assert_eq!(read_version(h, "a1", FileKey::Soul, &ids[5]).unwrap(), "v6");
-        assert!(read_version(h, "a1", FileKey::Soul, &ids[0]).is_err(), "pruned");
-        assert!(read_version(h, "a1", FileKey::Soul, "../../etc").is_err());
-        assert_eq!(find_by_sha(h, "a1", FileKey::Soul, &super::super::hash_of("v4")), Some(ids[3].clone()));
-        let dir = file_dir(h, "a1", FileKey::Soul);
+        assert_eq!(read_version(h, "a1", &FileKey::Soul, &ids[5]).unwrap(), "v6");
+        assert!(read_version(h, "a1", &FileKey::Soul, &ids[0]).is_err(), "pruned");
+        assert!(read_version(h, "a1", &FileKey::Soul, "../../etc").is_err());
+        assert_eq!(find_by_sha(h, "a1", &FileKey::Soul, &super::super::hash_of("v4")), Some(ids[3].clone()));
+        let dir = file_dir(h, "a1", &FileKey::Soul);
         let bodies = std::fs::read_dir(&dir)
             .unwrap()
             .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "md"))
@@ -254,10 +254,10 @@ mod tests {
     fn retired_history_is_not_seen_by_a_new_employee_with_the_same_id() {
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
-        record(h, "a1", FileKey::Soul, "old employee", &meta("dashboard"), 5).unwrap();
+        record(h, "a1", &FileKey::Soul, "old employee", &meta("dashboard"), 5).unwrap();
         let moved = retire(h, "a1").unwrap().unwrap();
         assert!(moved.starts_with(h.join("agent_file_history/_trash")));
-        assert!(list(h, "a1", FileKey::Soul).is_empty());
+        assert!(list(h, "a1", &FileKey::Soul).is_empty());
         assert!(retire(h, "a1").unwrap().is_none());
     }
 

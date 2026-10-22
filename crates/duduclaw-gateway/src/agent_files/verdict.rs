@@ -67,6 +67,10 @@ pub(crate) mod category {
     pub const ANALYSIS_UNAVAILABLE: &str = "analysis_unavailable";
     /// The file had been changed outside the dashboard before this save.
     pub const OUTSIDE_CHANGE: &str = "outside_change";
+    /// A skill asks the employee to run something dangerous.
+    pub const RISKY_ACTION: &str = "risky_action";
+    /// A skill already held suspicious lines this change did not touch.
+    pub const EXISTING_RISK: &str = "existing_risk";
 }
 
 /// One reason the check gave.
@@ -236,7 +240,7 @@ pub(crate) fn remember(a: Analysis) -> String {
 
 /// The record for `id` when it is still valid and matches `expected` in
 /// every binding field (verdict and reasons come from the record).
-pub(crate) fn recall(id: &str, user_id: &str, agent_id: &str, file: FileKey, base_hash: &str, content_sha256: &str) -> Result<Analysis, String> {
+pub(crate) fn recall(id: &str, user_id: &str, agent_id: &str, file: &FileKey, base_hash: &str, content_sha256: &str) -> Result<Analysis, String> {
     let map = match store().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -246,7 +250,7 @@ pub(crate) fn recall(id: &str, user_id: &str, agent_id: &str, file: FileKey, bas
         return Err("這次檢查的結果已過期（超過 15 分鐘），請重新檢查".into());
     }
     let a = &s.analysis;
-    if a.user_id != user_id || a.agent_id != agent_id || a.file != file || a.base_hash != base_hash || a.content_sha256 != content_sha256 {
+    if a.user_id != user_id || a.agent_id != agent_id || a.file != *file || a.base_hash != base_hash || a.content_sha256 != content_sha256 {
         return Err("內容或檔案版本和檢查時不同，請重新檢查".into());
     }
     Ok(a.clone())
@@ -317,15 +321,15 @@ mod tests {
     #[test]
     fn confirm_record_binds_every_field() {
         let id = remember(analysis());
-        assert!(recall(&id, "u", "a1", FileKey::Soul, "b", "c").is_ok());
-        assert!(recall(&id, "other", "a1", FileKey::Soul, "b", "c").is_err(), "another user");
-        assert!(recall(&id, "u", "a2", FileKey::Soul, "b", "c").is_err(), "another employee");
-        assert!(recall(&id, "u", "a1", FileKey::Identity, "b", "c").is_err(), "another file");
-        assert!(recall(&id, "u", "a1", FileKey::Soul, "b2", "c").is_err(), "another base");
-        assert!(recall(&id, "u", "a1", FileKey::Soul, "b", "c2").is_err(), "other content");
+        assert!(recall(&id, "u", "a1", &FileKey::Soul, "b", "c").is_ok());
+        assert!(recall(&id, "other", "a1", &FileKey::Soul, "b", "c").is_err(), "another user");
+        assert!(recall(&id, "u", "a2", &FileKey::Soul, "b", "c").is_err(), "another employee");
+        assert!(recall(&id, "u", "a1", &FileKey::Identity, "b", "c").is_err(), "another file");
+        assert!(recall(&id, "u", "a1", &FileKey::Soul, "b2", "c").is_err(), "another base");
+        assert!(recall(&id, "u", "a1", &FileKey::Soul, "b", "c2").is_err(), "other content");
         forget(&id);
-        assert!(recall(&id, "u", "a1", FileKey::Soul, "b", "c").is_err(), "used up");
-        assert!(recall("missing", "u", "a1", FileKey::Soul, "b", "c").is_err());
+        assert!(recall(&id, "u", "a1", &FileKey::Soul, "b", "c").is_err(), "used up");
+        assert!(recall("missing", "u", "a1", &FileKey::Soul, "b", "c").is_err());
     }
 
     #[test]

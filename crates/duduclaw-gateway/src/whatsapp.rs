@@ -536,14 +536,28 @@ async fn receive_webhook(
                         });
 
                     let session_id = format!("whatsapp:{sender}");
-                    let guarded = build_guarded_reply_with_session(
-                        &input_text,
-                        &state.ctx,
-                        &session_id,
-                        sender,
-                        Some(on_progress),
-                    )
-                    .await;
+                    // Thinking display: WhatsApp cannot edit messages, so the
+                    // answer ends with one "💭 思考了 N 秒" line.
+                    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+                        "whatsapp",
+                        // One-to-one by construction: this handler answers
+                        // with `send_text(.., sender, ..)`, i.e. in the
+                        // sender's own chat, never in a group.
+                        false,
+                        crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+                        None,
+                    );
+                    let on_progress = thinking.wrap(on_progress);
+                    let guarded = thinking
+                        .scope(build_guarded_reply_with_session(
+                            &input_text,
+                            &state.ctx,
+                            &session_id,
+                            sender,
+                            Some(on_progress),
+                        ))
+                        .await;
+                    let thinking_footer = thinking.finish().await;
 
                     if !guarded.still_valid().await {
                         send_text(
@@ -594,6 +608,10 @@ async fn receive_webhook(
                         continue;
                     }
 
+                    let reply = crate::thinking::channel_presenter::with_footer(
+                        reply,
+                        thinking_footer.as_ref(),
+                    );
                     // Markdown → WhatsApp formatting (*bold*, ~strike~,
                     // tables → monospace blocks), chunked under the 4096 cap.
                     let formatted = crate::markdown_render::to_whatsapp_text(&reply);

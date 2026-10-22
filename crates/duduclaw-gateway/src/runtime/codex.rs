@@ -1018,6 +1018,12 @@ impl AgentRuntime for CodexRuntime {
         cmd.arg("--skip-git-repo-check");
         cmd.args(sandbox_args_for(caps, explore));
         cmd.args(effort_args(context.effort));
+        // Thinking display: ask for reasoning summaries only when this
+        // reply turn's viewer reads thinking text; otherwise nothing is
+        // added (byte-identical argv).
+        cmd.args(crate::thinking::producers::codex_reasoning_summary_args(
+            &crate::thinking::policy(),
+        ));
         // Live round 8: a caller-required reply schema, when one is scoped.
         // `_schema_file` is held to the end of this function on purpose — the
         // temp file must outlive the spawn.
@@ -1181,6 +1187,12 @@ impl AgentRuntime for CodexRuntime {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let (mut content, input_tokens, output_tokens, chunks) = parse_codex_stdout(&stdout);
         super::extend_native_tool_events(super::native_tool_events_from_chunks(&chunks));
+        // Thinking display: `reasoning` items and reasoning tokens, reported
+        // after the run (no-op outside a reply turn).
+        crate::thinking::producers::report_codex(
+            &crate::thinking::producers::parse_codex_thinking(&stdout),
+            &mut crate::thinking::Recorder::new("codex"),
+        );
 
         if content.is_empty() {
             // Fallback: use the last line as content

@@ -19,12 +19,21 @@
 //! Nothing here stores thinking text. At the end of the turn the sink writes
 //! at most one `run_steps` row with the seconds and token count only.
 
+pub mod channel_format;
+pub mod channel_policy;
+pub mod channel_presenter;
+pub mod channel_status;
+pub mod channel_surfaces;
+pub mod claude_stream;
 pub mod done_meta;
 pub mod event;
 pub mod gate;
+pub mod llm_tap;
 pub mod policy;
+pub mod producers;
 pub mod recorder;
 pub mod sanitize;
+pub mod think_tags;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,6 +65,16 @@ pub fn now_ms() -> u64 {
 /// Report one thinking event to the current turn. No scope ⇒ no-op.
 pub fn emit(ev: ThinkingEvent) {
     let _ = THINKING_SINK.try_with(|sink| sink.accept(ev));
+}
+
+/// The next block number of the current turn, or `None` outside one.
+pub fn next_block_number() -> Option<usize> {
+    THINKING_SINK
+        .try_with(|sink| {
+            sink.next_block
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
+        .ok()
 }
 
 /// The current turn's policy, or [`ThinkingPolicy::INACTIVE`] outside one.
@@ -155,11 +174,15 @@ pub struct ThinkingSink {
     rules: Mutex<HashMap<String, Arc<crate::channel_reply::OutboundRules>>>,
     /// Per-turn cache of display ceilings by employee id.
     ceilings: Mutex<HashMap<String, SinkLevel>>,
+    /// Next block number of this turn: every recorder of the turn (each
+    /// retry, failover attempt and tool-loop round) draws its block ids from
+    /// here, so two producers never reuse an id.
+    next_block: std::sync::atomic::AtomicUsize,
 }
 
 /// The employee that is actually answering right now: the reply pipeline's
 /// task-local agent id, else the turn's recorded answerer.
-fn answering_agent() -> Option<String> {
+pub(crate) fn answering_agent() -> Option<String> {
     crate::claude_runner::CHANNEL_REPLY_AGENT_ID
         .try_with(|a| a.clone())
         .ok()
@@ -193,6 +216,7 @@ impl ThinkingSink {
             forward,
             ctx,
             rules: Mutex::new(HashMap::new()),
+            next_block: std::sync::atomic::AtomicUsize::new(0),
             ceilings: Mutex::new(HashMap::new()),
         }
     }

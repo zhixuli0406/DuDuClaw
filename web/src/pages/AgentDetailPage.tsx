@@ -67,6 +67,8 @@ import { agentTaskStats, isLiveState, type AgentTaskStats } from '@/components/a
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
 import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
+import { AgentFilesTab } from '@/pages/agent-files/AgentFilesTab';
+import { UnsavedChangesDialog } from '@/components/agent-files/UnsavedChangesDialog';
 import { AgentSourcesTab } from '@/pages/agent-sources/AgentSourcesTab';
 import { computeMood } from '@/lib/mascot-mood';
 import { toStatusKey } from '@/lib/task-status';
@@ -77,7 +79,7 @@ const MAX_AVATAR_BYTES = 512 * 1024;
 const AVATAR_ACCEPT = '.png,.jpg,.jpeg,.webp';
 const AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-const TAB_IDS = ['overview', 'work', 'records', 'computer', 'sources'] as const;
+const TAB_IDS = ['overview', 'work', 'records', 'files', 'computer', 'sources'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
 const MOOD_EMOJI: Record<string, string> = {
@@ -184,7 +186,20 @@ export function AgentDetailPage() {
     if (connectionState === 'authenticated') fetchAgents();
   }, [connectionState, fetchAgents]);
 
-  const setTab = (next: string) => navigate(`/agents/${encodeURIComponent(id)}/${next}`);
+  // The 設定檔 tab reports an unsaved edit; leaving the tab asks first.
+  const filesDirtyRef = useRef(false);
+  const onFilesDirty = useCallback((dirty: boolean) => {
+    filesDirtyRef.current = dirty;
+  }, []);
+  const [leaveToTab, setLeaveToTab] = useState<string | null>(null);
+  const goTab = (next: string) => navigate(`/agents/${encodeURIComponent(id)}/${next}`);
+  const setTab = (next: string) => {
+    if (tab === 'files' && next !== 'files' && filesDirtyRef.current) {
+      setLeaveToTab(next);
+      return;
+    }
+    goTab(next);
+  };
 
   const lifecycleAction = useCallback(
     async (fn: () => Promise<void>, successId: string) => {
@@ -515,6 +530,7 @@ export function AgentDetailPage() {
               <TabsTab value="overview">{intl.formatMessage({ id: 'agentDetail.tab.overview' })}</TabsTab>
               <TabsTab value="work">{intl.formatMessage({ id: 'agentDetail.tab.work' })}</TabsTab>
               <TabsTab value="records">{intl.formatMessage({ id: 'agentDetail.tab.records' })}</TabsTab>
+              <TabsTab value="files">{intl.formatMessage({ id: 'agentDetail.tab.files' })}</TabsTab>
               {(detail.capabilities?.computer_use || tab === 'computer') && (
                 <TabsTab value="computer">{intl.formatMessage({ id: 'agentDetail.tab.computer' })}</TabsTab>
               )}
@@ -538,6 +554,13 @@ export function AgentDetailPage() {
         <TabsPanel value="records">
           <RecordsTab activities={activities} />
         </TabsPanel>
+        <TabsPanel value="files">
+          {tab === 'files' && (
+            <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
+              <AgentFilesTab key={id} agentId={id} onDirtyChange={onFilesDirty} />
+            </div>
+          )}
+        </TabsPanel>
         <TabsPanel value="computer">
           {tab === 'computer' && <ComputerSessionPanel agentId={id} />}
         </TabsPanel>
@@ -549,6 +572,16 @@ export function AgentDetailPage() {
           )}
         </TabsPanel>
       </Tabs>
+      <UnsavedChangesDialog
+        open={leaveToTab !== null}
+        onStay={() => setLeaveToTab(null)}
+        onDiscard={() => {
+          const next = leaveToTab;
+          setLeaveToTab(null);
+          filesDirtyRef.current = false;
+          if (next) goTab(next);
+        }}
+      />
 
       <OffboardDialog
         open={showOffboard}
