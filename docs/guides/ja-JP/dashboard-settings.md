@@ -80,6 +80,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | タブ → セクション | キー |
 |---|---|
 | 予算 → 1日の上限 | `[budget] daily_cap_cents` |
+| スキル → この社員のスキル（未リリース） | 設定キーではない：オン／オフは `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`）、削除したスキルは `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）に移る。社員の担当者または管理者。[スキルライブラリ画面](../../features/ja-JP/15-skill-lifecycle.md)参照 |
 | ツールと権限 → 確認が必要なツール（常に承認待ち、不可逆として扱う、先に判定役が判断、タスク許可が必要） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | ツールと権限 → 並行ブランチ | `[fork] enabled` |
 | ツールと権限 → 送信内容の保護 | `[guardrails] enabled`、`block_secrets`、`block_injection_echo`、`redact_pii`、`deny_phrases` |

@@ -80,6 +80,7 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 | Tab → section | Key |
 |---|---|
 | Budget → Daily cap | `[budget] daily_cap_cents` |
+| Skills → This staffer's skills (unreleased) | not a config key: switches are stored in `<home>/skill_state/<agent_id>.json` (`skills.set_enabled`), removed skills move to `<home>/skill_archive/<agent_id>/` (`skills.remove` / `skills.restore`); Owner of the employee or admin. See [Skill library page](../features/15-skill-lifecycle.md#the-skill-library-page-unreleased) |
 | Tools & permissions → Tools that need a checkpoint (always wait for approval, treat as irreversible, let the judge decide first, needs a task grant) | `[capabilities] approval_required_tools`, `irreversible_tools`, `maybe_irreversible_tools`, `scoped_tools` |
 | Tools & permissions → Parallel branches | `[fork] enabled` |
 | Tools & permissions → Outgoing reply protection | `[guardrails] enabled`, `block_secrets`, `block_injection_echo`, `redact_pii`, `deny_phrases` |
