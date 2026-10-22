@@ -698,6 +698,24 @@ pub(crate) fn changed_sections(before: &toml::Table, after: &toml::Table) -> Vec
     keys.into_iter().filter(|k| before.get(*k) != after.get(*k)).cloned().collect()
 }
 
+/// The cloud-embedding disclosure record is written only by the disclosure
+/// dialog (`knowledge.embedding.select` with `acknowledge_disclosure`), so it
+/// always names who agreed to which vendor and host. The raw editor may
+/// remove it (that only narrows: cloud embedding stops), never add or
+/// change it.
+pub(crate) const DISCLOSURE_ACK_PATH: &str = "knowledge.embedding.cloud_disclosure_ack";
+
+pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    let new = super::config_commit::toml_at(after, DISCLOSURE_ACK_PATH);
+    if new.is_some() && new != super::config_commit::toml_at(before, DISCLOSURE_ACK_PATH) {
+        return Err(
+            "[knowledge.embedding] cloud_disclosure_ack cannot be edited here; choose the cloud provider in Settings → Knowledge base search, which records the acknowledgement"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn key_changed(before: &toml::Table, after: &toml::Table, path: &str) -> bool {
     super::config_commit::toml_at(before, path) != super::config_commit::toml_at(after, path)
 }
@@ -830,6 +848,9 @@ impl MethodHandler {
                 return Err(format!("[agent] name cannot be changed here (it is the employee id `{id}`)").into());
             }
         }
+        if matches!(kind, RawFile::Config) {
+            refuse_disclosure_ack_edit(&before, &after)?;
+        }
         let sections = changed_sections(&before, &after);
         // A submission whose parsed content equals the stored file is a true
         // no-op (the hidden [mcp_keys] re-attached at the end, or a pure
@@ -867,7 +888,26 @@ impl MethodHandler {
         } else {
             Some(write_backup(&path, &stored, chrono::Utc::now().timestamp())?)
         };
-        {
+        if let RawFile::Agent(id) = &kind {
+            // agent.toml goes through the profile file writer (version kept
+            // outside the employee directory, `agent_file_changed` audit).
+            let text = new_text.clone();
+            crate::agent_files::writer::commit(
+                &self.registry,
+                crate::agent_files::writer::Commit {
+                    home: &self.home_dir,
+                    agent_id: id,
+                    key: crate::agent_files::FileKey::AgentToml,
+                    expected_hash: Some(&stored_hash),
+                    meta: crate::agent_files::writer::CommitMeta::new(&ctx.user_id, "config.raw"),
+                    baseline: crate::agent_files::writer::Baseline::Accept,
+                },
+                move |_| Ok(text),
+                || Ok(()),
+            )
+            .await
+            .map_err(|e| rctx.scrub(&e.message()))?;
+        } else {
             let (p, h, t) = (path.clone(), stored_hash.clone(), new_text.clone());
             tokio::task::spawn_blocking(move || commit_text_locked(&p, &h, &t))
                 .await
@@ -1098,6 +1138,41 @@ client_id = "x"
         assert!(masked.contains("bind = \"127.0.0.1\""));
         assert_eq!(hidden, vec!["mcp_keys".to_string()]);
         assert!(paths.contains(&"accounts[id=a2].api_key_enc".to_string()), "{paths:?}");
+    }
+
+    /// What `agent_files.get` shows a Viewer of `agent.toml`: every
+    /// credential an employee file can hold is masked.
+    #[test]
+    fn agent_toml_secrets_are_masked() {
+        let agent = r#"
+[agent]
+name = "a1"
+
+[channels.discord]
+bot_token = "PLAIN-DISCORD-TOKEN"
+bot_token_enc = "ENC-DISCORD"
+
+[channels.telegram]
+bot_token_enc = "ENC-TELEGRAM"
+
+[channels.slack]
+app_token = "xapp-PLAIN"
+bot_token = "xoxb-PLAIN"
+
+[odoo]
+url = "https://user:odoo-pass@erp.example.com"
+api_key = "ODOO-API-KEY"
+password_enc = "ENC-ODOO-PW"
+username = "bot"
+
+[container.env]
+OPENAI_API_KEY = "sk-env-secret"
+"#;
+        let (masked, _, _) = mask_raw_toml(agent).unwrap();
+        for secret in ["PLAIN-DISCORD-TOKEN", "ENC-DISCORD", "ENC-TELEGRAM", "xapp-PLAIN", "xoxb-PLAIN", "odoo-pass", "ODOO-API-KEY", "ENC-ODOO-PW", "sk-env-secret"] {
+            assert!(!masked.contains(secret), "{secret} leaked:\n{masked}");
+        }
+        assert!(masked.contains("username = \"bot\""), "non-secret kept");
     }
 
     #[test]

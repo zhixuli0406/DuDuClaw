@@ -8,6 +8,7 @@ import { SourceStatusChip, chipModel } from './SourceStatusChip';
 import { PrincipalPicker, principalLabels } from './PrincipalPicker';
 import { PassageDrawer } from './PassageDrawer';
 import { EmbeddingStatusBanner } from './EmbeddingStatusBanner';
+import { useAuthStore } from '@/stores/auth-store';
 import type { KbPrincipals } from '@/lib/knowledge-api';
 
 beforeEach(() => vi.clearAllMocks());
@@ -134,5 +135,15 @@ describe('EmbeddingStatusBanner', () => {
     renderWithProviders(<EmbeddingStatusBanner />);
     await waitFor(() => expect(callsOf('knowledge.embedding.status').length).toBeGreaterThan(1));
     expect(screen.queryByRole('note')).toBeNull();
+  });
+
+  it('gives admins the reason and the one link to set it up', async () => {
+    useAuthStore.setState({ user: { id: 'a', email: 'a@example.com', role: 'admin' } as never });
+    mockRpc({ 'knowledge.embedding.status': () => ({ provider: 'local', available: false, mode: 'keyword_only', reason: '尚未安裝向量模型', coverage: 0 }) });
+    renderWithProviders(<EmbeddingStatusBanner />);
+    const note = await screen.findByRole('note');
+    expect(note).toHaveTextContent('尚未安裝向量模型');
+    expect(screen.getByRole('link', { name: 'Set up meaning-based search' })).toHaveAttribute('href', '/settings?tab=knowledgeSearch');
+    useAuthStore.setState({ user: null } as never);
   });
 });

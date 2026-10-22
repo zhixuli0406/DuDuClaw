@@ -1,0 +1,50 @@
+{
+  "ort_version": "1.24.2",
+  "archives": [
+    {
+      "target": "aarch64-apple-darwin",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-osx-arm64-1.24.2.tgz",
+      "size": 31604221,
+      "sha256": "0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde",
+      "kind": "tgz",
+      "member": "onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib",
+      "lib_file": "libonnxruntime.dylib"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
+      "size": 8123282,
+      "sha256": "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+      "kind": "tgz",
+      "member": "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
+      "lib_file": "libonnxruntime.so"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-aarch64-1.24.2.tgz",
+      "size": 7135756,
+      "sha256": "6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e",
+      "kind": "tgz",
+      "member": "onnxruntime-linux-aarch64-1.24.2/lib/libonnxruntime.so.1.24.2",
+      "lib_file": "libonnxruntime.so"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
+      "size": 74075355,
+      "sha256": "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
+      "kind": "zip",
+      "member": "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
+      "lib_file": "onnxruntime.dll"
+    },
+    {
+      "target": "aarch64-pc-windows-msvc",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-arm64-1.24.2.zip",
+      "size": 74960464,
+      "sha256": "dd8180d98e5a0ead7ead99029acc80b86a8b905b9aba4cc978e388039bb5823b",
+      "kind": "zip",
+      "member": "onnxruntime-win-arm64-1.24.2/lib/onnxruntime.dll",
+      "lib_file": "onnxruntime.dll"
+    }
+  ]
+}

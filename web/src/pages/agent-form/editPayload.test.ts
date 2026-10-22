@@ -2,10 +2,13 @@ import { describe, it, expect } from 'vitest';
 import en from '@/i18n/en.json';
 import zhTW from '@/i18n/zh-TW.json';
 import jaJP from '@/i18n/ja-JP.json';
+import authorityFields from './__fixtures__/authority-fields.json';
 import {
   buildUpdatePayload,
   clampInt,
   isAdminOnlyPath,
+  ADMIN_ONLY_FORM_PATHS_FALLBACK,
+  KV_REFUSED_SECTIONS,
   kvRowsFromTable,
   parseKvRow,
   teamRolesShareVendor,
@@ -174,18 +177,20 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     const adv = {
       ...DEFAULT_ADVANCED,
       kv: [
-        { section: 'prompt', key: 'cli_bare_mode', value: 'true', type: 'boolean' as const },
-        { section: 'prompt', key: 'minimal_core_kb', value: '4', type: 'integer' as const },
+        { section: 'evolution', key: 'skill_synthesis_enabled', value: 'true', type: 'boolean' as const },
+        { section: 'evolution', key: 'skill_synthesis_threshold', value: '4', type: 'integer' as const },
         { section: 'fork', key: 'default_budget_usd', value: '1.5', type: 'float' as const },
         { section: 'skills', key: 'recommended', value: 'a, b', type: 'string_array' as const },
-        { section: 'prompt', key: 'bad', value: '4.2', type: 'integer' as const },
+        { section: 'evolution', key: 'bad', value: '4.2', type: 'integer' as const },
+        // Refused section: skipped like any other invalid row.
+        { section: 'prompt', key: 'cli_bare_mode', value: 'true', type: 'boolean' as const },
       ],
     };
     const r = buildUpdatePayload(state({ adv }), new Set(['kv']), CTX);
     expect(r.includesKv).toBe(true);
     expect(r.payload.advanced_kv).toEqual([
-      { section: 'prompt', key: 'cli_bare_mode', value: true, type: 'boolean' },
-      { section: 'prompt', key: 'minimal_core_kb', value: 4, type: 'integer' },
+      { section: 'evolution', key: 'skill_synthesis_enabled', value: true, type: 'boolean' },
+      { section: 'evolution', key: 'skill_synthesis_threshold', value: 4, type: 'integer' },
       { section: 'fork', key: 'default_budget_usd', value: 1.5, type: 'float' },
       { section: 'skills', key: 'recommended', value: ['a', 'b'], type: 'string_array' },
     ]);
@@ -195,14 +200,15 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
 describe('typed key/value helpers', () => {
   it('reports which part of a row is wrong', () => {
     expect(parseKvRow({ section: 'Prompt!', key: 'k', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'section' });
-    expect(parseKvRow({ section: 'prompt', key: 'a-b', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'key' });
-    expect(parseKvRow({ section: 'prompt', key: 'Mode', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'key' });
+    expect(parseKvRow({ section: 'evolution', key: 'a-b', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'key' });
+    expect(parseKvRow({ section: 'evolution', key: 'Mode', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'key' });
     expect(parseKvRow({ section: 'a.b.c.d', key: 'k', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'section' });
     expect(parseKvRow({ section: 'evolution.noise_band', key: 'k', value: '1', type: 'integer' }).kind).toBe('ok');
     expect(parseKvRow({ section: 'sticker', key: 'k', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'section' });
-    expect(parseKvRow({ section: 'prompt', key: 'k', value: 'yes', type: 'boolean' })).toEqual({ kind: 'error', error: 'value' });
+    expect(parseKvRow({ section: 'evolution', key: 'k', value: 'yes', type: 'boolean' })).toEqual({ kind: 'error', error: 'value' });
     expect(parseKvRow({ section: 'prompt', key: '', value: '', type: 'string' })).toEqual({ kind: 'empty' });
-    for (const sec of ['ptc', 'cultural_context', 'capabilities', 'runtime', 'odoo', 'mcp', 'channels', 'agent', 'container', 'permissions']) {
+    for (const sec of ['ptc', 'cultural_context', 'capabilities', 'runtime', 'odoo', 'mcp', 'channels', 'agent', 'container', 'permissions',
+      'prompt', 'prompt.sub', 'os_watch', 'budget']) {
       expect(parseKvRow({ section: sec, key: 'k', value: 'v', type: 'string' })).toEqual({ kind: 'error', error: 'section' });
     }
   });
@@ -224,9 +230,46 @@ describe('admin-only paths and the team vendor rule', () => {
       'form.network_access', 'caps.scoped_tools', 'caps.computer_use_config.max_actions']) {
       expect(isAdminOnlyPath(p)).toBe(true);
     }
-    for (const p of ['form.display_name', 'v.fork_enabled', 'kv', 'runtime.provider']) {
+    for (const p of ['form.display_name', 'v.fork_enabled', 'kv', 'runtime.minimal_context', 'v.minimal_context']) {
       expect(isAdminOnlyPath(p)).toBe(false);
     }
+  });
+
+  it('keeps the fallback list equal to the shared authority table', () => {
+    const changePaths = authorityFields.fields
+      .filter((f) => f.kind === 'change')
+      .flatMap((f) => f.form_paths);
+    expect([...ADMIN_ONLY_FORM_PATHS_FALLBACK].sort()).toEqual([...changePaths].sort());
+    expect([...KV_REFUSED_SECTIONS].sort()).toEqual([...authorityFields.kv_refused_sections].sort());
+  });
+
+  it('treats the permission switches, guardrails and protected sections as admin-only', () => {
+    for (const p of ['form.can_create_agents', 'form.can_send_cross_agent', 'form.can_schedule_tasks',
+      'form.can_modify_own_skills', 'v.guardrails_enabled', 'v.guardrails_block_secrets',
+      'odoo.profile', 'odoo.api_key', 'runtime.provider', 'runtime.fallback', 'osWatch.enabled', 'adv.account_pool']) {
+      expect(isAdminOnlyPath(p)).toBe(true);
+    }
+  });
+
+  it('never drops budget raises or the role, which the server judges', () => {
+    for (const p of ['form.monthly_limit_cents', 'v.daily_cap_cents', 'form.hard_stop', 'form.role']) {
+      expect(isAdminOnlyPath(p)).toBe(false);
+    }
+    const loosenPaths = authorityFields.fields
+      .filter((f) => f.kind !== 'change')
+      .flatMap((f) => f.form_paths);
+    for (const p of loosenPaths) expect(isAdminOnlyPath(p)).toBe(false);
+  });
+
+  it('uses the server list when the gateway sends one', () => {
+    const server = ['form.display_name', 'caps.'];
+    expect(isAdminOnlyPath('form.display_name', server)).toBe(true);
+    expect(isAdminOnlyPath('caps.allowed_tools', server)).toBe(true);
+    // Not on the server list, so the fallback does not apply.
+    expect(isAdminOnlyPath('form.reports_to', server)).toBe(false);
+    // An empty server list falls back to the built-in table.
+    expect(isAdminOnlyPath('form.reports_to', [])).toBe(true);
+    expect(isAdminOnlyPath('form.display_name', [])).toBe(false);
   });
 
   it('flags executor and verifier on the same vendor', () => {

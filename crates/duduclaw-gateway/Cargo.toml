@@ -22,6 +22,8 @@ duduclaw-db = { workspace = true }
 # Document knowledge base (collections, ACL, keyword retrieval). The gateway
 # owns writes, the ingest worker and the routes.
 duduclaw-knowledge = { workspace = true }
+# Shared ONNX Runtime manifest (platform support shown by the embedding status RPC).
+duduclaw-onnx = { workspace = true }
 duduclaw-identity = { workspace = true }
 # `ner` is default-on in the redaction crate; named explicitly here because
 # the gateway HARD-REQUIRES it — `redaction_ner_model.rs` (the

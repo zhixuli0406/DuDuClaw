@@ -317,6 +317,8 @@ mod digest_rpc_tests {
                 role: UserRole::Employee,
                 agent_access: access,
                 must_change_password: false,
+                team_access: Default::default(),
+                acl_generation: 0,
             }
         };
         let viewer = mk(AccessLevel::Viewer);

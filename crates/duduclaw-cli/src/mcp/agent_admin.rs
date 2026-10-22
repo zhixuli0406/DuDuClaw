@@ -262,65 +262,48 @@ pub(crate) async fn handle_agent_update_soul(params: &Value, home_dir: &Path) ->
         });
     }
 
-    let soul_path = agent_dir.join("SOUL.md");
 
-    // Read old content for SHA-256 fingerprint comparison
-    let old_content = tokio::fs::read_to_string(&soul_path)
-        .await
-        .unwrap_or_default();
+    // Through the gateway's profile file writer: the same cross-process
+    // lock as a dashboard save, a version in `agent_file_history/`, the
+    // `agent_file_changed` audit row and the SOUL baseline update (inside the
+    // lock). The baseline must follow: otherwise every integrity check would
+    // flag this legitimate update as tampering.
+    let new_text = soul_content.to_string();
+    let write = duduclaw_gateway::agent_files::external::write_file(
+        home_dir,
+        agent_id,
+        duduclaw_gateway::agent_files::external::ExternalFile::Soul,
+        "mcp",
+        "mcp",
+        duduclaw_gateway::agent_files::external::ExternalBaseline::Accept,
+        move |_| Ok(new_text),
+    )
+    .map(|o| o.before);
+    let old_content = match write {
+        Ok(c) => c,
+        Err(e) => {
+            duduclaw_security::audit::append_tool_call(
+                home_dir,
+                agent_id,
+                "agent_update_soul",
+                &format!("FAILED: write: {e}"),
+                false,
+            );
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error writing SOUL.md: {e}")}],
+                "isError": true
+            });
+        }
+    };
     let old_hash = {
         let digest = <sha2::Sha256 as sha2::Digest>::digest(old_content.as_bytes());
         format!("{:x}", digest)
     };
 
-    // Atomic write: temp file + rename
-    let tmp_path = soul_path.with_extension("md.tmp");
-    if let Err(e) = tokio::fs::write(&tmp_path, soul_content).await {
-        duduclaw_security::audit::append_tool_call(
-            home_dir,
-            agent_id,
-            "agent_update_soul",
-            &format!("FAILED: write tmp: {e}"),
-            false,
-        );
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error writing SOUL.md: {e}")}],
-            "isError": true
-        });
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, &soul_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        duduclaw_security::audit::append_tool_call(
-            home_dir,
-            agent_id,
-            "agent_update_soul",
-            &format!("FAILED: rename: {e}"),
-            false,
-        );
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error committing SOUL.md: {e}")}],
-            "isError": true
-        });
-    }
-
     let new_hash = {
         let digest = <sha2::Sha256 as sha2::Digest>::digest(soul_content.as_bytes());
         format!("{:x}", digest)
     };
-
-    // Refresh the soul_guard integrity hash. Without this, the next
-    // `check_soul_integrity` call (and the new heartbeat check added in
-    // 2026-05-20) would flag every legitimate `agent_update_soul` call as
-    // tampering. Failure here is logged but does not fail the tool call —
-    // the SOUL.md was already updated and the heartbeat drift warning is
-    // a recoverable signal, not a security violation we can roll back.
-    if let Err(e) = duduclaw_security::soul_guard::accept_soul_change(agent_id, &agent_dir) {
-        tracing::warn!(
-            agent = %agent_id,
-            "Failed to refresh soul_guard hash after agent_update_soul: {e} — \
-             next integrity check will flag drift until manually re-accepted"
-        );
-    }
 
     duduclaw_security::audit::append_tool_call(
         home_dir,

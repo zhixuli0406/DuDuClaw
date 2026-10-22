@@ -152,6 +152,11 @@ impl MethodHandler {
             }
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
+        // A previous employee with this id (folder removed by hand) left its
+        // profile file history behind: this new employee must not inherit it.
+        if let Err(e) = crate::agent_files::history::retire(&self.home_dir, name) {
+            warn!(agent = name, error = %e, "old profile file history could not be moved aside");
+        }
 
         // If creating as main, demote the current main agent — only AFTER the
         // name claim succeeded, so a doomed create (name collision) can no

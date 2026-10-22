@@ -7,6 +7,11 @@
 //! JSONL file and reports Recall@1/5/10, MRR@10 per question type, the
 //! no-result rate of unanswerable questions and query latency. Never touches
 //! the real knowledge base.
+//!
+//! `--model local:<catalog id>` uses a model installed under the DuDuClaw
+//! home (or `--model-home`): every chunk is embedded once (timed, reported
+//! as chunks per minute) and the `vector` and `hybrid` modes run with it.
+//! Cloud models are not evaluated by this command.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -21,6 +26,7 @@ use duduclaw_knowledge::extract::Format;
 use duduclaw_knowledge::limits::KnowledgeConfig;
 use duduclaw_knowledge::sources::{Added, NewSource, SourceKind, add_source};
 use duduclaw_knowledge::store::{NewCollection, create_collection};
+use duduclaw_knowledge::embed::{Embedder, NoEmbedder};
 use serde_json::{Value, json};
 
 /// Arguments of `duduclaw knowledge eval`.
@@ -34,6 +40,8 @@ pub struct EvalArgs {
     pub min_recall: Option<f64>,
     pub report: Option<PathBuf>,
     pub work_dir: Option<PathBuf>,
+    /// Where `local:` models are installed (default: the DuDuClaw home).
+    pub model_home: PathBuf,
 }
 
 fn err(msg: impl Into<String>) -> DuDuClawError {
@@ -142,11 +150,7 @@ fn recall_at(report: &ModeReport, k: usize) -> f64 {
 /// Run the evaluation. Returns the process exit code (1 when below
 /// `--min-recall`).
 pub async fn run(args: EvalArgs) -> Result<i32> {
-    if args.model.trim() != "none" {
-        return Err(err(
-            "這個版本只有關鍵字檢索，--model 只能是 none（向量模型會在之後的版本提供）。",
-        ));
-    }
+    let embedder = load_embedder(&args.model, &args.model_home)?;
     let modes: Vec<String> = args
         .modes
         .split(',')
@@ -198,26 +202,35 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         &Narrowing::default(),
     )
     .map_err(|e| err(e.to_string()))?;
+    let embedding = match &embedder {
+        Some(e) => Some(embed_all(&home, e.as_ref())?),
+        None => None,
+    };
+    let cache = duduclaw_knowledge::embed::vector_cache::VectorCache::default();
     let mut reports = Vec::new();
     let mut unavailable = Vec::new();
     for mode in &modes {
-        if mode != "keyword" {
-            unavailable.push(
-                json!({"mode": mode, "reason": "向量檢索尚未提供（這個版本只有關鍵字比對）"}),
-            );
+        let vector_mode = matches!(mode.as_str(), "vector" | "hybrid");
+        let e: &dyn Embedder = match (&embedder, vector_mode) {
+            (_, false) => &NoEmbedder,
+            (Some(e), true) => e.as_ref(),
+            (None, true) => {
+                unavailable.push(json!({"mode": mode, "reason": "未指定向量模型（--model local:<模型>）"}));
+                continue;
+            }
+        };
+        if !matches!(mode.as_str(), "keyword" | "vector" | "hybrid") {
+            unavailable.push(json!({"mode": mode, "reason": "未知的模式（keyword、vector、hybrid）"}));
             continue;
         }
-        let report = evaluate("keyword", &questions, |q| {
+        let report = evaluate(mode, &questions, |q| {
             let started = Instant::now();
-            let hits = duduclaw_knowledge::search::search(
-                &conn,
-                &allowed,
-                q,
-                10,
-                &duduclaw_knowledge::embed::NoEmbedder,
-            )
-            .map(|r| r.hits)
-            .unwrap_or_default();
+            let result = if mode == "vector" {
+                duduclaw_knowledge::search::vector_only(&conn, &allowed, q, 10, e, &cache)
+            } else {
+                duduclaw_knowledge::search::search(&conn, &allowed, q, 10, e, &cache)
+            };
+            let hits = result.map(|r| r.hits).unwrap_or_default();
             (hits, started.elapsed())
         });
         reports.push(report);
@@ -238,14 +251,11 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
             "chunks_per_minute": if ing.seconds > 0.0 { ing.chunks as f64 * 60.0 / ing.seconds } else { 0.0 },
             "skipped": ing.skipped,
         },
+        "model": args.model,
+        "embedding": embedding,
         "modes": reports,
         "unavailable_modes": unavailable,
-        "environment": {
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-            "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
-            "rss_peak": "not measured",
-        },
+        "environment": environment(),
     });
     println!(
         "文件 {} 份、段落 {} 段（略過 {} 份），題目 {} 題",
@@ -254,6 +264,12 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         ing.skipped.len(),
         questions.len()
     );
+    if let Some(e) = &embedding {
+        println!(
+            "向量：{} 段，{:.1} 秒，每分鐘 {:.0} 段（{} 執行緒）",
+            e["chunks"], e["seconds"].as_f64().unwrap_or(0.0), e["chunks_per_minute"].as_f64().unwrap_or(0.0), e["threads"]
+        );
+    }
     for r in &reports {
         println!(
             "[{}] Recall@1 {:.2}  Recall@5 {:.2}  Recall@10 {:.2}  MRR@10 {:.2}  查詢 p50 {:.1} ms／p95 {:.1} ms",
@@ -294,4 +310,113 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         return Ok(1);
     }
     Ok(0)
+}
+
+/// `none` ⇒ no embedder; `local:<id>` ⇒ the installed catalog model.
+fn load_embedder(model: &str, model_home: &Path) -> Result<Option<Box<dyn Embedder>>> {
+    use duduclaw_knowledge::embed::{catalog, install, local_onnx::LocalOnnxEmbedder};
+    let model = model.trim();
+    if model == "none" {
+        return Ok(None);
+    }
+    let Some(id) = model.strip_prefix("local:") else {
+        return Err(err("--model 只能是 none 或 local:<模型>（雲端模型請在 gateway 設定後用儀表板測試）。"));
+    };
+    let spec = catalog::find(id).ok_or_else(|| {
+        let ids: Vec<&str> = catalog::models().iter().map(|m| m.id.as_str()).collect();
+        err(format!("沒有這個本機模型：{id}（可用：{}）", ids.join("、")))
+    })?;
+    if let Some(problem) = install::installed_problem(spec, model_home) {
+        return Err(err(format!("{id}：{problem}（模型位置 {}）", model_home.display())));
+    }
+    let lib = install::ort_lib(model_home).ok_or_else(|| err("這個平台沒有可用的 ONNX Runtime"))?;
+    let cfg = duduclaw_knowledge::embed::config::EmbeddingConfig::from_home(model_home);
+    Ok(Some(Box::new(LocalOnnxEmbedder::new(spec, model_home, lib, cfg.effective_threads(), cfg.batch_size))))
+}
+
+/// Embed every chunk of the evaluation database once; timing for the
+/// report. Fails the run on any model error (a partial vector set would
+/// make the vector numbers meaningless).
+fn embed_all(home: &Path, e: &dyn Embedder) -> Result<Value> {
+    let mut conn = duduclaw_knowledge::schema::open_home(home).map_err(|x| err(x.to_string()))?;
+    let sources: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM sources ORDER BY id").map_err(|x| err(x.to_string()))?;
+        stmt.query_map([], |r| r.get(0))
+            .map_err(|x| err(x.to_string()))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|x| err(x.to_string()))?
+    };
+    let cfg = duduclaw_knowledge::embed::config::EmbeddingConfig::from_home(home);
+    let started = Instant::now();
+    let (mut embedded, mut reused) = (0usize, 0usize);
+    for s in &sources {
+        let o = duduclaw_knowledge::embed::job::embed_source(&mut conn, s, e, cfg.batch_size, usize::MAX, |_, _, _| Ok(true))
+            .map_err(|x| err(format!("向量計算失敗：{x}")))?;
+        embedded += o.embedded;
+        reused += o.reused;
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    Ok(json!({
+        "model_id": e.model_id(),
+        "dim": e.dim(),
+        "chunks": embedded,
+        "reused": reused,
+        "seconds": seconds,
+        "chunks_per_minute": if seconds > 0.0 { embedded as f64 * 60.0 / seconds } else { 0.0 },
+        "threads": duduclaw_knowledge::embed::config::EmbeddingConfig::from_home(home).effective_threads(),
+        "rss_peak_bytes": rss_peak_bytes(),
+    }))
+}
+
+/// Peak resident set of this process (getrusage); `None` where unknown.
+fn rss_peak_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage writes into the provided struct and nothing else.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        #[allow(unsafe_code)]
+        let max = unsafe { usage.assume_init() }.ru_maxrss as u64;
+        // macOS reports bytes, Linux kilobytes.
+        Some(if cfg!(target_os = "macos") { max } else { max * 1024 })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn cpu_model() -> String {
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    } else {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn environment() -> Value {
+    json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "cpu": cpu_model(),
+        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "rss_peak_bytes": rss_peak_bytes(),
+    })
 }

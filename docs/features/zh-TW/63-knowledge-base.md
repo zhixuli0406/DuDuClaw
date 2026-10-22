@@ -2,7 +2,7 @@
 
 把公司文件（員工手冊、報價單、產品常見問題）放進**集合**，每個集合各自決定誰能讀，AI 員工就能搜尋這些文件，並指出答案出自哪一頁、哪張投影片或工作表的哪幾列。
 
-目前包含：儲存、匯入、關鍵字搜尋、`knowledge.*` RPC、上傳路由、三支唯讀 MCP 工具、`duduclaw knowledge eval` 指令，以及儀表板的文件知識庫頁面與 AI 員工綁定設定。向量（語意）搜尋、通道回覆時自動帶入段落與引用頁尾，會在之後的版本提供。既有的 wiki 完全不受影響。
+目前包含：儲存、匯入、關鍵字搜尋、以本機模型或可選的雲端供應商進行的語意（向量）搜尋、`knowledge.*` RPC、上傳路由、三支唯讀 MCP 工具、`duduclaw knowledge eval` 指令，以及儀表板的文件知識庫頁面與 AI 員工綁定設定。通道回覆時自動帶入段落與引用頁尾，會在之後的版本提供。既有的 wiki 完全不受影響。
 
 ---
 
@@ -72,7 +72,7 @@ AI 員工替某人回答時，取下列條件的交集：
 
 同一份檔案重複上傳到同一個集合會回「已存在」並傳回原本的來源。不同集合可以放同一份檔案。
 
-來源狀態依序是 `queued → extracting → indexing → ready`。還沒有向量模型時，`ready` 會帶 `status_detail = "keyword_only"`。失敗時會留下固定的代碼與給上傳者看的說明：
+來源狀態依序是 `queued → extracting → indexing → ready`，接著在計算向量期間經過 `embedding` 再回到 `ready`（整段期間都能用關鍵字搜到）。`status_detail` 說明搜尋涵蓋到哪裡：`hybrid`（向量已完成）、`keyword_only`（沒有可用的模型，或向量計算失敗；此時來源帶 `embedding_failed` 警告，下一次補齊時會重試）、`vector_limit`（已達 `max_vector_rows`）。失敗時會留下固定的代碼與給上傳者看的說明：
 
 | 代碼 | 意思 |
 |---|---|
@@ -103,14 +103,37 @@ AI 員工替某人回答時，取下列條件的交集：
 
 ## 搜尋
 
-這一版只有關鍵字搜尋：
+三份排序清單，各自在排序之前就先限縮到呼叫者可讀的集合，再以 reciprocal rank fusion（`Σ 1/(60 + rank)`，同分時依段落 id 排序，每份來源最多三段）合併：
 
-- 三個字以上的詞走 SQLite FTS5 trigram 索引。中文查詢會在「的、了、嗎」這類助詞處斷開，所以「請假的規定」也找得到「請假規定」。
-- 兩個字的詞（「請假」、`HR`）走有上限的子字串掃描，最多 2 萬段；掃描到上限時結果會標 `scan_capped`。
-- trigram 找到不到三段時，較長詞語拆出的兩字片段也會加入子字串掃描。
-- 幾份清單以 reciprocal rank fusion 合併，每份來源最多三段。
+- **Trigram**：三個字以上的詞走 SQLite FTS5 trigram 索引。中文查詢會在「的、了、嗎」這類助詞處斷開，所以「請假的規定」也找得到「請假規定」。
+- **短詞**：兩個字的詞（「請假」、`HR`）走有上限的子字串掃描，最多 2 萬段；掃描到上限時結果會標 `scan_capped`。trigram 找到不到三段時，較長詞語拆出的兩字片段也會加入掃描。
+- **向量**（依語意）：提問用和段落相同的模型轉成向量，與允許集合內的每一段計算餘弦相似度（在記憶體中的副本上逐一比對，段落或向量有變動就重新載入）。「小孩生病要在家顧可以請什麼假」能找到講「家庭照顧假」的段落，靠的就是這一路。
 
-每次結果都會說明檢索模式，以及向量搜尋為什麼沒啟用。和文件用詞不同的問法（用「薪水」問「薪資」）要等向量搜尋上線才找得到。
+每次結果都會說明模式（`hybrid`、`keyword_only`、`vector_only`）、搜尋範圍內已有向量的段落比例（`coverage`），以及沒用到向量時的原因（`vector_unavailable`）：沒有安裝模型、模型檔案沒通過檢查、平台不支援、雲端供應商尚未確認告知事項、去識別化被關閉、缺少 API 金鑰、雲端端點出錯，或允許的集合全都不能送到雲端。這時搜尋只用關鍵字，絕不會自己改用別的供應商。gateway 也會把原因寫進日誌（同一原因每小時最多一次）。
+
+### 向量模型
+
+| | multilingual-e5-small（預設） | Qwen3-Embedding-0.6B（選用） |
+|---|---|---|
+| 執行位置 | 在這台機器上（ONNX Runtime 1.24.2） | 在這台機器上（ONNX Runtime 1.24.2） |
+| 檔案 | `intfloat/multilingual-e5-small` @ `614241f6`：int8 ONNX 118 MB + 分詞器 17 MB | `onnx-community/Qwen3-Embedding-0.6B-ONNX` @ `c25a394d`：int8 ONNX 614 MB + 分詞器 11 MB |
+| 授權 | MIT | Apache-2.0（基底模型 `Qwen/Qwen3-Embedding-0.6B`；轉換版的 repository 本身沒有宣告授權） |
+| 向量 | 384 維、平均池化（mean pooling）、`query: `／`passage: ` 前綴 | 1,024 維中的前 512 維、取最後一個 token 池化（last-token pooling）、提問前加一段英文指示 |
+| 速度（Apple M4、5 執行緒） | 每分鐘約 1,200–2,500 段 | 每分鐘約 150–340 段 |
+
+每個檔案都固定在單一 commit，並附大小與 SHA-256，不會去解析「最新版」。模型不包含在執行檔裡：管理員到**系統設定 → 進階設定 → 文件知識庫搜尋**安裝（ONNX Runtime 函式庫約 30 MB，缺少時會一併安裝，與去識別化的 AI 偵測共用）。安裝完成後，背景會替每一段建立向量；重新建立索引的來源，文字沒變的段落會沿用原本的向量。超過 `idle_unload_minutes` 沒用到的模型會卸載。授權為非商用的模型（jina-embeddings v3／v5）不提供。Qwen3 的轉換版本身沒有附授權聲明，Apache-2.0 條款來自基底模型，商用前請自行確認。ONNX Runtime 執行庫也依平台固定了雜湊，載入前會先比對，知識庫與去識別化的 AI 偵測都一樣：手動放進去的執行庫會被拒絕。Intel 版 macOS 在這個版本沒有 ONNX Runtime 可用，會顯示「不支援」。
+
+**離線主機**：每個版本都附 `duduclaw-kb-model-multilingual-e5-small-<platform>.tar` 與它的 minisign 簽章檔 `.tar.minisig`，用自動更新信任的同一把發行金鑰簽署（`scripts/kb-model-bundle.sh <platform> <model> <dir>` 可為清單中的任何模型打包，設定 `KB_BUNDLE_MINISIGN_KEY` 會一併簽章）。兩個檔案不要解壓，一起放進 DuDuClaw 資料夾的 `models/embedding/`，再按**重新檢查（離線安裝）**。DuDuClaw 先驗簽章（也確認簽章寫的是這個檔名），通過後才讀取壓縮檔，只解出預期的一般檔案（遇到連結、其他路徑或多餘檔案就整包拒絕），接著逐檔比對固定的雜湊值、比對執行庫自己的雜湊，全部通過才算安裝完成，最後刪掉安裝包。沒有簽章、或不是這把金鑰簽的安裝包一律拒收。
+
+### 雲端供應商
+
+`provider = "openai"`（`text-embedding-3-small`，1,536 維）或 `"gemini"`（`gemini-embedding-001`，768 維）改由供應商端計算向量。規則：
+
+- 由管理員在儀表板選用，並且必須勾選確認：段落（去識別化之後）會送到該供應商與主機。這份確認（誰、何時、供應商、主機、連接埠、模型）存在 `config.toml`；還沒記錄連接埠的舊確認只涵蓋 443，其他連接埠的端點要重新確認；更換供應商、端點或模型都需要重新確認，改選其他方式則會移除這份確認。
+- 每一段與每個提問都先經過營運者的 `[redaction]` 規則，命中的內容換成 `[EMAIL]` 之類的標記，而且不會還原。去識別化被關閉或強制停用、規則編譯失敗、或根本沒有規則時：什麼都不送，搜尋維持只比對關鍵字。規則式去識別化抓不到所有人名；人名不能外流的話，請開啟 AI 偵測。
+- `restricted` 集合，以及 `embedding_policy = "local_only"` 的集合永遠不送；使用雲端供應商時，它們只用關鍵字搜尋。
+- `cloud_base_url` 必須是公開的 `https` 位址。內部網路、本機、link-local 或雲端中繼資料位址（`10.x`、`127.x`、`169.254.169.254`、`fc00::/7` 等）一律拒絕，除非管理員在設定檔進階編輯裡設 `allow_private_endpoint = true`；每次請求都會重新解析主機，連線固定在檢查過的位址。雲端向量一律直接連線，不使用 `HTTP_PROXY`／`HTTPS_PROXY`（經過代理伺服器時由代理自己解析主機，固定位址就失效）；只能透過代理上網的環境無法使用雲端供應商，請改用本機模型。供應商的 API 金鑰會送到設定的端點，端點不是供應商官方網址時，揭露對話框會特別提醒。
+- API 金鑰來自帳號清單（`cloud_account` 可指定單一帳號）或供應商的環境變數。雲端出錯時，該次搜尋只用關鍵字，受影響的來源會帶著 `embedding_failed` 警告，直到下一次補齊成功。
 
 ## AI 員工怎麼用
 
@@ -148,24 +171,41 @@ access_log_retention_days = 180
 max_collection_bytes = 2147483648 # 每個集合原檔總量 2 GB
 max_total_bytes = 21474836480     # 全部合計 20 GB
 extract_when_unavailable = "refuse"  # 或 "run_unsandboxed"
+
+[knowledge.embedding]
+provider = "local"                     # local | openai | gemini | none
+local_model = "multilingual-e5-small"  # 或 "qwen3-embedding-0.6b"
+cloud_model = ""                       # 空白 = 供應商的預設模型
+cloud_account = ""                     # 帳號 id；空白 = 該供應商的任一帳號，再退到環境變數
+cloud_base_url = ""                    # 空白 = 官方端點；只接受公開的 https
+allow_private_endpoint = false         # 限管理員：接受內部或本機端點（http 只允許連到 127.0.0.1）
+batch_size = 16
+threads = 0                            # 0 = 核心數的一半
+max_vector_rows = 200000
+idle_unload_minutes = 10
+# cloud_disclosure_ack 只由揭露對話框寫入；設定檔進階編輯不能新增或修改它
 ```
 
-超出範圍的值會被調回邊界。`enabled = false` 時工具不列出，所有 RPC 與上傳都會被拒絕。
+超出範圍的值會被調回邊界。`enabled = false` 時工具不列出，所有 RPC 與上傳都會被拒絕。不認得的 `provider` 值代表只用關鍵字搜尋，並附上原因。
+
+RPC：`knowledge.embedding.status`（任何已登入的使用者），以及只限管理員的 `.install {model}`、`.cancel`、`.remove {model}`、`.verify_offline {model}`、`.select {provider, local_model?, cloud_model?, cloud_account?, acknowledge_disclosure?}`、`.rebuild`。安裝、移除與更換供應商都會寫進 `security_audit.jsonl`。
 
 ## 檢查檢索品質
 
 ```
-duduclaw knowledge eval --docs <資料夾> --questions <題目.jsonl> [--k 5] [--min-recall 0.85] [--report out.json]
+duduclaw knowledge eval --docs <資料夾> --questions <題目.jsonl>
+  [--model none|local:multilingual-e5-small|local:qwen3-embedding-0.6b] [--model-home <目錄>]
+  [--modes keyword,vector,hybrid] [--k 5] [--min-recall 0.85] [--report out.json] [--work-dir <空目錄>]
 ```
 
-在暫存資料夾建一個一次性的資料庫，用和 gateway 相同的解析程序與索引方式匯入資料夾裡的文件，再回報各題型的 Recall@1／5／10、MRR@10、無解題得到空結果的比例，以及查詢延遲。Recall@k 低於 `--min-recall` 時結束碼為 1。題目每行長這樣：
+在暫存資料夾建一個一次性的資料庫，用和 gateway 相同的解析程序與索引方式匯入資料夾裡的文件，再回報各題型的 Recall@1／5／10、MRR@10、無解題得到空結果的比例，以及查詢延遲。使用 `local:` 模型（安裝在 DuDuClaw 資料夾底下，或用 `--model-home` 指定）時，每一段會先計算一次向量，報告另外列出每分鐘處理段落數、向量維度與記憶體峰值，並加上 `vector`（只用模型）與 `hybrid` 兩種模式。Recall@k 低於 `--min-recall` 時結束碼為 1。題目每行長這樣：
 
 ```json
 {"id":"q01","question":"到職滿一年的特休有幾天？","type":"factoid","gold":[{"source":"員工手冊.md","contains":"特別休假七日"}]}
 {"id":"q13","question":"公司有員工宿舍嗎？","type":"unanswerable","answerable":false}
 ```
 
-gold 也可以寫 `page`、`slide`、`sheet`、`row`。repo 裡的 `crates/duduclaw-knowledge/tests/fixtures/eval/` 有一份虛構的小題組；客戶的真實文件與題目請不要放進 repo。
+gold 也可以寫 `page`、`slide`、`sheet`、`row`。repo 裡有兩組虛構的題組：`crates/duduclaw-knowledge/tests/fixtures/eval/`（14 題）和 `eval-zh50/`（5 份文件、50 題，其中 8 題是和文件沒有共同詞語的換句話說）。在 `eval-zh50` 上（Apple M4，2026-10-22），Recall@5 的結果是：只用關鍵字 0.78、multilingual-e5-small 混合搜尋 0.96、Qwen3-Embedding-0.6B 混合搜尋 0.93，所以預設仍是 e5。客戶的真實文件與題目請不要放進 repo。
 
 ## 資料與刪除
 

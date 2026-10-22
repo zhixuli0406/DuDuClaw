@@ -14,6 +14,8 @@ fn viewer_ctx(agents: &[&str]) -> UserContext {
         role: UserRole::Employee,
         agent_access,
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

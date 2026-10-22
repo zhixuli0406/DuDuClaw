@@ -11,7 +11,7 @@
 //! | `sources.add` (paste / url) / `.delete` / `.reindex` | editor |
 //! | `search` / `passage.get` | viewer (human side only, no employee side) |
 //! | `access_log.list` | owner |
-//! | `embedding.status` | signed in |
+//! | `embedding.*` | see `embedding_rpc` (status: signed in; changes: Admin) |
 //!
 //! Admin counts as owner of every collection. A missing collection and one
 //! the caller may not see give the same "permission denied".
@@ -117,11 +117,19 @@ pub async fn handle(
         can_create: duduclaw_auth::acl::require_role(ctx, UserRole::Manager).is_ok(),
         cfg,
     };
+    if super::embedding_rpc::is_embedding_method(method) {
+        return Some(super::embedding_rpc::handle(home, method, params, ctx).await);
+    }
     if call.method == "knowledge.sources.add" {
         return Some(add_source(call).await.map_err(|e| message(&e)));
     }
     let wake = matches!(call.method.as_str(), "knowledge.sources.reindex");
-    let result = blocking(move || dispatch(call)).await;
+    let embedder = if call.method == "knowledge.search" {
+        Some(super::embedding::resolve(home).await)
+    } else {
+        None
+    };
+    let result = blocking(move || dispatch(call, embedder)).await;
     if wake && result.is_ok() {
         super::worker::notify();
     }
@@ -135,7 +143,7 @@ fn message(e: &KbError) -> String {
     e.public_message()
 }
 
-fn dispatch(call: Call) -> KbResult<Value> {
+fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embedder>>) -> KbResult<Value> {
     let mut conn = schema::open_home(&call.home)?;
     let p = &call.params;
     let u = &call.user;
@@ -244,7 +252,7 @@ fn dispatch(call: Call) -> KbResult<Value> {
             log_access(&conn, &access("reindex", u, Some(&src.collection_id)))?;
             Ok(json!({ "queued": true }))
         }
-        "knowledge.search" => search(&conn, &call),
+        "knowledge.search" => search(&conn, &call, embedder),
         "knowledge.passage.get" => passage(&conn, &call),
         "knowledge.access_log.list" => {
             let id = req(p, "collection_id")?;
@@ -266,13 +274,6 @@ fn dispatch(call: Call) -> KbResult<Value> {
             )?;
             Ok(json!({ "entries": rows }))
         }
-        "knowledge.embedding.status" => Ok(json!({
-            "provider": "none",
-            "available": false,
-            "mode": "keyword_only",
-            "reason": duduclaw_knowledge::embed::KEYWORD_ONLY_REASON,
-            "coverage": 0.0,
-        })),
         _ => Err(KbError::Invalid("未知的知識庫操作。".to_string())),
     }
 }
@@ -348,19 +349,22 @@ fn narrowing(p: &Value) -> Narrowing {
     }
 }
 
-fn search(conn: &Connection, call: &Call) -> KbResult<Value> {
+fn search(
+    conn: &Connection,
+    call: &Call,
+    embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embedder>>,
+) -> KbResult<Value> {
     let p = &call.params;
     let query = req(p, "query")?;
     let human = dashboard_human(&call.user);
     let allowed = acl::effective_collections(conn, &human, None, &narrowing(p))?;
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-    let r = duduclaw_knowledge::search::search(
-        conn,
-        &allowed,
-        query,
-        limit,
-        &duduclaw_knowledge::embed::NoEmbedder,
-    )?;
+    let embedder = embedder.unwrap_or_else(|| Arc::new(duduclaw_knowledge::embed::NoEmbedder));
+    let cache = super::embedding::cache(&call.home);
+    let r = duduclaw_knowledge::search::search(conn, &allowed, query, limit, embedder.as_ref(), &cache)?;
+    if let Some(reason) = &r.vector_unavailable {
+        super::embedding::warn_keyword_only(reason);
+    }
     let mut entry = access("search", &call.user, None);
     entry.query = Some(query.to_string());
     entry.allowed = allowed.ids().to_vec();

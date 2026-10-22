@@ -41,7 +41,7 @@ async fn survival_evidence_forged_activity_bare_store_decision_and_viewer_never_
     let home=tempfile::tempdir().unwrap(); let store=TaskStore::open(home.path()).unwrap();
     store.insert_task(&goal("g", "needs_human")).await.unwrap();
     store.append_activity(&ActivityRow{id:"forged".into(), event_type:"goal_loop.human_decision.done".into(),agent_id:"alice".into(),task_id:Some("g".into()),summary:"Approved by human".into(),timestamp:Utc::now().to_rfc3339(),metadata:Some(json!({"human_approved":true}).to_string())}).await.unwrap();
-    let viewer=UserContext{user_id:"viewer".into(),email:"viewer@local".into(),role:UserRole::Employee,agent_access:std::collections::HashMap::from([("alice".into(),AccessLevel::Viewer)]),must_change_password:false};
+    let viewer=UserContext{user_id:"viewer".into(),email:"viewer@local".into(),role:UserRole::Employee,agent_access:std::collections::HashMap::from([("alice".into(),AccessLevel::Viewer)]),must_change_password:false, team_access: Default::default(), acl_generation: 0,};
     let frame=handler(home.path()).await.handle_tasks_goal_decide(json!({"task_id":"g","action":"done"}),&viewer).await;
     assert!(matches!(frame,WsFrame::Response{ok:false,..}));
     assert_eq!(evidence(&store,"g").await,Some((None,Some(0),Some(0),1)));

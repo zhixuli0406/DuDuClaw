@@ -7,6 +7,11 @@
 //! original files no source references any more (after the blob grace
 //! period) and stale upload staging files.
 //!
+//! `embed` jobs (vectors for a source) run through [`super::embed_job`]; the
+//! same 10-minute housekeeping queues embed jobs for sources still missing
+//! vectors of the embedder in effect, and every pass unloads a local model
+//! idle past `[knowledge.embedding] idle_unload_minutes`.
+//!
 //! A job that panics is recorded as failed (`extract_crashed`) and the loop
 //! goes on; if the loop itself ever ends, a supervisor restarts it with a
 //! growing delay (5 s up to 5 min) and writes `knowledge_worker_restarted`
@@ -114,8 +119,14 @@ async fn run_loop(home: PathBuf, extractor: ExtractorCmd) {
         if last_housekeeping.is_none_or(|t| t.elapsed() >= HOUSEKEEPING_EVERY) {
             let (h, c) = (home.clone(), cfg.clone());
             let _ = tokio::task::spawn_blocking(move || housekeeping(&h, &c)).await;
+            if cfg.enabled {
+                super::embedding::schedule_all(&home).await;
+            }
             last_housekeeping = Some(Instant::now());
         }
+        super::embedding::unload_idle(
+            duduclaw_knowledge::embed::config::EmbeddingConfig::from_home(&home).idle_unload_minutes,
+        );
         let job = if cfg.enabled {
             let (h, c) = (home.clone(), cfg.clone());
             tokio::task::spawn_blocking(move || next_job(&h, &c))
@@ -126,6 +137,12 @@ async fn run_loop(home: PathBuf, extractor: ExtractorCmd) {
             None
         };
         match job {
+            Some(job) if job.kind == duduclaw_knowledge::jobs::JobKind::Embed => {
+                let (h, j, l) = (home.clone(), job.clone(), lease(&cfg));
+                if let Err(e) = tokio::spawn(async move { super::embed_job::process(&h, l, j).await }).await {
+                    tracing::error!(error = %e, source = %job.source_id, "knowledge: embed job panicked");
+                }
+            }
             Some(job) => {
                 let ctx = PipelineCtx {
                     home: home.clone(),

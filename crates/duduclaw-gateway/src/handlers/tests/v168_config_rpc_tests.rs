@@ -33,6 +33,8 @@ fn owner_of_a1() -> UserContext {
         role: duduclaw_auth::models::UserRole::Employee,
         agent_access: [("a1".to_string(), AccessLevel::Owner)].into_iter().collect(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 
@@ -55,7 +57,22 @@ async fn handler_with_agent() -> (tempfile::TempDir, MethodHandler) {
     ok(&handler
         .handle_agents_create_as(json!({ "name": "a1", "display_name": "A1" }), Some(&admin()))
         .await);
+    register_accounts(home.path());
     (home, handler)
+}
+
+/// `agents.update` re-reads the caller from `users.db` (owner decision D7),
+/// so the contexts above exist there with the same ids, roles and binding.
+fn register_accounts(home: &Path) {
+    let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+    for (id, role) in [("admin-1", UserRole::Admin), ("owner-7", UserRole::Employee)] {
+        let u = db.create_user(&format!("{id}@example.invalid"), id, "isolated-test-password", role).unwrap();
+        rusqlite::Connection::open(home.join("users.db"))
+            .unwrap()
+            .execute("UPDATE users SET id=?1 WHERE id=?2", rusqlite::params![id, u.id])
+            .unwrap();
+    }
+    db.bind_agent("owner-7", "a1", AccessLevel::Owner).unwrap();
 }
 
 // ── system.update_config ─────────────────────────────────────────────────────
@@ -382,7 +399,9 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
                 "night_engine": { "enabled": true },
                 "runtime": { "fallback": "qwen", "minimal_context": false },
                 "utility": "",
-                "advanced_kv": [{ "section": "prompt", "key": "cli_bare_mode", "value": true, "type": "boolean" }],
+                // `[prompt]` left the key/value editor (it holds the admin-only
+                // `cli_bare_mode`); the typed `prompt` object still writes it.
+                "prompt": { "cli_bare_mode": true },
             }),
             &admin(),
         )
@@ -410,13 +429,13 @@ async fn kv_type_mismatch_is_refused_and_the_employee_keeps_loading() {
     let e = err(&handler
         .handle(
             "agents.update",
-            json!({ "agent_id": "a1", "advanced_kv": [{ "section": "prompt", "key": "cli_bare_mode", "value": "true", "type": "string" }] }),
+            json!({ "agent_id": "a1", "advanced_kv": [{ "section": "heartbeat", "key": "enabled", "value": "true", "type": "string" }] }),
             &admin(),
         )
         .await);
     assert!(e.contains("line") && e.contains("agent.toml"), "{e}");
     let raw = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap();
-    assert!(!raw.contains("cli_bare_mode"));
+    assert!(!raw.contains("enabled = \"true\""));
 }
 
 // ── inference.update ─────────────────────────────────────────────────────────
@@ -699,4 +718,44 @@ async fn tick_source_upsert_appends_without_touching_other_tables() {
     assert!(out.contains("# trailing comment at end\n"), "{out}");
     let t: toml::Table = out.parse().unwrap();
     assert_eq!(t["tick"]["sources"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn raw_editor_cannot_forge_or_change_the_embedding_disclosure_record() {
+    let home = tempfile::tempdir().unwrap();
+    let ack = "[knowledge.embedding]\nprovider = \"openai\"\n\n[knowledge.embedding.cloud_disclosure_ack]\nby = \"admin-1\"\nat = \"2026-10-22T00:00:00Z\"\nprovider = \"openai\"\nhost = \"api.openai.com\"\nmodel = \"text-embedding-3-small\"\n";
+    std::fs::write(home.path().join("config.toml"), "[general]\nname = \"x\"\n").unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    // Adding a record by hand is refused and nothing is written.
+    let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
+    let forged = format!("{}\n{ack}", got["content"].as_str().unwrap());
+    let e = err(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": forged, "base_hash": got["hash"] }), &admin())
+        .await);
+    assert!(e.contains("cloud_disclosure_ack"), "{e}");
+    assert!(config(home.path()).get("knowledge").is_none());
+
+    // A record written by the dialog: other edits pass, changing it is
+    // refused, removing it is allowed (cloud embedding just stops).
+    std::fs::write(home.path().join("config.toml"), format!("[general]\nname = \"x\"\n\n{ack}")).unwrap();
+    let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
+    let content = got["content"].as_str().unwrap().to_string();
+    let renamed = content.replace("name = \"x\"", "name = \"y\"");
+    ok(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": renamed, "base_hash": got["hash"] }), &admin())
+        .await);
+    let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
+    let content = got["content"].as_str().unwrap().to_string();
+    let moved = content.replace("host = \"api.openai.com\"", "host = \"evil.example.com\"");
+    let e = err(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": moved, "base_hash": got["hash"] }), &admin())
+        .await);
+    assert!(e.contains("cloud_disclosure_ack"), "{e}");
+    let start = content.find("[knowledge.embedding.cloud_disclosure_ack]").unwrap();
+    let removed = content[..start].to_string();
+    ok(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": removed, "base_hash": got["hash"] }), &admin())
+        .await);
+    assert!(config(home.path())["knowledge"]["embedding"].get("cloud_disclosure_ack").is_none());
 }
