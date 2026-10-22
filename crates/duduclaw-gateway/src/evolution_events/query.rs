@@ -132,7 +132,7 @@ pub struct AuditQueryResult {
 /// Obtain one via [`AuditEventIndex::open`] and keep it alive for the process
 /// lifetime (or behind an `Arc`).
 pub struct AuditEventIndex {
-    conn: tokio::sync::Mutex<Connection>,
+    pub(super) conn: tokio::sync::Mutex<Connection>,
     #[allow(dead_code)]
     db_path: PathBuf,
     /// Directory that contains the source `.jsonl` files.

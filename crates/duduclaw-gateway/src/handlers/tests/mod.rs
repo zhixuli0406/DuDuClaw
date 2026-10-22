@@ -34,6 +34,7 @@ mod chat_history_row_content_and_artifact_tests;
 mod runs_tests;
 mod timeline_tests;
 mod skills_install_scan_tests;
+mod skills_manage_rpc_tests;
 mod d6_curation_tests;
 mod channels_add_enc_only_tests;
 mod channels_test_rpc_tests;

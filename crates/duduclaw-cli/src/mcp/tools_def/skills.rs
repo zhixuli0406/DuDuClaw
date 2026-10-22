@@ -36,10 +36,10 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "skill_list",
-        description: "List all skills installed for a specific agent",
+        description: "List the skills an agent loads (company-wide, department and own; skills switched off for that agent are not listed)",
         params: &[ParamDef {
             name: "agent_id",
-            description: "Agent name (default: main agent)",
+            description: "Agent name (default: the calling agent, else the main agent)",
             required: false,
         }],
     },

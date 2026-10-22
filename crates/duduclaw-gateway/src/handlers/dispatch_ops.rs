@@ -188,8 +188,22 @@ impl MethodHandler {
             // ── Shared Skills (open to all authenticated) ───
             "skills.leaderboard" => self.handle_skills_leaderboard(params).await,
             "skills.shared" => self.handle_skills_shared_list().await,
-            "skills.share" => self.handle_skills_share(params).await,
-            "skills.adopt" => self.handle_skills_adopt(params).await,
+            // B8: sharing copies from an employee and adopting writes into
+            // one — both need Owner of that employee (or admin), read live.
+            "skills.share" => {
+                let agent = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Err(e) = crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, agent, AccessLevel::Owner) {
+                    return WsFrame::error_response("", &e);
+                }
+                self.handle_skills_share(params).await
+            }
+            "skills.adopt" => {
+                let agent = params.get("target_agent_id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Err(e) = crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, agent, AccessLevel::Owner) {
+                    return WsFrame::error_response("", &e);
+                }
+                self.handle_skills_adopt(params).await
+            }
 
             // ── Custom skills (human × agent authored; V13-T13.0) ───
             // create/update/submit/list are open to any logged-in user (the

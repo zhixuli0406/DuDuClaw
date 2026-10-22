@@ -88,6 +88,8 @@ mod wiki_rpc;
 mod shared_wiki_rpc;
 mod search_rpc;
 mod skills_rpc;
+mod skills_list_rpc;
+mod skills_manage_rpc;
 mod skills_install_request;
 mod skills_custom;
 mod cron_rpc;

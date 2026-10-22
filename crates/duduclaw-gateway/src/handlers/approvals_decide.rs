@@ -645,11 +645,15 @@ impl MethodHandler {
         let mut targets: Vec<(std::path::PathBuf, &'static str, String)> =
             vec![(self.home_dir.join("skills"), "global", String::new())];
         if let Ok(rd) = std::fs::read_dir(self.home_dir.join("agents")) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    let agent = entry.file_name().to_string_lossy().to_string();
-                    targets.push((entry.path().join("SKILLS"), "agent", agent));
-                }
+            let mut agent_dirs: Vec<(String, std::path::PathBuf)> = rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+                .collect();
+            // B8: stable order regardless of `read_dir`.
+            agent_dirs.sort();
+            for (agent, path) in agent_dirs {
+                targets.push((path.join("SKILLS"), "agent", agent));
             }
         }
 
@@ -672,11 +676,18 @@ impl MethodHandler {
             }
         }
 
+        // B8: ties broken by (scope, owner, skill) so equal estimates keep
+        // one order across calls and restarts.
         rows.sort_by(|a, b| {
-            b["estimated_minutes_saved"]
-                .as_u64()
-                .unwrap_or(0)
-                .cmp(&a["estimated_minutes_saved"].as_u64().unwrap_or(0))
+            let mins = |v: &Value| v["estimated_minutes_saved"].as_u64().unwrap_or(0);
+            let key = |v: &Value| {
+                (
+                    v["scope"].as_str().unwrap_or("").to_string(),
+                    v["owner"].as_str().unwrap_or("").to_string(),
+                    v["skill"].as_str().unwrap_or("").to_string(),
+                )
+            };
+            mins(b).cmp(&mins(a)).then_with(|| key(a).cmp(&key(b)))
         });
         rows.truncate(limit);
         WsFrame::ok_response(
