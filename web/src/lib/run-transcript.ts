@@ -4,9 +4,10 @@
  *
  * Honesty contract (mirrors the gateway): the persisted per-run record is
  * session text turns + MCP tool-call receipts + (since the run_steps.db
- * upgrade) CLI-native tool steps and TodoWrite board snapshots. Thinking
- * summaries are still live-only — the gateway reports them under
- * `not_persisted` and the UI states that instead of faking events.
+ * upgrade) CLI-native tool steps and TodoWrite board snapshots, plus one
+ * `thinking` row per turn that thought (seconds and tokens only). Thinking
+ * text is live-only — the gateway reports it under `not_persisted` and the
+ * UI states that instead of faking events.
  */
 
 export type RunStatus = 'completed' | 'running' | 'no_reply';
@@ -59,7 +60,20 @@ export type TranscriptCard =
   | { type: 'prose'; role: 'user' | 'assistant'; ts: string; text: string }
   | { type: 'tool'; tool: string; ok: boolean; ts: string; preview: string }
   | { type: 'step'; tool: string; ts: string; preview: string }
-  | { type: 'todo'; label: string; ts: string; preview: string };
+  | { type: 'todo'; label: string; ts: string; preview: string }
+  | { type: 'thinking'; seconds: number | null; tokens: number | null; ts: string; preview: string };
+
+/**
+ * Seconds and tokens from a `thinking` row's preview (`思考 8 秒 · 1,240
+ * token`, written by the gateway). Pure — exported for tests. A preview in
+ * any other shape yields nulls, and the caller shows the raw preview.
+ */
+export function parseThinkingPreview(preview: string): { seconds: number | null; tokens: number | null } {
+  const m = /(\d+)\s*秒(?:\s*·\s*([\d,]+)\s*token)?/u.exec(preview);
+  if (!m) return { seconds: null, tokens: null };
+  const tokens = m[2] ? Number(m[2].replace(/,/g, '')) : null;
+  return { seconds: Number(m[1]), tokens: tokens !== null && Number.isFinite(tokens) ? tokens : null };
+}
 
 /**
  * Shape raw events into transcript cards. Defensive: events with unknown
@@ -88,6 +102,10 @@ export function cardsForEvents(events: readonly RunEvent[]): TranscriptCard[] {
       // TodoWrite board snapshot — label is "done/total", preview the
       // already-rendered board text.
       cards.push({ type: 'todo', label: e.label, ts: e.ts, preview: e.preview ?? '' });
+    } else if (e.kind === 'thinking') {
+      // One row per turn: seconds and tokens only — the text is never stored.
+      const preview = e.preview ?? '';
+      cards.push({ type: 'thinking', ...parseThinkingPreview(preview), ts: e.ts, preview });
     }
     // Unknown kinds: skipped on purpose.
   }

@@ -110,6 +110,19 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **審査依頼：** 種類 `agent_file_change`。現在も管理者である人がダッシュボードでのみ判断でき、期限は 3 日（期限切れは拒否扱い）。チャネルにはボタンのない通知だけが届きます。提案された内容は依頼が終わるまで `<home>/agent_file_pending/` に保存されます。承認時はまず適用し、待っている間にファイルが変わっていた場合は拒否され、依頼者が送り直す必要があります。
 - **監査：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（記録するのはハッシュだけで、内容は記録しません）。
 
+## 思考の表示
+
+専用の項目はまだないため、下の設定ファイルの詳細編集で設定します。どちらのファイルも毎ターン読み直すので、変更は次の返信から有効です。
+
+| ファイル | キー | 値 |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary`（既定：WebChat でタイマー、トークン、伏せ字処理済みの思考の文章）、`status`（タイマーとトークンのみ）、`off`（思考フレームを送らない。WebChat 自身のタイマーは残る） |
+| `config.toml` | `[thinking] max_chars` | 1 ターンの思考の文章の上限。既定 4000、200–20000 に収める |
+| `config.toml` | `[thinking] anthropic_display` | `summarized`（既定）または `updates`（ベータ、一部の Claude モデルのみ） |
+| `agent.toml` | `[model] show_thinking` | `summary`／`status`／`off`。未設定なら `[thinking] display` に従う。厳しい方が適用される |
+
+読めない・解析できない `config.toml`、または解釈できない `display` の値は `status` として扱います。思考の文章が見えるのはダッシュボードにサインインした WebChat 利用者だけで、メッセージアプリには届きません。詳細は[思考の表示](../../features/ja-JP/64-thinking-display.md)。
+
 ## 設定ファイルの詳細編集
 
 場所：システム設定 → 詳細設定 → 設定ファイルの詳細編集。管理者だけに表示され、RPC は `config.raw.get` / `config.raw.set` です。

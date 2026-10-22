@@ -6,7 +6,14 @@ import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { LayoutGrid } from 'lucide-react';
 import { Button, SubmitButton } from '@/components/mds';
-import { MessageBubble, TypingIndicator, TaskInsights, useChatFace } from '@/components/chat';
+import {
+  MessageBubble,
+  ThinkingSection,
+  ThinkingStatus,
+  TaskInsights,
+  splitTurnMessages,
+  useChatFace,
+} from '@/components/chat';
 import { DuDu } from '@/components/mascot';
 import { ChatArtifactCard } from '@/components/console';
 
@@ -57,6 +64,7 @@ export function OperatorConsolePage() {
     messages,
     steps,
     stepTree,
+    thinking,
     isStreaming,
     phase,
     connectionState,
@@ -89,11 +97,10 @@ export function OperatorConsolePage() {
 
   const face = useChatFace(phase, input.trim().length > 0, messages.length > 0);
   const empty = messages.length === 0;
-  const insightsVisible = stepTree.length > 0 || steps.length > 0;
-
-  const last = messages[messages.length - 1];
-  const streamingAssistant = isStreaming && last?.role === 'assistant' && last.tokens == null ? last : null;
-  const priorMessages = streamingAssistant ? messages.slice(0, -1) : messages;
+  // The current turn's reply (streaming, or finished with its thinking) sits
+  // below the step tree and thinking line.
+  const { prior: priorMessages, streamingAssistant, turnReply } = splitTurnMessages(messages, isStreaming);
+  const insightsVisible = stepTree.length > 0 || steps.length > 0 || turnReply !== null;
 
   const leadingAvatar = <DuDu face="idle" size={26} animated={false} label="DuDu" />;
 
@@ -194,16 +201,35 @@ export function OperatorConsolePage() {
             <>
               {priorMessages.map((msg) => (
                 <div key={msg.id} className="space-y-2">
+                  {msg.role === 'assistant' && msg.thinking && (
+                    <div className="pl-[34px]">
+                      <ThinkingSection thinking={msg.thinking} compact />
+                    </div>
+                  )}
                   <MessageBubble message={msg} leading={msg.role === 'assistant' ? leadingAvatar : undefined} />
                   {msg.artifact && <ChatArtifactCard artifact={msg.artifact} />}
                 </div>
               ))}
 
-              {insightsVisible && <TaskInsights tree={stepTree} todos={steps} streaming={isStreaming} />}
+              {insightsVisible && (
+                <TaskInsights
+                  tree={stepTree}
+                  todos={steps}
+                  streaming={isStreaming}
+                  thinking={turnReply?.thinking ?? null}
+                />
+              )}
 
               {streamingAssistant && <MessageBubble message={streamingAssistant} leading={leadingAvatar} />}
 
-              {isStreaming && !streamingAssistant && <TypingIndicator />}
+              {turnReply && (
+                <div className="space-y-2">
+                  <MessageBubble message={turnReply} leading={leadingAvatar} />
+                  {turnReply.artifact && <ChatArtifactCard artifact={turnReply.artifact} />}
+                </div>
+              )}
+
+              {isStreaming && !streamingAssistant && <ThinkingStatus thinking={thinking} stepTree={stepTree} />}
             </>
           )}
 

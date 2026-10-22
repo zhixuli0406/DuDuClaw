@@ -110,6 +110,19 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
+## 思考過程顯示
+
+目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。
+
+| 檔案 | 設定鍵 | 值 |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary`（預設：WebChat 顯示計時、token 與遮蔽後的思考文字）、`status`（只有計時與 token）、`off`（不送思考訊框；WebChat 自己的計時仍在） |
+| `config.toml` | `[thinking] max_chars` | 每輪思考文字上限，預設 4000，限制在 200–20000 |
+| `config.toml` | `[thinking] anthropic_display` | `summarized`（預設）或 `updates`（beta，只有部分 Claude 模型支援） |
+| `agent.toml` | `[model] show_thinking` | `summary`／`status`／`off`；不設定就跟隨 `[thinking] display`。兩者取較嚴格的 |
+
+`config.toml` 讀不到、解析失敗，或 `display` 值看不懂，都當成 `status`。只有登入 dashboard 的 WebChat 使用者看得到思考文字，通訊軟體永遠看不到。細節見[思考過程顯示](../../features/zh-TW/64-thinking-display.md)。
+
 ## 設定檔進階編輯
 
 位置：系統設定 → 進階設定 → 設定檔進階編輯。只有管理員看得到，RPC 是 `config.raw.get` / `config.raw.set`。

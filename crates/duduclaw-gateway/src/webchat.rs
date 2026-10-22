@@ -199,6 +199,11 @@ pub enum ChatMessage {
         /// That employee's display name, for the reply label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
+        /// What this turn's `thinking` frames amounted to (tokens, number of
+        /// blocks, final kinds; never text). Absent when no `thinking` frame
+        /// was sent this turn — always for a public-widget visitor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<crate::thinking::DoneMeta>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -1165,6 +1170,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             artifact: None,
                                             agent: None,
                                             agent_name: None,
+                                            thinking: None,
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1218,6 +1224,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // (ProgressEvent::ModelInfo) — stamped onto the
                                 // assistant_done frame below.
                                 let mut actual_model: Option<String> = None;
+                                // Summary of the thinking frames actually sent,
+                                // stamped onto the assistant_done frame below.
+                                let mut thinking_meta = crate::thinking::DoneMetaBuilder::default();
                                 let reply = loop {
                                     tokio::select! {
                                         r = &mut work => break r,
@@ -1249,11 +1258,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 // turn's thinking sink; widget visitors get
                                                 // nothing at all.
                                                 ProgressEvent::Thinking(t) => {
-                                                    match thinking_frame(
-                                                        t,
-                                                        conv_nonce.clone(),
-                                                        is_widget_visitor(&auth_user),
-                                                    ) {
+                                                    let widget = is_widget_visitor(&auth_user);
+                                                    if !widget {
+                                                        thinking_meta.observe(&t);
+                                                    }
+                                                    match thinking_frame(t, conv_nonce.clone(), widget) {
                                                         Some(frame) => frame,
                                                         None => continue,
                                                     }
@@ -1399,6 +1408,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     artifact: operator_artifact,
                                     agent: answered_by.as_ref().map(|a| a.id.clone()),
                                     agent_name: answered_by.map(|a| a.display_name),
+                                    thinking: thinking_meta.build(),
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if !guarded.still_valid().await {
@@ -1935,6 +1945,11 @@ mod tests {
             artifact: None,
             agent: Some("finance".into()),
             agent_name: Some("財務小幫手".into()),
+            thinking: Some(crate::thinking::DoneMeta {
+                tokens: Some(1240),
+                blocks: 1,
+                kinds: vec!["summary".into()],
+            }),
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(
@@ -1949,6 +1964,10 @@ mod tests {
             json.contains(r#""agent":"finance""#) && json.contains("財務小幫手"),
             "the answering employee must be on the wire: {json}"
         );
+        assert!(
+            json.contains(r#""thinking":{"tokens":1240,"blocks":1,"kinds":["summary"]}"#),
+            "thinking summary must be on the wire: {json}"
+        );
 
         // Without a nonce, `conv` is omitted entirely (old-client compatible).
         let without = ChatMessage::AssistantDone {
@@ -1959,6 +1978,7 @@ mod tests {
             artifact: None,
             agent: None,
             agent_name: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(
@@ -1972,6 +1992,10 @@ mod tests {
         assert!(
             !json.contains("artifact"),
             "absent artifact must not serialize: {json}"
+        );
+        assert!(
+            !json.contains("thinking"),
+            "absent thinking must not serialize: {json}"
         );
     }
 
@@ -1993,6 +2017,7 @@ mod tests {
             artifact: Some(artifact.clone()),
             agent: None,
             agent_name: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&done).expect("serialize");
         assert!(
