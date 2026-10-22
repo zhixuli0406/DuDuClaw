@@ -28,7 +28,7 @@ Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）�
 
 - Agent 把 **agent 結構檔**（`agent.toml`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`…）寫到正規的 `<home>/agents/<name>/` 樹之外。開新 agent 只能走 `create_agent` MCP 工具，那條路帶著委派授權閘；
 - Agent 寫**自己的 `SOUL.md`**，即使位置正確也擋。人格由操作者管理。這個 hook 沒有開放選項：在 `agent.toml [permissions] can_modify_own_soul = true` 明確開啟的 agent，只能透過 `agent_update_soul` MCP 工具改自己的 `SOUL.md`，不能直接寫檔；
-- Agent 寫**自己的 `CONTRACT.toml`**，即使位置正確也擋（判定 `BlockedOwnContractWrite`）。契約是操作者給 agent 的界線，所以完全沒有開放旗標；擋下時的訊息會請 agent 去找操作者，由操作者在儀表板修改（`contract.update`，僅限管理者，不經過這個 hook）；
+- Agent 寫**自己的 `CONTRACT.toml`**，即使位置正確也擋（判定 `BlockedOwnContractWrite`）。契約是操作者給 agent 的界線，所以完全沒有開放旗標；擋下時的訊息會請 agent 去找操作者，由操作者在儀表板修改（`contract.update`，員工的負責人或管理員，經過嚴格檢查，不經過這個 hook）；
 - Agent 動**別的 agent** 的檔案，一律擋；
 - Agent 寫入 **DuDuClaw 資料目錄**裡的其他任何位置。對帶員工身分（或宣稱的身分驗證失敗）的呼叫者，資料目錄底下能寫的只有自己的 agent 目錄與共用的 `attachments/`。這是允許清單，所以涵蓋稽核紀錄（`tool_calls.jsonl`，佐證檢查、判官摘要與近期行動摘要都讀它）、`evals/`（含留出集與其他員工的評測集）、所有 SQLite 資料庫、斷路器狀態、授權與組織檔、全域 `skills/` 與共用 wiki，日後新增的資料也一開始就受保護。這些資料的正當寫入者是 gateway 與受閘控的 MCP 工具，都不經過這個 hook。只有沒有員工身分的呼叫者不受影響，也就是 hook 指令沒帶 `--agent`、環境裡也沒有 `DUDUCLAW_AGENT_ID`。安裝的 hook 指令一定帶 `--agent`，hook 也優先採用它，所以操作者在某位員工的目錄裡手動執行 `claude`，會以該員工的身分被判斷（要求身分權杖的模式下，則是身分驗證失敗的呼叫者）。操作者要改這些檔案，請用儀表板，或直接用編輯器改；
 - 寫入目標是指向上述被擋位置的**符號連結**。Write／Edit 的路徑會判斷兩次：照字面一次、解析到實際落點一次（跟隨連結與連結之後的 `..`；懸空連結一律拒絕），任一次擋下就擋。相對路徑以 hook 輸入裡的工作目錄解析，輸入沒有工作目錄時以員工自己的目錄解析。無法確認實際落點的路徑一律拒絕，訊息為「無法確認這次寫入實際會落在哪裡」；
@@ -195,6 +195,16 @@ action_rules = [
 ## 用 @ 呼叫員工依發話者權限判斷（v1.76）
 
 v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的子字串比對：只綁定一位員工的 WebChat 帳號打別人的觸發詞就能叫到別人，任何 LINE 好友也一樣。現在先解析發話的真人（WebChat 用 dashboard 帳號；通訊軟體用**已驗證**的 `channel_identities`，沒有就視為未綁定），只在這個人叫得到的員工裡比對：管理員全部；每個人都叫得到這個對話的預設員工，以及 `[channels] public_trigger = true` 的員工（只有管理員能改，員工自己改不了）；dashboard 帳號與綁定了帳號的通訊軟體使用者另外加上綁定的員工。叫其他員工會在呼叫模型前被拒絕，並以 `trigger_route_refused` 記進 `security_audit.jsonl`（記帳號，或以這台機器的金鑰 `trigger_audit.key` 算出的平台 ID HMAC）。停用中的帳號，綁定不再算數。任何查詢失敗都當成未綁定處理。被叫來的員工在自己的 session 回答，對話紀錄與機密不會在員工之間混用；但在群組裡，回答仍是所有成員都看得到。細節見[用 @ 呼叫 AI 員工](62-calling-ai-staff.md)。
+
+## dashboard 權限每次呼叫即時讀取（v1.76）
+
+v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角色與員工綁定，access token 又有 30 分鐘效期，所以拿掉綁定、降級或停權，要等對方下次登入才生效。現在 RPC 派送的單一入口每次呼叫都從 `users.db` 重建呼叫者的身分；token 只用來證明「是誰」。角色、直接綁定、必須改密碼的旗標，以及下面的主管關係推導，全部以資料庫為準。任何會改到這些的寫入（綁定、解綁、改角色或密碼、改狀態、改主管、通道身分、改 email、離職）都會在同一個交易裡把計數器（`auth_meta.acl_generation`）加一，每次呼叫的快取以這個計數器為鍵，所以快取的結果不會比最後一次這類寫入還舊。帳號不存在或不是在職狀態，回 `account is suspended or offboarded`；讀不到資料庫時這次呼叫回 `authentication service unavailable`，不沿用 token 裡的任何東西，`system.doctor` 會顯示啟動後發生過幾次。資料庫讀取和登入的密碼檢查都在 blocking 執行緒池跑，一陣登入不會拖慢其他連線的呼叫。閘道管理 token（`system`）與鎖定畫面連線不變。
+
+帳號現在可以有一位直屬主管（`users.manager_user_id`，只有多人團隊版，經 `users.create`／`users.update` 設定）。同一次 `users.create`／`users.update` 的所有欄位在一個交易裡寫入，主管或降級被擋時，這次請求的其他修改也不會套用。寫入會擋下繞成一圈（`manager_cycle`）、一條主管鏈超過 8 個人（含最上層，`manager_too_deep`）、主管角色低於主管或不在職（`manager_role`、`manager_inactive`）；還有直屬部屬的人不能降成員工（`manager_has_reports`）；離職時部屬改掛 `transfer_to` 或離職者的主管，每一筆以 `user.reparent` 記稽核；轉給 `transfer_to` 的綁定，若對方原本就綁了同一位員工，保留兩者中較高的等級。系統會算出主管可以碰到部屬綁定的員工（最高 Operator），但這一版還沒有任何地方用到：路由、`agents.list` 與 Operator 等級的 RPC（記憶、對話紀錄、設定）仍然只看直接綁定。
+
+## 人修改 AI 員工設定檔（未發布）
+
+人格設定、自我介紹、工作規則、行為界線（`SOUL.md`、`IDENTITY.md`、`INSTRUCTIONS.md`、`CONTRACT.toml`）可以由員工的負責人與管理員在儀表板修改，每次存檔都先檢查再生效（拍板 D7）。誰能寫，每次呼叫都從 `users.db` 重新讀取，寫入前在檔案鎖內再讀一次，所以檢查進行中被解除綁定也會擋下寫入。先跑固定規則（大小與控制字元、嚴格解析行為界線、隱藏或看不見的內容、新增文字裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪掉某條）。接著由部署的輔助模型看差異：被改的文字包在帶隨機 nonce 的標籤裡、先去掉隱藏內容，回覆必須完全符合固定格式。模型只能讓結果更嚴。檢查沒完成至少算警告，不會當成通過，也不能關掉。非管理員遇到高風險只能送管理員審核（`agent_file_change`，只能在儀表板決定，通道只收沒有按鈕的通知）。這個檢查看的是人送出的內容，`agent-file-guard` 照舊擋員工自己寫這些檔。每次寫入都在員工資料夾外留版本並寫 `agent_file_changed`，被拒絕寫 `agent_file_change_refused`。INSTRUCTIONS.md 現在和 SOUL.md 一樣有自己的核可指紋。同一版也擴大只限管理員的 `agent.toml` 欄位（bot token、`[odoo]`、`[runtime] provider`／`fallback`、`[prompt] cli_bare_mode`、`[os_watch]`、`[model] account_pool`、`role = "main"`、放寬預算），見[儀表板設定](../../guides/zh-TW/dashboard-settings.md#設定檔未發布)。
 
 ## 支撐層
 

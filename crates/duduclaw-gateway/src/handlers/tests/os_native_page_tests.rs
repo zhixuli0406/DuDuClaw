@@ -409,7 +409,9 @@ async fn os_settings_update_remaps_and_writes_footprint() {
             "footprint": true,
             "frontmost_poll_secs": 45,
             "proactive": { "enabled": true, "base_threshold": 4 },
-        }), None)
+        // `[os_watch]` is admin-only (`agent_authority`); the route itself is
+        // admin-gated, so production always passes the admin caller.
+        }), Some(&UserContext::admin_fallback()))
         .await;
     assert!(
         frame_ok(&frame),
@@ -511,6 +513,8 @@ fn manager_ctx() -> UserContext {
         role: UserRole::Manager,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

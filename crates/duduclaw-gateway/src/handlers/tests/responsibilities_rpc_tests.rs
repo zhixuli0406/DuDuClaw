@@ -23,6 +23,8 @@ fn user_ctx(r: &Rig, agent: &str, level: AccessLevel, role: UserRole) -> UserCon
         role,
         agent_access,
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

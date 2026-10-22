@@ -122,6 +122,7 @@ impl MethodHandler {
             forward_model: RwLock::new(None),
             tick_hub: RwLock::new(None),
             tick_runtime: tokio::sync::Mutex::new(None),
+            live_ctx_cache: Arc::new(live_context::LiveContextCache::default()),
         }
     }
 

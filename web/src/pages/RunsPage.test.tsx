@@ -154,3 +154,31 @@ describe('RunsPage — selected run as URL (P11)', () => {
     });
   });
 });
+
+// ── Thinking rows: seconds and tokens only (the text is never stored) ─────────
+
+describe('RunsPage — thinking step', () => {
+  it('renders a thinking row as localized seconds + tokens', async () => {
+    mockWsClient.call.mockImplementation((method: string) =>
+      method === 'runs.get'
+        ? Promise.resolve({
+            ...RUN_DETAIL,
+            events: [
+              {
+                kind: 'thinking',
+                label: 'thinking',
+                seq: 0,
+                ts: '2026-08-12T00:00:01Z',
+                preview: '思考 8 秒 · 1,240 token',
+              },
+            ],
+          })
+        : Promise.resolve({ runs: [], agents: AGENTS }),
+    );
+    renderAt('/runs?run=run-42');
+    const row = await screen.findByTestId('run-thinking-row');
+    expect(row).toHaveTextContent('Thought for 8s · ~1.2k tokens');
+    // Nothing to expand: no <details> around it.
+    expect(row.closest('details')).toBeNull();
+  });
+});

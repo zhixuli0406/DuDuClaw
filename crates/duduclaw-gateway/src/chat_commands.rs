@@ -670,9 +670,14 @@ async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str
                         return format!("⚠️ {e}");
                     }
                     let target = name.to_string();
-                    match crate::channel_reply::update_agent_toml_with(
+                    match crate::channel_reply::update_agent_toml_edit(
                         &ctx.registry,
                         &resolved_id,
+                        crate::channel_reply::AgentTomlEdit {
+                            source: "chat.model",
+                            user_id: "channel",
+                            guard: || Ok(()),
+                        },
                         move |table| {
                             let model = table
                                 .entry("model")

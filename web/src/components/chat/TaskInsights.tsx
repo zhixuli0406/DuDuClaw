@@ -16,7 +16,8 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import type { ChatStep, StepNode } from '@/stores/chat-store';
+import type { ChatStep, StepNode, TurnThinking } from '@/stores/chat-store';
+import { ThinkingSection } from './ThinkingSection';
 
 /** Tool name → icon. Keeps the tree scannable at a glance. */
 function iconForTool(tool: string): LucideIcon {
@@ -80,15 +81,21 @@ function StepRow({ node, runningLabel, doneLabel }: { node: StepNode; runningLab
  * tools), and lists any task-board (`todo`) progress below it. Sits above the
  * in-progress assistant reply while streaming; once the reply lands it collapses
  * but stays expandable.
+ *
+ * `thinking` (a finished turn's thinking) heads the same box as a
+ * "thought for N s" line that stays visible when the steps collapse. A turn
+ * with thinking but no steps renders just that line.
  */
 export function TaskInsights({
   tree,
   todos,
   streaming,
+  thinking,
 }: {
   tree: readonly StepNode[];
   todos: readonly ChatStep[];
   streaming: boolean;
+  thinking?: TurnThinking | null;
 }) {
   const intl = useIntl();
   const [open, setOpen] = useState(true);
@@ -104,13 +111,19 @@ export function TaskInsights({
   }, [streaming]);
 
   const total = tree.length + todos.length;
-  if (total === 0) return null;
+  if (total === 0 && !thinking) return null;
 
   const runningLabel = intl.formatMessage({ id: 'chat.insights.running', defaultMessage: 'In progress' });
   const doneLabel = intl.formatMessage({ id: 'chat.insights.done', defaultMessage: 'Done' });
 
   return (
     <div className="rounded-xl border border-surface-border bg-surface p-3">
+      {thinking && (
+        <div className={cn(total > 0 && 'mb-2 border-b border-border pb-2')}>
+          <ThinkingSection thinking={thinking} />
+        </div>
+      )}
+      {total > 0 && (
       <button
         type="button"
         onClick={() => {
@@ -127,8 +140,9 @@ export function TaskInsights({
         </span>
         {streaming && <Loader2 className="h-3.5 w-3.5 animate-spin text-brand" />}
       </button>
+      )}
 
-      {open && (
+      {total > 0 && open && (
         <ol className="mt-2 space-y-1.5 border-l-2 border-border pl-3 text-xs text-muted-foreground">
           {tree.map((node) => (
             <StepRow key={node.id} node={node} runningLabel={runningLabel} doneLabel={doneLabel} />

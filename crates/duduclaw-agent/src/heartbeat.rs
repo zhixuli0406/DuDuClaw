@@ -599,6 +599,9 @@ async fn execute_heartbeat(
     // No automatic recovery — that's a policy decision that needs human input
     // (was the change intentional? rollback or accept?).
     check_soul_integrity_with_audit(home_dir, agent_id).await;
+    // INSTRUCTIONS.md reaches every prompt too: same baseline, same audit
+    // shape (`_instructions_integrity_drift`); the first check establishes it.
+    check_instructions_integrity_with_audit(home_dir, agent_id).await;
 
     // ── Proactive check (new) ──
     execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals, host_run_notice)
@@ -639,6 +642,15 @@ async fn check_soul_integrity_with_audit(home_dir: &Path, agent_id: &str) {
         return;
     }
 
+    // Once per drifted content, not on every heartbeat.
+    if !duduclaw_security::soul_guard::should_report_drift(
+        duduclaw_security::soul_guard::ProtectedDoc::Soul,
+        &agent_dir,
+        &result.current_hash,
+    ) {
+        return;
+    }
+
     warn!(
         agent = agent_id,
         current_hash = %result.current_hash,
@@ -656,6 +668,47 @@ async fn check_soul_integrity_with_audit(home_dir: &Path, agent_id: &str) {
             "drift: current={}, expected={}, msg={}",
             &result.current_hash.chars().take(16).collect::<String>(),
             &result.expected_hash.chars().take(16).collect::<String>(),
+            result.message,
+        ),
+        false,
+    );
+}
+
+/// [`check_soul_integrity_with_audit`] for `INSTRUCTIONS.md`.
+async fn check_instructions_integrity_with_audit(home_dir: &Path, agent_id: &str) {
+    use duduclaw_security::soul_guard::{ProtectedDoc, check_doc_integrity};
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if !agent_dir.join(ProtectedDoc::Instructions.file_name()).exists() {
+        return;
+    }
+    let id = agent_id.to_string();
+    let result = match tokio::task::spawn_blocking(move || {
+        check_doc_integrity(ProtectedDoc::Instructions, &id, &agent_dir)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(agent = agent_id, "INSTRUCTIONS integrity check task panicked: {e}");
+            return;
+        }
+    };
+    if result.intact {
+        return;
+    }
+    let dir = home_dir.join("agents").join(agent_id);
+    if !duduclaw_security::soul_guard::should_report_drift(ProtectedDoc::Instructions, &dir, &result.current_hash) {
+        return; // already reported for this content
+    }
+    warn!(agent = agent_id, "INSTRUCTIONS.md integrity drift detected: {}", result.message);
+    duduclaw_security::audit::append_tool_call(
+        home_dir,
+        agent_id,
+        "_instructions_integrity_drift",
+        &format!(
+            "drift: current={}, expected={}, msg={}",
+            result.current_hash.chars().take(16).collect::<String>(),
+            result.expected_hash.chars().take(16).collect::<String>(),
             result.message,
         ),
         false,
@@ -1574,6 +1627,27 @@ mod tests {
             summary.contains("drift:") && summary.contains("current=") && summary.contains("expected="),
             "drift audit summary should include current + expected hash; got: {summary}"
         );
+        // The same drifted content is not reported again on the next tick.
+        check_soul_integrity_with_audit(home, "drifty").await;
+        assert_eq!(read_audit_rows(home, "_soul_integrity_drift").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn instructions_drift_is_audited_once_per_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let agent_dir = make_test_agent_dir(home, "ins", None);
+        std::fs::write(agent_dir.join("INSTRUCTIONS.md"), "v1").unwrap();
+        // First check establishes the baseline: no row.
+        check_instructions_integrity_with_audit(home, "ins").await;
+        assert!(read_audit_rows(home, "_instructions_integrity_drift").is_empty());
+        std::fs::write(agent_dir.join("INSTRUCTIONS.md"), "edited outside").unwrap();
+        check_instructions_integrity_with_audit(home, "ins").await;
+        check_instructions_integrity_with_audit(home, "ins").await;
+        assert_eq!(read_audit_rows(home, "_instructions_integrity_drift").len(), 1);
+        std::fs::write(agent_dir.join("INSTRUCTIONS.md"), "edited again").unwrap();
+        check_instructions_integrity_with_audit(home, "ins").await;
+        assert_eq!(read_audit_rows(home, "_instructions_integrity_drift").len(), 2);
     }
 
     // ── WP21 collateral fix: `poll_assigned_tasks` enqueues wake-ups by

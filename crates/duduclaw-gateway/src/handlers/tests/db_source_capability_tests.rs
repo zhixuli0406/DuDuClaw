@@ -280,6 +280,8 @@ async fn grant_rpcs_require_admin() {
         role: UserRole::Employee,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     for method in ["db_sources.grants.list", "db_sources.grants.set"] {
         let frame = handler.handle(method, json!({}), &viewer).await;

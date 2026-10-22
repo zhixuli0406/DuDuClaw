@@ -192,6 +192,7 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         || kind == crate::expert_skills::SKILLS_ACTION_KIND
+        || kind == crate::agent_files::approval::ACTION_KIND
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 
@@ -205,6 +206,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
     } else if kind == crate::expert_skills::SKILLS_ACTION_KIND {
         "這則技能啟用審核已逾期，匯入的技能維持停用；要啟用請重新匯入。"
+    } else if kind == crate::agent_files::approval::ACTION_KIND {
+        "這份設定檔修改的審核已逾期，修改沒有套用；需要的話請重新送出。"
     } else if let Some(spec) = crate::approval::operator_cli_gate::spec_for(kind) {
         spec.expired_text
     } else {
@@ -234,6 +237,9 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
         return (spec.notice)(rec, reminder, &deadline_phrase(rec));
     }
+    if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
+        return agent_file_notice_body(rec, reminder);
+    }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
     } else {
@@ -251,6 +257,31 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
          狀況：{what}\n\
          這類知識變更只能在儀表板的待辦清單決定，請開啟儀表板審核。\n\
          期限：{deadline}未審核將自動捨棄\n\
+         編號：{id}",
+        agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
+        deadline = deadline_phrase(rec),
+        id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
+    )
+}
+
+/// The plain notice for a profile file change: which employee and which
+/// file, never the proposed text or the diff (those stay behind the
+/// dashboard's admin check).
+pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    let head = if reminder {
+        "⏰ 有一份設定檔修改的審核快到期了，逾時會自動拒絕"
+    } else {
+        "📥 有一份設定檔修改等待審核"
+    };
+    let file = crate::agent_files::approval::target(rec)
+        .map(|(_, k)| crate::agent_files::approval::plain_name(k))
+        .unwrap_or("設定檔");
+    format!(
+        "{head}\n\
+         AI 員工：{agent}\n\
+         檔案：{file}\n\
+         這類修改只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
+         期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
         deadline = deadline_phrase(rec),

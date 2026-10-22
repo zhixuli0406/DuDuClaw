@@ -226,18 +226,30 @@ describe('new controls round-trip from inspect to payload', () => {
 });
 
 describe('typed key/value editor', () => {
-  it('prefills from inspect and sends typed values', async () => {
+  // `[prompt]` is refused by the gateway's typed key/value write now, so the
+  // editor no longer prefills it; rows are added by hand.
+  async function addRow(user: ReturnType<typeof userEvent.setup>, key: string, type: string, value: string) {
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    const keys = screen.getAllByRole('textbox', { name: 'Key' });
+    await user.type(keys[keys.length - 1], key);
+    const types = screen.getAllByRole('combobox', { name: 'Type' });
+    await user.selectOptions(types[types.length - 1], type);
+    if (type === 'boolean') {
+      const values = screen.getAllByRole('combobox', { name: 'Value' });
+      await user.selectOptions(values[values.length - 1], value);
+    } else {
+      const values = screen.getAllByRole('textbox', { name: 'Value' });
+      await user.type(values[values.length - 1], value);
+    }
+  }
+
+  it('does not prefill the refused [prompt] section and sends typed values', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=advanced');
 
-    expect(await screen.findByDisplayValue('cli_bare_mode')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Add' }));
-    const keys = screen.getAllByRole('textbox', { name: 'Key' });
-    await user.type(keys[keys.length - 1], 'minimal_core_kb');
-    const types = screen.getAllByRole('combobox', { name: 'Type' });
-    await user.selectOptions(types[types.length - 1], 'integer');
-    const values = screen.getAllByRole('textbox', { name: 'Value' });
-    await user.type(values[values.length - 1], '4');
+    expect(await screen.findByText(en['agents.v168.kv.title'])).toBeInTheDocument();
+    expect(screen.queryByDisplayValue('cli_bare_mode')).not.toBeInTheDocument();
+    await addRow(user, 'skill_synthesis_threshold', 'integer', '4');
 
     await waitFor(
       () =>
@@ -245,8 +257,7 @@ describe('typed key/value editor', () => {
           'my-bot',
           {
             advanced_kv: [
-              { section: 'prompt', key: 'cli_bare_mode', value: true, type: 'boolean' },
-              { section: 'prompt', key: 'minimal_core_kb', value: 4, type: 'integer' },
+              { section: 'evolution', key: 'skill_synthesis_threshold', value: 4, type: 'integer' },
             ],
           },
         ),
@@ -254,13 +265,24 @@ describe('typed key/value editor', () => {
     );
   });
 
+  it('flags a row in the [prompt] section as not editable here', async () => {
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=advanced');
+    await screen.findByText(en['agents.v168.kv.title']);
+    await addRow(user, 'cli_bare_mode', 'boolean', 'true');
+    const sections = screen.getAllByRole('combobox', { name: 'Section' });
+    await user.clear(sections[sections.length - 1]);
+    await user.type(sections[sections.length - 1], 'prompt');
+    expect(screen.getByText(en['agents.v168.kv.error.section'])).toBeInTheDocument();
+  });
+
   it('shows the server parse error inline when the save is rejected', async () => {
     const user = userEvent.setup();
     updateAgent.mockRejectedValue(new Error('agent.toml does not parse: invalid type at line 12'));
     renderAt('/agents/my-bot/edit?tab=advanced');
 
-    await screen.findByDisplayValue('cli_bare_mode');
-    await user.selectOptions(screen.getAllByRole('combobox', { name: 'Value' })[0], 'false');
+    await screen.findByText(en['agents.v168.kv.title']);
+    await addRow(user, 'skill_synthesis_enabled', 'boolean', 'false');
 
     expect(
       await screen.findByText(/The server rejected this save: agent\.toml does not parse: invalid type at line 12/, {}, { timeout: 3000 }),
@@ -270,14 +292,8 @@ describe('typed key/value editor', () => {
   it('flags a value that does not match its type', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=advanced');
-    await screen.findByDisplayValue('cli_bare_mode');
-    await user.click(screen.getByRole('button', { name: 'Add' }));
-    const keys = screen.getAllByRole('textbox', { name: 'Key' });
-    await user.type(keys[keys.length - 1], 'minimal_core_kb');
-    const types = screen.getAllByRole('combobox', { name: 'Type' });
-    await user.selectOptions(types[types.length - 1], 'integer');
-    const values = screen.getAllByRole('textbox', { name: 'Value' });
-    await user.type(values[values.length - 1], 'four');
+    await screen.findByText(en['agents.v168.kv.title']);
+    await addRow(user, 'skill_synthesis_threshold', 'integer', 'four');
     expect(screen.getByText(en['agents.v168.kv.error.value'])).toBeInTheDocument();
   });
 });
@@ -310,6 +326,17 @@ describe('admin-only fields', () => {
     expect(screen.getByRole('switch', { name: 'Allow parallel branches' })).not.toHaveAttribute('data-disabled');
   });
 
+  it('disables the permission switches, guardrails and engine for a non-admin', async () => {
+    setRole('manager');
+    const { unmount } = renderAt('/agents/my-bot/edit?tab=tools');
+    expect(await screen.findByRole('switch', { name: en['agents.edit.canSendCrossAgent'] })).toHaveAttribute('data-disabled');
+    expect(screen.getByRole('switch', { name: en['agents.edit.canScheduleTasks'] })).toHaveAttribute('data-disabled');
+    expect(screen.getByRole('switch', { name: en['agents.v168.guardrails.enabled'] })).toHaveAttribute('data-disabled');
+    unmount();
+    renderAt('/agents/my-bot/edit?tab=brain');
+    expect(await screen.findByRole('combobox', { name: en['agents.runtime.provider'] })).toBeDisabled();
+  });
+
   it('keeps the controls enabled for an admin', async () => {
     renderAt('/agents/my-bot/edit');
     expect(await screen.findByRole('combobox', { name: 'Reports To' })).not.toBeDisabled();
@@ -320,7 +347,7 @@ describe('admin-only fields', () => {
 describe('removed dead controls and enforced permissions', () => {
   it('no longer shows sticker, stagnation, container extras or skill scan/auto-activate controls', async () => {
     const { unmount } = renderAt('/agents/my-bot/edit?tab=advanced');
-    await screen.findByDisplayValue('cli_bare_mode');
+    await screen.findByText(en['agents.v168.kv.title']);
     expect(screen.queryByText(en['agents.edit.sticker'])).not.toBeInTheDocument();
     unmount();
 
@@ -367,5 +394,128 @@ describe('removed dead controls and enforced permissions', () => {
     await user.click(screen.getByRole('switch', { name: 'Allow parallel branches' }));
     await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
     expect(lastPayload()).toEqual({ fork: { enabled: false } });
+  });
+});
+
+describe('boundaries (contract) review', () => {
+  const contractCalls = () =>
+    mockWsClient.call.mock.calls.filter(([m]) => m === 'contract.update') as Array<[string, Record<string, unknown>]>;
+
+  function mockContract(update: (params: Record<string, unknown>) => unknown) {
+    mockWsClient.call.mockImplementation(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'contract.get') {
+        return { agent_id: 'my-bot', must_not: [], must_always: [], max_tool_calls_per_turn: 0, hash: 'h1' };
+      }
+      if (method === 'contract.update') return update(params);
+      return { ...FULL };
+    });
+  }
+
+  const held = {
+    status: 'needs_confirmation',
+    file: 'contract',
+    agent_id: 'my-bot',
+    review: {
+      analysis_id: 'an-7',
+      verdict: 'warn',
+      basis: 'rules+ai',
+      summary: '',
+      reasons: [{ category: 'loosened_redline', severity: 'medium', message: 'x', evidence: '' }],
+      can_confirm: true,
+      can_request_approval: true,
+    },
+  };
+
+  it('opens the review dialog on needs_confirmation and confirms with the analysis id', async () => {
+    const user = userEvent.setup();
+    mockContract((p) => (p.action === 'confirm'
+      ? { status: 'applied', file: 'contract', agent_id: 'my-bot', hash: 'h2' }
+      : held));
+    renderAt('/agents/my-bot/edit?tab=tools');
+
+    const box = await screen.findByRole('textbox', { name: en['agents.contract.mustNot'] });
+    await user.type(box, 'share prices');
+    const dialog = await screen.findByRole('dialog', {}, { timeout: 3000 });
+    expect(dialog).toHaveAccessibleName(en['agentFiles.review.title.needsConfirmation']);
+    expect(contractCalls()).toHaveLength(1);
+    expect(contractCalls()[0][1]).toEqual({
+      agent_id: 'my-bot',
+      must_not: ['share prices'],
+      must_always: [],
+      max_tool_calls_per_turn: 0,
+      base_hash: 'h1',
+    });
+
+    await user.type(screen.getByLabelText(en['agentFiles.review.reasonLabel']), 'the shop wants it');
+    await user.click(screen.getByRole('button', { name: en['agentFiles.review.confirm'] }));
+
+    await waitFor(() => expect(contractCalls()).toHaveLength(2));
+    expect(contractCalls()[1][1]).toEqual({
+      agent_id: 'my-bot',
+      must_not: ['share prices'],
+      must_always: [],
+      max_tool_calls_per_turn: 0,
+      action: 'confirm',
+      analysis_id: 'an-7',
+      reason: 'the shop wants it',
+      base_hash: 'h1',
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    // The held answer is not re-sent by the autosave.
+    await new Promise((r) => setTimeout(r, 1300));
+    expect(contractCalls()).toHaveLength(2);
+  });
+
+  it('sends a non-admin owner\'s request to an admin', async () => {
+    const user = userEvent.setup();
+    setRole('employee');
+    useAuthStore.setState({
+      bindings: [{ user_id: 'u1', agent_name: 'my-bot', access_level: 'owner', bound_at: '2026-10-01' }],
+    } as never);
+    mockContract((p) => (p.action === 'request_approval'
+      ? { status: 'pending_approval', file: 'contract', agent_id: 'my-bot', approval_id: 'apr-12345678-x' }
+      : { ...held, status: 'blocked', review: { ...held.review, verdict: 'block', can_confirm: false } }));
+    renderAt('/agents/my-bot/edit?tab=tools');
+
+    const box = await screen.findByRole('textbox', { name: en['agents.contract.mustNot'] });
+    await user.type(box, 'nothing');
+    await screen.findByRole('dialog', {}, { timeout: 3000 });
+    expect(screen.queryByRole('button', { name: en['agentFiles.review.confirm'] })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText(en['agentFiles.review.reasonLabel']), 'please review');
+    await user.click(screen.getByRole('button', { name: en['agentFiles.review.requestApproval'] }));
+
+    await waitFor(() => expect(contractCalls()).toHaveLength(2));
+    expect(contractCalls()[1][1]).toMatchObject({ action: 'request_approval', analysis_id: 'an-7', reason: 'please review' });
+    expect(await screen.findByRole('dialog')).toHaveAccessibleName(en['agentFiles.review.title.pending']);
+    useAuthStore.setState({ bindings: [] } as never);
+  });
+
+  it('reloads the boundaries after a conflict', async () => {
+    const user = userEvent.setup();
+    mockContract(() => ({ status: 'conflict', file: 'contract', agent_id: 'my-bot', current_hash: 'h9' }));
+    renderAt('/agents/my-bot/edit?tab=tools');
+    const box = await screen.findByRole('textbox', { name: en['agents.contract.mustNot'] });
+    await user.type(box, 'mine');
+    await screen.findByRole('dialog', {}, { timeout: 3000 });
+    const getsBefore = mockWsClient.call.mock.calls.filter(([m]) => m === 'contract.get').length;
+    await user.click(screen.getByRole('button', { name: en['agentFiles.review.reload'] }));
+    await waitFor(() =>
+      expect(mockWsClient.call.mock.calls.filter(([m]) => m === 'contract.get').length).toBe(getsBefore + 1),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(screen.getByRole('textbox', { name: en['agents.contract.mustNot'] })).toHaveValue('');
+  });
+
+  it('is read-only for someone who neither owns the employee nor is an admin', async () => {
+    setRole('employee');
+    useAuthStore.setState({
+      bindings: [{ user_id: 'u1', agent_name: 'my-bot', access_level: 'viewer', bound_at: '2026-10-01' }],
+    } as never);
+    mockContract(() => held);
+    renderAt('/agents/my-bot/edit?tab=tools');
+    const box = await screen.findByRole('textbox', { name: en['agents.contract.mustNot'] });
+    expect(box).toBeDisabled();
+    expect(screen.getByText(en['agents.contract.readOnly'])).toBeInTheDocument();
+    useAuthStore.setState({ bindings: [] } as never);
   });
 });

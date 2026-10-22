@@ -223,6 +223,9 @@ impl MethodHandler {
                         // Every editable key as stored in this employee's own
                         // agent.toml (absent ⇒ not set).
                         "settings": settings,
+                        // Form dirty-paths only an admin may change (the
+                        // edit page drops them for everyone else).
+                        "admin_only_fields": super::agent_authority::admin_only_form_paths(),
                         // #6: full capabilities incl. native_sandbox + Progent policy
                         // + autonomy_level (folded in above). `serde` renders
                         // snake_case enums (effect: allow|forbid|ask, op:

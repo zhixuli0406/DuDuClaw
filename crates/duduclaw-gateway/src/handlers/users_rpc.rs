@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::users_org::{ManagerChange, org_error_frame, parse_manager_change};
 
 impl MethodHandler {
     // ── User management handlers (admin only) ────────────────
@@ -23,6 +24,7 @@ impl MethodHandler {
                         "role": u.role,
                         "status": u.status,
                         "department": u.department,
+                        "manager_user_id": u.manager_user_id,
                         "created_at": u.created_at,
                         "updated_at": u.updated_at,
                         "last_login": u.last_login,
@@ -94,16 +96,41 @@ impl MethodHandler {
             }
         }
 
-        match db.create_user(email, display_name, password, role) {
-            Ok(mut user) => {
-                if let Some(d) = department {
-                    if let Err(e) = db.set_department(&user.id, Some(d)) {
-                        return WsFrame::error_response(
-                            "",
-                            &format!("user created but setting department failed: {e}"),
-                        );
-                    }
-                    user.department = Some(d.to_string());
+        // Optional direct manager: created in the same transaction as the
+        // account, so a refused manager leaves no account behind.
+        let manager = match parse_manager_change(&params) {
+            Ok(change) => change.target().map(str::to_string),
+            Err(frame) => return frame,
+        };
+
+        // Argon2 + SQLite: off the runtime workers.
+        let created = {
+            let db = db.clone();
+            let (email, display_name, password) =
+                (email.to_string(), display_name.to_string(), password.to_string());
+            let (department, manager) = (department.map(str::to_string), manager.clone());
+            tokio::task::spawn_blocking(move || {
+                db.create_user_with(&duduclaw_auth::NewUser {
+                    email: &email,
+                    display_name: &display_name,
+                    password: &password,
+                    role,
+                    department: department.as_deref(),
+                    manager: manager.as_deref(),
+                })
+            })
+            .await
+        };
+        match created {
+            Ok(Ok(user)) => {
+                if let Some(m) = &manager {
+                    let _ = db.log_action(
+                        Some(&ctx.user_id),
+                        "user.set_manager",
+                        Some(&user.id),
+                        Some(&format!("manager={m}")),
+                        None,
+                    );
                 }
                 let _ = db.log_action(
                     Some(&ctx.user_id),
@@ -114,7 +141,9 @@ impl MethodHandler {
                 );
                 WsFrame::ok_response("", json!({ "user": user }))
             }
-            Err(e) => WsFrame::error_response("", &format!("failed to create user: {e}")),
+            Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
+            Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => WsFrame::error_response("", &e),
+            Err(_) => WsFrame::error_response("", "failed to create user"),
         }
     }
 
@@ -168,20 +197,58 @@ impl MethodHandler {
             _ => None,
         };
 
-        match db.update_user(user_id, display_name, role, password) {
-            Ok(()) => {
-                if let Some(dept) = department_change {
-                    if let Err(e) = db.set_department(user_id, dept.as_deref()) {
-                        return WsFrame::error_response(
-                            "",
-                            &format!("failed to update department: {e}"),
-                        );
-                    }
+        let manager_change = match parse_manager_change(&params) {
+            Ok(change) => change,
+            Err(frame) => return frame,
+        };
+
+        // Every field of this request commits together or not at all: a
+        // refused manager or demotion leaves the name, password and
+        // department as they were.
+        let applied = {
+            let db = db.clone();
+            let user_id = user_id.to_string();
+            let display_name = display_name.map(str::to_string);
+            let password = password.map(str::to_string);
+            let manager_change = manager_change.clone();
+            tokio::task::spawn_blocking(move || {
+                let manager = match &manager_change {
+                    ManagerChange::Unchanged => None,
+                    ManagerChange::Clear => Some(None),
+                    ManagerChange::Set(m) => Some(Some(m.as_str())),
+                };
+                db.apply_user_update(
+                    &user_id,
+                    &duduclaw_auth::UserUpdate {
+                        display_name: display_name.as_deref(),
+                        role,
+                        password: password.as_deref(),
+                        department: department_change.as_ref().map(|d| d.as_deref()),
+                        manager,
+                    },
+                )
+            })
+            .await
+        };
+        match applied {
+            Ok(Ok(())) => {
+                if manager_change != ManagerChange::Unchanged {
+                    let _ = db.log_action(
+                        Some(&ctx.user_id),
+                        "user.set_manager",
+                        Some(user_id),
+                        Some(&format!("manager={}", manager_change.target().unwrap_or("none"))),
+                        None,
+                    );
                 }
                 let _ = db.log_action(Some(&ctx.user_id), "user.update", Some(user_id), None, None);
                 WsFrame::ok_response("", json!({"status": "updated"}))
             }
-            Err(e) => WsFrame::error_response("", &format!("failed to update user: {e}")),
+            Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
+            Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => {
+                WsFrame::error_response("", &format!("failed to update user: {e}"))
+            }
+            Err(_) => WsFrame::error_response("", "failed to update user"),
         }
     }
 
@@ -296,34 +363,36 @@ impl MethodHandler {
             Some(id) => id,
             None => return WsFrame::error_response("", "user_id is required"),
         };
-        let transfer_to = params.get("transfer_to").and_then(|v| v.as_str());
+        let transfer_to = params
+            .get("transfer_to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
 
-        // Get user's bound agents before offboarding
-        let bindings = db.get_user_agents(user_id).unwrap_or_default();
-
-        // Set user status to offboarded
-        if let Err(e) = db.set_user_status(user_id, duduclaw_auth::UserStatus::Offboarded) {
-            return WsFrame::error_response("", &format!("failed to offboard user: {e}"));
-        }
-
-        // Transfer agent ownership if specified
-        let mut transferred = Vec::new();
-        if let Some(new_owner_id) = transfer_to {
-            for binding in &bindings {
-                // Unbind from old user
-                let _ = db.unbind_agent(user_id, &binding.agent_name);
-                // Bind to new owner
-                let _ = db.bind_agent(new_owner_id, &binding.agent_name, binding.access_level);
-                transferred.push(binding.agent_name.clone());
+        // One transaction: status, the leaver's reports (moved to
+        // `transfer_to`, else to the leaver's manager, each re-checked and
+        // audited as `user.reparent`) and, with `transfer_to`, the bindings.
+        let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
+            Ok(outcome) => outcome,
+            Err(duduclaw_auth::OrgError::UserNotFound) => {
+                return WsFrame::error_response("", "failed to offboard user: user not found");
             }
-        }
+            Err(e) => return org_error_frame(&e),
+        };
+        let transferred = outcome.transferred_agents;
+        let reparented: Vec<Value> = outcome
+            .reparented
+            .iter()
+            .map(|r| json!({ "user_id": r.user_id, "manager_user_id": r.to }))
+            .collect();
 
         let _ = db.log_action(
             Some(&ctx.user_id),
             "user.offboard",
             Some(user_id),
             Some(&format!(
-                "transferred_agents={transferred:?}, transfer_to={transfer_to:?}"
+                "transferred_agents={transferred:?}, transfer_to={transfer_to:?}, reparented={}",
+                reparented.len()
             )),
             None,
         );
@@ -333,6 +402,7 @@ impl MethodHandler {
             json!({
                 "status": "offboarded",
                 "transferred_agents": transferred,
+                "reparented": reparented,
             }),
         )
     }
