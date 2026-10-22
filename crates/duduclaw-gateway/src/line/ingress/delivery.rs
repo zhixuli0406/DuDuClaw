@@ -220,6 +220,22 @@ pub(crate) async fn deliver(
     reply_token: &str,
     messages: Vec<serde_json::Value>,
 ) -> bool {
+    deliver_with_reply_extra(http, token, reply_token, messages, None).await
+}
+
+/// [`deliver`] with one extra message that may only ride in a Reply call
+/// (the thinking footer). The route is decided here, at send time: the extra
+/// message goes into the Reply request only, and is dropped when the answer
+/// goes out by Push — because the token window passed, or because the Reply
+/// API refused the token and the same answer is pushed instead. Thinking
+/// display never costs a Push.
+pub(crate) async fn deliver_with_reply_extra(
+    http: &reqwest::Client,
+    token: &str,
+    reply_token: &str,
+    messages: Vec<serde_json::Value>,
+    reply_extra: Option<serde_json::Value>,
+) -> bool {
     let binding = INGRESS_BINDING.try_with(Clone::clone).ok();
     if let Some(binding) = &binding {
         let validity = binding_validity(binding).await;
@@ -238,7 +254,9 @@ pub(crate) async fn deliver(
             false
         }
         DeliveryRoute::Reply => {
-            match send_reply(http, token, reply_token, messages.clone()).await {
+            let reply_messages =
+                crate::thinking::channel_presenter::with_reply_extra(messages.clone(), reply_extra);
+            match send_reply(http, token, reply_token, reply_messages).await {
                 ReplyResult::Delivered => true,
                 ReplyResult::Failed => false,
                 ReplyResult::InvalidToken => {

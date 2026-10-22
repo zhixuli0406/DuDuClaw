@@ -51,6 +51,7 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 - Group "mention only" (`mention_only`, per group): since v1.76 a LINE group with it on answers only messages that call an AI employee by `@` (or ask for the `@` list) and the one message a called employee is waiting for; before, it silenced the group entirely. The shared Telegram bot also accepts employee mentions. See [Calling AI staff with `@`](../features/62-calling-ai-staff.md).
 - Website chat widget: "Open the website chat widget" writes `[webchat] public_widget` and "Widget key" writes `[webchat] widget_key` (16 to 256 visible ASCII characters, with a Generate button; turning the widget on requires a key; the key is never returned). Applies immediately. The widget key is stored in plain text in `config.toml`: it is the public key that appears in the website's page source, so it is not treated as a secret.
 - WhatsApp, Feishu, Google Chat, Teams, WeCom and DingTalk: the six webhook routes are always mounted. A route answers 404 until its channel is configured; after that it enforces the platform's signature check and answers 401 to a bad signature. `channels.add` starts the channel without a restart: `channels.add` returns `hot_started` and `restart_required: false`, with `not_started_reason` when credentials are incomplete. A per-employee Slack bot also starts when it is added.
+- Thinking display in messaging apps (no dedicated control; set in the Advanced config editor, read on every reply): `[thinking] channel_audience` = `internal` (default: a sender whose verified channel identity belongs to an active dashboard account that is an Admin or is bound to the answering employee sees the timer and a masked summary, everyone else the timer only), `all` (every sender of a one-to-one chat sees the summary) or `none` (nothing); `[thinking] channel_group_display` = `status` (default: group chats show the timer only), `summary` or `off`. The stricter of `[thinking] display` and the answering employee's `[model] show_thinking` still caps both. An unreadable `config.toml` or an unknown value shows nothing. Website visitors (Odoo live chat, the WebChat widget) never see thinking. See [Thinking display in messaging apps](../features/66-thinking-in-messaging-apps.md).
 
 ## Integrations → Odoo → Website live chat
 
@@ -136,7 +137,7 @@ No dedicated control yet; set these in the Advanced config editor (below). Both 
 | `config.toml` | `[thinking] anthropic_display` | `summarized` (default) or `updates` (beta, only some Claude models) |
 | `agent.toml` | `[model] show_thinking` | `summary` / `status` / `off`; unset follows `[thinking] display`. The stricter of the two wins |
 
-A `config.toml` that cannot be read or parsed, or an unknown `display` value, counts as `status`. Only signed-in dashboard users in WebChat can see thinking text; messaging apps never do. Details: [Thinking display](../features/64-thinking-display.md).
+A `config.toml` that cannot be read or parsed, or an unknown `display` value, counts as `status`. Thinking text is shown to signed-in dashboard users in WebChat and, in messaging apps, only to senders allowed by `[thinking] channel_audience` (see the Channels section). Details: [Thinking display](../features/64-thinking-display.md).
 
 ## Advanced config editor
 

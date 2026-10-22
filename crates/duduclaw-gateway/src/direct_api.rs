@@ -25,6 +25,12 @@ struct MessagesRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Thinking display: `{"type":"adaptive","display":"summarized"}` only
+    /// for a reply turn whose viewer reads thinking text and a model that
+    /// thinks on every request anyway (`thinking::producers`). `None` ⇒ the
+    /// key is absent (byte-identical body).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 /// A system prompt block with optional cache_control.
@@ -66,6 +72,21 @@ struct ContentBlock {
     block_type: String,
     #[serde(default)]
     text: String,
+    /// `thinking` blocks carry their (summary) text here. The signature and
+    /// `redacted_thinking.data` are deliberately not deserialised.
+    #[serde(default)]
+    thinking: String,
+}
+
+/// Report a response's thinking blocks (no-op outside a reply turn).
+fn report_thinking_blocks(content: &[ContentBlock]) {
+    use crate::thinking::producers::{AnthropicBlock, report_anthropic_blocks};
+    let blocks = content.iter().filter_map(|b| match b.block_type.as_str() {
+        "thinking" => Some(AnthropicBlock::Thinking(b.thinking.as_str())),
+        "redacted_thinking" => Some(AnthropicBlock::Redacted),
+        _ => None,
+    });
+    report_anthropic_blocks(blocks, &mut crate::thinking::Recorder::new("direct_api"));
 }
 
 /// Usage information from the API response.
@@ -342,6 +363,10 @@ async fn call_direct_api_inner(
         system,
         messages,
         stream: None,
+        thinking: crate::thinking::producers::direct_api_thinking(
+            &crate::thinking::policy(),
+            model,
+        ),
     };
 
     let mut request = client.post(API_BASE);
@@ -382,6 +407,7 @@ async fn call_direct_api_inner(
     let resp: MessagesResponse = serde_json::from_str(&response_text)
         .map_err(|e| format!("Failed to parse API response: {e}"))?;
 
+    report_thinking_blocks(&resp.content);
     let text = resp
         .content
         .iter()
@@ -876,6 +902,39 @@ mod tests {
         let solo = build_moa_messages(&[], "hi");
         assert_eq!(solo.len(), 1);
         assert_eq!(solo[0].role, duduclaw_llm::Role::User);
+    }
+
+    #[test]
+    fn request_body_has_no_thinking_key_outside_a_reply_turn() {
+        let body = MessagesRequest {
+            model: "claude-opus-5-5".into(),
+            max_tokens: 10,
+            system: vec![],
+            messages: vec![],
+            stream: None,
+            thinking: crate::thinking::producers::direct_api_thinking(
+                &crate::thinking::policy(),
+                "claude-opus-5-5",
+            ),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"model": "claude-opus-5-5", "max_tokens": 10, "system": [], "messages": []}),
+            "byte-identical to the body before thinking display"
+        );
+    }
+
+    #[test]
+    fn response_thinking_blocks_parse_without_reading_signatures() {
+        let resp: MessagesResponse = serde_json::from_str(
+            r#"{"content":[{"type":"thinking","thinking":"摘要","signature":"S"},{"type":"redacted_thinking","data":"D"},{"type":"text","text":"答"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.content[0].thinking, "摘要");
+        assert_eq!(resp.content[2].text, "答");
+        // No sink in scope: reporting is a no-op.
+        report_thinking_blocks(&resp.content);
     }
 
     #[test]

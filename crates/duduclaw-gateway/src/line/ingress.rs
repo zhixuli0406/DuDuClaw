@@ -11,7 +11,9 @@ mod revision;
 mod upkeep;
 mod worker;
 
-pub(super) use delivery::{LineNoticeCollector, deliver, line_progress_callback};
+pub(super) use delivery::{
+    LineNoticeCollector, deliver, deliver_with_reply_extra, line_progress_callback,
+};
 #[cfg(test)]
 use revision::line_revision;
 pub(super) use upkeep::spawn_snapshots;

@@ -51,6 +51,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 - グループの「メンションのみ」（`mention_only`、グループごと）：v1.76 から、LINE グループでオンにすると、`@` で AI スタッフを呼ぶメッセージ（または @ 一覧の要求）と、呼ばれたスタッフが待っている 1 件にだけ返信します。以前はグループ全体が無反応になっていました。Telegram の共有 bot もスタッフ名を受け付けます。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照。
 - Web サイト用チャットウィジェット：公開の切り替えは `[webchat] public_widget`、ウィジェットキーは `[webchat] widget_key` に書き込みます（可視 ASCII 16〜256 文字、生成ボタンあり。公開するにはキーが必要。キーは応答に含まれません）。即時反映。ウィジェットキーは `config.toml` に平文で保存されます。Web サイトのページソースに現れる公開キーなので、シークレットとしては扱いません。
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
+- メッセージングアプリでの思考表示（専用の設定項目はなく、設定ファイルの詳細編集で設定。返信ごとに読み直します）：`[thinking] channel_audience` = `internal`（既定：チャネル ID が検証済みで、有効な dashboard アカウントが管理者または回答する社員に紐付いている送信者はタイマーと伏せ字化した要約、それ以外はタイマーのみ）、`all`（1 対 1 チャットのすべての送信者が要約を見られる）、`none`（何も表示しない）。`[thinking] channel_group_display` = `status`（既定：グループチャットはタイマーのみ）、`summary`、`off`。`[thinking] display` と回答する社員の `[model] show_thinking` のうち厳しい方が、引き続き両方の上限になります。`config.toml` が読めない、または不明な値のときは何も表示しません。Web サイトの訪問者（Odoo ライブチャット、WebChat ウィジェット）には思考は表示されません。詳しくは[メッセージングアプリでの思考表示](../../features/ja-JP/66-thinking-in-messaging-apps.md)。
 
 ## 連携 → Odoo → Web サイトのライブチャット
 
@@ -136,7 +137,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 | `config.toml` | `[thinking] anthropic_display` | `summarized`（既定）または `updates`（ベータ、一部の Claude モデルのみ） |
 | `agent.toml` | `[model] show_thinking` | `summary`／`status`／`off`。未設定なら `[thinking] display` に従う。厳しい方が適用される |
 
-読めない・解析できない `config.toml`、または解釈できない `display` の値は `status` として扱います。思考の文章が見えるのはダッシュボードにサインインした WebChat 利用者だけで、メッセージアプリには届きません。詳細は[思考の表示](../../features/ja-JP/64-thinking-display.md)。
+読めない・解析できない `config.toml`、または解釈できない `display` の値は `status` として扱います。思考の文章が見えるのは、ダッシュボードにサインインした WebChat 利用者と、メッセージアプリでは `[thinking] channel_audience` が許可する送信者だけです（「チャネル管理」の項を参照）。詳細は[思考の表示](../../features/ja-JP/64-thinking-display.md)。
 
 ## 設定ファイルの詳細編集
 
