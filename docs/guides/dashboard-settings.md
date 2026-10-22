@@ -110,6 +110,19 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
 
+## Thinking display
+
+No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.
+
+| File | Key | Values |
+|---|---|---|
+| `config.toml` | `[thinking] display` | `summary` (default: timer, tokens and masked thinking text in WebChat), `status` (timer and tokens only), `off` (no thinking frames; WebChat still shows its own timer) |
+| `config.toml` | `[thinking] max_chars` | thinking text per turn, default 4000, clamped to 200–20000 |
+| `config.toml` | `[thinking] anthropic_display` | `summarized` (default) or `updates` (beta, only some Claude models) |
+| `agent.toml` | `[model] show_thinking` | `summary` / `status` / `off`; unset follows `[thinking] display`. The stricter of the two wins |
+
+A `config.toml` that cannot be read or parsed, or an unknown `display` value, counts as `status`. Only signed-in dashboard users in WebChat can see thinking text; messaging apps never do. Details: [Thinking display](../features/64-thinking-display.md).
+
 ## Advanced config editor
 
 Location: Settings → Advanced → Advanced config editor. Admins only; RPCs `config.raw.get` / `config.raw.set`.

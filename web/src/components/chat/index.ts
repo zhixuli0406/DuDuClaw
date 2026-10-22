@@ -8,6 +8,9 @@ export { MentionPopup, MENTION_LISTBOX_ID, mentionOptionId } from './MentionPopu
 export { TypingIndicator } from './TypingIndicator';
 export { ThinkingOrbIndicator, type ThinkingState } from './ThinkingOrbIndicator';
 export { TaskInsights } from './TaskInsights';
+export { ThinkingStatus } from './ThinkingStatus';
+export { ThinkingSection } from './ThinkingSection';
+export { splitTurnMessages } from './turn-layout';
 export { CenterStage, CornerDuDu } from './ChatStage';
 export { EmployeeRow, type EmployeeRowAgent } from './EmployeeRow';
 export { SessionHistoryMenu } from './SessionHistoryMenu';

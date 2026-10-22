@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ListChecks,
+  Lightbulb,
   ScrollText,
   User,
   Wrench,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { formatThinkingDuration, formatThinkingTokens } from '@/components/chat/thinking-format';
 import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import {
   cardsForEvents,
@@ -448,6 +450,8 @@ export function RunsPage() {
                   preview={c.preview}
                   ts={c.ts}
                 />
+              ) : c.type === 'thinking' ? (
+                <ThinkingRow key={i} seconds={c.seconds} tokens={c.tokens} preview={c.preview} ts={c.ts} />
               ) : c.type === 'prose' ? (
                 <div
                   key={i}
@@ -542,6 +546,38 @@ export function RunsPage() {
  * item (spec §task2: `border-l-2 border-border pl-3 text-xs`) rather than a
  * bordered card. `ok` (when defined) renders the pass/fail glyph; steps omit it.
  */
+/** One turn's thinking (run_steps.db): seconds and tokens only, never text —
+ *  so there is nothing to expand. */
+function ThinkingRow({
+  seconds,
+  tokens,
+  preview,
+  ts,
+}: {
+  seconds: number | null;
+  tokens: number | null;
+  preview: string;
+  ts: string;
+}) {
+  const intl = useIntl();
+  const text =
+    seconds === null
+      ? preview
+      : [
+          formatThinkingDuration(intl, Math.max(1, seconds), false),
+          ...(tokens !== null && tokens > 0 ? [formatThinkingTokens(intl, tokens)] : []),
+        ].join(' · ');
+  return (
+    <div className="ml-6 flex items-center gap-2 border-l-2 border-border py-1 pl-3 text-xs" data-testid="run-thinking-row">
+      <Lightbulb className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <span className="min-w-0 flex-1 truncate tabular-nums text-muted-foreground">{text}</span>
+      <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
+        {intl.formatTime(ts, { hour: '2-digit', minute: '2-digit' })}
+      </span>
+    </div>
+  );
+}
+
 function ToolStep({
   tool,
   icon: Icon = Wrench,

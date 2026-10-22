@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   cardsForEvents,
   isRunLive,
+  parseThinkingPreview,
   relativeParts,
   runDurationSecs,
   runStatusMeta,
@@ -75,6 +76,23 @@ describe('cardsForEvents', () => {
     ]);
     expect(cards[0]).toMatchObject({ type: 'tool', ok: true });
     expect(cards[1]).toMatchObject({ type: 'tool', ok: false });
+  });
+});
+
+describe('thinking rows', () => {
+  it('maps a thinking event to a seconds + tokens card, never text', () => {
+    const cards = cardsForEvents([
+      { kind: 'thinking', label: 'thinking', ts: '2026-07-11T08:00:00Z', preview: '思考 8 秒 · 1,240 token' },
+      { kind: 'thinking', label: 'thinking', ts: '2026-07-11T08:01:00Z', preview: '思考 3 秒' },
+    ]);
+    expect(cards).toEqual([
+      { type: 'thinking', seconds: 8, tokens: 1240, ts: '2026-07-11T08:00:00Z', preview: '思考 8 秒 · 1,240 token' },
+      { type: 'thinking', seconds: 3, tokens: null, ts: '2026-07-11T08:01:00Z', preview: '思考 3 秒' },
+    ]);
+  });
+
+  it('an unexpected preview yields nulls so the raw preview is shown', () => {
+    expect(parseThinkingPreview('something else')).toEqual({ seconds: null, tokens: null });
   });
 });
 
