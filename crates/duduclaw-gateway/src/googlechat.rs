@@ -57,7 +57,12 @@ const GCHAT_TEXT_CHUNK: usize = 4000;
 pub struct GoogleChatState {
     pub(crate) ctx: Arc<ReplyContext>,
     creds: GoogleChatCreds,
+    /// One message at a time per space, in arrival order (B10).
+    queue: crate::conversation_queue::ConversationQueue,
 }
+
+/// Said in the space when its queue of waiting messages is full.
+const QUEUE_FULL_TEXT: &str = "目前排隊中的訊息太多，這則訊息沒有受理，請稍後再傳一次。";
 
 /// Service-account credentials + token cache — separable from the webhook
 /// state so delegation forwarding / Computer Use can send without a
@@ -235,6 +240,7 @@ pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -
     let state = Arc::new(GoogleChatState {
         ctx: ctx.clone(),
         creds,
+        queue: Default::default(),
     });
 
     // Verify credentials eagerly so the dashboard shows real status.
@@ -321,8 +327,23 @@ async fn webhook_handler(
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
         "MESSAGE" => {
+            // One space's messages are answered one at a time, in order
+            // (they used to run concurrently, B10).
+            let space = event_space(&event);
             let st = state.clone();
-            tokio::spawn(async move { handle_message(&st, &event).await });
+            let queued = event.clone();
+            if state
+                .queue
+                .submit(&space, async move { handle_message(&st, &queued).await })
+                .is_err()
+            {
+                warn!("Google Chat: queue full for a space; telling the sender");
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
+                    create_message(&st.creds, &space, thread, QUEUE_FULL_TEXT).await;
+                });
+            }
             // ACK synchronously with an empty body — the reply arrives
             // asynchronously via the REST API.
             (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response()
@@ -345,6 +366,17 @@ async fn webhook_handler(
         }
         _ => (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response(),
     }
+}
+
+/// The space a MESSAGE event belongs to (the queue key; same lookup as
+/// [`handle_message`]).
+fn event_space(event: &serde_json::Value) -> String {
+    event
+        .pointer("/message/space/name")
+        .or_else(|| event.pointer("/space/name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value) {

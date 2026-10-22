@@ -55,6 +55,10 @@ googlechat_service_account_json = '{ "type": "service_account", ... }'
 - 返信は`spaces.messages.create`経由で非同期に送信されます(同期ウィン
   ドウはわずか30秒しかなく、agentタスクには短すぎるため)。スレッドは
   `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`によって正しく紐づけられます。
+- 1 つのスペースのメッセージは届いた順に 1 件ずつ返信します（以前は続けて
+  送られた数件が同時に処理され、後の返信が前のメッセージを踏まえないことが
+  ありました）。スペースごとに最大 20 件まで待機でき、それを超えると受け付け
+  なかったことをスペースに伝えます。
 - 未公開のChat appは自分のWorkspace組織内からしか見えません。より広い
   配布範囲が必要な場合はGoogle Workspace Marketplaceへの公開が必要で
   す。

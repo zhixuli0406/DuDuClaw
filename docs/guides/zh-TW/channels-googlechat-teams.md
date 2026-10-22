@@ -48,6 +48,9 @@ googlechat_service_account_json = '{ "type": "service_account", ... }'
 - 回覆是透過 `spaces.messages.create` 非同步送出的（同步窗口只有 30 秒，
   對 agent 任務來說太短），並透過 `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
   正確串起討論串。
+- 同一個空間的訊息依到達順序一則一則回答（以前連續傳的幾則會同時跑，
+  後面的回答可能沒看到前面的訊息）。每個空間最多 20 則排隊，超過時會在
+  空間裡說明這則訊息沒有受理。
 - 未發布的 Chat app 只有你的 Workspace 組織內部看得到；要更廣的發佈範圍
   需要透過 Google Workspace Marketplace 上架。
 

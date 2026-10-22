@@ -51,6 +51,10 @@ googlechat_service_account_json = '{ "type": "service_account", ... }'
 - Replies are sent asynchronously via `spaces.messages.create` (the
   synchronous window is only 30 s — too short for agent tasks) and thread
   correctly via `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`.
+- Messages of one space are answered one at a time, in the order they
+  arrived (before, several messages sent in a row ran at the same time, so
+  a later answer could miss an earlier message). Up to 20 messages per
+  space can wait; past that the space is told the message was not accepted.
 - Unpublished Chat apps are visible only inside your Workspace org; wider
   distribution requires Google Workspace Marketplace publishing.
 
