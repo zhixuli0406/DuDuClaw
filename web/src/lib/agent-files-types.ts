@@ -37,7 +37,9 @@ export type AgentFileReasonCategory =
   /** The file had been changed outside the dashboard; checked as a whole. */
   | 'outside_change'
   /** A skill asks the employee to run something dangerous. */
-  | 'risky_action';
+  | 'risky_action'
+  /** A skill already held suspicious lines this change did not touch. */
+  | 'existing_risk';
 
 export interface AgentFileReason {
   category: AgentFileReasonCategory;

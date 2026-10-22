@@ -7988,6 +7988,7 @@
   "agentFiles.file.skill": "Skill",
   "agentFiles.file.skillNamed": "Skill: {name}",
   "agentFiles.category.risky_action": "May ask it to run something dangerous",
+  "agentFiles.category.existing_risk": "This skill already contained suspicious lines that this change does not touch; saving does not approve them",
   "agentFiles.diff.noChanges": "Nothing is different",
   "agentFiles.loading": "Loading…",
   "agentFiles.list.label": "Profile files",

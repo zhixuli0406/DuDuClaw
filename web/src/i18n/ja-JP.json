@@ -7988,6 +7988,7 @@
   "agentFiles.file.skill": "スキル",
   "agentFiles.file.skillNamed": "スキル：{name}",
   "agentFiles.category.risky_action": "危険な操作を実行させる可能性があります",
+  "agentFiles.category.existing_risk": "このスキルには元から疑わしい内容があり、今回の変更では触れていません。保存してもそれが承認されたことにはなりません",
   "agentFiles.diff.noChanges": "違いはありません",
   "agentFiles.loading": "読み込み中…",
   "agentFiles.list.label": "設定ファイル一覧",

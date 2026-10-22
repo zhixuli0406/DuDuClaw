@@ -41,6 +41,7 @@ const CATEGORIES: ReadonlySet<string> = new Set<AgentFileReasonCategory>([
   'analysis_unavailable',
   'outside_change',
   'risky_action',
+  'existing_risk',
 ]);
 
 export function isFixedAgentFileKey(v: unknown): v is AgentFileFixedKey {

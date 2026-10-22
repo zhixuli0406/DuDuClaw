@@ -7988,6 +7988,7 @@
   "agentFiles.file.skill": "技能",
   "agentFiles.file.skillNamed": "技能：{name}",
   "agentFiles.category.risky_action": "可能要它執行危險的動作",
+  "agentFiles.category.existing_risk": "這個技能裡原本就有可疑內容，這次沒有改到；儲存不代表它已經被核可",
   "agentFiles.diff.noChanges": "內容沒有任何不同",
   "agentFiles.loading": "正在讀取…",
   "agentFiles.list.label": "設定檔清單",
