@@ -1,5 +1,5 @@
-//! Reciprocal rank fusion of the ranked lists (FTS, short-term `LIKE`, and
-//! vectors in a later release): `score = Σ 1 / (K + rank)`, rank 1-based.
+//! Reciprocal rank fusion of the ranked lists (FTS, short-term `LIKE` and
+//! vectors): `score = Σ 1 / (K + rank)`, rank 1-based.
 //! Ties break on the smaller chunk id, so the order is deterministic. At most
 //! [`PER_SOURCE_CAP`] chunks of one source make the final list.
 

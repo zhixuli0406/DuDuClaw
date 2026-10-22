@@ -74,7 +74,9 @@ pub use engine::{EngineOptions, MatchedSpan, RuleEngine, StructuredHit};
 pub use error::{RedactionError, Result};
 pub use gc::{GcConfig, GcTask, spawn_gc};
 pub use locate::{collect_token_locations, escape_pointer, scan_tokens};
-pub use manager::{ManagerPaths, RedactionManager, resolve_data_sources, resolve_rule_specs};
+pub use manager::{
+    ManagerPaths, RedactionManager, build_engine, resolve_data_sources, resolve_rule_specs,
+};
 pub use ner::{InstallDirs, NerConfig};
 pub use pipeline::{RedactionOutput, RedactionPipeline, ToolContext};
 pub use rules::{IdentityRule, JsonPathRule, Match, RestoreScope, Rule, RuleKind, RuleSpec};

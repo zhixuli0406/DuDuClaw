@@ -215,7 +215,9 @@ pub async fn process_job(ctx: &PipelineCtx, job: Job) {
     .await;
     match indexed {
         Ok(Some(o)) => {
-            tracing::info!(source = %src.id, chunks = o.chunks, suspect = o.suspect, "knowledge: source indexed")
+            tracing::info!(source = %src.id, chunks = o.chunks, suspect = o.suspect, "knowledge: source indexed");
+            // Vectors next, when an embedder is usable (keywords work already).
+            super::embedding::schedule_source(&ctx.home, &src.id).await;
         }
         Ok(None) => {
             tracing::info!(source = %src.id, "knowledge: ingest cancelled (source deleted)")

@@ -221,6 +221,8 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 結果都標明是文件內容：每一段內容（以及集合名稱與說明）放在有標記的區塊裡，每行以 `│ ` 開頭；標題與位置壓成一行，`[` `]` 會被換掉，文件無法偽造結果標題或提早結束區塊。`knowledge_search` 以 `[n] 標題 · 位置（集合） chunk_id=…` 編號，方便回覆時引用；匯入時被判定像指令的段落會多一行警告。`collections` 只能縮小範圍。`knowledge_get_passage` 每次都重新檢查權限，找不到的段落與沒權限的段落回應相同（`permission denied`）。
 
+`knowledge_search` 與 `knowledge_list_collections` 的回應第一行會說明檢索模式（混合＝關鍵字加語意向量，或只用關鍵字），沒有用到向量時附上原因（尚未安裝模型、雲端供應者未經確認、去識別化未啟用、雲端出錯等）；`knowledge_list_collections` 另外列出每個集合的向量覆蓋率。向量只會在這次呼叫能讀的集合裡排序段落。
+
 ## 已棄用的別名仍會列出
 
 已棄用的工具名稱仍會出現在 `tools/list`，說明前面加 `[deprecated → …]` 前綴——因為隱藏它等於讓它叫不動，那和棄用緩衝期的用意正好相反。完整的舊 → 新對照表在 [deprecations.md](../deprecations.md)。目前沒有任何 MCP 工具處於棄用狀態：v1.66.0 那一批別名已在 v1.69.0 移除。

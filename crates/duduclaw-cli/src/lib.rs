@@ -1877,10 +1877,12 @@ enum KnowledgeCommands {
         /// JSONL questions: {"id","question","type","answerable","gold":[{"source","page"|"sheet"+"row"|"slide","contains"}]}.
         #[arg(long)]
         questions: PathBuf,
-        /// Embedding model. This release: `none` (keyword retrieval only).
+        /// Embedding model: `none` (keyword only) or `local:<catalog id>`
+        /// (`local:multilingual-e5-small`, `local:qwen3-embedding-0.6b`),
+        /// installed under the DuDuClaw home or `--model-home`.
         #[arg(long, default_value = "none")]
         model: String,
-        /// Comma-separated modes. This release evaluates `keyword`.
+        /// Comma-separated modes: `keyword`, `vector`, `hybrid`.
         #[arg(long, default_value = "keyword")]
         modes: String,
         /// k for the pass/fail threshold (1, 5 or 10).
@@ -1895,6 +1897,9 @@ enum KnowledgeCommands {
         /// Keep the evaluation database in this (empty) folder instead of a temp dir.
         #[arg(long)]
         work_dir: Option<PathBuf>,
+        /// Home whose `models/embedding/` holds the `local:` model (default: the DuDuClaw home).
+        #[arg(long)]
+        model_home: Option<PathBuf>,
     },
 }
 
@@ -5386,6 +5391,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             min_recall,
             report,
             work_dir,
+            model_home,
         })) => {
             let code = knowledge_eval_cmd::run(knowledge_eval_cmd::EvalArgs {
                 docs,
@@ -5396,6 +5402,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 min_recall,
                 report,
                 work_dir,
+                model_home: model_home.unwrap_or_else(duduclaw_home),
             })
             .await?;
             std::process::exit(code);

@@ -11,6 +11,10 @@
 //! - [`route`]: `POST /api/internal/knowledge`, the signed loopback route
 //!   behind the read-only `knowledge_*` MCP tools.
 //! - [`turn_requesters`]: who a live turn is for.
+//! - [`embedding`]: the embedder in effect (`[knowledge.embedding]`), embed
+//!   job scheduling; [`embed_job`] runs one; [`embedding_rpc`] is
+//!   `knowledge.embedding.*`; [`redaction_adapter`] de-identifies text
+//!   before a cloud embedding call.
 //! - [`principals`]: who a collection owner may grant to (the permission
 //!   picker and the check before `knowledge.acl.set`).
 //! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
@@ -24,9 +28,14 @@
 
 pub mod agent_binding;
 pub mod denied;
+pub mod embed_job;
+pub mod embedding;
+pub mod embedding_rpc;
+pub mod embedding_select;
 pub mod extract_spawn;
 pub mod pipeline;
 pub mod principals;
+pub mod redaction_adapter;
 pub mod route;
 pub mod rpc;
 pub mod turn_requesters;

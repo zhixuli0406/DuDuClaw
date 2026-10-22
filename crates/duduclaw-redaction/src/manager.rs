@@ -134,6 +134,25 @@ pub fn resolve_rule_specs(config: &RedactionConfig, paths: &ManagerPaths) -> Res
     Ok(specs)
 }
 
+/// Validate `config` and compile its rule engine exactly as
+/// [`RedactionManager::open`] does, without opening the vault. For callers
+/// that only need to find and mark sensitive spans (the knowledge base
+/// de-identifying passages before a cloud embedding call).
+pub fn build_engine(config: &RedactionConfig, paths: &ManagerPaths) -> Result<RuleEngine> {
+    config.validate()?;
+    // Materialise rule specs from profiles + inline rules.
+    let specs = resolve_rule_specs(config, paths)?;
+    RuleEngine::from_specs_with(
+        specs,
+        &EngineOptions {
+            identity_people_dir: paths.identity_people_dir.clone(),
+            data_sources: resolve_data_sources(config)?,
+            ner_dirs: paths.ner_dirs.clone(),
+            ner: config.ner.clone(),
+        },
+    )
+}
+
 impl RedactionManager {
     /// Build a manager from a [`RedactionConfig`] and on-disk paths.
     ///
@@ -141,20 +160,7 @@ impl RedactionManager {
     /// inline `[redaction.rules.*]` entries. The gateway typically loads
     /// these once at startup and shares the resulting `Arc<RedactionManager>`.
     pub fn open(config: RedactionConfig, paths: ManagerPaths) -> Result<Self> {
-        config.validate()?;
-
-        // Materialise rule specs from profiles + inline rules.
-        let specs = resolve_rule_specs(&config, &paths)?;
-
-        let engine = Arc::new(RuleEngine::from_specs_with(
-            specs,
-            &EngineOptions {
-                identity_people_dir: paths.identity_people_dir.clone(),
-                data_sources: resolve_data_sources(&config)?,
-                ner_dirs: paths.ner_dirs.clone(),
-                ner: config.ner.clone(),
-            },
-        )?);
+        let engine = Arc::new(build_engine(&config, &paths)?);
         let vault = Arc::new(VaultStore::open(&paths.vault_db, &paths.key_dir)?);
         let audit: Arc<dyn AuditSink> = match &paths.audit_log {
             Some(p) => Arc::new(JsonlAuditSink::new(p.clone())),
