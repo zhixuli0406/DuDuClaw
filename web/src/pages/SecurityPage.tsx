@@ -8,6 +8,7 @@ import { AdvancedSection, ConfirmDialog } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
+import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
 import { toast, formatError } from '@/lib/toast';
 import {
   TRIGGER_KEYS,
@@ -139,6 +140,11 @@ export function SecurityPage() {
           inventory says where every credential comes from. Same reasoning for
           showing it to every edition. */}
       <CredentialInventoryPanel />
+
+      {/* Credential protection (B2c) — the one line "憑證保護：系統金鑰圈／檔案".
+          Every edition: person identities by domain-wide delegation exist in
+          both, so both need to see (and change) where they are protected. */}
+      <CredentialProtectionPanel />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an
