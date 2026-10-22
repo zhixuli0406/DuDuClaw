@@ -167,10 +167,18 @@ async fn live_tap_streams_reasoning_and_returns_the_done_response() {
     let home = tempfile::tempdir().unwrap();
     let (sink, got) = sink_at(SinkLevel::Summary, home.path());
     let tap = ReasoningTap::new(scripted(vec![], events), "anthropic_api", ThinkingKind::Summary, true);
-    let out = scope_turn(Some(sink), tap.complete(&ChatRequest::new("m")))
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out = crate::cost_telemetry::USAGE_ESTIMATED
+        .scope(
+            flag.clone(),
+            scope_turn(Some(sink), tap.complete(&ChatRequest::new("m"))),
+        )
         .await
         .unwrap();
-    assert_eq!(out, done);
+    assert_eq!(out.parts, done.parts, "the loop gets the Done parts untouched");
+    // The scripted stream carried no usage: an estimate, flagged as such.
+    assert!(out.usage.output_tokens > 0);
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     assert_eq!(*tap.inner.calls.lock().unwrap(), ["stream"]);
     let got = got.lock().unwrap();
     let thinking: Vec<&ThinkingEvent> = got
@@ -204,6 +212,43 @@ async fn a_signal_sink_never_switches_to_streaming() {
         .await
         .unwrap();
     assert_eq!(*tap.inner.calls.lock().unwrap(), ["complete"]);
+}
+
+/// Refuses `stream()`; `complete()` works.
+struct NoStream(Scripted);
+
+#[async_trait]
+impl ChatProvider for NoStream {
+    fn id(&self) -> &str {
+        "no-stream"
+    }
+    async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.0.complete(req).await
+    }
+    async fn stream(
+        &self,
+        _req: &ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        self.0.calls.lock().unwrap().push("stream-refused");
+        Err(LlmError::InvalidRequest("stream_options not supported".into()))
+    }
+}
+
+#[tokio::test]
+async fn a_backend_that_refuses_streaming_still_answers() {
+    let home = tempfile::tempdir().unwrap();
+    let (sink, _got) = sink_at(SinkLevel::Summary, home.path());
+    let tap = ReasoningTap::new(
+        NoStream(scripted(vec![ContentPart::Text("答".into())], vec![])),
+        "openai_compat",
+        ThinkingKind::Raw,
+        true,
+    );
+    let out = scope_turn(Some(sink), tap.complete(&ChatRequest::new("m")))
+        .await
+        .unwrap();
+    assert_eq!(out.text(), "答");
+    assert_eq!(*tap.inner.0.calls.lock().unwrap(), ["stream-refused", "complete"]);
 }
 
 #[tokio::test]

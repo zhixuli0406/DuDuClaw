@@ -62,6 +62,16 @@ pub fn emit(ev: ThinkingEvent) {
     let _ = THINKING_SINK.try_with(|sink| sink.accept(ev));
 }
 
+/// The next block number of the current turn, or `None` outside one.
+pub fn next_block_number() -> Option<usize> {
+    THINKING_SINK
+        .try_with(|sink| {
+            sink.next_block
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
+        .ok()
+}
+
 /// The current turn's policy, or [`ThinkingPolicy::INACTIVE`] outside one.
 pub fn policy() -> ThinkingPolicy {
     THINKING_SINK
@@ -159,6 +169,10 @@ pub struct ThinkingSink {
     rules: Mutex<HashMap<String, Arc<crate::channel_reply::OutboundRules>>>,
     /// Per-turn cache of display ceilings by employee id.
     ceilings: Mutex<HashMap<String, SinkLevel>>,
+    /// Next block number of this turn: every recorder of the turn (each
+    /// retry, failover attempt and tool-loop round) draws its block ids from
+    /// here, so two producers never reuse an id.
+    next_block: std::sync::atomic::AtomicUsize,
 }
 
 /// The employee that is actually answering right now: the reply pipeline's
@@ -197,6 +211,7 @@ impl ThinkingSink {
             forward,
             ctx,
             rules: Mutex::new(HashMap::new()),
+            next_block: std::sync::atomic::AtomicUsize::new(0),
             ceilings: Mutex::new(HashMap::new()),
         }
     }

@@ -93,12 +93,20 @@ impl<P> ReasoningTap<P> {
     /// response is returned untouched.
     async fn drain(
         &self,
+        req: &ChatRequest,
         mut stream: BoxStream<'static, Result<StreamEvent, LlmError>>,
     ) -> Result<ChatResponse, LlmError> {
         let mut splitter = ThinkSplitter::new();
         let mut live_text = false;
         while let Some(ev) = stream.next().await {
-            match ev? {
+            let ev = match ev {
+                Ok(ev) => ev,
+                Err(e) => {
+                    self.close_open();
+                    return Err(e);
+                }
+            };
+            match ev {
                 StreamEvent::ReasoningDelta(d) => {
                     live_text |= self.live_delta(&d);
                 }
@@ -117,17 +125,21 @@ impl<P> ReasoningTap<P> {
                     if !live_text {
                         self.report_parts(&resp);
                     }
-                    return Ok(resp);
+                    return Ok(with_estimated_usage(req, resp));
                 }
                 _ => {}
             }
         }
         // A stream without its `Done` event is a broken response.
+        self.close_open();
+        Err(LlmError::Parse("stream ended without a final response".into()))
+    }
+
+    fn close_open(&self) {
         let mut rec = self.rec();
         if rec.is_open() {
             rec.end_as(self.text_kind, None, None);
         }
-        Err(LlmError::Parse("stream ended without a final response".into()))
     }
 
     /// Report one live reasoning delta; `true` when it carried text.
@@ -144,6 +156,39 @@ impl<P> ReasoningTap<P> {
     }
 }
 
+/// A streamed response whose provider sent no usage chunk (input and output
+/// both 0) gets a token estimate instead of 0, and the call is flagged as
+/// estimated for cost telemetry (`cost_telemetry::mark_usage_estimated`).
+/// A response that carries any usage is returned unchanged.
+fn with_estimated_usage(req: &ChatRequest, mut resp: ChatResponse) -> ChatResponse {
+    if resp.usage.input_tokens != 0 || resp.usage.output_tokens != 0 {
+        return resp;
+    }
+    let output: u64 = resp
+        .parts
+        .iter()
+        .map(|p| match p {
+            ContentPart::Text(t) => duduclaw_llm::estimate_tokens(t),
+            ContentPart::Reasoning { text, .. } => duduclaw_llm::estimate_tokens(text),
+            ContentPart::ToolCall { name, args, .. } => {
+                duduclaw_llm::estimate_tokens(name)
+                    + duduclaw_llm::estimate_tokens(&args.to_string())
+            }
+            _ => 0,
+        })
+        .sum();
+    resp.usage.input_tokens = req.estimate_input_tokens();
+    resp.usage.output_tokens = output;
+    crate::cost_telemetry::mark_usage_estimated();
+    tracing::debug!(
+        provider = %resp.provider,
+        input = resp.usage.input_tokens,
+        output = resp.usage.output_tokens,
+        "streamed response carried no usage — recorded an estimate"
+    );
+    resp
+}
+
 #[async_trait]
 impl<P: ChatProvider> ChatProvider for ReasoningTap<P> {
     fn id(&self) -> &str {
@@ -152,8 +197,19 @@ impl<P: ChatProvider> ChatProvider for ReasoningTap<P> {
 
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         if self.live && super::policy().wants_live() {
-            let stream = self.inner.stream(req).await?;
-            return self.drain(stream).await;
+            match self.inner.stream(req).await {
+                Ok(stream) => return self.drain(req, stream).await,
+                // A backend that cannot stream this request (no SSE, rejects
+                // `stream_options`, …) must not fail a turn that worked
+                // before thinking display: answer this call without
+                // streaming. An error after the first event is returned as
+                // is (the call may already have had effects upstream).
+                Err(e) => tracing::debug!(
+                    provider = self.inner.id(),
+                    error = %e,
+                    "thinking display: streaming refused — falling back to a plain call"
+                ),
+            }
         }
         let resp = self.inner.complete(req).await?;
         self.report_parts(&resp);

@@ -45,8 +45,11 @@ impl Recorder {
         if self.open.is_some() {
             self.end(None, None);
         }
-        let id = format!("t{}", self.next_block);
+        // Inside a turn the id comes from the turn's counter, so a retry or
+        // a second runtime call never reuses an earlier block's id.
+        let n = super::next_block_number().unwrap_or(self.next_block);
         self.next_block += 1;
+        let id = format!("t{n}");
         let ev = ThinkingEvent {
             started_at: Some(super::now_ms()),
             ..self.event(&id, ThinkingPhase::Start, kind)
@@ -126,6 +129,14 @@ impl Recorder {
         self.open
             .clone()
             .unwrap_or_else(|| ("t0".to_string(), kind))
+    }
+}
+
+impl Drop for Recorder {
+    /// A producer that stops mid-block (an error return, a dropped future)
+    /// still closes it, so the viewer's timer never keeps running.
+    fn drop(&mut self) {
+        self.end(None, None);
     }
 }
 
