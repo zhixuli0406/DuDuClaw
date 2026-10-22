@@ -2,7 +2,7 @@
 
 > **ホワイトラベル機能は 1.72.2 で削除されました。** 製品名、ロゴ、サブタイトル、アクセントカラー、会社情報、About HTML ブロック、署名済みブランディングバンドル、`branding.*` RPC はすべて存在せず、`branding.json`／`branding.bundle.json` は無視されます。どの dashboard も DuDuClaw の製品表示と固定の上流ベンダー表記（嘟嘟數位科技有限公司 / Dudu Technology Ltd.）を表示します。この表記はバイナリに組み込まれており、設定ファイルや RPC では変更できません。
 >
-> 総代理店向けビルドでは、About ページに総代理店情報のブロックを 1 つ追加できます。これはダッシュボードの設定ではなくビルド入力です。[distributor-notice.md](distributor-notice.md) を参照してください。
+> 総代理店向けビルドでは、About ページに総代理店情報のブロックを 1 つ追加できます。内容は総代理店がライセンスコンソールで管理し、ダッシュボードの設定ではありません。[distributor-notice.md](distributor-notice.md) を参照してください。
 
 このページは現在、ベンダー側の販売代理店キーコンソールのみを説明します。
 
@@ -78,7 +78,7 @@ public_url      = "https://your-gateway.example.com"
 
 | メソッド | アクセス権限 |
 |---|---|
-| `about.get` | ログイン済みの任意のユーザー（固定の製品・ベンダー情報、バージョン、ライセンス階層。`distributor_notice` は総代理店向けビルドのみ） |
+| `about.get` | ログイン済みの任意のユーザー（固定の製品・ベンダー情報、バージョン、ライセンス階層。`distributor_notice` は総代理店向けビルド、または総代理店発行のライセンスで署名済みの内容を取得した場合のみ） |
 | `distributor.status/list/add/update/remove/issue/revoke/upgrade` | 管理者 |
 
 ## HTTPコントロールプレーン（オーナーゲートウェイ、発行者キーでゲート）

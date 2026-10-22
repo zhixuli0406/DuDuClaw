@@ -73,11 +73,12 @@ async fn about_uses_fixed_product_metadata_without_local_brand_overrides() {
                 assert!(result.get(removed).is_none(), "{removed} must be absent");
             }
             // A local branding.json can never inject a distributor notice: the
-            // field exists only when one was compiled into the binary.
-            match crate::distributor_notice::distributor_notice() {
+            // field comes only from the compiled build input or a signed
+            // runtime copy (`distributor_notice::effective_notice`).
+            match crate::distributor_notice::effective_notice() {
                 None => assert!(
                     result.get("distributor_notice").is_none(),
-                    "distributor_notice must be absent when not compiled in"
+                    "distributor_notice must be absent without a compiled or signed notice"
                 ),
                 Some(html) => assert_eq!(result["distributor_notice"], html),
             }
