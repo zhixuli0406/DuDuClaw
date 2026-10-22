@@ -224,8 +224,7 @@ pub fn verify_offline(spec: &ModelSpec, home: &Path, release_pubkey: &str) -> Re
             "找不到離線安裝包：請把 {name} 與 {name}.minisig 一起放進 DuDuClaw 資料夾的 models/embedding"
         ));
     };
-    super::bundle::verify_signature(&tar, &sig, release_pubkey, &name)?;
-    super::bundle::unpack(&tar, spec, home)?;
+    super::bundle::verify_and_unpack(&tar, &sig, release_pubkey, &name, spec, home)?;
     let dir = spec.install_dir(home);
     for f in &spec.files {
         match onnx_install::verify_path(&ModelSpec::dest(&dir, f), &f.path, f.size, &f.sha256) {
@@ -365,11 +364,12 @@ mod tests {
                 .unwrap_err()
                 .contains("檔名")
         );
-        // Correctly signed, but a file that does not match its pin.
+        // Correctly signed, but a file of the pinned size that does not
+        // match its hash (a larger one is already refused while unpacking).
         let pk = place_bundle(
             &spec,
             home.path(),
-            &[("onnx/m.onnx", b"model"), ("tok.json", b"{ }")],
+            &[("onnx/m.onnx", b"model"), ("tok.json", b"{]")],
             &name,
         );
         assert!(

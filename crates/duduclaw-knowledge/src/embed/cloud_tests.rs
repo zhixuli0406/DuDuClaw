@@ -281,3 +281,47 @@ async fn transport_is_safe_to_build_and_drop_in_async_code() {
         let _ = &transport;
     }
 }
+
+/// An `HTTPS_PROXY` / `HTTP_PROXY` in the environment must not take the
+/// request (the proxy would resolve the host itself and bypass the pin):
+/// with an unreachable proxy configured the request still reaches the
+/// pinned mock directly.
+#[test]
+fn proxy_environment_is_ignored() {
+    let (base, seen) = mock_server(openai_answer);
+    let vars = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+    ];
+    let before: Vec<Option<String>> = vars.iter().map(|v| std::env::var(v).ok()).collect();
+    for v in vars {
+        // SAFETY: test-only; no other test in this crate reads these vars.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(v, "http://127.0.0.1:9")
+        };
+    }
+    let e = embedder(CloudProvider::OpenAi, &base, Arc::new(EmailRedactor));
+    let result = e.embed_query("x");
+    for (v, old) in vars.iter().zip(before) {
+        #[allow(unsafe_code)]
+        unsafe {
+            match old {
+                Some(o) => std::env::set_var(v, o),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+    result.expect("direct connection despite the proxy variables");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn effective_port_uses_the_scheme_default() {
+    assert_eq!(effective_port("https://api.openai.com"), Some(443));
+    assert_eq!(effective_port("https://x.example.com:8443"), Some(8443));
+    assert_eq!(effective_port("http://127.0.0.1:18898"), Some(18898));
+}

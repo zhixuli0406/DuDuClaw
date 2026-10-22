@@ -31,6 +31,9 @@ use serde_json::{Value, json};
 struct JobSlot {
     model: Option<String>,
     running: bool,
+    /// An offline bundle is being verified and unpacked (shares the
+    /// `.part` file names with a download, so the two never overlap).
+    verifying: bool,
     progress: Option<Progress>,
     error: Option<String>,
     cancel: Option<Arc<AtomicBool>>,
@@ -148,7 +151,7 @@ async fn status(home: &Path, is_admin: bool) -> Value {
         let g = slot();
         json!({
             "model": g.model,
-            "state": if g.running { "downloading" } else if g.error.is_some() { "error" } else { "idle" },
+            "state": if g.running { "downloading" } else if g.verifying { "verifying" } else if g.error.is_some() { "error" } else { "idle" },
             "progress": g.progress,
             // Install errors can name local paths: Admins only.
             "error": if is_admin { g.error.clone() } else { None },
@@ -250,6 +253,9 @@ fn install_start(
         return Ok(json!({ "started": false, "installed": true }));
     }
     let mut g = slot();
+    if g.verifying {
+        return Err("正在檢查離線安裝包，請等完成後再安裝。".to_string());
+    }
     if g.running {
         return Ok(json!({ "started": false, "installed": false }));
     }
@@ -317,8 +323,11 @@ async fn remove(
     spec: &'static catalog::ModelSpec,
     actor: &str,
 ) -> Result<Value, String> {
-    if slot().running {
-        return Err("正在下載中，請先取消再移除。".to_string());
+    {
+        let g = slot();
+        if g.running || g.verifying {
+            return Err("正在下載或檢查中，請等完成再移除。".to_string());
+        }
     }
     super::embedding::drop_local();
     super::embedding::cache(home).clear();
@@ -340,9 +349,22 @@ async fn verify_offline(
     spec: &'static catalog::ModelSpec,
     actor: &str,
 ) -> Result<Value, String> {
-    if slot().running {
-        return Err("正在下載中，請等下載結束再檢查。".to_string());
+    /// Clears the `verifying` flag on every exit path (error, panic, cancel).
+    struct Verifying;
+    impl Drop for Verifying {
+        fn drop(&mut self) {
+            slot().verifying = false;
+        }
     }
+    let _verifying = {
+        let mut g = slot();
+        if g.running || g.verifying {
+            return Err("正在下載或檢查另一個安裝包，請等完成後再檢查。".to_string());
+        }
+        g.verifying = true;
+        g.model = Some(spec.id.clone());
+        Verifying
+    };
     let h = home.to_path_buf();
     // Bundles are signed with the release key the self-updater trusts.
     tokio::task::spawn_blocking(move || {
@@ -374,5 +396,37 @@ pub(crate) fn base_url_ok(raw: &str, allow_private: bool) -> Result<(), String> 
         Ok(())
     } else {
         validate_base_url(raw, allow_private).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offline_verify_is_exclusive_and_always_releases_the_slot() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = catalog::find(catalog::DEFAULT_MODEL).unwrap();
+        // A download in progress refuses a verify.
+        slot().running = true;
+        let err = verify_offline(home.path(), spec, "admin")
+            .await
+            .unwrap_err();
+        assert!(err.contains("請等完成"), "{err}");
+        slot().running = false;
+        // A failing verify (no bundle) releases the flag.
+        assert!(verify_offline(home.path(), spec, "admin").await.is_err());
+        assert!(!slot().verifying);
+        // While a verify holds the slot, install and a second verify refuse.
+        slot().verifying = true;
+        assert!(verify_offline(home.path(), spec, "admin").await.is_err());
+        if duduclaw_onnx::manifest::ort_archive_for_current_platform().is_some() {
+            assert!(
+                install_start(home.path(), spec, "admin")
+                    .unwrap_err()
+                    .contains("離線")
+            );
+        }
+        slot().verifying = false;
     }
 }

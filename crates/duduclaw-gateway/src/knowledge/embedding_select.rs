@@ -140,9 +140,11 @@ pub(crate) fn apply(
             ] {
                 ack.insert(key.into(), toml::Value::String(v));
             }
+            // Bound to the exact endpoint: host and effective port.
+            ack.insert("port".into(), toml::Value::Integer(i64::from(target.port)));
             t.insert("cloud_disclosure_ack".into(), toml::Value::Table(ack));
             Ok(
-                json!({"provider": provider.as_str(), "vendor": target.provider.vendor(), "host": target.host, "model": target.model}),
+                json!({"provider": provider.as_str(), "vendor": target.provider.vendor(), "host": target.host, "port": target.port, "model": target.model}),
             )
         }
         _ => {

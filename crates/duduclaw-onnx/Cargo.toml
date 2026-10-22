@@ -16,7 +16,8 @@ license.workspace = true
 # Features:
 # - (none)   the pinned manifest only; no network, no ORT.
 # - install  verified downloads and ORT archive extraction.
-# - runtime  `init_ort` (links the `ort` crate with `load-dynamic`).
+# - runtime  `init_ort` (links the `ort` crate with `load-dynamic`); checks
+#            the library against its pin right before loading it.
 #
 # The `ort` features below must stay identical to `duduclaw-redaction`'s:
 # cargo unifies them into one `ort` build, and `load-dynamic` keeps the
@@ -48,7 +49,9 @@ install = [
     "dep:flate2",
     "dep:zip",
 ]
-runtime = ["dep:ort"]
+# The loader verifies the library against its pin before loading it, so
+# it needs the hashing code of `install`.
+runtime = ["dep:ort", "install"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -16,8 +16,14 @@ use std::sync::OnceLock;
 /// installing it later in the same process still works.
 pub fn init_ort(lib_path: &Path) -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    if INIT.get().is_none() && !lib_path.exists() {
-        return Err(format!("ONNX Runtime 執行庫不存在：{}", lib_path.display()));
+    if INIT.get().is_none() {
+        if !lib_path.exists() {
+            return Err(format!("ONNX Runtime 執行庫不存在：{}", lib_path.display()));
+        }
+        // Checked at the load itself, not only when a feature was opened:
+        // a library swapped in between is refused (and not memoised, so a
+        // reinstall works without a restart).
+        crate::install::verify_ort_lib_path(lib_path)?;
     }
     INIT.get_or_init(|| {
         let builder = ort::init_from(lib_path)
@@ -29,4 +35,24 @@ pub fn init_ort(lib_path: &Path) -> Result<(), String> {
         Ok(())
     })
     .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_library_that_is_not_the_pinned_build_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libonnxruntime.so");
+        std::fs::write(&lib, b"swapped in after the install check").unwrap();
+        let err = init_ort(&lib).unwrap_err();
+        assert!(err.contains("ONNX Runtime"), "{err}");
+        // Not memoised: a missing library still reports missing.
+        assert!(
+            init_ort(&dir.path().join("absent"))
+                .unwrap_err()
+                .contains("不存在")
+        );
+    }
 }

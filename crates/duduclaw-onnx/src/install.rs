@@ -284,6 +284,15 @@ pub fn verify_ort_lib(ort_lib_root: &Path) -> Result<(), String> {
     verify_lib_at(&lib, pin)
 }
 
+/// [`verify_ort_lib`] for an explicit library path (what the loader is
+/// about to open), against this platform's pin.
+pub fn verify_ort_lib_path(lib: &Path) -> Result<(), String> {
+    let target = manifest::current_target();
+    let pin = manifest::ort_lib_pin(target)
+        .ok_or_else(|| format!("這個平台（{target}）沒有可用的 ONNX Runtime"))?;
+    verify_lib_at(lib, pin)
+}
+
 fn verify_lib_at(lib: &Path, (size, sha): (u64, &str)) -> Result<(), String> {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};

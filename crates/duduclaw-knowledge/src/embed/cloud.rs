@@ -191,6 +191,23 @@ fn checked_addrs(
     Ok((bare, addrs))
 }
 
+/// Client settings for cloud embedding calls. `no_proxy`: an
+/// `HTTP(S)_PROXY` in the gateway environment would make the proxy resolve
+/// the host itself and the pin to the checked addresses would not hold, so
+/// cloud embedding always connects directly.
+fn pinned_client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+}
+
+/// Effective port of a base URL (the scheme default when none is written).
+pub fn effective_port(base_url: &str) -> Option<u16> {
+    reqwest::Url::parse(base_url).ok()?.port_or_known_default()
+}
+
 fn send_pinned(
     url: &str,
     headers: &[(&str, String)],
@@ -199,10 +216,7 @@ fn send_pinned(
 ) -> Result<Value, String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "雲端端點網址格式不正確".to_string())?;
     let (host, addrs) = checked_addrs(&parsed, allow_private)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
+    let client = pinned_client_builder()
         .resolve_to_addrs(&host, &addrs)
         .build()
         .map_err(|e| e.to_string())?;

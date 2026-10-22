@@ -164,6 +164,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           umask 077
           printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          trap 'rm -f /tmp/minisign.key' EXIT
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           for f in duduclaw-*.tar.gz duduclaw-*.zip; do
             [ -f "$f" ] || continue
@@ -216,6 +217,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           umask 077
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
           export KB_BUNDLE_MINISIGN_KEY="$RUNNER_TEMP/minisign.key" KB_BUNDLE_TAG="$TAG"
           mkdir -p "$KB_BUNDLE_CACHE" dist-kb
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do

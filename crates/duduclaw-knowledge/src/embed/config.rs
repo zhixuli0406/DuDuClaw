@@ -83,6 +83,10 @@ pub struct DisclosureAck {
     pub at: String,
     pub provider: String,
     pub host: String,
+    /// Port of the acknowledged endpoint. Records written before ports
+    /// were recorded have none and cover only 443 (the official endpoints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub model: String,
 }
 
@@ -155,6 +159,8 @@ pub struct CloudTarget {
     pub model: String,
     pub base_url: String,
     pub host: String,
+    /// Effective port (scheme default when the URL names none).
+    pub port: u16,
 }
 
 impl EmbeddingConfig {
@@ -240,13 +246,16 @@ impl EmbeddingConfig {
             ));
         }
         Some(
-            validate_base_url(&base, self.allow_private_endpoint).map(|(base_url, host)| {
-                CloudTarget {
+            validate_base_url(&base, self.allow_private_endpoint).and_then(|(base_url, host)| {
+                let port = super::cloud::effective_port(&base_url)
+                    .ok_or_else(|| "雲端端點網址格式不正確".to_string())?;
+                Ok(CloudTarget {
                     provider,
                     model,
                     base_url,
                     host,
-                }
+                    port,
+                })
             }),
         )
     }
@@ -256,6 +265,7 @@ impl EmbeddingConfig {
         self.ack.as_ref().is_some_and(|a| {
             a.provider == target.provider.as_str()
                 && a.host == target.host
+                && a.port.unwrap_or(443) == target.port
                 && a.model == target.model
         })
     }
@@ -322,6 +332,32 @@ cloud_disclosure_ack = { by = "admin", at = "2026-10-22T00:00:00Z", provider = "
             "[knowledge.embedding]\nprovider = \"gemini\"\ncloud_model = \"../evil\"\n",
         );
         assert!(c.cloud_target().unwrap().is_err());
+    }
+
+    #[test]
+    fn ack_binds_the_port_and_old_records_cover_only_443() {
+        let base = |url: &str, port: &str| {
+            format!(
+                "[knowledge.embedding]\nprovider = \"openai\"\ncloud_base_url = \"{url}\"\ncloud_disclosure_ack = {{ by = \"a\", at = \"t\", provider = \"openai\", host = \"api.example.com\", model = \"text-embedding-3-small\"{port} }}\n"
+            )
+        };
+        let covers = |text: String| {
+            let c = EmbeddingConfig::from_toml_str(&text);
+            c.ack_covers(&c.cloud_target().unwrap().unwrap())
+        };
+        assert!(
+            covers(base("https://api.example.com", "")),
+            "no port recorded = 443"
+        );
+        assert!(
+            !covers(base("https://api.example.com:8443", "")),
+            "a record without a port never covers 8443"
+        );
+        assert!(covers(base(
+            "https://api.example.com:8443",
+            ", port = 8443"
+        )));
+        assert!(!covers(base("https://api.example.com", ", port = 8443")));
     }
 
     #[test]
