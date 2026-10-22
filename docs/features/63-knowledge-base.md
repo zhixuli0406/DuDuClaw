@@ -59,7 +59,7 @@ For an AI employee answering someone, the intersection of:
    | WebChat, signed-in dashboard account | that account (never taken from the session id) | user, department, Admin: all |
    | messaging app (LINE, Telegram, …), sender with a **verified** channel binding to an active account | that account | user, department, plus the chat's `channel` grants |
    | messaging app, any other sender | nobody | `channel` grants only |
-   | public WebChat widget visitor, Odoo website Live Chat visitor | nobody | `public` collections granted to `channel:widget` / `channel:odoolivechat` only (an internal collection granted to these channels is still not readable), never 1:1 |
+   | public WebChat widget visitor, Odoo website Live Chat visitor | nobody | `public` collections granted to `channel:widget` / `channel:odoolivechat` only (an internal collection granted to these channels is still not readable; the permission editor lists these channels as "Website chat widget (visitors)" and "Odoo website Live Chat (visitors)"), never 1:1 |
    | cron runs, and dispatched runs with no upstream turn (goal rounds, dashboard work) | nobody (system turn) | public and internal collections granted to the employee |
    | a run dispatched from a channel or WebChat turn (an employee asked another one) | the upstream turn's person | that person's grants outside a 1:1 conversation; for an unbound sender or visitor, that channel's grants only. Delegation never widens access; an upstream turn the gateway no longer remembers (restart, over 24 hours) reads nothing |
    | a tool call whose turn and run the gateway did not register, or a reply turn from an unrecognised session | nobody | none |

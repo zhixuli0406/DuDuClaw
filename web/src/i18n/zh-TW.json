@@ -8183,6 +8183,8 @@
   "kb.channel.wecom": "企業微信",
   "kb.channel.dingtalk": "釘釘",
   "kb.channel.webchat": "網頁對話",
+  "kb.channel.widget": "網站對話小工具（訪客）",
+  "kb.channel.odoolivechat": "Odoo 網站即時客服（訪客）",
   "kb.add.sizeLimit": "單檔上限 {mb} MB。",
   "kb.add.skipped": "沒有加入的檔案",
   "kb.add.skip.type": "不支援這種檔案格式，沒有加入。",

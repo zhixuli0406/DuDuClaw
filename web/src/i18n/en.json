@@ -8183,6 +8183,8 @@
   "kb.channel.wecom": "WeCom",
   "kb.channel.dingtalk": "DingTalk",
   "kb.channel.webchat": "Web chat",
+  "kb.channel.widget": "Website chat widget (visitors)",
+  "kb.channel.odoolivechat": "Odoo website Live Chat (visitors)",
   "kb.add.sizeLimit": "Each file up to {mb} MB.",
   "kb.add.skipped": "Files not added",
   "kb.add.skip.type": "this file type is not supported, so it was not added.",

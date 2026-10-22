@@ -59,7 +59,7 @@ AI 員工替某人回答時，取下列條件的交集：
    | WebChat，已登入的儀表板帳號 | 該帳號（不從 session id 推算） | 使用者、部門；管理員為全部 |
    | 通訊軟體（LINE、Telegram 等），發話者的通道帳號**已驗證**綁定到啟用中的帳號 | 該帳號 | 使用者、部門，加上該聊天室的 `channel` 授權 |
    | 通訊軟體，其他發話者 | 無 | 只有 `channel` 授權 |
-   | WebChat 公開小工具訪客、Odoo 網站即時客服訪客 | 無 | 只有授權給 `channel:widget`／`channel:odoolivechat` 的 **public** 集合（就算把 internal 集合授權給這些通道也讀不到），一律不算一對一 |
+   | WebChat 公開小工具訪客、Odoo 網站即時客服訪客 | 無 | 只有授權給 `channel:widget`／`channel:odoolivechat` 的 **public** 集合（就算把 internal 集合授權給這些通道也讀不到；權限編輯器的通道清單裡叫「網站對話小工具（訪客）」與「Odoo 網站即時客服（訪客）」），一律不算一對一 |
    | 排程，以及沒有上游 turn 的派工（目標回合、儀表板交辦） | 無（系統 turn） | 授權給員工、敏感度為 public 或 internal 的集合 |
    | 從通道或 WebChat turn 派出去的工作（員工請另一位員工處理） | 上游 turn 的對象 | 該對象在非一對一情境下的授權；未綁定的發話者或訪客只有該通道的授權。派工不會擴大範圍；gateway 已不記得的上游 turn（重新啟動、超過 24 小時）什麼都讀不到 |
    | gateway 沒有登記的 turn 與 run 的工具呼叫，或來自無法辨識的 session 的回覆 | 無 | 無 |

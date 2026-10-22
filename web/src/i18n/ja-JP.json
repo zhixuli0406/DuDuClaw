@@ -8183,6 +8183,8 @@
   "kb.channel.wecom": "WeCom（企業微信）",
   "kb.channel.dingtalk": "DingTalk（釘釘）",
   "kb.channel.webchat": "Web チャット",
+  "kb.channel.widget": "Webサイトのチャットウィジェット（訪問者）",
+  "kb.channel.odoolivechat": "Odoo Webサイトのライブチャット（訪問者）",
   "kb.add.sizeLimit": "1 ファイル {mb} MB まで。",
   "kb.add.skipped": "追加しなかったファイル",
   "kb.add.skip.type": "この形式には対応していないため追加しませんでした。",
