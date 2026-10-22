@@ -18,7 +18,10 @@
 //! are keyed by `auth_meta.acl_generation`).
 //!
 //! A message that only calls employees the sender may not call is refused
-//! without a model call. A lone `@` (or a partial or ambiguous name) asks for
+//! without a model call when the sender is a dashboard account (directly or
+//! through a verified channel identity); for an unmapped sender such a name
+//! is treated like a name that matches nobody (owner decision: no employee
+//! enumeration by outsiders). A lone `@` (or a partial or ambiguous name) asks for
 //! the list of callable employees. On channels, `@name` with no task arms a
 //! one-shot addressee ([`pending`]): only the sender's next message in that
 //! conversation goes to that employee.
@@ -117,6 +120,13 @@ pub fn decide(
             bare: trigger_match::task_text_without(text, &hit).is_empty(),
             agent: hit.id,
         },
+        // Only a sender we can name (a dashboard account, directly or
+        // through a verified channel identity) is told a call was refused.
+        // For an unmapped sender (a LINE friend, a Telegram user, a website
+        // or Odoo Live Chat visitor) a name they may not call reads like a
+        // name that matches nobody: plain text for the default employee, so
+        // the refusal cannot be used to find out which employees exist.
+        MentionScan::Forbidden(_) if matches!(access.sender, Sender::Unmapped) => TriggerRoute::None,
         MentionScan::Forbidden(hit) => TriggerRoute::Forbidden { agent: hit.id },
         MentionScan::Partial { token, candidates } => TriggerRoute::List { token, candidates },
     }

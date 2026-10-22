@@ -311,3 +311,151 @@ async fn agents_callable_is_not_enterprise_gated() {
     assert_eq!(p["default_agent"], "main");
     assert!(!is_enterprise_only_method("agents.callable"));
 }
+
+// ── review round (#182) ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn personal_edition_ignores_leftover_reporting_lines() {
+    let f = fixture().await;
+    // Enterprise → Personal downgrade: the users.db rows stay behind.
+    f.handler
+        .set_edition_override(Some(duduclaw_core::EditionProfile::Personal))
+        .await;
+    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
+    let mgr = callable(&f, &ctx).await;
+    assert_eq!(names(&mgr), vec!["faq", "main"], "no team grants in personal");
+    let create = f
+        .handler
+        .handle("tasks.create", json!({ "title": "報價", "assigned_to": "sales" }), &ctx)
+        .await;
+    assert!(is_denied(&create), "{create:?}");
+    let listed = f
+        .handler
+        .handle("tasks.list", json!({ "agent_id": "sales" }), &ctx)
+        .await;
+    assert!(is_denied(&listed), "{listed:?}");
+    // The read-only task identity follows the recorded edition too.
+    let live = crate::review_evidence::audience::trusted_dashboard_principal(f._home.path(), &f.mgr).unwrap();
+    assert!(live.team_access.is_empty());
+}
+
+#[tokio::test]
+async fn a_board_card_carries_no_conversation_link() {
+    let f = fixture().await;
+    let store = f.handler.task_store().await.unwrap();
+    let mut row = TaskRow::new(
+        "t-line".into(),
+        "追款".into(),
+        "客戶 A 的帳款".into(),
+        "medium".into(),
+        "sales".into(),
+        f.emp1.clone(),
+    );
+    row.source_channel = Some("line".into());
+    row.source_chat_id = Some("line:Ucustomer".into());
+    store.insert_task(&row).await.unwrap();
+    for method in ["tasks.list", "tasks.list_page"] {
+        let mgr = ok_payload(
+            &f.handler
+                .handle(method, json!({ "agent_id": "sales" }), &jwt_ctx(&f.mgr, UserRole::Manager))
+                .await,
+        );
+        let card = &mgr["tasks"][0];
+        assert_eq!(card["restricted"], true, "{method}");
+        assert_eq!(card["channel"], Value::Null, "{method}");
+        assert_eq!(card["channel_link"], Value::Null, "{method}");
+        assert_eq!(card["description"], "", "{method}");
+        // The employee's own user still gets the channel.
+        let own = ok_payload(
+            &f.handler
+                .handle(method, json!({ "agent_id": "sales" }), &jwt_ctx(&f.emp1, UserRole::Employee))
+                .await,
+        );
+        assert_eq!(own["tasks"][0]["channel"], "line", "{method}");
+    }
+}
+
+#[tokio::test]
+async fn the_default_employee_follows_the_callers_conversation() {
+    let f = fixture().await;
+    seed_agent(
+        f._home.path(),
+        "desk",
+        "櫃台",
+        "specialist",
+        "\n[channels.discord]\n[[channels.discord.bindings]]\nkind = \"thread\"\nid = \"T1\"\n",
+    );
+    f.handler.registry.write().await.scan().await.unwrap();
+    let ctx = jwt_ctx(&f.other, UserRole::Employee);
+    let fresh = ok_payload(&f.handler.handle("agents.callable", json!({}), &ctx).await);
+    assert_eq!(fresh["default_agent"], "main");
+    assert!(fresh["agents"].as_array().unwrap().iter().all(|a| a["name"] != "desk"));
+    let bound = ok_payload(
+        &f.handler
+            .handle("agents.callable", json!({ "session_id": "webchat:thread:T1" }), &ctx)
+            .await,
+    );
+    assert_eq!(bound["default_agent"], "desk");
+    let desk = bound["agents"].as_array().unwrap().iter().find(|a| a["name"] == "desk").unwrap();
+    assert_eq!(desk["via"], "default");
+    // A non-WebChat session id is ignored.
+    let other = ok_payload(
+        &f.handler
+            .handle("agents.callable", json!({ "session_id": "discord:thread:T1" }), &ctx)
+            .await,
+    );
+    assert_eq!(other["default_agent"], "main");
+}
+
+#[tokio::test]
+async fn a_manager_manages_tasks_they_created_for_the_team() {
+    let f = fixture().await;
+    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
+    let id = ok_payload(
+        &f.handler
+            .handle("tasks.create", json!({ "title": "整理報價單", "assigned_to": "sales" }), &ctx)
+            .await,
+    )["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let renamed = f
+        .handler
+        .handle("tasks.update", json!({ "task_id": id, "title": "整理本月報價單" }), &ctx)
+        .await;
+    assert_eq!(ok_payload(&renamed)["task"]["title"], "整理本月報價單");
+    // `cancelled` is a terminal task status (dashboard `TaskStatus`, the
+    // goal loop and the stop path treat it as finished).
+    let cancelled = ok_payload(
+        &f.handler
+            .handle("tasks.update", json!({ "task_id": id, "status": "cancelled" }), &ctx)
+            .await,
+    );
+    assert_eq!(cancelled["task"]["status"], "cancelled");
+    // Someone else's task on the same employee still needs direct Operator.
+    let theirs = ok_payload(
+        &f.handler
+            .handle("tasks.create", json!({ "title": "x", "assigned_to": "sales" }), &jwt_ctx(&f.emp1, UserRole::Employee))
+            .await,
+    )["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refused = f
+        .handler
+        .handle("tasks.update", json!({ "task_id": theirs, "title": "y" }), &ctx)
+        .await;
+    assert!(is_denied(&refused), "{refused:?}");
+    let refused = f.handler.handle("tasks.remove", json!({ "task_id": theirs }), &ctx).await;
+    assert!(is_denied(&refused), "{refused:?}");
+    // Once the line is cut the manager loses the task too.
+    f.db.set_manager(&f.lead, None).unwrap();
+    let refused = f
+        .handler
+        .handle("tasks.update", json!({ "task_id": id, "title": "z" }), &ctx)
+        .await;
+    assert!(is_denied(&refused), "{refused:?}");
+    f.db.set_manager(&f.lead, Some(&f.mgr)).unwrap();
+    let removed = f.handler.handle("tasks.remove", json!({ "task_id": id }), &ctx).await;
+    assert!(!is_denied(&removed), "{removed:?}");
+}

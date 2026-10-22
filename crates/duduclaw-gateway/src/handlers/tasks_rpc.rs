@@ -79,6 +79,38 @@ impl MethodHandler {
         Ok(reader)
     }
 
+    /// The "在 <通道> 中開啟" fields of a listed task: `channel` and a
+    /// conversation link resolved from the `/goal` source conversation.
+    /// Only a reader who may read the task's content gets them; for a board
+    /// card (a Manager listing a report's employee, an audience-restricted
+    /// task) both are null, since the link names the conversation the
+    /// employee works in.
+    pub(crate) async fn set_channel_fields(&self, reader: &TaskReader<'_>, r: &TaskRow, v: &mut Value) {
+        if !reader.can_read(&r.id, &r.assigned_to) {
+            v["channel"] = Value::Null;
+            v["channel_link"] = Value::Null;
+            return;
+        }
+        let channel_link = match (r.source_channel.as_deref(), r.source_chat_id.as_deref()) {
+            (Some(channel), Some(chat_id)) if !channel.is_empty() && !chat_id.is_empty() => {
+                // W2-7: Discord's guild id was snapshotted onto this row at
+                // `/goal` creation time (see `channel_link.rs` module docs)
+                // — pass it through rather than re-resolving it live.
+                crate::channel_link::resolve_conversation_link(
+                    &self.home_dir,
+                    channel,
+                    chat_id,
+                    None,
+                    r.source_discord_guild_id.as_deref(),
+                )
+                .await
+            }
+            _ => None,
+        };
+        v["channel"] = json!(r.source_channel);
+        v["channel_link"] = json!(channel_link);
+    }
+
     pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
@@ -112,28 +144,7 @@ impl MethodHandler {
                 let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let mut v = reader.task_json(r);
-                    let channel_link =
-                        match (r.source_channel.as_deref(), r.source_chat_id.as_deref()) {
-                            (Some(channel), Some(chat_id))
-                                if !channel.is_empty() && !chat_id.is_empty() =>
-                            {
-                                // W2-7: Discord's guild id was snapshotted onto
-                                // this row at `/goal` creation time (see
-                                // `channel_link.rs` module docs) — pass it
-                                // through rather than re-resolving it live.
-                                crate::channel_link::resolve_conversation_link(
-                                    &self.home_dir,
-                                    channel,
-                                    chat_id,
-                                    None,
-                                    r.source_discord_guild_id.as_deref(),
-                                )
-                                .await
-                            }
-                            _ => None,
-                        };
-                    v["channel"] = json!(r.source_channel);
-                    v["channel_link"] = json!(channel_link);
+                    self.set_channel_fields(&reader, r, &mut v).await;
                     tasks.push(v);
                 }
                 WsFrame::ok_response("", json!({ "tasks": tasks }))
@@ -273,9 +284,12 @@ impl MethodHandler {
         let existing = store.get_task(task_id).await.ok().flatten();
         let owner_agent = existing.as_ref().map(|r| r.assigned_to.clone());
         if let Some(agent) = owner_agent.as_deref() {
-            if !task_content_visible(&self.home_dir, ctx, task_id, agent)
-                || !ctx.has_agent_access(agent, AccessLevel::Operator)
-            {
+            let direct = task_content_visible(&self.home_dir, ctx, task_id, agent)
+                && ctx.has_agent_access(agent, AccessLevel::Operator);
+            let creator = existing
+                .as_ref()
+                .is_some_and(|r| creator_may_manage(&self.home_dir, ctx, r));
+            if !direct && !creator {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
         } else if !ctx.is_admin() {
@@ -470,9 +484,9 @@ impl MethodHandler {
         let ctx = &live;
         match store.get_task(task_id).await.ok().flatten() {
             Some(row) => {
-                if !ctx.has_agent_access(&row.assigned_to, AccessLevel::Operator)
-                    || !task_content_visible(&self.home_dir, ctx, task_id, &row.assigned_to)
-                {
+                let direct = ctx.has_agent_access(&row.assigned_to, AccessLevel::Operator)
+                    && task_content_visible(&self.home_dir, ctx, task_id, &row.assigned_to);
+                if !direct && !creator_may_manage(&self.home_dir, ctx, &row) {
                     return WsFrame::error_response("", PERMISSION_DENIED);
                 }
             }
@@ -605,24 +619,7 @@ impl MethodHandler {
                     let mut v = reader.task_json(r);
                     v["archived"] = json!(r.archived);
                     v["pinned"] = json!(r.pinned);
-                    let channel_link =
-                        match (r.source_channel.as_deref(), r.source_chat_id.as_deref()) {
-                            (Some(channel), Some(chat_id))
-                                if !channel.is_empty() && !chat_id.is_empty() =>
-                            {
-                                crate::channel_link::resolve_conversation_link(
-                                    &self.home_dir,
-                                    channel,
-                                    chat_id,
-                                    None,
-                                    r.source_discord_guild_id.as_deref(),
-                                )
-                                .await
-                            }
-                            _ => None,
-                        };
-                    v["channel"] = json!(r.source_channel);
-                    v["channel_link"] = json!(channel_link);
+                    self.set_channel_fields(&reader, r, &mut v).await;
                     tasks.push(v);
                 }
                 WsFrame::ok_response(
@@ -633,4 +630,19 @@ impl MethodHandler {
             Err(e) => WsFrame::error_response("", &format!("list tasks page: {e}")),
         }
     }
+}
+
+/// A Manager who handed a task to a report's employee (`tasks.create` with
+/// a team grant) may keep managing that task — update it, reassign it within
+/// what they may assign to, cancel or remove it — while they may still
+/// assign to its employee (`UserContext::can_assign_to` on the live
+/// identity) and the task's audience admits them. Tasks they did not create
+/// still need direct Operator. `created_by` is written by the gateway from
+/// the caller's own id, never from request input.
+fn creator_may_manage(home: &std::path::Path, live: &UserContext, row: &TaskRow) -> bool {
+    !live.user_id.is_empty()
+        && live.user_id != "system"
+        && row.created_by == live.user_id
+        && live.can_assign_to(&row.assigned_to)
+        && task_audience_allows(home, live, &row.id)
 }

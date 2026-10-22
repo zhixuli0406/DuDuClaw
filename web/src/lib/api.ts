@@ -5656,8 +5656,13 @@ export const api = {
       client.call('agents.list', params ?? {}) as Promise<{ agents: AgentDetail[] }>,
     /** AI staff the caller may call from the chat (own, team, default,
      *  public), with where each right comes from. */
-    callable: () =>
-      client.call('agents.callable', {}) as Promise<{ agents: CallableAgent[]; default_agent: string | null }>,
+    /** `sessionId`: the current WebChat conversation, so "default" in the
+     *  list is the employee that answers there when nobody is called. */
+    callable: (sessionId?: string | null) =>
+      client.call('agents.callable', sessionId ? { session_id: sessionId } : {}) as Promise<{
+        agents: CallableAgent[];
+        default_agent: string | null;
+      }>,
     status: (agentId: string) =>
       client.call('agents.status', { agent_id: agentId }) as Promise<AgentDetail>,
     create: (params: {

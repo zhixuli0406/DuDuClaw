@@ -533,7 +533,10 @@ pub fn trusted_dashboard_principal(
     // live identity. Review evidence, workflow audiences and the knowledge
     // base authorize on direct bindings (`has_agent_access`), which ignores
     // them, so nothing there widens. A team read error denies like any other.
-    let team_access = if role.at_least(duduclaw_auth::UserRole::Manager) {
+    // Personal edition: no team grants (`team_edition.rs`).
+    let team_access = if role.at_least(duduclaw_auth::UserRole::Manager)
+        && crate::team_edition::team_grants_enabled(home)
+    {
         duduclaw_auth::org::team_grants_on(&db, principal)
             .map_err(|_| "identity unavailable")?
             .into_iter()

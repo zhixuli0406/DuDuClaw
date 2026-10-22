@@ -38,10 +38,16 @@ impl WebChatState {
     /// failed lookup is not cached and returns `Err` (callers deny).
     pub(super) async fn acl_snapshot(&self, user_id: &str) -> Result<AclSnapshot, String> {
         let now = std::time::Instant::now();
-        let generation = match self.user_db.acl_generation() {
-            Ok(g) => Some(g),
-            Err(e) => {
+        // SQLite reads are blocking: keep them off the runtime workers.
+        let db = self.user_db.clone();
+        let generation = match tokio::task::spawn_blocking(move || db.acl_generation()).await {
+            Ok(Ok(g)) => Some(g),
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "WebChat ACL generation unreadable — bypassing the cache");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "WebChat ACL generation task failed — bypassing the cache");
                 None
             }
         };
@@ -53,7 +59,14 @@ impl WebChatState {
                 }
             }
         }
-        let lookup = load_acl_snapshot(&self.user_db, user_id, generation);
+        let (db, home, uid) = (
+            self.user_db.clone(),
+            self.ctx.home_dir.clone(),
+            user_id.to_string(),
+        );
+        let lookup = tokio::task::spawn_blocking(move || load_acl_snapshot(&home, &db, &uid, generation))
+            .await
+            .unwrap_or_else(|e| Err(format!("ACL lookup task failed: {e}")));
         if let (Ok(snapshot), Some(g)) = (&lookup, generation) {
             // Cache only a snapshot read at the generation seen before the
             // read; one taken after a concurrent write would carry a newer
@@ -84,6 +97,31 @@ impl WebChatState {
                 SenderAccess::no_bindings(auth_user)
             }
         }
+    }
+}
+
+impl WebChatState {
+    /// May this connection resume a stored session whose employee is
+    /// `stored_agent`? The same `SenderAccess::may_call` the `@` route and
+    /// `agents.callable` use, with the session's own default employee, so a
+    /// conversation started by `@` with a public or default employee resumes
+    /// like one with a bound or team employee. Fails closed to "only what
+    /// everyone may call" when the account cannot be read.
+    pub(super) async fn may_resume_into(
+        &self,
+        auth_user: &str,
+        stored_agent: &str,
+        sid: &str,
+        user_id: &str,
+    ) -> bool {
+        let access = self.sender_access(auth_user).await;
+        let reg = self.ctx.registry.read().await;
+        let default_id = crate::channel_reply::resolve_fallback_agent(&self.ctx, &reg, sid, user_id)
+            .await
+            .map(|a| a.config.agent.name.clone());
+        reg.get(stored_agent)
+            .filter(|a| a.config.agent.status.is_operational())
+            .is_some_and(|a| access.may_call(a, default_id.as_deref()))
     }
 }
 

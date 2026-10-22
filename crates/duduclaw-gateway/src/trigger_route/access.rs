@@ -147,8 +147,8 @@ pub fn is_public_trigger(agent: &LoadedAgent) -> bool {
 
 /// A dashboard account. Unknown, inactive or unreadable accounts get no
 /// bindings and are never Admin.
-pub fn for_dashboard_user(db: &UserDb, user_id: &str) -> SenderAccess {
-    match load_account(db, user_id) {
+pub fn for_dashboard_user(home: &Path, db: &UserDb, user_id: &str) -> SenderAccess {
+    match load_account(home, db, user_id) {
         Ok(Some(access)) => SenderAccess::from_effective(access),
         Ok(None) | Err(_) => SenderAccess::no_bindings(user_id),
     }
@@ -171,18 +171,38 @@ fn lookup_cache() -> std::sync::MutexGuard<'static, LookupCache> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// `auth_meta.acl_generation` through a read-only connection, or `None`
-/// when the identity store is absent or unreadable (the cache is then
-/// bypassed, never trusted).
+/// `auth_meta.acl_generation` through a read-only connection (kept per
+/// home and reopened after any error), or `None` when the identity store is
+/// absent or unreadable (the cache is then bypassed, never trusted).
 fn read_generation(home: &Path) -> Option<u64> {
+    type Conns = HashMap<PathBuf, rusqlite::Connection>;
+    static CONNS: OnceLock<Mutex<Conns>> = OnceLock::new();
+    let mut conns = CONNS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let query = |conn: &rusqlite::Connection| {
+        conn.query_row(
+            "SELECT value FROM auth_meta WHERE key = 'acl_generation'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .and_then(|v| u64::try_from(v).ok())
+    };
+    if let Some(conn) = conns.get(home) {
+        if let Some(g) = query(conn) {
+            return Some(g);
+        }
+        conns.remove(home);
+    }
     let conn = crate::review_evidence::audience::readonly_db(&home.join("users.db")).ok()?;
-    conn.query_row(
-        "SELECT value FROM auth_meta WHERE key = 'acl_generation'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .ok()
-    .and_then(|v| u64::try_from(v).ok())
+    let g = query(&conn)?;
+    if conns.len() >= 64 {
+        conns.clear();
+    }
+    conns.insert(home.to_path_buf(), conn);
+    Some(g)
 }
 
 /// A messaging-app sender: mapped through a **verified** `channel_identities`
@@ -231,7 +251,7 @@ fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> S
     let Ok(Some(user_id)) = db.find_verified_user_id_by_channel(channel, channel_user_id) else {
         return SenderAccess::unmapped();
     };
-    match load_account(&db, &user_id) {
+    match load_account(home, &db, &user_id) {
         Ok(Some(access)) => SenderAccess::from_effective(access),
         Ok(None) => SenderAccess::unmapped(),
         Err(e) => {
@@ -244,11 +264,16 @@ fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> S
 /// What an **active** account may call, read live (role, direct bindings,
 /// team grants, generation); `None` when missing or inactive. The single
 /// computation point for channel senders, dashboard users and WebChat.
+/// Team grants are dropped unless `home` runs the Enterprise edition
+/// (`team_edition.rs`).
 pub(crate) fn load_account(
+    home: &Path,
     db: &UserDb,
     user_id: &str,
 ) -> Result<Option<Arc<EffectiveAccess>>, String> {
-    Ok(db.effective_access(user_id)?.map(Arc::new))
+    Ok(db
+        .effective_access(user_id)?
+        .map(|a| Arc::new(crate::team_edition::gate_access(home, a))))
 }
 
 /// An inactive account's access at `generation`: nothing but what everyone

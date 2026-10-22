@@ -142,12 +142,13 @@ export function WebChatPage() {
   // fails; the page then falls back to `agents.list` (own staff only, a
   // subset of what the server lets through).
   const [callable, setCallable] = useState<readonly CallableAgent[] | null>(null);
+  const chatSessionId = useChatStore((s) => s.sessionId);
   const loadCallable = useCallback(() => {
     api.agents
-      .callable()
+      .callable(chatSessionId)
       .then((r) => setCallable(Array.isArray(r?.agents) ? r.agents : null))
       .catch(() => setCallable(null));
-  }, []);
+  }, [chatSessionId]);
   useEffect(() => {
     loadCallable();
   }, [loadCallable]);

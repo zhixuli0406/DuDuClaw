@@ -418,6 +418,7 @@ fn webchat_command_admin(user_db: &UserDb, auth_user: &str) -> bool {
 /// `generation` is the ACL generation read before this call; an inactive
 /// account's empty snapshot is stamped with it.
 fn load_acl_snapshot(
+    home: &std::path::Path,
     user_db: &UserDb,
     user_id: &str,
     generation: Option<u64>,
@@ -427,7 +428,7 @@ fn load_acl_snapshot(
     if user_db.get_user(user_id)?.is_none() {
         return Err("user not found".to_string());
     }
-    match crate::trigger_route::access::load_account(user_db, user_id)? {
+    match crate::trigger_route::access::load_account(home, user_db, user_id)? {
         Some(access) => Ok(AclSnapshot { access }),
         None => Ok(AclSnapshot {
             access: crate::trigger_route::access::inactive_access(
@@ -1024,9 +1025,15 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 // to non-default agents only — the
                                                 // default/main agent branch above is
                                                 // untouched, matching wave one).
+                                                // Same predicate as the `@` list
+                                                // (`agents.callable`): an employee the
+                                                // account may still call by `@` — a
+                                                // binding, a team grant, this
+                                                // conversation's default employee or a
+                                                // public one — resumes.
                                                 if resume_needs_acl_check(&stored_agent, &agent_id)
                                                     && !state
-                                                        .agent_access_allowed(&auth_user, &stored_agent)
+                                                        .may_resume_into(&auth_user, &stored_agent, &want, &user_id)
                                                         .await
                                                 {
                                                     warn!(
@@ -2334,7 +2341,7 @@ mod tests {
         // Mirrors a widget-visitor id or a user deleted mid-session — neither
         // is a row `get_user` can find, and that must deny rather than
         // silently defaulting to some permissive shape.
-        let result = load_acl_snapshot(&db, "no-such-user-id", None);
+        let result = load_acl_snapshot(_dir.path(), &db, "no-such-user-id", None);
         assert!(result.is_err(), "an unknown user id must fail closed");
     }
 
@@ -2352,7 +2359,7 @@ mod tests {
         db.bind_agent(&user.id, "sales-bot", AccessLevel::Viewer)
             .expect("bind agent");
 
-        let snap = load_acl_snapshot(&db, &user.id, None).expect("lookup should succeed");
+        let snap = load_acl_snapshot(_dir.path(), &db, &user.id, None).expect("lookup should succeed");
         assert_eq!(snap.role(), UserRole::Employee);
         assert!(acl_allows_agent(&snap, "sales-bot"));
         assert!(!acl_allows_agent(&snap, "other-bot"));
@@ -2379,13 +2386,17 @@ mod tests {
         db.bind_agent(&emp1, "sales", AccessLevel::Owner).unwrap();
         db.bind_agent(&other, "finance", AccessLevel::Owner).unwrap();
 
-        let snap = load_acl_snapshot(&db, &mgr, None).unwrap();
+        // Personal edition (nothing recorded, or a downgrade): no team.
+        let snap = load_acl_snapshot(_dir.path(), &db, &mgr, None).unwrap();
+        assert!(!acl_allows_agent(&snap, "sales"), "personal edition ignores team grants");
+        crate::team_edition::record(_dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        let snap = load_acl_snapshot(_dir.path(), &db, &mgr, None).unwrap();
         assert!(acl_allows_agent(&snap, "sales"), "a report's employee");
         assert!(!acl_allows_agent(&snap, "finance"), "a peer's employee");
         let before = snap.generation();
 
         db.set_manager(&lead, None).unwrap();
-        let snap = load_acl_snapshot(&db, &mgr, None).unwrap();
+        let snap = load_acl_snapshot(_dir.path(), &db, &mgr, None).unwrap();
         assert!(snap.generation() > before);
         assert!(!acl_allows_agent(&snap, "sales"), "the line was cut");
     }
@@ -2399,7 +2410,7 @@ mod tests {
         db.bind_agent(&user.id, "sales-bot", AccessLevel::Owner).unwrap();
         db.set_user_status(&user.id, duduclaw_auth::UserStatus::Suspended)
             .unwrap();
-        let snap = load_acl_snapshot(&db, &user.id, Some(42)).unwrap();
+        let snap = load_acl_snapshot(_dir.path(), &db, &user.id, Some(42)).unwrap();
         assert_eq!(snap.role(), UserRole::Employee, "never Admin once suspended");
         assert!(!acl_allows_agent(&snap, "sales-bot"));
         assert_eq!(snap.generation(), 42);
@@ -2448,7 +2459,7 @@ mod tests {
             .create_user("dana@example.com", "Dana", "pw-strong-123", UserRole::Admin)
             .expect("create user");
 
-        let snap = load_acl_snapshot(&db, &admin.id, None).expect("lookup should succeed");
+        let snap = load_acl_snapshot(_dir.path(), &db, &admin.id, None).expect("lookup should succeed");
         assert_eq!(snap.role(), UserRole::Admin);
         // Admin needs no bindings — `acl_allows_agent` short-circuits on role.
         assert!(acl_allows_agent(&snap, "literally-any-agent"));

@@ -246,6 +246,25 @@ pub fn calls_anyone(reg: &AgentRegistry, text: &str) -> bool {
     super::decide(reg, text, &everyone, None).addresses_bot()
 }
 
+/// [`calls_anyone`] for one sender: an unmapped sender's name for an
+/// employee they may not call reads like an unknown name, so it does not
+/// count as addressing the bot either (mention-only groups stay silent,
+/// exactly as for a name that matches nobody).
+pub fn calls_anyone_as(
+    home: &Path,
+    reg: &AgentRegistry,
+    channel: &str,
+    sender: &str,
+    text: &str,
+    fallback: Option<&str>,
+) -> bool {
+    if !super::may_mention(text) {
+        return false;
+    }
+    let access = access::for_channel_sender(home, channel, sender);
+    super::decide(reg, text, &access, fallback).addresses_bot()
+}
+
 /// Whether this reply language is used for `home` (re-exported for adapters
 /// building their own direct replies).
 pub fn lang(home: &Path) -> Lang {

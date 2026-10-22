@@ -56,7 +56,7 @@ impl MethodHandler {
             // The WebChat `@` list / staff picker: what the caller may call,
             // including a Manager's team (`agents_callable_rpc.rs`). Any
             // signed-in account, both editions.
-            "agents.callable" => self.handle_agents_callable(ctx).await,
+            "agents.callable" => self.handle_agents_callable(ctx, params).await,
             "agents.status" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_status(params).await

@@ -32,9 +32,30 @@ use super::MethodHandler;
 use crate::protocol::WsFrame;
 use crate::trigger_route::{self, SenderAccess};
 
-/// WebChat's session prefix: the default employee is resolved for this
-/// channel exactly as `webchat/route.rs` resolves it for a turn.
+/// WebChat's session prefix: without a `session_id` the default employee is
+/// resolved for this channel the way `webchat/route.rs` resolves it for a
+/// turn in a fresh conversation.
 const WEBCHAT_SESSION: &str = "webchat:webchat";
+
+/// Longest `session_id` accepted (a WebChat session id is far shorter).
+const MAX_SESSION_ID: usize = 256;
+
+/// The session the default employee is resolved for: the caller's current
+/// WebChat conversation when given (`session_id`, the id the chat socket
+/// announced), else a fresh WebChat conversation. Only `webchat:` sessions
+/// are accepted: the parameter only picks which employee counts as
+/// "default" in the list, and the router recomputes it from the real
+/// session on every message, so a forged value can at most mislabel the
+/// caller's own list, never grant a call.
+fn session_for(params: &Value) -> String {
+    params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| s.starts_with("webchat:") && s.len() <= MAX_SESSION_ID)
+        .map(str::to_string)
+        .unwrap_or_else(|| WEBCHAT_SESSION.to_string())
+}
 
 /// The live context as the router's [`EffectiveAccess`].
 fn effective_of(ctx: &UserContext) -> EffectiveAccess {
@@ -101,14 +122,15 @@ fn report_names(db: Option<&UserDb>, grants: &[(String, GrantSource)]) -> HashMa
 }
 
 impl MethodHandler {
-    pub(crate) async fn handle_agents_callable(&self, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_agents_callable(&self, ctx: &UserContext, params: Value) -> WsFrame {
         let access = Arc::new(effective_of(ctx));
         let sender = SenderAccess::from_effective(access.clone());
         let reg = self.registry.read().await;
+        let session = session_for(&params);
         let default_id = crate::channel_reply::resolve_fallback_agent_in(
             &self.home_dir,
             &reg,
-            WEBCHAT_SESSION,
+            &session,
             &ctx.user_id,
         )
         .await

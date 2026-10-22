@@ -887,8 +887,17 @@ async fn process_telegram_message(
         let from = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
         let reg = ctx.registry.read().await;
         let routing = telegram_routing_text(&msg, &bot_username).unwrap_or_default();
-        crate::trigger_route::turn::calls_anyone(&reg, &routing)
-            || crate::trigger_route::turn::has_pending(
+        let fallback = crate::channel_reply::resolve_fallback_agent(&ctx, &reg, &conversation, &from)
+            .await
+            .map(|a| a.config.agent.name.clone());
+        crate::trigger_route::turn::calls_anyone_as(
+            &ctx.home_dir,
+            &reg,
+            "telegram",
+            &from,
+            &routing,
+            fallback.as_deref(),
+        ) || crate::trigger_route::turn::has_pending(
                 "telegram",
                 &conversation,
                 &from,

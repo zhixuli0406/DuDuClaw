@@ -19,6 +19,7 @@ struct Org {
 }
 
 fn org(home: &Path) -> Org {
+    crate::team_edition::record(home, duduclaw_core::EditionProfile::Enterprise);
     let db = UserDb::new(&home.join("users.db")).unwrap();
     let mk = |name: &str, role| {
         db.create_user(&format!("{name}@test.local"), name, "TeamPass-12345", role)
@@ -186,4 +187,42 @@ async fn a_chat_command_never_calls_or_arms_anyone() {
     let d = turn::decide_channel_turn(t.path(), &reg, line_turn(c, "U_mgr", "幫我追款", "c2"));
     assert_eq!(d, TurnDecision::Default);
     assert!(!turn::calls_anyone(&reg, "/status @sales-rep"));
+}
+
+#[tokio::test]
+async fn personal_edition_ignores_leftover_reporting_lines_on_channels() {
+    let (t, reg) = registry(false).await;
+    org(t.path());
+    // An Enterprise → Personal downgrade keeps the users.db rows.
+    crate::team_edition::record(t.path(), duduclaw_core::EditionProfile::Personal);
+    let d = turn::decide_channel_turn(
+        t.path(),
+        &reg,
+        line_turn(conv(), "U_mgr", "@sales-rep 報價", "pe1"),
+    );
+    assert!(
+        matches!(d, TurnDecision::Reply { kind: turn::ReplyKind::Refusal, .. }),
+        "mapped account, no team grant: explicit refusal, got {d:?}"
+    );
+    let access = access::for_channel_sender(t.path(), "line", "U_mgr");
+    assert_eq!(callable_ids(&reg, &access, Some("dudu")), vec!["dudu".to_string()]);
+}
+
+#[tokio::test]
+async fn only_mapped_senders_are_told_about_a_refusal() {
+    let (t, reg) = registry(false).await;
+    org(t.path());
+    // Unmapped LINE user: a forbidden name is plain text for the default
+    // employee, exactly like a name that matches nobody.
+    let c = conv();
+    let forbidden = turn::decide_channel_turn(t.path(), &reg, line_turn(c, "U_stranger", "@財務小幫手 x", "u1"));
+    let unknown = turn::decide_channel_turn(t.path(), &reg, line_turn(c, "U_stranger", "@沒有這個人 x", "u2"));
+    assert_eq!(forbidden, TurnDecision::Default);
+    assert_eq!(unknown, TurnDecision::Default);
+    assert!(!turn::calls_anyone_as(t.path(), &reg, "line", "U_stranger", "@財務小幫手 x", Some("dudu")));
+    assert!(turn::calls_anyone_as(t.path(), &reg, "line", "U_stranger", "@嘟嘟總機 x", Some("dudu")));
+    // The mapped peer manager is told.
+    let d = turn::decide_channel_turn(t.path(), &reg, line_turn(conv(), "U_peer", "@財務小幫手 x", "u3"));
+    assert!(matches!(d, TurnDecision::Reply { kind: turn::ReplyKind::Refusal, .. }), "{d:?}");
+    assert!(turn::calls_anyone_as(t.path(), &reg, "line", "U_peer", "@財務小幫手 x", Some("dudu")));
 }

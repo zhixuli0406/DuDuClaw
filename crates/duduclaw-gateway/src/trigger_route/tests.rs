@@ -181,8 +181,13 @@ async fn admin_may_call_everyone() {
 async fn unmapped_channel_sender_reaches_only_default_and_public_employees() {
     let (_t, reg) = registry(false).await;
     let u = SenderAccess::unmapped();
+    // An unmapped sender is not told the name belongs to an employee they
+    // may not call: it reads like an unknown name (owner decision L5).
+    assert_eq!(decide(&reg, "@財務小幫手 幫我", &u, Some("dudu")), TriggerRoute::None);
+    assert_eq!(decide(&reg, "@不存在的人 幫我", &u, Some("dudu")), TriggerRoute::None);
+    // A dashboard account still gets the explicit refusal.
     assert!(matches!(
-        decide(&reg, "@財務小幫手 幫我", &u, Some("dudu")),
+        decide(&reg, "@財務小幫手 幫我", &account(&[], true), Some("dudu")),
         TriggerRoute::Forbidden { .. }
     ));
     assert_eq!(
@@ -774,7 +779,16 @@ async fn reply_ctx(public_sales: bool) -> (tempfile::TempDir, crate::channel_rep
 /// were removed (the message would reach the model as finance).
 #[tokio::test]
 async fn the_shared_channel_pipeline_refuses_a_forbidden_call_without_a_model_call() {
-    let (_t, ctx) = reply_ctx(false).await;
+    let (t, ctx) = reply_ctx(false).await;
+    // A sender mapped to a dashboard account gets the explicit refusal (an
+    // unmapped one would see the name treated as plain text).
+    let db = duduclaw_auth::UserDb::new(&t.path().join("users.db")).unwrap();
+    let user = db
+        .create_user("d1@test.local", "D1", "DiscordPass-123", UserRole::Employee)
+        .unwrap();
+    db.bind_channel_identity(&user.id, "discord", "discord-user-1", true)
+        .unwrap();
+    drop(db);
     let session = format!("discord:{}", uuid::Uuid::new_v4().simple());
     let reply = crate::channel_reply::build_guarded_reply_with_session(
         "@財務小幫手 幫我算帳",
