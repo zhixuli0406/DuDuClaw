@@ -73,13 +73,28 @@ pub fn strip_sender_prefix(text: &str) -> &str {
     }
 }
 
+/// Who is editing `agent.toml` through [`update_agent_toml_edit`].
+pub struct AgentTomlEdit<'a, G> {
+    /// Recorded on the version and the audit row (`agents.update`,
+    /// `chat.model`, `channels.add`, …).
+    pub source: &'static str,
+    pub user_id: &'a str,
+    /// Re-checked inside the file lock, right before the write (a live
+    /// permission check for dashboard callers; `|| Ok(())` for system paths).
+    pub guard: G,
+}
+
 /// Edit an agent's `agent.toml` and hot-reload the registry.
 ///
-/// The single implementation behind both the dashboard's `agents.update` RPC
-/// and the in-chat `/model` command. Writes atomically (temp + rename) and then
-/// re-scans the registry — the rescan is deliberately RELIABLE rather than
-/// best-effort, because the gateway has no periodic rescan and a skipped one
-/// leaves every consumer answering with the old config until a restart.
+/// The single implementation behind the dashboard's `agents.update` RPC, the
+/// in-chat `/model` command and every other internal `agent.toml` edit. Runs
+/// through the profile file writer (`agent_files::writer`): the mutation
+/// runs on the file as read under the cross-process lock (so no concurrent
+/// edit is lost), the result is rendered format-preserving (comments and key
+/// order survive), a version is kept and the change is audited, then the
+/// registry is re-scanned RELIABLY — the gateway has no periodic rescan, so
+/// a skipped one leaves every consumer answering with the old config until a
+/// restart.
 pub async fn update_agent_toml_with<F>(
     registry: &Arc<RwLock<AgentRegistry>>,
     agent_id: &str,
@@ -88,101 +103,82 @@ pub async fn update_agent_toml_with<F>(
 where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
 {
+    let edit = AgentTomlEdit { source: "agents.update", user_id: "system", guard: || Ok(()) };
+    update_agent_toml_edit(registry, agent_id, edit, mutate).await
+}
+
+/// [`update_agent_toml_with`] naming the source and the caller.
+pub async fn update_agent_toml_edit<F, G>(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    edit: AgentTomlEdit<'_, G>,
+    mutate: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
+{
     if !duduclaw_core::is_valid_agent_id(agent_id) {
         return Err(format!("Invalid agent_id: {agent_id}"));
     }
+    let home_dir = {
+        let reg = registry.read().await;
+        let agent = reg
+            .get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        // `agent.dir` is `<home_dir>/agents/<agent_id>`.
+        agent
+            .dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?
+    };
 
-    let reg = registry.read().await;
-    let agent = reg
-        .get(agent_id)
-        .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
-    let agent_toml_path = agent.dir.join("agent.toml");
-    // `agent.dir` is `<home_dir>/agents/<agent_id>` (see `AgentRegistry::new`
-    // callers) — walk up two levels rather than threading a separate
-    // `home_dir` parameter through every caller of this already-widely-used
-    // function just for the model-switch FYI below.
-    let home_dir = agent
-        .dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    drop(reg);
+    let model_changed = std::sync::atomic::AtomicBool::new(false);
+    let render = |current: &str| -> Result<String, String> {
+        let mut table: toml::Table = current
+            .parse()
+            .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
+        let model_before = read_model_preferred(&table);
+        mutate(&mut table)?;
+        model_changed.store(
+            read_model_preferred(&table).is_some_and(|after| Some(after.as_str()) != model_before.as_deref()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        crate::handlers::config_commit::render_preserving(current, &table)
+    };
+    let outcome = crate::agent_files::writer::commit(
+        registry,
+        crate::agent_files::writer::Commit {
+            home: &home_dir,
+            agent_id,
+            key: crate::agent_files::FileKey::AgentToml,
+            expected_hash: None,
+            meta: crate::agent_files::writer::CommitMeta::new(edit.user_id, edit.source),
+            baseline: crate::agent_files::writer::Baseline::Accept,
+        },
+        render,
+        edit.guard,
+    )
+    .await
+    .map_err(|e| e.message())?;
 
-    let content = tokio::fs::read_to_string(&agent_toml_path)
-        .await
-        .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
-
-    let mut table: toml::Table = content
-        .parse()
-        .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
-
-    let model_before = read_model_preferred(&table);
-    mutate(&mut table)?;
-    if let Some(home) = home_dir.as_deref() {
-        crate::product_policy::validate_table(crate::product_policy::load(home)?, &table)?;
+    if outcome.unchanged {
+        return Ok(true);
     }
-    let model_changed = read_model_preferred(&table)
-        .is_some_and(|after| Some(after.as_str()) != model_before.as_deref());
-
-    let new_content = toml::to_string_pretty(&table)
-        .map_err(|e| format!("Failed to serialise agent.toml: {e}"))?;
-
-    // Atomic write: temp file + rename
-    let tmp_path = agent_toml_path.with_extension("toml.tmp");
-    tokio::fs::write(&tmp_path, &new_content)
-        .await
-        .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
-    tokio::fs::rename(&tmp_path, &agent_toml_path)
-        .await
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            format!("Failed to commit agent.toml: {e}")
-        })?;
-
-    // Registry re-scan for hot-reload. This must be RELIABLE, not
-    // best-effort: the gateway has no periodic rescan, so a skipped scan
-    // here leaves the in-memory registry stale forever (agents answer —
-    // and WebChat displays — the OLD model until the next unrelated
-    // update/create or a restart; distributor-reported bug). The write
-    // lock is acquired unconditionally — reader guards are all bounded
-    // (longest: one system-prompt build), so this waits, it cannot hang.
-    // Scan failures (transient IO) retry inline before giving up.
-    let mut hot_reloaded = false;
-    for attempt in 1..=3u32 {
-        let mut reg = registry.write().await;
-        match reg.scan().await {
-            Ok(()) => {
-                hot_reloaded = true;
-                break;
-            }
-            Err(e) => {
-                warn!(agent_id, attempt, error = %e, "registry rescan failed after agent.toml write — retrying");
-                drop(reg);
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-    }
+    let hot_reloaded = outcome.registry_reloaded;
     if hot_reloaded {
         // Nudge live WebChat sockets to re-send their session_info frame
         // so open dashboard tabs reflect the change without a reconnect.
         let _ = agent_config_events().send(agent_id.to_string());
         // The channel-side FYI: only when `[model].preferred` actually
         // changed value (not merely re-written), and only once the change is
-        // truly live (hot_reloaded) — a rescan failure below leaves the old
-        // model answering, so announcing a switch that hasn't landed yet
-        // would be a lie.
-        if model_changed {
-            if let Some(home_dir) = &home_dir {
-                crate::pending_agent_notice::mark_model_changed(home_dir, agent_id);
-            }
+        // truly live — announcing a switch that hasn't landed would be a lie.
+        if model_changed.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::pending_agent_notice::mark_model_changed(&home_dir, agent_id);
         }
-    } else {
-        warn!(
-            agent_id,
-            "registry rescan failed 3× — change persisted to agent.toml but in-memory consumers are stale until the next successful scan"
-        );
     }
-
     Ok(hot_reloaded)
 }
 

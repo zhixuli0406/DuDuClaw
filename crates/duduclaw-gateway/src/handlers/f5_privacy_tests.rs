@@ -260,6 +260,8 @@ async fn push_table_by_event_kind() {
         role: UserRole::Employee,
         agent_access: HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     assert!(check(&lock, true, &status));
     for line in [&own_reply, &raw_queue, &other_reply] {
@@ -324,6 +326,8 @@ async fn production_identities_pass_the_live_check() {
         role: UserRole::Employee,
         agent_access: HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     assert!(live_reader_context(home.path(), &lock).is_err());
 }

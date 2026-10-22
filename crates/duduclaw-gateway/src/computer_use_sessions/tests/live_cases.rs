@@ -35,6 +35,8 @@ fn manager_ctx(id: &str) -> UserContext {
         role: UserRole::Manager,
         agent_access: [("alice".to_string(), AccessLevel::Operator)].into_iter().collect(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

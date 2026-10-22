@@ -9,12 +9,13 @@
 //! `Ok(None)` when there is nothing to send, so timing/shape stays uniform.
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::{generate_password, hash_password, verify_password_hash, UserDb};
 use crate::models::{User, UserRole};
+use crate::user_row::bump_acl_generation;
 
 /// OTP validity window.
 pub const OTP_TTL_SECS: i64 = 300;
@@ -122,9 +123,14 @@ impl UserDb {
         verified: bool,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
+        let mut conn = self.conn();
+        // One write transaction: the takeover check, the upsert and the ACL
+        // generation bump (a channel sender's mapping is authorization input).
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("bind lookup failed: {e}"))?;
 
-        let existing: Option<(String, i64)> = conn
+        let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT user_id, verified FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
                 params![channel, channel_user_id],
@@ -132,13 +138,11 @@ impl UserDb {
             )
             .optional()
             .map_err(|e| format!("bind lookup failed: {e}"))?;
-        if let Some((owner, ver)) = existing {
-            if ver != 0 && owner != user_id {
-                return Err("channel already bound to another user".to_string());
-            }
+        if matches!(&existing, Some((owner, ver)) if *ver != 0 && owner != user_id) {
+            return Err("channel already bound to another user".to_string());
         }
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO channel_identities (user_id, channel, channel_user_id, verified, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(channel, channel_user_id)
@@ -146,18 +150,23 @@ impl UserDb {
             params![user_id, channel, channel_user_id, verified as i64, now],
         )
         .map_err(|e| format!("bind channel identity failed: {e}"))?;
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("bind channel identity failed: {e}"))?;
+        tx.commit().map_err(|e| format!("bind channel identity failed: {e}"))
     }
 
     /// Remove a channel identity binding.
     pub fn unbind_channel_identity(&self, channel: &str, channel_user_id: &str) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("unbind failed: {e}"))?;
+        tx.execute(
             "DELETE FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
             params![channel, channel_user_id],
         )
         .map_err(|e| format!("unbind failed: {e}"))?;
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("unbind failed: {e}"))?;
+        tx.commit().map_err(|e| format!("unbind failed: {e}"))
     }
 
     /// Reverse lookup: which user owns this channel DM identity (verified or not)?
@@ -357,8 +366,13 @@ impl UserDb {
             return Err(OtpError::TooManyAttempts);
         }
 
-        // Always verify (uniform timing regardless of correctness).
-        if verify_password_hash(code, &code_hash).is_ok() {
+        // Always verify (uniform timing regardless of correctness). The
+        // pooled connection is released for the slow argon2 check; the
+        // consume below is a compare-and-swap, so nothing relies on holding it.
+        drop(conn);
+        let code_ok = verify_password_hash(code, &code_hash).is_ok();
+        let conn = self.conn();
+        if code_ok {
             // Atomic compare-and-swap consume (Haiku review #1): guard on
             // `consumed = 0` so two concurrent verifications on the pooled
             // connections cannot both succeed — exactly one UPDATE flips the row.
@@ -380,20 +394,24 @@ impl UserDb {
         // Record the wrong guess. On the Nth wrong guess (N = cap) the challenge
         // is invalidated and we report TooManyAttempts so the client stops
         // retrying; earlier wrong guesses report BadCode.
-        let next = attempts + 1;
+        // Increment in SQL (not from the value read above): the connection
+        // was released during the hash check, so a concurrent wrong guess
+        // must not be lost.
+        let next: i64 = conn
+            .query_row(
+                "UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ?1 RETURNING attempts",
+                params![challenge_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| OtpError::Internal)?;
         if next >= OTP_MAX_ATTEMPTS {
             conn.execute(
-                "UPDATE otp_challenges SET attempts = ?2, consumed = 1 WHERE id = ?1",
-                params![challenge_id, next],
+                "UPDATE otp_challenges SET consumed = 1 WHERE id = ?1",
+                params![challenge_id],
             )
             .map_err(|_| OtpError::Internal)?;
             return Err(OtpError::TooManyAttempts);
         }
-        conn.execute(
-            "UPDATE otp_challenges SET attempts = ?2 WHERE id = ?1",
-            params![challenge_id, next],
-        )
-        .map_err(|_| OtpError::Internal)?;
         Err(OtpError::BadCode)
     }
 

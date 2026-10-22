@@ -50,6 +50,7 @@ import { pilotReviewDeepLink } from '@/lib/decision-review-link';
 import { parseDiscoveryApproval, type DiscoveryApprovalSummary } from './discovery-approval-payload';
 import { parseKnowledgeQuarantine, type KnowledgeQuarantineView } from './knowledge-quarantine';
 import { WorkflowActivationFacts } from './WorkflowActivationFacts';
+import { AgentFileChangeFacts } from './AgentFileChangeFacts';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -97,6 +98,7 @@ const DESCRIBED_KINDS = new Set([
   'channel_ingress_admin',
   'responsibility_operator_change',
   'computer_workspace_admin',
+  'agent_file_change',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —
@@ -551,6 +553,8 @@ function GenericApprovalView({
       {knowledgeConflict && <KnowledgeConflictSection view={knowledgeConflict} t={t} />}
 
       {approval.kind === 'workflow_activation' && <WorkflowActivationFacts approval={approval} />}
+
+      {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={agentName} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (

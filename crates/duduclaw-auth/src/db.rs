@@ -4,11 +4,16 @@ use std::sync::Mutex;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::models::*;
+use crate::org::OrgError;
+use crate::user_update::{UserUpdate, UserWriteError};
+use crate::user_row::{
+    bump_acl_generation, has_column, load_user, user_from_row, USER_COLUMNS,
+};
 
 /// SQLite-backed user database with connection pool.
 pub struct UserDb {
@@ -122,19 +127,9 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
-        // Idempotent migration for databases created before
-        // `must_change_password` existed. ADD COLUMN errors if the column is
-        // already present, so probe table_info first.
-        let has_col = conn
-            .prepare("PRAGMA table_info(users)")
-            .and_then(|mut stmt| {
-                let cols = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<String>, _>>()?;
-                Ok(cols.iter().any(|c| c == "must_change_password"))
-            })
-            .map_err(|e| format!("failed to inspect users table: {e}"))?;
-        if !has_col {
+        // Idempotent migrations: ADD COLUMN errors if the column is already
+        // present, so each one probes table_info first.
+        if !has_column(&conn, "users", "must_change_password")? {
             conn.execute(
                 "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0",
                 [],
@@ -142,37 +137,19 @@ impl UserDb {
             .map_err(|e| format!("failed to migrate users table: {e}"))?;
         }
 
-        // Idempotent migration: `department` column (install-approval routing).
-        let has_dept = conn
-            .prepare("PRAGMA table_info(users)")
-            .and_then(|mut stmt| {
-                let cols = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<String>, _>>()?;
-                Ok(cols.iter().any(|c| c == "department"))
-            })
-            .map_err(|e| format!("failed to inspect users table: {e}"))?;
-        if !has_dept {
+        // `department` column (install-approval routing).
+        if !has_column(&conn, "users", "department")? {
             conn.execute("ALTER TABLE users ADD COLUMN department TEXT", [])
                 .map_err(|e| format!("failed to migrate users.department: {e}"))?;
         }
 
-        // Idempotent migration: `bootstrap_owner` marks the row
-        // `ensure_default_admin` created, so the first-run claim and the
-        // Personal-edition local session can find the owner after the claim
-        // replaced its placeholder email. Databases from before this column
-        // existed only ever had the owner under the placeholder address, so
-        // the backfill runs once, in the same step that adds the column.
-        let has_owner = conn
-            .prepare("PRAGMA table_info(users)")
-            .and_then(|mut stmt| {
-                let cols = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<String>, _>>()?;
-                Ok(cols.iter().any(|c| c == "bootstrap_owner"))
-            })
-            .map_err(|e| format!("failed to inspect users table: {e}"))?;
-        if !has_owner {
+        // `bootstrap_owner` marks the row `ensure_default_admin` created, so
+        // the first-run claim and the Personal-edition local session can find
+        // the owner after the claim replaced its placeholder email. Databases
+        // from before this column existed only ever had the owner under the
+        // placeholder address, so the backfill runs once, in the same step
+        // that adds the column.
+        if !has_column(&conn, "users", "bootstrap_owner")? {
             conn.execute(
                 "ALTER TABLE users ADD COLUMN bootstrap_owner INTEGER NOT NULL DEFAULT 0",
                 [],
@@ -184,6 +161,21 @@ impl UserDb {
             )
             .map_err(|e| format!("failed to backfill users.bootstrap_owner: {e}"))?;
         }
+
+        // `manager_user_id`: the person-to-person reporting line (`org.rs`).
+        // Existing rows stay NULL (no manager); nothing is backfilled.
+        if !has_column(&conn, "users", "manager_user_id")? {
+            conn.execute("ALTER TABLE users ADD COLUMN manager_user_id TEXT", [])
+                .map_err(|e| format!("failed to migrate users.manager_user_id: {e}"))?;
+        }
+        // `auth_meta.acl_generation` invalidates every cached live ACL: each
+        // authorization-relevant write bumps it in the same transaction.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_users_manager ON users(manager_user_id);
+             CREATE TABLE IF NOT EXISTS auth_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT OR IGNORE INTO auth_meta (key, value) VALUES ('acl_generation', 1);",
+        )
+        .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
         Ok(())
     }
 
@@ -233,6 +225,7 @@ impl UserDb {
             last_login: None,
             must_change_password: false,
             department: None,
+            manager_user_id: None,
         })
     }
 
@@ -245,30 +238,21 @@ impl UserDb {
             return Err("invalid email or password".to_string());
         }
 
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, email, display_name, password_hash, role, status, created_at, updated_at, last_login, must_change_password
-                 FROM users WHERE email = ?1",
+        // Fetch the row, then give the pooled connection back before the
+        // (deliberately slow) argon2 check: the pool has two connections and
+        // every RPC's live ACL read needs one.
+        let row_result = {
+            let conn = self.conn();
+            conn.query_row(
+                &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"),
+                params![email],
+                |row| Ok((user_from_row(row)?, row.get::<_, String>(11)?)),
             )
-            .map_err(|e| format!("query error: {e}"))?;
+        };
 
-        let row_result = stmt.query_row(params![email], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, i64>(9)? != 0,
-            ))
-        });
-
-        let row = match row_result {
+        // A missing row and a corrupt role/status take the same path, so
+        // neither is distinguishable from a wrong password.
+        let (user, stored_hash) = match row_result {
             Ok(r) => r,
             Err(_) => {
                 // Timing-safe: perform dummy hash to equalize response time
@@ -277,74 +261,20 @@ impl UserDb {
             }
         };
 
-        let (id, email, display_name, stored_hash, role_str, status_str, created_at, updated_at, last_login, must_change_password) = row;
-
         // Verify password (always runs, whether user exists or not handled above)
         verify_password_hash(password, &stored_hash)?;
 
-        let role: UserRole = role_str.parse()
-            .map_err(|_| "invalid email or password".to_string())?;
-        let status: UserStatus = status_str.parse()
-            .map_err(|_| "invalid email or password".to_string())?;
-
         // Check status — use generic message to prevent status enumeration
-        if status != UserStatus::Active {
+        if user.status != UserStatus::Active {
             return Err("invalid email or password".to_string());
         }
-
-        Ok(User {
-            id,
-            email,
-            display_name,
-            role,
-            status,
-            created_at,
-            updated_at,
-            last_login,
-            must_change_password,
-            department: None,
-        })
+        Ok(user)
     }
 
     /// Get a user by ID.
     pub fn get_user(&self, user_id: &str) -> Result<Option<User>, String> {
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department
-                 FROM users WHERE id = ?1",
-            )
-            .map_err(|e| format!("query error: {e}"))?;
-
-        let result = stmt
-            .query_row(params![user_id], |row| {
-                let role_str: String = row.get(3)?;
-                let status_str: String = row.get(4)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    role_str,
-                    status_str,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)? != 0,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            });
-
-        match result {
-            Ok((id, email, display_name, role_str, status_str, created_at, updated_at, last_login, must_change_password, department)) => {
-                let role: UserRole = role_str.parse()
-                    .map_err(|e: String| format!("corrupt role in DB: {e}"))?;
-                let status: UserStatus = status_str.parse()
-                    .map_err(|e: String| format!("corrupt status in DB: {e}"))?;
-                Ok(Some(User { id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department }))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("query error: {e}")),
-        }
+        load_user(&conn, user_id)
     }
 
     /// Get a user by email address, without presenting a credential.
@@ -354,63 +284,35 @@ impl UserDb {
     /// Personal-edition local session endpoint, whose authority is the TCP peer
     /// address being loopback (`server.rs::handle_local_session`).
     pub fn get_user_by_email(&self, email: &str) -> Result<Option<User>, String> {
-        let id: String = {
-            let conn = self.conn();
-            match conn.query_row(
-                "SELECT id FROM users WHERE email = ?1",
-                params![email],
-                |row| row.get::<_, String>(0),
-            ) {
-                Ok(id) => id,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(format!("query error: {e}")),
-            }
-            // guard dropped here, before `get_user` takes its own connection
-        };
-        self.get_user(&id)
+        let conn = self.conn();
+        conn.query_row(
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?1"),
+            params![email],
+            user_from_row,
+        )
+        .optional()
+        .map_err(|e| format!("query error: {e}"))
     }
 
     /// List all users.
     pub fn list_users(&self) -> Result<Vec<User>, String> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department
-                 FROM users ORDER BY created_at",
-            )
+            .prepare(&format!("SELECT {USER_COLUMNS} FROM users ORDER BY created_at"))
             .map_err(|e| format!("query error: {e}"))?;
-
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)? != 0,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })
+            .query_map([], user_from_row)
             .map_err(|e| format!("query error: {e}"))?;
-
-        let mut users = Vec::new();
-        for row in rows {
-            let (id, email, display_name, role_str, status_str, created_at, updated_at, last_login, must_change_password, department) =
-                row.map_err(|e| format!("row error: {e}"))?;
-            let role: UserRole = role_str.parse()
-                .map_err(|e: String| format!("corrupt role in DB: {e}"))?;
-            let status: UserStatus = status_str.parse()
-                .map_err(|e: String| format!("corrupt status in DB: {e}"))?;
-            users.push(User { id, email, display_name, role, status, created_at, updated_at, last_login, must_change_password, department });
-        }
-        Ok(users)
+        rows.collect::<Result<Vec<User>, _>>()
+            .map_err(|e| format!("row error: {e}"))
     }
 
-    /// Update a user's display_name and/or role.
+    /// Update a user's display_name, role and/or password, all or nothing
+    /// (see [`Self::apply_user_update`], which also covers department and
+    /// manager). A role or password change bumps the ACL generation.
+    /// Demoting someone to Employee while they still have direct reports is
+    /// refused with [`crate::org::MANAGER_HAS_REPORTS`] and changes nothing:
+    /// an Employee cannot be a manager.
     pub fn update_user(
         &self,
         user_id: &str,
@@ -418,36 +320,17 @@ impl UserDb {
         role: Option<UserRole>,
         password: Option<&str>,
     ) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-
-        if let Some(name) = display_name {
-            conn.execute(
-                "UPDATE users SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
-                params![name, now, user_id],
-            )
-            .map_err(|e| format!("update error: {e}"))?;
-        }
-
-        if let Some(r) = role {
-            conn.execute(
-                "UPDATE users SET role = ?1, updated_at = ?2 WHERE id = ?3",
-                params![r.to_string(), now, user_id],
-            )
-            .map_err(|e| format!("update error: {e}"))?;
-        }
-
-        if let Some(pw) = password {
-            let hash = hash_password(pw)?;
-            // Changing the password clears the forced-change flag (C1 fix).
-            conn.execute(
-                "UPDATE users SET password_hash = ?1, updated_at = ?2, must_change_password = 0 WHERE id = ?3",
-                params![hash, now, user_id],
-            )
-            .map_err(|e| format!("update error: {e}"))?;
-        }
-
-        Ok(())
+        let update = UserUpdate {
+            display_name,
+            role,
+            password,
+            ..UserUpdate::default()
+        };
+        self.apply_user_update(user_id, &update).map_err(|e| match e {
+            UserWriteError::Org(OrgError::HasReports) => crate::org::MANAGER_HAS_REPORTS.to_string(),
+            UserWriteError::Org(OrgError::UserNotFound) => "user not found".to_string(),
+            other => format!("update error: {other}"),
+        })
     }
 
     /// Change a user's login email. `email` must already have passed
@@ -455,8 +338,11 @@ impl UserDb {
     /// returns [`EMAIL_IN_USE`] and changes nothing.
     pub fn change_email(&self, user_id: &str, email: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        let affected = conn
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("update error: {e}"))?;
+        let affected = tx
             .execute(
                 "UPDATE users SET email = ?1, updated_at = ?2 WHERE id = ?3",
                 params![email, now, user_id],
@@ -472,14 +358,22 @@ impl UserDb {
         if affected == 0 {
             return Err("user not found".to_string());
         }
-        Ok(())
+        // The email is part of the live context.
+        bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
+        tx.commit().map_err(|e| format!("update error: {e}"))
     }
 
     /// Set a user's status (active / suspended / offboarded).
+    ///
+    /// Reporting lines are kept as they are; `users.offboard` goes through
+    /// [`Self::offboard_user`], which also moves the leaver's reports.
     pub fn set_user_status(&self, user_id: &str, status: UserStatus) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        let affected = conn
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("update error: {e}"))?;
+        let affected = tx
             .execute(
                 "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
                 params![status.to_string(), now, user_id],
@@ -489,7 +383,8 @@ impl UserDb {
         if affected == 0 {
             return Err("user not found".to_string());
         }
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
+        tx.commit().map_err(|e| format!("update error: {e}"))
     }
 
     /// Update last_login timestamp.
@@ -554,8 +449,11 @@ impl UserDb {
     ) -> Result<bool, String> {
         let hash = hash_password(new_password)?;
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        let affected = conn
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("claim error: {e}"))?;
+        let affected = tx
             .execute(
                 "UPDATE users SET password_hash = ?1, updated_at = ?2, must_change_password = 0, \
                  email = COALESCE(?3, email) \
@@ -563,6 +461,12 @@ impl UserDb {
                 params![hash, now, email],
             )
             .map_err(|e| format!("claim error: {e}"))?;
+        if affected == 1 {
+            // Clears the forced-change flag (and maybe the email) of a live
+            // context.
+            bump_acl_generation(&tx).map_err(|e| format!("claim error: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("claim error: {e}"))?;
         Ok(affected == 1)
     }
 
@@ -616,25 +520,33 @@ impl UserDb {
         access_level: AccessLevel,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("bind error: {e}"))?;
+        tx.execute(
             "INSERT OR REPLACE INTO user_agent_bindings (user_id, agent_name, access_level, bound_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![user_id, agent_name, access_level.to_string(), now],
         )
         .map_err(|e| format!("bind error: {e}"))?;
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("bind error: {e}"))?;
+        tx.commit().map_err(|e| format!("bind error: {e}"))
     }
 
     /// Unbind a user from an agent.
     pub fn unbind_agent(&self, user_id: &str, agent_name: &str) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("unbind error: {e}"))?;
+        tx.execute(
             "DELETE FROM user_agent_bindings WHERE user_id = ?1 AND agent_name = ?2",
             params![user_id, agent_name],
         )
         .map_err(|e| format!("unbind error: {e}"))?;
-        Ok(())
+        bump_acl_generation(&tx).map_err(|e| format!("unbind error: {e}"))?;
+        tx.commit().map_err(|e| format!("unbind error: {e}"))
     }
 
     /// Get all agents bound to a user.

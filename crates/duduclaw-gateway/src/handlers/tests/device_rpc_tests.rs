@@ -13,6 +13,8 @@ fn employee_ctx() -> UserContext {
         role: UserRole::Employee,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

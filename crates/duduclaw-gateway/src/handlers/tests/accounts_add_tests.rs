@@ -440,6 +440,8 @@ async fn remove_account_rechecks_admin_role_on_an_open_connection() {
         role: UserRole::Admin,
         agent_access: std::collections::HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     db.update_user(&user.id, None, Some(UserRole::Manager), None)

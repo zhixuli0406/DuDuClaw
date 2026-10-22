@@ -721,6 +721,7 @@ mod tests {
             last_login: None,
             must_change_password: false,
             department: dept.map(str::to_string),
+            manager_user_id: None,
         }
     }
 

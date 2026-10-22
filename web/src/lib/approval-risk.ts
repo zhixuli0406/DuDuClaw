@@ -41,6 +41,7 @@ const BASE_RISK: Record<string, RiskLevel> = {
   agent_hire: 'high', // spins up an autonomous worker that spends budget
   memory_forget_source: 'high', // deletes memory irreversibly (forget by source)
   knowledge_add_source: 'medium', // adds a document every reader of the collection will see
+  agent_file_change: 'high', // rewrites how an AI employee behaves; only reaches review after the check warned or blocked
 };
 
 /** Default when the kind is unrecognised — see BASE_RISK note. */

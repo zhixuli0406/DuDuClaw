@@ -131,6 +131,13 @@ impl MethodHandler {
         // the decision only after it succeeded — a failed side effect leaves
         // the approval pending (retryable) instead of terminal with the claim
         // stranded.
+        // A profile file change applies first and records the decision only
+        // after the write succeeded (same order as a knowledge review).
+        if let Some(rec) = &record {
+            if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
+                return Box::pin(self.decide_agent_file_change(&broker, &approval_id, approve, ctx)).await;
+            }
+        }
         if let Some(rec) = &record {
             if rec.action_kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE {
                 return self
@@ -375,7 +382,7 @@ impl MethodHandler {
         // re-read the card inside the lock: a concurrent approve/deny or an
         // expiry that happened while waiting is seen here, before anything
         // is applied.
-        let lock = knowledge_review_lock(approval_id.as_str());
+        let lock = decision_lock(approval_id.as_str());
         let _guard = lock.lock().await;
         let fresh = match broker.get(approval_id).await {
             Ok(Some(r)) => r,
@@ -691,7 +698,7 @@ pub(crate) const AUDIT_KNOWLEDGE_REVIEW_DECISION_UNRECORDED: &str =
 /// Per-approval-id lock serializing side effect + decision for knowledge
 /// reviews. Entries are tiny and keyed by approval id; they are dropped when
 /// no request holds them.
-fn knowledge_review_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(super) fn decision_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::OnceLock<
         std::sync::Mutex<
             std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
