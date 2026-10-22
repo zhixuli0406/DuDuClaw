@@ -6,6 +6,7 @@ import { hasMinRole } from '@/lib/roles';
 import { useAgentsStore } from './agents-store';
 import { useAuthStore } from './auth-store';
 import { useChatStore, historyToMessages } from './chat-store';
+import { fetchSessionCitations } from '@/lib/knowledge-citations';
 
 /**
  * Conversation history — the single source for BOTH the sidebar 對話紀錄 group
@@ -101,7 +102,13 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       const chat = useChatStore.getState();
       if (owner) chat.selectAgent(owner === mainAgentId() ? null : owner);
       // Re-read: `selectAgent` replaced the store slice above.
-      useChatStore.getState().resumeSession(session.session_id, historyToMessages(hist.messages ?? []));
+      const msgs = historyToMessages(hist.messages ?? []);
+      useChatStore.getState().resumeSession(session.session_id, msgs);
+      // Best effort: attach knowledge citations once history is on screen. A
+      // failure leaves the messages as they are.
+      void fetchSessionCitations(session.session_id).then((rows) => {
+        if (rows.length > 0) useChatStore.getState().applyHistoryCitations(session.session_id, rows);
+      });
       return true;
     } catch {
       return false;

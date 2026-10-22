@@ -46,7 +46,15 @@ impl MethodHandler {
                     .iter()
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
-                    if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer) {
+                    // Add-source cards (title, collection, preview) only to
+                    // whoever may decide them: an Admin or an editor of
+                    // that collection, re-read now. Everything else keeps
+                    // the employee-access rule.
+                    if r.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
+                        if !self.may_decide_knowledge_card(r, &fresh).await {
+                            continue;
+                        }
+                    } else if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer) {
                         continue;
                     }
                     if self.authorize_workflow_activation_record(&r.payload,&fresh).await.is_err(){continue;}
@@ -252,5 +260,27 @@ impl MethodHandler {
             })
             .collect();
         WsFrame::ok_response("", json!({ "count": items.len(), "items": items }))
+    }
+}
+
+impl MethodHandler {
+    /// Whether `fresh` may decide this knowledge add-source card (Admin or
+    /// an editor of its collection); `false` for every other kind.
+    async fn may_decide_knowledge_card(
+        &self,
+        r: &crate::approval::ApprovalRecord,
+        fresh: &UserContext,
+    ) -> bool {
+        if r.action_kind != crate::knowledge::add_source_approval::ACTION_KIND {
+            return false;
+        }
+        let users = self.user_db.read().await.clone();
+        let user = crate::knowledge::dashboard_user(fresh, users.as_ref());
+        let (home, rec) = (self.home_dir.clone(), r.clone());
+        crate::knowledge::blocking(move || {
+            crate::knowledge::add_source_approval::may_decide(&home, &rec, &user)
+        })
+        .await
+        .is_ok()
     }
 }

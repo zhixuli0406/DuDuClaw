@@ -96,8 +96,17 @@ impl MethodHandler {
             }
         }
 
+        // Row ids ride along (when both reads agree) so a resumed
+        // conversation can re-attach records keyed by message id, such as
+        // knowledge-base citations.
+        let ids = rc
+            .session_manager
+            .get_message_ids(&session_id)
+            .await
+            .unwrap_or_default();
         match rc.session_manager.get_messages(&session_id).await {
             Ok(msgs) => {
+                let ids = (ids.len() == msgs.len()).then_some(ids);
                 // F9: `get_messages` returns oldest→newest. Show the NEWEST
                 // `limit` turns (where the user left off), not the oldest — on a
                 // long resumed conversation the oldest window is stale scrollback.
@@ -105,8 +114,9 @@ impl MethodHandler {
                 let start = msgs.len().saturating_sub(limit);
                 let messages: Vec<Value> = msgs
                     .iter()
+                    .enumerate()
                     .skip(start)
-                    .map(|m| {
+                    .map(|(i, m)| {
                         let (content, artifact) =
                             chat_history_row_content_and_artifact(&m.role, &m.content);
                         let mut row = json!({
@@ -117,6 +127,9 @@ impl MethodHandler {
                         });
                         if let Some(a) = artifact {
                             row["artifact"] = a;
+                        }
+                        if let Some(id) = ids.as_ref().and_then(|v| v.get(i)) {
+                            row["id"] = json!(id);
                         }
                         row
                     })

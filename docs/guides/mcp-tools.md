@@ -43,7 +43,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `computer_use_config.workspace` | `agent.toml [capabilities.computer_use_config]` (with `computer_use`) | 3 `computer_workspace_*` tools hidden (see [`computer_workspace_*`](#computer_workspace_--durable-workspaces) below) |
 | `db_sources` | `agent.toml [capabilities]` | 4 `db_*` tools hidden |
 | `[fork] enabled` | `agent.toml` | 6 forking tools hidden |
-| `[knowledge] enabled` + collection grants | `config.toml` / `knowledge.db` / `agent.toml [knowledge] collections` | 3 `knowledge_*` tools hidden unless the knowledge base is on and at least one collection is granted to the employee or its department (after `[knowledge] collections` narrowing); a grant change sends `list_changed` (see [`knowledge_*`](#knowledge_--document-knowledge-base) below) |
+| `[knowledge] enabled` + collection grants | `config.toml` / `knowledge.db` / `agent.toml [knowledge] collections` | 4 `knowledge_*` tools hidden unless the knowledge base is on and at least one collection is granted to the employee or its department (after `[knowledge] collections` narrowing); a grant change sends `list_changed` (see [`knowledge_*`](#knowledge_--document-knowledge-base) below) |
 | `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
 
@@ -454,7 +454,17 @@ Results are labelled as document content: every passage (and every collection na
 `[n] title · location (collection) chunk_id=…` so a reply can cite them; a passage flagged
 at index time as instruction-like text carries a warning line. `collections` only narrows.
 `knowledge_get_passage` re-checks permissions on every call and answers a missing chunk and
-a forbidden one the same way (`permission denied`).
+a forbidden one the same way (`permission denied`). Inside a channel or WebChat reply the
+numbers continue the turn's citation numbering (passages already put into the prompt keep
+theirs), so `[n]` in the answer points at the same passage the reader can open.
+
+`knowledge_add_source` (scope `knowledge:write`, also not grantable to external keys)
+proposes a document for a collection on the employee's own side: `collection` plus exactly
+one of `path` (a file in the employee's own `attachments/`), `url` or `text`, and an
+optional `title`. It refuses in a public visitor's, an unbound sender's or an unregistered
+turn, and when too many of the employee's cards are waiting. It never adds anything itself: it files a
+`knowledge_add_source` card that only an Admin or the collection's editor can decide, in the
+dashboard, and answers with the card id. There is no exemption, for any caller.
 
 `knowledge_search` and `knowledge_list_collections` start their answer with the search mode
 (hybrid = keywords plus meaning-based vectors, or keywords only) and, when vectors were not

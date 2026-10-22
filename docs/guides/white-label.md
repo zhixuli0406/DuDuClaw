@@ -9,8 +9,8 @@
 > binary and cannot be changed through config or any RPC.
 >
 > A distributor build can carry one block of distributor information on the
-> About page. It is a build input, not a dashboard setting: see
-> [distributor-notice.md](distributor-notice.md).
+> About page. The distributor maintains it in the license console; it is not
+> a dashboard setting: see [distributor-notice.md](distributor-notice.md).
 
 This page now describes only the vendor-side distributor key console.
 
@@ -148,7 +148,7 @@ same as today). A refresh preserves the original `control_url`.
 
 | Method | Access |
 |---|---|
-| `about.get` | any logged-in user (fixed product and vendor fields, version, tier; `distributor_notice` only in a distributor build) |
+| `about.get` | any logged-in user (fixed product and vendor fields, version, tier; `distributor_notice` only from a distributor build or a signed runtime copy for a distributor-issued license) |
 | `distributor.status/list/add/update/remove/issue/revoke/upgrade` | admin |
 
 ## HTTP control-plane surface (owner gateway, issuer-key-gated)

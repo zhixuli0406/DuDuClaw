@@ -5,10 +5,27 @@ authorised distributor on the dashboard About page (`/about`), above the fixed
 vendor block. Public builds do not carry one, and their About page and
 `about.get` response are unchanged.
 
-The block is a **build input**. Its HTML is compiled into the gateway binary
-when the distributor build is produced. No setting, RPC or file on an installed
-system can change it, so an end customer cannot replace it with other content.
-The flip side: changing the text means producing and shipping a new build.
+The distributor maintains the content itself on the "Distributor information"
+page of the license console (the organisation's admin role). It reaches
+customers' dashboards two ways:
+
+- **Runtime update.** About one minute after start and then every six hours, a
+  licensed gateway asks the control-plane for the current notice of the
+  distributor that issued its license. The answer is signed with the key that
+  signs licenses and bound to that license; the gateway verifies it, sanitizes
+  it again and keeps the signed document in `<home>/distributor_notice.json`.
+  Editing that file only breaks the signature and falls back to the compiled
+  notice. A distributor's edit therefore reaches online customers within about
+  six hours, without a new build.
+- **Build input.** The release pipeline pulls the notice from the control-plane
+  and compiles it in, for offline installs and gateways that have not reached
+  the control-plane yet. It embeds one only when exactly one active
+  distributor has a notice; with several, the shared image embeds none
+  (customers still get their own distributor's notice at runtime).
+
+When both exist the runtime one wins; a signed "distributor cleared it" also
+overrides the compiled copy. No setting or RPC on an installed system can
+change the block, so an end customer cannot replace it.
 
 White-label branding (custom product name, logo, colours) stays removed; see
 [white-label.md](white-label.md). This block does not change the product name,
@@ -87,3 +104,20 @@ a warning.
 Call `about.get` from a logged-in dashboard session. A distributor build
 returns `distributor_notice` with the sanitized HTML; a public build returns
 no such key.
+
+## Runtime update details
+
+- Endpoint: `POST /v1/license/distributor-notice` with `subscription_id`,
+  `machine_fingerprint` and a fresh `nonce`. The control-plane echoes the
+  nonce; an answer without the matching nonce is discarded (replay guard).
+- `distributor_notice: null` means the license has no distributor, and the
+  gateway returns to the compiled notice. Otherwise it is a signed document
+  (`kind`, `subscription_id`, `distributor_id`, `version`, `html` or `null`,
+  `sha256`, `issued_at`, `public_key_id`, `signature`).
+- Refused: a bad signature or unknown key, a document for another license,
+  `html` not matching `sha256` or over 64 KB, a version older than the one in
+  force, HTML the sanitizer refuses. The gateway keeps what it shows and logs
+  a warning.
+- Replacing or revoking the license deletes the cached file; the compiled
+  notice applies until the next fetch brings the new license's.
+- A disabled distributor gets a signed "show nothing".

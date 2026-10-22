@@ -49,6 +49,7 @@ pub const MCP_SCOPE_STRINGS: &[&str] = &[
     "team:handoff",
     "discovery:execute",
     "knowledge:read",
+    "knowledge:write",
     "admin",
 ];
 
@@ -68,8 +69,8 @@ mod tests {
     /// alongside the bidirectional test in `duduclaw-cli/src/mcp_auth.rs` —
     /// two independent trip-wires on the same drift.
     #[test]
-    fn scope_list_has_27_entries() {
-        assert_eq!(MCP_SCOPE_STRINGS.len(), 27);
+    fn scope_list_has_28_entries() {
+        assert_eq!(MCP_SCOPE_STRINGS.len(), 28);
     }
 
     #[test]

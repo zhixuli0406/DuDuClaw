@@ -1,20 +1,24 @@
 //! Who a live turn is for, keyed like the computer-use turn registry:
-//! `(verified employee id, DUDUCLAW_TURN_ID) → RequesterIdentity`.
+//! `(verified employee id, DUDUCLAW_TURN_ID) → RequesterIdentity`, plus
+//! dispatched runs keyed `(employee, DUDUCLAW_DISPATCH_RUN_ID)`.
 //!
 //! The knowledge route reads this to decide the human side of a tool call.
 //! A registration lives as long as its [`RequesterGuard`].
 //!
-//! Producers today: `runtime_dispatch::run_agent_prompt` registers every
-//! runtime call made inside a channel turn as an unidentified sender of that
-//! chat ([`register_current_turn`]), so every runtime (Claude, Codex, Grok,
-//! Antigravity, OpenAI-compatible) gets the same answer.
+//! Producers:
+//! - Channel replies: the pipeline resolves the person once per turn
+//!   ([`super::requester_map::requester_for_reply`]: the WebChat account,
+//!   a verified channel binding, or an unbound sender; public visitors map
+//!   to their channel only) and scopes it as [`CURRENT_REQUESTER`]. Every
+//!   runtime call of that turn registers it ([`register_current_turn`]) —
+//!   the Claude spawn and `runtime_dispatch::run_agent_prompt` for the
+//!   other runtimes.
+//! - Cron and dispatched runs (sub-employees, goal rounds) register as
+//!   `System` on behalf of nobody ([`register_run`]): no person is in the
+//!   loop, so they read only public / internal collections granted to the
+//!   employee.
 //!
-//! TODO(knowledge-requester): the signed-in person behind a WebChat or
-//! channel turn (WebChat `auth_user`, verified channel bindings) comes from
-//! the trigger-routing work; once it lands, register that identity here, and
-//! register cron / heartbeat / dispatch turns as `System`. Until then such
-//! turns read only `channel` grants, and turns with no registered id read
-//! nothing.
+//! A tool call whose turn and run are both unregistered serves nobody.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,28 +81,122 @@ pub fn lookup(agent_id: &str, turn_id: &str) -> Option<RequesterIdentity> {
         .map(|(_, who)| who.clone())
 }
 
+tokio::task_local! {
+    /// The person the current channel reply turn is for, resolved once by
+    /// the reply pipeline before any runtime call.
+    pub static CURRENT_REQUESTER: RequesterIdentity;
+}
+
+/// The person of the current channel reply turn; `Unknown` outside one.
+pub fn current_requester() -> RequesterIdentity {
+    CURRENT_REQUESTER
+        .try_with(Clone::clone)
+        .unwrap_or(RequesterIdentity::Unknown)
+}
+
 /// Register the channel turn the current task is answering, for a runtime
-/// call of `agent_id`: turn id from the `CURRENT_TURN_ID` task-local, chat
-/// from the `REPLY_CHANNEL` task-local (else the session id) — the values
-/// the spawns put into `DUDUCLAW_TURN_ID` / `DUDUCLAW_REPLY_CHANNEL`. The
-/// sender is not known yet here, so the turn serves an unidentified sender of
-/// that chat. `None` outside a channel turn.
+/// call of `agent_id`: turn id from the `CURRENT_TURN_ID` task-local (the
+/// value the spawns put into `DUDUCLAW_TURN_ID`), person from
+/// [`CURRENT_REQUESTER`]. `None` outside a channel reply turn.
 pub fn register_current_turn(agent_id: &str) -> Option<RequesterGuard> {
+    let who = CURRENT_REQUESTER.try_with(Clone::clone).ok()?;
     let turn_id = duduclaw_memory::feedback::CURRENT_TURN_ID
         .try_with(|t| t.clone())
         .ok()
         .flatten()?;
-    let reply = crate::claude_runner::REPLY_CHANNEL
-        .try_with(|c| c.clone())
-        .ok()
-        .filter(|c| !c.is_empty())
-        .or_else(|| {
-            duduclaw_memory::feedback::CURRENT_SESSION_ID
-                .try_with(|s| s.clone())
+    register(agent_id, &turn_id, who)
+}
+
+/// Register a cron or dispatched run of `agent_id` (key = its
+/// `DUDUCLAW_DISPATCH_RUN_ID`).
+///
+/// - A cron run, or a dispatched run with no upstream turn (cron, goal
+///   loop, dashboard work): a system turn on behalf of nobody.
+/// - A dispatched run whose upstream turn id is in scope (`CURRENT_TURN_ID`,
+///   set by the dispatcher from the bus message): what that turn's person
+///   may read, never more ([`delegated`]); an upstream turn the gateway no
+///   longer remembers serves nobody. Delegation cannot widen access.
+pub fn register_run(agent_id: &str, run_key: &str, kind: &str) -> Option<RequesterGuard> {
+    let upstream = (kind == "dispatch")
+        .then(|| {
+            duduclaw_memory::feedback::CURRENT_TURN_ID
+                .try_with(|t| t.clone())
                 .ok()
                 .flatten()
-        })?;
-    register(agent_id, &turn_id, unbound_sender_of(&reply)?)
+        })
+        .flatten();
+    let who = match upstream {
+        Some(turn) => origin_of(&turn)
+            .map(|o| delegated(o, kind))
+            .unwrap_or(RequesterIdentity::Unknown),
+        None => RequesterIdentity::System {
+            kind: kind.to_string(),
+            on_behalf_of: None,
+        },
+    };
+    register(agent_id, run_key, who)
+}
+
+/// What a run dispatched from a turn of `who` may act as: the same person's
+/// grants outside a 1:1 conversation (`System` on behalf of them), or, for
+/// an unbound sender or visitor, that channel only (never 1:1).
+pub fn delegated(who: RequesterIdentity, kind: &str) -> RequesterIdentity {
+    match who {
+        RequesterIdentity::DashboardUser { user_id }
+        | RequesterIdentity::ChannelUser {
+            user_id: Some(user_id),
+            ..
+        } => RequesterIdentity::System {
+            kind: kind.to_string(),
+            on_behalf_of: Some(user_id),
+        },
+        RequesterIdentity::ChannelUser { channel, chat, .. } => RequesterIdentity::ChannelUser {
+            channel,
+            chat,
+            sender: String::new(),
+            user_id: None,
+        },
+        system @ RequesterIdentity::System { .. } => system,
+        RequesterIdentity::Unknown => RequesterIdentity::Unknown,
+    }
+}
+
+type Origins = HashMap<String, (std::time::Instant, RequesterIdentity)>;
+
+fn origins() -> std::sync::MutexGuard<'static, Origins> {
+    static O: OnceLock<Mutex<Origins>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// How long a turn's person is remembered for runs it dispatched.
+const ORIGIN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const MAX_ORIGINS: usize = 10_000;
+
+/// Remember who a channel reply turn was for, so runs it dispatches (which
+/// carry its turn id) are limited to that person.
+pub fn remember_turn_origin(turn_id: &str, who: RequesterIdentity) {
+    if !crate::computer_use_sessions::turns::valid_turn_id(turn_id) {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut m = origins();
+    if m.len() >= MAX_ORIGINS {
+        m.retain(|_, (at, _)| now.saturating_duration_since(*at) < ORIGIN_TTL);
+        if m.len() >= MAX_ORIGINS {
+            m.clear();
+        }
+    }
+    m.insert(turn_id.to_string(), (now, who));
+}
+
+/// The person of a remembered turn.
+pub fn origin_of(turn_id: &str) -> Option<RequesterIdentity> {
+    let m = origins();
+    m.get(turn_id)
+        .filter(|(at, _)| at.elapsed() < ORIGIN_TTL)
+        .map(|(_, who)| who.clone())
 }
 
 /// An unidentified sender of the chat `<channel>:<chat>`.
@@ -116,21 +214,44 @@ fn unbound_sender_of(reply: &str) -> Option<RequesterIdentity> {
 }
 
 /// The requester of a tool call. Only what the gateway itself registered for
-/// the verified employee's turn counts: the identity in this registry (a
-/// signed-in person, a channel sender, or a system turn); else, for a live
-/// channel turn in the computer-use turn record, an unidentified sender of
-/// that chat. A missing, malformed or unregistered turn id is
+/// the verified employee counts, in this order: the turn's registration (a
+/// signed-in person, a channel sender), a live channel turn in the
+/// computer-use turn record (an unidentified sender of that chat), then the
+/// run's registration (a system turn). Anything else is
 /// [`RequesterIdentity::Unknown`], which may read nothing.
 pub fn resolve(agent_id: &str, turn_id: Option<&str>) -> RequesterIdentity {
-    let Some(turn) = turn_id.filter(|t| crate::computer_use_sessions::turns::valid_turn_id(t))
-    else {
-        return RequesterIdentity::Unknown;
-    };
-    if let Some(who) = lookup(agent_id, turn) {
-        return who;
+    resolve_with_run(agent_id, turn_id, None)
+}
+
+/// [`resolve`] with the caller's dispatch run id as the last resort.
+pub fn resolve_with_run(
+    agent_id: &str,
+    turn_id: Option<&str>,
+    run_id: Option<&str>,
+) -> RequesterIdentity {
+    let valid = |t: &&str| crate::computer_use_sessions::turns::valid_turn_id(t);
+    if let Some(turn) = turn_id.filter(valid) {
+        if let Some(who) = lookup(agent_id, turn) {
+            return who;
+        }
+        if let Some(who) = crate::computer_use_sessions::turns::reply_channel_for(agent_id, turn)
+            .and_then(|reply| unbound_sender_of(&reply))
+        {
+            return who;
+        }
     }
-    crate::computer_use_sessions::turns::reply_channel_for(agent_id, turn)
-        .and_then(|reply| unbound_sender_of(&reply))
+    // Only what `register_run` writes counts on the run path: a system turn
+    // or a channel-only sender, never a person.
+    run_id
+        .filter(valid)
+        .and_then(|run| lookup(agent_id, run))
+        .filter(|who| {
+            matches!(
+                who,
+                RequesterIdentity::System { .. }
+                    | RequesterIdentity::ChannelUser { user_id: None, .. }
+            )
+        })
         .unwrap_or(RequesterIdentity::Unknown)
 }
 
@@ -187,24 +308,157 @@ mod tests {
 
     #[tokio::test]
     async fn the_current_channel_turn_is_registered_from_task_locals() {
+        let who = RequesterIdentity::DashboardUser {
+            user_id: "u-7".into(),
+        };
         let fut = async { register_current_turn("kb-agent-d") };
-        let guard = duduclaw_memory::feedback::CURRENT_TURN_ID
+        let guard = CURRENT_REQUESTER
             .scope(
-                Some("turn-42".to_string()),
-                crate::claude_runner::REPLY_CHANNEL.scope("line:Cgroup7".to_string(), fut),
+                who.clone(),
+                duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("turn-42".to_string()), fut),
             )
             .await
             .unwrap();
-        assert!(matches!(
-            resolve("kb-agent-d", Some("turn-42")),
-            RequesterIdentity::ChannelUser { user_id: None, .. }
-        ));
+        assert_eq!(resolve("kb-agent-d", Some("turn-42")), who);
         drop(guard);
         assert_eq!(
             resolve("kb-agent-d", Some("turn-42")),
             RequesterIdentity::Unknown
         );
-        // Outside a channel turn nothing is registered.
+        // Outside a channel reply turn nothing is registered, even with a
+        // turn id in scope (a dispatched run inherits its caller's turn id).
+        let none = duduclaw_memory::feedback::CURRENT_TURN_ID
+            .scope(Some("turn-43".to_string()), async {
+                register_current_turn("kb-agent-d")
+            })
+            .await;
+        assert!(none.is_none());
         assert!(register_current_turn("kb-agent-d").is_none());
+    }
+
+    #[test]
+    fn runs_are_system_turns_and_rank_last() {
+        let g = register_run("kb-agent-e", "run0123abcd", "cron").unwrap();
+        assert!(matches!(
+            resolve_with_run("kb-agent-e", None, Some("run0123abcd")),
+            RequesterIdentity::System { on_behalf_of: None, .. }
+        ));
+        // A run id never stands in for a person: a person registered under
+        // that id is ignored on the run path.
+        let p = register(
+            "kb-agent-e",
+            "run-person",
+            RequesterIdentity::DashboardUser { user_id: "u".into() },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_with_run("kb-agent-e", None, Some("run-person")),
+            RequesterIdentity::Unknown
+        );
+        // Another employee cannot use the run id.
+        assert_eq!(
+            resolve_with_run("kb-agent-f", None, Some("run0123abcd")),
+            RequesterIdentity::Unknown
+        );
+        // The turn registration wins over the run.
+        let t = register(
+            "kb-agent-e",
+            "turn-77",
+            RequesterIdentity::DashboardUser { user_id: "u-1".into() },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_with_run("kb-agent-e", Some("turn-77"), Some("run0123abcd")),
+            RequesterIdentity::DashboardUser { user_id: "u-1".into() }
+        );
+        // An unknown turn id falls through to the run.
+        assert!(matches!(
+            resolve_with_run("kb-agent-e", Some("turn-unknown"), Some("run0123abcd")),
+            RequesterIdentity::System { .. }
+        ));
+        drop((g, p, t));
+    }
+
+    #[tokio::test]
+    async fn delegated_runs_never_widen_access() {
+        let unbound = RequesterIdentity::ChannelUser {
+            channel: "line".into(),
+            chat: "Ustranger".into(),
+            sender: "Ustranger".into(),
+            user_id: None,
+        };
+        remember_turn_origin("line:Ustranger#t-del-1", unbound);
+        // B runs because A delegated from that turn: channel-only, never 1:1.
+        let g = duduclaw_memory::feedback::CURRENT_TURN_ID
+            .scope(Some("line:Ustranger#t-del-1".to_string()), async {
+                register_run("kb-agent-b", "rundel0001", "dispatch")
+            })
+            .await
+            .unwrap();
+        let who = resolve_with_run("kb-agent-b", None, Some("rundel0001"));
+        assert_eq!(
+            who,
+            RequesterIdentity::ChannelUser {
+                channel: "line".into(),
+                chat: "Ustranger".into(),
+                sender: String::new(),
+                user_id: None,
+            }
+        );
+        let human = duduclaw_knowledge::requester::human_ctx(&who, &super::super::NoUsers);
+        assert_eq!(human.mode, duduclaw_knowledge::acl::HumanMode::ChannelOnly);
+        assert!(!human.is_private);
+        drop(g);
+        // A forgotten upstream turn serves nobody.
+        let g = duduclaw_memory::feedback::CURRENT_TURN_ID
+            .scope(Some("line:x#t-unknown".to_string()), async {
+                register_run("kb-agent-b", "rundel0002", "dispatch")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_with_run("kb-agent-b", None, Some("rundel0002")),
+            RequesterIdentity::Unknown
+        );
+        drop(g);
+        // A signed-in person: their own grants, not 1:1.
+        assert_eq!(
+            delegated(RequesterIdentity::DashboardUser { user_id: "u1".into() }, "dispatch"),
+            RequesterIdentity::System {
+                kind: "dispatch".into(),
+                on_behalf_of: Some("u1".into())
+            }
+        );
+        // No upstream turn (cron, goal loop): a system turn.
+        let g = register_run("kb-agent-b", "rundel0003", "dispatch").unwrap();
+        assert!(matches!(
+            resolve_with_run("kb-agent-b", None, Some("rundel0003")),
+            RequesterIdentity::System { on_behalf_of: None, .. }
+        ));
+        drop(g);
+    }
+
+    /// The id a runtime hands to its MCP server for a run is the key the run
+    /// was registered under (`claude_runner::invoke_recorded` mints one key
+    /// and uses it for both).
+    #[tokio::test]
+    async fn every_runtime_sees_the_registered_run_key() {
+        let key = crate::memory_provenance::new_dispatch_run_key();
+        let pairs = crate::memory_provenance::DISPATCH_RUN
+            .scope(Some(("cron:bot".to_string(), key.clone())), async {
+                crate::memory_provenance::turn_source_env_pairs()
+            })
+            .await;
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == duduclaw_core::ENV_DISPATCH_RUN_ID && *v == key),
+            "{pairs:?}"
+        );
+        let _g = register_run("kb-agent-k", &key, "cron").unwrap();
+        assert!(matches!(
+            resolve_with_run("kb-agent-k", None, Some(&key)),
+            RequesterIdentity::System { .. }
+        ));
     }
 }

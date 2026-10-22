@@ -255,6 +255,7 @@ fn configure(conn: &Connection) -> KbResult<()> {
 /// Idempotent: creates whatever is missing and records the version.
 pub fn migrate(conn: &Connection) -> KbResult<()> {
     conn.execute_batch(DDL)?;
+    conn.execute_batch(crate::citations::DDL)?;
     let current: Option<String> = conn
         .query_row(
             "SELECT value FROM kb_meta WHERE key='schema_version'",

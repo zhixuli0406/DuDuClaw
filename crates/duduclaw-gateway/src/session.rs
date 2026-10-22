@@ -515,6 +515,25 @@ impl SessionManager {
         Ok(messages)
     }
 
+    /// Row ids of [`Self::get_messages`]' messages, in the same order (same
+    /// filter). Lets display paths tie a message to records keyed by its id
+    /// (knowledge-base citations) without changing `SessionMessage`.
+    pub async fn get_message_ids(&self, session_id: &str) -> Result<Vec<i64>> {
+        let conn = self.acquire().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM session_messages
+                 WHERE session_id = ?1 AND hidden = 0 AND undone_at IS NULL
+                 ORDER BY id ASC",
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
     /// Check whether the session's token count exceeds the compression threshold.
     pub async fn should_compress(&self, session_id: &str) -> bool {
         let conn = self.acquire().await;

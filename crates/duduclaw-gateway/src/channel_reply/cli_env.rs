@@ -91,8 +91,6 @@ pub(super) async fn spawn_claude_cli_with_env(
         // `--system-prompt-file` is set (2026-08-16). Removed.
         "-p",
         user_message,
-        "--model",
-        model,
         "--output-format",
         "stream-json",
         "--verbose",
@@ -102,6 +100,13 @@ pub(super) async fn spawn_claude_cli_with_env(
         "--max-turns",
         "50",
     ]);
+    // An unset model (`[model] utility = ""`, a failover with no model) must
+    // leave the choice to the CLI. `--model ""` was sent verbatim before
+    // 2026-10-22; in that day's logs only those calls failed with
+    // `assistant error: unknown` (correlation, not yet reproduced).
+    if !model.trim().is_empty() {
+        cmd.args(["--model", model]);
+    }
 
     // P1/WP-3: per-call reasoning effort. `--effort <low|medium|high|xhigh|max>`
     // verified on Claude Code 2.1.258 (`--help`); it is per-invocation only and
@@ -323,6 +328,13 @@ pub(super) async fn spawn_claude_cli_with_env(
         .ok()
         .filter(|id| !id.is_empty())
         .and_then(|agent| crate::computer_use_sessions::turns::register_current_turn(&agent));
+    // Knowledge-base tool calls of this turn learn who it is for (the
+    // person the reply pipeline resolved), for as long as this CLI runs.
+    let _knowledge_turn = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .try_with(|id| id.clone())
+        .ok()
+        .filter(|id| !id.is_empty())
+        .and_then(|agent| crate::knowledge::turn_requesters::register_current_turn(&agent));
 
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");

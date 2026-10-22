@@ -362,6 +362,18 @@ fn without_a_user_database_no_user_is_grantable() {
     assert!(dir.may_grant(&admin, PrincipalKind::Channel, "line"));
 }
 
+#[test]
+fn visitor_channels_can_be_granted_but_webchat_cannot() {
+    let dir = Directory::default();
+    let admin = ctx("root", UserRole::Admin, &[]);
+    assert!(dir.may_grant(&admin, PrincipalKind::Channel, "widget"));
+    assert!(dir.may_grant(&admin, PrincipalKind::Channel, "odoolivechat"));
+    assert!(!dir.may_grant(&admin, PrincipalKind::Channel, "webchat"));
+    assert!(!dir.may_grant(&admin, PrincipalKind::Channel, "widgets"));
+    let listed = grantable_channels();
+    assert!(listed.contains(&"widget") && listed.contains(&"odoolivechat"));
+}
+
 #[tokio::test]
 async fn people_search_is_capped_and_resolve_names_only_listed_ids() {
     let f = fixture(false).await;

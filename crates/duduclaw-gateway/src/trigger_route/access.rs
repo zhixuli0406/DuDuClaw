@@ -261,6 +261,27 @@ fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> S
     }
 }
 
+/// The **active** dashboard account a messaging-app sender is bound to
+/// through a **verified** `channel_identities` row; `None` for an unbound
+/// sender, an unverified row, an inactive account or any lookup failure
+/// (the least a sender can have). Used by the knowledge base to decide whose
+/// collections a channel turn may read.
+pub fn verified_user_for_channel_sender(
+    home: &Path,
+    channel: &str,
+    channel_user_id: &str,
+) -> Option<String> {
+    if channel_user_id.is_empty() {
+        return None;
+    }
+    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
+    let user_id = db
+        .find_verified_user_id_by_channel(channel, channel_user_id)
+        .ok()
+        .flatten()?;
+    load_account(home, &db, &user_id).ok().flatten().map(|_| user_id)
+}
+
 /// What an **active** account may call, read live (role, direct bindings,
 /// team grants, generation); `None` when missing or inactive. The single
 /// computation point for channel senders, dashboard users and WebChat.

@@ -499,6 +499,11 @@ where
     // below share one source.
     let run_session = format!("{}:{agent_id}", request_type.as_str());
     let run_key = crate::memory_provenance::new_dispatch_run_key();
+    // Knowledge-base reads during the run: no person is in the loop, so the
+    // run is a system turn (public / internal collections granted to the
+    // employee), keyed by the run id every runtime hands to its MCP server.
+    let _knowledge_run =
+        crate::knowledge::turn_requesters::register_run(agent_id, &run_key, request_type.as_str());
     let fut = crate::memory_provenance::DISPATCH_RUN
         .scope(Some((run_session.clone(), run_key.clone())), fut);
     // Native-tool collection: REUSE an outer scope when the goal loop already
@@ -1465,6 +1470,25 @@ pub(crate) fn is_rate_limit_error(error: &str) -> bool {
         || lower.contains("usage limit")
         || lower.contains("overloaded")
         || lower.contains("capacity limit")
+        || has_cli_error_code(&lower, "rate_limit")
+}
+
+/// Whether `lower` carries `claude CLI assistant error: <code>` with exactly
+/// `code` (the `error` field of the CLI's synthetic assistant message).
+///
+/// 2026-10-22 field incident: a weekly-capped subscription answers with the
+/// code `rate_limit` (underscore), which none of the phrase matches above
+/// catch. It was booked as a generic error, never cooled down, and the
+/// rotator kept picking the capped account for a whole trading day. Matching
+/// the whole code token (not a substring) keeps advisory field names such as
+/// `rate_limit_event` / `rate_limit_info` out.
+fn has_cli_error_code(lower: &str, code: &str) -> bool {
+    lower.split("assistant error:").skip(1).any(|rest| {
+        rest.trim_start()
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            == Some(code)
+    })
 }
 
 /// Where a Direct-API request for a model is served.
@@ -3154,12 +3178,16 @@ async fn call_with_rotation(
 
     let max_attempts = rotator.count().await.max(1);
     let mut last_error = String::new();
+    // One attempt per account: without this, Priority re-picked the same
+    // refusing account on every attempt (2026-10-22 incident).
+    let mut tried: Vec<String> = Vec::new();
 
     for attempt in 0..max_attempts {
-        let selected = match rotator.select_with_pool(account_pool).await {
+        let selected = match rotator.select_with_pool_excluding(account_pool, &tried).await {
             Some(s) => s,
             None => break,
         };
+        tried.push(selected.id.clone());
 
         // #15 (2026-05-12): bare_mode requires ANTHROPIC_API_KEY auth.
         // OAuth accounts can't supply that, so skip them with a hint
@@ -3911,6 +3939,9 @@ pub(crate) struct ClaudeCmdGuards {
     /// `(agent, turn) → reply channel` registration for the computer-use
     /// route's confirmations; lives as long as the spawned CLI.
     turn: Option<crate::computer_use_sessions::turns::TurnGuard>,
+    /// `(agent, turn) → person` for the knowledge route, inside a channel
+    /// reply turn; lives as long as the spawned CLI.
+    knowledge: Option<crate::knowledge::turn_requesters::RequesterGuard>,
 }
 
 fn prepare_claude_cmd(
@@ -4021,8 +4052,6 @@ fn prepare_claude_cmd(
     cmd.args([
         "-p",
         prompt,
-        "--model",
-        model,
         "--output-format",
         "stream-json",
         "--verbose",
@@ -4045,6 +4074,13 @@ fn prepare_claude_cmd(
         "--max-turns",
         "50",
     ]);
+    // An unset model (`[model] utility = ""`, a failover with no model) must
+    // leave the choice to the CLI. `--model ""` was sent verbatim before
+    // 2026-10-22; in that day's logs only those calls failed with
+    // `assistant error: unknown` (correlation, not yet reproduced).
+    if !model.trim().is_empty() {
+        cmd.args(["--model", model]);
+    }
 
     // P1/WP-3: per-call reasoning effort. `--effort <low|medium|high|xhigh|max>`
     // verified on Claude Code 2.1.258 (`--help`), per-invocation only (the CLI
@@ -4229,10 +4265,11 @@ fn prepare_claude_cmd(
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only
     // while the guards live, i.e. while the CLI runs.
-    let turn = config_dir
+    let spawned = config_dir
         .and_then(|d| d.file_name())
-        .and_then(|n| n.to_str())
-        .and_then(crate::computer_use_sessions::turns::register_current_turn);
+        .and_then(|n| n.to_str());
+    let turn = spawned.and_then(crate::computer_use_sessions::turns::register_current_turn);
+    let knowledge = spawned.and_then(crate::knowledge::turn_requesters::register_current_turn);
 
     Ok((
         cmd,
@@ -4240,6 +4277,7 @@ fn prepare_claude_cmd(
             prompt: prompt_guard,
             mcp_proxy: mcp_proxy_guard,
             turn,
+            knowledge,
         },
     ))
 }
@@ -4694,6 +4732,28 @@ mod rate_limit_classifier_tests {
         // on its own words after the advisory tokens are neutralized.
         let mixed = format!("usage limit reached; last frame: {ADVISORY_FRAME}");
         assert!(is_rate_limit_error(&mixed));
+    }
+
+    /// 2026-10-22: the exact strings the gateway logged while a weekly-capped
+    /// subscription refused every call.
+    #[test]
+    fn cli_rate_limit_error_code_classifies() {
+        assert!(is_rate_limit_error("claude CLI assistant error: rate_limit"));
+        assert!(is_rate_limit_error(
+            "All accounts exhausted. Last error: claude CLI assistant error: rate_limit"
+        ));
+    }
+
+    #[test]
+    fn other_cli_error_codes_do_not_classify() {
+        assert!(!is_rate_limit_error("claude CLI assistant error: unknown"));
+        assert!(!is_rate_limit_error(
+            "claude CLI assistant error: authentication_failed"
+        ));
+        // Advisory field names start with `rate_limit` but are not the code.
+        assert!(!is_rate_limit_error("claude CLI assistant error: rate_limit_info"));
+        // The bare token outside the CLI error shape is not enough either.
+        assert!(!is_rate_limit_error("field rate_limit present in frame"));
     }
 }
 
