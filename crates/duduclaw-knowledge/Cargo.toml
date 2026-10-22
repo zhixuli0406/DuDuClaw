@@ -51,7 +51,12 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 # Model download (async, through duduclaw-onnx) and the cloud embedding
 # providers (blocking client; only ever called off the async runtime).
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+# Offline bundles: minisign signature (release key) checked before the tar
+# is read; both already in the workspace lock.
+minisign-verify = "0.2"
+tar = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
+minisign = { version = "0.7", default-features = false }

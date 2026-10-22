@@ -176,7 +176,7 @@ async fn cloud(home: &Path, cfg: &EmbeddingConfig) -> Arc<dyn Embedder> {
             target.provider.vendor()
         ));
     };
-    let transport = match HttpTransport::new() {
+    let transport = match HttpTransport::new(cfg.allow_private_endpoint) {
         Ok(t) => Arc::new(t),
         Err(e) => return unavailable(format!("無法建立連線：{e}")),
     };

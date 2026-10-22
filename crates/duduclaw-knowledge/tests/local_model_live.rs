@@ -59,7 +59,8 @@ fn verify_offline_when_asked() {
         return;
     };
     let spec = catalog::find(&id).unwrap();
-    install::verify_offline(spec, &home).unwrap();
+    let pubkey = std::env::var("DUDUCLAW_KB_LIVE_PUBKEY").expect("release public key (base64) for the bundle signature");
+    install::verify_offline(spec, &home, &pubkey).unwrap();
     assert!(install::installed_problem(spec, &home).is_none());
 }
 

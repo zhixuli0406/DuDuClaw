@@ -8141,7 +8141,7 @@
   "kb.embedding.install.progress": "下載中 {percent}%",
   "kb.embedding.removed": "已移除模型，目前只比對關鍵字",
   "kb.embedding.verified": "模型檔案檢查通過，開始建立向量",
-  "kb.embedding.offline.hint": "沒有網路的主機：把離線安裝包解壓到 DuDuClaw 資料夾後，按「重新檢查」。",
+  "kb.embedding.offline.hint": "沒有網路的主機：把離線安裝包（.tar）和它的簽章檔（.tar.minisig）一起放進 DuDuClaw 資料夾的 models／embedding，不要解壓，再按「重新檢查」。",
   "kb.embedding.rebuild": "補齊尚未建立的向量",
   "kb.embedding.rebuild.queued": "已排入處理",
   "kb.embedding.disclosure.title": "改用 {vendor} 計算？",
@@ -8151,5 +8151,7 @@
   "kb.embedding.disclosure.queries": "員工與使用者在搜尋時輸入的問題也會去識別化後送出。",
   "kb.embedding.disclosure.redactionOff": "去識別化目前沒有啟用，啟用前不會送出任何內容，搜尋會維持只比對關鍵字。",
   "kb.embedding.disclosure.ack": "我了解文件段落（去識別化後）會送到 {vendor}（{host}）",
-  "kb.embedding.disclosure.confirm": "改用 {vendor}"
+  "kb.embedding.disclosure.confirm": "改用 {vendor}",
+  "kb.embedding.setUp": "設定語意搜尋",
+  "kb.embedding.disclosure.customEndpoint": "這個端點不是 {vendor} 官方的網址：你的 {vendor} API 金鑰也會送到 {host}。請確認這台主機可信任。"
 }

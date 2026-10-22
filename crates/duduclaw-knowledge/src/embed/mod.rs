@@ -11,6 +11,7 @@
 //! | module | role |
 //! |---|---|
 //! | [`catalog`] | pinned local models (`embed-catalog.json`) |
+//! | [`bundle`] | signed offline bundles: signature first, then a strict unpack |
 //! | [`install`] | download / offline verify / remove a local model |
 //! | [`job`] | compute a source's missing vectors (reuse first) |
 //! | [`local_onnx`] | ONNX Runtime inference, e5 mean / Qwen3 last-token pooling |
@@ -21,6 +22,7 @@
 //! | [`vectors`] | vector rows: pending, reuse by `text_sha256`, coverage |
 //! | [`vector_cache`] | brute-force cosine search over one model's vectors |
 
+pub mod bundle;
 pub mod catalog;
 pub mod cloud;
 pub mod cloud_gemini;

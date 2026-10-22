@@ -121,9 +121,9 @@ AI 員工替某人回答時，取下列條件的交集：
 | 向量 | 384 維、平均池化（mean pooling）、`query: `／`passage: ` 前綴 | 1,024 維中的前 512 維、取最後一個 token 池化（last-token pooling）、提問前加一段英文指示 |
 | 速度（Apple M4、5 執行緒） | 每分鐘約 1,200–2,500 段 | 每分鐘約 150–340 段 |
 
-每個檔案都固定在單一 commit，並附大小與 SHA-256，不會去解析「最新版」。模型不包含在執行檔裡：管理員到**系統設定 → 進階設定 → 文件知識庫搜尋**安裝（ONNX Runtime 函式庫約 30 MB，缺少時會一併安裝，與去識別化的 AI 偵測共用）。安裝完成後，背景會替每一段建立向量；重新建立索引的來源，文字沒變的段落會沿用原本的向量。超過 `idle_unload_minutes` 沒用到的模型會卸載。授權為非商用的模型（jina-embeddings v3／v5）不提供。Intel 版 macOS 在這個版本沒有 ONNX Runtime 可用，會顯示「不支援」。
+每個檔案都固定在單一 commit，並附大小與 SHA-256，不會去解析「最新版」。模型不包含在執行檔裡：管理員到**系統設定 → 進階設定 → 文件知識庫搜尋**安裝（ONNX Runtime 函式庫約 30 MB，缺少時會一併安裝，與去識別化的 AI 偵測共用）。安裝完成後，背景會替每一段建立向量；重新建立索引的來源，文字沒變的段落會沿用原本的向量。超過 `idle_unload_minutes` 沒用到的模型會卸載。授權為非商用的模型（jina-embeddings v3／v5）不提供。Qwen3 的轉換版本身沒有附授權聲明，Apache-2.0 條款來自基底模型，商用前請自行確認。ONNX Runtime 執行庫也依平台固定了雜湊，載入前會先比對，知識庫與去識別化的 AI 偵測都一樣：手動放進去的執行庫會被拒絕。Intel 版 macOS 在這個版本沒有 ONNX Runtime 可用，會顯示「不支援」。
 
-**離線主機**：每個版本都附 `duduclaw-kb-model-multilingual-e5-small-<platform>.tar`（模型檔加執行環境壓縮檔；`scripts/kb-model-bundle.sh <platform> <model> <dir>` 可為清單中的任何模型打包）。解壓到 DuDuClaw 資料夾（`tar -xf … -C ~/.duduclaw`），再按**重新檢查（離線安裝）**：所有檔案都會先對照同一份固定的雜湊值，通過才算安裝完成。
+**離線主機**：每個版本都附 `duduclaw-kb-model-multilingual-e5-small-<platform>.tar` 與它的 minisign 簽章檔 `.tar.minisig`，用自動更新信任的同一把發行金鑰簽署（`scripts/kb-model-bundle.sh <platform> <model> <dir>` 可為清單中的任何模型打包，設定 `KB_BUNDLE_MINISIGN_KEY` 會一併簽章）。兩個檔案不要解壓，一起放進 DuDuClaw 資料夾的 `models/embedding/`，再按**重新檢查（離線安裝）**。DuDuClaw 先驗簽章（也確認簽章寫的是這個檔名），通過後才讀取壓縮檔，只解出預期的一般檔案（遇到連結、其他路徑或多餘檔案就整包拒絕），接著逐檔比對固定的雜湊值、比對執行庫自己的雜湊，全部通過才算安裝完成，最後刪掉安裝包。沒有簽章、或不是這把金鑰簽的安裝包一律拒收。
 
 ### 雲端供應商
 
@@ -132,6 +132,7 @@ AI 員工替某人回答時，取下列條件的交集：
 - 由管理員在儀表板選用，並且必須勾選確認：段落（去識別化之後）會送到該供應商與主機。這份確認（誰、何時、供應商、主機、模型）存在 `config.toml`；更換供應商、端點或模型都需要重新確認，改選其他方式則會移除這份確認。
 - 每一段與每個提問都先經過營運者的 `[redaction]` 規則，命中的內容換成 `[EMAIL]` 之類的標記，而且不會還原。去識別化被關閉或強制停用、規則編譯失敗、或根本沒有規則時：什麼都不送，搜尋維持只比對關鍵字。規則式去識別化抓不到所有人名；人名不能外流的話，請開啟 AI 偵測。
 - `restricted` 集合，以及 `embedding_policy = "local_only"` 的集合永遠不送；使用雲端供應商時，它們只用關鍵字搜尋。
+- `cloud_base_url` 必須是公開的 `https` 位址。內部網路、本機、link-local 或雲端中繼資料位址（`10.x`、`127.x`、`169.254.169.254`、`fc00::/7` 等）一律拒絕，除非管理員在設定檔進階編輯裡設 `allow_private_endpoint = true`；每次請求都會重新解析主機，連線固定在檢查過的位址。供應商的 API 金鑰會送到設定的端點，端點不是供應商官方網址時，揭露對話框會特別提醒。
 - API 金鑰來自帳號清單（`cloud_account` 可指定單一帳號）或供應商的環境變數。雲端出錯時，該次搜尋只用關鍵字，受影響的來源會帶著 `embedding_failed` 警告，直到下一次補齊成功。
 
 ## AI 員工怎麼用
@@ -176,12 +177,13 @@ provider = "local"                     # local | openai | gemini | none
 local_model = "multilingual-e5-small"  # 或 "qwen3-embedding-0.6b"
 cloud_model = ""                       # 空白 = 供應商的預設模型
 cloud_account = ""                     # 帳號 id；空白 = 該供應商的任一帳號，再退到環境變數
-cloud_base_url = ""                    # 空白 = 官方端點；只接受 https（http 只允許連到 127.0.0.1）
+cloud_base_url = ""                    # 空白 = 官方端點；只接受公開的 https
+allow_private_endpoint = false         # 限管理員：接受內部或本機端點（http 只允許連到 127.0.0.1）
 batch_size = 16
 threads = 0                            # 0 = 核心數的一半
 max_vector_rows = 200000
 idle_unload_minutes = 10
-# cloud_disclosure_ack 由儀表板寫入
+# cloud_disclosure_ack 只由揭露對話框寫入；設定檔進階編輯不能新增或修改它
 ```
 
 超出範圍的值會被調回邊界。`enabled = false` 時工具不列出，所有 RPC 與上傳都會被拒絕。不認得的 `provider` 值代表只用關鍵字搜尋，並附上原因。

@@ -40,6 +40,9 @@ export interface KbEmbeddingCloudTarget {
   model?: string;
   host?: string;
   ack_valid?: boolean;
+  /** The endpoint is not the vendor's official one (the API key is sent there too). */
+  custom_endpoint?: boolean;
+  allow_private_endpoint?: boolean;
   error?: string;
 }
 

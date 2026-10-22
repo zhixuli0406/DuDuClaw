@@ -7,6 +7,7 @@
 //! cloud_model = ""                       # empty = the provider's default
 //! cloud_account = ""                     # account id to use (empty = rotator / env)
 //! cloud_base_url = ""                    # empty = the provider's official endpoint
+//! allow_private_endpoint = false         # Admin-only: accept a private / loopback endpoint
 //! batch_size = 16
 //! threads = 0                            # 0 = half the cores
 //! max_vector_rows = 200000
@@ -94,6 +95,9 @@ pub struct EmbeddingConfig {
     pub cloud_model: String,
     pub cloud_account: String,
     pub cloud_base_url: String,
+    /// Admin-only switch: accept a cloud endpoint on a private, loopback,
+    /// link-local or metadata address (a local proxy). Off by default.
+    pub allow_private_endpoint: bool,
     pub batch_size: usize,
     pub threads: usize,
     pub max_vector_rows: usize,
@@ -110,6 +114,7 @@ impl Default for EmbeddingConfig {
             cloud_model: String::new(),
             cloud_account: String::new(),
             cloud_base_url: String::new(),
+            allow_private_endpoint: false,
             batch_size: 16,
             threads: 0,
             max_vector_rows: 200_000,
@@ -190,6 +195,10 @@ impl EmbeddingConfig {
             cloud_model: s(t, "cloud_model").unwrap_or_default(),
             cloud_account: s(t, "cloud_account").unwrap_or_default(),
             cloud_base_url: s(t, "cloud_base_url").unwrap_or_default(),
+            allow_private_endpoint: t
+                .get("allow_private_endpoint")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
             batch_size: n(t, "batch_size", 16, 1, 64) as usize,
             threads: n(t, "threads", 0, 0, 64) as usize,
             max_vector_rows: n(t, "max_vector_rows", 200_000, 1_000, 2_000_000) as usize,
@@ -231,11 +240,13 @@ impl EmbeddingConfig {
             ));
         }
         Some(
-            validate_base_url(&base).map(|(base_url, host)| CloudTarget {
-                provider,
-                model,
-                base_url,
-                host,
+            validate_base_url(&base, self.allow_private_endpoint).map(|(base_url, host)| {
+                CloudTarget {
+                    provider,
+                    model,
+                    base_url,
+                    host,
+                }
             }),
         )
     }

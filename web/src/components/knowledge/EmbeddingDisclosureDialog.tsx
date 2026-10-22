@@ -25,6 +25,7 @@ export function EmbeddingDisclosureDialog({
   model,
   redactionReady,
   redactionReason,
+  customEndpoint,
   busy,
   onConfirm,
   onClose,
@@ -35,6 +36,8 @@ export function EmbeddingDisclosureDialog({
   model: string;
   redactionReady: boolean;
   redactionReason?: string;
+  /** The configured endpoint is not the vendor's own: the API key goes there too. */
+  customEndpoint: boolean;
   busy: boolean;
   onConfirm: () => void;
   onClose: () => void;
@@ -63,6 +66,12 @@ export function EmbeddingDisclosureDialog({
           <li>{t('kb.embedding.disclosure.excluded')}</li>
           <li>{t('kb.embedding.disclosure.queries')}</li>
         </ul>
+        {customEndpoint && (
+          <div role="alert" className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
+            <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" />
+            <p>{t('kb.embedding.disclosure.customEndpoint', { vendor, host })}</p>
+          </div>
+        )}
         {!redactionReady && (
           <div role="alert" className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
             <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" />

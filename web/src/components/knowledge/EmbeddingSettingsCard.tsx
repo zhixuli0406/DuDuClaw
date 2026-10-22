@@ -182,6 +182,7 @@ export function EmbeddingSettingsCard() {
           model={target.model}
           redactionReady={s.redaction?.ready ?? false}
           redactionReason={s.redaction?.reason}
+          customEndpoint={s.cloud?.provider === provider && s.cloud.custom_endpoint === true}
           busy={busy !== null}
           onConfirm={() => void save(true)}
           onClose={() => setDisclose(false)}

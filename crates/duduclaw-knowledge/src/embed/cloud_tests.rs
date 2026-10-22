@@ -96,7 +96,8 @@ fn gemini_answer(body: &Value) -> Value {
 }
 
 fn embedder(provider: CloudProvider, base: &str, redactor: Arc<dyn TextRedactor>) -> CloudEmbedder {
-    let (base, host) = validate_base_url(base).unwrap();
+    // The local mock is on 127.0.0.1: an explicitly allowed private endpoint.
+    let (base, host) = validate_base_url(base, true).unwrap();
     CloudEmbedder::new(
         provider,
         provider.default_model(),
@@ -104,7 +105,7 @@ fn embedder(provider: CloudProvider, base: &str, redactor: Arc<dyn TextRedactor>
         &host,
         "sk-test".into(),
         redactor,
-        Arc::new(HttpTransport::new().unwrap()),
+        Arc::new(HttpTransport::new(true).unwrap()),
     )
 }
 
@@ -198,21 +199,60 @@ fn wrong_dimension_or_shape_is_an_error() {
 #[test]
 fn base_url_rules() {
     assert_eq!(
-        validate_base_url("https://api.openai.com/").unwrap(),
+        validate_base_url("https://api.openai.com/", false).unwrap(),
         (
             "https://api.openai.com".to_string(),
             "api.openai.com".to_string()
         )
     );
-    assert!(validate_base_url("http://127.0.0.1:9999").is_ok());
+    assert!(validate_base_url("http://127.0.0.1:9999", true).is_ok());
+    assert!(validate_base_url("http://127.0.0.1:9999", false).is_err());
     assert!(
-        validate_base_url("http://api.openai.com").is_err(),
+        validate_base_url("http://api.openai.com", true).is_err(),
         "plain http off loopback"
     );
-    assert!(validate_base_url("http://localhost.evil.com").is_err());
-    assert!(validate_base_url("https://u:p@api.openai.com").is_err());
-    assert!(validate_base_url("https://api.openai.com/?x=1").is_err());
-    assert!(validate_base_url("ftp://x").is_err());
+    assert!(validate_base_url("http://localhost.evil.com", true).is_err());
+    assert!(validate_base_url("https://u:p@api.openai.com", false).is_err());
+    assert!(validate_base_url("https://api.openai.com/?x=1", false).is_err());
+    assert!(validate_base_url("ftp://x", false).is_err());
+}
+
+#[test]
+fn private_endpoints_need_the_explicit_switch() {
+    for private in [
+        "http://127.0.0.1:9999",
+        "https://127.0.0.1",
+        "https://localhost",
+        "https://api.localhost",
+        "https://10.0.0.5",
+        "https://192.168.1.10",
+        "https://169.254.169.254",
+        "https://[::1]",
+        "https://[fe80::1]",
+        "https://[::ffff:127.0.0.1]",
+        "https://100.64.0.1",
+    ] {
+        let err = validate_base_url(private, false).unwrap_err();
+        assert!(err.contains("allow_private_endpoint"), "{private}: {err}");
+    }
+    assert!(validate_base_url("https://10.0.0.5", true).is_ok());
+    assert!(
+        validate_base_url("https://8.8.8.8", false).is_ok(),
+        "public literal"
+    );
+}
+
+#[test]
+fn resolved_private_addresses_are_refused_at_connect_time() {
+    let url = reqwest::Url::parse("https://127.0.0.1:1/v1").unwrap();
+    assert!(checked_addrs(&url, false).is_err());
+    assert!(checked_addrs(&url, true).is_ok());
+    // A refused endpoint is never contacted: the error comes before any send.
+    let t = HttpTransport::new(false).unwrap();
+    let err = t
+        .post_json("https://127.0.0.1:1/v1/embeddings", &[], &json!({}))
+        .unwrap_err();
+    assert!(err.contains("內部網路"), "{err}");
 }
 
 #[test]
@@ -237,7 +277,7 @@ async fn transport_is_safe_to_build_and_drop_in_async_code() {
             Arc::new(EmailRedactor),
         );
         drop(e);
-        let transport = HttpTransport::new().unwrap();
+        let transport = HttpTransport::new(false).unwrap();
         let _ = &transport;
     }
 }

@@ -8141,7 +8141,7 @@
   "kb.embedding.install.progress": "ダウンロード中 {percent}%",
   "kb.embedding.removed": "モデルを削除しました。現在はキーワード一致のみです",
   "kb.embedding.verified": "モデルファイルを確認しました。検索データの作成を始めます",
-  "kb.embedding.offline.hint": "インターネットのない機器では、オフライン用パッケージを DuDuClaw フォルダーに展開してから「再確認」を押してください。",
+  "kb.embedding.offline.hint": "インターネットのない機器では、オフライン用パッケージ（.tar）と署名ファイル（.tar.minisig）を展開せずに DuDuClaw フォルダー内の models/embedding に置き、「再確認」を押してください。",
   "kb.embedding.rebuild": "未作成の検索データを補う",
   "kb.embedding.rebuild.queued": "処理待ちに追加しました",
   "kb.embedding.disclosure.title": "{vendor} で計算しますか？",
@@ -8151,5 +8151,7 @@
   "kb.embedding.disclosure.queries": "検索に使われる質問も匿名化してから送信されます。",
   "kb.embedding.disclosure.redactionOff": "匿名化が有効になっていません。有効にするまで何も送信されず、検索はキーワード一致のままです。",
   "kb.embedding.disclosure.ack": "段落（匿名化後）が {vendor}（{host}）に送信されることを理解しました",
-  "kb.embedding.disclosure.confirm": "{vendor} を使う"
+  "kb.embedding.disclosure.confirm": "{vendor} を使う",
+  "kb.embedding.setUp": "意味検索を設定する",
+  "kb.embedding.disclosure.customEndpoint": "このエンドポイントは {vendor} の公式アドレスではありません。{vendor} の API キーも {host} に送信されます。信頼できるホストか確認してください。"
 }

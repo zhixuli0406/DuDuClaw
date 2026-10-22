@@ -121,9 +121,9 @@ Every result says the mode (`hybrid`, `keyword_only`, `vector_only`), the share 
 | Vector | 384 dimensions, mean pooling, `query: ` / `passage: ` prefixes | first 512 of 1,024 dimensions, last-token pooling, an English instruction before the question |
 | Speed (Apple M4, 5 threads) | about 1,200–2,500 passages per minute | about 150–340 passages per minute |
 
-Every file is pinned to one commit with its size and SHA-256; nothing resolves "latest". Models are not part of the binary: an Admin installs one from **Settings → Knowledge base search** (the ONNX Runtime library, about 30 MB, is installed with it when missing, shared with the AI detection of redaction). After an install every passage gets a vector in the background; a re-indexed source keeps the vectors of passages whose text did not change. A model unused for `idle_unload_minutes` is unloaded. Models with a non-commercial licence (jina-embeddings v3 / v5) are not offered. macOS on Intel has no ONNX Runtime build at this version and shows "unsupported".
+Every file is pinned to one commit with its size and SHA-256; nothing resolves "latest". Models are not part of the binary: an Admin installs one from **Settings → Knowledge base search** (the ONNX Runtime library, about 30 MB, is installed with it when missing, shared with the AI detection of redaction). After an install every passage gets a vector in the background; a re-indexed source keeps the vectors of passages whose text did not change. A model unused for `idle_unload_minutes` is unloaded. Models with a non-commercial licence (jina-embeddings v3 / v5) are not offered. The Qwen3 conversion is published without a licence statement of its own; its Apache-2.0 terms come from the base model, so check them yourself before commercial use. The ONNX Runtime library is pinned per platform as well and is hashed before it is loaded, for the knowledge base and for the AI detection of redaction alike: a library placed by hand is refused. macOS on Intel has no ONNX Runtime build at this version and shows "unsupported".
 
-**Offline machines**: each release carries `duduclaw-kb-model-multilingual-e5-small-<platform>.tar` (model files plus the runtime archive; `scripts/kb-model-bundle.sh <platform> <model> <dir>` builds one for any catalog model). Unpack it into the DuDuClaw folder (`tar -xf … -C ~/.duduclaw`) and press **Check again (offline install)**: every file is hashed against the same pins before the model counts as installed.
+**Offline machines**: each release carries `duduclaw-kb-model-multilingual-e5-small-<platform>.tar` and its minisign signature `.tar.minisig`, signed with the release key the self-updater trusts (`scripts/kb-model-bundle.sh <platform> <model> <dir>` builds a bundle for any catalog model; `KB_BUNDLE_MINISIGN_KEY` signs it). Copy both files, still packed, into `models/embedding/` inside the DuDuClaw folder and press **Check again (offline install)**. DuDuClaw checks the signature (and that it names this file) before it reads the tar, unpacks only the expected regular files (links, other paths or extra files refuse the whole bundle), hashes every file against its pin, checks the runtime library against its own pin, and only then counts the model as installed; the bundle files are deleted afterwards. An unsigned bundle, or one signed by another key, is refused.
 
 ### Cloud providers
 
@@ -132,6 +132,7 @@ Every file is pinned to one commit with its size and SHA-256; nothing resolves "
 - An Admin chooses it in the dashboard and must tick that passages (after de-identification) go to that vendor and host. The acknowledgement (who, when, provider, host, model) is stored in `config.toml`; changing the provider, endpoint or model needs a new one, and choosing anything else removes it.
 - Every passage and every question goes through the operator's `[redaction]` rules first; each hit becomes a marker such as `[EMAIL]` and nothing is restored. Redaction switched off or force-disabled, rules that do not compile, or no rule at all: nothing is sent, search stays keyword-only. Rule-based redaction does not catch every name; turn on AI detection if names must not leave.
 - `restricted` collections and collections with `embedding_policy = "local_only"` are never sent; under a cloud provider they are searched by keywords only.
+- `cloud_base_url` must be a public `https` address. A private, loopback, link-local or metadata address (`10.x`, `127.x`, `169.254.169.254`, `fc00::/7`, …) is refused unless an Admin sets `allow_private_endpoint = true` in the raw config editor; the host is resolved again on every request and the connection pinned to the checked addresses. The provider's API key is sent to whatever endpoint is configured, and the disclosure dialog says so when it is not the vendor's own.
 - The API key comes from the account list (`cloud_account` narrows it to one account) or the provider's environment variable. A cloud error makes that search keyword-only, and the affected source keeps an `embedding_failed` warning until the next backfill succeeds.
 
 ## For AI employees
@@ -176,12 +177,13 @@ provider = "local"                     # local | openai | gemini | none
 local_model = "multilingual-e5-small"  # or "qwen3-embedding-0.6b"
 cloud_model = ""                       # empty = the provider's default
 cloud_account = ""                     # account id; empty = any account of that provider, then the env var
-cloud_base_url = ""                    # empty = the official endpoint; https only (http only to 127.0.0.1)
+cloud_base_url = ""                    # empty = the official endpoint; public https only
+allow_private_endpoint = false         # Admin-only: accept a private / loopback endpoint (http only to 127.0.0.1)
 batch_size = 16
 threads = 0                            # 0 = half the cores
 max_vector_rows = 200000
 idle_unload_minutes = 10
-# cloud_disclosure_ack is written by the dashboard
+# cloud_disclosure_ack is written by the disclosure dialog only; the raw editor refuses to add or change it
 ```
 
 Out-of-range values are clamped. `enabled = false` hides the tools and refuses every RPC and upload. An unknown `provider` value means keyword-only search, shown with the reason.

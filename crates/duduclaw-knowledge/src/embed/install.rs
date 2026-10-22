@@ -204,16 +204,28 @@ pub async fn install(
     Ok(())
 }
 
-/// Verify files an operator unpacked from an offline bundle: every model
-/// file must match its pin; a bundled ORT archive is verified and extracted
-/// when the library is missing. Writes the marker only when all passed.
-pub fn verify_offline(spec: &ModelSpec, home: &Path) -> Result<(), String> {
+/// Offline install from a signed bundle the operator copied into
+/// `<home>/models/embedding/` (`duduclaw-kb-model-<model>-<target>.tar` and
+/// its `.tar.minisig`). Order: signature over the whole tar against
+/// `release_pubkey` (its trusted comment must name the file) → unpack only
+/// the expected regular files → every model file against its pin → the
+/// bundled ORT archive against its pin, extracted and the library checked
+/// against its own pin → marker. The bundle files are deleted on success.
+pub fn verify_offline(spec: &ModelSpec, home: &Path, release_pubkey: &str) -> Result<(), String> {
     let Some(archive) = ort_manifest::ort_archive_for_current_platform() else {
         return Err(format!(
             "這個平台（{}）沒有可用的 ONNX Runtime，無法使用本機向量模型",
             ort_manifest::current_target()
         ));
     };
+    let name = super::bundle::bundle_name(spec, ort_manifest::current_target());
+    let Some((tar, sig)) = super::bundle::find(spec, home) else {
+        return Err(format!(
+            "找不到離線安裝包：請把 {name} 與 {name}.minisig 一起放進 DuDuClaw 資料夾的 models/embedding"
+        ));
+    };
+    super::bundle::verify_signature(&tar, &sig, release_pubkey, &name)?;
+    super::bundle::unpack(&tar, spec, home)?;
     let dir = spec.install_dir(home);
     for f in &spec.files {
         match onnx_install::verify_path(&ModelSpec::dest(&dir, f), &f.path, f.size, &f.sha256) {
@@ -224,7 +236,10 @@ pub fn verify_offline(spec: &ModelSpec, home: &Path) -> Result<(), String> {
     }
     onnx_install::install_ort_from_local_archive(&ort_root(home), archive)
         .map_err(|e| e.to_string())?;
-    write_marker(spec, home, "offline")
+    write_marker(spec, home, "offline")?;
+    let _ = std::fs::remove_file(&tar);
+    let _ = std::fs::remove_file(&sig);
+    Ok(())
 }
 
 /// Delete the model files and the marker (marker first, so a failure
@@ -290,51 +305,102 @@ mod tests {
         }
     }
 
+    /// Put a signed bundle of `files` for `spec` into `home`; returns the
+    /// public key.
+    fn place_bundle(
+        spec: &ModelSpec,
+        home: &Path,
+        files: &[(&str, &[u8])],
+        comment_name: &str,
+    ) -> String {
+        use crate::embed::bundle::{bundle_dir, bundle_name, test_support};
+        std::fs::create_dir_all(bundle_dir(home)).unwrap();
+        let name = bundle_name(spec, ort_manifest::current_target());
+        let tar = bundle_dir(home).join(&name);
+        let entries: Vec<(String, &[u8])> = files
+            .iter()
+            .map(|(p, b)| (format!("models/embedding/{}/{p}", spec.id), *b))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        test_support::tar_with(&refs, &tar);
+        let (pk, sig) = test_support::sign(
+            &std::fs::read(&tar).unwrap(),
+            &format!("duduclaw-kb-model test {comment_name}"),
+        );
+        std::fs::write(bundle_dir(home).join(format!("{name}.minisig")), sig).unwrap();
+        pk
+    }
+
     #[test]
-    fn offline_verify_needs_every_file_and_writes_the_marker_last() {
+    fn offline_install_checks_signature_then_pins_and_writes_the_marker_last() {
         if ort_manifest::ort_archive_for_current_platform().is_none() {
             return; // unsupported platform: covered by the next test
         }
         let home = tempfile::tempdir().unwrap();
         let spec = tiny_spec(&[("onnx/m.onnx", b"model"), ("tok.json", b"{}")]);
-        let dir = spec.install_dir(home.path());
-        std::fs::create_dir_all(dir.join("onnx")).unwrap();
-        std::fs::write(dir.join("onnx/m.onnx"), b"model").unwrap();
-        assert!(
-            verify_offline(&spec, home.path())
-                .unwrap_err()
-                .contains("tok.json")
+        let name = crate::embed::bundle::bundle_name(&spec, ort_manifest::current_target());
+        // No bundle at all.
+        let (other_pk, _) = crate::embed::bundle::test_support::sign(b"x", "x");
+        let err = verify_offline(&spec, home.path(), &other_pk).unwrap_err();
+        assert!(err.contains(".minisig"), "{err}");
+        // A bundle signed by another key: nothing is unpacked.
+        place_bundle(
+            &spec,
+            home.path(),
+            &[("onnx/m.onnx", b"model"), ("tok.json", b"{}")],
+            &name,
         );
-        std::fs::write(dir.join("tok.json"), b"{ }").unwrap();
+        let err = verify_offline(&spec, home.path(), &other_pk).unwrap_err();
+        assert!(err.contains("簽章"), "{err}");
+        assert!(!spec.install_dir(home.path()).join("onnx/m.onnx").exists());
+        // Signed for a different file name: refused.
+        let pk = place_bundle(
+            &spec,
+            home.path(),
+            &[("onnx/m.onnx", b"model"), ("tok.json", b"{}")],
+            "other.tar",
+        );
         assert!(
-            verify_offline(&spec, home.path())
+            verify_offline(&spec, home.path(), &pk)
+                .unwrap_err()
+                .contains("檔名")
+        );
+        // Correctly signed, but a file that does not match its pin.
+        let pk = place_bundle(
+            &spec,
+            home.path(),
+            &[("onnx/m.onnx", b"model"), ("tok.json", b"{ }")],
+            &name,
+        );
+        assert!(
+            verify_offline(&spec, home.path(), &pk)
                 .unwrap_err()
                 .contains("驗證失敗")
         );
-        std::fs::write(dir.join("tok.json"), b"{}").unwrap();
-        // Model files fine, but neither ORT library nor bundled archive.
-        let lib_dir = ort_manifest::ort_lib_dir(&ort_root(home.path()));
-        let err = verify_offline(&spec, home.path()).unwrap_err();
+        assert!(read_marker(&spec, home.path()).is_none());
+        // Correct model files; the bundle has no runtime archive and no
+        // verified library exists, so the install still stops.
+        let pk = place_bundle(
+            &spec,
+            home.path(),
+            &[("onnx/m.onnx", b"model"), ("tok.json", b"{}")],
+            &name,
+        );
+        let err = verify_offline(&spec, home.path(), &pk).unwrap_err();
         assert!(err.contains("ONNX Runtime"), "{err}");
         assert!(read_marker(&spec, home.path()).is_none());
-        // A library dropped in by hand (not the pinned build) is never
-        // trusted: no marker, and it is reported instead of loaded.
+        // A library dropped in by hand is reported, never trusted.
+        let lib_dir = ort_manifest::ort_lib_dir(&ort_root(home.path()));
         std::fs::create_dir_all(&lib_dir).unwrap();
-        let lib = ort_lib(home.path()).unwrap();
-        std::fs::write(&lib, b"lib").unwrap();
-        let err = verify_offline(&spec, home.path()).unwrap_err();
-        assert!(err.contains("無法驗證"), "{err}");
-        assert!(read_marker(&spec, home.path()).is_none());
+        std::fs::write(ort_lib(home.path()).unwrap(), b"lib").unwrap();
         write_marker(&spec, home.path(), "offline").unwrap();
         let problem = installed_problem(&spec, home.path()).unwrap();
         assert!(problem.contains("不符"), "{problem}");
-        // Removing the model reads as not installed; the library stays.
         remove(&spec, home.path()).unwrap();
         assert_eq!(
             installed_problem(&spec, home.path()).as_deref(),
             Some("尚未安裝向量模型")
         );
-        assert!(lib.exists());
     }
 
     #[test]

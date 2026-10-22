@@ -121,6 +121,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("knowledge.embedding", "cloud_model", Str),
     ("knowledge.embedding", "cloud_account", Str),
     ("knowledge.embedding", "cloud_base_url", Str),
+    ("knowledge.embedding", "allow_private_endpoint", Bool),
     ("knowledge.embedding", "batch_size", UInt),
     ("knowledge.embedding", "threads", UInt),
     ("knowledge.embedding", "max_vector_rows", UInt),

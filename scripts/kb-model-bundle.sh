@@ -12,17 +12,24 @@
 # crates/duduclaw-onnx/ort-archives.json (the same pins the binary checks);
 # a mismatch aborts.
 #
-# Install on an offline machine: copy the .tar over, then
-#   tar -xf duduclaw-kb-model-<id>-<target>.tar -C ~/.duduclaw
-# and press "Check again (offline install)" in the dashboard
-# (knowledge.embedding.verify_offline), which re-hashes every file, extracts
-# the runtime library and only then marks the model installed.
+# Signing: with KB_BUNDLE_MINISIGN_KEY=<secret key file> the tar is signed
+# with minisign (`.tar.minisig`, trusted comment
+# "duduclaw-kb-model <KB_BUNDLE_TAG> <file name>"). Release bundles are
+# signed with the release key the self-updater trusts; DuDuClaw refuses an
+# unsigned bundle or one signed by another key.
+#
+# Install on an offline machine: copy the .tar AND its .tar.minisig into
+# ~/.duduclaw/models/embedding/ (do not unpack it) and press "Check again
+# (offline install)" in the dashboard (knowledge.embedding.verify_offline).
+# DuDuClaw checks the signature first, unpacks only the expected files,
+# re-hashes every file against its pin, extracts and checks the runtime
+# library, and only then marks the model installed.
 #
 # KB_BUNDLE_CACHE=<dir> keeps downloads between runs (default: a temp dir).
 set -euo pipefail
 
 if [ $# -ne 3 ]; then
-  sed -n '2,19p' "$0" >&2
+  sed -n '2,26p' "$0" >&2
   exit 2
 fi
 TARGET="$1"
@@ -89,7 +96,17 @@ PY
 NAME="duduclaw-kb-model-${MODEL}-${TARGET}.tar"
 # Only the two trees: no "./" entry, so unpacking never touches the
 # permissions of the home directory itself.
-tar -cf "$OUT/$NAME" -C "$STAGE" models lib
+# COPYFILE_DISABLE: macOS tar would add AppleDouble "._*" entries, which
+# DuDuClaw (rightly) refuses as unexpected files.
+COPYFILE_DISABLE=1 tar -cf "$OUT/$NAME" -C "$STAGE" models lib
 (cd "$OUT" && sha256 "$NAME" | awk -v n="$NAME" '{print $1"  "n}' > "$NAME.sha256")
+if [ -n "${KB_BUNDLE_MINISIGN_KEY:-}" ]; then
+  command -v minisign >/dev/null 2>&1 || { echo "minisign not found" >&2; exit 1; }
+  minisign -S -s "$KB_BUNDLE_MINISIGN_KEY" -m "$OUT/$NAME" \
+    -t "duduclaw-kb-model ${KB_BUNDLE_TAG:-local} $NAME" -x "$OUT/$NAME.minisig"
+  echo "signed $OUT/$NAME.minisig"
+else
+  echo "not signed (set KB_BUNDLE_MINISIGN_KEY); DuDuClaw refuses unsigned bundles" >&2
+fi
 echo "wrote $OUT/$NAME"
 cat "$OUT/$NAME.sha256"

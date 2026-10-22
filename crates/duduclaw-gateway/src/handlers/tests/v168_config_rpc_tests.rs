@@ -700,3 +700,43 @@ async fn tick_source_upsert_appends_without_touching_other_tables() {
     let t: toml::Table = out.parse().unwrap();
     assert_eq!(t["tick"]["sources"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn raw_editor_cannot_forge_or_change_the_embedding_disclosure_record() {
+    let home = tempfile::tempdir().unwrap();
+    let ack = "[knowledge.embedding]\nprovider = \"openai\"\n\n[knowledge.embedding.cloud_disclosure_ack]\nby = \"admin-1\"\nat = \"2026-10-22T00:00:00Z\"\nprovider = \"openai\"\nhost = \"api.openai.com\"\nmodel = \"text-embedding-3-small\"\n";
+    std::fs::write(home.path().join("config.toml"), "[general]\nname = \"x\"\n").unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    // Adding a record by hand is refused and nothing is written.
+    let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
+    let forged = format!("{}\n{ack}", got["content"].as_str().unwrap());
+    let e = err(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": forged, "base_hash": got["hash"] }), &admin())
+        .await);
+    assert!(e.contains("cloud_disclosure_ack"), "{e}");
+    assert!(config(home.path()).get("knowledge").is_none());
+
+    // A record written by the dialog: other edits pass, changing it is
+    // refused, removing it is allowed (cloud embedding just stops).
+    std::fs::write(home.path().join("config.toml"), format!("[general]\nname = \"x\"\n\n{ack}")).unwrap();
+    let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
+    let content = got["content"].as_str().unwrap().to_string();
+    let renamed = content.replace("name = \"x\"", "name = \"y\"");
+    ok(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": renamed, "base_hash": got["hash"] }), &admin())
+        .await);
+    let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
+    let content = got["content"].as_str().unwrap().to_string();
+    let moved = content.replace("host = \"api.openai.com\"", "host = \"evil.example.com\"");
+    let e = err(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": moved, "base_hash": got["hash"] }), &admin())
+        .await);
+    assert!(e.contains("cloud_disclosure_ack"), "{e}");
+    let start = content.find("[knowledge.embedding.cloud_disclosure_ack]").unwrap();
+    let removed = content[..start].to_string();
+    ok(&handler
+        .handle("config.raw.set", json!({ "file": "config", "content": removed, "base_hash": got["hash"] }), &admin())
+        .await);
+    assert!(config(home.path())["knowledge"]["embedding"].get("cloud_disclosure_ack").is_none());
+}

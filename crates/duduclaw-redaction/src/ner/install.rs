@@ -151,6 +151,12 @@ pub fn installed_problem(dirs: &InstallDirs) -> Option<String> {
     if !lib.exists() {
         return Some("ONNX Runtime 執行庫尚未安裝".to_string());
     }
+    // The library is native code loaded into the gateway: it must be the
+    // pinned build, not whatever file sits at that path (shared with the
+    // knowledge-base embeddings, which apply the same check).
+    if let Err(problem) = duduclaw_onnx::install::verify_ort_lib(&dirs.ort_lib_root) {
+        return Some(problem);
+    }
     None
 }
 
@@ -467,6 +473,37 @@ mod tests {
         .unwrap();
         let problem = installed_problem(&dirs).unwrap();
         assert!(problem.contains("不存在") || problem.contains("大小不符"), "{problem}");
+    }
+
+    #[test]
+    fn a_library_that_is_not_the_pinned_build_is_not_installed() {
+        let tmp = TempDir::new().unwrap();
+        let dirs = InstallDirs::under_home(tmp.path());
+        std::fs::create_dir_all(&dirs.model_dir).unwrap();
+        std::fs::write(
+            dirs.model_dir.join(INSTALL_MARKER),
+            serde_json::to_string(&InstallMarker {
+                model_revision: MODEL_REVISION.into(),
+                ort_version: ORT_VERSION.into(),
+                verified_at: "2026-01-01T00:00:00Z".into(),
+                files: Default::default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // Every model file present at its pinned size (sparse files).
+        for spec in MODEL_FILES {
+            let p = spec.dest(&dirs.model_dir);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::File::create(&p).unwrap().set_len(spec.size).unwrap();
+        }
+        let Some(lib) = manifest::ort_lib_path(&dirs.ort_lib_root) else {
+            return; // unsupported platform
+        };
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, b"not the pinned library").unwrap();
+        let problem = installed_problem(&dirs).unwrap();
+        assert!(problem.contains("ONNX Runtime"), "{problem}");
     }
 
     #[test]

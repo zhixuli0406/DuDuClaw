@@ -118,6 +118,19 @@ describe('EmbeddingSettingsCard', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/Redaction is not switched on/);
   });
 
+  it('warns that the API key goes to a custom endpoint', async () => {
+    const user = userEvent.setup();
+    current = status({
+      provider: 'openai',
+      cloud: { provider: 'openai', vendor: 'OpenAI', host: 'proxy.example.com', model: 'm', custom_endpoint: true },
+    });
+    renderWithProviders(<EmbeddingSettingsCard />);
+    await screen.findByText('Keyword matching only');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    const alerts = await screen.findAllByRole('alert');
+    expect(alerts.map((a) => a.textContent).join(' ')).toMatch(/API key is sent to proxy\.example\.com/);
+  });
+
   it('non-admins see the status but no controls', async () => {
     current = status({ is_admin: false });
     renderWithProviders(<EmbeddingSettingsCard />);

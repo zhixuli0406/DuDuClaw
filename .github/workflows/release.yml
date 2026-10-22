@@ -187,9 +187,9 @@ jobs:
 
   # Offline bundles of the default knowledge-base embedding model (model
   # files + the pinned ONNX Runtime archive) for machines without internet.
-  # Every byte is checked against the pins compiled into the binary, and the
-  # binary re-checks them when the operator presses "Check again (offline
-  # install)" after unpacking. Not signed separately: the pins are the trust.
+  # Signed with the release minisign key (the key the self-updater trusts);
+  # the binary checks that signature before it unpacks a bundle, then every
+  # file against the pins compiled into it.
   kb-model-bundles:
     needs: [release, delivery-gate]
     runs-on: ubuntu-latest
@@ -204,15 +204,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           KB_BUNDLE_CACHE: ${{ runner.temp }}/kb-cache
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           # Through env, never interpolated into the script text.
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set — offline bundles must be signed"
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          export KB_BUNDLE_MINISIGN_KEY="$RUNNER_TEMP/minisign.key" KB_BUNDLE_TAG="$TAG"
           mkdir -p "$KB_BUNDLE_CACHE" dist-kb
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             ./scripts/kb-model-bundle.sh "$target" multilingual-e5-small dist-kb
           done
-          gh release upload "$TAG" dist-kb/duduclaw-kb-model-*.tar dist-kb/duduclaw-kb-model-*.tar.sha256 --clobber
+          rm -f "$RUNNER_TEMP/minisign.key"
+          gh release upload "$TAG" dist-kb/duduclaw-kb-model-*.tar dist-kb/duduclaw-kb-model-*.tar.sha256 dist-kb/duduclaw-kb-model-*.tar.minisig --clobber
 
   # Publish to npm
   npm-publish:

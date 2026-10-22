@@ -8141,7 +8141,7 @@
   "kb.embedding.install.progress": "Downloading {percent}%",
   "kb.embedding.removed": "Model removed; search now matches keywords only",
   "kb.embedding.verified": "Model files check out; building search data now",
-  "kb.embedding.offline.hint": "No internet on this machine? Unpack the offline bundle into the DuDuClaw folder, then press “Check again”.",
+  "kb.embedding.offline.hint": "No internet on this machine? Put the offline bundle (.tar) and its signature (.tar.minisig) into the models/embedding folder inside the DuDuClaw folder without unpacking them, then press “Check again”.",
   "kb.embedding.rebuild": "Fill in missing search data",
   "kb.embedding.rebuild.queued": "Queued",
   "kb.embedding.disclosure.title": "Use {vendor} to compute this?",
@@ -8151,5 +8151,7 @@
   "kb.embedding.disclosure.queries": "Questions people and AI staff search with are de-identified and sent too.",
   "kb.embedding.disclosure.redactionOff": "Redaction is not switched on. Nothing is sent until it is, and search stays keyword-only.",
   "kb.embedding.disclosure.ack": "I understand passages (after de-identification) will be sent to {vendor} ({host})",
-  "kb.embedding.disclosure.confirm": "Use {vendor}"
+  "kb.embedding.disclosure.confirm": "Use {vendor}",
+  "kb.embedding.setUp": "Set up meaning-based search",
+  "kb.embedding.disclosure.customEndpoint": "This endpoint is not {vendor}'s own address: your {vendor} API key is sent to {host} as well. Make sure you trust that host."
 }

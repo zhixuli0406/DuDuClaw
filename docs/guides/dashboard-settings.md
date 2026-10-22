@@ -104,7 +104,7 @@ Admin only (new in 1.76.0). Shows whether the document knowledge base searches b
 |---|---|---|
 | Where it is computed: On this computer / OpenAI / Google Gemini / Off | `[knowledge.embedding] provider` (+ `cloud_model`, `cloud_account` for cloud) | Next search. Choosing a cloud provider opens a dialog naming the vendor and host that receive passages; **Use** stays disabled until the box is ticked, and the acknowledgement is stored as `cloud_disclosure_ack`. The dialog warns when redaction is off (nothing is sent then). Choosing anything else removes the acknowledgement. |
 | Install (size) | downloads into `models/embedding/<model>/` and `lib/onnxruntime/` | Background download with progress, resumable after **Cancel**; vectors for every passage are queued when it finishes. |
-| Check again (offline install) | — | Hashes files unpacked from an offline bundle and marks the model installed. |
+| Check again (offline install) | — | Checks the signature of the offline bundle (`.tar` + `.tar.minisig`, still packed, in `models/embedding/`) against the release key, then unpacks it, hashes every file and marks the model installed. |
 | Use this model | `local_model` | Switches the local model; passages get vectors for it in the background (vectors of the previous model stay but are not compared). |
 | Remove | deletes the model files | Search becomes keyword-only with that reason shown; the runtime library stays. |
 | Fill in missing search data | — | Queues vectors for every source still missing them. |

@@ -82,19 +82,40 @@ impl CloudProvider {
     }
 }
 
-/// Accept `https://…`, or `http://` only to a loopback host (a local proxy
-/// or test double). Returns the normalised base (no trailing slash) and
-/// the host.
-pub fn validate_base_url(raw: &str) -> Result<(String, String), String> {
+/// Is `host` (as written in a URL) a name or literal that points inside
+/// this machine or network? Literal addresses go through the workspace's
+/// single SSRF classifier; `localhost` names count as loopback.
+fn host_is_private(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return !duduclaw_core::net_addr::is_public_ip(&ip);
+    }
+    let lower = bare.to_ascii_lowercase();
+    lower == "localhost" || lower.ends_with(".localhost")
+}
+
+/// Accept `https://…` to a public host. With `allow_private` (the
+/// Admin-only `[knowledge.embedding] allow_private_endpoint = true`) a
+/// private, loopback, link-local or metadata address is accepted too, and
+/// plain `http://` only to a loopback host. Returns the normalised base (no
+/// trailing slash) and the host.
+pub fn validate_base_url(raw: &str, allow_private: bool) -> Result<(String, String), String> {
     let url = reqwest::Url::parse(raw.trim()).map_err(|_| "雲端端點網址格式不正確".to_string())?;
     let host = url.host_str().unwrap_or("").to_string();
     if host.is_empty() || !url.username().is_empty() || url.password().is_some() {
         return Err("雲端端點網址格式不正確".to_string());
     }
+    let private = host_is_private(&host);
+    if private && !allow_private {
+        return Err(
+            "雲端端點指向內部網路、本機或保留位址；如確定要使用，管理員須設定 [knowledge.embedding] allow_private_endpoint = true"
+                .to_string(),
+        );
+    }
     let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1");
     match url.scheme() {
         "https" => {}
-        "http" if loopback => {}
+        "http" if loopback && allow_private => {}
         _ => return Err("雲端端點必須使用 https（本機測試端點除外）".to_string()),
     }
     if url.query().is_some() || url.fragment().is_some() {
@@ -117,42 +138,99 @@ pub trait JsonTransport: Send + Sync {
 /// Largest response body accepted from a provider.
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The real transport: blocking reqwest with a 60 s timeout.
+/// The real transport: blocking reqwest with a 60 s timeout, no
+/// redirects.
+///
+/// Every request resolves the host first and, unless private endpoints are
+/// allowed, refuses when any resolved address is not public (the shared
+/// SSRF classifier); the connection is then pinned to exactly the checked
+/// addresses, so a DNS answer that changes between check and connect cannot
+/// redirect the request (and the API key) inside the network.
 ///
 /// A `reqwest::blocking::Client` owns a small runtime and panics when it is
-/// created or dropped on an async worker thread. Callers hold embedders
-/// across async code, so the client is built once on a plain thread and
-/// kept for the life of the process; every handle shares it.
+/// created or dropped on an async worker thread, so each request builds
+/// and drops its client on a short-lived plain thread.
 pub struct HttpTransport {
-    client: &'static reqwest::blocking::Client,
-}
-
-fn shared_client() -> Result<&'static reqwest::blocking::Client, String> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            std::thread::spawn(|| {
-                reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .connect_timeout(Duration::from_secs(15))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .map_err(|e| e.to_string())
-            })
-            .join()
-            .unwrap_or_else(|_| Err("HTTP client thread panicked".to_string()))
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+    allow_private: bool,
 }
 
 impl HttpTransport {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self {
-            client: shared_client()?,
-        })
+    /// `allow_private` mirrors `[knowledge.embedding] allow_private_endpoint`.
+    pub fn new(allow_private: bool) -> Result<Self, String> {
+        Ok(Self { allow_private })
     }
+}
+
+fn checked_addrs(
+    url: &reqwest::Url,
+    allow_private: bool,
+) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+    use std::net::ToSocketAddrs;
+    let host = url.host_str().ok_or("雲端端點網址格式不正確")?.to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or("雲端端點網址格式不正確")?;
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let addrs: Vec<std::net::SocketAddr> = (bare.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| "無法解析雲端端點的主機名稱".to_string())?
+        .collect();
+    if addrs.is_empty() {
+        return Err("無法解析雲端端點的主機名稱".to_string());
+    }
+    if !allow_private
+        && addrs
+            .iter()
+            .any(|a| !duduclaw_core::net_addr::is_public_ip(&a.ip()))
+    {
+        return Err("雲端端點解析到內部網路或保留位址，已拒絕連線".to_string());
+    }
+    Ok((bare, addrs))
+}
+
+fn send_pinned(
+    url: &str,
+    headers: &[(&str, String)],
+    body: &Value,
+    allow_private: bool,
+) -> Result<Value, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "雲端端點網址格式不正確".to_string())?;
+    let (host, addrs) = checked_addrs(&parsed, allow_private)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.post(parsed).json(body);
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| format!("連線失敗：{}", e.without_url()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        // Provider error bodies can echo input or part of the key; only
+        // the status code is kept (it lands in logs and job errors).
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    // A misbehaving endpoint must not exhaust memory: 32 MB is about ten
+    // times the largest batch we request.
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(resp, MAX_RESPONSE_BYTES + 1),
+        &mut buf,
+    )
+    .map_err(|e| format!("讀取回應失敗：{e}"))?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err("雲端回應過大".to_string());
+    }
+    serde_json::from_slice(&buf).map_err(|_| "雲端回應不是 JSON".to_string())
 }
 
 impl JsonTransport for HttpTransport {
@@ -162,31 +240,13 @@ impl JsonTransport for HttpTransport {
         headers: &[(&str, String)],
         body: &Value,
     ) -> Result<Value, String> {
-        let mut req = self.client.post(url).json(body);
-        for (k, v) in headers {
-            req = req.header(*k, v);
-        }
-        let resp = req
-            .send()
-            .map_err(|e| format!("連線失敗：{}", e.without_url()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Provider error bodies can echo input or part of the key; only
-            // the status code is kept (it lands in logs and job errors).
-            return Err(format!("HTTP {}", status.as_u16()));
-        }
-        // A misbehaving endpoint must not exhaust memory: 32 MB is about ten
-        // times the largest batch we request.
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(
-            &mut std::io::Read::take(resp, MAX_RESPONSE_BYTES + 1),
-            &mut body,
-        )
-        .map_err(|e| format!("讀取回應失敗：{e}"))?;
-        if body.len() as u64 > MAX_RESPONSE_BYTES {
-            return Err("雲端回應過大".to_string());
-        }
-        serde_json::from_slice(&body).map_err(|_| "雲端回應不是 JSON".to_string())
+        let allow = self.allow_private;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| send_pinned(url, headers, body, allow))
+                .join()
+                .unwrap_or_else(|_| Err("HTTP 請求執行緒發生錯誤".to_string()))
+        })
     }
 }
 

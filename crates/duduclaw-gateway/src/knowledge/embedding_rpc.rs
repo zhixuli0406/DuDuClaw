@@ -6,7 +6,7 @@
 //! | `install` `{model}` | Admin | download a catalog model (and ONNX Runtime) in the background |
 //! | `cancel` | Admin | stop the download (partial files kept for resume) |
 //! | `remove` `{model}` | Admin | delete a model's files |
-//! | `verify_offline` `{model}` | Admin | hash files unpacked from an offline bundle, then mark installed |
+//! | `verify_offline` `{model}` | Admin | check a signed offline bundle (release key) before unpacking it, then the pins, then mark installed |
 //! | `select` `{provider, local_model?, cloud_model?, cloud_account?, cloud_base_url?, acknowledge_disclosure?}` | Admin | write `[knowledge.embedding]` |
 //! | `rebuild` | Admin | queue vectors for every source still missing them |
 //!
@@ -185,6 +185,11 @@ async fn status(home: &Path, is_admin: bool) -> Value {
             "model": t.model,
             "host": t.host,
             "ack_valid": cfg.ack_covers(&t),
+            // Not the vendor's own endpoint: the API key goes there too.
+            "custom_endpoint": duduclaw_knowledge::embed::cloud::validate_base_url(t.provider.default_base_url(), false)
+                .map(|(_, default_host)| default_host != t.host)
+                .unwrap_or(true),
+            "allow_private_endpoint": cfg.allow_private_endpoint,
         }),
         Some(Err(e)) => json!({ "error": e }),
         None => Value::Null,
@@ -339,9 +344,12 @@ async fn verify_offline(
         return Err("正在下載中，請等下載結束再檢查。".to_string());
     }
     let h = home.to_path_buf();
-    tokio::task::spawn_blocking(move || install::verify_offline(spec, &h))
-        .await
-        .map_err(|e| e.to_string())??;
+    // Bundles are signed with the release key the self-updater trusts.
+    tokio::task::spawn_blocking(move || {
+        install::verify_offline(spec, &h, crate::updater::UPDATE_PUBKEY)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     super::audit_admin(
         home,
         "knowledge_embedding_model_installed",
@@ -361,10 +369,10 @@ pub(crate) fn provider_ok(p: &str) -> Option<ProviderKind> {
 }
 
 /// Validate an optional cloud base URL.
-pub(crate) fn base_url_ok(raw: &str) -> Result<(), String> {
+pub(crate) fn base_url_ok(raw: &str, allow_private: bool) -> Result<(), String> {
     if raw.is_empty() {
         Ok(())
     } else {
-        validate_base_url(raw).map(|_| ())
+        validate_base_url(raw, allow_private).map(|_| ())
     }
 }

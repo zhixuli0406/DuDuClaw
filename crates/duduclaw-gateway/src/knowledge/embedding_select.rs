@@ -71,8 +71,16 @@ pub(crate) fn apply(
     }
     let cloud_account = text(p, "cloud_account", 128)?;
     let cloud_base_url = text(p, "cloud_base_url", 300)?;
+    // `allow_private_endpoint` is only ever set in the raw config editor
+    // (Admin); this RPC reads it and never writes it.
+    let allow_private = root
+        .get("knowledge")
+        .and_then(|k| k.get("embedding"))
+        .and_then(|e| e.get("allow_private_endpoint"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
     if let Some(u) = &cloud_base_url {
-        super::embedding_rpc::base_url_ok(u)?;
+        super::embedding_rpc::base_url_ok(u, allow_private)?;
     }
     let t = embedding_table(root);
     let previous = t
@@ -240,6 +248,31 @@ mod tests {
     }
 
     #[test]
+    fn private_endpoints_need_the_raw_editor_switch() {
+        let req = json!({"provider": "openai", "acknowledge_disclosure": true, "cloud_base_url": "http://127.0.0.1:9999"});
+        let err = run("", req.clone()).unwrap_err();
+        assert!(err.contains("allow_private_endpoint"), "{err}");
+        assert!(run("", json!({"provider": "openai", "acknowledge_disclosure": true, "cloud_base_url": "https://169.254.169.254"})).is_err());
+        let (_, v) = run(
+            "[knowledge.embedding]\nallow_private_endpoint = true\n",
+            req,
+        )
+        .unwrap();
+        assert_eq!(v["host"], "127.0.0.1");
+        // The RPC never turns the switch on itself.
+        let (root, _) = run(
+            "",
+            json!({"provider": "local", "allow_private_endpoint": true}),
+        )
+        .unwrap();
+        assert!(
+            root["knowledge"]["embedding"]
+                .get("allow_private_endpoint")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn inputs_are_validated() {
         assert!(run("", json!({"provider": "voyage"})).is_err());
         assert!(run("", json!({"provider": "local", "local_model": "jina-v3"})).is_err());
@@ -253,10 +286,10 @@ mod tests {
         assert!(run("", json!({"provider": "openai", "acknowledge_disclosure": true, "cloud_base_url": "http://evil.example.com"})).is_err());
         let (root, v) = run(
             "[knowledge]\nenabled = true\n",
-            json!({"provider": "gemini", "acknowledge_disclosure": true, "cloud_base_url": "http://127.0.0.1:9", "cloud_account": "acct-1"}),
+            json!({"provider": "gemini", "acknowledge_disclosure": true, "cloud_base_url": "https://proxy.example.com", "cloud_account": "acct-1"}),
         )
         .unwrap();
-        assert_eq!(v["host"], "127.0.0.1");
+        assert_eq!(v["host"], "proxy.example.com");
         assert_eq!(
             root["knowledge"]["enabled"].as_bool(),
             Some(true),
