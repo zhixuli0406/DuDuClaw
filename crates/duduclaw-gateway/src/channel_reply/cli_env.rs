@@ -516,19 +516,23 @@ pub(super) async fn spawn_claude_cli_with_env(
 
                         lines_seen += 1;
                         let parsed = serde_json::from_str::<serde_json::Value>(&line).ok();
-                        let partial_line = parsed
-                            .as_ref()
-                            .is_some_and(crate::thinking::claude_stream::is_stream_event);
+
                         // Keep only a truncated tail for diagnostics (full line
                         // can contain the user's prompt — we don't want it on disk).
                         // `rate_limit_event` frames are excluded: embedding one in a
                         // failure diagnostic made `is_rate_limit_error` classify a
                         // healthy account as rate-limited ("rateLimitType" ⊃
                         // "ratelimit" — TODO-rate-limit-warning-misread-as-failure).
-                        // Partial `stream_event` lines are excluded too: they can
-                        // carry thinking text, which never goes into diagnostics.
-                        if !partial_line && !crate::rate_limit_watch::line_is_rate_limit_frame(&line) {
-                            last_raw_line = line.chars().take(400).collect();
+                        // Thinking text never goes into diagnostics: partial
+                        // `stream_event` lines are skipped and thinking blocks of
+                        // an `assistant` line are reduced to their type.
+                        if !crate::rate_limit_watch::line_is_rate_limit_frame(&line) {
+                            if let Some(kept) = crate::thinking::claude_stream::diagnostic_line(
+                                &line,
+                                parsed.as_ref(),
+                            ) {
+                                last_raw_line = kept.chars().take(400).collect();
+                            }
                         }
 
                         // Optional raw-stream debug log (`thinking_delta` lines

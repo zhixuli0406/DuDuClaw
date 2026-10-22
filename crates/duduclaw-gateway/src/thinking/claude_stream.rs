@@ -72,17 +72,69 @@ pub fn debug_log_line<'a>(line: &'a str, parsed: Option<&Value>) -> Cow<'a, str>
     }
 }
 
+/// The text a failure diagnostic may keep for this line, or `None` to keep
+/// nothing: partial `stream_event` lines are dropped, and an `assistant`
+/// line's `thinking` / `redacted_thinking` blocks are reduced to their type
+/// before the line is kept, so thinking text never reaches an error message.
+pub fn diagnostic_line(line: &str, parsed: Option<&Value>) -> Option<String> {
+    let Some(event) = parsed else {
+        return Some(line.to_string());
+    };
+    if is_stream_event(event) {
+        return None;
+    }
+    let has_thinking = event
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .is_some_and(|c| c.iter().any(is_thinking_block));
+    if !has_thinking {
+        return Some(line.to_string());
+    }
+    let mut cleaned = event.clone();
+    if let Some(content) = cleaned
+        .pointer_mut("/message/content")
+        .and_then(Value::as_array_mut)
+    {
+        for block in content.iter_mut().filter(|b| is_thinking_block(b)) {
+            let kind = block.get("type").cloned().unwrap_or(Value::Null);
+            *block = serde_json::json!({"type": kind, "elided": true});
+        }
+    }
+    Some(cleaned.to_string())
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
 /// Per-spawn state.
 pub struct ClaudeStreamThinking {
     rec: Recorder,
     /// Content-block index of the thinking block being streamed.
     open_index: Option<u64>,
     open_has_text: bool,
-    /// Thinking blocks already reported from `stream_event`s that the
-    /// complete `assistant` message will repeat (skip that many).
+    /// Thinking blocks of the current streamed message already reported from
+    /// `stream_event`s — used for an `assistant` repeat that carries no
+    /// message id; reset at every new message.
     streamed_blocks: usize,
+    /// Message ids whose thinking was streamed (their `assistant` repeat is
+    /// skipped by id, so an aborted stream never suppresses a later block).
+    streamed_messages: std::collections::HashSet<String>,
+    /// Id of the message being streamed (`message_start`).
+    current_message: Option<String>,
     /// Any `stream_event` seen (partial messages are on).
     streaming: bool,
+}
+
+impl Drop for ClaudeStreamThinking {
+    /// An early return (stream error, timeout, a dropped future) still closes
+    /// an open block with the right kind.
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 impl Default for ClaudeStreamThinking {
@@ -103,20 +155,30 @@ impl ClaudeStreamThinking {
             open_index: None,
             open_has_text: false,
             streamed_blocks: 0,
+            streamed_messages: std::collections::HashSet::new(),
+            current_message: None,
             streaming: false,
         }
     }
 
     /// Look at one parsed stream-json line.
     pub fn observe(&mut self, event: &Value) -> Flow {
+        // A subagent's lines (Task tool, `parent_tool_use_id` set) belong to
+        // another conversation thread: never mix them into the main blocks.
+        let subagent = event
+            .get("parent_tool_use_id")
+            .is_some_and(|v| !v.is_null());
         match event.get("type").and_then(Value::as_str) {
             Some("stream_event") => {
-                self.streaming = true;
-                if let Some(inner) = event.get("event") {
-                    self.on_stream_event(inner);
+                if !subagent {
+                    self.streaming = true;
+                    if let Some(inner) = event.get("event") {
+                        self.on_stream_event(inner);
+                    }
                 }
                 Flow::Consumed
             }
+            Some("assistant") if subagent => Flow::Continue,
             Some("system")
                 if event.get("subtype").and_then(Value::as_str) == Some("thinking_tokens") =>
             {
@@ -130,10 +192,16 @@ impl ClaudeStreamThinking {
                 Flow::Continue
             }
             Some("assistant") => {
+                let id = event.pointer("/message/id").and_then(Value::as_str);
+                // Streamed live already (matched by message id): skip.
+                if id.is_some_and(|id| self.streamed_messages.contains(id)) {
+                    return Flow::Continue;
+                }
+                let by_counter = id.is_none();
                 if let Some(content) = event.pointer("/message/content").and_then(Value::as_array)
                 {
                     for block in content {
-                        self.on_assistant_block(block);
+                        self.on_assistant_block(block, by_counter);
                     }
                 }
                 Flow::Continue
@@ -168,13 +236,23 @@ impl ClaudeStreamThinking {
     fn on_stream_event(&mut self, ev: &Value) {
         let index = ev.get("index").and_then(Value::as_u64);
         match ev.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                // A new message: leftovers of an aborted one must not
+                // suppress blocks that were never streamed.
+                self.finish();
+                self.streamed_blocks = 0;
+                self.current_message = ev
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             Some("content_block_start") => {
                 match ev.pointer("/content_block/type").and_then(Value::as_str) {
                     Some("thinking") => {
                         self.rec.start(ThinkingKind::Summary);
                         self.open_index = index;
                         self.open_has_text = false;
-                        self.streamed_blocks += 1;
+                        self.note_streamed();
                         if let Some(t) = ev
                             .pointer("/content_block/thinking")
                             .and_then(Value::as_str)
@@ -186,7 +264,7 @@ impl ClaudeStreamThinking {
                     }
                     Some("redacted_thinking") => {
                         self.rec.oneshot(ThinkingKind::Redacted, None, None);
-                        self.streamed_blocks += 1;
+                        self.note_streamed();
                     }
                     _ => {}
                 }
@@ -211,7 +289,14 @@ impl ClaudeStreamThinking {
         }
     }
 
-    fn on_assistant_block(&mut self, block: &Value) {
+    fn note_streamed(&mut self) {
+        if let Some(id) = &self.current_message {
+            self.streamed_messages.insert(id.clone());
+        }
+        self.streamed_blocks += 1;
+    }
+
+    fn on_assistant_block(&mut self, block: &Value, by_counter: bool) {
         let kind = match block.get("type").and_then(Value::as_str) {
             Some("thinking") => {
                 let text = block
@@ -233,8 +318,8 @@ impl ClaudeStreamThinking {
         let Some((kind, text)) = kind else {
             return;
         };
-        if self.streamed_blocks > 0 {
-            // Already reported live from the partial stream.
+        if by_counter && self.streamed_blocks > 0 {
+            // Already reported live from the partial stream (no message ids).
             self.streamed_blocks -= 1;
             return;
         }

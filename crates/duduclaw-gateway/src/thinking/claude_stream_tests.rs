@@ -176,3 +176,120 @@ fn debug_log_elides_thinking_deltas_only() {
     }
     assert_eq!(debug_log_line("not json", None), "not json");
 }
+
+fn ev_line(v: serde_json::Value) -> Value {
+    v
+}
+
+#[tokio::test]
+async fn a_retry_after_an_aborted_attempt_gets_new_ids_and_both_blocks_close() {
+    use crate::channel_reply::{ProgressCallback, ProgressEvent};
+    let home = tempfile::tempdir().unwrap();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let g = Arc::clone(&got);
+    let cb: ProgressCallback = Box::new(move |e| {
+        if let ProgressEvent::Thinking(t) = e {
+            g.lock().unwrap().push(t);
+        }
+    });
+    let policy = ThinkingPolicy {
+        level: SinkLevel::Summary,
+        max_chars: crate::thinking::policy::DEFAULT_MAX_CHARS,
+        ..ThinkingPolicy::INACTIVE
+    };
+    let ctx = crate::thinking::SinkCtx {
+        home: home.path().to_path_buf(),
+        agent_id: "agnes".into(),
+        redaction: None,
+    };
+    let (_cb, sink) = crate::thinking::install(Some(policy), Some(cb), ctx);
+    crate::thinking::scope_turn(sink, async {
+        let start = ev_line(serde_json::json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}));
+        let delta = |t: &str| ev_line(serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":t}}}));
+        // Attempt 1 dies mid-thinking (error return ⇒ the parser is dropped).
+        {
+            let mut a1 = ClaudeStreamThinking::new();
+            a1.observe(&start);
+            a1.observe(&delta("第一次嘗試。\n"));
+        }
+        // Attempt 2 (retry / failover) thinks again from index 0.
+        let mut a2 = ClaudeStreamThinking::new();
+        a2.observe(&start);
+        a2.observe(&delta("第二次嘗試。\n"));
+        a2.observe(&ev_line(serde_json::json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}})));
+    })
+    .await;
+    let got = got.lock().unwrap();
+    let ids: Vec<&str> = got.iter().map(|e| e.block_id.as_str()).collect();
+    let starts: Vec<&str> = got.iter().filter(|e| e.phase == ThinkingPhase::Start).map(|e| e.block_id.as_str()).collect();
+    let ends: Vec<&str> = got.iter().filter(|e| e.phase == ThinkingPhase::End).map(|e| e.block_id.as_str()).collect();
+    assert_eq!(starts, ["t0", "t1"], "{ids:?}");
+    assert_eq!(ends, ["t0", "t1"], "both blocks closed: {ids:?}");
+    let last_t1 = got.iter().rev().find(|e| e.block_id == "t1" && e.text.is_some()).unwrap();
+    assert!(!last_t1.text.as_deref().unwrap().contains("第一次"), "attempts never merge");
+}
+
+#[test]
+fn subagent_lines_never_touch_the_main_blocks() {
+    let (mut p, got) = rig();
+    let flows = feed(
+        &mut p,
+        &[
+            r#"{"type":"stream_event","parent_tool_use_id":"toolu_1","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":"toolu_1","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"subagent plan"}}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"thinking","thinking":"subagent plan"}]}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}"#,
+        ],
+    );
+    assert_eq!(flows[0], Flow::Consumed, "still kept away from the other collectors");
+    p.finish();
+    let got = got.lock().unwrap();
+    assert_eq!(shape(&got), [("t0".into(), "start", "summary"), ("t0".into(), "end", "omitted")]);
+    assert!(got.iter().all(|e| e.text.is_none()));
+}
+
+#[test]
+fn an_aborted_streamed_message_never_suppresses_a_later_block() {
+    let (mut p, got) = rig();
+    feed(
+        &mut p,
+        &[
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"X"}}}"#,
+            // m1's assistant repeat never arrives (aborted); m2 is not streamed.
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m2"}}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"thinking","thinking":"第二則訊息的思考"}]}}"#,
+            // A late repeat of m1 is still skipped.
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"redacted_thinking","data":"X"}]}}"#,
+        ],
+    );
+    p.finish();
+    let got = got.lock().unwrap();
+    assert_eq!(
+        shape(&got),
+        [
+            ("t0".into(), "start", "redacted"),
+            ("t0".into(), "end", "redacted"),
+            ("t1".into(), "start", "summary"),
+            ("t1".into(), "end", "summary"),
+        ]
+    );
+    assert_eq!(got[3].text.as_deref(), Some("第二則訊息的思考"));
+}
+
+#[test]
+fn diagnostics_never_keep_thinking_text() {
+    let assistant = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"SECRET PLAN","signature":"S"},{"type":"redacted_thinking","data":"CIPHER"},{"type":"text","text":"答"}]}}"#;
+    let parsed: Value = serde_json::from_str(assistant).unwrap();
+    let kept = diagnostic_line(assistant, Some(&parsed)).unwrap();
+    assert!(!kept.contains("SECRET PLAN") && !kept.contains("CIPHER") && !kept.contains("\"S\""), "{kept}");
+    assert!(kept.contains("\"elided\":true") && kept.contains("答"), "{kept}");
+    let partial = PARTIAL_FIXTURE[4];
+    let parsed: Value = serde_json::from_str(partial).unwrap();
+    assert_eq!(diagnostic_line(partial, Some(&parsed)), None);
+    let result = PARTIAL_FIXTURE.last().unwrap();
+    let parsed: Value = serde_json::from_str(result).unwrap();
+    assert_eq!(diagnostic_line(result, Some(&parsed)).as_deref(), Some(*result));
+    assert_eq!(diagnostic_line("not json", None).as_deref(), Some("not json"));
+}
