@@ -13,8 +13,8 @@
 //!   commit. Apache-2.0. Six files, ~945 MB, dominated by
 //!   `onnx/model_q4.onnx_data`.
 //! * **ONNX Runtime** — Microsoft's official GitHub release matching the
-//!   version `ort-sys 2.0.0-rc.12` targets (1.24.2). We extract exactly one
-//!   member (the versioned shared library) out of each archive.
+//!   version `ort-sys 2.0.0-rc.12` targets (1.24.2), pinned in
+//!   `duduclaw_onnx::manifest` and re-exported here.
 
 use std::path::{Path, PathBuf};
 
@@ -24,12 +24,6 @@ use std::path::{Path, PathBuf};
 /// model version and recorded in every `AuditEvent::Redact` the model
 /// produces.
 pub const MODEL_REVISION: &str = "7ffa9a043d54d1be65afb281eddf0ffbe629385b";
-
-/// ONNX Runtime version. Must match what `ort-sys 2.0.0-rc.12` targets —
-/// its own crate description says "ONNX Runtime 1.24" and its bundled
-/// `dist.txt` pins `ms@1.24.2`. Loading a mismatched major/minor through
-/// `load-dynamic` is how you get an ABI crash instead of an error.
-pub const ORT_VERSION: &str = "1.24.2";
 
 /// Total model download size, for the UI's "917 MB" style warning.
 pub fn model_total_bytes() -> u64 {
@@ -104,130 +98,12 @@ pub const MODEL_FILES: &[RemoteFile] = &[
     },
 ];
 
-/// Archive container format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArchiveKind {
-    /// gzip-compressed tar (`.tgz`) — the macOS / Linux releases.
-    TarGz,
-    /// zip (`.zip`) — the Windows releases.
-    Zip,
-}
-
-/// A pinned ONNX Runtime release archive plus the one member we keep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OrtArchive {
-    /// Rust target triple this archive serves.
-    pub target: &'static str,
-    /// Download URL (Microsoft GitHub release asset).
-    pub url: &'static str,
-    /// Archive size in bytes.
-    pub size: u64,
-    /// Archive SHA-256, lowercase hex.
-    pub sha256: &'static str,
-    pub kind: ArchiveKind,
-    /// Path of the shared library INSIDE the archive. We extract only this
-    /// one member — the archives also carry headers, cmake files, debug
-    /// symbols and test data we have no use for, and (on macOS/Linux) an
-    /// unversioned symlink we would rather create as a plain file.
-    pub member: &'static str,
-    /// File name written under `<home>/lib/onnxruntime/<ver>/`. This is what
-    /// `ort::init_from` is pointed at.
-    pub lib_file: &'static str,
-}
-
-/// Every platform we can install ONNX Runtime for.
-///
-/// **macOS on Intel is absent on purpose.** Microsoft stopped shipping an
-/// `onnxruntime-osx-x86_64` asset before 1.24, and `ort`'s own binary
-/// distribution has no `x86_64-apple-darwin` entry at 1.24.2 either. Rather
-/// than substitute an unrelated build, that platform reports "unsupported"
-/// and the rule fails closed.
-pub const ORT_ARCHIVES: &[OrtArchive] = &[
-    OrtArchive {
-        target: "aarch64-apple-darwin",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-osx-arm64-1.24.2.tgz",
-        size: 31_604_221,
-        sha256: "0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde",
-        kind: ArchiveKind::TarGz,
-        member: "onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib",
-        lib_file: "libonnxruntime.dylib",
-    },
-    OrtArchive {
-        target: "x86_64-unknown-linux-gnu",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
-        size: 8_123_282,
-        sha256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
-        kind: ArchiveKind::TarGz,
-        member: "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
-        lib_file: "libonnxruntime.so",
-    },
-    OrtArchive {
-        target: "aarch64-unknown-linux-gnu",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-aarch64-1.24.2.tgz",
-        size: 7_135_756,
-        sha256: "6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e",
-        kind: ArchiveKind::TarGz,
-        member: "onnxruntime-linux-aarch64-1.24.2/lib/libonnxruntime.so.1.24.2",
-        lib_file: "libonnxruntime.so",
-    },
-    OrtArchive {
-        target: "x86_64-pc-windows-msvc",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
-        size: 74_075_355,
-        sha256: "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
-        kind: ArchiveKind::Zip,
-        member: "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
-        lib_file: "onnxruntime.dll",
-    },
-    OrtArchive {
-        target: "aarch64-pc-windows-msvc",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-arm64-1.24.2.zip",
-        size: 74_960_464,
-        sha256: "dd8180d98e5a0ead7ead99029acc80b86a8b905b9aba4cc978e388039bb5823b",
-        kind: ArchiveKind::Zip,
-        member: "onnxruntime-win-arm64-1.24.2/lib/onnxruntime.dll",
-        lib_file: "onnxruntime.dll",
-    },
-];
-
-/// The Rust target triple this binary was built for, as the manifest spells
-/// it. Windows MSVC and GNU (mingw) toolchains consume the same DLL, so both
-/// map onto the `-msvc` entry.
-pub fn current_target() -> &'static str {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "aarch64-apple-darwin"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin" // deliberately not in ORT_ARCHIVES — see above
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "aarch64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "x86_64-pc-windows-msvc"
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        "aarch64-pc-windows-msvc"
-    } else {
-        "unsupported"
-    }
-}
-
-/// The archive for the running platform, or `None` when this platform has no
-/// pinned ONNX Runtime build.
-pub fn ort_archive_for_current_platform() -> Option<&'static OrtArchive> {
-    let target = current_target();
-    ORT_ARCHIVES.iter().find(|a| a.target == target)
-}
-
-/// `<ort_lib_root>/<version>/` — where the shared library is installed.
-pub fn ort_lib_dir(ort_lib_root: &Path) -> PathBuf {
-    ort_lib_root.join(ORT_VERSION)
-}
-
-/// Full path of the shared library for the running platform, or `None` on an
-/// unsupported platform.
-pub fn ort_lib_path(ort_lib_root: &Path) -> Option<PathBuf> {
-    ort_archive_for_current_platform().map(|a| ort_lib_dir(ort_lib_root).join(a.lib_file))
-}
+// ONNX Runtime pins live in `duduclaw-onnx` (shared with the knowledge-base
+// embedding models: one process, one ORT init, one install directory).
+pub use duduclaw_onnx::manifest::{
+    ArchiveKind, ORT_ARCHIVES, ORT_VERSION, OrtArchive, current_target,
+    ort_archive_for_current_platform, ort_lib_dir, ort_lib_path,
+};
 
 /// Marker file written after a fully verified install.
 pub const INSTALL_MARKER: &str = "installed.json";

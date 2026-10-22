@@ -13,17 +13,20 @@
 //! rule reads the marker, so a partial install is indistinguishable from no
 //! install: fail-closed by construction, never "half the model".
 
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use futures_util::StreamExt;
+#[cfg(test)]
+use super::manifest::ArchiveKind;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use super::manifest::{
-    self, ArchiveKind, INSTALL_MARKER, InstallMarker, MODEL_FILES, MODEL_REVISION, ORT_VERSION,
-    OrtArchive, RemoteFile,
+    self, INSTALL_MARKER, InstallMarker, MODEL_FILES, MODEL_REVISION, ORT_VERSION, OrtArchive,
+    RemoteFile,
 };
 use crate::error::{RedactionError, Result};
 
@@ -43,33 +46,20 @@ pub struct Progress {
 /// Progress sink. Called often — must be cheap and must not block.
 pub type ProgressFn = Arc<dyn Fn(Progress) + Send + Sync>;
 
-/// Lock sentinel preventing two processes installing at once.
-const LOCK_FILE: &str = "install.lock";
-/// A lock older than this is assumed to belong to a crashed install.
-const LOCK_STALE_SECS: u64 = 6 * 60 * 60;
+/// The generic download / verify / extract code lives in `duduclaw-onnx`
+/// (shared with the knowledge-base embedding models); this maps its errors.
+fn onnx_err(e: duduclaw_onnx::OnnxError) -> RedactionError {
+    match e {
+        duduclaw_onnx::OnnxError::Io(io) => RedactionError::Io(io),
+        duduclaw_onnx::OnnxError::Message(m) => RedactionError::config(m),
+    }
+}
+
+pub use duduclaw_onnx::install::{hex_lower, part_path};
 
 /// SHA-256 of a file, lowercase hex. Streams — never loads the file.
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex_lower(&hasher.finalize()))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    duduclaw_onnx::install::sha256_file(path).map_err(onnx_err)
 }
 
 /// Result of checking one artefact against the manifest.
@@ -85,26 +75,11 @@ pub enum FileState {
 
 /// Full verification of one pinned file (hashes the whole thing).
 pub fn verify_file(dir: &Path, spec: &RemoteFile) -> FileState {
-    let path = spec.dest(dir);
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => return FileState::Missing,
-    };
-    if meta.len() != spec.size {
-        return FileState::Corrupt(format!(
-            "{}: expected {} bytes, found {}",
-            spec.rel_path,
-            spec.size,
-            meta.len()
-        ));
-    }
-    match sha256_file(&path) {
-        Ok(got) if got == spec.sha256 => FileState::Verified,
-        Ok(got) => FileState::Corrupt(format!(
-            "{}: sha256 mismatch (expected {}, got {got})",
-            spec.rel_path, spec.sha256
-        )),
-        Err(e) => FileState::Corrupt(format!("{}: cannot hash: {e}", spec.rel_path)),
+    use duduclaw_onnx::install::FileState as F;
+    match duduclaw_onnx::install::verify_path(&spec.dest(dir), spec.rel_path, spec.size, spec.sha256) {
+        F::Verified => FileState::Verified,
+        F::Missing => FileState::Missing,
+        F::Corrupt(why) => FileState::Corrupt(why),
     }
 }
 
@@ -175,6 +150,12 @@ pub fn installed_problem(dirs: &InstallDirs) -> Option<String> {
     };
     if !lib.exists() {
         return Some("ONNX Runtime 執行庫尚未安裝".to_string());
+    }
+    // The library is native code loaded into the gateway: it must be the
+    // pinned build, not whatever file sits at that path (shared with the
+    // knowledge-base embeddings, which apply the same check).
+    if let Err(problem) = duduclaw_onnx::install::verify_ort_lib(&dirs.ort_lib_root) {
+        return Some(problem);
     }
     None
 }
@@ -294,113 +275,32 @@ async fn install_ort(
     done: &mut u64,
     progress: &ProgressFn,
 ) -> Result<()> {
-    let lib_dir = manifest::ort_lib_dir(&dirs.ort_lib_root);
-    let lib_path = lib_dir.join(archive.lib_file);
-    if lib_path.exists() {
-        *done += archive.size;
+    let base = *done;
+    duduclaw_onnx::install::install_ort(client, &dirs.ort_lib_root, archive, cancel, &|got| {
         progress(Progress {
             file: "onnxruntime".to_string(),
-            done_bytes: *done,
+            done_bytes: base + got,
             total_bytes: total,
         });
-        return Ok(());
-    }
-    std::fs::create_dir_all(&lib_dir)?;
-
-    let tmp_archive = lib_dir.join(format!(
-        "onnxruntime-{ORT_VERSION}.{}",
-        match archive.kind {
-            ArchiveKind::TarGz => "tgz",
-            ArchiveKind::Zip => "zip",
-        }
-    ));
-    let base = *done;
-    fetch_verified(
-        client,
-        archive.url,
-        &tmp_archive,
-        archive.size,
-        archive.sha256,
-        cancel,
-        &|got| {
-            progress(Progress {
-                file: "onnxruntime".to_string(),
-                done_bytes: base + got,
-                total_bytes: total,
-            });
-        },
-    )
-    .await?;
-
-    extract_member(&tmp_archive, archive, &lib_path)?;
-    let _ = std::fs::remove_file(&tmp_archive);
+    })
+    .await
+    .map_err(onnx_err)?;
     *done += archive.size;
     Ok(())
 }
 
 /// Pull exactly one member out of the ORT release archive.
 pub fn extract_member(archive_path: &Path, archive: &OrtArchive, dest: &Path) -> Result<()> {
-    let tmp = dest.with_extension("part");
-    let _ = std::fs::remove_file(&tmp);
-    let found = match archive.kind {
-        ArchiveKind::TarGz => {
-            let f = std::fs::File::open(archive_path)?;
-            let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f));
-            let mut hit = false;
-            for entry in tar.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?.to_string_lossy().to_string();
-                if path == archive.member {
-                    let mut out = std::fs::File::create(&tmp)?;
-                    std::io::copy(&mut entry, &mut out)?;
-                    hit = true;
-                    break;
-                }
-            }
-            hit
-        }
-        ArchiveKind::Zip => {
-            let f = std::fs::File::open(archive_path)?;
-            let mut zip = zip::ZipArchive::new(f)
-                .map_err(|e| RedactionError::config(format!("ONNX Runtime zip 無法讀取：{e}")))?;
-            match zip.by_name(archive.member) {
-                Ok(mut entry) => {
-                    let mut out = std::fs::File::create(&tmp)?;
-                    std::io::copy(&mut entry, &mut out)?;
-                    true
-                }
-                Err(_) => false,
-            }
-        }
-    };
-    if !found {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RedactionError::config(format!(
-            "ONNX Runtime 壓縮檔裡找不到 {}（版本可能已變更）",
-            archive.member
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
-    }
-    std::fs::rename(&tmp, dest)?;
-    Ok(())
+    duduclaw_onnx::install::extract_member(archive_path, archive, dest).map_err(onnx_err)
 }
 
 fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        // No global timeout: a 917 MB file on a slow link is not an error.
-        .user_agent(concat!("duduclaw-redaction/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| RedactionError::config(format!("HTTP client: {e}")))
+    duduclaw_onnx::install::http_client(concat!("duduclaw-redaction/", env!("CARGO_PKG_VERSION")))
+        .map_err(onnx_err)
 }
 
 /// Stream `url` into `<dest>.part`, resuming from whatever is already there,
 /// verify the hash, then rename into place.
-#[allow(clippy::too_many_arguments)]
 async fn fetch_verified(
     client: &reqwest::Client,
     url: &str,
@@ -410,89 +310,9 @@ async fn fetch_verified(
     cancel: &Arc<AtomicBool>,
     on_bytes: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<()> {
-    let part = part_path(dest);
-    let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    if have > expect_size {
-        // A stale `.part` from a different revision — start over rather than
-        // resume into a file that can never hash correctly.
-        let _ = std::fs::remove_file(&part);
-        have = 0;
-    }
-
-    if have < expect_size {
-        let mut req = client.get(url);
-        if have > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| RedactionError::config(format!("下載失敗：{e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(RedactionError::config(format!(
-                "下載失敗（HTTP {}）：{}",
-                status.as_u16(),
-                short_url(url)
-            )));
-        }
-        // A server that ignored our Range header restarts the file; honour
-        // that rather than appending a second copy onto the first.
-        let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
-        let mut file = if resuming {
-            let mut f = std::fs::OpenOptions::new().write(true).open(&part)?;
-            f.seek(SeekFrom::Start(have))?;
-            f
-        } else {
-            have = 0;
-            std::fs::File::create(&part)?
-        };
-
-        let mut written = have;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                file.flush()?;
-                return Err(RedactionError::config("下載已取消".to_string()));
-            }
-            let chunk = chunk.map_err(|e| RedactionError::config(format!("下載中斷：{e}")))?;
-            file.write_all(&chunk)?;
-            written += chunk.len() as u64;
-            on_bytes(written);
-        }
-        file.flush()?;
-        drop(file);
-    }
-
-    let got_size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    if got_size != expect_size {
-        let _ = std::fs::remove_file(&part);
-        return Err(RedactionError::config(format!(
-            "下載檔大小不符（預期 {expect_size} 位元組，實際 {got_size}），已刪除重來"
-        )));
-    }
-    let got = sha256_file(&part)?;
-    if got != expect_sha {
-        let _ = std::fs::remove_file(&part);
-        return Err(RedactionError::config(
-            "下載檔完整性驗證失敗（sha256 不符），已刪除；請重新下載".to_string(),
-        ));
-    }
-    std::fs::rename(&part, dest)?;
-    on_bytes(expect_size);
-    Ok(())
-}
-
-/// `<dest>.part` — sibling temp file so the rename stays on one filesystem.
-pub fn part_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(".part");
-    dest.with_file_name(name)
-}
-
-/// Host portion of a URL, for error text that must not carry query strings.
-fn short_url(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
+    duduclaw_onnx::install::fetch_verified(client, url, dest, expect_size, expect_sha, cancel, on_bytes)
+        .await
+        .map_err(onnx_err)
 }
 
 /// Delete the model files (and the marker). The ONNX Runtime library is
@@ -523,41 +343,14 @@ pub fn remove_model(model_dir: &Path) -> Result<()> {
 
 /// Cross-process install lock, released on drop.
 struct InstallLock {
-    path: PathBuf,
+    _inner: duduclaw_onnx::install::InstallLock,
 }
 
 impl InstallLock {
     fn acquire(model_dir: &Path) -> Result<Self> {
-        let path = model_dir.join(LOCK_FILE);
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let stale = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs() > LOCK_STALE_SECS)
-                .unwrap_or(true);
-            if stale {
-                let _ = std::fs::remove_file(&path);
-            } else {
-                return Err(RedactionError::config(
-                    "另一個安裝程序正在下載模型，請稍候".to_string(),
-                ));
-            }
-        }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| {
-                RedactionError::config(format!("無法建立安裝鎖 {}：{e}", path.display()))
-            })?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        duduclaw_onnx::install::InstallLock::acquire(model_dir)
+            .map(|inner| Self { _inner: inner })
+            .map_err(onnx_err)
     }
 }
 
@@ -680,6 +473,37 @@ mod tests {
         .unwrap();
         let problem = installed_problem(&dirs).unwrap();
         assert!(problem.contains("不存在") || problem.contains("大小不符"), "{problem}");
+    }
+
+    #[test]
+    fn a_library_that_is_not_the_pinned_build_is_not_installed() {
+        let tmp = TempDir::new().unwrap();
+        let dirs = InstallDirs::under_home(tmp.path());
+        std::fs::create_dir_all(&dirs.model_dir).unwrap();
+        std::fs::write(
+            dirs.model_dir.join(INSTALL_MARKER),
+            serde_json::to_string(&InstallMarker {
+                model_revision: MODEL_REVISION.into(),
+                ort_version: ORT_VERSION.into(),
+                verified_at: "2026-01-01T00:00:00Z".into(),
+                files: Default::default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // Every model file present at its pinned size (sparse files).
+        for spec in MODEL_FILES {
+            let p = spec.dest(&dirs.model_dir);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::File::create(&p).unwrap().set_len(spec.size).unwrap();
+        }
+        let Some(lib) = manifest::ort_lib_path(&dirs.ort_lib_root) else {
+            return; // unsupported platform
+        };
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, b"not the pinned library").unwrap();
+        let problem = installed_problem(&dirs).unwrap();
+        assert!(problem.contains("ONNX Runtime"), "{problem}");
     }
 
     #[test]

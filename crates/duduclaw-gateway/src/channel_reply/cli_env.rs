@@ -91,8 +91,6 @@ pub(super) async fn spawn_claude_cli_with_env(
         // `--system-prompt-file` is set (2026-08-16). Removed.
         "-p",
         user_message,
-        "--model",
-        model,
         "--output-format",
         "stream-json",
         "--verbose",
@@ -102,6 +100,13 @@ pub(super) async fn spawn_claude_cli_with_env(
         "--max-turns",
         "50",
     ]);
+    // An unset model (`[model] utility = ""`, a failover with no model) must
+    // leave the choice to the CLI. `--model ""` was sent verbatim before
+    // 2026-10-22; in that day's logs only those calls failed with
+    // `assistant error: unknown` (correlation, not yet reproduced).
+    if !model.trim().is_empty() {
+        cmd.args(["--model", model]);
+    }
     // Thinking display: `--include-partial-messages` only when this turn's
     // viewer reads thinking text live (`crate::thinking::policy`). Outside a
     // reply turn, or for a channel / status-only viewer, nothing is added

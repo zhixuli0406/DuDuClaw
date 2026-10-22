@@ -99,6 +99,21 @@
 
 **權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
+## 系統設定 → 進階設定 → 文件知識庫搜尋
+
+只限管理員（1.76.0 新增）。顯示文件知識庫目前是依語意搜尋還是只比對關鍵字；只比對關鍵字時會說明原因，並顯示已有向量的段落比例。
+
+| 控制項 | 寫入 | 效果 |
+|---|---|---|
+| 計算方式：本機模型／OpenAI／Google Gemini／關閉 | `[knowledge.embedding] provider`（雲端另加 `cloud_model`、`cloud_account`） | 下一次搜尋生效。選雲端供應商會開啟對話框，寫明會收到段落的供應商與主機；勾選確認框之前，**改用 …** 按鈕維持停用，確認結果存成 `cloud_disclosure_ack`。去識別化沒有啟用時，對話框會提醒（此時什麼都不會送出）。改選其他方式會移除這份確認。 |
+| 安裝（大小） | 下載到 `models/embedding/<model>/` 與 `lib/onnxruntime/` | 背景下載並顯示進度，按**取消**後可以續傳；完成後替每一段排入建立向量的工作。 |
+| 重新檢查（離線安裝） | — | 先用發行金鑰驗證離線安裝包的簽章（`.tar` 加 `.tar.minisig`，不要解壓，放在 `models/embedding/`），通過才解開、逐檔比對雜湊值，再標示為已安裝。 |
+| 改用這個模型 | `local_model` | 切換本機模型；背景會替每一段建立新模型的向量（前一個模型的向量會保留，但不會拿來比對）。 |
+| 移除 | 刪除模型檔 | 搜尋改為只比對關鍵字並顯示原因；執行環境函式庫保留。 |
+| 補齊尚未建立的向量 | — | 替所有還缺向量的來源排入處理。 |
+
+詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md#向量模型)。
+
 ## 設定檔（未發布）
 
 RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯）。上限：Markdown 每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
@@ -131,7 +146,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **可編輯的檔案：**系統設定（`config.toml`）、推理設定（`inference.toml`），以及每位 AI 員工的 `agent.toml`（必須是 `agents/` 底下的實際目錄，不接受符號連結）。
 - **密鑰遮罩：**鍵名以 `_enc` 結尾、名為 `key` 或以 `_key` 結尾、或含 token、secret、password、passwd、api_key、apikey、widget_key、private_key、credential、service_account_json 的值，以及 `headers`、`otlp_headers`、`env` 表格裡的每個值、帶密碼的網址，都顯示成 `«set»`。存檔時原樣保留 `«set»` 就保留原值；原本沒有值卻寫 `«set»` 會被拒絕。`[mcp_keys]` 整段不顯示。
 - **驗證：**先檢查 TOML 語法，錯誤會指出第幾行第幾欄；再用對應的型別（系統設定的各區段驗證、`InferenceConfig`、`AgentConfig`）檢查，失敗就不寫入。不能在這裡改員工的 `[agent] name`。
-- **文件知識庫：**集合、文件、分享與存取紀錄在側邊欄「公司 → 文件知識庫」管理；`[knowledge]` 這些全域上限還沒有設定頁，它的各個鍵（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`，以及 `extract_when_unavailable` = `refuse`／`run_unsandboxed`）在這裡會檢查型別。員工的 `[knowledge] collections` 在「AI 員工 → 編輯設定 → 工具與權限 → 文件知識庫」設定（只能選已分享給它的集合），也可以直接改該員工的 `agent.toml`。詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。
+- **文件知識庫：**集合、文件、分享與存取紀錄在側邊欄「公司 → 文件知識庫」管理；`[knowledge]` 這些全域上限還沒有設定頁，它的各個鍵（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`，以及 `extract_when_unavailable` = `refuse`／`run_unsandboxed`）在這裡會檢查型別。`[knowledge.embedding]` 的各個鍵（`provider` = `local`／`openai`／`gemini`／`none`、`local_model`、`cloud_model`、`cloud_account`、`cloud_base_url`、`allow_private_endpoint`、`batch_size`、`threads`、`max_vector_rows`、`idle_unload_minutes`）也一樣；揭露確認紀錄 `cloud_disclosure_ack` 不能在這裡改（存檔會被拒絕），只能經由「文件知識庫搜尋」的揭露對話框寫入。員工的 `[knowledge] collections` 在「AI 員工 → 編輯設定 → 工具與權限 → 文件知識庫」設定（只能選已分享給它的集合），也可以直接改該員工的 `agent.toml`。詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。
 - **衝突：**開啟時取得檔案內容的雜湊值，存檔時帶回。檔案在這段時間被改過就拒絕，請重新載入再改。
 - **備份：**寫入前備份成 `<檔名>.bak-<Unix 時間>`（權限 0600），保留最近 5 份。
 - **稽核：**每次寫入記 `config_raw_edited`。改到 `[delegation]`、`[acp]`，或員工的 `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時等級為 Warning。

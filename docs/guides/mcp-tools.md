@@ -456,6 +456,12 @@ at index time as instruction-like text carries a warning line. `collections` onl
 `knowledge_get_passage` re-checks permissions on every call and answers a missing chunk and
 a forbidden one the same way (`permission denied`).
 
+`knowledge_search` and `knowledge_list_collections` start their answer with the search mode
+(hybrid = keywords plus meaning-based vectors, or keywords only) and, when vectors were not
+used, the reason (no model installed, cloud provider not acknowledged, redaction off, a
+cloud error, …); `knowledge_list_collections` also reports each collection's vector
+coverage. Vectors only ever rank passages inside the collections the call may read.
+
 ## Deprecated aliases are still listed
 
 A deprecated tool name keeps appearing in `tools/list` with a

@@ -82,6 +82,8 @@ mod credential_hardening_tests;
 #[cfg(test)]
 mod provider_rotation_tests;
 #[cfg(test)]
+mod quota_refusal_tests;
+#[cfg(test)]
 mod select_env_tests;
 #[cfg(test)]
 mod subscription_oauth_tests;

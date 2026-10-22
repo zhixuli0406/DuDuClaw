@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::KbResult;
 use crate::acl::AllowedSet;
-use crate::embed::{EmbedError, Embedder};
+use crate::embed::vector_cache::VectorCache;
+use crate::embed::{EmbedError, Egress, Embedder, is_available, vectors};
 use crate::fts::{like_pattern, plan_query};
 use crate::locator::{Locator, LocatorKind};
 use crate::rank::{cap_per_source, rrf};
@@ -59,6 +60,9 @@ pub struct Hit {
     pub fts_rank: Option<u32>,
     pub like_rank: Option<u32>,
     pub vec_rank: Option<u32>,
+    /// Cosine similarity to the query when the vector list had this chunk.
+    #[serde(default)]
+    pub vec_score: Option<f32>,
     /// Flagged at index time as instruction-like text.
     pub suspect: bool,
 }
@@ -69,8 +73,91 @@ pub struct SearchResponse {
     pub mode: RetrievalMode,
     /// zh-TW reason when vector retrieval was not used.
     pub vector_unavailable: Option<String>,
+    /// Share of the searched chunks that have a vector of the model in use
+    /// (`None` when vectors were not used or nothing is eligible).
+    #[serde(default)]
+    pub coverage: Option<f32>,
     /// The `LIKE` fallback hit its scan ceiling.
     pub scan_capped: bool,
+}
+
+/// What the vector side contributed to one search.
+struct VectorSide {
+    /// `(chunk_id, cosine)`, best first, already inside the allowed set.
+    hits: Vec<(i64, f32)>,
+    unavailable: Option<String>,
+    coverage: Option<f32>,
+}
+
+impl VectorSide {
+    fn off(reason: String) -> Self {
+        Self { hits: Vec::new(), unavailable: Some(reason), coverage: None }
+    }
+}
+
+/// zh-TW: every allowed collection is kept off the cloud provider.
+pub const CLOUD_EXCLUDED_REASON: &str =
+    "這些集合設定為只在本機計算向量（或屬機密），使用雲端向量時只以關鍵字檢索";
+/// zh-TW: vectors exist for none of the allowed passages yet.
+pub const NO_VECTORS_YET_REASON: &str = "向量尚未建立完成，目前只以關鍵字檢索";
+
+fn unavailable_reason(embedder: &dyn Embedder) -> String {
+    match embedder.embed_query("") {
+        Err(EmbedError::Unavailable(r) | EmbedError::Failed(r)) => r,
+        Ok(_) => crate::embed::KEYWORD_ONLY_REASON.to_string(),
+    }
+}
+
+/// Keep only chunks whose source is searchable right now.
+fn searchable(conn: &Connection, hits: Vec<(i64, f32)>) -> KbResult<Vec<(i64, f32)>> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+    let ids: Vec<i64> = hits.iter().map(|h| h.0).collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id
+          WHERE c.id IN (SELECT value FROM json_each(?1)) AND s.status IN ('embedding','ready')",
+    )?;
+    let ok: std::collections::HashSet<i64> = stmt
+        .query_map(params![serde_json::to_string(&ids).unwrap_or_default()], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(hits.into_iter().filter(|h| ok.contains(&h.0)).collect())
+}
+
+fn vector_side(
+    conn: &Connection,
+    allowed: &AllowedSet,
+    query: &str,
+    embedder: &dyn Embedder,
+    cache: &VectorCache,
+) -> KbResult<VectorSide> {
+    if !is_available(embedder) {
+        return Ok(VectorSide::off(unavailable_reason(embedder)));
+    }
+    let excluded = match embedder.egress() {
+        Egress::Cloud { .. } => vectors::cloud_excluded_collections(conn)?,
+        Egress::Local => Default::default(),
+    };
+    let eligible: Vec<String> = allowed.ids().iter().filter(|c| !excluded.contains(*c)).cloned().collect();
+    if eligible.is_empty() {
+        return Ok(VectorSide::off(CLOUD_EXCLUDED_REASON.to_string()));
+    }
+    let (have, total) = vectors::coverage(conn, embedder.model_id(), Some(&eligible), &excluded)?;
+    if have == 0 {
+        // Nothing to compare against: do not compute (or send) the query.
+        return Ok(VectorSide::off(NO_VECTORS_YET_REASON.to_string()));
+    }
+    let coverage = (total > 0).then(|| have as f32 / total as f32);
+    let q = match embedder.embed_query(query) {
+        Ok(q) => q,
+        Err(EmbedError::Unavailable(r) | EmbedError::Failed(r)) => {
+            tracing::warn!(reason = %r, "knowledge: query embedding failed; keyword-only for this search");
+            return Ok(VectorSide::off(r));
+        }
+    };
+    let snap = cache.snapshot(conn, embedder.model_id(), embedder.dim())?;
+    let hits = searchable(conn, snap.knn(&q, allowed, &excluded, LIST_LIMIT))?;
+    Ok(VectorSide { hits, unavailable: None, coverage })
 }
 
 /// A chunk row with its source title.
@@ -213,25 +300,108 @@ fn like_list(
     ))
 }
 
+/// Load, re-check against `allowed`, cap per source and build hits for a
+/// fused list whose third rank column (if any) is the vector rank.
+fn assemble(
+    conn: &Connection,
+    allowed: &AllowedSet,
+    fused: Vec<crate::rank::Fused>,
+    vec_scores: &HashMap<i64, f32>,
+    limit: usize,
+) -> KbResult<Vec<Hit>> {
+    let mut rows: HashMap<i64, ChunkRow> = HashMap::new();
+    for f in &fused {
+        if let Some(row) = load_chunk(conn, f.chunk_id)? {
+            // Invariant: nothing outside the allowed set leaves this module.
+            if allowed.contains(&row.collection_id) {
+                rows.insert(row.id, row);
+            }
+        }
+    }
+    let source_of: HashMap<i64, String> = rows.iter().map(|(id, r)| (*id, r.source_id.clone())).collect();
+    let kept = cap_per_source(fused, &source_of, limit);
+    Ok(kept
+        .into_iter()
+        .filter_map(|f| {
+            let row = rows.remove(&f.chunk_id)?;
+            let rank = |i: usize| f.ranks.get(i).copied().flatten();
+            Some(Hit {
+                chunk_id: row.id,
+                source_id: row.source_id,
+                collection_id: row.collection_id,
+                title: row.title,
+                locator_text: row.locator.display(),
+                locator: row.locator,
+                heading_path: row.heading_path,
+                text: row.text,
+                score: f.score,
+                fts_rank: rank(0),
+                like_rank: rank(1),
+                vec_rank: rank(2),
+                vec_score: vec_scores.get(&f.chunk_id).copied(),
+                suspect: row.flags & crate::index::FLAG_SUSPECT != 0,
+            })
+        })
+        .collect())
+}
+
+/// Vector list only (no keyword lists) — for `duduclaw knowledge eval
+/// --modes vector`, to see what the model alone contributes.
+pub fn vector_only(
+    conn: &Connection,
+    allowed: &AllowedSet,
+    query: &str,
+    limit: usize,
+    embedder: &dyn Embedder,
+    cache: &VectorCache,
+) -> KbResult<SearchResponse> {
+    let limit = limit.clamp(1, MAX_RESULTS);
+    if allowed.is_empty() || query.trim().is_empty() {
+        return Ok(SearchResponse { hits: Vec::new(), mode: RetrievalMode::None, vector_unavailable: None, coverage: None, scan_capped: false });
+    }
+    let vec = vector_side(conn, allowed, query, embedder, cache)?;
+    if vec.unavailable.is_some() {
+        return Ok(SearchResponse { hits: Vec::new(), mode: RetrievalMode::None, vector_unavailable: vec.unavailable, coverage: None, scan_capped: false });
+    }
+    let scores: HashMap<i64, f32> = vec.hits.iter().copied().collect();
+    let ids: Vec<i64> = vec.hits.iter().map(|h| h.0).collect();
+    let hits = assemble(conn, allowed, rrf(&[Vec::new(), Vec::new(), ids]), &scores, limit)?;
+    Ok(SearchResponse { hits, mode: RetrievalMode::VectorOnly, vector_unavailable: None, coverage: vec.coverage, scan_capped: false })
+}
+
 /// Search `allowed` for `query`, returning at most `limit` hits.
+///
+/// Keyword lists (FTS, short-term `LIKE`) always run; the vector list runs
+/// when `embedder` is usable and the allowed collections have vectors of
+/// its model. A vector side that cannot run is reported in
+/// `vector_unavailable`, never skipped silently.
 pub fn search(
     conn: &Connection,
     allowed: &AllowedSet,
     query: &str,
     limit: usize,
     embedder: &dyn Embedder,
+    cache: &VectorCache,
 ) -> KbResult<SearchResponse> {
     let limit = limit.clamp(1, MAX_RESULTS);
-    let vector_unavailable = match embedder.embed_query(query) {
-        Ok(_) => None,
-        Err(EmbedError::Unavailable(reason) | EmbedError::Failed(reason)) => Some(reason),
-    };
     let plan = plan_query(query);
-    if allowed.is_empty() || plan.is_empty() {
+    if allowed.is_empty() || query.trim().is_empty() {
+        let reason = (!is_available(embedder)).then(|| unavailable_reason(embedder));
         return Ok(SearchResponse {
             hits: Vec::new(),
             mode: RetrievalMode::None,
-            vector_unavailable,
+            vector_unavailable: reason,
+            coverage: None,
+            scan_capped: false,
+        });
+    }
+    let vec = vector_side(conn, allowed, query, embedder, cache)?;
+    if plan.is_empty() && vec.unavailable.is_some() {
+        return Ok(SearchResponse {
+            hits: Vec::new(),
+            mode: RetrievalMode::None,
+            vector_unavailable: vec.unavailable,
+            coverage: None,
             scan_capped: false,
         });
     }
@@ -244,46 +414,19 @@ pub fn search(
         like_terms.extend(plan.fallback_terms.iter().cloned());
     }
     let (like, scan_capped) = like_list(conn, allowed, &like_terms)?;
-    let fused = rrf(&[fts, like]);
-    let mut rows: HashMap<i64, ChunkRow> = HashMap::new();
-    for f in &fused {
-        if let Some(row) = load_chunk(conn, f.chunk_id)? {
-            // Invariant: nothing outside the allowed set leaves this function.
-            if allowed.contains(&row.collection_id) {
-                rows.insert(row.id, row);
-            }
-        }
-    }
-    let source_of: HashMap<i64, String> = rows
-        .iter()
-        .map(|(id, r)| (*id, r.source_id.clone()))
-        .collect();
-    let kept = cap_per_source(fused, &source_of, limit);
-    let hits = kept
-        .into_iter()
-        .filter_map(|f| {
-            let row = rows.remove(&f.chunk_id)?;
-            Some(Hit {
-                chunk_id: row.id,
-                source_id: row.source_id,
-                collection_id: row.collection_id,
-                title: row.title,
-                locator_text: row.locator.display(),
-                locator: row.locator,
-                heading_path: row.heading_path,
-                text: row.text,
-                score: f.score,
-                fts_rank: f.ranks[0],
-                like_rank: f.ranks[1],
-                vec_rank: None,
-                suspect: row.flags & crate::index::FLAG_SUSPECT != 0,
-            })
-        })
-        .collect();
+    let vec_scores: HashMap<i64, f32> = vec.hits.iter().copied().collect();
+    let vec_ids: Vec<i64> = vec.hits.iter().map(|h| h.0).collect();
+    let hits = assemble(conn, allowed, rrf(&[fts, like, vec_ids]), &vec_scores, limit)?;
+    let mode = match (vec.unavailable.is_none(), plan.is_empty()) {
+        (true, false) => RetrievalMode::Hybrid,
+        (true, true) => RetrievalMode::VectorOnly,
+        (false, _) => RetrievalMode::KeywordOnly,
+    };
     Ok(SearchResponse {
         hits,
-        mode: RetrievalMode::KeywordOnly,
-        vector_unavailable,
+        mode,
+        vector_unavailable: vec.unavailable,
+        coverage: vec.coverage,
         scan_capped,
     })
 }
@@ -353,7 +496,7 @@ mod tests {
     fn trigram_and_two_char_terms_find_passages() {
         let (conn, _, _) = setup();
         let set = allowed(&conn, "hr");
-        let r = search(&conn, &set, "第一年特休幾天", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &set, "第一年特休幾天", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert_eq!(r.mode, RetrievalMode::KeywordOnly);
         assert_eq!(
             r.vector_unavailable.as_deref(),
@@ -366,14 +509,14 @@ mod tests {
             "{}",
             r.hits[0].locator_text
         );
-        let r = search(&conn, &set, "請假", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &set, "請假", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert!(r.hits[0].text.contains("請假需於三日前"));
         assert_eq!(r.hits[0].like_rank, Some(1));
         // No trigram of 「加班費率」 beyond 「加班費」 exists; particles split runs.
-        let r = search(&conn, &set, "加班的費用", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &set, "加班的費用", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert!(r.hits[0].text.contains("加班費"), "{:?}", r.hits);
         // No trigram of 「特休天數」 is in the text; the bigram fallback finds 「特休」.
-        let r = search(&conn, &set, "特休天數", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &set, "特休天數", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert!(
             r.hits
                 .first()
@@ -389,22 +532,22 @@ mod tests {
         let set = allowed(&conn, "hr");
         assert!(set.contains(&hr) && !set.contains(&sales));
         for q in ["A-1234", "HR", "單價", "授權費另計", "特休"] {
-            let r = search(&conn, &set, q, 20, &NoEmbedder).unwrap();
+            let r = search(&conn, &set, q, 20, &NoEmbedder, &VectorCache::default()).unwrap();
             assert!(r.hits.iter().all(|h| h.collection_id == hr), "{q} leaked");
         }
-        let r = search(&conn, &allowed(&conn, "sales"), "A-1234", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &allowed(&conn, "sales"), "A-1234", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert!(r.hits[0].text.contains("A-1234"));
-        let r = search(&conn, &allowed(&conn, "sales"), "HR", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &allowed(&conn, "sales"), "HR", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert!(r.hits[0].text.contains("HR 系統"));
     }
 
     #[test]
     fn empty_allowed_set_or_query_returns_none_mode() {
         let (conn, _, _) = setup();
-        let r = search(&conn, &AllowedSet::default(), "特休", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &AllowedSet::default(), "特休", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert_eq!(r.mode, RetrievalMode::None);
         assert!(r.hits.is_empty());
-        let r = search(&conn, &allowed(&conn, "hr"), "的", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &allowed(&conn, "hr"), "的", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert_eq!(r.mode, RetrievalMode::None);
     }
 
@@ -420,7 +563,7 @@ mod tests {
             "text:特休",
             "a OR b AND",
         ] {
-            search(&conn, &set, q, 5, &NoEmbedder).unwrap();
+            search(&conn, &set, q, 5, &NoEmbedder, &VectorCache::default()).unwrap();
         }
     }
 
@@ -446,7 +589,7 @@ mod tests {
         );
         let set = allowed(&conn, "u");
         for q in ["A-1234", "ａ－１２３４", "hr", "一千元"] {
-            let r = search(&conn, &set, q, 5, &NoEmbedder).unwrap();
+            let r = search(&conn, &set, q, 5, &NoEmbedder, &VectorCache::default()).unwrap();
             let hit = r.hits.first().unwrap_or_else(|| panic!("{q} not found"));
             assert_eq!(
                 hit.text, "產品Ａ－１２３４，單價⼀千元！ＨＲ部門負責。",
@@ -463,7 +606,11 @@ mod tests {
             params![hr],
         )
         .unwrap();
-        let r = search(&conn, &allowed(&conn, "hr"), "特休假", 5, &NoEmbedder).unwrap();
+        let r = search(&conn, &allowed(&conn, "hr"), "特休假", 5, &NoEmbedder, &VectorCache::default()).unwrap();
         assert!(r.hits.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "search_vec_tests.rs"]
+mod vec_tests;

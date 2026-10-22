@@ -15,6 +15,9 @@ edition.workspace = true
 duduclaw-core = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-identity = { workspace = true }
+# Shared ONNX Runtime manifest / verified download / one-time init — the
+# knowledge-base embedding models load the same library.
+duduclaw-onnx = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -81,6 +84,8 @@ default = ["ner"]
 # Turning it off keeps `type = "ner"` parsing (so profiles stay wire-compatible)
 # but makes such a rule fail to COMPILE — fail-closed, never a silent skip.
 ner = [
+    "duduclaw-onnx/install",
+    "duduclaw-onnx/runtime",
     "dep:ort",
     "dep:tokenizers",
     "dep:reqwest",
