@@ -38,17 +38,16 @@ describe('<Tabs>', () => {
     expect(list).not.toHaveClass('bg-muted');
   });
 
-  it('styles the attribute base-ui puts on the current tab', () => {
-    renderWithProviders(<Fixture variant="line" />);
-    const tabA = screen.getByRole('tab', { name: 'A' });
-    expect(tabA).toHaveAttribute('data-active');
-    expect(tabA.className).toContain('data-[active]:after:bg-foreground');
-  });
-
-  it('the default variant also styles the current tab', () => {
-    renderWithProviders(<Fixture />);
-    const tabA = screen.getByRole('tab', { name: 'A' });
-    expect(tabA).toHaveAttribute('data-active');
-    expect(tabA.className).toContain('data-[active]:bg-background');
+  // @base-ui/react 1.x marks the current tab with `data-active`, not
+  // `data-selected`; selected styles keyed off the wrong attribute left the
+  // current tab looking like every other tab.
+  it.each(['default', 'line'] as const)('%s variant styles the tab base-ui marks active', (variant) => {
+    renderWithProviders(<Fixture variant={variant} />);
+    const active = screen.getByRole('tab', { name: 'A' });
+    const inactive = screen.getByRole('tab', { name: 'B' });
+    expect(active).toHaveAttribute('data-active');
+    expect(inactive).not.toHaveAttribute('data-active');
+    expect(active.className).toContain('data-[active]:text-foreground');
+    expect(active.className).not.toContain('data-[selected]');
   });
 });

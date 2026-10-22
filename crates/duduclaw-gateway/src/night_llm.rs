@@ -143,6 +143,28 @@ pub fn night_capabilities() -> duduclaw_core::types::CapabilitiesConfig {
     }
 }
 
+/// [`night_capabilities`] widened by exactly one read-only tool: Claude
+/// Code's built-in `WebSearch`. Used only by the expert-team generator's
+/// knowledge-base stage when the operator opts in.
+///
+/// `WebSearch` runs on the model vendor's side and returns result snippets;
+/// it cannot reach the local network, so it adds no SSRF surface. `WebFetch`
+/// (which fetches arbitrary URLs from this machine) stays denied, as do all
+/// write/exec tools. Search results only ever feed a JSON reply that is
+/// validated and then content-scanned at install, like any model output.
+pub fn research_capabilities() -> duduclaw_core::types::CapabilitiesConfig {
+    let base = night_capabilities();
+    duduclaw_core::types::CapabilitiesConfig {
+        allowed_tools: vec!["WebSearch".to_string()],
+        denied_tools: base
+            .denied_tools
+            .into_iter()
+            .filter(|t| t != "WebSearch")
+            .collect(),
+        ..base
+    }
+}
+
 // ── Production adapter ────────────────────────────────────────
 
 /// [`NightLlm`] implementation over the gateway's existing rotated Claude CLI
@@ -357,6 +379,23 @@ mod tests {
                 "{t} must be in the night denylist: {denied:?}"
             );
         }
+    }
+
+    #[test]
+    fn research_caps_add_only_web_search() {
+        let caps = research_capabilities();
+        assert_eq!(caps.allowed_tools(), vec!["WebSearch".to_string()]);
+        let denied = caps.disallowed_tools();
+        assert!(!denied.iter().any(|d| d == "WebSearch"));
+        for t in ["Bash", "Write", "Edit", "WebFetch", "Task", "computer"] {
+            assert!(denied.iter().any(|d| d == t), "{t} must stay denied: {denied:?}");
+        }
+        assert!(!caps.write_tools_allowed());
+        // The `--tools` surface the CLI gets is exactly WebSearch.
+        assert_eq!(
+            caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS),
+            vec!["WebSearch".to_string()]
+        );
     }
 
     // ── cost estimation ──

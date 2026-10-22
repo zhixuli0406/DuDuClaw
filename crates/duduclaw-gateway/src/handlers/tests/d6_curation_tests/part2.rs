@@ -85,6 +85,8 @@ pub(super) async fn experts_rpcs_deny_non_admin() {
         "experts.install_builtin",
         "experts.generate",
         "experts.generate_revise",
+        "experts.generate_status",
+        "experts.generate_cancel",
         "experts.install_draft",
     ] {
         let frame = handler
@@ -482,11 +484,13 @@ pub(super) async fn experts_generate_revise_guards() {
             description: "d".into(),
             team_size: 2,
             channels: vec![],
+            research: false,
         },
         rounds: crate::expert_generate::MAX_GENERATE_ROUNDS,
         created_at: crate::expert_admin::now_iso(),
         updated_at: crate::expert_admin::now_iso(),
         last_generation: "{}".into(),
+        notes: vec![],
     };
     crate::expert_generate::write_draft_state(home.path(), &state).unwrap();
     let frame = handler
@@ -553,6 +557,8 @@ pub(super) async fn experts_list_and_remove_round_trip() {
         agents: vec!["sales-lead".into()],
         global_skills: vec![],
         wiki_files: vec![],
+        agent_skills: Vec::new(),
+        agent_ids: Default::default(),
         installed_at: crate::expert_admin::now_iso(),
         source_format: String::new(),
     };

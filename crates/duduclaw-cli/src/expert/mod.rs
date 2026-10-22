@@ -207,31 +207,13 @@ enum ScanVerdict {
 /// security scanner (`duduclaw-gateway::skill_lifecycle::security_scanner`).
 /// Fail-closed: any block/high-risk finding stops this asset from landing.
 fn scan_external(content: &str) -> ScanVerdict {
-    let inj = duduclaw_security::input_guard::scan_input(
-        content,
-        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
-    );
-    if inj.blocked {
-        return ScanVerdict::Blocked(format!(
-            "prompt-injection risk {} (rules: {})",
-            inj.risk_score,
-            inj.matched_rules.join("/")
-        ));
+    // One scanner for install and for the dashboard's pre-install check
+    // (`experts.generate` preview / `experts.install_draft` report), so the
+    // two can never disagree about what gets skipped.
+    match duduclaw_gateway::expert_generate_staged::scan_pack_content(content) {
+        Some(reason) => ScanVerdict::Blocked(reason),
+        None => ScanVerdict::Ok,
     }
-    let scan = duduclaw_gateway::skill_lifecycle::security_scanner::scan_skill(content, None);
-    if !scan.passed {
-        let cats: Vec<String> = scan
-            .findings
-            .iter()
-            .map(|f| format!("{:?}", f.category))
-            .collect();
-        return ScanVerdict::Blocked(format!(
-            "security scan {:?} (findings: {})",
-            scan.risk_level,
-            cats.join("/")
-        ));
-    }
-    ScanVerdict::Ok
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
@@ -562,7 +544,7 @@ fn cmd_list(home: &Path, json: bool) -> Result<()> {
         println!(
             "      agents: {} · skills: {} · wiki: {}",
             r.agents.len(),
-            r.global_skills.len(),
+            r.skills_count(),
             r.wiki_files.len()
         );
     }
