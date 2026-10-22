@@ -86,10 +86,28 @@ pub fn is_junk_basename(name: &[u8]) -> bool {
         || name == b"__MACOSX"
 }
 
+/// Why an archive's names could not be decoded. `Display` is the zh-TW
+/// console text; the kind and the escaped sample feed the dashboard's
+/// error code (`import.name_encoding_ambiguous` / `_unknown`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameDecodeError {
+    /// GBK and Big5 both fit equally well (vs. nothing fits at all).
+    pub ambiguous: bool,
+    /// The first offending name, ASCII as is, other bytes as `\xNN`.
+    pub sample: String,
+    text: String,
+}
+
+impl std::fmt::Display for NameDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// Decode every name of one archive (see the module docs for the order).
 /// Junk entries should be filtered out by the caller first; they would only
 /// add noise to the encoding vote.
-pub fn decode_names(raw: &[RawName]) -> Result<DecodedNames, String> {
+pub fn decode_names(raw: &[RawName]) -> Result<DecodedNames, NameDecodeError> {
     // Unflagged names that need a guess.
     let guess_idx: Vec<usize> = raw
         .iter()
@@ -120,7 +138,7 @@ pub fn decode_names(raw: &[RawName]) -> Result<DecodedNames, String> {
 }
 
 /// Choose GBK or Big5 for the guessed names. Fail closed on no fit or a tie.
-fn pick_legacy(raw: &[RawName], guess_idx: &[usize]) -> Result<LegacyEncoding, String> {
+fn pick_legacy(raw: &[RawName], guess_idx: &[usize]) -> Result<LegacyEncoding, NameDecodeError> {
     let score = |enc: LegacyEncoding| -> Option<i64> {
         let mut total = 0i64;
         for &i in guess_idx {
@@ -136,11 +154,17 @@ fn pick_legacy(raw: &[RawName], guess_idx: &[usize]) -> Result<LegacyEncoding, S
         (None, Some(_)) => Ok(LegacyEncoding::Big5),
         (Some(g), Some(b)) if g > b => Ok(LegacyEncoding::Gbk),
         (Some(g), Some(b)) if b > g => Ok(LegacyEncoding::Big5),
-        (Some(_), Some(_)) => Err(format!(
-            "無法判斷壓縮檔內的中文檔名是 Big5 還是 GBK 編碼（例如 {}），為避免寫出亂碼已停止匯入。\
-             請在原電腦用支援 UTF-8 的壓縮工具（例如 macOS 內建壓縮、7-Zip 勾選 UTF-8）重新壓縮後再上傳。",
-            escape_bytes(&raw[guess_idx[0]].bytes)
-        )),
+        (Some(_), Some(_)) => {
+            let sample = escape_bytes(&raw[guess_idx[0]].bytes);
+            Err(NameDecodeError {
+                ambiguous: true,
+                text: format!(
+                    "無法判斷壓縮檔內的中文檔名是 Big5 還是 GBK 編碼（例如 {sample}），為避免寫出亂碼已停止匯入。\
+                     請在原電腦用支援 UTF-8 的壓縮工具（例如 macOS 內建壓縮、7-Zip 勾選 UTF-8）重新壓縮後再上傳。"
+                ),
+                sample,
+            })
+        }
         (None, None) => Err(undecodable_error(guess_idx[0], &raw[guess_idx[0]].bytes)),
     }
 }
@@ -182,13 +206,17 @@ fn is_cjk_punct(c: char) -> bool {
     ('\u{3000}'..='\u{303F}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c)
 }
 
-fn undecodable_error(index: usize, bytes: &[u8]) -> String {
-    format!(
-        "壓縮檔第 {} 個項目的檔名無法辨識編碼（原始內容：{}），為避免寫出亂碼已停止匯入。\
-         請用支援 UTF-8 檔名的壓縮工具重新壓縮後再上傳。",
-        index + 1,
-        escape_bytes(bytes)
-    )
+fn undecodable_error(index: usize, bytes: &[u8]) -> NameDecodeError {
+    let sample = escape_bytes(bytes);
+    NameDecodeError {
+        ambiguous: false,
+        text: format!(
+            "壓縮檔第 {} 個項目的檔名無法辨識編碼（原始內容：{sample}），為避免寫出亂碼已停止匯入。\
+             請用支援 UTF-8 檔名的壓縮工具重新壓縮後再上傳。",
+            index + 1,
+        ),
+        sample,
+    }
 }
 
 /// ASCII shown as is, everything else as `\xNN` — never raw bytes in a message.
@@ -295,6 +323,8 @@ mod tests {
             false,
         )])
         .unwrap_err();
+        assert!(!err.ambiguous);
+        let err = err.to_string();
         assert!(err.contains("無法辨識編碼"), "{err}");
         assert!(err.contains("\\x82"), "{err}");
     }

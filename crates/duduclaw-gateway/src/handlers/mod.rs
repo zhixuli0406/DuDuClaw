@@ -99,6 +99,7 @@ mod setup_token_rpc;
 mod system_status;
 mod experts_generate_rpc;
 mod experts_rpc;
+mod experts_import_rpc;
 mod system_config_rpc;
 mod audit_rpc;
 mod security_rpc;

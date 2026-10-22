@@ -266,6 +266,7 @@ impl MethodHandler {
             Ok(extra) => args.extend(extra),
             Err(frame) => return frame,
         }
+        args.extend(self.agent_cap_args().await);
         let preexisting = staged::report::existing_wiki_targets(&self.home_dir, pack_dir);
         // The slug the installer records under is the manifest's own name.
         let slug = std::fs::read_to_string(pack_dir.join("expert.toml"))
@@ -294,7 +295,8 @@ impl MethodHandler {
                     json!({ "success": true, "output": output, "placement": placement }),
                 )
             }
-            Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+            // The dashboard adds its own "安裝失敗" prefix: send the reason only.
+            Err(e) => WsFrame::error_response("", &e),
         }
     }
 }

@@ -14629,7 +14629,7 @@ async fn handle_expert_upload(
         None => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "missing Authorization header" })),
+                Json(serde_json::json!({ "error": "missing Authorization header", "code": "upload.unauthorized" })),
             )
                 .into_response();
         }
@@ -14639,7 +14639,7 @@ async fn handle_expert_upload(
         Err(_) => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "invalid or expired token" })),
+                Json(serde_json::json!({ "error": "invalid or expired token", "code": "upload.unauthorized" })),
             )
                 .into_response();
         }
@@ -14650,7 +14650,7 @@ async fn handle_expert_upload(
     if !ctx.is_admin() {
         return (
             axum::http::StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "只有管理員可以上傳專家包" })),
+            Json(serde_json::json!({ "error": "只有管理員可以匯入 AI 團隊", "code": "upload.forbidden" })),
         )
             .into_response();
     }
@@ -14664,7 +14664,7 @@ async fn handle_expert_upload(
             Err(e) => {
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": format!("malformed multipart: {e}") })),
+                    Json(serde_json::json!({ "error": format!("malformed multipart: {e}"), "code": "upload.malformed" })),
                 )
                     .into_response();
             }
@@ -14682,7 +14682,8 @@ async fn handle_expert_upload(
                             return (
                                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,
                                 Json(serde_json::json!({
-                                    "error": "檔案超過 50 MB 上限"
+                                    "error": "檔案超過 50 MB 上限",
+                                    "code": "upload.too_large"
                                 })),
                             )
                                 .into_response();
@@ -14694,7 +14695,8 @@ async fn handle_expert_upload(
                         return (
                             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
                             Json(serde_json::json!({
-                                "error": format!("讀取上傳內容失敗（檔案過大或連線中斷）: {e}")
+                                "error": format!("讀取上傳內容失敗（檔案過大或連線中斷）: {e}"),
+                                "code": "upload.interrupted"
                             })),
                         )
                             .into_response();
@@ -14708,7 +14710,7 @@ async fn handle_expert_upload(
     let Some(data) = data else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "missing 'file' field" })),
+            Json(serde_json::json!({ "error": "missing 'file' field", "code": "upload.no_file" })),
         )
             .into_response();
     };
@@ -14724,10 +14726,14 @@ async fn handle_expert_upload(
         std::str::from_utf8(&data).is_ok()
     };
     if !looks_right {
-        let msg = if ext == "zip" { "不是有效的 .zip 檔" } else { "檔案不是 UTF-8 文字檔" };
+        let (msg, code) = if ext == "zip" {
+            ("不是有效的 .zip 檔", "upload.not_zip")
+        } else {
+            ("檔案不是 UTF-8 文字檔", "upload.not_text")
+        };
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": msg })),
+            Json(serde_json::json!({ "error": msg, "code": code })),
         )
             .into_response();
     }
@@ -14737,7 +14743,7 @@ async fn handle_expert_upload(
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("建立暫存目錄失敗: {e}") })),
+            Json(serde_json::json!({ "error": format!("建立暫存目錄失敗: {e}"), "code": "upload.write_failed" })),
         )
             .into_response();
     }
@@ -14758,7 +14764,7 @@ async fn handle_expert_upload(
     if let Err(e) = tokio::fs::write(&dest, &data).await {
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("寫入上傳檔失敗: {e}") })),
+            Json(serde_json::json!({ "error": format!("寫入上傳檔失敗: {e}"), "code": "upload.write_failed" })),
         )
             .into_response();
     }

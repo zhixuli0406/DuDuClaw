@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use super::install::{InstallCtx, install_skill_global};
-use super::{InstallRecord, PackKind, Report, cfg_err, now_iso};
+use super::{InstallRecord, PackKind, Report, now_iso};
 
 use duduclaw_core::error::Result;
 
@@ -23,7 +23,7 @@ pub(super) async fn install(
 ) -> Result<InstallRecord> {
     let skill_md = dir.join("SKILL.md");
     let content = std::fs::read_to_string(&skill_md)
-        .map_err(|e| cfg_err(format!("讀取 SKILL.md 失敗: {e}")))?;
+        .map_err(|e| super::import_error::bad_content(format!("讀取 SKILL.md 失敗: {e}")))?;
 
     // Frontmatter name (Agent Skills spec identity); fallback to dir name.
     let dir_name = dir
@@ -34,17 +34,13 @@ pub(super) async fn install(
     let meta = duduclaw_agent::skill_loader::parse_skill_meta_from_content(&content, &dir_name);
     let name = crate::sanitize_agent_id(&meta.name);
     if !duduclaw_agent::skill_loader::is_safe_skill_name(&name) {
-        return Err(cfg_err(format!(
+        return Err(super::import_error::bad_content(format!(
             "SKILL.md name '{}' 非安全技能名稱",
             meta.name.escape_debug()
         )));
     }
 
-    if super::read_record(&ctx.home, &name).is_some() {
-        return Err(cfg_err(format!(
-            "專家包 '{name}' 已安裝（先 `expert remove {name}` 再重裝）"
-        )));
-    }
+    let slug = ctx.claim_slug(&name)?;
 
     // OpenClaw provenance → import as standard skill, flag automation as P1.
     if detect_openclaw(&content) {
@@ -63,7 +59,7 @@ pub(super) async fn install(
     }
 
     let mut record = InstallRecord {
-        slug: name.clone(),
+        slug,
         kind: PackKind::Skill,
         display_name: if meta.description.is_empty() {
             name.clone()
