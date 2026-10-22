@@ -35,9 +35,9 @@ export function AccountTab() {
   // WP-0 (bootstrap-admin recovery): `AuthGuard` force-redirected here because
   // this account still must change its password before doing anything else.
   // Say so, and once the change succeeds, force a fresh WS handshake (the
-  // gateway bakes `must_change_password` into the connection's UserContext
-  // once at `connect` time — a plain RPC success does NOT refresh it on the
-  // live socket) then send the user back to wherever they were headed.
+  // gateway re-reads the flag on every RPC, but this store's
+  // `mustChangePassword` is only refreshed by the `connect` response) then
+  // send the user back to wherever they were headed.
   const mustChangePassword = useConnectionStore((s) => s.mustChangePassword);
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
   const disconnectWs = useConnectionStore((s) => s.disconnect);
@@ -116,10 +116,10 @@ export function AccountTab() {
       setNext('');
       setConfirm('');
       if (mustChangePassword) {
-        // The gateway bakes `must_change_password` into this connection's
-        // UserContext once at handshake time — a successful RPC alone never
-        // refreshes it. Force a fresh handshake so the rest of the dashboard
-        // unlocks, then send the user back only if the server actually
+        // The gateway re-reads the flag on every RPC, but the client-side
+        // `mustChangePassword` comes from the `connect` response. Force a
+        // fresh handshake so the rest of the dashboard unlocks, then send
+        // the user back only if the server actually
         // confirms the flag is gone (never navigate away and leave the
         // account still locked out with no explanation on screen).
         disconnectWs();

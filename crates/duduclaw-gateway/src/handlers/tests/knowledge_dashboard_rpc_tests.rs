@@ -39,6 +39,30 @@ fn user(id: &str, agents: &[(&str, AccessLevel)]) -> UserContext {
         role: duduclaw_auth::models::UserRole::Employee,
         agent_access: agents.iter().map(|(a, l)| (a.to_string(), *l)).collect(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
+    }
+}
+
+/// `agents.update` checks the caller's Owner binding live against
+/// `users.db` (agent-file editing), not the context snapshot, so a test
+/// owner must exist there with the same id and binding.
+fn register_live_owner(home: &std::path::Path, id: &str, agents: &[(&str, AccessLevel)]) {
+    let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+    let u = db
+        .create_user(
+            &format!("{id}@example.com"),
+            id,
+            "isolated-test-password",
+            duduclaw_auth::models::UserRole::Employee,
+        )
+        .unwrap();
+    rusqlite::Connection::open(home.join("users.db"))
+        .unwrap()
+        .execute("UPDATE users SET id=?1 WHERE id=?2", rusqlite::params![id, u.id])
+        .unwrap();
+    for (a, l) in agents {
+        db.bind_agent(id, a, *l).unwrap();
     }
 }
 
@@ -142,6 +166,7 @@ async fn agent_collections_lists_grants_for_owners_only() {
 #[tokio::test]
 async fn agents_update_binds_only_granted_collections() {
     let f = fixture().await;
+    register_live_owner(f.home.path(), "owner-7", &[("a1", AccessLevel::Owner)]);
     let owner = user("owner-7", &[("a1", AccessLevel::Owner)]);
     ok(&f
         .handler

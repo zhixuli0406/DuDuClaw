@@ -40,6 +40,7 @@ const BASE_RISK: Record<string, RiskLevel> = {
   skill_create: 'high', // installs code that runs later
   agent_hire: 'high', // spins up an autonomous worker that spends budget
   memory_forget_source: 'high', // deletes memory irreversibly (forget by source)
+  agent_file_change: 'high', // rewrites how an AI employee behaves; only reaches review after the check warned or blocked
 };
 
 /** Default when the kind is unrecognised — see BASE_RISK note. */

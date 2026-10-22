@@ -12,6 +12,8 @@ fn ctx(id: &str, role: UserRole) -> UserContext {
         role,
         agent_access: HashMap::new(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

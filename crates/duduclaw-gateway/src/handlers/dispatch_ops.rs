@@ -133,7 +133,12 @@ impl MethodHandler {
             }
             "os.settings.update" => {
                 require_admin!();
-                self.handle_os_settings_update(params, Some(ctx)).await
+                // The write path judges admin-only keys by the caller: read
+                // the caller live (D7), not from the session token.
+                match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
+                    Ok(live) => Box::pin(self.handle_os_settings_update(params, Some(&live))).await,
+                    Err(_) => WsFrame::error_response("", "permission denied"),
+                }
             }
             "os.gate.recent" => {
                 require_admin!();

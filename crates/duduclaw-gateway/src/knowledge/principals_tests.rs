@@ -18,6 +18,8 @@ fn ctx(id: &str, role: UserRole, agents: &[&str]) -> UserContext {
             .map(|a| (a.to_string(), AccessLevel::Owner))
             .collect::<HashMap<_, _>>(),
         must_change_password: false,
+        team_access: Default::default(),
+        acl_generation: 0,
     }
 }
 

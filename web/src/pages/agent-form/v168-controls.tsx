@@ -100,7 +100,7 @@ export function TypedKvTable({
   const update = (idx: number, patch: Partial<KvRow>) =>
     onChange(rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   const remove = (idx: number) => onChange(rows.filter((_, i) => i !== idx));
-  const add = () => onChange([...rows, { section: 'prompt', key: '', value: '', type: 'string' }]);
+  const add = () => onChange([...rows, { section: KV_SECTION_SUGGESTIONS[0], key: '', value: '', type: 'string' }]);
 
   return (
     <div className="space-y-2">
@@ -130,7 +130,7 @@ export function TypedKvTable({
                     list="agent-kv-sections"
                     value={r.section}
                     onChange={(e) => update(idx, { section: e.target.value })}
-                    placeholder="prompt"
+                    placeholder="evolution"
                     aria-label={t('agents.v168.kv.section')}
                     aria-invalid={err === 'section'}
                     className="w-28 shrink-0"

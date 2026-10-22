@@ -114,6 +114,8 @@ async fn handler_with_flagged_admin() -> (MethodHandler, UserContext, Arc<UserDb
         role: UserRole::Admin,
         agent_access: std::collections::HashMap::new(),
         must_change_password: true,
+        team_access: Default::default(),
+        acl_generation: 0,
     };
     (handler, ctx, db, one_time_password)
 }

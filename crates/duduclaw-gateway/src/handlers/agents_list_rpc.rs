@@ -6,6 +6,14 @@ use super::*;
 impl MethodHandler {
     // ── Filtered agent list (respects UserContext) ────────────
 
+    /// Agents the caller is directly bound to (all of them for an Admin).
+    ///
+    /// `ctx` is the live context `dispatch` rebuilt from users.db for this
+    /// call (`live_context.rs`), not the handshake snapshot: an unbinding or
+    /// a role change shows up on the next `agents.list` without a re-login.
+    /// Team grants (`ctx.team_access`) are deliberately not listed here; this
+    /// list also drives the per-agent settings pages, which stay limited to
+    /// direct bindings.
     pub(crate) async fn handle_agents_list_filtered(&self, ctx: &UserContext, params: Value) -> WsFrame {
         // Re-scan to pick up changes
         if let Ok(mut reg) =
