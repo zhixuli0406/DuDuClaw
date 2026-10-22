@@ -7,6 +7,8 @@ pub mod events;
 pub mod livechat;
 pub mod models;
 pub mod rpc;
+/// SSRF / scheme validation for Odoo server URLs (shared by gateway + runtime).
+pub mod url_guard;
 /// X1 方案 4 — Odoo Helpdesk / Project as a decision-twin support queue.
 pub mod support_export;
 

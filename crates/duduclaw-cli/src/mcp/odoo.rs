@@ -736,8 +736,11 @@ pub(crate) async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, calle
             Ok(raw) => AgentOdooConfig::from_agent_toml(&raw),
             Err(_) => None,
         };
-    if let Some(cfg) = &override_cfg {
-        odoo.register_agent(caller_agent, cfg.clone()).await;
+    match &override_cfg {
+        Some(cfg) => odoo.register_agent(caller_agent, cfg.clone()).await,
+        // No (or unusable) override any more: drop one registered earlier so
+        // the agent falls back to the global server, as `odoo.agent_test` does.
+        None => odoo.unregister_agent(caller_agent).await,
     }
 
     // ── 3. Force a fresh handshake — the previous slot, if any, may have ───

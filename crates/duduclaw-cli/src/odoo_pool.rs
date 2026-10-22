@@ -46,6 +46,20 @@ struct ResolvedCredentials {
 #[derive(Default)]
 struct PoolSlot {
     connector: Option<Arc<OdooConnector>>,
+    /// Effective `(url, db)` the cached connector was opened against. A cached
+    /// connector is reused only while the agent's current effective endpoint
+    /// still equals this, so a changed server never reuses the old session.
+    endpoint: Option<(String, String)>,
+}
+
+impl PoolSlot {
+    /// The cached connector, only when it targets `endpoint`.
+    fn connector_for(&self, endpoint: &(String, String)) -> Option<Arc<OdooConnector>> {
+        match (&self.connector, &self.endpoint) {
+            (Some(conn), Some(ep)) if ep == endpoint => Some(conn.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Per-agent Odoo connector pool. Cheap to clone — backed by `Arc`.
@@ -122,6 +136,15 @@ impl OdooConnectorPool {
         self.drop_slot(&old_key).await;
     }
 
+    /// Forget `agent_id`'s override (its `agent.toml [odoo]` block was removed
+    /// or became unusable) and drop its cached connector, so a stale override
+    /// registered earlier cannot keep steering the agent to its old server.
+    pub async fn unregister_agent(&self, agent_id: &str) {
+        let old_key = self.pool_key(agent_id).await;
+        self.resolver.write().await.remove_agent(agent_id);
+        self.drop_slot(&old_key).await;
+    }
+
     /// Stable pool key for `agent_id`.
     pub async fn pool_key(&self, agent_id: &str) -> (String, String) {
         self.resolver.read().await.pool_key_for(agent_id)
@@ -151,6 +174,19 @@ impl OdooConnectorPool {
         }
     }
 
+    /// Effective `(url, db)` for an agent: global overlaid with its override
+    /// through the same `apply_to` merge the connection itself uses.
+    fn effective_endpoint(
+        global: &OdooConfig,
+        override_cfg: Option<&AgentOdooConfig>,
+    ) -> Result<(String, String), String> {
+        let mut config = global.clone();
+        if let Some(o) = override_cfg {
+            o.apply_to(&mut config)?;
+        }
+        Ok((config.url, config.db))
+    }
+
     /// Decrypted credentials for the given agent. Falls back to the global
     /// `[odoo]` block when no per-agent override sets the relevant fields.
     /// `decrypt` is invoked lazily so a miss in either pool slot never
@@ -165,18 +201,12 @@ impl OdooConnectorPool {
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        // Username merge.
+        // One merge function shared with `odoo.agent_test` and the decision
+        // export (`AgentOdooConfig::apply_to`): url / db / username / secrets,
+        // with url + db validated (fail closed).
         let mut config = global.clone();
         if let Some(o) = override_cfg {
-            if let Some(u) = &o.username {
-                config.username = u.clone();
-            }
-            if let Some(k) = &o.api_key_enc {
-                config.api_key_enc = k.clone();
-            }
-            if let Some(p) = &o.password_enc {
-                config.password_enc = p.clone();
-            }
+            o.apply_to(&mut config)?;
         }
 
         // Pick which credential source to resolve. Prefer api_key over
@@ -210,14 +240,19 @@ impl OdooConnectorPool {
         Fut: std::future::Future<Output = Result<String, String>>,
     {
         let key = self.pool_key(agent_id).await;
+        let endpoint = {
+            let resolver = self.resolver.read().await;
+            Self::effective_endpoint(resolver.global(), resolver.for_agent(agent_id))?
+        };
 
-        // Outer fast path — read lock, see if a connector is already cached.
+        // Outer fast path — read lock, see if a connector for the current
+        // effective endpoint is already cached.
         {
             let pool = self.pool.read().await;
             if let Some(slot) = pool.get(&key) {
                 let guard = slot.lock().await;
-                if let Some(conn) = &guard.connector {
-                    return Ok(conn.clone());
+                if let Some(conn) = guard.connector_for(&endpoint) {
+                    return Ok(conn);
                 }
             }
         }
@@ -232,10 +267,13 @@ impl OdooConnectorPool {
         };
 
         let mut guard = slot.lock().await;
-        if let Some(conn) = &guard.connector {
+        if let Some(conn) = guard.connector_for(&endpoint) {
             // Lost the race — another task connected first.
-            return Ok(conn.clone());
+            return Ok(conn);
         }
+        // Stale connector for a previous endpoint: discard before reconnecting.
+        guard.connector = None;
+        guard.endpoint = None;
 
         let resolver = self.resolver.read().await;
         let global = resolver.global().clone();
@@ -255,6 +293,7 @@ impl OdooConnectorPool {
         }
         let arc = Arc::new(conn);
         guard.connector = Some(arc.clone());
+        guard.endpoint = Some((creds.config.url.clone(), creds.config.db.clone()));
         info!(
             agent_id = %agent_id,
             profile = %key.1,
@@ -571,6 +610,157 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(creds.credential, "resolved(secret://vault/odoo-api-key)");
+    }
+
+    // ── B1: per-agent url / db override ──────────────────────────────────
+
+    /// Minimal fake Odoo JSON-RPC endpoint on 127.0.0.1 (plain HTTP is
+    /// allowed for strict localhost). Every request gets `result: 7`; the
+    /// returned counter is the number of requests served.
+    async fn fake_odoo() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":7}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (url, hits)
+    }
+
+    fn global_with(url: &str) -> OdooConfig {
+        OdooConfig {
+            url: url.into(),
+            db: "global_db".into(),
+            username: "u".into(),
+            api_key_enc: "ENC".into(),
+            ..OdooConfig::default()
+        }
+    }
+
+    async fn dec(enc: String) -> Result<String, String> {
+        Ok(format!("dec({enc})"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_credentials_applies_url_and_db_override() {
+        let global = global_with("https://global.example.com");
+        let over = AgentOdooConfig {
+            url: Some("https://alpha.example.com".into()),
+            db: Some("alpha_db".into()),
+            ..Default::default()
+        };
+        let creds = OdooConnectorPool::merge_credentials(&global, Some(&over), dec)
+            .await
+            .unwrap();
+        assert_eq!(creds.config.url, "https://alpha.example.com");
+        assert_eq!(creds.config.db, "alpha_db");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_credentials_refuses_ssrf_url_override() {
+        let global = global_with("https://global.example.com");
+        for bad in ["https://169.254.169.254", "http://erp.example.com", "https://192.168.1.9"] {
+            let over = AgentOdooConfig { url: Some(bad.into()), ..Default::default() };
+            let err = OdooConnectorPool::merge_credentials(&global, Some(&over), dec)
+                .await
+                .unwrap_err();
+            assert!(err.contains("url"), "{bad}: {err}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_override_connects_to_its_own_server_not_global() {
+        let (global_url, global_hits) = fake_odoo().await;
+        let (agent_url, agent_hits) = fake_odoo().await;
+        let pool = OdooConnectorPool::new(global_with(&global_url));
+        pool.register_agent(
+            "alpha",
+            AgentOdooConfig { url: Some(agent_url.clone()), db: Some("alpha_db".into()), ..Default::default() },
+        )
+        .await;
+        let conn = pool.get_or_connect("alpha", dec).await.expect("connect");
+        assert_eq!(conn.status().url, agent_url);
+        assert_eq!(conn.status().db, "alpha_db");
+        assert!(agent_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(global_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // An agent without an override still uses the global server.
+        let other = pool.get_or_connect("beta", dec).await.expect("connect");
+        assert_eq!(other.status().url, global_url);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_url_never_reuses_cached_connector() {
+        let (url_a, _) = fake_odoo().await;
+        let (url_b, hits_b) = fake_odoo().await;
+        let pool = OdooConnectorPool::new(global_with(&url_a));
+        pool.register_agent(
+            "alpha",
+            AgentOdooConfig { url: Some(url_a.clone()), ..Default::default() },
+        )
+        .await;
+        let first = pool.get_or_connect("alpha", dec).await.unwrap();
+        assert_eq!(first.status().url, url_a);
+        // Same endpoint ⇒ cached connector is reused.
+        let again = pool.get_or_connect("alpha", dec).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        // Change only the URL, keeping the profile (so the pool key is
+        // unchanged): the slot must not hand back the old session.
+        pool.register_agent(
+            "alpha",
+            AgentOdooConfig { url: Some(url_b.clone()), ..Default::default() },
+        )
+        .await;
+        let moved = pool.get_or_connect("alpha", dec).await.unwrap();
+        assert_eq!(moved.status().url, url_b);
+        assert!(hits_b.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_slot_is_replaced_even_without_re_registration() {
+        // Defence in depth: swap the resolver's global url under a live slot
+        // via a path that does not clear the pool (`register_agent` clears,
+        // so go through the resolver directly).
+        let (url_a, _) = fake_odoo().await;
+        let (url_b, _) = fake_odoo().await;
+        let pool = OdooConnectorPool::new(global_with(&url_a));
+        let first = pool.get_or_connect("alpha", dec).await.unwrap();
+        assert_eq!(first.status().url, url_a);
+        pool.resolver.write().await.set_global(global_with(&url_b));
+        let second = pool.get_or_connect("alpha", dec).await.unwrap();
+        assert_eq!(second.status().url, url_b);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsafe_override_url_fails_closed_even_with_cached_connector() {
+        let (url_a, _) = fake_odoo().await;
+        let pool = OdooConnectorPool::new(global_with(&url_a));
+        pool.get_or_connect("alpha", dec).await.unwrap();
+        pool.register_agent(
+            "alpha",
+            AgentOdooConfig { url: Some("https://169.254.169.254".into()), ..Default::default() },
+        )
+        .await;
+        let err = pool.get_or_connect("alpha", dec).await.err().expect("must refuse");
+        assert!(err.contains("url"), "{err}");
     }
 
     #[test]

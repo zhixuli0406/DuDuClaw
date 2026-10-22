@@ -10,6 +10,8 @@
 //! ```toml
 //! [odoo]
 //! profile         = "alpha"            # arbitrary label; appears in audit log
+//! url             = "https://erp.example.com"  # own Odoo server (admin-only, SSRF-checked)
+//! db              = "alpha_prod"       # database on that server
 //! username        = "agent_alpha_pm"   # service account
 //! api_key_enc     = "<encrypted>"      # AES-256-GCM via duduclaw-security
 //! allowed_models  = ["crm.lead", "sale.order"]
@@ -38,6 +40,13 @@ pub struct AgentOdooConfig {
     /// agents without explicit `[odoo].profile` still produce a stable
     /// pool key.
     pub profile: Option<String>,
+    /// Odoo server URL. When set, replaces `OdooConfig::url`. Validated by
+    /// [`crate::url_guard::is_safe_odoo_url`] in [`Self::apply_to`]; a URL
+    /// that fails the check refuses the connection (fail closed) instead of
+    /// falling back to the global server.
+    pub url: Option<String>,
+    /// Odoo database name. When set, replaces `OdooConfig::db`.
+    pub db: Option<String>,
     /// Service-account username. When set, replaces `OdooConfig::username`.
     pub username: Option<String>,
     /// Encrypted API key. When set, replaces `OdooConfig::api_key_enc`.
@@ -78,6 +87,8 @@ impl AgentOdooConfig {
     /// default block from `#[serde(default)]`).
     pub fn is_empty(&self) -> bool {
         self.profile.is_none()
+            && self.url.is_none()
+            && self.db.is_none()
             && self.username.is_none()
             && self.api_key_enc.is_none()
             && self.password_enc.is_none()
@@ -121,6 +132,50 @@ impl AgentOdooConfig {
         };
         let cfg = wrap.odoo?;
         if cfg.is_empty() { None } else { Some(cfg) }
+    }
+
+    /// Parse from an already-parsed `agent.toml` table (same rules as
+    /// [`Self::from_agent_toml`]: absent, vacuous or malformed `[odoo]` ⇒ `None`).
+    pub fn from_table(table: &toml::Table) -> Option<Self> {
+        let cfg: Self = table.get("odoo")?.clone().try_into().ok()?;
+        if cfg.is_empty() { None } else { Some(cfg) }
+    }
+
+    /// The single merge of this override over the global `[odoo]` block.
+    ///
+    /// Every place that dials Odoo on behalf of an agent (connector pool,
+    /// decision export, `odoo.agent_test`) goes through this function, so a
+    /// connectivity test can never pass for a config the runtime would not
+    /// use. Empty `url` / `db` count as unset. `url` / `db` are validated here and
+    /// a failure is an `Err` (fail closed): a malformed agent override must
+    /// not silently connect to the global server.
+    pub fn apply_to(&self, config: &mut OdooConfig) -> Result<(), String> {
+        fn set(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+        if let Some(url) = set(&self.url) {
+            if !crate::url_guard::is_safe_odoo_url(url) {
+                return Err("agent [odoo].url must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host".into());
+            }
+            config.url = url.to_string();
+        }
+        if let Some(db) = set(&self.db) {
+            if !crate::url_guard::is_valid_odoo_db(db) {
+                return Err("agent [odoo].db must be at most 63 characters of [a-zA-Z0-9_-]".into());
+            }
+            config.db = db.to_string();
+        }
+        // Credentials keep their historical "present ⇒ replace" semantics.
+        if let Some(u) = &self.username {
+            config.username = u.clone();
+        }
+        if let Some(k) = &self.api_key_enc {
+            config.api_key_enc = k.clone();
+        }
+        if let Some(p) = &self.password_enc {
+            config.password_enc = p.clone();
+        }
+        Ok(())
     }
 
     /// Verb part of an action token (`"write:crm.lead"` → `"write"`).
@@ -179,6 +234,11 @@ impl OdooConfigResolver {
     /// Register an `agent.toml [odoo]` override for `agent_id`.
     pub fn upsert_agent(&mut self, agent_id: impl Into<String>, cfg: AgentOdooConfig) {
         self.per_agent.insert(agent_id.into(), cfg);
+    }
+
+    /// Forget the override for `agent_id` (its `agent.toml [odoo]` was removed).
+    pub fn remove_agent(&mut self, agent_id: &str) {
+        self.per_agent.remove(agent_id);
     }
 
     pub fn global(&self) -> &OdooConfig {
@@ -372,6 +432,84 @@ mod tests {
         // `allowed_models` should be a list of strings.
         let raw = "[odoo]\nallowed_models = 42\n";
         assert!(AgentOdooConfig::from_agent_toml(raw).is_none());
+    }
+
+    // ── url / db override (B1) ───────────────────────────────────────────
+
+    fn global_cfg() -> OdooConfig {
+        OdooConfig {
+            url: "https://global.example.com".into(),
+            db: "global_db".into(),
+            username: "global_user".into(),
+            ..OdooConfig::default()
+        }
+    }
+
+    #[test]
+    fn apply_to_overrides_url_and_db_over_global() {
+        let over = AgentOdooConfig {
+            url: Some("https://alpha.example.com".into()),
+            db: Some("alpha_db".into()),
+            ..Default::default()
+        };
+        let mut cfg = global_cfg();
+        over.apply_to(&mut cfg).expect("valid override");
+        assert_eq!(cfg.url, "https://alpha.example.com");
+        assert_eq!(cfg.db, "alpha_db");
+        assert_eq!(cfg.username, "global_user", "unset fields inherit");
+    }
+
+    #[test]
+    fn apply_to_without_url_db_inherits_global() {
+        let over = AgentOdooConfig { username: Some("u".into()), ..Default::default() };
+        let mut cfg = global_cfg();
+        over.apply_to(&mut cfg).unwrap();
+        assert_eq!(cfg.url, "https://global.example.com");
+        assert_eq!(cfg.db, "global_db");
+        assert_eq!(cfg.username, "u");
+    }
+
+    #[test]
+    fn apply_to_refuses_unsafe_url_and_leaves_config_untouched_on_url() {
+        for bad in [
+            "http://erp.example.com",
+            "https://169.254.169.254/",
+            "https://10.0.0.5",
+            "https://user@erp.example.com",
+            "file:///etc/passwd",
+        ] {
+            let over = AgentOdooConfig { url: Some(bad.into()), ..Default::default() };
+            let mut cfg = global_cfg();
+            assert!(over.apply_to(&mut cfg).is_err(), "{bad} must be refused");
+            assert_eq!(cfg.url, "https://global.example.com");
+        }
+    }
+
+    #[test]
+    fn apply_to_refuses_bad_db_name() {
+        let over = AgentOdooConfig { db: Some("a;drop".into()), ..Default::default() };
+        assert!(over.apply_to(&mut global_cfg()).is_err());
+    }
+
+    #[test]
+    fn url_db_alone_make_a_non_empty_override_and_parse() {
+        let raw = "[odoo]\nurl = \"https://alpha.example.com\"\ndb = \"alpha_db\"\n";
+        let cfg = AgentOdooConfig::from_agent_toml(raw).expect("url/db-only override survives");
+        assert_eq!(cfg.url.as_deref(), Some("https://alpha.example.com"));
+        assert_eq!(cfg.db.as_deref(), Some("alpha_db"));
+    }
+
+    #[test]
+    fn from_table_matches_from_agent_toml() {
+        // Test-vs-runtime parity: the RPC path parses a table, the runtime
+        // parses text; both must yield the same merged config.
+        let raw = "[odoo]\nurl = \"https://alpha.example.com\"\ndb = \"alpha_db\"\nusername = \"a\"\n";
+        let table: toml::Table = raw.parse().unwrap();
+        let (mut a, mut b) = (global_cfg(), global_cfg());
+        AgentOdooConfig::from_table(&table).unwrap().apply_to(&mut a).unwrap();
+        AgentOdooConfig::from_agent_toml(raw).unwrap().apply_to(&mut b).unwrap();
+        assert_eq!((a.url, a.db, a.username), (b.url, b.db, b.username));
+        assert!(AgentOdooConfig::from_table(&"[agent]\nname=\"x\"".parse().unwrap()).is_none());
     }
 
     #[test]

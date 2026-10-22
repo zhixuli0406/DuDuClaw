@@ -125,56 +125,7 @@ impl MethodHandler {
     /// `evil.com`), and `https://user@10.0.0.1/` hid a private address behind
     /// userinfo. Any userinfo is refused outright.
     pub(crate) fn is_safe_odoo_url(url: &str) -> bool {
-        if url.len() > 512 {
-            return false;
-        }
-        let Ok(parsed) = url::Url::parse(url) else {
-            return false;
-        };
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return false;
-        }
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        match parsed.scheme() {
-            // Allow HTTP only for strict localhost.
-            "http" => matches!(host, "127.0.0.1" | "localhost" | "[::1]"),
-            // Reject private/reserved IPs to prevent SSRF against cloud metadata, LAN, etc.
-            "https" => !Self::is_private_host(host),
-            _ => false,
-        }
-    }
-
-    /// Check if a hostname is a private/reserved IP or a known metadata endpoint.
-    /// Uses `std::net::IpAddr` parsing to correctly handle all IPv4/IPv6 representations,
-    /// including IPv4-mapped IPv6 (`::ffff:10.0.0.1`), compressed forms, etc.
-    pub(crate) fn is_private_host(host: &str) -> bool {
-        // Strip brackets for IPv6 literals (e.g. "[::1]" → "::1")
-        let raw = host.trim_start_matches('[').trim_end_matches(']');
-
-        // Bare IPv6 without brackets (contains ':' but no '[') — reject as ambiguous
-        if !host.starts_with('[') && raw.contains(':') {
-            return true;
-        }
-
-        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
-            return Self::is_private_ip(ip);
-        }
-
-        // Hostname-based checks
-        let lower = host.to_ascii_lowercase();
-        lower == "localhost"
-            || lower.ends_with(".localhost")
-            || lower == "metadata.google.internal"
-            || lower == "metadata.azure.internal"
-    }
-
-    /// Check if an IP address is private, loopback, link-local, or otherwise
-    /// not a public internet address — the workspace-wide classifier
-    /// ([`duduclaw_core::net_addr::is_public_ip`]).
-    pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
-        !duduclaw_core::net_addr::is_public_ip(&ip)
+        duduclaw_odoo::url_guard::is_safe_odoo_url(url)
     }
 }
 

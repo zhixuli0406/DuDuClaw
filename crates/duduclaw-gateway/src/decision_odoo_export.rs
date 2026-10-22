@@ -100,15 +100,9 @@ async fn connect_for_agent(
         }
     }
     if let Some(cfg) = agent_override.as_ref() {
-        if let Some(username) = &cfg.username {
-            config.username = username.clone();
-        }
-        if let Some(key) = &cfg.api_key_enc {
-            config.api_key_enc = key.clone();
-        }
-        if let Some(password) = &cfg.password_enc {
-            config.password_enc = password.clone();
-        }
+        // Same merge (and url/db validation) as the connector pool and
+        // `odoo.agent_test`.
+        cfg.apply_to(&mut config)?;
     }
 
     // Resolve the credential from whichever file actually supplied it, so an

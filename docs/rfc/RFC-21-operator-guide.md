@@ -207,6 +207,8 @@ name = "proj-alpha-pm"
 
 [odoo]
 profile         = "alpha"
+url             = "https://erp.example.com" # optional: this agent's own Odoo server
+db              = "alpha_prod"              # optional: database on that server
 username        = "agent_alpha_pm"          # service account (provisioned in Odoo)
 api_key_enc     = "<encrypted>"             # agent-specific Odoo API key
 allowed_models  = ["crm.lead", "sale.order", "project.task"]
@@ -216,6 +218,17 @@ company_ids     = [1, 2]                    # multi-company narrowing
 
 Per-agent `[odoo]` blocks are entirely optional — agents without one
 fall back to the global `config.toml [odoo]` exactly as before.
+
+`url` and `db` are optional too: set them only when this agent must talk to a
+different Odoo server than the global one. Both the runtime connection and the
+dashboard's agent connection test merge the override over the global block
+through the same function, so a passing test means the agent really connects
+to that server. `url` must be HTTPS to a public host (plain `http://` only for
+`localhost` / `127.0.0.1`; private, link-local and metadata addresses and URLs
+with a user name are refused), `db` is at most 63 characters of
+`[a-zA-Z0-9_-]`. An override that fails these checks refuses the connection
+(it never falls back to the global server). When you change `url`, set the
+agent's key again for the new server. The whole `[odoo]` table is admin-only.
 
 ### Action whitelist syntax
 
