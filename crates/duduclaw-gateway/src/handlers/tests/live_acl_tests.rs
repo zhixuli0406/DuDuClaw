@@ -376,9 +376,10 @@ async fn users_rpcs_return_coded_manager_errors() {
         code(f.handler.handle("users.update", json!({"user_id": mgr, "manager_user_id": mgr}), &admin).await),
         json!("manager_cycle")
     );
+    // Below lead, but an Employee: the role check answers first.
     assert_eq!(
         code(f.handler.handle("users.update", json!({"user_id": lead, "manager_user_id": emp1}), &admin).await),
-        json!("manager_cycle")
+        json!("manager_role")
     );
     let emp2 = person(&f.db, "emp2", UserRole::Employee);
     assert_eq!(
