@@ -1932,6 +1932,7 @@ dependencies = [
  "duduclaw-llm",
  "duduclaw-memory",
  "duduclaw-odoo",
+ "duduclaw-onnx",
  "duduclaw-os",
  "duduclaw-redaction",
  "duduclaw-relay",
@@ -2044,11 +2045,14 @@ dependencies = [
  "chrono",
  "csv",
  "duduclaw-core",
+ "duduclaw-onnx",
  "ego-tree",
  "encoding_rs",
  "hex",
+ "ort",
  "pdf-extract",
  "quick-xml",
+ "reqwest",
  "rusqlite",
  "scraper",
  "serde",
@@ -2056,6 +2060,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
  "toml",
  "tracing",
  "unicode-normalization",
@@ -2160,6 +2166,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-onnx"
+version = "1.75.0"
+dependencies = [
+ "duduclaw-core",
+ "flate2",
+ "futures-util",
+ "ort",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "zip",
+]
+
+[[package]]
 name = "duduclaw-os"
 version = "1.75.0"
 dependencies = [
@@ -2201,6 +2225,7 @@ dependencies = [
  "chrono",
  "duduclaw-core",
  "duduclaw-identity",
+ "duduclaw-onnx",
  "duduclaw-security",
  "flate2",
  "futures-util",
