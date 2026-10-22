@@ -22,6 +22,7 @@
 pub mod channel_format;
 pub mod channel_policy;
 pub mod channel_presenter;
+pub mod channel_status;
 pub mod channel_surfaces;
 pub mod claude_stream;
 pub mod done_meta;
@@ -181,7 +182,7 @@ pub struct ThinkingSink {
 
 /// The employee that is actually answering right now: the reply pipeline's
 /// task-local agent id, else the turn's recorded answerer.
-fn answering_agent() -> Option<String> {
+pub(crate) fn answering_agent() -> Option<String> {
     crate::claude_runner::CHANNEL_REPLY_AGENT_ID
         .try_with(|a| a.clone())
         .ok()

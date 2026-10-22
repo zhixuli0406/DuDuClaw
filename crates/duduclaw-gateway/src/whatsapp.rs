@@ -540,6 +540,9 @@ async fn receive_webhook(
                     // answer ends with one "💭 思考了 N 秒" line.
                     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
                         "whatsapp",
+                        // One-to-one by construction: this handler answers
+                        // with `send_text(.., sender, ..)`, i.e. in the
+                        // sender's own chat, never in a group.
                         false,
                         crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
                         None,

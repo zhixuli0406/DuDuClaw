@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::channel_format::{self, StatusView};
-use super::channel_presenter::StatusSurface;
+use super::channel_status::{PostOutcome, StatusSurface};
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 const SLACK_API: &str = "https://slack.com/api";
@@ -40,6 +40,35 @@ async fn send_json(req: reqwest::RequestBuilder, what: &'static str) -> Option<V
     }
 }
 
+/// Send a post request whose JSON body says `ok` (Telegram, Slack): refused
+/// or unreachable ⇒ `Failed`; accepted but the id is missing or the body is
+/// unreadable ⇒ `Unknown` (the message may exist — never post it again).
+async fn post_outcome(
+    req: reqwest::RequestBuilder,
+    what: &'static str,
+    id_of: impl Fn(&Value) -> Option<String>,
+) -> PostOutcome {
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, what, "thinking status post failed");
+            return PostOutcome::Failed;
+        }
+    };
+    let status = resp.status();
+    let Ok(data) = resp.json::<Value>().await else {
+        return if status.is_success() {
+            PostOutcome::Unknown
+        } else {
+            PostOutcome::Failed
+        };
+    };
+    if data.get("ok").and_then(Value::as_bool) != Some(true) {
+        return PostOutcome::Failed;
+    }
+    id_of(&data).map_or(PostOutcome::Unknown, PostOutcome::Posted)
+}
+
 /// Telegram: `sendMessage` / `editMessageText` / `deleteMessage` against the
 /// bot's `api_base` (`https://api.telegram.org/bot<token>`).
 pub struct TelegramStatus {
@@ -51,7 +80,7 @@ pub struct TelegramStatus {
 
 #[async_trait]
 impl StatusSurface for TelegramStatus {
-    async fn post(&self, view: &StatusView) -> Option<String> {
+    async fn post(&self, view: &StatusView) -> PostOutcome {
         let (text, mode) = channel_format::telegram(view);
         let mut body = json!({"chat_id": self.chat_id, "text": text, "parse_mode": mode,
             "disable_notification": true});
@@ -62,10 +91,12 @@ impl StatusSurface for TelegramStatus {
             .http
             .post(format!("{}/sendMessage", self.api_base))
             .json(&body);
-        let data = send_json(req, "telegram sendMessage").await?;
-        data.pointer("/result/message_id")
-            .and_then(Value::as_i64)
-            .map(|id| id.to_string())
+        post_outcome(req, "telegram sendMessage", |data| {
+            data.pointer("/result/message_id")
+                .and_then(Value::as_i64)
+                .map(|id| id.to_string())
+        })
+        .await
     }
 
     async fn edit(&self, id: &str, view: &StatusView) {
@@ -115,14 +146,26 @@ impl DiscordStatus {
 
 #[async_trait]
 impl StatusSurface for DiscordStatus {
-    async fn post(&self, view: &StatusView) -> Option<String> {
+    async fn post(&self, view: &StatusView) -> PostOutcome {
         let req = self
             .http
             .post(self.url(""))
             .header("Authorization", format!("Bot {}", self.token))
             .json(&Self::body(view));
-        let data = send_json(req, "discord post").await?;
-        data.get("id").and_then(Value::as_str).map(str::to_string)
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                Ok(data) => match data.get("id").and_then(Value::as_str) {
+                    Some(id) => PostOutcome::Posted(id.to_string()),
+                    None => PostOutcome::Unknown,
+                },
+                Err(_) => PostOutcome::Unknown,
+            },
+            Ok(_) => PostOutcome::Failed,
+            Err(e) => {
+                tracing::debug!(error = %e, "thinking status: discord post failed");
+                PostOutcome::Failed
+            }
+        }
     }
 
     async fn edit(&self, id: &str, view: &StatusView) {
@@ -164,16 +207,16 @@ impl SlackStatus {
 
 #[async_trait]
 impl StatusSurface for SlackStatus {
-    async fn post(&self, view: &StatusView) -> Option<String> {
+    async fn post(&self, view: &StatusView) -> PostOutcome {
         let (text, blocks) = channel_format::slack(view);
         let mut body = json!({"channel": self.channel, "text": text, "blocks": blocks});
         if let Some(th) = &self.thread_ts {
             body["thread_ts"] = json!(th);
         }
-        let data = send_json(self.call("chat.postMessage", body), "slack post").await?;
-        (data.get("ok").and_then(Value::as_bool) == Some(true))
-            .then(|| data.get("ts").and_then(Value::as_str).map(str::to_string))
-            .flatten()
+        post_outcome(self.call("chat.postMessage", body), "slack post", |data| {
+            data.get("ts").and_then(Value::as_str).map(str::to_string)
+        })
+        .await
     }
 
     async fn edit(&self, id: &str, view: &StatusView) {

@@ -156,15 +156,25 @@ async fn arm_thinking(
             Some(a) => a.to_string(),
             None => resolve_agent_for_restore(ctx, session_id).await,
         };
-        let agent_dir = ctx.home_dir.join("agents").join(&agent_id);
         let show = crate::thinking::channel_policy::resolve_channel(
             &ctx.home_dir,
-            Some(&agent_dir),
+            &agent_id,
             presenter.channel(),
             user_id,
             presenter.is_group(),
         );
-        presenter.set_show(show);
+        // When `@` / trigger routing hands the turn to another employee, the
+        // presenter decides again for the one that actually answers.
+        let resolver: crate::thinking::channel_presenter::ShowResolver = {
+            let home = ctx.home_dir.clone();
+            let channel = presenter.channel();
+            let sender = user_id.to_string();
+            let group = presenter.is_group();
+            Arc::new(move |agent: &str| {
+                crate::thinking::channel_policy::resolve_channel(&home, agent, channel, &sender, group)
+            })
+        };
+        presenter.set_audience(&agent_id, show, resolver);
         let policy = crate::thinking::policy::channel_policy_for(&ctx.home_dir, show);
         let sink_ctx = crate::thinking::SinkCtx {
             home: ctx.home_dir.clone(),

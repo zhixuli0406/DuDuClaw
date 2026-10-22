@@ -688,6 +688,8 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
     // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
         "wecom",
+        // One-to-one by construction: the reply goes out as an app message
+        // to `touser = FromUserName` (the sender alone), never to a group.
         false,
         crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
         None,

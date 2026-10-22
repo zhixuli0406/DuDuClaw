@@ -13,7 +13,7 @@ The summary is the same text the dashboard chat shows (see [Thinking display](64
 | LINE (groups) | Nothing (LINE has no loading animation for groups) | The same extra message, timer only by default |
 | WhatsApp, Feishu, WeCom, DingTalk, Google Chat | The existing "already received" status line | One line "💭 思考了 12 秒" (+ the first 300 characters of the summary) at the end of the answer, above the "Powered by DuDuClaw" footer |
 
-"12 秒" is the time from the moment the message arrived until the answer was ready, the same number the dashboard chat shows. Nothing is shown when the model did not report any thinking. On the editable apps the "already received" status line is not posted while the thinking status shows; if the reply ends up empty, the status message is removed. Labels follow `[general] default_language` (Traditional Chinese, English or Japanese).
+"12 秒" is the time from the moment the message arrived until the answer was ready, the same number the dashboard chat shows. Nothing is shown when the model did not report any thinking. On the editable apps the "already received" status line is not posted while the thinking status shows; if the reply ends up empty or the turn is cancelled, the status message is removed. When an app refuses the status message three times in a row (or accepts it without returning its id), no more status messages are sent that turn. Teams gets the status as plain text, and the one-line footer on the other apps has mention and link syntax made inert, so a summary can never ping anyone or render a link. Labels follow `[general] default_language` (Traditional Chinese, English or Japanese).
 
 ## Who sees what
 
@@ -27,12 +27,12 @@ channel_group_display = "status"  # summary | status | off
 
 | Setting | One-to-one chat | Group chat |
 |---|---|---|
-| `internal` (default), sender bound to a dashboard account | timer + summary | timer (`channel_group_display`) |
+| `internal` (default), sender is an Admin or bound to the answering employee | timer + summary | timer (`channel_group_display`) |
 | `internal`, any other sender | timer | timer |
 | `all` | timer + summary | timer (`channel_group_display`) |
 | `none` | nothing | nothing |
 
-- "Bound" means the sender's channel identity is verified and belongs to an active dashboard account (the same check `@` calling uses). A failed lookup counts as not bound.
+- "Bound" means the sender's channel identity is verified, belongs to an active dashboard account, and that account is an Admin or is bound to the employee that answers (the same binding the dashboard uses for that employee). An account bound only to other employees sees the timer. The binding is read from the user database on every message, so revoking it takes effect at once. A failed lookup counts as not bound.
 - `channel_group_display` is the most a group chat shows, whoever speaks. Set it to `summary` to let bound colleagues read summaries in groups too.
 - The stricter of `[thinking] display` and the answering employee's `[model] show_thinking` caps everything: `status` means the timer only, `off` means nothing. An employee called with `@` uses its own setting.
 - A `config.toml` that cannot be read or parsed, or an unknown value, shows nothing.

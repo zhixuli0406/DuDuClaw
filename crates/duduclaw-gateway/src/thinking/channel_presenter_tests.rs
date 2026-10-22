@@ -1,19 +1,25 @@
 use super::*;
+use async_trait::async_trait;
 use crate::thinking::ThinkingPhase;
 
 #[derive(Default)]
 struct FakeSurface {
     calls: std::sync::Mutex<Vec<String>>,
+    refuse: bool,
 }
 
 #[async_trait]
 impl StatusSurface for FakeSurface {
-    async fn post(&self, view: &StatusView) -> Option<String> {
+    async fn post(&self, view: &StatusView) -> PostOutcome {
         self.calls
             .lock()
             .unwrap()
             .push(format!("post:{}", super::super::channel_format::plain(view, 300)));
-        Some("m1".into())
+        if self.refuse {
+            PostOutcome::Failed
+        } else {
+            PostOutcome::Posted("m1".into())
+        }
     }
     async fn edit(&self, id: &str, view: &StatusView) {
         self.calls
@@ -191,4 +197,85 @@ async fn line_footer_message_goes_first_and_never_exceeds_five() {
     }
     assert_eq!(with_reply_extra(answer(1), None).len(), 1);
     assert!(with_reply_extra(vec![], Some(extra)).is_empty());
+}
+
+
+#[tokio::test]
+async fn the_answering_employee_decides_what_is_shown() {
+    let surface = Arc::new(FakeSurface::default());
+    let p = ChannelThinking::new("telegram", false, Lang::ZhTw, Some(surface.clone()));
+    // Resolved for the conversation's default employee "a" (summary), but
+    // an `@`-called "b" answers, and this sender may only see b's timer.
+    let resolver: ShowResolver = Arc::new(|agent: &str| {
+        if agent == "a" { ShowThinking::Summary } else { ShowThinking::Status }
+    });
+    p.set_audience("a", ShowThinking::Summary, resolver);
+    crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .scope("b".to_string(), async {
+            p.observe(&ev("t0", ThinkingPhase::End, Some("b 的思考")));
+        })
+        .await;
+    assert_eq!(p.show(), ShowThinking::Status);
+    p.finish().await;
+    let calls = surface.calls.lock().unwrap().clone();
+    assert!(calls.iter().all(|c| !c.contains("b 的思考")), "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_refused_status_is_not_retried_at_finish() {
+    let surface = Arc::new(FakeSurface {
+        refuse: true,
+        ..FakeSurface::default()
+    });
+    let p = ChannelThinking::new("slack", false, Lang::ZhTw, Some(surface.clone()));
+    p.set_show(ShowThinking::Status);
+    p.observe(&ev("t0", ThinkingPhase::Start, None));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    p.finish().await;
+    let posts = surface.calls.lock().unwrap().iter().filter(|c| c.starts_with("post:")).count();
+    assert!(posts <= 2, "one live attempt (+ at most one final), got {posts}");
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_removes_its_frozen_status() {
+    let surface = Arc::new(FakeSurface::default());
+    {
+        let p = ChannelThinking::new("discord", false, Lang::ZhTw, Some(surface.clone()));
+        p.set_show(ShowThinking::Status);
+        p.observe(&ev("t0", ThinkingPhase::Start, None));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if p.is_status_posted().await {
+                break;
+            }
+        }
+        // The handler is cancelled here: no finish(), no abandon().
+    }
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+        if surface.calls.lock().unwrap().iter().any(|c| c == "delete:m1") {
+            break;
+        }
+    }
+    let calls = surface.calls.lock().unwrap().clone();
+    assert_eq!(calls.last().map(String::as_str), Some("delete:m1"), "{calls:?}");
+}
+
+#[test]
+fn footers_neutralise_mentions_and_markup() {
+    let footer = Footer {
+        view: StatusView {
+            done: true,
+            seconds: 2,
+            line: None,
+            summary: Some("通知 <users/all> 與 @all，見 [這裡](https://evil)".into()),
+            lang: Lang::ZhTw,
+        },
+    };
+    let text = footer.text();
+    for bad in ["<users/all>", "@all", "[這裡]"] {
+        assert!(!text.contains(bad), "{bad} in {text}");
+    }
 }

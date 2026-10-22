@@ -95,6 +95,23 @@ pub fn plain(view: &StatusView, summary_max: usize) -> String {
     out
 }
 
+/// Mention and markup syntax made inert for platforms that parse the reply
+/// text (`<users/all>`, `<at user_id="all">`, `<@id>`, `[t](url)`,
+/// `![](url)`, `@all`): angle and square brackets become look-alikes and the
+/// common broadcast mentions get a zero-width space after the `@`.
+pub fn neutralize_markup(s: &str) -> String {
+    let mut out = s
+        .replace('<', "‹")
+        .replace('>', "›")
+        .replace('[', "［")
+        .replace(']', "］");
+    for m in ["@all", "@everyone", "@here", "@channel", "@所有人"] {
+        let neutral = format!("@\u{200B}{}", m.trim_start_matches('@'));
+        out = out.replace(m, &neutral);
+    }
+    out
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -124,14 +141,21 @@ pub fn discord(view: &StatusView) -> String {
     let mut out = header(view);
     if let Some(l) = live_line(view) {
         out.push_str("\n-# ");
-        out.push_str(&l.replace('\n', " "));
+        out.push_str(&discord_inert(&l.replace('\n', " ")));
     }
     if let Some(s) = done_summary(view, DISCORD_SUMMARY_CHARS) {
         out.push_str("\n||");
-        out.push_str(&s.replace("||", "|\u{200B}|"));
+        out.push_str(&discord_inert(&s));
         out.push_str("||");
     }
     out
+}
+
+/// Discord text that cannot close a spoiler early: `||` is broken up and
+/// backticks (which would open a code span swallowing the closing `||`)
+/// become a look-alike.
+fn discord_inert(s: &str) -> String {
+    s.replace("||", "|\u{200B}|").replace('`', "ˋ")
 }
 
 fn slack_escape(s: &str) -> String {
@@ -248,6 +272,25 @@ mod tests {
         });
         assert_eq!(done, "💭 思考了 2 秒\n||a|\u{200B}|b||");
         assert_eq!(discord(&view(false, 2)), "💭 思考中… 2 秒\n-# 正在比對 <兩份> 報表");
+    }
+
+    #[test]
+    fn discord_backticks_cannot_swallow_the_spoiler_end() {
+        let done = discord(&StatusView {
+            summary: Some("```rm -rf``` and `x`".into()),
+            ..view(true, 2)
+        });
+        assert!(!done.contains('`'), "{done}");
+        assert!(done.ends_with("||"));
+    }
+
+    #[test]
+    fn markup_and_mentions_are_made_inert() {
+        let s = neutralize_markup("<users/all> <at user_id=\"all\"> [x](https://evil) ![](https://t/p.png) @all @所有人");
+        for bad in ["<", ">", "[x]", "![", "@all", "@所有人"] {
+            assert!(!s.contains(bad), "{bad} in {s}");
+        }
+        assert!(s.contains("https://evil"), "text stays readable: {s}");
     }
 
     #[test]

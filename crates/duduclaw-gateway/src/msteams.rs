@@ -1120,26 +1120,48 @@ pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> 
 }
 
 /// Thinking display: the editable status activity (Teams cannot fold text,
-/// so the summary is capped short).
+/// so the summary is capped short). Sent as `textFormat: plain` with markup
+/// neutralised, so a summary cannot render a link, an image or a mention.
 struct TeamsThinkingStatus {
     state: Arc<TeamsState>,
     target: TeamsTarget,
 }
 
-impl TeamsThinkingStatus {
-    fn body(&self, view: &crate::thinking::channel_format::StatusView) -> serde_json::Value {
-        let text = crate::thinking::channel_format::plain(
+/// The status activity body (pure, for tests).
+fn thinking_status_activity(
+    target: &TeamsTarget,
+    view: &crate::thinking::channel_format::StatusView,
+) -> serde_json::Value {
+    let text = crate::thinking::channel_format::neutralize_markup(
+        &crate::thinking::channel_format::plain(
             view,
             crate::thinking::channel_format::PLAIN_SUMMARY_CHARS,
-        );
-        message_activity(&self.target, &text, false)
+        ),
+    );
+    let mut body = message_activity(target, &text, false);
+    body["textFormat"] = serde_json::json!("plain");
+    body
+}
+
+impl TeamsThinkingStatus {
+    fn body(&self, view: &crate::thinking::channel_format::StatusView) -> serde_json::Value {
+        thinking_status_activity(&self.target, view)
     }
 }
 
 #[async_trait::async_trait]
 impl crate::thinking::channel_presenter::StatusSurface for TeamsThinkingStatus {
-    async fn post(&self, view: &crate::thinking::channel_format::StatusView) -> Option<String> {
-        send_activity(&self.state.creds, &self.target, &self.body(view)).await
+    async fn post(
+        &self,
+        view: &crate::thinking::channel_format::StatusView,
+    ) -> crate::thinking::channel_presenter::PostOutcome {
+        // `send_activity` returns no id both when the post failed and when
+        // the response was unreadable; treat it as a failure (the give-up
+        // rule then stops after a few attempts).
+        match send_activity(&self.state.creds, &self.target, &self.body(view)).await {
+            Some(id) => crate::thinking::channel_presenter::PostOutcome::Posted(id),
+            None => crate::thinking::channel_presenter::PostOutcome::Failed,
+        }
     }
 
     async fn edit(&self, id: &str, view: &crate::thinking::channel_format::StatusView) {
@@ -1292,6 +1314,31 @@ mod tests {
         assert_eq!(strip_mention_tags("<at>DuDu</at> 你好"), "你好");
         assert_eq!(strip_mention_tags("hello"), "hello");
         assert_eq!(strip_mention_tags("<at>Bot</at>"), "");
+    }
+
+    #[test]
+    fn thinking_status_is_plain_text_with_markup_neutralised() {
+        let target = TeamsTarget {
+            service_url: "https://smba.example".into(),
+            conversation_id: "c1".into(),
+            reply_to_id: "r1".into(),
+            bot_account: serde_json::json!({"id": "bot"}),
+            user_account: serde_json::json!({"id": "user"}),
+        };
+        let view = crate::thinking::channel_format::StatusView {
+            done: true,
+            seconds: 4,
+            line: None,
+            summary: Some("see [x](https://evil) ![](https://t/p.png) <at>all</at>".into()),
+            lang: crate::trigger_route::texts::Lang::ZhTw,
+        };
+        let body = thinking_status_activity(&target, &view);
+        assert_eq!(body["textFormat"], "plain");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.starts_with("💭 思考了 4 秒"), "{text}");
+        for bad in ["[x]", "![", "<at>"] {
+            assert!(!text.contains(bad), "{bad} in {text}");
+        }
     }
 
     #[test]

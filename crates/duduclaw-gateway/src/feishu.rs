@@ -486,7 +486,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
         "feishu",
-        is_group,
+        crate::thinking::channel_policy::feishu_is_group(&message),
         crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
         None,
     );

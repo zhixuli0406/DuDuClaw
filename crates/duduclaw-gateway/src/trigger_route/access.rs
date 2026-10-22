@@ -160,7 +160,7 @@ pub fn for_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> 
     access
 }
 
-fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> SenderAccess {
+pub(crate) fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> SenderAccess {
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else {
         return SenderAccess::unmapped();
     };

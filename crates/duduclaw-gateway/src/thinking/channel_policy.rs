@@ -7,9 +7,10 @@
 //! channel_group_display = "status" # summary | status | off (group chats)
 //! ```
 //!
-//! - `internal` (default): a sender bound to an active dashboard account
-//!   (a verified channel identity) sees the timer and the masked summary;
-//!   anyone else sees the timer only.
+//! - `internal` (default): a sender whose verified channel identity maps to
+//!   an active dashboard account that is an Admin or is bound to the
+//!   answering employee sees the timer and the masked summary; anyone else
+//!   (including accounts bound only to other employees) sees the timer only.
 //! - `all`: every sender of a 1:1 chat sees the summary.
 //! - `none`: nothing about thinking is shown in messaging apps.
 //! - Group chats show at most `channel_group_display` (default `status`:
@@ -136,21 +137,35 @@ pub fn channel_show(
     by_chat.strictest(global).strictest(agent)
 }
 
-/// Is this messaging-app sender bound to an active dashboard account
-/// (a verified channel identity)? Any lookup failure ⇒ `false`.
-pub fn sender_is_internal(home: &Path, channel: &str, channel_user_id: &str) -> bool {
-    use crate::trigger_route::access::{Sender, for_channel_sender};
-    matches!(
-        for_channel_sender(home, channel, channel_user_id).sender,
-        Sender::Admin | Sender::Account { .. }
-    )
+/// May this messaging-app sender read `agent_id`'s thinking summary? Only
+/// when a **verified** channel identity maps to an active dashboard account
+/// that is an Admin or is bound to this very employee (the same binding the
+/// dashboard's agent ACL uses). Read live from `users.db` (no cache), so a
+/// revoked binding takes effect on the next message. Any lookup failure ⇒
+/// `false`.
+pub fn sender_is_internal(
+    home: &Path,
+    channel: &str,
+    channel_user_id: &str,
+    agent_id: &str,
+) -> bool {
+    use crate::trigger_route::access::{Sender, lookup_channel_sender};
+    if channel_user_id.is_empty() || agent_id.is_empty() {
+        return false;
+    }
+    match lookup_channel_sender(home, channel, channel_user_id).sender {
+        Sender::Admin => true,
+        Sender::Account { bound, .. } => bound.contains(agent_id),
+        Sender::Unmapped => false,
+    }
 }
 
-/// Resolve one turn: both config layers, the employee's ceiling (a missing
-/// agent directory reads as `status`) and the sender.
+/// Resolve one turn for the employee `agent_id`: both config layers, the
+/// employee's ceiling (a missing agent directory reads as `status`) and the
+/// sender's access to that employee.
 pub fn resolve_channel(
     home: &Path,
-    agent_dir: Option<&Path>,
+    agent_id: &str,
     channel: &str,
     channel_user_id: &str,
     is_group: bool,
@@ -160,15 +175,45 @@ pub fn resolve_channel(
         return ShowThinking::Off;
     }
     let global = super::policy::ThinkingConfig::from_home(home).display;
-    let agent = agent_dir.map_or(ShowThinking::Status, super::policy::agent_ceiling);
-    let internal = sender_is_internal(home, channel, channel_user_id);
+    let agent = if agent_id.is_empty() {
+        ShowThinking::Status
+    } else {
+        super::policy::agent_ceiling(&home.join("agents").join(agent_id))
+    };
+    let internal = sender_is_internal(home, channel, channel_user_id, agent_id);
     channel_show(&cfg, internal, is_group, global, agent)
+}
+
+/// Feishu, for thinking display: fail closed — only an explicit 1:1 chat
+/// (`chat_type = "p2p"`) is one-to-one; `group`, `topic_group`, a missing
+/// or an unknown value all count as a group chat.
+pub fn feishu_is_group(message: &serde_json::Value) -> bool {
+    message.get("chat_type").and_then(|v| v.as_str()) != Some("p2p")
+}
+
+/// DingTalk, for thinking display: fail closed — only an explicit 1:1
+/// conversation (`conversationType = "1"`) is one-to-one.
+pub fn dingtalk_is_group(payload: &serde_json::Value) -> bool {
+    payload.get("conversationType").and_then(|v| v.as_str()) != Some("1")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ShowThinking::*;
+
+    #[test]
+    fn group_detection_fails_closed() {
+        use serde_json::json;
+        assert!(!feishu_is_group(&json!({"chat_type": "p2p"})));
+        for m in [json!({"chat_type": "group"}), json!({"chat_type": "topic_group"}), json!({}), json!({"chat_type": 1})] {
+            assert!(feishu_is_group(&m), "{m}");
+        }
+        assert!(!dingtalk_is_group(&json!({"conversationType": "1"})));
+        for p in [json!({"conversationType": "2"}), json!({}), json!({"conversationType": 1})] {
+            assert!(dingtalk_is_group(&p), "{p}");
+        }
+    }
 
     #[test]
     fn audience_matrix() {
@@ -235,69 +280,44 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_the_identity_store_and_fails_closed() {
+    fn resolve_requires_admin_or_a_binding_to_this_employee() {
         let home = tempfile::tempdir().unwrap();
-        let agent = home.path().join("agents").join("a");
-        std::fs::create_dir_all(&agent).unwrap();
+        let h = home.path();
+        for a in ["finance", "sales"] {
+            std::fs::create_dir_all(h.join("agents").join(a)).unwrap();
+        }
         // No identity store: every sender is external ⇒ timer only.
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "42", false),
-            Status
-        );
+        assert_eq!(resolve_channel(h, "finance", "telegram", "42", false), Status);
         // Missing employee directory ⇒ status ceiling.
-        assert_eq!(
-            resolve_channel(home.path(), None, "telegram", "42", false),
-            Status
-        );
-        // A verified identity bound to an active account ⇒ summary; an
-        // unverified one is still external.
-        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
-        let user = db
-            .create_user(
-                "emp@test.local",
-                "Emp",
-                "EmpPass-12345",
-                duduclaw_auth::UserRole::Employee,
-            )
+        assert_eq!(resolve_channel(h, "ghost", "telegram", "42", false), Status);
+        let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
+        let emp = db
+            .create_user("emp@test.local", "Emp", "EmpPass-12345", duduclaw_auth::UserRole::Employee)
             .unwrap();
-        db.bind_channel_identity(&user.id, "telegram", "7", true)
+        db.bind_agent(&emp.id, "finance", duduclaw_auth::AccessLevel::Operator)
             .unwrap();
-        db.bind_channel_identity(&user.id, "telegram", "8", false)
+        db.bind_channel_identity(&emp.id, "telegram", "7", true).unwrap();
+        db.bind_channel_identity(&emp.id, "telegram", "8", false).unwrap();
+        let admin = db
+            .create_user("adm@test.local", "Adm", "AdmPass-12345", duduclaw_auth::UserRole::Admin)
             .unwrap();
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "7", false),
-            Summary
-        );
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "7", true),
-            Status,
-            "group chats show the timer only by default"
-        );
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "8", false),
-            Status
-        );
-        std::fs::write(
-            home.path().join("config.toml"),
-            "[thinking]\nchannel_audience = \"all\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "42", false),
-            Summary
-        );
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "42", true),
-            Status
-        );
-        std::fs::write(
-            agent.join("agent.toml"),
-            "[model]\nshow_thinking = \"off\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_channel(home.path(), Some(&agent), "telegram", "42", false),
-            Off
-        );
+        db.bind_channel_identity(&admin.id, "telegram", "9", true).unwrap();
+        // Bound to this employee ⇒ summary; bound only to another ⇒ timer.
+        assert_eq!(resolve_channel(h, "finance", "telegram", "7", false), Summary);
+        assert_eq!(resolve_channel(h, "sales", "telegram", "7", false), Status);
+        // Unverified identity ⇒ external.
+        assert_eq!(resolve_channel(h, "finance", "telegram", "8", false), Status);
+        // Admin ⇒ summary for any employee.
+        assert_eq!(resolve_channel(h, "sales", "telegram", "9", false), Summary);
+        // Group chats: timer only by default.
+        assert_eq!(resolve_channel(h, "finance", "telegram", "7", true), Status);
+        // Read live: revoking the binding takes effect at once.
+        db.unbind_agent(&emp.id, "finance").unwrap();
+        assert_eq!(resolve_channel(h, "finance", "telegram", "7", false), Status);
+        std::fs::write(h.join("config.toml"), "[thinking]\nchannel_audience = \"all\"\n").unwrap();
+        assert_eq!(resolve_channel(h, "sales", "telegram", "42", false), Summary);
+        assert_eq!(resolve_channel(h, "sales", "telegram", "42", true), Status);
+        std::fs::write(h.join("agents/sales/agent.toml"), "[model]\nshow_thinking = \"off\"\n").unwrap();
+        assert_eq!(resolve_channel(h, "sales", "telegram", "42", false), Off);
     }
 }

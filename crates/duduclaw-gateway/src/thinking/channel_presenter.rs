@@ -22,13 +22,16 @@
 //! the WebChat timer shows. Nothing is shown when the model reported no
 //! thinking at all. Summary text is the gate's masked output only.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use duduclaw_core::show_thinking::ShowThinking;
 
 use super::channel_format::StatusView;
+pub use super::channel_status::{PostOutcome, StatusSurface};
+use super::channel_status::StatusSlot;
 use super::event::{ThinkingEvent, ThinkingKind};
 use crate::channel_reply::{ProgressCallback, ProgressEvent};
 use crate::trigger_route::texts::Lang;
@@ -52,17 +55,6 @@ pub fn current() -> Option<Arc<ChannelThinking>> {
     CHANNEL_THINKING.try_with(Arc::clone).ok()
 }
 
-/// One editable status message on a messaging platform.
-#[async_trait]
-pub trait StatusSurface: Send + Sync {
-    /// Post a new status message; its id, or `None` when it failed.
-    async fn post(&self, view: &StatusView) -> Option<String>;
-    /// Replace the status message's content.
-    async fn edit(&self, id: &str, view: &StatusView);
-    /// Remove the status message (the turn ended without an answer).
-    async fn delete(&self, id: &str);
-}
-
 /// What a non-editable platform adds to its reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Footer {
@@ -70,10 +62,26 @@ pub struct Footer {
 }
 
 impl Footer {
-    /// Plain text, the summary capped for platforms that cannot fold it.
+    /// Plain text for platforms that cannot fold the summary: capped, with
+    /// mention / markup syntax neutralised so a summary can never ping or
+    /// format anything.
     pub fn text(&self) -> String {
-        super::channel_format::plain(&self.view, super::channel_format::PLAIN_SUMMARY_CHARS)
+        super::channel_format::neutralize_markup(&super::channel_format::plain(
+            &self.view,
+            super::channel_format::PLAIN_SUMMARY_CHARS,
+        ))
     }
+}
+
+/// Decides what the sender may see for a given answering employee.
+pub type ShowResolver = Arc<dyn Fn(&str) -> ShowThinking + Send + Sync>;
+
+#[derive(Default)]
+struct Audience {
+    /// The employee the current `show` was resolved for.
+    agent: Option<String>,
+    resolver: Option<ShowResolver>,
+    cache: HashMap<String, ShowThinking>,
 }
 
 #[derive(Debug, Default)]
@@ -92,12 +100,14 @@ pub struct ChannelThinking {
     lang: Lang,
     started: Instant,
     show: Mutex<ShowThinking>,
+    audience: Mutex<Audience>,
     state: Mutex<State>,
     surface: Option<Arc<dyn StatusSurface>>,
-    /// The posted status message's id.
-    status_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    status: Arc<tokio::sync::Mutex<StatusSlot>>,
     stop: tokio::sync::watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `finish` or `abandon` ran (otherwise `Drop` removes the status).
+    settled: AtomicBool,
 }
 
 impl ChannelThinking {
@@ -115,11 +125,13 @@ impl ChannelThinking {
             lang,
             started: Instant::now(),
             show: Mutex::new(ShowThinking::Off),
+            audience: Mutex::new(Audience::default()),
             state: Mutex::new(State::default()),
             surface,
-            status_id: Arc::new(tokio::sync::Mutex::new(None)),
+            status: Arc::new(tokio::sync::Mutex::new(StatusSlot::default())),
             stop: tokio::sync::watch::channel(false).0,
             task: Mutex::new(None),
+            settled: AtomicBool::new(false),
         })
     }
 
@@ -134,6 +146,16 @@ impl ChannelThinking {
     /// What this turn's sender may see (set once per turn by the pipeline).
     pub fn set_show(&self, show: ShowThinking) {
         *self.show.lock().unwrap_or_else(|p| p.into_inner()) = show;
+    }
+
+    /// [`Self::set_show`] for `agent`, plus how to decide again when another
+    /// employee ends up answering (an `@` call routed inside the pipeline).
+    pub fn set_audience(&self, agent: &str, show: ShowThinking, resolver: ShowResolver) {
+        self.set_show(show);
+        let mut a = self.audience.lock().unwrap_or_else(|p| p.into_inner());
+        a.cache.insert(agent.to_string(), show);
+        a.agent = Some(agent.to_string());
+        a.resolver = Some(resolver);
     }
 
     pub fn show(&self) -> ShowThinking {
@@ -174,8 +196,42 @@ impl ChannelThinking {
         self.started.elapsed().as_secs().max(1)
     }
 
+    /// The employee answering now differs from the one `show` was resolved
+    /// for: decide again for it (cached per employee). Text already kept is
+    /// dropped when the new employee allows less than a summary.
+    fn retarget(&self, agent: &str) {
+        let show = {
+            let mut a = self.audience.lock().unwrap_or_else(|p| p.into_inner());
+            if a.agent.as_deref() == Some(agent) {
+                return;
+            }
+            let Some(resolver) = a.resolver.clone() else {
+                return;
+            };
+            let show = match a.cache.get(agent) {
+                Some(s) => *s,
+                None => {
+                    let s = resolver(agent);
+                    a.cache.insert(agent.to_string(), s);
+                    s
+                }
+            };
+            a.agent = Some(agent.to_string());
+            show
+        };
+        self.set_show(show);
+        if show != ShowThinking::Summary {
+            let mut st = self.state();
+            st.blocks.clear();
+            st.line = None;
+        }
+    }
+
     /// Feed one gated thinking event.
     pub fn observe(self: &Arc<Self>, ev: &ThinkingEvent) {
+        if let Some(agent) = super::answering_agent() {
+            self.retarget(&agent);
+        }
         let show = self.show();
         if show == ShowThinking::Off {
             return;
@@ -240,13 +296,13 @@ impl ChannelThinking {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        // Weak: a turn that ends without `finish` / `abandon` (an early
-        // return) drops the presenter, and the task stops with it.
-        let me = Arc::downgrade(self);
         let Some(surface) = self.surface.clone() else {
             return;
         };
-        let status_id = Arc::clone(&self.status_id);
+        // Weak: a turn that ends without `finish` / `abandon` drops the
+        // presenter, and the task stops with it.
+        let me = Arc::downgrade(self);
+        let status = Arc::clone(&self.status);
         let mut stop = self.stop.subscribe();
         let task = handle.spawn(async move {
             let mut last: Option<StatusView> = None;
@@ -261,14 +317,12 @@ impl ChannelThinking {
                     break;
                 }
                 {
-                    let mut id = status_id.lock().await;
-                    match id.as_deref() {
-                        None => *id = surface.post(&view).await,
-                        Some(existing) if last.as_ref() != Some(&view) => {
-                            surface.edit(existing, &view).await
-                        }
-                        Some(_) => {}
+                    let mut slot = status.lock().await;
+                    if slot.is_dead() {
+                        break;
                     }
+                    let changed = last.as_ref() != Some(&view);
+                    slot.show(surface.as_ref(), &view, changed).await;
                 }
                 last = Some(view);
                 tokio::select! {
@@ -283,17 +337,21 @@ impl ChannelThinking {
     async fn stop_status_task(&self) {
         let _ = self.stop.send(true);
         let task = self.task.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(task) = task {
-            if tokio::time::timeout(FINISH_WAIT, task).await.is_err() {
-                tracing::debug!(channel = self.channel, "thinking status task did not stop in time");
+        if let Some(mut task) = task {
+            if tokio::time::timeout(FINISH_WAIT, &mut task).await.is_err() {
+                // Never let a stuck post race the final edit.
+                task.abort();
+                tracing::debug!(channel = self.channel, "thinking status task aborted");
             }
         }
     }
 
     /// The answer is ready. Editable platforms: the status message becomes
-    /// "思考了 N 秒" (+ summary) and `None` is returned. Others: the footer
-    /// to add to the reply. `None` too when nothing is to be shown.
+    /// "思考了 N 秒" (+ summary) and `None` is returned (also when the
+    /// platform refused the status this turn). Others: the footer to add to
+    /// the reply. `None` too when nothing is to be shown.
     pub async fn finish(&self) -> Option<Footer> {
+        self.settled.store(true, Ordering::SeqCst);
         self.stop_status_task().await;
         if self.show() == ShowThinking::Off || !self.state().seen {
             return None;
@@ -302,27 +360,51 @@ impl ChannelThinking {
         let Some(surface) = self.surface.clone() else {
             return Some(Footer { view });
         };
-        let mut id = self.status_id.lock().await;
-        match id.as_deref() {
-            Some(existing) => surface.edit(existing, &view).await,
-            None => *id = surface.post(&view).await,
-        }
+        self.status.lock().await.show(surface.as_ref(), &view, true).await;
         None
     }
 
     /// Has the status message been posted?
     pub async fn is_status_posted(&self) -> bool {
-        self.status_id.lock().await.is_some()
+        self.status.lock().await.id.is_some()
     }
 
     /// The turn ended without an answer: remove the status message.
     pub async fn abandon(&self) {
+        self.settled.store(true, Ordering::SeqCst);
         self.stop_status_task().await;
         let Some(surface) = self.surface.clone() else {
             return;
         };
-        if let Some(id) = self.status_id.lock().await.take() {
+        if let Some(id) = self.status.lock().await.id.take() {
             surface.delete(&id).await;
+        }
+    }
+}
+
+impl Drop for ChannelThinking {
+    /// A handler that was cancelled or panicked between `scope` and
+    /// `finish` / `abandon`: best-effort removal of a status message that
+    /// would otherwise stay frozen at "思考中… N 秒".
+    fn drop(&mut self) {
+        if self.settled.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.stop.send(true);
+        if let Some(task) = self.task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            task.abort();
+        }
+        let (Some(surface), Ok(handle)) =
+            (self.surface.clone(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let id = match self.status.try_lock() {
+            Ok(mut slot) => slot.id.take(),
+            Err(_) => None,
+        };
+        if let Some(id) = id {
+            handle.spawn(async move { surface.delete(&id).await });
         }
     }
 }

@@ -447,7 +447,7 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
     // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
         "dingtalk",
-        is_group,
+        crate::thinking::channel_policy::dingtalk_is_group(payload),
         crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
         None,
     );
