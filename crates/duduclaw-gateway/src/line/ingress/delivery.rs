@@ -213,6 +213,16 @@ fn note_delivered(via: &'static str, receipt: Option<String>) {
     });
 }
 
+/// Will this run's answer go out through the Reply API right now? (Outside
+/// an ingress run the caller replies directly.) Thinking display only adds
+/// its extra message to a Reply call, never to a late Push.
+pub(crate) fn answer_goes_by_reply() -> bool {
+    let now = chrono::Utc::now().timestamp();
+    RUN.try_with(|r| r.borrow().route(now))
+        .map(|route| route == DeliveryRoute::Reply)
+        .unwrap_or(true)
+}
+
 /// Send the final answer of an ingress run. Called by `send_reply_rich`.
 pub(crate) async fn deliver(
     http: &reqwest::Client,

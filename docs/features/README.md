@@ -70,6 +70,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 63 | [Document knowledge base](63-knowledge-base.md) | Collections of company documents with per-collection permissions (users, departments, AI employees, channels), sandboxed extraction, keyword search with page / row locations, read-only `knowledge_*` MCP tools, `duduclaw knowledge eval` |
 | 64 | [Thinking display](64-thinking-display.md) | Live thinking timer in WebChat for every runtime; masked, shortened thinking summaries for signed-in dashboard users; never sent to messaging apps |
 | 65 | [Where thinking comes from](65-thinking-sources.md) | Which runtimes report thinking (Claude CLI, Codex, OpenAI-compatible APIs, Anthropic Direct API), what each shows, and when a request changes |
+| 66 | [Thinking display in messaging apps](66-thinking-in-messaging-apps.md) | Timer and masked summary in Telegram, Discord, Slack, Teams, LINE and the other apps; `[thinking] channel_audience` / `channel_group_display` |
 
 ---
 

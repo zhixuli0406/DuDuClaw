@@ -1,6 +1,6 @@
 # Thinking display
 
-When you send a message in the dashboard WebChat, the reply area shows that the AI employee is thinking right away, with a counter that keeps running until the answer arrives. If the model reports a thinking summary, you can read a masked, shortened version of it after the answer lands. Messaging apps never receive thinking text.
+When you send a message in the dashboard WebChat, the reply area shows that the AI employee is thinking right away, with a counter that keeps running until the answer arrives. If the model reports a thinking summary, you can read a masked, shortened version of it after the answer lands. In messaging apps, colleagues bound to a dashboard account can read the masked summary and everyone else sees the timer only; see [Thinking display in messaging apps](66-thinking-in-messaging-apps.md).
 
 Other languages: [繁體中文](zh-TW/64-thinking-display.md) · [日本語](ja-JP/64-thinking-display.md)
 
@@ -22,7 +22,8 @@ Screen readers hear one fixed "Thinking…" announcement; the ticking seconds an
 | Signed-in dashboard user in WebChat | yes | yes | yes, with `display = "summary"` |
 | Website chat widget visitor (public widget key) | no (the gateway sends no thinking frames) | no | no |
 | Odoo website Live Chat visitor | nothing | no | no |
-| Messaging apps (LINE, Telegram, Discord, Slack, …), ACP, internal sessions | at most the one status line "💭 已收到，正在思考（已 N 秒）。" ([notification governance](40-notification-governance.md)) | no | never |
+| Messaging apps (LINE, Telegram, Discord, Slack, …) | a thinking status message or a "💭 思考了 N 秒" line, see [Thinking display in messaging apps](66-thinking-in-messaging-apps.md) | no | only senders bound to a dashboard account, by default in 1:1 chats only (`[thinking] channel_audience`) |
+| ACP, internal sessions | at most the one status line "💭 已收到，正在思考（已 N 秒）。" ([notification governance](40-notification-governance.md)) | no | never |
 
 The timer in WebChat is measured in the browser, so a signed-in user sees it even with thinking display off.
 

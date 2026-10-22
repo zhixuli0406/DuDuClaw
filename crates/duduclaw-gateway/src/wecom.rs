@@ -684,22 +684,37 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
         });
     });
 
-    let guarded = build_guarded_reply_with_session(
-        &text,
-        &state.ctx,
-        &session_id,
-        &from_user,
-        Some(on_progress),
-    )
-    .await;
+    // Thinking display: this platform cannot edit messages, so the answer
+    // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "wecom",
+        false,
+        crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+        None,
+    );
+    let on_progress = thinking.wrap(on_progress);
+    let guarded = thinking
+        .scope(build_guarded_reply_with_session(
+            &text,
+            &state.ctx,
+            &session_id,
+            &from_user,
+            Some(on_progress),
+        ))
+        .await;
+    let thinking_footer = thinking.finish().await;
     if guarded.text.trim().is_empty() {
         warn!(from_user, "WeCom: reply is empty — skipping send");
         return;
     }
+    let reply_text = crate::thinking::channel_presenter::with_footer(
+        guarded.text.clone(),
+        thinking_footer.as_ref(),
+    );
 
     // Rich reply: msgtype markdown (WeCom client renders a markdown subset);
     // fall back to plain text per chunk on rejection.
-    for chunk in crate::channel_format::split_text(&guarded.text, WECOM_TEXT_CHUNK) {
+    for chunk in crate::channel_format::split_text(&reply_text, WECOM_TEXT_CHUNK) {
         if !guarded.still_valid().await {
             send_text(
                 state,

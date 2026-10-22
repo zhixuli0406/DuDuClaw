@@ -41,10 +41,13 @@ pub enum ProgressEvent {
     Interim { text: String },
     /// The employee is thinking ([`crate::thinking`]). Already passed through
     /// the turn's thinking gate: text, if any, is masked and truncated, and
-    /// is only present for a dashboard WebChat viewer allowed to see it.
+    /// is only present for a viewer allowed to see it (a dashboard WebChat
+    /// user, or a messaging-app sender allowed to read summaries).
     /// **Never channel text** — renders as an empty string and every text
     /// channel drops it via [`ProgressEvent::is_channel_text`]; the interim
-    /// watcher uses it only to say "thinking" instead of "processing".
+    /// watcher uses it only to say "thinking" instead of "processing", and a
+    /// channel's thinking presenter (`thinking::channel_presenter`) renders
+    /// it in its own status message or footer.
     Thinking(crate::thinking::ThinkingEvent),
 }
 

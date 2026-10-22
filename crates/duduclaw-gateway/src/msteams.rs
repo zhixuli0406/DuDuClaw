@@ -669,6 +669,12 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
 
     info!("📩 Teams [{sender_name}]: {}", truncate_bytes(&text, 80));
 
+    // `personal` is a 1:1 chat; `groupChat` / `channel` (or anything else)
+    // count as group conversations for thinking display.
+    let is_group_conversation = activity
+        .pointer("/conversation/conversationType")
+        .and_then(|v| v.as_str())
+        != Some("personal");
     let target = TeamsTarget {
         service_url,
         conversation_id,
@@ -893,17 +899,30 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     // it must never become the CCR principal — every unidentified sender would
     // hash to one shared retrieval scope. `reply_principal_for_sender` yields
     // "" there, which turns CCR off for the turn (fail-closed).
-    let guarded = build_guarded_reply_with_session(
-        &input_text,
-        &state.ctx,
-        &session_id,
-        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
-        Some(on_progress),
-    )
-    .await;
+    // Thinking display: one editable status activity.
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "teams",
+        is_group_conversation,
+        crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+        Some(Arc::new(TeamsThinkingStatus {
+            state: Arc::clone(state),
+            target: target.clone(),
+        })),
+    );
+    let on_progress = thinking.wrap(on_progress);
+    let guarded = thinking
+        .scope(build_guarded_reply_with_session(
+            &input_text,
+            &state.ctx,
+            &session_id,
+            crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+            Some(on_progress),
+        ))
+        .await;
     drop(typing_guard);
 
     if !guarded.still_valid().await {
+        thinking.abandon().await;
         deliver_reply(
             &state.creds,
             &target,
@@ -940,8 +959,11 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
 
     if reply.trim().is_empty() {
         warn!("Teams: reply is empty — skipping send");
+        thinking.abandon().await;
         return;
     }
+    // The thinking status becomes "思考了 N 秒" (+ summary) above the answer.
+    let _ = thinking.finish().await;
     deliver_reply(&state.creds, &target, &reply, Some(&guarded)).await;
 }
 
@@ -1095,6 +1117,38 @@ async fn delete_activity(creds: &TeamsCreds, target: &TeamsTarget, activity_id: 
 /// otherwise reach the customer as an empty or unintended message).
 pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
     event.is_channel_text()
+}
+
+/// Thinking display: the editable status activity (Teams cannot fold text,
+/// so the summary is capped short).
+struct TeamsThinkingStatus {
+    state: Arc<TeamsState>,
+    target: TeamsTarget,
+}
+
+impl TeamsThinkingStatus {
+    fn body(&self, view: &crate::thinking::channel_format::StatusView) -> serde_json::Value {
+        let text = crate::thinking::channel_format::plain(
+            view,
+            crate::thinking::channel_format::PLAIN_SUMMARY_CHARS,
+        );
+        message_activity(&self.target, &text, false)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::thinking::channel_presenter::StatusSurface for TeamsThinkingStatus {
+    async fn post(&self, view: &crate::thinking::channel_format::StatusView) -> Option<String> {
+        send_activity(&self.state.creds, &self.target, &self.body(view)).await
+    }
+
+    async fn edit(&self, id: &str, view: &crate::thinking::channel_format::StatusView) {
+        update_activity(&self.state.creds, &self.target, id, &self.body(view)).await;
+    }
+
+    async fn delete(&self, id: &str) {
+        delete_activity(&self.state.creds, &self.target, id).await;
+    }
 }
 
 #[cfg(test)]

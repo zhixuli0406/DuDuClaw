@@ -66,7 +66,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // so the watcher sees `Thinking` events (and can say "thinking"). No
     // sink at all for public visitors.
     let (on_progress, thinking_sink) =
-        arm_thinking(ctx, agent_override, session_id, on_progress).await;
+        arm_thinking(ctx, agent_override, session_id, user_id, on_progress).await;
     let collector: std::sync::Arc<std::sync::Mutex<Vec<crate::runtime::NativeToolEvent>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let ccr_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -137,6 +137,7 @@ async fn arm_thinking(
     ctx: &ReplyContext,
     agent_override: Option<&str>,
     session_id: &str,
+    user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> (
     Option<ProgressCallback>,
@@ -144,6 +145,36 @@ async fn arm_thinking(
 ) {
     if crate::odoo_livechat::is_public_visitor_session(session_id) {
         return (on_progress, None);
+    }
+    // Messaging apps whose handler installed a thinking presenter: what this
+    // sender may see (`thinking::channel_policy`). Without a presenter the
+    // channel keeps the text-less signal below.
+    if let Some(presenter) = crate::thinking::channel_presenter::current()
+        .filter(|_| super::interim::external_channel(session_id).is_some())
+    {
+        let agent_id = match agent_override {
+            Some(a) => a.to_string(),
+            None => resolve_agent_for_restore(ctx, session_id).await,
+        };
+        let agent_dir = ctx.home_dir.join("agents").join(&agent_id);
+        let show = crate::thinking::channel_policy::resolve_channel(
+            &ctx.home_dir,
+            Some(&agent_dir),
+            presenter.channel(),
+            user_id,
+            presenter.is_group(),
+        );
+        presenter.set_show(show);
+        let policy = crate::thinking::policy::channel_policy_for(&ctx.home_dir, show);
+        let sink_ctx = crate::thinking::SinkCtx {
+            home: ctx.home_dir.clone(),
+            agent_id,
+            redaction: crate::thinking::redaction_for_display(
+                ctx.redaction_manager.as_ref(),
+                &ctx.home_dir,
+            ),
+        };
+        return crate::thinking::install(Some(policy), on_progress, sink_ctx);
     }
     let widget_visitor = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
         .try_with(|p| crate::webchat::is_widget_visitor(p))
@@ -341,6 +372,12 @@ pub async fn build_guarded_reply_with_session(
 /// Fixed product attribution on external messaging replies. Internal sessions,
 /// the dashboard console and deliberate silence remain unchanged.
 pub(super) const PRODUCT_FOOTER: &str = "— Powered by DuDuClaw";
+
+/// The text [`append_product_footer`] adds to a reply (for channels that
+/// insert more lines above it).
+pub(crate) fn product_footer_suffix() -> String {
+    format!("\n\n{PRODUCT_FOOTER}")
+}
 
 /// Session prefixes that reach end customers (external messaging platforms).
 pub(super) const FOOTER_CHANNELS: &[&str] = &[

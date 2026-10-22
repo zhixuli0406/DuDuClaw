@@ -977,7 +977,16 @@ async fn process_line_events(
                     continue;
                 }
 
-                let on_progress = ingress::line_progress_callback(&state, &event, token);
+                // Thinking display: LINE cannot edit messages, so the answer
+                // gets one small "💭 思考了 N 秒" message in the same Reply call.
+                let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+                    "line",
+                    !is_one_to_one(&event),
+                    crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+                    None,
+                );
+                let on_progress = ingress::line_progress_callback(&state, &event, token)
+                    .map(|cb| thinking.wrap(cb));
 
                 // Build session ID scoped to group/room or user DM
                 let session_id =
@@ -1018,12 +1027,14 @@ async fn process_line_events(
                     continue;
                 }
 
-                // Loading animation (LINE shows it in 1:1 chats only; the API
-                // silently no-ops elsewhere). RAII guard stops the refresh loop.
+                // Loading animation (1:1 chats only: its `chatId` is a user id,
+                // so a group message must not start it in that user's 1:1
+                // chat). RAII guard stops the refresh loop.
                 let loading_guard =
                     event
                         .source
                         .as_ref()
+                        .filter(|_| is_one_to_one(&event))
                         .and_then(|s| s.user_id.clone())
                         .map(|uid| {
                             crate::channel_typing::line_loading(
@@ -1049,19 +1060,21 @@ async fn process_line_events(
                 } else {
                     session_id.clone()
                 };
-                let guarded = crate::trigger_route::as_called_turn(
-                    called,
-                    build_guarded_reply_for_agent(
-                        &input_text,
-                        &state.ctx,
-                        agent_id,
-                        &session_id,
-                        crate::ccr_runtime::reply_principal_for_sender(sender),
-                        on_progress,
-                    ),
-                )
-                .await;
+                let guarded = thinking
+                    .scope(crate::trigger_route::as_called_turn(
+                        called,
+                        build_guarded_reply_for_agent(
+                            &input_text,
+                            &state.ctx,
+                            agent_id,
+                            &session_id,
+                            crate::ccr_runtime::reply_principal_for_sender(sender),
+                            on_progress,
+                        ),
+                    ))
+                    .await;
                 drop(loading_guard);
+                let thinking_footer = thinking.finish().await;
 
                 if !guarded.still_valid().await {
                     send_ccr_revoked_reply(&state.http, &token, reply_token, sender).await;
@@ -1118,7 +1131,11 @@ async fn process_line_events(
                 // dropped. `segment_line_reply` returns one Flex bubble for short
                 // replies, or several plain-text messages (each within LINE's
                 // 5000-char text limit, capped at 5 messages/request) for long ones.
-                let mut messages = segment_line_reply(&reply, agent_name.as_deref());
+                let mut messages = crate::thinking::channel_presenter::line_messages_with_footer(
+                    segment_line_reply(&reply, agent_name.as_deref()),
+                    thinking_footer.as_ref(),
+                    ingress::answer_goes_by_reply(),
+                );
 
                 // Attach quick-reply buttons to the LAST message (LINE only shows
                 // quickReply on the most recent message). Presses arrive as
@@ -1148,6 +1165,15 @@ async fn process_line_events(
         }
     }
     .await
+}
+
+/// A message from a 1:1 chat (`source.type == "user"`).
+fn is_one_to_one(event: &LineEvent) -> bool {
+    event
+        .source
+        .as_ref()
+        .and_then(|s| s.source_type.as_deref())
+        == Some("user")
 }
 
 async fn send_ccr_revoked_reply(

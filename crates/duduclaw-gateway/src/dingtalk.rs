@@ -443,14 +443,25 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
     // never become the CCR principal — every unidentified sender would hash to
     // one shared retrieval scope. `reply_principal_for_sender` yields "" there,
     // which turns CCR off for the turn (fail-closed).
-    let guarded = build_guarded_reply_with_session(
-        &text,
-        &state.ctx,
-        &session_id,
-        crate::ccr_runtime::reply_principal_for_sender(&sender),
-        Some(on_progress),
-    )
-    .await;
+    // Thinking display: this platform cannot edit messages, so the answer
+    // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "dingtalk",
+        is_group,
+        crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+        None,
+    );
+    let on_progress = thinking.wrap(on_progress);
+    let guarded = thinking
+        .scope(build_guarded_reply_with_session(
+            &text,
+            &state.ctx,
+            &session_id,
+            crate::ccr_runtime::reply_principal_for_sender(&sender),
+            Some(on_progress),
+        ))
+        .await;
+    let thinking_footer = thinking.finish().await;
     if guarded.text.trim().is_empty() {
         warn!(conversation_id, "DingTalk: reply is empty — skipping send");
         return;
@@ -463,7 +474,11 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         );
         return;
     }
-    send_via_webhook_guarded(&state.http, &session_webhook, &guarded.text, true, &guarded).await;
+    let reply_text = crate::thinking::channel_presenter::with_footer(
+        guarded.text.clone(),
+        thinking_footer.as_ref(),
+    );
+    send_via_webhook_guarded(&state.http, &session_webhook, &reply_text, true, &guarded).await;
 }
 
 async fn send_via_webhook_guarded(

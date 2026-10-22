@@ -482,14 +482,25 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     // principal — every anonymous sender would hash to one shared retrieval
     // scope. `reply_principal_for_sender` yields "" there, which turns CCR off
     // for the turn (fail-closed).
-    let guarded = build_guarded_reply_with_session(
-        &input_text,
-        &state.ctx,
-        &session_id,
-        crate::ccr_runtime::reply_principal_for_sender(sender),
-        Some(on_progress),
-    )
-    .await;
+    // Thinking display: this platform cannot edit messages, so the answer
+    // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "feishu",
+        is_group,
+        crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+        None,
+    );
+    let on_progress = thinking.wrap(on_progress);
+    let guarded = thinking
+        .scope(build_guarded_reply_with_session(
+            &input_text,
+            &state.ctx,
+            &session_id,
+            crate::ccr_runtime::reply_principal_for_sender(sender),
+            Some(on_progress),
+        ))
+        .await;
+    let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
         send_message(
             state,
@@ -541,6 +552,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         warn!(chat_id, "Feishu: reply is empty — skipping send");
         return;
     }
+    let reply = crate::thinking::channel_presenter::with_footer(reply, thinking_footer.as_ref());
 
     // Rich reply: interactive Card 2.0 markdown (tables/code render
     // natively). Oversized or rejected cards fall back to plain text.

@@ -70,6 +70,7 @@
 | 63 | [文件知識庫](63-knowledge-base.md) | 公司文件依集合存放、各集合自訂權限（使用者、部門、AI 員工、通道）；沙箱內解析、可標出頁碼與列號的關鍵字搜尋、唯讀 `knowledge_*` MCP 工具、`duduclaw knowledge eval` |
 | 64 | [思考過程顯示](64-thinking-display.md) | WebChat 對每個 runtime 都顯示即時思考計時；登入的 dashboard 使用者可看遮蔽、截短後的思考摘要；通訊軟體永遠收不到 |
 | 65 | [思考內容從哪裡來](65-thinking-sources.md) | 哪些 runtime 會回報思考（Claude CLI、Codex、OpenAI 相容 API、Anthropic Direct API）、各顯示什麼、請求什麼時候會改 |
+| 66 | [通訊軟體的思考顯示](66-thinking-in-messaging-apps.md) | Telegram、Discord、Slack、Teams、LINE 等平台上的計時與遮蔽後摘要；`[thinking] channel_audience`／`channel_group_display` |
 
 ---
 
