@@ -11,6 +11,12 @@
 //! `<think>` that appears later is ordinary text (a user may legitimately
 //! ask about the tag) and is left alone. An unterminated leading block means
 //! the model never got past its reasoning, so nothing is left to show.
+//!
+//! Known limitation: some chat templates put the opening `<think>` in the
+//! prompt, so the model's output starts mid-reasoning and only carries the
+//! closing `…</think>`. That shape is not detected here (it is
+//! indistinguishable from an answer that mentions the tag) and still needs
+//! the server to split reasoning out (`reasoning_content`).
 
 /// Opening tag recognised at the start of the answer.
 pub const THINK_OPEN: &str = "<think>";

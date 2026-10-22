@@ -168,6 +168,14 @@ fn hold_back_keeps_the_unfinished_tail() {
     let (shown, tail) = split_hold_back(&mixed, 64);
     assert_eq!(shown, "字".repeat(10));
     assert_eq!(tail, "Z".repeat(70));
+    // Sentence cut (used on top of this when redaction is on).
+    assert_eq!(split_at_sentence("一句。二句還在"), ("一句。", "二句還在"));
+    assert_eq!(
+        split_at_sentence("line one\nline tw"),
+        ("line one\n", "line tw")
+    );
+    assert_eq!(split_at_sentence("Done! next"), ("Done!", " next"));
+    assert_eq!(split_at_sentence("沒有結尾"), ("", "沒有結尾"));
     // Short text: everything waits until whitespace or the end.
     assert_eq!(split_hold_back("abc", 64), ("", "abc"));
     assert_eq!(split_hold_back("", 64), ("", ""));

@@ -196,7 +196,7 @@ async fn finish_thinking(
             ),
         },
     };
-    sink.finish(&agent, &session);
+    sink.finish(&agent, &session).await;
 }
 
 pub(crate) async fn reply_identity_scope<T>(
