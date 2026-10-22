@@ -98,6 +98,19 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 
 **Permission flags are enforced (behaviour change).** `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` had no reader before. Since v1.68.0 a flag written as `false` blocks the matching tools at the MCP dispatch gate (`create_agent`; `send_to_agent`, `spawn_agent`; `create_reminder`, `tasks_create` with a `schedule`; `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording`); an absent or wrongly typed flag allows. Older templates often wrote these flags as `false`, so the first boot after the upgrade migrates every employee once: in a `[permissions]` table without the marker `permissions_enforced_since`, each of the four flags that is `false` becomes `true` and `permissions_enforced_since = "1.68.0"` is added; each reset writes the audit event `permission_flags_reset`. A `false` written afterwards on this page or in the Advanced config editor counts as an operator decision. Ephemeral role members (`agents/.ephemeral/`) are not migrated and keep least privilege.
 
+## Employee page → Data sources (unreleased)
+
+Visible to everyone bound to the employee (Viewer and up); adding and removing files needs the employee's Owner binding or Admin, re-read from the account database on every call, and on top of that the editor or owner role on the employee's own collection.
+
+| Control | Writes | Effect |
+|---|---|---|
+| Add files (first time): sensitivity, "Also let the colleagues who work with this employee now read them" | a new collection `<display name> 的資料` in `knowledge.db`, its grants, and the employee's `[knowledge] collections` when that list exists | Immediately. Grants: the creator (owner), the employee (viewer), and when ticked every active account bound to the employee (Owner → owner, Operator / Viewer → viewer). |
+| Add files | a source in the own collection | Read in the background; the list refreshes every 3 seconds while a file is still being read. |
+| Remove (optionally "also forget") | deletes the source; with the box ticked files forget requests for an Admin | Unsearchable at once; forget requests wait for approval. |
+| Manage in the document library | — | Opens the collection (sharing, test search, access record, settings). |
+
+Archiving or deleting the employee archives its own collection (only people owners keep access); restoring the employee puts back the grants archiving removed. The first upload also adds the collection to an existing `[knowledge] collections` list; later uploads leave that list alone. Details: [Document knowledge base](../features/63-knowledge-base.md#using-the-dashboard).
+
 ## Settings → Advanced → Knowledge base search
 
 Admin only (new in 1.76.0). Shows whether the document knowledge base searches by meaning or by keywords only, and why not when it does not, with the share of passages that already have vectors.

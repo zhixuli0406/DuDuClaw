@@ -98,6 +98,19 @@
 
 **權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
+## 員工頁 → 資料來源（未發布）
+
+綁定這位員工的人（檢視者以上）都看得到；新增與移除檔案需要這位員工的擁有者綁定或管理員身分（每次呼叫都重新從帳號資料庫讀取），而且還要是員工專用集合的編輯者或擁有者。
+
+| 操作 | 寫入 | 生效 |
+|---|---|---|
+| 新增檔案（第一次）：敏感度、「也讓目前和這位員工一起工作的同事讀取」 | `knowledge.db` 裡新的集合 `<顯示名稱> 的資料`、它的授權，以及員工設定裡既有的 `[knowledge] collections` 清單 | 立即。授權：建立的人（擁有者）、這位員工（檢視者），勾選時再加上所有綁定這位員工的有效帳號（擁有者 → 擁有者，操作者／檢視者 → 檢視者）。 |
+| 新增檔案 | 員工專用集合裡的一份來源 | 背景讀取；還有檔案在讀取時，清單每 3 秒更新。 |
+| 移除（可勾選「也請這位員工忘記」） | 刪除來源；勾選時送出遺忘申請給管理員 | 立即查不到；遺忘申請要等核准。 |
+| 在文件知識庫管理 | — | 打開這個集合（權限、試搜尋、存取紀錄、設定）。 |
+
+封存或刪除員工時，專用集合一起封存（只有身為擁有者的同事保留存取）；恢復員工時，放回封存時移除的授權。第一次上傳也會把集合加進既有的 `[knowledge] collections` 清單，之後的上傳不再動這份清單。細節見[文件知識庫](../../features/zh-TW/63-knowledge-base.md#在儀表板操作)。
+
 ## 系統設定 → 進階設定 → 文件知識庫搜尋
 
 只限管理員（1.76.0 新增）。顯示文件知識庫目前是依語意搜尋還是只比對關鍵字；只比對關鍵字時會說明原因，並顯示已有向量的段落比例。

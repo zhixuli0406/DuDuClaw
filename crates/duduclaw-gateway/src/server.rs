@@ -1936,6 +1936,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // `<home>/knowledge/knowledge.db` from background jobs.
     if duduclaw_core::gateway_instance::held(&home_dir) {
         crate::knowledge::worker::spawn(home_dir.clone());
+        // Employees archived or deleted outside the dashboard: their own
+        // collection is archived too.
+        handler.kb_own_reconcile().await;
     }
 
     // ── D5: semi-automatic topology evolution (human-gated) ───

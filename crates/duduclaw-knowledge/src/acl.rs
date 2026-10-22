@@ -235,9 +235,11 @@ pub fn ids_for_slugs(conn: &Connection, slugs: &[String]) -> KbResult<(Vec<Strin
 const EFFECTIVE_SQL: &str = "
 WITH agent_ok AS (
   SELECT collection_id FROM collection_acl
-   WHERE (principal_kind = 'agent' AND principal_id = ?1 AND role = 'viewer')
+   WHERE ((principal_kind = 'agent' AND principal_id = ?1 AND role = 'viewer')
       OR (principal_kind = 'department' AND ?2 IS NOT NULL AND principal_id = ?2
-          AND role IN ('viewer','editor'))),
+          AND role IN ('viewer','editor')))
+     AND collection_id NOT IN (SELECT collection_id FROM agent_own_collections
+                                WHERE agent_id = ?1 AND archived_at IS NOT NULL)),
 human_ok AS (
   SELECT collection_id FROM collection_acl
    WHERE role IN ('viewer','editor','owner')
@@ -325,9 +327,11 @@ pub fn effective_collections(
 pub fn agent_side_collections(conn: &Connection, agent: &AgentCtx) -> KbResult<AllowedSet> {
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT collection_id FROM collection_acl
-          WHERE (principal_kind = 'agent' AND principal_id = ?1 AND role = 'viewer')
+          WHERE ((principal_kind = 'agent' AND principal_id = ?1 AND role = 'viewer')
              OR (principal_kind = 'department' AND ?2 IS NOT NULL AND principal_id = ?2
-                 AND role IN ('viewer','editor'))
+                 AND role IN ('viewer','editor')))
+            AND collection_id NOT IN (SELECT collection_id FROM agent_own_collections
+                                       WHERE agent_id = ?1 AND archived_at IS NOT NULL)
           ORDER BY collection_id",
     )?;
     let dept = agent.department.as_deref().filter(|d| !d.is_empty());
