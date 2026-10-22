@@ -213,6 +213,7 @@ pub mod handlers;
 // `identity_resolve` MCP tool (the latter two used to hard-code wiki-cache).
 pub mod identity_provider;
 pub mod interruptibility;
+pub mod knowledge;
 pub mod knowledge_guard;
 pub(crate) mod local_session;
 pub mod maintenance;

@@ -31,6 +31,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `computer_use` | `agent.toml [capabilities]` | 隱藏 8 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
 | `db_sources` | `agent.toml [capabilities]` | 隱藏 4 個 `db_*` |
 | `[fork] enabled` | `agent.toml` | 隱藏 6 個分支工具 |
+| `[knowledge] enabled` 加集合授權 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | 除非知識庫啟用、且至少有一個集合授權給員工或其部門（經 `[knowledge] collections` 縮小後），否則隱藏 3 個 `knowledge_*`；授權變更會送出 `list_changed`（見下方 [`knowledge_*`](#knowledge_文件知識庫)） |
 | `[responsibilities] enabled` | `config.toml` | 隱藏 3 個 `responsibility_*`（見下方[持續任務工具](#responsibility_get--responsibility_followup--responsibility_ask持續任務工具)） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
 
@@ -213,6 +214,12 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 每個持續任務同時最多一個由 AI 員工安排、還在等的喚醒，所以等待中的 `responsibility_followup` 與 `responsibility_ask` 互斥。操作者金鑰不能用這兩個喚醒工具，因為那等於冒充員工。封閉的錯誤代碼：`not_found`、`not_active`、`no_open_occurrence`、`invalid_due_at`、`period_occurrence_limit`、`agent_followup_limit`、`epoch_changed`、`invalid_question`。
 
 沒有建立、修改、恢復或重新啟用持續任務的工具，也沒有送指示的工具。
+
+### `knowledge_*`：文件知識庫
+
+`knowledge_search`、`knowledge_get_passage`、`knowledge_list_collections` 讀取[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。scope 是 `knowledge:read`，不能授權給外部 MCP 金鑰。每次呼叫都透過簽章本機路由 `POST /api/internal/knowledge` 交給 gateway；gateway 算出這次呼叫能讀哪些集合（授權給員工本人與其部門的集合，依 `agent.toml [knowledge] collections` 縮小，再與這個 turn 所服務的人、敏感度規則取交集），並寫一筆存取紀錄。gateway 沒在執行時工具會直接說明，不會自己讀資料庫。
+
+結果都標明是文件內容：每一段內容（以及集合名稱與說明）放在有標記的區塊裡，每行以 `│ ` 開頭；標題與位置壓成一行，`[` `]` 會被換掉，文件無法偽造結果標題或提早結束區塊。`knowledge_search` 以 `[n] 標題 · 位置（集合） chunk_id=…` 編號，方便回覆時引用；匯入時被判定像指令的段落會多一行警告。`collections` 只能縮小範圍。`knowledge_get_passage` 每次都重新檢查權限，找不到的段落與沒權限的段落回應相同（`permission denied`）。
 
 ## 已棄用的別名仍會列出
 

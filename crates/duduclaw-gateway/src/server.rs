@@ -1931,6 +1931,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         error!("another gateway holds this data directory: the maintenance supervisor does not run in this process");
     }
 
+    // ── Document knowledge base ingest worker ─────────────────────
+    // One extraction child at a time; only the lock-holding gateway writes
+    // `<home>/knowledge/knowledge.db` from background jobs.
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::knowledge::worker::spawn(home_dir.clone());
+    }
+
     // ── D5: semi-automatic topology evolution (human-gated) ───
     // Independent of the dispatch engine: a slow background driver that mines
     // per-(agent, task_class) MAV reject / needs_human / oscillation evidence,
@@ -2259,6 +2266,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
     // mirroring the main /ws gate instead of being unauthenticated.
+    let knowledge_users = state.user_db.clone();
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
         state.jwt_config.clone(),
@@ -2657,6 +2665,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 crate::expert_admin::MAX_EXPERT_UPLOAD_BYTES + 512 * 1024,
             )),
         )
+        // Document knowledge base: multipart upload (editor of the
+        // collection) and original-file download (viewer). Bearer JWT; the
+        // body cap is `[knowledge] max_source_bytes` × 20 files + 1 MiB, read
+        // at boot (`knowledge::upload`).
+        .route(
+            "/api/knowledge/upload",
+            post(handle_knowledge_upload).layer(DefaultBodyLimit::max(
+                duduclaw_knowledge::limits::KnowledgeConfig::from_home(&home_dir).max_upload_body_bytes(),
+            )),
+        )
+        .route(
+            "/api/knowledge/sources/{id}/original",
+            get(handle_knowledge_original),
+        )
         // WP-G1: device-migration ("汰機搬家") restore upload + the
         // dedicated scheduled-backup download route. Admin + appliance JWT
         // gated (`authorize_device_admin`, mirrors `authorize_file_access`
@@ -2724,6 +2746,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));
+    // ── Document knowledge base (internal) ────────────────────────
+    // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
+    // tools: same loopback + signed-identity authentication as the
+    // computer-use route, own nonce set and rate limit, 64 KiB body cap.
+    app = app.merge(crate::knowledge::route::router(Arc::new(
+        crate::knowledge::route::KnowledgeRouteState::new(home_dir.clone(), Some(knowledge_users)),
+    )));
     // ── Device operations for the `os_*` MCP tools (internal) ─────
     // The mcp-server process reaches duduclaw-sysd only through this route
     // (sysd may answer only the gateway's main process). Same loopback +
@@ -14519,6 +14548,54 @@ fn require_bearer(
             .into_response()
     })?;
     require_password_changed(&ctx)
+}
+
+/// Bearer JWT → active, password-changed dashboard user (fail-closed).
+/// The error is the ready-to-send response, like `require_bearer`.
+#[allow(clippy::result_large_err)]
+fn knowledge_caller(state: &AppState, headers: &axum::http::HeaderMap) -> Result<UserContext, axum::response::Response> {
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing Authorization header" })),
+        )
+            .into_response()
+    })?;
+    let ctx = authenticate_jwt(state, token).map_err(|_| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or expired token" })),
+        )
+            .into_response()
+    })?;
+    require_password_changed(&ctx)?;
+    Ok(ctx)
+}
+
+/// POST /api/knowledge/upload — see `knowledge::upload`.
+async fn handle_knowledge_upload(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    multipart: Multipart,
+) -> axum::response::Response {
+    match knowledge_caller(&state, &headers) {
+        Ok(ctx) => {
+            crate::knowledge::upload::handle_upload(&state.home_dir, &ctx, Some(state.user_db.clone()), multipart).await
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// GET /api/knowledge/sources/{id}/original — see `knowledge::upload`.
+async fn handle_knowledge_original(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    match knowledge_caller(&state, &headers) {
+        Ok(ctx) => crate::knowledge::upload::handle_original(&state.home_dir, &ctx, Some(state.user_db.clone()), &id).await,
+        Err(resp) => resp,
+    }
 }
 
 /// POST /api/experts/upload — stage an expert-pack `.zip` (or a single-file

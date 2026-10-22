@@ -1287,6 +1287,26 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ("cost_agents", "Agents ranked by cost", "admin", "cost"),
     ("cost_recent", "Recent API call records", "admin", "cost"),
     ("cost_users", "End users ranked by cost", "admin", "cost"),
+    // ── Document knowledge base (knowledge) ──────────────────────────────
+    // Read-only; collection permissions are enforced by the gateway route.
+    (
+        "knowledge_search",
+        "Search the document knowledge base",
+        "knowledge:read",
+        "knowledge",
+    ),
+    (
+        "knowledge_get_passage",
+        "Read one knowledge-base passage",
+        "knowledge:read",
+        "knowledge",
+    ),
+    (
+        "knowledge_list_collections",
+        "List readable knowledge collections",
+        "knowledge:read",
+        "knowledge",
+    ),
     // ── Computer use actions (computer) ──────────────────────────────────
     // Additionally gated by `[capabilities] computer_use` at dispatch.
     (

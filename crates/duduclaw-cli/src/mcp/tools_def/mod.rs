@@ -44,6 +44,7 @@ mod fork;
 mod google;
 mod inference;
 mod integrations;
+mod knowledge;
 mod memory;
 mod odoo;
 mod ops;
@@ -76,6 +77,7 @@ pub(crate) const TOOL_GROUPS: &[&[ToolDef]] = &[
     data::TOOLS,
     os::TOOLS,
     recording::TOOLS,
+    knowledge::TOOLS,
 ];
 
 /// Every advertised tool, in registration order.
@@ -110,6 +112,10 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub(crate) const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("knowledge_search", "collections", "array"),
+    ("knowledge_search", "limit", "integer"),
+    ("knowledge_get_passage", "chunk_id", "integer"),
+    ("knowledge_get_passage", "context", "integer"),
     ("computer_click", "x", "integer"),
     ("computer_click", "y", "integer"),
     ("computer_click", "double", "boolean"),

@@ -19,6 +19,9 @@ duduclaw-container = { workspace = true }
 duduclaw-odoo = { workspace = true }
 # §13.7 WP-D: read-only SQL data sources (db_sources.* operator RPCs).
 duduclaw-db = { workspace = true }
+# Document knowledge base (collections, ACL, keyword retrieval). The gateway
+# owns writes, the ingest worker and the routes.
+duduclaw-knowledge = { workspace = true }
 duduclaw-identity = { workspace = true }
 # `ner` is default-on in the redaction crate; named explicitly here because
 # the gateway HARD-REQUIRES it — `redaction_ner_model.rs` (the

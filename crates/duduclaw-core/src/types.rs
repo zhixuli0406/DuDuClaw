@@ -3605,6 +3605,10 @@ pub struct AgentConfig {
     /// `agent_update` round-trip cannot drop the section.
     #[serde(default, skip_serializing_if = "TeamConfig::is_default")]
     pub team: TeamConfig,
+    /// `[knowledge]` — which document-knowledge collections this employee
+    /// uses (narrowing only); see [`crate::knowledge_agent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<crate::knowledge_agent::KnowledgeAgentConfig>,
 }
 
 /// How the system prompt is assembled.
