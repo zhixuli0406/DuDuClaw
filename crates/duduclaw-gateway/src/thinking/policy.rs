@@ -10,11 +10,14 @@
 //! `agent.toml [model] show_thinking` narrows it per employee
 //! ([`duduclaw_core::show_thinking`]); the stricter value wins.
 //!
-//! Text is only ever produced for a signed-in dashboard WebChat viewer.
-//! External channels and other sessions get [`SinkLevel::Signal`] (text-less
-//! events, used only so the interim status line can say "thinking"). Public
-//! visitors (Odoo Live Chat) get no sink at all, and WebChat widget visitors
-//! are held at `Signal` here and dropped again by the WebChat socket.
+//! Text is only ever produced for a signed-in dashboard WebChat viewer, or
+//! for a messaging-app sender allowed to read summaries
+//! ([`super::channel_policy`], resolved only when the channel installed a
+//! presenter — see [`channel_policy_for`]). Other external channel turns and
+//! other sessions get [`SinkLevel::Signal`] (text-less events, used only so
+//! the interim status line can say "thinking"). Public visitors (Odoo Live
+//! Chat) get no sink at all, and WebChat widget visitors are held at
+//! `Signal` here and dropped again by the WebChat socket.
 
 use std::path::Path;
 
@@ -217,6 +220,23 @@ pub fn resolve(
         max_chars: cfg.max_chars,
         anthropic_display: cfg.anthropic_display,
     })
+}
+
+/// The sink policy for a messaging-app turn whose sender may see `show`:
+/// `summary` ⇒ masked text (the presenter shows it), `status` ⇒ text-less
+/// events narrowed per answering employee, `off` ⇒ the text-less signal the
+/// interim line uses (as before messaging-app display existed).
+pub fn channel_policy_for(home: &Path, show: ShowThinking) -> ThinkingPolicy {
+    let cfg = ThinkingConfig::from_home(home);
+    ThinkingPolicy {
+        level: match show {
+            ShowThinking::Summary => SinkLevel::Summary,
+            ShowThinking::Status => SinkLevel::Status,
+            ShowThinking::Off => SinkLevel::Signal,
+        },
+        max_chars: cfg.max_chars,
+        anthropic_display: cfg.anthropic_display,
+    }
 }
 
 /// The most one employee allows to be shown, failing closed: a missing

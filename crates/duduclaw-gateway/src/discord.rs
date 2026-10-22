@@ -1919,6 +1919,19 @@ async fn handle_message_create(
     let cleanup_http = http.clone();
     let cleanup_token = token.to_string();
     let cleanup_channel = reply_channel_id.clone();
+    // Thinking display: one editable status message (spoiler summary for
+    // senders allowed to see it; mentions disabled).
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "discord",
+        !guild_id.is_empty(),
+        crate::trigger_route::texts::lang_for(&ctx.home_dir),
+        Some(Arc::new(crate::thinking::channel_surfaces::DiscordStatus {
+            http: http.clone(),
+            token: token.to_string(),
+            channel_id: reply_channel_id.clone(),
+        })),
+    );
+    let on_progress = thinking.wrap(on_progress);
 
     // ── Resolve effective agent ──
     // Per-agent bot binding wins; otherwise a guild-level `/agent` override
@@ -1981,7 +1994,7 @@ async fn handle_message_create(
                 session_id: Some(&session_id),
             })
     });
-    let guarded = crate::approval::scope_trusted_reply(target, async {
+    let guarded = thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some(agent) = &effective_agent {
             build_guarded_reply_for_agent(
                 clean_content,
@@ -2002,7 +2015,7 @@ async fn handle_message_create(
             )
             .await
         }
-    })
+    }))
     .await;
 
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
@@ -2018,6 +2031,7 @@ async fn handle_message_create(
             http: http.clone(),
         };
         if !guarded.still_valid().await {
+            thinking.abandon().await;
             return;
         }
         crate::channel_reply::deliver_documents_for_reply_guarded(
@@ -2033,8 +2047,11 @@ async fn handle_message_create(
     // ── Guard: don't send empty replies (Discord rejects empty content) ──
     if reply.trim().is_empty() {
         warn!(channel_id, "Discord: reply is empty — skipping send");
+        thinking.abandon().await;
         return;
     }
+    // The thinking status becomes "思考了 N 秒" (+ spoiler) above the answer.
+    let _ = thinking.finish().await;
 
     // ── Send reply with embed + buttons (respecting per-guild response_mode) ──
     let response_mode = channel_format::ResponseMode::parse(

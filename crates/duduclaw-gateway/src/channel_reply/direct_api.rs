@@ -122,9 +122,21 @@ pub(super) async fn try_operator_direct_api_tool_loop(
     }
 
     let auth = duduclaw_llm::ApiAuth::new(api_key.to_string());
-    let provider = duduclaw_llm::providers::AnthropicProvider::new(auth);
+    // Thinking display: a read-only tap reports each round's thinking blocks
+    // after the fact (summaries, omitted, redacted); the parts the loop
+    // replays — signatures and redacted data included — are untouched.
+    let provider = crate::thinking::llm_tap::ReasoningTap::new(
+        duduclaw_llm::providers::AnthropicProvider::new(auth),
+        "anthropic_api",
+        crate::thinking::ThinkingKind::Summary,
+        false,
+    );
 
-    let req = build_operator_tool_chat_request(model, system_prompt, user_prompt, tools);
+    let mut req = build_operator_tool_chat_request(model, system_prompt, user_prompt, tools);
+    // Ask for a thinking summary only when this turn's viewer reads thinking
+    // text; the provider attaches it only to a model that thinks anyway.
+    // `None` ⇒ the request body is unchanged.
+    req.thinking_display = crate::thinking::policy().requested_display();
 
     // Fail-closed capability filter already ran above; this is the static
     // PolicyKernel layer (complete mediation, I3) every other tool-loop

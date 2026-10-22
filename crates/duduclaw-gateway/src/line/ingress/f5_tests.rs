@@ -272,3 +272,93 @@ async fn a_pending_event_from_before_a_long_outage_is_held_not_adopted() {
     assert_eq!(row.status, "quarantined");
     assert_eq!(row.reason.as_deref(), Some("snapshot_unavailable"));
 }
+
+// ── Thinking footer: only inside the Reply call, never in a Push ──
+
+fn thinking_extra() -> serde_json::Value {
+    serde_json::json!({"type": "text", "text": "💭 思考了 3 秒"})
+}
+
+/// Run `deliver_with_reply_extra` for a dispatching row with the given token
+/// deadline (unix s) and return every captured request body.
+async fn deliver_answer_with_footer(
+    provider: &TestChannelProvider,
+    id: &str,
+    token_deadline: i64,
+) -> (bool, Vec<crate::test_channel_provider::CapturedRequest>) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fixture_in(dir.path(), &provider.token, "").await;
+    let (binding, _event) = dispatching_binding(&state, id).await;
+    let ledger = Arc::new(delivery::ProgressLedger::default());
+    let answer = vec![serde_json::json!({"type": "text", "text": "答案"})];
+    let delivered = RUN
+        .scope(
+            std::cell::RefCell::new(delivery::RunReceipt::new(
+                token_deadline,
+                LateReply::Push,
+                false,
+            )),
+            PROGRESS.scope(
+                ledger,
+                INGRESS_BINDING.scope(
+                    binding,
+                    deliver_with_reply_extra(
+                        &state.http,
+                        &provider.token,
+                        "reply-token",
+                        answer,
+                        Some(thinking_extra()),
+                    ),
+                ),
+            ),
+        )
+        .await;
+    (delivered, provider.requests())
+}
+
+fn carries_footer(body: &serde_json::Value) -> bool {
+    body["messages"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|x| x == &thinking_extra()))
+}
+
+#[tokio::test]
+async fn thinking_footer_rides_in_the_reply_call_first() {
+    let provider = TestChannelProvider::start().await;
+    let (ok, reqs) =
+        deliver_answer_with_footer(&provider, "foot-reply", chrono::Utc::now().timestamp() + 60).await;
+    assert!(ok);
+    let replies: Vec<_> = reqs.iter().filter(|r| r.path.ends_with("/message/reply")).collect();
+    assert_eq!(replies.len(), 1, "{reqs:?}");
+    assert_eq!(replies[0].body["messages"][0], thinking_extra());
+    assert_eq!(replies[0].body["messages"][1]["text"], "答案");
+    assert!(!reqs.iter().any(|r| r.path.ends_with("/message/push")));
+}
+
+#[tokio::test]
+async fn expired_reply_token_pushes_the_answer_without_the_thinking_footer() {
+    let provider = TestChannelProvider::start().await;
+    let (ok, reqs) =
+        deliver_answer_with_footer(&provider, "foot-late", chrono::Utc::now().timestamp() - 1).await;
+    assert!(ok, "{reqs:?}");
+    assert!(!reqs.iter().any(|r| r.path.ends_with("/message/reply")), "{reqs:?}");
+    let pushes: Vec<_> = reqs.iter().filter(|r| r.path.ends_with("/message/push")).collect();
+    assert_eq!(pushes.len(), 1, "{reqs:?}");
+    assert!(!carries_footer(&pushes[0].body), "{:?}", pushes[0].body);
+    assert_eq!(pushes[0].body["messages"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn refused_reply_token_pushes_the_answer_without_the_thinking_footer() {
+    let provider = TestChannelProvider::start().await;
+    invalid_token(&provider);
+    let (ok, reqs) =
+        deliver_answer_with_footer(&provider, "foot-refused", chrono::Utc::now().timestamp() + 60).await;
+    assert!(ok, "{reqs:?}");
+    let reply = reqs.iter().find(|r| r.path.ends_with("/message/reply")).unwrap();
+    assert!(carries_footer(&reply.body), "the refused Reply call carried it");
+    let pushes: Vec<_> = reqs.iter().filter(|r| r.path.ends_with("/message/push")).collect();
+    assert_eq!(pushes.len(), 1, "{reqs:?}");
+    assert!(!carries_footer(&pushes[0].body), "{:?}", pushes[0].body);
+    assert_eq!(pushes[0].body["messages"].as_array().unwrap().len(), 1);
+}

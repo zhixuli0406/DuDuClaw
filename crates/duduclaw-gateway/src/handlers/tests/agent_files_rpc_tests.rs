@@ -5,21 +5,21 @@
 use super::*;
 use crate::agent_files::review::test_seam;
 
-fn ok(frame: &WsFrame) -> Value {
+pub(super) fn ok(frame: &WsFrame) -> Value {
     match frame {
         WsFrame::Response { ok: true, payload: Some(p), .. } => p.clone(),
         other => panic!("expected ok, got {other:?}"),
     }
 }
 
-fn err(frame: &WsFrame) -> String {
+pub(super) fn err(frame: &WsFrame) -> String {
     match frame {
         WsFrame::Response { ok: false, error: Some(e), .. } => e.as_str().unwrap_or_default().to_string(),
         other => panic!("expected error, got {other:?}"),
     }
 }
 
-fn audit_rows(home: &Path, event: &str) -> Vec<Value> {
+pub(super) fn audit_rows(home: &Path, event: &str) -> Vec<Value> {
     std::fs::read_to_string(home.join("security_audit.jsonl"))
         .unwrap_or_default()
         .lines()
@@ -34,7 +34,7 @@ fn fake_discord_token() -> String {
     [&"MTIzNDU2Nzg5MDEyMzQ1Njc4", "AbCdEf", "x".repeat(27).as_str()].join(".")
 }
 
-const PASS: &str = r#"{"verdict":"pass","summary_zh":"沒有問題","findings":[]}"#;
+pub(super) const PASS: &str = r#"{"verdict":"pass","summary_zh":"沒有問題","findings":[]}"#;
 
 /// The session snapshot a JWT would carry.
 fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
@@ -49,19 +49,19 @@ fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext 
     }
 }
 
-struct Fx {
+pub(super) struct Fx {
     _dir: tempfile::TempDir,
-    home: PathBuf,
-    h: MethodHandler,
-    admin: UserContext,
-    owner_a: UserContext,
-    owner_b: UserContext,
-    operator: UserContext,
-    viewer: UserContext,
+    pub(super) home: PathBuf,
+    pub(super) h: MethodHandler,
+    pub(super) admin: UserContext,
+    pub(super) owner_a: UserContext,
+    pub(super) owner_b: UserContext,
+    pub(super) operator: UserContext,
+    pub(super) viewer: UserContext,
 }
 
 /// Agents a1 / b1 and five dashboard accounts in `users.db`.
-async fn fixture() -> Fx {
+pub(super) async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
     let h = MethodHandler::new(home.clone()).await;
@@ -92,15 +92,15 @@ async fn fixture() -> Fx {
 impl Fx {
     /// Boxed: debug builds keep every awaited `handle` future's state, and a
     /// test with many of them overflows the test thread's stack otherwise.
-    async fn call(&self, method: &str, params: Value, who: &UserContext) -> WsFrame {
+    pub(super) async fn call(&self, method: &str, params: Value, who: &UserContext) -> WsFrame {
         Box::pin(self.h.handle(method, params, who)).await
     }
 
-    async fn get(&self, who: &UserContext, file: &str) -> Value {
+    pub(super) async fn get(&self, who: &UserContext, file: &str) -> Value {
         ok(&self.call("agent_files.get", json!({ "agent_id": "a1", "file": file }), who).await)
     }
 
-    async fn save(&self, who: &UserContext, file: &str, content: &str, extra: Value) -> WsFrame {
+    pub(super) async fn save(&self, who: &UserContext, file: &str, content: &str, extra: Value) -> WsFrame {
         let base = self.get(&self.admin, file).await["hash"].as_str().unwrap().to_string();
         let mut p = json!({ "agent_id": "a1", "file": file, "content": content, "base_hash": base });
         if let (Some(o), Some(e)) = (p.as_object_mut(), extra.as_object()) {
@@ -109,11 +109,11 @@ impl Fx {
         self.call("agent_files.save", p, who).await
     }
 
-    fn soul(&self) -> String {
+    pub(super) fn soul(&self) -> String {
         std::fs::read_to_string(self.home.join("agents/a1/SOUL.md")).unwrap_or_default()
     }
 
-    fn drift(&self) -> duduclaw_security::soul_guard::DocDrift {
+    pub(super) fn drift(&self) -> duduclaw_security::soul_guard::DocDrift {
         duduclaw_security::soul_guard::doc_drift(duduclaw_security::soul_guard::ProtectedDoc::Soul, &self.home.join("agents/a1"))
     }
 }
@@ -126,7 +126,9 @@ async fn reads_need_a_binding_and_writes_need_owner() {
     test_seam::set(&f.home, |_| Ok(PASS.into()));
     let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.viewer).await);
     let files: Vec<&str> = list["files"].as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap()).collect();
-    assert_eq!(files, vec!["soul", "identity", "instructions", "contract", "agent_toml"]);
+    // The five fixed files first; the employee's own skill files follow.
+    assert_eq!(files[..5], ["soul", "identity", "instructions", "contract", "agent_toml"]);
+    assert!(files[5..].iter().all(|f| f.starts_with("skill:")), "{files:?}");
     assert!(list["files"].as_array().unwrap().iter().all(|x| x["editable_by_me"] == false));
     let mine = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.owner_a).await);
     assert_eq!(mine["files"][0]["editable_by_me"], true);

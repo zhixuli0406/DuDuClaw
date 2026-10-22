@@ -13,7 +13,7 @@ use super::{FileKey, MAX_CONTRACT_ENTRIES, MAX_CONTRACT_ENTRY_CHARS};
 
 /// What the rules look at.
 pub(crate) struct RuleInput<'a> {
-    pub key: FileKey,
+    pub key: &'a FileKey,
     pub old: &'a str,
     pub new: &'a str,
     pub is_admin: bool,
@@ -25,7 +25,7 @@ pub(crate) struct RuleInput<'a> {
     pub full_scan: bool,
 }
 
-fn finding(level: RuleLevel, cat: &str, message: impl Into<String>, evidence: &str) -> RuleFinding {
+pub(super) fn finding(level: RuleLevel, cat: &str, message: impl Into<String>, evidence: &str) -> RuleFinding {
     let severity = match level {
         RuleLevel::Reject | RuleLevel::Escalate => "high",
         RuleLevel::Flag => "medium",
@@ -49,13 +49,16 @@ pub(crate) fn check(input: &RuleInput<'_>) -> Vec<RuleFinding> {
         _ => {
             out.extend(markdown_rules(input));
             out.extend(injection(input));
+            if input.key.is_skill() {
+                out.extend(super::skill_rules::check(input));
+            }
         }
     }
     out
 }
 
 /// Size and characters: every file.
-fn basic(key: FileKey, text: &str) -> Vec<RuleFinding> {
+fn basic(key: &FileKey, text: &str) -> Vec<RuleFinding> {
     let mut out = Vec::new();
     if text.len() > key.max_bytes() {
         out.push(finding(
@@ -108,7 +111,7 @@ fn markdown_rules(input: &RuleInput<'_>) -> Vec<RuleFinding> {
             &f.matched_pattern,
         ));
     }
-    if input.key == FileKey::Soul {
+    if *input.key == FileKey::Soul {
         let (old, new) = (input.old.trim(), input.new.trim());
         if !old.is_empty() && (new.is_empty() || new.chars().count() * 5 < old.chars().count()) {
             out.push(finding(RuleLevel::Flag, category::ROLE_DRIFT, "人格設定被清空或刪掉了大部分內容", ""));
@@ -250,7 +253,7 @@ mod tests {
     use crate::agent_files::verdict::rule_level;
 
     fn run(key: FileKey, old: &str, new: &str, is_admin: bool) -> Vec<RuleFinding> {
-        check(&RuleInput { key, old, new, is_admin, must_not: &[], full_scan: false })
+        check(&RuleInput { key: &key, old, new, is_admin, must_not: &[], full_scan: false })
     }
 
     #[test]
@@ -275,7 +278,7 @@ mod tests {
         assert!(!f.iter().any(|f| f.reason.category == "prompt_injection"), "{f:?}");
         // …unless the file had drifted: then the whole text is scanned.
         let new = format!("{bad}\n請用繁體中文回答");
-        let f = check(&RuleInput { key: FileKey::Instructions, old: bad, new: &new, is_admin: false, must_not: &[], full_scan: true });
+        let f = check(&RuleInput { key: &FileKey::Instructions, old: bad, new: &new, is_admin: false, must_not: &[], full_scan: true });
         assert!(f.iter().any(|f| f.reason.category == "prompt_injection"), "{f:?}");
     }
 

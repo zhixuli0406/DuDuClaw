@@ -21,6 +21,18 @@ use tracing::{debug, info, warn};
 // Types
 // ---------------------------------------------------------------------------
 
+tokio::task_local! {
+    /// Set by a producer that had to estimate a call's usage (a streamed
+    /// response without a usage chunk); read by the runtime dispatcher when it
+    /// records the call (`usage_estimated` column).
+    pub static USAGE_ESTIMATED: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Flag the current runtime call's usage as estimated (no-op outside one).
+pub fn mark_usage_estimated() {
+    let _ = USAGE_ESTIMATED.try_with(|f| f.store(true, std::sync::atomic::Ordering::Relaxed));
+}
+
 /// Raw token usage extracted from Claude CLI `stream-json` result events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -551,6 +563,19 @@ impl CostTelemetry {
             }
         }
 
+        // Thinking display (2026-10): a streamed openai-compat call whose
+        // provider sent no usage chunk is recorded from a token estimate and
+        // flagged here (1), never silently as 0. Same idempotent pattern.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE token_usage ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("token_usage usage_estimated migration failed: {e}"));
+            }
+        }
+
         // A1-3 ledger (2026-09-30): per-round cost attribution for goal-loop
         // dispatches (`crate::runtime::GOAL_ROUND_ATTRIBUTION`). Nullable,
         // additive; same "duplicate column name" ignore pattern as above.
@@ -582,6 +607,33 @@ impl CostTelemetry {
     /// Record a single API call's token usage (no user/channel attribution).
     /// Thin wrapper over [`Self::record_attributed`] for callers that don't have
     /// a human user (sub-agent dispatch, evolution, utility calls).
+    /// [`Self::record`] or [`Self::record_team_role`] for usage that was
+    /// estimated rather than reported by the provider (`usage_estimated`
+    /// column = 1).
+    pub async fn record_estimated(
+        &self,
+        agent_id: &str,
+        request_type: RequestType,
+        model: &str,
+        usage: &TokenUsage,
+        role: Option<(&str, &str)>,
+    ) {
+        let attribution = crate::runtime::ROLE_COST_ATTRIBUTION
+            .try_with(Clone::clone)
+            .ok();
+        let (role, episode) = match role {
+            Some((r, e)) => (Some(r), Some(e)),
+            None => (
+                attribution.as_ref().map(|a| a.role),
+                attribution.as_ref().map(|a| a.episode_id.as_str()),
+            ),
+        };
+        self.record_with_role(
+            agent_id, request_type, model, usage, None, None, false, "", role, episode, true,
+        )
+        .await;
+    }
+
     pub async fn record(
         &self,
         agent_id: &str,
@@ -603,6 +655,7 @@ impl CostTelemetry {
             "",
             attribution.as_ref().map(|a| a.role),
             attribution.as_ref().map(|a| a.episode_id.as_str()),
+            false,
         )
         .await;
     }
@@ -663,6 +716,7 @@ impl CostTelemetry {
             stages,
             None,
             None,
+            false,
         )
         .await;
     }
@@ -690,6 +744,7 @@ impl CostTelemetry {
             "",
             Some(role),
             Some(episode_id),
+            false,
         )
         .await;
     }
@@ -707,6 +762,7 @@ impl CostTelemetry {
         stages: &str,
         role: Option<&str>,
         episode_id: Option<&str>,
+        usage_estimated: bool,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         // A1-3 ledger: a goal-loop dispatch carries its task id / round in a
@@ -746,8 +802,8 @@ impl CostTelemetry {
              (agent_id, request_type, model, input_tokens, cache_read_tokens,
               cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
               cache_hit_rate, cache_savings_millicents, created_at, user_id, channel,
-              compressed, compression_stages, role, episode_id, round)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+              compressed, compression_stages, role, episode_id, round, usage_estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 agent_id,
                 request_type.as_str(),
@@ -768,6 +824,7 @@ impl CostTelemetry {
                 role,
                 episode_id,
                 round,
+                usage_estimated as i64,
             ],
         );
         drop(conn);
@@ -2026,6 +2083,33 @@ mod tests {
         let records = telemetry.recent_records(1).await.unwrap();
         assert!(!records[0].compressed);
         assert_eq!(records[0].compression_stages, "");
+    }
+
+    #[tokio::test]
+    async fn estimated_usage_is_flagged_and_measured_usage_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("est.db")).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 3,
+        };
+        telemetry
+            .record("agent_m", RequestType::Chat, "deepseek-v3.2", &usage)
+            .await;
+        telemetry
+            .record_estimated("agent_e", RequestType::Chat, "deepseek-v3.2", &usage, None)
+            .await;
+        let conn = telemetry.conn.lock().await;
+        let flags: Vec<(String, i64)> = conn
+            .prepare("SELECT agent_id, usage_estimated FROM token_usage ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(flags, [("agent_m".to_string(), 0), ("agent_e".to_string(), 1)]);
     }
 
     // The two wp5 cache-break tests snapshot the same process-global metrics
