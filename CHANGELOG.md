@@ -4,6 +4,7 @@
 
 ### Added
 
+- 容器瀏覽器新增主管遮罩觀看頁面 `/computer/<員工>`。僅限目前報告線下、真人回合啟動且在本次觀看窗口內的工作階段；背景身分不能借用真人來源。權限撤銷會清除舊圖，暫停容器只回舊快照、不喚醒。觀看與停止綁定工作階段，舊確認不能停止替換後的新階段；完整控制仍依原直接綁定授權。受控 Docker／Chrome 已驗證遮罩、撤權、暫停快取與 390px；真服務商、各平台與使用者親測仍分開記錄。見 `docs/guides/browser-watch.md` 與 `wiki/impl/team-browser-acceptance.md`。
 - **未發布，驗證中**：容器瀏覽器可選擇保存登入狀態。全域與員工開關預設關閉，正常結束時只封存 Cookies／Local Storage／IndexedDB，加密綁定員工實例，主機不解開封存檔。白名單縮小、換負責人、刪除／封存員工時清除；電腦分頁可查看與清除。RED／緊急停止不保存，注入暫停後須有接手權限的人明確選擇保留。匯出與備份排除登入快照。已完成 12,799 項 Rust 測試、封存 helper 6 項測試、dashboard 62 項測試與建置。真實 gateway 容器流程另外抓到設定解析與輸入管線問題，修正後完成合成 Cookie 保存、重開還原及清除；修正後 14 項相關 Rust 回歸也通過。最終原生儀表板與真網站帳號仍待驗證，分層證據見 `wiki/impl/browser-profile-acceptance.md`。
 - AI 員工專屬通道：員工頁「整合」分頁多了「專屬通道」區塊，可以讓一位員工用自己的 Telegram Bot 和自己的 Google Chat 應用程式對外說話，不用重新啟動。沒設定的員工照舊走共用通道。設定步驟見 `docs/guides/per-employee-channels.md`（三語）。
   - **Telegram**：貼上 BotFather 的 Token 按「連線」。存檔前先用 `getMe` 問 Telegram，被拒絕的 Token 不會存；當下連不到 Telegram 時先存、Bot 自己重試。卡片顯示「已連線，Bot 是 @xxx」或沒連上的原因（Token 被撤銷會顯示「Bot Token 無效」）。存檔只重啟這位員工的 Bot，其他 Bot 不受影響（以前每次存檔都把所有 Bot 重啟一輪）。

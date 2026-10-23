@@ -113,7 +113,7 @@ export function ComputerWatchPanel({ agentId, expectedSession, onExpired }: {
   return <section className="mx-auto w-full max-w-[1440px] space-y-4 p-4 sm:p-6" aria-label={t('title')}>
     <header className="flex flex-wrap items-start justify-between gap-4 border-b pb-4">
       <div className="min-w-0 space-y-1">
-        <h2 className="flex items-center gap-2 font-medium"><Eye className="size-4" aria-hidden="true" />{t('title')}</h2>
+        <h2 className="flex flex-wrap items-center gap-2 font-medium"><Eye className="size-4" aria-hidden="true" />{t('title')}<span className="min-w-0 break-all font-mono text-xs text-muted-foreground">· {agentId}</span></h2>
         <p className="max-w-2xl text-sm text-muted-foreground">{t('notice')}</p>
       </div>
       {status?.active && (confirm ? <div className="flex flex-wrap items-center gap-2">
