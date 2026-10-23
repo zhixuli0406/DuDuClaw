@@ -289,7 +289,8 @@ impl GoalLoopDriver {
         let iter = u32::try_from(intent.iter).unwrap_or(u32::MAX);
         if self.queue.get_by_id(&intent.intent_id).await?.is_none() {
             crate::responsibility::test_hooks::pause_point("before_enqueue", &task.id).await;
-            let mut payload = enqueue::build_goal_payload(task, iter, state_text);
+            let assigner = enqueue::assigner_label(&self.home_dir, task);
+            let mut payload = enqueue::build_goal_payload(task, iter, state_text, assigner.as_deref());
             payload.push_str(&crate::responsibility::steering::render_block(&steering));
             let msg = enqueue::goal_queue_message(intent.intent_id.clone(), task, payload);
             self.queue.enqueue(&msg).await?;

@@ -261,7 +261,8 @@ pub(crate) async fn enqueue_goal_work(
     iter: u32,
     state_text: &str,
 ) -> Result<String, String> {
-    let payload = build_goal_payload(task, iter, state_text);
+    let assigner = store.home_dir().and_then(|home| assigner_label(home, task));
+    let payload = build_goal_payload(task, iter, state_text, assigner.as_deref());
     let msg = goal_queue_message(uuid::Uuid::new_v4().to_string(), task, payload);
     let result = queue.enqueue(&msg).await.map(|()| msg.id.clone());
     // I-1c: the plan has now been injected into this round's payload —
@@ -292,7 +293,12 @@ pub(super) async fn clear_consumed_plan(store: &Arc<TaskStore>, task: &TaskRow) 
 
 /// The work payload of one goal round (P2-A: shared by the random-id rail
 /// above and the fixed-id durable rail, so the text is one implementation).
-pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) -> String {
+pub(super) fn build_goal_payload(
+    task: &TaskRow,
+    iter: u32,
+    state_text: &str,
+    assigner: Option<&str>,
+) -> String {
     let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
     // I-3a: a task continued from `done`/`failed`/`cancelled` via the
     // dashboard's "接著做" action stamps `judge_feedback` with
@@ -355,11 +361,16 @@ pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) ->
     // reads this the same way, and the self-report marker is parsed by
     // `goal_state::parse_state_update` regardless of which runtime
     // produced it.
+    // The person who handed the task over (chat `/交辦`, dashboard), by name
+    // only — never an account id.
+    let assigner_block = assigner
+        .map(|who| format!("\n• 交辦人: {who}"))
+        .unwrap_or_default();
     let payload = format!(
         "{marker} 你有一個自主目標任務要推進:\n\
              • Task ID: {}\n\
              • 標題: {}\n\
-             • 說明: {}{criteria_block}\n\n\
+             • 說明: {}{assigner_block}{criteria_block}\n\n\
              {state_text}\n\n\
              若你在推進過程中形成了新的『待驗證假設』,請在回覆最後附上下列標記(純文字,任何 \
              AI 執行環境皆可產出;省略此標記則系統會沿用上一輪的假設清單,絕不自行臆測):\n\
@@ -371,6 +382,51 @@ pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) ->
         task.id, task.title, task.description,
     );
     payload
+}
+
+/// "王小明（業務部）" for a task handed over by a dashboard account
+/// (`on_behalf_of = user:<id>`), read from `users.db`. `None` when the task
+/// names nobody or the account cannot be read (the prompt then has no
+/// assigner line; an id never stands in for the name).
+pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<String> {
+    let user_id = task.on_behalf_of.as_deref()?.strip_prefix("user:")?;
+    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
+    let user = db.get_user(user_id).ok().flatten()?;
+    // One line of plain text: control characters (a newline could start a
+    // fake instruction block), line/paragraph separators, bidi controls and
+    // zero-width characters are dropped.
+    let clean = |s: &str| -> String {
+        let s: String = s.chars().filter(|&c| !is_hidden_or_breaking(c)).collect();
+        duduclaw_core::truncate_chars(s.trim(), 40).to_string()
+    };
+    let name = clean(&user.display_name);
+    if name.is_empty() {
+        return None;
+    }
+    let dept = user.department.as_deref().map(clean).filter(|d| !d.is_empty());
+    Some(match dept {
+        Some(dept) => format!("{name}（{dept}）"),
+        None => name,
+    })
+}
+
+/// Characters a one-line display name must not carry: C0/C1 controls,
+/// U+2028/U+2029, bidi embeddings, overrides and isolates (U+202A–U+202E,
+/// U+2066–U+2069, U+200E/U+200F, U+061C), zero-width characters
+/// (U+200B–U+200D, U+2060, U+FEFF) and the soft hyphen.
+fn is_hidden_or_breaking(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{061C}'
+                | '\u{2060}'
+                | '\u{FEFF}'
+                | '\u{00AD}'
+        )
 }
 
 /// The queue row of one goal round with the given message id.
@@ -403,5 +459,18 @@ pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) ->
         // P2-B: a goal round carries no upstream channel turn to lose.
         upstream_unknown: false,
         lane: None,
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::is_hidden_or_breaking;
+
+    #[test]
+    fn display_names_lose_breaks_bidi_and_zero_width_characters() {
+        let raw = "陳\u{2028}經\u{202E}理\u{2066}\u{200B}\u{FEFF}\n（業務）";
+        let clean: String = raw.chars().filter(|&c| !is_hidden_or_breaking(c)).collect();
+        assert_eq!(clean, "陳經理（業務）");
+        assert!(!is_hidden_or_breaking('A') && !is_hidden_or_breaking('（'));
     }
 }

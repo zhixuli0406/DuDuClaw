@@ -131,6 +131,7 @@ pub use config::{
     baseline_boundary, effective_risk_boundary, pause_inflight_on_restart, review_wip_limit,
 };
 pub(crate) use config::{DeadlineHit, derive_goal_kind, no_progress_minutes, resolve_deadline_hit};
+pub(crate) use config::{CHAT_ASSIGN_WINDOW_MINUTES, chat_assign_caps};
 // `enqueue_goal_work` keeps its `goal_loop::` path (it is `pub(crate)`), but the
 // only caller today is the test module, so the binding is test-gated to stay
 // warning-free in a release build.

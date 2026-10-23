@@ -378,6 +378,11 @@ impl TaskStore {
                 "authority_revision",
                 "authority_revision INTEGER NOT NULL DEFAULT 1 CHECK(authority_revision >= 1)",
             ),
+            // Chat assignment (2026-10): who a person handed the task over
+            // for and where. Nullable, never backfilled — every older row
+            // reads back as "not assigned by a person".
+            ("on_behalf_of", "on_behalf_of TEXT"),
+            ("created_via", "created_via TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -402,6 +407,14 @@ impl TaskStore {
             [],
         )
         .map_err(|e| format!("create idx_tasks_archived: {e}"))?;
+        // "Tasks I assigned" (`/交辦 狀態`, `tasks.list_page on_behalf_of`):
+        // a partial index, so the many rows without a principal cost nothing.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_on_behalf_of ON tasks(on_behalf_of, updated_at) \
+             WHERE on_behalf_of IS NOT NULL",
+            [],
+        )
+        .map_err(|e| format!("create idx_tasks_on_behalf_of: {e}"))?;
         Ok(())
     }
 

@@ -720,13 +720,14 @@ async fn handle_event(
             // Real per-channel admin status (fail-closed) — never hardcoded.
             let is_admin =
                 crate::channel_reply::is_channel_admin(ctx, "slack", &[user, &session_id]).await;
-            let reply = crate::chat_commands::handle_command(
+            let caller = crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "slack", user);
+            let reply = crate::chat_commands::handle_command_with_caller(
                 &cmd,
                 ctx,
                 &session_id,
                 &agent_id,
                 is_admin,
-                user,
+                &caller,
             )
             .await;
             send_message(
@@ -1175,13 +1176,15 @@ async fn handle_slash_command_envelope(
                 let is_admin =
                     crate::channel_reply::is_channel_admin(ctx, "slack", &[user_id, &session_id])
                         .await;
-                let reply = crate::chat_commands::handle_command(
+                let caller =
+                    crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "slack", user_id);
+                let reply = crate::chat_commands::handle_command_with_caller(
                     &cmd,
                     ctx,
                     &session_id,
                     &agent_id,
                     is_admin,
-                    user_id,
+                    &caller,
                 )
                 .await;
                 respond_via_response_url(http, response_url, "ephemeral", &reply).await;

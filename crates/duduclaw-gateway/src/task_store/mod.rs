@@ -22,7 +22,8 @@ pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority,
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
      pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
-     discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision";
+     discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision, \
+     on_behalf_of, created_via";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -47,6 +48,7 @@ pub(crate) use discovery::DiscoveryDecisionReceipt;
 mod goals;
 mod iterations;
 mod plans;
+mod principal;
 mod pure;
 mod resp_occurrence;
 mod resp_schema;
@@ -74,6 +76,7 @@ pub use responsibility::ResponsibilityContract;
 pub use steering::{DurableInfo, IntentBegin, NewSteering, SteeringSubmit};
 pub use stop::StopTreeOutcome;
 pub use plans::plan_order_for_insert;
+pub use principal::ACTIVE_STATUSES;
 pub use pure::{
     deps_satisfied, introduces_dependency_cycle, introduces_parent_cycle, lease_is_expired,
     parse_depends_on, zombie_action, zombie_reclaim_due,
@@ -355,6 +358,17 @@ pub struct TaskRow {
     /// own typed shape.
     #[serde(default, skip_serializing)]
     pub criteria_ledger: Option<String>,
+    /// The person a task was handed over for (`user:<dashboard account id>`),
+    /// written by the gateway when a person assigns work (`/交辦` in a
+    /// chat, the dashboard). Never taken from request input or tool
+    /// arguments. `None` for every row written before this column existed
+    /// and for work an employee or the system created on its own.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// Where that person assigned it (`line`, `webchat`, `telegram`,
+    /// `dashboard`, …). `None` when `on_behalf_of` is `None`.
+    #[serde(default)]
+    pub created_via: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -427,6 +441,8 @@ impl TaskRow {
             discovery_run_id: None,
             discovery_approval_id: None,
             criteria_ledger: None,
+            on_behalf_of: None,
+            created_via: None,
         }
     }
 }

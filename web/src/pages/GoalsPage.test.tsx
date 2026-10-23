@@ -316,3 +316,28 @@ it('keeps discovery tasks out of ordinary goal cards even when a legacy row has 
   expect(await screen.findByText('整理客戶月報')).toBeInTheDocument();
   expect(screen.queryByText('Must not use goal intervention')).not.toBeInTheDocument();
 });
+
+describe('GoalsPage — assigned by me', () => {
+  it('opens the "assigned by me" view from ?assigned=me and lists through on_behalf_of', async () => {
+    const mineTask = { ...goalTask, id: 'mine-1', title: '整理報價單', status: 'in_progress', on_behalf_of: 'user:u1', created_via: 'line' };
+    mockWsClient.call.mockImplementation((method: string, params?: Record<string, unknown>) => {
+      if (method === 'tasks.list_page') {
+        const isMine = params?.on_behalf_of === 'me';
+        const unfinished = !params?.status;
+        return Promise.resolve({ tasks: isMine && unfinished ? [mineTask] : [], total: isMine && unfinished ? 1 : 0, limit: 50, offset: 0 });
+      }
+      if (method === 'agents.list') return Promise.resolve({ agents: [{ name: 'agnes', display_name: 'Agnes' }] });
+      return Promise.resolve({});
+    });
+    renderGoalsAt('/goals?assigned=me');
+    expect(await screen.findByText('整理報價單')).toBeInTheDocument();
+    const calls = mockWsClient.call.mock.calls.filter(([m]) => m === 'tasks.list_page');
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, p] of calls) {
+      expect((p as Record<string, unknown>).on_behalf_of).toBe('me');
+      expect((p as Record<string, unknown>).agent_id).toBeUndefined();
+    }
+    expect(mockWsClient.call.mock.calls.some(([m]) => m === 'tasks.list')).toBe(false);
+    expect(screen.getAllByText('Assigned by me').length).toBeGreaterThan(0);
+  });
+});

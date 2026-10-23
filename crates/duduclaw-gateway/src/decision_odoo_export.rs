@@ -89,8 +89,14 @@ async fn connect_for_agent(
 
     let agent_toml_path =
         crate::outcome_spec::agent_work_dir(home_dir, agent_id).join("agent.toml");
-    let agent_raw = std::fs::read_to_string(&agent_toml_path).unwrap_or_default();
-    let agent_override = AgentOdooConfig::from_agent_toml(&agent_raw);
+    // A missing agent.toml means "no override"; any other read failure must
+    // not silently send the agent to the global server.
+    let agent_raw = match std::fs::read_to_string(&agent_toml_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err(duduclaw_odoo::ODOO_UNREADABLE.to_string()),
+    };
+    let agent_override = AgentOdooConfig::parse_agent_toml(&agent_raw)?;
     if let (Some(requested), Some(cfg)) = (profile, agent_override.as_ref()) {
         // An explicit `--profile` must name the agent's actual profile; it is
         // an assertion by the caller, not a selector that silently falls back
@@ -100,15 +106,9 @@ async fn connect_for_agent(
         }
     }
     if let Some(cfg) = agent_override.as_ref() {
-        if let Some(username) = &cfg.username {
-            config.username = username.clone();
-        }
-        if let Some(key) = &cfg.api_key_enc {
-            config.api_key_enc = key.clone();
-        }
-        if let Some(password) = &cfg.password_enc {
-            config.password_enc = password.clone();
-        }
+        // Same merge (and url/db validation) as the connector pool and
+        // `odoo.agent_test`.
+        cfg.apply_to(&mut config)?;
     }
 
     // Resolve the credential from whichever file actually supplied it, so an

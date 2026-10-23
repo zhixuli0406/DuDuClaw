@@ -53,6 +53,10 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
 - メッセージングアプリでの思考表示（専用の設定項目はなく、設定ファイルの詳細編集で設定。返信ごとに読み直します）：`[thinking] channel_audience` = `internal`（既定：チャネル ID が検証済みで、有効な dashboard アカウントが管理者または回答する社員に紐付いている送信者はタイマーと伏せ字化した要約、それ以外はタイマーのみ）、`all`（1 対 1 チャットのすべての送信者が要約を見られる）、`none`（何も表示しない）。`[thinking] channel_group_display` = `status`（既定：グループチャットはタイマーのみ）、`summary`、`off`。`[thinking] display` と回答する社員の `[model] show_thinking` のうち厳しい方が、引き続き両方の上限になります。`config.toml` が読めない、または不明な値のときは何も表示しません。Web サイトの訪問者（Odoo ライブチャット、WebChat ウィジェット）には思考は表示されません。詳しくは[メッセージングアプリでの思考表示](../../features/ja-JP/66-thinking-in-messaging-apps.md)。
 
+## 連携 → Odoo → 接続設定
+
+「社内ネットワーク上の Odoo への接続を許可」は `[odoo] allow_private_network` に書き込まれます（管理者のみ、既定はオフ。接続設定と一緒に `odoo.configure` で保存され、「接続テスト」は画面上のスイッチ値を使います）。オフの間は、Odoo の URL（全体でも従業員ごとでも）は公開ホストへの HTTPS が必須です（`http://` は `localhost` のみ）。オンにすると 192.168.x.x や 10.x.x.x などの社内アドレスに HTTPS・HTTP のどちらでも接続できます。ローカルマシン、リンクローカル、クラウドのメタデータアドレス（169.254.169.254、`metadata.google.internal`）は常に拒否され、接続は検査済みの解決結果に固定され、プロキシは使いません。アップグレード後の初回起動で、設定済みの Odoo URL が社内アドレスに解決される場合は自動でオンになり（監査イベント `odoo_allow_private_network_auto_enabled`）、既存の環境は切断されません。次回の接続から有効です。
+
 ## 連携 → Odoo → Web サイトのライブチャット
 
 専用の保存ボタンで `odoo.livechat.set`（管理者）から `[odoo_livechat]` に書き込みます。Odoo 接続の保存は `[odoo]` 全体を書き換えるため、別セクションにしています。ボットの API キーは `bot_api_key_enc` として暗号化保存され、返されません。空欄なら変更しません。保存と「AI に戻す」は監査ログに記録されます。詳細は [features/ja-JP/61-odoo-livechat.md](../../features/ja-JP/61-odoo-livechat.md)。

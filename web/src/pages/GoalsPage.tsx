@@ -56,6 +56,11 @@ const FINISHED_STATUSES = ['done', 'cancelled', 'failed', 'blocked'] as const;
 /** I-3b: page size for the 已結束／已封存 section's "load more" pagination
  *  (replaces the old client-side `.slice(0, 20)` hard cutoff). */
 const LIST_PAGE_SIZE = 20;
+/** The agent-filter value for "tasks I handed over" (`tasks.list_page`
+ *  with `on_behalf_of: 'me'`); never a real staff id (ids have no `_` lead). */
+const ASSIGNED_BY_ME = '__assigned_by_me__';
+/** Unfinished goals shown in the waiting / active sections in that view. */
+const MINE_ACTIVE_LIMIT = 200;
 
 function statusTone(status: string): string {
   switch (status) {
@@ -271,7 +276,12 @@ export function GoalsPage() {
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [agentFilter, setAgentFilter] = useState('');
+  // `/goals?assigned=me` (the WebChat task card) opens the "assigned by me" view.
+  const [agentFilter, setAgentFilter] = useState(() =>
+    searchParams.get('assigned') === 'me' ? ASSIGNED_BY_ME : '',
+  );
+  const mine = agentFilter === ASSIGNED_BY_ME;
+  const realAgent = mine ? '' : agentFilter;
   const [search, setSearch] = useState('');
   const [renameTarget, setRenameTarget] = useState<TaskInfo | null>(null);
 
@@ -297,11 +307,15 @@ export function GoalsPage() {
   // Non-admins must scope tasks.list to a bound agent (check_agent_filter) —
   // an unscoped first load would error out. `agents.list` is already
   // binding-filtered server-side, so its first entry is a valid default scope.
+  // An account with no staff of its own (a manager who only reaches a
+  // report's staff) starts on the tasks it handed over.
   useEffect(() => {
     if (!isAdmin && !agentFilter && agents.length > 0) {
       setAgentFilter(agents[0].name);
+    } else if (!isAdmin && !agentFilter && agentsLoaded && agents.length === 0) {
+      setAgentFilter(ASSIGNED_BY_ME);
     }
-  }, [isAdmin, agentFilter, agents]);
+  }, [isAdmin, agentFilter, agents, agentsLoaded]);
 
   const load = useCallback(async () => {
     if (!isAdmin && !agentFilter) {
@@ -312,10 +326,12 @@ export function GoalsPage() {
       return;
     }
     try {
-      const r = await api.tasks.list({
-        goal_mode: true,
-        ...(agentFilter ? { agent_id: agentFilter } : {}),
-      });
+      const r = mine
+        ? await api.tasks.listPage({ goal_mode: true, on_behalf_of: 'me', archived: false, limit: MINE_ACTIVE_LIMIT })
+        : await api.tasks.list({
+            goal_mode: true,
+            ...(agentFilter ? { agent_id: agentFilter } : {}),
+          });
       setTasks((r.tasks ?? []).filter((t) => t.goal_mode && t.kind !== 'discovery'));
       setLoadError(null);
     } catch (e) {
@@ -327,7 +343,7 @@ export function GoalsPage() {
     }
     // errorText stable; intl from context.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentFilter, isAdmin, agentsLoaded, agents.length]);
+  }, [agentFilter, mine, isAdmin, agentsLoaded, agents.length]);
 
   const loadList = useCallback(
     async (reset: boolean) => {
@@ -340,12 +356,17 @@ export function GoalsPage() {
         return;
       }
       (reset ? setListLoading : setListLoadingMore)(true);
+      const scope = mine
+        ? { on_behalf_of: 'me' as const }
+        : agentFilter
+          ? { agent_id: agentFilter }
+          : {};
       try {
         if (showArchived) {
           if (reset) archivedOffsetRef.current = 0;
           const r = await api.tasks.listPage({
             goal_mode: true,
-            ...(agentFilter ? { agent_id: agentFilter } : {}),
+            ...scope,
             archived: true,
             limit: LIST_PAGE_SIZE,
             offset: archivedOffsetRef.current,
@@ -366,7 +387,7 @@ export function GoalsPage() {
               api.tasks.listPage({
                 status,
                 goal_mode: true,
-                ...(agentFilter ? { agent_id: agentFilter } : {}),
+                ...scope,
                 archived: false,
                 limit: LIST_PAGE_SIZE,
                 offset: offsets[status] ?? 0,
@@ -408,7 +429,7 @@ export function GoalsPage() {
       // errorText/intl stable from context.
       // eslint-disable-next-line react-hooks/exhaustive-deps
     },
-    [agentFilter, isAdmin, showArchived],
+    [agentFilter, mine, isAdmin, showArchived],
   );
 
   useEffect(() => {
@@ -489,9 +510,11 @@ export function GoalsPage() {
     filteredList.length === 0 &&
     (tasks.length > 0 || listTasks.length > 0);
 
-  const agentLabel = agentFilter
-    ? agents.find((a) => a.name === agentFilter)?.display_name || agentFilter
-    : intl.formatMessage({ id: 'foresight.allAgents' });
+  const agentLabel = mine
+    ? intl.formatMessage({ id: 'goals.filter.assignedByMe' })
+    : agentFilter
+      ? agents.find((a) => a.name === agentFilter)?.display_name || agentFilter
+      : intl.formatMessage({ id: 'foresight.allAgents' });
 
   // Only declare "nothing here at all" once BOTH fetches have had a chance to
   // answer — otherwise an account with zero active/waiting but non-zero
@@ -520,6 +543,9 @@ export function GoalsPage() {
               {isAdmin && (
                 <SelectItem value="">{intl.formatMessage({ id: 'foresight.allAgents' })}</SelectItem>
               )}
+              {/* Tasks this account handed over (chat 「/交辦」, the dashboard),
+                  including ones for a report's AI staff. */}
+              <SelectItem value={ASSIGNED_BY_ME}>{intl.formatMessage({ id: 'goals.filter.assignedByMe' })}</SelectItem>
               {agents.map((a) => (
                 <SelectItem key={a.name} value={a.name}>
                   {a.display_name || a.name}
@@ -534,7 +560,7 @@ export function GoalsPage() {
         </div>
       </div>
 
-      <DiscoverySection agentId={agentFilter || undefined} enabled={connState === 'authenticated' && (isAdmin || !!agentFilter)} />
+      <DiscoverySection agentId={realAgent || undefined} enabled={connState === 'authenticated' && (isAdmin || !!realAgent)} />
 
       {loading || waitingForListToRuleOutEmpty ? (
         <CollectionPageState state="loading" />

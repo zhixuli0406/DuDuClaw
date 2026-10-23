@@ -80,4 +80,4 @@ A called employee answers in its own session inside the conversation (`<conversa
 
 - Discord, Slack and the other channels use the same rules, the text list and the one-shot call, but they have no buttons and no native-mention filtering. Only WebChat and LINE were tested end to end; Telegram is covered by unit tests.
 - A sender with a linked dashboard account on other channels is mapped only when the identity was verified through the channel login flow.
-- A manager hands work to team employees from the dashboard for now; a chat command for it is not built yet. On the task board a manager sees team employees' tasks as cards only.
+- Calling an employee never creates a task. To hand one over from a chat, use `/交辦 @name task` ([Assigning tasks from a chat](67-assigning-tasks.md)). On the task board a manager sees team employees' tasks as cards only, except the ones they assigned (**Goals → Assigned by me**).
