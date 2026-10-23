@@ -17,7 +17,7 @@
 //! Enterprise-only, so a Personal install refuses it before this runs, and
 //! `require_manager!` refuses an Employee.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use duduclaw_auth::org::derived_team_level;
 use duduclaw_auth::{AccessLevel, MAX_ORG_DEPTH, User, UserAgentBinding, UserContext, UserDb};
@@ -32,6 +32,35 @@ use duduclaw_agent::registry::AgentRegistry;
 /// Plain-language refusal when the team cannot be read (detail goes to the
 /// log, never to the client).
 const TEAM_UNREADABLE: &str = "目前無法讀取團隊資料，請稍後再試。";
+
+type HistoryFlags = HashMap<String, BTreeSet<String>>;
+
+/// Advisory buttons use the same live gate as actual disclosure. An audit or
+/// window failure hides every button, while the ordinary callable team remains
+/// available. All database work runs with the existing blocking team read.
+fn history_flags(home: &std::path::Path, db: &UserDb, ctx: &UserContext, members: &[Member]) -> (Option<bool>, HistoryFlags) {
+    use crate::team_oversight::{self, OversightDenied};
+    let Ok(window) = team_oversight::observe_window(home, db, "gateway") else {
+        return (None, HashMap::new());
+    };
+    if !window.enabled {
+        return (Some(false), HashMap::new());
+    }
+    let agents: BTreeSet<_> = members.iter().flat_map(|m| &m.bindings)
+        .filter(|b| ctx.can_call_agent(&b.agent_name)).map(|b| b.agent_name.clone()).collect();
+    if agents.len() > MAX_COUNTED_AGENTS {
+        return (None, HashMap::new());
+    }
+    let mut readable = HashMap::new();
+    for agent in agents {
+        match team_oversight::can_view_team_history(home, db, ctx, &agent) {
+            Ok(scope) => { readable.insert(agent, scope.reports.into_keys().collect()); }
+            Err(OversightDenied::ReadError) => return (None, HashMap::new()),
+            Err(_) => {}
+        }
+    }
+    (Some(true), readable)
+}
 
 fn level_name(level: AccessLevel) -> &'static str {
     match level {
@@ -119,6 +148,8 @@ fn agent_rows(
     bindings: &[UserAgentBinding],
     ids: &[String],
     open: Option<&HashMap<String, i64>>,
+    history: &HistoryFlags,
+    report_id: &str,
 ) -> Vec<Value> {
     let entries = trigger_route::list::callable_agents(reg, ids);
     entries
@@ -137,6 +168,7 @@ fn agent_rows(
                 "operational": operational,
                 "level": level_name(derived_team_level(binding.access_level)),
                 "assignable": operational && ctx.can_assign_to(&entry.id),
+                "history_readable": history.get(&entry.id).is_some_and(|reports| reports.contains(report_id)),
                 "active_tasks": open
                     .map(|c| json!(c.get(&entry.id).copied().unwrap_or(0)))
                     .unwrap_or(Value::Null),
@@ -152,9 +184,16 @@ impl MethodHandler {
         };
         let read = {
             let id = ctx.user_id.clone();
-            tokio::task::spawn_blocking(move || read_team(&db, &id)).await
+            let home = self.home_dir.clone();
+            let ctx = ctx.clone();
+            tokio::task::spawn_blocking(move || {
+                read_team(&db, &id).map(|(me, members)| {
+                    let (history_enabled, history) = history_flags(&home, &db, &ctx, &members);
+                    (me, members, history_enabled, history)
+                })
+            }).await
         };
-        let (me, members) = match read {
+        let (me, members, history_enabled, history) = match read {
             Ok(Ok(team)) => team,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "users.my_team: team unreadable");
@@ -188,7 +227,7 @@ impl MethodHandler {
                     "department": m.user.department,
                     "manager_user_id": m.user.manager_user_id,
                     "depth": m.depth,
-                    "agents": agent_rows(self, &reg, ctx, &m.bindings, ids, open.as_ref()),
+                    "agents": agent_rows(self, &reg, ctx, &m.bindings, ids, open.as_ref(), &history, &m.user.id),
                 })
             })
             .collect();
@@ -199,6 +238,7 @@ impl MethodHandler {
                 "manager": me,
                 "max_depth": MAX_ORG_DEPTH,
                 "members": rows,
+                "history_enabled": history_enabled,
             }),
         )
     }

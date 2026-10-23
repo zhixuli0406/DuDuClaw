@@ -1,4 +1,5 @@
 import { useIntl } from 'react-intl';
+import { Eye } from 'lucide-react';
 import { CharacterAvatar } from '@/components/character';
 import { cn } from '@/lib/utils';
 import { groupMentionCandidates, type MentionAgent, type MentionGroup } from '@/lib/mention';
@@ -98,6 +99,7 @@ export function MentionPopup({
                     >
                       <CharacterAvatar agentId={a.name} name={a.display_name} size={22} variant="avatar" animated={false} />
                       <span className="font-medium">{a.display_name}</span>
+                      {a.manager_may_read === true && <Eye className="size-3 shrink-0 text-muted-foreground" aria-label={intl.formatMessage({ id: 'teamHistory.notice' })}><title>{intl.formatMessage({ id: 'teamHistory.notice' })}</title></Eye>}
                       {subtitle && <span className="truncate text-xs text-muted-foreground">{subtitle}</span>}
                     </li>
                   );

@@ -6,7 +6,7 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 
 ## How saving works
 
-Unreleased Enterprise backend: `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). A dedicated page is not included yet. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).
+Unreleased Enterprise setting (User Management → Organisation settings): `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). Inform staff before enabling it. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).
 
 - System settings (`config.toml`) are written through `system.update_config`, which is admin-only. A page sends only the fields you changed; with no change nothing is sent and the page says "Nothing changed, so there is nothing to save."
 - The write locks the file and re-reads it. If another writer changed the file after you loaded it, the save is refused; reload and save again.

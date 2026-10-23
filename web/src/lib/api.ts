@@ -92,6 +92,8 @@ export type CallableVia = 'admin' | 'binding' | 'team' | 'default' | 'public';
  *  WebChat `@` list and staff picker. Computed on the server with the same
  *  check every message goes through, so everything listed can be called. */
 export interface CallableAgent {
+  /** True only when the caller's own conversation is visible to a manager. */
+  manager_may_read?: boolean;
   name: string;
   display_name: string;
   /** The exact `@…` text that calls this staff member. */
@@ -2255,6 +2257,8 @@ export interface UserDetail extends UserInfo {
 
 /** One AI employee a manager may call through a report (`users.my_team`). */
 export interface TeamAgent {
+  /** Server-computed advisory flag; disclosure is authorised again per read. */
+  history_readable?: boolean;
   name: string;
   display_name: string;
   /** The text that calls exactly this employee in a conversation (`@名字`). */
@@ -2286,9 +2290,46 @@ export interface TeamMember {
 }
 
 export interface MyTeam {
+  /** null = the activation window could not be read safely. */
+  history_enabled?: boolean | null;
   manager: { id: string; display_name: string } | null;
   max_depth: number;
   members: TeamMember[];
+}
+
+export type TeamHistoryClass = 'own' | 'report_webchat' | 'external';
+export type TeamHistoryPart = { t: 'text'; v: string } | { t: 'mask'; cat: string; n: number }
+  | { t: 'attachment'; kind: string; name?: string };
+export interface TeamHistorySession {
+  session_id: string;
+  class: TeamHistoryClass;
+  channel: string | null;
+  report: { user_id: string; display_name: string } | null;
+  title: string;
+  title_masked: boolean;
+  last_active: string;
+  turns: number;
+}
+export interface TeamHistoryList {
+  sessions: TeamHistorySession[];
+  next_before?: string | null;
+  ner: boolean;
+  since: string;
+}
+export interface TeamHistoryTranscript {
+  session_id: string;
+  agent_id: string;
+  class: TeamHistoryClass;
+  read_only: true;
+  ner: boolean;
+  since: string;
+  messages: Array<{ role: string; sender_label: string; parts: TeamHistoryPart[]; timestamp: string }>;
+  masked_counts: Record<string, number>;
+}
+export interface TeamHistorySettings {
+  manager_team_history: boolean;
+  since: string | null;
+  generation: number;
 }
 
 export interface AuditEntry {
@@ -8313,6 +8354,16 @@ export const api = {
     /** 我的團隊: everyone below the caller (manager+, Enterprise only) and the
      *  AI employees the caller may call through each of them. */
     myTeam: () => client.call('users.my_team') as Promise<MyTeam>,
+    teamHistory: {
+      list: (params: { agent_id: string; report_user_id?: string; class?: TeamHistoryClass; before?: string; limit?: number }) =>
+        client.call('users.team_history.list', params) as Promise<TeamHistoryList>,
+      get: (sessionId: string, limit = 200) =>
+        client.call('users.team_history.get', { session_id: sessionId, limit }) as Promise<TeamHistoryTranscript>,
+    },
+    orgSettings: {
+      get: () => client.call('users.org_settings.get') as Promise<TeamHistorySettings>,
+      update: (enabled: boolean) => client.call('users.org_settings.update', { manager_team_history: enabled }) as Promise<TeamHistorySettings>,
+    },
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,
     bindAgent: (userId: string, agentName: string, accessLevel?: string) =>

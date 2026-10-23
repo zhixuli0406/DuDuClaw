@@ -435,6 +435,7 @@ export const navGroups: NavGroup[] = [
     label: 'navGroup.org',
     items: [
       { to: '/team', icon: UsersRound, label: 'nav.myTeam', desc: 'nav.myTeam.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
+      { to: '/team/conversations', icon: MessagesSquare, label: 'nav.teamHistory', desc: 'nav.teamHistory.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
     ],
   },
 ];
