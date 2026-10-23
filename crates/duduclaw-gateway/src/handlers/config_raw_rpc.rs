@@ -495,6 +495,10 @@ fn mark_permissions_if_edited(new_text: &str, stored: &str) -> Result<String, St
 /// Validate a `config.toml` with the section validators the gateway itself
 /// applies when it reads each section.
 pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
+    if let Some(people)=table.get("people") {
+        let people=people.as_table().ok_or("[people] must be a table")?;
+        if people.get("manager_team_history").is_some_and(|v|!v.is_bool()) {return Err("people.manager_team_history must be a boolean".into());}
+    }
     crate::task_sandbox::settings::parse(table).map_err(|e| format!("[container.sandbox]: {e}"))?;
     if table.contains_key("computer_use") {
         crate::computer_use_image::parse(table).map_err(|e| format!("[computer_use]: {e}"))?;
@@ -613,6 +617,7 @@ pub(crate) fn validate_raw(file: &RawFile, text: &str) -> Result<toml::Table, St
 /// executables are refused here outright (terminal only).
 const RAW_REFUSED_KEYS: &[&str] = &["dispatch.judge_command", "evolution.eval_binary"];
 const RAW_CONFIG_SENSITIVE_KEYS: &[&str] = &[
+    "people.manager_team_history",
     "container.sandbox.when_unavailable",
     "container.sandbox.script_when_unavailable",
     "tick.allow_command_sources",
@@ -851,6 +856,33 @@ impl MethodHandler {
         if matches!(kind, RawFile::Config) {
             refuse_disclosure_ack_edit(&before, &after)?;
         }
+        // B11 L3: the raw editor follows the same one-bot / one-app rule as
+        // the dashboard bind, under the same lock.
+        let _bind = crate::agent_channels::binding_lock().await;
+        if let RawFile::Agent(id) = &kind
+            && let Some(msg) = crate::agent_channels::conflicts::raw_agent_edit_conflict(
+                &self.home_dir,
+                &self.registry,
+                id,
+                &before,
+                &after,
+            )
+            .await
+        {
+            return Err(msg.into());
+        }
+        if matches!(kind, RawFile::Config) {
+            let project = |t: &toml::Table| {
+                super::config_commit::toml_at(t, "channels.googlechat_project_number")
+                    .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+            };
+            if let Some(p) = project(&after).filter(|p| !p.is_empty() && Some(p) != project(&before).as_ref())
+                && let Some(msg) =
+                    crate::agent_channels::conflicts::shared_project_conflict(&self.registry, &p).await
+            {
+                return Err(msg.into());
+            }
+        }
         let sections = changed_sections(&before, &after);
         // A submission whose parsed content equals the stored file is a true
         // no-op (the hidden [mcp_keys] re-attached at the end, or a pure
@@ -882,6 +914,11 @@ impl MethodHandler {
             .map_err(RawSetError::Frame)?;
         }
         let protected = protected_changed(&kind, &before, &after, &sections);
+        if matches!(kind,RawFile::Config) && key_changed(&before,&after,"people.manager_team_history") {
+            if let Some(db)=self.user_db.read().await.as_ref() {
+                crate::team_oversight::observe_window(&self.home_dir,db,&ctx.user_id)?;
+            }
+        }
 
         let backup = if stored.is_empty() {
             None
@@ -956,6 +993,11 @@ impl MethodHandler {
         crate::security_autopilot::emit_config_changed();
 
         let (hot_reloaded, restart_required) = self.apply_raw_reloads(&kind, &before, &after, &sections).await;
+        if matches!(kind,RawFile::Config) && key_changed(&before,&after,"people.manager_team_history") {
+            if let Some(db)=self.user_db.read().await.as_ref() {
+                crate::team_oversight::observe_window(&self.home_dir,db,&ctx.user_id)?;
+            }
+        }
         info!(file = kind.kind(), ?sections, ?restart_required, "config.raw.set completed");
         Ok(json!({
             "success": true,

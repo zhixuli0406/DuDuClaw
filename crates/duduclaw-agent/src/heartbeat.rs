@@ -831,11 +831,12 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
 
         // Legacy stores have no kind column. Once present, only the explicit
         // ordinary-worker kinds may wake this scheduler; unknown kinds deny.
-        let has_kind = {
+        let (has_kind, has_principal) = {
             let mut columns = tdb.prepare("PRAGMA table_info(tasks)").map_err(|e| e.to_string())?;
             let names = columns.query_map([], |row| row.get::<_,String>(1)).map_err(|e| e.to_string())?
                 .collect::<std::result::Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
-            names.iter().any(|name| name == "kind")
+            (names.iter().any(|name| name == "kind"),
+             names.iter().any(|name| name == "on_behalf_of"))
         };
         let kind_gate = if has_kind { "AND kind IN ('task','goal')" } else { "" };
         // P2-A M3-5: tasks inside a stopped tree are excluded in the query
@@ -913,6 +914,12 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                     Some((id, title))
                 }
             });
+        // The person each task was handed over for (gateway-written
+        // `tasks.on_behalf_of`); the wake-up's run works for them.
+        let todo_principal = todo.as_ref()
+            .map(|(id, _, _)| task_principal(&tdb, id, has_principal)).transpose()?.flatten();
+        let stalled_principal = stalled.as_ref()
+            .map(|(id, _)| task_principal(&tdb, id, has_principal)).transpose()?.flatten();
         drop(tdb);
 
         if todo.is_none() && stalled.is_none() {
@@ -928,6 +935,7 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         // agent within the last hour. We use the `payload` LIKE marker on
         // existing pending/acked rows so there's no extra schema.
         let cooldown_cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        ensure_queue_principal_column(&qdb);
 
         if let Some((task_id, title, priority)) = todo {
             let marker = format!("[heartbeat-pull task_id={task_id}]");
@@ -955,10 +963,10 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                 qdb.execute(
                     "INSERT INTO message_queue \
                      (id, sender, target, payload, status, retry_count, delegation_depth, \
-                      sender_agent, origin_agent, created_at) \
+                      sender_agent, origin_agent, created_at, on_behalf_of) \
                      VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, \
-                      'heartbeat', 'heartbeat', ?4)",
-                    rusqlite::params![&id, &agent, &payload, &now],
+                      'heartbeat', 'heartbeat', ?4, ?5)",
+                    rusqlite::params![&id, &agent, &payload, &now, &todo_principal],
                 )
                 .map_err(|e| format!("enqueue todo wake-up: {e}"))?;
                 info!(
@@ -994,10 +1002,10 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                 qdb.execute(
                     "INSERT INTO message_queue \
                      (id, sender, target, payload, status, retry_count, delegation_depth, \
-                      sender_agent, origin_agent, created_at) \
+                      sender_agent, origin_agent, created_at, on_behalf_of) \
                      VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, \
-                      'heartbeat', 'heartbeat', ?4)",
-                    rusqlite::params![&id, &agent, &payload, &now],
+                      'heartbeat', 'heartbeat', ?4, ?5)",
+                    rusqlite::params![&id, &agent, &payload, &now, &stalled_principal],
                 )
                 .map_err(|e| format!("enqueue stall wake-up: {e}"))?;
                 info!(
@@ -1012,6 +1020,31 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
+}
+
+/// `tasks.on_behalf_of` of one task: the person it was handed over for,
+/// written by the gateway when the task was created. `None` on a store
+/// without the column or an empty value. A lookup/type error skips the pass
+/// instead of converting someone's work into an employee-owned wake-up.
+/// The dispatcher validates non-empty values before any run uses them.
+fn task_principal(tdb: &rusqlite::Connection, task_id: &str, has_principal: bool) -> Result<Option<String>, String> {
+    if !has_principal {
+        return Ok(None);
+    }
+    tdb.query_row(
+        "SELECT on_behalf_of FROM tasks WHERE id = ?1",
+        rusqlite::params![task_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .map(|v| v.filter(|v| !v.trim().is_empty()))
+    .map_err(|e| format!("read task principal: {e}"))
+}
+
+/// The gateway adds `message_queue.on_behalf_of` at start; add it here too
+/// so a wake-up written before that migration ran still has the column
+/// ("duplicate column" is the normal case and ignored).
+fn ensure_queue_principal_column(qdb: &rusqlite::Connection) {
+    let _ = qdb.execute("ALTER TABLE message_queue ADD COLUMN on_behalf_of TEXT", []);
 }
 
 /// Execute proactive checks for an agent if PROACTIVE.md exists and conditions allow.
@@ -1298,6 +1331,9 @@ async fn execute_proactive_check(
             // pushable channel conversation (sessions.db) — an unset field no
             // longer silently discards the whole feature.
             let notify = &agent_config.proactive;
+            // B11: a fallback conversation that came in through an employee's
+            // own bot / app goes out through the same one.
+            let mut sender_agent: Option<String> = None;
             let target = if !notify.notify_channel.is_empty() && !notify.notify_chat_id.is_empty()
             {
                 Some((notify.notify_channel.clone(), notify.notify_chat_id.clone()))
@@ -1305,11 +1341,15 @@ async fn execute_proactive_check(
                 let home = home_dir.to_path_buf();
                 let aid = agent_id.to_string();
                 let fallback = tokio::task::spawn_blocking(move || {
-                    proactive::resolve_notify_fallback(&home, &aid)
+                    proactive::resolve_notify_fallback_with_sender(&home, &aid)
                 })
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|(ch, chat, sender)| {
+                    sender_agent = sender;
+                    (ch, chat)
+                });
                 if let Some((ch, chat)) = &fallback {
                     info!(
                         agent = agent_id,
@@ -1341,6 +1381,7 @@ async fn execute_proactive_check(
                     "channel": channel,
                     "chat_id": chat_id,
                     "thread_id": notify.notify_thread_id,
+                    "sender_agent": sender_agent,
                     "message": message,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
@@ -1557,6 +1598,18 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|v| v.get("tool_name").and_then(|t| t.as_str()) == Some(tool))
             .collect()
+    }
+
+    #[test]
+    fn task_principal_read_errors_are_not_employee_owned_work() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE tasks (id TEXT PRIMARY KEY, on_behalf_of TEXT);
+            INSERT INTO tasks VALUES ('owned', 'user:person'), ('old', NULL), ('bad', X'FF');").unwrap();
+        assert_eq!(task_principal(&db, "owned", true).unwrap().as_deref(), Some("user:person"));
+        assert_eq!(task_principal(&db, "old", true).unwrap(), None);
+        assert!(task_principal(&db, "bad", true).is_err());
+        assert!(task_principal(&db, "missing", true).is_err());
+        assert_eq!(task_principal(&db, "legacy", false).unwrap(), None);
     }
 
     fn make_test_agent_dir(home: &Path, name: &str, soul: Option<&str>) -> std::path::PathBuf {

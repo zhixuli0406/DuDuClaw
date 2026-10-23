@@ -127,6 +127,18 @@ pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
     }
 }
 
+/// Record an access event before releasing protected content. Unlike the
+/// best-effort writer, lock, serialization, write and sync failures are
+/// returned to the caller, which must refuse access on any error.
+pub fn try_append_audit_event(home_dir: &Path, event: &AuditEvent) -> Result<(), String> {
+    let value = serde_json::to_value(event).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(map) = value else {
+        return Err("audit event must be an object".to_string());
+    };
+    crate::audit_chain::append_chained_line_strict(&home_dir.join("security_audit.jsonl"), map)
+        .map_err(|e| e.to_string())
+}
+
 /// Read recent audit events (last N entries).
 ///
 /// Simplified: collect all lines, then slice the tail (MW-L2).
@@ -390,6 +402,12 @@ pub fn append_tool_call_with_extras(
         if let Some(task_id) = duduclaw_core::host_task_id() {
             map.insert("task_id".into(), task_id.into());
         }
+    }
+    // A call made for a person names them (the gateway sets
+    // `DUDUCLAW_ON_BEHALF_OF` at spawn; a malformed value is left out). The
+    // host value always replaces an extra of the same name.
+    if let Some(principal) = duduclaw_core::host_principal() {
+        map.insert("on_behalf_of".into(), principal.to_string().into());
     }
 
     // 0600 on create: since result_text landed, rows can carry business
@@ -1125,10 +1143,14 @@ pub fn log_os_boot(home_dir: &Path, image_version: Option<&str>) {
 }
 
 #[cfg(test)]
+#[path = "audit_strict_tests.rs"]
+mod strict_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fresh_home() -> std::path::PathBuf {
+    pub(super) fn fresh_home() -> std::path::PathBuf {
         // No uuid dep in this crate — pid + monotonic counter + nanos is
         // unique enough for a test scratch dir.
         use std::sync::atomic::{AtomicU64, Ordering};

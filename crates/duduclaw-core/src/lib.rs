@@ -13,6 +13,7 @@ pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod gateway_instance;
 pub mod google_identity;
+pub mod human_principal;
 pub mod config;
 pub mod container_engine;
 pub mod cron_tz;
@@ -92,6 +93,10 @@ pub use delegation_policy::{
     MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, RESERVED_QUEUE_SENDERS,
     STANDALONE_CLIENT_PREFIX, SYSTEM_SENDERS,
 };
+pub use human_principal::{
+    host_principal, host_principal_checked, human_right_for_path, HumanPrincipal,
+    HumanPrincipalMode, HumanRight, PrincipalRejection, ENV_ON_BEHALF_OF,
+};
 pub use department::{
     department_of_page, department_page_visible, is_valid_department,
     namespace_department_visible, top_level_namespace as wiki_top_level_namespace,
@@ -135,7 +140,7 @@ pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp
 pub use provider_env::{
     provider_env_key_names, resolve_env_key as resolve_provider_env_key, KNOWN_PROVIDER_IDS,
 };
-pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
+pub use sensitivity::{is_private_session, perception_source_sensitivity, session_conversation, Sensitivity};
 // `try_admit_role_member` is `#[deprecated]` (no production caller, superseded
 // by `ephemeral::admit_role_member`); re-exported so the deprecation is visible
 // at the workspace-facing name too, hence the allow on the whole tree.
@@ -296,6 +301,14 @@ pub fn mcp_forward_env_vars() -> Vec<(String, String)> {
 /// Read by `send_to_agent` MCP tool to record a callback so the
 /// dispatcher can forward sub-agent responses back to the originating channel.
 pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
+
+/// Which bot / app the conversation in [`ENV_REPLY_CHANNEL`] came in
+/// through: the id of the AI employee whose **own** Telegram bot or Google
+/// Chat app received it. Absent = the shared bot / app (or unknown, legacy).
+/// Replies, delegated answers, reminders and approval pushes for that
+/// conversation go out through the same bot / app; the chat id itself never
+/// carries it (B11).
+pub const ENV_REPLY_SENDER: &str = "DUDUCLAW_REPLY_SENDER";
 
 /// Wiki RL Trust Feedback context for sub-agent dispatch (v1.10).
 ///

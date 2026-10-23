@@ -78,6 +78,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/66-thinking-in-messaging-apps.md](features/66-thinking-in-messaging-apps.md) | Thinking display in messaging apps — timer and masked summary per platform, who sees what; [繁體中文](features/zh-TW/66-thinking-in-messaging-apps.md) / [日本語](features/ja-JP/66-thinking-in-messaging-apps.md) |
 | [features/67-assigning-tasks.md](features/67-assigning-tasks.md) | Assigning tasks from a chat — `/交辦 @employee task` (`/assign`, `／交辦`) creates a goal task with `on_behalf_of`, who may assign to whom, the one-message wait after `/交辦 @name`, `/交辦 狀態`, progress back to the chat, "Assigned by me" on the Goals page, audit events; [繁體中文](features/zh-TW/67-assigning-tasks.md) / [日本語](features/ja-JP/67-assigning-tasks.md) |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
+| [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — unreleased Enterprise backend API, live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---
@@ -197,6 +198,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
+| [guides/per-employee-channels.md](guides/per-employee-channels.md) | 讓 AI 員工有自己的 Telegram Bot 與 Google Chat 應用程式（設定步驟、權限、驗證方式；另有 [zh-TW](guides/zh-TW/per-employee-channels.md)、[ja-JP](guides/ja-JP/per-employee-channels.md)） | Current |
 | [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate from`，預設 dry-run） | Current |
 | [guides/white-label.md](guides/white-label.md) | Distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`); notes that white-label branding was removed in 1.72.2 (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/distributor-notice.md](guides/distributor-notice.md) | Distributor information on the About page — kept by the distributor in the license console, delivered as a signed runtime copy every 6 hours and compiled into the distributor build (`DUDUCLAW_DISTRIBUTOR_NOTICE_PATH`), the HTML allowlist, the sandboxed iframe, how to check `about.get` (also in `zh-TW/` and `ja-JP/`) | Current |

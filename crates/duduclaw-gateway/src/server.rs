@@ -811,6 +811,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "Failed to initialize user database: {e}"
         ))
     })?);
+    // Establish the non-retroactive window before any channel accepts turns.
+    handler.resolve_edition_profile().await;
+    if let Err(e)=crate::team_oversight::observe_window(&home_dir,&user_db,"gateway_boot") {
+        // The observer persists reset-required (or retains a process latch
+        // when the DB is unavailable). Only B5 stays fenced; ordinary
+        // gateway operation must not depend on a new history audit writer.
+        warn!(error=%e,"team history activation sync failed; team history remains unavailable");
+    }
     // Ensure a default admin exists on first run
     let bootstrap_password = match user_db.ensure_default_admin() {
         Ok(password) => password, // Some(..) on first run, None if an admin already existed
@@ -1227,6 +1235,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let r = crate::webhook_slots::start_webhook(channel, &home_dir, reply_ctx.clone()).await;
         webhook_slots.set(channel, r);
     }
+    // AI employees' own Google Chat apps: one always-mounted path per
+    // employee id, verified per request against that employee's app
+    // (crate::googlechat_agents); credentials are checked in the background.
+    let googlechat_agents_router = crate::googlechat_agents::router(reply_ctx.clone());
+    crate::googlechat_agents::spawn_boot_probes(reply_ctx.clone());
     // Odoo website Live Chat: the bot answers as an Odoo operator. Always
     // spawned; it idles until `[odoo_livechat] enabled = true`, so the
     // dashboard can switch it on without a restart (crate::odoo_livechat).
@@ -1946,6 +1959,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::maintenance::supervisor::spawn(Arc::new(env), boot_revoked).await;
     } else {
         error!("another gateway holds this data directory: the maintenance supervisor does not run in this process");
+    }
+
+    // ── B5 session origin backfill ────────────────────────────────
+    // Rows written before `sessions.origin_kind` existed get an origin from
+    // their id once (re-runnable; rows a live turn stamped first are kept).
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::session_origin::backfill::spawn(
+            home_dir.clone(),
+            session_manager.clone(),
+            user_db.clone(),
+        );
     }
 
     // ── Document knowledge base ingest worker ─────────────────────
@@ -2777,6 +2801,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));
+    // Separate MCP processes delegate human permission checks to this
+    // host, using its verified license runtime and live opaque contexts.
+    app = app.merge(crate::on_behalf_of::route::router(Arc::new(
+        crate::on_behalf_of::route::RouteState::new(home_dir.clone(), Some(_license_runtime.clone())),
+    )));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
     // tools: same loopback + signed-identity authentication as the
@@ -2848,6 +2877,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Webhook channels are always mounted; an unconfigured channel's empty
     // slot answers 404 (crate::webhook_slots).
     app = app.merge(crate::webhook_slots::router(webhook_slots));
+    app = app.merge(googlechat_agents_router);
 
     // Merge plugin extension routes (if any)
     if let Some(extra) = extension.extra_routes() {

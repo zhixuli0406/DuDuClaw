@@ -21,6 +21,7 @@
     { "key": "channels.discord", "form_paths": [], "kind": "change" },
     { "key": "channels.telegram", "form_paths": [], "kind": "change" },
     { "key": "channels.slack", "form_paths": [], "kind": "change" },
+    { "key": "channels.googlechat", "form_paths": [], "kind": "change" },
     { "key": "odoo", "form_paths": ["odoo."], "kind": "change" },
     { "key": "runtime.provider", "form_paths": ["runtime.provider"], "kind": "change" },
     { "key": "runtime.fallback", "form_paths": ["runtime.fallback"], "kind": "change" },

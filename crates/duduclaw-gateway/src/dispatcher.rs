@@ -81,6 +81,11 @@ struct BusMessage {
     /// value is read as explore as well). Absent ⇒ normal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lane: Option<String>,
+    /// The person the receiving run works for (`crate::on_behalf_of`), as
+    /// the MCP server wrote it from its host env. Validated before use;
+    /// absent ⇒ nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_behalf_of: Option<String>,
 }
 
 /// Starts the agent dispatcher as a background task.
@@ -300,6 +305,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             &msg.target,
             &msg.id,
             "sqlite_queue",
+            msg.on_behalf_of.as_deref(),
         )
         .await;
         if let crate::delegation_gate::GateOutcome::Deny(denied) = gate {
@@ -438,6 +444,16 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         // Every spawn of this run (Claude CLI, the openai-compat tool loop's
         // MCP child) carries the read-only lane; other runtimes refuse.
         let dispatch_fut = crate::explore_lane::EXPLORE.scope(explore_lane, dispatch_fut);
+        // The person this run works for, from the queue row (the MCP server
+        // wrote it from its host env, or the gateway copied it from the task
+        // row). Every spawn of the run carries it as `DUDUCLAW_ON_BEHALF_OF`.
+        let principal = crate::on_behalf_of::from_stored(
+            home_dir,
+            msg.on_behalf_of.as_deref(),
+            &msg.target,
+            "message_queue",
+        );
+        let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -490,6 +506,19 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         } else {
             None
         };
+        // B11: a sub-agent working for an own-bot conversation keeps naming
+        // that bot, so its own delegations answer through it too.
+        let reply_sender = if msg.reply_channel.as_deref().is_some_and(|rc| !rc.is_empty()) {
+            let home = home_dir.to_path_buf();
+            let id = msg.id.clone();
+            tokio::task::spawn_blocking(move || lookup_callback_sender(&home, &id))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -497,7 +526,10 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                         collector,
                         crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(
                             attr,
-                            crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut),
+                            crate::claude_runner::REPLY_CHANNEL.scope(
+                                rc,
+                                crate::claude_runner::REPLY_SENDER.scope(reply_sender, dispatch_fut),
+                            ),
                         ),
                     )
                     .await
@@ -511,7 +543,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                     .await
             }
             (None, Some(rc)) if !rc.is_empty() => {
-                let fut = crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut);
+                let fut = crate::claude_runner::REPLY_CHANNEL
+                    .scope(rc, crate::claude_runner::REPLY_SENDER.scope(reply_sender, dispatch_fut));
                 match heartbeat_attr {
                     Some(attr) => crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attr, fut).await,
                     None => fut.await,
@@ -809,6 +842,7 @@ async fn poll_and_dispatch(
                         session_id: msg.session_id.clone(),
                         upstream_unknown: false,
                         lane: None,
+                        on_behalf_of: msg.on_behalf_of.clone(),
                     };
                     consumed_without_dispatch += 1;
                     match serde_json::to_string(&err_response) {
@@ -833,6 +867,7 @@ async fn poll_and_dispatch(
                         &msg.agent_id,
                         &msg.message_id,
                         "bus_dispatch",
+                        msg.on_behalf_of.as_deref(),
                     )
                     .await;
                     match outcome {
@@ -876,6 +911,7 @@ async fn poll_and_dispatch(
             session_id: msg.session_id.clone(),
             upstream_unknown: false,
             lane: None,
+            on_behalf_of: msg.on_behalf_of.clone(),
         };
         match serde_json::to_string(&err_response) {
             Ok(json) => synthetic_responses.push(json),
@@ -932,7 +968,7 @@ async fn poll_and_dispatch(
 
     // ── Deliver proactive notifications (already removed from the queue) ──
     for send in proactive_sends {
-        match forward_to_channel(
+        match forward_to_channel_as(
             home_dir,
             &send.channel,
             &send.channel_id,
@@ -941,6 +977,7 @@ async fn poll_and_dispatch(
             &send.agent_id,
             &send.agent_id,
             None,
+            send.sender_agent.as_deref(),
         )
         .await
         {
@@ -1035,6 +1072,13 @@ async fn poll_and_dispatch(
                 .scope(turn_id_for_scope, dispatch_fut);
             let dispatch_fut =
                 crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
+            let principal = crate::on_behalf_of::from_stored(
+                &home,
+                msg.on_behalf_of.as_deref(),
+                &msg.agent_id,
+                "bus_queue",
+            );
+            let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
             // The delegation's lane (written by a run in the explore lane,
             // `spawn_agent` / `spawn_ephemeral`): the receiving run stays
             // read-only too, or is refused when the employee cannot carry
@@ -1229,6 +1273,7 @@ async fn poll_and_dispatch(
                 session_id: msg.session_id.clone(),
                 upstream_unknown: false,
                 lane: None,
+                on_behalf_of: msg.on_behalf_of.clone(),
             };
 
             if let Ok(json) = serde_json::to_string(&response_entry) {
@@ -1581,6 +1626,7 @@ pub async fn dispatch_taskspec(
                     &target_agent,
                     &spec.task_id,
                     "task_spec",
+                    None,
                 )
                 .await
             {
@@ -1789,7 +1835,14 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
     for msg in messages {
         // A read-only (lane) delegation is never merged with an ordinary one:
         // the merged run would take the lane of whichever came first.
-        let key = format!("{}\u{0}{}", msg.agent_id, if msg.lane.is_some() { "L" } else { "" });
+        // Nor is work for one person merged with work for another (or for
+        // nobody): the merged run would act for whoever came first.
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            msg.agent_id,
+            if msg.lane.is_some() { "L" } else { "" },
+            msg.on_behalf_of.as_deref().unwrap_or("")
+        );
         let entry = groups.entry(key.clone()).or_default();
         if entry.is_empty() {
             order.push(key);
@@ -1864,6 +1917,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 session_id: first.session_id.clone(),
                 upstream_unknown: first.upstream_unknown,
                 lane: first.lane.clone(),
+                on_behalf_of: first.on_behalf_of.clone(),
             });
         }
     }
@@ -2245,6 +2299,8 @@ pub async fn reforward_message(
 /// `duduclaw-cli::mcp::send_to_agent_with_ctx` — kept local to avoid
 /// a cross-crate dep on the MCP server module.
 fn parse_reply_channel(rc: &str) -> Result<(String, String, Option<String>), String> {
+    // An employee bucket (`#agent:`) is not part of the chat id (B11).
+    let rc = duduclaw_core::session_conversation(rc);
     let parts: Vec<&str> = rc.splitn(3, ':').collect();
     if parts.len() < 2 {
         return Err(format!(
@@ -2274,6 +2330,9 @@ struct ProactiveSend {
     channel_id: String,
     thread_id: Option<String>,
     message: String,
+    /// B11: the employee whose own bot / app the target conversation came in
+    /// through (`None` = the default token cascade).
+    sender_agent: Option<String>,
 }
 
 /// Parse one bus-queue line as a `proactive_notification`, `None` for every
@@ -2288,7 +2347,20 @@ fn parse_proactive_line(line: &str) -> Option<ProactiveSend> {
     }
     let agent_id = v.get("agent_id")?.as_str()?.trim().to_string();
     let channel = v.get("channel")?.as_str()?.trim().to_string();
-    let chat_id = v.get("chat_id")?.as_str()?.trim().to_string();
+    let raw_chat = v.get("chat_id")?.as_str()?.trim();
+    // A chat id taken from a bucketed session id (`<chat>#agent:<id>`) is
+    // the chat plus the employee whose own bot the conversation used (B11).
+    let (chat_part, bucket_sender) = match raw_chat.split_once("#agent:") {
+        Some((chat, agent)) => (chat, Some(agent.to_string())),
+        None => (raw_chat, None),
+    };
+    let chat_id = chat_part.to_string();
+    let sender_agent = v
+        .get("sender_agent")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .or(bucket_sender)
+        .filter(|a| duduclaw_core::is_valid_agent_id(a));
     let message = v.get("message")?.as_str()?.trim().to_string();
     if agent_id.is_empty() || channel.is_empty() || chat_id.is_empty() || message.is_empty() {
         return None;
@@ -2309,12 +2381,13 @@ fn parse_proactive_line(line: &str) -> Option<ProactiveSend> {
         channel_id,
         thread_id,
         message,
+        sender_agent,
     })
 }
 
 /// Check if a delegation callback exists for this message and forward
 /// the response to the originating channel.
-async fn forward_delegation_response(
+pub(crate) async fn forward_delegation_response(
     home_dir: &Path,
     original_message_id: &str,
     response_text: &str,
@@ -2333,19 +2406,27 @@ async fn forward_delegation_response(
             Err(_) => return None,
         };
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        // B11 column; a table created by an older writer may lack it, and a
+        // RETURNING over a missing column would drop the forward. "Duplicate
+        // column" is the expected error once it exists.
+        let _ = conn.execute("ALTER TABLE delegation_callbacks ADD COLUMN sender_agent TEXT", []);
 
         conn.query_row(
             "DELETE FROM delegation_callbacks WHERE message_id = ?1 \
-             RETURNING message_id, agent_id, channel_type, channel_id, thread_id, retry_count",
+             RETURNING message_id, agent_id, channel_type, channel_id, thread_id, retry_count, sender_agent",
             rusqlite::params![msg_id],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i32>(5)?,
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i32>(5)?,
+                    ),
+                    row.get::<_, Option<String>>(6)?
+                        .filter(|s| duduclaw_core::is_valid_agent_id(s)),
                 ))
             },
         )
@@ -2355,7 +2436,8 @@ async fn forward_delegation_response(
     .ok()
     .flatten();
 
-    let Some((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count)) = callback
+    let Some(((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count), sender_agent)) =
+        callback
     else {
         // No callback registered — this is the legitimate case for purely
         // internal delegations (cron/reminder/heartbeat), but it is ALSO
@@ -2398,7 +2480,7 @@ async fn forward_delegation_response(
         "Forwarding sub-agent response to originating channel"
     );
 
-    match forward_to_channel(
+    match forward_to_channel_as(
         home_dir,
         &channel_type,
         &channel_id,
@@ -2407,6 +2489,7 @@ async fn forward_delegation_response(
         responder_agent,
         &callback_agent_id,
         chain_root.as_deref(),
+        sender_agent.as_deref(),
     )
     .await
     {
@@ -2459,15 +2542,16 @@ async fn forward_delegation_response(
                 let ch_type = channel_type.clone();
                 let ch_id = channel_id.clone();
                 let tid = thread_id.clone();
+                let sender = sender_agent.clone();
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
                         let _ = conn.execute(
                             "INSERT OR IGNORE INTO delegation_callbacks \
-                             (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now],
+                             (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at, sender_agent) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now, sender],
                         );
                     }
                 }).await;
@@ -2528,6 +2612,21 @@ fn candidate_session_ids(
             }
         }
     }
+}
+
+/// `candidates` with each agent's bucket (`<sid>#agent:<id>`) tried first.
+fn with_agent_buckets<'a>(
+    candidates: Vec<String>,
+    agents: impl Iterator<Item = &'a str> + Clone,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for sid in candidates {
+        for agent in agents.clone().filter(|a| duduclaw_core::is_valid_agent_id(a)) {
+            out.push(crate::trigger_route::called_session(&sid, agent));
+        }
+        out.push(sid);
+    }
+    out
 }
 
 /// Sanitize an agent name for inclusion in the XML `<subagent_reply>` tag.
@@ -2647,11 +2746,17 @@ async fn append_subagent_reply_to_parent_session_with(
     let response_owned = response_text.to_string();
     let responder_owned = responder_agent.to_string();
 
-    let candidates = candidate_session_ids(channel_type, channel_id, thread_id);
     let parent = parent_agent_id.to_string();
     let root = chain_root_agent
         .filter(|s| !s.is_empty() && *s != parent_agent_id)
         .map(str::to_string);
+    // An employee's own-bot or `@`-called turn lives in its bucket of the
+    // conversation (`<sid>#agent:<id>`, B11): try the parent's and the chain
+    // root's bucket before the conversation itself.
+    let candidates = with_agent_buckets(
+        candidate_session_ids(channel_type, channel_id, thread_id),
+        std::iter::once(parent.as_str()).chain(root.as_deref()),
+    );
 
     let ch_type = channel_type.to_string();
     let ch_id = channel_id.to_string();
@@ -2956,6 +3061,36 @@ async fn forward_to_channel(
     originating_agent: &str,
     chain_root_agent: Option<&str>,
 ) -> Result<(), String> {
+    forward_to_channel_as(
+        home_dir,
+        channel_type,
+        channel_id,
+        thread_id,
+        text,
+        responder_agent,
+        originating_agent,
+        chain_root_agent,
+        None,
+    )
+    .await
+}
+
+/// [`forward_to_channel`] for a conversation that came in through an AI
+/// employee's own bot / app (`sender`, B11): the answer goes out through that
+/// same bot / app and nothing else — a missing token is an error, never a
+/// switch to the shared bot or to the callback agent's own bot.
+#[allow(clippy::too_many_arguments)]
+async fn forward_to_channel_as(
+    home_dir: &Path,
+    channel_type: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+    responder_agent: &str,
+    originating_agent: &str,
+    chain_root_agent: Option<&str>,
+    sender: Option<&str>,
+) -> Result<(), String> {
     // Validate channel_id format to prevent URL injection / SSRF
     validate_channel_id(channel_type, channel_id)?;
     if let Some(tid) = thread_id {
@@ -3039,20 +3174,25 @@ async fn forward_to_channel(
 
     match channel_type {
         "telegram" => {
-            let token = resolve_forward_token(
-                home_dir,
-                originating_agent,
-                chain_root_agent,
-                "telegram",
-                &config,
-                "telegram_bot_token_enc",
-                "telegram_bot_token",
-            )
-            .await;
+            let token = match sender {
+                Some(agent) => own_telegram_token(home_dir, agent).await?,
+                None => {
+                    resolve_forward_token(
+                        home_dir,
+                        originating_agent,
+                        chain_root_agent,
+                        "telegram",
+                        &config,
+                        "telegram_bot_token_enc",
+                        "telegram_bot_token",
+                    )
+                    .await
+                }
+            };
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
-            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(&token));
             for (i, body) in chunks.iter().enumerate() {
                 let mut payload = serde_json::json!({
                     "chat_id": channel_id,
@@ -3354,8 +3494,11 @@ async fn forward_to_channel(
             }
         }
         "googlechat" => {
+            // The app the conversation came in through (B11 M2): the
+            // employee's own app when `sender` names it, else the app the
+            // space is known to contain (shared by default).
             for (i, body) in chunks.iter().enumerate() {
-                crate::googlechat::send_text_to_space(home_dir, channel_id, body)
+                crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, body)
                     .await
                     .map_err(|e| format!("googlechat send chunk {}/{}: {e}", i + 1, total))?;
                 if i + 1 < total {
@@ -3473,6 +3616,15 @@ async fn resolve_forward_token(
     get_config_token(config, enc_key, plain_key, home_dir).await
 }
 
+/// The employee's own Telegram bot token (B11): required, no cascade.
+async fn own_telegram_token(home_dir: &Path, agent: &str) -> Result<String, String> {
+    let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(home_dir).await;
+    crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &sm_cfg)
+        .await
+        .map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
+        .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))
+}
+
 /// Look up the origin_agent for a message_id. Used by
 /// `forward_delegation_response` to feed the token-cascade in
 /// `forward_to_channel` so nested sub-agent replies can inherit the
@@ -3481,6 +3633,21 @@ async fn resolve_forward_token(
 /// Returns None if the message_queue.db is missing, the query fails,
 /// or the row has no origin_agent — callers then cascade directly to
 /// the global config token (original v1.8.14 behaviour).
+/// The own-bot sender recorded with the delegation callback of `message_id`
+/// (B11), if any.
+fn lookup_callback_sender(home_dir: &Path, message_id: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(home_dir.join("message_queue.db")).ok()?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+    conn.query_row(
+        "SELECT sender_agent FROM delegation_callbacks WHERE message_id = ?1",
+        rusqlite::params![message_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|s| duduclaw_core::is_valid_agent_id(s))
+}
+
 fn lookup_origin_agent(home_dir: &Path, message_id: &str) -> Option<String> {
     let db_path = home_dir.join("message_queue.db");
     let conn = rusqlite::Connection::open(&db_path).ok()?;
@@ -4050,6 +4217,7 @@ mod tests {
             "mkt_rep",
             "forged-1",
             "bus_dispatch",
+            None,
         )
         .await;
         assert!(matches!(
@@ -4165,6 +4333,7 @@ mod tests {
             session_id: None,
             upstream_unknown: false,
             lane: None,
+            on_behalf_of: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // None fields with skip_serializing_if should be absent
@@ -4678,6 +4847,7 @@ mod tests {
                 session_id: None,
                 upstream_unknown: false,
                 lane: None,
+                on_behalf_of: None,
             },
             BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -4696,6 +4866,7 @@ mod tests {
                 session_id: None,
                 upstream_unknown: false,
                 lane: None,
+                on_behalf_of: None,
             },
         ];
         let coalesced = coalesce_messages(msgs);
@@ -4972,7 +5143,8 @@ bot_token = "{token}"
                 channel_id TEXT NOT NULL,
                 thread_id TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                sender_agent TEXT
             );",
         )
         .unwrap();
@@ -5343,6 +5515,15 @@ bot_token = "{token}"
         let send = parse_proactive_line(line).unwrap();
         assert_eq!(send.channel_id, "-100");
         assert_eq!(send.thread_id, Some("77".to_string()));
+        assert_eq!(send.sender_agent, None);
+
+        // B11: a bucketed chat id is the chat plus the own-bot sender.
+        let line = r#"{"type":"proactive_notification","agent_id":"sales","channel":"telegram","chat_id":"555#agent:sales","message":"m"}"#;
+        let send = parse_proactive_line(line).unwrap();
+        assert_eq!(send.channel_id, "555");
+        assert_eq!(send.sender_agent.as_deref(), Some("sales"));
+        let line = r#"{"type":"proactive_notification","agent_id":"sales","channel":"telegram","chat_id":"555","sender_agent":"sales","message":"m"}"#;
+        assert_eq!(parse_proactive_line(line).unwrap().sender_agent.as_deref(), Some("sales"));
     }
 
     #[test]

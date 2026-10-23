@@ -281,6 +281,7 @@ async fn set_normalizes_name_to_directory_name_and_predicate_honours_it() {
         "wh-dir",
         "task-1",
         "bus_dispatch",
+        None,
     )
     .await;
     assert!(

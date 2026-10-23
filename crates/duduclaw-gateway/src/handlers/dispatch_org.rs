@@ -78,6 +78,12 @@ impl MethodHandler {
         }
 
         match method {
+            "users.team_history.list" => self.handle_team_history_list(params,ctx).await,
+            "users.team_history.get" => self.handle_team_history_get(params,ctx).await,
+            "users.org_settings.get" | "users.org_settings.update" => {
+                require_admin!();
+                self.handle_org_history_settings(params,ctx,method.ends_with(".update")).await
+            }
             "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact"
             | "discovery.cancel" => self.handle_discovery_rpc(method, params, ctx).await,
             "dashboard.layout.view" => {

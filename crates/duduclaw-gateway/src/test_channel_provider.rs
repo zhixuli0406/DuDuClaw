@@ -59,7 +59,8 @@ pub(crate) fn register_local_route(token: &str, origin: &str) -> LocalProviderRo
         Some("127.0.0.1" | "localhost" | "[::1]")
     ));
     assert!(matches!(parsed.scheme(), "http" | "https"));
-    assert!(token.starts_with("p0-test-"));
+    // Synthetic tokens only; Telegram-shaped ones (`<id>:p0-test-…`) too.
+    assert!(token.starts_with("p0-test-") || token.contains(":p0-test-"));
     assert!(
         routes()
             .lock()

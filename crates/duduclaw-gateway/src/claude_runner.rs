@@ -490,6 +490,7 @@ where
     F: std::future::Future<Output = Result<String, String>>,
 {
     use crate::cost_telemetry::RequestType as RT;
+    let fut = crate::on_behalf_of::context::scope(home_dir, agent_id, fut);
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
@@ -2846,7 +2847,7 @@ async fn call_local_inference(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    let raw = call_local_inference_raw(
+    let raw = crate::on_behalf_of::context::scope(home_dir, agent_id.unwrap_or(""), call_local_inference_raw(
         home_dir,
         prompt,
         system_prompt,
@@ -2854,7 +2855,7 @@ async fn call_local_inference(
         agent_id,
         capabilities,
     )
-    .await?;
+    ).await?;
     finish_local_reply(raw)
 }
 
@@ -3786,6 +3787,11 @@ tokio::task_local! {
     /// so the dispatcher can forward sub-agent responses back to the originating channel.
     pub static REPLY_CHANNEL: String;
 
+    /// B11: the AI employee whose own bot / app the [`REPLY_CHANNEL`]
+    /// conversation came in through (absent = shared bot / app). Exported as
+    /// [`duduclaw_core::ENV_REPLY_SENDER`] next to the reply channel.
+    pub static REPLY_SENDER: String;
+
     /// RFC-22 P1-7: caller agent_id for cost_telemetry attribution along the
     /// channel_reply path. Without this, `spawn_claude_cli_with_env` cannot
     /// record per-agent token usage and `cost_telemetry.db` shows 0 entries
@@ -3952,6 +3958,7 @@ pub(crate) struct ClaudeCmdGuards {
     /// `(agent, turn) → person` for the knowledge route, inside a channel
     /// reply turn; lives as long as the spawned CLI.
     knowledge: Option<crate::knowledge::turn_requesters::RequesterGuard>,
+    principal_context: Option<crate::on_behalf_of::context::ContextGuard>,
 }
 
 fn prepare_claude_cmd(
@@ -4253,6 +4260,9 @@ fn prepare_claude_cmd(
     if let Ok(channel) = REPLY_CHANNEL.try_with(|ch| ch.clone()) {
         cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
     }
+    if let Some(sender) = reply_sender() {
+        cmd.env(duduclaw_core::ENV_REPLY_SENDER, &sender);
+    }
 
     // v1.10: Inject wiki RL trust feedback context so the MCP server can
     // attach turn_id / session_id to sub-agent dispatch BusMessages.
@@ -4275,6 +4285,8 @@ fn prepare_claude_cmd(
     }
     crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
     crate::memory_provenance::inject_dispatch_run_env(&mut cmd);
+    // The person this turn or run is for (never an inherited gateway value).
+    crate::on_behalf_of::inject_env(&mut cmd);
 
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only
@@ -4284,6 +4296,8 @@ fn prepare_claude_cmd(
         .and_then(|n| n.to_str());
     let turn = spawned.and_then(crate::computer_use_sessions::turns::register_current_turn);
     let knowledge = spawned.and_then(crate::knowledge::turn_requesters::register_current_turn);
+    let principal_context = spawned.and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));
+    crate::on_behalf_of::context::inject(&mut cmd, principal_context.as_ref());
 
     Ok((
         cmd,
@@ -4292,6 +4306,7 @@ fn prepare_claude_cmd(
             mcp_proxy: mcp_proxy_guard,
             turn,
             knowledge,
+            principal_context,
         },
     ))
 }
@@ -5629,4 +5644,29 @@ mod local_think_tests {
         // A genuinely empty reply keeps its existing meaning (not this error).
         assert_eq!(finish_local_reply(String::new()).unwrap(), "");
     }
+}
+
+/// The own-bot sender of the current reply conversation (B11): the
+/// [`REPLY_SENDER`] task-local in the gateway, else the
+/// [`duduclaw_core::ENV_REPLY_SENDER`] env var (MCP server child). Only a
+/// valid employee id counts.
+pub fn reply_sender() -> Option<String> {
+    REPLY_SENDER
+        .try_with(|s| s.clone())
+        .ok()
+        .or_else(|| std::env::var(duduclaw_core::ENV_REPLY_SENDER).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| duduclaw_core::is_valid_agent_id(s))
+}
+
+/// [`reply_sender`] when `(channel, chat_id)` is the current reply
+/// conversation — a send anywhere else keeps the default bot / app.
+pub fn reply_sender_for(channel: &str, chat_id: &str) -> Option<String> {
+    let sender = reply_sender()?;
+    let rc = REPLY_CHANNEL
+        .try_with(|c| c.clone())
+        .ok()
+        .or_else(|| std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).ok())?;
+    let (ch, chat) = crate::decision_notify::parse_origin(&rc)?;
+    (ch == channel.trim() && chat == chat_id.trim()).then_some(sender)
 }

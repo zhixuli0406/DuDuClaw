@@ -121,6 +121,18 @@ fn trajectory_line(rec: &ApprovalRecord) -> String {
 /// treatment for the button-push body so a crafted summary/trajectory can't
 /// forge a fake section boundary in the rendered message.
 pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    approval_body_with(rec, reminder, None)
+}
+
+/// [`approval_body`] with the person the raising run works for
+/// (`on_behalf_of`), already rendered as a display label: shown as
+/// 「由 ○○ 交辦」 under the employee, so whoever decides can tell a request
+/// raised on someone's behalf (including their own) from the employee's own.
+pub(crate) fn approval_body_with(
+    rec: &ApprovalRecord,
+    reminder: bool,
+    assigner: Option<&str>,
+) -> String {
     let head = if reminder {
         "⏰ 這項核可快到期了，逾時會自動拒絕"
     } else {
@@ -128,13 +140,16 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
     };
     format!(
         "{prefix}\n{head}\n\
-         AI 員工：{agent}\n\
+         AI 員工：{agent}\n{assigner}\
          想做的事：{kind}\n\
          內容：{summary}{trajectory}\n\
          期限：{deadline}未回覆將自動拒絕\n\
          編號：{id}",
         prefix = crate::decision_notify::reason_prefix(DecisionSource::Approval),
         agent = crate::goal_state::xml_escape(&rec.agent_id),
+        assigner = assigner
+            .map(|who| format!("由 {} 交辦\n", crate::goal_state::xml_escape(who)))
+            .unwrap_or_default(),
         kind = zh_action_kind(&rec.action_kind),
         summary = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(
             &rec.summary,
@@ -394,6 +409,10 @@ async fn push_dashboard_only(
         return None;
     }
     let mut text = dashboard_only_notice_body(rec, reminder);
+    if let Some(p) = rec.on_behalf_of.as_deref() {
+        let who = crate::on_behalf_of::label::display_label(home_dir, p);
+        text.push_str(&format!("\n由 {} 交辦", crate::goal_state::xml_escape(&who)));
+    }
     if let Some(url) = crate::deep_link::deep_link(
         home_dir,
         crate::deep_link::DeepLinkKind::Approval,
@@ -443,7 +462,11 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         return None;
     }
 
-    let body = approval_body(rec, reminder);
+    let assigner = rec
+        .on_behalf_of
+        .as_deref()
+        .map(|p| crate::on_behalf_of::label::display_label(home_dir, p));
+    let body = approval_body_with(rec, reminder, assigner.as_deref());
     // A clickable deep link to the unified inbox — `None` when no dashboard
     // base URL is configured/derivable, in which case the rendered text stays
     // exactly as it reads without this feature.
@@ -569,6 +592,28 @@ pub(crate) async fn apply_decision(
     );
     if auth != PressAuth::Allow {
         return Err(refusal_text(auth, "核准"));
+    }
+    // `[approval] forbid_self_approval`: the person this request was raised
+    // for does not approve it themselves (verified account, or the same
+    // unbound sender by keyed digest).
+    let decider = crate::trigger_route::access::verified_user_for_channel_sender(
+        home_dir,
+        channel,
+        channel_user_id,
+    )
+    .and_then(|u| duduclaw_core::HumanPrincipal::user(&u))
+    .or_else(|| {
+        let digest = crate::trigger_route::access::keyed_digest(home_dir, channel, channel_user_id);
+        duduclaw_core::HumanPrincipal::unmapped(channel, &digest)
+    })
+    .map(|p| p.to_string());
+    if crate::on_behalf_of::self_approval::refuses(
+        home_dir,
+        rec.on_behalf_of.as_deref(),
+        decider.as_deref(),
+        approve,
+    ) {
+        return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
     }
 
     // ── decide ──────────────────────────────────────────────
@@ -843,6 +888,7 @@ mod tests {
             binding: None,
             answer: None,
             invalidated_reason: None,
+            on_behalf_of: None,
         }
     }
 

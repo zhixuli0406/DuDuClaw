@@ -65,7 +65,7 @@ impl MethodHandler {
         // Per-agent channel: format "discord:agent_name", "telegram:agent_name", etc.
         if let Some((platform, agent_name)) = channel_type.split_once(':') {
             let channel_section = match platform {
-                "discord" | "telegram" | "slack" => platform,
+                "discord" | "telegram" | "slack" | "googlechat" => platform,
                 _ => {
                     return WsFrame::error_response(
                         "",
@@ -92,6 +92,10 @@ impl MethodHandler {
 
             // Hot-stop the per-agent bot
             self.hot_stop_channel(channel_type).await;
+            crate::agent_channels::identity::clear(channel_type);
+            if platform == "googlechat" {
+                crate::googlechat_agents::forget(agent_name);
+            }
 
             info!(channel_type, "Per-agent channel removed and stopped");
             return WsFrame::ok_response(
@@ -301,6 +305,13 @@ impl MethodHandler {
         let mut restarted = Vec::new();
         for ch in channel_types {
             let label = format!("{ch}:{agent_name}");
+            // Telegram restarts only this employee's bot (one poller per bot).
+            if *ch == "telegram" {
+                if self.restart_agent_telegram(agent_name).await {
+                    restarted.push(label);
+                }
+                continue;
+            }
             self.hot_stop_channel(&label).await;
 
             let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match *ch {

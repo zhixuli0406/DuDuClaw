@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+mod team_history_rpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -183,6 +184,8 @@ mod device_rpc;
 mod device_timedate_rpc;
 mod maintenance_rpc;
 mod device_backup;
+mod agent_channels_gchat_rpc;
+mod agent_channels_rpc;
 mod dispatch_core;
 mod dispatch_kb;
 mod dispatch_kb_agent;
@@ -413,7 +416,10 @@ impl MethodHandler {
         ctx: &UserContext,
         conn: crate::power_local::RpcConnInfo,
     ) -> WsFrame {
-        self.dispatch(method, params, ctx, conn).await
+        // Keep the shared dispatcher off the caller's async state. At -O0
+        // its ~21 KiB future is otherwise copied through each outer poll
+        // frame and repeated calls can exhaust a default worker stack.
+        Box::pin(self.dispatch(method, params, ctx, conn)).await
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
@@ -499,6 +505,9 @@ impl MethodHandler {
             return frame;
         }
         if let Some(frame) = self.dispatch_kb(method, &params, ctx).await {
+            return frame;
+        }
+        if let Some(frame) = self.dispatch_agent_channels(method, &params, ctx).await {
             return frame;
         }
         self.dispatch_core(method, params, ctx, conn).await
