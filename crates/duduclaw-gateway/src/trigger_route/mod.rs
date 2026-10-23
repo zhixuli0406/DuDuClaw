@@ -10,12 +10,18 @@
 //! | sender | may call |
 //! |---|---|
 //! | dashboard Admin | everyone |
-//! | dashboard user (WebChat) | employees bound to the account (any level) |
-//! | messaging-app sender mapped to a dashboard account (verified `channel_identities`) | bound employees, plus the default employee and `[channels] public_trigger` employees |
+//! | dashboard user (WebChat), or a messaging-app sender mapped to one (verified `channel_identities`) | employees bound to the account (any level); for a Manager also the employees bound to anyone below them (`users.manager_user_id`, at most Operator); plus the default employee and `[channels] public_trigger` employees |
 //! | anyone else (LINE friend, Telegram user, web-widget visitor) | the default employee and `public_trigger` employees |
 //!
+//! The account part is read live from `users.db` ([`access::load_account`]):
+//! a binding, role or manager change reaches the next message (the caches
+//! are keyed by `auth_meta.acl_generation`).
+//!
 //! A message that only calls employees the sender may not call is refused
-//! without a model call. A lone `@` (or a partial or ambiguous name) asks for
+//! without a model call when the sender is a dashboard account (directly or
+//! through a verified channel identity); for an unmapped sender such a name
+//! is treated like a name that matches nobody (owner decision: no employee
+//! enumeration by outsiders). A lone `@` (or a partial or ambiguous name) asks for
 //! the list of callable employees. On channels, `@name` with no task arms a
 //! one-shot addressee ([`pending`]): only the sender's next message in that
 //! conversation goes to that employee.
@@ -32,9 +38,12 @@ pub mod turn;
 
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod team_tests;
 
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
 use duduclaw_agent::trigger_match::{self, MentionScan, MentionTarget};
+use duduclaw_auth::GrantSource;
 
 pub use access::{Sender, SenderAccess};
 
@@ -91,14 +100,16 @@ pub fn mention_targets(reg: &AgentRegistry) -> Vec<MentionTarget> {
 }
 
 /// Decide what `text` asks for. `fallback` is the conversation's default
-/// employee (who answers when nobody is called).
+/// employee (who answers when nobody is called). A chat command (`/goal …`,
+/// a safety word) never calls anyone: its `@name` is an argument, not an
+/// addressee, so it must not arm a one-shot addressee either.
 pub fn decide(
     reg: &AgentRegistry,
     text: &str,
     access: &SenderAccess,
     fallback: Option<&str>,
 ) -> TriggerRoute {
-    if !may_mention(text) {
+    if !may_mention(text) || crate::chat_commands::is_command(text) {
         return TriggerRoute::None;
     }
     let targets = mention_targets(reg);
@@ -109,6 +120,13 @@ pub fn decide(
             bare: trigger_match::task_text_without(text, &hit).is_empty(),
             agent: hit.id,
         },
+        // Only a sender we can name (a dashboard account, directly or
+        // through a verified channel identity) is told a call was refused.
+        // For an unmapped sender (a LINE friend, a Telegram user, a website
+        // or Odoo Live Chat visitor) a name they may not call reads like a
+        // name that matches nobody: plain text for the default employee, so
+        // the refusal cannot be used to find out which employees exist.
+        MentionScan::Forbidden(_) if matches!(access.sender, Sender::Unmapped) => TriggerRoute::None,
         MentionScan::Forbidden(hit) => TriggerRoute::Forbidden { agent: hit.id },
         MentionScan::Partial { token, candidates } => TriggerRoute::List { token, candidates },
     }
@@ -120,11 +138,36 @@ pub fn callable_ids(
     access: &SenderAccess,
     fallback: Option<&str>,
 ) -> Vec<String> {
+    callable_grants(reg, access, fallback)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Every employee `access` may call, in id order, with why. Uses exactly
+/// the predicate [`decide`] uses, so the list and the router never disagree.
+pub fn callable_grants(
+    reg: &AgentRegistry,
+    access: &SenderAccess,
+    fallback: Option<&str>,
+) -> Vec<(String, GrantSource)> {
     mention_targets(reg)
         .into_iter()
-        .filter(|t| reg.get(&t.id).is_some_and(|a| access.may_call(a, fallback)))
-        .map(|t| t.id)
+        .filter_map(|t| {
+            let grant = reg.get(&t.id).and_then(|a| access.grant(a, fallback))?;
+            Some((t.id, grant))
+        })
         .collect()
+}
+
+/// Why `access` may call `agent` (for the audit trail), if they may.
+pub fn grant_for(
+    reg: &AgentRegistry,
+    access: &SenderAccess,
+    agent: &str,
+    fallback: Option<&str>,
+) -> Option<GrantSource> {
+    reg.get(agent).and_then(|a| access.grant(a, fallback))
 }
 
 /// The display name of `id`, or the id itself.
@@ -215,10 +258,12 @@ pub fn allow_direct_reply(
     }
 }
 
-/// Log a trigger-routing decision. Allowed switches log at info; refusals
-/// also go to `security_audit.jsonl` so they can be reviewed later. The
-/// sender is recorded as the dashboard account when mapped, else as an HMAC
-/// of the channel id under a per-home key (never the raw platform id).
+/// Log a trigger-routing decision. Allowed switches log at info with where
+/// the right came from (`via`: `admin`, `binding`, `team:<user>:<depth>`,
+/// `default`, `public`); refusals also go to `security_audit.jsonl` so they
+/// can be reviewed later. The sender is recorded as the dashboard account
+/// when mapped, else as an HMAC of the channel id under a per-home key
+/// (never the raw platform id).
 pub fn audit(
     home: &std::path::Path,
     channel: &str,
@@ -226,9 +271,11 @@ pub fn audit(
     channel_sender: &str,
     agent: &str,
     outcome: &'static str,
+    via: Option<&GrantSource>,
 ) {
     let who = access.audit_label(home, channel, channel_sender);
-    tracing::info!(channel, sender = %who, agent, outcome, "trigger routing decision");
+    let via = via.map(GrantSource::label).unwrap_or_default();
+    tracing::info!(channel, sender = %who, agent, outcome, via = %via, "trigger routing decision");
     if outcome == "refused" && !recently_audited(&who, agent) {
         let event = duduclaw_security::audit::AuditEvent::new(
             "trigger_route_refused",

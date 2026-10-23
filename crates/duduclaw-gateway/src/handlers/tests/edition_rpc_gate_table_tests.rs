@@ -91,6 +91,9 @@ fn personal_surfaces_are_untouched() {
         "security.credential_hygiene",
         "security.credential_inventory",
         "security.credential_cleanup",
+        "security.credential_protection",
+        "security.credential_protection_enable",
+        "security.credential_protection_disable",
         "killswitch.get",
         "killswitch.update",
         // 帳務：同一 RPC 服務個人版預算檢視，分區隱藏在前端

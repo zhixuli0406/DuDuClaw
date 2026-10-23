@@ -35,6 +35,27 @@ impl MethodHandler {
                 }
             };
         }
+        // Task board listing (`tasks.list`, `tasks.list_page`): like
+        // `check_agent_filter!(Viewer)`, and a Manager may also list an
+        // employee they may hand work to through a report
+        // (`UserContext::can_assign_to`). Rows they may not read come back as
+        // board cards (`TaskReader`).
+        macro_rules! check_task_board_filter {
+            () => {
+                if !ctx.is_admin() {
+                    match params.get("agent_id").and_then(|v| v.as_str()) {
+                        Some(id) if !id.is_empty() => {
+                            if !ctx.has_agent_access(id, AccessLevel::Viewer) && !ctx.can_assign_to(id) {
+                                return WsFrame::error_response("", "permission denied");
+                            }
+                        }
+                        _ => {
+                            return WsFrame::error_response("", "agent_id parameter is required");
+                        }
+                    }
+                }
+            };
+        }
         // Helper for list/filter RPCs that accept an OPTIONAL `agent_id` filter.
         // Admins may list across all agents; non-admins must scope the query to
         // an agent they are bound to (otherwise they could enumerate other
@@ -276,8 +297,9 @@ impl MethodHandler {
             "workflow_runs.cancel" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_cancel(params,ctx).await),
             "workflow_runs.reset_failures" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_reset_failures(params,ctx).await),
             "tasks.list" => {
-                // Non-admins must scope the listing to a bound agent.
-                check_agent_filter!(AccessLevel::Viewer);
+                // Non-admins must scope the listing to an agent they are
+                // bound to or may assign to.
+                check_task_board_filter!();
                 self.handle_tasks_list(params, ctx).await
             }
             "tasks.create" => {
@@ -290,7 +312,12 @@ impl MethodHandler {
                 if assigned_to.is_empty() {
                     return WsFrame::error_response("", "assigned_to is required");
                 }
-                check_agent_named!(assigned_to, AccessLevel::Operator);
+                // Assigning work: a direct Operator/Owner binding, Admin, or
+                // a team grant that derived Operator (a Manager handing work
+                // to a report's employee). Never wider than that.
+                if !ctx.can_assign_to(assigned_to) {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 self.handle_tasks_create(params, ctx).await
             }
             "tasks.update" => self.handle_tasks_update(params, ctx).await,
@@ -310,7 +337,7 @@ impl MethodHandler {
             // apply to finished tasks. Same Viewer/agent-filter gate as
             // `tasks.list`.
             "tasks.list_page" => {
-                check_agent_filter!(AccessLevel::Viewer);
+                check_task_board_filter!();
                 self.handle_tasks_list_page(params, ctx).await
             }
             // L2: task comments. Access is gated inside the handler by the

@@ -11,6 +11,7 @@ mod edition_rpc_gate_table_tests;
 mod must_change_password_gate_tests;
 mod users_change_email_tests;
 mod live_acl_tests;
+mod team_callable_rpc_tests;
 mod data_file_guard_field_tests;
 mod evolution_v3_dashboard_tests;
 mod goal_task_settle_verb_tests;
@@ -78,3 +79,4 @@ mod reseller_boundary_tests;
 mod product_policy_tests;
 
 mod subscription_risk_gate_tests;
+mod credential_protection_rpc_tests;

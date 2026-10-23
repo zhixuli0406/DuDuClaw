@@ -85,6 +85,37 @@ export interface AgentEvolution {
   max_silence_hours: number;
 }
 
+/** Where the right to call an AI staff member comes from (`agents.callable`). */
+export type CallableVia = 'admin' | 'binding' | 'team' | 'default' | 'public';
+
+/** One AI staff member the signed-in account may call from the chat: the
+ *  WebChat `@` list and staff picker. Computed on the server with the same
+ *  check every message goes through, so everything listed can be called. */
+export interface CallableAgent {
+  name: string;
+  display_name: string;
+  /** The exact `@…` text that calls this staff member. */
+  call_text: string;
+  department?: string;
+  icon?: string;
+  has_avatar?: boolean;
+  trigger?: string;
+  role?: string;
+  status?: string;
+  via: CallableVia;
+  /** `team` only: the report whose AI staff this is. */
+  via_user?: string;
+  via_user_name?: string;
+  depth?: number;
+  /** Access the grant carries; `null` for the default / public staff. */
+  level: 'owner' | 'operator' | 'viewer' | null;
+  /** May hand this staff member a task. */
+  assignable: boolean;
+  /** May be picked as the conversation partner (the default staff member is
+   *  reached by picking nobody; public staff only by `@`). */
+  selectable: boolean;
+}
+
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
@@ -547,6 +578,35 @@ export interface CredentialCleanupResult {
   removed_paths: string[];
   backup_path?: string;
   message?: string;
+}
+
+// ── Credential protection (B2c) ──
+// `security.credential_protection*`: where the credentials that let an AI
+// employee act as a specific person are protected. Never carries a key —
+// only a non-secret key id.
+export type CredentialProtectionLevel = 'file' | 'user_store' | 'app_bound';
+export type CredentialProtectionState =
+  | 'not_enabled'
+  | 'ready'
+  | 'needs_authorization'
+  | 'missing'
+  | 'key_changed'
+  | 'invalid'
+  | 'unsupported'
+  | 'unavailable';
+export interface CredentialProtectionStatus {
+  /** Effective level now (`file` unless `ready`). */
+  level: CredentialProtectionLevel;
+  /** What this platform's credential store gives once enabled. */
+  platform_level: CredentialProtectionLevel;
+  backend: 'macos_keychain' | 'windows_credential_manager' | 'none';
+  state: CredentialProtectionState;
+  key_id: string | null;
+  enabled_at: string | null;
+  person_identity_allowed: boolean;
+  /** zh-TW one-liner from the gateway (CLI uses the same text). */
+  summary: string;
+  detail: string;
 }
 
 // ── Credential inventory (WP-H1 P1) ──
@@ -5626,6 +5686,15 @@ export const api = {
      *  (hidden by default). */
     list: (params?: { include_archived?: boolean }) =>
       client.call('agents.list', params ?? {}) as Promise<{ agents: AgentDetail[] }>,
+    /** AI staff the caller may call from the chat (own, team, default,
+     *  public), with where each right comes from. */
+    /** `sessionId`: the current WebChat conversation, so "default" in the
+     *  list is the employee that answers there when nobody is called. */
+    callable: (sessionId?: string | null) =>
+      client.call('agents.callable', sessionId ? { session_id: sessionId } : {}) as Promise<{
+        agents: CallableAgent[];
+        default_agent: string | null;
+      }>,
     status: (agentId: string) =>
       client.call('agents.status', { agent_id: agentId }) as Promise<AgentDetail>,
     create: (params: {
@@ -6899,6 +6968,16 @@ export const api = {
      *  backend round-trips (WP-H1 P1). */
     credentialInventory: () =>
       client.call('security.credential_inventory') as Promise<CredentialInventoryReport>,
+    /** B2c: where person-identity credentials are protected (no key material). */
+    credentialProtection: () =>
+      client.call('security.credential_protection') as Promise<CredentialProtectionStatus>,
+    /** Create the protected key in the OS keychain. `reset` replaces a key
+     *  that exists but cannot be used (voids credentials sealed with it). */
+    credentialProtectionEnable: (reset = false) =>
+      client.call('security.credential_protection_enable', { reset }) as Promise<CredentialProtectionStatus>,
+    /** Remove the protected key; saved person credentials stop working. */
+    credentialProtectionDisable: () =>
+      client.call('security.credential_protection_disable', { confirm: true }) as Promise<CredentialProtectionStatus>,
   },
   audit: {
     unifiedLog: (params?: {

@@ -292,6 +292,27 @@ fn manager_reaches_two_levels_down_at_most_operator() {
 }
 
 #[test]
+fn team_grants_on_a_read_only_connection_match_effective_access() {
+    let (db, t) = test_db();
+    let o = org(&db);
+    let ro = rusqlite::Connection::open_with_flags(
+        t.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let grants = team_grants_on(&ro, &o.mgr).unwrap();
+    let live = db.effective_access(&o.mgr).unwrap().unwrap();
+    assert_eq!(grants, live.team);
+    assert_eq!(grants["sales"].level, AccessLevel::Operator);
+    assert_eq!(grants["sales"].via_user, o.emp1);
+    assert_eq!(grants["sales"].depth, 2);
+    assert_eq!(grants["hr"].level, AccessLevel::Viewer);
+    assert!(!grants.contains_key("finance"));
+    // Someone outside the tree reaches nothing.
+    assert!(team_grants_on(&ro, &o.other).unwrap().is_empty());
+}
+
+#[test]
 fn employees_get_no_team_and_direct_bindings_win_ties() {
     let (db, _t) = test_db();
     let o = org(&db);

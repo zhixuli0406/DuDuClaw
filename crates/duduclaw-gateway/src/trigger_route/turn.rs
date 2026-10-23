@@ -124,7 +124,8 @@ pub fn decision_for_route(
         },
         TriggerRoute::Routed { agent, bare } => {
             if !turn.quiet {
-                audit(home, turn.channel, access, turn.sender, &agent, "allowed");
+                let via = super::grant_for(reg, access, &agent, turn.fallback);
+                audit(home, turn.channel, access, turn.sender, &agent, "allowed", via.as_ref());
             }
             if bare && !turn.sender.is_empty() {
                 if turn.pending == PendingPolicy::Live {
@@ -146,7 +147,7 @@ pub fn decision_for_route(
         }
         TriggerRoute::Forbidden { agent } => {
             if !turn.quiet {
-                audit(home, turn.channel, access, turn.sender, &agent, "refused");
+                audit(home, turn.channel, access, turn.sender, &agent, "refused", None);
             }
             TurnDecision::Reply {
                 text: texts::forbidden(lang).to_string(),
@@ -193,7 +194,7 @@ fn addressee(
         Some(id)
     } else {
         if !turn.quiet {
-            audit(home, turn.channel, &access, turn.sender, &id, "refused");
+            audit(home, turn.channel, &access, turn.sender, &id, "refused", None);
         }
         None
     }
@@ -225,10 +226,11 @@ pub fn pick_from_list(
         .filter(|a| a.config.agent.status.is_operational())
         .is_some_and(|a| access.may_call(a, turn.fallback));
     if !callable {
-        audit(home, turn.channel, &access, turn.sender, agent, "refused");
+        audit(home, turn.channel, &access, turn.sender, agent, "refused", None);
         return texts::forbidden(lang).to_string();
     }
-    audit(home, turn.channel, &access, turn.sender, agent, "allowed");
+    let via = super::grant_for(reg, &access, agent, turn.fallback);
+    audit(home, turn.channel, &access, turn.sender, agent, "allowed", via.as_ref());
     let key = PendingKey::new(turn.channel, turn.conversation, turn.sender);
     pending::arm(&key, agent, turn.event, turn.seq);
     super::ask_for_task_text(lang, &super::display_name(reg, agent))
@@ -239,9 +241,28 @@ pub fn pick_from_list(
 /// mention-only group modes. Permission is applied later, per sender.
 pub fn calls_anyone(reg: &AgentRegistry, text: &str) -> bool {
     let everyone = SenderAccess {
-        sender: super::Sender::Admin,
+        sender: super::Sender::Admin { user_id: None },
     };
     super::decide(reg, text, &everyone, None).addresses_bot()
+}
+
+/// [`calls_anyone`] for one sender: an unmapped sender's name for an
+/// employee they may not call reads like an unknown name, so it does not
+/// count as addressing the bot either (mention-only groups stay silent,
+/// exactly as for a name that matches nobody).
+pub fn calls_anyone_as(
+    home: &Path,
+    reg: &AgentRegistry,
+    channel: &str,
+    sender: &str,
+    text: &str,
+    fallback: Option<&str>,
+) -> bool {
+    if !super::may_mention(text) {
+        return false;
+    }
+    let access = access::for_channel_sender(home, channel, sender);
+    super::decide(reg, text, &access, fallback).addresses_bot()
 }
 
 /// Whether this reply language is used for `home` (re-exported for adapters
