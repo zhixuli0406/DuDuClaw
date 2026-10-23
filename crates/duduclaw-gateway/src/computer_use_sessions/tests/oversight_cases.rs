@@ -1,6 +1,96 @@
 use super::*;
 
 #[tokio::test]
+async fn a_stop_confirmation_keeps_its_session_fence_after_direct_authority_is_granted() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    let old = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    mgr.stop("alice", Some(&old)).await.unwrap();
+    let new = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let upgraded = duduclaw_auth::UserContext::admin_fallback();
+    assert!(live_view::authorize(
+        &upgraded,
+        "alice",
+        live_view::LiveAction::Watch
+    ));
+    // This is the same post-authority helper called by the actual direct
+    // dashboard RPC, with the confirmation captured before the upgrade.
+    assert!(
+        mgr.live_stop_with_login_bound("alice", &upgraded, false, Some(&old))
+            .await
+            .is_err()
+    );
+    assert!(mgr.live_entry("alice", Some(&new)).is_some());
+}
+
+#[tokio::test]
+async fn a_team_stop_never_terminates_a_replacement_session() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    let old = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    mgr.stop("alice", Some(&old)).await.unwrap();
+    let new = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let actor = duduclaw_auth::UserContext::admin_fallback();
+    assert!(mgr.live_stop_expected("alice", &old, &actor).await.is_err());
+    assert!(
+        mgr.live_status("alice", "manager")["active"]
+            .as_bool()
+            .unwrap()
+    );
+    let result = mgr.live_stop_expected("alice", &new, &actor).await.unwrap();
+    assert_eq!(result["session_id"], new);
+    assert_eq!(result["ended"], true);
+}
+
+#[tokio::test]
+async fn a_team_disclosure_attributes_only_the_actual_starter_among_shared_reports() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    let id = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let now = chrono::Utc::now();
+    mgr.entry("alice")
+        .unwrap()
+        .shared
+        .origin
+        .set(super::super::oversight::SessionOrigin::from_requester(
+            &duduclaw_knowledge::requester::RequesterIdentity::DashboardUser {
+                user_id: "report-a".into(),
+            },
+            now,
+        ))
+        .unwrap();
+    let reports = ["report-a", "report-b"]
+        .into_iter()
+        .map(|user| {
+            (
+                user.to_owned(),
+                duduclaw_auth::OverseenReport {
+                    user_id: user.into(),
+                    display_name: user.into(),
+                    depth: 1,
+                    level: duduclaw_auth::AccessLevel::Operator,
+                },
+            )
+        })
+        .collect();
+    let scope = crate::team_oversight::TeamOversight {
+        viewer_user_id: "manager".into(),
+        agent: "alice".into(),
+        reports,
+        since: now - chrono::Duration::seconds(1),
+        generation: 1,
+    };
+    assert_eq!(
+        mgr.team_report_for("alice", &id, &scope),
+        Some(("report-a".into(), 1))
+    );
+    assert_eq!(mgr.team_report_for("alice", "replaced", &scope), None);
+}
+
+#[tokio::test]
 async fn masked_view_uses_shared_cache_without_queueing_behind_an_employee() {
     let tmp = home();
     let state = Arc::new(FakeState::default());

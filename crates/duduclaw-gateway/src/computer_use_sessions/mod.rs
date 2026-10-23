@@ -39,6 +39,7 @@
 //!   cannot cancel.
 
 pub mod actions;
+pub(crate) mod attended;
 pub mod auth;
 mod backend;
 pub mod gates;
@@ -1081,6 +1082,7 @@ impl ComputerUseSessions {
     }
 
     pub async fn start(&self, agent_id: &str, req: StartRequest) -> Result<Value, OpError> {
+        let origin = oversight::SessionOrigin::capture_live_turn(agent_id, req.turn_id.as_deref());
         if crate::ephemeral::is_ephemeral_id(agent_id) {
             return Err(OpError::new(
                 ErrorCode::Forbidden,
@@ -1245,11 +1247,7 @@ impl ComputerUseSessions {
             nav_hosts: nav_hosts.clone(),
             nav_configured: !nav.hosts.is_empty(),
         };
-        let requester = crate::knowledge::turn_requesters::resolve(agent_id, req.turn_id.as_deref());
-        let _ = session.shared.origin.set(oversight::SessionOrigin::from_requester(
-            &requester,
-            chrono::Utc::now(),
-        ));
+        let _ = session.shared.origin.set(origin);
         let task = req
             .task
             .as_deref()
