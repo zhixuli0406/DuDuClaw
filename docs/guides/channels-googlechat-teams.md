@@ -57,6 +57,9 @@ googlechat_service_account_json = '{ "type": "service_account", ... }'
   messages per person and 40 per space can wait; past that the space is
   told the message was not accepted, at most once a minute per person and
   once every 10 seconds per space. An event without a space is refused.
+- This ordering and its limits apply to each employee's own Chat app too.
+  The queue survives individual webhook requests; different apps in the same
+  space have independent queues and can answer in parallel.
 - Unpublished Chat apps are visible only inside your Workspace org; wider
   distribution requires Google Workspace Marketplace publishing.
 
