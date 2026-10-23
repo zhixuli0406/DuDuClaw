@@ -46,3 +46,16 @@ inspection. It does not exercise the open external-key or remote-MCP paths.
 Final local test counts and live-probe outcomes are recorded in the PR; CI,
 merge, deployment, real-provider acceptance and user acceptance are distinct
 gates.
+
+The 2026-10-23 isolated native probe passed all 12 scenarios after a real
+RPC regression fixed unnecessarily reconfirming an `anyone` policy when
+switching to `none` or `home`. It verified signed subject isolation,
+per-call reauthorization in one MCP process, domain/employee-proof refusals,
+explicit shared-account fallback, tool hiding, master switch, offline denial
+and token-free audit rows. The mock binary was built with no default features
+and `live-test-mocks`; no real Google account or provider consent was used.
+
+The earlier full local command returned failure only in the existing core
+gateway-instance lock reacquisition test. Its gateway and CLI suites passed;
+30 focused reruns and a separate full core rerun passed. These separate runs
+do not change the original command's failure result.
