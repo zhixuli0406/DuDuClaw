@@ -8,6 +8,7 @@ struct Fx {
     admin: UserContext,
     employee: String,
     external: String,
+    since_micros: i64,
 }
 
 #[tokio::test]
@@ -58,6 +59,10 @@ fn denied(f: WsFrame) -> Value {
     }
 }
 async fn fixture() -> Fx {
+    fixture_with_manager_id(None).await
+}
+
+async fn fixture_with_manager_id(manager_id: Option<&str>) -> Fx {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("config.toml"),
@@ -74,6 +79,23 @@ async fn fixture() -> Fx {
         )
         .unwrap()
         .id;
+    let manager = if let Some(manager_id) = manager_id {
+        let fixture_id = uuid::Uuid::parse_str(manager_id).unwrap();
+        assert_eq!(fixture_id.get_version_num(), 4);
+        // No reference to this newly created user exists yet. Keep the
+        // deterministic ID local to the one regression journey that opts in.
+        let changed = rusqlite::Connection::open(home.path().join("users.db"))
+            .unwrap()
+            .execute(
+                "UPDATE users SET id = ?1 WHERE id = ?2",
+                params![manager_id, manager],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        manager_id.to_owned()
+    } else {
+        manager
+    };
     let employee = db
         .create_user(
             "employee@test.invalid",
@@ -153,6 +175,7 @@ async fn fixture() -> Fx {
         admin,
         employee,
         external,
+        since_micros: since,
     }
 }
 
@@ -162,7 +185,8 @@ async fn manager_reads_report_fulltext_external_masked_and_never_gains_old_reade
 }
 
 async fn manager_reads_body() {
-    let f = fixture().await;
+    let audit_started = Utc::now();
+    let f = fixture_with_manager_id(Some("00000912-0000-4000-8000-000000000001")).await;
     let mine_rc = f.handler.reply_ctx.read().await.clone().unwrap();
     {
         let conn = mine_rc.session_manager.acquire().await;
@@ -297,7 +321,310 @@ async fn manager_reads_body() {
     let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
     assert_eq!(audit.matches("team_history_viewed").count(), 3);
     assert!(!audit.contains(&f.external));
-    assert!(!audit.contains("0912") && !audit.contains("a@example.com"));
+    // Exact metadata rejects content without treating lawful UUID/hash/time
+    // digits as PII. The historical CI audit was not retained; this fixture
+    // establishes the short-substring false positive, not its historical cause.
+    let digests = ["mine", "report", f.external.as_str()]
+        .map(|id| crate::team_history::audit::session_digest(f.home.path(), id).unwrap());
+    let expected = expected_journey_audit(
+        &f.manager.user_id,
+        &f.admin.user_id,
+        &f.employee,
+        f.since_micros,
+        f.db.acl_generation().unwrap(),
+        &digests,
+    );
+    let rows: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("audit JSON syntax at /"))
+        .collect();
+    assert_eq!(rows.len(), expected.len(), "audit row count at /");
+    let audit_finished = Utc::now();
+    for (ordinal, (row, expected)) in rows.iter().zip(&expected).enumerate() {
+        validate_journey_audit_row(row, expected, audit_started, audit_finished)
+            .unwrap_or_else(|rule| panic!("audit row {} contract: {rule}", ordinal + 1));
+    }
+    assert!(
+        matches!(
+            duduclaw_security::audit_chain::verify_chain(
+                &f.home.path().join("security_audit.jsonl")
+            )
+            .expect("audit chain read at /"),
+            duduclaw_security::audit_chain::ChainVerifyResult::Intact { lines_checked: 8 }
+        ),
+        "audit chain integrity at /_prev_hash"
+    );
+}
+
+// Each expected row is a closed event-specific schema, including all nested
+// values. None of these expected values come from the RPC/audit under test.
+fn expected_journey_audit(
+    manager: &str,
+    admin: &str,
+    employee: &str,
+    since_micros: i64,
+    generation: u64,
+    digests: &[String; 3],
+) -> Vec<Value> {
+    let since = DateTime::from_timestamp_micros(since_micros).unwrap();
+    let event = |kind: &str, agent: &str, severity: &str, details: Value| json!({"event_type":kind,"agent_id":agent,"severity":severity,"details":details});
+    let mut rows = vec![event(
+        "team_history_setting_changed",
+        "",
+        "warning",
+        json!({"actor":"edition_watcher","old":null,"new":true,"since_micros":since_micros}),
+    )];
+    for (index, class, channel, report, depth, masked) in [
+        (0, "own", Value::Null, Value::Null, Value::Null, json!({})),
+        (
+            1,
+            "report_webchat",
+            Value::Null,
+            json!(employee),
+            json!(1),
+            json!({}),
+        ),
+        // The assistant attachment line is withheld in full. The Unicode
+        // email regex covers the entire user line, including its phone. The
+        // higher-priority phone splits that email into two mask parts; recount
+        // counts rendered parts, not distinct PII values. Categories stay closed.
+        (
+            2,
+            "external",
+            json!("line"),
+            Value::Null,
+            Value::Null,
+            json!({"PHONE":1,"EMAIL":2}),
+        ),
+    ] {
+        rows.push(event(
+            "team_history_viewed",
+            "sales",
+            "info",
+            json!({
+                "viewer":manager,"viewer_role":"manager","agent":"sales",
+                "session":digests[index],"class":class,"channel":channel,
+                "report":report,"via_depth":depth,"messages":2,"masked":masked,
+                "ner":false,"since":since,"generation":generation,
+            }),
+        ));
+    }
+    rows.push(event(
+        "team_history_listed",
+        "sales",
+        "info",
+        json!({
+            "viewer":manager,"viewer_role":"manager","agent":"sales",
+            "class":null,"report":null,"sessions":1,"since":since,"generation":generation,
+        }),
+    ));
+    // Hidden/missing/inaccessible sessions are indistinguishable. Identical
+    // denials for the same viewer/agent/reason are deduplicated for 60 seconds.
+    for (viewer, agent) in [(manager, "sales"), (manager, ""), (admin, "")] {
+        rows.push(event(
+            "team_history_denied",
+            agent,
+            "warning",
+            json!({"viewer":viewer,"agent":agent,"reason":"hidden"}),
+        ));
+    }
+    rows
+}
+
+fn validate_journey_audit_row(
+    row: &Value,
+    expected: &Value,
+    started: DateTime<Utc>,
+    finished: DateTime<Utc>,
+) -> Result<(), &'static str> {
+    let envelope = row.as_object().ok_or("object at /")?;
+    let keys = [
+        "timestamp",
+        "event_type",
+        "agent_id",
+        "severity",
+        "details",
+        "_prev_hash",
+    ];
+    if envelope.len() != keys.len() || keys.iter().any(|key| !envelope.contains_key(*key)) {
+        return Err("closed envelope at /");
+    }
+    let timestamp = row["timestamp"]
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .ok_or("RFC3339 at /timestamp")?;
+    if timestamp < started || timestamp > finished {
+        return Err("journey time window at /timestamp");
+    }
+    let previous = row["_prev_hash"]
+        .as_str()
+        .ok_or("hex string at /_prev_hash")?;
+    if previous.len() != 64
+        || !previous
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("64 lowercase hex at /_prev_hash");
+    }
+    if row["event_type"] != expected["event_type"] {
+        return Err("exact event at /event_type");
+    }
+    if row["agent_id"] != expected["agent_id"] {
+        return Err("exact fixture agent at /agent_id");
+    }
+    if row["severity"] != expected["severity"] {
+        return Err("exact event severity at /severity");
+    }
+    // Equality to trusted fixtures checks the complete key set, JSON types,
+    // UUIDs, keyed session digest, ACL generation, window and mask counts.
+    // It rejects arbitrary strings even when their type/shape looks valid.
+    if row["details"] != expected["details"] {
+        // Diagnostic-only refinement: the enclosing exact equality remains
+        // the acceptance rule. Pointers are trusted static schema names; never
+        // print values, unknown keys, or an untrusted event string.
+        for pointer in [
+            "/details/actor",
+            "/details/old",
+            "/details/new",
+            "/details/since_micros",
+            "/details/viewer",
+            "/details/viewer_role",
+            "/details/agent",
+            "/details/session",
+            "/details/class",
+            "/details/channel",
+            "/details/report",
+            "/details/via_depth",
+            "/details/messages",
+            "/details/masked/PHONE",
+            "/details/masked/EMAIL",
+            "/details/masked",
+            "/details/ner",
+            "/details/since",
+            "/details/generation",
+            "/details/sessions",
+            "/details/reason",
+        ] {
+            if row.pointer(pointer) != expected.pointer(pointer) {
+                return Err(pointer);
+            }
+        }
+        return Err("closed exact fixture metadata at /details");
+    }
+    Ok(())
+}
+
+#[test]
+fn audit_metadata_accepts_lawful_digits_and_rejects_content_mutations() {
+    let instant = DateTime::parse_from_rfc3339("2026-09-12T00:00:00.0912Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let expected = expected_journey_audit(
+        "00000912-0000-4000-8000-000000000001",
+        "00000912-0000-4000-8000-000000000002",
+        "00000912-0000-4000-8000-000000000003",
+        instant.timestamp_micros(),
+        10912,
+        &[
+            "0912abcdef012345".into(),
+            "abcdef0912012345".into(),
+            "abcdef0123450912".into(),
+        ],
+    );
+    let make_row = |expected: &Value| {
+        let mut row = expected.clone();
+        row["timestamp"] = json!(instant);
+        // Structural positive only: integration separately verifies the real
+        // production chain, so no claim this synthetic hash has a valid chain.
+        row["_prev_hash"] = json!(format!("0912{}", "0".repeat(60)));
+        row
+    };
+    for expected in &expected {
+        let row = make_row(expected);
+        assert!(validate_journey_audit_row(&row, expected, instant, instant).is_ok());
+        for secret in [
+            "0912-345-678",
+            "0912345678",
+            "a@example.com",
+            "電話0912-345-678和a@example.com",
+            "收到0912345678，📎DELIVER:/private/person.txt",
+            "OLD-CONTENT-SECRET",
+            "OLD-TITLE-SECRET",
+            "SUMMARY-SECRET",
+            "📎DELIVER:/private/person.txt",
+            "/private/person.txt",
+            "person.txt",
+            "line:C0123456789abcdef0123456789abcdef",
+        ] {
+            for key in ["content", "phone", "email", "attachment_path"] {
+                let mut mutated = row.clone();
+                mutated[key] = json!(secret);
+                assert!(
+                    validate_journey_audit_row(&mutated, expected, instant, instant).is_err(),
+                    "reject unknown envelope field at /"
+                );
+                let mut mutated = row.clone();
+                mutated["details"][key] = json!(secret);
+                assert!(
+                    validate_journey_audit_row(&mutated, expected, instant, instant).is_err(),
+                    "reject unknown details field at /details"
+                );
+            }
+            // Overwrite every allowed field, including valid-typed metadata
+            // and numeric/bool fields, rather than only testing extra keys.
+            for key in [
+                "timestamp",
+                "event_type",
+                "agent_id",
+                "severity",
+                "_prev_hash",
+            ] {
+                let mut mutated = row.clone();
+                mutated[key] = json!(secret);
+                assert!(
+                    validate_journey_audit_row(&mutated, expected, instant, instant).is_err(),
+                    "reject envelope field overwrite at /"
+                );
+            }
+            for key in expected["details"].as_object().unwrap().keys() {
+                let mut mutated = row.clone();
+                mutated["details"][key] = json!(secret);
+                assert!(
+                    validate_journey_audit_row(&mutated, expected, instant, instant).is_err(),
+                    "reject metadata overwrite at /details"
+                );
+            }
+        }
+        // Shape-valid substitutions still fail the fixture's exact contract.
+        for (pointer, replacement) in [
+            ("/details/generation", json!(10913)),
+            ("/details/session", json!("0000000000000000")),
+            ("/details/masked", json!({"PHONE":2,"EMAIL":2})),
+            ("/details/masked", json!({"PHONE":1,"EMAIL":1})),
+            (
+                "/details/masked",
+                json!({"PHONE":1,"EMAIL":2,"a@example.com":1}),
+            ),
+            ("/details/masked", json!({"PHONE":"0912345678","EMAIL":2})),
+        ] {
+            if row.pointer(pointer).is_some() {
+                let mut mutated = row.clone();
+                *mutated.pointer_mut(pointer).unwrap() = replacement;
+                assert!(
+                    validate_journey_audit_row(&mutated, expected, instant, instant).is_err(),
+                    "reject shape-valid metadata mutation at /details"
+                );
+            }
+        }
+        for key in row.as_object().unwrap().keys() {
+            let mut mutated = row.clone();
+            mutated.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_journey_audit_row(&mutated, expected, instant, instant).is_err(),
+                "reject missing envelope field at /"
+            );
+        }
+    }
 }
 
 #[test]
