@@ -115,6 +115,11 @@ pub(crate) async fn spawn_agent_with_ctx(
     if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
+    // The person this run works for (host env only); the dispatcher scopes
+    // it onto the spawned employee's run.
+    if let Some(principal) = host_on_behalf_of(home_dir, caller) {
+        entry["on_behalf_of"] = serde_json::json!(principal);
+    }
 
     // RFC-22 Decision 2-C (Phase 3 W1): on bus_queue write failure, surface
     // the underlying I/O error to the caller. Previously we returned an
