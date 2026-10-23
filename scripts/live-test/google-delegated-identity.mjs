@@ -14,6 +14,7 @@ import { once } from 'node:events';
 
 const binary = resolve(process.argv[2] ?? 'target/debug/duduclaw');
 const home = mkdtempSync(join(tmpdir(), 'ddc-google-delegate-'));
+console.log(`ARTIFACTS ${home}`);
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });

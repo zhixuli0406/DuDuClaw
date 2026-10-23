@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 關閉員工的 Google 個人代表身分或改回公司帳號時，不再要求確認已移除的「任何人都能使用」限制；設定個人代表且開放任何人使用時仍須確認。
+
 ### Added
 - 每位 AI 員工可以用不同的 Google 帳號（公司授權代表，B2a）：Google Workspace 客戶用一個開了網域委派的服務帳號，讓每位員工以一位指定同事的身分讀信、存草稿、管理日曆與文件。
   - **設定**：員工頁新增「連線」分頁，顯示目前用哪個 Google 帳號；「已設定」僅表示本地資料備妥，需另按「測試連線」確認。管理員可以改成「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。測試會替同事取權杖、比對 Gmail 回報的信箱，再按服務測授權；Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點，試算表、文件、簡報與表單只驗授權簽發，不寄任何東西。「整合 → Google」新增「公司授權代表」分區：匯入服務帳號金鑰、複製用戶端 ID 與完整權限清單、設定允許網域，以及列出各員工的代表帳號。設定為 `agent.toml [google] identity`（`home`／`none`／`delegate:<email>`）、`fallback`、`requesters`；全域預設為 `config.toml [integrations.google_identity] default_identity`、`allowed_subject_domains`。沒寫 `[google]` 的員工照舊用公司共用帳號；改信箱或 fallback 時保留原本的發問者限制，未知型別拒絕。
