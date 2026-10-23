@@ -1,5 +1,7 @@
 # Watching an employee's browser
 
+Only a live, verified human turn establishes the session’s origin. A scheduled or delegated background run does not become a human start by carrying that person’s identity. The admitted origin remains recorded after the turn ends; it grants no continued presence or browser control.
+
 Open `/computer/<employee>` while signed in to the dashboard. This page does
 not grant access to the employee's settings, files, memory, or conversations.
 
@@ -29,7 +31,7 @@ that employee. Repeated polls by the same viewer/session are deduplicated for
 one minute. Viewing requests are bounded per person; the stop action is not
 blocked by the viewing budget.
 
-The stop confirmation is tied to the session being shown. If that session has
+The team-view stop confirmation is tied to the session being shown. If that session has
 ended and a new one has started, the old confirmation cannot stop the new one.
 
 The macOS local-browser target is a separate feature with a different privacy
