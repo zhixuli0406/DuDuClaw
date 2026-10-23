@@ -26,6 +26,25 @@ const FORCED_REFETCH_MIN: Duration = Duration::from_secs(60);
 
 static LAST_FORCED: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
+async fn fetch_jwks(http: &reqwest::Client, jwks_url: &str) -> Result<serde_json::Value, String> {
+    let resp = http
+        .get(jwks_url)
+        .send()
+        .await
+        .map_err(|e| format!("JWKS fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("JWKS fetch status {}", resp.status()));
+    }
+    resp.json().await.map_err(|e| format!("JWKS parse: {e}"))
+}
+
+/// Return the forced-refetch slot of `jwks_url` (its fetch failed).
+fn release_forced_refetch(jwks_url: &str) {
+    if let Some(m) = LAST_FORCED.get() {
+        m.lock().unwrap_or_else(|e| e.into_inner()).remove(jwks_url);
+    }
+}
+
 /// Whether a forced refetch of `jwks_url` may run now (and record it).
 fn forced_refetch_allowed(jwks_url: &str) -> bool {
     let mut map = LAST_FORCED
@@ -80,19 +99,21 @@ async fn rsa_components_for_kid(
         }
     };
     // Unknown kid on a fresh document: refetch at most once a minute.
-    if force_refresh && cached_fresh && !forced_refetch_allowed(jwks_url) {
+    let rate_limited = force_refresh && cached_fresh;
+    if rate_limited && !forced_refetch_allowed(jwks_url) {
         return Err(format!("kid {kid} not found in JWKS"));
     }
 
-    let resp = http
-        .get(jwks_url)
-        .send()
-        .await
-        .map_err(|e| format!("JWKS fetch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("JWKS fetch status {}", resp.status()));
-    }
-    let doc: serde_json::Value = resp.json().await.map_err(|e| format!("JWKS parse: {e}"))?;
+    let doc = match fetch_jwks(http, jwks_url).await {
+        Ok(doc) => doc,
+        Err(e) => {
+            // A failed fetch did not refresh anything: give the slot back.
+            if rate_limited {
+                release_forced_refetch(jwks_url);
+            }
+            return Err(e);
+        }
+    };
     let mut keys: HashMap<String, (String, String)> = HashMap::new();
     for key in doc
         .get("keys")
@@ -175,6 +196,8 @@ mod tests {
         assert!(forced_refetch_allowed(&url));
         assert!(!forced_refetch_allowed(&url), "second forced refetch inside a minute is refused");
         assert!(forced_refetch_allowed(&format!("{url}-other")), "per URL");
+        release_forced_refetch(&url);
+        assert!(forced_refetch_allowed(&url), "a failed fetch returns the slot");
     }
 
     #[test]

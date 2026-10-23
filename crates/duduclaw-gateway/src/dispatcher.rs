@@ -949,7 +949,7 @@ async fn poll_and_dispatch(
 
     // ── Deliver proactive notifications (already removed from the queue) ──
     for send in proactive_sends {
-        match forward_to_channel(
+        match forward_to_channel_as(
             home_dir,
             &send.channel,
             &send.channel_id,
@@ -958,6 +958,7 @@ async fn poll_and_dispatch(
             &send.agent_id,
             &send.agent_id,
             None,
+            send.sender_agent.as_deref(),
         )
         .await
         {
@@ -2293,6 +2294,9 @@ struct ProactiveSend {
     channel_id: String,
     thread_id: Option<String>,
     message: String,
+    /// B11: the employee whose own bot / app the target conversation came in
+    /// through (`None` = the default token cascade).
+    sender_agent: Option<String>,
 }
 
 /// Parse one bus-queue line as a `proactive_notification`, `None` for every
@@ -2307,7 +2311,20 @@ fn parse_proactive_line(line: &str) -> Option<ProactiveSend> {
     }
     let agent_id = v.get("agent_id")?.as_str()?.trim().to_string();
     let channel = v.get("channel")?.as_str()?.trim().to_string();
-    let chat_id = v.get("chat_id")?.as_str()?.trim().to_string();
+    let raw_chat = v.get("chat_id")?.as_str()?.trim();
+    // A chat id taken from a bucketed session id (`<chat>#agent:<id>`) is
+    // the chat plus the employee whose own bot the conversation used (B11).
+    let (chat_part, bucket_sender) = match raw_chat.split_once("#agent:") {
+        Some((chat, agent)) => (chat, Some(agent.to_string())),
+        None => (raw_chat, None),
+    };
+    let chat_id = chat_part.to_string();
+    let sender_agent = v
+        .get("sender_agent")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .or(bucket_sender)
+        .filter(|a| duduclaw_core::is_valid_agent_id(a));
     let message = v.get("message")?.as_str()?.trim().to_string();
     if agent_id.is_empty() || channel.is_empty() || chat_id.is_empty() || message.is_empty() {
         return None;
@@ -2328,6 +2345,7 @@ fn parse_proactive_line(line: &str) -> Option<ProactiveSend> {
         channel_id,
         thread_id,
         message,
+        sender_agent,
     })
 }
 
@@ -5457,6 +5475,15 @@ bot_token = "{token}"
         let send = parse_proactive_line(line).unwrap();
         assert_eq!(send.channel_id, "-100");
         assert_eq!(send.thread_id, Some("77".to_string()));
+        assert_eq!(send.sender_agent, None);
+
+        // B11: a bucketed chat id is the chat plus the own-bot sender.
+        let line = r#"{"type":"proactive_notification","agent_id":"sales","channel":"telegram","chat_id":"555#agent:sales","message":"m"}"#;
+        let send = parse_proactive_line(line).unwrap();
+        assert_eq!(send.channel_id, "555");
+        assert_eq!(send.sender_agent.as_deref(), Some("sales"));
+        let line = r#"{"type":"proactive_notification","agent_id":"sales","channel":"telegram","chat_id":"555","sender_agent":"sales","message":"m"}"#;
+        assert_eq!(parse_proactive_line(line).unwrap().sender_agent.as_deref(), Some("sales"));
     }
 
     #[test]

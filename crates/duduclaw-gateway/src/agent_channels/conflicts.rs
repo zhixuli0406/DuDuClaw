@@ -209,11 +209,24 @@ pub async fn raw_agent_edit_conflict(
             str_at(tg_after, "bot_token").unwrap_or(""),
         );
         let sm_cfg = SecretManagerConfig::load_from_home(home).await;
-        if let Some(token) = reference.resolve(&sm_cfg, home).await {
-            let token = crate::config_crypto::repair_telegram_token(token.expose()).into_owned();
-            if let Some(h) = telegram_bot_holder(home, registry, &token, agent_id).await {
-                return Some(h.telegram_refusal());
+        let has_value = str_at(tg_after, "bot_token_enc").is_some_and(|v| !v.trim().is_empty())
+            || str_at(tg_after, "bot_token").is_some_and(|v| !v.trim().is_empty());
+        match reference.resolve(&sm_cfg, home).await {
+            Some(token) => {
+                let token = crate::config_crypto::repair_telegram_token(token.expose()).into_owned();
+                if let Some(h) = telegram_bot_holder(home, registry, &token, agent_id).await {
+                    return Some(h.telegram_refusal());
+                }
             }
+            // A token that cannot be read cannot be checked: refuse (fail
+            // closed) rather than store a bot that may already be in use.
+            None if has_value => {
+                return Some(
+                    "無法讀取這組 Telegram Bot Token（可能不是這台機器加密的值，或密碼管理工具連不上），所以沒辦法確認它沒有被其他 AI 員工使用，這次沒有儲存。請改在員工頁「專屬通道」重新貼上 Token。"
+                        .into(),
+                );
+            }
+            None => {}
         }
     }
     let gc_after = str_at(section(after, "googlechat"), "project_number").map(str::trim);

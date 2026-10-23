@@ -659,6 +659,8 @@ async fn record_pending_update_report(
         "expected_version": expected_version,
         "initiated_at": chrono::Utc::now().to_rfc3339(),
         "reply_channel_raw": reply_channel_raw,
+        // B11: the own bot / app that conversation came in through.
+        "reply_sender": duduclaw_gateway::claude_runner::reply_sender(),
         "restart_triggered": false,
         "restart_triggered_at": serde_json::Value::Null,
     })

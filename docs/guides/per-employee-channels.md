@@ -71,7 +71,9 @@ How it behaves:
   another app, a wrong audience, a missing or forged token are refused (HTTP
   401). An address for an employee without an app, or an unknown id, answers
   the same 401, so the address does not reveal which employees have an app.
-  One source address may make at most 120 requests a minute.
+  A source address with more than 120 refused requests a minute gets HTTP 429
+  for requests without a plausible token; verified requests are never
+  counted.
 - Replies (and messages this employee forwards to a space later) are sent with
   this app's credentials, so the app must be a member of the space.
 - To change only the project number, leave the key field empty; the stored
@@ -89,8 +91,9 @@ that conversation came in through:
 
 On Telegram this is the employee's own bot; if that bot was removed in the
 meantime the message fails instead of going out through another bot. On
-Google Chat the app that is a member of the space is used (the shared app
-when it is there, otherwise the employee's own app).
+Google Chat the app that most recently received a message from that space is
+used; if Google refuses the send because that app has left the space, it is
+forgotten and the next send uses another app seen there.
 
 ## Security notes
 

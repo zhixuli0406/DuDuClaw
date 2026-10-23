@@ -811,10 +811,17 @@ pub async fn send_text_to_space_as(
     space: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    let creds = sending_creds(home_dir, agent, space).await?;
+    let (creds, member) = sending_creds(home_dir, agent, space).await?;
     let formatted = crate::markdown_render::to_googlechat_text(markdown);
     for chunk in crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK) {
-        if create_message(&creds, space, None, &chunk).await.is_none() {
+        if let Err(status) = post_message(&creds, space, None, &chunk).await {
+            // The registry picked an app that is no longer in the space
+            // (403 / 404): forget it so the next send picks another (L-3).
+            if let Some(member) = member.as_deref()
+                && matches!(status, Some(403) | Some(404))
+            {
+                crate::agent_channels::gchat_spaces::forget(home_dir, space, member);
+            }
             return Err("Google Chat send failed".into());
         }
     }
@@ -826,29 +833,34 @@ pub async fn send_text_to_space_as(
 /// load it is an error, never a silent switch to the shared app (B11 M1).
 /// Without it (or for an employee with no app) the space's recorded member
 /// app decides, falling back to the shared app.
+/// The second value is the registry member the app was picked by (`None`
+/// when the caller named the app explicitly or nothing was recorded).
 async fn sending_creds(
     home_dir: &Path,
     agent: Option<&str>,
     space: &str,
-) -> Result<Arc<GoogleChatCreds>, String> {
-    let own = match agent {
+) -> Result<(Arc<GoogleChatCreds>, Option<String>), String> {
+    use crate::agent_channels::gchat_spaces::{self, SHARED, SpaceApp};
+    let (own, member) = match agent {
         Some(id) if crate::agent_channels::store::agent_has_googlechat_section(home_dir, id) => {
-            Some(id.to_string())
+            (Some(id.to_string()), None)
         }
-        _ => match crate::agent_channels::gchat_spaces::app_for_space(home_dir, space) {
-            crate::agent_channels::gchat_spaces::SpaceApp::Agent(id) => Some(id),
-            crate::agent_channels::gchat_spaces::SpaceApp::Shared => None,
+        _ => match gchat_spaces::app_for_space(home_dir, space) {
+            Some(SpaceApp::Agent(id)) => (Some(id.clone()), Some(id)),
+            Some(SpaceApp::Shared) => (None, Some(SHARED.to_string())),
+            None => (None, None),
         },
     };
-    match own {
+    let creds = match own {
         Some(id) => crate::googlechat_agents::agent_creds(home_dir, &id)
             .await
-            .ok_or_else(|| format!("AI employee {id}'s own Google Chat app could not be loaded")),
+            .ok_or_else(|| format!("AI employee {id}'s own Google Chat app could not be loaded"))?,
         None => GoogleChatCreds::from_config(home_dir)
             .await
             .map(Arc::new)
-            .ok_or_else(|| "Google Chat channel not configured".to_string()),
-    }
+            .ok_or_else(|| "Google Chat channel not configured".to_string())?,
+    };
+    Ok((creds, member))
 }
 
 /// spaces.messages.create — returns the created message `name` for edits.
@@ -858,11 +870,22 @@ async fn create_message(
     thread: Option<&str>,
     text: &str,
 ) -> Option<String> {
+    post_message(creds, space, thread, text).await.ok().flatten()
+}
+
+/// [`create_message`] keeping the failure's HTTP status (`None` for a
+/// token or transport error).
+async fn post_message(
+    creds: &GoogleChatCreds,
+    space: &str,
+    thread: Option<&str>,
+    text: &str,
+) -> Result<Option<String>, Option<u16>> {
     let token = match creds.get_token().await {
         Ok(t) => t,
         Err(e) => {
             error!("Google Chat token error: {e}");
-            return None;
+            return Err(None);
         }
     };
     let mut body = serde_json::json!({ "text": text });
@@ -879,13 +902,11 @@ async fn create_message(
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<serde_json::Value>().await.ok().and_then(|v| {
-                v.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|s| s.to_string())
-            })
-        }
+        Ok(resp) if resp.status().is_success() => Ok(resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))),
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -893,11 +914,11 @@ async fn create_message(
                 "Google Chat send failed ({status}): {}",
                 truncate_bytes(&body, 200)
             );
-            None
+            Err(Some(status.as_u16()))
         }
         Err(e) => {
             error!("Google Chat send error: {e}");
-            None
+            Err(None)
         }
     }
 }

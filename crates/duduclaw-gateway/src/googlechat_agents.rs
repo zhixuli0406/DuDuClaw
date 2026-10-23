@@ -12,9 +12,10 @@
 //! missing or malformed bearer, an id with no app configured right now
 //! (config is re-read on every request), a token that does not verify —
 //! answers the same 401, checked in that order so nothing is read or
-//! decrypted for a request without a plausible token. A single source address
-//! is limited to 120 requests a minute. Errors never fall through to the
-//! shared app.
+//! decrypted for a request without a plausible token. A source with more than
+//! 120 refused requests a minute gets 429 for requests without a plausible
+//! token (verified requests are never counted). Errors never fall through to
+//! the shared app.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -72,18 +73,35 @@ pub fn router(ctx: Arc<ReplyContext>) -> Router {
     Router::new().route(ROUTE, post(webhook)).with_state(ctx)
 }
 
-/// Requests per minute one source address may make to these endpoints
-/// before being refused (Google spreads a Chat app's calls over many
-/// addresses, so this only bounds a single noisy source).
-const MAX_REQUESTS_PER_IP_PER_MIN: u32 = 120;
+/// Refused (failed-verification) requests per minute from one source address
+/// after which that source's requests without a plausible bearer are answered
+/// 429 without further work. Verified requests are never counted, so a flood
+/// of garbage cannot lock out real Chat events — not even when every request
+/// arrives through one reverse proxy address (no trusted-proxy setting exists,
+/// so forwarded headers are deliberately not read).
+const MAX_FAILURES_PER_IP_PER_MIN: u32 = 120;
 /// Largest event body read (Chat events are a few KB).
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-fn ip_allowed(ip: std::net::IpAddr) -> bool {
-    use std::time::Instant;
-    static SEEN: OnceLock<Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>> = OnceLock::new();
-    let mut map = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
+type FailureMap = HashMap<std::net::IpAddr, (std::time::Instant, u32)>;
+
+fn failures() -> &'static Mutex<FailureMap> {
+    static SEEN: OnceLock<Mutex<FailureMap>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// Whether `ip` already used up its failure budget this minute.
+fn over_failure_budget(ip: std::net::IpAddr) -> bool {
+    let map = failures().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ip).is_some_and(|(at, n)| {
+        at.elapsed().as_secs() < 60 && *n >= MAX_FAILURES_PER_IP_PER_MIN
+    })
+}
+
+/// Count one refused request from `ip`.
+fn record_failure(ip: std::net::IpAddr) {
+    let mut map = failures().lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
     if map.len() > 4096 {
         map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 120);
     }
@@ -91,8 +109,7 @@ fn ip_allowed(ip: std::net::IpAddr) -> bool {
     if now.duration_since(entry.0).as_secs() >= 60 {
         *entry = (now, 0);
     }
-    entry.1 += 1;
-    entry.1 <= MAX_REQUESTS_PER_IP_PER_MIN
+    entry.1 = entry.1.saturating_add(1);
 }
 
 async fn webhook(
@@ -104,8 +121,11 @@ async fn webhook(
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0.ip());
+    // Over budget: anything without a plausible Chat token is dropped before
+    // the body is read. Plausible tokens still go to verification.
     if let Some(ip) = peer
-        && !ip_allowed(ip)
+        && over_failure_budget(ip)
+        && plausible_bearer(request.headers()).is_none()
     {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
@@ -113,7 +133,13 @@ async fn webhook(
     let Ok(body) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    handle(ctx, &agent, &parts.headers, body).await
+    let response = handle(ctx, &agent, &parts.headers, body).await;
+    if let Some(ip) = peer
+        && response.status() == StatusCode::UNAUTHORIZED
+    {
+        record_failure(ip);
+    }
+    response
 }
 
 /// The bearer token when it is present and its header is a plausible Chat
@@ -215,4 +241,21 @@ pub fn spawn_boot_probes(ctx: Arc<ReplyContext>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn only_refusals_count_toward_the_budget() {
+        let ip: std::net::IpAddr = "198.51.100.77".parse().unwrap();
+        assert!(!over_failure_budget(ip));
+        for _ in 0..MAX_FAILURES_PER_IP_PER_MIN {
+            record_failure(ip);
+        }
+        assert!(over_failure_budget(ip));
+        let other: std::net::IpAddr = "198.51.100.78".parse().unwrap();
+        assert!(!over_failure_budget(other), "per source address");
+    }
 }
