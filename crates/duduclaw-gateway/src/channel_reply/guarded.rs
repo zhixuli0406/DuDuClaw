@@ -130,12 +130,9 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                                 thinking_sink.clone(),
                                 crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(
                                     requester,
-                                    crate::on_behalf_of::scope_first(
-                                        principal,
-                                        crate::knowledge::cite_turn::TURN_CITATIONS.scope(
-                                            cited.clone(),
-                                            pipeline,
-                                        ),
+                                    crate::knowledge::cite_turn::TURN_CITATIONS.scope(
+                                        cited.clone(),
+                                        pipeline,
                                     ),
                                 ),
                             ),
@@ -145,6 +142,9 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
             ),
         ),
     ));
+    // Scope the already boxed turn, keeping every added layer pointer-sized
+    // and preserving the innermost boxed reply pipeline.
+    let turn = Box::pin(crate::on_behalf_of::scope_first(principal, turn));
     let raw = match interim {
         Some(w) => w.run(turn).await,
         None => turn.await,
