@@ -59,6 +59,12 @@ fn header(lang: Lang, n: usize) -> String {
 }
 
 /// The input text of a turn that answers `texts` (oldest first).
+///
+/// The model sees one user message, numbered, not separate messages
+/// (B10 review M4, accepted). Every text comes from the same one-to-one
+/// sender (`mergeable` + the ledger's conversation filter), so a message
+/// that imitates the numbering or the header line can only confuse that
+/// sender's own turn — the same reach as writing anything in one message.
 pub(crate) fn combined_text(lang: Lang, texts: &[String]) -> String {
     let mut out = header(lang, texts.len());
     for (i, t) in texts.iter().enumerate() {

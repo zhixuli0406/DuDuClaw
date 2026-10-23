@@ -125,3 +125,38 @@ async fn a_one_shot_head_does_not_take_the_next_messages() {
     assert!(s.absorb_followers(&head, &plain).await.unwrap().is_empty());
     assert_eq!(status_of(&s, "m2").await, "ready");
 }
+
+/// B10 review M2: a head that fails before running gives its folded
+/// messages back, each with its own payload, and they run on their own.
+#[tokio::test]
+async fn a_head_that_never_runs_gives_the_folded_messages_back() {
+    let (_d, s) = store_with(&[
+        accepted("m1", "c", "r1", "第一則"),
+        accepted("m2", "c", "r1", "第二則"),
+        accepted("m3", "c", "r1", "第三則"),
+    ])
+    .await;
+    let head = s.claim(10).await.unwrap().unwrap();
+    let merged = s.absorb_followers(&head, &plain).await.unwrap();
+    assert_eq!(merged.len(), 2);
+    assert_eq!(s.unfold(&head, &merged).await.unwrap(), 2);
+    for id in ["m2", "m3"] {
+        assert_eq!(status_of(&s, id).await, "ready");
+    }
+    let rows = s.list().await.unwrap();
+    let head_payload: serde_json::Value =
+        serde_json::from_str(rows.iter().find(|r| r.event_id == "m1").unwrap().payload.as_deref().unwrap()).unwrap();
+    assert!(merged_from_payload(&head_payload).is_empty(), "head no longer carries them");
+    // The head fails before dispatch (late reply with "fail"); the
+    // restored messages then run one by one, with their own payload.
+    assert!(s.transition(&head, "claimed", "failed_before_dispatch", Some("late_reply_expired")).await.unwrap());
+    let next = s.claim(10).await.unwrap().unwrap();
+    assert_eq!(next.event_id, "m2");
+    let p: serde_json::Value = serde_json::from_str(next.payload.as_deref().unwrap()).unwrap();
+    assert_eq!(p["event"]["message"]["text"], "第二則");
+    assert_eq!(p["destination"], "D");
+    // A lease that is not ours restores nothing.
+    let mut stale = next.clone();
+    stale.lease_id = Some("other".into());
+    assert_eq!(s.unfold(&stale, &merged).await.unwrap(), 0);
+}

@@ -21,7 +21,7 @@
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use super::{IngressRow, IngressStore, PENDING_REVISION, ROW_SELECT, row_from_sql};
+use super::{IngressRow, IngressStore, PAYLOAD_SECONDS, PENDING_REVISION, ROW_SELECT, row_from_sql};
 
 /// Status of a message answered as part of an earlier message's turn.
 pub(crate) const MERGED_STATUS: &str = "merged";
@@ -181,6 +181,67 @@ impl IngressStore {
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(merged)
+    }
+}
+
+impl IngressStore {
+    /// Undo [`Self::absorb_followers`] for a head that will not run (B10
+    /// review M2: its late reply failed before dispatch). The folded
+    /// messages go back to `ready` with their own payload, so each is
+    /// handled on its own once the head leaves the conversation; the head
+    /// payload drops its `merged` list. Only while the head is still
+    /// claimed under this lease. Returns how many were restored.
+    pub(crate) async fn unfold(&self, head: &IngressRow, merged: &[MergedEvent]) -> Result<usize, String> {
+        let restored = {
+            let mut conn = self.connection().lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            let current = tx
+                .query_row(&format!("{ROW_SELECT} WHERE i.id=?1"), [&head.id], row_from_sql)
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let Some(current) = current.filter(|c| c.status == "claimed" && c.lease_id == head.lease_id)
+            else {
+                return Ok(0);
+            };
+            let mut payload = current
+                .payload
+                .as_deref()
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .unwrap_or_default();
+            let destination = payload["destination"].clone();
+            let mut restored = 0;
+            for m in merged {
+                let n = tx
+                    .execute(
+                        "UPDATE ingress SET status='ready',reason=NULL WHERE id=?1 AND status=?2",
+                        params![m.id, MERGED_STATUS],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if n != 1 {
+                    continue;
+                }
+                let own = serde_json::json!({"destination": destination, "event": m.event});
+                tx.execute(
+                    "INSERT OR REPLACE INTO ingress_payload VALUES (?1,?2,?3)",
+                    params![m.id, own.to_string(), m.received_at + PAYLOAD_SECONDS],
+                )
+                .map_err(|e| e.to_string())?;
+                restored += 1;
+            }
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("merged");
+            }
+            tx.execute(
+                "UPDATE ingress_payload SET payload=?2 WHERE id=?1",
+                params![head.id, payload.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            restored
+        };
+        Ok(restored)
     }
 }
 
