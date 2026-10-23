@@ -1,9 +1,10 @@
 # Google delegated identity acceptance
 
-Status: IMPLEMENTED; final local validation in progress. The EXT continuation
-adds dedicated-key execution, employee-specific HTTP MCP mounts, actual service
-GET probes and completed-mail-poll status. This status does not mean real
-provider acceptance, CI, merge, deployment or user acceptance.
+Status: IMPLEMENTED. Local backend and isolated mock integration passed on
+`375f8588`; strict clippy retains existing baseline failures. The EXT adds
+dedicated-key execution, employee-specific HTTP MCP mounts, actual service GET
+probes and completed-mail-poll status. Required CI, merge, deployment, real
+provider acceptance and user acceptance remain separate gates in [PR #212](https://github.com/zhixuli0406/DuDuClaw/pull/212).
 
 ## Engineering evidence and remaining gates
 
@@ -63,10 +64,32 @@ store path aliasing). Their minimal fixture corrections were independently
 reviewed, with all original success assertions retained. No real provider,
 host model account or OS credential store was used.
 
-Latest-main integration, final backend tests and clippy, required CI, merge
-and deployment remain independent gates. The earlier six-crate continuation
-log reached all successful result blocks, but its process exit was not
-retrieved; it is not relabeled as captured exit0.
+After integrating #199 `b5417bc5` and main `da2170b7`, independently reviewed
+source `375f8588` passed the final six-crate command with a captured exit0:
+45 unit/integration/doc result blocks totaled 13,931 passed, 0 failed,
+60 ignored and 32 filtered. The selected packages were agent, CLI, core,
+gateway, LLM and security, with no default dashboard feature. The five
+workflow E2E groups run separately by CI remained excluded locally:
+`three_page_pilot_`, `security_race_tests`, `resume_tests`, `f1b_e2e_tests` and
+`f5a_e2e_tests`. This is not an unfiltered workspace test claim.
+
+Shipping and mock binaries were rebuilt from that same integrated source;
+both builds returned exit0 and saved-binary hashes matched the build outputs.
+The ordinary baseline then repeated all original assertions with the new mock
+binary and returned exit0 with confirmed cleanup: 19 tools, six approved
+writes, four service-resource GETs, unavailable mailbox status and both
+actual mounted model tool loops. All Google/MCP/model endpoints and accounts
+were newly created local fixtures; no real provider/keychain acceptance is
+claimed.
+
+Strict `clippy -D warnings` returned exit101 at 66 existing core diagnostics.
+All 92 reported primary/secondary source locations matched dependency #199's
+existing code. No lint allowance or CI rule was changed; this is not strict
+clippy PASS. The previous two-async-lint exception was not applied to a
+different baseline failure. The earlier six-crate continuation log reached
+all successful result blocks but its process exit was not retrieved; the new
+captured exit0 belongs only to the integrated final run and does not rewrite
+that history.
 
 Final local test counts and live-probe outcomes are recorded in the PR; CI,
 merge, deployment, real-provider acceptance and user acceptance are distinct
