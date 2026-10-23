@@ -1,5 +1,6 @@
 //! Test-owned isolated fixture using the bridge's fake HTTP proxy transport.
-//! Public URL validation, DNS checks, and dispatcher authorization remain real.
+//! Production public-IP validation and pinning paths remain real; HTTP uses the loopback proxy.
+//! A numeric public origin avoids external DNS. No domain-DNS or public-socket evidence is claimed.
 use super::*;
 use crate::approval::{ApprovalBroker, DecisionContext, ExecutionBinding, GrantSpec, payload_hash};
 use crate::review_evidence::{ReviewSnapshot, capture_artifact};
@@ -80,7 +81,7 @@ async fn public_proxy() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHa
                 let (status, headers, body) = if first.contains("/redirect") {
                     (
                         "302 Found",
-                        "Location: http://example.com/escape\r\n",
+                        "Location: http://1.1.1.1/escape\r\n",
                         "redirect".to_string(),
                     )
                 } else if first.contains("/login") {
@@ -143,7 +144,7 @@ impl Pilot {
         .unwrap();
         std::fs::write(
             root.join("config.toml"),
-            format!("[workflow]\nfixture_environment='staging'\nallowed_origins=['http://example.com']\nstaging_proxy='{proxy_url}'\n")
+            format!("[workflow]\nfixture_environment='staging'\nallowed_origins=['http://1.1.1.1']\nstaging_proxy='{proxy_url}'\n")
         )
         .unwrap();
         crate::mcp_internal_key::ensure_internal_mcp_key(root).unwrap();
@@ -256,7 +257,7 @@ impl Pilot {
                     tool: "web_fetch_cached".into(),
                 },
                 input: InputRef::Literal {
-                    value: json!({"url":format!("http://example.com/p1-pilot/page-{page}")}),
+                    value: json!({"url":format!("http://1.1.1.1/p1-pilot/page-{page}")}),
                 },
                 input_schema: args_schema.clone(),
                 output_schema: read.clone(),
