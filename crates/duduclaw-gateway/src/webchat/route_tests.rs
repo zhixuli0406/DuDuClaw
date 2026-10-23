@@ -32,6 +32,14 @@ async fn fixture() -> Fixture {
         "specialist",
         "",
     );
+    write_agent(
+        &agents,
+        "faq",
+        "常見問題",
+        "@常見問題",
+        "specialist",
+        "\n[channels]\npublic_trigger = true\n",
+    );
     let mut registry = duduclaw_agent::AgentRegistry::new(agents);
     registry.scan().await.unwrap();
     let sessions =
@@ -136,7 +144,7 @@ async fn a_lone_at_sign_returns_the_choices() {
             assert_eq!(code.as_deref(), Some(MENTION_CHOICES_CODE));
             assert_eq!(
                 choices.unwrap(),
-                vec!["@嘟嘟總機".to_string(), "@財務小幫手".to_string()]
+                vec!["@嘟嘟總機".to_string(), "@常見問題".to_string(), "@財務小幫手".to_string()]
             );
         }
         other => panic!("expected choices, got {other:?}"),
@@ -152,4 +160,89 @@ async fn a_suspended_account_loses_its_bindings() {
         .unwrap();
     let refused = route(&f, "@財務小幫手 幫我算帳", None).await.unwrap_err();
     assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+}
+
+async fn route_as(f: &Fixture, user: &str, text: &str) -> Result<WebRoute, Box<ChatMessage>> {
+    decide_webchat_route(&f.state, user, text, None, "dudu", "webchat:x", "webchat:u").await
+}
+
+/// mgr (Manager) → lead (Manager) → emp1 (Employee, sales-rep Owner); the
+/// fixture's `emp` (finance Operator) reports to nobody.
+fn team(f: &Fixture) -> (String, String) {
+    crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Enterprise);
+    let db = &f.state.user_db;
+    let mk = |email: &str, role| db.create_user(email, email, "EmpPass-12345", role).unwrap().id;
+    let mgr = mk("mgr@test.local", UserRole::Manager);
+    let lead = mk("lead@test.local", UserRole::Manager);
+    let emp1 = mk("emp1@test.local", UserRole::Employee);
+    db.set_manager(&lead, Some(&mgr)).unwrap();
+    db.set_manager(&emp1, Some(&lead)).unwrap();
+    db.bind_agent(&emp1, "sales-rep", AccessLevel::Owner).unwrap();
+    (mgr, lead)
+}
+
+#[tokio::test]
+async fn a_manager_calls_a_reports_employee_but_not_a_peers() {
+    let f = fixture().await;
+    let (mgr, _lead) = team(&f);
+    let r = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap();
+    assert_eq!(r.agent.as_deref(), Some("sales-rep"));
+    assert!(r.switched);
+    let refused = route_as(&f, &mgr, "@財務小幫手 幫我算帳").await.unwrap_err();
+    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    match *route_as(&f, &mgr, "@").await.unwrap_err() {
+        ChatMessage::Error { choices, .. } => assert_eq!(
+            choices.unwrap(),
+            vec!["@嘟嘟總機".to_string(), "@常見問題".to_string(), "@業務專員".to_string()]
+        ),
+        other => panic!("expected choices, got {other:?}"),
+    }
+    // Explicit selection follows the same set.
+    assert!(f.state.agent_access_allowed(&mgr, "sales-rep").await);
+    assert!(!f.state.agent_access_allowed(&mgr, "finance").await);
+}
+
+#[tokio::test]
+async fn cutting_the_reporting_line_takes_effect_on_the_next_message() {
+    let f = fixture().await;
+    let (mgr, lead) = team(&f);
+    // Warm the ACL cache, then change the org: no TTL wait.
+    assert!(route_as(&f, &mgr, "@sales-rep 報價").await.is_ok());
+    f.state.user_db.set_manager(&lead, None).unwrap();
+    let refused = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap_err();
+    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert!(!f.state.agent_access_allowed(&mgr, "sales-rep").await);
+}
+
+#[tokio::test]
+async fn personal_edition_ignores_leftover_reporting_lines_in_webchat() {
+    let f = fixture().await;
+    let (mgr, _lead) = team(&f);
+    crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
+    let refused = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap_err();
+    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert!(!f.state.agent_access_allowed(&mgr, "sales-rep").await);
+}
+
+#[tokio::test]
+async fn a_widget_visitor_is_not_told_about_a_refusal() {
+    let f = fixture().await;
+    // A forbidden name is plain text for the default employee.
+    let r = route_as(&f, "widget-visitor:abc", "@財務小幫手 幫我算帳").await.unwrap();
+    assert_eq!(r, WebRoute { agent: None, switched: false });
+}
+
+#[tokio::test]
+async fn resume_follows_the_same_rule_as_the_at_list() {
+    let f = fixture().await;
+    // finance (bound) resumes; sales-rep (not callable) does not; the
+    // default and a public employee (callable by `@`) resume.
+    assert!(f.state.may_resume_into(&f.emp, "finance", "webchat:x", "webchat:u").await);
+    assert!(!f.state.may_resume_into(&f.emp, "sales-rep", "webchat:x", "webchat:u").await);
+    assert!(f.state.may_resume_into(&f.emp, "dudu", "webchat:x", "webchat:u").await, "default employee");
+    assert!(f.state.may_resume_into(&f.emp, "faq", "webchat:x", "webchat:u").await, "public employee");
+    // Explicit selection stays narrower: a public employee is not a partner.
+    assert!(!f.state.agent_access_allowed(&f.emp, "faq").await);
+    let (mgr, _lead) = team(&f);
+    assert!(f.state.may_resume_into(&mgr, "sales-rep", "webchat:x", "webchat:u").await, "team employee");
 }

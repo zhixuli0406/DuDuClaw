@@ -1,7 +1,8 @@
 /**
  * `@` autocomplete for the chat composer: typing `@` lists the AI staff the
- * signed-in account may call (the `agents.list` result is already filtered
- * to that set by the gateway), filters as you type and inserts `@name `.
+ * signed-in account may call (`agents.callable`: own staff, a manager's team,
+ * the default and public staff — the same set the gateway lets through),
+ * filters as you type and inserts `@name `.
  *
  * Mirrors the gateway matcher (`duduclaw_agent::trigger_match`): a mention
  * starts at `@` or `＠` that is not glued to an e-mail local part, and the
@@ -19,6 +20,20 @@ export interface MentionAgent {
   readonly role?: string;
   readonly status?: string;
   readonly archived?: boolean;
+  /** From `agents.callable`: where the right to call comes from. */
+  readonly via?: 'admin' | 'binding' | 'team' | 'default' | 'public';
+  readonly via_user?: string;
+  readonly via_user_name?: string;
+  /** The server's exact `@…` text for this staff member. */
+  readonly call_text?: string;
+}
+
+/** One section of the `@` popup. `team` sections are per report. */
+export interface MentionGroup {
+  readonly kind: 'mine' | 'team' | 'public';
+  /** `team` only: the report's display name. */
+  readonly owner?: string;
+  readonly agents: readonly MentionAgent[];
 }
 
 /** An `@…` being typed: `start` is the index of the `@`, `query` the text
@@ -78,12 +93,43 @@ export function filterMentionCandidates(agents: readonly MentionAgent[], query: 
   return [...starts, ...contains];
 }
 
-/** The text that calls exactly `agent`: its display name when no other
- *  callable staff shares it, else its id. */
+/** The text that calls exactly `agent`: the server's `call_text` when it
+ *  sent one, else its display name when no other callable staff shares it,
+ *  else its id. */
 export function mentionText(agent: MentionAgent, all: readonly MentionAgent[]): string {
+  if (agent.call_text && agent.call_text.trim().length > 1) return agent.call_text.trim();
   const display = agent.display_name.trim();
   const shared = all.filter((a) => a.display_name.trim().toLocaleLowerCase() === display.toLocaleLowerCase()).length;
   return display && shared <= 1 ? `@${display}` : `@${agent.name}`;
+}
+
+/** Split candidates into the popup's sections, keeping their order: my own
+ *  staff (and the default one), each report's staff (my team), public staff.
+ *  The flat order of the result is the keyboard order. */
+export function groupMentionCandidates(candidates: readonly MentionAgent[]): MentionGroup[] {
+  const mine: MentionAgent[] = [];
+  const publicOnes: MentionAgent[] = [];
+  const team = new Map<string, MentionAgent[]>();
+  for (const a of candidates) {
+    if (a.via === 'team') {
+      const owner = a.via_user_name || a.via_user || '';
+      team.set(owner, [...(team.get(owner) ?? []), a]);
+    } else if (a.via === 'public') {
+      publicOnes.push(a);
+    } else {
+      mine.push(a);
+    }
+  }
+  const groups: MentionGroup[] = [];
+  if (mine.length) groups.push({ kind: 'mine', agents: mine });
+  for (const [owner, agents] of team) groups.push({ kind: 'team', owner, agents });
+  if (publicOnes.length) groups.push({ kind: 'public', agents: publicOnes });
+  return groups;
+}
+
+/** Candidates in popup order (the order `groupMentionCandidates` renders). */
+export function orderMentionCandidates(candidates: readonly MentionAgent[]): MentionAgent[] {
+  return groupMentionCandidates(candidates).flatMap((g) => g.agents);
 }
 
 /** Replace the active mention with `call` plus a space; returns the new text
