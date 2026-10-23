@@ -34,6 +34,9 @@ The following were separate invocations, with overlapping tests:
 | Team RPC tests and shared poll budget | 3 plus 1 passed |
 | Future-size checks | 4 passed |
 | Launcher environment and signature golden vector | 2 passed |
+| Final CLI production type-check | exit 0 |
+| Final gateway library suite, five isolated workflow groups excluded | 9,395 passed, 0 failed, 49 ignored, 32 filtered, exit 0 |
+| Final frontend focus, TypeScript and production build | 16 passed; type-check and build exit 0 |
 
 Backend snapshot `7e22bdfa` was exercised using the opt-in
 `computer_team_native_dashboard_fixture`, the isolated launcher
@@ -76,5 +79,15 @@ physical owner-presence test. The local Docker overlay is not a published
 image. Real service accounts, native Linux/amd64/Windows, release deployment
 and user acceptance are not established by this run.
 
-Root CLI type-checking, the final full suites, current PR CI and merge are
-recorded separately when completed; focused PASS counts do not replace them.
+The strict all-target clippy invocation exited 101 at 64 core diagnostics.
+The repository already marks clippy advisory in CI; this run is retained as
+a failure. The diagnostic files match main except `types.rs`, whose branch
+change adds only `persist_login`, outside those diagnostic regions. No lint
+policy or CI rule was relaxed.
+
+An additional direct invocation of the isolated workflow pilot tests exited
+101 (four failures) because the launcher omitted the required verified
+`DUDUCLAW_P1_PILOT_BINARY`; these flows did not reach execution. A current
+branch default-feature CLI build and the five isolated groups remain pending.
+Current PR CI and merge are separate gates; focused PASS counts do not replace
+them.
