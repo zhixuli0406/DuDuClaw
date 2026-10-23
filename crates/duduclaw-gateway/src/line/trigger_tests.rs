@@ -315,3 +315,36 @@ fn direct_reply_renders_the_list_as_quick_replies() {
     assert_eq!(msgs[0]["text"], "拒絕");
     assert!(msgs[0].get("quickReply").is_none());
 }
+
+/// PR-C: in a mention-only group `/交辦` and `/assign` address the bot, other
+/// commands still need a mention; `/交辦 @name` alone arms the wait at
+/// admission and the next event becomes the assignment, also on replay.
+#[tokio::test]
+async fn assign_commands_address_the_bot_and_arm_the_wait_at_admission() {
+    let (dir, state) = fixture(false).await;
+    crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
+    let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+    let owner = db
+        .create_user("o@test.local", "owner", "TeamPass-12345", duduclaw_auth::UserRole::Employee)
+        .unwrap()
+        .id;
+    db.bind_agent(&owner, "sales-rep", duduclaw_auth::AccessLevel::Owner).unwrap();
+    db.bind_channel_identity(&owner, "line", "U_owner", true).unwrap();
+    let group = format!("C{}", uuid::Uuid::new_v4().simple());
+
+    assert!(admit(&state, &group_text("a1", &group, "U_owner", "/交辦", 1_000)).await.addresses_bot());
+    assert!(admit(&state, &group_text("a2", &group, "U_owner", "/assign status", 1_001)).await.addresses_bot());
+    assert!(!admit(&state, &group_text("a3", &group, "U_owner", "/status", 1_002)).await.addresses_bot());
+
+    let bare = admit(&state, &group_text("a4", &group, "U_owner", "/交辦 @sales-rep", 1_003)).await;
+    assert!(bare.addresses_bot());
+    let next = group_text("a5", &group, "U_owner", "幫我追款", 1_004);
+    let first = admit(&state, &next).await;
+    assert_eq!(first.decision, TurnDecision::Assign { id: "sales-rep".into() });
+    assert!(first.addresses_bot());
+    let again = replay(&state, &next, &first.stored()).await;
+    assert_eq!(again.decision, TurnDecision::Assign { id: "sales-rep".into() });
+    // Only the next message.
+    let after = admit(&state, &group_text("a6", &group, "U_owner", "今天天氣", 1_005)).await;
+    assert_eq!(after.decision, TurnDecision::Default);
+}

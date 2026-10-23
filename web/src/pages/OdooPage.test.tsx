@@ -68,6 +68,62 @@ describe('OdooPage saved-credential display', () => {
     ).toBeInTheDocument();
   });
 
+  it('shows the internal-network switch off by default and on when stored', async () => {
+    mockConfig({});
+    const first = renderWithProviders(<OdooPage />);
+    const off = await screen.findByRole('switch', { name: /Allow Odoo on an internal network/i });
+    expect(off).toHaveAttribute('aria-checked', 'false');
+    first.unmount();
+
+    mockConfig({ allow_private_network: true });
+    renderWithProviders(<OdooPage />);
+    const on = await screen.findByRole('switch', { name: /Allow Odoo on an internal network/i });
+    expect(on).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('fills the form from the saved config even when the live status call never answers', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.status') return new Promise(() => {}); // unreachable Odoo
+      if (method === 'odoo.config') {
+        return Promise.resolve({
+          url: 'https://erp.example.com',
+          db: 'prod',
+          protocol: 'jsonrpc',
+          auth_method: 'api_key',
+          username: 'bot',
+          poll_enabled: false,
+          poll_interval_seconds: 60,
+          poll_models: [],
+          webhook_enabled: false,
+          allow_private_network: true,
+          features_crm: true,
+          features_sale: true,
+          features_inventory: true,
+          features_accounting: true,
+          features_project: false,
+          features_hr: false,
+        });
+      }
+      return Promise.resolve({ agents: [] });
+    });
+    renderWithProviders(<OdooPage />);
+    expect(await screen.findByDisplayValue('https://erp.example.com')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('prod')).toBeInTheDocument();
+    const sw = screen.getByRole('switch', { name: /Allow Odoo on an internal network/i });
+    expect(sw).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('button', { name: /^save$/i })).not.toBeDisabled();
+  });
+
+  it('blocks saving (and says why) when the saved config cannot be loaded', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.config') return Promise.reject(new Error('boom'));
+      return Promise.resolve({ connected: false, agents: [] });
+    });
+    renderWithProviders(<OdooPage />);
+    expect(await screen.findByText(/Could not load the saved Odoo settings/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^save$/i })).toBeDisabled();
+  });
+
   it('keeps the neutral placeholder when nothing is stored', async () => {
     mockConfig({ has_api_key: false });
     renderWithProviders(<OdooPage />);

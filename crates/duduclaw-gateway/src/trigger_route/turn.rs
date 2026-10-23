@@ -78,6 +78,10 @@ pub enum TurnDecision {
         list: Option<Vec<CallableAgent>>,
         kind: ReplyKind,
     },
+    /// The message an armed `/交辦 @name` was waiting for: it becomes a
+    /// task for `id` (the adapter runs [`super::assign::run_pending`], which
+    /// checks the sender's right again). No model call.
+    Assign { id: String },
 }
 
 impl TurnDecision {
@@ -115,13 +119,18 @@ pub fn decision_for_route(
     let key = PendingKey::new(turn.channel, turn.conversation, turn.sender);
     let lang = texts::lang_for(home);
     match route {
-        TriggerRoute::None => match addressee(home, reg, &key, turn) {
-            Some(id) => TurnDecision::Agent {
-                via_trigger: turn.fallback != Some(id.as_str()),
-                id,
-            },
-            None => TurnDecision::Default,
-        },
+        TriggerRoute::None => {
+            if let Some(id) = assign_addressee(&key, turn) {
+                return TurnDecision::Assign { id };
+            }
+            match addressee(home, reg, &key, turn) {
+                Some(id) => TurnDecision::Agent {
+                    via_trigger: turn.fallback != Some(id.as_str()),
+                    id,
+                },
+                None => TurnDecision::Default,
+            }
+        }
         TriggerRoute::Routed { agent, bare } => {
             if !turn.quiet {
                 let via = super::grant_for(reg, access, &agent, turn.fallback);
@@ -163,6 +172,23 @@ pub fn decision_for_route(
                 kind: ReplyKind::List,
             }
         }
+    }
+}
+
+/// The employee an armed `/交辦 @name` waits on, for a message that calls
+/// nobody and is not a chat command. Live claims it; Peek only looks; Replay reuses what
+/// this event already claimed in this process.
+fn assign_addressee(key: &PendingKey, turn: ChannelTurn<'_>) -> Option<String> {
+    if turn.sender.is_empty() || crate::chat_commands::is_command(turn.text) {
+        return None;
+    }
+    match turn.pending {
+        PendingPolicy::Live => pending::claim_kind(key, turn.event, turn.seq, pending::PendingKind::Assign),
+        PendingPolicy::Peek => match pending::peek_kind(key, turn.seq) {
+            Some((id, pending::PendingKind::Assign)) => Some(id),
+            _ => None,
+        },
+        PendingPolicy::Replay(_) => pending::claimed(key, turn.event, pending::PendingKind::Assign),
     }
 }
 

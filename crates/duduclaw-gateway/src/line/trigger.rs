@@ -49,6 +49,9 @@ pub(crate) struct LineRoute {
     pub one_shot: bool,
     /// The message mentions the bot itself (LINE native mention).
     pub bot_mentioned: bool,
+    /// The message is `/交辦 …` / `/assign …` (the one chat command a
+    /// "mention only" group answers without a mention).
+    pub assign_command: bool,
 }
 
 impl LineRoute {
@@ -65,7 +68,7 @@ impl LineRoute {
     /// someone by `@`, asks for the list, or is the message a one-shot
     /// addressee was waiting for. "Mention only" groups answer only these.
     pub fn addresses_bot(&self) -> bool {
-        self.bot_mentioned || self.decision.addresses_bot()
+        self.bot_mentioned || self.assign_command || self.decision.addresses_bot()
     }
 
     /// A reply from a called (non-default) employee is labelled with its
@@ -122,7 +125,7 @@ pub(crate) fn routing_text(event: &LineEvent) -> (String, bool) {
     )
 }
 
-fn sender_of(event: &LineEvent) -> &str {
+pub(crate) fn sender_of(event: &LineEvent) -> &str {
     event
         .source
         .as_ref()
@@ -134,7 +137,7 @@ fn sender_of(event: &LineEvent) -> &str {
 /// `webhookEventId` (the durable ingress refuses events without one); fall
 /// back to a digest of what identifies the message so two id-less events
 /// never share state.
-fn event_key(event: &LineEvent, session: &str) -> String {
+pub(crate) fn event_key(event: &LineEvent, session: &str) -> String {
     match event
         .webhook_event_id
         .as_deref()
@@ -164,6 +167,7 @@ pub(crate) async fn line_route(
     let sender = sender_of(event);
     let session = format!("line:{}", ingress::line_conversation(event));
     let (text, bot_mentioned) = routing_text(event);
+    let assign_command = crate::chat_commands::is_assign_command(&text);
     let reg = state.ctx.registry.read().await;
     let fallback = default_employee(&reg, &session, sender)?;
     if !routable(event) {
@@ -172,6 +176,7 @@ pub(crate) async fn line_route(
             decision: TurnDecision::Default,
             one_shot: false,
             bot_mentioned,
+            assign_command,
         });
     }
     let access = if crate::trigger_route::may_mention(&text) {
@@ -207,12 +212,31 @@ pub(crate) async fn line_route(
         &access,
         route,
     );
+    if assign_command && matches!(mode, RouteMode::Admission) && !sender.is_empty() {
+        // `/交辦 @name` alone: arm the one-shot assign addressee at
+        // admission, before the next event is admitted (see
+        // `assign::arm_on_admission`).
+        let caller = crate::trigger_route::assign::AssignCaller {
+            home: &state.home_dir,
+            channel: "line",
+            conversation: &session,
+            sender,
+            event: Some(&event_id),
+            seq: event
+                .timestamp
+                .unwrap_or_else(crate::trigger_route::pending::next_seq),
+            fallback: Some(&fallback),
+            access: access::for_channel_sender(&state.home_dir, "line", sender),
+        };
+        crate::trigger_route::assign::arm_on_admission(&reg, &text, &caller);
+    }
     let one_shot = calls_nobody && matches!(decision, TurnDecision::Agent { .. });
     Some(LineRoute {
         fallback,
         decision,
         one_shot,
         bot_mentioned,
+        assign_command,
     })
 }
 

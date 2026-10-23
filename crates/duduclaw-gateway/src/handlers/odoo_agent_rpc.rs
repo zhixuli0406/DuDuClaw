@@ -189,7 +189,7 @@ impl MethodHandler {
 
     /// `odoo.agent_test {agent_id}` — test connectivity using the agent's
     /// effective Odoo config: the global `config.toml [odoo]` overlaid with the
-    /// agent's `agent.toml [odoo]` (url/db/username), and the agent's credential
+    /// agent's `agent.toml [odoo]` (url/db/username, via `AgentOdooConfig::apply_to`), and the agent's credential
     /// if present, else the global one. Reuses the same SSRF-safe URL validator
     /// as `odoo.configure`. Never writes to disk.
     pub(crate) async fn handle_odoo_agent_test(&self, params: Value) -> WsFrame {
@@ -211,42 +211,18 @@ impl MethodHandler {
         let global_table = self.read_config_table(&global_path).await;
         let mut cfg = duduclaw_odoo::OdooConfig::from_toml(&global_table);
 
-        if let Some(a) = agent_table.get("odoo").and_then(|v| v.as_table()) {
-            if let Some(u) = a
-                .get("url")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                cfg.url = u.to_string();
+        // Same merge function the runtime connector pool uses, so this test
+        // can never pass for a config the runtime would not dial. An override
+        // that fails url/db validation is reported, never silently ignored.
+        match duduclaw_odoo::AgentOdooConfig::from_table(&agent_table) {
+            Ok(Some(over)) => {
+                if let Err(msg) = over.apply_to(&mut cfg) {
+                    return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
+                }
             }
-            if let Some(d) = a
-                .get("db")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                cfg.db = d.to_string();
-            }
-            if let Some(un) = a
-                .get("username")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                cfg.username = un.to_string();
-            }
-            if let Some(pr) = a
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                cfg.protocol = pr.to_string();
-            }
-
-            if let Some(am) = a
-                .get("auth_method")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                cfg.auth_method = am.to_string();
+            Ok(None) => {}
+            Err(msg) => {
+                return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
             }
         }
         // v1.68.0: JSON-RPC only, same rule as `odoo.configure` — whether
@@ -268,14 +244,10 @@ impl MethodHandler {
             );
         }
         // Fail-closed SSRF/HTTPS re-check on the EFFECTIVE url actually dialed.
-        if !Self::is_safe_odoo_url(&cfg.url) {
-            return WsFrame::ok_response(
-                "",
-                json!({
-                    "success": false,
-                    "message": "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host",
-                }),
-            );
+        if let Err(msg) =
+            duduclaw_odoo::url_guard::check_url(&cfg.url, cfg.allow_private_network)
+        {
+            return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
         }
 
         // Credential: prefer the agent's, else the global one.

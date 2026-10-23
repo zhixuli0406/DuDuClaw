@@ -355,6 +355,36 @@ pub fn review_wip_limit(home_dir: &Path) -> i64 {
         .unwrap_or(DEFAULT_REVIEW_WIP_LIMIT)
 }
 
+/// Chat `/交辦` caps per person (`config.toml [goal_defaults]`): at most
+/// `chat_assign_per_window` tasks every [`CHAT_ASSIGN_WINDOW_MINUTES`], and
+/// at most `chat_assign_max_open` of them unfinished. A missing, malformed
+/// or out-of-range value (negative, over 1000) uses the default; 0 turns
+/// chat assigning off for everyone but keeps the dashboard.
+pub const CHAT_ASSIGN_WINDOW_MINUTES: u64 = 10;
+pub const DEFAULT_CHAT_ASSIGN_PER_WINDOW: u32 = 10;
+pub const DEFAULT_CHAT_ASSIGN_MAX_OPEN: u32 = 30;
+
+/// `(per_window, max_open)` for chat `/交辦`.
+pub fn chat_assign_caps(home_dir: &Path) -> (u32, u32) {
+    let table = std::fs::read_to_string(home_dir.join("config.toml"))
+        .ok()
+        .and_then(|c| c.parse::<toml::Table>().ok());
+    let read = |key: &str, default: u32| -> u32 {
+        table
+            .as_ref()
+            .and_then(|t| t.get("goal_defaults"))
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_integer())
+            .filter(|n| (0..=1000).contains(n))
+            .map(|n| n as u32)
+            .unwrap_or(default)
+    };
+    (
+        read("chat_assign_per_window", DEFAULT_CHAT_ASSIGN_PER_WINDOW),
+        read("chat_assign_max_open", DEFAULT_CHAT_ASSIGN_MAX_OPEN),
+    )
+}
+
 // ── Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
 // G1) ────────────────────────────────────────────────────────────
 

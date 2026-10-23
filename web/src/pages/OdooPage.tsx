@@ -80,6 +80,7 @@ export function OdooPage() {
   const [webhookEnabled, setWebhookEnabled] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
   const [globalUnblockModels, setGlobalUnblockModels] = useState('');
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
   // Last-saved value of the global unblock list — used to detect when Save is
   // about to *expand* which sensitive models every AI employee can reach, so
   // that expansion (not unrelated saves) is what triggers the extra confirm
@@ -115,14 +116,19 @@ export function OdooPage() {
   const [schemaFilter, setSchemaFilter] = useState('');
   const [pickedModels, setPickedModels] = useState<Set<string>>(new Set());
 
+  // The stored settings load on their own; the live connection status (which
+  // really dials Odoo and can take a minute when the server is unreachable)
+  // loads in parallel into its own state and never gates the form.
+  const [configLoaded, setConfigLoaded] = useState(false);
+
   const loadConfig = useCallback(async () => {
     setLoading(true);
+    void api.odoo
+      .status()
+      .then((res) => setStatus(res))
+      .catch((e) => console.warn('[api]', e));
     try {
-      const [statusRes, configRes] = await Promise.all([
-        api.odoo.status(),
-        api.odoo.config(),
-      ]);
-      setStatus(statusRes);
+      const configRes = await api.odoo.config();
       if (configRes) {
         setUrl(configRes.url ?? '');
         setDb(configRes.db ?? '');
@@ -132,6 +138,7 @@ export function OdooPage() {
         setPollInterval(String(configRes.poll_interval_seconds ?? 60));
         setPollModels((configRes.poll_models ?? []).join(','));
         setWebhookEnabled(configRes.webhook_enabled ?? false);
+        setAllowPrivateNetwork(configRes.allow_private_network ?? false);
         setSavedCreds({
           apiKey: configRes.has_api_key ?? false,
           password: configRes.has_password ?? false,
@@ -148,11 +155,15 @@ export function OdooPage() {
           hr: configRes.features_hr ?? false,
         });
       }
+      // Not configured yet (null) is a valid, loaded state: the form starts blank.
+      setConfigLoaded(true);
     } catch (e) {
-      // Silently handle feature-gate errors (not licensed); show other errors
+      // Silently handle feature-gate errors (not licensed); show other errors.
+      // Saving stays blocked: a form showing defaults must never overwrite the
+      // stored settings.
       const msg = e instanceof Error ? e.message : '';
       if (!msg.includes('Feature requires upgrade')) {
-        setError(t('common.error'));
+        setError(t('odoo.loadFailed'));
       }
     } finally {
       setLoading(false);
@@ -181,6 +192,7 @@ export function OdooPage() {
    * doesn't turn into noise on every unrelated edit.
    */
   const requestSave = () => {
+    if (!configLoaded) return;
     const before = new Set(parseUnblockModels(unblockModelsBaseline));
     const added = parseUnblockModels(globalUnblockModels).filter((m) => !before.has(m));
     if (added.length > 0) {
@@ -209,6 +221,7 @@ export function OdooPage() {
         webhook_enabled: webhookEnabled,
         webhook_secret: webhookSecret || undefined,
         unblock_models: parseUnblockModels(globalUnblockModels),
+        allow_private_network: allowPrivateNetwork,
         features_crm: features.crm,
         features_sale: features.sale,
         features_inventory: features.inventory,
@@ -248,6 +261,7 @@ export function OdooPage() {
         username: username.trim(),
         api_key: authMethod === 'api_key' && apiKey ? apiKey : undefined,
         password: authMethod === 'password' && password ? password : undefined,
+        allow_private_network: allowPrivateNetwork,
       });
       setTestResult({ ok: res.success, message: res.message });
     } catch (e) {
@@ -339,7 +353,7 @@ export function OdooPage() {
               {t('common.saved')}
             </span>
           )}
-          <Button variant="brand" size="sm" onClick={requestSave} disabled={saving || !url.trim()}>
+          <Button variant="brand" size="sm" onClick={requestSave} disabled={saving || !url.trim() || !configLoaded}>
             {saving ? <Loader2 className="animate-spin" /> : <Save />}
             {saving ? t('common.saving') : t('common.save')}
           </Button>
@@ -357,6 +371,17 @@ export function OdooPage() {
           <RowText label={t('odoo.db')} value={db} onChange={setDb} placeholder="mycompany" tier="text" />
           <RowSelect label={t('odoo.authMethod')} value={authMethod} onChange={setAuthMethod} options={authOptions} />
           <RowText label={t('odoo.username')} value={username} onChange={setUsername} placeholder="admin@mycompany.com" tier="text" />
+          <RowSwitch
+            label={t('odoo.allowPrivateNetwork')}
+            description={t('odoo.allowPrivateNetworkHint')}
+            checked={allowPrivateNetwork}
+            onChange={(v) => {
+              setAllowPrivateNetwork(v);
+              // An earlier refusal was about the old setting.
+              setTestResult(null);
+              setError(null);
+            }}
+          />
           {authMethod === 'api_key' ? (
             <RowSecret
               label={t('odoo.apiKey')}

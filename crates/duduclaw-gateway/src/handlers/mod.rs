@@ -181,6 +181,7 @@ mod maintenance_rpc;
 mod device_backup;
 mod dispatch_core;
 mod dispatch_kb;
+mod dispatch_kb_agent;
 mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;

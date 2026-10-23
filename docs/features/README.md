@@ -71,6 +71,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 64 | [Thinking display](64-thinking-display.md) | Live thinking timer in WebChat for every runtime; masked, shortened thinking summaries for signed-in dashboard users; never sent to messaging apps |
 | 65 | [Where thinking comes from](65-thinking-sources.md) | Which runtimes report thinking (Claude CLI, Codex, OpenAI-compatible APIs, Anthropic Direct API), what each shows, and when a request changes |
 | 66 | [Thinking display in messaging apps](66-thinking-in-messaging-apps.md) | Timer and masked summary in Telegram, Discord, Slack, Teams, LINE and the other apps; `[thinking] channel_audience` / `channel_group_display` |
+| 67 | [Assigning tasks from a chat](67-assigning-tasks.md) | `/交辦 @employee task` (`/assign`) creates a goal task on the sender's behalf, limited to employees they may assign to; progress back to the chat; `/交辦 狀態`; "Assigned by me" on the Goals page |
 
 ---
 

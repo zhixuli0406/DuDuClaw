@@ -2,7 +2,7 @@ import { useIntl } from 'react-intl';
 import { Badge } from '@/components/mds';
 import { cn } from '@/lib/utils';
 import type { AgentFileKey, AgentFileListEntry } from '@/lib/agent-files-types';
-import { agentFileLabel, agentFileName, isSkillKey } from '@/components/agent-files/review-text';
+import { agentFileHeading, agentFileName, isSkillKey } from '@/components/agent-files/review-text';
 
 export interface AgentFileListProps {
   files: ReadonlyArray<AgentFileListEntry>;
@@ -27,7 +27,7 @@ function Item({ entry, selected, onSelect }: { entry: AgentFileListEntry; select
         )}
         data-testid={`agent-file-${entry.file}`}
       >
-        <span className="text-sm font-medium text-foreground">{agentFileLabel(intl, entry.file)}</span>
+        <span className="text-sm font-medium text-foreground">{agentFileHeading(intl, entry.file)}</span>
         <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground">{agentFileName(entry.file)}</span>
         <span className="flex flex-wrap gap-1">
           {entry.pending_approval_id && <Badge variant="secondary">{t('agentFiles.badge.pending')}</Badge>}

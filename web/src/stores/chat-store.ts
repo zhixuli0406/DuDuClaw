@@ -59,9 +59,26 @@ export interface ChatMessage {
   readonly agentId?: string;
   /** That staff member's display name (`assistant_done.agent_name`). */
   readonly agentName?: string;
+  /** A task this reply created (`/交辦`, from `assistant_done.task`). */
+  readonly task?: AssignedTaskRef;
   /** The turn's thinking (wall time, tokens, masked blocks) — in memory only,
    *  never part of the stored history. */
   readonly thinking?: TurnThinking;
+}
+
+/** A task created from the chat, as `assistant_done.task` carries it. */
+export interface AssignedTaskRef {
+  readonly id: string;
+  readonly agent: string;
+}
+
+/** Validate `assistant_done.task`: both fields non-empty strings, else
+ *  `undefined` (an older or hand-crafted frame shows no card). Pure. */
+export function parseAssignedTask(raw: unknown): AssignedTaskRef | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined;
+  const { id, agent } = raw as { id?: unknown; agent?: unknown };
+  if (typeof id !== 'string' || !id || typeof agent !== 'string' || !agent) return undefined;
+  return { id, agent };
 }
 
 /** A file selected for upload, already read into base64. */
@@ -283,6 +300,16 @@ function nextConvId(): string {
   return `c-${Date.now().toString(36)}-${convCounter}`;
 }
 
+let clientMsgCounter = 0;
+
+/** A fresh client message id (`[A-Za-z0-9_-]`, at most 64 characters). */
+export function newClientMessageId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return uuid;
+  clientMsgCounter += 1;
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${clientMsgCounter}`;
+}
+
 /**
  * Assemble the `user_message` wire frame (pure — exported for tests).
  *
@@ -300,14 +327,17 @@ export function buildUserMessageFrame(opts: {
   agentId: string | null;
   attachments: readonly PendingAttachment[];
   convId?: string | null;
+  /** One id per send: a `/交辦` derives its task id from it on the server. */
+  msgId?: string | null;
 }): Record<string, unknown> {
-  const { content, sessionId, agentId, attachments, convId } = opts;
+  const { content, sessionId, agentId, attachments, convId, msgId } = opts;
   return {
     type: 'user_message',
     content,
     session_id: sessionId,
     ...(agentId ? { agent: agentId } : {}),
     ...(convId ? { conv: convId } : {}),
+    ...(msgId ? { msg_id: msgId } : {}),
     attachments: attachments.map((a) => ({
       filename: a.name,
       mime: a.mime,
@@ -591,6 +621,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ...(typeof data.agent_name === 'string' && data.agent_name ? { agentName: data.agent_name } : {}),
             };
             const thinkingMeta = parseThinkingDoneMeta(data.thinking);
+            const assignedTask = parseAssignedTask(data.task);
+            const taskField = assignedTask ? { task: assignedTask } : {};
             set((state) => {
               const msgs = [...state.messages];
               const last = msgs[msgs.length - 1];
@@ -608,6 +640,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...(citations ? { citations } : {}),
                   ...answeredBy,
                   ...thinking,
+                  ...taskField,
                 };
               } else {
                 msgs.push({
@@ -620,6 +653,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...(citations ? { citations } : {}),
                   ...answeredBy,
                   ...thinking,
+                  ...taskField,
                 });
               }
               return {
@@ -842,6 +876,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             agentId: get().selectedAgentId,
             attachments: atts,
             convId: get().convId,
+            msgId: newClientMessageId(),
           }),
         ),
       );
