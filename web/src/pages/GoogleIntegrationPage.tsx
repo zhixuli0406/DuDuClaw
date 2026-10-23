@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { IntegrationConnectPanel } from '@/components/IntegrationConnectPanel';
 import { GoogleCredentialPaths } from '@/components/GoogleCredentialPaths';
+import { GoogleDelegationPanel } from '@/components/GoogleDelegationPanel';
 import { Card, CardContent, Button, Badge } from '@/components/mds';
 import { api } from '@/lib/api';
 import { toast } from '@/lib/toast';
@@ -57,6 +58,8 @@ const CAPABILITIES = [
  *  3. {@link GoogleCredentialPaths} — the two alternatives that need no OAuth
  *     client at all: service-account domain-wide delegation (Workspace domains)
  *     and the Apps Script bridge (works for personal @gmail.com too).
+ *  4. {@link GoogleDelegationPanel} — per-employee identities: the sealed
+ *     delegation key and which colleague each AI employee acts as.
  *
  * Google scope badges strip the long googleapis URL prefix for readability.
  */
@@ -159,6 +162,7 @@ export function GoogleIntegrationPage() {
         formatScope={(s) => s.replace('https://www.googleapis.com/auth/', '')}
       />
       <GoogleCredentialPaths />
+      <GoogleDelegationPanel />
     </div>
   );
 }

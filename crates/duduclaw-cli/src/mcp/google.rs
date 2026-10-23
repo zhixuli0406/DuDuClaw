@@ -13,7 +13,10 @@ pub(crate) fn arg_u32(args: &Value, key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-pub(crate) async fn handle_google_status(home_dir: &Path) -> Value {
+pub(crate) async fn handle_google_status(
+    home_dir: &Path,
+    g: &super::google_identity_client::GoogleCaller,
+) -> Value {
     use duduclaw_gateway::google_workspace::{
         GOOGLE_PROVIDER, GoogleBackend, REQUIRED_SCOPES, resolve_backend,
     };
@@ -24,7 +27,15 @@ pub(crate) async fn handle_google_status(home_dir: &Path) -> Value {
         .find(|t| t.provider_id == GOOGLE_PROVIDER);
     let configured = mcp_oauth::has_client_config(home_dir, GOOGLE_PROVIDER);
 
-    let mut out = String::new();
+    // Lead with who this employee acts as (per-employee Google identity).
+    // A person identity or a refusal is the whole answer: the home vault
+    // details below would describe an account this employee does not use.
+    let (header, describes_home) = super::google_identity_client::status_header(home_dir, g).await;
+    let mut out = header;
+    if !describes_home {
+        return tool_text(out.trim_end());
+    }
+    out.push('\n');
 
     // Lead with the credential source actually in effect. Three exist (OAuth
     // vault, service-account delegation, Apps Script bridge) and the OAuth
@@ -98,7 +109,7 @@ pub(crate) async fn handle_google_status(home_dir: &Path) -> Value {
     tool_text(out.trim_end())
 }
 
-pub(crate) async fn handle_gmail_search(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_gmail_search(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let query = match args.get("query").and_then(|v| v.as_str()) {
@@ -107,7 +118,7 @@ pub(crate) async fn handle_gmail_search(args: &Value, home_dir: &Path) -> Value 
     };
     let max = arg_u32(args, "max_results", 10);
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "gmail_search").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -117,7 +128,7 @@ pub(crate) async fn handle_gmail_search(args: &Value, home_dir: &Path) -> Value 
     }
 }
 
-pub(crate) async fn handle_gmail_read(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_gmail_read(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
@@ -125,7 +136,7 @@ pub(crate) async fn handle_gmail_read(args: &Value, home_dir: &Path) -> Value {
         _ => return tool_error("Missing required parameter: message_id"),
     };
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "gmail_read").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -135,7 +146,7 @@ pub(crate) async fn handle_gmail_read(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_gmail_create_draft(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_gmail_create_draft(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let to = match args.get("to").and_then(|v| v.as_str()) {
@@ -156,7 +167,7 @@ pub(crate) async fn handle_gmail_create_draft(args: &Value, home_dir: &Path) -> 
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "gmail_create_draft").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -169,7 +180,7 @@ pub(crate) async fn handle_gmail_create_draft(args: &Value, home_dir: &Path) -> 
     }
 }
 
-pub(crate) async fn handle_calendar_list_events(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_calendar_list_events(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let time_min = args
@@ -194,7 +205,7 @@ pub(crate) async fn handle_calendar_list_events(args: &Value, home_dir: &Path) -
     }
     let max = arg_u32(args, "max_results", 20);
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "calendar_list_events").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -204,7 +215,7 @@ pub(crate) async fn handle_calendar_list_events(args: &Value, home_dir: &Path) -
     }
 }
 
-pub(crate) async fn handle_calendar_create_event(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_calendar_create_event(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let summary = match args.get("summary").and_then(|v| v.as_str()) {
@@ -249,7 +260,7 @@ pub(crate) async fn handle_calendar_create_event(args: &Value, home_dir: &Path) 
         })
         .unwrap_or(false);
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "calendar_create_event").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -295,7 +306,7 @@ pub(crate) fn arg_u64(args: &Value, key: &str) -> Option<u64> {
     })
 }
 
-pub(crate) async fn handle_sheets_read(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_sheets_read(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let spreadsheet = match args.get("spreadsheet_id").and_then(|v| v.as_str()) {
@@ -307,7 +318,7 @@ pub(crate) async fn handle_sheets_read(args: &Value, home_dir: &Path) -> Value {
         _ => return tool_error("Missing required parameter: range"),
     };
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "sheets_read").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -317,7 +328,7 @@ pub(crate) async fn handle_sheets_read(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_sheets_append(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_sheets_append(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let spreadsheet = match args.get("spreadsheet_id").and_then(|v| v.as_str()) {
@@ -349,7 +360,7 @@ pub(crate) async fn handle_sheets_append(args: &Value, home_dir: &Path) -> Value
         return tool_error("Parameter 'values' must contain at least one cell");
     }
 
-    let backend = match gw::resolve_backend(home_dir).await {
+    let backend = match g.backend(home_dir, "sheets_append").await {
         Ok(b) => b,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -380,14 +391,14 @@ pub(crate) fn task_list_arg(args: &Value) -> &str {
         .unwrap_or(TASKS_DEFAULT_LIST)
 }
 
-pub(crate) async fn handle_forms_get(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_forms_get(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let form_id = match args.get("form_id").and_then(|v| v.as_str()) {
         Some(v) if !v.trim().is_empty() => v,
         _ => return tool_error("Missing required parameter: form_id"),
     };
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "forms_get").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -397,14 +408,14 @@ pub(crate) async fn handle_forms_get(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_forms_list_responses(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_forms_list_responses(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let form_id = match args.get("form_id").and_then(|v| v.as_str()) {
         Some(v) if !v.trim().is_empty() => v,
         _ => return tool_error("Missing required parameter: form_id"),
     };
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "forms_list_responses").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -414,10 +425,10 @@ pub(crate) async fn handle_forms_list_responses(args: &Value, home_dir: &Path) -
     }
 }
 
-pub(crate) async fn handle_gtasks_lists(home_dir: &Path) -> Value {
+pub(crate) async fn handle_gtasks_lists(home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "gtasks_lists").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -427,7 +438,7 @@ pub(crate) async fn handle_gtasks_lists(home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_gtasks_list(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_gtasks_list(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let list_id = task_list_arg(args);
@@ -437,7 +448,7 @@ pub(crate) async fn handle_gtasks_list(args: &Value, home_dir: &Path) -> Value {
         .unwrap_or(false);
     let max = arg_u32(args, "max_results", 50);
 
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "gtasks_list").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -447,7 +458,7 @@ pub(crate) async fn handle_gtasks_list(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_gtasks_create(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_gtasks_create(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let title = match args.get("title").and_then(|v| v.as_str()) {
@@ -475,7 +486,7 @@ pub(crate) async fn handle_gtasks_create(args: &Value, home_dir: &Path) -> Value
         }
     }
 
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "gtasks_create").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -491,7 +502,7 @@ pub(crate) async fn handle_gtasks_create(args: &Value, home_dir: &Path) -> Value
     }
 }
 
-pub(crate) async fn handle_gtasks_complete(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_gtasks_complete(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
@@ -500,7 +511,7 @@ pub(crate) async fn handle_gtasks_complete(args: &Value, home_dir: &Path) -> Val
     };
     let list_id = task_list_arg(args);
 
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "gtasks_complete").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -520,7 +531,7 @@ pub(crate) async fn handle_gtasks_complete(args: &Value, home_dir: &Path) -> Val
 // natively (2026-07-30 decision) — no preview enrollment for any customer.
 // ─────────────────────────────────────────────────────────────────
 
-pub(crate) async fn handle_drive_search(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_drive_search(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let query = match args.get("query").and_then(|v| v.as_str()) {
@@ -534,7 +545,7 @@ pub(crate) async fn handle_drive_search(args: &Value, home_dir: &Path) -> Value 
         .filter(|s| !s.is_empty());
     let max = arg_u32(args, "max_results", 20);
 
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "drive_search").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -544,14 +555,14 @@ pub(crate) async fn handle_drive_search(args: &Value, home_dir: &Path) -> Value 
     }
 }
 
-pub(crate) async fn handle_drive_read(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_drive_read(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let file_id = match args.get("file_id").and_then(|v| v.as_str()) {
         Some(v) if !v.trim().is_empty() => v,
         _ => return tool_error("Missing required parameter: file_id"),
     };
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "drive_read").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -561,14 +572,14 @@ pub(crate) async fn handle_drive_read(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_docs_read(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_docs_read(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let document_id = match args.get("document_id").and_then(|v| v.as_str()) {
         Some(v) if !v.trim().is_empty() => v,
         _ => return tool_error("Missing required parameter: document_id"),
     };
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "docs_read").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -578,7 +589,7 @@ pub(crate) async fn handle_docs_read(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_docs_append(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_docs_append(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let document_id = match args.get("document_id").and_then(|v| v.as_str()) {
@@ -589,7 +600,7 @@ pub(crate) async fn handle_docs_append(args: &Value, home_dir: &Path) -> Value {
         Some(v) if !v.is_empty() => v,
         _ => return tool_error("Missing required parameter: text"),
     };
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "docs_append").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };
@@ -602,14 +613,14 @@ pub(crate) async fn handle_docs_append(args: &Value, home_dir: &Path) -> Value {
     }
 }
 
-pub(crate) async fn handle_slides_read(args: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_slides_read(args: &Value, home_dir: &Path, g: &super::google_identity_client::GoogleCaller) -> Value {
     use duduclaw_gateway::google_workspace as gw;
 
     let presentation_id = match args.get("presentation_id").and_then(|v| v.as_str()) {
         Some(v) if !v.trim().is_empty() => v,
         _ => return tool_error("Missing required parameter: presentation_id"),
     };
-    let token = match gw::get_valid_google_token(home_dir).await {
+    let token = match g.token(home_dir, "slides_read").await {
         Ok(t) => t,
         Err(e) => return tool_error(&e.to_string()),
     };

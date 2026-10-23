@@ -140,6 +140,31 @@ AI 社員に紐づいている人（閲覧者以上）なら誰でも見られ�
 
 社員をアーカイブまたは削除すると専用コレクションもアーカイブされ（オーナーである人だけがアクセスを残します）、社員を復元するとアーカイブで外した共有が戻ります。最初のアップロードでは既存の `[knowledge] collections` の一覧にもコレクションを追加し、その後のアップロードでは一覧に触れません。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md#ダッシュボードでの操作)。
 
+## AI 社員ページ → 接続（未リリース）
+
+この社員に紐づく人（閲覧者以上）は、どの Google アカウントを使っているか、今使えるかを見られます（`agents.google_identity_get`）。変更と「接続テスト」は管理者だけです。
+
+| 操作 | 書き込み先 | 反映 |
+|---|---|---|
+| 変更 → 会社の共用アカウント／同僚として利用（ドメイン委任）／使わない | `agent.toml [google] identity` = `home`／`delegate:<email>`／`none`（`agents.google_identity_set`） | 次の Google ツール呼び出し。`none` にすると 19 個の Google ツールが見えなくなります（ツール一覧が変わります）。メールアドレスは許可されたドメインにある必要があります。 |
+| 「同僚のアカウントが使えないときは会社の共用アカウントを使う」 | `[google] fallback = "home"`（チェックなしなら書きません） | 対象は、鍵が未取り込み、同僚の停止・退職、Google の拒否や接続不能だけです。依頼者の拒否、設定の誤り、保護の問題では切り替えません。 |
+| 接続テスト | なし | 同僚向けにトークンを取得し（全スコープ、次にサービスごと）、Gmail が同じアドレスを返すか確かめます。何も送信しません。 |
+
+`[google] requesters`（既定 `bound_people`、ほかに `owner_only`、`anyone`）はこのページにまだ操作がありません。`agents.google_identity_set`（`anyone` には `confirm_anyone: true` が必要）か設定ファイルの詳細編集（管理者）で設定します。管理者でない担当者が `agent.toml` を編集する場合、`[google]` は狭める方向にしか変えられません（`none` にする、`fallback` を外す、`requesters` を厳しくする）。詳しくは[AI 社員ごとに別の Google アカウントを使う](google-workspace.md#ai-社員ごとに別の-google-アカウントを使う会社の委任未リリース)。
+
+## 連携 → Google → 会社の委任（未リリース）
+
+管理者のみ、両エディション。
+
+| 操作 | 書き込み先 | 反映 |
+|---|---|---|
+| 鍵ファイルを取り込む／差し替える | `<home>/protected/google-service-account.sealed`。資格情報の保護鍵で封印（`google.delegation.import_key`） | すぐ。「セキュリティ → 資格情報の保護」がシステムのキーチェーンでないと拒否されます。鍵はブラウザーに戻りません。パネルにはサービスアカウント、クライアント ID、スコープのリスト、管理コンソールの場所が表示されます。 |
+| 削除 | 封印した鍵を削除（`google.delegation.remove_key`、確認あり） | 同僚として動いているすべての社員が Google を使えなくなります（切り替えが許可されていれば共用アカウントへ）。 |
+| 委任できるドメイン | `config.toml [integrations.google_identity] allowed_subject_domains`（`google.delegation.settings_set`） | 次の呼び出し。ドメインが完全一致の場合のみ。空欄なら `[integrations.google_service_account] subject` のドメインだけ、なければ誰も不可。 |
+| （操作なし）`default_identity` | `[integrations.google_identity] default_identity` = `home`（既定）／`none` | `[google]` のない社員が使うもの。 |
+
+下の一覧には、同僚として動いている社員と、使えない場合の理由が表示されます。
+
 ## システム設定 → 詳細設定 → ナレッジベース検索
 
 管理者のみ（1.76.0 で追加）。ドキュメントナレッジベースが意味で検索しているか、キーワード一致のみかを表示します。キーワードのみの場合はその理由と、すでにベクトルを持つ段落の割合も表示します。

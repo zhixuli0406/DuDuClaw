@@ -140,6 +140,31 @@ Visible to everyone bound to the employee (Viewer and up); adding and removing f
 
 Archiving or deleting the employee archives its own collection (only people owners keep access); restoring the employee puts back the grants archiving removed. The first upload also adds the collection to an existing `[knowledge] collections` list; later uploads leave that list alone. Details: [Document knowledge base](../features/63-knowledge-base.md#using-the-dashboard).
 
+## Employee page → Connections (unreleased)
+
+Everyone bound to the employee (Viewer and up) sees which Google account it uses and whether that works right now (`agents.google_identity_get`). Changing it and **Test connection** are Admin only.
+
+| Control | Writes | Effect |
+|---|---|---|
+| Change → Company's shared account / Act as a colleague (domain delegation) / Do not use | `agent.toml [google] identity` = `home` / `delegate:<email>` / `none` (`agents.google_identity_set`) | Next Google tool call. `none` hides the 19 Google tools from the employee (tools list changes). The email must be in an allowed domain. |
+| "If the colleague's account cannot be used, use the company's shared account" | `[google] fallback = "home"` (unticked: the key is left out) | Covers only: no key imported, colleague suspended or offboarded, Google rejected or unreachable. A refused requester, a setting error or a protection problem never falls back. |
+| Test connection | nothing | Mints for the colleague (full list, then per service), checks Gmail reports the same address. Sends nothing. |
+
+`[google] requesters` (`bound_people` default, `owner_only`, `anyone`) has no control on this page yet; set it with `agents.google_identity_set` (`anyone` needs `confirm_anyone: true`) or the Advanced config editor (Admin). A non-admin Owner editing `agent.toml` may only narrow `[google]` (switch to `none`, drop `fallback`, tighten `requesters`). Details: [Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-unreleased).
+
+## Integrations → Google → Company delegation (unreleased)
+
+Admin only, both editions.
+
+| Control | Writes | Effect |
+|---|---|---|
+| Import key file / Replace key file | `<home>/protected/google-service-account.sealed`, sealed with the credential-protection key (`google.delegation.import_key`) | Immediately. Refused until Security → Credential protection is in the system keychain. The key never comes back to the browser; the panel shows the service account, client id, scope list and Admin console path. |
+| Remove | deletes the sealed key (`google.delegation.remove_key`, confirmation) | Every employee acting as a colleague stops using Google (or falls back, where allowed). |
+| Allowed domains | `config.toml [integrations.google_identity] allowed_subject_domains` (`google.delegation.settings_set`) | Next call. Exact domain match. Empty: only the domain of `[integrations.google_service_account] subject`, or nobody. |
+| (no control) `default_identity` | `[integrations.google_identity] default_identity` = `home` (default) / `none` | What employees without `[google]` use. |
+
+The list at the bottom shows each employee acting as a colleague and why it is blocked, if it is.
+
 ## Settings → Advanced → Knowledge base search
 
 Admin only (new in 1.76.0). Shows whether the document knowledge base searches by meaning or by keywords only, and why not when it does not, with the share of passages that already have vectors.

@@ -333,7 +333,11 @@ pub(crate) async fn visible_tools_in_lane(
     let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, &principal.client_id);
     let scope_listing = scope_listing_applies(principal, client_is_agent, employee_process);
 
-    let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir);
+    // Per-employee Google identity: an effective `none` hides the group —
+    // the same predicate the dispatch gate refuses with.
+    let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir)
+        && super::google_identity_client::GoogleCaller::for_process(home_dir, &principal.client_id)
+            .tools_listed(home_dir);
     // H8: same deny-by-default gate for GitHub — discoverable ⇔ callable.
     let github_enabled = duduclaw_gateway::github_workspace::integration_enabled(home_dir);
 

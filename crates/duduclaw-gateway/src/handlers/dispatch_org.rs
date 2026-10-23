@@ -267,6 +267,39 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_google_integration_set(params).await
             }
+            // ── Per-employee Google identity (B2a) ──────────────
+            // Who each AI employee acts as. Writing an identity, the sealed
+            // delegation key and the domain list are admin-only; reading an
+            // employee's own identity needs Viewer access to that employee.
+            "google.delegation.get" => {
+                require_admin!();
+                self.handle_google_delegation_get().await
+            }
+            "google.delegation.import_key" => {
+                require_admin!();
+                self.handle_google_delegation_import_key(params, ctx).await
+            }
+            "google.delegation.remove_key" => {
+                require_admin!();
+                self.handle_google_delegation_remove_key(params, ctx).await
+            }
+            "google.delegation.settings_set" => {
+                require_admin!();
+                self.handle_google_delegation_settings_set(params, ctx).await
+            }
+            "google.identity.test" => {
+                require_admin!();
+                self.handle_google_identity_test(params).await
+            }
+            "agents.google_identity_get" => {
+                let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                check_agent_named!(&agent_id, AccessLevel::Viewer);
+                self.handle_agents_google_identity_get(&agent_id).await
+            }
+            "agents.google_identity_set" => {
+                require_admin!();
+                self.handle_agents_google_identity_set(params, ctx).await
+            }
 
             // P9 employee digest + feedback on finished work (per-call ACL
             // inside: Viewer to read, Operator + task audience to rate).
@@ -542,23 +575,36 @@ impl MethodHandler {
                 self.handle_mail_status().await
             }
             "mail.list" => {
-                require_manager!();
-                self.handle_mail_list(params).await
+                match self.mailbox_reader_gate(ctx).await {
+                    Ok(reader) => self.handle_mail_list(params, reader).await,
+                    Err(e) => WsFrame::error_response("", &e),
+                }
             }
             "mail.read" => {
-                require_manager!();
+                if let Err(e) = self.mailbox_reader_gate(ctx).await {
+                    return WsFrame::error_response("", &e);
+                }
                 self.handle_mail_read(params, ctx).await
             }
             "mail.archive" => {
                 require_manager!();
+                if let Err(e) = self.mailbox_viewer_gate(ctx).await {
+                    return WsFrame::error_response("", &e);
+                }
                 self.handle_mail_archive(params, ctx).await
             }
             "mail.outbox" => {
                 require_manager!();
+                if let Err(e) = self.mailbox_viewer_gate(ctx).await {
+                    return WsFrame::error_response("", &e);
+                }
                 self.handle_mail_outbox(params).await
             }
             "mail.decide" => {
                 require_manager!();
+                if let Err(e) = self.mailbox_viewer_gate(ctx).await {
+                    return WsFrame::error_response("", &e);
+                }
                 self.handle_mail_decide(params, ctx).await
             }
 

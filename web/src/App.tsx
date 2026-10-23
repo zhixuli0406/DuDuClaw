@@ -306,6 +306,8 @@ export function App() {
               <Route path="knowledge-base/:id" element={<CollectionDetailPage />} />
               {/* 關於 — open to every authenticated user (all instances). */}
               <Route path="about" element={<AboutPage />} />
+              {/* Personal inbox reads are authorized per receipt by the gateway. */}
+              <Route path="mail" element={<MailPage />} />
               {/* N-1 launcher (§2 L3 + §5 WP N-1) — app grid, open to every
                   authenticated role (each card's own visibility still gates
                   per-app via isAppVisible). Not a nav item by design — see
@@ -348,9 +350,6 @@ export function App() {
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
                 <Route path="org" element={<OrgChartPage />} />
-                {/* 信箱 (Agent Mail, P2-d) — every `mail.*` RPC is
-                    `require_manager!`-gated server-side; this mirrors that. */}
-                <Route path="mail" element={<MailPage />} />
                 {/* 我的團隊 (1.76.0) — `users.my_team` is `require_manager!`
                     and, as a `users.*` method, Enterprise-only server-side;
                     both are mirrored here. */}

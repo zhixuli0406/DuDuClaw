@@ -201,6 +201,12 @@ vendored-openssl = ["openssl-sys/vendored"]
 # with the in-process llama.cpp / mistral.rs backends they gated
 # (`wiki/reports/feature-audit-2026-09-29.md` T1-D3 / T3-S5).
 discord-voice = ["dep:songbird"]
+# Isolated live tests only (debug builds; a release build with it does not
+# compile, see `lib.rs`). Credential protection uses an in-memory store
+# instead of the OS keychain, and Google REST calls may be pointed at a local
+# mock with `DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE`. Never enabled by CI or the
+# release workflow.
+live-test-mocks = []
 # OpenTelemetry GenAI tracing + OTLP export (see src/otel.rs). Default OFF.
 otel = [
     "dep:opentelemetry",
@@ -228,6 +234,10 @@ calamine = "0.36.1"
 # production build).
 duduclaw-memory = { workspace = true, features = ["test-hooks"] }
 tempfile = "3"
+# Per-employee Google identity tests sign real RS256 service-account
+# assertions against a local mock token endpoint. Already in Cargo.lock (via
+# sqlx-mysql); test-only.
+rsa = { version = "0.9", features = ["pem"] }
 # `Router::oneshot` for middleware regression tests (decision_gate) — drives the
 # real router in-process instead of binding a port. Already in the tree via axum.
 tower = { version = "0.5", features = ["util"] }

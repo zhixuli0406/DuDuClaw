@@ -255,7 +255,7 @@ pub fn build_claims(
     }
 }
 
-/// Cached access token for one `(client_email, subject)` pair.
+/// Cached access token for one `(client_email, subject, scopes)` triple.
 #[derive(Debug, Clone)]
 struct CachedToken {
     access_token: String,
@@ -263,11 +263,39 @@ struct CachedToken {
     good_until: Instant,
 }
 
-/// Process-wide token cache. Keyed by `client_email|subject` so a deployment
-/// impersonating several users doesn't cross-contaminate.
+/// Process-wide token cache. Keyed by `client_email|subject|scopes` so a
+/// deployment impersonating several users doesn't cross-contaminate, and a
+/// narrow-scope token (the per-service checks of `google.identity.test`)
+/// can never be served to a call that needs the full list.
 fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
     static CACHE: OnceLock<RwLock<HashMap<String, CachedToken>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn cache_key(client_email: &str, subject: &str, scopes: &[&str]) -> String {
+    format!("{client_email}|{subject}|{}", scopes.join(" "))
+}
+
+/// Whether [`mint_for_subject`] may answer from / write to the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    Use,
+    /// Always mint fresh and do not store the result (verification calls).
+    Bypass,
+}
+
+/// A minted access token. `Debug` never prints the token.
+#[derive(Clone)]
+pub struct MintedToken {
+    pub access_token: String,
+    /// Seconds until Google says it expires (not reduced by the skew).
+    pub expires_in: u64,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MintedToken(<redacted>, expires_in={})", self.expires_in)
+    }
 }
 
 /// Sign the assertion and exchange it for an access token, using the cache when
@@ -277,11 +305,30 @@ pub async fn get_token(
     scopes: &[&str],
 ) -> Result<String, ServiceAccountError> {
     let key = load_key(&config.key_file)?;
-    let cache_key = format!("{}|{}", key.client_email, config.subject);
+    mint_for_subject(&key, &config.subject, scopes, CacheMode::Use)
+        .await
+        .map(|t| t.access_token)
+}
 
-    if let Some(hit) = cache().read().await.get(&cache_key) {
-        if Instant::now() < hit.good_until {
-            return Ok(hit.access_token.clone());
+/// Mint a token for `subject` with an already-loaded key: the shared core of
+/// the home path ([`get_token`]) and per-employee delegation (the key there
+/// comes from the sealed store, never a readable file).
+pub async fn mint_for_subject(
+    key: &ServiceAccountKey,
+    subject: &str,
+    scopes: &[&str],
+    cache_mode: CacheMode,
+) -> Result<MintedToken, ServiceAccountError> {
+    let cache_key = cache_key(&key.client_email, subject, scopes);
+    if cache_mode == CacheMode::Use
+        && let Some(hit) = cache().read().await.get(&cache_key)
+    {
+        let now = Instant::now();
+        if now < hit.good_until {
+            return Ok(MintedToken {
+                access_token: hit.access_token.clone(),
+                expires_in: (hit.good_until - now + EXPIRY_SKEW).as_secs(),
+            });
         }
     }
 
@@ -289,8 +336,8 @@ pub async fn get_token(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let claims = build_claims(&key, &config.subject, scopes, now);
-    let assertion = sign_assertion(&key, &claims)?;
+    let claims = build_claims(key, subject, scopes, now);
+    let assertion = sign_assertion(key, &claims)?;
 
     let token_uri = key
         .token_uri
@@ -298,6 +345,7 @@ pub async fn get_token(
         .unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ServiceAccountError::RequestFailed(e.to_string()))?;
     let resp = client
@@ -326,16 +374,30 @@ pub async fn get_token(
     let parsed: TokenResponse = serde_json::from_str(&body).map_err(|e| {
         ServiceAccountError::RequestFailed(format!("malformed token response: {e}"))
     })?;
-    let ttl = Duration::from_secs(parsed.expires_in.unwrap_or(ASSERTION_TTL_SECS));
-    let good_until = Instant::now() + ttl.saturating_sub(EXPIRY_SKEW);
-    cache().write().await.insert(
-        cache_key,
-        CachedToken {
-            access_token: parsed.access_token.clone(),
-            good_until,
-        },
-    );
-    Ok(parsed.access_token)
+    let expires_in = parsed.expires_in.unwrap_or(ASSERTION_TTL_SECS);
+    if cache_mode == CacheMode::Use {
+        let good_until = Instant::now() + Duration::from_secs(expires_in).saturating_sub(EXPIRY_SKEW);
+        cache().write().await.insert(
+            cache_key,
+            CachedToken {
+                access_token: parsed.access_token.clone(),
+                good_until,
+            },
+        );
+    }
+    Ok(MintedToken { access_token: parsed.access_token, expires_in })
+}
+
+/// The OAuth error code of a [`ServiceAccountError::Rejected`]
+/// (`unauthorized_client`, `invalid_grant`, …), parsed from the summary
+/// [`summarize_token_error`] wrote (`HTTP 401: <code> — …`). Exact token,
+/// used only to pick an explanation.
+pub fn rejection_code(err: &ServiceAccountError) -> Option<&str> {
+    let ServiceAccountError::Rejected(summary, _) = err else { return None };
+    let rest = summary.strip_prefix("HTTP ")?;
+    let (_, after) = rest.split_once(": ")?;
+    let code = after.split(' ').next()?;
+    (!code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_')).then_some(code)
 }
 
 #[derive(Debug, Deserialize)]
@@ -601,6 +663,30 @@ subject = "boss@customer.com"
         let body = "<html><body>Internal Server Error<script>evil()</script></body></html>";
         let s = summarize_token_error(body, 500);
         assert_eq!(s, "HTTP 500");
+    }
+
+    #[test]
+    fn rejection_code_is_the_exact_oauth_error() {
+        let e = ServiceAccountError::Rejected(
+            summarize_token_error(r#"{"error":"invalid_grant","error_description":"Invalid email or User ID"}"#, 400),
+            "1".into(),
+        );
+        assert_eq!(rejection_code(&e), Some("invalid_grant"));
+        let bare = ServiceAccountError::Rejected(summarize_token_error("{}", 500), "1".into());
+        assert_eq!(rejection_code(&bare), None);
+        assert_eq!(rejection_code(&ServiceAccountError::InvalidSubject), None);
+    }
+
+    #[test]
+    fn cache_key_separates_scopes_and_subjects() {
+        assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "a@c.com", &["x", "y"]));
+        assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "b@c.com", &["x"]));
+    }
+
+    #[test]
+    fn minted_token_debug_hides_the_token() {
+        let t = MintedToken { access_token: "ya29.SECRET".into(), expires_in: 10 };
+        assert!(!format!("{t:?}").contains("SECRET"));
     }
 
     #[test]

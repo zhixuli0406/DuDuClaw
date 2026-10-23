@@ -1,5 +1,5 @@
 {
-  "_comment": "Admin-only agent.toml fields. Read by the gateway test (crates/duduclaw-gateway/src/handlers/agent_authority.rs) and the editPayload vitest, so the server table and the dashboard fallback list cannot drift. kind: change = any change needs an admin; loosen = only raising a budget cap / turning hard_stop off needs an admin; role_main = becoming or leaving role \"main\" needs an admin. form_paths ending in \".\" are prefixes.",
+  "_comment": "Admin-only agent.toml fields. Read by the gateway test (crates/duduclaw-gateway/src/handlers/agent_authority.rs) and the editPayload vitest, so the server table and the dashboard fallback list cannot drift. kind: change = any change needs an admin; loosen = only raising a budget cap / turning hard_stop off needs an admin; role_main = becoming or leaving role \"main\" needs an admin; google_narrow = the owner may only narrow [google] (switch to none, drop fallback, tighten requesters). form_paths ending in \".\" are prefixes.",
   "fields": [
     { "key": "agent.reports_to", "form_paths": ["form.reports_to"], "kind": "change" },
     { "key": "agent.department", "form_paths": ["form.department"], "kind": "change" },
@@ -29,7 +29,8 @@
     { "key": "model.account_pool", "form_paths": ["adv.account_pool"], "kind": "change" },
     { "key": "budget.monthly_limit_cents", "form_paths": ["form.monthly_limit_cents"], "kind": "loosen" },
     { "key": "budget.daily_cap_cents", "form_paths": ["v.daily_cap_cents"], "kind": "loosen" },
-    { "key": "budget.hard_stop", "form_paths": ["form.hard_stop"], "kind": "loosen" }
+    { "key": "budget.hard_stop", "form_paths": ["form.hard_stop"], "kind": "loosen" },
+    { "key": "google", "form_paths": [], "kind": "google_narrow" }
   ],
   "kv_refused_sections": ["ptc", "cultural_context", "sticker", "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt", "os_watch", "budget"]
 }
