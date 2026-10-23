@@ -126,21 +126,23 @@ async fn mention_only_group_answers_only_messages_that_call_an_employee() {
         "the default employee is not labelled"
     );
 
-    // An unmapped LINE friend calling a non-public employee is answered
-    // with a refusal (addressed, but no model turn as finance).
+    // An unmapped LINE friend calling a non-public employee is treated like
+    // a name that matches nobody (owner decision on #182 L5): not addressed
+    // in a mention-only group, no refusal that would confirm the name, and
+    // never a model turn as finance.
     let call_finance = admit(
         &state,
         &group_text("e3", &g, "U1", "@財務小幫手 幫我算帳", 3),
     )
     .await;
-    assert!(call_finance.addresses_bot());
-    assert!(matches!(
-        call_finance.decision,
-        TurnDecision::Reply {
-            kind: ReplyKind::Refusal,
-            ..
-        }
-    ));
+    let call_nobody = admit(
+        &state,
+        &group_text("e3b", &g, "U1", "@沒有這個人 幫我算帳", 3),
+    )
+    .await;
+    assert!(!call_finance.addresses_bot());
+    assert_eq!(call_finance.addresses_bot(), call_nobody.addresses_bot());
+    assert_eq!(call_finance.decision, TurnDecision::Default);
     assert_eq!(call_finance.agent(), "dudu");
 
     let list = admit(&state, &group_text("e4", &g, "U1", "@", 4)).await;

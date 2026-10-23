@@ -179,3 +179,32 @@ for recent window fingerprints and connection events. The UI polls every
 30 seconds, so an expiry or device-side close may appear on the next poll.
 The complete OS image and real SSH/notification flow are not yet verified;
 this is an unreleased interface, not acceptance of the assembled device.
+
+## Security → Credential protection (unreleased)
+
+The **Credential protection** card on the Security page (Admin, both editions) shows one
+line: "Credential protection: Files" or "Credential protection: System keychain (…)", followed by what that
+means. It covers only credentials that let an AI employee act as a specific
+person; every other setting keeps working the same way whatever the card
+says.
+
+- **Move to system keychain** (`security.credential_protection_enable`)
+  creates the protected key in the macOS keychain or Windows Credential
+  Manager. Linux and Docker show "this platform has no supported system keychain" and no button.
+- **Needs re-authorization** appears on macOS after an upgrade or while the
+  keychain is locked. Run `duduclaw credentials authorize` in Terminal on that
+  Mac and allow the dialog once.
+- **Protection key missing / replaced / settings error** stop personal
+  accounts. **Re-enable** (`reset: true`) makes a new key; saved personal
+  credentials stop working and people reconnect.
+- **Replace key** (also `reset: true`) is offered while everything looks fine,
+  for when the key and its record may both have been swapped; it has the same
+  effect as Re-enable. On a macOS build without hardened runtime the line says
+  "readable by programs under the same user account", because code injected
+  into DuDuClaw could read the key.
+- **Turn off** (`security.credential_protection_disable`, `confirm: true`,
+  typed confirmation) deletes the key; saved personal credentials stop
+  working.
+
+`duduclaw credentials status` (add `--json` for scripts) prints the same
+state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).

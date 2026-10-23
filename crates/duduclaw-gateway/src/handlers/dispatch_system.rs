@@ -258,6 +258,20 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_security_credential_cleanup(ctx).await
             }
+            // B2c: the protected key in the OS credential store (person
+            // identities). Admin only; never returns key material.
+            "security.credential_protection" => {
+                require_admin!();
+                self.handle_security_credential_protection().await
+            }
+            "security.credential_protection_enable" => {
+                require_admin!();
+                self.handle_security_credential_protection_enable(params, ctx).await
+            }
+            "security.credential_protection_disable" => {
+                require_admin!();
+                self.handle_security_credential_protection_disable(params, ctx).await
+            }
 
             // ── Security Audit (secaudit dashboard, DESIGN-code-security-
             // audit-2026-08 §3.1, manager+) — reads/reviews reports written
