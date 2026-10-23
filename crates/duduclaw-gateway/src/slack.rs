@@ -547,6 +547,23 @@ fn to_slack_mrkdwn(text: &str) -> String {
 // ── Event handling ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+fn scope_attended_slack_message<F: std::future::Future>(
+    event: &serde_json::Value,
+    session: &str,
+    future: F,
+) -> impl std::future::Future<Output=F::Output> {
+    // Logging/addressing may retain a placeholder, but attendance is granted
+    // only to the original typed Slack user ID. Slack also uses W IDs for
+    // Enterprise users; deliberately do not impose a fixed ID length.
+    let sender = event.get("user").and_then(|value|value.as_str()).filter(|id| {
+        id.len()>1 && id.len()<=128 && matches!(id.as_bytes()[0],b'U'|b'W')
+            && id.bytes().all(|byte|byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    }).unwrap_or("");
+    let bot_or_nonmessage = event.get("type").and_then(|v|v.as_str())!=Some("message")
+        || event.get("bot_id").is_some() || event.get("subtype").is_some();
+    crate::computer_use_sessions::attended::verified_channel_message(session,sender,bot_or_nonmessage,future)
+}
+
 async fn handle_event(
     payload: &serde_json::Value,
     bot_token: &str,
@@ -916,7 +933,7 @@ async fn handle_event(
         })),
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = thinking.scope(crate::approval::scope_trusted_reply(target, async {
+    let guarded = scope_attended_slack_message(event, &session_id, thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some(agent) = agent_name {
             build_guarded_reply_for_agent(
                 &input_text,
@@ -931,7 +948,7 @@ async fn handle_event(
             build_guarded_reply_with_session(&input_text, ctx, &session_id, user, Some(on_progress))
                 .await
         }
-    }))
+    })))
     .await;
     drop(status_guard);
 
@@ -1587,6 +1604,51 @@ pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attended_foundation_slack_producer_refuses_missing_or_invalid_sender() {
+        for event in [
+            serde_json::json!({"type":"message"}),
+            serde_json::json!({"type":"message","user":null}),
+            serde_json::json!({"type":"message","user":7}),
+            serde_json::json!({"type":"message","user":false}),
+            serde_json::json!({"type":"message","user":[]}),
+            serde_json::json!({"type":"message","user":""}),
+            serde_json::json!({"type":"message","user":"unknown"}),
+            serde_json::json!({"type":"message","user":" "}),
+            serde_json::json!({"type":"message","user":"U1\n"}),
+        ] {
+            scope_attended_slack_message(&event,"slack:attendance-invalid",
+                duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some("slack:attendance-invalid".into()),async {
+                    assert!(!crate::computer_use_sessions::attended::bind_final_route("slack:attendance-invalid","slack:attendance-invalid","slack-attendance-invalid","slack-invalid-turn"),"{event}");
+                    let guard=crate::computer_use_sessions::turns::register("slack-attendance-invalid","slack-invalid-turn","slack:attendance-invalid").unwrap();
+                    assert!(!crate::computer_use_sessions::turns::attended_live_for("slack-attendance-invalid","slack-invalid-turn"),"{event}");
+                    drop(guard);
+                })).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attended_foundation_slack_producer_accepts_typed_user_and_grid_ids_only() {
+        for (event,expected) in [
+            (serde_json::json!({"type":"message","user":"U123ABC"}),true),
+            (serde_json::json!({"type":"message","user":"W1ABC"}),true),
+            (serde_json::json!({"type":"message","user":"U123ABC","bot_id":"B1"}),false),
+            (serde_json::json!({"type":"message","user":"U123ABC","subtype":"bot_message"}),false),
+            (serde_json::json!({"type":"app_mention","user":"U123ABC"}),false),
+            (serde_json::json!({"type":"message","user":"U"}),false),
+            (serde_json::json!({"type":"message","user":"U1/other"}),false),
+        ] {
+            scope_attended_slack_message(&event,"slack:attendance-positive",
+                duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some("slack:attendance-positive".into()),async {
+                    let bound=crate::computer_use_sessions::attended::bind_final_route("slack:attendance-positive","slack:attendance-positive","slack-attendance-positive","slack-positive-turn");
+                    assert_eq!(bound,expected,"{event}");
+                    let guard=crate::computer_use_sessions::turns::register("slack-attendance-positive","slack-positive-turn","slack:attendance-positive").unwrap();
+                    assert_eq!(crate::computer_use_sessions::turns::attended_live_for("slack-attendance-positive","slack-positive-turn"),expected,"{event}");
+                    drop(guard);
+                })).await;
+        }
+    }
 
     #[test]
     fn test_strip_bot_mention() {

@@ -25,14 +25,27 @@ impl super::ComputerUseSessions {
         expected: &str,
         scope: &crate::team_oversight::TeamOversight,
     ) -> bool {
-        scope.agent == agent
-            && self.live_entry(agent, Some(expected)).is_some_and(|entry| {
-                entry
-                    .shared
-                    .origin
-                    .get()
-                    .is_some_and(|origin| origin.allows(scope))
-            })
+        self.team_report_for(agent, expected, scope).is_some()
+    }
+
+    /// Only the actual starter is recorded in who-read notices, even if
+    /// several reports happen to share an employee binding.
+    pub(crate) fn team_report_for(
+        &self,
+        agent: &str,
+        expected: &str,
+        scope: &crate::team_oversight::TeamOversight,
+    ) -> Option<(String, u8)> {
+        if scope.agent != agent {
+            return None;
+        }
+        let entry = self.live_entry(agent, Some(expected))?;
+        let origin = entry.shared.origin.get()?;
+        if !origin.allows(scope) {
+            return None;
+        }
+        let report = scope.reports.get(origin.user_id.as_ref()?)?;
+        Some((report.user_id.clone(), report.depth))
     }
 
     /// At most one capture per five seconds, shared by all viewers. A busy
@@ -163,6 +176,16 @@ fn snapshot_error() -> super::OpError {
 }
 
 impl SessionOrigin {
+    /// Capture the host-proven fact at admission, before long approval or
+    /// container-start waits. A durable fact is not a live presence grant.
+    pub(crate) fn capture_live_turn(agent: &str, turn: Option<&str>) -> Self {
+        let who = turn
+            .filter(|turn| super::turns::attended_live_for(agent, turn))
+            .map(|turn| crate::knowledge::turn_requesters::resolve(agent, Some(turn)))
+            .unwrap_or(RequesterIdentity::Unknown);
+        Self::from_requester(&who, Utc::now())
+    }
+
     pub(crate) fn from_requester(requester: &RequesterIdentity, started_at: DateTime<Utc>) -> Self {
         // Only a live, identified person counts. A background job on behalf
         // of a report is not that report starting a browser in a live turn.
@@ -193,6 +216,42 @@ impl SessionOrigin {
 mod tests {
     use super::*;
     use duduclaw_auth::{AccessLevel, OverseenReport};
+
+    #[tokio::test]
+    async fn requester_identity_alone_cannot_create_a_human_session_origin() {
+        let agent = "employee-a";
+        let turn = format!("origin-{}", uuid::Uuid::new_v4());
+        let session = "webchat:origin-fixture";
+        let scope = scope(Utc::now() - chrono::Duration::seconds(1));
+        let _requester = crate::knowledge::turn_requesters::register(
+            agent,
+            &turn,
+            RequesterIdentity::DashboardUser {
+                user_id: "report-a".into(),
+            },
+        )
+        .unwrap();
+        let untrusted = super::super::turns::register(agent, &turn, session).unwrap();
+        assert!(!SessionOrigin::capture_live_turn(agent, Some(&turn)).allows(&scope));
+        drop(untrusted);
+        let origin = super::super::attended::verified_webchat_message(
+            session,
+            Some("report-a"),
+            duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(session.into()), async {
+                assert!(super::super::attended::bind_final_route(
+                    session, session, agent, &turn
+                ));
+                let _live = super::super::turns::register(agent, &turn, session).unwrap();
+                SessionOrigin::capture_live_turn(agent, Some(&turn))
+            }),
+        )
+        .await;
+        assert!(
+            origin.allows(&scope),
+            "the recorded fact survives the model turn ending"
+        );
+        assert!(!SessionOrigin::capture_live_turn(agent, Some(&turn)).allows(&scope));
+    }
 
     fn scope(since: DateTime<Utc>) -> crate::team_oversight::TeamOversight {
         crate::team_oversight::TeamOversight {

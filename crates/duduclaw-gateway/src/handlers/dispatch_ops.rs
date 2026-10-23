@@ -103,7 +103,8 @@ impl MethodHandler {
             | "computer_sessions.takeover"
             | "computer_sessions.hand_back"
             | "computer_sessions.resume"
-            | "computer_sessions.stop" => {
+            | "computer_sessions.stop"
+            | "computer_sessions.snapshot" => {
                 self.handle_computer_sessions(method, params, ctx).await
             }
             "computer_workspaces.list"

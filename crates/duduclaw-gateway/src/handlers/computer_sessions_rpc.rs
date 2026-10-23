@@ -71,6 +71,9 @@ impl MethodHandler {
         params: Value,
         ctx: &UserContext,
     ) -> WsFrame {
+        if method == "computer_sessions.snapshot" {
+            return Box::pin(self.handle_computer_snapshot(params, ctx)).await;
+        }
         let Some(action) = rpc_action(method) else {
             return WsFrame::error_response("", "unknown computer_sessions method");
         };
@@ -82,7 +85,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "permission denied");
         };
         if !authorize(&live, agent, action) {
-            return WsFrame::error_response("", "permission denied");
+            return Box::pin(self.handle_computer_team(method, params, ctx)).await;
         }
         let sessions = admin_sessions(&self.home_dir);
         let result = match method {
@@ -114,11 +117,17 @@ impl MethodHandler {
                 if params.get("keep_login").is_some_and(|v| !v.is_boolean()) {
                     return WsFrame::error_response("", "keep_login must be true or false");
                 }
+                let expected = match params.get("session_id") {
+                    None => None,
+                    Some(Value::String(id)) if !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control) => Some(id.as_str()),
+                    _ => return WsFrame::error_response("", "invalid session_id"),
+                };
                 sessions
-                    .live_stop_with_login(
+                    .live_stop_with_login_bound(
                         agent,
                         &live,
                         params["keep_login"].as_bool().unwrap_or(false),
+                        expected,
                     )
                     .await
             }
