@@ -54,6 +54,7 @@ import {
   Database,
   Library,
   UsersRound,
+  Eye,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -419,6 +420,7 @@ export const navGroups: NavGroup[] = [
     // 設定 — management shell entry + brand/about page.
     label: 'navGroup.settings',
     items: [
+      { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
@@ -435,6 +437,7 @@ export const navGroups: NavGroup[] = [
     label: 'navGroup.org',
     items: [
       { to: '/team', icon: UsersRound, label: 'nav.myTeam', desc: 'nav.myTeam.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
+      { to: '/team/conversations', icon: MessagesSquare, label: 'nav.teamHistory', desc: 'nav.teamHistory.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
     ],
   },
 ];
@@ -773,9 +776,9 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
     }
   }
   for (const group of navGroups) {
-    const item = group.items.find(
-      (i) => i.to === pathname || (i.to !== '/' && pathname.startsWith(i.to)),
-    );
+    const item = group.items
+      .filter((i) => i.to === pathname || (i.to !== '/' && pathname.startsWith(`${i.to}/`)))
+      .sort((a, b) => b.to.length - a.to.length)[0];
     if (item) return [{ labelId: item.crumb ?? item.label }];
   }
   return [];

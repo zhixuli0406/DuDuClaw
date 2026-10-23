@@ -12,6 +12,7 @@
 import { defaultLocale, messages, useLocaleStore } from '@/i18n';
 
 export interface MentionAgent {
+  readonly manager_may_read?: boolean;
   readonly name: string;
   readonly display_name: string;
   readonly trigger?: string;

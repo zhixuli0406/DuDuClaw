@@ -51,6 +51,7 @@ import {
   type MentionAgent,
 } from '@/lib/mention';
 import { api, type CallableAgent } from '@/lib/api';
+import { ManagerReadNotice } from '@/components/chat/ManagerReadNotice';
 
 export function WebChatPage() {
   const intl = useIntl();
@@ -144,16 +145,20 @@ export function WebChatPage() {
   // fails; the page then falls back to `agents.list` (own staff only, a
   // subset of what the server lets through).
   const [callable, setCallable] = useState<readonly CallableAgent[] | null>(null);
+  const callableRequest = useRef(0);
   const chatSessionId = useChatStore((s) => s.sessionId);
   const loadCallable = useCallback(() => {
+    const request = ++callableRequest.current;
     api.agents
       .callable(chatSessionId)
-      .then((r) => setCallable(Array.isArray(r?.agents) ? r.agents : null))
-      .catch(() => setCallable(null));
+      .then((r) => { if (request === callableRequest.current) setCallable(Array.isArray(r?.agents) ? r.agents : null); })
+      .catch(() => { if (request === callableRequest.current) setCallable(null); });
   }, [chatSessionId]);
   useEffect(() => {
     loadCallable();
-  }, [loadCallable]);
+    window.addEventListener('focus', loadCallable);
+    return () => { ++callableRequest.current; window.removeEventListener('focus', loadCallable); };
+  }, [loadCallable, selectedAgentId]);
 
   // The chosen partner (an AI staff member) or DuDu (the office assistant).
   const partner = useMemo(() => {
@@ -181,6 +186,7 @@ export function WebChatPage() {
           name: a.name,
           display_name: a.display_name,
           status: (a.status ?? 'active') as EmployeeRowAgent['status'],
+          manager_may_read: a.manager_may_read === true,
         }));
     }
     return agents.filter((a) => a.role !== 'main');
@@ -519,7 +525,7 @@ export function WebChatPage() {
           removed left column; it is conversation chrome, not history chrome. */}
       {staffAgents.length > 0 && (
         <div className="shrink-0 border-b border-surface-border">
-          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={handleSelectAgent} />
+          <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={handleSelectAgent} defaultManagerMayRead={callable?.find(a => a.name === mainAgentId)?.manager_may_read === true} />
         </div>
       )}
 
@@ -712,6 +718,7 @@ export function WebChatPage() {
               title={intl.formatMessage({ id: 'webchat.hint', defaultMessage: 'Enter to send, Shift+Enter for newline' })}
             />
           </div>
+          <ManagerReadNotice visible={callable?.find(a => a.name === historyAgentId)?.manager_may_read === true} />
         </div>
       </div>
     </div>

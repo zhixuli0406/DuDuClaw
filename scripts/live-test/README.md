@@ -89,3 +89,23 @@ lists what would go with sizes. `target/release` and other target triples are
 untouched unless you pass `--all-profiles`. The cache once reached 134 GB and a
 full disk crashed Docker Desktop; run it when free space drops below about
 100 GB.
+
+## Actual VNC authentication
+
+After installing the dashboard dependencies, run:
+
+```sh
+node scripts/live-test/computer-vnc-auth.mjs <already-built-local-image>
+```
+
+The test creates its own labelled container with no network, a read-only root,
+private tmpfs, no-new-privileges and CPU/memory limits. It checks actual RFB
+password authentication twice, rejects a wrong password and the sandbox user,
+checks both TCP tables for VNC listeners, then stops VNC and verifies socket
+removal. Its fixture directory is retained. Cleanup verifies the random ownership
+label before removing only that container. No image is pulled or published.
+
+An RFB greeting alone cannot verify these checks. The old helper emitted the
+greeting and then rejected the Unix peer named `localhost` against its
+`127.0.0.1` allowlist. The corrected helper binds to loopback without that IP-only
+allowlist; root-only socket permissions and VNC password authentication remain.
