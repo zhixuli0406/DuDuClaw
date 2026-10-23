@@ -25,6 +25,7 @@ import {
   TaskInsights,
   splitTurnMessages,
   EmployeeRow,
+  type EmployeeRowAgent,
   useChatFace,
   MicButton,
   VoicePlayToggle,
@@ -44,8 +45,10 @@ import {
   filterMentionCandidates,
   findActiveMention,
   mentionText,
+  orderMentionCandidates,
   type MentionAgent,
 } from '@/lib/mention';
+import { api, type CallableAgent } from '@/lib/api';
 
 export function WebChatPage() {
   const intl = useIntl();
@@ -134,17 +137,52 @@ export function WebChatPage() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [input]);
 
+  // Who this account may call (`agents.callable`: own staff, a manager's
+  // team, the default and public staff). `null` until loaded or when the RPC
+  // fails; the page then falls back to `agents.list` (own staff only, a
+  // subset of what the server lets through).
+  const [callable, setCallable] = useState<readonly CallableAgent[] | null>(null);
+  const chatSessionId = useChatStore((s) => s.sessionId);
+  const loadCallable = useCallback(() => {
+    api.agents
+      .callable(chatSessionId)
+      .then((r) => setCallable(Array.isArray(r?.agents) ? r.agents : null))
+      .catch(() => setCallable(null));
+  }, [chatSessionId]);
+  useEffect(() => {
+    loadCallable();
+  }, [loadCallable]);
+
   // The chosen partner (an AI staff member) or DuDu (the office assistant).
-  const partner = useMemo(
-    () => (selectedAgentId ? agents.find((a) => a.name === selectedAgentId) ?? null : null),
-    [agents, selectedAgentId],
+  const partner = useMemo(() => {
+    if (!selectedAgentId) return null;
+    return (
+      agents.find((a) => a.name === selectedAgentId)
+      ?? callable?.find((a) => a.name === selectedAgentId)
+      ?? null
+    );
+  }, [agents, callable, selectedAgentId]);
+  const mainAgentId = useMemo(
+    () => agents.find((a) => a.role === 'main')?.name ?? callable?.find((a) => a.role === 'main')?.name ?? null,
+    [agents, callable],
   );
-  const mainAgentId = useMemo(() => agents.find((a) => a.role === 'main')?.name ?? null, [agents]);
   const historyAgentId = selectedAgentId ?? mainAgentId;
 
   // The main agent is already represented by the leading DuDu chip (which routes
-  // to it), so it gets no duplicate employee chip in the row.
-  const staffAgents = useMemo(() => agents.filter((a) => a.role !== 'main'), [agents]);
+  // to it), so it gets no duplicate employee chip in the row. Only staff the
+  // server accepts as an explicit partner get a chip (own and team staff).
+  const staffAgents = useMemo<readonly EmployeeRowAgent[]>(() => {
+    if (callable) {
+      return callable
+        .filter((a) => a.selectable && a.role !== 'main')
+        .map((a) => ({
+          name: a.name,
+          display_name: a.display_name,
+          status: (a.status ?? 'active') as EmployeeRowAgent['status'],
+        }));
+    }
+    return agents.filter((a) => a.role !== 'main');
+  }, [agents, callable]);
 
   /**
    * Every user-driven partner switch goes through here so the store and the URL
@@ -230,19 +268,28 @@ export function WebChatPage() {
     startNewConversation();
   };
 
-  // `@` list: only the staff this account may call — `agents.list` is
-  // already filtered to them by the gateway, which also re-checks every send.
+  // `@` list: exactly the staff this account may call (`agents.callable`),
+  // grouped mine / team / public; the gateway re-checks every send. Opening
+  // the popup refreshes the list so an org change shows up without a reload.
   const activeMention = useMemo(() => findActiveMention(input, caret), [input, caret]);
-  const mentionCandidates = useMemo(
-    () => (activeMention ? filterMentionCandidates(agents as readonly MentionAgent[], activeMention.query) : []),
-    [activeMention, agents],
+  const mentionTyping = activeMention !== null;
+  useEffect(() => {
+    if (mentionTyping) loadCallable();
+  }, [mentionTyping, loadCallable]);
+  const mentionSource = useMemo<readonly MentionAgent[]>(
+    () => (callable ?? agents) as readonly MentionAgent[],
+    [callable, agents],
   );
-  const mentionOpen = activeMention !== null && !mentionDismissed && agentsLoaded;
+  const mentionCandidates = useMemo(
+    () => (activeMention ? orderMentionCandidates(filterMentionCandidates(mentionSource, activeMention.query)) : []),
+    [activeMention, mentionSource],
+  );
+  const mentionOpen = activeMention !== null && !mentionDismissed && (agentsLoaded || callable !== null);
   const safeMentionIndex = mentionCandidates.length ? Math.min(mentionIndex, mentionCandidates.length - 1) : 0;
 
   const pickMention = (agent: MentionAgent) => {
     if (!activeMention) return;
-    const next = applyMention(input, activeMention, mentionText(agent, agents as readonly MentionAgent[]));
+    const next = applyMention(input, activeMention, mentionText(agent, mentionSource));
     setInput(next.text);
     setCaret(next.caret);
     setMentionIndex(0);

@@ -21,6 +21,18 @@ unicode-script = "0.5"
 unicode-segmentation = "1.12"
 regex = "1"
 
+# B2c protected key (src/credential_protection): the OS credential store is a
+# default dependency on the two platforms that have one. Both crates are
+# already in the dependency tree (security-framework via native-tls,
+# keyring via duduclaw-core's optional `keychain` feature); MIT OR Apache-2.0.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+security-framework-sys = "2.17"
+core-foundation = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
+
 [features]
 default = []
 # WP-H1 P1 — `secret://keychain/<service>/<account>`. A pure passthrough to
