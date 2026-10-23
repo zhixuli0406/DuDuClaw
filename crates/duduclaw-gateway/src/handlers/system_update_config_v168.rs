@@ -50,6 +50,7 @@ pub(crate) struct V168Outcome {
 /// Keys whose change is audited as `config_protected_key_changed`: each
 /// widens delegation, execution or memory-trust reach.
 const PROTECTED_KEYS: &[&str] = &[
+    "computer_use.profiles.enabled",
     "acp.trusted",
     "tick.allow_command_sources",
     "container.sandbox.when_unavailable",
@@ -458,13 +459,37 @@ fn apply_sandbox(table: &mut toml::Table, params: &Value, out: &mut V168Outcome)
     Ok(())
 }
 
-fn apply_computer_use(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
-    let Some(v) = str_param(params, "computer_use.image")? else {
-        return Ok(());
-    };
-    set_or_clear_str(table, &["computer_use"], "image", v.trim(), out)?;
-    crate::computer_use_image::parse(table).map_err(|e| format!("invalid computer_use.image: {e}"))?;
-    out.applied_immediate = true;
+fn apply_computer_use(
+    table: &mut toml::Table,
+    params: &Value,
+    out: &mut V168Outcome,
+) -> Result<(), String> {
+    if let Some(v) = str_param(params, "computer_use.image")? {
+        set_or_clear_str(table, &["computer_use"], "image", v.trim(), out)?;
+        crate::computer_use_image::parse(table)
+            .map_err(|e| format!("invalid computer_use.image: {e}"))?;
+        out.applied_immediate = true;
+    }
+    let before = out.changes.len();
+    if let Some(v) = bool_param(params, "computer_use.profiles.enabled")? {
+        set_bool(table, &["computer_use", "profiles"], "enabled", v, out)?;
+    }
+    for (key, lo, hi) in [
+        (
+            "max_bytes",
+            1024 * 1024,
+            crate::computer_profiles::HARD_MAX_BYTES,
+        ),
+        ("retention_days", 0, 3650),
+    ] {
+        if let Some(v) = u64_param(params, &format!("computer_use.profiles.{key}"), lo, hi)? {
+            set_int(table, &["computer_use", "profiles"], key, v, out)?;
+        }
+    }
+    if out.changes.len() > before {
+        crate::computer_profiles::ProfilesConfig::parse(table)?;
+        out.applied_immediate = true;
+    }
     Ok(())
 }
 

@@ -39,6 +39,7 @@ export type ComputerSessionStatus =
       hold: ComputerHold | null;
       viewers: number;
       stream_available: boolean;
+      can_keep_login?: boolean;
     };
 
 /** A one-time viewer ticket (valid 30 s, single use). */
@@ -72,11 +73,12 @@ export const computerSessionApi = {
     }) as Promise<{ ok: true; session_id: string }>,
   resume: (agentId: string) =>
     client.call('computer_sessions.resume', { agent_id: agentId }) as Promise<{ ok: true; session_id: string }>,
-  stop: (agentId: string) =>
-    client.call('computer_sessions.stop', { agent_id: agentId }) as Promise<{
+  stop: (agentId: string, keepLogin = false) =>
+    client.call('computer_sessions.stop', { agent_id: agentId, ...(keepLogin ? { keep_login: true } : {}) }) as Promise<{
       ok: true;
       session_id: string;
       ended: boolean;
+      keep_login_honored?: boolean;
     }>,
 };
 

@@ -110,8 +110,34 @@ as_sandbox() {
 
 as_sandbox openbox --sm-disable >/dev/null 2>&1 &
 
+# The restore window is root-owned. A late helper cannot overwrite a live
+# browser profile. A timed-out restore starts empty and remains observable.
+if [ "${DUDUCLAW_PROFILE_WAIT:-0}" = "1" ]; then
+    touch "$ROOT_TMP/profile.waiting"
+    for _ in $(seq 1 200); do
+        [ -f "$ROOT_TMP/profile.ready" ] && break
+        sleep 0.1
+    done
+fi
+# Serialize the transition with the import helper: a slow import can never
+# overlap opening Chromium, even when the polling deadline has elapsed.
+exec {PROFILE_LOCK}>"$ROOT_TMP/profile.lock"
+flock -x "$PROFILE_LOCK"
+if [ "${DUDUCLAW_PROFILE_WAIT:-0}" = "1" ] && [ ! -f "$ROOT_TMP/profile.ready" ]; then
+    touch "$ROOT_TMP/profile.restore_timeout"
+fi
+rm -f "$ROOT_TMP/profile.waiting"
+touch "$ROOT_TMP/profile.started"
+flock -u "$PROFILE_LOCK"
+exec {PROFILE_LOCK}>&-
+
 run_browser() {
     while kill -0 "$XVFB_PID" 2>/dev/null; do
+        if [ -f "$ROOT_TMP/profile.stopping" ]; then
+            touch "$ROOT_TMP/profile.quiesced"
+            sleep 0.1
+            continue
+        fi
         as_sandbox chromium \
             --kiosk \
             --window-position=0,0 \

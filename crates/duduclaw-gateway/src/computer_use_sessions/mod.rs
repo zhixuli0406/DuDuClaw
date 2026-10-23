@@ -302,6 +302,23 @@ pub enum EndReason {
     ResumeFailed,
 }
 
+fn preserve_login_on_end(
+    reason: EndReason,
+    threat: ThreatLevel,
+    held: bool,
+    keep_held: bool,
+) -> bool {
+    threat == ThreatLevel::Green
+        && (!held || keep_held)
+        && matches!(
+            reason,
+            EndReason::Requested
+                | EndReason::Deadline
+                | EndReason::Idle
+                | EndReason::OperatorStopped
+        )
+}
+
 impl EndReason {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -437,6 +454,9 @@ pub(crate) struct SessionShared {
     pub(crate) workspace: workspace::WorkspaceSlot,
     /// Keep-alive, dashboard viewers, takeover and the injection hold (P8).
     pub(crate) live: live_view::LiveState,
+    profile_result: std::sync::Mutex<Option<String>>,
+    discard_profile: std::sync::atomic::AtomicBool,
+    keep_held_login: std::sync::atomic::AtomicBool,
 }
 
 impl SessionShared {
@@ -506,6 +526,8 @@ impl ManagedSession {
             "seconds_left": self.seconds_left(now),
             "width": self.config.display_width,
             "height": self.config.display_height,
+            "login_state": self.shared.profile_result.lock().unwrap_or_else(|p| p.into_inner())
+                .clone().unwrap_or_else(|| self.backend.login_state().to_string()),
         })
     }
 }
@@ -576,6 +598,7 @@ fn active_registry() -> &'static std::sync::Mutex<Weak<ComputerUseSessions>> {
 /// unregister itself: each leaves the global registry when its container is
 /// gone, so the 5-session cap keeps counting it until then.
 pub async fn emergency_stop_tool_sessions() -> Vec<String> {
+    crate::computer_use_orchestrator::discard_all_login_state().await;
     let active = active_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -792,7 +815,7 @@ impl ComputerUseSessions {
             actions = session.actions_used,
             "computer-use tool session ended"
         );
-        let audit = audit_entry(
+        let mut audit = audit_entry(
             &session.agent_id,
             "session_end",
             json!({
@@ -804,6 +827,20 @@ impl ComputerUseSessions {
             None,
         );
         let home = self.home.clone();
+        let shared = Arc::clone(&session.shared);
+        let discard = shared.discard_profile.load(Ordering::Acquire)
+            || !preserve_login_on_end(
+                reason,
+                crate::computer_use_orchestrator::read_threat_level_sync(&home),
+                shared.live.hold().is_some(),
+                shared.keep_held_login.load(Ordering::Acquire),
+            );
+        if discard {
+            backend
+                .control()
+                .discard_login
+                .store(true, Ordering::Release);
+        }
         let lease = workspace::take_lease(&session.shared);
         // A takeover still held when the session ends leaves its handoff too.
         let takeover = session
@@ -816,7 +853,15 @@ impl ComputerUseSessions {
             .map(|l| (l, session.agent_id.clone(), session.session_id.clone()));
         session.shared.live.set_frozen(None);
         Some(tokio::spawn(async move {
+            if discard {
+                backend.discard_login();
+            }
             backend.stop().await;
+            audit.details["login_state"] = json!(backend.login_state());
+            *shared
+                .profile_result
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(backend.login_state().to_string());
             if let Some((lease, agent, id)) = takeover {
                 live_ops::release_on_end(home.clone(), agent, id, lease).await;
             }
@@ -873,7 +918,10 @@ impl ComputerUseSessions {
                 keepalive::OnOp::End(reason) => Some(reason),
                 _ => None,
             })
-            .or_else(|| capability_problem(&caps).map(|_| EndReason::CapabilityRevoked));
+            .or_else(|| capability_problem(&caps).map(|_| EndReason::CapabilityRevoked))
+            .or_else(|| {
+                (!session.backend.login_owner_valid()).then_some(EndReason::CapabilityRevoked)
+            });
         if let Some(reason) = reason {
             self.end_and_wait(session, reason).await;
             return Err(OpError::new(ErrorCode::SessionEnded, reason.message()));
@@ -1125,6 +1173,8 @@ impl ComputerUseSessions {
             contract_must_not: contract_must_not_rules(&gates::agent_dir(&self.home, agent_id)),
             keep_alive_minutes: cap.keep_alive_minutes(),
             takeover_idle_minutes: cap.takeover_idle_minutes(),
+            persist_login: cap.persist_login
+                && crate::computer_profiles::ProfilesConfig::active(&self.home).is_some(),
             ..Default::default()
         };
         // The id exists before any lease is taken (it is the lease holder).
@@ -1217,6 +1267,7 @@ impl ComputerUseSessions {
             "max_session_minutes": session.config.max_session_minutes,
             "keep_alive_minutes": session.config.keep_alive_minutes,
             "confirmation_channel": confirmation_channel,
+            "login_state": session.backend.login_state(),
             "reachable_hosts": nav_hosts,
             "unreachable_hosts": skipped_hosts,
             "ignored_allowlist_entries": nav.dropped.len(),
@@ -1748,6 +1799,7 @@ impl ComputerUseSessions {
             || level == ThreatLevel::Red
             || Instant::now() >= session.deadline
             || capability_problem(&agent_capabilities(&self.home, &session.agent_id)).is_some()
+            || !session.backend.login_owner_valid()
             || workspace::lease_problem(&self.home, &session.agent_id, &session.shared).is_some()
         {
             return Err(OpError::new(
@@ -2015,13 +2067,21 @@ impl ComputerUseSessions {
         {
             return Err(not_found());
         }
-        let body = json!({
+        let mut body = json!({
             "ok": true,
             "session_id": session.session_id,
             "actions_used": session.actions_used,
             "duration_secs": session.started.elapsed().as_secs(),
         });
         self.end_and_wait(&mut session, EndReason::Requested).await;
+        body["login_state"] = json!(
+            session
+                .shared
+                .profile_result
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        );
         Ok(body)
     }
 
@@ -2076,7 +2136,9 @@ impl ComputerUseSessions {
             let activity = session
                 .shared
                 .effective_activity(session.last_activity, now);
-            let decision = if session.shared.workspace.lost.load(Ordering::Acquire) {
+            let decision = if !session.backend.login_owner_valid() {
+                keepalive::OnReap::End(EndReason::CapabilityRevoked)
+            } else if session.shared.workspace.lost.load(Ordering::Acquire) {
                 keepalive::OnReap::End(EndReason::LeaseLost)
             } else {
                 keepalive::on_reap(&keepalive::Clock {

@@ -165,6 +165,7 @@ const CAP_LIST_KEYS: ReadonlyArray<keyof AgentCapabilities> = [
 ];
 
 const COMPUTER_USE_CONFIG_KEYS: ReadonlyArray<keyof ComputerUseConfig> = [
+  'persist_login',
   'allowed_apps', 'blocked_actions', 'max_session_minutes', 'max_actions', 'display_width', 'display_height',
   'auto_confirm_trusted', 'keep_alive_minutes', 'takeover_idle_minutes',
 ];

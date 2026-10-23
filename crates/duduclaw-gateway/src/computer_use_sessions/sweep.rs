@@ -267,6 +267,10 @@ pub async fn sweep_once(home: &Path) -> usize {
 
 /// [`sweep_once`] with the gate decided by the caller.
 pub async fn sweep_once_with(home: &Path, maintain: bool) -> usize {
+    if maintain {
+        let h = home.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || crate::computer_profiles::sweep(&h)).await;
+    }
     let label = computer_use_home_label(home);
     let format = format!(
         "{{{{.ID}}}}|{{{{.Names}}}}|{{{{.State}}}}|{{{{.Label \"{DEADLINE_LABEL}\"}}}}|{{{{.Label \"{WORKSPACE_LABEL}\"}}}}|{{{{.Label \"{LEASE_LABEL}\"}}}}"
