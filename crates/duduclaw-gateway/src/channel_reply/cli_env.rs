@@ -1115,6 +1115,6 @@ pub(super) async fn spawn_claude_cli_with_env(
     Ok(result_text)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "cli_env_thinking_tests.rs"]
 mod thinking_tests;
