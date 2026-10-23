@@ -28,3 +28,5 @@ pub mod logger;
 pub mod query;
 pub mod reliability;
 pub mod schema;
+/// Per-(employee, skill) activation counts for the dashboard skill library (B8).
+pub mod skill_usage;

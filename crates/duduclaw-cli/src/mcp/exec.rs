@@ -173,6 +173,13 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
     // W3-3b (a): `.ephemeral/` included — a role member's SKILLS live in its
     // own scaffold, and the bare registry path made every bundled office
     // script report "Script not found" for team members.
+    // B8: a skill switched off for this employee is not loaded, so its
+    // scripts are not callable either (listing ⇔ callable).
+    if duduclaw_agent::skill_state::read_disabled(home_dir, default_agent).is_disabled(skill) {
+        return tool_error(&format!(
+            "Skill '{skill}' is switched off for agent '{default_agent}'."
+        ));
+    }
     let agent_dir = caller_agent_dir(home_dir, default_agent);
     let script_path = agent_dir
         .join("SKILLS")

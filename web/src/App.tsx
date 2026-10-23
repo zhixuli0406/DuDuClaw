@@ -74,6 +74,7 @@ const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'Inference
 const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'LocalModelsPage');
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
+const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
@@ -350,6 +351,12 @@ export function App() {
                 {/* 信箱 (Agent Mail, P2-d) — every `mail.*` RPC is
                     `require_manager!`-gated server-side; this mirrors that. */}
                 <Route path="mail" element={<MailPage />} />
+                {/* 我的團隊 (1.76.0) — `users.my_team` is `require_manager!`
+                    and, as a `users.*` method, Enterprise-only server-side;
+                    both are mirrored here. */}
+                <Route element={<EditionGuard enterprise />}>
+                  <Route path="team" element={<TeamPage />} />
+                </Route>
               </Route>
 
               {/* AI 團隊 — every role reaches the page (the nav shows it to

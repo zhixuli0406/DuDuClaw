@@ -16,6 +16,10 @@ pub fn installed_skill_revision(
     if !duduclaw_core::is_valid_agent_id(owner) || !duduclaw_core::is_valid_agent_id(skill_id) {
         return Err("invalid installed skill id".into());
     }
+    // B8: a skill switched off for its owner cannot be pinned into a workflow.
+    if duduclaw_agent::skill_state::read_disabled(home, owner).is_disabled(skill_id) {
+        return Err("installed skill is switched off".into());
+    }
     let home = home.canonicalize().map_err(|_| "skill home unavailable")?;
     for path in [
         home.join("agents")
