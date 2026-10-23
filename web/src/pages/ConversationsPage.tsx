@@ -341,7 +341,6 @@ export function ConversationsPage() {
                   <ListGridCell>
                     <button
                       type="button"
-                      onClick={() => void open(s)}
                       className="min-w-0 truncate text-left text-sm text-foreground hover:underline"
                       title={title}
                     >

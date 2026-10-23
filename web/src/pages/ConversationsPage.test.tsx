@@ -12,6 +12,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useChatStore } from '@/stores/chat-store';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useConversationsStore } from '@/stores/conversations-store';
 
 /** `n` webchat sessions, newest first, alternating between two employees. */
 function fakeSessions(n: number) {
@@ -280,4 +281,29 @@ describe('ConversationsPage — bound-history identity isolation', () => {
     expect(await screen.findByText(en['webchat.history.error'])).toBeInTheDocument();
     expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
   });
+});
+
+
+it('opens exactly once for a title click, Enter, Space and a parent-row click', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(1) } as never);
+  const originalResume = useConversationsStore.getState().resume;
+  const resume = vi.fn().mockResolvedValue(true);
+  useConversationsStore.setState({ resume });
+  try {
+    renderWithProviders(<ConversationsPage />);
+    const title = await screen.findByRole('button', { name: /^對話 1$/ });
+    await user.click(title);
+    expect(resume).toHaveBeenCalledTimes(1);
+    await user.keyboard('[Enter]');
+    expect(resume).toHaveBeenCalledTimes(2);
+    await user.keyboard(' ');
+    expect(resume).toHaveBeenCalledTimes(3);
+    const row = title.closest('[role="row"]');
+    expect(row).not.toBeNull();
+    await user.click(row!);
+    expect(resume).toHaveBeenCalledTimes(4);
+  } finally {
+    act(() => { useConversationsStore.setState({ resume: originalResume }); });
+  }
 });
