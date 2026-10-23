@@ -5,6 +5,8 @@ import {
   findActiveMention,
   mentionErrorText,
   mentionText,
+  groupMentionCandidates,
+  orderMentionCandidates,
   type MentionAgent,
 } from './mention';
 
@@ -74,5 +76,36 @@ describe('mentionErrorText', () => {
     expect(text).toContain('• @業務專員');
     expect(mentionErrorText({ code: 'agent_forbidden' }, 'en')).toBeNull();
     expect(mentionErrorText({}, 'en')).toBeNull();
+  });
+});
+
+describe('team grouping (agents.callable)', () => {
+  const callable: MentionAgent[] = [
+    { name: 'dudu', display_name: '嘟嘟總機', via: 'default', status: 'active' },
+    { name: 'faq', display_name: '常見問題', via: 'public', status: 'active' },
+    { name: 'sales-rep', display_name: '業務專員', via: 'team', via_user: 'u1', via_user_name: '王小明', status: 'active' },
+    { name: 'finance', display_name: '財務小幫手', via: 'binding', status: 'active' },
+    { name: 'hr', display_name: '人資助理', via: 'team', via_user: 'u2', status: 'active' },
+  ];
+
+  it('groups mine, then each report, then public, keeping order inside a group', () => {
+    const groups = groupMentionCandidates(callable);
+    expect(groups.map((g) => [g.kind, g.owner ?? '', g.agents.map((a) => a.name)])).toEqual([
+      ['mine', '', ['dudu', 'finance']],
+      ['team', '王小明', ['sales-rep']],
+      ['team', 'u2', ['hr']],
+      ['public', '', ['faq']],
+    ]);
+    expect(orderMentionCandidates(callable).map((a) => a.name)).toEqual(['dudu', 'finance', 'sales-rep', 'hr', 'faq']);
+  });
+
+  it('an agents.list result (no via) stays one group', () => {
+    expect(groupMentionCandidates(agents.slice(0, 3)).map((g) => g.kind)).toEqual(['mine']);
+  });
+
+  it("prefers the server's call text", () => {
+    const twin: MentionAgent = { name: 'sales-2', display_name: '業務專員', call_text: '@sales-2' };
+    expect(mentionText(twin, [twin])).toBe('@sales-2');
+    expect(mentionText({ name: 'x', display_name: 'X', call_text: '@' }, [])).toBe('@X');
   });
 });

@@ -20,6 +20,7 @@ mod ccr_run_cmd; // Controlled four-arm CCR execution over recorded source bytes
 // `duduclaw compat windows-vm app`, no platform install does. Behind the
 // `app-compat` feature so the platform binary carries neither the subcommands
 // nor their deps; the OS recipe builds with `--features app-compat`.
+mod credentials_cmd; // B2c: `duduclaw credentials status|authorize` — protected key in the OS keychain
 #[cfg(feature = "app-compat")]
 mod compat_cmd; // CP-1/A3: `duduclaw compat` — compat.d declarative runner registry CLI surface
 #[cfg(feature = "app-compat")]
@@ -2592,6 +2593,16 @@ enum MaintenanceCommands {
     Knobs {
         #[command(subcommand)]
         command: KnobsCommands,
+    },
+
+    /// Where person-identity credentials are protected (OS keychain or file).
+    ///
+    /// Examples:
+    ///     duduclaw credentials status
+    ///     duduclaw credentials authorize    # macOS, after an upgrade
+    Credentials {
+        #[command(subcommand)]
+        command: credentials_cmd::CredentialsCommands,
     },
 
     /// Print version information
@@ -5674,6 +5685,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             days, agent, output, format,
         } }) => {
             knobs_survival::run(&duduclaw_home(), days, agent.as_deref(), output.as_deref(), &format).await
+        }
+        Commands::Maintenance(MaintenanceCommands::Credentials { command }) => {
+            credentials_cmd::run(&duduclaw_home(), command)
         }
         Commands::Maintenance(MaintenanceCommands::Version) => {
             println!("duduclaw {}", duduclaw_gateway::updater::current_version());

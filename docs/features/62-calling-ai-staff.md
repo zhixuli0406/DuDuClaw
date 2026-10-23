@@ -17,19 +17,38 @@ People talk to one AI employee by default and can hand a single message to anoth
 | Sender | May call |
 |---|---|
 | Dashboard Admin | everyone |
-| Dashboard user in WebChat | the default employee (as before), plus the employees bound to the account (any access level) |
-| Messaging-app sender linked to a dashboard account (a verified channel identity) | the conversation's default employee, employees opened to outside contacts, and the account's bound employees |
+| Dashboard user in WebChat | the default employee (as before), employees opened to outside contacts, and the employees bound to the account (any access level); a manager also reaches their team's employees (next section) |
+| Messaging-app sender linked to a dashboard account (a verified channel identity) | the conversation's default employee, employees opened to outside contacts, and the account's bound employees; a manager also reaches their team's employees |
 | Anyone else: a LINE friend, a Telegram user, a website widget visitor | the conversation's default employee and employees opened to outside contacts |
+
+### Managers reach their team's employees
+
+In the Enterprise edition each account can have one direct manager (`manager_user_id` on `users.create` / `users.update`; the dashboard screen for it comes later). Someone whose role is Manager (or Admin) may call the AI employees bound to anyone below them, down to 8 levels. A suspended report still counts (the manager can look after their employees); an offboarded one does not. Someone with the Employee role gets no team, even if people are filed under them.
+
+Rights that come through a report stop at Operator, never Owner:
+
+| Action | Admin | Direct Owner | Direct Operator | Direct Viewer | Manager (through a report) | Default and public employees | Unlinked sender |
+|---|---|---|---|---|---|---|---|
+| `@` chat, pick the employee as the WebChat partner | ✅ | ✅ | ✅ | ✅ | ✅ | `@` only, not as a picked partner (the default employee is who answers when nobody is picked) | default and public employees only |
+| Hand over work (dashboard task create, goal create, task reassign) | ✅ | ✅ | ✅ | ❌ | ✅ when the report's binding is Owner or Operator | ❌ | ❌ |
+| Task board listing for the employee | ✅ | ✅ | ✅ | ✅ | ✅ when work may be handed over; cards only (title, status), no content | — | — |
+| Memory, conversation history, employee settings and persona files | ✅ | by binding level | by binding level | by binding level | ❌ | — | — |
+
+When the report's binding is Viewer, the manager may only chat with that employee. The **AI staff** page and the employee settings pages still list direct bindings only.
+
+A manager may update, reassign, cancel or remove a task they handed to a team employee from the dashboard (they created it) while they may still assign to that employee; tasks created by others still need direct Operator. A task shown as a card only carries no link to its source conversation (`channel` and `channel_link` are null).
+
+A binding, role, status or manager change applies to the next message and the next dashboard action, with no new login and no cache window to wait out (every write invalidates the permission caches). If the user records cannot be read, access narrows to no bindings. The Personal edition has no users or managers and behaves as before; after a downgrade from Enterprise, reporting lines left in the data are ignored.
 
 An employee is opened to outside contacts on its edit page (**Callable by outside contacts**, `[channels] public_trigger = true` in `agent.toml`). It is off by default, only an Admin can change it, and employees cannot change it themselves.
 
-Calling an employee you may not call is refused before any model call: the reply says you have no permission to call that employee. It does not name the employee, but it does tell you the name belongs to one (a name that matches nobody is just text for the default employee). The refusal is written to the security audit log (`trigger_route_refused`) with the dashboard account, or, for an unlinked sender, a 16-character HMAC of the platform id under a key kept in this installation (`trigger_audit.key`, owner-only, created once); the raw platform id is never logged. Repeated refusals from the same sender for the same employee are audited once a minute. Allowed switches are logged at info level.
+A dashboard account (signed in to WebChat, or a messaging-app sender linked to one) who calls an employee they may not call is refused before any model call: the reply says you have no permission to call that employee. It does not name the employee, but it does tell you the name belongs to one. An unlinked sender (a LINE friend, a Telegram user, a website widget or Odoo Live Chat visitor) gets no refusal: a name they may not call is treated like a name that matches nobody, plain text for the default employee, and it does not count as addressing the bot in a mention-only group, so outsiders cannot use it to find out which employees exist. The refusal is written to the security audit log (`trigger_route_refused`) with the dashboard account, or, for an unlinked sender, a 16-character HMAC of the platform id under a key kept in this installation (`trigger_audit.key`, owner-only, created once); the raw platform id is never logged. Repeated refusals from the same sender for the same employee are audited once a minute. Allowed switches are logged at info level with where the right came from (`via`): `binding`, `team:<report account id>:<levels>`, `default`, `public` or `admin`. An Admin account is recorded as `user:<account id>`.
 
 **In a group chat everyone sees the answer.** A linked member who calls an employee bound to their account in a LINE or Telegram group gets the answer in the group, where every member can read it. Bind restricted employees to people with that in mind, or have them use a one-to-one chat.
 
 ## The `@` list
 
-- **WebChat**: typing `@` in the message box opens a list of the employees you may call (avatar, name, department). It filters as you type; arrow keys move, Enter or Tab inserts `@name `, Escape closes it. Each reply from an employee other than the one you are talking to is labelled with who answered.
+- **WebChat**: typing `@` in the message box opens a list of the employees you may call (avatar, name, department). The list comes from `agents.callable`, the same rule every message is checked against; when it has more than one source it is split into **My AI staff**, **My team: <name>'s AI staff** and **Public AI staff**. The staff strip above the conversation includes team employees too. It filters as you type; arrow keys move, Enter or Tab inserts `@name `, Escape closes it. Each reply from an employee other than the one you are talking to is labelled with who answered.
 - **LINE**: send `@` alone (or `@` with part of a name) and the bot answers with the list as quick-reply buttons, at most 13 at a time; a longer list ends with a "more" button for the next page. Tapping a name sends `@name`.
 - **Telegram** (shared bot): the same list comes as inline buttons, or as text when no button fits.
 - Other channels answer with a text list.
@@ -61,3 +80,4 @@ A called employee answers in its own session inside the conversation (`<conversa
 
 - Discord, Slack and the other channels use the same rules, the text list and the one-shot call, but they have no buttons and no native-mention filtering. Only WebChat and LINE were tested end to end; Telegram is covered by unit tests.
 - A sender with a linked dashboard account on other channels is mapped only when the identity was verified through the channel login flow.
+- A manager hands work to team employees from the dashboard for now; a chat command for it is not built yet. On the task board a manager sees team employees' tasks as cards only.

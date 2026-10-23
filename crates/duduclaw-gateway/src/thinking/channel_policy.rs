@@ -154,8 +154,10 @@ pub fn sender_is_internal(
         return false;
     }
     match lookup_channel_sender(home, channel, channel_user_id).sender {
-        Sender::Admin => true,
-        Sender::Account { bound, .. } => bound.contains(agent_id),
+        Sender::Admin { .. } => true,
+        // Bound to THIS employee directly; a team grant (a manager calling a
+        // report's employee) does not make the sender internal here.
+        Sender::Account { access, .. } => access.direct.contains_key(agent_id),
         Sender::Unmapped => false,
     }
 }

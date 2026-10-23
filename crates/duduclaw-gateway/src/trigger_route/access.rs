@@ -1,24 +1,31 @@
 //! Who the sender of a message is, for deciding which employees they may
 //! call. Every lookup failure narrows (fail closed): a broken identity store
 //! never grants more than an unknown sender gets.
+//!
+//! A mapped account's callable set is its [`EffectiveAccess`] read from
+//! `users.db` (`duduclaw_auth::org`): direct bindings plus, for a Manager,
+//! the employees bound to anyone below them in the reporting tree. The
+//! conversation's default employee and `[channels] public_trigger`
+//! employees are open to every sender on top of that.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use duduclaw_agent::registry::LoadedAgent;
-use duduclaw_auth::{UserDb, UserRole, UserStatus};
+use duduclaw_auth::{EffectiveAccess, GrantSource, UserDb, UserRole};
 
 /// The human behind a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sender {
-    /// An active dashboard Admin: may call everyone.
-    Admin,
-    /// An active dashboard account with these employee bindings.
+    /// An active dashboard Admin: may call everyone. `user_id` is `None`
+    /// only for a synthetic "everyone" sender (no real account).
+    Admin { user_id: Option<String> },
+    /// An active dashboard account and what it may call (read live).
     Account {
         user_id: String,
-        bound: BTreeSet<String>,
+        access: Arc<EffectiveAccess>,
     },
     /// Nobody we can name: a messaging-app sender without a verified
     /// identity, a public web-widget visitor, or a failed lookup.
@@ -30,7 +37,8 @@ pub enum Sender {
 /// Every sender may call the conversation's default employee (in WebChat the
 /// default/main employee stays reachable by every signed-in account, as
 /// before `@` routing existed) and employees opened with `[channels]
-/// public_trigger`. Calling anyone else needs a binding, or Admin.
+/// public_trigger`. Calling anyone else needs a direct binding, a team grant
+/// (a Manager calling a report's employee), or Admin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderAccess {
     pub sender: Sender,
@@ -44,14 +52,17 @@ impl SenderAccess {
         }
     }
 
-    /// From a role and binding set already loaded (e.g. WebChat's ACL cache).
-    pub fn from_role(user_id: &str, role: UserRole, bound: BTreeSet<String>) -> Self {
-        let sender = if role == UserRole::Admin {
-            Sender::Admin
+    /// From an effective access already loaded (an Admin role becomes
+    /// [`Sender::Admin`]).
+    pub fn from_effective(access: Arc<EffectiveAccess>) -> Self {
+        let sender = if access.role == UserRole::Admin {
+            Sender::Admin {
+                user_id: Some(access.user_id.clone()),
+            }
         } else {
             Sender::Account {
-                user_id: user_id.to_string(),
-                bound,
+                user_id: access.user_id.clone(),
+                access,
             }
         };
         Self { sender }
@@ -63,21 +74,39 @@ impl SenderAccess {
         Self {
             sender: Sender::Account {
                 user_id: user_id.to_string(),
-                bound: BTreeSet::new(),
+                access: Arc::new(empty_access(user_id, 0)),
             },
+        }
+    }
+
+    /// Why this sender may call `agent` in a conversation whose default
+    /// employee is `fallback`, or `None` when they may not. A binding or a
+    /// team grant is reported before the "open to everyone" sources.
+    pub fn grant(&self, agent: &LoadedAgent, fallback: Option<&str>) -> Option<GrantSource> {
+        let id = agent.config.agent.name.as_str();
+        let open_here = || {
+            if fallback == Some(id) {
+                Some(GrantSource::Default)
+            } else if is_public_trigger(agent) {
+                Some(GrantSource::Public)
+            } else {
+                None
+            }
+        };
+        match &self.sender {
+            Sender::Admin { .. } => Some(GrantSource::Admin),
+            Sender::Account { access, .. } => access
+                .level(id)
+                .map(|(_, source)| source)
+                .or_else(open_here),
+            Sender::Unmapped => open_here(),
         }
     }
 
     /// May this sender call `agent` in a conversation whose default employee
     /// is `fallback`?
     pub fn may_call(&self, agent: &LoadedAgent, fallback: Option<&str>) -> bool {
-        let id = agent.config.agent.name.as_str();
-        let open_here = fallback == Some(id) || is_public_trigger(agent);
-        match &self.sender {
-            Sender::Admin => true,
-            Sender::Account { bound, .. } => open_here || bound.contains(id),
-            Sender::Unmapped => open_here,
-        }
+        self.grant(agent, fallback).is_some()
     }
 
     /// Stable, non-identifying label for logs and the audit trail. An
@@ -85,13 +114,25 @@ impl SenderAccess {
     /// the platform id cannot be recovered from the log by guessing.
     pub fn audit_label(&self, home: &Path, channel: &str, channel_sender: &str) -> String {
         match &self.sender {
-            Sender::Admin => "admin".to_string(),
+            Sender::Admin { user_id: Some(id) } => format!("user:{id}"),
+            Sender::Admin { user_id: None } => "admin".to_string(),
             Sender::Account { user_id, .. } => format!("user:{user_id}"),
             Sender::Unmapped => format!(
                 "unmapped:{channel}:{}",
                 keyed_digest(home, channel, channel_sender)
             ),
         }
+    }
+}
+
+/// No bindings, no team, never Admin.
+fn empty_access(user_id: &str, generation: u64) -> EffectiveAccess {
+    EffectiveAccess {
+        user_id: user_id.to_string(),
+        role: UserRole::Employee,
+        direct: BTreeMap::new(),
+        team: BTreeMap::new(),
+        generation,
     }
 }
 
@@ -106,20 +147,21 @@ pub fn is_public_trigger(agent: &LoadedAgent) -> bool {
 
 /// A dashboard account. Unknown, inactive or unreadable accounts get no
 /// bindings and are never Admin.
-pub fn for_dashboard_user(db: &UserDb, user_id: &str) -> SenderAccess {
-    match load_account(db, user_id) {
-        Ok(Some((role, bound))) => SenderAccess::from_role(user_id, role, bound),
+pub fn for_dashboard_user(home: &Path, db: &UserDb, user_id: &str) -> SenderAccess {
+    match load_account(home, db, user_id) {
+        Ok(Some(access)) => SenderAccess::from_effective(access),
         Ok(None) | Err(_) => SenderAccess::no_bindings(user_id),
     }
 }
 
-/// How long one channel sender's identity lookup is reused (one event's
-/// route is computed several times; a revoked binding still takes effect
-/// within this window).
+/// How long one channel sender's identity lookup may be reused. Every
+/// authorization write bumps `auth_meta.acl_generation`, and an entry is
+/// only reused at the generation it was read at, so a revoked binding or a
+/// changed manager takes effect on the next message; this TTL is a backstop.
 const LOOKUP_TTL: Duration = Duration::from_secs(5);
 const LOOKUP_MAX: usize = 4_096;
 
-type LookupCache = HashMap<(PathBuf, String, String), (SenderAccess, Instant)>;
+type LookupCache = HashMap<(PathBuf, String, String), (SenderAccess, Instant, u64)>;
 
 fn lookup_cache() -> std::sync::MutexGuard<'static, LookupCache> {
     static CACHE: OnceLock<Mutex<LookupCache>> = OnceLock::new();
@@ -129,10 +171,45 @@ fn lookup_cache() -> std::sync::MutexGuard<'static, LookupCache> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// `auth_meta.acl_generation` through a read-only connection (kept per
+/// home and reopened after any error), or `None` when the identity store is
+/// absent or unreadable (the cache is then bypassed, never trusted).
+fn read_generation(home: &Path) -> Option<u64> {
+    type Conns = HashMap<PathBuf, rusqlite::Connection>;
+    static CONNS: OnceLock<Mutex<Conns>> = OnceLock::new();
+    let mut conns = CONNS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let query = |conn: &rusqlite::Connection| {
+        conn.query_row(
+            "SELECT value FROM auth_meta WHERE key = 'acl_generation'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .and_then(|v| u64::try_from(v).ok())
+    };
+    if let Some(conn) = conns.get(home) {
+        if let Some(g) = query(conn) {
+            return Some(g);
+        }
+        conns.remove(home);
+    }
+    let conn = crate::review_evidence::audience::readonly_db(&home.join("users.db")).ok()?;
+    let g = query(&conn)?;
+    if conns.len() >= 64 {
+        conns.clear();
+    }
+    conns.insert(home.to_path_buf(), conn);
+    Some(g)
+}
+
 /// A messaging-app sender: mapped through a **verified** `channel_identities`
 /// row to an active dashboard account, else unmapped. An absent or unreadable
 /// identity store, an unverified row or an inactive account all mean
-/// unmapped (the least an app sender can have). Reused for a few seconds.
+/// unmapped (the least an app sender can have). Reused while the ACL
+/// generation is unchanged, for a few seconds at most.
 pub fn for_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> SenderAccess {
     if channel_user_id.is_empty() {
         return SenderAccess::unmapped();
@@ -143,20 +220,27 @@ pub fn for_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> 
         channel_user_id.to_string(),
     );
     let now = Instant::now();
-    if let Some((access, at)) = lookup_cache().get(&key) {
-        if now.saturating_duration_since(*at) < LOOKUP_TTL {
-            return access.clone();
+    let generation = read_generation(home);
+    if let Some(g) = generation {
+        if let Some((access, at, cached_gen)) = lookup_cache().get(&key) {
+            if *cached_gen == g && now.saturating_duration_since(*at) < LOOKUP_TTL {
+                return access.clone();
+            }
         }
     }
     let access = lookup_channel_sender(home, channel, channel_user_id);
-    let mut cache = lookup_cache();
-    if cache.len() >= LOOKUP_MAX {
-        cache.retain(|_, (_, at)| now.saturating_duration_since(*at) < LOOKUP_TTL);
+    // Cache only under a generation read before the lookup: a write in
+    // between bumps it, so the entry is unreachable rather than stale.
+    if let Some(g) = generation {
+        let mut cache = lookup_cache();
         if cache.len() >= LOOKUP_MAX {
-            cache.clear();
+            cache.retain(|_, (_, at, cg)| *cg == g && now.saturating_duration_since(*at) < LOOKUP_TTL);
+            if cache.len() >= LOOKUP_MAX {
+                cache.clear();
+            }
         }
+        cache.insert(key, (access.clone(), now, g));
     }
-    cache.insert(key, (access.clone(), now));
     access
 }
 
@@ -167,9 +251,13 @@ pub(crate) fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id:
     let Ok(Some(user_id)) = db.find_verified_user_id_by_channel(channel, channel_user_id) else {
         return SenderAccess::unmapped();
     };
-    match load_account(&db, &user_id) {
-        Ok(Some((role, bound))) => SenderAccess::from_role(&user_id, role, bound),
-        _ => SenderAccess::unmapped(),
+    match load_account(home, &db, &user_id) {
+        Ok(Some(access)) => SenderAccess::from_effective(access),
+        Ok(None) => SenderAccess::unmapped(),
+        Err(e) => {
+            tracing::warn!(channel, error = %e, "sender access read failed — treating the sender as unmapped");
+            SenderAccess::unmapped()
+        }
     }
 }
 
@@ -191,27 +279,28 @@ pub fn verified_user_for_channel_sender(
         .find_verified_user_id_by_channel(channel, channel_user_id)
         .ok()
         .flatten()?;
-    load_account(&db, &user_id).ok().flatten().map(|_| user_id)
+    load_account(home, &db, &user_id).ok().flatten().map(|_| user_id)
 }
 
-/// Role and bindings of an **active** account; `None` when missing or
-/// inactive.
+/// What an **active** account may call, read live (role, direct bindings,
+/// team grants, generation); `None` when missing or inactive. The single
+/// computation point for channel senders, dashboard users and WebChat.
+/// Team grants are dropped unless `home` runs the Enterprise edition
+/// (`team_edition.rs`).
 pub(crate) fn load_account(
+    home: &Path,
     db: &UserDb,
     user_id: &str,
-) -> Result<Option<(UserRole, BTreeSet<String>)>, String> {
-    let Some(user) = db.get_user(user_id)? else {
-        return Ok(None);
-    };
-    if user.status != UserStatus::Active {
-        return Ok(None);
-    }
-    let bound = db
-        .get_user_agents(user_id)?
-        .into_iter()
-        .map(|b| b.agent_name)
-        .collect();
-    Ok(Some((user.role, bound)))
+) -> Result<Option<Arc<EffectiveAccess>>, String> {
+    Ok(db
+        .effective_access(user_id)?
+        .map(|a| Arc::new(crate::team_edition::gate_access(home, a))))
+}
+
+/// An inactive account's access at `generation`: nothing but what everyone
+/// may call.
+pub(crate) fn inactive_access(user_id: &str, generation: u64) -> Arc<EffectiveAccess> {
+    Arc::new(empty_access(user_id, generation))
 }
 
 /// File holding the per-home key for audit identifiers (32 random bytes,

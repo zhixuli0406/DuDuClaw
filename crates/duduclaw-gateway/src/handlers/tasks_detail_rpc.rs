@@ -376,8 +376,10 @@ impl MethodHandler {
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "valid agent_id is required");
         }
-        if let Err(e) = acl::require_agent_access(ctx, agent_id, AccessLevel::Operator) {
-            return WsFrame::error_response("", &e);
+        // Assigning a goal: Operator on the agent, or a team grant that
+        // derived Operator (a Manager handing work to a report's employee).
+        if !ctx.can_assign_to(agent_id) {
+            return WsFrame::error_response("", "permission denied");
         }
         // T5/O4 (feature audit 2026-09-29): every field below is read
         // verbatim from the request and handed to `goal_create_core`, which
