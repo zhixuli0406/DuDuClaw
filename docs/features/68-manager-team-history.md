@@ -20,7 +20,13 @@ Each conversation open is recorded. Changing filters, refreshing or receiving a 
 
 Administrators find **Organisation settings → Manager conversation access** on **User Management**. Inform staff before enabling it; turning it off and on starts a new time boundary. The adjacent AI-detection shortcut opens the existing redaction settings. A notice below the WebChat composer and an eye on the staff selector appear only when the gateway says that this person’s conversation with that AI staff member can be read by a manager.
 
-The separate “who viewed my conversations” history is not included in this change.
+### Who viewed my conversations
+
+Every Enterprise account, including an Employee, can open **Settings → Who viewed my conversations** (`/my/history-views`). It lists only that signed-in person's WebChat openings through Team conversations: the viewer's current display name, AI employee's current display name, time and the closed type **Your WebChat**. Removed accounts or AI employees receive a generic label. Conversation contents, session identifiers, customer conversations, other people's records and raw audit details are never returned. An Admin cannot select another account.
+
+The records remain available when manager viewing is switched off or the reporting relationship changes. This is a record of the dedicated team-history entry point, not a complete account of older administrative reading paths. Only `team_history_viewed` with this account as the WebChat report is supported; screen-status events and unknown event types do not become view receipts.
+
+Choose **Load more** for earlier pages. Each call scans at most 4 MiB / 10,000 audit lines and returns at most 100 own receipts (the page requests 50). A page may contain no matches while an earlier page remains available. There is no global/hidden count. Opaque cursors are bound to the account and home, expire after ten minutes and stop working after a gateway restart or an audit snapshot change; refresh to start again. The independent receipt-list quota is 300 calls per account per hour. At most two reads run at once; a busy, corrupt, truncated or unreadable log shows an error rather than “no views.” Local log removal or archiving limits historical coverage. This bounded reader checks scanned chain links; it is not a full-file forensic verification or proof against same-OS-user log modification.
 
 ## The switch and time boundary
 

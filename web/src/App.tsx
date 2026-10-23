@@ -75,6 +75,7 @@ const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'Local
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
+const MyHistoryViewsPage = lazyPage(() => import('./pages/MyHistoryViewsPage'), 'MyHistoryViewsPage');
 const TeamHistoryPage = lazyPage(() => import('./pages/TeamHistoryPage'), 'TeamHistoryPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
@@ -341,6 +342,11 @@ export function App() {
                 <Route element={<RoleGuard minRole="manager" />}>
                   <Route path="license" element={<LicenseShell />} />
                 </Route>
+              </Route>
+
+              {/* Self-only receipts are available to every Enterprise account. */}
+              <Route element={<EditionGuard enterprise />}>
+                <Route path="my/history-views" element={<MyHistoryViewsPage />} />
               </Route>
 
               {/* manager+ routes (Zone B/C) */}

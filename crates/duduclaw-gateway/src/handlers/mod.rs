@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 mod team_history_rpc;
+mod my_history_views_rpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;

@@ -9,6 +9,16 @@ import {
 import { isVisible } from '@/lib/nav-visibility';
 import { crumbsFor } from './nav-model';
 
+describe('own conversation-view receipts', () => {
+  it('is reachable by an enterprise employee and hidden on Personal', () => {
+    const entry = navGroups.flatMap(g => g.items).find(i => i.to === '/my/history-views')!;
+    expect(isVisible(entry, 'employee', false)).toBe(true);
+    expect(isVisible(entry, 'employee', true)).toBe(false);
+    expect(entry.ownScope).toBe(true);
+    expect(crumbsFor('/my/history-views')).toContainEqual({ labelId: 'nav.myHistoryViews' });
+  });
+});
+
 // P2-a-nav (2026-08-15, `DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.4):
 // `/experts` ("AI 團隊", formerly "專家包") was `minRole: 'admin'` and buried
 // at the tail of the Personal edition's collapsed 進階 group — invisible to
