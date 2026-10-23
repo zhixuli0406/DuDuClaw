@@ -176,6 +176,13 @@ pub(crate) async fn handle_tools_call(
     // Who this call acts as for the record-relationship checks
     // (`record_authz.rs`), resolved once per call.
     let record_actor = record_actor_for(home_dir, caller_client_id, default_agent);
+    // Per-employee Google identity: decided from the proven employee only
+    // (never a tool argument). Only built for the Google tools.
+    let google_caller = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
+        super::google_identity_client::GoogleCaller::for_process(home_dir, caller_client_id)
+    } else {
+        super::google_identity_client::GoogleCaller::default()
+    };
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
@@ -695,25 +702,30 @@ pub(crate) async fn handle_tools_call(
                 "isError": true
             })
         }
-        "google_status" => handle_google_status(home_dir).await,
-        "gmail_search" => handle_gmail_search(&arguments, home_dir).await,
-        "gmail_read" => handle_gmail_read(&arguments, home_dir).await,
-        "gmail_create_draft" => handle_gmail_create_draft(&arguments, home_dir).await,
-        "calendar_list_events" => handle_calendar_list_events(&arguments, home_dir).await,
-        "calendar_create_event" => handle_calendar_create_event(&arguments, home_dir).await,
-        "sheets_read" => handle_sheets_read(&arguments, home_dir).await,
-        "sheets_append" => handle_sheets_append(&arguments, home_dir).await,
-        "forms_get" => handle_forms_get(&arguments, home_dir).await,
-        "forms_list_responses" => handle_forms_list_responses(&arguments, home_dir).await,
-        "gtasks_lists" => handle_gtasks_lists(home_dir).await,
-        "gtasks_list" => handle_gtasks_list(&arguments, home_dir).await,
-        "gtasks_create" => handle_gtasks_create(&arguments, home_dir).await,
-        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir).await,
-        "drive_search" => handle_drive_search(&arguments, home_dir).await,
-        "drive_read" => handle_drive_read(&arguments, home_dir).await,
-        "docs_read" => handle_docs_read(&arguments, home_dir).await,
-        "docs_append" => handle_docs_append(&arguments, home_dir).await,
-        "slides_read" => handle_slides_read(&arguments, home_dir).await,
+        // Per-employee Google identity: `none` hides and refuses the whole
+        // group (same predicate as `tools/list`).
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && !google_caller.tools_listed(home_dir) => {
+            tool_error("這位 AI 員工設定為不使用 Google。")
+        }
+        "google_status" => handle_google_status(home_dir, &google_caller).await,
+        "gmail_search" => handle_gmail_search(&arguments, home_dir, &google_caller).await,
+        "gmail_read" => handle_gmail_read(&arguments, home_dir, &google_caller).await,
+        "gmail_create_draft" => handle_gmail_create_draft(&arguments, home_dir, &google_caller).await,
+        "calendar_list_events" => handle_calendar_list_events(&arguments, home_dir, &google_caller).await,
+        "calendar_create_event" => handle_calendar_create_event(&arguments, home_dir, &google_caller).await,
+        "sheets_read" => handle_sheets_read(&arguments, home_dir, &google_caller).await,
+        "sheets_append" => handle_sheets_append(&arguments, home_dir, &google_caller).await,
+        "forms_get" => handle_forms_get(&arguments, home_dir, &google_caller).await,
+        "forms_list_responses" => handle_forms_list_responses(&arguments, home_dir, &google_caller).await,
+        "gtasks_lists" => handle_gtasks_lists(home_dir, &google_caller).await,
+        "gtasks_list" => handle_gtasks_list(&arguments, home_dir, &google_caller).await,
+        "gtasks_create" => handle_gtasks_create(&arguments, home_dir, &google_caller).await,
+        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir, &google_caller).await,
+        "drive_search" => handle_drive_search(&arguments, home_dir, &google_caller).await,
+        "drive_read" => handle_drive_read(&arguments, home_dir, &google_caller).await,
+        "docs_read" => handle_docs_read(&arguments, home_dir, &google_caller).await,
+        "docs_append" => handle_docs_append(&arguments, home_dir, &google_caller).await,
+        "slides_read" => handle_slides_read(&arguments, home_dir, &google_caller).await,
         "notion_status" => handle_notion_status(home_dir).await,
         "notion_search" => handle_notion_search(&arguments, home_dir).await,
         "notion_page_read" => handle_notion_page_read(&arguments, home_dir).await,
@@ -748,6 +760,12 @@ pub(crate) async fn handle_tools_call(
         _ => {
             return jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}"));
         }
+    };
+
+    let result = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
+        google_caller.finish(home_dir, default_agent, tool_name, result)
+    } else {
+        result
     };
 
     // ── Tool call audit trail (L1 anti-hallucination) ──────────

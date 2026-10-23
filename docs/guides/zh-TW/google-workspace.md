@@ -95,7 +95,76 @@ Google 事先驗證過應用程式。
 來源。
 
 兩條免憑證的路徑記錄在
-[google-no-oauth-client.md](../google-no-oauth-client.md)。
+[google-no-oauth-client.md](../google-no-oauth-client.md)。要讓每位 AI 員工各自代表一位同事，見[每位 AI 員工用不同的 Google 帳號](#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+
+## 每位 AI 員工用不同的 Google 帳號（公司授權代表，未發布）
+
+預設所有 AI 員工共用下方設定的那一個 Google 帳號（公司共用帳號）。Google Workspace 客戶可以改成讓每位員工代表一位指定的同事：業務助理在 `alice@customer.com` 的信箱裡讀信、存草稿，排程助理管理 `bob@customer.com` 的日曆。全部共用一個開了網域委派的服務帳號，每位員工各自指定代表的同事。
+
+### 需要什麼
+
+- 一個 Google Workspace 網域，以及一位能授權用戶端 ID 的超級管理員（Google 管理控制台 → 安全性 → 存取權與資料控管 → API 控制項 → 管理全網域委派），授權的權限清單要和儀表板顯示的完全一致。
+- 憑證保護已改放系統金鑰圈（「安全」頁，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)）。服務帳號金鑰用這把保護金鑰封存，AI 員工讀不到它的檔案。macOS 與 Windows 可以用；Linux 與 Docker 目前沒有支援的金鑰圈，代表同事一律拒絕。
+
+### 設定步驟
+
+1. **安全 → 憑證保護 → 改放系統金鑰圈。**
+2. **整合 → Google → 公司授權代表 → 匯入金鑰檔。** 選服務帳號的 JSON 金鑰檔。gateway 檢查後封存，存成 `<home>/protected/google-service-account.sealed`（只有擁有者能讀）。匯入後請刪掉原本的檔案。面板會顯示要交給超級管理員的用戶端 ID 和權限清單。
+3. **允許代表的網域。** 只有這些網域的同事能被代表（網域完全相同才算，子網域不算）。沒填時只允許和公司共用服務帳號 `subject` 同網域；兩者都沒有就一律不能代表。
+4. **員工頁 → 連線 → 變更 → 代表某位同事（網域委派）**，填同事的公司信箱後儲存。
+5. **測試連線**：用完整權限清單替這位同事取一次權杖，確認 Gmail 回報的是同一個信箱，再逐一服務各取一次權杖。Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點；試算表、文件、簡報與表單目前只驗簽發授權，尚未確認服務資料可讀。不寄任何東西，也不使用或寫入權杖快取。
+
+帳號卡片的「已設定，請測試連線」只表示本地設定已備妥，不能證明封存金鑰可解開或 Google 已接受授權。每次原生委派工具呼叫都會請 gateway 重查當下設定、發問者權限及帳號狀態；只有 gateway 快取簽發結果。
+
+同樣的操作都有 RPC（皆需管理員）：`google.delegation.get`、`google.delegation.import_key`、`google.delegation.remove_key`、`google.delegation.settings_set`、`agents.google_identity_set`、`google.identity.test`。`agents.google_identity_get` 需要對這位員工有檢視權限。
+
+### 設定值
+
+```toml
+# agent.toml（管理員設定；員工用 Write/Edit 改不了）
+[google]
+identity = "delegate:alice@customer.com"  # home | none | delegate:<email>
+fallback = "none"           # none（預設）| home
+requesters = "bound_people" # bound_people（預設）| owner_only | anyone
+
+# config.toml
+[integrations.google_identity]
+default_identity = "home"   # 沒寫 [google] 的員工用什麼：home（預設）| none
+allowed_subject_domains = ["customer.com"]
+```
+
+沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 19 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。`owner` 與 `user:<id>`（員工用負責人自己連結的帳號）保留給之後的版本，目前一律拒絕。
+
+### 誰能透過這位員工使用這個帳號
+
+同事的信箱是個人的資料，所以員工只替部分發問者使用它（`requesters`）：
+
+| 設定 | 允許 |
+|---|---|
+| `bound_people`（預設） | 綁定這位員工的人（任何權限）與管理員，不論是在儀表板、WebChat 或已驗證的通道綁定；排程與系統工作（cron、heartbeat、Agent Mail）；由上述的人委派出來的工作 |
+| `owner_only` | 那位同事自己的 DuDuClaw 帳號，以及排程工作 |
+| `anyone` | 能和這位員工對話的人（用 RPC 設定時要加 `confirm_anyone: true`） |
+
+網站的公開訪客（WebChat 小工具、Odoo 線上客服）在任何設定下都會被拒。沒有綁定帳號的通道發話者，除非設成 `anyone`，否則也會被拒。
+
+### 用不了的時候
+
+工具呼叫會失敗，並說明原因和誰能處理，不會悄悄改用公司共用帳號。可能的原因：呼叫者不是通過驗證的員工；發問者沒有權限；信箱不在允許的網域；那位同事的 DuDuClaw 帳號已停權或離職；憑證保護還沒就緒（或保護金鑰被換掉，封存的金鑰解不開，要重設憑證保護後重新匯入金鑰）；還沒匯入金鑰；Google 拒絕委派（`unauthorized_client` 通常是管理控制台的權限清單少了幾項，`invalid_grant` 是帳號不存在或已停用）；DuDuClaw 主程式沒有在執行。
+
+勾選「萬一這位同事的帳號用不了，改用公司共用帳號」（`fallback = "home"`）後，最後那一類（還沒匯入金鑰、同事停權、Google 拒絕或連不上）會改用公司共用帳號，並在結果開頭說明原因。發問者沒有權限、設定錯誤、憑證保護的問題，一律不會改用公司帳號。
+
+### 其他跟著改變的地方
+
+- **`google_status`** 先講這位員工目前代表誰。代表同事時，回報現在能不能取得權杖，不再列公司共用帳號的細節。
+- **Agent Mail** 用「收信所屬員工」的身分讀信。如果那位員工代表某位同事，信箱頁只有管理員和那位同事看得到（行為變更；用公司共用帳號的信箱仍是主管以上可看）。一個安裝仍然只有一個信箱。
+- **外掛的 Google MCP 伺服器**（`bearer_token = "oauth://google"`）在這個版本對代表同事的員工會跳過不掛載，否則帶進去的會是公司共用帳號的權杖。
+- **稽核**：gateway 每次發出或拒絕權杖，都在 `tool_calls.jsonl` 寫一列 `google_token`（員工、身分、帳號、發問者類型、工具、拒絕代碼）；用同事身分的每次 Google 工具呼叫寫一列 `google_call`。兩者都不含權杖。變更員工身分會在帳號稽核記錄寫 `agent.google_identity_set`，並在 `security_audit.jsonl` 寫 `agent_google_identity_set`。
+
+### 限制
+
+- `gmail.compose` 讓拿到存取權杖的人可以寄信。工具只會存草稿，但有不受限 shell 的員工可以拿它替自己那位同事取得的權杖直接呼叫 Google。
+- 有 shell 的員工和 gateway 是同一個作業系統帳號，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)中金鑰圈的限制。
+- 還沒在真的 Workspace 上驗證：管理控制台的實際流程、Google 真正的錯誤字串、關閉 Gmail 的組織單位，以及 Google 自家遠端 MCP 端點收不收委派權杖。
 
 ## 前置準備：建立一個 Google OAuth client
 

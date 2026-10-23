@@ -2798,7 +2798,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // tools: same loopback + signed-identity authentication as the
     // computer-use route, own nonce set and rate limit, 64 KiB body cap.
     app = app.merge(crate::knowledge::route::router(Arc::new(
-        crate::knowledge::route::KnowledgeRouteState::new(home_dir.clone(), Some(knowledge_users)),
+        crate::knowledge::route::KnowledgeRouteState::new(home_dir.clone(), Some(knowledge_users.clone())),
+    )));
+    // ── Per-employee Google identity (internal, B2a) ──────────────
+    // `POST /api/internal/google-token`: the MCP server's only way to a
+    // delegated colleague's token. Same loopback + signed-identity
+    // authentication, own nonce set and rate limit, 4 KiB body cap; the
+    // delegation key is unsealed only here (the gateway-lock holder).
+    app = app.merge(crate::google_identity::route::router(Arc::new(
+        crate::google_identity::route::GoogleTokenRouteState::new(home_dir.clone(), Some(knowledge_users)),
     )));
     // ── Device operations for the `os_*` MCP tools (internal) ─────
     // The mcp-server process reaches duduclaw-sysd only through this route
@@ -16200,7 +16208,7 @@ async fn healthz_handler() -> impl IntoResponse {
         start,
     );
     let ok = !cron_stalled && !hb_stalled;
-    let body = Json(serde_json::json!({
+    let body = serde_json::json!({
         "ok": ok,
         "service": "duduclaw-gateway",
         "version": env!("CARGO_PKG_VERSION"),
@@ -16211,7 +16219,14 @@ async fn healthz_handler() -> impl IntoResponse {
             "heartbeat_tick_secs_ago": hb_ago,
             "heartbeat_stalled": hb_stalled,
         },
-    }));
+    });
+    #[cfg(feature = "live-test-mocks")]
+    let body = {
+        let mut body = body;
+        body["live_test_mocks"] = serde_json::json!(true);
+        body
+    };
+    let body = Json(body);
     let status = if ok {
         axum::http::StatusCode::OK
     } else {

@@ -29,6 +29,10 @@ pub(crate) enum AuthorityKind {
     Loosen,
     /// Becoming, or ceasing to be, `role = "main"`.
     RoleMain,
+    /// `[google]`: whose Google account the employee acts as. The Owner may
+    /// only narrow — switch to `none`, drop `fallback = "home"`, or tighten
+    /// `requesters`; any other change needs an admin.
+    GoogleNarrow,
 }
 
 impl AuthorityKind {
@@ -38,6 +42,7 @@ impl AuthorityKind {
             Self::Change => "change",
             Self::Loosen => "loosen",
             Self::RoleMain => "role_main",
+            Self::GoogleNarrow => "google_narrow",
         }
     }
 }
@@ -56,7 +61,7 @@ const fn key(toml_key: &'static str, form_paths: &'static [&'static str], kind: 
     AuthorityKey { toml_key, form_paths, kind }
 }
 
-use AuthorityKind::{Change, Loosen, RoleMain};
+use AuthorityKind::{Change, GoogleNarrow, Loosen, RoleMain};
 
 /// Every admin-only field. Keep in sync with the fixture (a test enforces it).
 pub(crate) const AUTHORITY: &[AuthorityKey] = &[
@@ -105,6 +110,8 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("budget.monthly_limit_cents", &["form.monthly_limit_cents"], Loosen),
     key("budget.daily_cap_cents", &["v.daily_cap_cents"], Loosen),
     key("budget.hard_stop", &["form.hard_stop"], Loosen),
+    // Whose Google account the employee acts as (a colleague's mailbox).
+    key("google", &[], GoogleNarrow),
 ];
 
 /// The effective value of an authority key: an absent key reads as the value
@@ -172,7 +179,26 @@ fn needs_admin(k: &AuthorityKey, before: &Value, after: &Value) -> bool {
             before.as_bool() == Some(true) && after.as_bool() != Some(true)
         }
         Loosen => cap_loosened(before, after),
+        GoogleNarrow => !google_only_narrows(before, after),
     }
+}
+
+/// `[google]` before/after (JSON of the table, `null` when absent): true
+/// when the change only narrows what the employee can reach.
+fn google_only_narrows(before: &Value, after: &Value) -> bool {
+    use duduclaw_core::google_identity::{AgentGoogleSection, Fallback, section_from_table};
+    let read = |v: &Value| -> Option<AgentGoogleSection> {
+        if v.is_null() {
+            return Some(AgentGoogleSection::default());
+        }
+        let table: toml::Table = serde_json::from_value(v.clone()).ok()?;
+        section_from_table(&table).ok()
+    };
+    let (Some(b), Some(a)) = (read(before), read(after)) else { return false };
+    let identity_ok = a.identity == b.identity
+        || a.identity == Some(duduclaw_core::google_identity::Selector::None);
+    let fallback_ok = a.fallback == b.fallback || a.fallback == Fallback::None;
+    identity_ok && fallback_ok && a.requesters >= b.requesters
 }
 
 /// Before/after of every authority key whose change needs an admin.

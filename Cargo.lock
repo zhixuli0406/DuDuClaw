@@ -1963,6 +1963,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "rsa",
  "rusqlite",
  "rust_xlsxwriter",
  "scraper",

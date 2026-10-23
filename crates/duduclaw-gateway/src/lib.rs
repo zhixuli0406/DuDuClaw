@@ -29,6 +29,12 @@
 #![allow(clippy::unwrap_or_default)]
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
+
+// The live-test seams (in-memory credential protection, Google REST base
+// override) must never reach a shipped binary.
+#[cfg(all(feature = "live-test-mocks", not(debug_assertions)))]
+compile_error!("the `live-test-mocks` feature is for isolated debug live tests only and must not be enabled in a release build");
+
 pub mod a2a_signing;
 pub mod access_control;
 pub mod workflow;
@@ -94,6 +100,7 @@ pub mod doctor_probes;
 pub mod extension;
 pub mod github_workspace;
 pub mod google_apps_script;
+pub mod google_identity;
 pub mod google_service_account;
 pub mod google_workspace;
 pub mod googlechat;

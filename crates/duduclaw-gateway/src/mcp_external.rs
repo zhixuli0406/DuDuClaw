@@ -170,6 +170,31 @@ pub async fn resolve_secret_refs(
     servers: Vec<ExternalMcpServer>,
     home_dir: &Path,
 ) -> Vec<ExternalMcpServer> {
+    resolve_secret_refs_for(servers, home_dir, true).await
+}
+
+/// Whether `oauth://google` may resolve for the employee in `agent_dir`:
+/// only when its Google identity is the home account. A delegated colleague
+/// (B2a) is not served to external Google MCP servers yet — resolving the
+/// bearer to the home token there would silently act as the wrong person —
+/// so those servers are skipped. Unreadable settings skip them too.
+pub fn oauth_google_allowed(agent_dir: &Path, home_dir: &Path) -> bool {
+    use duduclaw_core::google_identity::{Effective, SectionRead, combine, parse_agent_section, read_home_config};
+    let section = match duduclaw_core::agent_toml::read_effective_text(agent_dir) {
+        Ok(text) => parse_agent_section(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SectionRead::Absent,
+        Err(_) => SectionRead::Invalid("unreadable".into()),
+    };
+    combine(&section, &read_home_config(home_dir)).effective == Effective::Home
+}
+
+/// [`resolve_secret_refs`] with `oauth://google` allowed or not (see
+/// [`oauth_google_allowed`]).
+pub async fn resolve_secret_refs_for(
+    servers: Vec<ExternalMcpServer>,
+    home_dir: &Path,
+    oauth_google_allowed: bool,
+) -> Vec<ExternalMcpServer> {
     use duduclaw_security::secret_manager::{SecretManagerConfig, resolve_secret_reference};
 
     let needs_secret = |s: &ExternalMcpServer| {
@@ -194,7 +219,14 @@ pub async fn resolve_secret_refs(
 
     // Resolve the Google OAuth token at most once per pass (shared by all
     // `oauth://google` mounts; the getter refreshes an expired token itself).
-    let google_token: Option<String> = if servers.iter().any(needs_oauth) {
+    let google_token: Option<String> = if !oauth_google_allowed {
+        if servers.iter().any(needs_oauth) {
+            tracing::warn!(
+                "oauth://google is not available for an employee whose Google identity is not the home account — skipping those servers"
+            );
+        }
+        None
+    } else if servers.iter().any(needs_oauth) {
         match crate::google_workspace::get_valid_google_token(home_dir).await {
             Ok(t) => Some(t),
             Err(e) => {
@@ -259,7 +291,8 @@ pub async fn load_external_mcp_servers_resolved(
     agent_dir: &Path,
     home_dir: &Path,
 ) -> Vec<ExternalMcpServer> {
-    resolve_secret_refs(load_external_mcp_servers(agent_dir), home_dir).await
+    let google_ok = oauth_google_allowed(agent_dir, home_dir);
+    resolve_secret_refs_for(load_external_mcp_servers(agent_dir), home_dir, google_ok).await
 }
 
 /// Resolve a security-relevant tool-filter list (`allowed_tools`/`denied_tools`).
@@ -867,6 +900,40 @@ bearer_token = "oauth://google"
             out.is_empty(),
             "unresolvable oauth://google ⇒ server dropped"
         );
+    }
+
+    #[test]
+    fn oauth_google_only_for_the_home_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='bot'\n").unwrap();
+        assert!(oauth_google_allowed(&dir, home.path()));
+        for google in [
+            "[google]\nidentity='delegate:a@c.test'\n",
+            "[google]\nidentity='none'\n",
+            "[google]\nidentity='bogus'\n",
+        ] {
+            std::fs::write(dir.join("agent.toml"), format!("[agent]\nname='bot'\n{google}")).unwrap();
+            assert!(!oauth_google_allowed(&dir, home.path()), "{google}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_google_is_skipped_when_not_allowed() {
+        let s = r#"
+[[mcp.external]]
+name = "gmail"
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+bearer_token = "oauth://google"
+
+[[mcp.external]]
+name = "plain"
+command = "x"
+"#;
+        let out = resolve_secret_refs_for(parse(s), Path::new("/nonexistent-home"), false).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "plain");
     }
 
     #[tokio::test]

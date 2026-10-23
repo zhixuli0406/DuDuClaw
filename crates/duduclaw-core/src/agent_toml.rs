@@ -313,6 +313,9 @@ pub struct GoalIntentSectionView {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct AgentTomlSections {
+    /// A malformed Google section denies only Google, while the other
+    /// lenient sections remain readable. Missing is distinct from invalid.
+    pub google: crate::google_identity::SectionRead,
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub runtime: RuntimeSection,
     #[serde(deserialize_with = "crate::lenient::or_default")]

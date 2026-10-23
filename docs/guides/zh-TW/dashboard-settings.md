@@ -141,6 +141,31 @@
 
 封存或刪除員工時，專用集合一起封存（只有身為擁有者的同事保留存取）；恢復員工時，放回封存時移除的授權。第一次上傳也會把集合加進既有的 `[knowledge] collections` 清單，之後的上傳不再動這份清單。細節見[文件知識庫](../../features/zh-TW/63-knowledge-base.md#在儀表板操作)。
 
+## 員工頁 → 連線（未發布）
+
+綁定這位員工的人（檢視者以上）都看得到它用哪個 Google 帳號、現在能不能用（`agents.google_identity_get`）。變更與「測試連線」只有管理員能做。
+
+| 控制項 | 寫入 | 生效 |
+|---|---|---|
+| 變更 → 公司共用帳號／代表某位同事（網域委派）／不使用 | `agent.toml [google] identity` = `home`／`delegate:<email>`／`none`（`agents.google_identity_set`） | 下一次 Google 工具呼叫。`none` 會讓這位員工看不到 19 個 Google 工具（工具清單會變）。信箱必須在允許的網域內。 |
+| 「萬一這位同事的帳號用不了，改用公司共用帳號」 | `[google] fallback = "home"`（不勾就不寫這個欄位） | 只涵蓋：還沒匯入金鑰、同事停權或離職、Google 拒絕或連不上。發問者沒有權限、設定錯誤、憑證保護的問題一律不改用。 |
+| 測試連線 | 不寫入 | 替同事取權杖（先完整清單，再逐一服務），確認 Gmail 回報同一個信箱。不寄任何東西。 |
+
+`[google] requesters`（預設 `bound_people`，另有 `owner_only`、`anyone`）這一頁還沒有控制項，用 `agents.google_identity_set`（`anyone` 要加 `confirm_anyone: true`）或設定檔進階編輯（管理員）設定。非管理員的擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`）。細節見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+
+## 整合 → Google → 公司授權代表（未發布）
+
+只有管理員，兩個版本都有。
+
+| 控制項 | 寫入 | 生效 |
+|---|---|---|
+| 匯入金鑰檔／換一個金鑰檔 | `<home>/protected/google-service-account.sealed`，用憑證保護金鑰封存（`google.delegation.import_key`） | 立即。「安全 → 憑證保護」還沒改放系統金鑰圈時會被拒。金鑰不會傳回瀏覽器；面板顯示服務帳號、用戶端 ID、權限清單與管理控制台路徑。 |
+| 移除 | 刪除封存的金鑰（`google.delegation.remove_key`，要確認） | 所有代表同事的員工停止使用 Google（允許改用公司帳號的會改用）。 |
+| 允許代表的網域 | `config.toml [integrations.google_identity] allowed_subject_domains`（`google.delegation.settings_set`） | 下一次呼叫。網域完全相同才算。空白時只允許 `[integrations.google_service_account] subject` 的網域，沒有就一律不行。 |
+| （無控制項）`default_identity` | `[integrations.google_identity] default_identity` = `home`（預設）／`none` | 沒寫 `[google]` 的員工用什麼。 |
+
+最下方列出每位代表同事的員工，以及目前不能用的原因。
+
 ## 系統設定 → 進階設定 → 文件知識庫搜尋
 
 只限管理員（1.76.0 新增）。顯示文件知識庫目前是依語意搜尋還是只比對關鍵字；只比對關鍵字時會說明原因，並顯示已有向量的段落比例。

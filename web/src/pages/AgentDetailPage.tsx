@@ -70,6 +70,7 @@ import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
 import { AgentFilesTab } from '@/pages/agent-files/AgentFilesTab';
 import { UnsavedChangesDialog } from '@/components/agent-files/UnsavedChangesDialog';
 import { AgentSourcesTab } from '@/pages/agent-sources/AgentSourcesTab';
+import { AgentConnectionsTab } from '@/components/agent/AgentConnectionsTab';
 import { computeMood } from '@/lib/mascot-mood';
 import { toStatusKey } from '@/lib/task-status';
 import { timeAgo, formatCents } from '@/lib/format';
@@ -79,7 +80,7 @@ const MAX_AVATAR_BYTES = 512 * 1024;
 const AVATAR_ACCEPT = '.png,.jpg,.jpeg,.webp';
 const AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-const TAB_IDS = ['overview', 'work', 'records', 'files', 'computer', 'sources'] as const;
+const TAB_IDS = ['overview', 'work', 'records', 'files', 'computer', 'sources', 'connections'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
 /** Old or guessed tab paths and the tab that holds that content. */
@@ -556,6 +557,7 @@ export function AgentDetailPage() {
                 <TabsTab value="computer">{intl.formatMessage({ id: 'agentDetail.tab.computer' })}</TabsTab>
               )}
               <TabsTab value="sources">{intl.formatMessage({ id: 'agentDetail.tab.sources' })}</TabsTab>
+              <TabsTab value="connections">{intl.formatMessage({ id: 'agentDetail.tab.connections' })}</TabsTab>
             </TabsList>
           </div>
         </div>
@@ -584,6 +586,13 @@ export function AgentDetailPage() {
         </TabsPanel>
         <TabsPanel value="computer">
           {tab === 'computer' && <ComputerSessionPanel agentId={id} />}
+        </TabsPanel>
+        <TabsPanel value="connections">
+          {tab === 'connections' && (
+            <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
+              <AgentConnectionsTab key={id} agentId={id} />
+            </div>
+          )}
         </TabsPanel>
         <TabsPanel value="sources">
           {tab === 'sources' && (

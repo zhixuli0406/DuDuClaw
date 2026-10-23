@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- 關閉員工的 Google 個人代表身分或改回公司帳號時，不再要求確認已移除的「任何人都能使用」限制；設定個人代表且開放任何人使用時仍須確認。
+
 ### Added
 - AI 員工專屬通道：員工頁「整合」分頁多了「專屬通道」區塊，可以讓一位員工用自己的 Telegram Bot 和自己的 Google Chat 應用程式對外說話，不用重新啟動。沒設定的員工照舊走共用通道。設定步驟見 `docs/guides/per-employee-channels.md`（三語）。
   - **Telegram**：貼上 BotFather 的 Token 按「連線」。存檔前先用 `getMe` 問 Telegram，被拒絕的 Token 不會存；當下連不到 Telegram 時先存、Bot 自己重試。卡片顯示「已連線，Bot 是 @xxx」或沒連上的原因（Token 被撤銷會顯示「Bot Token 無效」）。存檔只重啟這位員工的 Bot，其他 Bot 不受影響（以前每次存檔都把所有 Bot 重啟一輪）。
@@ -14,6 +17,14 @@
   - 開發版（debug build）才有的測試用網址覆寫：`DUDUCLAW_DEV_TELEGRAM_API_BASE`、`DUDUCLAW_DEV_GOOGLECHAT_API_BASE`、`DUDUCLAW_DEV_GOOGLECHAT_JWKS_URL`，只接受本機 `http://` 位址，正式版不編進去。
   - **行為變更**：員工專屬 Bot（Telegram）與專屬 Chat 應用程式的對話改存在這位員工自己的對話分桶（`<對話>#agent:<員工代號>`），存取規則與真人接手仍然看原本的對話。以前同一個人私訊兩位員工的 Bot 時，Telegram 給的聊天 ID 相同，兩位員工共用一個對話，第二位員工會直接出錯不回覆；兩個 Bot 在同一個群組也一樣。升級後既有員工專屬 Bot 的對話紀錄從新的分桶重新開始（舊紀錄還在，不會刪）。`@` 叫出的員工在一對一聊天裡的分桶現在也算一對一對話（以前一律當群組），個人層級的內容判斷和一對一聊天一致。
   - 已驗證：單元測試（衝突判斷、`getMe` 分類、專案編號與金鑰檢查、只寫密文、狀態字）；用假 Telegram Bot API 跑真的輪詢與回覆流程：兩位員工各自的 Bot 回答同一個人、各自用自己的分桶、回覆不會跨 Bot、Token 撤銷後 Bot 停下並顯示「Bot Token 無效」、同一個 Bot 設在兩位員工時只啟動一個並標出原因；用假 Google（JWKS、權杖端點、Chat API）與本機簽的 JWT 跑真的端點：A 的權杖打 B 的端點 401、audience 錯 401、沒權杖 401、偽造簽章 401、沒應用程式 404、兩個應用程式在同一個聊天室各自用自己的服務帳戶回答、主動轉送用員工的應用程式、移除後端點關閉；RPC 測試（負責人只能看狀態、檢視者與其他人看不到、四個寫入都只限管理員、Telegram 拒絕的 Token 不存、三條寫入路徑都擋重複、`agent.toml` 只有密文）；儀表板元件測試；gateway lib 8,833 項（略過需要 docker 的 discovery 測試與 CI 本來就略過的五組）、gateway 整合測試 24 個檔、core 1,042 項全過。隔離環境以開發版 binary、假 Telegram Bot API、假 Google 與假模型（openai_compat）實測：管理員從 RPC 綁兩個 Bot 不用重啟、同一人私訊兩個 Bot 各自由 sales／hr 回答並存在各自分桶、群組只有被 @ 的 Bot 回答、負責人綁定被拒、Telegram 拒絕的 Token 不存、重複 Bot 被拒、封鎖名單對專屬 Bot 一樣有效、Token 撤銷後狀態變「Bot Token 無效」、換新 Token 與移除都不用重啟；Google Chat 兩個應用程式在同一聊天室各自用自己的服務帳戶回答、A 的權杖打 B 401、audience 錯 401、沒權杖 401、沒應用程式 404、重複專案編號被拒；`agent.toml`、狀態檔與 log 裡找不到 Token 或私鑰。尚未驗證：真的 Telegram Bot 與真的 Google Workspace（需要真 Bot Token、Google Cloud 專案與公開 HTTPS 網址）；Google Chat 的「HTTP 端點網址」驗證對象模式不支援（只支援專案編號）；這一版之前建立的提醒仍由共用 Bot 送；語音回覆模式仍以聊天室為單位、不分 Bot。
+- 每位 AI 員工可以用不同的 Google 帳號（公司授權代表，B2a）：Google Workspace 客戶用一個開了網域委派的服務帳號，讓每位員工以一位指定同事的身分讀信、存草稿、管理日曆與文件。
+  - **設定**：員工頁新增「連線」分頁，顯示目前用哪個 Google 帳號；「已設定」僅表示本地資料備妥，需另按「測試連線」確認。管理員可以改成「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。測試會替同事取權杖、比對 Gmail 回報的信箱，再按服務測授權；Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點，試算表、文件、簡報與表單只驗授權簽發，不寄任何東西。「整合 → Google」新增「公司授權代表」分區：匯入服務帳號金鑰、複製用戶端 ID 與完整權限清單、設定允許網域，以及列出各員工的代表帳號。設定為 `agent.toml [google] identity`（`home`／`none`／`delegate:<email>`）、`fallback`、`requesters`；全域預設為 `config.toml [integrations.google_identity] default_identity`、`allowed_subject_domains`。沒寫 `[google]` 的員工照舊用公司共用帳號；改信箱或 fallback 時保留原本的發問者限制，未知型別拒絕。
+  - **金鑰只封存，不落成可讀的檔案**：服務帳號金鑰用系統金鑰圈裡的保護金鑰封存（`pk:v1`）存成 `<home>/protected/google-service-account.sealed`，AI 員工讀不到。憑證保護還沒改放系統金鑰圈、或在 Linux／Docker 上，一律不能代表同事。保護金鑰被換掉時，封存的金鑰解不開，公司授權代表停用、`security_audit.jsonl` 記一筆 Critical 的 `google_delegation_key_unreadable`，要重設憑證保護後重新匯入，舊紀錄不會被悄悄覆蓋。
+  - **只有 gateway 簽發**：每次委派工具呼叫都經 `POST /api/internal/google-token`（本機、簽章身分、一次性 nonce、限流），由 gateway 重查有效設定、這個 turn 的發問者、帳號狀態與憑證保護。只有 gateway 快取簽發結果，MCP 不跨呼叫沿用 token；整合總開關也會阻擋簽發。呼叫者只認 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工，宣稱卻證明不了的行程不能用代表同事的設定。`[google]` 納入 `AgentTomlSections`，與其他設定一樣讀有效的預設組合產物；區段錯誤拒絕 Google，不影響其他區段。
+  - **誰能透過員工使用**：預設只有綁定這位員工的人、管理員與排程等系統工作；`owner_only` 只限那位同事本人；`anyone` 要明確確認。網站公開訪客在任何設定下都不行。同事的 DuDuClaw 帳號停權或離職後立即不能再代表。
+  - **不會默默改用公司帳號**：用不了時工具回覆原因與誰能處理。只有管理員替員工勾了「改用公司共用帳號」（`fallback = "home"`），而且原因是還沒匯入金鑰、同事停權、Google 拒絕或連不上時，才改用並在回覆開頭說明；發問者沒有權限、設定錯誤、憑證保護的問題一律不改用。
+  - **稽核**：gateway 每次發出或拒絕權杖寫一列 `google_token`，用同事身分的每次工具呼叫寫一列 `google_call`（都不含權杖）；變更員工身分寫 `agent.google_identity_set` 與 `agent_google_identity_set`。新 RPC：`google.delegation.get`／`import_key`／`remove_key`／`settings_set`、`agents.google_identity_get`／`agents.google_identity_set`、`google.identity.test`。
+  - **仍未完整**：外部員工專屬 API key 的委派取權杖（`B2a-EXT`）與 `oauth://google` 的委派掛載及逐次呼叫守門（`B2a-MCP`）尚未實作；目前非 home 的外掛 Google MCP 直接略過，絕不換成公司 token。驗證範圍與本地測試結果見 PR 及 `wiki/impl/google-delegated-identity-acceptance.md`。尚未驗證：真的 Google Workspace（管理控制台授權流程、真實錯誤字串、關閉 Gmail 的組織單位、Google 自家遠端 MCP 收不收委派權杖）、Windows 真機、使用者驗收。
 - AI 員工頁新增「資料來源」分頁：在員工頁直接替這位員工加、減資料檔案，不用再到文件知識庫建集合、分享、回員工設定綁定這六個步驟。
   - **看得到什麼**：綁定這位員工的人（檢視者以上）都看得到它能查哪些集合。先列它自己的資料，再列其他人分享給它的集合，每個集合標出敏感度、文件數、員工設定有沒有用到，以及還有誰讀得到（集合擁有者看到名字，其他人只看到人數）。分頁最上面說明：和這位員工對話的人只拿得到他自己讀得到的段落，放在這裡的檔案不會讓原本讀不到的人看到。
   - **新增檔案**：這位員工的擁有者與管理員按「新增檔案」。第一次會建立員工專用集合「<顯示名稱> 的資料」，敏感度由上傳的人選（預設公司內部），分享給建立的人（擁有者）、這位員工（檢視者），以及（可取消勾選）當下所有綁定這位員工的有效帳號：員工的擁有者成為集合擁有者，操作者與檢視者成為檢視者。只透過團隊呼叫這位員工的主管、部門、通道與沒有帳號的發話者不會加入。剛建立的集合會加進員工設定既有的 `[knowledge] collections` 清單（原本是 `[]` 的會變成只用這個集合，分頁會提示），之後的上傳不再動這份清單；`[knowledge]` 段落讀不懂時什麼都不建立。透過 RPC 呼叫而沒帶 `share_chat_users` 時視為不分享。之後用同一個上傳對話框加檔案、貼文字或網頁。
@@ -116,6 +127,10 @@
 ### Changed
 - **行為變更**：首次開啟時「請先建立第一位 AI 員工」的引導頁，現在只會把管理員帶過去（只有管理員能建立員工，而且管理員看得到全部員工，名單是空的才真的代表還沒有員工）。主管或一般成員就算自己沒有綁定任何 AI 員工，也照常進入儀表板，主管可以直接開「我的團隊」。以前他們每一頁都會被導到引導頁、無法使用。已驗證：前端測試（管理員且沒有員工時導向引導頁；主管與一般成員不導向）。
 - **行為變更**：以 `/交辦`、`／交辦` 或 `/assign` 開頭的訊息現在是指令，不再交給 AI 員工回覆（`/交辦事項` 這類後面直接接字的不算）。dashboard 建立的任務（`tasks.create`、交辦目標）與綁定帳號的人在聊天打的 `/goal`、確認的目標建議，現在會記下 `on_behalf_of`／`created_via`（權限規則不變，舊資料不回填）。debug 版本的 gateway 會讀 `DUDUCLAW_LINE_API_BASE`（只接受本機位址）把 LINE 回覆與推播送到測試用的伺服器，正式版不受影響。
+- **行為變更**：Agent Mail 的 Gmail 收信用所屬員工實際解析出的 Google 帳號，逐封保存代表帳號；fallback 到公司帳號就記成共用收件。管理員看全部，其他有效帳號只看自己的個人收件；共用、舊版、來源不明與投遞資料夾信件維持主管以上。清單先過濾再分頁，讀取授權成功後才標已讀，改代表帳號不會重標歷史信件；不同帳號的 Gmail 訊息 ID 分別去重。本人一般員工可從「連線」分頁開唯讀信箱，不能因此取得封存、待寄出或寄件決定權。這些操作仍須主管角色，並受持久的個人帳號保護紀錄收窄；混合多人的待寄出帳本只限管理員。身分用不了時不收信並記錄原因（只有明確設 `fallback = "home"` 才改讀公司帳號）。尚未驗證：真的 Gmail 收信、Windows 真機與信箱頁實際瀏覽器操作；RPC／元件回歸結果見 PR。
+- 外掛的 Google MCP 伺服器（`bearer_token = "oauth://google"`）對代表同事或不使用 Google 的員工會跳過不掛載，以免帶入公司共用帳號的權杖。已驗證：單元測試。尚未驗證：Google 自家遠端 MCP 端點收不收委派權杖。
+- `google_status` 改為先講員工目前代表誰；代表同事時只回報現在能不能取得權杖。
+- 非管理員的員工擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`），其他變更要管理員。
 - **行為變更**：`tasks.create`（含 `kind = "goal"`）、`tasks.goal_create`，以及 `tasks.assign`、`tasks.update` 改派的目的員工，改用「可以交辦」判斷：管理員、直接綁定 Operator 以上，或經由部屬拿到 Operator 的主管。任務看板 `tasks.list`／`tasks.list_page` 也讓主管列出可以交辦的團隊員工，但沒有直接綁定時只看得到卡片（標題、狀態），看不到內容；只有卡片的任務也不附原本對話的連結（`channel`、`channel_link` 為空）。主管自己建立、交辦給團隊員工的任務，只要仍可交辦給那位員工，就能修改、改派、取消或刪除；其他任務改派時原本負責的員工仍要直接 Operator。已驗證：RPC 測試與隔離環境實測（主管交辦給團隊員工成功、給同級同事的員工或只有 Viewer 的團隊員工回 permission denied；看板列得到團隊員工、列不到其他員工；記憶 RPC 仍拒絕；個人版擁有者照常建立任務）。尚未驗證：dashboard 任務頁實際畫面。
 - **行為變更**：`tasks.goal_create` 只接受管理員帶非空白的 `risk_boundary`，其他人帶了會回「only an admin can set a risk boundary」；交辦目標表單的風險邊界欄只顯示給管理員。原因：任務自己的邊界會取代 `[goal_defaults] baseline_boundary`（2026-10-23 owner 決定，聊天 `/交辦` 同一規則）。
 - **行為變更**：只有 dashboard 帳號（WebChat 登入，或綁定了帳號的通訊軟體使用者）叫了沒有權限的員工時會收到明確拒絕。沒有綁定帳號的發話者（LINE 好友、Telegram 使用者、網站聊天與 Odoo 線上客服訪客）叫不到的名字，改成和對不上任何人的名字一樣當成一般文字交給預設員工，在「只回提及」的群組裡也不算叫 bot，外部的人無法藉由拒絕訊息查出有哪些員工；這類情況不再寫 `trigger_route_refused`。已驗證：單元測試涵蓋 LINE 未綁定使用者、WebChat 網站訪客、綁定帳號的同級主管與 Discord 共用管線。尚未驗證：實機 Telegram、Odoo。

@@ -18,12 +18,15 @@ use duduclaw_security::credential_protection::{CredentialProtection, ProtectionS
 /// test under `crates/duduclaw-gateway/tests/` that calls
 /// `security.credential_protection_enable` would reach the real login
 /// keychain, so none may (status with no marker never touches the store).
+/// A `live-test-mocks` build (debug only, never shipped; `lib.rs` refuses a
+/// release build with it) uses the same in-memory store, so an isolated
+/// live test never reaches the login keychain either.
 pub(crate) fn protection_for(home: &Path) -> CredentialProtection {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "live-test-mocks"))]
     {
         CredentialProtection::with_store(home, Box::new(test_store::for_home(home)))
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "live-test-mocks")))]
     {
         CredentialProtection::platform(home)
     }
@@ -168,7 +171,7 @@ impl MethodHandler {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "live-test-mocks"))]
 pub(crate) mod test_store {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
