@@ -172,6 +172,8 @@ export interface AgentFileVersion {
   file: AgentFileKey;
   at: string;
   user_id: string;
+  /** Editor's display name resolved by the server; null when the account is gone (absent for the system). */
+  user_name?: string | null;
   /** dashboard | rollback | rename | agents.update | contract.update | config.raw | approval | initial | mcp | chat.model */
   source: string;
   sha256: string;

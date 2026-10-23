@@ -81,6 +81,23 @@ describe('AgentDetailPage', () => {
     );
   });
 
+  it('sends an old tab path to the tab that holds that content', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) =>
+      method === 'knowledge.agent.data_sources'
+        ? { agent_id: 'my-bot', binding: 'all', collections: [], own: null, can_manage: false, manage_blocked: null, default_readers: [] }
+        : { ...DETAIL, tasks: [], events: [], agents: [] },
+    );
+    renderAt('my-bot/data-sources');
+    const tab = await screen.findByRole('tab', { name: en['agentDetail.tab.sources'] });
+    await waitFor(() => expect(tab).toHaveAttribute('aria-selected', 'true'));
+  });
+
+  it('shows the overview for a tab path that does not exist', async () => {
+    renderAt('my-bot/nonsense');
+    const tab = await screen.findByRole('tab', { name: 'Overview' });
+    await waitFor(() => expect(tab).toHaveAttribute('aria-selected', 'true'));
+  });
+
   it('adds the computer tab only for an employee with computer use', async () => {
     const { unmount } = renderAt('my-bot');
     await screen.findByRole('heading', { name: 'My Bot' });

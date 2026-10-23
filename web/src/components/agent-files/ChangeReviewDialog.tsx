@@ -71,7 +71,7 @@ function ReasonList({ reasons }: { reasons: AgentFileReason[] }) {
   );
 }
 
-function UnavailableNotice() {
+function UnavailableNotice({ applied = false }: { applied?: boolean }) {
   const intl = useIntl();
   return (
     <p
@@ -79,7 +79,9 @@ function UnavailableNotice() {
       className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-sm text-foreground"
     >
       <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
-      <span>{intl.formatMessage({ id: 'agentFiles.review.analysisUnavailable' })}</span>
+      <span>
+        {intl.formatMessage({ id: applied ? 'agentFiles.review.analysisUnavailableApplied' : 'agentFiles.review.analysisUnavailable' })}
+      </span>
     </p>
   );
 }
@@ -229,7 +231,7 @@ export function ChangeReviewDialog({
           )}
         </DialogHeader>
 
-        {unavailable && status !== 'rejected' && status !== 'conflict' && <UnavailableNotice />}
+        {unavailable && status !== 'rejected' && status !== 'conflict' && <UnavailableNotice applied={status === 'applied'} />}
 
         {(isWarn || isBlock || status === 'rejected') && (reasons.length > 0 || summary !== '') && (
           <div className={cn('space-y-2 rounded-lg border p-3', TONE_PANEL[tone])} data-tone={tone}>
