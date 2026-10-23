@@ -206,6 +206,9 @@ impl MessageQueue {
         // `user:<id>` / `unmapped:<channel>:<digest>`). Written by the MCP
         // server from its host env, or by the gateway from a task row.
         Self::ensure_column(conn, "message_queue", "on_behalf_of", "TEXT")?;
+        // B11: the employee whose own bot / app the originating conversation
+        // came in through (NULL = shared bot / app or a legacy row).
+        Self::ensure_column(conn, "delegation_callbacks", "sender_agent", "TEXT")?;
         Ok(())
     }
 

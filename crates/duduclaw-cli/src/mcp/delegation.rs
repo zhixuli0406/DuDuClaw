@@ -95,6 +95,7 @@ pub(crate) async fn send_to_agent_with_ctx(
         let ts_now = chrono::Utc::now().to_rfc3339();
         let reply_channel = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL)
             .ok()
+            .map(|s| duduclaw_core::session_conversation(&s).to_string())
             .filter(|s| !s.is_empty());
         // v1.10: Forward wiki RL trust feedback context so the dispatcher
         // can re-establish task_locals around the sub-agent dispatch and
@@ -247,6 +248,12 @@ pub(crate) async fn send_to_agent_with_ctx(
         let msg_id_cb = msg_id.clone();
         let caller_cb = caller.to_string();
         let channel_str = reply_channel;
+        // B11: the employee whose own bot / app this conversation came in
+        // through, so the forwarded answer goes out through the same one.
+        let sender_cb: Option<String> = std::env::var(duduclaw_core::ENV_REPLY_SENDER)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| duduclaw_core::is_valid_agent_id(s));
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                 let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
@@ -260,10 +267,13 @@ pub(crate) async fn send_to_agent_with_ctx(
                          channel_id   TEXT NOT NULL,
                          thread_id    TEXT,
                          retry_count  INTEGER NOT NULL DEFAULT 0,
-                         created_at   TEXT NOT NULL
+                         created_at   TEXT NOT NULL,
+                         sender_agent TEXT
                      );
                      CREATE INDEX IF NOT EXISTS idx_dc_agent ON delegation_callbacks(agent_id);"
                 );
+                // Older tables lack the column; "duplicate column" is expected.
+                let _ = conn.execute("ALTER TABLE delegation_callbacks ADD COLUMN sender_agent TEXT", []);
                 // Parse channel context. Supported formats:
                 //   "telegram:12345"            → chat, no thread
                 //   "telegram:12345:6789"       → chat + topic/thread
@@ -275,7 +285,11 @@ pub(crate) async fn send_to_agent_with_ctx(
                 //   "line:<user_id>"            → LINE user
                 //   "slack:<channel_id>"        → Slack channel
                 //   "slack:<channel_id>:<ts>"   → Slack thread (ts = parent timestamp)
-                let parts: Vec<&str> = channel_str.splitn(3, ':').collect();
+                // An employee bucket (`#agent:`) is not part of the chat id
+                // (B11); the bot it came through travels separately.
+                let parts: Vec<&str> = duduclaw_core::session_conversation(&channel_str)
+                    .splitn(3, ':')
+                    .collect();
                 if parts.len() >= 2 && duduclaw_core::SUPPORTED_CHANNEL_TYPES.contains(&parts[0]) {
                     // Rate limit: max 100 pending callbacks per agent to prevent DoS
                     let count: i64 = conn.query_row(
@@ -301,9 +315,9 @@ pub(crate) async fn send_to_agent_with_ctx(
                     let now = chrono::Utc::now().to_rfc3339();
                     let _ = conn.execute(
                         "INSERT OR IGNORE INTO delegation_callbacks \
-                         (message_id, agent_id, channel_type, channel_id, thread_id, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![msg_id_cb, caller_cb, ch_type, ch_id, thread, now],
+                         (message_id, agent_id, channel_type, channel_id, thread_id, created_at, sender_agent) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![msg_id_cb, caller_cb, ch_type, ch_id, thread, now, sender_cb],
                     );
                     }
                 }

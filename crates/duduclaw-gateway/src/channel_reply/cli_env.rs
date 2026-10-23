@@ -311,6 +311,9 @@ pub(super) async fn spawn_claude_cli_with_env(
     if let Ok(channel) = crate::claude_runner::REPLY_CHANNEL.try_with(|ch| ch.clone()) {
         cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
     }
+    if let Some(sender) = crate::claude_runner::reply_sender() {
+        cmd.env(duduclaw_core::ENV_REPLY_SENDER, &sender);
+    }
 
     // v1.10: Inject wiki RL trust feedback context so the MCP server can
     // forward turn_id / session_id into BusMessage when enqueueing
@@ -1118,6 +1121,6 @@ pub(super) async fn spawn_claude_cli_with_env(
     Ok(result_text)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "cli_env_thinking_tests.rs"]
 mod thinking_tests;

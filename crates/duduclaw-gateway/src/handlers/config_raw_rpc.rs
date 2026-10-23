@@ -851,6 +851,33 @@ impl MethodHandler {
         if matches!(kind, RawFile::Config) {
             refuse_disclosure_ack_edit(&before, &after)?;
         }
+        // B11 L3: the raw editor follows the same one-bot / one-app rule as
+        // the dashboard bind, under the same lock.
+        let _bind = crate::agent_channels::binding_lock().await;
+        if let RawFile::Agent(id) = &kind
+            && let Some(msg) = crate::agent_channels::conflicts::raw_agent_edit_conflict(
+                &self.home_dir,
+                &self.registry,
+                id,
+                &before,
+                &after,
+            )
+            .await
+        {
+            return Err(msg.into());
+        }
+        if matches!(kind, RawFile::Config) {
+            let project = |t: &toml::Table| {
+                super::config_commit::toml_at(t, "channels.googlechat_project_number")
+                    .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+            };
+            if let Some(p) = project(&after).filter(|p| !p.is_empty() && Some(p) != project(&before).as_ref())
+                && let Some(msg) =
+                    crate::agent_channels::conflicts::shared_project_conflict(&self.registry, &p).await
+            {
+                return Err(msg.into());
+            }
+        }
         let sections = changed_sections(&before, &after);
         // A submission whose parsed content equals the stored file is a true
         // no-op (the hidden [mcp_keys] re-attached at the end, or a pure

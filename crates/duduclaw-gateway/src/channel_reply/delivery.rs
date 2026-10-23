@@ -243,6 +243,8 @@ pub(super) fn channel_display_name(channel: &str) -> &'static str {
 }
 
 pub(super) fn parse_session_id_parts(session_id: &str) -> (&str, &str) {
+    // An employee bucket (`#agent:`) is not part of the chat id (B11).
+    let session_id = duduclaw_core::session_conversation(session_id);
     let parts: Vec<&str> = session_id.splitn(3, ':').collect();
     match parts.len() {
         0 | 1 => ("", session_id),

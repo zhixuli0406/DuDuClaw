@@ -3787,6 +3787,11 @@ tokio::task_local! {
     /// so the dispatcher can forward sub-agent responses back to the originating channel.
     pub static REPLY_CHANNEL: String;
 
+    /// B11: the AI employee whose own bot / app the [`REPLY_CHANNEL`]
+    /// conversation came in through (absent = shared bot / app). Exported as
+    /// [`duduclaw_core::ENV_REPLY_SENDER`] next to the reply channel.
+    pub static REPLY_SENDER: String;
+
     /// RFC-22 P1-7: caller agent_id for cost_telemetry attribution along the
     /// channel_reply path. Without this, `spawn_claude_cli_with_env` cannot
     /// record per-agent token usage and `cost_telemetry.db` shows 0 entries
@@ -4254,6 +4259,9 @@ fn prepare_claude_cmd(
     // delegation callbacks for sub-agent response forwarding.
     if let Ok(channel) = REPLY_CHANNEL.try_with(|ch| ch.clone()) {
         cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
+    }
+    if let Some(sender) = reply_sender() {
+        cmd.env(duduclaw_core::ENV_REPLY_SENDER, &sender);
     }
 
     // v1.10: Inject wiki RL trust feedback context so the MCP server can
@@ -5636,4 +5644,29 @@ mod local_think_tests {
         // A genuinely empty reply keeps its existing meaning (not this error).
         assert_eq!(finish_local_reply(String::new()).unwrap(), "");
     }
+}
+
+/// The own-bot sender of the current reply conversation (B11): the
+/// [`REPLY_SENDER`] task-local in the gateway, else the
+/// [`duduclaw_core::ENV_REPLY_SENDER`] env var (MCP server child). Only a
+/// valid employee id counts.
+pub fn reply_sender() -> Option<String> {
+    REPLY_SENDER
+        .try_with(|s| s.clone())
+        .ok()
+        .or_else(|| std::env::var(duduclaw_core::ENV_REPLY_SENDER).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| duduclaw_core::is_valid_agent_id(s))
+}
+
+/// [`reply_sender`] when `(channel, chat_id)` is the current reply
+/// conversation — a send anywhere else keeps the default bot / app.
+pub fn reply_sender_for(channel: &str, chat_id: &str) -> Option<String> {
+    let sender = reply_sender()?;
+    let rc = REPLY_CHANNEL
+        .try_with(|c| c.clone())
+        .ok()
+        .or_else(|| std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).ok())?;
+    let (ch, chat) = crate::decision_notify::parse_origin(&rc)?;
+    (ch == channel.trim() && chat == chat_id.trim()).then_some(sender)
 }

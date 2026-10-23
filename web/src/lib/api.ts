@@ -201,6 +201,36 @@ export interface ProactiveSettings {
   quiet_hours_note?: string | null;
 }
 
+/** Connection state of an employee's own bot / app (B11). */
+export type AgentOwnChannelState = 'not_configured' | 'connecting' | 'connected' | 'error';
+
+/** `agents.channels.status` — an AI employee's own channel identities. */
+export interface AgentOwnChannels {
+  agent_id: string;
+  telegram: {
+    configured: boolean;
+    state: AgentOwnChannelState;
+    connected: boolean;
+    bot_username: string | null;
+    error: string | null;
+    last_event: string | null;
+    shared_bot_configured: boolean;
+    can_edit: boolean;
+  };
+  googlechat: {
+    configured: boolean;
+    state: AgentOwnChannelState;
+    connected: boolean;
+    project_number: string | null;
+    service_account_email: string | null;
+    endpoint_path: string;
+    error: string | null;
+    last_event: string | null;
+    shared_app_configured: boolean;
+    can_edit: boolean;
+  };
+}
+
 export interface ChannelStatus {
   name: string;
   connected: boolean;
@@ -6269,6 +6299,35 @@ export const api = {
   channels: {
     status: () =>
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
+    // B11 — an AI employee's own Telegram bot / Google Chat app, managed from
+    // the employee's page. Status + Telegram: the employee's owner or an
+    // admin; Google Chat writes: admin only.
+    agentStatus: (agentId: string) =>
+      client.call('agents.channels.status', { agent_id: agentId }) as Promise<AgentOwnChannels>,
+    agentTelegramSet: (agentId: string, token: string) =>
+      client.call('agents.channels.telegram.set', { agent_id: agentId, token }) as Promise<{
+        success: boolean;
+        bot_username: string | null;
+        verified: boolean;
+        hot_started: boolean;
+        replaces_shared_bot: boolean;
+      }>,
+    agentTelegramRemove: (agentId: string) =>
+      client.call('agents.channels.telegram.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
+    agentGoogleChatSet: (agentId: string, projectNumber: string, serviceAccountJson?: string) =>
+      client.call('agents.channels.googlechat.set', {
+        agent_id: agentId,
+        project_number: projectNumber,
+        ...(serviceAccountJson && serviceAccountJson.trim() ? { service_account_json: serviceAccountJson } : {}),
+      }) as Promise<{
+        success: boolean;
+        endpoint_path: string;
+        service_account_email: string | null;
+        verified: boolean;
+        error: string | null;
+      }>,
+    agentGoogleChatRemove: (agentId: string) =>
+      client.call('agents.channels.googlechat.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
     add: (type: string, config: Record<string, string>, agent?: string) =>
       client.call('channels.add', { type, config, ...(agent ? { agent } : {}) }) as Promise<{
         success?: boolean;

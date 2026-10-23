@@ -26,8 +26,16 @@ pub(crate) async fn handle_send_message(
     // three. WebChat is refused inside `resolve_channel_target`: it's a
     // session-scoped WebSocket connection with no persistent bot identity a
     // stateless MCP call can deliver into.
-    let result = match duduclaw_gateway::reminder_scheduler::send_channel_message(
-        home_dir, http, channel, chat_id, text,
+    // B11: a message back into the conversation that came through an
+    // employee's own bot / app goes out through that bot / app.
+    let sender = duduclaw_gateway::claude_runner::reply_sender_for(channel, chat_id);
+    let result = match duduclaw_gateway::reminder_scheduler::send_channel_message_as(
+        home_dir,
+        http,
+        channel,
+        chat_id,
+        text,
+        sender.as_deref(),
     )
     .await
     {
