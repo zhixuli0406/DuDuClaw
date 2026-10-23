@@ -1,5 +1,6 @@
 import { useState, useEffect, type FormEvent } from 'react';
-import { useNavigate } from 'react-router';
+import { useLocation, useNavigate } from 'react-router';
+import { browserWatchReturn } from '@/lib/browser-watch-return';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
@@ -13,6 +14,8 @@ type OtpStep = 'email' | 'code';
 export function LoginPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const location = useLocation();
+  const returnTo = browserWatchReturn((location.state as { from?: unknown } | null)?.from) ?? '/';
   const brandName = useEffectiveName();
   const login = useAuthStore((s) => s.login);
   const otpRequest = useAuthStore((s) => s.otpRequest);
@@ -53,12 +56,12 @@ export function LoginPage() {
   useEffect(() => {
     let active = true;
     void tryLocalSession().then((ok) => {
-      if (ok && active) navigate('/', { replace: true });
+      if (ok && active) navigate(returnTo, { replace: true });
     });
     return () => {
       active = false;
     };
-  }, [tryLocalSession, navigate]);
+  }, [tryLocalSession, navigate, returnTo]);
 
   const handleClaim = async (e: FormEvent) => {
     e.preventDefault();
@@ -107,7 +110,7 @@ export function LoginPage() {
     setError('');
     try {
       await login(email, password);
-      navigate('/', { replace: true });
+      navigate(returnTo, { replace: true });
     } catch (err) {
       setError(localizeLoginError(err instanceof Error ? err.message : String(err)));
     }
@@ -134,7 +137,7 @@ export function LoginPage() {
     setError('');
     try {
       await otpVerify(challengeId, code);
-      navigate('/', { replace: true });
+      navigate(returnTo, { replace: true });
     } catch (err) {
       setError(localizeLoginError(err instanceof Error ? err.message : String(err)));
     }
