@@ -123,6 +123,9 @@ pub struct HumanCtx {
     /// A 1:1 conversation (or a dashboard session). `false` excludes
     /// personal and restricted collections.
     pub is_private: bool,
+    /// A public visitor (website widget, website Live Chat): only `public`
+    /// collections, whatever is granted to the channel.
+    pub public_only: bool,
 }
 
 impl HumanCtx {
@@ -136,6 +139,7 @@ impl HumanCtx {
             channel_chat: None,
             is_admin,
             is_private: true,
+            public_only: false,
         }
     }
 
@@ -149,6 +153,7 @@ impl HumanCtx {
             channel_chat: None,
             is_admin: false,
             is_private: false,
+            public_only: false,
         }
     }
 }
@@ -193,6 +198,13 @@ impl AllowedSet {
     /// JSON array for `json_each(?)` in SQL.
     pub fn json(&self) -> String {
         serde_json::to_string(&self.ids).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// The subset of this set whose ids satisfy `keep` (only ever smaller).
+    pub fn filtered(&self, keep: impl Fn(&str) -> bool) -> Self {
+        Self {
+            ids: self.ids.iter().filter(|id| keep(id)).cloned().collect(),
+        }
     }
 
     pub(crate) fn from_ids(ids: impl IntoIterator<Item = String>) -> Self {
@@ -240,6 +252,7 @@ SELECT c.id FROM collections c
    AND ((?7 = 1 AND ?9 = 'full') OR c.id IN human_ok
         OR (?9 = 'internal_only' AND c.sensitivity IN ('public','internal')))
    AND (?8 = 1 OR c.sensitivity IN ('public','internal'))
+   AND (?10 = 0 OR c.sensitivity = 'public')
  ORDER BY c.id";
 
 /// Narrowing from a tool argument or a dashboard selection: only shrinks.
@@ -278,6 +291,7 @@ pub fn effective_collections(
             human.is_admin as i64,
             human.is_private as i64,
             mode,
+            human.public_only as i64,
         ],
         |r| r.get::<_, String>(0),
     )?;

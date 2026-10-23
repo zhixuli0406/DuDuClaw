@@ -121,6 +121,11 @@ pub enum Scope {
     /// [`EXTERNALLY_GRANTABLE_SCOPES`]: the gateway resolves who a call is for
     /// from the employee's live turn, which an external client does not have.
     KnowledgeRead,
+    /// Proposing a document for a knowledge collection
+    /// (`knowledge_add_source`). Every proposal waits for a person in the
+    /// dashboard; not externally grantable (same reason as
+    /// [`Scope::KnowledgeRead`]).
+    KnowledgeWrite,
     Admin,
 }
 
@@ -153,6 +158,7 @@ impl std::fmt::Display for Scope {
             Scope::TeamHandoff => "team:handoff",
             Scope::DiscoveryExecute => "discovery:execute",
             Scope::KnowledgeRead => "knowledge:read",
+            Scope::KnowledgeWrite => "knowledge:write",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -193,6 +199,7 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "recording" => Scope::Recording,
         "discovery:execute" => Scope::DiscoveryExecute,
         "knowledge:read" => Scope::KnowledgeRead,
+        "knowledge:write" => Scope::KnowledgeWrite,
         "admin" => Scope::Admin,
         _ => return None,
     })
@@ -233,6 +240,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" => Some(Scope::DiscoveryExecute),
         // Document knowledge base — read-only, ACL enforced by the gateway.
         "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections" => Some(Scope::KnowledgeRead),
+        // Proposing a source: always approval-gated by the gateway route.
+        "knowledge_add_source" => Some(Scope::KnowledgeWrite),
         // ── Memory: read family ──────────────────────────────────────────
         "memory_search"
         | "memory_read"

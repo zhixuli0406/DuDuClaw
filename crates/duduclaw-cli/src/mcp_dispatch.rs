@@ -4107,6 +4107,8 @@ effect = "forbid"
         "inference_mode",
         "inference_status",
         "inspect_branches",
+        // Files a proposal only; a person decides it in the dashboard.
+        "knowledge_add_source",
         // Read-only; collection permissions are enforced by the gateway.
         "knowledge_get_passage",
         "knowledge_list_collections",
@@ -4275,7 +4277,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            250,
+            251,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

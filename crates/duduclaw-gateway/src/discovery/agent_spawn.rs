@@ -914,7 +914,10 @@ impl ContainerAttemptRunner {
         } else {None};
         let mut seen=std::collections::BTreeSet::new();
         for _ in 0..MAX_ACCOUNT_SELECTIONS {
-            let Some(account)=rotator.select_for_provider_with_pool(provider,&req.account_pool).await else {break};
+            // Exclude accounts already walked, or an unusable first pick comes
+            // back every time and ends the walk (2026-10-22 rotation fix).
+            let tried:Vec<String>=seen.iter().cloned().collect();
+            let Some(account)=rotator.select_for_provider_with_pool_excluding(provider,&req.account_pool,&tried).await else {break};
             if !seen.insert(account.id.clone()) {break;}
             if !req.account_pool.is_empty() {
                 let label=rotator.status().await.into_iter().find(|a|a.id==account.id).map(|a|a.label);

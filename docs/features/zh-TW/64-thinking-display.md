@@ -1,6 +1,6 @@
 # 思考過程顯示
 
-在 dashboard 的 WebChat 送出訊息後，回覆區馬上顯示 AI 員工正在思考，計時一路跑到回覆送達。模型有回報思考摘要時，回覆送達後可以展開看遮蔽、截短過的版本。通訊軟體永遠收不到思考內容。
+在 dashboard 的 WebChat 送出訊息後，回覆區馬上顯示 AI 員工正在思考，計時一路跑到回覆送達。模型有回報思考摘要時，回覆送達後可以展開看遮蔽、截短過的版本。在通訊軟體上，綁定 dashboard 帳號的同仁看得到遮蔽後的摘要，其他人只看得到計時，見[通訊軟體的思考顯示](66-thinking-in-messaging-apps.md)。
 
 其他語言：[English](../64-thinking-display.md) · [日本語](../ja-JP/64-thinking-display.md)
 
@@ -22,7 +22,8 @@
 | 登入 dashboard 的 WebChat 使用者 | 有 | 有 | `display = "summary"` 時有 |
 | 網站聊天小工具的訪客（公開小工具金鑰） | 沒有（gateway 不送任何思考訊框） | 沒有 | 沒有 |
 | Odoo 網站 Live Chat 訪客 | 什麼都沒有 | 沒有 | 沒有 |
-| 通訊軟體（LINE、Telegram、Discord、Slack…）、ACP、內部工作階段 | 最多一行狀態「💭 已收到，正在思考（已 N 秒）。」（見[通知治理](40-notification-governance.md)） | 沒有 | 永遠沒有 |
+| 通訊軟體（LINE、Telegram、Discord、Slack…） | 思考狀態訊息或一行「💭 思考了 N 秒」，見[通訊軟體的思考顯示](66-thinking-in-messaging-apps.md) | 沒有 | 只有綁定 dashboard 帳號的發話者，預設只在一對一聊天（`[thinking] channel_audience`） |
+| ACP、內部工作階段 | 最多一行狀態「💭 已收到，正在思考（已 N 秒）。」（見[通知治理](40-notification-governance.md)） | 沒有 | 永遠沒有 |
 
 WebChat 的計時在瀏覽器裡算，所以就算關掉思考顯示，登入的使用者仍看得到計時。
 

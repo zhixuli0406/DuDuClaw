@@ -228,16 +228,22 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
     // (3 consecutive failures → cooldown) and a failing primary auto-falls back to
     // the configured fallback (defaulting to the always-available Claude core)
     // instead of the old one-shot `select().execute()` with no health memory.
-    let resp = failover(req.home_dir)
-        .execute_with_failover(
-            reg,
-            &provider,
-            fallback.as_ref(),
-            req.prompt,
-            &ctx,
-            &model_fallbacks,
+    // Set by a producer that had to estimate this call's usage.
+    let usage_estimated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resp = crate::cost_telemetry::USAGE_ESTIMATED
+        .scope(
+            usage_estimated.clone(),
+            failover(req.home_dir).execute_with_failover(
+                reg,
+                &provider,
+                fallback.as_ref(),
+                req.prompt,
+                &ctx,
+                &model_fallbacks,
+            ),
         )
         .await?;
+    let usage_estimated = usage_estimated.load(std::sync::atomic::Ordering::Relaxed);
     // OTel: record the provider that actually answered (post-failover) and
     // usage on the `chat` span (see `crate::otel`). `gen_ai.request.model`
     // stays the *requested* model per semconv; `resp.model_used` may differ
@@ -276,7 +282,8 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
             // A team round can finish and tear down its isolated home as soon
             // as this call returns. Persist role usage before that happens so
             // P2b and the per-role ledger cannot lose the measured cost.
-            record_usage(home, agent_id, request_type, model, usage, role_attribution).await;
+            record_usage(home, agent_id, request_type, model, usage, role_attribution, usage_estimated)
+                .await;
         } else {
             // A1-3 ledger: task-locals do not cross `tokio::spawn`, so carry
             // the goal-round attribution (if any) into the detached write.
@@ -284,7 +291,8 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
                 .try_with(Clone::clone)
                 .ok();
             tokio::spawn(async move {
-                let write = record_usage(home, agent_id, request_type, model, usage, None);
+                let write =
+                    record_usage(home, agent_id, request_type, model, usage, None, usage_estimated);
                 match goal_round {
                     Some(g) => crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(g, write).await,
                     None => write.await,
@@ -304,6 +312,7 @@ async fn record_usage(
     model: String,
     usage: TokenUsage,
     role_attribution: Option<crate::runtime::RoleCostAttribution>,
+    usage_estimated: bool,
 ) {
     let telemetry = match crate::cost_telemetry::get_telemetry() {
         Some(t) => t,
@@ -315,7 +324,14 @@ async fn record_usage(
             }
         }
     };
-    if let Some(a) = role_attribution {
+    if usage_estimated {
+        let role = role_attribution
+            .as_ref()
+            .map(|a| (a.role, a.episode_id.as_str()));
+        telemetry
+            .record_estimated(&agent_id, request_type, &model, &usage, role)
+            .await;
+    } else if let Some(a) = role_attribution {
         telemetry
             .record_team_role(
                 &agent_id,
@@ -594,7 +610,7 @@ pub(crate) async fn record_claude_utility_result(
     let role = crate::runtime::ROLE_COST_ATTRIBUTION.try_with(Clone::clone).ok();
     for (model, usage) in measured {
         record_usage(home_dir.to_path_buf(), agent_id.clone(), RequestType::Evolution,
-            model, usage, role.clone()).await;
+            model, usage, role.clone(), false).await;
     }
     true
 }

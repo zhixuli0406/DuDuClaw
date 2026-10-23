@@ -122,6 +122,8 @@ async fn run_loop(home: PathBuf, extractor: ExtractorCmd) {
             if cfg.enabled {
                 super::embedding::schedule_all(&home).await;
             }
+            // Waiting files of expired / decided add-source cards.
+            super::add_source_guard::sweep_unreferenced(&home).await;
             last_housekeeping = Some(Instant::now());
         }
         super::embedding::unload_idle(

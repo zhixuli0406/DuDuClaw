@@ -603,7 +603,7 @@ impl CompatSse {
             .and_then(Value::as_array)
             .unwrap_or(&Vec::new())
         {
-            let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = self.tool_call_index(tc);
             while self.tool_calls.len() <= index {
                 self.tool_calls
                     .push((String::new(), String::new(), String::new()));
@@ -631,6 +631,37 @@ impl CompatSse {
                     });
                 }
             }
+        }
+    }
+}
+
+impl CompatSse {
+    /// Which accumulated tool call a streamed `tool_calls[]` entry belongs to.
+    /// The OpenAI shape carries `index`; some compatible servers omit it, and
+    /// defaulting to 0 merged parallel calls into one with concatenated
+    /// arguments. Without `index`: an `id` already seen continues that call,
+    /// a new `id` (or a function `name` with no `id`) starts a new call, and a
+    /// bare argument fragment continues the latest call.
+    fn tool_call_index(&self, tc: &Value) -> usize {
+        if let Some(i) = tc.get("index").and_then(Value::as_u64) {
+            return i as usize;
+        }
+        let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+        if let Some(id) = id {
+            return self
+                .tool_calls
+                .iter()
+                .position(|(seen, _, _)| seen == id)
+                .unwrap_or(self.tool_calls.len());
+        }
+        let starts_call = tc
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| !n.is_empty());
+        if starts_call || self.tool_calls.is_empty() {
+            self.tool_calls.len()
+        } else {
+            self.tool_calls.len() - 1
         }
     }
 }
@@ -1030,6 +1061,42 @@ mod tests {
         assert_eq!(resp.usage.output_tokens, 3);
         assert_eq!(resp.model_used, "deepseek-v3.2");
         assert!(matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "think"));
+    }
+
+    #[test]
+    fn sse_parallel_tool_calls_without_index_stay_separate() {
+        let mut p = CompatSse::new("gemini");
+        let mut out = Vec::new();
+        for line in [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"a1","function":{"name":"weather","arguments":"{\"city\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"a1","function":{"arguments":"\"Taipei\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"b2","function":{"name":"time","arguments":"{}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"news","arguments":"{\"q\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"x\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            p.on_line(line, &mut out);
+        }
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
+        let calls: Vec<(String, serde_json::Value)> = resp
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall { name, args, .. } => Some((name.clone(), args.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("weather".to_string(), serde_json::json!({"city": "Taipei"})),
+                ("time".to_string(), serde_json::json!({})),
+                ("news".to_string(), serde_json::json!({"q": "x"})),
+            ]
+        );
     }
 
     #[test]

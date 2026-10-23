@@ -76,6 +76,25 @@ pub async fn request_for_plan(
     summary: &str,
     counts: serde_json::Value,
 ) -> Result<ApprovalId, String> {
+    request_for_plan_from(home, plan, summary, counts, None).await
+}
+
+/// Who filed a forget request, when it was not the local command line.
+pub const ORIGIN_KNOWLEDGE_DELETE: &str = "knowledge_source_delete";
+
+/// Fixed text on a forget card filed while deleting a knowledge source in
+/// the dashboard.
+pub const KNOWLEDGE_ORIGIN_NOTICE: &str = "這筆請求在儀表板刪除知識庫文件時，由操作者勾選「一併忘記」建立。\
+    範圍較粗：會忘記引用過這份文件的那幾輪對話所學到的全部記憶，不只是文件內容。";
+
+/// [`request_for_plan`] with the filing origin recorded on the card.
+pub async fn request_for_plan_from(
+    home: &Path,
+    plan: &ForgetPlan,
+    summary: &str,
+    counts: serde_json::Value,
+    origin: Option<&str>,
+) -> Result<ApprovalId, String> {
     let broker = ApprovalBroker::open(home)?;
     let ttl = chrono::DateTime::parse_from_rfc3339(&plan.document.expires_at)
         .map(|t| (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds())
@@ -87,6 +106,7 @@ pub async fn request_for_plan(
         "agent_id": plan.document.agent_id,
         "plan_expires_at": plan.document.expires_at,
         "counts": counts,
+        "origin": origin,
     });
     let bind = binding(plan);
     let filing = Filing {
@@ -139,7 +159,7 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
          命名空間：{agent}\n\
          建立時間：{created}\n\
          影響：記憶 {mem} 筆、對話訊息 {msg} 則、知識頁 {wiki} 頁\n\
-         {ORIGIN_NOTICE}\n\
+         {origin_notice}\n\
          這類請求只能由管理員在儀表板的待辦清單核准。\n\
          期限：{deadline}未核准將自動拒絕\n\
          編號：{id}",
@@ -149,6 +169,13 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
         msg = n("session_messages"),
         wiki = n("wiki_pages"),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
+        origin_notice = if rec.payload.get("origin").and_then(|v| v.as_str())
+            == Some(ORIGIN_KNOWLEDGE_DELETE)
+        {
+            KNOWLEDGE_ORIGIN_NOTICE
+        } else {
+            ORIGIN_NOTICE
+        },
     )
 }
 

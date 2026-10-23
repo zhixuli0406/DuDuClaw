@@ -10,15 +10,16 @@ impl MethodHandler {
             "",
             about_payload(
                 &tier.to_string(),
-                crate::distributor_notice::distributor_notice(),
+                crate::distributor_notice::effective_notice(),
             ),
         )
     }
 }
 
 /// `about.get` body. The vendor block and product name are fixed; the only
-/// optional part is `distributor_notice`, the sanitized HTML compiled into a
-/// distributor build. The key is omitted entirely when no notice is compiled in.
+/// optional part is `distributor_notice`, the sanitized HTML from the
+/// distributor (signed runtime copy, else compiled into a distributor build).
+/// The key is omitted entirely when there is none.
 pub(crate) fn about_payload(tier: &str, distributor_notice: Option<String>) -> Value {
     let mut payload = json!({
         "product_name": "DuDuClaw",

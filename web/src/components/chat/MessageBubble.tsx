@@ -1,8 +1,10 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
+import { CitedText, CitationSourceList } from './CitationChips';
+import { PassageDrawer } from '@/components/knowledge/PassageDrawer';
 
 /** A single chat turn rendered as a left/right-aligned bubble (Multica plain
  *  style, spec §5.6): the user's turn sits right on `bg-secondary`, the
@@ -22,6 +24,9 @@ export function MessageBubble({
 }) {
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
+  const citations = !isUser && !isSystem ? message.citations : undefined;
+  const hasCitations = !!citations && citations.length > 0;
+  const [openChunk, setOpenChunk] = useState<number | null>(null);
 
   return (
     <div className={cn('flex w-full items-end gap-2', isUser ? 'justify-end' : 'justify-start')}>
@@ -47,13 +52,32 @@ export function MessageBubble({
         {message.content && (
           <div className={cn('whitespace-pre-wrap break-words', isSystem && 'flex items-start gap-1.5')}>
             {isSystem && <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />}
-            <span>{message.content}</span>
+            <span>
+              {hasCitations ? (
+                <CitedText
+                  text={message.content}
+                  citations={citations}
+                  onOpen={(chunkId) => setOpenChunk(chunkId)}
+                />
+              ) : (
+                message.content
+              )}
+            </span>
           </div>
+        )}
+        {hasCitations && (
+          <CitationSourceList
+            citations={citations}
+            onOpen={(chunkId) => setOpenChunk(chunkId)}
+          />
         )}
         {message.tokens != null && message.tokens > 0 && (
           <div className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">{message.tokens} tokens</div>
         )}
       </div>
+      {/* The document library's passage drawer: permissions are re-checked
+          by the gateway on every open; the sheet returns focus on close. */}
+      {hasCitations && <PassageDrawer chunkId={openChunk} onClose={() => setOpenChunk(null)} />}
     </div>
   );
 }

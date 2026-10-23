@@ -332,6 +332,11 @@ impl LicenseRuntime {
         }
 
         let last_seen_crl_at = read_last_seen_crl(&home_dir);
+        crate::distributor_notice::runtime::load_cached(
+            &home_dir,
+            &registry,
+            license.as_ref().map(|l| l.subscription_id.as_str()),
+        );
 
         Self {
             state: Arc::new(RwLock::new(LicenseRuntimeInner {
@@ -351,7 +356,30 @@ impl LicenseRuntime {
     pub fn spawn_background_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let phone_home = tokio::spawn(phone_home_loop(self.clone()));
         let crl_poll = tokio::spawn(crl_loop(self.clone()));
-        vec![phone_home, crl_poll]
+        let notice_poll = tokio::spawn(crate::distributor_notice::runtime::poll_loop(self.clone()));
+        vec![phone_home, crl_poll, notice_poll]
+    }
+
+    /// `(subscription_id, machine_fingerprint)` of the installed license, for
+    /// the distributor-notice fetch.
+    pub(crate) async fn notice_identity(&self) -> Option<(String, String)> {
+        let inner = self.state.read().await;
+        inner
+            .license
+            .as_ref()
+            .map(|l| (l.subscription_id.clone(), l.machine_fingerprint.clone()))
+    }
+
+    pub(crate) fn control_url(&self) -> &str {
+        &self.control_url
+    }
+
+    pub(crate) fn home_dir(&self) -> &Path {
+        &self.home_dir
+    }
+
+    pub(crate) fn registry(&self) -> &PublicKeyRegistry {
+        &self.registry
     }
 
     /// Currently-active tier. Always returns `OpenSource` when no license
@@ -492,6 +520,9 @@ impl LicenseRuntime {
 
         let validated = load_and_validate(&self.registry, &self.gate).await;
         let ok = validated.is_some();
+        // A notice cached for the previous license no longer applies; the
+        // next fetch brings the new subscription's.
+        crate::distributor_notice::runtime::reset(&self.home_dir);
         {
             let mut inner = self.state.write().await;
             inner.license = validated;
@@ -502,6 +533,7 @@ impl LicenseRuntime {
                     .to_string(),
             );
         }
+        crate::distributor_notice::runtime::spawn_fetch_now(self.clone());
         Ok(self.snapshot().await)
     }
 }
@@ -929,8 +961,11 @@ async fn phone_home_loop(runtime: LicenseRuntime) {
         tokio::time::sleep(next_sleep).await;
 
         if let Err(e) = runtime.do_phone_home_once().await {
-            // Any error here is non-fatal — we re-evaluate next cycle.
-            debug!(error = %e, "phone-home attempt failed; will retry next cycle");
+            // Non-fatal, re-evaluated next cycle, but logged at warn: a
+            // refresh that keeps failing ends in the offline grace period
+            // (until 2026-10-22 every refresh failed the nonce check at
+            // debug level and nobody saw it).
+            warn!(error = %e, "phone-home attempt failed; will retry next cycle");
         }
     }
 }
@@ -1077,6 +1112,7 @@ impl LicenseRuntime {
     async fn downgrade_to_opensource(&self, reason: &str) {
         let mut inner = self.state.write().await;
         inner.license = None;
+        crate::distributor_notice::runtime::reset(&self.home_dir);
         // Best-effort: remove the local file so subsequent restarts don't
         // reload a known-bad license.
         if let Err(e) = storage::delete_default() {

@@ -72,6 +72,15 @@ describe('AgentDetailPage', () => {
     expect(screen.getByRole('tab', { name: 'Records' })).toBeInTheDocument();
   });
 
+  it('has a profile files tab that opens the files view', async () => {
+    renderAt('my-bot');
+    const tab = await screen.findByRole('tab', { name: en['agentDetail.tab.files'] });
+    await userEvent.click(tab);
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('agent_files.list', { agent_id: 'my-bot' }),
+    );
+  });
+
   it('adds the computer tab only for an employee with computer use', async () => {
     const { unmount } = renderAt('my-bot');
     await screen.findByRole('heading', { name: 'My Bot' });

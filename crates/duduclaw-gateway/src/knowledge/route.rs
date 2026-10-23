@@ -11,6 +11,13 @@
 //! | `search` | `query`, `collections?` (slugs, narrowing only), `limit?` (≤ 20) | `hits`, `mode`, `vector_unavailable`, `scan_capped` |
 //! | `get_passage` | `chunk_id`, `context?` (0–2) | passage with `before` / `match` / `after` |
 //! | `list_collections` | — | the turn's effective collections with counts |
+//! | `add_source` | `collection` (slug), one of `path` / `url` / `text`, `title?` | an approval card id (never ingests directly) |
+//!
+//! Every body may carry `run_id` (the caller's `DUDUCLAW_DISPATCH_RUN_ID`):
+//! a cron or dispatched run registered by the gateway is a system turn.
+//! Search results inside a live channel turn are numbered in that turn's
+//! citation ledger ([`super::ledger`]), shared with the passages injected
+//! into the prompt.
 //!
 //! The tools exist for an employee only while its own side (grants to it or
 //! its department, narrowed by `[knowledge] collections`) is non-empty —
@@ -69,7 +76,7 @@ impl KnowledgeRouteState {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
-enum Request {
+pub(crate) enum Request {
     Search {
         query: String,
         #[serde(default)]
@@ -78,6 +85,8 @@ enum Request {
         limit: Option<u32>,
         #[serde(default)]
         turn_id: Option<String>,
+        #[serde(default)]
+        run_id: Option<String>,
     },
     GetPassage {
         chunk_id: i64,
@@ -85,19 +94,48 @@ enum Request {
         context: Option<u32>,
         #[serde(default)]
         turn_id: Option<String>,
+        #[serde(default)]
+        run_id: Option<String>,
     },
     ListCollections {
         #[serde(default)]
         turn_id: Option<String>,
+        #[serde(default)]
+        run_id: Option<String>,
+    },
+    AddSource {
+        collection: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        turn_id: Option<String>,
+        #[serde(default)]
+        run_id: Option<String>,
     },
 }
 
 impl Request {
-    fn turn_id(&self) -> Option<&str> {
+    pub(crate) fn turn_id(&self) -> Option<&str> {
         match self {
             Request::Search { turn_id, .. }
             | Request::GetPassage { turn_id, .. }
-            | Request::ListCollections { turn_id } => turn_id.as_deref(),
+            | Request::ListCollections { turn_id, .. }
+            | Request::AddSource { turn_id, .. } => turn_id.as_deref(),
+        }
+    }
+
+    pub(crate) fn run_id(&self) -> Option<&str> {
+        match self {
+            Request::Search { run_id, .. }
+            | Request::GetPassage { run_id, .. }
+            | Request::ListCollections { run_id, .. }
+            | Request::AddSource { run_id, .. } => run_id.as_deref(),
         }
     }
 }
@@ -180,7 +218,17 @@ async fn handle(
             "文件知識庫已由管理員關閉。",
         );
     }
-    let requester = super::turn_requesters::resolve(&caller.agent_id, request.turn_id());
+    if let Request::AddSource { .. } = &request {
+        return match super::route_add::serve_add_source(&state.home, &caller.agent_id, request).await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(Refusal(status, code, msg)) => refuse(status, code, &msg),
+        };
+    }
+    let requester = super::turn_requesters::resolve_with_run(
+        &caller.agent_id,
+        request.turn_id(),
+        request.run_id(),
+    );
     let st = state.clone();
     let agent = caller.agent_id.clone();
     let embedder = match &request {
@@ -201,7 +249,7 @@ async fn handle(
 }
 
 #[derive(Debug)]
-struct Refusal(StatusCode, &'static str, String);
+pub(crate) struct Refusal(pub StatusCode, pub &'static str, pub String);
 
 impl From<KbError> for Refusal {
     fn from(e: KbError) -> Self {
@@ -224,7 +272,7 @@ impl From<KbError> for Refusal {
     }
 }
 
-fn agent_dir(home: &std::path::Path, agent: &str) -> PathBuf {
+pub(crate) fn agent_dir(home: &std::path::Path, agent: &str) -> PathBuf {
     crate::ephemeral::resolve_agent_dir(home, agent)
         .unwrap_or_else(|| home.join("agents").join(agent))
 }
@@ -308,7 +356,7 @@ fn serve_with(
         embedder: embedder.unwrap_or_else(|| std::sync::Arc::new(duduclaw_knowledge::embed::NoEmbedder)),
         cache: super::embedding::cache(&st.home),
     };
-    let result = run_op(&conn, &allowed, &request, &mut entry, &vectors);
+    let result = run_op(&conn, &allowed, &request, &mut entry, &vectors, agent);
     if result.is_err() && entry.outcome == "ok" {
         entry.outcome = "denied".into();
     }
@@ -330,6 +378,7 @@ fn run_op(
     request: &Request,
     entry: &mut AccessEntry,
     vectors: &Vectors,
+    agent: &str,
 ) -> Result<Value, Refusal> {
     match request {
         Request::Search { query, limit, .. } => {
@@ -356,20 +405,44 @@ fn run_op(
                 super::embedding::warn_keyword_only(reason);
             }
             entry.mode = Some(r.mode.as_str().to_string());
+            // Inside a live channel turn, number hits in the turn's ledger
+            // (shared with the injected passages); else list order.
+            let numbers = request
+                .turn_id()
+                .map(|t| super::ledger::number(agent, t, &r.hits, &query))
+                .unwrap_or_else(|| vec![None; r.hits.len()]);
+            let numbered: Vec<u32> = numbers
+                .iter()
+                .enumerate()
+                .map(|(i, n)| n.unwrap_or(i as u32 + 1))
+                .collect();
             entry.results = r
                 .hits
                 .iter()
+                .zip(&numbered)
                 .enumerate()
-                .map(|(i, h)| json!({"chunk_id": h.chunk_id, "source_id": h.source_id, "n": i + 1, "rank": i + 1}))
+                .map(|(i, (h, n))| json!({"chunk_id": h.chunk_id, "source_id": h.source_id, "n": n, "rank": i + 1}))
                 .collect();
             if r.hits.is_empty() {
                 entry.outcome = "no_match".into();
             }
             let collections = collection_names(conn, allowed)?;
+            let hits: Vec<Value> = r
+                .hits
+                .iter()
+                .zip(&numbered)
+                .map(|(h, n)| {
+                    let mut v = serde_json::to_value(h).unwrap_or(Value::Null);
+                    if let Some(m) = v.as_object_mut() {
+                        m.insert("n".into(), json!(n));
+                    }
+                    v
+                })
+                .collect();
             Ok(json!({
                 "ok": true,
                 "no_collections": allowed.is_empty(),
-                "hits": r.hits,
+                "hits": hits,
                 "mode": r.mode,
                 "vector_unavailable": r.vector_unavailable,
                 "coverage": r.coverage,
@@ -440,6 +513,11 @@ fn run_op(
                 "vector_unavailable": reason,
             }))
         }
+        Request::AddSource { .. } => Err(Refusal(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "知識庫請求格式不正確。".into(),
+        )),
     }
 }
 

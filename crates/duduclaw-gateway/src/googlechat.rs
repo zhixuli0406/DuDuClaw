@@ -537,14 +537,33 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     // become the CCR principal — every unidentified sender would hash to one
     // shared retrieval scope. `reply_principal_for_sender` yields "" there,
     // which turns CCR off for the turn (fail-closed).
-    let guarded = build_guarded_reply_with_session(
-        &input_text,
-        &state.ctx,
-        &session_id,
-        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
-        Some(on_progress),
-    )
-    .await;
+    // Google Chat already shows a "思考中…" placeholder that the answer
+    // replaces, so thinking display adds one line to the answer instead of a
+    // second status message.
+    let is_dm = message
+        .pointer("/space/type")
+        .or_else(|| event.pointer("/space/type"))
+        .and_then(|v| v.as_str())
+        == Some("DM");
+    // Thinking display: this platform cannot edit messages, so the answer
+    // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "googlechat",
+        !is_dm,
+        crate::trigger_route::texts::lang_for(&state.ctx.home_dir),
+        None,
+    );
+    let on_progress = thinking.wrap(on_progress);
+    let guarded = thinking
+        .scope(build_guarded_reply_with_session(
+            &input_text,
+            &state.ctx,
+            &session_id,
+            crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+            Some(on_progress),
+        ))
+        .await;
+    let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
         deliver_reply(
             &state.creds,
@@ -584,6 +603,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         }
         return;
     }
+    let reply = crate::thinking::channel_presenter::with_footer(reply, thinking_footer.as_ref());
 
     deliver_reply(
         &state.creds,

@@ -17,6 +17,17 @@
 
 use crate::acl::{AgentCtx, AgentNarrowing, HumanCtx, HumanMode};
 
+/// Channels whose senders are public visitors (website widget, website Live
+/// Chat). They are never mapped to an account, never treated as 1:1, and
+/// read only `public` collections even when an internal one is granted to
+/// their channel (owner decision on PR #181).
+pub const PUBLIC_VISITOR_CHANNELS: &[&str] = &["widget", "odoolivechat"];
+
+/// Whether `channel` is a public-visitor channel (exact match).
+pub fn is_public_visitor_channel(channel: &str) -> bool {
+    PUBLIC_VISITOR_CHANNELS.contains(&channel)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequesterIdentity {
     /// A signed-in dashboard user (dashboard pages, WebChat).
@@ -122,8 +133,13 @@ pub fn human_ctx(req: &RequesterIdentity, dir: &dyn UserDirectory) -> HumanCtx {
             user_id,
         } => {
             let session = format!("{channel}:{chat}");
-            let private = duduclaw_core::sensitivity::is_private_session(&session, sender);
-            let user = user_id.as_deref().and_then(|u| lookup(dir, u));
+            let visitor = is_public_visitor_channel(channel);
+            let private =
+                !visitor && duduclaw_core::sensitivity::is_private_session(&session, sender);
+            let user = user_id
+                .as_deref()
+                .filter(|_| !visitor)
+                .and_then(|u| lookup(dir, u));
             HumanCtx {
                 mode: if user.is_some() {
                     HumanMode::Full
@@ -136,6 +152,7 @@ pub fn human_ctx(req: &RequesterIdentity, dir: &dyn UserDirectory) -> HumanCtx {
                 channel_chat: Some(session),
                 is_admin: user.as_ref().is_some_and(|u| u.is_admin),
                 is_private: private,
+                public_only: visitor,
             }
         }
         RequesterIdentity::System {

@@ -12,6 +12,12 @@
 //! | `search` / `passage.get` | viewer (human side only, no employee side) |
 //! | `access_log.list` | owner |
 //! | `embedding.*` | see `embedding_rpc` (status: signed in; changes: Admin) |
+//! | `citations.for_session` | conversation owner (Admin: any), see [`super::rpc_channels`] |
+//! | `proposals.list` / `proposals.decide` | Admin or the card collection's editor / owner (fresh identity) |
+//!
+//! `sources.delete` with `also_forget_memories: true` also files forget
+//! requests for the conversations that cited the source
+//! ([`super::forget`]); an Admin decides those in the dashboard.
 //!
 //! Admin counts as owner of every collection. A missing collection and one
 //! the caller may not see give the same "permission denied".
@@ -123,6 +129,36 @@ pub async fn handle(
     if call.method == "knowledge.sources.add" {
         return Some(add_source(call).await.map_err(|e| message(&e)));
     }
+    if matches!(
+        call.method.as_str(),
+        "knowledge.proposals.list" | "knowledge.proposals.decide"
+    ) {
+        // Who may decide is re-read from the user database now, never
+        // taken from the session's cached role.
+        let Ok(fresh) = crate::review_evidence::audience::fresh_dashboard_context(home, ctx) else {
+            return Some(Err("permission denied".to_string()));
+        };
+        let user = dashboard_user(&fresh, users.as_ref());
+        return Some(if call.method == "knowledge.proposals.list" {
+            super::rpc_channels::proposals_list(home, user)
+                .await
+                .map_err(|e| message(&e))
+        } else {
+            super::rpc_channels::proposals_decide(home, params, user).await
+        });
+    }
+    if call.method == "knowledge.citations.for_session" {
+        return Some(
+            super::rpc_channels::citations_for_session(home, params, call.user)
+                .await
+                .map_err(|e| message(&e)),
+        );
+    }
+    let forget = call.method == "knowledge.sources.delete"
+        && call.params.get("also_forget_memories").and_then(Value::as_bool) == Some(true);
+    if forget {
+        return Some(delete_and_forget(call).await.map_err(|e| message(&e)));
+    }
     let wake = matches!(call.method.as_str(), "knowledge.sources.reindex");
     let embedder = if call.method == "knowledge.search" {
         Some(super::embedding::resolve(home).await)
@@ -196,12 +232,19 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         "knowledge.collections.delete" => {
             let id = req(p, "id")?.to_string();
             role_on(&conn, &id, u, Role::Owner)?;
+            let source_ids: Vec<String> = duduclaw_knowledge::sources::list_sources(&conn, &id)?
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
             let orphans = store::delete_collection(
                 &mut conn,
                 &id,
                 p.get("confirm_name").and_then(Value::as_str).unwrap_or(""),
             )?;
             remove_blobs(&call.home, &mut conn, &orphans);
+            for sid in &source_ids {
+                duduclaw_knowledge::citations::scrub_source(&conn, sid)?;
+            }
             log_access(&conn, &access("collection_change", u, Some(&id)))?;
             audit_admin(
                 &call.home,
@@ -234,6 +277,8 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
             if let Some(sha) = duduclaw_knowledge::sources::delete_source(&mut conn, &src.id)? {
                 remove_blobs(&call.home, &mut conn, &[sha]);
             }
+            // No document text stays behind in stored citations.
+            duduclaw_knowledge::citations::scrub_source(&conn, &src.id)?;
             let mut entry = access("delete_source", u, Some(&src.collection_id));
             entry.results = vec![json!({"source_id": src.id})];
             log_access(&conn, &entry)?;
@@ -408,6 +453,23 @@ fn passage(conn: &Connection, call: &Call) -> KbResult<Value> {
     }
     log_access(conn, &entry)?;
     Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+}
+
+/// Delete a source, then file forget requests for the conversations that
+/// cited it. The deletion runs exactly as without the flag; forget plans are
+/// filed only after it succeeded (the `turn_citations` rows they read keep
+/// their ids after the source is gone).
+async fn delete_and_forget(call: Call) -> KbResult<Value> {
+    let source_id = req(&call.params, "source_id")?.to_string();
+    let title =
+        super::rpc_channels::editable_source_title(&call.home, &source_id, &call.user).await?;
+    let (home, actor) = (call.home.clone(), call.user.user_id.clone());
+    let mut deleted = blocking(move || dispatch(call, None)).await?;
+    let summary = super::forget::plan_for_source(&home, &source_id, &title, &actor).await;
+    if let Some(m) = deleted.as_object_mut() {
+        m.insert("forget".into(), serde_json::to_value(&summary).unwrap_or(Value::Null));
+    }
+    Ok(deleted)
 }
 
 /// Paste and URL sources (files come through the upload route).

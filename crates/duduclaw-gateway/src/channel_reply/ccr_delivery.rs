@@ -174,6 +174,9 @@ pub struct GuardedReply {
     /// The employee that answered (absent when the turn never resolved one,
     /// e.g. a refused delivery).
     pub answered_by: Option<crate::trigger_route::AnsweredBy>,
+    /// Knowledge-base sources the reply cites (WebChat shows them; messaging
+    /// apps already carry them as a text footer).
+    pub citations: Vec<duduclaw_knowledge::cite::CitationRef>,
     pub(super) guards: Vec<duduclaw_llm::CcrDeliveryGuards>,
     /// True when the lease was already lost when this value was built, so the
     /// turn's persisted side effects must be rolled back.
@@ -196,6 +199,7 @@ impl GuardedReply {
             text,
             artifact,
             answered_by: None,
+            citations: Vec::new(),
             guards,
             refused: false,
             rollback,
@@ -216,11 +220,18 @@ impl GuardedReply {
         self
     }
 
+    /// Attach the cited knowledge sources.
+    pub(super) fn with_citations(mut self, cited: Vec<duduclaw_knowledge::cite::CitationRef>) -> Self {
+        self.citations = cited;
+        self
+    }
+
     pub(super) fn refused() -> Self {
         Self {
             text: CCR_DELIVERY_REFUSED_TEXT.to_string(),
             artifact: None,
             answered_by: None,
+            citations: Vec::new(),
             guards: Vec::new(),
             refused: true,
             rollback: None,

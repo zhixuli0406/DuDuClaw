@@ -556,3 +556,56 @@ fn agent_side_alone_decides_whether_the_tools_exist() {
         .is_empty()
     );
 }
+
+#[test]
+fn public_visitors_read_only_public_collections() {
+    let mut conn = crate::schema::open_in_memory().unwrap();
+    let cfg = crate::limits::KnowledgeConfig::default();
+    let mk = |conn: &mut rusqlite::Connection, slug: &str, sens: &str| {
+        let c = crate::store::create_collection(
+            conn,
+            &crate::store::NewCollection {
+                name: slug.into(),
+                slug: Some(slug.into()),
+                sensitivity: Some(sens.into()),
+                ..Default::default()
+            },
+            "owner",
+            &cfg,
+        )
+        .unwrap();
+        let (_, rev) = crate::acl::get_acl(conn, &c.id).unwrap();
+        crate::acl::set_acl(
+            conn,
+            &c.id,
+            &[
+                (PrincipalKind::User, "owner".to_string(), Role::Owner),
+                (PrincipalKind::Channel, "widget".to_string(), Role::Viewer),
+                (PrincipalKind::Channel, "odoolivechat".to_string(), Role::Viewer),
+            ],
+            rev,
+            "owner",
+        )
+        .unwrap();
+        c.id
+    };
+    let public = mk(&mut conn, "faq", "public");
+    mk(&mut conn, "internal-faq", "internal");
+    for channel in ["widget", "odoolivechat"] {
+        let visitor = human_ctx(
+            &RequesterIdentity::ChannelUser {
+                channel: channel.into(),
+                chat: "v1".into(),
+                sender: "v1".into(),
+                // A forged user id on a visitor channel is ignored.
+                user_id: Some("owner".into()),
+            },
+            &users(&[("owner", None, true)]),
+        );
+        assert!(visitor.public_only && !visitor.is_private && visitor.user_id.is_none());
+        let allowed = effective_collections(&conn, &visitor, None, &Narrowing::default()).unwrap();
+        assert_eq!(allowed.ids(), std::slice::from_ref(&public), "{channel}");
+    }
+    // An ordinary unbound LINE sender with the same grants is not limited to public.
+    assert!(!unbound("line", "Uxyz").public_only);
+}

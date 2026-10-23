@@ -6,6 +6,7 @@ import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
 import { effectiveName } from '@/lib/product-identity';
 import type { ChatArtifact } from '@/components/console/artifact-types';
 import { mentionErrorText } from '@/lib/mention';
+import { attachHistoryCitations, parseChatCitations, type ChatCitation, type SessionCitationRow } from '@/lib/knowledge-citations';
 import {
   applyThinking,
   finishTurnThinking,
@@ -49,6 +50,10 @@ export interface ChatMessage {
    * marker tag or a silently-missing card.
    */
   readonly artifact?: ChatArtifact;
+  /** Knowledge-base sources cited by `[n]` markers in this reply (validated). */
+  readonly citations?: readonly ChatCitation[];
+  /** Stored row id from `chat.sessions.history` (resumed messages only). */
+  readonly historyId?: number;
   /** The AI staff member that answered (from `assistant_done.agent`). Differs
    *  from the selected partner when the message called someone else by `@`. */
   readonly agentId?: string;
@@ -254,6 +259,9 @@ interface ChatStore {
    * matches it).
    */
   resumeSession: (sessionId: string, messages: readonly ChatMessage[]) => void;
+  /** Attach knowledge citations (by stored row id) to the resumed session's
+   *  assistant messages. No-op when the active session changed meanwhile. */
+  applyHistoryCitations: (sessionId: string, rows: readonly SessionCitationRow[]) => void;
   setRecording: (v: boolean) => void;
   setTranscribing: (v: boolean) => void;
   setTtsEnabled: (v: boolean) => void;
@@ -325,6 +333,8 @@ export interface HistoryMessageWire {
    * `ChatMessage` state.
    */
   readonly artifact?: unknown;
+  /** Stored message row id (optional; newer gateways). */
+  readonly id?: number;
 }
 
 /**
@@ -347,6 +357,7 @@ export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessa
       timestamp: Number.isFinite(ts) ? ts : Date.now(),
       ...(typeof m.tokens === 'number' ? { tokens: m.tokens } : {}),
       ...(artifact ? { artifact } : {}),
+      ...(typeof m.id === 'number' && Number.isFinite(m.id) ? { historyId: m.id } : {}),
     };
   });
 }
@@ -574,6 +585,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             // `undefined` for the overwhelming majority of replies (anything
             // that never went through O-4's pending-op path on the backend).
             const artifact = parseChatArtifact(data.artifact);
+            const citations = parseChatCitations(data.citations);
             const answeredBy = {
               ...(typeof data.agent === 'string' && data.agent ? { agentId: data.agent } : {}),
               ...(typeof data.agent_name === 'string' && data.agent_name ? { agentName: data.agent_name } : {}),
@@ -593,6 +605,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   content: data.content,
                   tokens: data.tokens_used,
                   ...(artifact ? { artifact } : {}),
+                  ...(citations ? { citations } : {}),
                   ...answeredBy,
                   ...thinking,
                 };
@@ -604,6 +617,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   timestamp: Date.now(),
                   tokens: data.tokens_used,
                   ...(artifact ? { artifact } : {}),
+                  ...(citations ? { citations } : {}),
                   ...answeredBy,
                   ...thinking,
                 });
@@ -748,6 +762,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
         sessionId: state.ownSessionId,
         resumedExplicitly: false,
       }));
+    },
+
+    applyHistoryCitations: (sessionId, rows) => {
+      set((state) =>
+        state.sessionId === sessionId
+          ? { messages: attachHistoryCitations(state.messages, rows) }
+          : {},
+      );
     },
 
     resumeSession: (sessionId: string, messages: readonly ChatMessage[]) => {

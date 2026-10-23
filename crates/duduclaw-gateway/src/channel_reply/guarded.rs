@@ -49,6 +49,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     Option<Vec<duduclaw_llm::CcrDeliveryGuards>>,
     Arc<CcrTurnDelivery>,
     Option<crate::trigger_route::AnsweredBy>,
+    Vec<duduclaw_knowledge::cite::CitationRef>,
 ) {
     // P10: one model-free status line if this turn stays silent too long
     // (off by default; external channel sessions only).
@@ -66,7 +67,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // so the watcher sees `Thinking` events (and can say "thinking"). No
     // sink at all for public visitors.
     let (on_progress, thinking_sink) =
-        arm_thinking(ctx, agent_override, session_id, on_progress).await;
+        arm_thinking(ctx, agent_override, session_id, user_id, on_progress).await;
     let collector: std::sync::Arc<std::sync::Mutex<Vec<crate::runtime::NativeToolEvent>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let ccr_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -77,6 +78,16 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     let delivery = Arc::new(CcrTurnDelivery::default());
     let answered: Arc<std::sync::Mutex<Option<crate::trigger_route::AnsweredBy>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // Document knowledge base: attachments the adapter saved for this
+    // message belong to this conversation and sender (first claim wins);
+    // the person this turn is for (resolved once, before any runtime call)
+    // and the sources the reply cites.
+    crate::knowledge::chat_attachments::claim_in_text(session_id, user_id, text);
+    let requester =
+        crate::knowledge::requester_map::requester_for_reply(&ctx.home_dir, session_id, user_id)
+            .await;
+    let cited: Arc<std::sync::Mutex<Vec<duduclaw_knowledge::cite::CitationRef>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     // Keep the authenticated channel caller and exact conversation in scope
     // for the whole turn. CCR history validation runs before the native tool
     // loop, and handle persistence runs after it; scoping only `cli_future`
@@ -98,13 +109,19 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                             answered.clone(),
                             crate::thinking::scope_turn(
                                 thinking_sink.clone(),
-                                build_reply_with_session_inner(
-                                    text,
-                                    ctx,
-                                    agent_override,
-                                    session_id,
-                                    user_id,
-                                    on_progress,
+                                crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(
+                                    requester,
+                                    crate::knowledge::cite_turn::TURN_CITATIONS.scope(
+                                        cited.clone(),
+                                        build_reply_with_session_inner(
+                                            text,
+                                            ctx,
+                                            agent_override,
+                                            session_id,
+                                            user_id,
+                                            on_progress,
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
@@ -127,7 +144,11 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         .map(|mut held| std::mem::take(&mut *held));
     let answered_by = answered.lock().ok().and_then(|mut a| a.take());
     finish_thinking(thinking_sink.as_deref(), ctx, agent_override, session_id, &answered_by).await;
-    (raw, operator_result_artifact, guards, delivery, answered_by)
+    let cited = cited
+        .lock()
+        .map(|mut c| std::mem::take(&mut *c))
+        .unwrap_or_default();
+    (raw, operator_result_artifact, guards, delivery, answered_by, cited)
 }
 
 /// Build this turn's thinking sink (see `crate::thinking`). The agent is only
@@ -137,6 +158,7 @@ async fn arm_thinking(
     ctx: &ReplyContext,
     agent_override: Option<&str>,
     session_id: &str,
+    user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> (
     Option<ProgressCallback>,
@@ -144,6 +166,46 @@ async fn arm_thinking(
 ) {
     if crate::odoo_livechat::is_public_visitor_session(session_id) {
         return (on_progress, None);
+    }
+    // Messaging apps whose handler installed a thinking presenter: what this
+    // sender may see (`thinking::channel_policy`). Without a presenter the
+    // channel keeps the text-less signal below.
+    if let Some(presenter) = crate::thinking::channel_presenter::current()
+        .filter(|_| super::interim::external_channel(session_id).is_some())
+    {
+        let agent_id = match agent_override {
+            Some(a) => a.to_string(),
+            None => resolve_agent_for_restore(ctx, session_id).await,
+        };
+        let show = crate::thinking::channel_policy::resolve_channel(
+            &ctx.home_dir,
+            &agent_id,
+            presenter.channel(),
+            user_id,
+            presenter.is_group(),
+        );
+        // When `@` / trigger routing hands the turn to another employee, the
+        // presenter decides again for the one that actually answers.
+        let resolver: crate::thinking::channel_presenter::ShowResolver = {
+            let home = ctx.home_dir.clone();
+            let channel = presenter.channel();
+            let sender = user_id.to_string();
+            let group = presenter.is_group();
+            Arc::new(move |agent: &str| {
+                crate::thinking::channel_policy::resolve_channel(&home, agent, channel, &sender, group)
+            })
+        };
+        presenter.set_audience(&agent_id, show, resolver);
+        let policy = crate::thinking::policy::channel_policy_for(&ctx.home_dir, show);
+        let sink_ctx = crate::thinking::SinkCtx {
+            home: ctx.home_dir.clone(),
+            agent_id,
+            redaction: crate::thinking::redaction_for_display(
+                ctx.redaction_manager.as_ref(),
+                &ctx.home_dir,
+            ),
+        };
+        return crate::thinking::install(Some(policy), on_progress, sink_ctx);
     }
     let widget_visitor = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
         .try_with(|p| crate::webchat::is_widget_visitor(p))
@@ -221,7 +283,7 @@ pub async fn build_guarded_reply_for_agent(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
-    let (raw, operator_result_artifact, guards, delivery, answered_by) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by, cited) =
         build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -252,9 +314,11 @@ pub async fn build_guarded_reply_for_agent(
     } else {
         append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
     };
+    let final_text = crate::knowledge::cite_turn::with_footer(final_text, session_id, &cited);
     attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
+        .with_citations(cited)
 }
 
 /// Hand the turn's rollback handle to the reply when (and only when) the
@@ -295,7 +359,7 @@ pub async fn build_guarded_reply_with_session(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
-    let (raw, operator_result_artifact, guards, delivery, answered_by) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by, cited) =
         build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -332,15 +396,23 @@ pub async fn build_guarded_reply_with_session(
         }
         _ => with_notice,
     };
-    let final_text = append_product_footer(labelled, session_id);
+    let with_sources = crate::knowledge::cite_turn::with_footer(labelled, session_id, &cited);
+    let final_text = append_product_footer(with_sources, session_id);
     attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
+        .with_citations(cited)
 }
 
 /// Fixed product attribution on external messaging replies. Internal sessions,
 /// the dashboard console and deliberate silence remain unchanged.
 pub(super) const PRODUCT_FOOTER: &str = "— Powered by DuDuClaw";
+
+/// The text [`append_product_footer`] adds to a reply (for channels that
+/// insert more lines above it).
+pub(crate) fn product_footer_suffix() -> String {
+    format!("\n\n{PRODUCT_FOOTER}")
+}
 
 /// Session prefixes that reach end customers (external messaging platforms).
 pub(super) const FOOTER_CHANNELS: &[&str] = &[
@@ -362,6 +434,12 @@ pub(super) fn footer_applies_to_session(session_id: &str) -> bool {
             .strip_prefix(c)
             .is_some_and(|rest| rest.starts_with(':'))
     })
+}
+
+/// A conversation on an external messaging platform (LINE, Telegram, …):
+/// replies there carry plain-text footers and senders are channel users.
+pub fn is_messaging_session(session_id: &str) -> bool {
+    footer_applies_to_session(session_id)
 }
 
 pub(super) fn append_product_footer(reply: String, session_id: &str) -> String {

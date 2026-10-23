@@ -114,6 +114,10 @@ pub struct ExpectSpec {
     /// asserted. `[[expect.grounded]]` array-of-tables, zero or more.
     #[serde(default)]
     pub grounded: Vec<GroundedSpec>,
+    /// Knowledge-base citation assertions: the final answer's `[n]` must
+    /// resolve to a passage of the named source (`[[expect.cites]]`).
+    #[serde(default)]
+    pub cites: Vec<super::cites::CitesSpec>,
 }
 
 impl ExpectSpec {
@@ -127,6 +131,7 @@ impl ExpectSpec {
             && self.min_text_blocks.is_none()
             && self.max_tool_calls.is_none()
             && self.grounded.is_empty()
+            && self.cites.is_empty()
     }
 }
 
@@ -222,6 +227,14 @@ impl EvalCaseFile {
                 regex::Regex::new(re).map_err(|e| {
                     format!("[[expect.grounded]] #{i} output_regex does not compile: {e}")
                 })?;
+            }
+        }
+        for (i, c) in self.expect.cites.iter().enumerate() {
+            if c.source.trim().is_empty() {
+                return Err(format!("[[expect.cites]] #{i} source must not be empty"));
+            }
+            if c.page == Some(0) {
+                return Err(format!("[[expect.cites]] #{i} page starts at 1"));
             }
         }
         if let Some(j) = &self.judge {
