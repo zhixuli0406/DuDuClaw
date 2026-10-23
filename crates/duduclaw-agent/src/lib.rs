@@ -17,11 +17,14 @@ pub mod prompt_snapshot;
 pub mod registry;
 pub mod resolver;
 pub mod runner;
+pub mod skill_archive;
 pub mod skill_ext_gap;
 pub mod skill_hub;
 pub mod skill_loader;
 pub mod skill_recommend;
 pub mod skill_registry;
+/// Per-employee skill switches (B8): which composed skills an employee does not load.
+pub mod skill_state;
 /// `@`-mention matching for calling an AI employee by name.
 pub mod trigger_match;
 pub mod trust_tier;

@@ -60,6 +60,8 @@ mod schema;
 mod steering;
 mod stop;
 mod tasks;
+mod team_counts;
+pub(crate) use team_counts::MAX_COUNTED_AGENTS;
 
 #[cfg(test)]
 mod tests;

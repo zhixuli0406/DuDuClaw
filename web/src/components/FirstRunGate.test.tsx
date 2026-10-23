@@ -6,6 +6,7 @@ import '@/test/mocks';
 import en from '@/i18n/en.json';
 import { FirstRunGate } from './FirstRunGate';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 
 function renderGate() {
   return render(
@@ -25,6 +26,9 @@ function renderGate() {
 beforeEach(() => {
   vi.clearAllMocks();
   useAgentsStore.setState({ agents: [], loading: false, loaded: false, error: null });
+  useAuthStore.setState({
+    user: { id: 'u1', username: 'owner', display_name: 'Owner', role: 'admin' },
+  } as never);
 });
 
 describe('FirstRunGate', () => {
@@ -41,6 +45,19 @@ describe('FirstRunGate', () => {
     renderGate();
     expect(screen.getByText('WELCOME')).toBeInTheDocument();
     expect(screen.queryByText('DASHBOARD')).not.toBeInTheDocument();
+  });
+
+  it('never sends a manager or employee with no bound employees to /welcome', () => {
+    for (const role of ['manager', 'employee'] as const) {
+      useAuthStore.setState({
+        user: { id: 'u2', username: role, display_name: role, role },
+      } as never);
+      useAgentsStore.setState({ loaded: true, loading: false, agents: [] });
+      const { unmount } = renderGate();
+      expect(screen.getByText('DASHBOARD')).toBeInTheDocument();
+      expect(screen.queryByText('WELCOME')).not.toBeInTheDocument();
+      unmount();
+    }
   });
 
   it('renders the app when at least one agent exists', () => {

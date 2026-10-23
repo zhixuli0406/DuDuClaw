@@ -59,6 +59,9 @@ impl MethodHandler {
                 }));
             }
         }
+        // B8: `read_dir` order is whatever the filesystem yields; sort by
+        // name so the list (and anything keyed on its order) is stable.
+        skills.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         WsFrame::ok_response("", json!({ "skills": skills }))
     }
 

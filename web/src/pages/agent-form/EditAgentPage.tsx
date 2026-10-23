@@ -108,6 +108,8 @@ import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourc
 import { ChangeReviewDialog, type ChangeReviewState } from '@/components/agent-files/ChangeReviewDialog';
 import { analysisUnavailable, responseNeedsDialog } from '@/components/agent-files/review-text';
 import type { AgentFileSaveAction, AgentFileSaveResponse } from '@/lib/agent-files-types';
+import { AgentSkillsPanel } from '@/components/skills/AgentSkillsPanel';
+import { sortAgentsByName } from '@/lib/skill-library';
 
 /**
  * W2-8 — client-side mirror of the gateway's `notify_governance::QuietWindow::
@@ -1122,7 +1124,7 @@ export function EditAgentPage() {
   // if it isn't in the live roster so it is never silently dropped.
   const reportsToOptions: SelectOption[] = [
     { value: '', label: intl.formatMessage({ id: 'agents.edit.reportsTo.none' }), raw: '' },
-    ...agents.filter((a) => a.name !== agent.name).map((a) => ({ value: a.name, label: a.display_name || a.name, raw: a.name })),
+    ...sortAgentsByName(agents.filter((a) => a.name !== agent.name), intl.locale).map((a) => ({ value: a.name, label: a.display_name || a.name, raw: a.name })),
   ];
   if (form.reports_to && !reportsToOptions.some((o) => o.value === form.reports_to)) {
     reportsToOptions.push({ value: form.reports_to, label: form.reports_to, raw: form.reports_to });
@@ -1207,6 +1209,15 @@ export function EditAgentPage() {
           </SettingsSection>
 
           <p className="px-1 text-xs text-muted-foreground">{t('agents.v168.skillScanAlways')}</p>
+
+          {/* B8: which skills this employee loads — switches, use, removal. */}
+          <SettingsSection title={t('skills.manage.panelTitle')}>
+            <SettingsCard>
+              <div className="p-4">
+                <AgentSkillsPanel agentId={agent.name} agentName={agent.display_name || agent.name} />
+              </div>
+            </SettingsCard>
+          </SettingsSection>
 
           <SettingsSection title={t('agents.evo.skillSynthesis')}>
             <SettingsCard>

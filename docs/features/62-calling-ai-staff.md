@@ -23,7 +23,7 @@ People talk to one AI employee by default and can hand a single message to anoth
 
 ### Managers reach their team's employees
 
-In the Enterprise edition each account can have one direct manager (`manager_user_id` on `users.create` / `users.update`; the dashboard screen for it comes later). Someone whose role is Manager (or Admin) may call the AI employees bound to anyone below them, down to 8 levels. A suspended report still counts (the manager can look after their employees); an offboarded one does not. Someone with the Employee role gets no team, even if people are filed under them.
+In the Enterprise edition each account can have one direct manager (**Direct manager** when you edit a member under Manage → Members, or `manager_user_id` on `users.create` / `users.update`; the same page switches to an org chart. A manager sees their reports and the employees they can reach on Organization → My team; see [Dashboard settings](../guides/dashboard-settings.md#organization--my-team-enterprise-1760)). Someone whose role is Manager (or Admin) may call the AI employees bound to anyone below them, down to 8 levels. A suspended report still counts (the manager can look after their employees); an offboarded one does not. Someone with the Employee role gets no team, even if people are filed under them.
 
 Rights that come through a report stop at Operator, never Owner:
 

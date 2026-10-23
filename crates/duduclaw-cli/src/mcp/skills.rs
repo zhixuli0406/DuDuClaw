@@ -512,111 +512,135 @@ pub(crate) async fn handle_skill_pin(params: &Value, home_dir: &Path) -> Value {
     }
 }
 
-/// List all skills installed for a specific agent, including global skills.
-pub(crate) async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
-    let agent_id = params
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let agent_name = if agent_id.is_empty() {
+/// List the skills an employee actually loads: company-wide, department and
+/// own layers composed with the registry's precedence (own > department >
+/// global), minus the skills switched off for that employee (B8 — anything
+/// not loaded is not listed). Defaults to the calling employee, then to the
+/// main agent when the caller has no identity.
+pub(crate) async fn handle_skill_list(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let requested = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_name = if !requested.is_empty() {
+        requested.to_string()
+    } else if !default_agent.is_empty() {
+        default_agent.to_string()
+    } else {
         resolve_main_agent_name(home_dir).await
-    } else {
-        agent_id.to_string()
     };
-
-    // Collect global skills from ~/.duduclaw/skills/.
-    //
-    // 2026-05-11: switched from flat `read_dir` to the recursive
-    // `AgentRegistry::load_skills` so the Anthropic Skills spec
-    // (`<skill-name>/SKILL.md`) is honoured alongside the legacy flat
-    // `<skill>.md` layout. The only thing we need on top of `load_skills`
-    // is the per-skill `description` for display — re-parse it from the
-    // already-loaded content, no second `read_dir` round-trip.
-    let global_skills_dir = home_dir.join("skills");
-    let mut global_skills = Vec::new();
-    let mut global_names = std::collections::HashSet::new();
-
-    for sk in duduclaw_agent::registry::AgentRegistry::load_skills(&global_skills_dir).await {
-        // WP8: show the localised (zh-TW default) name/description so
-        // non-English-reading employees can tell what a skill does; the
-        // registry key (sk.name) stays the machine identity for override dedup.
-        let meta =
-            duduclaw_agent::skill_loader::parse_skill_meta_from_content(&sk.content, &sk.name);
-        let locale = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
-        global_names.insert(sk.name.clone());
-        global_skills.push(format!(
-            "- {}: {} (global)",
-            meta.display_name(locale),
-            meta.display_description(locale)
-        ));
+    if !duduclaw_core::is_valid_agent_id(&agent_name) {
+        return mcp_error(&format!("invalid agent id '{agent_name}'"));
     }
-
-    // Collect agent-local skills from ~/.duduclaw/agents/<agent>/SKILLS/
-    let skills_dir = home_dir.join("agents").join(&agent_name).join("SKILLS");
-    let mut agent_skills = Vec::new();
-
-    for sk in duduclaw_agent::registry::AgentRegistry::load_skills(&skills_dir).await {
-        let meta =
-            duduclaw_agent::skill_loader::parse_skill_meta_from_content(&sk.content, &sk.name);
-        let locale = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
-        let suffix = if global_names.contains(&sk.name) {
-            " (override)"
-        } else {
-            ""
-        };
-        agent_skills.push(format!(
-            "- {}: {}{}",
-            meta.display_name(locale),
-            meta.display_description(locale),
-            suffix
-        ));
+    let entries = listed_skills(home_dir, &agent_name).await;
+    if entries.is_empty() {
+        return mcp_text(&format!("No skills installed for agent '{agent_name}'."));
     }
+    let mut parts = Vec::new();
+    for (layer, title) in [
+        ("global", "**Global skills**".to_string()),
+        ("department", "**Department skills**".to_string()),
+        ("agent", format!("**Agent '{agent_name}' skills**")),
+    ] {
+        let lines: Vec<&str> = entries.iter().filter(|e| e.0 == layer).map(|e| e.1.as_str()).collect();
+        if !lines.is_empty() {
+            parts.push(format!("{title} ({}):\n{}", lines.len(), lines.join("\n")));
+        }
+    }
+    mcp_text(&format!("Total {} skill(s):\n\n{}", entries.len(), parts.join("\n\n")))
+}
 
-    // Remove global skills that are overridden by agent-local
-    let agent_local_names: std::collections::HashSet<String> = agent_skills
+/// `(layer, display line)` for every skill `agent_name` loads.
+async fn listed_skills(home_dir: &Path, agent_name: &str) -> Vec<(&'static str, String)> {
+    use duduclaw_agent::registry::AgentRegistry;
+    let agent_dir = home_dir.join("agents").join(agent_name);
+    let global = AgentRegistry::load_skills(&home_dir.join("skills")).await;
+    let dept = agent_department(&agent_dir).await;
+    let dept_skills = match &dept {
+        Some(d) => AgentRegistry::load_skills(&duduclaw_agent::skill_loader::department_skills_dir(home_dir, d)).await,
+        None => Vec::new(),
+    };
+    let local = AgentRegistry::load_skills(&agent_dir.join("SKILLS")).await;
+    let global_names: std::collections::HashSet<String> = global.iter().map(|s| s.name.clone()).collect();
+    let dept_names: std::collections::HashSet<String> = dept_skills.iter().map(|s| s.name.clone()).collect();
+    let local_names: std::collections::HashSet<String> = local.iter().map(|s| s.name.clone()).collect();
+    let state = duduclaw_agent::skill_state::read_disabled(home_dir, agent_name);
+    let composed = state.filter(AgentRegistry::compose_skill_layers(&global, dept_skills, local));
+    let locale = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
+    composed
         .iter()
-        .filter_map(|s| {
-            s.strip_prefix("- ")
-                .and_then(|s| s.split(':').next())
-                .map(String::from)
+        .map(|sk| {
+            // WP8: localised (zh-TW default) name/description; the registry
+            // key (sk.name) stays the machine identity.
+            let meta = duduclaw_agent::skill_loader::parse_skill_meta_from_content(&sk.content, &sk.name);
+            let layer = if local_names.contains(&sk.name) {
+                "agent"
+            } else if dept_names.contains(&sk.name) {
+                "department"
+            } else {
+                "global"
+            };
+            let suffix = if layer != "global" && global_names.contains(&sk.name) { " (override)" } else { "" };
+            let tag = if layer == "global" { " (global)" } else { "" };
+            (layer, format!("- {}: {}{}{}", meta.display_name(locale), meta.display_description(locale), tag, suffix))
         })
-        .collect();
-    global_skills.retain(|s| {
-        let name = s
-            .strip_prefix("- ")
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("");
-        !agent_local_names.contains(name)
-    });
+        .collect()
+}
 
-    let total = global_skills.len() + agent_skills.len();
-    if total == 0 {
-        serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "No skills installed for agent '{agent_name}'."
-            )}]
-        })
-    } else {
-        let mut parts = Vec::new();
-        if !global_skills.is_empty() {
-            parts.push(format!(
-                "**Global skills** ({}):\n{}",
-                global_skills.len(),
-                global_skills.join("\n")
-            ));
+/// The employee's department from its `agent.toml`, when valid.
+async fn agent_department(agent_dir: &Path) -> Option<String> {
+    let text = tokio::fs::read_to_string(agent_dir.join("agent.toml")).await.ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    let dept = table.get("agent")?.get("department")?.as_str()?.trim().to_string();
+    (!dept.is_empty() && duduclaw_core::is_valid_department(&dept)).then_some(dept)
+}
+
+#[cfg(test)]
+mod skill_list_b8_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text(v: &Value) -> String {
+        v["content"][0]["text"].as_str().unwrap_or_default().to_string()
+    }
+
+    fn agent(home: &Path, id: &str, dept: &str) {
+        let dir = home.join("agents").join(id);
+        std::fs::create_dir_all(dir.join("SKILLS")).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = \"{id}\"\ndepartment = \"{dept}\"\n")).unwrap();
+    }
+
+    /// Listing matches loading: all three layers, minus the switched-off ones,
+    /// for the calling employee by default.
+    #[tokio::test]
+    async fn lists_what_the_employee_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        agent(home, "alice", "sales");
+        agent(home, "bob", "");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::write(home.join("skills/tone.md"), "company voice").unwrap();
+        let dept = duduclaw_agent::skill_loader::department_skills_dir(home, "sales");
+        std::fs::create_dir_all(&dept).unwrap();
+        std::fs::write(dept.join("pricing.md"), "dept pricing").unwrap();
+        std::fs::write(home.join("agents/alice/SKILLS/quote.md"), "own quote").unwrap();
+        std::fs::write(home.join("agents/bob/SKILLS/quote.md"), "bob quote").unwrap();
+
+        let out = text(&handle_skill_list(&json!({}), home, "alice").await);
+        for name in ["tone", "pricing", "quote"] {
+            assert!(out.contains(&format!("- {name}:")), "{name} missing: {out}");
         }
-        if !agent_skills.is_empty() {
-            parts.push(format!(
-                "**Agent '{}' skills** ({}):\n{}",
-                agent_name,
-                agent_skills.len(),
-                agent_skills.join("\n")
-            ));
-        }
-        let text = format!("Total {} skill(s):\n\n{}", total, parts.join("\n\n"));
-        serde_json::json!({
-            "content": [{"type": "text", "text": text}]
-        })
+
+        duduclaw_agent::skill_state::set_disabled(home, "alice", &["tone".into(), "quote".into()], true).unwrap();
+        let out = text(&handle_skill_list(&json!({}), home, "alice").await);
+        assert!(!out.contains("- tone:") && !out.contains("- quote:"), "{out}");
+        assert!(out.contains("- pricing:"), "{out}");
+        // Bob is unaffected.
+        let out = text(&handle_skill_list(&json!({ "agent_id": "bob" }), home, "alice").await);
+        assert!(out.contains("- tone:") && out.contains("- quote:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_path_shaped_agent_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v = handle_skill_list(&json!({ "agent_id": "../x" }), tmp.path(), "").await;
+        assert_eq!(v["isError"], true);
     }
 }
