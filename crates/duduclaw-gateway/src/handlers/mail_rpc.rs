@@ -32,9 +32,14 @@ impl MethodHandler {
         self.mailbox_access_gate(ctx, false).await
     }
 
-    pub(crate) async fn mailbox_reader_gate(&self, ctx: &UserContext) -> Result<crate::google_identity::mailbox::Reader, String> {
+    pub(crate) async fn mailbox_reader_gate(
+        &self,
+        ctx: &UserContext,
+    ) -> Result<crate::google_identity::mailbox::Reader, String> {
         use crate::google_identity::mailbox::Reader;
-        if ctx.is_admin() { return Ok(Reader::Admin); }
+        if ctx.is_admin() {
+            return Ok(Reader::Admin);
+        }
         let people = self.people_for_mail().await;
         let email = people.by_id(&ctx.user_id).filter(|p| p.active).map(|p| p.email);
         if let Some(email) = &email {
@@ -45,7 +50,8 @@ impl MethodHandler {
         if ctx.role.at_least(UserRole::Manager) {
             return Ok(Reader::Manager { email });
         }
-        email.map(|email| Reader::Person { email })
+        email
+            .map(|email| Reader::Person { email })
             .ok_or_else(|| "無法確認你的有效帳號，請重新登入或聯絡管理員。".into())
     }
 
@@ -55,9 +61,12 @@ impl MethodHandler {
             return Ok(());
         }
         let mut accounts = crate::google_identity::mailbox::accounts(&self.home_dir)?;
-        let owner = crate::mail_worker::resolve_owner_agent(&self.home_dir, &self.registry, &cfg).await;
+        let owner =
+            crate::mail_worker::resolve_owner_agent(&self.home_dir, &self.registry, &cfg).await;
         if cfg.gmail_enabled {
-            match duduclaw_core::google_identity::effective_for(&self.home_dir, owner.as_deref()).effective {
+            match duduclaw_core::google_identity::effective_for(&self.home_dir, owner.as_deref())
+                .effective
+            {
                 crate::google_identity::Effective::Home => {}
                 crate::google_identity::Effective::Delegate { email } => accounts.push(email),
                 crate::google_identity::Effective::Personal { selector } => {
@@ -84,7 +93,11 @@ impl MethodHandler {
         if accounts.iter().any(|email| !own_accounts.iter().any(|own| own.trim().eq_ignore_ascii_case(email))) {
             return Err("這個信箱包含個人的 Google 信件，只有帳號本人和管理員看得到；混合多個帳號時只限管理員。".into());
         }
-        if read_only { Ok(()) } else { acl::require_role(ctx, UserRole::Manager) }
+        if read_only {
+            Ok(())
+        } else {
+            acl::require_role(ctx, UserRole::Manager)
+        }
     }
 
     async fn people_for_mail(&self) -> Box<dyn crate::google_identity::requester_gate::People> {
@@ -97,6 +110,10 @@ impl MethodHandler {
         let payload = tokio::task::spawn_blocking(move || {
             let cfg = crate::mail::MailConfig::from_home(&home);
             let smtp = crate::mail_worker::resolve_smtp_config(&home);
+            let (last_poll, last_poll_error) = match crate::mail_poll_status::read(&home) {
+                Ok(status) => (status, false),
+                Err(_) => (None, true),
+            };
             json!({
                 "enabled": cfg.enabled,
                 "auto_trigger": cfg.auto_trigger,
@@ -110,6 +127,8 @@ impl MethodHandler {
                 "sender_allowlist_count": cfg.allowed_senders.len(),
                 "recipient_allowlist_count": cfg.allowed_recipients.len(),
                 "inbound_dir": crate::mail::inbound_dir(&home).to_string_lossy(),
+                "last_poll":last_poll,
+                "last_poll_error":last_poll_error,
             })
         })
         .await;
@@ -119,7 +138,11 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_mail_list(&self, params: Value, reader: crate::google_identity::mailbox::Reader) -> WsFrame {
+    pub(crate) async fn handle_mail_list(
+        &self,
+        params: Value,
+        reader: crate::google_identity::mailbox::Reader,
+    ) -> WsFrame {
         let agent = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -143,7 +166,9 @@ impl MethodHandler {
 
         let home = self.home_dir.clone();
         let rows = tokio::task::spawn_blocking(move || {
-            crate::mail::read_mailbox(&home).inbox.into_iter()
+            crate::mail::read_mailbox(&home)
+                .inbox
+                .into_iter()
                 .filter(|m| reader.allows(m))
                 .filter(|m| include_archived || !m.archived)
                 .filter(|m| agent.as_deref().is_none_or(|a| m.agent_id == a))
@@ -199,7 +224,9 @@ impl MethodHandler {
         let by = format!("dashboard:{}", ctx.user_id);
         let result = tokio::task::spawn_blocking(move || {
             let item = crate::mail::get_inbox_item(&home, &mail_id)?;
-            if !reader.allows(&item) { return None; }
+            if !reader.allows(&item) {
+                return None;
+            }
             crate::mail::mark_read(&home, &mail_id, &by);
             Some(item)
         })

@@ -41,8 +41,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::mcp_dispatch::{jsonrpc_error, jsonrpc_response};
-use crate::mcp_protocol::RequestEra;
 use crate::mcp_http_server::HttpState;
+use crate::mcp_protocol::RequestEra;
 use crate::mcp_rate_limit::OpType;
 
 // ── Origin validation ─────────────────────────────────────────────────────────
@@ -156,7 +156,10 @@ pub(crate) async fn mcp_post_handler(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(crate::mcp_protocol::unsupported_version_error(&Value::Null, ver)),
+            Json(crate::mcp_protocol::unsupported_version_error(
+                &Value::Null,
+                ver,
+            )),
         )
             .into_response();
     }
@@ -165,8 +168,8 @@ pub(crate) async fn mcp_post_handler(
     //    (static mcp_keys AND OAuth-issued tokens). Spec MUST: a 401 from the
     //    MCP endpoint carries `WWW-Authenticate` pointing at the RFC 9728
     //    resource-metadata document so clients can discover the OAuth flow.
-    let (principal, ns_ctx) =
-        match crate::mcp_http_server::authenticate_bearer(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) =
+        match crate::mcp_http_server::authenticate_bearer_call(&headers, &state.home_dir) {
             Ok(p) => p,
             Err(mut r) => {
                 if r.status() == StatusCode::UNAUTHORIZED {
@@ -178,104 +181,107 @@ pub(crate) async fn mcp_post_handler(
                 return r;
             }
         };
-
-    // 4. Body: exactly one JSON-RPC request or notification per POST.
-    let msg: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => {
+    let principal = authenticated.principal().clone();
+    crate::mcp_auth::with_authenticated_call(authenticated, async {
+        // 4. Body: exactly one JSON-RPC request or notification per POST.
+        let msg: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(jsonrpc_error(&Value::Null, -32700, "Parse error")),
+                )
+                    .into_response();
+            }
+        };
+        if msg.is_array() {
+            // 2025-06-18 removed JSON-RPC batching; a stateless server rejects it.
             return (
                 StatusCode::BAD_REQUEST,
-                Json(jsonrpc_error(&Value::Null, -32700, "Parse error")),
+                Json(jsonrpc_error(
+                    &Value::Null,
+                    -32600,
+                    "JSON-RPC batching is not supported",
+                )),
             )
                 .into_response();
         }
-    };
-    if msg.is_array() {
-        // 2025-06-18 removed JSON-RPC batching; a stateless server rejects it.
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(jsonrpc_error(
-                &Value::Null,
-                -32600,
-                "JSON-RPC batching is not supported",
-            )),
-        )
-            .into_response();
-    }
-    let method = msg.get("method").and_then(|v| v.as_str());
-    let has_id = msg.get("id").map(|i| !i.is_null()).unwrap_or(false);
+        let method = msg.get("method").and_then(|v| v.as_str());
+        let has_id = msg.get("id").map(|i| !i.is_null()).unwrap_or(false);
 
-    // Client-to-server JSON-RPC *responses* are only legal replies to server
-    // requests — a stateless tools-only server never issues any, so any
-    // response body is a protocol violation (spec: return an HTTP error).
-    if method.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(jsonrpc_error(
-                &Value::Null,
-                -32600,
-                "Body must be a single JSON-RPC request or notification",
-            )),
-        )
-            .into_response();
-    }
-    let method = method.unwrap_or_default();
-
-    let id = msg.get("id").cloned().unwrap_or(Value::Null);
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-    // 5. Era. `initialize` is always legacy; otherwise a modern revision in
-    //    the header or in the body `_meta` selects the modern rules.
-    let body_era = if method == "initialize" {
-        RequestEra::Legacy
-    } else {
-        crate::mcp_protocol::request_era(&params)
-    };
-    let header_is_modern = header_version
-        .as_deref()
-        .is_some_and(|v| crate::mcp_protocol::MODERN_PROTOCOL_VERSIONS.contains(&v));
-    let modern = method != "initialize"
-        && (header_is_modern || !matches!(body_era, RequestEra::Legacy));
-
-    // 6. Notifications: accept and answer 202 with no body (spec MUST; the
-    //    modern header rules do not cover notification POSTs).
-    if !has_id {
-        return StatusCode::ACCEPTED.into_response();
-    }
-
-    if modern {
-        if let Err(resp) = validate_modern(&headers, &id, method, &params, &body_era) {
-            return resp;
-        }
-        return modern_request(&state, &principal, &ns_ctx, &id, method, &params).await;
-    }
-
-    // 7. Legacy requests — tools-only surface, mirroring the stdio server.
-    let jsonrpc = match method {
-        "initialize" => jsonrpc_response(
-            &id,
-            crate::mcp_protocol::initialize_result(&params, json!({ "tools": {} })),
-        ),
-        "ping" => jsonrpc_response(&id, json!({})),
-        "tools/list" => {
-            crate::mcp::handle_tools_list_for_agent(
-                &id,
-                &principal,
-                &state.home_dir,
-                &state.dispatcher.default_agent,
+        // Client-to-server JSON-RPC *responses* are only legal replies to server
+        // requests — a stateless tools-only server never issues any, so any
+        // response body is a protocol violation (spec: return an HTTP error).
+        if method.is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(jsonrpc_error(
+                    &Value::Null,
+                    -32600,
+                    "Body must be a single JSON-RPC request or notification",
+                )),
             )
-            .await
+                .into_response();
         }
-        "tools/call" => match call_tool(&state, &principal, &ns_ctx, &params, &id).await {
-            Ok(v) => v,
-            Err(secs) => return rate_limited(&id, secs, false),
-        },
-        other => jsonrpc_error(&id, -32601, &format!("Method not found: {other}")),
-    };
+        let method = method.unwrap_or_default();
 
-    // Single application/json response — the spec's non-streaming server mode
-    // (clients MUST accept it).
-    (StatusCode::OK, Json(jsonrpc)).into_response()
+        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // 5. Era. `initialize` is always legacy; otherwise a modern revision in
+        //    the header or in the body `_meta` selects the modern rules.
+        let body_era = if method == "initialize" {
+            RequestEra::Legacy
+        } else {
+            crate::mcp_protocol::request_era(&params)
+        };
+        let header_is_modern = header_version
+            .as_deref()
+            .is_some_and(|v| crate::mcp_protocol::MODERN_PROTOCOL_VERSIONS.contains(&v));
+        let modern =
+            method != "initialize" && (header_is_modern || !matches!(body_era, RequestEra::Legacy));
+
+        // 6. Notifications: accept and answer 202 with no body (spec MUST; the
+        //    modern header rules do not cover notification POSTs).
+        if !has_id {
+            return StatusCode::ACCEPTED.into_response();
+        }
+
+        if modern {
+            if let Err(resp) = validate_modern(&headers, &id, method, &params, &body_era) {
+                return resp;
+            }
+            return modern_request(&state, &principal, &ns_ctx, &id, method, &params).await;
+        }
+
+        // 7. Legacy requests — tools-only surface, mirroring the stdio server.
+        let jsonrpc = match method {
+            "initialize" => jsonrpc_response(
+                &id,
+                crate::mcp_protocol::initialize_result(&params, json!({ "tools": {} })),
+            ),
+            "ping" => jsonrpc_response(&id, json!({})),
+            "tools/list" => {
+                crate::mcp::handle_tools_list_for_agent(
+                    &id,
+                    &principal,
+                    &state.home_dir,
+                    &state.dispatcher.default_agent,
+                )
+                .await
+            }
+            "tools/call" => match call_tool(&state, &principal, &ns_ctx, &params, &id).await {
+                Ok(v) => v,
+                Err(secs) => return rate_limited(&id, secs, false),
+            },
+            other => jsonrpc_error(&id, -32601, &format!("Method not found: {other}")),
+        };
+
+        // Single application/json response — the spec's non-streaming server mode
+        // (clients MUST accept it).
+        (StatusCode::OK, Json(jsonrpc)).into_response()
+    })
+    .await
 }
 
 /// `tools/call` with the per-key rate gate and the call timeout. `Err` is
@@ -295,17 +301,19 @@ async fn call_tool(
     {
         return Err(e.retry_after_secs);
     }
-    Ok(match tokio::time::timeout(
-        state.call_timeout,
-        state
-            .dispatcher
-            .dispatch_tool_call(principal, ns_ctx, params, id),
+    Ok(
+        match tokio::time::timeout(
+            state.call_timeout,
+            state
+                .dispatcher
+                .dispatch_tool_call(principal, ns_ctx, params, id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => jsonrpc_error(id, -32603, "Request timed out (30s limit exceeded)"),
+        },
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => jsonrpc_error(id, -32603, "Request timed out (30s limit exceeded)"),
-    })
 }
 
 /// The rate-limited answer: JSON-RPC `-32029` (moved out of the MCP-reserved
@@ -335,7 +343,11 @@ fn rate_limited(id: &Value, retry_after_secs: u64, modern: bool) -> Response {
 /// A `400` carrying a JSON-RPC error body (modern clients read the body to
 /// tell a modern server from a legacy one, so it is never bare).
 fn bad_request(id: &Value, code: i64, message: &str) -> Response {
-    (StatusCode::BAD_REQUEST, Json(jsonrpc_error(id, code, message))).into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(jsonrpc_error(id, code, message)),
+    )
+        .into_response()
 }
 
 /// Modern request validation (2026-07-28 Streamable HTTP "Server
@@ -370,7 +382,13 @@ fn validate_modern(
     };
     let mismatch = crate::mcp_protocol::HEADER_MISMATCH;
     match header("MCP-Protocol-Version") {
-        None => return Err(bad_request(id, mismatch, "Missing MCP-Protocol-Version header")),
+        None => {
+            return Err(bad_request(
+                id,
+                mismatch,
+                "Missing MCP-Protocol-Version header",
+            ));
+        }
         Some(v) if v != body_version => {
             return Err(bad_request(
                 id,

@@ -1,17 +1,20 @@
 # Google delegated identity acceptance
 
-Status: PARTIAL. This branch implements gateway-issued domain delegation for
-native Google tools and account-aware Agent Mail receipts. It is not the
-complete per-employee Google identity work package.
+Status: IMPLEMENTED. Local backend and isolated mock integration passed on
+`375f8588`; strict clippy retains existing baseline failures. The EXT adds
+dedicated-key execution, employee-specific HTTP MCP mounts, actual service GET
+probes and completed-mail-poll status. Required CI, merge, deployment, real
+provider acceptance and user acceptance remain separate gates in [PR #212](https://github.com/zhixuli0406/DuDuClaw/pull/212).
 
-## Open requirements
+## Engineering evidence and remaining gates
 
-| ID | State | Remaining work |
+| ID | State | Evidence and remaining work |
 | --- | --- | --- |
-| B2a-EXT | OPEN | External per-employee API keys currently lack the gateway-issued employee proof needed by the signed token route. Even an explicitly allowed `requesters = "anyone"` client cannot obtain a delegated token. Add a separately authenticated route path; keep anonymous and general external keys unable to select a person. |
-| B2a-MCP | OPEN | `oauth://google` mounts are skipped for delegated identities. Support requires account-specific mounting plus a per-call interceptor that rechecks the current requester and refuses after access changes. Do not substitute the shared token. Acceptance against Google's remote MCP endpoints remains separate. |
-| B2a-SVC | PARTIAL | Connection testing mints all scopes and checks Gmail identity, then mints each service scope. Only Gmail, Calendar, Drive and Tasks also read a service endpoint. Sheets, Docs, Slides and Forms data access is not verified. |
-| B2a-MAIL-STATUS | OPEN | `PollReport.account_unavailable` is counted and logged but not yet exposed on the mailbox page. |
+| B2a-EXT | LOCAL FIXTURE PASS | Closed 19-tool lane, explicit read/write scope and actual employee policy/approval gates. Gateway returns results, not Google bearers; accepted calls keep their employee/tool/final arguments and recheck live authority. |
+| B2a-MCP | LOCAL FIXTURE PASS | HTTP `oauth://google` mounts select the employee account and recheck live requester/account permissions at each call. Exact-client hooks and separate actual-fallback notices preserve original payload redaction/CCR. Person-account stdio mounts are refused. Google's own endpoint acceptance remains unverified. |
+| B2a-SVC | LOCAL FIXTURE PASS | Sheets, Docs, Slides and Forms find an accessible sample and GET the actual service resource. No sample stays unverified; issuance alone is not service access. |
+| B2a-MAIL-STATUS | LOCAL FIXTURE PASS | Last completed poll timestamp, unavailable-account count and transport errors reach `mail.status` and the mailbox page, distinct from an empty or untested mailbox. |
+| EXT-WRITE-RETRY | CONTROLLED UNIT PASS | Dedicated non-GET/HEAD writes make one attempt after transport/429/5xx. Actual signed-route503/429 RED observed two requests each; GREEN observes one. Three controlled tests pass, including GET/HEAD and legacy retry positives. Exact product delta independently approved; legacy caller semantics remain unchanged. |
 
 ## Security boundaries
 
@@ -36,13 +39,71 @@ complete per-employee Google identity work package.
 
 ## Verification
 
-The repeatable isolated gateway/MCP probe is
-`scripts/live-test/google-delegated-identity.mjs`. It requires a debug binary
-with `live-test-mocks`; the release profile refuses that feature. It creates
-its own temporary home, loopback fake Google and ephemeral RSA key, uses an
-in-memory credential store, disables model dispatch and keeps artifacts for
-inspection. It does not exercise the open external-key or remote-MCP paths.
+The ordinary continuation baseline is
+`scripts/live-test/google-connectors-baseline.mjs`. It requires a debug binary
+with `live-test-mocks`, a fresh temporary home and the macOS loopback-only
+sandbox. REST, MCP, model and RSA issuer are synthetic; the runtime has no host
+model CLI in PATH. The baseline covers all 19 tools with normal approval for
+mock writes, HTTP account mounting, actual configured fallback notice,
+service GETs and mailbox availability status. It is not real-provider proof.
+
+The historical `google-delegated-identity.mjs` evidence remains separate.
+Do not re-run its paused P1 native scenarios. The seven prior actual P2
+native RED cases, two fixture failures, lack of a reproduced P1 native RED,
+and actual pure-unit P1 RED keep their original outcomes; later controlled
+unit PASS does not rewrite them.
+
+The 2026-10-24 ordinary baseline returned exit0: all19 dedicated tools,
+six writes with normal Admin approvals, four actual service-resource GETs,
+completed unavailable-mailbox status and two real gateway model tool loops
+(person HTTP mount and explicitly configured Home fallback with its notice).
+The success receipt records `cleanup_confirmed: true`; all owned processes,
+connections and local servers stopped before it was written. The first two
+ordinary attempts remain failures (missing mock Drive list response and mock
+store path aliasing). Their minimal fixture corrections were independently
+reviewed, with all original success assertions retained. No real provider,
+host model account or OS credential store was used.
+
+After integrating #199 `b5417bc5` and main `da2170b7`, independently reviewed
+source `375f8588` passed the final six-crate command with a captured exit0:
+45 unit/integration/doc result blocks totaled 13,931 passed, 0 failed,
+60 ignored and 32 filtered. The selected packages were agent, CLI, core,
+gateway, LLM and security, with no default dashboard feature. The five
+workflow E2E groups run separately by CI remained excluded locally:
+`three_page_pilot_`, `security_race_tests`, `resume_tests`, `f1b_e2e_tests` and
+`f5a_e2e_tests`. This is not an unfiltered workspace test claim.
+
+Shipping and mock binaries were rebuilt from that same integrated source;
+both builds returned exit0 and saved-binary hashes matched the build outputs.
+The ordinary baseline then repeated all original assertions with the new mock
+binary and returned exit0 with confirmed cleanup: 19 tools, six approved
+writes, four service-resource GETs, unavailable mailbox status and both
+actual mounted model tool loops. All Google/MCP/model endpoints and accounts
+were newly created local fixtures; no real provider/keychain acceptance is
+claimed.
+
+Strict `clippy -D warnings` returned exit101 at 66 existing core diagnostics.
+All 92 reported primary/secondary source locations matched dependency #199's
+existing code. No lint allowance or CI rule was changed; this is not strict
+clippy PASS. The previous two-async-lint exception was not applied to a
+different baseline failure. The earlier six-crate continuation log reached
+all successful result blocks but its process exit was not retrieved; the new
+captured exit0 belongs only to the integrated final run and does not rewrite
+that history.
 
 Final local test counts and live-probe outcomes are recorded in the PR; CI,
 merge, deployment, real-provider acceptance and user acceptance are distinct
 gates.
+
+The 2026-10-23 isolated native probe passed all 12 scenarios after a real
+RPC regression fixed unnecessarily reconfirming an `anyone` policy when
+switching to `none` or `home`. It verified signed subject isolation,
+per-call reauthorization in one MCP process, domain/employee-proof refusals,
+explicit shared-account fallback, tool hiding, master switch, offline denial
+and token-free audit rows. The mock binary was built with no default features
+and `live-test-mocks`; no real Google account or provider consent was used.
+
+The earlier full local command returned failure only in the existing core
+gateway-instance lock reacquisition test. Its gateway and CLI suites passed;
+30 focused reruns and a separate full core rerun passed. These separate runs
+do not change the original command's failure result.

@@ -34,7 +34,7 @@ An administrator's selection does **not** grant consent. The account holder open
 
 Withdrawing consent refuses future calls immediately, including calls through an administrator-configured employee. The generic employee editor cannot introduce a self-account selection; use Connections so self-consent and audit are recorded together.
 
-An employee-specific external connection key does not identify a human requester. The default rule refuses personal-account use; an administrator can explicitly select `requesters = "anyone"` to permit these authorized external tools, while personal consent is still required. Public website visitors remain refused even under `anyone`.
+An employee-specific external key does not identify a person. In this integration, the Dedicated execute and Google HTTP mount paths do not yet implement personal-account authority. These two paths refuse **Follow primary owner** and **Choose colleague**, even with `requesters = "anyone"`, personal consent or home fallback. The original in-product personal Google native-tool route still applies its requester and consent checks and refuses public visitors. Support for other external routes needs separate verification; Personal × Dedicated integration remains open.
 
 ## Manage and disconnect
 

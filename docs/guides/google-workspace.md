@@ -152,8 +152,10 @@ delegation serves all of them; each employee names the colleague it acts as.
    delegation)**, enter the colleague's work email, save.
 5. **Test connection** mints a token for that colleague with the full scope
    list, checks Gmail reports the same address, then mints per-service scopes.
-   Gmail, Calendar, Drive and Tasks also read a read-only endpoint; Sheets,
-   Docs, Slides and Forms currently verify issuance only, not service access.
+   Gmail, Calendar, Drive and Tasks read read-only endpoints. Sheets, Docs,
+   Slides and Forms first find an accessible sample and then GET its service
+   resource. With no sample, that service stays unverified; token issuance
+   alone does not count as data access.
    It sends nothing and does not reuse or fill
    the token cache.
 
@@ -232,15 +234,55 @@ setting error and a protection problem never fall back.
   arriving mail. When that is a colleague, the Mailbox pages are visible only
   to Admins and that colleague (behaviour change; a shared-account mailbox
   keeps the Manager gate). Agent Mail is still one mailbox per installation.
-- **External Google MCP servers** (`bearer_token = "oauth://google"`) are
-  skipped for an employee acting as a colleague in this release, because the
-  bearer would otherwise be the shared account's token.
+- **External Google MCP servers** (`bearer_token = "oauth://google"`) use
+  the employee's selected account on HTTP mounts. Permission failures skip
+  that Google mount; other configured servers remain available. See below.
 - **Audit:** every token the gateway issues or refuses is a `google_token`
   row in `tool_calls.jsonl` (employee, identity, account, requester kind,
   tool, refusal code); every Google tool call on a colleague's identity is a
   `google_call` row. Neither ever contains a token. Changing an employee's
   identity writes `agent.google_identity_set` to the account audit log and
   `agent_google_identity_set` to `security_audit.jsonl`.
+
+### Dedicated employee API keys and Google MCP mounts (unreleased)
+
+An authenticated employee-specific API key with explicit `google:read` or
+`google:write` may use the corresponding tools in the closed 19-tool Google
+surface. `admin` alone is not a substitute. The key must belong to a real
+employee with readable configuration. General external key grant options and
+other connectors are unchanged; OAuth authentication does not create this
+execution receipt. A legitimate internal custom integration key without an
+employee keeps its existing Home-account path.
+
+These calls still pass the employee's tool allow/deny lists, action rules,
+PolicyKernel, scoped grants and required approvals. The accepted employee,
+tool and final arguments stay fixed through an approval wait. Expired keys,
+removed employees and changed authority are refused, never replaced by a
+process's ambient identity or another account. The gateway executes the
+Google request and returns bounded tool results without returning a Google
+bearer to the external MCP client.
+
+A key identifies the employee, not a human requester. For a delegated person
+account it is an **Unknown** requester: `bound_people` and `owner_only` refuse
+it, even with Home fallback enabled. Only an operator's explicit `anyone`
+setting permits this use; it does not authorize public website visitors.
+
+For an employee's HTTP MCP mount, `bearer_token = "oauth://google"` resolves
+that employee's account in the gateway. Each actual call rechecks the live
+requester, selector, domain, colleague status and credential protection,
+including when the connection is reused. A person-account stdio mount is
+skipped because stdio does not consume the HTTP bearer. An actual configured
+Home fallback adds a separate notice to that call's result; a successful
+person-account call does not claim to have used Home. Provider JSON and
+redaction/CCR processing retain their original structure.
+
+Agent Mail also records the last completed poll time, unavailable-account
+count and transport-error count. An unavailable or unreadable account is
+shown separately from an empty mailbox; no completed poll is not reported as
+successful zero-mail access. The per-installation mailbox and reader gates
+remain unchanged.
+
+Dedicated gateway execution makes one attempt for non-GET/HEAD REST requests: transport errors, 429 and 5xx do not automatically repeat a write. GET/HEAD retain one retry. This restriction applies to the dedicated execute route; existing Home callers keep their previous helper behavior.
 
 ### Limits
 

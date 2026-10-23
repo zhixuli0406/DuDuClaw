@@ -14,6 +14,11 @@ use super::requester_gate::{NoPeople, People, Person};
 use super::resolve::{Resolved, resolve_person};
 use super::*;
 
+#[path = "execute_tests.rs"]
+mod execute_tests;
+#[path = "mcp_mount_tests.rs"]
+mod mcp_mount_tests;
+
 // ── mock Google ─────────────────────────────────────────────────
 
 /// One token request the mock saw (claims of the signed assertion).
@@ -40,6 +45,31 @@ fn seen_for(sub: &str) -> Vec<Seen> {
         .collect()
 }
 
+type MintPause = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+fn mint_pauses() -> &'static Mutex<HashMap<String, MintPause>> {
+    static PAUSES: OnceLock<Mutex<HashMap<String, MintPause>>> = OnceLock::new();
+    PAUSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pause_mint(subject: &str) -> MintPause {
+    let pause = (
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    );
+    assert!(
+        mint_pauses()
+            .lock()
+            .unwrap()
+            .insert(subject.to_owned(), pause.clone())
+            .is_none()
+    );
+    pause
+}
+
 fn claims_of(assertion: &str) -> Value {
     use base64::Engine as _;
     let payload = assertion.split('.').nth(1).unwrap_or("");
@@ -54,13 +84,22 @@ async fn token_endpoint(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let c = claims_of(form.get("assertion").map(String::as_str).unwrap_or(""));
-    let sub = c["sub"].as_str().unwrap_or("").to_string();
+    let sub = form
+        .get("refresh_token")
+        .and_then(|value| value.strip_prefix("unit-refresh:"))
+        .unwrap_or_else(|| c["sub"].as_str().unwrap_or(""))
+        .to_string();
     seen().lock().unwrap().push(Seen {
         sub: sub.clone(),
         scope: c["scope"].as_str().unwrap_or("").to_string(),
         iss: c["iss"].as_str().unwrap_or("").to_string(),
         grant_type: form.get("grant_type").cloned().unwrap_or_default(),
     });
+    let pause = mint_pauses().lock().unwrap().remove(&sub);
+    if let Some((entered, release)) = pause {
+        entered.notify_one();
+        release.notified().await;
+    }
     let local = sub.split('@').next().unwrap_or("");
     if local.starts_with("unauth") {
         return (
@@ -103,6 +142,81 @@ async fn ok_json() -> axum::Json<Value> {
     axum::Json(json!({"items": []}))
 }
 
+fn service_reads() -> &'static Mutex<Vec<(String, String)>> {
+    static READS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+    READS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+async fn service_endpoint(
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let account = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer tok:"))
+        .unwrap_or("")
+        .to_string();
+    service_reads()
+        .lock()
+        .unwrap()
+        .push((account.clone(), uri.to_string()));
+    for code in [429u16, 503] {
+        if uri
+            .path()
+            .ends_with(&format!("/unit-write-{code}:batchUpdate"))
+        {
+            return (
+                axum::http::StatusCode::from_u16(code).unwrap(),
+                axum::Json(json!({"error":{"message":"synthetic transient write failure"}})),
+            )
+                .into_response();
+        }
+    }
+    if uri.path().ends_with("/drive/v3/files") {
+        let query: HashMap<String, String> =
+            url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+        if query.get("q").is_some() {
+            if account.starts_with("nosample") {
+                return axum::Json(json!({"files":[]})).into_response();
+            }
+            let q = query.get("q").unwrap();
+            let service = if q.contains("spreadsheet") {
+                "sheets"
+            } else if q.contains("document") {
+                "docs"
+            } else if q.contains("presentation") {
+                "slides"
+            } else {
+                "forms"
+            };
+            return axum::Json(json!({"files":[{"id":format!("fixture-{service}")}]}))
+                .into_response();
+        }
+    }
+    if account.starts_with("denied-resource") && uri.path().contains("fixture-") {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(json!({"error":{"message":"fixture denied"}})),
+        )
+            .into_response();
+    }
+    for (resource, key, id) in [
+        ("spreadsheets", "spreadsheetId", "fixture-sheets"),
+        ("documents", "documentId", "fixture-docs"),
+        ("presentations", "presentationId", "fixture-slides"),
+        ("forms", "formId", "fixture-forms"),
+    ] {
+        if uri.path().ends_with(&format!("/{resource}/{id}")) {
+            return axum::Json(json!({key:id})).into_response();
+        }
+    }
+    ok_json().await.into_response()
+}
+
 /// Start the mock once per test process; returns its base URL.
 fn mock() -> &'static str {
     static BASE: OnceLock<String> = OnceLock::new();
@@ -120,7 +234,7 @@ fn mock() -> &'static str {
                         "/gmail.googleapis.com/gmail/v1/users/me/profile",
                         axum::routing::get(gmail_profile),
                     )
-                    .fallback(ok_json);
+                    .fallback(axum::routing::any(service_endpoint));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(format!("http://{}", listener.local_addr().unwrap()))
                     .unwrap();
@@ -693,6 +807,24 @@ async fn identity_test_reports_each_check_and_sends_nothing() {
     assert!(ids.contains(&"identity_match") && ids.contains(&"gmail") && ids.contains(&"tasks"));
     // Full list once, then one mint per service (8) — all fresh (cache bypassed).
     assert_eq!(seen_for("check@c.test").len(), 9);
+    let urls: Vec<String> = service_reads()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(account, _)| account == "check@c.test")
+        .map(|(_, uri)| uri.clone())
+        .collect();
+    for service in [
+        "sheets.googleapis.com/v4/spreadsheets/fixture-sheets",
+        "docs.googleapis.com/v1/documents/fixture-docs",
+        "slides.googleapis.com/v1/presentations/fixture-slides",
+        "forms.googleapis.com/v1/forms/fixture-forms",
+    ] {
+        assert!(
+            urls.iter().any(|url| url.contains(service)),
+            "did not read {service}: {urls:?}"
+        );
+    }
 
     home.agent("mm", "[google]\nidentity='delegate:mismatch@c.test'\n");
     let (_, steps) = check::run(home.p(), "mm", &NoPeople).await;
@@ -704,6 +836,25 @@ async fn identity_test_reports_each_check_and_sends_nothing() {
     let (_, steps) = check::run(home.p(), "ua", &NoPeople).await;
     assert_eq!(steps.last().unwrap().id, "authorize");
     assert!(!steps.last().unwrap().ok);
+}
+
+#[tokio::test]
+async fn identity_service_checks_do_not_call_minting_data_access() {
+    for (agent, email) in [
+        ("none", "nosample@c.test"),
+        ("denied", "denied-resource@c.test"),
+    ] {
+        let home = Home::new();
+        home.ready(agent, email, "");
+        let (_, steps) = check::run(home.p(), agent, &NoPeople).await;
+        for id in ["sheets", "docs", "slides", "forms"] {
+            let step = steps.iter().find(|s| s.id == id).expect("service step");
+            assert!(
+                !step.ok,
+                "minting alone must not prove service access: {step:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

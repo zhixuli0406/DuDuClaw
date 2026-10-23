@@ -520,8 +520,9 @@ impl MethodHandler {
 
 /// Validate `agents.google_identity_set` params into the `[google]` table
 /// to write (the identity is always written explicitly). B2a accepts
-/// `home`, `none` and `delegate:<email>`; `requesters = "anyone"` needs
-/// `confirm_anyone: true`.
+/// `home`, `none` and `delegate:<email>`; a delegate with `requesters =
+/// "anyone"` needs `confirm_anyone: true`. Leaving a person identity drops
+/// that policy and never asks the operator to confirm a widening.
 pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, String> {
     for field in ["fallback", "requesters"] {
         if params.get(field).is_some_and(|value| !value.is_string()) {
@@ -547,7 +548,8 @@ pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, Strin
         None => Requesters::default(),
         Some(r) => Requesters::parse(r)?,
     };
-    if matches!(sel, Selector::Delegate(_) | Selector::Owner | Selector::User(_)) && requesters == Requesters::Anyone
+    if requesters == Requesters::Anyone
+        && matches!(sel, Selector::Delegate(_) | Selector::Owner | Selector::User(_))
         && params.get("confirm_anyone").and_then(Value::as_bool) != Some(true)
     {
         return Err("「任何人都能透過這位員工使用」需要明確確認（confirm_anyone: true）。公開訪客仍然一律不行。".into());

@@ -46,6 +46,29 @@ async fn call(h: &MethodHandler, method: &str, params: Value, who: &UserContext)
     Box::pin(h.handle(method, params, who)).await
 }
 
+#[tokio::test]
+async fn leaving_a_person_identity_does_not_reconfirm_its_anyone_policy() {
+    for identity in ["none", "home"] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let h = MethodHandler::new(home.clone()).await;
+        ok(&h.handle_agents_create_as(json!({"name":"bot", "display_name":"Bot"}),
+            Some(&UserContext::admin_fallback())).await);
+        let path = home.join("agents/bot/agent.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\n[google]\nidentity='delegate:alice@c.test'\nrequesters='anyone'\nfallback='home'\n");
+        std::fs::write(path, text).unwrap();
+        ok(&call(&h, "agents.google_identity_set", json!({"agent_id":"bot", "identity":identity}),
+            &UserContext::admin_fallback()).await);
+        let table = std::fs::read_to_string(home.join("agents/bot/agent.toml")).unwrap()
+            .parse::<toml::Table>().unwrap();
+        let google = table["google"].as_table().unwrap();
+        assert_eq!(google["identity"].as_str(), Some(identity));
+        assert!(!google.contains_key("requesters"));
+        assert!(!google.contains_key("fallback"));
+    }
+}
+
 fn home_with_agent(agent: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();

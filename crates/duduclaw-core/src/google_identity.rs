@@ -28,6 +28,13 @@
 
 use std::path::Path;
 
+#[path = "google_identity/tools.rs"]
+mod tools;
+pub use tools::{NATIVE_GOOGLE_TOOLS, NativeGoogleScope, native_google_scope};
+#[path = "google_identity/credentials.rs"]
+mod credentials;
+pub use credentials::{CredentialKind, CredentialRef};
+
 /// The `agent.toml` table.
 pub const AGENT_SECTION: &str = "google";
 /// The `config.toml [integrations]` sub-table.

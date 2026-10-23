@@ -276,8 +276,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     // Validate the installation policy after a possible restore and before runtime startup.
-    crate::product_policy::load(&home_dir)
-        .map_err(duduclaw_core::error::DuDuClawError::Config)?;
+    crate::product_policy::load(&home_dir).map_err(duduclaw_core::error::DuDuClawError::Config)?;
     crate::data_exports::initialize(&home_dir)
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     {
@@ -868,7 +867,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             println!();
         } else {
             println!("\n  🔑 First-run admin — log in with this, you'll be asked to change it:");
-            println!("     Email:    {}", duduclaw_auth::db::BOOTSTRAP_PLACEHOLDER_EMAIL);
+            println!(
+                "     Email:    {}",
+                duduclaw_auth::db::BOOTSTRAP_PLACEHOLDER_EMAIL
+            );
             println!(
                 "     Password: {}",
                 bootstrap_password.as_deref().unwrap_or_default()
@@ -1958,7 +1960,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // spawned supervisor has not been polled yet. Status stays readable.
         crate::maintenance::supervisor::spawn(Arc::new(env), boot_revoked).await;
     } else {
-        error!("another gateway holds this data directory: the maintenance supervisor does not run in this process");
+        error!(
+            "another gateway holds this data directory: the maintenance supervisor does not run in this process"
+        );
     }
 
     // ── B5 session origin backfill ────────────────────────────────
@@ -2380,7 +2384,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // a `token` query param so browser preview/download links work.
         .route("/api/files", get(handle_files_list))
         .route("/api/files/download", get(handle_files_download))
-        .route("/api/data-exports/{id}/download", get(data_exports_http::download))
+        .route(
+            "/api/data-exports/{id}/download",
+            get(data_exports_http::download),
+        )
         .route("/api/files/preview", get(handle_files_preview))
         .route("/api/ccr/dashboard", get(handle_ccr_dashboard))
         .route(
@@ -2728,7 +2735,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route(
             "/api/knowledge/upload",
             post(handle_knowledge_upload).layer(DefaultBodyLimit::max(
-                duduclaw_knowledge::limits::KnowledgeConfig::from_home(&home_dir).max_upload_body_bytes(),
+                duduclaw_knowledge::limits::KnowledgeConfig::from_home(&home_dir)
+                    .max_upload_body_bytes(),
             )),
         )
         .route(
@@ -2812,7 +2820,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // tools: same loopback + signed-identity authentication as the
     // computer-use route, own nonce set and rate limit, 64 KiB body cap.
     app = app.merge(crate::knowledge::route::router(Arc::new(
-        crate::knowledge::route::KnowledgeRouteState::new(home_dir.clone(), Some(knowledge_users.clone())),
+        crate::knowledge::route::KnowledgeRouteState::new(
+            home_dir.clone(),
+            Some(knowledge_users.clone()),
+        ),
     )));
     // ── Per-employee Google identity (internal, B2a) ──────────────
     // `POST /api/internal/google-token`: the MCP server's only way to a
@@ -2820,7 +2831,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // authentication, own nonce set and rate limit, 4 KiB body cap; the
     // delegation key is unsealed only here (the gateway-lock holder).
     app = app.merge(crate::google_identity::route::router(Arc::new(
-        crate::google_identity::route::GoogleTokenRouteState::new(home_dir.clone(), Some(knowledge_users)),
+        crate::google_identity::route::GoogleTokenRouteState::new(
+            home_dir.clone(),
+            Some(knowledge_users.clone()),
+        ),
+    )));
+    app = app.merge(crate::google_identity::execute::router(Arc::new(
+        crate::google_identity::execute::ExecuteState::new(home_dir.clone(), Some(knowledge_users)),
     )));
     // ── Device operations for the `os_*` MCP tools (internal) ─────
     // The mcp-server process reaches duduclaw-sysd only through this route
@@ -3011,7 +3028,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
         // Mark the Odoo Live Chat bot offline so visitors are not routed to
         // a bot that is about to stop answering.
-        bounded_step("odoo livechat offline", 5, crate::odoo_livechat::go_offline_on_shutdown()).await;
+        bounded_step(
+            "odoo livechat offline",
+            5,
+            crate::odoo_livechat::go_offline_on_shutdown(),
+        )
+        .await;
         bounded_step("prediction engine flush", 20, pe_for_shutdown.flush_all()).await;
         bounded_step(
             "metacognition persist",
@@ -3215,8 +3237,7 @@ async fn handle_otp_request(
                 challenge.code.clone(),
             );
             tokio::spawn(async move {
-                let text =
-                    format!("DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
+                let text = format!("DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
                 match deliverer.deliver(&channel, &chat_id, &text).await {
                     Ok(()) => {
                         let _ = user_db.log_action(
@@ -14187,21 +14208,22 @@ async fn authorize_review_artifact(
     state: &AppState,
     ctx: &UserContext,
     agent: Option<&str>,
-    name: &str
+    name: &str,
 ) -> Result<(), axum::response::Response> {
-    let denied = ||
+    let denied = || {
         (
             axum::http::StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"access denied"}))
+            Json(serde_json::json!({"error":"access denied"})),
         )
-            .into_response();
+            .into_response()
+    };
     let store = state.handler.workflow_store().await.map_err(|_| denied())?;
     crate::review_evidence::download::authorize_artifact_access(
         &state.home_dir,
         &store,
         ctx,
         agent,
-        name
+        name,
     )
     .await
     .map_err(|_| denied())?;
@@ -14230,7 +14252,10 @@ async fn handle_files_list(
     axum::extract::Query(q): axum::extract::Query<FilesListQuery>,
 ) -> axum::response::Response {
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
-    let ctx = match authorize_file_access(&state, &headers, None, agent) { Ok(ctx) => ctx, Err(resp) => return resp };
+    let ctx = match authorize_file_access(&state, &headers, None, agent) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
     let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
         Some(d) => d,
         None => {
@@ -14243,7 +14268,12 @@ async fn handle_files_list(
     };
     let mut files = Vec::new();
     for file in crate::files_api::list_files(&dir) {
-        if authorize_review_artifact(&state, &ctx, agent, &file.name).await.is_ok() { files.push(file); }
+        if authorize_review_artifact(&state, &ctx, agent, &file.name)
+            .await
+            .is_ok()
+        {
+            files.push(file);
+        }
     }
     // I-2b: join the provenance ledger so the panel can say which task / AI
     // staff member delivered a file versus which files a human sent in.
@@ -14282,7 +14312,7 @@ async fn handle_files_download(
     // Auth (header or `token` query) + per-agent authorization, fail-closed.
     let ctx = match authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
         Ok(ctx) => ctx,
-        Err(resp) => return resp
+        Err(resp) => return resp,
     };
     if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
         return resp;
@@ -14377,7 +14407,7 @@ async fn handle_files_preview(
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
     let ctx = match authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
         Ok(ctx) => ctx,
-        Err(resp) => return resp
+        Err(resp) => return resp,
     };
     if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
         return resp;
@@ -14598,7 +14628,10 @@ fn require_bearer(
 /// Bearer JWT → active, password-changed dashboard user (fail-closed).
 /// The error is the ready-to-send response, like `require_bearer`.
 #[allow(clippy::result_large_err)]
-fn knowledge_caller(state: &AppState, headers: &axum::http::HeaderMap) -> Result<UserContext, axum::response::Response> {
+fn knowledge_caller(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<UserContext, axum::response::Response> {
     let token = extract_bearer_token(headers).ok_or_else(|| {
         (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -14625,7 +14658,13 @@ async fn handle_knowledge_upload(
 ) -> axum::response::Response {
     match knowledge_caller(&state, &headers) {
         Ok(ctx) => {
-            crate::knowledge::upload::handle_upload(&state.home_dir, &ctx, Some(state.user_db.clone()), multipart).await
+            crate::knowledge::upload::handle_upload(
+                &state.home_dir,
+                &ctx,
+                Some(state.user_db.clone()),
+                multipart,
+            )
+            .await
         }
         Err(resp) => resp,
     }
@@ -14638,7 +14677,15 @@ async fn handle_knowledge_original(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     match knowledge_caller(&state, &headers) {
-        Ok(ctx) => crate::knowledge::upload::handle_original(&state.home_dir, &ctx, Some(state.user_db.clone()), &id).await,
+        Ok(ctx) => {
+            crate::knowledge::upload::handle_original(
+                &state.home_dir,
+                &ctx,
+                Some(state.user_db.clone()),
+                &id,
+            )
+            .await
+        }
         Err(resp) => resp,
     }
 }
@@ -14754,8 +14801,10 @@ async fn handle_expert_upload(
     // signature; a single-file agent definition (.md / .yml) must be UTF-8
     // text. The real fences (zip-slip, per-entry caps, content scanning) run
     // inside the install pipeline.
-    let ext = crate::expert_admin::upload_extension(&crate::expert_admin::sanitize_upload_name(&client_name))
-        .unwrap_or("zip");
+    let ext = crate::expert_admin::upload_extension(&crate::expert_admin::sanitize_upload_name(
+        &client_name,
+    ))
+    .unwrap_or("zip");
     let looks_right = if ext == "zip" {
         data.len() >= 4 && data.starts_with(b"PK")
     } else {
@@ -15816,7 +15865,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // Per-connection gate for broadcast events (task gate, employee binding,
     // admin-only kinds, lock screen); see `handlers/push_filter.rs`.
     let mut push_gate = crate::handlers::PushGate::new_with_legacy(
-        &state.home_dir, &user_ctx, pre_auth, conn_info.legacy_admin_authenticated,
+        &state.home_dir,
+        &user_ctx,
+        pre_auth,
+        conn_info.legacy_admin_authenticated,
     );
     let mut logs_subscribed = false;
 
@@ -16507,11 +16559,17 @@ fn html_escape(s: &str) -> String {
 /// The small page the browser lands on after a remote MCP sign-in. Every
 /// inserted value is HTML-escaped.
 fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::response::Response {
-    let title = if ok { "Connected" } else { "Sign-in did not complete" };
+    let title = if ok {
+        "Connected"
+    } else {
+        "Sign-in did not complete"
+    };
     let link = match back {
         Some(origin) => format!(
             "<p><a href=\"{}\" style=\"color:#8A5A10\">Back to the dashboard</a></p>",
-            html_escape(&format!("{origin}/manage/integrations?tab=mcp&mcp_tab=remote"))
+            html_escape(&format!(
+                "{origin}/manage/integrations?tab=mcp&mcp_tab=remote"
+            ))
         ),
         None => "<p style=\"color:#5B6470\">You can close this window.</p>".to_string(),
     };
@@ -16556,8 +16614,14 @@ async fn handle_remote_mcp_oauth_callback(
                 serde_json::json!({ "agent_id": p.agent_id, "server": p.server, "error": duduclaw_core::truncate_chars(err, 100) }),
             );
         }
-        let desc = params.get("error_description").map(String::as_str).unwrap_or("");
-        let msg = duduclaw_core::truncate_chars(&format!("The authorization server answered: {err} {desc}"), 300);
+        let desc = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or("");
+        let msg = duduclaw_core::truncate_chars(
+            &format!("The authorization server answered: {err} {desc}"),
+            300,
+        );
         return remote_mcp_result_page(false, &msg, back.as_deref());
     }
     let code = params.get("code").map(String::as_str).unwrap_or("");
@@ -16567,7 +16631,10 @@ async fn handle_remote_mcp_oauth_callback(
                 info!(agent = %done.agent_id, server = %done.server, "remote MCP sign-in completed");
                 remote_mcp_result_page(
                     true,
-                    &format!("{} is connected for {}. Return to the dashboard.", done.server, done.agent_id),
+                    &format!(
+                        "{} is connected for {}. Return to the dashboard.",
+                        done.server, done.agent_id
+                    ),
                     Some(&done.redirect_origin),
                 )
             }

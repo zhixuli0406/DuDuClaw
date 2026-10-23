@@ -26,6 +26,17 @@ const ROUTE: &str = "/api/internal/google-token";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+#[async_trait::async_trait]
+impl duduclaw_gateway::google_identity::native_tools::NativeGoogleAccess for GoogleCaller {
+    async fn backend(&self, home: &Path, tool: &str) -> Result<GoogleBackend, String> {
+        GoogleCaller::backend(self, home, tool).await
+    }
+
+    async fn token(&self, home: &Path, tool: &str) -> Result<String, String> {
+        GoogleCaller::token(self, home, tool).await
+    }
+}
+
 /// Who is calling, as far as choosing a Google identity goes.
 #[derive(Debug, Default)]
 pub(crate) struct GoogleCaller {
@@ -33,6 +44,8 @@ pub(crate) struct GoogleCaller {
     agent: Option<String>,
     /// An employee id the process claims but could not prove.
     unproven_claim: Option<String>,
+    /// Dedicated calls execute in the host; no Google bearer reaches this process.
+    dedicated: Option<crate::mcp_auth::AcceptedGoogleCall>,
     /// What the last acquisition used (for the audit row and the notice).
     last: Mutex<Option<CallRecord>>,
 }
@@ -57,6 +70,16 @@ pub(crate) enum Plan {
 impl GoogleCaller {
     /// The caller of this MCP process for `caller_client_id`.
     pub(crate) fn for_process(home: &Path, caller_client_id: &str) -> Self {
+        if let Some(call) = crate::mcp_auth::current_accepted_google_call() {
+            // Only the lane accepted by the dispatcher is sticky; merely
+            // authenticating an internal integration key does not change Home.
+            return Self {
+                agent: (call.principal().client_id == caller_client_id)
+                    .then(|| call.principal().client_id.clone()),
+                dedicated: Some(call),
+                ..Default::default()
+            };
+        }
         if let Some(a) = crate::mcp_namespace::verified_employee_from_env(home) {
             return Self {
                 agent: Some(a),
@@ -91,6 +114,39 @@ impl GoogleCaller {
         }
     }
 
+    pub(crate) fn is_dedicated(&self) -> bool {
+        self.dedicated.is_some()
+    }
+
+    fn dedicated_authority(
+        &self,
+        home: &Path,
+        tool: &str,
+        args: &Value,
+    ) -> Result<(&str, &duduclaw_core::google_identity::CredentialRef), &'static str> {
+        let refused = "Google 專用連線已失效或權限已變更，這次操作尚未執行。請重新連線後再試。";
+        let call = self.dedicated.as_ref().ok_or(refused)?;
+        let agent = self.agent.as_deref().ok_or(refused)?;
+        if agent != call.principal().client_id
+            || !call.matches(tool, args)
+            || !crate::mcp_auth::dedicated_google_tool_allowed(home, call.principal(), tool)
+        {
+            return Err(refused);
+        }
+        Ok((agent, call.credential_ref().ok_or(refused)?))
+    }
+
+    pub(crate) async fn execute_dedicated(&self, home: &Path, tool: &str, args: &Value) -> Value {
+        let (agent, reference) = match self.dedicated_authority(home, tool, args) {
+            Ok(authority) => authority,
+            Err(error) => return super::tool_error(error),
+        };
+        match super::google_execute_client::execute(home, agent, reference, tool, args).await {
+            Ok(result) => result,
+            Err(error) => super::tool_error(&error),
+        }
+    }
+
     /// The decision for this caller (local files only).
     pub(crate) fn plan(&self, home: &Path) -> Plan {
         if let Some(a) = &self.agent {
@@ -122,6 +178,9 @@ impl GoogleCaller {
 
     /// A bearer backend for a tool that supports the Apps Script bridge too.
     pub(crate) async fn backend(&self, home: &Path, tool: &str) -> Result<GoogleBackend, String> {
+        if self.is_dedicated() {
+            return Err("Google 專用連線必須由 DuDuClaw 主程式執行，不能取得 Google 權杖。".into());
+        }
         match self.plan(home) {
             Plan::Home => {
                 self.record(CallRecord {
@@ -180,6 +239,9 @@ impl GoogleCaller {
 
     /// A bearer token for a tool that needs the direct API.
     pub(crate) async fn token(&self, home: &Path, tool: &str) -> Result<String, String> {
+        if self.is_dedicated() {
+            return Err("Google 專用連線必須由 DuDuClaw 主程式執行，不能取得 Google 權杖。".into());
+        }
         match self.plan(home) {
             Plan::Home => {
                 self.record(CallRecord {
@@ -414,6 +476,106 @@ pub(crate) async fn status_header(home: &Path, caller: &GoogleCaller) -> (String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dedicated_receipt_keeps_its_lane_when_employee_config_becomes_invalid() {
+        use crate::mcp_auth::{authenticate_with_key_call, with_authenticated_call};
+        for removed in [true, false] {
+            let home = home_with("bot", "[google]\nidentity='none'\n");
+            let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+            std::fs::write(home.path().join("config.toml"), format!(
+                "[mcp_keys.{key}]\nclient_id='bot'\nscopes=['google:read']\nis_external=true\ncreated_at='{}'\n",
+                chrono::Utc::now().to_rfc3339(),
+            )).unwrap();
+            let call = authenticate_with_key_call(key, home.path()).unwrap();
+            with_authenticated_call(call, async {
+                let args = json!({"query":"unit-fixed"});
+                let current = crate::mcp_auth::current_authenticated_call().unwrap();
+                let accepted = crate::mcp_auth::accept_google_lane(
+                    home.path(),
+                    current.principal(),
+                    "gmail_search",
+                )
+                .unwrap()
+                .bind(args.clone());
+                crate::mcp_auth::with_accepted_google_call(Some(accepted), async {
+                    let initial = GoogleCaller::for_process(home.path(), "bot");
+                    assert!(initial.is_dedicated());
+                    assert!(
+                        initial
+                            .dedicated_authority(home.path(), "gmail_search", &args)
+                            .is_ok()
+                    );
+                    assert!(
+                        initial
+                            .dedicated_authority(home.path(), "gmail_create_draft", &args)
+                            .is_err()
+                    );
+                    assert!(
+                        initial
+                            .dedicated_authority(
+                                home.path(),
+                                "gmail_search",
+                                &json!({"query":"changed"})
+                            )
+                            .is_err()
+                    );
+                    let path = home.path().join("agents/bot/agent.toml");
+                    if removed {
+                        std::fs::remove_file(path).unwrap();
+                    } else {
+                        std::fs::write(path, "[capabilities]\nallowed_tools=[").unwrap();
+                    }
+                    let caller = GoogleCaller::for_process(home.path(), "bot");
+                    assert!(
+                        caller.is_dedicated(),
+                        "an invalid employee must not change the receipt's lane"
+                    );
+                    assert_eq!(caller.agent.as_deref(), Some("bot"));
+                    assert!(
+                        caller
+                            .dedicated_authority(home.path(), "gmail_search", &args)
+                            .is_err()
+                    );
+                    // These methods must refuse before any vault, network or
+                    // ambient identity lookup; no account credentials exist here.
+                    assert!(caller.token(home.path(), "gmail_search").await.is_err());
+                    assert!(caller.backend(home.path(), "gmail_search").await.is_err());
+                })
+                .await;
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_custom_key_without_employee_keeps_original_home_path() {
+        use crate::mcp_auth::{authenticate_with_key_call, with_authenticated_call};
+        let home = tempfile::tempdir().unwrap();
+        let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{key}]\nclient_id='integration-client'\nscopes=['google:read']\nis_external=false\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        let call = authenticate_with_key_call(key, home.path()).unwrap();
+        with_authenticated_call(call, async {
+            let current = crate::mcp_auth::current_authenticated_call().unwrap();
+            assert!(
+                crate::mcp_auth::accept_google_lane(
+                    home.path(),
+                    current.principal(),
+                    "gmail_search"
+                )
+                .is_none()
+            );
+            let caller = GoogleCaller::for_process(home.path(), "integration-client");
+            assert!(!caller.is_dedicated());
+            assert_eq!(caller.plan(home.path()), Plan::Home);
+        })
+        .await;
+        let scope = crate::mcp_auth::with_accepted_google_call(None, std::future::pending::<()>());
+        assert!(std::mem::size_of_val(&scope) <= 512);
+    }
 
     fn home_with(agent: &str, google: &str) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();

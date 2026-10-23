@@ -3,6 +3,41 @@
 use super::*;
 
 #[tokio::test]
+async fn host_notice_is_delivered_after_original_json_path_redaction() {
+    let provider =
+        ScriptedProvider::new(vec![tool_use_resp("call-1", "search"), final_resp("done")]);
+    let executor = MockExecutor::new(MockBehavior::HostNotice(
+        r#"{"name":"王小明","id":7}"#.into(),
+        "ACTUAL_COMPANY_FALLBACK".into(),
+    ));
+    run_tool_loop_with_provenance(
+        &provider,
+        ChatRequest::new("m"),
+        &executor,
+        3,
+        ProvenanceConfig::default(),
+        Some(Arc::new(SpyInterceptor::allow_all())),
+    )
+    .await
+    .unwrap();
+    let sent = provider.last_request();
+    let ContentPart::ToolResult {
+        content, is_error, ..
+    } = &sent.messages.last().unwrap().parts[0]
+    else {
+        panic!("missing tool result")
+    };
+    assert!(!is_error);
+    assert!(content.contains("ACTUAL_COMPANY_FALLBACK"));
+    assert!(content.contains("<REDACT:X>"));
+    assert!(content.contains("\"id\""));
+    assert!(
+        !content.contains("王小明"),
+        "a notice prefix must never turn structured JSON into an unredacted string: {content}"
+    );
+}
+
+#[tokio::test]
 async fn policy_executor_passes_allowed_tool_through() {
     use duduclaw_core::types::ToolPolicy;
     let inner = MockExecutor::new(MockBehavior::Ok("ran".into()));

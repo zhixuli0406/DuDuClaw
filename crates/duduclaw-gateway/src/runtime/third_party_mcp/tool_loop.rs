@@ -131,6 +131,7 @@ mod tests {
             bearer_token: None,
             headers: Vec::new(),
             filter: Default::default(),
+            google_guard: None,
         }
     }
 
