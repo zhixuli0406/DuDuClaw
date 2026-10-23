@@ -2595,6 +2595,8 @@ mod workspace_docker;
 mod live_cases;
 #[path = "tests/profile_cases.rs"]
 mod profile_cases;
+#[path = "tests/profile_docker.rs"]
+mod profile_docker;
 
 // ── 2026-10: action rules on the computer-use route ─────────────────────
 
