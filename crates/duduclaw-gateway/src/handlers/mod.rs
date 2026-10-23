@@ -176,6 +176,8 @@ mod device_rpc;
 mod device_timedate_rpc;
 mod maintenance_rpc;
 mod device_backup;
+mod agent_channels_gchat_rpc;
+mod agent_channels_rpc;
 mod dispatch_core;
 mod dispatch_kb;
 mod dispatch_knowledge;
@@ -491,6 +493,9 @@ impl MethodHandler {
             return frame;
         }
         if let Some(frame) = self.dispatch_kb(method, &params, ctx).await {
+            return frame;
+        }
+        if let Some(frame) = self.dispatch_agent_channels(method, &params, ctx).await {
             return frame;
         }
         self.dispatch_core(method, params, ctx, conn).await

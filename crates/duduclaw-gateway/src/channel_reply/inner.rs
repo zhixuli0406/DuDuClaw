@@ -191,8 +191,9 @@ pub(super) async fn build_reply_with_session_inner(
     // conversation (history, redaction vault, pending goal state); the
     // access gate and takeover above ran on the conversation itself.
     let called_sid;
+    let own_bot = crate::trigger_route::in_own_bot_turn();
     let session_id: &str = match agent {
-        Some(a) if via_trigger => {
+        Some(a) if via_trigger || own_bot => {
             called_sid = crate::trigger_route::called_session(session_id, &a.config.agent.name);
             &called_sid
         }
@@ -212,6 +213,20 @@ pub(super) async fn build_reply_with_session_inner(
             "Using agent: {} ({})",
             a.config.agent.display_name, a.config.agent.name
         );
+    }
+
+    // Test seam (per-employee channels e2e): stands in for the model turn
+    // after the session bucket is chosen, claiming the session the way the
+    // real turn does so a cross-employee session clash shows up.
+    #[cfg(test)]
+    if let Some(reply) = crate::agent_channels::e2e_seam::answer(
+        ctx,
+        agent.map(|a| a.config.agent.name.as_str()),
+        session_id,
+    )
+    .await
+    {
+        return reply;
     }
 
     let model = agent

@@ -1746,6 +1746,9 @@ pub struct GoogleChatSender {
     pub(crate) space: String,
     /// Requesting user's Chat id (`users/…`) for confirmation scoping.
     pub(crate) user_id: String,
+    /// The AI employee whose own Chat app sends (falls back to the shared
+    /// app when that employee has none). `None` = shared app.
+    pub(crate) agent: Option<String>,
 }
 
 /// Create a Google Chat sender (dedicated constructor — needs `home_dir`
@@ -1755,17 +1758,28 @@ pub fn create_googlechat_sender(
     space: String,
     user_id: String,
 ) -> Box<dyn ChannelSender> {
+    create_googlechat_sender_for(home_dir, space, user_id, None)
+}
+
+/// [`create_googlechat_sender`] sending as `agent`'s own Chat app.
+pub fn create_googlechat_sender_for(
+    home_dir: std::path::PathBuf,
+    space: String,
+    user_id: String,
+    agent: Option<String>,
+) -> Box<dyn ChannelSender> {
     Box::new(GoogleChatSender {
         home_dir,
         space,
         user_id,
+        agent,
     })
 }
 
 #[async_trait]
 impl ChannelSender for GoogleChatSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        crate::googlechat::send_text_to_space(&self.home_dir, &self.space, text)
+        crate::googlechat::send_text_to_space_as(&self.home_dir, self.agent.as_deref(), &self.space, text)
             .await
             .map_err(ChannelSendError)
     }

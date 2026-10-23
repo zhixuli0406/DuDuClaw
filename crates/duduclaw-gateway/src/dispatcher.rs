@@ -3354,8 +3354,11 @@ async fn forward_to_channel(
             }
         }
         "googlechat" => {
+            // The employee's own Chat app when it (or the chain root) has
+            // one — that app is the member of the space — else the shared app.
+            let sender_agent = googlechat_sender_agent(home_dir, originating_agent, chain_root_agent).await;
             for (i, body) in chunks.iter().enumerate() {
-                crate::googlechat::send_text_to_space(home_dir, channel_id, body)
+                crate::googlechat::send_text_to_space_as(home_dir, sender_agent.as_deref(), channel_id, body)
                     .await
                     .map_err(|e| format!("googlechat send chunk {}/{}: {e}", i + 1, total))?;
                 if i + 1 < total {
@@ -3471,6 +3474,23 @@ async fn resolve_forward_token(
     }
     // 4: global fallback.
     get_config_token(config, enc_key, plain_key, home_dir).await
+}
+
+/// Which employee's own Google Chat app forwards a delegation reply: the
+/// callback agent's, else the chain root's, else none (shared app).
+async fn googlechat_sender_agent(
+    home_dir: &Path,
+    callback_agent_id: &str,
+    origin_agent: Option<&str>,
+) -> Option<String> {
+    for agent in std::iter::once(callback_agent_id).chain(origin_agent) {
+        if !agent.is_empty()
+            && crate::agent_channels::store::agent_chat_app(home_dir, agent).await.is_some()
+        {
+            return Some(agent.to_string());
+        }
+    }
+    None
 }
 
 /// Look up the origin_agent for a message_id. Used by

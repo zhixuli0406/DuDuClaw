@@ -122,6 +122,8 @@ pub fn perception_source_sensitivity(source: &str) -> Sensitivity {
 ///   chat the conversation is keyed by the sender, so the post-prefix remainder
 ///   equals `user_id`. In a group the remainder is a group/room/space id,
 ///   structurally distinct. `rest == user_id` → `true`.
+/// - An employee bucket `<conversation>#agent:<id>` (per-employee bots,
+///   `@`-called employees) is classified by its conversation part.
 /// - WebChat sessions are single-viewer browser connections; `compose_session_id`
 ///   may append `#agent:…#conv:…` suffixes, so `webchat` also accepts
 ///   `user_id` followed by a `#`-delimited suffix.
@@ -152,6 +154,19 @@ pub fn is_private_session(session_id: &str, user_id: &str) -> bool {
     // Identity test: 1:1 conversations are keyed by the sender themselves.
     if rest == user_id {
         return true;
+    }
+    // An employee's own bucket of a conversation (`<conversation>#agent:<id>`,
+    // used by per-employee bots and `@`-called employees) is as private as
+    // the conversation it belongs to: compare the conversation part only.
+    // Exactly one bucket suffix with a non-empty id; anything else falls
+    // through to the fail-closed default.
+    if channel != "webchat"
+        && let Some((conversation, agent)) = rest.split_once("#agent:")
+        && !agent.is_empty()
+        && !agent.contains('#')
+        && !conversation.is_empty()
+    {
+        return conversation == user_id && !(channel == "telegram" && conversation.starts_with('-'));
     }
     // WebChat: single-viewer session, id = "webchat:" + user_id, optionally with
     // compose_session_id's "#agent:…#conv:…" suffix appended.
@@ -289,6 +304,22 @@ mod tests {
         assert!(!is_private_session("telegram:-100456", "123"));
         // Even if a group member's id somehow appeared, the '-' marker wins.
         assert!(!is_private_session("telegram:-100456", "-100456"));
+    }
+
+    #[test]
+    fn agent_bucket_of_a_dm_stays_private_and_of_a_group_does_not() {
+        // Per-employee bot / called-employee buckets keep the conversation's class.
+        assert!(is_private_session("telegram:123#agent:hr-bot", "123"));
+        assert!(is_private_session("line:U1#agent:hr-bot", "U1"));
+        assert!(!is_private_session("telegram:-100456#agent:hr-bot", "123"));
+        assert!(!is_private_session("telegram:-100456#agent:hr-bot", "-100456"));
+        assert!(!is_private_session("line:C999#agent:hr-bot", "U1"));
+        assert!(!is_private_session("googlechat:spaces/AAA#agent:a", "users/1"));
+        // Malformed buckets fail closed.
+        assert!(!is_private_session("telegram:123#agent:", "123"));
+        assert!(!is_private_session("telegram:123#agent:a#agent:b", "123"));
+        assert!(!is_private_session("telegram:#agent:a", ""));
+        assert!(!is_private_session("telegram:999#agent:a", "123"));
     }
 
     #[test]

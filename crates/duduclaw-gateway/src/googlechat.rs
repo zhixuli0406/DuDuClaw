@@ -56,7 +56,19 @@ const GCHAT_TEXT_CHUNK: usize = 4000;
 
 pub struct GoogleChatState {
     pub(crate) ctx: Arc<ReplyContext>,
-    creds: GoogleChatCreds,
+    pub(crate) creds: Arc<GoogleChatCreds>,
+    /// `Some(id)` when this is an employee's own Chat app: every message is
+    /// answered by that employee, in its own session bucket.
+    pub(crate) agent: Option<String>,
+}
+
+/// Where a creds handle re-reads its service-account key at refresh time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredSource {
+    /// `config.toml [channels] googlechat_service_account_json`.
+    Global,
+    /// `agents/<id>/agent.toml [channels.googlechat] service_account_json`.
+    Agent(String),
 }
 
 /// Service-account credentials + token cache — separable from the webhook
@@ -80,7 +92,8 @@ pub struct GoogleChatCreds {
     token_uri: String,
     /// Cached OAuth token (access_token, fetched_at).
     token: RwLock<(String, std::time::Instant)>,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    source: CredSource,
 }
 
 impl GoogleChatCreds {
@@ -104,8 +117,18 @@ impl GoogleChatCreds {
         sa_json: &str,
         home_dir: &Path,
     ) -> Option<GoogleChatCreds> {
+        Self::with_source(sa_json, home_dir, CredSource::Global)
+    }
+
+    /// Creds for an employee's own Chat app (re-read from its `agent.toml`).
+    pub(crate) fn for_agent(sa_json: &str, home_dir: &Path, agent_id: &str) -> Option<GoogleChatCreds> {
+        Self::with_source(sa_json, home_dir, CredSource::Agent(agent_id.to_string()))
+    }
+
+    fn with_source(sa_json: &str, home_dir: &Path, source: CredSource) -> Option<GoogleChatCreds> {
         let (client_email, private_key, token_uri) = Self::parse_service_account_json(sa_json)?;
         Some(GoogleChatCreds {
+            source,
             home_dir: home_dir.to_path_buf(),
             client_email,
             private_key,
@@ -123,6 +146,57 @@ impl GoogleChatCreds {
         })
     }
 
+    /// The service account this handle signs as.
+    pub(crate) fn client_email(&self) -> &str {
+        &self.client_email
+    }
+
+    /// Chat REST API origin (`https://chat.googleapis.com/v1`). Test builds
+    /// can route one service account to a local fake; debug builds honour
+    /// `DUDUCLAW_DEV_GOOGLECHAT_API_BASE` (loopback only) for live tests.
+    pub(crate) fn api_base(&self) -> String {
+        #[cfg(test)]
+        if let Some(origin) = test_routes::api(&self.client_email) {
+            return origin;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(origin) =
+            crate::agent_channels::dev_override::loopback_origin("DUDUCLAW_DEV_GOOGLECHAT_API_BASE")
+        {
+            return origin;
+        }
+        CHAT_API.to_string()
+    }
+
+    /// JWKS URL inbound request tokens are verified against (Google's Chat
+    /// signer). Same test / debug override rules as [`Self::api_base`].
+    pub(crate) fn jwks_url(&self) -> String {
+        #[cfg(test)]
+        if let Some(url) = test_routes::jwks(&self.client_email) {
+            return url;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(url) =
+            crate::agent_channels::dev_override::loopback_origin("DUDUCLAW_DEV_GOOGLECHAT_JWKS_URL")
+        {
+            return url;
+        }
+        CHAT_JWKS_URL.to_string()
+    }
+
+    /// The service-account key as configured right now for this handle's
+    /// source. `None` when it cannot be read (or was removed).
+    async fn current_service_account_json(&self) -> Option<String> {
+        match &self.source {
+            CredSource::Global => read_config(&self.home_dir, "googlechat_service_account_json")
+                .await
+                .filter(|j| !j.trim().is_empty()),
+            CredSource::Agent(id) => crate::agent_channels::store::agent_chat_app(&self.home_dir, id)
+                .await
+                .map(|app| app.service_account.expose_owned()),
+        }
+    }
+
     /// Build from global config; `None` when the channel isn't configured.
     pub(crate) async fn from_config(home_dir: &std::path::Path) -> Option<GoogleChatCreds> {
         let sa_json = read_config(home_dir, "googlechat_service_account_json").await?;
@@ -130,6 +204,11 @@ impl GoogleChatCreds {
             return None;
         }
         Self::from_service_account_json(&sa_json, home_dir)
+    }
+
+    /// The access token (fetched or cached) — used by the credential probe.
+    pub(crate) async fn token(&self) -> Result<String, String> {
+        self.get_token().await
     }
 
     /// Get (or refresh) the service-account access token (JWT-bearer grant).
@@ -151,19 +230,20 @@ impl GoogleChatCreds {
         // directly) — this is an outbound credential, not a security gate,
         // so failing open to "try with the last known key" is preferable to
         // breaking every send on a momentary read hiccup.
-        let (client_email, private_key, token_uri) =
-            match read_config(&self.home_dir, "googlechat_service_account_json").await {
-                Some(json) if !json.trim().is_empty() => Self::parse_service_account_json(&json)
-                    .ok_or_else(|| {
-                        "googlechat_service_account_json is not a valid service-account key"
-                            .to_string()
-                    })?,
-                _ => (
-                    self.client_email.clone(),
-                    self.private_key.clone(),
-                    self.token_uri.clone(),
-                ),
-            };
+        //
+        // An employee's own app fails closed instead: when its key was
+        // removed (or the employee deleted) nothing is sent as that app.
+        let (client_email, private_key, token_uri) = match self.current_service_account_json().await {
+            Some(json) => Self::parse_service_account_json(&json).ok_or_else(|| {
+                "googlechat_service_account_json is not a valid service-account key".to_string()
+            })?,
+            None if self.source == CredSource::Global => (
+                self.client_email.clone(),
+                self.private_key.clone(),
+                self.token_uri.clone(),
+            ),
+            None => return Err("this AI employee's Google Chat app is no longer configured".into()),
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -234,7 +314,8 @@ pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -
 
     let state = Arc::new(GoogleChatState {
         ctx: ctx.clone(),
-        creds,
+        creds: Arc::new(creds),
+        agent: None,
     });
 
     // Verify credentials eagerly so the dashboard shows real status.
@@ -297,19 +378,33 @@ async fn webhook_handler(
             return (StatusCode::UNAUTHORIZED, "not configured").into_response();
         }
     };
-    if let Err(e) = crate::webhook_jwt::verify_rs256(
-        &state.creds.http,
-        token,
-        CHAT_JWKS_URL,
-        CHAT_ISSUER,
-        &project_number,
-    )
-    .await
-    {
+    if let Err(e) = verify_request(&state.creds, token, &project_number).await {
         warn!("Google Chat webhook: JWT verification failed: {e}");
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
+    dispatch_event(state, body).await
+}
 
+/// Verify a Chat request token: RS256 by Google's Chat signer, audience =
+/// the app's Cloud project number. Fail closed on every error.
+pub(crate) async fn verify_request(
+    creds: &GoogleChatCreds,
+    token: &str,
+    project_number: &str,
+) -> Result<serde_json::Value, String> {
+    crate::webhook_jwt::verify_rs256(
+        &creds.http,
+        token,
+        &creds.jwks_url(),
+        CHAT_ISSUER,
+        project_number,
+    )
+    .await
+}
+
+/// Handle an already-verified Chat event (shared by the shared app and the
+/// employees' own apps).
+pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> axum::response::Response {
     let event: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -333,8 +428,10 @@ async fn webhook_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
             info!("Google Chat: added to space {space}");
-            let product =
-                "DuDuClaw".to_string();
+            let product = match &state.agent {
+                Some(id) => crate::trigger_route::display_name(&*state.ctx.registry.read().await, id),
+                None => "DuDuClaw".to_string(),
+            };
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
@@ -400,7 +497,8 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     let mut attachment_lines: Vec<String> = Vec::new();
     if !attachments.is_empty() {
         let attach_base =
-            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None).await;
+            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), state.agent.as_deref())
+                .await;
         for att in &attachments {
             let filename = att.effective_filename();
             match &att.reference {
@@ -501,19 +599,28 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
 
     // ── Chat commands ──
     let session_id = format!("googlechat:{space}");
+    // An employee's own app answers in the employee's own bucket of the space
+    // (two employees' apps can share one space).
+    let reply_session = match &state.agent {
+        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
+        None => session_id.clone(),
+    };
     if crate::chat_commands::is_command(&text) {
         if let Some(cmd) = crate::chat_commands::parse_command(&text, None) {
-            let agent_id = {
-                let reg = state.ctx.registry.read().await;
-                reg.main_agent()
-                    .map(|a| a.config.agent.name.clone())
-                    .unwrap_or_default()
+            let agent_id = match &state.agent {
+                Some(agent) => agent.clone(),
+                None => {
+                    let reg = state.ctx.registry.read().await;
+                    reg.main_agent()
+                        .map(|a| a.config.agent.name.clone())
+                        .unwrap_or_default()
+                }
             };
             let reply = crate::chat_commands::handle_command_for_sender(
                 &cmd,
                 &state.ctx,
                 "googlechat",
-                &session_id,
+                &reply_session,
                 &agent_id,
                 &sender_id,
             )
@@ -554,15 +661,35 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         None,
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = thinking
-        .scope(build_guarded_reply_with_session(
-            &input_text,
-            &state.ctx,
-            &session_id,
-            crate::ccr_runtime::reply_principal_for_sender(&sender_id),
-            Some(on_progress),
-        ))
-        .await;
+    let guarded = match &state.agent {
+        // Own app: deterministic routing to its employee, in the employee's
+        // bucket; the access gate and takeover still run on the space.
+        Some(agent) => {
+            thinking
+                .scope(crate::trigger_route::as_own_bot_turn(
+                    crate::channel_reply::build_guarded_reply_for_agent(
+                        &input_text,
+                        &state.ctx,
+                        agent,
+                        &session_id,
+                        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+                        Some(on_progress),
+                    ),
+                ))
+                .await
+        }
+        None => {
+            thinking
+                .scope(build_guarded_reply_with_session(
+                    &input_text,
+                    &state.ctx,
+                    &session_id,
+                    crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+                    Some(on_progress),
+                ))
+                .await
+        }
+    };
     let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
         deliver_reply(
@@ -581,14 +708,15 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     // sender's default `send_document` degrades to a text notice (→ dashboard
     // Files panel); the marker is stripped from the reply.
     let reply = {
-        let doc_sender = crate::channel_sender::create_googlechat_sender(
+        let doc_sender = crate::channel_sender::create_googlechat_sender_for(
             state.ctx.home_dir.clone(),
             space.clone(),
             sender_id.clone(),
+            state.agent.clone(),
         );
         crate::channel_reply::deliver_documents_for_reply_guarded(
             state.ctx.as_ref(),
-            None,
+            state.agent.as_deref(),
             guarded.text.clone(),
             doc_sender.as_ref(),
             Some(&guarded),
@@ -657,9 +785,32 @@ pub async fn send_text_to_space(
     space: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    let creds = GoogleChatCreds::from_config(home_dir)
-        .await
-        .ok_or("Google Chat channel not configured")?;
+    send_text_to_space_as(home_dir, None, space, markdown).await
+}
+
+/// [`send_text_to_space`] as an employee's own Chat app when `agent` has one
+/// (its app is the member of the spaces it talks in), else as the shared app.
+pub async fn send_text_to_space_as(
+    home_dir: &Path,
+    agent: Option<&str>,
+    space: &str,
+    markdown: &str,
+) -> Result<(), String> {
+    let creds = match agent {
+        Some(id) => match crate::googlechat_agents::agent_creds(home_dir, id).await {
+            Some(c) => c,
+            None => Arc::new(
+                GoogleChatCreds::from_config(home_dir)
+                    .await
+                    .ok_or("Google Chat channel not configured")?,
+            ),
+        },
+        None => Arc::new(
+            GoogleChatCreds::from_config(home_dir)
+                .await
+                .ok_or("Google Chat channel not configured")?,
+        ),
+    };
     let formatted = crate::markdown_render::to_googlechat_text(markdown);
     for chunk in crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK) {
         if create_message(&creds, space, None, &chunk).await.is_none() {
@@ -684,7 +835,7 @@ async fn create_message(
         }
     };
     let mut body = serde_json::json!({ "text": text });
-    let mut url = format!("{CHAT_API}/{space}/messages");
+    let mut url = format!("{}/{space}/messages", creds.api_base());
     if let Some(th) = thread {
         body["thread"] = serde_json::json!({ "name": th });
         url.push_str("?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
@@ -816,9 +967,9 @@ fn parse_gchat_attachments(message: &serde_json::Value) -> Vec<GchatAttachment> 
 /// Build the media-download URL for an uploaded attachment's `resourceName`.
 /// The resource name is a slash-separated path segment
 /// (`spaces/…/messages/…/attachments/…`) used verbatim in the URL path.
-fn media_download_url(resource_name: &str) -> String {
+fn media_download_url(api_base: &str, resource_name: &str) -> String {
     format!(
-        "{CHAT_API}/media/{}?alt=media",
+        "{api_base}/media/{}?alt=media",
         resource_name.trim_start_matches('/')
     )
 }
@@ -828,7 +979,7 @@ fn media_download_url(resource_name: &str) -> String {
 /// through the shared SSRF-validated downloader.
 async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<Vec<u8>, String> {
     let token = creds.get_token().await?;
-    let url = media_download_url(resource_name);
+    let url = media_download_url(&creds.api_base(), resource_name);
     let bearer = format!("Bearer {token}");
     crate::media::download_url(
         &creds.http,
@@ -848,7 +999,7 @@ async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str)
             return;
         }
     };
-    let url = format!("{CHAT_API}/{message_name}?updateMask=text");
+    let url = format!("{}/{message_name}?updateMask=text", creds.api_base());
     let body = serde_json::json!({ "text": text });
     match creds
         .http
@@ -875,6 +1026,35 @@ async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str)
 /// Progress-callback filter: only events a text channel can render
 /// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would
 /// otherwise reach the customer as an empty or unintended message).
+/// Test-only routing of one service account's Chat API / JWKS to a local
+/// fake, keyed by the account's `client_email` (parallel tests never share
+/// an override).
+#[cfg(test)]
+pub(crate) mod test_routes {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn routes() -> &'static Mutex<HashMap<String, (String, String)>> {
+        static R: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+        R.get_or_init(Default::default)
+    }
+
+    pub(crate) fn set(client_email: &str, api: &str, jwks: &str) {
+        routes()
+            .lock()
+            .unwrap()
+            .insert(client_email.into(), (api.into(), jwks.into()));
+    }
+
+    pub(crate) fn api(client_email: &str) -> Option<String> {
+        routes().lock().unwrap().get(client_email).map(|r| r.0.clone())
+    }
+
+    pub(crate) fn jwks(client_email: &str) -> Option<String> {
+        routes().lock().unwrap().get(client_email).map(|r| r.1.clone())
+    }
+}
+
 pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
     event.is_channel_text()
 }
@@ -961,12 +1141,12 @@ mod tests {
     #[test]
     fn media_download_url_is_wellformed() {
         assert_eq!(
-            media_download_url("spaces/A/messages/B/attachments/C"),
+            media_download_url(CHAT_API, "spaces/A/messages/B/attachments/C"),
             "https://chat.googleapis.com/v1/media/spaces/A/messages/B/attachments/C?alt=media"
         );
         // A leading slash must not produce a double slash.
         assert_eq!(
-            media_download_url("/spaces/A/messages/B/attachments/C"),
+            media_download_url(CHAT_API, "/spaces/A/messages/B/attachments/C"),
             "https://chat.googleapis.com/v1/media/spaces/A/messages/B/attachments/C?alt=media"
         );
     }
