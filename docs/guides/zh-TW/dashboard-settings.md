@@ -53,6 +53,10 @@
 - WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘：六條 webhook 路由一律掛著。通道設定好之前回 404；設定好之後會驗證平台的簽章，簽章錯誤回 401。`channels.add` 不必重啟就會啟動通道，`channels.add` 回 `hot_started` 與 `restart_required: false`；憑證不完整時附 `not_started_reason`。個別員工的 Slack bot 也會在新增時直接啟動。
 - 通訊軟體的思考顯示（沒有專屬控制項，在設定檔進階編輯裡設定，每次回覆都重新讀取）：`[thinking] channel_audience` = `internal`（預設：通道身分已驗證、帳號啟用中，且是管理員或綁定回答員工的發話者看得到計時與遮蔽後的摘要，其他人只看計時）、`all`（一對一聊天的所有發話者都看得到摘要）或 `none`（都不顯示）；`[thinking] channel_group_display` = `status`（預設：群組聊天只顯示計時）、`summary` 或 `off`。`[thinking] display` 與回答員工的 `[model] show_thinking` 取較嚴格者，仍是兩者的上限。`config.toml` 讀不到或值不認得時都不顯示。網站訪客（Odoo 線上客服、WebChat 網站小工具）永遠看不到思考。詳見[通訊軟體的思考顯示](../../features/zh-TW/66-thinking-in-messaging-apps.md)。
 
+## 整合 → Odoo → 連線設定
+
+「允許連到內網的 Odoo」寫入 `[odoo] allow_private_network`（只有管理員能改，預設關閉；隨連線設定由 `odoo.configure` 一起儲存，「測試連線」用畫面上的開關值）。關閉時，Odoo 網址（全域或個別員工）必須是 HTTPS 且指向公開主機（只有 `localhost` 可用 `http://`）。開啟後允許 192.168.x.x、10.x.x.x 這類內網位址，HTTPS 或 HTTP 都可以；本機位址、link-local 與雲端 metadata 位址（169.254.169.254、`metadata.google.internal`）仍一律拒絕，連線會釘在解析時檢查過的位址上，也不走代理。升級後第一次開機時，若已設定的 Odoo 網址解析到內網位址，系統會自動把它打開（稽核事件 `odoo_allow_private_network_auto_enabled`），舊客戶不會斷線。下次連線時生效。
+
 ## 整合 → Odoo → 網站線上客服
 
 用自己的儲存按鈕透過 `odoo.livechat.set`（管理員）寫入 `[odoo_livechat]`。它和 `[odoo]` 分開，因為儲存 Odoo 連線設定時會整段改寫 `[odoo]`。機器人 API 金鑰加密存成 `bot_api_key_enc`，不會回傳；欄位留空表示不變。每次儲存與每次「交回 AI」都寫入稽核紀錄。詳見 [features/zh-TW/61-odoo-livechat.md](../../features/zh-TW/61-odoo-livechat.md)。
