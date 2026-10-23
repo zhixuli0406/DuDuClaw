@@ -9,7 +9,7 @@ import { OrgHistorySettings } from './OrgHistorySettings';
 beforeEach(() => {
   vi.clearAllMocks();
   useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
-  mockWsClient.call.mockResolvedValue({ manager_team_history: true, since: '2026-10-23T00:00:00Z', generation: 1 });
+  mockWsClient.call.mockResolvedValue({ manager_team_history: true, since: '2026-10-23T00:00:00Z' });
 });
 
 describe('organisation conversation settings', () => {
@@ -18,7 +18,7 @@ describe('organisation conversation settings', () => {
     renderWithProviders(<OrgHistorySettings />);
     const toggle = await screen.findByRole('switch', { name: 'Manager conversation access' });
     await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'));
-    mockWsClient.call.mockResolvedValue({ manager_team_history: false, since: null, generation: 2 });
+    mockWsClient.call.mockResolvedValue({ manager_team_history: false, since: null });
     await user.click(toggle);
     expect(mockWsClient.call).toHaveBeenCalledWith('users.org_settings.update', { manager_team_history: false });
     await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'));

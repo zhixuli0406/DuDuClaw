@@ -2329,7 +2329,6 @@ export interface TeamHistoryTranscript {
 export interface TeamHistorySettings {
   manager_team_history: boolean;
   since: string | null;
-  generation: number;
 }
 
 export interface AuditEntry {

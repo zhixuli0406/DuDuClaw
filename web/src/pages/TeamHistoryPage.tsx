@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useIntl } from 'react-intl';
+import { useIntl, type IntlShape } from 'react-intl';
 import { useSearchParams } from 'react-router';
 import { Eye, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
 import { api, type MyTeam, type TeamHistoryClass, type TeamHistoryList, type TeamHistoryPart, type TeamHistoryTranscript } from '@/lib/api';
@@ -142,7 +142,7 @@ export function TeamHistoryPage() {
             {currentPage?.sessions.length === 0 && <p className="py-8 text-sm text-muted-foreground">{msg('empty')}</p>}
             {currentPage?.sessions.map(s => <button type="button" key={s.session_id} onClick={() => { setError(null); setSelected(s.session_id); }} aria-pressed={selected === s.session_id}
               className={cn('w-full min-w-0 rounded-xl border border-surface-border p-3 text-left hover:bg-muted', selected === s.session_id && 'bg-surface-selected ring-1 ring-brand/40')}>
-              <span className="block break-words text-sm font-medium">{s.title || msg('untitled')}</span>
+              <span className="block break-words text-sm font-medium">{localizedTitle(s.title, s.title_masked, intl) || msg('untitled')}</span>
               <span className="mt-1 block text-xs text-muted-foreground">{s.report?.display_name ?? (s.class === 'own' ? msg('you') : msg('external'))} · {s.channel ?? 'WebChat'} · {s.turns}</span>
               <time className="text-xs text-muted-foreground" dateTime={s.last_active}>{formatDate(s.last_active, intl.locale)}</time>
               {s.title_masked && <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs">{msg('masked')}</span>}
@@ -171,6 +171,19 @@ function HistoryPart({ part }: { part: TeamHistoryPart }) {
   const intl = useIntl();
   if (part.t === 'text') return <>{part.v}</>;
   if (part.t === 'attachment') return <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">{intl.formatMessage({ id: part.kind === 'image' ? 'teamHistory.image' : 'teamHistory.attachment' })}{part.name ? ` · ${part.name}` : ''}</span>;
-  const label = intl.formatMessage({ id: `teamHistory.category.${part.cat}`, defaultMessage: part.cat });
+  const label = categoryLabel(intl, part.cat);
   return <span className="mx-0.5 inline-block rounded-md bg-brand/10 px-1.5 py-0.5 text-xs text-brand" title={intl.formatMessage({ id: 'teamHistory.maskHint' }, { category: label })}>{label} {part.n}</span>;
+}
+
+function categoryLabel(intl: IntlShape, category: string): string {
+  const id = `teamHistory.category.${category}`;
+  return id in intl.messages ? intl.formatMessage({ id }) : category;
+}
+
+/** Only translate the server's masked-title markers. An own conversation's
+ * literal text must remain unchanged; unknown custom categories stay text. */
+function localizedTitle(title: string, masked: boolean, intl: IntlShape): string {
+  if (!masked) return title;
+  return title.replace(/〔([A-Z][A-Z0-9_]*) (\d+)〕/g, (_value, category: string, n: string) =>
+    `〔${categoryLabel(intl, category)} ${n}〕`);
 }

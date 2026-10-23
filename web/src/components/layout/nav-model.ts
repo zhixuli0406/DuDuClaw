@@ -774,9 +774,9 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
     }
   }
   for (const group of navGroups) {
-    const item = group.items.find(
-      (i) => i.to === pathname || (i.to !== '/' && pathname.startsWith(i.to)),
-    );
+    const item = group.items
+      .filter((i) => i.to === pathname || (i.to !== '/' && pathname.startsWith(`${i.to}/`)))
+      .sort((a, b) => b.to.length - a.to.length)[0];
     if (item) return [{ labelId: item.crumb ?? item.label }];
   }
   return [];

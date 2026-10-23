@@ -172,6 +172,7 @@ describe('App routes — Enterprise-only pages are closed on Personal (WP-A D8/D
     setRole('manager');
     renderAppAt('/team/conversations');
     expect(await screen.findByRole('heading', { name: 'Team conversations' })).toBeInTheDocument();
+    await waitFor(() => expect(document.title).toMatch(/^Team conversations ·/));
   });
 });
 

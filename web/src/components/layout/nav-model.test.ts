@@ -208,6 +208,12 @@ describe('nav-model — 1.76.0 /team (我的團隊) addition', () => {
 });
 
 describe('nav-model — page titles for the people pages', () => {
+  it('uses the specific leaf for team conversations and matches route segments', () => {
+    expect(crumbsFor('/team/conversations').at(-1)?.labelId).toBe('nav.teamHistory');
+    expect(crumbsFor('/team/conversations/detail').at(-1)?.labelId).toBe('nav.teamHistory');
+    expect(crumbsFor('/teamwork')).toEqual([]);
+  });
+
   it('gives /team and the members page (canonical and legacy path) their own label', () => {
     expect(crumbsFor('/team').at(-1)?.labelId).toBe('nav.myTeam');
     expect(crumbsFor('/manage/users').at(-1)?.labelId).toBe('manage.users');

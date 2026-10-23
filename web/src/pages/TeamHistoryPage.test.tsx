@@ -31,6 +31,19 @@ beforeEach(() => {
 });
 
 describe('TeamHistoryPage', () => {
+  it('localizes masked list titles while preserving literal titles of own conversations', async () => {
+    const normal = mockWsClient.call.getMockImplementation()!;
+    mockWsClient.call.mockImplementation((method, params) => method === 'users.team_history.list'
+      ? Promise.resolve({ sessions: [
+        { ...row('external'), title: 'Call 〔PHONE 1〕 / 〔MY_RULE 2〕' },
+        { ...row('own'), class: 'own', channel: null, title: 'Literal 〔PHONE 1〕', title_masked: false },
+      ], ner: false, since: '2026-10-23T00:00:00Z' })
+      : normal(method, params));
+    renderWithProviders(<TeamHistoryPage />);
+    expect(await screen.findByRole('button', { name: /Call 〔Phone 1〕 \/ 〔MY_RULE 2〕/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Literal 〔PHONE 1〕/ })).toBeInTheDocument();
+  });
+
   it('renders escaped read-only parts, masking labels and the regex-only warning without links or a composer', async () => {
     const user = userEvent.setup();
     renderWithProviders(<TeamHistoryPage />);
