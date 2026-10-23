@@ -92,6 +92,9 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("channels.discord", &[], Change),
     key("channels.telegram", &[], Change),
     key("channels.slack", &[], Change),
+    // B11: an employee's own Google Chat app (an organisation cloud
+    // credential and a new inbound endpoint).
+    key("channels.googlechat", &[], Change),
     // ERP models, actions, companies and credentials
     // (`odoo.agent_config_set` is admin-only).
     key("odoo", &["odoo."], Change),

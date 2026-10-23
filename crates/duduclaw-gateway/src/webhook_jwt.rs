@@ -19,6 +19,47 @@ use tokio::sync::RwLock;
 
 /// JWKS cache TTL (Microsoft guidance: refresh at least every 24h).
 const JWKS_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Least time between two forced refetches of one JWKS URL. An unknown `kid`
+/// forces a refetch (key rotation); without a floor every unauthenticated
+/// request with a random `kid` made an outbound fetch.
+const FORCED_REFETCH_MIN: Duration = Duration::from_secs(60);
+
+static LAST_FORCED: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+async fn fetch_jwks(http: &reqwest::Client, jwks_url: &str) -> Result<serde_json::Value, String> {
+    let resp = http
+        .get(jwks_url)
+        .send()
+        .await
+        .map_err(|e| format!("JWKS fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("JWKS fetch status {}", resp.status()));
+    }
+    resp.json().await.map_err(|e| format!("JWKS parse: {e}"))
+}
+
+/// Return the forced-refetch slot of `jwks_url` (its fetch failed).
+fn release_forced_refetch(jwks_url: &str) {
+    if let Some(m) = LAST_FORCED.get() {
+        m.lock().unwrap_or_else(|e| e.into_inner()).remove(jwks_url);
+    }
+}
+
+/// Whether a forced refetch of `jwks_url` may run now (and record it).
+fn forced_refetch_allowed(jwks_url: &str) -> bool {
+    let mut map = LAST_FORCED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match map.get(jwks_url) {
+        Some(at) if now.duration_since(*at) < FORCED_REFETCH_MIN => false,
+        _ => {
+            map.insert(jwks_url.to_string(), now);
+            true
+        }
+    }
+}
 
 struct CachedJwks {
     /// kid → (n, e) RSA components (base64url).
@@ -39,28 +80,40 @@ async fn rsa_components_for_kid(
     kid: &str,
     force_refresh: bool,
 ) -> Result<(String, String), String> {
-    if !force_refresh {
+    let cached_fresh = {
         let cache = jwks_cache().read().await;
-        if let Some(entry) = cache.get(jwks_url) {
-            if entry.fetched_at.elapsed() < JWKS_TTL {
-                if let Some(k) = entry.keys.get(kid) {
-                    return Ok(k.clone());
+        match cache.get(jwks_url) {
+            Some(entry) if entry.fetched_at.elapsed() < JWKS_TTL => {
+                if !force_refresh {
+                    // Unknown kid: the caller retries with a (rate-limited)
+                    // forced refetch.
+                    return entry
+                        .keys
+                        .get(kid)
+                        .cloned()
+                        .ok_or_else(|| format!("kid {kid} not in cached JWKS"));
                 }
-                // Unknown kid on a fresh-enough document → fall through to
-                // a forced refresh below (key rotation).
+                true
             }
+            _ => false,
         }
+    };
+    // Unknown kid on a fresh document: refetch at most once a minute.
+    let rate_limited = force_refresh && cached_fresh;
+    if rate_limited && !forced_refetch_allowed(jwks_url) {
+        return Err(format!("kid {kid} not found in JWKS"));
     }
 
-    let resp = http
-        .get(jwks_url)
-        .send()
-        .await
-        .map_err(|e| format!("JWKS fetch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("JWKS fetch status {}", resp.status()));
-    }
-    let doc: serde_json::Value = resp.json().await.map_err(|e| format!("JWKS parse: {e}"))?;
+    let doc = match fetch_jwks(http, jwks_url).await {
+        Ok(doc) => doc,
+        Err(e) => {
+            // A failed fetch did not refresh anything: give the slot back.
+            if rate_limited {
+                release_forced_refetch(jwks_url);
+            }
+            return Err(e);
+        }
+    };
     let mut keys: HashMap<String, (String, String)> = HashMap::new();
     for key in doc
         .get("keys")
@@ -136,6 +189,16 @@ pub fn bearer_token(auth_header: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_refetch_is_rate_limited_per_url() {
+        let url = format!("http://127.0.0.1:1/jwks-{}", uuid::Uuid::new_v4());
+        assert!(forced_refetch_allowed(&url));
+        assert!(!forced_refetch_allowed(&url), "second forced refetch inside a minute is refused");
+        assert!(forced_refetch_allowed(&format!("{url}-other")), "per URL");
+        release_forced_refetch(&url);
+        assert!(forced_refetch_allowed(&url), "a failed fetch returns the slot");
+    }
 
     #[test]
     fn bearer_extraction() {

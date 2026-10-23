@@ -238,6 +238,9 @@ tempfile = "3"
 # assertions against a local mock token endpoint. Already in Cargo.lock (via
 # sqlx-mysql); test-only.
 rsa = { version = "0.9", features = ["pem"] }
+# B11 per-employee Google Chat e2e: RSA keys for locally signed test JWTs
+# and service-account keys (already in the tree via jsonwebtoken / rustls).
+aws-lc-rs = "1"
 # `Router::oneshot` for middleware regression tests (decision_gate) — drives the
 # real router in-process instead of binding a port. Already in the tree via axum.
 tower = { version = "0.5", features = ["util"] }

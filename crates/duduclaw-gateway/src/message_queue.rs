@@ -198,6 +198,9 @@ impl MessageQueue {
         )?;
         // 2026-10-08: read-only explore lane for event-woken runs.
         Self::ensure_column(conn, "message_queue", "lane", "TEXT")?;
+        // B11: the employee whose own bot / app the originating conversation
+        // came in through (NULL = shared bot / app or a legacy row).
+        Self::ensure_column(conn, "delegation_callbacks", "sender_agent", "TEXT")?;
         Ok(())
     }
 

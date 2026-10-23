@@ -327,6 +327,28 @@ pub fn in_called_turn() -> bool {
 }
 
 tokio::task_local! {
+    /// Set by an employee's own bot (its own Telegram bot or Google Chat app)
+    /// around the reply it builds: the turn runs in that employee's own
+    /// session bucket ([`called_session`]) after the access gate and takeover
+    /// checks ran on the conversation itself — exactly like a called turn,
+    /// but it is not a call (no name prefix, no `@` semantics). Without it two
+    /// employees' bots in one chat (and every Telegram DM: a person has the
+    /// same private-chat id with every bot) shared one session, and the second
+    /// employee's turn failed on the session-ownership check.
+    pub static OWN_BOT_TURN: ();
+}
+
+/// Run `fut` as a turn answered by an employee's own bot.
+pub async fn as_own_bot_turn<F: std::future::Future>(fut: F) -> F::Output {
+    OWN_BOT_TURN.scope((), fut).await
+}
+
+/// Whether the current reply is answered by an employee's own bot.
+pub fn in_own_bot_turn() -> bool {
+    OWN_BOT_TURN.try_with(|_| ()).is_ok()
+}
+
+tokio::task_local! {
     /// Set by the reply builder for one turn; read by its wrapper so the
     /// reply is restored, contract-checked and labelled as the employee that
     /// actually answered.

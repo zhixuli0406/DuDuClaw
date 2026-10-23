@@ -295,6 +295,17 @@ const PUSHABLE_CHANNELS: [&str; 8] = [
 /// conversation from `<home>/sessions.db` (`<channel>:<chat…>` session ids).
 /// Returns `(channel, chat_id)` — e.g. `("discord", "thread:123…")`.
 pub fn resolve_notify_fallback(home_dir: &Path, agent_id: &str) -> Option<(String, String)> {
+    resolve_notify_fallback_with_sender(home_dir, agent_id).map(|(ch, chat, _)| (ch, chat))
+}
+
+/// [`resolve_notify_fallback`] plus the employee whose bucket the
+/// conversation was (`<channel>:<chat>#agent:<id>`, B11): the chat id never
+/// carries the bucket, and the bucket's employee is returned as the sender so
+/// the notice goes out through that employee's own bot / app.
+pub fn resolve_notify_fallback_with_sender(
+    home_dir: &Path,
+    agent_id: &str,
+) -> Option<(String, String, Option<String>)> {
     let db_path = home_dir.join("sessions.db");
     let conn = rusqlite::Connection::open_with_flags(
         &db_path,
@@ -313,10 +324,16 @@ pub fn resolve_notify_fallback(home_dir: &Path, agent_id: &str) -> Option<(Strin
         .flatten()
         .collect();
     for id in ids {
-        if let Some((channel, chat)) = id.split_once(':') {
-            if PUSHABLE_CHANNELS.contains(&channel) && !chat.is_empty() {
-                return Some((channel.to_string(), chat.to_string()));
-            }
+        let conversation = duduclaw_core::session_conversation(&id);
+        let sender = id
+            .split_once("#agent:")
+            .map(|(_, a)| a.to_string())
+            .filter(|a| duduclaw_core::is_valid_agent_id(a));
+        if let Some((channel, chat)) = conversation.split_once(':')
+            && PUSHABLE_CHANNELS.contains(&channel)
+            && !chat.is_empty()
+        {
+            return Some((channel.to_string(), chat.to_string(), sender));
         }
     }
     None
@@ -722,5 +739,12 @@ mod tests {
         assert_eq!(chat, "thread:123");
 
         assert!(resolve_notify_fallback(home.path(), "no-such-agent").is_none());
+
+        // B11: an own-bot bucket yields the plain chat id plus the sender.
+        insert("telegram:777#agent:sales", "sales", "2026-07-28T12:00:00Z", None);
+        let (ch, chat, sender) =
+            resolve_notify_fallback_with_sender(home.path(), "sales").expect("bucket target");
+        assert_eq!((ch.as_str(), chat.as_str()), ("telegram", "777"));
+        assert_eq!(sender.as_deref(), Some("sales"));
     }
 }
