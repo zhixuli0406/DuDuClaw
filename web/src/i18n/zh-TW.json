@@ -2746,6 +2746,8 @@
   "killswitch.tokenExplosionMultiplier": "用量暴增倍數 (token)",
   "killswitch.cooldownSecs": "冷卻時間 (秒)",
   "killswitch.halfOpenAllowCount": "半開放允許次數",
+  "killswitch.hardWindowSecs": "迴圈硬上限視窗 (秒)",
+  "killswitch.hardMaxMessages": "視窗內訊息硬上限（超過就斷路）",
   "killswitch.safetyWords": "安全指令詞",
   "killswitch.safetyWords.stop": "停止",
   "killswitch.safetyWords.stop_all": "全部停止",

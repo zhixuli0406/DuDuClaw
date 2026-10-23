@@ -2746,6 +2746,8 @@
   "killswitch.tokenExplosionMultiplier": "Token Explosion Multiplier",
   "killswitch.cooldownSecs": "Cooldown (secs)",
   "killswitch.halfOpenAllowCount": "Half-open Allow Count",
+  "killswitch.hardWindowSecs": "Loop hard-limit window (seconds)",
+  "killswitch.hardMaxMessages": "Message hard limit in that window (trips above it)",
   "killswitch.safetyWords": "Safety Words",
   "killswitch.safetyWords.stop": "Stop",
   "killswitch.safetyWords.stop_all": "Stop All",

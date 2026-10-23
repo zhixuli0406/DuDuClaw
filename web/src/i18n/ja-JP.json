@@ -2746,6 +2746,8 @@
   "killswitch.tokenExplosionMultiplier": "トークン爆発倍率",
   "killswitch.cooldownSecs": "クールダウン（秒）",
   "killswitch.halfOpenAllowCount": "ハーフオープン許可回数",
+  "killswitch.hardWindowSecs": "ループ上限のウィンドウ（秒）",
+  "killswitch.hardMaxMessages": "ウィンドウ内のメッセージ上限（超えると作動）",
   "killswitch.safetyWords": "安全ワード",
   "killswitch.safetyWords.stop": "停止",
   "killswitch.safetyWords.stop_all": "全停止",

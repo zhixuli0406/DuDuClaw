@@ -404,6 +404,12 @@ function KillswitchSection() {
               <Field label={intl.formatMessage({ id: 'killswitch.halfOpenAllowCount' })} hint="1-1000">
                 <Input type="number" min={1} max={1000} value={config.circuit_breaker.half_open_allow_count} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, half_open_allow_count: Number(e.target.value) } })} />
               </Field>
+              <Field label={intl.formatMessage({ id: 'killswitch.hardWindowSecs' })} hint="1-86400">
+                <Input data-testid="killswitch-hard-window" type="number" min={1} max={86400} value={config.circuit_breaker.hard_window_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, hard_window_secs: Number(e.target.value) } })} />
+              </Field>
+              <Field label={intl.formatMessage({ id: 'killswitch.hardMaxMessages' })} hint="1-100000">
+                <Input data-testid="killswitch-hard-max" type="number" min={1} max={100000} value={config.circuit_breaker.hard_max_messages} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, hard_max_messages: Number(e.target.value) } })} />
+              </Field>
             </div>
           </AdvancedSection>
 
