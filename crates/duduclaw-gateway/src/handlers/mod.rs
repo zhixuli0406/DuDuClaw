@@ -103,6 +103,7 @@ mod experts_rpc;
 mod system_config_rpc;
 mod audit_rpc;
 mod security_rpc;
+mod credential_protection_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
 mod playbook_rpc;
