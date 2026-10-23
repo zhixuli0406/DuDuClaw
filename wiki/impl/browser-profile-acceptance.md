@@ -10,8 +10,14 @@ browser remain separate required work.
 - Archive helper: six Python unit tests passed, including path/link/special-file
   rejection and byte/file limits. Python compilation and entrypoint shell syntax
   checks passed.
-- Dashboard initial focused run: TypeScript and 60 tests passed. Two later
-  explicit held-session keep-login UI tests have been added and await execution.
+- Final dashboard focused run: TypeScript, seven files / 62 tests and the
+  production build passed, including both held-session keep-login decisions.
+- The integrated core, CLI and gateway run after merging main `1cc573e5`
+  completed with exit 0: 12,799 tests passed across 39 unit, integration and
+  documentation suites (59 ignored). Gateway library: 9,305 passed, 47 ignored,
+  32 filtered; CLI: 2,236 passed, four ignored; core: 1,044 passed, one ignored.
+  This run preceded the stdin EOF correction below. Both builds used the CI
+  no-default-feature configuration, debug assertions and debug info level zero.
 - The actual Dockerfile built on Docker Desktop macOS arm64. With the production
   read-only root, private tmpfs, no-new-privileges, 512 MiB, one CPU and no network,
   a synthetic persistent Cookie survived export and a fresh Chromium container.
@@ -26,11 +32,25 @@ browser remain separate required work.
 - Independent static review closed atomic pointer/previous-generation retention,
   owner suspension cycles, ten-second save budget and unsafe end-state findings.
   The graceful-close correction was independently approved as well.
+- The real gateway-manager test initially failed because profile settings were
+  absent from the strict image-config vocabulary. Its next run exposed a second
+  defect: Tokio's Unix child-stdin shutdown does not close the pipe. The importer
+  waited for EOF while its parent awaited output. Both failures remain recorded.
+  The corrected code owns and explicitly drops stdin; it was independently
+  approved. The rebuilt test binary then passed the actual gateway start, Cookie
+  seed, encrypted save, fresh-container restore and reset flow in 17.32 seconds.
+  The encrypted generation was 30,929 bytes and contained no plaintext synthetic
+  Cookie. Only the fresh fixture's labelled containers were removed; the existing
+  production-container fingerprint was unchanged.
+- On that rebuilt revision `c139daba`, all nine profile tests, four session-policy
+  tests and the strict image-config regression passed. The native test used image
+  `sha256:75335e96884213916b7e523b2ddee0466036604501aadde0a56bb099005df48f`
+  on Docker Desktop macOS arm64. Test-binary SHA-256:
+  `e096e7c4ef9974b11adfc869b4c665ed7e8b069cf1da0992189c7a341febbbd1`.
 
 ## Remaining gates
 
-- Run final profile/session/config/RPC Rust tests and full relevant suites.
-- Run the final UI tests/build and isolated native gateway/dashboard journey.
+- Complete the isolated native dashboard journey with the final shipping binary.
 - Verify real website account sign-in separately; no personal account has been
   used in the fixture. No broad claim about website compatibility is supported.
 - CI on the final revision, Linux/amd64/Windows boundaries, merge and user
