@@ -61,6 +61,11 @@ pub(crate) trait SessionBackend: Send + Sync {
     fn login_owner_valid(&self) -> bool {
         true
     }
+    /// An immutable, shareable proof for reads that cannot take the session
+    /// lock. Unsupported backends provide none and cached viewing is refused.
+    fn login_owner_check(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        None
+    }
     fn discard_login(&mut self) {}
 }
 
@@ -143,6 +148,9 @@ impl SessionBackend for OrchestratorBackend {
     }
     fn login_owner_valid(&self) -> bool {
         self.inner.login_owner_valid()
+    }
+    fn login_owner_check(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        Some(self.inner.login_owner_check())
     }
     fn discard_login(&mut self) {
         self.inner.discard_login();

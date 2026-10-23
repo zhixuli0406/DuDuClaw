@@ -378,14 +378,24 @@ impl ProfileSession {
     }
 
     pub(crate) fn valid_owner(&self) -> Result<bool, String> {
+        Self::owner_matches(&self.home, &self.agent, &self.identity)
+    }
+
+    fn owner_matches(home: &Path, agent: &str, expected: &Identity) -> Result<bool, String> {
         let identity: Identity = serde_json::from_slice(
-            &agent_state(&self.home, &self.agent)?
+            &agent_state(home, agent)?
                 .read_bytes_checked(IDENTITY, HEADER_MAX, true)
                 .map_err(failure)?
                 .ok_or_else(|| failure("identity"))?,
         )
         .map_err(failure)?;
-        Ok(identity == self.identity && owners(&self.home, &self.agent)? == self.identity.owners)
+        Ok(identity == *expected && owners(home, agent)? == expected.owners)
+    }
+
+    /// A read-only owner proof without cloning the writer's lease or lock.
+    pub(crate) fn owner_check(&self) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
+        let (home, agent, identity) = (self.home.clone(), self.agent.clone(), self.identity.clone());
+        std::sync::Arc::new(move || Self::owner_matches(&home, &agent, &identity).unwrap_or(false))
     }
 
     pub(crate) fn restore(&self) -> Result<(Option<Zeroizing<Vec<u8>>>, &'static str), String> {

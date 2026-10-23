@@ -47,6 +47,7 @@ pub mod keepalive;
 pub(crate) mod live_ops;
 pub mod live_view;
 pub mod navigation;
+pub(crate) mod oversight;
 pub mod rfb;
 pub mod sweep;
 pub mod turns;
@@ -444,6 +445,10 @@ pub struct StartRequest {
 /// State an approval wait updates without taking the session lock.
 #[derive(Default)]
 pub(crate) struct SessionShared {
+    /// Captured from the host's live requester registry, never tool arguments.
+    pub(crate) origin: OnceLock<oversight::SessionOrigin>,
+    pub(crate) login_owner_check: OnceLock<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    pub(crate) snapshot: std::sync::Mutex<Option<oversight::CachedSnapshot>>,
     /// Approvals currently awaited for this session's employee. While one
     /// is pending the session does not count as idle.
     approvals_waiting: AtomicU32,
@@ -734,6 +739,7 @@ impl ComputerUseSessions {
     /// Insert a ready session (tests use this to skip the container start).
     pub(crate) fn insert(&self, session: ManagedSession) -> SessionRef {
         let agent = session.agent_id.clone();
+        let _ = session.shared.login_owner_check.set(session.backend.login_owner_check());
         let _ = session.shared.live.meta.set(live_view::SessionMeta {
             max_actions: session.config.max_actions,
             deadline: session.deadline,
@@ -1239,6 +1245,11 @@ impl ComputerUseSessions {
             nav_hosts: nav_hosts.clone(),
             nav_configured: !nav.hosts.is_empty(),
         };
+        let requester = crate::knowledge::turn_requesters::resolve(agent_id, req.turn_id.as_deref());
+        let _ = session.shared.origin.set(oversight::SessionOrigin::from_requester(
+            &requester,
+            chrono::Utc::now(),
+        ));
         let task = req
             .task
             .as_deref()
@@ -1291,6 +1302,12 @@ impl ComputerUseSessions {
     ) -> Result<Value, OpError> {
         self.admit(agent_id, gates::TOOL_SCREENSHOT, "", &json!({})).await?;
         let mut session = self.locked(agent_id, session_id).await?;
+        self.capture_masked(&mut session).await
+    }
+
+    /// Shared masking pipeline; callers establish authority and session liveness.
+    async fn capture_masked(&self, session: &mut ManagedSession) -> Result<Value, OpError> {
+        let agent_id = session.agent_id.clone();
         let shot = session.backend.screenshot().await;
         let now = Instant::now();
         session.last_activity = now;
@@ -1335,7 +1352,7 @@ impl ComputerUseSessions {
             Err(_) => None,
         };
         self.audit_line(
-            agent_id,
+            &agent_id,
             "screenshot",
             json!({
                 "session_id": session.session_id,
@@ -1354,6 +1371,12 @@ impl ComputerUseSessions {
         body["fully_masked"] = json!(fully_masked);
         body["mask_reason"] = json!(mask_reason);
         body["injection_hold"] = json!(scan == PageScan::Held);
+        *session.shared.snapshot.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(oversight::CachedSnapshot {
+                captured: Instant::now(),
+                captured_at: chrono::Utc::now().timestamp_millis(),
+                body: body.clone(),
+            });
         Ok(body)
     }
 
