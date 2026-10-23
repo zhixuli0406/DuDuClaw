@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyMention,
+  assignableAgents,
+  isAssignCommand,
   filterMentionCandidates,
   findActiveMention,
   mentionErrorText,
@@ -107,5 +109,20 @@ describe('team grouping (agents.callable)', () => {
     const twin: MentionAgent = { name: 'sales-2', display_name: '業務專員', call_text: '@sales-2' };
     expect(mentionText(twin, [twin])).toBe('@sales-2');
     expect(mentionText({ name: 'x', display_name: 'X', call_text: '@' }, [])).toBe('@X');
+  });
+});
+
+describe('assign command filter', () => {
+  it('recognises the assign command spellings only at the start', () => {
+    for (const t of ['/交辦 @', '／交辦 @業', '/assign @x', '/ASSIGN', '  /交辦']) expect(isAssignCommand(t)).toBe(true);
+    for (const t of ['/交辦事項 @', '/assignment', '請 /交辦 @x', '@業務']) expect(isAssignCommand(t)).toBe(false);
+  });
+  it('keeps only assignable staff', () => {
+    const list = [
+      { name: 'a', display_name: 'A', assignable: true },
+      { name: 'b', display_name: 'B', assignable: false },
+      { name: 'c', display_name: 'C' },
+    ];
+    expect(assignableAgents(list).map((x) => x.name)).toEqual(['a']);
   });
 });

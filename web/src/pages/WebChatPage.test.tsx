@@ -197,6 +197,47 @@ describe('WebChatPage', () => {
     expect(input.value).toBe('@業務專員 ');
   });
 
+  it('after /交辦 the @ list offers only staff who can take a task', async () => {
+    const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({
+      default_agent: 'dudu',
+      agents: [
+        { name: 'dudu', display_name: '嘟嘟總機', call_text: '@嘟嘟總機', role: 'main', status: 'active', via: 'default', level: null, assignable: false, selectable: false },
+        { name: 'hr', display_name: '人資助理', call_text: '@人資助理', role: 'specialist', status: 'active', via: 'team', via_user: 'u2', via_user_name: '林小華', depth: 1, level: 'viewer', assignable: false, selectable: true },
+        { name: 'sales-rep', display_name: '業務專員', call_text: '@業務專員', role: 'specialist', status: 'active', via: 'team', via_user: 'u1', via_user_name: '王小明', depth: 2, level: 'operator', assignable: true, selectable: true },
+      ],
+    });
+    useChatStore.setState({ isStreaming: false, connectionState: 'connected' as never });
+    useAgentsStore.setState({ loaded: true, agents: [] as never });
+    renderWithProviders(<WebChatPage />);
+    await waitFor(() => expect(callable).toHaveBeenCalled());
+    const input = screen.getByPlaceholderText(/message/i) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '/交辦 @', selectionStart: 5 } });
+    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(1));
+    expect(screen.getAllByRole('option')[0]).toHaveTextContent('業務專員');
+    // Ordinary text lists everyone callable again.
+    fireEvent.change(input, { target: { value: '@', selectionStart: 1 } });
+    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(3));
+  });
+
+  it('shows a task card under a reply that created a task', () => {
+    useChatStore.setState({
+      isStreaming: false,
+      messages: [
+        { id: 'u1', role: 'user', content: '/交辦 @業務專員 整理報價單', timestamp: 1 },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: '📌 已交辦給【業務專員】',
+          timestamp: 2,
+          task: { id: '1a2b3c4d-0000-5000-8000-000000000000', agent: 'sales-rep' },
+        },
+      ] as never,
+    });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByText('Task #1a2b3c4d assigned')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'View progress' })).toHaveAttribute('href', '/goals?assigned=me');
+  });
+
   it('labels a reply that another AI staff member answered', () => {
     useChatStore.setState({
       selectedAgentId: null,

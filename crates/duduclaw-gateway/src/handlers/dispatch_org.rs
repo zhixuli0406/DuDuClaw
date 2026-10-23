@@ -337,7 +337,12 @@ impl MethodHandler {
             // apply to finished tasks. Same Viewer/agent-filter gate as
             // `tasks.list`.
             "tasks.list_page" => {
-                check_task_board_filter!();
+                // `on_behalf_of: "me"` lists only the caller's own handed-over
+                // tasks (the principal comes from the live identity), so no
+                // employee scope is needed for it.
+                if !super::tasks_rpc::assigned_by_me(&params) {
+                    check_task_board_filter!();
+                }
                 self.handle_tasks_list_page(params, ctx).await
             }
             // L2: task comments. Access is gated inside the handler by the

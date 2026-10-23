@@ -30,6 +30,10 @@
 //! sender's permissions, the one-shot state and the channel replies.
 
 pub mod access;
+pub mod assign;
+mod assign_audit;
+pub(crate) mod assign_create;
+pub mod assign_texts;
 pub mod list;
 pub mod pending;
 pub mod spans;

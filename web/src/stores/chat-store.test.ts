@@ -2,12 +2,31 @@ import { describe, it, expect } from 'vitest';
 import {
   buildUserMessageFrame,
   frameBelongsToConversation,
+  newClientMessageId,
   historyToMessages,
   isResumeNotFound,
+  parseAssignedTask,
   parseChatArtifact,
   sessionIdAfterHello,
   useChatStore,
 } from './chat-store';
+
+describe('client message ids', () => {
+  it('are plain tokens, unique per send, and travel as msg_id', () => {
+    const a = newClientMessageId();
+    const b = newClientMessageId();
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+    const frame = buildUserMessageFrame({
+      content: '/交辦 @sales 整理',
+      sessionId: 'webchat:x',
+      agentId: null,
+      attachments: [],
+      msgId: a,
+    });
+    expect(frame.msg_id).toBe(a);
+  });
+});
 
 describe('buildUserMessageFrame (L1 per-agent routing)', () => {
   it('omits the agent key when no partner is selected (byte-compatible)', () => {
@@ -335,5 +354,15 @@ describe('sessionIdAfterHello (resume-before-connect guard)', () => {
     useChatStore.getState().resumeSession('webchat:past-42', []);
     useChatStore.getState().selectAgent('sales-bot');
     expect(useChatStore.getState().resumedExplicitly).toBe(false);
+  });
+});
+
+describe('parseAssignedTask (/交辦 task card)', () => {
+  it('keeps a well-formed task and drops anything else', () => {
+    expect(parseAssignedTask({ id: 't-1', agent: 'sales-rep' })).toEqual({ id: 't-1', agent: 'sales-rep' });
+    expect(parseAssignedTask(null)).toBeUndefined();
+    expect(parseAssignedTask({ id: '', agent: 'x' })).toBeUndefined();
+    expect(parseAssignedTask({ id: 't', agent: 3 })).toBeUndefined();
+    expect(parseAssignedTask('t-1')).toBeUndefined();
   });
 });
