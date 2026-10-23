@@ -1227,7 +1227,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         };
                                         // `/交辦` keeps the task for a card; every other
                                         // command answers with text only. `/rules off`
-                                        // still sees no channel identity here.
+                                        // still sees no channel identity here. The other
+                                        // commands run in the same principal scope as a
+                                        // reply turn, so one that creates the session
+                                        // (`/status`) records who owns it (B5 session origin).
+                                        let principal = &crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL;
                                         let (reply, task) = match &cmd {
                                             crate::chat_commands::ChatCommand::Assign(assign_cmd) => {
                                                 let ac = caller.assign_caller(&state.ctx.home_dir, sid, Some(effective_agent_id));
@@ -1235,14 +1239,20 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 (r.text, r.task)
                                             }
                                             crate::chat_commands::ChatCommand::Rules { .. } => (
-                                                crate::chat_commands::handle_command(
-                                                    &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
+                                                principal.scope(
+                                                    auth_user.clone(),
+                                                    crate::chat_commands::handle_command(
+                                                        &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
+                                                    ),
                                                 ).await,
                                                 None,
                                             ),
                                             _ => (
-                                                crate::chat_commands::handle_command_with_caller(
-                                                    &cmd, &state.ctx, sid, effective_agent_id, is_admin, &caller,
+                                                principal.scope(
+                                                    auth_user.clone(),
+                                                    crate::chat_commands::handle_command_with_caller(
+                                                        &cmd, &state.ctx, sid, effective_agent_id, is_admin, &caller,
+                                                    ),
                                                 ).await,
                                                 None,
                                             ),

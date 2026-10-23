@@ -151,6 +151,7 @@ pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
 pub mod team_edition;
+pub mod team_history;
 pub mod trigger_route;
 pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
@@ -352,6 +353,7 @@ pub mod search_index;
 pub mod secret_redact;
 pub mod server;
 pub mod session;
+pub mod session_origin;
 pub mod session_portability;
 pub mod session_summarizer;
 pub mod session_summarizer_task;
