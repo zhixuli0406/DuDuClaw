@@ -50,6 +50,7 @@ pub(super) async fn install(
 
     let name = ctx.claim_slug(&name)?;
     ctx.ensure_quota(count_agent_files(dir)).await?;
+    ctx.begin_writes()?;
 
     let description = val
         .get("description")
@@ -253,6 +254,7 @@ async fn import_agents(
             model_preferred: model_pref,
             soul_body: Some(body),
         };
+        ctx.note_agent(&final_id);
         if let Err(e) = crate::scaffold_agent_dir(&ctx.home, &scaffold).await {
             report.skipped("agent", &final_id, format!("建立失敗: {e}"));
             continue;
@@ -335,6 +337,7 @@ fn import_commands(ctx: &InstallCtx, dir: &Path, report: &mut Report, record: &m
             report.imported("command", &name);
             continue;
         }
+        ctx.note_path(&dest_dir);
         if std::fs::create_dir_all(&dest_dir)
             .and_then(|_| std::fs::write(dest_dir.join("SKILL.md"), &skill_md))
             .is_ok()

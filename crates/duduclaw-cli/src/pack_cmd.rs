@@ -218,6 +218,8 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
         reimport: opts.reimport.clone(),
         agent_cap: opts.agent_cap,
         extract_root: Some(resolved.dir.clone()),
+        #[cfg(test)]
+        fail_after_dispatch: false,
     };
 
     match load_pack_dir(&root) {

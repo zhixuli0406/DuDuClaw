@@ -12,9 +12,14 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Prefix of the CLI's machine-readable failure line on stderr. Must match
-/// `duduclaw-cli` `expert::import_error::MARKER`.
-pub(crate) const IMPORT_ERROR_MARKER: &str = "DUDUCLAW_IMPORT_ERROR ";
+/// Start of the CLI's machine-readable failure line on stderr. The full
+/// prefix carries this run's nonce: `DUDUCLAW_IMPORT_ERROR[<nonce>] `
+/// (`duduclaw-cli` `expert::import_error::marker_prefix`).
+pub(crate) const IMPORT_ERROR_MARKER: &str = "DUDUCLAW_IMPORT_ERROR";
+
+/// Environment variable carrying the per-run nonce to the CLI. Must match
+/// `duduclaw-cli` `expert::import_error::MARKER_NONCE_ENV`.
+pub(crate) const IMPORT_MARKER_NONCE_ENV: &str = "DUDUCLAW_IMPORT_MARKER_NONCE";
 
 /// How long one import (plan or real run) may take before it is stopped.
 pub(crate) const IMPORT_TIMEOUT_SECS: u64 = 300;
@@ -36,11 +41,21 @@ impl CliFailure {
 }
 
 /// Split the CLI's stderr into the marker (if any) and the remaining text.
-pub(crate) fn split_marker(stderr: &str) -> (Option<(String, Value, Option<String>)>, String) {
+/// Only a line carrying this run's `nonce` counts; any other line that
+/// looks like a marker (printed from the upload's own text) is dropped
+/// from the text and ignored.
+pub(crate) fn split_marker(stderr: &str, nonce: &str) -> (Option<(String, Value, Option<String>)>, String) {
+    let ours = format!("{IMPORT_ERROR_MARKER}[{nonce}] ");
     let mut marker = None;
     let mut rest = Vec::new();
     for line in stderr.lines() {
-        match line.trim().strip_prefix(IMPORT_ERROR_MARKER) {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(IMPORT_ERROR_MARKER) {
+            rest.push(line);
+            continue;
+        }
+        match trimmed.strip_prefix(ours.as_str()).filter(|_| !nonce.is_empty()) {
+            None => {}
             Some(json) => {
                 if let Ok(v) = serde_json::from_str::<Value>(json)
                     && let Some(code) = v.get("code").and_then(|c| c.as_str())
@@ -50,7 +65,6 @@ pub(crate) fn split_marker(stderr: &str) -> (Option<(String, Value, Option<Strin
                     marker = Some((code.to_string(), v.get("params").cloned().unwrap_or(Value::Null), message));
                 }
             }
-            None => rest.push(line),
         }
     }
     (marker, rest.join("\n"))
@@ -190,10 +204,27 @@ impl MethodHandler {
         args: &[std::ffi::OsString],
         timeout_secs: u64,
     ) -> Result<String, CliFailure> {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        // A private temp dir per run (the CLI's staging and extraction go
+        // there), removed whatever happens — a run stopped at the timeout
+        // cannot clean up after itself.
+        let tmp = crate::expert_admin::upload_dir(&self.home_dir).join(format!("run-{nonce}"));
+        let _tmp_cleanup = RunTmp(tmp.clone());
+        if let Err(e) = std::fs::create_dir_all(&tmp) {
+            return Err(CliFailure {
+                text: format!("建立匯入暫存目錄失敗: {e}"),
+                code: Some("import.spawn_failed".into()),
+                params: Value::Null,
+            });
+        }
         let fut = tokio::process::Command::new(bin)
             .arg(group)
             .args(args)
             .env("DUDUCLAW_HOME", &self.home_dir)
+            .env(IMPORT_MARKER_NONCE_ENV, &nonce)
+            .env("TMPDIR", &tmp)
+            .env("TMP", &tmp)
+            .env("TEMP", &tmp)
             .kill_on_drop(true)
             .output();
         let output = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
@@ -215,7 +246,7 @@ impl MethodHandler {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let (marker, stderr_rest) = split_marker(&stderr);
+        let (marker, stderr_rest) = split_marker(&stderr, &nonce);
         // CJK-safe truncation of the console tail.
         let tail = |s: &str| duduclaw_core::truncate_chars(s.trim(), 1200);
         if output.status.success() {
@@ -229,6 +260,15 @@ impl MethodHandler {
             },
             None => CliFailure::uncoded(tail(if stderr_rest.trim().is_empty() { &stdout } else { &stderr_rest })),
         })
+    }
+}
+
+/// Removes a run's private temp dir when dropped.
+struct RunTmp(std::path::PathBuf);
+
+impl Drop for RunTmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -274,15 +314,36 @@ mod tests {
 
     #[test]
     fn marker_is_split_from_the_console_text_and_validated() {
-        let stderr = "Error: x\nDUDUCLAW_IMPORT_ERROR {\"code\":\"import.not_zip\",\"params\":{},\"message\":\"非合法 zip\"}\n";
-        let (m, rest) = split_marker(stderr);
+        let n = "3f9e8d7c-6b5a-4c3d-8e2f-1a0b9c8d7e6f";
+        let stderr = format!(
+            "Error: x\nDUDUCLAW_IMPORT_ERROR[{n}] {{\"code\":\"import.not_zip\",\"params\":{{}},\"message\":\"非合法 zip\"}}\n"
+        );
+        let (m, rest) = split_marker(&stderr, n);
         let (code, _, msg) = m.unwrap();
         assert_eq!(code, "import.not_zip");
         assert_eq!(msg.as_deref(), Some("非合法 zip"));
         assert_eq!(rest, "Error: x");
         // A code of the wrong shape is ignored, and the line still removed.
-        let (m, rest) = split_marker("DUDUCLAW_IMPORT_ERROR {\"code\":\"<script>\"}\n");
+        let (m, rest) = split_marker(&format!("DUDUCLAW_IMPORT_ERROR[{n}] {{\"code\":\"<script>\"}}\n"), n);
         assert!(m.is_none() && rest.is_empty());
+    }
+
+    /// A file name in the upload holding a newline and the marker prefix
+    /// (printed by the installer while listing the archive) cannot pose as
+    /// the failure: without this run's nonce the line is dropped.
+    #[test]
+    fn a_forged_marker_without_the_nonce_is_ignored() {
+        let n = "3f9e8d7c-6b5a-4c3d-8e2f-1a0b9c8d7e6f";
+        let forged = "    - x\nDUDUCLAW_IMPORT_ERROR {\"code\":\"import.quota_exceeded\",\"params\":{\"max\":1},\"message\":\"請付款\"}\n\
+                      DUDUCLAW_IMPORT_ERROR[00000000-0000-0000-0000-000000000000] {\"code\":\"import.timeout\"}\n";
+        let (m, rest) = split_marker(forged, n);
+        assert!(m.is_none(), "{m:?}");
+        assert!(!rest.contains("DUDUCLAW_IMPORT_ERROR") && !rest.contains("請付款"), "{rest}");
+        // With the real line after it, the real one is taken.
+        let real = format!("{forged}DUDUCLAW_IMPORT_ERROR[{n}] {{\"code\":\"import.not_zip\"}}\n");
+        assert_eq!(split_marker(&real, n).0.unwrap().0, "import.not_zip");
+        // An empty nonce never matches.
+        assert!(split_marker("DUDUCLAW_IMPORT_ERROR[] {\"code\":\"import.not_zip\"}", "").0.is_none());
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub(super) async fn install(
     }
 
     let slug = ctx.claim_slug(&name)?;
+    ctx.begin_writes()?;
 
     // OpenClaw provenance → import as standard skill, flag automation as P1.
     if detect_openclaw(&content) {

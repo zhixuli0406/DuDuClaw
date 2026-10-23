@@ -219,10 +219,16 @@ pub fn unrecognized_error(
     );
     eprintln!("  目錄內容:");
     for c in &contents {
-        eprintln!("    - {c}");
+        // Names come from the upload: escaped, so a name holding a newline
+        // cannot print a line of its own.
+        eprintln!("    - {}", c.escape_debug());
     }
     for n in &nested {
-        eprintln!("  在更深的資料夾 {} 找到可以匯入的內容（{}）：請直接壓縮那個資料夾再匯入", n.rel, n.format);
+        eprintln!(
+            "  在更深的資料夾 {} 找到可以匯入的內容（{}）：請直接壓縮那個資料夾再匯入",
+            n.rel.escape_debug(),
+            n.format
+        );
     }
     eprintln!();
     let found: Vec<serde_json::Value> = nested

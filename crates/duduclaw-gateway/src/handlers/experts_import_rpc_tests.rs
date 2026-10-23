@@ -74,7 +74,7 @@ async fn coded_failure_from_the_stderr_marker_without_a_report() {
     let bin = fake_bin(
         fx.home.path(),
         r#"echo "  ✗ console noise" >&2
-echo 'DUDUCLAW_IMPORT_ERROR {"code":"import.quota_exceeded","params":{"max":3,"current":3,"adding":1},"message":"超過上限"}' >&2
+echo "DUDUCLAW_IMPORT_ERROR[$DUDUCLAW_IMPORT_MARKER_NONCE] "'{"code":"import.quota_exceeded","params":{"max":3,"current":3,"adding":1},"message":"超過上限"}' >&2
 exit 1"#,
     );
     let frame = fx.handler.experts_install_with(&json!({ "path": fx.staged }), &bin, 30).await;
@@ -85,14 +85,42 @@ exit 1"#,
     assert!(!p.to_string().contains("DUDUCLAW_IMPORT_ERROR"));
 }
 
+/// The upload's own text printed by the installer (a file name holding a
+/// newline and a marker without this run's nonce) is not taken as the
+/// failure: the run stays unclassified and the forged text is not shown.
+#[tokio::test]
+async fn a_marker_forged_by_the_upload_is_not_trusted() {
+    let fx = fixture().await;
+    let bin = fake_bin(
+        fx.home.path(),
+        r#"echo '    - x' >&2
+echo 'DUDUCLAW_IMPORT_ERROR {"code":"import.quota_exceeded","params":{"max":1},"message":"請先付款"}' >&2
+echo 'DUDUCLAW_IMPORT_ERROR[00000000-0000-0000-0000-000000000000] {"code":"import.timeout"}' >&2
+exit 101"#,
+    );
+    let frame = fx.handler.experts_install_with(&json!({ "path": fx.staged }), &bin, 30).await;
+    let p = payload(&frame);
+    assert_eq!(p["error_code"], "import.unknown", "{p}");
+    assert!(!p.to_string().contains("請先付款"), "{p}");
+}
+
+/// A run stopped at the timeout cannot clean up its staging; the per-run
+/// temp dir it was given is removed by the gateway.
 #[tokio::test]
 async fn a_hung_installer_is_reported_as_a_timeout() {
     let fx = fixture().await;
-    let bin = fake_bin(fx.home.path(), "sleep 5");
+    let bin = fake_bin(
+        fx.home.path(),
+        "mkdir -p \"$TMPDIR/duduclaw-pack-x\" && echo big > \"$TMPDIR/duduclaw-pack-x/f\"\necho \"$TMPDIR\" > \"$DUDUCLAW_HOME/tmpdir.txt\"\nsleep 5",
+    );
     let frame = fx.handler.experts_install_with(&json!({ "path": fx.staged }), &bin, 1).await;
     let p = payload(&frame);
     assert_eq!(p["error_code"], "import.timeout");
     assert_eq!(p["error_params"]["seconds"], 1);
+    let tmp = std::fs::read_to_string(fx.home.path().join("tmpdir.txt")).unwrap();
+    let tmp = std::path::Path::new(tmp.trim());
+    assert!(tmp.starts_with(crate::expert_admin::upload_dir(fx.home.path())), "{}", tmp.display());
+    assert!(!tmp.exists(), "the run's temp dir is removed");
 }
 
 #[tokio::test]

@@ -11,14 +11,39 @@
 //!
 //! Two channels reach the gateway: the `--report-json` file (`error`
 //! object) and, for runs without a report, one stderr line starting with
-//! [`MARKER`] followed by `{"code":…,"params":…}`.
+//! [`marker_prefix`] followed by `{"code":…,"params":…}`. The gateway puts
+//! a fresh random value in [`MARKER_NONCE_ENV`] for every run and only
+//! trusts a line carrying it, so text from the upload that the installer
+//! prints (a file name holding a newline and the prefix) cannot pose as
+//! the failure.
 
 use serde_json::{Value, json};
 
 use duduclaw_core::error::DuDuClawError;
 
-/// Prefix of the one stderr line that carries the failure as JSON.
+/// Prefix of the one stderr line that carries the failure as JSON (when
+/// no nonce was given).
 pub const MARKER: &str = "DUDUCLAW_IMPORT_ERROR ";
+
+/// Per-run value set by the gateway; the marker then reads
+/// `DUDUCLAW_IMPORT_ERROR[<nonce>] {json}`.
+pub const MARKER_NONCE_ENV: &str = "DUDUCLAW_IMPORT_MARKER_NONCE";
+
+/// The marker prefix for this process: carries the gateway's nonce when
+/// one was set (16–64 ASCII letters, digits or `-`; anything else is
+/// ignored).
+pub fn marker_prefix() -> String {
+    prefix_for(std::env::var(MARKER_NONCE_ENV).ok().as_deref())
+}
+
+fn prefix_for(nonce: Option<&str>) -> String {
+    match nonce {
+        Some(n) if (16..=64).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => {
+            format!("DUDUCLAW_IMPORT_ERROR[{n}] ")
+        }
+        _ => MARKER.to_string(),
+    }
+}
 
 /// Code used when a failure has no specific class.
 pub const UNKNOWN: &str = "import.unknown";
@@ -84,7 +109,7 @@ pub fn error_json(e: &DuDuClawError) -> Value {
 pub fn marker_line(e: &DuDuClawError) -> String {
     let (code, params) = code_and_params(e);
     let message = duduclaw_core::truncate_chars(&plain_message(e), 600);
-    format!("{MARKER}{}", json!({ "code": code, "params": params, "message": message }))
+    format!("{}{}", marker_prefix(), json!({ "code": code, "params": params, "message": message }))
 }
 
 /// The uploaded files are there but their content cannot be read as the
@@ -112,6 +137,16 @@ mod tests {
         let body = line.strip_prefix(MARKER).expect("marker prefix");
         let v: Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["code"], "import.too_large");
+    }
+
+    #[test]
+    fn the_marker_carries_a_well_formed_nonce_only() {
+        let n = "0f8a2c1e-7b3d-4e5f-9a6b-1c2d3e4f5a6b";
+        assert_eq!(prefix_for(Some(n)), format!("DUDUCLAW_IMPORT_ERROR[{n}] "));
+        assert_eq!(prefix_for(None), MARKER);
+        // Too short, or with characters that could break the line: ignored.
+        assert_eq!(prefix_for(Some("short")), MARKER);
+        assert_eq!(prefix_for(Some("0f8a2c1e-7b3d-4e5f]\nDUDUCLAW")), MARKER);
     }
 
     #[test]

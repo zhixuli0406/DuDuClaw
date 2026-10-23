@@ -35,6 +35,9 @@ pub(super) struct InstallCtx {
     /// The gateway's agent cap (`--agent-cap`), applied with the one
     /// resolved from disk ([`super::quota`]).
     pub agent_cap: Option<usize>,
+    /// What a real replace moved away and what the new version wrote
+    /// ([`InstallCtx::begin_writes`], [`InstallCtx::note_agent`]).
+    pub replace_state: std::sync::Mutex<super::reimport::ReplaceState>,
 }
 
 /// Options of one pipeline run beyond the source itself.
@@ -58,6 +61,10 @@ pub(crate) struct PipelineOpts {
     /// source handed over is then used as is (no second unwrap, so the
     /// wrapper depth stays [`detect::MAX_WRAPPER_DEPTH`]).
     pub extract_root: Option<PathBuf>,
+    /// Tests only: fail right after the importer wrote everything (the
+    /// same point as a failed install-record write).
+    #[cfg(test)]
+    pub fail_after_dispatch: bool,
 }
 
 /// Entry for `duduclaw pack install` once it hands a roster-shaped pack over
@@ -154,7 +161,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let replace = super::reimport::resolve_target(home, &opts.reimport)?;
     if let Some(t) = &replace {
         let edits = if dry_run {
-            super::reimport::edits_since_import(home, &t.record)
+            super::reimport::edits_since_import(home, &t.slug, &t.record, &t.agents)
         } else {
             super::reimport::ensure_edits_accepted(home, t)?
         };
@@ -170,34 +177,60 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         reimport: opts.reimport.clone(),
         replace,
         agent_cap: opts.agent_cap,
+        replace_state: Default::default(),
     };
     if let Some(z) = &zip_summary {
         super::report::report_zip_summary(z, report);
     }
 
-    // ── 3. Dispatch (a real replace first moves the earlier import to the
-    //    backup, and moves it back if anything below fails). ──
-    let retired = match (&ctx.replace, dry_run) {
-        (Some(t), false) => Some(super::reimport::retire(home, t)?),
-        _ => None,
-    };
+    // ── 3. Dispatch. A real replace moves the earlier import to the backup
+    //    only once the importer's checks have passed (`begin_writes`), and
+    //    moves it back if anything after that fails. ──
     let dispatched = match format {
         Format::Native => install_native(&ctx, &root, report).await,
         Format::ClaudePlugin => super::plugin::install(&ctx, &root, report).await,
         Format::Skill => super::skill_import::install(&ctx, &root, report).await,
         Format::AgentConfig(kind) => super::agent_config::install(&ctx, &root, kind, report).await,
     };
+    let state = ctx.take_replace_state();
+    let dispatched = match dispatched {
+        // Every importer moves the earlier import away before it writes; a
+        // real replace that got here without doing so must not record.
+        Ok(_) if ctx.replace.is_some() && !dry_run && state.retired.is_none() => Err(
+            super::import_error::import_err(
+                "import.replace_failed",
+                serde_json::json!({ "slug": ctx.replace.as_ref().map(|t| t.slug.clone()) }),
+                "取代流程沒有先備份之前的版本，已停止，沒有寫入匯入紀錄",
+            ),
+        ),
+        #[cfg(test)]
+        Ok(_) if opts.fail_after_dispatch => Err(super::import_error::import_err(
+            "import.replace_failed",
+            serde_json::json!({}),
+            "test: injected failure after the importer wrote",
+        )),
+        other => other,
+    };
     let record = match dispatched.and_then(|r| {
         if dry_run { Ok(r) } else { super::write_record(home, &r).map(|()| r) }
     }) {
         Ok(r) => r,
         Err(e) => {
-            if let Some(log) = &retired {
-                super::reimport::rollback(log);
+            if let Some(log) = &state.retired {
+                super::reimport::rollback(log, &state);
+                let n = super::reimport::withdraw_pending(home, &log.failed_record(), "import_failed").await;
+                eprintln!(
+                    "  {} 之前的版本已還原；新版本已寫入的部分移到 {}{}",
+                    style("↺").yellow(),
+                    log.backup.join("failed-new").display(),
+                    if n > 0 { format!("，並撤回它送出的 {n} 張審核單") } else { String::new() }
+                );
+                report.detail("rolled_back", serde_json::json!({ "withdrawn_approvals": n }));
             }
             return Err(e);
         }
     };
+    let retired = state.retired;
 
     report.render_console(dry_run);
     report.meta("slug", &record.slug);
@@ -213,7 +246,8 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         }
         if let Some(log) = &retired {
             super::reimport::finish(home, log, &record.agents);
-            report.detail("replaced", serde_json::json!({ "agents": log.agents }));
+            let n = super::reimport::withdraw_pending(home, &log.record_backup(), "import_replaced").await;
+            report.detail("replaced", serde_json::json!({ "agents": log.agents, "withdrawn_approvals": n }));
         }
         println!(
             "  {} 已安裝專家包 {} v{} [{}]\n",
@@ -265,6 +299,7 @@ async fn install_native(
         .filter(|a| crate::is_valid_agent_id(&crate::sanitize_agent_id(&a.name)))
         .count();
     ctx.ensure_quota(adding).await?;
+    ctx.begin_writes()?;
 
     let mut record = InstallRecord {
         slug: slug.clone(),
@@ -551,6 +586,7 @@ async fn install_one_agent(
         model_preferred: None,
         soul_body,
     };
+    ctx.note_agent(&final_id);
     crate::scaffold_agent_dir(&ctx.home, &scaffold).await?;
     report.imported("agent", &final_id);
     record.agents.push(final_id.clone());
@@ -833,6 +869,7 @@ pub(super) fn install_skill_global(
         report.imported("skill", name);
         return;
     }
+    ctx.note_path(&dest);
     match copy_dir(src, &dest) {
         Ok(()) => {
             report.imported("skill", name);
@@ -873,6 +910,7 @@ pub(super) fn install_wiki_tree(
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        ctx.note_path(&dest);
         match std::fs::copy(&src, &dest) {
             Ok(_) => {
                 report.imported("wiki", &rel_str);

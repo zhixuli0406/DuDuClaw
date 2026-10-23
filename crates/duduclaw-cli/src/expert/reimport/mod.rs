@@ -8,8 +8,12 @@
 //!   backup first (employees into `agents/_trash/<id>_<stamp>`, the same
 //!   place `agent_remove` uses; its skills, knowledge pages, original files
 //!   and record into `experts/_replaced/<slug>_<stamp>/`), then the new
-//!   version installs under the same names. If the new install fails, the
-//!   backup is moved back. An employee edited after the import is never
+//!   version installs under the same names. Nothing moves until every check
+//!   the new version can fail before writing (format, name, the agent cap)
+//!   has passed. If the new install still fails, what it wrote so far is
+//!   moved into the backup's `failed-new/`, the earlier import is moved
+//!   back and its org entries are restored. Approvals still pending for the
+//!   import that ends up out of use are withdrawn. An employee edited after the import is never
 //!   replaced silently: without `--accept-edits` the run stops with
 //!   `import.replace_edited` and the list of what changed.
 //! - **copy** (`--as-copy`): installs next to the earlier one, under a new
@@ -33,7 +37,7 @@ use super::import_error::import_err;
 use super::{InstallRecord, read_record};
 use baseline::{ChangeKind, FileChange};
 
-pub(crate) use retire::{finish, retire, rollback};
+pub(crate) use retire::{RetireLog, finish, rollback, withdraw_pending};
 
 /// What the operator asked for when the import already exists.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -50,10 +54,27 @@ pub enum ReimportMode {
 /// The earlier import being replaced, resolved before anything is written.
 #[derive(Debug, Clone)]
 pub struct ReplaceTarget {
+    /// The requested import name (validated); paths are built from this,
+    /// never from the record file's own `slug`.
+    pub slug: String,
     pub record: InstallRecord,
     pub accept_edits: bool,
+    /// Employees of the earlier import that a replace moves away.
+    pub agents: Vec<String>,
+    /// Ids in the record whose current directory was created after that
+    /// import (someone reused the id): left alone.
+    pub kept: Vec<String>,
     /// Employee ids whose names become free for the new version.
     pub freed: BTreeSet<String>,
+}
+
+/// Replace bookkeeping of one run: the backup made once the new version's
+/// checks passed, and every path the new version started writing.
+#[derive(Debug, Default)]
+pub struct ReplaceState {
+    pub retired: Option<RetireLog>,
+    pub written_agents: Vec<String>,
+    pub written_paths: Vec<std::path::PathBuf>,
 }
 
 /// Per-employee changes since the import (what a replace would move away).
@@ -91,16 +112,62 @@ pub fn resolve_target(home: &Path, mode: &ReimportMode) -> Result<Option<Replace
             format!("找不到要取代的匯入「{slug}」（可能已經移除）"),
         ));
     };
-    let freed = record.agents.iter().cloned().collect();
-    Ok(Some(ReplaceTarget { record, accept_edits: *accept_edits, freed }))
+    let (agents, kept) = split_owned(home, slug, &record);
+    let freed = agents.iter().cloned().collect();
+    Ok(Some(ReplaceTarget {
+        slug: slug.clone(),
+        record,
+        accept_edits: *accept_edits,
+        agents,
+        kept,
+        freed,
+    }))
 }
 
-/// Changes made to each employee of `rec` since it was imported. Employees
-/// whose directory is already gone are left out (nothing to lose).
-pub fn edits_since_import(home: &Path, rec: &InstallRecord) -> Vec<AgentEdits> {
-    let base = baseline::read(home, &rec.slug);
-    let mut out = Vec::new();
+/// Grace after an import for the directories it created (an install takes
+/// minutes; its record is written at the end).
+const OWNED_GRACE_SECS: i64 = 600;
+
+/// Split the record's employee ids into those this import created and
+/// those whose directory was created later (the employee was removed and
+/// someone made a new one with the same id). When a time cannot be read
+/// the id counts as the import's (the earlier behaviour).
+pub(crate) fn split_owned(home: &Path, slug: &str, rec: &InstallRecord) -> (Vec<String>, Vec<String>) {
+    use chrono::{DateTime, Utc};
+    let written = std::fs::metadata(crate::expert::experts_dir(home).join(slug).join("install.json"))
+        .and_then(|m| m.modified())
+        .ok()
+        .map(DateTime::<Utc>::from);
+    let installed = DateTime::parse_from_rfc3339(&rec.installed_at).ok().map(|d| d.with_timezone(&Utc));
+    let cutoff = [written, installed]
+        .into_iter()
+        .flatten()
+        .max()
+        .map(|t| t + chrono::Duration::seconds(OWNED_GRACE_SECS));
+    let (mut owned, mut kept) = (Vec::new(), Vec::new());
     for id in &rec.agents {
+        if !crate::is_valid_agent_id(id) || owned.contains(id) || kept.contains(id) {
+            continue;
+        }
+        let born = std::fs::metadata(home.join("agents").join(id))
+            .and_then(|m| m.created())
+            .ok()
+            .map(DateTime::<Utc>::from);
+        match (born, cutoff) {
+            (Some(b), Some(c)) if b > c => kept.push(id.clone()),
+            _ => owned.push(id.clone()),
+        }
+    }
+    (owned, kept)
+}
+
+/// Changes made to each of `agents` (employees of `rec`, imported as
+/// `slug`) since the import. Employees whose directory is already gone are
+/// left out (nothing to lose).
+pub fn edits_since_import(home: &Path, slug: &str, rec: &InstallRecord, agents: &[String]) -> Vec<AgentEdits> {
+    let base = baseline::read(home, slug);
+    let mut out = Vec::new();
+    for id in agents {
         if !crate::is_valid_agent_id(id) {
             continue;
         }
@@ -178,20 +245,21 @@ pub fn claim_slug(home: &Path, mode: &ReimportMode, slug: &str) -> Result<String
                     format!("「{slug}」已經有太多副本，請先移除不需要的再匯入"),
                 )
             }),
-        ReimportMode::Fresh => Err(already_imported(home, &existing)),
+        ReimportMode::Fresh => Err(already_imported(home, slug, &existing)),
     }
 }
 
-fn already_imported(home: &Path, rec: &InstallRecord) -> duduclaw_core::error::DuDuClawError {
-    let edits = edits_since_import(home, rec);
+fn already_imported(home: &Path, slug: &str, rec: &InstallRecord) -> duduclaw_core::error::DuDuClawError {
+    let (agents, _) = split_owned(home, slug, rec);
+    let edits = edits_since_import(home, slug, rec, &agents);
     let name = if rec.display_name.trim().is_empty() { rec.slug.clone() } else { rec.display_name.clone() };
     import_err(
         "import.already_imported",
         json!({
-            "slug": rec.slug,
+            "slug": slug,
             "name": name,
             "kind": rec.kind.label(),
-            "agents": rec.agents,
+            "agents": agents,
             "installed_at": rec.installed_at,
             "edited": !edits.is_empty(),
             "edits": edits,
@@ -216,14 +284,14 @@ pub fn cli_hint(code: &str, params: &serde_json::Value) -> Option<String> {
 }
 
 pub fn ensure_edits_accepted(home: &Path, target: &ReplaceTarget) -> Result<Vec<AgentEdits>> {
-    let edits = edits_since_import(home, &target.record);
+    let edits = edits_since_import(home, &target.slug, &target.record, &target.agents);
     if edits.is_empty() || target.accept_edits {
         return Ok(edits);
     }
     let names: Vec<&str> = edits.iter().map(|e| e.display.as_str()).collect();
     Err(import_err(
         "import.replace_edited",
-        json!({ "slug": target.record.slug, "edits": edits }),
+        json!({ "slug": target.slug, "edits": edits }),
         format!(
             "{} 在匯入後被修改過；取代會把這些修改移到備份，需要再確認一次才會取代",
             names.join("、")
@@ -235,9 +303,10 @@ pub fn ensure_edits_accepted(home: &Path, target: &ReplaceTarget) -> Result<Vec<
 pub fn replace_detail(target: &ReplaceTarget, edits: &[AgentEdits]) -> serde_json::Value {
     let rec = &target.record;
     json!({
-        "slug": rec.slug,
-        "name": if rec.display_name.trim().is_empty() { rec.slug.clone() } else { rec.display_name.clone() },
-        "agents": rec.agents,
+        "slug": target.slug,
+        "name": if rec.display_name.trim().is_empty() { target.slug.clone() } else { rec.display_name.clone() },
+        "agents": target.agents,
+        "kept": target.kept,
         "edited": !edits.is_empty(),
         "edits": edits,
     })
@@ -262,6 +331,43 @@ impl crate::expert::install::InstallCtx {
             Some(skip) => duduclaw_core::agent_names::NameBook::load_excluding(&self.home, skip),
             None => duduclaw_core::agent_names::NameBook::load(&self.home),
         }
+    }
+
+    /// Called by each importer once its checks have passed and before its
+    /// first write: a real replace moves the earlier import to the backup
+    /// here (once). Nothing to do for other runs.
+    pub fn begin_writes(&self) -> Result<()> {
+        let Some(target) = self.replace.as_ref().filter(|_| !self.dry_run) else {
+            return Ok(());
+        };
+        let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.retired.is_none() {
+            state.retired = Some(retire::retire(&self.home, target)?);
+        }
+        Ok(())
+    }
+
+    /// The new version is about to create employee `id` (a failed replace
+    /// moves it aside and drops its org entry).
+    pub fn note_agent(&self, id: &str) {
+        if self.replace.is_some() && !self.dry_run {
+            let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
+            state.written_agents.push(id.to_string());
+            state.written_paths.push(self.home.join("agents").join(id));
+        }
+    }
+
+    /// The new version is about to create `path` (a skill, a knowledge page).
+    pub fn note_path(&self, path: &Path) {
+        if self.replace.is_some() && !self.dry_run {
+            let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
+            state.written_paths.push(path.to_path_buf());
+        }
+    }
+
+    /// The bookkeeping, taken once the importer is done.
+    pub fn take_replace_state(&self) -> ReplaceState {
+        std::mem::take(&mut *self.replace_state.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// [`claim_slug`] for this run.

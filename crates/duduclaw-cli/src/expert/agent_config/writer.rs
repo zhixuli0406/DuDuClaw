@@ -96,6 +96,7 @@ pub async fn install(
     // The cap counts every employee this import would add, before anything
     // (even the archived original) is written.
     ctx.ensure_quota(id_map.len()).await?;
+    ctx.begin_writes()?;
     report.meta("slug", &slug);
     report.meta("format", bundle.format_code);
 
@@ -343,6 +344,7 @@ async fn install_agent(
             model_preferred: model,
             soul_body: soul,
         };
+        ctx.note_agent(id);
         if let Err(e) = crate::scaffold_agent_dir(&ctx.home, &scaffold).await {
             report.skipped("agent", id, format!("建立失敗：{e}"));
             report.tag("agent.failed", json!({ "id": id }));
