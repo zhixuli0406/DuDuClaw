@@ -12,15 +12,6 @@
 - 關閉員工的 Google 個人代表身分或改回公司帳號時，不再要求確認已移除的「任何人都能使用」限制；設定個人代表且開放任何人使用時仍須確認。
 
 ### Added
-- 每位 AI 員工可以用不同的 Google 帳號（公司授權代表，B2a）：Google Workspace 客戶用一個開了網域委派的服務帳號，讓每位員工以一位指定同事的身分讀信、存草稿、管理日曆與文件。
-  - **設定**：員工頁新增「連線」分頁，顯示目前用哪個 Google 帳號；「已設定」僅表示本地資料備妥，需另按「測試連線」確認。管理員可以改成「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。測試會替同事取權杖、比對 Gmail 回報的信箱，再按服務測授權；Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點，試算表、文件、簡報與表單只驗授權簽發，不寄任何東西。「整合 → Google」新增「公司授權代表」分區：匯入服務帳號金鑰、複製用戶端 ID 與完整權限清單、設定允許網域，以及列出各員工的代表帳號。設定為 `agent.toml [google] identity`（`home`／`none`／`delegate:<email>`）、`fallback`、`requesters`；全域預設為 `config.toml [integrations.google_identity] default_identity`、`allowed_subject_domains`。沒寫 `[google]` 的員工照舊用公司共用帳號；改信箱或 fallback 時保留原本的發問者限制，未知型別拒絕。
-  - **金鑰只封存，不落成可讀的檔案**：服務帳號金鑰用系統金鑰圈裡的保護金鑰封存（`pk:v1`）存成 `<home>/protected/google-service-account.sealed`，AI 員工讀不到。憑證保護還沒改放系統金鑰圈、或在 Linux／Docker 上，一律不能代表同事。保護金鑰被換掉時，封存的金鑰解不開，公司授權代表停用、`security_audit.jsonl` 記一筆 Critical 的 `google_delegation_key_unreadable`，要重設憑證保護後重新匯入，舊紀錄不會被悄悄覆蓋。
-  - **只有 gateway 簽發**：每次委派工具呼叫都經 `POST /api/internal/google-token`（本機、簽章身分、一次性 nonce、限流），由 gateway 重查有效設定、這個 turn 的發問者、帳號狀態與憑證保護。只有 gateway 快取簽發結果，MCP 不跨呼叫沿用 token；整合總開關也會阻擋簽發。呼叫者只認 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工，宣稱卻證明不了的行程不能用代表同事的設定。`[google]` 納入 `AgentTomlSections`，與其他設定一樣讀有效的預設組合產物；區段錯誤拒絕 Google，不影響其他區段。
-  - **誰能透過員工使用**：預設只有綁定這位員工的人、管理員與排程等系統工作；`owner_only` 只限那位同事本人；`anyone` 要明確確認。網站公開訪客在任何設定下都不行。同事的 DuDuClaw 帳號停權或離職後立即不能再代表。
-  - **不會默默改用公司帳號**：用不了時工具回覆原因與誰能處理。只有管理員替員工勾了「改用公司共用帳號」（`fallback = "home"`），而且原因是還沒匯入金鑰、同事停權、Google 拒絕或連不上時，才改用並在回覆開頭說明；發問者沒有權限、設定錯誤、憑證保護的問題一律不改用。
-  - **稽核**：gateway 每次發出或拒絕權杖寫一列 `google_token`，用同事身分的每次工具呼叫寫一列 `google_call`（都不含權杖）；變更員工身分寫 `agent.google_identity_set` 與 `agent_google_identity_set`。新 RPC：`google.delegation.get`／`import_key`／`remove_key`／`settings_set`、`agents.google_identity_get`／`agents.google_identity_set`、`google.identity.test`。
-  - **仍未完整**：外部員工專屬 API key 的委派取權杖（`B2a-EXT`）與 `oauth://google` 的委派掛載及逐次呼叫守門（`B2a-MCP`）尚未實作；目前非 home 的外掛 Google MCP 直接略過，絕不換成公司 token。驗證範圍與本地測試結果見 PR 及 `wiki/impl/google-delegated-identity-acceptance.md`。尚未驗證：真的 Google Workspace（管理控制台授權流程、真實錯誤字串、關閉 Gmail 的組織單位、Google 自家遠端 MCP 收不收委派權杖）、Windows 真機、使用者驗收。
-
 - **未發布，驗證中**：容器瀏覽器可選擇保存登入狀態。全域與員工開關預設關閉，正常結束時只封存 Cookies／Local Storage／IndexedDB，加密綁定員工實例，主機不解開封存檔。白名單縮小、換負責人、刪除／封存員工時清除；電腦分頁可查看與清除。RED／緊急停止不保存，注入暫停後須有接手權限的人明確選擇保留。匯出與備份排除登入快照。已完成 12,799 項 Rust 測試、封存 helper 6 項測試、dashboard 62 項測試與建置。真實 gateway 容器流程另外抓到設定解析與輸入管線問題，修正後完成合成 Cookie 保存、重開還原及清除；修正後 14 項相關 Rust 回歸也通過。最後的 shipping binary 與正式前端產物已在 Chrome 完成保存／還原／清除、390px 無橫向溢出；即時畫面另需 VNC 修復 #207 的本機組合候選。真網站帳號與實際金鑰圈未驗，分層證據見 `wiki/impl/browser-profile-acceptance.md`。
 - **排程交辦**：主管（和任何有交辦權的人）可以把工作排到之後，或固定週期交辦給自己或團隊的 AI 員工，例如「每週一 09:00 寫週報」。設定當下不建立任務；時間到才以建立者的名義建立目標或看板任務，跟當下親自交辦一樣。
   - **聊天**：`/交辦 @員工 任務 || 時間:每週一 9:00`（也接受 `排程:`、`schedule:`、`at:`）。看得懂 `明天 15:00`、`10/25 下午2點`、`2026-10-25 14:00`、`每天 9:00`、`平日 早上9點`、`每週一、三、五 14:30`、`每小時`、`daily 09:00`、`every monday 9:00`；週期沒寫時間就是 09:00，時間以閘道主機時區解讀，確認訊息寫出讀到的排程與下次時間。`/交辦 排程` 列出自己的排程，`/交辦 排程 暫停|恢復|刪除 <編號>` 管理。管理員另可用 `cron:`。
