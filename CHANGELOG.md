@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- 企業版「我的連線」：同事自行連結 Google，逐位允許 AI 員工使用；員工可跟著主要 Owner 或指定有效的直接 Owner。Owner 可選自己的帳號或關閉使用，不能擴大發問者與公司備援範圍；管理員不能代本人同意。連結使用十分鐘、單次、同人同登入工作階段的 PKCE 流程，保存 Google 實際開放服務，個人憑證以系統金鑰圈保護金鑰封存。每次工具呼叫重驗人員、同意與服務權限；解除／離職先刪本機並阻擋遲到寫入，共用授權或公司帳號無法確認時不撤銷 Google 端。提供三語指南與僅含工具名稱、員工、時間及成功狀態的本人使用紀錄；個人版維持既有共用帳號入口。尚待最終 Rust、隔離活測與獨立審查，未發布。
+- 企業版「我的連線」：同事自行連結 Google，逐位允許 AI 員工使用；員工可跟著主要 Owner 或指定有效的直接 Owner。Owner 可選自己的帳號或關閉使用，不能擴大發問者與公司備援範圍；管理員不能代本人同意。連結使用十分鐘、單次、同人同登入工作階段的 PKCE 流程，保存 Google 實際開放服務，個人憑證以系統金鑰圈保護金鑰封存。每次工具呼叫重驗人員、同意與服務權限；解除／離職先刪本機並阻擋遲到寫入，共用授權或公司帳號無法確認時不撤銷 Google 端。提供三語指南與僅含工具名稱、員工、時間及成功狀態的本人使用紀錄；個人版維持既有共用帳號入口。已驗證：gateway lib 9,352 項、CLI／core 全量 3,383 項、前端建置及 7 組隔離活測（假 Google、真執行檔）；同 production 來源的 gateway 整合測試亦全過。原始失敗與 clippy 既有基線例外見 `wiki/impl/google-personal-identity-acceptance.md`。尚未驗證：真的 Google 授權、真的系統金鑰圈、Windows／Linux 真機及使用者驗收；B9 瀏覽器負責人切換清除仍待整合，未發布。
 - 每位 AI 員工可以用不同的 Google 帳號（公司授權代表，B2a）：Google Workspace 客戶用一個開了網域委派的服務帳號，讓每位員工以一位指定同事的身分讀信、存草稿、管理日曆與文件。
   - **設定**：員工頁新增「連線」分頁，顯示目前用哪個 Google 帳號；「已設定」僅表示本地資料備妥，需另按「測試連線」確認。管理員可以改成「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。測試會替同事取權杖、比對 Gmail 回報的信箱，再按服務測授權；Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點，試算表、文件、簡報與表單只驗授權簽發，不寄任何東西。「整合 → Google」新增「公司授權代表」分區：匯入服務帳號金鑰、複製用戶端 ID 與完整權限清單、設定允許網域，以及列出各員工的代表帳號。設定為 `agent.toml [google] identity`（`home`／`none`／`delegate:<email>`）、`fallback`、`requesters`；全域預設為 `config.toml [integrations.google_identity] default_identity`、`allowed_subject_domains`。沒寫 `[google]` 的員工照舊用公司共用帳號；改信箱或 fallback 時保留原本的發問者限制，未知型別拒絕。
   - **金鑰只封存，不落成可讀的檔案**：服務帳號金鑰用系統金鑰圈裡的保護金鑰封存（`pk:v1`）存成 `<home>/protected/google-service-account.sealed`，AI 員工讀不到。憑證保護還沒改放系統金鑰圈、或在 Linux／Docker 上，一律不能代表同事。保護金鑰被換掉時，封存的金鑰解不開，公司授權代表停用、`security_audit.jsonl` 記一筆 Critical 的 `google_delegation_key_unreadable`，要重設憑證保護後重新匯入，舊紀錄不會被悄悄覆蓋。

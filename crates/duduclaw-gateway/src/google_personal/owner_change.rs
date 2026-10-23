@@ -46,10 +46,7 @@ mod tests {
         let mut after = before.clone();
         after.identity = Some(Selector::User("alice".into()));
         assert!(validate(&before, &after, "alice", Some("alice"), false).is_err());
-        assert_eq!(
-            validate(&before, &after, "alice", Some("alice"), true).unwrap(),
-            true
-        );
+        assert!(validate(&before, &after, "alice", Some("alice"), true).unwrap());
         assert!(validate(&before, &after, "bob", Some("alice"), true).is_err());
         after.requesters = Requesters::BoundPeople;
         assert!(validate(&before, &after, "alice", Some("alice"), true).is_err());
@@ -60,9 +57,6 @@ mod tests {
         after.identity = Some(Selector::Owner);
         assert!(validate(&before, &after, "alice", Some("bob"), true).is_err());
         after.identity = Some(Selector::None);
-        assert_eq!(
-            validate(&before, &after, "alice", None, false).unwrap(),
-            false
-        );
+        assert!(!validate(&before, &after, "alice", None, false).unwrap());
     }
 }

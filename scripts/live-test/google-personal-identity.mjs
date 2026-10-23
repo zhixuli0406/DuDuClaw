@@ -18,6 +18,7 @@ const binary = resolve(process.argv[2]);
 const home = mkdtempSync(join(tmpdir(), 'ddc-google-personal-'));
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+const isRunning = (child) => child.exitCode === null && child.signalCode === null;
 const scopes = 'openid email https://www.googleapis.com/auth/gmail.readonly';
 const codes = new Map();
 const refreshes = new Map();
@@ -79,7 +80,9 @@ mock.listen(0, '127.0.0.1'); await once(mock, 'listening');
 const mockBase = `http://127.0.0.1:${mock.address().port}`;
 const portLease = createServer(); portLease.listen(0, '127.0.0.1'); await once(portLease, 'listening');
 const port = portLease.address().port; await new Promise((done) => portLease.close(done));
-const made = spawnSync('bash', [join(scriptDir, 'make-home.sh'), home, '--port', String(port)], { encoding: 'utf8' });
+const made = spawnSync('bash', [join(scriptDir, 'make-home.sh'), home, '--port', String(port)], {
+  env: { PATH: process.env.PATH, TMPDIR: tmpdir(), LANG: 'en_US.UTF-8', HOME: home }, encoding: 'utf8',
+});
 assert.equal(made.status, 0, made.stderr);
 writeFileSync(join(home, 'config.toml'), readFileSync(join(home, 'config.toml'), 'utf8') + `
 [integrations]
@@ -139,11 +142,13 @@ async function mcp(agent, name, args) {
     return await rpc('tools/call', { name, arguments: args });
   } finally {
     lines.close(); child.stdin.end();
-    if (child.exitCode === null) { child.kill(); await once(child, 'exit'); }
+    if (isRunning(child)) { const exited = once(child, 'exit'); child.kill(); await exited; }
   }
 }
 async function callback(start, account) {
   const authorize = new URL(start.authorization_url);
+  assert.equal(authorize.origin, mockBase, 'OAuth authorization must use the loopback mock');
+  assert.equal(new URL(start.redirect_uri).origin, apiBase, 'callback must stay on this loopback gateway');
   assert.equal(authorize.searchParams.get('access_type'), 'offline');
   assert(authorize.searchParams.get('prompt').includes('consent'));
   assert.equal(authorize.searchParams.get('code_challenge_method'), 'S256');
@@ -156,7 +161,7 @@ async function callback(start, account) {
 try {
   for (let i = 0; ; i++) {
     try { if ((await fetch(`${apiBase}/health`)).ok) break; } catch {}
-    assert(i < 120 && gateway.exitCode === null, 'gateway failed to start'); await delay(500);
+    assert(i < 120 && isRunning(gateway), 'gateway failed to start'); await delay(500);
   }
   assert.equal((await (await fetch(`${apiBase}/healthz`)).json()).live_test_mocks, true);
   const login = { email: 'admin@c.test', password: 'fixture-password-only' };
@@ -214,7 +219,7 @@ try {
     assert(['active', 'suspended'].includes(status));
     assert(/^[0-9a-f-]+$/.test(users[0].id));
     const change = spawnSync('/usr/bin/sqlite3', [join(home, 'users.db'),
-      `UPDATE users SET status='${status}' WHERE id='${users[0].id}';`], { encoding: 'utf8' });
+      `UPDATE users SET status='${status}' WHERE id='${users[0].id}';`], { env, encoding: 'utf8' });
     assert.equal(change.status, 0, change.stderr);
   };
   fixtureStatus('suspended');
@@ -255,8 +260,13 @@ try {
 } finally {
   heldRevoke = undefined;
   for (const socket of sockets) socket.close();
-  gateway.kill('SIGTERM');
-  if (gateway.exitCode === null) await Promise.race([once(gateway, 'exit'), delay(10000)]);
-  if (gateway.exitCode === null) { gateway.kill('SIGKILL'); await once(gateway, 'exit'); }
+  if (isRunning(gateway)) {
+    const exited = once(gateway, 'exit');
+    gateway.kill('SIGTERM');
+    let timer;
+    await Promise.race([exited, new Promise((done) => { timer = setTimeout(done, 10000); })]);
+    clearTimeout(timer);
+  }
+  if (isRunning(gateway)) { const exited = once(gateway, 'exit'); gateway.kill('SIGKILL'); await exited; }
   mock.closeAllConnections(); await new Promise((done) => mock.close(done)); log.end();
 }
