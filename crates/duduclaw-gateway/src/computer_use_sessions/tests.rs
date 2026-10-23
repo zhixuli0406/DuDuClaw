@@ -109,6 +109,8 @@ fn loopback() -> SocketAddr {
 
 #[derive(Default)]
 struct FakeState {
+    observed_attendance: Mutex<Vec<bool>>,
+    observed_action_turn: Mutex<Vec<Option<String>>>,
     executed: Mutex<Vec<ComputerAction>>,
     stops: AtomicU32,
     starts: AtomicU32,
@@ -191,6 +193,7 @@ impl SessionBackend for FakeBackend {
         self.state.stops.fetch_add(1, Ordering::SeqCst);
     }
     async fn screenshot(&self) -> Result<MaskedScreenshot, ComputerUseError> {
+        self.state.observed_attendance.lock().unwrap().push(attended_call::current("alice"));
         Ok(MaskedScreenshot {
             png_base64: self.state.frame.lock().unwrap().clone().unwrap_or_else(tiny_png_b64),
             full_mask: *self.state.full_mask.lock().unwrap(),
@@ -205,6 +208,7 @@ impl SessionBackend for FakeBackend {
             .unwrap_or_else(|| Ok("about:blank - Chromium".to_string()))
     }
     async fn execute(&self, action: &ComputerAction) -> Result<(), ComputerUseError> {
+        self.state.observed_action_turn.lock().unwrap().push(attended_call::current_turn("alice"));
         self.state.executed.lock().unwrap().push(action.clone());
         Ok(())
     }
@@ -2604,6 +2608,8 @@ mod workspace_cases;
 
 #[path = "tests/on_behalf_of.rs"]
 mod on_behalf_of;
+#[path = "tests/attended_call.rs"]
+mod attended_call_cases;
 
 #[path = "tests/workspace_docker.rs"]
 mod workspace_docker;

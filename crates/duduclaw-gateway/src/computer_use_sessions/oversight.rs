@@ -180,7 +180,10 @@ impl SessionOrigin {
     /// container-start waits. A durable fact is not a live presence grant.
     pub(crate) fn capture_live_turn(agent: &str, turn: Option<&str>) -> Self {
         let who = turn
-            .filter(|turn| super::turns::attended_live_for(agent, turn))
+            .filter(|turn| {
+                super::attended_call::current_turn(agent).as_deref() == Some(*turn)
+                    && super::turns::attended_live_for(agent, turn)
+            })
             .map(|turn| crate::knowledge::turn_requesters::resolve(agent, Some(turn)))
             .unwrap_or(RequesterIdentity::Unknown);
         Self::from_requester(&who, Utc::now())
@@ -218,6 +221,28 @@ mod tests {
     use duduclaw_auth::{AccessLevel, OverseenReport};
 
     #[tokio::test]
+    async fn an_unattended_caller_cannot_borrow_another_live_runtime_turn_as_its_origin() {
+        let agent = "employee-a";
+        let turn = format!("other-runtime-{}", uuid::Uuid::new_v4());
+        let session = "webchat:other-runtime";
+        let scope = scope(Utc::now() - chrono::Duration::seconds(1));
+        let _requester = crate::knowledge::turn_requesters::register(agent, &turn,
+            RequesterIdentity::DashboardUser { user_id: "report-a".into() }).unwrap();
+        super::super::attended::verified_webchat_message(session, Some("report-a"),
+            duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(session.into()),
+                duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some(turn.clone()), async {
+                    assert!(super::super::attended::bind_final_route(session, session, agent, &turn));
+                    let _live = super::super::turns::register_current_turn(agent).unwrap();
+                    assert!(super::super::turns::attended_live_for(agent, &turn));
+                    super::super::attended_call::request_scope(None, async {
+                        assert!(!SessionOrigin::capture_live_turn(agent, Some(&turn)).allows(&scope),
+                            "the calling runtime has no attended proof of its own");
+                    }).await;
+                })),
+        ).await;
+    }
+
+    #[tokio::test]
     async fn requester_identity_alone_cannot_create_a_human_session_origin() {
         let agent = "employee-a";
         let turn = format!("origin-{}", uuid::Uuid::new_v4());
@@ -234,7 +259,9 @@ mod tests {
         let untrusted = super::super::turns::register(agent, &turn, session).unwrap();
         assert!(!SessionOrigin::capture_live_turn(agent, Some(&turn)).allows(&scope));
         drop(untrusted);
-        let origin = super::super::attended::verified_webchat_message(
+        let home = tempfile::tempdir().unwrap();
+        let origin = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(
+            Some(turn.clone()), super::super::attended::verified_webchat_message(
             session,
             Some("report-a"),
             duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(session.into()), async {
@@ -242,9 +269,13 @@ mod tests {
                     session, session, agent, &turn
                 ));
                 let _live = super::super::turns::register(agent, &turn, session).unwrap();
-                SessionOrigin::capture_live_turn(agent, Some(&turn))
+                let runtime = crate::on_behalf_of::context::register(home.path(), agent).unwrap();
+                let call = crate::on_behalf_of::context::attended_call(home.path(), agent, runtime.reference()).unwrap();
+                super::super::attended_call::request_scope(Some(call), async {
+                    SessionOrigin::capture_live_turn(agent, Some(&turn))
+                }).await
             }),
-        )
+        ))
         .await;
         assert!(
             origin.allows(&scope),

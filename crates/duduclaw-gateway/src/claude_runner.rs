@@ -490,7 +490,10 @@ where
     F: std::future::Future<Output = Result<String, String>>,
 {
     use crate::cost_telemetry::RequestType as RT;
-    let fut = crate::on_behalf_of::context::scope(home_dir, agent_id, fut);
+    let fut = crate::computer_use_sessions::attended_call::runtime_scope(
+        request_type == RT::Chat,
+        crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
+    );
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
@@ -5670,3 +5673,7 @@ pub fn reply_sender_for(channel: &str, chat_id: &str) -> Option<String> {
     let (ch, chat) = crate::decision_notify::parse_origin(&rc)?;
     (ch == channel.trim() && chat == chat_id.trim()).then_some(sender)
 }
+
+#[cfg(test)]
+#[path = "claude_runner/attended_call_tests.rs"]
+mod attended_call_producer_tests;
