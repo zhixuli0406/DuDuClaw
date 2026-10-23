@@ -41,6 +41,8 @@ pub(crate) const CONTINUE_MESSAGE_PREFIX: &str = "\u{0}duduclaw:continue\u{0}";
 // ── Task row ────────────────────────────────────────────────
 
 mod activity;
+mod assign_schedules;
+pub(crate) use assign_schedules::AssignScheduleSlot;
 mod authority;
 mod claim;
 mod discovery;
@@ -68,6 +70,7 @@ mod tests;
 #[cfg(test)]
 mod tests_survival_evidence;
 
+pub use assign_schedules::{ASSIGN_SCHEDULE_LIVE_STATUSES, AssignScheduleRow, ScheduleFireOutcome};
 pub use authority::{TaskAuthoritySnapshot, task_snapshot_hash};
 pub use resp_occurrence::{MaterializeOutcome, MaterializeRequest, PeriodUsage};
 pub use resp_schema::{RESP_SCHEMA_OWNER, RESP_SCHEMA_VERSION};

@@ -103,6 +103,25 @@ pub async fn create_goal_task(
     store: &TaskStore,
     req: GoalCreateRequest,
 ) -> Result<GoalCreated, String> {
+    create_goal_task_inner(home_dir, store, req, None).await
+}
+
+/// The same goal contract, with an atomic scheduled-slot fence at insert.
+pub(crate) async fn create_scheduled_goal_task(
+    home_dir: &Path,
+    store: &TaskStore,
+    req: GoalCreateRequest,
+    slot: &crate::task_store::AssignScheduleSlot<'_>,
+) -> Result<GoalCreated, String> {
+    create_goal_task_inner(home_dir, store, req, Some(slot)).await
+}
+
+async fn create_goal_task_inner(
+    home_dir: &Path,
+    store: &TaskStore,
+    req: GoalCreateRequest,
+    slot: Option<&crate::task_store::AssignScheduleSlot<'_>>,
+) -> Result<GoalCreated, String> {
     let description = req.description.trim();
     if description.is_empty() {
         return Err("description is required".to_string());
@@ -232,10 +251,10 @@ pub async fn create_goal_task(
         crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
     }
 
-    store
-        .insert_task(&task)
-        .await
-        .map_err(|e| format!("create goal task: {e}"))?;
+    match slot {
+        Some(slot) => store.insert_assign_schedule_task(&task, slot).await,
+        None => store.insert_task(&task).await,
+    }.map_err(|e| format!("create goal task: {e}"))?;
 
     // Team-as-Agent P1/WP-4: freeze the role→{runtime, model, effort} team for
     // this task, once, right after creation — same frozen-contract moment as

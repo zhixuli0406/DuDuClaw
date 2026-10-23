@@ -535,6 +535,9 @@ pub use goal_loop::plan as goal_plan;
 //        `tasks_create kind="goal"` entry so the H9-G contract freeze and the
 //        I-1c plan-first parking can never drift between the two rails ──
 pub mod goal_create_core;
+// Scheduled assignments: work handed to an AI employee for later or on a
+// repeat, re-authorized at every fire (`assign_schedule/mod.rs`).
+pub mod assign_schedule;
 // ── D5: semi-automatic topology evolution (edge optimization, human-gated) ──
 pub mod topology_evolution;
 // ── WP2.4: structured outcome acceptance — deterministic (zero-LLM) validation
