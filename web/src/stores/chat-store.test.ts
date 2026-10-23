@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildUserMessageFrame,
   frameBelongsToConversation,
+  newClientMessageId,
   historyToMessages,
   isResumeNotFound,
   parseAssignedTask,
@@ -9,6 +10,23 @@ import {
   sessionIdAfterHello,
   useChatStore,
 } from './chat-store';
+
+describe('client message ids', () => {
+  it('are plain tokens, unique per send, and travel as msg_id', () => {
+    const a = newClientMessageId();
+    const b = newClientMessageId();
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+    const frame = buildUserMessageFrame({
+      content: '/交辦 @sales 整理',
+      sessionId: 'webchat:x',
+      agentId: null,
+      attachments: [],
+      msgId: a,
+    });
+    expect(frame.msg_id).toBe(a);
+  });
+});
 
 describe('buildUserMessageFrame (L1 per-agent routing)', () => {
   it('omits the agent key when no partner is selected (byte-compatible)', () => {

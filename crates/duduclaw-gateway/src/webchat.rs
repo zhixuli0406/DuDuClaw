@@ -65,6 +65,11 @@ pub enum ChatMessage {
         /// byte-compatible single-bucket behaviour (pre-fix clients).
         #[serde(default)]
         conv: Option<String>,
+        /// Client id of this message (one per send; 1–64 of `[A-Za-z0-9_-]`,
+        /// anything else is ignored). A `/交辦` derives its task id from it,
+        /// so the same frame sent twice creates one task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
     },
     /// Server → Client: assistant response chunk (streaming).
     #[serde(rename = "assistant_chunk")]
@@ -833,7 +838,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                         };
 
                         match chat_msg {
-                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv } => {
+                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv, msg_id } => {
+                                let assign_event = assign_event_id(msg_id.as_deref());
                                 // ── Forced password-change gate ──────────
                                 // Mirrors `handlers.rs::dispatch`'s gate on the
                                 // dashboard WS path (same error code, so a
@@ -1119,7 +1125,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 if !crate::chat_commands::is_command(&content) {
                                     if let Some(frame) = Box::pin(route::pending_assign_reply(
                                         &state, &auth_user, &content, effective_agent.as_deref(),
-                                        &agent_id, sid, &user_id, conv_nonce.clone(),
+                                        &agent_id, sid, &user_id, conv_nonce.clone(), assign_event.as_deref(),
                                     )).await {
                                         if let Ok(json) = serde_json::to_string(&frame) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1206,7 +1212,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             channel: "webchat",
                                             channel_user_id: if is_widget_visitor(&auth_user) { "" } else { &auth_user },
                                             access: state.sender_access(&auth_user).await,
-                                            event: None,
+                                            event: assign_event.as_deref(),
                                             seq: crate::trigger_route::pending::next_seq(),
                                         };
                                         // `/交辦` keeps the task for a card; every other
@@ -1822,6 +1828,16 @@ mod widget_auth_tests {
     }
 }
 
+/// The `/交辦` event id of a WebChat frame: its client `msg_id`, when it is
+/// a plain token (1–64 of `[A-Za-z0-9_-]`).
+fn assign_event_id(msg_id: Option<&str>) -> Option<String> {
+    msg_id
+        .filter(|m| {
+            !m.is_empty() && m.len() <= 64 && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .map(|m| format!("web:{m}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1953,6 +1969,24 @@ mod tests {
             ChatMessage::UserMessage { conv, .. } => assert_eq!(conv.as_deref(), Some("c-42")),
             other => panic!("expected UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_client_message_id_is_the_assign_event_only_when_plain() {
+        let msg: ChatMessage = serde_json::from_str(
+            r#"{"type":"user_message","content":"/交辦 @x y","session_id":"webchat:x","msg_id":"m-1a2b"}"#,
+        )
+        .expect("parse");
+        match msg {
+            ChatMessage::UserMessage { msg_id, .. } => {
+                assert_eq!(assign_event_id(msg_id.as_deref()).as_deref(), Some("web:m-1a2b"))
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+        assert_eq!(assign_event_id(None), None);
+        assert_eq!(assign_event_id(Some("")), None);
+        assert_eq!(assign_event_id(Some("a b")), None);
+        assert_eq!(assign_event_id(Some(&"x".repeat(65))), None);
     }
 
     #[test]

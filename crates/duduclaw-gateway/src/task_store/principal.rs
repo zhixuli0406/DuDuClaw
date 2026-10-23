@@ -17,6 +17,28 @@ pub const ACTIVE_STATUSES: &[&str] = &[
 ];
 
 impl TaskStore {
+    /// Chat-assign volume for `principal` (tasks whose `created_by` is
+    /// `assign:<channel>`): how many were created in the last
+    /// `window_minutes` (archived or not), and how many are still in
+    /// [`ACTIVE_STATUSES`] and not archived.
+    pub async fn chat_assign_counts(&self, principal: &str, window_minutes: u64) -> Result<(i64, i64), String> {
+        let list = ACTIVE_STATUSES
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN julianday(created_at) >= julianday('now', ?2) THEN 1 ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN archived = 0 AND status IN ({list}) THEN 1 ELSE 0 END), 0) \
+             FROM tasks WHERE on_behalf_of = ?1 AND created_by LIKE 'assign:%'"
+        );
+        let window = format!("-{} minutes", window_minutes.min(10_080));
+        let conn = self.conn.lock().await;
+        conn.query_row(&sql, params![principal, window], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("count chat assignments: {e}"))
+    }
+
     /// The home directory this store lives in (`<home>/tasks.db`).
     pub fn home_dir(&self) -> Option<&Path> {
         self.db_path.parent()

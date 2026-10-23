@@ -486,6 +486,14 @@ impl<'a> CommandCaller<'a> {
         }
     }
 
+    /// This caller, with the platform's stable id of the incoming message
+    /// (a `/交辦` derives its task id from it, so a redelivered message
+    /// creates nothing twice).
+    pub fn with_event(mut self, event: Option<&'a str>) -> Self {
+        self.event = event.filter(|e| !e.is_empty());
+        self
+    }
+
     /// The assign-command view of this caller in conversation `session_id`.
     pub fn assign_caller(
         &self,

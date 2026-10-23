@@ -514,6 +514,9 @@ async fn assigned_by_me_lists_own_handed_over_tasks_with_content() {
         .unwrap()
         .clone();
     assert_eq!(other_row["restricted"], true);
+    // Who it was assigned for and from where are content too.
+    assert!(other_row["on_behalf_of"].is_null(), "{other_row}");
+    assert!(other_row["created_via"].is_null(), "{other_row}");
 
     // Someone else's id in the field is ignored: an ordinary listing, which
     // a non-admin without `agent_id` is refused.
@@ -539,4 +542,25 @@ async fn assigned_by_me_lists_own_handed_over_tasks_with_content() {
             .await,
     );
     assert_eq!(after["tasks"][0]["restricted"], true);
+}
+
+#[tokio::test]
+async fn only_an_admin_sets_a_goal_risk_boundary_from_the_dashboard() {
+    let f = fixture().await;
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    let params = |boundary: &str| {
+        json!({ "agent_id": "sales", "description": "整理報價單", "risk_boundary": boundary })
+    };
+    let refused = f.handler.handle("tasks.goal_create", params("沒有限制"), &mgr).await;
+    assert!(
+        matches!(&refused, WsFrame::Response { ok: false, error: Some(e), .. }
+            if e.to_string().contains("only an admin can set a risk boundary")),
+        "{refused:?}"
+    );
+    // A blank boundary is no boundary: the manager may still assign.
+    let blank = f.handler.handle("tasks.goal_create", params("  "), &mgr).await;
+    assert!(matches!(blank, WsFrame::Response { ok: true, .. }), "{blank:?}");
+    let admin = jwt_ctx(&f.admin, UserRole::Admin);
+    let ok = f.handler.handle("tasks.goal_create", params("不得寄信給客戶"), &admin).await;
+    assert!(matches!(ok, WsFrame::Response { ok: true, .. }), "{ok:?}");
 }

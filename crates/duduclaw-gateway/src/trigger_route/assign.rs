@@ -322,6 +322,12 @@ fn assignable_list(
 /// refusal; repeats inside the window get no answer. Other channels always
 /// answer.
 fn refused(caller: &AssignCaller<'_>, agent: Option<&str>, reason: &'static str, text: String) -> Plan {
+    Plan::Reply(refusal(caller, agent, reason, text))
+}
+
+/// The reply of [`refused`], for refusals decided after planning (the
+/// chat-assign caps in `assign_create`).
+pub(super) fn refusal(caller: &AssignCaller<'_>, agent: Option<&str>, reason: &'static str, text: String) -> AssignReply {
     super::assign_audit::refused(caller, agent.unwrap_or(""), reason);
     let throttled = matches!(caller.channel, "line" | "telegram")
         && !super::allow_direct_reply(
@@ -330,7 +336,13 @@ fn refused(caller: &AssignCaller<'_>, agent: Option<&str>, reason: &'static str,
             caller.sender,
             super::turn::ReplyKind::Refusal,
         );
-    Plan::Reply(AssignReply::text(if throttled { String::new() } else { text }))
+    AssignReply::text(if throttled { String::new() } else { text })
+}
+
+/// Whether the sender is a dashboard Admin (the only sender whose `/交辦`
+/// may set a per-task risk boundary).
+pub(super) fn sender_is_admin(caller: &AssignCaller<'_>) -> bool {
+    matches!(caller.access.sender, Sender::Admin { .. })
 }
 
 /// For a channel that admits an event before handling it (LINE durable

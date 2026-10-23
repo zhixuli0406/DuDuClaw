@@ -979,6 +979,7 @@ async fn process_telegram_message(
                 &scope_id,
                 agent_name.as_deref(),
                 from_user_id,
+                msg_id,
             )
             .await;
             return;
@@ -1363,12 +1364,13 @@ async fn process_telegram_message(
     // The message an armed `/交辦 @name` was waiting for becomes the task.
     if let Some(crate::trigger_route::turn::TurnDecision::Assign { id }) = &trigger_decision {
         let fallback = bound_for_route.clone().flatten();
+        let event = msg_id.map(assign_event_id);
         let caller = crate::trigger_route::assign::AssignCaller {
             home: &ctx.home_dir,
             channel: "telegram",
             conversation: &session_id,
             sender: &user_id,
-            event: None,
+            event: event.as_deref(),
             seq: crate::trigger_route::pending::next_seq(),
             fallback: fallback.as_deref(),
             access: crate::trigger_route::access::for_channel_sender(&ctx.home_dir, "telegram", &user_id),
@@ -1916,6 +1918,11 @@ fn reply_principal_for_sender(from_user_id: Option<i64>) -> String {
 /// — used for the per-channel `admin_users` check so a group's admin can be
 /// identified by their own id, not just the shared chat id, and for the CCR
 /// principal (see [`reply_principal_for_sender`]).
+/// The stable id of a Telegram message for a `/交辦` task id.
+fn assign_event_id(message_id: i64) -> String {
+    format!("msg:{message_id}")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     text: &str,
@@ -1927,6 +1934,7 @@ async fn handle_command(
     scope_id: &str,
     agent_name: Option<&str>,
     from_user_id: Option<i64>,
+    message_id: Option<i64>,
 ) {
     // ── WP9: `/start <token>` deep-link binding (global/shared bot only) ──
     // Runs BEFORE the access gate so a brand-new employee can onboard even
@@ -2207,11 +2215,16 @@ async fn handle_command(
                 // group/chat id) — the identity `/rules off`'s mapped_role
                 // gate resolves against, and the one `/交辦` and `/goal`
                 // look up the sender's dashboard account with.
+                // Telegram message ids are unique within a chat (the task id
+                // also hashes the conversation), so a redelivered update
+                // finds the task it already created.
+                let event = message_id.map(assign_event_id);
                 let caller = crate::chat_commands::CommandCaller::for_channel(
                     &ctx.home_dir,
                     "telegram",
                     from_id_str.as_deref().unwrap_or(scope_id),
-                );
+                )
+                .with_event(event.as_deref());
                 let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,

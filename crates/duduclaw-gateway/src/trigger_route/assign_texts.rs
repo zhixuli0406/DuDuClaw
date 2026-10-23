@@ -103,12 +103,28 @@ pub fn nobody_assignable(lang: Lang) -> &'static str {
     }
 }
 
-/// The task could not be created.
-pub fn failed(lang: Lang, reason: &str) -> String {
+/// The task could not be created (or the list read). Fixed text: the
+/// cause goes to the log only, never into the chat.
+pub fn failed(lang: Lang) -> &'static str {
     match lang {
-        Lang::ZhTw => format!("⚠️ 交辦沒有成功：{reason}"),
-        Lang::En => format!("⚠️ The task was not assigned: {reason}"),
-        Lang::Ja => format!("⚠️ タスクを任せられませんでした：{reason}"),
+        Lang::ZhTw => "⚠️ 交辦沒有成功，請稍後再試；一直失敗的話請聯絡管理員。",
+        Lang::En => "⚠️ The task was not assigned. Please try again later, or ask an administrator if it keeps failing.",
+        Lang::Ja => "⚠️ タスクを任せられませんでした。しばらくしてから再度お試しください。続く場合は管理者に連絡してください。",
+    }
+}
+
+/// The sender assigned too many tasks from chat (rate or open-task cap).
+pub fn too_many(lang: Lang, per_window: u32, window_minutes: u64, max_open: u32) -> String {
+    match lang {
+        Lang::ZhTw => format!(
+            "⚠️ 交辦太多了：從聊天交辦每 {window_minutes} 分鐘最多 {per_window} 件，還沒結束的最多 {max_open} 件。請稍後再試，或等手上的任務結束。"
+        ),
+        Lang::En => format!(
+            "⚠️ Too many tasks: from a chat you can assign at most {per_window} every {window_minutes} minutes, and keep at most {max_open} unfinished. Try again later, or wait for some to finish."
+        ),
+        Lang::Ja => format!(
+            "⚠️ 依頼が多すぎます。チャットからは {window_minutes} 分ごとに最大 {per_window} 件、未完了は最大 {max_open} 件までです。しばらくしてから、または進行中のタスクが終わってから再度お試しください。"
+        ),
     }
 }
 
@@ -124,6 +140,8 @@ pub struct Confirmation<'a> {
     pub progress_here: bool,
     /// The task waits for a plan to be approved first.
     pub plan_first: bool,
+    /// A `邊界:` segment was dropped (only an Admin may set it).
+    pub boundary_ignored: bool,
 }
 
 /// The reply after a task was created.
@@ -148,6 +166,14 @@ pub fn confirmation(lang: Lang, c: &Confirmation<'_>) -> String {
             Lang::ZhTw => format!("（依組織關係交辦：{owner}的 AI 員工）"),
             Lang::En => format!("(Assigned through your team: {owner}'s AI staff)"),
             Lang::Ja => format!("（組織関係で依頼：{owner}の AI スタッフ）"),
+        });
+    }
+    if c.boundary_ignored {
+        out.push('\n');
+        out.push_str(match lang {
+            Lang::ZhTw => "邊界設定只有管理員能改，已沿用預設。",
+            Lang::En => "Only an administrator can set the risk boundary; the default applies.",
+            Lang::Ja => "リスク境界は管理者のみ変更できます。既定の境界を使います。",
         });
     }
     if c.plan_first {
@@ -264,13 +290,17 @@ mod tests {
             team_owner: None,
             progress_here: true,
             plan_first: false,
+            boundary_ignored: false,
         };
         let plain = confirmation(Lang::ZhTw, &c);
+        assert!(!plain.contains("邊界設定"));
         assert!(plain.contains("【業務專員】") && plain.contains("#1a2b3c4d"));
         assert!(!plain.contains("依組織關係"));
         c.team_owner = Some("王小明");
         assert!(confirmation(Lang::ZhTw, &c).contains("依組織關係交辦：王小明的 AI 員工"));
         c.progress_here = false;
         assert!(confirmation(Lang::En, &c).contains("Goals page"));
+        c.boundary_ignored = true;
+        assert!(confirmation(Lang::ZhTw, &c).contains("邊界設定只有管理員能改，已沿用預設"));
     }
 }

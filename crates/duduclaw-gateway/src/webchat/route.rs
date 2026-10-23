@@ -233,6 +233,7 @@ pub(super) async fn pending_assign_reply(
     sid: &str,
     user_id: &str,
     conv: Option<String>,
+    assign_event: Option<&str>,
 ) -> Option<ChatMessage> {
     use crate::trigger_route::pending::{self, PendingKey, PendingKind};
     if super::is_widget_visitor(auth_user) {
@@ -264,7 +265,7 @@ pub(super) async fn pending_assign_reply(
         channel: "webchat",
         conversation: sid,
         sender: auth_user,
-        event: None,
+        event: assign_event,
         seq,
         fallback: Some(fallback),
         access,

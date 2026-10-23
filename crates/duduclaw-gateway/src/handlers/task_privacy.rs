@@ -38,6 +38,9 @@ const CONTENT_FIELDS: &[(&str, fn() -> Value)] = &[
     ("risk_boundary", || Value::Null),
     ("plan_pending", || Value::Null),
     ("message_id", || Value::Null),
+    // Who a task was assigned for (`user:<account id>`) and from where.
+    ("on_behalf_of", || Value::Null),
+    ("created_via", || Value::Null),
 ];
 
 /// Identity for one task-content read, re-read from the identity store.

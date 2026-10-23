@@ -393,9 +393,10 @@ pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<S
     let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
     let user = db.get_user(user_id).ok().flatten()?;
     // One line of plain text: control characters (a newline could start a
-    // fake instruction block) are dropped.
+    // fake instruction block), line/paragraph separators, bidi controls and
+    // zero-width characters are dropped.
     let clean = |s: &str| -> String {
-        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        let s: String = s.chars().filter(|&c| !is_hidden_or_breaking(c)).collect();
         duduclaw_core::truncate_chars(s.trim(), 40).to_string()
     };
     let name = clean(&user.display_name);
@@ -407,6 +408,25 @@ pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<S
         Some(dept) => format!("{name}（{dept}）"),
         None => name,
     })
+}
+
+/// Characters a one-line display name must not carry: C0/C1 controls,
+/// U+2028/U+2029, bidi embeddings, overrides and isolates (U+202A–U+202E,
+/// U+2066–U+2069, U+200E/U+200F, U+061C), zero-width characters
+/// (U+200B–U+200D, U+2060, U+FEFF) and the soft hyphen.
+fn is_hidden_or_breaking(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{061C}'
+                | '\u{2060}'
+                | '\u{FEFF}'
+                | '\u{00AD}'
+        )
 }
 
 /// The queue row of one goal round with the given message id.
@@ -439,5 +459,18 @@ pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) ->
         // P2-B: a goal round carries no upstream channel turn to lose.
         upstream_unknown: false,
         lane: None,
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::is_hidden_or_breaking;
+
+    #[test]
+    fn display_names_lose_breaks_bidi_and_zero_width_characters() {
+        let raw = "陳\u{2028}經\u{202E}理\u{2066}\u{200B}\u{FEFF}\n（業務）";
+        let clean: String = raw.chars().filter(|&c| !is_hidden_or_breaking(c)).collect();
+        assert_eq!(clean, "陳經理（業務）");
+        assert!(!is_hidden_or_breaking('A') && !is_hidden_or_breaking('（'));
     }
 }

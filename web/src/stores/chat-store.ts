@@ -300,6 +300,16 @@ function nextConvId(): string {
   return `c-${Date.now().toString(36)}-${convCounter}`;
 }
 
+let clientMsgCounter = 0;
+
+/** A fresh client message id (`[A-Za-z0-9_-]`, at most 64 characters). */
+export function newClientMessageId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return uuid;
+  clientMsgCounter += 1;
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${clientMsgCounter}`;
+}
+
 /**
  * Assemble the `user_message` wire frame (pure — exported for tests).
  *
@@ -317,14 +327,17 @@ export function buildUserMessageFrame(opts: {
   agentId: string | null;
   attachments: readonly PendingAttachment[];
   convId?: string | null;
+  /** One id per send: a `/交辦` derives its task id from it on the server. */
+  msgId?: string | null;
 }): Record<string, unknown> {
-  const { content, sessionId, agentId, attachments, convId } = opts;
+  const { content, sessionId, agentId, attachments, convId, msgId } = opts;
   return {
     type: 'user_message',
     content,
     session_id: sessionId,
     ...(agentId ? { agent: agentId } : {}),
     ...(convId ? { conv: convId } : {}),
+    ...(msgId ? { msg_id: msgId } : {}),
     attachments: attachments.map((a) => ({
       filename: a.name,
       mime: a.mime,
@@ -863,6 +876,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             agentId: get().selectedAgentId,
             attachments: atts,
             convId: get().convId,
+            msgId: newClientMessageId(),
           }),
         ),
       );
