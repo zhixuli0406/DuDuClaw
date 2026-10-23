@@ -86,6 +86,10 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     let requester =
         crate::knowledge::requester_map::requester_for_reply(&ctx.home_dir, session_id, user_id)
             .await;
+    // The same person, as the `on_behalf_of` every spawn of this turn
+    // carries (`DUDUCLAW_ON_BEHALF_OF`), and every delegation or task the
+    // employee starts from it inherits.
+    let principal = crate::on_behalf_of::principal_for_requester(&ctx.home_dir, &requester);
     let cited: Arc<std::sync::Mutex<Vec<duduclaw_knowledge::cite::CitationRef>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     // Keep the authenticated channel caller and exact conversation in scope
@@ -126,9 +130,12 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                                 thinking_sink.clone(),
                                 crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(
                                     requester,
-                                    crate::knowledge::cite_turn::TURN_CITATIONS.scope(
-                                        cited.clone(),
-                                        pipeline,
+                                    crate::on_behalf_of::scope_first(
+                                        principal,
+                                        crate::knowledge::cite_turn::TURN_CITATIONS.scope(
+                                            cited.clone(),
+                                            pipeline,
+                                        ),
                                     ),
                                 ),
                             ),

@@ -799,6 +799,7 @@ impl AgentRuntime for AntigravityRuntime {
         // upstream-unknown marker (added by `spawn_mcp_env`) may reach the
         // MCP child.
         cmd.env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN);
+        cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
         for (k, v) in spawn_mcp_env(&context.home_dir, &context.agent_id) {
             cmd.env(k, v);
         }

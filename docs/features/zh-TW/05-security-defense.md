@@ -206,6 +206,20 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 人格設定、自我介紹、工作規則、行為界線（`SOUL.md`、`IDENTITY.md`、`INSTRUCTIONS.md`、`CONTRACT.toml`）可以由員工的負責人與管理員在儀表板修改，每次存檔都先檢查再生效（拍板 D7）。誰能寫，每次呼叫都從 `users.db` 重新讀取，寫入前在檔案鎖內再讀一次，所以檢查進行中被解除綁定也會擋下寫入。先跑固定規則（大小與控制字元、嚴格解析行為界線、隱藏或看不見的內容、新增文字裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪掉某條）。接著由部署的輔助模型看差異：被改的文字包在帶隨機 nonce 的標籤裡、先去掉隱藏內容，回覆必須完全符合固定格式。模型只能讓結果更嚴。檢查沒完成至少算警告，不會當成通過，也不能關掉。非管理員遇到高風險只能送管理員審核（`agent_file_change`，只能在儀表板決定，通道只收沒有按鈕的通知）。這個檢查看的是人送出的內容，`agent-file-guard` 照舊擋員工自己寫這些檔。每次寫入都在員工資料夾外留版本並寫 `agent_file_changed`，被拒絕寫 `agent_file_change_refused`。INSTRUCTIONS.md 現在和 SOUL.md 一樣有自己的核可指紋。同一版也擴大只限管理員的 `agent.toml` 欄位（bot token、`[odoo]`、`[runtime] provider`／`fallback`、`[prompt] cli_bare_mode`、`[os_watch]`、`[model] account_pool`、`role = "main"`、放寬預算），見[儀表板設定](../../guides/zh-TW/dashboard-settings.md#設定檔未發布)。
 
+## 工作替誰做（`on_behalf_of`，未發布）
+
+由真人發起的工作（一輪對話、`/交辦`、dashboard 建的任務），gateway 現在會把「這是替誰做的」一路帶下去：員工的 runtime 會拿到 `DUDUCLAW_ON_BEHALF_OF`（所有 runtime，不只 Claude）；`send_to_agent`／`spawn_agent` 把它寫進佇列（`message_queue.on_behalf_of`、`bus_queue.jsonl` 欄位），派工器再套到接手的那一輪；目標任務的每一輪與 heartbeat 喚醒從任務列（`tasks.on_behalf_of`）抄過來；`tasks_create` 建的新任務會記上；這一輪提出的核可也會存（`approvals.on_behalf_of`）。值是 `user:<帳號 id>`（WebChat 帳號或已驗證的通道身分），或 `unmapped:<通道>:<摘要>`（沒有帳號的發話者，用的是 `@` 路由稽核同一把金鑰的 HMAC，不會出現平台原始 id）。來源只有 gateway 寫的東西：spawn 時設定的環境變數，以及 gateway 或 MCP server（依該環境變數）寫的資料列，絕不讀工具參數。系統發送者名稱（`dashboard`、`cron` 等）、保留 id、格式不對的值一律拒收，並記為 `on_behalf_of_rejected`；第一個寫入的值為準，下游不覆寫。gateway 自己的環境變數不會傳下去：spawn 白名單不含這個變數，各 runtime 在設定本輪的值之前會先移除繼承來的值。
+
+這一版的作用：
+
+- **記錄**（預設，`[delegation] human_principal = "record"`）：該輪的每一筆 `tool_calls.jsonl`、每一筆 `delegation_denied`、每一張核可都帶著它，通道核可卡片顯示「由 ○○ 交辦」（優先顯示名稱，找不到時用帳號短碼）。不會因此拒絕任何事。
+- **強制**（`human_principal = "enforce"`，需自行開啟；值無法辨識或 `config.toml` 讀不到也視為強制）：員工組織樹允許一次委派之後，還要真人也有權限。`send_to_agent`／`spawn_agent` 與派工器的委派閘門要求這個人能呼叫目標（Admin；直接綁定或主管的團隊推導，任何等級；或 `public_trigger` 員工）；`tasks_create`（員工指派給自己也算）、`create_task`、排程、看別人信箱與修改別人的任務要求 Operator 以上。未對應帳號的發話者只能到 `public_trigger` 員工，且不能交辦。帳號不存在或停用、值格式不對、`users.db` 讀不到，一律拒絕（`human_principal_not_permitted`）。目標任務每一輪、heartbeat 喚醒與 cron 在派工時不再依真人重檢，它們在建立任務時已經檢查過。
+- `[approval] forbid_self_approval = true`（預設關）：AI 員工替某人辦事時提出的核可，不能由同一個人自己同意（dashboard 與通道按鈕都一樣，拒絕仍可以）。綁定式請求不變，只由綁定的那個人決定。
+
+電腦操作 start／action 的核可，依已驗證的員工與 `turn_id`，從主機登記的進行中對話取出真人。請求參數不能指定真人，也不能借用另一位員工的對話。沒有或查不到 turn 時不記真人，因此無法在這些請求辨認自批者；沒有 turn 的工作區、截圖與停止請求也不記真人。
+
+它只會收窄。偽造的值頂多讓紀錄錯，或讓一個員工本身已經通過的檢查在真人這一關也通過。沒涵蓋：有 Bash 的員工可以自己用別的值啟動 MCP server（和所有靠環境變數帶身分的機制一樣，只是減速帶）；記錄模式不擋任何事；用 `tasks_create` 建的排程，之後每次執行不會帶上這個人。`spawn_ephemeral` 及其延後准入佇列也還沒傳遞真人身分。Grok 與已棄用的 Gemini CLI 是否把 spawn 環境轉交 MCP 子程序，尚未驗證。已有單元與整合測試；真模型呼叫 `send_to_agent` 的端到端流程未活測。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。

@@ -4275,6 +4275,8 @@ fn prepare_claude_cmd(
     }
     crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
     crate::memory_provenance::inject_dispatch_run_env(&mut cmd);
+    // The person this turn or run is for (never an inherited gateway value).
+    crate::on_behalf_of::inject_env(&mut cmd);
 
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only

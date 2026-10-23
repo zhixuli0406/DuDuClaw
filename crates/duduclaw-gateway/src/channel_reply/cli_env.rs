@@ -325,6 +325,8 @@ pub(super) async fn spawn_claude_cli_with_env(
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
     crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
+    // The person this turn is for (never an inherited gateway value).
+    crate::on_behalf_of::inject_env(&mut cmd);
     // Record `(agent, turn) → reply channel` for as long as this CLI runs, so
     // the computer-use route can ask a human in THIS chat (and only here)
     // about a high-risk action of this employee. Dropped when this function

@@ -81,6 +81,11 @@ struct BusMessage {
     /// value is read as explore as well). Absent ⇒ normal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lane: Option<String>,
+    /// The person the receiving run works for (`crate::on_behalf_of`), as
+    /// the MCP server wrote it from its host env. Validated before use;
+    /// absent ⇒ nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_behalf_of: Option<String>,
 }
 
 /// Starts the agent dispatcher as a background task.
@@ -300,6 +305,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             &msg.target,
             &msg.id,
             "sqlite_queue",
+            msg.on_behalf_of.as_deref(),
         )
         .await;
         if let crate::delegation_gate::GateOutcome::Deny(denied) = gate {
@@ -438,6 +444,16 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         // Every spawn of this run (Claude CLI, the openai-compat tool loop's
         // MCP child) carries the read-only lane; other runtimes refuse.
         let dispatch_fut = crate::explore_lane::EXPLORE.scope(explore_lane, dispatch_fut);
+        // The person this run works for, from the queue row (the MCP server
+        // wrote it from its host env, or the gateway copied it from the task
+        // row). Every spawn of the run carries it as `DUDUCLAW_ON_BEHALF_OF`.
+        let principal = crate::on_behalf_of::from_stored(
+            home_dir,
+            msg.on_behalf_of.as_deref(),
+            &msg.target,
+            "message_queue",
+        );
+        let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -809,6 +825,7 @@ async fn poll_and_dispatch(
                         session_id: msg.session_id.clone(),
                         upstream_unknown: false,
                         lane: None,
+                        on_behalf_of: msg.on_behalf_of.clone(),
                     };
                     consumed_without_dispatch += 1;
                     match serde_json::to_string(&err_response) {
@@ -833,6 +850,7 @@ async fn poll_and_dispatch(
                         &msg.agent_id,
                         &msg.message_id,
                         "bus_dispatch",
+                        msg.on_behalf_of.as_deref(),
                     )
                     .await;
                     match outcome {
@@ -876,6 +894,7 @@ async fn poll_and_dispatch(
             session_id: msg.session_id.clone(),
             upstream_unknown: false,
             lane: None,
+            on_behalf_of: msg.on_behalf_of.clone(),
         };
         match serde_json::to_string(&err_response) {
             Ok(json) => synthetic_responses.push(json),
@@ -1035,6 +1054,13 @@ async fn poll_and_dispatch(
                 .scope(turn_id_for_scope, dispatch_fut);
             let dispatch_fut =
                 crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
+            let principal = crate::on_behalf_of::from_stored(
+                &home,
+                msg.on_behalf_of.as_deref(),
+                &msg.agent_id,
+                "bus_queue",
+            );
+            let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
             // The delegation's lane (written by a run in the explore lane,
             // `spawn_agent` / `spawn_ephemeral`): the receiving run stays
             // read-only too, or is refused when the employee cannot carry
@@ -1229,6 +1255,7 @@ async fn poll_and_dispatch(
                 session_id: msg.session_id.clone(),
                 upstream_unknown: false,
                 lane: None,
+                on_behalf_of: msg.on_behalf_of.clone(),
             };
 
             if let Ok(json) = serde_json::to_string(&response_entry) {
@@ -1581,6 +1608,7 @@ pub async fn dispatch_taskspec(
                     &target_agent,
                     &spec.task_id,
                     "task_spec",
+                    None,
                 )
                 .await
             {
@@ -1789,7 +1817,14 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
     for msg in messages {
         // A read-only (lane) delegation is never merged with an ordinary one:
         // the merged run would take the lane of whichever came first.
-        let key = format!("{}\u{0}{}", msg.agent_id, if msg.lane.is_some() { "L" } else { "" });
+        // Nor is work for one person merged with work for another (or for
+        // nobody): the merged run would act for whoever came first.
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            msg.agent_id,
+            if msg.lane.is_some() { "L" } else { "" },
+            msg.on_behalf_of.as_deref().unwrap_or("")
+        );
         let entry = groups.entry(key.clone()).or_default();
         if entry.is_empty() {
             order.push(key);
@@ -1864,6 +1899,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 session_id: first.session_id.clone(),
                 upstream_unknown: first.upstream_unknown,
                 lane: first.lane.clone(),
+                on_behalf_of: first.on_behalf_of.clone(),
             });
         }
     }
@@ -4050,6 +4086,7 @@ mod tests {
             "mkt_rep",
             "forged-1",
             "bus_dispatch",
+            None,
         )
         .await;
         assert!(matches!(
@@ -4165,6 +4202,7 @@ mod tests {
             session_id: None,
             upstream_unknown: false,
             lane: None,
+            on_behalf_of: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // None fields with skip_serializing_if should be absent
@@ -4678,6 +4716,7 @@ mod tests {
                 session_id: None,
                 upstream_unknown: false,
                 lane: None,
+                on_behalf_of: None,
             },
             BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -4696,6 +4735,7 @@ mod tests {
                 session_id: None,
                 upstream_unknown: false,
                 lane: None,
+                on_behalf_of: None,
             },
         ];
         let coalesced = coalesce_messages(msgs);

@@ -250,7 +250,20 @@ pub(crate) async fn handle_tasks_create(
         {
             return tool_error(&reason);
         }
+    } else if let Err(reason) = check_human_principal(
+        home_dir,
+        default_agent,
+        &assigned_to,
+        "tasks_create",
+        duduclaw_core::delegation_policy_from_home(home_dir),
+    ) {
+        // A task for yourself needs no employee-tree check, but in enforce
+        // mode the person it is for must still be allowed to hand this
+        // employee work (no laundering a hand-over through self-assignment).
+        return tool_error(&reason);
     }
+    // The person the new task is for: the host env only, never an argument.
+    let on_behalf_of = host_on_behalf_of(home_dir, default_agent);
 
     // ── P2-A H-2 / S-M2: where the new task hangs ────────────────────────
     // A schedule (cron routine or reminder) is not a sub-task: it takes no
@@ -314,8 +327,9 @@ pub(crate) async fn handle_tasks_create(
                 .unwrap_or(false),
             parent_task_id: parent_task_id.clone(),
             source_label: String::new(),
-            // An employee's own goal: no person is named here (the PR that
-            // carries the human principal through MCP sets it from the host).
+            // Created while working for a person: the goal is theirs too.
+            created_via: on_behalf_of.as_ref().map(|_| "agent".to_string()),
+            on_behalf_of: on_behalf_of.clone(),
             ..Default::default()
         };
         return match duduclaw_gateway::goal_create_core::create_goal_task(home_dir, &store, req)
@@ -414,6 +428,8 @@ pub(crate) async fn handle_tasks_create(
     );
     row.tags = tags;
     row.parent_task_id = parent_task_id;
+    row.created_via = on_behalf_of.as_ref().map(|_| "agent".to_string());
+    row.on_behalf_of = on_behalf_of;
 
     // G1 durable dispatch options. `depends_on` accepts a JSON array or a
     // comma-separated list of task ids; when any dispatch option is present the

@@ -391,6 +391,12 @@ pub fn append_tool_call_with_extras(
             map.insert("task_id".into(), task_id.into());
         }
     }
+    // A call made for a person names them (the gateway sets
+    // `DUDUCLAW_ON_BEHALF_OF` at spawn; a malformed value is left out). The
+    // host value always replaces an extra of the same name.
+    if let Some(principal) = duduclaw_core::host_principal() {
+        map.insert("on_behalf_of".into(), principal.to_string().into());
+    }
 
     // 0600 on create: since result_text landed, rows can carry business
     // data (e.g. Odoo reads), so the file must not be world/group-readable.
