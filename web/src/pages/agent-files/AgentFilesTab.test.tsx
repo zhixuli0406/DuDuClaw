@@ -40,13 +40,16 @@ function entry(file: string, over: Partial<AgentFileListEntry> = {}): AgentFileL
 interface Setup {
   editable?: boolean;
   soul?: Partial<AgentFileListEntry>;
+  /** INSTRUCTIONS.md is absent on a fresh employee. */
+  noInstructions?: boolean;
+  runtimeFiles?: Array<{ name: string; content: string; size: number; truncated: boolean }> | 'fail';
   drift?: { state: 'intact' | 'drifted' | 'none'; accepted_version_id: string | null };
   save?: (params: Record<string, unknown>) => AgentFileSaveResponse | Promise<AgentFileSaveResponse>;
 }
 
 const SOUL = '我是 Alice，親切的客服。';
 
-function mockGateway({ editable = true, soul = {}, drift = { state: 'intact', accepted_version_id: null }, save }: Setup = {}) {
+function mockGateway({ editable = true, soul = {}, noInstructions = false, runtimeFiles = [], drift = { state: 'intact', accepted_version_id: null }, save }: Setup = {}) {
   let current = SOUL;
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   vi.mocked(client.call).mockImplementation(async (method: string, params?: Record<string, unknown>) => {
@@ -59,7 +62,7 @@ function mockGateway({ editable = true, soul = {}, drift = { state: 'intact', ac
           files: [
             entry('soul', { editable_by_me: editable, ...soul }),
             entry('identity', { editable_by_me: editable }),
-            entry('instructions', { editable_by_me: editable }),
+            entry('instructions', { editable_by_me: editable, exists: !noInstructions, size: noInstructions ? 0 : 10 }),
             entry('contract', { editable_by_me: editable }),
             entry('agent_toml', { editable_by_me: false }),
             entry('skill:quote/SKILL.md', { editable_by_me: editable, skill_name: 'quote', path: 'SKILLS/quote/SKILL.md' }),
@@ -70,12 +73,15 @@ function mockGateway({ editable = true, soul = {}, drift = { state: 'intact', ac
         return {
           agent_id: 'a1',
           file: p.file,
-          content: p.file === 'soul' ? current : `內容 ${String(p.file)}`,
+          content: p.file === 'soul' ? current : p.file === 'instructions' && noInstructions ? '' : `內容 ${String(p.file)}`,
           hash: p.file === 'soul' ? `h:${current}` : `h-${String(p.file)}`,
-          exists: true,
+          exists: !(p.file === 'instructions' && noInstructions),
           masked: [],
           drift: p.file === 'soul' ? drift : { state: 'none', accepted_version_id: null },
         };
+      case 'agent_files.runtime_files':
+        if (runtimeFiles === 'fail') throw new Error('boom');
+        return { agent_id: 'a1', files: runtimeFiles };
       case 'agent_files.diff':
         return { added: 1, removed: 1, hunks: [{ op: 'remove', lines: [SOUL] }, { op: 'add', lines: ['新的人格'] }] };
       case 'agent_files.save':
@@ -120,9 +126,12 @@ describe('<AgentFilesTab>', () => {
     mockGateway();
     await openTab();
     const nav = screen.getByRole('navigation', { name: en['agentFiles.list.label'] });
-    for (const id of ['soul', 'identity', 'instructions', 'contract', 'agent_toml'] as const) {
+    for (const id of ['soul', 'identity', 'contract', 'agent_toml'] as const) {
       expect(within(nav).getByText(en[`agentFiles.file.${id}`])).toBeInTheDocument();
     }
+    // Work rules carry the industry names people search for.
+    expect(within(nav).getByText(en['agentFiles.file.instructionsFull'])).toBeInTheDocument();
+    expect(within(nav).getByText('INSTRUCTIONS.md')).toBeInTheDocument();
     expect(within(nav).getByText('SOUL.md')).toBeInTheDocument();
     expect(within(nav).getByText('Skill: quote')).toBeInTheDocument();
     expect(within(nav).getByText('SKILLS/quote/SKILL.md')).toBeInTheDocument();
@@ -270,5 +279,70 @@ describe('<AgentFilesTab>', () => {
     await userEvent.type(screen.getByRole('textbox', { name: 'Edit Skill: quote' }), '，再列出方案');
     await userEvent.click(screen.getByRole('button', { name: en['agentFiles.editor.saveAndCheck'] }));
     await waitFor(() => expect(gw.calls.some((c) => c.method === 'agent_files.save' && c.params.file === 'skill:quote/SKILL.md')).toBe(true));
+  });
+
+  it('work rules explain where imported AGENTS.md / CLAUDE.md content lives', async () => {
+    loginAs('owner');
+    mockGateway();
+    await openTab();
+    await userEvent.click(screen.getByTestId('agent-file-instructions'));
+    expect(await screen.findByTestId('instructions-help')).toHaveTextContent(en['agentFiles.help.instructions']);
+    expect(screen.getByRole('heading', { name: en['agentFiles.file.instructionsFull'] })).toBeInTheDocument();
+  });
+
+  it('offers to create missing work rules and saves through the ordinary save path', async () => {
+    loginAs('owner');
+    const gw = mockGateway({ noInstructions: true });
+    renderWithProviders(<AgentFilesTab agentId="a1" />);
+    await screen.findByTestId('agent-files-tab');
+    await userEvent.click(screen.getByTestId('agent-file-instructions'));
+    await screen.findByTestId('instructions-missing');
+    // Only one way to start: the header edit button is not shown.
+    expect(screen.queryByRole('button', { name: en['agentFiles.editor.edit'] })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: en['agentFiles.instructions.create'] }));
+    const box = screen.getByRole('textbox', { name: 'Edit Work rules' });
+    expect(box).toHaveValue(en['agentFiles.instructions.template']);
+    await userEvent.click(screen.getByRole('button', { name: en['agentFiles.editor.saveAndCheck'] }));
+    await waitFor(() => expect(gw.calls.some((c) => c.method === 'agent_files.save')).toBe(true));
+    expect(gw.calls.find((c) => c.method === 'agent_files.save')?.params).toMatchObject({
+      agent_id: 'a1',
+      file: 'instructions',
+      content: en['agentFiles.instructions.template'],
+      base_hash: 'h-instructions',
+    });
+  });
+
+  it('a viewer sees that work rules are missing but cannot create them', async () => {
+    loginAs('viewer');
+    mockGateway({ editable: false, noInstructions: true });
+    renderWithProviders(<AgentFilesTab agentId="a1" />);
+    await screen.findByTestId('agent-files-tab');
+    await userEvent.click(screen.getByTestId('agent-file-instructions'));
+    await screen.findByTestId('instructions-missing');
+    expect(screen.getByText(en['agentFiles.instructions.createViewOnly'])).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en['agentFiles.instructions.create'] })).not.toBeInTheDocument();
+  });
+
+  it('shows the generated runtime files read-only, loaded only when opened', async () => {
+    loginAs('owner');
+    const gw = mockGateway({ runtimeFiles: [{ name: 'AGENTS.md', content: '# Alice 的執行環境檔', size: 20, truncated: false }] });
+    await openTab();
+    expect(gw.calls.some((c) => c.method === 'agent_files.runtime_files')).toBe(false);
+    const section = screen.getByTestId('runtime-files-section');
+    expect(within(section).getByText(en['agentFiles.runtime.title'])).toBeInTheDocument();
+    await userEvent.click(within(section).getByText(en['agentFiles.runtime.title']));
+    const file = await screen.findByTestId('runtime-file-AGENTS.md');
+    expect(file).toHaveTextContent('# Alice 的執行環境檔');
+    expect(within(section).getByText(en['agentFiles.runtime.note'])).toBeInTheDocument();
+    expect(within(section).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(gw.calls.filter((c) => c.method === 'agent_files.runtime_files')).toHaveLength(1);
+  });
+
+  it('says so when the generated files cannot be read', async () => {
+    loginAs('owner');
+    mockGateway({ runtimeFiles: 'fail' });
+    await openTab();
+    await userEvent.click(screen.getByText(en['agentFiles.runtime.title']));
+    expect(await screen.findByText(en['agentFiles.runtime.failed'])).toBeInTheDocument();
   });
 });

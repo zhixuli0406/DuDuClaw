@@ -143,6 +143,19 @@ export interface AgentFileGetResponse {
   version_id?: string | null;
 }
 
+/** Generated CLI context files (CLAUDE.md / AGENTS.md), read-only. */
+export interface AgentRuntimeFile {
+  name: string;
+  content: string;
+  size: number;
+  truncated: boolean;
+}
+
+export interface AgentRuntimeFilesResponse {
+  agent_id: string;
+  files: AgentRuntimeFile[];
+}
+
 export interface AgentFileDiffHunk {
   op: 'equal' | 'add' | 'remove';
   lines: string[];
