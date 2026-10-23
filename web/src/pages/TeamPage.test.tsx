@@ -141,13 +141,14 @@ describe('TeamPage', () => {
     expect(navigate).toHaveBeenCalledWith('/chat', { state: { draft: '@HR Helper ' } });
   });
 
-  it('assigns a goal with tasks.create kind=goal and lands on the new task', async () => {
+  it('assigns a goal with tasks.create kind=goal and stays on the team page', async () => {
     const user = userEvent.setup();
     renderWithProviders(<TeamPage />);
     const wang = await screen.findByRole('region', { name: 'Wang' });
     await user.click(within(wang).getAllByRole('button', { name: 'Assign' })[0]);
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText('Assign to Sales Rep')).toBeInTheDocument();
+    expect(within(dialog).queryByText(/Goals page/)).not.toBeInTheDocument();
     const submit = within(dialog).getByRole('button', { name: 'Assign' });
     expect(submit).toBeDisabled();
     await user.type(within(dialog).getByLabelText('What should be done'), 'Tidy up the quotes');
@@ -158,7 +159,11 @@ describe('TeamPage', () => {
       agent_id: 'sales',
       description: 'Tidy up the quotes',
     });
-    expect(navigate).toHaveBeenCalledWith('/goals?task=task-1');
+    // A manager cannot open a report's task yet: no jump to a page that
+    // would only say "permission denied".
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(navigate).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: 'My team' })).toBeInTheDocument();
   });
 
   it('explains how to get a team when nobody reports to the viewer', async () => {

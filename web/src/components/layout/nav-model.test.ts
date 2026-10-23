@@ -7,6 +7,7 @@ import {
   primaryItemsForEdition,
 } from './nav-model';
 import { isVisible } from '@/lib/nav-visibility';
+import { crumbsFor } from './nav-model';
 
 // P2-a-nav (2026-08-15, `DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.4):
 // `/experts` ("AI 團隊", formerly "專家包") was `minRole: 'admin'` and buried
@@ -203,5 +204,13 @@ describe('nav-model — 1.76.0 /team (我的團隊) addition', () => {
     expect(isVisible(item, 'admin', false)).toBe(true);
     expect(isVisible(item, 'employee', false)).toBe(false);
     expect(isVisible(item, 'admin', true)).toBe(false);
+  });
+});
+
+describe('nav-model — page titles for the people pages', () => {
+  it('gives /team and the members page (canonical and legacy path) their own label', () => {
+    expect(crumbsFor('/team').at(-1)?.labelId).toBe('nav.myTeam');
+    expect(crumbsFor('/manage/users').at(-1)?.labelId).toBe('manage.users');
+    expect(crumbsFor('/users').at(-1)?.labelId).toBe('manage.users');
   });
 });

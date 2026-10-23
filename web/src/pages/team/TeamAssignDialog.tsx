@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate } from 'react-router';
 import { api, type TeamAgent } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -19,6 +18,11 @@ import {
  * with `tasks.create` (`kind: "goal"`). The gateway decides whether the
  * caller may hand this employee work; the button is only offered when the
  * team listing says so.
+ *
+ * After a successful assignment the viewer stays on 我的團隊 with a
+ * confirmation: a manager who reaches the employee only through a report
+ * cannot open the task itself yet, so jumping to it would land on a
+ * permission error.
  */
 export function TeamAssignDialog({
   agent,
@@ -31,7 +35,6 @@ export function TeamAssignDialog({
   onClose: () => void;
 }) {
   const intl = useIntl();
-  const navigate = useNavigate();
   const [goal, setGoal] = useState('');
   const [criteria, setCriteria] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -46,9 +49,13 @@ export function TeamAssignDialog({
         description: goalText,
         acceptance_criteria: criteria.trim() || undefined,
       });
-      toast.success(intl.formatMessage({ id: 'team.assign.success' }, { name: agent.display_name }));
+      toast.success(
+        intl.formatMessage(
+          { id: 'team.assign.success' },
+          { name: agent.display_name, title: task.title || goalText },
+        ),
+      );
       onClose();
-      navigate(`/goals?task=${encodeURIComponent(task.id)}`);
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       setSubmitting(false);

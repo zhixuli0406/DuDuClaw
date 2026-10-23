@@ -1,24 +1,23 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate } from 'react-router';
 import { api, type UserDetail } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { useAuthStore } from '@/stores/auth-store';
-import type { UserRole } from '@/stores/auth-store';
-import { ROLE_LEVELS } from '@/lib/roles';
 import { OrgChartView } from './users/OrgChartView';
-import { channelLabel } from './users/dialog-common';
 import { CreateUserDialog, EditUserDialog } from './users/UserFormDialogs';
 import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
 import { OffboardDialog, RemoveUserDialog } from './users/LifecycleDialogs';
+import {
+  BindingChips,
+  IdentityChips,
+  RoleBadge,
+  RoleDetails,
+  StatusBadge,
+  UserActions,
+  useAgentDisplayName,
+} from './users/UserRowParts';
 import { listChannelIdentities, type ChannelIdentity } from '@/lib/channel-identity-api';
 import {
   Button,
-  Badge,
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
   ListGridContainer,
   ListGridHeader,
   ListGridHeaderCell,
@@ -27,49 +26,18 @@ import {
   ActorAvatar,
   Empty,
   Segmented,
-  type BadgeProps,
+  useIsMobile,
 } from '@/components/mds';
-import {
-  Users,
-  UserPlus,
-  Pencil,
-  Link2,
-  UserX,
-  Trash2,
-  X,
-  Eye,
-  MoreHorizontal,
-  Loader2,
-  AlertTriangle,
-  ShieldCheck,
-  Plus,
-} from 'lucide-react';
+import { Users, UserPlus, Loader2, AlertTriangle } from 'lucide-react';
 
 type UsersView = 'list' | 'org';
-
-function roleBadgeProps(role: string): { variant: BadgeProps['variant']; className?: string } {
-  if (role === 'admin') return { variant: 'destructive' };
-  if (role === 'manager') return { variant: 'secondary' };
-  return { variant: 'outline' };
-}
-
-function statusBadgeProps(status: string): { variant: BadgeProps['variant']; className?: string } {
-  if (status === 'active') return { variant: 'secondary', className: 'bg-success/15 text-success' };
-  if (status === 'suspended') return { variant: 'secondary', className: 'bg-warning/15 text-warning' };
-  return { variant: 'outline' };
-}
 
 const COLUMNS = 'minmax(0,1.4fr) minmax(0,0.8fr) minmax(0,1.5fr) minmax(0,1.5fr) minmax(0,0.7fr) 2.5rem';
 
 export function UsersPage() {
   const intl = useIntl();
-  const navigate = useNavigate();
-  const viewerRole = useAuthStore((s) => s.user?.role);
-  // View-as gate mirrors the server: strictly lower rank only.
-  const canViewDashboard = (targetRole: string, status: string) =>
-    status === 'active' &&
-    viewerRole != null &&
-    (ROLE_LEVELS[targetRole as UserRole] ?? 99) < ROLE_LEVELS[viewerRole];
+  const isMobile = useIsMobile();
+  const agentName = useAgentDisplayName();
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -85,6 +53,12 @@ export function UsersPage() {
   const [showIdentityBind, setShowIdentityBind] = useState<string | null>(null);
   const [view, setView] = useState<UsersView>('list');
   const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
+  const actionsFor = (user: UserDetail) => ({
+    onEdit: () => setShowEdit(user),
+    onBind: () => setShowBind(user.id),
+    onOffboard: () => setShowOffboard(user),
+    onRemove: () => setShowRemove(user),
+  });
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -175,6 +149,47 @@ export function UsersPage() {
       ) : view === 'org' ? (
         <OrgChartView users={users} onEdit={setShowEdit} />
       ) : (
+        isMobile ? (
+          // Phones: one stacked card per person (the six-column grid does
+          // not fit, and the page must not scroll sideways).
+          <ul className="space-y-3">
+            {users.map((user) => (
+              <li key={user.id} className="space-y-2 rounded-xl border border-surface-border bg-card px-4 py-3">
+                <div className="flex items-start gap-2">
+                  <ActorAvatar actorType="user" name={user.display_name} size="sm" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-foreground">{user.display_name}</p>
+                    <p className="truncate text-xs text-muted-foreground">{user.email}</p>
+                  </div>
+                  <UserActions user={user} {...actionsFor(user)} />
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <RoleBadge role={user.role} />
+                  <StatusBadge status={user.status} />
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {intl.formatMessage({ id: 'users.col.agents' })}
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    <BindingChips user={user} agentName={agentName} onUnbind={(a) => handleUnbind(user.id, a)} />
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {intl.formatMessage({ id: 'users.col.channelIdentity' })}
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    <IdentityChips state={identities[user.id]} onAdd={() => setShowIdentityBind(user.id)} />
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
         <div className="overflow-hidden rounded-xl border border-surface-border">
           <ListGridContainer
             columns={COLUMNS}
@@ -190,144 +205,36 @@ export function UsersPage() {
               </ListGridHeader>
             }
           >
-            {users.map((user) => {
-              const role = roleBadgeProps(user.role);
-              const status = statusBadgeProps(user.status);
-              return (
-                <ListGridRow key={user.id} rowSize="lg" className="cursor-default">
-                  <ListGridCell className="gap-2">
-                    <ActorAvatar actorType="user" name={user.display_name} size="sm" />
-                    <div className="min-w-0">
-                      <p className="truncate text-sm font-medium text-foreground">{user.display_name}</p>
-                      <p className="truncate text-xs text-muted-foreground">{user.email}</p>
-                    </div>
-                  </ListGridCell>
-                  <ListGridCell className="flex-col items-start gap-0.5">
-                    <Badge variant={role.variant} className={role.className}>{user.role}</Badge>
-                    {user.department && (
-                      <span className="truncate text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'users.dept.prefix' })}{user.department}
-                      </span>
-                    )}
-                    {nameOf(user.manager_user_id) && (
-                      <span className="truncate text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'users.manager.prefix' })}{nameOf(user.manager_user_id)}
-                      </span>
-                    )}
-                  </ListGridCell>
-                  <ListGridCell className="flex-wrap gap-1 py-1.5">
-                    {user.bindings.map((b) => (
-                      <span
-                        key={b.agent_name}
-                        className="group inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-                      >
-                        <ActorAvatar actorType="agent" name={b.agent_name} size="xs" />
-                        {b.agent_name}
-                        <span className="text-muted-foreground/70">({b.access_level})</span>
-                        <button
-                          type="button"
-                          data-stop-row-nav
-                          onClick={() => handleUnbind(user.id, b.agent_name)}
-                          className="rounded-full p-0.5 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 pointer-coarse:opacity-100"
-                          title={intl.formatMessage({ id: 'users.action.unbind' })}
-                          aria-label={`unbind ${b.agent_name}`}
-                        >
-                          <X className="size-3" />
-                        </button>
-                      </span>
-                    ))}
-                    {user.bindings.length === 0 && <span className="text-xs text-muted-foreground">—</span>}
-                  </ListGridCell>
-                  <ListGridCell className="flex-wrap gap-1 py-1.5">
-                    {(() => {
-                      const rec = identities[user.id];
-                      if (rec === undefined) {
-                        return <Loader2 className="size-3.5 animate-spin text-muted-foreground" />;
-                      }
-                      if (rec === 'error') {
-                        return (
-                          <span className="text-xs text-destructive">
-                            {intl.formatMessage({ id: 'users.channelIdentity.loadError' })}
-                          </span>
-                        );
-                      }
-                      return rec.map((ident) => (
-                        <span
-                          key={`${ident.channel}:${ident.channel_user_id}`}
-                          className="inline-flex max-w-40 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-                          title={`${channelLabel(ident.channel)} · ${ident.channel_user_id}`}
-                        >
-                          <ShieldCheck
-                            className="size-3 shrink-0 text-success"
-                            aria-label={intl.formatMessage({ id: 'users.channelIdentity.verifiedTooltip' })}
-                          />
-                          <span className="truncate">
-                            {channelLabel(ident.channel)} · {ident.channel_user_id}
-                          </span>
-                        </span>
-                      ));
-                    })()}
-                    <button
-                      type="button"
-                      data-stop-row-nav
-                      onClick={() => setShowIdentityBind(user.id)}
-                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-surface-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:border-brand hover:text-brand"
-                      title={intl.formatMessage({ id: 'users.channelIdentity.add' })}
-                    >
-                      <Plus className="size-3" />
-                      {intl.formatMessage({ id: 'users.channelIdentity.add' })}
-                    </button>
-                  </ListGridCell>
-                  <ListGridCell>
-                    <Badge variant={status.variant} className={status.className}>{user.status}</Badge>
-                  </ListGridCell>
-                  <ListGridCell className="justify-end">
-                    <DropdownMenu>
-                      <DropdownMenuTrigger
-                        render={
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={intl.formatMessage({ id: 'common.more' })}
-                            data-stop-row-nav
-                          />
-                        }
-                      >
-                        <MoreHorizontal />
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent>
-                        {canViewDashboard(user.role, user.status) && (
-                          <DropdownMenuItem onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}>
-                            <Eye />
-                            {intl.formatMessage({ id: 'users.action.viewDashboard' })}
-                          </DropdownMenuItem>
-                        )}
-                        <DropdownMenuItem onClick={() => setShowEdit(user)}>
-                          <Pencil />
-                          {intl.formatMessage({ id: 'users.action.edit' })}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => setShowBind(user.id)}>
-                          <Link2 />
-                          {intl.formatMessage({ id: 'users.action.bind' })}
-                        </DropdownMenuItem>
-                        {user.status === 'active' && (
-                          <DropdownMenuItem onClick={() => setShowOffboard(user)}>
-                            <UserX />
-                            {intl.formatMessage({ id: 'users.action.offboard' })}
-                          </DropdownMenuItem>
-                        )}
-                        <DropdownMenuItem variant="destructive" onClick={() => setShowRemove(user)}>
-                          <Trash2 />
-                          {intl.formatMessage({ id: 'users.action.remove' })}
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </ListGridCell>
-                </ListGridRow>
-              );
-            })}
+            {users.map((user) => (
+              <ListGridRow key={user.id} rowSize="lg" className="cursor-default">
+                <ListGridCell className="gap-2">
+                  <ActorAvatar actorType="user" name={user.display_name} size="sm" />
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-foreground">{user.display_name}</p>
+                    <p className="truncate text-xs text-muted-foreground">{user.email}</p>
+                  </div>
+                </ListGridCell>
+                <ListGridCell className="flex-col items-start gap-0.5">
+                  <RoleBadge role={user.role} />
+                  <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
+                </ListGridCell>
+                <ListGridCell className="flex-wrap gap-1 py-1.5">
+                  <BindingChips user={user} agentName={agentName} onUnbind={(a) => handleUnbind(user.id, a)} />
+                </ListGridCell>
+                <ListGridCell className="flex-wrap gap-1 py-1.5">
+                  <IdentityChips state={identities[user.id]} onAdd={() => setShowIdentityBind(user.id)} />
+                </ListGridCell>
+                <ListGridCell>
+                  <StatusBadge status={user.status} />
+                </ListGridCell>
+                <ListGridCell className="justify-end">
+                  <UserActions user={user} {...actionsFor(user)} />
+                </ListGridCell>
+              </ListGridRow>
+            ))}
           </ListGridContainer>
         </div>
+        )
       )}
 
       {/* Create User Dialog */}

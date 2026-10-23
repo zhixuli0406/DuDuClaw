@@ -8430,12 +8430,12 @@
   "team.action.chat": "對話",
   "team.action.assign": "交辦",
   "team.assign.title": "交辦給「{name}」",
-  "team.assign.subtitle": "這是 {report} 的 AI 員工。交辦後會當成目標任務來完成，進度可以在「目標」頁查看。",
+  "team.assign.subtitle": "這是 {report} 的 AI 員工。交辦後它會把這件事當成目標任務，持續做到完成。",
   "team.assign.goal": "要完成什麼",
   "team.assign.goalPlaceholder": "例如：整理本月報價單，列出還沒回覆的客戶",
   "team.assign.criteria": "怎樣算完成（選填）",
   "team.assign.criteriaPlaceholder": "留空就以上面的內容為準",
-  "team.assign.success": "已交辦給「{name}」",
+  "team.assign.success": "已交辦給【{name}】：{title}",
   "users.view.label": "檢視方式",
   "users.view.list": "清單",
   "users.view.org": "組織圖",
@@ -8454,5 +8454,8 @@
   "users.org.suspended": "已停權",
   "users.org.role.admin": "管理員",
   "users.org.role.manager": "主管",
-  "users.org.role.employee": "員工"
+  "users.org.role.employee": "員工",
+  "users.status.active": "在職",
+  "users.status.suspended": "已停權",
+  "users.status.offboarded": "已離職"
 }

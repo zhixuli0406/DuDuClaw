@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import type { UserDetail } from '@/lib/api';
 import { buildOrgTree, type OrgNode } from '@/lib/org-tree';
 import { ActorAvatar, Badge } from '@/components/mds';
+import { useAgentDisplayName } from './UserRowParts';
 
 /**
  * 組織圖: the Users page's reporting lines, drawn from `manager_user_id`.
@@ -71,6 +72,7 @@ function OrgBranch({ node, onEdit }: { node: OrgNode<UserDetail>; onEdit: (u: Us
 
 function PersonRow({ user, onEdit }: { user: UserDetail; onEdit: (u: UserDetail) => void }) {
   const intl = useIntl();
+  const agentName = useAgentDisplayName();
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 py-1.5">
       <button
@@ -82,11 +84,11 @@ function PersonRow({ user, onEdit }: { user: UserDetail; onEdit: (u: UserDetail)
         <ActorAvatar actorType="user" name={user.display_name} size="sm" />
         <span className="truncate text-sm font-medium">{user.display_name}</span>
       </button>
-      <Badge variant={user.role === 'employee' ? 'outline' : 'secondary'}>
+      <Badge variant={user.role === 'employee' ? 'outline' : 'secondary'} className="shrink-0 whitespace-nowrap">
         {intl.formatMessage({ id: `users.org.role.${user.role}` })}
       </Badge>
       {user.status === 'suspended' && (
-        <Badge variant="secondary" className="bg-warning/15 text-warning">
+        <Badge variant="secondary" className="shrink-0 whitespace-nowrap bg-warning/15 text-warning">
           {intl.formatMessage({ id: 'users.org.suspended' })}
         </Badge>
       )}
@@ -100,10 +102,10 @@ function PersonRow({ user, onEdit }: { user: UserDetail; onEdit: (u: UserDetail)
         {user.bindings.map((b) => (
           <span
             key={b.agent_name}
-            className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+            className="inline-flex max-w-full items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
           >
-            <ActorAvatar actorType="agent" name={b.agent_name} size="xs" />
-            {b.agent_name}
+            <ActorAvatar actorType="agent" name={agentName(b.agent_name)} size="xs" />
+            <span className="truncate">{agentName(b.agent_name)}</span>
           </span>
         ))}
       </div>

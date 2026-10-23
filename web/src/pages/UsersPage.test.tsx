@@ -5,6 +5,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { UsersPage } from './UsersPage';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -127,5 +128,43 @@ describe('UsersPage — reporting lines', () => {
     expect(
       await within(dialog).findByText('That would make the reporting line loop back on itself. Choose a different manager.'),
     ).toBeInTheDocument();
+  });
+
+  it('shows roles, statuses and AI staff in plain words, with display names', async () => {
+    useAgentsStore.setState({
+      agents: [{ name: 'sales', display_name: 'Sales Rep', status: 'active' }] as never[],
+      loaded: true,
+      loading: false,
+    } as never);
+    renderWithProviders(<UsersPage />);
+    await screen.findByText('Manager: Lin');
+    expect(screen.getAllByText('Active').length).toBeGreaterThan(0);
+    expect(screen.getByText('Suspended')).toBeInTheDocument();
+    expect(screen.getAllByText('Employee').length).toBeGreaterThan(0);
+    expect(screen.queryByText('active')).not.toBeInTheDocument();
+    expect(screen.queryByText('employee')).not.toBeInTheDocument();
+    expect(screen.getByText('Sales Rep')).toBeInTheDocument();
+    expect(screen.queryByText('sales')).not.toBeInTheDocument();
+  });
+
+  it('stacks each person into a card on a phone-width screen', async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes('max-width'),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      const { container } = renderWithProviders(<UsersPage />);
+      await screen.findByText('Manager: Lin');
+      expect(container.querySelector('[role="grid"], [data-slot="list-grid"]')).toBeNull();
+      const cards = container.querySelectorAll('li');
+      expect(cards.length).toBe(USERS.length);
+      expect(within(cards[2] as HTMLElement).getByText('Manager: Chen')).toBeInTheDocument();
+      expect(within(cards[2] as HTMLElement).getByRole('button', { name: 'More' })).toBeInTheDocument();
+    } finally {
+      window.matchMedia = original;
+    }
   });
 });
