@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { api, type UserDetail } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { OrgChartView } from './users/OrgChartView';
+import { OrgHistorySettings } from './users/OrgHistorySettings';
 import { CreateUserDialog, EditUserDialog } from './users/UserFormDialogs';
 import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
 import { OffboardDialog, RemoveUserDialog } from './users/LifecycleDialogs';
@@ -120,6 +121,8 @@ export function UsersPage() {
           </Button>
         </div>
       </div>
+
+      <OrgHistorySettings />
 
       {fetchError && (
         <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">

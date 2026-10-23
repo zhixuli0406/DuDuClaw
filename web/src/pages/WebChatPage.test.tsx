@@ -22,6 +22,19 @@ beforeEach(() => {
 });
 
 describe('WebChatPage', () => {
+  it('shows oversight notice only for the selected server-confirmed staff and removes it after refresh', async () => {
+    useChatStore.setState({ selectedAgentId: 'sales', sessionId: null });
+    useAgentsStore.setState({ loaded: true, agents: [{ name: 'sales', display_name: 'Sales', role: 'specialist', status: 'active' }] as never });
+    const sales = { name: 'sales', display_name: 'Sales', call_text: '@Sales', role: 'specialist', status: 'active', via: 'binding' as const, level: 'operator' as const, assignable: true, selectable: true, manager_may_read: true };
+    const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [sales], default_agent: null });
+    renderWithProviders(<WebChatPage />);
+    const notice = await screen.findByRole('link', { name: 'Your manager can read your conversations with this AI staff member (read-only).' });
+    expect(notice).toHaveAttribute('href', expect.stringContaining('68-manager-team-history.md'));
+    callable.mockResolvedValue({ agents: [{ ...sales, manager_may_read: false }], default_agent: null });
+    fireEvent(window, new Event('focus'));
+    await waitFor(() => expect(screen.queryByRole('link', { name: /Your manager can read/ })).not.toBeInTheDocument());
+  });
+
   it('renders the chat composer', () => {
     renderWithProviders(<WebChatPage />);
     expect(screen.getByPlaceholderText(/message/i)).toBeInTheDocument();

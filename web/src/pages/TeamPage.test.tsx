@@ -106,6 +106,20 @@ describe('nestTeam', () => {
 });
 
 describe('TeamPage', () => {
+  it('offers conversation links only for server-readable report bindings', async () => {
+    const user = userEvent.setup();
+    const team = structuredClone(TEAM);
+    const wang = team.members.find(m => m.id === 'emp1')!;
+    wang.status = 'active';
+    wang.agents[0].history_readable = true;
+    answer(team);
+    renderWithProviders(<TeamPage />);
+    const region = await screen.findByRole('region', { name: 'Wang' });
+    expect(screen.getAllByRole('button', { name: 'View conversations' })).toHaveLength(1);
+    await user.click(within(region).getByRole('button', { name: 'View conversations' }));
+    expect(navigate).toHaveBeenCalledWith('/team/conversations?agent=sales&report=emp1');
+  });
+
   it('shows the tree, each report’s AI staff and what the viewer may do with them', async () => {
     renderWithProviders(<TeamPage />);
     expect(await screen.findByRole('heading', { name: 'My team' })).toBeInTheDocument();

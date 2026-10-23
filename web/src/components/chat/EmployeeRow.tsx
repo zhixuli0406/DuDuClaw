@@ -2,12 +2,14 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { CharacterAvatar, agentPose, type AgentLifecycle } from '@/components/character';
 import { DuDu } from '@/components/mascot';
+import { Eye } from 'lucide-react';
 
 /** Minimal agent shape the row needs (a slice of AgentInfo). */
 export interface EmployeeRowAgent {
   readonly name: string;
   readonly display_name: string;
   readonly status: AgentLifecycle;
+  readonly manager_may_read?: boolean;
 }
 
 /**
@@ -20,10 +22,12 @@ export function EmployeeRow({
   agents,
   selectedId,
   onSelect,
+  defaultManagerMayRead = false,
 }: {
   agents: readonly EmployeeRowAgent[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  defaultManagerMayRead?: boolean;
 }) {
   const intl = useIntl();
 
@@ -52,6 +56,7 @@ export function EmployeeRow({
         )}
       >
         <DuDu face="idle" size={24} animated={false} label="DuDu" />
+        {defaultManagerMayRead && <Eye className="size-3 text-muted-foreground" aria-label={intl.formatMessage({ id: 'teamHistory.notice' })}><title>{intl.formatMessage({ id: 'teamHistory.notice' })}</title></Eye>}
       </button>
 
       {agents.map((a) => {
@@ -63,7 +68,7 @@ export function EmployeeRow({
             role="radio"
             aria-checked={selected}
             onClick={() => onSelect(a.name)}
-            title={a.display_name}
+            title={a.manager_may_read ? `${a.display_name} — ${intl.formatMessage({ id: 'teamHistory.notice' })}` : a.display_name}
             className={cn(
               'flex shrink-0 items-center rounded-xl p-1 transition-colors',
               'outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
@@ -80,6 +85,7 @@ export function EmployeeRow({
               pose={agentPose(a.status)}
               animated={false}
             />
+            {a.manager_may_read && <Eye className="size-3 text-muted-foreground" aria-label={intl.formatMessage({ id: 'teamHistory.notice' })} />}
           </button>
         );
       })}

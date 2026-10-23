@@ -319,6 +319,33 @@ async fn changes_reach_the_next_call_and_offboarded_people_drop_out() {
 }
 
 #[tokio::test]
+async fn history_buttons_follow_the_live_oversight_gate_not_derived_call_access() {
+    let f = fixture(duduclaw_core::EditionProfile::Enterprise).await;
+    let config = f._home.path().join("config.toml");
+    std::fs::write(&config, "[people]\nmanager_team_history = true\n").unwrap();
+    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
+    let p = ok_payload(&my_team(&f, &ctx).await);
+    assert_eq!(p["history_enabled"], true);
+    let m = members(&p);
+    assert_eq!(agent(&m[&f.emp1], "sales")["history_readable"], true);
+    assert_eq!(agent(&m[&f.emp2], "hr")["history_readable"], false);
+
+    f.db.set_user_status(&f.emp1, duduclaw_auth::UserStatus::Suspended).unwrap();
+    let m = members(&ok_payload(&my_team(&f, &ctx).await));
+    assert_eq!(agent(&m[&f.emp1], "sales")["assignable"], true);
+    assert_eq!(agent(&m[&f.emp1], "sales")["history_readable"], false);
+
+    std::fs::write(&config, "[people]\nmanager_team_history = false\n").unwrap();
+    let p = ok_payload(&my_team(&f, &ctx).await);
+    assert_eq!(p["history_enabled"], false);
+    for member in p["members"].as_array().unwrap() {
+        for a in member["agents"].as_array().unwrap() {
+            assert_eq!(a["history_readable"], false);
+        }
+    }
+}
+
+#[tokio::test]
 async fn personal_edition_refuses_the_team_page() {
     let f = fixture(duduclaw_core::EditionProfile::Personal).await;
     for ctx in [
