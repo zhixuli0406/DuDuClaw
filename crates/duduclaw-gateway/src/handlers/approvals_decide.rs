@@ -637,7 +637,13 @@ impl MethodHandler {
     /// global + per-agent skills, reads `estimated_minutes_saved` from metadata.
     /// Only skills carrying an estimate (i.e. approved via WP8's flow) appear —
     /// drafts have no estimate and are naturally excluded (no fabricated data).
-    pub(crate) async fn handle_skills_leaderboard(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_skills_leaderboard(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // B8: an employee's own skills are ranked only for callers who may
+        // view that employee (read live); company-wide skills stay visible.
+        let fresh = match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
+            Ok(f) => f,
+            Err(_) => return WsFrame::error_response("", "permission denied"),
+        };
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let loc = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
 
@@ -645,11 +651,16 @@ impl MethodHandler {
         let mut targets: Vec<(std::path::PathBuf, &'static str, String)> =
             vec![(self.home_dir.join("skills"), "global", String::new())];
         if let Ok(rd) = std::fs::read_dir(self.home_dir.join("agents")) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    let agent = entry.file_name().to_string_lossy().to_string();
-                    targets.push((entry.path().join("SKILLS"), "agent", agent));
-                }
+            let mut agent_dirs: Vec<(String, std::path::PathBuf)> = rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+                .filter(|(agent, _)| fresh.has_agent_access(agent, AccessLevel::Viewer))
+                .collect();
+            // B8: stable order regardless of `read_dir`.
+            agent_dirs.sort();
+            for (agent, path) in agent_dirs {
+                targets.push((path.join("SKILLS"), "agent", agent));
             }
         }
 
@@ -672,11 +683,18 @@ impl MethodHandler {
             }
         }
 
+        // B8: ties broken by (scope, owner, skill) so equal estimates keep
+        // one order across calls and restarts.
         rows.sort_by(|a, b| {
-            b["estimated_minutes_saved"]
-                .as_u64()
-                .unwrap_or(0)
-                .cmp(&a["estimated_minutes_saved"].as_u64().unwrap_or(0))
+            let mins = |v: &Value| v["estimated_minutes_saved"].as_u64().unwrap_or(0);
+            let key = |v: &Value| {
+                (
+                    v["scope"].as_str().unwrap_or("").to_string(),
+                    v["owner"].as_str().unwrap_or("").to_string(),
+                    v["skill"].as_str().unwrap_or("").to_string(),
+                )
+            };
+            mins(b).cmp(&mins(a)).then_with(|| key(a).cmp(&key(b)))
         });
         rows.truncate(limit);
         WsFrame::ok_response(

@@ -6,6 +6,8 @@ import {
   navGroupsForEdition,
   primaryItemsForEdition,
 } from './nav-model';
+import { isVisible } from '@/lib/nav-visibility';
+import { crumbsFor } from './nav-model';
 
 // P2-a-nav (2026-08-15, `DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.4):
 // `/experts` ("AI 團隊", formerly "專家包") was `minRole: 'admin'` and buried
@@ -164,5 +166,51 @@ describe('nav-model — 1.76.0 /knowledge-base addition', () => {
       expect(rows[0].minRole).toBeUndefined();
       expect(rows[0].desc).toBe(`${rows[0].label}.desc`);
     }
+  });
+});
+
+// 1.76.0 我的團隊 (human org, PR-E): a new manager+ page in a new 組織 group.
+// Enterprise-only — the Personal edition's nav lists are maintained
+// separately and must NOT gain it (users.my_team is refused there).
+describe('nav-model — 1.76.0 /team (我的團隊) addition', () => {
+  const findTeam = () => navGroups.flatMap((g) => g.items).find((i) => i.to === '/team');
+
+  it('lives in the 組織 group, appended after the three fixed groups', () => {
+    expect(navGroups[3].label).toBe('navGroup.org');
+    expect(navGroups[3].items.map((i) => i.to)).toEqual(['/team']);
+    for (const g of navGroups.slice(0, 3)) {
+      expect(g.items.some((i) => i.to === '/team')).toBe(false);
+    }
+  });
+
+  it('is manager+, Enterprise-only and tagged newIn 1.76.0', () => {
+    const item = findTeam();
+    expect(item?.minRole).toBe('manager');
+    expect(item?.enterprise).toBe(true);
+    expect(item?.newIn).toBe('1.76.0');
+    expect(item?.desc).toBe(`${item?.label}.desc`);
+  });
+
+  it('never appears in the Personal edition nav', () => {
+    const all = [...primaryItemsForEdition(true), ...navGroupsForEdition(true).flatMap((g) => g.items)];
+    expect(all.some((i) => i.to === '/team')).toBe(false);
+    expect(personalPrimaryItems.some((i) => i.to === '/team')).toBe(false);
+    expect(personalAdvancedGroup.items.some((i) => i.to === '/team')).toBe(false);
+  });
+
+  it('is visible to a manager and an admin on Enterprise, hidden from an employee and on Personal', () => {
+    const item = findTeam()!;
+    expect(isVisible(item, 'manager', false)).toBe(true);
+    expect(isVisible(item, 'admin', false)).toBe(true);
+    expect(isVisible(item, 'employee', false)).toBe(false);
+    expect(isVisible(item, 'admin', true)).toBe(false);
+  });
+});
+
+describe('nav-model — page titles for the people pages', () => {
+  it('gives /team and the members page (canonical and legacy path) their own label', () => {
+    expect(crumbsFor('/team').at(-1)?.labelId).toBe('nav.myTeam');
+    expect(crumbsFor('/manage/users').at(-1)?.labelId).toBe('manage.users');
+    expect(crumbsFor('/users').at(-1)?.labelId).toBe('manage.users');
   });
 });

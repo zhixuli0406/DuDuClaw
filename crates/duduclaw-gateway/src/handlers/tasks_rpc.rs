@@ -86,7 +86,7 @@ impl MethodHandler {
     /// task) both are null, since the link names the conversation the
     /// employee works in.
     pub(crate) async fn set_channel_fields(&self, reader: &TaskReader<'_>, r: &TaskRow, v: &mut Value) {
-        if !reader.can_read(&r.id, &r.assigned_to) {
+        if !reader.can_read_row(r) {
             v["channel"] = Value::Null;
             v["channel_link"] = Value::Null;
             return;
@@ -227,6 +227,10 @@ impl MethodHandler {
             .get("parent_task_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // The person handing the work over: the authenticated account, never
+        // a request field (the gateway admin token names nobody).
+        row.on_behalf_of = crate::trigger_route::assign::principal_for_user(&ctx.user_id);
+        row.created_via = row.on_behalf_of.as_ref().map(|_| "dashboard".to_string());
 
         if let Err(e) = store.insert_task(&row).await {
             return WsFrame::error_response("", &format!("create task: {e}"));
@@ -598,6 +602,9 @@ impl MethodHandler {
         };
         let status = params.get("status").and_then(|v| v.as_str());
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+        if assigned_by_me(&params) {
+            return self.handle_tasks_list_mine(&store, params.clone(), ctx).await;
+        }
         let reader = match self.task_board_reader(ctx, agent_id) {
             Ok(r) => r,
             Err(f) => return f,
@@ -611,6 +618,55 @@ impl MethodHandler {
             .list_tasks_paginated(
                 status, agent_id, priority, goal_mode, archived, limit, offset,
             )
+            .await
+        {
+            Ok((rows, total)) => {
+                let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let mut v = reader.task_json(r);
+                    v["archived"] = json!(r.archived);
+                    v["pinned"] = json!(r.pinned);
+                    self.set_channel_fields(&reader, r, &mut v).await;
+                    tasks.push(v);
+                }
+                WsFrame::ok_response(
+                    "",
+                    json!({ "tasks": tasks, "total": total, "limit": limit, "offset": offset }),
+                )
+            }
+            Err(e) => WsFrame::error_response("", &format!("list tasks page: {e}")),
+        }
+    }
+}
+
+/// `tasks.list_page { on_behalf_of: "me" }`: the tasks the caller handed
+/// over. Only the literal `"me"` means anything; any other value (another
+/// account's id included) is ignored and the call is an ordinary listing.
+pub(crate) fn assigned_by_me(params: &Value) -> bool {
+    params.get("on_behalf_of").and_then(Value::as_str) == Some("me")
+}
+
+impl MethodHandler {
+    /// The "assigned by me" page: rows whose `on_behalf_of` is the caller's
+    /// own principal (taken from the live identity, never from params),
+    /// optionally narrowed to one employee. Content follows
+    /// [`TaskReader::can_read_row`].
+    async fn handle_tasks_list_mine(&self, store: &TaskStore, params: Value, ctx: &UserContext) -> WsFrame {
+        let reader = match TaskReader::new(&self.home_dir, ctx) {
+            Ok(r) => r,
+            Err(f) => return f,
+        };
+        let Some(principal) = crate::trigger_route::assign::principal_for_user(&reader.live().user_id) else {
+            return WsFrame::ok_response("", json!({ "tasks": [], "total": 0, "limit": 0, "offset": 0 }));
+        };
+        let status = params.get("status").and_then(|v| v.as_str());
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).filter(|a| !a.is_empty());
+        let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
+        let archived = params.get("archived").and_then(|v| v.as_bool());
+        let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+        let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+        match store
+            .list_principal_page(&principal, status, agent_id, goal_mode, archived, limit, offset)
             .await
         {
             Ok((rows, total)) => {

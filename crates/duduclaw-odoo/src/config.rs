@@ -37,6 +37,13 @@ pub struct OdooConfig {
     /// Empty ⇒ the default block list is fully in force.
     #[serde(default)]
     pub unblock_models: Vec<String>,
+    /// Admin-only switch: allow the Odoo server (global url and per-agent
+    /// urls) to live on a private/internal network address. Default `false`.
+    /// Even when on, loopback (except the existing `http://localhost`
+    /// exception) and cloud-metadata addresses stay refused, the resolved
+    /// addresses are still pinned and no proxy is used.
+    #[serde(default)]
+    pub allow_private_network: bool,
 }
 
 impl Default for OdooConfig {
@@ -71,6 +78,7 @@ impl Default for OdooConfig {
             features_project: false,
             features_hr: false,
             unblock_models: Vec::new(),
+            allow_private_network: false,
         }
     }
 }

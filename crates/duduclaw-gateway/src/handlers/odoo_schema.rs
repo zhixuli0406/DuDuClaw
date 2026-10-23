@@ -30,7 +30,10 @@ impl MethodHandler {
         let table = self.read_config_table(&config_path).await;
 
         let (odoo_cfg, credential) = if inline_url.is_some() {
-            match Self::build_test_config_from_params(&params) {
+            match Self::build_test_config_from_params(
+                &params,
+                super::odoo_config::read_allow_private_network(&self.home_dir),
+            ) {
                 Ok((cfg, Some(cred))) => (cfg, cred),
                 Ok((cfg, None)) => {
                     // No credential in params — fall back to saved one so the user
@@ -258,14 +261,18 @@ impl MethodHandler {
     /// back to the stored credential.
     pub(crate) fn build_test_config_from_params(
         params: &Value,
+        stored_allow_private: bool,
     ) -> Result<(duduclaw_odoo::OdooConfig, Option<String>), String> {
+        // The form's switch value wins (test-before-save); otherwise the stored one.
+        let allow_private = params
+            .get("allow_private_network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(stored_allow_private);
         // URL — reuse the same SSRF-safe validator as `configure`.
         let url = match params.get("url").and_then(|v| v.as_str()).map(str::trim) {
-            Some(u) if Self::is_safe_odoo_url(u) => u,
-            Some(_) => {
-                return Err(
-                    "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)".into(),
-                );
+            Some(u) => {
+                duduclaw_odoo::url_guard::check_url(u, allow_private)?;
+                u
             }
             _ => return Err("Missing 'url' parameter".into()),
         };
@@ -327,6 +334,7 @@ impl MethodHandler {
             protocol: protocol.into(),
             auth_method: auth_method.into(),
             username: username.into(),
+            allow_private_network: allow_private,
             ..Default::default()
         };
         Ok((cfg, credential))

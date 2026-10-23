@@ -26,6 +26,8 @@ export interface MentionAgent {
   readonly via_user_name?: string;
   /** The server's exact `@…` text for this staff member. */
   readonly call_text?: string;
+  /** From `agents.callable`: may be handed a task (`/交辦`). */
+  readonly assignable?: boolean;
 }
 
 /** One section of the `@` popup. `team` sections are per report. */
@@ -78,6 +80,19 @@ function names(a: MentionAgent): string[] {
 /** Staff that can be called right now (active, not archived). */
 export function callableAgents(agents: readonly MentionAgent[]): MentionAgent[] {
   return agents.filter((a) => (a.status ?? 'active') === 'active' && !a.archived);
+}
+
+/** The composer text starts with the assign command (`/交辦`, `／交辦`,
+ *  `/assign`), so the `@` list should offer only staff who can take a task.
+ *  Mirrors the gateway's `chat_commands::strip_assign_command`. */
+export function isAssignCommand(text: string): boolean {
+  const t = text.trimStart();
+  return [/^\/交辦(\s|$)/, /^／交辦(\s|$)/, /^\/assign(\s|$)/i].some((re) => re.test(t));
+}
+
+/** Staff who may be handed a task. */
+export function assignableAgents(agents: readonly MentionAgent[]): MentionAgent[] {
+  return agents.filter((a) => a.assignable === true);
 }
 
 /** Candidates for `query`: names that start with it first, then names that

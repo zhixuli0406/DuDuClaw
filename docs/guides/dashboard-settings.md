@@ -53,6 +53,10 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 - WhatsApp, Feishu, Google Chat, Teams, WeCom and DingTalk: the six webhook routes are always mounted. A route answers 404 until its channel is configured; after that it enforces the platform's signature check and answers 401 to a bad signature. `channels.add` starts the channel without a restart: `channels.add` returns `hot_started` and `restart_required: false`, with `not_started_reason` when credentials are incomplete. A per-employee Slack bot also starts when it is added.
 - Thinking display in messaging apps (no dedicated control; set in the Advanced config editor, read on every reply): `[thinking] channel_audience` = `internal` (default: a sender whose verified channel identity belongs to an active dashboard account that is an Admin or is bound to the answering employee sees the timer and a masked summary, everyone else the timer only), `all` (every sender of a one-to-one chat sees the summary) or `none` (nothing); `[thinking] channel_group_display` = `status` (default: group chats show the timer only), `summary` or `off`. The stricter of `[thinking] display` and the answering employee's `[model] show_thinking` still caps both. An unreadable `config.toml` or an unknown value shows nothing. Website visitors (Odoo live chat, the WebChat widget) never see thinking. See [Thinking display in messaging apps](../features/66-thinking-in-messaging-apps.md).
 
+## Integrations → Odoo → Connection
+
+"Allow Odoo on an internal network" writes `[odoo] allow_private_network` (admin only, default off; saved together with the connection through `odoo.configure`, tested by the same switch value in **Test connection**). Off: the Odoo url, global or per employee, must be HTTPS to a public host (plain `http://` only for `localhost`). On: addresses such as 192.168.x.x or 10.x.x.x are allowed, over HTTPS or HTTP; the local machine, link-local and cloud metadata addresses (169.254.169.254, `metadata.google.internal`) stay refused, the resolved addresses are pinned for the connection and no proxy is used. The first boot after the upgrade turns it on by itself when a configured Odoo url already resolves to an internal address (audit event `odoo_allow_private_network_auto_enabled`), so existing installs keep working. Takes effect on the next connection.
+
 ## Integrations → Odoo → Website live chat
 
 Saved with its own button through `odoo.livechat.set` (admin) into `[odoo_livechat]`, a separate section from `[odoo]` because the Odoo connection save rewrites the whole `[odoo]` section. The bot API key is stored encrypted as `bot_api_key_enc` and never returned; leaving the field empty keeps it. Every save and every **Hand back to AI** is written to the audit log. See [features/61-odoo-livechat.md](../features/61-odoo-livechat.md).
@@ -80,6 +84,7 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 | Tab → section | Key |
 |---|---|
 | Budget → Daily cap | `[budget] daily_cap_cents` |
+| Skills → This staffer's skills (unreleased) | not a config key: switches are stored in `<home>/skill_state/<agent_id>.json` (`skills.set_enabled`), removed skills move to `<home>/skill_archive/<agent_id>/` (`skills.remove` / `skills.restore`); Owner of the employee or admin. See [Skill library page](../features/15-skill-lifecycle.md#the-skill-library-page-unreleased) |
 | Tools & permissions → Tools that need a checkpoint (always wait for approval, treat as irreversible, let the judge decide first, needs a task grant) | `[capabilities] approval_required_tools`, `irreversible_tools`, `maybe_irreversible_tools`, `scoped_tools` |
 | Tools & permissions → Parallel branches | `[fork] enabled` |
 | Tools & permissions → Outgoing reply protection | `[guardrails] enabled`, `block_secrets`, `block_injection_echo`, `redact_pii`, `deny_phrases` |
@@ -98,6 +103,29 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 **Who may save (unreleased, behaviour change).** `agents.update` re-reads the caller's role and employee binding from the account database on every save, and again right before writing. Removing someone's binding, suspending them or requiring a password change takes effect on their next save without waiting for their session to expire. Every save of `agent.toml` from any path (this page, `/model` in a chat, the Advanced config editor, automatic edits) now keeps comments and key order, keeps a version (see [Profile files](#profile-files-unreleased)) and writes `agent_file_changed`. When the registry cannot be reloaded after a save, the message reads 「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」 (there is no periodic reload).
 
 **Permission flags are enforced (behaviour change).** `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` had no reader before. Since v1.68.0 a flag written as `false` blocks the matching tools at the MCP dispatch gate (`create_agent`; `send_to_agent`, `spawn_agent`; `create_reminder`, `tasks_create` with a `schedule`; `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording`); an absent or wrongly typed flag allows. Older templates often wrote these flags as `false`, so the first boot after the upgrade migrates every employee once: in a `[permissions]` table without the marker `permissions_enforced_since`, each of the four flags that is `false` becomes `true` and `permissions_enforced_since = "1.68.0"` is added; each reset writes the audit event `permission_flags_reset`. A `false` written afterwards on this page or in the Advanced config editor counts as an operator decision. Ephemeral role members (`agents/.ephemeral/`) are not migrated and keep least privilege.
+
+## Manage → Members: direct manager and org chart (Enterprise, 1.76.0)
+
+Admins only. The Personal edition has no such page.
+
+| Control | Writes | Effect |
+|---|---|---|
+| Create / edit member → Direct manager | `manager_user_id` on `users.create` / `users.update` (choosing "None" clears it) | The next message and the next dashboard action follow the new reporting line. The list offers only active people whose role is Manager or Admin, minus the person and everyone below them; the gateway checks again and, when it refuses, says why in plain words: the line would loop, it would go past 8 levels, the manager's role is too low, or (when you change someone with reports to Employee) they still have direct reports. |
+| List → Role column | — | Shows "Manager: …". |
+| List / Org chart | — | Display only. The org chart draws the reporting lines from the direct manager, with each person's bound AI staff next to them; people with no manager and no reports are listed under "No manager set". Offboarded people are left out; suspended people are shown and marked. Click a name to edit. |
+
+What a manager gets through their reports: see [Calling AI staff with @](../features/62-calling-ai-staff.md#managers-reach-their-teams-employees).
+
+## Organization → My team (Enterprise, 1.76.0)
+
+Only people whose role is Manager or Admin see it (sidebar group "Organization"). The page lists the people who report to you (down to 8 levels; suspended people included, offboarded people not) and the AI staff you can reach through each of them:
+
+- Tag "Can assign work" or "Chat only": when the report's binding is Owner or Operator you get Operator and may assign work; when it is Viewer you may only chat.
+- "N open tasks": tasks assigned to that employee that are not done, cancelled or failed.
+- **Chat** opens WebChat with `@name ` already typed. Disabled while the employee is not active.
+- **Assign** asks what should be done (and, optionally, how you will know it is done), creates a goal task (`tasks.create` with `kind = "goal"`). You stay on the page with an "Assigned to …" confirmation; a manager cannot open a report's task itself yet.
+
+The data comes from the RPC `users.my_team`, computed with the same rules every call and assignment uses, so everything listed can be reached. It is refused in the Personal edition and for the Employee role.
 
 ## Employee page → Data sources (unreleased)
 

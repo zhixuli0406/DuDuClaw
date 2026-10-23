@@ -53,6 +53,10 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
 - メッセージングアプリでの思考表示（専用の設定項目はなく、設定ファイルの詳細編集で設定。返信ごとに読み直します）：`[thinking] channel_audience` = `internal`（既定：チャネル ID が検証済みで、有効な dashboard アカウントが管理者または回答する社員に紐付いている送信者はタイマーと伏せ字化した要約、それ以外はタイマーのみ）、`all`（1 対 1 チャットのすべての送信者が要約を見られる）、`none`（何も表示しない）。`[thinking] channel_group_display` = `status`（既定：グループチャットはタイマーのみ）、`summary`、`off`。`[thinking] display` と回答する社員の `[model] show_thinking` のうち厳しい方が、引き続き両方の上限になります。`config.toml` が読めない、または不明な値のときは何も表示しません。Web サイトの訪問者（Odoo ライブチャット、WebChat ウィジェット）には思考は表示されません。詳しくは[メッセージングアプリでの思考表示](../../features/ja-JP/66-thinking-in-messaging-apps.md)。
 
+## 連携 → Odoo → 接続設定
+
+「社内ネットワーク上の Odoo への接続を許可」は `[odoo] allow_private_network` に書き込まれます（管理者のみ、既定はオフ。接続設定と一緒に `odoo.configure` で保存され、「接続テスト」は画面上のスイッチ値を使います）。オフの間は、Odoo の URL（全体でも従業員ごとでも）は公開ホストへの HTTPS が必須です（`http://` は `localhost` のみ）。オンにすると 192.168.x.x や 10.x.x.x などの社内アドレスに HTTPS・HTTP のどちらでも接続できます。ローカルマシン、リンクローカル、クラウドのメタデータアドレス（169.254.169.254、`metadata.google.internal`）は常に拒否され、接続は検査済みの解決結果に固定され、プロキシは使いません。アップグレード後の初回起動で、設定済みの Odoo URL が社内アドレスに解決される場合は自動でオンになり（監査イベント `odoo_allow_private_network_auto_enabled`）、既存の環境は切断されません。次回の接続から有効です。
+
 ## 連携 → Odoo → Web サイトのライブチャット
 
 専用の保存ボタンで `odoo.livechat.set`（管理者）から `[odoo_livechat]` に書き込みます。Odoo 接続の保存は `[odoo]` 全体を書き換えるため、別セクションにしています。ボットの API キーは `bot_api_key_enc` として暗号化保存され、返されません。空欄なら変更しません。保存と「AI に戻す」は監査ログに記録されます。詳細は [features/ja-JP/61-odoo-livechat.md](../../features/ja-JP/61-odoo-livechat.md)。
@@ -80,6 +84,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | タブ → セクション | キー |
 |---|---|
 | 予算 → 1日の上限 | `[budget] daily_cap_cents` |
+| スキル → この社員のスキル（未リリース） | 設定キーではない：オン／オフは `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`）、削除したスキルは `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）に移る。社員の担当者または管理者。[スキルライブラリ画面](../../features/ja-JP/15-skill-lifecycle.md)参照 |
 | ツールと権限 → 確認が必要なツール（常に承認待ち、不可逆として扱う、先に判定役が判断、タスク許可が必要） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | ツールと権限 → 並行ブランチ | `[fork] enabled` |
 | ツールと権限 → 送信内容の保護 | `[guardrails] enabled`、`block_secrets`、`block_injection_echo`、`redact_pii`、`deny_phrases` |
@@ -98,6 +103,29 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 **保存できる人（未リリース、動作の変更）。** `agents.update` は保存のたびに呼び出し元のロールと社員への紐付けをアカウントデータベースから読み直し、書き込み直前にファイルロック内でもう一度確認します。紐付けの解除、アカウントの停止、パスワード変更の要求は、セッションの期限を待たず次の保存から有効です。どの経路からの `agent.toml` の書き込みも（このページ、チャットの `/model`、設定ファイルの詳細編集、自動の変更）コメントとキーの順序を保ち、版を残し（[設定ファイル](#設定ファイル未リリース)を参照）、`agent_file_changed` を記録します。保存後に社員一覧を再読み込みできなかったときのメッセージは「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」です（定期的な再読み込みはありません）。
 
 **権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
+
+## 管理 → メンバー：直属の上司と組織図（Enterprise 版、1.76.0）
+
+管理者のみ。Personal 版にはこのページはありません。
+
+| コントロール | 書き込み先 | 効果 |
+|---|---|---|
+| メンバーの追加／編集 → 直属の上司 | `users.create`／`users.update` の `manager_user_id`（「未設定」を選ぶと解除） | 保存後、次のメッセージと次のダッシュボード操作から新しい上司関係で判断します。一覧には在職中でロールがマネージャーか管理者の人だけが出て、本人とその下の人は出ません。ゲートウェイも改めて確認し、拒否するときは理由をわかりやすく示します：関係が循環する、8 階層を超える、上司のロールが足りない、（部下がいる人を一般社員に変えるとき）まだ直属の部下がいる。 |
+| 一覧 → ロール列 | — | 「上司：○○」を表示します。 |
+| 一覧／組織図 | — | 表示の切り替えのみ。組織図は直属の上司から上下関係を描き、各人の横に紐付いた AI スタッフを並べます。上司も部下もいない人は「上司未設定」にまとめます。退職者は表示せず、停止中の人は表示して印を付けます。名前をクリックすると編集できます。 |
+
+上司が部下経由で得られる権限は [@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照してください。
+
+## 組織 → マイチーム（Enterprise 版、1.76.0）
+
+ロールがマネージャーか管理者の人だけに表示されます（サイドバーの「組織」）。あなたに報告する人（最大 8 階層下まで。停止中の人は含み、退職者は含まない）と、各人を通じて呼び出せる AI スタッフを一覧にします。
+
+- 「依頼できる」「会話のみ」のタグ：部下の紐付けが Owner か Operator なら Operator を得て仕事を依頼できます。Viewer なら会話のみです。
+- 「進行中 N 件」：そのスタッフに割り当てられ、完了・取消・失敗していないタスクの数。
+- **会話**：WebChat を開き、入力欄に `@名前 ` を入れた状態にします。スタッフが停止中のときは押せません。
+- **依頼**：依頼する内容（と任意の完了の目安）を書くとゴールタスク（`tasks.create`、`kind = "goal"`）を作ります。送信後はこのページのまま「依頼しました」と表示されます。上司は部下のスタッフのタスク内容をまだ開けません。
+
+データは RPC `users.my_team` から取得し、毎回の呼び出しや依頼と同じ判断を使うので、一覧にあるものはすべて呼び出せます。Personal 版と一般社員のロールでは拒否されます。
 
 ## AI 社員ページ → データソース（未リリース）
 

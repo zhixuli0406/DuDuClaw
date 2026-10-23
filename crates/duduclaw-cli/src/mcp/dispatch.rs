@@ -309,7 +309,7 @@ pub(crate) async fn handle_tools_call(
         // T5/O13 merged skill-search entry (`source` picks hubs / bank).
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_gaps" => handle_skill_gaps(&arguments, home_dir, default_agent).await,
-        "skill_list" => handle_skill_list(&arguments, home_dir).await,
+        "skill_list" => handle_skill_list(&arguments, home_dir, default_agent).await,
         "skill_security_scan" => handle_skill_security_scan(&arguments, home_dir).await,
         "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
         "skill_synthesis_status" => handle_skill_synthesis_status(&arguments, home_dir).await,

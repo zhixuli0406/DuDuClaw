@@ -2044,6 +2044,10 @@ impl AutopilotEngine {
             Err(e) => return Err(format!("canonicalize {skill_path:?}: {e}")),
         }
 
+        // B8: a skill switched off for the target employee is not run.
+        if duduclaw_agent::skill_state::read_disabled(&self.home_dir, target).is_disabled(skill) {
+            return Err(format!("skill '{skill}' is switched off for {target}"));
+        }
         let skill_body = tokio::fs::read_to_string(&skill_path)
             .await
             .map_err(|e| format!("read skill {skill_path:?}: {e}"))?;

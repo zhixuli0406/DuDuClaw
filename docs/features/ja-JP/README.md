@@ -71,6 +71,7 @@
 | 64 | [思考の表示](64-thinking-display.md) | どのランタイムでも WebChat に考え中のタイマーを表示。サインインしたダッシュボード利用者には伏せ字処理・短縮済みの思考の要約。メッセージアプリには送らない |
 | 65 | [思考はどこから来るか](65-thinking-sources.md) | 思考を報告する runtime（Claude CLI、Codex、OpenAI 互換 API、Anthropic Direct API）、それぞれの表示内容、リクエストが変わる条件 |
 | 66 | [メッセージングアプリでの思考表示](66-thinking-in-messaging-apps.md) | Telegram、Discord、Slack、Teams、LINE などでのタイマーと伏せ字化した要約。`[thinking] channel_audience`／`channel_group_display` |
+| 67 | [チャットからタスクを任せる](67-assigning-tasks.md) | `/交辦 @スタッフ 内容`（`/assign`）で送信者の代わりに目標タスクを作成。任せる権限のあるスタッフのみ。進捗は元の会話へ、`/交辦 狀態`、「目標」ページの「自分が任せた」 |
 
 ---
 

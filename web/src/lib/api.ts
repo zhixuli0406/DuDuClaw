@@ -509,11 +509,40 @@ export interface SharedWikiStats {
 
 export interface SkillInfo {
   name: string;
-  agent_id?: string;
+  agent_id?: string | null;
   content: string;
   /** Which layer the skill came from: company-wide / department / this staffer. */
   scope?: 'global' | 'department' | 'agent';
   security_status?: 'pass' | 'warn' | 'fail';
+  /** B8: localised name / description and tags from the frontmatter (search). */
+  display_name?: string;
+  description?: string;
+  tags?: string[];
+  /** B8: false when switched off for this employee (not loaded). */
+  enabled?: boolean;
+  /** B8: times the system activated it for this employee, and the latest. */
+  use_count?: number;
+  last_used_at?: string | null;
+  /** B8: file modification time, Unix seconds. */
+  modified_at?: number | null;
+  /** B8 aggregate view, company-wide rows: employees that have it. */
+  holders?: SkillHolder[];
+  enabled_count?: number;
+}
+
+/** B8: one employee holding a company-wide skill. */
+export interface SkillHolder {
+  agent_id: string;
+  display_name?: string;
+  enabled: boolean;
+  use_count: number;
+  last_used_at?: string | null;
+}
+
+/** B8: whether an employee's skill switch file could be read. */
+export interface SkillStateStatus {
+  ok: boolean;
+  error?: string;
 }
 
 /**
@@ -533,8 +562,29 @@ export interface SkillScanPath {
 /** Aggregate (`skills.list` with no `agent_id`) — every layer, every staffer. */
 export interface SkillsListAll {
   global_skills: SkillInfo[];
-  agents: Array<{ agent_id: string; display_name?: string; skills: SkillInfo[] }>;
+  agents: Array<{
+    agent_id: string;
+    display_name?: string;
+    skills: SkillInfo[];
+    skill_state?: SkillStateStatus;
+    can_manage?: boolean;
+  }>;
   scanned?: SkillScanPath[];
+  /** Set when activation counts could not be read. */
+  usage_error?: string | null;
+  /** True when the oldest-used pairs were cut off by the server's cap. */
+  usage_truncated?: boolean;
+}
+
+/** `skills.list {agent_id}`. */
+export interface SkillsListOne {
+  agent_id?: string;
+  skills: SkillInfo[];
+  scanned?: SkillScanPath[];
+  skill_state?: SkillStateStatus;
+  can_manage?: boolean;
+  usage_error?: string | null;
+  usage_truncated?: boolean;
 }
 
 export interface HeartbeatInfo {
@@ -812,6 +862,10 @@ export interface TaskInfo {
   /** Set by the server when the reader may see only this card: the task's
    *  content is limited to an audience the reader is not in. */
   restricted?: boolean;
+  /** Who the task was handed over for (`user:<account id>`), when a person
+   *  assigned it; and where (`line`, `webchat`, `dashboard`, …). */
+  on_behalf_of?: string | null;
+  created_via?: string | null;
   /** Discovery is orchestrated separately from the ordinary goal worker. */
   kind?: 'task' | 'goal' | 'discovery';
   id: string;
@@ -2143,6 +2197,8 @@ export interface UserInfo {
   status: 'active' | 'suspended' | 'offboarded';
   /** Department this user belongs to (drives install-approval routing). */
   department?: string | null;
+  /** Direct manager's user id (`users.list`); null/absent = none. */
+  manager_user_id?: string | null;
   created_at: string;
   updated_at: string;
   last_login?: string;
@@ -2165,6 +2221,44 @@ export interface UserAgentBinding {
 
 export interface UserDetail extends UserInfo {
   bindings: UserAgentBinding[];
+}
+
+/** One AI employee a manager may call through a report (`users.my_team`). */
+export interface TeamAgent {
+  name: string;
+  display_name: string;
+  /** The text that calls exactly this employee in a conversation (`@名字`). */
+  call_text: string;
+  icon?: string;
+  has_avatar?: boolean;
+  status: string;
+  /** Active (not paused / terminated): can take a conversation or new work. */
+  operational: boolean;
+  /** What the manager derives from the report's access: never above operator. */
+  level: 'operator' | 'viewer';
+  /** The caller may hand this employee a task. */
+  assignable: boolean;
+  /** Open tasks assigned to this employee; null when the count is unavailable. */
+  active_tasks: number | null;
+}
+
+/** One person below the caller in the reporting tree (`users.my_team`). */
+export interface TeamMember {
+  id: string;
+  display_name: string;
+  role: UserInfo['role'];
+  status: UserInfo['status'];
+  department?: string | null;
+  manager_user_id?: string | null;
+  /** 1 = direct report. */
+  depth: number;
+  agents: TeamAgent[];
+}
+
+export interface MyTeam {
+  manager: { id: string; display_name: string } | null;
+  max_depth: number;
+  members: TeamMember[];
 }
 
 export interface AuditEntry {
@@ -2295,6 +2389,8 @@ export interface OdooConfig {
   poll_interval_seconds: number;
   poll_models: string[];
   webhook_enabled: boolean;
+  /** Admin-only: allow an Odoo server on an internal network address. */
+  allow_private_network?: boolean;
   /**
    * Whether each write-only credential is on file. The values stay server-side;
    * these flags are what let the form say "已儲存（留空表示不變更）" instead of
@@ -2326,6 +2422,7 @@ export interface OdooConfigUpdate {
   webhook_enabled: boolean;
   webhook_secret?: string;
   unblock_models?: string[];
+  allow_private_network?: boolean;
   features_crm: boolean;
   features_sale: boolean;
   features_inventory: boolean;
@@ -2345,6 +2442,7 @@ export interface OdooTestParams {
   username: string;
   api_key?: string;
   password?: string;
+  allow_private_network?: boolean;
 }
 
 // ── Read-only SQL data sources (`db_sources.*`, WP-D §13.7) ──
@@ -6514,10 +6612,7 @@ export const api = {
   },
   skills: {
     list: (agentId: string) =>
-      client.call('skills.list', { agent_id: agentId }) as Promise<{
-        skills: SkillInfo[];
-        scanned?: SkillScanPath[];
-      }>,
+      client.call('skills.list', { agent_id: agentId }) as Promise<SkillsListOne>,
     /** Aggregate across every layer and every staffer (no `agent_id`). */
     listAll: () => client.call('skills.list', {}) as Promise<SkillsListAll>,
     content: (agentId: string, skillName: string) =>
@@ -7504,6 +7599,17 @@ export const api = {
       ),
     create: (params: TaskCreateParams) =>
       client.call('tasks.create', { ...params }) as Promise<{ task: TaskInfo }>,
+    /** `tasks.create` with `kind: "goal"`: an autonomous goal for `agent`.
+     *  The gateway checks the caller may hand `agent` work (a direct
+     *  Operator binding, Admin, or a report's employee for a manager). */
+    createGoal: (params: { agent: string; description: string; acceptance_criteria?: string }) =>
+      client.call('tasks.create', {
+        kind: 'goal',
+        assigned_to: params.agent,
+        agent_id: params.agent,
+        description: params.description,
+        ...(params.acceptance_criteria ? { acceptance_criteria: params.acceptance_criteria } : {}),
+      }) as Promise<{ task: TaskInfo }>,
     update: (taskId: string, fields: TaskUpdateParams) =>
       client.call('tasks.update', { task_id: taskId, ...fields }) as Promise<{ task: TaskInfo }>,
     remove: (taskId: string) =>
@@ -7655,6 +7761,9 @@ export const api = {
       archived?: boolean;
       limit?: number;
       offset?: number;
+      /** `'me'`: only tasks the signed-in account handed over (chat
+       *  `/交辦`, the dashboard). No `agent_id` is needed then. */
+      on_behalf_of?: 'me';
     }) =>
       client.call('tasks.list_page', params) as Promise<{
         tasks: TaskInfo[];
@@ -8068,11 +8177,33 @@ export const api = {
       client.call('users.subordinates') as Promise<{
         users: Array<{ id: string; display_name: string; role: string }>;
       }>,
-    create: (params: { email: string; display_name: string; password: string; role?: string; department?: string }) =>
+    create: (params: {
+      email: string;
+      display_name: string;
+      password: string;
+      role?: string;
+      department?: string;
+      /** Direct manager; omit for none. */
+      manager_user_id?: string;
+    }) =>
       client.call('users.create', params) as Promise<{ user: UserInfo }>,
-    /** `department: ''` clears the user's department; omit to leave unchanged. */
-    update: (params: { user_id: string; display_name?: string; role?: string; password?: string; department?: string }) =>
+    /** `department: ''` clears the user's department; omit to leave unchanged.
+     *  `manager_user_id: null` (or `''`) clears the direct manager; omit to
+     *  leave it unchanged. The gateway validates the reporting line and
+     *  refuses with a coded error (`manager_cycle`, `manager_too_deep`,
+     *  `manager_role`, `manager_has_reports`, …). */
+    update: (params: {
+      user_id: string;
+      display_name?: string;
+      role?: string;
+      password?: string;
+      department?: string;
+      manager_user_id?: string | null;
+    }) =>
       client.call('users.update', params) as Promise<{ status: string }>,
+    /** 我的團隊: everyone below the caller (manager+, Enterprise only) and the
+     *  AI employees the caller may call through each of them. */
+    myTeam: () => client.call('users.my_team') as Promise<MyTeam>,
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,
     bindAgent: (userId: string, agentName: string, accessLevel?: string) =>

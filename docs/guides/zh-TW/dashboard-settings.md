@@ -53,6 +53,10 @@
 - WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘：六條 webhook 路由一律掛著。通道設定好之前回 404；設定好之後會驗證平台的簽章，簽章錯誤回 401。`channels.add` 不必重啟就會啟動通道，`channels.add` 回 `hot_started` 與 `restart_required: false`；憑證不完整時附 `not_started_reason`。個別員工的 Slack bot 也會在新增時直接啟動。
 - 通訊軟體的思考顯示（沒有專屬控制項，在設定檔進階編輯裡設定，每次回覆都重新讀取）：`[thinking] channel_audience` = `internal`（預設：通道身分已驗證、帳號啟用中，且是管理員或綁定回答員工的發話者看得到計時與遮蔽後的摘要，其他人只看計時）、`all`（一對一聊天的所有發話者都看得到摘要）或 `none`（都不顯示）；`[thinking] channel_group_display` = `status`（預設：群組聊天只顯示計時）、`summary` 或 `off`。`[thinking] display` 與回答員工的 `[model] show_thinking` 取較嚴格者，仍是兩者的上限。`config.toml` 讀不到或值不認得時都不顯示。網站訪客（Odoo 線上客服、WebChat 網站小工具）永遠看不到思考。詳見[通訊軟體的思考顯示](../../features/zh-TW/66-thinking-in-messaging-apps.md)。
 
+## 整合 → Odoo → 連線設定
+
+「允許連到內網的 Odoo」寫入 `[odoo] allow_private_network`（只有管理員能改，預設關閉；隨連線設定由 `odoo.configure` 一起儲存，「測試連線」用畫面上的開關值）。關閉時，Odoo 網址（全域或個別員工）必須是 HTTPS 且指向公開主機（只有 `localhost` 可用 `http://`）。開啟後允許 192.168.x.x、10.x.x.x 這類內網位址，HTTPS 或 HTTP 都可以；本機位址、link-local 與雲端 metadata 位址（169.254.169.254、`metadata.google.internal`）仍一律拒絕，連線會釘在解析時檢查過的位址上，也不走代理。升級後第一次開機時，若已設定的 Odoo 網址解析到內網位址，系統會自動把它打開（稽核事件 `odoo_allow_private_network_auto_enabled`），舊客戶不會斷線。下次連線時生效。
+
 ## 整合 → Odoo → 網站線上客服
 
 用自己的儲存按鈕透過 `odoo.livechat.set`（管理員）寫入 `[odoo_livechat]`。它和 `[odoo]` 分開，因為儲存 Odoo 連線設定時會整段改寫 `[odoo]`。機器人 API 金鑰加密存成 `bot_api_key_enc`，不會回傳；欄位留空表示不變。每次儲存與每次「交回 AI」都寫入稽核紀錄。詳見 [features/zh-TW/61-odoo-livechat.md](../../features/zh-TW/61-odoo-livechat.md)。
@@ -80,6 +84,7 @@
 | 分頁 → 區塊 | 設定鍵 |
 |---|---|
 | 預算 → 每日上限 | `[budget] daily_cap_cents` |
+| 技能 → 這位員工的技能（尚未發版） | 不是設定鍵：開關存在 `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`），移除的技能搬到 `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）；需員工負責人或管理員。見[技能庫頁面](../../features/zh-TW/15-skill-lifecycle.md) |
 | 工具與權限 → 需要把關的工具（一律等人核可、視為不可逆、先由判官判斷、需任務授權） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | 工具與權限 → 平行分支 | `[fork] enabled` |
 | 工具與權限 → 出站內容防護 | `[guardrails] enabled`、`block_secrets`、`block_injection_echo`、`redact_pii`、`deny_phrases` |
@@ -98,6 +103,29 @@
 **誰能存檔（未發布，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔未發布)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
 **權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
+
+## 管理 → 成員：直屬主管與組織圖（企業版，1.76.0）
+
+只限管理員。個人版沒有這一頁。
+
+| 控制項 | 寫入 | 效果 |
+|---|---|---|
+| 新增／編輯成員 → 直屬主管 | `users.create`／`users.update` 的 `manager_user_id`（選「未指定」＝清除） | 存檔後下一則訊息與下一次 dashboard 操作就照新的主管關係判斷。下拉選單只列在職、角色是主管或管理員的人，不含本人和他底下的人；伺服器仍會再檢查一次，拒絕時以白話說明原因：會繞成一圈、超過 8 層、主管角色不足，或（把有部屬的人改成一般員工時）還有直屬部屬。 |
+| 清單 → 角色欄 | — | 顯示「主管：○○」。 |
+| 清單／組織圖 | — | 只改變顯示方式。組織圖依直屬主管畫出上下層，每個人旁邊列出他綁定的 AI 員工；沒有主管也沒有部屬的人放在「未指定主管」。離職的人不顯示，停權的人照常顯示並標示。點名字可以編輯。 |
+
+主管能從部屬那裡拿到什麼，見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md#主管叫得到團隊的員工)。
+
+## 組織 → 我的團隊（企業版，1.76.0）
+
+角色是主管或管理員的人才看得到（側欄「組織」）。頁面列出向你回報的人（往下最多 8 層，停權的人照列，離職的不列），以及透過每個人你叫得到的 AI 員工：
+
+- 標籤「可交辦」或「只能對話」：部屬的綁定是 Owner 或 Operator 時，你拿到的是 Operator，可以交辦；是 Viewer 時只能對話。
+- 「進行中 N 件」：指派給這位員工、還沒完成、取消或失敗的任務。
+- **對話**：開啟 WebChat，輸入框先填好 `@名字 `。員工停用時不能按。
+- **交辦**：寫下要完成什麼（和選填的完成標準），建立一個目標任務（`tasks.create`，`kind = "goal"`）。送出後留在這一頁並顯示「已交辦給【名字】」；主管目前還打不開部屬員工的任務內容。
+
+資料來自 RPC `users.my_team`，和每一次呼叫、交辦用的是同一套判斷，所以列出來的都叫得到。個人版與一般員工呼叫這個 RPC 會被拒絕。
 
 ## 員工頁 → 資料來源（未發布）
 

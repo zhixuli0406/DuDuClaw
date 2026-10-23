@@ -731,13 +731,31 @@ pub(crate) async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, calle
     // W3-3b (a): the caller may be an `eph-*` role member, whose agent.toml
     // lives under `agents/.ephemeral/<id>/`.
     let agent_toml_path = caller_agent_dir(home_dir, caller_agent).join("agent.toml");
+    // A missing agent.toml or a missing [odoo] block ⇒ global config. A block
+    // (or file) that cannot be read ⇒ refuse, never fall back to the global
+    // server; any override registered earlier is dropped.
     let override_cfg: Option<AgentOdooConfig> =
         match tokio::fs::read_to_string(&agent_toml_path).await {
-            Ok(raw) => AgentOdooConfig::from_agent_toml(&raw),
-            Err(_) => None,
+            Ok(raw) => match AgentOdooConfig::parse_agent_toml(&raw) {
+                Ok(cfg) => cfg,
+                Err(msg) => {
+                    odoo.unregister_agent(caller_agent).await;
+                    return mcp_error(&msg);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            // Present but unreadable (permissions, I/O): refuse, never fall
+            // back to the global server.
+            Err(_) => {
+                odoo.unregister_agent(caller_agent).await;
+                return mcp_error(duduclaw_odoo::ODOO_UNREADABLE);
+            }
         };
-    if let Some(cfg) = &override_cfg {
-        odoo.register_agent(caller_agent, cfg.clone()).await;
+    match &override_cfg {
+        Some(cfg) => odoo.register_agent(caller_agent, cfg.clone()).await,
+        // No (or unusable) override any more: drop one registered earlier so
+        // the agent falls back to the global server, as `odoo.agent_test` does.
+        None => odoo.unregister_agent(caller_agent).await,
     }
 
     // ── 3. Force a fresh handshake — the previous slot, if any, may have ───

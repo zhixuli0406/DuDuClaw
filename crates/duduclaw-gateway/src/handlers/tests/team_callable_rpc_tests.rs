@@ -459,3 +459,108 @@ async fn a_manager_manages_tasks_they_created_for_the_team() {
     let removed = f.handler.handle("tasks.remove", json!({ "task_id": id }), &ctx).await;
     assert!(!is_denied(&removed), "{removed:?}");
 }
+
+/// PR-C: `tasks.list_page { on_behalf_of: "me" }` lists what the caller
+/// handed over, with its content, even through a team grant; the principal
+/// comes from the identity, and any other value is ignored.
+#[tokio::test]
+async fn assigned_by_me_lists_own_handed_over_tasks_with_content() {
+    let f = fixture().await;
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    let created = ok_payload(
+        &f.handler
+            .handle(
+                "tasks.create",
+                json!({ "title": "整理報價單", "description": "三家比價", "assigned_to": "sales" }),
+                &mgr,
+            )
+            .await,
+    )["task"]
+        .clone();
+    assert_eq!(created["on_behalf_of"], json!(format!("user:{}", f.mgr)));
+    assert_eq!(created["created_via"], "dashboard");
+    // Another account's task for the same employee.
+    let emp1 = jwt_ctx(&f.emp1, UserRole::Employee);
+    ok_payload(
+        &f.handler
+            .handle("tasks.create", json!({ "title": "別人的", "assigned_to": "sales" }), &emp1)
+            .await,
+    );
+
+    let mine = ok_payload(
+        &f.handler
+            .handle("tasks.list_page", json!({ "on_behalf_of": "me" }), &mgr)
+            .await,
+    );
+    let tasks = mine["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{mine}");
+    assert_eq!(tasks[0]["title"], "整理報價單");
+    assert_eq!(tasks[0]["description"], "三家比價", "the assigner reads the content");
+    assert!(tasks[0].get("restricted").is_none());
+    assert_eq!(mine["total"], 1);
+
+    // The ordinary board listing of the same employee still shows the other
+    // account's task as a card only.
+    let board = ok_payload(
+        &f.handler
+            .handle("tasks.list_page", json!({ "agent_id": "sales" }), &mgr)
+            .await,
+    );
+    let other_row = board["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["title"] == "別人的")
+        .unwrap()
+        .clone();
+    assert_eq!(other_row["restricted"], true);
+    // Who it was assigned for and from where are content too.
+    assert!(other_row["on_behalf_of"].is_null(), "{other_row}");
+    assert!(other_row["created_via"].is_null(), "{other_row}");
+
+    // Someone else's id in the field is ignored: an ordinary listing, which
+    // a non-admin without `agent_id` is refused.
+    let spoof = f
+        .handler
+        .handle("tasks.list_page", json!({ "on_behalf_of": format!("user:{}", f.emp1) }), &mgr)
+        .await;
+    assert!(matches!(spoof, WsFrame::Response { ok: false, .. }), "{spoof:?}");
+    // emp1's own view lists only emp1's task.
+    let emp1_mine = ok_payload(
+        &f.handler
+            .handle("tasks.list_page", json!({ "on_behalf_of": "me" }), &emp1)
+            .await,
+    );
+    assert_eq!(emp1_mine["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(emp1_mine["tasks"][0]["title"], "別人的");
+
+    // Losing the team grant stops the content (the row stays listed as a card).
+    f.db.set_manager(&f.lead, None).unwrap();
+    let after = ok_payload(
+        &f.handler
+            .handle("tasks.list_page", json!({ "on_behalf_of": "me" }), &mgr)
+            .await,
+    );
+    assert_eq!(after["tasks"][0]["restricted"], true);
+}
+
+#[tokio::test]
+async fn only_an_admin_sets_a_goal_risk_boundary_from_the_dashboard() {
+    let f = fixture().await;
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    let params = |boundary: &str| {
+        json!({ "agent_id": "sales", "description": "整理報價單", "risk_boundary": boundary })
+    };
+    let refused = f.handler.handle("tasks.goal_create", params("沒有限制"), &mgr).await;
+    assert!(
+        matches!(&refused, WsFrame::Response { ok: false, error: Some(e), .. }
+            if e.to_string().contains("only an admin can set a risk boundary")),
+        "{refused:?}"
+    );
+    // A blank boundary is no boundary: the manager may still assign.
+    let blank = f.handler.handle("tasks.goal_create", params("  "), &mgr).await;
+    assert!(matches!(blank, WsFrame::Response { ok: true, .. }), "{blank:?}");
+    let admin = jwt_ctx(&f.admin, UserRole::Admin);
+    let ok = f.handler.handle("tasks.goal_create", params("不得寄信給客戶"), &admin).await;
+    assert!(matches!(ok, WsFrame::Response { ok: true, .. }), "{ok:?}");
+}

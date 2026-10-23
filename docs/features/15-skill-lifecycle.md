@@ -261,7 +261,29 @@ The marketplace is accessible through MCP:
 | Tool | Purpose |
 |------|---------|
 | `skill_search` | Search every skill source (hubs + learned bank) with weighted ranking; `source` narrows it |
-| `skill_list` | List installed skills per agent |
+| `skill_list` | List the skills an agent loads (company-wide, department and own); skills switched off for that agent are not listed. Defaults to the calling agent (unreleased; it used to default to the main agent and skip the department layer) |
+
+---
+
+## The Skill Library page (unreleased)
+
+The dashboard's **Skills** page has four tabs: Market, Team Skills, My Skills and Leaderboard. The open tab is part of the address (`/skills?tab=shared`, `?tab=mySkills`, `?tab=leaderboard`), so a link or a reload lands on the same tab.
+
+**Order.** Lists are sorted in the browser with the page language's collation rules: case does not matter, `step-2` comes before `step-10`, and Chinese names follow the language's usual order instead of byte order. Pick an order with the sort menu: by name, recently used, most used or recently added. The choice is remembered per browser. Rows that tie keep a fixed order. The gateway also returns employees in name order, so nothing reshuffles after a restart.
+
+**Search.** The search box on Team Skills and My Skills matches the name, the description, the tags and (on My Skills) the employee's name. Every word you type has to match somewhere.
+
+**Who uses a skill.** On My Skills, *Who uses it* in a row's menu lists every employee that has the skill, whether it is switched on for each, how many times the system activated it for that employee and when it last did. The count comes from `skill_activate` events, which are written when the evolution loop decides an employee needs a skill for a conversation. A skill's text is part of every prompt anyway; that is not counted. When the usage records cannot be read the page says so and shows 0.
+
+**Switching a skill off for one employee.** A skill switched off for an employee is no longer put into that employee's prompts, no longer listed by `skill_list`, its office scripts cannot be run for that employee, automations cannot run it for that employee and it cannot be pinned into a workflow. Other employees are not affected. Company-wide and department skills can only be switched off per employee; a company-wide row in the all-employees view has *Switch off for every staffer*. The switches live in `<home>/skill_state/<agent_id>.json`, outside the employee's own folder, so the employee cannot turn its own switches back on. If that file exists but cannot be read, the employee loads **no** skills until it is repaired or deleted, and the page shows a red notice. Names are matched ignoring case. Switching only narrows what an employee loads; it does not hide the skill's files from an employee that can read its own folder, and it does not stop the skill being graduated or shared from that folder. If the switch was saved but the employees could not be reloaded, the request fails with "saved, but reloading failed, try again" instead of reporting success.
+
+**Removing an employee's own skill.** *Remove* takes a skill out of the employee's own `SKILLS/` folder and keeps it under `<home>/skill_archive/<agent_id>/`. The employee's Skills settings list removed skills with a *Restore* button; restoring refuses to overwrite a skill that has the same files again. Both refuse to move files through a link: if the `SKILLS/` folder or any folder on the way is a symbolic link, nothing is moved. When a restore fails halfway, the files already moved go back into the archive.
+
+**Who may do what.** Viewers of an employee see its skills, switches and removed skills. The employee's Owner or an admin changes them; permissions are read again from the account database on every call, and a request naming several employees is refused as a whole if one of them is out of reach (the permission check is all-or-nothing; the writes themselves are per employee, and each item's result is reported). Search on the Market tab and the Leaderboard also show an employee's own skills only to callers who may view that employee (behaviour change). Admins can select several rows and switch them off or on, or remove them, in one go. Sharing a skill to the team and adopting a team skill now also need Owner of that employee (behaviour change). Every change writes an audit event: `skill_switched_off`, `skill_switched_on`, `skill_removed`, `skill_restored`.
+
+**Security verdicts** recorded at install time are kept per layer and owner. Two employees' skills with the same name no longer share one verdict. Verdicts recorded before this change carried only a name; they are not shown any more and the skill reads *Not scanned* until it is installed again.
+
+The employee edit page's **Skills** tab has the same list for one employee, under *This staffer's skills*.
 
 ---
 
