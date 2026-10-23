@@ -2,7 +2,7 @@
 
 Unreleased Enterprise dashboard and read-only API.
 
-In the Enterprise edition, an active Manager or Admin can read conversations for an AI employee directly bound at Operator or Owner to an active person below them in the reporting tree (up to eight levels). Admin alone grants no access to this view. A forced password change, reassignment, suspension or removed binding takes effect on the next request; permissions are checked again before returning content. Ordinary history, export, download and WebChat resume permissions do not change.
+In the Enterprise edition, an active Manager or Admin can read conversations for an AI employee directly bound at Operator or Owner to an active person below them in the reporting tree (up to eight levels). Admin alone grants no access to this view. A forced password change, reassignment, suspension or removed binding takes effect on the next request; permissions are checked again before returning content. Manager oversight does not widen ordinary history, export, download or WebChat resume permissions. The separate direct-binding privacy change is described below.
 
 | Conversation | Returned content |
 |---|---|
@@ -68,3 +68,15 @@ Every successful get requires a durable chained `team_history_viewed` event, wit
 Counts describe the returned parts after message selection/truncation; numbering still comes from the whole visible window. A boot-time audit error fences team history without stopping the gateway. Recovery must record a fresh window; if the database cannot persist its reset marker, a process latch keeps the view closed until that repair succeeds. Masking admission is bounded to eight requests and a three-second wait, with one actual worker.
 
 See [Calling AI staff](62-calling-ai-staff.md) and [Security defense](05-security-defense.md).
+
+## Direct Viewer and Operator bindings (unreleased behavior change)
+
+Directly bound Viewers and Operators can continue chatting and calling AI staff. Their conversation history is now scoped: their own signed-in WebChat stays full text, other accounts’ WebChats are hidden, and external customer conversations open in a separate read-only masked view. Direct Owners and Admins retain full access. Unknown and internal session origins are excluded from this conversation view; task runs retain their existing task audience.
+
+The restriction covers history lists, transcripts, session-run inspectors, conversation search and CSV/XLSX conversation exports. External titles use a generic label. Routing identifiers and export references do not expose platform IDs such as phone-bearing WhatsApp IDs. Search matches external text after masking. Existing export downloads recollect current visible content; an old raw export cannot survive a privilege downgrade. NER is optional: an absent model means regex-only masking with a notice; a partially installed or failing model refuses external content. Masking cannot guarantee removal of every name or address.
+
+Attachment browsing requires a host-stamped own-WebChat owner or the existing explicit task/review audience. External and other accounts’ attachment names and bytes are unavailable through the shared archive. Legacy archives without trustworthy ownership are hidden from restricted readers. KB documents, task audiences and computer workspaces keep their own permissions. A model mentioning a path does not grant ownership.
+
+`[people] bound_history_privacy = true` is the default, including when the value is missing or malformed. Admins can explicitly set it to `false` in the advanced configuration editor for migration; this restores the previous broad direct-binding history behavior. It does not enable manager oversight or change the independent `manager_team_history` window. Re-enable it after checking bindings and notifying staff. Own-WebChat text may contain copied third-party data; intentional copies and same-OS/Bash access are outside this read-time boundary. No stored source conversation is rewritten.
+
+Restricted projection scans fail explicitly beyond 20,000 visible user/assistant messages or 8 MiB per request. A stale or restarted list cursor requires refresh. Opaque identifiers are routing names, not grants: each request rechecks live bindings and stored origin.

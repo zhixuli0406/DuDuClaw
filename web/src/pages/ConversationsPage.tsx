@@ -111,7 +111,7 @@ export function ConversationsPage() {
       .list(scoped ? { agent_id: scoped, limit: FETCH_LIMIT } : { limit: FETCH_LIMIT })
       .then((res) => {
         if (cancelled) return;
-        setSessions((res?.sessions ?? []).filter((s) => isConversationSession(s.session_id)));
+        setSessions((res?.sessions ?? []).filter((s) => isConversationSession(s.session_id, s.channel)));
         setState('ready');
       })
       .catch(() => {
@@ -132,9 +132,9 @@ export function ConversationsPage() {
     const needle = query.trim().toLowerCase();
     if (!needle) return sessions;
     return sessions.filter((s) => {
-      const channel = sessionChannel(s.session_id);
+      const channel = sessionChannel(s.session_id, s.channel);
       const haystack = [
-        s.title || untitled,
+        (s.read_only ? intl.formatMessage({id:'boundHistory.label'}) : s.title) || untitled,
         agentLabel(s.agent_id),
         s.agent_id,
         channel?.label ?? '',
@@ -316,8 +316,8 @@ export function ConversationsPage() {
             }
           >
             {visible.map((s) => {
-              const channel = sessionChannel(s.session_id);
-              const title = s.title || untitled;
+              const channel = sessionChannel(s.session_id, s.channel);
+              const title = (s.read_only ? intl.formatMessage({id:'boundHistory.label'}) : s.title) || untitled;
               const owner = agentLabel(s.agent_id);
               return (
                 <ListGridRow

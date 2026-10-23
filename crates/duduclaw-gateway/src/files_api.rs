@@ -579,6 +579,8 @@ mod tests {
         index.insert(
             "1_a.docx".to_string(),
             crate::artifacts::FileProvenance {
+                saved_task_archive:false,
+                owner_user_id:None,
                 origin: crate::artifacts::ArtifactOrigin::Declared,
                 task_id: Some("task-1".into()),
                 round: Some(2),

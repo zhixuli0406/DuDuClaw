@@ -8717,5 +8717,15 @@
   "teamHistory.view": "会話を見る",
   "teamHistory.settings.detection": "AI検出をインストール",
   "teamHistory.image": "添付画像",
-  "teamHistory.category.NAME": "氏名"
+  "teamHistory.category.NAME": "氏名",
+  "boundHistory.title": "外部の会話（読み取り専用）",
+  "boundHistory.label": "外部の会話",
+  "boundHistory.description": "顧客の会話はマスクされます。この AI 社員と話すには新しい会話を始めてください。",
+  "boundHistory.regexOnly": "NER が未導入のためルールによるマスクのみです。氏名や住所が表示される場合があります。",
+  "boundHistory.loading": "履歴を読み込んでいます…",
+  "boundHistory.error": "履歴を取得できません。更新して再試行してください。",
+  "boundHistory.refresh": "更新",
+  "boundHistory.new": "新しい会話",
+  "boundHistory.staff": "AI 社員",
+  "boundHistory.customer": "顧客"
 }

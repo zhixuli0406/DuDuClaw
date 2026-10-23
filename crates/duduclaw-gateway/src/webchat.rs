@@ -1195,7 +1195,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     let attach_base = crate::channel_reply::resolve_attachment_base(
                                         state.ctx.as_ref(), Some(effective_agent_id),
                                     ).await;
-                                    let refs = save_webchat_attachments(&attach_base, &attachments).await;
+                                    let refs = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(auth_user.clone(),save_webchat_attachments(&attach_base, &attachments)).await;
                                     if !refs.is_empty() {
                                         if !full_content.trim().is_empty() {
                                             full_content.push_str("\n\n");
@@ -1713,7 +1713,7 @@ async fn save_webchat_attachments(
         } else {
             att.filename.clone()
         };
-        match crate::media::save_attachment_in_base(base_dir, &data, &filename).await {
+        match crate::media::save_webchat_attachment_in_base(base_dir, &data, &filename).await {
             Ok(path) => {
                 let mime = att
                     .mime

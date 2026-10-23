@@ -453,7 +453,7 @@ impl MethodHandler {
             // conversations.
             "chat.sessions.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_chat_sessions_list(params).await
+                self.handle_chat_sessions_list(params, ctx).await
             }
             // Gated inside the handler by the session's owning agent (Viewer) —
             // the agent id is resolved from the session; an unknown session id

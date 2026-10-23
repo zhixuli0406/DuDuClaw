@@ -251,3 +251,5 @@ IPv4 アドレス、担当者の鍵とデバイスの指紋、終了日時、接
 
 ターミナルでは `duduclaw credentials status`（スクリプト用に `--json`）で同じ状態を
 確認できます。詳細は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置く未リリース)。
+
+直接バインドの履歴プライバシー：`[people] bound_history_privacy = true` が既定で、欠落・不正値でも制限を維持します。移行時に Admin が詳細エディターで明示的に `false` を指定すると、従来の Viewer／Operator の広い履歴アクセスを復元できます。Owner／Admin とチャット・呼び出し権限は維持します。検索・エクスポート・添付・NER の制限は機能 68 を参照。

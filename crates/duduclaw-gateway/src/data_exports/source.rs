@@ -139,7 +139,15 @@ pub fn collect(
         rows: Vec::new(),
     };
     let mut bytes = 0;
-    super::authorize(home, original, request)?;
+    let initial_live=super::authorize(home, original, request)?;
+    let initial_history_mode=if request.dataset==Dataset::Conversations {
+        if let Some(agent)=request.agent_id.as_deref() {
+            Some(crate::history_privacy::mode(home,&initial_live,agent)?)
+        } else { None }
+    } else { None };
+    if initial_history_mode==Some(crate::history_privacy::Mode::Filtered) {
+        return super::conversation_privacy::collect(home,original,request,checkpoint);
+    }
     match request.dataset {
         Dataset::Tasks => {
             table.headers = vec![
@@ -412,6 +420,12 @@ pub fn collect(
             &mut bytes,
             &mut checkpoint,
         )?,
+    }
+    if request.dataset==Dataset::Conversations {
+        let live=fresh(home,original)?;
+        if let Some(agent)=request.agent_id.as_deref() {
+            if crate::history_privacy::mode(home,&live,agent)?!=crate::history_privacy::Mode::Full {return Err("EXPORT_PERMISSION_DENIED".into());}
+        } else if !live.is_admin() { return Err("EXPORT_PERMISSION_DENIED".into()); }
     }
     Ok(table)
 }

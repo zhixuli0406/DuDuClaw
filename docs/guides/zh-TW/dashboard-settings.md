@@ -243,3 +243,5 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 
 終端機用 `duduclaw credentials status`（腳本可加 `--json`）看同樣的狀態。細節見
 [安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)。
+
+直接綁定歷史隱私：`[people] bound_history_privacy = true` 預設開啟，缺值或格式錯誤也維持限制。管理員可在進階編輯器明確設 `false` 過渡，恢復先前 Viewer／Operator 的廣泛歷史讀取。Owner／Admin 及聊天／呼叫權限不變；搜尋、匯出、附件與 NER 限制見功能 68。

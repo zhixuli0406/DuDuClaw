@@ -280,6 +280,11 @@ fn binding_and_admin_role_are_refreshed_and_unknown_usage_stays_unknown() {
     let dir = fixture();
     seed_conversations(dir.path(), 1);
     let (db, ctx) = user(dir.path(), "viewer@test.invalid", UserRole::Manager);
+    // Live revocation of a reader's own history needs a real host origin;
+    // a legacy/unknown fixture correctly has no restricted-reader access.
+    let c=rusqlite::Connection::open(dir.path().join("sessions.db")).unwrap();
+    c.execute_batch("ALTER TABLE sessions ADD COLUMN origin_kind TEXT;ALTER TABLE sessions ADD COLUMN owner_user_id TEXT;ALTER TABLE sessions ADD COLUMN title TEXT;ALTER TABLE sessions ADD COLUMN last_active TEXT;ALTER TABLE sessions ADD COLUMN archived_at TEXT;ALTER TABLE session_messages ADD COLUMN tokens INTEGER DEFAULT 0;").unwrap();
+    c.execute("UPDATE sessions SET origin_kind='webchat_user',owner_user_id=?1,last_active='2026-10-10T02:00:00Z'",[&ctx.user_id]).unwrap();
     let req = request(Dataset::Conversations, ExportFormat::Csv);
     let id = build_now(dir.path(), &ctx, &req);
     db.unbind_agent(&ctx.user_id, "sales").unwrap();
@@ -686,4 +691,29 @@ fn wiki_large_files_and_cancellation_are_checked_before_unbounded_loading() {
         .unwrap(),
         "EXPORT_CANCELLED"
     );
+}
+
+#[test]
+fn bound_conversation_exports_scope_mask_and_recollect_on_privilege_downgrade() {
+    let dir=fixture();
+    let (db,user)=user(dir.path(),"bound-export@test.invalid",UserRole::Employee);
+    std::fs::write(dir.path().join("config.toml"),"[people]\nbound_history_privacy=true").unwrap();
+    let conn=rusqlite::Connection::open(dir.path().join("sessions.db")).unwrap();
+    conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT); CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,timestamp TEXT,tokens INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
+    for (sid,kind,owner) in [("mine","webchat_user",user.user_id.as_str()),("theirs","webchat_user","stranger"),("whatsapp:+886912345678","channel","")] {
+        conn.execute("INSERT INTO sessions VALUES (?1,'sales',?2,?3,'PRIVATE TITLE','2026-10-10T02:00:00Z',NULL)",params![sid,kind,owner]).unwrap();
+        conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES (?1,'user','phone 0912-345-678 email a@example.com','2026-10-10T02:00:00Z')",[sid]).unwrap();
+    }
+    let req=request(Dataset::Conversations,ExportFormat::Csv);
+    let table=source::collect(dir.path(),&user,&req,||Ok(())).unwrap();
+    assert_eq!(table.rows.len(),2);
+    let own=table.rows.iter().find(|r|matches!(&r.cells[1],Cell::Text(s) if s=="mine")).unwrap();
+    assert!(matches!(&own.cells[5],Cell::Text(s) if s.contains("0912-345-678")));
+    let external=table.rows.iter().find(|r|r.id!=own.id).unwrap();
+    let cells=format!("{:?}",external.cells);
+    assert!(!cells.contains("886912345678")); assert!(!cells.contains("a@example.com")); assert!(!cells.contains("0912-345-678"));
+    db.bind_agent(&user.user_id,"sales",AccessLevel::Owner).unwrap();
+    let old=build_now(dir.path(),&user,&req);
+    db.bind_agent(&user.user_id,"sales",AccessLevel::Viewer).unwrap();
+    assert!(download(dir.path(),&user,&old).is_err());
 }
