@@ -21,6 +21,7 @@ fn enterprise_surfaces_are_listed() {
         "users.offboard",
         "users.subordinates",
         "users.my_team",
+        "users.my_history_views",
         "users.audit_log",
         // 部門
         "departments.list",

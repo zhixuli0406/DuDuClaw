@@ -9,6 +9,34 @@ struct Fx {
     employee: String,
     external: String,
 }
+
+#[tokio::test]
+async fn receipt_rpc_is_self_only_even_for_admin_and_survives_the_setting_being_off() {
+    let f = fixture().await;
+    payload(f.handler.handle("users.team_history.get", json!({"session_id":"report"}), &f.manager).await);
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    std::fs::write(f.home.path().join("config.toml"), "[people]\nmanager_team_history=false").unwrap();
+    let p = payload(f.handler.handle("users.my_history_views", json!({}), &employee).await);
+    assert_eq!(p["views"].as_array().unwrap().len(), 1);
+    assert_eq!(p["views"][0]["viewer_display_name"], "主管");
+    assert_eq!(p["views"][0]["type"], "webchat");
+    let row=p["views"][0].as_object().unwrap();
+    assert_eq!(row.len(),4);
+    for key in ["details","viewer","report","session","messages","masked","agent_id"] {assert!(!row.contains_key(key));}
+    assert!(payload(f.handler.handle("users.my_history_views",json!({}),&f.admin).await)["views"].as_array().unwrap().is_empty());
+    assert_eq!(denied(f.handler.handle("users.my_history_views",json!({"user_id":f.employee}),&f.admin).await)["code"],"invalid_params");
+}
+
+#[tokio::test]
+async fn receipt_rpc_rechecks_a_suspended_account_and_never_hides_a_read_error() {
+    let f=fixture().await;
+    let employee=f.db.live_user_context(&f.employee).unwrap().unwrap();
+    std::fs::write(f.home.path().join("security_audit.jsonl"),"bad json\n").unwrap();
+    assert_eq!(denied(f.handler.handle("users.my_history_views",json!({}),&employee).await)["code"],"read_error");
+    f.db.set_user_status(&f.employee,duduclaw_auth::UserStatus::Suspended).unwrap();
+    let response=f.handler.handle("users.my_history_views",json!({}),&employee).await;
+    assert!(matches!(response,WsFrame::Response{ok:false,..}));
+}
 fn payload(f: WsFrame) -> Value {
     match f {
         WsFrame::Response {

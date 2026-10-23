@@ -2333,6 +2333,14 @@ export interface TeamMember {
   agents: TeamAgent[];
 }
 
+/** Metadata-only receipts for the authenticated account's own WebChat. */
+export interface MyHistoryView {
+  viewer_display_name: string | null;
+  agent_display_name: string | null;
+  timestamp: string;
+  type: 'webchat';
+}
+
 export interface MyTeam {
   /** null = the activation window could not be read safely. */
   history_enabled?: boolean | null;
@@ -8438,6 +8446,7 @@ export const api = {
     /** 我的團隊: everyone below the caller (manager+, Enterprise only) and the
      *  AI employees the caller may call through each of them. */
     myTeam: () => client.call('users.my_team') as Promise<MyTeam>,
+    myHistoryViews: (before?: string) => client.call('users.my_history_views', { before, limit: 50 }) as Promise<{ views: MyHistoryView[]; next_before: string | null }>,
     teamHistory: {
       list: (params: { agent_id: string; report_user_id?: string; class?: TeamHistoryClass; before?: string; limit?: number }) =>
         client.call('users.team_history.list', params) as Promise<TeamHistoryList>,
