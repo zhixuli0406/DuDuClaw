@@ -682,7 +682,7 @@ mod tests {
             let err = OdooConnectorPool::merge_credentials(&global, Some(&over), dec)
                 .await
                 .unwrap_err();
-            assert!(err.contains("url"), "{bad}: {err}");
+            assert!(err.contains("Odoo 網址"), "{bad}: {err}");
         }
     }
 
@@ -760,7 +760,7 @@ mod tests {
         )
         .await;
         let err = pool.get_or_connect("alpha", dec).await.err().expect("must refuse");
-        assert!(err.contains("url"), "{err}");
+        assert!(err.contains("Odoo 網址"), "{err}");
     }
 
     #[test]
