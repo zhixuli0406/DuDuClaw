@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+mod team_history_rpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -414,7 +415,10 @@ impl MethodHandler {
         ctx: &UserContext,
         conn: crate::power_local::RpcConnInfo,
     ) -> WsFrame {
-        self.dispatch(method, params, ctx, conn).await
+        // Keep the shared dispatcher off the caller's async state. At -O0
+        // its ~21 KiB future is otherwise copied through each outer poll
+        // frame and repeated calls can exhaust a default worker stack.
+        Box::pin(self.dispatch(method, params, ctx, conn)).await
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).

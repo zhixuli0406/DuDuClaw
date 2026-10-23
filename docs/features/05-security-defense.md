@@ -1,5 +1,7 @@
 # Security Defense
 
+Unreleased Enterprise [team-history API](68-manager-team-history.md): live reporting-line checks are independent of ordinary agent access; external transcripts require read-time masking and every disclosure requires a durable chained audit. A disabled setting, uncertain origin, installed-model failure or audit failure cannot return transcript content. Regex-only operation explicitly reports `ner: false` and can leave names/addresses visible. Direct host/database access remains outside this product boundary.
+
 > Four live guards, where each one runs, and what none of them covers.
 
 ---
