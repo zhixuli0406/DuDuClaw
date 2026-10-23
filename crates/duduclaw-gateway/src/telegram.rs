@@ -1226,6 +1226,22 @@ async fn process_telegram_message(
         });
     });
 
+    // Thinking display: one editable status message ("💭 思考中… N 秒",
+    // then "💭 思考了 N 秒" + an expandable summary for senders allowed to
+    // see it). What this sender may see is decided by the reply pipeline.
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "telegram",
+        msg.chat.chat_type.as_deref() != Some("private"),
+        crate::trigger_route::texts::lang_for(&ctx.home_dir),
+        Some(Arc::new(crate::thinking::channel_surfaces::TelegramStatus {
+            http: client.clone(),
+            api_base: api_base.clone(),
+            chat_id,
+            thread_id,
+        })),
+    );
+    let on_progress = thinking.wrap(on_progress);
+
     // Typing indicator while the reply is generated (RAII —
     // stops on drop, including panic/early-continue paths).
     let typing_guard = crate::channel_typing::telegram_typing(
@@ -1371,7 +1387,7 @@ async fn process_telegram_message(
         _ => None,
     };
 
-    let (reply, guarded) = crate::approval::scope_trusted_reply(target, async {
+    let (reply, guarded) = thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some((ref called_agent, via_trigger)) = called {
             // Called by `@` (or the one message a tapped employee was
             // waiting for): this message only, in that employee's own
@@ -1432,7 +1448,7 @@ async fn process_telegram_message(
                 SharedRoute::Guide(msg) => (msg, None),
             }
         }
-    })
+    }))
     .await;
     drop(typing_guard);
 
@@ -1458,6 +1474,7 @@ async fn process_telegram_message(
             http: client.clone(),
         };
         if crate::channel_reply::guard_lost(guarded.as_ref()).await {
+            thinking.abandon().await;
             return;
         }
         crate::channel_reply::deliver_documents_for_reply_guarded(
@@ -1481,6 +1498,7 @@ async fn process_telegram_message(
     // even on the silent-by-design (blocked/muted) empty-reply path.
     if reply.trim().is_empty() {
         warn!(chat_id, "Telegram: reply is empty — skipping send");
+        thinking.abandon().await;
         if let Some(mid) = progress_msg_cleanup.lock().await.take() {
             let del_body = json!({ "chat_id": chat_id, "message_id": mid });
             let _ = client
@@ -1491,6 +1509,9 @@ async fn process_telegram_message(
         }
         return;
     }
+
+    // The thinking status becomes "思考了 N 秒" (+ summary) above the answer.
+    let _ = thinking.finish().await;
 
     // Non-empty reply — remove the interim progress/task-board
     // message now; the final reply below supersedes it.

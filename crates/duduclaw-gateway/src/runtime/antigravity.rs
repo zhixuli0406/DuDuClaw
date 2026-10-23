@@ -151,6 +151,15 @@ fn parse_stream_output_keyed(raw: &str, key: Option<&str>) -> Result<ParsedStrea
     parse_stream_output_inner(raw, key).map_err(|e| setup::redact_key(&e, key))
 }
 
+/// Debug-log the name of a step type this parser does not map (capped,
+/// names only).
+fn log_unmapped_step_type(step_type: Option<&str>) {
+    tracing::debug!(
+        step_type = %duduclaw_core::truncate_chars(step_type.unwrap_or("<missing>"), 40),
+        "agy step_update with an unmapped step_type (not reported as thinking)"
+    );
+}
+
 fn parse_stream_output_inner(raw: &str, key: Option<&str>) -> Result<ParsedStream, String> {
     let mut result: Option<Value> = None;
     let mut tools = std::collections::BTreeMap::<u64, super::NativeToolEvent>::new();
@@ -166,7 +175,12 @@ fn parse_stream_output_inner(raw: &str, key: Option<&str>) -> Result<ParsedStrea
                 let Some(step) = event.get("step_update") else {
                     continue;
                 };
-                if step.get("step_type").and_then(Value::as_str) != Some("tool") {
+                let step_type = step.get("step_type").and_then(Value::as_str);
+                if step_type != Some("tool") {
+                    // Thinking display: agy's non-tool step vocabulary is not
+                    // known yet — record the type name only (never content)
+                    // so it can be mapped once observed.
+                    log_unmapped_step_type(step_type);
                     continue;
                 }
                 let Some(index) = step.get("step_index").and_then(Value::as_u64) else {
@@ -1088,6 +1102,21 @@ mod tests {
         assert_eq!(events[0].tool_name, "run_command");
         assert!(!events[0].success);
         assert!(events[0].input_text.as_deref().unwrap().contains("pwd"));
+    }
+
+    /// Thinking display: a non-tool step (vocabulary not yet mapped) is only
+    /// debug-logged by name — no tool event, no thinking event, no degrade.
+    #[test]
+    fn unmapped_step_types_are_skipped_not_reported() {
+        let raw = concat!(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_index\":1,\"step_type\":\"planner_response\",\"state\":\"DONE\",\"thinking\":\"secret plan\"}}\n",
+            "{\"event\":\"step_update\",\"step_update\":{\"step_index\":2,\"state\":\"DONE\"}}\n",
+            "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"OK\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_tokens\":0}}}\n"
+        );
+        let parsed = parse_stream_output(raw).unwrap();
+        assert_eq!(parsed.content, "OK");
+        assert!(parsed.tools.is_empty());
+        assert!(parsed.degraded.is_none());
     }
 
     // ── 2026-09-28 review: the strict parser had no degradation path ─────────

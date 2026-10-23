@@ -45,8 +45,11 @@ impl Recorder {
         if self.open.is_some() {
             self.end(None, None);
         }
-        let id = format!("t{}", self.next_block);
+        // Inside a turn the id comes from the turn's counter, so a retry or
+        // a second runtime call never reuses an earlier block's id.
+        let n = super::next_block_number().unwrap_or(self.next_block);
         self.next_block += 1;
+        let id = format!("t{n}");
         let ev = ThinkingEvent {
             started_at: Some(super::now_ms()),
             ..self.event(&id, ThinkingPhase::Start, kind)
@@ -89,6 +92,20 @@ impl Recorder {
         });
     }
 
+    /// Close the open block as `kind` — a block opened before its text was
+    /// known (e.g. `Summary`) that ended with none is really `Omitted`.
+    pub fn end_as(&mut self, kind: ThinkingKind, full_text: Option<&str>, tokens: Option<u64>) {
+        if let Some((_, open_kind)) = self.open.as_mut() {
+            *open_kind = kind;
+        }
+        self.end(full_text, tokens);
+    }
+
+    /// Is a block open right now?
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
     /// A whole block known only after the fact (non-streaming runtimes).
     pub fn oneshot(&mut self, kind: ThinkingKind, text: Option<&str>, tokens: Option<u64>) {
         self.start(kind);
@@ -112,6 +129,14 @@ impl Recorder {
         self.open
             .clone()
             .unwrap_or_else(|| ("t0".to_string(), kind))
+    }
+}
+
+impl Drop for Recorder {
+    /// A producer that stops mid-block (an error return, a dropped future)
+    /// still closes it, so the viewer's timer never keeps running.
+    fn drop(&mut self) {
+        self.end(None, None);
     }
 }
 

@@ -259,14 +259,21 @@ impl OpenAiCompatRuntime {
             .map_err(|e| format!("Failed to parse response: {e}"))?;
 
         let first_choice = parsed.choices.first();
+        let raw_content = first_choice
+            .and_then(|c| c.message.as_ref())
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+        // Thinking display (no-op outside a reply turn): the reasoning field,
+        // else a leading inline `<think>` block, as one raw block.
+        report_plain_reasoning(
+            first_choice
+                .and_then(|c| c.message.as_ref())
+                .and_then(|m| m.reasoning_content.as_deref()),
+            &raw_content,
+        );
         // Open models often inline their reasoning as a leading
         // `<think>…</think>` block — never part of the answer.
-        let content = duduclaw_core::think_tags::strip_leading_think_block(
-            &first_choice
-                .and_then(|c| c.message.as_ref())
-                .and_then(|m| m.content.clone())
-                .unwrap_or_default(),
-        );
+        let content = duduclaw_core::think_tags::strip_leading_think_block(&raw_content);
 
         // Empty content is an ERROR, never a success. Reasoning models (Grok,
         // DeepSeek R1) can burn the whole `max_tokens` budget on
@@ -371,7 +378,16 @@ impl OpenAiCompatRuntime {
         // Tap accumulates usage across every loop iteration into one billable
         // total (the loop re-sends the prefix each round — summing per-call
         // usage is the true billed cost fed back into RuntimeResponse).
-        let provider = UsageTap::new(base_provider);
+        // Thinking display: a read-only tap reports `reasoning_content` /
+        // `reasoning` / a leading `<think>` block as raw thinking; it streams
+        // only when this reply turn's viewer reads thinking text live, and
+        // never changes what the loop gets back.
+        let provider = UsageTap::new(crate::thinking::llm_tap::ReasoningTap::new(
+            base_provider,
+            "openai_compat",
+            crate::thinking::ThinkingKind::Raw,
+            true,
+        ));
 
         let model_id = compose_model_id(provider_name, &context.model);
         let mut req = build_tool_chat_request(context, prompt, model_id);
@@ -575,6 +591,75 @@ fn classify_final_text(resp: &ChatResponse, model: &str) -> Result<String, Strin
         ));
     }
     Ok(text)
+}
+
+/// Thinking display for the plain chat/completions path: the reasoning field
+/// if the server split it out, else a leading inline `<think>` block, as one
+/// raw block (a no-op outside a reply turn).
+fn report_plain_reasoning(reasoning_content: Option<&str>, raw_content: &str) {
+    let text = reasoning_content
+        .filter(|r| !r.trim().is_empty())
+        .or_else(|| crate::thinking::think_tags::leading_think_text(raw_content));
+    if let Some(text) = text {
+        crate::thinking::Recorder::new("openai_compat").oneshot(
+            crate::thinking::ThinkingKind::Raw,
+            Some(text),
+            None,
+        );
+    }
+}
+
+/// Thinking display for the SSE path: reasoning deltas
+/// (`delta.reasoning_content` / `delta.reasoning`) and the inner text of a
+/// leading `<think>` block in `delta.content`, as one raw block.
+struct SseReasoning {
+    rec: crate::thinking::Recorder,
+    splitter: crate::thinking::think_tags::ThinkSplitter,
+}
+
+impl SseReasoning {
+    fn new() -> Self {
+        Self::with_recorder(crate::thinking::Recorder::new("openai_compat"))
+    }
+
+    fn with_recorder(rec: crate::thinking::Recorder) -> Self {
+        Self {
+            rec,
+            splitter: crate::thinking::think_tags::ThinkSplitter::new(),
+        }
+    }
+
+    fn observe(&mut self, chunk: &serde_json::Value) {
+        let field = chunk
+            .pointer("/choices/0/delta/reasoning_content")
+            .or_else(|| chunk.pointer("/choices/0/delta/reasoning"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let inline = chunk
+            .pointer("/choices/0/delta/content")
+            .and_then(|v| v.as_str())
+            .map(|c| self.splitter.push(c))
+            .unwrap_or_default();
+        self.delta(&field);
+        self.delta(&inline);
+    }
+
+    fn delta(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.rec.is_open() {
+            self.rec.start(crate::thinking::ThinkingKind::Raw);
+        }
+        self.rec.delta(text);
+    }
+
+    fn finish(&mut self) {
+        let tail = self.splitter.finish();
+        self.delta(&tail);
+        self.rec.end(None, None);
+    }
 }
 
 /// A [`ChatProvider`] decorator that accumulates [`NormalizedUsage`] across
@@ -855,6 +940,9 @@ impl OpenAiCompatRuntime {
         let mut stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut content = String::new();
+        // Thinking display: `reasoning_content` / `reasoning` deltas and a
+        // leading inline `<think>` block, live (no-op outside a reply turn).
+        let mut reasoning = SseReasoning::new();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut done = false;
@@ -882,6 +970,7 @@ impl OpenAiCompatRuntime {
                         break;
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        reasoning.observe(&chunk);
                         if let Some(delta) = chunk
                             .pointer("/choices/0/delta/content")
                             .and_then(|v| v.as_str())
@@ -910,6 +999,7 @@ impl OpenAiCompatRuntime {
             if let Some(json_str) = line.strip_prefix("data: ") {
                 if json_str != "[DONE]" {
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        reasoning.observe(&chunk);
                         if let Some(delta) = chunk
                             .pointer("/choices/0/delta/content")
                             .and_then(|v| v.as_str())
@@ -931,6 +1021,7 @@ impl OpenAiCompatRuntime {
             }
         }
 
+        reasoning.finish();
         Ok(super::RuntimeResponse {
             content: sse_final_content(&content, &context.model)?,
             input_tokens,
@@ -1115,6 +1206,33 @@ mod tests {
         };
         let err = classify_final_text(&no_text, "deepseek-chat").unwrap_err();
         assert!(err.contains("Empty response"), "got: {err}");
+    }
+
+    #[test]
+    fn sse_reasoning_reads_both_fields_and_a_leading_think_block() {
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let g = std::sync::Arc::clone(&got);
+        let rec = crate::thinking::Recorder::with_emitter(
+            "openai_compat",
+            std::sync::Arc::new(move |ev| g.lock().unwrap().push(ev)),
+        );
+        let mut r = SseReasoning::with_recorder(rec);
+        for chunk in [
+            serde_json::json!({"choices":[{"delta":{"reasoning_content":"先"}}]}),
+            serde_json::json!({"choices":[{"delta":{"reasoning":"想"}}]}),
+            serde_json::json!({"choices":[{"delta":{"content":"<think>內"}}]}),
+            serde_json::json!({"choices":[{"delta":{"content":"嵌</think>答案"}}]}),
+            serde_json::json!({"choices":[{"delta":{"content":"<think>not reasoning</think>"}}]}),
+        ] {
+            r.observe(&chunk);
+        }
+        r.finish();
+        let got = got.lock().unwrap();
+        let text: String = got.iter().filter_map(|e| e.text.clone()).collect();
+        assert_eq!(text, "先想內嵌");
+        assert!(got.iter().all(|e| e.kind == crate::thinking::ThinkingKind::Raw));
+        assert_eq!(got.iter().filter(|e| e.phase.as_str() == "start").count(), 1);
+        assert_eq!(got.last().unwrap().phase.as_str(), "end");
     }
 
     #[test]

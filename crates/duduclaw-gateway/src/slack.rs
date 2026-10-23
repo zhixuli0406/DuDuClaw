@@ -902,7 +902,21 @@ async fn handle_event(
         drop(status_guard);
         return;
     }
-    let guarded = crate::approval::scope_trusted_reply(target, async {
+    // Thinking display: one editable status message in the thread (a
+    // context block with the summary for senders allowed to see it).
+    let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
+        "slack",
+        !is_dm,
+        crate::trigger_route::texts::lang_for(&ctx.home_dir),
+        Some(Arc::new(crate::thinking::channel_surfaces::SlackStatus {
+            http: http.clone(),
+            token: bot_token.to_string(),
+            channel: channel.to_string(),
+            thread_ts: Some(thread_ts.clone().unwrap_or_else(|| ts.to_string())),
+        })),
+    );
+    let on_progress = thinking.wrap(on_progress);
+    let guarded = thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some(agent) = agent_name {
             build_guarded_reply_for_agent(
                 &input_text,
@@ -917,7 +931,7 @@ async fn handle_event(
             build_guarded_reply_with_session(&input_text, ctx, &session_id, user, Some(on_progress))
                 .await
         }
-    })
+    }))
     .await;
     drop(status_guard);
 
@@ -930,6 +944,7 @@ async fn handle_event(
             http: http.clone(),
         };
         if !guarded.still_valid().await {
+            thinking.abandon().await;
             return;
         }
         crate::channel_reply::deliver_documents_for_reply_guarded(
@@ -955,8 +970,11 @@ async fn handle_event(
     // Guard: don't send empty replies
     if reply.trim().is_empty() {
         warn!(channel, "Slack: reply is empty — skipping send");
+        thinking.abandon().await;
         return;
     }
+    // The thinking status becomes "思考了 N 秒" (+ summary) above the answer.
+    let _ = thinking.finish().await;
 
     // Mention the sender in group channels so they get notified
     let mention = if !is_dm { Some(user) } else { None };

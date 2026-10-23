@@ -1160,7 +1160,7 @@ impl MethodHandler {
                 {
                     if old_name != new_name && !old_name.is_empty() {
                         for key in [crate::agent_files::FileKey::Soul, crate::agent_files::FileKey::Identity] {
-                            match self.sync_renamed_profile_file(&agent_id, key, old_name, new_name, caller).await {
+                            match self.sync_renamed_profile_file(&agent_id, key.clone(), old_name, new_name, caller).await {
                                 Ok(true) => soul_sync_changes.push(format!(
                                     "{} self-name synced \"{old_name}\" -> \"{new_name}\"",
                                     key.file_name()
@@ -1254,7 +1254,7 @@ impl MethodHandler {
         caller: Option<&UserContext>,
     ) -> Result<bool, String> {
         use crate::agent_files::writer::{Baseline, Commit, CommitMeta, commit};
-        let path = crate::agent_files::file_path(&self.home_dir, agent_id, key)?;
+        let path = crate::agent_files::file_path(&self.home_dir, agent_id, &key)?;
         if !path.exists() {
             return Ok(false);
         }

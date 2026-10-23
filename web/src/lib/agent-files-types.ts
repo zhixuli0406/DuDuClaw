@@ -1,12 +1,18 @@
 /**
  * Wire types for the `agent_files.*` RPCs (people editing an AI employee's
- * profile files: SOUL / IDENTITY / INSTRUCTIONS / CONTRACT, with agent.toml
- * shown read-only) and the shared save envelope that `contract.update` now
- * returns too. The gateway module is `crates/duduclaw-gateway/src/agent_files/`.
+ * profile files: SOUL / IDENTITY / INSTRUCTIONS / CONTRACT and the
+ * employee's own skill files, with agent.toml shown read-only) and the
+ * shared save envelope that `contract.update` now returns too. The gateway module is `crates/duduclaw-gateway/src/agent_files/`.
  */
 
-/** Which file. `agent_toml` is read-only here (edit it on the edit page). */
-export type AgentFileKey = 'soul' | 'identity' | 'instructions' | 'contract' | 'agent_toml';
+/** The fixed files. `agent_toml` is read-only here (edit it on the edit page). */
+export type AgentFileFixedKey = 'soul' | 'identity' | 'instructions' | 'contract' | 'agent_toml';
+
+/** One of the employee's own skill files: `skill:<path inside SKILLS/>`. */
+export type AgentFileSkillKey = `skill:${string}`;
+
+/** Which file. */
+export type AgentFileKey = AgentFileFixedKey | AgentFileSkillKey;
 
 /** How the file compares with the last approved version (SOUL / INSTRUCTIONS only). */
 export type AgentFileDrift = 'intact' | 'drifted' | 'none';
@@ -29,7 +35,11 @@ export type AgentFileReasonCategory =
   | 'format'
   | 'analysis_unavailable'
   /** The file had been changed outside the dashboard; checked as a whole. */
-  | 'outside_change';
+  | 'outside_change'
+  /** A skill asks the employee to run something dangerous. */
+  | 'risky_action'
+  /** A skill already held suspicious lines this change did not touch. */
+  | 'existing_risk';
 
 export interface AgentFileReason {
   category: AgentFileReasonCategory;
@@ -105,12 +115,19 @@ export interface AgentFileListEntry {
   last_change: AgentFileLastChange | null;
   drift: AgentFileDrift;
   pending_approval_id: string | null;
+  /** Skill files only: the skill's name (folder or file name). */
+  skill_name?: string;
+  /** Skill files only: `SKILLS/<path>`. */
+  path?: string;
+  /** Skill files only: the file could not be read (too large, not text). */
+  unreadable?: boolean;
 }
 
 export interface AgentFileListResponse {
   agent_id: string;
+  /** The five fixed files first, then the employee's skill files. */
   files: AgentFileListEntry[];
-  /** Byte limits per file key. */
+  /** Byte limits per fixed file key, plus `skill` for every skill file. */
   limits: Record<string, number>;
 }
 
