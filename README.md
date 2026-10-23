@@ -280,7 +280,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 
 ## Documentation
 
-- [Read-only team conversations](docs/features/68-manager-team-history.md): unreleased Enterprise dashboard and API for report WebChat and masked external conversations, with staff notices, an activation boundary and mandatory audit.
+- [Read-only team conversations](docs/features/68-manager-team-history.md): unreleased Enterprise dashboard and API for report WebChat and masked external conversations, with staff notices, an activation boundary and mandatory audit. Direct Viewer/Operator history now keeps own WebChat full, masks external conversations and hides other accounts; Owner/Admin remain full. This behavior change has an explicit migration setting.
 - Self-service: **Who viewed my conversations** shows only your own team-history receipts ([guide](docs/features/68-manager-team-history.md)).
 - [ARCHITECTURE.md](ARCHITECTURE.md): full system architecture
 - [docs/README.md](docs/README.md): public docs index (architecture / RFC / ADR / specs / guides)

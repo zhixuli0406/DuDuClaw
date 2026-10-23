@@ -364,3 +364,14 @@ pub(crate) fn keyed_digest(home: &Path, channel: &str, id: &str) -> String {
     let hex = hex::encode(mac.finalize().into_bytes());
     duduclaw_core::truncate_bytes(&hex, 16).to_string()
 }
+
+/// Domain-separated key for private history routing names. It is never a
+/// credential or an authorization decision, and never leaves the gateway.
+pub(crate) fn private_view_key(home: &Path, viewer: &str) -> Result<[u8; 32], String> {
+    use hmac::{Hmac, Mac};
+    let key = audit_key(home).ok_or("history unavailable")?;
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).map_err(|_| "history unavailable")?;
+    mac.update(b"private_history_view_v1\0");
+    mac.update(viewer.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}

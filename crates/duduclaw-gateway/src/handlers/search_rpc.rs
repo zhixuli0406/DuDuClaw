@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::history_privacy::{self as privacy, Mode};
 
 impl MethodHandler {
     // ── I-5: cross-source content search (⌘K backend) ────────
@@ -60,14 +61,14 @@ impl MethodHandler {
 
         let mut hits: Vec<crate::search_index::SearchHit> = Vec::new();
 
+        let live=match self.bound_history_live(ctx) { Ok(c)=>c, Err(e)=>return WsFrame::error_response("",&e) };
+        let mode=if let Some(a)=agent_id { match privacy::mode(&self.home_dir,&live,a) { Ok(m)=>m,Err(e)=>return WsFrame::error_response("",&e) } } else if live.is_admin() {Mode::Full} else {return WsFrame::error_response("","agent_id required");};
         if wants("conversations") {
-            let session_db = self.home_dir.join("sessions.db");
-            hits.extend(crate::search_index::search_conversations(
-                &session_db,
-                agent_id,
-                query,
-                per_source_limit,
-            ));
+            if mode==Mode::Filtered {
+                match self.bound_conversation_search(&live,agent_id.unwrap(),query,per_source_limit).await {Ok(found)=>hits.extend(found),Err(e)=>return WsFrame::error_response("",&e)}
+            } else {
+                hits.extend(crate::search_index::search_conversations(&self.home_dir.join("sessions.db"),agent_id,query,per_source_limit));
+            }
         }
 
         if wants("artifacts") {
@@ -172,6 +173,8 @@ impl MethodHandler {
             }
         }
 
+        let still_allowed=if let Some(a)=agent_id { self.bound_history_recheck(&live,a,mode).is_ok() } else {self.bound_history_live(&live).is_ok_and(|c|c.is_admin())};
+        if !still_allowed { return WsFrame::error_response("","history authority changed; refresh"); }
         let (hits, truncated) = crate::search_index::merge_and_cap(hits);
         let rows: Vec<Value> = hits
             .iter()
