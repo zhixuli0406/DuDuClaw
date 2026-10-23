@@ -274,6 +274,7 @@ impl ApprovalBroker {
             binding: Some(binding),
             answer: None,
             invalidated_reason: None,
+            on_behalf_of: raising_principal(),
         })
     }
 

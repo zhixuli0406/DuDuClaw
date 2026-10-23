@@ -300,6 +300,20 @@ pub struct ApprovalRecord {
     pub answer: Option<Value>,
     #[serde(default)]
     pub invalidated_reason: Option<String>,
+    /// The person the run that raised this request works for
+    /// (`crate::on_behalf_of`, wire form), stamped by the broker from the
+    /// host, never from the request. Cards show it as 「由 ○○ 交辦」.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+}
+
+/// Who the run raising a request works for: the gateway's task-local
+/// (a run inside the gateway process) or, in the `duduclaw mcp-server`
+/// process, the `DUDUCLAW_ON_BEHALF_OF` the gateway set when it spawned the
+/// employee. Never a value from the request itself.
+pub(crate) fn raising_principal() -> Option<String> {
+    crate::on_behalf_of::ON_BEHALF_OF.try_with(Clone::clone)
+        .unwrap_or_else(|_| duduclaw_core::host_principal().map(|p| p.to_string()))
 }
 
 impl ApprovalRecord {
