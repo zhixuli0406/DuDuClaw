@@ -18,7 +18,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Why a URL was refused, as text an operator can act on.
-const MSG_PRIVATE: &str = "這個 Odoo 網址指向內網位址，預設不允許。只有管理員能在「整合 → Odoo」開啟「允許連到內網的 Odoo」（config.toml [odoo] allow_private_network）";
+const MSG_PRIVATE: &str = "這個 Odoo 網址指向內網位址，預設不允許。請管理員在本頁開啟「允許連到內網的 Odoo」後再試";
 const MSG_UNSAFE: &str = "Odoo 網址不被允許：必須是 HTTPS（只有 localhost／127.0.0.1 可用 http://），不能帶帳號密碼，也不能指向本機、保留位址或雲端 metadata 位址";
 
 /// Names that are never allowed in any mode (compared without a trailing dot).
@@ -75,6 +75,8 @@ pub fn check_url(url: &str, allow_private: bool) -> Result<(), String> {
         // Plain HTTP is only for strict localhost (handled above) or, with
         // the admin switch on, an internal host.
         "http" if allow_private => {}
+        // Plain HTTP to an internal address is also a "switch" matter.
+        "http" if is_private_literal(host) => return Err(MSG_PRIVATE.into()),
         "http" => return Err(MSG_UNSAFE.into()),
         _ => return Err(MSG_UNSAFE.into()),
     }
@@ -100,6 +102,13 @@ pub fn check_url(url: &str, allow_private: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A private (non-public, not always-denied) IP literal host.
+fn is_private_literal(host: &str) -> bool {
+    let raw = host.trim_start_matches('[').trim_end_matches(']');
+    raw.parse::<IpAddr>()
+        .is_ok_and(|ip| !is_always_denied_ip(ip) && is_private_ip(ip))
 }
 
 /// Boolean form of [`check_url`] with the admin switch **off** (the strict
@@ -302,6 +311,15 @@ mod tests {
         for url in ["https://10.0.0.5/", "https://192.168.1.9:8443", "https://172.16.0.1"] {
             let err = check_url(url, false).unwrap_err();
             assert!(err.contains("允許連到內網的 Odoo"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn refusal_text_has_no_internal_key_and_covers_plain_http() {
+        for url in ["https://10.0.0.5/", "http://192.168.1.9:8069"] {
+            let err = check_url(url, false).unwrap_err();
+            assert!(err.contains("允許連到內網的 Odoo"), "{url}: {err}");
+            assert!(!err.contains("allow_private_network") && !err.contains("config.toml"), "{err}");
         }
     }
 

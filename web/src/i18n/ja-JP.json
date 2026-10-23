@@ -1709,6 +1709,7 @@
   "odoo.feature.hr.desc": "従業員、出勤、休暇管理",
   "odoo.sync": "同期設定",
   "odoo.access": "データアクセス範囲",
+  "odoo.loadFailed": "保存済みの Odoo 設定を読み込めませんでした。既存の設定を上書きしないよう、保存を無効にしています。ページを再読み込みしてください。",
   "odoo.allowPrivateNetwork": "社内ネットワーク上の Odoo への接続を許可",
   "odoo.allowPrivateNetworkHint": "既定ではオフです。Odoo サーバーが社内のアドレス（例：192.168.x.x、10.x.x.x）にある場合のみオンにしてください。変更できるのは管理者のみです。オン・オフに関わらず、ローカルマシンとクラウドのメタデータアドレスは常に拒否されます。",
   "odoo.unblockModels": "ブロック解除するモデル（全体）",

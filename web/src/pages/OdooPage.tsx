@@ -116,14 +116,19 @@ export function OdooPage() {
   const [schemaFilter, setSchemaFilter] = useState('');
   const [pickedModels, setPickedModels] = useState<Set<string>>(new Set());
 
+  // The stored settings load on their own; the live connection status (which
+  // really dials Odoo and can take a minute when the server is unreachable)
+  // loads in parallel into its own state and never gates the form.
+  const [configLoaded, setConfigLoaded] = useState(false);
+
   const loadConfig = useCallback(async () => {
     setLoading(true);
+    void api.odoo
+      .status()
+      .then((res) => setStatus(res))
+      .catch((e) => console.warn('[api]', e));
     try {
-      const [statusRes, configRes] = await Promise.all([
-        api.odoo.status(),
-        api.odoo.config(),
-      ]);
-      setStatus(statusRes);
+      const configRes = await api.odoo.config();
       if (configRes) {
         setUrl(configRes.url ?? '');
         setDb(configRes.db ?? '');
@@ -150,11 +155,15 @@ export function OdooPage() {
           hr: configRes.features_hr ?? false,
         });
       }
+      // Not configured yet (null) is a valid, loaded state: the form starts blank.
+      setConfigLoaded(true);
     } catch (e) {
-      // Silently handle feature-gate errors (not licensed); show other errors
+      // Silently handle feature-gate errors (not licensed); show other errors.
+      // Saving stays blocked: a form showing defaults must never overwrite the
+      // stored settings.
       const msg = e instanceof Error ? e.message : '';
       if (!msg.includes('Feature requires upgrade')) {
-        setError(t('common.error'));
+        setError(t('odoo.loadFailed'));
       }
     } finally {
       setLoading(false);
@@ -183,6 +192,7 @@ export function OdooPage() {
    * doesn't turn into noise on every unrelated edit.
    */
   const requestSave = () => {
+    if (!configLoaded) return;
     const before = new Set(parseUnblockModels(unblockModelsBaseline));
     const added = parseUnblockModels(globalUnblockModels).filter((m) => !before.has(m));
     if (added.length > 0) {
@@ -343,7 +353,7 @@ export function OdooPage() {
               {t('common.saved')}
             </span>
           )}
-          <Button variant="brand" size="sm" onClick={requestSave} disabled={saving || !url.trim()}>
+          <Button variant="brand" size="sm" onClick={requestSave} disabled={saving || !url.trim() || !configLoaded}>
             {saving ? <Loader2 className="animate-spin" /> : <Save />}
             {saving ? t('common.saving') : t('common.save')}
           </Button>
@@ -365,7 +375,12 @@ export function OdooPage() {
             label={t('odoo.allowPrivateNetwork')}
             description={t('odoo.allowPrivateNetworkHint')}
             checked={allowPrivateNetwork}
-            onChange={setAllowPrivateNetwork}
+            onChange={(v) => {
+              setAllowPrivateNetwork(v);
+              // An earlier refusal was about the old setting.
+              setTestResult(null);
+              setError(null);
+            }}
           />
           {authMethod === 'api_key' ? (
             <RowSecret

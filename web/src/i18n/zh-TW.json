@@ -1709,6 +1709,7 @@
   "odoo.feature.hr.desc": "員工、出勤、休假管理",
   "odoo.sync": "同步設定",
   "odoo.access": "資料存取範圍",
+  "odoo.loadFailed": "讀不到已儲存的 Odoo 設定，為了不蓋掉原本的設定，已暫時關閉儲存。請重新整理頁面再試。",
   "odoo.allowPrivateNetwork": "允許連到內網的 Odoo",
   "odoo.allowPrivateNetworkHint": "預設關閉。只有 Odoo 伺服器放在公司內網位址（例如 192.168.x.x、10.x.x.x）時才需要開啟，且只有管理員能改。不論開或關，本機位址與雲端 metadata 位址一律不允許。",
   "odoo.unblockModels": "解鎖的資料模型（全域）",
