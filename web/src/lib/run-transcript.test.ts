@@ -12,6 +12,16 @@ import {
 const NOW = Date.parse('2026-07-11T09:00:00Z');
 
 describe('cardsForEvents', () => {
+  it('renders only bounded same-origin signed browser context as a button', () => {
+    const ts = '2026-07-11T08:00:00Z';
+    const href = '/computer/alice?l=payload.tag';
+    expect(cardsForEvents([{ kind:'computer_watch', ts, preview:href }])).toEqual([
+      { type:'computer_watch',ts,watch:{ agentId:'alice',href } },
+    ]);
+    for (const preview of ['https://evil.example/computer/alice?l=a.b','/computer/alice','/computer/alice?l=a.b&jwt=x']) {
+      expect(cardsForEvents([{ kind:'computer_watch',ts,preview }])).toEqual([]);
+    }
+  });
   it('maps text and tool_use events to prose / tool cards in order', () => {
     const events: RunEvent[] = [
       { kind: 'text', role: 'user', ts: '2026-07-11T08:00:00Z', preview: '幫我查 SOP' },

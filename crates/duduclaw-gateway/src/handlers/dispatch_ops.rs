@@ -98,6 +98,7 @@ impl MethodHandler {
             "computer_profiles.status" | "computer_profiles.reset" => {
                 self.handle_computer_profiles(method, params, ctx).await
             }
+            "computer_sessions.open_link" => self.handle_computer_open_link(params, ctx).await,
             "computer_sessions.status"
             | "computer_sessions.view"
             | "computer_sessions.takeover"

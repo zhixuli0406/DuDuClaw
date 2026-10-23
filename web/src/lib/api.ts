@@ -1149,6 +1149,7 @@ export interface PlanStepUpdateParams {
 // ── Activity Feed types ─────────────────────────────────────
 
 export type ActivityType =
+  | 'computer_session.started'
   | 'task_created'
   | 'task_completed'
   | 'task_blocked'

@@ -207,6 +207,7 @@ mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
+mod computer_watch_links_rpc;
 mod config_raw_rpc;
 mod agents_update_v168;
 mod agent_authority;

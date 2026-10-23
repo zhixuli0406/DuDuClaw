@@ -203,7 +203,7 @@ fn record(
 /// Polls share a bounded per-person budget across employees. A stop is
 /// never throttled by previous viewing; the common image cache separately
 /// limits actual captures to one per five seconds for all viewers.
-fn take_view_budget(home: &Path, viewer: &str) -> bool {
+pub(super) fn take_view_budget(home: &Path, viewer: &str) -> bool {
     use std::{
         collections::{HashMap, VecDeque},
         sync::{Mutex, OnceLock},
