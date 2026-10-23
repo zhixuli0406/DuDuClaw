@@ -185,9 +185,13 @@ async fn profile_output(
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("stderr unavailable"))?;
-        let write = async {
+        let write = async move {
             stdin.write_all(input).await?;
-            stdin.shutdown().await
+            stdin.shutdown().await?;
+            // Unix pipe shutdown is a no-op in Tokio. Close this handle
+            // before joining the output readers: the importer waits for EOF.
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
         };
         let read = async {
             let mut data = Vec::new();
