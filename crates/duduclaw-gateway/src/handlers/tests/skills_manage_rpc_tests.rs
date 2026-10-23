@@ -230,3 +230,52 @@ async fn share_and_adopt_need_owner() {
     let e = err(&f.call("skills.adopt", json!({ "skill_name": "docx", "target_agent_id": "b1" }), &f.owner_a).await);
     assert!(e.contains("permission"), "{e}");
 }
+
+#[tokio::test]
+async fn search_and_leaderboard_only_show_visible_employees() {
+    let f = fixture().await;
+    for a in ["a1", "b1"] {
+        std::fs::write(
+            f.home.join(format!("agents/{a}/SKILLS/secret-{a}.md")),
+            format!("---\nname: secret-{a}\nestimated_minutes_saved: 5\n---\nzebra-marker for {a}\n"),
+        )
+        .unwrap();
+    }
+    f.h.registry.write().await.scan().await.unwrap();
+    let authors = |hits: Vec<Value>| -> Vec<String> {
+        let mut v: Vec<String> = hits.iter().map(|h| h["author"].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(authors(f.h.local_skill_hits(&f.viewer_a, "zebra-marker").await), vec!["a1"]);
+    assert_eq!(authors(f.h.local_skill_hits(&f.admin, "zebra-marker").await), vec!["a1", "b1"]);
+
+    let owners = |p: Value| -> Vec<String> {
+        p["leaderboard"].as_array().unwrap().iter().filter_map(|r| r["owner"].as_str()).map(String::from).collect()
+    };
+    let lb = ok(&f.call("skills.leaderboard", json!({}), &f.viewer_a).await);
+    assert_eq!(owners(lb), vec!["a1"]);
+    let lb = ok(&f.call("skills.leaderboard", json!({}), &f.admin).await);
+    assert_eq!(owners(lb), vec!["a1", "b1"]);
+}
+
+/// A switch that was written but could not be reloaded is reported as an
+/// error, never as success.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_reload_is_an_error_not_a_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture().await;
+    let agents = f.home.join("agents");
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let frame = f
+        .call("skills.set_enabled", json!({ "items": [item("a1", "pdf")], "enabled": false }), &f.admin)
+        .await;
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = err(&frame);
+    assert_eq!(e, crate::handlers::skills_manage_rpc::RELOAD_FAILED);
+    // The switch itself was saved; a retry reloads it.
+    assert!(duduclaw_agent::skill_state::read_disabled(&f.home, "a1").is_disabled("pdf"));
+    ok(&f.call("skills.set_enabled", json!({ "items": [item("a1", "pdf")], "enabled": false }), &f.admin).await);
+    assert!(!f.loaded("a1").await.contains(&"pdf".to_string()));
+}

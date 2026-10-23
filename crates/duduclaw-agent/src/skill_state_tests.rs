@@ -79,3 +79,24 @@ fn skill_names_are_validated() {
     let home = TempDir::new().unwrap();
     assert!(set_disabled(home.path(), "alice", &["a/b".to_string()], true).is_err());
 }
+
+#[test]
+fn switches_ignore_ascii_case() {
+    let home = TempDir::new().unwrap();
+    set_disabled(home.path(), "alice", &["quote".to_string()], true).unwrap();
+    let state = set_disabled(home.path(), "alice", &["QUOTE".to_string()], true).unwrap();
+    assert_eq!(state.names(), vec!["quote"], "no duplicate entry");
+    assert!(state.is_disabled("Quote"));
+    let state = set_disabled(home.path(), "alice", &["Quote".to_string()], false).unwrap();
+    assert!(!state.is_disabled("quote"));
+}
+
+#[test]
+fn write_errors_do_not_reveal_paths() {
+    let home = TempDir::new().unwrap();
+    let path = state_path(home.path(), "alice").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "bad").unwrap();
+    let err = set_disabled(home.path(), "alice", &["a".to_string()], true).unwrap_err();
+    assert!(!err.contains(&home.path().display().to_string()), "{err}");
+}

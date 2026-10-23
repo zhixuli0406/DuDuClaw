@@ -637,7 +637,13 @@ impl MethodHandler {
     /// global + per-agent skills, reads `estimated_minutes_saved` from metadata.
     /// Only skills carrying an estimate (i.e. approved via WP8's flow) appear —
     /// drafts have no estimate and are naturally excluded (no fabricated data).
-    pub(crate) async fn handle_skills_leaderboard(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_skills_leaderboard(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // B8: an employee's own skills are ranked only for callers who may
+        // view that employee (read live); company-wide skills stay visible.
+        let fresh = match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
+            Ok(f) => f,
+            Err(_) => return WsFrame::error_response("", "permission denied"),
+        };
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let loc = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
 
@@ -649,6 +655,7 @@ impl MethodHandler {
                 .flatten()
                 .filter(|e| e.path().is_dir())
                 .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+                .filter(|(agent, _)| fresh.has_agent_access(agent, AccessLevel::Viewer))
                 .collect();
             // B8: stable order regardless of `read_dir`.
             agent_dirs.sort();

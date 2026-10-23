@@ -8394,5 +8394,6 @@
   "skills.manage.archived": "削除したスキル",
   "skills.manage.restore": "元に戻す",
   "skills.manage.openAgent": "社員のスキル設定",
-  "skills.manage.editFiles": "スキルファイルを編集"
+  "skills.manage.editFiles": "スキルファイルを編集",
+  "skills.usage.truncated": "利用記録が多すぎるため、最近使われたものだけを数えています。長く使われていないスキルは 0 と表示されることがあります。"
 }

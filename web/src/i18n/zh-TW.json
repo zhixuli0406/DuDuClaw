@@ -8394,5 +8394,6 @@
   "skills.manage.archived": "已移除的技能",
   "skills.manage.restore": "復原",
   "skills.manage.openAgent": "員工的技能設定",
-  "skills.manage.editFiles": "編輯技能檔"
+  "skills.manage.editFiles": "編輯技能檔",
+  "skills.usage.truncated": "使用紀錄太多，只計算最近用過的部分，較久沒用的技能次數可能顯示為 0。"
 }

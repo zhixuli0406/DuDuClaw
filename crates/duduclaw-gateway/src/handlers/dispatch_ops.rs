@@ -186,7 +186,7 @@ impl MethodHandler {
             }
 
             // ── Shared Skills (open to all authenticated) ───
-            "skills.leaderboard" => self.handle_skills_leaderboard(params).await,
+            "skills.leaderboard" => self.handle_skills_leaderboard(params, ctx).await,
             "skills.shared" => self.handle_skills_shared_list().await,
             // B8: sharing copies from an employee and adopting writes into
             // one — both need Owner of that employee (or admin), read live.

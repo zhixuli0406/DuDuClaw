@@ -350,7 +350,7 @@ impl MethodHandler {
             "skills.remove" => self.handle_skills_remove(params, ctx).await,
             "skills.archived" => self.handle_skills_archived(params, ctx).await,
             "skills.restore" => self.handle_skills_restore(params, ctx).await,
-            "skills.search" => self.handle_skills_search(params).await,
+            "skills.search" => self.handle_skills_search(params, ctx).await,
             "skills.content" => {
                 // HS4: skill content is read from a specific agent's registry —
                 // scope to an agent the caller is bound to.

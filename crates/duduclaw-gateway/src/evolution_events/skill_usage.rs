@@ -6,9 +6,10 @@
 //! skill library means *activations*, not "the skill text was in a prompt"
 //! (every loaded skill is in every prompt).
 //!
-//! One grouped query over the indexed `event_type` column, capped at
-//! [`MAX_USAGE_ROWS`] groups, so the cost does not grow with how many events
-//! each pair has.
+//! One grouped query over the indexed `event_type` column. Its cost grows
+//! with the number of `skill_activate` rows; the result is capped at
+//! [`MAX_USAGE_ROWS`] pairs, most recently used first, and says when the cap
+//! cut pairs off.
 
 use std::collections::HashMap;
 
@@ -30,9 +31,16 @@ pub struct SkillUsage {
 /// `(agent_id, skill_id)` → usage.
 pub type SkillUsageMap = HashMap<(String, String), SkillUsage>;
 
+/// Usage per pair, and whether pairs beyond [`MAX_USAGE_ROWS`] were dropped.
+#[derive(Debug, Default)]
+pub struct SkillUsageSummary {
+    pub usage: SkillUsageMap,
+    pub truncated: bool,
+}
+
 impl AuditEventIndex {
     /// Group every indexed `skill_activate` event by employee and skill.
-    pub async fn skill_usage(&self) -> Result<SkillUsageMap, String> {
+    pub async fn skill_usage(&self) -> Result<SkillUsageSummary, String> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
@@ -40,11 +48,12 @@ impl AuditEventIndex {
                  FROM audit_index
                  WHERE event_type = 'skill_activate' AND skill_id IS NOT NULL
                  GROUP BY agent_id, skill_id
+                 ORDER BY MAX(timestamp) DESC, agent_id, skill_id
                  LIMIT ?1",
             )
             .map_err(|e| format!("prepare skill usage query: {e}"))?;
         let rows = stmt
-            .query_map(params![MAX_USAGE_ROWS], |r| {
+            .query_map(params![MAX_USAGE_ROWS + 1], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -54,14 +63,19 @@ impl AuditEventIndex {
             })
             .map_err(|e| format!("run skill usage query: {e}"))?;
         let mut out = SkillUsageMap::new();
+        let mut truncated = false;
         for row in rows {
             let (agent, skill, count, last) = row.map_err(|e| format!("read skill usage row: {e}"))?;
+            if out.len() as i64 >= MAX_USAGE_ROWS {
+                truncated = true;
+                break;
+            }
             out.insert(
                 (agent, skill),
                 SkillUsage { count: u64::try_from(count).unwrap_or(0), last_used_at: last },
             );
         }
-        Ok(out)
+        Ok(SkillUsageSummary { usage: out, truncated })
     }
 }
 
@@ -98,7 +112,9 @@ mod tests {
         std::fs::write(events.join("2026-10-03.jsonl"), body).unwrap();
         let idx = AuditEventIndex::open_with_events_dir(home.path(), &events).unwrap();
         idx.sync_from_files().await.unwrap();
-        let usage = idx.skill_usage().await.unwrap();
+        let summary = idx.skill_usage().await.unwrap();
+        assert!(!summary.truncated);
+        let usage = summary.usage;
         let alice = &usage[&("alice".to_string(), "pdf".to_string())];
         assert_eq!(alice.count, 2);
         assert_eq!(alice.last_used_at, "2026-10-03T00:00:00Z");

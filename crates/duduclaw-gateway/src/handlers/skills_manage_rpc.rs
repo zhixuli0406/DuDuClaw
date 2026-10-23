@@ -22,6 +22,9 @@ use duduclaw_security::audit::{AuditEvent, Severity};
 /// Upper bound on items in one bulk request.
 const MAX_BULK_ITEMS: usize = 200;
 
+/// The change was written but the running employees were not reloaded.
+pub(crate) const RELOAD_FAILED: &str = "已儲存，但重新載入失敗，請重試";
+
 /// One `(employee, skill)` target of a bulk request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillTarget {
@@ -93,14 +96,22 @@ impl MethodHandler {
     }
 
     /// Rescan the registry so prompts pick up the change, and tell open
-    /// dashboards to refetch.
-    async fn after_skill_change(&self, action: &str, agents: &[String]) {
-        {
+    /// dashboards to refetch. A failed rescan is an error for the caller: the
+    /// change is on disk but the running employees still use the old set, so
+    /// reporting success would show a switch that has not taken effect.
+    async fn after_skill_change(&self, action: &str, agents: &[String]) -> Result<(), String> {
+        let scanned = {
             let mut reg = self.registry.write().await;
-            if let Err(e) = reg.scan().await {
-                warn!("rescan after skill {action} failed: {e}");
-            }
-        }
+            reg.scan().await
+        };
+        self.notify_skill_change(action, agents).await;
+        scanned.map_err(|e| {
+            warn!("rescan after skill {action} failed: {e}");
+            RELOAD_FAILED.to_string()
+        })
+    }
+
+    async fn notify_skill_change(&self, action: &str, agents: &[String]) {
         for a in agents {
             crate::dashboard_feedback::emit(
                 &self.home_dir,
@@ -148,7 +159,7 @@ impl MethodHandler {
             }
         }
         if !changed.is_empty() {
-            self.after_skill_change(if enabled { "enabled" } else { "disabled" }, &changed).await;
+            self.after_skill_change(if enabled { "enabled" } else { "disabled" }, &changed).await?;
         }
         Ok(json!({ "results": results, "enabled": enabled }))
     }
@@ -192,7 +203,7 @@ impl MethodHandler {
             }
         }
         if !changed.is_empty() {
-            self.after_skill_change("removed", &changed).await;
+            self.after_skill_change("removed", &changed).await?;
         }
         Ok(json!({ "results": results }))
     }
@@ -256,7 +267,7 @@ impl MethodHandler {
             agent_id,
             json!({ "agent_id": agent_id, "skill": m.skill_name, "archive_id": archive_id, "user_id": fresh.user_id }),
         );
-        self.after_skill_change("restored", &agents).await;
+        self.after_skill_change("restored", &agents).await?;
         Ok(json!({ "agent_id": agent_id, "skill_name": m.skill_name, "restored": true }))
     }
 
@@ -264,14 +275,20 @@ impl MethodHandler {
     /// missing when the audit index cannot be read.
     pub(crate) async fn skill_usage_map(
         &self,
-    ) -> (crate::evolution_events::skill_usage::SkillUsageMap, Option<String>) {
+    ) -> (crate::evolution_events::skill_usage::SkillUsageSummary, Option<String>) {
         let idx = match self.audit_index().await {
             Ok(i) => i,
-            Err(e) => return (Default::default(), Some(e)),
+            Err(e) => {
+                warn!("skill usage: audit index unavailable: {e}");
+                return (Default::default(), Some("usage records unavailable".into()));
+            }
         };
         match idx.skill_usage().await {
             Ok(m) => (m, None),
-            Err(e) => (Default::default(), Some(e)),
+            Err(e) => {
+                warn!("skill usage query failed: {e}");
+                (Default::default(), Some("usage records unavailable".into()))
+            }
         }
     }
 }

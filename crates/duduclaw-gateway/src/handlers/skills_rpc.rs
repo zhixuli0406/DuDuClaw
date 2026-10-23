@@ -31,18 +31,17 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_skills_search(&self, params: Value) -> WsFrame {
-        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        if query.is_empty() {
-            return WsFrame::error_response("", "Missing 'query' parameter");
-        }
-
+    /// Installed skills matching `query` (name or content), only on the
+    /// employees `viewer` may view.
+    pub(crate) async fn local_skill_hits(&self, viewer: &UserContext, query: &str) -> Vec<Value> {
         let lower = query.to_lowercase();
         let reg = self.registry.read().await;
         let mut results = Vec::new();
-
-        // Search across all agents' installed skills
-        for agent in reg.list() {
+        for agent in reg
+            .list()
+            .into_iter()
+            .filter(|a| viewer.has_agent_access(&a.config.agent.name, AccessLevel::Viewer))
+        {
             for skill in &agent.skills {
                 let name_match = skill.name.to_lowercase().contains(&lower);
                 let content_match = skill.content.to_lowercase().contains(&lower);
@@ -58,6 +57,22 @@ impl MethodHandler {
                 }
             }
         }
+        results
+    }
+
+    pub(crate) async fn handle_skills_search(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        if query.is_empty() {
+            return WsFrame::error_response("", "Missing 'query' parameter");
+        }
+        // B8: installed skills are searched only on employees the caller may
+        // view (read live); admins see every employee.
+        let fresh = match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
+            Ok(f) => f,
+            Err(_) => return WsFrame::error_response("", "permission denied"),
+        };
+
+        let mut results = self.local_skill_hits(&fresh, query).await;
 
         // Search the skill market via the multi-hub aggregator — the same
         // HubRegistry the MCP `skill_search` tool uses, so the dashboard and

@@ -154,8 +154,9 @@ impl MethodHandler {
         let global_skills = AgentRegistry::load_skills(&global_dir).await;
         let global_diag = Self::skill_layer_diag("global", &global_dir, global_skills.len());
         let verdicts = self.load_skill_scan_verdicts();
-        let (usage, usage_error) = self.skill_usage_map().await;
-        let lc = ListCtx { verdicts: &verdicts, usage: &usage };
+        let (summary, usage_error) = self.skill_usage_map().await;
+        let usage_truncated = summary.truncated;
+        let lc = ListCtx { verdicts: &verdicts, usage: &summary.usage };
         let reg = self.registry.read().await;
 
         if let Some(id) = params.get("agent_id").and_then(|v| v.as_str()) {
@@ -176,6 +177,7 @@ impl MethodHandler {
                     "skill_state": state_json(&state),
                     "can_manage": fresh.has_agent_access(id, AccessLevel::Owner),
                     "usage_error": usage_error,
+                    "usage_truncated": usage_truncated,
                 }),
             );
         }
@@ -218,6 +220,7 @@ impl MethodHandler {
                 "agents": all_agents,
                 "scanned": scanned,
                 "usage_error": usage_error,
+                "usage_truncated": usage_truncated,
             }),
         )
     }

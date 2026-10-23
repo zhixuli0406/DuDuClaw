@@ -571,6 +571,8 @@ export interface SkillsListAll {
   scanned?: SkillScanPath[];
   /** Set when activation counts could not be read. */
   usage_error?: string | null;
+  /** True when the oldest-used pairs were cut off by the server's cap. */
+  usage_truncated?: boolean;
 }
 
 /** `skills.list {agent_id}`. */
@@ -581,6 +583,7 @@ export interface SkillsListOne {
   skill_state?: SkillStateStatus;
   can_manage?: boolean;
   usage_error?: string | null;
+  usage_truncated?: boolean;
 }
 
 export interface HeartbeatInfo {

@@ -80,9 +80,10 @@ interface Loaded {
   states: Record<string, SkillStateStatus>;
   canManage: Record<string, boolean>;
   usageError: string | null;
+  usageTruncated: boolean;
 }
 
-const EMPTY: Loaded = { rows: [], scanned: [], states: {}, canManage: {}, usageError: null };
+const EMPTY: Loaded = { rows: [], scanned: [], states: {}, canManage: {}, usageError: null, usageTruncated: false };
 
 async function fetchSkills(agent: string): Promise<Loaded> {
   if (agent === ALL_AGENTS) {
@@ -102,6 +103,7 @@ async function fetchSkills(agent: string): Promise<Loaded> {
       states,
       canManage,
       usageError: r?.usage_error ?? null,
+      usageTruncated: r?.usage_truncated === true,
     };
   }
   const r = await api.skills.list(agent);
@@ -111,6 +113,7 @@ async function fetchSkills(agent: string): Promise<Loaded> {
     states: r?.skill_state ? { [agent]: r.skill_state } : {},
     canManage: { [agent]: r?.can_manage === true },
     usageError: r?.usage_error ?? null,
+    usageTruncated: r?.usage_truncated === true,
   };
 }
 
@@ -296,6 +299,9 @@ export function MySkillsTab({ filter }: { filter: string }) {
         <SkillStateErrors states={data.states} nameOf={displayNameOf} />
         {data.usageError && (
           <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'skills.usage.unavailable' })}</p>
+        )}
+        {data.usageTruncated && (
+          <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'skills.usage.truncated' })}</p>
         )}
 
         {isAdmin && selectedRows.length > 0 && (

@@ -25,6 +25,56 @@ const MANIFEST: &str = "manifest.json";
 const MAX_DEPTH: usize = 8;
 /// Upper bound on archived entries listed per employee.
 pub const MAX_ARCHIVE_LISTED: usize = 500;
+/// Upper bound on directory entries walked while locating one skill.
+const MAX_SCANNED_ENTRIES: usize = 20_000;
+
+/// `path` must be a directory that is not itself a symbolic link.
+fn require_real_dir(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err("the skills folder is a link; refusing to move files through it".into()),
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err("the skills folder is not a folder".into()),
+        Err(e) => Err(format!("read the skills folder: {e}")),
+    }
+}
+
+/// Every existing directory between `root` and `rel` (exclusive of `rel`
+/// itself) must be a real directory, not a symbolic link, so a move can
+/// never be redirected outside the skills folder. Checked again right
+/// before each move.
+fn require_no_linked_parents(root: &Path, rel: &Path) -> Result<(), String> {
+    require_real_dir(root)?;
+    let mut cur = root.to_path_buf();
+    let parents: Vec<_> = rel.parent().map(|p| p.components().collect()).unwrap_or_default();
+    for comp in parents {
+        cur.push(comp.as_os_str());
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+                return Err(format!("'{}' is a link or not a folder; refusing to move files through it", rel.display()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read '{}': {e}", rel.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Create the missing directories above `rel` one level at a time, refusing
+/// links, so restoring never writes through a link an employee planted.
+fn create_parents(root: &Path, rel: &Path) -> Result<(), String> {
+    let mut cur = root.to_path_buf();
+    let parents: Vec<_> = rel.parent().map(|p| p.components().collect()).unwrap_or_default();
+    for comp in parents {
+        cur.push(comp.as_os_str());
+        match std::fs::create_dir(&cur) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create a folder for '{}': {e}", rel.display())),
+        }
+    }
+    require_no_linked_parents(root, rel)
+}
 
 /// What one archive holds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,11 +100,13 @@ pub fn agent_archive_dir(home: &Path, agent_id: &str) -> Result<PathBuf, String>
 /// called `name`. Empty when the employee's own layer has no such skill.
 pub fn locate(skills_dir: &Path, name: &str) -> Result<Vec<PathBuf>, String> {
     validate_skill_name(name)?;
-    let root = match std::fs::canonicalize(skills_dir) {
-        Ok(p) => p,
-        Err(_) => return Ok(Vec::new()),
-    };
+    match std::fs::symlink_metadata(skills_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        _ => require_real_dir(skills_dir)?,
+    }
+    let root = std::fs::canonicalize(skills_dir).map_err(|e| format!("read the skills folder: {e}"))?;
     let mut found: Vec<PathBuf> = Vec::new();
+    let mut seen_entries = 0usize;
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::from([(root.clone(), 0)]);
     while let Some((dir, depth)) = queue.pop_front() {
         if depth > MAX_DEPTH {
@@ -62,6 +114,10 @@ pub fn locate(skills_dir: &Path, name: &str) -> Result<Vec<PathBuf>, String> {
         }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
+            seen_entries += 1;
+            if seen_entries > MAX_SCANNED_ENTRIES {
+                return Err("the skills folder holds too many files to search".into());
+            }
             let file_name = entry.file_name();
             let Some(fname) = file_name.to_str() else { continue };
             if fname.starts_with('.') {
@@ -160,6 +216,7 @@ pub fn archive(
         return Err(format!("'{name}' is not one of this employee's own skills"));
     }
     for rel in &entries {
+        require_no_linked_parents(skills_dir, rel)?;
         let abs = skills_dir.join(rel);
         if abs.is_dir() && holds_nested_skill(&abs) {
             return Err(format!("'{name}' contains other skills; move them out first"));
@@ -167,16 +224,7 @@ pub fn archive(
     }
     let archive_id = new_archive_id();
     let dest = agent_archive_dir(home, agent_id)?.join(&archive_id);
-    std::fs::create_dir_all(&dest).map_err(|e| format!("create archive directory: {e}"))?;
-    let mut moved: Vec<String> = Vec::new();
-    for (i, rel) in entries.iter().enumerate() {
-        let target_name = format!("{i}-{}", flatten(rel));
-        if let Err(e) = std::fs::rename(skills_dir.join(rel), dest.join(&target_name)) {
-            rollback(skills_dir, &dest, &entries, &moved);
-            return Err(format!("move '{}' to the archive: {e}", rel.display()));
-        }
-        moved.push(target_name);
-    }
+    std::fs::create_dir_all(&dest).map_err(|e| format!("create archive folder: {e}"))?;
     let manifest = ArchiveManifest {
         archive_id,
         agent_id: agent_id.to_string(),
@@ -185,10 +233,26 @@ pub fn archive(
         archived_by: archived_by.to_string(),
         entries: entries.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
     };
+    // The manifest goes first: an interrupted move still leaves a listed
+    // archive instead of files nobody can find.
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
     if let Err(e) = std::fs::write(dest.join(MANIFEST), text) {
-        rollback(skills_dir, &dest, &entries, &moved);
+        let _ = std::fs::remove_dir_all(&dest);
         return Err(format!("write archive manifest: {e}"));
+    }
+    let mut moved: Vec<String> = Vec::new();
+    for (i, rel) in entries.iter().enumerate() {
+        let target_name = format!("{i}-{}", flatten(rel));
+        let moved_ok = require_no_linked_parents(skills_dir, rel)
+            .and_then(|()| {
+                std::fs::rename(skills_dir.join(rel), dest.join(&target_name))
+                    .map_err(|e| format!("move '{}' to the archive: {e}", rel.display()))
+            });
+        if let Err(e) = moved_ok {
+            rollback(skills_dir, &dest, &entries, &moved);
+            return Err(e);
+        }
+        moved.push(target_name);
     }
     Ok(manifest)
 }
@@ -261,24 +325,43 @@ pub fn restore(
         return Err("archive belongs to another employee".into());
     }
     let src = dir.join(archive_id);
+    match std::fs::symlink_metadata(skills_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(skills_dir).map_err(|e| format!("create the skills folder: {e}"))?;
+        }
+        _ => require_real_dir(skills_dir)?,
+    }
     let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (i, rel) in manifest.entries.iter().enumerate() {
         let rel_path = safe_relative(rel)?;
         let stored = src.join(format!("{i}-{}", flatten(&rel_path)));
-        let target = skills_dir.join(&rel_path);
-        if target.exists() {
+        if std::fs::symlink_metadata(&stored).is_err() {
+            return Err(format!("the archive is missing '{}'", rel_path.display()));
+        }
+        require_no_linked_parents(skills_dir, &rel_path)?;
+        if std::fs::symlink_metadata(skills_dir.join(&rel_path)).is_ok() {
             return Err(format!("'{}' already exists; rename or remove it first", rel_path.display()));
         }
-        pairs.push((stored, target));
+        pairs.push((stored, rel_path));
     }
-    if let Err(e) = std::fs::create_dir_all(skills_dir) {
-        return Err(format!("create skills directory: {e}"));
-    }
-    for (stored, target) in &pairs {
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create skill directory: {e}"))?;
+    let mut done: Vec<usize> = Vec::new();
+    for (i, (stored, rel)) in pairs.iter().enumerate() {
+        let target = skills_dir.join(rel);
+        let step = create_parents(skills_dir, rel).and_then(|()| {
+            if std::fs::symlink_metadata(&target).is_ok() {
+                return Err(format!("'{}' already exists; rename or remove it first", rel.display()));
+            }
+            std::fs::rename(stored, &target).map_err(|e| format!("move '{}' back: {e}", rel.display()))
+        });
+        if let Err(e) = step {
+            // Put back what was already restored so the archive stays whole.
+            for &j in done.iter().rev() {
+                let (s, r) = &pairs[j];
+                let _ = std::fs::rename(skills_dir.join(r), s);
+            }
+            return Err(e);
         }
-        std::fs::rename(stored, target).map_err(|e| format!("move skill back: {e}"))?;
+        done.push(i);
     }
     std::fs::remove_dir_all(&src).map_err(|e| format!("clean up archive: {e}"))?;
     Ok(manifest)

@@ -8394,5 +8394,6 @@
   "skills.manage.archived": "Removed skills",
   "skills.manage.restore": "Restore",
   "skills.manage.openAgent": "Staffer's skill settings",
-  "skills.manage.editFiles": "Edit skill files"
+  "skills.manage.editFiles": "Edit skill files",
+  "skills.usage.truncated": "There are too many usage records; only the most recently used are counted, so skills not used for a long time may show 0."
 }

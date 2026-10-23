@@ -63,10 +63,13 @@ impl DisabledSkills {
         Self::Names(BTreeSet::new())
     }
 
-    /// Whether `skill_name` must not be loaded for this employee.
+    /// Whether `skill_name` must not be loaded for this employee. Names are
+    /// compared ignoring ASCII case, like the loader's own de-duplication
+    /// (and a case-insensitive filesystem), so `Quote` cannot slip past a
+    /// switch stored as `quote`.
     pub fn is_disabled(&self, skill_name: &str) -> bool {
         match self {
-            Self::Names(set) => set.contains(skill_name),
+            Self::Names(set) => set.iter().any(|n| n.eq_ignore_ascii_case(skill_name)),
             Self::Unreadable(_) => true,
         }
     }
@@ -183,8 +186,7 @@ pub fn set_disabled(
             Ok(DisabledSkills::Names(set)) => set,
             Ok(DisabledSkills::Unreadable(e)) | Err(e) => {
                 return Ok(Err(format!(
-                    "the skill switch file for '{agent_id}' cannot be read ({e}); repair or delete {} first",
-                    path.display()
+                    "the skill switches of '{agent_id}' cannot be read ({e}); repair or delete the switch file first"
                 )));
             }
         };
@@ -205,9 +207,11 @@ fn apply(current: BTreeSet<String>, names: &[String], disabled: bool) -> BTreeSe
     let mut next = current;
     for n in names {
         if disabled {
-            next.insert(n.clone());
+            if !next.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                next.insert(n.clone());
+            }
         } else {
-            next.remove(n);
+            next.retain(|x| !x.eq_ignore_ascii_case(n));
         }
     }
     next

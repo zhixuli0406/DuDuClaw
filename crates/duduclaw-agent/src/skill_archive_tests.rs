@@ -91,3 +91,50 @@ fn unsafe_manifest_entries_are_refused() {
     assert!(safe_relative("").is_err());
     assert!(safe_relative("group/nested").is_ok());
 }
+
+#[cfg(unix)]
+#[test]
+fn restore_refuses_a_parent_swapped_for_a_link() {
+    let (home, skills) = setup();
+    write(&skills, "group/foo/SKILL.md", "x");
+    let m = archive(home.path(), "alice", &skills, "foo", "u").unwrap();
+    assert_eq!(m.entries, vec!["group/foo"]);
+    // The employee swaps the now-empty `group` for a link to somewhere else.
+    let outside = home.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::remove_dir_all(skills.join("group")).unwrap();
+    std::os::unix::fs::symlink(&outside, skills.join("group")).unwrap();
+    let err = restore(home.path(), "alice", &skills, &m.archive_id).unwrap_err();
+    assert!(err.contains("link"), "{err}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing lands outside");
+    assert_eq!(list(home.path(), "alice").unwrap().len(), 1, "the archive is kept");
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_and_restore_refuse_a_linked_skills_folder() {
+    let (home, skills) = setup();
+    write(&skills, "pdf.md", "x");
+    let m = archive(home.path(), "alice", &skills, "pdf", "u").unwrap();
+    let elsewhere = home.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    write(&elsewhere, "other.md", "x");
+    std::fs::remove_dir_all(&skills).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &skills).unwrap();
+    assert!(restore(home.path(), "alice", &skills, &m.archive_id).unwrap_err().contains("link"));
+    assert!(archive(home.path(), "alice", &skills, "other", "u").unwrap_err().contains("link"));
+    assert!(elsewhere.join("other.md").exists());
+    assert!(!elsewhere.join("pdf.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_refuses_a_skill_reached_through_a_linked_folder() {
+    let (home, skills) = setup();
+    write(&skills, "real/foo/SKILL.md", "x");
+    std::os::unix::fs::symlink(skills.join("real"), skills.join("alias")).unwrap();
+    // `foo` is found both directly and through `alias`; the linked path is refused.
+    let err = archive(home.path(), "alice", &skills, "foo", "u").unwrap_err();
+    assert!(err.contains("link"), "{err}");
+    assert!(skills.join("real/foo/SKILL.md").exists());
+}
