@@ -37,7 +37,7 @@ The bracketed line appears only when the right to assign comes from your reporti
 | The same account, for an employee bound at Viewer, the conversation's default employee or an employee opened to outside contacts | nobody: you may talk to them, and the bot says you have no permission to assign them tasks |
 | Anyone else (a LINE friend, a Telegram user, a website widget visitor) | nobody: the bot asks you to link your messaging account in the dashboard first (**Profile → Channel identities**), whatever name you typed, so the answer says nothing about which employees exist |
 
-A dashboard account that names an employee it may not reach at all gets the same refusal as a forbidden `@` call. Your rights are read live for every command, and checked again when the message an armed `/交辦 @name` was waiting for arrives: a binding or manager change takes effect immediately.
+A dashboard account that names an employee it may not reach at all gets the same refusal as a forbidden `@` call. On LINE and Telegram a refusal goes out at most once every 10 seconds per sender in a conversation; repeats inside that window get no answer. Your rights are read live for every command, and checked again when the message an armed `/交辦 @name` was waiting for arrives: a binding or manager change takes effect immediately.
 
 The gateway writes the task itself, with no AI model in between. The Personal edition has no other accounts: the owner (Admin) can use `/交辦` as usual.
 
