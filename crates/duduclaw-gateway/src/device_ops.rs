@@ -273,6 +273,8 @@ impl DeviceOps for SystemDeviceOps {
         let mut cmd = tokio::process::Command::new("tar");
         cmd.arg("-czf")
             .arg(dest_path)
+            // Browser sessions must reauthenticate after any restore.
+            .arg("--exclude=*/computer_profiles")
             .arg("-C")
             .arg(source_dir)
             .arg(".");

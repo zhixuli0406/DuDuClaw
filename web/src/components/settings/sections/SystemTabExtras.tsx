@@ -185,6 +185,13 @@ export function SandboxSection({ values, set }: { values: FlatValues; set: SetFn
           onChange={(v) => set('computer_use.image', v.trim())}
           placeholder={t('settings.computerUse.image.placeholder')}
         />
+        <RowSwitch label={t('browserLogin.enable')} description={t('browserLogin.enable.help')}
+          checked={vBool(values, 'computer_use.profiles.enabled')}
+          onChange={(v) => set('computer_use.profiles.enabled', v)} />
+        <RowNum label={t('browserLogin.maxMiB')} value={vNum(values, 'computer_use.profiles.max_bytes', 64 * MIB) / MIB}
+          min={1} max={128} onChange={(n) => set('computer_use.profiles.max_bytes', n * MIB)} />
+        <RowNum label={t('browserLogin.retentionDays')} value={vNum(values, 'computer_use.profiles.retention_days', 30)}
+          min={0} max={3650} onChange={(n) => set('computer_use.profiles.retention_days', n)} />
       </SettingsCard>
     </SettingsSection>
   );

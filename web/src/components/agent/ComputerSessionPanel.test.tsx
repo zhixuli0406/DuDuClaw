@@ -150,4 +150,35 @@ describe('ComputerSessionPanel', () => {
       expect(mockWsClient.call).toHaveBeenCalledWith('computer_sessions.stop', { agent_id: 'alice' }),
     );
   });
+
+  it('requires an explicit choice to preserve logins after an injection hold', async () => {
+    respond({
+      'computer_sessions.status': {
+        ...RUNNING, state: 'held', can_keep_login: true,
+        hold: { reason: 'injection_suspected', categories: ['instruction_override'], since: 1 },
+      },
+      'computer_sessions.stop': { ok: true, keep_login_honored: true },
+    });
+    renderPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Stop session/ }));
+    const keep = screen.getByRole('checkbox');
+    expect(keep).not.toBeChecked();
+    await userEvent.click(keep);
+    await userEvent.click(screen.getByRole('button', { name: 'End it' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('computer_sessions.stop', {
+      agent_id: 'alice', keep_login: true,
+    }));
+  });
+
+  it('keeps the held-session preservation choice hidden without control authority', async () => {
+    respond({ 'computer_sessions.status': {
+      ...RUNNING, state: 'held', can_keep_login: false,
+      hold: { reason: 'injection_suspected', categories: [], since: 1 },
+    } });
+    renderPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Stop session/ }));
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'End it' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('computer_sessions.stop', { agent_id: 'alice' }));
+  });
 });

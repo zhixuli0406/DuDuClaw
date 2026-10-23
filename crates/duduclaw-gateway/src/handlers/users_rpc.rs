@@ -1,8 +1,8 @@
 //! Split out of the pre-split `handlers.rs` (P12b). Pure movement.
 
+use super::users_org::{ManagerChange, org_error_frame, parse_manager_change};
 #[allow(unused_imports)]
 use super::*;
-use super::users_org::{ManagerChange, org_error_frame, parse_manager_change};
 
 impl MethodHandler {
     // ── User management handlers (admin only) ────────────────
@@ -311,8 +311,23 @@ impl MethodHandler {
         }
         drop(reg);
 
+        let was_owner = match db.check_agent_access(user_id, agent_name) {
+            Ok(value) => value == Some(AccessLevel::Owner),
+            Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
+        };
         match db.bind_agent(user_id, agent_name, access_level) {
             Ok(()) => {
+                if was_owner || access_level == AccessLevel::Owner {
+                    if let Err(error) =
+                        crate::computer_use_sessions::workspace_admin::admin_sessions(
+                            &self.home_dir,
+                        )
+                        .forget_login(agent_name, "owner_changed")
+                        .await
+                    {
+                        tracing::warn!(agent = %agent_name, error = %error, "browser login cleanup pending after handover");
+                    }
+                }
                 let _ = db.log_action(
                     Some(&ctx.user_id),
                     "user.bind_agent",
@@ -341,8 +356,23 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "agent_name is required"),
         };
 
+        let was_owner = match db.check_agent_access(user_id, agent_name) {
+            Ok(value) => value == Some(AccessLevel::Owner),
+            Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
+        };
         match db.unbind_agent(user_id, agent_name) {
             Ok(()) => {
+                if was_owner {
+                    if let Err(error) =
+                        crate::computer_use_sessions::workspace_admin::admin_sessions(
+                            &self.home_dir,
+                        )
+                        .forget_login(agent_name, "owner_changed")
+                        .await
+                    {
+                        tracing::warn!(agent = %agent_name, error = %error, "browser login cleanup pending after handover");
+                    }
+                }
                 let _ = db.log_action(
                     Some(&ctx.user_id),
                     "user.unbind_agent",

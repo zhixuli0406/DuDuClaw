@@ -243,6 +243,7 @@ What you install is fully transparent:
 - **No privilege escalation**: runs entirely in user space
 - **Maintainer**: Dudu Technology Ltd. (registered in Taiwan, tax ID 94139082)
 - **High-risk actions in chat**: an employee asks for approval of a high-risk computer-use step in its channel, and you answer with the request's full ID. An operation whose result is unknown is never re-sent automatically; an Admin settles it in the dashboard. See the [operator guide](docs/guides/durable-channel-decisions.md)
+- **Browser login persistence (unreleased)**: optional encrypted per-employee container snapshots, default off, with reset and handover protection. Final container acceptance is pending. See the [guide](docs/guides/browser-login-state.md).
 
 Every release asset ships with three kinds of verification: a SHA-256 checksum, a [cosign](https://github.com/sigstore/cosign) keyless signature, and a minisign Ed25519 signature (the built-in auto-updater enforces this one and refuses unsigned or tampered releases):
 
