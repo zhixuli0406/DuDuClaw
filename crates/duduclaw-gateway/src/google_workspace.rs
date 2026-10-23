@@ -690,8 +690,28 @@ fn http_client() -> Result<reqwest::Client, GoogleApiError> {
         .map_err(|e| GoogleApiError::Http(format!("client build failed: {e}")))
 }
 
-/// Perform one Google REST call with a single retry on transport error / 429 /
-/// 5xx, then classify the result. Success bodies are parsed as JSON.
+tokio::task_local! {
+    static DEDICATED_WRITE_POLICY: ();
+}
+
+/// Host-only scope for the dedicated execute route. Writes may have landed
+/// before a transient error, so they must never be automatically repeated.
+/// Box before constructing the scope to preserve the default-stack boundary.
+pub(crate) fn with_dedicated_write_policy<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    DEDICATED_WRITE_POLICY.scope((), Box::pin(future))
+}
+
+fn automatic_retry_allowed(method: &reqwest::Method) -> bool {
+    *method == reqwest::Method::GET
+        || *method == reqwest::Method::HEAD
+        || DEDICATED_WRITE_POLICY.try_with(|_| ()).is_err()
+}
+
+/// Perform a Google REST call and classify its result. Legacy callers and
+/// GET/HEAD may retry once on transport errors / 429 / 5xx. Dedicated writes
+/// make one attempt. Success bodies are parsed as JSON.
 async fn google_request(
     token: &str,
     method: reqwest::Method,
@@ -700,11 +720,14 @@ async fn google_request(
     body: Option<&Value>,
 ) -> Result<Value, GoogleApiError> {
     let client = http_client()?;
+    let retry_allowed = automatic_retry_allowed(&method);
 
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let mut req = client.request(method.clone(), effective_url(url).as_ref()).bearer_auth(token);
+        let mut req = client
+            .request(method.clone(), effective_url(url).as_ref())
+            .bearer_auth(token);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -715,7 +738,7 @@ async fn google_request(
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                if attempt < 2 {
+                if retry_allowed && attempt < 2 {
                     continue;
                 }
                 return Err(GoogleApiError::Http(format!("request failed: {e}")));
@@ -733,7 +756,7 @@ async fn google_request(
         }
 
         // Retry once on transient failures.
-        if (code == 429 || (500..=599).contains(&code)) && attempt < 2 {
+        if (code == 429 || (500..=599).contains(&code)) && retry_allowed && attempt < 2 {
             continue;
         }
 
@@ -760,11 +783,14 @@ async fn google_request_text(
     query: &[(&str, String)],
 ) -> Result<String, GoogleApiError> {
     let client = http_client()?;
+    let retry_allowed = automatic_retry_allowed(&method);
 
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let mut req = client.request(method.clone(), effective_url(url).as_ref()).bearer_auth(token);
+        let mut req = client
+            .request(method.clone(), effective_url(url).as_ref())
+            .bearer_auth(token);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -772,7 +798,7 @@ async fn google_request_text(
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                if attempt < 2 {
+                if retry_allowed && attempt < 2 {
                     continue;
                 }
                 return Err(GoogleApiError::Http(format!("request failed: {e}")));
@@ -787,7 +813,7 @@ async fn google_request_text(
                 .map_err(|e| GoogleApiError::Http(format!("failed reading body: {e}")));
         }
 
-        if (code == 429 || (500..=599).contains(&code)) && attempt < 2 {
+        if (code == 429 || (500..=599).contains(&code)) && retry_allowed && attempt < 2 {
             continue;
         }
 
@@ -2569,6 +2595,136 @@ fn days_until(time_max: Option<&str>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dedicated_write_policy_preserves_read_and_legacy_status_retries() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for code in [429u16, 503] {
+            for method in [
+                reqwest::Method::GET,
+                reqwest::Method::HEAD,
+                reqwest::Method::POST,
+            ] {
+                for text in [false, true] {
+                    let count = Arc::new(AtomicUsize::new(0));
+                    let seen = count.clone();
+                    let app = axum::Router::new().fallback(axum::routing::any(move || {
+                        let seen = seen.clone();
+                        async move {
+                            let status = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                code
+                            } else {
+                                200
+                            };
+                            (
+                                axum::http::StatusCode::from_u16(status).unwrap(),
+                                axum::Json(json!({"fixture":true})),
+                            )
+                        }
+                    }));
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/", listener.local_addr().unwrap());
+                    let server = tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    // POST here is intentionally legacy: it keeps its original retry.
+                    let dedicated = method != reqwest::Method::POST;
+                    let call = async {
+                        if text {
+                            google_request_text("synthetic-unit-token", method.clone(), &url, &[])
+                                .await
+                                .map(|_| ())
+                        } else {
+                            google_request("synthetic-unit-token", method.clone(), &url, &[], None)
+                                .await
+                                .map(|_| ())
+                        }
+                    };
+                    let result = if dedicated {
+                        with_dedicated_write_policy(call).await
+                    } else {
+                        call.await
+                    };
+                    server.abort();
+                    let _ = server.await;
+                    assert!(
+                        result.is_ok(),
+                        "{method} text={text} status={code}: {result:?}"
+                    );
+                    assert_eq!(
+                        count.load(Ordering::SeqCst),
+                        2,
+                        "{method} text={text} status={code}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_write_policy_never_retries_transport_failure_but_reads_and_legacy_do() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::AsyncReadExt;
+        for (method, dedicated, expected) in [
+            (reqwest::Method::POST, true, 1),
+            (reqwest::Method::GET, true, 2),
+            (reqwest::Method::HEAD, true, 2),
+            (reqwest::Method::POST, false, 2),
+        ] {
+            for text in [false, true] {
+                let count = Arc::new(AtomicUsize::new(0));
+                let seen = count.clone();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = [0u8; 4096];
+                        assert!(socket.read(&mut request).await.unwrap() > 0);
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        // No HTTP response: the request arrived but its outcome is unknown.
+                        drop(socket);
+                    }
+                });
+                let call = async {
+                    if text {
+                        google_request_text("synthetic-unit-token", method.clone(), &url, &[])
+                            .await
+                            .map(|_| ())
+                    } else {
+                        google_request(
+                            "synthetic-unit-token",
+                            method.clone(),
+                            &url,
+                            &[],
+                            Some(&json!({"fixture":true})),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                };
+                let result = if dedicated {
+                    with_dedicated_write_policy(call).await
+                } else {
+                    call.await
+                };
+                server.abort();
+                let _ = server.await;
+                assert!(result.is_err());
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    expected,
+                    "{method} dedicated={dedicated} text={text}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn clamp_bounds() {
