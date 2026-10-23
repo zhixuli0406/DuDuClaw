@@ -139,7 +139,7 @@ impl MethodHandler {
         let events:Vec<_>=transcript.messages.iter().map(|m|json!({"kind":"text","role":m.role,"ts":m.timestamp,"preview":crate::history_privacy::plain_parts(&m.parts)})).collect();
         self.bound_history_recheck(ctx, agent, Mode::Filtered)?;
         Ok(
-            json!({"run":{"id":handles::issue_run(&self.home_dir,&ctx.user_id,run_id)?,"session_id":handles::issue(&self.home_dir,&ctx.user_id,sid)?,"agent_id":agent,"channel":channel,"started_at":first.timestamp,"ended_at":last.map(|m|&m.timestamp),"status":if last.is_some(){"completed"}else{"no_reply"}},"events":events,"event_sources":{"text":"conversation history"},"not_persisted":["thinking_summaries"],"omitted":["tool_steps"],"read_only":true,"ner":transcript.ner}),
+            json!({"run":{"id":handles::issue_run(&self.home_dir,&ctx.user_id,run_id)?,"session_id":handles::issue(&self.home_dir,&ctx.user_id,sid)?,"agent_id":agent,"channel":channel,"started_at":first.timestamp,"ended_at":last.map(|m|&m.timestamp),"status":if last.is_some(){"completed"}else{"no_reply"}},"events":events,"event_sources":{"text":"conversation history"},"not_persisted":["thinking_summaries"],"omitted":["tool_steps"],"read_only":true,"privacy_mode":if external {"masked"}else{"own"},"ner":transcript.ner}),
         )
     }
 }

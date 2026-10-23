@@ -47,7 +47,7 @@ impl MethodHandler {
                 } else {
                     s.metadata.id.clone()
                 };
-                hits.push(crate::search_index::SearchHit {source:crate::search_index::SOURCE_CONVERSATION,id:handles::reference(&self.home_dir,&ctx.user_id,&format!("{}:{}",s.metadata.id,raw.id))?,title:duduclaw_core::truncate_chars(&content,80),snippet:duduclaw_core::truncate_chars(&content,400),agent_id:Some(agent.into()),timestamp:Some(m.timestamp.clone()),jump:json!({"session_id":id,"role":m.role,"read_only":external,"channel":projection::channel(&s.metadata.class)})});
+                hits.push(crate::search_index::SearchHit {source:crate::search_index::SOURCE_CONVERSATION,id:handles::reference(&self.home_dir,&ctx.user_id,&format!("{}:{}",s.metadata.id,raw.id))?,title:duduclaw_core::truncate_chars(&content,80),snippet:duduclaw_core::truncate_chars(&content,400),agent_id:Some(agent.into()),timestamp:Some(m.timestamp.clone()),jump:json!({"session_id":id,"role":m.role,"read_only":external,"privacy_mode":if external {"masked"}else{"own"},"ner":masked.ner,"channel":projection::channel(&s.metadata.class)})});
             }
         }
         hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));

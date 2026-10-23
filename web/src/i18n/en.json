@@ -8721,11 +8721,12 @@
   "boundHistory.title": "External conversation (read-only)",
   "boundHistory.label": "External conversation",
   "boundHistory.description": "Customer conversations are masked. Start a new conversation to chat with this AI staff member.",
-  "boundHistory.regexOnly": "NER is not installed. Names and addresses may remain visible; only rule-based masking is available.",
+  "boundHistory.regexOnly": "AI detection is not installed on this device. Names and addresses may remain visible; only rule-based masking is available.",
   "boundHistory.loading": "Loading history…",
   "boundHistory.error": "History is unavailable. Refresh to try again.",
   "boundHistory.refresh": "Refresh",
   "boundHistory.new": "New conversation",
   "boundHistory.staff": "AI staff",
-  "boundHistory.customer": "Customer"
+  "boundHistory.customer": "Customer",
+  "boundHistory.toolsOmitted": "Tool steps are hidden in this conversation view. Task runs retain their own permissions."
 }

@@ -12,7 +12,7 @@ describe('external history view', () => {
     expect(screen.getByText('External conversation (read-only)')).toBeInTheDocument();
     expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeInTheDocument();
     expect(screen.getByText('Phone 1')).toBeInTheDocument();
-    expect(screen.getByText(/NER is not installed/)).toBeInTheDocument();
+    expect(screen.getByText(/AI detection is not installed/)).toBeInTheDocument();
     expect(container.querySelector('img, a, textarea, audio, video, iframe')).toBeNull();
     expect(screen.queryByText(/PRIVATE-FILENAME|UNSAFE FALLBACK/)).not.toBeInTheDocument();
   });
@@ -33,7 +33,7 @@ it('refreshes metadata safely and uses current staff names without a false regex
   const refresh=vi.spyOn(useConversationsStore.getState(),'refreshView').mockResolvedValue();
   useConversationsStore.setState({readOnlyView:{...data,ner:true,messages:[{...data.messages[0],role:'assistant',sender_label:'',timestamp:'invalid',parts:[{t:'attachment',kind:'image'}]}]}} as never);
   renderWithProviders(<ReadOnlyHistoryView/>);
-  expect(screen.queryByText(/NER is not installed/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/AI detection is not installed/)).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button',{name:'Refresh'}));
   expect(refresh).toHaveBeenCalledOnce();
 });

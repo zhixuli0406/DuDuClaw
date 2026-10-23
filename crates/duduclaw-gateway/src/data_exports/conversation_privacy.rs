@@ -85,7 +85,7 @@ pub fn collect(
                             if transcript.ner {
                                 "masked; regex and NER"
                             } else {
-                                "masked; regex only; NER not installed"
+                                "masked; rule-based only; AI detection not installed"
                             }
                         } else {
                             "own WebChat; full text"
