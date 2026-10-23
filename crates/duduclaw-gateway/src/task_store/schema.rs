@@ -102,6 +102,8 @@ impl TaskStore {
         Self::init_survival_evidence_schema(conn)?;
         // ── P2-A responsibilities / steering / stop (new tables only) ──
         Self::init_responsibility_schema(conn)?;
+        // ── Scheduled assignments (new table only) ──
+        Self::init_assign_schedule_schema(conn)?;
         Ok(())
     }
 

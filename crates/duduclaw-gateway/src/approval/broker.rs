@@ -51,6 +51,7 @@ impl ApprovalBroker {
             binding: None,
             answer: None,
             invalidated_reason: None,
+            on_behalf_of: raising_principal(),
         };
         let id = rec.id.clone();
         self.store.insert(&rec).await?;
@@ -117,6 +118,7 @@ impl ApprovalBroker {
             } else {
                 Some(simulation.to_json())
             },
+            on_behalf_of: raising_principal(),
         };
         let id = rec.id.clone();
         self.store.insert(&rec).await?;

@@ -163,6 +163,7 @@ pub mod security_rules_seed;
 pub mod takeover;
 pub mod team_edition;
 pub mod team_history;
+pub mod team_oversight;
 pub mod trigger_route;
 pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
@@ -239,6 +240,7 @@ pub mod memory_forget_approval;
 pub mod memory_forget_steps;
 pub mod wiki_host_sources;
 pub mod memory_provenance;
+pub mod on_behalf_of;
 pub mod message_queue;
 pub mod miniapp;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
@@ -541,6 +543,9 @@ pub use goal_loop::plan as goal_plan;
 //        `tasks_create kind="goal"` entry so the H9-G contract freeze and the
 //        I-1c plan-first parking can never drift between the two rails ──
 pub mod goal_create_core;
+// Scheduled assignments: work handed to an AI employee for later or on a
+// repeat, re-authorized at every fire (`assign_schedule/mod.rs`).
+pub mod assign_schedule;
 // ── D5: semi-automatic topology evolution (edge optimization, human-gated) ──
 pub mod topology_evolution;
 // ── WP2.4: structured outcome acceptance — deterministic (zero-LLM) validation

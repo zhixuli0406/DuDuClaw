@@ -2093,6 +2093,8 @@ impl AutopilotEngine {
             session_id: None,
             upstream_unknown: false,
             lane,
+            // An event-woken run is for nobody in particular.
+            on_behalf_of: None,
         };
         mq.enqueue(&msg).await
     }

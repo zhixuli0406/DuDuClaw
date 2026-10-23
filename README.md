@@ -64,6 +64,8 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 
 <a id="architecture"></a>
 
+Unreleased: [scheduled assignments](docs/features/67-assigning-tasks.md#scheduling-an-assignment) let you hand work to an AI employee for later or on a repeat, from chat or the dashboard. Each run checks the creator's current permission.
+
 ## Architecture at a glance
 
 The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
@@ -281,6 +283,8 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 
 Enterprise personal Google connections (unreleased): connect your own account, allow individual AI employees, and withdraw consent in [My connections](docs/guides/google-personal-connections.md).
 
+- [Read-only team conversations](docs/features/68-manager-team-history.md): unreleased Enterprise dashboard and API for report WebChat and masked external conversations, with staff notices, an activation boundary and mandatory audit.
+- Self-service: **Who viewed my conversations** shows only your own team-history receipts ([guide](docs/features/68-manager-team-history.md)).
 - [ARCHITECTURE.md](ARCHITECTURE.md): full system architecture
 - [docs/README.md](docs/README.md): public docs index (architecture / RFC / ADR / specs / guides)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md): production deployment (Tailscale / Docker / systemd / auto-update / monitoring)

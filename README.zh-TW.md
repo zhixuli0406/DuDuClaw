@@ -65,6 +65,8 @@ duduclaw run                  # 接著打開 http://localhost:18789
 
 <a id="architecture"></a>
 
+尚未發版：[排程交辦](docs/features/zh-TW/67-assigning-tasks.md)可從聊天或儀表板把工作排到之後，或固定週期交辦給 AI 員工；每次執行前都重新確認建立者的權限。
+
 ## 架構一覽
 
 AI 運行時是大腦,DuDuClaw 是水電管線,中間用 MCP(JSON-RPC 2.0)橋接。大腦可換,管線不動:
@@ -282,6 +284,8 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 企業版個人 Google 連線（未發布）：自行連結帳號，逐位允許或關閉 AI 員工使用，見[我的連線](docs/guides/zh-TW/google-personal-connections.md)。
 
+- [主管唯讀團隊對話](docs/features/zh-TW/68-manager-team-history.md)：尚未發版的企業版頁面與 API；部屬 WebChat 全文、外部對話遮蔽，含職員提示、生效時間與強制稽核。
+- 自身透明度：**誰看過我的對話**只列主管經團隊入口查看本人 WebChat 的紀錄（[說明](docs/features/zh-TW/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):完整系統架構
 - [docs/README.md](docs/README.md):公開文件索引(架構 / RFC / ADR / 規格 / 指南)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):生產部署(Tailscale / Docker / systemd / 自動更新 / 監控)

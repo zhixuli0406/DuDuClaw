@@ -350,7 +350,7 @@ fn create_audit_key(path: &Path) -> Option<Vec<u8>> {
 
 /// HMAC-SHA256(key, channel ‖ 0 ‖ id), 16 hex characters. Without a usable
 /// key the identifier is withheld (`"unavailable"`), never logged raw.
-fn keyed_digest(home: &Path, channel: &str, id: &str) -> String {
+pub(crate) fn keyed_digest(home: &Path, channel: &str, id: &str) -> String {
     use hmac::{Hmac, Mac};
     let Some(key) = audit_key(home) else {
         return "unavailable".to_string();

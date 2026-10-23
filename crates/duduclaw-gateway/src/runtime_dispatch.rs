@@ -137,6 +137,10 @@ pub struct AgentPrompt<'a> {
     )
 )]
 pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
+    crate::on_behalf_of::context::scope(req.home_dir, req.agent_id, run_agent_prompt_inner(req)).await
+}
+
+async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
     if let Some(dir) = req.agent_dir {
         crate::runtime_config::ensure_active_agent_provider(dir)?;
     }

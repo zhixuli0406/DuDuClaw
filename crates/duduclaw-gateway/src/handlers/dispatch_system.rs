@@ -229,6 +229,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_audit_unified_log(params).await
             }
+            "audit.resolve_session_digest" => {
+                require_admin!();
+                self.handle_history_resolve_digest(params).await
+            }
             "audit.evolution_query" => {
                 require_admin!();
                 self.handle_audit_evolution_query(params).await

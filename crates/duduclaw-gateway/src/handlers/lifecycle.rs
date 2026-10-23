@@ -154,6 +154,11 @@ impl MethodHandler {
         // Team grants follow the edition (`team_edition.rs`); the channel
         // and WebChat paths read what was last resolved here.
         crate::team_edition::record(&self.home_dir, edition);
+        if let Some(db) = self.user_db.read().await.as_ref() {
+            if let Err(e) = crate::team_oversight::observe_window(&self.home_dir, db, "edition_watcher") {
+                warn!(error=%e, "team history activation sync failed; reads remain fenced");
+            }
+        }
         edition
     }
 
@@ -680,6 +685,7 @@ impl MethodHandler {
     pub async fn set_user_db(&self, db: Arc<UserDb>, jwt: Arc<JwtConfig>) {
         *self.user_db.write().await = Some(db);
         *self.jwt_config.write().await = Some(jwt);
+        self.resolve_edition_profile().await;
     }
 
     /// Inject the reply context for hot-starting channels. Called once after

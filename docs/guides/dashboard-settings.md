@@ -6,6 +6,8 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 
 ## How saving works
 
+Unreleased Enterprise setting (User Management → Organisation settings): `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). Inform staff before enabling it. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).
+
 - System settings (`config.toml`) are written through `system.update_config`, which is admin-only. A page sends only the fields you changed; with no change nothing is sent and the page says "Nothing changed, so there is nothing to save."
 - The write locks the file and re-reads it. If another writer changed the file after you loaded it, the save is refused; reload and save again.
 - When `config.toml` does not parse, `system.update_config`, the live data feed editor and the Advanced config editor refuse to write; fix the syntax in the Advanced config editor first. The other settings pages that write `config.toml` (channels, accounts, Odoo and so on) refuse in the same way.
@@ -196,6 +198,16 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Baselines:** saving SOUL.md or INSTRUCTIONS.md updates its approved fingerprint (INSTRUCTIONS.md has one now too, checked by the heartbeat as `_instructions_integrity_drift`). A file changed outside the system shows as changed-outside; restore the approved version or check and accept the current content (save it as it is: the whole file is checked, at least a reason or an approval request is needed, and once confirmed the file is not rewritten; the current text is kept as a version and becomes the approved baseline. Saving an unchanged file that was not changed outside is still "unchanged"). Renaming an employee updates the name inside SOUL.md / IDENTITY.md and keeps an approved SOUL approved, while a SOUL that had already changed outside stays flagged. The name must be plain text (1–64 characters, no line breaks, invisible characters or `< > [ ] { }` / backticks), and a renamed file that trips a fixed rule is left as it was (listed in `identity_files_skipped`).
 - **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
+
+## Assign panel → When, and Goals → Assigned by me → Scheduled (unreleased)
+
+| Control | Writes | Effect |
+|---|---|---|
+| Assign panel → **When**: now / once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins) | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the browser's zone) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
+| Goals → Assigned by me → Scheduled: **Pause / Resume / Remove** | the row's `status` | At once. Resume re-checks the creator's right and continues from the next slot after now; a one-time schedule whose time passed cannot resume. Remove keeps the row as `removed` (never listed or run again). |
+| **Show everyone's** (Admins) | — | Lists every person's schedules with the creator's name. |
+
+Caps live in `config.toml` (no control yet; Advanced config editor): `[goal_defaults] assign_schedule_max_active` (default 20 per person, 0..200) and `assign_schedule_min_interval_minutes` (non-Admins, default 60, can only be raised). Existing schedules also recheck the interval at every run and resume. Pause/remove prevents a run whose task has not yet been stored; stop an already stored task separately. Details: [Scheduling an assignment](../features/67-assigning-tasks.md#scheduling-an-assignment).
 
 ## Thinking display
 

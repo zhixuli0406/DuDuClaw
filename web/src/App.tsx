@@ -76,6 +76,8 @@ const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePag
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
+const MyHistoryViewsPage = lazyPage(() => import('./pages/MyHistoryViewsPage'), 'MyHistoryViewsPage');
+const TeamHistoryPage = lazyPage(() => import('./pages/TeamHistoryPage'), 'TeamHistoryPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
@@ -346,6 +348,11 @@ export function App() {
               </Route>
 
               <Route element={<EditionGuard enterprise />}><Route path="me/connections" element={<MyConnectionsPage />} /></Route>
+              {/* Self-only receipts are available to every Enterprise account. */}
+              <Route element={<EditionGuard enterprise />}>
+                <Route path="my/history-views" element={<MyHistoryViewsPage />} />
+              </Route>
+
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="forks" element={<ForkPage />} />
@@ -357,6 +364,7 @@ export function App() {
                     both are mirrored here. */}
                 <Route element={<EditionGuard enterprise />}>
                   <Route path="team" element={<TeamPage />} />
+                  <Route path="team/conversations" element={<TeamHistoryPage />} />
                 </Route>
               </Route>
 
