@@ -305,6 +305,15 @@ impl RuleEngine {
     /// only system-prompt-aware rules fire on a `SystemPrompt` source
     /// with `selective` policy).
     pub fn apply(&self, text: &str, source: &Source) -> Vec<MatchedSpan> {
+        resolve_overlaps(self.all_text_matches(text, source))
+    }
+
+    /// Return every text match before priority-based overlap resolution.
+    /// Disclosure views must cover the union: dropping a lower-priority
+    /// partial overlap can otherwise expose the rest of its sensitive value.
+    /// This has the same rule error semantics as `apply`; callers requiring
+    /// fail-closed NER must invoke the fallible NER runtime separately.
+    pub fn all_text_matches(&self, text: &str, source: &Source) -> Vec<MatchedSpan> {
         let only_system_prompt_rules = matches!(source, Source::SystemPrompt { .. });
 
         let mut all: Vec<MatchedSpan> = Vec::new();
@@ -320,7 +329,7 @@ impl RuleEngine {
             }
         }
 
-        resolve_overlaps(all)
+        all
     }
 }
 
@@ -372,6 +381,18 @@ mod tests {
             enabled: true,
             kind: RuleKind::Regex { pattern: pattern.into() },
         }
+    }
+
+    #[test]
+    fn raw_text_matches_keep_partial_overlaps_without_changing_apply() {
+        let engine=RuleEngine::from_specs(vec![rspec("email",r"[a-z]+@[a-z]+\.[a-z]+",50),rspec("partial","@",200)]).unwrap();
+        let source=Source::ToolResult{tool_name:"test".into()};
+        let raw=engine.all_text_matches("alice@example.com",&source);
+        assert_eq!(raw.len(),2);
+        assert!(raw.iter().any(|m|m.span.start==0&&m.span.end==17));
+        let resolved=engine.apply("alice@example.com",&source);
+        assert_eq!(resolved.len(),1);
+        assert_eq!(resolved[0].rule.id(),"partial");
     }
 
     fn ner_spec() -> RuleSpec {
