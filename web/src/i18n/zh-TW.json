@@ -8799,5 +8799,19 @@
   "teamHistory.view": "看對話",
   "teamHistory.settings.detection": "安裝 AI 智慧偵測",
   "teamHistory.image": "圖片附件",
-  "teamHistory.category.NAME": "姓名"
+  "teamHistory.category.NAME": "姓名",
+  "nav.myHistoryViews": "誰看過我的對話",
+  "nav.myHistoryViews.desc": "我的對話檢視紀錄",
+  "myHistoryViews.title": "誰看過我的對話",
+  "myHistoryViews.scope": "這裡列出主管透過「團隊對話」開啟你本人 WebChat 的紀錄，只顯示檢視者目前的名稱和 AI 員工，不含對話內容。其他管理員讀取途徑與外部客戶對話不在此列；本機稽核紀錄若已移除或封存，更早的紀錄可能無法顯示。",
+  "myHistoryViews.refresh": "重新整理",
+  "myHistoryViews.more": "載入更多",
+  "myHistoryViews.list": "我的對話檢視紀錄",
+  "myHistoryViews.unavailable": "目前無法讀取紀錄，請重新整理後再試。",
+  "myHistoryViews.empty": "目前沒有你的對話被檢視的紀錄。",
+  "myHistoryViews.scanMore": "這一頁沒有符合的紀錄，可以載入更多查看更早的紀錄。",
+  "myHistoryViews.formerManager": "已移除的主管",
+  "myHistoryViews.formerAgent": "已移除的 AI 員工",
+  "myHistoryViews.webchat": "我的 WebChat",
+  "myHistoryViews.loading": "正在讀取檢視紀錄"
 }
