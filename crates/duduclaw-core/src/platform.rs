@@ -598,6 +598,13 @@ pub fn kill_process(pid: u32) -> std::io::Result<()> {
     sys::kill_process(pid)
 }
 
+/// Is a process with this id still running? `0` and ids that do not fit
+/// are reported as not running. A process this user may not signal still
+/// counts as running (Unix `EPERM`).
+pub fn process_alive(pid: u32) -> bool {
+    pid != 0 && i32::try_from(pid).is_ok() && sys::process_alive(pid)
+}
+
 /// Forcefully kill a whole process group / tree.
 ///
 /// Unix: `kill(-pgid, SIGKILL)` — every process still in group `pgid` (spawn
@@ -745,6 +752,11 @@ mod sys {
             .unwrap_or(false)
     }
 
+    pub fn process_alive(pid: u32) -> bool {
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     pub fn terminate_process(pid: u32) -> std::io::Result<()> {
         let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if rc != 0 {
@@ -874,6 +886,24 @@ mod sys {
 
     pub fn has_loose_permissions(_path: &Path) -> bool {
         false
+    }
+
+    pub fn process_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        /// `STILL_ACTIVE`: the exit code of a process that has not exited.
+        const STILL_ACTIVE: u32 = 259;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // Access denied means it exists; anything else, it does not.
+            return std::io::Error::last_os_error().raw_os_error() == Some(5);
+        }
+        let mut code: u32 = 0;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+        unsafe { CloseHandle(handle); }
+        ok != 0 && code == STILL_ACTIVE
     }
 
     pub fn terminate_process(pid: u32) -> std::io::Result<()> {

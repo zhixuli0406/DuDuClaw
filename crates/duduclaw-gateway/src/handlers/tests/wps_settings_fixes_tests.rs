@@ -146,3 +146,52 @@ fn killswitch_update_null_disarms_a_trigger() {
     .unwrap();
     assert!(changes.is_empty());
 }
+
+/// B10: the hard loop limit is read back with defaults and validated on write.
+#[test]
+fn killswitch_hard_loop_limit_round_trips_and_is_range_checked() {
+    let resp = killswitch_table_to_response(&toml::Table::new());
+    assert_eq!(resp["circuit_breaker"]["hard_window_secs"], json!(60));
+    assert_eq!(resp["circuit_breaker"]["hard_max_messages"], json!(30));
+    let mut table = toml::Table::new();
+    let changes = apply_killswitch_to_table(
+        &mut table,
+        &json!({ "circuit_breaker": { "hard_window_secs": 120, "hard_max_messages": 50 } }),
+    )
+    .unwrap();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    let resp = killswitch_table_to_response(&table);
+    assert_eq!(resp["circuit_breaker"]["hard_window_secs"], json!(120));
+    assert_eq!(resp["circuit_breaker"]["hard_max_messages"], json!(50));
+    for bad in [
+        json!({ "circuit_breaker": { "hard_window_secs": 0 } }),
+        json!({ "circuit_breaker": { "hard_max_messages": 0 } }),
+        json!({ "circuit_breaker": { "hard_max_messages": 100_001 } }),
+    ] {
+        assert!(apply_killswitch_to_table(&mut toml::Table::new(), &bad).is_err(), "{bad}");
+    }
+}
+
+/// B10: `killswitch.update` writes through the config commit: the
+/// operator's comments survive, and an unparsable file is refused rather
+/// than replaced with defaults.
+#[tokio::test]
+async fn killswitch_update_keeps_comments_and_refuses_a_broken_file() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("KILLSWITCH.toml");
+    std::fs::write(&path, "# operator note\n[circuit_breaker]\n# keep me\ncooldown_secs = 60\n").unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let frame = handler
+        .handle_killswitch_update(json!({ "circuit_breaker": { "hard_max_messages": 45 } }))
+        .await;
+    ok_payload(frame);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# operator note") && text.contains("# keep me"), "{text}");
+    assert!(text.contains("hard_max_messages = 45"), "{text}");
+    std::fs::write(&path, "[circuit_breaker\nbroken").unwrap();
+    let frame = handler
+        .handle_killswitch_update(json!({ "circuit_breaker": { "hard_max_messages": 40 } }))
+        .await;
+    assert!(is_error(&frame), "{frame:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[circuit_breaker\nbroken");
+}

@@ -126,7 +126,7 @@ impl IngressStore {
         .map_err(|e| e.to_string())?;
         let gone = ids(
             &tx,
-            "SELECT id FROM ingress WHERE status IN ('completed','closed') AND received_at<?1 LIMIT 2000",
+            "SELECT id FROM ingress WHERE status IN ('completed','closed','merged') AND received_at<?1 LIMIT 2000",
             cutoff,
         )?;
         for id in &gone {

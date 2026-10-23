@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::Result;
 
-use super::{cfg_err, io_err, safe_zip};
+use serde_json::json;
+
+use super::import_error::import_err;
+use super::{io_err, safe_zip};
 
 /// A resolved source: the directory to read, and what extraction left out
 /// when it came from a zip.
@@ -47,7 +50,7 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
         download_zip(&url, &zip_path).await?;
         let unpack = staging.join("unpacked");
         let z = safe_zip::extract_to(&zip_path, &unpack)?;
-        return Ok(unpacked(descend_single_dir(unpack), z));
+        return Ok(unpacked(unpack, z));
     }
     // WP2.2 R2/R3: `registry:<slug>` — resolve via the pack registry with
     // client-side sha256 (always) + minisign (code lane) verification.
@@ -71,7 +74,7 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
 
     let path = PathBuf::from(source);
     if !path.exists() {
-        return Err(cfg_err(format!("來源不存在: {source}")));
+        return Err(import_err("import.source_missing", json!({}), format!("來源不存在: {source}")));
     }
     if path.is_dir() {
         return Ok(ResolvedSource { dir: path, zip: None });
@@ -86,9 +89,11 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
     }
     // A file → must be a zip.
     if ext != "zip" {
-        return Err(cfg_err(format!(
-            "來源檔不是資料夾，也不是 .zip / .md / .yml 檔: {source}"
-        )));
+        return Err(import_err(
+            "import.bad_extension",
+            json!({}),
+            format!("來源檔不是資料夾，也不是 .zip / .md / .yml 檔: {source}"),
+        ));
     }
     std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
     let unpack = staging.join("unpacked");
@@ -104,7 +109,7 @@ fn stage_single_file(path: &Path, staging: &Path) -> Result<ResolvedSource> {
         .map_err(|e| io_err(format!("讀取 {} 失敗: {e}", path.display())))?
         .len();
     if len > safe_zip::MAX_UNPACK_BYTES {
-        return Err(cfg_err(format!("檔案過大（{len} bytes）")));
+        return Err(safe_zip::too_large(format!("檔案過大（{len} bytes）")));
     }
     let name = path
         .file_name()
@@ -123,37 +128,21 @@ fn stage_single_file(path: &Path, staging: &Path) -> Result<ResolvedSource> {
     Ok(ResolvedSource { dir, zip: None })
 }
 
-/// GitHub source archives wrap everything in a `<repo>-<branch>/` top dir —
-/// when the extraction root has exactly one directory and no manifest of its
-/// own, descend into it so format detection sees the real pack root.
-fn descend_single_dir(root: PathBuf) -> PathBuf {
-    if root.join("expert.toml").is_file() || root.join(".claude-plugin").is_dir() {
-        return root;
-    }
-    let entries: Vec<_> = std::fs::read_dir(&root)
-        .map(|it| it.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    let dirs: Vec<_> = entries.iter().filter(|p| p.is_dir()).collect();
-    if dirs.len() == 1 && entries.len() == 1 {
-        return dirs[0].clone();
-    }
-    root
-}
-
 /// Download a URL to `dest`, capped at [`safe_zip::MAX_UNPACK_BYTES`].
 async fn download_zip(url: &str, dest: &Path) -> Result<()> {
+    let failed = |msg: String| import_err("import.download_failed", json!({}), msg);
     let resp = reqwest::get(url)
         .await
-        .map_err(|e| io_err(format!("下載失敗: {e}")))?;
+        .map_err(|e| failed(format!("下載失敗: {e}")))?;
     if !resp.status().is_success() {
-        return Err(io_err(format!("下載失敗 HTTP {}", resp.status())));
+        return Err(failed(format!("下載失敗 HTTP {}", resp.status())));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| io_err(format!("讀取回應失敗: {e}")))?;
+        .map_err(|e| failed(format!("讀取回應失敗: {e}")))?;
     if bytes.len() as u64 > safe_zip::MAX_UNPACK_BYTES {
-        return Err(cfg_err(format!(
+        return Err(safe_zip::too_large(format!(
             "下載內容過大（{} bytes > 上限 {}）",
             bytes.len(),
             safe_zip::MAX_UNPACK_BYTES

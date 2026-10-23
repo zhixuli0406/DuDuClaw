@@ -1,5 +1,9 @@
+import { useEffect, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
-import type { ExpertImportItem, ExpertImportReport } from '@/lib/api';
+import type { ExpertImportItem, ExpertImportReport, ExpertReimport } from '@/lib/api';
+import { EditsList } from './EditsList';
+import { ImportErrorPanel, type ImportFailure } from './ImportErrorPanel';
+import { ReimportChoice } from './ReimportChoice';
 import {
   Badge,
   Button,
@@ -70,23 +74,37 @@ function message(intl: IntlShape, item: ExpertImportItem): string | null {
  * them and why, and anything that was left out. Each line is rendered from
  * its message code in the viewer's language; the technical name and the
  * importer's own wording sit under a collapsed "details".
+ *
+ * A failed run shows why in plain language with its error code
+ * ([`ImportErrorPanel`]); an upload imported before offers "replace" or
+ * "import as a copy", and replacing employees edited since the import asks
+ * a second time, listing what would be moved to the backup.
  */
 export function ImportReportDialog({
   open,
   phase,
   report,
+  failure,
   error,
+  reimport,
   busy,
   onConfirm,
+  onReimport,
   onClose,
 }: {
   open: boolean;
   phase: 'plan' | 'done';
   report: ExpertImportReport | null;
-  /** Set when the run failed: shown above the report. */
+  /** Set when the run failed (coded). */
+  failure?: ImportFailure | null;
+  /** Uncoded failure text (older gateways): shown as an unclassified failure. */
   error?: string;
+  /** How this run treats an earlier import of the same upload. */
+  reimport?: ExpertReimport | null;
   busy: boolean;
-  onConfirm: () => void;
+  onConfirm: (opts?: { acceptEdits?: boolean }) => void;
+  /** Re-run the plan with a re-import choice. */
+  onReimport?: (choice: ExpertReimport) => void;
   onClose: () => void;
 }) {
   const intl = useIntl();
@@ -98,27 +116,82 @@ export function ImportReportDialog({
   const disabledSkills = Number(report?.meta.disabled_skills ?? 0);
   const kindLabel = (kind: string) =>
     intl.messages[`experts.report.kind.${kind}`] ? t(`experts.report.kind.${kind}`) : t('experts.report.kind.other');
-  const failed = Boolean(error);
+  const shownFailure: ImportFailure | null =
+    failure ?? (error ? { code: report?.error?.code ?? 'import.unknown', params: report?.error?.params, text: error } : null);
+  const failed = shownFailure !== null;
+  const replaceInfo = report?.details?.replace ?? null;
+  const needsEditConsent = phase === 'plan' && !failed && reimport?.mode === 'replace' && Boolean(replaceInfo?.edited);
+  const [confirmingEdits, setConfirmingEdits] = useState(false);
+  useEffect(() => {
+    if (!open) setConfirmingEdits(false);
+  }, [open]);
+  const failureCode = shownFailure?.code;
+  const hideItems = failureCode === 'import.already_imported' || confirmingEdits;
+  const conflictOnly =
+    failureCode === 'import.nothing_imported' &&
+    Array.isArray(shownFailure?.params?.agents) &&
+    (shownFailure?.params?.agents as Array<Record<string, unknown>>).some((a) => a.code === 'agent.conflict');
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o && !busy) onClose(); }}>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>
-            {failed ? t('experts.report.failedTitle') : phase === 'plan' ? t('experts.report.planTitle') : t('experts.report.doneTitle')}
+            {failureCode === 'import.already_imported'
+              ? t('experts.reimport.title')
+              : failed
+                ? t('experts.report.failedTitle')
+                : phase === 'plan'
+                  ? t('experts.report.planTitle')
+                  : t('experts.report.doneTitle')}
           </DialogTitle>
           <DialogDescription>
-            {failed
+            {failureCode === 'import.already_imported'
+              ? t('experts.reimport.desc')
+              : failed
               ? t('experts.report.failedDesc')
               : t(phase === 'plan' ? 'experts.report.planDesc' : 'experts.report.doneDesc', { format: formatLabel })}
           </DialogDescription>
         </DialogHeader>
 
-        {failed && (
-          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs break-words">{error}</p>
+        {shownFailure && (
+          <ImportErrorPanel failure={shownFailure}>
+            {failureCode === 'import.already_imported' && onReimport && (
+              <ReimportChoice
+                slug={String(shownFailure.params?.slug ?? '')}
+                edited={Boolean(shownFailure.params?.edited)}
+                busy={busy}
+                onChoose={onReimport}
+              />
+            )}
+            {conflictOnly && onReimport && <ReimportChoice busy={busy} onChoose={onReimport} />}
+            {failureCode === 'import.replace_edited' && (
+              <Button variant="destructive" size="sm" disabled={busy} onClick={() => onConfirm({ acceptEdits: true })}>
+                {busy && <Spinner className="size-3.5" />}
+                {t('experts.reimport.edits.confirm')}
+              </Button>
+            )}
+          </ImportErrorPanel>
         )}
 
-        {report === null ? (
+        {!failed && phase === 'plan' && reimport?.mode === 'replace' && replaceInfo && (
+          <p className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs">
+            {t('experts.reimport.planReplace', { name: replaceInfo.name, count: replaceInfo.agents.length })}
+          </p>
+        )}
+        {!failed && phase === 'plan' && reimport?.mode === 'copy' && (
+          <p className="rounded-lg border border-surface-border px-3 py-2 text-xs">{t('experts.reimport.planCopy')}</p>
+        )}
+
+        {confirmingEdits && replaceInfo && (
+          <div className="space-y-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-3 text-xs">
+            <p className="text-sm font-medium">{t('experts.reimport.edits.title')}</p>
+            <p>{t('experts.reimport.edits.desc')}</p>
+            <EditsList edits={replaceInfo.edits} />
+          </div>
+        )}
+
+        {hideItems ? null : report === null ? (
           !failed && <p className="text-sm text-muted-foreground">{t('experts.report.unavailable')}</p>
         ) : (
           <div className="space-y-4">
@@ -167,14 +240,29 @@ export function ImportReportDialog({
         )}
 
         <DialogFooter>
-          {phase === 'plan' && !failed ? (
+          {confirmingEdits ? (
+            <>
+              <Button variant="outline" size="sm" onClick={() => setConfirmingEdits(false)} disabled={busy}>
+                {t('experts.reimport.edits.back')}
+              </Button>
+              <Button variant="destructive" size="sm" onClick={() => onConfirm({ acceptEdits: true })} disabled={busy}>
+                {busy && <Spinner className="size-3.5" />}
+                {t('experts.reimport.edits.confirm')}
+              </Button>
+            </>
+          ) : phase === 'plan' && !failed ? (
             <>
               <Button variant="outline" size="sm" onClick={onClose} disabled={busy}>
                 {t('common.cancel')}
               </Button>
-              <Button variant="brand" size="sm" onClick={onConfirm} disabled={busy || report === null}>
+              <Button
+                variant="brand"
+                size="sm"
+                onClick={() => (needsEditConsent ? setConfirmingEdits(true) : onConfirm())}
+                disabled={busy || report === null}
+              >
                 {busy && <Spinner className="size-3.5" />}
-                {t('experts.report.confirm')}
+                {reimport?.mode === 'replace' ? t('experts.reimport.confirmReplace') : t('experts.report.confirm')}
               </Button>
             </>
           ) : (

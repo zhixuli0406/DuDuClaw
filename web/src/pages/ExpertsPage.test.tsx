@@ -7,6 +7,7 @@ import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { ExpertsPage } from './ExpertsPage';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 import type { ExpertCatalogEntry } from '@/lib/api';
 
 function renderPage() {
@@ -85,6 +86,9 @@ function mockCatalog(packs: ExpertCatalogEntry[]) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The page is for administrators (every experts.* RPC is admin-only);
+  // the non-admin notice has its own test below.
+  useAuthStore.setState({ user: { display_name: 'Boss', role: 'admin' } as never });
   useAgentsStore.setState({
     agents: [],
     loading: false,
@@ -157,5 +161,17 @@ describe('ExpertsPage — built-in AI team catalog cards (P2-a)', () => {
         expect.anything(),
       ),
     );
+  });
+});
+
+describe('ExpertsPage — who may import', () => {
+  it('tells a non-admin that importing needs an administrator and calls no experts.* RPC', async () => {
+    useAuthStore.setState({ user: { display_name: 'E', role: 'employee' } as never });
+    mockCatalog([teamEntry]);
+    renderPage();
+    expect(await screen.findByText('Only administrators can import AI teams')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Upload/i })).toBeDisabled();
+    expect(mockWsClient.call).not.toHaveBeenCalledWith('experts.list', expect.anything(), expect.anything(), expect.anything());
+    expect(mockWsClient.call.mock.calls.some(([m]) => String(m).startsWith('experts.'))).toBe(false);
   });
 });

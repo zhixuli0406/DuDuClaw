@@ -21,7 +21,7 @@ use std::path::Path;
 
 use super::install::{InstallCtx, install_skill_global};
 use super::{
-    InstallRecord, PackKind, Report, ScanVerdict, cfg_err, io_err, map_model, now_iso,
+    InstallRecord, PackKind, Report, ScanVerdict, map_model, now_iso,
     scan_external, set_capabilities,
 };
 
@@ -34,25 +34,23 @@ pub(super) async fn install(
 ) -> Result<InstallRecord> {
     let plugin_json = dir.join(".claude-plugin").join("plugin.json");
     let raw = std::fs::read_to_string(&plugin_json)
-        .map_err(|e| io_err(format!("讀取 plugin.json 失敗: {e}")))?;
+        .map_err(|e| super::import_error::bad_content(format!("讀取 plugin.json 失敗: {e}")))?;
     // Claude Code plugin.json is JSON5-flavoured in the wild (comments); parse
     // leniently, falling back to strict JSON.
     let val: serde_json::Value = json5::from_str(&raw)
         .or_else(|_| serde_json::from_str(&raw))
-        .map_err(|e| cfg_err(format!("plugin.json 解析失敗: {e}")))?;
+        .map_err(|e| super::import_error::bad_content(format!("plugin.json 解析失敗: {e}")))?;
 
     let name = val
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| crate::sanitize_agent_id(s))
         .filter(|s| crate::is_valid_agent_id(s))
-        .ok_or_else(|| cfg_err("plugin.json 缺少合法 name".into()))?;
+        .ok_or_else(|| super::import_error::bad_content("plugin.json 缺少合法 name".into()))?;
 
-    if super::read_record(&ctx.home, &name).is_some() {
-        return Err(cfg_err(format!(
-            "專家包 '{name}' 已安裝（先 `expert remove {name}` 再重裝）"
-        )));
-    }
+    let name = ctx.claim_slug(&name)?;
+    ctx.ensure_quota(count_agent_files(dir)).await?;
+    ctx.begin_writes()?;
 
     let description = val
         .get("description")
@@ -96,6 +94,9 @@ pub(super) async fn install(
         && let Ok(rd) = std::fs::read_dir(&skills_dir)
     {
         for entry in rd.flatten() {
+            if ctx.stopping() {
+                break;
+            }
             if entry.path().is_dir() {
                 let sname = entry.file_name().to_string_lossy().into_owned();
                 install_skill_global(ctx, &entry.path(), &sname, report, &mut record);
@@ -127,6 +128,17 @@ pub(super) async fn install(
     Ok(record)
 }
 
+/// `agents/*.md` files: the employees this plugin would add (upper bound).
+fn count_agent_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("agents"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 async fn import_agents(
     ctx: &InstallCtx,
     dir: &Path,
@@ -147,6 +159,9 @@ async fn import_agents(
 
     let mut count = 0;
     for path in entries {
+        if ctx.stopping() {
+            break;
+        }
         let raw = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -177,17 +192,17 @@ async fn import_agents(
 
         // Conflict resolution.
         let mut final_id = agent_id.clone();
-        if ctx.home.join("agents").join(&final_id).exists() {
+        if ctx.agent_taken(&final_id) {
             if ctx.rename {
                 final_id = crate::sanitize_agent_id(&format!("{agent_id}-imported"));
                 if !crate::is_valid_agent_id(&final_id)
-                    || ctx.home.join("agents").join(&final_id).exists()
+                    || ctx.agent_taken(&final_id)
                 {
                     report.conflict("agent", &agent_id, "重新命名後仍衝突");
                     continue;
                 }
             } else {
-                report.conflict("agent", &agent_id, "同名 agent 已存在（--rename）");
+                report.conflict("agent", &agent_id, "同名 AI 員工已存在（可另存一份副本，改用新代號匯入）");
                 continue;
             }
         }
@@ -245,6 +260,7 @@ async fn import_agents(
             model_preferred: model_pref,
             soul_body: Some(body),
         };
+        ctx.note_agent(&final_id);
         if let Err(e) = crate::scaffold_agent_dir(&ctx.home, &scaffold).await {
             report.skipped("agent", &final_id, format!("建立失敗: {e}"));
             continue;
@@ -281,6 +297,9 @@ fn import_commands(ctx: &InstallCtx, dir: &Path, report: &mut Report, record: &m
         return;
     };
     for entry in rd.flatten() {
+        if ctx.stopping() {
+            break;
+        }
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
@@ -327,6 +346,7 @@ fn import_commands(ctx: &InstallCtx, dir: &Path, report: &mut Report, record: &m
             report.imported("command", &name);
             continue;
         }
+        ctx.note_path(&dest_dir);
         if std::fs::create_dir_all(&dest_dir)
             .and_then(|_| std::fs::write(dest_dir.join("SKILL.md"), &skill_md))
             .is_ok()

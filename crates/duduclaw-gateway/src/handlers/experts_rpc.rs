@@ -43,76 +43,8 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "packs": packs }))
     }
 
-    pub(crate) async fn handle_experts_install(&self, params: Value) -> WsFrame {
-        let Some(path) = params.get("path").and_then(|v| v.as_str()) else {
-            return WsFrame::error_response("", "path parameter is required");
-        };
-        let src = std::path::Path::new(path);
-        if !src.exists() {
-            return WsFrame::error_response("", "安裝來源不存在（請重新上傳）");
-        }
-        // Only what `POST /api/experts/upload` staged: since agent-definition
-        // formats are recognised by common file names (`AGENTS.md`,
-        // `SOUL.md`), an arbitrary server path (a home directory, a repo)
-        // would otherwise qualify. Directory installs stay a CLI action.
-        let staged = match (
-            src.canonicalize(),
-            crate::expert_admin::upload_dir(&self.home_dir).canonicalize(),
-        ) {
-            (Ok(s), Ok(dir)) => s.starts_with(&dir) && s.is_file(),
-            _ => false,
-        };
-        if !staged {
-            return WsFrame::error_response("", "安裝來源必須是透過儀表板上傳的檔案（請重新上傳）");
-        }
-        let accepted_ext = src
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(crate::expert_admin::upload_extension)
-            .is_some();
-        if !accepted_ext {
-            return WsFrame::error_response("", "安裝來源必須是 .zip、.md 或 .yml 檔");
-        }
-        let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        // Reuse the full CLI install pipeline via our own binary. Hooks are
-        // NEVER auto-trusted from the dashboard — they land disabled with an
-        // approval request (fail-closed), decided in the approval center.
-        // The machine-readable report comes back through a private temp file.
-        let report_path = crate::expert_admin::upload_dir(&self.home_dir)
-            .join(format!("report-{}.json", uuid::Uuid::new_v4()));
-        if let Some(parent) = report_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut args = vec!["install".into(), src.as_os_str().to_os_string()];
-        if dry_run {
-            args.push("--dry-run".into());
-        }
-        args.push("--report-json".into());
-        args.push(report_path.as_os_str().to_os_string());
-        match Self::attach_under_args(&params) {
-            Ok(extra) => args.extend(extra),
-            Err(frame) => return frame,
-        }
-        let result = self.spawn_pack_cli(&args, 300).await;
-        let report = std::fs::read_to_string(&report_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-        let _ = std::fs::remove_file(&report_path);
-        match result {
-            Ok(output) => WsFrame::ok_response(
-                "",
-                json!({ "success": true, "dry_run": dry_run, "output": output, "report": report }),
-            ),
-            // A failed run still wrote its report (what was detected, what was
-            // refused and why): hand it back so the dashboard can show it.
-            Err(e) if report.is_some() => WsFrame::ok_response(
-                "",
-                json!({ "success": false, "dry_run": dry_run, "error": e, "report": report }),
-            ),
-            Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
-        }
-    }
+    // `experts.install` (upload → plan → install, structured failures)
+    // lives in `experts_import_rpc.rs`.
 
     /// `experts.skills_apply` — apply the approval-center decision for an
     /// import's disabled skills (approve → enable; deny / expire → stay off).
@@ -194,7 +126,9 @@ impl MethodHandler {
     }
 
     /// [`Self::spawn_cli_group`] with the binary given, so tests can observe
-    /// the argv without touching the process-wide `DUDUCLAW_BIN`.
+    /// the argv without touching the process-wide `DUDUCLAW_BIN`. The error
+    /// is plain text: the CLI's own failure message when it gave one (never
+    /// the machine-readable marker line), else the output tail.
     pub(crate) async fn spawn_cli_group_with_bin(
         &self,
         bin: &std::path::Path,
@@ -202,31 +136,9 @@ impl MethodHandler {
         args: &[std::ffi::OsString],
         timeout_secs: u64,
     ) -> Result<String, String> {
-        let fut = tokio::process::Command::new(bin)
-            .arg(group)
-            .args(args)
-            .env("DUDUCLAW_HOME", &self.home_dir)
-            .kill_on_drop(true)
-            .output();
-        let output =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => return Err(format!("子程序啟動失敗: {e}")),
-                Err(_) => return Err(format!("子程序逾時（{timeout_secs} 秒），已中止")),
-            };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Strip ANSI-free console tail for surfacing (CJK-safe truncation).
-        let tail = |s: &str| duduclaw_core::truncate_chars(s.trim(), 1200);
-        if !output.status.success() {
-            let detail = if stderr.trim().is_empty() {
-                &stdout
-            } else {
-                &stderr
-            };
-            return Err(tail(detail));
-        }
-        Ok(tail(&stdout))
+        self.spawn_cli_group_detailed(bin, group, args, timeout_secs)
+            .await
+            .map_err(|f| f.text)
     }
 
     pub(crate) async fn handle_experts_remove(&self, params: Value) -> WsFrame {
@@ -354,12 +266,14 @@ impl MethodHandler {
             }
             let mut args = vec!["install".into(), pack_dir.into_os_string()];
             args.extend(attach_args);
+            args.extend(self.agent_cap_args().await);
+            // The dashboard adds its own "安裝失敗" prefix: send the reason only.
             return match self.spawn_pack_cli(&args, 300).await {
                 Ok(output) => WsFrame::ok_response(
                     "",
                     json!({ "success": true, "slug": slug, "output": output }),
                 ),
-                Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+                Err(e) => WsFrame::error_response("", &e),
             };
         }
 
@@ -409,6 +323,7 @@ impl MethodHandler {
 
         let mut args = vec!["install".into(), cache_pack.into_os_string()];
         args.extend(attach_args);
+        args.extend(self.agent_cap_args().await);
         match self.spawn_pack_cli(&args, 300).await {
             Ok(output) => WsFrame::ok_response(
                 "",
@@ -418,7 +333,7 @@ impl MethodHandler {
                     "output": output,
                 }),
             ),
-            Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
+            Err(e) => WsFrame::error_response("", &e),
         }
     }
 

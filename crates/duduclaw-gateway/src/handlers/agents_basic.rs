@@ -103,63 +103,69 @@ impl MethodHandler {
     /// reached. Self-hosted deployments (Apache 2.0) are NEVER capped; a
     /// `max` of 0 in features.toml means unlimited.
     pub(crate) async fn tier_limit_message(&self, kind: &str, current: usize) -> Option<String> {
-        // Personal-edition agent cap. B+C decision (2026-07-16): UNLIMITED by
-        // default (`personal_max_agents()` = 0, honoring the self-host
-        // promise); the dashboard shows a soft upgrade hint above the
-        // recommended size instead. `DUDUCLAW_PERSONAL_MAX_AGENTS` lets a
-        // managed/hosted deployment opt into a hard cap. Enterprise edition
-        // falls through to the license-tier logic below.
-        if kind == "agent" && self.resolve_edition_profile().await.is_personal() {
-            let cap = duduclaw_core::EditionProfile::personal_max_agents();
-            if crate::license_runtime::cap_exceeded(cap, current) {
+        if kind == "agent" {
+            let cap = self.effective_agent_cap().await;
+            if !crate::license_runtime::cap_exceeded(cap, current) {
+                return None;
+            }
+            if self.resolve_edition_profile().await.is_personal() {
                 return Some(format!(
                     "個人版最多可建立 {cap} 個 AI 員工。\
                      如需調整授權範圍，請聯絡總經銷：\
                      https://futurecorp.tw"
                 ));
             }
-            // Under the personal cap → allow, without consulting license tiers.
-            return None;
+            let tier = crate::license_runtime::global()?.current_tier().await;
+            return Some(format!(
+                "您的方案（{tier}）最多可建立 {cap} 個Agent。\
+                 如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw"
+            ));
         }
 
         let rt = crate::license_runtime::global()?;
-
-        // P-License §7 decision (b): a signed per-license `max_agents` override is
-        // the issuer's EXPLICIT intent to cap this seat count, so it overrides the
-        // "self-host is never limited" default (an OEM/self-host distributor who
-        // sells "system + N agents" must actually be held to N). Only the agent
-        // cap participates in this override — channels keep the pure self-host
-        // exemption.
-        let agent_override = kind == "agent" && rt.snapshot().await.max_agents.is_some();
-
-        // Apache 2.0 promise: never limit self-host. Default deployment is
-        // self-host, so the limit only ever bites managed Cloud tenants — UNLESS
-        // an explicit signed agent-count override says otherwise (§7(b)). Channels
-        // keep the pure self-host exemption.
-        let is_self_host = crate::license_runtime::is_self_host_deployment();
-        let enforce = match kind {
-            "agent" => crate::license_runtime::agent_cap_enforced(is_self_host, agent_override),
-            _ => !is_self_host,
-        };
-        if !enforce {
+        // Apache 2.0 promise: never limit self-host. Channels keep the pure
+        // self-host exemption (only the agent cap has a signed override).
+        if crate::license_runtime::is_self_host_deployment() {
             return None;
         }
         let tier = rt.current_tier().await;
         let max = match kind {
-            // Uses the effective (override > tier) limit so a per-license quota
-            // actually bites, not just the tier default.
-            "agent" => rt.effective_max_agents().await,
             "channel" => rt.feature_gate().max_channels(tier),
             _ => 0,
         };
         if !crate::license_runtime::cap_exceeded(max, current) {
             return None;
         }
-        let noun = if kind == "agent" { "Agent" } else { "通道" };
         Some(format!(
-            "您的方案（{tier}）最多可建立 {max} 個{noun}。\
+            "您的方案（{tier}）最多可建立 {max} 個通道。\
              如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw"
         ))
+    }
+
+    /// The agent-count cap in force for this gateway (`0` = unlimited) —
+    /// the one decision `agents.create`, `templates.create` and the pack
+    /// importer (`experts.install` passes it as `--agent-cap`) all use.
+    ///
+    /// Personal edition: `personal_max_agents()` (unlimited by default per
+    /// the B+C decision of 2026-07-16; `DUDUCLAW_PERSONAL_MAX_AGENTS` opts a
+    /// hosted deployment into a hard cap), without consulting license tiers.
+    /// Otherwise the license: a signed per-license `max_agents` override is
+    /// the issuer's explicit intent to cap the seat count and applies even
+    /// self-hosted (P-License §7(b)); without one, self-host is never capped.
+    pub(crate) async fn effective_agent_cap(&self) -> usize {
+        if self.resolve_edition_profile().await.is_personal() {
+            return duduclaw_core::EditionProfile::personal_max_agents();
+        }
+        let Some(rt) = crate::license_runtime::global() else {
+            return 0;
+        };
+        let agent_override = rt.snapshot().await.max_agents.is_some();
+        let is_self_host = crate::license_runtime::is_self_host_deployment();
+        if !crate::license_runtime::agent_cap_enforced(is_self_host, agent_override) {
+            return 0;
+        }
+        // Effective limit (override > tier) so a per-license quota bites.
+        rt.effective_max_agents().await
     }
 
     /// Count configured channels across global config.toml + every agent's

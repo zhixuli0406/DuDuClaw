@@ -912,37 +912,57 @@ pub async fn agent_cap_message_from_disk(
     home_dir: &std::path::Path,
     current: usize,
 ) -> Option<String> {
+    let cap = agent_cap_from_disk(home_dir).await;
+    if !cap_exceeded(cap.max, current) {
+        return None;
+    }
+    let max = cap.max;
+    Some(match cap.tier {
+        None => format!(
+            "個人版最多可建立 {max} 個 AI 員工。\
+             如需調整授權範圍，請聯絡總經銷：\
+             https://futurecorp.tw"
+        ),
+        Some(tier) => format!(
+            "您的方案（{tier}）最多可建立 {max} 個 Agent。\
+             如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw"
+        ),
+    })
+}
+
+/// The agent-count cap that applies to this home, resolved from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCap {
+    /// `0` = unlimited (or not enforced on this deployment).
+    pub max: usize,
+    /// The license tier when the cap comes from the license; `None` for
+    /// the Personal-edition cap.
+    pub tier: Option<String>,
+}
+
+/// [`agent_cap_message_from_disk`]'s decision without a count: the cap a
+/// caller outside the gateway must hold to. Used by the pack importer,
+/// which adds several employees at once and so has to compare
+/// `current + adding` itself.
+pub async fn agent_cap_from_disk(home_dir: &std::path::Path) -> AgentCap {
     let runtime = LicenseRuntime::bootstrap(home_dir.to_path_buf(), production_registry()).await;
     let snapshot = runtime.snapshot().await;
     let edition =
         duduclaw_core::EditionProfile::resolve_from_env(None, Some(snapshot.tier.as_toml_key()));
 
     if edition.is_personal() {
-        let cap = duduclaw_core::EditionProfile::personal_max_agents();
-        if cap_exceeded(cap, current) {
-            return Some(format!(
-                "個人版最多可建立 {cap} 個 AI 員工。\
-                 如需調整授權範圍，請聯絡總經銷：\
-                 https://futurecorp.tw"
-            ));
-        }
-        return None;
+        return AgentCap { max: duduclaw_core::EditionProfile::personal_max_agents(), tier: None };
     }
 
     let agent_override = snapshot.max_agents.is_some();
     let is_self_host = is_self_host_deployment();
     if !agent_cap_enforced(is_self_host, agent_override) {
-        return None;
+        return AgentCap { max: 0, tier: Some(snapshot.tier.to_string()) };
     }
-    let max = runtime.effective_max_agents().await;
-    if !cap_exceeded(max, current) {
-        return None;
+    AgentCap {
+        max: runtime.effective_max_agents().await,
+        tier: Some(snapshot.tier.to_string()),
     }
-    Some(format!(
-        "您的方案（{}）最多可建立 {max} 個 Agent。\
-         如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw",
-        snapshot.tier
-    ))
 }
 
 // ── Phone-home loop ───────────────────────────────────────────

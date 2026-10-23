@@ -24,13 +24,20 @@ pub fn norm(s: &str) -> String {
 impl NameBook {
     /// Every name the current employees answer to.
     pub fn load(home: &Path) -> Self {
+        Self::load_excluding(home, &BTreeSet::new())
+    }
+
+    /// [`Self::load`] without the employees whose directory names are in
+    /// `skip` — used when a re-import is about to replace exactly those
+    /// employees, so their names are free for the new version.
+    pub fn load_excluding(home: &Path, skip: &BTreeSet<String>) -> Self {
         let mut taken = BTreeSet::new();
         let Ok(rd) = std::fs::read_dir(home.join("agents")) else {
             return NameBook { taken };
         };
         for e in rd.flatten() {
             let dir_name = e.file_name().to_string_lossy().into_owned();
-            if dir_name.starts_with('.') || dir_name.starts_with('_') {
+            if dir_name.starts_with('.') || dir_name.starts_with('_') || skip.contains(&dir_name) {
                 continue;
             }
             taken.insert(norm(&dir_name));
@@ -114,5 +121,16 @@ mod tests {
         assert_eq!(d2, "業務小美-doubao-a1");
         let (free, changed) = book.unique_display("報告顧問", "doubao-a2");
         assert_eq!((free.as_str(), changed), ("報告顧問", false));
+    }
+
+    #[test]
+    fn excluded_employees_free_their_names() {
+        let home = tempfile::tempdir().unwrap();
+        agent(home.path(), "doubao-a1", "報告顧問", "@報告顧問");
+        agent(home.path(), "sales", "業務小美", "@小美");
+        let skip: BTreeSet<String> = ["doubao-a1".to_string()].into_iter().collect();
+        let book = NameBook::load_excluding(home.path(), &skip);
+        assert!(!book.is_taken("報告顧問") && !book.is_taken("doubao-a1"));
+        assert!(book.is_taken("小美"));
     }
 }

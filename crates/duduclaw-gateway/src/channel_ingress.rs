@@ -13,6 +13,9 @@
 //! - `quarantined`: route/authority changed, or could not be read after
 //!   repeated back-off. `close` (and `retry` for `revalidation_unavailable`).
 //! - `closed`: an operator resolved it.
+//! - `merged`: answered as part of the turn of an earlier message of the
+//!   same conversation (its payload moved into that event's payload; see
+//!   [`merge`]). Terminal, does not hold the conversation.
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -23,10 +26,12 @@ pub mod cli_approval;
 pub mod cli_batch;
 pub(crate) mod config;
 mod maintenance;
+mod merge;
 mod resolve;
 mod schema;
 pub(crate) mod snapshot;
 
+pub(crate) use merge::{MergedEvent, merged_json};
 pub(crate) use resolve::ResolveRequest;
 
 pub(crate) const LEASE_SECONDS: i64 = 90;

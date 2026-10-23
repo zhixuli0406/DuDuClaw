@@ -50,6 +50,8 @@ duduclaw pack install <src>        # kindで経路分岐。プレミアム内容
 
 `--dry-run`は1バイトも書き込まずに完全なプランを表示します。すべての項目は正直なレポート(imported / skipped / conflict / warning)に載ります——何も黙って落とされません。`expert remove <slug>`は、インストール記録が「パックが作成した」と言うものだけを削除します。既存のアセットは残ります。
 
+同じパックをもう一度インストールするときは、`--replace <slug>`（以前のバージョンをまずバックアップへ移し、失敗時は元に戻す）か、両方を残す `--as-copy` を付けます。ダッシュボードでも同じ選択肢が表示されます。書き込む前に追加される AI スタッフの数を数え、ライセンスの上限を超える場合はパック全体をインストールしません。エラーコードと対処は[他のプラットフォームから AI スタッフをインポート](../../guides/ja-JP/agent-config-import.md)を参照してください。
+
 ## 組織配置:部門 × ランク
 
 `department`を持つロスターメンバーは、それが`agent.toml`の`[agent] department`に書き込まれ、インストーラーが対応する共有wikiの部門スペースを作成します——新入りは即座に組織図と部門ページに現れます。ランク(`executive` / `manager` / `staff`)は表示用メタデータです:マニフェストが省略した場合はroleから導出されます(`ceo` → executive、`main` / `front_desk` / `team_leader` / `product_manager` → manager、それ以外はstaff)。ランクは導出されるものであり、決して権威を持ちません——階層の唯一の情報源は`reports_to`ツリーのままです。

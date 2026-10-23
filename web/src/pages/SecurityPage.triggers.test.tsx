@@ -15,6 +15,7 @@ const RESPONSE = {
   circuit_breaker: {
     frequency_window_secs: 60, frequency_max_replies: 20, similarity_threshold: 0.8,
     token_explosion_multiplier: 5, cooldown_secs: 30, half_open_allow_count: 3,
+    hard_window_secs: 60, hard_max_messages: 30,
   },
   safety_words: { stop: ['stop'], stop_all: [], resume: [], status: [] },
   defensive_prompt: { enabled: true, languages: ['zh-TW'] },
@@ -46,5 +47,30 @@ describe('SecurityPage kill-switch triggers', () => {
     );
     const params = mockWsClient.call.mock.calls.find(([m]) => m === 'killswitch.update')?.[1] as Record<string, unknown>;
     expect(params.triggers).toEqual({ cost_limit_usd: 25 });
+  });
+
+  // B10 review H1: the hard loop limit is editable on the same card and
+  // goes out with the rest of the circuit-breaker section.
+  it('edits the hard loop limit and sends it with the circuit breaker', async () => {
+    localStorage.setItem('dudu.settings.advanced.security.killswitch', '1');
+    renderWithProviders(<SecurityPage />);
+    const windowInput = (await screen.findAllByTestId('killswitch-hard-window'))[0] as HTMLInputElement;
+    const maxInput = screen.getAllByTestId('killswitch-hard-max')[0] as HTMLInputElement;
+    expect(windowInput.value).toBe('60');
+    expect(maxInput.value).toBe('30');
+    expect(screen.getAllByText('Loop hard-limit window (seconds)').length).toBeGreaterThan(0);
+    fireEvent.change(windowInput, { target: { value: '120' } });
+    fireEvent.change(maxInput, { target: { value: '50' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0]);
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(mockWsClient.call.mock.calls.some(([m]) => m === 'killswitch.update')).toBe(true),
+    );
+    const params = mockWsClient.call.mock.calls.find(([m]) => m === 'killswitch.update')?.[1] as {
+      circuit_breaker: Record<string, number>;
+    };
+    expect(params.circuit_breaker.hard_window_secs).toBe(120);
+    expect(params.circuit_breaker.hard_max_messages).toBe(50);
   });
 });

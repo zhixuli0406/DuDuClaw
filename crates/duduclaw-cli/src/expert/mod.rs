@@ -26,9 +26,12 @@ use duduclaw_core::error::{DuDuClawError, Result};
 pub(crate) mod agent_config;
 pub mod detect;
 pub mod hooks;
+pub(crate) mod import_error;
 mod install;
 pub mod manifest;
 mod plugin;
+mod quota;
+pub(crate) mod reimport;
 pub mod registry;
 mod safe_zip;
 mod skill_import;
@@ -40,6 +43,8 @@ mod zip_names;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod error_code_tests;
 
 /// UI locale for display-name resolution.
 const UI_LOCALE: &str = "zh-TW";
@@ -58,6 +63,33 @@ pub(crate) use source::resolve_source as resolve_pack_source;
 pub(crate) use source::resolve_source_full as resolve_pack_source_full;
 pub(crate) use install::PipelineOpts;
 pub(crate) use detect::resolve_root as resolve_pack_root;
+pub(crate) use import_error::{bad_content, import_err};
+pub(crate) use reimport::ReimportMode;
+
+/// The stderr marker line carrying `e`'s failure code (see
+/// [`import_error::MARKER`]).
+pub(crate) fn import_marker_line(e: &DuDuClawError) -> String {
+    import_error::marker_line(e)
+}
+
+/// Terminal follow-up for `e` (which flag to add), if its code has one.
+pub(crate) fn import_cli_hint(e: &DuDuClawError) -> Option<String> {
+    let (code, params) = import_error::code_and_params(e);
+    reimport::cli_hint(code, &params)
+}
+
+/// Write a report holding only `e` (front-door failures before the
+/// pipeline opened its own report). Never replaces an existing file.
+pub(crate) fn write_failure_report(path: &Path, dry_run: bool, e: &DuDuClawError) {
+    let Ok(mut file) = report::open_report_file(path) else {
+        return;
+    };
+    let body = serde_json::to_string_pretty(&report::failure_report_json(dry_run, e)).unwrap_or_default();
+    use std::io::Write;
+    if let Err(err) = file.write_all(body.as_bytes()) {
+        eprintln!("  ⚠ 寫入匯入報告失敗：{err}");
+    }
+}
 
 #[derive(Subcommand)]
 pub enum ExpertCommands {
