@@ -1526,6 +1526,7 @@ export function EditAgentPage() {
                 onChange={(v) => updateCapConfig('takeover_idle_minutes', clampInt(v, 1, 60))}
               />
               <RowSwitch disabled={!isAdmin} label={t('agents.cap.autoConfirmTrusted')} description={t('agents.cap.autoConfirmTrusted.help')} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
+              <RowSwitch disabled={!isAdmin} label={t('browserLogin.persist')} description={t('browserLogin.persist.help')} checked={caps.computer_use_config.persist_login ?? false} onChange={(v) => updateCapConfig('persist_login', v)} />
             </SettingsCard>
           </DangerZone>
           </fieldset>

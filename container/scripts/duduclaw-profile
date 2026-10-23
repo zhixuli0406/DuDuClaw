@@ -1,0 +1,90 @@
+#!/usr/bin/python3
+"""Root-side lifecycle only; archive parsing runs as the sandbox user."""
+
+import os
+import fcntl
+from pathlib import Path
+import pwd
+import subprocess
+import sys
+import time
+
+ROOT = Path("/tmp/duduclaw-root")
+
+
+def wait_for(check, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.1)
+    raise ValueError("profile lifecycle timed out")
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 3:
+        raise ValueError("invalid profile invocation")
+    action, raw_limit = sys.argv[1:]
+    limit = int(raw_limit)
+    if action not in ("import", "export") or not 1 <= limit <= 128 * 1024 * 1024:
+        raise ValueError("invalid profile invocation")
+    wait_for(lambda: ROOT.is_dir(), 5)
+    lock = None
+    if action == "import":
+        wait_for(lambda: (ROOT / "profile.waiting").exists() or (ROOT / "profile.started").exists(), 10)
+        lock = open(ROOT / "profile.lock", "a", encoding="utf-8")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # The entrypoint waits for this helper before opening Chromium. A
+        # timed-out handshake never permits a late import into a live profile.
+        if not (ROOT / "profile.waiting").exists() or (ROOT / "profile.started").exists():
+            raise ValueError("profile restore window closed")
+    else:
+        (ROOT / "profile.stopping").touch(mode=0o600)
+        sandbox_uid = pwd.getpwnam("sandbox").pw_uid
+
+        # Close through Chromium's own lifecycle. Signalling every Chromium
+        # process also kills its network service before the cookie DB flushes.
+        # If shutdown cannot complete, refuse the snapshot rather than force it.
+        close_browser = """import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, '/usr/local/bin')
+from duduclaw_cdp import WebSocket, list_pages
+pages = list_pages(2)
+if pages:
+    WebSocket(pages[0], 2).call('Browser.close')
+"""
+        subprocess.run(["setpriv", "--reuid=sandbox", "--regid=sandbox", "--init-groups", "--",
+                        "python3", "-c", close_browser],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
+
+        def quiesced():
+            running = False
+            for process in Path("/proc").iterdir():
+                if not process.name.isdecimal():
+                    continue
+                try:
+                    if (process.stat().st_uid == sandbox_uid
+                            and (process / "comm").read_text().strip() == "chromium"
+                            and (process / "stat").read_text().split(') ', 1)[1][0] != 'Z'):
+                        running = True
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+            return not running and (ROOT / "profile.quiesced").exists()
+
+        wait_for(quiesced, 6)
+    command = ["setpriv", "--reuid=sandbox", "--regid=sandbox", "--init-groups", "--",
+               "python3", "/usr/local/bin/duduclaw_profile.py", action, str(limit)]
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        raise ValueError("profile archive refused")
+    if action == "import":
+        (ROOT / "profile.ready").touch(mode=0o600)
+        lock.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        print("profile lifecycle refused", file=sys.stderr)
+        sys.exit(1)

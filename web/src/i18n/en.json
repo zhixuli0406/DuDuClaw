@@ -8616,5 +8616,21 @@
   "skills.manage.bulkBar": "Bulk actions",
   "users.status.active": "Active",
   "users.status.suspended": "Suspended",
-  "users.status.offboarded": "Offboarded"
+  "users.status.offboarded": "Offboarded",
+  "browserLogin.title": "Login state",
+  "browserLogin.keep": "Keep these login changes (the held page may be unsafe)",
+  "browserLogin.keepRefused": "The browser was asked to stop, but these login changes were not saved.",
+  "browserLogin.enable": "Allow browser login persistence",
+  "browserLogin.enable.help": "Off by default. Each employee also needs its own setting. Saved logins let the employee browse as that account.",
+  "browserLogin.persist": "Save this employee's logins",
+  "browserLogin.persist.help": "Requires the administrator's global setting. Saves at normal shutdown and restores next time; websites may still require sign-in.",
+  "browserLogin.maxMiB": "Saved-state limit per employee (MiB)",
+  "browserLogin.retentionDays": "Retention days (0 keeps indefinitely)",
+  "browserLogin.saved": "Login state is saved.",
+  "browserLogin.empty": "No saved login state.",
+  "browserLogin.disabled": "Persistence is off. Saved logins are not used and still expire under the retention policy.",
+  "browserLogin.details": "{size} MiB · {hosts} websites · Updated {date}",
+  "browserLogin.reset": "Clear login state",
+  "browserLogin.reset.confirm": "This ends the current browser and clears saved logins. Sign in again next time.",
+  "browserLogin.reset.done": "Login state cleared."
 }

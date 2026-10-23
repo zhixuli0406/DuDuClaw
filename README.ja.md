@@ -243,6 +243,7 @@ duduclaw license             # ライセンス管理(activate / status / redeem 
 - **特権昇格なし**:完全にユーザー空間で動作
 - **メンテナ**:嘟嘟數位科技有限公司(台湾登記企業、統一編号 94139082)
 - **チャネルでの高リスク操作**:AI社員がチャネルで高リスクな Computer Use ステップの承認を求めたら、リクエストの完全な ID を付けて返信します。結果が不明な操作は自動で再送されず、Admin がダッシュボードで確定させます。詳しくは[運用ガイド](docs/guides/ja-JP/durable-channel-decisions.md)
+- **ブラウザーログイン保存（未リリース）**：社員ごとのコンテナーログインを暗号化して保存できます。既定は無効で、削除・所有者変更に対応します。実コンテナー検証は未完了です。[ガイド](docs/guides/ja-JP/browser-login-state.md)。
 
 各リリース資産には 3 種類の検証手段が付属します:SHA-256 チェックサム、[cosign](https://github.com/sigstore/cosign) keyless 署名、minisign Ed25519 署名(内蔵オートアップデータはこの署名を必須とし、未署名・改竄されたリリースを拒否します):
 

@@ -115,6 +115,7 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   // after the operator opens the 工具與權限 tab.
   autonomy_level: 'approver',
   computer_use_config: {
+    persist_login: false,
     allowed_apps: [],
     blocked_actions: [],
     max_session_minutes: 30,

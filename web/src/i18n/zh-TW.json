@@ -8616,5 +8616,21 @@
   "skills.manage.bulkBar": "批次操作",
   "users.status.active": "在職",
   "users.status.suspended": "已停權",
-  "users.status.offboarded": "已離職"
+  "users.status.offboarded": "已離職",
+  "browserLogin.title": "登入狀態",
+  "browserLogin.keep": "保留這次登入變動（暫停中的頁面可能不安全）",
+  "browserLogin.keepRefused": "瀏覽器已要求結束，但沒有保存這次登入變動。",
+  "browserLogin.enable": "允許保存瀏覽器登入",
+  "browserLogin.enable.help": "預設關閉。開啟後仍需為每位員工個別設定；保存的登入會讓員工以該帳號瀏覽網站。",
+  "browserLogin.persist": "保存這位員工的登入",
+  "browserLogin.persist.help": "需要管理員先開啟全域保存功能。只在正常結束時保存，下次開啟時還原；網站可能仍要求重新登入。",
+  "browserLogin.maxMiB": "每位員工的保存上限（MiB）",
+  "browserLogin.retentionDays": "保留天數（0 表示不自動清除）",
+  "browserLogin.saved": "已保存登入狀態。",
+  "browserLogin.empty": "尚未保存登入狀態。",
+  "browserLogin.disabled": "目前未啟用保存。已保存的登入暫不使用，仍依保留期限清除。",
+  "browserLogin.details": "{size} MiB · {hosts} 個網站 · 更新於 {date}",
+  "browserLogin.reset": "清除登入狀態",
+  "browserLogin.reset.confirm": "這會結束目前的瀏覽器，清除保存的登入；下次需要重新登入。",
+  "browserLogin.reset.done": "已清除登入狀態。"
 }

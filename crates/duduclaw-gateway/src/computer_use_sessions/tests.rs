@@ -134,6 +134,8 @@ struct FakeState {
     /// VNC server starts, by mode.
     vnc_starts: Mutex<Vec<&'static str>>,
     fail_vnc: AtomicBool,
+    owner_changed: AtomicBool,
+    login_discarded: AtomicBool,
 }
 
 /// The fake container access a viewer gets.
@@ -241,6 +243,19 @@ impl SessionBackend for FakeBackend {
     }
     fn control(&self) -> Arc<OrchestratorControl> {
         Arc::clone(&self.control)
+    }
+    fn login_owner_valid(&self) -> bool {
+        !self.state.owner_changed.load(Ordering::SeqCst)
+    }
+    fn discard_login(&mut self) {
+        self.state.login_discarded.store(true, Ordering::SeqCst);
+    }
+    fn login_state(&self) -> &str {
+        if self.state.login_discarded.load(Ordering::SeqCst) {
+            "discarded"
+        } else {
+            "disabled"
+        }
     }
 }
 
@@ -2578,6 +2593,8 @@ mod workspace_docker;
 
 #[path = "tests/live_cases.rs"]
 mod live_cases;
+#[path = "tests/profile_cases.rs"]
+mod profile_cases;
 
 // ── 2026-10: action rules on the computer-use route ─────────────────────
 

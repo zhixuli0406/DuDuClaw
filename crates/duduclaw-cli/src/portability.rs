@@ -21,7 +21,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
 /// Top-level directory names skipped during export (heavy or ephemeral).
-const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target"];
+const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target", "computer_profiles"];
 
 /// `true` if a top-level entry name should be excluded from the export.
 fn is_excluded(name: &str) -> bool {
@@ -155,6 +155,7 @@ mod tests {
 
     #[test]
     fn excludes_heavy_and_ephemeral() {
+        assert!(is_excluded("computer_profiles"));
         assert!(is_excluded("models"));
         assert!(is_excluded("logs"));
         assert!(is_excluded("backup_2026"));

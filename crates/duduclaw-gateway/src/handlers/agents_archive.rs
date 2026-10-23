@@ -81,6 +81,13 @@ impl MethodHandler {
         // Its own knowledge collection (資料來源 tab) is archived with it:
         // nobody reads it through a share until the employee is restored.
         self.kb_own_offboard(agent_id).await;
+        if let Err(error) =
+            crate::computer_use_sessions::workspace_admin::admin_sessions(&self.home_dir)
+                .forget_login(agent_id, "agent_removed")
+                .await
+        {
+            tracing::warn!(agent = %agent_id, error = %error, "browser login cleanup pending after offboarding");
+        }
         Ok(())
     }
 

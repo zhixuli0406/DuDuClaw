@@ -468,6 +468,22 @@ impl ComputerUseSessions {
     /// ends the session at its next check), then the end itself when the
     /// lock comes free within [`STOP_LOCK_WAIT`].
     pub async fn live_stop(&self, agent_id: &str, ctx: &UserContext) -> Result<Value, OpError> {
+        self.live_stop_with_login(agent_id, ctx, false).await
+    }
+
+    pub async fn live_stop_with_login(
+        &self,
+        agent_id: &str,
+        ctx: &UserContext,
+        keep_login: bool,
+    ) -> Result<Value, OpError> {
+        let may_keep = || {
+            live_identity(&self.home, ctx)
+                .is_some_and(|live| live_view::authorize(&live, agent_id, LiveAction::Control))
+        };
+        if keep_login && !may_keep() {
+            return Err(OpError::new(ErrorCode::Forbidden, "permission denied"));
+        }
         let entry = self.entry(agent_id).ok_or_else(no_session)?;
         let operator = operator_label(ctx);
         self.audit_operator(agent_id, "operator_stop", json!({"session_id": entry.session_id}), &operator);
@@ -477,10 +493,85 @@ impl ComputerUseSessions {
             tokio::time::timeout(STOP_LOCK_WAIT, Arc::clone(&entry.session).lock_owned()).await
             && session.session_id == entry.session_id
         {
-            self.end_and_wait(&mut session, EndReason::OperatorStopped).await;
+            if keep_login {
+                if may_keep() {
+                    session
+                        .shared
+                        .keep_held_login
+                        .store(true, Ordering::Release);
+                } else {
+                    session
+                        .shared
+                        .discard_profile
+                        .store(true, Ordering::Release);
+                }
+            }
+            self.end_and_wait(&mut session, EndReason::OperatorStopped)
+                .await;
             ended = true;
         }
-        Ok(json!({"ok": true, "session_id": entry.session_id, "ended": ended}))
+        let login_state = entry
+            .shared
+            .profile_result
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        Ok(
+            json!({"ok": true, "session_id": entry.session_id, "ended": ended,
+            "keep_login_honored": login_state.as_deref() == Some("saved"), "login_state": login_state}),
+        )
+    }
+
+    /// Resetting login state never exports the session being terminated.
+    pub async fn reset_login(&self, agent_id: &str, ctx: &UserContext) -> Result<(), OpError> {
+        if let Some(entry) = self.entry(agent_id) {
+            entry.shared.discard_profile.store(true, Ordering::Release);
+            let result = self.live_stop(agent_id, ctx).await?;
+            if result["ended"] != true {
+                return Err(OpError::new(
+                    super::ErrorCode::Unavailable,
+                    "瀏覽器正在結束，請稍後再清除登入狀態。",
+                ));
+            }
+        }
+        crate::computer_profiles::reset(&self.home, agent_id).map_err(|_| {
+            OpError::new(
+                super::ErrorCode::Unavailable,
+                "目前無法清除瀏覽器登入狀態，請稍後再試。",
+            )
+        })?;
+        self.audit_operator(
+            agent_id,
+            "profile_reset",
+            json!({"reason": "operator"}),
+            &operator_label(ctx),
+        );
+        Ok(())
+    }
+
+    /// Host-owned offboarding/handover hook. No operator impersonation and
+    /// no export of the previous owner's login state.
+    pub(crate) async fn forget_login(&self, agent_id: &str, reason: &str) -> Result<(), String> {
+        let caps =
+            duduclaw_core::agent_toml::load(&self.home.join("agents").join(agent_id)).capabilities;
+        let saved = crate::computer_profiles::state(&self.home, agent_id)?.is_some();
+        if !saved
+            && !(caps.computer_use_config.persist_login
+                && crate::computer_profiles::ProfilesConfig::active(&self.home).is_some())
+        {
+            return Ok(());
+        }
+        if let Some(entry) = self.entry(agent_id) {
+            entry.shared.discard_profile.store(true, Ordering::Release);
+            entry.control.stopped.store(true, Ordering::Release);
+            let mut session = Arc::clone(&entry.session).lock_owned().await;
+            self.end_and_wait(&mut session, EndReason::CapabilityRevoked)
+                .await;
+        }
+        crate::computer_profiles::reset(&self.home, agent_id)?;
+        self.audit_line(agent_id, "profile_deleted", json!({"reason": reason}), None)
+            .await;
+        Ok(())
     }
 
     /// Reaper step: end every lease whose idle limit ran out.

@@ -70,6 +70,8 @@ COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
 COPY container/scripts/duduclaw-eval-dom /usr/local/bin/duduclaw-eval-dom
 COPY container/scripts/duduclaw-navigate /usr/local/bin/duduclaw-navigate
 COPY container/scripts/duduclaw_cdp.py /usr/local/bin/duduclaw_cdp.py
+COPY container/scripts/duduclaw-profile /usr/local/bin/duduclaw-profile
+COPY container/scripts/duduclaw_profile.py /usr/local/bin/duduclaw_profile.py
 # Live view (P8): started on demand by the gateway through `docker exec`.
 # x11vnc listens only on a unix socket (`-rfbport 0 -rfbportv6 -1`) in the
 # root-only /tmp/duduclaw-root. The helper refuses if 5900-5999 still listens.
@@ -78,7 +80,8 @@ COPY container/scripts/duduclaw-vnc-relay /usr/local/bin/duduclaw-vnc-relay
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh \
         /usr/local/bin/duduclaw-eval-dom /usr/local/bin/duduclaw-navigate \
         /usr/local/bin/duduclaw-vnc /usr/local/bin/duduclaw-vnc-relay \
-    && chmod 0644 /usr/local/bin/duduclaw_cdp.py
+        /usr/local/bin/duduclaw-profile \
+    && chmod 0644 /usr/local/bin/duduclaw_cdp.py /usr/local/bin/duduclaw_profile.py
 
 # Managed Chromium policies (container/scripts/chromium-policy.json):
 #   - name resolution through /etc/hosts only (the gateway's --add-host

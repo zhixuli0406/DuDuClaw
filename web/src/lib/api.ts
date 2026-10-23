@@ -4033,6 +4033,7 @@ export interface IdentityResolveResult {
 export type ComputerUseMode = 'container' | 'native' | 'auto';
 
 export interface ComputerUseConfig {
+  persist_login?: boolean;
   allowed_apps?: string[];
   blocked_actions?: string[];
   max_session_minutes?: number;
