@@ -47,10 +47,27 @@ browser remain separate required work.
   `sha256:75335e96884213916b7e523b2ddee0466036604501aadde0a56bb099005df48f`
   on Docker Desktop macOS arm64. Test-binary SHA-256:
   `e096e7c4ef9974b11adfc869b4c665ed7e8b069cf1da0992189c7a341febbbd1`.
+- The final shipping CLI (SHA-256
+  `5ef7b834486a174a458f2d2dab1896f4853b6e903866f8e13aad638d0883e15e`)
+  and the actual production dashboard build completed an isolated Chrome journey:
+  normal Stop displayed saved state; a fresh start returned restored and actual
+  CDP Cookie inspection confirmed the synthetic value; dashboard Clear stopped
+  the running container and removed saved state. The 390px layout had no horizontal
+  overflow. The gateway, preview process and owned containers were stopped.
+- This dashboard journey also found an independent existing VNC defect: x11vnc's
+  IP allowlist rejected its Unix peer named localhost. The live picture succeeded
+  with the separate [VNC fix #207](https://github.com/zhixuli0406/DuDuClaw/pull/207)
+  overlaid on the local profile image. Chrome displayed a synthetic coloured page
+  and viewer count one. This is a combined local candidate, not a published image
+  or a claim that the original VNC helper passed.
+- The manually prepared GUI fixture initially lacked a machine encryption key.
+  Saving correctly failed closed. After initializing an owner-only random mock
+  machine key in that isolated home, the save/restore/clear journey passed. No
+  real OS keychain, website account or fresh-install key provisioning was tested.
 
 ## Remaining gates
 
-- Complete the isolated native dashboard journey with the final shipping binary.
+- Complete final CI and integrate the separately reviewed VNC helper correction.
 - Verify real website account sign-in separately; no personal account has been
   used in the fixture. No broad claim about website compatibility is supported.
 - CI on the final revision, Linux/amd64/Windows boundaries, merge and user
