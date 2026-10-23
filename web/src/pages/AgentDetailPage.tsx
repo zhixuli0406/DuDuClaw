@@ -82,6 +82,19 @@ const AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const TAB_IDS = ['overview', 'work', 'records', 'files', 'computer', 'sources'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
+/** Old or guessed tab paths and the tab that holds that content. */
+const TAB_ALIASES: Readonly<Record<string, TabId>> = {
+  'data-sources': 'sources',
+  datasources: 'sources',
+  knowledge: 'sources',
+  documents: 'sources',
+  file: 'files',
+  profile: 'files',
+  tasks: 'work',
+  history: 'records',
+  activity: 'records',
+};
+
 const MOOD_EMOJI: Record<string, string> = {
   focused: '🧐',
   relaxed: '😌',
@@ -111,7 +124,15 @@ export function AgentDetailPage() {
   const params = useParams();
   const id = params.id ?? '';
   const rawTab = params.tab ?? 'overview';
-  const tab: TabId = (TAB_IDS as readonly string[]).includes(rawTab) ? (rawTab as TabId) : 'overview';
+  const knownTab = (TAB_IDS as readonly string[]).includes(rawTab);
+  const tab: TabId = knownTab ? (rawTab as TabId) : (TAB_ALIASES[rawTab.toLowerCase()] ?? 'overview');
+  // An unknown tab path lands on the closest real tab and the address bar says so
+  // (it used to show the overview under a URL that named something else).
+  useEffect(() => {
+    if (id && params.tab && !knownTab) {
+      navigate(`/agents/${encodeURIComponent(id)}${tab === 'overview' ? '' : `/${tab}`}`, { replace: true });
+    }
+  }, [id, params.tab, knownTab, tab, navigate]);
 
   const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);

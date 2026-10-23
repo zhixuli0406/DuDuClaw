@@ -392,6 +392,25 @@ async fn hard_rules_reject_and_base_hash_conflicts() {
 }
 
 #[tokio::test]
+async fn history_names_the_editor_and_keeps_the_review_reason() {
+    let f = fixture().await;
+    test_seam::set(&f.home, |_| Ok("not json".into()));
+    let r = ok(&f.save(&f.admin, "soul", "管理員版本", json!({})).await);
+    let id = r["review"]["analysis_id"].as_str().unwrap().to_string();
+    ok(&f.save(&f.admin, "soul", "管理員版本", json!({ "action": "confirm", "analysis_id": id, "reason": "我看過內容了", "acknowledge_risk": true })).await);
+    let hist = ok(&f.call("agent_files.history", json!({ "agent_id": "a1", "file": "soul" }), &f.admin).await);
+    let v = &hist["versions"][0];
+    assert_eq!(v["user_id"], "admin-1");
+    assert_eq!(v["user_name"], "admin-1", "display name of the account, resolved on read");
+    assert_eq!(v["confirm_reason"], "我看過內容了");
+    assert!(v.get("email").is_none() && !v.to_string().contains("example.invalid"), "no email in the history");
+    // A deleted account reads as null (the UI says "a deleted user").
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute("DELETE FROM users WHERE id='admin-1'", []).unwrap();
+    let hist = ok(&f.call("agent_files.history", json!({ "agent_id": "a1", "file": "soul" }), &f.operator).await);
+    assert!(hist["versions"][0]["user_name"].is_null(), "{hist}");
+}
+
+#[tokio::test]
 async fn applied_save_updates_registry_baseline_history_and_notice() {
     let f = fixture().await;
     test_seam::set(&f.home, |_| Ok(PASS.into()));

@@ -68,7 +68,7 @@ describe('<ChangeReviewDialog>', () => {
   it('keeps applied open when the automatic check did not finish', () => {
     renderDialog(res('applied', { review: review({ verdict: 'pass', basis: 'rules+ai_unavailable', reasons: [] }) }));
     expect(screen.getByRole('dialog')).toBeInTheDocument();
-    expect(screen.getByText(en['agentFiles.review.analysisUnavailable'])).toBeInTheDocument();
+    expect(screen.getByText(en['agentFiles.review.analysisUnavailableApplied'])).toBeInTheDocument();
   });
 
   it('needs_confirmation: plain reasons, evidence, and a required reason', async () => {

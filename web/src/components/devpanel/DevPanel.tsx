@@ -161,7 +161,9 @@ export function DevPanel() {
         aria-label={intl.formatMessage({ id: 'devpanel.open' })}
         title={intl.formatMessage({ id: 'devpanel.open' })}
         className={cn(
-          'fixed bottom-20 right-4 z-40 flex size-11 items-center justify-center rounded-full',
+          // Below md the corner is the composer's send button (and the bottom nav sits
+          // under it), so the launcher only floats on wider screens; `~` still summons it.
+          'fixed bottom-20 right-4 z-40 hidden size-11 items-center justify-center rounded-full md:flex',
           'bg-surface-raised text-muted-foreground shadow-[var(--floating-shadow)] ring-1 ring-surface-border',
           'transition-colors hover:bg-surface-hover hover:text-foreground',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',

@@ -201,6 +201,7 @@ impl MethodHandler {
             self.live(ctx, agent_id, AccessLevel::Operator)?;
             crate::agent_files::file_path(&self.home_dir, agent_id, &key)?;
             let versions = history::list(&self.home_dir, agent_id, &key);
+            let versions = with_editor_names(&self.home_dir, &versions);
             Ok(json!({ "agent_id": agent_id, "file": key.as_str(), "versions": versions }))
         })())
     }
@@ -455,4 +456,40 @@ enum ApplyRefusal {
     /// The file no longer matches the request's `base_hash`.
     Changed,
     Other(String),
+}
+
+/// Each kept version plus `user_name`: the editor's display name, resolved
+/// when read from `users.db` (read-only, the same source the permission check
+/// uses; never the email). `null` when the account no longer exists or the
+/// database cannot be read; the UI then says "a deleted user". The `system`
+/// marker and empty ids carry no name.
+fn with_editor_names(home: &std::path::Path, versions: &[history::VersionEntry]) -> Vec<Value> {
+    let conn = match crate::review_evidence::audience::readonly_db(&home.join("users.db")) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "agent_files.history: editor names unavailable");
+            None
+        }
+    };
+    let mut cache: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    versions
+        .iter()
+        .map(|v| {
+            let mut row = serde_json::to_value(v).unwrap_or(Value::Null);
+            let id = v.user_id.as_str();
+            if !id.is_empty() && id != "system" {
+                let name = cache
+                    .entry(id.to_string())
+                    .or_insert_with(|| {
+                        let conn = conn.as_ref()?;
+                        conn.query_row("SELECT display_name FROM users WHERE id = ?1", [id], |r| r.get::<_, String>(0))
+                            .ok()
+                            .filter(|n| !n.trim().is_empty())
+                    })
+                    .clone();
+                row["user_name"] = json!(name);
+            }
+            row
+        })
+        .collect()
 }

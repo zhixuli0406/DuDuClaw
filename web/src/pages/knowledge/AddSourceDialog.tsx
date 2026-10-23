@@ -171,6 +171,8 @@ export function AddSourceDialog({
         </DialogHeader>
         <Segmented aria-label={t('kb.add.modeLabel')} value={mode} onValueChange={setMode} options={modeOptions} />
 
+        {/* One body box for all three modes: the dialog is centred, so a body that changed height moved it. */}
+        <div className="min-h-[19rem]" data-testid="add-source-body">
         {mode === 'file' && (
           <div className="space-y-3">
             <div
@@ -330,6 +332,7 @@ export function AddSourceDialog({
             )}
           </div>
         )}
+        </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={close}>
