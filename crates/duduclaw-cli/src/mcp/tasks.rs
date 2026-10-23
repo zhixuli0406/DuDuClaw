@@ -314,6 +314,9 @@ pub(crate) async fn handle_tasks_create(
                 .unwrap_or(false),
             parent_task_id: parent_task_id.clone(),
             source_label: String::new(),
+            // An employee's own goal: no person is named here (the PR that
+            // carries the human principal through MCP sets it from the host).
+            ..Default::default()
         };
         return match duduclaw_gateway::goal_create_core::create_goal_task(home_dir, &store, req)
             .await

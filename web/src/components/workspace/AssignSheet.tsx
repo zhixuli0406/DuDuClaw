@@ -6,6 +6,7 @@ import { ChevronRight } from 'lucide-react';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { useAssignStore, type AssignMode } from '@/stores/assign-store';
 import {
   Button,
@@ -86,6 +87,9 @@ export function AssignSheet() {
   const [priority, setPriority] = useState('medium');
   const [durationHours, setDurationHours] = useState('');
   const [riskBoundary, setRiskBoundary] = useState('');
+  // A per-goal risk boundary replaces the deployment baseline: Admin only
+  // (the gateway refuses it from anyone else).
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [requireBeliefs, setRequireBeliefs] = useState(false);
   const [showMore, setShowMore] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
@@ -175,7 +179,7 @@ export function AssignSheet() {
         acceptance_criteria: composeCriteria(),
         priority: priority as 'low' | 'medium' | 'high' | 'urgent',
         duration_hours: parsedDuration,
-        risk_boundary: riskBoundary.trim() || undefined,
+        risk_boundary: (isAdmin && riskBoundary.trim()) || undefined,
         require_beliefs: requireBeliefs || undefined,
         plan_first: planFirst || undefined,
       });
@@ -383,6 +387,7 @@ export function AssignSheet() {
                       />
                     </div>
 
+                    {isAdmin && (
                     <div className="space-y-1.5">
                       <label htmlFor="assign-risk" className="text-xs font-medium text-muted-foreground">
                         {intl.formatMessage({ id: 'goals.create.riskBoundary' })}
@@ -398,6 +403,7 @@ export function AssignSheet() {
                         {intl.formatMessage({ id: 'goals.create.riskBoundaryHint' })}
                       </p>
                     </div>
+                    )}
 
                     <div className="space-y-1.5">
                       <label className="flex items-center gap-2 text-sm font-medium text-foreground">

@@ -1265,7 +1265,16 @@ pub async fn intercept_pending_confirmation(
         return Some("⏰ 剛剛那個目標建議已經逾時作廢了，若還想立案請重新描述一次。".to_string());
     }
 
-    Some(settle_pending(ctx, session_id, &pending, choice).await)
+    // A confirmed suggestion records the person it was created for, like a
+    // typed `/goal` (the sender's verified dashboard account, if any).
+    let principal = crate::chat_commands::channel_principal(&ctx.home_dir, session_id, user_id);
+    Some(
+        crate::chat_commands::with_goal_principal(
+            principal,
+            settle_pending(ctx, session_id, &pending, choice),
+        )
+        .await,
+    )
 }
 
 async fn record_outcome(
@@ -1366,6 +1375,10 @@ fn build_plan_first_task(
     }
     if !chat_id.is_empty() {
         task.source_chat_id = Some(chat_id);
+    }
+    if let Some((who, via)) = crate::chat_commands::current_goal_principal() {
+        task.on_behalf_of = Some(who);
+        task.created_via = Some(via);
     }
     crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
     task
