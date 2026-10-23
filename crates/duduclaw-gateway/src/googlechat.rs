@@ -57,8 +57,11 @@ const GCHAT_TEXT_CHUNK: usize = 4000;
 pub struct GoogleChatState {
     pub(crate) ctx: Arc<ReplyContext>,
     creds: GoogleChatCreds,
-    /// One message at a time per space, in arrival order (B10).
+    /// One message at a time per space and sender, in arrival order, with
+    /// a cap per sender and per space (B10).
     queue: crate::conversation_queue::ConversationQueue,
+    /// "Queue full" notices: one per sender per minute, one per space per 10 s.
+    full_notices: crate::conversation_queue::NoticeThrottle,
 }
 
 /// Said in the space when its queue of waiting messages is full.
@@ -241,6 +244,7 @@ pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -
         ctx: ctx.clone(),
         creds,
         queue: Default::default(),
+        full_notices: Default::default(),
     });
 
     // Verify credentials eagerly so the dashboard shows real status.
@@ -327,22 +331,39 @@ async fn webhook_handler(
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
         "MESSAGE" => {
-            // One space's messages are answered one at a time, in order
-            // (they used to run concurrently, B10).
+            // One sender's messages in a space are answered one at a time,
+            // in order (they used to run concurrently, B10).
             let space = event_space(&event);
+            if space.is_empty() {
+                warn!("Google Chat: MESSAGE event without space name — refused");
+                return (StatusCode::BAD_REQUEST, "bad request").into_response();
+            }
+            let sender = event
+                .pointer("/message/sender/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             let st = state.clone();
             let queued = event.clone();
             if state
                 .queue
-                .submit(&space, async move { handle_message(&st, &queued).await })
+                .submit_in(&space, &format!("{space}|{sender}"), async move {
+                    handle_message(&st, &queued).await
+                })
                 .is_err()
             {
-                warn!("Google Chat: queue full for a space; telling the sender");
-                let st = state.clone();
-                tokio::spawn(async move {
-                    let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
-                    create_message(&st.creds, &space, thread, QUEUE_FULL_TEXT).await;
-                });
+                let notify = state.full_notices.allow(&[
+                    (&format!("sender:{space}|{sender}"), std::time::Duration::from_secs(60)),
+                    (&format!("space:{space}"), std::time::Duration::from_secs(10)),
+                ]);
+                warn!(notify, "Google Chat: queue full for a space or sender");
+                if notify {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
+                        create_message(&st.creds, &space, thread, QUEUE_FULL_TEXT).await;
+                    });
+                }
             }
             // ACK synchronously with an empty body — the reply arrives
             // asynchronously via the REST API.
