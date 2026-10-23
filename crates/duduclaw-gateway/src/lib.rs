@@ -253,6 +253,8 @@ pub mod situation_classifier;
 // WP5c — conversation → knowledge-base semantic routing.
 pub mod auto_wiki_page;
 pub mod builtin_skills_seed_migration;
+/// One-time upgrade migration for `[odoo] allow_private_network`.
+pub mod odoo_private_network_migration;
 /// X1 方案 2 — the tool-call audit trail as the causal graph's first real source.
 pub mod causal_audit_ingest;
 pub mod causal_extraction_runner;

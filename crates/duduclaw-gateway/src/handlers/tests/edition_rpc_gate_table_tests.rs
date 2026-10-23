@@ -61,6 +61,7 @@ fn personal_surfaces_are_untouched() {
         // 設定檔編輯 (agent_files.*) — a Personal owner edits their own employees too
         "agent_files.list",
         "agent_files.get",
+        "agent_files.runtime_files",
         "agent_files.diff",
         "agent_files.history",
         "agent_files.save",

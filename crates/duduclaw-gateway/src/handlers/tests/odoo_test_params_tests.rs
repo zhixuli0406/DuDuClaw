@@ -15,7 +15,7 @@ fn full_params() -> Value {
 
 #[test]
 fn happy_path_returns_config_and_credential() {
-    let (cfg, cred) = MethodHandler::build_test_config_from_params(&full_params()).unwrap();
+    let (cfg, cred) = MethodHandler::build_test_config_from_params(&full_params(), false).unwrap();
     assert_eq!(cfg.url, "https://fc00.example.com/odoo");
     assert_eq!(cfg.db, "odoo_demo");
     assert_eq!(cfg.protocol, "jsonrpc");
@@ -28,14 +28,14 @@ fn happy_path_returns_config_and_credential() {
 #[test]
 fn missing_url_is_rejected() {
     let p = json!({ "db": "x" });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("url"), "got: {err}");
 }
 
 #[test]
 fn missing_db_is_rejected() {
     let p = json!({ "url": "https://x.example.com" });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("db"), "got: {err}");
 }
 
@@ -43,18 +43,33 @@ fn missing_db_is_rejected() {
 fn http_non_localhost_url_is_rejected() {
     // SSRF guard: only HTTPS, except for strict localhost.
     let p = json!({ "url": "http://evil.example.com", "db": "x" });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("HTTPS"), "got: {err}");
 }
 
 #[test]
 fn private_ip_is_rejected() {
     let p = json!({ "url": "https://10.0.0.1", "db": "x" });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
-    assert!(
-        err.contains("HTTPS") || err.contains("localhost"),
-        "got: {err}"
-    );
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
+    assert!(err.contains("允許連到內網的 Odoo"), "got: {err}");
+}
+
+#[test]
+fn private_ip_follows_the_admin_switch_but_metadata_never_passes() {
+    let p = json!({ "url": "https://10.0.0.1", "db": "x" });
+    // Stored switch on.
+    let (cfg, _) = MethodHandler::build_test_config_from_params(&p, true).unwrap();
+    assert!(cfg.allow_private_network);
+    // Switch sent with the form wins over the stored value.
+    let on = json!({ "url": "https://10.0.0.1", "db": "x", "allow_private_network": true });
+    assert!(MethodHandler::build_test_config_from_params(&on, false).is_ok());
+    let off = json!({ "url": "https://10.0.0.1", "db": "x", "allow_private_network": false });
+    assert!(MethodHandler::build_test_config_from_params(&off, true).is_err());
+    // Metadata / loopback stay refused with the switch on.
+    for url in ["https://169.254.169.254", "https://metadata.google.internal", "https://127.0.0.1"] {
+        let p = json!({ "url": url, "db": "x", "allow_private_network": true });
+        assert!(MethodHandler::build_test_config_from_params(&p, true).is_err(), "{url}");
+    }
 }
 
 #[test]
@@ -65,14 +80,14 @@ fn fc00_dotted_hostname_is_not_misclassified_as_ipv6_ula() {
         "url": "https://fc00.example.com",
         "db": "test",
     });
-    let res = MethodHandler::build_test_config_from_params(&p);
+    let res = MethodHandler::build_test_config_from_params(&p, false);
     assert!(res.is_ok(), "got: {res:?}");
 }
 
 #[test]
 fn invalid_db_name_is_rejected() {
     let p = json!({ "url": "https://x.example.com", "db": "bad name!" });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("database name"), "got: {err}");
 }
 
@@ -83,7 +98,7 @@ fn invalid_protocol_is_rejected() {
         "db": "x",
         "protocol": "soap",
     });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("protocol"), "got: {err}");
 }
 
@@ -94,7 +109,7 @@ fn invalid_auth_method_is_rejected() {
         "db": "x",
         "auth_method": "oauth",
     });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("auth_method"), "got: {err}");
 }
 
@@ -107,7 +122,7 @@ fn missing_credential_returns_none_for_fallback() {
         "db": "x",
         "auth_method": "api_key",
     });
-    let (_cfg, cred) = MethodHandler::build_test_config_from_params(&p).unwrap();
+    let (_cfg, cred) = MethodHandler::build_test_config_from_params(&p, false).unwrap();
     assert!(cred.is_none());
 }
 
@@ -118,7 +133,7 @@ fn empty_credential_string_treated_as_missing() {
         "db": "x",
         "api_key": "",
     });
-    let (_cfg, cred) = MethodHandler::build_test_config_from_params(&p).unwrap();
+    let (_cfg, cred) = MethodHandler::build_test_config_from_params(&p, false).unwrap();
     assert!(cred.is_none());
 }
 
@@ -131,7 +146,7 @@ fn password_auth_method_picks_password_field() {
         "password": "pw",
         "api_key": "should-be-ignored",
     });
-    let (cfg, cred) = MethodHandler::build_test_config_from_params(&p).unwrap();
+    let (cfg, cred) = MethodHandler::build_test_config_from_params(&p, false).unwrap();
     assert_eq!(cfg.auth_method, "password");
     assert_eq!(cred.as_deref(), Some("pw"));
 }
@@ -144,14 +159,14 @@ fn username_over_256_chars_is_rejected() {
         "db": "x",
         "username": long,
     });
-    let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+    let err = MethodHandler::build_test_config_from_params(&p, false).unwrap_err();
     assert!(err.contains("Username"), "got: {err}");
 }
 
 #[test]
 fn localhost_http_is_allowed_for_dev() {
     let p = json!({ "url": "http://127.0.0.1:8069", "db": "dev" });
-    let res = MethodHandler::build_test_config_from_params(&p);
+    let res = MethodHandler::build_test_config_from_params(&p, false);
     assert!(res.is_ok(), "got: {res:?}");
 }
 

@@ -256,6 +256,7 @@ fn configure(conn: &Connection) -> KbResult<()> {
 pub fn migrate(conn: &Connection) -> KbResult<()> {
     conn.execute_batch(DDL)?;
     conn.execute_batch(crate::citations::DDL)?;
+    conn.execute_batch(crate::agent_own::DDL)?;
     let current: Option<String> = conn
         .query_row(
             "SELECT value FROM kb_meta WHERE key='schema_version'",

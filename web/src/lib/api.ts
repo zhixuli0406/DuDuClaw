@@ -24,6 +24,7 @@ import type {
   AgentFileHistoryResponse,
   AgentFileKey,
   AgentFileListResponse,
+  AgentRuntimeFilesResponse,
   AgentFilePendingResponse,
   AgentFileSaveParams,
   AgentFileSaveResponse,
@@ -2324,6 +2325,8 @@ export interface OdooConfig {
   poll_interval_seconds: number;
   poll_models: string[];
   webhook_enabled: boolean;
+  /** Admin-only: allow an Odoo server on an internal network address. */
+  allow_private_network?: boolean;
   /**
    * Whether each write-only credential is on file. The values stay server-side;
    * these flags are what let the form say "已儲存（留空表示不變更）" instead of
@@ -2355,6 +2358,7 @@ export interface OdooConfigUpdate {
   webhook_enabled: boolean;
   webhook_secret?: string;
   unblock_models?: string[];
+  allow_private_network?: boolean;
   features_crm: boolean;
   features_sale: boolean;
   features_inventory: boolean;
@@ -2374,6 +2378,7 @@ export interface OdooTestParams {
   username: string;
   api_key?: string;
   password?: string;
+  allow_private_network?: boolean;
 }
 
 // ── Read-only SQL data sources (`db_sources.*`, WP-D §13.7) ──
@@ -7879,6 +7884,9 @@ export const api = {
         file,
         ...(versionId ? { version_id: versionId } : {}),
       }) as Promise<AgentFileGetResponse>,
+    /** The generated CLI context files (read-only). */
+    runtimeFiles: (agentId: string) =>
+      client.call('agent_files.runtime_files', { agent_id: agentId }) as Promise<AgentRuntimeFilesResponse>,
     /** Compare `content` (or a stored `version_id`) against the current file
      *  (or `against`, another version id). */
     diff: (

@@ -139,6 +139,9 @@ function CollectionCard({ collection: c, onOpen }: { collection: KbCollection; o
           <SensitivityBadge value={c.sensitivity} />
           {c.my_role && <Badge variant="outline">{t(`kb.role.${c.my_role}`)}</Badge>}
           {c.department && <Badge variant="ghost">{c.department}</Badge>}
+          {c.own_agent && (
+            <Badge variant="ghost">{t(c.own_agent.archived ? 'kb.card.ownAgentArchived' : 'kb.card.ownAgent')}</Badge>
+          )}
         </div>
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <FileText aria-hidden className="size-3.5" />

@@ -109,6 +109,16 @@ pub(crate) fn odo_valid_action(action: &str) -> bool {
     }
 }
 
+/// The admin-only global switch `config.toml [odoo] allow_private_network`
+/// (default off; an unreadable file counts as off — fail closed).
+pub(crate) fn read_allow_private_network(home_dir: &Path) -> bool {
+    std::fs::read_to_string(home_dir.join("config.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .map(|t| duduclaw_odoo::OdooConfig::from_toml(&t).allow_private_network)
+        .unwrap_or(false)
+}
+
 /// Apply the per-agent `[odoo]` override fields from `agents.update` params.
 /// Encrypts `api_key`/`password` into their `_enc` variants — cleartext is
 /// never written. Returns the change list (empty if no `odoo` object present).
@@ -247,12 +257,9 @@ pub(crate) fn apply_odoo_to_table(
                 section.remove(*toml_key);
                 changes.push(format!("odoo.{toml_key} cleared"));
             } else {
-                if *toml_key == "url" && !MethodHandler::is_safe_odoo_url(v) {
-                    return Err(
-                        "odoo.url must use HTTPS (http:// only allowed for localhost/127.0.0.1) \
-                         and must not target a private/reserved host"
-                            .into(),
-                    );
+                if *toml_key == "url" {
+                    // Per-agent urls follow the single global admin switch.
+                    duduclaw_odoo::url_guard::check_url(v, read_allow_private_network(home_dir))?;
                 }
                 if *toml_key == "db"
                     && !(v.len() < 64
@@ -320,5 +327,22 @@ mod v168_url_binding_tests {
         apply_odoo_to_table(&mut t, &json!({"odoo": {"url": "https://erp.example.com", "api_key": "***set***"}}), home.path())
             .unwrap();
         assert_eq!(t["odoo"]["api_key_enc"].as_str(), Some("ENC"));
+    }
+
+    #[test]
+    fn agent_private_url_follows_the_global_switch() {
+        let home = tempfile::tempdir().unwrap();
+        let params = json!({"odoo": {"url": "https://10.0.0.7", "api_key": "k"}});
+        let mut t = toml::Table::new();
+        // No config.toml / switch off ⇒ refused with the how-to-enable text.
+        let e = apply_odoo_to_table(&mut t, &params, home.path()).unwrap_err();
+        assert!(e.contains("允許連到內網的 Odoo"), "{e}");
+        // Switch on ⇒ accepted; metadata still refused.
+        std::fs::write(home.path().join("config.toml"), "[odoo]\nallow_private_network = true\n").unwrap();
+        assert!(read_allow_private_network(home.path()));
+        let mut t = toml::Table::new();
+        apply_odoo_to_table(&mut t, &params, home.path()).unwrap();
+        let meta = json!({"odoo": {"url": "https://169.254.169.254", "api_key": "k"}});
+        assert!(apply_odoo_to_table(&mut toml::Table::new(), &meta, home.path()).is_err());
     }
 }

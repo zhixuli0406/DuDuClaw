@@ -182,6 +182,7 @@ mod agent_channels_gchat_rpc;
 mod agent_channels_rpc;
 mod dispatch_core;
 mod dispatch_kb;
+mod dispatch_kb_agent;
 mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
