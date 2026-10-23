@@ -33,17 +33,19 @@
 // The live-test seams (in-memory credential protection, Google REST base
 // override) must never reach a shipped binary.
 #[cfg(all(feature = "live-test-mocks", not(debug_assertions)))]
-compile_error!("the `live-test-mocks` feature is for isolated debug live tests only and must not be enabled in a release build");
+compile_error!(
+    "the `live-test-mocks` feature is for isolated debug live tests only and must not be enabled in a release build"
+);
 
 pub mod a2a_signing;
 pub mod access_control;
-pub mod workflow;
-pub mod review_evidence;
-pub mod workflow_drafts;
-pub mod workflow_draft_context;
 pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
+pub mod review_evidence;
+pub mod workflow;
+pub mod workflow_draft_context;
+pub mod workflow_drafts;
 // ── D7: "every Claude account failed authentication" alarm bell ──────────
 pub mod auth_outage;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
@@ -74,6 +76,7 @@ pub mod network;
 // ── IMPL-POWER: the appliance lock screen's login-free power surface ─────
 pub mod power_local;
 // ── WP-G1: scheduled backups + device-migration restore ──────────────────
+pub mod agent_channels;
 pub mod backup_restore;
 pub mod backup_schedule;
 pub(crate) mod causal_ccr_outbox;
@@ -86,8 +89,8 @@ pub mod channel_typing;
 pub mod claude_runner;
 pub mod config_crypto;
 pub mod connector_lifecycle;
-pub(crate) mod conversation_queue;
 pub mod consolidation_failures;
+pub(crate) mod conversation_queue;
 pub mod cost_telemetry;
 pub mod decision_action;
 pub mod decision_capture;
@@ -105,21 +108,20 @@ pub mod google_service_account;
 pub mod google_workspace;
 pub mod googlechat;
 pub mod googlechat_agents;
-pub mod agent_channels;
+pub mod killswitch_triggers;
 pub mod markdown_render;
 pub mod mcp_external;
 pub mod mcp_internal_key;
 pub mod msteams;
 pub mod notion_workspace;
 pub mod rate_limit_watch;
+pub mod redaction_sources;
 pub(crate) mod synthetic_connector_adapter;
 #[cfg(test)]
 pub(crate) mod test_channel_provider;
 #[cfg(all(test, unix))]
 pub(crate) mod test_exec;
 pub mod watchdog;
-pub mod killswitch_triggers;
-pub mod redaction_sources;
 pub mod webhook_jwt;
 pub mod webhook_slots;
 pub mod wecom;
@@ -136,7 +138,6 @@ pub mod autopilot_engine;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
 pub mod autopilot_store;
-mod image_data;
 pub mod cep_matcher;
 pub mod cron_scheduler;
 pub mod cron_store;
@@ -144,6 +145,7 @@ pub mod cron_templates;
 pub mod departments;
 pub mod distributor_notice;
 pub mod distributor_store;
+mod image_data;
 pub mod license_runtime;
 pub mod license_seed;
 pub mod license_serve;
@@ -159,18 +161,18 @@ pub mod premium_templates;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
-pub mod team_edition;
-pub mod team_history;
-pub mod trigger_route;
-pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
 /// Discovery attempt-container blocks.
 pub mod task_sandbox;
+pub mod task_store;
+pub mod team_edition;
+pub mod team_history;
 pub mod tick_config;
 pub mod tick_headers;
 pub mod tick_source;
 pub mod tick_source_poll;
 pub mod tick_source_ws;
+pub mod trigger_route;
 // WP-E2: box-side relay client (crates/duduclaw-relay's WebSocket
 // counterpart) — reuses tick_source_ws's reconnect-backoff shape, hence the
 // grouping alongside the resident-sensing modules above.
@@ -198,10 +200,10 @@ pub mod delegation;
 pub mod delegation_gate;
 pub mod delegation_router;
 pub mod direct_api;
-/// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
-pub mod discovery;
 pub mod discord;
 pub mod discord_voice;
+/// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
+pub mod discovery;
 pub mod dispatcher;
 /// WP-4G — resource ceilings applied to inbound office / compressed documents
 /// before any parser (LibreOffice, the bundled Python skills) is handed them.
@@ -210,17 +212,17 @@ pub mod email;
 pub mod ephemeral;
 pub mod events_store;
 pub mod expert_admin;
-pub mod expert_replace_journal;
 pub mod expert_generate;
 pub mod expert_generate_staged;
+pub mod expert_replace_journal;
 pub mod expert_skills;
-pub mod process_group;
 pub mod external_factors;
 pub mod footprint_distill;
 pub mod foresight;
 pub mod growth;
 pub mod guardrail;
 pub mod handlers;
+pub mod process_group;
 // G5 (2026-09 feature audit) — one `config.toml [identity]` → provider
 // builder shared by the dashboard RPC, the channel `<sender>` block, and the
 // `identity_resolve` MCP tool (the latter two used to hard-code wiki-cache).
@@ -232,13 +234,13 @@ pub(crate) mod local_session;
 pub mod maintenance;
 pub mod mast;
 pub mod memory_factory;
-pub mod memory_migrate;
 pub mod memory_forget_approval;
 pub mod memory_forget_steps;
-pub mod wiki_host_sources;
+pub mod memory_migrate;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
+pub mod wiki_host_sources;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
 // background poller → autopilot bus. Both transports default OFF.
 pub mod odoo_events;
@@ -251,20 +253,18 @@ pub mod proactive_gate;
 pub mod profile_distill;
 pub mod redteam;
 pub mod relay_client;
-pub mod remote_mcp;
 pub mod relay_config;
 pub mod relay_device;
+pub mod remote_mcp;
 pub mod rule_induction;
 pub mod secaudit_reports;
 pub mod security_posture;
 pub mod setup_token_wizard;
-pub mod subscription_risk_gate;
 pub mod situation_classifier;
+pub mod subscription_risk_gate;
 // WP5c — conversation → knowledge-base semantic routing.
 pub mod auto_wiki_page;
 pub mod builtin_skills_seed_migration;
-/// One-time upgrade migration for `[odoo] allow_private_network`.
-pub mod odoo_private_network_migration;
 /// X1 方案 2 — the tool-call audit trail as the causal graph's first real source.
 pub mod causal_audit_ingest;
 pub mod causal_extraction_runner;
@@ -305,9 +305,16 @@ pub mod decision_synthetic;
 pub mod decision_task_board_export;
 pub mod decision_task_board_shadow;
 pub mod defensive_prompt;
+/// One-time upgrade migration for `[odoo] allow_private_network`.
+pub mod odoo_private_network_migration;
 // Three failover layers under one tree: `failover::model` (model-level
 // timeout/overload fallback, formerly the top-level `llm_fallback` module)
 // alongside `FailoverManager` (runtime-level). See the module header.
+pub mod action_review;
+pub mod agent_files;
+pub mod channel_ingress;
+pub mod decide;
+pub mod digest;
 pub mod failover;
 pub mod fault_attribution;
 pub mod feishu;
@@ -319,11 +326,11 @@ pub mod install_notify;
 pub mod install_requests;
 pub mod knowledge_route;
 pub mod lifecycle_flush;
-pub mod channel_ingress;
 pub mod line;
 pub mod local_llm;
 pub mod log;
 pub mod mail;
+pub(crate) mod mail_poll_status;
 pub mod mail_worker;
 pub mod mcp_oauth;
 pub mod mcp_registry;
@@ -370,7 +377,6 @@ pub mod session_titler_task;
 pub mod skill_approval;
 pub mod skill_gap_digest;
 pub mod skill_lifecycle;
-pub mod agent_files;
 pub mod slack;
 pub mod stt;
 pub mod task_spec;
@@ -387,9 +393,6 @@ mod wiki_mcp_source;
 pub mod wiki_trust_federation;
 pub mod workforce_private;
 pub mod xml_fence;
-pub mod decide;
-pub mod digest;
-pub mod action_review;
 
 // ── Hermes-learnings modules (Phase 3, 4, 6) ──
 pub mod rl;
@@ -409,10 +412,10 @@ pub mod redaction_ner_model;
 pub mod redaction_integration;
 
 // ── RFC-23 §13.6: redaction for external MCP servers + the direct-API loop ──
-pub mod redaction_proxy;
-pub mod third_party_tools;
 pub mod explore_lane;
 pub mod mcp_events;
+pub mod redaction_proxy;
+pub mod third_party_tools;
 
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{GatewayConfig, start_gateway};
@@ -505,10 +508,10 @@ pub mod update_report_reconcile;
 //        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
 //        judge-rejected tasks with feedback ──
 pub mod goal_loop;
-/// P2-A: continuous responsibilities, bounded wake-ups, steering, stop.
-pub mod responsibility;
 #[cfg(test)]
 pub(crate) mod model_call_probe;
+/// P2-A: continuous responsibilities, bounded wake-ups, steering, stop.
+pub mod responsibility;
 // ── Audit O8 (2026-09-29): the eight single-purpose goal-loop modules that
 //        used to live at the crate root were merged into three siblings under
 //        `goal_loop/` — `signals` (A1 gap fingerprint / A2 visit graph / H10
@@ -583,8 +586,8 @@ pub mod role_turns;
 /// gate, and the planner → executor(s) → verifier round.
 pub mod team_composer;
 
-pub mod product_policy;
 pub mod data_exports;
+pub mod product_policy;
 
 /// Thinking display: the normalised `ThinkingEvent`, the per-turn sink and
 /// gate (masking, truncation, CONTRACT checks) and the display policy.

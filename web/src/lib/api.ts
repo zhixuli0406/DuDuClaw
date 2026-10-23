@@ -3480,6 +3480,13 @@ export interface MailStatus {
   sender_allowlist_count: number;
   recipient_allowlist_count: number;
   inbound_dir: string;
+  last_poll?: {
+    checked_at: string;
+    gmail_attempted: boolean;
+    account_unavailable: number;
+    transport_errors: number;
+  } | null;
+  last_poll_error?: boolean;
 }
 
 /** WP-7I — I-5 ⌘K content search. One cross-source hit from `search.query`.

@@ -162,7 +162,6 @@ mod agent_admin;
 mod agent_update;
 mod agents;
 pub(crate) mod approval;
-pub(crate) mod workflow_operation;
 mod audit_reliability;
 mod autopilot_skills;
 mod belief;
@@ -175,10 +174,12 @@ mod cost;
 mod cron_tasks;
 mod decision_tools;
 mod delegation;
+mod discovery;
 mod dispatch;
 mod evolution;
 mod exec;
 mod google;
+mod google_execute_client;
 mod google_identity_client;
 mod identity;
 mod inference;
@@ -191,14 +192,13 @@ mod notion_github;
 mod odoo;
 mod os_tools;
 mod record_authz;
-mod responsibilities;
 mod reminders;
+mod responsibilities;
 mod server;
 mod skills;
 mod skills_lifecycle;
 mod spawn;
 mod tasks;
-mod discovery;
 mod tasks_goals;
 mod team_handoff;
 mod tools_def;
@@ -210,10 +210,10 @@ mod wiki_maint;
 mod wiki_shared;
 mod wiki_shared_ops;
 mod wiki_util;
+pub(crate) mod workflow_operation;
 mod working_state;
 
 pub(crate) use action_guard::*;
-pub(crate) use responsibilities::*;
 pub(crate) use agent_admin::*;
 pub(crate) use agent_update::*;
 pub(crate) use agents::*;
@@ -225,12 +225,12 @@ pub(crate) use bus_tasks::*;
 pub(crate) use channels::*;
 pub(crate) use codrive_mail::*;
 pub(crate) use computer_use_client::handle_computer_use_tool;
-pub(crate) use knowledge_client::{KNOWLEDGE_TOOLS, handle_knowledge_tool};
 pub use config_read::*;
 pub(crate) use cost::*;
 pub(crate) use cron_tasks::*;
 pub(crate) use decision_tools::*;
 pub(crate) use delegation::*;
+pub(crate) use discovery::*;
 pub(crate) use dispatch::*;
 pub(crate) use evolution::*;
 pub(crate) use exec::*;
@@ -238,6 +238,7 @@ pub(crate) use google::*;
 pub(crate) use identity::*;
 pub(crate) use inference::*;
 pub(crate) use jsonrpc::*;
+pub(crate) use knowledge_client::{KNOWLEDGE_TOOLS, handle_knowledge_tool};
 pub(crate) use media_tools::*;
 pub(crate) use memory_tools::*;
 pub(crate) use messaging::*;
@@ -246,12 +247,12 @@ pub(crate) use odoo::*;
 pub(crate) use os_tools::*;
 pub(crate) use record_authz::*;
 pub(crate) use reminders::*;
+pub(crate) use responsibilities::*;
 pub use server::*;
 pub(crate) use skills::*;
 pub(crate) use skills_lifecycle::*;
 pub(crate) use spawn::*;
 pub(crate) use tasks::*;
-pub(crate) use discovery::*;
 pub(crate) use tasks_goals::*;
 pub(crate) use team_handoff::*;
 pub(crate) use tools_def::*;
@@ -265,34 +266,11 @@ pub(crate) use wiki_shared_ops::*;
 pub(crate) use wiki_util::*;
 pub(crate) use working_state::*;
 
+/// 2026-10: tool effect classes, action rules and the explore lane.
 #[cfg(test)]
-mod tests;
+mod action_rules_tests;
 #[cfg(test)]
 mod agent_identity_tests;
-#[cfg(test)]
-mod wiki_schema_tests;
-#[cfg(test)]
-mod task_board_tests;
-#[cfg(test)]
-mod working_state_mcp_tests;
-#[cfg(test)]
-mod team_handoff_mcp_tests;
-#[cfg(test)]
-mod ephemeral_caller_dir_tests;
-#[cfg(test)]
-mod mcp_scope_dispatch_tests;
-#[cfg(test)]
-mod wiki_namespace_tests;
-#[cfg(test)]
-mod odoo_pool_dispatch_tests;
-#[cfg(test)]
-mod skill_description_parser_tests;
-#[cfg(test)]
-mod audit_input_tests;
-#[cfg(test)]
-mod wp5_install_approval_tests;
-#[cfg(test)]
-mod office_script_tests;
 /// R5: `agent.toml` reader directions inside this module, pinned.
 ///
 /// Three readers here moved onto the shared typed parse point
@@ -311,16 +289,39 @@ mod office_script_tests;
 #[cfg(test)]
 mod agent_toml_reader_direction_tests;
 #[cfg(test)]
+mod audit_input_tests;
+#[cfg(test)]
+mod ephemeral_caller_dir_tests;
+#[cfg(test)]
 mod mail_tool_tests;
-/// O7: the `tools/list` fixed-cost budget (golden bytes + description caps).
 #[cfg(test)]
-mod tools_list_budget_tests;
-/// 2026-10: tool effect classes, action rules and the explore lane.
+mod mcp_scope_dispatch_tests;
 #[cfg(test)]
-mod action_rules_tests;
+mod odoo_pool_dispatch_tests;
+#[cfg(test)]
+mod office_script_tests;
+#[cfg(test)]
+mod skill_description_parser_tests;
 /// Standalone profile: `tools/list` for scoped non-employee callers.
 #[cfg(test)]
 mod standalone_listing_tests;
+#[cfg(test)]
+mod task_board_tests;
+#[cfg(test)]
+mod team_handoff_mcp_tests;
+#[cfg(test)]
+mod tests;
+/// O7: the `tools/list` fixed-cost budget (golden bytes + description caps).
+#[cfg(test)]
+mod tools_list_budget_tests;
+#[cfg(test)]
+mod wiki_namespace_tests;
+#[cfg(test)]
+mod wiki_schema_tests;
+#[cfg(test)]
+mod working_state_mcp_tests;
+#[cfg(test)]
+mod wp5_install_approval_tests;
 // ── T5 merged-entry-point regression tests (O3 / O4 / O13) ─────────────────
 #[cfg(test)]
 mod merged_entry_tests;
@@ -331,11 +332,11 @@ mod record_authz_tests;
 #[cfg(test)]
 mod responsibilities_tests;
 // P2-A round 4: host-decided parent for tasks created during a round.
-#[cfg(test)]
-mod round_parent_tests;
 /// Pre-`RecordActor` handler signatures for the existing tests.
 #[cfg(test)]
 mod caller_shims;
+#[cfg(test)]
+mod round_parent_tests;
 // Task audience (U6) in `tasks_list` / `activity_list`.
 #[cfg(test)]
 mod task_audience_mcp_tests;

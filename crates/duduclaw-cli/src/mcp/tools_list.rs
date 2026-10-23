@@ -26,33 +26,14 @@
 use super::*;
 
 pub(crate) use crate::mcp_dispatch::{
-    CODRIVE_TOOLS, COMPUTER_USE_TOOLS, COMPUTER_WORKSPACE_TOOLS, DB_SOURCE_TOOLS, FORK_TOOLS, OS_NATIVE_TOOLS,
-    RECORDING_TOOLS, SYSTEM_OPERATOR_TOOLS,
+    CODRIVE_TOOLS, COMPUTER_USE_TOOLS, COMPUTER_WORKSPACE_TOOLS, DB_SOURCE_TOOLS, FORK_TOOLS,
+    OS_NATIVE_TOOLS, RECORDING_TOOLS, SYSTEM_OPERATOR_TOOLS,
 };
 
 /// Tools hidden while the Google Workspace integration gate is off
 /// (`config.toml [integrations] google_workspace`, default false).
-pub(crate) const GOOGLE_WORKSPACE_TOOLS: &[&str] = &[
-    "google_status",
-    "gmail_search",
-    "gmail_read",
-    "gmail_create_draft",
-    "calendar_list_events",
-    "calendar_create_event",
-    "sheets_read",
-    "sheets_append",
-    "forms_get",
-    "forms_list_responses",
-    "gtasks_lists",
-    "gtasks_list",
-    "gtasks_create",
-    "gtasks_complete",
-    "drive_search",
-    "drive_read",
-    "docs_read",
-    "docs_append",
-    "slides_read",
-];
+pub(crate) const GOOGLE_WORKSPACE_TOOLS: &[&str] =
+    duduclaw_core::google_identity::NATIVE_GOOGLE_TOOLS;
 
 /// GitHub native tools, gated by `[integrations] github` exactly the way
 /// [`GOOGLE_WORKSPACE_TOOLS`] is gated by `[integrations] google_workspace`
@@ -332,12 +313,22 @@ pub(crate) async fn visible_tools_in_lane(
     // not act for the process's agent. Discovery filter only.
     let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, &principal.client_id);
     let scope_listing = scope_listing_applies(principal, client_is_agent, employee_process);
+    let dedicated_google = crate::mcp_auth::dedicated_google_call(home_dir, principal).is_some();
 
     // Per-employee Google identity: an effective `none` hides the group —
     // the same predicate the dispatch gate refuses with.
-    let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir)
-        && super::google_identity_client::GoogleCaller::for_process(home_dir, &principal.client_id)
-            .tools_listed(home_dir);
+    // Listing has no accepted execution marker. Select only a current,
+    // verified employee for display; execution acceptance stays in dispatch.
+    let google_listed = if crate::mcp_auth::dedicated_google_call(home_dir, principal).is_some() {
+        duduclaw_core::google_identity::effective_for(home_dir, Some(&principal.client_id))
+            .effective
+            .tools_listed()
+    } else {
+        super::google_identity_client::GoogleCaller::for_process(home_dir, &principal.client_id)
+            .tools_listed(home_dir)
+    };
+    let google_enabled =
+        duduclaw_gateway::google_workspace::integration_enabled(home_dir) && google_listed;
     // H8: same deny-by-default gate for GitHub — discoverable ⇔ callable.
     let github_enabled = duduclaw_gateway::github_workspace::integration_enabled(home_dir);
 
@@ -366,7 +357,7 @@ pub(crate) async fn visible_tools_in_lane(
         .and_then(|raw| toml::from_str::<crate::mcp_dispatch::PolicyOnlyConfig>(&raw).ok())
         .map(|cfg| cfg.capabilities);
     let member_invalid = is_member && member_caps.is_none();
-    let caps = if principal.is_external || effective_agent.is_empty() {
+    let caps = if (principal.is_external && !dedicated_google) || effective_agent.is_empty() {
         duduclaw_core::types::CapabilitiesConfig::default()
     } else if is_member {
         member_caps.unwrap_or_default()
@@ -375,7 +366,7 @@ pub(crate) async fn visible_tools_in_lane(
         duduclaw_core::agent_toml::load(&agent_dir).capabilities
     };
     let cap_gate: Option<(Vec<String>, Vec<String>)> =
-        if !principal.is_external && !effective_agent.is_empty() {
+        if (!principal.is_external || dedicated_google) && !effective_agent.is_empty() {
             // Raw config fields (NOT the computed accessors) to match the gate.
             // A vanished/invalid ephemeral scaffold must advertise no tools.
             Some((
@@ -426,8 +417,9 @@ pub(crate) async fn visible_tools_in_lane(
     // the call path and the gateway route check
     // (`knowledge_client::available_for`). A grant change moves the set, so
     // the watcher sends `list_changed`.
-    let allow_knowledge =
-        gated_caller && !member_invalid && super::knowledge_client::available_for(home_dir, effective_agent);
+    let allow_knowledge = gated_caller
+        && !member_invalid
+        && super::knowledge_client::available_for(home_dir, effective_agent);
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
@@ -451,7 +443,7 @@ pub(crate) async fn visible_tools_in_lane(
     // Fail-closed on a store error, matching `has_active_grant`'s own posture.
     let mut scoped_without_grant: std::collections::HashSet<&'static str> =
         std::collections::HashSet::new();
-    if gated_caller {
+    if gated_caller || dedicated_google {
         let agent_dir =
             match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, effective_agent) {
                 Some(dir) => dir,
@@ -479,7 +471,7 @@ pub(crate) async fn visible_tools_in_lane(
     // 2026-10: `[capabilities] action_rules` — a `block`ed tool is hidden
     // (mirror of dispatch §3.455, same `action_rule_verdict`); `ask` stays
     // listed because it is callable after an approval.
-    let action_rules = if gated_caller && !member_invalid {
+    let action_rules = if (gated_caller || dedicated_google) && !member_invalid {
         let agent_dir =
             match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, effective_agent) {
                 Some(dir) => dir,
@@ -491,6 +483,9 @@ pub(crate) async fn visible_tools_in_lane(
     };
 
     let tool_allowed_by_capability = |name: &str| -> bool {
+        if principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&name) {
+            return true;
+        }
         let Some((denied, allowed)) = cap_gate.as_ref() else {
             return true; // external / unresolved caller → not gated here
         };
@@ -504,7 +499,14 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| {
             // C4: discoverable ⇔ callable — same predicate as the dispatch
             // gate (legacy whitelist ∪ explicitly-granted grantable scopes).
-            !principal.is_external || crate::mcp_auth::external_tool_allowed(t.name, principal)
+            !principal.is_external
+                || crate::mcp_auth::external_tool_allowed(t.name, principal)
+                || crate::mcp_auth::dedicated_google_tool_allowed(home_dir, principal, t.name)
+        })
+        .filter(|t| {
+            !dedicated_google
+                || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name)
+                || crate::mcp_auth::dedicated_google_tool_allowed(home_dir, principal, t.name)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| github_enabled || !GITHUB_WORKSPACE_TOOLS.contains(&t.name))
@@ -519,17 +521,19 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_cu_workspace || !COMPUTER_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| allow_fork || !FORK_TOOLS.contains(&t.name))
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
-        .filter(|t| {
-            allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name)
-        })
+        .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
         // O7: PORTICO scoped tools without an active grant.
-        .filter(|t| !scoped_without_grant.contains(t.name))
+        .filter(|t| {
+            (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+                || !scoped_without_grant.contains(t.name)
+        })
         // WP-7A bug2: internal per-agent capability filter (mirror of §3.45).
         .filter(|t| tool_allowed_by_capability(t.name))
         // 2026-10: action rules `block` (mirror of §3.455).
         .filter(|t| {
-            crate::mcp_dispatch::action_rule_verdict(&action_rules, t.name)
-                != Some(duduclaw_core::ActionVerdict::Block)
+            (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+                || crate::mcp_dispatch::action_rule_verdict(&action_rules, t.name)
+                    != Some(duduclaw_core::ActionVerdict::Block)
         })
         // 2026-10: read-only explore lane (mirror of dispatch §0b).
         .filter(|t| lane_refusal(lane, t.name).is_none())

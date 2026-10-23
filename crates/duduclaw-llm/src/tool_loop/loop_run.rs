@@ -1,9 +1,9 @@
 //! The loop body itself — [`run_tool_loop_with_provenance_and_ccr`].
 //! Moved verbatim out of `tool_loop.rs`.
 
-use super::*;
 use super::outcome::mask_and_cap;
 use super::telemetry::{CCR_FIND_RATE_LIMITED_MESSAGE, finish_tool_loop};
+use super::*;
 
 /// Tool loop with scoped, durable compression of post-redaction tool results.
 /// Existing callers use [`run_tool_loop_with_provenance`] and remain unchanged.
@@ -154,6 +154,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
             };
 
             let mut ccr_source_original: Option<String> = None;
+            let mut host_notice = None;
             // Third field marks a transformed result: its old CCR call is
             // retired, while a source-only lease still protects egress.
             let mut verified_source_for_delivery: Option<(CcrSourceArtifact, String, bool)> = None;
@@ -163,7 +164,9 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                 (Some(reason), _) => (reason, true, false),
                 // Interceptor refusal — same shape: fed back, never dispatched.
                 (None, Some(reason)) => (reason, true, false),
-                (None, None) if name == CCR_FIND_TOOL && ccr_find_calls >= CCR_FIND_MAX_CALLS_PER_LOOP => {
+                (None, None)
+                    if name == CCR_FIND_TOOL && ccr_find_calls >= CCR_FIND_MAX_CALLS_PER_LOOP =>
+                {
                     telemetry.ccr_find_rate_limited =
                         telemetry.ccr_find_rate_limited.saturating_add(1);
                     tracing::warn!(
@@ -299,6 +302,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                 }
                 (None, None) => match tools.call(&name, args.clone()).await {
                     Ok(outcome) => {
+                        host_notice = outcome.host_notice;
                         let mut source_artifact = outcome.source_artifact;
                         let source_retention_at = outcome.source_retention_at;
                         let mut ccr_eligible = outcome.ccr_eligible;
@@ -661,6 +665,19 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
             }
             if !is_error && let Some(saved_result) = saved_result {
                 ccr_saved_results.push(saved_result);
+            }
+
+            // Preserve the original JSON paths and CCR/source payload above.
+            // A host-only account notice is redacted on its own, then delivered
+            // as separate text for this actual invocation, including failures.
+            if executed && let Some(notice) = host_notice {
+                let mut value =
+                    Value::String(duduclaw_security::audit::mask_sensitive_text(&notice));
+                if let Some(interceptor) = interceptor.as_ref() {
+                    interceptor.after_call(&server, &name, &args, &mut value);
+                }
+                let notice = value_to_result(value, false);
+                content = format!("{notice}\n\n{content}");
             }
 
             // Tool output flows back into the conversation ⇒ register it as a

@@ -8,6 +8,50 @@
 //! discoverable.
 
 use super::{Principal, Scope, tool_requires_scope};
+use std::path::Path;
+
+/// A dedicated employee credential proven by this exact authentication.
+/// Neither ambient process identity nor a caller-provided principal is proof.
+pub(crate) fn dedicated_google_call(
+    home: &Path,
+    principal: &Principal,
+) -> Option<super::AuthenticatedCall> {
+    if principal.client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+        || !crate::mcp_namespace::client_is_agent(home, &principal.client_id)
+    {
+        return None;
+    }
+    let call = super::current_call_matches(principal)?;
+    call.credential_ref().filter(|r| r.is_well_formed())?;
+    // A malformed employee config cannot erase its policy on the new lane.
+    let path = home
+        .join("agents")
+        .join(&principal.client_id)
+        .join("agent.toml");
+    if std::fs::metadata(&path).ok()?.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    toml::from_str::<crate::mcp_dispatch::PolicyOnlyConfig>(&std::fs::read_to_string(path).ok()?)
+        .ok()?;
+    Some(call)
+}
+
+/// The only new external exception: exact native Google tools, explicit scope,
+/// a real employee and the matching same-call credential receipt. Admin is not
+/// a substitute, and no other connector or process-agent tool is exposed.
+pub(crate) fn dedicated_google_tool_allowed(
+    home: &Path,
+    principal: &Principal,
+    tool: &str,
+) -> bool {
+    use duduclaw_core::google_identity::{NativeGoogleScope, native_google_scope};
+    let required = match native_google_scope(tool) {
+        Some(NativeGoogleScope::Read) => Scope::GoogleRead,
+        Some(NativeGoogleScope::Write) => Scope::GoogleWrite,
+        None => return false,
+    };
+    principal.scopes.contains(&required) && dedicated_google_call(home, principal).is_some()
+}
 
 /// C4 (ecosystem WP3.2): scopes an OPERATOR may grant to external clients at
 /// key issuance. Curated and conservative — credential-adjacent connector
@@ -177,7 +221,10 @@ mod external_scope_tests {
             tool_requires_scope("working_state_handoff"),
             Some(Scope::MemoryWrite)
         );
-        assert!(external_tool_allowed("working_state_handoff", &memory_write));
+        assert!(external_tool_allowed(
+            "working_state_handoff",
+            &memory_write
+        ));
         // Wire string round-trips both ways.
         assert_eq!(Scope::TeamHandoff.to_string(), "team:handoff");
         assert!(

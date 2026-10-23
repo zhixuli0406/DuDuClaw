@@ -246,7 +246,11 @@ pub(crate) async fn handle_tools_call(
         "memory_invalidate_by_origin" => {
             let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
             let client_is_agent = duduclaw_core::is_valid_agent_id(caller_client_id)
-                && home_dir.join("agents").join(caller_client_id).join("agent.toml").is_file();
+                && home_dir
+                    .join("agents")
+                    .join(caller_client_id)
+                    .join("agent.toml")
+                    .is_file();
             let acting = crate::mcp_memory_handlers::ai_employee_caller(
                 caller_client_id,
                 env_agent.as_deref(),
@@ -297,8 +301,12 @@ pub(crate) async fn handle_tools_call(
         // call acts for: the process's `default_agent` on the internal key,
         // the key's own client id otherwise (a per-agent key IS the agent).
         "create_agent" => {
-            handle_create_agent(&arguments, home_dir, acting_agent_id(caller_client_id, default_agent))
-                .await
+            handle_create_agent(
+                &arguments,
+                home_dir,
+                acting_agent_id(caller_client_id, default_agent),
+            )
+            .await
         }
         "list_agents" => handle_list_agents(&arguments, home_dir, default_agent).await,
         "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
@@ -309,8 +317,12 @@ pub(crate) async fn handle_tools_call(
         "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, default_agent).await,
         "agent_update" => handle_agent_update(&arguments, home_dir, record_actor).await,
         "agent_remove" => {
-            handle_agent_remove(&arguments, home_dir, acting_agent_id(caller_client_id, default_agent))
-                .await
+            handle_agent_remove(
+                &arguments,
+                home_dir,
+                acting_agent_id(caller_client_id, default_agent),
+            )
+            .await
         }
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
         // T5/O13 merged skill-search entry (`source` picks hubs / bank).
@@ -457,8 +469,10 @@ pub(crate) async fn handle_tools_call(
         // Task Board tools
         "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent, record_actor).await,
         "tasks_create" => handle_tasks_create(&arguments, home_dir, record_actor).await,
-        "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" =>
-            handle_discovery_query(tool_name, &arguments, home_dir, default_agent).await,
+        "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact"
+        | "discovery_cancel" => {
+            handle_discovery_query(tool_name, &arguments, home_dir, default_agent).await
+        }
         "tasks_update" => handle_tasks_update(&arguments, home_dir, record_actor).await,
         "tasks_claim" => handle_tasks_claim(&arguments, home_dir, record_actor).await,
         "tasks_renew" => handle_tasks_renew(&arguments, home_dir, default_agent).await,
@@ -537,7 +551,9 @@ pub(crate) async fn handle_tools_call(
         // `[knowledge]` section are checked in the client with the same
         // predicate `tools/list` uses; every permission decision is the
         // gateway's (`POST /api/internal/knowledge`).
-        "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections"
+        "knowledge_search"
+        | "knowledge_get_passage"
+        | "knowledge_list_collections"
         | "knowledge_add_source" => {
             handle_knowledge_tool(tool_name, &arguments, home_dir, default_agent).await
         }
@@ -707,16 +723,29 @@ pub(crate) async fn handle_tools_call(
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && !google_caller.tools_listed(home_dir) => {
             tool_error("這位 AI 員工設定為不使用 Google。")
         }
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.is_dedicated() => {
+            google_caller
+                .execute_dedicated(home_dir, name, &arguments)
+                .await
+        }
         "google_status" => handle_google_status(home_dir, &google_caller).await,
         "gmail_search" => handle_gmail_search(&arguments, home_dir, &google_caller).await,
         "gmail_read" => handle_gmail_read(&arguments, home_dir, &google_caller).await,
-        "gmail_create_draft" => handle_gmail_create_draft(&arguments, home_dir, &google_caller).await,
-        "calendar_list_events" => handle_calendar_list_events(&arguments, home_dir, &google_caller).await,
-        "calendar_create_event" => handle_calendar_create_event(&arguments, home_dir, &google_caller).await,
+        "gmail_create_draft" => {
+            handle_gmail_create_draft(&arguments, home_dir, &google_caller).await
+        }
+        "calendar_list_events" => {
+            handle_calendar_list_events(&arguments, home_dir, &google_caller).await
+        }
+        "calendar_create_event" => {
+            handle_calendar_create_event(&arguments, home_dir, &google_caller).await
+        }
         "sheets_read" => handle_sheets_read(&arguments, home_dir, &google_caller).await,
         "sheets_append" => handle_sheets_append(&arguments, home_dir, &google_caller).await,
         "forms_get" => handle_forms_get(&arguments, home_dir, &google_caller).await,
-        "forms_list_responses" => handle_forms_list_responses(&arguments, home_dir, &google_caller).await,
+        "forms_list_responses" => {
+            handle_forms_list_responses(&arguments, home_dir, &google_caller).await
+        }
         "gtasks_lists" => handle_gtasks_lists(home_dir, &google_caller).await,
         "gtasks_list" => handle_gtasks_list(&arguments, home_dir, &google_caller).await,
         "gtasks_create" => handle_gtasks_create(&arguments, home_dir, &google_caller).await,

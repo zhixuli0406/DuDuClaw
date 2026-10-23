@@ -29,6 +29,9 @@ pub(super) fn mask_and_cap(text: &str, max_chars: usize) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub content: String,
+    /// Trusted executor notice, never parsed from MCP result metadata. It is
+    /// delivered separately after content redaction and source/CCR checks.
+    pub host_notice: Option<String>,
     pub is_error: bool,
     /// Verified by the executor's trusted connector, never parsed from tool
     /// output text. Generic MCP results leave this unset.
@@ -48,6 +51,7 @@ impl ToolOutcome {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            host_notice: None,
             is_error: false,
             source_artifact: None,
             source_retention_at: None,
@@ -59,12 +63,20 @@ impl ToolOutcome {
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            host_notice: None,
             is_error: true,
             source_artifact: None,
             source_retention_at: None,
             ccr_eligible: false,
             ccr_revoke_call: false,
         }
+    }
+
+    pub fn with_host_notice(mut self, notice: &str) -> Self {
+        if !notice.trim().is_empty() {
+            self.host_notice = Some(duduclaw_core::truncate_chars(notice, 500));
+        }
+        self
     }
 
     pub fn with_source_artifact(mut self, artifact: CcrSourceArtifact) -> Self {

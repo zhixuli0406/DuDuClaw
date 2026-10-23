@@ -1792,10 +1792,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     // None for a utility call. A refusal is returned (fail closed) before any
     // MCP server is started.
     let dot_mcp = crate::runtime::third_party_mcp::tool_loop::servers_for_tool_loop(
-        agent_id,
-        &home_dir,
-        &agent_dir,
-        &externals,
+        agent_id, &home_dir, &agent_dir, &externals,
     )
     .await?;
 
@@ -1840,6 +1837,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
 
     let mut clients = vec![("duduclaw".to_string(), internal)];
     let mut filters = vec![duduclaw_llm::ToolFilter::default()];
+    let mut google_guards = Vec::new();
     for ext in externals {
         // Transport per entry: `url` ⇒ remote Streamable HTTP (Google
         // Workspace official MCP, DocuSeal self-hosted /mcp, …); otherwise
@@ -1866,6 +1864,9 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         match connected {
             Ok(c) => {
                 info!(server = %ext.name, "external MCP server mounted");
+                if let Some(guard) = ext.google_guard {
+                    google_guards.push((clients.len(), guard));
+                }
                 clients.push((ext.name.clone(), c));
                 filters.push(ext.filter);
             }
@@ -1900,7 +1901,30 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     }
 
     let registry = match duduclaw_llm::ToolRegistry::from_clients_named(clients, filters).await {
-        Ok(reg) => Some(reg),
+        Ok(mut reg) => {
+            for (client, guard) in google_guards {
+                if let Some(notice) = guard.fallback_notice()
+                    && reg.set_client_notice(client, notice).is_err()
+                {
+                    warn!("Google MCP fallback notice unavailable — disabling tools");
+                    return Ok(None);
+                }
+                if let Some(notice) = guard.account_notice()
+                    && reg.annotate_client_tools(client, notice).is_err()
+                {
+                    warn!("Google MCP account annotation unavailable — disabling tools");
+                    return Ok(None);
+                }
+                if reg
+                    .register_client_interceptor(client, std::sync::Arc::new(guard))
+                    .is_err()
+                {
+                    warn!("Google MCP live authority unavailable — disabling tools");
+                    return Ok(None);
+                }
+            }
+            Some(reg)
+        }
         Err(e) => {
             // A misbehaving external server can fail the combined tools/list.
             // Degrade to internal-only rather than losing all tools.
@@ -2481,7 +2505,8 @@ async fn try_direct_api_chain(
             continue;
         }
         if policy.require_provider(&provider).is_ok()
-            && candidate_provider_has_key(&provider, home_dir, rotator.as_deref()).await {
+            && candidate_provider_has_key(&provider, home_dir, rotator.as_deref()).await
+        {
             providers_with_keys.insert(provider);
         }
     }
@@ -2510,7 +2535,10 @@ async fn try_direct_api_chain(
     drive_direct_api_chain(&candidates, |model| async move {
         let (provider, bare) = provider_and_bare(&model);
         if let Err(message) = crate::product_policy::require_provider(home_dir, &provider) {
-            return Err(ChainError { message, failover: false });
+            return Err(ChainError {
+                message,
+                failover: false,
+            });
         }
         if provider == "anthropic" {
             match try_direct_api(
@@ -3183,7 +3211,10 @@ async fn call_with_rotation(
     let mut tried: Vec<String> = Vec::new();
 
     for attempt in 0..max_attempts {
-        let selected = match rotator.select_with_pool_excluding(account_pool, &tried).await {
+        let selected = match rotator
+            .select_with_pool_excluding(account_pool, &tried)
+            .await
+        {
             Some(s) => s,
             None => break,
         };
@@ -4099,7 +4130,9 @@ fn prepare_claude_cmd(
     // Thinking display: `--include-partial-messages` only inside a reply turn
     // whose viewer reads thinking text live; dispatch / cron / heartbeat have
     // no sink in scope, so their argv is byte-identical to before.
-    cmd.args(crate::thinking::claude_stream::extra_args(&crate::thinking::policy()));
+    cmd.args(crate::thinking::claude_stream::extra_args(
+        &crate::thinking::policy(),
+    ));
 
     // P1/WP-3: per-call reasoning effort. `--effort <low|medium|high|xhigh|max>`
     // verified on Claude Code 2.1.258 (`--help`), per-invocation only (the CLI
@@ -4760,7 +4793,9 @@ mod rate_limit_classifier_tests {
     /// subscription refused every call.
     #[test]
     fn cli_rate_limit_error_code_classifies() {
-        assert!(is_rate_limit_error("claude CLI assistant error: rate_limit"));
+        assert!(is_rate_limit_error(
+            "claude CLI assistant error: rate_limit"
+        ));
         assert!(is_rate_limit_error(
             "All accounts exhausted. Last error: claude CLI assistant error: rate_limit"
         ));
@@ -4773,7 +4808,9 @@ mod rate_limit_classifier_tests {
             "claude CLI assistant error: authentication_failed"
         ));
         // Advisory field names start with `rate_limit` but are not the code.
-        assert!(!is_rate_limit_error("claude CLI assistant error: rate_limit_info"));
+        assert!(!is_rate_limit_error(
+            "claude CLI assistant error: rate_limit_info"
+        ));
         // The bare token outside the CLI error shape is not enough either.
         assert!(!is_rate_limit_error("field rate_limit present in frame"));
     }
@@ -5198,7 +5235,7 @@ mod chain_tests {
 
     /// P2-B N4: the openai-compat tool loop's MCP server gets the turn and
     /// run in scope.
-        /// 2026-10-20: a `.mcp.json` the gate cannot read refuses the tool
+    /// 2026-10-20: a `.mcp.json` the gate cannot read refuses the tool
     /// loop (`Err`, spawn-gate prefixed) before any MCP server starts; the
     /// openai-compat runtime returns it, the other callers degrade.
     #[tokio::test]
@@ -5211,12 +5248,15 @@ mod chain_tests {
             .await
             .err()
             .expect("refused");
-        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err), "{err}");
+        assert!(
+            duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+            "{err}"
+        );
         assert!(tools_or_degrade::<()>("trader", Err(err)).is_none());
         assert_eq!(tools_or_degrade("trader", Ok(Some(7))), Some(7));
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn mcp_client_envs_carry_the_turn_and_run_in_scope() {
         let envs = crate::memory_provenance::DISPATCH_RUN
             .scope(Some(("dispatch:agnes".into(), "k1".into())), async {
@@ -5329,7 +5369,11 @@ mod redaction_proxy_cli_args_tests {
         // dropped for every dispatch turn.
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&dir))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// 2026-10-08: the explore lane and `action_rules` route third-party
@@ -5338,7 +5382,11 @@ mod redaction_proxy_cli_args_tests {
     fn explore_lane_and_action_rules_route_through_the_proxy() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&dir))
+                .unwrap()
+                .is_none()
+        );
         let (args, _guard) = crate::explore_lane::EXPLORE
             .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap())
             .expect("explore lane proxies third-party servers");
@@ -5349,7 +5397,11 @@ mod redaction_proxy_cli_args_tests {
             "[capabilities]\naction_rules = [{ effect = \"modify\", verdict = \"ask\" }]\n",
         )
         .unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_some());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&dir))
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// 2026-10-08 close-out: when the gate is needed and the gated copy
@@ -5362,15 +5414,26 @@ mod redaction_proxy_cli_args_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".mcp.json"), "{ not json").unwrap();
         // Nothing needs gating ⇒ untouched.
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&dir))
+                .unwrap()
+                .is_none()
+        );
         // Redaction only ⇒ old fallback.
         enable_redaction(tmp.path());
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&dir))
+                .unwrap()
+                .is_none()
+        );
         // Explore lane ⇒ refused with the spawn-gate marker and audited.
         let err = crate::explore_lane::EXPLORE
             .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)))
             .expect_err("explore lane must fail closed");
-        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err), "{err}");
+        assert!(
+            duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err),
+            "{err}"
+        );
         // action_rules ⇒ refused too.
         std::fs::write(
             dir.join("agent.toml"),
@@ -5379,7 +5442,10 @@ mod redaction_proxy_cli_args_tests {
         .unwrap();
         assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_err());
         let audit = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
-        assert!(audit.contains("third_party_gate_config_unavailable"), "{audit}");
+        assert!(
+            audit.contains("third_party_gate_config_unavailable"),
+            "{audit}"
+        );
     }
 
     /// Direct `url` entries are dropped from a gated spawn and audited.
@@ -5389,16 +5455,21 @@ mod redaction_proxy_cli_args_tests {
         let dir = agent_dir_with_mcp_json(tmp.path());
         let mut cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
-        cfg["mcpServers"]["direct"] = json!({ "type": "http", "url": "https://mcp.example.com/mcp" });
+        cfg["mcpServers"]["direct"] =
+            json!({ "type": "http", "url": "https://mcp.example.com/mcp" });
         std::fs::write(dir.join(".mcp.json"), cfg.to_string()).unwrap();
         let (args, _g) = crate::explore_lane::EXPLORE
             .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)))
             .unwrap()
             .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
         assert!(body["mcpServers"].get("direct").is_none());
         let audit = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
-        assert!(audit.contains("third_party_remote_entry_dropped") && audit.contains("direct"), "{audit}");
+        assert!(
+            audit.contains("third_party_remote_entry_dropped") && audit.contains("direct"),
+            "{audit}"
+        );
     }
 
     #[test]
@@ -5407,8 +5478,9 @@ mod redaction_proxy_cli_args_tests {
         let dir = agent_dir_with_mcp_json(tmp.path());
         enable_redaction(tmp.path());
 
-        let (args, guard) =
-            mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().expect("an external stdio server to proxy");
+        let (args, guard) = mcp_proxy_cli_args(tmp.path(), Some(&dir))
+            .unwrap()
+            .expect("an external stdio server to proxy");
         assert_eq!(args[0], "--mcp-config");
         assert_eq!(args[1], guard.to_string_lossy());
         assert_eq!(args[2], "--strict-mcp-config");
@@ -5449,7 +5521,11 @@ mod redaction_proxy_cli_args_tests {
 
         let bare = tmp.path().join("agents").join("no-config");
         std::fs::create_dir_all(&bare).unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&bare)).unwrap().is_none());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&bare))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -5466,7 +5542,11 @@ mod redaction_proxy_cli_args_tests {
                 .to_string(),
         )
         .unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        assert!(
+            mcp_proxy_cli_args(tmp.path(), Some(&dir))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -5516,8 +5596,9 @@ mod redaction_proxy_cli_args_tests {
         )
         .unwrap();
 
-        let (args, guard) =
-            mcp_config_cli_args(tmp.path(), Some(&employee), Some(&member_mcp)).unwrap().unwrap();
+        let (args, guard) = mcp_config_cli_args(tmp.path(), Some(&employee), Some(&member_mcp))
+            .unwrap()
+            .unwrap();
         assert_eq!(args[0], "--mcp-config");
         assert_eq!(args[1], member_mcp.to_string_lossy());
         assert_eq!(args[2], "--strict-mcp-config");
@@ -5539,7 +5620,11 @@ mod redaction_proxy_cli_args_tests {
         )
         .unwrap();
         // Redaction inactive ⇒ no flags at all, auto-discovery untouched.
-        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), None).unwrap().is_none());
+        assert!(
+            mcp_config_cli_args(tmp.path(), Some(&dir), None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -5551,8 +5636,9 @@ mod redaction_proxy_cli_args_tests {
         let missing = tmp.path().join("nope").join(".mcp.json");
         // N10: the missing file is still named with --strict-mcp-config, so
         // the CLI cannot discover the employee's <cwd>/.mcp.json instead.
-        let (args, guard) =
-            mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).unwrap().expect("flags");
+        let (args, guard) = mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing))
+            .unwrap()
+            .expect("flags");
         assert_eq!(
             args,
             vec![
@@ -5611,10 +5697,14 @@ mod instructions_slot_tests {
         std::fs::write(dir.join("SOUL.md"), "SOUL-BODY").unwrap();
         std::fs::write(dir.join("IDENTITY.md"), "IDENTITY-BODY").unwrap();
         std::fs::write(dir.join("INSTRUCTIONS.md"), "INSTRUCTIONS-BODY").unwrap();
-        let agent = duduclaw_agent::registry::AgentRegistry::load_agent(&dir).await.unwrap();
+        let agent = duduclaw_agent::registry::AgentRegistry::load_agent(&dir)
+            .await
+            .unwrap();
         let p = super::build_system_prompt(&agent, None, None);
         let ident = p.find("IDENTITY-BODY").unwrap();
-        let instr = p.find("# Instructions\nINSTRUCTIONS-BODY").expect("instructions injected");
+        let instr = p
+            .find("# Instructions\nINSTRUCTIONS-BODY")
+            .expect("instructions injected");
         assert!(p.find("SOUL-BODY").unwrap() < ident && ident < instr, "{p}");
     }
 }

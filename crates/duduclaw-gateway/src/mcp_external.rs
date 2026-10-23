@@ -127,6 +127,8 @@ pub struct ExternalMcpServer {
     pub headers: Vec<(String, String)>,
     /// Per-server tool visibility filter.
     pub filter: ToolFilter,
+    /// Host-only live authority; never parsed from server output or config.
+    pub(crate) google_guard: Option<crate::google_identity::mcp_mount::GoogleMountGuard>,
 }
 
 impl ExternalMcpServer {
@@ -179,7 +181,9 @@ pub async fn resolve_secret_refs(
 /// bearer to the home token there would silently act as the wrong person —
 /// so those servers are skipped. Unreadable settings skip them too.
 pub fn oauth_google_allowed(agent_dir: &Path, home_dir: &Path) -> bool {
-    use duduclaw_core::google_identity::{Effective, SectionRead, combine, parse_agent_section, read_home_config};
+    use duduclaw_core::google_identity::{
+        Effective, SectionRead, combine, parse_agent_section, read_home_config,
+    };
     let section = match duduclaw_core::agent_toml::read_effective_text(agent_dir) {
         Ok(text) => parse_agent_section(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => SectionRead::Absent,
@@ -291,8 +295,75 @@ pub async fn load_external_mcp_servers_resolved(
     agent_dir: &Path,
     home_dir: &Path,
 ) -> Vec<ExternalMcpServer> {
-    let google_ok = oauth_google_allowed(agent_dir, home_dir);
-    resolve_secret_refs_for(load_external_mcp_servers(agent_dir), home_dir, google_ok).await
+    let mut servers = load_external_mcp_servers(agent_dir);
+    let has_google = servers
+        .iter()
+        .any(|s| s.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF));
+    let prepared = if has_google {
+        Some(
+            crate::google_identity::mcp_mount::GoogleMountGuard::prepare(home_dir, agent_dir).await,
+        )
+    } else {
+        None
+    };
+    let mut token = None;
+    if let Some(prepared) = prepared {
+        match prepared {
+            Ok((bearer, guard)) => {
+                token = Some(bearer);
+                // Only HTTP uses bearer_token. A stdio child's independent
+                // credentials must never be described as this person's.
+                servers.retain(|server| {
+                    let unusable = guard.is_person_identity()
+                        && server.url.is_none()
+                        && server.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF);
+                    if unusable {
+                        tracing::warn!(
+                            "person Google MCP needs HTTP bearer transport — skipping stdio mount"
+                        );
+                    }
+                    !unusable
+                });
+                for server in &mut servers {
+                    if server.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF) {
+                        server.bearer_token = None;
+                        server.google_guard = Some(guard.clone());
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code,
+                    "employee Google MCP identity unavailable — skipping mounts"
+                );
+                let agent = agent_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|id| duduclaw_core::is_valid_agent_id(id))
+                    .unwrap_or("unknown");
+                duduclaw_security::audit::append_tool_call_with_extras(
+                    home_dir,
+                    agent,
+                    "google_mcp_mount",
+                    "Google mount refused",
+                    false,
+                    &[("reason", serde_json::json!(error.code))],
+                );
+                servers.retain(|s| s.bearer_token.as_deref() != Some(OAUTH_GOOGLE_REF));
+            }
+        }
+    }
+    // Resolve other secret refs first. A provider's opaque access token must
+    // never be reinterpreted as a `secret://` configuration instruction.
+    let mut servers = resolve_secret_refs_for(servers, home_dir, false).await;
+    if let Some(token) = token {
+        for server in &mut servers {
+            if server.google_guard.is_some() {
+                server.bearer_token = Some(token.clone());
+            }
+        }
+    }
+    servers
 }
 
 /// Resolve a security-relevant tool-filter list (`allowed_tools`/`denied_tools`).
@@ -477,6 +548,7 @@ pub fn parse_external_servers(sections: &AgentTomlSections) -> Vec<ExternalMcpSe
             bearer_token,
             headers,
             filter,
+            google_guard: None,
         });
     }
     out
@@ -914,7 +986,11 @@ bearer_token = "oauth://google"
             "[google]\nidentity='none'\n",
             "[google]\nidentity='bogus'\n",
         ] {
-            std::fs::write(dir.join("agent.toml"), format!("[agent]\nname='bot'\n{google}")).unwrap();
+            std::fs::write(
+                dir.join("agent.toml"),
+                format!("[agent]\nname='bot'\n{google}"),
+            )
+            .unwrap();
             assert!(!oauth_google_allowed(&dir, home.path()), "{google}");
         }
     }
