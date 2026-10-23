@@ -2614,6 +2614,8 @@ mod profile_cases;
 mod oversight_cases;
 #[path = "tests/profile_docker.rs"]
 mod profile_docker;
+#[path = "tests/team_docker.rs"]
+mod team_docker;
 
 // ── 2026-10: action rules on the computer-use route ─────────────────────
 

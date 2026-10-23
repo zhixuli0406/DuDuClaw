@@ -1304,7 +1304,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // (these replaced the former `_with_artifact` siblings).
                                 // B10 review L1: learn whether an empty answer is a
                                 // deliberate silence (no `no_reply` frame then).
-                                let work = crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+                                let work = crate::computer_use_sessions::attended::verified_webchat_message(sid, Some(auth_user.as_str()), crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
                                     .scope(auth_user.clone(), async {
                                         match &effective_agent {
                                             Some(a) => {
@@ -1320,7 +1320,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 .await
                                             }
                                         }
-                                    }));
+                                    })));
                                 tokio::pin!(work);
                                 // The model the backend ACTUALLY answered with
                                 // (ProgressEvent::ModelInfo) — stamped onto the

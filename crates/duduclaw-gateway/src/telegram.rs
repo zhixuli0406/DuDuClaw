@@ -1467,7 +1467,7 @@ async fn process_telegram_message(
     } else {
         duduclaw_security::circuit_breaker::SenderKind::Person
     };
-    let (reply, guarded) = thinking.scope(crate::channel_reply::as_sender(sender_kind, crate::approval::scope_trusted_reply(target, async {
+    let (reply, guarded) = crate::computer_use_sessions::attended::verified_channel_message(&session_id, &user_id, sender_kind == duduclaw_security::circuit_breaker::SenderKind::Bot, thinking.scope(crate::channel_reply::as_sender(sender_kind, crate::approval::scope_trusted_reply(target, async {
         if let Some((ref called_agent, via_trigger)) = called {
             // Called by `@` (or the one message a tapped employee was
             // waiting for): this message only, in that employee's own
@@ -1530,7 +1530,7 @@ async fn process_telegram_message(
                 SharedRoute::Guide(msg) => (msg, None),
             }
         }
-    })))
+    }))))
     .await;
     drop(typing_guard);
 
