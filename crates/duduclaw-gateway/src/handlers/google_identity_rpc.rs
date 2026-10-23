@@ -51,6 +51,24 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) 
                 Err(e) => ("blocked", e),
             },
         },
+        Effective::Personal { selector } => match people.user_db() {
+            None => ("blocked", "人員資料尚未就緒，請聯絡管理員。".into()),
+            Some(db) => match crate::google_personal::access::select_user(db, agent, selector) {
+                Err(r) => (r.code, r.message_zh),
+                Ok(user) if user.status != duduclaw_auth::UserStatus::Active => ("person_inactive", "負責人目前不是有效帳號。".into()),
+                Ok(user) => match db.google_consent(&user.id, agent) {
+                    Ok(Some(false)) => ("consent_declined", "帳號本人已關閉這位員工的使用權。".into()),
+                    Ok(None) => ("awaiting_consent", "等待帳號本人到「我的連線」允許。".into()),
+                    Err(_) => ("blocked", "本人同意紀錄無法讀取。".into()),
+                    Ok(Some(true)) => match crate::person_credentials::get(home, &user.id) {
+                        Ok(Some(record)) if record.metadata.status == crate::person_credentials::Status::Connected => ("configured", "已保存個人連線；實際使用仍會檢查有效狀態與可用服務。".into()),
+                        Ok(Some(_)) => ("needs_reconnect", "請本人到「我的連線」重新連結。".into()),
+                        Ok(None) => ("not_connected", "本人尚未連結 Google。".into()),
+                        Err(e) => ("blocked", e),
+                    }
+                },
+            }
+        },
         other => (
             "blocked",
             resolve::refusal_for(other)
@@ -62,10 +80,26 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) 
         Effective::Delegate { email } => Some(email.clone()),
         _ => None,
     };
+    let selected_person = match (&eff.effective, people.user_db()) {
+        (Effective::Personal { selector }, Some(db)) => crate::google_personal::access::select_user(db, agent, selector).ok().map(|u| json!({"user_id":u.id,"name":u.display_name,"login_email":u.email})),
+        _ => None,
+    };
+    let owners = people.user_db().and_then(|db| db.get_agent_users(agent).ok().map(|bindings| bindings.into_iter()
+        .filter(|b| b.access_level == AccessLevel::Owner).filter_map(|b| db.get_user(&b.user_id).ok().flatten().map(|u| json!({"user_id":u.id,"name":u.display_name,"email":u.email,"is_primary":b.is_primary}))).collect::<Vec<_>>()));
+    let bound_people = people.user_db().and_then(|db| db.get_agent_users(agent).ok().map(|bindings| bindings.into_iter()
+        .filter_map(|b| db.get_user(&b.user_id).ok().flatten()).filter(|u| u.status == duduclaw_auth::UserStatus::Active)
+        .map(|u| json!({"user_id":u.id,"name":u.display_name,"email":u.email})).collect::<Vec<_>>()));
+    let allowed_channels = std::fs::read_to_string(home.join("agents").join(agent).join("agent.toml")).ok()
+        .and_then(|s| s.parse::<toml::Table>().ok()).and_then(|t| t.get("permissions").and_then(toml::Value::as_table).and_then(|p| p.get("allowed_channels")).cloned());
     json!({
         "agent_id": agent,
         "kind": eff.effective.kind(),
         "email": email,
+        "selected_person": selected_person,
+        "owners": owners,
+        "bound_people": bound_people,
+        "allowed_channels": allowed_channels,
+        "identity": match &eff.effective { Effective::Personal { selector } => Some(selector.to_config_value()), _ => None },
         "explicit": eff.explicit,
         "fallback": eff.fallback.as_str(),
         "requesters": eff.requesters.as_str(),
@@ -98,6 +132,15 @@ impl MethodHandler {
         };
         let home_cfg = gi::read_home_config(&home);
         let people = self.people().await;
+        if let Some(db) = people.user_db() {
+            if let Ok(records) = crate::person_credentials::all_metadata(&home) {
+                for record in records {
+                    if let Ok(user) = db.get_user(&record.owner_id) {
+                        let _ = crate::person_credentials::sync_user_status(&home, &record.owner_id, user.is_some_and(|u| u.status == duduclaw_auth::UserStatus::Active));
+                    }
+                }
+            }
+        }
         let agents: Vec<Value> = {
             let reg = self.registry.read().await;
             let mut names: Vec<String> = reg
@@ -121,6 +164,7 @@ impl MethodHandler {
                     Ok(c) => json!({
                         "default_identity": c.default_identity.to_config_value(),
                         "allowed_subject_domains": c.allowed_subject_domains,
+                        "allowed_domains": c.allowed_domains,
                     }),
                     Err(_) => Value::Null,
                 },
@@ -129,6 +173,7 @@ impl MethodHandler {
                 "required_scopes": crate::google_workspace::REQUIRED_SCOPES,
                 "admin_console_path": ADMIN_CONSOLE_PATH,
                 "agents": agents,
+                "personal_connections": crate::person_credentials::all_metadata(&home).ok(),
             }),
         )
     }
@@ -202,7 +247,7 @@ impl MethodHandler {
         ctx: &UserContext,
     ) -> WsFrame {
         let mut section = toml::Table::new();
-        let current = gi::read_home_config(&self.home_dir).unwrap_or_default();
+        let current = match gi::read_home_config(&self.home_dir) { Ok(c) => c, Err(e) => return WsFrame::error_response("", &e) };
         let default_identity = match params.get("default_identity") {
             None => current.default_identity.to_config_value(),
             Some(Value::String(s)) => match Selector::parse(s) {
@@ -253,6 +298,21 @@ impl MethodHandler {
                 toml::Value::Array(domains.iter().cloned().map(toml::Value::String).collect()),
             );
         }
+        let personal_domains = match params.get("allowed_domains") {
+            None => current.allowed_domains,
+            Some(Value::Array(items)) => {
+                let mut domains = Vec::new();
+                for value in items {
+                    let Some(domain) = value.as_str().map(|s| s.trim().trim_start_matches('@').to_ascii_lowercase()).filter(|s| gi::is_domain(s)) else {
+                        return WsFrame::error_response("", "同事可連結的網域必須是有效的網域清單。");
+                    };
+                    if !domains.contains(&domain) { domains.push(domain); }
+                }
+                domains
+            }
+            Some(_) => return WsFrame::error_response("", "allowed_domains 必須是字串陣列"),
+        };
+        if !personal_domains.is_empty() { section.insert("allowed_domains".into(), toml::Value::Array(personal_domains.iter().cloned().map(toml::Value::String).collect())); }
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
         let mut integrations = table
@@ -274,11 +334,11 @@ impl MethodHandler {
             "google_identity_settings_set",
             Severity::Info,
             ctx,
-            json!({ "default_identity": default_identity, "allowed_subject_domains": domains }),
+            json!({ "default_identity": default_identity, "allowed_subject_domains": domains, "allowed_domains": personal_domains }),
         );
         WsFrame::ok_response(
             "",
-            json!({ "default_identity": default_identity, "allowed_subject_domains": domains }),
+            json!({ "default_identity": default_identity, "allowed_subject_domains": domains, "allowed_domains": personal_domains }),
         )
     }
 
@@ -338,12 +398,32 @@ impl MethodHandler {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        let parsed = match gi::section_from_table(&section) { Ok(p) => p, Err(e) => return WsFrame::error_response("", &e) };
+        let personal_selector = parsed.identity.as_ref().filter(|s| matches!(s, Selector::Owner | Selector::User(_)));
+        let db = self.user_db.read().await.clone();
+        let selected = if let Some(selector) = personal_selector {
+            if self.resolve_edition_profile().await.is_personal() { return super::gates::enterprise_only_reject_frame(); }
+            let Some(db) = &db else { return WsFrame::error_response("", "人員資料尚未就緒。"); };
+            match crate::google_personal::access::select_user(db, &agent_id, selector) {
+                Ok(user) if user.status == duduclaw_auth::UserStatus::Active => Some(user.id),
+                Ok(_) => return WsFrame::error_response("", "指定的同事目前不是有效帳號。"),
+                Err(r) => return WsFrame::error_response("", &r.message_zh),
+            }
+        } else { None };
+        let mut self_consent = false;
+        if !ctx.is_admin() {
+            let before_policy = match &before { gi::SectionRead::Present(p) => p.clone(), gi::SectionRead::Absent => gi::AgentGoogleSection::default(), gi::SectionRead::Invalid(_) => return WsFrame::error_response("", "原本的 Google 設定無法辨識，請管理員修正。") };
+            match crate::google_personal::owner_change::validate(&before_policy, &parsed, &ctx.user_id, selected.as_deref(), params.get("confirm_shared_access").and_then(Value::as_bool) == Some(true)) {
+                Ok(own) => self_consent = own,
+                Err(e) => return WsFrame::error_response("", &e),
+            }
+        }
         if let Some(Selector::Delegate(email)) = section
             .get("identity")
             .and_then(|v| v.as_str())
             .and_then(|s| Selector::parse(s).ok())
         {
-            let cfg = gi::read_home_config(&self.home_dir).unwrap_or_default();
+            let cfg = match gi::read_home_config(&self.home_dir) { Ok(c) => c, Err(e) => return WsFrame::error_response("", &e) };
             if !gi::delegate_domain_allowed(
                 &email,
                 &cfg,
@@ -358,13 +438,18 @@ impl MethodHandler {
             }
         }
         let new_section = section.clone();
+        let expected_before = before.clone();
+        let own_home = self.home_dir.clone();
+        let own_agent = agent_id.clone();
+        let restrict_caller = !ctx.is_admin();
         let result = self
             .update_agent_toml_as(
                 &agent_id,
                 "agents.google_identity_set",
                 Some(ctx),
-                None,
+                if ctx.is_admin() { None } else { Some(ctx) },
                 move |table| {
+                    if restrict_caller && gi::read_agent_section(&own_home, &own_agent) != expected_before { return Err("Google 設定已變更，請重新開啟後再儲存。".into()); }
                     if new_section.is_empty() {
                         table.remove(gi::AGENT_SECTION);
                     } else {
@@ -376,6 +461,10 @@ impl MethodHandler {
             .await;
         if let Err(e) = result {
             return WsFrame::error_response("", &e);
+        }
+        if self_consent {
+            let Some(db) = &db else { return WsFrame::error_response("", "人員資料尚未就緒，尚未允許帳號使用。"); };
+            if let Err(e) = db.set_google_consent(&ctx.user_id, &agent_id, true, &ctx.user_id) { return WsFrame::error_response("", &e); }
         }
         let after = gi::read_agent_section(&self.home_dir, &agent_id);
         let describe = |s: &gi::SectionRead| match s {
@@ -444,11 +533,6 @@ pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, Strin
         .and_then(Value::as_str)
         .ok_or("請提供 identity")?;
     let sel = Selector::parse(identity)?;
-    if matches!(sel, Selector::Owner | Selector::User(_)) {
-        return Err(
-            "這個版本只能設定「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。".into(),
-        );
-    }
     let mut t = toml::Table::new();
     let fallback = match params
         .get("fallback")
@@ -463,7 +547,7 @@ pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, Strin
         None => Requesters::default(),
         Some(r) => Requesters::parse(r)?,
     };
-    if requesters == Requesters::Anyone
+    if matches!(sel, Selector::Delegate(_) | Selector::Owner | Selector::User(_)) && requesters == Requesters::Anyone
         && params.get("confirm_anyone").and_then(Value::as_bool) != Some(true)
     {
         return Err("「任何人都能透過這位員工使用」需要明確確認（confirm_anyone: true）。公開訪客仍然一律不行。".into());
@@ -472,7 +556,7 @@ pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, Strin
         "identity".into(),
         toml::Value::String(sel.to_config_value()),
     );
-    if matches!(sel, Selector::Delegate(_)) {
+    if matches!(sel, Selector::Delegate(_) | Selector::Owner | Selector::User(_)) {
         if fallback != "none" {
             t.insert("fallback".into(), toml::Value::String(fallback));
         }

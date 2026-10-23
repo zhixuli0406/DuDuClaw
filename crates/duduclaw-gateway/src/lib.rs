@@ -101,6 +101,8 @@ pub mod extension;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub mod google_identity;
+pub mod person_credentials;
+pub mod google_personal;
 pub mod google_service_account;
 pub mod google_workspace;
 pub mod googlechat;

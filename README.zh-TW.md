@@ -279,6 +279,8 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## 文件
 
+企業版個人 Google 連線（未發布）：自行連結帳號，逐位允許或關閉 AI 員工使用，見[我的連線](docs/guides/zh-TW/google-personal-connections.md)。
+
 - [ARCHITECTURE.md](ARCHITECTURE.md):完整系統架構
 - [docs/README.md](docs/README.md):公開文件索引(架構 / RFC / ADR / 規格 / 指南)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):生產部署(Tailscale / Docker / systemd / 自動更新 / 監控)

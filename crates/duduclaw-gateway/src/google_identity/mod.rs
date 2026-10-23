@@ -83,6 +83,7 @@ pub const REFUSAL_CODES: &[&str] = &[
     "delegate_rejected",
     "google_unreachable",
     "gateway_unreachable",
+    "not_connected", "awaiting_consent", "consent_declined", "ambiguous_owner", "no_owner", "needs_reconnect", "scope_missing",
 ];
 
 /// Message when the protected key is not ready (B2c design §11).
@@ -150,7 +151,8 @@ pub fn audit_issue(
             (true, "delegate", email.as_str(), false, "")
         }
         Ok(resolve::Resolved::UseHome { fallback, .. }) => (true, "home", "", *fallback, ""),
-        Err(r) => (false, "delegate", "", false, r.code),
+        Ok(resolve::Resolved::Personal { kind, email, .. }) => (true, *kind, email.as_str(), false, ""),
+        Err(r) => (false, duduclaw_core::google_identity::effective_for(home, Some(agent)).effective.kind(), "", false, r.code),
     };
     let summary = format!(
         "tool={tool} identity={identity}{}",
@@ -169,6 +171,7 @@ pub fn audit_issue(
             ("google_tool", json!(tool)),
             ("fallback", json!(fallback)),
             ("reason", json!(reason)),
+            ("google_identity_user", match outcome { Ok(resolve::Resolved::Personal { user_id, .. }) => json!(user_id), _ => serde_json::Value::Null }),
         ],
     );
 }
@@ -211,16 +214,19 @@ pub async fn gateway_backend_with_account(
             .await
             .map(|b| (b, None))
             .map_err(GatewayBackendError::Home),
-        (Effective::Delegate { .. }, Some(agent)) => {
+        (Effective::Delegate { .. } | Effective::Personal { .. }, Some(agent)) => {
             let requester = duduclaw_knowledge::requester::RequesterIdentity::System {
                 kind: kind.to_string(),
                 on_behalf_of: None,
             };
             let people = requester_gate::people_for(home, None);
-            let outcome = resolve::resolve_person(home, agent, &requester, people.as_ref()).await;
+            let outcome = resolve::resolve_person_for_tool(home, agent, &requester, people.as_ref(), kind).await;
             audit_issue(home, agent, kind, requester.kind(), &outcome);
             match outcome {
                 Ok(resolve::Resolved::Delegated { token, email }) => {
+                    Ok((GoogleBackend::Direct(token.access_token), Some(email)))
+                }
+                Ok(resolve::Resolved::Personal { token, email, .. }) => {
                     Ok((GoogleBackend::Direct(token.access_token), Some(email)))
                 }
                 Ok(resolve::Resolved::UseHome { .. }) => resolve_backend(home)

@@ -78,6 +78,8 @@ impl MethodHandler {
         }
 
         match method {
+            "me.google.status" | "me.google.connect_start" | "me.google.connect_finish" | "me.google.connect_paste"
+            | "me.google.disconnect" | "me.google.consents.set" | "users.google_disconnect" | "agents.primary_owner_set" => self.handle_personal_google_rpc(method, params, ctx).await,
             "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact"
             | "discovery.cancel" => self.handle_discovery_rpc(method, params, ctx).await,
             "dashboard.layout.view" => {
@@ -297,7 +299,8 @@ impl MethodHandler {
                 self.handle_agents_google_identity_get(&agent_id).await
             }
             "agents.google_identity_set" => {
-                require_admin!();
+                let agent_id = params.get("agent_id").and_then(Value::as_str).unwrap_or("");
+                check_agent_named!(agent_id, AccessLevel::Owner);
                 self.handle_agents_google_identity_set(params, ctx).await
             }
 

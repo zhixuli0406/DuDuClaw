@@ -75,6 +75,7 @@ const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'Local
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
+const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
@@ -344,6 +345,7 @@ export function App() {
                 </Route>
               </Route>
 
+              <Route element={<EditionGuard enterprise />}><Route path="me/connections" element={<MyConnectionsPage />} /></Route>
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="forks" element={<ForkPage />} />

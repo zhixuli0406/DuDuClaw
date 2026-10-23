@@ -278,6 +278,8 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 
 ## Documentation
 
+Enterprise personal Google connections (unreleased): connect your own account, allow individual AI employees, and withdraw consent in [My connections](docs/guides/google-personal-connections.md).
+
 - [ARCHITECTURE.md](ARCHITECTURE.md): full system architecture
 - [docs/README.md](docs/README.md): public docs index (architecture / RFC / ADR / specs / guides)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md): production deployment (Tailscale / Docker / systemd / auto-update / monitoring)

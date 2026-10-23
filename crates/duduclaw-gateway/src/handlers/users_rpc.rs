@@ -263,8 +263,11 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user_id is required"),
         };
 
+        let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
         match db.set_user_status(user_id, duduclaw_auth::UserStatus::Suspended) {
             Ok(()) => {
+                let cleanup_error = crate::google_personal::lifecycle::disconnect(&self.home_dir, &db, user_id, &ctx.user_id, true).await.err();
+                if let Ok(agents) = &google_affected_agents { crate::google_personal::lifecycle::notify_affected(&self.home_dir, &ctx.user_id, agents); }
                 let _ = db.log_action(
                     Some(&ctx.user_id),
                     "user.suspend",
@@ -272,7 +275,7 @@ impl MethodHandler {
                     None,
                     None,
                 );
-                WsFrame::ok_response("", json!({"status": "suspended"}))
+                WsFrame::ok_response("", json!({"status": "suspended", "google_cleanup_error":cleanup_error,"google_affected_agents":google_affected_agents.ok()}))
             }
             Err(e) => WsFrame::error_response("", &format!("failed to suspend user: {e}")),
         }
@@ -372,6 +375,7 @@ impl MethodHandler {
         // One transaction: status, the leaver's reports (moved to
         // `transfer_to`, else to the leaver's manager, each re-checked and
         // audited as `user.reparent`) and, with `transfer_to`, the bindings.
+        let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
         let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
             Ok(outcome) => outcome,
             Err(duduclaw_auth::OrgError::UserNotFound) => {
@@ -380,6 +384,8 @@ impl MethodHandler {
             Err(e) => return org_error_frame(&e),
         };
         let transferred = outcome.transferred_agents;
+        let google_cleanup_error = crate::google_personal::lifecycle::disconnect(&self.home_dir, &db, user_id, &ctx.user_id, true).await.err();
+        if let Ok(agents) = &google_affected_agents { crate::google_personal::lifecycle::notify_affected(&self.home_dir, &ctx.user_id, agents); }
         let reparented: Vec<Value> = outcome
             .reparented
             .iter()
@@ -401,6 +407,8 @@ impl MethodHandler {
             "",
             json!({
                 "status": "offboarded",
+                "google_cleanup_error": google_cleanup_error,
+                "google_affected_agents": google_affected_agents.ok(),
                 "transferred_agents": transferred,
                 "reparented": reparented,
             }),

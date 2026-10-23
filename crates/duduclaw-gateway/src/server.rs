@@ -2667,6 +2667,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             post(handle_causal_alias_revoke).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
+        .route(crate::google_personal::flow::CALLBACK_PATH, get(handle_personal_google_callback))
         // Native remote MCP sign-in (remote_mcp). Unauthenticated by design
         // (a browser redirect from the authorization server); the single-use,
         // ten-minute `state` bound to the pending sign-in is the guard.
@@ -3116,22 +3117,10 @@ async fn handle_login(
         .collect();
 
     // Issue tokens
-    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+    let (access_token, refresh_token) = match state.jwt_config.issue_session_tokens(&user, &agent_access) {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
-        }
-    };
-
-    let refresh_token = match state.jwt_config.issue_refresh_token(&user.id) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to issue refresh token: {e}");
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "token generation failed"})),
@@ -3284,21 +3273,10 @@ async fn handle_otp_verify(
         .map(|b| (b.agent_name.clone(), b.access_level))
         .collect();
 
-    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+    let (access_token, refresh_token) = match state.jwt_config.issue_session_tokens(&user, &agent_access) {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
-        }
-    };
-    let refresh_token = match state.jwt_config.issue_refresh_token(&user.id) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to issue refresh token: {e}");
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "token generation failed"})),
@@ -3641,7 +3619,7 @@ async fn handle_refresh(
         .map(|b| (b.agent_name.clone(), b.access_level))
         .collect();
 
-    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+    let access_token = match state.jwt_config.issue_access_token_in_session(&user, &agent_access, claims.jti.as_deref()) {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to issue access token: {e}");
@@ -4303,21 +4281,10 @@ async fn handle_local_session(
         .map(|b| (b.agent_name.clone(), b.access_level))
         .collect();
 
-    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+    let (access_token, refresh_token) = match state.jwt_config.issue_session_tokens(&user, &agent_access) {
         Ok(t) => t,
         Err(e) => {
             error!("local session: failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
-        }
-    };
-    let refresh_token = match state.jwt_config.issue_refresh_token(&user.id) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("local session: failed to issue refresh token: {e}");
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "token generation failed"})),
@@ -15591,6 +15558,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // with it the dispatch-top allowlist) is opt-in, never a fallback.
     let mut pre_auth = false;
     let mut legacy_admin_authenticated = false;
+    let mut dashboard_session: Option<(String, String)> = None;
 
     // --- Authentication gate ---
     // Resolve a UserContext from the first "connect" message.
@@ -15650,6 +15618,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                             if let Some(jwt_str) = jwt_param {
                                 match authenticate_jwt(&state, jwt_str) {
                                     Ok(ctx) => {
+                                        // Session provenance comes only from this
+                                        // verified JWT, never connect parameters.
+                                        dashboard_session = state.jwt_config.verify_access_token(jwt_str).ok()
+                                            .and_then(|claims| claims.jti.map(|jti| (claims.sub, jti)));
                                         // `must_change_password` is surfaced here so a
                                         // future frontend can route straight to a
                                         // change-password screen on the handshake
@@ -15905,11 +15877,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 let task_state = state.clone();
                                 let task_ctx = user_ctx.clone();
                                 let task_tx = rpc_tx.clone();
+                                let task_session = dashboard_session.clone();
                                 tokio::spawn(async move {
-                                    let mut response = task_state
-                                        .handler
-                                        .handle_conn(&method, params, &task_ctx, conn_info)
-                                        .await;
+                                    let mut response = crate::google_personal::DASHBOARD_SESSION.scope(
+                                        task_session,
+                                        task_state.handler.handle_conn(&method, params, &task_ctx, conn_info),
+                                    ).await;
 
                                     // P4-3+ OS live event tail: unlike `logs.subscribe` above
                                     // (which flips its flag on the method NAME alone, before
@@ -16364,35 +16337,28 @@ async fn handle_mcp_oauth_callback(
     };
 
     // Exchange the authorization code for tokens
-    let token = match crate::mcp_oauth::exchange_code(
+    match crate::mcp_oauth::exchange_and_store(
+        state.handler.home_dir(),
         &pending.config,
         &params.code,
         &pending.code_verifier,
     )
     .await
     {
-        Ok(t) => t,
+        Ok(()) => (),
         Err(e) => {
             warn!(provider = %pending.provider_id, error = %e, "MCP OAuth token exchange failed");
             return axum::response::Html(format!(
                 "<html><body><h2>Authentication failed</h2>\
-                 <p>Token exchange error: {e}</p>\
+                 <p>Token exchange error: {}</p>\
                  <p>Please close this window and try again.</p>\
-                 </body></html>"
+                 </body></html>", html_escape(&e)
             ));
         }
     };
 
-    // Save the token to disk
+    // The exchange helper holds the grant fence through durable publication.
     let home_dir = state.handler.home_dir();
-    if let Err(e) = crate::mcp_oauth::upsert_token(home_dir, token) {
-        warn!(error = %e, "Failed to save MCP OAuth token");
-        return axum::response::Html(format!(
-            "<html><body><h2>Authentication failed</h2>\
-             <p>Failed to save token: {e}</p>\
-             </body></html>"
-        ));
-    }
 
     info!(provider = %pending.provider_id, "MCP OAuth authentication successful");
 
@@ -16436,6 +16402,61 @@ async fn handle_mcp_oauth_callback(
 }
 
 // ── Remote MCP OAuth callback (remote_mcp) ──────────────────
+
+/// Receipt is unauthenticated, but cannot exchange credentials. The redirect
+/// carries only state; the original verified dashboard login must finish it.
+async fn handle_personal_google_callback(
+    State(state): State<Arc<AppState>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    personal_google_callback_response(state.handler.home_dir(), query.as_deref().unwrap_or(""))
+}
+
+fn personal_google_callback_response(home: &std::path::Path, query: &str) -> axum::response::Response {
+    let result = crate::google_personal::pending::callback_values(query)
+        .and_then(|(nonce, code)| crate::google_personal::pending::receive_code(home, &nonce, &code)
+            .map(|(origin, _)| (nonce, origin)));
+    let mut response = match result {
+        Ok((nonce, origin)) => {
+            let target = format!("{origin}/me/connections?google_state={nonce}");
+            axum::response::Redirect::to(&target).into_response()
+        }
+        Err(message) => axum::response::Html(format!(
+            "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>DuDuClaw Google</title></head><body><h1>Google 連結未完成</h1><p>{}</p><p>請回到 DuDuClaw「我的連線」。</p></body></html>", html_escape(&message)
+        )).into_response(),
+    };
+    let headers = response.headers_mut();
+    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    headers.insert(axum::http::HeaderName::from_static("referrer-policy"), axum::http::HeaderValue::from_static("no-referrer"));
+    headers.insert(axum::http::HeaderName::from_static("content-security-policy"), axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"));
+    response
+}
+
+#[cfg(test)]
+mod personal_google_callback_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn callback_has_no_store_no_referrer_and_redirects_without_code() {
+        let home = tempfile::tempdir().unwrap();
+        let nonce = crate::google_personal::pending::insert(crate::google_personal::pending::Pending {
+            home:home.path().into(),user_id:"alice".into(),session_ref:uuid::Uuid::new_v4().to_string(),
+            redirect_uri:"https://dashboard.example/api/me/google/callback".into(),dashboard_origin:"https://dashboard.example".into(),
+            paste:false,code_verifier:"VERIFIER_MUST_NOT_LEAK".into(),client_id:"fixture".into(),client_secret:"SECRET_MUST_NOT_LEAK".into(),
+            epoch:1,created:std::time::Instant::now(),code:None,
+        });
+        let response = personal_google_callback_response(home.path(), &format!("state={nonce}&code=CODE_MUST_NOT_LEAK"));
+        assert_eq!(response.status(),axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[axum::http::header::LOCATION],format!("https://dashboard.example/me/connections?google_state={nonce}"));
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL],"no-store");
+        assert_eq!(response.headers()["referrer-policy"],"no-referrer");
+        let body=axum::body::to_bytes(response.into_body(),16*1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("MUST_NOT_LEAK"));
+        let error=personal_google_callback_response(home.path(),"state=unknown&error=%3Cscript%3Ealert(1)%3C/script%3E");
+        let body=axum::body::to_bytes(error.into_body(),16*1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("<script>"));
+    }
+}
 
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

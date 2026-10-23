@@ -24,9 +24,24 @@ function setRole(role: 'admin' | 'manager' | 'employee') {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  useAuthStore.setState({bindings:[]});
 });
 
 describe('AgentConnectionsTab', () => {
+  it('requires an Owner to acknowledge shared access before selecting their own account', async()=>{
+    setRole('employee');
+    useAuthStore.setState({bindings:[{user_id:'u1',agent_name:'bot',access_level:'owner',bound_at:'now'}]});
+    vi.spyOn(api.googleIdentity,'get').mockResolvedValue({...HOME,bound_people:[{user_id:'bob',name:'Bob',email:'bob@example.com'}],allowed_channels:['line']});
+    const set=vi.spyOn(api.googleIdentity,'set').mockResolvedValue({...HOME,kind:'user',identity:'user:u1',state:'configured'});
+    renderWithProviders(<AgentConnectionsTab agentId="bot"/>);
+    const user=userEvent.setup();
+    await user.click(await screen.findByRole('button',{name:'Change'}));
+    expect(screen.getByText(/Bob/)).toBeInTheDocument();
+    expect(screen.getByRole('button',{name:'Save'})).toBeDisabled();
+    await user.click(screen.getByRole('checkbox',{name:/checked who can use/i}));
+    await user.click(screen.getByRole('button',{name:'Save'}));
+    await waitFor(()=>expect(set).toHaveBeenCalledWith({agent_id:'bot',identity:'user:u1',fallback:'none',requesters:'bound_people',confirm_shared_access:true}));
+  });
   it('shows the identity in effect and hides changes from non-admins', async () => {
     setRole('employee');
     vi.spyOn(api.googleIdentity, 'get').mockResolvedValue({

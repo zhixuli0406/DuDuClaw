@@ -278,6 +278,8 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## ドキュメント
 
+Enterprise の個人 Google 接続（未リリース）：本人が接続し、社員ごとに利用を許可・解除できます。[自分の接続](docs/guides/ja-JP/google-personal-connections.md)を参照してください。
+
 - [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体
 - [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)

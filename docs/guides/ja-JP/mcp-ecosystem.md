@@ -63,7 +63,7 @@ URL とすべての認証情報は `<home>/remote_mcp/servers.json`（権限 060
 
 **切断**は保存済みの認証情報を削除し、サーバーは残します（後で再接続できます）。**削除**は記録と `.mcp.json` の項目も消します。従業員のサーバー一覧からリモートサーバーを削除した場合も同じです。
 
-プロバイダーの認可サーバーのメタデータに `revocation_endpoint`（RFC 7009）があれば、Gateway はリフレッシュトークン（なければアクセストークン）の失効も依頼します。ローカルの削除の後にバックグラウンドで最大 10 秒行うため、プロバイダーが遅い・失敗しても認証情報がディスクに残ることはありません。結果は監査 `remote_mcp_token_revocation`（`revoked`、`http_<ステータス>`、`failed`、`timeout`）に記録されます。Bearer トークンやエンドポイントのないプロバイダーはここから失効できないので、プロバイダー側で取り消してください。
+切断が保証するのはローカル認証情報の削除のみです。動的プロバイダーやプロキシでは上流の本人・共有許可の境界を証明できず、その HTTP 200 も Google 側の失効終了を証明しません。新しいデータディレクトリでも動的な失効要求は送信しません。失効先が宣言されていれば監査 `remote_mcp_token_revocation` に `local_only_unknown_grant` を記録します。プロバイダー側の許可は本人がそのアカウントで取り消してください。
 
 ### 追加ヘッダーとサーバーストリーム（任意）
 
@@ -195,7 +195,7 @@ action_rules = [
 | `mcp.registry_install { name, version?, agent_id, remote?, server_name?, env? }` | サインイン済み（管理者以外 ⇒ インストール申請） | スキャン付きの経路でインストール |
 | `mcp.remote_connect { agent_id, name, url?, auth, bearer?, redirect_origin?, client_id?, client_secret?, headers?, server_stream? }` | 管理者 | 接続。`oauth` は `authorize_url` を返す。`headers` `{名前: 値}` は保存済みのものを置き換える |
 | `mcp.remote_status { agent_id? }` | 管理者 | 秘密情報を含まない記録（`header_names`、`server_stream`） |
-| `mcp.remote_disconnect { agent_id, name, forget? }` | 管理者 | 認証情報の削除（`forget` で項目も削除）、可能ならプロバイダーで失効 |
+| `mcp.remote_disconnect { agent_id, name, forget? }` | 管理者 | ローカル認証情報の削除（`forget` で項目も削除）。プロバイダー側は手動で失効 |
 | `mcp.tool_effects { agent_id }` | 管理者 | 最後に一覧化されたサードパーティツールと種類・判断 |
 | `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?, arguments? }` | 管理者 | 購読（`mode` は既定 `explore`、または `normal`。`delivery` は既定 `webhook`、`poll`、`auto`。`arguments` は `{ イベント名: オブジェクト }`） |
 | `mcp.events_discover { agent_id, server }` | 管理者 | サーバーの `events/list` |
@@ -210,7 +210,7 @@ action_rules = [
 - 実際の Zapier・Composio アカウントや、実在するサードパーティの OAuth プロバイダーではテストしていません。検証はローカルの偽の認可サーバーと偽の MCP サーバーに対してのみです。
 - 切れた応答ストリームは、サーバーがイベントに番号（`id:`）を付けて `GET` での再開に対応している場合だけ再開します。サーバー起点の `GET` ストリームはサーバーごとのオプトインで、ローカルの偽サーバーでのみテストしています。
 - 旧式の HTTP+SSE サーバーは引き続き `npx mcp-remote` を使います（上記）。DuDuClaw が送れないヘッダー（`Cookie` など）を要求するレジストリ項目はインストール不可と表示されます。サーバーが別のサインイン方法を受け付けるなら URL で接続してください。
-- プロバイダーでの失効は、認可サーバーが `revocation_endpoint` を宣言している場合だけで、ベストエフォートです。
+- 動的プロバイダーはローカルのみ切断します。`revocation_endpoint` があっても本人がプロバイダー側で失効してください。
 - サードパーティツールの分類は第 4 節のとおりサーバーのアノテーションを信じます。ダッシュボードが読むスナップショットは従業員自身のプロセスツリーが書きます。
 - MCP Events：第 5 節の最後を参照。プッシュ配信は未実装です。Gateway はサーバーが受け付ける https アドレスで到達できる必要があります。
 - デスクトップアプリのダッシュボードのオリジン（`tauri://…`）はリダイレクト先として受け付けません。ブラウザからサインインしてください。

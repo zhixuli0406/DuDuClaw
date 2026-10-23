@@ -525,8 +525,8 @@ impl MethodHandler {
         .await;
         match res {
             Ok(Ok((existed, target))) => {
-                // RFC 7009 revocation at the provider, after the local delete
-                // and off the request path: best effort, audited.
+                // Record the local-only provider outcome after deleting the
+                // local credentials; dynamic grant boundaries are unverified.
                 if let Some(t) = target {
                     let (home, a, s) = (self.home_dir.clone(), agent_id.clone(), server.clone());
                     tokio::spawn(async move {
