@@ -28,6 +28,7 @@ pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
     duduclaw_core::ENV_DELEGATION_DEPTH,
     duduclaw_core::ENV_HOP_DEPTH,
     duduclaw_core::ENV_REPLY_CHANNEL,
+    duduclaw_core::ENV_REPLY_SENDER,
     // The task of a goal round (set per call by the gateway's runtimes).
     duduclaw_core::ENV_TASK_ID,
     // The read-only explore lane (heartbeat proactive check, 2026-10).

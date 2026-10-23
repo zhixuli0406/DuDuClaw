@@ -1298,6 +1298,9 @@ async fn execute_proactive_check(
             // pushable channel conversation (sessions.db) — an unset field no
             // longer silently discards the whole feature.
             let notify = &agent_config.proactive;
+            // B11: a fallback conversation that came in through an employee's
+            // own bot / app goes out through the same one.
+            let mut sender_agent: Option<String> = None;
             let target = if !notify.notify_channel.is_empty() && !notify.notify_chat_id.is_empty()
             {
                 Some((notify.notify_channel.clone(), notify.notify_chat_id.clone()))
@@ -1305,11 +1308,15 @@ async fn execute_proactive_check(
                 let home = home_dir.to_path_buf();
                 let aid = agent_id.to_string();
                 let fallback = tokio::task::spawn_blocking(move || {
-                    proactive::resolve_notify_fallback(&home, &aid)
+                    proactive::resolve_notify_fallback_with_sender(&home, &aid)
                 })
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|(ch, chat, sender)| {
+                    sender_agent = sender;
+                    (ch, chat)
+                });
                 if let Some((ch, chat)) = &fallback {
                     info!(
                         agent = agent_id,
@@ -1341,6 +1348,7 @@ async fn execute_proactive_check(
                     "channel": channel,
                     "chat_id": chat_id,
                     "thread_id": notify.notify_thread_id,
+                    "sender_agent": sender_agent,
                     "message": message,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });

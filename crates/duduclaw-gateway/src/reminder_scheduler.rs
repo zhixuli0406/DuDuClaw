@@ -116,6 +116,11 @@ pub struct Reminder {
     /// Error message if delivery failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// B11: the AI employee whose own bot / app the conversation the reminder
+    /// was set in came through; delivery uses the same bot / app. `None` =
+    /// shared bot / app (and every reminder created before this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_agent: Option<String>,
 }
 
 fn default_agent() -> String {
@@ -248,6 +253,49 @@ pub async fn send_channel_message(
         .send_text(text)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// [`send_channel_message`] through the AI employee's own bot / app that the
+/// conversation came in through (`sender`, B11). Telegram uses that
+/// employee's own token and Google Chat its own app — a missing one is an
+/// error, never a switch to the shared bot. Other channels, and `None`, keep
+/// [`send_channel_message`].
+pub async fn send_channel_message_as(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    channel: &str,
+    chat_id: &str,
+    text: &str,
+    sender: Option<&str>,
+) -> Result<(), String> {
+    let Some(agent) = sender.filter(|a| duduclaw_core::is_valid_agent_id(a)) else {
+        return send_channel_message(home_dir, http, channel, chat_id, text).await;
+    };
+    match channel {
+        "telegram" => {
+            crate::product_policy::require_channel(home_dir, channel)?;
+            let sm_cfg = SecretManagerConfig::load_from_home(home_dir).await;
+            let token = crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &sm_cfg)
+                .await
+                .map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
+                .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))?;
+            let target = crate::channel_sender::ChannelTarget {
+                channel_type: "telegram".into(),
+                chat_id: chat_id.to_string(),
+                token,
+                extra_id: None,
+            };
+            crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
+                .send_text(text)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "googlechat" => {
+            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::googlechat::send_text_to_space_as(home_dir, Some(agent), chat_id, text).await
+        }
+        _ => send_channel_message(home_dir, http, channel, chat_id, text).await,
+    }
 }
 
 // ── Config helpers (duplicated from mcp.rs to avoid circular deps) ──
@@ -812,11 +860,19 @@ async fn deliver_reminder(
             .map_err(|_| "Semaphore closed".to_string())?;
 
         // Retry once on failure
-        let result =
-            send_channel_message(home_dir, http, &reminder.channel, &reminder.chat_id, &text).await;
+        let sender = reminder.sender_agent.as_deref();
+        let result = send_channel_message_as(
+            home_dir,
+            http,
+            &reminder.channel,
+            &reminder.chat_id,
+            &text,
+            sender,
+        )
+        .await;
         if let Err(first_err) = result {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            send_channel_message(home_dir, http, &reminder.channel, &reminder.chat_id, &text)
+            send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
                 .await
                 .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
         }

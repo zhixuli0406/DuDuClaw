@@ -91,6 +91,7 @@ import {
   DEFAULT_ADVANCED,
 } from './defaults';
 import { KnowledgeBindingSection } from './KnowledgeBindingSection';
+import { AgentOwnChannelsSection } from './AgentOwnChannelsSection';
 import { ToolPolicyEditor } from './editors';
 import {
   buildUpdatePayload,
@@ -1598,6 +1599,8 @@ export function EditAgentPage() {
               </fieldset>
             </SettingsCard>
           </SettingsSection>
+
+          {id && <AgentOwnChannelsSection agentId={id} />}
 
           <SettingsSection title={t('agents.edit.group.integration')} description={t('agents.edit.channels.unified.desc')}>
             {agentChannels.length === 0 ? (
