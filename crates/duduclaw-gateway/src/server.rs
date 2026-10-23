@@ -1948,6 +1948,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         error!("another gateway holds this data directory: the maintenance supervisor does not run in this process");
     }
 
+    // ── B5 session origin backfill ────────────────────────────────
+    // Rows written before `sessions.origin_kind` existed get an origin from
+    // their id once (re-runnable; rows a live turn stamped first are kept).
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::session_origin::backfill::spawn(
+            home_dir.clone(),
+            session_manager.clone(),
+            user_db.clone(),
+        );
+    }
+
     // ── Document knowledge base ingest worker ─────────────────────
     // One extraction child at a time; only the lock-holding gateway writes
     // `<home>/knowledge/knowledge.db` from background jobs.

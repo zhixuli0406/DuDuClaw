@@ -399,10 +399,8 @@ async fn record_turn(
     if text.trim().is_empty() {
         return;
     }
-    if let Err(e) = ctx
-        .session_manager
-        .get_or_create(session_id, agent_id)
-        .await
+    if let Err(e) =
+        crate::session_origin::ensure_turn_session(&ctx.session_manager, session_id, agent_id).await
     {
         debug!(session = session_id, error = %e, "takeover: session ensure failed");
         return;

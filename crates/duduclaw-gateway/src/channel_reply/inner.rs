@@ -744,7 +744,8 @@ pub(super) async fn build_reply_with_session_inner(
         crate::goal_intent::precheck(ctx, session_id, &agent_id, user_id, text).await;
 
     // ── All pre-filters passed — now create/load session ──
-    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
+    // Records where this conversation comes from (first stamp wins).
+    let _ = crate::session_origin::ensure_turn_session(session_mgr, session_id, &agent_id).await;
 
     // ── Phase 3: Check if previous trajectory should get feedback ──
     // The current user message may contain feedback (positive/negative) for

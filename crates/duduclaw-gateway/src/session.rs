@@ -270,6 +270,11 @@ impl SessionManager {
         );
         // Ignore errors — columns already exist on subsequent runs
 
+        // B5 session origin (2026-10): where each conversation comes from and,
+        // for a signed-in WebChat account, who owns it. NULL on rows written
+        // before this migration (see `session_origin::backfill`).
+        crate::session_origin::store::migrate(conn);
+
         Ok(())
     }
 
@@ -278,49 +283,20 @@ impl SessionManager {
     /// Uses INSERT OR IGNORE + SELECT to avoid the TOCTOU race where two
     /// concurrent callers both see "not found" and both attempt INSERT,
     /// causing one to fail with a UNIQUE constraint error.
+    ///
+    /// A row this creates records origin `unknown` (B5 session origin); it
+    /// never stamps a legacy row. Live turns use
+    /// [`crate::session_origin::ensure_turn_session`] instead, which records
+    /// where the conversation comes from; this stays for tests and the
+    /// `migrate-from` import.
     pub async fn get_or_create(&self, session_id: &str, agent_id: &str) -> Result<Session> {
-        let conn = self.acquire().await;
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // Atomic upsert: INSERT OR IGNORE is a no-op if the row already exists.
-        conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, agent_id, summary, total_tokens, last_active, model, created_at)
-             VALUES (?1, ?2, '', 0, ?3, 'auto', ?3)",
-            params![session_id, agent_id, now],
+        self.create_inner(
+            session_id,
+            agent_id,
+            &crate::session_origin::SessionOrigin::unknown(),
+            false,
         )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-
-        // Authoritative SELECT — reads whichever row won the race.
-        let session = conn
-            .query_row(
-                "SELECT id, agent_id, summary, total_tokens, last_active, model,
-                        COALESCE(lineage, 1)
-                 FROM sessions WHERE id = ?1",
-                params![session_id],
-                |row| {
-                    Ok(Session {
-                        id: row.get(0)?,
-                        agent_id: row.get(1)?,
-                        summary: row.get(2)?,
-                        total_tokens: row.get(3)?,
-                        last_active: row.get(4)?,
-                        model: row.get(5)?,
-                        lineage: row.get::<_, i64>(6)?.max(1) as u32,
-                    })
-                },
-            )
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-
-        // Verify the session belongs to the expected agent to prevent session
-        // hijacking across agents (e.g. two agents racing with the same session_id).
-        if session.agent_id != agent_id {
-            return Err(DuDuClawError::Gateway(format!(
-                "Session '{session_id}' belongs to agent '{}', not '{agent_id}'",
-                session.agent_id
-            )));
-        }
-
-        Ok(session)
+        .await
     }
 
     /// Append a message to the session and update token count.
