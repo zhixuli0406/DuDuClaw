@@ -1995,7 +1995,7 @@ async fn handle_message_create(
                 session_id: Some(&session_id),
             })
     });
-    let guarded = thinking.scope(crate::approval::scope_trusted_reply(target, async {
+    let guarded = crate::computer_use_sessions::attended::verified_channel_message(&session_id, user_id, false, thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some(agent) = &effective_agent {
             build_guarded_reply_for_agent(
                 clean_content,
@@ -2016,7 +2016,7 @@ async fn handle_message_create(
             )
             .await
         }
-    }))
+    })))
     .await;
 
     // Stop typing (explicit drop; also runs automatically on panic via Drop)

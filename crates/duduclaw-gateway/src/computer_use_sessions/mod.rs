@@ -39,6 +39,7 @@
 //!   cannot cancel.
 
 pub mod actions;
+pub(crate) mod attended;
 pub mod auth;
 mod backend;
 pub mod gates;
