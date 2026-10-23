@@ -21,6 +21,7 @@ import {
   type ComputerViewTicket,
 } from '@/lib/computer-session';
 import { ComputerViewer, type ViewerEnd } from './ComputerViewer';
+import { BrowserLoginState } from './BrowserLoginState';
 
 /** How often the status card refreshes while the tab is open. */
 const POLL_MS = 5000;
@@ -52,6 +53,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
   const [ended, setEnded] = useState<ViewerEnd | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
+  const [keepLogin, setKeepLogin] = useState(false);
   const [note, setNote] = useState('');
 
   const refresh = useCallback(async () => {
@@ -105,8 +107,11 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
     run(async () => {
       setConfirmStop(false);
       setTicket(null);
-      await computerSessionApi.stop(agentId);
-    }, 'computerSession.stop.done');
+      const result = await computerSessionApi.stop(agentId, keepLogin);
+      if (keepLogin && !result.keep_login_honored) toast.error(t('browserLogin.keepRefused'));
+      else toast.success(t('computerSession.stop.done'));
+      setKeepLogin(false);
+    });
 
   if (denied) {
     return (
@@ -122,6 +127,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
 
   return (
     <div className="mx-auto w-full max-w-[1440px] space-y-4 p-4 sm:p-6">
+      <BrowserLoginState agentId={agentId} />
       <Card>
         <CardHeader>
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
@@ -218,6 +224,10 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
                 {confirmStop ? (
                   <>
                     <span className="text-sm text-muted-foreground">{t('computerSession.stop.confirm')}</span>
+                    {active.hold && active.can_keep_login && <label className="flex items-center gap-2 text-xs">
+                      <input type="checkbox" checked={keepLogin} onChange={(e) => setKeepLogin(e.target.checked)} />
+                      {t('browserLogin.keep')}
+                    </label>}
                     <Button size="sm" variant="destructive" disabled={busy} onClick={stop}>
                       {t('computerSession.stop.yes')}
                     </Button>
@@ -226,7 +236,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
                     </Button>
                   </>
                 ) : (
-                  <Button size="sm" variant="ghost" disabled={busy} onClick={() => setConfirmStop(true)}>
+                  <Button size="sm" variant="ghost" disabled={busy} onClick={() => { setKeepLogin(false); setConfirmStop(true); }}>
                     <Square />
                     {t('computerSession.stop')}
                   </Button>

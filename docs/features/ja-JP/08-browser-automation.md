@@ -277,7 +277,7 @@ gateway は視聴側のプロトコル（RFB 3.7/3.8）を読みます：キー�
 
 ### 対象外と未検証
 
-- 開発環境に Docker がなかったため、一時停止・再開とストリームはフェイクと単体テストでのみ検証しています。v1.72.0 のイメージのスモークは実行され、起動を拒否しました。Debian の x11vnc 0.9.17（libvncserver 0.9.15）は `-rfbport 0 -unixsock -localhost -noipv6` でも IPv6 `::1:5900` で待ち受けたため、ヘルパーがサーバを止めたものです。ローカルの arm64 イメージで `-rfbport 0 -rfbportv6 -1 -unixsock`（他のフラグは同じ）を試すと、5900–5999 に LISTEN はなく、unix socket は `RFB 003.008` を返しました。そのフラグでの両アーキテクチャのイメージ CI と、実ブラウザの noVNC は未実施です。
+- `-rfbportv6 -1` の修正は公開イメージに含まれます。[v1.75.0 のワークフロー](https://github.com/zhixuli0406/DuDuClaw/actions/runs/39171117110) は2026-10-18に linux/amd64 と linux/arm64 のビルド・orchestrator フラグでの smoke を完了しました。unix socket relay と VNC TCP 非公開の確認であり、実ブラウザー noVNC と一時停止・再開の受け入れ検証は別です。
 - 実ブラウザでの noVNC 表示、実コンテナでの `docker pause`／`docker unpause`、一時停止中のコンテナへの `docker rm --force` は未検証です。
 - VNC 認証は 8 文字のパスワードと DES です。実際の保護は root 専用の unix socket と、gateway の認証済み・フィルタ付きの中継です。パスワードは権限のある視聴者のブラウザに届きます。
 - 従業員に割り当てられたマネージャーや Operator には画面全体が見えます（マスクは従業員が受け取るスクリーンショットにのみ適用され、ライブストリームには適用されません）。サイトが表示する内容も含みます。

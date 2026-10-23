@@ -268,6 +268,7 @@ pub mod ccr_replay;
 pub mod ccr_runtime;
 pub mod channel_sender;
 pub mod chat_commands;
+pub mod computer_profiles;
 pub mod computer_use;
 pub mod computer_use_image;
 pub mod computer_use_orchestrator;

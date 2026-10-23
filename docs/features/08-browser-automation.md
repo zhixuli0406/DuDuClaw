@@ -277,7 +277,7 @@ A person resumes it from the Computer tab (**Resume**, audited `injection_resume
 
 ### Not covered and not verified
 
-- No Docker was available where this was built: pause/resume and the stream were tested with fakes and unit tests only. The v1.72.0 image smoke did run and refused to start: Debian x11vnc 0.9.17 linked to libvncserver 0.9.15 still listened on IPv6 `::1:5900` with `-rfbport 0 -unixsock -localhost -noipv6`, so the helper stopped the server. A local arm64 probe of `-rfbport 0 -rfbportv6 -1 -unixsock` (the other flags unchanged) had no LISTEN on 5900–5999 and returned `RFB 003.008` on the unix socket. Both-arch image CI with that flag, and noVNC in a real browser, have not run.
+- The `-rfbportv6 -1` fix is in the published image. The [v1.75.0 image workflow](https://github.com/zhixuli0406/DuDuClaw/actions/runs/39171117110) passed both linux/amd64 and linux/arm64 builds and orchestrator-flag smoke tests on 2026-10-18. This verifies the unix-socket relay and no VNC TCP listener; real-browser noVNC and pause/resume acceptance remain separate.
 - The noVNC picture in a real browser against a real container, and `docker pause` / `docker unpause` and `docker rm --force` on paused containers, are unverified.
 - VNC authentication uses an 8-character password and DES; the real protection is the root-only unix socket and the gateway's authenticated, filtered relay. The password reaches the authorized viewer's browser.
 - A Manager or Operator bound to the employee sees the whole screen (masking applies to the employee's screenshots, not to the live stream), including what a site displays.
