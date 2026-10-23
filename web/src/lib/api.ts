@@ -858,6 +858,50 @@ export interface CriteriaLedger {
   invalid_reports: number;
 }
 
+/** When a scheduled assignment fires, as the dashboard sends it
+ *  (`tasks.goal_create` / `tasks.create` with `schedule`). Times are
+ *  wall-clock in `schedule_timezone`; `cron` is Admin-only. */
+export type AssignScheduleInput =
+  | { kind: 'once'; at: string }
+  | { kind: 'hourly'; minute?: number }
+  | { kind: 'daily' | 'weekdays'; time: string }
+  | { kind: 'weekly'; days: number[]; time: string }
+  | { kind: 'cron'; expr: string };
+
+/** The stored schedule (`assign_schedules.list`); `days` 1 = Monday … 7 = Sunday. */
+export type AssignScheduleSpec =
+  | { kind: 'once'; at: string }
+  | { kind: 'hourly'; minute: number }
+  | { kind: 'daily' | 'weekdays'; hour: number; minute: number }
+  | { kind: 'weekly'; days: number[]; hour: number; minute: number }
+  | { kind: 'cron'; expr: string };
+
+/** One scheduled assignment. Every fire re-checks the creator's right. */
+export interface AssignScheduleInfo {
+  id: string;
+  agent_id: string;
+  kind: 'task' | 'goal';
+  title: string;
+  description: string;
+  schedule: AssignScheduleSpec;
+  timezone: string | null;
+  status: 'active' | 'paused' | 'done';
+  /** `by_user` | `access_lost` | `agent_unavailable` | `create_failed` | `schedule_restricted`. */
+  pause_reason: string | null;
+  created_via: string;
+  creator_user_id: string;
+  /** Filled in an Admin's "everyone" listing for other people's rows. */
+  creator_name: string | null;
+  next_fire_at: string | null;
+  last_fire_at: string | null;
+  last_task_id: string | null;
+  /** `created` | `skipped:<reason>` | `failed`. */
+  last_outcome: string | null;
+  fire_count: number;
+  skip_count: number;
+  created_at: string;
+}
+
 export interface TaskInfo {
   /** Set by the server when the reader may see only this card: the task's
    *  content is limited to an audience the reader is not in. */
@@ -7633,6 +7677,22 @@ export const api = {
         warning?: string;
       }>,
   },
+  /** Scheduled assignments: the caller's own; `scope: 'all'` lists
+   *  everyone's for an Admin. */
+  assignSchedules: {
+    list: (scope: 'mine' | 'all' = 'mine') =>
+      client.call('assign_schedules.list', { scope }) as Promise<{
+        schedules: AssignScheduleInfo[];
+        max_active: number | null;
+        min_interval_minutes: number | null;
+      }>,
+    pause: (id: string) =>
+      client.call('assign_schedules.pause', { id }) as Promise<{ schedule: AssignScheduleInfo }>,
+    resume: (id: string) =>
+      client.call('assign_schedules.resume', { id }) as Promise<{ schedule: AssignScheduleInfo }>,
+    remove: (id: string) =>
+      client.call('assign_schedules.remove', { id }) as Promise<{ schedule: AssignScheduleInfo }>,
+  },
   tasks: {
     list: (filters?: {
       status?: TaskStatus;
@@ -7733,6 +7793,20 @@ export const api = {
          *  生成，等待你核准" instead of the normal assign toast. */
         plan_first: boolean;
       }>,
+    /** `tasks.goal_create` with a `schedule`: nothing starts now; the goal
+     *  is created at each fire on the caller's behalf. */
+    goalSchedule: (params: {
+      agent_id: string;
+      description: string;
+      acceptance_criteria?: string;
+      priority?: 'low' | 'medium' | 'high' | 'urgent';
+      duration_hours?: number;
+      risk_boundary?: string;
+      require_beliefs?: boolean;
+      plan_first?: boolean;
+      schedule: AssignScheduleInput;
+      schedule_timezone?: string;
+    }) => client.call('tasks.goal_create', { ...params }) as Promise<{ schedule: AssignScheduleInfo }>,
     /** One goal task's whole loop story: rounds, task-scoped activity,
      *  pending kickoff approval. */
     timeline: (taskId: string) =>

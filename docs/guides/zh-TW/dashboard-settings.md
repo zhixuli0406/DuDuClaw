@@ -171,6 +171,14 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
+## 排程交辦（尚未發版）
+
+交辦面板的「什麼時候做」可選指定時間一次、每天、平日、每週或每小時，管理員另有自訂 cron。時間以瀏覽器時區解讀；設定當下不建立任務，時間到才重新確認建立者權限並交辦。
+
+「目標 → 我交辦的 → 排程」可暫停、恢復與刪除，管理員可切換看所有人的排程。暫停或刪除先於任務落地，就不會建立該輪任務；已落地的任務需另外停止。恢復會重驗建立者權限與目前執行間隔限制。
+
+設定檔 `[goal_defaults] assign_schedule_max_active` 預設每人 20 個（0–200）；`assign_schedule_min_interval_minutes` 預設非管理員最短 60 分鐘，只能調高，既有排程下次執行也會檢查。詳見[排程交辦](../../features/zh-TW/67-assigning-tasks.md)。
+
 ## 思考過程顯示
 
 目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。

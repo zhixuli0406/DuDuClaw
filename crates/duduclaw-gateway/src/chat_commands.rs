@@ -298,6 +298,8 @@ pub fn parse_assign_args(rest: &str) -> crate::trigger_route::assign::AssignComm
         AssignCommand::List
     } else if rest == "狀態" || rest == "状态" || rest.eq_ignore_ascii_case("status") {
         AssignCommand::Status
+    } else if let Some(sub) = crate::trigger_route::schedule_chat::strip_schedules_word(rest) {
+        AssignCommand::Schedules(crate::trigger_route::schedule_chat::parse_command(sub))
     } else {
         AssignCommand::Text(rest.to_string())
     }

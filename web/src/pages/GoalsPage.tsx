@@ -5,6 +5,7 @@ import { Target, Plus, RefreshCw, Check, Trash2, Hand, Search, Pin } from 'lucid
 
 import { api, type TaskInfo } from '@/lib/api';
 import { DiscoverySection } from '@/components/tasks/DiscoverySection';
+import { ScheduledAssignmentsSection } from '@/components/tasks/ScheduledAssignmentsSection';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -561,6 +562,9 @@ export function GoalsPage() {
       </div>
 
       <DiscoverySection agentId={realAgent || undefined} enabled={connState === 'authenticated' && (isAdmin || !!realAgent)} />
+
+      {/* 我交辦的 → 排程: work handed over for later or on a repeat. */}
+      <ScheduledAssignmentsSection enabled={mine && connState === 'authenticated'} isAdmin={isAdmin} />
 
       {loading || waitingForListToRuleOutEmpty ? (
         <CollectionPageState state="loading" />

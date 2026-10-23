@@ -36,6 +36,8 @@ pub(crate) mod assign_create;
 pub mod assign_texts;
 pub mod list;
 pub mod pending;
+pub(crate) mod schedule_chat;
+mod schedule_texts;
 pub mod spans;
 pub mod texts;
 pub mod turn;

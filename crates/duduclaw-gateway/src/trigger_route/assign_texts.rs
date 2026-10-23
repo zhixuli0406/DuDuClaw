@@ -57,21 +57,24 @@ pub fn usage(lang: Lang) -> &'static str {
              /交辦 @AI員工 要做的事 — 交辦一件任務，AI 員工完成或卡住時會回到這個對話通知你\n\
              可以用「||」再加：驗收標準、時限:24h、邊界:不可做的事、想一想（先給計畫再開工）\n\
              /交辦 — 看你可以交辦的 AI 員工\n\
-             /交辦 狀態 — 看你交辦、還沒結束的任務"
+             /交辦 狀態 — 看你交辦、還沒結束的任務\n\
+             排程：在後面加「|| 時間:明天 15:00」或「|| 排程:每週一 9:00」；/交辦 排程 — 看、暫停或刪除你的排程"
         }
         Lang::En => {
             "📌 Assign a task\n\
              /assign @staff what to do — hand over a task; you are told here when it is done or stuck\n\
              Add with \"||\": acceptance criteria, duration:24h, risk:what not to do, plan (a plan first)\n\
              /assign — staff you can assign to\n\
-             /assign status — your unfinished assigned tasks"
+             /assign status — your unfinished assigned tasks\n\
+             Schedule it: add \"|| at:tomorrow 15:00\" or \"|| schedule:every monday 9:00\"; /assign schedules — list, pause or remove yours"
         }
         Lang::Ja => {
             "📌 タスクを任せる\n\
              /交辦 @スタッフ 内容 — タスクを任せます。完了や行き詰まりはこの会話に届きます\n\
              「||」で追加：受け入れ基準、時限:24h、邊界:してはいけないこと、想一想（先に計画）\n\
              /交辦 — 任せられるスタッフ\n\
-             /交辦 狀態 — 任せた未完了のタスク"
+             /交辦 狀態 — 任せた未完了のタスク\n\
+             予約：後ろに「|| 時間:明天 15:00」や「|| 排程:每週一 9:00」；/交辦 排程 — 予約の確認・一時停止・削除"
         }
     }
 }

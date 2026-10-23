@@ -65,6 +65,8 @@ duduclaw run                  # 接著打開 http://localhost:18789
 
 <a id="architecture"></a>
 
+尚未發版：[排程交辦](docs/features/zh-TW/67-assigning-tasks.md)可從聊天或儀表板把工作排到之後，或固定週期交辦給 AI 員工；每次執行前都重新確認建立者的權限。
+
 ## 架構一覽
 
 AI 運行時是大腦,DuDuClaw 是水電管線,中間用 MCP(JSON-RPC 2.0)橋接。大腦可換,管線不動:
