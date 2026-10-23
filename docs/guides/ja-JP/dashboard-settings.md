@@ -1,6 +1,6 @@
 # ダッシュボード設定の対応表（v1.68.0）
 
-未リリースの Enterprise バックエンド：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。専用画面は未追加です。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
+未リリースのEnterprise設定（ユーザー管理 → 組織の設定）：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。有効にする前に職員へ通知してください。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
 
 v1.68.0 からダッシュボードで設定できる項目について、どのページにあるか、どの設定キーに書き込むか、保存後に gateway の再起動が必要かをまとめます。最後の節では、専用のコントロールがないキーを編集する「設定ファイルの詳細編集」を説明します。
 

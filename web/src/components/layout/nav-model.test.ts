@@ -177,7 +177,7 @@ describe('nav-model — 1.76.0 /team (我的團隊) addition', () => {
 
   it('lives in the 組織 group, appended after the three fixed groups', () => {
     expect(navGroups[3].label).toBe('navGroup.org');
-    expect(navGroups[3].items.map((i) => i.to)).toEqual(['/team']);
+    expect(navGroups[3].items.map((i) => i.to)).toEqual(['/team', '/team/conversations']);
     for (const g of navGroups.slice(0, 3)) {
       expect(g.items.some((i) => i.to === '/team')).toBe(false);
     }
@@ -208,6 +208,12 @@ describe('nav-model — 1.76.0 /team (我的團隊) addition', () => {
 });
 
 describe('nav-model — page titles for the people pages', () => {
+  it('uses the specific leaf for team conversations and matches route segments', () => {
+    expect(crumbsFor('/team/conversations').at(-1)?.labelId).toBe('nav.teamHistory');
+    expect(crumbsFor('/team/conversations/detail').at(-1)?.labelId).toBe('nav.teamHistory');
+    expect(crumbsFor('/teamwork')).toEqual([]);
+  });
+
   it('gives /team and the members page (canonical and legacy path) their own label', () => {
     expect(crumbsFor('/team').at(-1)?.labelId).toBe('nav.myTeam');
     expect(crumbsFor('/manage/users').at(-1)?.labelId).toBe('manage.users');
