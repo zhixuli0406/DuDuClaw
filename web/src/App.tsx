@@ -75,6 +75,7 @@ const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'Local
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
+const TeamHistoryPage = lazyPage(() => import('./pages/TeamHistoryPage'), 'TeamHistoryPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
@@ -356,6 +357,7 @@ export function App() {
                     both are mirrored here. */}
                 <Route element={<EditionGuard enterprise />}>
                   <Route path="team" element={<TeamPage />} />
+                  <Route path="team/conversations" element={<TeamHistoryPage />} />
                 </Route>
               </Route>
 

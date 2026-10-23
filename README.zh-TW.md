@@ -282,7 +282,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## 文件
 
-- [主管唯讀團隊對話](docs/features/zh-TW/68-manager-team-history.md)：尚未發版的企業版 API；部屬 WebChat 全文、外部對話遮蔽，含生效時間與強制稽核。頁面由後續變更加入。
+- [主管唯讀團隊對話](docs/features/zh-TW/68-manager-team-history.md)：尚未發版的企業版頁面與 API；部屬 WebChat 全文、外部對話遮蔽，含職員提示、生效時間與強制稽核。
 - [ARCHITECTURE.md](ARCHITECTURE.md):完整系統架構
 - [docs/README.md](docs/README.md):公開文件索引(架構 / RFC / ADR / 規格 / 指南)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):生產部署(Tailscale / Docker / systemd / 自動更新 / 監控)
