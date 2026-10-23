@@ -342,8 +342,15 @@ impl MethodHandler {
             }
 
             // ── Skills (open to all) ─────────────────────────
-            "skills.list" => self.handle_skills_list(params).await,
-            "skills.search" => self.handle_skills_search(params).await,
+            // B8: filtered to the employees the caller may view (read live).
+            "skills.list" => self.handle_skills_list(params, ctx).await,
+            // B8: per-employee switches and removal — Owner of each named
+            // employee (or admin), checked live inside the handlers.
+            "skills.set_enabled" => self.handle_skills_set_enabled(params, ctx).await,
+            "skills.remove" => self.handle_skills_remove(params, ctx).await,
+            "skills.archived" => self.handle_skills_archived(params, ctx).await,
+            "skills.restore" => self.handle_skills_restore(params, ctx).await,
+            "skills.search" => self.handle_skills_search(params, ctx).await,
             "skills.content" => {
                 // HS4: skill content is read from a specific agent's registry —
                 // scope to an agent the caller is bound to.

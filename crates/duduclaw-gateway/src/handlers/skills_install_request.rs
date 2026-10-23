@@ -583,7 +583,7 @@ impl MethodHandler {
                 // column reflects that it passed vetting instead of showing
                 // "Not scanned" (Bug#9). Best-effort — a write failure must not
                 // fail an otherwise-successful install.
-                self.record_skill_scan_verdict(&installed, scan.risk_level);
+                self.record_skill_scan_verdict(scope, &installed, scan.risk_level);
                 Ok(json!({ "skill_name": installed, "scope": scope }))
             }
             "mcp" => {
@@ -658,9 +658,15 @@ impl MethodHandler {
         }
     }
 
-    /// Sidecar path mapping installed skill name → security-scan verdict
+    /// Sidecar path mapping an installed skill (`<layer>/<name>`, see
+    /// `skills_list_rpc::verdict_key`) → security-scan verdict
     /// (`pass` / `warn` / `fail`). Lets `skills.list` surface a real verdict on
     /// approved installs instead of "Not scanned" (Bug#9).
+    ///
+    /// B8: keyed by layer and owner, not by bare name — two employees' skills
+    /// sharing a name used to share one verdict. Entries written before B8
+    /// (bare names) are no longer shown: they cannot be attributed to one
+    /// install.
     pub(crate) fn skill_scan_verdicts_path(&self) -> std::path::PathBuf {
         self.home_dir.join("skill_scan_verdicts.json")
     }
@@ -675,28 +681,33 @@ impl MethodHandler {
         }
     }
 
-    /// Record a skill's scan verdict in the sidecar map (cross-process safe via
-    /// an advisory file lock — coding convention #3). Best-effort: any error is
-    /// swallowed so it never blocks an install.
+    /// Record a skill's scan verdict for the install `scope` it went to
+    /// (cross-process safe via an advisory file lock — coding convention #3).
+    /// Best-effort: an error is logged, never blocks an install.
     pub(crate) fn record_skill_scan_verdict(
         &self,
+        scope: &str,
         skill_name: &str,
         risk: crate::skill_lifecycle::security_scanner::RiskLevel,
     ) {
         let path = self.skill_scan_verdicts_path();
-        let name = skill_name.to_string();
+        let key = super::skills_list_rpc::verdict_key(
+            &super::skills_list_rpc::verdict_layer_for_install_scope(scope),
+            skill_name,
+        );
         let verdict = Self::risk_to_verdict(risk).to_string();
-        let _ = duduclaw_core::with_file_lock(&path, || {
+        let written = duduclaw_core::with_file_lock(&path, || {
             let mut map: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
-            map.insert(name.clone(), Value::String(verdict.clone()));
-            if let Ok(serialized) = serde_json::to_string(&Value::Object(map)) {
-                let _ = std::fs::write(&path, serialized);
-            }
-            Ok::<(), std::io::Error>(())
+            map.insert(key.clone(), Value::String(verdict.clone()));
+            let serialized = serde_json::to_string(&Value::Object(map)).map_err(std::io::Error::other)?;
+            std::fs::write(&path, serialized)
         });
+        if let Err(e) = written {
+            warn!(skill = %skill_name, error = %e, "failed to record skill scan verdict");
+        }
     }
 
     /// Load the skill scan-verdict map (name → `pass`/`warn`/`fail`). Missing or

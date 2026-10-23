@@ -31,6 +31,7 @@ const ENTERPRISE_METHODS: &[&str] = &[
     "users.unbind_agent",
     "users.offboard",
     "users.subordinates",
+    "users.my_team",
     "users.audit_log",
     "departments.list",
     "departments.create",

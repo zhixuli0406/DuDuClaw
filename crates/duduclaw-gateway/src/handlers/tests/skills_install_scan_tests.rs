@@ -85,7 +85,7 @@ async fn skills_list_keeps_global_layer_and_scope_badge() {
     }
 
     let frame = handler
-        .handle_skills_list(json!({ "agent_id": "agnes" }))
+        .handle_skills_list(json!({ "agent_id": "agnes" }), &UserContext::admin_fallback())
         .await;
     let payload = match &frame {
         WsFrame::Response {
@@ -165,7 +165,7 @@ async fn skills_list_aggregate_reads_disk_not_the_scan_snapshot() {
     )
     .unwrap();
 
-    let frame = handler.handle_skills_list(json!({})).await;
+    let frame = handler.handle_skills_list(json!({}), &UserContext::admin_fallback()).await;
     let payload = match &frame {
         WsFrame::Response {
             payload: Some(p), ..
@@ -221,7 +221,7 @@ async fn skills_list_reports_the_directories_it_scanned() {
     }
 
     let frame = handler
-        .handle_skills_list(json!({ "agent_id": "agnes" }))
+        .handle_skills_list(json!({ "agent_id": "agnes" }), &UserContext::admin_fallback())
         .await;
     let payload = match &frame {
         WsFrame::Response {

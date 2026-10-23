@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { Link } from 'react-router';
 import { Plus, Puzzle } from 'lucide-react';
+import { matchesQuery } from '@/lib/skill-library';
 import { cn } from '@/lib/utils';
 import {
   Button,
@@ -55,10 +56,13 @@ export function CustomSkillsSection({ filter = '' }: { filter?: string }) {
     load();
   }, [load]);
 
-  const q = filter.trim().toLowerCase();
+  const q = filter.trim();
   const visible = useMemo(
-    () => (q ? skills.filter((s) => s.display_name.toLowerCase().includes(q)) : skills),
-    [skills, q],
+    () =>
+      skills.filter((s) =>
+        matchesQuery(filter, [s.display_name, s.slug, s.description_human, ...(s.tags ?? '').split(',')]),
+      ),
+    [skills, filter],
   );
 
   const newButton = (

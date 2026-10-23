@@ -11,6 +11,9 @@ use tracing::{error, info, warn};
 pub struct SkillFile {
     pub name: String,
     pub content: String,
+    /// Last-modified time of the skill body (Unix seconds), when the
+    /// filesystem reports one. Used for "recently added" ordering.
+    pub modified_unix: Option<i64>,
 }
 
 /// A fully loaded agent with its configuration and associated markdown files.
@@ -157,8 +160,14 @@ impl AgentRegistry {
                         };
 
                     let local = std::mem::take(&mut agent.skills);
-                    agent.skills =
+                    let composed =
                         Self::compose_skill_layers(&self.global_skills, dept_skills, local);
+                    // Per-employee switches only narrow the composed set.
+                    agent.skills = crate::skill_state::read_disabled(
+                        &home_dir,
+                        &agent.config.agent.name,
+                    )
+                    .filter(composed);
 
                     let name = agent.config.agent.name.clone();
                     // Two agent directories sharing the same agent name would
@@ -266,7 +275,12 @@ impl AgentRegistry {
         let instructions =
             Self::load_optional_md(&dir.join(duduclaw_core::INSTRUCTIONS_FILE)).await;
         let memory = Self::load_optional_md(&dir.join("MEMORY.md")).await;
-        let skills = Self::load_skills(&dir.join("SKILLS")).await;
+        let mut skills = Self::load_skills(&dir.join("SKILLS")).await;
+        // Per-employee switches (`<home>/skill_state/`) also apply to a
+        // standalone load, so no path hands a switched-off skill to a prompt.
+        if let Some(home) = duduclaw_core::preset::agent_home_dir(dir) {
+            skills = crate::skill_state::read_disabled(&home, &config.agent.name).filter(skills);
+        }
         let contract = crate::contract::load_contract(dir);
 
         Ok(LoadedAgent {
@@ -309,9 +323,16 @@ impl AgentRegistry {
         self.agents.get(name)
     }
 
-    /// Return all loaded agents as a list.
+    /// Return all loaded agents, ordered by agent name.
+    ///
+    /// The backing map is a `HashMap`, whose iteration order changes on every
+    /// process start; every caller that renders or iterates this list (the
+    /// dashboard's agent pickers, the aggregate skill view, rosters) would
+    /// otherwise show a different order after each gateway restart.
     pub fn list(&self) -> Vec<&LoadedAgent> {
-        self.agents.values().collect()
+        let mut agents: Vec<&LoadedAgent> = self.agents.values().collect();
+        agents.sort_by(|a, b| a.config.agent.name.cmp(&b.config.agent.name));
+        agents
     }
 
     /// Return the global skills (loaded from `~/.duduclaw/skills/`).
@@ -564,6 +585,11 @@ impl AgentRegistry {
                     continue;
                 }
 
+                let modified_unix = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
                 match fs::read_to_string(&path).await {
                     Ok(content) => {
                         // If we previously inserted a flat-form skill
@@ -575,6 +601,7 @@ impl AgentRegistry {
                                 .find(|s| s.name.eq_ignore_ascii_case(&skill_name))
                         {
                             existing.content = content;
+                            existing.modified_unix = modified_unix;
                             seen.insert(dedup_key);
                             continue;
                         }
@@ -582,6 +609,7 @@ impl AgentRegistry {
                         skills.push(SkillFile {
                             name: skill_name,
                             content,
+                            modified_unix,
                         });
                     }
                     Err(e) => {
@@ -702,7 +730,7 @@ mod load_skills_tests {
     // ── WP7: three-layer skill composition ───────────────────────────────
 
     fn sf(name: &str, body: &str) -> SkillFile {
-        SkillFile { name: name.to_string(), content: body.to_string() }
+        SkillFile { name: name.to_string(), content: body.to_string(), modified_unix: None }
     }
 
     #[test]
@@ -970,6 +998,70 @@ skill_security_scan = true
             names,
             std::collections::HashSet::from(["sales-lead", "warehouse-lead"])
         );
+    }
+    /// B8: `list()` is ordered by agent name, not by `HashMap` iteration.
+    #[tokio::test]
+    async fn list_is_ordered_by_agent_name() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        for n in ["zeta", "alpha", "mike", "bravo"] {
+            write_full_agent_toml(&agents_dir.join(n), n);
+        }
+        let mut registry = AgentRegistry::new(agents_dir);
+        registry.scan().await.unwrap();
+        let names: Vec<&str> = registry.list().iter().map(|a| a.config.agent.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "mike", "zeta"]);
+    }
+
+    /// B8: a skill switched off for one employee is not loaded for that
+    /// employee (from any layer) and stays loaded for everyone else.
+    #[tokio::test]
+    async fn switched_off_skill_is_not_loaded_for_that_employee_only() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        write_full_agent_toml(&agents_dir.join("alice"), "alice");
+        write_full_agent_toml(&agents_dir.join("bob"), "bob");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::write(home.join("skills").join("tone.md"), "global tone").unwrap();
+        for a in ["alice", "bob"] {
+            let d = agents_dir.join(a).join("SKILLS");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("quote.md"), format!("{a} quote")).unwrap();
+        }
+        crate::skill_state::set_disabled(
+            home,
+            "alice",
+            &["tone".to_string(), "quote".to_string()],
+            true,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new(agents_dir);
+        registry.scan().await.unwrap();
+        let names = |id: &str| -> Vec<String> {
+            registry.get(id).unwrap().skills.iter().map(|s| s.name.clone()).collect()
+        };
+        assert!(names("alice").is_empty(), "{:?}", names("alice"));
+        assert_eq!(names("bob"), vec!["tone", "quote"]);
+    }
+
+    /// B8: an unreadable switch file loads no skills for that employee.
+    #[tokio::test]
+    async fn unreadable_switch_file_loads_no_skills() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        write_full_agent_toml(&agents_dir.join("alice"), "alice");
+        let d = agents_dir.join("alice").join("SKILLS");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("quote.md"), "q").unwrap();
+        std::fs::create_dir_all(home.join("skill_state")).unwrap();
+        std::fs::write(home.join("skill_state").join("alice.json"), "garbage").unwrap();
+        let mut registry = AgentRegistry::new(agents_dir.clone());
+        registry.scan().await.unwrap();
+        assert!(registry.get("alice").unwrap().skills.is_empty());
+        let standalone = AgentRegistry::load_agent(&agents_dir.join("alice")).await.unwrap();
+        assert!(standalone.skills.is_empty());
     }
 }
 
