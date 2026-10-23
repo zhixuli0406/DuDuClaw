@@ -278,6 +278,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## ドキュメント
 
+- [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：未リリースの Enterprise API。部下の WebChat とマスクした外部会話を有効期間と必須監査で制限。画面は別途追加します。
 - [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体
 - [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)

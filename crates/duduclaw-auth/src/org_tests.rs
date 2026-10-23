@@ -620,3 +620,46 @@ fn concurrent_opposite_assignments_cannot_both_win() {
         assert!(ma.is_none() || mb.is_none(), "round {round}: no two-person loop");
     }
 }
+
+#[test]
+fn oversight_keeps_every_active_operator_or_owner_report() {
+    let (db, _t) = test_db();
+    let o = org(&db);
+    db.bind_agent(&o.emp2, "sales", AccessLevel::Operator).unwrap();
+    db.bind_agent(&o.other, "sales", AccessLevel::Owner).unwrap();
+    db.bind_agent(&o.mgr, "sales", AccessLevel::Owner).unwrap();
+    let reports = db.overseen_reports(&o.mgr, "sales").unwrap();
+    assert_eq!(reports.len(), 2, "self and unrelated people are excluded");
+    assert!(reports.iter().any(|r| r.user_id == o.emp1 && r.depth == 2 && r.level == AccessLevel::Owner));
+    assert!(reports.iter().any(|r| r.user_id == o.emp2 && r.depth == 1 && r.level == AccessLevel::Operator));
+    assert!(db.overseen_reports(&o.mgr, "hr").unwrap().is_empty(), "Viewer is not oversight authority");
+    db.set_user_status(&o.emp2, UserStatus::Suspended).unwrap();
+    assert_eq!(db.overseen_reports(&o.mgr, "sales").unwrap().len(), 1);
+    db.set_manager(&o.emp1, None).unwrap();
+    assert!(db.overseen_reports(&o.mgr, "sales").unwrap().is_empty(), "reassignment is immediate");
+}
+
+#[test]
+fn oversight_walks_suspended_managers_but_excludes_inactive_reports_and_corrupt_bindings() {
+    let (db, _t) = test_db();
+    let o = org(&db);
+    db.bind_agent(&o.lead, "sales", AccessLevel::Owner).unwrap();
+    db.set_user_status(&o.lead, UserStatus::Suspended).unwrap();
+    let reports = db.overseen_reports(&o.mgr, "sales").unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].user_id, o.emp1);
+    db.conn().execute("UPDATE user_agent_bindings SET access_level = 'unexpected' WHERE user_id = ?1", [&o.emp1]).unwrap();
+    assert!(db.overseen_reports(&o.mgr, "sales").unwrap().is_empty());
+}
+
+#[test]
+fn oversight_bounds_hand_written_cycles_and_denies_unreadable_storage() {
+    let (db, _t) = test_db();
+    let o = org(&db);
+    db.conn().execute("UPDATE users SET manager_user_id = ?1 WHERE id = ?2", rusqlite::params![o.lead, o.mgr]).unwrap();
+    let reports = db.overseen_reports(&o.mgr, "sales").unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].user_id, o.emp1);
+    db.conn().execute("DROP TABLE user_agent_bindings", []).unwrap();
+    assert!(db.overseen_reports(&o.mgr, "sales").is_err());
+}
