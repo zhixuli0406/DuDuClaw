@@ -759,6 +759,13 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
       ...(item ? [{ labelId: item.crumb ?? item.label }] : []),
     ];
   }
+  // Legacy top-level aliases that still render a 管理 page in place (`/users`,
+  // `/billing`, `/logs`, … — see App.tsx) get that page's trail, so the tab
+  // title is not just the product name.
+  const managed = `/manage${pathname}`;
+  if (allManageNav.some((i) => i.to === managed)) {
+    return crumbsFor(managed);
+  }
   const flat: NavItem[] = [...dailyItems, inboxEntry, conversationsEntry, staffEntry];
   for (const item of flat) {
     if (item.to === pathname || (item.to !== '/' && pathname.startsWith(item.to))) {

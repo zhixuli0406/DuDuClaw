@@ -8473,12 +8473,12 @@
   "team.action.chat": "Chat",
   "team.action.assign": "Assign",
   "team.assign.title": "Assign to {name}",
-  "team.assign.subtitle": "This is {report}'s AI staff member. The work becomes a goal it works on until done; follow it on the Goals page.",
+  "team.assign.subtitle": "This is {report}'s AI staff member. It takes the work on as a goal and keeps at it until it is done.",
   "team.assign.goal": "What should be done",
   "team.assign.goalPlaceholder": "For example: tidy up this month's quotes and list the customers who haven't replied",
   "team.assign.criteria": "How you'll know it's done (optional)",
   "team.assign.criteriaPlaceholder": "Leave empty to use the request above",
-  "team.assign.success": "Assigned to {name}",
+  "team.assign.success": "Assigned to {name}: {title}",
   "users.view.label": "View",
   "users.view.list": "List",
   "users.view.org": "Org chart",
@@ -8498,5 +8498,8 @@
   "users.org.role.admin": "Admin",
   "users.org.role.manager": "Manager",
   "users.org.role.employee": "Employee",
-  "skills.manage.bulkBar": "Bulk actions"
+  "skills.manage.bulkBar": "Bulk actions",
+  "users.status.active": "Active",
+  "users.status.suspended": "Suspended",
+  "users.status.offboarded": "Offboarded"
 }

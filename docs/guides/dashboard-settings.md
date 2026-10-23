@@ -119,7 +119,7 @@ Only people whose role is Manager or Admin see it (sidebar group "Organization")
 - Tag "Can assign work" or "Chat only": when the report's binding is Owner or Operator you get Operator and may assign work; when it is Viewer you may only chat.
 - "N open tasks": tasks assigned to that employee that are not done, cancelled or failed.
 - **Chat** opens WebChat with `@name ` already typed. Disabled while the employee is not active.
-- **Assign** asks what should be done (and, optionally, how you will know it is done), creates a goal task (`tasks.create` with `kind = "goal"`) and takes you to that task on the Goals page.
+- **Assign** asks what should be done (and, optionally, how you will know it is done), creates a goal task (`tasks.create` with `kind = "goal"`). You stay on the page with an "Assigned to …" confirmation; a manager cannot open a report's task itself yet.
 
 The data comes from the RPC `users.my_team`, computed with the same rules every call and assignment uses, so everything listed can be reached. It is refused in the Personal edition and for the Employee role.
 

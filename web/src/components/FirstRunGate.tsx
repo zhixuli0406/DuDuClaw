@@ -1,12 +1,21 @@
 import { useEffect } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 
 /**
  * FirstRunGate — wraps the authenticated app (inside MainLayout, past the WS
  * handshake). When the install has zero agents, it forces the user to the
  * first-run onboarding at `/welcome` so a brand-new DuDuClaw is never a dead,
  * agent-less dashboard.
+ *
+ * Only an admin is sent there: `agents.list` returns every employee to an
+ * admin, so an empty list really means an empty install, and only an admin
+ * can create the first employee (`agents.create` is admin-only). A manager
+ * or employee sees just their own bindings; an empty list is normal for
+ * them (a manager may reach a team's employees on `/team`) and must never
+ * trap them on a wizard they cannot finish. A session with no known role
+ * (legacy single-token login) keeps the old behaviour.
  *
  * Anti-flash: redirect only AFTER `agents.list` has resolved once (`loaded`),
  * never on the initial empty array. `/welcome` is mounted OUTSIDE this gate
@@ -18,6 +27,8 @@ export function FirstRunGate() {
   const loading = useAgentsStore((s) => s.loading);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const location = useLocation();
+  const role = useAuthStore((s) => s.user?.role);
+  const canOnboard = role === undefined || role === 'admin';
 
   useEffect(() => {
     if (!loaded && !loading) {
@@ -44,6 +55,7 @@ export function FirstRunGate() {
   // (pathname briefly `/license`, not yet `/app/system/license`) and the CTA
   // becomes a dead loop again.
   if (
+    canOnboard &&
     agents.length === 0 &&
     location.pathname !== '/welcome' &&
     location.pathname !== '/license' &&

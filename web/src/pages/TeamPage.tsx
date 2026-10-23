@@ -188,12 +188,12 @@ function MemberCard({
     <section aria-label={member.display_name} className="space-y-2 py-1">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <ActorAvatar actorType="user" name={member.display_name} size="sm" />
-        <span className="text-sm font-medium text-foreground">{member.display_name}</span>
-        <Badge variant={member.role === 'employee' ? 'outline' : 'secondary'}>
+        <span className="min-w-0 truncate text-sm font-medium text-foreground">{member.display_name}</span>
+        <Badge variant={member.role === 'employee' ? 'outline' : 'secondary'} className="shrink-0 whitespace-nowrap">
           {intl.formatMessage({ id: `users.org.role.${member.role}` })}
         </Badge>
         {member.status === 'suspended' && (
-          <Badge variant="secondary" className="bg-warning/15 text-warning">
+          <Badge variant="secondary" className="shrink-0 whitespace-nowrap bg-warning/15 text-warning">
             {intl.formatMessage({ id: 'users.org.suspended' })}
           </Badge>
         )}
@@ -234,25 +234,30 @@ function AgentRow({
 }) {
   const intl = useIntl();
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg bg-muted/50 px-3 py-2">
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        <ActorAvatar actorType="agent" name={agent.display_name} size="xs" />
-        <span className="truncate text-sm text-foreground">{agent.display_name}</span>
-        <Badge variant="outline">
-          {intl.formatMessage({ id: agent.assignable ? 'team.level.assign' : 'team.level.talk' })}
-        </Badge>
-        {!agent.operational && (
-          <Badge variant="secondary" className="bg-warning/15 text-warning">
-            {intl.formatMessage({ id: 'team.agent.unavailable' })}
+    // Stacked on phones (name, then tags, then buttons); one line from `sm`.
+    <div className="flex flex-col gap-2 rounded-lg bg-muted/50 px-3 py-2 sm:flex-row sm:items-center sm:gap-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <ActorAvatar actorType="agent" name={agent.display_name} size="xs" />
+          <span className="truncate text-sm text-foreground">{agent.display_name}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge variant="outline" className="shrink-0 whitespace-nowrap">
+            {intl.formatMessage({ id: agent.assignable ? 'team.level.assign' : 'team.level.talk' })}
           </Badge>
-        )}
+          {!agent.operational && (
+            <Badge variant="secondary" className="shrink-0 whitespace-nowrap bg-warning/15 text-warning">
+              {intl.formatMessage({ id: 'team.agent.unavailable' })}
+            </Badge>
+          )}
+          {agent.active_tasks !== null && (
+            <span className="whitespace-nowrap text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'team.activeTasks' }, { count: agent.active_tasks })}
+            </span>
+          )}
+        </div>
       </div>
-      {agent.active_tasks !== null && (
-        <span className="text-xs text-muted-foreground">
-          {intl.formatMessage({ id: 'team.activeTasks' }, { count: agent.active_tasks })}
-        </span>
-      )}
-      <div className="flex gap-2">
+      <div className="flex shrink-0 gap-2">
         <Button variant="outline" size="sm" onClick={onChat} disabled={!agent.operational}>
           <MessageCircle />
           {intl.formatMessage({ id: 'team.action.chat' })}

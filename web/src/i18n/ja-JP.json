@@ -8473,12 +8473,12 @@
   "team.action.chat": "会話",
   "team.action.assign": "依頼",
   "team.assign.title": "「{name}」に依頼",
-  "team.assign.subtitle": "{report} さんの AI スタッフです。依頼はゴールタスクとして進められ、進み具合は「ゴールタスク」ページで確認できます。",
+  "team.assign.subtitle": "{report} さんの AI スタッフです。依頼はゴールタスクとして、完了まで進められます。",
   "team.assign.goal": "依頼する内容",
   "team.assign.goalPlaceholder": "例：今月の見積書を整理し、未返信のお客様を一覧にする",
   "team.assign.criteria": "完了の目安（任意）",
   "team.assign.criteriaPlaceholder": "空欄なら上の依頼内容を基準にします",
-  "team.assign.success": "「{name}」に依頼しました",
+  "team.assign.success": "「{name}」に依頼しました：{title}",
   "users.view.label": "表示",
   "users.view.list": "一覧",
   "users.view.org": "組織図",
@@ -8498,5 +8498,8 @@
   "users.org.role.admin": "管理者",
   "users.org.role.manager": "マネージャー",
   "users.org.role.employee": "従業員",
-  "skills.manage.bulkBar": "一括操作"
+  "skills.manage.bulkBar": "一括操作",
+  "users.status.active": "在職",
+  "users.status.suspended": "停止中",
+  "users.status.offboarded": "退職済み"
 }
