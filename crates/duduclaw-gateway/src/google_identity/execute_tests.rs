@@ -359,3 +359,39 @@ async fn authenticated_requests_share_the_routes_rate_limit_even_when_metadata_i
     }
     assert_eq!(call(app, &home, value).await.0, 429);
 }
+
+#[tokio::test]
+async fn dedicated_writes_never_retry_transient_service_responses() {
+    let mut observed = Vec::new();
+    for code in [503u16, 429] {
+        let subject = format!("execute-write-{code}@c.test");
+        let home = ready("execute-bot", &subject, "requesters='anyone'");
+        let raw = std::fs::read_to_string(home.p().join("config.toml")).unwrap();
+        std::fs::write(
+            home.p().join("config.toml"),
+            raw.replace(
+                "scopes=['google:read']",
+                "scopes=['google:read','google:write']",
+            ),
+        )
+        .unwrap();
+        let mut req = request("docs_append");
+        req["arguments"] =
+            json!({"document_id":format!("unit-write-{code}"),"text":"synthetic unit write"});
+        let (status, value) = call(router(&home), &home, req).await;
+        assert_eq!(status, 200, "{value}");
+        assert_eq!(value["result"]["isError"], true, "{value}");
+        let count = service_reads()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(account, path)| account == &subject && path.ends_with(":batchUpdate"))
+            .count();
+        observed.push((code, count));
+    }
+    assert_eq!(
+        observed,
+        vec![(503, 1), (429, 1)],
+        "dedicated writes must not repeat"
+    );
+}

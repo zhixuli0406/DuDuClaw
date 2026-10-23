@@ -238,7 +238,7 @@ async fn serve(
         };
         json!({"content":[{"type":"text","text":message}]})
     } else {
-        Box::pin(dispatch_native(
+        crate::google_workspace::with_dedicated_write_policy(dispatch_native(
             &state.home,
             &request.tool,
             &request.arguments,

@@ -162,6 +162,18 @@ async fn service_endpoint(
         .lock()
         .unwrap()
         .push((account.clone(), uri.to_string()));
+    for code in [429u16, 503] {
+        if uri
+            .path()
+            .ends_with(&format!("/unit-write-{code}:batchUpdate"))
+        {
+            return (
+                axum::http::StatusCode::from_u16(code).unwrap(),
+                axum::Json(json!({"error":{"message":"synthetic transient write failure"}})),
+            )
+                .into_response();
+        }
+    }
     if uri.path().ends_with("/drive/v3/files") {
         let query: HashMap<String, String> =
             url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
@@ -222,7 +234,7 @@ fn mock() -> &'static str {
                         "/gmail.googleapis.com/gmail/v1/users/me/profile",
                         axum::routing::get(gmail_profile),
                     )
-                    .fallback(axum::routing::get(service_endpoint));
+                    .fallback(axum::routing::any(service_endpoint));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(format!("http://{}", listener.local_addr().unwrap()))
                     .unwrap();
