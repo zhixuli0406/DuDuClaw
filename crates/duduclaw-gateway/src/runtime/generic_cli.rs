@@ -608,6 +608,8 @@ impl GenericCliRuntime {
             // `DUDUCLAW_UPSTREAM_UNKNOWN` the operator happened to export
             // would mark every run's writes; only the scoped value counts.
             cmd.env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN);
+            cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
+            cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
             for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
                 cmd.env(k, v);
             }

@@ -158,6 +158,7 @@ impl MethodHandler {
                     "role": format!("{:?}", cfg.role).to_lowercase(),
                     "status": format!("{:?}", cfg.status).to_lowercase(),
                     "assignable": ctx.can_assign_to(id),
+                    "manager_may_read": db.as_deref().is_some_and(|db| crate::team_oversight::manager_may_read(&self.home_dir,db,ctx,id)),
                 });
                 if let (Value::Object(out), Value::Object(extra)) =
                     (&mut v, grant_fields(source, &access, id))

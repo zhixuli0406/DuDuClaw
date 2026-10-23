@@ -1,5 +1,7 @@
 # Calling AI staff with `@`
 
+Unreleased: a callable entry may include `manager_may_read`, indicating that an active manager can use the separate [read-only team history API](68-manager-team-history.md). This does not grant resume, export or ordinary history access. Its dashboard notice is a separate change.
+
 People talk to one AI employee by default and can hand a single message to another one by typing `@` and a name, the way you mention someone in a messaging app. Since v1.76.0 who you can call depends on who you are, and every message is routed on its own.
 
 ## How a message is routed

@@ -1,12 +1,13 @@
 # Live-test scripts
 
-Two scripts for validating a build against a real gateway without touching the
+Scripts for validating a build against a real gateway without touching the
 production home (`~/.duduclaw`).
 
 | Script | What it does |
 |---|---|
 | `make-home.sh <target-dir> [--port N]` | Creates an isolated DuDuClaw home: loopback `config.toml` (default port 18977) and two employees. `plain` has no tool allowlist (the old kind of test employee). `prod-shaped` is written like a production employee: `[capabilities] allowed_tools = ["mcp__duduclaw__*", "Read", "Write", "Edit", "Bash"]`, a `denied_tools` entry, `approval_required_tools`, all four `[permissions]` flags, `[budget]`, `[evolution] gvu_enabled = true`, a `CONTRACT.toml` and a `SOUL.md`. Refuses a non-empty target and any target inside `~/.duduclaw`. Writes no secrets. |
 | `mcp-probe.sh <home> <agent-id> [tool ...]` | Starts the real `duduclaw mcp-server` for that employee from the command and env in its own `.mcp.json`, sends `initialize`, `tools/list` and one `tools/call` per tool (default: `tasks_list`, `memory_search`, `working_state_get`, `user_profile_get`), and prints `ok`, `REFUSED: ...` or `ERROR: ...` per call. Exits 1 when a default check fails for `prod-shaped`. |
+| `python3 on-behalf-of.py <home> <binary>` | After booting and stopping the isolated gateway, calls the real `prod-shaped` stdio MCP server. Checks host identity stamping on tasks and queue rows, forged tool arguments, rejection auditing, enforce refusals and absent-principal behavior. Writes disposable test rows and temporarily changes the isolated delegation policy. It calls no model; runtime delivery, real channels and human acceptance require separate checks. |
 
 ## Why `prod-shaped` exists
 
@@ -87,3 +88,23 @@ lists what would go with sizes. `target/release` and other target triples are
 untouched unless you pass `--all-profiles`. The cache once reached 134 GB and a
 full disk crashed Docker Desktop; run it when free space drops below about
 100 GB.
+
+## Actual VNC authentication
+
+After installing the dashboard dependencies, run:
+
+```sh
+node scripts/live-test/computer-vnc-auth.mjs <already-built-local-image>
+```
+
+The test creates its own labelled container with no network, a read-only root,
+private tmpfs, no-new-privileges and CPU/memory limits. It checks actual RFB
+password authentication twice, rejects a wrong password and the sandbox user,
+checks both TCP tables for VNC listeners, then stops VNC and verifies socket
+removal. Its fixture directory is retained. Cleanup verifies the random ownership
+label before removing only that container. No image is pulled or published.
+
+An RFB greeting alone cannot verify these checks. The old helper emitted the
+greeting and then rejected the Unix peer named `localhost` against its
+`127.0.0.1` allowlist. The corrected helper binds to loopback without that IP-only
+allowlist; root-only socket permissions and VNC password authentication remain.
