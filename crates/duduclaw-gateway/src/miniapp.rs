@@ -1438,6 +1438,7 @@ mod tests {
             binding: None,
             answer: None,
             invalidated_reason: None,
+            on_behalf_of: None,
         };
         let s = detail_summary(&rec);
         assert!(!s.contains("永久退款") && !s.contains("七天"), "{s}");

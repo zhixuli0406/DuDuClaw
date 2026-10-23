@@ -2573,6 +2573,9 @@ mod secret_persistence;
 #[path = "tests/workspace_cases.rs"]
 mod workspace_cases;
 
+#[path = "tests/on_behalf_of.rs"]
+mod on_behalf_of;
+
 #[path = "tests/workspace_docker.rs"]
 mod workspace_docker;
 

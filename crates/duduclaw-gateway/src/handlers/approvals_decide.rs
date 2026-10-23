@@ -55,6 +55,20 @@ impl MethodHandler {
                 }
             }
         }
+        // `[approval] forbid_self_approval`: a request raised while an
+        // employee worked for this account is not approved by the same
+        // account (bound requests are decided by their bound person only).
+        if let Some(rec) = record.as_ref().filter(|r| r.binding.is_none()) {
+            let me = duduclaw_core::HumanPrincipal::user(&ctx.user_id).map(|p| p.to_string());
+            if crate::on_behalf_of::self_approval::refuses(
+                &self.home_dir,
+                rec.on_behalf_of.as_deref(),
+                me.as_deref(),
+                approve,
+            ) {
+                return WsFrame::error_response("", crate::on_behalf_of::self_approval::REFUSAL);
+            }
+        }
         if let Some(rec) = record.as_ref().filter(|r| r.binding.is_some()) {
             if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind)
                 && rec.is_stale(chrono::Utc::now())

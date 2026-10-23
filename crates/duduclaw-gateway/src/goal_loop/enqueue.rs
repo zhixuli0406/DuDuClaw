@@ -389,44 +389,7 @@ pub(super) fn build_goal_payload(
 /// names nobody or the account cannot be read (the prompt then has no
 /// assigner line; an id never stands in for the name).
 pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<String> {
-    let user_id = task.on_behalf_of.as_deref()?.strip_prefix("user:")?;
-    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
-    let user = db.get_user(user_id).ok().flatten()?;
-    // One line of plain text: control characters (a newline could start a
-    // fake instruction block), line/paragraph separators, bidi controls and
-    // zero-width characters are dropped.
-    let clean = |s: &str| -> String {
-        let s: String = s.chars().filter(|&c| !is_hidden_or_breaking(c)).collect();
-        duduclaw_core::truncate_chars(s.trim(), 40).to_string()
-    };
-    let name = clean(&user.display_name);
-    if name.is_empty() {
-        return None;
-    }
-    let dept = user.department.as_deref().map(clean).filter(|d| !d.is_empty());
-    Some(match dept {
-        Some(dept) => format!("{name}（{dept}）"),
-        None => name,
-    })
-}
-
-/// Characters a one-line display name must not carry: C0/C1 controls,
-/// U+2028/U+2029, bidi embeddings, overrides and isolates (U+202A–U+202E,
-/// U+2066–U+2069, U+200E/U+200F, U+061C), zero-width characters
-/// (U+200B–U+200D, U+2060, U+FEFF) and the soft hyphen.
-fn is_hidden_or_breaking(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{2028}' | '\u{2029}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{061C}'
-                | '\u{2060}'
-                | '\u{FEFF}'
-                | '\u{00AD}'
-        )
+    crate::on_behalf_of::label::person_name(home, task.on_behalf_of.as_deref()?)
 }
 
 /// The queue row of one goal round with the given message id.
@@ -459,12 +422,15 @@ pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) ->
         // P2-B: a goal round carries no upstream channel turn to lose.
         upstream_unknown: false,
         lane: None,
+        // The person the task was handed over for (written by the gateway
+        // when the task was created); the round runs on their behalf.
+        on_behalf_of: task.on_behalf_of.clone(),
     }
 }
 
 #[cfg(test)]
 mod label_tests {
-    use super::is_hidden_or_breaking;
+    use crate::on_behalf_of::label::is_hidden_or_breaking;
 
     #[test]
     fn display_names_lose_breaks_bidi_and_zero_width_characters() {

@@ -160,6 +160,18 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Only a live host registration for the authenticated employee can name
+/// the person. A caller cannot borrow another employee's turn or supply
+/// `on_behalf_of` in the JSON body. Missing/unknown turns name nobody.
+pub(super) fn request_principal(home: &std::path::Path, agent: &str, request: &Request) -> Option<String> {
+    let turn = match request {
+        Request::Start { turn_id, .. } | Request::Action { turn_id, .. } => turn_id.as_deref()?,
+        _ => return None,
+    };
+    let requester = crate::knowledge::turn_requesters::lookup(agent, turn)?;
+    crate::on_behalf_of::principal_for_requester(home, &requester)
+}
+
 async fn handle(
     State(sessions): State<Arc<ComputerUseSessions>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -210,6 +222,7 @@ async fn handle(
         }
     };
     let budget = op_budget(&request);
+    let principal = request_principal(sessions.home(), &agent_id, &request);
     let op = async {
         match request {
             Request::Start { width, height, task, turn_id, workspace } if valid_turn_id(&turn_id) => {
@@ -248,6 +261,7 @@ async fn handle(
             _ => Err(super::not_found()),
         }
     };
+    let op = crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op);
     let outcome: Result<Value, OpError> = match tokio::time::timeout(budget, op).await {
         Ok(outcome) => outcome,
         Err(_) => {

@@ -96,12 +96,24 @@ const GATEWAY_INTERNAL_SENDERS: [&str; 1] = ["__deferred_gvu__"];
 /// table — same fail-closed default every extractor here already assumed
 /// (missing/malformed `[delegation]` ⇒ department policy + empty whitelist;
 /// missing/malformed `[acp]` ⇒ `trusted = false`).
-fn read_config_table(home_dir: &Path) -> toml::Table {
+fn read_config_table(home_dir: &Path) -> (toml::Table, duduclaw_core::HumanPrincipalMode) {
     let path = home_dir.join("config.toml");
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| content.parse::<toml::Table>().ok())
-        .unwrap_or_default()
+    let table = match std::fs::read_to_string(&path) {
+        Ok(content) => content.parse::<toml::Table>().ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (toml::Table::new(), duduclaw_core::HumanPrincipalMode::Record);
+        }
+        Err(_) => None,
+    };
+    let Some(table) = table else {
+        warn!("config.toml unreadable or malformed; human_principal treated as enforce");
+        return (toml::Table::new(), duduclaw_core::HumanPrincipalMode::Enforce);
+    };
+    let (mode, warning) = duduclaw_core::HumanPrincipalMode::from_table(&table);
+    if let Some(warning) = warning {
+        warn!("{warning}");
+    }
+    (table, mode)
 }
 
 /// `config.toml [acp] trusted` — WP21 T7, design doc §2.6.
@@ -303,6 +315,7 @@ fn resolve_sender<'a>(
 ///
 /// Denials are logged and audited here; the caller owns the task-status
 /// write-back because the two rails record failure differently.
+#[allow(clippy::too_many_arguments)] // Keeps both durable queue rails on the same gate.
 pub(crate) async fn gate_bus_dispatch(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -311,6 +324,7 @@ pub(crate) async fn gate_bus_dispatch(
     target: &str,
     task_id: &str,
     path_kind: &str,
+    on_behalf_of: Option<&str>,
 ) -> GateOutcome {
     let Some(sender) = resolve_sender(sender_agent, origin_agent) else {
         // v1.52 transitional window — see the module docs. Loud, not silent:
@@ -329,7 +343,7 @@ pub(crate) async fn gate_bus_dispatch(
     // WP21 欠帳⑤: one read + one parse of config.toml serves both extractors
     // below — previously `delegation_rules_from_home` and
     // `acp_trusted_from_home` each re-read and re-parsed the whole file.
-    let config_table = read_config_table(home_dir);
+    let (config_table, human_mode) = read_config_table(home_dir);
     let rules = delegation_rules_from_table(&config_table);
     // WP21 T7: `[acp] trusted = true` widens the extra-system-senders list for
     // this decision only — see `acp_trusted_from_table` for the risk this opts
@@ -343,7 +357,35 @@ pub(crate) async fn gate_bus_dispatch(
     let view = DispatchOrgView::new(home_dir, Some(&guard));
     let sender_id = view.canonical_id(sender);
     let target_id = view.canonical_id(target);
-    let decision = can_delegate_rules_ext(&rules, &view, &sender_id, &target_id, &extra_senders);
+    let decision = can_delegate_rules_ext(&rules, &view, &sender_id, &target_id, &extra_senders)
+        .and_then(|()| {
+            // The employee tree allowed it; in enforce mode the person the
+            // work is for must be allowed too. System and gateway-internal
+            // senders (goal rounds, heartbeat wake-ups, cron) are not an
+            // employee handing work on, so they add no person check here:
+            // their task was authorized when it was created.
+            if duduclaw_core::is_system_sender(&sender_id)
+                || extra_senders.iter().any(|s| s.trim() == sender_id)
+            {
+                return Ok(());
+            }
+            let principal = on_behalf_of
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|value| duduclaw_core::HumanPrincipal::parse(value).inspect_err(|rejection| {
+                    crate::on_behalf_of::audit_rejected(home_dir, &sender_id, path_kind, rejection);
+                }))
+                .transpose();
+            crate::on_behalf_of::access::check(
+                home_dir,
+                human_mode,
+                &principal,
+                &sender_id,
+                &target_id,
+                path_kind,
+                rules.policy,
+            )
+        });
     drop(guard);
 
     match decision {
@@ -358,7 +400,7 @@ pub(crate) async fn gate_bus_dispatch(
                 path_kind,
                 "Delegation denied — task failed, no agent spawned (WP21 C1)"
             );
-            audit_denial(home_dir, &denied, task_id, path_kind);
+            audit_denial(home_dir, &denied, task_id, path_kind, on_behalf_of);
             GateOutcome::Deny(denied)
         }
     }
@@ -368,7 +410,13 @@ pub(crate) async fn gate_bus_dispatch(
 ///
 /// Uses the project's existing audit writer, which takes an exclusive advisory
 /// lock around the append (cross-process safety, project convention #3).
-fn audit_denial(home_dir: &Path, denied: &DelegationDenied, task_id: &str, path_kind: &str) {
+fn audit_denial(
+    home_dir: &Path,
+    denied: &DelegationDenied,
+    task_id: &str,
+    path_kind: &str,
+    on_behalf_of: Option<&str>,
+) {
     let event = AuditEvent::new(
         "delegation_denied",
         truncate_chars(&denied.target, 64),
@@ -381,6 +429,7 @@ fn audit_denial(home_dir: &Path, denied: &DelegationDenied, task_id: &str, path_
             "path_kind": path_kind,
             "task_id": truncate_chars(task_id, 64),
             "message": denied.message_zh(),
+            "on_behalf_of": on_behalf_of.map(|v| truncate_chars(v, 96)),
         }),
     );
     crate::security_autopilot::audit_and_emit(home_dir, &event);
@@ -410,6 +459,10 @@ pub(crate) fn denial_notice(denied: &DelegationDenied) -> String {
         duduclaw_core::DelegationDenyReason::InvalidAgentId => {
             "⛔ 這項委派未執行：委派對象資訊不完整，請確認後重試。".to_string()
         }
+        duduclaw_core::DelegationDenyReason::HumanPrincipalNotPermitted => format!(
+            "⛔ 這項委派未執行：發出這個指令的人沒有權限把工作交給「{t}」。\
+             如需開通，請管理員到儀表板替這個人綁定該員工。"
+        ),
         _ => format!(
             "⛔ 這項委派未執行：「{s}」沒有指派工作給「{t}」的權限。\
              如需開通，請管理員到儀表板「委派權限」設定。"
@@ -475,6 +528,7 @@ mod tests {
             target,
             "task-1",
             "bus_dispatch",
+            None,
         )
         .await
     }
@@ -711,6 +765,7 @@ mod tests {
                 "mkt_rep",
                 "task-legacy",
                 "bus_dispatch",
+                None,
             )
             .await,
             GateOutcome::LegacyNoSender
@@ -726,6 +781,7 @@ mod tests {
             "mkt_rep",
             "task-origin",
             "bus_dispatch",
+            None,
         )
         .await;
         assert!(matches!(outcome, GateOutcome::Deny(_)));
