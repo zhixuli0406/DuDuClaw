@@ -360,6 +360,19 @@ impl CronScheduler {
                 warn!("workflow routine tick refused: {error}");
             }
 
+            // Scheduled assignments (`assign_schedule`): due rows become
+            // tasks/goals on this same tick, only in the process holding the
+            // gateway lock (the slot advance is compare-and-set besides).
+            if duduclaw_core::gateway_instance::held(&self.home_dir) {
+                let home = self.home_dir.clone();
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::assign_schedule::fire::tick(&home, &registry, Utc::now()).await {
+                        warn!("scheduled assignments tick failed: {e}");
+                    }
+                });
+            }
+
             // ── WP2.6 P1: scheduler-level daily skill-gap digest ──
             // Rides the existing 30s tick (no new scheduler, mirroring the
             // heartbeat task-board pull precedent). Internally gated: default

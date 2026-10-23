@@ -400,6 +400,13 @@ impl MethodHandler {
         if risk_boundary.is_some() && !ctx.is_admin() {
             return WsFrame::error_response("", "only an admin can set a risk boundary");
         }
+        // `schedule`: assign the goal later or on a repeat (`assign_schedule`);
+        // the right checked above is checked again at every fire.
+        if params.get("schedule").is_some_and(|s| !s.is_null()) {
+            return self
+                .handle_assign_schedule_create(crate::assign_schedule::AssignKind::Goal, agent_id, &params, ctx)
+                .await;
+        }
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,

@@ -57,22 +57,22 @@ skill_security_scan = true
     std::fs::write(dir.join("agent.toml"), toml).unwrap();
 }
 
-struct Fixture {
-    handler: MethodHandler,
-    db: Arc<UserDb>,
-    _home: tempfile::TempDir,
-    admin: String,
-    mgr: String,
-    lead: String,
-    emp1: String,
-    emp2: String,
-    other: String,
+pub(super) struct Fixture {
+    pub(super) handler: MethodHandler,
+    pub(super) db: Arc<UserDb>,
+    pub(super) _home: tempfile::TempDir,
+    pub(super) admin: String,
+    pub(super) mgr: String,
+    pub(super) lead: String,
+    pub(super) emp1: String,
+    pub(super) emp2: String,
+    pub(super) other: String,
 }
 
 /// The design's live-test org: mgr (Manager) → lead (Manager) → emp1
 /// (sales Owner); emp2 (under mgr, hr Viewer); other (finance Owner, no
 /// manager). Employees: main (default), finance, sales, hr, faq (public).
-async fn fixture() -> Fixture {
+pub(super) async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
     seed_agent(home.path(), "main", "嘟嘟總機", "main", "");
     seed_agent(home.path(), "finance", "財務小幫手", "specialist", "");
@@ -117,7 +117,7 @@ async fn fixture() -> Fixture {
 
 /// What the WS handshake builds: claims only, no team (the live context
 /// replaces it per RPC).
-fn jwt_ctx(user_id: &str, role: UserRole) -> UserContext {
+pub(super) fn jwt_ctx(user_id: &str, role: UserRole) -> UserContext {
     UserContext {
         user_id: user_id.to_string(),
         email: format!("{user_id}@test.invalid"),
@@ -129,7 +129,7 @@ fn jwt_ctx(user_id: &str, role: UserRole) -> UserContext {
     }
 }
 
-fn ok_payload(frame: &WsFrame) -> Value {
+pub(super) fn ok_payload(frame: &WsFrame) -> Value {
     match frame {
         WsFrame::Response { ok: true, payload: Some(p), .. } => p.clone(),
         other => panic!("expected ok response, got {other:?}"),
