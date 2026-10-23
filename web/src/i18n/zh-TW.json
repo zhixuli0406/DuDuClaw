@@ -54,6 +54,8 @@
   "agentConnections.choice.user": "指定同事",
   "agentConnections.choice.mine": "用我的 Google",
   "agentConnections.primary": "設為主要負責人",
+  "agentConnections.primaryConfirmTitle": "變更主要負責人？",
+  "agentConnections.primaryConfirmMessage": "要將 {name} 設為主要負責人嗎？這會停止這位員工進行中的瀏覽器工作階段，並清除儲存的瀏覽器登入。下次使用瀏覽器時需要重新登入。",
   "agentConnections.personalConfirm": "我已確認誰能透過這位員工使用我的帳號；管理員、已綁定同事與允許通道會依上方規則存取。公開訪客一律不行。",
   "agentConnections.personalHint": "設定後仍需帳號本人到「我的連線」允許，管理員不能代為同意。",
   "agentConnections.requesterLabel": "誰能透過員工使用",

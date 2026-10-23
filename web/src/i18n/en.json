@@ -54,6 +54,8 @@
   "agentConnections.choice.user": "Choose colleague",
   "agentConnections.choice.mine": "Use my Google",
   "agentConnections.primary": "Set primary owner",
+  "agentConnections.primaryConfirmTitle": "Change primary owner?",
+  "agentConnections.primaryConfirmMessage": "Set {name} as primary owner? This stops the employee’s active browser sessions and clears saved browser sign-ins. The next browser session will need a new sign-in.",
   "agentConnections.personalConfirm": "I have checked who can use my account through this employee. The requester rules above apply to administrators, bound colleagues and allowed channels. Public visitors are always refused.",
   "agentConnections.personalHint": "The account holder must allow access in My connections. Administrators cannot consent for them.",
   "agentConnections.requesterLabel": "Who can request use",

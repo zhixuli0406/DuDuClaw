@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
 import { CheckCircle2, Loader2, Mail, XCircle } from 'lucide-react';
@@ -10,6 +10,7 @@ import {
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { toast } from '@/lib/toast';
+import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import {
   Badge,
   Button,
@@ -39,10 +40,41 @@ function choiceOf(v: AgentGoogleIdentity): Choice {
  * (公司共用帳號 / 代表某位同事（網域委派） / 不使用) and runs the connection
  * test, which proves the colleague's account works without sending anything.
  */
+type AuthSnapshot = ReturnType<typeof useAuthStore.getState>;
+
+function actorFingerprint(state: AuthSnapshot): string {
+  // No credentials: every available identity/status/binding field participates.
+  return JSON.stringify([state.user, state.bindings, state.isAuthenticated, state.initialized]);
+}
+
 export function AgentConnectionsTab({ agentId }: { agentId: string }) {
+  const actorScope = useAuthStore(actorFingerprint);
+  const actor = useAuthStore((state) => state.user);
+  const enterprise = useSystemStore((state) => state.status?.edition_profile !== 'personal');
+  const [actorEpoch, setActorEpoch] = useState(0);
+  useLayoutEffect(() => {
+    let previous = actorFingerprint(useAuthStore.getState());
+    return useAuthStore.subscribe((state) => {
+      const next = actorFingerprint(state);
+      if (next !== previous) {
+        previous = next;
+        // Preserve intermediate changes even when React batches A→B→A.
+        setActorEpoch((epoch) => epoch + 1);
+      }
+    });
+  }, []);
+  if (actor && actor.status !== 'active') return null;
+  return <AgentConnectionsScope
+    key={JSON.stringify([agentId, actorScope, actorEpoch, enterprise])}
+    agentId={agentId}
+    actorScope={actorScope}
+  />;
+}
+
+function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actorScope: string }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
-  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin' && s.user.status === 'active');
   const ownEmail = useAuthStore((s) => s.user?.email);
   const userId = useAuthStore((s) => s.user?.id);
   const isOwner = useAuthStore((s) => s.bindings.some(b=>b.agent_name===agentId&&b.access_level==='owner'));
@@ -60,16 +92,34 @@ export function AgentConnectionsTab({ agentId }: { agentId: string }) {
   const [anyoneConfirmed,setAnyoneConfirmed] = useState(false);
   const [busy, setBusy] = useState<'idle' | 'saving' | 'testing'>('idle');
   const [steps, setSteps] = useState<GoogleIdentityTestStep[] | null>(null);
+  const [primaryPending, setPrimaryPending] = useState<{
+    agentId: string; userId: string; name: string;
+  } | null>(null);
+
+  const live = useRef(true);
+  const loadEpoch = useRef(0);
+  useLayoutEffect(() => {
+    live.current = actorFingerprint(useAuthStore.getState()) === actorScope;
+    const unsubscribe = useAuthStore.subscribe((state) => {
+      if (actorFingerprint(state) !== actorScope) live.current = false;
+    });
+    return () => { live.current = false; unsubscribe(); };
+  }, [actorScope]);
+  const isCurrent = useCallback(() => live.current
+    && actorFingerprint(useAuthStore.getState()) === actorScope, [actorScope]);
 
   const load = useCallback(async () => {
+    if (!isCurrent()) return;
+    const request = ++loadEpoch.current;
     try {
       const v = await api.googleIdentity.get(agentId);
+      if (!isCurrent() || request !== loadEpoch.current) return;
       setView(v);
       setError(null);
     } catch (e) {
-      setError(e);
+      if (isCurrent() && request === loadEpoch.current) setError(e);
     }
-  }, [agentId]);
+  }, [agentId, isCurrent]);
 
   useEffect(() => {
     void load();
@@ -88,6 +138,7 @@ export function AgentConnectionsTab({ agentId }: { agentId: string }) {
   };
 
   const save = async () => {
+    if (!isCurrent()) return;
     const identity =
       choice === 'delegate' ? `delegate:${email.trim()}` : choice==='user' ? `user:${selectedUser}` : choice==='mine' ? `user:${userId}` : choice;
     const personal = ['owner','user','mine'].includes(choice);
@@ -103,26 +154,43 @@ export function AgentConnectionsTab({ agentId }: { agentId: string }) {
           ...(confirmed ? {confirm_shared_access:true} : {}),
         } : {}),
       });
+      if (!isCurrent()) return;
       setView(v);
       setEditing(false);
       setSteps(null);
       toast.success(t('agentConnections.saved'));
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      if (isCurrent()) toast.error(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy('idle');
+      if (isCurrent()) setBusy('idle');
     }
   };
 
   const runTest = async () => {
+    if (!isCurrent()) return;
     setBusy('testing');
     try {
       const r = await api.googleIdentity.test(agentId);
-      setSteps(r.steps);
+      if (isCurrent()) setSteps(r.steps);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      if (isCurrent()) toast.error(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy('idle');
+      if (isCurrent()) setBusy('idle');
+    }
+  };
+
+  const confirmPrimaryOwner = async () => {
+    if (!isCurrent() || !primaryPending || primaryPending.agentId !== agentId || !isAdmin || !enterprise || busy !== 'idle') return;
+    setBusy('saving');
+    try {
+      await api.personalGoogle.primaryOwner(primaryPending.agentId, primaryPending.userId);
+      if (!isCurrent()) return;
+      setPrimaryPending(null);
+      await load();
+    } catch (e) {
+      if (isCurrent()) toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (isCurrent()) setBusy('idle');
     }
   };
 
@@ -257,7 +325,17 @@ export function AgentConnectionsTab({ agentId }: { agentId: string }) {
             </div>
           </div>
         )}
-        {isAdmin&&enterprise&&view.owners&&view.owners.length>1&&<div className="space-y-2">{view.owners.map(person=><div key={person.user_id} className="flex items-center justify-between gap-3 text-sm"><span>{person.name} ({person.email})</span><Button variant="outline" disabled={person.is_primary||busy!=='idle'} onClick={()=>void (async()=>{setBusy('saving');try{await api.personalGoogle.primaryOwner(agentId,person.user_id);await load();}catch(e){toast.error(e instanceof Error?e.message:String(e));}finally{setBusy('idle');}})()}>{t('agentConnections.primary')}</Button></div>)}</div>}
+        {isAdmin&&enterprise&&view.owners&&view.owners.length>1&&<div className="space-y-2">{view.owners.map(person=><div key={person.user_id} className="flex items-center justify-between gap-3 text-sm"><span>{person.name} ({person.email})</span><Button variant="outline" disabled={person.is_primary||busy!=='idle'} onClick={() => setPrimaryPending({agentId, userId: person.user_id, name: person.name})}>{t('agentConnections.primary')}</Button></div>)}</div>}
+
+        <ConfirmDialog
+          open={primaryPending !== null && primaryPending.agentId === agentId && isAdmin && enterprise}
+          onClose={() => { if (busy === 'idle') setPrimaryPending(null); }}
+          onConfirm={() => void confirmPrimaryOwner()}
+          title={t('agentConnections.primaryConfirmTitle')}
+          message={t('agentConnections.primaryConfirmMessage', {name: primaryPending?.name ?? ''})}
+          confirmLabel={t('common.confirm')}
+          busy={busy !== 'idle'}
+        />
 
         {steps && (
           <ul className="space-y-1.5 text-sm" data-testid="agent-connections-steps">

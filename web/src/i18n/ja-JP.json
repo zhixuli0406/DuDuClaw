@@ -54,6 +54,8 @@
   "agentConnections.choice.user": "同僚を指定",
   "agentConnections.choice.mine": "自分の Google を使う",
   "agentConnections.primary": "主担当者に設定",
+  "agentConnections.primaryConfirmTitle": "主担当者を変更しますか？",
+  "agentConnections.primaryConfirmMessage": "{name} を主担当者に設定しますか？社員が実行中のブラウザーセッションを停止し、保存済みのブラウザーログインを消去します。次回はログインし直す必要があります。",
   "agentConnections.personalConfirm": "この社員を通じて誰が利用できるか確認しました。上記の依頼者ルールが管理者、紐付いた同僚、許可されたチャンネルに適用されます。公開の訪問者は拒否されます。",
   "agentConnections.personalHint": "設定後、本人が「自分の接続」で許可する必要があります。管理者は代理で同意できません。",
   "agentConnections.requesterLabel": "利用を依頼できる人",

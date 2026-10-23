@@ -6,8 +6,8 @@ use serde::Serialize;
 
 use crate::user_row::{bump_acl_generation, has_column, load_user};
 #[cfg(test)]
-use crate::{AccessLevel, UserRole};
-use crate::{User, UserDb, UserStatus};
+use crate::AccessLevel;
+use crate::{User, UserDb, UserRole, UserStatus};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     if !has_column(conn, "user_agent_bindings", "is_primary")? {
@@ -46,7 +46,62 @@ pub struct GoogleConsent {
     pub decided_at: String,
 }
 
+fn require_active_google_owner(conn: &Connection, agent: &str, user_id: &str) -> Result<(), String> {
+    let owner: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM user_agent_bindings b JOIN users u ON u.id = b.user_id
+         WHERE b.agent_name = ?1 AND b.user_id = ?2 AND b.access_level = 'owner' AND u.status = 'active')",
+        params![agent, user_id], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if owner { Ok(()) } else { Err("主要負責人必須是這位員工的有效擁有者。".into()) }
+}
+
+fn primary_owner_generation_key(agent: &str) -> String {
+    format!("google_primary_owner_generation:{agent}")
+}
+
+/// Read from the caller's existing snapshot, including a read-only connection.
+/// Legacy installations have no per-agent row and begin at zero. Corrupt
+/// values or SQL errors must never become a valid ownership version.
+pub fn read_primary_owner_generation(conn: &Connection, agent: &str) -> Result<u64, String> {
+    let value: Option<i64> = conn.query_row(
+        "SELECT value FROM auth_meta WHERE key = ?1",
+        [primary_owner_generation_key(agent)],
+        |row| row.get(0),
+    ).optional().map_err(|_| "目前無法確認主要負責人的狀態。".to_owned())?;
+    match value {
+        None => Ok(0),
+        Some(value) => u64::try_from(value)
+            .map_err(|_| "目前無法確認主要負責人的狀態。".to_owned()),
+    }
+}
+
+// Only the primary-owner write transaction calls this. A corrupt version or
+// exhausted counter aborts that transaction instead of wrapping or resetting.
+fn bump_primary_owner_generation(conn: &Connection, agent: &str) -> Result<(), String> {
+    let next = i64::try_from(read_primary_owner_generation(conn, agent)?)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or("目前無法更新主要負責人的狀態。")?;
+    conn.execute(
+        "INSERT INTO auth_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![primary_owner_generation_key(agent), next],
+    ).map_err(|_| "目前無法更新主要負責人的狀態。".to_owned())?;
+    Ok(())
+}
+
 impl UserDb {
+    /// Durable version of this agent's primary-owner writes. It is separate
+    /// from the global ACL cache generation and advances even for A→B→A.
+    pub fn google_primary_owner_generation(&self, agent: &str) -> Result<u64, String> {
+        read_primary_owner_generation(&self.conn(), agent)
+    }
+
+    /// Preflight before a browser ownership barrier. The setter still checks
+    /// the same rule again inside its write transaction.
+    pub fn validate_google_primary_owner_candidate(&self, agent: &str, user_id: &str) -> Result<(), String> {
+        require_active_google_owner(&self.conn(), agent, user_id)
+    }
     /// Owner selection is one database snapshot; no arbitrary first row.
     pub fn google_owner(&self, agent: &str) -> Result<User, OwnerError> {
         let mut conn = self.conn();
@@ -91,14 +146,18 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        let owner: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM user_agent_bindings b JOIN users u ON u.id = b.user_id
-             WHERE b.agent_name = ?1 AND b.user_id = ?2 AND b.access_level = 'owner' AND u.status = 'active')",
-            params![agent, user_id], |r| r.get(0)
-        ).map_err(|e| e.to_string())?;
-        if !owner {
-            return Err("主要負責人必須是這位員工的有效擁有者。".into());
-        }
+        // Browser cleanup may await process termination. Read the actor in
+        // this same write transaction so a revoked role/status/password gate
+        // cannot race the ownership mutation, including while SQLite waits.
+        load_user(&tx, actor)?
+            .filter(|user| {
+                user.role == UserRole::Admin
+                    && user.status == UserStatus::Active
+                    && !user.must_change_password
+            })
+            .ok_or("你的管理權限已變更，請重新登入後再試。")?;
+        require_active_google_owner(&tx, agent, user_id)?;
+        bump_primary_owner_generation(&tx, agent)?;
         tx.execute(
             "UPDATE user_agent_bindings SET is_primary = 0 WHERE agent_name = ?1",
             [agent],

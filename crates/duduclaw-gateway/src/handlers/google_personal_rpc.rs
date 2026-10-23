@@ -5,6 +5,13 @@ use super::*;
 use crate::google_personal::{self, access, flow, lifecycle, pending};
 use duduclaw_core::google_identity::{self as gi, Effective};
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static PRIMARY_OWNER_AFTER_BROWSER_RESET: (
+        Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>
+    );
+}
+
 impl MethodHandler {
     pub(crate) async fn handle_personal_google_rpc(
         &self,
@@ -109,11 +116,20 @@ impl MethodHandler {
                         .get("user_id")
                         .and_then(Value::as_str)
                         .ok_or("請指定主要負責人。")?;
+                    // Reject an invalid candidate without destroying a valid
+                    // login. Invalidate before EVERY write, including A→B→A;
+                    // the final owner fingerprint alone is insufficient.
+                    db.validate_google_primary_owner_candidate(agent, user)?;
+                    crate::computer_use_sessions::workspace_admin::admin_sessions(&self.home_dir)
+                        .forget_login(agent, "primary_owner_changed")
+                        .await
+                        .map_err(|_| "目前無法清除先前的瀏覽器登入狀態，這次變更未套用。".to_owned())?;
+                    #[cfg(test)]
+                    if let Ok((reached, release)) = PRIMARY_OWNER_AFTER_BROWSER_RESET.try_with(Clone::clone) {
+                        reached.notify_one();
+                        release.notified().await;
+                    }
                     db.set_google_primary_owner(agent, user, &ctx.user_id)?;
-                    // B2b-B9-OWNER-RESET: the integration must invalidate the
-                    // browser profile after EVERY successful primary change,
-                    // including A→B→A. Comparing final is_primary/bound_at is
-                    // insufficient. Root wires B9's reset hook at this boundary.
                     Ok(json!({"agent_id":agent,"user_id":user}))
                 }
                 _ => Err("找不到這項連線操作。".into()),
