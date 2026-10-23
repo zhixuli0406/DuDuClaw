@@ -34,6 +34,7 @@ pub const KIND_TODO_UPDATE: &str = "todo_update";
 /// One row per reply turn that thought: seconds and token count only
 /// (`思考 8 秒 · 1,240 token`). Thinking text is never stored.
 pub const KIND_THINKING: &str = "thinking";
+pub(crate) const KIND_COMPUTER_WATCH: &str = "computer_watch";
 
 /// Days of history kept (time-based retention).
 pub const RETENTION_DAYS: i64 = 7;
@@ -116,6 +117,39 @@ pub struct RunStepStore {
 }
 
 impl RunStepStore {
+    /// Host context only: preserve the complete bounded signature, without the
+    /// generic prose masking/truncation which would corrupt navigation context.
+    pub(crate) fn append_computer_watch(&self, home: &Path, agent: &str, run: &str, href: &str) -> Result<(), String> {
+        if run.len() != 32 || !run.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err("invalid host run".into());
+        }
+        let token = href.strip_prefix(&format!("/computer/{agent}?l=")).ok_or("invalid watch path")?;
+        let claims = crate::computer_watch_links::verify_at(home, token, chrono::Utc::now().timestamp())?;
+        if claims.agent_id != agent { return Err("invalid watch agent".into()); }
+        self.lock().execute(
+            "INSERT INTO run_steps(agent_id,session_key,ts,kind,label,payload_preview,seq) VALUES(?1,?2,?3,?4,?5,?6,0)",
+            params![agent,format!("computer-run:{run}"),chrono::Utc::now().to_rfc3339(),KIND_COMPUTER_WATCH,"已開啟瀏覽器",href],
+        ).map_err(|_| "watch event unavailable")?;
+        if (self.insert_count.fetch_add(1, Ordering::Relaxed) + 1) % PRUNE_EVERY_INSERTS == 0 {
+            let _ = self.prune(agent);
+        }
+        Ok(())
+    }
+
+    /// Join only the host run key that actually produced this numeric run row.
+    pub(crate) fn attach_computer_watches(&self, agent: &str, host_run: &str, run_id: i64) -> Result<(), String> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|_| "watch event unavailable")?;
+        let changed = tx.execute(
+            "UPDATE run_steps SET session_key=?1 WHERE agent_id=?2 AND session_key=?3 AND kind=?4
+             AND EXISTS(SELECT 1 FROM dispatch_runs WHERE id=?5 AND agent_id=?2)",
+            params![format!("dispatch:{run_id}"),agent,format!("computer-run:{host_run}"),KIND_COMPUTER_WATCH,run_id],
+        ).map_err(|_| "watch event unavailable")?;
+        tx.execute("UPDATE dispatch_runs SET step_count=step_count+?1 WHERE id=?2 AND agent_id=?3",
+            params![changed as i64,run_id,agent]).map_err(|_| "watch event unavailable")?;
+        tx.commit().map_err(|_| "watch event unavailable".into())
+    }
+
     /// Open (or create) `<home>/run_steps.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("run_steps.db");
@@ -657,6 +691,35 @@ pub(crate) fn mask_secretish(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_browser_step_preserves_signed_context_and_joins_only_its_run() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".keyfile"), [42;32]).unwrap();
+        duduclaw_core::platform::set_owner_only(&home.path().join(".keyfile")).unwrap();
+        let store = RunStepStore::open_in_memory().unwrap();
+        let agent = "a".repeat(64);
+        let host_run = "0123456789abcdef0123456789abcdef";
+        let token = crate::computer_watch_links::issue_at(home.path(), &agent,
+            "cu-0123456789abcdef0123456789abcdef",chrono::Utc::now().timestamp(),600).unwrap();
+        let href = format!("/computer/{agent}?l={token}");
+        store.append_computer_watch(home.path(), &agent, host_run, &href).unwrap();
+        let row = store.recent_for_session(&format!("computer-run:{host_run}"),10).unwrap().pop().unwrap();
+        assert_eq!(row.payload_preview,href);
+        assert!(store.append_computer_watch(home.path(),"bob",host_run,&href).is_err());
+        assert!(store.append_computer_watch(home.path(),&agent,"../forged",&href).is_err());
+        assert!(store.append_computer_watch(home.path(),&agent,host_run,"https://evil.example").is_err());
+        let id = store.record_dispatch_run(&agent,"dispatch","2026-10-24T00:00:00Z","2026-10-24T00:01:00Z",
+            "completed","","",&[]).unwrap();
+        store.attach_computer_watches("bob",host_run,id).unwrap();
+        assert!(store.recent_for_session(&format!("dispatch:{id}"),10).unwrap().is_empty());
+        store.attach_computer_watches(&agent,"different-run",id).unwrap();
+        assert!(store.recent_for_session(&format!("dispatch:{id}"),10).unwrap().is_empty());
+        store.attach_computer_watches(&agent,host_run,id).unwrap();
+        let rows = store.recent_for_session(&format!("dispatch:{id}"),10).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].payload_preview,href);
+    }
 
     /// 2026-08-14: a goal-loop dispatch prompt's marker is parsed into
     /// durable `task_id`/`round` columns at record time; non-goal runs stay

@@ -15,6 +15,7 @@ mod live_acl_tests;
 mod team_callable_rpc_tests;
 mod team_history_rpc_tests;
 mod computer_team_rpc_tests;
+mod computer_watch_link_tests;
 mod team_rpc_tests;
 mod data_file_guard_field_tests;
 mod evolution_v3_dashboard_tests;

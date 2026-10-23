@@ -230,6 +230,12 @@ async fn handle(
             _=>true,
         });
     let principal = request_principal(sessions.home(), &agent_id, &request);
+    let host_task = serde_json::from_slice::<Value>(&body).ok()
+        .and_then(|body| body.get("principal_context").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|reference| crate::on_behalf_of::context::host_task(sessions.home(), &agent_id, &reference));
+    let host_run = serde_json::from_slice::<Value>(&body).ok()
+        .and_then(|body| body.get("principal_context").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|reference| crate::on_behalf_of::context::host_run(sessions.home(), &agent_id, &reference));
     let op = async {
         match request {
             Request::Start { width, height, task, turn_id, workspace } if valid_turn_id(&turn_id) => {
@@ -268,8 +274,8 @@ async fn handle(
             _ => Err(super::not_found()),
         }
     };
-    let op = super::attended_call::request_scope(attendance,
-        crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op));
+    let op = crate::computer_watch_links::delivery::task_scope(host_task, host_run, super::attended_call::request_scope(attendance,
+        crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op)));
     let outcome: Result<Value, OpError> = match tokio::time::timeout(budget, op).await {
         Ok(outcome) => outcome,
         Err(_) => {

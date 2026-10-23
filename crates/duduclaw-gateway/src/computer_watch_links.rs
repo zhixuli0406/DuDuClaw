@@ -3,6 +3,8 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::path::Path;
 
+pub(crate) mod delivery;
+
 const MAX_AGE: u64 = 30 * 60;
 const MAX_TOKEN: usize = 1024;
 const UNAVAILABLE: &str = "watch link unavailable";
@@ -105,6 +107,47 @@ fn valid_session(value: &str) -> bool {
     value.strip_prefix("cu-").is_some_and(lower_hex_32)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoticeRoute {
+    WebChat,
+    TextOnly,
+    ExternalBase(String),
+}
+
+/// Delivery policy only. Its caller must separately prove a live attended
+/// runtime call and obtain the exact transport from the host turn registry.
+pub(crate) fn notice_route(
+    channel: &str,
+    mapped: bool,
+    dashboard_base: Option<&str>,
+) -> Option<NoticeRoute> {
+    if channel == "webchat" {
+        return mapped.then_some(NoticeRoute::WebChat);
+    }
+    if !matches!(channel, "telegram" | "line" | "discord" | "slack") {
+        return None;
+    }
+    let base = mapped.then_some(dashboard_base).flatten()
+        .and_then(|base| url::Url::parse(base).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty() && url.password().is_none()
+            && url.query().is_none() && url.fragment().is_none())
+        .filter(|url| match url.host() {
+            Some(url::Host::Ipv4(ip)) => !ip.is_loopback() && !ip.is_unspecified(),
+            Some(url::Host::Ipv6(ip)) => !ip.is_loopback() && !ip.is_unspecified()
+                && ip.to_ipv4().is_none_or(|v4| !v4.is_loopback() && !v4.is_unspecified()),
+            Some(url::Host::Domain(host)) => {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                host != "localhost" && !host.ends_with(".localhost")
+            }
+            None => false,
+        });
+    Some(match base {
+        Some(base) => NoticeRoute::ExternalBase(base.as_str().trim_end_matches('/').into()),
+        None => NoticeRoute::TextOnly,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +225,52 @@ mod tests {
             std::fs::read(home.path().join(".keyfile")).unwrap().len(),
             3
         );
+    }
+
+    #[test]
+    fn external_notice_never_contains_an_unusable_loopback_or_unsafe_base() {
+        for base in [
+            "http://localhost:18899",
+            "http://localhost.:18899",
+            "http://127.1:18899",
+            "http://[::1]:18899",
+            "http://[::ffff:127.0.0.1]:18899",
+            "http://[::ffff:7f00:1]:18899",
+            "http://[::ffff:0.0.0.0]:18899",
+            "http://[::ffff:0:0]:18899",
+            "http://0.0.0.0:18899",
+            "http://[::]:18899",
+            "file:///private/home",
+            "javascript:alert(1)",
+            "https://user:secret@dashboard.example",
+            "https://dashboard.example?token=secret",
+            "https://dashboard.example/#secret",
+        ] {
+            assert_eq!(
+                notice_route("telegram", true, Some(base)),
+                Some(NoticeRoute::TextOnly),
+                "{base}"
+            );
+        }
+        assert_eq!(notice_route("slack", true, None), Some(NoticeRoute::TextOnly));
+    }
+
+    #[test]
+    fn only_recognized_internal_conversations_receive_navigation_context() {
+        assert_eq!(notice_route("webchat", true, None), Some(NoticeRoute::WebChat));
+        for channel in ["telegram", "line", "discord", "slack"] {
+            assert_eq!(
+                notice_route(channel, true, Some("https://dashboard.example/app/")),
+                Some(NoticeRoute::ExternalBase("https://dashboard.example/app".into()))
+            );
+            assert_eq!(
+                notice_route(channel, false, Some("https://dashboard.example")),
+                Some(NoticeRoute::TextOnly)
+            );
+        }
+        for channel in ["odoolivechat", "widget", "public_trigger", "googlechat", "", "unknown"] {
+            assert_eq!(notice_route(channel, true, Some("https://dashboard.example")), None);
+        }
+        assert_eq!(notice_route("webchat", false, None), None);
     }
 }

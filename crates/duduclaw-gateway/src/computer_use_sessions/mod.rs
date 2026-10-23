@@ -1289,6 +1289,10 @@ impl ComputerUseSessions {
         info!(agent = %agent_id, session = %session_id, "computer-use tool session started");
         self.audit_line(agent_id, "session_start", details, None)
             .await;
+        crate::computer_watch_links::delivery::notify_started(
+            &self.home, agent_id, req.turn_id.as_deref(), &session_id,
+            body["seconds_left"].as_u64().unwrap_or(0),
+        ).await;
         Ok(body)
     }
 

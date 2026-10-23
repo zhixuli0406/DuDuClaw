@@ -1,4 +1,6 @@
 import { useState, type ReactNode } from 'react';
+import { Link } from 'react-router';
+import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
 import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
@@ -23,6 +25,7 @@ export function MessageBubble({
    *  message called another AI staff member by `@`. */
   label?: string;
 }) {
+  const intl = useIntl();
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
   const citations = !isUser && !isSystem ? message.citations : undefined;
@@ -67,6 +70,12 @@ export function MessageBubble({
           </div>
         )}
         {message.task && !isUser && <AssignedTaskCard task={message.task} />}
+        {message.computerWatch && !isUser && (
+          <Link to={message.computerWatch.href} target="_blank" rel="noreferrer"
+            className="mt-2 inline-flex rounded-md border border-surface-border px-3 py-2 text-sm font-medium text-primary hover:bg-secondary">
+            {intl.formatMessage({ id: 'computerSession.watch' })}
+          </Link>
+        )}
         {hasCitations && (
           <CitationSourceList
             citations={citations}

@@ -11,7 +11,7 @@ const root = realpathSync(process.argv[2]);
 assert(basename(root).startsWith('dudu-team-native-') && (statSync(root).mode & 0o777) === 0o700, 'pass the private fixture root');
 const home = join(root, 'data');
 const phase = process.argv[3];
-assert(['baseline', 'off', 'restore', 'sid-fence', 'finish', 'abort'].includes(phase), 'select an explicit fixture phase');
+assert(['baseline', 'watch-context', 'off', 'restore', 'sid-fence', 'finish', 'abort'].includes(phase), 'select an explicit fixture phase');
 const ready = JSON.parse(readFileSync(join(home, 'team-ui-ready.json'), 'utf8'));
 assert(ready.status === 'READY' && Number.isInteger(ready.port) && ready.port > 0 && ready.port < 65536);
 const base = `http://127.0.0.1:${ready.port}`;
@@ -78,7 +78,7 @@ let failure;
 try {
   if (phase === 'abort') save('team-ui-finish.json', { status: 'FAIL', reason: 'explicit fixture abort' });
   else if (phase === 'finish') {
-    for (const prior of ['baseline', 'off', 'restore', 'sid-fence']) check(JSON.parse(readFileSync(join(home, `api-${prior}.json`), 'utf8')).status === 'PASS', `${prior} evidence present`);
+    for (const prior of ['baseline', 'watch-context', 'off', 'restore', 'sid-fence']) check(JSON.parse(readFileSync(join(home, `api-${prior}.json`), 'utf8')).status === 'PASS', `${prior} evidence present`);
     const ui = JSON.parse(readFileSync(join(home, 'team-ui-review.json'), 'utf8'));
     check(ui.status === 'PASS' && ui.revocation_cleared === true, 'actual dashboard review recorded');
     save('team-ui-finish.json', { status: 'PASS', cases, ui, boundary: 'controlled synthetic gateway/container/UI; no channel/model/provider or physical owner acceptance' });
@@ -97,15 +97,26 @@ try {
         check(!(await manager(method, { agent_id: 'alice', name: 'alice', confirm: true })).ok, `${method} denied for team-only viewer`);
       }
       check(!(await manager('computer_sessions.snapshot', { agent_id: 'alice', session_id: 'cu-expired' })).ok, 'snapshot cannot silently switch session');
+    } else if (phase === 'watch-context') {
+      const opened = await manager('computer_sessions.open_link', { token: ready.watch_token });
+      check(opened.ok && opened.payload.agent_id === 'alice' && opened.payload.session_id === ready.session_id, 'valid context opens only the signed live session');
+      check(Object.keys(opened.payload).sort().join(',') === 'agent_id,expires_at,ok,session_id', 'open returns closed navigation fields without credentials or page content');
+      const peer = await connect(ready.peer_email);
+      check(!(await peer('computer_sessions.open_link', { token: ready.watch_token })).ok, 'signed link never grants an unbound peer access');
+      for (const [name, token] of [['expired', ready.expired_token], ['other session', ready.other_session_token], ['tampered', `${ready.watch_token}A`]]) {
+        check(!(await admin('computer_sessions.open_link', { token })).ok, `${name} context refused even for Admin`);
+      }
     } else if (phase === 'off') {
       check((await admin('users.org_settings.update', { manager_team_history: false })).ok, 'shared setting disabled');
       check(!(await manager('computer_sessions.status', { agent_id: 'alice' })).ok, 'same socket loses team status');
       check(!(await manager('computer_sessions.snapshot', { agent_id: 'alice', session_id: ready.session_id })).ok, 'cached image refused after shared setting disabled');
+      check(!(await manager('computer_sessions.open_link', { token: ready.watch_token })).ok, 'navigation context refused after shared setting disabled');
     } else if (phase === 'restore') {
       check((await admin('users.org_settings.update', { manager_team_history: true })).ok, 'shared setting restored');
       const status = await manager('computer_sessions.status', { agent_id: 'alice' });
       check(status.ok && !status.payload.active, 'reactivation does not reveal the older session');
       check(!(await manager('computer_sessions.snapshot', { agent_id: 'alice', session_id: ready.session_id })).ok, 'old-window screenshot remains hidden');
+      check(!(await manager('computer_sessions.open_link', { token: ready.watch_token })).ok, 'old-window navigation context remains hidden');
     } else {
       check((await admin('computer_sessions.stop', { agent_id: 'alice', session_id: ready.session_id })).ok, 'original fixture session stopped');
       const replacement = await startReplacement();
@@ -116,6 +127,7 @@ try {
       check(!stale.ok, 'team confirmation remains fenced after direct access is granted');
       const current = await promoted('computer_sessions.status', { agent_id: 'alice' });
       check(current.ok && current.payload.active && current.payload.session_id === replacement, 'replacement is still running after stale confirmation');
+      check(!(await promoted('computer_sessions.open_link', { token: ready.watch_token })).ok, 'old navigation context cannot select a replacement after direct access is granted');
       check((await promoted('computer_sessions.stop', { agent_id: 'alice', session_id: replacement })).ok, 'current explicit confirmation can stop its own target');
     }
   }

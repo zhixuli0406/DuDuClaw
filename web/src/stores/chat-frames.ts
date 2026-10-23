@@ -4,6 +4,17 @@
  * Split out of `chat-store.ts`, which re-exports everything here.
  */
 import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
+import { browserWatchReturn } from '@/lib/browser-watch-return';
+
+export interface ComputerWatchRef { readonly agentId: string; readonly href: string }
+export function parseComputerWatch(raw: unknown): ComputerWatchRef | undefined {
+  if (!raw || typeof raw !== 'object') return;
+  const { agent_id: agentId, href } = raw as Record<string, unknown>;
+  if (typeof agentId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(agentId)) return;
+  const safe = browserWatchReturn(href);
+  if (!safe || !safe.startsWith(`/computer/${agentId}?l=`)) return;
+  return { agentId, href: safe };
+}
 
 /**
  * Decide whether a reply frame belongs to the conversation currently open, so a
@@ -27,6 +38,7 @@ export const IN_TURN_FRAME_TYPES: ReadonlySet<string> = new Set([
   'step',
   'progress',
   'thinking',
+  'computer_watch',
 ]);
 
 /** Frame types tagged with the conversation nonce (`conv`) and dropped by the

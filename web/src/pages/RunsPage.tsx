@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { Link } from 'react-router';
 import {
   ArrowLeft,
   CheckCircle2,
@@ -436,7 +437,11 @@ export function RunsPage() {
               </p>
             )}
             {cards.map((c, i) =>
-              c.type === 'step' ? (
+              c.type === 'computer_watch' ? (
+                <Link key={i} to={c.watch.href} className="inline-flex rounded-md border border-surface-border px-3 py-2 text-sm text-primary">
+                  {intl.formatMessage({ id: 'computerSession.watch' })}
+                </Link>
+              ) : c.type === 'step' ? (
                 // CLI-native tool step (run_steps.db) — no ok/fail icon: the step
                 // store persists starts only, an outcome must never be invented.
                 <ToolStep key={i} tool={c.tool} preview={c.preview} ts={c.ts} />

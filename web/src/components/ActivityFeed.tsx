@@ -36,6 +36,7 @@ const FALLBACK_CONFIG: TypeConfig = {
 };
 
 const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
+  'computer_session.started': { icon: Eye, color: 'text-brand', bgColor: 'bg-brand/10' },
   task_created: {
     icon: Plus,
     color: 'text-blue-500',
@@ -125,6 +126,7 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
  */
 type Tier = 1 | 2 | 3;
 const TIER: Record<ActivityType, Tier> = {
+  'computer_session.started': 2,
   task_created: 1,
   agent_created: 1,
   task_completed: 1,

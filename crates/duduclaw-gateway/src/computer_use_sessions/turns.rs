@@ -66,6 +66,7 @@ pub fn valid_turn_id(turn_id: &str) -> bool {
 pub struct TurnGuard {
     key: Key,
     id: u64,
+    _watch_socket: Option<crate::computer_watch_links::delivery::SocketGuard>,
 }
 
 impl Drop for TurnGuard {
@@ -113,7 +114,9 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
                 .flatten(),
             super::attended::capture(agent_id, turn_id),
         ));
-    Some(TurnGuard { key, id })
+    Some(TurnGuard { key, id,
+        _watch_socket: crate::computer_watch_links::delivery::register_socket(agent_id, turn_id),
+    })
 }
 
 /// The reply channel of `agent_id`'s live turn `turn_id` (the newest

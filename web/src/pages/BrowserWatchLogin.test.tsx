@@ -29,7 +29,7 @@ function page(entry: string | { pathname: string; state: unknown }) {
 async function passwordLogin() {
   await userEvent.type(await screen.findByLabelText('Email', { exact: true }), 'fixture@example.invalid');
   await userEvent.type(screen.getByLabelText('Password', { exact: true }), 'fixture-password');
-  await userEvent.click(screen.getByRole('button', { name: 'Sign In', exact: true }));
+  await userEvent.click(screen.getByRole('button', { name: /^Sign In$/ }));
 }
 beforeEach(() => {
   useAuthStore.setState({

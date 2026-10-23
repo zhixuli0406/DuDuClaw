@@ -16,7 +16,7 @@ import {
   type TurnThinking,
 } from './chat-thinking';
 
-import { IN_TURN_FRAME_TYPES, parseChatArtifact, shouldRenderFrame } from './chat-frames';
+import { IN_TURN_FRAME_TYPES, parseChatArtifact, parseComputerWatch, shouldRenderFrame, type ComputerWatchRef } from './chat-frames';
 
 export * from './chat-thinking';
 export * from './chat-frames';
@@ -61,6 +61,7 @@ export interface ChatMessage {
   readonly agentName?: string;
   /** A task this reply created (`/交辦`, from `assistant_done.task`). */
   readonly task?: AssignedTaskRef;
+  readonly computerWatch?: ComputerWatchRef;
   /** The turn's thinking (wall time, tokens, masked blocks) — in memory only,
    *  never part of the stored history. */
   readonly thinking?: TurnThinking;
@@ -607,6 +608,23 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 },
               ],
             }));
+            break;
+          }
+
+          case 'computer_watch': {
+            const computerWatch = parseComputerWatch(data);
+            if (!computerWatch || !get().isStreaming || data.conv !== get().convId) break;
+            set((state) => {
+              const messages = [...state.messages];
+              const last = messages[messages.length - 1];
+              if (last?.role === 'assistant') {
+                messages[messages.length - 1] = { ...last, computerWatch };
+              } else {
+                messages.push({ id: nextId(), role: 'assistant', content: '',
+                  timestamp: Date.now(), computerWatch });
+              }
+              return { messages };
+            });
             break;
           }
 

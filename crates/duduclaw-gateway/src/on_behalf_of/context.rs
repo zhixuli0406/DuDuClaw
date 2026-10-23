@@ -16,6 +16,8 @@ struct Entry {
     principal: Option<String>,
     created: Instant,
     attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
+    task: Option<String>,
+    run: Option<String>,
 }
 fn entries() -> &'static Mutex<HashMap<String, Entry>> {
     static ENTRIES: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
@@ -79,6 +81,9 @@ fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option
             principal,
             created: now,
             attendance: crate::computer_use_sessions::attended_call::capture(agent),
+            task: crate::runtime::round_task_env().map(|(_, task)| task),
+            run: crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten()
+                .map(|(_, run)| run),
         },
     );
     Some(ContextGuard(reference))
@@ -91,6 +96,17 @@ pub(crate) fn attended_call(home: &Path, agent: &str, reference: &str)
     lookup(home,agent,reference)?;
     entries().lock().unwrap_or_else(|p| p.into_inner()).get(reference)?
         .attendance.clone().filter(|call| call.valid_for(agent))
+}
+
+/// The task comes only from the gateway round scope at runtime registration.
+/// A model's start `task` label and process environment cannot supply it.
+pub(crate) fn host_task(home: &Path, agent: &str, reference: &str) -> Option<String> {
+    lookup(home, agent, reference)?;
+    entries().lock().unwrap_or_else(|p| p.into_inner()).get(reference)?.task.clone()
+}
+pub(crate) fn host_run(home: &Path, agent: &str, reference: &str) -> Option<String> {
+    lookup(home, agent, reference)?;
+    entries().lock().unwrap_or_else(|p| p.into_inner()).get(reference)?.run.clone()
 }
 
 /// `Some(None)` is a verified background context; `None` means unproven.
@@ -147,6 +163,27 @@ pub(crate) fn inject(cmd: &mut tokio::process::Command, guard: Option<&ContextGu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn browser_background_linkage_comes_only_from_the_registered_host_scope() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let guard = register(home.path(), "alice").unwrap();
+        assert!(host_task(home.path(), "alice", guard.reference()).is_none());
+        assert!(host_run(home.path(), "alice", guard.reference()).is_none());
+        let attr = crate::runtime::GoalRoundAttribution { episode_id:"verified-task".into(), round:Some(2) };
+        let run = "0123456789abcdef0123456789abcdef";
+        let guard = crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attr,
+            crate::memory_provenance::DISPATCH_RUN.scope(Some(("dispatch:alice".into(),run.into())),
+                async { register(home.path(), "alice").unwrap() })).await;
+        let reference = guard.reference().to_owned();
+        assert_eq!(host_task(home.path(), "alice", &reference).as_deref(),Some("verified-task"));
+        assert_eq!(host_run(home.path(), "alice", &reference).as_deref(),Some(run));
+        assert!(host_task(other.path(), "alice", &reference).is_none());
+        assert!(host_run(home.path(), "bob", &reference).is_none());
+        drop(guard);
+        assert!(host_task(home.path(), "alice", &reference).is_none());
+        assert!(host_run(home.path(), "alice", &reference).is_none());
+    }
     #[tokio::test]
     async fn host_context_is_bound_to_home_agent_and_lifetime_including_none() {
         let home = tempfile::tempdir().unwrap();

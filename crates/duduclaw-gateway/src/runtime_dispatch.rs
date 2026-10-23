@@ -153,6 +153,7 @@ async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse,
     let _knowledge_turn = (!req.agent_id.is_empty())
         .then(|| crate::knowledge::turn_requesters::register_current_turn(req.agent_id))
         .flatten();
+    let _computer_turn = crate::computer_use_sessions::turns::register_current_turn(req.agent_id);
     // Reuse caller-provided settings when present (RFC-25 L7 followup — avoids a
     // second agent.toml read on paths that already parsed it to decide routing);
     // otherwise read once here.
