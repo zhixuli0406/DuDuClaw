@@ -214,7 +214,8 @@ async fn computer_team_native_dashboard_fixture() {
         let first = super::super::attended::verified_webchat_message(
             conversation,
             Some(&report),
-            duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(conversation.into()), async {
+            duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(conversation.into()),
+                duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some(turn.clone()), async {
                 if !super::super::attended::bind_final_route(
                     conversation,
                     conversation,
@@ -225,17 +226,21 @@ async fn computer_team_native_dashboard_fixture() {
                 }
                 let _live = super::super::turns::register("alice", &turn, conversation)
                     .ok_or("fixture attended registration failed")?;
-                sessions
-                    .start(
+                let runtime = crate::on_behalf_of::context::register(&home, "alice")
+                    .ok_or("fixture runtime registration failed")?;
+                let caller = crate::on_behalf_of::context::attended_call(&home, "alice", runtime.reference())
+                    .ok_or("fixture attended caller proof missing")?;
+                super::super::attended_call::request_scope(Some(caller),
+                    sessions.start(
                         "alice",
                         StartRequest {
                             turn_id: Some(turn.clone()),
                             ..Default::default()
                         },
-                    )
+                    ))
                     .await
                     .map_err(|e| format!("{e:?}"))
-            }),
+            })),
         )
         .await?;
         let ids = owned(&home).await?;

@@ -304,7 +304,13 @@ async fn post(home: &Path, agent_id: &str, body: &Value, timeout: Duration) -> R
         .timeout(timeout)
         .build()
         .map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
-    let bytes = serde_json::to_vec(body).map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
+    let mut body=body.clone();
+    // Host-issued per-runtime reference is part of the signed body. Never
+    // accept this field from model arguments or infer it from a turn id.
+    if let Ok(reference)=std::env::var("DUDUCLAW_PRINCIPAL_CONTEXT") {
+        body["principal_context"]=json!(reference);
+    }
+    let bytes = serde_json::to_vec(&body).map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
