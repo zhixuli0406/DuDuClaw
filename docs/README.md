@@ -78,6 +78,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/66-thinking-in-messaging-apps.md](features/66-thinking-in-messaging-apps.md) | Thinking display in messaging apps — timer and masked summary per platform, who sees what; [繁體中文](features/zh-TW/66-thinking-in-messaging-apps.md) / [日本語](features/ja-JP/66-thinking-in-messaging-apps.md) |
 | [features/67-assigning-tasks.md](features/67-assigning-tasks.md) | Assigning tasks from a chat — `/交辦 @employee task` (`/assign`, `／交辦`) creates a goal task with `on_behalf_of`, who may assign to whom, the one-message wait after `/交辦 @name`, `/交辦 狀態`, progress back to the chat, "Assigned by me" on the Goals page, scheduled and recurring assignments (`|| 時間:每週一 9:00`, `/交辦 排程`, re-checked at every run), audit events; [繁體中文](features/zh-TW/67-assigning-tasks.md) / [日本語](features/ja-JP/67-assigning-tasks.md) |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
+| [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — unreleased Enterprise backend API, live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

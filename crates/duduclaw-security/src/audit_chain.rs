@@ -184,6 +184,34 @@ pub fn append_chained_line(
     }
 }
 
+/// A fail-closed writer for access-control audit events. The sidecar lock
+/// serializes Windows writers; on Unix the data-file flock also serializes
+/// with the existing best-effort writer. Neither lock failure is ignored.
+/// Sync the appended event before its caller can release protected content.
+pub fn append_chained_line_strict(
+    path: &Path,
+    record: serde_json::Map<String, serde_json::Value>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    duduclaw_core::with_file_lock(path, || {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        #[cfg(unix)]
+        duduclaw_core::platform::flock_exclusive(&file)?;
+        chain_and_write(path, &file, record)?;
+        file.sync_all()?;
+        // File fsync alone does not persist a newly created directory
+        // entry. Do this on every append to avoid an exists/create race.
+        #[cfg(unix)]
+        {
+            let parent=path.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or_else(||Path::new("."));
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })
+}
+
 /// The critical section: read the current tail hash, chain the record to it,
 /// append. Must run under the writer lock taken by [`append_chained_line`].
 fn chain_and_write(

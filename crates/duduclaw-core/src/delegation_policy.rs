@@ -481,6 +481,10 @@ pub enum DenyReason {
     /// The `reports_to` chain exceeded [`MAX_ANCESTOR_HOPS`] (or loops), so
     /// ancestry could not be established.
     ChainTooDeep,
+    /// The employee tree allowed it, but the person the work is for
+    /// (`on_behalf_of`, `[delegation] human_principal = "enforce"`) may not
+    /// hand work to the target, or could not be resolved.
+    HumanPrincipalNotPermitted,
 }
 
 impl DenyReason {
@@ -493,6 +497,7 @@ impl DenyReason {
             DenyReason::DifferentDepartment => "different_department",
             DenyReason::MissingDepartment => "missing_department",
             DenyReason::ChainTooDeep => "chain_too_deep",
+            DenyReason::HumanPrincipalNotPermitted => "human_principal_not_permitted",
         }
     }
 }
@@ -524,6 +529,12 @@ impl DelegationDenied {
         let s = short_id(&self.sender);
         let t = short_id(&self.target);
         match self.reason {
+            DenyReason::HumanPrincipalNotPermitted => format!(
+                "委派遭拒:發出這個指令的人沒有權限把工作交給「{t}」(「{s}」本身可以委派,\
+                 但 [delegation] human_principal = \"enforce\" 也要求真人有權限)。\
+                 可行處理:① 請管理員在 dashboard 把「{t}」綁定給這個人(交辦需要操作權限);\
+                 ② 改由有權限的人直接交辦;③ 需要時把 human_principal 改回 \"record\"。"
+            ),
             DenyReason::SelfDelegation => format!(
                 "委派遭拒:「{s}」不可委派給自己。自我委派會形成回音迴圈,三種委派政策皆禁止。"
             ),

@@ -99,6 +99,17 @@ pub struct TeamGrant {
     pub depth: u8,
 }
 
+/// One active report with a direct Operator/Owner binding on an employee.
+/// Kept separate from `TeamGrant`: oversight needs every qualifying person,
+/// and must not mistake a derived Operator grant for a direct Owner binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverseenReport {
+    pub user_id: String,
+    pub display_name: String,
+    pub depth: u8,
+    pub level: AccessLevel,
+}
+
 /// Where a caller's access to one agent comes from. `Default` and `Public`
 /// are routing-level sources (the conversation's default employee and
 /// `[channels] public_trigger`); [`EffectiveAccess::level`] never returns
@@ -253,6 +264,47 @@ fn grant_rank(g: &TeamGrant) -> (std::cmp::Reverse<u8>, u8, String) {
     (std::cmp::Reverse(g.level.level()), g.depth, g.via_user.clone())
 }
 
+/// Active reports who hold a direct Operator or Owner binding on `agent`.
+/// This is a bounded database query, not an authorization decision: callers
+/// must first verify the viewer's live status, role, edition and settings.
+/// A corrupt binding grants no visibility; a database read failure is an error.
+pub fn overseen_reports_on(
+    conn: &Connection,
+    manager_id: &str,
+    agent: &str,
+) -> Result<Vec<OverseenReport>, String> {
+    let sql = format!(
+        "{TEAM_CTE}
+         SELECT t.id, u.display_name, MIN(t.depth), b.access_level
+           FROM team t JOIN users u ON u.id = t.id
+           JOIN user_agent_bindings b ON b.user_id = t.id
+          WHERE u.status = 'active' AND b.agent_name = ?3
+          GROUP BY t.id, u.display_name, b.access_level
+          ORDER BY MIN(t.depth), t.id"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("oversight query error: {e}"))?;
+    let rows = stmt.query_map(rusqlite::params![manager_id, MAX_ORG_DEPTH, agent], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, u8>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    }).map_err(|e| format!("oversight query error: {e}"))?;
+    let mut reports = Vec::new();
+    for row in rows {
+        let (user_id, display_name, depth, raw_level) =
+            row.map_err(|e| format!("oversight row error: {e}"))?;
+        let Ok(level) = raw_level.parse::<AccessLevel>() else {
+            continue;
+        };
+        if level.at_least(AccessLevel::Operator) {
+            reports.push(OverseenReport { user_id, display_name, depth, level });
+        }
+    }
+    Ok(reports)
+}
+
 fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeMap<String, AccessLevel>, String> {
     let mut stmt = conn
         .prepare("SELECT agent_name, access_level FROM user_agent_bindings WHERE user_id = ?1")
@@ -303,6 +355,11 @@ fn load_access(conn: &mut Connection, user_id: &str) -> Result<Option<(User, Eff
 }
 
 impl UserDb {
+    /// All qualifying people for a manager's read-only oversight of `agent`.
+    pub fn overseen_reports(&self, manager_id: &str, agent: &str) -> Result<Vec<OverseenReport>, String> {
+        overseen_reports_on(&self.conn(), manager_id, agent)
+    }
+
     /// Current ACL generation (bumped by every authorization-relevant write).
     pub fn acl_generation(&self) -> Result<u64, String> {
         let conn = self.conn();

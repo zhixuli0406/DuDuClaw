@@ -143,6 +143,8 @@ impl ApprovalStore {
             ("binding_json", "binding_json TEXT"),
             ("answer_json", "answer_json TEXT"),
             ("invalidated_reason", "invalidated_reason TEXT"),
+            // The person the raising run works for (`on_behalf_of`).
+            ("on_behalf_of", "on_behalf_of TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -171,8 +173,8 @@ impl ApprovalStore {
                 (id, agent_id, action_kind, summary, payload, status,
                  created_at, decided_at, decided_by, ttl_seconds,
                  notify_channel, notify_chat_id, reminded_at, simulation, request_kind, binding_json, answer_json,
-                invalidated_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18){}",
+                invalidated_reason, on_behalf_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19){}",
             if if_absent { " ON CONFLICT(id) DO NOTHING" } else { "" }
         );
         conn.execute(
@@ -196,6 +198,7 @@ impl ApprovalStore {
                 rec.binding.as_ref().map(|v| serde_json::to_string(v).unwrap()),
                 rec.answer.as_ref().map(Value::to_string),
                 rec.invalidated_reason,
+                rec.on_behalf_of,
             ],
         )
         .map(|n| n == 1)
@@ -241,7 +244,7 @@ impl ApprovalStore {
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
                     notify_channel, notify_chat_id, reminded_at, simulation,
-                    request_kind, binding_json, answer_json, invalidated_reason
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -282,7 +285,7 @@ impl ApprovalStore {
                 "SELECT id, agent_id, action_kind, summary, payload, status,
                         created_at, decided_at, decided_by, ttl_seconds,
                         notify_channel, notify_chat_id, reminded_at, simulation,
-                        request_kind, binding_json, answer_json, invalidated_reason
+                        request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
                  FROM approvals WHERE action_kind = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| format!("prepare list_by_kind: {e}"))?;
@@ -325,7 +328,7 @@ impl ApprovalStore {
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
                                 notify_channel, notify_chat_id, reminded_at, simulation,
-                                request_kind, binding_json, answer_json, invalidated_reason
+                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
                          FROM approvals
                          WHERE status = 'pending' AND agent_id = ?1
                          ORDER BY created_at ASC",
@@ -344,7 +347,7 @@ impl ApprovalStore {
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
                                 notify_channel, notify_chat_id, reminded_at, simulation,
-                                request_kind, binding_json, answer_json, invalidated_reason
+                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
                          FROM approvals
                          WHERE status = 'pending'
                          ORDER BY created_at ASC",
@@ -404,6 +407,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
             .get::<_, Option<String>>(16)?
             .and_then(|s| serde_json::from_str(&s).ok()),
         invalidated_reason: row.get(17)?,
+        on_behalf_of: row.get(18)?,
     })
 }
 

@@ -150,6 +150,8 @@ pub fn turn_source_env_pairs() -> Vec<(String, String)> {
             ));
         }
     }
+    // The person the turn or run is for (`crate::on_behalf_of`).
+    out.extend(crate::on_behalf_of::env_pairs());
     out
 }
 

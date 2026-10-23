@@ -1986,6 +1986,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "unicode-normalization",
+ "unicode-segmentation",
  "url",
  "uuid",
  "zbus",

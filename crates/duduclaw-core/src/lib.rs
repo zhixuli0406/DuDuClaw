@@ -12,6 +12,7 @@ pub mod autostart;
 pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod gateway_instance;
+pub mod human_principal;
 pub mod config;
 pub mod container_engine;
 pub mod cron_tz;
@@ -90,6 +91,10 @@ pub use delegation_policy::{
     DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
     MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, RESERVED_QUEUE_SENDERS,
     STANDALONE_CLIENT_PREFIX, SYSTEM_SENDERS,
+};
+pub use human_principal::{
+    host_principal, host_principal_checked, human_right_for_path, HumanPrincipal,
+    HumanPrincipalMode, HumanRight, PrincipalRejection, ENV_ON_BEHALF_OF,
 };
 pub use department::{
     department_of_page, department_page_visible, is_valid_department,
