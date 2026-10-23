@@ -687,10 +687,12 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
     drop(reg);
 
     // Session info
-    let session_info = match ctx
-        .session_manager
-        .get_or_create(session_id, agent_id)
-        .await
+    let session_info = match crate::session_origin::ensure_turn_session(
+        &ctx.session_manager,
+        session_id,
+        agent_id,
+    )
+    .await
     {
         Ok(session) => format!(
             "Session: #{}\nTokens: {}\nLast active: {}",
