@@ -78,6 +78,58 @@ chat_assign_max_open = 30     # unfinished tasks assigned from chats, 0..1000
 
 A missing or out-of-range value uses the default.
 
+## Scheduling an assignment
+
+Work can be handed over for later or on a repeat. Nothing is created when you set it up; at each due time the gateway creates the task (or goal) on your behalf, exactly as if you had assigned it then.
+
+**From a chat**, add a `時間:` or `排程:` segment (also `schedule:`, `at:`, `when:`):
+
+| You send | Schedule |
+|---|---|
+| `/交辦 @業務專員 寫週報 \|\| 時間:每週一 9:00` | every Monday 09:00 |
+| `… \|\| 排程:平日 早上9點` | Monday to Friday 09:00 |
+| `… \|\| 排程:每週一、三、五 下午2點半` | Mon, Wed, Fri 14:30 |
+| `… \|\| 排程:每天 18:00` / `daily 18:00` | every day |
+| `… \|\| 排程:每小時` / `hourly` | every hour on the hour |
+| `… \|\| 時間:明天 15:00` / `10/25 14:00` / `2026-10-25 14:00` / `tomorrow 15:00` | once |
+| `… \|\| 排程:cron 0 9 * * 1` | a cron expression (Admins only) |
+
+A repeat without a time means 09:00, and a date without a year that has already passed this year means next year. Chat times are read in the gateway host's time zone; the confirmation shows what was understood and the next run. The other `||` segments (criteria, `時限:`, `想一想`) apply to every run.
+
+- `/交辦 排程` (`/assign schedules`) lists your schedules with their number, employee, timing and state.
+- `/交辦 排程 暫停 <number>`, `恢復 <number>`, `刪除 <number>` (`pause`, `resume`, `remove`) control one of yours. The number is the 8-character `#…` from the list.
+
+**In the dashboard**, the assign panel has **When**: now (the default), once at a date and time, every day, weekdays, weekly on chosen days, every hour, or (Admins) a custom cron expression. Times are read in your browser's time zone. **Goals → Assigned by me** shows a **Scheduled** section with the next and last run and **Pause / Resume / Remove**; an Admin can switch it to everyone's schedules. Over RPC, `tasks.goal_create` and `tasks.create` accept `schedule` (`{kind:"once", at}`, `{kind:"daily"|"weekdays", time}`, `{kind:"weekly", days:[1..7], time}`, `{kind:"hourly", minute}`, `{kind:"cron", expr}`, or a phrase such as `"每週一 9:00"`) and `schedule_timezone` (IANA); `assign_schedules.list` (`scope: "mine" | "all"`), `.pause`, `.resume` and `.remove` (`id`) manage them.
+
+**Your right is checked again at every run.** Creating a schedule needs the same right as assigning now. Before each run the gateway re-reads your account: if it was suspended or offboarded, the binding was removed, or the report you reached the employee through moved out of your team (or an Admin who set a cron schedule or a risk boundary is no longer Admin), the run is skipped, the schedule is paused with the reason, and you get a message on your linked channels. An employee that is disabled or deleted pauses the schedule the same way. Resume re-checks the creator's right (an Admin resuming someone else's schedule does not lend it their own rights). Only the creator and Admins can see or control a schedule; other people's numbers read as not found.
+
+Each run records `on_behalf_of = user:<you>`, `created_via` (`dashboard` or the chat channel) and, for chat schedules, the conversation, so progress goes back there. Goals have `created_by = goal:schedule`; board tasks keep your account id in `created_by`.
+
+Lists show at most 200 entries, with active/paused schedules first and recently completed history after them, so history cannot hide ongoing schedules' controls.
+
+Limits:
+
+- At most 20 active or paused schedules per person.
+- Without Admin rights a schedule may run at most once an hour; Admins at most every 5 minutes.
+- Raising the minimum interval also applies to existing schedules on their next run or resume. A restricted schedule pauses; create a new schedule with a longer interval.
+- A pause or removal committed before the run's task is stored prevents that task. Stop an already stored task separately on its task page.
+- If the previous run of the same schedule is still unfinished, that slot is skipped (`previous_open`), so runs never pile up.
+- A run missed by more than 24 hours (the gateway was down) is skipped, not replayed; a shorter outage runs the missed slot once.
+- A one-time schedule must be at least a minute ahead and within a year.
+- Scheduled runs do not count toward the chat caps above; they appear under **Assigned by me** and in `/交辦 狀態` like any other task you assigned.
+
+```toml
+[goal_defaults]
+assign_schedule_max_active = 20            # per person, 0..200
+assign_schedule_min_interval_minutes = 60  # non-Admins; can only be raised (60..10080)
+```
+
+An existing unreadable or malformed configuration, or a wrongly typed scheduling limit, never falls back to looser defaults: create and resume are refused, and due schedules wait for the settings to be repaired. Listing, pausing and removing remain available; the dashboard asks for an administrator's attention.
+
+Schedules are evaluated on the cron scheduler's 30-second tick, only in the gateway that holds the data directory's lock. Each slot's task id is derived from the schedule and the slot, so a restart or a retry never creates the same run twice.
+
+Audit events: `assign_schedule_created`, `assign_schedule_paused` / `_resumed` / `_removed` (by a person), `assign_schedule_fired` (with the task id), `assign_schedule_skipped` (with the reason: `access_lost`, `agent_unavailable`, `schedule_restricted`, `previous_open`, `missed`, `create_failed`) and `assign_schedule_auto_paused`.
+
 ## Group chats
 
 Assigning works in groups, but only for linked accounts, and **everyone in the group sees the command, the confirmation (with the task text), every progress notice and the titles `/交辦 狀態` lists** (a task whose audience does not include the channel shows its number only). In a LINE group with **mention only** on, `/交辦` and `/assign` count as addressing the bot (other commands still need a mention), and so does the one message an armed `/交辦 @name` is waiting for.
