@@ -221,7 +221,9 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 電腦操作 start／action 的核可，依已驗證的員工與 `turn_id`，從主機登記的進行中對話取出真人。請求參數不能指定真人，也不能借用另一位員工的對話。沒有或查不到 turn 時不記真人，因此無法在這些請求辨認自批者；沒有 turn 的工作區、截圖與停止請求也不記真人。
 
-它只會收窄。偽造的值頂多讓紀錄錯，或讓一個員工本身已經通過的檢查在真人這一關也通過。沒涵蓋：有 Bash 的員工可以自己用別的值啟動 MCP server（和所有靠環境變數帶身分的機制一樣，只是減速帶）；記錄模式不擋任何事；用 `tasks_create` 建的排程，之後每次執行不會帶上這個人。`spawn_ephemeral` 及其延後准入佇列也還沒傳遞真人身分。Grok 與已棄用的 Gemini CLI 是否把 spawn 環境轉交 MCP 子程序，尚未驗證。已有單元與整合測試；真模型呼叫 `send_to_agent` 的端到端流程未活測。
+真人檢查只會收窄員工權限。記錄模式仍依賴主機帶入的標記，不強制權限；強制模式下，單改真人環境變數不能改變 gateway context 登記的人。這不是作業系統隔離：同一個 OS 帳號下、有不受限 Bash 的員工，仍可能讀取程序憑證或改寫本機資料庫。用 `tasks_create` 建的排程，之後每次執行不會帶上這個人。`spawn_ephemeral` 及其延後准入佇列也還沒傳遞真人身分。Grok 與已棄用的 Gemini CLI 是否把 spawn 環境轉交 MCP 子程序，尚未驗證。
+
+本機已驗證：關閉 dashboard feature 的後端單元、整合與文件測試；原 dispatcher 回歸在預設堆疊通過；以及真實 stdio MCP 子程序呼叫簽名內部路由。native fixture 使用臨時測試 issuer 簽署的 license，涵蓋 Enterprise AND 條件、團隊 Manager 交辦、Viewer 只能呼叫、即時撤權／停權、明確背景 None 與缺少／跨員工／失效／不一致 context。這不代表正式 issuer、真模型呼叫 `send_to_agent` 或實機通道驗收；預設 dashboard feature 另由 CI 檢查。
 
 ## 支撐層
 
