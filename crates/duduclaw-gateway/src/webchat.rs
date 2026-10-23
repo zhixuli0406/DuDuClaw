@@ -289,6 +289,12 @@ impl ChatMessage {
     }
 }
 
+mod liveness;
+
+/// Sent instead of a reply when a turn produced none (B10).
+const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一次。";
+/// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
+const NO_REPLY_CODE: &str = "no_reply";
 mod route;
 
 /// A file attachment uploaded through the WebChat socket.
@@ -777,14 +783,16 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
     // Heartbeat: send ping every 30s, close if no pong in 60s
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    let mut last_pong = std::time::Instant::now();
+    // B10: liveness counts every frame read and every finished turn (see
+    // `liveness`), not only pongs, which stay unread while a turn runs.
+    let live = liveness::Liveness::new();
 
     // Message processing loop
     loop {
         tokio::select! {
             // Heartbeat tick
             _ = heartbeat_interval.tick() => {
-                if last_pong.elapsed().as_secs() > 60 {
+                if live.timed_out() {
                     warn!("WebChat heartbeat timeout: {user_id}");
                     break;
                 }
@@ -823,6 +831,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                     None => break,
                 };
 
+                // Touches again when this frame's handling ends, however it ends.
+                let _busy = live.busy();
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
@@ -1282,7 +1292,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // the only caller that reads the second half — see
                                 // `channel_reply::build_guarded_reply_with_session`
                                 // (these replaced the former `_with_artifact` siblings).
-                                let work = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+                                // B10 review L1: learn whether an empty answer is a
+                                // deliberate silence (no `no_reply` frame then).
+                                let work = crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
                                     .scope(auth_user.clone(), async {
                                         match &effective_agent {
                                             Some(a) => {
@@ -1298,7 +1310,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 .await
                                             }
                                         }
-                                    });
+                                    }));
                                 tokio::pin!(work);
                                 // The model the backend ACTUALLY answered with
                                 // (ProgressEvent::ModelInfo) — stamped onto the
@@ -1307,7 +1319,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // Summary of the thinking frames actually sent,
                                 // stamped onto the assistant_done frame below.
                                 let mut thinking_meta = crate::thinking::DoneMetaBuilder::default();
-                                let reply = loop {
+                                let (reply, deliberate_silence) = loop {
                                     tokio::select! {
                                         r = &mut work => break r,
                                         Some(ev) = prx.recv() => {
@@ -1476,8 +1488,24 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     warn!("WebChat: source changed before reply delivery — skipping send");
                                     continue;
                                 }
+                                if reply.trim().is_empty() && deliberate_silence {
+                                    // Kept silent on purpose (failsafe mute, breaker,
+                                    // access gate): no frame, as before (review L1).
+                                    warn!("WebChat: reply withheld by design — skipping send");
+                                    continue;
+                                }
                                 if reply.trim().is_empty() {
-                                    warn!("WebChat: reply is empty — skipping send");
+                                    // B10: an explicit frame, so the page and the
+                                    // widget stop waiting for this message (the
+                                    // dashboard keeps its input locked until a
+                                    // reply or an error arrives).
+                                    warn!("WebChat: reply is empty — telling the client");
+                                    let frame = ChatMessage::error_coded(NO_REPLY_TEXT, NO_REPLY_CODE);
+                                    if let Ok(json) = serde_json::to_string(&frame) {
+                                        if sink.send(Message::Text(json.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                     continue;
                                 }
 
@@ -1523,9 +1551,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                             break;
                         }
                     }
-                    Message::Pong(_) => {
-                        last_pong = std::time::Instant::now();
-                    }
+                    Message::Pong(_) => {}
                     Message::Close(_) => {
                         info!("WebChat connection closed by client: {user_id}");
                         break;

@@ -66,6 +66,14 @@ pub struct CircuitBreakerConfig {
     pub cooldown_secs: u64,
     /// Number of requests allowed through in half-open state for probing.
     pub half_open_allow_count: u32,
+    /// Long window for the hard loop limit (seconds). Unlike the short
+    /// frequency window (which only makes messages wait), more than
+    /// `hard_max_messages` inside this window trips the breaker.
+    pub hard_window_secs: u64,
+    /// Messages per scope inside `hard_window_secs` that trip the breaker.
+    /// Far above what a person types; stops a bot-to-bot loop of short,
+    /// varied messages that no other check catches.
+    pub hard_max_messages: u32,
 }
 
 /// Failsafe graceful degradation configuration.
@@ -146,6 +154,8 @@ impl Default for CircuitBreakerConfig {
             token_explosion_multiplier: 3.0,
             cooldown_secs: 60,
             half_open_allow_count: 2,
+            hard_window_secs: 60,
+            hard_max_messages: 30,
         }
     }
 }
@@ -229,6 +239,9 @@ impl KillswitchConfig {
             || self.circuit_breaker.similarity_threshold > 1.0
         {
             warnings.push("similarity_threshold must be 0.0–1.0");
+        }
+        if self.circuit_breaker.hard_window_secs == 0 || self.circuit_breaker.hard_max_messages == 0 {
+            warnings.push("circuit_breaker.hard_window_secs and hard_max_messages must be > 0 (1 is used)");
         }
         if self.circuit_breaker.token_explosion_multiplier < 1.0 {
             warnings.push("token_explosion_multiplier must be >= 1.0");

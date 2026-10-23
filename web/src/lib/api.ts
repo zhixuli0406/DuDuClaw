@@ -5174,6 +5174,10 @@ export interface KillswitchCircuitBreaker {
   token_explosion_multiplier: number;
   cooldown_secs: number;
   half_open_allow_count: number;
+  /** Long window of the hard loop limit (seconds). */
+  hard_window_secs: number;
+  /** Messages per conversation in that window that trip the breaker. */
+  hard_max_messages: number;
 }
 
 export interface KillswitchFailsafe {

@@ -282,14 +282,23 @@ async fn process_claimed(
     // the operator's decision).
     // A redelivered webhook's token is never tried (review N2).
     let rerun = row.run_authorization_id.is_some();
+    // B10: messages that waited behind the previous turn are answered in
+    // this one, with the newest message's reply token.
+    let (event, payload, newest_received, merged) =
+        fold_waiting(store, &row, event, payload, &state.home_dir).await;
     let now = chrono::Utc::now().timestamp();
-    let token_deadline = reply_token_deadline(row.received_at, &event);
+    let token_deadline = reply_token_deadline(newest_received, &event);
     if cfg.late_reply == LateReply::Fail && now > token_deadline && event.reply_token.is_some() {
         let reason = if is_redelivery(&event) {
             "redelivered_reply_token_not_used"
         } else {
             "late_reply_expired"
         };
+        // The folded messages did not run either: put them back so each is
+        // handled on its own (they wait until the head leaves `claimed`).
+        if !merged.is_empty() && store.unfold(&row, &merged).await.is_err() {
+            error!(ingress_id = %row.id, "LINE ingress: folded messages could not be restored; they stay with the head");
+        }
         if store
             .transition(&row, "claimed", "failed_before_dispatch", Some(reason))
             .await
@@ -338,6 +347,43 @@ async fn process_claimed(
         _ => return,
     };
     alert(store, kind, &row, reason.unwrap_or("unknown")).await;
+    // The messages answered in this turn share its outcome; list them too.
+    for m in &merged {
+        alerts::record(store, kind, &m.id, reason.unwrap_or("unknown")).await;
+    }
+}
+
+/// Fold the `ready` messages directly behind `row` into this run (see
+/// `channel_ingress::merge`). Returns the event the turn runs as, the head
+/// payload (now listing the folded messages) and the receipt time the reply
+/// deadline counts from. Unchanged when nothing qualifies or the ledger
+/// cannot be read (the head then runs alone, as before).
+async fn fold_waiting(
+    store: &IngressStore,
+    row: &IngressRow,
+    event: LineEvent,
+    payload: serde_json::Value,
+    home: &std::path::Path,
+) -> (LineEvent, serde_json::Value, i64, Vec<crate::channel_ingress::MergedEvent>) {
+    if row.decision_fastlane || !super::merge::mergeable(&event) {
+        return (event, payload, row.received_at, Vec::new());
+    }
+    let merged = match store.absorb_followers(row, &super::merge::mergeable_json).await {
+        Ok(m) => m,
+        Err(_) => {
+            warn!(ingress_id = %row.id, "LINE ingress: waiting messages could not be folded; answering one by one");
+            return (event, payload, row.received_at, Vec::new());
+        }
+    };
+    let lang = crate::trigger_route::texts::lang_for(home);
+    let Some((combined, newest)) = super::merge::combined_event(&payload["event"], &merged, lang) else {
+        return (event, payload, row.received_at, Vec::new());
+    };
+    info!(ingress_id = %row.id, folded = merged.len(), "LINE ingress: answering waiting messages in one turn");
+    // Same shape as the stored payload, which now lists the folded messages.
+    let mut payload = payload;
+    payload["merged"] = crate::channel_ingress::merged_json(&merged);
+    (combined, payload, newest, merged)
 }
 
 /// Keep the dispatch lease alive. Ends only when the lease is definitely

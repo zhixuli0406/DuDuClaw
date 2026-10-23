@@ -80,6 +80,7 @@ pub mod channel_typing;
 pub mod claude_runner;
 pub mod config_crypto;
 pub mod connector_lifecycle;
+pub(crate) mod conversation_queue;
 pub mod consolidation_failures;
 pub mod cost_telemetry;
 pub mod decision_action;
