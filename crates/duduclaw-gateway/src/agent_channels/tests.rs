@@ -69,6 +69,17 @@ fn service_account_json_is_checked_without_network() {
 }
 
 #[test]
+fn token_uri_must_be_googles_endpoint() {
+    assert!(googlechat_config::token_uri_allowed("https://oauth2.googleapis.com/token"));
+    assert!(!googlechat_config::token_uri_allowed("https://evil.example/token"));
+    assert!(!googlechat_config::token_uri_allowed("http://oauth2.googleapis.com/token"));
+    assert!(!googlechat_config::token_uri_allowed("https://oauth2.googleapis.com.evil.com/token"));
+    assert!(!googlechat_config::token_uri_allowed("https://oauth2.googleapis.com:8443/token"));
+    // Debug builds (tests) accept a loopback fake.
+    assert!(googlechat_config::token_uri_allowed("http://127.0.0.1:9/token"));
+}
+
+#[test]
 fn store_writes_ciphertext_only_and_removes_sections() {
     let mut t: toml::Table = "[channels.telegram]\nbot_token = \"plain\"\n"
         .parse()

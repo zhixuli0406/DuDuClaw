@@ -173,6 +173,8 @@ impl MethodHandler {
         if self.registry.read().await.get(agent_id).is_none() {
             return WsFrame::error_response("", "Agent not found");
         }
+        // Held across the duplicate check and the write (B11 L3).
+        let _bind = agent_channels::binding_lock().await;
         if let Some(holder) =
             conflicts::telegram_bot_holder(&self.home_dir, &self.registry, &token, agent_id).await
         {

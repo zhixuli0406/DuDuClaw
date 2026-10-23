@@ -490,6 +490,19 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         } else {
             None
         };
+        // B11: a sub-agent working for an own-bot conversation keeps naming
+        // that bot, so its own delegations answer through it too.
+        let reply_sender = if msg.reply_channel.as_deref().is_some_and(|rc| !rc.is_empty()) {
+            let home = home_dir.to_path_buf();
+            let id = msg.id.clone();
+            tokio::task::spawn_blocking(move || lookup_callback_sender(&home, &id))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -497,7 +510,10 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                         collector,
                         crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(
                             attr,
-                            crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut),
+                            crate::claude_runner::REPLY_CHANNEL.scope(
+                                rc,
+                                crate::claude_runner::REPLY_SENDER.scope(reply_sender, dispatch_fut),
+                            ),
                         ),
                     )
                     .await
@@ -511,7 +527,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                     .await
             }
             (None, Some(rc)) if !rc.is_empty() => {
-                let fut = crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut);
+                let fut = crate::claude_runner::REPLY_CHANNEL
+                    .scope(rc, crate::claude_runner::REPLY_SENDER.scope(reply_sender, dispatch_fut));
                 match heartbeat_attr {
                     Some(attr) => crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attr, fut).await,
                     None => fut.await,
@@ -2245,6 +2262,8 @@ pub async fn reforward_message(
 /// `duduclaw-cli::mcp::send_to_agent_with_ctx` — kept local to avoid
 /// a cross-crate dep on the MCP server module.
 fn parse_reply_channel(rc: &str) -> Result<(String, String, Option<String>), String> {
+    // An employee bucket (`#agent:`) is not part of the chat id (B11).
+    let rc = duduclaw_core::session_conversation(rc);
     let parts: Vec<&str> = rc.splitn(3, ':').collect();
     if parts.len() < 2 {
         return Err(format!(
@@ -2314,7 +2333,7 @@ fn parse_proactive_line(line: &str) -> Option<ProactiveSend> {
 
 /// Check if a delegation callback exists for this message and forward
 /// the response to the originating channel.
-async fn forward_delegation_response(
+pub(crate) async fn forward_delegation_response(
     home_dir: &Path,
     original_message_id: &str,
     response_text: &str,
@@ -2333,19 +2352,27 @@ async fn forward_delegation_response(
             Err(_) => return None,
         };
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        // B11 column; a table created by an older writer may lack it, and a
+        // RETURNING over a missing column would drop the forward. "Duplicate
+        // column" is the expected error once it exists.
+        let _ = conn.execute("ALTER TABLE delegation_callbacks ADD COLUMN sender_agent TEXT", []);
 
         conn.query_row(
             "DELETE FROM delegation_callbacks WHERE message_id = ?1 \
-             RETURNING message_id, agent_id, channel_type, channel_id, thread_id, retry_count",
+             RETURNING message_id, agent_id, channel_type, channel_id, thread_id, retry_count, sender_agent",
             rusqlite::params![msg_id],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i32>(5)?,
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i32>(5)?,
+                    ),
+                    row.get::<_, Option<String>>(6)?
+                        .filter(|s| duduclaw_core::is_valid_agent_id(s)),
                 ))
             },
         )
@@ -2355,7 +2382,8 @@ async fn forward_delegation_response(
     .ok()
     .flatten();
 
-    let Some((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count)) = callback
+    let Some(((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count), sender_agent)) =
+        callback
     else {
         // No callback registered — this is the legitimate case for purely
         // internal delegations (cron/reminder/heartbeat), but it is ALSO
@@ -2398,7 +2426,7 @@ async fn forward_delegation_response(
         "Forwarding sub-agent response to originating channel"
     );
 
-    match forward_to_channel(
+    match forward_to_channel_as(
         home_dir,
         &channel_type,
         &channel_id,
@@ -2407,6 +2435,7 @@ async fn forward_delegation_response(
         responder_agent,
         &callback_agent_id,
         chain_root.as_deref(),
+        sender_agent.as_deref(),
     )
     .await
     {
@@ -2459,15 +2488,16 @@ async fn forward_delegation_response(
                 let ch_type = channel_type.clone();
                 let ch_id = channel_id.clone();
                 let tid = thread_id.clone();
+                let sender = sender_agent.clone();
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
                         let _ = conn.execute(
                             "INSERT OR IGNORE INTO delegation_callbacks \
-                             (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now],
+                             (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at, sender_agent) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now, sender],
                         );
                     }
                 }).await;
@@ -2528,6 +2558,21 @@ fn candidate_session_ids(
             }
         }
     }
+}
+
+/// `candidates` with each agent's bucket (`<sid>#agent:<id>`) tried first.
+fn with_agent_buckets<'a>(
+    candidates: Vec<String>,
+    agents: impl Iterator<Item = &'a str> + Clone,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for sid in candidates {
+        for agent in agents.clone().filter(|a| duduclaw_core::is_valid_agent_id(a)) {
+            out.push(crate::trigger_route::called_session(&sid, agent));
+        }
+        out.push(sid);
+    }
+    out
 }
 
 /// Sanitize an agent name for inclusion in the XML `<subagent_reply>` tag.
@@ -2647,11 +2692,17 @@ async fn append_subagent_reply_to_parent_session_with(
     let response_owned = response_text.to_string();
     let responder_owned = responder_agent.to_string();
 
-    let candidates = candidate_session_ids(channel_type, channel_id, thread_id);
     let parent = parent_agent_id.to_string();
     let root = chain_root_agent
         .filter(|s| !s.is_empty() && *s != parent_agent_id)
         .map(str::to_string);
+    // An employee's own-bot or `@`-called turn lives in its bucket of the
+    // conversation (`<sid>#agent:<id>`, B11): try the parent's and the chain
+    // root's bucket before the conversation itself.
+    let candidates = with_agent_buckets(
+        candidate_session_ids(channel_type, channel_id, thread_id),
+        std::iter::once(parent.as_str()).chain(root.as_deref()),
+    );
 
     let ch_type = channel_type.to_string();
     let ch_id = channel_id.to_string();
@@ -2956,6 +3007,36 @@ async fn forward_to_channel(
     originating_agent: &str,
     chain_root_agent: Option<&str>,
 ) -> Result<(), String> {
+    forward_to_channel_as(
+        home_dir,
+        channel_type,
+        channel_id,
+        thread_id,
+        text,
+        responder_agent,
+        originating_agent,
+        chain_root_agent,
+        None,
+    )
+    .await
+}
+
+/// [`forward_to_channel`] for a conversation that came in through an AI
+/// employee's own bot / app (`sender`, B11): the answer goes out through that
+/// same bot / app and nothing else — a missing token is an error, never a
+/// switch to the shared bot or to the callback agent's own bot.
+#[allow(clippy::too_many_arguments)]
+async fn forward_to_channel_as(
+    home_dir: &Path,
+    channel_type: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+    responder_agent: &str,
+    originating_agent: &str,
+    chain_root_agent: Option<&str>,
+    sender: Option<&str>,
+) -> Result<(), String> {
     // Validate channel_id format to prevent URL injection / SSRF
     validate_channel_id(channel_type, channel_id)?;
     if let Some(tid) = thread_id {
@@ -3039,20 +3120,25 @@ async fn forward_to_channel(
 
     match channel_type {
         "telegram" => {
-            let token = resolve_forward_token(
-                home_dir,
-                originating_agent,
-                chain_root_agent,
-                "telegram",
-                &config,
-                "telegram_bot_token_enc",
-                "telegram_bot_token",
-            )
-            .await;
+            let token = match sender {
+                Some(agent) => own_telegram_token(home_dir, agent).await?,
+                None => {
+                    resolve_forward_token(
+                        home_dir,
+                        originating_agent,
+                        chain_root_agent,
+                        "telegram",
+                        &config,
+                        "telegram_bot_token_enc",
+                        "telegram_bot_token",
+                    )
+                    .await
+                }
+            };
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
-            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(&token));
             for (i, body) in chunks.iter().enumerate() {
                 let mut payload = serde_json::json!({
                     "chat_id": channel_id,
@@ -3354,11 +3440,11 @@ async fn forward_to_channel(
             }
         }
         "googlechat" => {
-            // The employee's own Chat app when it (or the chain root) has
-            // one — that app is the member of the space — else the shared app.
-            let sender_agent = googlechat_sender_agent(home_dir, originating_agent, chain_root_agent).await;
+            // The app the conversation came in through (B11 M2): the
+            // employee's own app when `sender` names it, else the app the
+            // space is known to contain (shared by default).
             for (i, body) in chunks.iter().enumerate() {
-                crate::googlechat::send_text_to_space_as(home_dir, sender_agent.as_deref(), channel_id, body)
+                crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, body)
                     .await
                     .map_err(|e| format!("googlechat send chunk {}/{}: {e}", i + 1, total))?;
                 if i + 1 < total {
@@ -3476,21 +3562,13 @@ async fn resolve_forward_token(
     get_config_token(config, enc_key, plain_key, home_dir).await
 }
 
-/// Which employee's own Google Chat app forwards a delegation reply: the
-/// callback agent's, else the chain root's, else none (shared app).
-async fn googlechat_sender_agent(
-    home_dir: &Path,
-    callback_agent_id: &str,
-    origin_agent: Option<&str>,
-) -> Option<String> {
-    for agent in std::iter::once(callback_agent_id).chain(origin_agent) {
-        if !agent.is_empty()
-            && crate::agent_channels::store::agent_chat_app(home_dir, agent).await.is_some()
-        {
-            return Some(agent.to_string());
-        }
-    }
-    None
+/// The employee's own Telegram bot token (B11): required, no cascade.
+async fn own_telegram_token(home_dir: &Path, agent: &str) -> Result<String, String> {
+    let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(home_dir).await;
+    crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &sm_cfg)
+        .await
+        .map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
+        .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))
 }
 
 /// Look up the origin_agent for a message_id. Used by
@@ -3501,6 +3579,21 @@ async fn googlechat_sender_agent(
 /// Returns None if the message_queue.db is missing, the query fails,
 /// or the row has no origin_agent — callers then cascade directly to
 /// the global config token (original v1.8.14 behaviour).
+/// The own-bot sender recorded with the delegation callback of `message_id`
+/// (B11), if any.
+fn lookup_callback_sender(home_dir: &Path, message_id: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(home_dir.join("message_queue.db")).ok()?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+    conn.query_row(
+        "SELECT sender_agent FROM delegation_callbacks WHERE message_id = ?1",
+        rusqlite::params![message_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|s| duduclaw_core::is_valid_agent_id(s))
+}
+
 fn lookup_origin_agent(home_dir: &Path, message_id: &str) -> Option<String> {
     let db_path = home_dir.join("message_queue.db");
     let conn = rusqlite::Connection::open(&db_path).ok()?;
@@ -4992,7 +5085,8 @@ bot_token = "{token}"
                 channel_id TEXT NOT NULL,
                 thread_id TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                sender_agent TEXT
             );",
         )
         .unwrap();

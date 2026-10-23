@@ -58,6 +58,8 @@ impl MethodHandler {
                 );
             }
         };
+        // Held across the duplicate check and the write (B11 L3).
+        let _bind = agent_channels::binding_lock().await;
         if let Some(holder) = conflicts::googlechat_project_holder(
             &self.home_dir,
             &self.registry,

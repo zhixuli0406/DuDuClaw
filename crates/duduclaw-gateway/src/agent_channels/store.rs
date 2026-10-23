@@ -99,6 +99,12 @@ fn googlechat_section(home: &Path, agent_id: &str) -> Option<toml::Table> {
         .cloned()
 }
 
+/// Whether the employee's `agent.toml` has a `[channels.googlechat]` section
+/// at all (configured, even if its key cannot be resolved right now).
+pub fn agent_has_googlechat_section(home: &Path, agent_id: &str) -> bool {
+    googlechat_section(home, agent_id).is_some()
+}
+
 /// Read the employee's own Chat app fresh from `agent.toml` (per request,
 /// never cached). `None` when not (completely) configured or the key cannot
 /// be resolved — callers fail closed.

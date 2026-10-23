@@ -69,12 +69,28 @@ How it behaves:
 - Every request Google sends to that address is verified against **that**
   employee's project number before anything is read. A request signed for
   another app, a wrong audience, a missing or forged token are refused (HTTP
-  401). An address for an employee without an app answers 404.
+  401). An address for an employee without an app, or an unknown id, answers
+  the same 401, so the address does not reveal which employees have an app.
+  One source address may make at most 120 requests a minute.
 - Replies (and messages this employee forwards to a space later) are sent with
   this app's credentials, so the app must be a member of the space.
 - To change only the project number, leave the key field empty; the stored
   key is kept.
 - Removing the app closes the address at once.
+
+## Where later messages go
+
+Everything that answers a conversation later goes out through the bot or app
+that conversation came in through:
+
+- answers from another AI employee this employee handed the work to;
+- reminders and messages the employee sends back into that chat;
+- approval requests, `/goal` progress and other notices for that chat.
+
+On Telegram this is the employee's own bot; if that bot was removed in the
+meantime the message fails instead of going out through another bot. On
+Google Chat the app that is a member of the space is used (the shared app
+when it is there, otherwise the employee's own app).
 
 ## Security notes
 
@@ -88,7 +104,8 @@ How it behaves:
 
 ## Not covered
 
-- Scheduled notifications and reminders still send through the shared Google
-  Chat app; replies and delegation results use the employee's app.
+- Reminders created before this release keep sending through the shared bot.
+- Only the "Project number" authentication audience is supported for Google
+  Chat apps (not "HTTP endpoint URL").
 - Discord and Slack per-employee bots are set from the same page through
   **Add channel** (admin) as before.

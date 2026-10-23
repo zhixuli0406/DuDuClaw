@@ -284,7 +284,8 @@ pub(crate) fn refusal_text(auth: PressAuth, subject: &str) -> String {
 /// for a malformed value or a non-pushable transport (webchat, dashboard, …) —
 /// the caller then falls through to the next link in the chain.
 pub(crate) fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
-    let rc = reply_channel.trim();
+    // An employee bucket (`#agent:`) is not part of the chat id (B11).
+    let rc = duduclaw_core::session_conversation(reply_channel.trim());
     let parts: Vec<&str> = rc.splitn(3, ':').collect();
     if parts.len() < 2 {
         return None;

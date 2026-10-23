@@ -244,6 +244,12 @@ impl GoogleChatCreds {
             ),
             None => return Err("this AI employee's Google Chat app is no longer configured".into()),
         };
+        // An employee's key may only post its assertion to Google (B11 L2).
+        if matches!(self.source, CredSource::Agent(_))
+            && !crate::agent_channels::googlechat_config::token_uri_allowed(&token_uri)
+        {
+            return Err("service-account token_uri is not Google's token endpoint".into());
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -414,6 +420,15 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
     };
 
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    // Verified event: remember which app is in this space, so sends with no
+    // explicit sender (approvals, goals, reminders) use an app that is there.
+    if let Some(space) = event
+        .pointer("/space/name")
+        .or_else(|| event.pointer("/message/space/name"))
+        .and_then(|v| v.as_str())
+    {
+        crate::agent_channels::gchat_spaces::record(&state.ctx.home_dir, space, state.agent.as_deref());
+    }
     match event_type {
         "MESSAGE" => {
             let st = state.clone();
@@ -796,21 +811,7 @@ pub async fn send_text_to_space_as(
     space: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    let creds = match agent {
-        Some(id) => match crate::googlechat_agents::agent_creds(home_dir, id).await {
-            Some(c) => c,
-            None => Arc::new(
-                GoogleChatCreds::from_config(home_dir)
-                    .await
-                    .ok_or("Google Chat channel not configured")?,
-            ),
-        },
-        None => Arc::new(
-            GoogleChatCreds::from_config(home_dir)
-                .await
-                .ok_or("Google Chat channel not configured")?,
-        ),
-    };
+    let creds = sending_creds(home_dir, agent, space).await?;
     let formatted = crate::markdown_render::to_googlechat_text(markdown);
     for chunk in crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK) {
         if create_message(&creds, space, None, &chunk).await.is_none() {
@@ -818,6 +819,36 @@ pub async fn send_text_to_space_as(
         }
     }
     Ok(())
+}
+
+/// The app a send uses. `agent` names the app the conversation came in
+/// through: that employee's own app when it has one — and then a failure to
+/// load it is an error, never a silent switch to the shared app (B11 M1).
+/// Without it (or for an employee with no app) the space's recorded member
+/// app decides, falling back to the shared app.
+async fn sending_creds(
+    home_dir: &Path,
+    agent: Option<&str>,
+    space: &str,
+) -> Result<Arc<GoogleChatCreds>, String> {
+    let own = match agent {
+        Some(id) if crate::agent_channels::store::agent_has_googlechat_section(home_dir, id) => {
+            Some(id.to_string())
+        }
+        _ => match crate::agent_channels::gchat_spaces::app_for_space(home_dir, space) {
+            crate::agent_channels::gchat_spaces::SpaceApp::Agent(id) => Some(id),
+            crate::agent_channels::gchat_spaces::SpaceApp::Shared => None,
+        },
+    };
+    match own {
+        Some(id) => crate::googlechat_agents::agent_creds(home_dir, &id)
+            .await
+            .ok_or_else(|| format!("AI employee {id}'s own Google Chat app could not be loaded")),
+        None => GoogleChatCreds::from_config(home_dir)
+            .await
+            .map(Arc::new)
+            .ok_or_else(|| "Google Chat channel not configured".to_string()),
+    }
 }
 
 /// spaces.messages.create — returns the created message `name` for edits.

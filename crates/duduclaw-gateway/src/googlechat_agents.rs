@@ -8,9 +8,13 @@
 //! credentials. An employee without an app keeps the shared app
 //! (`/webhook/googlechat`, unchanged).
 //!
-//! The route is always mounted; it answers 404 for an id that has no app
-//! configured right now (config is re-read on every request), and 401 for a
-//! token that does not verify. Errors never fall through to the shared app.
+//! The route is always mounted. Every request without a verified token —
+//! missing or malformed bearer, an id with no app configured right now
+//! (config is re-read on every request), a token that does not verify —
+//! answers the same 401, checked in that order so nothing is read or
+//! decrypted for a request without a plausible token. A single source address
+//! is limited to 120 requests a minute. Errors never fall through to the
+//! shared app.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -68,54 +72,98 @@ pub fn router(ctx: Arc<ReplyContext>) -> Router {
     Router::new().route(ROUTE, post(webhook)).with_state(ctx)
 }
 
+/// Requests per minute one source address may make to these endpoints
+/// before being refused (Google spreads a Chat app's calls over many
+/// addresses, so this only bounds a single noisy source).
+const MAX_REQUESTS_PER_IP_PER_MIN: u32 = 120;
+/// Largest event body read (Chat events are a few KB).
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+fn ip_allowed(ip: std::net::IpAddr) -> bool {
+    use std::time::Instant;
+    static SEEN: OnceLock<Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>> = OnceLock::new();
+    let mut map = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if map.len() > 4096 {
+        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 120);
+    }
+    let entry = map.entry(ip).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() >= 60 {
+        *entry = (now, 0);
+    }
+    entry.1 += 1;
+    entry.1 <= MAX_REQUESTS_PER_IP_PER_MIN
+}
+
 async fn webhook(
     State(ctx): State<Arc<ReplyContext>>,
     UrlPath(agent): UrlPath<String>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
-    handle(ctx, &agent, &headers, body).await
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    if let Some(ip) = peer
+        && !ip_allowed(ip)
+    {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let (parts, body) = request.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    handle(ctx, &agent, &parts.headers, body).await
 }
 
-/// Verify and dispatch one request for `agent` (fail closed).
+/// The bearer token when it is present and its header is a plausible Chat
+/// signer token (RS256 with a short key id). Checked before any employee
+/// config is read or decrypted (B11 M4).
+fn plausible_bearer(headers: &HeaderMap) -> Option<&str> {
+    let auth = headers.get("authorization").and_then(|h| h.to_str().ok())?;
+    let token = crate::webhook_jwt::bearer_token(auth)?;
+    let header = jsonwebtoken::decode_header(token).ok()?;
+    let kid_ok = header
+        .kid
+        .as_deref()
+        .is_some_and(|k| !k.is_empty() && k.len() <= 128 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    (header.alg == jsonwebtoken::Algorithm::RS256 && kid_ok).then_some(token)
+}
+
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+}
+
+/// Verify and dispatch one request for `agent` (fail closed). Every refusal
+/// before a verified token is the same 401, so a caller cannot tell which
+/// employees have an app (B11 L1).
 pub(crate) async fn handle(
     ctx: Arc<ReplyContext>,
     agent: &str,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
+    let Some(token) = plausible_bearer(headers) else {
+        warn!(agent = duduclaw_core::truncate_chars(agent, 64), "Google Chat (own app): missing or malformed bearer token");
+        return unauthorized();
+    };
     if !duduclaw_core::is_valid_agent_id(agent) || ctx.registry.read().await.get(agent).is_none() {
-        return StatusCode::NOT_FOUND.into_response();
+        return unauthorized();
     }
     let Some(app) = crate::agent_channels::store::agent_chat_app(&ctx.home_dir, agent).await else {
-        return StatusCode::NOT_FOUND.into_response();
+        return unauthorized();
     };
     let Some(creds) = creds_for(&ctx.home_dir, agent, app.service_account.expose()) else {
-        warn!(
-            agent,
-            "Google Chat (own app): stored service-account key is unusable — rejecting"
-        );
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let auth = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let Some(token) = crate::webhook_jwt::bearer_token(auth) else {
-        warn!(agent, "Google Chat (own app): missing bearer token");
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        warn!(agent, "Google Chat (own app): stored service-account key is unusable — rejecting");
+        return unauthorized();
     };
     if let Err(e) = crate::googlechat::verify_request(&creds, token, &app.project_number).await {
         warn!(agent, "Google Chat (own app): JWT verification failed: {e}");
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return unauthorized();
     }
     let label = crate::agent_channels::label("googlechat", agent);
     set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
-    let state = Arc::new(GoogleChatState {
-        ctx,
-        creds,
-        agent: Some(agent.to_string()),
-    });
+    let state = Arc::new(GoogleChatState { ctx, creds, agent: Some(agent.to_string()) });
     crate::googlechat::dispatch_event(state, body).await
 }
 

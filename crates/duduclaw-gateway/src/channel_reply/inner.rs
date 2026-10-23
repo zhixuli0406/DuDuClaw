@@ -1689,9 +1689,19 @@ pub(super) async fn build_reply_with_session_inner(
         // entirely — the unconsumed cli_future is lazy and simply drops.
         Some(local_reply) => Ok(local_reply),
         None if is_channel_session => {
-            crate::claude_runner::REPLY_CHANNEL
-                .scope(session_id.to_string(), cli_future)
-                .await
+            // The delivery address is the conversation, never the employee
+            // bucket (`#agent:`); an own-bot turn also names its bot (B11).
+            let reply_channel = duduclaw_core::session_conversation(session_id).to_string();
+            if own_bot {
+                crate::claude_runner::REPLY_CHANNEL
+                    .scope(
+                        reply_channel,
+                        crate::claude_runner::REPLY_SENDER.scope(agent_id.clone(), cli_future),
+                    )
+                    .await
+            } else {
+                crate::claude_runner::REPLY_CHANNEL.scope(reply_channel, cli_future).await
+            }
         }
         None => cli_future.await,
     };

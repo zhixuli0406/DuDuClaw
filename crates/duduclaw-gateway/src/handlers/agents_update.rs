@@ -165,7 +165,13 @@ impl MethodHandler {
         }
 
         // One Telegram bot per employee (B11): refuse a bot another employee
-        // already uses before anything is written.
+        // already uses before anything is written; the bind lock is held
+        // until the write is done (L3).
+        let _bind = if params.get("telegram_bot_token").is_some() {
+            Some(crate::agent_channels::binding_lock().await)
+        } else {
+            None
+        };
         if let Some(raw) = params
             .get("telegram_bot_token")
             .and_then(|v| v.as_str())

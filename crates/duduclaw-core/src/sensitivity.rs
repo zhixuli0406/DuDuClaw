@@ -103,6 +103,21 @@ pub fn perception_source_sensitivity(source: &str) -> Sensitivity {
     }
 }
 
+/// The conversation an employee bucket belongs to: `telegram:123#agent:hr`
+/// → `telegram:123`. Everything that turns a session id into a delivery
+/// address (reply channel, `/goal` source, decision origin, memory chat id)
+/// must use this — the `#agent:` bucket is a storage key, not part of a chat
+/// id. WebChat ids (`webchat:<u>#agent:…#conv:…`) are not delivery addresses
+/// and are returned unchanged.
+pub fn session_conversation(session_id: &str) -> &str {
+    if session_id.starts_with("webchat:") {
+        return session_id;
+    }
+    session_id
+        .split_once("#agent:")
+        .map_or(session_id, |(conversation, _)| conversation)
+}
+
 /// Whether `session_id` denotes a **1:1 private** conversation with `user_id`.
 ///
 /// Personal-or-higher context (persona blocks, calendar, screen, clipboard) may
@@ -304,6 +319,16 @@ mod tests {
         assert!(!is_private_session("telegram:-100456", "123"));
         // Even if a group member's id somehow appeared, the '-' marker wins.
         assert!(!is_private_session("telegram:-100456", "-100456"));
+    }
+
+    #[test]
+    fn session_conversation_strips_only_the_employee_bucket() {
+        assert_eq!(session_conversation("telegram:123#agent:hr"), "telegram:123");
+        assert_eq!(session_conversation("telegram:-100:7#agent:hr"), "telegram:-100:7");
+        assert_eq!(session_conversation("googlechat:spaces/A#agent:a"), "googlechat:spaces/A");
+        assert_eq!(session_conversation("telegram:123"), "telegram:123");
+        assert_eq!(session_conversation("discord:thread:9"), "discord:thread:9");
+        assert_eq!(session_conversation("webchat:u#agent:a#conv:1"), "webchat:u#agent:a#conv:1");
     }
 
     #[test]

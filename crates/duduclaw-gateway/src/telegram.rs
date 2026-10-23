@@ -280,6 +280,8 @@ pub async fn start_telegram_bots(
                 }
             }
         }
+        // Deterministic precedence for a leftover duplicate: lowest id wins.
+        tokens.sort_by(|a, b| a.0.cmp(&b.0));
         tokens
     };
     // 1. Global bot from config.toml — skipped when an agent already owns the
@@ -287,9 +289,18 @@ pub async fn start_telegram_bots(
     //    fix for the dual-registration 409 + identity-mixing bug.
     if let Some(token) = read_telegram_token(home_dir).await {
         if !token.is_empty() {
+            // Same BOT (bot id), not the same token string: a regenerated
+            // token keeps the id and polling both would 409 (B11 L4).
+            let bot = |t: &str| {
+                crate::agent_channels::conflicts::telegram_bot_id(t)
+                    .unwrap_or(t)
+                    .to_string()
+            };
+            let agent_bots: Vec<(String, String)> =
+                agent_tokens.iter().map(|(n, t)| (n.clone(), bot(t))).collect();
             if let Some(owner) = crate::channel_reply::find_global_token_owner(
-                &token,
-                agent_tokens.iter().map(|(n, t)| (n.as_str(), t.as_str())),
+                &bot(&token),
+                agent_bots.iter().map(|(n, b)| (n.as_str(), b.as_str())),
             ) {
                 warn!(
                     "Telegram global token is also bound to agent '{owner}' — \

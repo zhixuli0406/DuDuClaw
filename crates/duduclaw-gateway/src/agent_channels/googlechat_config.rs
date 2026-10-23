@@ -42,9 +42,31 @@ pub fn validate_service_account_json(raw: &str) -> Result<ServiceAccountInfo, St
         .and_then(|k| k.as_str())
         .ok_or_else(bad)?;
     jsonwebtoken::EncodingKey::from_rsa_pem(key.as_bytes()).map_err(|_| bad())?;
+    if let Some(uri) = v.get("token_uri").and_then(|u| u.as_str())
+        && !token_uri_allowed(uri)
+    {
+        return Err("服務帳戶金鑰的 token_uri 必須是 https://oauth2.googleapis.com/token，請使用 Google Cloud 下載的原始金鑰檔。".into());
+    }
     Ok(ServiceAccountInfo {
         client_email: email.to_string(),
     })
+}
+
+/// Where a service-account assertion may be posted: Google's OAuth token
+/// endpoint over https. Debug builds also accept a loopback `http://` URL
+/// (local fakes in tests).
+pub fn token_uri_allowed(uri: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(uri.trim()) else {
+        return false;
+    };
+    if url.scheme() == "https" && url.host_str() == Some("oauth2.googleapis.com") && url.port().is_none() {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    if url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")) {
+        return true;
+    }
+    false
 }
 
 /// `client_email` of an already-validated key (for status display).

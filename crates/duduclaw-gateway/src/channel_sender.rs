@@ -526,7 +526,7 @@ pub(crate) async fn send_with_markup(
 ) -> Result<Option<crate::decision_card::PushedMessage>, String> {
     match channel {
         "telegram" => {
-            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+            let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(token));
             let body = json!({ "chat_id": chat_id, "text": text, "reply_markup": markup });
             let resp = http
                 .post(&url)
@@ -898,7 +898,7 @@ pub struct TelegramSender {
 #[async_trait]
 impl ChannelSender for TelegramSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
+        let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(&self.bot_token));
         let resp = self
             .http
             .post(&url)
@@ -920,7 +920,7 @@ impl ChannelSender for TelegramSender {
     }
 
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
-        let url = format!("https://api.telegram.org/bot{}/sendPhoto", self.bot_token);
+        let url = format!("{}/sendPhoto", crate::telegram::telegram_poll_api_base(&self.bot_token));
         let part = reqwest::multipart::Part::bytes(png_data.to_vec())
             .file_name("screenshot.png")
             .mime_str("image/png")
@@ -950,8 +950,8 @@ impl ChannelSender for TelegramSender {
         mime: &str,
     ) -> Result<(), ChannelSendError> {
         let url = format!(
-            "https://api.telegram.org/bot{}/sendDocument",
-            self.bot_token
+            "{}/sendDocument",
+            crate::telegram::telegram_poll_api_base(&self.bot_token)
         );
         let part = reqwest::multipart::Part::bytes(data.to_vec())
             .file_name(filename.to_string())

@@ -162,3 +162,80 @@ pub async fn googlechat_project_holder(
         })
     })
 }
+
+/// The employee (other than none) whose own Chat app uses `project_number` —
+/// for a change of the SHARED app's project number (B11 L3).
+pub async fn googlechat_project_employee(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    project_number: &str,
+) -> Option<Holder> {
+    let wanted = project_number.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    agent_rows(registry).await.into_iter().find_map(|row| {
+        row.googlechat
+            .as_ref()
+            .is_some_and(|g| g.project_number.trim() == wanted)
+            .then_some(Holder::Employee {
+                id: row.id,
+                display_name: row.display_name,
+            })
+    })
+}
+
+fn section<'a>(t: &'a toml::Table, channel: &str) -> Option<&'a toml::Table> {
+    t.get("channels")?.as_table()?.get(channel)?.as_table()
+}
+
+fn str_at<'a>(t: Option<&'a toml::Table>, key: &str) -> Option<&'a str> {
+    t?.get(key)?.as_str()
+}
+
+/// Duplicate check for a raw edit of `agents/<id>/agent.toml` (the raw
+/// config editor): the same rules as the dashboard bind (B11 L3). `Some`
+/// is the refusal text.
+pub async fn raw_agent_edit_conflict(
+    home: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    before: &toml::Table,
+    after: &toml::Table,
+) -> Option<String> {
+    let (tg_before, tg_after) = (section(before, "telegram"), section(after, "telegram"));
+    if tg_after.is_some() && tg_after != tg_before {
+        let reference = duduclaw_security::secret_ref::SecretRef::from_typed(
+            str_at(tg_after, "bot_token_enc"),
+            str_at(tg_after, "bot_token").unwrap_or(""),
+        );
+        let sm_cfg = SecretManagerConfig::load_from_home(home).await;
+        if let Some(token) = reference.resolve(&sm_cfg, home).await {
+            let token = crate::config_crypto::repair_telegram_token(token.expose()).into_owned();
+            if let Some(h) = telegram_bot_holder(home, registry, &token, agent_id).await {
+                return Some(h.telegram_refusal());
+            }
+        }
+    }
+    let gc_after = str_at(section(after, "googlechat"), "project_number").map(str::trim);
+    let gc_before = str_at(section(before, "googlechat"), "project_number").map(str::trim);
+    if let Some(project) = gc_after.filter(|p| !p.is_empty() && Some(*p) != gc_before) {
+        if let Some(h) = googlechat_project_holder(home, registry, project, agent_id).await {
+            return Some(h.googlechat_refusal());
+        }
+    }
+    None
+}
+
+/// Duplicate check for a change of the shared app's project number
+/// (`config.toml [channels] googlechat_project_number`). `Some` = refusal.
+pub async fn shared_project_conflict(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    project_number: &str,
+) -> Option<String> {
+    googlechat_project_employee(registry, project_number).await.map(|h| match h {
+        Holder::Employee { display_name, .. } => format!(
+            "這個專案編號已經是 AI 員工「{display_name}」專屬 Google Chat 應用程式的專案編號，共用設定請使用另一個 Google Cloud 專案。"
+        ),
+        Holder::Shared => String::new(),
+    })
+}

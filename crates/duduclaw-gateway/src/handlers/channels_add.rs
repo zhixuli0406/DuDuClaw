@@ -52,6 +52,7 @@ impl MethodHandler {
         if !agent_name.is_empty() && matches!(channel_type, "discord" | "telegram" | "slack") {
             // One Telegram bot belongs to one employee (getUpdates is
             // exclusive per bot): refuse a bot another employee already uses.
+            let _bind = crate::agent_channels::binding_lock().await;
             if channel_type == "telegram" {
                 if let Some(holder) = crate::agent_channels::conflicts::telegram_bot_holder(
                     &self.home_dir,
@@ -157,6 +158,17 @@ impl MethodHandler {
                     "not_started_reason": (!hot_started).then_some("check_credentials"),
                 }),
             );
+        }
+
+        // The shared Google Chat app may not reuse an employee's own app
+        // project (B11 L3).
+        let _bind = crate::agent_channels::binding_lock().await;
+        if channel_type == "googlechat" {
+            if let Some(msg) =
+                crate::agent_channels::conflicts::shared_project_conflict(&self.registry, secret).await
+            {
+                return WsFrame::error_response("", &msg);
+            }
         }
 
         // Global channel: write to config.toml [channels]

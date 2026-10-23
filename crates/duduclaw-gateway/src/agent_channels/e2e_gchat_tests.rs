@@ -50,7 +50,7 @@ fn test_key() -> &'static TestKey {
 }
 
 /// A request token as Google's Chat signer would mint it for `audience`.
-fn chat_jwt(audience: &str) -> String {
+pub(crate) fn chat_jwt(audience: &str) -> String {
     let now = chrono::Utc::now().timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-kid".into());
@@ -138,20 +138,20 @@ pub(crate) fn service_account(fake: &Fake, email: &str) -> String {
     .to_string()
 }
 
-fn googlechat_section(home: &Path, project: &str, sa_json: &str) -> String {
+pub(crate) fn googlechat_section(home: &Path, project: &str, sa_json: &str) -> String {
     let enc = crate::config_crypto::encrypt_value(sa_json, home).unwrap();
     format!(
         "\n[channels.googlechat]\nproject_number = \"{project}\"\nservice_account_json_enc = \"{enc}\"\n"
     )
 }
 
-fn message_event(space: &str, text: &str) -> Value {
+pub(crate) fn message_event(space: &str, text: &str) -> Value {
     json!({"type": "MESSAGE", "space": {"name": space, "type": "SPACE"}, "message": {
         "text": text, "argumentText": text, "space": {"name": space, "type": "SPACE"},
         "sender": {"name": "users/42", "displayName": "Human"}}})
 }
 
-async fn post(app: &Router, agent: &str, bearer: Option<&str>, event: &Value) -> StatusCode {
+pub(crate) async fn post(app: &Router, agent: &str, bearer: Option<&str>, event: &Value) -> StatusCode {
     let mut req = Request::builder()
         .method("POST")
         .uri(format!("/webhook/googlechat/agents/{agent}"))
@@ -167,7 +167,7 @@ async fn post(app: &Router, agent: &str, bearer: Option<&str>, event: &Value) ->
     resp.status()
 }
 
-fn texts_with_bearer(fake: &Fake, bearer: &str) -> Vec<String> {
+pub(crate) fn texts_with_bearer(fake: &Fake, bearer: &str) -> Vec<String> {
     fake.state
         .calls
         .lock()
@@ -178,7 +178,7 @@ fn texts_with_bearer(fake: &Fake, bearer: &str) -> Vec<String> {
         .collect()
 }
 
-async fn wait_text(fake: &Fake, bearer: &str, needle: &str) -> String {
+pub(crate) async fn wait_text(fake: &Fake, bearer: &str, needle: &str) -> String {
     for _ in 0..150 {
         let all = texts_with_bearer(fake, bearer).join("\n");
         if all.contains(needle) {
@@ -251,11 +251,11 @@ async fn each_app_reaches_only_its_employee_and_wrong_audiences_are_refused() {
     );
     assert_eq!(
         post(&app, "dudu", Some(&chat_jwt("111111111")), &event).await,
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     assert_eq!(
         post(&app, "nobody", Some(&chat_jwt("111111111")), &event).await,
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
@@ -335,7 +335,7 @@ async fn removing_an_app_closes_its_endpoint() {
     let event = message_event("spaces/X", "hi");
     assert_eq!(
         post(&app, "ops", Some(&chat_jwt("333333333")), &event).await,
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     assert!(
         crate::googlechat::send_text_to_space_as(home.path(), Some("ops"), "spaces/X", "x")
