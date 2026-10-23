@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { api, type UserDetail } from '@/lib/api';
@@ -6,26 +6,15 @@ import { toast, formatError } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import type { UserRole } from '@/stores/auth-store';
 import { ROLE_LEVELS } from '@/lib/roles';
-import { ConfirmDialog } from '@/components/settings/controls';
-import {
-  listChannelIdentities,
-  bindChannelIdentity,
-  type ChannelIdentity,
-} from '@/lib/channel-identity-api';
+import { OrgChartView } from './users/OrgChartView';
+import { channelLabel } from './users/dialog-common';
+import { CreateUserDialog, EditUserDialog } from './users/UserFormDialogs';
+import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
+import { OffboardDialog, RemoveUserDialog } from './users/LifecycleDialogs';
+import { listChannelIdentities, type ChannelIdentity } from '@/lib/channel-identity-api';
 import {
   Button,
   Badge,
-  Input,
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
@@ -37,6 +26,7 @@ import {
   ListGridCell,
   ActorAvatar,
   Empty,
+  Segmented,
   type BadgeProps,
 } from '@/components/mds';
 import {
@@ -55,108 +45,7 @@ import {
   Plus,
 } from 'lucide-react';
 
-/** Channels the backend's admin-prefill bind endpoint accepts (mirrors
- * `OTP_CHANNELS` in `server.rs::handle_channel_bind` — keep in sync). */
-const IDENTITY_CHANNELS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: 'telegram', label: 'Telegram' },
-  { value: 'line', label: 'LINE' },
-  { value: 'discord', label: 'Discord' },
-  { value: 'slack', label: 'Slack' },
-];
-
-function channelLabel(value: string): string {
-  return IDENTITY_CHANNELS.find((c) => c.value === value)?.label ?? value;
-}
-
-/** Local option shape shared by the role / access / agent pickers below. */
-interface Option {
-  value: string;
-  label: string;
-}
-
-// Plain-language options paired with the raw enum value that actually gets
-// written to the RPC payload.
-function roleOptions(intl: ReturnType<typeof useIntl>): Option[] {
-  return [
-    { value: 'employee', label: intl.formatMessage({ id: 'users.role.employee' }) },
-    { value: 'manager', label: intl.formatMessage({ id: 'users.role.manager' }) },
-    { value: 'admin', label: intl.formatMessage({ id: 'users.role.admin' }) },
-  ];
-}
-
-function accessOptions(intl: ReturnType<typeof useIntl>): Option[] {
-  return [
-    { value: 'owner', label: intl.formatMessage({ id: 'users.access.owner' }) },
-    { value: 'operator', label: intl.formatMessage({ id: 'users.access.operator' }) },
-    { value: 'viewer', label: intl.formatMessage({ id: 'users.access.viewer' }) },
-  ];
-}
-
-/** Fetch existing department names once (for the create/edit datalist). */
-function useDepartmentNames(): string[] {
-  const [names, setNames] = useState<string[]>([]);
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const res = await api.departments.list();
-        if (alive) setNames((res?.departments ?? []).map((d) => d.name));
-      } catch {
-        /* departments are optional; a free-text department still works */
-      }
-    })();
-    return () => { alive = false; };
-  }, []);
-  return names;
-}
-
-/** A department picker: type-ahead over existing departments, free entry OK.
- *  Empty value = no department (clears on edit). */
-function DepartmentInput({
-  value,
-  onChange,
-  options,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  options: string[];
-}) {
-  const intl = useIntl();
-  return (
-    <>
-      <Input
-        list="dept-options"
-        placeholder={intl.formatMessage({ id: 'users.field.departmentPlaceholder' })}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      />
-      <datalist id="dept-options">
-        {options.map((d) => (
-          <option key={d} value={d} />
-        ))}
-      </datalist>
-    </>
-  );
-}
-
-/** Stacked label + control block used across the user dialogs (spec §5.3). */
-function DialogField({
-  label,
-  help,
-  children,
-}: {
-  label: string;
-  help?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <label className="text-sm font-medium text-foreground">{label}</label>
-      {children}
-      {help && <p className="text-xs text-muted-foreground">{help}</p>}
-    </div>
-  );
-}
+type UsersView = 'list' | 'org';
 
 function roleBadgeProps(role: string): { variant: BadgeProps['variant']; className?: string } {
   if (role === 'admin') return { variant: 'destructive' };
@@ -194,6 +83,8 @@ export function UsersPage() {
   // failed; a missing key means "not fetched yet".
   const [identities, setIdentities] = useState<Record<string, ChannelIdentity[] | 'error'>>({});
   const [showIdentityBind, setShowIdentityBind] = useState<string | null>(null);
+  const [view, setView] = useState<UsersView>('list');
+  const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -263,12 +154,26 @@ export function UsersPage() {
         </div>
       )}
 
+      {!loading && users.length > 0 && (
+        <Segmented<UsersView>
+          value={view}
+          onValueChange={setView}
+          aria-label={intl.formatMessage({ id: 'users.view.label' })}
+          options={[
+            { value: 'list', label: intl.formatMessage({ id: 'users.view.list' }) },
+            { value: 'org', label: intl.formatMessage({ id: 'users.view.org' }) },
+          ]}
+        />
+      )}
+
       {loading ? (
         <div className="flex items-center justify-center py-16">
           <Loader2 className="size-6 animate-spin text-muted-foreground" />
         </div>
       ) : users.length === 0 ? (
         <Empty icon={Users} title={intl.formatMessage({ id: 'users.title' })} />
+      ) : view === 'org' ? (
+        <OrgChartView users={users} onEdit={setShowEdit} />
       ) : (
         <div className="overflow-hidden rounded-xl border border-surface-border">
           <ListGridContainer
@@ -302,6 +207,11 @@ export function UsersPage() {
                     {user.department && (
                       <span className="truncate text-xs text-muted-foreground">
                         {intl.formatMessage({ id: 'users.dept.prefix' })}{user.department}
+                      </span>
+                    )}
+                    {nameOf(user.manager_user_id) && (
+                      <span className="truncate text-xs text-muted-foreground">
+                        {intl.formatMessage({ id: 'users.manager.prefix' })}{nameOf(user.manager_user_id)}
                       </span>
                     )}
                   </ListGridCell>
@@ -423,6 +333,7 @@ export function UsersPage() {
       {/* Create User Dialog */}
       {showCreate && (
         <CreateUserDialog
+          users={users}
           onClose={() => setShowCreate(false)}
           onCreated={() => {
             setShowCreate(false);
@@ -435,6 +346,7 @@ export function UsersPage() {
       {showEdit && (
         <EditUserDialog
           user={showEdit}
+          users={users}
           onClose={() => setShowEdit(null)}
           onUpdated={() => {
             setShowEdit(null);
@@ -505,581 +417,5 @@ export function UsersPage() {
         />
       )}
     </div>
-  );
-}
-
-// ── UI.1 — delete-user confirm dialog ──
-
-function RemoveUserDialog({
-  user,
-  onClose,
-  onRemoved,
-}: {
-  user: UserDetail;
-  onClose: () => void;
-  onRemoved: () => void;
-}) {
-  const intl = useIntl();
-  const [submitting, setSubmitting] = useState(false);
-
-  const handleConfirm = async () => {
-    setSubmitting(true);
-    try {
-      await api.users.remove(user.id);
-      toast.success(intl.formatMessage({ id: 'users.removed' }));
-      onRemoved();
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <ConfirmDialog
-      open
-      onClose={onClose}
-      onConfirm={handleConfirm}
-      title={intl.formatMessage({ id: 'users.action.remove' })}
-      message={intl.formatMessage({ id: 'users.remove.confirm' }, { name: user.display_name })}
-      confirmLabel={intl.formatMessage({ id: 'common.delete' })}
-      requireText={user.display_name}
-      requireTextHint={intl.formatMessage({ id: 'users.remove.requireHint' })}
-      busy={submitting}
-    />
-  );
-}
-
-// ── Sub-dialogs ──────────────────────────────────────────────
-
-function CreateUserDialog({
-  onClose,
-  onCreated,
-}: {
-  onClose: () => void;
-  onCreated: () => void;
-}) {
-  const intl = useIntl();
-  const [email, setEmail] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [password, setPassword] = useState('');
-  const [userRole, setUserRole] = useState('employee');
-  const [department, setDepartment] = useState('');
-  const [error, setError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const deptOptions = useDepartmentNames();
-  const roles = roleOptions(intl);
-
-  const handleSubmit = async () => {
-    setError('');
-    // Frontend validation (MEDIUM-1 fix). Do NOT require a dotted domain: the
-    // seed admin account is `admin@local` and internal hostnames like
-    // `manager.test@local` are legitimate (Bug#6). Match the backend's lenient
-    // rule — a non-empty local part, an `@`, and a non-empty domain.
-    if (!/^[^\s@]+@[^\s@]+$/.test(email)) {
-      setError(intl.formatMessage({ id: 'users.error.invalidEmail' }));
-      return;
-    }
-    if (password.length < 8) {
-      setError(intl.formatMessage({ id: 'users.error.passwordTooShort' }));
-      return;
-    }
-    setSubmitting(true);
-    try {
-      await api.users.create({
-        email, display_name: displayName, password, role: userRole,
-        ...(department.trim() ? { department: department.trim() } : {}),
-      });
-      onCreated();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create user');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'users.create' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          {error && (
-            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
-          )}
-          <DialogField label={intl.formatMessage({ id: 'users.field.email' })}>
-            <Input
-              type="email"
-              placeholder={intl.formatMessage({ id: 'users.field.email' })}
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-          </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.field.display_name' })}>
-            <Input
-              placeholder={intl.formatMessage({ id: 'users.field.display_name' })}
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-            />
-          </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.field.password' })}>
-            <Input
-              type="password"
-              placeholder={intl.formatMessage({ id: 'users.field.password' })}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.col.role' })}>
-            <Select value={userRole} onValueChange={(v) => setUserRole(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>{roles.find((r) => r.value === userRole)?.label}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {roles.map((r) => (
-                  <SelectItem key={r.value} value={r.value}>{r.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </DialogField>
-          <DialogField
-            label={intl.formatMessage({ id: 'users.field.department' })}
-            help={intl.formatMessage({ id: 'users.field.departmentHint' })}
-          >
-            <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
-          </DialogField>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button
-            variant="brand"
-            onClick={handleSubmit}
-            disabled={submitting || !email || !displayName || !password}
-          >
-            {intl.formatMessage({ id: 'common.create' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function EditUserDialog({
-  user,
-  onClose,
-  onUpdated,
-}: {
-  user: UserDetail;
-  onClose: () => void;
-  onUpdated: () => void;
-}) {
-  const intl = useIntl();
-  const [displayName, setDisplayName] = useState(user.display_name);
-  const [userRole, setUserRole] = useState<string>(user.role);
-  const [department, setDepartment] = useState(user.department ?? '');
-  const [newPassword, setNewPassword] = useState('');
-  const [error, setError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const deptOptions = useDepartmentNames();
-  const roles = roleOptions(intl);
-
-  const handleSubmit = async () => {
-    setError('');
-    // Match CreateUserDialog's client-side rule so the user gets a clear
-    // message instead of an opaque backend rejection.
-    if (newPassword && newPassword.length < 8) {
-      setError(intl.formatMessage({ id: 'users.error.passwordTooShort' }));
-      return;
-    }
-    setSubmitting(true);
-    try {
-      // Send department only when it changed. An empty string clears it.
-      const deptChanged = department.trim() !== (user.department ?? '').trim();
-      await api.users.update({
-        user_id: user.id,
-        display_name: displayName !== user.display_name ? displayName : undefined,
-        role: userRole !== user.role ? userRole : undefined,
-        password: newPassword || undefined,
-        ...(deptChanged ? { department: department.trim() } : {}),
-      });
-      onUpdated();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'users.action.edit' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          {error && (
-            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
-          )}
-          <DialogField label={intl.formatMessage({ id: 'users.field.display_name' })}>
-            <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
-          </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.col.role' })}>
-            <Select value={userRole} onValueChange={(v) => setUserRole(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>{roles.find((r) => r.value === userRole)?.label}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {roles.map((r) => (
-                  <SelectItem key={r.value} value={r.value}>{r.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </DialogField>
-          <DialogField
-            label={intl.formatMessage({ id: 'users.field.department' })}
-            help={intl.formatMessage({ id: 'users.field.departmentHint' })}
-          >
-            <DepartmentInput value={department} onChange={setDepartment} options={deptOptions} />
-          </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.field.new_password' })}>
-            <Input
-              type="password"
-              placeholder={intl.formatMessage({ id: 'users.field.new_password' })}
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-            />
-          </DialogField>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="brand" onClick={handleSubmit} disabled={submitting}>
-            {intl.formatMessage({ id: 'common.save' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function BindAgentDialog({
-  userId,
-  boundAgents,
-  onClose,
-  onBound,
-}: {
-  userId: string;
-  /** Agent names this user is already bound to — excluded from the picker. */
-  boundAgents: string[];
-  onClose: () => void;
-  onBound: () => void;
-}) {
-  const intl = useIntl();
-  const [agentName, setAgentName] = useState('');
-  const [accessLevel, setAccessLevel] = useState('owner');
-  const [agentOptions, setAgentOptions] = useState<Option[] | null>(null);
-  const [error, setError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const accesses = accessOptions(intl);
-
-  useEffect(() => {
-    let cancelled = false;
-    api.agents
-      .list()
-      .then(({ agents }) => {
-        if (cancelled) return;
-        const options = agents
-          .filter((a) => !boundAgents.includes(a.name))
-          .map((a) => ({
-            value: a.name,
-            label: a.display_name && a.display_name !== a.name ? `${a.display_name} · ${a.name}` : a.name,
-          }));
-        setAgentOptions(options);
-        setAgentName((prev) => prev || options[0]?.value || '');
-      })
-      .catch(() => {
-        // Roster fetch failed — fall back to the free-text input below.
-        if (!cancelled) setAgentOptions(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // boundAgents is derived fresh from the parent each open; the dialog
-    // remounts per open so a one-shot fetch is enough.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const handleSubmit = async () => {
-    setError('');
-    setSubmitting(true);
-    try {
-      await api.users.bindAgent(userId, agentName, accessLevel);
-      onBound();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'users.action.bind' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          <p className="text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'users.action.bind.explain' })}
-          </p>
-          {error && (
-            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
-          )}
-          <DialogField label={intl.formatMessage({ id: 'users.field.agent_name' })}>
-            {agentOptions && agentOptions.length > 0 ? (
-              <Select value={agentName} onValueChange={(v) => setAgentName(String(v))}>
-                <SelectTrigger className="w-full">
-                  <SelectValue>{agentOptions.find((o) => o.value === agentName)?.label ?? agentName}</SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {agentOptions.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ) : agentOptions && agentOptions.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                {intl.formatMessage({ id: 'users.bind.none_available' })}
-              </p>
-            ) : (
-              <Input
-                placeholder={intl.formatMessage({ id: 'users.field.agent_name' })}
-                value={agentName}
-                onChange={(e) => setAgentName(e.target.value)}
-              />
-            )}
-          </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.action.bind.accessLevel' })}>
-            <Select value={accessLevel} onValueChange={(v) => setAccessLevel(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>{accesses.find((a) => a.value === accessLevel)?.label}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {accesses.map((a) => (
-                  <SelectItem key={a.value} value={a.value}>{a.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </DialogField>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !agentName}>
-            {intl.formatMessage({ id: 'users.action.bind' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-// ── WP-B (2026-08-12 IA audit §2-1) — 驗證身分 ──────────────────
-//
-// The third of three unrelated "binding" concepts in the dashboard:
-// dashboard user ↔ channel DM identity (`channel_identities` table). This is
-// the data `approver_links`/`mapped_role` actually read for channel-side
-// approvals (`decision_notify.rs`) — previously had a ready backend
-// (`verified_channels_for_user`, `POST /api/channel-identity/bind`) but zero
-// dashboard surface, so an admin who only did "授權存取" (§ user↔agent) and
-// "路由訊息" (§ agent↔channel) would reasonably assume channel approvals were
-// already wired up. They were not — this dialog closes that gap.
-function BindChannelIdentityDialog({
-  userId,
-  onClose,
-  onBound,
-}: {
-  userId: string;
-  onClose: () => void;
-  onBound: () => void;
-}) {
-  const intl = useIntl();
-  const [channel, setChannel] = useState(IDENTITY_CHANNELS[0].value);
-  const [channelUserId, setChannelUserId] = useState('');
-  const [error, setError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-
-  const handleSubmit = async () => {
-    const trimmed = channelUserId.trim();
-    if (!trimmed) return;
-    setError('');
-    setSubmitting(true);
-    try {
-      await bindChannelIdentity(userId, channel, trimmed);
-      onBound();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const howToId = `users.channelIdentity.howTo.${channel}`;
-
-  return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'users.channelIdentity.add' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          <p className="text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'users.channelIdentity.explain' })}
-          </p>
-          {error && (
-            <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
-          )}
-          <DialogField label={intl.formatMessage({ id: 'users.channelIdentity.channel' })}>
-            <Select value={channel} onValueChange={(v) => setChannel(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>{IDENTITY_CHANNELS.find((c) => c.value === channel)?.label}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {IDENTITY_CHANNELS.map((c) => (
-                  <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </DialogField>
-          <DialogField
-            label={intl.formatMessage({ id: 'users.channelIdentity.channelUserId' })}
-            help={intl.formatMessage({ id: howToId })}
-          >
-            <Input
-              value={channelUserId}
-              onChange={(e) => setChannelUserId(e.target.value)}
-              placeholder={intl.formatMessage({ id: 'users.channelIdentity.channelUserIdPlaceholder' })}
-            />
-          </DialogField>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !channelUserId.trim()}>
-            {intl.formatMessage({ id: 'users.channelIdentity.add' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function OffboardDialog({
-  user,
-  users,
-  onClose,
-  onOffboarded,
-}: {
-  user: UserDetail;
-  users: UserDetail[];
-  onClose: () => void;
-  onOffboarded: () => void;
-}) {
-  const intl = useIntl();
-  const [transferTo, setTransferTo] = useState('');
-  const [confirming, setConfirming] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-
-  const handleConfirm = async () => {
-    setSubmitting(true);
-    try {
-      await api.users.offboard(user.id, transferTo || undefined);
-      onOffboarded();
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
-      setSubmitting(false);
-    }
-  };
-
-  const hasBindings = user.bindings.length > 0;
-
-  // No AI staff to reassign (or transferee already chosen) → route the
-  // destructive step through the shared ConfirmDialog. Payload is unchanged:
-  // offboard(user.id, transferTo || undefined).
-  if (!hasBindings || confirming) {
-    return (
-      <ConfirmDialog
-        open
-        onClose={hasBindings ? () => setConfirming(false) : onClose}
-        onConfirm={handleConfirm}
-        title={intl.formatMessage({ id: 'users.action.offboard' })}
-        message={intl.formatMessage({ id: 'users.offboard.confirm' }, { name: user.display_name })}
-        confirmLabel={intl.formatMessage({ id: 'users.action.offboard' })}
-        busy={submitting}
-      />
-    );
-  }
-
-  // Bindings present → pick a transferee first (preserves the transferTo field),
-  // then hand off to ConfirmDialog above.
-  const transferOptions: Option[] = [
-    { value: '', label: intl.formatMessage({ id: 'users.offboard.no_transfer' }) },
-    ...users.map((u) => ({ value: u.id, label: `${u.display_name} (${u.email})` })),
-  ];
-
-  return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'users.action.offboard' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            {intl.formatMessage({ id: 'users.offboard.confirm' }, { name: user.display_name })}
-          </p>
-          <div>
-            <p className="text-sm font-medium text-foreground">
-              {intl.formatMessage({ id: 'users.offboard.agents' })}
-            </p>
-            <div className="mt-1 flex flex-wrap gap-1">
-              {user.bindings.map((b) => (
-                <span
-                  key={b.agent_name}
-                  className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-                >
-                  <ActorAvatar actorType="agent" name={b.agent_name} size="xs" />
-                  {b.agent_name}
-                </span>
-              ))}
-            </div>
-          </div>
-          <DialogField label={intl.formatMessage({ id: 'users.offboard.transfer' })}>
-            <Select value={transferTo} onValueChange={(v) => setTransferTo(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>{transferOptions.find((o) => o.value === transferTo)?.label}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {transferOptions.map((o) => (
-                  <SelectItem key={o.value || 'none'} value={o.value}>{o.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </DialogField>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="destructive" onClick={() => setConfirming(true)}>
-            {intl.formatMessage({ id: 'users.action.offboard' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }

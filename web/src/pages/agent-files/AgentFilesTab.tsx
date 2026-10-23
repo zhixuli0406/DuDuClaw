@@ -22,7 +22,8 @@ import { DiffView } from '@/components/agent-files/DiffView';
 import { DriftBanner } from '@/components/agent-files/DriftBanner';
 import { HistoryDrawer } from '@/components/agent-files/HistoryDrawer';
 import { UnsavedChangesDialog } from '@/components/agent-files/UnsavedChangesDialog';
-import { agentFileLabel, agentFileName, isSkillKey } from '@/components/agent-files/review-text';
+import { RuntimeFilesSection } from '@/components/agent-files/RuntimeFilesSection';
+import { agentFileHeading, agentFileLabel, agentFileName, isSkillKey } from '@/components/agent-files/review-text';
 import { AgentFileList } from './AgentFileList';
 import { useAgentFileSave, type SentChange } from './useAgentFileSave';
 
@@ -215,6 +216,14 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
     }
   };
 
+  // INSTRUCTIONS.md does not exist on a fresh employee: creating it is an
+  // ordinary save of a first text (same check, history and approval path).
+  const startCreateInstructions = () => {
+    setDraft(t('agentFiles.instructions.template'));
+    setPreview(null);
+    setMode('edit');
+  };
+
   const confirmLeave = () => {
     const to = leaveTo;
     setLeaveTo(null);
@@ -235,6 +244,8 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
   }
 
   const label = agentFileLabel(intl, selected);
+  const heading = agentFileHeading(intl, selected);
+  const missingInstructions = selected === 'instructions' && doc !== null && !doc.exists && mode === 'view' && !conflict;
 
   return (
     <div className="grid gap-4 md:grid-cols-[16rem_1fr]" data-testid="agent-files-tab">
@@ -243,7 +254,7 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
       <section aria-label={label} className="min-w-0 space-y-3">
         <header className="flex flex-wrap items-start justify-between gap-2">
           <div className="min-w-0">
-            <h2 className="text-base font-semibold text-foreground">{label}</h2>
+            <h2 className="text-base font-semibold text-foreground">{heading}</h2>
             <p className="truncate font-mono text-[11px] text-muted-foreground">{agentFileName(selected)}</p>
           </div>
           {mode === 'view' && doc && (
@@ -254,7 +265,7 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
                   {t('agentFiles.editor.history')}
                 </Button>
               )}
-              {editable && (
+              {editable && !missingInstructions && (
                 <Button variant="brand" size="sm" onClick={startEdit}>
                   <Pencil aria-hidden="true" />
                   {t('agentFiles.editor.edit')}
@@ -263,6 +274,12 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
             </div>
           )}
         </header>
+
+        {selected === 'instructions' && (
+          <p className="text-sm text-muted-foreground" data-testid="instructions-help">
+            {t('agentFiles.help.instructions')}
+          </p>
+        )}
 
         {selected === 'agent_toml' ? (
           <p className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
@@ -306,6 +323,23 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
           </p>
         ) : conflict ? (
           <ConflictView mine={conflict.mine} current={conflict.current} onReload={backToView} />
+        ) : missingInstructions ? (
+          <div className="space-y-2" data-testid="instructions-missing">
+            <Empty
+              icon={FileText}
+              title={t(editable ? 'agentFiles.instructions.createHint' : 'agentFiles.instructions.createViewOnly')}
+              variant="dashed"
+              className="py-8"
+            />
+            {editable && (
+              <div className="flex justify-center">
+                <Button variant="brand" onClick={startCreateInstructions}>
+                  <Pencil aria-hidden="true" />
+                  {t('agentFiles.instructions.create')}
+                </Button>
+              </div>
+            )}
+          </div>
         ) : mode === 'view' ? (
           doc.content === '' ? (
             <Empty icon={FileText} title={t('agentFiles.editor.empty')} variant="dashed" className="py-8" />
@@ -356,6 +390,10 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
           </div>
         )}
       </section>
+
+      <div className="md:col-span-2">
+        <RuntimeFilesSection agentId={agentId} />
+      </div>
 
       <ChangeReviewDialog
         state={save.review}

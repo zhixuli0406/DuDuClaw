@@ -28,6 +28,7 @@ impl MethodHandler {
                     { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
                     { "name": "agent_files.list", "description": "List an AI employee's profile files (persona, introduction, work rules, boundaries, basic settings)" },
                     { "name": "agent_files.get", "description": "Read one profile file or a kept version" },
+                    { "name": "agent_files.runtime_files", "description": "Read-only view of the context files generated for the employee's CLI (CLAUDE.md, AGENTS.md)" },
                     { "name": "agent_files.diff", "description": "Line diff of a proposed change or a kept version" },
                     { "name": "agent_files.history", "description": "Kept versions of one profile file" },
                     { "name": "agent_files.save", "description": "Check and save a profile file (rules + AI review; owner or admin)" },

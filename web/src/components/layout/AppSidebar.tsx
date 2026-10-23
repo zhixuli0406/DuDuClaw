@@ -515,6 +515,7 @@ export function AppSidebar() {
   const workItems = filterVisible(navGroups[0].items, user?.role, isPersonal, ctx);
   const companyItems = filterVisible(navGroups[1].items, user?.role, isPersonal, ctx);
   const settingsItems = filterVisible(navGroups[2].items, user?.role, isPersonal, ctx);
+  const orgItems = filterVisible(navGroups[3].items, user?.role, isPersonal, ctx);
   // The daily row is shared by both editions; Personal adds a second flat row
   // BELOW the 對話紀錄 zone so the zone lands where 對話 used to sit.
   const dailyRow = filterVisible(dailyItems, user?.role, isPersonal, ctx);
@@ -627,6 +628,17 @@ export function AppSidebar() {
               collapsed={collapsed}
               sectionCollapsed={isSectionCollapsed(navGroups[1].label)}
               onToggle={() => toggleSection(navGroups[1].label)}
+            />
+
+            {/* 組織 (1.76.0) — people-side pages; empty (and hidden) for an
+                Employee, since every row is manager+. */}
+            <NavGroupSection
+              label={navGroups[3].label}
+              items={orgItems}
+              badgeFor={badgeFor}
+              collapsed={collapsed}
+              sectionCollapsed={isSectionCollapsed(navGroups[3].label)}
+              onToggle={() => toggleSection(navGroups[3].label)}
             />
           </>
         )}

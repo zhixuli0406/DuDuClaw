@@ -20,6 +20,7 @@ fn enterprise_surfaces_are_listed() {
         "users.unbind_agent",
         "users.offboard",
         "users.subordinates",
+        "users.my_team",
         "users.audit_log",
         // 部門
         "departments.list",
@@ -61,6 +62,7 @@ fn personal_surfaces_are_untouched() {
         // 設定檔編輯 (agent_files.*) — a Personal owner edits their own employees too
         "agent_files.list",
         "agent_files.get",
+        "agent_files.runtime_files",
         "agent_files.diff",
         "agent_files.history",
         "agent_files.save",
