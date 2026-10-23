@@ -52,6 +52,21 @@ pub fn opaque_data_key_available(home: &Path) -> bool {
     opaque_data_key(home).is_some()
 }
 
+/// A purpose-separated, gateway-bound signing key. Read-only lookup keeps
+/// a missing/invalid machine key fail-closed instead of replacing it.
+pub(crate) fn watch_link_key(home: &Path) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    use ring::hkdf;
+    let master = opaque_data_key(home).ok_or("watch link key unavailable")?;
+    let namespace = std::fs::canonicalize(home).map_err(|_| "watch link key unavailable")?;
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"duduclaw/context-signing");
+    let prk = salt.extract(master.as_ref());
+    let info = [b"computer-watch-link/v1".as_slice(), b"\0", namespace.as_os_str().as_encoded_bytes()];
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    prk.expand(&info, hkdf::HKDF_SHA256).map_err(|_| "watch link key unavailable")?
+        .fill(key.as_mut()).map_err(|_| "watch link key unavailable")?;
+    Ok(key)
+}
+
 // Keychain secrets are text. Accept an explicit hex/base64 encoding of the
 // existing 32-byte machine key, or exactly 32 UTF-8 bytes; never derive a new
 // key or fall back to a different key when a stored entry is malformed.
