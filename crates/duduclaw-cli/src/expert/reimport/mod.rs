@@ -38,6 +38,7 @@ use super::{InstallRecord, read_record};
 use baseline::{ChangeKind, FileChange};
 
 pub(crate) use retire::{RetireLog, finish, rollback, withdraw_pending};
+pub(crate) use duduclaw_gateway::expert_replace_journal::{RecoverScope, recover_interrupted};
 
 /// What the operator asked for when the import already exists.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,12 +70,10 @@ pub struct ReplaceTarget {
 }
 
 /// Replace bookkeeping of one run: the backup made once the new version's
-/// checks passed, and every path the new version started writing.
+/// checks passed (its journal notes every path the new version writes).
 #[derive(Debug, Default)]
 pub struct ReplaceState {
     pub retired: Option<RetireLog>,
-    pub written_agents: Vec<String>,
-    pub written_paths: Vec<std::path::PathBuf>,
 }
 
 /// Per-employee changes since the import (what a replace would move away).
@@ -350,18 +349,17 @@ impl crate::expert::install::InstallCtx {
     /// The new version is about to create employee `id` (a failed replace
     /// moves it aside and drops its org entry).
     pub fn note_agent(&self, id: &str) {
-        if self.replace.is_some() && !self.dry_run {
-            let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
-            state.written_agents.push(id.to_string());
-            state.written_paths.push(self.home.join("agents").join(id));
+        let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(log) = state.retired.as_mut() {
+            log.note_agent(id);
         }
     }
 
     /// The new version is about to create `path` (a skill, a knowledge page).
     pub fn note_path(&self, path: &Path) {
-        if self.replace.is_some() && !self.dry_run {
-            let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
-            state.written_paths.push(path.to_path_buf());
+        let mut state = self.replace_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(log) = state.retired.as_mut() {
+            log.note_path(path);
         }
     }
 

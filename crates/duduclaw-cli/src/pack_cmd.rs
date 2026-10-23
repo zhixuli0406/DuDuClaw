@@ -220,6 +220,8 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
         extract_root: Some(resolved.dir.clone()),
         #[cfg(test)]
         fail_after_dispatch: false,
+        #[cfg(test)]
+        abandon_after_dispatch: false,
     };
 
     match load_pack_dir(&root) {

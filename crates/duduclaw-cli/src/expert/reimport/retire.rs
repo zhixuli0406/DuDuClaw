@@ -1,42 +1,37 @@
 //! Moving an earlier import out of the way before its replacement installs,
 //! and moving it back when the replacement fails.
 //!
-//! Everything is a `rename` inside the home (one file system), recorded in
-//! order, so a rollback is the same list reversed. Nothing is deleted:
-//! what a failed replacement already wrote is moved into the backup's
-//! `failed-new/` (same layout as the home). The org entries of the
-//! employees moved away are kept, and put back on a rollback.
+//! Everything is a `rename` inside the home (one file system). Before the
+//! first move a journal is written (`duduclaw_gateway::expert_replace_journal`):
+//! the planned moves, the org entries of the employees moved, and every
+//! path the new version then starts creating. A rollback here and the
+//! recovery of a replace that was stopped half way (gateway start, next
+//! import) both undo from that journal. Nothing is deleted: what a failed
+//! replacement already wrote is moved into the backup's `failed-new/`.
 
-use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::json;
 
 use duduclaw_core::agent_trash::AGENT_TRASH_DIR;
 use duduclaw_core::error::Result;
+use duduclaw_core::org_store;
+use duduclaw_gateway::expert_replace_journal::{self as journal, REPLACED_DIR, ReplaceJournal};
 
 use super::ReplaceTarget;
-use crate::expert::import_error::import_err;
-use super::ReplaceState;
 use crate::expert::experts_dir;
-use duduclaw_core::org_store::{self, OrgEntry};
+use crate::expert::import_error::import_err;
 
-/// Where the non-employee parts of a replaced import are kept.
-pub const REPLACED_DIR: &str = "_replaced";
+pub(crate) use journal::withdraw_pending;
 
-/// The moves made by [`retire`], in order.
-#[derive(Debug, Default)]
+/// A replace in progress: its journal (kept on disk) and what moved.
+#[derive(Debug)]
 pub struct RetireLog {
     home: PathBuf,
-    slug: String,
-    moves: Vec<(PathBuf, PathBuf)>,
-    /// Org entries of the moved employees before anything changed
-    /// (`None`: there was none).
-    org_before: Vec<(String, Option<OrgEntry>)>,
+    pub(crate) journal: ReplaceJournal,
     /// Employee ids that were moved to the trash.
     pub agents: Vec<String>,
-    /// `experts/_replaced/<slug>_<stamp>` (may not exist when only
-    /// employees moved).
+    /// `experts/_replaced/<slug>_<stamp>`.
     pub backup: PathBuf,
 }
 
@@ -46,132 +41,89 @@ impl RetireLog {
         self.backup.join("record")
     }
 
-    /// Where a failed replacement's own record went on rollback.
-    pub fn failed_record(&self) -> PathBuf {
-        self.aside_path(&experts_dir(&self.home).join(&self.slug))
+    /// The new version is about to create employee `id`.
+    pub fn note_agent(&mut self, id: &str) {
+        self.journal.note_agent(&self.home, id);
+        self.save();
     }
 
-    fn aside_path(&self, p: &Path) -> PathBuf {
-        let rel = p.strip_prefix(&self.home).unwrap_or(p);
-        let rel: PathBuf = rel.components().filter(|c| matches!(c, Component::Normal(_))).collect();
-        self.backup.join("failed-new").join(rel)
+    /// The new version is about to create `path` (appended to the
+    /// journal's sidecar, not a full rewrite).
+    pub fn note_path(&mut self, path: &Path) {
+        if let Err(e) = self.journal.append_written(&self.home, path) {
+            eprintln!("  ⚠ 取代紀錄（journal）更新失敗：{e}");
+        }
+    }
+
+    fn save(&self) {
+        if let Err(e) = self.journal.save(&self.home) {
+            eprintln!("  ⚠ 取代紀錄（journal）更新失敗：{e}");
+        }
+    }
+
+    /// The replace is over (installed, or rolled back).
+    pub fn close(&self) {
+        self.journal.remove(&self.home);
     }
 }
 
-/// Move the earlier import of `target` out of the way. On any failure the
-/// moves already made are undone and the error says so.
+/// Move the earlier import of `target` out of the way. The journal is
+/// written before anything moves; on any failure what moved is put back.
 pub fn retire(home: &Path, target: &ReplaceTarget) -> Result<RetireLog> {
     let slug = &target.slug;
     let now = chrono::Utc::now();
     let stamp = now.format("%Y%m%d%H%M%S").to_string();
-    let org = org_store::load(home);
     // A fresh folder even when an earlier replace (or a failed one) used
     // the same second.
     let replaced = experts_dir(home).join(REPLACED_DIR);
     let backup = std::iter::once(format!("{slug}_{stamp}"))
         .chain((2..100).map(|n| format!("{slug}_{stamp}-{n}")))
         .map(|name| replaced.join(name))
-        .find(|p| p.symlink_metadata().is_err())
+        .find(|p| p.symlink_metadata().is_err() && !ReplaceJournal::new(home, slug, p).path(home).exists())
         .ok_or_else(|| import_err("import.replace_failed", json!({ "slug": slug }), "備份資料夾名稱已用完，請稍後再試"))?;
-    let mut log = RetireLog {
-        home: home.to_path_buf(),
-        slug: slug.clone(),
-        backup,
-        org_before: target.agents.iter().map(|id| (id.clone(), org.get(id).cloned())).collect(),
-        ..Default::default()
-    };
-    match plan_moves(home, target, now, &log.backup) {
-        Ok(moves) => {
-            for (from, to, agent) in moves {
-                if let Err(e) = move_path(&from, &to) {
-                    rollback(&log, &ReplaceState::default());
-                    return Err(import_err(
-                        "import.replace_failed",
-                        json!({ "slug": slug }),
-                        format!("無法把之前的版本移到備份（{}）：{e}；已還原，什麼都沒改", from.display()),
-                    ));
-                }
-                if let Some(id) = agent {
-                    log.agents.push(id);
-                }
-                log.moves.push((from, to));
-            }
-            Ok(log)
-        }
-        Err(msg) => Err(import_err("import.replace_failed", json!({ "slug": slug }), msg)),
-    }
-}
+    let failed = |msg: String| import_err("import.replace_failed", json!({ "slug": slug }), msg);
 
-/// Undo [`retire`] after the replacement failed. First everything the
-/// replacement wrote (`state`) is moved into `<backup>/failed-new/`, then
-/// every move is reversed (newest first), then the org entries of the
-/// employees involved are put back as they were. Best effort — a failed
-/// step is printed so the operator can finish it by hand.
-pub fn rollback(log: &RetireLog, state: &ReplaceState) {
-    let originals: BTreeSet<&PathBuf> = log.moves.iter().map(|(from, _)| from).collect();
-    for p in state.written_paths.iter().rev() {
-        if !originals.contains(p) && p.symlink_metadata().is_ok() {
-            move_aside(log, p);
-        }
+    let moves = plan_moves(home, target, now, &backup).map_err(failed)?;
+    let mut j = ReplaceJournal::new(home, slug, &backup);
+    let org = org_store::load(home);
+    for id in &target.agents {
+        j.keep_org(id, org.get(id));
     }
-    for (from, to) in log.moves.iter().rev() {
-        if from.symlink_metadata().is_ok() && !move_aside(log, from) {
-            continue;
-        }
-        if let Err(e) = std::fs::rename(to, from) {
-            eprintln!(
-                "  ✗ 還原失敗：{} → {}：{e}（請手動搬回）",
-                to.display(),
+    for (from, to, _) in &moves {
+        j.plan_move(home, from, to);
+    }
+    // The new version writes these whether or not the earlier one had them.
+    j.note_path(home, &home.join("imported").join(slug));
+    j.note_path(home, &experts_dir(home).join(slug));
+    j.save(home)
+        .map_err(|e| failed(format!("無法寫入取代紀錄（journal）：{e}；什麼都沒改")))?;
+
+    let mut log = RetireLog { home: home.to_path_buf(), journal: j, agents: Vec::new(), backup };
+    for (from, to, agent) in moves {
+        if let Err(e) = move_path(&from, &to) {
+            rollback(&log);
+            return Err(failed(format!(
+                "無法把之前的版本移到備份（{}）：{e}；已還原，什麼都沒改",
                 from.display()
-            );
+            )));
+        }
+        if let Some(id) = agent {
+            log.agents.push(id);
         }
     }
-    restore_org(log, &state.written_agents);
-    // Only removes the backup folder when nothing is left in it.
-    for sub in ["skills", "wiki", ""] {
-        let _ = std::fs::remove_dir(log.backup.join(sub));
-    }
+    Ok(log)
 }
 
-fn move_aside(log: &RetireLog, p: &Path) -> bool {
-    let mut aside = log.aside_path(p);
-    let mut n = 2;
-    while aside.symlink_metadata().is_ok() {
-        aside.set_file_name(format!(
-            "{}-{n}",
-            p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
-        ));
-        n += 1;
+/// Undo the replace after the new version failed (see
+/// [`journal::undo`]), print what could not be undone, close the journal.
+/// Returns where the new version's record folder went (its approvals).
+pub fn rollback(log: &RetireLog) -> Option<PathBuf> {
+    let out = journal::undo(&log.home, &log.journal);
+    for f in &out.failures {
+        eprintln!("  ✗ 還原失敗：{f}（請手動處理）");
     }
-    match move_path(p, &aside) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("  ✗ 還原失敗：{} 無法移開：{e}（請手動處理）", p.display());
-            false
-        }
-    }
-}
-
-/// The org entries as they were before the replace: earlier employees get
-/// theirs back; employees only the failed replacement created lose theirs.
-fn restore_org(log: &RetireLog, written: &[String]) {
-    for (id, before) in &log.org_before {
-        let res = match before {
-            Some(entry) => org_store::upsert(&log.home, id, entry.clone()).map(|_| ()),
-            None => org_store::remove(&log.home, id).map(|_| ()),
-        };
-        if let Err(e) = res {
-            eprintln!("  ✗ 組織資料還原失敗（{id}）：{e}（請手動檢查 org.toml）");
-        }
-    }
-    for id in written {
-        if log.org_before.iter().any(|(old, _)| old == id) || !crate::is_valid_agent_id(id) {
-            continue;
-        }
-        if let Err(e) = org_store::remove(&log.home, id) {
-            eprintln!("  ✗ 組織資料還原失敗（{id}）：{e}（請手動檢查 org.toml）");
-        }
-    }
+    log.close();
+    out.failed_record
 }
 
 type PlannedMove = (PathBuf, PathBuf, Option<String>);
@@ -252,37 +204,4 @@ pub fn finish(home: &Path, log: &RetireLog, new_agents: &[String]) {
             eprintln!("  ⚠ 組織資料移除失敗（{id}）：{e}");
         }
     }
-}
-
-/// Withdraw the approvals still pending for an import that is out of use
-/// (its record folder is `record_dir`): the skills and hooks requests it
-/// filed. A request already decided is left as it is. Returns how many
-/// were withdrawn.
-pub async fn withdraw_pending(home: &Path, record_dir: &Path, reason: &str) -> usize {
-    let ids: Vec<String> = ["skills-state.json", "hooks-state.json"]
-        .iter()
-        .filter_map(|f| std::fs::read_to_string(record_dir.join(f)).ok())
-        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter_map(|v| v.get("approval_id").and_then(|i| i.as_str()).map(str::to_string))
-        .filter(|id| !id.is_empty())
-        .collect();
-    if ids.is_empty() {
-        return 0;
-    }
-    let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("  ⚠ 無法撤回舊的審核單（{e}），請到「待辦」手動拒絕");
-            return 0;
-        }
-    };
-    let mut n = 0;
-    for id in ids {
-        match broker.withdraw(&duduclaw_gateway::approval::ApprovalId::from(id.clone()), reason).await {
-            Ok(true) => n += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("  ⚠ 撤回審核單 {id} 失敗：{e}"),
-        }
-    }
-    n
 }

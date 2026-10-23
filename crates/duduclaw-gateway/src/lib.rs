@@ -199,6 +199,7 @@ pub mod email;
 pub mod ephemeral;
 pub mod events_store;
 pub mod expert_admin;
+pub mod expert_replace_journal;
 pub mod expert_generate;
 pub mod expert_generate_staged;
 pub mod expert_skills;

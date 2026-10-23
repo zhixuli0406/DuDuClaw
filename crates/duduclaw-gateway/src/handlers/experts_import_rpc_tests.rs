@@ -123,6 +123,24 @@ async fn a_hung_installer_is_reported_as_a_timeout() {
     assert!(!tmp.exists(), "the run's temp dir is removed");
 }
 
+/// At the timeout the installer gets SIGTERM first (time to put a
+/// half-done replace back), and the gateway's timeout code wins over what
+/// it writes into the report while stopping.
+#[tokio::test]
+async fn a_timed_out_installer_is_asked_to_stop_before_it_is_killed() {
+    let fx = fixture().await;
+    let body = format!(
+        "on_term() {{\necho term > \"$DUDUCLAW_HOME/got-term\"\nREPORT='{}'\n{WRITE_REPORT_AND_FAIL}\n}}\ntrap 'on_term \"$@\"' TERM\nsleep 30 &\nwait",
+        r#"{"error":{"code":"import.replace_failed","params":{},"message":"stopped"}}"#
+    );
+    let bin = fake_bin(fx.home.path(), &body);
+    let frame = fx.handler.experts_install_with(&json!({ "path": fx.staged }), &bin, 1).await;
+    let p = payload(&frame);
+    assert_eq!(p["error_code"], "import.timeout", "{p}");
+    assert_eq!(p["error_params"]["seconds"], 1);
+    assert!(fx.home.path().join("got-term").is_file(), "SIGTERM was sent first");
+}
+
 #[tokio::test]
 async fn an_uncoded_failure_is_unknown_with_its_console_tail_and_no_prefix() {
     let fx = fixture().await;

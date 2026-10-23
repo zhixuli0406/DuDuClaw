@@ -24,6 +24,10 @@ pub(crate) const IMPORT_MARKER_NONCE_ENV: &str = "DUDUCLAW_IMPORT_MARKER_NONCE";
 /// How long one import (plan or real run) may take before it is stopped.
 pub(crate) const IMPORT_TIMEOUT_SECS: u64 = 300;
 
+/// After the timeout the installer is asked to stop (SIGTERM, so it can put
+/// a half-done replace back) and given this long before it is killed.
+pub(crate) const IMPORT_STOP_GRACE_SECS: u64 = 15;
+
 /// A failed CLI run: plain text plus the failure code when the CLI (or the
 /// spawn itself) gave one.
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +160,17 @@ impl MethodHandler {
                 "",
                 json!({ "success": true, "dry_run": dry_run, "output": output, "report": report }),
             ),
+            // At the timeout the gateway's own code wins: whatever the
+            // installer wrote while it was being stopped is in the report.
+            Err(fail) if fail.code.as_deref() == Some("import.timeout") => {
+                let report = report.map(|mut r| {
+                    if let Some(o) = r.as_object_mut() {
+                        o.remove("error");
+                    }
+                    r
+                });
+                WsFrame::ok_response("", failure_payload(dry_run, fail, report))
+            }
             Err(fail) => WsFrame::ok_response("", failure_payload(dry_run, fail, report)),
         }
     }
@@ -217,7 +232,7 @@ impl MethodHandler {
                 params: Value::Null,
             });
         }
-        let fut = tokio::process::Command::new(bin)
+        let spawned = tokio::process::Command::new(bin)
             .arg(group)
             .args(args)
             .env("DUDUCLAW_HOME", &self.home_dir)
@@ -225,24 +240,54 @@ impl MethodHandler {
             .env("TMPDIR", &tmp)
             .env("TMP", &tmp)
             .env("TEMP", &tmp)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output();
-        let output = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
                 return Err(CliFailure {
                     text: format!("子程序啟動失敗: {e}"),
                     code: Some("import.spawn_failed".into()),
                     params: Value::Null,
                 });
             }
+        };
+        let read_all = |pipe: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
+                }
+                buf
+            })
+        };
+        let out_task = read_all(child.stdout.take().map(|p| Box::new(p) as _));
+        let err_task = read_all(child.stderr.take().map(|p| Box::new(p) as _));
+        let status = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(CliFailure {
+                    text: format!("等待匯入程式結束失敗: {e}"),
+                    code: Some("import.spawn_failed".into()),
+                    params: Value::Null,
+                });
+            }
             Err(_) => {
+                stop_gracefully(&mut child, IMPORT_STOP_GRACE_SECS).await;
                 return Err(CliFailure {
                     text: format!("匯入超過 {timeout_secs} 秒仍未完成，已中止"),
                     code: Some("import.timeout".into()),
                     params: json!({ "seconds": timeout_secs }),
                 });
             }
+        };
+        let output = std::process::Output {
+            status,
+            stdout: out_task.await.unwrap_or_default(),
+            stderr: err_task.await.unwrap_or_default(),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -261,6 +306,24 @@ impl MethodHandler {
             None => CliFailure::uncoded(tail(if stderr_rest.trim().is_empty() { &stdout } else { &stderr_rest })),
         })
     }
+}
+
+/// Ask the installer to stop (SIGTERM: it puts a half-done replace back
+/// from its journal), wait up to `grace_secs`, then kill it. On Windows the
+/// stop is forceful right away; the journal is recovered by the next
+/// import or gateway start.
+pub(crate) async fn stop_gracefully(child: &mut tokio::process::Child, grace_secs: u64) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = duduclaw_core::platform::terminate_process(pid);
+        if tokio::time::timeout(std::time::Duration::from_secs(grace_secs), child.wait()).await.is_ok() {
+            return;
+        }
+        tracing::warn!(pid, "import installer did not stop within {grace_secs}s of SIGTERM; killing it");
+    }
+    #[cfg(not(unix))]
+    let _ = grace_secs;
+    let _ = child.kill().await;
 }
 
 /// Removes a run's private temp dir when dropped.

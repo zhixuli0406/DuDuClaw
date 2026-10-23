@@ -452,6 +452,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         ),
     }
 
+    // An import replace that stopped half way (installer killed at the
+    // dashboard's timeout, machine went down) is put back now: the earlier
+    // version restored, the half-installed one moved aside, an audit event
+    // and a warning written per replace (`expert_replace_journal`).
+    for r in crate::expert_replace_journal::recover_interrupted(
+        &home_dir,
+        crate::expert_replace_journal::RecoverScope::Abandoned,
+    )
+    .await
+    {
+        tracing::warn!(
+            slug = %r.slug,
+            failures = r.outcome.failures.len(),
+            "import replace recovered at start"
+        );
+    }
+
     // Install operator-configured extra allowed Origins for dashboard WS/CORS.
     // Empty by default => built-in loopback origins only (no behaviour change).
     let extra_origins = init_allowed_origins(config.allowed_origins.clone());

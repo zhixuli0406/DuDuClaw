@@ -422,3 +422,82 @@ async fn a_replace_leaves_an_employee_that_only_reuses_the_id() {
     assert!(agent.join("MINE.md").is_file(), "the other employee was not moved");
     assert!(trash_entries(home.path(), "my-advisor").is_empty());
 }
+
+fn dead_pid() -> u32 {
+    let mut c = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" });
+    if cfg!(windows) {
+        c.args(["/C", "exit"]);
+    }
+    let mut child = c.spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// The installer is killed half way through a replace (the dashboard's
+/// timeout, the machine going down): the journal it left makes the next
+/// import put the earlier version back first, with an audit event.
+#[tokio::test]
+async fn a_replace_stopped_half_way_is_put_back_by_the_next_import() {
+    use duduclaw_gateway::approval::ApprovalStatus;
+    use duduclaw_gateway::expert_replace_journal as journal;
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let v1 = team_pack(&src.path().join("v1"), &[Member { name: "lead", reports_to: "", department: "銷售" }], false, true);
+    assert_eq!(run(home.path(), &v1, false, ReimportMode::Fresh).await.0, None);
+    let old_approval = hooks_approval(&home.path().join("experts/team-pack"));
+    let v2 = team_pack(
+        &src.path().join("v2"),
+        &[
+            Member { name: "lead", reports_to: "", department: "客服" },
+            Member { name: "helper", reports_to: "lead", department: "客服" },
+        ],
+        true,
+        true,
+    );
+    let o = PipelineOpts { reimport: replace("team-pack", false), abandon_after_dispatch: true, ..Default::default() };
+    cmd_install_with(home.path(), v2.to_str().unwrap(), o).await.unwrap_err();
+    // Half done: the new version's files are live, the journal is left.
+    let left = journal::list(home.path());
+    assert_eq!(left.len(), 1);
+    assert!(home.path().join("agents/helper/agent.toml").is_file());
+    let new_approval = hooks_approval(&home.path().join("experts/team-pack"));
+    // Its process is gone.
+    let mut j = left[0].clone();
+    j.pid = dead_pid();
+    j.save(home.path()).unwrap();
+
+    let other = source(src.path(), "other-pack", "別的。");
+    let (code, report) = run(home.path(), &other, true, ReimportMode::Fresh).await;
+    assert_eq!(code, None, "{report}");
+    assert_eq!(report["details"]["recovered"][0], "team-pack", "{report}");
+
+    assert!(journal::list(home.path()).is_empty(), "journal removed");
+    let lead = std::fs::read_to_string(home.path().join("agents/lead/agent.toml")).unwrap();
+    assert!(lead.contains("銷售") && !lead.contains("客服"), "{lead}");
+    assert_eq!(org_department(home.path(), "lead").as_deref(), Some("銷售"));
+    assert!(!home.path().join("agents/helper").exists());
+    assert_eq!(org_department(home.path(), "helper"), None);
+    assert!(!home.path().join("shared/wiki/team/notes.md").exists());
+    assert!(trash_entries(home.path(), "lead").is_empty());
+    assert_eq!(approval_status(home.path(), &old_approval).await, ApprovalStatus::Pending);
+    assert_eq!(approval_status(home.path(), &new_approval).await, ApprovalStatus::Denied);
+    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+    assert!(audit.contains("expert_replace_recovered"), "{audit}");
+}
+
+/// A replace that completes or rolls back leaves no journal behind.
+#[tokio::test]
+async fn a_finished_replace_leaves_no_journal() {
+    use duduclaw_gateway::expert_replace_journal as journal;
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let pack = source(src.path(), "my-advisor", "規則。");
+    assert_eq!(run(home.path(), &pack, false, ReimportMode::Fresh).await.0, None);
+    assert_eq!(run(home.path(), &pack, false, replace("my-advisor", false)).await.0, None);
+    assert!(journal::list(home.path()).is_empty());
+    let o = PipelineOpts { reimport: replace("my-advisor", false), fail_after_dispatch: true, ..Default::default() };
+    cmd_install_with(home.path(), pack.to_str().unwrap(), o).await.unwrap_err();
+    assert!(journal::list(home.path()).is_empty());
+    assert!(home.path().join("agents/my-advisor/agent.toml").is_file());
+}

@@ -65,6 +65,10 @@ pub(crate) struct PipelineOpts {
     /// same point as a failed install-record write).
     #[cfg(test)]
     pub fail_after_dispatch: bool,
+    /// Tests only: stop right after the importer wrote, without rolling
+    /// back or closing the journal (what a killed installer leaves).
+    #[cfg(test)]
+    pub abandon_after_dispatch: bool,
 }
 
 /// Entry for `duduclaw pack install` once it hands a roster-shaped pack over
@@ -88,6 +92,23 @@ pub async fn cmd_install(
     cmd_install_with(home, source, opts).await
 }
 
+/// Resolves when this process is asked to stop (SIGTERM — what the gateway
+/// sends at its timeout before it kills). Only for runs the gateway
+/// started (it sets the marker nonce); a terminal run keeps the default
+/// signal handling. Never on Windows, where the stop is forceful and the
+/// journal is recovered by the next import or gateway start instead.
+async fn terminated() {
+    #[cfg(unix)]
+    if std::env::var_os(super::import_error::MARKER_NONCE_ENV).is_some() {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// [`cmd_install`] with the full option set.
 ///
 /// With `report_json`, the machine-readable report is written on success
@@ -100,7 +121,48 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
         None => None,
     };
     let mut report = Report::default();
-    let outcome = install_inner(home, source, &opts, &mut report).await;
+    // A replace stopped half way earlier (killed installer, machine down)
+    // is put back before anything else happens.
+    let recovered = super::reimport::recover_interrupted(home, super::reimport::RecoverScope::Abandoned).await;
+    if !recovered.is_empty() {
+        for r in &recovered {
+            eprintln!(
+                "  {} 上次取代「{}」沒有做完，已還原之前的版本",
+                style("↺").yellow(),
+                r.slug
+            );
+        }
+        report.detail(
+            "recovered",
+            serde_json::json!(recovered.iter().map(|r| r.slug.clone()).collect::<Vec<_>>()),
+        );
+    }
+    let outcome = {
+        let run = install_inner(home, source, &opts, &mut report);
+        tokio::pin!(run);
+        // The stop request first: the importer is only interrupted where it
+        // waits (sync file work runs to its next await).
+        tokio::select! {
+            biased;
+            () = terminated() => Err(super::import_error::import_err(
+                "import.timeout",
+                serde_json::json!({ "interrupted": true }),
+                "匯入被要求停止",
+            )),
+            r = &mut run => r,
+        }
+    };
+    // Told to stop part-way through a replace: put the earlier version back
+    // from this run's own journal (the importer future is gone by now).
+    if outcome.as_ref().err().and_then(super::import_error::failure_of).map(|f| f.params.get("interrupted").is_some())
+        == Some(true)
+    {
+        let mine = super::reimport::recover_interrupted(home, super::reimport::RecoverScope::IncludingOwn).await;
+        if !mine.is_empty() {
+            eprintln!("  {} 匯入中止，之前的版本已還原", style("↺").yellow());
+            report.detail("rolled_back", serde_json::json!({ "interrupted": true }));
+        }
+    }
     if let Err(e) = &outcome {
         report.meta("error", &super::import_error::plain_message(e));
         report.set_error(super::import_error::error_json(e));
@@ -204,6 +266,10 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
             ),
         ),
         #[cfg(test)]
+        Ok(_) if opts.abandon_after_dispatch => {
+            return Err(super::import_error::import_err("import.replace_failed", serde_json::json!({}), "test: abandoned"));
+        }
+        #[cfg(test)]
         Ok(_) if opts.fail_after_dispatch => Err(super::import_error::import_err(
             "import.replace_failed",
             serde_json::json!({}),
@@ -217,8 +283,10 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         Ok(r) => r,
         Err(e) => {
             if let Some(log) = &state.retired {
-                super::reimport::rollback(log, &state);
-                let n = super::reimport::withdraw_pending(home, &log.failed_record(), "import_failed").await;
+                let n = match super::reimport::rollback(log) {
+                    Some(dir) => super::reimport::withdraw_pending(home, &dir, "import_failed").await,
+                    None => 0,
+                };
                 eprintln!(
                     "  {} 之前的版本已還原；新版本已寫入的部分移到 {}{}",
                     style("↺").yellow(),
@@ -231,6 +299,10 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         }
     };
     let retired = state.retired;
+    // The record is written: the replace has happened, its journal goes.
+    if let Some(log) = &retired {
+        log.close();
+    }
 
     report.render_console(dry_run);
     report.meta("slug", &record.slug);
