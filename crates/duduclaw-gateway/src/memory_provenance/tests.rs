@@ -288,6 +288,7 @@ async fn upstream_unknown_marker_rides_the_queue_and_reaches_the_spawn_env() {
         session_id: None,
         upstream_unknown: true,
         lane: None,
+        on_behalf_of: None,
     };
     queue.enqueue(&msg).await.unwrap();
     let got = queue.get_by_id("m-1").await.unwrap().unwrap();
