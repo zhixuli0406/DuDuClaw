@@ -195,7 +195,16 @@ const TEAM_CTE: &str = "WITH RECURSIVE team(id, depth) AS (
 
 /// Fold the team's bindings into one grant per agent: highest derived level,
 /// then the nearest subordinate, then the smallest user id (deterministic).
-fn team_grants(conn: &Connection, manager_id: &str) -> Result<BTreeMap<String, TeamGrant>, String> {
+///
+/// Public for read-only callers that hold their own connection (the
+/// gateway's task-content reader opens `users.db` read-only). The caller
+/// decides whether `manager_id` may have a team at all (Active and role at
+/// least Manager); this function only walks the tree. On `Err` the caller
+/// must narrow.
+pub fn team_grants_on(
+    conn: &Connection,
+    manager_id: &str,
+) -> Result<BTreeMap<String, TeamGrant>, String> {
     let sql = format!(
         "{TEAM_CTE}
          SELECT t.id, MIN(t.depth), b.agent_name, b.access_level
@@ -278,7 +287,7 @@ fn load_access(conn: &mut Connection, user_id: &str) -> Result<Option<(User, Eff
     let direct = direct_bindings(&tx, user_id)?;
     // Q2: only someone whose role can manage gets anything from a team.
     let team = if user.role.at_least(UserRole::Manager) {
-        team_grants(&tx, user_id)?
+        team_grants_on(&tx, user_id)?
     } else {
         BTreeMap::new()
     };

@@ -162,7 +162,16 @@ impl MethodHandler {
         let jwt_ctx = ctx.clone();
         let resolved = tokio::task::spawn_blocking(move || resolve_live_context(&db, &cache, &jwt_ctx)).await;
         match resolved {
-            Ok(result) => result.map_err(|e| WsFrame::error_response("", &e)),
+            Ok(Ok(mut live)) => {
+                // Team grants are an Enterprise feature: a Personal home
+                // (e.g. after a downgrade with reporting lines left in
+                // users.db) gets none (`team_edition.rs`).
+                if !live.team_access.is_empty() && self.resolve_edition_profile().await.is_personal() {
+                    live.team_access.clear();
+                }
+                Ok(live)
+            }
+            Ok(Err(e)) => Err(WsFrame::error_response("", &e)),
             Err(join) => {
                 // The blocking task panicked or was cancelled: same as a
                 // failed read.

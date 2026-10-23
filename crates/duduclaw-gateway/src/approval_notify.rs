@@ -283,7 +283,7 @@ pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
         "📥 有一份設定檔修改等待審核"
     };
     let file = crate::agent_files::approval::target(rec)
-        .map(|(_, k)| crate::agent_files::approval::plain_name(k))
+        .map(|(_, k)| crate::agent_files::approval::plain_name(&k))
         .unwrap_or("設定檔");
     format!(
         "{head}\n\
