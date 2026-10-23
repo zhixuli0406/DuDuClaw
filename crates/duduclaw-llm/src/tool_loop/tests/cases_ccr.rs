@@ -1,7 +1,45 @@
 //! Tool-loop tests (cases_ccr), moved verbatim out of `tool_loop.rs`.
 
-use super::*;
 use super::super::telemetry::{CCR_TELEMETRY_PENDING_LIMIT, try_ccr_telemetry_permit};
+use super::*;
+
+#[tokio::test]
+async fn actual_fallback_notice_is_visible_per_call_but_not_part_of_ccr_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::ccr::CcrStore::new(dir.path().join("ccr.db"));
+    let runtime = CcrRuntime::new_unrestricted_for_test(store.clone(), ccr_test_scope());
+    let payload = "provider account data ".repeat(400);
+    let executor = MockExecutor::new(MockBehavior::HostNotice(
+        payload,
+        "ACTUAL_COMPANY_FALLBACK".into(),
+    ));
+    let provider =
+        ScriptedProvider::new(vec![tool_use_resp("call-1", "search"), final_resp("done")]);
+    let outcome = run_tool_loop_with_provenance_and_ccr(
+        &provider,
+        ChatRequest::new("m"),
+        &executor,
+        3,
+        ProvenanceConfig::default(),
+        Some(Arc::new(SpyInterceptor::allow_all())),
+        Some(runtime),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.ccr_saved_results.len(), 1);
+    let sent = provider.last_request();
+    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0] else {
+        panic!("missing tool result")
+    };
+    assert!(content.contains("ACTUAL_COMPANY_FALLBACK"));
+    assert!(content.contains("[CCR:"));
+    let saved = &outcome.ccr_saved_results[0];
+    let original = store
+        .retrieve(&ccr_test_scope(), &saved.id, None, 0, 8192)
+        .unwrap();
+    assert!(original.text.contains("provider account data"));
+    assert!(!original.text.contains("ACTUAL_COMPANY_FALLBACK"));
+}
 
 #[tokio::test]
 async fn ccr_delivery_lease_survives_model_request_and_is_not_copied_into_tool_event() {
@@ -23,8 +61,7 @@ async fn ccr_delivery_lease_survives_model_request_and_is_not_copied_into_tool_e
     assert!(outcome.ccr_delivery_guards.still_valid().await);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     let sent = provider.last_request();
-    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0]
-    else {
+    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0] else {
         panic!("missing CCR tool result")
     };
     assert!(content.contains("lease-bound original passage"));
@@ -257,8 +294,7 @@ async fn ccr_stores_post_interceptor_original_before_marker() {
 
     let sent = provider.last_request();
     assert!(sent.tools.iter().any(|t| t.name == CCR_RETRIEVE_TOOL));
-    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0]
-    else {
+    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0] else {
         panic!("missing tool result")
     };
     assert!(content.contains("[CCR:"));
@@ -395,8 +431,7 @@ async fn ccr_tool_loop_binds_verified_artifact_and_rejects_revoked_handle() {
     .await
     .unwrap();
     let sent = provider.last_request();
-    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0]
-    else {
+    let ContentPart::ToolResult { content, .. } = &sent.messages.last().unwrap().parts[0] else {
         panic!("missing tool result")
     };
     let id = content

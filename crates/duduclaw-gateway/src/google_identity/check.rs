@@ -1,7 +1,7 @@
 //! `google.identity.test {agent_id}`: prove a delegate works without sending
 //! anything (design §7.3). Every step mints fresh (the cache is bypassed and
-//! never written), reads at most one read-only endpoint, and reports one
-//! line per check.
+//! never written), reads only GET endpoints, and reports one line per check.
+//! Document services use a Drive metadata lookup and then their own API.
 
 use std::path::Path;
 
@@ -22,8 +22,8 @@ pub struct Step {
     pub detail: String,
 }
 
-/// Per-service probe: scope group and one read-only endpoint (`None` =
-/// minting with the scope is the check).
+/// Per-service probe: scope group and a read-only list endpoint. Document
+/// services without a list endpoint discover one sample through Drive.
 const SERVICES: &[(&str, &str, &[&str], Option<&str>)] = &[
     (
         "gmail",
@@ -85,6 +85,70 @@ fn step(id: &'static str, label: &'static str, ok: bool, detail: impl Into<Strin
         ok,
         detail: detail.into(),
     }
+}
+
+/// Only the resource id crosses this boundary; no document content, title or
+/// sample id is returned to the dashboard. No sample means unverified, never
+/// that issuing a token proved the service's data API works.
+async fn resource_probe(
+    id: &str,
+    discovery_token: &str,
+    service_token: &str,
+) -> Result<String, String> {
+    let (mime, endpoint, field) = match id {
+        "sheets" => (
+            "application/vnd.google-apps.spreadsheet",
+            "https://sheets.googleapis.com/v4/spreadsheets",
+            "spreadsheetId",
+        ),
+        "docs" => (
+            "application/vnd.google-apps.document",
+            "https://docs.googleapis.com/v1/documents",
+            "documentId",
+        ),
+        "slides" => (
+            "application/vnd.google-apps.presentation",
+            "https://slides.googleapis.com/v1/presentations",
+            "presentationId",
+        ),
+        "forms" => (
+            "application/vnd.google-apps.form",
+            "https://forms.googleapis.com/v1/forms",
+            "formId",
+        ),
+        _ => return Err("沒有可用的唯讀驗證方法。".into()),
+    };
+    let mut lookup = url::Url::parse("https://www.googleapis.com/drive/v3/files")
+        .map_err(|_| "無法準備唯讀驗證。")?;
+    lookup
+        .query_pairs_mut()
+        .append_pair("q", &format!("trashed = false and mimeType = '{mime}'"))
+        .append_pair("pageSize", "1")
+        .append_pair("fields", "files(id)");
+    let files = gw::api_get(discovery_token, lookup.as_str())
+        .await
+        .map_err(|_| "無法列出可用的驗證檔案；尚未確認服務資料存取。")?;
+    let sample = files.get("files").and_then(Value::as_array).and_then(|rows| rows.first())
+        .and_then(|file| file.get("id")).and_then(Value::as_str)
+        .ok_or("授權已簽發，但沒有找到這類檔案，尚未確認服務資料存取。請先準備一份本人可讀的檔案再測試。")?;
+    if sample.is_empty()
+        || sample.len() > 256
+        || !sample
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Google 回傳的驗證檔案識別碼無法辨識，尚未確認服務資料存取。".into());
+    }
+    let result = gw::api_get(
+        service_token,
+        &format!("{endpoint}/{sample}?fields={field}"),
+    )
+    .await
+    .map_err(|_| "授權已簽發，但讀取這項服務的檔案資料失敗；請確認 API 已開通及檔案權限。")?;
+    if result.get(field).and_then(Value::as_str) != Some(sample) {
+        return Err("服務回應無法辨識，尚未確認資料存取。".into());
+    }
+    Ok("可讀取這項服務的檔案識別資料（未讀取內容）。".into())
 }
 
 /// Run the checks for `agent`. Stops at the first check later ones depend on.
@@ -199,7 +263,7 @@ pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<Strin
         let result = match mint_delegate(home, &email, scopes, CacheMode::Bypass).await {
             Err(r) => Err(r.message_zh),
             Ok(t) => match probe {
-                None => Ok("已核准這項服務的授權；尚未讀取服務資料確認是否開通".to_string()),
+                None => resource_probe(id, &full.access_token, &t.access_token).await,
                 Some(url) => gw::api_get(&t.access_token, url)
                     .await
                     .map(|_| "可以使用".to_string())

@@ -74,6 +74,14 @@ pub(crate) fn authenticate_bearer(
     headers: &HeaderMap,
     home_dir: &std::path::Path,
 ) -> Result<(Principal, NamespaceContext), Response> {
+    authenticate_bearer_call(headers, home_dir)
+        .map(|(call, namespace)| (call.principal().clone(), namespace))
+}
+
+pub(crate) fn authenticate_bearer_call(
+    headers: &HeaderMap,
+    home_dir: &std::path::Path,
+) -> Result<(crate::mcp_auth::AuthenticatedCall, NamespaceContext), Response> {
     let auth_header = headers
         .get("Authorization")
         .ok_or_else(|| {
@@ -121,10 +129,11 @@ pub(crate) fn authenticate_bearer(
     // scope/namespace enforcement below.
     let auth_result = if raw_key.starts_with(crate::mcp_oauth_server::OAUTH_TOKEN_PREFIX) {
         crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir)
+            .map(crate::mcp_auth::AuthenticatedCall::without_reference)
     } else {
-        authenticate_with_key(raw_key, home_dir)
+        crate::mcp_auth::authenticate_with_key_call(raw_key, home_dir)
     };
-    let principal = auth_result.map_err(|e| {
+    let authenticated = auth_result.map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(crate::mcp_dispatch::jsonrpc_error(
@@ -136,8 +145,9 @@ pub(crate) fn authenticate_bearer(
             .into_response()
     })?;
 
+    let principal = authenticated.principal();
     let ns_ctx = resolve_for_caller(
-        &principal,
+        principal,
         // HTTP callers are remote: the internal key never inherits this
         // process's employee identity here (it stays in the shared pool); a
         // per-agent key still maps to its employee's own namespace.
@@ -158,7 +168,7 @@ pub(crate) fn authenticate_bearer(
             .into_response()
     })?;
 
-    Ok((principal, ns_ctx))
+    Ok((authenticated, ns_ctx))
 }
 
 /// Extract and validate a Bearer key OR `?api_key=` query param.
@@ -185,16 +195,16 @@ fn authenticate_bearer_or_query(
                 .into_response()
         })?;
         let ns_ctx = resolve_for_caller(
-        &principal,
-        // HTTP callers are remote: the internal key never inherits this
-        // process's employee identity here (it stays in the shared pool); a
-        // per-agent key still maps to its employee's own namespace.
-        CallerIdentity {
-            verified_agent: None,
-            client_is_agent: client_is_agent(home_dir, &principal.client_id),
-        },
-    )
-    .map_err(|e| {
+            &principal,
+            // HTTP callers are remote: the internal key never inherits this
+            // process's employee identity here (it stays in the shared pool); a
+            // per-agent key still maps to its employee's own namespace.
+            CallerIdentity {
+                verified_agent: None,
+                client_is_agent: client_is_agent(home_dir, &principal.client_id),
+            },
+        )
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(crate::mcp_dispatch::jsonrpc_error(
@@ -339,74 +349,77 @@ async fn call_handler(
     Json(body): Json<Value>,
 ) -> Response {
     // Authenticate (header only — no query param to prevent access log leakage)
-    let (principal, ns_ctx) = match authenticate_bearer(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) = match authenticate_bearer_call(&headers, &state.home_dir) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let principal = authenticated.principal().clone();
+    crate::mcp_auth::with_authenticated_call(authenticated, async {
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
 
-    let id = body.get("id").cloned().unwrap_or(Value::Null);
+        // Validate JSON-RPC
+        if body.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+            return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32600,
+                "jsonrpc field must be '2.0'",
+            ));
+        }
+        let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if method != "tools/call" {
+            return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32601,
+                &format!("Method not found: '{method}'. Use 'tools/call'"),
+            ));
+        }
 
-    // Validate JSON-RPC
-    if body.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-        return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &id,
-            -32600,
-            "jsonrpc field must be '2.0'",
-        ));
-    }
-    let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if method != "tools/call" {
-        return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &id,
-            -32601,
-            &format!("Method not found: '{method}'. Use 'tools/call'"),
-        ));
-    }
-
-    // ── HTTP rate gate: 60 req/min per API key ────────────────────────────────
-    if let Err(e) = state
-        .dispatcher
-        .rate_limiter
-        .check(&principal.client_id, OpType::HttpRequest)
-    {
-        let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &id,
-            -32029,
-            &format!(
-                "HTTP rate limit exceeded, retry after {} seconds",
-                e.retry_after_secs
-            ),
-        ));
-        resp.headers_mut().insert(
-            "Retry-After",
-            e.retry_after_secs
-                .to_string()
-                .parse()
-                .unwrap_or_else(|_| "1".parse().unwrap()),
-        );
-        return resp;
-    }
-
-    let params = body.get("params").cloned().unwrap_or(Value::Null);
-
-    // Dispatch with timeout
-    let jsonrpc = match tokio::time::timeout(
-        state.call_timeout,
-        state
+        // ── HTTP rate gate: 60 req/min per API key ────────────────────────────────
+        if let Err(e) = state
             .dispatcher
-            .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => crate::mcp_dispatch::jsonrpc_error(
-            &id,
-            -32603,
-            "Request timed out (30s limit exceeded)",
-        ),
-    };
+            .rate_limiter
+            .check(&principal.client_id, OpType::HttpRequest)
+        {
+            let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32029,
+                &format!(
+                    "HTTP rate limit exceeded, retry after {} seconds",
+                    e.retry_after_secs
+                ),
+            ));
+            resp.headers_mut().insert(
+                "Retry-After",
+                e.retry_after_secs
+                    .to_string()
+                    .parse()
+                    .unwrap_or_else(|_| "1".parse().unwrap()),
+            );
+            return resp;
+        }
 
-    into_axum_response(jsonrpc)
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+
+        // Dispatch with timeout
+        let jsonrpc = match tokio::time::timeout(
+            state.call_timeout,
+            state
+                .dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32603,
+                "Request timed out (30s limit exceeded)",
+            ),
+        };
+
+        into_axum_response(jsonrpc)
+    })
+    .await
 }
 
 // ── POST /ingest/transcript ───────────────────────────────────────────────────
@@ -422,77 +435,80 @@ async fn ingest_transcript_handler(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
-    let (principal, ns_ctx) = match authenticate_bearer(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) = match authenticate_bearer_call(&headers, &state.home_dir) {
         Ok(p) => p,
         Err(r) => return r,
     };
-    if let Err(e) = state
-        .dispatcher
-        .rate_limiter
-        .check(&principal.client_id, OpType::HttpRequest)
-    {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "stored": false,
-                "error": format!("rate limited, retry after {}s", e.retry_after_secs),
-            })),
-        )
-            .into_response();
-    }
-
-    let Some(text) = extract_transcript_text(&payload) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "stored": false,
-                "error": "no transcript text found (accepted fields: text / transcript / summary / segments[].text / transcript_segments[].text)",
-            })),
-        )
-            .into_response();
-    };
-    let source = payload
-        .get("source")
-        .and_then(|v| v.as_str())
-        .or_else(|| payload.get("app").and_then(|v| v.as_str()))
-        .unwrap_or("wearable");
-    // CJK-safe cap — a runaway payload becomes a truncated memory, not a DoS.
-    let text = duduclaw_core::truncate_bytes(&text, 16 * 1024);
-    let params = serde_json::json!({
-        "name": "memory_store",
-        "arguments": {
-            "content": format!("[{source} 逐字稿] {text}"),
-            "tags": format!("wearable,{source}"),
-        },
-    });
-    let jsonrpc = match tokio::time::timeout(
-        state.call_timeout,
-        state
+    let principal = authenticated.principal().clone();
+    crate::mcp_auth::with_authenticated_call(authenticated, async {
+        if let Err(e) = state
             .dispatcher
-            .dispatch_tool_call(&principal, &ns_ctx, &params, &Value::Null),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => {
+            .rate_limiter
+            .check(&principal.client_id, OpType::HttpRequest)
+        {
             return (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({ "stored": false, "error": "timed out" })),
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "stored": false,
+                    "error": format!("rate limited, retry after {}s", e.retry_after_secs),
+                })),
             )
                 .into_response();
         }
-    };
-    let ok = jsonrpc.get("error").is_none();
-    let status = if ok {
-        StatusCode::OK
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
-    };
-    (
-        status,
-        Json(serde_json::json!({ "stored": ok, "detail": jsonrpc })),
-    )
-        .into_response()
+
+        let Some(text) = extract_transcript_text(&payload) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "stored": false,
+                    "error": "no transcript text found (accepted fields: text / transcript / summary / segments[].text / transcript_segments[].text)",
+                })),
+            )
+                .into_response();
+        };
+        let source = payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("app").and_then(|v| v.as_str()))
+            .unwrap_or("wearable");
+        // CJK-safe cap — a runaway payload becomes a truncated memory, not a DoS.
+        let text = duduclaw_core::truncate_bytes(&text, 16 * 1024);
+        let params = serde_json::json!({
+            "name": "memory_store",
+            "arguments": {
+                "content": format!("[{source} 逐字稿] {text}"),
+                "tags": format!("wearable,{source}"),
+            },
+        });
+        let jsonrpc = match tokio::time::timeout(
+            state.call_timeout,
+            state
+                .dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &Value::Null),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({ "stored": false, "error": "timed out" })),
+                )
+                    .into_response();
+            }
+        };
+        let ok = jsonrpc.get("error").is_none();
+        let status = if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::UNPROCESSABLE_ENTITY
+        };
+        (
+            status,
+            Json(serde_json::json!({ "stored": ok, "detail": jsonrpc })),
+        )
+            .into_response()
+    }).await
 }
 
 /// Lenient transcript extraction across wearable-vendor payload shapes.
@@ -672,74 +688,81 @@ async fn stream_call_handler(
     Query(query): Query<StreamCallQuery>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (principal, ns_ctx) = match authenticate_bearer(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) = match authenticate_bearer_call(&headers, &state.home_dir) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let principal = authenticated.principal().clone();
+    crate::mcp_auth::with_authenticated_call(authenticated, async {
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
 
-    let id = body.get("id").cloned().unwrap_or(Value::Null);
-    let params = body.get("params").cloned().unwrap_or(Value::Null);
-
-    // HTTP rate gate
-    if let Err(e) = state
-        .dispatcher
-        .rate_limiter
-        .check(&principal.client_id, OpType::HttpRequest)
-    {
-        return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &id,
-            -32029,
-            &format!(
-                "HTTP rate limit exceeded, retry after {} seconds",
-                e.retry_after_secs
-            ),
-        ));
-    }
-
-    let conn_id = query.conn_id.clone();
-
-    // HS7: only the principal that opened the SSE stream may push into it.
-    // Fail-closed: a non-existent connection is not owned by anyone.
-    if !state.sse_store.is_owner(&conn_id, &principal.client_id) {
-        return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &id,
-            -32003,
-            "Forbidden: conn_id does not belong to the authenticated principal",
-        ));
-    }
-
-    // Push progress event
-    let progress = serde_json::json!({
-        "status": "running",
-        "tool": params.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
-        "conn_id": conn_id,
-    });
-    state
-        .sse_store
-        .push_event(&conn_id, "tool_progress", &progress.to_string());
-
-    // Dispatch tool call
-    let jsonrpc = tokio::time::timeout(
-        state.call_timeout,
-        state
+        // HTTP rate gate
+        if let Err(e) = state
             .dispatcher
-            .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
-    )
+            .rate_limiter
+            .check(&principal.client_id, OpType::HttpRequest)
+        {
+            return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32029,
+                &format!(
+                    "HTTP rate limit exceeded, retry after {} seconds",
+                    e.retry_after_secs
+                ),
+            ));
+        }
+
+        let conn_id = query.conn_id.clone();
+
+        // HS7: only the principal that opened the SSE stream may push into it.
+        // Fail-closed: a non-existent connection is not owned by anyone.
+        if !state.sse_store.is_owner(&conn_id, &principal.client_id) {
+            return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32003,
+                "Forbidden: conn_id does not belong to the authenticated principal",
+            ));
+        }
+
+        // Push progress event
+        let progress = serde_json::json!({
+            "status": "running",
+            "tool": params.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            "conn_id": conn_id,
+        });
+        state
+            .sse_store
+            .push_event(&conn_id, "tool_progress", &progress.to_string());
+
+        // Dispatch tool call
+        let jsonrpc = tokio::time::timeout(
+            state.call_timeout,
+            state
+                .dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            crate::mcp_dispatch::jsonrpc_error(
+                &id,
+                -32603,
+                "Request timed out (30s limit exceeded)",
+            )
+        });
+
+        // Push result to SSE stream
+        state
+            .sse_store
+            .push_event(&conn_id, "tool_result", &jsonrpc.to_string());
+
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "accepted": true, "conn_id": conn_id })),
+        )
+            .into_response()
+    })
     .await
-    .unwrap_or_else(|_| {
-        crate::mcp_dispatch::jsonrpc_error(&id, -32603, "Request timed out (30s limit exceeded)")
-    });
-
-    // Push result to SSE stream
-    state
-        .sse_store
-        .push_event(&conn_id, "tool_result", &jsonrpc.to_string());
-
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "accepted": true, "conn_id": conn_id })),
-    )
-        .into_response()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

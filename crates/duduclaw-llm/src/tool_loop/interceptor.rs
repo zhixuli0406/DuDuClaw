@@ -31,13 +31,21 @@ pub enum InterceptDecision {
 /// (see [`ToolExecutor::server_of`]) — implementations must treat that as
 /// "unknown", never as a server literally named the empty string.
 ///
-/// Both hooks are synchronous on purpose: they run between two provider
-/// round-trips on the loop's own task, and the RFC-23 pipeline they wrap is
-/// itself synchronous (SQLite vault + in-memory rule engine).
+/// The original hooks stay synchronous for the RFC-23 pipeline. A registry
+/// host guard may override `before_call_async` to capture task-local authority
+/// and move OS credential checks off the async worker.
+#[async_trait]
 pub trait ToolInterceptor: Send + Sync {
     /// Called before dispatch. Returning [`InterceptDecision::Deny`] means the
     /// tool is **never invoked**.
     fn before_call(&self, server: &str, tool: &str, args: Value) -> InterceptDecision;
+
+    /// Registry-bound host guards may offload blocking credential checks while
+    /// first capturing their caller's task-local authority. Existing hooks keep
+    /// their synchronous behavior through this default implementation.
+    async fn before_call_async(&self, server: &str, tool: &str, args: Value) -> InterceptDecision {
+        self.before_call(server, tool, args)
+    }
 
     /// Called after a dispatched tool returned, with the parsed result so
     /// structured (JSON-path) rules can see keys rather than raw text.

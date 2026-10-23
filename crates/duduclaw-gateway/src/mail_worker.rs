@@ -301,19 +301,25 @@ pub async fn poll_gmail(
     // The mailbox owner's Google identity (B2a): `home` is the unchanged
     // path; a delegate is minted in this process; a refusal skips the poll.
     let owner = (!owner_agent.is_empty()).then_some(owner_agent);
-    let (backend, google_account) = match crate::google_identity::gateway_backend_with_account(home_dir, owner, "mail_poll").await {
-        Ok(b) => b,
-        Err(crate::google_identity::GatewayBackendError::Home(e)) => {
-            warn!(error = %e, "mail: Gmail transport unavailable this tick");
-            report.transport_errors += 1;
-            return Vec::new();
-        }
-        Err(crate::google_identity::GatewayBackendError::Refused(r)) => {
-            warn!(code = r.code, "mail: owner's Google identity refused; Gmail not polled");
-            report.account_unavailable += 1;
-            return Vec::new();
-        }
-    };
+    let (backend, google_account) =
+        match crate::google_identity::gateway_backend_with_account(home_dir, owner, "mail_poll")
+            .await
+        {
+            Ok(b) => b,
+            Err(crate::google_identity::GatewayBackendError::Home(e)) => {
+                warn!(error = %e, "mail: Gmail transport unavailable this tick");
+                report.transport_errors += 1;
+                return Vec::new();
+            }
+            Err(crate::google_identity::GatewayBackendError::Refused(r)) => {
+                warn!(
+                    code = r.code,
+                    "mail: owner's Google identity refused; Gmail not polled"
+                );
+                report.account_unavailable += 1;
+                return Vec::new();
+            }
+        };
     if let Some(email) = google_account.as_deref()
         && let Err(error) = crate::google_identity::mailbox::protect(home_dir, email)
     {
@@ -340,10 +346,11 @@ pub async fn poll_gmail(
         }
         // Cheap dedupe before paying for the full read.
         let mailbox = mail::read_mailbox(home_dir);
-        if mailbox
-            .seen_external
-            .contains(&mail::inbound_seen_key("gmail", &meta.id, google_account.as_deref()))
-        {
+        if mailbox.seen_external.contains(&mail::inbound_seen_key(
+            "gmail",
+            &meta.id,
+            google_account.as_deref(),
+        )) {
             report.duplicate += 1;
             continue;
         }
@@ -362,7 +369,14 @@ pub async fn poll_gmail(
             subject: full.subject,
             body: full.body,
         };
-        let outcome = mail::ingest_inbound_for_account(home_dir, cfg, &mailbox, &incoming, owner_agent, google_account.as_deref());
+        let outcome = mail::ingest_inbound_for_account(
+            home_dir,
+            cfg,
+            &mailbox,
+            &incoming,
+            owner_agent,
+            google_account.as_deref(),
+        );
         report.record(&outcome);
         if let IngestOutcome::Stored {
             mail_id,
@@ -405,7 +419,8 @@ async fn trigger_for_mail(
     // The task sandbox has none of those tools, so a sandboxed run would do
     // nothing, and a host run would hand untrusted inbound mail to the very
     // employee the operator chose to isolate. Skip it, and say so.
-    let sandboxed = crate::task_sandbox::sandbox_enabled_in_registry(registry, &item.agent_id).await;
+    let sandboxed =
+        crate::task_sandbox::sandbox_enabled_in_registry(registry, &item.agent_id).await;
     if mail_trigger_skipped_for_sandbox(home_dir, &item.agent_id, sandboxed) {
         return false;
     }
@@ -439,7 +454,11 @@ async fn trigger_for_mail(
 /// must be skipped, after reporting it (`task_sandbox_not_applied`, `path =
 /// "mail"`, `action = "skipped"`, once per agent per process). The mail itself
 /// stays in the inbox, unmarked, for a human to handle.
-fn mail_trigger_skipped_for_sandbox(home_dir: &Path, agent_id: &str, sandbox_enabled: bool) -> bool {
+fn mail_trigger_skipped_for_sandbox(
+    home_dir: &Path,
+    agent_id: &str,
+    sandbox_enabled: bool,
+) -> bool {
     if !sandbox_enabled {
         return false;
     }
@@ -639,6 +658,15 @@ pub async fn run_once(
         }
     }
 
+    let status = crate::mail_poll_status::PollStatus::new(cfg.gmail_enabled, &report);
+    let status_home = home_dir.to_path_buf();
+    if !matches!(
+        tokio::task::spawn_blocking(move || crate::mail_poll_status::record(&status_home, &status))
+            .await,
+        Ok(Ok(()))
+    ) {
+        warn!("mail: last completed poll status could not be saved");
+    }
     if !report.is_quiet() || settle != SettleReport::default() {
         info!(
             stored = report.stored,
@@ -648,6 +676,7 @@ pub async fn run_once(
             triggered = report.triggered,
             suspicious = report.suspicious_not_triggered,
             transport_errors = report.transport_errors,
+            account_unavailable = report.account_unavailable,
             sent = settle.sent,
             rejected = settle.rejected,
             failed = settle.failed,
@@ -699,6 +728,29 @@ mod tests {
 
     fn home() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[tokio::test]
+    async fn disabled_google_identity_is_recorded_as_unavailable_for_mail_status() {
+        let h = home();
+        write_agent(h.path(), "mail-google-status", false);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(h.path().join("agents/mail-google-status/agent.toml"))
+            .unwrap()
+            .write_all(b"\n[google]\nidentity='none'\n")
+            .unwrap();
+        std::fs::write(h.path().join("config.toml"),"[mail]\nenabled=true\ngmail_enabled=true\ndropfolder_enabled=false\ndefault_agent='mail-google-status'\n").unwrap();
+        let mut registry = AgentRegistry::new(h.path().join("agents"));
+        registry.scan().await.unwrap();
+        let broker = ApprovalBroker::open(h.path()).unwrap();
+        let (report, _) = run_once(h.path(), &Arc::new(RwLock::new(registry)), &broker).await;
+        assert_eq!(report.account_unavailable, 1);
+        assert_eq!(report.stored, 0);
+        let status = crate::mail_poll_status::read(h.path()).unwrap().unwrap();
+        assert_eq!(status.account_unavailable, 1);
+        assert!(status.gmail_attempted);
     }
 
     fn enabled_cfg() -> MailConfig {
@@ -1118,14 +1170,33 @@ skill_security_scan = false
     #[test]
     fn mail_trigger_decision_follows_the_sandbox_flag() {
         let h = home();
-        assert!(!mail_trigger_skipped_for_sandbox(h.path(), "mail-dec-off", false));
+        assert!(!mail_trigger_skipped_for_sandbox(
+            h.path(),
+            "mail-dec-off",
+            false
+        ));
         assert!(!audit_text(h.path()).contains("task_sandbox_not_applied"));
-        assert!(mail_trigger_skipped_for_sandbox(h.path(), "mail-dec-on", true));
+        assert!(mail_trigger_skipped_for_sandbox(
+            h.path(),
+            "mail-dec-on",
+            true
+        ));
         // Still skipped after the once-per-process report has been spent.
-        assert!(mail_trigger_skipped_for_sandbox(h.path(), "mail-dec-on", true));
+        assert!(mail_trigger_skipped_for_sandbox(
+            h.path(),
+            "mail-dec-on",
+            true
+        ));
         let audit = audit_text(h.path());
-        assert_eq!(audit.matches("task_sandbox_not_applied").count(), 1, "{audit}");
-        assert!(audit.contains("\"path\":\"mail\"") && audit.contains("\"action\":\"skipped\""), "{audit}");
+        assert_eq!(
+            audit.matches("task_sandbox_not_applied").count(),
+            1,
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"path\":\"mail\"") && audit.contains("\"action\":\"skipped\""),
+            "{audit}"
+        );
     }
 
     #[tokio::test]
@@ -1142,13 +1213,25 @@ skill_security_scan = false
         );
         let mut r = PollReport::default();
         let mut budget = 10;
-        let fresh = poll_dropfolder(h.path(), &enabled_cfg(), "mail-sandboxed", &mut r, &mut budget);
+        let fresh = poll_dropfolder(
+            h.path(),
+            &enabled_cfg(),
+            "mail-sandboxed",
+            &mut r,
+            &mut budget,
+        );
         assert_eq!(fresh.len(), 1);
 
         assert!(!trigger_for_mail(h.path(), &registry, &fresh[0]).await);
         let item = mail::get_inbox_item(h.path(), &fresh[0]).unwrap();
-        assert!(!item.triggered, "a skipped trigger must not read as triggered");
+        assert!(
+            !item.triggered,
+            "a skipped trigger must not read as triggered"
+        );
         let audit = audit_text(h.path());
-        assert!(audit.contains("task_sandbox_not_applied") && audit.contains("mail-sandboxed"), "{audit}");
+        assert!(
+            audit.contains("task_sandbox_not_applied") && audit.contains("mail-sandboxed"),
+            "{audit}"
+        );
     }
 }
