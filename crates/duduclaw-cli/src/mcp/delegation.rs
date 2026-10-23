@@ -121,6 +121,11 @@ pub(crate) async fn send_to_agent_with_ctx(
         // A run in the explore lane hands read-only work on (`lane`); the
         // legacy-schema fallback below cannot carry it, so it is not used.
         let lane = duduclaw_core::ProcessLane::current().delegation_stamp();
+        // The person this run works for, from the host env only. When there
+        // is one it must reach the row: the legacy-schema fallback cannot
+        // carry it, so it is not used (losing it would lose the person's
+        // limits on the receiving run).
+        let on_behalf_of = host_on_behalf_of(home_dir, caller);
         tokio::task::spawn_blocking(move || -> bool {
             let Ok(conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
@@ -129,6 +134,34 @@ pub(crate) async fn send_to_agent_with_ctx(
             if lane.is_some() {
                 // Same column the gateway adds; ignore "duplicate column".
                 let _ = conn.execute("ALTER TABLE message_queue ADD COLUMN lane TEXT", []);
+            }
+            if on_behalf_of.is_some() {
+                let _ = conn.execute("ALTER TABLE message_queue ADD COLUMN on_behalf_of TEXT", []);
+                return conn
+                    .execute(
+                        "INSERT OR IGNORE INTO message_queue \
+                         (id, sender, target, payload, status, retry_count, delegation_depth, \
+                          origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
+                          upstream_unknown, lane, on_behalf_of) \
+                         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        rusqlite::params![
+                            msg_id_cl,
+                            caller_cl,
+                            target_cl,
+                            prompt_cl,
+                            outgoing_depth,
+                            origin_cl,
+                            caller_cl,
+                            ts_now,
+                            reply_channel,
+                            trust_turn_id,
+                            trust_session_id,
+                            upstream_dropped,
+                            lane,
+                            on_behalf_of,
+                        ],
+                    )
+                    .is_ok_and(|rows| rows > 0);
             }
             let inserted = if lane.is_some() {
                 conn.execute(
@@ -461,7 +494,9 @@ pub(crate) async fn check_delegation_allowed(
     let rules = duduclaw_core::delegation_rules_from_home(home_dir);
     let org = org_snapshot(home_dir, &[sender, target]).await;
     match duduclaw_core::can_delegate_rules(&rules, &org, sender, target) {
-        Ok(()) => Ok(()),
+        // The employee tree allows it; the person the work is for must too
+        // (`[delegation] human_principal = "enforce"`; record mode passes).
+        Ok(()) => check_human_principal(home_dir, sender, target, path_kind, rules.policy).await,
         Err(denied) => {
             duduclaw_security::audit::append_tool_call_with_extras(
                 home_dir,

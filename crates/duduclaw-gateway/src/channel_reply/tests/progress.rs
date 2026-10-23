@@ -494,6 +494,7 @@ mod channel_callback_source_tests {
         assert!(line.contains("event.is_channel_text() && !event.to_display().is_empty()"));
         for (channel, src, filter) in CALLBACKS {
             if filter.starts_with("forwards_progress") {
+                let src = src.replace("\r\n", "\n");
                 assert!(
                     src.contains("pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {\n    event.is_channel_text()"),
                     "{channel}: forwards_progress must start from is_channel_text()"

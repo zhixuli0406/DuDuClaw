@@ -202,6 +202,7 @@ async fn ttl_expiry_treated_as_deny() {
         binding: None,
         answer: None,
         invalidated_reason: None,
+        on_behalf_of: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -241,6 +242,7 @@ async fn poll_expires_stale_on_read() {
         binding: None,
         answer: None,
         invalidated_reason: None,
+        on_behalf_of: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -299,6 +301,7 @@ async fn list_pending_sweeps_expired() {
         binding: None,
         answer: None,
         invalidated_reason: None,
+        on_behalf_of: None,
     };
     b.store.insert(&stale).await.unwrap();
     let pending = b.list_pending(None).await.unwrap();
@@ -349,6 +352,7 @@ async fn await_decision_returns_expired_past_ttl() {
         binding: None,
         answer: None,
         invalidated_reason: None,
+        on_behalf_of: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();

@@ -69,7 +69,7 @@ fn channel_reply_entry_futures_stay_small() {
 /// before its own five layers.
 #[test]
 fn large_reply_futures_are_boxed_before_task_local_layers() {
-    let guarded = include_str!("../guarded.rs");
+    let guarded = include_str!("../guarded.rs").replace("\r\n", "\n");
     assert!(
         guarded.contains("let pipeline = Box::pin(build_reply_with_session_inner("),
         "the reply pipeline future must be boxed before the scope chain wraps it"

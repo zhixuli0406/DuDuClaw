@@ -629,7 +629,11 @@ impl AgentRuntime for GrokRuntime {
         // P2-B N4: the turn/run source identity, same channel as the id. Grok
         // may hand its MCP child only the declared config env, in which case
         // this does not arrive (unverified); the persisted config is not used
-        // for per-turn values.
+        // for per-turn values. Grok inherits the gateway's environment, so an
+        // ambient `DUDUCLAW_ON_BEHALF_OF` is removed first; only the scoped
+        // value (in the pairs) may reach the MCP child.
+        cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
+        cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
         for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
             cmd.env(k, v);
         }
