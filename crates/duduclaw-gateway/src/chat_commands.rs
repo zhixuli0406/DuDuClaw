@@ -521,7 +521,7 @@ pub async fn handle_command_with_caller(
         ChatCommand::Assign(assign) => {
             let fallback = (!agent_id.is_empty()).then_some(agent_id);
             let assign_caller = caller.assign_caller(&ctx.home_dir, session_id, fallback);
-            crate::trigger_route::assign::run(ctx, assign, &assign_caller)
+            Box::pin(crate::trigger_route::assign::run(ctx, assign, &assign_caller))
                 .await
                 .text
         }

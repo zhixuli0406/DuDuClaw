@@ -1357,8 +1357,11 @@ async fn process_telegram_message(
             fallback: fallback.as_deref(),
             access: crate::trigger_route::access::for_channel_sender(&ctx.home_dir, "telegram", &user_id),
         };
-        let reply = crate::trigger_route::assign::run_pending(&ctx, id, &input_text, &caller).await;
-        send_reply(&client, &api_base, chat_id, &reply.text, thread_id, msg_id, None).await;
+        let reply =
+            Box::pin(crate::trigger_route::assign::run_pending(&ctx, id, &input_text, &caller)).await;
+        if !reply.text.trim().is_empty() {
+            send_reply(&client, &api_base, chat_id, &reply.text, thread_id, msg_id, None).await;
+        }
         return;
     }
     let called = match &trigger_decision {
@@ -2197,7 +2200,9 @@ async fn handle_command(
                     &caller,
                 )
                 .await;
-                send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+                if !reply.trim().is_empty() {
+                    send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+                }
             }
             // Still-unknown slash command — ignore (legacy behavior).
             //

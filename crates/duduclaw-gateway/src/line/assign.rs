@@ -49,7 +49,7 @@ pub(crate) async fn command_messages(
     let event_id = trigger::event_key(event, &session);
     let seq = event.timestamp.unwrap_or_else(crate::trigger_route::pending::next_seq);
     let c = caller(state, &session, sender, &event_id, seq, Some(fallback));
-    let reply = assign::run(&state.ctx, cmd, &c).await;
+    let reply = Box::pin(assign::run(&state.ctx, cmd, &c)).await;
     messages_for(&reply, crate::trigger_route::texts::lang_for(&state.home_dir))
 }
 
@@ -67,13 +67,17 @@ pub(crate) async fn pending_messages(
     let event_id = trigger::event_key(event, &session);
     let seq = event.timestamp.unwrap_or_else(crate::trigger_route::pending::next_seq);
     let c = caller(state, &session, sender, &event_id, seq, Some(fallback));
-    let reply = assign::run_pending(&state.ctx, agent, text, &c).await;
+    let reply = Box::pin(assign::run_pending(&state.ctx, agent, text, &c)).await;
     messages_for(&reply, crate::trigger_route::texts::lang_for(&state.home_dir))
 }
 
 /// The LINE messages for one reply: the assignable list as quick-reply
 /// buttons, anything else as text.
 pub(crate) fn messages_for(reply: &AssignReply, lang: Lang) -> Vec<serde_json::Value> {
+    if reply.text.trim().is_empty() {
+        // A throttled refusal: send nothing.
+        return Vec::new();
+    }
     match reply.list.as_deref() {
         Some(agents) if !agents.is_empty() => vec![list_message(&reply.text, agents, lang)],
         _ => vec![serde_json::json!({ "type": "text", "text": reply.text })],

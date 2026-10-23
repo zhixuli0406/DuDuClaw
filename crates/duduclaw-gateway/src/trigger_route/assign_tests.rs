@@ -103,10 +103,17 @@ async fn an_unmapped_sender_is_asked_to_link_an_account_whatever_they_name() {
     let c = conv();
     let x = caller(t.path(), c, "U_x", None);
     for text in ["/交辦", "/交辦 狀態", "/交辦 @嘟嘟總機 x", "/交辦 @沒有這個人 x"] {
+        // A fresh conversation each time: on LINE a repeat inside the
+        // throttle window gets no answer at all.
+        let x = caller(t.path(), conv(), "U_x", None);
         let r = run_line(&reg, &x, text).await;
         assert_eq!(r.text, t::needs_identity(Lang::ZhTw), "{text}");
         assert!(r.task.is_none());
     }
+    let again = run_line(&reg, &x, "/交辦").await;
+    assert_eq!(again.text, t::needs_identity(Lang::ZhTw));
+    let throttled = run_line(&reg, &x, "/交辦").await;
+    assert!(throttled.text.is_empty(), "a repeat within the window is silent");
     assert!(audit_lines(t.path(), "human_assign_refused") >= 1);
 }
 
@@ -172,14 +179,15 @@ async fn a_direct_owner_assigns_and_others_are_refused_with_the_right_text() {
     assert_eq!(r.text, t::call_only(Lang::ZhTw, "財務小幫手"));
     assert!(r.task.is_none());
     // The default employee is open for talking only.
-    let r = run_line(&reg, &viewer, "/交辦 @嘟嘟總機 x").await;
+    let viewer2 = caller(t.path(), conv(), "U_viewer", None);
+    let r = run_line(&reg, &viewer2, "/交辦 @嘟嘟總機 x").await;
     assert_eq!(r.text, t::call_only(Lang::ZhTw, "嘟嘟總機"));
     // A peer manager: no grant at all → the explicit refusal.
     let peer = caller(t.path(), c, "U_peer", None);
     let r = run_line(&reg, &peer, "/交辦 @sales-rep x").await;
     assert_eq!(r.text, texts::forbidden(Lang::ZhTw));
     let r2 = run_line(&reg, &peer, "/交辦 @sales-rep y").await;
-    assert_eq!(r2.text, texts::forbidden(Lang::ZhTw));
+    assert!(r2.text.is_empty(), "the repeat inside the window is silent: {}", r2.text);
     // Refusals are audited, a repeat within the minute only once.
     let store = crate::task_store::TaskStore::open(t.path()).unwrap();
     assert_eq!(store.list_tasks(None, Some("finance"), None).await.unwrap().len(), 0);

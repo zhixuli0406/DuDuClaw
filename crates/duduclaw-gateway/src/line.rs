@@ -942,9 +942,13 @@ async fn process_line_events(
                                 .as_ref()
                                 .map(|r| r.fallback.as_str())
                                 .unwrap_or(agent_id);
-                            let messages =
-                                assign::command_messages(state, &event, assign_cmd, fallback).await;
-                            let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                            let messages = Box::pin(assign::command_messages(
+                                state, &event, assign_cmd, fallback,
+                            ))
+                            .await;
+                            if !messages.is_empty() {
+                                let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                            }
                             continue;
                         }
                         // Real per-channel admin status (fail-closed) — never hardcoded.
@@ -1027,9 +1031,13 @@ async fn process_line_events(
                     }
                     _ => None,
                 }) {
-                    let messages =
-                        assign::pending_messages(state, &event, &assignee, &input_text, &fallback).await;
-                    let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                    let messages = Box::pin(assign::pending_messages(
+                        state, &event, &assignee, &input_text, &fallback,
+                    ))
+                    .await;
+                    if !messages.is_empty() {
+                        let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                    }
                     continue;
                 }
 

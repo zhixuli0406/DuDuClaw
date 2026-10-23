@@ -269,7 +269,8 @@ pub(super) async fn pending_assign_reply(
         fallback: Some(fallback),
         access,
     };
-    let reply = crate::trigger_route::assign::run_pending(&state.ctx, &agent, text, &caller).await;
+    let reply =
+        Box::pin(crate::trigger_route::assign::run_pending(&state.ctx, &agent, text, &caller)).await;
     Some(ChatMessage::AssistantDone {
         content: reply.text,
         tokens_used: 0,

@@ -316,9 +316,21 @@ fn assignable_list(
     }
 }
 
+/// A refusal: audited, and on LINE and Telegram (metered or group-heavy
+/// channels whose adapters skip an empty reply) sent at most once per sender
+/// per conversation every [`super::DIRECT_REPLY_INTERVAL`], like the `@`
+/// refusal; repeats inside the window get no answer. Other channels always
+/// answer.
 fn refused(caller: &AssignCaller<'_>, agent: Option<&str>, reason: &'static str, text: String) -> Plan {
     super::assign_audit::refused(caller, agent.unwrap_or(""), reason);
-    Plan::Reply(AssignReply::text(text))
+    let throttled = matches!(caller.channel, "line" | "telegram")
+        && !super::allow_direct_reply(
+            caller.channel,
+            caller.conversation,
+            caller.sender,
+            super::turn::ReplyKind::Refusal,
+        );
+    Plan::Reply(AssignReply::text(if throttled { String::new() } else { text }))
 }
 
 /// For a channel that admits an event before handling it (LINE durable
@@ -365,7 +377,9 @@ pub async fn run(
         let reg = ctx.registry.read().await;
         plan(&reg, lang, cmd, caller)
     };
-    execute(home, lang, decided, caller).await
+    // Boxed: the reply pipelines that await this are already very large
+    // futures (a debug build overflowed its stack with this inlined).
+    Box::pin(execute(home, lang, decided, caller)).await
 }
 
 /// Run the message an armed `/交辦 @name` (for `agent`) was waiting for.
@@ -381,7 +395,7 @@ pub async fn run_pending(
         let reg = ctx.registry.read().await;
         plan_pending(&reg, lang, agent, text, caller)
     };
-    execute(home, lang, decided, caller).await
+    Box::pin(execute(home, lang, decided, caller)).await
 }
 
 /// Carry out a [`Plan`].

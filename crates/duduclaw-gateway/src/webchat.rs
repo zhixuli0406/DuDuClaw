@@ -1117,10 +1117,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // The message an armed `/交辦 @name` was waiting
                                 // for becomes that task (rights checked again).
                                 if !crate::chat_commands::is_command(&content) {
-                                    if let Some(frame) = route::pending_assign_reply(
+                                    if let Some(frame) = Box::pin(route::pending_assign_reply(
                                         &state, &auth_user, &content, effective_agent.as_deref(),
                                         &agent_id, sid, &user_id, conv_nonce.clone(),
-                                    ).await {
+                                    )).await {
                                         if let Ok(json) = serde_json::to_string(&frame) {
                                             let _ = sink.send(Message::Text(json.into())).await;
                                         }
@@ -1215,7 +1215,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         let (reply, task) = match &cmd {
                                             crate::chat_commands::ChatCommand::Assign(assign_cmd) => {
                                                 let ac = caller.assign_caller(&state.ctx.home_dir, sid, Some(effective_agent_id));
-                                                let r = crate::trigger_route::assign::run(&state.ctx, assign_cmd, &ac).await;
+                                                let r = Box::pin(crate::trigger_route::assign::run(&state.ctx, assign_cmd, &ac)).await;
                                                 (r.text, r.task)
                                             }
                                             crate::chat_commands::ChatCommand::Rules { .. } => (
