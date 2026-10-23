@@ -329,10 +329,11 @@ pub fn resolve_notify_fallback_with_sender(
             .split_once("#agent:")
             .map(|(_, a)| a.to_string())
             .filter(|a| duduclaw_core::is_valid_agent_id(a));
-        if let Some((channel, chat)) = conversation.split_once(':') {
-            if PUSHABLE_CHANNELS.contains(&channel) && !chat.is_empty() {
-                return Some((channel.to_string(), chat.to_string(), sender));
-            }
+        if let Some((channel, chat)) = conversation.split_once(':')
+            && PUSHABLE_CHANNELS.contains(&channel)
+            && !chat.is_empty()
+        {
+            return Some((channel.to_string(), chat.to_string(), sender));
         }
     }
     None
