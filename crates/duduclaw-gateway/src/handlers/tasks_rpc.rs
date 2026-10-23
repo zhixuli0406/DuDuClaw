@@ -163,6 +163,15 @@ impl MethodHandler {
         if params.get("kind").is_some_and(|value| !value.is_null() && !value.is_string()) {
             return WsFrame::error_response("", "kind must be a string");
         }
+        // `schedule`: hand the task over later or on a repeat instead of now
+        // (`assign_schedule`). The dispatcher already checked
+        // `can_assign_to(assigned_to)`; every fire checks it again.
+        if params.get("schedule").is_some_and(|s| !s.is_null()) {
+            let agent = params.get("assigned_to").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            return self
+                .handle_assign_schedule_create(crate::assign_schedule::AssignKind::Task, &agent, &params, ctx)
+                .await;
+        }
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
