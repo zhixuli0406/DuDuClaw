@@ -12,6 +12,10 @@
 //!
 //! A public web-widget visitor is treated like an unmapped messaging-app
 //! sender: the default employee plus `[channels] public_trigger` employees.
+//!
+//! "May call" for an account is its live effective access (direct bindings
+//! and, for a Manager, team grants through `users.manager_user_id`), the
+//! same set the `agents.callable` RPC lists for the `@` popup.
 
 use crate::trigger_route::{self, SenderAccess, TriggerRoute};
 
@@ -22,24 +26,61 @@ pub(super) const AGENT_FORBIDDEN_CODE: &str = "mention_forbidden";
 /// Error code on a `@` list / ambiguous name answer; `choices` carries the
 /// `@name` texts (the dashboard renders the heading).
 pub(super) const MENTION_CHOICES_CODE: &str = "mention_choices";
+/// Most cached ACL snapshots; beyond it stale generations go first, then
+/// everything.
+const ACL_CACHE_MAX: usize = 4_096;
 
 impl WebChatState {
-    /// The account's role and bindings, through the short-TTL ACL cache. A
+    /// What the account may call, through the ACL cache. An entry is reused
+    /// only while `auth_meta.acl_generation` is unchanged (every binding,
+    /// role, status or manager write bumps it) and for `ACL_CACHE_TTL` at
+    /// most. When the generation cannot be read the cache is bypassed. A
     /// failed lookup is not cached and returns `Err` (callers deny).
     pub(super) async fn acl_snapshot(&self, user_id: &str) -> Result<AclSnapshot, String> {
         let now = std::time::Instant::now();
-        {
+        // SQLite reads are blocking: keep them off the runtime workers.
+        let db = self.user_db.clone();
+        let generation = match tokio::task::spawn_blocking(move || db.acl_generation()).await {
+            Ok(Ok(g)) => Some(g),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "WebChat ACL generation unreadable — bypassing the cache");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "WebChat ACL generation task failed — bypassing the cache");
+                None
+            }
+        };
+        if let Some(g) = generation {
             let cache = self.acl_cache.lock().await;
             if let Some((snapshot, at)) = cache.get(user_id) {
-                if now.duration_since(*at) < super::ACL_CACHE_TTL {
+                if snapshot.generation() == g && now.duration_since(*at) < super::ACL_CACHE_TTL {
                     return Ok(snapshot.clone());
                 }
             }
         }
-        let lookup = load_acl_snapshot(&self.user_db, user_id);
-        if let Ok(snapshot) = &lookup {
-            let mut cache = self.acl_cache.lock().await;
-            cache.insert(user_id.to_string(), (snapshot.clone(), now));
+        let (db, home, uid) = (
+            self.user_db.clone(),
+            self.ctx.home_dir.clone(),
+            user_id.to_string(),
+        );
+        let lookup = tokio::task::spawn_blocking(move || load_acl_snapshot(&home, &db, &uid, generation))
+            .await
+            .unwrap_or_else(|e| Err(format!("ACL lookup task failed: {e}")));
+        if let (Ok(snapshot), Some(g)) = (&lookup, generation) {
+            // Cache only a snapshot read at the generation seen before the
+            // read; one taken after a concurrent write would carry a newer
+            // generation and is simply not cached.
+            if snapshot.generation() == g {
+                let mut cache = self.acl_cache.lock().await;
+                if cache.len() >= ACL_CACHE_MAX && !cache.contains_key(user_id) {
+                    cache.retain(|_, (s, _)| s.generation() == g);
+                    if cache.len() >= ACL_CACHE_MAX {
+                        cache.clear();
+                    }
+                }
+                cache.insert(user_id.to_string(), (snapshot.clone(), now));
+            }
         }
         lookup
     }
@@ -50,14 +91,37 @@ impl WebChatState {
             return SenderAccess::unmapped();
         }
         match self.acl_snapshot(auth_user).await {
-            Ok(s) => {
-                SenderAccess::from_role(auth_user, s.role, s.bound_agents.iter().cloned().collect())
-            }
+            Ok(s) => SenderAccess::from_effective(s.access),
             Err(e) => {
                 tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — only the default employee is callable: {e}");
                 SenderAccess::no_bindings(auth_user)
             }
         }
+    }
+}
+
+impl WebChatState {
+    /// May this connection resume a stored session whose employee is
+    /// `stored_agent`? The same `SenderAccess::may_call` the `@` route and
+    /// `agents.callable` use, with the session's own default employee, so a
+    /// conversation started by `@` with a public or default employee resumes
+    /// like one with a bound or team employee. Fails closed to "only what
+    /// everyone may call" when the account cannot be read.
+    pub(super) async fn may_resume_into(
+        &self,
+        auth_user: &str,
+        stored_agent: &str,
+        sid: &str,
+        user_id: &str,
+    ) -> bool {
+        let access = self.sender_access(auth_user).await;
+        let reg = self.ctx.registry.read().await;
+        let default_id = crate::channel_reply::resolve_fallback_agent(&self.ctx, &reg, sid, user_id)
+            .await
+            .map(|a| a.config.agent.name.clone());
+        reg.get(stored_agent)
+            .filter(|a| a.config.agent.status.is_operational())
+            .is_some_and(|a| access.may_call(a, default_id.as_deref()))
     }
 }
 
@@ -103,7 +167,7 @@ pub(super) async fn decide_webchat_route(
         .unwrap_or_else(|| default_id.clone());
     let route = trigger_route::decide(&reg, text, &access, Some(&default_id));
     Ok(
-        match route_outcome(state, &reg, &access, auth_user, route)? {
+        match route_outcome(state, &reg, &access, auth_user, &default_id, route)? {
             None => WebRoute {
                 agent: selected
                     .map(str::to_string)
@@ -125,17 +189,19 @@ fn route_outcome(
     reg: &duduclaw_agent::registry::AgentRegistry,
     access: &SenderAccess,
     auth_user: &str,
+    default_id: &str,
     route: TriggerRoute,
 ) -> Result<Option<String>, Box<ChatMessage>> {
     let home = &state.ctx.home_dir;
     match route {
         TriggerRoute::None => Ok(None),
         TriggerRoute::Routed { agent, .. } => {
-            trigger_route::audit(home, "webchat", access, auth_user, &agent, "allowed");
+            let via = trigger_route::grant_for(reg, access, &agent, Some(default_id));
+            trigger_route::audit(home, "webchat", access, auth_user, &agent, "allowed", via.as_ref());
             Ok(Some(agent))
         }
         TriggerRoute::Forbidden { agent } => {
-            trigger_route::audit(home, "webchat", access, auth_user, &agent, "refused");
+            trigger_route::audit(home, "webchat", access, auth_user, &agent, "refused", None);
             Err(Box::new(ChatMessage::error_coded(
                 trigger_route::FORBIDDEN_TEXT,
                 AGENT_FORBIDDEN_CODE,

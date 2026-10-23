@@ -146,11 +146,15 @@ impl MethodHandler {
         };
         let env = std::env::var("DUDUCLAW_EDITION").ok();
         let override_ed = *self.edition_override.read().await;
-        duduclaw_core::EditionProfile::resolve(
+        let edition = duduclaw_core::EditionProfile::resolve(
             env.as_deref(),
             override_ed.map(|e| e.as_str()),
             tier_key.as_deref(),
-        )
+        );
+        // Team grants follow the edition (`team_edition.rs`); the channel
+        // and WebChat paths read what was last resolved here.
+        crate::team_edition::record(&self.home_dir, edition);
+        edition
     }
 
     /// Lazily open (once) the shared [`AuditEventIndex`] and return it.

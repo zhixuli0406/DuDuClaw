@@ -527,17 +527,30 @@ pub fn trusted_dashboard_principal(
         let (agent, level) = row.map_err(|_| "identity unavailable")?;
         bindings.insert(agent, level.parse()?);
     }
+    let role: duduclaw_auth::UserRole = role.parse()?;
+    // Team grants (a Manager calling or assigning to a report's employee)
+    // are carried so the task board can apply `can_assign_to` on this same
+    // live identity. Review evidence, workflow audiences and the knowledge
+    // base authorize on direct bindings (`has_agent_access`), which ignores
+    // them, so nothing there widens. A team read error denies like any other.
+    // Personal edition: no team grants (`team_edition.rs`).
+    let team_access = if role.at_least(duduclaw_auth::UserRole::Manager)
+        && crate::team_edition::team_grants_enabled(home)
+    {
+        duduclaw_auth::org::team_grants_on(&db, principal)
+            .map_err(|_| "identity unavailable")?
+            .into_iter()
+            .collect()
+    } else {
+        Default::default()
+    };
     Ok(duduclaw_auth::UserContext {
         user_id: principal.into(),
         email,
-        role: role.parse()?,
+        role,
         agent_access: bindings,
         must_change_password: false,
-        // Deliberately empty: review evidence, workflow audiences and the
-        // knowledge base authorize on direct bindings only. When team grants
-        // start to drive routing (PR-B of the human-org design) revisit this
-        // read-only path, or build it with `UserContext::from_live`.
-        team_access: Default::default(),
+        team_access,
         acl_generation: 0,
     })
 }

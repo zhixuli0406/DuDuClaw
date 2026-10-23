@@ -309,25 +309,37 @@ pub struct ChatAttachment {
 /// an active-connection disconnect mechanism.
 const ACL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Snapshot of a user's role + full agent-binding set — the data
-/// `WebChatState::agent_access_allowed` needs to gate explicit `agent`
-/// selection in a WebChat `user_message`. Pure data, no DB handle, so the
-/// decision logic below (`acl_allows_agent` / `resolve_agent_acl`) is
-/// unit-testable without a live `UserDb`.
+/// Snapshot of what a user may call — role, direct bindings and team
+/// grants (`duduclaw_auth::EffectiveAccess`, read live from users.db at one
+/// ACL generation) — the data `WebChatState::agent_access_allowed` needs to
+/// gate explicit `agent` selection in a WebChat `user_message`. Pure data,
+/// no DB handle, so the decision logic below (`acl_allows_agent` /
+/// `resolve_agent_acl`) is unit-testable without a live `UserDb`.
 #[derive(Debug, Clone)]
 struct AclSnapshot {
-    role: duduclaw_auth::UserRole,
-    bound_agents: std::collections::HashSet<String>,
+    access: std::sync::Arc<duduclaw_auth::EffectiveAccess>,
+}
+
+impl AclSnapshot {
+    fn role(&self) -> duduclaw_auth::UserRole {
+        self.access.role
+    }
+
+    fn generation(&self) -> u64 {
+        self.access.generation
+    }
 }
 
 /// C-ACL (P0-S1): may `snapshot`'s user address `agent_name` by name in a
 /// `user_message`? Admins pass unconditionally; everyone else needs a
 /// binding to the named agent at ANY access level — Viewer is enough to
-/// converse (this gates *which agent* the turn addresses, not what the user
-/// may do to it once selected; that finer-grained check is
-/// `duduclaw_auth::acl::require_agent_access` on the dashboard RPC path).
+/// converse — or a team grant (a Manager calling an employee bound to one of
+/// their reports). This gates *which agent* the turn addresses, not what the
+/// user may do to it once selected; that finer-grained check is
+/// `duduclaw_auth::acl::require_agent_access` on the dashboard RPC path, and
+/// team grants never reach it.
 fn acl_allows_agent(snapshot: &AclSnapshot, agent_name: &str) -> bool {
-    snapshot.role == duduclaw_auth::UserRole::Admin || snapshot.bound_agents.contains(agent_name)
+    snapshot.role() == duduclaw_auth::UserRole::Admin || snapshot.access.may_call(agent_name)
 }
 
 /// Compose a (possibly failed) ACL lookup into a final allow/deny decision.
@@ -413,23 +425,28 @@ fn webchat_command_admin(user_db: &UserDb, auth_user: &str) -> bool {
     )
 }
 
-/// Load `user_id`'s role + full agent-binding set from the auth DB — the one
-/// DB round-trip `WebChatState::agent_access_allowed` performs on a cache
-/// miss.
-fn load_acl_snapshot(user_db: &UserDb, user_id: &str) -> Result<AclSnapshot, String> {
+/// Load what `user_id` may call from the auth DB — the DB round-trip
+/// `WebChatState::agent_access_allowed` performs on a cache miss.
+/// `generation` is the ACL generation read before this call; an inactive
+/// account's empty snapshot is stamped with it.
+fn load_acl_snapshot(
+    home: &std::path::Path,
+    user_db: &UserDb,
+    user_id: &str,
+    generation: Option<u64>,
+) -> Result<AclSnapshot, String> {
     // An unknown account fails closed; an inactive one keeps no bindings and
     // is never Admin (the JWT may outlive a suspension).
     if user_db.get_user(user_id)?.is_none() {
         return Err("user not found".to_string());
     }
-    match crate::trigger_route::access::load_account(user_db, user_id)? {
-        Some((role, bound)) => Ok(AclSnapshot {
-            role,
-            bound_agents: bound.into_iter().collect(),
-        }),
+    match crate::trigger_route::access::load_account(home, user_db, user_id)? {
+        Some(access) => Ok(AclSnapshot { access }),
         None => Ok(AclSnapshot {
-            role: duduclaw_auth::UserRole::Employee,
-            bound_agents: std::collections::HashSet::new(),
+            access: crate::trigger_route::access::inactive_access(
+                user_id,
+                generation.unwrap_or(0),
+            ),
         }),
     }
 }
@@ -443,9 +460,9 @@ pub struct WebChatState {
     user_db: Arc<UserDb>,
     /// Track active connections per user_id.
     connections: tokio::sync::Mutex<std::collections::HashMap<String, usize>>,
-    /// C-ACL (P0-S1): per-user role+bindings snapshot cache, keyed by
-    /// authenticated user id. Populated lazily on the first explicit-agent
-    /// selection and refreshed after `ACL_CACHE_TTL`.
+    /// C-ACL (P0-S1): per-user callable-set snapshot cache, keyed by
+    /// authenticated user id. Populated lazily; an entry is reused only at
+    /// the ACL generation it was read at, and for `ACL_CACHE_TTL` at most.
     acl_cache:
         tokio::sync::Mutex<std::collections::HashMap<String, (AclSnapshot, std::time::Instant)>>,
 }
@@ -1024,9 +1041,15 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 // to non-default agents only — the
                                                 // default/main agent branch above is
                                                 // untouched, matching wave one).
+                                                // Same predicate as the `@` list
+                                                // (`agents.callable`): an employee the
+                                                // account may still call by `@` — a
+                                                // binding, a team grant, this
+                                                // conversation's default employee or a
+                                                // public one — resumes.
                                                 if resume_needs_acl_check(&stored_agent, &agent_id)
                                                     && !state
-                                                        .agent_access_allowed(&auth_user, &stored_agent)
+                                                        .may_resume_into(&auth_user, &stored_agent, &want, &user_id)
                                                         .await
                                                 {
                                                     warn!(
@@ -2238,8 +2261,16 @@ mod tests {
 
     fn snapshot(role: UserRole, bound: &[&str]) -> AclSnapshot {
         AclSnapshot {
-            role,
-            bound_agents: bound.iter().map(|s| s.to_string()).collect(),
+            access: std::sync::Arc::new(duduclaw_auth::EffectiveAccess {
+                user_id: "u-test".into(),
+                role,
+                direct: bound
+                    .iter()
+                    .map(|s| (s.to_string(), AccessLevel::Viewer))
+                    .collect(),
+                team: Default::default(),
+                generation: 1,
+            }),
         }
     }
 
@@ -2372,7 +2403,7 @@ mod tests {
         // Mirrors a widget-visitor id or a user deleted mid-session — neither
         // is a row `get_user` can find, and that must deny rather than
         // silently defaulting to some permissive shape.
-        let result = load_acl_snapshot(&db, "no-such-user-id");
+        let result = load_acl_snapshot(_dir.path(), &db, "no-such-user-id", None);
         assert!(result.is_err(), "an unknown user id must fail closed");
     }
 
@@ -2390,10 +2421,61 @@ mod tests {
         db.bind_agent(&user.id, "sales-bot", AccessLevel::Viewer)
             .expect("bind agent");
 
-        let snap = load_acl_snapshot(&db, &user.id).expect("lookup should succeed");
-        assert_eq!(snap.role, UserRole::Employee);
-        assert!(snap.bound_agents.contains("sales-bot"));
-        assert!(!snap.bound_agents.contains("other-bot"));
+        let snap = load_acl_snapshot(_dir.path(), &db, &user.id, None).expect("lookup should succeed");
+        assert_eq!(snap.role(), UserRole::Employee);
+        assert!(acl_allows_agent(&snap, "sales-bot"));
+        assert!(!acl_allows_agent(&snap, "other-bot"));
+        assert_eq!(snap.generation(), db.acl_generation().unwrap());
+    }
+
+    /// PR-B (team callable): a Manager may select an employee bound to a
+    /// report two levels down, never a peer's; clearing the middle manager's
+    /// line takes the grant away at the next generation.
+    #[test]
+    fn load_acl_snapshot_includes_team_grants_and_follows_the_org() {
+        let (_jwt, db, _dir) = fixtures();
+        let mk = |email: &str, role| {
+            db.create_user(email, email, "pw-strong-123", role)
+                .expect("create user")
+                .id
+        };
+        let mgr = mk("mgr@example.com", UserRole::Manager);
+        let lead = mk("lead@example.com", UserRole::Manager);
+        let emp1 = mk("emp1@example.com", UserRole::Employee);
+        let other = mk("other@example.com", UserRole::Employee);
+        db.set_manager(&lead, Some(&mgr)).unwrap();
+        db.set_manager(&emp1, Some(&lead)).unwrap();
+        db.bind_agent(&emp1, "sales", AccessLevel::Owner).unwrap();
+        db.bind_agent(&other, "finance", AccessLevel::Owner).unwrap();
+
+        // Personal edition (nothing recorded, or a downgrade): no team.
+        let snap = load_acl_snapshot(_dir.path(), &db, &mgr, None).unwrap();
+        assert!(!acl_allows_agent(&snap, "sales"), "personal edition ignores team grants");
+        crate::team_edition::record(_dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        let snap = load_acl_snapshot(_dir.path(), &db, &mgr, None).unwrap();
+        assert!(acl_allows_agent(&snap, "sales"), "a report's employee");
+        assert!(!acl_allows_agent(&snap, "finance"), "a peer's employee");
+        let before = snap.generation();
+
+        db.set_manager(&lead, None).unwrap();
+        let snap = load_acl_snapshot(_dir.path(), &db, &mgr, None).unwrap();
+        assert!(snap.generation() > before);
+        assert!(!acl_allows_agent(&snap, "sales"), "the line was cut");
+    }
+
+    #[test]
+    fn inactive_account_snapshot_calls_nothing_and_carries_the_generation() {
+        let (_jwt, db, _dir) = fixtures();
+        let user = db
+            .create_user("sus@example.com", "Sus", "pw-strong-123", UserRole::Admin)
+            .unwrap();
+        db.bind_agent(&user.id, "sales-bot", AccessLevel::Owner).unwrap();
+        db.set_user_status(&user.id, duduclaw_auth::UserStatus::Suspended)
+            .unwrap();
+        let snap = load_acl_snapshot(_dir.path(), &db, &user.id, Some(42)).unwrap();
+        assert_eq!(snap.role(), UserRole::Employee, "never Admin once suspended");
+        assert!(!acl_allows_agent(&snap, "sales-bot"));
+        assert_eq!(snap.generation(), 42);
     }
 
     /// v1.68.0: WebChat admin-gated commands — Admin accounts only; managers,
@@ -2439,8 +2521,8 @@ mod tests {
             .create_user("dana@example.com", "Dana", "pw-strong-123", UserRole::Admin)
             .expect("create user");
 
-        let snap = load_acl_snapshot(&db, &admin.id).expect("lookup should succeed");
-        assert_eq!(snap.role, UserRole::Admin);
+        let snap = load_acl_snapshot(_dir.path(), &db, &admin.id, None).expect("lookup should succeed");
+        assert_eq!(snap.role(), UserRole::Admin);
         // Admin needs no bindings — `acl_allows_agent` short-circuits on role.
         assert!(acl_allows_agent(&snap, "literally-any-agent"));
     }

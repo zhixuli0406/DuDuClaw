@@ -28,8 +28,8 @@ fn frame(r: Result<Value, String>) -> WsFrame {
 }
 
 /// Text shown for a file: `agent.toml` is masked (secrets never leave).
-fn display_text(key: FileKey, text: &str) -> Result<(String, Vec<String>), String> {
-    if key != FileKey::AgentToml || text.is_empty() {
+fn display_text(key: &FileKey, text: &str) -> Result<(String, Vec<String>), String> {
+    if *key != FileKey::AgentToml || text.is_empty() {
         return Ok((text.to_string(), Vec::new()));
     }
     let (masked, keys, _) = super::config_raw_rpc::mask_raw_toml(text)
@@ -37,7 +37,7 @@ fn display_text(key: FileKey, text: &str) -> Result<(String, Vec<String>), Strin
     Ok((masked, keys))
 }
 
-fn drift_of(home: &Path, agent_id: &str, key: FileKey) -> (&'static str, Option<String>) {
+fn drift_of(home: &Path, agent_id: &str, key: &FileKey) -> (&'static str, Option<String>) {
     let Some(doc) = key.protected_doc() else { return ("none", None) };
     let Ok(dir) = crate::agent_files::agent_dir(home, agent_id) else { return ("none", None) };
     let state = duduclaw_security::soul_guard::doc_drift(doc, &dir);
@@ -59,29 +59,56 @@ impl MethodHandler {
     async fn agent_files_list(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
         let agent_id = str_param(params, "agent_id")?;
         let live = self.live(ctx, agent_id, AccessLevel::Viewer)?;
-        crate::agent_files::agent_dir(&self.home_dir, agent_id)?;
+        let dir = crate::agent_files::agent_dir(&self.home_dir, agent_id)?;
         fa::sweep(&self.home_dir).await;
         let can_write = live.has_agent_access(agent_id, AccessLevel::Owner);
+        let skills = crate::agent_files::skills::list(&dir);
         let mut files = Vec::new();
         let mut limits = serde_json::Map::new();
         for key in FileKey::ALL {
-            let path = crate::agent_files::file_path(&self.home_dir, agent_id, key)?;
-            let text = crate::agent_files::read_or_empty(&path)?;
-            let last = history::last(&self.home_dir, agent_id, key);
-            files.push(json!({
-                "file": key.as_str(),
-                "label_key": key.label_key(),
-                "exists": path.exists(),
-                "size": text.len(),
-                "hash": crate::agent_files::hash_of(&text),
-                "editable_by_me": can_write && key.text_editable(),
-                "last_change": last.map(|v| json!({ "at": v.at, "user_id": v.user_id, "source": v.source })),
-                "drift": drift_of(&self.home_dir, agent_id, key).0,
-                "pending_approval_id": fa::pending_for(&self.home_dir, agent_id, key).await,
-            }));
+            files.push(self.list_entry(agent_id, &key, can_write).await?);
             limits.insert(key.as_str().into(), json!(key.max_bytes()));
         }
+        // The skills folder is employee-writable: one odd file (gone, too
+        // big, not text) shows as unreadable instead of failing the list.
+        for p in skills {
+            let key = FileKey::Skill(p.clone());
+            let mut entry = match self.list_entry(agent_id, &key, can_write).await {
+                Ok(e) => e,
+                Err(_) => json!({
+                    "file": key.as_str(), "label_key": key.label_key(), "exists": true, "size": 0, "hash": "",
+                    "editable_by_me": false, "last_change": null, "drift": "none", "pending_approval_id": null,
+                    "unreadable": true,
+                }),
+            };
+            entry["skill_name"] = json!(p.skill_name());
+            entry["path"] = json!(format!("{}/{}", crate::agent_files::skills::SKILLS_DIR, p.rel()));
+            files.push(entry);
+        }
+        limits.insert("skill".into(), json!(crate::agent_files::MAX_MARKDOWN_BYTES));
         Ok(json!({ "agent_id": agent_id, "files": files, "limits": limits }))
+    }
+
+    /// One `agent_files.list` row. A file larger than twice its limit is not
+    /// read (it cannot be saved here anyway).
+    async fn list_entry(&self, agent_id: &str, key: &FileKey, can_write: bool) -> Result<Value, String> {
+        let path = crate::agent_files::file_path(&self.home_dir, agent_id, key)?;
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > (key.max_bytes() as u64) * 2 {
+            return Err(format!("{} is too large to show", key.file_name()));
+        }
+        let text = crate::agent_files::read_or_empty(&path)?;
+        let last = history::last(&self.home_dir, agent_id, key);
+        Ok(json!({
+            "file": key.as_str(),
+            "label_key": key.label_key(),
+            "exists": path.exists(),
+            "size": text.len(),
+            "hash": crate::agent_files::hash_of(&text),
+            "editable_by_me": can_write && key.text_editable(),
+            "last_change": last.map(|v| json!({ "at": v.at, "user_id": v.user_id, "source": v.source })),
+            "drift": drift_of(&self.home_dir, agent_id, key).0,
+            "pending_approval_id": fa::pending_for(&self.home_dir, agent_id, key).await,
+        }))
     }
 
     /// `agent_files.get {agent_id, file, version_id?}`.
@@ -94,13 +121,16 @@ impl MethodHandler {
         let key = file_param(params)?;
         let version = params.get("version_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         self.live(ctx, agent_id, if version.is_some() { AccessLevel::Operator } else { AccessLevel::Viewer })?;
-        let path = crate::agent_files::file_path(&self.home_dir, agent_id, key)?;
+        let path = crate::agent_files::file_path(&self.home_dir, agent_id, &key)?;
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > (key.max_bytes() as u64) * 2 {
+            return Err(format!("{} is too large to show", key.file_name()));
+        }
         let text = match version {
-            Some(v) => history::read_version(&self.home_dir, agent_id, key, v)?,
+            Some(v) => history::read_version(&self.home_dir, agent_id, &key, v)?,
             None => crate::agent_files::read_or_empty(&path)?,
         };
-        let (content, masked) = display_text(key, &text)?;
-        let (state, accepted) = drift_of(&self.home_dir, agent_id, key);
+        let (content, masked) = display_text(&key, &text)?;
+        let (state, accepted) = drift_of(&self.home_dir, agent_id, &key);
         Ok(json!({
             "agent_id": agent_id,
             "file": key.as_str(),
@@ -124,22 +154,22 @@ impl MethodHandler {
         let agent_id = str_param(params, "agent_id")?;
         let key = file_param(params)?;
         self.live(ctx, agent_id, AccessLevel::Operator)?;
-        let current = crate::agent_files::read_or_empty(&crate::agent_files::file_path(&self.home_dir, agent_id, key)?)?;
+        let current = crate::agent_files::read_or_empty(&crate::agent_files::file_path(&self.home_dir, agent_id, &key)?)?;
         let version = |k: &str| params.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let new = match (params.get("content").and_then(|v| v.as_str()), version("version_id")) {
             (Some(c), _) => c.to_string(),
-            (None, Some(v)) => history::read_version(&self.home_dir, agent_id, key, v)?,
+            (None, Some(v)) => history::read_version(&self.home_dir, agent_id, &key, v)?,
             (None, None) => return Err("`content` or `version_id` is required".into()),
         };
         if new.len() > key.max_bytes() * 2 {
             return Err("content is too large".into());
         }
         let old = match version("against") {
-            Some(v) => history::read_version(&self.home_dir, agent_id, key, v)?,
+            Some(v) => history::read_version(&self.home_dir, agent_id, &key, v)?,
             None => current,
         };
-        let (old, _) = display_text(key, &old)?;
-        let (new, _) = display_text(key, &new)?;
+        let (old, _) = display_text(&key, &old)?;
+        let (new, _) = display_text(&key, &new)?;
         Ok(crate::agent_files::diff::diff_json(&old, &new))
     }
 
@@ -149,8 +179,8 @@ impl MethodHandler {
             let agent_id = str_param(&params, "agent_id")?;
             let key = file_param(&params)?;
             self.live(ctx, agent_id, AccessLevel::Operator)?;
-            crate::agent_files::agent_dir(&self.home_dir, agent_id)?;
-            let versions = history::list(&self.home_dir, agent_id, key);
+            crate::agent_files::file_path(&self.home_dir, agent_id, &key)?;
+            let versions = history::list(&self.home_dir, agent_id, &key);
             Ok(json!({ "agent_id": agent_id, "file": key.as_str(), "versions": versions }))
         })())
     }
@@ -168,7 +198,7 @@ impl MethodHandler {
             let agent_id = str_param(&params, "agent_id")?;
             let key = file_param(&params)?;
             self.live(ctx, agent_id, AccessLevel::Owner)?;
-            let content = history::read_version(&self.home_dir, agent_id, key, version)?;
+            let content = history::read_version(&self.home_dir, agent_id, &key, version)?;
             self.agent_files_save(&params, ctx, Some(content)).await
         };
         frame(r.await)
@@ -255,7 +285,7 @@ impl MethodHandler {
     async fn contract_update_live(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
         let agent_id = str_param(params, "agent_id")?;
         let live = self.live(ctx, agent_id, AccessLevel::Owner)?;
-        let path = crate::agent_files::file_path(&self.home_dir, agent_id, FileKey::Contract)?;
+        let path = crate::agent_files::file_path(&self.home_dir, agent_id, &FileKey::Contract)?;
         let current = crate::agent_files::read_or_empty(&path)?;
         let table = build_contract_table(params)?;
         let content = super::config_commit::render_preserving(&current, &table)?;
@@ -360,7 +390,7 @@ impl MethodHandler {
         decided_by: &str,
         ctx: &UserContext,
     ) -> Result<Value, ApplyRefusal> {
-        use crate::agent_files::writer::{Baseline, Commit, CommitError, CommitMeta, commit};
+        use crate::agent_files::writer::{Commit, CommitError, CommitMeta, commit};
         let (agent_id, key) = fa::target(rec).ok_or_else(|| ApplyRefusal::Other("not a profile file change".into()))?;
         let content = fa::approved_content(&self.home_dir, rec).map_err(ApplyRefusal::Other)?;
         let p = &rec.payload;
@@ -381,7 +411,14 @@ impl MethodHandler {
         let decider = ctx.clone();
         let result = commit(
             &self.registry,
-            Commit { home: &self.home_dir, agent_id: &agent_id, key, expected_hash: Some(&base_hash), meta, baseline: Baseline::Accept },
+            Commit {
+                home: &self.home_dir,
+                agent_id: &agent_id,
+                key,
+                expected_hash: Some(&base_hash),
+                meta,
+                baseline: flow::baseline_for(&content, &base_hash),
+            },
             move |_| Ok(content),
             move || crate::approval::operator_cli_gate::require_admin_decider(&home, &decider),
         )

@@ -235,26 +235,26 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(SkillMeta, String), 
     Ok((meta, body))
 }
 
+/// The frontmatter fields as the loader reads them.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RawMeta {
+    name: String,
+    description: String,
+    trigger: String,
+    tools: Vec<String>,
+    tags: Vec<String>,
+    author: String,
+    version: String,
+    requires: Vec<String>,
+    skill_type: SkillType,
+    compose_mode: ComposeMode,
+    display: HashMap<String, LocalizedText>,
+    estimated_minutes_saved: Option<u32>,
+}
+
 /// Parse skill frontmatter YAML using serde_yaml (MCP-M6 — replaces custom parser).
 fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
-    /// Intermediate struct for serde deserialization.
-    #[derive(serde::Deserialize, Default)]
-    #[serde(default)]
-    struct RawMeta {
-        name: String,
-        description: String,
-        trigger: String,
-        tools: Vec<String>,
-        tags: Vec<String>,
-        author: String,
-        version: String,
-        requires: Vec<String>,
-        skill_type: SkillType,
-        compose_mode: ComposeMode,
-        display: HashMap<String, LocalizedText>,
-        estimated_minutes_saved: Option<u32>,
-    }
-
     let raw: RawMeta = serde_yaml::from_str(yaml).unwrap_or_else(|e| {
         tracing::warn!("YAML parse error in {}: {e} — falling back to defaults", path.display());
         RawMeta::default()
@@ -283,6 +283,36 @@ fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
         display: raw.display,
         estimated_minutes_saved: raw.estimated_minutes_saved,
     })
+}
+
+/// Strict check of a SKILL.md's frontmatter for a person editing it: when
+/// the text starts with `---`, the block must be closed, its YAML must be a
+/// mapping, and every field the loader knows must have the right type (other
+/// keys are allowed; the loader itself falls back to empty metadata on any
+/// error, which would silently drop the skill's name and description). A
+/// `name`, when given, must be a single safe path component. Text without
+/// frontmatter is fine.
+pub fn check_frontmatter(content: &str) -> Result<(), String> {
+    let Some(rest) = content.trim_start().strip_prefix("---") else {
+        return Ok(());
+    };
+    let after_first = rest.trim_start_matches(['\r', '\n']);
+    let end = after_first
+        .find("\n---")
+        .ok_or_else(|| "the opening --- has no closing ---".to_string())?;
+    let yaml = after_first.get(..end).unwrap_or("");
+    if yaml.trim().is_empty() {
+        return Ok(());
+    }
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).map_err(|e| format!("YAML: {e}"))?;
+    if !value.is_mapping() {
+        return Err("the block must be a list of `key: value` lines".into());
+    }
+    let raw: RawMeta = serde_yaml::from_value(value).map_err(|e| format!("YAML: {e}"))?;
+    if !raw.name.is_empty() && !is_safe_skill_name(&raw.name) {
+        return Err("`name` must be a single name without `/`, `..` or a leading dot".into());
+    }
+    Ok(())
 }
 
 /// Scan a directory for tool scripts (.js, .ts, .py).
@@ -482,6 +512,18 @@ mod display_tests {
 #[cfg(test)]
 mod install_safety_tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_check_is_strict() {
+        assert!(check_frontmatter("plain body, no frontmatter").is_ok());
+        assert!(check_frontmatter("---\nname: quote\ndescription: 報價\ntools: [a, b]\n---\nbody").is_ok());
+        assert!(check_frontmatter("---\n---\nbody").is_err(), "the loader cannot read an empty block either");
+        assert!(check_frontmatter("---\nname: quote\nbody without a closing line").is_err());
+        assert!(check_frontmatter("---\nname: [unclosed\n---\nbody").is_err(), "bad YAML");
+        assert!(check_frontmatter("---\ntools: just-a-string\n---\nbody").is_err(), "wrong type");
+        assert!(check_frontmatter("---\n- a\n- b\n---\nbody").is_err(), "not a mapping");
+        assert!(check_frontmatter("---\nname: ../../victim/SOUL\n---\nbody").is_err(), "unsafe name");
+    }
 
     #[test]
     fn safe_skill_name_rejects_traversal_shapes() {
