@@ -247,6 +247,10 @@ impl SessionBackend for FakeBackend {
     fn login_owner_valid(&self) -> bool {
         !self.state.owner_changed.load(Ordering::SeqCst)
     }
+    fn login_owner_check(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        let state = Arc::clone(&self.state);
+        Some(Arc::new(move || !state.owner_changed.load(Ordering::SeqCst)))
+    }
     fn discard_login(&mut self) {
         self.state.login_discarded.store(true, Ordering::SeqCst);
     }
@@ -355,6 +359,16 @@ fn insert_session(
     agent: &str,
     config: ComputerUseConfig,
 ) -> String {
+    insert_session_until(mgr, state, agent, config, Instant::now()+Duration::from_secs(600))
+}
+
+fn insert_session_until(
+    mgr: &ComputerUseSessions,
+    state: &Arc<FakeState>,
+    agent: &str,
+    config: ComputerUseConfig,
+    deadline: Instant,
+) -> String {
     let now = Instant::now();
     let id = format!("cu-{}", uuid::Uuid::new_v4().as_simple());
     mgr.insert(ManagedSession {
@@ -366,7 +380,7 @@ fn insert_session(
         }),
         config,
         started: now,
-        deadline: now + Duration::from_secs(600),
+        deadline,
         actions_used: 0,
         last_activity: now,
         shared: Arc::new(SessionShared::default()),
@@ -2598,6 +2612,9 @@ mod workspace_docker;
 mod live_cases;
 #[path = "tests/profile_cases.rs"]
 mod profile_cases;
+
+#[path = "tests/oversight_cases.rs"]
+mod oversight_cases;
 #[path = "tests/profile_docker.rs"]
 mod profile_docker;
 
