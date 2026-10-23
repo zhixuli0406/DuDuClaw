@@ -247,7 +247,7 @@ duduclaw license             # 授權管理(activate / status / redeem / rebind 
 - **維護者**:嘟嘟數位科技有限公司(台灣登記公司,統編 94139082)
 - **頻道裡的高風險操作**:AI 員工在頻道裡請你核准高風險 Computer Use 步驟時,你要回覆該請求的完整 ID;執行結果不明的操作不會自動重送,由 Admin 在管理後台核對。見[操作指南](docs/guides/zh-TW/durable-channel-decisions.md)
 - **瀏覽器登入保存（未發布）**：可選擇加密保存每位員工的容器登入，預設關閉，提供清除與交接保護。真容器驗收待完成。見[使用指南](docs/guides/zh-TW/browser-login-state.md)。
-- **主管觀看瀏覽器（未發布）**：主管可看部屬在真人回合啟動的容器瀏覽器遮罩快照，並結束該工作階段。原有直接綁定的操作權限保留。見[使用指南](docs/guides/zh-TW/browser-watch.md)。
+- **主管觀看瀏覽器（未發布）**：主管可看部屬在真人回合啟動的容器瀏覽器遮罩快照，並結束該工作階段。原有直接綁定的操作權限保留。已驗證對話及對應的工作／執行紀錄可提供限定工作階段的觀看入口，登入後會返回原連結。見[使用指南](docs/guides/zh-TW/browser-watch.md)。
 
 每個 Release 資產都附三種驗證:SHA-256 checksum、[cosign](https://github.com/sigstore/cosign) keyless 簽章、minisign Ed25519 簽章(內建自動更新器會強制驗證,拒絕未簽章或被竄改的版本):
 

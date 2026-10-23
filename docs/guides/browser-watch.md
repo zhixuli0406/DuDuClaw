@@ -37,3 +37,24 @@ ended and a new one has started, the old confirmation cannot stop the new one.
 The macOS local-browser target is a separate feature with a different privacy
 boundary. Team viewing must not expose its page. Platform and provider
 acceptance remain separate from controlled Docker/dashboard fixtures.
+
+## Open a link from a conversation or task
+
+When a container browser starts during a verified conversation, WebChat can
+show a viewing button. Telegram, LINE, Discord and Slack use the original
+account and thread; a link needs a mapped dashboard user and a configured non-loopback
+dashboard address (the administrator must ensure it is reachable). Otherwise the notification is text only. Delivery is best
+effort and does not change whether the browser started. Background runs keep
+the entry in the matching task or run record instead of impersonating a
+conversation.
+
+Sign in normally after opening the link, including any required second factor.
+The dashboard returns to that browser. The link expires within 30 minutes,
+is tied to one session, and grants no permission. Access is checked again
+when opening and viewing it. A forwarded link cannot grant access.
+
+Link-based viewing uses masked snapshots and a stop confirmation for that
+exact session, including for directly bound viewers. An expired link or a
+replacement session clears the image and controls. Use the page's explicit
+current-session button to leave the old link and check the current session
+under your usual permissions. Do not use a viewing link as a login credential.
