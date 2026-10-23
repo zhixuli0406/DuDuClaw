@@ -64,6 +64,8 @@ duduclaw run                  # 起動後 http://localhost:18789 を開く
 
 <a id="architecture"></a>
 
+未リリース：[予約して依頼する](docs/features/ja-JP/67-assigning-tasks.md)機能で、チャットやダッシュボードから AI スタッフへ日時指定・繰り返しの依頼ができます。毎回の実行前に作成者の権限を確認し直します。
+
 ## アーキテクチャ概要
 
 AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます。頭脳は差し替え可能、配管はそのまま:

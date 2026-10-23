@@ -50,6 +50,19 @@ pub enum AssignCommand {
     Status,
     /// `/交辦 <text>`: `@employee` plus the task (or the name alone).
     Text(String),
+    /// `/交辦 排程 …`: the sender's scheduled assignments.
+    Schedules(ScheduleCommand),
+}
+
+/// `/交辦 排程` (list), `/交辦 排程 暫停|恢復|刪除 <編號>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleCommand {
+    List,
+    Pause(String),
+    Resume(String),
+    Remove(String),
+    /// Anything else after `排程`.
+    Usage,
 }
 
 /// The sender of one `/交辦` (or of the message an armed `/交辦 @name` was
@@ -196,6 +209,9 @@ pub(crate) enum Plan {
     Arm { agent: String, name: String },
     Create(CreateSpec),
     Status,
+    /// `/交辦 @name task || 時間:<when>`: a scheduled assignment.
+    ScheduleCreate { spec: CreateSpec, when: String },
+    Schedules(ScheduleCommand),
 }
 
 /// One task to create.
@@ -216,6 +232,7 @@ pub(crate) fn plan(reg: &AgentRegistry, lang: Lang, cmd: &AssignCommand, caller:
         AssignCommand::Status => Plan::Status,
         AssignCommand::List => Plan::Reply(assignable_list(reg, lang, caller, None)),
         AssignCommand::Text(text) => plan_text(reg, lang, text, caller),
+        AssignCommand::Schedules(c) => Plan::Schedules(c.clone()),
     }
 }
 
@@ -255,15 +272,23 @@ fn plan_text(reg: &AgentRegistry, lang: Lang, text: &str, caller: &AssignCaller<
     }
 }
 
-/// The task text (with optional `||` segments) as a goal.
+/// The task text (with optional `||` segments) as a goal; a `時間:` /
+/// `排程:` segment makes it a scheduled assignment.
 fn spec_for(agent: String, agent_name: String, grant: GrantSource, task: &str, lang: Lang) -> Plan {
-    match crate::chat_commands::parse_goal_args(Some(task)) {
-        goal @ GoalCommand::Create { .. } => Plan::Create(CreateSpec {
-            agent,
-            agent_name,
-            grant,
-            goal,
-        }),
+    let (when, task) = super::schedule_chat::split_schedule(task);
+    match crate::chat_commands::parse_goal_args(Some(&task)) {
+        goal @ GoalCommand::Create { .. } => {
+            let spec = CreateSpec {
+                agent,
+                agent_name,
+                grant,
+                goal,
+            };
+            match when {
+                Some(when) => Plan::ScheduleCreate { spec, when },
+                None => Plan::Create(spec),
+            }
+        }
         // `status` alone, or a malformed `時限:` segment.
         _ => Plan::Reply(AssignReply::text(t::usage(lang))),
     }
@@ -427,6 +452,10 @@ pub(crate) async fn execute(home: &Path, lang: Lang, decided: Plan, caller: &Ass
             AssignReply::text(t::ask_for_task(lang, &name, pending::PENDING_TTL.as_secs() / 60))
         }
         Plan::Create(spec) => super::assign_create::create(home, lang, spec, caller).await,
+        Plan::ScheduleCreate { spec, when } => {
+            AssignReply::text(super::schedule_chat::create(home, lang, spec, &when, caller).await)
+        }
+        Plan::Schedules(c) => AssignReply::text(super::schedule_chat::command(home, lang, &c, caller).await),
     }
 }
 

@@ -64,6 +64,8 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 
 <a id="architecture"></a>
 
+Unreleased: [scheduled assignments](docs/features/67-assigning-tasks.md#scheduling-an-assignment) let you hand work to an AI employee for later or on a repeat, from chat or the dashboard. Each run checks the creator's current permission.
+
 ## Architecture at a glance
 
 The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
