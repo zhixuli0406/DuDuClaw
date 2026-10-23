@@ -15,6 +15,7 @@ struct Entry {
     agent: String,
     principal: Option<String>,
     created: Instant,
+    attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
 }
 fn entries() -> &'static Mutex<HashMap<String, Entry>> {
     static ENTRIES: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
@@ -27,10 +28,11 @@ tokio::task_local! { static CONTEXT: Option<String>; }
 pub struct ContextGuard(String);
 impl Drop for ContextGuard {
     fn drop(&mut self) {
-        entries()
+        let removed=entries()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.0);
+        if let Some(call)=removed.and_then(|entry|entry.attendance) {call.invalidate();}
     }
 }
 impl ContextGuard {
@@ -53,7 +55,13 @@ fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option
     let home = home.canonicalize().ok()?;
     let mut entries = entries().lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
-    entries.retain(|_, v| now.saturating_duration_since(v.created) < MAX_AGE);
+    entries.retain(|_, value| {
+        let keep = now.saturating_duration_since(value.created) < MAX_AGE;
+        if !keep && let Some(call) = &value.attendance {
+            call.invalidate();
+        }
+        keep
+    });
     if entries.len() >= MAX_CONTEXTS {
         return None;
     }
@@ -70,9 +78,19 @@ fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option
             agent: agent.into(),
             principal,
             created: now,
+            attendance: crate::computer_use_sessions::attended_call::capture(agent),
         },
     );
     Some(ContextGuard(reference))
+}
+
+/// Per-runtime proof, never inferred from the principal or upstream turn id.
+pub(crate) fn attended_call(home: &Path, agent: &str, reference: &str)
+    -> Option<crate::computer_use_sessions::attended_call::AttendedCall>
+{
+    lookup(home,agent,reference)?;
+    entries().lock().unwrap_or_else(|p| p.into_inner()).get(reference)?
+        .attendance.clone().filter(|call| call.valid_for(agent))
 }
 
 /// `Some(None)` is a verified background context; `None` means unproven.
@@ -216,5 +234,29 @@ mod tests {
             .created = Instant::now() - MAX_AGE;
         assert_eq!(lookup(home.path(), "bot", guard.reference()), None);
         assert_eq!(lookup(home.path(), "bot", "bad"), None);
+    }
+
+    #[tokio::test]
+    async fn expired_context_sweep_revokes_attended_clones_even_before_guard_drop() {
+        let home = tempfile::tempdir().unwrap();
+        let session = "webchat:context-expiry";
+        let agent = "context-expiry-agent";
+        let turn = format!("context-expiry-{}", uuid::Uuid::new_v4());
+        crate::computer_use_sessions::attended::verified_webchat_message(
+            session, Some("owner"),
+            duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(session.into()),
+                duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some(turn.clone()), async {
+                    assert!(crate::computer_use_sessions::attended::bind_final_route(session, session, agent, &turn));
+                    let guard = register(home.path(), agent).unwrap();
+                    let captured = attended_call(home.path(), agent, guard.reference()).unwrap();
+                    entries().lock().unwrap().get_mut(guard.reference()).unwrap().created =
+                        Instant::now() - MAX_AGE - Duration::from_secs(1);
+                    let replacement = register(home.path(), agent).unwrap();
+                    assert!(!captured.valid_for(agent), "TTL sweep must revoke in-flight clones");
+                    drop(guard);
+                    assert!(!captured.valid_for(agent), "a missing registry row cannot defeat revocation");
+                    assert!(attended_call(home.path(), agent, replacement.reference()).unwrap().valid_for(agent), "an old runtime cannot revoke a different current runtime");
+                })),
+        ).await;
     }
 }
