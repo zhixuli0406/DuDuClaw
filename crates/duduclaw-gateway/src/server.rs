@@ -2184,6 +2184,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // One-time upgrade migration: keep an Odoo on an internal address working
+    // (writes `[odoo] allow_private_network = true` once, with an audit event).
+    // Awaited because the connector reads the switch on its first use; a
+    // failure only logs.
+    {
+        let report = crate::odoo_private_network_migration::run(&home_dir).await;
+        if let Some(e) = &report.error {
+            tracing::warn!("Odoo allow_private_network migration: {e}");
+        }
+    }
+
     // I-2b provenance backfill (2026-08-15): files archived before the
     // artifacts ledger existed carry no origin, so `/files` and the task
     // 「產物」tab would show them as history-less rows forever. The pass is

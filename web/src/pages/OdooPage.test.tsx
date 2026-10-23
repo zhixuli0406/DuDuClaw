@@ -68,6 +68,19 @@ describe('OdooPage saved-credential display', () => {
     ).toBeInTheDocument();
   });
 
+  it('shows the internal-network switch off by default and on when stored', async () => {
+    mockConfig({});
+    const first = renderWithProviders(<OdooPage />);
+    const off = await screen.findByRole('switch', { name: /Allow Odoo on an internal network/i });
+    expect(off).toHaveAttribute('aria-checked', 'false');
+    first.unmount();
+
+    mockConfig({ allow_private_network: true });
+    renderWithProviders(<OdooPage />);
+    const on = await screen.findByRole('switch', { name: /Allow Odoo on an internal network/i });
+    expect(on).toHaveAttribute('aria-checked', 'true');
+  });
+
   it('keeps the neutral placeholder when nothing is stored', async () => {
     mockConfig({ has_api_key: false });
     renderWithProviders(<OdooPage />);

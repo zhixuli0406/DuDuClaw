@@ -2234,6 +2234,8 @@ export interface OdooConfig {
   poll_interval_seconds: number;
   poll_models: string[];
   webhook_enabled: boolean;
+  /** Admin-only: allow an Odoo server on an internal network address. */
+  allow_private_network?: boolean;
   /**
    * Whether each write-only credential is on file. The values stay server-side;
    * these flags are what let the form say "已儲存（留空表示不變更）" instead of
@@ -2265,6 +2267,7 @@ export interface OdooConfigUpdate {
   webhook_enabled: boolean;
   webhook_secret?: string;
   unblock_models?: string[];
+  allow_private_network?: boolean;
   features_crm: boolean;
   features_sale: boolean;
   features_inventory: boolean;
@@ -2284,6 +2287,7 @@ export interface OdooTestParams {
   username: string;
   api_key?: string;
   password?: string;
+  allow_private_network?: boolean;
 }
 
 // ── Read-only SQL data sources (`db_sources.*`, WP-D §13.7) ──

@@ -45,7 +45,7 @@ pub struct AgentOdooConfig {
     /// pool key.
     pub profile: Option<String>,
     /// Odoo server URL. When set, replaces `OdooConfig::url`. Validated by
-    /// [`crate::url_guard::is_safe_odoo_url`] in [`Self::apply_to`]; a URL
+    /// [`crate::url_guard::check_url`] in [`Self::apply_to`]; a URL
     /// that fails the check refuses the connection (fail closed) instead of
     /// falling back to the global server.
     pub url: Option<String>,
@@ -173,9 +173,9 @@ impl AgentOdooConfig {
             v.as_deref().map(str::trim).filter(|s| !s.is_empty())
         }
         if let Some(url) = set(&self.url) {
-            if !crate::url_guard::is_safe_odoo_url(url) {
-                return Err("agent [odoo].url must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host".into());
-            }
+            // Per-agent urls follow the single global admin switch
+            // (`config.allow_private_network`); an agent cannot opt itself in.
+            crate::url_guard::check_url(url, config.allow_private_network)?;
             config.url = url.to_string();
         }
         if let Some(db) = set(&self.db) {

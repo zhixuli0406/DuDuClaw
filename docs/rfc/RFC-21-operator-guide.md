@@ -223,11 +223,7 @@ fall back to the global `config.toml [odoo]` exactly as before.
 different Odoo server than the global one. Both the runtime connection and the
 dashboard's agent connection test merge the override over the global block
 through the same function, so a passing test means the agent really connects
-to that server. `url` must be HTTPS to a public host (plain `http://` only for
-`localhost` / `127.0.0.1`; private, link-local and metadata addresses and URLs
-with a user name are refused), `db` is at most 63 characters of
-`[a-zA-Z0-9_-]`. An override that fails these checks refuses the connection
-(it never falls back to the global server). When you change `url`, set the
+to that server. `url` must be HTTPS to a public host (plain `http://` only for `localhost` / `127.0.0.1`; private, link-local and metadata addresses and URLs with a user name are refused; every address the host name resolves to is checked and pinned), `db` is at most 63 characters of `[a-zA-Z0-9_-]`. An administrator can allow Odoo servers on an internal network with the single global switch `config.toml [odoo] allow_private_network = true` (default `false`; agents cannot set it): internal addresses are then accepted over HTTPS or HTTP, while loopback, link-local and cloud-metadata addresses stay refused. An override that fails these checks refuses the connection (it never falls back to the global server). When you change `url`, set the
 agent's key again for the new server. The whole `[odoo]` table is admin-only.
 
 ### Action whitelist syntax

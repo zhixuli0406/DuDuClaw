@@ -269,7 +269,7 @@ impl OdooConnector {
         // address to be public, and pin the client to exactly those addresses.
         // `no_proxy` because a proxy would resolve the host itself and the pin
         // would not hold.
-        let plan = crate::url_guard::plan_connection(&config.url).await?;
+        let plan = crate::url_guard::plan_connection(&config.url, config.allow_private_network).await?;
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())

@@ -244,14 +244,10 @@ impl MethodHandler {
             );
         }
         // Fail-closed SSRF/HTTPS re-check on the EFFECTIVE url actually dialed.
-        if !Self::is_safe_odoo_url(&cfg.url) {
-            return WsFrame::ok_response(
-                "",
-                json!({
-                    "success": false,
-                    "message": "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1) and must not target a private/reserved host",
-                }),
-            );
+        if let Err(msg) =
+            duduclaw_odoo::url_guard::check_url(&cfg.url, cfg.allow_private_network)
+        {
+            return WsFrame::ok_response("", json!({ "success": false, "message": msg }));
         }
 
         // Credential: prefer the agent's, else the global one.

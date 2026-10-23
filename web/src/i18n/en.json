@@ -1710,6 +1710,8 @@
   "odoo.feature.hr.desc": "Employees, attendance, leave management",
   "odoo.sync": "Sync Settings",
   "odoo.access": "Data Access",
+  "odoo.allowPrivateNetwork": "Allow Odoo on an internal network",
+  "odoo.allowPrivateNetworkHint": "Off by default. Turn on only when your Odoo server runs on a company-internal address (for example 192.168.x.x or 10.x.x.x). Only administrators can change this. The local machine and cloud metadata addresses stay blocked either way.",
   "odoo.unblockModels": "Unblocked models (global)",
   "odoo.unblockModelsHint": "Sensitive models blocked by default (e.g. res.partner) become readable for all AI staff once listed here; per-staff settings take precedence. Comma-separated.",
   "odoo.pollEnabled": "Enable polling sync",

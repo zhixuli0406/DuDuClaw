@@ -10,14 +10,21 @@ impl MethodHandler {
     /// Refuses to store credentials if encryption is unavailable.
     /// Uses atomic write (temp + rename).
     pub(crate) async fn handle_odoo_configure(&self, params: Value) -> WsFrame {
+        // Admin switch: the value sent with this save wins, else the stored one.
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let stored_allow = duduclaw_odoo::OdooConfig::from_toml(&table).allow_private_network;
+        let allow_private = params
+            .get("allow_private_network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(stored_allow);
         // Validate URL
         let url = match params.get("url").and_then(|v| v.as_str()).map(str::trim) {
-            Some(u) if Self::is_safe_odoo_url(u) => u,
-            Some(_) => {
-                return WsFrame::error_response(
-                    "",
-                    "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)",
-                );
+            Some(u) => {
+                if let Err(msg) = duduclaw_odoo::url_guard::check_url(u, allow_private) {
+                    return WsFrame::error_response("", &msg);
+                }
+                u
             }
             _ => return WsFrame::error_response("", "Missing 'url' parameter"),
         };
@@ -69,11 +76,12 @@ impl MethodHandler {
             }
         };
 
-        let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
-
         // Build the [odoo] section
         let mut odoo = toml::map::Map::new();
+        odoo.insert(
+            "allow_private_network".into(),
+            toml::Value::Boolean(allow_private),
+        );
         odoo.insert("url".into(), toml::Value::String(url.into()));
         odoo.insert("db".into(), toml::Value::String(db.into()));
         odoo.insert("protocol".into(), toml::Value::String(protocol.into()));

@@ -1709,6 +1709,8 @@
   "odoo.feature.hr.desc": "従業員、出勤、休暇管理",
   "odoo.sync": "同期設定",
   "odoo.access": "データアクセス範囲",
+  "odoo.allowPrivateNetwork": "社内ネットワーク上の Odoo への接続を許可",
+  "odoo.allowPrivateNetworkHint": "既定ではオフです。Odoo サーバーが社内のアドレス（例：192.168.x.x、10.x.x.x）にある場合のみオンにしてください。変更できるのは管理者のみです。オン・オフに関わらず、ローカルマシンとクラウドのメタデータアドレスは常に拒否されます。",
   "odoo.unblockModels": "ブロック解除するモデル（全体）",
   "odoo.unblockModelsHint": "既定でブロックされる機密モデル（res.partner など）をここに列挙すると全 AI スタッフが読み取り可能になります。スタッフ個別設定が優先されます。カンマ区切り。",
   "odoo.pollEnabled": "ポーリング同期を有効化",

@@ -91,6 +91,7 @@ impl MethodHandler {
                 "has_webhook_secret": !cfg.webhook_secret_enc.is_empty()
                     || !cfg.webhook_secret.is_empty(),
                 "unblock_models": cfg.unblock_models,
+                "allow_private_network": cfg.allow_private_network,
                 "features_crm": cfg.features_crm,
                 "features_sale": cfg.features_sale,
                 "features_inventory": cfg.features_inventory,

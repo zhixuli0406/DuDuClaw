@@ -52,6 +52,10 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 - Web サイト用チャットウィジェット：公開の切り替えは `[webchat] public_widget`、ウィジェットキーは `[webchat] widget_key` に書き込みます（可視 ASCII 16〜256 文字、生成ボタンあり。公開するにはキーが必要。キーは応答に含まれません）。即時反映。ウィジェットキーは `config.toml` に平文で保存されます。Web サイトのページソースに現れる公開キーなので、シークレットとしては扱いません。
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
 
+## 連携 → Odoo → 接続設定
+
+「社内ネットワーク上の Odoo への接続を許可」は `[odoo] allow_private_network` に書き込まれます（管理者のみ、既定はオフ。接続設定と一緒に `odoo.configure` で保存され、「接続テスト」は画面上のスイッチ値を使います）。オフの間は、Odoo の URL（全体でも従業員ごとでも）は公開ホストへの HTTPS が必須です（`http://` は `localhost` のみ）。オンにすると 192.168.x.x や 10.x.x.x などの社内アドレスに HTTPS・HTTP のどちらでも接続できます。ローカルマシン、リンクローカル、クラウドのメタデータアドレス（169.254.169.254、`metadata.google.internal`）は常に拒否され、接続は検査済みの解決結果に固定され、プロキシは使いません。アップグレード後の初回起動で、設定済みの Odoo URL が社内アドレスに解決される場合は自動でオンになり（監査イベント `odoo_allow_private_network_auto_enabled`）、既存の環境は切断されません。次回の接続から有効です。
+
 ## 連携 → Odoo → Web サイトのライブチャット
 
 専用の保存ボタンで `odoo.livechat.set`（管理者）から `[odoo_livechat]` に書き込みます。Odoo 接続の保存は `[odoo]` 全体を書き換えるため、別セクションにしています。ボットの API キーは `bot_api_key_enc` として暗号化保存され、返されません。空欄なら変更しません。保存と「AI に戻す」は監査ログに記録されます。詳細は [features/ja-JP/61-odoo-livechat.md](../../features/ja-JP/61-odoo-livechat.md)。

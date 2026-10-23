@@ -80,6 +80,7 @@ export function OdooPage() {
   const [webhookEnabled, setWebhookEnabled] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
   const [globalUnblockModels, setGlobalUnblockModels] = useState('');
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
   // Last-saved value of the global unblock list — used to detect when Save is
   // about to *expand* which sensitive models every AI employee can reach, so
   // that expansion (not unrelated saves) is what triggers the extra confirm
@@ -132,6 +133,7 @@ export function OdooPage() {
         setPollInterval(String(configRes.poll_interval_seconds ?? 60));
         setPollModels((configRes.poll_models ?? []).join(','));
         setWebhookEnabled(configRes.webhook_enabled ?? false);
+        setAllowPrivateNetwork(configRes.allow_private_network ?? false);
         setSavedCreds({
           apiKey: configRes.has_api_key ?? false,
           password: configRes.has_password ?? false,
@@ -209,6 +211,7 @@ export function OdooPage() {
         webhook_enabled: webhookEnabled,
         webhook_secret: webhookSecret || undefined,
         unblock_models: parseUnblockModels(globalUnblockModels),
+        allow_private_network: allowPrivateNetwork,
         features_crm: features.crm,
         features_sale: features.sale,
         features_inventory: features.inventory,
@@ -248,6 +251,7 @@ export function OdooPage() {
         username: username.trim(),
         api_key: authMethod === 'api_key' && apiKey ? apiKey : undefined,
         password: authMethod === 'password' && password ? password : undefined,
+        allow_private_network: allowPrivateNetwork,
       });
       setTestResult({ ok: res.success, message: res.message });
     } catch (e) {
@@ -357,6 +361,12 @@ export function OdooPage() {
           <RowText label={t('odoo.db')} value={db} onChange={setDb} placeholder="mycompany" tier="text" />
           <RowSelect label={t('odoo.authMethod')} value={authMethod} onChange={setAuthMethod} options={authOptions} />
           <RowText label={t('odoo.username')} value={username} onChange={setUsername} placeholder="admin@mycompany.com" tier="text" />
+          <RowSwitch
+            label={t('odoo.allowPrivateNetwork')}
+            description={t('odoo.allowPrivateNetworkHint')}
+            checked={allowPrivateNetwork}
+            onChange={setAllowPrivateNetwork}
+          />
           {authMethod === 'api_key' ? (
             <RowSecret
               label={t('odoo.apiKey')}
