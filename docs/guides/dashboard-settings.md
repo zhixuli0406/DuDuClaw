@@ -174,6 +174,16 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
 
+## Assign panel → When, and Goals → Assigned by me → Scheduled (unreleased)
+
+| Control | Writes | Effect |
+|---|---|---|
+| Assign panel → **When**: now / once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins) | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the browser's zone) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
+| Goals → Assigned by me → Scheduled: **Pause / Resume / Remove** | the row's `status` | At once. Resume re-checks the creator's right and continues from the next slot after now; a one-time schedule whose time passed cannot resume. Remove keeps the row as `removed` (never listed or run again). |
+| **Show everyone's** (Admins) | — | Lists every person's schedules with the creator's name. |
+
+Caps live in `config.toml` (no control yet; Advanced config editor): `[goal_defaults] assign_schedule_max_active` (default 20 per person, 0..200) and `assign_schedule_min_interval_minutes` (non-Admins, default 60, can only be raised). Existing schedules also recheck the interval at every run and resume. Pause/remove prevents a run whose task has not yet been stored; stop an already stored task separately. Details: [Scheduling an assignment](../features/67-assigning-tasks.md#scheduling-an-assignment).
+
 ## Thinking display
 
 No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.
