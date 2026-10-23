@@ -233,6 +233,7 @@ mod progress;
 mod prompt_build;
 
 pub(crate) use access_gate::*;
+pub(crate) use breaker_wait::as_sender;
 pub use ccr_delivery::*;
 use cli_env::*;
 pub use cli_spawn::*;

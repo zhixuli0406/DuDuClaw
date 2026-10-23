@@ -1242,7 +1242,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // the only caller that reads the second half — see
                                 // `channel_reply::build_guarded_reply_with_session`
                                 // (these replaced the former `_with_artifact` siblings).
-                                let work = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+                                // B10 review L1: learn whether an empty answer is a
+                                // deliberate silence (no `no_reply` frame then).
+                                let work = crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
                                     .scope(auth_user.clone(), async {
                                         match &effective_agent {
                                             Some(a) => {
@@ -1258,7 +1260,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 .await
                                             }
                                         }
-                                    });
+                                    }));
                                 tokio::pin!(work);
                                 // The model the backend ACTUALLY answered with
                                 // (ProgressEvent::ModelInfo) — stamped onto the
@@ -1267,7 +1269,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // Summary of the thinking frames actually sent,
                                 // stamped onto the assistant_done frame below.
                                 let mut thinking_meta = crate::thinking::DoneMetaBuilder::default();
-                                let reply = loop {
+                                let (reply, deliberate_silence) = loop {
                                     tokio::select! {
                                         r = &mut work => break r,
                                         Some(ev) = prx.recv() => {
@@ -1434,6 +1436,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 if !guarded.still_valid().await {
                                     rollback_owned_webchat_archives(&owned_archives).await;
                                     warn!("WebChat: source changed before reply delivery — skipping send");
+                                    continue;
+                                }
+                                if reply.trim().is_empty() && deliberate_silence {
+                                    // Kept silent on purpose (failsafe mute, breaker,
+                                    // access gate): no frame, as before (review L1).
+                                    warn!("WebChat: reply withheld by design — skipping send");
                                     continue;
                                 }
                                 if reply.trim().is_empty() {

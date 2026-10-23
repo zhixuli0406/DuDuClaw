@@ -59,6 +59,20 @@ impl std::fmt::Display for TripReason {
     }
 }
 
+/// Who sent an inbound message, as far as the channel can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SenderKind {
+    /// A person, or a sender the channel cannot classify.
+    #[default]
+    Person,
+    /// The channel marks the sender as a bot (for example Telegram
+    /// `User.is_bot`). Bots get the strict frequency trip (B10 review H1).
+    Bot,
+}
+
+/// Most entries kept for the hard loop limit, per scope.
+const HARD_HISTORY_CAP: usize = 1024;
+
 /// Decision returned by the circuit breaker check.
 #[derive(Debug, Clone)]
 pub enum BreakerDecision {
@@ -144,6 +158,12 @@ pub struct CircuitBreaker {
 
     /// Timestamps of recent inbound messages (for frequency detection).
     inbound_timestamps: VecDeque<Instant>,
+    /// Timestamps inside the long hard-limit window (see
+    /// `CircuitBreakerConfig::hard_max_messages`).
+    hard_timestamps: VecDeque<Instant>,
+    /// When a "too many messages" refusal was last announced (one notice
+    /// per hard window; see [`CircuitBreaker::record_refused`]).
+    last_refusal_notice: Option<Instant>,
     /// Hashes of recent inbound messages (for repetition detection).
     recent_inbound_hashes: VecDeque<u64>,
     /// Raw text of the last few inbound messages (for similarity).
@@ -171,6 +191,8 @@ impl CircuitBreaker {
             state: BreakerState::Closed,
             config,
             inbound_timestamps: VecDeque::with_capacity(64),
+            hard_timestamps: VecDeque::new(),
+            last_refusal_notice: None,
             recent_inbound_hashes: VecDeque::with_capacity(8),
             recent_inbound_texts: VecDeque::with_capacity(4),
             recent_token_counts: VecDeque::with_capacity(32),
@@ -232,6 +254,13 @@ impl CircuitBreaker {
     /// Call this before processing a user message. If the decision is
     /// `Trip`, the caller should escalate to the failsafe manager.
     pub fn check_inbound(&mut self, text: &str) -> BreakerDecision {
+        self.check_inbound_as(text, SenderKind::Person)
+    }
+
+    /// [`Self::check_inbound`] knowing who sent the message: a
+    /// [`SenderKind::Bot`] over the frequency limit trips the breaker (the
+    /// strict behaviour), a person waits.
+    pub fn check_inbound_as(&mut self, text: &str, sender: SenderKind) -> BreakerDecision {
         let now = Instant::now();
 
         // If open, check if cooldown has elapsed → transition to half-open
@@ -303,13 +332,29 @@ impl CircuitBreaker {
                 }
             }
 
-        // Check 2: Frequency. More than `frequency_max_replies` messages in
-        // the window used to trip the breaker and drop every message for the
-        // cooldown — a person typing a question in several short messages
-        // lost the answers (B10). The extra message now waits until the
-        // window has room, so the reply rate stays bounded and nothing is
-        // dropped. Bot loops are still stopped by checks 1 and 3.
+        // Check 2a: Hard loop limit over a long window. Trips for anyone:
+        // a person never sends `hard_max_messages` in `hard_window_secs`,
+        // while two bots trading short, varied messages ("收到" / "OK!")
+        // pass every other check (B10 review H1).
+        if let Some(reason) = self.hard_limit_reached(now) {
+            self.trip(reason.clone());
+            return BreakerDecision::Trip(reason);
+        }
+
+        // Check 2b: Frequency over the short window. A bot over the limit
+        // trips as before. A person used to trip it too, and every message
+        // of the cooldown was dropped — someone typing a question in several
+        // short messages lost the answers (B10). Their extra message now
+        // waits until the window has room, so the reply rate stays bounded.
         if let Some(wait) = self.frequency_wait(now) {
+            if sender == SenderKind::Bot {
+                let reason = TripReason::FrequencyAnomaly {
+                    count: self.inbound_timestamps.len() as u32 + 1,
+                    window_secs: self.config.frequency_window_secs,
+                };
+                self.trip(reason.clone());
+                return BreakerDecision::Trip(reason);
+            }
             return BreakerDecision::Wait(wait);
         }
         self.record_inbound_internal(text, now);
@@ -376,6 +421,37 @@ impl CircuitBreaker {
         Some((oldest + window).saturating_duration_since(now).max(Duration::from_millis(10)))
     }
 
+    /// More than `hard_max_messages` within `hard_window_secs`?
+    fn hard_limit_reached(&mut self, now: Instant) -> Option<TripReason> {
+        let window = Duration::from_secs(self.config.hard_window_secs.max(1));
+        let cutoff = now.checked_sub(window);
+        self.hard_timestamps
+            .retain(|t| cutoff.is_none_or(|c| *t > c));
+        let max = self.config.hard_max_messages.max(1) as usize;
+        (self.hard_timestamps.len() >= max).then(|| TripReason::FrequencyAnomaly {
+            count: self.hard_timestamps.len() as u32 + 1,
+            window_secs: self.config.hard_window_secs.max(1),
+        })
+    }
+
+    /// A message the caller refused after waiting too long for the
+    /// frequency window (it is not answered). It still counts toward the
+    /// hard limit and the repetition check, so a flood cannot slip past
+    /// them by being refused. Returns whether to tell the sender (at most
+    /// once per hard window).
+    pub fn record_refused(&mut self, text: &str) -> bool {
+        let now = Instant::now();
+        self.record_inbound_internal(text, now);
+        let window = Duration::from_secs(self.config.hard_window_secs.max(1));
+        let notify = self
+            .last_refusal_notice
+            .is_none_or(|t| now.saturating_duration_since(t) >= window);
+        if notify {
+            self.last_refusal_notice = Some(now);
+        }
+        notify
+    }
+
     /// Trip the circuit breaker (Closed → Open).
     fn trip(&mut self, reason: TripReason) {
         warn!("Circuit breaker TRIPPED: {reason}");
@@ -395,6 +471,7 @@ impl CircuitBreaker {
         self.half_open_passes = 0;
         // Clear sliding window data so stale metrics don't re-trip immediately
         self.inbound_timestamps.clear();
+        self.hard_timestamps.clear();
         self.recent_inbound_hashes.clear();
         self.recent_inbound_texts.clear();
         // Keep recent_token_counts — the rolling average is still valid
@@ -403,6 +480,10 @@ impl CircuitBreaker {
 
     /// Record inbound message metadata.
     fn record_inbound_internal(&mut self, text: &str, now: Instant) {
+        self.hard_timestamps.push_back(now);
+        if self.hard_timestamps.len() > HARD_HISTORY_CAP {
+            self.hard_timestamps.pop_front();
+        }
         self.inbound_timestamps.push_back(now);
         // Cap at 64 entries to prevent unbounded memory growth on long-lived scopes.
         // The frequency check already prunes by window, but this is a hard safety net.
@@ -442,11 +523,29 @@ impl CircuitBreakerRegistry {
     ///
     /// The scope key is typically `"channel:scope_id"` (e.g., `"telegram:12345"`).
     pub async fn check_inbound(&self, scope: &str, text: &str) -> BreakerDecision {
+        self.check_inbound_as(scope, text, SenderKind::Person).await
+    }
+
+    /// [`CircuitBreaker::check_inbound_as`] for `scope`.
+    pub async fn check_inbound_as(
+        &self,
+        scope: &str,
+        text: &str,
+        sender: SenderKind,
+    ) -> BreakerDecision {
         let mut map = self.breakers.write().await;
         let breaker = map
             .entry(scope.to_string())
             .or_insert_with(|| CircuitBreaker::new(self.config.clone()));
-        breaker.check_inbound(text)
+        breaker.check_inbound_as(text, sender)
+    }
+
+    /// [`CircuitBreaker::record_refused`] for `scope`.
+    pub async fn record_refused(&self, scope: &str, text: &str) -> bool {
+        let mut map = self.breakers.write().await;
+        map.entry(scope.to_string())
+            .or_insert_with(|| CircuitBreaker::new(self.config.clone()))
+            .record_refused(text)
     }
 
     /// Record an outbound message for echo detection.
@@ -510,6 +609,8 @@ mod tests {
             token_explosion_multiplier: 3.0,
             cooldown_secs: 1, // short for tests
             half_open_allow_count: 1,
+            hard_window_secs: 60,
+            hard_max_messages: 30,
         }
     }
 
@@ -570,6 +671,54 @@ mod tests {
             decision,
             BreakerDecision::Trip(TripReason::ContentRepetition { .. })
         ));
+    }
+
+    /// B10 review H1: two bots trading short, varied messages pass the echo
+    /// and repetition checks and (paced) the frequency wait; the hard limit
+    /// over the long window still trips.
+    #[test]
+    fn a_short_varied_bot_loop_trips_the_hard_limit() {
+        let mut config = test_config();
+        config.frequency_max_replies = 1_000; // pacing never hits the short window
+        let mut cb = CircuitBreaker::new(config);
+        let replies = ["收到", "好的，了解", "OK!", "沒問題", "了解了"];
+        for i in 0..30 {
+            let text = replies[i % replies.len()];
+            assert!(matches!(cb.check_inbound(text), BreakerDecision::Allow), "message {i}");
+        }
+        assert!(matches!(
+            cb.check_inbound("收到"),
+            BreakerDecision::Trip(TripReason::FrequencyAnomaly { window_secs: 60, .. })
+        ));
+        assert_eq!(cb.state(), BreakerState::Open);
+    }
+
+    /// A sender the channel marks as a bot keeps the strict frequency trip.
+    #[test]
+    fn a_bot_sender_over_the_frequency_limit_trips() {
+        let mut cb = CircuitBreaker::new(test_config());
+        for text in ["a", "b", "c"] {
+            assert!(matches!(cb.check_inbound_as(text, SenderKind::Bot), BreakerDecision::Allow));
+        }
+        assert!(matches!(
+            cb.check_inbound_as("d", SenderKind::Bot),
+            BreakerDecision::Trip(TripReason::FrequencyAnomaly { .. })
+        ));
+    }
+
+    /// Refused messages still count, and the refusal is announced once per window.
+    #[test]
+    fn refused_messages_count_and_are_announced_once() {
+        let mut config = test_config();
+        config.hard_max_messages = 5;
+        config.frequency_max_replies = 1_000;
+        let mut cb = CircuitBreaker::new(config);
+        assert!(cb.record_refused("flood"));
+        for _ in 0..3 {
+            assert!(!cb.record_refused("flood"), "one notice per window");
+        }
+        assert!(matches!(cb.check_inbound("x"), BreakerDecision::Allow));
+        assert!(matches!(cb.check_inbound("y"), BreakerDecision::Trip(_)), "refused ones counted");
     }
 
     /// B10: a person repeating a short message while waiting ("在嗎？" ×3,

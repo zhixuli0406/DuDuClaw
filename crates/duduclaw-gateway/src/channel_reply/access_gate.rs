@@ -36,6 +36,29 @@ pub(super) const GATED_CHANNELS: &[&str] = &[
     "dingtalk",
 ];
 
+tokio::task_local! {
+    /// Set when the current turn ends in a deliberate silence (see
+    /// [`track_silence`]).
+    static DELIBERATE_SILENCE: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Run a turn and report whether its empty answer (if any) was a
+/// deliberate silence (access gate, failsafe mute, breaker, rate limit,
+/// takeover) rather than a model that produced nothing. WebChat uses it to
+/// tell the visitor about a genuinely empty answer without revealing that a
+/// protection kept it quiet (B10 review L1).
+pub(crate) async fn track_silence<F: std::future::Future>(turn: F) -> (F::Output, bool) {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out = DELIBERATE_SILENCE.scope(flag.clone(), turn).await;
+    (out, flag.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Mark the current turn's silence as deliberate (no-op outside
+/// [`track_silence`]). [`record_silent_reply`] does this itself.
+pub(crate) fn mark_deliberate_silence() {
+    let _ = DELIBERATE_SILENCE.try_with(|f| f.store(true, std::sync::atomic::Ordering::SeqCst));
+}
+
 /// Record a `channel_failures.jsonl` line for a reply that is intentionally
 /// dropped by design (pairing/access/failsafe/circuit-breaker gates). The
 /// gate's safety semantics are unchanged — it still never replies to the
@@ -48,6 +71,7 @@ pub(crate) fn record_silent_reply(
     user_id: &str,
     reason: &str,
 ) {
+    mark_deliberate_silence();
     let rec = serde_json::json!({
         "event": "channel_reply_silent",
         "session_id": session_id,

@@ -32,8 +32,9 @@ cost_limit_usd = 50.0
 # Sliding window for frequency anomaly detection (seconds).
 frequency_window_secs = 10
 # Max messages per conversation in the frequency window. A message over the
-# limit waits until the window has room (at most 30 s) and is then answered;
-# it no longer trips the breaker or gets dropped.
+# limit waits until the window has room and is then answered; one still
+# waiting after 30 s is refused (counted, the sender told once a minute).
+# A sender the channel marks as a bot (Telegram is_bot) trips instead.
 frequency_max_replies = 5
 # Content similarity threshold (0.0-1.0) for repetition detection: three
 # near-identical inbound messages in a row trip the breaker. Messages shorter
@@ -47,6 +48,11 @@ token_explosion_multiplier = 3.0
 cooldown_secs = 60
 # Requests allowed through in half-open state for recovery probing.
 half_open_allow_count = 2
+# Hard loop limit: more than hard_max_messages in hard_window_secs in one
+# conversation trips the breaker for anyone (stops bots trading short,
+# varied messages).
+hard_window_secs = 60
+hard_max_messages = 30
 
 [failsafe]
 # Auto-recover from L1 Degraded after N seconds (0 = manual only).
