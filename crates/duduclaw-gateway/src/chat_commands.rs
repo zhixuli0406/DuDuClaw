@@ -67,6 +67,11 @@ pub enum ChatCommand {
     /// see [`handle_rules_off`] for the authorization predicate. Zero LLM
     /// cost either way.
     Rules { all: bool, off: Option<u32> },
+    /// `/交辦` / `／交辦` / `/assign` — hand an employee a task from the chat
+    /// (see [`crate::trigger_route::assign`]). Needs a caller identity:
+    /// [`handle_command_with_caller`]; plain [`handle_command`] answers that
+    /// the channel does not support it.
+    Assign(crate::trigger_route::assign::AssignCommand),
 }
 
 /// The three shapes a `/goal` command can take.
@@ -114,7 +119,7 @@ pub enum GoalCommand {
 ///   remainder from `outcome:` onward, so any `||` inside a JSON schema survives)
 ///   and validated later in [`handle_goal_create`].
 /// - anything else → the whole tail is the goal description
-fn parse_goal_args(args: Option<&str>) -> GoalCommand {
+pub(crate) fn parse_goal_args(args: Option<&str>) -> GoalCommand {
     let raw = args.map(str::trim).unwrap_or("");
     if raw.is_empty() {
         return GoalCommand::Usage;
@@ -259,6 +264,43 @@ pub fn is_command(text: &str) -> bool {
     let trimmed = text.trim();
     (trimmed.starts_with('/') && trimmed.len() > 1 && trimmed.as_bytes()[1].is_ascii_alphabetic())
         || is_likely_safety_word(trimmed)
+        || is_assign_command(trimmed)
+}
+
+/// Spellings of the assign command. The match is an exact prefix followed by
+/// whitespace or the end of the message (`/交辦事項` is not the command).
+const ASSIGN_PREFIXES: &[&str] = &["/交辦", "／交辦", "/assign"];
+
+/// The text after an assign command prefix, or `None` when `text` is not
+/// one. ASCII spellings match case-insensitively.
+pub fn strip_assign_command(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    ASSIGN_PREFIXES.iter().find_map(|p| {
+        let head = trimmed.get(..p.len())?;
+        if !head.eq_ignore_ascii_case(p) {
+            return None;
+        }
+        let rest = &trimmed[p.len()..];
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+    })
+}
+
+/// `/交辦 …`, `／交辦 …` or `/assign …`.
+pub fn is_assign_command(text: &str) -> bool {
+    strip_assign_command(text).is_some()
+}
+
+/// Parse the tail of an assign command.
+pub fn parse_assign_args(rest: &str) -> crate::trigger_route::assign::AssignCommand {
+    use crate::trigger_route::assign::AssignCommand;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        AssignCommand::List
+    } else if rest == "狀態" || rest == "状态" || rest.eq_ignore_ascii_case("status") {
+        AssignCommand::Status
+    } else {
+        AssignCommand::Text(rest.to_string())
+    }
 }
 
 /// Fast heuristic: does this look like a safety word?
@@ -307,6 +349,10 @@ pub fn parse_command(
         if let Some(cmd) = parse_safety_word_with_config(trimmed, &default_config) {
             return Some(cmd);
         }
+    }
+
+    if let Some(rest) = strip_assign_command(trimmed) {
+        return Some(ChatCommand::Assign(parse_assign_args(rest)));
     }
 
     if !trimmed.starts_with('/') {
@@ -408,7 +454,131 @@ pub async fn handle_command_for_sender(
     } else {
         crate::channel_reply::is_channel_admin(ctx, channel, &[sender_id, session_id]).await
     };
-    handle_command(cmd, ctx, session_id, agent_id, is_admin, sender_id).await
+    let caller = CommandCaller::for_channel(&ctx.home_dir, channel, sender_id);
+    handle_command_with_caller(cmd, ctx, session_id, agent_id, is_admin, &caller).await
+}
+
+/// Who sent a chat command, for the commands that act on the sender's own
+/// authority (`/交辦`; `/goal` records the person it was created for).
+#[derive(Debug, Clone)]
+pub struct CommandCaller<'a> {
+    /// Channel name (`line`, `telegram`, `webchat`, …).
+    pub channel: &'a str,
+    /// The sender's platform id (WebChat: the account id); empty = unknown.
+    pub channel_user_id: &'a str,
+    pub access: crate::trigger_route::SenderAccess,
+    /// A stable id of the incoming message, when the channel has one.
+    pub event: Option<&'a str>,
+    /// Order key of the message.
+    pub seq: i64,
+}
+
+impl<'a> CommandCaller<'a> {
+    /// A messaging-app sender, identified through its verified channel
+    /// identity (unmapped when there is none).
+    pub fn for_channel(home: &std::path::Path, channel: &'a str, channel_user_id: &'a str) -> Self {
+        Self {
+            channel,
+            channel_user_id,
+            access: crate::trigger_route::access::for_channel_sender(home, channel, channel_user_id),
+            event: None,
+            seq: crate::trigger_route::pending::next_seq(),
+        }
+    }
+
+    /// This caller, with the platform's stable id of the incoming message
+    /// (a `/交辦` derives its task id from it, so a redelivered message
+    /// creates nothing twice).
+    pub fn with_event(mut self, event: Option<&'a str>) -> Self {
+        self.event = event.filter(|e| !e.is_empty());
+        self
+    }
+
+    /// The assign-command view of this caller in conversation `session_id`.
+    pub fn assign_caller(
+        &self,
+        home: &'a std::path::Path,
+        session_id: &'a str,
+        fallback: Option<&'a str>,
+    ) -> crate::trigger_route::assign::AssignCaller<'a> {
+        crate::trigger_route::assign::AssignCaller {
+            home,
+            channel: self.channel,
+            conversation: session_id,
+            sender: self.channel_user_id,
+            event: self.event,
+            seq: self.seq,
+            fallback,
+            access: self.access.clone(),
+        }
+    }
+}
+
+/// [`handle_command`] for a caller whose identity is known: `/交辦` runs on
+/// the caller's own rights, and a `/goal` records the dashboard account it
+/// was created for. `agent_id` is the conversation's default employee.
+pub async fn handle_command_with_caller(
+    cmd: &ChatCommand,
+    ctx: &ReplyContext,
+    session_id: &str,
+    agent_id: &str,
+    is_admin: bool,
+    caller: &CommandCaller<'_>,
+) -> String {
+    match cmd {
+        ChatCommand::Assign(assign) => {
+            let fallback = (!agent_id.is_empty()).then_some(agent_id);
+            let assign_caller = caller.assign_caller(&ctx.home_dir, session_id, fallback);
+            Box::pin(crate::trigger_route::assign::run(ctx, assign, &assign_caller))
+                .await
+                .text
+        }
+        ChatCommand::Goal(_) => {
+            let principal = crate::trigger_route::assign::principal_of(&caller.access)
+                .map(|p| (p, caller.channel.to_string()));
+            with_goal_principal(
+                principal,
+                handle_command(cmd, ctx, session_id, agent_id, is_admin, caller.channel_user_id),
+            )
+            .await
+        }
+        _ => handle_command(cmd, ctx, session_id, agent_id, is_admin, caller.channel_user_id).await,
+    }
+}
+
+tokio::task_local! {
+    /// The person a `/goal` (or a confirmed goal suggestion) is created for:
+    /// `(on_behalf_of, created_via)`. Set by the command entry from the
+    /// verified sender, never from the message text.
+    static GOAL_PRINCIPAL: Option<(String, String)>;
+}
+
+/// Run `fut` with the goal principal set.
+pub(crate) async fn with_goal_principal<F: std::future::Future>(
+    principal: Option<(String, String)>,
+    fut: F,
+) -> F::Output {
+    GOAL_PRINCIPAL.scope(principal, fut).await
+}
+
+/// The goal principal of the current command, if any.
+pub(crate) fn current_goal_principal() -> Option<(String, String)> {
+    GOAL_PRINCIPAL.try_with(|p| p.clone()).ok().flatten()
+}
+
+/// The principal of a messaging-app sender in `session_id`
+/// (`<channel>:<chat>`), for a confirmed goal suggestion.
+pub(crate) fn channel_principal(
+    home: &std::path::Path,
+    session_id: &str,
+    user_id: &str,
+) -> Option<(String, String)> {
+    let channel = session_id.split(':').next().filter(|c| !c.is_empty())?;
+    if user_id.is_empty() {
+        return None;
+    }
+    let access = crate::trigger_route::access::for_channel_sender(home, channel, user_id);
+    crate::trigger_route::assign::principal_of(&access).map(|p| (p, channel.to_string()))
 }
 
 /// Execute a chat command and return the response text.
@@ -487,6 +657,10 @@ pub async fn handle_command(
         ChatCommand::Rules { off: Some(n), .. } => {
             handle_rules_off(ctx, session_id, channel_user_id, agent_id, *n).await
         }
+        ChatCommand::Assign(_) => crate::trigger_route::assign_texts::not_supported(
+            crate::trigger_route::texts::lang_for(&ctx.home_dir),
+        )
+        .to_string(),
     }
 }
 
@@ -584,6 +758,7 @@ fn handle_help() -> String {
      `/undo [次數]` — 撤銷最近 N 輪對話（預設 1，最多 20）\n\
      `/rollback` — 回退到最近一次檢查點（僅回退對話，不還原檔案）\n\
      `/goal <目標>` — 交付一個自主目標，AI 自主做到完成、卡住問你（`/goal status` 看進度）\n\
+     `/交辦 @AI員工 <任務>` — 把任務交辦給你可以指派的 AI 員工（`/交辦` 看名單、`/交辦 狀態` 看進度）\n\
      `/rules` — 看目前生效中的經驗法則（`/rules all` 看全部、`/rules off <編號>` 停用一條，限管理員／主管）\n\
      `/takeover` — 看目前是誰在回覆（管理員直接發言即接手；`+30m` 延長、`end` 交還）\n\n\
      *Safety Words*\n\
@@ -1105,6 +1280,10 @@ pub(crate) async fn handle_goal_create(
     }
     task.source_chat_id = Some(chat_id);
     task.source_discord_guild_id = source_discord_guild_id;
+    if let Some((who, via)) = current_goal_principal() {
+        task.on_behalf_of = Some(who);
+        task.created_via = Some(via);
+    }
 
     // P1 "想一想": generate a narrative plan and park the task `needs_human`
     // instead of `todo` — same precedent as the decomposer call above (runs
@@ -1248,6 +1427,12 @@ async fn try_decompose_goal(
             for row in &mut rows {
                 row.source_discord_guild_id = Some(guild.clone());
             }
+        }
+    }
+    if let Some((who, via)) = current_goal_principal() {
+        for row in &mut rows {
+            row.on_behalf_of = Some(who.clone());
+            row.created_via = Some(via.clone());
         }
     }
     for row in &rows {
@@ -3003,6 +3188,20 @@ mod goal_contract_tests {
         let reply =
             handle_command_for_sender(&cmd, &ctx, "whatsapp", "whatsapp:u", "main", "u").await;
         assert!(reply.starts_with(ADMIN_REFUSAL_PREFIX), "{reply}");
+    }
+
+    /// `/交辦` needs a caller identity: the plain entry says the channel does
+    /// not support it, the caller entry runs it (an unmapped webhook sender
+    /// is asked to link an account).
+    #[tokio::test]
+    async fn assign_needs_a_caller_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = admin_test_ctx(tmp.path());
+        let cmd = parse_command("/交辦 @main 整理", None).unwrap();
+        let plain = handle_command(&cmd, &ctx, "whatsapp:u", "main", false, "u").await;
+        assert_eq!(plain, "這個通道還不支援交辦。");
+        let reply = handle_command_for_sender(&cmd, &ctx, "whatsapp", "whatsapp:u", "main", "u").await;
+        assert!(reply.contains("綁定你的通訊帳號"), "{reply}");
     }
 
     /// Source guard: none of the six webhook channel handlers may pass a

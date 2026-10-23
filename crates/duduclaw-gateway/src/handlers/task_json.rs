@@ -75,6 +75,10 @@ pub(crate) fn task_row_to_json(r: &TaskRow) -> Value {
         // I-3b: archive/pin flags for the `/goals` board (task_store.rs).
         "archived": r.archived,
         "pinned": r.pinned,
+        // Who a person handed the task over for (`user:<account id>`, the
+        // same kind of value as `created_by`) and where.
+        "on_behalf_of": r.on_behalf_of,
+        "created_via": r.created_via,
     })
 }
 

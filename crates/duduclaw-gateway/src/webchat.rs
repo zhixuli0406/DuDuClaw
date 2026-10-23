@@ -65,6 +65,11 @@ pub enum ChatMessage {
         /// byte-compatible single-bucket behaviour (pre-fix clients).
         #[serde(default)]
         conv: Option<String>,
+        /// Client id of this message (one per send; 1–64 of `[A-Za-z0-9_-]`,
+        /// anything else is ignored). A `/交辦` derives its task id from it,
+        /// so the same frame sent twice creates one task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
     },
     /// Server → Client: assistant response chunk (streaming).
     #[serde(rename = "assistant_chunk")]
@@ -210,6 +215,10 @@ pub enum ChatMessage {
         /// was sent this turn — always for a public-widget visitor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<crate::thinking::DoneMeta>,
+        /// A task this reply created (`/交辦`): `{ "id", "agent" }`, so the
+        /// dashboard can show a card that links to it. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<serde_json::Value>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -839,7 +848,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                         };
 
                         match chat_msg {
-                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv } => {
+                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv, msg_id } => {
+                                let assign_event = assign_event_id(msg_id.as_deref());
                                 // ── Forced password-change gate ──────────
                                 // Mirrors `handlers.rs::dispatch`'s gate on the
                                 // dashboard WS path (same error code, so a
@@ -1120,6 +1130,19 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // any model call. The
                                 // default employee stays reachable by everyone.
                                 // Chat commands keep the selected employee.
+                                // The message an armed `/交辦 @name` was waiting
+                                // for becomes that task (rights checked again).
+                                if !crate::chat_commands::is_command(&content) {
+                                    if let Some(frame) = Box::pin(route::pending_assign_reply(
+                                        &state, &auth_user, &content, effective_agent.as_deref(),
+                                        &agent_id, sid, &user_id, conv_nonce.clone(), assign_event.as_deref(),
+                                    )).await {
+                                        if let Ok(json) = serde_json::to_string(&frame) {
+                                            let _ = sink.send(Message::Text(json.into())).await;
+                                        }
+                                        continue;
+                                    }
+                                }
                                 let routed = if crate::chat_commands::is_command(&content) {
                                     route::WebRoute { agent: effective_agent.clone(), switched: false }
                                 } else {
@@ -1195,9 +1218,35 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         // dashboard Admin account — never a
                                         // public-widget visitor (was hardcoded `true`).
                                         let is_admin = webchat_command_admin(&state.user_db, &auth_user);
-                                        let reply = crate::chat_commands::handle_command(
-                                            &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
-                                        ).await;
+                                        let caller = crate::chat_commands::CommandCaller {
+                                            channel: "webchat",
+                                            channel_user_id: if is_widget_visitor(&auth_user) { "" } else { &auth_user },
+                                            access: state.sender_access(&auth_user).await,
+                                            event: assign_event.as_deref(),
+                                            seq: crate::trigger_route::pending::next_seq(),
+                                        };
+                                        // `/交辦` keeps the task for a card; every other
+                                        // command answers with text only. `/rules off`
+                                        // still sees no channel identity here.
+                                        let (reply, task) = match &cmd {
+                                            crate::chat_commands::ChatCommand::Assign(assign_cmd) => {
+                                                let ac = caller.assign_caller(&state.ctx.home_dir, sid, Some(effective_agent_id));
+                                                let r = Box::pin(crate::trigger_route::assign::run(&state.ctx, assign_cmd, &ac)).await;
+                                                (r.text, r.task)
+                                            }
+                                            crate::chat_commands::ChatCommand::Rules { .. } => (
+                                                crate::chat_commands::handle_command(
+                                                    &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
+                                                ).await,
+                                                None,
+                                            ),
+                                            _ => (
+                                                crate::chat_commands::handle_command_with_caller(
+                                                    &cmd, &state.ctx, sid, effective_agent_id, is_admin, &caller,
+                                                ).await,
+                                                None,
+                                            ),
+                                        };
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,
                                             tokens_used: 0,
@@ -1211,6 +1260,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             agent_name: None,
                                             citations: None,
                                             thinking: None,
+                                            task: task.map(|t| serde_json::json!({ "id": t.id, "agent": t.agent })),
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1470,6 +1520,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     agent_name: answered_by.map(|a| a.display_name),
                                     citations,
                                     thinking: thinking_meta.build(),
+                                    task: None,
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if !guarded.still_valid().await {
@@ -1803,6 +1854,16 @@ mod widget_auth_tests {
     }
 }
 
+/// The `/交辦` event id of a WebChat frame: its client `msg_id`, when it is
+/// a plain token (1–64 of `[A-Za-z0-9_-]`).
+fn assign_event_id(msg_id: Option<&str>) -> Option<String> {
+    msg_id
+        .filter(|m| {
+            !m.is_empty() && m.len() <= 64 && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .map(|m| format!("web:{m}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,6 +1998,24 @@ mod tests {
     }
 
     #[test]
+    fn a_client_message_id_is_the_assign_event_only_when_plain() {
+        let msg: ChatMessage = serde_json::from_str(
+            r#"{"type":"user_message","content":"/交辦 @x y","session_id":"webchat:x","msg_id":"m-1a2b"}"#,
+        )
+        .expect("parse");
+        match msg {
+            ChatMessage::UserMessage { msg_id, .. } => {
+                assert_eq!(assign_event_id(msg_id.as_deref()).as_deref(), Some("web:m-1a2b"))
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+        assert_eq!(assign_event_id(None), None);
+        assert_eq!(assign_event_id(Some("")), None);
+        assert_eq!(assign_event_id(Some("a b")), None);
+        assert_eq!(assign_event_id(Some(&"x".repeat(65))), None);
+    }
+
+    #[test]
     fn user_message_without_conv_is_none() {
         // Legacy frame (no `conv`) → None → single-bucket byte-compatible path.
         let msg: ChatMessage = serde_json::from_str(
@@ -2010,6 +2089,7 @@ mod tests {
                 blocks: 1,
                 kinds: vec!["summary".into()],
             }),
+            task: None,
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(
@@ -2040,6 +2120,7 @@ mod tests {
             agent_name: None,
             citations: None,
             thinking: None,
+            task: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(
@@ -2083,6 +2164,7 @@ mod tests {
                 excerpt: "特休假依年資計算".into(),
             }]),
             thinking: None,
+            task: None,
         };
         let v: serde_json::Value = serde_json::to_value(&done).expect("serialize");
         assert_eq!(v["type"], "assistant_done");
@@ -2111,6 +2193,7 @@ mod tests {
             agent_name: None,
             citations: None,
             thinking: None,
+            task: None,
         };
         let json = serde_json::to_string(&done).expect("serialize");
         assert!(

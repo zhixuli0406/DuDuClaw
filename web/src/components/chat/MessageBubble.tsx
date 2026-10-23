@@ -3,6 +3,7 @@ import { AlertTriangle } from 'lucide-react';
 import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
+import { AssignedTaskCard } from './AssignedTaskCard';
 import { CitedText, CitationSourceList } from './CitationChips';
 import { PassageDrawer } from '@/components/knowledge/PassageDrawer';
 
@@ -65,6 +66,7 @@ export function MessageBubble({
             </span>
           </div>
         )}
+        {message.task && !isUser && <AssignedTaskCard task={message.task} />}
         {hasCitations && (
           <CitationSourceList
             citations={citations}

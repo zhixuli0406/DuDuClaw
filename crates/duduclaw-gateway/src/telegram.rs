@@ -874,7 +874,8 @@ async fn process_telegram_message(
             .is_some_and(|u| u.eq_ignore_ascii_case(&bot_username));
 
     // Check for bot commands (always process, even in mention-only mode)
-    let is_command = text_content.starts_with('/');
+    let is_command =
+        text_content.starts_with('/') || crate::chat_commands::is_assign_command(text_content);
 
     // The shared bot also counts a message that calls an AI employee by `@`
     // (or asks for the `@` list), or the one message a tapped employee is
@@ -964,8 +965,9 @@ async fn process_telegram_message(
     let caption_text = msg.caption.as_deref().unwrap_or("");
 
     let input_text = if let Some(text) = &msg.text {
-        // Handle bot commands
-        if text.starts_with('/') {
+        // Handle bot commands (`／交辦` too: the full-width spelling of the
+        // assign command).
+        if text.starts_with('/') || crate::chat_commands::is_assign_command(text) {
             let from_user_id = msg.from.as_ref().map(|u| u.id);
             handle_command(
                 text,
@@ -977,6 +979,7 @@ async fn process_telegram_message(
                 &scope_id,
                 agent_name.as_deref(),
                 from_user_id,
+                msg_id,
             )
             .await;
             return;
@@ -1356,6 +1359,27 @@ async fn process_telegram_message(
             None => (text.clone(), None),
         };
         send_reply(&client, &api_base, chat_id, &body, thread_id, msg_id, markup).await;
+        return;
+    }
+    // The message an armed `/交辦 @name` was waiting for becomes the task.
+    if let Some(crate::trigger_route::turn::TurnDecision::Assign { id }) = &trigger_decision {
+        let fallback = bound_for_route.clone().flatten();
+        let event = msg_id.map(assign_event_id);
+        let caller = crate::trigger_route::assign::AssignCaller {
+            home: &ctx.home_dir,
+            channel: "telegram",
+            conversation: &session_id,
+            sender: &user_id,
+            event: event.as_deref(),
+            seq: crate::trigger_route::pending::next_seq(),
+            fallback: fallback.as_deref(),
+            access: crate::trigger_route::access::for_channel_sender(&ctx.home_dir, "telegram", &user_id),
+        };
+        let reply =
+            Box::pin(crate::trigger_route::assign::run_pending(&ctx, id, &input_text, &caller)).await;
+        if !reply.text.trim().is_empty() {
+            send_reply(&client, &api_base, chat_id, &reply.text, thread_id, msg_id, None).await;
+        }
         return;
     }
     let called = match &trigger_decision {
@@ -1900,6 +1924,11 @@ fn reply_principal_for_sender(from_user_id: Option<i64>) -> String {
 /// — used for the per-channel `admin_users` check so a group's admin can be
 /// identified by their own id, not just the shared chat id, and for the CCR
 /// principal (see [`reply_principal_for_sender`]).
+/// The stable id of a Telegram message for a `/交辦` task id.
+fn assign_event_id(message_id: i64) -> String {
+    format!("msg:{message_id}")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     text: &str,
@@ -1911,6 +1940,7 @@ async fn handle_command(
     scope_id: &str,
     agent_name: Option<&str>,
     from_user_id: Option<i64>,
+    message_id: Option<i64>,
 ) {
     // ── WP9: `/start <token>` deep-link binding (global/shared bot only) ──
     // Runs BEFORE the access gate so a brand-new employee can onboard even
@@ -2189,18 +2219,30 @@ async fn handle_command(
                     crate::channel_reply::is_channel_admin(ctx, "telegram", &identities).await;
                 // The sender's own account id (not `scope_id`, which may be a
                 // group/chat id) — the identity `/rules off`'s mapped_role
-                // gate resolves against.
-                let channel_user_id = from_id_str.as_deref().unwrap_or(scope_id);
-                let reply = crate::chat_commands::handle_command(
+                // gate resolves against, and the one `/交辦` and `/goal`
+                // look up the sender's dashboard account with.
+                // Telegram message ids are unique within a chat (the task id
+                // also hashes the conversation), so a redelivered update
+                // finds the task it already created.
+                let event = message_id.map(assign_event_id);
+                let caller = crate::chat_commands::CommandCaller::for_channel(
+                    &ctx.home_dir,
+                    "telegram",
+                    from_id_str.as_deref().unwrap_or(scope_id),
+                )
+                .with_event(event.as_deref());
+                let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,
                     &session_id,
                     &agent_id,
                     is_admin,
-                    channel_user_id,
+                    &caller,
                 )
                 .await;
-                send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+                if !reply.trim().is_empty() {
+                    send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+                }
             }
             // Still-unknown slash command — ignore (legacy behavior).
             //

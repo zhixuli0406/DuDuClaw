@@ -61,6 +61,7 @@ fn personal_surfaces_are_untouched() {
         // 設定檔編輯 (agent_files.*) — a Personal owner edits their own employees too
         "agent_files.list",
         "agent_files.get",
+        "agent_files.runtime_files",
         "agent_files.diff",
         "agent_files.history",
         "agent_files.save",
@@ -90,6 +91,9 @@ fn personal_surfaces_are_untouched() {
         "security.credential_hygiene",
         "security.credential_inventory",
         "security.credential_cleanup",
+        "security.credential_protection",
+        "security.credential_protection_enable",
+        "security.credential_protection_disable",
         "killswitch.get",
         "killswitch.update",
         // 帳務：同一 RPC 服務個人版預算檢視，分區隱藏在前端

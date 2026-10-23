@@ -389,6 +389,17 @@ impl MethodHandler {
         // plan-first parking, the team freeze and the activity row all live
         // there; authorisation (the Operator ACL above) deliberately stays
         // here, because the two rails answer to different authorities.
+        // A per-task risk boundary replaces the deployment baseline
+        // (`[goal_defaults] baseline_boundary`), so only an Admin may set one
+        // (owner decision, PR #194 review M2; the chat `/交辦` drops it).
+        let risk_boundary = params
+            .get("risk_boundary")
+            .and_then(|v| v.as_str())
+            .filter(|b| !b.trim().is_empty())
+            .map(str::to_string);
+        if risk_boundary.is_some() && !ctx.is_admin() {
+            return WsFrame::error_response("", "only an admin can set a risk boundary");
+        }
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -422,10 +433,7 @@ impl MethodHandler {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             duration_hours,
-            risk_boundary: params
-                .get("risk_boundary")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            risk_boundary,
             require_beliefs: params
                 .get("require_beliefs")
                 .and_then(|v| v.as_bool())
@@ -440,6 +448,11 @@ impl MethodHandler {
                 .unwrap_or(false),
             parent_task_id: None,
             source_label: "儀表板".to_string(),
+            on_behalf_of: crate::trigger_route::assign::principal_for_user(&ctx.user_id),
+            created_via: Some("dashboard".to_string()),
+            source: None,
+            task_id: None,
+            grant_via: crate::trigger_route::assign::dashboard_grant_via(ctx, agent_id),
         };
         let created = match crate::goal_create_core::create_goal_task(
             &self.home_dir,

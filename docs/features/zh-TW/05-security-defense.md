@@ -254,6 +254,20 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 尚未涵蓋：Windows 上的解析沒有沙箱（預設因此拒收）也沒有記憶體上限；心跳沒有 turn id 也沒有 run id，它的工具呼叫什麼都讀不到。規則式去識別化無法辨認送往雲端向量供應商的段落中的每一個人名（AI 偵測模型表現較好，但也不完美）。
 
+## 指定人的憑證放系統金鑰圈（未發布）
+
+讓 AI 員工代表某一個人（例如同事的 Google 帳號）之後，憑證被偷的代價變高，所以這類憑證另外用一把金鑰。這把「保護金鑰」是 32 bytes 的 AES-256 金鑰，只存在作業系統的憑證儲存區，代表特定人的憑證用它封存（`pk:v1:<金鑰代號>:…`）。全 home 共用的憑證（`.keyfile` 與它解密的 `*_enc` 值）不變。
+
+- **預設關閉。** 管理員在「安全」頁的「憑證保護」卡片開啟（RPC `security.credential_protection_enable`）；`duduclaw credentials status` 印出同一行狀態。關閉時其他功能都不變，需要代表特定人的功能則拒絕執行。
+- **macOS：** 項目放在登入金鑰圈，解密權限只信任建立它的 `duduclaw` 執行檔（以程式碼雜湊識別）。用 Claude 的 `Read`、`cat`、備份、`security` 或 Python 讀這把金鑰都會失敗；有人在 Mac 前面時，macOS 會先跳出詢問。gateway 自己讀取時不會跳對話框。注入 `duduclaw` 行程的程式碼也算 `duduclaw`：測試中把程式碼注入 ad-hoc 簽章的建立者，可以不經詢問讀到金鑰，開了 hardened runtime 就擋下。所以只有執行中的執行檔開了 hardened runtime，卡片才顯示「只有 DuDuClaw 程式讀得到」；目前發布的 CLI 還沒開，會顯示「同一個帳號的程式讀得到」並說明可被注入。升級後新的執行檔雜湊不同，個人帳號會暫停，直到有人在這台 Mac 上執行 `duduclaw credentials authorize` 並允許一次；其他功能照常。
+- **Windows：** 金鑰放在認證管理員，不會出現在檔案或備份裡，但同一個 Windows 帳號下的任何程式都讀得到，包括能執行指令的 AI 員工。儀表板照實顯示。
+- **Linux 與 Docker：** 還沒有支援的儲存區。卡片顯示「檔案（這個平台不支援系統金鑰圈）」，代表特定人的功能維持拒絕。
+- **金鑰被換掉就拒絕，不會拿來用。** macOS 上同一個使用者的任何程式都能不經詢問改寫或刪除金鑰圈項目（以暫存金鑰圈實測）。所以 gateway 會用啟用時記下的金鑰代號與加密的檢查值核對金鑰，行程第一次載入的金鑰會被釘住直到結束，封存值帶的金鑰代號不同也算金鑰被換。任一種情況都會停用個人帳號並顯示「保護金鑰被更換」。如果金鑰和記錄一起被換掉，再讓 gateway 重新啟動，前兩項檢查會通過，只剩舊的封存值對不上會露出來。「換一把新金鑰」（一切正常時也可以按）會產生新金鑰，大家要重新連結。
+- **只有 gateway 解封。** 只有持有 `<home>/locks/gateway.lock` 的行程拿得到金鑰，MCP server 與 CLI 子命令拿不到。
+- **稽核：** `security_audit.jsonl` 記 `credential_protection_enabled`（含先前狀態，重新換金鑰為 Critical）、`credential_protection_enable_failed`、`credential_protection_disabled`，以及 gateway 第一次看到金鑰不見、被換或記錄損壞時的 `credential_protection_broken`。每列記狀態、等級、後端與金鑰代號，不記金鑰。
+
+擋不住的部分：能執行指令的員工仍可以換掉金鑰（會被偵測，見上）、殺掉 gateway 自己起一個，或在發布的 macOS CLI 還沒開 hardened runtime 之前對 `duduclaw` 執行檔注入程式碼。真正的隔離仍是不給 Bash、用任務沙箱，或讓 gateway 用另一個作業系統帳號執行。
+
 ## 這些守衛擋不住什麼
 
 明講這一節本身就是防線的一部分。
@@ -263,6 +277,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **Bash 通道也會誤擋一些無害的指令。** 受檢位置上的路徑解析失敗時一律拒絕，即使路徑在資料目錄以外；懸空的符號連結即使指向資料目錄以外也會被拒絕。
 - **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
+- **系統金鑰圈分不開員工與 gateway。** 兩者是同一個作業系統帳號。macOS 上保護金鑰擋得住其他程式讀取，擋不住被換掉；Windows 上同帳號的任何程式都讀得到。見[指定人的憑證放系統金鑰圈](#指定人的憑證放系統金鑰圈未發布)。
 - **只有 Claude runtime 會跑這些 hook。** Codex、Antigravity 與其他 runtime 靠各自的沙箱旗標。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）

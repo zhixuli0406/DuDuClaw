@@ -1936,6 +1936,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // `<home>/knowledge/knowledge.db` from background jobs.
     if duduclaw_core::gateway_instance::held(&home_dir) {
         crate::knowledge::worker::spawn(home_dir.clone());
+        // Employees archived or deleted outside the dashboard: their own
+        // collection is archived too.
+        handler.kb_own_reconcile().await;
     }
 
     // ── D5: semi-automatic topology evolution (human-gated) ───
@@ -2181,6 +2184,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 skills = ?report.seeded,
                 "WP19 built-in skills backfill applied"
             );
+        }
+    }
+
+    // One-time upgrade migration: keep an Odoo on an internal address working
+    // (writes `[odoo] allow_private_network = true` once, with an audit event).
+    // Awaited because the connector reads the switch on its first use; a
+    // failure only logs.
+    {
+        let report = crate::odoo_private_network_migration::run(&home_dir).await;
+        if let Some(e) = &report.error {
+            tracing::warn!("Odoo allow_private_network migration: {e}");
         }
     }
 

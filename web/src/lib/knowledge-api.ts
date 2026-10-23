@@ -36,6 +36,8 @@ export interface KbCollection {
   source_count: number;
   ready_count: number;
   chunk_count: number;
+  /** Set when this is an AI employee's own collection (its 資料來源 tab). */
+  own_agent?: { agent_id: string; archived: boolean };
 }
 
 export type KbSourceStatus =
@@ -194,6 +196,72 @@ export interface KbAgentCollections {
   unreadable: boolean;
 }
 
+/** Someone who can read a collection, as the employee page names them. */
+export interface KbReader {
+  kind: KbPrincipalKind;
+  id: string;
+  label: string;
+  role: KbRole;
+  /** The signed-in person's own grant. */
+  you: boolean;
+}
+
+export interface KbReaderCounts {
+  users: number;
+  departments: number;
+  agents: number;
+  channels: number;
+}
+
+/** One collection on the employee page's 資料來源 tab. */
+export interface KbAgentTabCollection {
+  id: string;
+  slug: string;
+  name: string;
+  sensitivity: KbSensitivity;
+  source_count: number;
+  ready_count: number;
+  chunk_count: number;
+  /** The employee's settings use it (not narrowed away). */
+  in_use: boolean;
+  /** This employee's own collection. */
+  is_own: boolean;
+  my_role: KbRole | null;
+  /** Names only for a person who can read the collection; else `null`. */
+  readers: KbReader[] | null;
+  reader_counts: KbReaderCounts;
+}
+
+export type KbManageBlocked = 'not_owner' | 'archived' | 'settings_unreadable' | 'not_collection_editor';
+
+/** `knowledge.agent.data_sources`. */
+export interface KbAgentDataSources {
+  agent_id: string;
+  binding: 'all' | 'only' | 'off' | 'unreadable';
+  /** Every collection shared with the employee (its own included). */
+  collections: KbAgentTabCollection[];
+  own: {
+    collection: KbAgentTabCollection;
+    archived: boolean;
+    share_chat_users: boolean;
+    /** `null` when the signed-in person cannot read the collection. */
+    sources: KbSource[] | null;
+  } | null;
+  can_manage: boolean;
+  manage_blocked: KbManageBlocked | null;
+  /** Who a new own collection would be shared with (besides the creator). */
+  default_readers: Array<{ id: string; label: string; role: KbRole }>;
+}
+
+/** What `also_forget_memories` filed (one Admin approval card per plan). */
+export interface KbForgetSummary {
+  conversations: number;
+  filed: unknown[];
+  nothing_to_forget: number;
+  failed: string[];
+  skipped: number;
+}
+
 export interface KbLimits {
   max_source_bytes: number;
   max_files_per_upload: number;
@@ -277,7 +345,13 @@ export const knowledgeApi = {
       url,
       ...(title ? { title } : {}),
     }),
-  deleteSource: (sourceId: string) => call<{ deleted: boolean }>('knowledge.sources.delete', { source_id: sourceId }),
+  /** `alsoForget` files forget requests for the conversations that cited
+   *  the source (an Admin approves each one). */
+  deleteSource: (sourceId: string, alsoForget = false) =>
+    call<{ deleted: boolean; forget?: KbForgetSummary }>('knowledge.sources.delete', {
+      source_id: sourceId,
+      ...(alsoForget ? { also_forget_memories: true } : {}),
+    }),
   reindexSource: (sourceId: string) => call<{ queued: boolean }>('knowledge.sources.reindex', { source_id: sourceId }),
 
   search: (query: string, collections?: string[], limit = 10) =>
@@ -300,6 +374,15 @@ export const knowledgeApi = {
 
   agentCollections: (agentId: string) =>
     call<KbAgentCollections>('knowledge.agent.collections', { agent_id: agentId }),
+  /** The employee page's 資料來源 tab. */
+  agentDataSources: (agentId: string) => call<KbAgentDataSources>('knowledge.agent.data_sources', { agent_id: agentId }),
+  /** Create the employee's own collection on first use (or return it). */
+  ensureOwnCollection: (agentId: string, opts: { sensitivity?: KbSensitivity; shareChatUsers?: boolean } = {}) =>
+    call<{ collection: KbCollection; created: boolean; binding_changed: boolean }>('knowledge.agent.own.ensure', {
+      agent_id: agentId,
+      ...(opts.sensitivity ? { sensitivity: opts.sensitivity } : {}),
+      ...(opts.shareChatUsers === undefined ? {} : { share_chat_users: opts.shareChatUsers }),
+    }),
   /** `null` = every granted collection; `[]` = none. Written through `agents.update`. */
   bindAgent: (agentId: string, collections: string[] | null) =>
     call<unknown>('agents.update', { agent_id: agentId, knowledge: { collections } }),

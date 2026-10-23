@@ -25,42 +25,43 @@ use crate::channel_reply::{
 };
 use crate::channel_settings::keys;
 
+mod assign;
 mod ingress;
 mod trigger;
 pub(crate) use ingress::durable_line_enabled;
 use ingress::{drain_line_ingress, line_conversation, record_reply_failure};
 
-const LINE_API: &str = "https://api.line.me/v2/bot";
+const LINE_API_ORIGIN: &str = "https://api.line.me";
+
+/// The LINE Messaging API origin. A debug build honours
+/// `DUDUCLAW_LINE_API_BASE` when it points at this machine
+/// (`http://127.0.0.1:<port>` / `http://localhost:<port>`), so a local test
+/// can capture replies and pushes; a release build always uses LINE.
+pub(crate) fn line_api_origin() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(base) = std::env::var("DUDUCLAW_LINE_API_BASE") {
+        let base = base.trim().trim_end_matches('/');
+        let local = ["http://127.0.0.1:", "http://localhost:"]
+            .iter()
+            .any(|p| base.starts_with(p) && base[p.len()..].bytes().all(|b| b.is_ascii_digit()));
+        if local {
+            return base.to_string();
+        }
+    }
+    LINE_API_ORIGIN.to_string()
+}
+
+/// `<origin>/v2/bot<path>`.
+pub(crate) fn line_api_url(path: &str) -> String {
+    format!("{}/v2/bot{path}", line_api_origin())
+}
+
 fn line_provider_url(_token: &str, path: &str) -> String {
-    let url = format!("{}{path}", line_api_base());
+    let url = line_api_url(path);
     #[cfg(test)]
     return crate::test_channel_provider::url(_token, &url);
     #[cfg(not(test))]
     url
-}
-
-/// The Messaging API base for replies and pushes. Debug builds only:
-/// `DUDUCLAW_LINE_API_BASE` may point it at a local fake LINE API (loopback
-/// `http://127.0.0.1:<port>` / `http://localhost:<port>` only) for live
-/// tests; release builds always use the real API.
-fn line_api_base() -> String {
-    #[cfg(debug_assertions)]
-    if let Some(base) = std::env::var("DUDUCLAW_LINE_API_BASE")
-        .ok()
-        .and_then(|b| debug_loopback_base(&b))
-    {
-        return base;
-    }
-    LINE_API.to_string()
-}
-
-/// `base` + `/v2/bot` when `base` is a plain loopback http origin.
-#[cfg(debug_assertions)]
-fn debug_loopback_base(base: &str) -> Option<String> {
-    let url = reqwest::Url::parse(base.trim()).ok()?;
-    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost"));
-    (url.scheme() == "http" && loopback && url.path() == "/")
-        .then(|| format!("{}/v2/bot", base.trim().trim_end_matches('/')))
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -216,7 +217,7 @@ pub async fn fetch_line_add_friend_info(
         .build()
         .map_err(|e| format!("HTTP client 建立失敗：{e}"))?;
     let resp = http
-        .get(format!("{LINE_API}/info"))
+        .get(line_api_url("/info"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -379,7 +380,7 @@ async fn verify_line_status(
         return;
     }
     match http
-        .get(format!("{LINE_API}/info"))
+        .get(line_api_url("/info"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -934,6 +935,22 @@ async fn process_line_events(
                             }
                             continue; // blocked users are silently ignored
                         }
+                        // `/交辦`: the sender's own rights; the assignable
+                        // list comes back as quick-reply buttons.
+                        if let crate::chat_commands::ChatCommand::Assign(assign_cmd) = &cmd {
+                            let fallback = route
+                                .as_ref()
+                                .map(|r| r.fallback.as_str())
+                                .unwrap_or(agent_id);
+                            let messages = Box::pin(assign::command_messages(
+                                state, &event, assign_cmd, fallback,
+                            ))
+                            .await;
+                            if !messages.is_empty() {
+                                let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                            }
+                            continue;
+                        }
                         // Real per-channel admin status (fail-closed) — never hardcoded.
                         let is_admin = crate::channel_reply::is_channel_admin(
                             &state.ctx,
@@ -941,13 +958,18 @@ async fn process_line_events(
                             &[sender, &session_id],
                         )
                         .await;
-                        let reply = crate::chat_commands::handle_command(
+                        let caller = crate::chat_commands::CommandCaller::for_channel(
+                            &state.home_dir,
+                            "line",
+                            sender,
+                        );
+                        let reply = crate::chat_commands::handle_command_with_caller(
                             &cmd,
                             &state.ctx,
                             &session_id,
                             agent_id,
                             is_admin,
-                            sender,
+                            &caller,
                         )
                         .await;
                         let messages = vec![serde_json::json!({ "type": "text", "text": reply })];
@@ -964,8 +986,10 @@ async fn process_line_events(
                 // with logging/audit (same result: idempotent per event).
                 let session_for_route = format!("line:{}", ingress::line_conversation(&event));
                 let principal = crate::ccr_runtime::reply_principal_for_sender(sender);
-                if let Some(crate::trigger_route::turn::TurnDecision::Reply { .. }) =
-                    route.as_ref().map(|r| &r.decision)
+                if let Some(
+                    crate::trigger_route::turn::TurnDecision::Reply { .. }
+                    | crate::trigger_route::turn::TurnDecision::Assign { .. },
+                ) = route.as_ref().map(|r| &r.decision)
                 {
                     if let Some(gate_reply) = crate::channel_reply::gate_direct_reply(
                         &state.ctx,
@@ -996,6 +1020,22 @@ async fn process_line_events(
                     if trigger::direct_reply_allowed(*kind, &event) {
                         let lang = crate::trigger_route::texts::lang_for(&state.home_dir);
                         let messages = trigger::direct_reply_messages(text, list.as_deref(), lang);
+                        let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                    }
+                    continue;
+                }
+                // The message an armed `/交辦 @name` was waiting for.
+                if let Some((assignee, fallback)) = route.as_ref().and_then(|r| match &r.decision {
+                    crate::trigger_route::turn::TurnDecision::Assign { id } => {
+                        Some((id.clone(), r.fallback.clone()))
+                    }
+                    _ => None,
+                }) {
+                    let messages = Box::pin(assign::pending_messages(
+                        state, &event, &assignee, &input_text, &fallback,
+                    ))
+                    .await;
+                    if !messages.is_empty() {
                         let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
                     }
                     continue;

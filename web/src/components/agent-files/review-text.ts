@@ -77,6 +77,14 @@ export function agentFileLabel(intl: IntlShape, file: string): string {
   return isFixedAgentFileKey(file) ? intl.formatMessage({ id: `agentFiles.file.${file}` }) : file;
 }
 
+/** The name shown in the file list and above the editor. Work rules also
+ *  carry the industry names people search for (AGENTS.md / Agent.md); every
+ *  other place keeps the short plain name. */
+export function agentFileHeading(intl: IntlShape, file: string): string {
+  if (file === 'instructions') return intl.formatMessage({ id: 'agentFiles.file.instructionsFull' });
+  return agentFileLabel(intl, file);
+}
+
 /** Localized text for a reason category. An unknown (newer) category falls
  *  back to the server's own sentence so nothing is silently dropped. */
 export function reasonCategoryText(intl: IntlShape, category: string, fallback = ''): string {

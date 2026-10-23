@@ -42,7 +42,9 @@ import { DuDu } from '@/components/mascot';
 import { isImageMime, readAttachment } from '@/lib/attachments';
 import {
   applyMention,
+  assignableAgents,
   filterMentionCandidates,
+  isAssignCommand,
   findActiveMention,
   mentionText,
   orderMentionCandidates,
@@ -276,10 +278,13 @@ export function WebChatPage() {
   useEffect(() => {
     if (mentionTyping) loadCallable();
   }, [mentionTyping, loadCallable]);
-  const mentionSource = useMemo<readonly MentionAgent[]>(
-    () => (callable ?? agents) as readonly MentionAgent[],
-    [callable, agents],
-  );
+  // After `/交辦` (or `/assign`) the list offers only staff who can take a
+  // task; the gateway checks the right again when the command arrives.
+  const assigning = isAssignCommand(input);
+  const mentionSource = useMemo<readonly MentionAgent[]>(() => {
+    const all = (callable ?? agents) as readonly MentionAgent[];
+    return assigning ? assignableAgents(all) : all;
+  }, [callable, agents, assigning]);
   const mentionCandidates = useMemo(
     () => (activeMention ? orderMentionCandidates(filterMentionCandidates(mentionSource, activeMention.query)) : []),
     [activeMention, mentionSource],

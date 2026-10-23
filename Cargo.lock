@@ -2166,6 +2166,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2294,10 +2295,14 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "core-foundation 0.10.1",
  "duduclaw-core",
+ "keyring",
  "regex",
  "reqwest",
  "ring",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tokio",
