@@ -132,7 +132,7 @@ async fn tasks_create_records_the_principal_from_the_host_only() {
 }
 
 #[tokio::test]
-async fn enforce_mode_refuses_what_the_person_may_not_do_and_record_does_not() {
+async fn enforce_requires_host_context_even_after_binding_while_record_does_not() {
     let _lock = OBO_LOCK.lock().await;
     let tmp = home_with_queue();
     let home = tmp.path();
@@ -165,12 +165,14 @@ async fn enforce_mode_refuses_what_the_person_may_not_do_and_record_does_not() {
     assert_eq!(row["reason"], "human_principal_not_permitted");
     assert_eq!(row["on_behalf_of"], format!("user:{u}"));
 
-    // Binding the person to `worker` (Operator) lets it through.
+    // A binding cannot replace the gateway's live host context. Positive
+    // authenticated cases run through the real route in native MCP tests.
     db.bind_agent(&u, "worker", duduclaw_auth::AccessLevel::Operator).unwrap();
-    let ok = send_to_agent_with_ctx(&params, home, "main", ctx()).await;
-    assert!(ok.get("isError").is_none(), "{ok}");
+    let refused = send_to_agent_with_ctx(&params, home, "main", ctx()).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(queued_principal(home).len(), 1, "no context means no new queue row even after binding");
 
-    // Self-assignment is checked too: a Viewer cannot launder a hand-over.
+    // Self-assignment also needs host context, including for a Viewer.
     let viewer = db
         .create_user("w@test.local", "看看", "TeamPass-12345", duduclaw_auth::UserRole::Employee)
         .unwrap()

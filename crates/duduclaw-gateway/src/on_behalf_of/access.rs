@@ -28,6 +28,18 @@ pub fn principal_permits(
     target: &str,
     right: HumanRight,
 ) -> Result<bool, String> {
+    principal_permits_with_team(home, principal, target, right, crate::team_edition::team_grants_enabled(home))
+}
+
+/// Internal authority route supplies the verified license decision directly;
+/// it must not inherit the legacy environment-based edition override.
+pub(crate) fn principal_permits_with_team(
+    home: &Path,
+    principal: &HumanPrincipal,
+    target: &str,
+    right: HumanRight,
+    team_enabled: bool,
+) -> Result<bool, String> {
     match principal {
         HumanPrincipal::Unmapped { .. } => Ok(right == HumanRight::Call && is_public_trigger(home, target)),
         HumanPrincipal::User(user_id) => {
@@ -38,9 +50,10 @@ pub fn principal_permits(
             };
             // The same live computation `@` routing uses (team grants only
             // on the Enterprise edition).
-            let Some(access) = crate::trigger_route::access::load_account(home, &db, user_id)? else {
+            let Some(mut access) = db.effective_access(user_id)? else {
                 return Ok(false);
             };
+            if !team_enabled { access.team.clear(); }
             Ok(match right {
                 HumanRight::Assign => access.may_assign(target),
                 HumanRight::Call => access.may_call(target) || is_public_trigger(home, target),

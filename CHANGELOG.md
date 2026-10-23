@@ -101,6 +101,7 @@
   - 尚未驗證：使用次數的實際數字（沒有用真模型觸發 `skill_activate`，只有單元測試）；儀表板畫面沒有用瀏覽器實際操作（只有 vitest）；Windows 上的開關檔改名覆寫與技能移動。
 - 記住工作是替誰做的（`on_behalf_of`）：對話、`/交辦` 與 dashboard 任務的真人身分，會帶入 runtime 的 `DUDUCLAW_ON_BEHALF_OF`，並沿 `send_to_agent`／`spawn_agent`、目標任務每一輪與 heartbeat 喚醒傳遞；`tasks_create` 建的任務也會記錄（`created_via = agent`）。核可與 MCP 工具稽核會記上交辦人，通道卡片顯示「由 ○○ 交辦」（優先顯示名稱，找不到時用帳號短碼）。沒有帳號的發話者只記通道及 HMAC 摘要，不存平台原始 id。工具參數不能改寫身分，系統名稱與格式不對的值拒收並記 `on_behalf_of_rejected`。
   - 新設定 `[delegation] human_principal`：預設 `"record"`，只記錄、不擋任何事；設為 `"enforce"` 時，員工之間的委派在組織樹允許之後，還要這個人自己也有權限（傳訊與 `spawn_agent` 要能呼叫對方，交辦任務要操作權限以上；沒有帳號的發話者只能到開放的員工，且不能交辦）。值打錯或 `config.toml` 讀不到時視為 `"enforce"`。
+  - 強制模式的 MCP 權限檢查改由 gateway 執行：以主機建立、綁定員工的短期參照查真人權限，團隊授權讀取已驗簽的 license runtime；不接受工具參數或 Enterprise 環境變數作為授權。背景工作也要有效的 None context，缺少或失效即拒絕；預設記錄模式不受影響，知識庫授權不變。
   - 新設定 `[approval] forbid_self_approval`（預設關）：開啟後，AI 員工替某人辦事時提出的核可，不能由同一個人自己按同意（dashboard 與通道按鈕都適用，拒絕仍可以）。
   - 電腦操作 start／action 的核可，依已驗證的員工與主機登記的 turn 取得交辦人，不採用請求本文的身分參數；缺少或查不到 turn 時不記真人。設定錯型、任務或佇列身分欄位讀取失敗會收窄或拒絕該次操作，避免變成無交辦人的自主工作。
   - 已驗證：核心、員工與安全套件測試；電腦操作的簽名 HTTP 請求、交辦人承接與拒絕自批回歸。完整 gateway 測試的一項新斷言已依既有壞列略過契約修正，待整合後重跑。尚未驗證：完整 CLI 測試、隔離 stdio MCP 活測、真實模型／通道、Grok 與 Gemini CLI 的 MCP 子程序傳遞；`spawn_ephemeral`、延後准入及舊式 MCP cron 排程不在本次承接範圍。

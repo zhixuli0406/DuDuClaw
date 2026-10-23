@@ -256,7 +256,7 @@ pub(crate) async fn handle_tasks_create(
         &assigned_to,
         "tasks_create",
         duduclaw_core::delegation_policy_from_home(home_dir),
-    ) {
+    ).await {
         // A task for yourself needs no employee-tree check, but in enforce
         // mode the person it is for must still be allowed to hand this
         // employee work (no laundering a hand-over through self-assignment).

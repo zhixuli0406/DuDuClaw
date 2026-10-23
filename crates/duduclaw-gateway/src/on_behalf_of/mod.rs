@@ -21,6 +21,8 @@
 //! nobody.
 
 pub mod access;
+pub mod context;
+pub mod route;
 pub mod label;
 pub mod self_approval;
 
@@ -56,9 +58,11 @@ pub fn scope_first<F: Future>(value: Option<String>, fut: F) -> impl Future<Outp
 /// `(DUDUCLAW_ON_BEHALF_OF, value)` when a principal is in scope, for the
 /// runtimes that hand turn identity to the MCP server as explicit pairs.
 pub fn env_pairs() -> Vec<(String, String)> {
-    current()
+    let mut pairs = current()
         .map(|v| vec![(ENV_ON_BEHALF_OF.to_string(), v)])
-        .unwrap_or_default()
+        .unwrap_or_default();
+    pairs.extend(context::env_pair());
+    pairs
 }
 
 /// Set the variable on a spawn from the scope, removing any value the
@@ -139,3 +143,6 @@ pub fn audit_rejected(home: &Path, agent: &str, source: &str, rejection: &Princi
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_tests;

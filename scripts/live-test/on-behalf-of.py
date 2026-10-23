@@ -129,9 +129,9 @@ def main():
         result = call(None, "tasks_create", {
             "title": "obo-live-system", "assigned_to": "prod-shaped",
         })
-        assert not result.get("isError"), result
-        assert task("obo-live-system") == (None, None)
-        print("PASS absent host identity preserves employee-owned work")
+        assert result.get("isError"), result
+        assert task("obo-live-system") is None
+        print("PASS absent host context cannot claim background authority in enforce mode")
     finally:
         (home / "config.toml").write_text(original)
 

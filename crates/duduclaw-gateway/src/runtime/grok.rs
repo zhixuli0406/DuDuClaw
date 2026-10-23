@@ -633,6 +633,7 @@ impl AgentRuntime for GrokRuntime {
         // ambient `DUDUCLAW_ON_BEHALF_OF` is removed first; only the scoped
         // value (in the pairs) may reach the MCP child.
         cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
+        cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
         for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
             cmd.env(k, v);
         }

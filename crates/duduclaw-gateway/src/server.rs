@@ -2777,6 +2777,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));
+    // Separate MCP processes delegate human permission checks to this
+    // host, using its verified license runtime and live opaque contexts.
+    app = app.merge(crate::on_behalf_of::route::router(Arc::new(
+        crate::on_behalf_of::route::RouteState::new(home_dir.clone(), Some(_license_runtime.clone())),
+    )));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
     // tools: same loopback + signed-identity authentication as the

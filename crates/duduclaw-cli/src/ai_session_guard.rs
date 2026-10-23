@@ -34,6 +34,7 @@ pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
     duduclaw_core::ENV_LANE,
     // The person the run works for (`on_behalf_of`).
     duduclaw_core::ENV_ON_BEHALF_OF,
+    duduclaw_gateway::on_behalf_of::context::ENV_CONTEXT,
     // Also refused by the LINE inbox and computer-workspace commands before
     // the lists were merged into this one.
     "DUDUCLAW_MCP_API_KEY",

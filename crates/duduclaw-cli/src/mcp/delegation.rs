@@ -482,7 +482,7 @@ pub(crate) async fn check_delegation_allowed(
     match duduclaw_core::can_delegate_rules(&rules, &org, sender, target) {
         // The employee tree allows it; the person the work is for must too
         // (`[delegation] human_principal = "enforce"`; record mode passes).
-        Ok(()) => check_human_principal(home_dir, sender, target, path_kind, rules.policy),
+        Ok(()) => check_human_principal(home_dir, sender, target, path_kind, rules.policy).await,
         Err(denied) => {
             duduclaw_security::audit::append_tool_call_with_extras(
                 home_dir,

@@ -490,6 +490,7 @@ where
     F: std::future::Future<Output = Result<String, String>>,
 {
     use crate::cost_telemetry::RequestType as RT;
+    let fut = crate::on_behalf_of::context::scope(home_dir, agent_id, fut);
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
@@ -2846,7 +2847,7 @@ async fn call_local_inference(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    let raw = call_local_inference_raw(
+    let raw = crate::on_behalf_of::context::scope(home_dir, agent_id.unwrap_or(""), call_local_inference_raw(
         home_dir,
         prompt,
         system_prompt,
@@ -2854,7 +2855,7 @@ async fn call_local_inference(
         agent_id,
         capabilities,
     )
-    .await?;
+    ).await?;
     finish_local_reply(raw)
 }
 
@@ -3952,6 +3953,7 @@ pub(crate) struct ClaudeCmdGuards {
     /// `(agent, turn) → person` for the knowledge route, inside a channel
     /// reply turn; lives as long as the spawned CLI.
     knowledge: Option<crate::knowledge::turn_requesters::RequesterGuard>,
+    principal_context: Option<crate::on_behalf_of::context::ContextGuard>,
 }
 
 fn prepare_claude_cmd(
@@ -4286,6 +4288,8 @@ fn prepare_claude_cmd(
         .and_then(|n| n.to_str());
     let turn = spawned.and_then(crate::computer_use_sessions::turns::register_current_turn);
     let knowledge = spawned.and_then(crate::knowledge::turn_requesters::register_current_turn);
+    let principal_context = spawned.and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));
+    crate::on_behalf_of::context::inject(&mut cmd, principal_context.as_ref());
 
     Ok((
         cmd,
@@ -4294,6 +4298,7 @@ fn prepare_claude_cmd(
             mcp_proxy: mcp_proxy_guard,
             turn,
             knowledge,
+            principal_context,
         },
     ))
 }

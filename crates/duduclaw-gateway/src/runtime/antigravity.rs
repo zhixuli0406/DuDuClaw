@@ -800,6 +800,7 @@ impl AgentRuntime for AntigravityRuntime {
         // MCP child.
         cmd.env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN);
         cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
+        cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
         for (k, v) in spawn_mcp_env(&context.home_dir, &context.agent_id) {
             cmd.env(k, v);
         }

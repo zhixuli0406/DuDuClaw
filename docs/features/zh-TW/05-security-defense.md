@@ -214,6 +214,9 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 - **記錄**（預設，`[delegation] human_principal = "record"`）：該輪的每一筆 `tool_calls.jsonl`、每一筆 `delegation_denied`、每一張核可都帶著它，通道核可卡片顯示「由 ○○ 交辦」（優先顯示名稱，找不到時用帳號短碼）。不會因此拒絕任何事。
 - **強制**（`human_principal = "enforce"`，需自行開啟；值無法辨識或 `config.toml` 讀不到也視為強制）：員工組織樹允許一次委派之後，還要真人也有權限。`send_to_agent`／`spawn_agent` 與派工器的委派閘門要求這個人能呼叫目標（Admin；直接綁定或主管的團隊推導，任何等級；或 `public_trigger` 員工）；`tasks_create`（員工指派給自己也算）、`create_task`、排程、看別人信箱與修改別人的任務要求 Operator 以上。未對應帳號的發話者只能到 `public_trigger` 員工，且不能交辦。帳號不存在或停用、值格式不對、`users.db` 讀不到，一律拒絕（`human_principal_not_permitted`）。目標任務每一輪、heartbeat 喚醒與 cron 在派工時不再依真人重檢，它們在建立任務時已經檢查過。
+
+強制模式下，獨立 MCP 程序會向正在執行的 gateway 查驗真人權限。它只送主機建立、綁定員工與 home 的不透明參照；gateway 以當下帳號資料驗權；團隊授權必須同時有已驗簽的 Enterprise license，且該 home 的 gateway 已解析為 Enterprise。任一條件為 Personal 或未知就不給團隊授權，不接受本文指定的真人或 Enterprise 環境變數當作證明。背景工作也必須有主機明確登記的 None context：缺少、跨員工／home、過期或已釋放的參照都會拒絕；主機紀錄與 MCP 的身分標記不一致也會拒絕。參照在 runtime 返回或 24 小時後失效，同時最多保留 4096 筆。預設記錄模式不需要此路由。這份 context 與知識庫 requester 分開，不會增加文件存取權。
+
 - `[approval] forbid_self_approval = true`（預設關）：AI 員工替某人辦事時提出的核可，不能由同一個人自己同意（dashboard 與通道按鈕都一樣，拒絕仍可以）。綁定式請求不變，只由綁定的那個人決定。
 
 電腦操作 start／action 的核可，依已驗證的員工與 `turn_id`，從主機登記的進行中對話取出真人。請求參數不能指定真人，也不能借用另一位員工的對話。沒有或查不到 turn 時不記真人，因此無法在這些請求辨認自批者；沒有 turn 的工作區、截圖與停止請求也不記真人。
