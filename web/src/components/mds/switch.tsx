@@ -12,7 +12,9 @@ export const Switch = forwardRef<
     data-slot="switch"
     className={cn(
       'inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent p-0.5 outline-none transition-colors',
-      'data-[unchecked]:bg-input data-[checked]:bg-primary',
+      // Off state keeps a muted-foreground outline: the `input` fill alone is
+      // about 1.5:1 against dark surfaces (WCAG 1.4.11 asks for 3:1).
+      'data-[unchecked]:border-muted-foreground data-[unchecked]:bg-input data-[checked]:bg-primary',
       'focus-visible:ring-3 focus-visible:ring-ring/50',
       'data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50',
       className
