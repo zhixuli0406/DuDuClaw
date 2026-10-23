@@ -50,6 +50,21 @@ impl MethodHandler {
         // (below) instead of erroring out — otherwise the save silently fails and
         // nothing is persisted.
         if !agent_name.is_empty() && matches!(channel_type, "discord" | "telegram" | "slack") {
+            // One Telegram bot belongs to one employee (getUpdates is
+            // exclusive per bot): refuse a bot another employee already uses.
+            let _bind = crate::agent_channels::binding_lock().await;
+            if channel_type == "telegram" {
+                if let Some(holder) = crate::agent_channels::conflicts::telegram_bot_holder(
+                    &self.home_dir,
+                    &self.registry,
+                    token,
+                    agent_name,
+                )
+                .await
+                {
+                    return WsFrame::error_response("", &holder.telegram_refusal());
+                }
+            }
             let (token_field, secret_field) = match channel_type {
                 "discord" => ("bot_token", None),
                 "telegram" => ("bot_token", None),
@@ -88,33 +103,17 @@ impl MethodHandler {
                     // a present-but-empty plaintext as "channel removed"). All
                     // per-agent readers (telegram.rs / discord.rs / slack.rs /
                     // config_crypto::resolve_agent_token) prefer `_enc`.
-                    // Keyfile-unavailable falls back to legacy plaintext.
-                    match crate::config_crypto::encrypt_value(&token_owned, &home) {
-                        Some(enc) => {
-                            section.remove(token_field); // drop any stale plaintext copy
-                            section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
-                        }
-                        None => {
-                            section.insert(
-                                token_field.to_string(),
-                                toml::Value::String(token_owned.clone()),
-                            );
-                        }
-                    }
+                    // agent.toml lives in the employee's own directory: a
+                    // token that cannot be encrypted is refused, never stored
+                    // as plaintext there (B11).
+                    let enc = crate::agent_channels::store::encrypt_or_refuse(&token_owned, &home)?;
+                    section.remove(token_field); // drop any stale plaintext copy
+                    section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
                     if let Some(sf) = secret_field {
                         if !secret_owned.is_empty() {
-                            match crate::config_crypto::encrypt_value(&secret_owned, &home) {
-                                Some(enc) => {
-                                    section.remove(sf); // drop any stale plaintext copy
-                                    section.insert(format!("{sf}_enc"), toml::Value::String(enc));
-                                }
-                                None => {
-                                    section.insert(
-                                        sf.to_string(),
-                                        toml::Value::String(secret_owned.clone()),
-                                    );
-                                }
-                            }
+                            let enc = crate::agent_channels::store::encrypt_or_refuse(&secret_owned, &home)?;
+                            section.remove(sf); // drop any stale plaintext copy
+                            section.insert(format!("{sf}_enc"), toml::Value::String(enc));
                         }
                     }
                     Ok(())
@@ -129,7 +128,9 @@ impl MethodHandler {
             self.hot_stop_channel(&label).await;
 
             let mut hot_started = false;
-            if let Some(ctx) = self.reply_ctx.read().await.clone() {
+            if channel_type == "telegram" {
+                hot_started = self.restart_agent_telegram(agent_name).await;
+            } else if let Some(ctx) = self.reply_ctx.read().await.clone() {
                 let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
                     "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
                     "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
@@ -157,6 +158,17 @@ impl MethodHandler {
                     "not_started_reason": (!hot_started).then_some("check_credentials"),
                 }),
             );
+        }
+
+        // The shared Google Chat app may not reuse an employee's own app
+        // project (B11 L3).
+        let _bind = crate::agent_channels::binding_lock().await;
+        if channel_type == "googlechat" {
+            if let Some(msg) =
+                crate::agent_channels::conflicts::shared_project_conflict(&self.registry, secret).await
+            {
+                return WsFrame::error_response("", &msg);
+            }
         }
 
         // Global channel: write to config.toml [channels]

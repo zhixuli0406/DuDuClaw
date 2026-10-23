@@ -170,6 +170,9 @@ pub(crate) async fn handle_create_reminder(
         status: ReminderStatus::Pending,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
+        // B11: set in a conversation that came through an employee's own
+        // bot / app ⇒ delivered through the same one.
+        sender_agent: duduclaw_gateway::claude_runner::reply_sender_for(channel, chat_id),
     };
 
     let id = reminder.id.clone();

@@ -141,6 +141,10 @@ struct PendingUpdateReport {
     /// `duduclaw-gateway`, not `duduclaw-cli`.
     #[serde(default)]
     reply_channel_raw: Option<String>,
+    /// B11: the employee whose own bot / app that conversation came in
+    /// through (`DUDUCLAW_REPLY_SENDER` at write time); `None` = default.
+    #[serde(default)]
+    reply_sender: Option<String>,
     /// `system` only. `false` until this sweep's first sighting, at which
     /// point it schedules the actual gateway restart and flips this to
     /// `true` — distinguishing "haven't reacted yet" from "already
@@ -298,7 +302,7 @@ async fn reconcile_system(
     finalize_report(
         home_dir,
         agent_id,
-        &report.reply_channel_raw,
+        &report,
         &text,
         success,
         "system",
@@ -399,7 +403,7 @@ async fn reconcile_device(
             finalize_report(
                 home_dir,
                 agent_id,
-                &report.reply_channel_raw,
+                &report,
                 "系統更新已完成重開機評估：開機評估結果正常。",
                 true,
                 "device",
@@ -414,7 +418,7 @@ async fn reconcile_device(
             finalize_report(
                 home_dir,
                 agent_id,
-                &report.reply_channel_raw,
+                &report,
                 "系統更新後開機評估失敗，機器已自動退回上一個版本，目前運作正常，沒有造成資料損失。若要重試更新，請告訴我。",
                 false,
                 "device",
@@ -436,7 +440,7 @@ async fn reconcile_device(
             finalize_report(
                 home_dir,
                 agent_id,
-                &report.reply_channel_raw,
+                &report,
                 "系統更新後的開機評估遲遲沒有明確結果，需要人工檢查目前的開機狀態。",
                 false,
                 "device",
@@ -465,13 +469,13 @@ async fn reconcile_device(
 async fn finalize_report(
     home_dir: &Path,
     agent_id: &str,
-    reply_channel_raw: &Option<String>,
+    report: &PendingUpdateReport,
     text: &str,
     success: bool,
     target: &str,
     http: &reqwest::Client,
 ) {
-    let delivered = deliver(home_dir, agent_id, reply_channel_raw, text, http).await;
+    let delivered = deliver(home_dir, agent_id, report, text, http).await;
     if !delivered {
         warn!(
             agent = agent_id,
@@ -502,14 +506,18 @@ async fn finalize_report(
 async fn deliver(
     home_dir: &Path,
     agent_id: &str,
-    reply_channel_raw: &Option<String>,
+    report: &PendingUpdateReport,
     text: &str,
     http: &reqwest::Client,
 ) -> bool {
-    if let Some(raw) = reply_channel_raw {
+    if let Some(raw) = &report.reply_channel_raw {
         if let Some((channel, chat_id)) = crate::decision_notify::parse_origin(raw) {
-            match crate::reminder_scheduler::send_channel_message(
-                home_dir, http, &channel, &chat_id, text,
+            let sender = report
+                .reply_sender
+                .as_deref()
+                .filter(|a| duduclaw_core::is_valid_agent_id(a));
+            match crate::reminder_scheduler::send_channel_message_as(
+                home_dir, http, &channel, &chat_id, text, sender,
             )
             .await
             {
@@ -706,6 +714,7 @@ mod tests {
                 expected_version: Some("9.9.9".into()),
                 initiated_at: Some(Utc::now().to_rfc3339()),
                 reply_channel_raw: None,
+                reply_sender: None,
                 restart_triggered: false,
                 restart_triggered_at: None,
             },
@@ -734,6 +743,7 @@ mod tests {
                 expected_version: Some("9.9.9".into()),
                 initiated_at: None,
                 reply_channel_raw: None,
+                reply_sender: None,
                 restart_triggered: true,
                 restart_triggered_at: Some(Utc::now().to_rfc3339()),
             },
@@ -761,6 +771,7 @@ mod tests {
                 expected_version: Some("9.9.9".into()),
                 initiated_at: None,
                 reply_channel_raw: None,
+                reply_sender: None,
                 restart_triggered: true,
                 restart_triggered_at: Some(
                     (Utc::now() - chrono::Duration::seconds(200)).to_rfc3339(),
@@ -786,6 +797,7 @@ mod tests {
                 expected_version: None,
                 initiated_at: None,
                 reply_channel_raw: None,
+                reply_sender: None,
                 restart_triggered: false,
                 restart_triggered_at: None,
             },

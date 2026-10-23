@@ -197,6 +197,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
+| [guides/per-employee-channels.md](guides/per-employee-channels.md) | 讓 AI 員工有自己的 Telegram Bot 與 Google Chat 應用程式（設定步驟、權限、驗證方式；另有 [zh-TW](guides/zh-TW/per-employee-channels.md)、[ja-JP](guides/ja-JP/per-employee-channels.md)） | Current |
 | [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate from`，預設 dry-run） | Current |
 | [guides/white-label.md](guides/white-label.md) | Distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`); notes that white-label branding was removed in 1.72.2 (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/distributor-notice.md](guides/distributor-notice.md) | Distributor information on the About page — kept by the distributor in the license console, delivered as a signed runtime copy every 6 hours and compiled into the distributor build (`DUDUCLAW_DISTRIBUTOR_NOTICE_PATH`), the HTML allowlist, the sandboxed iframe, how to check `about.get` (also in `zh-TW/` and `ja-JP/`) | Current |

@@ -164,6 +164,35 @@ impl MethodHandler {
             }
         }
 
+        // One Telegram bot per employee (B11): refuse a bot another employee
+        // already uses before anything is written; the bind lock is held
+        // until the write is done (L3).
+        let _bind = if params.get("telegram_bot_token").is_some() {
+            Some(crate::agent_channels::binding_lock().await)
+        } else {
+            None
+        };
+        if let Some(raw) = params
+            .get("telegram_bot_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let token = match crate::config_crypto::validate_channel_token("telegram", raw) {
+                Ok(t) => t,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+            if let Some(holder) = crate::agent_channels::conflicts::telegram_bot_holder(
+                &self.home_dir,
+                &self.registry,
+                &token,
+                &agent_id,
+            )
+            .await
+            {
+                return WsFrame::error_response("", &holder.telegram_refusal());
+            }
+        }
+
         // Detect per-agent channel token changes BEFORE the closure consumes
         // params — so we know what to hot-restart after the write succeeds.
         let mut channels_to_restart: Vec<&'static str> = Vec::new();
@@ -672,7 +701,7 @@ impl MethodHandler {
                             // plaintext as "channel removed"). All per-agent
                             // readers (telegram/discord/slack bots,
                             // config_crypto::resolve_agent_token) prefer
-                            // `_enc`. Keyfile-unavailable ⇒ legacy plaintext.
+                            // `_enc`.
                             // Applies to every sensitive field routed through
                             // this closure, incl. the wecom/dingtalk secrets.
                             let is_sensitive = toml_key.contains("token")
@@ -680,19 +709,13 @@ impl MethodHandler {
                                 || toml_key == "app_id"
                                 || toml_key.contains("aes_key");
                             if is_sensitive {
+                                // B11: agent.toml sits in the employee's own
+                                // directory — refuse rather than store a
+                                // plaintext token there.
                                 let enc_key = format!("{toml_key}_enc");
-                                match crate::config_crypto::encrypt_value(val, &home) {
-                                    Some(enc) => {
-                                        section.remove(toml_key); // drop stale plaintext
-                                        section.insert(enc_key, toml::Value::String(enc));
-                                    }
-                                    None => {
-                                        section.insert(
-                                            toml_key.to_string(),
-                                            toml::Value::String(val.into()),
-                                        );
-                                    }
-                                }
+                                let enc = crate::agent_channels::store::encrypt_or_refuse(val, &home)?;
+                                section.remove(toml_key); // drop stale plaintext
+                                section.insert(enc_key, toml::Value::String(enc));
                             } else {
                                 // Identifier, not a secret — plaintext is the
                                 // canonical copy (e.g. phone_number_id).

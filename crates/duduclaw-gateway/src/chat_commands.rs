@@ -689,10 +689,12 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
     drop(reg);
 
     // Session info
-    let session_info = match ctx
-        .session_manager
-        .get_or_create(session_id, agent_id)
-        .await
+    let session_info = match crate::session_origin::ensure_turn_session(
+        &ctx.session_manager,
+        session_id,
+        agent_id,
+    )
+    .await
     {
         Ok(session) => format!(
             "Session: #{}\nTokens: {}\nLast active: {}",
@@ -1052,6 +1054,8 @@ async fn handle_rollback(ctx: &ReplyContext, session_id: &str) -> String {
 /// notices push back to the conversation that launched the goal (falling back to
 /// the agent's `[proactive]` channel when a task has no source).
 pub(crate) fn source_from_session(session_id: &str) -> (String, String) {
+    // An employee bucket (`#agent:`) is not part of the chat id (B11).
+    let session_id = duduclaw_core::session_conversation(session_id);
     let parts: Vec<&str> = session_id.splitn(3, ':').collect();
     match parts.as_slice() {
         [] | [_] => (String::new(), session_id.to_string()),

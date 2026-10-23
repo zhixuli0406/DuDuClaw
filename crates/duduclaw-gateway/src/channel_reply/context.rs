@@ -30,6 +30,10 @@ pub struct ReplyContext {
     pub http: reqwest::Client,
     pub session_manager: Arc<SessionManager>,
     pub channel_status: ChannelStatusMap,
+    /// Own-app webhook states are rebuilt per request; ordering and overload
+    /// notices must instead live for the whole gateway reply context.
+    pub(crate) googlechat_queue: crate::conversation_queue::ConversationQueue,
+    pub(crate) googlechat_full_notices: crate::conversation_queue::NoticeThrottle,
     /// Broadcast sender for pushing events (e.g. channel status changes) to WebSocket clients.
     pub event_tx: tokio::sync::broadcast::Sender<String>,
     /// Prediction engine for event-driven evolution.
@@ -127,6 +131,8 @@ impl ReplyContext {
             http,
             session_manager,
             channel_status,
+            googlechat_queue: Default::default(),
+            googlechat_full_notices: Default::default(),
             event_tx,
             prediction_engine: None,
             gvu_loop: None,

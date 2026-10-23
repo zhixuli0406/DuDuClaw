@@ -3149,7 +3149,13 @@ async fn handle_slash_command(
 
             match sub_name {
                 "info" => {
-                    let info = match ctx.session_manager.get_or_create(&session_id, "main").await {
+                    let info = match crate::session_origin::ensure_turn_session(
+                        &ctx.session_manager,
+                        &session_id,
+                        "main",
+                    )
+                    .await
+                    {
                         Ok(s) => format!(
                             "**Session**: `{}`\n**Tokens**: {}\n**Last Active**: {}",
                             s.id, s.total_tokens, s.last_active

@@ -280,6 +280,8 @@ pub async fn start_telegram_bots(
                 }
             }
         }
+        // Deterministic precedence for a leftover duplicate: lowest id wins.
+        tokens.sort_by(|a, b| a.0.cmp(&b.0));
         tokens
     };
     // 1. Global bot from config.toml — skipped when an agent already owns the
@@ -287,9 +289,18 @@ pub async fn start_telegram_bots(
     //    fix for the dual-registration 409 + identity-mixing bug.
     if let Some(token) = read_telegram_token(home_dir).await {
         if !token.is_empty() {
+            // Same BOT (bot id), not the same token string: a regenerated
+            // token keeps the id and polling both would 409 (B11 L4).
+            let bot = |t: &str| {
+                crate::agent_channels::conflicts::telegram_bot_id(t)
+                    .unwrap_or(t)
+                    .to_string()
+            };
+            let agent_bots: Vec<(String, String)> =
+                agent_tokens.iter().map(|(n, t)| (n.clone(), bot(t))).collect();
             if let Some(owner) = crate::channel_reply::find_global_token_owner(
-                &token,
-                agent_tokens.iter().map(|(n, t)| (n.as_str(), t.as_str())),
+                &bot(&token),
+                agent_bots.iter().map(|(n, b)| (n.as_str(), b.as_str())),
             ) {
                 warn!(
                     "Telegram global token is also bound to agent '{owner}' — \
@@ -308,15 +319,30 @@ pub async fn start_telegram_bots(
     }
 
     // 2. Per-agent bots (dedup among agents themselves — first claim wins).
+    //    Saves refuse a bot another employee uses; a leftover duplicate (an
+    //    older config) is skipped AND marked so its page says why.
+    let mut seen_bots: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (agent_name, token) in agent_tokens {
-        if seen_tokens.contains(&token) {
-            info!(
-                "Telegram bot for agent '{agent_name}' shares an already-claimed token — skipping duplicate"
+        let label = format!("telegram:{agent_name}");
+        let bot_id = crate::agent_channels::conflicts::telegram_bot_id(&token)
+            .unwrap_or(token.as_str())
+            .to_string();
+        if let Some(first) = seen_bots.get(&bot_id) {
+            warn!(
+                "Telegram bot for agent '{agent_name}' is the same bot as agent '{first}' — not started"
             );
+            set_channel_connected(
+                &ctx.channel_status,
+                &label,
+                false,
+                Some(duplicate_bot_error(first)),
+                Some(&ctx.event_tx),
+            )
+            .await;
             continue;
         }
+        seen_bots.insert(bot_id, agent_name.clone());
         seen_tokens.insert(token.clone());
-        let label = format!("telegram:{agent_name}");
         if let Some(handle) = spawn_telegram_bot(
             token,
             label.clone(),
@@ -333,6 +359,43 @@ pub async fn start_telegram_bots(
     results
 }
 
+/// Status text for an employee whose bot is already another employee's.
+fn duplicate_bot_error(first_agent: &str) -> String {
+    format!("這個 Bot 已由 AI 員工「{first_agent}」使用，一個 Bot 只能給一位員工；請到 BotFather 另建一個 Bot。")
+}
+
+/// (Re)start ONE employee's own bot after its token changed; every other bot
+/// keeps polling untouched (the older path restarted every bot on each save,
+/// briefly running two pollers per token). `None` when the employee has no
+/// token right now, another employee already uses the same bot (marked in the
+/// status map), or Telegram rejected the token at start.
+pub async fn start_agent_telegram_bot(
+    home_dir: &Path,
+    ctx: Arc<ReplyContext>,
+    agent_name: &str,
+) -> Option<(String, tokio::task::JoinHandle<()>)> {
+    let label = format!("telegram:{agent_name}");
+    crate::agent_channels::identity::clear(&label);
+    let token = resolve_current_token(&ctx, Some(agent_name)).await?;
+    if let Some(crate::agent_channels::conflicts::Holder::Employee { id, .. }) =
+        crate::agent_channels::conflicts::telegram_bot_holder(home_dir, &ctx.registry, &token, agent_name)
+            .await
+    {
+        set_channel_connected(
+            &ctx.channel_status,
+            &label,
+            false,
+            Some(duplicate_bot_error(&id)),
+            Some(&ctx.event_tx),
+        )
+        .await;
+        return None;
+    }
+    spawn_telegram_bot(token, label.clone(), Some(agent_name.to_string()), ctx, home_dir)
+        .await
+        .map(|h| (label, h))
+}
+
 /// Spawn a single Telegram bot (shared by global and per-agent paths).
 async fn spawn_telegram_bot(
     token: String,
@@ -346,7 +409,7 @@ async fn spawn_telegram_bot(
         .build()
         .ok()?;
 
-    let api_base = format!("{}/bot{}", TELEGRAM_API, token);
+    let api_base = telegram_poll_api_base(&token);
 
     // Verify token. The verification result decides only whether we give up
     // *now*: a rejection by Telegram (`ok: false`) is authoritative and fatal,
@@ -358,6 +421,7 @@ async fn spawn_telegram_bot(
                 if let Some(user) = &data.result {
                     let name = user.username.as_deref().unwrap_or("unknown");
                     info!("Telegram bot connected: @{name} (label: {label})");
+                    crate::agent_channels::identity::set(&label, name);
                     // Only register commands for the global bot
                     if agent_name.is_none() {
                         register_commands(&client, &api_base).await;
@@ -727,8 +791,15 @@ async fn poll_loop(
 
                 // ── Inline keyboard button presses ──
                 if let Some(cb) = update.callback_query {
-                    handle_callback_query(&cb, &client, &api_base, &ctx, &verified_account_id)
-                        .await;
+                    handle_callback_query(
+                        &cb,
+                        &client,
+                        &api_base,
+                        &ctx,
+                        &verified_account_id,
+                        agent_name.as_deref(),
+                    )
+                    .await;
                     continue;
                 }
 
@@ -825,7 +896,8 @@ async fn process_telegram_message(
     // starts fresh (mirrors Discord thread auto-archive handling).
     if msg.forum_topic_closed.is_some() {
         if let Some(tid) = thread_id {
-            let session_id = format!("telegram:{chat_id}:{tid}");
+            let session_id =
+                own_bot_session(&format!("telegram:{chat_id}:{tid}"), agent_name.as_deref());
             match ctx.session_manager.delete_session(&session_id).await {
                 Ok(()) => info!("Telegram: forum topic {tid} closed — session cleared"),
                 Err(e) => warn!("Telegram: forum topic {tid} closed, session clear failed: {e}"),
@@ -1415,15 +1487,17 @@ async fn process_telegram_message(
             effective_agent = Some(called_agent.clone());
             (guard.text.clone(), Some(guard))
         } else if let Some(ref agent) = agent_name {
-            // Per-agent bot: unchanged deterministic routing to its owner.
-            let guard = build_guarded_reply_for_agent(
+            // Per-agent bot: deterministic routing to its owner, answered in
+            // the owner's own bucket of this chat (the access gate and
+            // takeover checks still run on the chat itself).
+            let guard = crate::trigger_route::as_own_bot_turn(build_guarded_reply_for_agent(
                 &input_text,
                 &ctx,
                 agent,
                 &session_id,
                 &user_id,
                 Some(on_progress),
-            )
+            ))
             .await;
             (guard.text.clone(), Some(guard))
         } else {
@@ -1535,7 +1609,7 @@ async fn process_telegram_message(
     // Check voice mode
     let session_key = format!("telegram:{chat_id}");
     let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
-    let markup = conversation_markup(&session_id, &reply);
+    let markup = conversation_markup(&own_bot_session(&session_id, agent_name.as_deref()), &reply);
 
     if voice_enabled {
         let tts_provider = crate::tts::EdgeTtsProvider::new();
@@ -1721,6 +1795,7 @@ async fn handle_callback_query(
     api_base: &str,
     ctx: &Arc<ReplyContext>,
     account_id: &str,
+    agent_name: Option<&str>,
 ) {
     let data = cb.data.as_deref().unwrap_or("");
     let sender = cb
@@ -1845,11 +1920,12 @@ async fn handle_callback_query(
 
     let answer = match data {
         "duduclaw:new_session" => {
-            let session_id = if let Some(tid) = thread_id {
+            let conversation = if let Some(tid) = thread_id {
                 format!("telegram:{chat_id}:{tid}")
             } else {
                 format!("telegram:{chat_id}")
             };
+            let session_id = own_bot_session(&conversation, agent_name);
             match ctx.session_manager.delete_session(&session_id).await {
                 Ok(()) => "✅ 已開啟新的對話".to_string(),
                 Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
@@ -2033,14 +2109,14 @@ async fn handle_command(
             // could retrieve each other's tool originals.
             let reply_user_id = reply_principal_for_sender(from_user_id);
             let (reply, guarded) = if let Some(agent) = agent_name {
-                let guard = build_guarded_reply_for_agent(
+                let guard = crate::trigger_route::as_own_bot_turn(build_guarded_reply_for_agent(
                     args,
                     ctx,
                     agent,
                     &session_id,
                     &reply_user_id,
                     None,
-                )
+                ))
                 .await;
                 (guard.text.clone(), Some(guard))
             } else {
@@ -2084,7 +2160,7 @@ async fn handle_command(
                 &reply,
                 thread_id,
                 None,
-                Some(conversation_markup(&session_id, &reply)),
+                Some(conversation_markup(&own_bot_session(&session_id, agent_name), &reply)),
                 &ctx.home_dir,
                 guarded.as_ref(),
             )
@@ -2128,11 +2204,12 @@ async fn handle_command(
             send_reply(client, api_base, chat_id, msg, thread_id, None, None).await;
         }
         "/reset" => {
-            let session_id = if let Some(tid) = thread_id {
+            let conversation = if let Some(tid) = thread_id {
                 format!("telegram:{chat_id}:{tid}")
             } else {
                 format!("telegram:{chat_id}")
             };
+            let session_id = own_bot_session(&conversation, agent_name);
             let msg = match ctx.session_manager.delete_session(&session_id).await {
                 Ok(()) => format!("✅ 已清除工作階段 `{session_id}`。"),
                 Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
@@ -2234,7 +2311,7 @@ async fn handle_command(
                 let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,
-                    &session_id,
+                    &own_bot_session(&session_id, agent_name),
                     &agent_id,
                     is_admin,
                     &caller,
@@ -3733,8 +3810,33 @@ async fn get_bot_account_id(client: &reqwest::Client, api_base: &str) -> Option<
     Some(data.result?.id.to_string())
 }
 
-fn telegram_poll_api_base(token: &str) -> String {
-    let original = format!("{TELEGRAM_API}/bot{token}");
+/// Bot API origin. Debug builds only: `DUDUCLAW_DEV_TELEGRAM_API_BASE`
+/// (a loopback `http://` origin) points every bot at a local fake Bot API for
+/// live tests; release builds always use the real one.
+pub(crate) fn telegram_api_root() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(origin) = crate::agent_channels::dev_override::loopback_origin(
+        "DUDUCLAW_DEV_TELEGRAM_API_BASE",
+    ) {
+        return origin;
+    }
+    TELEGRAM_API.to_string()
+}
+
+/// The session a reply in this conversation is stored under: the
+/// conversation itself for the shared bot, the employee's own bucket of it for
+/// an employee's own bot (`trigger_route::OWN_BOT_TURN`). Telegram gives a
+/// person the same private-chat id with every bot, so without the bucket two
+/// employees' bots shared one session.
+fn own_bot_session(conversation: &str, agent_name: Option<&str>) -> String {
+    match agent_name {
+        Some(agent) => crate::trigger_route::called_session(conversation, agent),
+        None => conversation.to_string(),
+    }
+}
+
+pub(crate) fn telegram_poll_api_base(token: &str) -> String {
+    let original = format!("{}/bot{token}", telegram_api_root());
     #[cfg(test)]
     let original = crate::test_channel_provider::url(token, &original);
     original
@@ -4070,6 +4172,7 @@ mod native_callback_acl_tests {
                 &telegram_poll_api_base(&provider.token),
                 &fixture.ctx,
                 "telegram|7",
+                None,
             )
             .await;
             if allowed {
