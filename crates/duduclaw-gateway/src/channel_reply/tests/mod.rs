@@ -2,6 +2,7 @@ use super::*;
 
 mod ccr_guarded_reply;
 mod fallback;
+mod future_size;
 mod misc;
 mod operator_direct_api;
 mod progress;

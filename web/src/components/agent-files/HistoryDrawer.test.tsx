@@ -12,7 +12,7 @@ import { client } from '@/lib/ws-client';
 import { HistoryDrawer, sourceLabelKey } from './HistoryDrawer';
 
 const versions = [
-  { version_id: '1730000000002-bbbbbbbbbbbb', file: 'soul', at: '2026-10-22T03:00:00Z', user_id: 'owner-a', source: 'dashboard', sha256: 'h2', size: 10, verdict: 'pass', reason_categories: [] },
+  { version_id: '1730000000002-bbbbbbbbbbbb', file: 'soul', at: '2026-10-22T03:00:00Z', user_id: 'u-uuid-1', user_name: 'Alice', confirm_reason: '客服語氣調整', source: 'dashboard', sha256: 'h2', size: 10, verdict: 'pass', reason_categories: [] },
   { version_id: '1730000000001-aaaaaaaaaaaa', file: 'soul', at: '2026-10-21T03:00:00Z', user_id: 'system', source: 'initial', sha256: 'h1', size: 8, verdict: null, reason_categories: [] },
 ];
 
@@ -44,6 +44,16 @@ function renderDrawer(canRestore: boolean, onRestore = vi.fn()) {
 describe('<HistoryDrawer>', () => {
   afterEach(() => vi.mocked(client.call).mockReset());
 
+  it('says "a deleted user" instead of showing a raw id', async () => {
+    vi.mocked(client.call).mockImplementation(async (method: string) =>
+      method === 'agent_files.history' ? { agent_id: 'a1', file: 'soul', versions: [{ ...versions[0], user_name: null }] } : {},
+    );
+    renderDrawer(false);
+    const row = await screen.findByTestId('history-version');
+    expect(within(row).getByText(`Changed by ${en['agentFiles.history.deletedUser']}`)).toBeInTheDocument();
+    expect(screen.queryByText(/u-uuid-1/)).toBeNull();
+  });
+
   it('lists versions with who and where in plain words', async () => {
     mockCalls();
     renderDrawer(true);
@@ -51,7 +61,10 @@ describe('<HistoryDrawer>', () => {
     expect(rows).toHaveLength(2);
     expect(within(rows[0]).getByText(en['agentFiles.history.source.dashboard'])).toBeInTheDocument();
     expect(within(rows[0]).getByText(en['agentFiles.history.current'])).toBeInTheDocument();
-    expect(within(rows[0]).getByText('Changed by owner-a')).toBeInTheDocument();
+    expect(within(rows[0]).getByText('Changed by Alice')).toBeInTheDocument();
+    expect(within(rows[0]).getByTestId('history-reason')).toHaveTextContent('Reason: 客服語氣調整');
+    expect(within(rows[1]).queryByTestId('history-reason')).toBeNull();
+    expect(screen.queryByText(/u-uuid-1/)).toBeNull();
     expect(within(rows[1]).getByText(en['agentFiles.history.source.initial'])).toBeInTheDocument();
     expect(within(rows[1]).getByText('Changed by System')).toBeInTheDocument();
     expect(vi.mocked(client.call)).toHaveBeenCalledWith('agent_files.history', { agent_id: 'a1', file: 'soul' });

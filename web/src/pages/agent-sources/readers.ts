@@ -21,13 +21,21 @@ export function readerLabel(intl: IntlShape, r: KbReader): string {
  * gateway gave them (the viewer owns the collection), else counts.
  * Admins can always read every collection, so they are always mentioned.
  */
-export function readersSentence(intl: IntlShape, readers: KbReader[] | null, counts: KbReaderCounts): string {
+export function readersSentence(
+  intl: IntlShape,
+  readers: KbReader[] | null,
+  counts: KbReaderCounts,
+  /** The employee whose tab this is: it reads its own collections too, so it is named first. */
+  self?: { id: string; name: string },
+): string {
+  const selfLabel = self ? intl.formatMessage({ id: 'agentSources.reader.self' }, { name: self.name }) : null;
   if (readers) {
-    const names = readers.map((r) => readerLabel(intl, r));
+    const rest = self ? readers.filter((r) => !(r.kind === 'agent' && r.id === self.id)) : readers;
+    const names = rest.map((r) => readerLabel(intl, r));
     if (names.length === 0) return intl.formatMessage({ id: 'agentSources.readers.adminsOnly' });
     return intl.formatMessage(
       { id: 'agentSources.readers.named' },
-      { names: intl.formatList(names, { type: 'conjunction' }) },
+      { names: intl.formatList(selfLabel ? [selfLabel, ...names] : names, { type: 'conjunction' }) },
     );
   }
   const parts: string[] = [];
@@ -40,7 +48,7 @@ export function readersSentence(intl: IntlShape, readers: KbReader[] | null, cou
   if (parts.length === 0) return intl.formatMessage({ id: 'agentSources.readers.adminsOnly' });
   return intl.formatMessage(
     { id: 'agentSources.readers.counted' },
-    { parts: intl.formatList(parts, { type: 'conjunction' }) },
+    { parts: intl.formatList(selfLabel ? [selfLabel, ...parts] : parts, { type: 'conjunction' }) },
   );
 }
 

@@ -118,6 +118,16 @@ describe('PassageDrawer', () => {
     expect(screen.getByText(/reads like instructions/)).toBeInTheDocument();
   });
 
+  it('disables both walk buttons when the source has a single passage', async () => {
+    mockRpc({
+      'knowledge.passage.get': () => ({ chunk_id: 5, source_id: 's', collection_id: 'c', title: 'one.txt', locator_text: 'page 1', heading_path: '', segment_label: null, before: '', match: 'Only passage.', after: '', prev_chunk_id: null, next_chunk_id: null, suspect: false }),
+    });
+    renderWithProviders(<PassageDrawer chunkId={5} onClose={vi.fn()} />);
+    await screen.findByText('Only passage.');
+    expect(screen.getByRole('button', { name: /Previous/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Next/ })).toBeDisabled();
+  });
+
   it('shows an error when the passage may no longer be read', async () => {
     mockRpc({ 'knowledge.passage.get': () => { throw new Error('permission denied'); } });
     renderWithProviders(<PassageDrawer chunkId={9} onClose={vi.fn()} />);

@@ -58,6 +58,17 @@ function file(name: string, size = 10) {
 }
 
 describe('AddSourceDialog', () => {
+  it('keeps one body box while switching between upload, paste and web address', async () => {
+    const user = userEvent.setup();
+    renderAt(<AddSourceDialog collection={collection()} onClose={vi.fn()} onAdded={vi.fn()} />);
+    const body = await screen.findByTestId('add-source-body');
+    expect(body.className).toContain('min-h-');
+    await user.click(screen.getByRole('radio', { name: /Paste text/ }));
+    expect(screen.getByTestId('add-source-body')).toBe(body);
+    await user.click(screen.getByRole('radio', { name: /Web page/ }));
+    expect(screen.getByTestId('add-source-body')).toBe(body);
+  });
+
   it('uploads dropped files with a progress bar and lists each outcome', async () => {
     const user = userEvent.setup();
     const onAdded = vi.fn();

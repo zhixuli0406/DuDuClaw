@@ -108,7 +108,13 @@ export function HistoryDrawer({
     [agentId, file],
   );
 
-  const who = (id: string) => (id === 'system' || id === '' ? t('agentFiles.history.system') : id);
+  // Display name from the server; an account that no longer exists reads as such (never the raw id).
+  const who = (v: AgentFileVersion) =>
+    v.user_id === 'system' || v.user_id === ''
+      ? t('agentFiles.history.system')
+      : v.user_name?.trim()
+        ? v.user_name
+        : t('agentFiles.history.deletedUser');
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -143,7 +149,12 @@ export function HistoryDrawer({
                     <span className="text-muted-foreground">{t(sourceLabelKey(v.source))}</span>
                     {isCurrent && <Badge variant="secondary">{t('agentFiles.history.current')}</Badge>}
                   </div>
-                  <p className="text-xs text-muted-foreground">{t('agentFiles.history.by', { name: who(v.user_id) })}</p>
+                  <p className="text-xs text-muted-foreground">{t('agentFiles.history.by', { name: who(v) })}</p>
+                  {v.confirm_reason?.trim() && (
+                    <p className="break-words text-xs text-muted-foreground" data-testid="history-reason">
+                      {t('agentFiles.history.reason', { reason: v.confirm_reason.trim() })}
+                    </p>
+                  )}
                   <div className="flex flex-wrap gap-1.5">
                     <Button size="xs" variant="outline" onClick={() => view(v.version_id)} aria-pressed={selected && detail?.kind === 'view'}>
                       {t('agentFiles.history.view')}

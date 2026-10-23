@@ -63,7 +63,7 @@ describe('AgentSourcesTab', () => {
     expect(screen.queryByRole('button', { name: 'Add files' })).toBeNull();
     const shared = screen.getByTestId('agent-shared-collections');
     expect(within(shared).getByText('HR handbook')).toBeInTheDocument();
-    expect(within(shared).getByText('Who can read: 3 colleagues and 1 department, and admins.')).toBeInTheDocument();
+    expect(within(shared).getByText('Who can read: Sales helper (this employee), 3 colleagues, and 1 department, and admins.')).toBeInTheDocument();
     // Not a reader: no link into the library.
     expect(within(shared).queryByRole('button', { name: /Open collection/ })).toBeNull();
   });
@@ -123,7 +123,7 @@ describe('AgentSourcesTab', () => {
     render();
     expect(await screen.findByText('prices.xlsx')).toBeInTheDocument();
     expect(screen.getByText('這份 PDF 沒有文字層，請先轉成文字再上傳。')).toBeInTheDocument();
-    expect(screen.getByText('Who can read: you and Ken, and admins.')).toBeInTheDocument();
+    expect(screen.getByText('Who can read: Sales helper (this employee), you, and Ken, and admins.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Manage in the document library/ })).toBeInTheDocument();
     // The own collection is not repeated under "shared by others".
     expect(within(screen.getByTestId('agent-shared-collections')).queryByText('Sales helper 的資料')).toBeNull();

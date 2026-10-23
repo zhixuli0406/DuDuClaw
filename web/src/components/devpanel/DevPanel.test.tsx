@@ -90,6 +90,14 @@ describe('DevPanel — role gate', () => {
     expect(screen.getByLabelText('Open developer panel')).toBeInTheDocument();
   });
 
+  it('keeps the collapsed trigger off narrow screens so it cannot cover the chat send button', () => {
+    useAuthStore.setState({ user: { id: 'u', email: 'm@example.com', role: 'manager' } as never });
+    renderWithProviders(<DevPanel />);
+    const cls = screen.getByLabelText('Open developer panel').className.split(/\s+/);
+    expect(cls).toContain('hidden');
+    expect(cls).toContain('md:flex');
+  });
+
   it('renders the collapsed trigger for an admin', () => {
     useAuthStore.setState({ user: { role: 'admin' } } as never);
     renderWithProviders(<DevPanel />);
