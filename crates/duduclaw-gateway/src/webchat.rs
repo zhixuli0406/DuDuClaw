@@ -679,6 +679,31 @@ pub async fn handle_chat_socket_public(
     handle_chat_socket(socket, state, peer_ip).await;
 }
 
+/// Outbound staging happens after the model future's principal scope has
+/// ended. Carry the authenticated socket principal across the actual archive
+/// write too; model text and a declared path never establish ownership.
+async fn stage_owned_webchat_deliverable(
+    principal: &str,
+    raw: &str,
+    agent_dir: &std::path::Path,
+    home: &std::path::Path,
+    check: Option<&crate::office_docs::DeliveryCheck<'_>>,
+) -> Result<crate::office_docs::StagedDeliverable, String> {
+    crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+        .scope(
+            principal.to_owned(),
+            crate::office_docs::stage_deliverable_checked(
+                raw,
+                agent_dir,
+                home,
+                crate::artifacts::ArtifactOrigin::Declared,
+                Some("webchat"),
+                check,
+            ),
+        )
+        .await
+}
+
 /// These paths come only from `StagedDeliverable::owned_archive_path`, which
 /// names fresh guarded copies. Never remove an attachment that existed before
 /// this reply.
@@ -1430,12 +1455,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         let delivery_valid = || guarded.still_valid_blocking();
                                         for p in &paths {
                                             if !guarded.still_valid().await { break; }
-                                            match crate::office_docs::stage_deliverable_checked(
+                                            match stage_owned_webchat_deliverable(
+                                                &auth_user,
                                                 p,
                                                 &agent_dir,
                                                 &state.ctx.home_dir,
-                                                crate::artifacts::ArtifactOrigin::Declared,
-                                                Some("webchat"),
                                                 Some(&delivery_valid),
                                             )
                                             .await
@@ -1878,6 +1902,41 @@ fn assign_event_id(msg_id: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use duduclaw_auth::{AccessLevel, JwtConfig, UserDb, UserRole, UserStatus};
+
+    #[tokio::test]
+    async fn bound_outbound_archive_uses_socket_owner_and_preserves_delivery_fence() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/sales");
+        std::fs::create_dir_all(&agent).unwrap();
+        let source = agent.join("report.txt");
+        std::fs::write(&source, "synthetic own reply").unwrap();
+        let permit = || true;
+        let staged = stage_owned_webchat_deliverable(
+            "alice", source.to_str().unwrap(), &agent, home.path(), Some(&permit),
+        ).await.unwrap();
+        assert!(staged.archived);
+        let records = || {
+            std::fs::read_to_string(home.path().join("artifacts.jsonl"))
+                .unwrap().lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let rows = records();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["owner_user_id"], "alice");
+        assert_eq!(rows[0]["channel"], "webchat");
+        assert_eq!(rows[0]["origin"], "declared");
+
+        stage_owned_webchat_deliverable(
+            "widget-visitor:visitor", source.to_str().unwrap(), &agent, home.path(), Some(&permit),
+        ).await.unwrap();
+        assert!(records().last().unwrap().get("owner_user_id").is_none());
+        let deny = || false;
+        assert!(stage_owned_webchat_deliverable(
+            "alice", source.to_str().unwrap(), &agent, home.path(), Some(&deny),
+        ).await.is_err());
+        assert_eq!(records().len(), 2);
+    }
 
     /// Build an isolated in-temp-dir `UserDb` + a test `JwtConfig`.
     fn fixtures() -> (JwtConfig, UserDb, tempfile::TempDir) {
