@@ -34,7 +34,7 @@ function securityDot(status?: string): string {
   return 'bg-muted-foreground';
 }
 
-export const MY_SKILLS_COLUMNS = 'minmax(0,1fr) auto auto auto 2.5rem';
+export const MY_SKILLS_COLUMNS = 'minmax(11rem,1fr) auto auto auto 2.5rem';
 
 /** One installed skill: name and description, owner, last use, security, actions. */
 export function InstalledSkillRow({
@@ -96,9 +96,9 @@ export function InstalledSkillRow({
         </div>
       </ListGridCell>
       <ListGridCell className="gap-2">
-        <Badge variant="secondary">{intl.formatMessage({ id: `skills.my.scope.${scope}` })}</Badge>
+        <Badge variant="secondary" className="shrink-0 whitespace-nowrap">{intl.formatMessage({ id: `skills.my.scope.${scope}` })}</Badge>
         {holders ? (
-          <span className="text-xs text-muted-foreground">
+          <span className="whitespace-nowrap text-xs text-muted-foreground">
             {intl.formatMessage(
               { id: 'skills.usage.holders' },
               { on: skill.enabled_count ?? holders.length, total: holders.length },
@@ -116,7 +116,7 @@ export function InstalledSkillRow({
         )}
       </ListGridCell>
       <ListGridCell>
-        <span className="truncate text-xs text-muted-foreground" title={skill.last_used_at ?? undefined}>
+        <span className="whitespace-nowrap text-xs text-muted-foreground" title={skill.last_used_at ?? undefined}>
           {intl.formatMessage(
             { id: 'skills.usage.line' },
             { count: skill.use_count ?? 0, when: lastUsed(skill.last_used_at) },

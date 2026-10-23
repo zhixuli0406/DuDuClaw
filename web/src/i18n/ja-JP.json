@@ -1295,7 +1295,7 @@
   "skills.market.subtitle": "OpenClaw 互換の Skill プラグインを検索・インストール",
   "skills.market.searchPlaceholder": "スキルを検索（名前、タグ、説明）...",
   "skills.market.search": "検索",
-  "skills.market.noResults": "スキルが見つかりません",
+  "skills.market.noResults": "一致するスキルが見つかりません",
   "skills.market.categories": "カテゴリ別に閲覧",
   "skills.install.title": "Skill をインストール",
   "skills.install.scope": "インストール範囲",
@@ -4175,7 +4175,7 @@
   "skills.custom.status.rejected": "差し戻し済み",
   "skills.custom.status.retired": "停止済み",
   "skills.custom.sectionTitle": "カスタムスキル",
-  "skills.custom.new": "＋ 新規スキル",
+  "skills.custom.new": "新規スキル",
   "skills.custom.empty": "カスタムスキルはまだありません",
   "skills.custom.emptyHint": "欲しいスキルを自然な言葉で説明し、AIスタッフに草案を作らせましょう",
   "skills.custom.notFound": "スキルが見つかりません",
@@ -8435,9 +8435,9 @@
   "skills.manage.panelHint": "オフにしたスキルは、この社員の会話に含まれなくなり、スキル一覧にも表示されません。会社・部署共通のスキルはここでオフにするだけです。社員自身のスキルは削除もでき、削除したスキルは元に戻せます。",
   "skills.manage.switchFor": "{agent} が「{name}」を使う",
   "skills.manage.partialFailure": "{count} 件が完了しませんでした：{message}",
-  "skills.manage.enabledDone": "{count} 件のスキルをオンにしました",
-  "skills.manage.disabledDone": "{count} 件のスキルをオフにしました",
-  "skills.manage.removedDone": "{count} 件のスキルを削除しました。社員の設定から元に戻せます",
+  "skills.manage.enabledDone": "{agents} 人の社員で {skills} 件のスキルをオンにしました",
+  "skills.manage.disabledDone": "{agents} 人の社員で {skills} 件のスキルをオフにしました",
+  "skills.manage.removedDone": "{agents} 人の社員から {skills} 件のスキルを削除しました。社員の設定から元に戻せます",
   "skills.manage.restoredDone": "「{name}」を元に戻しました",
   "skills.manage.select": "「{name}」を選択",
   "skills.manage.selectAll": "すべて選択",
@@ -8497,5 +8497,6 @@
   "users.org.suspended": "停止中",
   "users.org.role.admin": "管理者",
   "users.org.role.manager": "マネージャー",
-  "users.org.role.employee": "従業員"
+  "users.org.role.employee": "従業員",
+  "skills.manage.bulkBar": "一括操作"
 }

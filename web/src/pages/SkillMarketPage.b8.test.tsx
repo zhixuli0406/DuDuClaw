@@ -9,6 +9,12 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { SkillMarketPage } from './SkillMarketPage';
 
+const toastSuccess = vi.fn();
+vi.mock('@/lib/toast', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('@/lib/toast')>();
+  return { ...orig, toast: { ...orig.toast, success: (m: string) => toastSuccess(m), error: vi.fn() } };
+});
+
 /** B8 — ordering, search, tab in the URL, and per-employee management. */
 
 let lastSearch = '';
@@ -46,7 +52,7 @@ function aggregate() {
         enabled: true,
         enabled_count: 2,
         holders: [
-          { agent_id: 'agnes', enabled: true, use_count: 0 },
+          { agent_id: 'agnes', display_name: 'Zoe Agnes', enabled: true, use_count: 0 },
           { agent_id: 'bruno', enabled: true, use_count: 3, last_used_at: '2026-10-20T00:00:00Z' },
         ],
       },
@@ -81,7 +87,7 @@ beforeEach(() => {
   } catch {
     /* jsdom */
   }
-  mockWsClient.call.mockImplementation((method: string) => {
+  mockWsClient.call.mockImplementation((method: string, params?: unknown) => {
     if (method === 'agents.list') return Promise.resolve({ agents: twoAgents });
     if (method === 'skills.list') return Promise.resolve(aggregate());
     if (method === 'skills.shared')
@@ -91,8 +97,10 @@ beforeEach(() => {
           { name: 'Beta', description: 'greeting', shared_by: 'bruno', shared_at: '2026-10-02', adopted_by: [], usage_count: 5, tags: ['front-desk'] },
         ],
       });
-    if (method === 'skills.set_enabled' || method === 'skills.remove')
-      return Promise.resolve({ results: [{ agent_id: 'bruno', skill_name: 'quote', ok: true }] });
+    if (method === 'skills.set_enabled' || method === 'skills.remove') {
+      const items = ((params as { items?: Array<{ agent_id: string; skill_name: string }> })?.items ?? []);
+      return Promise.resolve({ results: items.map((i) => ({ ...i, ok: true })) });
+    }
     return Promise.resolve({});
   });
 });
@@ -174,6 +182,21 @@ describe('SkillMarketPage — B8', () => {
         ],
       }),
     );
+    // One skill on two staff is reported as one skill, not two.
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith('Switched off 1 skill for 2 staff'));
+  });
+
+  it('lists holders by display name in the usage dialog', async () => {
+    const user = userEvent.setup();
+    renderAt('/skills?tab=mySkills');
+    await waitFor(() => expect(screen.getAllByText('quote')).toHaveLength(2));
+    const toneRow = screen.getAllByRole('row').find((r) => within(r).queryByText('Tone'))!;
+    await user.click(within(toneRow).getByRole('button', { name: 'More actions' }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Who uses it' }));
+    const dialog = await screen.findByRole('dialog');
+    const names = within(dialog).getAllByRole('switch').map((s) => s.getAttribute('aria-label'));
+    // Sorted by display name, not by employee id (agnes < bruno).
+    expect(names).toEqual(['Bruno uses “Tone”', 'Zoe Agnes uses “Tone”']);
   });
 
   it('bulk-removes only employees’ own skills after confirmation', async () => {

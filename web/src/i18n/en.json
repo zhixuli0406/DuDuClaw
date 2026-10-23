@@ -1300,7 +1300,7 @@
   "skills.market.subtitle": "Search and install OpenClaw-compatible skill plugins",
   "skills.market.searchPlaceholder": "Search skills (name, tag, description)...",
   "skills.market.search": "Search",
-  "skills.market.noResults": "No skills found",
+  "skills.market.noResults": "No matching skills",
   "skills.market.categories": "Browse by Category",
   "skills.install.title": "Install Skill",
   "skills.install.scope": "Install Scope",
@@ -4175,7 +4175,7 @@
   "skills.custom.status.rejected": "Rejected",
   "skills.custom.status.retired": "Retired",
   "skills.custom.sectionTitle": "Self-built skills",
-  "skills.custom.new": "+ New skill",
+  "skills.custom.new": "New skill",
   "skills.custom.empty": "No self-built skills yet",
   "skills.custom.emptyHint": "Describe the skill you want in plain language and let an AI staffer draft it",
   "skills.custom.notFound": "Skill not found",
@@ -8435,9 +8435,9 @@
   "skills.manage.panelHint": "A switched-off skill is no longer put into this staffer's conversations and no longer appears in its skill list. Company and department skills can only be switched off here; the staffer's own skills can also be removed, and a removed skill can be restored.",
   "skills.manage.switchFor": "{agent} uses “{name}”",
   "skills.manage.partialFailure": "{count, plural, one {# item} other {# items}} not done: {message}",
-  "skills.manage.enabledDone": "Switched on {count, plural, one {# skill} other {# skills}}",
-  "skills.manage.disabledDone": "Switched off {count, plural, one {# skill} other {# skills}}",
-  "skills.manage.removedDone": "Removed {count, plural, one {# skill} other {# skills}}; restore from the staffer's settings",
+  "skills.manage.enabledDone": "Switched on {skills, plural, one {# skill} other {# skills}} for {agents, plural, one {# staffer} other {# staff}}",
+  "skills.manage.disabledDone": "Switched off {skills, plural, one {# skill} other {# skills}} for {agents, plural, one {# staffer} other {# staff}}",
+  "skills.manage.removedDone": "Removed {skills, plural, one {# skill} other {# skills}} from {agents, plural, one {# staffer} other {# staff}}; restore from the staffer's settings",
   "skills.manage.restoredDone": "Restored “{name}”",
   "skills.manage.select": "Select “{name}”",
   "skills.manage.selectAll": "Select all",
@@ -8497,5 +8497,6 @@
   "users.org.suspended": "Suspended",
   "users.org.role.admin": "Admin",
   "users.org.role.manager": "Manager",
-  "users.org.role.employee": "Employee"
+  "users.org.role.employee": "Employee",
+  "skills.manage.bulkBar": "Bulk actions"
 }

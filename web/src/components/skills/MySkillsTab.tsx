@@ -7,7 +7,7 @@ import { api, type SkillInfo, type SkillScanPath, type SkillStateStatus } from '
 import type { SkillTarget } from '@/lib/api-skills-manage';
 import { client } from '@/lib/ws-client';
 import { debounceTrailing } from '@/lib/debounce';
-import { matchesQuery, sortSkills } from '@/lib/skill-library';
+import { collatorFor, matchesQuery, sortSkills } from '@/lib/skill-library';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -247,9 +247,14 @@ export function MySkillsTab({ filter }: { filter: string }) {
           last_used_at: r.last_used_at,
           can_manage: data.canManage[r.agent_id as string] === true,
         }));
-      return [...own, ...fromGlobal];
+      const collator = collatorFor(intl.locale);
+      return [...own, ...fromGlobal].sort(
+        (a, b) =>
+          collator.compare(a.display_name, b.display_name) ||
+          (a.agent_id < b.agent_id ? -1 : a.agent_id > b.agent_id ? 1 : 0),
+      );
     },
-    [data.rows, data.canManage, displayNameOf],
+    [data.rows, data.canManage, displayNameOf, intl.locale],
   );
 
   const selectedRows = useMemo(() => visible.filter((s) => selected.has(rowKey(s))), [visible, selected]);
@@ -305,7 +310,12 @@ export function MySkillsTab({ filter }: { filter: string }) {
         )}
 
         {isAdmin && selectedRows.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm">
+          // Floats over the page so selecting rows never pushes the table down.
+          <div
+            role="toolbar"
+            aria-label={intl.formatMessage({ id: 'skills.manage.bulkBar' })}
+            className="fixed inset-x-0 bottom-20 z-30 mx-auto flex w-fit max-w-[calc(100%-2rem)] flex-wrap items-center gap-2 rounded-xl border border-surface-border bg-surface px-3 py-2 text-sm shadow-lg md:bottom-6"
+          >
             <span className="text-muted-foreground">
               {intl.formatMessage({ id: 'skills.manage.selected' }, { count: selectedRows.length })}
             </span>
@@ -346,7 +356,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
           <div className="overflow-x-auto rounded-xl border border-surface-border">
             <ListGridContainer
               columns={MY_SKILLS_COLUMNS}
-              className="!h-auto [&>[aria-hidden]]:hidden"
+              className="!h-auto min-w-[40rem] [&>[aria-hidden]]:hidden"
               header={
                 <ListGridHeader>
                   <ListGridHeaderCell className="gap-2">

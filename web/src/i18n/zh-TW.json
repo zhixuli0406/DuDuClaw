@@ -1295,7 +1295,7 @@
   "skills.market.subtitle": "搜尋並安裝 OpenClaw 相容的 Skill 外掛",
   "skills.market.searchPlaceholder": "搜尋 skill（名稱、標籤、描述）...",
   "skills.market.search": "搜尋",
-  "skills.market.noResults": "找不到符合的 Skill",
+  "skills.market.noResults": "找不到符合的技能",
   "skills.market.categories": "依類別瀏覽",
   "skills.install.title": "安裝 Skill",
   "skills.install.scope": "安裝範圍",
@@ -4175,7 +4175,7 @@
   "skills.custom.status.rejected": "已退回",
   "skills.custom.status.retired": "已停用",
   "skills.custom.sectionTitle": "自建技能",
-  "skills.custom.new": "＋自建技能",
+  "skills.custom.new": "自建技能",
   "skills.custom.empty": "還沒有自建技能",
   "skills.custom.emptyHint": "用自然語言描述你要的技能，交給 AI 員工起草",
   "skills.custom.notFound": "找不到這個技能",
@@ -8435,9 +8435,9 @@
   "skills.manage.panelHint": "關掉的技能不會再放進這位員工的對話，也不會出現在它的技能清單。公司與部門共用的技能只能在這裡關掉；員工自己的技能可以移除，移除後可以復原。",
   "skills.manage.switchFor": "{agent} 使用「{name}」",
   "skills.manage.partialFailure": "{count, plural, other {# 項}}沒有完成：{message}",
-  "skills.manage.enabledDone": "已開啟 {count, plural, other {# 項}}技能",
-  "skills.manage.disabledDone": "已關掉 {count, plural, other {# 項}}技能",
-  "skills.manage.removedDone": "已移除 {count, plural, other {# 項}}技能，可以從員工設定復原",
+  "skills.manage.enabledDone": "已在 {agents} 位員工開啟 {skills} 項技能",
+  "skills.manage.disabledDone": "已在 {agents} 位員工關掉 {skills} 項技能",
+  "skills.manage.removedDone": "已從 {agents} 位員工移除 {skills} 項技能，可以從員工設定復原",
   "skills.manage.restoredDone": "已復原「{name}」",
   "skills.manage.select": "選取「{name}」",
   "skills.manage.selectAll": "全選",
@@ -8497,5 +8497,6 @@
   "users.org.suspended": "已停權",
   "users.org.role.admin": "管理員",
   "users.org.role.manager": "主管",
-  "users.org.role.employee": "員工"
+  "users.org.role.employee": "員工",
+  "skills.manage.bulkBar": "批次操作"
 }

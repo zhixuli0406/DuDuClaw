@@ -167,6 +167,7 @@ export function SkillMarketPage() {
       {/* Control row: section switcher + search (spec §5.2). */}
       <div className="flex h-12 shrink-0 items-center gap-2 overflow-x-auto border-b border-surface-border px-4">
         <Segmented
+          className="shrink-0"
           value={activeTab}
           onValueChange={setActiveTab}
           options={tabOptions}

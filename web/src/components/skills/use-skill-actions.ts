@@ -14,8 +14,14 @@ export function useSkillActions(onDone: () => void) {
   const report = useCallback(
     (results: readonly SkillTargetResult[], okId: string) => {
       const failed = failedTargets(results);
-      const done = results.length - failed.length;
-      if (done > 0) toast.success(intl.formatMessage({ id: okId }, { count: done }));
+      const ok = results.filter((r) => r.ok);
+      if (ok.length > 0) {
+        // Count distinct skills and employees, not (employee, skill) pairs:
+        // switching one company-wide skill off for 5 staff is 1 skill.
+        const skills = new Set(ok.map((r) => r.skill_name)).size;
+        const agents = new Set(ok.map((r) => r.agent_id)).size;
+        toast.success(intl.formatMessage({ id: okId }, { skills, agents }));
+      }
       if (failed.length > 0) {
         toast.error(
           intl.formatMessage(

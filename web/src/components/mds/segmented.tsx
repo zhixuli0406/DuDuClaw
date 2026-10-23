@@ -47,7 +47,7 @@ export function Segmented<T extends string>({
             data-state={selected ? 'active' : 'inactive'}
             onClick={() => onValueChange(opt.value)}
             className={cn(
-              'rounded-sm px-2.5 py-1 text-xs font-medium text-muted-foreground outline-none transition-colors',
+              'shrink-0 whitespace-nowrap rounded-sm px-2.5 py-1 text-xs font-medium text-muted-foreground outline-none transition-colors',
               'focus-visible:ring-3 focus-visible:ring-ring/50',
               'disabled:pointer-events-none disabled:opacity-50',
               selected
