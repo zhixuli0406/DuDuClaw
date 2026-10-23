@@ -8783,5 +8783,19 @@
   "teamHistory.view": "会話を見る",
   "teamHistory.settings.detection": "AI検出をインストール",
   "teamHistory.image": "添付画像",
-  "teamHistory.category.NAME": "氏名"
+  "teamHistory.category.NAME": "氏名",
+  "nav.myHistoryViews": "会話を閲覧した人",
+  "nav.myHistoryViews.desc": "自分の会話の閲覧記録",
+  "myHistoryViews.title": "会話を閲覧した人",
+  "myHistoryViews.scope": "「チームの会話」から上司があなたの WebChat を開いた記録です。閲覧者の現在の名前と AI スタッフのみを表示し、会話の内容は含みません。他の管理者向け閲覧経路や外部顧客の会話は対象外です。ローカル監査ログが削除・保管された場合、古い記録は表示できないことがあります。",
+  "myHistoryViews.refresh": "更新",
+  "myHistoryViews.more": "さらに読み込む",
+  "myHistoryViews.list": "自分の会話の閲覧記録",
+  "myHistoryViews.unavailable": "現在、記録を読み取れません。更新して再度お試しください。",
+  "myHistoryViews.empty": "会話の閲覧記録はありません。",
+  "myHistoryViews.scanMore": "このページに該当する記録はありません。さらに読み込むと以前の記録を確認できます。",
+  "myHistoryViews.formerManager": "削除済みの上司",
+  "myHistoryViews.formerAgent": "削除済みの AI スタッフ",
+  "myHistoryViews.webchat": "自分の WebChat",
+  "myHistoryViews.loading": "閲覧記録を読み込み中"
 }

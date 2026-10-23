@@ -54,6 +54,7 @@ import {
   Database,
   Library,
   UsersRound,
+  Eye,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -419,6 +420,7 @@ export const navGroups: NavGroup[] = [
     // 設定 — management shell entry + brand/about page.
     label: 'navGroup.settings',
     items: [
+      { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
