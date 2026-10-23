@@ -92,7 +92,7 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
       {data.binding === 'off' && <Notice tone="warn" text={t('agentSources.binding.off')} />}
       {data.binding === 'unreadable' && <Notice tone="warn" text={t('agentSources.binding.unreadable')} />}
       <OwnSection data={data} agentName={agentName} opening={opening} onAdd={() => void openAdd()} onChanged={() => void load()} />
-      <SharedSection collections={others} />
+      <SharedSection collections={others} self={{ id: agentId, name: agentName }} />
       {creating && (
         <CreateOwnDialog
           agentId={agentId}
@@ -207,7 +207,7 @@ function OwnSection({
                 <Badge variant="ghost">{t('agentSources.shared.notInUse')}</Badge>
               )}
             </div>
-            <ReadersLine c={own.collection} />
+            <ReadersLine c={own.collection} self={{ id: data.agent_id, name: agentName }} />
             {own.sources === null ? (
               <p className="text-sm text-muted-foreground">{t('agentSources.own.notReader')}</p>
             ) : own.sources.length === 0 ? (
@@ -229,11 +229,11 @@ function OwnSection({
   );
 }
 
-function ReadersLine({ c }: { c: KbAgentTabCollection }) {
+function ReadersLine({ c, self }: { c: KbAgentTabCollection; self?: { id: string; name: string } }) {
   const intl = useIntl();
   return (
     <div className="space-y-1">
-      <p className="text-xs text-muted-foreground">{readersSentence(intl, c.readers, c.reader_counts)}</p>
+      <p className="text-xs text-muted-foreground">{readersSentence(intl, c.readers, c.reader_counts, self)}</p>
       {hasChannelReader(c.readers, c.reader_counts) && (
         <p className="text-xs text-amber-800 dark:text-amber-300">{intl.formatMessage({ id: 'agentSources.readers.channelWarning' })}</p>
       )}
@@ -241,7 +241,7 @@ function ReadersLine({ c }: { c: KbAgentTabCollection }) {
   );
 }
 
-function SharedSection({ collections }: { collections: KbAgentTabCollection[] }) {
+function SharedSection({ collections, self }: { collections: KbAgentTabCollection[]; self: { id: string; name: string } }) {
   const intl = useIntl();
   const t = (id: string, v?: Record<string, string | number>) => intl.formatMessage({ id }, v);
   const navigate = useNavigate();
@@ -263,7 +263,7 @@ function SharedSection({ collections }: { collections: KbAgentTabCollection[] })
                   {!c.in_use && <Badge variant="ghost">{t('agentSources.shared.notInUse')}</Badge>}
                   <span className="text-xs text-muted-foreground">{t('kb.card.sources', { count: c.source_count })}</span>
                 </div>
-                <ReadersLine c={c} />
+                <ReadersLine c={c} self={self} />
                 {c.my_role && (
                   <Button variant="link" size="sm" className="h-auto px-0" onClick={() => navigate(`/knowledge-base/${encodeURIComponent(c.id)}`)}>
                     {t('agentSources.shared.open')}

@@ -442,20 +442,24 @@ async fn dispatch(
                 INGRESS_BINDING.scope(
                     binding,
                     crate::approval::scope_trusted_reply(target, async {
+                        // Boxed: the five task-local layers around this
+                        // block each keep by-value copies of the future they
+                        // wrap in an unoptimised build; a pointer keeps the
+                        // worker's stack budget for the reply pipeline.
                         if row.decision_fastlane {
-                            process_line_decision(event, state, &token).await;
+                            Box::pin(process_line_decision(event, state, &token)).await;
                         } else {
                             let stored = store.route_agent(&row.id).await.ok().flatten().map(
                                 |(agent, one_shot)| super::super::trigger::StoredRoute { agent, one_shot },
                             );
-                            process_line_events(
+                            Box::pin(process_line_events(
                                 vec![event],
                                 state,
                                 &token,
                                 &resolved,
                                 &account_id,
                                 stored.as_ref(),
-                            )
+                            ))
                             .await;
                         }
                     }),

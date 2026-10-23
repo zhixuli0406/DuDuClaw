@@ -92,8 +92,23 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // for the whole turn. CCR history validation runs before the native tool
     // loop, and handle persistence runs after it; scoping only `cli_future`
     // leaves both paths (and local-first inference) without an identity.
-    // Boxed: the reply future is large, and the interim watcher must not
-    // add a second copy of it to the caller's stack.
+    // Boxed twice, innermost first. In an unoptimised build every
+    // task-local layer below keeps by-value copies of the future it wraps in
+    // its own poll frame (construction temporaries, `Pin::set(None)` on
+    // completion), so wrapping the ~10 KiB pipeline future directly cost
+    // 20-40 KiB of stack per layer (about 600 KiB for the whole chain) and
+    // overflowed a tokio worker's 2 MiB stack on a plain LINE message.
+    // Wrapping a `Pin<Box<_>>` makes each layer pointer-sized. The outer box
+    // keeps the interim watcher from adding another copy to the caller's
+    // stack. `channel_reply/tests/future_size.rs` pins this shape.
+    let pipeline = Box::pin(build_reply_with_session_inner(
+        text,
+        ctx,
+        agent_override,
+        session_id,
+        user_id,
+        on_progress,
+    ));
     let turn = Box::pin(reply_identity_scope(
         session_id,
         user_id,
@@ -113,14 +128,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                                     requester,
                                     crate::knowledge::cite_turn::TURN_CITATIONS.scope(
                                         cited.clone(),
-                                        build_reply_with_session_inner(
-                                            text,
-                                            ctx,
-                                            agent_override,
-                                            session_id,
-                                            user_id,
-                                            on_progress,
-                                        ),
+                                        pipeline,
                                     ),
                                 ),
                             ),
@@ -283,15 +291,18 @@ pub async fn build_guarded_reply_for_agent(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
+    // Boxed so every channel adapter that wraps this future in its own
+    // task-local scopes carries a pointer, not the turn state (see the
+    // stack note in `build_reply_with_session_inner_capturing_operator_result`).
     let (raw, operator_result_artifact, guards, delivery, answered_by, cited) =
-        build_reply_with_session_inner_capturing_operator_result(
+        Box::pin(build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
             Some(agent_name),
             session_id,
             user_id,
             on_progress,
-        )
+        ))
         .await;
     let Some(guards) = guards else {
         delivery.settle(&ctx.session_manager, false).await;
@@ -359,15 +370,16 @@ pub async fn build_guarded_reply_with_session(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
+    // Boxed for the same reason as in `build_guarded_reply_for_agent`.
     let (raw, operator_result_artifact, guards, delivery, answered_by, cited) =
-        build_reply_with_session_inner_capturing_operator_result(
+        Box::pin(build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
             None,
             session_id,
             user_id,
             on_progress,
-        )
+        ))
         .await;
     let Some(guards) = guards else {
         delivery.settle(&ctx.session_manager, false).await;
