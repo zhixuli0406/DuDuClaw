@@ -2,8 +2,6 @@
 //! retain their separate task audience in runs_rpc.
 use super::*;
 use crate::history_privacy::{Class, Mode, handles, read};
-use crate::team_history::mask;
-use std::collections::BTreeMap;
 impl MethodHandler {
     pub(super) async fn bound_runs_list(
         &self,
@@ -126,7 +124,13 @@ impl MethodHandler {
             _ => "webchat".into(),
         };
         let transcript = if external {
-            mask::external(self.home_dir.clone(), source, BTreeMap::new(), agent.into()).await?
+            crate::history_privacy::projection::project(
+                self.home_dir.clone(),
+                source,
+                true,
+                agent.into(),
+            )
+            .await?
         } else {
             crate::history_privacy::projection::own(source, agent)
         };

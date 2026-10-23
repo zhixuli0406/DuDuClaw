@@ -77,7 +77,11 @@ pub async fn project(
     agent: String,
 ) -> Result<mask::Transcript, String> {
     if external {
-        mask::external(home, rows, BTreeMap::new(), agent).await
+        // TOML/regex/model errors can contain private configuration text.
+        // Return only a closed diagnosis to every restricted consumer.
+        mask::external(home, rows, BTreeMap::new(), agent)
+            .await
+            .map_err(|_| "masking_failed".into())
     } else {
         Ok(own(rows, &agent))
     }

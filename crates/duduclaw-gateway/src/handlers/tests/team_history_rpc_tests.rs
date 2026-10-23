@@ -616,3 +616,21 @@ async fn bound_full_read_fence_refuses_a_downgrade_before_releasing_content() {
     assert!(f.handler.bound_history_recheck(&old,"sales",crate::history_privacy::Mode::Full).is_err());
     assert!(f.handler.bound_history_recheck(&old,"sales",crate::history_privacy::Mode::Filtered).is_ok());
 }
+
+#[tokio::test]
+async fn bound_mask_failures_never_return_private_configuration_lines() {
+    let f=fixture().await;
+    let reader=f.db.live_user_context(&f.employee).unwrap().unwrap();
+    // Strict mode remains enabled when config cannot parse. The masker may
+    // diagnose that line internally, but an employee must not receive it.
+    std::fs::write(f.home.path().join("config.toml"),"private_api_key = 'SYNTHETIC-CONFIG-SECRET").unwrap();
+    let error=denied(f.handler.handle("chat.sessions.history",json!({"session_id":f.external}),&reader).await);
+    assert_eq!(error["message"],"masking_failed");
+    assert!(!error.to_string().contains("SYNTHETIC-CONFIG-SECRET"));
+    let runs=payload(f.handler.handle("runs.list",json!({"agent_id":"sales"}),&reader).await);
+    let external=runs["runs"].as_array().unwrap().iter().find(|r|r["channel"]=="line").unwrap();
+    let error=denied(f.handler.handle("runs.get",json!({"run_id":external["id"]}),&reader).await);
+    assert_eq!(error["message"],"masking_failed");
+    let error=denied(f.handler.handle("search.query",json!({"agent_id":"sales","sources":["conversations"],"q":"電話"}),&reader).await);
+    assert_eq!(error["message"],"masking_failed");
+}

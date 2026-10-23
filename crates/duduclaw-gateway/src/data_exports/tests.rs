@@ -716,4 +716,6 @@ fn bound_conversation_exports_scope_mask_and_recollect_on_privilege_downgrade() 
     let old=build_now(dir.path(),&user,&req);
     db.bind_agent(&user.user_id,"sales",AccessLevel::Viewer).unwrap();
     assert!(download(dir.path(),&user,&old).is_err());
+    std::fs::write(dir.path().join("config.toml"),"private_api_key = 'SYNTHETIC-CONFIG-SECRET").unwrap();
+    assert_eq!(source::collect(dir.path(),&user,&req,||Ok(())).err().unwrap(),"EXPORT_MASKING_FAILED");
 }

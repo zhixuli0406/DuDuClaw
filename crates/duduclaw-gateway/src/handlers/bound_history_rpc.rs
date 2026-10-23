@@ -3,7 +3,6 @@
 use super::*;
 use crate::history_privacy::{self as privacy, Class, Mode, handles, read};
 use crate::team_history::{audit, limits, mask};
-use std::collections::BTreeMap;
 
 impl MethodHandler {
     pub(super) fn bound_history_live(&self, ctx: &UserContext) -> Result<UserContext, String> {
@@ -84,13 +83,9 @@ impl MethodHandler {
         .await
         .map_err(|_| "history unavailable")??;
         let messages = rows.into_iter().map(|r| r.message).collect();
-        let mut transcript = mask::external(
-            self.home_dir.clone(),
-            messages,
-            BTreeMap::new(),
-            agent.into(),
-        )
-        .await?;
+        let mut transcript =
+            privacy::projection::project(self.home_dir.clone(), messages, true, agent.into())
+                .await?;
         let start = transcript.messages.len().saturating_sub(limit);
         transcript.messages.drain(..start);
         mask::recount(&mut transcript);

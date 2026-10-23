@@ -50,7 +50,8 @@ pub fn collect(
         privacy::mode(home, &current, agent)?;
         let external = projection::external(&s.metadata.class);
         let transcript =
-            projection::project_sync(home, projection::clone_rows(&s.rows), external, agent)?;
+            projection::project_sync(home, projection::clone_rows(&s.rows), external, agent)
+                .map_err(|_| "EXPORT_MASKING_FAILED")?;
         if transcript.messages.len() != s.rows.len() {
             return Err("EXPORT_SOURCE_UNAVAILABLE".into());
         }
