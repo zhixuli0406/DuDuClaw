@@ -1,4 +1,6 @@
 {
+  "computerWatch.expired": "This link has expired.",
+  "computerWatch.current": "View current status",
   "computerWatch.title": "Team browser view",
   "computerWatch.loading": "Loading browser status…",
   "computerWatch.denied": "You can no longer view this browser.",

@@ -32,7 +32,11 @@ function snapshot(value: unknown, expected: string): Snapshot | null {
 
 /** The standalone page reads only computer-session RPCs. The server, not
  * the route or its link token, selects direct access versus team viewing. */
-export function ComputerWatchPanel({ agentId }: { agentId: string }) {
+export function ComputerWatchPanel({ agentId, expectedSession, onExpired }: {
+  agentId: string;
+  expectedSession?: string;
+  onExpired?: () => void;
+}) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id: `computerWatch.${id}` });
   const [mode, setMode] = useState<'loading' | 'direct' | 'masked' | 'denied'>('loading');
@@ -58,7 +62,12 @@ export function ComputerWatchPanel({ agentId }: { agentId: string }) {
         const value = await client.call('computer_sessions.status', { agent_id: agentId }) as Record<string, unknown>;
         if (!valid()) return;
         if (!value || value.ok !== true || typeof value.active !== 'boolean') throw new Error('invalid status');
-        if (value.view_mode !== 'masked') { setMode('direct'); return; }
+        if (expectedSession && (!value.active || value.session_id !== expectedSession)) {
+          setImage(null); setStatus(null); setConfirm(null); setMode('denied'); onExpired?.(); return;
+        }
+        // A chat link stays pinned even for someone who also has direct
+        // access. It cannot mount a panel that might select a newer session.
+        if (value.view_mode !== 'masked' && !expectedSession) { setMode('direct'); return; }
         setMode('masked'); setUnavailable(false);
         if (!value.active) { previousSession = null; setStatus({ active: false }); setImage(null); setConfirm(null); return; }
         const id = value.session_id;
@@ -83,7 +92,7 @@ export function ComputerWatchPanel({ agentId }: { agentId: string }) {
     const visible = () => { if (document.visibilityState !== 'hidden') void refresh(); };
     document.addEventListener('visibilitychange', visible);
     return () => { alive = false; ++epoch.current; clearInterval(timer); document.removeEventListener('visibilitychange', visible); };
-  }, [agentId]);
+  }, [agentId, expectedSession, onExpired]);
 
   const stop = async () => {
     if (!confirm || confirm !== status?.session_id || stopping) return;

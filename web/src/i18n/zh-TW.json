@@ -1,4 +1,6 @@
 {
+  "computerWatch.expired": "這個連結已過期。",
+  "computerWatch.current": "查看目前狀態",
   "computerWatch.title": "團隊瀏覽器畫面",
   "computerWatch.loading": "正在讀取瀏覽器狀態…",
   "computerWatch.denied": "目前無法觀看這個瀏覽器。",
