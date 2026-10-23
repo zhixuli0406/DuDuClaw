@@ -28,6 +28,16 @@ impl MethodHandler {
             return None;
         }
         let users = self.user_db.read().await.clone();
+        if super::dispatch_kb_agent::AGENT_TAB_METHODS.contains(&method) {
+            if !crate::knowledge::enabled(&self.home_dir) {
+                return Some(WsFrame::error_response("", "文件知識庫已由管理員關閉。"));
+            }
+            let dir = self.knowledge_directory(users).await;
+            return Some(match self.kb_agent_tab(method, params, ctx, dir).await {
+                Ok(v) => WsFrame::ok_response("", v),
+                Err(e) => kb_error_frame(method, e),
+            });
+        }
         if REGISTRY_METHODS.contains(&method) || method == "knowledge.acl.set" {
             if !crate::knowledge::enabled(&self.home_dir) {
                 return Some(WsFrame::error_response("", "文件知識庫已由管理員關閉。"));
@@ -110,12 +120,7 @@ impl MethodHandler {
         match result {
             Ok(Some(v)) => Some(WsFrame::ok_response("", v)),
             Ok(None) => None,
-            Err(e) => {
-                if matches!(e, duduclaw_knowledge::KbError::Db(_) | duduclaw_knowledge::KbError::Io(_)) {
-                    tracing::error!(error = %e, method, "knowledge RPC failed");
-                }
-                Some(WsFrame::error_response("", &e.public_message()))
-            }
+            Err(e) => Some(kb_error_frame(method, e)),
         }
     }
 
@@ -154,6 +159,14 @@ impl MethodHandler {
         let reg = self.registry.read().await;
         reg.get(agent_id).map(agent_ref)
     }
+}
+
+/// An error answer; database and file errors are logged, never shown.
+fn kb_error_frame(method: &str, e: duduclaw_knowledge::KbError) -> WsFrame {
+    if matches!(e, duduclaw_knowledge::KbError::Db(_) | duduclaw_knowledge::KbError::Io(_)) {
+        tracing::error!(error = %e, method, "knowledge RPC failed");
+    }
+    WsFrame::error_response("", &e.public_message())
 }
 
 fn agent_ref(a: &duduclaw_agent::registry::LoadedAgent) -> AgentRef {

@@ -111,6 +111,26 @@ impl MethodHandler {
         }))
     }
 
+    /// `agent_files.runtime_files {agent_id}`: the generated `CLAUDE.md` /
+    /// `AGENTS.md` of the employee, read-only (Viewer). Same directory and
+    /// symlink rules as the profile files; never writes.
+    pub(crate) async fn handle_agent_files_runtime_files(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        frame(self.agent_files_runtime_files(&params, ctx))
+    }
+
+    fn agent_files_runtime_files(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
+        let agent_id = str_param(params, "agent_id")?;
+        self.live(ctx, agent_id, AccessLevel::Viewer)?;
+        let dir = crate::agent_files::agent_dir(&self.home_dir, agent_id)?;
+        let files = crate::agent_files::runtime_context::read_all(&dir)?;
+        Ok(json!({
+            "agent_id": agent_id,
+            "files": files.iter().map(|f| json!({
+                "name": f.name, "content": f.content, "size": f.size, "truncated": f.truncated,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
     /// `agent_files.get {agent_id, file, version_id?}`.
     pub(crate) async fn handle_agent_files_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
         frame(self.agent_files_get(&params, ctx))

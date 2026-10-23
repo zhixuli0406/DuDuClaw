@@ -122,6 +122,19 @@ Only people whose role is Manager or Admin see it (sidebar group "Organization")
 
 The data comes from the RPC `users.my_team`, computed with the same rules every call and assignment uses, so everything listed can be reached. It is refused in the Personal edition and for the Employee role.
 
+## Employee page → Data sources (unreleased)
+
+Visible to everyone bound to the employee (Viewer and up); adding and removing files needs the employee's Owner binding or Admin, re-read from the account database on every call, and on top of that the editor or owner role on the employee's own collection.
+
+| Control | Writes | Effect |
+|---|---|---|
+| Add files (first time): sensitivity, "Also let the colleagues who work with this employee now read them" | a new collection `<display name> 的資料` in `knowledge.db`, its grants, and the employee's `[knowledge] collections` when that list exists | Immediately. Grants: the creator (owner), the employee (viewer), and when ticked every active account bound to the employee (Owner → owner, Operator / Viewer → viewer). |
+| Add files | a source in the own collection | Read in the background; the list refreshes every 3 seconds while a file is still being read. |
+| Remove (optionally "also forget") | deletes the source; with the box ticked files forget requests for an Admin | Unsearchable at once; forget requests wait for approval. |
+| Manage in the document library | — | Opens the collection (sharing, test search, access record, settings). |
+
+Archiving or deleting the employee archives its own collection (only people owners keep access); restoring the employee puts back the grants archiving removed. The first upload also adds the collection to an existing `[knowledge] collections` list; later uploads leave that list alone. Details: [Document knowledge base](../features/63-knowledge-base.md#using-the-dashboard).
+
 ## Settings → Advanced → Knowledge base search
 
 Admin only (new in 1.76.0). Shows whether the document knowledge base searches by meaning or by keywords only, and why not when it does not, with the share of passages that already have vectors.
@@ -142,6 +155,9 @@ Details: [Document knowledge base](../features/63-knowledge-base.md#embedding-mo
 RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`; also used by the boundaries editor on the employee edit page (`contract.update`). Files: persona (`SOUL.md`), self-introduction (`IDENTITY.md`), work rules (`INSTRUCTIONS.md`), boundaries (`CONTRACT.toml`), basic settings (`agent.toml`, read-only and masked here; edit it on the edit page or, as an admin, in the Advanced config editor), and the employee's own skills (existing `.md` files under `SKILLS/`, file key `skill:<path>`, for example `skill:quote/SKILL.md`). Skills can only be edited here, not created or deleted (use the custom skill flow to add one), and scripts next to a skill are never touched; every path level must be a single name without `..` or invisible characters (zero-width, direction controls), at most four levels deep; symlinks and hard links are refused, and a save checks under the file lock that no folder was swapped before it writes (the lock file lives outside the employee's folder). Other writers of skill files (custom skills, the employee's own skill tools, skill graduation) do not go through here, keep no versions and do not take this lock. Limits: 64 KB per Markdown or skill file, 32 KB for `CONTRACT.toml`, at most 100 `must_not` and 100 `must_always` entries of up to 500 characters.
 
 - **Profile files tab:** the 設定檔 (Profile files) tab on the employee detail page (`/agents/<employee>/files`). On the left, a plain-language list with the real file name in small grey text and the badges "Waiting for review", "Changed outside the dashboard" and "View only". On the right the file is shown read-only; its owner and admins press Edit to change it, with the size and limit below and the buttons Show changes, Save and check, and Discard changes. The check result uses the same review dialog as the boundaries editor. If someone else saved first, your text and the current text are shown side by side with Copy my content and Reload. Version history (Operator and up) lists time, who and where each version came from, and can view, compare with the current text or restore. An unsaved edit asks before switching file, switching tab or closing the page (leaving through the sidebar or other links does not ask yet). People who can only view see "You can view this. Only this staff member's owner or an administrator can change it."
+- **Work rules and AGENTS.md / Agent.md:** the list and the heading read "Work rules (AGENTS.md / Agent.md)" because many people look for it under the industry name; the real file name `INSTRUCTIONS.md` stays in the small grey text. The import merges AGENTS.md, CLAUDE.md, GEMINI.md, Agent.md and copilot-instructions into this file, and it is given to the employee on every conversation whichever runtime it uses. When a new employee has no such file, the tab shows "Create work rules" (the button is only visible to the owner and admins); it opens a short template and nothing is written until Save and check, through the same save, check and approval path (no separate write path).
+- **Files generated for the runtime (read-only):** a collapsed block at the bottom of the tab, read the first time it is opened. It shows the `CLAUDE.md` and `AGENTS.md` the system generated for the employee's runtime (RPC `agent_files.runtime_files`, Viewer and up; only these two fixed names, the employee folder checks are reused, symlinks and non-regular files are never read, at most 64 KB per file). They cannot be edited here; change the rules in Work rules.
+- **Search:** typing `agent.md`, `agents.md`, `CLAUDE.md` or "work rules" in the command palette (Cmd/Ctrl+K) lists one row "<employee> · Profile files" per employee that opens that employee's profile files tab.
 - **Who:** anyone bound to the employee reads the files; Operator and up read versions and diffs; the employee's Owner and admins save. Every call re-reads the account database, not the session. Admins decide approval requests.
 - **Check on every save:** fixed rules first (size, control characters, a strict `CONTRACT.toml` parse, hidden or invisible content, injection patterns in the lines this change adds or in new `must_always` entries, key-like text, a persona that loses most of its text, a contract that drops or rewrites a `must_not` / `must_always` entry or raises / removes the tool-call limit; skills additionally: a leading `---` block must read the way the skill loader reads it and its `name` must be a single name, and the skill scanner's findings on the lines this change adds count, with commands, sending data out and injection patterns as high risk (decided by the actual added lines, so a second line of the same kind is still new) and bare links and mentions of a forbidden item as needs attention; high-risk content already in the file is listed as "already in this skill"; a skill changed outside the dashboard since its last save here is checked as a whole against that last saved version), then a short review of the diff by the deployment's utility model (`[runtime] utility_provider` / `utility_model`, override with `[agent_files] review_provider` / `review_model`; billed to the deployment as `agent-file-review`, never to the employee's budget). The model can only make the result stricter. Results: `pass` applies at once; `warn` needs a reason (at least 4 characters) or a request to an admin; `block` can only be sent to an admin by a non-admin, and an admin applies it only with a reason and "I understand the risk" (audited as Critical). If the review cannot finish (no utility model, timeout, an unusable answer, a quota reached) or the change was too long to show in full, the result is at least `warn` (or `block` with `[agent_files] on_analysis_failure = "block"`), a non-admin can only send it to an admin, and an admin confirms it only with "I understand the risk"; it is never a silent pass and cannot be switched off. Quotas per day: 200 per deployment, 40 per person, 60 per employee (`review_daily_limit`, `review_daily_limit_per_user`, `review_daily_limit_per_agent`), plus at most 10 checks per person per minute (`checks_per_minute`); the same change checked again within 15 minutes reuses the result. Confirming does not run the review again; a confirmation must match the same person, file, starting version and content within 15 minutes, the fixed rules are re-run at the person's current permission level (stricter now ⇒ check again), and confirming a `block` re-checks inside the file lock that the person is still an admin. A SOUL.md or INSTRUCTIONS.md changed outside the dashboard is checked as a whole and compared with the last approved version (reason "changed outside").
 - **Saving:** under the file lock, with the hash the editor read (`base_hash`); a file changed by someone else in between is refused as a conflict. The new text takes effect from the employee's next turn; channels get a one-line notice with the next reply.
@@ -201,3 +217,32 @@ for recent window fingerprints and connection events. The UI polls every
 30 seconds, so an expiry or device-side close may appear on the next poll.
 The complete OS image and real SSH/notification flow are not yet verified;
 this is an unreleased interface, not acceptance of the assembled device.
+
+## Security → Credential protection (unreleased)
+
+The **Credential protection** card on the Security page (Admin, both editions) shows one
+line: "Credential protection: Files" or "Credential protection: System keychain (…)", followed by what that
+means. It covers only credentials that let an AI employee act as a specific
+person; every other setting keeps working the same way whatever the card
+says.
+
+- **Move to system keychain** (`security.credential_protection_enable`)
+  creates the protected key in the macOS keychain or Windows Credential
+  Manager. Linux and Docker show "this platform has no supported system keychain" and no button.
+- **Needs re-authorization** appears on macOS after an upgrade or while the
+  keychain is locked. Run `duduclaw credentials authorize` in Terminal on that
+  Mac and allow the dialog once.
+- **Protection key missing / replaced / settings error** stop personal
+  accounts. **Re-enable** (`reset: true`) makes a new key; saved personal
+  credentials stop working and people reconnect.
+- **Replace key** (also `reset: true`) is offered while everything looks fine,
+  for when the key and its record may both have been swapped; it has the same
+  effect as Re-enable. On a macOS build without hardened runtime the line says
+  "readable by programs under the same user account", because code injected
+  into DuDuClaw could read the key.
+- **Turn off** (`security.credential_protection_disable`, `confirm: true`,
+  typed confirmation) deletes the key; saved personal credentials stop
+  working.
+
+`duduclaw credentials status` (add `--json` for scripts) prints the same
+state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).

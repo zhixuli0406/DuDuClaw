@@ -265,4 +265,14 @@ describe('CommandPalette — content search (I-5)', () => {
     await new Promise((r) => setTimeout(r, 400));
     expect(mockWsClient.call.mock.calls.map((c) => c[0])).not.toContain('search.query');
   });
+
+  it('finds the profile files tab of each employee by the industry names agent.md / agents.md', async () => {
+    useAgentsStore.setState({ agents: [{ name: 'alice', display_name: 'Alice', role: 'main' }], loading: false } as never);
+    mockIdLookupCalls();
+    renderPalette();
+    fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), { target: { value: 'agents.md' } });
+    const row = await screen.findByText(/Alice · Profile files/);
+    fireEvent.click(row);
+    await waitFor(() => expect(screen.getByTestId('location-probe')).toHaveTextContent('/agents/alice/files'));
+  });
 });

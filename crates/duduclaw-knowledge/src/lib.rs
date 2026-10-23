@@ -24,6 +24,7 @@
 //! passages as quoted material.
 
 pub mod acl;
+pub mod agent_own;
 pub mod audit;
 pub mod blob;
 pub mod chunk;

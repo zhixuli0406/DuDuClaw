@@ -24,6 +24,7 @@ import type {
   AgentFileHistoryResponse,
   AgentFileKey,
   AgentFileListResponse,
+  AgentRuntimeFilesResponse,
   AgentFilePendingResponse,
   AgentFileSaveParams,
   AgentFileSaveResponse,
@@ -577,6 +578,35 @@ export interface CredentialCleanupResult {
   removed_paths: string[];
   backup_path?: string;
   message?: string;
+}
+
+// ── Credential protection (B2c) ──
+// `security.credential_protection*`: where the credentials that let an AI
+// employee act as a specific person are protected. Never carries a key —
+// only a non-secret key id.
+export type CredentialProtectionLevel = 'file' | 'user_store' | 'app_bound';
+export type CredentialProtectionState =
+  | 'not_enabled'
+  | 'ready'
+  | 'needs_authorization'
+  | 'missing'
+  | 'key_changed'
+  | 'invalid'
+  | 'unsupported'
+  | 'unavailable';
+export interface CredentialProtectionStatus {
+  /** Effective level now (`file` unless `ready`). */
+  level: CredentialProtectionLevel;
+  /** What this platform's credential store gives once enabled. */
+  platform_level: CredentialProtectionLevel;
+  backend: 'macos_keychain' | 'windows_credential_manager' | 'none';
+  state: CredentialProtectionState;
+  key_id: string | null;
+  enabled_at: string | null;
+  person_identity_allowed: boolean;
+  /** zh-TW one-liner from the gateway (CLI uses the same text). */
+  summary: string;
+  detail: string;
 }
 
 // ── Credential inventory (WP-H1 P1) ──
@@ -6978,6 +7008,16 @@ export const api = {
      *  backend round-trips (WP-H1 P1). */
     credentialInventory: () =>
       client.call('security.credential_inventory') as Promise<CredentialInventoryReport>,
+    /** B2c: where person-identity credentials are protected (no key material). */
+    credentialProtection: () =>
+      client.call('security.credential_protection') as Promise<CredentialProtectionStatus>,
+    /** Create the protected key in the OS keychain. `reset` replaces a key
+     *  that exists but cannot be used (voids credentials sealed with it). */
+    credentialProtectionEnable: (reset = false) =>
+      client.call('security.credential_protection_enable', { reset }) as Promise<CredentialProtectionStatus>,
+    /** Remove the protected key; saved person credentials stop working. */
+    credentialProtectionDisable: () =>
+      client.call('security.credential_protection_disable', { confirm: true }) as Promise<CredentialProtectionStatus>,
   },
   audit: {
     unifiedLog: (params?: {
@@ -7832,6 +7872,9 @@ export const api = {
         file,
         ...(versionId ? { version_id: versionId } : {}),
       }) as Promise<AgentFileGetResponse>,
+    /** The generated CLI context files (read-only). */
+    runtimeFiles: (agentId: string) =>
+      client.call('agent_files.runtime_files', { agent_id: agentId }) as Promise<AgentRuntimeFilesResponse>,
     /** Compare `content` (or a stored `version_id`) against the current file
      *  (or `against`, another version id). */
     diff: (

@@ -407,6 +407,21 @@ export function CommandPalette() {
       perform: () => navigate(`/agents/${encodeURIComponent(a.name)}`),
     }));
 
+    // Profile files per employee: people search for the industry names
+    // (agent.md / agents.md), so each employee gets one "profile files" row
+    // whose keywords carry them.
+    const agentFileCommands: Command[] = agents.map((a) => ({
+      id: `entity:agent-files:${a.name}`,
+      groupLabel: t('cmdk.group.agents'),
+      groupRoute: staffEntry.to,
+      label: `${a.display_name} · ${t('cmdk.agentFiles.suffix')}`,
+      subtitle: a.name,
+      keywords: `${t('cmdk.agentFiles.keywords')} ${a.name}`,
+      icon: FileText,
+      route: `/agents/${a.name}/files`,
+      perform: () => navigate(`/agents/${encodeURIComponent(a.name)}/files`),
+    }));
+
     // Entity search (T1.5) — jump to a task detail by fuzzy title (CJK-safe via
     // the shared `fuzzyMatch`). Sourced from whatever the tasks store holds.
     const taskCommands: Command[] = tasks.map((task) => ({
@@ -455,7 +470,7 @@ export function CommandPalette() {
           perform: () => logout(),
         }];
 
-    return [...navCommands, ...manageCommands, ...agentCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
+    return [...navCommands, ...manageCommands, ...agentCommands, ...agentFileCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
   }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
 
   // Empty query → recent routes first, then all commands in natural order.
