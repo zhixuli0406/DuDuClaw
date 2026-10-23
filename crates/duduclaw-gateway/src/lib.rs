@@ -161,18 +161,19 @@ pub mod premium_templates;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
+pub mod team_edition;
+pub mod team_history;
+pub mod team_oversight;
+pub mod trigger_route;
+pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
 /// Discovery attempt-container blocks.
 pub mod task_sandbox;
-pub mod task_store;
-pub mod team_edition;
-pub mod team_history;
 pub mod tick_config;
 pub mod tick_headers;
 pub mod tick_source;
 pub mod tick_source_poll;
 pub mod tick_source_ws;
-pub mod trigger_route;
 // WP-E2: box-side relay client (crates/duduclaw-relay's WebSocket
 // counterpart) — reuses tick_source_ws's reconnect-backoff shape, hence the
 // grouping alongside the resident-sensing modules above.
@@ -238,6 +239,7 @@ pub mod memory_forget_approval;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
 pub mod memory_provenance;
+pub mod on_behalf_of;
 pub mod message_queue;
 pub mod miniapp;
 pub mod wiki_host_sources;

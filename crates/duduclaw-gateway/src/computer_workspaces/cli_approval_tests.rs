@@ -274,6 +274,7 @@ fn the_channel_notice_names_the_workspace_request_not_a_knowledge_review() {
         binding: None,
         answer: None,
         invalidated_reason: None,
+        on_behalf_of: None,
     };
     for reminder in [false, true] {
         let body = crate::approval_notify::dashboard_only_notice_body(&rec, reminder);

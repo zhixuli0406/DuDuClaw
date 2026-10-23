@@ -124,10 +124,18 @@ impl MethodHandler {
                     continue;
                 }
 
-                let raw_summary = row
+                let raw_summary = if event_type=="team_history_viewed" {
+                    let details=row.get("details").unwrap_or(&Value::Null);
+                    let db=self.user_db.read().await.clone();
+                    let name=|id:&str| db.as_deref().and_then(|db|db.get_user(id).ok().flatten()).map(|u|u.display_name).unwrap_or_else(||id.to_owned());
+                    let viewer=name(details.get("viewer").and_then(Value::as_str).unwrap_or("主管"));
+                    let report=details.get("report").and_then(Value::as_str).map(name);
+                    let agent=self.registry.read().await.get(&agent_id).map(|a|a.config.agent.display_name.clone()).filter(|n|!n.is_empty()).unwrap_or_else(||agent_id.clone());
+                    super::team_history_rpc::viewed_summary(details,&viewer,&agent,report.as_deref())
+                }else{ row
                     .get("details")
                     .map(|d| d.to_string())
-                    .unwrap_or_default();
+                    .unwrap_or_default() };
                 let summary = truncate_bytes(&raw_summary, SUMMARY_MAX_BYTES).to_string();
 
                 events.push(json!({

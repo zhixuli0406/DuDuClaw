@@ -94,6 +94,7 @@ futures-util = { workspace = true }
 tempfile = "3"
 zeroize = "1"
 unicode-normalization = "0.1"
+unicode-segmentation = "=1.13.2"
 flate2 = "1"
 tar = "0.4"
 dirs = "5"

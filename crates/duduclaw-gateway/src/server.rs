@@ -810,6 +810,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "Failed to initialize user database: {e}"
         ))
     })?);
+    // Establish the non-retroactive window before any channel accepts turns.
+    handler.resolve_edition_profile().await;
+    if let Err(e)=crate::team_oversight::observe_window(&home_dir,&user_db,"gateway_boot") {
+        // The observer persists reset-required (or retains a process latch
+        // when the DB is unavailable). Only B5 stays fenced; ordinary
+        // gateway operation must not depend on a new history audit writer.
+        warn!(error=%e,"team history activation sync failed; team history remains unavailable");
+    }
     // Ensure a default admin exists on first run
     let bootstrap_password = match user_db.ensure_default_admin() {
         Ok(password) => password, // Some(..) on first run, None if an admin already existed
@@ -2801,6 +2809,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));
+    // Separate MCP processes delegate human permission checks to this
+    // host, using its verified license runtime and live opaque contexts.
+    app = app.merge(crate::on_behalf_of::route::router(Arc::new(
+        crate::on_behalf_of::route::RouteState::new(home_dir.clone(), Some(_license_runtime.clone())),
+    )));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
     // tools: same loopback + signed-identity authentication as the
