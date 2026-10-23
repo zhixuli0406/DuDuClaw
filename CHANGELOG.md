@@ -4,7 +4,7 @@
 
 ### Added
 
-- **未發布，驗證中**：容器瀏覽器可選擇保存登入狀態。全域與員工開關預設關閉，正常結束時只封存 Cookies／Local Storage／IndexedDB，加密綁定員工實例，主機不解開封存檔。白名單縮小、換負責人、刪除／封存員工時清除；電腦分頁可查看與清除。RED／緊急停止不保存，注入暫停後須有接手權限的人明確選擇保留。匯出與備份排除登入快照。已完成 Rust 型別檢查、封存 helper 6 項測試與真容器合成 Cookie 重開；最終 Rust 測試、完整 dashboard、原生 gateway 流程與真網站帳號仍待驗證，見 `wiki/impl/browser-profile-acceptance.md`。
+- **未發布，驗證中**：容器瀏覽器可選擇保存登入狀態。全域與員工開關預設關閉，正常結束時只封存 Cookies／Local Storage／IndexedDB，加密綁定員工實例，主機不解開封存檔。白名單縮小、換負責人、刪除／封存員工時清除；電腦分頁可查看與清除。RED／緊急停止不保存，注入暫停後須有接手權限的人明確選擇保留。匯出與備份排除登入快照。已完成 12,799 項 Rust 測試、封存 helper 6 項測試、dashboard 62 項測試與建置。真實 gateway 容器流程另外抓到設定解析與輸入管線問題，修正後完成合成 Cookie 保存、重開還原及清除；修正後 14 項相關 Rust 回歸也通過。最終原生儀表板與真網站帳號仍待驗證，分層證據見 `wiki/impl/browser-profile-acceptance.md`。
 - AI 員工專屬通道：員工頁「整合」分頁多了「專屬通道」區塊，可以讓一位員工用自己的 Telegram Bot 和自己的 Google Chat 應用程式對外說話，不用重新啟動。沒設定的員工照舊走共用通道。設定步驟見 `docs/guides/per-employee-channels.md`（三語）。
   - **Telegram**：貼上 BotFather 的 Token 按「連線」。存檔前先用 `getMe` 問 Telegram，被拒絕的 Token 不會存；當下連不到 Telegram 時先存、Bot 自己重試。卡片顯示「已連線，Bot 是 @xxx」或沒連上的原因（Token 被撤銷會顯示「Bot Token 無效」）。存檔只重啟這位員工的 Bot，其他 Bot 不受影響（以前每次存檔都把所有 Bot 重啟一輪）。
   - **Google Chat**：每位員工一個自己的 Google Cloud 專案與 Chat 應用程式。管理員貼上專案編號和服務帳戶 JSON 金鑰；Google 把這個應用程式的事件送到 `/webhook/googlechat/agents/<員工代號>`，每個請求都先用這位員工的專案編號（JWT audience）驗證才讀內容：替別的應用程式簽的、audience 不對、沒有或偽造的權杖一律 401，沒有應用程式的員工網址回 404，任何錯誤都不會落到共用應用程式。回覆、附件下載和派工轉送都用這個應用程式的服務帳戶。只改專案編號時金鑰欄留空即可保留原金鑰。
