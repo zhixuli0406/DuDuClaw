@@ -27,6 +27,8 @@
 //!   picker and the check before `knowledge.acl.set`).
 //! - [`agent_binding`]: `agent.toml [knowledge] collections` from the
 //!   employee edit page (`agents.update`).
+//! - [`agent_own`]: the employee page's 「資料來源」 tab and the employee's
+//!   own collection (created on first upload, archived with the employee).
 //! - [`denied`]: the admin-wide list of refused reads.
 //! - [`upload_limits`]: `knowledge.limits`, the upload limits the dashboard
 //!   checks before sending a file.
@@ -37,6 +39,7 @@
 pub mod add_source_approval;
 pub mod add_source_guard;
 pub mod agent_binding;
+pub mod agent_own;
 pub mod auto_retrieve;
 pub mod chat_add;
 pub mod chat_attachments;

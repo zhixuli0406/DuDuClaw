@@ -36,6 +36,19 @@ pub struct CollectionSummary {
     pub source_count: i64,
     pub ready_count: i64,
     pub chunk_count: i64,
+    /// The AI employee whose own collection this is (the employee page's
+    /// 「資料來源」 tab), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_agent: Option<OwnAgentRef>,
+}
+
+/// Which employee an own collection belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnAgentRef {
+    pub agent_id: String,
+    /// The employee is archived or deleted: only the collection's owners
+    /// can still open it.
+    pub archived: bool,
 }
 
 /// Input for [`create_collection`].
@@ -165,6 +178,20 @@ pub fn create_collection(
     created_by: &str,
     cfg: &KnowledgeConfig,
 ) -> KbResult<Collection> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let id = create_collection_in(&tx, new, created_by, cfg)?;
+    tx.commit()?;
+    get_collection(conn, &id)?.ok_or(KbError::PermissionDenied)
+}
+
+/// [`create_collection`] inside the caller's transaction (so a caller can
+/// add more rows that commit or roll back with it). Returns the new id.
+pub fn create_collection_in(
+    tx: &rusqlite::Transaction<'_>,
+    new: &NewCollection,
+    created_by: &str,
+    cfg: &KnowledgeConfig,
+) -> KbResult<String> {
     let name = clean_name(&new.name)?;
     let description = clean_description(&new.description)?;
     let department = clean_department(new.department.as_deref())?;
@@ -179,7 +206,6 @@ pub fn create_collection(
         }
         None => derive_slug(&name),
     };
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let count: i64 = tx.query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0))?;
     if count as usize >= cfg.max_collections {
         return Err(KbError::Rejected {
@@ -211,8 +237,7 @@ pub fn create_collection(
          VALUES (?1, 'user', ?2, 'owner', ?2, ?3)",
         params![id, created_by, now],
     )?;
-    tx.commit()?;
-    get_collection(conn, &id)?.ok_or(KbError::PermissionDenied)
+    Ok(id)
 }
 
 pub fn get_collection(conn: &Connection, id: &str) -> KbResult<Option<Collection>> {
@@ -241,12 +266,17 @@ fn summarize(
     my_role: Option<Role>,
 ) -> KbResult<CollectionSummary> {
     let (source_count, ready_count, chunk_count) = counts(conn, &c.id)?;
+    let own_agent = crate::agent_own::for_collection(conn, &c.id)?.map(|o| OwnAgentRef {
+        agent_id: o.agent_id,
+        archived: o.archived_at.is_some(),
+    });
     Ok(CollectionSummary {
         collection: c,
         my_role,
         source_count,
         ready_count,
         chunk_count,
+        own_agent,
     })
 }
 

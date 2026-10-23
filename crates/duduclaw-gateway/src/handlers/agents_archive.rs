@@ -78,6 +78,9 @@ impl MethodHandler {
         let status = status.to_string();
         self.update_agent_toml(agent_id, move |table| offboard_freeze_table(table, &status))
             .await?;
+        // Its own knowledge collection (資料來源 tab) is archived with it:
+        // nobody reads it through a share until the employee is restored.
+        self.kb_own_offboard(agent_id).await;
         Ok(())
     }
 
@@ -153,6 +156,7 @@ impl MethodHandler {
         if let Err(e) = res {
             return WsFrame::error_response("", &format!("Failed to unarchive agent: {e}"));
         }
+        self.kb_own_restore(&agent_id).await;
         crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(

@@ -681,3 +681,41 @@ async fn soft_delete_moves_the_history_aside() {
     assert!(!f.home.join("agent_file_history/b1").exists());
     assert!(std::fs::read_dir(f.home.join("agent_file_history/_trash")).unwrap().count() >= 1);
 }
+
+// ── Work rules (INSTRUCTIONS.md) creation + generated context files ─────────
+
+#[tokio::test]
+async fn a_missing_instructions_file_is_listed_and_can_be_created_through_save() {
+    let f = fixture().await;
+    test_seam::set(&f.home, |_| Ok(PASS.into()));
+    let _ = std::fs::remove_file(f.home.join("agents/a1/INSTRUCTIONS.md"));
+    let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.owner_a).await);
+    let row = &list["files"][2];
+    assert_eq!(row["file"], "instructions");
+    assert_eq!(row["exists"], false);
+    assert_eq!(row["editable_by_me"], true, "the owner can create it");
+
+    // The ordinary save path (check, history, baseline) creates it.
+    let r = ok(&f.save(&f.owner_a, "instructions", "# Rules\nReply politely.\n", json!({})).await);
+    assert_eq!(r["status"], "applied", "{r}");
+    let text = std::fs::read_to_string(f.home.join("agents/a1/INSTRUCTIONS.md")).unwrap();
+    assert!(text.contains("Reply politely."));
+    let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.owner_a).await);
+    assert_eq!(list["files"][2]["exists"], true);
+}
+
+#[tokio::test]
+async fn runtime_files_are_read_only_and_follow_the_viewer_gate() {
+    let f = fixture().await;
+    let dir = f.home.join("agents/a1");
+    std::fs::write(dir.join("CLAUDE.md"), "generated claude").unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "generated agents").unwrap();
+    let r = ok(&f.call("agent_files.runtime_files", json!({ "agent_id": "a1" }), &f.viewer).await);
+    let names: Vec<&str> = r["files"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["CLAUDE.md", "AGENTS.md"]);
+    assert_eq!(r["files"][0]["content"], "generated claude");
+    // Another employee's owner has no binding to a1.
+    assert!(err(&f.call("agent_files.runtime_files", json!({ "agent_id": "a1" }), &f.owner_b).await).contains("permission"));
+    // Neither name is a valid `agent_files.get` / `save` key.
+    assert!(err(&f.call("agent_files.get", json!({ "agent_id": "a1", "file": "AGENTS.md" }), &f.admin).await).contains("file must be"));
+}
