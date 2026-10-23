@@ -100,3 +100,35 @@ it('clears old chat state before releasing a protected history pane on an accoun
   useAuthStore.setState({user:{id:'new-user',email:'new@test.invalid',display_name:'New user',role:'employee',status:'active'},bindings:[]});
   off();expect(atRelease).toEqual([]);
 });
+
+
+it('invalidates cached list, resumed text and delayed history when only account status changes', async () => {
+  await useConversationsStore.getState().fetch();
+  await useConversationsStore.getState().resume(row);
+  let resolve!: (value: unknown) => void;
+  mockWsClient.call.mockImplementation(() => new Promise(done => { resolve = done; }));
+  const pending = useConversationsStore.getState().resume(row);
+  useChatStore.setState({ resumedExplicitly: true, messages: [{ id: 'old', role: 'assistant', content: 'OLD AUTHORIZED FULL TEXT', timestamp: 0 }] });
+  useAuthStore.setState({ user: { ...useAuthStore.getState().user!, status: 'suspended' } });
+  const revoked = useConversationsStore.getState();
+  const revokedMessages = useChatStore.getState().messages;
+  resolve(history);
+  const accepted = await pending;
+  expect(revoked.sessions).toEqual([]);
+  expect(revoked.readOnlyView).toBeNull();
+  expect(revokedMessages).toEqual([]);
+  expect(accepted).toBe(false);
+  expect(useConversationsStore.getState().readOnlyView).toBeNull();
+});
+
+it('rejects a delayed list from an earlier account-status generation', async () => {
+  let resolve!: (value: unknown) => void;
+  mockWsClient.call.mockImplementation(() => new Promise(done => { resolve = done; }));
+  const pending = useConversationsStore.getState().fetch();
+  const user = useAuthStore.getState().user!;
+  useAuthStore.setState({ user: { ...user, status: 'suspended' } });
+  useAuthStore.setState({ user: { ...user, status: 'active' } });
+  resolve({ sessions: [row] });
+  await pending;
+  expect(useConversationsStore.getState().sessions).toEqual([]);
+});

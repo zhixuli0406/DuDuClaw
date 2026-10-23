@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { History, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/mds';
@@ -6,6 +6,8 @@ import { timeAgo } from '@/lib/format';
 import { api, type ChatSessionSummary } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { useDismissable } from '@/hooks/useDismissable';
+import { useAuthStore } from '@/stores/auth-store';
+import { conversationIdentityKey } from '@/stores/conversations-store';
 
 type LoadState = 'idle' | 'loading' | 'error' | 'ready';
 
@@ -33,29 +35,43 @@ export function SessionHistoryMenu({
 }) {
   const intl = useIntl();
   const [open, setOpen] = useState(false);
-  const [state, setState] = useState<LoadState>('idle');
-  const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
+  const subject = useAuthStore(conversationIdentityKey);
+  const userStatus = useAuthStore((s) => s.user?.status);
+  const key = JSON.stringify([subject, agentId, open]);
+  const currentKey = useRef(key);
+  currentKey.current = key;
+  const epoch = useRef(0);
+  const [listing, setListing] = useState<{
+    key: string; state: LoadState; sessions: ChatSessionSummary[];
+  } | null>(null);
+  const current = listing?.key === key ? listing : null;
+  const state = current?.state ?? (open ? 'loading' : 'idle');
+  const sessions = current?.sessions ?? [];
   const rootRef = useRef<HTMLDivElement>(null);
 
-  const load = async () => {
-    setState('loading');
+  const load = useCallback(async () => {
+    const ticket = ++epoch.current;
+    const isCurrent = () => ticket === epoch.current && key === currentKey.current;
+    if (!open || (userStatus && userStatus !== 'active')) {
+      setListing({ key, state: 'ready', sessions: [] });
+      return;
+    }
+    setListing({ key, state: 'loading', sessions: [] });
     try {
       const res = await api.chatSessions.list({
-        ...(agentId ? { agent_id: agentId } : {}),
-        limit: 50,
+        ...(agentId ? { agent_id: agentId } : {}), limit: 50,
       });
-      setSessions(res?.sessions ?? []);
-      setState('ready');
+      if (isCurrent()) setListing({ key, state: 'ready', sessions: res?.sessions ?? [] });
     } catch {
-      setState('error');
+      if (isCurrent()) setListing({ key, state: 'error', sessions: [] });
     }
-  };
+  }, [agentId, key, open, userStatus]);
 
-  // (Re)load whenever the popover opens or the target employee changes while open.
   useEffect(() => {
     if (open) void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, agentId]);
+    else setListing(null);
+    return () => { ++epoch.current; };
+  }, [open, load]);
 
   // Dismiss on outside click / Escape.
   useDismissable(rootRef, open, () => setOpen(false));
@@ -154,7 +170,7 @@ export function SessionHistoryMenu({
                     )}
                   >
                     <span className="truncate text-sm text-foreground">
-                      {s.title.trim() ||
+                      {(s.read_only ? intl.formatMessage({ id: 'boundHistory.label' }) : s.title?.trim()) ||
                         intl.formatMessage({
                           id: 'webchat.history.untitled',
                           defaultMessage: '（無標題）',

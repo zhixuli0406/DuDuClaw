@@ -31,12 +31,13 @@ let selectingForResume = false;
 function mainAgentId(): string | null {
   return useAgentsStore.getState().agents.find(a => a.role === 'main')?.name ?? null;
 }
-function identityKey(): string {
-  const { user, bindings } = useAuthStore.getState();
-  return JSON.stringify([user?.id, user?.role, bindings.map(b => [b.agent_name, b.access_level]).sort()]);
+/** Every history cache uses the same complete authenticated subject. */
+export function conversationIdentityKey(state = useAuthStore.getState()): string {
+  const { user, bindings } = state;
+  return JSON.stringify([user?.id, user?.role, user?.status, bindings.map(b => [b.agent_name, b.access_level]).sort()]);
 }
 function scopeKey(): string {
-  return JSON.stringify([identityKey(), useChatStore.getState().selectedAgentId ?? mainAgentId()]);
+  return JSON.stringify([conversationIdentityKey(), useChatStore.getState().selectedAgentId ?? mainAgentId()]);
 }
 function validExternal(history: ChatSessionHistory): boolean {
   if (history.privacy_mode !== 'masked' || typeof history.ner !== 'boolean' || !history.channel || history.channel==='webchat' || !isConversationSession(history.session_id,history.channel)) return false;
@@ -127,8 +128,7 @@ function invalidateViews() {
   useConversationsStore.setState({ sessions: [], status: 'idle', ...emptyView });
 }
 useAuthStore.subscribe((next, previous) => {
-  const fingerprint = (state: typeof next) => JSON.stringify([state.user?.id, state.user?.role, state.bindings.map(b => [b.agent_name, b.access_level]).sort()]);
-  if (fingerprint(next) === fingerprint(previous)) return;
+  if (conversationIdentityKey(next) === conversationIdentityKey(previous)) return;
   if (next.user?.id !== previous.user?.id) {
     useChatStore.getState().disconnect();
     useChatStore.getState().discardHistory(true);
