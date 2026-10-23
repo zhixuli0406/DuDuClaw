@@ -92,6 +92,29 @@ pub async fn cmd_install(
     cmd_install_with(home, source, opts).await
 }
 
+/// Set once the gateway asked this run to stop (see [`listen_for_stop`]).
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The failure of a run that was told to stop.
+pub(crate) fn interrupted() -> duduclaw_core::error::DuDuClawError {
+    super::import_error::import_err("import.timeout", serde_json::json!({ "interrupted": true }), "匯入被要求停止")
+}
+
+/// Most of an import is file work with no wait in between, so a stop
+/// request cannot cancel it from outside: a task on another worker raises
+/// [`STOP_REQUESTED`], the importers stop starting new writes, and the run
+/// rolls back as for any failure.
+fn listen_for_stop() {
+    tokio::spawn(async {
+        terminated().await;
+        STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 /// Resolves when this process is asked to stop (SIGTERM — what the gateway
 /// sends at its timeout before it kills). Only for runs the gateway
 /// started (it sets the marker nonce); a terminal run keeps the default
@@ -137,6 +160,7 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
             serde_json::json!(recovered.iter().map(|r| r.slug.clone()).collect::<Vec<_>>()),
         );
     }
+    listen_for_stop();
     let outcome = {
         let run = install_inner(home, source, &opts, &mut report);
         tokio::pin!(run);
@@ -144,11 +168,7 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
         // waits (sync file work runs to its next await).
         tokio::select! {
             biased;
-            () = terminated() => Err(super::import_error::import_err(
-                "import.timeout",
-                serde_json::json!({ "interrupted": true }),
-                "匯入被要求停止",
-            )),
+            () = terminated() => Err(interrupted()),
             r = &mut run => r,
         }
     };
@@ -265,6 +285,8 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
                 "取代流程沒有先備份之前的版本，已停止，沒有寫入匯入紀錄",
             ),
         ),
+        // Told to stop while the importer worked: roll back like any failure.
+        Ok(_) if stop_requested() => Err(interrupted()),
         #[cfg(test)]
         Ok(_) if opts.abandon_after_dispatch => {
             return Err(super::import_error::import_err("import.replace_failed", serde_json::json!({}), "test: abandoned"));
@@ -452,6 +474,9 @@ async fn install_native(
         e.agents.iter().map(|a| (a.name.as_str(), a)).collect();
 
     for name in &order {
+        if ctx.stopping() {
+            break;
+        }
         let Some(agent) = by_name.get(name.as_str()) else {
             continue;
         };
@@ -963,6 +988,9 @@ pub(super) fn install_wiki_tree(
     collect_rel_files(wiki_src, wiki_src, &mut files);
     let wiki_root = ctx.home.join("shared").join("wiki");
     for rel in files {
+        if ctx.stopping() {
+            break;
+        }
         let src = wiki_src.join(&rel);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let content = std::fs::read_to_string(&src).unwrap_or_default();

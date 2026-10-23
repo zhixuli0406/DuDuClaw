@@ -332,10 +332,19 @@ impl crate::expert::install::InstallCtx {
         }
     }
 
+    /// The gateway asked this run to stop (SIGTERM at its timeout): the
+    /// importers stop starting new writes and the run rolls back.
+    pub fn stopping(&self) -> bool {
+        crate::expert::install::stop_requested()
+    }
+
     /// Called by each importer once its checks have passed and before its
     /// first write: a real replace moves the earlier import to the backup
     /// here (once). Nothing to do for other runs.
     pub fn begin_writes(&self) -> Result<()> {
+        if self.stopping() {
+            return Err(crate::expert::install::interrupted());
+        }
         let Some(target) = self.replace.as_ref().filter(|_| !self.dry_run) else {
             return Ok(());
         };

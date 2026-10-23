@@ -94,6 +94,9 @@ pub(super) async fn install(
         && let Ok(rd) = std::fs::read_dir(&skills_dir)
     {
         for entry in rd.flatten() {
+            if ctx.stopping() {
+                break;
+            }
             if entry.path().is_dir() {
                 let sname = entry.file_name().to_string_lossy().into_owned();
                 install_skill_global(ctx, &entry.path(), &sname, report, &mut record);
@@ -156,6 +159,9 @@ async fn import_agents(
 
     let mut count = 0;
     for path in entries {
+        if ctx.stopping() {
+            break;
+        }
         let raw = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -291,6 +297,9 @@ fn import_commands(ctx: &InstallCtx, dir: &Path, report: &mut Report, record: &m
         return;
     };
     for entry in rd.flatten() {
+        if ctx.stopping() {
+            break;
+        }
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;

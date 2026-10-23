@@ -127,6 +127,9 @@ pub async fn install(
     let stage = tempfile::tempdir().map_err(|e| cfg_err(format!("建立暫存目錄失敗：{e}")))?;
     let mut quarantined: Vec<QuarantinedSkill> = Vec::new();
     for draft in &order {
+        if ctx.stopping() {
+            break;
+        }
         let Some(id) = id_map.get(&draft.ref_id).cloned() else {
             continue;
         };
