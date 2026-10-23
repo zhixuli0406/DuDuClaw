@@ -80,6 +80,10 @@ impl MethodHandler {
                                     || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())
                             }),
                         ),
+                        (
+                            "googlechat",
+                            crate::agent_channels::store::googlechat_configured(ch.googlechat.as_ref()),
+                        ),
                     ];
                     for &(platform, configured) in pairs {
                         if configured {
