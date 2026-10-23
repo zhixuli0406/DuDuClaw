@@ -189,7 +189,11 @@ pub(crate) async fn handle(
     }
     let label = crate::agent_channels::label("googlechat", agent);
     set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
-    let state = Arc::new(GoogleChatState { ctx, creds, agent: Some(agent.to_string()) });
+    let state = Arc::new(GoogleChatState {
+        ctx,
+        creds,
+        agent: Some(agent.to_string()),
+    });
     crate::googlechat::dispatch_event(state, body).await
 }
 

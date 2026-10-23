@@ -71,6 +71,9 @@ pub(crate) enum CredSource {
     Agent(String),
 }
 
+/// Said in the space when its queue of waiting messages is full.
+const QUEUE_FULL_TEXT: &str = "目前排隊中的訊息太多，這則訊息沒有受理，請稍後再傳一次。";
+
 /// Service-account credentials + token cache — separable from the webhook
 /// state so delegation forwarding / Computer Use can send without a
 /// `ReplyContext`.
@@ -431,8 +434,44 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
     }
     match event_type {
         "MESSAGE" => {
+            // One sender's messages in a space are answered one at a time,
+            // in order (they used to run concurrently, B10).
+            let space = event_space(&event);
+            if space.is_empty() {
+                warn!("Google Chat: MESSAGE event without space name — refused");
+                return (StatusCode::BAD_REQUEST, "bad request").into_response();
+            }
+            let sender = event
+                .pointer("/message/sender/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             let st = state.clone();
-            tokio::spawn(async move { handle_message(&st, &event).await });
+            let queued = event.clone();
+            // The queue outlives each request. Include the app identity so
+            // two apps in one space do not block each other or share caps.
+            let group = serde_json::json!([state.agent.as_deref(), &space]).to_string();
+            let conversation = serde_json::json!([state.agent.as_deref(), &space, &sender]).to_string();
+            if state
+                .ctx.googlechat_queue
+                .submit_in(&group, &conversation, async move {
+                    handle_message(&st, &queued).await
+                })
+                .is_err()
+            {
+                let notify = state.ctx.googlechat_full_notices.allow(&[
+                    (&format!("sender:{conversation}"), std::time::Duration::from_secs(60)),
+                    (&format!("space:{group}"), std::time::Duration::from_secs(10)),
+                ]);
+                warn!(notify, "Google Chat: queue full for a space or sender");
+                if notify {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
+                        create_message(&st.creds, &space, thread, QUEUE_FULL_TEXT).await;
+                    });
+                }
+            }
             // ACK synchronously with an empty body — the reply arrives
             // asynchronously via the REST API.
             (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response()
@@ -457,6 +496,17 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
         }
         _ => (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response(),
     }
+}
+
+/// The space a MESSAGE event belongs to (the queue key; same lookup as
+/// [`handle_message`]).
+fn event_space(event: &serde_json::Value) -> String {
+    event
+        .pointer("/message/space/name")
+        .or_else(|| event.pointer("/space/name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value) {

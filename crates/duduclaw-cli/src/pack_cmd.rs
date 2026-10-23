@@ -88,6 +88,22 @@ pub enum PackCommands {
         /// the dashboard upload).
         #[arg(long, hide = true)]
         report_json: Option<PathBuf>,
+        /// Team packs and agent imports: replace the earlier import with
+        /// this name (it is moved to a backup first, and back on failure).
+        #[arg(long, value_name = "SLUG", conflicts_with = "as_copy")]
+        replace: Option<String>,
+        /// With --replace: also replace employees that were edited after
+        /// the earlier import (their edits go to the backup).
+        #[arg(long, requires = "replace")]
+        accept_edits: bool,
+        /// Team packs and agent imports: keep the earlier import and add
+        /// this one as a copy under a new name.
+        #[arg(long)]
+        as_copy: bool,
+        /// Agent-count cap decided by the gateway (dashboard imports). Only
+        /// narrows the cap resolved from the license.
+        #[arg(long, hide = true)]
+        agent_cap: Option<usize>,
     },
 }
 
@@ -109,8 +125,17 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
             attach_under,
             force,
             report_json,
+            replace,
+            accept_edits,
+            as_copy,
+            agent_cap,
         } => {
-            install_pack(
+            let reimport = match (replace, as_copy) {
+                (Some(slug), _) => crate::expert::ReimportMode::Replace { slug, accept_edits },
+                (None, true) => crate::expert::ReimportMode::Copy,
+                (None, false) => crate::expert::ReimportMode::Fresh,
+            };
+            let result = install_pack(
                 &home,
                 &source,
                 InstallOptions {
@@ -120,9 +145,20 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
                     attach_under,
                     force,
                     report_json,
+                    reimport,
+                    agent_cap,
                 },
             )
-            .await
+            .await;
+            if let Err(e) = &result {
+                if let Some(hint) = crate::expert::import_cli_hint(e) {
+                    eprintln!("  {} {hint}", style("→").cyan());
+                }
+                // One machine-readable line for callers without a report
+                // file (the dashboard's one-click installs).
+                eprintln!("{}", crate::expert::import_marker_line(e));
+            }
+            result
         }
     }
 }
@@ -140,6 +176,8 @@ pub(crate) struct InstallOptions {
     pub attach_under: Option<String>,
     pub force: bool,
     pub report_json: Option<PathBuf>,
+    pub reimport: crate::expert::ReimportMode,
+    pub agent_cap: Option<usize>,
 }
 
 /// **The** pack install front door.
@@ -151,6 +189,19 @@ pub(crate) struct InstallOptions {
 /// falls through to the expert pipeline unchanged — those importers are the
 /// reason the detection there stays fail-closed and is not duplicated here.
 pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions) -> Result<()> {
+    let outcome = install_pack_inner(home, source, &opts).await;
+    // A failure before the pipeline opened its report (source resolution,
+    // tier gate, …) still leaves a report with the coded error, so the
+    // dashboard can explain it. The pipeline's own report is never replaced.
+    if let (Err(e), Some(path)) = (&outcome, &opts.report_json)
+        && !path.exists()
+    {
+        crate::expert::write_failure_report(path, opts.dry_run, e);
+    }
+    outcome
+}
+
+async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) -> Result<()> {
     refuse_in_ai_session(&crate::ai_session_guard::markers())?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
@@ -164,6 +215,13 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
         attach_under: opts.attach_under.clone(),
         report_json: opts.report_json.clone(),
         zip_summary: resolved.zip,
+        reimport: opts.reimport.clone(),
+        agent_cap: opts.agent_cap,
+        extract_root: Some(resolved.dir.clone()),
+        #[cfg(test)]
+        fail_after_dispatch: false,
+        #[cfg(test)]
+        abandon_after_dispatch: false,
     };
 
     match load_pack_dir(&root) {
@@ -189,7 +247,7 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
         Err(PackError::NotFound(_)) => {
             crate::expert::install_via_expert_pipeline_with(home, &root.to_string_lossy(), pipeline).await
         }
-        Err(e) => Err(cfg_err(e.to_string())),
+        Err(e) => Err(crate::expert::bad_content(e.to_string())),
     }
 }
 
@@ -203,10 +261,14 @@ pub(crate) fn refuse_in_ai_session(markers: &[&str]) -> Result<()> {
     if markers.is_empty() {
         return Ok(());
     }
-    Err(cfg_err(format!(
-        "AI 員工不能安裝或匯入 AI 團隊，請由管理者在儀表板或自己的終端機操作（偵測到 {}）",
-        markers.join("、")
-    )))
+    Err(crate::expert::import_err(
+        "import.ai_session",
+        serde_json::json!({}),
+        format!(
+            "AI 員工不能安裝或匯入 AI 團隊，請由管理者在儀表板或自己的終端機操作（偵測到 {}）",
+            markers.join("、")
+        ),
+    ))
 }
 
 /// Install a job preset into `<home>/presets/<id>/preset.toml`.
@@ -293,11 +355,15 @@ fn install_preset_pack(
 /// license file.
 pub(crate) fn tier_gate(pack: &Pack, unlocked: bool) -> Result<()> {
     if pack.tier == PackTier::Premium && !unlocked {
-        return Err(cfg_err(format!(
-            "「{}」屬於付費方案的內建內容，目前的授權未開放（premium_templates）。\
-             升級方案後再安裝，或改用免費的包。",
-            pack.display(UI_LOCALE)
-        )));
+        return Err(crate::expert::import_err(
+            "import.premium_locked",
+            serde_json::json!({ "name": pack.display(UI_LOCALE) }),
+            format!(
+                "「{}」屬於付費方案的內建內容，目前的授權未開放（premium_templates）。\
+                 升級方案後再安裝，或改用免費的包。",
+                pack.display(UI_LOCALE)
+            ),
+        ));
     }
     Ok(())
 }

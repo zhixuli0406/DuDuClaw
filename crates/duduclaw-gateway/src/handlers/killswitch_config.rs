@@ -126,6 +126,16 @@ pub(crate) fn apply_killswitch_to_table(
             );
             changes.push(format!("circuit_breaker.half_open_allow_count = {v}"));
         }
+        // B10: the hard loop limit (trips for anyone over it in the window).
+        for (key, max) in [("hard_window_secs", 86_400u64), ("hard_max_messages", 100_000u64)] {
+            if let Some(v) = c.get(key).and_then(|v| v.as_u64()) {
+                if v == 0 || v > max {
+                    return Err(format!("circuit_breaker.{key} must be 1-{max}"));
+                }
+                sect.insert(key.into(), toml::Value::Integer(v as i64));
+                changes.push(format!("circuit_breaker.{key} = {v}"));
+            }
+        }
     }
 
     // ── [failsafe] ──
@@ -278,6 +288,8 @@ pub(crate) fn killswitch_table_to_response(table: &toml::Table) -> Value {
             "token_explosion_multiplier": flt(cb, "token_explosion_multiplier", ks.circuit_breaker.token_explosion_multiplier),
             "cooldown_secs": int(cb, "cooldown_secs", ks.circuit_breaker.cooldown_secs as i64),
             "half_open_allow_count": int(cb, "half_open_allow_count", ks.circuit_breaker.half_open_allow_count as i64),
+            "hard_window_secs": int(cb, "hard_window_secs", ks.circuit_breaker.hard_window_secs as i64),
+            "hard_max_messages": int(cb, "hard_max_messages", ks.circuit_breaker.hard_max_messages as i64),
         },
         "failsafe": {
             "l1_auto_recover_secs": int(fs, "l1_auto_recover_secs", ks.failsafe.l1_auto_recover_secs as i64),

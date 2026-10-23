@@ -38,7 +38,7 @@ use duduclaw_core::error::Result;
 pub use detect::ConfigKind;
 
 use super::install::InstallCtx;
-use super::{InstallRecord, Report, cfg_err};
+use super::{InstallRecord, Report};
 
 /// Read `root` as `kind` and install it (or plan it, in a dry run).
 pub(in crate::expert) async fn install(
@@ -47,7 +47,7 @@ pub(in crate::expert) async fn install(
     kind: ConfigKind,
     report: &mut Report,
 ) -> Result<InstallRecord> {
-    let bundle = adapters::read(kind, root).map_err(cfg_err)?;
+    let bundle = adapters::read(kind, root).map_err(crate::expert::import_error::bad_content)?;
     writer::install(ctx, bundle, root, report).await
 }
 

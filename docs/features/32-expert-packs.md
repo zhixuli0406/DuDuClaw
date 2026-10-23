@@ -50,6 +50,8 @@ Every install, including one-click dashboard installs and LLM-generated drafts, 
 
 `--dry-run` renders the full plan without writing a byte. Every item lands in an honest report (imported / skipped / conflict / warning) — nothing is silently dropped. `expert remove <slug>` deletes only what the install record says the pack created; pre-existing assets stay.
 
+Installing the same pack again takes `--replace <slug>` (the earlier version moves to a backup first and back on failure) or `--as-copy` to keep both; the dashboard offers the same choice. Before anything is written, the installer counts the AI staff the pack would add and refuses the whole pack when that exceeds the license limit. Error codes and what to do about them: [Import AI staff from another platform](../guides/agent-config-import.md).
+
 ## Org Placement: Department × Rank
 
 A roster member with a `department` gets it written to `[agent] department` in `agent.toml`, and the installer creates the matching shared-wiki department space — so the new hire shows up on the org chart and departments page immediately. Rank (`executive` / `manager` / `staff`) is display metadata: when the manifest omits it, it is derived from the role (`ceo` → executive; `main` / `front_desk` / `team_leader` / `product_manager` → manager; everything else staff). Rank is derived, never authoritative — the `reports_to` tree remains the single source of hierarchy.

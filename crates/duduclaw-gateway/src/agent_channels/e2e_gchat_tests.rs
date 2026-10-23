@@ -63,6 +63,8 @@ pub(crate) fn chat_jwt(audience: &str) -> String {
 struct FakeGoogle {
     /// `(method, path, bearer, body)` of every Chat API call.
     calls: Mutex<Vec<(String, String, String, Value)>>,
+    first_message_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    first_message_started: tokio::sync::Notify,
 }
 
 async fn fake_google(
@@ -106,6 +108,15 @@ async fn fake_google(
         calls.push((method.to_string(), path.clone(), bearer, body));
         calls.len()
     };
+    let gate = if method == Method::POST && path.ends_with("/messages") {
+        f.first_message_gate.lock().unwrap().take()
+    } else {
+        None
+    };
+    if let Some(gate) = gate {
+        f.first_message_started.notify_one();
+        gate.acquire().await.unwrap().forget();
+    }
     axum::Json(
         json!({"name": format!("{}/m{n}", path.trim_end_matches("/messages").trim_start_matches('/'))}),
     )
@@ -190,6 +201,51 @@ pub(crate) async fn wait_text(fake: &Fake, bearer: &str, needle: &str) -> String
         "no message with {needle} sent as {bearer}: {:?}",
         fake.state.calls.lock().unwrap()
     );
+}
+
+#[tokio::test]
+async fn own_app_requests_queue_in_order_while_other_apps_keep_running() {
+    let home = tempfile::tempdir().unwrap();
+    let agents = home.path().join("agents");
+    let fake = start_fake().await;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let email_a = format!("queued-a-{id}@p0-test.iam.gserviceaccount.com");
+    let email_b = format!("queued-b-{id}@p0-test.iam.gserviceaccount.com");
+    use crate::trigger_route::tests::write_agent;
+    write_agent(&agents, "dudu", "總機", "@dudu", "main", "");
+    for (agent, email, project) in [
+        ("sales", &email_a, "444444441"),
+        ("hr", &email_b, "444444442"),
+    ] {
+        let sa = service_account(&fake, email);
+        write_agent(&agents, agent, agent, "", "specialist", &googlechat_section(home.path(), project, &sa));
+    }
+    let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    super::e2e_seam::arm(home.path());
+    let app = crate::googlechat_agents::router(ctx);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *fake.state.first_message_gate.lock().unwrap() = Some(gate.clone());
+    let first = message_event("spaces/QUEUED", "first");
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("444444441")), &first).await, StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(10), fake.state.first_message_started.notified()).await.unwrap();
+
+    let second = message_event("spaces/QUEUED", "second");
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("444444441")), &second).await, StatusCode::OK);
+    assert_eq!(post(&app, "hr", Some(&chat_jwt("444444442")), &second).await, StatusCode::OK);
+    wait_text(&fake, &format!("Bearer tok-{email_b}"), "OWN_BOT_REPLY").await;
+    // A slow first turn in sales must prevent a second placeholder/reply,
+    // while hr can finish in the very same space with the same human sender.
+    let before_release = texts_with_bearer(&fake, &format!("Bearer tok-{email_a}"));
+    gate.add_permits(1);
+    assert_eq!(before_release.len(), 1, "another request bypassed the own-app queue: {before_release:?}");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let replies = texts_with_bearer(&fake, &format!("Bearer tok-{email_a}"))
+                .iter().filter(|text| text.contains("OWN_BOT_REPLY")).count();
+            if replies == 2 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
 }
 
 #[tokio::test]

@@ -113,7 +113,10 @@ pub(super) async fn build_reply_with_session_inner(
     };
     match intercepted {
         Some(crate::takeover::Intercepted::Announce(msg)) => return msg,
-        Some(crate::takeover::Intercepted::Silent) => return String::new(),
+        Some(crate::takeover::Intercepted::Silent) => {
+            super::mark_deliberate_silence();
+            return String::new();
+        }
         None => {}
     }
 
@@ -182,7 +185,11 @@ pub(super) async fn build_reply_with_session_inner(
                 crate::trigger_route::turn::TurnDecision::Reply { text, kind, .. } => {
                     let throttled = kind != crate::trigger_route::turn::ReplyKind::AskTask
                         && !crate::trigger_route::allow_direct_reply(channel, session_id, user_id, kind);
-                    return if throttled { String::new() } else { text };
+                    if throttled {
+                        super::mark_deliberate_silence();
+                        return String::new();
+                    }
+                    return text;
                 }
                 // The message an armed `/交辦 @name` was waiting for: it
                 // becomes the task (rights re-checked), no model call.
@@ -616,9 +623,26 @@ pub(super) async fn build_reply_with_session_inner(
     // ── L2: Circuit breaker check ──
     let mut breaker_state = duduclaw_security::circuit_breaker::BreakerState::Closed;
     if let Some(ref cb_registry) = ctx.circuit_breakers {
-        let decision = cb_registry.check_inbound(session_id, text).await;
+        let decision = match super::breaker_wait::check_inbound_waiting(cb_registry, session_id, text).await {
+            super::breaker_wait::Admission::Decision(d) => d,
+            super::breaker_wait::Admission::Refused { notify } => {
+                record_silent_reply(
+                    &ctx.home_dir,
+                    session_id,
+                    user_id,
+                    "silent_by_design: rate_limited_after_wait",
+                );
+                return if notify {
+                    super::breaker_wait::refused_text(crate::trigger_route::texts::lang_for(&ctx.home_dir))
+                        .to_string()
+                } else {
+                    String::new()
+                };
+            }
+        };
         match decision {
-            duduclaw_security::circuit_breaker::BreakerDecision::Allow => {}
+            duduclaw_security::circuit_breaker::BreakerDecision::Allow
+            | duduclaw_security::circuit_breaker::BreakerDecision::Wait(_) => {}
             duduclaw_security::circuit_breaker::BreakerDecision::Throttle => {
                 breaker_state = duduclaw_security::circuit_breaker::BreakerState::HalfOpen;
                 // Allow through but mark for defensive prompt injection later

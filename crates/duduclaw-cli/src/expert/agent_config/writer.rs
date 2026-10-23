@@ -18,6 +18,7 @@ use super::outcome::{Outcome, Status};
 use super::placement::{self, SkillJob};
 use super::slots::{SlotCtx, clean_display_name, write_slots};
 use crate::expert::install::InstallCtx;
+use crate::expert::import_error::import_err;
 use crate::expert::{
     InstallRecord, PackKind, Report, ScanVerdict, cfg_err, now_iso, scan_external,
 };
@@ -78,7 +79,10 @@ pub async fn install(
     }
 
     let order = topo_order(&bundle.agents);
-    let mut book = NameBook::load(&ctx.home);
+    // The import name first: a re-import is recognised before any employee
+    // is reported as clashing with its own earlier version.
+    let slug = choose_slug(ctx, &bundle, &order)?;
+    let mut book = ctx.name_book();
     let mut id_map: BTreeMap<String, String> = BTreeMap::new();
     let mut planned_ids: BTreeSet<String> = BTreeSet::new();
     for draft in &order {
@@ -89,7 +93,10 @@ pub async fn install(
             id_map.insert(draft.ref_id.clone(), id);
         }
     }
-    let slug = choose_slug(ctx, &bundle, &order, &id_map)?;
+    // The cap counts every employee this import would add, before anything
+    // (even the archived original) is written.
+    ctx.ensure_quota(id_map.len()).await?;
+    ctx.begin_writes()?;
     report.meta("slug", &slug);
     report.meta("format", bundle.format_code);
 
@@ -120,6 +127,9 @@ pub async fn install(
     let stage = tempfile::tempdir().map_err(|e| cfg_err(format!("建立暫存目錄失敗：{e}")))?;
     let mut quarantined: Vec<QuarantinedSkill> = Vec::new();
     for draft in &order {
+        if ctx.stopping() {
+            break;
+        }
         let Some(id) = id_map.get(&draft.ref_id).cloned() else {
             continue;
         };
@@ -148,9 +158,16 @@ pub async fn install(
         report.tag("archive.unmapped", json!({ "file": u.rel }));
     }
     placement::file_quarantine(ctx, &slug, quarantined, report).await;
-    if record.agents.is_empty() && !ctx.dry_run {
-        let _ = std::fs::remove_dir_all(ctx.home.join("imported").join(&slug));
-        return Err(cfg_err("沒有任何 AI 員工匯入成功（請看上方原因）".into()));
+    if record.agents.is_empty() {
+        if !ctx.dry_run {
+            let _ = std::fs::remove_dir_all(ctx.home.join("imported").join(&slug));
+        }
+        let problems = report.agent_problems();
+        return Err(import_err(
+            "import.nothing_imported",
+            json!({ "agents": problems }),
+            "沒有任何 AI 員工匯入成功（原因見匯入報告裡每位員工的說明）",
+        ));
     }
     Ok(record)
 }
@@ -201,20 +218,10 @@ fn resolve_id(
     book: &NameBook,
     report: &mut Report,
 ) -> Option<String> {
-    let candidates = [
-        crate::sanitize_agent_id(&draft.id_hint),
-        crate::sanitize_agent_id(&format!("{format}-{}", draft.ref_id)),
-        format!(
-            "{format}-{}",
-            &crate::expert::registry::sha256_hex(draft.display_name.as_bytes())[..8]
-        ),
-    ];
-    let base = candidates
-        .into_iter()
-        .find(|c| crate::is_valid_agent_id(c) && !duduclaw_core::is_reserved_agent_id(c))?;
-    let dir_taken = |id: &str| ctx.home.join("agents").join(id).exists() || planned.contains(id);
+    let base = base_id(draft, format)?;
+    let dir_taken = |id: &str| ctx.agent_taken(id) || planned.contains(id);
     if dir_taken(&base) && !ctx.rename {
-        report.conflict("agent", &base, "同名 AI 員工已存在（加 --rename 以 -imported 結尾匯入）");
+        report.conflict("agent", &base, "同名 AI 員工已存在（可另存一份副本，改用新代號匯入）");
         report.tag("agent.conflict", json!({ "id": base }));
         return None;
     }
@@ -240,28 +247,37 @@ fn resolve_id(
     None
 }
 
-fn choose_slug(
-    ctx: &InstallCtx,
-    bundle: &ImportBundle,
-    order: &[AgentDraft],
-    ids: &BTreeMap<String, String>,
-) -> Result<String> {
+/// The id an employee gets before any clash handling: ASCII form of the
+/// hint, else `<format>-<ref>`, else a hash of the display name.
+fn base_id(draft: &AgentDraft, format: &str) -> Option<String> {
+    let candidates = [
+        crate::sanitize_agent_id(&draft.id_hint),
+        crate::sanitize_agent_id(&format!("{format}-{}", draft.ref_id)),
+        format!(
+            "{format}-{}",
+            &crate::expert::registry::sha256_hex(draft.display_name.as_bytes())[..8]
+        ),
+    ];
+    candidates
+        .into_iter()
+        .find(|c| crate::is_valid_agent_id(c) && !duduclaw_core::is_reserved_agent_id(c))
+}
+
+/// The import name: the source's own hint, else the first employee's base
+/// id (taken before clash handling, so importing the same source twice
+/// always lands on the same name and is recognised as a re-import), else
+/// `<format>-import`.
+fn choose_slug(ctx: &InstallCtx, bundle: &ImportBundle, order: &[AgentDraft]) -> Result<String> {
     let hint = crate::sanitize_agent_id(&bundle.slug_hint);
     let first = order
         .first()
-        .and_then(|a| ids.get(&a.ref_id))
-        .cloned()
+        .and_then(|a| base_id(a, bundle.format_code))
         .unwrap_or_default();
     let slug = [hint, first, format!("{}-import", bundle.format_code)]
         .into_iter()
         .find(|s| crate::is_valid_agent_id(s))
         .ok_or_else(|| cfg_err("無法產生匯入代號".into()))?;
-    if crate::expert::read_record(&ctx.home, &slug).is_some() {
-        return Err(cfg_err(format!(
-            "「{slug}」已經匯入過（先在儀表板移除，或執行 `duduclaw expert remove {slug}` 後再匯入）"
-        )));
-    }
-    Ok(slug)
+    ctx.claim_slug(&slug)
 }
 
 async fn install_agent(
@@ -331,6 +347,7 @@ async fn install_agent(
             model_preferred: model,
             soul_body: soul,
         };
+        ctx.note_agent(id);
         if let Err(e) = crate::scaffold_agent_dir(&ctx.home, &scaffold).await {
             report.skipped("agent", id, format!("建立失敗：{e}"));
             report.tag("agent.failed", json!({ "id": id }));

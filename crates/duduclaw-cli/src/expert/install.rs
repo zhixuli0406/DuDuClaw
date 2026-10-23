@@ -28,6 +28,16 @@ pub(super) struct InstallCtx {
     /// (`--attach-under`). Validated to exist BEFORE anything installs
     /// (fail-closed); pack roots then scaffold with `reports_to` set to it.
     pub attach_under: Option<String>,
+    /// What to do when this was imported before ([`super::reimport`]).
+    pub reimport: super::reimport::ReimportMode,
+    /// The earlier import a replace moves away (resolved up front).
+    pub replace: Option<super::reimport::ReplaceTarget>,
+    /// The gateway's agent cap (`--agent-cap`), applied with the one
+    /// resolved from disk ([`super::quota`]).
+    pub agent_cap: Option<usize>,
+    /// What a real replace moved away and what the new version wrote
+    /// ([`InstallCtx::begin_writes`], [`InstallCtx::note_agent`]).
+    pub replace_state: std::sync::Mutex<super::reimport::ReplaceState>,
 }
 
 /// Options of one pipeline run beyond the source itself.
@@ -42,6 +52,23 @@ pub(crate) struct PipelineOpts {
     /// What the front door's zip extraction left out (when it already
     /// extracted the source before handing a directory over).
     pub zip_summary: Option<safe_zip::ExtractSummary>,
+    /// `--replace <slug>` / `--as-copy` / `--accept-edits`.
+    pub reimport: super::reimport::ReimportMode,
+    /// `--agent-cap` (the dashboard passes the gateway's cap).
+    pub agent_cap: Option<usize>,
+    /// Set by the front door, which already resolved the source and stepped
+    /// through wrapper folders: the extraction root it started from. The
+    /// source handed over is then used as is (no second unwrap, so the
+    /// wrapper depth stays [`detect::MAX_WRAPPER_DEPTH`]).
+    pub extract_root: Option<PathBuf>,
+    /// Tests only: fail right after the importer wrote everything (the
+    /// same point as a failed install-record write).
+    #[cfg(test)]
+    pub fail_after_dispatch: bool,
+    /// Tests only: stop right after the importer wrote, without rolling
+    /// back or closing the journal (what a killed installer leaves).
+    #[cfg(test)]
+    pub abandon_after_dispatch: bool,
 }
 
 /// Entry for `duduclaw pack install` once it hands a roster-shaped pack over
@@ -65,6 +92,46 @@ pub async fn cmd_install(
     cmd_install_with(home, source, opts).await
 }
 
+/// Set once the gateway asked this run to stop (see [`listen_for_stop`]).
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The failure of a run that was told to stop.
+pub(crate) fn interrupted() -> duduclaw_core::error::DuDuClawError {
+    super::import_error::import_err("import.timeout", serde_json::json!({ "interrupted": true }), "匯入被要求停止")
+}
+
+/// Most of an import is file work with no wait in between, so a stop
+/// request cannot cancel it from outside: a task on another worker raises
+/// [`STOP_REQUESTED`], the importers stop starting new writes, and the run
+/// rolls back as for any failure.
+fn listen_for_stop() {
+    tokio::spawn(async {
+        terminated().await;
+        STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// Resolves when this process is asked to stop (SIGTERM — what the gateway
+/// sends at its timeout before it kills). Only for runs the gateway
+/// started (it sets the marker nonce); a terminal run keeps the default
+/// signal handling. Never on Windows, where the stop is forceful and the
+/// journal is recovered by the next import or gateway start instead.
+async fn terminated() {
+    #[cfg(unix)]
+    if std::env::var_os(super::import_error::MARKER_NONCE_ENV).is_some() {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// [`cmd_install`] with the full option set.
 ///
 /// With `report_json`, the machine-readable report is written on success
@@ -77,9 +144,48 @@ pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOp
         None => None,
     };
     let mut report = Report::default();
-    let outcome = install_inner(home, source, &opts, &mut report).await;
+    // A replace stopped half way earlier (killed installer, machine down)
+    // is put back before anything else happens.
+    let recovered = super::reimport::recover_interrupted(home, super::reimport::RecoverScope::Abandoned).await;
+    if !recovered.is_empty() {
+        for r in &recovered {
+            eprintln!(
+                "  {} 上次取代「{}」沒有做完，已還原之前的版本",
+                style("↺").yellow(),
+                r.slug
+            );
+        }
+        report.detail(
+            "recovered",
+            serde_json::json!(recovered.iter().map(|r| r.slug.clone()).collect::<Vec<_>>()),
+        );
+    }
+    listen_for_stop();
+    let outcome = {
+        let run = install_inner(home, source, &opts, &mut report);
+        tokio::pin!(run);
+        // The stop request first: the importer is only interrupted where it
+        // waits (sync file work runs to its next await).
+        tokio::select! {
+            biased;
+            () = terminated() => Err(interrupted()),
+            r = &mut run => r,
+        }
+    };
+    // Told to stop part-way through a replace: put the earlier version back
+    // from this run's own journal (the importer future is gone by now).
+    if outcome.as_ref().err().and_then(super::import_error::failure_of).map(|f| f.params.get("interrupted").is_some())
+        == Some(true)
+    {
+        let mine = super::reimport::recover_interrupted(home, super::reimport::RecoverScope::IncludingOwn).await;
+        if !mine.is_empty() {
+            eprintln!("  {} 匯入中止，之前的版本已還原", style("↺").yellow());
+            report.detail("rolled_back", serde_json::json!({ "interrupted": true }));
+        }
+    }
     if let Err(e) = &outcome {
-        report.meta("error", &e.to_string());
+        report.meta("error", &super::import_error::plain_message(e));
+        report.set_error(super::import_error::error_json(e));
     }
     if let Some(file) = report_file.as_mut() {
         use std::io::Write;
@@ -99,25 +205,20 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let cleanup = Cleanup(staging.clone());
 
     let resolved = super::source::resolve_source_full(source, &staging).await?;
-    let root = detect::resolve_root(&resolved.dir);
+    let (root, extract_root) = match &opts.extract_root {
+        Some(er) => (resolved.dir.clone(), er.clone()),
+        None => (detect::resolve_root(&resolved.dir), resolved.dir.clone()),
+    };
     let zip_summary = resolved.zip.or(opts.zip_summary.clone());
 
     // ── 2. Detect format (fail-closed). ──
     let Some(format) = detect::detect(&root) else {
         let contents = detect::list_contents(&root);
-        eprintln!(
-            "\n  {} 無法識別的格式。支援：DuDuClaw 專家包（expert.toml）、Claude Code 外掛、單一技能（SKILL.md）、\
-             豆包夥伴安裝包、OpenClaw、Hermes、AGENTS.md／CLAUDE.md／GEMINI.md、Claude Code／Copilot 子代理、Dify 應用匯出檔。\n",
-            style("✗").red().bold()
-        );
-        eprintln!("  目錄內容:");
-        for c in &contents {
-            eprintln!("    - {c}");
-        }
-        eprintln!();
         report.meta("unrecognized_contents", &contents.join("\n"));
+        // Look for a deeper pack before the staging dir is cleaned up.
+        let err = detect::unrecognized_error(&extract_root, &root, contents);
         drop(cleanup);
-        return Err(cfg_err("未識別格式，拒絕安裝".into()));
+        return Err(err);
     };
 
     // ── attach-under: validate the target exists BEFORE anything installs
@@ -125,40 +226,105 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let attach_under = match opts.attach_under.as_deref().map(str::trim) {
         Some("") | None => None,
         Some(id) => {
-            if !crate::is_valid_agent_id(id) {
+            if !crate::is_valid_agent_id(id) || !home.join("agents").join(id).join("agent.toml").is_file() {
                 drop(cleanup);
-                return Err(cfg_err(format!("--attach-under '{id}' 非合法 agent id")));
-            }
-            if !home.join("agents").join(id).join("agent.toml").is_file() {
-                drop(cleanup);
-                return Err(cfg_err(format!(
-                    "--attach-under 目標 '{id}' 不存在（先建立主管或改用既有 agent）"
-                )));
+                return Err(super::import_error::import_err(
+                    "import.attach_under_missing",
+                    serde_json::json!({ "id": duduclaw_core::truncate_chars(id, 64) }),
+                    format!("--attach-under 目標 '{id}' 不存在（先建立主管或改用既有 agent）"),
+                ));
             }
             Some(id.to_string())
         }
     };
 
+    // ── Re-import: resolve what a replace would move away, and refuse a
+    //    replace of edited employees without explicit consent. ──
+    let replace = super::reimport::resolve_target(home, &opts.reimport)?;
+    if let Some(t) = &replace {
+        let edits = if dry_run {
+            super::reimport::edits_since_import(home, &t.slug, &t.record, &t.agents)
+        } else {
+            super::reimport::ensure_edits_accepted(home, t)?
+        };
+        report.detail("replace", super::reimport::replace_detail(t, &edits));
+    }
+
     let ctx = InstallCtx {
         home: home.to_path_buf(),
         dry_run,
-        rename: opts.rename,
+        rename: opts.rename || opts.reimport == super::reimport::ReimportMode::Copy,
         trust_hooks: opts.trust_hooks,
         attach_under,
+        reimport: opts.reimport.clone(),
+        replace,
+        agent_cap: opts.agent_cap,
+        replace_state: Default::default(),
     };
     if let Some(z) = &zip_summary {
         super::report::report_zip_summary(z, report);
     }
 
-    // ── 3. Dispatch. ──
-    let record = match format {
-        Format::Native => install_native(&ctx, &root, report).await?,
-        Format::ClaudePlugin => super::plugin::install(&ctx, &root, report).await?,
-        Format::Skill => super::skill_import::install(&ctx, &root, report).await?,
-        Format::AgentConfig(kind) => {
-            super::agent_config::install(&ctx, &root, kind, report).await?
+    // ── 3. Dispatch. A real replace moves the earlier import to the backup
+    //    only once the importer's checks have passed (`begin_writes`), and
+    //    moves it back if anything after that fails. ──
+    let dispatched = match format {
+        Format::Native => install_native(&ctx, &root, report).await,
+        Format::ClaudePlugin => super::plugin::install(&ctx, &root, report).await,
+        Format::Skill => super::skill_import::install(&ctx, &root, report).await,
+        Format::AgentConfig(kind) => super::agent_config::install(&ctx, &root, kind, report).await,
+    };
+    let state = ctx.take_replace_state();
+    let dispatched = match dispatched {
+        // Every importer moves the earlier import away before it writes; a
+        // real replace that got here without doing so must not record.
+        Ok(_) if ctx.replace.is_some() && !dry_run && state.retired.is_none() => Err(
+            super::import_error::import_err(
+                "import.replace_failed",
+                serde_json::json!({ "slug": ctx.replace.as_ref().map(|t| t.slug.clone()) }),
+                "取代流程沒有先備份之前的版本，已停止，沒有寫入匯入紀錄",
+            ),
+        ),
+        // Told to stop while the importer worked: roll back like any failure.
+        Ok(_) if stop_requested() => Err(interrupted()),
+        #[cfg(test)]
+        Ok(_) if opts.abandon_after_dispatch => {
+            return Err(super::import_error::import_err("import.replace_failed", serde_json::json!({}), "test: abandoned"));
+        }
+        #[cfg(test)]
+        Ok(_) if opts.fail_after_dispatch => Err(super::import_error::import_err(
+            "import.replace_failed",
+            serde_json::json!({}),
+            "test: injected failure after the importer wrote",
+        )),
+        other => other,
+    };
+    let record = match dispatched.and_then(|r| {
+        if dry_run { Ok(r) } else { super::write_record(home, &r).map(|()| r) }
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(log) = &state.retired {
+                let n = match super::reimport::rollback(log) {
+                    Some(dir) => super::reimport::withdraw_pending(home, &dir, "import_failed").await,
+                    None => 0,
+                };
+                eprintln!(
+                    "  {} 之前的版本已還原；新版本已寫入的部分移到 {}{}",
+                    style("↺").yellow(),
+                    log.backup.join("failed-new").display(),
+                    if n > 0 { format!("，並撤回它送出的 {n} 張審核單") } else { String::new() }
+                );
+                report.detail("rolled_back", serde_json::json!({ "withdrawn_approvals": n }));
+            }
+            return Err(e);
         }
     };
+    let retired = state.retired;
+    // The record is written: the replace has happened, its journal goes.
+    if let Some(log) = &retired {
+        log.close();
+    }
 
     report.render_console(dry_run);
     report.meta("slug", &record.slug);
@@ -166,9 +332,17 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     report.meta("pack_format", format_label(format));
     report.meta("agents", &record.agents.join(","));
 
-    // ── 4. Persist the install record (real runs only). ──
+    // ── 4. Install record already persisted above (real runs); keep what
+    //    each employee looks like now, so a later replace can tell edits. ──
     if !dry_run {
-        super::write_record(home, &record)?;
+        if let Err(e) = super::reimport::baseline::write(home, &record.slug, &record.agents) {
+            eprintln!("  {} {e}", style("⚠").yellow());
+        }
+        if let Some(log) = &retired {
+            super::reimport::finish(home, log, &record.agents);
+            let n = super::reimport::withdraw_pending(home, &log.record_backup(), "import_replaced").await;
+            report.detail("replaced", serde_json::json!({ "agents": log.agents, "withdrawn_approvals": n }));
+        }
         println!(
             "  {} 已安裝專家包 {} v{} [{}]\n",
             style("✓").green(),
@@ -203,24 +377,26 @@ async fn install_native(
     dir: &Path,
     report: &mut Report,
 ) -> Result<InstallRecord> {
-    let m = manifest::read(dir).map_err(cfg_err)?;
+    let m = manifest::read(dir).map_err(super::import_error::bad_content)?;
     let e = &m.expert;
 
     if e.name.trim().is_empty() || !crate::is_valid_agent_id(&e.name) {
-        return Err(cfg_err(format!(
+        return Err(super::import_error::bad_content(format!(
             "expert.name '{}' 非合法 slug",
             e.name.escape_debug()
         )));
     }
-    if super::read_record(&ctx.home, &e.name).is_some() {
-        return Err(cfg_err(format!(
-            "專家包 '{}' 已安裝（先 `expert remove {}` 再重裝）",
-            e.name, e.name
-        )));
-    }
+    let slug = ctx.claim_slug(&e.name)?;
+    let adding = e
+        .agents
+        .iter()
+        .filter(|a| crate::is_valid_agent_id(&crate::sanitize_agent_id(&a.name)))
+        .count();
+    ctx.ensure_quota(adding).await?;
+    ctx.begin_writes()?;
 
     let mut record = InstallRecord {
-        slug: e.name.clone(),
+        slug: slug.clone(),
         kind: PackKind::Native,
         display_name: e.display(super::UI_LOCALE).to_string(),
         version: e.version.clone(),
@@ -290,7 +466,7 @@ async fn install_native(
     // Names (ids, display names, triggers) current employees answer to:
     // channel routing calls `@display` and `@id`, so no new member may
     // share one.
-    let mut book = duduclaw_core::agent_names::NameBook::load(&ctx.home);
+    let mut book = ctx.name_book();
 
     // in-pack name → final (possibly renamed) agent id.
     let mut id_map: BTreeMap<String, String> = BTreeMap::new();
@@ -298,6 +474,9 @@ async fn install_native(
         e.agents.iter().map(|a| (a.name.as_str(), a)).collect();
 
     for name in &order {
+        if ctx.stopping() {
+            break;
+        }
         let Some(agent) = by_name.get(name.as_str()) else {
             continue;
         };
@@ -336,7 +515,7 @@ async fn install_native(
     }
 
     // ── hooks/ → quarantined; enablement is ApprovalBroker-gated ──
-    super::hooks::import_hooks(ctx, dir, &e.name, report).await;
+    super::hooks::import_hooks(ctx, dir, &slug, report).await;
 
     Ok(record)
 }
@@ -363,7 +542,7 @@ fn team_id_suffix(
     let free = |suffix: &str| {
         bases.iter().all(|b| {
             let id = crate::sanitize_agent_id(&format!("{b}{suffix}"));
-            crate::is_valid_agent_id(&id) && !ctx.home.join("agents").join(&id).exists()
+            crate::is_valid_agent_id(&id) && !ctx.agent_taken(&id)
         })
     };
     if free("") {
@@ -402,7 +581,7 @@ async fn install_one_agent(
         return Ok(None);
     }
     let final_id = crate::sanitize_agent_id(&format!("{base}{}", placement.suffix));
-    if !crate::is_valid_agent_id(&final_id) || ctx.home.join("agents").join(&final_id).exists() {
+    if !crate::is_valid_agent_id(&final_id) || ctx.agent_taken(&final_id) {
         report.conflict("agent", &final_id, "代號已被使用，這位沒有安裝");
         return Ok(None);
     }
@@ -504,6 +683,7 @@ async fn install_one_agent(
         model_preferred: None,
         soul_body,
     };
+    ctx.note_agent(&final_id);
     crate::scaffold_agent_dir(&ctx.home, &scaffold).await?;
     report.imported("agent", &final_id);
     record.agents.push(final_id.clone());
@@ -786,6 +966,7 @@ pub(super) fn install_skill_global(
         report.imported("skill", name);
         return;
     }
+    ctx.note_path(&dest);
     match copy_dir(src, &dest) {
         Ok(()) => {
             report.imported("skill", name);
@@ -807,6 +988,9 @@ pub(super) fn install_wiki_tree(
     collect_rel_files(wiki_src, wiki_src, &mut files);
     let wiki_root = ctx.home.join("shared").join("wiki");
     for rel in files {
+        if ctx.stopping() {
+            break;
+        }
         let src = wiki_src.join(&rel);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let content = std::fs::read_to_string(&src).unwrap_or_default();
@@ -826,6 +1010,7 @@ pub(super) fn install_wiki_tree(
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        ctx.note_path(&dest);
         match std::fs::copy(&src, &dest) {
             Ok(_) => {
                 report.imported("wiki", &rel_str);

@@ -15,6 +15,9 @@ use duduclaw_core::error::{DuDuClawError, Result};
 // WP-4G: one source of truth for the entry-count and compression-ratio
 // ceilings, shared with the inbound-document gate.
 use duduclaw_gateway::document_limits as doclimits;
+use serde_json::json;
+
+use super::import_error::import_err;
 
 /// Hard ceiling on total uncompressed bytes and on the archive file itself.
 pub const MAX_UNPACK_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
@@ -45,25 +48,30 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
         .map_err(|e| io_err(format!("讀取 {} 失敗: {e}", zip_path.display())))?
         .len();
     if file_len > MAX_UNPACK_BYTES {
-        return Err(cfg_err(format!(
+        return Err(too_large(format!(
             "壓縮檔過大（{file_len} bytes > 上限 {MAX_UNPACK_BYTES}）"
         )));
     }
 
     let file = std::fs::File::open(zip_path)
         .map_err(|e| io_err(format!("開啟 {} 失敗: {e}", zip_path.display())))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| cfg_err(format!("非合法 zip：{e}")))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+        import_err("import.not_zip", json!({}), format!("非合法 zip：{e}"))
+    })?;
 
     // WP-4G ceiling 1 — entry count. A million micro-entries exhausts inodes
     // and file handles long before the byte budget notices anything. Counted
     // before junk filtering: clutter still costs a header read each.
     if archive.len() as u64 > doclimits::DEFAULT_MAX_ENTRIES as u64 {
-        return Err(cfg_err(format!(
-            "壓縮檔條目數 {} 超過上限 {}（疑似耗盡型攻擊）",
-            archive.len(),
-            doclimits::DEFAULT_MAX_ENTRIES
-        )));
+        return Err(import_err(
+            "import.too_many_entries",
+            json!({ "count": archive.len(), "limit": doclimits::DEFAULT_MAX_ENTRIES }),
+            format!(
+                "壓縮檔條目數 {} 超過上限 {}（疑似耗盡型攻擊）",
+                archive.len(),
+                doclimits::DEFAULT_MAX_ENTRIES
+            ),
+        ));
     }
 
     let plan = plan_entries(&mut archive)?;
@@ -101,7 +109,7 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
             && let Ok(pc) = parent.canonicalize()
             && !pc.starts_with(&root_canon)
         {
-            return Err(cfg_err(format!(
+            return Err(unsafe_entry(&rel.display().to_string(), format!(
                 "拒絕逃逸解包圍欄的條目：{}",
                 rel.display()
             )));
@@ -109,7 +117,7 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
 
         total = total.saturating_add(entry.size());
         if total > MAX_UNPACK_BYTES {
-            return Err(cfg_err(format!(
+            return Err(too_large(format!(
                 "解包總量超過上限 {MAX_UNPACK_BYTES} bytes（疑似 zip bomb）"
             )));
         }
@@ -121,11 +129,15 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
         if packed >= doclimits::RATIO_MIN_COMPRESSED_BYTES {
             let ratio = entry.size() / packed;
             if ratio > doclimits::DEFAULT_MAX_COMPRESSION_RATIO as u64 {
-                return Err(cfg_err(format!(
-                    "條目 {} 壓縮比 {ratio}:1 超過上限 {}:1（疑似 zip bomb）",
-                    rel.display(),
-                    doclimits::DEFAULT_MAX_COMPRESSION_RATIO
-                )));
+                return Err(import_err(
+                    "import.zip_bomb",
+                    json!({ "entry": rel.display().to_string() }),
+                    format!(
+                        "條目 {} 壓縮比 {ratio}:1 超過上限 {}:1（疑似 zip bomb）",
+                        rel.display(),
+                        doclimits::DEFAULT_MAX_COMPRESSION_RATIO
+                    ),
+                ));
             }
         }
 
@@ -143,9 +155,13 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
             .map_err(|e| io_err(format!("解壓 {} 失敗: {e}", rel.display())))?;
         written = written.saturating_add(n);
         if written > MAX_UNPACK_BYTES {
-            return Err(cfg_err(format!(
-                "解包實際輸出超過上限 {MAX_UNPACK_BYTES} bytes（zip 標頭宣告不實，疑似 zip bomb）"
-            )));
+            return Err(import_err(
+                "import.zip_bomb",
+                json!({ "entry": rel.display().to_string() }),
+                format!(
+                    "解包實際輸出超過上限 {MAX_UNPACK_BYTES} bytes（zip 標頭宣告不實，疑似 zip bomb）"
+                ),
+            ));
         }
     }
 
@@ -174,10 +190,8 @@ fn plan_entries(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<ExtractP
         // good enough for this first fence. The decoded name is fenced again
         // below.
         if entry.enclosed_name().is_none() {
-            return Err(cfg_err(format!(
-                "拒絕不安全的 zip 條目（zip-slip）：{}",
-                String::from_utf8_lossy(entry.name_raw())
-            )));
+            let name = String::from_utf8_lossy(entry.name_raw()).into_owned();
+            return Err(unsafe_entry(&name, format!("拒絕不安全的 zip 條目（zip-slip）：{name}")));
         }
         let bytes = entry.name_raw().to_vec();
         if is_junk_raw(&bytes) {
@@ -195,7 +209,14 @@ fn plan_entries(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<ExtractP
         raw.push(RawName { bytes, utf8_flag });
     }
 
-    let decoded = decode_names(&raw).map_err(cfg_err)?;
+    let decoded = decode_names(&raw).map_err(|e| {
+        let code = if e.ambiguous {
+            "import.name_encoding_ambiguous"
+        } else {
+            "import.name_encoding_unknown"
+        };
+        import_err(code, json!({ "sample": e.sample }), e.to_string())
+    })?;
     summary.legacy_encoding = decoded.legacy;
 
     let mut entries = Vec::with_capacity(kept.len());
@@ -207,14 +228,36 @@ fn plan_entries(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<ExtractP
         let rel = decoded_rel_path(&name)?;
         let key = rel.to_string_lossy().to_lowercase();
         if !seen.insert(key) {
-            return Err(cfg_err(format!(
-                "壓縮檔內有兩個項目的路徑相同（只差大小寫）：{}，無法判斷要用哪一個，已停止匯入",
-                rel.display()
-            )));
+            return Err(import_err(
+                "import.case_duplicate",
+                json!({ "path": rel.display().to_string() }),
+                format!(
+                    "壓縮檔內有兩個項目的路徑相同（只差大小寫）：{}，無法判斷要用哪一個，已停止匯入",
+                    rel.display()
+                ),
+            ));
         }
         entries.push((i, rel));
     }
     Ok(ExtractPlan { entries, summary })
+}
+
+/// The archive (or what it unpacks to) is over [`MAX_UNPACK_BYTES`].
+pub(super) fn too_large(message: String) -> DuDuClawError {
+    import_err(
+        "import.too_large",
+        json!({ "limit_mb": MAX_UNPACK_BYTES / (1024 * 1024) }),
+        message,
+    )
+}
+
+/// An entry whose path is unsafe or not portable (zip-slip and friends).
+fn unsafe_entry(entry: &str, message: String) -> DuDuClawError {
+    import_err(
+        "import.unsafe_path",
+        json!({ "entry": duduclaw_core::truncate_chars(entry, 200) }),
+        message,
+    )
 }
 
 /// Turn a decoded entry name into a safe relative path. A backslash is a
@@ -222,7 +265,10 @@ fn plan_entries(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<ExtractP
 /// character). Refuses NUL, absolute paths, drive prefixes and `..`.
 fn decoded_rel_path(name: &str) -> Result<PathBuf> {
     let unified = name.replace('\\', "/");
-    let refuse = || cfg_err(format!("拒絕不安全的 zip 條目（zip-slip）：{}", name.escape_debug()));
+    let refuse = || {
+        let shown = name.escape_debug().to_string();
+        unsafe_entry(&shown, format!("拒絕不安全的 zip 條目（zip-slip）：{shown}"))
+    };
     if unified.contains('\0') || unified.starts_with('/') {
         return Err(refuse());
     }

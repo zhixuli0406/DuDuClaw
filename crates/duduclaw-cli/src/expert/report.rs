@@ -42,6 +42,10 @@ pub(super) struct Report {
     /// Summary fields for the machine-readable report (`slug`, `format`,
     /// `disabled_skills`, …).
     meta: std::collections::BTreeMap<String, String>,
+    /// Structured extras (`replace`: what a replace moves away, …).
+    details: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Set when the run failed: `{code, params, message}`.
+    error: Option<serde_json::Value>,
 }
 
 impl ItemStatus {
@@ -61,6 +65,33 @@ impl Report {
         self.meta.insert(key.to_string(), value.to_string());
     }
 
+    pub(super) fn detail(&mut self, key: &str, value: serde_json::Value) {
+        self.details.insert(key.to_string(), value);
+    }
+
+    pub(super) fn set_error(&mut self, error: serde_json::Value) {
+        self.error = Some(error);
+    }
+
+    /// Employee-level lines that kept an employee out (skipped / conflict),
+    /// for the "nothing was imported" error: each one's name, reason code
+    /// and parameters, so the dashboard can say why per employee.
+    pub(super) fn agent_problems(&self) -> Vec<serde_json::Value> {
+        self.items
+            .iter()
+            .filter(|i| i.kind == "agent" && matches!(i.status, ItemStatus::Skipped | ItemStatus::Conflict))
+            .map(|i| {
+                serde_json::json!({
+                    "name": i.name,
+                    "status": i.status.code(),
+                    "code": i.code,
+                    "params": i.params,
+                    "detail": i.detail,
+                })
+            })
+            .collect()
+    }
+
     /// The report as JSON for the dashboard (`pack install --report-json`).
     /// `kind` / `status` are stable codes the UI translates; `name` /
     /// `detail` are already human-readable zh-TW.
@@ -69,6 +100,8 @@ impl Report {
         serde_json::json!({
             "dry_run": dry_run,
             "meta": self.meta,
+            "details": self.details,
+            "error": self.error,
             "counts": {
                 "imported": count(ItemStatus::Imported),
                 "skipped": count(ItemStatus::Skipped),
@@ -190,3 +223,11 @@ pub(super) fn report_zip_summary(z: &super::safe_zip::ExtractSummary, report: &m
     }
 }
 
+/// A report for a run that stopped before the pipeline had one (the front
+/// door's source resolution, tier gate, …): just the error.
+pub(crate) fn failure_report_json(dry_run: bool, e: &duduclaw_core::error::DuDuClawError) -> serde_json::Value {
+    let mut r = Report::default();
+    r.meta("error", &super::import_error::plain_message(e));
+    r.set_error(super::import_error::error_json(e));
+    r.to_json(dry_run)
+}
