@@ -88,12 +88,70 @@ async fn owned_channel(
     ] {
         let dir = home.path().join("agents").join(id);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"),format!("[agent]\nname='{id}'\ndisplay_name='{display}'\nrole='{role}'\n[model]\npreferred='{model}'\n[runtime]\nprovider='{runtime}'\n[goal_intent]\nenabled=false\nmode='off'\n[evolution]\nenabled=false\n")).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                r#"[agent]
+name='{id}'
+display_name='{display}'
+role='{role}'
+status='active'
+trigger='@{display}'
+reports_to=''
+icon='🤖'
+[model]
+preferred='{model}'
+fallback=''
+account_pool=[]
+[runtime]
+provider='{runtime}'
+[container]
+timeout_ms=1800000
+[heartbeat]
+enabled=false
+interval_seconds=3600
+max_concurrent_runs=1
+cron=''
+[budget]
+monthly_limit_cents=5000
+warn_threshold_percent=80
+hard_stop=true
+[permissions]
+can_create_agents=false
+can_send_cross_agent=false
+can_modify_own_skills=false
+can_modify_own_soul=false
+can_schedule_tasks=false
+allowed_channels=['*']
+[goal_intent]
+enabled=false
+mode='off'
+[evolution]
+enabled=false
+"#
+            ),
+        )
+        .unwrap();
     }
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
         duduclaw_agent::AgentRegistry::new(home.path().join("agents")),
     ));
     registry.write().await.scan().await.unwrap();
+    {
+        let loaded = registry.read().await;
+        assert_eq!(loaded.list().len(), 2);
+        assert_eq!(
+            loaded.get("main").unwrap().config.agent.display_name,
+            "Wrong Main"
+        );
+        let worker = loaded.get("worker").unwrap();
+        assert_eq!(worker.config.agent.display_name, "Actual Worker");
+        assert_eq!(worker.config.model.preferred, "gpt-5.4");
+        assert_eq!(
+            worker.config.runtime.provider.as_deref(),
+            Some(provider.as_str())
+        );
+    }
     let sessions =
         std::sync::Arc::new(SessionManager::new(&home.path().join("sessions.db")).unwrap());
     let status = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));

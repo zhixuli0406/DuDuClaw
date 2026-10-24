@@ -201,8 +201,46 @@ async fn actual_postlicense_template_writer_persists_aligned_runtime_and_retains
         role_id:"owned-role".into(),kind:crate::premium_templates::RoleKind::Worker,
         name:"template".into(),display_name:"Template".into(),trigger:"@Template".into(),reports_to:String::new(),summary:"Owned fixture".into(),
         soul_md:"# Owned fixture".into(),contract_toml:String::new(),
-        agent_toml:"# retained\n[agent]\nname='template'\ndisplay_name='Template'\nrole='specialist'\n[model]\npreferred='gpt-5.4'\n[runtime]\nprovider='claude'\nfallback='openai_compat'\n".into(),extras_dir:None,
+        agent_toml: r#"# retained
+[agent]
+name='template'
+display_name='Template'
+role='specialist'
+status='active'
+trigger='@Template'
+reports_to=''
+icon='🤖'
+[model]
+preferred='gpt-5.4'
+fallback=''
+account_pool=[]
+[runtime]
+provider='claude'
+fallback='openai_compat'
+[container]
+timeout_ms=1800000
+[heartbeat]
+enabled=false
+interval_seconds=3600
+max_concurrent_runs=1
+cron=''
+[budget]
+monthly_limit_cents=5000
+warn_threshold_percent=80
+hard_stop=true
+[permissions]
+can_create_agents=false
+can_send_cross_agent=false
+can_modify_own_skills=false
+can_modify_own_soul=false
+can_schedule_tasks=false
+allowed_channels=['*']
+[evolution]
+enabled=false
+"#.into(),extras_dir:None,
     };
+    toml::from_str::<duduclaw_core::types::AgentConfig>(&assembled.agent_toml)
+        .expect("post-license fixture must be a complete agent configuration");
     let params = json!({"name":"template"});
     let admin = UserContext::admin_fallback();
     let mut employee = admin.clone();
@@ -223,6 +261,18 @@ async fn actual_postlicense_template_writer_persists_aligned_runtime_and_retains
         .create_assembled_template_agent(&params, &admin, assets.path(), "owned-role", &assembled)
         .await);
     assert_eq!(payload["runtime_provider_auto_aligned"], "codex");
+    {
+        let registry = h.registry.read().await;
+        let loaded = registry
+            .get("template")
+            .expect("written template must hot-load");
+        assert_eq!(loaded.config.model.preferred, "gpt-5.4");
+        assert_eq!(loaded.config.runtime.provider.as_deref(), Some("codex"));
+        assert_eq!(
+            loaded.config.runtime.fallback.as_deref(),
+            Some("openai_compat")
+        );
+    }
     assert_eq!(
         disk(home.path(), "template")["runtime"]["provider"].as_str(),
         Some("codex")
