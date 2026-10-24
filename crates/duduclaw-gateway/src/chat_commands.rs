@@ -842,13 +842,11 @@ async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str
             match new_model {
                 Some(name) => {
                     let name = name.trim();
-                    if name == current {
-                        return format!("🤖 已經在用 `{current}` 了，沒有變更。");
-                    }
                     if let Err(e) = validate_model_name(name) {
                         return format!("⚠️ {e}");
                     }
                     let target = name.to_string();
+                    let mut alignment = crate::runtime_config::ModelRuntimeAlignment::Unchanged;
                     match crate::channel_reply::update_agent_toml_edit(
                         &ctx.registry,
                         &resolved_id,
@@ -857,13 +855,14 @@ async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str
                             user_id: "channel",
                             guard: || Ok(()),
                         },
-                        move |table| {
+                        |table| {
                             let model = table
                                 .entry("model")
                                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                                 .as_table_mut()
                                 .ok_or("agent.toml [model] is not a table")?;
                             model.insert("preferred".into(), toml::Value::String(target));
+                            alignment = crate::runtime_config::align_model_runtime(table)?;
                             Ok(())
                         },
                     )
@@ -872,12 +871,25 @@ async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str
                         // The rescan is what makes the change take effect now;
                         // say so plainly when it did not land rather than
                         // reporting a success the next turn will contradict.
+                        Ok(true) if name == current && alignment.aligned_provider().is_none() => {
+                            if let Some(reason) = alignment.skipped_reason() {
+                                format!("⚠️ 模型未變；執行環境未自動調整（{reason}），請管理員檢查設定。")
+                            } else {
+                                format!("🤖 已經在用 `{current}` 了，沒有變更。")
+                            }
+                        }
+                        Ok(true) if name == current => {
+                            alignment.audit(&ctx.home_dir, &resolved_id, "chat.model", "channel");
+                            format!("✅ 模型未變，已修正執行環境；下一則訊息就會生效。")
+                        }
                         Ok(true) => {
+                            alignment.audit(&ctx.home_dir, &resolved_id, "chat.model", "channel");
                             format!("✅ 已切換模型：`{current}` → `{name}`，下一則訊息就會生效。")
                         }
-                        Ok(false) => format!(
-                            "⚠️ 已寫入設定（`{current}` → `{name}`），但熱重載失敗，要重啟 gateway 才會生效。"
-                        ),
+                        Ok(false) => {
+                            alignment.audit(&ctx.home_dir, &resolved_id, "chat.model", "channel");
+                            format!("⚠️ 已寫入模型／執行環境設定，但熱重載失敗，要重啟 gateway 才會生效。")
+                        },
                         Err(e) => format!("⚠️ 切換失敗：{e}"),
                     }
                 }
@@ -3294,3 +3306,7 @@ mod goal_status_privacy_tests {
         assert!(on_telegram.contains("機密報價"));
     }
 }
+
+#[cfg(test)]
+#[path = "chat_commands/runtime_alignment_tests.rs"]
+mod runtime_alignment_tests;

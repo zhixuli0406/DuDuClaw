@@ -447,6 +447,10 @@ pub fn infer_provider_for_model(model: &str) -> Option<RuntimeType> {
     }
     // The family's own CLI when it is installed; otherwise the API-mode
     // backend, which serves any model, so the aligned config is runnable.
+    #[cfg(test)]
+    if let Some(installed) = testing::availability(model) {
+        return Some(if installed { family } else { RuntimeType::OpenAiCompat });
+    }
     let installed = duduclaw_core::which_runtime(spec.id).is_some();
     #[cfg(test)]
     let installed = installed
@@ -1413,3 +1417,9 @@ mod tests {
         assert!(consulted.is_empty());
     }
 }
+
+#[path = "runtime_config/alignment.rs"]
+mod alignment;
+pub(crate) use alignment::{ModelRuntimeAlignment, align_model_runtime, ensure_model_provider};
+#[cfg(test)]
+pub(crate) use alignment::testing;

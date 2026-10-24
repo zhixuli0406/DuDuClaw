@@ -2,6 +2,18 @@
 
 > 一個平台，十二個 runtime id：十一個 CLI 後端（Claude、Codex、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode），加上以 HTTP 連接任何 OpenAI 相容端點的 `openai_compat`。
 
+## 執行失敗與明確備援
+
+`[runtime] fallback` 缺省或無效時，不會自動改試 Claude。只有明確設定的 runtime 備援會進入既有的健康、政策與相容模型檢查；帳號輪替、模型備援及已設定的本地推論仍保留。非 Claude 對話失敗不會再額外呼叫 Anthropic Direct API。
+
+錯誤訊息及診斷會區分原選後端、明確備援與未實際執行的原因。GPT／Codex 或 API 後端的認證錯誤不會要求登入 Claude；只有真正的 Claude CLI 認證失敗會開啟 Claude 警報，真正的 Claude CLI 成功才會清除。OpenAI 相容端點不一定是 OpenAI，請依實際設定檢查憑證。原先仰賴隱式 Claude 備援的設定，需要由管理員明確填入 `fallback`。
+
+## 模型與執行環境的一致性
+
+建立員工、套用編輯過的板模、儲存模型及管理員的 `/model` 指令，共用相同的模型家族校準規則。可確定模型屬於另一個執行環境時，儲存會一併修正 provider；保留明確的 API 相容後端、備援與未知的自訂模型。推定變更仍受原本的管理員權限與產品政策限制。同值 `/model` 也可修正舊的錯配，回覆會區分修正成功與熱重載失敗。
+
+未經儲存的舊設定若有確定的模型／provider 錯配，請管理員儲存修正後再重試。讀取與路由不會偷偷改設定檔，也不會把這種設定問題當成 Claude 未登入。未知模型不會僅憑名稱片段被改派。
+
 ---
 
 ## 比喻：多語辦公室

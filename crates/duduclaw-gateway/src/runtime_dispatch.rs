@@ -5,8 +5,9 @@
 //! Claude CLI. It resolves the agent's `[runtime] provider`, selects the matching
 //! `AgentRuntime` from a process-wide `RuntimeRegistry` (auto-detected once at
 //! first use), and executes — falling back to the configured fallback provider,
-//! then to Claude, when the primary runtime is unavailable.
+//! with no extra runtime hop when fallback is absent.
 
+use crate::failover::{RuntimeDispatchFailure,RuntimePreflightKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -118,7 +119,8 @@ pub struct AgentPrompt<'a> {
 
 /// Execute a prompt through the agent's configured runtime provider.
 ///
-/// Selection order: `provider_override` → `[runtime] provider` → `[runtime] fallback` → Claude.
+/// Primary: `provider_override` → `[runtime] provider` (default Claude).
+/// Runtime fallback is attempted only when explicitly configured.
 // OTel GenAI semconv (Development): `chat` span for one model call through
 // the multi-runtime choke-point. Attribute names centralized in `crate::otel`.
 // Provider / effective model / usage are known only after failover resolution,
@@ -136,13 +138,18 @@ pub struct AgentPrompt<'a> {
         gen_ai.usage.output_tokens = tracing::field::Empty,
     )
 )]
-pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
+pub async fn run_agent_prompt_detailed(req: AgentPrompt<'_>) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
     crate::on_behalf_of::context::scope(req.home_dir, req.agent_id, run_agent_prompt_inner(req)).await
 }
 
-async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
+/// Backward-compatible String view; execution/usage happens only in detailed.
+pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
+    run_agent_prompt_detailed(req).await.map_err(|error|error.legacy_message())
+}
+
+async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
     if let Some(dir) = req.agent_dir {
-        crate::runtime_config::ensure_active_agent_provider(dir)?;
+        crate::runtime_config::ensure_active_agent_provider(dir).map_err(|error|RuntimeDispatchFailure::preflight(req.provider_override,req.model,RuntimePreflightKind::Config,error))?;
     }
     // Knowledge-base tool calls made during this call learn who the turn is
     // for from the gateway's own record (every runtime, not just Claude).
@@ -165,11 +172,9 @@ async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse,
         }
     };
     let provider = req.provider_override.unwrap_or(settings.provider);
-    crate::product_policy::require_runtime(req.home_dir, provider.as_str())?;
-    let fallback = settings
-        .fallback
-        // Always fall back to Claude (the always-available core) if nothing set.
-        .or(Some(RuntimeType::Claude));
+    crate::runtime_config::ensure_model_provider(req.model, provider).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Config,error))?;
+    crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Policy,error))?;
+    let fallback = settings.fallback;
 
     // Budget circuit breaker (cost *enforcement*, not just observation). Blocks
     // a new LLM call when the agent's rolling spend has hit its hard cap. Inert
@@ -178,7 +183,7 @@ async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse,
     // hiccups). Utility calls (empty agent_id) are exempt.
     let budget = crate::budget::check_agent_budget(req.home_dir, req.agent_dir, req.agent_id).await;
     if budget.is_denied() {
-        return Err(budget.user_message());
+        return Err(RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Budget,budget.user_message()));
     }
 
     let reg = registry(req.home_dir).await;
@@ -230,14 +235,14 @@ async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse,
 
     // RFC-25 R1: route through the FailoverManager so provider health is tracked
     // (3 consecutive failures → cooldown) and a failing primary auto-falls back to
-    // the configured fallback (defaulting to the always-available Claude core)
+    // the explicitly configured fallback (None means no extra runtime hop)
     // instead of the old one-shot `select().execute()` with no health memory.
     // Set by a producer that had to estimate this call's usage.
     let usage_estimated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let resp = crate::cost_telemetry::USAGE_ESTIMATED
         .scope(
             usage_estimated.clone(),
-            failover(req.home_dir).execute_with_failover(
+            failover(req.home_dir).execute_with_failover_detailed(
                 reg,
                 &provider,
                 fallback.as_ref(),
@@ -1148,5 +1153,29 @@ mod hint_tests {
             .await;
         assert_eq!(seen, Some(schema));
         assert!(output_schema_override().is_none());
+    }
+}
+
+/// Owned registry injection only for future isolated source-declared tests.
+/// No host CLI detection is performed when this owned-home entry is present.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    pub(crate) struct RegistryGuard { home:PathBuf, registry:&'static RuntimeRegistry }
+    impl RegistryGuard {
+        pub(crate) async fn install(home:&Path,registry:RuntimeRegistry)->Self {
+            assert!(home.is_dir());
+            let registry:&'static RuntimeRegistry=Box::leak(Box::new(registry));
+            let mut map=REGISTRIES.get_or_init(||Mutex::new(HashMap::new())).lock().await;
+            assert!(map.insert(home.to_owned(),registry).is_none());
+            Self{home:home.to_owned(),registry}
+        }
+    }
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            let mut map=REGISTRIES.get().unwrap().try_lock().expect("owned registry still in use");
+            assert!(map.get(&self.home).is_some_and(|actual|std::ptr::eq(*actual,self.registry)));
+            map.remove(&self.home);
+        }
     }
 }

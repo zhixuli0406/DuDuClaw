@@ -251,3 +251,8 @@ use prompt_build::*;
 
 #[cfg(test)]
 mod tests;
+
+mod reply_origin;
+use reply_origin::{ReplyAttempt,ReplyFailure,ReplyOrigin,direct_api_allowed};
+#[cfg(test)]
+mod origin_tests;

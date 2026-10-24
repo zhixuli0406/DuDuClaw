@@ -9,7 +9,7 @@ impl MethodHandler {
     /// CONTRACT.toml / agent.toml must still parse (fail-closed: an invalid
     /// document is rejected, nothing is written). `[agent].name` is always
     /// forced to the final agent name so the directory and config agree.
-    pub(crate) async fn handle_templates_create_agent(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_templates_create_agent(&self, params: Value, caller: &UserContext) -> WsFrame {
         use crate::premium_templates as pt;
         let role_id = params.get("role_id").and_then(|v| v.as_str()).unwrap_or("");
         if role_id.is_empty() {
@@ -33,6 +33,20 @@ impl MethodHandler {
             }
         };
 
+        self.create_assembled_template_agent(&params, caller, &premium_dir, role_id, &assembled).await
+    }
+
+    /// The real post-license writer. Kept owner-private so owned fixtures can
+    /// test the commit without faking a global license or reading host assets.
+    pub(super) async fn create_assembled_template_agent(
+        &self, params: &Value, caller: &UserContext, premium_dir: &Path,
+        role_id: &str, assembled: &crate::premium_templates::AssembledRole,
+    ) -> WsFrame {
+        use crate::premium_templates as pt;
+        if !caller.is_admin() { return WsFrame::error_response("", "Administrator required"); }
+        if let Err(error) = self.validate_template_policy(assembled) {
+            return WsFrame::error_response("", &error);
+        }
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
@@ -131,6 +145,10 @@ impl MethodHandler {
             Err(e) => {
                 return WsFrame::error_response("", &format!("agent.toml 格式錯誤，未寫入：{e}"));
             }
+        };
+        let (agent_toml, alignment) = match prepare_template_runtime(&self.home_dir, &agent_toml) {
+            Ok(value) => value,
+            Err(error) => return WsFrame::error_response("", &error),
         };
         let parsed_agent: toml::Table = match agent_toml.parse() {
             Ok(t) => t,
@@ -251,6 +269,8 @@ impl MethodHandler {
         }
 
         // Same protections as agents.create: file-guard hook + registry rescan.
+        alignment.audit(&self.home_dir, &name, "templates.create_agent", &caller.user_id);
+
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
         if let Err(e) =
             crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
@@ -291,6 +311,8 @@ impl MethodHandler {
             "",
             json!({
                 "success": true,
+                "runtime_provider_auto_aligned": alignment.aligned_provider().map(|p|p.as_str().to_owned()),
+                "runtime_provider_align_skipped": alignment.skipped_reason(),
                 "warning": extras_warning,
                 "agent": {
                     "name": name,
@@ -301,4 +323,14 @@ impl MethodHandler {
             }),
         )
     }
+}
+
+/// Same final-document preparation used by the licensed template writer.
+pub(super) fn prepare_template_runtime(home: &Path, original: &str) -> Result<(String,crate::runtime_config::ModelRuntimeAlignment),String> {
+    let mut table:toml::Table=original.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
+    let alignment=crate::runtime_config::align_model_runtime(&mut table)?;
+    let rendered=super::config_commit::render_preserving(original,&table)?;
+    let final_table:toml::Table=rendered.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
+    crate::product_policy::load(home).and_then(|policy|crate::product_policy::validate_table(policy,&final_table))?;
+    Ok((rendered,alignment))
 }

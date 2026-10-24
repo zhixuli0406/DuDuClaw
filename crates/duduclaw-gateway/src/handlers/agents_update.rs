@@ -979,74 +979,16 @@ impl MethodHandler {
                 }
             }
 
-            // ── Auto-align [runtime] provider to [model] preferred ──
-            // Live incident (2026-07-28): model grok-4.5 saved with the
-            // default provider "claude" routed into the Claude CLI and died
-            // with model_not_found — the warning log existed but nothing
-            // stopped the broken save. On the FINAL table state, a confident
-            // family mismatch rewrites the provider to the runtime that can
-            // actually serve the model (family CLI if installed, else
-            // openai_compat). `openai_compat` always passes the match check,
-            // so API-mode setups are never touched.
-            {
-                let preferred = table
-                    .get("model")
-                    .and_then(|m| m.get("preferred"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                if let Some(model) = preferred {
-                    // An unparseable stored provider means we cannot tell
-                    // whether the model matches it, so the auto-align is
-                    // SKIPPED rather than run against a guessed default —
-                    // rewriting `[runtime] provider` on a guess is exactly the
-                    // kind of silent config damage `RuntimeType::parse` now
-                    // refuses to enable. `load_runtime_settings` already logs
-                    // the bad value on every read of this agent.
-                    let provider = table
-                        .get("runtime")
-                        .and_then(|r| r.get("provider"))
-                        .and_then(|v| v.as_str())
-                        .map(duduclaw_core::types::RuntimeType::parse)
-                        .unwrap_or(Some(duduclaw_core::types::RuntimeType::default()));
-                    if let Some(provider) = provider
-                        && !crate::runtime_config::model_matches_provider(&model, provider)
-                    {
-                        let inferred = crate::runtime_config::infer_provider_for_model(&model);
-                        let (inferred, skipped) = auto_align_target(inferred, &model);
-                        if let Some(reason) = skipped {
-                            // Reported through the response field only: a
-                            // skip is not a change, so it must not satisfy
-                            // the "No valid fields to update" guard below.
-                            tracing::info!(
-                                model = %model,
-                                reason,
-                                "runtime.provider not auto-aligned: inferred runtime cannot safely use this model spelling"
-                            );
-                            if let Ok(mut slot) = align_skipped_for_closure.lock() {
-                                *slot = Some(reason);
-                            }
-                        }
-                        if let Some(aligned) = inferred
-                        {
-                            let rt_section = table
-                                .entry("runtime")
-                                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-                                .as_table_mut()
-                                .ok_or("Invalid [runtime] section")?;
-                            rt_section.insert(
-                                "provider".into(),
-                                toml::Value::String(aligned.as_str().into()),
-                            );
-                            changes.push(format!(
-                                "runtime.provider auto-aligned \"{}\" → \"{}\" (model \"{model}\")",
-                                provider.as_str(),
-                                aligned.as_str()
-                            ));
-                            if let Ok(mut slot) = aligned_for_closure.lock() {
-                                *slot = Some(aligned.as_str().to_string());
-                            }
-                        }
-                    }
+            // Canonical final-table alignment remains inside the same
+            // authority diff/product-policy/atomic writer boundary.
+            let alignment = crate::runtime_config::align_model_runtime(table)?;
+            if let Some(reason) = alignment.skipped_reason() {
+                if let Ok(mut slot) = align_skipped_for_closure.lock() { *slot = Some(reason); }
+            }
+            if let Some(description) = alignment.description() {
+                changes.push(description);
+                if let Ok(mut slot) = aligned_for_closure.lock() {
+                    *slot = alignment.aligned_provider().map(|p|p.as_str().to_owned());
                 }
             }
 
@@ -1305,26 +1247,5 @@ impl MethodHandler {
         .await
         .map_err(|e| e.message())?;
         Ok(!outcome.unchanged)
-    }
-}
-
-/// Auto-align only when the inferred runtime accepts the model spelling.
-/// Antigravity's `--model` takes display names, so a `gemini-*` model id must
-/// never silently switch a Claude agent to Antigravity.
-pub(crate) fn auto_align_target(
-    inferred: Option<duduclaw_core::types::RuntimeType>,
-    model: &str,
-) -> (
-    Option<duduclaw_core::types::RuntimeType>,
-    Option<&'static str>,
-) {
-    match inferred {
-        Some(duduclaw_core::types::RuntimeType::Antigravity)
-            if model.to_ascii_lowercase().starts_with("gemini-") =>
-        {
-            (None, Some("model_id_requires_display_name"))
-        }
-        Some(rt) if rt.is_deprecated() => (None, Some("deprecated_runtime")),
-        other => (other, None),
     }
 }
