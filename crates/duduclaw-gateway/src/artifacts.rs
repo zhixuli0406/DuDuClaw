@@ -155,6 +155,8 @@ pub struct ArtifactEvidenceRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRecord {
     /// RFC3339 UTC — when the file landed in `attachments/`.
+    /// Host-stamped signed-in WebChat owner; never inferred from file text.
+    pub owner_user_id: Option<String>,
     pub produced_at: String,
     /// Owning agent, or empty for the shared (`<home>/attachments/`) bucket.
     pub agent_id: String,
@@ -177,6 +179,7 @@ pub struct ArtifactRecord {
 impl ArtifactRecord {
     fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
+        if let Some(owner)=&self.owner_user_id { map.insert("owner_user_id".into(),owner.clone().into()); }
         map.insert("produced_at".into(), self.produced_at.clone().into());
         map.insert("agent_id".into(), self.agent_id.clone().into());
         map.insert("archived_name".into(), self.archived_name.clone().into());
@@ -207,6 +210,7 @@ impl ArtifactRecord {
     fn from_line(line: &str) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
         Some(ArtifactRecord {
+            owner_user_id: v.get("owner_user_id").and_then(|v|v.as_str()).filter(|s|!s.trim().is_empty()).map(str::to_owned),
             evidence: v.get("evidence").cloned().and_then(|e| serde_json::from_value(e).ok()),
             produced_at: v.get("produced_at").and_then(|x| x.as_str())?.to_string(),
             agent_id: v
@@ -420,7 +424,12 @@ pub fn record_saved(
         return;
     };
     let (home, agent_id) = derive_home_and_agent(base_dir);
+    let owner_user_id = if ctx.channel==Some("webchat") {
+        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone).ok()
+            .filter(|u|!u.trim().is_empty() && !crate::webchat::is_widget_visitor(u))
+    } else {None};
     let rec = ArtifactRecord {
+        owner_user_id,
         evidence: None,
         produced_at: chrono::Utc::now().to_rfc3339(),
         agent_id,
@@ -451,6 +460,7 @@ pub fn record_review_reference(
         return;
     };
     let record = ArtifactRecord {
+        owner_user_id:None,
         produced_at: row.produced_at.clone(),
         agent_id: row.agent_id.clone(),
         archived_name: name.clone(),
@@ -599,6 +609,10 @@ pub fn find_delivered(home_dir: &Path, agent: &str, archived_name: &str) -> Opti
 /// Provenance for one archived file, as `/api/files` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileProvenance {
+    /// A real save recorded a source and task. Basename-only backfill has
+    /// no source and is attribution evidence, never a positive read grant.
+    pub saved_task_archive: bool,
+    pub owner_user_id: Option<String>,
     pub origin: ArtifactOrigin,
     pub task_id: Option<String>,
     pub round: Option<u32>,
@@ -619,6 +633,8 @@ pub fn provenance_index(home_dir: &Path, agent: Option<&str>) -> BTreeMap<String
         out.insert(
             rec.archived_name.clone(),
             FileProvenance {
+                saved_task_archive:rec.task_id.is_some() && rec.source_path.is_some() && rec.origin.is_outbound(),
+                owner_user_id:rec.owner_user_id,
                 origin: rec.origin,
                 task_id: rec.task_id,
                 round: rec.round,
@@ -993,6 +1009,7 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
                 Some((task_id, round)) => {
                     report.attributed += 1;
                     ArtifactRecord {
+                        owner_user_id:None,
                         evidence: None,
                         produced_at,
                         agent_id: agent_id.clone(),
@@ -1009,6 +1026,7 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
                 None => {
                     report.unknown += 1;
                     ArtifactRecord {
+                        owner_user_id:None,
                         evidence: None,
                         produced_at,
                         agent_id: agent_id.clone(),
@@ -2217,5 +2235,27 @@ mod tests {
             archive_goal_task_artifacts(home, "task-1", "").await,
             GoalArchiveReport::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_history_owner_tests {
+    use super::*;
+    #[tokio::test]
+    async fn only_host_webchat_principal_stamps_an_attachment_owner() {
+        let home=tempfile::tempdir().unwrap();let base=home.path().join("agents/sales");std::fs::create_dir_all(base.join("attachments")).unwrap();
+        let path=base.join("attachments/1_report.txt");std::fs::write(&path,b"test").unwrap();
+        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope("alice".into(),async {
+            record_saved(&base,&path,"report.txt",4,&SaveContext::uploaded(Some("webchat")));
+        }).await;
+        let rows=read_ledger(home.path());assert_eq!(rows.last().unwrap().owner_user_id.as_deref(),Some("alice"));
+        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope("alice".into(),async {
+            record_saved(&base,&path,"report.txt",4,&SaveContext::uploaded(Some("line")));
+        }).await;
+        assert_eq!(read_ledger(home.path()).last().unwrap().owner_user_id,None);
+        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope("widget-visitor:visitor".into(),async {
+            record_saved(&base,&path,"report.txt",4,&SaveContext::uploaded(Some("webchat")));
+        }).await;
+        assert_eq!(read_ledger(home.path()).last().unwrap().owner_user_id,None);
     }
 }

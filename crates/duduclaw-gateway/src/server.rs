@@ -14323,7 +14323,11 @@ async fn handle_files_list(
         until_ms: q.until,
     };
     let files = crate::files_api::filter_files(files, &filter);
-    Json(serde_json::json!({ "files": files })).into_response()
+    let mut visible = Vec::new();
+    for file in files {
+        if authorize_review_artifact(&state, &ctx, agent, &file.name).await.is_ok() { visible.push(file); }
+    }
+    Json(serde_json::json!({ "files": visible })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -14398,6 +14402,7 @@ async fn handle_files_download(
         }
     };
 
+    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await { return resp; }
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
     let ct = crate::files_api::content_type_for(&q.name);
@@ -14591,6 +14596,7 @@ async fn handle_files_preview(
         }
     }
 
+    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await { return resp; }
     stream_preview_pdf(&cached, &format!("{stem}.pdf"), "application/pdf").await
 }
 

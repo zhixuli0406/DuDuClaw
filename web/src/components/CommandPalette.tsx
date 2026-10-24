@@ -120,7 +120,12 @@ function jumpToSearchHit(hit: SearchHit, query: string, navigate: (to: string) =
         .getState()
         .fetch()
         .then(() => {
-          const session = useConversationsStore.getState().sessions.find((s) => s.session_id === sessionId);
+          const recent = useConversationsStore.getState().sessions.find((s) => s.session_id === sessionId);
+          // Search may reach older authorized sessions outside the recent
+          // picker cap. The history RPC still rechecks the routing name,
+          // caller, origin and read-only mode before displaying anything.
+          const targetAgent=str(hit.agent_id);
+          const session=recent ?? (targetAgent ? {session_id:sessionId,agent_id:targetAgent,title:'',last_active:hit.timestamp||new Date().toISOString(),turns:0,tokens:0,channel:str(jump.channel),read_only:jump.read_only===true} : undefined);
           if (!session) {
             navigate('/conversations');
             return;
@@ -253,7 +258,9 @@ export function CommandPalette() {
   // I-5: cross-source content search — `search.query` results, appended after
   // the local nav/entity matches (see the `results` memo below). Kept
   // separate from `results` itself because it resolves asynchronously.
-  const [contentHits, setContentHits] = useState<readonly SearchHit[]>([]);
+  const contentKey=JSON.stringify([user?.id,user?.role,user?.status,bindings.map(b=>[b.agent_name,b.access_level]).sort(),dataScope,searchAgentId,query,open]);
+  const [contentState,setContentState]=useState<{key:string;hits:readonly SearchHit[]} | null>(null);
+  const contentHits=contentState?.key===contentKey?contentState.hits:[];
   const [contentSearching, setContentSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -277,7 +284,7 @@ export function CommandPalette() {
     if (open) {
       setQuery('');
       setActiveIndex(0);
-      setContentHits([]);
+      setContentState(null);
       setContentSearching(false);
       // Focus after paint so the dialog is mounted.
       requestAnimationFrame(() => inputRef.current?.focus());
@@ -291,12 +298,12 @@ export function CommandPalette() {
   useEffect(() => {
     const trimmed = query.trim();
     if (!open || trimmed.length < CONTENT_SEARCH_MIN_CHARS) {
-      setContentHits([]);
+      setContentState(null);
       setContentSearching(false);
       return;
     }
     if (dataScope !== 'all' && !searchAgentId) {
-      setContentHits([]);
+      setContentState(null);
       setContentSearching(false);
       return;
     }
@@ -310,10 +317,10 @@ export function CommandPalette() {
           limit: CONTENT_SEARCH_LIMIT,
         })
         .then((res) => {
-          if (!cancelled) setContentHits(res?.hits ?? []);
+          if (!cancelled) setContentState({key:contentKey,hits:res?.hits??[]});
         })
         .catch(() => {
-          if (!cancelled) setContentHits([]);
+          if (!cancelled) setContentState(null);
         })
         .finally(() => {
           if (!cancelled) setContentSearching(false);
@@ -323,7 +330,7 @@ export function CommandPalette() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [open, query, dataScope, searchAgentId]);
+  }, [open, query, dataScope, searchAgentId,contentKey]);
 
   const isPersonal = status?.edition_profile === 'personal';
 
@@ -685,6 +692,7 @@ export function CommandPalette() {
           </kbd>
         </div>
 
+        {contentHits.some(hit=>hit.source==='conversation'&&hit.jump?.read_only===true&&hit.jump?.ner!==true) && <p role="status" className="mx-4 mt-2 rounded-lg bg-amber-500/10 p-3 text-xs">{t('boundHistory.regexOnly')}</p>}
         {/* Results */}
         <div
           ref={listRef}
