@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
@@ -12,6 +12,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useChatStore } from '@/stores/chat-store';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useConversationsStore } from '@/stores/conversations-store';
 
 /** `n` webchat sessions, newest first, alternating between two employees. */
 function fakeSessions(n: number) {
@@ -209,4 +210,100 @@ describe('ConversationsPage — state as URL (P11)', () => {
     await user.type(screen.getByRole('textbox'), '對話');
     await waitFor(() => expect(screen.getByTestId('search-probe')).not.toHaveTextContent('page='));
   });
+});
+
+
+describe('ConversationsPage — bound-history identity isolation', () => {
+  const privateRow = {
+    session_id: 'whatsapp:+886912345678', agent_id: 'sales',
+    title: 'OWNER PRIVATE CUSTOMER TITLE', last_active: '2026-10-24T00:00:00Z',
+    turns: 2, tokens: 0, channel: 'whatsapp',
+  };
+  const safeRows = [
+    { ...privateRow, session_id: 'webchat:mine', title: 'MY OWN FULL TITLE', channel: 'webchat' },
+    { ...privateRow, session_id: `view:v1:s:${'a'.repeat(64)}`, title: 'External conversation', read_only: true },
+  ];
+  function owner() {
+    useAuthStore.setState({
+      user: { id: 'same-user', display_name: 'Employee', role: 'employee', status: 'active' } as never,
+      bindings: [{ user_id: 'same-user', agent_name: 'sales', access_level: 'owner', bound_at: '' }],
+    });
+    useChatStore.setState({ selectedAgentId: 'sales' });
+  }
+  function operator() {
+    useAuthStore.setState({ bindings: [{ user_id: 'same-user', agent_name: 'sales', access_level: 'operator', bound_at: '' }] });
+  }
+
+  it('immediately hides an Owner list after a same-role binding downgrade and accepts the new scoped list', async () => {
+    owner();
+    let resolveScoped!: (value: unknown) => void;
+    vi.spyOn(api.chatSessions, 'list')
+      .mockResolvedValueOnce({ sessions: [privateRow] } as never)
+      .mockImplementationOnce(() => new Promise(resolve => { resolveScoped = resolve; }) as never);
+    renderWithProviders(<ConversationsPage />);
+    await screen.findByText(privateRow.title);
+    act(operator);
+    expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
+    await waitFor(() => expect(resolveScoped).toBeTypeOf('function'));
+    await act(async () => { resolveScoped({ sessions: safeRows }); });
+    expect(await screen.findByText('MY OWN FULL TITLE')).toBeInTheDocument();
+    expect(screen.getByText(en['boundHistory.label'])).toBeInTheDocument();
+    expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
+  });
+
+  it('cannot land a delayed Owner response after the same user becomes an Operator', async () => {
+    owner();
+    let resolveOwner!: (value: unknown) => void;
+    vi.spyOn(api.chatSessions, 'list')
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOwner = resolve; }) as never)
+      .mockResolvedValueOnce({ sessions: safeRows } as never);
+    renderWithProviders(<ConversationsPage />);
+    await waitFor(() => expect(resolveOwner).toBeTypeOf('function'));
+    act(operator);
+    await screen.findByText('MY OWN FULL TITLE');
+    await act(async () => { resolveOwner({ sessions: [privateRow] }); });
+    expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
+    expect(screen.getByText('MY OWN FULL TITLE')).toBeInTheDocument();
+  });
+
+  it('erases cached rows while revalidating on focus and keeps them erased on refusal', async () => {
+    owner();
+    let refuse!: (error: unknown) => void;
+    vi.spyOn(api.chatSessions, 'list')
+      .mockResolvedValueOnce({ sessions: [privateRow] } as never)
+      .mockImplementationOnce(() => new Promise((_, reject) => { refuse = reject; }) as never);
+    renderWithProviders(<ConversationsPage />);
+    await screen.findByText(privateRow.title);
+    act(() => { window.dispatchEvent(new Event('focus')); });
+    expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
+    await waitFor(() => expect(refuse).toBeTypeOf('function'));
+    await act(async () => { refuse(new Error('permission denied')); });
+    expect(await screen.findByText(en['webchat.history.error'])).toBeInTheDocument();
+    expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
+  });
+});
+
+
+it('opens exactly once for a title click, Enter, Space and a parent-row click', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: fakeSessions(1) } as never);
+  const originalResume = useConversationsStore.getState().resume;
+  const resume = vi.fn().mockResolvedValue(true);
+  useConversationsStore.setState({ resume });
+  try {
+    renderWithProviders(<ConversationsPage />);
+    const title = await screen.findByRole('button', { name: /^對話 1$/ });
+    await user.click(title);
+    expect(resume).toHaveBeenCalledTimes(1);
+    await user.keyboard('[Enter]');
+    expect(resume).toHaveBeenCalledTimes(2);
+    await user.keyboard(' ');
+    expect(resume).toHaveBeenCalledTimes(3);
+    const row = title.closest('[role="row"]');
+    expect(row).not.toBeNull();
+    await user.click(row!);
+    expect(resume).toHaveBeenCalledTimes(4);
+  } finally {
+    act(() => { useConversationsStore.setState({ resume: originalResume }); });
+  }
 });

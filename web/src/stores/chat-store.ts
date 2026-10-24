@@ -276,6 +276,8 @@ interface ChatStore {
    * matches it).
    */
   resumeSession: (sessionId: string, messages: readonly ChatMessage[]) => void;
+  /** Detach displayed history without sending a reset/archive to that id. */
+  discardHistory: (identityChanged?: boolean) => void;
   /** Attach knowledge citations (by stored row id) to the resumed session's
    *  assistant messages. No-op when the active session changed meanwhile. */
   applyHistoryCitations: (sessionId: string, rows: readonly SessionCitationRow[]) => void;
@@ -451,6 +453,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     wsRef = socket;
 
     socket.onopen = () => {
+      if (wsRef !== socket) return;
       reconnectAttempt = 0;
       // C5: the server now requires the first frame to authenticate the
       // connection with the current access token before any message is accepted.
@@ -467,6 +470,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     };
 
     socket.onmessage = (event) => {
+      if (wsRef !== socket) return;
       try {
         const data = JSON.parse(event.data);
         // A finished reply — for ANY conversation, even one whose frames are
@@ -726,12 +730,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
     };
 
     socket.onclose = () => {
+      if (wsRef !== socket) return;
       if (wsRef === socket) wsRef = null;
       set({ connectionState: 'disconnected' });
       scheduleReconnect(connect);
     };
 
     socket.onerror = () => {
+      if (wsRef !== socket) return;
       // onclose will fire after this — reconnect is handled there
     };
   }
@@ -804,6 +810,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
           ? { messages: attachHistoryCitations(state.messages, rows) }
           : {},
       );
+    },
+
+    discardHistory: (identityChanged = false) => {
+      clearVisemeIdle();
+      set(state => ({
+        messages: [], steps: [], stepTree: [], thinking: null, isStreaming: false,
+        phase: 'idle', viseme: REST_VISEME, resumedExplicitly: false, convId: nextConvId(),
+        sessionId: identityChanged ? null : state.ownSessionId,
+        ...(identityChanged ? { ownSessionId: null, selectedAgentId: null } : {}),
+      }));
     },
 
     resumeSession: (sessionId: string, messages: readonly ChatMessage[]) => {

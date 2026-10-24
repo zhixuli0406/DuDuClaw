@@ -5678,6 +5678,10 @@ export type GoogleCredentialsInput =
 /** One past WebChat session, as returned by `chat.sessions.list`
  *  (newest first, archived excluded). */
 export interface ChatSessionSummary {
+  /** Explicit source label for opaque, privacy-filtered session ids. */
+  channel?: string;
+  read_only?: boolean;
+  title_masked?: boolean;
   session_id: string;
   agent_id: string;
   /** Auto-generated title following the discussion (background titler);
@@ -5692,6 +5696,9 @@ export interface ChatSessionSummary {
 }
 
 export interface ChatSessionMessage {
+  sender_label?: string;
+  parts?: TeamHistoryPart[];
+  artifact?: unknown;
   role: string;
   content: string;
   /** RFC3339 timestamp. */
@@ -5702,6 +5709,10 @@ export interface ChatSessionMessage {
 }
 
 export interface ChatSessionHistory {
+  read_only?: boolean;
+  privacy_mode?: 'own' | 'masked';
+  channel?: string;
+  ner?: boolean;
   session_id: string;
   agent_id: string;
   messages: ChatSessionMessage[];

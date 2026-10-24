@@ -121,9 +121,9 @@ export function ConversationsZone({
             )
           ) : (
             shown.map((s) => {
-              const channel = sessionChannel(s.session_id);
+              const channel = sessionChannel(s.session_id, s.channel);
               const title =
-                s.title || intl.formatMessage({ id: 'webchat.history.untitled', defaultMessage: '(Untitled)' });
+                (s.read_only ? intl.formatMessage({id:'boundHistory.label'}) : s.title) || intl.formatMessage({ id: 'webchat.history.untitled', defaultMessage: '(Untitled)' });
               return (
                 <SidebarMenuItem key={s.session_id}>
                   <button
