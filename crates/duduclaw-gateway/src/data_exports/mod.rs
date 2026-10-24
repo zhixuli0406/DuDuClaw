@@ -3,6 +3,7 @@
 mod lifecycle;
 mod limits;
 mod source;
+mod conversation_privacy;
 pub use lifecycle::{initialize, sweep};
 use lifecycle::{job_dir, private_directory, private_file};
 pub use limits::DownloadPermit;

@@ -1,3 +1,4 @@
+import { ReadOnlyHistoryView } from '@/components/chat/ReadOnlyHistoryView';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -54,6 +55,19 @@ import { api, type CallableAgent } from '@/lib/api';
 import { ManagerReadNotice } from '@/components/chat/ManagerReadNotice';
 
 export function WebChatPage() {
+  const viewOnly = useConversationsStore(s => s.viewOnly);
+  useEffect(() => {
+    const refresh = () => {
+      void useConversationsStore.getState().fetch();
+      if (useConversationsStore.getState().viewOnly || useChatStore.getState().resumedExplicitly) void useConversationsStore.getState().refreshView();
+    };
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
+  }, []);
+  return viewOnly ? <ReadOnlyHistoryView /> : <InteractiveWebChatPage />;
+}
+
+function InteractiveWebChatPage() {
   const intl = useIntl();
   const {
     messages,

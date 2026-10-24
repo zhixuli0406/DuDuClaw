@@ -498,6 +498,7 @@ pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
     if let Some(people)=table.get("people") {
         let people=people.as_table().ok_or("[people] must be a table")?;
         if people.get("manager_team_history").is_some_and(|v|!v.is_bool()) {return Err("people.manager_team_history must be a boolean".into());}
+        if people.get("bound_history_privacy").is_some_and(|v|!v.is_bool()) {return Err("people.bound_history_privacy must be a boolean".into());}
     }
     crate::task_sandbox::settings::parse(table).map_err(|e| format!("[container.sandbox]: {e}"))?;
     if table.contains_key("computer_use") {
@@ -618,6 +619,7 @@ pub(crate) fn validate_raw(file: &RawFile, text: &str) -> Result<toml::Table, St
 const RAW_REFUSED_KEYS: &[&str] = &["dispatch.judge_command", "evolution.eval_binary"];
 const RAW_CONFIG_SENSITIVE_KEYS: &[&str] = &[
     "people.manager_team_history",
+    "people.bound_history_privacy",
     "container.sandbox.when_unavailable",
     "container.sandbox.script_when_unavailable",
     "tick.allow_command_sources",
@@ -1140,6 +1142,18 @@ impl MethodHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_history_transition_key_is_boolean_and_security_audited() {
+        for value in ["true","false"] {
+            let table=format!("[people]\nbound_history_privacy={value}").parse::<toml::Table>().unwrap();
+            assert!(validate_config_table(&table).is_ok());
+        }
+        let bad="[people]\nbound_history_privacy='false'".parse::<toml::Table>().unwrap();
+        assert!(validate_config_table(&bad).is_err());
+        assert!(RAW_CONFIG_SENSITIVE_KEYS.contains(&"people.bound_history_privacy"));
+    }
+
 
     const SAMPLE: &str = r#"# operator comment
 [gateway]

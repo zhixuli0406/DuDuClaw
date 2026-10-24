@@ -12,6 +12,8 @@
  */
 const CHANNEL_LABELS: Record<string, string> = {
   webchat: 'Web',
+  widget: 'Website visitor',
+  odoolivechat: 'Odoo Live Chat',
   telegram: 'Telegram',
   discord: 'Discord',
   line: 'LINE',
@@ -32,7 +34,11 @@ export interface SessionChannel {
 }
 
 /** Resolve the originating channel of a session id; null when unknown. */
-export function sessionChannel(sessionId: string): SessionChannel | null {
+export function sessionChannel(sessionId: string, explicitChannel?: string): SessionChannel | null {
+  if (explicitChannel !== undefined) {
+    const label=CHANNEL_LABELS[explicitChannel];
+    return label ? {key:explicitChannel,label} : null;
+  }
   const sep = sessionId.indexOf(':');
   if (sep <= 0) return null;
   const key = sessionId.slice(0, sep).toLowerCase();
@@ -52,6 +58,6 @@ export function channelLabel(key: string): string {
 }
 
 /** True when the session is a user conversation on a known channel. */
-export function isConversationSession(sessionId: string): boolean {
-  return sessionChannel(sessionId) !== null;
+export function isConversationSession(sessionId: string, explicitChannel?: string): boolean {
+  return sessionChannel(sessionId, explicitChannel) !== null;
 }
