@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
 };
 use serde_json::Value;
@@ -21,6 +21,9 @@ pub(crate) struct CapturedRequest {
     pub path: String,
     pub authorization: Option<String>,
     pub body: Value,
+    pub method: String,
+    pub content_type: Option<String>,
+    pub raw_body: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -133,6 +136,7 @@ impl Drop for TestChannelProvider {
 async fn capture(
     State(state): State<FixtureState>,
     uri: Uri,
+    method: Method,
     headers: HeaderMap,
     bytes: Bytes,
 ) -> impl IntoResponse {
@@ -143,6 +147,9 @@ async fn capture(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        method: method.as_str().to_owned(),
+        content_type: headers.get("content-type").and_then(|v| v.to_str().ok()).map(str::to_owned),
+        raw_body: bytes.to_vec(),
     });
     let value = loop {
         let queued = {
