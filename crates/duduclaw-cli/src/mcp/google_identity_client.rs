@@ -56,6 +56,7 @@ struct CallRecord {
     account: String,
     fallback: bool,
     notice: Option<String>,
+    user_id: Option<String>,
 }
 
 /// How a call will get its credential.
@@ -185,6 +186,7 @@ impl GoogleCaller {
                 self.record(CallRecord {
                     identity: "home",
                     account: String::new(),
+                    user_id: None,
                     fallback: false,
                     notice: None,
                 });
@@ -194,16 +196,18 @@ impl GoogleCaller {
                 self.record(CallRecord {
                     identity: "refused",
                     account: String::new(),
+                    user_id: None,
                     fallback: false,
                     notice: None,
                 });
                 Err(m)
             }
             Plan::Gateway { agent } => match fetch(home, &agent, tool).await {
-                Ok(Fetched::Token { token, account }) => {
+                Ok(Fetched::Token { token, account, kind, user_id }) => {
                     self.record(CallRecord {
-                        identity: "delegate",
+                        identity: kind,
                         account,
+                        user_id,
                         fallback: false,
                         notice: None,
                     });
@@ -213,6 +217,7 @@ impl GoogleCaller {
                     self.record(CallRecord {
                         identity: "home",
                         account: String::new(),
+                        user_id: None,
                         fallback,
                         notice,
                     });
@@ -222,6 +227,7 @@ impl GoogleCaller {
                     self.record(CallRecord {
                         identity: "refused",
                         account: String::new(),
+                        user_id: None,
                         fallback: false,
                         notice: None,
                     });
@@ -241,6 +247,7 @@ impl GoogleCaller {
                 self.record(CallRecord {
                     identity: "home",
                     account: String::new(),
+                    user_id: None,
                     fallback: false,
                     notice: None,
                 });
@@ -294,6 +301,7 @@ impl GoogleCaller {
                     ("google_tool", json!(tool)),
                     ("google_identity", json!(rec.identity)),
                     ("google_account", json!(rec.account)),
+                    ("google_identity_user", json!(rec.user_id)),
                     ("fallback", json!(rec.fallback)),
                 ],
             );
@@ -305,7 +313,7 @@ impl GoogleCaller {
 fn plan_of(eff: &Effective, agent: &str) -> Plan {
     match eff {
         Effective::Home => Plan::Home,
-        Effective::Delegate { .. } if !agent.is_empty() => Plan::Gateway {
+        Effective::Delegate { .. } | Effective::Personal { .. } if !agent.is_empty() => Plan::Gateway {
             agent: agent.to_string(),
         },
         other => Plan::Refuse(
@@ -320,6 +328,8 @@ enum Fetched {
     Token {
         token: String,
         account: String,
+        kind: &'static str,
+        user_id: Option<String>,
     },
     Home {
         fallback: bool,
@@ -357,7 +367,11 @@ async fn fetch(home: &Path, agent: &str, tool: &str) -> Result<Fetched, String> 
             if token.is_empty() {
                 return Err("DuDuClaw gateway 的回應無法辨識。".into());
             }
-            Ok(Fetched::Token { token, account })
+            let kind = match v.get("identity_kind").and_then(Value::as_str) {
+                Some("owner") => "owner", Some("user") => "user", _ => "delegate",
+            };
+            let user_id = v.get("google_identity_user").and_then(Value::as_str).map(str::to_owned);
+            Ok(Fetched::Token { token, account, kind, user_id })
         }
         Some("home") => Ok(Fetched::Home {
             fallback: v.get("fallback").and_then(Value::as_bool).unwrap_or(false),
@@ -438,23 +452,23 @@ pub(crate) async fn status_header(home: &Path, caller: &GoogleCaller) -> (String
         Plan::Home => ("目前代表：公司共用帳號（home）。\n".into(), true),
         Plan::Refuse(m) => (format!("目前代表：無法使用 — {m}\n"), false),
         Plan::Gateway { agent } => {
-            let email = match effective_for(home, Some(&agent)).effective {
-                Effective::Delegate { email } => email,
-                _ => String::new(),
+            let configured = match effective_for(home, Some(&agent)).effective {
+                Effective::Delegate { email } => format!("公司授權代表 {email}（網域委派）"),
+                Effective::Personal { selector } => match selector {
+                    duduclaw_core::google_identity::Selector::Owner => "跟著負責人的 Google 帳號".into(),
+                    _ => "指定同事的 Google 帳號".into(),
+                },
+                _ => "設定已變更".into(),
             };
-            let state = match fetch(home, &agent, "google_status").await {
-                Ok(Fetched::Token { .. }) => {
-                    "可以使用（19 個工具都以這位同事的身分執行）".to_string()
-                }
-                Ok(Fetched::Home { notice, .. }) => {
-                    notice.unwrap_or_else(|| "改用公司共用帳號".into())
-                }
-                Err(m) => format!("目前不能使用：{m}"),
+            let (identity, state) = match fetch(home, &agent, "google_status").await {
+                Ok(Fetched::Token { account, kind, .. }) => (
+                    if kind == "delegate" { configured } else { format!("個人 Google 帳號 {account}") },
+                    "已連線；各工具仍依本人實際開放的服務判斷".to_string(),
+                ),
+                Ok(Fetched::Home { notice, .. }) => ("公司共用帳號".into(), notice.unwrap_or_else(|| "改用公司共用帳號".into())),
+                Err(m) => (configured, format!("目前不能使用：{m}")),
             };
-            (
-                format!("目前代表：公司授權代表 {email}（網域委派）。\n狀態：{state}\n"),
-                false,
-            )
+            (format!("目前代表：{identity}。\n狀態：{state}\n"), false)
         }
     }
 }
@@ -643,6 +657,7 @@ mod tests {
         c.record(CallRecord {
             identity: "home",
             account: String::new(),
+            user_id: None,
             fallback: true,
             notice: Some("已改用公司共用帳號處理".into()),
         });

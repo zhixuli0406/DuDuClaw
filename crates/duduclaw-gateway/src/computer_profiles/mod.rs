@@ -163,12 +163,17 @@ fn owners(home: &Path, agent: &str) -> Result<Option<Vec<(String, String)>>, Str
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {}
         _ => return Err(failure("users db")),
     }
-    let conn =
+    let mut conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(failure)?;
+    // Version and Owner rows must share one database snapshot. Final row
+    // equality alone cannot detect overlapping A→B→A ownership writes.
+    let tx = conn.transaction().map_err(failure)?;
+    let generation = duduclaw_auth::google_identity::read_primary_owner_generation(&tx, agent)
+        .map_err(failure)?;
     // B2b's primary-owner column may be installed later. Both layouts use
     // the same ownership check, including suspension/offboarding status.
-    let primary = conn
+    let primary = tx
         .prepare("PRAGMA table_info(user_agent_bindings)")
         .map_err(failure)?
         .query_map([], |r| r.get::<_, String>(1))
@@ -182,7 +187,7 @@ fn owners(home: &Path, agent: &str) -> Result<Option<Vec<(String, String)>>, Str
     } else {
         "SELECT b.user_id, b.bound_at, u.status, 0, u.updated_at FROM user_agent_bindings b JOIN users u ON u.id=b.user_id WHERE b.agent_name=?1 AND b.access_level='owner' ORDER BY b.user_id"
     };
-    let mut query = conn.prepare(sql).map_err(failure)?;
+    let mut query = tx.prepare(sql).map_err(failure)?;
     let rows = query
         .query_map([agent], |r| {
             Ok((
@@ -191,7 +196,8 @@ fn owners(home: &Path, agent: &str) -> Result<Option<Vec<(String, String)>>, Str
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?
+                    r.get::<_, String>(4)?,
+                    generation
                 ])
                 .to_string(),
             ))

@@ -242,6 +242,7 @@ mod tests {
             exp: 0,
             iat: 0,
             token_type: "access".to_string(),
+            jti: None,
         }
     }
 

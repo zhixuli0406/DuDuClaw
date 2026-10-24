@@ -31,7 +31,7 @@
     { "key": "budget.monthly_limit_cents", "form_paths": ["form.monthly_limit_cents"], "kind": "loosen" },
     { "key": "budget.daily_cap_cents", "form_paths": ["v.daily_cap_cents"], "kind": "loosen" },
     { "key": "budget.hard_stop", "form_paths": ["form.hard_stop"], "kind": "loosen" },
-    { "key": "google", "form_paths": [], "kind": "google_narrow" }
+    { "key": "google", "form_paths": ["form.google."], "kind": "google_narrow" }
   ],
   "kv_refused_sections": ["ptc", "cultural_context", "sticker", "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt", "os_watch", "budget"]
 }

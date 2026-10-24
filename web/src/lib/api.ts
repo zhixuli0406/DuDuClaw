@@ -5607,6 +5607,11 @@ export type GoogleIdentityKind = 'home' | 'none' | 'delegate' | 'owner' | 'user'
 export interface AgentGoogleIdentity {
   agent_id: string;
   kind: GoogleIdentityKind;
+  identity?: string | null;
+  selected_person?: { user_id: string; name: string; login_email: string } | null;
+  owners?: { user_id: string; name: string; email: string; is_primary: boolean }[] | null;
+  bound_people?: { user_id: string; name: string; email: string }[] | null;
+  allowed_channels?: string[] | null;
   /** The colleague's address for `delegate`. */
   email: string | null;
   /** The employee's `agent.toml` names an identity (vs the home default). */
@@ -5614,7 +5619,7 @@ export interface AgentGoogleIdentity {
   fallback: 'none' | 'home';
   requesters: 'bound_people' | 'owner_only' | 'anyone';
   /** `ready` means locally configured, not a successful unseal or Google probe. */
-  state: 'home' | 'none' | 'ready' | 'blocked';
+  state: 'home' | 'none' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
   /** zh-TW reason when blocked. */
   message: string;
 }
@@ -5628,13 +5633,14 @@ export interface GoogleDelegationStatus {
   protection: CredentialProtectionStatus;
   key: GoogleDelegationKeyInfo | null;
   key_error: string | null;
-  settings: { default_identity: 'home' | 'none'; allowed_subject_domains: string[] } | null;
+  settings: { default_identity: 'home' | 'none'; allowed_subject_domains: string[]; allowed_domains?: string[] } | null;
   settings_error: string | null;
   /** The home service account's subject (the default allowed domain). */
   home_subject: string | null;
   required_scopes: string[];
   admin_console_path: string;
   agents: AgentGoogleIdentity[];
+  personal_connections?: { owner_id: string; account_email: string; status: 'connected' | 'needs_reconnect' | 'suspended' }[] | null;
 }
 export interface GoogleIdentityTestStep {
   id: string;
@@ -5649,6 +5655,18 @@ export interface GoogleIdentitySetInput {
   fallback?: 'none' | 'home';
   requesters?: 'bound_people' | 'owner_only' | 'anyone';
   confirm_anyone?: boolean;
+  confirm_shared_access?: boolean;
+}
+
+export interface PersonalGoogleStatus {
+  connection: { owner_id: string; account_email: string; granted_scopes: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
+  login_email: string;
+  client_configured: boolean;
+  integration_enabled: boolean;
+  requires_login: boolean;
+  requests: { agent_id: string; allowed: boolean | null; requesters: 'anyone' | 'bound_people' | 'owner_only'; bound_people: { user_id: string; name: string; email: string }[]; channels: string[]; public_visitors_allowed: false }[];
+  delegated: { agent_id: string; email: string }[];
+  recent_usage: { timestamp: string; agent_id: string; tool_name: string; success: boolean }[];
 }
 
 export type GoogleCredentialsInput =
@@ -7698,7 +7716,7 @@ export const api = {
     importKey: (keyJson: string) =>
       client.call('google.delegation.import_key', { key_json: keyJson }) as Promise<{ key: GoogleDelegationKeyInfo }>,
     removeKey: () => client.call('google.delegation.remove_key', { confirm: true }) as Promise<{ removed: boolean }>,
-    setSettings: (params: { allowed_subject_domains?: string[]; default_identity?: 'home' | 'none' }) =>
+    setSettings: (params: { allowed_subject_domains?: string[]; allowed_domains?: string[]; default_identity?: 'home' | 'none' }) =>
       client.call('google.delegation.settings_set', { ...params }) as Promise<{
         default_identity: 'home' | 'none';
         allowed_subject_domains: string[];
@@ -7714,6 +7732,16 @@ export const api = {
         ok: boolean;
         steps: GoogleIdentityTestStep[];
       }>,
+  },
+  personalGoogle: {
+    status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
+    start: () => client.call('me.google.connect_start', { redirect_origin: window.location.origin }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    finish: (state: string) => client.call('me.google.connect_finish', { state }),
+    paste: (url: string) => client.call('me.google.connect_paste', { url }),
+    disconnect: () => client.call('me.google.disconnect', { confirm: true }) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
+    consent: (agentId: string, allowed: boolean) => client.call('me.google.consents.set', { agent_id: agentId, allowed, confirm_shared_access: allowed }),
+    primaryOwner: (agentId: string, userId: string) => client.call('agents.primary_owner_set', { agent_id: agentId, user_id: userId }),
+    disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }),
   },
   mcp: {
     list: () =>

@@ -224,14 +224,14 @@ fn combine_follows_the_resolution_order() {
         combine(&SectionRead::Absent, &Err("x".into())).effective,
         Effective::Invalid(_)
     ));
-    // B2b selectors are not served yet.
+    // B2b selectors reach the gateway's person gates.
     let o = SectionRead::Present(AgentGoogleSection {
         identity: Some(Selector::Owner),
         ..Default::default()
     });
     assert_eq!(
         combine(&o, &home_default).effective,
-        Effective::NotAvailable { kind: "owner" }
+        Effective::Personal { selector: Selector::Owner }
     );
 }
 

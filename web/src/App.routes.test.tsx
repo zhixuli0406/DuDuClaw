@@ -119,6 +119,11 @@ describe('App routes — legacy paths land somewhere real (WP-A §2-8/§2-13)', 
 });
 
 describe('App routes — Enterprise-only pages are closed on Personal (WP-A D8/D10-B)', () => {
+  it('blocks personal Google self-service on the Personal edition', async()=>{
+    setEdition('personal');
+    await expectLandsOn('/me/connections','/');
+    expect(mockWsClient.call.mock.calls.some(([method])=>method==='me.google.status')).toBe(false);
+  });
   it('blocks the canonical /manage/distributors on Personal', async () => {
     setEdition('personal');
     await expectLandsOn('/manage/distributors', '/');

@@ -143,6 +143,7 @@ mod mcp_ecosystem_rpc;
 pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
 mod google_identity_rpc;
+mod google_personal_rpc;
 mod accounts_util;
 mod tasks_rpc;
 mod discovery_rpc;

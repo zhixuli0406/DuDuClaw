@@ -74,6 +74,7 @@ impl GoogleMountGuard {
                 false,
                 Some(format!("目前代表 {email} 使用 Google。")),
             ),
+            resolve::Resolved::Personal { .. } => return Err(unavailable()),
             resolve::Resolved::UseHome { fallback, notice } => (
                 crate::google_workspace::get_valid_google_token(&home)
                     .await

@@ -436,6 +436,7 @@ export const navGroups: NavGroup[] = [
     // `enterprise: true` for every other consumer).
     label: 'navGroup.org',
     items: [
+      { to: '/me/connections', icon: Plug, label: 'myConnections.title', desc: 'myConnections.navDesc', enterprise: true, newIn: '1.76.0' },
       { to: '/team', icon: UsersRound, label: 'nav.myTeam', desc: 'nav.myTeam.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
       { to: '/team/conversations', icon: MessagesSquare, label: 'nav.teamHistory', desc: 'nav.teamHistory.desc', minRole: 'manager', enterprise: true, newIn: '1.76.0' },
     ],

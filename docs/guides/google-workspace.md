@@ -189,9 +189,9 @@ An employee without `[google]` uses `default_identity`, so an existing
 installation behaves exactly as before. `none` hides the 19 Google tools
 from that employee and refuses calls to them. A value that cannot be read
 (a typo, an unknown key) refuses Google for that employee; it never turns
-into the shared account. `owner` and `user:<id>` (an employee using its
-owner's own connected account) are reserved for a later release and are
-refused for now.
+into the shared account. Enterprise employees may use `owner` or `user:<id>`
+with an active direct Owner and that person's explicit consent; see
+[Personal Google connections (unreleased)](google-personal-connections.md).
 
 ### Who can use the account through the employee
 

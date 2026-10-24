@@ -168,6 +168,8 @@ pub struct UserAgentBinding {
     pub agent_name: String,
     pub access_level: AccessLevel,
     pub bound_at: String,
+    #[serde(default)]
+    pub is_primary: bool,
 }
 
 /// An audit log entry.

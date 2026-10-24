@@ -28,6 +28,7 @@ use crate::google_workspace::REQUIRED_SCOPES;
 pub enum Resolved {
     /// A token minted for the delegate.
     Delegated { email: String, token: MintedToken },
+    Personal { kind: &'static str, user_id: String, email: String, token: MintedToken },
     /// The home account, in the caller's own process. `fallback` is true when
     /// a delegate failed and the employee's `fallback = "home"` covered it;
     /// `notice` is then prepended to the tool result.
@@ -40,14 +41,10 @@ pub enum Resolved {
 /// Refusal for an effective selector that is not a delegate.
 pub fn refusal_for(effective: &Effective) -> Option<Refusal> {
     match effective {
-        Effective::Home | Effective::Delegate { .. } => None,
+        Effective::Home | Effective::Delegate { .. } | Effective::Personal { .. } => None,
         Effective::Disabled => Some(Refusal::hard(
             "disabled",
             "這位 AI 員工設定為不使用 Google。",
-        )),
-        Effective::NotAvailable { .. } => Some(Refusal::hard(
-            "not_available",
-            "這位 AI 員工設定的 Google 身分（跟著負責人或指定同事）在這個版本還不能使用，請管理員改成「公司共用帳號」或「代表某位同事」。",
         )),
         Effective::Invalid(why) => Some(Refusal::hard(
             "config_invalid",
@@ -142,7 +139,26 @@ pub async fn resolve_person(
     requester: &RequesterIdentity,
     people: &dyn People,
 ) -> Result<Resolved, Refusal> {
+    resolve_person_for_tool(home, agent, requester, people, "google_status").await
+}
+
+pub async fn resolve_person_for_tool(
+    home: &Path,
+    agent: &str,
+    requester: &RequesterIdentity,
+    people: &dyn People,
+    tool: &str,
+) -> Result<Resolved, Refusal> {
     let eff = gi::effective_for(home, Some(agent));
+    if matches!(eff.effective, Effective::Personal { .. }) {
+        let outcome = crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool).await;
+        return match outcome {
+            Err(r) if r.fallback_eligible && eff.fallback == Fallback::Home => Ok(Resolved::UseHome {
+                fallback: true, notice: Some(format!("已改用公司共用帳號處理，因為：{}", r.message_zh)),
+            }),
+            other => other,
+        };
+    }
     let email = match &eff.effective {
         Effective::Home => {
             return Ok(Resolved::UseHome {

@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::requester_gate::people_for;
-use super::resolve::{Resolved, resolve_person};
+use super::resolve::{Resolved, resolve_person_for_tool};
 use super::{Refusal, audit_issue};
 use crate::computer_use_sessions::auth::{RateLimiter, ReplayGuard, authenticate, check_peer};
 
@@ -185,7 +185,7 @@ pub(crate) async fn serve(
         return outcome.map(|_| Value::Null);
     }
     let people = people_for(&state.home, state.users.as_ref());
-    let outcome = resolve_person(&state.home, agent, requester, people.as_ref()).await;
+    let outcome = resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
     audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
     match outcome? {
         Resolved::Delegated { email, token } => Ok(json!({
@@ -194,6 +194,10 @@ pub(crate) async fn serve(
             "access_token": token.access_token,
             "expires_in": token.expires_in,
             "account_email": email,
+        })),
+        Resolved::Personal { kind, user_id, email, token } => Ok(json!({
+            "ok": true, "mode": "delegate", "identity_kind": kind, "google_identity_user": user_id,
+            "access_token": token.access_token, "expires_in": token.expires_in, "account_email": email,
         })),
         Resolved::UseHome { fallback, notice } => Ok(json!({
             "ok": true,

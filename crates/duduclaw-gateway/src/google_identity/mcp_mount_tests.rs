@@ -220,3 +220,26 @@ async fn person_mount_never_claims_a_stdio_child_used_an_ignored_http_bearer() {
     .await;
     assert!(servers.is_empty());
 }
+
+
+#[tokio::test]
+async fn personal_selectors_refuse_external_mount_even_with_anyone_and_available_home_fallback() {
+    let user = uuid::Uuid::new_v4().to_string();
+    for selector in ["owner".to_owned(), format!("user:{user}")] {
+        let home = Home::new();
+        home.ready("mount-bot", "mount-personal-unsupported@c.test", "requesters='anyone'\nfallback='home'\n");
+        home.agent("mount-bot", &format!("[google]\nidentity='{selector}'\nrequesters='anyone'\nfallback='home'\n"));
+        crate::mcp_oauth::save_tokens(home.p(), &[crate::mcp_oauth::McpOAuthToken {
+            provider_id: crate::google_workspace::GOOGLE_PROVIDER.into(),
+            access_token: "home-personal-boundary-token".into(), refresh_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: crate::google_workspace::REQUIRED_SCOPES.iter().map(|scope| scope.to_string()).collect(),
+        }]).unwrap();
+        let result = CURRENT_REQUESTER.scope(system(), mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/mount-bot"))).await;
+        let error = match result { Err(error) => error, Ok(_) => panic!("Personal identity yielded an external mount bearer") };
+        assert_eq!(error.code, "no_verified_caller");
+        assert!(!error.fallback_eligible);
+        assert!(!error.message_zh.contains("home-personal-boundary-token"));
+        assert!(seen_for("mount-personal-unsupported@c.test").is_empty());
+    }
+}
