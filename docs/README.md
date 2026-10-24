@@ -171,6 +171,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/editions.md](guides/editions.md) | Personal vs Enterprise edition comparison (limits, management surfaces, what decides the edition, how to upgrade; [zh-TW](guides/zh-TW/editions.md), [ja-JP](guides/ja-JP/editions.md)) | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
+| [guides/mcp-call-lifetimes.md](guides/mcp-call-lifetimes.md) | Host API reference for scoped MCP HTTP authority and operation lifetime ([zh-TW](guides/zh-TW/mcp-call-lifetimes.md), [ja-JP](guides/ja-JP/mcp-call-lifetimes.md)); Gateway/provider integration is separate | Unreleased |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
 | [guides/dashboard-settings.md](guides/dashboard-settings.md) | 儀表板設定對照（v1.68.0）：每個開關的頁面位置、寫入的設定鍵、是否需要重啟；AI 員工編輯頁欄位與管理員限定欄位；`[permissions]` 生效與開機遷移；「設定檔進階編輯」（遮罩、驗證、備份、稽核、衝突偵測）（also in `zh-TW/` and `ja-JP/`） | Current |
 | [guides/mcp-standalone.md](guides/mcp-standalone.md) | 單獨使用 MCP server（不裝 gateway）：`duduclaw mcp init` 為 Claude Code／Codex／Cursor 簽發金鑰並寫好設定、24 個記憶與 wiki 工具、實測的 scope 對照表、升級到完整平台、MCP Registry 上架（also in `zh-TW/` and `ja-JP/`） | Current |

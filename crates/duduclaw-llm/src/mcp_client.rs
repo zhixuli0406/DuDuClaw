@@ -54,7 +54,10 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::ccr::{CcrScope, CcrSourceArtifact};
-use crate::tool_loop::{InterceptDecision, ToolExecutor, ToolInterceptor, ToolOutcome};
+use crate::tool_loop::{
+    ClientOperation, InterceptDecision, PreparedClientCall, SecretBearer, ToolCallLease,
+    ToolExecutor, ToolInterceptor, ToolOutcome,
+};
 use crate::types::ToolDef;
 
 /// JSON-RPC protocol version echoed in every frame.
@@ -63,6 +66,10 @@ const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Default per-request timeout.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A scoped operation includes queueing, preparation, handshake and its final
+/// response. Hosts may choose a shorter deadline, never an unbounded lease.
+const MAX_SCOPED_MCP_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -121,6 +128,63 @@ impl McpToolDef {
 pub struct ToolCallResult {
     pub content: String,
     pub is_error: bool,
+}
+
+/// Immutable host-owned connection configuration. A scoped slot never caches a
+/// bearer or MCP session in this recipe. It cannot be constructed from model
+/// arguments or an MCP response. Other fixed headers remain host configuration;
+/// the recipe deliberately does not implement Debug or serialization.
+#[derive(Clone)]
+pub struct ScopedHttpRecipe {
+    url: String,
+    headers: Vec<(String, String)>,
+    operation_timeout: Duration,
+}
+
+impl ScopedHttpRecipe {
+    pub fn new(
+        url: String,
+        headers: Vec<(String, String)>,
+        operation_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let invalid = || McpError::Spawn("invalid scoped MCP HTTP recipe".into());
+        let parsed = reqwest::Url::parse(&url).map_err(|_| invalid())?;
+        if !http_endpoint_allowed(&url)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || operation_timeout.is_zero()
+            || operation_timeout > MAX_SCOPED_MCP_TIMEOUT
+        {
+            return Err(invalid());
+        }
+        for (name, value) in &headers {
+            if [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "cookie2",
+                "mcp-session-id",
+            ]
+            .iter()
+            .any(|denied| name.eq_ignore_ascii_case(denied))
+                || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || reqwest::header::HeaderValue::from_str(value).is_err()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(Self {
+            url,
+            headers,
+            operation_timeout,
+        })
+    }
+}
+
+struct ScopedHttpAuthority {
+    bearer: SecretBearer,
+    lease: Box<dyn ToolCallLease>,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +386,9 @@ enum McpTransport {
         headers: Vec<(String, String)>,
         /// Session id issued by the server at `initialize`, if any.
         session_id: Option<String>,
+        /// Present only for a single scoped operation. The transport owns
+        /// both values through response parsing, including error/cancel paths.
+        scoped: Option<ScopedHttpAuthority>,
     },
 }
 
@@ -515,6 +582,7 @@ impl McpClient {
                 url: url.to_string(),
                 headers: headers.to_vec(),
                 session_id: None,
+                scoped: None,
             },
             next_id: AtomicI64::new(1),
             timeout,
@@ -523,6 +591,71 @@ impl McpClient {
         };
         client.handshake().await?;
         Ok(client)
+    }
+
+    // Only a RegistryClient scoped operation can create this client. Keeping
+    // it private prevents callers from accidentally caching its live lease.
+    async fn connect_http_with_call_lease(
+        recipe: &ScopedHttpRecipe,
+        bearer: SecretBearer,
+        lease: Box<dyn ToolCallLease>,
+    ) -> Result<Self, McpError> {
+        let http = reqwest::Client::builder()
+            .timeout(recipe.operation_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| McpError::Spawn("scoped MCP HTTP client unavailable".into()))?;
+        let mut client = Self {
+            transport: McpTransport::Http {
+                http,
+                url: recipe.url.clone(),
+                headers: recipe.headers.clone(),
+                session_id: None,
+                scoped: Some(ScopedHttpAuthority { bearer, lease }),
+            },
+            next_id: AtomicI64::new(1),
+            timeout: recipe.operation_timeout,
+            label: "scoped-http".into(),
+            workflow_version: None,
+        };
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    fn is_scoped_http(&self) -> bool {
+        matches!(
+            &self.transport,
+            McpTransport::Http {
+                scoped: Some(_),
+                ..
+            }
+        )
+    }
+
+    async fn validate_scoped_authority(&mut self) -> Result<(), McpError> {
+        if let McpTransport::Http {
+            scoped: Some(authority),
+            ..
+        } = &mut self.transport
+        {
+            authority
+                .lease
+                .validate_before_send()
+                .await
+                .map_err(|_| McpError::Io("scoped MCP authority is no longer valid".into()))?;
+        }
+        Ok(())
+    }
+
+    fn redact_scoped_response(&self, value: &mut Value) {
+        if let McpTransport::Http {
+            scoped: Some(authority),
+            ..
+        } = &self.transport
+        {
+            authority.bearer.redact_value(value);
+        }
     }
 
     async fn handshake(&mut self) -> Result<(), McpError> {
@@ -546,9 +679,14 @@ impl McpClient {
         // Announce readiness; notifications get no reply.
         let note = build_initialized_notification();
         if is_http {
-            // Best-effort: stateless HTTP servers may reject or ignore
-            // notifications entirely — never fail the mount over it.
+            // Persistent compatibility: stateless servers may reject this
+            // notification. Scoped operations instead require acceptance.
             if let Err(e) = self.http_notify(&note).await {
+                if self.is_scoped_http() {
+                    // A scoped notification is part of the authorized
+                    // operation. Never continue after a refused authority.
+                    return Err(e);
+                }
                 warn!(server = %self.label, error = %e, "MCP initialized notification not accepted (continuing)");
             }
         } else {
@@ -733,6 +871,7 @@ impl McpClient {
         expect_id: i64,
         capture_session: bool,
     ) -> Result<Value, McpError> {
+        let scoped = self.is_scoped_http();
         let resp = self.http_post(&frame).await?;
         let status = resp.status();
 
@@ -758,9 +897,21 @@ impl McpClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let body = resp.text().await.map_err(|e| McpError::Io(e.to_string()))?;
+        let body = resp.text().await.map_err(|e| {
+            if scoped {
+                McpError::Io("scoped MCP response unavailable".into())
+            } else {
+                McpError::Io(e.to_string())
+            }
+        })?;
 
         if !status.is_success() {
+            if scoped {
+                // A provider may echo Authorization in its error body.
+                return Err(McpError::Io(format!(
+                    "scoped MCP HTTP response rejected: {status}"
+                )));
+            }
             let snippet: String = body.chars().take(300).collect();
             return Err(McpError::Io(format!("HTTP {status}: {snippet}")));
         }
@@ -768,17 +919,27 @@ impl McpClient {
             return Err(McpError::Io("MCP HTTP response too large".into()));
         }
 
-        if content_type.starts_with("text/event-stream") {
-            return sse_extract_response(&body, expect_id)
-                .ok_or_else(|| McpError::Parse("no matching response frame in SSE body".into()));
-        }
-        let value: Value =
-            serde_json::from_str(&body).map_err(|e| McpError::Parse(e.to_string()))?;
+        let mut value: Value = if content_type.starts_with("text/event-stream") {
+            sse_extract_response(&body, expect_id)
+                .ok_or_else(|| McpError::Parse("no matching response frame in SSE body".into()))?
+        } else {
+            serde_json::from_str(&body).map_err(|e| {
+                if scoped {
+                    McpError::Parse("invalid scoped MCP response".into())
+                } else {
+                    McpError::Parse(e.to_string())
+                }
+            })?
+        };
         if value.get("id").and_then(Value::as_i64) != Some(expect_id) {
             return Err(McpError::Parse(format!(
                 "HTTP response id mismatch (expected {expect_id})"
             )));
         }
+        // Holding a lease alone does not freeze an independently updated ACL.
+        // Recheck after body parsing before returning any response content.
+        self.validate_scoped_authority().await?;
+        self.redact_scoped_response(&mut value);
         Ok(value)
     }
 
@@ -787,7 +948,7 @@ impl McpClient {
         let resp = self.http_post(frame).await?;
         let status = resp.status();
         if status.is_success() {
-            Ok(())
+            self.validate_scoped_authority().await
         } else {
             Err(McpError::Io(format!("HTTP {status}")))
         }
@@ -795,16 +956,24 @@ impl McpClient {
 
     /// Shared POST builder for the HTTP transport: standard MCP headers +
     /// caller headers + session echo.
-    async fn http_post(&self, frame: &Value) -> Result<reqwest::Response, McpError> {
+    async fn http_post(&mut self, frame: &Value) -> Result<reqwest::Response, McpError> {
         let McpTransport::Http {
             http,
             url,
             headers,
             session_id,
-        } = &self.transport
+            scoped,
+        } = &mut self.transport
         else {
             return Err(McpError::Io("http_post on non-http transport".into()));
         };
+        if let Some(authority) = scoped.as_mut() {
+            authority
+                .lease
+                .validate_before_send()
+                .await
+                .map_err(|_| McpError::Io("scoped MCP authority is no longer valid".into()))?;
+        }
         let mut req = http
             .post(url.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -816,18 +985,44 @@ impl McpClient {
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
         }
+        if let Some(authority) = scoped.as_ref() {
+            let token = authority.bearer.as_bytes();
+            if token.is_empty()
+                || token.iter().any(|byte| {
+                    !byte.is_ascii() || byte.is_ascii_control() || byte.is_ascii_whitespace()
+                })
+            {
+                return Err(McpError::Io("invalid scoped MCP bearer".into()));
+            }
+            let mut bytes = b"Bearer ".to_vec();
+            bytes.extend_from_slice(token);
+            let header = reqwest::header::HeaderValue::from_bytes(&bytes);
+            bytes.fill(0);
+            let mut header =
+                header.map_err(|_| McpError::Io("invalid scoped MCP bearer".into()))?;
+            header.set_sensitive(true);
+            req = req.header(reqwest::header::AUTHORIZATION, header);
+        }
         if let Some(sid) = session_id {
             req = req.header("mcp-session-id", sid.as_str());
         }
-        req.json(frame)
-            .send()
-            .await
-            .map_err(|e| McpError::Io(e.to_string()))
+        let is_scoped = scoped.is_some();
+        req.json(frame).send().await.map_err(|e| {
+            if is_scoped {
+                McpError::Io("scoped MCP HTTP request failed".into())
+            } else {
+                McpError::Io(e.to_string())
+            }
+        })
     }
 }
 
 /// Upper bound for a buffered MCP HTTP response body (16 MB).
 const MAX_HTTP_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "mcp_client/scoped_http_tests.rs"]
+mod scoped_http_tests;
 
 /// Extract the JSON-RPC response frame with `expect_id` from an SSE body:
 /// events are blank-line-separated; each event's `data:` lines join to one
@@ -868,6 +1063,111 @@ impl Drop for McpClient {
 // Registry — aggregates N clients behind the ToolExecutor trait
 // ---------------------------------------------------------------------------
 
+/// Host-created registry entries. Existing constructors wrap their clients in
+/// Persistent. Scoped HTTP entries contain only an immutable recipe and guard;
+/// discovery and every call create and drop their own authenticated client.
+/// Cross-call stateful MCP sessions are not preserved. Dropping a call releases
+/// local authority only; an already-sent remote effect remains unconfirmed.
+pub enum RegistryClient {
+    Persistent(McpClient),
+    ScopedHttp(ScopedHttpSlot),
+}
+
+impl RegistryClient {
+    pub fn scoped_http(recipe: ScopedHttpRecipe, guard: Arc<dyn ToolInterceptor>) -> Self {
+        Self::ScopedHttp(ScopedHttpSlot { recipe, guard })
+    }
+}
+
+/// Opaque host configuration; no bearer or held authority lives in this slot.
+pub struct ScopedHttpSlot {
+    recipe: ScopedHttpRecipe,
+    guard: Arc<dyn ToolInterceptor>,
+}
+
+enum ScopedCallError {
+    Denied,
+    Unconfirmed,
+}
+
+impl ScopedCallError {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Denied => "Scoped MCP authorization unavailable; operation refused",
+            Self::Unconfirmed => {
+                "Scoped MCP result unconfirmed; remote execution may have occurred"
+            }
+        }
+    }
+
+    fn into_mcp_error(self) -> McpError {
+        McpError::Io(self.message().into())
+    }
+}
+
+impl ScopedHttpSlot {
+    async fn prepare(
+        &self,
+        server: &str,
+        operation: ClientOperation<'_>,
+        args: Value,
+    ) -> Result<(Value, SecretBearer, Box<dyn ToolCallLease>), ScopedCallError> {
+        // Do not surface a host implementation's arbitrary error string. It
+        // might include credentials obtained while preparing this call.
+        let PreparedClientCall {
+            arguments,
+            lease,
+            fresh_http_bearer,
+        } = self
+            .guard
+            .prepare_client_call(server, operation, args)
+            .await
+            .map_err(|_| ScopedCallError::Denied)?;
+        let lease = lease.ok_or(ScopedCallError::Denied)?;
+        let bearer = fresh_http_bearer.ok_or(ScopedCallError::Denied)?;
+        Ok((arguments, bearer, lease))
+    }
+
+    async fn discover(&self, server: &str) -> Result<Vec<McpToolDef>, McpError> {
+        let operation = async {
+            let (_, bearer, lease) = self
+                .prepare(server, ClientOperation::Discover, Value::Null)
+                .await?;
+            let mut client = McpClient::connect_http_with_call_lease(&self.recipe, bearer, lease)
+                .await
+                .map_err(|_| ScopedCallError::Unconfirmed)?;
+            let tools = client.list_tools().await;
+            drop(client);
+            tools.map_err(|_| ScopedCallError::Unconfirmed)
+        };
+        match tokio::time::timeout(self.recipe.operation_timeout, operation).await {
+            Ok(result) => result.map_err(ScopedCallError::into_mcp_error),
+            Err(_) => Err(ScopedCallError::Unconfirmed.into_mcp_error()),
+        }
+    }
+
+    async fn call(
+        &self,
+        server: &str,
+        name: &str,
+        args: Value,
+    ) -> Result<(Value, ToolCallResult), ScopedCallError> {
+        let (args, bearer, lease) = self
+            .prepare(server, ClientOperation::Tool { name }, args)
+            .await?;
+        let mut client = McpClient::connect_http_with_call_lease(&self.recipe, bearer, lease)
+            .await
+            .map_err(|_| ScopedCallError::Unconfirmed)?;
+        let result = client.call_tool(name, args.clone()).await;
+        // Drop the authority before releasing the registry's exact-client
+        // mutex. Error, timeout and cancellation drop the same owned value.
+        drop(client);
+        result
+            .map(|result| (args, result))
+            .map_err(|_| ScopedCallError::Unconfirmed)
+    }
+}
+
 /// Aggregates tools from multiple [`McpClient`]s and routes calls by tool
 /// name. Implements [`ToolExecutor`], so a registry is what
 /// [`run_tool_loop`](crate::run_tool_loop) drives.
@@ -876,7 +1176,7 @@ impl Drop for McpClient {
 /// name, the earlier client owns it and a warning is logged; the later one's
 /// tool is dropped from both the routing table and `tool_defs()`.
 pub struct ToolRegistry {
-    clients: Vec<Mutex<McpClient>>,
+    clients: Vec<Mutex<RegistryClient>>,
     /// tool name → index into `clients`.
     routes: HashMap<String, usize>,
     defs: Vec<ToolDef>,
@@ -895,6 +1195,9 @@ pub struct ToolRegistry {
     /// supplied by a model or a colliding logical server name.
     client_interceptors: HashMap<usize, Arc<dyn ToolInterceptor>>,
     client_notices: HashMap<usize, String>,
+    /// Host-only deadlines parallel to scoped slots. Keeping this outside the
+    /// mutex lets one timeout also bound waiting for that exact client lock.
+    scoped_operation_timeouts: HashMap<usize, Duration>,
 }
 
 struct VerifiedMcpRoute {
@@ -978,7 +1281,10 @@ impl ToolRegistry {
             per_client.push(c.list_tools().await?);
         }
         let (routes, defs) = build_routes_filtered(&per_client, &filters);
-        let clients = clients.into_iter().map(Mutex::new).collect();
+        let clients = clients
+            .into_iter()
+            .map(|client| Mutex::new(RegistryClient::Persistent(client)))
+            .collect();
         Ok(Self {
             clients,
             routes,
@@ -989,6 +1295,7 @@ impl ToolRegistry {
             ccr_disabled_tools: HashSet::new(),
             client_interceptors: HashMap::new(),
             client_notices: HashMap::new(),
+            scoped_operation_timeouts: HashMap::new(),
         })
     }
 
@@ -1006,6 +1313,49 @@ impl ToolRegistry {
         let mut registry = Self::from_clients_filtered(clients, filters).await?;
         registry.server_names = server_names;
         Ok(registry)
+    }
+
+    /// Build mixed persistent/scoped slots. A scoped guard is fixed to its
+    /// actual index before any credential-bearing discovery request; neither
+    /// remote tool metadata nor a colliding logical name can replace it.
+    pub async fn from_client_slots_named(
+        mut clients: Vec<(String, RegistryClient)>,
+        filters: Vec<ToolFilter>,
+    ) -> Result<Self, McpError> {
+        let mut client_interceptors = HashMap::new();
+        let mut scoped_operation_timeouts = HashMap::new();
+        for (index, (name, client)) in clients.iter().enumerate() {
+            if let RegistryClient::ScopedHttp(slot) = client {
+                if name.trim().is_empty() {
+                    return Err(McpError::Spawn(
+                        "scoped MCP server must have a host name".into(),
+                    ));
+                }
+                client_interceptors.insert(index, slot.guard.clone());
+                scoped_operation_timeouts.insert(index, slot.recipe.operation_timeout);
+            }
+        }
+        let mut per_client = Vec::with_capacity(clients.len());
+        for (name, client) in &mut clients {
+            per_client.push(match client {
+                RegistryClient::Persistent(client) => client.list_tools().await?,
+                RegistryClient::ScopedHttp(slot) => slot.discover(name).await?,
+            });
+        }
+        let (routes, defs) = build_routes_filtered(&per_client, &filters);
+        let (server_names, clients): (Vec<_>, Vec<_>) = clients.into_iter().unzip();
+        Ok(Self {
+            clients: clients.into_iter().map(Mutex::new).collect(),
+            routes,
+            defs,
+            server_names,
+            source_verifiers: HashMap::new(),
+            source_attestation_required: HashSet::new(),
+            ccr_disabled_tools: HashSet::new(),
+            client_interceptors,
+            client_notices: HashMap::new(),
+            scoped_operation_timeouts,
+        })
     }
 
     /// Logical server name owning `tool`, when this registry was built with
@@ -1284,18 +1634,59 @@ impl ToolExecutor for ToolRegistry {
             )
             .without_ccr());
         }
+        // One deadline owns the complete future, including waiting for this
+        // exact slot. Cancellation only drops local authority; remote effects
+        // already sent are unconfirmed and must not be automatically replayed.
+        if let Some(timeout) = self.scoped_operation_timeouts.get(&idx) {
+            match tokio::time::timeout(*timeout, self.call_on_client(idx, name, args)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // A timeout can happen before the lock is acquired; do
+                    // not imply this account actually received the call.
+                    Ok(ToolOutcome::error(ScopedCallError::Unconfirmed.message()))
+                }
+            }
+        } else {
+            self.call_on_client(idx, name, args).await
+        }
+    }
+}
+
+impl ToolRegistry {
+    async fn call_on_client(
+        &self,
+        idx: usize,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolOutcome, String> {
         let mut client = self.clients[idx].lock().await;
         let server = self.server_names.get(idx).map(String::as_str).unwrap_or("");
         let interceptor = self.client_interceptors.get(&idx);
-        let args = if let Some(interceptor) = interceptor {
-            match interceptor.before_call_async(server, name, args).await {
-                InterceptDecision::Allow(args) => args,
-                InterceptDecision::Deny(reason) => return Ok(ToolOutcome::error(reason)),
+        let (args, result) = match &mut *client {
+            RegistryClient::Persistent(client) => {
+                let args = if let Some(interceptor) = interceptor {
+                    match interceptor.before_call_async(server, name, args).await {
+                        InterceptDecision::Allow(args) => args,
+                        InterceptDecision::Deny(reason) => return Ok(ToolOutcome::error(reason)),
+                    }
+                } else {
+                    args
+                };
+                let result = client.call_tool(name, args.clone()).await;
+                (args, result)
             }
-        } else {
-            args
+            RegistryClient::ScopedHttp(slot) => {
+                // prepare_client_call replaces the old before hook only for
+                // this branch; calling both would authorize twice.
+                match slot.call(server, name, args.clone()).await {
+                    Ok((args, result)) => (args, Ok(result)),
+                    Err(ScopedCallError::Denied) => {
+                        return Ok(ToolOutcome::error(ScopedCallError::Denied.message()));
+                    }
+                    Err(error) => (args, Err(error.into_mcp_error())),
+                }
+            }
         };
-        let result = client.call_tool(name, args.clone()).await;
         drop(client);
         let outcome = match result {
             Ok(mut result) => {
@@ -1541,6 +1932,7 @@ mod tests {
             ccr_disabled_tools: HashSet::new(),
             client_interceptors: HashMap::new(),
             client_notices: HashMap::new(),
+            scoped_operation_timeouts: HashMap::new(),
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -1584,6 +1976,7 @@ mod tests {
             ccr_disabled_tools: HashSet::new(),
             client_interceptors: HashMap::new(),
             client_notices: HashMap::new(),
+            scoped_operation_timeouts: HashMap::new(),
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
