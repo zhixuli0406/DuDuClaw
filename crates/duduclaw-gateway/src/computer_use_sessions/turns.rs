@@ -32,6 +32,7 @@ fn registry() -> &'static Mutex<
             String,
             Option<crate::approval::DecisionContext>,
             Option<crate::approval::TrustedReplyTarget>,
+            Option<super::attended::AttendedInputProof>,
         )>,
     >,
 > {
@@ -44,6 +45,7 @@ fn registry() -> &'static Mutex<
                     String,
                     Option<crate::approval::DecisionContext>,
                     Option<crate::approval::TrustedReplyTarget>,
+                    Option<super::attended::AttendedInputProof>,
                 )>,
             >,
         >,
@@ -64,13 +66,14 @@ pub fn valid_turn_id(turn_id: &str) -> bool {
 pub struct TurnGuard {
     key: Key,
     id: u64,
+    _watch_socket: Option<crate::computer_watch_links::delivery::SocketGuard>,
 }
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         let mut turns = registry().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(list) = turns.get_mut(&self.key) {
-            list.retain(|(id, _, _, _)| *id != self.id);
+            list.retain(|(id, ..)| *id != self.id);
             if list.is_empty() {
                 turns.remove(&self.key);
             }
@@ -109,8 +112,11 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
                 .try_with(Clone::clone)
                 .ok()
                 .flatten(),
+            super::attended::capture(agent_id, turn_id),
         ));
-    Some(TurnGuard { key, id })
+    Some(TurnGuard { key, id,
+        _watch_socket: crate::computer_watch_links::delivery::register_socket(agent_id, turn_id),
+    })
 }
 
 /// The reply channel of `agent_id`'s live turn `turn_id` (the newest
@@ -125,7 +131,7 @@ pub fn reply_channel_for(agent_id: &str, turn_id: &str) -> Option<String> {
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.to_string(), turn_id.to_string()))
         .and_then(|list| list.last())
-        .map(|(_, channel, _, _)| channel.clone())
+        .map(|(_, channel, ..)| channel.clone())
 }
 
 /// Register the turn the current task is answering, for a CLI spawn of
@@ -234,7 +240,7 @@ pub fn decision_context_for(
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|v| v.last())
-        .and_then(|(_, _, c, _)| c.clone())
+        .and_then(|(_, _, c, _, _)| c.clone())
 }
 
 /// Never reconstruct a transport from a chat id or an employee-supplied token.
@@ -250,5 +256,15 @@ pub(crate) fn target_for(
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|v| v.last())
-        .and_then(|(_, _, _, t)| t.clone())
+        .and_then(|(_, _, _, t, _)| t.clone())
+}
+
+/// A verified inbound human message is still live for this exact employee and
+/// turn. Principal/transport context alone never establishes this proof.
+pub(crate) fn attended_live_for(agent_id:&str,turn_id:&str)->bool {
+    if !valid_turn_id(turn_id) {return false;}
+    registry().lock().unwrap_or_else(|p|p.into_inner())
+        .get(&(agent_id.into(),turn_id.into())).and_then(|list|list.last())
+        .and_then(|(_,_,_,_,proof)|proof.as_ref())
+        .is_some_and(|proof|proof.valid_for(agent_id,turn_id))
 }

@@ -1149,6 +1149,7 @@ export interface PlanStepUpdateParams {
 // ── Activity Feed types ─────────────────────────────────────
 
 export type ActivityType =
+  | 'computer_session.started'
   | 'task_created'
   | 'task_completed'
   | 'task_blocked'
@@ -4155,6 +4156,7 @@ export interface IdentityResolveResult {
 export type ComputerUseMode = 'container' | 'native' | 'auto';
 
 export interface ComputerUseConfig {
+  persist_login?: boolean;
   allowed_apps?: string[];
   blocked_actions?: string[];
   max_session_minutes?: number;

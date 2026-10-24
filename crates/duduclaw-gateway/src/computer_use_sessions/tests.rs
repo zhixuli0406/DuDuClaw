@@ -109,6 +109,8 @@ fn loopback() -> SocketAddr {
 
 #[derive(Default)]
 struct FakeState {
+    observed_attendance: Mutex<Vec<bool>>,
+    observed_action_turn: Mutex<Vec<Option<String>>>,
     executed: Mutex<Vec<ComputerAction>>,
     stops: AtomicU32,
     starts: AtomicU32,
@@ -134,6 +136,8 @@ struct FakeState {
     /// VNC server starts, by mode.
     vnc_starts: Mutex<Vec<&'static str>>,
     fail_vnc: AtomicBool,
+    owner_changed: AtomicBool,
+    login_discarded: AtomicBool,
 }
 
 /// The fake container access a viewer gets.
@@ -189,6 +193,7 @@ impl SessionBackend for FakeBackend {
         self.state.stops.fetch_add(1, Ordering::SeqCst);
     }
     async fn screenshot(&self) -> Result<MaskedScreenshot, ComputerUseError> {
+        self.state.observed_attendance.lock().unwrap().push(attended_call::current("alice"));
         Ok(MaskedScreenshot {
             png_base64: self.state.frame.lock().unwrap().clone().unwrap_or_else(tiny_png_b64),
             full_mask: *self.state.full_mask.lock().unwrap(),
@@ -203,6 +208,7 @@ impl SessionBackend for FakeBackend {
             .unwrap_or_else(|| Ok("about:blank - Chromium".to_string()))
     }
     async fn execute(&self, action: &ComputerAction) -> Result<(), ComputerUseError> {
+        self.state.observed_action_turn.lock().unwrap().push(attended_call::current_turn("alice"));
         self.state.executed.lock().unwrap().push(action.clone());
         Ok(())
     }
@@ -241,6 +247,23 @@ impl SessionBackend for FakeBackend {
     }
     fn control(&self) -> Arc<OrchestratorControl> {
         Arc::clone(&self.control)
+    }
+    fn login_owner_valid(&self) -> bool {
+        !self.state.owner_changed.load(Ordering::SeqCst)
+    }
+    fn login_owner_check(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        let state = Arc::clone(&self.state);
+        Some(Arc::new(move || !state.owner_changed.load(Ordering::SeqCst)))
+    }
+    fn discard_login(&mut self) {
+        self.state.login_discarded.store(true, Ordering::SeqCst);
+    }
+    fn login_state(&self) -> &str {
+        if self.state.login_discarded.load(Ordering::SeqCst) {
+            "discarded"
+        } else {
+            "disabled"
+        }
     }
 }
 
@@ -340,6 +363,16 @@ fn insert_session(
     agent: &str,
     config: ComputerUseConfig,
 ) -> String {
+    insert_session_until(mgr, state, agent, config, Instant::now()+Duration::from_secs(600))
+}
+
+fn insert_session_until(
+    mgr: &ComputerUseSessions,
+    state: &Arc<FakeState>,
+    agent: &str,
+    config: ComputerUseConfig,
+    deadline: Instant,
+) -> String {
     let now = Instant::now();
     let id = format!("cu-{}", uuid::Uuid::new_v4().as_simple());
     mgr.insert(ManagedSession {
@@ -351,7 +384,7 @@ fn insert_session(
         }),
         config,
         started: now,
-        deadline: now + Duration::from_secs(600),
+        deadline,
         actions_used: 0,
         last_activity: now,
         shared: Arc::new(SessionShared::default()),
@@ -2575,12 +2608,23 @@ mod workspace_cases;
 
 #[path = "tests/on_behalf_of.rs"]
 mod on_behalf_of;
+#[path = "tests/attended_call.rs"]
+mod attended_call_cases;
 
 #[path = "tests/workspace_docker.rs"]
 mod workspace_docker;
 
 #[path = "tests/live_cases.rs"]
 mod live_cases;
+#[path = "tests/profile_cases.rs"]
+mod profile_cases;
+
+#[path = "tests/oversight_cases.rs"]
+mod oversight_cases;
+#[path = "tests/profile_docker.rs"]
+mod profile_docker;
+#[path = "tests/team_docker.rs"]
+mod team_docker;
 
 // ── 2026-10: action rules on the computer-use route ─────────────────────
 

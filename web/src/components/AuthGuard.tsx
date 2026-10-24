@@ -7,6 +7,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { ErrorState } from '@/components/mds/error-state';
 import { ROLE_LEVELS } from '@/lib/roles';
+import { browserWatchReturn } from '@/lib/browser-watch-return';
 
 /** The account-settings tab that owns self-service password change (the only
  *  RPC a `must_change_password` account may call besides `users.me`). Kept as
@@ -107,7 +108,8 @@ export function AuthGuard() {
   }
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    const from = browserWatchReturn(`${location.pathname}${location.search}`);
+    return <Navigate to="/login" replace state={from ? { from } : undefined} />;
   }
 
   // 3. WP-0 (bootstrap-admin recovery): an account still flagged

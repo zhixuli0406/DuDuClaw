@@ -52,6 +52,8 @@ use std::path::Path;
 /// link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeepLinkKind {
+    /// A browser's standalone page. Session context is added by the host issuer.
+    ComputerSession,
     /// A task (goal-loop or manually assigned) — `/tasks/<id>`.
     Task,
     /// Anything surfaced in the unified HITL inbox: `ApprovalBroker` rows
@@ -109,6 +111,10 @@ pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
 pub fn deep_link(home_dir: &Path, kind: DeepLinkKind, id: &str) -> Option<String> {
     let base = dashboard_base_url(home_dir)?;
     let path: String = match kind {
+        DeepLinkKind::ComputerSession => {
+            if !duduclaw_core::is_valid_agent_id(id) { return None; }
+            format!("/computer/{id}")
+        }
         DeepLinkKind::Task => format!("/tasks/{id}"),
         // H5: per-item anchor. `id` here is whatever the caller already had
         // (a bare `ApprovalRecord`/`InstallRequest` id, no `approval:`/

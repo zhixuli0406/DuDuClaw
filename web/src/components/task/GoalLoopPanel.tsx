@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { CircleDot, Hand, Radar, UserCheck } from 'lucide-react';
 import { api, type CriteriaLedger, type GoalTimeline, type PauseReasonToken, type TaskInfo } from '@/lib/api';
+import { parseComputerWatch } from '@/stores/chat-frames';
 import { timeAgo, formatHms, secondsBetween } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { Badge, Button } from '@/components/mds';
@@ -319,7 +320,7 @@ export function GoalRoundTimeline({ task, timeline }: { task: TaskInfo; timeline
     }
     const interesting = /^goal_loop\.(created|kickoff_|needs_human|oscillation|human_decision|reassigned|dep_blocked|operator_skipped|observer_autoclose)/;
     for (const ev of timeline.activity ?? []) {
-      if (interesting.test(ev.type)) {
+      if (interesting.test(ev.type) || ev.type === 'computer_session.started') {
         out.push({ key: `e${ev.id}`, at: ev.timestamp, kind: 'event', event: ev });
       }
     }
@@ -470,6 +471,12 @@ export function GoalRoundTimeline({ task, timeline }: { task: TaskInfo; timeline
               ) : n.event ? (
                 <div className="flex flex-wrap items-center gap-2 text-xs">
                   <span className="text-muted-foreground">{n.event.summary}</span>
+                  {n.event.type === 'computer_session.started' && (() => {
+                    const watch = parseComputerWatch(n.event.metadata);
+                    return watch ? <button type="button" onClick={() => navigate(watch.href)} className="text-primary hover:underline">
+                      {intl.formatMessage({ id: 'computerSession.watch' })}
+                    </button> : null;
+                  })()}
                   <span className="ml-auto font-mono tabular-nums text-muted-foreground/70">
                     {timeAgo(n.event.timestamp)}
                   </span>

@@ -38,9 +38,9 @@ pub(crate) const IMAGE_INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Keys `[computer_use]` may carry. Anything else is a typo and makes the
 /// table invalid (fail closed) instead of silently using the default.
-/// `workspaces` is the `[computer_use.workspaces]` sub-table, parsed by
-/// `crate::computer_workspaces::config`.
-const KNOWN_KEYS: &[&str] = &["image", "workspaces"];
+/// The `workspaces` and `profiles` sub-tables have their own strict parsers;
+/// an invalid optional feature disables it without changing image selection.
+const KNOWN_KEYS: &[&str] = &["image", "workspaces", "profiles"];
 
 /// `ghcr.io/zhixuli0406/duduclaw-computer-use:v<this gateway's version>`.
 pub fn default_image() -> String {
@@ -451,6 +451,17 @@ mod tests {
             format!("ghcr.io/zhixuli0406/duduclaw-computer-use:v{}", env!("CARGO_PKG_VERSION"))
         );
         assert!(!image.ends_with(":latest"));
+    }
+
+    #[test]
+    fn profile_settings_do_not_block_image_resolution_and_typos_still_fail() {
+        for settings in ["enabled=true", "enabled='invalid'", "unknown=true"] {
+            let config = table(&format!(
+                "[computer_use]\nimage='duduclaw-computer-use:latest'\n[computer_use.profiles]\n{settings}\n"
+            ));
+            assert_eq!(parse(&config).unwrap(), "duduclaw-computer-use:latest");
+        }
+        assert!(parse(&table("[computer_use.profiels]\nenabled=true\n")).is_err());
     }
 
     #[test]

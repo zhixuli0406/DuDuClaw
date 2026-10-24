@@ -490,7 +490,10 @@ where
     F: std::future::Future<Output = Result<String, String>>,
 {
     use crate::cost_telemetry::RequestType as RT;
-    let fut = crate::on_behalf_of::context::scope(home_dir, agent_id, fut);
+    let fut = crate::computer_use_sessions::attended_call::runtime_scope(
+        request_type == RT::Chat,
+        crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
+    );
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
@@ -547,8 +550,9 @@ where
         let source = request_type.as_str().to_string();
         // Store masks + caps again; this pre-trim just bounds the move.
         let preview_in = duduclaw_core::truncate_chars(prompt, 500);
+        let watch_run_key = run_key.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = store.record_dispatch_run(
+            match store.record_dispatch_run(
                 &agent,
                 &source,
                 &started_at,
@@ -558,7 +562,8 @@ where
                 &preview_out,
                 &steps,
             ) {
-                tracing::debug!(error = %e, "dispatch run record failed (ignored)");
+                Ok(id) => { let _ = store.attach_computer_watches(&agent, &watch_run_key, id); }
+                Err(e) => tracing::debug!(error = %e, "dispatch run record failed (ignored)"),
             }
         })
         .await;
@@ -5670,3 +5675,7 @@ pub fn reply_sender_for(channel: &str, chat_id: &str) -> Option<String> {
     let (ch, chat) = crate::decision_notify::parse_origin(&rc)?;
     (ch == channel.trim() && chat == chat_id.trim()).then_some(sender)
 }
+
+#[cfg(test)]
+#[path = "claude_runner/attended_call_tests.rs"]
+mod attended_call_producer_tests;

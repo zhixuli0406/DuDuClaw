@@ -34,6 +34,9 @@ static WEBCHAT_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ChatMessage {
+    /// Host-issued navigation context for the originating internal conversation.
+    #[serde(rename = "computer_watch")]
+    ComputerWatch { agent_id: String, href: String, conv: Option<String> },
     /// Client → Server: first frame, authenticates the connection (C5).
     #[serde(rename = "auth")]
     Auth { token: String },
@@ -1310,6 +1313,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<
                                     crate::channel_reply::ProgressEvent,
                                 >();
+                                let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(
+                                    crate::computer_watch_links::delivery::WEBCHAT_NOTICE_CAPACITY,
+                                );
                                 let on_progress: crate::channel_reply::ProgressCallback =
                                     Box::new(move |event| {
                                         // Forward the STRUCTURED event so the dashboard can
@@ -1329,7 +1335,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // (these replaced the former `_with_artifact` siblings).
                                 // B10 review L1: learn whether an empty answer is a
                                 // deliberate silence (no `no_reply` frame then).
-                                let work = crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+                                let work = crate::computer_use_sessions::attended::verified_webchat_message(sid, Some(auth_user.as_str()), crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
                                     .scope(auth_user.clone(), async {
                                         match &effective_agent {
                                             Some(a) => {
@@ -1345,7 +1351,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                 .await
                                             }
                                         }
-                                    }));
+                                    })));
+                                let work = crate::computer_watch_links::delivery::webchat_scope(
+                                    &state.ctx.home_dir, effective_agent_id, sid,
+                                    !is_widget_visitor(&auth_user), watch_tx, work,
+                                );
                                 tokio::pin!(work);
                                 // The model the backend ACTUALLY answered with
                                 // (ProgressEvent::ModelInfo) — stamped onto the
@@ -1357,6 +1367,15 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let (reply, deliberate_silence) = loop {
                                     tokio::select! {
                                         r = &mut work => break r,
+                                        Some(notice) = watch_rx.recv() => {
+                                            let msg = ChatMessage::ComputerWatch {
+                                                agent_id: notice.agent_id, href: notice.href,
+                                                conv: conv_nonce.clone(),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&msg) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                        }
                                         Some(ev) = prx.recv() => {
                                             use crate::channel_reply::ProgressEvent;
                                             let content = ev.to_display();
@@ -1410,6 +1429,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         }
                                     }
                                 };
+                                for notice in crate::computer_watch_links::delivery::take_pending(&mut watch_rx) {
+                                    let msg = ChatMessage::ComputerWatch {
+                                        agent_id: notice.agent_id, href: notice.href, conv: conv_nonce.clone(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&msg) {
+                                        let _ = sink.send(Message::Text(json.into())).await;
+                                    }
+                                }
                                 // O-4→O-3: split off the artifact half early — every
                                 // transformation below (📎DELIVER parsing, cli-noise,
                                 // branding, etc.) only ever operates on the text; the

@@ -35,6 +35,103 @@ use std::path::Path;
 use duduclaw_security::secret_manager::SecretManagerConfig;
 use duduclaw_security::secret_ref::{Secret, SecretRef, SecretStatus};
 
+fn opaque_data_key(home: &Path) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    use duduclaw_core::keychain::{MasterKeySource, resolve_master_key};
+    let key = match resolve_master_key(home) {
+        MasterKeySource::Filesystem => load_keyfile(home)?,
+        MasterKeySource::Keychain(secret) => {
+            let secret = zeroize::Zeroizing::new(secret);
+            decode_master_key(&secret)?
+        }
+    };
+    Some(zeroize::Zeroizing::new(key))
+}
+
+/// Read-only availability check for the same key source used by opaque data.
+pub fn opaque_data_key_available(home: &Path) -> bool {
+    opaque_data_key(home).is_some()
+}
+
+/// A purpose-separated, gateway-bound signing key. Read-only lookup keeps
+/// a missing/invalid machine key fail-closed instead of replacing it.
+pub(crate) fn watch_link_key(home: &Path) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    use ring::hkdf;
+    let master = opaque_data_key(home).ok_or("watch link key unavailable")?;
+    let namespace = std::fs::canonicalize(home).map_err(|_| "watch link key unavailable")?;
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"duduclaw/context-signing");
+    let prk = salt.extract(master.as_ref());
+    let info = [b"computer-watch-link/v1".as_slice(), b"\0", namespace.as_os_str().as_encoded_bytes()];
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    prk.expand(&info, hkdf::HKDF_SHA256).map_err(|_| "watch link key unavailable")?
+        .fill(key.as_mut()).map_err(|_| "watch link key unavailable")?;
+    Ok(key)
+}
+
+// Keychain secrets are text. Accept an explicit hex/base64 encoding of the
+// existing 32-byte machine key, or exactly 32 UTF-8 bytes; never derive a new
+// key or fall back to a different key when a stored entry is malformed.
+fn decode_master_key(secret: &str) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let decoded = if secret.len() == 64 {
+        hex::decode(secret).ok()?
+    } else if secret.len() == 32 {
+        secret.as_bytes().to_vec()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(secret)
+            .ok()?
+    };
+    let decoded = zeroize::Zeroizing::new(decoded);
+    decoded.as_slice().try_into().ok()
+}
+
+/// Seal opaque data with context binding. Read-only key lookup: unlike a
+/// credential write, a browser snapshot must never silently generate a new
+/// machine key. The caller supplies a versioned, unambiguous AAD encoding.
+pub(crate) fn seal_bytes(home: &Path, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use ring::{
+        aead,
+        rand::{SecureRandom, SystemRandom},
+    };
+    let key = opaque_data_key(home).ok_or("machine encryption key unavailable")?;
+    let key = aead::UnboundKey::new(&aead::AES_256_GCM, key.as_ref())
+        .map_err(|_| "encryption key unavailable")?;
+    let mut nonce = [0u8; 12];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| "encryption RNG failed")?;
+    let mut data = plaintext.to_vec();
+    aead::LessSafeKey::new(key)
+        .seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(aad),
+            &mut data,
+        )
+        .map_err(|_| "encryption failed")?;
+    let mut out = Vec::with_capacity(12 + data.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
+/// Open opaque data only with the same machine key and context.
+pub(crate) fn open_bytes(home: &Path, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    use ring::aead;
+    if ciphertext.len() < 28 {
+        return Err("invalid sealed data".into());
+    }
+    let key = opaque_data_key(home).ok_or("machine encryption key unavailable")?;
+    let key = aead::UnboundKey::new(&aead::AES_256_GCM, key.as_ref())
+        .map_err(|_| "encryption key unavailable")?;
+    let nonce = aead::Nonce::try_assume_unique_for_key(&ciphertext[..12])
+        .map_err(|_| "invalid sealed data")?;
+    let mut data = ciphertext[12..].to_vec();
+    let plain = aead::LessSafeKey::new(key)
+        .open_in_place(nonce, aead::Aad::from(aad), &mut data)
+        .map_err(|_| "sealed data authentication failed")?;
+    Ok(plain.to_vec())
+}
+
 /// Extract `[secret_manager]` from a config table already sitting in memory.
 ///
 /// Shared by [`decrypt_config_field_async`] and [`read_encrypted_config_field`]
@@ -821,6 +918,26 @@ mod telegram_token_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_key_decoding_preserves_the_machine_key_and_refuses_malformed_entries() {
+        use base64::Engine;
+        let key = [42u8; 32];
+        assert_eq!(decode_master_key(&hex::encode(key)), Some(key));
+        assert_eq!(
+            decode_master_key(&base64::engine::general_purpose::STANDARD.encode(key)),
+            Some(key)
+        );
+        assert_eq!(decode_master_key(&"a".repeat(32)), Some([b'a'; 32]));
+        for bad in [
+            "",
+            "bad-key",
+            &"x".repeat(64),
+            &base64::engine::general_purpose::STANDARD.encode([1u8; 31]),
+        ] {
+            assert!(decode_master_key(bad).is_none());
+        }
+    }
 
     struct TempHome(std::path::PathBuf);
     impl TempHome {
