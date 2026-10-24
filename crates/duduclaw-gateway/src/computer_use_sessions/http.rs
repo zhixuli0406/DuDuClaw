@@ -222,6 +222,13 @@ async fn handle(
         }
     };
     let budget = op_budget(&request);
+    let attendance = serde_json::from_slice::<Value>(&body).ok()
+        .and_then(|body|body.get("principal_context").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|reference|crate::on_behalf_of::context::attended_call(sessions.home(),&agent_id,&reference))
+        .filter(|call|match &request {
+            Request::Start{turn_id,..}|Request::Action{turn_id,..}=>turn_id.as_deref().is_some_and(|turn|call.matches_turn(&agent_id,turn)),
+            _=>true,
+        });
     let principal = request_principal(sessions.home(), &agent_id, &request);
     let op = async {
         match request {
@@ -261,7 +268,8 @@ async fn handle(
             _ => Err(super::not_found()),
         }
     };
-    let op = crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op);
+    let op = super::attended_call::request_scope(attendance,
+        crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op));
     let outcome: Result<Value, OpError> = match tokio::time::timeout(budget, op).await {
         Ok(outcome) => outcome,
         Err(_) => {

@@ -13,6 +13,8 @@
 - 關閉員工的 Google 個人代表身分或改回公司帳號時，不再要求確認已移除的「任何人都能使用」限制；設定個人代表且開放任何人使用時仍須確認。
 
 ### Added
+
+- 容器瀏覽器新增主管遮罩觀看頁面 `/computer/<員工>`。僅限目前報告線下、真人回合啟動且在本次觀看窗口內的工作階段；背景身分不能借用真人來源。權限撤銷會清除舊圖，暫停容器只回舊快照、不喚醒。觀看與停止綁定工作階段，舊確認不能停止替換後的新階段；完整控制仍依原直接綁定授權。受控 Docker／Chrome 已驗證遮罩、撤權、暫停快取與 390px；真服務商、各平台與使用者親測仍分開記錄。見 `docs/guides/browser-watch.md` 與 `wiki/impl/team-browser-acceptance.md`。
 - 每位 AI 員工可以用不同的 Google 帳號（公司授權代表，B2a）：Google Workspace 客戶用一個開了網域委派的服務帳號，讓每位員工以一位指定同事的身分讀信、存草稿、管理日曆與文件。
   - **設定**：員工頁新增「連線」分頁，顯示目前用哪個 Google 帳號；「已設定」僅表示本地資料備妥，需另按「測試連線」確認。管理員可以改成「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。測試會替同事取權杖、比對 Gmail 回報的信箱，再按服務測授權；Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點，試算表、文件、簡報與表單會先找可讀範例，再 GET 服務資源；沒有範例就維持未驗證，不把取權杖當成資料可讀。不寄任何東西。「整合 → Google」新增「公司授權代表」分區：匯入服務帳號金鑰、複製用戶端 ID 與完整權限清單、設定允許網域，以及列出各員工的代表帳號。設定為 `agent.toml [google] identity`（`home`／`none`／`delegate:<email>`）、`fallback`、`requesters`；全域預設為 `config.toml [integrations.google_identity] default_identity`、`allowed_subject_domains`。沒寫 `[google]` 的員工照舊用公司共用帳號；改信箱或 fallback 時保留原本的發問者限制，未知型別拒絕。
   - **金鑰只封存，不落成可讀的檔案**：服務帳號金鑰用系統金鑰圈裡的保護金鑰封存（`pk:v1`）存成 `<home>/protected/google-service-account.sealed`，AI 員工讀不到。憑證保護還沒改放系統金鑰圈、或在 Linux／Docker 上，一律不能代表同事。保護金鑰被換掉時，封存的金鑰解不開，公司授權代表停用、`security_audit.jsonl` 記一筆 Critical 的 `google_delegation_key_unreadable`，要重設憑證保護後重新匯入，舊紀錄不會被悄悄覆蓋。
