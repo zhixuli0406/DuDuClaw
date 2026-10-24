@@ -18,3 +18,9 @@ describe('session-channel', () => {
     expect(isConversationSession('goal:1')).toBe(false);
   });
 });
+
+it('prefers explicit server channels for opaque routes and refuses an unknown explicit class', () => {
+  expect(sessionChannel('view:v1:s:abcdef','whatsapp')?.label).toBe('WhatsApp');
+  expect(sessionChannel('view:v1:s:abcdef','widget')?.label).toBe('Website visitor');
+  expect(sessionChannel('webchat:misleading','internal')).toBeNull();
+});

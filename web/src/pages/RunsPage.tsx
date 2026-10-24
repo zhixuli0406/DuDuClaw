@@ -25,6 +25,7 @@ import {
   type RunStatus,
   type RunSummary,
 } from '@/lib/run-transcript';
+import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
@@ -112,13 +113,13 @@ export function RunsPage() {
   // URL is the state, not a copy of it, so a bookmarked/shared link opens the
   // same view and no mirror effect can fall out of sync.
   const [agentFilter, setAgentFilter] = useUrlState('agent', '');
-  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [runState, setRunState] = useState<{key:string;rows:RunSummary[]} | null>(null);
   const [listError, setListError] = useState<unknown>(null);
   const [listLoaded, setListLoaded] = useState(false);
   // The open transcript is page state too: `?run=<id>` makes "look at this
   // run" a shareable link (P11, phase-4 audit).
   const [selectedId, setSelectedId] = useUrlStateNullable('run');
-  const [detail, setDetail] = useState<RunDetail | null>(null);
+  const [detailState, setDetailState] = useState<{key:string;id:string;value:RunDetail} | null>(null);
   const [detailError, setDetailError] = useState<unknown>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
@@ -126,6 +127,21 @@ export function RunsPage() {
   // an agent_id) — default to the first AI staff member the viewer can see.
   const effectiveAgent =
     agentFilter || (scope !== 'all' ? (visibleAgents[0]?.name ?? '') : '');
+
+  const subject = useAuthStore(s=>JSON.stringify([s.user?.id,s.user?.role,s.user?.status,s.bindings.map(b=>[b.agent_name,b.access_level]).sort()]));
+  const previousSubject=useRef(subject);
+  useEffect(()=>{
+    if(previousSubject.current!==subject){previousSubject.current=subject;setSelectedId(null);}
+  },[subject,setSelectedId]);
+  const privacyKey=JSON.stringify([subject,scope,effectiveAgent]);
+  const privacyRef=useRef(privacyKey);privacyRef.current=privacyKey;
+  const listEpoch=useRef(0);const detailEpoch=useRef(0);
+  const runs=runState?.key===privacyKey?runState.rows:[];
+  const detail=detailState?.key===privacyKey&&detailState.id===selectedId?detailState.value:null;
+  useEffect(()=>{
+    ++listEpoch.current;++detailEpoch.current;
+    setRunState(null);setDetailState(null);setDetailError(null);setListError(null);setListLoaded(false);
+  },[privacyKey]);
 
   // Only the user's own choice reaches the URL — the non-admin default scope
   // above is derived, not a filter the user picked, so it stays out (W3-3).
@@ -146,19 +162,18 @@ export function RunsPage() {
 
   // ── Runs list: initial fetch + gentle refresh ─────────────
   const fetchRuns = useCallback(async () => {
-    if (scope !== 'all' && !effectiveAgent) return; // nothing visible yet
+    if (scope !== 'all' && !effectiveAgent) {setRunState({key:privacyKey,rows:[]});setListLoaded(true);return;}
+    const ticket=++listEpoch.current;const key=privacyKey;
     try {
-      const res = await api.runs.list(
-        effectiveAgent ? { agent_id: effectiveAgent } : {},
-      );
-      setRuns(res.runs);
-      setListError(null);
-    } catch (e) {
-      setListError(e);
+      const res=await api.runs.list(effectiveAgent?{agent_id:effectiveAgent}:{});
+      if(ticket!==listEpoch.current||key!==privacyRef.current)return;
+      setRunState({key,rows:res.runs});setListError(null);
+    } catch(e) {
+      if(ticket===listEpoch.current&&key===privacyRef.current){setRunState(null);setListError(e);}
     } finally {
-      setListLoaded(true);
+      if(ticket===listEpoch.current&&key===privacyRef.current)setListLoaded(true);
     }
-  }, [effectiveAgent, scope]);
+  },[effectiveAgent,scope,privacyKey]);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -173,26 +188,33 @@ export function RunsPage() {
   }, [connectionState, fetchRuns]);
 
   // ── Transcript: fetch on selection; poll while live ───────
-  const fetchDetail = useCallback(async (runId: string, replace: boolean) => {
-    if (replace) {
-      setDetailLoading(true);
-      setDetail(null);
+  const fetchDetail = useCallback(async (runId:string,replace:boolean)=>{
+    const ticket=++detailEpoch.current;const key=privacyKey;
+    if(replace){setDetailLoading(true);setDetailState(null);setDetailError(null);}
+    try{
+      const res=await api.runs.get(runId);
+      if(ticket!==detailEpoch.current||key!==privacyRef.current)return;
+      setDetailState({key,id:runId,value:res});setDetailError(null);
+    }catch(e){
+      if(ticket===detailEpoch.current&&key===privacyRef.current){setDetailState(null);setDetailError(e);}
+    }finally{
+      if(ticket===detailEpoch.current&&key===privacyRef.current)setDetailLoading(false);
     }
-    try {
-      const res = await api.runs.get(runId);
-      setDetail(res);
-      setDetailError(null);
-    } catch (e) {
-      setDetailError(e);
-    } finally {
-      setDetailLoading(false);
-    }
-  }, []);
+  },[privacyKey]);
 
   useEffect(() => {
     if (!selectedId || connectionState !== 'authenticated') return;
     void fetchDetail(selectedId, true);
   }, [selectedId, connectionState, fetchDetail]);
+
+  useEffect(()=>{
+    const refresh=()=>{
+      setRunState(null);setListLoaded(false);void fetchRuns();
+      if(selectedId)void fetchDetail(selectedId,true);
+    };
+    window.addEventListener('focus',refresh);
+    return ()=>window.removeEventListener('focus',refresh);
+  },[selectedId,fetchRuns,fetchDetail]);
 
   const detailIsLive = detail ? isRunLive(detail.run) : false;
   useEffect(() => {
@@ -252,7 +274,7 @@ export function RunsPage() {
             onValueChange={(v) => {
               setAgentFilter(String(v));
               setSelectedId(null);
-              setDetail(null);
+              setDetailState(null);
             }}
           >
             <SelectTrigger size="sm" className="max-w-44">
@@ -424,6 +446,8 @@ export function RunsPage() {
             </div>
           </div>
 
+          {detail.privacy_mode==='masked' && detail.ner!==true && <p role="status" className="mx-5 mt-3 rounded-lg bg-amber-500/10 p-3 text-sm">{intl.formatMessage({id:'boundHistory.regexOnly'})}</p>}
+          {detail.omitted?.includes('tool_steps') && <p className="mx-5 mt-2 text-xs text-muted-foreground">{intl.formatMessage({id:'boundHistory.toolsOmitted'})}</p>}
           {/* Event cards */}
           <div
             ref={scrollRef}

@@ -289,3 +289,5 @@ says.
 
 `duduclaw credentials status` (add `--json` for scripts) prints the same
 state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).
+
+Direct-binding history privacy: `[people] bound_history_privacy = true` is enabled by default (missing/invalid values stay restricted). Admins may explicitly set `false` in the advanced editor for migration; this restores old broad Viewer/Operator history. Owner/Admin and chat/call permissions are unchanged. See feature 68 for search/export/attachment scope and NER limits.

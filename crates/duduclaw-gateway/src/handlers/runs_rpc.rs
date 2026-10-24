@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::history_privacy::{self as privacy, Mode, Class, handles, read};
 
 impl MethodHandler {
     // ── Run inspector (G12) ─────────────────────────────────
@@ -35,6 +36,14 @@ impl MethodHandler {
             .unwrap_or(RUNS_LIST_DEFAULT_LIMIT as u64)
             .min(RUNS_LIST_MAX_LIMIT as u64) as usize;
 
+        let live = match self.bound_history_live(ctx) { Ok(c)=>c, Err(e)=>return WsFrame::error_response("",&e) };
+        let initial = if agent_filter.is_empty() {
+            if live.is_admin() { Mode::Full } else { return WsFrame::error_response("","agent_id required"); }
+        } else { match privacy::mode(&self.home_dir,&live,&agent_filter) { Ok(m)=>m,Err(_)=>return WsFrame::error_response("","permission denied") } };
+        let restricted = if initial == Mode::Filtered {
+            match self.bound_runs_list(&live,&agent_filter,limit).await { Ok(r)=>Some(r),Err(e)=>return WsFrame::error_response("",&e) }
+        } else { None };
+
         let reader = match self
             .task_list_reader(ctx, Some(agent_filter.as_str()).filter(|a| !a.is_empty()))
         {
@@ -50,7 +59,7 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("open sessions db: {e}")),
         };
 
-        let mut rows = match query_run_msg_rows(&conn, &agent_filter, RUNS_SCAN_MSG_CAP) {
+        let mut rows = match if initial == Mode::Filtered { Ok(vec![]) } else { query_run_msg_rows(&conn, &agent_filter, RUNS_SCAN_MSG_CAP) } {
             Ok(r) => r,
             Err(e) => return WsFrame::error_response("", &format!("runs query: {e}")),
         };
@@ -93,6 +102,8 @@ impl MethodHandler {
                 run_summary_to_json(r, steps)
             })
             .collect();
+
+        if let Some(restricted) = restricted { runs_json = restricted; }
 
         // Cron/dispatch runs (dispatch_runs in run_steps.db) — the scheduled
         // twin of the session-folded channel runs above. Previously these
@@ -142,10 +153,14 @@ impl MethodHandler {
                 .cmp(a["started_at"].as_str().unwrap_or(""))
         });
         runs_json.truncate(limit);
+        let valid = if agent_filter.is_empty() { self.bound_history_live(&live).is_ok_and(|c|c.is_admin()) } else { self.bound_history_recheck(&live,&agent_filter,initial).is_ok() };
+        if !valid { return WsFrame::error_response("","history authority changed; refresh"); }
         WsFrame::ok_response("", json!({ "runs": runs_json }))
     }
 
     pub(crate) async fn handle_runs_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let live_ctx=match self.bound_history_live(ctx) {Ok(c)=>c,Err(_)=>return WsFrame::error_response("","Run not found")};
+        let ctx=&live_ctx;
         let run_id = params.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
 
         // Cron/dispatch run (`dispatch:<id>`) — served entirely from
@@ -226,6 +241,9 @@ impl MethodHandler {
             );
         }
 
+        let live = match self.bound_history_live(ctx) { Ok(c)=>c, Err(_)=>return WsFrame::error_response("","Run not found") };
+        let resolved = match handles::resolve_run(&self.home_dir,&live.user_id,run_id).await { Ok(r)=>r, Err(_)=>return WsFrame::error_response("","Run not found") };
+        let run_id=resolved.as_str();
         let Some((session_id, rowid_str)) = run_id.rsplit_once('#') else {
             return WsFrame::error_response("", "Missing or invalid 'run_id' parameter");
         };
@@ -241,6 +259,15 @@ impl MethodHandler {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &format!("open sessions db: {e}")),
         };
+
+        let owner=match conn.query_row("SELECT agent_id FROM sessions WHERE id=?1",[session_id],|r|r.get::<_,String>(0)) {Ok(a)=>a,Err(_)=>return WsFrame::error_response("","Run not found")};
+        let initial=match privacy::mode(&self.home_dir,&live,&owner) { Ok(m)=>m, Err(_)=>return WsFrame::error_response("","Run not found") };
+        if initial==Mode::Filtered {
+            let metadata=match read::metadata(&conn,&live.user_id,session_id) { Ok(Some(m))=>m, _=>return WsFrame::error_response("","Run not found") };
+            if metadata.class==Class::Hidden { return WsFrame::error_response("","Run not found"); }
+            drop(conn);
+            return match self.bound_run_get(&live,run_id,&metadata.agent,metadata.class).await { Ok(v)=>WsFrame::ok_response("",v),Err(e)=>WsFrame::error_response("",&e) };
+        }
 
         // Resolve the run's user turn + owning agent. Fail closed: an unknown
         // run id yields "not found" BEFORE any payload is exposed.
@@ -436,6 +463,7 @@ impl MethodHandler {
             })
         });
 
+        if let Err(e)=self.bound_history_recheck(&live,&agent_id,initial) {return WsFrame::error_response("",&e);}
         let run = json!({
             "id": run_id,
             "session_id": session_id,

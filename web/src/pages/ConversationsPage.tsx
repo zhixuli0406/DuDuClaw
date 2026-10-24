@@ -12,7 +12,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useChatStore } from '@/stores/chat-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { useConversationsStore } from '@/stores/conversations-store';
+import { conversationIdentityKey, useConversationsStore } from '@/stores/conversations-store';
 import {
   ActorAvatar,
   Badge,
@@ -60,6 +60,8 @@ export function ConversationsPage() {
   const navigate = useNavigate();
 
   const role = useAuthStore((s) => s.user?.role);
+  const subject = useAuthStore(conversationIdentityKey);
+  const userStatus = useAuthStore((s) => s.user?.status);
   const canListAll = hasMinRole(role, 'admin');
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
@@ -69,8 +71,9 @@ export function ConversationsPage() {
   const resume = useConversationsStore((s) => s.resume);
   const startNew = useConversationsStore((s) => s.startNew);
 
-  const [sessions, setSessions] = useState<readonly ChatSessionSummary[]>([]);
-  const [state, setState] = useState<LoadState>('loading');
+  const [listing, setListing] = useState<{
+    key: string; sessions: readonly ChatSessionSummary[]; state: LoadState;
+  } | null>(null);
   // P11 (state-as-URL): search / employee scope / page all live in the query
   // string, so a filtered listing is bookmarkable and survives a refresh.
   const [query, setQuery] = useUrlState('q', '');
@@ -88,40 +91,50 @@ export function ConversationsPage() {
   );
   // The scope a non-admin listing falls back to when no employee is picked.
   const defaultAgentId = selectedAgentId ?? mainAgentId;
+  const scopedAgentId = agentFilter !== 'all' ? agentFilter : canListAll ? null : defaultAgentId;
+  const listKey = JSON.stringify([subject, connectionState, scopedAgentId, reloadNonce]);
+  const currentKey = useRef(listKey);
+  currentKey.current = listKey;
+  const requestEpoch = useRef(0);
+  // Scope changes hide old rows during render, before effects can run.
+  const current = listing?.key === listKey ? listing : null;
+  const sessions = current?.sessions ?? [];
+  const state = current?.state ?? 'loading';
 
   useEffect(() => {
     if (connectionState === 'authenticated') fetchAgents();
   }, [connectionState, fetchAgents]);
 
   useEffect(() => {
-    if (connectionState !== 'authenticated') return;
-    let cancelled = false;
-
-    const scoped = agentFilter !== 'all' ? agentFilter : canListAll ? null : defaultAgentId;
-    // Non-admin with nothing to scope to: the RPC would reject an unscoped
-    // listing, so say "nothing here" rather than showing a failure.
-    if (!canListAll && !scoped) {
-      setSessions([]);
-      setState('ready');
+    const ticket = ++requestEpoch.current;
+    const key = listKey;
+    const isCurrent = () => ticket === requestEpoch.current && key === currentKey.current;
+    if (connectionState !== 'authenticated' || (userStatus && userStatus !== 'active')) {
+      setListing({ key, sessions: [], state: 'ready' });
       return;
     }
-
-    setState('loading');
+    if (!canListAll && !scopedAgentId) {
+      setListing({ key, sessions: [], state: 'ready' });
+      return;
+    }
+    setListing({ key, sessions: [], state: 'loading' });
     api.chatSessions
-      .list(scoped ? { agent_id: scoped, limit: FETCH_LIMIT } : { limit: FETCH_LIMIT })
+      .list(scopedAgentId ? { agent_id: scopedAgentId, limit: FETCH_LIMIT } : { limit: FETCH_LIMIT })
       .then((res) => {
-        if (cancelled) return;
-        setSessions((res?.sessions ?? []).filter((s) => isConversationSession(s.session_id)));
-        setState('ready');
+        if (!isCurrent()) return;
+        setListing({ key, sessions: (res?.sessions ?? []).filter((s) => isConversationSession(s.session_id, s.channel)), state: 'ready' });
       })
       .catch(() => {
-        if (!cancelled) setState('error');
+        if (isCurrent()) setListing({ key, sessions: [], state: 'error' });
       });
+    return () => { ++requestEpoch.current; };
+  }, [connectionState, userStatus, canListAll, scopedAgentId, listKey]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [connectionState, canListAll, agentFilter, defaultAgentId, reloadNonce]);
+  useEffect(() => {
+    const refresh = () => setReloadNonce((n) => n + 1);
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
+  }, []);
 
   const agentLabel = (agentId: string) =>
     agents.find((a) => a.name === agentId)?.display_name ?? agentId;
@@ -132,9 +145,9 @@ export function ConversationsPage() {
     const needle = query.trim().toLowerCase();
     if (!needle) return sessions;
     return sessions.filter((s) => {
-      const channel = sessionChannel(s.session_id);
+      const channel = sessionChannel(s.session_id, s.channel);
       const haystack = [
-        s.title || untitled,
+        (s.read_only ? intl.formatMessage({id:'boundHistory.label'}) : s.title) || untitled,
         agentLabel(s.agent_id),
         s.agent_id,
         channel?.label ?? '',
@@ -316,8 +329,8 @@ export function ConversationsPage() {
             }
           >
             {visible.map((s) => {
-              const channel = sessionChannel(s.session_id);
-              const title = s.title || untitled;
+              const channel = sessionChannel(s.session_id, s.channel);
+              const title = (s.read_only ? intl.formatMessage({id:'boundHistory.label'}) : s.title) || untitled;
               const owner = agentLabel(s.agent_id);
               return (
                 <ListGridRow
@@ -328,7 +341,6 @@ export function ConversationsPage() {
                   <ListGridCell>
                     <button
                       type="button"
-                      onClick={() => void open(s)}
                       className="min-w-0 truncate text-left text-sm text-foreground hover:underline"
                       title={title}
                     >
