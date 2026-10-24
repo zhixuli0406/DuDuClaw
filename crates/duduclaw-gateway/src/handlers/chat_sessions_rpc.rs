@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::history_privacy::{self as privacy, Class, Mode, handles, read};
 
 impl MethodHandler {
     // ── WebChat session history + resume handlers (WP3) ─────────
@@ -13,7 +14,7 @@ impl MethodHandler {
     // these RPCs only surface what exists so the client can pick a session id
     // to resume.
 
-    pub(crate) async fn handle_chat_sessions_list(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_chat_sessions_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_filter = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -30,6 +31,17 @@ impl MethodHandler {
             .unwrap_or(CHAT_SESSIONS_LIST_DEFAULT_LIMIT as u64)
             .min(CHAT_SESSIONS_LIST_MAX_LIMIT as u64) as usize;
 
+        let live = match self.bound_history_live(ctx) { Ok(c) => c, Err(e) => return WsFrame::error_response("", &e) };
+        let initial = if let Some(agent) = agent_filter {
+            match privacy::mode(&self.home_dir, &live, agent) { Ok(m) => m, Err(_) => return WsFrame::error_response("", "session not found") }
+        } else if live.is_admin() { Mode::Full } else { return WsFrame::error_response("", "agent_id required"); };
+        if initial == Mode::Filtered {
+            return match self.bound_history_list(&live, agent_filter.unwrap(), limit).await {
+                Ok(sessions) => WsFrame::ok_response("",json!({"sessions":sessions})),
+                Err(e) => WsFrame::error_response("",&e),
+            };
+        }
+
         let rc = match self.reply_ctx.read().await.clone() {
             Some(c) => c,
             // Reply context not yet wired (very early startup) — no sessions to
@@ -39,6 +51,10 @@ impl MethodHandler {
 
         match rc.session_manager.list_sessions(agent_filter, limit).await {
             Ok(list) => {
+                let valid = if let Some(agent) = agent_filter {
+                    self.bound_history_recheck(&live, agent, initial).is_ok()
+                } else { self.bound_history_live(&live).is_ok_and(|c|c.is_admin()) };
+                if !valid { return WsFrame::error_response("", "history authority changed; refresh"); }
                 let sessions: Vec<Value> = list
                     .iter()
                     .map(|s| {
@@ -60,7 +76,7 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_chat_sessions_history(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let session_id = params
+        let mut session_id = params
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -80,6 +96,10 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "session store unavailable"),
         };
 
+        let live = match self.bound_history_live(ctx) { Ok(c) => c, Err(e) => return WsFrame::error_response("",&e) };
+        session_id = match handles::resolve(&self.home_dir,&live.user_id,&session_id).await {
+            Ok(s) => s, Err(_) => return WsFrame::error_response("","session not found"),
+        };
         // Resolve the owning agent; fail closed on an unknown id (never expose
         // an empty transcript for a session that does not exist).
         let owner = match rc.session_manager.session_agent(&session_id).await {
@@ -87,12 +107,20 @@ impl MethodHandler {
             Ok(None) => return WsFrame::error_response("", "session not found"),
             Err(e) => return WsFrame::error_response("", &format!("resolve session: {e}")),
         };
-        // Agent-scoped authz — viewer level, fail-closed for non-admins (mirrors
-        // runs.get). Prevents loading a conversation for an agent the caller
-        // cannot see.
-        if !ctx.is_admin() {
-            if let Err(e) = acl::require_agent_access(ctx, &owner, AccessLevel::Viewer) {
-                return WsFrame::error_response("", &e);
+        let initial = match privacy::mode(&self.home_dir,&live,&owner) {
+            Ok(m) => m, Err(_) => return WsFrame::error_response("","session not found"),
+        };
+        if initial == Mode::Filtered {
+            let home=self.home_dir.clone(); let user=live.user_id.clone(); let id=session_id.clone();
+            let permit=match read::permit() { Ok(p)=>p,Err(e)=>return WsFrame::error_response("",&e) };
+            let metadata=tokio::task::spawn_blocking(move || {let _permit=permit;read::metadata(&read::open(&home)?,&user,&id)}).await;
+            let class=match metadata { Ok(Ok(Some(m))) => m.class, _ => return WsFrame::error_response("","session not found") };
+            match class {
+                Class::Hidden => return WsFrame::error_response("","session not found"),
+                Class::External {channel} => return match self.bound_external_history(&live,&session_id,&owner,&channel,limit).await {
+                    Ok(value) => WsFrame::ok_response("",value), Err(e) => WsFrame::error_response("",&e),
+                },
+                Class::Own => {},
             }
         }
 
@@ -106,6 +134,7 @@ impl MethodHandler {
             .unwrap_or_default();
         match rc.session_manager.get_messages(&session_id).await {
             Ok(msgs) => {
+                if let Err(e)=self.bound_history_recheck(&live,&owner,initial) { return WsFrame::error_response("",&e); }
                 let ids = (ids.len() == msgs.len()).then_some(ids);
                 // F9: `get_messages` returns oldest→newest. Show the NEWEST
                 // `limit` turns (where the user left off), not the oldest — on a
@@ -134,14 +163,9 @@ impl MethodHandler {
                         row
                     })
                     .collect();
-                WsFrame::ok_response(
-                    "",
-                    json!({
-                        "session_id": session_id,
-                        "agent_id": owner,
-                        "messages": messages,
-                    }),
-                )
+                let mut response=json!({"session_id":session_id,"agent_id":owner,"messages":messages});
+                if initial==Mode::Filtered {response["privacy_mode"]=json!("own");response["channel"]=json!("webchat");}
+                WsFrame::ok_response("",response)
             }
             Err(e) => WsFrame::error_response("", &format!("session history: {e}")),
         }

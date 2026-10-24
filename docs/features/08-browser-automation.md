@@ -277,8 +277,8 @@ A person resumes it from the Computer tab (**Resume**, audited `injection_resume
 
 ### Not covered and not verified
 
-- The `-rfbportv6 -1` fix is in the published image. The [v1.75.0 image workflow](https://github.com/zhixuli0406/DuDuClaw/actions/runs/39171117110) passed both linux/amd64 and linux/arm64 builds and orchestrator-flag smoke tests on 2026-10-18. This verifies the unix-socket relay and no VNC TCP listener; real-browser noVNC and pause/resume acceptance remain separate.
-- The noVNC picture in a real browser against a real container, and `docker pause` / `docker unpause` and `docker rm --force` on paused containers, are unverified.
+- The [v1.75.0 image workflow](https://github.com/zhixuli0406/DuDuClaw/actions/runs/39171117110) passed linux/amd64 and linux/arm64 builds and orchestrator-flag smoke on 2026-10-18. Its RFB greeting did not prove authentication. A later real-browser test found that the x11vnc -localhost IP allowlist rejects its Unix peer named localhost. The unreleased helper uses -listen 127.0.0.1 instead, preserving the root-only Unix socket, password and both no-TCP-listener checks.
+- On Docker Desktop macOS arm64, the local corrected image passed actual RFB authentication and reconnect, wrong-password refusal, sandbox socket denial, no 5900–5999 listener and socket removal on stop. Chrome displayed a synthetic page through the real gateway/noVNC relay. No real website account was used. Other browsers, remote WSS proxies, native Linux/Windows and forced removal of paused containers remain unverified. The isolated protocol test is scripts/live-test/computer-vnc-auth.mjs; install dashboard dependencies before running it.
 - VNC authentication uses an 8-character password and DES; the real protection is the root-only unix socket and the gateway's authenticated, filtered relay. The password reaches the authorized viewer's browser.
 - A Manager or Operator bound to the employee sees the whole screen (masking applies to the employee's screenshots, not to the live stream), including what a site displays.
 - Switching between view-only and input mode restarts the VNC server, so open viewers disconnect and reconnect.

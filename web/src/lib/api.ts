@@ -92,6 +92,8 @@ export type CallableVia = 'admin' | 'binding' | 'team' | 'default' | 'public';
  *  WebChat `@` list and staff picker. Computed on the server with the same
  *  check every message goes through, so everything listed can be called. */
 export interface CallableAgent {
+  /** True only when the caller's own conversation is visible to a manager. */
+  manager_may_read?: boolean;
   name: string;
   display_name: string;
   /** The exact `@…` text that calls this staff member. */
@@ -886,6 +888,50 @@ export interface CriteriaLedger {
   units: CriteriaLedgerUnit[];
   last_report_round: number | null;
   invalid_reports: number;
+}
+
+/** When a scheduled assignment fires, as the dashboard sends it
+ *  (`tasks.goal_create` / `tasks.create` with `schedule`). Times are
+ *  wall-clock in `schedule_timezone`; `cron` is Admin-only. */
+export type AssignScheduleInput =
+  | { kind: 'once'; at: string }
+  | { kind: 'hourly'; minute?: number }
+  | { kind: 'daily' | 'weekdays'; time: string }
+  | { kind: 'weekly'; days: number[]; time: string }
+  | { kind: 'cron'; expr: string };
+
+/** The stored schedule (`assign_schedules.list`); `days` 1 = Monday … 7 = Sunday. */
+export type AssignScheduleSpec =
+  | { kind: 'once'; at: string }
+  | { kind: 'hourly'; minute: number }
+  | { kind: 'daily' | 'weekdays'; hour: number; minute: number }
+  | { kind: 'weekly'; days: number[]; hour: number; minute: number }
+  | { kind: 'cron'; expr: string };
+
+/** One scheduled assignment. Every fire re-checks the creator's right. */
+export interface AssignScheduleInfo {
+  id: string;
+  agent_id: string;
+  kind: 'task' | 'goal';
+  title: string;
+  description: string;
+  schedule: AssignScheduleSpec;
+  timezone: string | null;
+  status: 'active' | 'paused' | 'done';
+  /** `by_user` | `access_lost` | `agent_unavailable` | `create_failed` | `schedule_restricted`. */
+  pause_reason: string | null;
+  created_via: string;
+  creator_user_id: string;
+  /** Filled in an Admin's "everyone" listing for other people's rows. */
+  creator_name: string | null;
+  next_fire_at: string | null;
+  last_fire_at: string | null;
+  last_task_id: string | null;
+  /** `created` | `skipped:<reason>` | `failed`. */
+  last_outcome: string | null;
+  fire_count: number;
+  skip_count: number;
+  created_at: string;
 }
 
 export interface TaskInfo {
@@ -2255,6 +2301,8 @@ export interface UserDetail extends UserInfo {
 
 /** One AI employee a manager may call through a report (`users.my_team`). */
 export interface TeamAgent {
+  /** Server-computed advisory flag; disclosure is authorised again per read. */
+  history_readable?: boolean;
   name: string;
   display_name: string;
   /** The text that calls exactly this employee in a conversation (`@名字`). */
@@ -2285,10 +2333,54 @@ export interface TeamMember {
   agents: TeamAgent[];
 }
 
+/** Metadata-only receipts for the authenticated account's own WebChat. */
+export interface MyHistoryView {
+  viewer_display_name: string | null;
+  agent_display_name: string | null;
+  timestamp: string;
+  type: 'webchat';
+}
+
 export interface MyTeam {
+  /** null = the activation window could not be read safely. */
+  history_enabled?: boolean | null;
   manager: { id: string; display_name: string } | null;
   max_depth: number;
   members: TeamMember[];
+}
+
+export type TeamHistoryClass = 'own' | 'report_webchat' | 'external';
+export type TeamHistoryPart = { t: 'text'; v: string } | { t: 'mask'; cat: string; n: number }
+  | { t: 'attachment'; kind: string; name?: string };
+export interface TeamHistorySession {
+  session_id: string;
+  class: TeamHistoryClass;
+  channel: string | null;
+  report: { user_id: string; display_name: string } | null;
+  title: string;
+  title_masked: boolean;
+  last_active: string;
+  turns: number;
+}
+export interface TeamHistoryList {
+  sessions: TeamHistorySession[];
+  next_before?: string | null;
+  ner: boolean;
+  since: string;
+}
+export interface TeamHistoryTranscript {
+  session_id: string;
+  agent_id: string;
+  class: TeamHistoryClass;
+  read_only: true;
+  ner: boolean;
+  since: string;
+  messages: Array<{ role: string; sender_label: string; parts: TeamHistoryPart[]; timestamp: string }>;
+  masked_counts: Record<string, number>;
+}
+export interface TeamHistorySettings {
+  manager_team_history: boolean;
+  since: string | null;
 }
 
 export interface AuditEntry {
@@ -5510,6 +5602,10 @@ export type GoogleCredentialsInput =
 /** One past WebChat session, as returned by `chat.sessions.list`
  *  (newest first, archived excluded). */
 export interface ChatSessionSummary {
+  /** Explicit source label for opaque, privacy-filtered session ids. */
+  channel?: string;
+  read_only?: boolean;
+  title_masked?: boolean;
   session_id: string;
   agent_id: string;
   /** Auto-generated title following the discussion (background titler);
@@ -5524,6 +5620,9 @@ export interface ChatSessionSummary {
 }
 
 export interface ChatSessionMessage {
+  sender_label?: string;
+  parts?: TeamHistoryPart[];
+  artifact?: unknown;
   role: string;
   content: string;
   /** RFC3339 timestamp. */
@@ -5534,6 +5633,10 @@ export interface ChatSessionMessage {
 }
 
 export interface ChatSessionHistory {
+  read_only?: boolean;
+  privacy_mode?: 'own' | 'masked';
+  channel?: string;
+  ner?: boolean;
   session_id: string;
   agent_id: string;
   messages: ChatSessionMessage[];
@@ -7693,6 +7796,22 @@ export const api = {
         warning?: string;
       }>,
   },
+  /** Scheduled assignments: the caller's own; `scope: 'all'` lists
+   *  everyone's for an Admin. */
+  assignSchedules: {
+    list: (scope: 'mine' | 'all' = 'mine') =>
+      client.call('assign_schedules.list', { scope }) as Promise<{
+        schedules: AssignScheduleInfo[];
+        max_active: number | null;
+        min_interval_minutes: number | null;
+      }>,
+    pause: (id: string) =>
+      client.call('assign_schedules.pause', { id }) as Promise<{ schedule: AssignScheduleInfo }>,
+    resume: (id: string) =>
+      client.call('assign_schedules.resume', { id }) as Promise<{ schedule: AssignScheduleInfo }>,
+    remove: (id: string) =>
+      client.call('assign_schedules.remove', { id }) as Promise<{ schedule: AssignScheduleInfo }>,
+  },
   tasks: {
     list: (filters?: {
       status?: TaskStatus;
@@ -7793,6 +7912,20 @@ export const api = {
          *  生成，等待你核准" instead of the normal assign toast. */
         plan_first: boolean;
       }>,
+    /** `tasks.goal_create` with a `schedule`: nothing starts now; the goal
+     *  is created at each fire on the caller's behalf. */
+    goalSchedule: (params: {
+      agent_id: string;
+      description: string;
+      acceptance_criteria?: string;
+      priority?: 'low' | 'medium' | 'high' | 'urgent';
+      duration_hours?: number;
+      risk_boundary?: string;
+      require_beliefs?: boolean;
+      plan_first?: boolean;
+      schedule: AssignScheduleInput;
+      schedule_timezone?: string;
+    }) => client.call('tasks.goal_create', { ...params }) as Promise<{ schedule: AssignScheduleInfo }>,
     /** One goal task's whole loop story: rounds, task-scoped activity,
      *  pending kickoff approval. */
     timeline: (taskId: string) =>
@@ -8314,6 +8447,17 @@ export const api = {
     /** 我的團隊: everyone below the caller (manager+, Enterprise only) and the
      *  AI employees the caller may call through each of them. */
     myTeam: () => client.call('users.my_team') as Promise<MyTeam>,
+    myHistoryViews: (before?: string) => client.call('users.my_history_views', { before, limit: 50 }) as Promise<{ views: MyHistoryView[]; next_before: string | null }>,
+    teamHistory: {
+      list: (params: { agent_id: string; report_user_id?: string; class?: TeamHistoryClass; before?: string; limit?: number }) =>
+        client.call('users.team_history.list', params) as Promise<TeamHistoryList>,
+      get: (sessionId: string, limit = 200) =>
+        client.call('users.team_history.get', { session_id: sessionId, limit }) as Promise<TeamHistoryTranscript>,
+    },
+    orgSettings: {
+      get: () => client.call('users.org_settings.get') as Promise<TeamHistorySettings>,
+      update: (enabled: boolean) => client.call('users.org_settings.update', { manager_team_history: enabled }) as Promise<TeamHistorySettings>,
+    },
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,
     bindAgent: (userId: string, agentName: string, accessLevel?: string) =>

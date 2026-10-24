@@ -30,6 +30,8 @@ import {
 import { PromptBar } from './PromptBar';
 import { AgentModelPicker } from './AgentModelPicker';
 import { ConnectorChips } from './ConnectorChips';
+import { ScheduleField } from './ScheduleField';
+import { WHEN_NOW, scheduleErrorText, toScheduleInput, viewerTimezone, type WhenValue } from '@/lib/assign-schedule';
 
 /**
  * AssignSheet — the one 交辦 panel (UX plan I-1a/I-1b).
@@ -94,6 +96,8 @@ export function AssignSheet() {
   const [showMore, setShowMore] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // When it runs: now (default), once later, or on a repeat.
+  const [when, setWhen] = useState<WhenValue>(WHEN_NOW);
 
   useEffect(() => {
     if (open && !loaded) fetchAgents();
@@ -119,6 +123,7 @@ export function AssignSheet() {
     setRequireBeliefs(false);
     setShowMore(false);
     setShowGuide(false);
+    setWhen(WHEN_NOW);
   }, [open, prefill, defaultAgentId]);
 
   // The roster can arrive after the panel opened; adopt the default then.
@@ -171,6 +176,39 @@ export function AssignSheet() {
       toast.error(intl.formatMessage({ id: 'goals.create.durationInvalid' }));
       return;
     }
+    let schedule;
+    try {
+      schedule = toScheduleInput(when);
+    } catch {
+      toast.error(intl.formatMessage({ id: 'assign.when.incomplete' }));
+      return;
+    }
+    if (schedule) {
+      setSubmitting(true);
+      try {
+        await api.tasks.goalSchedule({
+          agent_id: agentId,
+          description: goalText,
+          acceptance_criteria: composeCriteria(),
+          priority: priority as 'low' | 'medium' | 'high' | 'urgent',
+          duration_hours: parsedDuration,
+          risk_boundary: (isAdmin && riskBoundary.trim()) || undefined,
+          require_beliefs: requireBeliefs || undefined,
+          plan_first: planFirst || undefined,
+          schedule,
+          schedule_timezone: viewerTimezone(),
+        });
+        toast.success(intl.formatMessage({ id: 'assign.when.scheduled' }));
+        closeAssign();
+        // The schedule is listed under 我交辦的.
+        navigate('/goals?assigned=me');
+      } catch (e) {
+        toast.error(scheduleErrorText(intl, e));
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     setSubmitting(true);
     try {
       const result = await api.tasks.goalCreate({
@@ -211,7 +249,13 @@ export function AssignSheet() {
 
   const submitLabel = intl.formatMessage({
     id:
-      mode === 'ask' ? 'assign.submitAsk' : mode === 'plan' ? 'assign.submitPlan' : 'assign.submit',
+      mode === 'ask'
+        ? 'assign.submitAsk'
+        : when.kind !== 'now'
+          ? 'assign.when.submit'
+          : mode === 'plan'
+            ? 'assign.submitPlan'
+            : 'assign.submit',
   });
 
   return (
@@ -294,6 +338,8 @@ export function AssignSheet() {
               contract, once approved) — only 問一問 skips these fields. */}
           {mode !== 'ask' && (
             <>
+              <ScheduleField value={when} onChange={setWhen} isAdmin={isAdmin} disabled={submitting} />
+
               {/* 約束／完成標準 */}
               <div className="space-y-1.5">
                 <label htmlFor="assign-criteria" className="text-xs font-medium text-muted-foreground">

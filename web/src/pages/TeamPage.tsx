@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { AlertTriangle, Loader2, MessageCircle, Send, UsersRound } from 'lucide-react';
+import { AlertTriangle, Eye, Loader2, MessageCircle, Send, UsersRound } from 'lucide-react';
 import { api, type MyTeam, type TeamAgent, type TeamMember } from '@/lib/api';
 import { formatError } from '@/lib/toast';
 import { MAX_ORG_DEPTH } from '@/lib/org-tree';
@@ -88,12 +88,13 @@ export function TeamPage() {
 
   return (
     <div className="mx-auto w-full max-w-[1200px] space-y-6">
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
         <UsersRound className="size-5 text-muted-foreground" />
         <div>
           <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.myTeam' })}</h1>
           <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'team.subtitle' })}</p>
         </div>
+        {team?.members.some(m => m.agents.some(a => a.history_readable === true)) && <Button variant="outline" size="sm" className="ml-auto" onClick={() => navigate('/team/conversations')}><Eye />{intl.formatMessage({ id: 'teamHistory.title' })}</Button>}
       </div>
 
       {error && (
@@ -128,6 +129,7 @@ export function TeamPage() {
                   node={node}
                   onChat={openChat}
                   onAssign={(agent, report) => setAssigning({ agent, report })}
+                  onHistory={(agent, report) => navigate(`/team/conversations?${new URLSearchParams({ agent: agent.name, report })}`)}
                 />
               </li>
             ))}
@@ -153,19 +155,21 @@ function TeamBranch({
   node,
   onChat,
   onAssign,
+  onHistory,
 }: {
   node: TeamNode;
   onChat: (agent: TeamAgent) => void;
   onAssign: (agent: TeamAgent, report: string) => void;
+  onHistory: (agent: TeamAgent, report: string) => void;
 }) {
   return (
     <div>
-      <MemberCard member={node.member} onChat={onChat} onAssign={onAssign} />
+      <MemberCard member={node.member} onChat={onChat} onAssign={onAssign} onHistory={onHistory} />
       {node.reports.length > 0 && (
         <ul className="mt-2 ml-4 space-y-2 border-l border-surface-border pl-4">
           {node.reports.map((r) => (
             <li key={r.member.id}>
-              <TeamBranch node={r} onChat={onChat} onAssign={onAssign} />
+              <TeamBranch node={r} onChat={onChat} onAssign={onAssign} onHistory={onHistory} />
             </li>
           ))}
         </ul>
@@ -178,10 +182,12 @@ function MemberCard({
   member,
   onChat,
   onAssign,
+  onHistory,
 }: {
   member: TeamMember;
   onChat: (agent: TeamAgent) => void;
   onAssign: (agent: TeamAgent, report: string) => void;
+  onHistory: (agent: TeamAgent, report: string) => void;
 }) {
   const intl = useIntl();
   return (
@@ -214,6 +220,7 @@ function MemberCard({
                 agent={agent}
                 onChat={() => onChat(agent)}
                 onAssign={() => onAssign(agent, member.display_name)}
+                onHistory={() => onHistory(agent, member.id)}
               />
             </li>
           ))}
@@ -227,10 +234,12 @@ function AgentRow({
   agent,
   onChat,
   onAssign,
+  onHistory,
 }: {
   agent: TeamAgent;
   onChat: () => void;
   onAssign: () => void;
+  onHistory: () => void;
 }) {
   const intl = useIntl();
   return (
@@ -258,6 +267,7 @@ function AgentRow({
         </div>
       </div>
       <div className="flex shrink-0 gap-2">
+        {agent.history_readable === true && <Button variant="outline" size="sm" onClick={onHistory}><Eye />{intl.formatMessage({ id: 'teamHistory.view' })}</Button>}
         <Button variant="outline" size="sm" onClick={onChat} disabled={!agent.operational}>
           <MessageCircle />
           {intl.formatMessage({ id: 'team.action.chat' })}

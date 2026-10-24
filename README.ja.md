@@ -64,6 +64,8 @@ duduclaw run                  # 起動後 http://localhost:18789 を開く
 
 <a id="architecture"></a>
 
+未リリース：[予約して依頼する](docs/features/ja-JP/67-assigning-tasks.md)機能で、チャットやダッシュボードから AI スタッフへ日時指定・繰り返しの依頼ができます。毎回の実行前に作成者の権限を確認し直します。
+
 ## アーキテクチャ概要
 
 AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます。頭脳は差し替え可能、配管はそのまま:
@@ -280,7 +282,8 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## ドキュメント
 
-- [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：未リリースの Enterprise API。部下の WebChat とマスクした外部会話を有効期間と必須監査で制限。画面は別途追加します。
+- [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：未リリースのEnterprise画面とAPI。部下のWebChatとマスクした外部会話を、職員向け通知、有効期間、必須監査とともに提供します。 直接 Viewer／Operator は本人の WebChat を全文、外部をマスク、他人を非表示とします。Owner／Admin の全文権限は維持し、移行設定を用意します。
+- **会話を閲覧した人**では、自分のチーム閲覧記録のみを確認できます（[説明](docs/features/ja-JP/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体
 - [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)

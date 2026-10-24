@@ -1,8 +1,8 @@
 # Read-only team conversations
 
-Unreleased backend API. A dashboard view and employee-side notices are separate changes.
+Unreleased Enterprise dashboard and read-only API.
 
-In the Enterprise edition, an active Manager or Admin can read conversations for an AI employee directly bound at Operator or Owner to an active person below them in the reporting tree (up to eight levels). Admin alone grants no access to this view. A forced password change, reassignment, suspension or removed binding takes effect on the next request; permissions are checked again before returning content. Ordinary history, export, download and WebChat resume permissions do not change.
+In the Enterprise edition, an active Manager or Admin can read conversations for an AI employee directly bound at Operator or Owner to an active person below them in the reporting tree (up to eight levels). Admin alone grants no access to this view. A forced password change, reassignment, suspension or removed binding takes effect on the next request; permissions are checked again before returning content. Manager oversight does not widen ordinary history, export, download or WebChat resume permissions. The separate direct-binding privacy change is described below.
 
 | Conversation | Returned content |
 |---|---|
@@ -11,6 +11,22 @@ In the Enterprise edition, an active Manager or Admin can read conversations for
 | Another person's WebChat, unknown/unstamped origin, internal task or schedule | Hidden, with no hidden count |
 
 Only visible, non-undone user and assistant messages from the current activation window are returned. Stored titles, summaries, prior context, hidden turns, thinking and tool steps are excluded. List titles come from the first visible user message in that window. Attachment paths and download links are never returned.
+
+## Using the dashboard
+
+Open **My team → Team conversations**, or choose **View conversations** beside an eligible report’s AI staff member. Select an AI staff member, optionally filter by report or conversation type, and open a conversation. External conversations carry a **Masked** label. The view has no composer, resume, export or attachment download action; message text is rendered as text, without loading links or embedded media. The missing-AI-detection warning remains visible when applicable.
+
+Each conversation open is recorded. Changing filters, refreshing or receiving a refusal clears displayed content; returning focus refreshes the reporting scope. A failed request shows an error instead of keeping an earlier transcript. An opaque load-more cursor is passed back unchanged.
+
+Administrators find **Organisation settings → Manager conversation access** on **User Management**. Inform staff before enabling it; turning it off and on starts a new time boundary. The adjacent AI-detection shortcut opens the existing redaction settings. A notice below the WebChat composer and an eye on the staff selector appear only when the gateway says that this person’s conversation with that AI staff member can be read by a manager.
+
+### Who viewed my conversations
+
+Every Enterprise account, including an Employee, can open **Settings → Who viewed my conversations** (`/my/history-views`). It lists only that signed-in person's WebChat openings through Team conversations: the viewer's current display name, AI employee's current display name, time and the closed type **Your WebChat**. Removed accounts or AI employees receive a generic label. Conversation contents, session identifiers, customer conversations, other people's records and raw audit details are never returned. An Admin cannot select another account.
+
+The records remain available when manager viewing is switched off or the reporting relationship changes. This is a record of the dedicated team-history entry point, not a complete account of older administrative reading paths. Only `team_history_viewed` with this account as the WebChat report is supported; screen-status events and unknown event types do not become view receipts.
+
+Choose **Load more** for earlier pages. Each call scans at most 4 MiB / 10,000 audit lines and returns at most 100 own receipts (the page requests 50). A page may contain no matches while an earlier page remains available. There is no global/hidden count. Opaque cursors are bound to the account and home, expire after ten minutes and stop working after a gateway restart or an audit snapshot change; refresh to start again. The independent receipt-list quota is 300 calls per account per hour. At most two reads run at once; a busy, corrupt, truncated or unreadable log shows an error rather than “no views.” Local log removal or archiving limits historical coverage. This bounded reader checks scanned chain links; it is not a full-file forensic verification or proof against same-OS-user log modification.
 
 ## The switch and time boundary
 
@@ -35,6 +51,9 @@ An absent local NER model is allowed with `ner: false`: **names and addresses ma
 
 This protects the product read path. A person with direct access to the gateway's OS files/databases can bypass these product controls. Regex and NER do not guarantee detection of every personal fact in free text.
 
+
+A macOS arm64 native check with pinned model revision `7ffa9a043d54d1be65afb281eddf0ffbe629385b` and ONNX Runtime 1.24.2 returned `ner:true` for two synthetic Chinese/English examples (names, addresses, phones and emails). This is a smoke check, not a detection-accuracy benchmark. NER may mask ordinary prefixes too; overlapping detections can produce adjacent placeholders, and counts describe rendered parts rather than distinct people.
+
 ## RPC contract
 
 | Method | Parameters / result |
@@ -55,3 +74,15 @@ Every successful get requires a durable chained `team_history_viewed` event, wit
 Counts describe the returned parts after message selection/truncation; numbering still comes from the whole visible window. A boot-time audit error fences team history without stopping the gateway. Recovery must record a fresh window; if the database cannot persist its reset marker, a process latch keeps the view closed until that repair succeeds. Masking admission is bounded to eight requests and a three-second wait, with one actual worker.
 
 See [Calling AI staff](62-calling-ai-staff.md) and [Security defense](05-security-defense.md).
+
+## Direct Viewer and Operator bindings (unreleased behavior change)
+
+Directly bound Viewers and Operators can continue chatting and calling AI staff. Their conversation history is now scoped: their own signed-in WebChat stays full text, other accounts’ WebChats are hidden, and external customer conversations open in a separate read-only masked view. Direct Owners and Admins retain full access. Unknown and internal session origins are excluded from this conversation view; task runs retain their existing task audience.
+
+The restriction covers history lists, transcripts, session-run inspectors, conversation search and CSV/XLSX conversation exports. External titles use a generic label. Routing identifiers and export references do not expose platform IDs such as phone-bearing WhatsApp IDs. Search matches external text after masking. Existing export downloads recollect current visible content; an old raw export cannot survive a privilege downgrade. NER is optional: an absent model means regex-only masking with a notice; a partially installed or failing model refuses external content. Masking cannot guarantee removal of every name or address.
+
+Attachment browsing requires a host-stamped own-WebChat owner or the existing explicit task/review audience. External and other accounts’ attachment names and bytes are unavailable through the shared archive. Legacy archives without trustworthy ownership are hidden from restricted readers. KB documents, task audiences and computer workspaces keep their own permissions. A model mentioning a path does not grant ownership.
+
+`[people] bound_history_privacy = true` is the default, including when the value is missing or malformed. Admins can explicitly set it to `false` in the advanced configuration editor for migration; this restores the previous broad direct-binding history behavior. It does not enable manager oversight or change the independent `manager_team_history` window. Re-enable it after checking bindings and notifying staff. Own-WebChat text may contain copied third-party data; intentional copies and same-OS/Bash access are outside this read-time boundary. No stored source conversation is rewritten.
+
+Restricted projection scans fail explicitly beyond 20,000 visible user/assistant messages or 8 MiB per request. A stale or restarted list cursor requires refresh. Opaque identifiers are routing names, not grants: each request rechecks live bindings and stored origin.

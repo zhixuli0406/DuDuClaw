@@ -157,6 +157,34 @@ describe('App routes — Enterprise-only pages are closed on Personal (WP-A D8/D
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/team'));
     expect(await screen.findByRole('heading', { name: 'My team' })).toBeInTheDocument();
   });
+
+  it('guards team conversations by both edition and live account role', async () => {
+    setEdition('personal');
+    await expectLandsOn('/team/conversations', '/');
+  });
+
+  it('refuses the team conversation deep link to an employee', async () => {
+    setRole('employee');
+    await expectLandsOn('/team/conversations', '/');
+  });
+
+  it('opens the dedicated read-only conversation page for an enterprise manager', async () => {
+    setRole('manager');
+    renderAppAt('/team/conversations');
+    expect(await screen.findByRole('heading', { name: 'Team conversations' })).toBeInTheDocument();
+    await waitFor(() => expect(document.title).toMatch(/^Team conversations ·/));
+  });
+
+  it('lets an enterprise employee open their own view records', async () => {
+    setRole('employee');
+    renderAppAt('/my/history-views');
+    expect(await screen.findByRole('heading', { name: 'Who viewed my conversations' })).toBeInTheDocument();
+  });
+
+  it('keeps own view records enterprise-only on direct navigation', async () => {
+    setEdition('personal');
+    await expectLandsOn('/my/history-views', '/');
+  });
 });
 
 // N-1 (`DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-1, §2 L2): the new

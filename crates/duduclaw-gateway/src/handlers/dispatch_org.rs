@@ -78,6 +78,7 @@ impl MethodHandler {
         }
 
         match method {
+            "users.my_history_views" => self.handle_my_history_views(params,ctx).await,
             "users.team_history.list" => self.handle_team_history_list(params,ctx).await,
             "users.team_history.get" => self.handle_team_history_get(params,ctx).await,
             "users.org_settings.get" | "users.org_settings.update" => {
@@ -376,6 +377,18 @@ impl MethodHandler {
             "tasks.role_turns" => self.handle_tasks_role_turns(params, ctx).await,
             "tasks.goal_decide" => self.handle_tasks_goal_decide(params, ctx).await,
             "tasks.goal_create" => self.handle_tasks_goal_create(params, ctx).await,
+            // Scheduled assignments: the caller's own (an Admin: everyone's).
+            // Ownership is decided inside (`assign_schedule::manage`).
+            "assign_schedules.list" => self.handle_assign_schedules_list(params, ctx).await,
+            "assign_schedules.pause" => {
+                self.handle_assign_schedules_manage(params, ctx, crate::assign_schedule::ManageAction::Pause).await
+            }
+            "assign_schedules.resume" => {
+                self.handle_assign_schedules_manage(params, ctx, crate::assign_schedule::ManageAction::Resume).await
+            }
+            "assign_schedules.remove" => {
+                self.handle_assign_schedules_manage(params, ctx, crate::assign_schedule::ManageAction::Remove).await
+            }
             "tasks.flow_metrics" => {
                 check_agent_filter!(AccessLevel::Viewer);
                 self.handle_tasks_flow_metrics(params).await
@@ -453,7 +466,7 @@ impl MethodHandler {
             // conversations.
             "chat.sessions.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_chat_sessions_list(params).await
+                self.handle_chat_sessions_list(params, ctx).await
             }
             // Gated inside the handler by the session's owning agent (Viewer) —
             // the agent id is resolved from the session; an unknown session id

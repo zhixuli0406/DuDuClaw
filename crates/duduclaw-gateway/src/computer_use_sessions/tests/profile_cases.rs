@@ -97,9 +97,13 @@ async fn reset_discards_the_running_profile_before_stopping() {
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
-    mgr.reset_login("alice", &duduclaw_auth::UserContext::admin_fallback())
-        .await
-        .unwrap();
+    let result = mgr
+        .reset_login("alice", &duduclaw_auth::UserContext::admin_fallback())
+        .await;
+    #[cfg(unix)]
+    result.unwrap();
+    #[cfg(not(unix))]
+    assert_eq!(result.unwrap_err().code, ErrorCode::Unavailable);
     assert!(mgr.is_empty());
     assert_eq!(state.stops.load(Ordering::SeqCst), 1);
     assert!(state.login_discarded.load(Ordering::SeqCst));

@@ -1,6 +1,6 @@
 # 儀表板設定對照（v1.68.0）
 
-尚未發版的企業版後端：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。專屬頁面尚未加入。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
+尚未發版的企業版設定（成員管理 → 組織設定）：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。開啟前請先告知職員。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
 
 這份文件列出 v1.68.0 起可以在儀表板設定的項目：在哪一頁、寫到哪個設定鍵、存檔後是否要重啟 gateway。最後一節說明「設定檔進階編輯」，用來修改沒有專屬控制項的鍵。
 
@@ -174,6 +174,14 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
+## 排程交辦（尚未發版）
+
+交辦面板的「什麼時候做」可選指定時間一次、每天、平日、每週或每小時，管理員另有自訂 cron。時間以瀏覽器時區解讀；設定當下不建立任務，時間到才重新確認建立者權限並交辦。
+
+「目標 → 我交辦的 → 排程」可暫停、恢復與刪除，管理員可切換看所有人的排程。暫停或刪除先於任務落地，就不會建立該輪任務；已落地的任務需另外停止。恢復會重驗建立者權限與目前執行間隔限制。
+
+設定檔 `[goal_defaults] assign_schedule_max_active` 預設每人 20 個（0–200）；`assign_schedule_min_interval_minutes` 預設非管理員最短 60 分鐘，只能調高，既有排程下次執行也會檢查。詳見[排程交辦](../../features/zh-TW/67-assigning-tasks.md)。
+
 ## 思考過程顯示
 
 目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。
@@ -243,3 +251,5 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 
 終端機用 `duduclaw credentials status`（腳本可加 `--json`）看同樣的狀態。細節見
 [安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)。
+
+直接綁定歷史隱私：`[people] bound_history_privacy = true` 預設開啟，缺值或格式錯誤也維持限制。管理員可在進階編輯器明確設 `false` 過渡，恢復先前 Viewer／Operator 的廣泛歷史讀取。Owner／Admin 及聊天／呼叫權限不變；搜尋、匯出、附件與 NER 限制見功能 68。

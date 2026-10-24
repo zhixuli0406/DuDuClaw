@@ -64,6 +64,8 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 
 <a id="architecture"></a>
 
+Unreleased: [scheduled assignments](docs/features/67-assigning-tasks.md#scheduling-an-assignment) let you hand work to an AI employee for later or on a repeat, from chat or the dashboard. Each run checks the creator's current permission.
+
 ## Architecture at a glance
 
 The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
@@ -280,7 +282,8 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 
 ## Documentation
 
-- [Read-only team conversations](docs/features/68-manager-team-history.md): unreleased Enterprise API for a manager's report WebChat and masked external conversations, with an activation boundary and mandatory audit; dashboard view follows separately.
+- [Read-only team conversations](docs/features/68-manager-team-history.md): unreleased Enterprise dashboard and API for report WebChat and masked external conversations, with staff notices, an activation boundary and mandatory audit. Direct Viewer/Operator history now keeps own WebChat full, masks external conversations and hides other accounts; Owner/Admin remain full. This behavior change has an explicit migration setting.
+- Self-service: **Who viewed my conversations** shows only your own team-history receipts ([guide](docs/features/68-manager-team-history.md)).
 - [ARCHITECTURE.md](ARCHITECTURE.md): full system architecture
 - [docs/README.md](docs/README.md): public docs index (architecture / RFC / ADR / specs / guides)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md): production deployment (Tailscale / Docker / systemd / auto-update / monitoring)
