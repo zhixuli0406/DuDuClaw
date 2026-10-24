@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import { useSearchParams } from 'react-router';
 import { Eye, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
-import { api, type MyTeam, type TeamHistoryClass, type TeamHistoryList, type TeamHistoryPart, type TeamHistoryTranscript } from '@/lib/api';
+import { api, type MyTeam, type TeamHistoryClass, type TeamHistoryList, type TeamHistoryTranscript } from '@/lib/api';
 import { Button } from '@/components/mds';
+import { HistoryPart, historyCategoryLabel as categoryLabel } from '@/components/chat/HistoryPart';
 import { cn } from '@/lib/utils';
 
 /** Content is rendered as plain React text. No Markdown renderer, embedded
@@ -165,19 +166,6 @@ export function TeamHistoryPage() {
 function formatDate(value: string, locale: string) {
   const stamp = new Date(value);
   return Number.isNaN(stamp.getTime()) ? '' : stamp.toLocaleString(locale);
-}
-
-function HistoryPart({ part }: { part: TeamHistoryPart }) {
-  const intl = useIntl();
-  if (part.t === 'text') return <>{part.v}</>;
-  if (part.t === 'attachment') return <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">{intl.formatMessage({ id: part.kind === 'image' ? 'teamHistory.image' : 'teamHistory.attachment' })}{part.name ? ` · ${part.name}` : ''}</span>;
-  const label = categoryLabel(intl, part.cat);
-  return <span className="mx-0.5 inline-block rounded-md bg-brand/10 px-1.5 py-0.5 text-xs text-brand" title={intl.formatMessage({ id: 'teamHistory.maskHint' }, { category: label })}>{label} {part.n}</span>;
-}
-
-function categoryLabel(intl: IntlShape, category: string): string {
-  const id = `teamHistory.category.${category}`;
-  return id in intl.messages ? intl.formatMessage({ id }) : category;
 }
 
 /** Only translate the server's masked-title markers. An own conversation's

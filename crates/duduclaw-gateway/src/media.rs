@@ -174,6 +174,15 @@ pub async fn save_attachment_in_base(
     Ok(path)
 }
 
+/// Authenticated WebChat's inbound-only save. The principal task-local is
+/// installed by the socket host, never by a model or attachment filename.
+pub(crate) async fn save_webchat_attachment_in_base(base_dir:&std::path::Path,data:&[u8],filename:&str)->Result<std::path::PathBuf,String> {
+    let path=save_attachment_in_base_untracked(base_dir,data,filename).await?;
+    crate::knowledge::chat_attachments::note_saved(&path,filename);
+    crate::artifacts::record_saved(base_dir,&path,filename,data.len() as u64,&crate::artifacts::SaveContext::uploaded(Some("webchat")));
+    Ok(path)
+}
+
 /// [`save_attachment_in_base`] without the provenance row — for callers that
 /// know the file's real origin and record it themselves.
 pub async fn save_attachment_in_base_untracked(

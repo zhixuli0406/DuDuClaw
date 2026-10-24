@@ -86,22 +86,31 @@ async fn search_drops_deliverables_of_tasks_the_reader_may_not_see() {
         })
         .to_string()
     };
-    std::fs::create_dir_all(f.home.join("agents/sales/attachments")).unwrap();
-    std::fs::write(
-        f.home.join("artifacts.jsonl"),
-        format!(
-            "{}\n{}\n",
-            line(PRIVATE, "secret-quote.md"),
-            line(OPEN, "secret-open.md")
-        ),
-    )
-    .unwrap();
+    let agent = f.home.join("agents/sales");
+    std::fs::create_dir_all(agent.join("attachments")).unwrap();
+    // Current host archives retain their source and task attribution. A legacy
+    // task-id-only row may restrict an attachment, but never grants it access.
+    for (task, name) in [(PRIVATE, "secret-quote.md"), (OPEN, "secret-open.md")] {
+        let source = agent.join(name);
+        let archive = agent.join("attachments").join(format!("1_{name}"));
+        std::fs::write(&source, b"x").unwrap();
+        std::fs::write(&archive, b"x").unwrap();
+        crate::artifacts::record_saved(&agent, &archive, name, 1, &crate::artifacts::SaveContext {
+            origin: crate::artifacts::ArtifactOrigin::Declared,
+            task_id: Some(task), round: Some(1), channel: Some("goal_loop"), source_path: Some(&source),
+        });
+    }
+    let ledger = f.home.join("artifacts.jsonl");
+    let rows = std::fs::read_to_string(&ledger).unwrap();
+    std::fs::write(&ledger, format!("{}{}\n", rows, line(OPEN, "secret-legacy.md"))).unwrap();
     let q = json!({"q": "secret", "agent_id": "sales", "sources": ["artifacts"]});
     let bob = payload(f.handler.handle_search_query(q.clone(), &f.bob).await).to_string();
     assert!(!bob.contains("secret-quote.md"), "{bob}");
     assert!(bob.contains("secret-open.md"));
+    assert!(!bob.contains("secret-legacy.md"));
     let alice = payload(f.handler.handle_search_query(q, &f.alice).await).to_string();
     assert!(alice.contains("secret-quote.md"));
+    assert!(!alice.contains("secret-legacy.md"));
 }
 
 #[tokio::test]
