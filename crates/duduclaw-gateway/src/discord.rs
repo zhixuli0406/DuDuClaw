@@ -29,6 +29,20 @@ use crate::channel_settings::keys;
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
+#[path = "discord/agent_selection.rs"]
+mod agent_selection;
+#[cfg(test)]
+#[path = "discord/routing_test_transport.rs"]
+mod routing_test_transport;
+#[cfg(test)]
+#[path = "discord/routing_tests.rs"]
+mod routing_tests;
+
+#[cfg(test)]
+pub(crate) fn test_sender_url(token: &str, original: &str) -> String {
+    routing_test_transport::sender_url(token, original)
+}
+
 // ── Discord API types ───────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1053,6 +1067,7 @@ async fn gateway_loop(
                                             let bot_id = bot_id.clone();
                                             let app_id = app_id.clone();
                                             let ctx = ctx.clone();
+                                            let agent = agent_name.clone();
                                             tokio::spawn(async move {
                                                 // Decision lane only for a decision
                                                 // button whose presser passed the access
@@ -1061,7 +1076,7 @@ async fn gateway_loop(
                                                 let _permit = crate::channel_decision_route::current_discord_permits()
                                                     .acquire(lane)
                                                     .await;
-                                                handle_interaction(&d, &bot_id, &app_id, &http, &token, &ctx).await;
+                                                handle_interaction(&d, &bot_id, &app_id, &http, &token, &ctx, agent.as_deref()).await;
                                             });
                                         }
                                     }
@@ -1737,13 +1752,18 @@ async fn handle_message_create(
                 .await;
                 return;
             }
-            let agent_id = match agent_name {
-                Some(a) => a.to_string(),
-                None => {
-                    let reg = ctx.registry.read().await;
-                    reg.main_agent()
-                        .map(|a| a.config.agent.name.clone())
-                        .unwrap_or_default()
+            let explicit = match agent_selection::explicit_agent(ctx, agent_name, guild_id).await {
+                Ok(selected) => selected,
+                Err(()) => {
+                    let _ = send_discord_message(http, token, channel_id, json!({"content":crate::channel_reply::SELECTED_AGENT_UNAVAILABLE})).await;
+                    return;
+                }
+            };
+            let agent_id = match agent_selection::command_agent(ctx, explicit.as_deref(), session_id, user_id).await {
+                Ok(name) => name,
+                Err(()) => {
+                    let _ = send_discord_message(http, token, channel_id, json!({"content":crate::channel_reply::SELECTED_AGENT_UNAVAILABLE})).await;
+                    return;
                 }
             };
             // Real per-channel admin status (fail-closed) — never hardcoded.
@@ -1765,6 +1785,16 @@ async fn handle_message_create(
             return;
         }
     }
+
+    // Select once after the existing sender gates, before any thread is made.
+    // Unspecified stays None so the shared default + trigger route still runs.
+    let effective_agent = match agent_selection::explicit_agent(ctx, agent_name, guild_id).await {
+        Ok(selected) => selected,
+        Err(()) => {
+            let _ = send_discord_message(http, token, channel_id, json!({"content":crate::channel_reply::SELECTED_AGENT_UNAVAILABLE})).await;
+            return;
+        }
+    };
 
     // Track whether we created a new thread (for guide message later)
     let mut created_thread = false;
@@ -1814,13 +1844,18 @@ async fn handle_message_create(
         let typing_http = http.clone();
         let typing_token = token.to_string();
         let typing_channel = reply_channel_id.clone();
+        #[cfg(test)]
+        let typing_home = ctx.home_dir.clone();
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let flag_clone = flag.clone();
         let handle = tokio::spawn(async move {
             let mut consecutive_failures = 0u32;
             while flag_clone.load(Ordering::Relaxed) {
+                let url = format!("{DISCORD_API}/channels/{typing_channel}/typing");
+                #[cfg(test)]
+                let url = routing_test_transport::url(&typing_home, &typing_token, &url);
                 match typing_http
-                    .post(format!("{DISCORD_API}/channels/{typing_channel}/typing"))
+                    .post(&url)
                     .header("Authorization", format!("Bot {typing_token}"))
                     .send()
                     .await
@@ -1850,6 +1885,8 @@ async fn handle_message_create(
     let progress_http = http.clone();
     let progress_token = token.to_string();
     let progress_channel = reply_channel_id.clone();
+    #[cfg(test)]
+    let progress_home = ctx.home_dir.clone();
     let last_progress = Arc::new(std::sync::Mutex::new(
         std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -1883,6 +1920,8 @@ async fn handle_message_create(
         let t = progress_token.clone();
         let ch = progress_channel.clone();
         let mid = progress_msg_id_cb.clone();
+        #[cfg(test)]
+        let home = progress_home.clone();
         tokio::spawn(async move {
             let existing_id = match mid.lock() {
                 Ok(g) => g.clone(),
@@ -1890,16 +1929,22 @@ async fn handle_message_create(
             };
             if let Some(msg_id) = existing_id {
                 // Edit the existing progress message
+                let url = format!("{DISCORD_API}/channels/{ch}/messages/{msg_id}");
+                #[cfg(test)]
+                let url = routing_test_transport::url(&home, &t, &url);
                 let _ = c
-                    .patch(format!("{DISCORD_API}/channels/{ch}/messages/{msg_id}"))
+                    .patch(&url)
                     .header("Authorization", format!("Bot {t}"))
                     .json(&json!({ "content": msg_text }))
                     .send()
                     .await;
             } else {
                 // Send the first progress message and save its ID
+                let url = format!("{DISCORD_API}/channels/{ch}/messages");
+                #[cfg(test)]
+                let url = routing_test_transport::url(&home, &t, &url);
                 let resp = c
-                    .post(format!("{DISCORD_API}/channels/{ch}/messages"))
+                    .post(&url)
                     .header("Authorization", format!("Bot {t}"))
                     .json(&json!({ "content": msg_text }))
                     .send()
@@ -1920,6 +1965,8 @@ async fn handle_message_create(
     let cleanup_http = http.clone();
     let cleanup_token = token.to_string();
     let cleanup_channel = reply_channel_id.clone();
+    #[cfg(test)]
+    let cleanup_home = ctx.home_dir.clone();
     // Thinking display: one editable status message (spoiler summary for
     // senders allowed to see it; mentions disabled).
     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
@@ -1933,46 +1980,6 @@ async fn handle_message_create(
         })),
     );
     let on_progress = thinking.wrap(on_progress);
-
-    // ── Resolve effective agent ──
-    // Per-agent bot binding wins; otherwise a guild-level `/agent` override
-    // (AGENT_OVERRIDE, written by the slash command / select menu) applies.
-    // v1.68.0: the dashboard's 「指定 AI 員工」 writes the `global` scope; it
-    // now applies (to guilds and DMs) wherever no per-guild value is set.
-    let guild_agent_override = if agent_name.is_none() {
-        match settings
-            .get_scoped_or_global("discord", scope_id, keys::AGENT_OVERRIDE)
-            .await
-        {
-            Some(name) if !name.is_empty() => {
-                let reg = ctx.registry.read().await;
-                if reg.get(&name).is_some() {
-                    Some(name)
-                } else {
-                    warn!(
-                        "Discord guild {guild_id}: agent_override '{name}' is not a loaded agent — ignoring"
-                    );
-                    None
-                }
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let effective_agent: Option<String> =
-        agent_name.map(|s| s.to_string()).or(guild_agent_override);
-
-    // ── Get agent display name for embed footer ──
-    let display_name = {
-        let reg = ctx.registry.read().await;
-        match &effective_agent {
-            Some(name) => reg.get(name).map(|a| a.config.agent.display_name.clone()),
-            None => reg
-                .main_agent()
-                .map(|a| a.config.agent.display_name.clone()),
-        }
-    };
 
     let context = crate::approval::DecisionContext {
         channel: "discord".into(),
@@ -2018,6 +2025,9 @@ async fn handle_message_create(
         }
     }))
     .await;
+    // Default routing may have selected a bound or explicitly called employee.
+    // Attribute the reply to that actual selection instead of guessing main.
+    let display_name = guarded.answered_by.as_ref().map(|who| who.display_name.clone());
 
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
     drop(typing_guard);
@@ -2035,14 +2045,23 @@ async fn handle_message_create(
             thinking.abandon().await;
             return;
         }
-        crate::channel_reply::deliver_documents_for_reply_guarded(
-            ctx.as_ref(),
-            effective_agent.as_deref(),
-            guarded.text.clone(),
-            &sender,
-            Some(&guarded),
-        )
-        .await
+        if let Some(answered) = &guarded.answered_by {
+            let delivery = crate::channel_reply::deliver_documents_for_reply_guarded(
+                ctx.as_ref(),
+                Some(&answered.id),
+                guarded.text.clone(),
+                &sender,
+                Some(&guarded),
+            );
+            #[cfg(test)]
+            let delivered = routing_test_transport::scope_sender(&ctx.home_dir, delivery).await;
+            #[cfg(not(test))]
+            let delivered = delivery.await;
+            delivered
+        } else {
+            // A refused/unresolved turn cannot borrow main's document folder.
+            crate::office_docs::parse_deliverables(&guarded.text).0
+        }
     };
 
     // ── Guard: don't send empty replies (Discord rejects empty content) ──
@@ -2112,8 +2131,11 @@ async fn handle_message_create(
         let t = cleanup_token;
         let ch = cleanup_channel;
         tokio::spawn(async move {
+            let url = format!("{DISCORD_API}/channels/{ch}/messages/{pmid}");
+            #[cfg(test)]
+            let url = routing_test_transport::url(&cleanup_home, &t, &url);
             let _ = c
-                .delete(format!("{DISCORD_API}/channels/{ch}/messages/{pmid}"))
+                .delete(&url)
                 .header("Authorization", format!("Bot {t}"))
                 .send()
                 .await;
@@ -2156,6 +2178,8 @@ async fn handle_message_create(
         let guide_token = token.to_string();
         let guide_channel = channel_id.to_string();
         let guide_msg_id = message_id.to_string();
+        #[cfg(test)]
+        let guide_home = ctx.home_dir.clone();
         tokio::spawn(async move {
             let guide = json!({
                 "content": "💬 已在對話串中回覆 ↓",
@@ -2165,8 +2189,11 @@ async fn handle_message_create(
                     "fail_if_not_exists": false,
                 },
             });
+            let url = format!("{DISCORD_API}/channels/{guide_channel}/messages");
+            #[cfg(test)]
+            let url = routing_test_transport::url(&guide_home, &guide_token, &url);
             let resp = guide_http
-                .post(format!("{DISCORD_API}/channels/{guide_channel}/messages"))
+                .post(&url)
                 .header("Authorization", format!("Bot {guide_token}"))
                 .json(&guide)
                 .send()
@@ -2177,10 +2204,11 @@ async fn handle_message_create(
                     if let Some(mid) = body["id"].as_str() {
                         let mid = mid.to_string();
                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        let url = format!("{DISCORD_API}/channels/{guide_channel}/messages/{mid}");
+                        #[cfg(test)]
+                        let url = routing_test_transport::url(&guide_home, &guide_token, &url);
                         let _ = guide_http
-                            .delete(format!(
-                                "{DISCORD_API}/channels/{guide_channel}/messages/{mid}"
-                            ))
+                            .delete(&url)
                             .header("Authorization", format!("Bot {guide_token}"))
                             .send()
                             .await;
@@ -2315,7 +2343,7 @@ async fn send_raw(
     #[cfg(test)]
     let url = crate::test_channel_provider::url(token, &url);
     match http
-        .post(url)
+        .post(&url)
         .header("Authorization", format!("Bot {token}"))
         .json(&cleaned)
         .send()
@@ -2339,7 +2367,7 @@ async fn send_raw(
                     obj.remove("message_reference");
                 }
                 match http
-                    .post(format!("{DISCORD_API}/channels/{channel_id}/messages"))
+                    .post(&url)
                     .header("Authorization", format!("Bot {token}"))
                     .json(&fallback)
                     .send()
@@ -2399,6 +2427,7 @@ async fn handle_interaction(
     http: &reqwest::Client,
     token: &str,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) {
     let interaction_type = data["type"].as_u64().unwrap_or(0);
     let interaction_id = data["id"].as_str().unwrap_or("");
@@ -2416,6 +2445,7 @@ async fn handle_interaction(
                 http,
                 token,
                 ctx,
+                agent_name,
             )
             .await;
         }
@@ -2619,7 +2649,7 @@ async fn handle_component_interaction(
         send_interaction_response(http, interaction_id, interaction_token, 5, None).await;
         let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
         let payload = channel_format::to_discord_message(&outcome, None, false);
-        edit_interaction_response(http, app_id, interaction_token, &payload).await;
+        edit_interaction_response(http, app_id, interaction_token, &payload, &ctx.home_dir).await;
         return;
     }
 
@@ -2870,6 +2900,7 @@ async fn handle_slash_command(
     http: &reqwest::Client,
     _bot_token: &str,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) {
     let cmd_data = match data.get("data") {
         Some(d) => d,
@@ -2913,46 +2944,54 @@ async fn handle_slash_command(
                 .and_then(|o| o["value"].as_str())
                 .unwrap_or("");
 
-            // Honour the guild-level agent override (written by /agent or the
-            // Switch Agent select menu).
-            let scope = if guild_id.is_empty() { "dm" } else { guild_id };
-            let agent_override = match ctx
-                .channel_settings
-                .get("discord", scope, keys::AGENT_OVERRIDE)
-                .await
-            {
-                Some(name) if !name.is_empty() => {
-                    let reg = ctx.registry.read().await;
-                    if reg.get(&name).is_some() {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-
             let session_id = format!("discord:{channel_id}");
+            // The same access/pairing gate as the ordinary reply runs before
+            // selection errors; a missing target must not expose private state.
+            let access = match crate::decision_notify::read_trusted_channel_access(
+                ctx,
+                &crate::approval::DecisionContext {
+                    channel: "discord".into(),
+                    account_id: app_id.into(),
+                    conversation_id: channel_id.into(),
+                    principal_id: user_id.into(),
+                },
+                crate::decision_notify::DecisionAccessScope {
+                    channel_id: (!guild_id.is_empty()).then_some(channel_id),
+                    guild_id: (!guild_id.is_empty()).then_some(guild_id),
+                    session_id: Some(&session_id),
+                },
+            ).await {
+                Ok(policy) => policy,
+                Err(_) => {
+                    edit_interaction_response(http, app_id, interaction_token, &json!({"content":crate::channel_reply::SELECTED_AGENT_UNAVAILABLE}), &ctx.home_dir).await;
+                    return;
+                }
+            };
+            if let Some(reply) = crate::channel_reply::check_user_access_gate_with_policy(ctx, &session_id, user_id, prompt, &access).await {
+                if !reply.is_empty() {
+                    edit_interaction_response(http, app_id, interaction_token, &json!({"content":reply}), &ctx.home_dir).await;
+                }
+                return;
+            }
+            let agent_override = match agent_selection::explicit_agent(ctx, agent_name, guild_id).await {
+                Ok(selected) => selected,
+                Err(()) => {
+                    edit_interaction_response(http, app_id, interaction_token, &json!({"content":crate::channel_reply::SELECTED_AGENT_UNAVAILABLE}), &ctx.home_dir).await;
+                    return;
+                }
+            };
             let guarded = if let Some(agent) = &agent_override {
                 build_guarded_reply_for_agent(prompt, ctx, agent, &session_id, user_id, None).await
             } else {
                 build_guarded_reply_with_session(prompt, ctx, &session_id, user_id, None).await
             };
 
-            let agent_name = {
-                let reg = ctx.registry.read().await;
-                match &agent_override {
-                    Some(n) => reg.get(n).map(|a| a.config.agent.display_name.clone()),
-                    None => reg
-                        .main_agent()
-                        .map(|a| a.config.agent.display_name.clone()),
-                }
-            };
+            let display_name = guarded.answered_by.as_ref().map(|who| who.display_name.clone());
 
             let payload =
-                channel_format::to_discord_message(&guarded.text, agent_name.as_deref(), false);
+                channel_format::to_discord_message(&guarded.text, display_name.as_deref(), false);
             if guarded.still_valid().await {
-                edit_interaction_response(http, app_id, interaction_token, &payload).await;
+                edit_interaction_response(http, app_id, interaction_token, &payload, &ctx.home_dir).await;
             }
         }
 
@@ -3318,10 +3357,13 @@ async fn edit_interaction_response(
     app_id: &str,
     interaction_token: &str,
     data: &Value,
+    _home: &Path,
 ) {
     let cleaned = data.clone();
 
     let url = format!("{DISCORD_API}/webhooks/{app_id}/{interaction_token}/messages/@original");
+    #[cfg(test)]
+    let url = routing_test_transport::url(_home, interaction_token, &url);
     match http.patch(&url).json(&cleaned).send().await {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();

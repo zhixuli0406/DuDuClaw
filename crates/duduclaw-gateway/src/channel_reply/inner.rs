@@ -1,9 +1,13 @@
 use super::*;
 
+/// Fixed refusal for a removed explicit target, without naming private agents.
+pub(crate) const SELECTED_AGENT_UNAVAILABLE: &str =
+    "⚠️ 指定的 AI 員工目前無法使用，請檢查頻道設定或重新選擇。";
+
 /// Inner implementation shared by both default-agent and explicit-agent paths.
 ///
-/// When `agent_override` is `Some(name)`, the named agent is looked up directly.
-/// When `None`, the default agent resolution logic (config.toml → main_agent) is used.
+/// Some(name) must resolve exactly; a missing explicit target is refused.
+/// None retains channel/thread/permission/default routing and sender-aware calls.
 // OTel GenAI semconv (Development): root `invoke_agent` span for one channel
 // turn. Attribute names are centralized in `crate::otel` (tracing macros need
 // literal field names, so the dotted literals here mirror those consts).
@@ -141,7 +145,14 @@ pub(super) async fn build_reply_with_session_inner(
         // snapshot — those callers already applied `@` routing themselves
         // and mark a called employee with `trigger_route::as_called_turn`).
         via_trigger = crate::trigger_route::in_called_turn();
-        reg.get(name).or_else(|| reg.main_agent())
+        match reg.get(name) {
+            Some(agent) => Some(agent),
+            None => return if public_visitor {
+                crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()
+            } else {
+                SELECTED_AGENT_UNAVAILABLE.into()
+            },
+        }
     } else {
         let fallback = resolve_fallback_agent(ctx, &reg, session_id, user_id).await;
         // WebChat decides `@` routing itself (it knows the dashboard account

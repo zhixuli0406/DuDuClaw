@@ -14,6 +14,12 @@ Agent creation, edited templates, model saves and the administrator `/model` com
 
 An older unsaved profile with a known model/provider mismatch is refused before model execution. Ask an administrator to save its settings and retry. Reading or routing never silently rewrites the file, and a configuration mismatch is not a Claude login error. Model-name substrings do not determine a runtime.
 
+## Discord employee selection
+
+Ordinary messages, text commands such as `/model`, and `/ask` use the same explicit employee order: a per-employee bot binding, the guild or DM selection, then the global selection. An empty scoped selection inherits the global setting. A removed or renamed explicit target is refused rather than silently replaced by the main employee.
+
+With no explicit selection, ordinary conversation retains the existing channel/thread bindings, allowed-channel and default routing, followed by sender-aware `@` calls. Text commands resolve their context through the existing fallback without interpreting the command as an employee call. `/agent` and Switch Agent still require Manage Server to change a guild binding. Reply labels identify the employee actually selected by the reply pipeline, including bound and `@`-called employees. Document delivery uses that employee's existing directory checks; an unresolved reply does not scan the main employee's files.
+
 ---
 
 ## The Metaphor: A Multilingual Office
