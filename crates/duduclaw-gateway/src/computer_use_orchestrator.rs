@@ -40,6 +40,16 @@ fn session_registry() -> &'static tokio::sync::Mutex<HashMap<String, Arc<Orchest
     SESSION_REGISTRY.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// Include sessions already ending (absent from the manager but still
+/// registered until container removal) in an emergency's persistence fence.
+pub(crate) async fn discard_all_login_state() {
+    for control in session_registry().lock().await.values() {
+        control
+            .discard_login
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Maximum concurrent computer use sessions (prevents DoS).
 const MAX_CONCURRENT_SESSIONS: usize = 5;
 
@@ -136,6 +146,83 @@ pub(crate) async fn docker_output_with_stdin<S: AsRef<std::ffi::OsStr>>(
             "{what} timed out after {}s",
             limit.as_secs()
         ))),
+    }
+}
+
+/// The profile helper can emit hostile archive bytes. Bound both pipes
+/// before allocation and kill the Docker client on overflow or timeout.
+async fn profile_output(
+    container: &str,
+    action: &str,
+    input: &[u8],
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let run = async {
+        let mut child = tokio::process::Command::new(docker_program())
+            .args([
+                "exec",
+                "-i",
+                container,
+                "duduclaw-profile",
+                action,
+                &max_bytes.to_string(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("stderr unavailable"))?;
+        let write = async move {
+            stdin.write_all(input).await?;
+            stdin.shutdown().await?;
+            // Unix pipe shutdown is a no-op in Tokio. Close this handle
+            // before joining the output readers: the importer waits for EOF.
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        };
+        let read = async {
+            let mut data = Vec::new();
+            stdout.take(max_bytes + 1).read_to_end(&mut data).await?;
+            if data.len() as u64 > max_bytes {
+                return Err(std::io::Error::other("profile too large"));
+            }
+            Ok::<_, std::io::Error>(data)
+        };
+        let errors = async {
+            let mut data = Vec::new();
+            stderr.take(8193).read_to_end(&mut data).await?;
+            if data.len() > 8192 {
+                return Err(std::io::Error::other("profile stderr limit"));
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (_, data, ()) = tokio::try_join!(write, read, errors)?;
+        if !child.wait().await?.success() {
+            return Err(std::io::Error::other("profile helper refused"));
+        }
+        Ok::<_, std::io::Error>(data)
+    };
+    let budget = if action == "export" {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(20)
+    };
+    match tokio::time::timeout(budget, run).await {
+        Ok(Ok(data)) => Ok(data),
+        _ => Err("browser login state unavailable".into()),
     }
 }
 
@@ -365,6 +452,10 @@ pub struct ComputerUseConfig {
     /// Minutes without viewer input before a dashboard takeover lease
     /// expires (already defaulted and capped).
     pub takeover_idle_minutes: u32,
+    /// Gateway-enabled login persistence (both switches already checked).
+    /// Not accepted through serialized orchestrator configuration.
+    #[serde(skip)]
+    pub persist_login: bool,
 }
 
 impl Default for ComputerUseConfig {
@@ -389,6 +480,7 @@ impl Default for ComputerUseConfig {
             contract_must_not: Vec::new(),
             keep_alive_minutes: 0,
             takeover_idle_minutes: duduclaw_core::types::COMPUTER_USE_DEFAULT_TAKEOVER_IDLE_MINUTES,
+            persist_login: false,
         }
     }
 }
@@ -495,6 +587,7 @@ pub struct OrchestratorControl {
     pub paused: AtomicBool,
     /// Set to true to end the session.
     pub stopped: AtomicBool,
+    pub(crate) discard_login: AtomicBool,
 }
 
 impl OrchestratorControl {
@@ -502,6 +595,7 @@ impl OrchestratorControl {
         Self {
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            discard_login: AtomicBool::new(false),
         }
     }
 }
@@ -527,6 +621,9 @@ pub struct ComputerUseOrchestrator {
     registered_as: Option<String>,
     /// Whether the container is paused (`docker pause`, keep-alive).
     frozen: AtomicBool,
+    profile: Option<crate::computer_profiles::ProfileSession>,
+    profile_can_save: bool,
+    login_state: String,
 }
 
 /// SEC: Ensure the container is cleaned up even on panic/task cancellation.
@@ -582,6 +679,9 @@ impl ComputerUseOrchestrator {
             masking: MaskingConfig::default(),
             registered_as: None,
             frozen: AtomicBool::new(false),
+            profile: None,
+            profile_can_save: false,
+            login_state: "disabled".into(),
         }
     }
 
@@ -691,6 +791,22 @@ impl ComputerUseOrchestrator {
         Arc::clone(&self.control)
     }
 
+    pub(crate) fn login_state(&self) -> &str {
+        &self.login_state
+    }
+    pub(crate) fn login_owner_valid(&self) -> bool {
+        self.profile
+            .as_ref()
+            .is_none_or(|p| p.valid_owner().unwrap_or(false))
+    }
+    pub(crate) fn discard_login(&mut self) {
+        self.control
+            .discard_login
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.profile_can_save = false;
+        self.login_state = "discarded".into();
+    }
+
     // ── Container lifecycle ───────────────────────────────────
 
     /// Start the container (`--network=none` unless a valid egress
@@ -740,6 +856,37 @@ impl ComputerUseOrchestrator {
                 return Err(ComputerUseError::Unavailable(WORKSPACE_MOUNT_UNSAFE.to_string()));
             }
         }
+        let mut restored = None;
+        if self.config.persist_login {
+            let result = crate::computer_profiles::ProfilesConfig::active(&self.home_dir)
+                .ok_or_else(|| "profiles disabled".to_string())
+                .and_then(|cfg| {
+                    crate::computer_profiles::ProfileSession::prepare(
+                        &self.home_dir,
+                        &self.agent_id,
+                        &self
+                            .config
+                            .pinned_hosts
+                            .iter()
+                            .map(|p| p.host.clone())
+                            .collect::<Vec<_>>(),
+                        cfg,
+                    )
+                });
+            match result {
+                Ok(profile) => match profile.restore() {
+                    Ok((bytes, status)) => {
+                        restored = bytes;
+                        self.login_state = status.into();
+                        self.profile = Some(profile);
+                    }
+                    Err(_) => self.login_state = "unavailable".into(),
+                },
+                Err(_) => self.login_state = "unavailable".into(),
+            }
+        }
+        // Only wait when the matching gateway restore handshake will run.
+        self.config.persist_login = self.profile.is_some();
         let args = build_docker_run_args(&container_name, &self.config, &valid_domains, &labels);
 
         let output = docker_output(&args, DOCKER_RUN_TIMEOUT, "Container start").await?;
@@ -768,8 +915,32 @@ impl ComputerUseOrchestrator {
 
         self.container_id = Some(container_name.clone());
 
+        if self.profile.is_some() {
+            let max = crate::computer_profiles::ProfilesConfig::active(&self.home_dir)
+                .map_or(64 * 1024 * 1024, |c| c.max_bytes);
+            if profile_output(
+                &container_name,
+                "import",
+                restored.as_deref().map_or(&[], |v| v.as_slice()),
+                max,
+            )
+            .await
+            .is_err()
+            {
+                self.profile = None;
+                self.login_state = "restore_failed".into();
+                // Stop this start rather than leave partially imported login
+                // files behind after a failed or late handshake.
+                return Err(ComputerUseError::Unavailable(
+                    "瀏覽器登入狀態還原失敗，請清除登入狀態後再試。".into(),
+                ));
+            }
+        }
+        drop(restored);
+
         // Wait for Xvfb to be ready (poll with timeout)
         self.wait_for_display(&container_name).await?;
+        self.profile_can_save = true;
 
         info!(
             agent = %self.agent_id,
@@ -810,21 +981,89 @@ impl ComputerUseOrchestrator {
 
     /// Stop and remove the container.
     pub async fn stop_session(&mut self) {
-        if let Some(ref name) = self.container_id {
+        if let Some(name) = self.container_id.clone() {
             info!(container = %name, "Stopping computer use session");
             // A paused (keep-alive) container is resumed first so `stop`
             // can deliver its signal; `rm -f` follows either way.
             if self.frozen.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                let _ = docker_output(&["unpause", name], CLEANUP_TIMEOUT, "Container unpause")
-                    .await;
+                let _ =
+                    docker_output(&["unpause", &name], CLEANUP_TIMEOUT, "Container unpause").await;
+            }
+            if self.profile_can_save
+                && (read_threat_level_sync(&self.home_dir) != ThreatLevel::Green
+                    || self
+                        .control
+                        .discard_login
+                        .load(std::sync::atomic::Ordering::Acquire))
+            {
+                self.discard_login();
+            }
+            if self.profile_can_save {
+                if let Some(profile) = self.profile.take() {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let result = match crate::computer_profiles::ProfilesConfig::active(
+                        &self.home_dir,
+                    ) {
+                        Some(config) => match {
+                            let control = Arc::clone(&self.control);
+                            let home = self.home_dir.clone();
+                            tokio::select! {
+                                result = profile_output(&name, "export", &[], config.max_bytes) => result,
+                                _ = async {
+                                    loop {
+                                        if control.discard_login.load(std::sync::atomic::Ordering::Acquire)
+                                            || read_threat_level_sync(&home) != ThreatLevel::Green { break; }
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                } => Err("browser snapshot interrupted".into()),
+                            }
+                        } {
+                            Ok(data) => {
+                                let data = zeroize::Zeroizing::new(data);
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                // A timed-out blocking writer retains its lock
+                                // and checks this deadline before committing.
+                                // The container can still be removed promptly.
+                                let control = Arc::clone(&self.control);
+                                let writer = tokio::task::spawn_blocking(move || {
+                                    profile.save_guarded_before(&data, deadline, &|| {
+                                        !control
+                                            .discard_login
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                    })
+                                });
+                                match tokio::time::timeout(remaining, writer).await {
+                                    Ok(Ok(result)) => result,
+                                    _ => Err("browser login save deadline exceeded".into()),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        },
+                        None => Err("profiles disabled".into()),
+                    };
+                    self.login_state = if result.is_ok() {
+                        "saved"
+                    } else {
+                        "save_failed"
+                    }
+                    .into();
+                    if result.is_err() {
+                        warn!(agent = %self.agent_id, "browser login state was not saved");
+                    }
+                }
             }
             // Best-effort cleanup (each step bounded; `rm -f` still runs if
             // `stop` hangs or times out).
-            let _ = docker_output(&["stop", "-t", "5", name], CLEANUP_TIMEOUT, "Container stop")
-                .await;
-            let _ = docker_output(&["rm", "-f", name], CLEANUP_TIMEOUT, "Container remove").await;
+            let _ = docker_output(
+                &["stop", "-t", "5", &name],
+                CLEANUP_TIMEOUT,
+                "Container stop",
+            )
+            .await;
+            let _ = docker_output(&["rm", "-f", &name], CLEANUP_TIMEOUT, "Container remove").await;
         }
         self.container_id = None;
+        self.profile = None;
     }
 
     // ── Screenshot capture ────────────────────────────────────
@@ -1332,6 +1571,9 @@ pub(crate) fn build_docker_run_args(
     // `start_container` refuses an unsafe source before building the argv.
     if let Some(mount) = config.workspace_mount.as_ref().and_then(workspace_mount_args) {
         args.extend(mount);
+    }
+    if config.persist_login {
+        args.extend(["-e".to_string(), "DUDUCLAW_PROFILE_WAIT=1".to_string()]);
     }
 
     // No privilege gain after start: setuid/setgid binaries and file
@@ -2281,11 +2523,15 @@ mod tests {
                     timings.push((label.to_string(), t.elapsed()));
                 }
                 // A click somewhere else after the pointer sat at 300,300.
-                orch.execute_action(&ComputerAction::LeftClick { coordinate: [517, 211] })
-                    .await
-                    .map_err(|e| e.to_string())?;
+                orch.execute_action(&ComputerAction::LeftClick {
+                    coordinate: [517, 211],
+                })
+                .await
+                .map_err(|e| e.to_string())?;
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                eval("document.documentElement.getAttribute('data-dd-click')").await.map(Some)
+                eval("document.documentElement.getAttribute('data-dd-click')")
+                    .await
+                    .map(Some)
             }
             .await;
         }

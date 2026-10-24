@@ -14,6 +14,57 @@ use crate::computer_use_sessions::live_view::authorize;
 use crate::computer_use_sessions::workspace_admin::admin_sessions;
 
 impl MethodHandler {
+    pub(crate) async fn handle_computer_profiles(
+        &self,
+        method: &str,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
+        use crate::computer_use_sessions::live_view::LiveAction;
+        let agent = params["agent_id"].as_str().unwrap_or("");
+        if !duduclaw_core::is_valid_agent_id(agent) {
+            return WsFrame::error_response("", "invalid agent_id");
+        }
+        let Some(live) = live_identity(&self.home_dir, ctx) else {
+            return WsFrame::error_response("", "permission denied");
+        };
+        let action = if method == "computer_profiles.reset" {
+            LiveAction::Control
+        } else {
+            LiveAction::Watch
+        };
+        if !authorize(&live, agent, action) {
+            return WsFrame::error_response("", "permission denied");
+        }
+        if method == "computer_profiles.reset" {
+            if params["confirm"] != true {
+                return WsFrame::error_response("", "清除登入狀態會結束瀏覽器，請明確確認。");
+            }
+            return match admin_sessions(&self.home_dir)
+                .reset_login(agent, &live)
+                .await
+            {
+                Ok(()) => WsFrame::ok_response("", json!({"ok": true})),
+                Err(e) => WsFrame::error_response("", &e.message),
+            };
+        }
+        let caps =
+            duduclaw_core::agent_toml::load(&self.home_dir.join("agents").join(agent)).capabilities;
+        match crate::computer_profiles::state(&self.home_dir, agent) {
+            Ok(state) => WsFrame::ok_response(
+                "",
+                json!({
+                    "enabled": crate::computer_profiles::ProfilesConfig::active(&self.home_dir).is_some() && caps.computer_use && caps.computer_use_config.persist_login,
+                    "saved": state.is_some(), "sealed_bytes": state.as_ref().map(|s| s.sealed_bytes),
+                    "updated_at": state.as_ref().map(|s| s.updated_at),
+                    "hosts_count": state.as_ref().map(|s| s.hosts.len()),
+                    "can_reset": authorize(&live, agent, LiveAction::Control),
+                }),
+            ),
+            Err(_) => WsFrame::error_response("", "目前無法讀取瀏覽器登入狀態。"),
+        }
+    }
+
     pub(crate) async fn handle_computer_sessions(
         &self,
         method: &str,
@@ -35,7 +86,22 @@ impl MethodHandler {
         }
         let sessions = admin_sessions(&self.home_dir);
         let result = match method {
-            "computer_sessions.status" => Ok(sessions.live_status(agent, &live.user_id)),
+            "computer_sessions.status" => {
+                let mut status = sessions.live_status(agent, &live.user_id);
+                let caps =
+                    duduclaw_core::agent_toml::load(&self.home_dir.join("agents").join(agent))
+                        .capabilities;
+                status["can_keep_login"] = json!(
+                    authorize(
+                        &live,
+                        agent,
+                        crate::computer_use_sessions::live_view::LiveAction::Control
+                    ) && caps.computer_use_config.persist_login
+                        && crate::computer_profiles::ProfilesConfig::active(&self.home_dir)
+                            .is_some()
+                );
+                Ok(status)
+            }
             "computer_sessions.view" => sessions.live_view_open(agent, &live).await,
             "computer_sessions.takeover" => sessions.live_takeover(agent, &live).await,
             "computer_sessions.hand_back" => {
@@ -44,7 +110,18 @@ impl MethodHandler {
                     .await
             }
             "computer_sessions.resume" => sessions.live_resume(agent, &live).await,
-            "computer_sessions.stop" => sessions.live_stop(agent, &live).await,
+            "computer_sessions.stop" => {
+                if params.get("keep_login").is_some_and(|v| !v.is_boolean()) {
+                    return WsFrame::error_response("", "keep_login must be true or false");
+                }
+                sessions
+                    .live_stop_with_login(
+                        agent,
+                        &live,
+                        params["keep_login"].as_bool().unwrap_or(false),
+                    )
+                    .await
+            }
             _ => return WsFrame::error_response("", "unknown computer_sessions method"),
         };
         match result {

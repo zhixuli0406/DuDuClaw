@@ -84,6 +84,7 @@ mod secaudit; // Code security audit MVP: intake + OSS scanner orchestration (`d
 mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
+mod computer_profiles_cmd;
 mod computer_workspaces_cmd; // P2-C: `duduclaw ops computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
@@ -1726,6 +1727,13 @@ enum OpsCommands {
     ComputerWorkspaces {
         #[command(subcommand)]
         command: computer_workspaces_cmd::ComputerWorkspaceCommands,
+    },
+
+    /// (operator) Read-only saved browser login-state metadata.
+    #[command(hide = true, name = "computer-profiles")]
+    ComputerProfiles {
+        #[command(subcommand)]
+        command: computer_profiles_cmd::ComputerProfileCommands,
     },
 
     /// Manage AI 員工職務組合 (agent presets) — named, versioned configuration
@@ -4817,24 +4825,28 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             tenant,
             acl,
             replay_hash,
-        }) => decision_cmd::load_outcome_model_screen(decision_cmd::LoadOutcomeModelScreenOptions {
-            db,
-            causal_db,
-            tenant,
-            acl,
-            replay_hash,
-        }),
-        Commands::DecisionOutcome(DecisionOutcomeCommands::DecisionOutcomeModelScreenRequestReview {
-            home,
-            db,
-            causal_db,
-            tenant,
-            acl,
-            replay_hash,
-            agent,
-            summary,
-            ttl_seconds,
         }) => {
+            decision_cmd::load_outcome_model_screen(decision_cmd::LoadOutcomeModelScreenOptions {
+                db,
+                causal_db,
+                tenant,
+                acl,
+                replay_hash,
+            })
+        }
+        Commands::DecisionOutcome(
+            DecisionOutcomeCommands::DecisionOutcomeModelScreenRequestReview {
+                home,
+                db,
+                causal_db,
+                tenant,
+                acl,
+                replay_hash,
+                agent,
+                summary,
+                ttl_seconds,
+            },
+        ) => {
             decision_cmd::outcome_model_screen_request_review(
                 decision_cmd::OutcomeModelScreenRequestReviewOptions {
                     home,
@@ -5240,6 +5252,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Ops(OpsCommands::ComputerWorkspaces { command }) => {
             computer_workspaces_cmd::run(&duduclaw_home(), command).await
+        }
+        Commands::Ops(OpsCommands::ComputerProfiles { command }) => {
+            computer_profiles_cmd::run(&duduclaw_home(), command)
         }
         Commands::Ops(OpsCommands::Org { command }) => match command {
             OrgCommands::Show => cmd_org_show(),
@@ -8536,10 +8551,19 @@ mod admin_auth_token_tests {
     async fn env_wins_and_plaintext_still_read() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        std::fs::write(home.join("config.toml"), "[gateway]\nauth_token = \"plain-1\"\n").unwrap();
-        assert_eq!(resolve_admin_auth_token(home, None).await.as_deref(), Some("plain-1"));
+        std::fs::write(
+            home.join("config.toml"),
+            "[gateway]\nauth_token = \"plain-1\"\n",
+        )
+        .unwrap();
         assert_eq!(
-            resolve_admin_auth_token(home, Some("env-1")).await.as_deref(),
+            resolve_admin_auth_token(home, None).await.as_deref(),
+            Some("plain-1")
+        );
+        assert_eq!(
+            resolve_admin_auth_token(home, Some("env-1"))
+                .await
+                .as_deref(),
             Some("env-1")
         );
         // Empty env falls through to the file.
@@ -9060,6 +9084,30 @@ async fn computer_use_check(home: &std::path::Path) -> (String, CheckStatus, Str
 async fn computer_workspaces_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let (status, message) = duduclaw_gateway::computer_workspaces::doctor::check(home).await;
     ("電腦操作工作區".to_string(), status, message)
+}
+
+fn computer_profiles_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    use duduclaw_gateway::computer_profiles::ProfilesConfig;
+    let (status, message) = match ProfilesConfig::load(home) {
+        Err(_) => (CheckStatus::Warn, "登入保存設定無法讀取，已停用。".into()),
+        Ok(config) if !config.enabled => (CheckStatus::Pass, "未啟用瀏覽器登入保存。".into()),
+        Ok(_) if !cfg!(unix) => (
+            CheckStatus::Warn,
+            "此平台不支援瀏覽器登入保存，已停用。".into(),
+        ),
+        Ok(_) if !duduclaw_gateway::config_crypto::opaque_data_key_available(home) => (
+            CheckStatus::Warn,
+            "缺少本機加密金鑰，無法保存登入；不會寫入明文。".into(),
+        ),
+        Ok(config) => (
+            CheckStatus::Pass,
+            format!(
+                "登入保存已啟用，每位員工上限 {} MiB；仍需個別開啟。",
+                config.max_bytes / (1024 * 1024)
+            ),
+        ),
+    };
+    ("瀏覽器登入保存".into(), status, message)
 }
 
 /// One finding per removed or deprecated runtime value in an agent config.
@@ -10027,6 +10075,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     checks.push(computer_use_check(&home).await);
     // Check 4b-3: durable computer-use workspaces (P2-C).
     checks.push(computer_workspaces_check(&home).await);
+    checks.push(computer_profiles_check(&home));
 
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);

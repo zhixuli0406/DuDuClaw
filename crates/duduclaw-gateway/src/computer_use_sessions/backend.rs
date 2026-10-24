@@ -54,6 +54,14 @@ pub(crate) trait SessionBackend: Send + Sync {
     }
     /// The control flags shared with the registry.
     fn control(&self) -> Arc<OrchestratorControl>;
+    /// Login-state lifecycle result; mocks and unsupported backends default off.
+    fn login_state(&self) -> &str {
+        "disabled"
+    }
+    fn login_owner_valid(&self) -> bool {
+        true
+    }
+    fn discard_login(&mut self) {}
 }
 
 /// Builds a backend for `(agent_id, home, config)`.
@@ -128,6 +136,16 @@ impl SessionBackend for OrchestratorBackend {
 
     fn control(&self) -> Arc<OrchestratorControl> {
         self.inner.control_handle()
+    }
+
+    fn login_state(&self) -> &str {
+        self.inner.login_state()
+    }
+    fn login_owner_valid(&self) -> bool {
+        self.inner.login_owner_valid()
+    }
+    fn discard_login(&mut self) {
+        self.inner.discard_login();
     }
 }
 

@@ -257,6 +257,14 @@ pub(crate) fn apply_capabilities_to_table(
             .as_table_mut()
             .ok_or_else(|| "Invalid [capabilities.computer_use_config] section".to_string())?;
 
+        if let Some(raw) = cfg.get("persist_login") {
+            let enabled = raw.as_bool().ok_or("persist_login must be true or false")?;
+            sub.insert("persist_login".into(), toml::Value::Boolean(enabled));
+            changes.push(format!(
+                "capabilities.computer_use_config.persist_login = {enabled}"
+            ));
+        }
+
         for (param_key, toml_key) in &[
             ("allowed_apps", "allowed_apps"),
             ("blocked_actions", "blocked_actions"),
