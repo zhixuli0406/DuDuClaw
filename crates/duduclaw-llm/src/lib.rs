@@ -58,27 +58,27 @@ pub use moa::{
 pub use provenance::{
     CJK_TAINT_MIN_CHARS, CallDecision, DEFAULT_TAINT_MIN_CHARS, FlagKind, MAX_LEDGER_SPANS,
     MAX_LEDGER_TOTAL_CHARS, PREVIEW_MAX_CHARS, ProvenanceConfig, ProvenanceFlag, ProvenanceLedger,
-    ProvenancePolicy, ScopedToolTrust, SensitiveTool, SourceKind, TaintHit, TrustLevel, evaluate_call,
-    seed_default_ledger,
+    ProvenancePolicy, ScopedToolTrust, SensitiveTool, SourceKind, TaintHit, TrustLevel,
+    evaluate_call, seed_default_ledger,
 };
 pub use provider::{ApiAuth, ChatProvider, ProviderId, resolve_env_key, split_model_id};
 pub use registry::{Feature, ModelCaps, ModelInfo, ModelRegistry, PriceCliff};
 pub use tool_loop::{
-    CcrDeliveryGuards, CcrSavedResult, DEFAULT_MAX_TOOL_ITERS, InterceptDecision, MAX_ITERS_STOP,
-    PolicyExecutor, ToolExecutor, ToolInterceptor, ToolLoopOutcome, ToolLoopTelemetry, ToolOutcome,
-    run_tool_loop, run_tool_loop_with_provenance, run_tool_loop_with_provenance_and_ccr,
+    CcrDeliveryGuards, CcrSavedResult, ClientOperation, DEFAULT_MAX_TOOL_ITERS, InterceptDecision,
+    MAX_ITERS_STOP, PolicyExecutor, PreparedClientCall, SecretBearer, ToolCallLease, ToolExecutor,
+    ToolInterceptor, ToolLoopOutcome, ToolLoopTelemetry, ToolOutcome, run_tool_loop,
+    run_tool_loop_with_provenance, run_tool_loop_with_provenance_and_ccr,
 };
 
 #[cfg(feature = "mcp-client")]
 pub use mcp_client::{
-    DEFAULT_MCP_TIMEOUT, McpClient, McpError, McpSourceVerifier, McpToolDef, ToolCallResult,
-    ToolFilter, ToolRegistry, VerifiedMcpSource, build_initialize_request,
-    build_initialized_notification, build_tools_call_request, build_tools_list_request,
-    parse_tool_call_result, parse_tools_list_response,
+    DEFAULT_MCP_TIMEOUT, McpClient, McpError, McpSourceVerifier, McpToolDef, RegistryClient,
+    ScopedHttpRecipe, ToolCallResult, ToolFilter, ToolRegistry, VerifiedMcpSource,
+    build_initialize_request, build_initialized_notification, build_tools_call_request,
+    build_tools_list_request, parse_tool_call_result, parse_tools_list_response,
 };
 pub use types::{
     CACHE_SPLIT_MARKER, CacheHint, ChatMessage, ChatRequest, ChatResponse, ContentPart,
     NormalizedUsage, ReasoningHint, Role, StopReason, StreamEvent, SystemBlock, ThinkingDisplay,
-    ToolChoice,
-    ToolDef, estimate_tokens,
+    ToolChoice, ToolDef, estimate_tokens,
 };

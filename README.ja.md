@@ -289,6 +289,7 @@ Enterprise の個人 Google 接続（未リリース）：本人が接続し、�
 - [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
+- [MCP 操作ごとの権限](docs/guides/ja-JP/mcp-call-lifetimes.md)：HTTP 操作単位の権限を扱う未リリースのホスト API リファレンス
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);[52-desktop-edition.md](docs/features/52-desktop-edition.md):デスクトップ版、人と AI で一台を共有;ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md);アプリ互換・イメージのビルド・リリースはいずれも [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ(互換層は同リポジトリの `docs/guides/app-compat.md`)
