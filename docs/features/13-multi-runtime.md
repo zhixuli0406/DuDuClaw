@@ -2,6 +2,24 @@
 
 > One platform, twelve runtime ids: eleven CLI backends (Claude, Codex, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
 
+## Failure provenance and explicit fallback
+
+An absent or invalid `[runtime] fallback` does not silently try Claude. An explicitly configured runtime fallback still uses the existing health, policy and compatible-model checks. Account rotation, model fallback and configured local inference remain available. A non-Claude reply does not add an Anthropic Direct API hop after failure.
+
+Diagnostics distinguish the primary backend, explicit fallback and unexecuted steps. GPT/Codex or API authentication errors do not instruct Claude login. Only an actual Claude CLI authentication failure opens its outage, and only an actual Claude CLI success clears it. An OpenAI-compatible endpoint may belong to another vendor. Administrators who relied on implicit Claude fallback must now configure `fallback` explicitly.
+
+## Model and runtime consistency
+
+Agent creation, edited templates, model saves and the administrator `/model` command share the same model-family alignment rule. A confident mismatch is corrected when saving, subject to the existing administrator and product-policy checks. Explicit API-compatible backends, fallback settings and unknown custom models are preserved. Saving the same model can repair an older runtime mismatch; the response distinguishes a live repair from a failed registry reload.
+
+An older unsaved profile with a known model/provider mismatch is refused before model execution. Ask an administrator to save its settings and retry. Reading or routing never silently rewrites the file, and a configuration mismatch is not a Claude login error. Model-name substrings do not determine a runtime.
+
+## Discord employee selection
+
+Ordinary messages, text commands such as `/model`, and `/ask` use the same explicit employee order: a per-employee bot binding, the guild or DM selection, then the global selection. An empty scoped selection inherits the global setting. A removed or renamed explicit target is refused rather than silently replaced by the main employee.
+
+With no explicit selection, ordinary conversation retains the existing channel/thread bindings, allowed-channel and default routing, followed by sender-aware `@` calls. Text commands resolve their context through the existing fallback without interpreting the command as an employee call. `/agent` and Switch Agent still require Manage Server to change a guild binding. Reply labels identify the employee actually selected by the reply pipeline, including bound and `@`-called employees. Document delivery uses that employee's existing directory checks; an unresolved reply does not scan the main employee's files.
+
 ---
 
 ## The Metaphor: A Multilingual Office

@@ -156,7 +156,7 @@ impl MethodHandler {
             }
             "templates.create_agent" => {
                 require_admin!();
-                self.handle_templates_create_agent(params).await
+                self.handle_templates_create_agent(params, ctx).await
             }
 
             // ── Behavioral contract (per-agent CONTRACT.toml, CON.1–CON.3) ──

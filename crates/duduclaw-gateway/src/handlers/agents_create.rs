@@ -241,6 +241,14 @@ impl MethodHandler {
             }
         };
 
+        let alignment = match crate::runtime_config::align_model_runtime(&mut agent_config) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+                return WsFrame::error_response("", &error);
+            }
+        };
+
         if let Err(e) = crate::product_policy::load(&self.home_dir)
             .and_then(|policy| crate::product_policy::validate_table(policy, &agent_config)) {
             let _ = tokio::fs::remove_dir_all(&agent_dir).await;
@@ -277,6 +285,8 @@ impl MethodHandler {
             caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
             &runtime_outcome.deprecated,
         );
+
+        alignment.audit(&self.home_dir, name, "agents.create", caller.map(|c|c.user_id.as_str()).unwrap_or("unknown"));
 
         // Honor an optional `soul` param (the agent's persona / system prompt).
         // Trim + cap defensively; fall back to a stock one-liner when absent.
@@ -328,6 +338,8 @@ impl MethodHandler {
             "",
             json!({
                 "success": true,
+                "runtime_provider_auto_aligned": alignment.aligned_provider().map(|p|p.as_str().to_owned()),
+                "runtime_provider_align_skipped": alignment.skipped_reason(),
                 "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
             }),
         )

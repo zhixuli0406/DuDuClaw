@@ -1,9 +1,13 @@
 use super::*;
 
+/// Fixed refusal for a removed explicit target, without naming private agents.
+pub(crate) const SELECTED_AGENT_UNAVAILABLE: &str =
+    "⚠️ 指定的 AI 員工目前無法使用，請檢查頻道設定或重新選擇。";
+
 /// Inner implementation shared by both default-agent and explicit-agent paths.
 ///
-/// When `agent_override` is `Some(name)`, the named agent is looked up directly.
-/// When `None`, the default agent resolution logic (config.toml → main_agent) is used.
+/// Some(name) must resolve exactly; a missing explicit target is refused.
+/// None retains channel/thread/permission/default routing and sender-aware calls.
 // OTel GenAI semconv (Development): root `invoke_agent` span for one channel
 // turn. Attribute names are centralized in `crate::otel` (tracing macros need
 // literal field names, so the dotted literals here mirror those consts).
@@ -141,7 +145,14 @@ pub(super) async fn build_reply_with_session_inner(
         // snapshot — those callers already applied `@` routing themselves
         // and mark a called employee with `trigger_route::as_called_turn`).
         via_trigger = crate::trigger_route::in_called_turn();
-        reg.get(name).or_else(|| reg.main_agent())
+        match reg.get(name) {
+            Some(agent) => Some(agent),
+            None => return if public_visitor {
+                crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()
+            } else {
+                SELECTED_AGENT_UNAVAILABLE.into()
+            },
+        }
     } else {
         let fallback = resolve_fallback_agent(ctx, &reg, session_id, user_id).await;
         // WebChat decides `@` routing itself (it knows the dashboard account
@@ -284,12 +295,19 @@ pub(super) async fn build_reply_with_session_inner(
     // non-Claude call carries its own provider on the nested `chat` span.
     {
         let span = tracing::Span::current();
-        span.record(crate::otel::attrs::SYSTEM, "anthropic");
-        span.record(crate::otel::attrs::PROVIDER_NAME, "anthropic");
         span.record(crate::otel::attrs::AGENT_NAME, agent_id.as_str());
         span.record(crate::otel::attrs::REQUEST_MODEL, model.as_str());
     }
     let agent_dir = agent.map(|a| a.dir.clone());
+    // Reject a confidently broken stored pair before utility/model/CLI calls.
+    // Reading never migrates a profile; an authorized writer owns repairs.
+    if let Some(dir) = agent_dir.as_deref() {
+        let settings = crate::runtime_config::load_runtime_settings(dir);
+        if let Err(error) = crate::runtime_config::ensure_model_provider(&model, settings.provider) {
+            return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { format!("⚠️ {error}") };
+        }
+    }
+
 
     // ── 「加入知識庫 <集合>」 (document knowledge base) ──
     // Proposes this message's attachments (or the sender's recent ones) for
@@ -1341,7 +1359,7 @@ pub(super) async fn build_reply_with_session_inner(
     // Track the last underlying failure so the fallback message can
     // accurately describe what went wrong (rate limit vs timeout vs
     // missing binary etc.) instead of always blaming "not installed".
-    let mut last_cli_error: Option<String> = None;
+    let mut last_cli_error: Option<ReplyFailure> = None;
 
     // Record the moment we dispatched the CLI call. This is the lower
     // time bound used by the action-claim verifier when scanning
@@ -1472,6 +1490,12 @@ pub(super) async fn build_reply_with_session_inner(
     let non_claude = runtime_settings
         .as_ref()
         .and_then(|s| s.non_claude_provider());
+    if let Some(settings)=&runtime_settings {
+        if let Err(error)=crate::runtime_config::ensure_model_provider(&model,settings.provider) {
+            return if public_visitor {crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()} else {format!("⚠️ {error}")};
+        }
+    }
+
 
     // A channel reply needs the platform tools and the conversation state the
     // task sandbox does not provide, so it runs on the host — reported once
@@ -1485,7 +1509,7 @@ pub(super) async fn build_reply_with_session_inner(
     );
 
     let cli_future: std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ReplyAttempt, ReplyFailure>> + Send + '_>,
     > = if duduclaw_llm::is_moa_model_id(&model) {
         // MoA virtual model (`moa:<name>`) — API-mode only. A CLI spawn can
         // never serve an ensemble (and `claude -p --model moa:x` would just
@@ -1515,7 +1539,8 @@ pub(super) async fn build_reply_with_session_inner(
                 &moa_history,
             )
             .await
-            .map_err(|e| format!("MoA 模型 `{moa_model}` 需要 API 模式（無法經由 CLI 執行）：{e}"))
+            .map(|text| ReplyAttempt::new(text, ReplyOrigin::Moa))
+            .map_err(|error| ReplyFailure::simple(ReplyOrigin::Moa,error))
         })
     } else if let Some(provider) = non_claude {
         info!(
@@ -1548,7 +1573,7 @@ pub(super) async fn build_reply_with_session_inner(
         let hb_session_id = session_id;
         Box::pin(async move {
             let work =
-                crate::runtime_dispatch::run_agent_prompt(crate::runtime_dispatch::AgentPrompt {
+                crate::runtime_dispatch::run_agent_prompt_detailed(crate::runtime_dispatch::AgentPrompt {
                     agent_dir: hb_agent_dir,
                     home_dir: hb_home,
                     agent_id: hb_agent_id,
@@ -1580,7 +1605,7 @@ pub(super) async fn build_reply_with_session_inner(
                         }
                     }
                 }
-            }?;
+            }.map_err(ReplyFailure::runtime)?;
             // Detect and surface a runtime substitution — the response was
             // actually produced by a different backend than `[runtime]
             // provider` configured (failover happened inside the choke-point,
@@ -1616,10 +1641,13 @@ pub(super) async fn build_reply_with_session_inner(
                     });
                 }
             }
-            Ok(resp.content)
+            let origin = ReplyOrigin::runtime_name(&resp.runtime_name);
+            Ok(ReplyAttempt::new(resp.content, origin))
         })
     } else {
-        Box::pin(call_claude_cli_rotated(
+        Box::pin(async {
+            #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,false);
+            call_claude_cli_rotated(
             &effective_message,
             &model,
             &full_system_prompt,
@@ -1631,7 +1659,10 @@ pub(super) async fn build_reply_with_session_inner(
             &conversation_history,
             &account_pool,
             None,
-        ))
+        ).await
+            .map(|text| ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)))
+            .map_err(|error| ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
+        })
     };
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES
         .iter()
@@ -1684,12 +1715,12 @@ pub(super) async fn build_reply_with_session_inner(
             }
             Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
                 info!(
-                    "inference_mode=local: router escalated to cloud → falling back to Claude CLI"
+                    "inference_mode=local: router escalated to cloud → falling back to the configured runtime"
                 );
             }
             Err(e) => {
                 warn!(
-                    "inference_mode=local but local inference failed → falling back to Claude CLI: {e}"
+                    "inference_mode=local but local inference failed → falling back to the configured runtime: {e}"
                 );
             }
         }
@@ -1727,11 +1758,10 @@ pub(super) async fn build_reply_with_session_inner(
     // this request's history was compressed and by which stages.
     let cli_future = crate::prompt_compression::CHANNEL_REPLY_COMPRESSION
         .scope(compression_info.clone(), cli_future);
-    let local_first_answered = local_first_reply.is_some();
     let reply = match local_first_reply {
         // Local-first already answered (inference_mode=local): skip the CLI
         // entirely — the unconsumed cli_future is lazy and simply drops.
-        Some(local_reply) => Ok(local_reply),
+        Some(local_reply) => Ok(ReplyAttempt::new(local_reply, ReplyOrigin::Local)),
         None if is_channel_session => {
             // The delivery address is the conversation, never the employee
             // bucket (`#agent:`); an own-bot turn also names its bot (B11).
@@ -1756,44 +1786,29 @@ pub(super) async fn build_reply_with_session_inner(
         // to keep answering with nothing (the "session chain break" bug).
         // Convert to the error path so the classified 空回應 fallback message
         // is sent and channel_failures.jsonl gets an audit row.
-        Ok(reply) if reply.trim().is_empty() => {
+        Ok(reply) if reply.text.trim().is_empty() => {
             warn!("Reply pipeline returned empty response — routing to fallback chain");
-            last_cli_error = Some("Empty response from reply pipeline".to_string());
+            last_cli_error = Some(ReplyFailure::simple(reply.origin,"Empty response from reply pipeline".to_string()));
             None
         }
         Ok(reply) => {
-            if !local_first_answered {
-                info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
-                // D7 recovery: a Claude account actually answered, so any
-                // open "all accounts failed authentication" outage is over —
-                // close it and say so once. Deliberately gated on
-                // `!local_first_answered`: a local-model reply proves nothing
-                // about cloud credentials and must not clear the alarm (that
-                // would flap the notification on every alternating turn).
-                let outage_agent = if agent_id.trim().is_empty() {
-                    "system"
-                } else {
-                    agent_id.as_str()
-                };
-                crate::auth_outage::record_recovery(&ctx.home_dir, outage_agent).await;
-            }
-            Some(reply)
+            info!(origin=reply.origin.label(), chars=reply.text.len(), "Reply completed");
+            let span=tracing::Span::current();
+            span.record(crate::otel::attrs::SYSTEM,reply.origin.telemetry_id());
+            span.record(crate::otel::attrs::PROVIDER_NAME,reply.origin.telemetry_id());
+            super::reply_origin::record_reply_recovery(reply.origin,&ctx.home_dir,&agent_id).await;
+            Some(reply.text)
         }
-        Err(e) => {
-            let log_line = format!("[{}] claude CLI error: {e}\n", chrono::Utc::now());
-            let _ = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(ctx.home_dir.join("debug.log"))
-                .await
-                .map(|mut f| {
+        Err(error) => {
+            let diagnostic=error.audit();
+            let log_line=format!("[{}] reply runtime failure: {diagnostic}\n",chrono::Utc::now());
+            let _ = tokio::fs::OpenOptions::new().create(true).append(true)
+                .open(ctx.home_dir.join("debug.log")).await.map(|mut file| {
                     use tokio::io::AsyncWriteExt;
-                    tokio::spawn(async move {
-                        let _ = f.write_all(log_line.as_bytes()).await;
-                    });
+                    tokio::spawn(async move { let _=file.write_all(log_line.as_bytes()).await; });
                 });
-            warn!("claude CLI unavailable: {e}");
-            last_cli_error = Some(e);
+            warn!(diagnostic=%diagnostic,"Reply runtime unavailable");
+            last_cli_error=Some(error);
             None
         }
     };
@@ -1802,9 +1817,7 @@ pub(super) async fn build_reply_with_session_inner(
     // could not be confirmed. Answering from a local model or the plain
     // Direct API instead would hide that from the person, so skip both
     // fallbacks and show the gate's own sentence (step 3 below).
-    let mcp_gate_refused = last_cli_error
-        .as_deref()
-        .is_some_and(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error);
+    let mcp_gate_refused = last_cli_error.as_ref().and_then(ReplyFailure::spawn_gate_message).is_some();
 
     // 2. Fallback: Local model inference (if configured)
     let reply = match reply {
@@ -1828,13 +1841,8 @@ pub(super) async fn build_reply_with_session_inner(
             {
                 Ok(local_reply) => {
                     info!("Replied via local model ({} chars)", local_reply.len());
-                    // Prepend a notice so the user knows CLI failed and local model is answering
-                    let cli_err = last_cli_error.as_deref().unwrap_or("unknown");
-                    let hint = classify_cli_error_hint(cli_err);
-                    let notice = format!(
-                        "⚠️ Claude CLI 暫時不可用（{hint}），本次由本地模型代為回應。\n\
-                         系統會在背景自動偵測恢復。\n\n"
-                    );
+                    let notice = last_cli_error.as_ref().map(ReplyFailure::local_notice)
+                        .unwrap_or_else(||"⚠️ 本次由已設定的本地模型代為回應。\n\n".into());
                     Some(format!("{notice}{local_reply}"))
                 }
                 Err(e) => {
@@ -1852,13 +1860,17 @@ pub(super) async fn build_reply_with_session_inner(
     // The Direct API requires an API key — OAuth tokens are not supported.
     // Only attempt this fallback when an API key is available; skip entirely
     // for OAuth-only setups to avoid the misleading "未設定任何 API 帳號" error.
-    let fallback_api_key = get_api_key(&ctx.home_dir).await;
+    let allow_direct_api = direct_api_allowed(non_claude,duduclaw_llm::is_moa_model_id(&model),mcp_gate_refused);
+    let fallback_api_key = if reply.is_none() && allow_direct_api {
+        #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,true);
+        get_api_key(&ctx.home_dir).await
+    } else { None };
     let reply = match reply {
         Some(r) => Some(r),
         None if mcp_gate_refused => None,
         // A `moa:` id is not an Anthropic model — the MoA branch above was
         // this request's API path; don't re-send the ensemble id upstream.
-        None if fallback_api_key.is_some() && !duduclaw_llm::is_moa_model_id(&model) => {
+        None if allow_direct_api && fallback_api_key.is_some() => {
             let key = fallback_api_key.as_deref().unwrap_or_default();
             // P34 #4: a `system_operator`-capable agent gets one attempt at
             // the real MCP tool loop before falling through to the plain
@@ -1901,7 +1913,8 @@ pub(super) async fn build_reply_with_session_inner(
                         Some(resp.text)
                     }
                     Err(e) => {
-                        let log_line = format!("[{}] direct API error: {e}\n", chrono::Utc::now());
+                        let diagnostic = ReplyFailure::simple(ReplyOrigin::AnthropicApi,e.clone()).audit();
+                        let log_line = format!("[{}] direct API failure: {diagnostic}\n", chrono::Utc::now());
                         let _ = tokio::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
@@ -1913,10 +1926,12 @@ pub(super) async fn build_reply_with_session_inner(
                                     let _ = f.write_all(log_line.as_bytes()).await;
                                 });
                             });
-                        warn!("Direct API unavailable: {e}");
+                        warn!(diagnostic=%diagnostic,"Direct API unavailable");
                         // Only overwrite if we don't already have a more specific CLI error.
-                        if last_cli_error.is_none() {
-                            last_cli_error = Some(e);
+                        if let Some(primary)=last_cli_error.as_mut() {
+                            primary.append_direct_api_failure(e);
+                        } else {
+                            last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::AnthropicApi,e));
                         }
                         None
                     }
@@ -1924,7 +1939,7 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
         None => {
-            info!("Skipping Direct API fallback — no API key available (OAuth-only setup)");
+            info!("Skipping Direct API fallback — not eligible or no API key");
             None
         }
     };
@@ -3701,15 +3716,15 @@ pub(super) async fn build_reply_with_session_inner(
     // 3. Fallback: classified error message
     let reg = ctx.registry.read().await;
     let name = reg
-        .main_agent()
+        .get(&agent_id)
         .map(|a| a.config.agent.display_name.clone())
         .unwrap_or_else(|| "DuDuClaw".to_string());
     drop(reg);
 
-    let err_str = last_cli_error
-        .clone()
-        .unwrap_or_else(|| "No error info".to_string());
-    let reason = classify_cli_failure(&err_str);
+    let failure = last_cli_error.unwrap_or_else(||ReplyFailure::simple(ReplyOrigin::Unknown,"No error info".into()));
+    let reason = failure.reason();
+    let diagnostic = failure.audit();
+    let err_str = diagnostic.to_string();
     warn!(
         agent = %name,
         reason = ?reason,
@@ -3722,13 +3737,13 @@ pub(super) async fn build_reply_with_session_inner(
     // new token. Alarm once per outage; `record_outage` debounces and
     // swallows its own errors, so this can never turn a fallback message into
     // a hard failure.
-    if reason == FailureReason::AuthFailed {
+    if let Some(auth_error) = failure.claude_auth_error() {
         let outage_agent = if agent_id.trim().is_empty() {
             "system"
         } else {
             agent_id.as_str()
         };
-        crate::auth_outage::record_outage(&ctx.home_dir, outage_agent, &err_str).await;
+        crate::auth_outage::record_outage(&ctx.home_dir, outage_agent, auth_error).await;
     }
 
     // Append a structured audit line so the dashboard can surface failure trends.
@@ -3747,8 +3762,8 @@ pub(super) async fn build_reply_with_session_inner(
     // when one actually exists (`failure_doc_url` never invents a URL).
     // `json!` serializes `Option<String>`/`Option<&str>` as `null` when
     // `None`, so this stays fail-quiet the same way `deep_link` itself does.
-    let console_url = failure_console_url(&ctx.home_dir, reason);
-    let doc_url = failure_doc_url(reason);
+    let console_url = if failure.display_origin().is_claude_cli() {failure_console_url(&ctx.home_dir, reason)} else {None};
+    let doc_url = failure.display_origin().is_claude_cli().then(||failure_doc_url(reason)).flatten();
     let audit = serde_json::json!({
         "event": "channel_reply_fallback",
         "agent": name,
@@ -3758,23 +3773,28 @@ pub(super) async fn build_reply_with_session_inner(
         "channel": crate::trajectory_guard::channel_from_session_id(session_id),
         "reason": reason_token,
         "error": err_str.chars().take(300).collect::<String>(),
+        "runtime_failure": diagnostic,
         "mast": mast.as_str(),
         "mast_category": mast.category_str(),
         "console_url": console_url,
         "doc_url": doc_url,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    if let Ok(line) = serde_json::to_string(&audit) {
-        let path = ctx.home_dir.join("channel_failures.jsonl");
-        if let Ok(mut f) = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            use tokio::io::AsyncWriteExt;
-            let _ = f.write_all(format!("{line}\n").as_bytes()).await;
-        }
+    // Shared JSONL appends must use the existing cross-process file lock.
+    // Await off-thread I/O, then preserve the same best-effort reply path.
+    let audit_home = ctx.home_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::trajectory_guard::append_anomaly(&audit_home, &audit)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(kind = ?error.kind(), "Channel failure audit append failed"),
+        Err(error) => warn!(
+            cancelled = error.is_cancelled(),
+            panicked = error.is_panic(),
+            "Channel failure audit task failed"
+        ),
     }
 
     // A public website visitor (Odoo Live Chat) is a customer, not the
@@ -3786,10 +3806,10 @@ pub(super) async fn build_reply_with_session_inner(
     // The spawn gate already wrote its own audit event; the person sees the
     // gate's sentence (which names the employee and asks the operator to
     // check the file) instead of a generic "something failed" message.
-    if let Some(msg) = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&err_str) {
+    if let Some(msg) = failure.spawn_gate_message() {
         return msg.to_string();
     }
-    format_fallback_message(&name, reason, &ctx.home_dir)
+    failure.message(&name, &ctx.home_dir)
 }
 
 /// True when a non-Claude reply's actual answering runtime differs from the

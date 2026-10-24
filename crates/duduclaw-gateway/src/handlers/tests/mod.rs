@@ -87,3 +87,5 @@ mod product_policy_tests;
 mod subscription_risk_gate_tests;
 mod credential_protection_rpc_tests;
 mod google_identity_rpc_tests;
+
+mod runtime_model_alignment_tests;

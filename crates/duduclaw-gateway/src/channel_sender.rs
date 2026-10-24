@@ -1143,6 +1143,8 @@ impl ChannelSender for DiscordSender {
             "https://discord.com/api/v10/channels/{}/messages",
             self.channel_id
         );
+        #[cfg(test)]
+        let url = crate::discord::test_sender_url(&self.bot_token, &url);
         let resp = self
             .http
             .post(&url)
@@ -1191,6 +1193,8 @@ impl ChannelSender for DiscordSender {
             "https://discord.com/api/v10/channels/{}/messages",
             self.channel_id
         );
+        #[cfg(test)]
+        let url = crate::discord::test_sender_url(&self.bot_token, &url);
         let file_part = reqwest::multipart::Part::bytes(data.to_vec())
             .file_name(filename.to_string())
             .mime_str(mime)

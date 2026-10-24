@@ -31,6 +31,8 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 pub mod model;
+mod failure;
+pub use failure::{RuntimeDispatchFailure,RuntimePreflightFailure,RuntimePreflightKind,RuntimeStep,RuntimeStepOutcome,RuntimeStepRole};
 
 use crate::runtime::{RuntimeContext, RuntimeRegistry, RuntimeResponse, RuntimeType};
 
@@ -159,264 +161,103 @@ impl FailoverManager {
         context: &RuntimeContext,
         model_fallbacks: &[String],
     ) -> Result<RuntimeResponse, String> {
-        let policy = crate::product_policy::load(&context.home_dir)?;
-        policy.require_runtime(primary.as_str())?;
-        crate::product_policy::require_model(policy, &context.model)?;
-        if let Some(provider) = context.preferred_provider.as_deref() { policy.require_provider(provider)?; }
-        // Check primary health (with cooldown recovery)
-        let primary_available = {
-            let mut health = self.health.write().await;
-            let entry = health
-                .entry(primary.clone())
-                .or_insert_with(|| ProviderHealth::new(primary.clone()));
-            entry.check_cooldown()
+        self.execute_with_failover_detailed(registry,primary,fallback,prompt,context,model_fallbacks).await.map_err(|error|error.legacy_message())
+    }
+
+    /// Same execution/health lifecycle, retaining both attempted and skipped
+    /// legs. The String API above never executes a second request.
+    pub async fn execute_with_failover_detailed(
+        &self, registry:&RuntimeRegistry, primary:&RuntimeType,
+        fallback:Option<&RuntimeType>, prompt:&str, context:&RuntimeContext,
+        model_fallbacks:&[String],
+    ) -> Result<RuntimeResponse,RuntimeDispatchFailure> {
+        use RuntimeStepOutcome as Outcome;
+        use RuntimeStepRole::{Primary,Fallback};
+        let mut failure=RuntimeDispatchFailure::new(*primary,&context.model);
+        let policy=crate::product_policy::load(&context.home_dir).map_err(|error|RuntimeDispatchFailure::preflight(Some(*primary),&context.model,RuntimePreflightKind::Policy,error))?;
+        let primary_policy=(|| {
+            policy.require_runtime(primary.as_str())?;
+            crate::product_policy::require_model(policy,&context.model)?;
+            if let Some(provider)=context.preferred_provider.as_deref() { policy.require_provider(provider)?; }
+            Ok::<_,String>(())
+        })();
+        if let Err(error)=primary_policy {
+            return Err(RuntimeDispatchFailure::preflight(Some(*primary),&context.model,RuntimePreflightKind::Policy,error));
+        }
+        let primary_available={
+            let mut health=self.health.write().await;
+            health.entry(*primary).or_insert_with(||ProviderHealth::new(*primary)).check_cooldown()
         };
-
-        // P0/WP-B: the primary's own error, kept so a *refused* cross-family
-        // failover can return the real root cause instead of a generic
-        // "unavailable" (the live test's codex argv bug must stay visible in
-        // the judge-seam audit, not be replaced by the guard's own message).
-        let mut primary_error: Option<String> = None;
-
-        // Try primary
-        if primary_available {
-            if let Some(runtime) = registry.get(primary) {
-                // Empty content is a FAILURE, not a success: an "Ok" with no text
-                // would be silently dropped by every channel (they skip empty
-                // sends) and an empty assistant turn would poison the session
-                // history — the user sees nothing and the conversation chain
-                // breaks. Route it through the same failover + classified-error
-                // path as a hard error.
-                match {
-                    #[cfg(test)]
-                    crate::model_call_probe::record("failover_execute");
-                    runtime.execute(prompt, context).await
-                } {
-                    Ok(response) if !response.content.trim().is_empty() => {
-                        self.record_success(primary).await;
-                        // Truthful attribution (live round 3 E2): tell a
-                        // scoped caller which runtime/model really answered.
-                        // On this leg they equal what was requested; the
-                        // fallback leg below overwrites when they do not.
-                        crate::runtime::record_runtime_outcome(primary.clone(), &context.model);
-                        if response.input_tokens > 0 || response.output_tokens > 0 {
-                            crate::runtime::record_role_usage(crate::role_turns::RoleTurnUsage {
-                                usage_input_tokens: Some(response.input_tokens),
-                                usage_output_tokens: Some(response.output_tokens),
-                                usage_cache_read_tokens: None,
-                                usage_legs: None,
-                            });
-                        }
-                        return Ok(response);
-                    }
-                    Ok(_) => {
-                        warn!(
-                            runtime = ?primary,
-                            model = %context.model,
-                            reason = "empty_response",
-                            "Primary runtime returned empty response — attempting failover"
-                        );
-                        primary_error = Some(format!("Empty response from primary ({primary:?})"));
-                        self.record_failure(primary).await;
-                        crate::metrics::global_metrics().record_failover();
-                    }
-                    Err(e) => {
-                        if is_non_retryable(&e) {
-                            // Don't failover on user errors
-                            return Err(e);
-                        }
-                        warn!(
-                            runtime = ?primary,
-                            error = %e,
-                            reason = "execution_failed",
-                            "Primary runtime failed — attempting failover"
-                        );
-                        primary_error = Some(e);
-                        self.record_failure(primary).await;
-                        crate::metrics::global_metrics().record_failover();
-                    }
+        if !primary_available {
+            failure.push(Primary,*primary,Some(&context.model),Outcome::Cooldown);
+        } else if let Some(runtime)=registry.get(primary) {
+            match {
+                #[cfg(test)] crate::model_call_probe::record("failover_execute");
+                runtime.execute(prompt,context).await
+            } {
+                Ok(response) if !response.content.trim().is_empty()=>{
+                    self.record_success(primary).await;
+                    record_successful_response(primary,context,&response);
+                    return Ok(response);
                 }
-            } else {
-                // 2026-07-23 distributor incident: the primary runtime's CLI
-                // was never registered (binary missing / detection failed at
-                // startup) — `registry.get()` returns `None` silently and this
-                // branch used to do nothing at all, falling through to the
-                // fallback with zero signal. The user believed they were
-                // talking to `primary`; a different runtime answered instead.
-                // Distinguished from the above cases via `reason =
-                // "not_registered"` (vs. `"execution_failed"` /
-                // `"empty_response"`) so operators can tell "never had this
-                // backend available" apart from "backend errored this call".
-                warn!(
-                    runtime = ?primary,
-                    reason = "not_registered",
-                    "Primary runtime not registered (CLI missing or unavailable at startup) \
-                     — falling through to fallback"
-                );
-                crate::metrics::global_metrics().record_failover();
-            }
-        }
-
-        // Try fallback
-        if let Some(fb) = fallback {
-            policy.require_runtime(fb.as_str())?;
-            let fb_available = {
-                let mut health = self.health.write().await;
-                let entry = health
-                    .entry(fb.clone())
-                    .or_insert_with(|| ProviderHealth::new(fb.clone()));
-                entry.check_cooldown()
-            };
-
-            if fb_available {
-                if let Some(runtime) = registry.get(fb) {
-                    // WP-A1: the fallback runtime must NOT inherit the primary's
-                    // model. Before this, a codex agent whose `[model] preferred`
-                    // is `gpt-5.4` failed over to Claude and the Claude runtime
-                    // was spawned with `--model gpt-5.4` — a foreign model id
-                    // that the backend rejects (or, worse, silently substitutes),
-                    // and `model_used` then reported `gpt-5.4` for a Claude call.
-                    let Some((fb_model, model_source)) =
-                        resolve_fallback_model(fb, &context.model, model_fallbacks)
-                    else {
-                        // (4) Nothing nameable for this runtime — refuse to
-                        // spawn rather than send a foreign model id. Counted as
-                        // a failed attempt so a permanently mis-configured
-                        // fallback cools down instead of being retried forever.
-                        warn!(
-                            agent = %context.agent_id,
-                            from_runtime = ?primary,
-                            to_runtime = ?fb,
-                            from_model = %context.model,
-                            reason = "no_model_for_fallback_runtime",
-                            "Fallback runtime has no configured or catalog model — refusing to spawn"
-                        );
-                        self.record_failure(fb).await;
-                        return Err(format!(
-                            "Primary ({primary:?}) failed and no model configured for fallback runtime {fb:?} \
-                             — set `agent.toml [model] fallbacks` to a model that runtime serves"
-                        ));
-                    };
-
-                    // P0/WP-B: a call that cares WHICH FAMILY answers (the
-                    // decorrelated acceptance judge) opts out of cross-family
-                    // failover. Compared at model level, not runtime level, so
-                    // another Claude tier still counts as same-family and is
-                    // allowed — it is the substituted model that decides whose
-                    // blind spots the answer inherits.
-                    //
-                    // Fail-closed on "cannot prove same family": an unknown
-                    // model id on either side blocks the hop. The caller then
-                    // degrades explicitly (audited) to the resolution it would
-                    // have used anyway, so refusing costs nothing and never
-                    // stalls a verdict. `fb` is NOT recorded as a failure — it
-                    // did not fail, it was declined.
-                    // P2 live probe (2026-09-25): an UNKNOWN model id kept verbatim
-                    // across the hop (`kimi:no-such-model` → Claude) compared equal
-                    // to itself and slipped through. "Same family" therefore also
-                    // requires the family to be *known* — fail-closed as documented.
-                    let family_known =
-                        crate::runtime_config::model_family(&context.model).is_some();
-                    if !context.allow_cross_family_failover
-                        && (!family_known
-                            || !crate::runtime_config::same_model_family(&context.model, &fb_model))
-                    {
-                        warn!(
-                            agent = %context.agent_id,
-                            from_runtime = ?primary,
-                            to_runtime = ?fb,
-                            from_model = %context.model,
-                            to_model = %fb_model,
-                            reason = "cross_family_failover_blocked",
-                            "Refusing cross-family failover — this call requires its own model family"
-                        );
-                        return Err(match primary_error {
-                            Some(e) => format!(
-                                "{e} (cross-family failover to {fb:?}/{fb_model} refused for this call)"
-                            ),
-                            None => format!(
-                                "Runtime {primary:?} unavailable and cross-family failover to \
-                                 {fb:?}/{fb_model} refused for this call"
-                            ),
-                        });
-                    }
-
-                    warn!(
-                        agent = %context.agent_id,
-                        from_runtime = ?primary,
-                        to_runtime = ?fb,
-                        from_model = %context.model,
-                        to_model = %fb_model,
-                        model_source,
-                        "Failing over to a different runtime — substituting a model it serves"
-                    );
-
-                    // Clone-and-override rather than mutating the caller's
-                    // context: the caller (and the cost-telemetry attribution
-                    // that reads `resp.model_used`) must still see the model it
-                    // originally requested for the primary attempt.
-                    let fb_context = if fb_model == context.model {
-                        None
-                    } else {
-                        let mut c = context.clone();
-                        c.model = fb_model;
-                        Some(c)
-                    };
-                    let exec_context = fb_context.as_ref().unwrap_or(context);
-
-                    info!(runtime = ?fb, "Trying fallback runtime");
-                    match {
-                        #[cfg(test)]
-                        crate::model_call_probe::record("failover_execute");
-                        runtime.execute(prompt, exec_context).await
-                    } {
-                        Ok(response) if !response.content.trim().is_empty() => {
-                            self.record_success(fb).await;
-                            // Truthful attribution (live round 3 E2): this
-                            // answer came from `fb` on the SUBSTITUTED model,
-                            // not from the requested pair. A caller that
-                            // records a ledger row must be able to say so —
-                            // `role_turns.jsonl` used to record the requested
-                            // codex/gpt-5.6-sol for work Claude actually did.
-                            crate::runtime::record_runtime_outcome(fb.clone(), &exec_context.model);
-                            if response.input_tokens > 0 || response.output_tokens > 0 {
-                                crate::runtime::record_role_usage(
-                                    crate::role_turns::RoleTurnUsage {
-                                        usage_input_tokens: Some(response.input_tokens),
-                                        usage_output_tokens: Some(response.output_tokens),
-                                        usage_cache_read_tokens: None,
-                                        usage_legs: None,
-                                    },
-                                );
-                            }
-                            return Ok(response);
-                        }
-                        Ok(_) => {
-                            self.record_failure(fb).await;
-                            return Err(format!(
-                                "Empty response from both primary ({primary:?}) and fallback ({fb:?}) runtimes"
-                            ));
-                        }
-                        Err(e) => {
-                            self.record_failure(fb).await;
-                            return Err(format!(
-                                "Both primary ({primary:?}) and fallback ({fb:?}) failed. Last error: {e}"
-                            ));
-                        }
-                    }
-                } else {
-                    warn!(
-                        runtime = ?fb,
-                        reason = "not_registered",
-                        "Fallback runtime also not registered — no backend available"
-                    );
+                Ok(_)=>{
+                    failure.push(Primary,*primary,Some(&context.model),Outcome::Empty);
+                    self.record_failure(primary).await;
+                    crate::metrics::global_metrics().record_failover();
+                }
+                Err(error)=>{
+                    let stop=is_non_retryable(&error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error);
+                    failure.push(Primary,*primary,Some(&context.model),Outcome::ExecutionError(error));
+                    if stop {return Err(failure);}
+                    self.record_failure(primary).await;
+                    crate::metrics::global_metrics().record_failover();
                 }
             }
+        } else {
+            failure.push(Primary,*primary,Some(&context.model),Outcome::NotRegistered);
+            crate::metrics::global_metrics().record_failover();
         }
-
-        Err(format!(
-            "Runtime {primary:?} unavailable and no fallback configured"
-        ))
+        let Some(fb)=fallback else { return Err(failure); };
+        if let Err(error)=policy.require_runtime(fb.as_str()) {
+            failure.push(Fallback,*fb,None,Outcome::PolicyRefused(error));return Err(failure);
+        }
+        let fb_available={
+            let mut health=self.health.write().await;
+            health.entry(*fb).or_insert_with(||ProviderHealth::new(*fb)).check_cooldown()
+        };
+        if !fb_available {failure.push(Fallback,*fb,None,Outcome::Cooldown);return Err(failure);}
+        let Some(runtime)=registry.get(fb) else {failure.push(Fallback,*fb,None,Outcome::NotRegistered);return Err(failure);};
+        let Some((fb_model,model_source))=resolve_fallback_model(fb,&context.model,model_fallbacks) else {
+            self.record_failure(fb).await;
+            failure.push(Fallback,*fb,None,Outcome::NoCompatibleModel);return Err(failure);
+        };
+        if let Err(error)=crate::product_policy::require_model(policy,&fb_model) {
+            failure.push(Fallback,*fb,Some(&fb_model),Outcome::PolicyRefused(error));return Err(failure);
+        }
+        let family_known=crate::runtime_config::model_family(&context.model).is_some();
+        if !context.allow_cross_family_failover && (!family_known || !crate::runtime_config::same_model_family(&context.model,&fb_model)) {
+            failure.push(Fallback,*fb,Some(&fb_model),Outcome::CrossFamilyRefused);return Err(failure);
+        }
+        warn!(agent=%context.agent_id,from_runtime=?primary,to_runtime=?fb,from_model=%context.model,to_model=%fb_model,model_source,"Explicit runtime fallback — substituting a compatible model");
+        let mut fb_context=context.clone();fb_context.model=fb_model;
+        match {
+            #[cfg(test)] crate::model_call_probe::record("failover_execute");
+            runtime.execute(prompt,&fb_context).await
+        } {
+            Ok(response) if !response.content.trim().is_empty()=>{
+                self.record_success(fb).await;
+                record_successful_response(fb,&fb_context,&response);
+                Ok(response)
+            }
+            Ok(_)=>{
+                self.record_failure(fb).await;
+                failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::Empty);Err(failure)
+            }
+            Err(error)=>{
+                self.record_failure(fb).await;
+                failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::ExecutionError(error));Err(failure)
+            }
+        }
     }
 
     async fn record_success(&self, runtime_type: &RuntimeType) {
@@ -504,6 +345,15 @@ fn resolve_fallback_model(
 
     // (4) nothing nameable
     None
+}
+
+fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,response:&RuntimeResponse) {
+    crate::runtime::record_runtime_outcome(*runtime,&context.model);
+    if response.input_tokens>0 || response.output_tokens>0 {
+        crate::runtime::record_role_usage(crate::role_turns::RoleTurnUsage {
+            usage_input_tokens:Some(response.input_tokens),usage_output_tokens:Some(response.output_tokens),usage_cache_read_tokens:None,usage_legs:None,
+        });
+    }
 }
 
 /// Determine if an error is non-retryable (should NOT trigger failover).
@@ -1032,3 +882,7 @@ mod tests {
         assert_eq!(kiro.consecutive_failures, 1);
     }
 }
+
+#[cfg(test)]
+#[path="failover/routing_failure_tests.rs"]
+mod routing_failure_tests;
