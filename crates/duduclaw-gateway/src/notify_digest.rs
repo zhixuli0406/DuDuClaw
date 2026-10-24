@@ -277,6 +277,10 @@ fn format_millicents(mc: u64) -> String {
     }
 }
 
+#[cfg(test)]
+#[path = "notify_digest_cost_scope_tests.rs"]
+mod cost_scope_tests;
+
 // ── Collection ───────────────────────────────────────────────────────────
 
 /// Gather everything a digest reports on. Every source is best-effort: a
@@ -343,12 +347,16 @@ pub async fn collect(home_dir: &Path, since: DateTime<Utc>, now: DateTime<Utc>) 
         }
     }
 
-    if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
-        let hours = ((now - since).num_hours().max(1)) as u64;
-        match telemetry.summary_global(hours).await {
-            Ok(sum) => stats.cost_millicents = sum.total_cost_millicents,
-            Err(e) => debug!(error = %e, "notify-digest: 讀取花費統計失敗（略過此項）"),
-        }
+    let hours = ((now - since).num_hours().max(1)) as u64;
+    match crate::cost_telemetry::CostTelemetry::summary_existing(
+        &home_dir.join("cost_telemetry.db"),
+        hours,
+    )
+    .await
+    {
+        Ok(Some(sum)) => stats.cost_millicents = sum.total_cost_millicents,
+        Ok(None) => {}
+        Err(e) => debug!(error = %e, "notify-digest: 讀取花費統計失敗（略過此項）"),
     }
 
     stats.broken_notify_types = crate::notify_stats::broken_types(home_dir, 30);

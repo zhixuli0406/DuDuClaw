@@ -470,6 +470,35 @@ impl CostTelemetry {
         })
     }
 
+    /// Read an existing ledger without creating it or initializing its schema.
+    /// A missing database is normal for a home that has not incurred costs.
+    pub(crate) async fn summary_existing(
+        db_path: &Path,
+        hours_ago: u64,
+    ) -> Result<Option<CostSummary>, String> {
+        let conn = match Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => conn,
+            Err(error) => {
+                if !db_path
+                    .try_exists()
+                    .map_err(|e| format!("inspect existing telemetry db: {e}"))?
+                {
+                    return Ok(None);
+                }
+                return Err(format!("open existing telemetry db: {error}"));
+            }
+        };
+        let reader = Self {
+            conn: Mutex::new(conn),
+            db_path: db_path.to_path_buf(),
+            cost_pressure_flags: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        reader.summary_global(hours_ago).await.map(Some)
+    }
+
     /// Mark `agent_id` as currently under cost pressure. Called from
     /// [`Self::record`] when a request trips the 200 K price cliff so
     /// prompt builders know to engage compression next turn.
