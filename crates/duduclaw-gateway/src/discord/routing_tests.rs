@@ -540,7 +540,15 @@ async fn unconfigured_normal_handler_preserves_channel_thread_allowed_main_and_a
             .await;
             let path = f.ctx.home_dir.join("config.toml");
             let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-            config["general"]["default_agent"] = toml::Value::String("worker".into());
+            let general = config
+                .get_mut("general")
+                .and_then(toml::Value::as_table_mut)
+                .expect("owned fixture has a general table");
+            assert!(
+                general
+                    .insert("default_agent".into(), toml::Value::String("worker".into()))
+                    .is_none()
+            );
             std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
         }
         if mode == "channel" || mode == "thread" || mode == "allowed" {
