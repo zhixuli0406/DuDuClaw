@@ -27,8 +27,9 @@ mod grants;
 mod scope;
 pub mod strategy;
 
-pub use grants::{external_tool_allowed, EXTERNALLY_GRANTABLE_SCOPES};
-pub use scope::{parse_scopes, tool_requires_scope, tool_requires_scope_for_args, Scope};
+pub use grants::{EXTERNALLY_GRANTABLE_SCOPES, external_tool_allowed};
+pub(crate) use grants::{dedicated_google_call, dedicated_google_tool_allowed};
+pub use scope::{Scope, parse_scopes, tool_requires_scope, tool_requires_scope_for_args};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -38,12 +39,80 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 use subtle::ConstantTimeEq;
 
+mod accepted_google;
+pub(crate) use accepted_google::{
+    AcceptedGoogleCall, accept_google_lane, current_accepted_google_call, with_accepted_google_call,
+};
+
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub client_id: String,
     pub scopes: HashSet<Scope>,
     pub is_external: bool,
     pub created_at: DateTime<Utc>,
+}
+
+/// The same successful authentication that produced this call's principal.
+/// OAuth and explicitly unauthenticated calls have no Google execution receipt.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedCall {
+    principal: Principal,
+    credential_ref: Option<duduclaw_core::google_identity::CredentialRef>,
+}
+
+impl AuthenticatedCall {
+    pub(crate) fn principal(&self) -> &Principal {
+        &self.principal
+    }
+    pub(crate) fn credential_ref(&self) -> Option<&duduclaw_core::google_identity::CredentialRef> {
+        self.credential_ref.as_ref()
+    }
+    pub(crate) fn without_reference(principal: Principal) -> Self {
+        Self {
+            principal,
+            credential_ref: None,
+        }
+    }
+    fn verified(
+        principal: Principal,
+        raw: &str,
+        kind: duduclaw_core::google_identity::CredentialKind,
+    ) -> Self {
+        use sha2::Digest;
+        Self {
+            principal,
+            credential_ref: Some(duduclaw_core::google_identity::CredentialRef {
+                kind,
+                sha256: format!("{:x}", sha2::Sha256::digest(raw.as_bytes())),
+            }),
+        }
+    }
+}
+
+tokio::task_local! {
+    static AUTHENTICATED_CALL: AuthenticatedCall;
+}
+
+/// Box before returning the scope future: dispatch itself can be large.
+pub(crate) fn with_authenticated_call<F: std::future::Future>(
+    call: AuthenticatedCall,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    AUTHENTICATED_CALL.scope(call, Box::pin(future))
+}
+
+pub(crate) fn current_authenticated_call() -> Option<AuthenticatedCall> {
+    AUTHENTICATED_CALL.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn current_call_matches(principal: &Principal) -> Option<AuthenticatedCall> {
+    current_authenticated_call().filter(|call| {
+        let actual = call.principal();
+        actual.client_id == principal.client_id
+            && actual.scopes == principal.scopes
+            && actual.is_external == principal.is_external
+            && actual.created_at == principal.created_at
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -306,6 +375,19 @@ pub fn authenticate_with_key(raw_key: &str, config_dir: &Path) -> Result<Princip
     authenticate_against_registry(raw_key, &registry)
 }
 
+pub(crate) fn authenticate_with_key_call(
+    raw_key: &str,
+    config_dir: &Path,
+) -> Result<AuthenticatedCall, AuthError> {
+    authenticate_with_key(raw_key, config_dir).map(|principal| {
+        AuthenticatedCall::verified(
+            principal,
+            raw_key,
+            duduclaw_core::google_identity::CredentialKind::Legacy,
+        )
+    })
+}
+
 /// Core lookup shared by [`authenticate_with_key`] (fresh parse every call)
 /// and [`authenticate_from_env_cached`] (mtime-cached parse) — the constant-
 /// time comparison and expiry check are identical either way; only how the
@@ -441,6 +523,13 @@ pub fn authenticate_from_env_cached(
     config_dir: &Path,
     cache: &KeyRegistryCache,
 ) -> Result<Principal, AuthError> {
+    authenticate_from_env_cached_call(config_dir, cache).map(|call| call.principal)
+}
+
+pub(crate) fn authenticate_from_env_cached_call(
+    config_dir: &Path,
+    cache: &KeyRegistryCache,
+) -> Result<AuthenticatedCall, AuthError> {
     let raw_key = match std::env::var("DUDUCLAW_MCP_API_KEY") {
         Ok(k) => k,
         Err(_) => {
@@ -461,7 +550,9 @@ pub fn authenticate_from_env_cached(
                      [mcp_keys] in config.toml). All scopes granted to default internal \
                      principal. This is only safe for trusted local usage."
                 );
-                return Ok(default_internal_principal());
+                return Ok(AuthenticatedCall::without_reference(
+                    default_internal_principal(),
+                ));
             }
             return Err(AuthError::MissingKey);
         }
@@ -469,7 +560,15 @@ pub fn authenticate_from_env_cached(
 
     // Same prefix-based dispatch as `authenticate_from_env`.
     if raw_key.starts_with(crate::mcp_refresh::REFRESH_TOKEN_PREFIX) {
-        return crate::mcp_refresh::authenticate_with_refresh_token(&raw_key, config_dir);
+        return crate::mcp_refresh::authenticate_with_refresh_token(&raw_key, config_dir).map(
+            |principal| {
+                AuthenticatedCall::verified(
+                    principal,
+                    &raw_key,
+                    duduclaw_core::google_identity::CredentialKind::Refresh,
+                )
+            },
+        );
     }
 
     let registry = cache.registry(config_dir).map_err(|()| {
@@ -480,7 +579,13 @@ pub fn authenticate_from_env_cached(
         AuthError::ReloadFailed
     })?;
 
-    authenticate_against_registry(&raw_key, &registry)
+    authenticate_against_registry(&raw_key, &registry).map(|principal| {
+        AuthenticatedCall::verified(
+            principal,
+            &raw_key,
+            duduclaw_core::google_identity::CredentialKind::Legacy,
+        )
+    })
 }
 
 /// M6: whether the operator has explicitly opted into running the MCP server
@@ -518,3 +623,6 @@ fn default_internal_principal() -> Principal {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod authenticated_call_tests;

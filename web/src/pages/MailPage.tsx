@@ -142,6 +142,17 @@ export function MailPage() {
 
   const pendingCount = drafts?.filter((d) => d.status === 'pending').length ?? 0;
   const unreadCount = messages?.filter((m) => !m.read).length ?? 0;
+  const lastPoll = status?.last_poll;
+  const checkedAt = lastPoll ? intl.formatDate(lastPoll.checked_at, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  }) : '';
+  const pollWarning = status?.last_poll_error
+    ? t('mail.warn.pollUnknown')
+    : status?.gmail_enabled && lastPoll?.gmail_attempted && lastPoll.account_unavailable > 0
+      ? t('mail.warn.googleAccountUnavailable', { n: lastPoll.account_unavailable, at: checkedAt })
+      : lastPoll && lastPoll.transport_errors > 0
+        ? t('mail.warn.pollErrors', { n: lastPoll.transport_errors, at: checkedAt })
+        : null;
 
   return (
     <div className="flex h-full flex-col">
@@ -166,6 +177,14 @@ export function MailPage() {
           />
         ) : (
           <>
+            {pollWarning && (
+              <Card className="mb-4 border-amber-500/40">
+                <CardContent className="flex items-start gap-2 py-3 text-sm">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+                  <span>{pollWarning}</span>
+                </CardContent>
+              </Card>
+            )}
             {status && !status.smtp_configured && pendingCount > 0 && (
               <Card className="mb-4 border-amber-500/40">
                 <CardContent className="flex items-start gap-2 py-3 text-sm">

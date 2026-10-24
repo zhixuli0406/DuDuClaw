@@ -25,6 +25,10 @@ use crate::mcp_rate_limit::{OpType, RateLimiter};
 use duduclaw_core::types::ToolPolicy;
 use duduclaw_memory::SqliteMemoryEngine;
 
+#[cfg(test)]
+#[path = "mcp_dispatch_google_tests.rs"]
+mod google_tests;
+
 /// TTL for a PolicyKernel `Ask` escalation awaiting human approval (P1-2, D-3).
 const POLICY_ASK_TTL_SECONDS: i64 = 300;
 /// Poll interval while blocking on that approval (P1-2, D-3).
@@ -705,6 +709,11 @@ impl McpDispatcher {
         // whitelist, namespace isolation and the per-key rate limiter stay on
         // `principal.client_id`.
         let gate_agent: &str = acting_gate_agent(principal, &self.default_agent);
+        let google_lane = crate::mcp_auth::accept_google_lane(&self.home_dir, principal, tool_name);
+        let dedicated_google = google_lane.is_some();
+        // This exception affects only native Google tools. External namespace,
+        // redaction, process-agent and OS-tool behavior stays external.
+        let employee_policy_applies = !principal.is_external || dedicated_google;
 
         // ── 0a. Removed tool names (answered after the rate limit) ───────────
         // A name removed after its deprecation window
@@ -723,7 +732,10 @@ impl McpDispatcher {
         // hidden tools out of discovery, but a malicious external client can
         // still call any tool by name via `tools/call`. Mirror the filter
         // here so non-discoverable tools are also non-callable.
-        if principal.is_external && !crate::mcp_auth::external_tool_allowed(tool_name, principal) {
+        if principal.is_external
+            && !dedicated_google
+            && !crate::mcp_auth::external_tool_allowed(tool_name, principal)
+        {
             warn!(
                 client_id = %principal.client_id,
                 tool = %tool_name,
@@ -743,7 +755,9 @@ impl McpDispatcher {
         // present but empty or unknown value refuses every call (fail
         // closed). `tools/list` hides the same tools through the same
         // predicate (`mcp::tools_list::lane_permits`).
-        if let Some(msg) = crate::mcp::lane_refusal(&duduclaw_core::ProcessLane::current(), tool_name) {
+        if let Some(msg) =
+            crate::mcp::lane_refusal(&duduclaw_core::ProcessLane::current(), tool_name)
+        {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             self.audit_dispatch_denial(tool_name, params, "explore_lane", &msg);
             return jsonrpc_error(id, -32003, &msg);
@@ -948,7 +962,7 @@ impl McpDispatcher {
         // (see `acting_gate_agent`) because the injection-scan audit, the
         // PolicyKernel approval row, the egress vault key, the os_notify
         // audit and the §3.7 approval gate all need the same identity.
-        let agent_gate = if principal.is_external {
+        let agent_gate = if !employee_policy_applies {
             AgentGateConfig::default()
         } else {
             load_agent_gate_config(&self.home_dir, gate_agent).await
@@ -970,7 +984,7 @@ impl McpDispatcher {
         // clients are already whitelist-confined (§0) and carry no per-agent
         // capability config (`agent_gate` is the empty default for them), so
         // they are not subject to this gate.
-        if !principal.is_external {
+        if employee_policy_applies {
             use duduclaw_core::tool_catalog::{
                 ToolListVerdict, removed_name_for_call, tool_list_matches, tool_list_verdict,
             };
@@ -1023,7 +1037,7 @@ impl McpDispatcher {
         // loosens a name-list gate: `allow` only means "no friction from this
         // layer". The `computer_*` tools apply the same resolution in the
         // gateway (`computer_use_sessions::gates`), which owns their session.
-        if !principal.is_external
+        if employee_policy_applies
             && action_rule_verdict_for_call(
                 &agent_gate.action_rules,
                 tool_name,
@@ -1047,7 +1061,7 @@ impl McpDispatcher {
         // gate. Only an EXPLICIT `false` refuses; an absent or wrong-typed
         // key keeps the pre-1.68 behaviour. Read through `AgentTomlSections`
         // (preset-resolved file when the agent has one).
-        if !principal.is_external {
+        if employee_policy_applies {
             let needed = permissions_for_call(
                 tool_name,
                 params_owned.get("arguments").unwrap_or(&Value::Null),
@@ -1099,7 +1113,7 @@ impl McpDispatcher {
         // policy → the kernel abstains (Allow). External clients aren't agents,
         // so they carry no per-agent policy. High-risk `Ask` decisions block on
         // the ApprovalBroker (fail-closed: TTL-expiry counts as denial).
-        if !principal.is_external && !agent_gate.policy.is_empty() {
+        if employee_policy_applies && !agent_gate.policy.is_empty() {
             let args_val = params_owned
                 .get("arguments")
                 .cloned()
@@ -1428,7 +1442,7 @@ impl McpDispatcher {
         // opened/queried is denied (`has_active_grant` returns false on error).
         // Zero-overhead for the vast majority of agents: an empty `scoped_tools`
         // set short-circuits before any DB work.
-        if !principal.is_external {
+        if employee_policy_applies {
             // W3-3b: use the SAME acting-agent resolution as §3.4's capability
             // gate. `principal.client_id` is `gateway-internal` for every
             // MCP child the gateway spawns, so reading
@@ -1524,7 +1538,7 @@ impl McpDispatcher {
         // are already confined to the read-only whitelist and carry no per-agent
         // approval config, so they're skipped. Fail-closed: a denial/expiry/
         // broker-unavailable returns an error instead of dispatching.
-        if !principal.is_external {
+        if employee_policy_applies {
             // Keyed by the ACTING agent: with the internal key the client_id
             // is `gateway-internal`, whose `agents/gateway-internal/agent.toml`
             // does not exist, so approval_required_tools / irreversible_tools /
@@ -1571,18 +1585,29 @@ impl McpDispatcher {
         ));
         // ── 4. Tool dispatch ─────────────────────────────────────────────────
         let caller_is_admin = principal.scopes.contains(&Scope::Admin);
-        let handler = crate::mcp::handle_tools_call(
-            id,
-            &params_owned,
-            &self.home_dir,
-            &self.http,
-            &self.memory,
-            &self.default_agent,
-            &self.odoo,
-            ns_ctx,
-            &self.daily_quota,
-            &principal.client_id,
-            caller_is_admin,
+        let accepted_google = google_lane.map(|lane| {
+            lane.bind(
+                params_owned
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+        });
+        let handler = crate::mcp_auth::with_accepted_google_call(
+            accepted_google,
+            crate::mcp::handle_tools_call(
+                id,
+                &params_owned,
+                &self.home_dir,
+                &self.http,
+                &self.memory,
+                &self.default_agent,
+                &self.odoo,
+                ns_ctx,
+                &self.daily_quota,
+                &principal.client_id,
+                caller_is_admin,
+            ),
         );
         let mut result = if let Some(call) = &workflow {
             if call.is_read() {
@@ -2277,15 +2302,22 @@ effect = "forbid"
         let principal = make_principal(vec![Scope::Admin], false);
         let ns_ctx = make_ns_ctx(false);
 
-        let params = make_params("wiki_write", serde_json::json!({ "path": "a.md", "content": "x" }));
+        let params = make_params(
+            "wiki_write",
+            serde_json::json!({ "path": "a.md", "content": "x" }),
+        );
         let result = dispatcher
             .dispatch_tool_call(&principal, &ns_ctx, &params, &serde_json::json!(90))
             .await;
         assert_eq!(result["error"]["code"], -32003, "got: {result}");
         let msg = result["error"]["message"].as_str().unwrap_or("");
         assert!(msg.contains("action_rules"), "got: {msg}");
-        let audit = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
-        assert!(audit.contains("\"action_rule\""), "audit row expected: {audit}");
+        let audit =
+            std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
+        assert!(
+            audit.contains("\"action_rule\""),
+            "audit row expected: {audit}"
+        );
 
         // A tool rule beats the effect rule; reads are untouched.
         for tool in ["memory_store", "memory_search"] {
@@ -2310,10 +2342,20 @@ effect = "forbid"
         let principal = make_principal(vec![Scope::Admin], false);
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let result = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &params, &serde_json::json!(92))
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &params,
+                &serde_json::json!(92),
+            )
             .await;
         assert_eq!(result["error"]["code"], -32003, "got: {result}");
-        assert!(result["error"]["message"].as_str().unwrap_or("").contains("denied_tools"));
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("denied_tools")
+        );
     }
 
     // A scoped tool with NO active grant is denied (fail-closed) with guidance
@@ -3038,8 +3080,12 @@ effect = "forbid"
             serde_json::json!({"workspace_id": "ws-0123456789abcdef0123456789abcdef", "path": "a.md", "content": EMAIL_TOKEN}),
         );
         let typed = make_params("computer_type", serde_json::json!({ "text": EMAIL_TOKEN }));
-        let w = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &write, &serde_json::json!(31)).await;
-        let _typed_result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &typed, &serde_json::json!(32)).await;
+        let w = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &write, &serde_json::json!(31))
+            .await;
+        let _typed_result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &typed, &serde_json::json!(32))
+            .await;
         unsafe {
             std::env::remove_var("DUDUCLAW_REDACTION_SCOPES");
         }
@@ -3058,8 +3104,16 @@ effect = "forbid"
                 .find_map(|v| find_key(&v, "chars"))
         };
         let token_chars = EMAIL_TOKEN.chars().count() as u64;
-        assert_eq!(chars_of("computer_type"), Some("alice@acme.com".len() as u64), "control: the * rule does restore computer_type; rows: {rows}");
-        assert_eq!(chars_of("computer_workspace_write"), Some(token_chars), "workspace content stayed a token; rows: {rows}");
+        assert_eq!(
+            chars_of("computer_type"),
+            Some("alice@acme.com".len() as u64),
+            "control: the * rule does restore computer_type; rows: {rows}"
+        );
+        assert_eq!(
+            chars_of("computer_workspace_write"),
+            Some(token_chars),
+            "workspace content stayed a token; rows: {rows}"
+        );
         assert!(!rows.contains("alice@acme.com"));
     }
 
@@ -3098,11 +3152,20 @@ effect = "forbid"
                 rows.push_str(&std::fs::read_to_string(&entry).unwrap_or_default());
             }
         }
-        for tool in ["computer_workspace_list", "computer_workspace_read", "computer_workspace_write"] {
+        for tool in [
+            "computer_workspace_list",
+            "computer_workspace_read",
+            "computer_workspace_write",
+        ] {
             assert!(rows.contains(tool), "{tool} audited; rows: {rows}");
         }
         assert!(rows.contains("path_sha256"), "{rows}");
-        assert!(!rows.contains("secret-dir") && !rows.contains("plan.md") && !rows.contains("PRIVATE-BODY"), "{rows}");
+        assert!(
+            !rows.contains("secret-dir")
+                && !rows.contains("plan.md")
+                && !rows.contains("PRIVATE-BODY"),
+            "{rows}"
+        );
     }
 
     fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -3762,11 +3825,18 @@ effect = "forbid"
             true,
         )
         .await;
-        assert_ne!(result["error"]["code"], -32003, "approved call runs: {result}");
+        assert_ne!(
+            result["error"]["code"], -32003,
+            "approved call runs: {result}"
+        );
         let grant = &rec.payload[duduclaw_gateway::approval::action_grant::ACTION_GRANT_KEY];
         assert_eq!(grant["tool"], "memory_search");
         assert_eq!(grant["agent_id"], "dudu");
-        assert!(rec.summary.contains("此核准只涵蓋這一次呼叫"), "{}", rec.summary);
+        assert!(
+            rec.summary.contains("此核准只涵蓋這一次呼叫"),
+            "{}",
+            rec.summary
+        );
         let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
         let after = broker.get(&rec.id).await.unwrap().unwrap();
         assert_eq!(
@@ -3820,7 +3890,13 @@ effect = "forbid"
         let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
         let mut filed = None;
         for _ in 0..400 {
-            if let Some(rec) = broker.list_pending(None).await.unwrap_or_default().into_iter().next() {
+            if let Some(rec) = broker
+                .list_pending(None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+            {
                 filed = Some(rec);
                 break;
             }
@@ -3830,7 +3906,10 @@ effect = "forbid"
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         if let (Some(rec), Some(approve)) = (&filed, decide) {
-            broker.decide(&rec.id, approve, "test-approver").await.unwrap();
+            broker
+                .decide(&rec.id, approve, "test-approver")
+                .await
+                .unwrap();
         }
         let result = tokio::time::timeout(Duration::from_secs(30), task)
             .await
@@ -3847,7 +3926,10 @@ effect = "forbid"
         assert!(filed.is_none(), "block files no approval");
         assert_eq!(result["error"]["code"], -32003, "{result}");
         assert!(
-            result["error"]["message"].as_str().unwrap_or("").contains("動作審查"),
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("動作審查"),
             "{result}"
         );
     }
@@ -3856,18 +3938,22 @@ effect = "forbid"
     async fn enforce_review_ask_runs_only_after_an_approval() {
         use duduclaw_gateway::action_review::ReviewVerdict;
         let tmp = enforce_home();
-        let (filed, result) =
-            dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(true)).await;
+        let (filed, result) = dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(true)).await;
         let rec = filed.expect("ask files an approval");
         assert_eq!(rec.agent_id, "dudu");
         assert!(rec.summary.contains("動作審查"), "{}", rec.summary);
-        assert!(result.get("error").is_none(), "approved call runs: {result}");
+        assert!(
+            result.get("error").is_none(),
+            "approved call runs: {result}"
+        );
 
         let tmp = enforce_home();
-        let (filed, result) =
-            dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(false)).await;
+        let (filed, result) = dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(false)).await;
         assert!(filed.is_some());
-        assert_eq!(result["error"]["code"], -32003, "denied call refused: {result}");
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "denied call refused: {result}"
+        );
     }
 
     #[tokio::test]

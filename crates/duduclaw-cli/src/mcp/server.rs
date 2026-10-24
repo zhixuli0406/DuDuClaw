@@ -200,10 +200,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             _ = watch.tick() => {
                 if let Some(previous) = last_advertised.as_ref()
                     && let Ok(p) =
-                        crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
+                        crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache)
                 {
                     let current: Vec<String> =
-                        visible_tool_names(&p, home_dir, &default_agent)
+                        crate::mcp_auth::with_authenticated_call(p.clone(),
+                            visible_tool_names(p.principal(), home_dir, &default_agent))
                             .await
                             .into_iter()
                             .map(str::to_string)
@@ -285,9 +286,8 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         if modern {
             modern_seen = true;
             if let Some(problem) = crate::mcp_protocol::modern_meta_problem(&params) {
-                let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
-                    &id, -32602, &problem,
-                ));
+                let err =
+                    crate::mcp_protocol::modernize_response(jsonrpc_error(&id, -32602, &problem));
                 write_response(&mut stdout, &err).await?;
                 continue;
             }
@@ -309,10 +309,9 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             }
             // Removed in 2026-07-28; still part of every legacy revision.
             ("ping", false) => jsonrpc_response(&id, serde_json::json!({})),
-            ("server/discover", true) => jsonrpc_response(
-                &id,
-                crate::mcp_protocol::discover_result(capabilities()),
-            ),
+            ("server/discover", true) => {
+                jsonrpc_response(&id, crate::mcp_protocol::discover_result(capabilities()))
+            }
             ("subscriptions/listen", true) => {
                 // Acknowledge first (spec MUST), then deliver tagged
                 // `list_changed` until the client cancels. No response is
@@ -336,13 +335,17 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // A subscriber the watcher cannot authenticate would never be
                 // compared against, so refuse instead of acknowledging.
                 let baseline = if wants {
-                    match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
+                    match crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache)
+                    {
                         Ok(p) => Some(
-                            visible_tool_names(&p, home_dir, &default_agent)
-                                .await
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect::<Vec<_>>(),
+                            crate::mcp_auth::with_authenticated_call(
+                                p.clone(),
+                                visible_tool_names(p.principal(), home_dir, &default_agent),
+                            )
+                            .await
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>(),
                         ),
                         Err(e) => {
                             let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
@@ -362,8 +365,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 if !wants {
                     // Nothing this server offers was asked for: end the
                     // subscription at once instead of leaving it open.
-                    write_response(&mut stdout, &crate::mcp_protocol::subscription_complete(&id))
-                        .await?;
+                    write_response(
+                        &mut stdout,
+                        &crate::mcp_protocol::subscription_complete(&id),
+                    )
+                    .await?;
                     continue;
                 }
                 if last_advertised.is_none() {
@@ -386,10 +392,18 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // Gap (a): re-authenticate per call instead of reusing the
                 // boot-time `principal` — a revoked/rescoped key must stop
                 // (or start) seeing tools without a restart.
-                match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
+                match crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache) {
                     Ok(p) => {
-                        let resp =
-                            handle_tools_list_for_agent(&id, &p, home_dir, &default_agent).await;
+                        let resp = crate::mcp_auth::with_authenticated_call(
+                            p.clone(),
+                            handle_tools_list_for_agent(
+                                &id,
+                                p.principal(),
+                                home_dir,
+                                &default_agent,
+                            ),
+                        )
+                        .await;
                         // O7: remember exactly what we advertised — read back
                         // off the response we are about to send, not from a
                         // second evaluation, so the watcher above compares
@@ -421,9 +435,15 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // `auth_cache` above) instead of reusing the boot-time
                 // `principal` for the whole life of this long-running
                 // subprocess.
-                match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
-                    Ok(p) => match resolve_ns(&p) {
-                        Ok(ns) => dispatcher.dispatch_tool_call(&p, &ns, &params, &id).await,
+                match crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache) {
+                    Ok(p) => match resolve_ns(p.principal()) {
+                        Ok(ns) => {
+                            crate::mcp_auth::with_authenticated_call(
+                                p.clone(),
+                                dispatcher.dispatch_tool_call(p.principal(), &ns, &params, &id),
+                            )
+                            .await
+                        }
                         Err(e) => jsonrpc_error(
                             &id,
                             -32003,
@@ -454,9 +474,9 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 /// the one command that issues one.
 pub(crate) fn startup_auth_error(e: &crate::mcp_auth::AuthError) -> String {
     match e {
-        crate::mcp_auth::AuthError::MissingKey => format!(
-            "MCP authentication failed: {e}. Run: duduclaw mcp init --client claude-code"
-        ),
+        crate::mcp_auth::AuthError::MissingKey => {
+            format!("MCP authentication failed: {e}. Run: duduclaw mcp init --client claude-code")
+        }
         _ => format!("MCP authentication failed: {e}"),
     }
 }

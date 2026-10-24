@@ -7,7 +7,7 @@ production home (`~/.duduclaw`).
 |---|---|
 | `make-home.sh <target-dir> [--port N]` | Creates an isolated DuDuClaw home: loopback `config.toml` (default port 18977) and two employees. `plain` has no tool allowlist (the old kind of test employee). `prod-shaped` is written like a production employee: `[capabilities] allowed_tools = ["mcp__duduclaw__*", "Read", "Write", "Edit", "Bash"]`, a `denied_tools` entry, `approval_required_tools`, all four `[permissions]` flags, `[budget]`, `[evolution] gvu_enabled = true`, a `CONTRACT.toml` and a `SOUL.md`. Refuses a non-empty target and any target inside `~/.duduclaw`. Writes no secrets. |
 | `mcp-probe.sh <home> <agent-id> [tool ...]` | Starts the real `duduclaw mcp-server` for that employee from the command and env in its own `.mcp.json`, sends `initialize`, `tools/list` and one `tools/call` per tool (default: `tasks_list`, `memory_search`, `working_state_get`, `user_profile_get`), and prints `ok`, `REFUSED: ...` or `ERROR: ...` per call. Exits 1 when a default check fails for `prod-shaped`. |
-| `node google-delegated-identity.mjs <binary>` | Creates its own temporary home, starts a real gateway and stdio MCP servers, and exchanges signed RSA assertions with a loopback fake Google. Requires a debug build with `--features live-test-mocks` and Node 22+. Credential protection uses an in-memory store; no real keychain, model or Google account is touched. Checks shared-account compatibility, two delegated subjects, same-process account changes, domain refusal, unsigned and unproven callers, provider rejection, explicit fallback, `none`, the master switch, audit redaction and offline gateway refusal. Artifacts remain in the printed temporary folder. |
+| `google-delegated-identity.mjs` (historical, paused) | Do not run during the narrowed EXT follow-up; use the ordinary baseline below. Retained for the original evidence. Creates its own temporary home, starts a real gateway and stdio MCP servers, and exchanges signed RSA assertions with a loopback fake Google. Requires a debug build with `--features live-test-mocks` and Node 22+. Credential protection uses an in-memory store; no real keychain, model or Google account is touched. Checks shared-account compatibility, two delegated subjects, same-process account changes, domain refusal, unsigned and unproven callers, provider rejection, explicit fallback, `none`, the master switch, audit redaction and offline gateway refusal. Artifacts remain in the printed temporary folder. |
 | `python3 on-behalf-of.py <home> <binary>` | After booting and stopping the isolated gateway, calls the real `prod-shaped` stdio MCP server. Checks host identity stamping on tasks and queue rows, forged tool arguments, rejection auditing, enforce refusals and absent-principal behavior. Writes disposable test rows and temporarily changes the isolated delegation policy. It calls no model; runtime delivery, real channels and human acceptance require separate checks. |
 
 ## Why `prod-shaped` exists
@@ -89,6 +89,42 @@ lists what would go with sizes. `target/release` and other target triples are
 untouched unless you pass `--all-profiles`. The cache once reached 134 GB and a
 full disk crashed Docker Desktop; run it when free space drops below about
 100 GB.
+
+## Google connectors: ordinary local baseline
+
+`google-connectors-baseline.mjs <debug-binary>` uses a new temporary home,
+synthetic RSA issuer and loopback REST/MCP/model servers. On macOS, each
+gateway/MCP process runs under a loopback-only sandbox; an outbound-denial
+self-check must pass first. Other native platforms are not covered by this
+script. The binary must be
+built with `--no-default-features --features live-test-mocks`; `/healthz`
+refuses any other build before credential setup. Runtime `HOME` is empty and
+`PATH` contains only the provided DuDuClaw binary, so a model fallback cannot
+use an installed host model CLI or its account. No production home or real
+provider credential is read.
+
+The baseline exercises the canonical 19 Google tools (mock-only writes use
+normal Admin approvals), actual service GET probes, an HTTP Google MCP mount
+through a local model tool loop, and unavailable-account vs empty-mailbox
+status. It records synthetic observations under the printed `ARTIFACTS`
+directory. A local PASS does not verify a real Google tenant, Google's own
+remote MCP acceptance, keychain behavior or user acceptance.
+
+This is separate from the historical `google-delegated-identity.mjs` race
+driver. Do not use that driver's paused identity-downgrade scenarios as part
+of the ordinary baseline. Its prior failures remain historical evidence.
+
+The lifecycle helper starts every child with an explicit minimal environment,
+including the initial setup shell. Owned POSIX process groups have bounded
+TERM -> KILL cleanup and confirmed termination; any cleanup failure fails the
+baseline. PASS lines and `baseline-results.json` are produced only after
+cleanup succeeds. The fixture root is canonicalized before setup so the
+mock credential store uses one home path.
+
+```bash
+node --test scripts/live-test/google-connectors-harness.test.mjs
+node scripts/live-test/google-connectors-baseline.mjs /path/to/mock-debug-binary
+```
 
 ## Actual VNC authentication
 

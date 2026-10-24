@@ -54,7 +54,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::ccr::{CcrScope, CcrSourceArtifact};
-use crate::tool_loop::{ToolExecutor, ToolOutcome};
+use crate::tool_loop::{InterceptDecision, ToolExecutor, ToolInterceptor, ToolOutcome};
 use crate::types::ToolDef;
 
 /// JSON-RPC protocol version echoed in every frame.
@@ -891,6 +891,10 @@ pub struct ToolRegistry {
     source_verifiers: HashMap<String, VerifiedMcpRoute>,
     source_attestation_required: HashSet<String>,
     ccr_disabled_tools: HashSet<String>,
+    /// Host-owned guards bound to the exact connected client, never a name
+    /// supplied by a model or a colliding logical server name.
+    client_interceptors: HashMap<usize, Arc<dyn ToolInterceptor>>,
+    client_notices: HashMap<usize, String>,
 }
 
 struct VerifiedMcpRoute {
@@ -983,6 +987,8 @@ impl ToolRegistry {
             source_verifiers: HashMap::new(),
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
+            client_interceptors: HashMap::new(),
+            client_notices: HashMap::new(),
         })
     }
 
@@ -1007,6 +1013,51 @@ impl ToolRegistry {
     pub fn server_for_tool(&self, tool: &str) -> Option<&str> {
         let idx = *self.routes.get(tool)?;
         self.server_names.get(idx).map(String::as_str)
+    }
+
+    /// Apply a host guard on every call routed to this exact client. It runs
+    /// after acquiring the client's lock so a queued call sees live authority.
+    /// This composes with, and never replaces, the outer redaction interceptor.
+    pub fn register_client_interceptor(
+        &mut self,
+        client: usize,
+        interceptor: Arc<dyn ToolInterceptor>,
+    ) -> Result<(), String> {
+        if client >= self.clients.len() {
+            return Err("MCP guard client is not registered".into());
+        }
+        if self.client_interceptors.contains_key(&client) {
+            return Err("MCP guard already registered for this client".into());
+        }
+        self.client_interceptors.insert(client, interceptor);
+        Ok(())
+    }
+
+    /// Add a trusted account notice to schemas routed to this exact client.
+    /// The original tool-result JSON remains unchanged for redaction/CCR.
+    pub fn annotate_client_tools(&mut self, client: usize, notice: &str) -> Result<(), String> {
+        if client >= self.clients.len() {
+            return Err("MCP notice client is not registered".into());
+        }
+        for def in &mut self.defs {
+            if self.routes.get(&def.name) == Some(&client) {
+                def.description.push_str("\n\n");
+                def.description
+                    .push_str(&duduclaw_core::truncate_chars(notice, 500));
+            }
+        }
+        Ok(())
+    }
+
+    /// Notice for calls actually sent through this client. A refused host
+    /// guard returns before this is attached; provider output cannot set it.
+    pub fn set_client_notice(&mut self, client: usize, notice: &str) -> Result<(), String> {
+        if client >= self.clients.len() {
+            return Err("MCP notice client is not registered".into());
+        }
+        self.client_notices
+            .insert(client, duduclaw_core::truncate_chars(notice, 500));
+        Ok(())
     }
 
     /// Require independent source attestation on one exact registry-owned
@@ -1234,11 +1285,45 @@ impl ToolExecutor for ToolRegistry {
             .without_ccr());
         }
         let mut client = self.clients[idx].lock().await;
+        let server = self.server_names.get(idx).map(String::as_str).unwrap_or("");
+        let interceptor = self.client_interceptors.get(&idx);
+        let args = if let Some(interceptor) = interceptor {
+            match interceptor.before_call_async(server, name, args).await {
+                InterceptDecision::Allow(args) => args,
+                InterceptDecision::Deny(reason) => return Ok(ToolOutcome::error(reason)),
+            }
+        } else {
+            args
+        };
         let result = client.call_tool(name, args.clone()).await;
         drop(client);
-        match result {
-            Ok(r) => Ok(self.outcome_from_result(name, &args, r).await),
+        let outcome = match result {
+            Ok(mut result) => {
+                if let Some(interceptor) = interceptor {
+                    let mut content = serde_json::from_str::<Value>(&result.content)
+                        .unwrap_or_else(|_| Value::String(result.content.clone()));
+                    let original = content.clone();
+                    interceptor.after_call(server, name, &args, &mut content);
+                    if content != original {
+                        result.content = match content {
+                            Value::String(text) => text,
+                            value => value.to_string(),
+                        };
+                    }
+                }
+                // A transformed result still goes through the same source
+                // attestation; a hook cannot attest its own rewritten bytes.
+                Ok(self.outcome_from_result(name, &args, result).await)
+            }
             Err(e) => self.outcome_from_error(name, e),
+        };
+        match (outcome, self.client_notices.get(&idx)) {
+            (Ok(outcome), Some(notice)) => Ok(outcome.with_host_notice(notice)),
+            (Err(error), Some(notice)) => {
+                Ok(ToolOutcome::error(format!("tool dispatch failed: {error}"))
+                    .with_host_notice(notice))
+            }
+            (outcome, None) => outcome,
         }
     }
 }
@@ -1454,6 +1539,8 @@ mod tests {
             source_verifiers: HashMap::new(),
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
+            client_interceptors: HashMap::new(),
+            client_notices: HashMap::new(),
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -1495,6 +1582,8 @@ mod tests {
             source_verifiers: HashMap::new(),
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
+            client_interceptors: HashMap::new(),
+            client_notices: HashMap::new(),
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -1906,16 +1995,20 @@ mod http_transport_tests {
     /// Exercises the full connect_http → list_tools → call_tool path.
     #[tokio::test]
     async fn http_client_end_to_end_against_local_mock() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
 
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                let calls = server_calls.clone();
                 tokio::spawn(async move {
                     // Read until headers end, then honor content-length.
                     let mut buf = Vec::new();
@@ -1968,12 +2061,15 @@ mod http_transport_tests {
                                 {"name":"echo","description":"echo back","inputSchema":{"type":"object"}}
                             ]}})),
                         ),
-                        ("tools/call", Some(id)) => (
-                            "200 OK",
-                            Some(json!({"jsonrpc":"2.0","id":id,"result":{
+                        ("tools/call", Some(id)) => {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                Some(json!({"jsonrpc":"2.0","id":id,"result":{
                                 "content":[{"type":"text","text":"echoed!"}],
                                 "isError":false}})),
-                        ),
+                            )
+                        }
                         _ => ("400 Bad Request", None),
                     };
                     let body = payload.map(|p| p.to_string()).unwrap_or_default();
@@ -2007,5 +2103,95 @@ mod http_transport_tests {
             .expect("tools/call");
         assert_eq!(result.content, "echoed!");
         assert!(!result.is_error);
+
+        struct LiveGuard(Arc<AtomicBool>);
+        impl ToolInterceptor for LiveGuard {
+            fn before_call(&self, _: &str, _: &str, args: Value) -> InterceptDecision {
+                if self.0.load(Ordering::SeqCst) {
+                    InterceptDecision::Deny("revoked".into())
+                } else {
+                    InterceptDecision::Allow(args)
+                }
+            }
+            fn after_call(&self, _: &str, _: &str, _: &Value, _: &mut Value) {}
+        }
+        let second = McpClient::connect_http(&url, &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut registry = ToolRegistry::from_clients_named(
+            vec![("same-name".into(), client), ("same-name".into(), second)],
+            vec![],
+        )
+        .await
+        .unwrap();
+        // Both advertise echo; first-wins routing must not borrow the other
+        // client's authority just because their logical names collide.
+        registry
+            .register_client_interceptor(1, Arc::new(LiveGuard(Arc::new(AtomicBool::new(true)))))
+            .unwrap();
+        registry.annotate_client_tools(1, "wrong-account").unwrap();
+        registry
+            .set_client_notice(1, "wrong-account-fallback")
+            .unwrap();
+        assert!(!registry.defs()[0].description.contains("wrong-account"));
+        let original = registry.call("echo", json!({})).await.unwrap();
+        assert!(!original.is_error);
+        assert!(
+            original.host_notice.is_none(),
+            "other client's fallback must not contaminate a successful delegate"
+        );
+        let revoked = Arc::new(AtomicBool::new(false));
+        registry
+            .register_client_interceptor(0, Arc::new(LiveGuard(revoked.clone())))
+            .unwrap();
+        registry
+            .annotate_client_tools(0, "company-account fallback")
+            .unwrap();
+        registry
+            .set_client_notice(0, "company-account fallback")
+            .unwrap();
+        assert!(
+            registry.defs()[0]
+                .description
+                .contains("company-account fallback")
+        );
+        assert!(
+            registry
+                .register_client_interceptor(0, Arc::new(LiveGuard(revoked.clone())))
+                .is_err()
+        );
+        assert!(registry.annotate_client_tools(2, "invalid").is_err());
+        let fallback = registry.call("echo", json!({})).await.unwrap();
+        assert!(!fallback.is_error);
+        assert_eq!(
+            fallback.content, "echoed!",
+            "provider payload remains unchanged"
+        );
+        assert_eq!(
+            fallback.host_notice.as_deref(),
+            Some("company-account fallback")
+        );
+        let before = calls.load(Ordering::SeqCst);
+        let held = registry.clients[0].lock().await;
+        let queued = registry.call("echo", json!({}));
+        tokio::pin!(queued);
+        tokio::select! {
+            result = &mut queued => panic!("call escaped the held client lock: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+        }
+        revoked.store(true, Ordering::SeqCst);
+        drop(held);
+        let denied = queued.await.unwrap();
+        assert!(denied.is_error);
+        assert_eq!(denied.content, "revoked");
+        assert!(
+            denied.host_notice.is_none(),
+            "a call never dispatched did not use the fallback account"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "denied queued call never reaches provider"
+        );
     }
 }

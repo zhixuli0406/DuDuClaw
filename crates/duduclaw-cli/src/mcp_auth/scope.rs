@@ -10,7 +10,6 @@ use std::collections::HashSet;
 
 use super::AuthError;
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
     MemoryRead,
@@ -236,6 +235,12 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
 /// unaffected. When adding a new tool, map it to the least scope it needs here;
 /// leaving it unmapped means it requires Admin.
 pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
+    if let Some(scope) = duduclaw_core::google_identity::native_google_scope(tool_name) {
+        return Some(match scope {
+            duduclaw_core::google_identity::NativeGoogleScope::Read => Scope::GoogleRead,
+            duduclaw_core::google_identity::NativeGoogleScope::Write => Scope::GoogleWrite,
+        });
+    }
     match tool_name {
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" => Some(Scope::DiscoveryExecute),
         // Document knowledge base — read-only, ACL enforced by the gateway.
@@ -366,17 +371,10 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // Forms (structure + responses) and Google Tasks listing are read-only
         // too. `gtasks_*` is Google Tasks — distinct from DuDuClaw's own
         // `tasks_*` task-board tools.
-        "google_status" | "gmail_search" | "gmail_read" | "calendar_list_events"
-        | "sheets_read" | "forms_get" | "forms_list_responses" | "gtasks_lists"
-        | "gtasks_list" | "drive_search" | "drive_read" | "docs_read" | "slides_read" => {
-            Some(Scope::GoogleRead)
-        }
         // Write class: draft creation (never sends) + real calendar-event
         // creation + spreadsheet row append + Google Tasks create/complete.
         // Defence-in-depth beyond any per-agent approval_required_tools gate
         // the operator adds.
-        "gmail_create_draft" | "calendar_create_event" | "sheets_append" | "gtasks_create"
-        | "gtasks_complete" | "docs_append" => Some(Scope::GoogleWrite),
         // Notion native tools. Read class: connection diagnostics, search, and
         // page read. Write class: append paragraph blocks to an existing page.
         "notion_status" | "notion_search" | "notion_page_read" => Some(Scope::NotionRead),
@@ -533,8 +531,14 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
 
 /// Argument-aware create scope; ordinary tasks retain their Admin contract.
 pub fn tool_requires_scope_for_args(tool: &str, args: &serde_json::Value) -> Option<Scope> {
-    if tool == "tasks_create" && args.get("kind").and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("discovery")) {
+    if tool == "tasks_create"
+        && args
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("discovery"))
+    {
         Some(Scope::DiscoveryExecute)
-    } else { tool_requires_scope(tool) }
+    } else {
+        tool_requires_scope(tool)
+    }
 }

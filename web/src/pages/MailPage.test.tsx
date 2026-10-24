@@ -236,6 +236,21 @@ describe('MailPage — Agent Mail 信箱 (P2-d)', () => {
     ).toBeInTheDocument();
   });
 
+  it('distinguishes an unavailable Google account from a successful empty check', async () => {
+    mockMail({ status: { gmail_enabled: true, last_poll: {
+      checked_at: '2026-10-23T10:00:00Z', gmail_attempted: true,
+      account_unavailable: 1, transport_errors: 0,
+    } } });
+    renderPage();
+    expect(await screen.findByText(/Google account could not be used/i)).toBeInTheDocument();
+  });
+
+  it('reports unreadable check status as unknown instead of zero failures', async () => {
+    mockMail({ status: { last_poll: null, last_poll_error: true } });
+    renderPage();
+    expect(await screen.findByText(/Could not read the last mailbox check/i)).toBeInTheDocument();
+  });
+
   it('explains itself instead of showing an empty page when the mailbox is switched off', async () => {
     mockMail({ status: { enabled: false } });
     renderPage();
