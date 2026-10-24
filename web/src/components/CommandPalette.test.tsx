@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { fireEvent, screen, waitFor, act } from '@testing-library/react';
 import { useLocation } from 'react-router';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -275,4 +275,35 @@ describe('CommandPalette — content search (I-5)', () => {
     fireEvent.click(row);
     await waitFor(() => expect(screen.getByTestId('location-probe')).toHaveTextContent('/agents/alice/files'));
   });
+});
+
+
+describe('CommandPalette restricted conversation results',()=>{
+  const alias=`view:v1:s:${'b'.repeat(64)}`;
+  const hit={source:'conversation',id:'opaque-ref',title:'Masked external match',snippet:'UniquePrivacyQuery',agent_id:'sales',timestamp:'2026-10-24T00:00:00Z',jump:{session_id:alias,channel:'whatsapp',read_only:true,ner:false}};
+  function viewer(id='viewer-a'){
+    useAuthStore.setState({user:{id,display_name:id,role:'employee',status:'active'},bindings:[{user_id:id,agent_name:'sales',access_level:'viewer',bound_at:''}]} as never);
+    useAgentsStore.setState({agents:[{name:'sales',display_name:'Sales',role:'main',status:'active'}],loaded:true} as never);
+  }
+  it('states the regex-only boundary before a masked search snippet is read',async()=>{
+    viewer();mockIdLookupCalls({'search.query':{hits:[hit]}});renderPalette();
+    fireEvent.change(screen.getByRole('combobox'),{target:{value:'UniquePrivacyQuery'}});
+    expect(await screen.findByText(/AI detection is not installed/)).toBeInTheDocument();
+  });
+  it('drops delayed content from an earlier account even with the same role and employee',async()=>{
+    viewer();let resolveOld!:(v:unknown)=>void;let calls=0;
+    mockWsClient.call.mockImplementation((method:string)=>method==='search.query'?(++calls===1?new Promise(r=>{resolveOld=r;}):Promise.resolve({hits:[]})):Promise.resolve({sessions:[]}));
+    renderPalette();fireEvent.change(screen.getByRole('combobox'),{target:{value:'UniquePrivacyQuery'}});
+    await waitFor(()=>expect(resolveOld).toBeTypeOf('function'));
+    act(()=>viewer('viewer-b'));
+    await act(async()=>resolveOld({hits:[{...hit,title:'OLD ACCOUNT PRIVATE SEARCH'}]}));
+    expect(screen.queryByText('OLD ACCOUNT PRIVATE SEARCH')).not.toBeInTheDocument();
+  });
+  it('opens a server-authorized opaque search hit even outside the recent session-list cap',async()=>{
+    viewer();mockIdLookupCalls({'search.query':{hits:[hit]},'chat.sessions.list':{sessions:[]},'chat.sessions.history':{session_id:alias,agent_id:'sales',channel:'whatsapp',privacy_mode:'masked',read_only:true,ner:false,messages:[{role:'user',content:'[PHONE_1]',timestamp:'2026-10-24T00:00:00Z',tokens:0,parts:[{t:'mask',cat:'PHONE',n:1}]}]}});
+    renderPalette();fireEvent.change(screen.getByRole('combobox'),{target:{value:'UniquePrivacyQuery'}});
+    fireEvent.click(await screen.findByText('Masked external match'));
+    await waitFor(()=>expect(screen.getByTestId('location-probe')).toHaveTextContent('/chat'));
+  });
+
 });

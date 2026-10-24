@@ -203,8 +203,10 @@ async fn manager_reads_body() {
             .await,
     );
     let text = external.to_string();
+    assert!(!external["messages"].to_string().contains("0912"));
     for secret in [
-        "0912",
+        "0912-345-678",
+        "0912345678",
         "a@example.com",
         "person.txt",
         "OLD-CONTENT",
@@ -548,4 +550,115 @@ async fn counts_and_audit_summary_describe_only_returned_message_parts() {
         .unwrap();
     assert!(viewed["summary"].as_str().unwrap().contains("主管檢視了"));
     assert!(viewed["summary"].as_str().unwrap().contains("遮蔽1處"));
+}
+
+#[tokio::test]
+async fn restricted_team_metadata_uses_scoped_opaque_ids_and_cursors_even_for_raw_requests() {
+    let f=fixture().await;
+    let rc=f.handler.reply_ctx.read().await.clone().unwrap();
+    let phone_id="whatsapp:+886912345678";
+    {
+        let c=rc.session_manager.acquire().await;
+        c.execute("INSERT INTO sessions(id,agent_id,last_active,created_at,origin_kind,owner_user_id,title,summary) SELECT ?1,agent_id,last_active,created_at,origin_kind,owner_user_id,title,summary FROM sessions WHERE id=?2",params![phone_id,f.external]).unwrap();
+        c.execute("INSERT INTO session_messages(session_id,role,content,timestamp) SELECT ?1,role,content,timestamp FROM session_messages WHERE session_id=?2",params![phone_id,f.external]).unwrap();
+    }
+    let list=payload(f.handler.handle("users.team_history.list",json!({"agent_id":"sales","class":"external","limit":1}),&f.manager).await);
+    let handle=list["sessions"][0]["session_id"].as_str().unwrap();
+    assert!(crate::history_privacy::handles::is_handle(handle));
+    assert!(!list.to_string().contains("886912345678"));
+    let cursor=list["next_before"].as_str().unwrap();assert!(cursor.starts_with("view:v1:c:"));
+    let get=payload(f.handler.handle("users.team_history.get",json!({"session_id":handle}),&f.manager).await);
+    assert_eq!(get["session_id"],handle);assert!(!get.to_string().contains("886912345678"));
+    let raw=payload(f.handler.handle("users.team_history.get",json!({"session_id":phone_id}),&f.manager).await);
+    assert_eq!(raw["session_id"],handle);assert_eq!(raw["messages"],get["messages"]);
+    let next=payload(f.handler.handle("users.team_history.list",json!({"agent_id":"sales","class":"external","limit":1,"before":cursor}),&f.manager).await);
+    assert_eq!(next["sessions"].as_array().unwrap().len(),1);assert_ne!(next["sessions"][0]["session_id"],handle);
+    assert!(matches!(f.handler.handle("users.team_history.get",json!({"session_id":handle}),&f.admin).await,WsFrame::Response{ok:false,..}));
+    let admin=payload(f.handler.handle("chat.sessions.history",json!({"session_id":phone_id}),&f.admin).await);
+    assert!(admin.to_string().contains("0912-345-678"));
+}
+
+#[tokio::test]
+async fn directly_bound_operator_reads_own_full_external_masked_and_hides_other_webchat() {
+    let f = fixture().await;
+    let operator = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let own = payload(f.handler.handle("chat.sessions.history", json!({"session_id":"report"}), &operator).await);
+    assert_ne!(own["read_only"], true);
+    assert!(own.to_string().contains("0912-345-678"));
+    let external = payload(f.handler.handle("chat.sessions.history", json!({"session_id":f.external}), &operator).await);
+    assert_eq!(external["read_only"], true);
+    assert_eq!(external["privacy_mode"], "masked");
+    assert_eq!(external["channel"], "line");
+    assert!(!external.to_string().contains("0912-345-678"));
+    assert!(!external.to_string().contains("a@example.com"));
+    assert!(!external.to_string().contains("/private"));
+    assert!(crate::history_privacy::handles::is_handle(external["session_id"].as_str().unwrap()));
+    assert_eq!(denied(f.handler.handle("chat.sessions.history", json!({"session_id":"hidden"}), &operator).await), denied(f.handler.handle("chat.sessions.history", json!({"session_id":"missing"}), &operator).await));
+    let list = payload(f.handler.handle("chat.sessions.list",json!({"agent_id":"sales"}), &operator).await);
+    assert_eq!(list["sessions"].as_array().unwrap().len(),2);
+    assert!(!list.to_string().contains("SUMMARY-SECRET"));
+    assert!(!list.to_string().contains(&f.external));
+    assert_eq!(payload(f.handler.handle("chat.sessions.history",json!({"session_id":external["session_id"]}), &operator).await)["read_only"],true);
+    f.db.bind_agent(&f.employee,"sales",AccessLevel::Viewer).unwrap();
+    assert_eq!(payload(f.handler.handle("chat.sessions.history", json!({"session_id":f.external}), &operator).await)["read_only"],true);
+    f.db.bind_agent(&f.employee,"sales",AccessLevel::Owner).unwrap();
+    assert!(payload(f.handler.handle("chat.sessions.history", json!({"session_id":"hidden"}), &operator).await).to_string().contains("0912-345-678"));
+    f.db.bind_agent(&f.employee,"sales",AccessLevel::Operator).unwrap();
+    std::fs::write(f.home.path().join("config.toml"),"[people]\nbound_history_privacy=false").unwrap();
+    assert!(payload(f.handler.handle("chat.sessions.history", json!({"session_id":"hidden"}), &operator).await).to_string().contains("0912-345-678"));
+    std::fs::write(f.home.path().join("config.toml"),"[people]\nbound_history_privacy=true").unwrap();
+    std::fs::create_dir_all(f.home.path().join("models/privacy-filter")).unwrap();
+    denied(f.handler.handle("chat.sessions.history", json!({"session_id":f.external}), &operator).await);
+    assert!(payload(f.handler.handle("chat.sessions.history", json!({"session_id":"report"}), &operator).await).to_string().contains("0912-345-678"));
+}
+
+#[tokio::test]
+async fn bound_search_matches_only_masked_external_text_and_run_routes_hide_identifiers() {
+    let f=fixture().await;
+    let user=f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let hits=payload(f.handler.handle("search.query",json!({"agent_id":"sales","sources":["conversations"],"q":"a@example.com"}),&user).await);
+    for hit in hits["hits"].as_array().unwrap() { assert_eq!(hit["jump"]["session_id"],"report"); }
+    let all=payload(f.handler.handle("search.query",json!({"agent_id":"sales","sources":["conversations"],"q":"電話"}),&user).await);
+    assert!(!all.to_string().contains(&f.external));
+    assert!(!all.to_string().contains("hidden"));
+    let runs=payload(f.handler.handle("runs.list",json!({"agent_id":"sales"}),&user).await);
+    assert!(!runs.to_string().contains(&f.external));
+    assert!(!runs.to_string().contains("hidden"));
+    for r in runs["runs"].as_array().unwrap() {
+        let result=payload(f.handler.handle("runs.get",json!({"run_id":r["id"]}),&user).await);
+        if r["channel"]=="line" {
+            assert!(!result["events"].to_string().contains("0912"));
+            assert!(!result.to_string().contains("a@example.com"));
+            assert!(!result.to_string().contains("/private"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn bound_full_read_fence_refuses_a_downgrade_before_releasing_content() {
+    let f=fixture().await;
+    f.db.bind_agent(&f.employee,"sales",AccessLevel::Owner).unwrap();
+    let old=f.db.live_user_context(&f.employee).unwrap().unwrap();
+    assert!(f.handler.bound_history_recheck(&old,"sales",crate::history_privacy::Mode::Full).is_ok());
+    f.db.bind_agent(&f.employee,"sales",AccessLevel::Operator).unwrap();
+    assert!(f.handler.bound_history_recheck(&old,"sales",crate::history_privacy::Mode::Full).is_err());
+    assert!(f.handler.bound_history_recheck(&old,"sales",crate::history_privacy::Mode::Filtered).is_ok());
+}
+
+#[tokio::test]
+async fn bound_mask_failures_never_return_private_configuration_lines() {
+    let f=fixture().await;
+    let reader=f.db.live_user_context(&f.employee).unwrap().unwrap();
+    // Strict mode remains enabled when config cannot parse. The masker may
+    // diagnose that line internally, but an employee must not receive it.
+    std::fs::write(f.home.path().join("config.toml"),"private_api_key = 'SYNTHETIC-CONFIG-SECRET").unwrap();
+    let error=denied(f.handler.handle("chat.sessions.history",json!({"session_id":f.external}),&reader).await);
+    assert_eq!(error,json!("masking_failed"));
+    assert!(!error.to_string().contains("SYNTHETIC-CONFIG-SECRET"));
+    let runs=payload(f.handler.handle("runs.list",json!({"agent_id":"sales"}),&reader).await);
+    let external=runs["runs"].as_array().unwrap().iter().find(|r|r["channel"]=="line").unwrap();
+    let error=denied(f.handler.handle("runs.get",json!({"run_id":external["id"]}),&reader).await);
+    assert_eq!(error,json!("masking_failed"));
+    let error=denied(f.handler.handle("search.query",json!({"agent_id":"sales","sources":["conversations"],"q":"電話"}),&reader).await);
+    assert_eq!(error,json!("masking_failed"));
 }
