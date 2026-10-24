@@ -721,6 +721,12 @@ fn office_container(content: &[u8]) -> Vec<u8> {
 async fn real_bound_worker_delivery_archives_and_sends_worker_multipart_never_main_same_name() {
     for mode in ["declared", "swept", "forbidden_main", "unresolved_menu"] {
         let f = Fixture::new().await;
+        // Short Auto replies are plain text; embed mode exposes the employee footer.
+        f.ctx
+            .channel_settings
+            .set("discord", "global", keys::RESPONSE_MODE, "embed")
+            .await
+            .unwrap();
         f.edit("worker", |t| {
             t.insert("channels".into(), discord_binding("channel"));
         })

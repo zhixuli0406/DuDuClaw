@@ -59,6 +59,10 @@ fn failover(home_dir: &Path) -> &'static crate::failover::FailoverManager {
 
 /// Get (or lazily build) the runtime registry for `home_dir`.
 pub async fn registry(home_dir: &Path) -> &'static RuntimeRegistry {
+    #[cfg(test)]
+    if let Some(registry) = testing::owned_registry(home_dir) {
+        return registry;
+    }
     let map = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().await;
     if let Some(reg) = guard.get(home_dir) {
@@ -1161,21 +1165,100 @@ mod hint_tests {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    pub(crate) struct RegistryGuard { home:PathBuf, registry:&'static RuntimeRegistry }
+
+    // Owned injection must not share the async auto-detection cache lock.
+    // Every synchronous critical section only copies/inserts/removes a pointer.
+    static OWNED_REGISTRIES: OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, &'static RuntimeRegistry>>,
+    > = OnceLock::new();
+
+    pub(super) fn owned_registry(home: &Path) -> Option<&'static RuntimeRegistry> {
+        OWNED_REGISTRIES
+            .get()
+            .and_then(|map| map.lock().unwrap().get(home).copied())
+    }
+
+    pub(crate) struct RegistryGuard {
+        home: PathBuf,
+        registry: &'static RuntimeRegistry,
+    }
     impl RegistryGuard {
-        pub(crate) async fn install(home:&Path,registry:RuntimeRegistry)->Self {
+        pub(crate) async fn install(home: &Path, registry: RuntimeRegistry) -> Self {
             assert!(home.is_dir());
-            let registry:&'static RuntimeRegistry=Box::leak(Box::new(registry));
-            let mut map=REGISTRIES.get_or_init(||Mutex::new(HashMap::new())).lock().await;
-            assert!(map.insert(home.to_owned(),registry).is_none());
-            Self{home:home.to_owned(),registry}
+            let registry: &'static RuntimeRegistry = Box::leak(Box::new(registry));
+            let mut map = OWNED_REGISTRIES
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            assert!(map.insert(home.to_owned(), registry).is_none());
+            Self {
+                home: home.to_owned(),
+                registry,
+            }
         }
     }
     impl Drop for RegistryGuard {
         fn drop(&mut self) {
-            let mut map=REGISTRIES.get().unwrap().try_lock().expect("owned registry still in use");
-            assert!(map.get(&self.home).is_some_and(|actual|std::ptr::eq(*actual,self.registry)));
+            let mut map = OWNED_REGISTRIES.get().unwrap().lock().unwrap();
+            assert!(
+                map.get(&self.home)
+                    .is_some_and(|actual| std::ptr::eq(*actual, self.registry))
+            );
             map.remove(&self.home);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_registry_guard_is_independent_of_production_cache_contention() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let config = b"[general]\ninference_mode='claude'\n";
+        for home in [first.path(), second.path()] {
+            std::fs::write(home.join("config.toml"), config).unwrap();
+        }
+        let first_guard = RegistryGuard::install(
+            first.path(),
+            RuntimeRegistry::with_runtimes(HashMap::new()),
+        )
+        .await;
+        let second_guard = RegistryGuard::install(
+            second.path(),
+            RuntimeRegistry::with_runtimes(HashMap::new()),
+        )
+        .await;
+        let first_registry = first_guard.registry;
+        let second_registry = second_guard.registry;
+        assert!(!std::ptr::eq(first_registry, second_registry));
+
+        // Hold the actual shared cache lock, as another home's startup can.
+        // Neither owned lookup nor either Drop may acquire this Tokio mutex.
+        let production_cache = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
+        let production_guard = production_cache.lock().await;
+        let production_entries = production_guard.len();
+        drop(first_guard);
+        assert!(owned_registry(first.path()).is_none());
+        assert!(std::ptr::eq(
+            owned_registry(second.path()).unwrap(),
+            second_registry
+        ));
+        let second_lookup = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::registry(second.path()),
+        )
+        .await
+        .expect("owned lookup must bypass the held production cache lock");
+        assert!(std::ptr::eq(second_lookup, second_registry));
+        // The exact injected empty registry cannot call any CLI or provider.
+        assert!(second_registry.available().is_empty());
+        drop(second_guard);
+        assert!(owned_registry(second.path()).is_none());
+        assert_eq!(production_guard.len(), production_entries);
+        assert!(!production_guard.contains_key(first.path()));
+        assert!(!production_guard.contains_key(second.path()));
+        drop(production_guard);
+
+        for home in [first.path(), second.path()] {
+            assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), config);
         }
     }
 }
