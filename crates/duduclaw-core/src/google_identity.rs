@@ -23,8 +23,8 @@
 //! (which decides again from its own read of the same files). Every parse
 //! failure is reported as [`Effective::Invalid`]: a selector that cannot be
 //! read refuses Google for that employee and never falls back to the home
-//! account. `owner` and `user:<id>` parse (they are the B2b values) but are
-//! not available yet and are refused as [`Effective::NotAvailable`].
+//! account. `owner` and `user:<id>` resolve through the gateway's personal
+//! credential vault and require the selected person's explicit consent.
 
 use std::path::Path;
 
@@ -306,6 +306,9 @@ pub struct HomeIdentityConfig {
     /// Lower-case domains a `delegate:` email may be in. Empty ⇒ only the
     /// home service account subject's domain (when one is configured).
     pub allowed_subject_domains: Vec<String>,
+    /// Domains accepted for a person's own OAuth connection; empty allows
+    /// any verified Google account, including a consumer Gmail account.
+    pub allowed_domains: Vec<String>,
 }
 
 impl Default for HomeIdentityConfig {
@@ -313,11 +316,12 @@ impl Default for HomeIdentityConfig {
         Self {
             default_identity: Selector::Home,
             allowed_subject_domains: Vec::new(),
+            allowed_domains: Vec::new(),
         }
     }
 }
 
-const HOME_KEYS: &[&str] = &["default_identity", "allowed_subject_domains"];
+const HOME_KEYS: &[&str] = &["default_identity", "allowed_subject_domains", "allowed_domains"];
 
 /// Parse the home section out of a `config.toml` body. Absent ⇒ defaults
 /// (today's behaviour); present but wrong ⇒ error.
@@ -371,6 +375,14 @@ pub fn parse_home_config(text: &str) -> Result<HomeIdentityConfig, String> {
     Ok(HomeIdentityConfig {
         default_identity,
         allowed_subject_domains,
+        allowed_domains: match section.get("allowed_domains") {
+            None => Vec::new(),
+            Some(toml::Value::Array(values)) => values.iter().map(|value| {
+                let domain = value.as_str().ok_or("allowed_domains 必須是字串陣列")?.trim().to_ascii_lowercase();
+                if is_domain(&domain) { Ok(domain) } else { Err("allowed_domains 含有無效網域".to_string()) }
+            }).collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("allowed_domains 必須是字串陣列".into()),
+        },
     })
 }
 
@@ -412,8 +424,9 @@ pub enum Effective {
     Disabled,
     /// Act as this Workspace user; only the gateway mints it.
     Delegate { email: String },
-    /// A selector this release does not serve yet (`owner`, `user:`).
-    NotAvailable { kind: &'static str },
+    /// A human's own connected Google account. The gateway enforces the
+    /// Enterprise, active Owner, self-consent and per-call scope gates.
+    Personal { selector: Selector },
     /// The configuration cannot be read: refused, never home.
     Invalid(String),
 }
@@ -424,7 +437,7 @@ impl Effective {
             Self::Home => "home",
             Self::Disabled => "none",
             Self::Delegate { .. } => "delegate",
-            Self::NotAvailable { kind } => kind,
+            Self::Personal { selector } => selector.kind(),
             Self::Invalid(_) => "invalid",
         }
     }
@@ -465,8 +478,7 @@ fn effective_of(sel: &Selector) -> Effective {
         Selector::Delegate(email) => Effective::Delegate {
             email: email.clone(),
         },
-        Selector::Owner => Effective::NotAvailable { kind: "owner" },
-        Selector::User(_) => Effective::NotAvailable { kind: "user" },
+        Selector::Owner | Selector::User(_) => Effective::Personal { selector: sel.clone() },
     }
 }
 

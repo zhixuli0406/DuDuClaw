@@ -63,7 +63,7 @@ Claude CLI 把它當一般的 stdio MCP server 啟動。隱藏指令 `duduclaw m
 
 **中斷連線**會刪除已保存的登入資訊但保留伺服器（之後可再連線）；**移除**連同紀錄與 `.mcp.json` 項目一起刪除。從員工的伺服器清單移除遠端伺服器也一樣。
 
-服務商的授權伺服器中繼資料有 `revocation_endpoint`（RFC 7009）時，Gateway 也會請它撤銷 refresh token（沒有時撤銷 access token）：在本機刪除之後於背景進行，最多 10 秒，服務商緩慢或失敗都不會讓登入資訊留在磁碟上。結果記為稽核 `remote_mcp_token_revocation`（`revoked`、`http_<狀態碼>`、`failed`、`timeout`）。Bearer 權杖與沒有該端點的服務商無法從這裡撤銷，請到服務商帳號撤銷。
+中斷連線只保證刪除本機登入資訊。動態服務商或代理無法證明上游帳號及共用授權邊界，它的 HTTP 200 也不能證明下游 Google 撤銷已結束。因此即使是全新資料目錄，Gateway 也不會送出動態服務商撤銷請求；有宣告撤銷端點時，稽核 `remote_mcp_token_revocation` 記為 `local_only_unknown_grant`。若要撤銷服務商端授權，請本人到該服務商帳號處理。
 
 ### 額外標頭與伺服器串流（選用）
 
@@ -197,7 +197,7 @@ action_rules = [
 | `mcp.registry_install { name, version?, agent_id, remote?, server_name?, env? }` | 已登入（非管理者 ⇒ 安裝申請） | 走有掃描的安裝流程 |
 | `mcp.remote_connect { agent_id, name, url?, auth, bearer?, redirect_origin?, client_id?, client_secret?, headers?, server_stream? }` | 管理者 | 連線；`oauth` 回傳 `authorize_url`；`headers` `{名稱: 值}` 取代已存的標頭 |
 | `mcp.remote_status { agent_id? }` | 管理者 | 不含秘密的紀錄（`header_names`、`server_stream`） |
-| `mcp.remote_disconnect { agent_id, name, forget? }` | 管理者 | 刪除登入資訊（`forget` 連項目一起移除），可行時再到服務商撤銷 |
+| `mcp.remote_disconnect { agent_id, name, forget? }` | 管理者 | 刪除本機登入資訊（`forget` 連項目一起移除），服務商端授權需手動撤銷 |
 | `mcp.tool_effects { agent_id }` | 管理者 | 最近列出的第三方工具與類型、決定 |
 | `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?, arguments? }` | 管理者 | 訂閱（`mode` 預設 `explore`，或 `normal`；`delivery` 預設 `webhook`，或 `poll`、`auto`；`arguments` 為 `{ 事件名稱: 物件 }`） |
 | `mcp.events_discover { agent_id, server }` | 管理者 | 伺服器的 `events/list` |
@@ -212,7 +212,7 @@ action_rules = [
 - 沒有用真的 Zapier、Composio 帳號或真的第三方 OAuth 服務商測試；流程只對本機的假授權伺服器與假 MCP 伺服器驗證過。
 - 只有伺服器替事件編號（`id:`）並支援 `GET` 續傳時，才會續接中斷的回應串流；伺服器主動推送的 `GET` 串流需逐一開啟，只對本機假伺服器測試過。
 - 舊版 HTTP+SSE 伺服器仍走 `npx mcp-remote`（見上方）。註冊表中要求 DuDuClaw 無法送出的標頭（例如 `Cookie`）的項目顯示為無法安裝；若伺服器接受其他登入方式，請改用網址連線。
-- 只有授權伺服器宣告 `revocation_endpoint` 時才會到服務商撤銷，且為盡力而為。
+- 動態服務商僅中斷本機登入資訊；即使宣告 `revocation_endpoint`，服務商端仍需本人手動撤銷。
 - 第三方工具分類依第 4 節所述採信伺服器的標記；儀表板讀的快照檔由員工自己的行程寫入。
 - MCP Events：見第 5 節結尾；未實作推播；Gateway 必須能以伺服器接受的 https 位址連到。
 - 桌面版的儀表板來源（`tauri://…`）不是可接受的轉回來源；請用瀏覽器登入。

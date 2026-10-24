@@ -281,12 +281,15 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 
 ## Documentation
 
+Enterprise personal Google connections (unreleased): connect your own account, allow individual AI employees, and withdraw consent in [My connections](docs/guides/google-personal-connections.md).
+
 - [Read-only team conversations](docs/features/68-manager-team-history.md): unreleased Enterprise dashboard and API for report WebChat and masked external conversations, with staff notices, an activation boundary and mandatory audit. Direct Viewer/Operator history now keeps own WebChat full, masks external conversations and hides other accounts; Owner/Admin remain full. This behavior change has an explicit migration setting.
 - Self-service: **Who viewed my conversations** shows only your own team-history receipts ([guide](docs/features/68-manager-team-history.md)).
 - [ARCHITECTURE.md](ARCHITECTURE.md): full system architecture
 - [docs/README.md](docs/README.md): public docs index (architecture / RFC / ADR / specs / guides)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md): production deployment (Tailscale / Docker / systemd / auto-update / monitoring)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md): dev environment and agent development
+- [MCP operation lifetimes](docs/guides/mcp-call-lifetimes.md): unreleased host API reference for per-operation HTTP authority
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md): writing custom MCP tools
 - [docs/spec](docs/spec/soul-md-spec.md): SOUL.md and CONTRACT.toml format specs
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md): the DuDuClaw OS appliance; [52-desktop-edition.md](docs/features/52-desktop-edition.md): the desktop edition, one machine shared by a person and the AI; hardware requirements in [hardware-requirements.md](docs/guides/hardware-requirements.md); app compatibility, image build and releases all live in the [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo (see its `docs/guides/app-compat.md`)

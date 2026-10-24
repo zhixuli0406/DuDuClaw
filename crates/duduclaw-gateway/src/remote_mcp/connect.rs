@@ -353,6 +353,9 @@ fn save_connected(
 /// Start a connection. `none` / `bearer` are probed and stored at once;
 /// `oauth` runs discovery and registration and returns the authorize URL.
 pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOutcome, String> {
+    // Check the persistent unknown-revocation fence before exposing a new
+    // authorization URL. Finish takes its own lease through publication.
+    let _grant_lease = if req.auth == AuthKind::Oauth { Some(crate::google_personal::grants::acquire(home).await?) } else { None };
     store::validate_ids(&req.agent_id, &req.server)?;
     let url = resolve_url(home, &req)?;
     let policy = OutboundPolicy::for_mcp_url(&url);
@@ -601,6 +604,9 @@ async fn complete_inner(
     }
     let url = validate_remote_url(&p.mcp_url)?;
     let policy = OutboundPolicy::for_mcp_url(&url);
+    // Dynamic providers can also be Google; do not let a remote exchange
+    // create an unobserved shared grant during personal revocation.
+    let _google_grant_lease = crate::google_personal::grants::acquire(home).await?;
     let tokens = oauth::exchange_code(
         &p.token_endpoint,
         policy,
@@ -640,9 +646,8 @@ async fn complete_inner(
 /// Forget the credentials of a connection. `forget = false` keeps the record
 /// (URL) as `not_connected` so it can be connected again; `forget = true`
 /// removes it. Returns whether a record existed. Local only; the caller
-/// revokes at the provider afterwards ([`revocation_target`] read before,
-/// [`revoke_at_provider`] after), so a slow or failing provider never blocks
-/// the local delete.
+/// records the unverified-provider outcome afterwards ([`revocation_target`]
+/// read before, [`revoke_at_provider`] after). No provider request is sent.
 pub fn disconnect(home: &Path, agent_id: &str, server: &str, forget: bool) -> Result<bool, String> {
     store::validate_ids(agent_id, server)?;
     if forget {
@@ -667,10 +672,11 @@ pub fn disconnect(home: &Path, agent_id: &str, server: &str, forget: bool) -> Re
     })
 }
 
-/// What to revoke at the provider for (agent, server): its OAuth
+/// The advertised revocation target for (agent, server): its OAuth
 /// revocation endpoint, client credentials and the token to revoke (refresh
 /// token if any, else access token). `None` for bearer / none records or
-/// when the server advertised no endpoint.
+/// when the server advertised no endpoint. Retained for the disconnect audit;
+/// dynamic provider requests are not sent without a verified grant boundary.
 pub struct RevocationTarget {
     pub endpoint: Url,
     pub creds: ClientCredentials,
@@ -702,20 +708,12 @@ pub fn revocation_target(home: &Path, agent_id: &str, server: &str) -> Option<Re
     })
 }
 
-/// RFC 7009 revocation at the provider, best effort (10 s). Returns an
-/// outcome token for the audit row: `revoked`, `http_<status>`, `failed`,
-/// `timeout`.
-pub async fn revoke_at_provider(target: RevocationTarget) -> &'static str {
-    let fut = oauth::revoke_token(&target.endpoint, target.policy, &target.creds, &target.token, target.hint);
-    match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
-        Ok(Ok(200)) => "revoked",
-        Ok(Ok(400)) => "http_400",
-        Ok(Ok(401)) => "http_401",
-        Ok(Ok(503)) => "http_503",
-        Ok(Ok(_)) => "http_other",
-        Ok(Err(_)) => "failed",
-        Err(_) => "timeout",
-    }
+/// Dynamic providers do not establish the upstream account or shared-grant
+/// boundary. A proxy's 200 cannot prove that Google has finished revoking.
+/// The caller removes local credentials first; provider access is left for
+/// the operator to revoke directly. This also applies on an empty home.
+pub async fn revoke_at_provider(_target: RevocationTarget) -> &'static str {
+    "local_only_unknown_grant"
 }
 
 /// Non-secret view of every record (optionally one employee's).
@@ -877,6 +875,7 @@ pub async fn upstream_auth(
     }
 
     let _lock = refresh_lock(home, agent_id, server).await?;
+    let _google_grant_lease = crate::google_personal::grants::acquire(home).await.map_err(AuthError::Transient)?;
     // Re-read under the lock.
     let (_, mut secrets) = load_usable(home, agent_id, server)?;
     let current = to_upstream(&secrets)?;

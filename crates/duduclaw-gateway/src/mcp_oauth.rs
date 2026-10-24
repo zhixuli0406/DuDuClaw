@@ -285,6 +285,15 @@ pub fn build_exchange_request(
 }
 
 /// Exchange an authorization code for tokens.
+/// Complete a home OAuth exchange and publication under the same grant
+/// lease used by personal connections. CLI/HTTP entry points must use this
+/// wrapper rather than separating exchange and upsert across the fence.
+pub async fn exchange_and_store(home: &Path, config: &McpOAuthConfig, code: &str, verifier: &str) -> Result<(), String> {
+    let _lease = crate::google_personal::grants::acquire(home).await?;
+    let token = exchange_code(config, code, verifier).await?;
+    upsert_token(home, token)
+}
+
 pub async fn exchange_code(
     config: &McpOAuthConfig,
     code: &str,

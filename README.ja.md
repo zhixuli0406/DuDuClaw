@@ -281,12 +281,15 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## ドキュメント
 
+Enterprise の個人 Google 接続（未リリース）：本人が接続し、社員ごとに利用を許可・解除できます。[自分の接続](docs/guides/ja-JP/google-personal-connections.md)を参照してください。
+
 - [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：未リリースのEnterprise画面とAPI。部下のWebChatとマスクした外部会話を、職員向け通知、有効期間、必須監査とともに提供します。 直接 Viewer／Operator は本人の WebChat を全文、外部をマスク、他人を非表示とします。Owner／Admin の全文権限は維持し、移行設定を用意します。
 - **会話を閲覧した人**では、自分のチーム閲覧記録のみを確認できます（[説明](docs/features/ja-JP/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体
 - [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
+- [MCP 操作ごとの権限](docs/guides/ja-JP/mcp-call-lifetimes.md)：HTTP 操作単位の権限を扱う未リリースのホスト API リファレンス
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);[52-desktop-edition.md](docs/features/52-desktop-edition.md):デスクトップ版、人と AI で一台を共有;ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md);アプリ互換・イメージのビルド・リリースはいずれも [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ(互換層は同リポジトリの `docs/guides/app-compat.md`)

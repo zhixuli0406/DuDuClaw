@@ -121,14 +121,12 @@ name, the URL, and the sign-in:
 again later); **Remove** also deletes the record and the `.mcp.json` entry.
 Removing a remote server from the employee's server list does the same.
 
-When the provider's authorization server metadata advertises a
-`revocation_endpoint` (RFC 7009), the gateway also asks it to revoke the
-refresh token (or the access token when there is none): after the local
-delete, in the background, at most 10 seconds, so a slow or failing provider
-never keeps the credentials on disk. The outcome is audited as
-`remote_mcp_token_revocation` (`revoked`, `http_<status>`, `failed`,
-`timeout`). Bearer tokens and providers without the endpoint cannot be revoked
-from here: revoke them in your account there.
+Disconnect guarantees local credential removal only. A dynamic provider or
+proxy cannot prove the upstream account/shared-grant boundary, and its HTTP
+200 cannot prove that a downstream Google revocation has finished. The gateway
+does not send dynamic provider revocation requests, even on a fresh home;
+`remote_mcp_token_revocation` records `local_only_unknown_grant` when a target
+was advertised. Revoke the app in the provider account yourself if intended.
 
 ### Extra headers and the server stream (optional)
 
@@ -487,7 +485,7 @@ no real MCP Events provider.
 | `mcp.registry_install { name, version?, agent_id, remote?, server_name?, env? }` | signed in (non-Admin ⇒ install request) | Install through the scanned path |
 | `mcp.remote_connect { agent_id, name, url?, auth, bearer?, redirect_origin?, client_id?, client_secret?, headers?, server_stream? }` | Admin | Connect; `oauth` returns `authorize_url`; `headers` `{name: value}` replaces the stored ones |
 | `mcp.remote_status { agent_id? }` | Admin | Records without secrets (`header_names`, `server_stream`) |
-| `mcp.remote_disconnect { agent_id, name, forget? }` | Admin | Delete credentials (`forget` also removes the entry), then revoke at the provider when possible |
+| `mcp.remote_disconnect { agent_id, name, forget? }` | Admin | Delete local credentials (`forget` also removes the entry); provider revocation is manual |
 | `mcp.tool_effects { agent_id }` | Admin | Third-party tools last listed, with kind and verdict |
 | `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?, arguments? }` | Admin | Subscribe (`mode` `explore` default, or `normal`; `delivery` `webhook` default, `poll` or `auto`; `arguments` `{ event name: object }`) |
 | `mcp.events_discover { agent_id, server }` | Admin | The server's `events/list` |
@@ -514,8 +512,8 @@ bridge entries with their host and connection state.
   Registry entries that require a header DuDuClaw cannot send (such as
   `Cookie`) are shown as not installable; connect them by URL if the server
   accepts another way to sign in.
-- Revocation at the provider runs only when the authorization server
-  advertises `revocation_endpoint`, and is best effort.
+- Dynamic providers disconnect locally only, even when an authorization
+  server advertises `revocation_endpoint`. Provider revocation is manual.
 - Third-party tool classification trusts the server's annotations as
   described in section 4; the snapshot file the dashboard reads is written by
   the employee's own process tree.

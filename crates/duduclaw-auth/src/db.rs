@@ -127,6 +127,8 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
+        crate::google_identity::migrate(&conn)?;
+
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
         if !has_column(&conn, "users", "must_change_password")? {
@@ -524,9 +526,25 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("bind error: {e}"))?;
+        if access_level == AccessLevel::Owner {
+            let owners: Vec<String> = {
+                let mut statement = tx.prepare("SELECT user_id FROM user_agent_bindings WHERE agent_name = ?1 AND access_level = 'owner' AND user_id != ?2")
+                    .map_err(|e| e.to_string())?;
+                statement.query_map(params![agent_name, user_id], |row| row.get(0)).map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+            if let [previous] = owners.as_slice() {
+                let updated = tx.execute("UPDATE user_agent_bindings SET is_primary = 1 WHERE agent_name = ?1 AND user_id = ?2 AND NOT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1 AND is_primary = 1)", params![agent_name, previous]).map_err(|e| e.to_string())?;
+                if updated > 0 {
+                    tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp) VALUES(NULL, 'agent.primary_owner_auto', ?1, ?2, ?3)",
+                        params![agent_name, serde_json::json!({"primary_user_id": previous}).to_string(), now]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
         tx.execute(
-            "INSERT OR REPLACE INTO user_agent_bindings (user_id, agent_name, access_level, bound_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO user_agent_bindings (user_id, agent_name, access_level, bound_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, agent_name) DO UPDATE SET access_level = excluded.access_level, bound_at = excluded.bound_at,
+             is_primary = CASE WHEN excluded.access_level = 'owner' THEN user_agent_bindings.is_primary ELSE 0 END",
             params![user_id, agent_name, access_level.to_string(), now],
         )
         .map_err(|e| format!("bind error: {e}"))?;
@@ -554,7 +572,7 @@ impl UserDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT user_id, agent_name, access_level, bound_at
+                "SELECT user_id, agent_name, access_level, bound_at, is_primary
                  FROM user_agent_bindings WHERE user_id = ?1",
             )
             .map_err(|e| format!("query error: {e}"))?;
@@ -566,16 +584,17 @@ impl UserDb {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })
             .map_err(|e| format!("query error: {e}"))?;
 
         let mut bindings = Vec::new();
         for row in rows {
-            let (uid, agent, level_str, bound) = row.map_err(|e| format!("row error: {e}"))?;
+            let (uid, agent, level_str, bound, is_primary) = row.map_err(|e| format!("row error: {e}"))?;
             let access_level: AccessLevel = level_str.parse()
                 .map_err(|e: String| format!("corrupt access_level in DB: {e}"))?;
-            bindings.push(UserAgentBinding { user_id: uid, agent_name: agent, access_level, bound_at: bound });
+            bindings.push(UserAgentBinding { user_id: uid, agent_name: agent, access_level, bound_at: bound, is_primary });
         }
         Ok(bindings)
     }
@@ -585,7 +604,7 @@ impl UserDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT user_id, agent_name, access_level, bound_at
+                "SELECT user_id, agent_name, access_level, bound_at, is_primary
                  FROM user_agent_bindings WHERE agent_name = ?1",
             )
             .map_err(|e| format!("query error: {e}"))?;
@@ -597,16 +616,17 @@ impl UserDb {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })
             .map_err(|e| format!("query error: {e}"))?;
 
         let mut bindings = Vec::new();
         for row in rows {
-            let (uid, agent, level_str, bound) = row.map_err(|e| format!("row error: {e}"))?;
+            let (uid, agent, level_str, bound, is_primary) = row.map_err(|e| format!("row error: {e}"))?;
             let access_level: AccessLevel = level_str.parse()
                 .map_err(|e: String| format!("corrupt access_level in DB: {e}"))?;
-            bindings.push(UserAgentBinding { user_id: uid, agent_name: agent, access_level, bound_at: bound });
+            bindings.push(UserAgentBinding { user_id: uid, agent_name: agent, access_level, bound_at: bound, is_primary });
         }
         Ok(bindings)
     }

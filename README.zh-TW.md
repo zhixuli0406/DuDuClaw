@@ -282,12 +282,15 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## 文件
 
+企業版個人 Google 連線（未發布）：自行連結帳號，逐位允許或關閉 AI 員工使用，見[我的連線](docs/guides/zh-TW/google-personal-connections.md)。
+
 - [主管唯讀團隊對話](docs/features/zh-TW/68-manager-team-history.md)：尚未發版的企業版頁面與 API；部屬 WebChat 全文、外部對話遮蔽，含職員提示、生效時間與強制稽核。 直接 Viewer／Operator 的本人 WebChat 保留全文、外部遮蔽、他人隱藏；Owner／Admin 維持全文，行為變更附明確過渡設定。
 - 自身透明度：**誰看過我的對話**只列主管經團隊入口查看本人 WebChat 的紀錄（[說明](docs/features/zh-TW/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):完整系統架構
 - [docs/README.md](docs/README.md):公開文件索引(架構 / RFC / ADR / 規格 / 指南)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):生產部署(Tailscale / Docker / systemd / 自動更新 / 監控)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開發環境與 agent 開發
+- [MCP 操作授權生命週期](docs/guides/zh-TW/mcp-call-lifetimes.md)：未發布的主機 API 參考，說明每次 HTTP 操作的授權範圍
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):自訂 MCP 工具教學
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md 與 CONTRACT.toml 格式規範
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);[52-desktop-edition.md](docs/features/52-desktop-edition.md):桌面版,人機共用一台機器;硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md);app 相容層、映像建置與發布都在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo(相容層說明見該 repo 的 `docs/guides/app-compat.md`)

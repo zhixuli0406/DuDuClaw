@@ -41,11 +41,11 @@ use crate::ccr::{
     CCR_FIND_TOOL, CCR_RETRIEVE_TOOL, CcrError, CcrRuntime, CcrScope, CcrSourceArtifact,
 };
 use crate::error::LlmError;
+#[cfg(test)]
+use crate::provenance::SourceKind;
 use crate::provenance::{
     ProvenanceConfig, ProvenanceFlag, ProvenancePolicy, evaluate_call, seed_default_ledger,
 };
-#[cfg(test)]
-use crate::provenance::SourceKind;
 use crate::provider::ChatProvider;
 use crate::types::ToolDef;
 use crate::types::{ChatMessage, ChatRequest, ChatResponse, ContentPart, Role, StopReason};
@@ -75,7 +75,10 @@ mod telemetry;
 mod tests;
 
 pub use executor::{PolicyExecutor, ToolExecutor};
-pub use interceptor::{InterceptDecision, ToolInterceptor};
+pub use interceptor::{
+    ClientOperation, InterceptDecision, PreparedClientCall, SecretBearer, ToolCallLease,
+    ToolInterceptor,
+};
 pub use loop_run::run_tool_loop_with_provenance_and_ccr;
 pub use outcome::ToolOutcome;
 pub use telemetry::{

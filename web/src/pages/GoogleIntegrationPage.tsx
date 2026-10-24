@@ -15,6 +15,7 @@ import {
 import { IntegrationConnectPanel } from '@/components/IntegrationConnectPanel';
 import { GoogleCredentialPaths } from '@/components/GoogleCredentialPaths';
 import { GoogleDelegationPanel } from '@/components/GoogleDelegationPanel';
+import { GooglePersonalAdminPanel } from '@/components/GooglePersonalAdminPanel';
 import { Card, CardContent, Button, Badge } from '@/components/mds';
 import { api } from '@/lib/api';
 import { toast } from '@/lib/toast';
@@ -163,6 +164,7 @@ export function GoogleIntegrationPage() {
       />
       <GoogleCredentialPaths />
       <GoogleDelegationPanel />
+      <GooglePersonalAdminPanel />
     </div>
   );
 }
