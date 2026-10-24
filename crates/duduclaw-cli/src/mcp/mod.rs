@@ -179,6 +179,7 @@ mod dispatch;
 mod evolution;
 mod exec;
 mod google;
+mod google_identity_client;
 mod identity;
 mod inference;
 mod jsonrpc;

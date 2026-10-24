@@ -289,6 +289,19 @@ Letting an AI employee act as one specific person (for example a colleague's Goo
 
 What it does not stop: an employee with a shell can still replace the key (detected, as above), kill the gateway and start its own, or inject code into the `duduclaw` executable while the released macOS CLI lacks hardened runtime. Real separation is still not granting Bash, the task sandbox, or running the gateway as a different OS user.
 
+## Acting as a colleague's Google account (unreleased)
+
+Company delegation (B2a) lets an AI employee use Google as one named colleague. The gates, all failing closed:
+
+- **Only the proven employee.** The identity is chosen from the employee proven by `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN`, never from a tool argument. A process claiming an employee it cannot prove gets only the home default, and nothing when the claimed employee is set to anything else.
+- **Only the gateway mints.** The MCP server asks `POST /api/internal/google-token` (loopback, signed identity, nonce, rate limit, the same authentication as the knowledge route). The gateway reads the employee's `[google]` itself, looks up who the turn is for in its own registry, and unseals the delegation key only after `person_identity_gate()` passes (credential protection at or above the minimum level; Linux and Docker are refused). The token stays in the MCP server's memory for that turn.
+- **The key is sealed.** The service-account key is stored only as a `pk:v1` value under the protected key. A sealed key that does not open with the current protected key is treated as a replaced key: delegation stops, `google_delegation_key_unreadable` (Critical) is written once, and the admin resets protection and imports the key again. The record is not overwritten silently.
+- **Who asked.** By default only people bound to the employee, Admins, and system turns may use the colleague's account; public visitors never, under any setting. A refused requester or a setting error never falls back to the shared account; other failures do so only when the employee's `fallback = "home"` says so, and the reply says it did.
+- **People are re-read.** A colleague whose DuDuClaw account is suspended or offboarded is refused on the next call.
+- **Settings are admin-only.** `[google]` is frozen for the employee's own Write/Edit (agent-file guard) and is an authority key: a non-admin Owner may only narrow it.
+
+Limits: `gmail.compose` lets the token holder send mail; an employee with an unrestricted shell can use the token issued for its own colleague directly against Google, and runs as the same OS user as the gateway. External Google MCP servers (`oauth://google`) are skipped for a delegated employee in this release. See [Per-employee Google accounts](../guides/google-workspace.md#per-employee-google-accounts-company-delegation-unreleased).
+
 ## What these guards do not cover
 
 Saying this plainly is part of the defense.

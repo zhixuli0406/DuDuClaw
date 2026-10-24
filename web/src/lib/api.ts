@@ -5592,6 +5592,57 @@ export interface GoogleCredentialsStatus {
   required_scopes: string[];
 }
 
+// ── Per-employee Google identity (B2a) ──
+// Which Google account each AI employee acts as. Never carries a key or a
+// token: the delegation key is sealed in the gateway.
+export type GoogleIdentityKind = 'home' | 'none' | 'delegate' | 'owner' | 'user' | 'invalid';
+export interface AgentGoogleIdentity {
+  agent_id: string;
+  kind: GoogleIdentityKind;
+  /** The colleague's address for `delegate`. */
+  email: string | null;
+  /** The employee's `agent.toml` names an identity (vs the home default). */
+  explicit: boolean;
+  fallback: 'none' | 'home';
+  requesters: 'bound_people' | 'owner_only' | 'anyone';
+  /** `ready` means locally configured, not a successful unseal or Google probe. */
+  state: 'home' | 'none' | 'ready' | 'blocked';
+  /** zh-TW reason when blocked. */
+  message: string;
+}
+export interface GoogleDelegationKeyInfo {
+  client_email: string;
+  client_id: string | null;
+  imported_at: string;
+  key_id: string;
+}
+export interface GoogleDelegationStatus {
+  protection: CredentialProtectionStatus;
+  key: GoogleDelegationKeyInfo | null;
+  key_error: string | null;
+  settings: { default_identity: 'home' | 'none'; allowed_subject_domains: string[] } | null;
+  settings_error: string | null;
+  /** The home service account's subject (the default allowed domain). */
+  home_subject: string | null;
+  required_scopes: string[];
+  admin_console_path: string;
+  agents: AgentGoogleIdentity[];
+}
+export interface GoogleIdentityTestStep {
+  id: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+}
+export interface GoogleIdentitySetInput {
+  agent_id: string;
+  /** `home`, `none` or `delegate:<email>`. */
+  identity: string;
+  fallback?: 'none' | 'home';
+  requesters?: 'bound_people' | 'owner_only' | 'anyone';
+  confirm_anyone?: boolean;
+}
+
 export type GoogleCredentialsInput =
   | { mode: 'service_account'; key_file: string; subject: string }
   /** Omit `secret` to keep the stored one while editing the URL. */
@@ -7631,6 +7682,29 @@ export const api = {
       client.call('google.integration.set', { enabled }) as Promise<{
         enabled: boolean;
         changed: boolean;
+      }>,
+  },
+  /** Per-employee Google identity (B2a). Writes are admin-only. */
+  googleIdentity: {
+    delegation: () => client.call('google.delegation.get') as Promise<GoogleDelegationStatus>,
+    importKey: (keyJson: string) =>
+      client.call('google.delegation.import_key', { key_json: keyJson }) as Promise<{ key: GoogleDelegationKeyInfo }>,
+    removeKey: () => client.call('google.delegation.remove_key', { confirm: true }) as Promise<{ removed: boolean }>,
+    setSettings: (params: { allowed_subject_domains?: string[]; default_identity?: 'home' | 'none' }) =>
+      client.call('google.delegation.settings_set', { ...params }) as Promise<{
+        default_identity: 'home' | 'none';
+        allowed_subject_domains: string[];
+      }>,
+    get: (agentId: string) =>
+      client.call('agents.google_identity_get', { agent_id: agentId }) as Promise<AgentGoogleIdentity>,
+    set: (params: GoogleIdentitySetInput) =>
+      client.call('agents.google_identity_set', { ...params }) as Promise<AgentGoogleIdentity>,
+    test: (agentId: string) =>
+      client.call('google.identity.test', { agent_id: agentId }) as Promise<{
+        agent_id: string;
+        email: string | null;
+        ok: boolean;
+        steps: GoogleIdentityTestStep[];
       }>,
   },
   mcp: {

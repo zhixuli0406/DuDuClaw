@@ -23,6 +23,10 @@ in that domain with no consent screen — and, importantly, **no Google app
 verification or CASA review**, which is what blocks the OAuth path from serving
 customers outside the developer's own domain.
 
+To have each AI employee act as a different colleague (instead of one
+`subject` for everyone), see
+[Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-unreleased).
+
 ### What you are asking the customer for
 
 Be straight with them: delegation lets the authorized client impersonate any

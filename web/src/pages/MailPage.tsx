@@ -32,6 +32,7 @@ import {
 } from 'lucide-react';
 import { api, type MailMessage, type MailMessageFull, type MailDraft, type MailStatus } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAuthStore } from '@/stores/auth-store';
 
 /**
  * MailPage (`/mail`, Agent Mail / P2-d) — 信箱.
@@ -58,6 +59,7 @@ export function MailPage() {
     [intl],
   );
   const connState = useConnectionStore((s) => s.state);
+  const canManage = useAuthStore((s) => s.user?.role === 'admin' || s.user?.role === 'manager');
 
   const [tab, setTab] = useState<'inbox' | 'outbox'>('inbox');
   const [status, setStatus] = useState<MailStatus | null>(null);
@@ -76,9 +78,9 @@ export function MailPage() {
   const load = useCallback(async () => {
     try {
       const [st, inbox, out] = await Promise.all([
-        api.mail.status(),
+        canManage ? api.mail.status() : Promise.resolve(null),
         api.mail.list({ limit: 50 }),
-        api.mail.outbox({ limit: 50 }),
+        canManage ? api.mail.outbox({ limit: 50 }) : Promise.resolve({ drafts: [] }),
       ]);
       setStatus(st);
       setMessages(inbox.messages ?? []);
@@ -87,7 +89,7 @@ export function MailPage() {
     } catch (e) {
       setLoadError(e);
     }
-  }, []);
+  }, [canManage]);
 
   useEffect(() => {
     if (connState === 'authenticated') void load();
@@ -181,7 +183,7 @@ export function MailPage() {
             <Tabs value={tab} onValueChange={(v) => setTab(v as 'inbox' | 'outbox')} className="flex flex-col gap-4">
               <TabsList>
                 <TabsTab value="inbox">{t('mail.tabs.inbox', { n: unreadCount })}</TabsTab>
-                <TabsTab value="outbox">{t('mail.tabs.outbox', { n: pendingCount })}</TabsTab>
+                {canManage && <TabsTab value="outbox">{t('mail.tabs.outbox', { n: pendingCount })}</TabsTab>}
               </TabsList>
 
               <TabsPanel value="inbox" className="space-y-3">
@@ -215,7 +217,7 @@ export function MailPage() {
                           <Button size="sm" variant="outline" onClick={() => void openMail(m.mail_id)}>
                             {t('mail.action.open')}
                           </Button>
-                          <Button
+                          {canManage && <Button
                             size="sm"
                             variant="ghost"
                             disabled={busy === m.mail_id}
@@ -223,7 +225,7 @@ export function MailPage() {
                           >
                             <Archive className="size-3.5" />
                             {t('mail.action.archive')}
-                          </Button>
+                          </Button>}
                         </div>
                       </CardContent>
                     </Card>

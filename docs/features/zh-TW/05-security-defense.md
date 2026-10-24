@@ -289,6 +289,19 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 擋不住的部分：能執行指令的員工仍可以換掉金鑰（會被偵測，見上）、殺掉 gateway 自己起一個，或在發布的 macOS CLI 還沒開 hardened runtime 之前對 `duduclaw` 執行檔注入程式碼。真正的隔離仍是不給 Bash、用任務沙箱，或讓 gateway 用另一個作業系統帳號執行。
 
+## 代表同事使用 Google 帳號（未發布）
+
+公司授權代表（B2a）讓 AI 員工以一位指定同事的身分使用 Google。各道守門都在失敗時拒絕：
+
+- **只認已證明的員工。** 身分只依 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工決定，絕不看工具參數。宣稱某位員工卻證明不了的行程，只能用公司預設；宣稱的員工若設成其他身分，連預設也不給。
+- **只有 gateway 簽發。** MCP 伺服器向 `POST /api/internal/google-token` 要權杖（本機、簽章身分、一次性 nonce、限流，和知識庫路由同一套驗證）。gateway 自己讀員工的 `[google]`、用自己的登錄查這個 turn 是為誰做的，並且只在 `person_identity_gate()` 通過後（憑證保護達到最低等級；Linux 與 Docker 一律拒絕）才解開委派金鑰。權杖只留在 MCP 伺服器這個 turn 的記憶體裡。
+- **金鑰是封存的。** 服務帳號金鑰只以保護金鑰封存的 `pk:v1` 形式保存。用目前的保護金鑰解不開，就當成金鑰被換掉：委派停止、寫一次 `google_delegation_key_unreadable`（Critical），由管理員重設憑證保護後重新匯入。舊紀錄不會被悄悄覆蓋。
+- **誰在要求。** 預設只有綁定這位員工的人、管理員和系統工作能用那位同事的帳號；公開訪客在任何設定下都不行。發問者被拒或設定錯誤絕不改用公司共用帳號；其他失敗只有員工設了 `fallback = "home"` 才改用，回覆會說明。
+- **每次重讀人員狀態。** 同事的 DuDuClaw 帳號停權或離職後，下一次呼叫就拒絕。
+- **設定只有管理員能改。** `[google]` 對員工自己的 Write/Edit 是凍結的（員工檔案守衛），也是權限欄位：非管理員的擁有者只能改得更窄。
+
+限制：`gmail.compose` 讓拿到權杖的人能寄信；有不受限 shell 的員工可以拿自己那位同事的權杖直接呼叫 Google，而且和 gateway 是同一個作業系統帳號。這個版本對代表同事的員工會跳過外掛的 Google MCP 伺服器（`oauth://google`）。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+
 ## 這些守衛擋不住什麼
 
 明講這一節本身就是防線的一部分。

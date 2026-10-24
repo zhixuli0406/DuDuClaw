@@ -639,6 +639,50 @@ pub async fn get_valid_google_token(home_dir: &Path) -> Result<String, GoogleAut
 
 // ── HTTP plumbing ───────────────────────────────────────────────────────────
 
+/// The URL actually requested. Production: unchanged. A `live-test-mocks`
+/// build (never a release: see the `compile_error!` in `lib.rs`) may send
+/// every Google REST call to a local mock named by
+/// `DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE` (`https://gmail.googleapis.com/x` →
+/// `<base>/gmail.googleapis.com/x`).
+fn effective_url(url: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(test)]
+    {
+        if let Some(base) = test_api_base::get()
+            && let Some(rest) = url.strip_prefix("https://")
+        {
+            return std::borrow::Cow::Owned(format!("{base}/{rest}"));
+        }
+    }
+    #[cfg(feature = "live-test-mocks")]
+    {
+        if let Ok(base) = std::env::var("DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE")
+            && let Some(rest) = url.strip_prefix("https://")
+        {
+            return std::borrow::Cow::Owned(format!("{}/{rest}", base.trim_end_matches('/')));
+        }
+    }
+    std::borrow::Cow::Borrowed(url)
+}
+
+/// Unit tests' mock Google (set once by the test that starts it).
+#[cfg(test)]
+pub(crate) mod test_api_base {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<String> = OnceLock::new();
+    pub(crate) fn set(base: String) {
+        let _ = BASE.set(base);
+    }
+    pub(crate) fn get() -> Option<&'static str> {
+        BASE.get().map(String::as_str)
+    }
+}
+
+/// One read-only GET (identity checks). Same retry and status
+/// classification as every tool call.
+pub async fn api_get(token: &str, url: &str) -> Result<Value, GoogleApiError> {
+    google_request(token, reqwest::Method::GET, url, &[], None).await
+}
+
 fn http_client() -> Result<reqwest::Client, GoogleApiError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -660,7 +704,7 @@ async fn google_request(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let mut req = client.request(method.clone(), url).bearer_auth(token);
+        let mut req = client.request(method.clone(), effective_url(url).as_ref()).bearer_auth(token);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -720,7 +764,7 @@ async fn google_request_text(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let mut req = client.request(method.clone(), url).bearer_auth(token);
+        let mut req = client.request(method.clone(), effective_url(url).as_ref()).bearer_auth(token);
         if !query.is_empty() {
             req = req.query(query);
         }

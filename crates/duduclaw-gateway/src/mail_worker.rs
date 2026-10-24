@@ -77,6 +77,11 @@ pub struct PollReport {
     pub suspicious_not_triggered: usize,
     /// Transport-level failures (unreadable file, API error).
     pub transport_errors: usize,
+    /// Gmail not polled because the owning employee's Google identity was
+    /// refused (a delegate that cannot be minted, `none`, a broken
+    /// setting). Never retried with the home account unless the employee's
+    /// `[google] fallback = "home"` allows it.
+    pub account_unavailable: usize,
 }
 
 impl PollReport {
@@ -293,14 +298,29 @@ pub async fn poll_gmail(
     report: &mut PollReport,
     budget: &mut usize,
 ) -> Vec<String> {
-    let backend = match crate::google_workspace::resolve_backend(home_dir).await {
+    // The mailbox owner's Google identity (B2a): `home` is the unchanged
+    // path; a delegate is minted in this process; a refusal skips the poll.
+    let owner = (!owner_agent.is_empty()).then_some(owner_agent);
+    let (backend, google_account) = match crate::google_identity::gateway_backend_with_account(home_dir, owner, "mail_poll").await {
         Ok(b) => b,
-        Err(e) => {
+        Err(crate::google_identity::GatewayBackendError::Home(e)) => {
             warn!(error = %e, "mail: Gmail transport unavailable this tick");
             report.transport_errors += 1;
             return Vec::new();
         }
+        Err(crate::google_identity::GatewayBackendError::Refused(r)) => {
+            warn!(code = r.code, "mail: owner's Google identity refused; Gmail not polled");
+            report.account_unavailable += 1;
+            return Vec::new();
+        }
     };
+    if let Some(email) = google_account.as_deref()
+        && let Err(error) = crate::google_identity::mailbox::protect(home_dir, email)
+    {
+        warn!(%error, "mail: could not persist the personal-mail privacy floor");
+        report.account_unavailable += 1;
+        return Vec::new();
+    }
     let found =
         match crate::google_workspace::gmail_search_via(&backend, &cfg.gmail_query, GMAIL_PAGE)
             .await
@@ -322,7 +342,7 @@ pub async fn poll_gmail(
         let mailbox = mail::read_mailbox(home_dir);
         if mailbox
             .seen_external
-            .contains(&format!("gmail|{}", meta.id))
+            .contains(&mail::inbound_seen_key("gmail", &meta.id, google_account.as_deref()))
         {
             report.duplicate += 1;
             continue;
@@ -342,7 +362,7 @@ pub async fn poll_gmail(
             subject: full.subject,
             body: full.body,
         };
-        let outcome = mail::ingest_inbound(home_dir, cfg, &mailbox, &incoming, owner_agent);
+        let outcome = mail::ingest_inbound_for_account(home_dir, cfg, &mailbox, &incoming, owner_agent, google_account.as_deref());
         report.record(&outcome);
         if let IngestOutcome::Stored {
             mail_id,

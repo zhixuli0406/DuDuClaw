@@ -88,6 +88,8 @@ pub const AGENT_CAPABILITY_SECTION: &str = "capabilities";
 /// - `os_watch` — which host paths the OS-native watcher observes.
 /// - `team` — `[team.roles.*]` picks the runtime/model of each role,
 ///   including the verifier that judges this employee's own output.
+/// - `google` — which Google account the employee acts as (a delegated
+///   colleague's mailbox is a person's data, so only an admin sets it).
 ///
 /// Since G1 round 3 the freeze itself is an allow-list
 /// ([`AGENT_EDITABLE_SECTIONS`]): every section not listed editable is frozen,
@@ -112,6 +114,8 @@ pub const AGENT_SECURITY_SECTIONS: &[&str] = &[
     "team",
     // Which knowledge collections the employee uses (narrowing only).
     "knowledge",
+    // Which Google identity the employee acts as (admin-set).
+    "google",
 ];
 
 /// The only `agent.toml` sections the agent may still edit with Write/Edit

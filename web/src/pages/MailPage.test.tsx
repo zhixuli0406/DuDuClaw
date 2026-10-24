@@ -7,6 +7,7 @@ import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { MailPage } from './MailPage';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAuthStore } from '@/stores/auth-store';
 import type { MailDraft, MailMessage, MailStatus } from '@/lib/api';
 
 function renderPage() {
@@ -106,9 +107,20 @@ function mockMail(opts: {
 beforeEach(() => {
   vi.clearAllMocks();
   useConnectionStore.setState({ state: 'authenticated' });
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } } as never);
 });
 
 describe('MailPage — Agent Mail 信箱 (P2-d)', () => {
+  it('lets an employee read personal receipts without calling manager RPCs or rendering actions', async () => {
+    useAuthStore.setState({ user: { id: 'alice', role: 'employee' } } as never);
+    mockMail({ messages: [plainMail] });
+    renderPage();
+    await screen.findByText('報價需求');
+    expect(mockWsClient.call).not.toHaveBeenCalledWith('mail.status', expect.anything());
+    expect(mockWsClient.call).not.toHaveBeenCalledWith('mail.outbox', expect.anything());
+    expect(screen.queryByRole('button', { name: /Archive/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: /Pending|Outbox/ })).not.toBeInTheDocument();
+  });
   it('renders arrived mail with sender, subject and unread marker', async () => {
     mockMail({ messages: [plainMail] });
     renderPage();

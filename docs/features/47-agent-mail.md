@@ -148,6 +148,14 @@ Naming another agent's `agent_id` runs through the same delegation-policy
 check every other cross-agent tool uses — mailbox access follows the org
 chart, not a flat namespace.
 
+## Whose Gmail is read (unreleased)
+
+The Gmail transport reads the mailbox as the Google identity of the employee that owns arriving mail (`[mail] default_agent`, see above). An employee on the company's shared account reads it exactly as before. An employee set to act as a colleague through company delegation (`agent.toml [google] identity = "delegate:<email>"`) reads that colleague's mailbox, minted inside the gateway. When the identity cannot be used, that tick polls nothing and logs why; it does not read the shared account unless the employee's `fallback = "home"` allows it. While the mailbox is a colleague's, the Mailbox pages (`mail.list`, `mail.read`, `mail.archive`, `mail.outbox`, `mail.decide`) are open only to Admins and that colleague (**behaviour change**; a shared-account mailbox keeps the Manager gate). There is still one mailbox per installation. See [Per-employee Google accounts](../guides/google-workspace.md#per-employee-google-accounts-company-delegation-unreleased).
+
+Each received Gmail message records the actual delegated account used to fetch it. An explicit fallback to the company account records a shared receipt. `mail.list` filters before pagination; `mail.read` checks the stored receipt before marking it read. Admins can read everything; an active account holder (including an Employee) can read only their personal receipts. Shared-account, legacy, unknown and drop-folder receipts keep the Manager requirement. Changing the current selector or disabling Gmail never relabels stored messages. The employee's Connections tab links to the holder's read-only inbox; that view does not expose archive or outbound decisions.
+
+All write RPCs and the outbox retain the Manager requirement. Their shared ledger also keeps a durable privacy floor: once personal Gmail was polled, those surfaces additionally require the matching account holder; multiple personal accounts restrict them to Admins. An unreadable floor denies non-Admins. This conservative restriction persists across account changes.
+
 ## Security Design
 
 - **Never auto-sent, structurally.** `mail_send` (and `record_outbox_draft`

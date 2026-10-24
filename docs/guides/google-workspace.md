@@ -112,7 +112,146 @@ OAuth vault → Apps Script bridge; the bridge sits last because it covers the
 fewest tools. `google_status` names the source actually in effect.
 
 The two credential-free paths are documented in
-[google-no-oauth-client.md](google-no-oauth-client.md).
+[google-no-oauth-client.md](google-no-oauth-client.md). To give each AI
+employee its own colleague's account, see
+[Per-employee Google accounts](#per-employee-google-accounts-company-delegation-unreleased).
+
+## Per-employee Google accounts (company delegation, unreleased)
+
+By default every AI employee uses the one Google account set up below (the
+company's shared account). A Google Workspace customer can instead let each
+employee act as one named colleague: the sales assistant reads and drafts in
+`alice@customer.com`'s mailbox, the scheduling assistant works in
+`bob@customer.com`'s calendar. One service account with domain-wide
+delegation serves all of them; each employee names the colleague it acts as.
+
+### What you need
+
+- A Google Workspace domain and a super admin who can authorize one client
+  id (Admin console → Security → Access and data control → API controls →
+  Manage Domain Wide Delegation) for the full scope list the dashboard shows.
+- Credential protection in the system keychain (Security page, see
+  [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased)).
+  The service-account key is sealed with that protection key, so it is never
+  a file an AI employee can read. macOS and Windows qualify. On Linux and in
+  Docker there is no supported keychain yet, and acting as a colleague is
+  refused.
+
+### Set it up
+
+1. **Security → Credential protection → Move to system keychain.**
+2. **Integrations → Google → Company delegation → Import key file.** Pick
+   the service-account JSON key. The gateway checks it, seals it and stores
+   it as `<home>/protected/google-service-account.sealed` (owner-only). Delete
+   the original file afterwards. The panel shows the client id and the scope
+   list to hand to the super admin.
+3. **Allowed domains.** Only colleagues in these domains can be named
+   (exact domain match, no subdomains). Left empty, only the domain of the
+   home service account's `subject` is allowed; with neither, nobody is.
+4. **Employee page → Connections → Change → Act as a colleague (domain
+   delegation)**, enter the colleague's work email, save.
+5. **Test connection** mints a token for that colleague with the full scope
+   list, checks Gmail reports the same address, then mints per-service scopes.
+   Gmail, Calendar, Drive and Tasks also read a read-only endpoint; Sheets,
+   Docs, Slides and Forms currently verify issuance only, not service access.
+   It sends nothing and does not reuse or fill
+   the token cache.
+
+The account card's "Configured — test connection" badge is a local setup
+check, not proof the sealed key opens or Google accepts the grant. Every
+native delegated tool call asks the gateway to recheck current settings,
+requester permissions and account status; only the gateway caches minting.
+
+The same choices are available as RPCs (all Admin): `google.delegation.get`,
+`google.delegation.import_key`, `google.delegation.remove_key`,
+`google.delegation.settings_set`, `agents.google_identity_set`,
+`google.identity.test`. `agents.google_identity_get` needs Viewer access to
+the employee.
+
+### Settings
+
+```toml
+# agent.toml (admin-set; employees cannot edit it with Write/Edit)
+[google]
+identity = "delegate:alice@customer.com"  # home | none | delegate:<email>
+fallback = "none"          # none (default) | home
+requesters = "bound_people" # bound_people (default) | owner_only | anyone
+
+# config.toml
+[integrations.google_identity]
+default_identity = "home"              # what employees without [google] use: home (default) | none
+allowed_subject_domains = ["customer.com"]
+```
+
+An employee without `[google]` uses `default_identity`, so an existing
+installation behaves exactly as before. `none` hides the 19 Google tools
+from that employee and refuses calls to them. A value that cannot be read
+(a typo, an unknown key) refuses Google for that employee; it never turns
+into the shared account. `owner` and `user:<id>` (an employee using its
+owner's own connected account) are reserved for a later release and are
+refused for now.
+
+### Who can use the account through the employee
+
+The colleague's mailbox is a person's data, so the employee only uses it for
+some requesters (`requesters`):
+
+| Setting | Allowed |
+|---|---|
+| `bound_people` (default) | People bound to this employee (any access level) and Admins, in the dashboard, WebChat or a verified channel binding; scheduled and system work (cron, heartbeat, Agent Mail); work delegated from one of those people |
+| `owner_only` | The colleague's own DuDuClaw account and scheduled work |
+| `anyone` | Anyone who can talk to the employee (needs `confirm_anyone: true` when set over RPC) |
+
+Public website visitors (WebChat widget, Odoo Live Chat) are refused under
+every setting. An unbound channel sender is refused unless `anyone` is set.
+
+### When it cannot be used
+
+The tool call fails with a reason and who can fix it. It does not quietly
+use the shared account. The reasons: the caller is not a verified employee;
+the requester is not allowed; the email is outside the allowed domains; the
+colleague's DuDuClaw account is suspended or offboarded; credential
+protection is not ready (or its key was replaced, in which case the sealed
+key no longer opens: reset protection and import the key again); no key was
+imported; Google rejected the delegation (`unauthorized_client` usually means
+the scope list in the Admin console is incomplete, `invalid_grant` that the
+account does not exist or is disabled); the gateway is not running.
+
+With **"If the colleague's account cannot be used, use the company's shared
+account"** ticked (`fallback = "home"`), the last group (no key imported,
+colleague suspended, Google rejected or unreachable) uses the shared account
+instead and the result starts with a note saying so. A refused requester, a
+setting error and a protection problem never fall back.
+
+### What else changes
+
+- **`google_status`** starts with who the employee acts as. For a colleague
+  it reports whether a token can be obtained right now instead of the shared
+  account's details.
+- **Agent Mail** reads the mailbox as the identity of the employee that owns
+  arriving mail. When that is a colleague, the Mailbox pages are visible only
+  to Admins and that colleague (behaviour change; a shared-account mailbox
+  keeps the Manager gate). Agent Mail is still one mailbox per installation.
+- **External Google MCP servers** (`bearer_token = "oauth://google"`) are
+  skipped for an employee acting as a colleague in this release, because the
+  bearer would otherwise be the shared account's token.
+- **Audit:** every token the gateway issues or refuses is a `google_token`
+  row in `tool_calls.jsonl` (employee, identity, account, requester kind,
+  tool, refusal code); every Google tool call on a colleague's identity is a
+  `google_call` row. Neither ever contains a token. Changing an employee's
+  identity writes `agent.google_identity_set` to the account audit log and
+  `agent_google_identity_set` to `security_audit.jsonl`.
+
+### Limits
+
+- `gmail.compose` lets whoever holds the access token send mail. The tools
+  only create drafts, but an employee with an unrestricted shell can call
+  Google directly with a token it was issued for its own colleague.
+- An employee with a shell runs as the same OS user as the gateway; see the
+  keychain limits in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).
+- Not yet verified against a real Workspace tenant: the exact Admin console
+  flow, Google's real error strings, a Gmail-disabled organizational unit,
+  and whether Google's own remote MCP endpoints accept delegated tokens.
 
 ## Prerequisites: create a Google OAuth client
 

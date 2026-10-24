@@ -9,7 +9,18 @@
 
 - 企業版新增「團隊對話」唯讀頁：從「我的團隊」或側欄進入，依 AI 員工、部屬與對話類型篩選；外部對話顯示遮蔽占位與偵測限制，附件不提供下載，沒有輸入框或匯出。管理員可在成員管理切換組織設定；只有伺服器確認主管看得到的職員對話，才在聊天輸入框與選擇器顯示告知。篩選、重新整理與拒絕時清除舊內容，避免過期回應顯示在另一段對話中。「誰看過我的對話」與直接檢視者的權限收窄另有後續變更。
 
+### Fixed
+- 關閉員工的 Google 個人代表身分或改回公司帳號時，不再要求確認已移除的「任何人都能使用」限制；設定個人代表且開放任何人使用時仍須確認。
+
 ### Added
+- 每位 AI 員工可以用不同的 Google 帳號（公司授權代表，B2a）：Google Workspace 客戶用一個開了網域委派的服務帳號，讓每位員工以一位指定同事的身分讀信、存草稿、管理日曆與文件。
+  - **設定**：員工頁新增「連線」分頁，顯示目前用哪個 Google 帳號；「已設定」僅表示本地資料備妥，需另按「測試連線」確認。管理員可以改成「公司共用帳號」、「代表某位同事（網域委派）」或「不使用」。測試會替同事取權杖、比對 Gmail 回報的信箱，再按服務測授權；Gmail、日曆、雲端硬碟與工作清單另外讀取唯讀端點，試算表、文件、簡報與表單只驗授權簽發，不寄任何東西。「整合 → Google」新增「公司授權代表」分區：匯入服務帳號金鑰、複製用戶端 ID 與完整權限清單、設定允許網域，以及列出各員工的代表帳號。設定為 `agent.toml [google] identity`（`home`／`none`／`delegate:<email>`）、`fallback`、`requesters`；全域預設為 `config.toml [integrations.google_identity] default_identity`、`allowed_subject_domains`。沒寫 `[google]` 的員工照舊用公司共用帳號；改信箱或 fallback 時保留原本的發問者限制，未知型別拒絕。
+  - **金鑰只封存，不落成可讀的檔案**：服務帳號金鑰用系統金鑰圈裡的保護金鑰封存（`pk:v1`）存成 `<home>/protected/google-service-account.sealed`，AI 員工讀不到。憑證保護還沒改放系統金鑰圈、或在 Linux／Docker 上，一律不能代表同事。保護金鑰被換掉時，封存的金鑰解不開，公司授權代表停用、`security_audit.jsonl` 記一筆 Critical 的 `google_delegation_key_unreadable`，要重設憑證保護後重新匯入，舊紀錄不會被悄悄覆蓋。
+  - **只有 gateway 簽發**：每次委派工具呼叫都經 `POST /api/internal/google-token`（本機、簽章身分、一次性 nonce、限流），由 gateway 重查有效設定、這個 turn 的發問者、帳號狀態與憑證保護。只有 gateway 快取簽發結果，MCP 不跨呼叫沿用 token；整合總開關也會阻擋簽發。呼叫者只認 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工，宣稱卻證明不了的行程不能用代表同事的設定。`[google]` 納入 `AgentTomlSections`，與其他設定一樣讀有效的預設組合產物；區段錯誤拒絕 Google，不影響其他區段。
+  - **誰能透過員工使用**：預設只有綁定這位員工的人、管理員與排程等系統工作；`owner_only` 只限那位同事本人；`anyone` 要明確確認。網站公開訪客在任何設定下都不行。同事的 DuDuClaw 帳號停權或離職後立即不能再代表。
+  - **不會默默改用公司帳號**：用不了時工具回覆原因與誰能處理。只有管理員替員工勾了「改用公司共用帳號」（`fallback = "home"`），而且原因是還沒匯入金鑰、同事停權、Google 拒絕或連不上時，才改用並在回覆開頭說明；發問者沒有權限、設定錯誤、憑證保護的問題一律不改用。
+  - **稽核**：gateway 每次發出或拒絕權杖寫一列 `google_token`，用同事身分的每次工具呼叫寫一列 `google_call`（都不含權杖）；變更員工身分寫 `agent.google_identity_set` 與 `agent_google_identity_set`。新 RPC：`google.delegation.get`／`import_key`／`remove_key`／`settings_set`、`agents.google_identity_get`／`agents.google_identity_set`、`google.identity.test`。
+  - **仍未完整**：外部員工專屬 API key 的委派取權杖（`B2a-EXT`）與 `oauth://google` 的委派掛載及逐次呼叫守門（`B2a-MCP`）尚未實作；目前非 home 的外掛 Google MCP 直接略過，絕不換成公司 token。驗證範圍與本地測試結果見 PR 及 `wiki/impl/google-delegated-identity-acceptance.md`。尚未驗證：真的 Google Workspace（管理控制台授權流程、真實錯誤字串、關閉 Gmail 的組織單位、Google 自家遠端 MCP 收不收委派權杖）、Windows 真機、使用者驗收。
 - **排程交辦**：主管（和任何有交辦權的人）可以把工作排到之後，或固定週期交辦給自己或團隊的 AI 員工，例如「每週一 09:00 寫週報」。設定當下不建立任務；時間到才以建立者的名義建立目標或看板任務，跟當下親自交辦一樣。
   - **聊天**：`/交辦 @員工 任務 || 時間:每週一 9:00`（也接受 `排程:`、`schedule:`、`at:`）。看得懂 `明天 15:00`、`10/25 下午2點`、`2026-10-25 14:00`、`每天 9:00`、`平日 早上9點`、`每週一、三、五 14:30`、`每小時`、`daily 09:00`、`every monday 9:00`；週期沒寫時間就是 09:00，時間以閘道主機時區解讀，確認訊息寫出讀到的排程與下次時間。`/交辦 排程` 列出自己的排程，`/交辦 排程 暫停|恢復|刪除 <編號>` 管理。管理員另可用 `cron:`。
   - **dashboard**：交辦面板新增「什麼時候做」（現在、指定時間一次、每天、平日、每週選幾天、每小時；管理員另有自訂 cron），以瀏覽器時區解讀。「目標 → 我交辦的」新增「排程」區塊，顯示下次與上次執行，可暫停、恢復、刪除；管理員可切換看所有人的。RPC：`tasks.goal_create`／`tasks.create` 接受 `schedule`＋`schedule_timezone`；新增 `assign_schedules.list`（`scope: mine|all`）、`.pause`、`.resume`、`.remove`。
@@ -140,6 +151,10 @@
 ### Changed
 - **行為變更**：首次開啟時「請先建立第一位 AI 員工」的引導頁，現在只會把管理員帶過去（只有管理員能建立員工，而且管理員看得到全部員工，名單是空的才真的代表還沒有員工）。主管或一般成員就算自己沒有綁定任何 AI 員工，也照常進入儀表板，主管可以直接開「我的團隊」。以前他們每一頁都會被導到引導頁、無法使用。已驗證：前端測試（管理員且沒有員工時導向引導頁；主管與一般成員不導向）。
 - **行為變更**：以 `/交辦`、`／交辦` 或 `/assign` 開頭的訊息現在是指令，不再交給 AI 員工回覆（`/交辦事項` 這類後面直接接字的不算）。dashboard 建立的任務（`tasks.create`、交辦目標）與綁定帳號的人在聊天打的 `/goal`、確認的目標建議，現在會記下 `on_behalf_of`／`created_via`（權限規則不變，舊資料不回填）。debug 版本的 gateway 會讀 `DUDUCLAW_LINE_API_BASE`（只接受本機位址）把 LINE 回覆與推播送到測試用的伺服器，正式版不受影響。
+- **行為變更**：Agent Mail 的 Gmail 收信用所屬員工實際解析出的 Google 帳號，逐封保存代表帳號；fallback 到公司帳號就記成共用收件。管理員看全部，其他有效帳號只看自己的個人收件；共用、舊版、來源不明與投遞資料夾信件維持主管以上。清單先過濾再分頁，讀取授權成功後才標已讀，改代表帳號不會重標歷史信件；不同帳號的 Gmail 訊息 ID 分別去重。本人一般員工可從「連線」分頁開唯讀信箱，不能因此取得封存、待寄出或寄件決定權。這些操作仍須主管角色，並受持久的個人帳號保護紀錄收窄；混合多人的待寄出帳本只限管理員。身分用不了時不收信並記錄原因（只有明確設 `fallback = "home"` 才改讀公司帳號）。尚未驗證：真的 Gmail 收信、Windows 真機與信箱頁實際瀏覽器操作；RPC／元件回歸結果見 PR。
+- 外掛的 Google MCP 伺服器（`bearer_token = "oauth://google"`）對代表同事或不使用 Google 的員工會跳過不掛載，以免帶入公司共用帳號的權杖。已驗證：單元測試。尚未驗證：Google 自家遠端 MCP 端點收不收委派權杖。
+- `google_status` 改為先講員工目前代表誰；代表同事時只回報現在能不能取得權杖。
+- 非管理員的員工擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`），其他變更要管理員。
 - **行為變更**：`tasks.create`（含 `kind = "goal"`）、`tasks.goal_create`，以及 `tasks.assign`、`tasks.update` 改派的目的員工，改用「可以交辦」判斷：管理員、直接綁定 Operator 以上，或經由部屬拿到 Operator 的主管。任務看板 `tasks.list`／`tasks.list_page` 也讓主管列出可以交辦的團隊員工，但沒有直接綁定時只看得到卡片（標題、狀態），看不到內容；只有卡片的任務也不附原本對話的連結（`channel`、`channel_link` 為空）。主管自己建立、交辦給團隊員工的任務，只要仍可交辦給那位員工，就能修改、改派、取消或刪除；其他任務改派時原本負責的員工仍要直接 Operator。已驗證：RPC 測試與隔離環境實測（主管交辦給團隊員工成功、給同級同事的員工或只有 Viewer 的團隊員工回 permission denied；看板列得到團隊員工、列不到其他員工；記憶 RPC 仍拒絕；個人版擁有者照常建立任務）。尚未驗證：dashboard 任務頁實際畫面。
 - **行為變更**：`tasks.goal_create` 只接受管理員帶非空白的 `risk_boundary`，其他人帶了會回「only an admin can set a risk boundary」；交辦目標表單的風險邊界欄只顯示給管理員。原因：任務自己的邊界會取代 `[goal_defaults] baseline_boundary`（2026-10-23 owner 決定，聊天 `/交辦` 同一規則）。
 - **行為變更**：只有 dashboard 帳號（WebChat 登入，或綁定了帳號的通訊軟體使用者）叫了沒有權限的員工時會收到明確拒絕。沒有綁定帳號的發話者（LINE 好友、Telegram 使用者、網站聊天與 Odoo 線上客服訪客）叫不到的名字，改成和對不上任何人的名字一樣當成一般文字交給預設員工，在「只回提及」的群組裡也不算叫 bot，外部的人無法藉由拒絕訊息查出有哪些員工；這類情況不再寫 `trigger_route_refused`。已驗證：單元測試涵蓋 LINE 未綁定使用者、WebChat 網站訪客、綁定帳號的同級主管與 Discord 共用管線。尚未驗證：實機 Telegram、Odoo。
@@ -238,6 +253,7 @@
   - 尚未驗證：Telegram、Discord、Slack 等平台的實際收發（它們和 LINE 共用同一段回覆流程，但沒有用假 API 實測）；回覆流程本體（`build_reply_with_session_inner` 約 238 KB）與 LINE 的 `process_line_events`（約 141 KB）兩個大函式自己的堆疊用量沒有縮小，要再省得拆函式。
 
 ### Security
+- 將前端測試相依 undici 更新至 7.30.1，修補 EventSource 記憶體耗盡、過量內容編碼導致程序終止與 SRI 演算法大小寫繞過。
 - 委派可以替沒有權限的人做事：員工 A 收到一位只能「檢視」某員工的人的要求，仍能用 `send_to_agent` 或 `tasks_create` 把工作交給那位員工，因為委派只看員工之間的組織關係。現在可以用 `[delegation] human_principal = "enforce"` 要求真人也有權限（預設仍只記錄，見上方 Added）。gateway 自己的環境變數裡若有 `DUDUCLAW_ON_BEHALF_OF`，不會傳給任何員工：spawn 白名單不含它，各 runtime 也會先移除。
 - 員工專屬 Bot Token（Discord、Telegram、Slack，經 `channels.add` 或 `agents.update` 存入）在本機加密金鑰無法使用時改成拒絕存檔，不再退回明文寫進員工自己資料夾裡的 `agent.toml`；新的專屬通道 RPC 也一樣。`[channels.googlechat]` 加入只限管理員的欄位清單（`agent_authority`）。已驗證：RPC 測試確認 `agent.toml` 只有密文。尚未驗證：加密金鑰真的無法寫入的情境只用程式路徑檢查，沒有實際製造權限錯誤。
 - dashboard 的權限改成每次呼叫都從資料庫讀：以前 WebSocket 連線一直用握手時的角色與綁定，access token 又有 30 分鐘效期，所以管理員拿掉某人的員工綁定、把人降級或停權，對方已開著的頁面在下次登入前都還照舊。現在每個 RPC 都依 `users.db` 重建身分（token 只證明是誰），快取以 `auth_meta.acl_generation` 為鍵，每一種會影響權限的寫入（綁定、解綁、改角色或密碼、改狀態、改主管、通道身分、改 email、離職）都在同一個交易裡更新這個計數器。帳號不存在或不在職回 `account is suspended or offboarded`；讀不到資料庫時這次呼叫回 `authentication service unavailable`，不沿用 token 的任何內容，並記入計數，`system.doctor` 會多一列「dashboard 權限讀取」顯示啟動後失敗幾次。資料庫讀取與登入的密碼檢查改在 blocking 執行緒池執行，登入時的雜湊運算也不再佔住共用的資料庫連線。必須改密碼的旗標也改成即時：改完密碼不必重新連線，管理員重設後也立刻生效。閘道管理 token 與鎖定畫面連線不變。已驗證：gateway 測試（連線不中斷下解綁、降級、停權在下一次呼叫生效；token 宣稱 Admin 但資料庫不是時不會放寬；讀取失敗一律拒絕並計數；快取依計數器失效、滿了先丟舊計數器的項目）；隔離環境的 gateway 實測（企業版，WebSocket 連線全程不中斷）：解綁後同一條連線的下一次 `agents.list` 立刻少掉那位員工、重新綁定立刻出現；主管被降級後 `users.subordinates` 立刻回 permission denied；停權後下一次呼叫回 `account is suspended or offboarded`。延遲量測見 PR #175（兩個登入同時跑雜湊、雙 worker runtime 下連續 300 次 RPC）。尚未驗證：正式環境多人同時使用時的延遲。
