@@ -170,15 +170,11 @@ pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
 /// Discovery attempt-container blocks.
 pub mod task_sandbox;
-pub mod task_store;
-pub mod team_edition;
-pub mod team_history;
 pub mod tick_config;
 pub mod tick_headers;
 pub mod tick_source;
 pub mod tick_source_poll;
 pub mod tick_source_ws;
-pub mod trigger_route;
 // WP-E2: box-side relay client (crates/duduclaw-relay's WebSocket
 // counterpart) — reuses tick_source_ws's reconnect-backoff shape, hence the
 // grouping alongside the resident-sensing modules above.
