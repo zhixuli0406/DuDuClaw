@@ -48,6 +48,10 @@ export interface RunEvent {
 }
 
 export interface RunDetail {
+  read_only?: boolean;
+  privacy_mode?: 'own' | 'masked';
+  ner?: boolean;
+  omitted?: string[];
   run: Omit<RunSummary, 'step_count' | 'preview'>;
   events: RunEvent[];
   event_sources?: Record<string, string>;

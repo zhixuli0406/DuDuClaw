@@ -8,6 +8,7 @@ use crate::team_history::{
     reader::{self, ListFilter},
 };
 use crate::team_oversight::{self, OversightDenied, TeamOversight};
+use crate::history_privacy::handles;
 use std::collections::BTreeMap;
 
 fn error(code: &str, message: &str, retry: Option<u64>) -> WsFrame {
@@ -234,7 +235,14 @@ impl MethodHandler {
         let Some(rc) = self.reply_ctx.read().await.clone() else {
             return error("read_error", "session store unavailable", None);
         };
-        let page = match reader::list(&rc.session_manager, &scope, &filter, limit, before).await {
+        let before = match before {
+            Some(value) => match handles::resolve_cursor(&self.home_dir,&ctx.user_id,value).await {
+                Ok(raw)=>Some(raw),
+                Err(_)=>return error("invalid_cursor","refresh history",None),
+            },
+            None=>None,
+        };
+        let page = match reader::list(&rc.session_manager, &scope, &filter, limit, before.as_deref()).await {
             Ok(p) => p,
             Err(_) => {
                 return self.history_denied(
@@ -277,7 +285,10 @@ impl MethodHandler {
                     format!("{} 對話", ch.as_deref().unwrap_or("外部"))
                 }
             };
-            sessions.push(json!({"session_id":session.id,"class":class,"channel":ch,"report":report,"title":title,"title_masked":external,"last_active":session.last_active,"turns":session.turns}));
+            let handle=match handles::issue(&self.home_dir,&ctx.user_id,&session.id) {
+                Ok(handle)=>handle,Err(_)=>return error("audit_unavailable","history unavailable",None),
+            };
+            sessions.push(json!({"session_id":handle,"class":class,"channel":ch,"report":report,"title":title,"title_masked":external,"last_active":session.last_active,"turns":session.turns}));
         }
         if self.history_recheck(&db, ctx, &scope).is_err() {
             return self.history_denied(
@@ -292,9 +303,15 @@ impl MethodHandler {
         let dedup =
             serde_json::to_string(&(agent, &filter.report, &filter.class)).unwrap_or_default();
         if audit::write(&self.home_dir,"team_history_listed",&ctx.user_id,agent,json!({"viewer":ctx.user_id,"viewer_role":ctx.role,"agent":agent,"class":filter.class,"report":filter.report,"sessions":sessions.len(),"since":scope.since,"generation":scope.generation}),Some(dedup)).is_err(){return error("audit_unavailable","audit unavailable",None)}
+        let next_before=match page.next_before {
+            Some(raw)=>match handles::issue_cursor(&self.home_dir,&ctx.user_id,&raw) {
+                Ok(handle)=>Some(handle),Err(_)=>return error("audit_unavailable","history unavailable",None),
+            },
+            None=>None,
+        };
         WsFrame::ok_response(
             "",
-            json!({"sessions":sessions,"ner":ner,"since":scope.since,"next_before":page.next_before,"read_only":true}),
+            json!({"sessions":sessions,"ner":ner,"since":scope.since,"next_before":next_before,"read_only":true}),
         )
     }
 
@@ -335,6 +352,11 @@ impl MethodHandler {
                 Some(retry),
             );
         }
+        let resolved=match handles::resolve(&self.home_dir,&ctx.user_id,id).await {
+            Ok(raw)=>raw,
+            Err(_)=>return self.history_denied(ctx,"","hidden","not_found","session not found",None),
+        };
+        let id=resolved.as_str();
         let agent = match rc.session_manager.session_agent(id).await {
             Ok(Some(a)) => a,
             _ => {
@@ -463,9 +485,12 @@ impl MethodHandler {
             _ => None,
         };
         if audit::write(&self.home_dir,"team_history_viewed",&ctx.user_id,&agent,json!({"viewer":ctx.user_id,"viewer_role":ctx.role,"agent":agent,"session":digest,"class":reader::class_name(&session.class),"channel":channel(&session.class),"report":report.map(|r|&r.user_id),"via_depth":report.map(|r|r.depth),"messages":transcript.messages.len(),"masked":transcript.masked_counts,"ner":transcript.ner,"since":scope.since,"generation":scope.generation}),None).is_err(){return error("audit_unavailable","audit unavailable",None)}
+        let handle=match handles::issue(&self.home_dir,&ctx.user_id,id) {
+            Ok(handle)=>handle,Err(_)=>return error("audit_unavailable","history unavailable",None),
+        };
         WsFrame::ok_response(
             "",
-            json!({"session_id":id,"agent_id":agent,"class":reader::class_name(&session.class),"read_only":true,"ner":transcript.ner,"since":scope.since,"messages":transcript.messages,"masked_counts":transcript.masked_counts}),
+            json!({"session_id":handle,"agent_id":agent,"class":reader::class_name(&session.class),"read_only":true,"ner":transcript.ner,"since":scope.since,"messages":transcript.messages,"masked_counts":transcript.masked_counts}),
         )
     }
 

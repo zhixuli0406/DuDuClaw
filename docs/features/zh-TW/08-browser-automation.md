@@ -277,8 +277,8 @@ gateway 會解析觀看端送來的協定內容（RFB 3.7/3.8）：鍵盤、滑�
 
 ### 未涵蓋與未驗證
 
-- `-rfbportv6 -1` 修正已在發布的映像中。[v1.75.0 映像工作流程](https://github.com/zhixuli0406/DuDuClaw/actions/runs/39171117110) 在 2026-10-18 的 linux/amd64、linux/arm64 建置與使用 orchestrator 旗標的 smoke 都通過，涵蓋 unix socket relay 與 VNC TCP 未監聽；真瀏覽器 noVNC 與暫停／恢復驗收仍須分別確認。
-- 真實瀏覽器中的 noVNC 畫面、真實容器的 `docker pause`／`docker unpause` 以及對暫停中容器的 `docker rm --force` 都未驗證。
+- [v1.75.0 映像工作流程](https://github.com/zhixuli0406/DuDuClaw/actions/runs/39171117110) 在 2026-10-18 的 linux/amd64、linux/arm64 建置與 orchestrator 旗標 smoke 通過，但 RFB greeting 不代表密碼握手完成。後來的真瀏覽器測試發現 x11vnc 的 -localhost IP 白名單會拒絕名稱為 localhost 的 Unix socket 來源；尚未發布的 helper 改用 -listen 127.0.0.1，保留 root 專用 Unix socket、密碼與兩種 TCP 未監聽檢查。
+- 本機 Docker Desktop macOS arm64 的修正映像已通過實際 RFB 密碼握手與重連、錯密碼拒絕、sandbox 無法連 socket、5900–5999 未監聽與停止後 socket 移除。Chrome 經真實 gateway／noVNC 轉送看到了合成測試頁，沒有使用真網站帳號。其他瀏覽器、遠端 WSS 代理、原生 Linux／Windows 與強制移除暫停容器仍未驗證。隔離協定測試為 scripts/live-test/computer-vnc-auth.mjs，執行前須先安裝 dashboard 相依套件。
 - VNC 認證是 8 字元密碼與 DES；真正的保護是 root 專用的 unix socket 與 gateway 經過驗證、過濾的轉送。密碼會送到有權觀看者的瀏覽器。
 - 綁定該員工的主管或 Operator 看得到整個畫面（遮罩只套用在員工拿到的截圖，不套用在即時串流），包括網站顯示的內容。
 - 在唯讀與輸入模式之間切換會重啟 VNC 伺服器，正在觀看的人會斷線後重連。

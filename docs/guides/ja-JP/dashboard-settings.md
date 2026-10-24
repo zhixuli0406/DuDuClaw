@@ -1,6 +1,6 @@
 # ダッシュボード設定の対応表（v1.68.0）
 
-未リリースの Enterprise バックエンド：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。専用画面は未追加です。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
+未リリースのEnterprise設定（ユーザー管理 → 組織の設定）：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。有効にする前に職員へ通知してください。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
 
 v1.68.0 からダッシュボードで設定できる項目について、どのページにあるか、どの設定キーに書き込むか、保存後に gateway の再起動が必要かをまとめます。最後の節では、専用のコントロールがないキーを編集する「設定ファイルの詳細編集」を説明します。
 
@@ -259,3 +259,5 @@ IPv4 アドレス、担当者の鍵とデバイスの指紋、終了日時、接
 
 ターミナルでは `duduclaw credentials status`（スクリプト用に `--json`）で同じ状態を
 確認できます。詳細は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置く未リリース)。
+
+直接バインドの履歴プライバシー：`[people] bound_history_privacy = true` が既定で、欠落・不正値でも制限を維持します。移行時に Admin が詳細エディターで明示的に `false` を指定すると、従来の Viewer／Operator の広い履歴アクセスを復元できます。Owner／Admin とチャット・呼び出し権限は維持します。検索・エクスポート・添付・NER の制限は機能 68 を参照。

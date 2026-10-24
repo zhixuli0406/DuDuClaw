@@ -35,19 +35,24 @@ pub async fn authorize_artifact_access(
         .artifact_audiences(agent_id, name)
         .await
         .map_err(|_| "permission denied")?;
-    // Compatibility: retain current task packet restrictions even before a
-    // review snapshot, when the legacy provenance trail knows the task.
-    if let Some(task) = crate::artifacts::provenance_index(home, agent)
-        .get(name)
-        .and_then(|p| p.task_id.as_ref())
-    {
-        // The current packet audience is checked in the loop below.
-        bindings.push((task.clone(), Vec::new()));
-    }
-    if bindings.is_empty() {
-        return Ok(());
+    let explicit_binding = !bindings.is_empty();
+    let index=crate::artifacts::provenance_index(home,agent);
+    let provenance=index.get(name);
+    // Legacy task attribution remains a restriction, but a basename-only
+    // inferred row is never sufficient to grant a restricted reader bytes.
+    if let Some(task)=provenance.and_then(|p|p.task_id.as_ref()) {
+        bindings.push((task.clone(),Vec::new()));
     }
     let fresh = super::audience::fresh_dashboard_context(home, ctx)?;
+    if fresh.requires_password_change() {return Err("permission denied".into());}
+    if let Some(agent)=agent {
+        if crate::history_privacy::mode(home,&fresh,agent)?==crate::history_privacy::Mode::Filtered && !explicit_binding {
+            let p=provenance.ok_or("permission denied")?;
+            let own=p.channel.as_deref()==Some("webchat") && p.owner_user_id.as_deref()==Some(fresh.user_id.as_str());
+            if !own && !p.saved_task_archive {return Err("permission denied".into());}
+        }
+    } else if !fresh.is_admin() {return Err("permission denied".into());}
+    if bindings.is_empty() {return Ok(());}
     let ctx = &fresh;
     let task_store = crate::task_store::TaskStore::open(home).map_err(|_| "permission denied")?;
     for (task_id, audience) in bindings {
@@ -321,5 +326,42 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_history_tests {
+    use super::*;
+    #[tokio::test]
+    async fn conversation_archives_require_trusted_own_stamp_but_keep_owner_full() {
+        use duduclaw_auth::{UserDb,UserRole,AccessLevel};
+        let home=tempfile::tempdir().unwrap();
+        let db=UserDb::new(&home.path().join("users.db")).unwrap();
+        let user=db.create_user("bound-files@test.invalid","viewer","isolated-password",UserRole::Employee).unwrap();
+        db.bind_agent(&user.id,"sales",AccessLevel::Viewer).unwrap();
+        let ctx=db.live_user_context(&user.id).unwrap().unwrap();
+        let store=WorkflowStore::open(home.path()).unwrap();store.initialize_evidence().await.unwrap();
+        let base=home.path().join("agents/sales");std::fs::create_dir_all(base.join("attachments")).unwrap();
+        for name in ["own.txt","other.txt","external.txt","legacy.txt"] {std::fs::write(base.join("attachments").join(name),b"synthetic").unwrap();}
+        for (name,principal,channel) in [("own.txt",user.id.as_str(),"webchat"),("other.txt","someone-else","webchat"),("external.txt",user.id.as_str(),"line")] {
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(principal.into(),async {
+                crate::artifacts::record_saved(&base,&base.join("attachments").join(name),name,9,&crate::artifacts::SaveContext::uploaded(Some(channel)));
+            }).await;
+        }
+        assert!(authorize_artifact_access(home.path(),&store,&ctx,Some("sales"),"own.txt").await.is_ok());
+        for name in ["other.txt","external.txt","legacy.txt"] {assert!(authorize_artifact_access(home.path(),&store,&ctx,Some("sales"),name).await.is_err(),"{name}");}
+        let tasks=crate::task_store::TaskStore::open(home.path()).unwrap();
+        tasks.insert_task(&crate::task_store::TaskRow::new("bound-task".into(),"Synthetic".into(),"No private content".into(),"normal".into(),"sales".into(),"operator".into())).await.unwrap();
+        for (name,source) in [("task-copy.txt",Some(std::path::Path::new("/synthetic/real-copy.txt"))),("inferred-name.txt",None)] {
+            let path=base.join("attachments").join(name);std::fs::write(&path,b"synthetic").unwrap();
+            crate::artifacts::record_saved(&base,&path,name,9,&crate::artifacts::SaveContext{origin:crate::artifacts::ArtifactOrigin::Swept,task_id:Some("bound-task"),round:None,channel:None,source_path:source});
+        }
+        assert!(authorize_artifact_access(home.path(),&store,&ctx,Some("sales"),"task-copy.txt").await.is_ok());
+        assert!(authorize_artifact_access(home.path(),&store,&ctx,Some("sales"),"inferred-name.txt").await.is_err());
+        db.bind_agent(&user.id,"sales",AccessLevel::Owner).unwrap();
+        assert!(authorize_artifact_access(home.path(),&store,&ctx,Some("sales"),"other.txt").await.is_ok());
+        db.bind_agent(&user.id,"sales",AccessLevel::Viewer).unwrap();
+        std::fs::write(home.path().join("config.toml"),"[people]\nbound_history_privacy=false").unwrap();
+        assert!(authorize_artifact_access(home.path(),&store,&ctx,Some("sales"),"legacy.txt").await.is_ok());
     }
 }

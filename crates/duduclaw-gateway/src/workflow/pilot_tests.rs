@@ -38,7 +38,7 @@ fn assert_three_sources(evidence: &FixtureRunEvidence) {
         let step = &evidence.steps[i];
         assert_eq!(step.evidence_kind, ExecutionEvidenceKind::McpRead);
         let value = step.output.as_ref().unwrap();
-        let url = format!("http://example.com/p1-pilot/page-{page}");
+        let url = format!("http://1.1.1.1/p1-pilot/page-{page}");
         assert_eq!(value["url"], url);
         assert_eq!(items[i], *value);
         assert!(

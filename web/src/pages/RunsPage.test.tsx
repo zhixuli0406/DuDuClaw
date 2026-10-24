@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
@@ -180,5 +180,24 @@ describe('RunsPage — thinking step', () => {
     expect(row).toHaveTextContent('Thought for 8s · ~1.2k tokens');
     // Nothing to expand: no <details> around it.
     expect(row.closest('details')).toBeNull();
+  });
+});
+
+
+describe('RunsPage restricted history',()=>{
+  it('shows the installed-detection boundary for masked run text',async()=>{
+    mockWsClient.call.mockImplementation((method:string)=>Promise.resolve(method==='runs.get'?{...RUN_DETAIL,read_only:true,privacy_mode:'masked',ner:false,omitted:['tool_steps'],events:[{kind:'text',role:'user',ts:'2026-10-24T00:00:00Z',preview:'[PHONE_1]'}]}:{runs:[],agents:AGENTS}));
+    renderAt('/runs?run=run-42');
+    expect(await screen.findByText(/AI detection is not installed/)).toBeInTheDocument();
+  });
+  it('never installs an old account transcript after a scope switch',async()=>{
+    let resolveOld!:(v:unknown)=>void;
+    mockWsClient.call.mockImplementation((method:string)=>method==='runs.get'?new Promise(r=>{resolveOld=r;}):Promise.resolve({runs:[],agents:AGENTS}));
+    renderAt('/runs?run=run-42');
+    await waitFor(()=>expect(resolveOld).toBeTypeOf('function'));
+    const finishOld=resolveOld;
+    act(()=>useAuthStore.setState({user:{id:'new-account',display_name:'New',role:'employee',status:'active'},bindings:[]} as never));
+    await act(async()=>finishOld({...RUN_DETAIL,events:[{kind:'text',role:'user',ts:'2026-10-24T00:00:00Z',preview:'PREVIOUS ACCOUNT PRIVATE RUN'}]}));
+    expect(screen.queryByText('PREVIOUS ACCOUNT PRIVATE RUN')).not.toBeInTheDocument();
   });
 });

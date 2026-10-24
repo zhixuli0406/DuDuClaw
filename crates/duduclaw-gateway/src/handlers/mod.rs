@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 mod team_history_rpc;
+mod my_history_views_rpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -164,6 +165,9 @@ mod plans_rpc;
 mod activity_timeline_rpc;
 mod runs_rpc;
 mod chat_sessions_rpc;
+mod bound_history_rpc;
+mod bound_runs_rpc;
+mod bound_search_rpc;
 mod fork_migrate_rpc;
 mod approvals_topology_rpc;
 mod mail_rpc;
