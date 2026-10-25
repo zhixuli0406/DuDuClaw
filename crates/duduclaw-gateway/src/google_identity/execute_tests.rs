@@ -210,10 +210,13 @@ async fn credential_wait_rechecks_original_authority_before_any_service_read() {
             );
         } else {
             assert_eq!(status, 403, "{mutation}: {value}");
-            // The accepted W3 operation pins its original source before the
-            // wait. Source mutations are stale, even when their new state is
-            // also disabled; the source fence runs before fresh admission.
-            let expected = "identity_changed";
+            // Preserve the resolver-specific refusal codes: the live
+            // disabled gate precedes the source fence for Delegate and
+            // Home service-account paths.
+            let expected = match mutation {
+                "master" | "home-sa" => "disabled",
+                _ => "identity_changed",
+            };
             assert_eq!(value["code"], expected, "{mutation}: {value}");
             assert!(
                 !service_reads()
