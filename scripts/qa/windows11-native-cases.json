@@ -1,8 +1,8 @@
 {
-  "scope": "WINDOWS11_NATIVE18_LIBTEST_ONLY",
+  "scope": "WINDOWS11_NATIVE24_LIBTEST_ONLY",
   "source": {
-    "head": "a0cf1a7066bb35b6b03f20a65435b1c5f9defc7c",
-    "tree": "d202fbd21528077865c63010d715fcd0dd54c07a"
+    "head": "bc0afa8032b0d1a3a6e5f293ca1ecd041add186b",
+    "tree": "ed7bce326eb371ed569fd53fded90b8141510020"
   },
   "target": "x86_64-pc-windows-msvc",
   "source_files": {
@@ -40,6 +40,31 @@
       "sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
       "git_blob": "28e2dcd7e3e7ed2714a7ce5cde9096c2e272aed0",
       "bytes": 19092
+    },
+    "crates/duduclaw-gateway/src/google_identity/home_source/w3_observation.rs": {
+      "sha256": "40f5e9c156df4c7d18f8172479cb468a0a4ca20cdd4b0c10c21ecd01d45ef919",
+      "git_blob": "8e2428b61d308d8354f6ad4b16e8c066e53cfe69",
+      "bytes": 21394
+    },
+    "crates/duduclaw-gateway/src/google_identity/home_source/w3_windows_identity.rs": {
+      "sha256": "a14caa021f0a22f56d7dbda98c3a7d15f5a3d131611cdc5e091a822a067ed2a1",
+      "git_blob": "25ae72ef85644122927c99041276674258e311d7",
+      "bytes": 2866
+    },
+    "crates/duduclaw-gateway/src/computer_use_sessions/tests.rs": {
+      "sha256": "f02f6dba82bc1b19943d70e7e1df83155235cc2a6f5b114cbaa7558e2860f060",
+      "git_blob": "67e16cb2075f565eb57a75e98f6aed8842abb29b",
+      "bytes": 96855
+    },
+    "crates/duduclaw-gateway/src/computer_use_sessions/tests/action_boundary.rs": {
+      "sha256": "79469eea9cfd948d2f2f4116ae07ee6d3918779cc91d7ed73fd59f74906cd929",
+      "git_blob": "c2a10ba7db7af00193f9a843a15f66bade0d4831",
+      "bytes": 9273
+    },
+    "crates/duduclaw-gateway/src/computer_use_sessions/mod.rs": {
+      "sha256": "4ff8df57b389a1fd8d44eeeb9efb510f26c47a034aea479c95f5a928ff5dec39",
+      "git_blob": "5ef810af9c18bfa918242495421ad41eb7b4f6af",
+      "bytes": 98469
     }
   },
   "cases": [
@@ -168,6 +193,48 @@
       "source": "crates/duduclaw-fork/src/test_runner.rs",
       "source_sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
       "function_line": 442
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "google_identity::home_source::w3_observation::w3_source_oracles::w3_source_capture_detects_equal_bytes_replaced_inode",
+      "source": "crates/duduclaw-gateway/src/google_identity/home_source/w3_observation.rs",
+      "source_sha256": "40f5e9c156df4c7d18f8172479cb468a0a4ca20cdd4b0c10c21ecd01d45ef919",
+      "function_line": 488
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "google_identity::home_source::w3_observation::w3_source_oracles::w3_windows_unchanged_file_validates_and_missing_identity_refuses",
+      "source": "crates/duduclaw-gateway/src/google_identity/home_source/w3_observation.rs",
+      "source_sha256": "40f5e9c156df4c7d18f8172479cb468a0a4ca20cdd4b0c10c21ecd01d45ef919",
+      "function_line": 520
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "google_identity::home_source::w3_observation::w3_source_oracles::w3_windows_directory_replacement_refuses_the_original_snapshot",
+      "source": "crates/duduclaw-gateway/src/google_identity/home_source/w3_observation.rs",
+      "source_sha256": "40f5e9c156df4c7d18f8172479cb468a0a4ca20cdd4b0c10c21ecd01d45ef919",
+      "function_line": 533
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "google_identity::home_source::w3_observation::windows_identity::tests::windows_file_id_query_failure_never_yields_identity",
+      "source": "crates/duduclaw-gateway/src/google_identity/home_source/w3_windows_identity.rs",
+      "source_sha256": "a14caa021f0a22f56d7dbda98c3a7d15f5a3d131611cdc5e091a822a067ed2a1",
+      "function_line": 87
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "computer_use_sessions::tests::listed_tools_need_a_human_decision_and_the_session_survives_the_wait",
+      "source": "crates/duduclaw-gateway/src/computer_use_sessions/tests.rs",
+      "source_sha256": "f02f6dba82bc1b19943d70e7e1df83155235cc2a6f5b114cbaa7558e2860f060",
+      "function_line": 1566
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "computer_use_sessions::tests::action_boundary::live_gates_after_durable_begin_refuse_before_any_backend_action",
+      "source": "crates/duduclaw-gateway/src/computer_use_sessions/tests/action_boundary.rs",
+      "source_sha256": "79469eea9cfd948d2f2f4116ae07ee6d3918779cc91d7ed73fd59f74906cd929",
+      "function_line": 93
     }
   ],
   "artifacts_expected": [
@@ -203,7 +270,7 @@
     "debug_assertions": true,
     "overflow_checks": true
   },
-  "schema": "duduclaw-native18-cases-v1",
+  "schema": "duduclaw-native24-cases-v1",
   "inputs": {
     "Cargo.toml": {
       "sha256": "7fc89f4b548c0af36dad364d6e63cd0a4edbf4ce2fe0db0e0470baf3554a983d",

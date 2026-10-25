@@ -8,10 +8,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ProductHead = 'a0cf1a7066bb35b6b03f20a65435b1c5f9defc7c'
-$ProductTree = 'd202fbd21528077865c63010d715fcd0dd54c07a'
+$ProductHead = 'bc0afa8032b0d1a3a6e5f293ca1ecd041add186b'
+$ProductTree = 'ed7bce326eb371ed569fd53fded90b8141510020'
 $TargetTriple = 'x86_64-pc-windows-msvc'
-$Scope = 'WINDOWS11_NATIVE18_LIBTEST_ONLY'
+$Scope = 'WINDOWS11_NATIVE24_LIBTEST_ONLY'
 $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $ToolsRoot = [IO.Path]::GetFullPath($PSScriptRoot)
@@ -172,12 +172,12 @@ function Assets-Manifest() {
 
 Require ($IsWindows -and [Environment]::Is64BitProcess) 'The builder requires native x64 Windows'
 Require ($WorkflowHead -cmatch '^[0-9a-f]{40}$' -and $WorkflowHead -ceq $env:GITHUB_SHA -and $WorkflowHead -cne $ProductHead) 'Workflow commit is not its distinct github.sha'
-Require ($env:GITHUB_EVENT_NAME -ceq 'push' -and $env:GITHUB_REF -ceq 'refs/heads/chore/windows11-a0cf-artifacts-20261025') 'Builder event/ref is not authorized'
+Require ($env:GITHUB_EVENT_NAME -ceq 'push' -and $env:GITHUB_REF -ceq 'refs/heads/chore/windows11-acceptance-artifacts-20261025') 'Builder event/ref is not authorized'
 Require ($env:GITHUB_RUN_ID -cmatch '^\d+$' -and $env:GITHUB_RUN_ATTEMPT -cmatch '^\d+$') 'Invalid workflow run identity'
 Require ($RepositoryRoot -ieq [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)) 'Unexpected repository root'
 Assert-Under $ToolsRoot $env:RUNNER_TEMP
 Assert-Under $OutputDirectory $env:RUNNER_TEMP
-Require ([IO.Path]::GetFileName($OutputDirectory) -ceq "native18-a0cf1a70-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT") 'Unexpected artifact directory'
+Require ([IO.Path]::GetFileName($OutputDirectory) -ceq "native24-bc0afa80-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT") 'Unexpected artifact directory'
 Require (-not (Test-Path -LiteralPath $OutputDirectory)) 'One-shot artifact directory already exists'
 Assert-NormalPath $RepositoryRoot $false
 Assert-NormalPath $ToolsRoot $false
@@ -189,11 +189,11 @@ foreach ($entry in @{ CARGO_BUILD_JOBS = '1'; CARGO_PROFILE_DEV_DEBUG = '0'; CAR
 }
 $env:CARGO_TARGET_DIR = $TargetRoot
 $Inventory = Read-Json (Join-Path $ToolsRoot 'cases.json')
-Require ($Inventory.schema -ceq 'duduclaw-native18-cases-v1' -and $Inventory.scope -ceq $Scope) 'Wrong portable case inventory'
+Require ($Inventory.schema -ceq 'duduclaw-native24-cases-v1' -and $Inventory.scope -ceq $Scope) 'Wrong portable case inventory'
 Require ($Inventory.source.head -ceq $ProductHead -and $Inventory.source.tree -ceq $ProductTree -and $Inventory.target -ceq $TargetTriple) 'Wrong case source or target'
-Require ($Inventory.source_files.Count -eq 7 -and $Inventory.cases.Count -eq 18 -and @($Inventory.cases.name | Sort-Object -Unique).Count -eq 18) 'Expected exactly seven source files and eighteen unique names'
+Require ($Inventory.source_files.Count -eq 12 -and $Inventory.cases.Count -eq 24 -and @($Inventory.cases.name | Sort-Object -Unique).Count -eq 24) 'Expected exactly twelve source files and twenty-four unique names'
 Require ($Inventory.inputs.Count -eq 7) 'Expected the fixed Cargo and frontend input inventory'
-foreach ($group in @{ 'cli-libtest' = 7; 'gateway-libtest' = 4; 'fork-libtest' = 7 }.GetEnumerator()) {
+foreach ($group in @{ 'cli-libtest' = 7; 'gateway-libtest' = 10; 'fork-libtest' = 7 }.GetEnumerator()) {
     Require (@($Inventory.cases | Where-Object { $_.artifact -ceq $group.Key }).Count -eq $group.Value) 'Native case group counts differ'
 }
 $LockSha = $Inventory.inputs['Cargo.lock'].sha256
@@ -232,7 +232,7 @@ foreach ($spec in @(@{ id = 'rustc'; exe = $Rustc }, @{ id = 'cargo'; exe = $Car
     $evidence.Add($stdout); $evidence.Add($stderr)
 }
 Require (([IO.File]::ReadAllText((Join-Path $OutputDirectory 'rustc-vV.txt'))) -cmatch '(?m)^host: x86_64-pc-windows-msvc\r?$') 'Unexpected Rust host target'
-Write-Json (Join-Path $OutputDirectory 'toolchain.json') ([ordered]@{ schema = 'native18-toolchain-v1'; target = $TargetTriple; rustc = @{ path = $Rustc; version_file = 'rustc-vV.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'rustc-vV.txt') }; cargo = @{ path = $Cargo; version_file = 'cargo-vV.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'cargo-vV.txt') }; node = @{ version_file = 'node-version.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'node-version.txt') }; npm = @{ version_file = 'npm-version.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'npm-version.txt') }; probes = $toolRecords; powershell_version = $PSVersionTable.PSVersion.ToString(); runner_os = $env:RUNNER_OS; runner_arch = $env:RUNNER_ARCH })
+Write-Json (Join-Path $OutputDirectory 'toolchain.json') ([ordered]@{ schema = 'native24-toolchain-v1'; target = $TargetTriple; rustc = @{ path = $Rustc; version_file = 'rustc-vV.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'rustc-vV.txt') }; cargo = @{ path = $Cargo; version_file = 'cargo-vV.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'cargo-vV.txt') }; node = @{ version_file = 'node-version.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'node-version.txt') }; npm = @{ version_file = 'npm-version.txt'; version_sha256 = File-Sha (Join-Path $OutputDirectory 'npm-version.txt') }; probes = $toolRecords; powershell_version = $PSVersionTable.PSVersion.ToString(); runner_os = $env:RUNNER_OS; runner_arch = $env:RUNNER_ARCH })
 $evidence.Add('toolchain.json')
 $assetsBefore = Assets-Manifest
 Write-Json (Join-Path $OutputDirectory 'assets-manifest.json') $assetsBefore
@@ -296,5 +296,5 @@ foreach ($file in Get-ChildItem -LiteralPath $OutputDirectory -Force -Recurse -F
     Require ($allowlist -ccontains $relative) 'Unexpected artifact file'
     Assert-NormalPath $file.FullName $true
 }
-Write-Json (Join-Path $OutputDirectory 'manifest.json') ([ordered]@{ schema = 'duduclaw-native18-build-v1'; scope = $Scope; source = @{ head = $ProductHead; tree = $ProductTree }; target = $TargetTriple; source_files = $Inventory.source_files; cases = $Inventory.cases; artifacts = $artifacts.ToArray(); evidence_files = $evidenceFiles; workflow = @{ head = $WorkflowHead; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT; basename = 'workflow.yml'; sha256 = $evidenceFiles['workflow.yml']; collector = @{ basename = 'collector.ps1'; sha256 = $evidenceFiles['collector.ps1'] }; cases = @{ basename = 'cases.json'; sha256 = $evidenceFiles['cases.json'] } }; cargo_lock_sha256 = $LockSha; build_inputs = $Inventory.inputs; source_copy_stat = $sourceProofs; commands = $commands.ToArray(); current_source_Cargo_validated_libtests = $true; fresh_true_allowed_not_claimed_new_compilation = $true; build_only = $true; shipping_binary = $false; candidate_executed = $false; release_approved = $false; GUI_or_provider_acceptance = $false })
+Write-Json (Join-Path $OutputDirectory 'manifest.json') ([ordered]@{ schema = 'duduclaw-native24-build-v1'; scope = $Scope; source = @{ head = $ProductHead; tree = $ProductTree }; target = $TargetTriple; source_files = $Inventory.source_files; cases = $Inventory.cases; artifacts = $artifacts.ToArray(); evidence_files = $evidenceFiles; workflow = @{ head = $WorkflowHead; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT; basename = 'workflow.yml'; sha256 = $evidenceFiles['workflow.yml']; collector = @{ basename = 'collector.ps1'; sha256 = $evidenceFiles['collector.ps1'] }; cases = @{ basename = 'cases.json'; sha256 = $evidenceFiles['cases.json'] } }; cargo_lock_sha256 = $LockSha; build_inputs = $Inventory.inputs; source_copy_stat = $sourceProofs; commands = $commands.ToArray(); current_source_Cargo_validated_libtests = $true; fresh_true_allowed_not_claimed_new_compilation = $true; build_only = $true; shipping_binary = $false; candidate_executed = $false; release_approved = $false; GUI_or_provider_acceptance = $false })
 Write-Host 'Validated three current-source Cargo libtests; no generated executable was run.'
