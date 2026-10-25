@@ -1564,6 +1564,26 @@ fn decide_when_pending(
 
 #[tokio::test]
 async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() {
+    async fn pending_for(
+        broker: &crate::approval::ApprovalBroker,
+        tool: &str,
+        deadline: tokio::time::Instant,
+    ) -> crate::approval::ApprovalRecord {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let pending = broker.list_pending(Some("alice")).await.unwrap();
+                if let Some(rec) = pending.first() {
+                    assert_eq!(pending.len(), 1);
+                    assert_eq!(rec.payload["tool"], tool);
+                    return rec.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real pending approval must appear within the fixture TTL")
+    }
+
     let tmp = home();
     let h = tmp.path();
     let state = Arc::new(FakeState::default());
@@ -1575,34 +1595,80 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         "[capabilities]\ncomputer_use = true\napproval_required_tools = [\"computer_click\"]\n\
          irreversible_tools = [\"computer_type\"]\nmaybe_irreversible_tools = [\"computer_key\"]\n",
     );
+    assert_eq!(mgr.approval_ttl_secs, 5);
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(u64::try_from(mgr.approval_ttl_secs).unwrap());
 
-    // Approved after longer than the idle timeout: the reaper leaves the
-    // session alone during the wait and the action runs.
-    let decider = decide_when_pending(h.to_path_buf(), "alice", true, Duration::from_millis(250));
-    let reaper = async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        mgr.reap_once().await
+    // These borrowed futures have no background tasks. On failure or expiry,
+    // dropping the shared five-second scope cancels every pending waiter.
+    let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+    let (reaped_tx, reaped_rx) = tokio::sync::oneshot::channel();
+    let entry = mgr.entry("alice").unwrap();
+    let decider = async {
+        let broker = crate::approval::ApprovalBroker::open(h).unwrap();
+        let rec = pending_for(&broker, "computer_click", deadline).await;
+        assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 1);
+        pending_tx.send(()).expect("the reaper is still waiting");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        reaped_rx.await.expect("the pending session passed its reaper check");
+        broker.decide(&rec.id, true, "test-operator").await.unwrap();
+        rec.summary
     };
-    let (done, reaped) = tokio::join!(
-        async {
-            let req = click(1, 1);
-            mgr.action("alice", None, None, &req).await
-        },
-        reaper
-    );
+    let reaper = async {
+        pending_rx.await.expect("the action reached a real pending approval");
+        assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 1);
+        assert!(entry.session.try_lock().is_ok(), "approval holds no session lock");
+        assert!(state.executed.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        {
+            let session = entry.session.try_lock().expect("pending wait stays unlocked");
+            assert!(session.last_activity.elapsed() >= Duration::from_millis(100));
+            assert!(!session.ended);
+            assert_eq!(session.actions_used, 0);
+        }
+        assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 1);
+        assert!(state.executed.lock().unwrap().is_empty());
+        let reaped = mgr.reap_once().await;
+        assert_eq!(reaped, 0, "the pending session must survive before the decision");
+        assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 1);
+        assert!(entry.session.try_lock().is_ok(), "the reaper released its lock");
+        assert!(state.executed.lock().unwrap().is_empty());
+        reaped_tx.send(()).expect("the human decision is still waiting");
+        reaped
+    };
+    let (done, reaped, summary) = tokio::time::timeout_at(deadline, async {
+        tokio::join!(
+            async {
+                let req = click(1, 1);
+                mgr.action("alice", None, None, &req).await
+            },
+            reaper,
+            decider
+        )
+    })
+    .await
+    .expect("the approval and reaper must finish within the original fixture TTL");
     assert_eq!(reaped, 0, "a pending approval is not idleness");
     assert_eq!(done.unwrap()["actions_used"], 1);
-    let summary = decider.await.unwrap();
     assert!(summary.contains("computer_click"), "{summary}");
+    assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 0);
 
     // Denied: refused, nothing runs. Typed text never reaches the summary.
-    let decider = decide_when_pending(h.to_path_buf(), "alice", false, Duration::ZERO);
-    let err = mgr
-        .action("alice", None, None, &typed("hunter2"))
-        .await
-        .unwrap_err();
+    let decider = async {
+        let broker = crate::approval::ApprovalBroker::open(h).unwrap();
+        let rec = pending_for(&broker, "computer_type", deadline).await;
+        tokio::time::sleep(Duration::ZERO).await;
+        broker.decide(&rec.id, false, "test-operator").await.unwrap();
+        rec.summary
+    };
+    let request = typed("hunter2");
+    let (denied, summary) = tokio::time::timeout_at(deadline, async {
+        tokio::join!(mgr.action("alice", None, None, &request), decider)
+    })
+    .await
+    .expect("the denial must finish within the original fixture TTL");
+    let err = denied.unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalDenied);
-    let summary = decider.await.unwrap();
     assert!(
         summary.contains("7 個字元") && !summary.contains("hunter2"),
         "{summary}"
@@ -1612,15 +1678,18 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
     let mut quick = manager(h, &state, IDLE_TIMEOUT);
     quick.approval_ttl_secs = 1;
     insert_session(&quick, &state, "alice", ComputerUseConfig::default());
-    let err = quick
-        .action(
+    let err = tokio::time::timeout_at(
+        deadline,
+        quick.action(
             "alice",
             None,
             None,
             &ActionRequest::Key { key: "Tab".into() },
-        )
-        .await
-        .unwrap_err();
+        ),
+    )
+    .await
+    .expect("the original one-second expiry must finish within the fixture TTL")
+    .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalDenied);
     assert_eq!(
         state.executed.lock().unwrap().len(),
