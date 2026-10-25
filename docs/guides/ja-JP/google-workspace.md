@@ -156,7 +156,7 @@ default_identity = "home"   # [google] のない社員が使うもの：home（�
 allowed_subject_domains = ["customer.com"]
 ```
 
-`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` にするとその社員から 19 個の Google ツールが見えなくなり、呼び出しも拒否されます。読めない値（入力ミス、知らない項目）はその社員の Google をすべて拒否し、共用アカウントに切り替わることはありません。`owner` と `user:<id>`（社員が担当者自身の接続したアカウントを使う）は今後のリリース用で、現在は拒否されます。
+`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 19 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（未リリース）](google-personal-connections.md)を参照してください。
 
 ### この社員を通じて誰がアカウントを使えるか
 

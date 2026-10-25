@@ -19,7 +19,11 @@ fn err(frame: &WsFrame) -> String {
             ok: false,
             error: Some(e),
             ..
-        } => e.as_str().unwrap_or_default().to_string(),
+        } => e
+            .as_str()
+            .or_else(|| e.get("message").and_then(Value::as_str))
+            .expect("refusal must carry a user-facing message")
+            .to_string(),
         other => panic!("expected error, got {other:?}"),
     }
 }
@@ -201,10 +205,16 @@ async fn admin_sets_a_delegate_within_the_allowed_domains() {
         text.contains("identity = \"delegate:alice@c.test\""),
         "{text}"
     );
-    // B2b selectors and an unconfirmed `anyone` are refused.
+    // Personal edition rejects B2b selectors with the structured edition gate.
+    h.set_edition_override(Some(duduclaw_core::EditionProfile::Personal)).await;
+    for selector in ["owner", "user:u1"] {
+        let frame = call(&h, "agents.google_identity_set", json!({"agent_id":"bot","identity":selector}), &admin).await;
+        assert!(!err(&frame).is_empty());
+        let WsFrame::Response { ok: false, error: Some(error), .. } = frame else { panic!("expected edition refusal") };
+        assert_eq!(error["code"], super::super::gates::ENTERPRISE_ONLY_ERROR_CODE);
+    }
+    // Unconfirmed widening and malformed or missing targets stay refused.
     for params in [
-        json!({"agent_id": "bot", "identity": "owner"}),
-        json!({"agent_id": "bot", "identity": "user:u1"}),
         json!({"agent_id": "bot", "identity": "delegate:alice@c.test", "requesters": "anyone"}),
         json!({"agent_id": "bot", "identity": "delegate:not-an-email"}),
         json!({"agent_id": "ghost", "identity": "none"}),

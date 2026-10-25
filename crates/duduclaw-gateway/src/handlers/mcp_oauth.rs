@@ -110,6 +110,10 @@ impl MethodHandler {
 
     /// Start an OAuth flow: generate PKCE, store pending state, return auth URL.
     pub(crate) async fn handle_mcp_oauth_start(&self, params: Value) -> WsFrame {
+        let _grant_lease = match crate::google_personal::grants::acquire(&self.home_dir).await {
+            Ok(lease) => lease,
+            Err(message) => return WsFrame::error_response("", &message),
+        };
         use crate::mcp_oauth;
 
         let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {

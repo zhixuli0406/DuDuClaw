@@ -281,6 +281,8 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## ドキュメント
 
+Enterprise の個人 Google 接続（未リリース）：本人が接続し、社員ごとに利用を許可・解除できます。[自分の接続](docs/guides/ja-JP/google-personal-connections.md)を参照してください。
+
 - [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：未リリースのEnterprise画面とAPI。部下のWebChatとマスクした外部会話を、職員向け通知、有効期間、必須監査とともに提供します。 直接 Viewer／Operator は本人の WebChat を全文、外部をマスク、他人を非表示とします。Owner／Admin の全文権限は維持し、移行設定を用意します。
 - **会話を閲覧した人**では、自分のチーム閲覧記録のみを確認できます（[説明](docs/features/ja-JP/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体

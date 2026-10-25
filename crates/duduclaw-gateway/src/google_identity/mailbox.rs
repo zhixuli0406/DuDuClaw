@@ -15,6 +15,7 @@ pub enum Reader {
     Admin,
     Manager { email: Option<String> },
     Person { email: String },
+    PersonAccounts { emails: Vec<String>, manager: bool },
 }
 
 impl Reader {
@@ -33,10 +34,11 @@ impl Reader {
                     Self::Manager { email: Some(email) } | Self::Person { email } => {
                         email.eq_ignore_ascii_case(account)
                     }
+                    Self::PersonAccounts { emails, .. } => emails.iter().any(|email| email.eq_ignore_ascii_case(account)),
                     _ => false,
                 }
             }
-            None => matches!(self, Self::Manager { .. }),
+            None => matches!(self, Self::Manager { .. } | Self::PersonAccounts { manager: true, .. }),
         }
     }
 }

@@ -222,6 +222,12 @@ async fn serve(
                 })?;
             (backend, String::new(), fallback, notice)
         }
+        Ok(Resolved::Personal { .. }) => {
+            return Err(Refusal::hard(
+                "personal_external_unsupported",
+                "這條專用外部連線尚未支援個人 Google 帳號。",
+            ));
+        }
         Err(error) => return Err(error),
     };
     // Minting/refresh may await a provider; revocation during that wait must

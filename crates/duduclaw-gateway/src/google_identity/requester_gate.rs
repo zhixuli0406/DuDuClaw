@@ -31,6 +31,7 @@ pub struct Person {
 
 /// The account directory the gate reads. A lookup failure is "nobody".
 pub trait People: Send + Sync {
+    fn user_db(&self) -> Option<&UserDb> { None }
     fn by_id(&self, user_id: &str) -> Option<Person>;
     fn by_email(&self, email: &str) -> Result<Option<Person>, Refusal>;
     fn bound(&self, user_id: &str, agent: &str) -> bool;
@@ -49,6 +50,7 @@ fn person(u: duduclaw_auth::models::User) -> Person {
 }
 
 impl People for UserDbPeople {
+    fn user_db(&self) -> Option<&UserDb> { Some(self.0.as_ref()) }
     fn by_id(&self, user_id: &str) -> Option<Person> {
         self.0.get_user(user_id).ok().flatten().map(person)
     }
