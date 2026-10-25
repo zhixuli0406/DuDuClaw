@@ -14,6 +14,7 @@ mod users_change_email_tests;
 mod live_acl_tests;
 mod team_callable_rpc_tests;
 mod team_history_rpc_tests;
+mod computer_team_rpc_tests;
 mod team_rpc_tests;
 mod assign_schedule_rpc_tests;
 mod data_file_guard_field_tests;

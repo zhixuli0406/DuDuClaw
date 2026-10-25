@@ -227,6 +227,7 @@ pub(super) async fn build_reply_with_session_inner(
     // A called employee answers in its own session bucket of this
     // conversation (history, redaction vault, pending goal state); the
     // access gate and takeover above ran on the conversation itself.
+    let source_conversation = session_id;
     let called_sid;
     let own_bot = crate::trigger_route::in_own_bot_turn();
     let session_id: &str = match agent {
@@ -236,6 +237,11 @@ pub(super) async fn build_reply_with_session_inner(
         }
         _ => session_id,
     };
+    if let Some(a) = agent {
+        crate::computer_use_sessions::attended::bind_final_route(
+            source_conversation, session_id, &a.config.agent.name, &turn_id,
+        );
+    }
     if let Some(a) = agent {
         crate::trigger_route::record_answered_by(crate::trigger_route::AnsweredBy {
             id: a.config.agent.name.clone(),
@@ -260,6 +266,7 @@ pub(super) async fn build_reply_with_session_inner(
         ctx,
         agent.map(|a| a.config.agent.name.as_str()),
         session_id,
+        &turn_id,
     )
     .await
     {

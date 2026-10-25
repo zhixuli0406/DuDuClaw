@@ -60,6 +60,18 @@ fn start_ws(spec: &str) -> StartRequest {
     }
 }
 
+#[tokio::test]
+async fn cached_oversight_refuses_a_fenced_workspace_before_the_reaper() {
+    let tmp=ws_home(); let state=Arc::new(FakeState::default()); let runtime=rt();
+    let mgr=ws_mgr(tmp.path(),&state,&runtime);
+    let workspace=new_ws(&mgr,"alice").await;
+    let id=mgr.entry("alice").unwrap().session_id;
+    mgr.screenshot("alice",Some(&id)).await.unwrap();
+    WorkspaceStore::open(tmp.path()).unwrap().fence(&workspace,"operator:test","revoke").unwrap();
+    let session=mgr.lookup("alice").unwrap(); let _busy=session.lock().await;
+    assert!(tokio::time::timeout(Duration::from_millis(250),mgr.masked_snapshot("alice",&id)).await.unwrap().is_err());
+}
+
 fn err(r: Result<Value, OpError>) -> OpError {
     r.unwrap_err()
 }

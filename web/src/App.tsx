@@ -29,6 +29,7 @@ const RunsPage = lazyPage(() => import('./pages/RunsPage'), 'RunsPage');
 const CanvasPage = lazyPage(() => import('./pages/CanvasPage'), 'CanvasPage');
 const FilesPage = lazyPage(() => import('./pages/FilesPage'), 'FilesPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
+const ComputerWatchPage = lazyPage(() => import('./pages/ComputerWatchPage'), 'ComputerWatchPage');
 const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
 const ExpertsPage = lazyPage(() => import('./pages/ExpertsPage'), 'ExpertsPage');
 const GalleryPage = lazyPage(() => import('./pages/GalleryPage'), 'GalleryPage');
@@ -288,6 +289,7 @@ export function App() {
               <Route path="world" element={<WorldPage />} />
               <Route path="agents/:id" element={<AgentDetailPage />} />
               <Route path="agents/:id/:tab" element={<AgentDetailPage />} />
+              <Route path="computer/:agentId" element={<ComputerWatchPage />} />
               <Route path="memory" element={<MemoryPage />} />
               <Route path="growth" element={<GrowthPage />} />
               {/* 桌寵工作室 — photo → interactive desktop pet (WP-P2/P3). */}

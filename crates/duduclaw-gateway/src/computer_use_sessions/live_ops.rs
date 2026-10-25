@@ -477,6 +477,18 @@ impl ComputerUseSessions {
         ctx: &UserContext,
         keep_login: bool,
     ) -> Result<Value, OpError> {
+        self.live_stop_with_login_bound(agent_id, ctx, keep_login, None).await
+    }
+
+    /// Preserve the confirmation fence even if live access changed from
+    /// team viewing to a direct binding while the confirmation was open.
+    pub(crate) async fn live_stop_with_login_bound(
+        &self,
+        agent_id: &str,
+        ctx: &UserContext,
+        keep_login: bool,
+        expected: Option<&str>,
+    ) -> Result<Value, OpError> {
         let may_keep = || {
             live_identity(&self.home, ctx)
                 .is_some_and(|live| live_view::authorize(&live, agent_id, LiveAction::Control))
@@ -484,9 +496,38 @@ impl ComputerUseSessions {
         if keep_login && !may_keep() {
             return Err(OpError::new(ErrorCode::Forbidden, "permission denied"));
         }
-        let entry = self.entry(agent_id).ok_or_else(no_session)?;
+        let entry = self.live_entry(agent_id, expected).ok_or_else(no_session)?;
+        self.stop_live_entry(agent_id, entry, ctx, keep_login).await
+    }
+
+    /// A team stop is bound to the session the manager actually inspected.
+    pub(crate) async fn live_stop_expected(
+        &self,
+        agent_id: &str,
+        expected: &str,
+        ctx: &UserContext,
+    ) -> Result<Value, OpError> {
+        self.live_stop_with_login_bound(agent_id, ctx, false, Some(expected)).await
+    }
+
+    async fn stop_live_entry(
+        &self,
+        agent_id: &str,
+        entry: Entry,
+        ctx: &UserContext,
+        keep_login: bool,
+    ) -> Result<Value, OpError> {
+        let may_keep = || {
+            live_identity(&self.home, ctx)
+                .is_some_and(|live| live_view::authorize(&live, agent_id, LiveAction::Control))
+        };
         let operator = operator_label(ctx);
-        self.audit_operator(agent_id, "operator_stop", json!({"session_id": entry.session_id}), &operator);
+        self.audit_operator(
+            agent_id,
+            "operator_stop",
+            json!({"session_id": entry.session_id}),
+            &operator,
+        );
         entry.control.stopped.store(true, Ordering::Release);
         let mut ended = false;
         if let Ok(mut session) =
