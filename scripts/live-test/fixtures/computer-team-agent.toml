@@ -1,0 +1,55 @@
+[agent]
+name = "alice"
+display_name = "Native browser fixture"
+role = "worker"
+status = "active"
+trigger = "@native-fixture"
+reports_to = ""
+icon = "x"
+
+[model]
+preferred = "fixture"
+fallback = "fixture"
+account_pool = []
+
+[runtime]
+provider = "openai_compat"
+
+[container]
+timeout_ms = 60000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 0
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = false
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+permissions_enforced_since = "1.68.0"
+
+[evolution]
+gvu_enabled = false
+strategy = "balanced"
+max_silence_hours = 12.0
+
+[capabilities]
+computer_use = true
+allowed_tools = ["mcp__duduclaw__computer_session_start", "mcp__duduclaw__computer_session_stop", "mcp__duduclaw__computer_session_status", "mcp__duduclaw__computer_screenshot"]
+denied_tools = ["Bash", "WebFetch"]
+
+[capabilities.computer_use_config]
+keep_alive_minutes = 10

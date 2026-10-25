@@ -799,6 +799,12 @@ impl ComputerUseOrchestrator {
             .as_ref()
             .is_none_or(|p| p.valid_owner().unwrap_or(false))
     }
+    pub(crate) fn login_owner_check(&self) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
+        self.profile.as_ref().map_or_else(
+            || std::sync::Arc::new(|| true) as std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+            |profile| profile.owner_check(),
+        )
+    }
     pub(crate) fn discard_login(&mut self) {
         self.control
             .discard_login

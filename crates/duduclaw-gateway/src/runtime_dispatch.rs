@@ -143,7 +143,10 @@ pub struct AgentPrompt<'a> {
     )
 )]
 pub async fn run_agent_prompt_detailed(req: AgentPrompt<'_>) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
-    crate::on_behalf_of::context::scope(req.home_dir, req.agent_id, run_agent_prompt_inner(req)).await
+    crate::computer_use_sessions::attended_call::runtime_scope(
+        req.request_type == RequestType::Chat,
+        crate::on_behalf_of::context::scope(req.home_dir, req.agent_id, run_agent_prompt_inner(req)),
+    ).await
 }
 
 /// Backward-compatible String view; execution/usage happens only in detailed.
@@ -748,6 +751,10 @@ pub async fn run_utility_prompt_with_hint(
 pub fn hint_opts_out_of_cross_family_failover(hint: Option<&UtilityModelHint>) -> bool {
     hint.is_some()
 }
+
+#[cfg(test)]
+#[path = "runtime_dispatch_attended_tests.rs"]
+mod attended_entry_tests;
 
 #[cfg(test)]
 mod hint_tests {

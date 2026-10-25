@@ -39,6 +39,8 @@
 //!   cannot cancel.
 
 pub mod actions;
+pub(crate) mod attended;
+pub(crate) mod attended_call;
 pub mod auth;
 mod backend;
 pub mod gates;
@@ -47,6 +49,7 @@ pub mod keepalive;
 pub(crate) mod live_ops;
 pub mod live_view;
 pub mod navigation;
+pub(crate) mod oversight;
 pub mod rfb;
 pub mod sweep;
 pub mod turns;
@@ -444,6 +447,10 @@ pub struct StartRequest {
 /// State an approval wait updates without taking the session lock.
 #[derive(Default)]
 pub(crate) struct SessionShared {
+    /// Captured from the host's live requester registry, never tool arguments.
+    pub(crate) origin: OnceLock<oversight::SessionOrigin>,
+    pub(crate) login_owner_check: OnceLock<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    pub(crate) snapshot: std::sync::Mutex<Option<oversight::CachedSnapshot>>,
     /// Approvals currently awaited for this session's employee. While one
     /// is pending the session does not count as idle.
     approvals_waiting: AtomicU32,
@@ -738,6 +745,7 @@ impl ComputerUseSessions {
     /// Insert a ready session (tests use this to skip the container start).
     pub(crate) fn insert(&self, session: ManagedSession) -> SessionRef {
         let agent = session.agent_id.clone();
+        let _ = session.shared.login_owner_check.set(session.backend.login_owner_check());
         let _ = session.shared.live.meta.set(live_view::SessionMeta {
             max_actions: session.config.max_actions,
             deadline: session.deadline,
@@ -1079,6 +1087,7 @@ impl ComputerUseSessions {
     }
 
     pub async fn start(&self, agent_id: &str, req: StartRequest) -> Result<Value, OpError> {
+        let origin = oversight::SessionOrigin::capture_live_turn(agent_id, req.turn_id.as_deref());
         if crate::ephemeral::is_ephemeral_id(agent_id) {
             return Err(OpError::new(
                 ErrorCode::Forbidden,
@@ -1243,6 +1252,7 @@ impl ComputerUseSessions {
             nav_hosts: nav_hosts.clone(),
             nav_configured: !nav.hosts.is_empty(),
         };
+        let _ = session.shared.origin.set(origin);
         let task = req
             .task
             .as_deref()
@@ -1295,6 +1305,12 @@ impl ComputerUseSessions {
     ) -> Result<Value, OpError> {
         self.admit(agent_id, gates::TOOL_SCREENSHOT, "", &json!({})).await?;
         let mut session = self.locked(agent_id, session_id).await?;
+        self.capture_masked(&mut session).await
+    }
+
+    /// Shared masking pipeline; callers establish authority and session liveness.
+    async fn capture_masked(&self, session: &mut ManagedSession) -> Result<Value, OpError> {
+        let agent_id = session.agent_id.clone();
         let shot = session.backend.screenshot().await;
         let now = Instant::now();
         session.last_activity = now;
@@ -1339,7 +1355,7 @@ impl ComputerUseSessions {
             Err(_) => None,
         };
         self.audit_line(
-            agent_id,
+            &agent_id,
             "screenshot",
             json!({
                 "session_id": session.session_id,
@@ -1358,6 +1374,12 @@ impl ComputerUseSessions {
         body["fully_masked"] = json!(fully_masked);
         body["mask_reason"] = json!(mask_reason);
         body["injection_hold"] = json!(scan == PageScan::Held);
+        *session.shared.snapshot.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(oversight::CachedSnapshot {
+                captured: Instant::now(),
+                captured_at: chrono::Utc::now().timestamp_millis(),
+                body: body.clone(),
+            });
         Ok(body)
     }
 
@@ -1605,7 +1627,7 @@ impl ComputerUseSessions {
                     )
                 })?;
             #[cfg(test)]
-            self.pause_action_boundary("after_claim", &mut session).await;
+            self.pause_action_boundary_with_session("after_claim", &mut session).await;
             // Re-read native gates after the claim; policy/task/TTL are also
             // checked at the durable execution boundary.
             self.check_alive(&mut session).await?;
@@ -1627,7 +1649,7 @@ impl ComputerUseSessions {
         )
         .await;
         #[cfg(test)]
-        self.pause_action_boundary("after_audit", &mut session).await;
+        self.pause_action_boundary_with_session("after_audit", &mut session).await;
         // Audit may await disk work: run the live gates once more after it.
         self.check_alive(&mut session).await?;
         self.ensure_not_paused(&session).await?;
@@ -1639,7 +1661,7 @@ impl ComputerUseSessions {
                 .map_err(|_| OpError::new(ErrorCode::ConfirmationDenied, "執行前核准已失效。"))?;
         }
         #[cfg(test)]
-        self.pause_action_boundary("after_begin", &mut session).await;
+        self.pause_action_boundary_with_session("after_begin", &mut session).await;
         // No claim/audit/authorization await may follow the last observation.
         // The session mutex stays held throughout; the desktop itself is not frozen.
         let final_check = async {
@@ -1827,7 +1849,17 @@ impl ComputerUseSessions {
     }
 
     #[cfg(test)]
-    async fn pause_action_boundary(&self, phase: &'static str, session: &mut ManagedSession) {
+    async fn pause_action_boundary_with_session(&self, phase: &'static str, session: &mut ManagedSession) {
+        if self.pause_action_boundary(phase).await
+            && phase == "after_begin"
+            && self.action_boundary_expire_deadline.swap(false, Ordering::AcqRel)
+        {
+            session.deadline = Instant::now();
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_action_boundary(&self, phase: &'static str) -> bool {
         let pause = {
             let mut slot = self.action_boundary_pause.lock().unwrap();
             if slot
@@ -1842,11 +1874,9 @@ impl ComputerUseSessions {
         if let Some((_, entered, release)) = pause {
             entered.notify_one();
             release.notified().await;
-            if phase == "after_begin"
-                && self.action_boundary_expire_deadline.swap(false, Ordering::AcqRel)
-            {
-                session.deadline = Instant::now();
-            }
+            true
+        } else {
+            false
         }
     }
 

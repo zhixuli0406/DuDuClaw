@@ -1124,7 +1124,7 @@ async fn process_line_events(
                 } else {
                     session_id.clone()
                 };
-                let guarded = thinking
+                let guarded = crate::computer_use_sessions::attended::verified_channel_message(&session_id, crate::ccr_runtime::reply_principal_for_sender(sender), false, thinking
                     .scope(crate::trigger_route::as_called_turn(
                         called,
                         build_guarded_reply_for_agent(
@@ -1135,7 +1135,7 @@ async fn process_line_events(
                             crate::ccr_runtime::reply_principal_for_sender(sender),
                             on_progress,
                         ),
-                    ))
+                    )))
                     .await;
                 drop(loading_guard);
                 let thinking_footer = thinking.finish().await;
