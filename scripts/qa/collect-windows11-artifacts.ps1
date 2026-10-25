@@ -8,8 +8,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ProductHead = 'ba8211e63307231482ee8f6f4c44ae58ad4d89e4'
-$ProductTree = '68ed32d05b22a222edb22260dc55870acc4b8c84'
+$ProductHead = 'a0cf1a7066bb35b6b03f20a65435b1c5f9defc7c'
+$ProductTree = 'd202fbd21528077865c63010d715fcd0dd54c07a'
 $TargetTriple = 'x86_64-pc-windows-msvc'
 $Scope = 'WINDOWS11_NATIVE18_LIBTEST_ONLY'
 $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
@@ -172,12 +172,12 @@ function Assets-Manifest() {
 
 Require ($IsWindows -and [Environment]::Is64BitProcess) 'The builder requires native x64 Windows'
 Require ($WorkflowHead -cmatch '^[0-9a-f]{40}$' -and $WorkflowHead -ceq $env:GITHUB_SHA -and $WorkflowHead -cne $ProductHead) 'Workflow commit is not its distinct github.sha'
-Require ($env:GITHUB_EVENT_NAME -ceq 'push' -and $env:GITHUB_REF -ceq 'refs/heads/chore/windows11-acceptance-artifacts-20261025') 'Builder event/ref is not authorized'
+Require ($env:GITHUB_EVENT_NAME -ceq 'push' -and $env:GITHUB_REF -ceq 'refs/heads/chore/windows11-a0cf-artifacts-20261025') 'Builder event/ref is not authorized'
 Require ($env:GITHUB_RUN_ID -cmatch '^\d+$' -and $env:GITHUB_RUN_ATTEMPT -cmatch '^\d+$') 'Invalid workflow run identity'
 Require ($RepositoryRoot -ieq [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)) 'Unexpected repository root'
 Assert-Under $ToolsRoot $env:RUNNER_TEMP
 Assert-Under $OutputDirectory $env:RUNNER_TEMP
-Require ([IO.Path]::GetFileName($OutputDirectory) -ceq "native18-ba8211e6-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT") 'Unexpected artifact directory'
+Require ([IO.Path]::GetFileName($OutputDirectory) -ceq "native18-a0cf1a70-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT") 'Unexpected artifact directory'
 Require (-not (Test-Path -LiteralPath $OutputDirectory)) 'One-shot artifact directory already exists'
 Assert-NormalPath $RepositoryRoot $false
 Assert-NormalPath $ToolsRoot $false

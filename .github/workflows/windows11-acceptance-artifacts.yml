@@ -2,7 +2,7 @@ name: Windows11 native18 artifact builder
 
 on:
   push:
-    branches: [chore/windows11-acceptance-artifacts-20261025]
+    branches: [chore/windows11-a0cf-artifacts-20261025]
     paths:
       - .github/workflows/windows11-acceptance-artifacts.yml
       - scripts/qa/collect-windows11-artifacts.ps1
@@ -29,7 +29,7 @@ env:
 
 jobs:
   build-libtests:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/chore/windows11-acceptance-artifacts-20261025'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/chore/windows11-a0cf-artifacts-20261025'
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
@@ -48,7 +48,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Workflow checkout does not match github.sha' }
           if ($env:GITHUB_RUN_ID -notmatch '^\d+$' -or $env:GITHUB_RUN_ATTEMPT -notmatch '^\d+$') { throw 'Invalid run identity' }
           $tools = Join-Path $env:RUNNER_TEMP "native18-tools-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $output = Join-Path $env:RUNNER_TEMP "native18-ba8211e6-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $output = Join-Path $env:RUNNER_TEMP "native18-a0cf1a70-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           if ((Test-Path -LiteralPath $tools) -or (Test-Path -LiteralPath $output)) { throw 'One-shot builder directory already exists' }
           New-Item -ItemType Directory -Path $tools | Out-Null
           $files = [ordered]@{}
@@ -72,15 +72,15 @@ jobs:
       - name: Check out the fixed product source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ba8211e63307231482ee8f6f4c44ae58ad4d89e4
+          ref: a0cf1a7066bb35b6b03f20a65435b1c5f9defc7c
           persist-credentials: false
           clean: true
       - name: Verify the product commit and tree
         run: |
           $head = (git rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $head -cne 'ba8211e63307231482ee8f6f4c44ae58ad4d89e4') { throw 'Wrong product HEAD' }
+          if ($LASTEXITCODE -ne 0 -or $head -cne 'a0cf1a7066bb35b6b03f20a65435b1c5f9defc7c') { throw 'Wrong product HEAD' }
           $tree = (git rev-parse 'HEAD^{tree}').Trim()
-          if ($LASTEXITCODE -ne 0 -or $tree -cne '68ed32d05b22a222edb22260dc55870acc4b8c84') { throw 'Wrong product tree' }
+          if ($LASTEXITCODE -ne 0 -or $tree -cne 'd202fbd21528077865c63010d715fcd0dd54c07a') { throw 'Wrong product tree' }
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: "22"
@@ -104,7 +104,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Locked frontend dependency installation failed' }
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Actual frontend build failed' }
-          $receipt = [ordered]@{ source_head = 'ba8211e63307231482ee8f6f4c44ae58ad4d89e4'; commands = @(@('npm', 'ci', '--legacy-peer-deps'), @('npm', 'run', 'build')); natural_exit_codes = @(0, 0); stub = $false }
+          $receipt = [ordered]@{ source_head = 'a0cf1a7066bb35b6b03f20a65435b1c5f9defc7c'; commands = @(@('npm', 'ci', '--legacy-peer-deps'), @('npm', 'run', 'build')); natural_exit_codes = @(0, 0); stub = $false }
           $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $env:NATIVE18_TOOLS 'frontend-build.json') -Encoding utf8NoBOM
       - name: Compile and collect three current-source libtests without running them
         id: collect
@@ -116,7 +116,7 @@ jobs:
         if: success() && steps.collect.outputs.complete == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: windows11-native18-ba8211e6-${{ github.run_id }}-${{ github.run_attempt }}
+          name: windows11-native18-a0cf1a70-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.NATIVE18_OUTPUT }}/
           if-no-files-found: error
           retention-days: 3
