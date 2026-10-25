@@ -16,7 +16,7 @@ $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $ToolsRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $TargetRoot = Join-Path $RepositoryRoot 'target'
-$Git = (Get-Command git.exe -CommandType Application -ErrorAction Stop).Source
+$Git = [string](@(Get-Command git.exe -CommandType Application -ErrorAction Stop)[0].Source)
 
 function Require([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -222,8 +222,8 @@ foreach ($entry in $Inventory.source_files.GetEnumerator()) {
     $sourceProofs[$entry.Key] = Copy-Verified (Join-Path $RepositoryRoot $entry.Key) (Join-Path $OutputDirectory $relative)
     $evidence.Add($relative)
 }
-$Rustc = (Get-Command rustc.exe -CommandType Application -ErrorAction Stop).Source
-$Cargo = (Get-Command cargo.exe -CommandType Application -ErrorAction Stop).Source
+$Rustc = [string](@(Get-Command rustc.exe -CommandType Application -ErrorAction Stop)[0].Source)
+$Cargo = [string](@(Get-Command cargo.exe -CommandType Application -ErrorAction Stop)[0].Source)
 $toolRecords = [ordered]@{}
 foreach ($spec in @(@{ id = 'rustc'; exe = $Rustc }, @{ id = 'cargo'; exe = $Cargo })) {
     $stdout = "$($spec.id)-vV.txt"
