@@ -91,29 +91,36 @@ async fn frame_or_focus_drift_after_each_long_wait_never_clicks_and_requires_new
 
 #[tokio::test]
 async fn live_gates_after_durable_begin_refuse_before_any_backend_action() {
-    for interruption in [
-        "stop",
-        "pause",
-        "red",
-        "yellow",
-        "revoke",
-        "tool_denied",
-        "policy",
-        "deadline",
-    ] {
-        let tmp = home();
-        let state = Arc::new(FakeState::default());
-        let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
-        let session = insert_session(&mgr, &state, "alice", high_risk_config());
-        let control = mgr.entry("alice").unwrap().control;
-        let deadline = Instant::now() + Duration::from_secs(1);
-        if interruption == "deadline" {
-            mgr.lookup("alice").unwrap().lock().await.deadline = deadline;
-        }
-        let (entered, release) = barrier(&mgr, "after_begin");
-        let req = click(10, 20);
-        let mutate = async {
-            entered.notified().await;
+    // One fixture budget covers every boundary wait and all eight interruptions.
+    // This does not interrupt synchronous filesystem or SQLite work.
+    let fixture_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    tokio::time::timeout_at(fixture_deadline, async {
+        for interruption in [
+            "stop",
+            "pause",
+            "red",
+            "yellow",
+            "revoke",
+            "tool_denied",
+            "policy",
+            "deadline",
+        ] {
+            let tmp = home();
+            let state = Arc::new(FakeState::default());
+            let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+            let session = insert_session(&mgr, &state, "alice", high_risk_config());
+            let control = mgr.entry("alice").unwrap().control;
+            let (entered, release) = barrier(&mgr, "after_begin");
+            let req = click(10, 20);
+            let action = mgr.action("alice", Some(&session), Some("yes"), &req);
+            tokio::pin!(action);
+            tokio::select! {
+                result = &mut action => {
+                    panic!("{interruption}: action ended before durable after_begin: {result:?}");
+                }
+                _ = entered.notified() => {}
+            }
+            assert!(state.executed.lock().unwrap().is_empty(), "{interruption}");
             match interruption {
                 "stop" => control.stopped.store(true, Ordering::Release),
                 "pause" => control.paused.store(true, Ordering::Release),
@@ -133,29 +140,30 @@ async fn live_gates_after_durable_begin_refuse_before_any_backend_action() {
                 )
                 .unwrap(),
                 "deadline" => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    tokio::time::sleep(remaining + Duration::from_millis(10)).await;
+                    // Expire only after the real durable boundary was reached.
+                    // The hook owns the session lock and consumes this once.
+                    mgr.action_boundary_expire_deadline.store(true, Ordering::Release);
                 }
                 _ => unreachable!(),
             }
             release.notify_one();
-        };
-        let (result, ()) = tokio::join!(
-            mgr.action("alice", Some(&session), Some("yes"), &req),
-            mutate
-        );
-        assert!(result.is_err(), "{interruption}");
-        assert!(state.executed.lock().unwrap().is_empty(), "{interruption}");
-        let broker = crate::approval::ApprovalBroker::open(tmp.path()).unwrap();
-        let ops = broker.list_operations().await.unwrap();
-        assert_eq!(ops.len(), 1, "{interruption}");
-        assert_eq!(
-            ops[0].state,
-            crate::approval::OperationState::Failed,
-            "{interruption}"
-        );
-        assert_eq!(ops[0].receipt.as_ref().unwrap()["backend_invoked"], false);
-    }
+            let result = action.await;
+            assert!(result.is_err(), "{interruption}");
+            assert!(state.executed.lock().unwrap().is_empty(), "{interruption}");
+            assert!(!mgr.action_boundary_expire_deadline.load(Ordering::Acquire));
+            let broker = crate::approval::ApprovalBroker::open(tmp.path()).unwrap();
+            let ops = broker.list_operations().await.unwrap();
+            assert_eq!(ops.len(), 1, "{interruption}");
+            assert_eq!(
+                ops[0].state,
+                crate::approval::OperationState::Failed,
+                "{interruption}"
+            );
+            assert_eq!(ops[0].receipt.as_ref().unwrap()["backend_invoked"], false);
+        }
+    })
+    .await
+    .expect("durable after_begin fixture exceeded its shared 30-second budget");
 }
 
 #[tokio::test]
