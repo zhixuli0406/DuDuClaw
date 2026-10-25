@@ -6,6 +6,9 @@ use std::{
     io::Read,
 };
 use zeroize::Zeroizing;
+#[cfg(windows)]
+#[path = "w3_windows_identity.rs"]
+mod windows_identity;
 fn changed() -> Refusal {
     Refusal::hard(
         "identity_changed",
@@ -17,6 +20,8 @@ struct Identity {
     len: u64,
     modified: Option<std::time::SystemTime>,
     readonly: bool,
+    #[cfg(windows)]
+    windows_id: windows_identity::FileId,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -27,6 +32,7 @@ struct Identity {
     ctime: (i64, i64),
 }
 impl Identity {
+    #[cfg(not(windows))]
     fn of(m: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
@@ -44,6 +50,32 @@ impl Identity {
             ctime: (m.ctime(), m.ctime_nsec()),
         }
     }
+    fn from_file(file: &std::fs::File) -> Result<(std::fs::Metadata, Self), Refusal> {
+        let metadata = file.metadata().map_err(|_| changed())?;
+        #[cfg(windows)]
+        let identity = Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            readonly: metadata.permissions().readonly(),
+            windows_id: windows_identity::file_id(file).map_err(|_| changed())?,
+        };
+        #[cfg(not(windows))]
+        let identity = Self::of(&metadata);
+        Ok((metadata, identity))
+    }
+    fn from_path(path: &Path, _directory: bool) -> Result<(std::fs::Metadata, Self), Refusal> {
+        #[cfg(windows)]
+        {
+            let file = windows_identity::open_identity(path, _directory).map_err(|_| changed())?;
+            Self::from_file(&file)
+        }
+        #[cfg(not(windows))]
+        {
+            let metadata = std::fs::metadata(path).map_err(|_| changed())?;
+            let identity = Self::of(&metadata);
+            Ok((metadata, identity))
+        }
+    }
 }
 pub(crate) struct FileProof {
     path: PathBuf,
@@ -58,7 +90,7 @@ impl FileProof {
         limit: usize,
     ) -> Result<(Self, Zeroizing<Vec<u8>>), Refusal> {
         let canonical = path.canonicalize().map_err(|_| changed())?;
-        let before = std::fs::metadata(&canonical).map_err(|_| changed())?;
+        let (before, before_identity) = Identity::from_path(&canonical, false)?;
         if !before.is_file() || before.len() > limit as u64 {
             return Err(changed());
         }
@@ -69,9 +101,11 @@ impl FileProof {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
+        #[cfg(windows)]
+        windows_identity::configure_read(&mut options);
         let mut file = options.open(&canonical).map_err(|_| changed())?;
-        let opened = file.metadata().map_err(|_| changed())?;
-        if Identity::of(&before) != Identity::of(&opened) {
+        let (opened, identity) = Identity::from_file(&file)?;
+        if !opened.is_file() || before_identity != identity {
             return Err(changed());
         }
         let mut bytes = Zeroizing::new(Vec::new());
@@ -79,12 +113,11 @@ impl FileProof {
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| changed())?;
-        let after = file.metadata().map_err(|_| changed())?;
-        let path_after = std::fs::metadata(path).map_err(|_| changed())?;
-        let identity = Identity::of(&opened);
+        let (_, after_identity) = Identity::from_file(&file)?;
+        let (_, path_after_identity) = Identity::from_path(path, false)?;
         if bytes.len() > limit
-            || identity != Identity::of(&after)
-            || identity != Identity::of(&path_after)
+            || identity != after_identity
+            || identity != path_after_identity
             || path.canonicalize().map_err(|_| changed())? != canonical
         {
             return Err(changed());
@@ -128,6 +161,11 @@ impl FileProof {
             h.update(self.identity.mode.to_be_bytes());
             h.update(self.identity.ctime.0.to_be_bytes());
             h.update(self.identity.ctime.1.to_be_bytes());
+        }
+        #[cfg(windows)]
+        {
+            h.update(self.identity.windows_id.volume.to_be_bytes());
+            h.update(self.identity.windows_id.id);
         }
         format!("{:x}", h.finalize())
     }
@@ -209,8 +247,8 @@ impl SourceSnapshot {
         let config_projection = projection(&home)?.0;
         let policy = duduclaw_core::google_identity::effective_for(&home, Some(agent));
         let snapshot = Self {
-            home_identity: directory_identity(&std::fs::metadata(&home).map_err(|_| changed())?),
-            agent_identity: directory_identity(&std::fs::metadata(&dir).map_err(|_| changed())?),
+            home_identity: directory_identity(&home)?,
+            agent_identity: directory_identity(&dir)?,
             agent_dir: dir,
             agent: agent.into(),
             control: crate::mcp_oauth::home_store::closed_readonly_control(&home)
@@ -232,10 +270,10 @@ impl SourceSnapshot {
         crate::google_personal::grants::check_metadata_barrier(&self.home)
             .map_err(|_| changed())?;
         if self.home.canonicalize().map_err(|_| changed())? != self.home
-            || directory_identity(&std::fs::metadata(&self.home).map_err(|_| changed())?)
+            || directory_identity(&self.home)?
                 != self.home_identity
             || self.agent_dir.canonicalize().map_err(|_| changed())? != self.agent_dir
-            || directory_identity(&std::fs::metadata(&self.agent_dir).map_err(|_| changed())?)
+            || directory_identity(&self.agent_dir)?
                 != self.agent_identity
             || projection(&self.home)?.0 != self.config_projection
             || duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent))
@@ -257,10 +295,10 @@ impl SourceSnapshot {
         crate::google_personal::grants::check_metadata_barrier(&self.home)
             .map_err(|_| changed())?;
         if self.home.canonicalize().map_err(|_| changed())? != self.home
-            || directory_identity(&std::fs::metadata(&self.home).map_err(|_| changed())?)
+            || directory_identity(&self.home)?
                 != self.home_identity
             || self.agent_dir.canonicalize().map_err(|_| changed())? != self.agent_dir
-            || directory_identity(&std::fs::metadata(&self.agent_dir).map_err(|_| changed())?)
+            || directory_identity(&self.agent_dir)?
                 != self.agent_identity
             || projection(&self.home)?.0 != self.config_projection
             || duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent))
@@ -395,15 +433,15 @@ impl LocalDependency {
     }
 }
 
-fn directory_identity(meta: &std::fs::Metadata) -> Identity {
-    let mut identity = Identity::of(meta);
+fn directory_identity(path: &Path) -> Result<Identity, Refusal> {
+    let (_, mut identity) = Identity::from_path(path, true)?;
     identity.len = 0;
     identity.modified = None;
     #[cfg(unix)]
     {
         identity.ctime = (0, 0);
     }
-    identity
+    Ok(identity)
 }
 fn policy_weight(policy: &duduclaw_core::google_identity::EffectiveIdentity) -> usize {
     use duduclaw_core::google_identity::{Effective, Selector};
@@ -438,16 +476,85 @@ fn value_weight(value: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod w3_source_oracles {
     use super::*;
+    fn set_modified(path: &Path, modified: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
     #[test]
     fn w3_source_capture_detects_equal_bytes_replaced_inode() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("key.json");
         std::fs::write(&path, b"same").unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        set_modified(&path, modified);
         let (proof, _) = FileProof::capture(&path, 64).unwrap();
         let replacement = temp.path().join("new");
         std::fs::write(&replacement, b"same").unwrap();
+        set_modified(&replacement, modified);
+        let (metadata, replacement_identity) = Identity::from_path(&replacement, false).unwrap();
+        assert_eq!(proof.identity.len, metadata.len());
+        assert_eq!(proof.identity.modified, metadata.modified().ok());
+        assert_eq!(proof.identity.readonly, metadata.permissions().readonly());
+        #[cfg(windows)]
+        assert_ne!(proof.identity.windows_id, replacement_identity.windows_id);
+        #[cfg(not(windows))]
+        let _ = replacement_identity;
         std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"same");
+        let (current, _) = FileProof::capture(&path, 64).unwrap();
+        assert_eq!(proof.canonical, current.canonical);
+        assert_eq!(proof.identity.len, current.identity.len);
+        assert_eq!(proof.identity.modified, current.identity.modified);
+        assert_eq!(proof.identity.readonly, current.identity.readonly);
+        #[cfg(windows)]
+        assert_ne!(proof.identity.windows_id, current.identity.windows_id);
         assert!(proof.validate().is_err());
+        assert_ne!(proof.digest(), current.digest());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn w3_windows_unchanged_file_validates_and_missing_identity_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key.json");
+        std::fs::write(&path, b"same").unwrap();
+        let (proof, _) = FileProof::capture(&path, 64).unwrap();
+        proof.validate().unwrap();
+        let missing = temp.path().join("absent").join("key.json");
+        assert!(Identity::from_path(&missing, false).is_err());
+        assert!(FileProof::capture(&missing, 64).is_err());
+        assert!(!temp.path().join("absent").exists());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn w3_windows_directory_replacement_refuses_the_original_snapshot() {
+        for replace_home in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let agent = home.join("agents/bot");
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(home.join("config.toml"), "").unwrap();
+            std::fs::write(agent.join("agent.toml"), "[agent]\nname='bot'\n").unwrap();
+            let snapshot = SourceSnapshot::capture(&home, "bot").unwrap();
+            snapshot.validate().unwrap();
+            let target = if replace_home { &home } else { &agent };
+            let before = directory_identity(target).unwrap();
+            let retained = temp.path().join("retained");
+            std::fs::rename(target, &retained).unwrap();
+            if replace_home {
+                std::fs::create_dir_all(&agent).unwrap();
+                std::fs::write(home.join("config.toml"), "").unwrap();
+            } else {
+                std::fs::create_dir(&agent).unwrap();
+            }
+            std::fs::write(agent.join("agent.toml"), "[agent]\nname='bot'\n").unwrap();
+            let after = directory_identity(target).unwrap();
+            assert_ne!(before.windows_id, after.windows_id);
+            assert_eq!(snapshot.validate().unwrap_err().code, "identity_changed");
+        }
     }
     #[test]
     fn w3_source_capture_enforces_bound_while_reading_and_no_lock_creation() {
