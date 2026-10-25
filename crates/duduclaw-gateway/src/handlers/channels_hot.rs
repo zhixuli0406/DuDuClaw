@@ -150,7 +150,10 @@ impl MethodHandler {
         };
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         // v1.68: remove the keys (plaintext and `_enc`) instead of blanking
         // them. With both gone the readers see "not configured", exactly as
@@ -163,7 +166,7 @@ impl MethodHandler {
         }
 
         // XC.2: atomic write (temp + rename).
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }
 

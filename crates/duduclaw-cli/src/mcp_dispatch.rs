@@ -690,6 +690,10 @@ impl McpDispatcher {
             Err(error) => return jsonrpc_error(id, -32003, &error),
         };
         let mut clean_params = params.clone();
+        // Host account metadata can never be supplied by an MCP caller.
+        if let Some(object) = clean_params.as_object_mut() {
+            object.remove(duduclaw_gateway::google_personal::authority::APPROVAL_ACCOUNT_KEY);
+        }
         if workflow.is_some() {
             if let Some(object) = clean_params.as_object_mut() {
                 object.remove("_meta");
@@ -709,7 +713,8 @@ impl McpDispatcher {
         // whitelist, namespace isolation and the per-key rate limiter stay on
         // `principal.client_id`.
         let gate_agent: &str = acting_gate_agent(principal, &self.default_agent);
-        let google_lane = crate::mcp_auth::accept_google_lane(&self.home_dir, principal, tool_name);
+        let mut google_lane =
+            crate::mcp_auth::accept_google_lane(&self.home_dir, principal, tool_name);
         let dedicated_google = google_lane.is_some();
         // This exception affects only native Google tools. External namespace,
         // redaction, process-agent and OS-tool behavior stays external.
@@ -1141,8 +1146,25 @@ impl McpDispatcher {
                     return jsonrpc_error(id, -32003, &format!("Denied by policy: {reason}"));
                 }
                 duduclaw_security::policy_kernel::Decision::Ask { risk } => {
+                    let approval_payload = if let Some(lane) = google_lane.as_mut() {
+                        match lane
+                            .approval_payload(
+                                &self.home_dir,
+                                &params_owned,
+                                self.redaction.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(payload) => payload,
+                            Err(message) => return jsonrpc_error(id, -32003, &message),
+                        }
+                    } else {
+                        params_owned.clone()
+                    };
                     if let Some(call) = &workflow {
-                        if let Err(error) = call.require_human("policy_ask", &params_owned).await {
+                        if let Err(error) =
+                            call.require_human("policy_ask", &approval_payload).await
+                        {
                             return jsonrpc_error(id, -32003, &error);
                         }
                     } else {
@@ -1172,18 +1194,23 @@ impl McpDispatcher {
                         let grant = duduclaw_gateway::approval::action_grant::ActionGrant::build(
                             gate_agent,
                             tool_name,
-                            &params_owned,
+                            &approval_payload,
                         );
-                        let outcome = crate::mcp::approval::run_approval_bound(
-                            &broker,
-                            gate_agent,
-                            crate::mcp::approval::ApprovalSubject::ToolCall(tool_name),
-                            &risk,
-                            params_owned.clone(),
-                            POLICY_ASK_TTL_SECONDS,
-                            POLICY_ASK_POLL,
-                            None,
-                            Some(&grant),
+                        let outcome = crate::mcp_auth::with_google_account_approval(
+                            google_lane
+                                .as_ref()
+                                .and_then(|lane| lane.approval_account()),
+                            crate::mcp::approval::run_approval_bound(
+                                &broker,
+                                gate_agent,
+                                crate::mcp::approval::ApprovalSubject::ToolCall(tool_name),
+                                &risk,
+                                approval_payload.clone(),
+                                POLICY_ASK_TTL_SECONDS,
+                                POLICY_ASK_POLL,
+                                None,
+                                Some(&grant),
+                            ),
                         )
                         .await;
                         if let crate::mcp::InstallApprovalOutcome::Denied(msg) = outcome {
@@ -1209,6 +1236,17 @@ impl McpDispatcher {
                 .is_some_and(|v| v.to_string().contains("<REDACT:"))
         {
             return jsonrpc_error(id, -32003, "workflow_secret_restore_unsupported");
+        }
+
+        // Pin a Personal account/alias mapping before restoration too when
+        // no Policy Ask ran. Existing Ask remains before this point.
+        if let Some(lane) = google_lane.as_mut() {
+            if let Err(message) = lane
+                .approval_payload(&self.home_dir, &params_owned, self.redaction.as_deref())
+                .await
+            {
+                return jsonrpc_error(id, -32003, &message);
+            }
         }
 
         // ── 3.6 Egress "secret in-use" decision (RFC-23 / P2-4) ──────────────
@@ -1281,6 +1319,16 @@ impl McpDispatcher {
                         );
                     }
                 }
+            }
+        }
+
+        if let Some(lane) = google_lane.as_mut() {
+            let args = params_owned
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Err(message) = lane.record_restored(args, self.redaction.as_deref()) {
+                return jsonrpc_error(id, -32003, &message);
             }
         }
 
@@ -1538,17 +1586,33 @@ impl McpDispatcher {
         // are already confined to the read-only whitelist and carry no per-agent
         // approval config, so they're skipped. Fail-closed: a denial/expiry/
         // broker-unavailable returns an error instead of dispatching.
+        let google_approval_payload = if let Some(lane) = google_lane.as_mut() {
+            match lane
+                .final_approval_payload(&self.home_dir, &params_owned, self.redaction.as_deref())
+                .await
+            {
+                Ok(payload) => payload,
+                Err(message) => return jsonrpc_error(id, -32003, &message),
+            }
+        } else {
+            params_owned.clone()
+        };
         if employee_policy_applies {
             // Keyed by the ACTING agent: with the internal key the client_id
             // is `gateway-internal`, whose `agents/gateway-internal/agent.toml`
             // does not exist, so approval_required_tools / irreversible_tools /
             // maybe_irreversible_tools were never enforced in production.
-            if let Err(msg) = crate::mcp::approval::gate_tool_approval_dispatch_workflow(
-                &self.home_dir,
-                gate_agent,
-                tool_name,
-                params_owned.clone(),
-                workflow.as_ref(),
+            if let Err(msg) = crate::mcp_auth::with_google_account_approval(
+                google_lane
+                    .as_ref()
+                    .and_then(|lane| lane.approval_account()),
+                crate::mcp::approval::gate_tool_approval_dispatch_workflow(
+                    &self.home_dir,
+                    gate_agent,
+                    tool_name,
+                    google_approval_payload,
+                    workflow.as_ref(),
+                ),
             )
             .await
             {
@@ -1577,6 +1641,18 @@ impl McpDispatcher {
         } else {
             None
         };
+        if let Some(lane) = &google_lane {
+            let args = params_owned
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Err(message) = lane
+                .validate(&self.home_dir, &args, self.redaction.as_deref())
+                .await
+            {
+                return jsonrpc_error(id, -32003, &message);
+            }
+        }
         let effect_observation = Arc::new(std::sync::Mutex::new(
             crate::mcp::workflow_operation::HandlerObservation::RejectedBeforeEffect,
         ));

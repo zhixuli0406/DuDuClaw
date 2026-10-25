@@ -110,10 +110,6 @@ impl MethodHandler {
 
     /// Start an OAuth flow: generate PKCE, store pending state, return auth URL.
     pub(crate) async fn handle_mcp_oauth_start(&self, params: Value) -> WsFrame {
-        let _grant_lease = match crate::google_personal::grants::acquire(&self.home_dir).await {
-            Ok(lease) => lease,
-            Err(message) => return WsFrame::error_response("", &message),
-        };
         use crate::mcp_oauth;
 
         let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {
@@ -121,6 +117,18 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "provider_id is required"),
         };
 
+        if provider_id == "google" {
+            return match start_google_home_rpc(&self.home_dir, &params, &self.mcp_oauth_pending)
+                .await
+            {
+                Ok(payload) => WsFrame::ok_response("", payload),
+                Err(_) => WsFrame::error_response("", "Google 連結未完成，請重新從控制台開始。"),
+            };
+        }
+        let _grant_lease = match crate::google_personal::grants::acquire(&self.home_dir).await {
+            Ok(lease) => lease,
+            Err(message) => return WsFrame::error_response("", &message),
+        };
         let client_id = params
             .get("client_id")
             .and_then(|v| v.as_str())
@@ -225,12 +233,9 @@ impl MethodHandler {
         let auth_url = mcp_oauth::build_auth_url(&config, &state, &code_challenge);
 
         // Store pending
-        let pending = mcp_oauth::PendingOAuth {
-            provider_id: provider_id.clone(),
-            state: state.clone(),
-            code_verifier,
-            config,
-            created_at: std::time::Instant::now(),
+        let pending = match mcp_oauth::PendingOAuth::other(config, code_verifier) {
+            Ok(p) => p,
+            Err(message) => return WsFrame::error_response("", &message),
         };
 
         {
@@ -251,3 +256,32 @@ impl MethodHandler {
         )
     }
 }
+
+/// Actual Google handler pipeline, shared with the host/RAM-lock tests.
+async fn start_google_home_rpc(
+    home: &std::path::Path,
+    params: &Value,
+    pending: &tokio::sync::RwLock<
+        std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>,
+    >,
+) -> crate::mcp_oauth::home_store::Result<Value> {
+    use crate::mcp_oauth::{home_lifecycle as flow, home_store::Error};
+    fn text<'a>(params: &'a Value, key: &str) -> std::result::Result<Option<&'a str>, Error> {
+        match params.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s)),
+            _ => Err(Error::Invalid),
+        }
+    }
+    let input = flow::GoogleHomeStartInput::new(
+        text(params, "client_id")?,
+        text(params, "client_secret")?,
+    )?;
+    let captured = flow::capture_google_home_start(home, input)?;
+    let started = flow::begin_google_home_authorization(home, captured).await?;
+    let (url, state) = crate::mcp_oauth::insert_google_start(home, started, pending).await?;
+    Ok(json!({"auth_url":url,"state":state}))
+}
+#[cfg(test)]
+#[path = "mcp_oauth_home_tests.rs"]
+mod home_tests;

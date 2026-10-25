@@ -8,4 +8,4 @@ pub mod key;
 pub mod schema;
 pub mod store;
 
-pub use store::{VaultEntry, VaultStats, VaultStore};
+pub use store::{MappingReceipt, VaultEntry, VaultStats, VaultStore};

@@ -34,6 +34,14 @@ pub use tools::{NATIVE_GOOGLE_TOOLS, NativeGoogleScope, native_google_scope};
 #[path = "google_identity/credentials.rs"]
 mod credentials;
 pub use credentials::{CredentialKind, CredentialRef};
+#[path = "google_identity/selection.rs"]
+mod selection;
+pub use selection::{
+    ApprovedGoogleIdentity, GOOGLE_ACCOUNT_APPROVAL_KEY, GOOGLE_SELECTION_ROUTE,
+    GOOGLE_SELECTION_TTL_SECS, GoogleAccountApproval, GoogleHomeConnectionApproval,
+    GoogleHomeSourceApproval, GoogleSelectionRequest, GoogleSelectionStamp,
+    google_arguments_digest, google_digest_well_formed,
+};
 
 /// The `agent.toml` table.
 pub const AGENT_SECTION: &str = "google";
@@ -321,7 +329,11 @@ impl Default for HomeIdentityConfig {
     }
 }
 
-const HOME_KEYS: &[&str] = &["default_identity", "allowed_subject_domains", "allowed_domains"];
+const HOME_KEYS: &[&str] = &[
+    "default_identity",
+    "allowed_subject_domains",
+    "allowed_domains",
+];
 
 /// Parse the home section out of a `config.toml` body. Absent ⇒ defaults
 /// (today's behaviour); present but wrong ⇒ error.
@@ -377,10 +389,21 @@ pub fn parse_home_config(text: &str) -> Result<HomeIdentityConfig, String> {
         allowed_subject_domains,
         allowed_domains: match section.get("allowed_domains") {
             None => Vec::new(),
-            Some(toml::Value::Array(values)) => values.iter().map(|value| {
-                let domain = value.as_str().ok_or("allowed_domains 必須是字串陣列")?.trim().to_ascii_lowercase();
-                if is_domain(&domain) { Ok(domain) } else { Err("allowed_domains 含有無效網域".to_string()) }
-            }).collect::<Result<Vec<_>, _>>()?,
+            Some(toml::Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    let domain = value
+                        .as_str()
+                        .ok_or("allowed_domains 必須是字串陣列")?
+                        .trim()
+                        .to_ascii_lowercase();
+                    if is_domain(&domain) {
+                        Ok(domain)
+                    } else {
+                        Err("allowed_domains 含有無效網域".to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             Some(_) => return Err("allowed_domains 必須是字串陣列".into()),
         },
     })
@@ -478,7 +501,9 @@ fn effective_of(sel: &Selector) -> Effective {
         Selector::Delegate(email) => Effective::Delegate {
             email: email.clone(),
         },
-        Selector::Owner | Selector::User(_) => Effective::Personal { selector: sel.clone() },
+        Selector::Owner | Selector::User(_) => Effective::Personal {
+            selector: sel.clone(),
+        },
     }
 }
 

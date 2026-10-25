@@ -62,36 +62,20 @@ pub fn integration_enabled(home_dir: &Path) -> bool {
 /// when the file changed, `Ok(false)` when it was already on, and an error
 /// rather than a silent overwrite on malformed TOML.
 pub fn enable_integration(home_dir: &Path) -> std::io::Result<bool> {
-    if integration_enabled(home_dir) {
-        return Ok(false);
-    }
-    let path = home_dir.join("config.toml");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("config.toml is not valid TOML, refusing to rewrite it: {e}"),
-        )
-    })?;
-    doc.as_table_mut()
-        .entry("integrations")
-        .or_insert(toml_edit::table())
-        .as_table_mut()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "[integrations] exists but is not a table",
-            )
-        })?
-        .insert("github", toml_edit::value(true));
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(true)
+    let path=home_dir.join("config.toml");
+    let raw=crate::handlers::config_commit::read_text_or_empty(&path).map_err(std::io::Error::other)?;
+    let expected=crate::handlers::config_commit::content_hash(&raw);
+    let mut changed=false;
+    crate::commit_config_rendered(home_dir,&expected,|current| {
+        let mut doc:toml_edit::DocumentMut=current.parse().map_err(|e|format!("config.toml is not valid TOML: {e}"))?;
+        if doc.get("integrations").and_then(toml_edit::Item::as_table).and_then(|t|t.get("github")).and_then(toml_edit::Item::as_bool)==Some(true) {
+            return Ok(current.to_owned());
+        }
+        doc.as_table_mut().entry("integrations").or_insert(toml_edit::table()).as_table_mut().ok_or("integrations is not a table")?
+            .insert("github",toml_edit::value(true));
+        changed=true;Ok(doc.to_string())
+    }).map_err(std::io::Error::other)?;
+    Ok(changed)
 }
 
 /// The message an agent sees when it calls a GitHub tool while the gate is

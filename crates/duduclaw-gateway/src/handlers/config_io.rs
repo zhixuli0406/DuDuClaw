@@ -39,6 +39,9 @@ impl MethodHandler {
         } else {
             path.to_path_buf()
         };
+        if target.file_name().and_then(|n|n.to_str())==Some("config.toml") {
+            return Err(std::io::Error::other("config.toml requires snapshot-bound final commit"));
+        }
         refuse_overwriting_unparsable(&target).await?;
         // Edit the file as it stands rather than re-serialising the table, so
         // comments, blank lines and key order survive (`render_preserving`).
@@ -52,6 +55,10 @@ impl MethodHandler {
         crate::product_policy::validate_write(&self.home_dir, &target, &original, &content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
         tokio::fs::write(path, content).await
+    }
+
+    pub(crate) async fn write_config_table_snapshot(&self,path:&std::path::Path,expected_hash:String,table:&toml::Table)->std::io::Result<()> {
+        super::config_commit::commit_table_locked(path,expected_hash,table).await.map_err(std::io::Error::other)
     }
 
     /// Strict TOML read for security-sensitive mutations (WP-K). Unlike

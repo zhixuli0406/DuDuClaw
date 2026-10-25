@@ -64,7 +64,11 @@ impl MethodHandler {
 
         // ── persist ──
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let original=match super::config_commit::read_text_or_empty(&config_path) {
+            Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("寫入設定失敗:{e}")),
+        };
+        let config_expected_hash=super::config_commit::content_hash(&original);
+        let mut table=original.parse::<toml::Table>().unwrap_or_default();
 
         // An existing-but-non-table section is operator data we refuse to
         // silently destroy; report it instead of overwriting.
@@ -88,13 +92,8 @@ impl MethodHandler {
         }
 
         // Atomic write: temp + rename (same discipline as delegation.set).
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("寫入設定失敗:{e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("儲存設定失敗:{e}"));
+        if let Err(e)=super::config_commit::commit_table_locked(&config_path,config_expected_hash,&table).await {
+            return WsFrame::error_response("",&format!("寫入設定失敗:{e}"));
         }
 
         let after = crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(

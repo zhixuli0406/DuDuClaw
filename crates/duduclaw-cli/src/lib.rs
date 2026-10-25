@@ -10,6 +10,7 @@ use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 use removed_spelling::RemovedSpelling;
 mod acp;
+mod onboard_config;
 mod causal_cmd; // Explicit synthetic causal curation fixture
 mod causal_observational_demo; // Binary-treatment observational fixture requiring human review
 mod ccr_cmd; // Local CCR scope invalidation
@@ -7192,6 +7193,8 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     use dialoguer::{Confirm, Input, Password, Select};
 
     let home = duduclaw_home();
+    let config_plan = onboard_config::OnboardConfigPlan::capture(&home)
+        .map_err(DuDuClawError::Config)?;
     let product_policy = duduclaw_core::product_profile::load(&home).map_err(DuDuClawError::Config)?;
 
     // Soft-deprecation: the dashboard now handles first-run setup. This CLI
@@ -7203,7 +7206,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     );
 
     // ── Pre-check: detect existing configuration ─────────────
-    let config_exists = home.join("config.toml").exists();
+    let config_exists = config_plan.existed();
     if config_exists {
         println!();
         println!(
@@ -7216,10 +7219,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
         if skip_prompts {
             // --yes mode: refuse to silently overwrite existing config
-            return Err(DuDuClawError::Config(
-                "已存在設定檔，拒絕自動覆蓋。請手動執行 `duduclaw onboard` 進行互動式重設。"
-                    .to_string(),
-            ));
+            config_plan.check_automatic_reset(skip_prompts).map_err(DuDuClawError::Config)?;
         }
 
         let reset_options = &["重新設定（備份現有設定後重來）", "取消（保留現有設定）"];
@@ -7242,8 +7242,13 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             .await
             .map_err(|e| DuDuClawError::Config(format!("Failed to create backup dir: {e}")))?;
 
-        // Back up key files (non-recursive, only top-level config + agents)
-        for name in &["config.toml", "inference.toml", ".keyfile"] {
+        // Back up the config that this reset actually observed, rather than a
+        // concurrent winner that may have appeared during the prompt.
+        if let Err(e) = config_plan.backup_config(&backup_dir) {
+            eprintln!("  {} 備份 config.toml 失敗：{e}", style("⚠").yellow());
+        }
+        // Other reset/backup behavior remains unchanged.
+        for name in &["inference.toml", ".keyfile"] {
             let src = home.join(name);
             if src.exists() {
                 let dst = backup_dir.join(name);
@@ -7260,8 +7265,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             copy_dir_recursive(&agents_src, &agents_dst).await;
         }
 
-        // Remove old config files (keep logs, models, backups)
-        for name in &["config.toml", "inference.toml"] {
+        // Keep config.toml until the snapshot-bound final publication. A
+        // cancelled/failed wizard must not unlink the guarded source file.
+        for name in &["inference.toml"] {
             let p = home.join(name);
             if p.exists() {
                 let _ = tokio::fs::remove_file(&p).await;
@@ -8224,11 +8230,8 @@ telegram_bot_token_enc = "{telegram_token_enc}"
 discord_bot_token_enc = "{discord_token_enc}"
 "#
     );
-    tokio::fs::write(&config_path, config_content)
-        .await
-        .map_err(|e| {
-            DuDuClawError::Config(format!("Failed to write {}: {e}", config_path.display()))
-        })?;
+    config_plan.commit_rendered(&home, |_| Ok(config_content))
+        .map_err(|e|DuDuClawError::Config(format!("Failed to write {}: {e}",config_path.display())))?;
     println!("  {} {}", style("✓").green(), config_path.display());
 
     // inference.toml (only for local / hybrid modes)
@@ -8610,12 +8613,34 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     // zero-prompt bootstrap already satisfies.
     let _ = yes;
     if !home.join("config.toml").exists() {
-        duduclaw_core::write_minimal_config(&home, &bind, port)?;
-        println!(
-            "First run — created {}",
-            home.join("config.toml").display()
-        );
-        println!("   Finish setup in the dashboard: http://localhost:{port}\n");
+        std::fs::create_dir_all(&home)?;
+        let content = format!(
+        "# DuDuClaw configuration (auto-created on first run).\n\
+         # Finish setup in the dashboard — no need to edit this by hand.\n\
+         \n\
+         [general]\n\
+         log_level = \"info\"\n\
+         default_language = \"zh-TW\"\n\
+         \n\
+         [gateway]\n\
+         bind = \"{bind}\"\n\
+         port = {port}\n"
+    );
+        use sha2::Digest as _;
+        let expected_empty=hex::encode(sha2::Sha256::digest(b""));
+        let mut attempted=false;
+        let result=duduclaw_gateway::commit_config_rendered(&home,&expected_empty,|_| {
+            if home.join("config.toml").exists() { return Err("config.toml already exists".into()); }
+            attempted=true;Ok(content)
+        });
+        if let Err(e)=result {
+            // Another writer won before our renderer ran: retain its config.
+            // Errors after our own write attempt are never treated as success.
+            if attempted || !home.join("config.toml").exists() { return Err(DuDuClawError::Config(e)); }
+        } else {
+            println!("First run — created {}",home.join("config.toml").display());
+            println!("   Finish setup in the dashboard: http://localhost:{port}\n");
+        }
     }
 
     println!("DuDuClaw Server Starting...");
@@ -9864,12 +9889,10 @@ fn cmd_doctor_fix_residue(home: &std::path::Path) -> duduclaw_core::error::Resul
 
     // config.toml is written by the running gateway too — advisory lock plus
     // temp+rename, matching `security.credential_cleanup`'s discipline.
-    duduclaw_core::with_file_lock(&config_path, || {
-        let tmp = config_path.with_extension("toml.tmp");
-        std::fs::write(&tmp, content.as_bytes())?;
-        std::fs::rename(&tmp, &config_path)
-    })
-    .map_err(|e| DuDuClawError::Config(format!("寫回 config.toml 失敗:{e}")))?;
+    use sha2::Digest as _;
+    let expected_hash=hex::encode(sha2::Sha256::digest(raw.as_bytes()));
+    duduclaw_gateway::commit_config_rendered(&home,&expected_hash,|_|Ok(content))
+        .map_err(|e| DuDuClawError::Config(format!("寫回 config.toml 失敗:{e}")))?;
 
     println!("\n✓ 已刪除 {} 個明文欄位:", removed.len());
     for p in &removed {

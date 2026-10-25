@@ -1,8 +1,8 @@
 # MCP HTTP 操作ごとの権限の有効期間
 
-更新日：2026-10-24。状態：`mcp-client` feature を使う、`duduclaw-llm` の未リリース開発者 API。
+更新日：2026-10-25。状態：`mcp-client` feature を使う、`duduclaw-llm` の未リリース開発者 API。
 
-ホストは MCP のツール探索や一回のツール呼び出しに、新しい bearer とその操作だけが所有する lease を渡せます。本書は共通トランスポート API のリファレンスです。この変更だけでは Gateway や Google 個人アカウントの処理に接続されず、利用者向けの画面や設定スイッチもありません。
+ホストは MCP のツール探索や一回のツール呼び出しに、新しい bearer とその操作だけが所有する lease を渡せます。本書は共通トランスポート API のリファレンスです。以下の bearer／lease API は従来の Generic 経路です。未リリースの Google 個人アカウント連携は下記の独立した Closed 経路を使い、新しい画面スイッチは追加しません。
 
 ## ホスト API の契約
 
@@ -33,6 +33,21 @@ Scoped の応答は、今回の bearer を返却 JSON の key と value から�
 
 `RegistryClient::Persistent` は既存の接続と `before_call_async` 経路を維持します。scoped の準備はその slot の before hook を置き換え、二重には呼びません。既存の filter、同名ツールの先着優先、`after_call`、ソース証明／CCR、ホスト通知は registry の処理を通ります。
 
+## Google ホストの Closed 接続（未リリースのソース草稿）
+
+`RegistryClient::scoped_http_closed(recipe, host_binding, guard)` で明示的に選択します。実際の slot が server、recipe、filter、元の設定項目、絶対期限を持つ `ClosedClientTarget` を非公開コンストラクターで作ります。`prepare_closed_client_call` は一度だけ消費する `OwnedScopedOperation` を返し、既定では拒否します。応答型や最終引数が違う場合、Generic bearer／lease API へ切り替えません。
+
+Gateway はメタデータ処理の移譲前に実際の依頼者を取得し、元の設定項目と順番、完全な frame、操作 nonce、元のアカウント選択を固定します。資格情報所有者が 3 POST、JSON／SSE 解読、文字結合、既知の JSON 再解析、整理、最後の bearer／session 除去を完了し、型付き完了結果だけを渡します。Closed リクエストと各 POST 応答はそれぞれ 16 MiB が上限で、応答は操作全体の合算制限ではありません。Closed の資格情報更新と送信では環境 proxy、リダイレクト、再試行を無効にします。
+
+同じ期限を registry と外側 loop の結果 hook、ソース検証、CCR 準備、次のモデル要求への引き渡しまで使います。期限切れの内容、アカウント通知、新しい CCR 参照は一緒に保留します。`ToolOutcome` の新しい任意フィールドは crate 内限定なので、`mcp-client` 使用時の外部 Rust struct literal はコンストラクターへの移行が必要です。既存コンストラクターの既定は Closed policy なしで、Generic／Persistent の従来シグネチャは維持します。
+
+同期キーチェーンとローカル処理は強制中断できず、戻った時点と次の送信前に期限を再確認します。中断は開始済みの資格情報更新、遠隔作用、保存を取り消しません。CCR は既存の単一呼び出しメタデータ tombstone 取引で清理し、開始済みの有限な SQLite 処理が後で完了する場合があります。クラッシュや清理失敗では未公開行が既存の期限処理まで残り得ます。永続的なタイムアウト調整機構や保存ゼロの保証は追加しません。
+
+新しい M1 テストはソースのみで未コンパイル／未実行です。feature 無効のビルド、独立コード／セキュリティ審査、完全な CI、実プロバイダーと利用者の受入れは未完了です。サービスアカウント委任、Bridge、その他 W3 経路は別作業です。
+
+
+Closed は provenance と結果メタデータを一時保持し、同期 ledger／route 構築後に元の期限をすべて再確認します。期限切れの結果を除外し、その span を含めず ledger を再構築してから確定します。テスト版では Home 更新端点の独立した owned fixture が必要で、欠ける場合は復号やプロバイダー送信前に拒否します。Legacy の端点方針は変更しません。
+
 ## ソース参照
 
 - [MCP client と registry](../../../crates/duduclaw-llm/src/mcp_client.rs)
@@ -40,3 +55,7 @@ Scoped の応答は、今回の bearer を返却 JSON の key と value から�
 - [Scoped HTTP テスト](../../../crates/duduclaw-llm/src/mcp_client/scoped_http_tests.rs)
 
 [English](../mcp-call-lifetimes.md) · [繁體中文](../zh-TW/mcp-call-lifetimes.md)
+
+### W3 アカウント種別
+
+未公開W3ソースは Home SA と委任を同じClosed操作契約に接続し、Google承認wireにサービスアカウント／Apps Scriptタグと任意の型付き `home_source` を追加します。既存Personal/OAuth JSONはこのフィールドを省略したままです。Rust struct literalで `GoogleAccountApproval` を作る外部コードは `home_source` の追加が必要です。Rustソース互換性の変更であり、公開構造体が同じバイト列であるとは主張しません。新たな依存、token schema、承認gateはありません。W3テストは未コンパイル・未実行です。

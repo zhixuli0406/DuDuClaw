@@ -1,6 +1,6 @@
-//! Identity and per-call authority for `oauth://google` mounts. The selected
-//! bearer lives only in the gateway's MCP client; a reused registry cannot
-//! turn a new requester or changed employee setting into old account access.
+//! Legacy Home/delegate authority for `oauth://google` mounts. Personal HTTP
+//! mounts use the opaque owned Closed operation exported below, with no bearer
+//! outlet to the generic MCP client. Every call captures its real requester.
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::google_identity::{Effective, Fallback, effective_for};
@@ -21,7 +21,7 @@ pub(crate) struct GoogleMountGuard {
 
 /// This is host task-local authority, not environment or wire input. A
 /// dispatched run is constrained by its gateway registration/upstream person.
-fn requester(agent: &str) -> RequesterIdentity {
+pub(in crate::google_identity) fn requester(agent: &str) -> RequesterIdentity {
     let run = crate::memory_provenance::DISPATCH_RUN
         .try_with(|run| run.as_ref().map(|(_, key)| key.clone()))
         .ok()
@@ -178,3 +178,5 @@ impl ToolInterceptor for GoogleMountGuard {
     }
     fn after_call(&self, _: &str, _: &str, _: &Value, _: &mut Value) {}
 }
+
+pub(crate) use super::effect_authority::GoogleClosedMount;

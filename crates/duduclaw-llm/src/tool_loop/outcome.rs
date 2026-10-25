@@ -28,6 +28,9 @@ pub(super) fn mask_and_cap(text: &str, max_chars: usize) -> Option<String> {
 /// aborting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
+    /// Host-only absolute validity; only the actual Closed registry constructs it.
+    #[cfg(feature = "mcp-client")]
+    pub(crate) closed_postprocess: Option<crate::mcp_client::ClosedPostprocessPolicy>,
     pub content: String,
     /// Trusted executor notice, never parsed from MCP result metadata. It is
     /// delivered separately after content redaction and source/CCR checks.
@@ -50,6 +53,8 @@ pub struct ToolOutcome {
 impl ToolOutcome {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "mcp-client")]
+            closed_postprocess: None,
             content: content.into(),
             host_notice: None,
             is_error: false,
@@ -62,6 +67,8 @@ impl ToolOutcome {
 
     pub fn error(content: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "mcp-client")]
+            closed_postprocess: None,
             content: content.into(),
             host_notice: None,
             is_error: true,

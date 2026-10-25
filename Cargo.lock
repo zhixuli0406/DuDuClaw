@@ -1920,6 +1920,7 @@ dependencies = [
  "dirs 5.0.1",
  "duduclaw-agent",
  "duduclaw-auth",
+ "duduclaw-cli",
  "duduclaw-cli-runtime",
  "duduclaw-container",
  "duduclaw-core",

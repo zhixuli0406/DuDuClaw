@@ -244,3 +244,6 @@ fn write_owner_only_atomic(home: &Path, body: &[u8]) -> Result<(), String> {
     }
     result
 }
+
+#[path = "delegation_key/w3_material.rs"]
+pub(crate) mod w3_material;

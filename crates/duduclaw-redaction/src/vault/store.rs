@@ -40,6 +40,16 @@ pub struct VaultEntry {
     pub expired_marker: bool,
 }
 
+/// Opaque metadata receipt for a set of encrypted alias mappings. It never
+/// contains decrypted values, ciphertext, keys or a restorable token payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MappingReceipt([u8; 32]);
+impl std::fmt::Debug for MappingReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MappingReceipt([opaque])")
+    }
+}
+
 /// Stats for dashboard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VaultStats {
@@ -246,6 +256,81 @@ impl VaultStore {
             last_reveal_at: row.last_reveal_at,
             expired_marker: is_expired,
         }))
+    }
+
+    /// Pin encrypted mapping identity before an approval without moving
+    /// plaintext restoration before that approval. Reject missing, expired,
+    /// oversized or ambiguous matches. Ordinary egress lookup is unchanged.
+    pub fn mapping_receipt(
+        &self,
+        args: &serde_json::Value,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<MappingReceipt> {
+        let mut tokens = crate::egress::collect_tokens(args);
+        tokens.sort();
+        tokens.dedup();
+        if tokens.len() > 128 {
+            return Err(RedactionError::vault("too many alias bindings"));
+        }
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        let initial = serde_json::to_vec(&(agent_id, session_key(session_id), args))?;
+        hash.update(&initial);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| RedactionError::vault("mapping receipt unavailable"))?;
+        let mut stmt=conn.prepare("SELECT CASE WHEN length(original_enc)<=65536 THEN original_enc ELSE NULL END,
+            category,rule_id,agent_id,session_id,restore_scope,cross_session,created_at,expires_at,expired_marker
+            FROM redaction_mappings WHERE token=?1 AND agent_id=?2 AND (session_id=?3 OR cross_session=1) LIMIT 2")?;
+        for token in tokens {
+            let mut rows =
+                stmt.query(params![token.as_str(), agent_id, session_key(session_id)])?;
+            let row = rows
+                .next()?
+                .ok_or_else(|| RedactionError::vault("alias mapping is missing"))?;
+            let encrypted: Option<Vec<u8>> = row.get(0)?;
+            let category: String = row.get(1)?;
+            let rule_id: String = row.get(2)?;
+            let owner: String = row.get(3)?;
+            let session: String = row.get(4)?;
+            let scope: String = row.get(5)?;
+            let cross: i64 = row.get(6)?;
+            let created: i64 = row.get(7)?;
+            let expires: i64 = row.get(8)?;
+            let expired: i64 = row.get(9)?;
+            if encrypted.is_none()
+                || expires <= Utc::now().timestamp()
+                || expired != 0
+                || rows.next()?.is_some()
+            {
+                return Err(RedactionError::vault(
+                    "alias mapping expired, oversized or ambiguous",
+                ));
+            }
+            // Parse the scope, but do not decrypt or authorize a reveal here.
+            // The existing egress evaluator still enforces the caller scope.
+            let _: RestoreScope = serde_json::from_str(&scope)?;
+            let bytes = serde_json::to_vec(&(
+                token.as_str(),
+                encrypted,
+                category,
+                rule_id,
+                owner,
+                session,
+                scope,
+                cross,
+                created,
+                expires,
+                expired,
+            ))?;
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(&bytes);
+        }
+        let digest = hash.finish();
+        let mut result = [0u8; 32];
+        result.copy_from_slice(digest.as_ref());
+        Ok(MappingReceipt(result))
     }
 
     /// Bump the reveal counter — called after a successful restore. Scoped to
@@ -771,5 +856,84 @@ mod tests {
             )
             .unwrap();
         assert!(!blob.windows(secret.len()).any(|w| w == secret.as_bytes()));
+    }
+    #[test]
+    fn mapping_receipt_reads_no_key_and_rejects_mutation_ambiguity_and_expiry() {
+        let (store, tmp) = fresh_store();
+        let token = "<REDACT:EMAIL:0123456789abcdef0123456789abcdef>";
+        // Deliberately invalid ciphertext: a metadata receipt must not try to
+        // decrypt it or create an agent key merely to pin the mapping.
+        store.conn.lock().unwrap().execute("INSERT INTO redaction_mappings(token,original_enc,category,rule_id,agent_id,session_id,restore_scope,cross_session,created_at,expires_at,expired_marker) VALUES(?1,?2,'EMAIL','unit','external','s1',?4,0,1,?3,0)",params![token,vec![1u8,2,3],Utc::now().timestamp()+3600,serde_json::to_string(&RestoreScope::AllScopes {scopes:vec![]}).unwrap()]).unwrap();
+        let args = serde_json::json!({"message_id":token});
+        let receipt = store
+            .mapping_receipt(&args, "external", Some("s1"))
+            .unwrap();
+        assert!(!tmp.path().join("external.key").exists());
+        store.record_reveal(token, "external", Some("s1")).unwrap();
+        assert_eq!(
+            receipt,
+            store
+                .mapping_receipt(&args, "external", Some("s1"))
+                .unwrap()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE redaction_mappings SET original_enc=?1 WHERE token=?2",
+                params![vec![4u8, 5, 6], token],
+            )
+            .unwrap();
+        assert_ne!(
+            receipt,
+            store
+                .mapping_receipt(&args, "external", Some("s1"))
+                .unwrap()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE redaction_mappings SET expires_at=1 WHERE token=?1",
+                [token],
+            )
+            .unwrap();
+        assert!(
+            store
+                .mapping_receipt(&args, "external", Some("s1"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn mapping_receipt_refuses_ambiguous_cross_session_matches() {
+        let (store, _tmp) = fresh_store();
+        let token = "<REDACT:EMAIL:0123456789abcdef0123456789abcdef>";
+        let scope = RestoreScope::AllScopes { scopes: vec![] };
+        for session in ["s1", "s2"] {
+            store
+                .insert_mapping(
+                    token,
+                    "fixture-value",
+                    "external",
+                    Some(session),
+                    "EMAIL",
+                    "unit",
+                    &scope,
+                    true,
+                    24,
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .mapping_receipt(
+                    &serde_json::json!({"message_id":token}),
+                    "external",
+                    Some("s1")
+                )
+                .is_err()
+        );
     }
 }

@@ -27,8 +27,10 @@
 
 pub mod check;
 pub(crate) mod credential_registry;
+pub(crate) mod effect_authority;
 pub mod delegation_key;
 pub mod execute;
+pub(crate) mod home_source;
 pub mod mailbox;
 pub(crate) mod mcp_mount;
 pub mod native_tools;
@@ -36,6 +38,8 @@ pub mod requester_gate;
 pub mod resolve;
 pub mod route;
 
+#[cfg(test)]
+pub(crate) mod route_test_probe;
 #[cfg(test)]
 mod tests;
 

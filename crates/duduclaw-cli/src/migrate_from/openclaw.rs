@@ -223,7 +223,7 @@ pub(super) async fn migrate_with_home(
     }
     let anthropic_key = env.get("ANTHROPIC_API_KEY").cloned().unwrap_or_default();
 
-    let mut config_table = read_config_table(&ctx.home);
+    let (mut config_table,config_expected_hash) = read_config_table(&ctx.home);
     plan_api_key(ctx, &mut report, &mut config_table, &anthropic_key);
     for (k, _) in env.iter() {
         if k.ends_with("_API_KEY") && k != "ANTHROPIC_API_KEY" {
@@ -269,7 +269,7 @@ pub(super) async fn migrate_with_home(
     }
 
     if ctx.apply
-        && let Err(e) = write_config_table(&ctx.home, &config_table)
+        && let Err(e) = write_config_table(&ctx.home,&config_table,&config_expected_hash)
     {
         report.skipped("config", "config.toml", format!("寫入失敗: {e}"));
     }

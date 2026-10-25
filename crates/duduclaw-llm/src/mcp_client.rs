@@ -98,6 +98,13 @@ pub enum McpError {
     Parse(String),
 }
 
+mod closed;
+pub use closed::{ClosedClientTarget, OwnedScopedFailure, OwnedScopedOperation, OwnedScopedReply};
+pub(crate) use closed::ClosedPostprocessPolicy;
+#[cfg(test)]
+#[path = "mcp_client/closed_tests.rs"]
+pub(crate) mod closed_tests;
+
 // ---------------------------------------------------------------------------
 // Data shapes
 // ---------------------------------------------------------------------------
@@ -1075,7 +1082,13 @@ pub enum RegistryClient {
 
 impl RegistryClient {
     pub fn scoped_http(recipe: ScopedHttpRecipe, guard: Arc<dyn ToolInterceptor>) -> Self {
-        Self::ScopedHttp(ScopedHttpSlot { recipe, guard })
+        Self::ScopedHttp(ScopedHttpSlot {
+            recipe,
+            guard,
+            mode: ScopedMode::Generic,
+            host_binding: String::new(),
+            closed_filter: ToolFilter::default(),
+        })
     }
 }
 
@@ -1083,6 +1096,14 @@ impl RegistryClient {
 pub struct ScopedHttpSlot {
     recipe: ScopedHttpRecipe,
     guard: Arc<dyn ToolInterceptor>,
+    mode: ScopedMode,
+    host_binding: String,
+    closed_filter: ToolFilter,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopedMode {
+    Generic,
+    Closed,
 }
 
 enum ScopedCallError {
@@ -1198,6 +1219,7 @@ pub struct ToolRegistry {
     /// Host-only deadlines parallel to scoped slots. Keeping this outside the
     /// mutex lets one timeout also bound waiting for that exact client lock.
     scoped_operation_timeouts: HashMap<usize, Duration>,
+    closed_client_indices: HashSet<usize>,
 }
 
 struct VerifiedMcpRoute {
@@ -1296,6 +1318,7 @@ impl ToolRegistry {
             client_interceptors: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
+            closed_client_indices: HashSet::new(),
         })
     }
 
@@ -1324,27 +1347,45 @@ impl ToolRegistry {
     ) -> Result<Self, McpError> {
         let mut client_interceptors = HashMap::new();
         let mut scoped_operation_timeouts = HashMap::new();
-        for (index, (name, client)) in clients.iter().enumerate() {
+        let mut closed_client_indices = HashSet::new();
+        for (index, (name, client)) in clients.iter_mut().enumerate() {
             if let RegistryClient::ScopedHttp(slot) = client {
                 if name.trim().is_empty() {
                     return Err(McpError::Spawn(
                         "scoped MCP server must have a host name".into(),
                     ));
                 }
-                client_interceptors.insert(index, slot.guard.clone());
+                if slot.mode == ScopedMode::Closed {
+                    slot.closed_filter = filters.get(index).cloned().unwrap_or_default();
+                    closed_client_indices.insert(index);
+                } else {
+                    client_interceptors.insert(index, slot.guard.clone());
+                }
                 scoped_operation_timeouts.insert(index, slot.recipe.operation_timeout);
             }
         }
         let mut per_client = Vec::with_capacity(clients.len());
+        let mut closed_discovery_deadlines = Vec::new();
         for (name, client) in &mut clients {
+            let index = per_client.len();
             per_client.push(match client {
                 RegistryClient::Persistent(client) => client.list_tools().await?,
+                RegistryClient::ScopedHttp(slot) if slot.mode == ScopedMode::Closed => {
+                    let deadline = tokio::time::Instant::now() + slot.recipe.operation_timeout;
+                    closed_discovery_deadlines.push((index, deadline));
+                    slot.discover_closed(name, deadline).await?
+                }
                 RegistryClient::ScopedHttp(slot) => slot.discover(name).await?,
             });
         }
+        for (index, deadline) in &closed_discovery_deadlines {
+            if tokio::time::Instant::now() >= *deadline {
+                per_client[*index].clear();
+            }
+        }
         let (routes, defs) = build_routes_filtered(&per_client, &filters);
         let (server_names, clients): (Vec<_>, Vec<_>) = clients.into_iter().unzip();
-        Ok(Self {
+        let registry = Self {
             clients: clients.into_iter().map(Mutex::new).collect(),
             routes,
             defs,
@@ -1355,7 +1396,26 @@ impl ToolRegistry {
             client_interceptors,
             client_notices: HashMap::new(),
             scoped_operation_timeouts,
-        })
+            closed_client_indices,
+        };
+        // Cloning/filtering schemas and dropping discovery inputs are part
+        // of discovery admission, before the final original-deadline check.
+        drop(per_client);
+        drop(filters);
+        #[cfg(test)]
+        if !closed_discovery_deadlines.is_empty() {
+            closed_tests::r2_admission_checkpoint("routes", registry.routes.len());
+        }
+        let now = tokio::time::Instant::now();
+        if closed_discovery_deadlines
+            .iter()
+            .any(|(_, deadline)| now >= *deadline)
+        {
+            return Err(McpError::Io(
+                OwnedScopedFailure::Unconfirmed.message().into(),
+            ));
+        }
+        Ok(registry)
     }
 
     /// Logical server name owning `tool`, when this registry was built with
@@ -1626,6 +1686,15 @@ impl ToolExecutor for ToolRegistry {
             .routes
             .get(name)
             .ok_or_else(|| format!("unknown tool: {name}"))?;
+        if self.closed_client_indices.contains(&idx) {
+            let timeout = *self
+                .scoped_operation_timeouts
+                .get(&idx)
+                .ok_or_else(|| "Closed MCP route unavailable".to_string())?;
+            return self
+                .call_closed_on_client(idx, name, args, tokio::time::Instant::now() + timeout)
+                .await;
+        }
         if self.source_attestation_required.contains(name)
             && !self.source_verifiers.contains_key(name)
         {
@@ -1933,6 +2002,7 @@ mod tests {
             client_interceptors: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
+            closed_client_indices: HashSet::new(),
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -1977,6 +2047,7 @@ mod tests {
             client_interceptors: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
+            closed_client_indices: HashSet::new(),
         };
         let scope = CcrScope {
             tenant_id: "local".into(),

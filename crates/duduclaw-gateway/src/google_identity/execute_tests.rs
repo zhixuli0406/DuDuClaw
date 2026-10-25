@@ -93,13 +93,22 @@ async fn post(app: Router, peer: &str, headers: HeaderMap, bytes: Vec<u8>) -> (u
 }
 async fn call(app: Router, home: &Home, value: Value) -> (u16, Value) {
     let bytes = serde_json::to_vec(&value).unwrap();
-    post(
+    let result = post(
         app,
         "127.0.0.1:5678",
         signed(home, "execute-bot", &bytes, INTERNAL),
         bytes,
     )
-    .await
+    .await;
+    for item in seen().lock().unwrap().iter() {
+        assert!(
+            !result
+                .1
+                .to_string()
+                .contains(&closed_fixture_token(&item.sub))
+        );
+    }
+    result
 }
 
 #[tokio::test]
@@ -137,15 +146,14 @@ async fn credential_wait_rechecks_original_authority_before_any_service_read() {
                 let raw = std::fs::read_to_string(home.p().join("config.toml")).unwrap();
                 std::fs::write(home.p().join("config.toml"), format!("{raw}\n[integrations.google_service_account]\nkey_file='unit-home-sa.json'\nsubject='{subject}'\n")).unwrap();
             } else {
-                std::fs::write(home.p().join(crate::mcp_oauth::TOKEN_FILE), serde_json::to_vec(&json!([{
-                    "provider_id":"google", "access_token":"unit-expired", "refresh_token":format!("unit-refresh:{subject}"),
-                    "expires_at":"2020-01-01T00:00:00Z", "scopes":["unit-fixture"],
-                }])).unwrap()).unwrap();
-                std::fs::write(home.p().join("mcp-oauth-configs.json"), serde_json::to_vec(&json!([{
-                    "provider_id":"google", "client_id":"unit-client", "client_secret":"unit-secret-only",
-                    "auth_url":format!("{}/authorize", mock()), "token_url":format!("{}/token", mock()),
-                    "redirect_uri":"http://127.0.0.1/unit", "scopes":["unit-fixture"],
-                }])).unwrap()).unwrap();
+                // Establish the normal source-bound Home state and machine
+                // key before capturing the operation that will wait. The
+                // fixture then expires naturally when its past clock drops.
+                let past = u64::try_from(chrono::Utc::now().timestamp()).unwrap() - 4 * 3600;
+                let _clock = crate::mcp_oauth::home_store::oauth_testing::ClockGuard::fixed(past);
+                crate::mcp_oauth::google_home_test_fixture::connect(
+                    home.p(), "unit-expired", Some(&format!("unit-refresh:{subject}")),
+                ).await;
             }
         }
         let (entered, release) = pause_mint(&subject);
@@ -202,9 +210,11 @@ async fn credential_wait_rechecks_original_authority_before_any_service_read() {
             );
         } else {
             assert_eq!(status, 403, "{mutation}: {value}");
+            // Preserve the resolver-specific refusal codes: the live
+            // disabled gate precedes the source fence for Delegate and
+            // Home service-account paths.
             let expected = match mutation {
-                "none" | "master" | "home-sa" | "home-oauth" => "disabled",
-                "sealed-key" => "delegate_unavailable",
+                "master" | "home-sa" => "disabled",
                 _ => "identity_changed",
             };
             assert_eq!(value["code"], expected, "{mutation}: {value}");
@@ -379,8 +389,9 @@ async fn dedicated_writes_never_retry_transient_service_responses() {
         req["arguments"] =
             json!({"document_id":format!("unit-write-{code}"),"text":"synthetic unit write"});
         let (status, value) = call(router(&home), &home, req).await;
-        assert_eq!(status, 200, "{value}");
-        assert_eq!(value["result"]["isError"], true, "{value}");
+        assert_eq!(status, 502, "{value}");
+        assert_eq!(value["code"], "result_unconfirmed", "{value}");
+        assert!(!value.to_string().contains(&closed_fixture_token(&subject)));
         let count = service_reads()
             .lock()
             .unwrap()

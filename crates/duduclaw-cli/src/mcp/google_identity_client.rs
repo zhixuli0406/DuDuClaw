@@ -141,7 +141,16 @@ impl GoogleCaller {
             Ok(authority) => authority,
             Err(error) => return super::tool_error(error),
         };
-        match super::google_execute_client::execute(home, agent, reference, tool, args).await {
+        match super::google_execute_client::execute(
+            home,
+            agent,
+            reference,
+            tool,
+            args,
+            self.dedicated.as_ref().and_then(|c| c.selection_stamp()),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(error) => super::tool_error(&error),
         }
@@ -203,7 +212,12 @@ impl GoogleCaller {
                 Err(m)
             }
             Plan::Gateway { agent } => match fetch(home, &agent, tool).await {
-                Ok(Fetched::Token { token, account, kind, user_id }) => {
+                Ok(Fetched::Token {
+                    token,
+                    account,
+                    kind,
+                    user_id,
+                }) => {
                     self.record(CallRecord {
                         identity: kind,
                         account,
@@ -313,9 +327,11 @@ impl GoogleCaller {
 fn plan_of(eff: &Effective, agent: &str) -> Plan {
     match eff {
         Effective::Home => Plan::Home,
-        Effective::Delegate { .. } | Effective::Personal { .. } if !agent.is_empty() => Plan::Gateway {
-            agent: agent.to_string(),
-        },
+        Effective::Delegate { .. } | Effective::Personal { .. } if !agent.is_empty() => {
+            Plan::Gateway {
+                agent: agent.to_string(),
+            }
+        }
         other => Plan::Refuse(
             duduclaw_gateway::google_identity::resolve::refusal_for(other)
                 .map(|r| r.message_zh)
@@ -368,10 +384,20 @@ async fn fetch(home: &Path, agent: &str, tool: &str) -> Result<Fetched, String> 
                 return Err("DuDuClaw gateway 的回應無法辨識。".into());
             }
             let kind = match v.get("identity_kind").and_then(Value::as_str) {
-                Some("owner") => "owner", Some("user") => "user", _ => "delegate",
+                Some("owner") => "owner",
+                Some("user") => "user",
+                _ => "delegate",
             };
-            let user_id = v.get("google_identity_user").and_then(Value::as_str).map(str::to_owned);
-            Ok(Fetched::Token { token, account, kind, user_id })
+            let user_id = v
+                .get("google_identity_user")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Ok(Fetched::Token {
+                token,
+                account,
+                kind,
+                user_id,
+            })
         }
         Some("home") => Ok(Fetched::Home {
             fallback: v.get("fallback").and_then(Value::as_bool).unwrap_or(false),
@@ -455,17 +481,26 @@ pub(crate) async fn status_header(home: &Path, caller: &GoogleCaller) -> (String
             let configured = match effective_for(home, Some(&agent)).effective {
                 Effective::Delegate { email } => format!("公司授權代表 {email}（網域委派）"),
                 Effective::Personal { selector } => match selector {
-                    duduclaw_core::google_identity::Selector::Owner => "跟著負責人的 Google 帳號".into(),
+                    duduclaw_core::google_identity::Selector::Owner => {
+                        "跟著負責人的 Google 帳號".into()
+                    }
                     _ => "指定同事的 Google 帳號".into(),
                 },
                 _ => "設定已變更".into(),
             };
             let (identity, state) = match fetch(home, &agent, "google_status").await {
                 Ok(Fetched::Token { account, kind, .. }) => (
-                    if kind == "delegate" { configured } else { format!("個人 Google 帳號 {account}") },
+                    if kind == "delegate" {
+                        configured
+                    } else {
+                        format!("個人 Google 帳號 {account}")
+                    },
                     "已連線；各工具仍依本人實際開放的服務判斷".to_string(),
                 ),
-                Ok(Fetched::Home { notice, .. }) => ("公司共用帳號".into(), notice.unwrap_or_else(|| "改用公司共用帳號".into())),
+                Ok(Fetched::Home { notice, .. }) => (
+                    "公司共用帳號".into(),
+                    notice.unwrap_or_else(|| "改用公司共用帳號".into()),
+                ),
                 Err(m) => (configured, format!("目前不能使用：{m}")),
             };
             (format!("目前代表：{identity}。\n狀態：{state}\n"), false)

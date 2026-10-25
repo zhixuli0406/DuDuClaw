@@ -316,3 +316,10 @@ mod tests {
         assert!(a.delete("x").await.is_err());
     }
 }
+
+impl FileSecretAdapter {
+    /// Apply existing roots and permissions before a closed owner captures a bounded handle.
+    pub fn closed_vetted_path(&self, name: &str) -> Result<PathBuf> {
+        vet_path(name, &self.home_dir)
+    }
+}

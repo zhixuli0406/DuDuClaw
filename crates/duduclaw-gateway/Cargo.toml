@@ -229,6 +229,10 @@ url = "2"
 libc = "0.2"
 
 [dev-dependencies]
+# Deterministic per-test Home deadline checks; production Tokio features stay unchanged.
+tokio = { workspace = true, features = ["test-util"] }
+# D1 composed CLI HTTP tests: dev-cycle only, no new production dependency.
+duduclaw-cli = { path = "../duduclaw-cli", default-features = false }
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
 calamine = "0.36.1"
 # P2-B: `Provenance::test_only` exists only with this feature (never in a

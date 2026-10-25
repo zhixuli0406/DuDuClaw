@@ -84,25 +84,25 @@ pub(crate) async fn execute(
             duduclaw_gateway::discovery::maintenance::check_clean(home).map_err(DuDuClawError::Agent)?;
             // Persist only after both known-good and cheating fixtures pass.
             let path = home.join("config.toml");
-            duduclaw_core::with_file_lock(&path, || {
-                let source = std::fs::read_to_string(&path)?;
-                let current_table = source.parse::<toml::Table>().map_err(std::io::Error::other)?;
+            let initial=std::fs::read_to_string(&path)?;
+            use sha2::Digest as _;
+            let expected_hash=hex::encode(sha2::Sha256::digest(initial.as_bytes()));
+            duduclaw_gateway::commit_config_rendered(home,&expected_hash,|source| {
+                let current_table = source.parse::<toml::Table>().map_err(|e|e.to_string())?;
                 let current: DiscoveryConfig = current_table.get("discovery")
-                    .ok_or_else(|| std::io::Error::other("discovery configuration removed"))?
-                    .clone().try_into().map_err(std::io::Error::other)?;
+                    .ok_or_else(|| "discovery configuration removed".to_string())?
+                    .clone().try_into().map_err(|e|e.to_string())?;
                 let current_config = serde_json::to_value(current.evaluators.get(&name))
-                    .map_err(std::io::Error::other)?;
+                    .map_err(|e|e.to_string())?;
                 if current_config != tested_config {
-                    return Err(std::io::Error::other("evaluator settings changed during self-test; repeat registration"));
+                    return Err("evaluator settings changed during self-test; repeat registration".to_string());
                 }
                 let mut doc = source
                     .parse::<toml_edit::DocumentMut>()
-                    .map_err(std::io::Error::other)?;
+                    .map_err(|e|e.to_string())?;
                 doc["discovery"]["evaluators"][&name]["sha256"] = toml_edit::value(&sha256);
-                let temporary = home.join(format!("config.discovery-{}.tmp", uuid::Uuid::new_v4()));
-                std::fs::write(&temporary, doc.to_string())?;
-                std::fs::rename(temporary, &path)
-            })?;
+                Ok(doc.to_string())
+            }).map_err(std::io::Error::other)?;
             println!(
                 "{}",
                 serde_json::json!({"status":"registered","evaluator":name,"sha256":sha256})

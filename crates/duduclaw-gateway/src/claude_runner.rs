@@ -1836,10 +1836,18 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         return Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry));
     }
 
-    let mut clients = vec![("duduclaw".to_string(), internal)];
+    let mut clients = vec![(
+        "duduclaw".to_string(),
+        duduclaw_llm::RegistryClient::Persistent(internal),
+    )];
     let mut filters = vec![duduclaw_llm::ToolFilter::default()];
     let mut google_guards = Vec::new();
     for ext in externals {
+        if let Some(mount) = ext.google_closed.clone() {
+            clients.push((ext.name.clone(), mount.registry_slot()));
+            filters.push(ext.filter);
+            continue;
+        }
         // Transport per entry: `url` ⇒ remote Streamable HTTP (Google
         // Workspace official MCP, DocuSeal self-hosted /mcp, …); otherwise
         // spawn the stdio child as before.
@@ -1868,7 +1876,10 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
                 if let Some(guard) = ext.google_guard {
                     google_guards.push((clients.len(), guard));
                 }
-                clients.push((ext.name.clone(), c));
+                clients.push((
+                    ext.name.clone(),
+                    duduclaw_llm::RegistryClient::Persistent(c),
+                ));
                 filters.push(ext.filter);
             }
             // A single external server failing must not sink the whole reply —
@@ -1892,7 +1903,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         {
             Ok(c) => {
                 info!(server = %server.name, "third-party .mcp.json server mounted behind duduclaw mcp-proxy");
-                clients.push((server.name, c));
+                clients.push((server.name, duduclaw_llm::RegistryClient::Persistent(c)));
                 filters.push(duduclaw_llm::ToolFilter::default());
             }
             Err(e) => {
@@ -1901,7 +1912,8 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         }
     }
 
-    let registry = match duduclaw_llm::ToolRegistry::from_clients_named(clients, filters).await {
+    let registry = match duduclaw_llm::ToolRegistry::from_client_slots_named(clients, filters).await
+    {
         Ok(mut reg) => {
             for (client, guard) in google_guards {
                 if let Some(notice) = guard.fallback_notice()
@@ -2875,15 +2887,19 @@ async fn call_local_inference(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    let raw = crate::on_behalf_of::context::scope(home_dir, agent_id.unwrap_or(""), call_local_inference_raw(
+    let raw = crate::on_behalf_of::context::scope(
         home_dir,
-        prompt,
-        system_prompt,
-        model_id,
-        agent_id,
-        capabilities,
+        agent_id.unwrap_or(""),
+        call_local_inference_raw(
+            home_dir,
+            prompt,
+            system_prompt,
+            model_id,
+            agent_id,
+            capabilities,
+        ),
     )
-    ).await?;
+    .await?;
     finish_local_reply(raw)
 }
 
@@ -4329,7 +4345,8 @@ fn prepare_claude_cmd(
         .and_then(|n| n.to_str());
     let turn = spawned.and_then(crate::computer_use_sessions::turns::register_current_turn);
     let knowledge = spawned.and_then(crate::knowledge::turn_requesters::register_current_turn);
-    let principal_context = spawned.and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));
+    let principal_context =
+        spawned.and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));
     crate::on_behalf_of::context::inject(&mut cmd, principal_context.as_ref());
 
     Ok((

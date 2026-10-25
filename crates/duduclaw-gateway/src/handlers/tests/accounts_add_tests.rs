@@ -928,11 +928,46 @@ async fn stale_config_writer_cannot_restore_deleted_account() {
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let path = home.path().join("config.toml");
     std::fs::write(&path, "[[accounts]]\nid = \"old-token\"\n").unwrap();
-    let stale: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let (stale, snapshot) = handler.read_toml_write_snapshot(&path).await.unwrap();
     let removed = handler.handle_accounts_remove(json!({"account_id": "old-token"})).await;
     assert!(matches!(removed, WsFrame::Response { ok: true, .. }), "{removed:?}");
-    let result = handler.atomic_write_toml(&path, &stale).await;
+    let result = handler.atomic_write_toml_snapshot(&path, &stale, snapshot).await;
     assert!(result.is_err());
     let current: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
     assert!(current["accounts"].as_array().unwrap().is_empty());
+}
+
+
+#[tokio::test]
+async fn home_whole_table_helper_without_original_snapshot_refuses_even_fresh_table() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let path = home.path().join("config.toml");
+    let original = "[integrations]\ngoogle_workspace=false\n";
+    std::fs::write(&path, original).unwrap();
+    let table = original.parse::<toml::Table>().unwrap();
+    assert!(handler.atomic_write_toml(&path, &table).await.is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn home_snapshot_handler_refuses_external_target_and_preserves_bad_read() {
+    let home = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let other_path = other.path().join("config.toml");
+    std::fs::write(&other_path, "[integrations]\ngoogle_workspace=false\n").unwrap();
+    assert!(handler.read_toml_write_snapshot(&other_path).await.is_err());
+    let (table, snapshot) = config_commit::read_home_table_snapshot(&other_path).unwrap();
+    assert!(handler.atomic_write_toml_snapshot(&other_path, &table, snapshot).await.is_err());
+    let path = home.path().join("config.toml");
+    let invalid = "[broken";
+    std::fs::write(&path, invalid).unwrap();
+    assert!(handler.read_toml_write_snapshot(&path).await.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+    // A non-NotFound IO failure is also a refusal, never an empty table.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(handler.read_toml_write_snapshot(&path).await.is_err());
+    assert!(path.is_dir());
 }

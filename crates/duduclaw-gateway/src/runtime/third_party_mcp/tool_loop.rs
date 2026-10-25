@@ -132,6 +132,8 @@ mod tests {
             headers: Vec::new(),
             filter: Default::default(),
             google_guard: None,
+            google_closed: None,
+            source_ordinal: 0,
         }
     }
 

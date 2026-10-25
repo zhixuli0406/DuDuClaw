@@ -242,10 +242,11 @@ impl MethodHandler {
     /// error, and creates no backup (a true no-op should leave no trace).
     pub(crate) async fn handle_security_credential_cleanup(&self, ctx: &UserContext) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
-        let table = match self.read_config_table_strict(&config_path).await {
-            Ok(t) => t,
-            Err(e) => return WsFrame::error_response("", &format!("憑證清理失敗:{e}")),
+        let original=match super::config_commit::read_text_or_empty(&config_path) {
+            Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("憑證清理失敗:{e}")),
         };
+        let table:toml::Table=match original.parse() {Ok(t)=>t,Err(e)=>return WsFrame::error_response("",&format!("憑證清理失敗:{e}"))};
+        let expected_hash=super::config_commit::content_hash(&original);
 
         let cleanable = crate::security_posture::find_plaintext_secrets(&table)
             .iter()
@@ -269,6 +270,7 @@ impl MethodHandler {
             Ok(b) => b,
             Err(e) => return WsFrame::error_response("", &format!("備份設定檔失敗:{e}")),
         };
+        if raw.as_slice()!=original.as_bytes() { return WsFrame::error_response("","設定檔已變更，請重新整理後再清理。"); }
         if let Err(e) = tokio::fs::write(&backup_path, &raw).await {
             return WsFrame::error_response("", &format!("備份設定檔失敗:{e}"));
         }
@@ -294,20 +296,9 @@ impl MethodHandler {
             let path_for_lock = config_path.clone();
             let table_for_write = table.clone();
             tokio::task::spawn_blocking(move || {
-                duduclaw_core::with_file_lock(&path_for_lock, || {
-                    // Format-preserving: only the stripped keys leave the
-                    // file; the operator's comments and order stay.
-                    let current = std::fs::read_to_string(&path_for_lock)?;
-                    let content =
-                        super::config_commit::render_preserving(&current, &table_for_write)
-                            .map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
-                    let tmp_path = path_for_lock.with_extension("toml.tmp");
-                    std::fs::write(&tmp_path, content)?;
-                    std::fs::rename(&tmp_path, &path_for_lock)?;
-                    Ok::<(), std::io::Error>(())
-                })
+                super::config_commit::commit_rendered_locked(&path_for_lock,&expected_hash,|current| {
+                    super::config_commit::render_preserving(current,&table_for_write)
+                }).map_err(std::io::Error::other)
             })
             .await
         };

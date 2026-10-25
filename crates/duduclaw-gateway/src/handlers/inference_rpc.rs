@@ -21,7 +21,10 @@ impl MethodHandler {
     /// Response: `{ success, changes[] }`.
     pub(crate) async fn handle_skill_synthesis_update(&self, params: Value) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         let changes = match apply_skill_synthesis_to_table(&mut table, &params) {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
@@ -29,7 +32,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response("", "No valid skill_synthesis fields to update");
         }
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }
         info!(?changes, "skill_synthesis.update completed");

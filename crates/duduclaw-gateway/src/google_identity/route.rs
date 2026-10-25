@@ -176,6 +176,13 @@ pub(crate) async fn serve(
     tool: &str,
     requester: &RequesterIdentity,
 ) -> Result<Value, Refusal> {
+    #[cfg(test)]
+    if super::route_test_probe::refuse_work(&state.home, super::route_test_probe::Work::Token) {
+        return Err(Refusal::hard(
+            "test_work_boundary",
+            "Token work refused by owned route test.",
+        ));
+    }
     if !crate::google_workspace::integration_enabled(&state.home) {
         let outcome = Err(Refusal::hard(
             "disabled",
@@ -185,7 +192,8 @@ pub(crate) async fn serve(
         return outcome.map(|_| Value::Null);
     }
     let people = people_for(&state.home, state.users.as_ref());
-    let outcome = resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
+    let outcome =
+        resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
     audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
     match outcome? {
         Resolved::Delegated { email, token } => Ok(json!({
@@ -195,7 +203,13 @@ pub(crate) async fn serve(
             "expires_in": token.expires_in,
             "account_email": email,
         })),
-        Resolved::Personal { kind, user_id, email, token } => Ok(json!({
+        Resolved::Personal {
+            kind,
+            user_id,
+            email,
+            token,
+            ..
+        } => Ok(json!({
             "ok": true, "mode": "delegate", "identity_kind": kind, "google_identity_user": user_id,
             "access_token": token.access_token, "expires_in": token.expires_in, "account_email": email,
         })),

@@ -237,7 +237,7 @@ fn caller_label(c: &Caller) -> String {
     }
 }
 
-fn collect_tokens(v: &Value) -> Vec<Token> {
+pub(crate) fn collect_tokens(v: &Value) -> Vec<Token> {
     fn walk(v: &Value, out: &mut Vec<Token>) {
         match v {
             Value::String(s) => {

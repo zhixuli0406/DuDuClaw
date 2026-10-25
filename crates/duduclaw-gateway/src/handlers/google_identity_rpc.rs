@@ -314,7 +314,9 @@ impl MethodHandler {
         };
         if !personal_domains.is_empty() { section.insert("allowed_domains".into(), toml::Value::Array(personal_domains.iter().cloned().map(toml::Value::String).collect())); }
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let original=match super::config_commit::read_text_or_empty(&config_path) {Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("無法寫入 config.toml：{e}"))};
+        let config_expected_hash=super::config_commit::content_hash(&original);
+        let mut table=original.parse::<toml::Table>().unwrap_or_default();
         let mut integrations = table
             .get("integrations")
             .and_then(|v| v.as_table())
@@ -326,7 +328,7 @@ impl MethodHandler {
             integrations.insert(gi::HOME_SECTION.into(), toml::Value::Table(section));
         }
         table.insert("integrations".into(), toml::Value::Table(integrations));
-        if let Err(e) = self.write_config_table(&config_path, &table).await {
+        if let Err(e) = self.write_config_table_snapshot(&config_path,config_expected_hash,&table).await {
             return WsFrame::error_response("", &format!("無法寫入 config.toml：{e}"));
         }
         sec_audit(

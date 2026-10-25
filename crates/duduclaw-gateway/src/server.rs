@@ -16392,101 +16392,49 @@ async fn handle_reliability_summary_http(
 
 // ── MCP OAuth callback endpoint ─────────────────────────────
 
-/// Query parameters from the OAuth provider redirect.
-#[derive(serde::Deserialize)]
-struct OAuthCallbackParams {
-    code: String,
-    state: String,
+/// GET /api/mcp/oauth/callback — fixed redacted result, including malformed,
+/// rejected and code-less replies. Identifiable state is consumed once by host.
+async fn handle_mcp_oauth_callback(
+    State(state):State<Arc<AppState>>,
+    axum::extract::RawQuery(query):axum::extract::RawQuery,
+)->axum::response::Response {
+    let result=crate::mcp_oauth::complete_callback_query(state.handler.home_dir(),state.handler.mcp_oauth_pending(),query.as_deref().unwrap_or("")).await;
+    if matches!(result.as_deref(),Ok("github")) {
+        match crate::github_workspace::enable_integration(state.handler.home_dir()) {
+            Ok(true)=>info!("enabled [integrations] github in config.toml"),
+            Ok(false)=>{},Err(_)=>warn!("could not auto-enable github integration; enable it manually in config.toml"),
+        }
+    }
+    // Google master enable already belongs to its same-ticket three-point
+    // publication. A generic enable here would rotate/invalidate its source.
+    mcp_oauth_callback_html(result.is_ok())
+}
+fn mcp_oauth_callback_html(success:bool)->axum::response::Response {
+    let body=if success{"<!doctype html><html><body><h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p></body></html>"}
+        else{"<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>"};
+    let mut response=axum::response::Html(body).into_response();
+    let headers=response.headers_mut();
+    headers.insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));
+    headers.insert(axum::http::HeaderName::from_static("referrer-policy"),axum::http::HeaderValue::from_static("no-referrer"));
+    headers.insert(axum::http::HeaderName::from_static("content-security-policy"),axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"));
+    response
 }
 
-/// GET /api/mcp/oauth/callback — Handles the OAuth redirect from the provider.
-async fn handle_mcp_oauth_callback(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<OAuthCallbackParams>,
-) -> impl IntoResponse {
-    // Look up the pending OAuth flow by state nonce
-    let pending = {
-        let mut map = state.handler.mcp_oauth_pending().write().await;
-        crate::mcp_oauth::cleanup_pending(&mut map);
-        map.remove(&params.state)
-    };
-
-    let pending = match pending {
-        Some(p) => p,
-        None => {
-            warn!("MCP OAuth callback with unknown state parameter");
-            return axum::response::Html(
-                "<html><body><h2>Authentication failed</h2>\
-                 <p>Unknown or expired OAuth state. Please try again from the dashboard.</p>\
-                 </body></html>"
-                    .to_string(),
-            );
-        }
-    };
-
-    // Exchange the authorization code for tokens
-    match crate::mcp_oauth::exchange_and_store(
-        state.handler.home_dir(),
-        &pending.config,
-        &params.code,
-        &pending.code_verifier,
-    )
-    .await
-    {
-        Ok(()) => (),
-        Err(e) => {
-            warn!(provider = %pending.provider_id, error = %e, "MCP OAuth token exchange failed");
-            return axum::response::Html(format!(
-                "<html><body><h2>Authentication failed</h2>\
-                 <p>Token exchange error: {}</p>\
-                 <p>Please close this window and try again.</p>\
-                 </body></html>", html_escape(&e)
-            ));
-        }
-    };
-
-    // The exchange helper holds the grant fence through durable publication.
-    let home_dir = state.handler.home_dir();
-
-    info!(provider = %pending.provider_id, "MCP OAuth authentication successful");
-
-    // Connecting Google IS the opt-in: flip the `[integrations]
-    // google_workspace` gate so the 19 workspace tools actually reach agents.
-    // Leaving it to a manual config.toml edit made "connected" a lie — the
-    // credential test passed while every tool call dead-ended.
-    if pending.provider_id == "google" {
-        match crate::google_workspace::enable_integration(home_dir) {
-            Ok(true) => info!("enabled [integrations] google_workspace in config.toml"),
-            Ok(false) => {}
-            Err(e) => {
-                warn!(error = %e, "could not auto-enable google_workspace integration; enable it manually in config.toml")
-            }
+#[cfg(test)]
+mod home_callback_response_tests {
+    use super::*;
+    #[tokio::test]
+    async fn callback_html_is_fixed_redacted_and_has_no_store_or_referrer() {
+        for success in [false,true] {
+            let response=mcp_oauth_callback_html(success);
+            assert_eq!(response.headers()["cache-control"],"no-store");
+            assert_eq!(response.headers()["referrer-policy"],"no-referrer");
+            let body=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
+            let text=std::str::from_utf8(&body).unwrap();
+            assert!(!text.contains("error_description"));assert!(!text.contains("owned-code"));
+            assert!(text.contains(if success{"Authentication Successful"}else{"Authentication failed"}));
         }
     }
-    // H8 (2026-09 feature audit): GitHub now has the same deny-by-default
-    // gate Google does, so connecting has to open it for the same reason —
-    // otherwise the connection test goes green while every GitHub tool call
-    // dead-ends on the closed gate.
-    if pending.provider_id == "github" {
-        match crate::github_workspace::enable_integration(home_dir) {
-            Ok(true) => info!("enabled [integrations] github in config.toml"),
-            Ok(false) => {}
-            Err(e) => {
-                warn!(error = %e, "could not auto-enable github integration; enable it manually in config.toml")
-            }
-        }
-    }
-
-    axum::response::Html(
-        "<html><body style=\"font-family: system-ui, sans-serif; display: flex; \
-         justify-content: center; align-items: center; height: 100vh; margin: 0; \
-         background: #F5F4F0;\">\
-         <div style=\"text-align: center;\">\
-         <h2 style=\"color: #102B48;\">Authentication Successful</h2>\
-         <p style=\"color: #5B6470;\">You can close this window and return to the dashboard.</p>\
-         </div></body></html>"
-            .to_string(),
-    )
 }
 
 // ── Remote MCP OAuth callback (remote_mcp) ──────────────────

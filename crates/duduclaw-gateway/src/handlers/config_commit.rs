@@ -169,6 +169,63 @@ pub(crate) fn read_text_or_empty(path: &Path) -> Result<String, String> {
     }
 }
 
+/// Host-owned proof of the read which produced a whole Home config table.
+/// No caller may replace this with a fresh hash taken at final publication.
+pub(crate) struct HomeTableSnapshot {
+    path: PathBuf,
+    expected_hash: String,
+    existed: bool,
+}
+
+pub(crate) fn read_home_table_snapshot(
+    path: &Path,
+) -> Result<(toml::Table, HomeTableSnapshot), String> {
+    if path.file_name().and_then(|n| n.to_str()) != Some("config.toml") {
+        return Err("Home table snapshot requires config.toml".into());
+    }
+    let (raw, existed) = match std::fs::read_to_string(path) {
+        Ok(raw) => (raw, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let table = raw
+        .parse::<toml::Table>()
+        .map_err(|e| format!("Invalid config.toml; refusing edit: {e}"))?;
+    let snapshot = HomeTableSnapshot {
+        path: path.to_path_buf(),
+        expected_hash: content_hash(&raw),
+        existed,
+    };
+    Ok((table, snapshot))
+}
+
+pub(crate) fn commit_home_table_snapshot(
+    path: &Path,
+    snapshot: HomeTableSnapshot,
+    table: &toml::Table,
+) -> Result<(), String> {
+    if snapshot.path.as_path() != path {
+        return Err("config.toml snapshot target mismatch".into());
+    }
+    commit_rendered_locked(path, &snapshot.expected_hash, |current| {
+        // An absent read must not bless a concurrently created empty file.
+        if path.try_exists().map_err(|e| e.to_string())? != snapshot.existed {
+            return Err(changed_on_disk(path));
+        }
+        let current_table = current
+            .parse::<toml::Table>()
+            .map_err(|e| format!("Invalid config.toml; refusing edit: {e}"))?;
+        // Keep the legacy whole-table helper's accounts restriction, now
+        // after the original snapshot CAS and under the common locks.
+        if current_table.get("accounts") != table.get("accounts") {
+            return Err(
+                "config.toml accounts changed while this edit was open; reload and retry".into(),
+            );
+        }
+        render_preserving(current, table)
+    })
+}
+
 /// Atomically replace `path` with `new_content`, under the cross-process
 /// advisory lock, but only when the file still hashes to `expected_hash`
 /// (the hash of what the caller read). Synchronous; call it through
@@ -220,6 +277,24 @@ pub(crate) fn commit_rendered_locked(
     expected_hash: &str,
     render: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(), String> {
+    commit_rendered_policy(path,expected_hash,render,true)
+}
+/// Existing local CLI policy remains at its caller. This narrow final-write
+/// adapter changes locking/durability, not operator role/product policy.
+pub(crate) fn commit_local_config_rendered(
+    home:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,
+)->Result<(),String> {
+    commit_rendered_policy(&home.join("config.toml"),expected_hash,render,false)
+}
+fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool)->Result<(),String> {
+    if path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
+        let home=path.parent().ok_or("config.toml has no parent")?;
+        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g))))
+            .map_err(|e|e.to_string())?;
+    }
+    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None)
+}
+fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>)->Result<(),String> {
     let outcome = duduclaw_core::with_file_lock(path, || {
         let current = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -233,7 +308,7 @@ pub(crate) fn commit_rendered_locked(
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
-        if matches!(path.file_name().and_then(|n| n.to_str()), Some("config.toml" | "agent.toml" | "inference.toml")) {
+        if dashboard_policy && matches!(path.file_name().and_then(|n| n.to_str()), Some("config.toml" | "agent.toml" | "inference.toml")) {
             let home = if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
                 path.parent().and_then(Path::parent).and_then(Path::parent)
             } else { path.parent() };
@@ -242,6 +317,9 @@ pub(crate) fn commit_rendered_locked(
                     return Ok(Err(e));
                 }
             }
+        }
+        if let Some(g)=source {
+            return Ok(crate::google_identity::home_source::commit_google_config_under_guard(g,&current,&new_content).map_err(|e|e.to_string()));
         }
         replace_owner_only(path, &new_content)?;
         Ok(Ok(()))

@@ -174,19 +174,57 @@ impl MethodHandler {
 #[cfg(any(test, feature = "live-test-mocks"))]
 pub(crate) mod test_store {
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
 
     use duduclaw_security::credential_protection::MemoryKeyStore;
 
-    /// One app-bound in-memory store per home, shared across calls.
+    // Match the physical home used by the marker and Google call context. For a
+    // home not created yet, resolve its existing ancestor without creating it;
+    // the same identity must survive enable() creating the remaining directories.
+    fn home_identity(home: &Path) -> PathBuf {
+        let absolute = if home.is_absolute() {
+            home.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(home))
+                .unwrap_or_else(|_| home.to_path_buf())
+        };
+        for ancestor in absolute.ancestors() {
+            if let Ok(mut physical) = ancestor.canonicalize() {
+                let Ok(suffix) = absolute.strip_prefix(ancestor) else {
+                    continue;
+                };
+                for component in suffix.components() {
+                    match component {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            physical.pop();
+                        }
+                        _ => physical.push(component.as_os_str()),
+                    }
+                    // A missing/.. suffix may return to an existing symlink.
+                    if let Ok(resolved) = physical.canonicalize() {
+                        physical = resolved;
+                    }
+                }
+                return physical;
+            }
+        }
+        // Unresolvable paths stay isolated; this test seam never writes paths
+        // or changes the platform store's canonical-account policy.
+        absolute
+    }
+
+    /// One app-bound in-memory store per physical home, shared across calls.
     pub(crate) fn for_home(home: &Path) -> Arc<MemoryKeyStore> {
         static STORES: OnceLock<Mutex<HashMap<PathBuf, Arc<MemoryKeyStore>>>> = OnceLock::new();
+        let identity = home_identity(home);
         STORES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .entry(home.to_path_buf())
+            .entry(identity)
             .or_insert_with(|| Arc::new(MemoryKeyStore::app_bound()))
             .clone()
     }

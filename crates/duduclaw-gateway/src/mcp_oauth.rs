@@ -9,6 +9,40 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;
 
+#[path = "mcp_oauth/home_lifecycle.rs"]
+pub(crate) mod home_lifecycle;
+#[path = "mcp_oauth/home_store.rs"]
+pub(crate) mod home_store;
+#[cfg(test)]
+pub(crate) mod google_home_test_fixture;
+
+/// Opaque naming facade; secret ownership stays in the lexical SourceOwner.
+pub(crate) mod home_oauth_material {
+    pub(crate) use crate::google_identity::home_source::{
+        HomeOAuthBearer, HomeOAuthMaterialProof, HomeOAuthResolved, resolve_home_oauth_pinned,
+        validate_home_oauth_material,
+    };
+}
+
+#[path = "mcp_oauth/home_clients.rs"]
+mod home_clients;
+
+/// Nonsecret classification only, never a token/authority or a public view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeRevokePresence {
+    NoCredential,
+    GoogleCredential,
+    OtherProvider,
+}
+/// The caller must already hold this home's global Google grant lease.
+/// Missing/hidden public tokens alone never prove that revoke is safe.
+pub(crate) fn home_presence_for_personal_revoke(
+    home: &Path,
+    lease: &crate::google_personal::grants::Lease,
+) -> home_store::Result<HomeRevokePresence> {
+    home_store::read_revoke_presence(home, lease)
+}
+
 /// OAuth provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpOAuthConfig {
@@ -31,14 +65,144 @@ pub struct McpOAuthToken {
     pub scopes: Vec<String>,
 }
 
-/// In-memory state for a pending OAuth flow (waiting for callback).
-#[derive(Debug, Clone)]
+/// Closed RAM flow. Google never carries an unbound legacy config. No
+/// Debug/Clone/serialization or field constructor can bypass this distinction.
 pub struct PendingOAuth {
-    pub provider_id: String,
-    pub state: String,
-    pub code_verifier: String,
-    pub config: McpOAuthConfig,
-    pub created_at: std::time::Instant,
+    flow: PendingOAuthFlow,
+}
+enum PendingOAuthFlow {
+    Google(home_lifecycle::GoogleHomePending),
+    Other {
+        config: McpOAuthConfig,
+        verifier: zeroize::Zeroizing<String>,
+        created_at: std::time::Instant,
+    },
+}
+impl PendingOAuth {
+    pub(crate) fn other(config: McpOAuthConfig, verifier: String) -> Result<Self, String> {
+        if config.provider_id == "google" {
+            return Err("Google requires a bound Home flow.".into());
+        }
+        Ok(Self {
+            flow: PendingOAuthFlow::Other {
+                config,
+                verifier: zeroize::Zeroizing::new(verifier),
+                created_at: std::time::Instant::now(),
+            },
+        })
+    }
+    fn is_google(&self) -> bool {
+        matches!(&self.flow, PendingOAuthFlow::Google(_))
+    }
+    fn expired(&self) -> bool {
+        match &self.flow {
+            PendingOAuthFlow::Google(p) => p.is_expired(),
+            PendingOAuthFlow::Other { created_at, .. } => {
+                created_at.elapsed().as_secs() >= PENDING_TTL_SECS
+            }
+        }
+    }
+}
+/// B1 grant is already dropped. Revalidate SAME ticket after the final RAM
+/// write-lock await before exposing URL/state or replacing the latest flow.
+pub(crate) async fn insert_google_start(
+    home: &Path,
+    started: home_lifecycle::StartedGoogleHomeAuthorization,
+    pending: &tokio::sync::RwLock<HashMap<String, PendingOAuth>>,
+) -> home_store::Result<(String, String)> {
+    let (url, state, google) = started.into_response_parts();
+    let mut map = pending.write().await;
+    home_lifecycle::validate_google_home_pending(home, &google)?;
+    cleanup_pending(&mut map);
+    map.retain(|_, entry| !entry.is_google());
+    map.insert(
+        state.clone(),
+        PendingOAuth {
+            flow: PendingOAuthFlow::Google(google),
+        },
+    );
+    Ok((url, state))
+}
+/// One identifiable RAM state is consumed even for provider rejection/missing
+/// code. Query scope/error_description are never token evidence or output.
+pub(crate) async fn complete_callback_query(
+    home: &Path,
+    pending: &tokio::sync::RwLock<HashMap<String, PendingOAuth>>,
+    query: &str,
+) -> Result<String, ()> {
+    // Unknown descriptions/scopes are never decoded or echoed. Even an
+    // oversized rejection can consume its one unambiguous bounded state;
+    // oversize/malformed code cannot become a provider request.
+    let mut states = Vec::new();
+    let mut code = None;
+    let mut failed = query.len() > 16 * 1024;
+    fn decoded(value: &str) -> String {
+        let field = zeroize::Zeroizing::new(format!("v={value}"));
+        url::form_urlencoded::parse(field.as_bytes())
+            .next()
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
+    }
+    for field in query.split('&') {
+        let (raw_key, raw_value) = field.split_once('=').unwrap_or((field, ""));
+        if raw_key.len() > 32 {
+            continue;
+        }
+        let key = decoded(raw_key);
+        match key.as_str() {
+            "state" => {
+                if raw_value.len() > 384 || states.len() >= 128 {
+                    return Err(());
+                }
+                states.push(decoded(raw_value));
+            }
+            "code" => {
+                if code.is_some() || raw_value.len() > 48 * 1024 {
+                    failed = true;
+                } else if !failed {
+                    code = Some(zeroize::Zeroizing::new(decoded(raw_value)));
+                }
+            }
+            "error" => failed = true,
+            _ => {}
+        }
+    }
+    if states.is_empty() || states.iter().any(|s| s != &states[0]) {
+        return Err(());
+    }
+    if states.len() != 1 {
+        failed = true;
+    }
+    let state = &states[0];
+    if state.is_empty() || state.len() > 128 || state.chars().any(char::is_control) {
+        return Err(());
+    }
+    let entry = {
+        let mut map = pending.write().await;
+        cleanup_pending(&mut map);
+        map.remove(state)
+    }
+    .ok_or(())?;
+    if failed {
+        return Err(());
+    }
+    let code = code.filter(|c| !c.is_empty()).ok_or(())?;
+    match entry.flow {
+        PendingOAuthFlow::Google(google) => {
+            home_lifecycle::complete_google_home_authorization(home, google, state, code)
+                .await
+                .map_err(|_| ())?;
+            Ok("google".into())
+        }
+        PendingOAuthFlow::Other {
+            config, verifier, ..
+        } => {
+            exchange_and_store(home, &config, &code, &verifier)
+                .await
+                .map_err(|_| ())?;
+            Ok(config.provider_id)
+        }
+    }
 }
 
 pub const TOKEN_FILE: &str = "mcp-oauth-tokens.json";
@@ -85,22 +249,12 @@ pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
             client_secret: String::new(),
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
             token_url: "https://oauth2.googleapis.com/token".into(),
-            // Native Gmail + Calendar tool surface. `gmail.compose` is required
-            // to create drafts; `calendar.events` to create/list events. `drive`
-            // was dropped (no Drive tools ship) to keep the authorization
-            // surface minimal. Tokens authorized with the old scope set will
-            // 403 on the new write APIs → the tools guide the user to reconnect.
-            scopes: vec![
-                "https://www.googleapis.com/auth/gmail.readonly".into(),
-                "https://www.googleapis.com/auth/gmail.compose".into(),
-                "https://www.googleapis.com/auth/calendar.events".into(),
-                // v1.45: Sheets read/append native tools. Tokens authorized
-                // before this scope was added will 403 on the Sheets APIs → the
-                // tools guide the user to reconnect (google_status flags it as a
-                // missing scope).
-                "https://www.googleapis.com/auth/spreadsheets".into(),
-                "https://www.googleapis.com/auth/userinfo.email".into(),
-            ],
+            // This exact full Home request is captured by B1 and callback.
+            // Legacy token rows are not upgraded by this template change.
+            scopes: crate::google_workspace::REQUIRED_SCOPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             redirect_uri: redirect_uri.to_string(),
         },
         McpOAuthConfig {
@@ -284,21 +438,34 @@ pub fn build_exchange_request(
     }
 }
 
-/// Exchange an authorization code for tokens.
-/// Complete a home OAuth exchange and publication under the same grant
+/// Complete a non-Google OAuth exchange and publication under the same grant
 /// lease used by personal connections. CLI/HTTP entry points must use this
 /// wrapper rather than separating exchange and upsert across the fence.
-pub async fn exchange_and_store(home: &Path, config: &McpOAuthConfig, code: &str, verifier: &str) -> Result<(), String> {
+pub async fn exchange_and_store(
+    home: &Path,
+    config: &McpOAuthConfig,
+    code: &str,
+    verifier: &str,
+) -> Result<(), String> {
+    if config.provider_id == "google" {
+        return Err("Google requires a bound Home flow.".into());
+    }
     let _lease = crate::google_personal::grants::acquire(home).await?;
     let token = exchange_code(config, code, verifier).await?;
     upsert_token(home, token)
 }
 
+/// Generic provider transport; Google must consume its bound Home flow.
 pub async fn exchange_code(
     config: &McpOAuthConfig,
     code: &str,
     code_verifier: &str,
 ) -> Result<McpOAuthToken, String> {
+    if config.provider_id == "google" {
+        return Err("Google requires a bound Home flow.".into());
+    }
+    #[cfg(test)]
+    home_store::test_probe::provider(&config.client_id);
     let client = reqwest::Client::new();
     let plan = build_exchange_request(config, code, code_verifier);
 
@@ -368,6 +535,9 @@ pub async fn refresh_token(
     config: &McpOAuthConfig,
     refresh_tok: &str,
 ) -> Result<McpOAuthToken, String> {
+    if config.provider_id == "google" {
+        return Err(home_store::Error::PendingWiring.to_string());
+    }
     let client = reqwest::Client::new();
     let params = [
         ("grant_type", "refresh_token"),
@@ -442,6 +612,8 @@ pub async fn refresh_token(
 const ENC_PREFIX: &str = "enc:v1:";
 
 fn encrypt_field(plaintext: &str, home_dir: &Path) -> String {
+    #[cfg(test)]
+    home_store::test_probe::crypto(home_dir);
     if plaintext.is_empty() {
         return String::new();
     }
@@ -454,6 +626,8 @@ fn encrypt_field(plaintext: &str, home_dir: &Path) -> String {
 }
 
 fn decrypt_field(stored: &str, home_dir: &Path) -> String {
+    #[cfg(test)]
+    home_store::test_probe::crypto(home_dir);
     match stored.strip_prefix(ENC_PREFIX) {
         Some(cipher) => crate::config_crypto::decrypt_value(cipher, home_dir)
             .unwrap_or_else(|| stored.to_string()),
@@ -462,58 +636,68 @@ fn decrypt_field(stored: &str, home_dir: &Path) -> String {
     }
 }
 
+/// Exact encrypted storage size for AES-GCM nonce(12)+tag(16), base64 and
+/// enc:v1 prefix; preflight also checks plaintext fallback separately.
+fn encrypted_size_placeholder(plain: &str) -> home_store::Result<String> {
+    if plain.is_empty() {
+        return Ok(String::new());
+    }
+    let size = plain
+        .len()
+        .checked_add(28)
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| (n / 3).checked_mul(4))
+        .and_then(|n| n.checked_add(ENC_PREFIX.len()))
+        .ok_or(home_store::Error::Invalid)?;
+    if size > home_store::raw_array::MAX_BYTES {
+        return Err(home_store::Error::Invalid);
+    }
+    Ok("A".repeat(size))
+}
+fn decode_secret(home: &Path, provider: &str, stored: &str) -> Option<String> {
+    if provider != "google" {
+        return Some(decrypt_field(stored, home));
+    }
+    if let Some(cipher) = stored.strip_prefix(ENC_PREFIX) {
+        #[cfg(test)]
+        {
+            home_store::test_probe::crypto(home);
+            home_store::test_probe::google_crypto(home);
+        }
+        crate::config_crypto::decrypt_value(cipher, home)
+    } else if stored.starts_with("enc:") {
+        // Reserved encryption versions are never legacy plaintext secrets.
+        None
+    } else {
+        Some(stored.into())
+    }
+}
+fn decode_public_token(home: &Path, stored: &McpOAuthToken) -> Option<McpOAuthToken> {
+    let mut token = stored.clone();
+    token.access_token = decode_secret(home, &stored.provider_id, &stored.access_token)?;
+    token.refresh_token = match &stored.refresh_token {
+        Some(r) => Some(decode_secret(home, &stored.provider_id, r)?),
+        None => None,
+    };
+    Some(token)
+}
+
 /// Load all stored tokens from disk, decrypting secrets.
 pub fn load_tokens(home_dir: &Path) -> Vec<McpOAuthToken> {
-    let path = home_dir.join(TOKEN_FILE);
-    let mut tokens: Vec<McpOAuthToken> = match std::fs::read_to_string(&path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
-    for t in &mut tokens {
-        t.access_token = decrypt_field(&t.access_token, home_dir);
-        if let Some(rt) = t.refresh_token.take() {
-            t.refresh_token = Some(decrypt_field(&rt, home_dir));
-        }
-    }
-    tokens
+    home_store::load_decoded_public(home_dir, None).unwrap_or_default()
 }
 
 /// Save tokens to disk using atomic write (temp + rename), encrypting secrets.
 pub fn save_tokens(home_dir: &Path, tokens: &[McpOAuthToken]) -> Result<(), String> {
-    let path = home_dir.join(TOKEN_FILE);
-
-    // Encrypt a copy so the in-memory caller keeps cleartext.
-    let on_disk: Vec<McpOAuthToken> = tokens
-        .iter()
-        .map(|t| McpOAuthToken {
-            provider_id: t.provider_id.clone(),
-            access_token: encrypt_field(&t.access_token, home_dir),
-            refresh_token: t
-                .refresh_token
-                .as_ref()
-                .map(|rt| encrypt_field(rt, home_dir)),
-            expires_at: t.expires_at,
-            scopes: t.scopes.clone(),
-        })
-        .collect();
-
-    let json = serde_json::to_string_pretty(&on_disk)
-        .map_err(|e| format!("Failed to serialize tokens: {e}"))?;
-
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)
-        .map_err(|e| format!("Failed to write temp token file: {e}"))?;
-    std::fs::rename(&tmp_path, &path).map_err(|e| format!("Failed to rename token file: {e}"))?;
-
-    Ok(())
+    home_store::save_public(home_dir, tokens).map_err(|e| e.to_string())
 }
 
 /// Get a valid (non-expired) token for a specific provider.
 pub fn get_token(home_dir: &Path, provider_id: &str) -> Option<McpOAuthToken> {
-    let tokens = load_tokens(home_dir);
-    tokens
+    home_store::load_decoded_public(home_dir, Some(provider_id))
+        .ok()?
         .into_iter()
-        .find(|t| t.provider_id == provider_id && !is_expired(t))
+        .find(|t| !is_expired(t))
 }
 
 /// Get the stored token for a provider **regardless of expiry**.
@@ -526,9 +710,10 @@ pub fn get_token(home_dir: &Path, provider_id: &str) -> Option<McpOAuthToken> {
 /// it. Reporting that state as "not connected" is what made an operator whose
 /// integration was working believe their saved credentials had been wiped.
 pub fn get_stored_token(home_dir: &Path, provider_id: &str) -> Option<McpOAuthToken> {
-    load_tokens(home_dir)
+    home_store::load_decoded_public(home_dir, Some(provider_id))
+        .ok()?
         .into_iter()
-        .find(|t| t.provider_id == provider_id)
+        .next()
 }
 
 /// Check if a token is expired (with 60s grace period).
@@ -568,24 +753,19 @@ pub fn mask_secret_tail(secret: &str) -> String {
 
 /// Remove a token for a specific provider.
 pub fn remove_token(home_dir: &Path, provider_id: &str) -> Result<(), String> {
-    let mut tokens = load_tokens(home_dir);
-    tokens.retain(|t| t.provider_id != provider_id);
-    save_tokens(home_dir, &tokens)
+    home_store::remove_public(home_dir, provider_id).map_err(|e| e.to_string())
 }
 
 /// Upsert a token: replace existing for same provider_id, or append.
 pub fn upsert_token(home_dir: &Path, token: McpOAuthToken) -> Result<(), String> {
-    let mut tokens = load_tokens(home_dir);
-    tokens.retain(|t| t.provider_id != token.provider_id);
-    tokens.push(token);
-    save_tokens(home_dir, &tokens)
+    home_store::upsert_public(home_dir, token).map_err(|e| e.to_string())
 }
 
 // ── Pending OAuth cleanup ───────────────────────────────────
 
 /// Remove pending entries older than 10 minutes.
 pub fn cleanup_pending(pending: &mut HashMap<String, PendingOAuth>) {
-    pending.retain(|_, p| p.created_at.elapsed().as_secs() < PENDING_TTL_SECS);
+    pending.retain(|_, p| !p.expired());
 }
 
 // ── Client credential persistence ───────────────────────────
@@ -597,7 +777,7 @@ pub fn cleanup_pending(pending: &mut HashMap<String, PendingOAuth>) {
 // here — `client_secret` encrypted at rest with the same keyfile as the token
 // file. Stored in `mcp-oauth-configs.json`.
 
-const CLIENT_CONFIG_FILE: &str = "mcp-oauth-configs.json";
+pub(crate) const CLIENT_CONFIG_FILE: &str = "mcp-oauth-configs.json";
 
 /// Persisted client credentials + endpoints for a provider. Enables in-place
 /// token refresh without re-prompting the user for their client secret.
@@ -613,77 +793,27 @@ pub struct McpOAuthClientConfig {
     pub redirect_uri: String,
 }
 
-/// Load all stored client configs, decrypting `client_secret`.
+/// Explicit legacy all-provider view; it is not an effect authority.
 pub fn load_client_configs(home_dir: &Path) -> Vec<McpOAuthClientConfig> {
-    let path = home_dir.join(CLIENT_CONFIG_FILE);
-    let mut configs: Vec<McpOAuthClientConfig> = match std::fs::read_to_string(&path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
-    for c in &mut configs {
-        c.client_secret = decrypt_field(&c.client_secret, home_dir);
-    }
-    configs
+    home_clients::load(home_dir, None).unwrap_or_default()
 }
-
-/// Save client configs with atomic write, encrypting `client_secret`.
-fn save_client_configs(home_dir: &Path, configs: &[McpOAuthClientConfig]) -> Result<(), String> {
-    let path = home_dir.join(CLIENT_CONFIG_FILE);
-    let on_disk: Vec<McpOAuthClientConfig> = configs
-        .iter()
-        .map(|c| McpOAuthClientConfig {
-            provider_id: c.provider_id.clone(),
-            client_id: c.client_id.clone(),
-            client_secret: encrypt_field(&c.client_secret, home_dir),
-            auth_url: c.auth_url.clone(),
-            token_url: c.token_url.clone(),
-            scopes: c.scopes.clone(),
-            redirect_uri: c.redirect_uri.clone(),
-        })
-        .collect();
-
-    let json = serde_json::to_string_pretty(&on_disk)
-        .map_err(|e| format!("Failed to serialize client configs: {e}"))?;
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)
-        .map_err(|e| format!("Failed to write temp client-config file: {e}"))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("Failed to rename client-config file: {e}"))?;
-    Ok(())
-}
-
-/// Get the stored client config for a provider (secret decrypted).
+/// Select and capture one provider before decrypting only its secret.
 pub fn get_client_config(home_dir: &Path, provider_id: &str) -> Option<McpOAuthClientConfig> {
-    load_client_configs(home_dir)
+    home_clients::load(home_dir, Some(provider_id))
+        .ok()?
         .into_iter()
-        .find(|c| c.provider_id == provider_id)
+        .next()
 }
-
-/// Upsert a client config: replace existing for the same provider, or append.
+/// Target-only raw-preserving update; Google uses the common source fence.
 pub fn upsert_client_config(home_dir: &Path, config: McpOAuthClientConfig) -> Result<(), String> {
-    let mut configs = load_client_configs(home_dir);
-    configs.retain(|c| c.provider_id != config.provider_id);
-    configs.push(config);
-    save_client_configs(home_dir, &configs)
+    home_clients::upsert(home_dir, config).map_err(|e| e.to_string())
 }
-
-/// Whether a provider has persisted client credentials (used for the dashboard
-/// `configured` flag, since the built-in templates carry empty credentials).
+/// Saved client metadata, not Home token/master state or provider acceptance.
 pub fn has_client_config(home_dir: &Path, provider_id: &str) -> bool {
-    get_client_config(home_dir, provider_id)
-        .map(|c| !c.client_id.is_empty())
-        .unwrap_or(false)
+    home_clients::has(home_dir, provider_id)
 }
-
-/// Remove a provider's stored client config (called on revoke).
 pub fn remove_client_config(home_dir: &Path, provider_id: &str) -> Result<(), String> {
-    let mut configs = load_client_configs(home_dir);
-    let before = configs.len();
-    configs.retain(|c| c.provider_id != provider_id);
-    if configs.len() == before {
-        return Ok(());
-    }
-    save_client_configs(home_dir, &configs)
+    home_clients::remove(home_dir, provider_id).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1017,19 +1147,18 @@ mod saved_credential_display_tests {
         );
     }
 
-    #[test]
-    fn stored_token_is_returned_even_after_the_access_token_expires() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn stored_token_is_returned_even_after_the_access_token_expires() {
         let home = std::env::temp_dir().join(format!("dc-oauth-stored-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
 
-        let token = McpOAuthToken {
-            provider_id: "google".into(),
-            access_token: "ya29.stale".into(),
-            refresh_token: Some("1//refresh".into()),
-            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(3)),
-            scopes: vec!["gmail.readonly".into()],
-        };
-        upsert_token(&home, token).unwrap();
+        // Publish a valid callback at an owned past wall time, then observe
+        // expiry after returning to the real clock. No forbidden Google upsert.
+        {
+            let past = u64::try_from(chrono::Utc::now().timestamp()).unwrap() - 4 * 3600;
+            let _clock = home_store::oauth_testing::ClockGuard::fixed(past);
+            google_home_test_fixture::connect(&home, "ya29.stale", Some("1//refresh")).await;
+        }
 
         // The call-time accessor hides it (correct — it cannot be sent as-is)…
         assert!(get_token(&home, "google").is_none());

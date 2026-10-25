@@ -569,6 +569,8 @@ pub struct ComputerUseSessions {
             Arc<tokio::sync::Notify>,
         )>,
     >,
+    #[cfg(test)]
+    action_boundary_expire_deadline: std::sync::atomic::AtomicBool,
 }
 
 /// Removes an employee from `starting` when the start ends, however it ends.
@@ -679,6 +681,8 @@ impl ComputerUseSessions {
             tickets: live_view::TicketBook::default(),
             #[cfg(test)]
             action_boundary_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            action_boundary_expire_deadline: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1601,7 +1605,7 @@ impl ComputerUseSessions {
                     )
                 })?;
             #[cfg(test)]
-            self.pause_action_boundary("after_claim").await;
+            self.pause_action_boundary("after_claim", &mut session).await;
             // Re-read native gates after the claim; policy/task/TTL are also
             // checked at the durable execution boundary.
             self.check_alive(&mut session).await?;
@@ -1623,7 +1627,7 @@ impl ComputerUseSessions {
         )
         .await;
         #[cfg(test)]
-        self.pause_action_boundary("after_audit").await;
+        self.pause_action_boundary("after_audit", &mut session).await;
         // Audit may await disk work: run the live gates once more after it.
         self.check_alive(&mut session).await?;
         self.ensure_not_paused(&session).await?;
@@ -1635,7 +1639,7 @@ impl ComputerUseSessions {
                 .map_err(|_| OpError::new(ErrorCode::ConfirmationDenied, "執行前核准已失效。"))?;
         }
         #[cfg(test)]
-        self.pause_action_boundary("after_begin").await;
+        self.pause_action_boundary("after_begin", &mut session).await;
         // No claim/audit/authorization await may follow the last observation.
         // The session mutex stays held throughout; the desktop itself is not frozen.
         let final_check = async {
@@ -1823,7 +1827,7 @@ impl ComputerUseSessions {
     }
 
     #[cfg(test)]
-    async fn pause_action_boundary(&self, phase: &'static str) {
+    async fn pause_action_boundary(&self, phase: &'static str, session: &mut ManagedSession) {
         let pause = {
             let mut slot = self.action_boundary_pause.lock().unwrap();
             if slot
@@ -1838,6 +1842,11 @@ impl ComputerUseSessions {
         if let Some((_, entered, release)) = pause {
             entered.notify_one();
             release.notified().await;
+            if phase == "after_begin"
+                && self.action_boundary_expire_deadline.swap(false, Ordering::AcqRel)
+            {
+                session.deadline = Instant::now();
+            }
         }
     }
 

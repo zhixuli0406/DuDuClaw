@@ -4,6 +4,9 @@
 use super::outcome::mask_and_cap;
 use super::telemetry::{CCR_FIND_RATE_LIMITED_MESSAGE, finish_tool_loop};
 use super::*;
+#[path = "closed_postprocess.rs"]
+mod closed_postprocess;
+use closed_postprocess::ClosedPostprocess;
 
 /// Tool loop with scoped, durable compression of post-redaction tool results.
 /// Existing callers use [`run_tool_loop_with_provenance`] and remain unchanged.
@@ -108,6 +111,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
         });
 
         let mut result_parts = Vec::with_capacity(calls.len());
+        let mut closed_outputs = Vec::new();
         for (id, name, args) in calls {
             let is_ccr_find = name == CCR_FIND_TOOL;
             let is_ccr_retrieve = name == CCR_RETRIEVE_TOOL;
@@ -122,6 +126,8 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
             let mut ccr_preview_sizes: Option<(usize, usize)> = None;
             let mut saved_result: Option<CcrSavedResult> = None;
             let mut ccr_revoke_call = false;
+            let mut closed = ClosedPostprocess::default();
+            let mut pending_delivery_guard = None;
             // R1: capture the call's own serialized arguments BEFORE `args`
             // is (possibly) moved into `tools.call(&name, args)` below —
             // `Value::to_string()` only borrows, so this is safe regardless
@@ -302,6 +308,20 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                 }
                 (None, None) => match tools.call(&name, args.clone()).await {
                     Ok(outcome) => {
+                        #[cfg(feature = "mcp-client")]
+                        closed.adopt(
+                            outcome.closed_postprocess.clone(),
+                            ccr.as_ref(),
+                            ccr.as_ref()
+                                .and_then(|runtime| {
+                                    runtime.source_key_for_call(
+                                        tools.server_of(&name).as_deref(),
+                                        &name,
+                                    )
+                                })
+                                .unwrap_or_else(|| name.clone()),
+                            id.clone(),
+                        );
                         host_notice = outcome.host_notice;
                         let mut source_artifact = outcome.source_artifact;
                         let source_retention_at = outcome.source_retention_at;
@@ -323,7 +343,9 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                             result_is_error = true;
                         }
                         let pre_redaction_content = content.clone();
-                        if let Some(icept) = interceptor.as_ref() {
+                        if !closed.stop()
+                            && let Some(icept) = interceptor.as_ref()
+                        {
                             let pretty = content.contains('\n');
                             let mut value = result_to_value(&content);
                             icept.after_call(&server, &name, &args, &mut value);
@@ -331,29 +353,31 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                         }
                         if let Some(artifact) = &source_artifact {
                             if !result_is_error
-                                && !tools
-                                    .verify_ccr_source(
+                                && !closed
+                                    .wait(tools.verify_ccr_source(
                                         &name,
                                         &args,
                                         &content,
                                         artifact,
                                         source_retention_at,
-                                    )
+                                    ))
                                     .await
+                                    .unwrap_or(false)
                             {
                                 if content != pre_redaction_content {
                                     // An interceptor may redact a valid source,
                                     // but a source revoked since the first
                                     // attestation must still be withheld.
-                                    if tools
-                                        .verify_ccr_source(
+                                    if closed
+                                        .wait(tools.verify_ccr_source(
                                             &name,
                                             &args,
                                             &pre_redaction_content,
                                             artifact,
                                             source_retention_at,
-                                        )
+                                        ))
                                         .await
+                                        .unwrap_or(false)
                                     {
                                         verified_source_for_delivery = Some((
                                             artifact.clone(),
@@ -368,7 +392,10 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                                         ccr_revoke_call = true;
                                     } else {
                                         if let Some(runtime) = ccr.as_ref() {
-                                            revoke_observed_stale_artifact(runtime, artifact)
+                                            closed
+                                                .metadata(revoke_observed_stale_artifact(
+                                                    runtime, artifact,
+                                                ))
                                                 .await?;
                                         }
                                         content =
@@ -377,7 +404,11 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                                     }
                                 } else {
                                     if let Some(runtime) = ccr.as_ref() {
-                                        revoke_observed_stale_artifact(runtime, artifact).await?;
+                                        closed
+                                            .metadata(revoke_observed_stale_artifact(
+                                                runtime, artifact,
+                                            ))
+                                            .await?;
                                     }
                                     content =
                                         "Trusted MCP source could not be verified; result withheld"
@@ -404,7 +435,8 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                                 } else {
                                     None
                                 };
-                                if ccr_eligible
+                                if !closed.stop()
+                                    && ccr_eligible
                                     && !result_is_error
                                     && source_key.is_some()
                                     && runtime
@@ -423,58 +455,76 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                                     let source_tool_for_store = source_tool.clone();
                                     let source_call_id_for_store = source_call_id.clone();
                                     let source_artifact_for_store = source_artifact.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        match source_artifact_for_store {
-                                            Some(artifact) if source_retention_at.is_some() => {
-                                                store.put_bound_until(
+                                    let worker = closed.worker();
+                                    match closed
+                                        .wait(tokio::task::spawn_blocking(move || {
+                                            if worker.as_ref().is_some_and(|w| w.cancelled()) {
+                                                store.revoke_source_call(
+                                                    &scope,
+                                                    &source_tool_for_store,
+                                                    &source_call_id_for_store,
+                                                )?;
+                                                return Err(CcrError::Revoked);
+                                            }
+                                            let result = match source_artifact_for_store {
+                                                Some(artifact) if source_retention_at.is_some() => {
+                                                    store.put_bound_until(
+                                                        &scope,
+                                                        &source_tool_for_store,
+                                                        &source_call_id_for_store,
+                                                        &original,
+                                                        &artifact,
+                                                        source_retention_at
+                                                            .expect("checked deadline"),
+                                                    )
+                                                }
+                                                Some(artifact) => store.put_bound(
                                                     &scope,
                                                     &source_tool_for_store,
                                                     &source_call_id_for_store,
                                                     &original,
                                                     &artifact,
-                                                    source_retention_at.expect("checked deadline"),
-                                                )
+                                                ),
+                                                None => store.put(
+                                                    &scope,
+                                                    &source_tool_for_store,
+                                                    &source_call_id_for_store,
+                                                    &original,
+                                                ),
+                                            };
+                                            if worker.as_ref().is_some_and(|w| w.cancelled()) {
+                                                store.revoke_source_call(
+                                                    &scope,
+                                                    &source_tool_for_store,
+                                                    &source_call_id_for_store,
+                                                )?;
+                                                return Err(CcrError::Revoked);
                                             }
-                                            Some(artifact) => store.put_bound(
-                                                &scope,
-                                                &source_tool_for_store,
-                                                &source_call_id_for_store,
-                                                &original,
-                                                &artifact,
-                                            ),
-                                            None => store.put(
-                                                &scope,
-                                                &source_tool_for_store,
-                                                &source_call_id_for_store,
-                                                &original,
-                                            ),
-                                        }
-                                    })
-                                    .await
+                                            result
+                                        }))
+                                        .await
                                     {
-                                        Ok(Ok(entry)) => {
+                                        Ok(Ok(Ok(entry))) => {
                                             let still_valid = match &source_artifact {
-                                                Some(artifact) => {
-                                                    tools
-                                                        .verify_ccr_source(
-                                                            &name,
-                                                            &args,
-                                                            &content,
-                                                            artifact,
-                                                            source_retention_at,
-                                                        )
-                                                        .await
-                                                }
+                                                Some(artifact) => closed
+                                                    .wait(tools.verify_ccr_source(
+                                                        &name,
+                                                        &args,
+                                                        &content,
+                                                        artifact,
+                                                        source_retention_at,
+                                                    ))
+                                                    .await
+                                                    .unwrap_or(false),
                                                 None => true,
                                             };
                                             if !still_valid {
-                                                revoke_observed_stale_artifact(
+                                                closed.metadata(revoke_observed_stale_artifact(
                                                     runtime,
                                                     source_artifact.as_ref().expect(
                                                         "postcheck applies only to bound source",
                                                     ),
-                                                )
-                                                .await?;
+                                                )).await?;
                                                 content =
                                                     "Trusted MCP source changed; result withheld"
                                                         .into();
@@ -499,18 +549,22 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                                                 content = preview;
                                             }
                                         }
-                                        Ok(Err(CcrError::Revoked)) => {
+                                        Ok(Ok(Err(CcrError::Revoked))) => {
+                                            closed.failed();
                                             content =
                                                 "CCR source call was revoked; result withheld"
                                                     .into();
                                             result_is_error = true;
                                         }
-                                        Ok(Err(e)) => {
+                                        Ok(Ok(Err(e))) => {
+                                            closed.failed();
                                             tracing::warn!(error = %e, "CCR store failed; passing full tool result")
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
+                                            closed.failed();
                                             tracing::warn!(error = %e, "CCR storage task failed; passing full tool result")
                                         }
+                                        Err(()) => {}
                                     }
                                 }
                             }
@@ -535,7 +589,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
 
             // The source-call tombstone applies to every dispatched output,
             // including short successes, tool errors, and dispatch failures.
-            if executed && name != CCR_RETRIEVE_TOOL && name != CCR_FIND_TOOL {
+            if !closed.stop() && executed && name != CCR_RETRIEVE_TOOL && name != CCR_FIND_TOOL {
                 if let Some(runtime) = ccr.as_ref() {
                     let store = runtime.store.clone();
                     let scope = runtime.scope.clone();
@@ -551,50 +605,56 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                             || saved.source_call_id != source_call_id
                     });
                     let source_original = ccr_source_original;
-                    match tokio::task::spawn_blocking(move || {
-                        let status = match source_original {
-                            Some(original) => store.ensure_source_call_content(
-                                &scope,
-                                &source_tool,
-                                &source_call_id,
-                                &original,
-                            ),
-                            None => store.ensure_source_call_active(
-                                &scope,
-                                &source_tool,
-                                &source_call_id,
-                            ),
-                        };
-                        status?;
-                        if ccr_revoke_call {
-                            store.revoke_source_call(&scope, &source_tool, &source_call_id)?;
-                        }
-                        Ok::<(), CcrError>(())
-                    })
-                    .await
+                    match closed
+                        .wait(tokio::task::spawn_blocking(move || {
+                            let status = match source_original {
+                                Some(original) => store.ensure_source_call_content(
+                                    &scope,
+                                    &source_tool,
+                                    &source_call_id,
+                                    &original,
+                                ),
+                                None => store.ensure_source_call_active(
+                                    &scope,
+                                    &source_tool,
+                                    &source_call_id,
+                                ),
+                            };
+                            status?;
+                            if ccr_revoke_call {
+                                store.revoke_source_call(&scope, &source_tool, &source_call_id)?;
+                            }
+                            Ok::<(), CcrError>(())
+                        }))
+                        .await
                     {
-                        Ok(Ok(())) => {}
-                        Ok(Err(CcrError::Revoked)) => {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(CcrError::Revoked))) => {
+                            closed.failed();
                             content = "CCR source call was revoked; result withheld".into();
                             is_error = true;
                         }
-                        Ok(Err(e)) => {
+                        Ok(Ok(Err(e))) => {
+                            closed.failed();
                             tracing::warn!(error = %e, "CCR source check failed; result withheld");
                             content =
                                 "CCR source status could not be verified; result withheld".into();
                             is_error = true;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
+                            closed.failed();
                             tracing::warn!(error = %e, "CCR source check task failed; result withheld");
                             content =
                                 "CCR source status could not be verified; result withheld".into();
                             is_error = true;
                         }
+                        Err(()) => {}
                     }
                 }
             }
 
-            if !is_error
+            if !closed.stop()
+                && !is_error
                 && let (Some(runtime), Some((artifact, digest, transformed))) =
                     (ccr.as_ref(), verified_source_for_delivery.as_ref())
             {
@@ -606,32 +666,42 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                     .source_key_for_call(tools.server_of(&name).as_deref(), &name)
                     .unwrap_or_else(|| name.clone());
                 let source_call_id = id.clone();
-                match tokio::task::spawn_blocking(move || {
-                    if transformed {
-                        runtime.acquire_transformed_source_delivery_guard(&artifact, &digest)
-                    } else {
-                        runtime.acquire_source_delivery_guard(
-                            &artifact,
-                            &digest,
-                            &source_tool,
-                            &source_call_id,
-                        )
-                    }
-                })
-                .await
+                match closed
+                    .wait(tokio::task::spawn_blocking(move || {
+                        if transformed {
+                            runtime.acquire_transformed_source_delivery_guard(&artifact, &digest)
+                        } else {
+                            runtime.acquire_source_delivery_guard(
+                                &artifact,
+                                &digest,
+                                &source_tool,
+                                &source_call_id,
+                            )
+                        }
+                    }))
+                    .await
                 {
-                    Ok(Ok(guard)) => ccr_delivery_guards.push(guard),
-                    Ok(Err(error)) => {
+                    Ok(Ok(Ok(guard))) => {
+                        if closed.active() {
+                            pending_delivery_guard = Some(guard);
+                        } else {
+                            ccr_delivery_guards.push(guard);
+                        }
+                    }
+                    Ok(Ok(Err(error))) => {
+                        closed.failed();
                         tracing::warn!(error = %error, "CCR source delivery lease refused");
                         content = "Trusted MCP source changed; result withheld".into();
                         is_error = true;
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
+                        closed.failed();
                         tracing::warn!(error = %error, "CCR source delivery lease task failed");
                         content =
                             "Trusted MCP source could not be verified; result withheld".into();
                         is_error = true;
                     }
+                    Err(()) => {}
                 }
             }
 
@@ -653,7 +723,10 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                         .saturating_add(ccr_returned_bytes);
                 }
             }
-            if !is_error && let Some((raw_bytes, preview_bytes)) = ccr_preview_sizes {
+            if !closed.active()
+                && !is_error
+                && let Some((raw_bytes, preview_bytes)) = ccr_preview_sizes
+            {
                 telemetry.ccr_compressed_results =
                     telemetry.ccr_compressed_results.saturating_add(1);
                 telemetry.ccr_original_bytes = telemetry
@@ -663,14 +736,21 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                     .ccr_delivered_bytes
                     .saturating_add(preview_bytes as u64);
             }
-            if !is_error && let Some(saved_result) = saved_result {
-                ccr_saved_results.push(saved_result);
+
+            if !closed.active()
+                && !is_error
+                && let Some(saved) = saved_result.take()
+            {
+                ccr_saved_results.push(saved);
             }
 
             // Preserve the original JSON paths and CCR/source payload above.
             // A host-only account notice is redacted on its own, then delivered
             // as separate text for this actual invocation, including failures.
-            if executed && let Some(notice) = host_notice {
+            if !closed.stop()
+                && executed
+                && let Some(notice) = host_notice
+            {
                 let mut value =
                     Value::String(duduclaw_security::audit::mask_sensitive_text(&notice));
                 if let Some(interceptor) = interceptor.as_ref() {
@@ -683,7 +763,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
             // Tool output flows back into the conversation ⇒ register it as a
             // provenance span (Tainted unless the caller vouched for the
             // tool). The synthesized block message is ours — never registered.
-            if executed {
+            if executed && !closed.active() {
                 if let Some(ledger) = ledger.as_mut() {
                     ledger.register(&content, cfg.result_trust(&name, &args));
                 }
@@ -694,7 +774,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
             // meaningful signal for the A3 forward model's tool-set/outcome
             // diff, not something to silently drop from the trace. R1: the
             // dispatched/refused call's own text (masked) rides along too.
-            tool_calls.push(LoopToolCall {
+            let mut completed_trace = LoopToolCall {
                 tool_name: name.clone(),
                 success: !is_error,
                 // A retrieved original must not be copied into the audit /
@@ -707,7 +787,45 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                     mask_and_cap(&content, LOOP_TOOL_CALL_RESULT_MAX_CHARS)
                 },
                 input_text,
-            });
+            };
+            // Last admission check is after every awaited or synchronous hook
+            // and output transformation, immediately before publication.
+            if closed.stop() {
+                content = closed.message().into();
+                is_error = true;
+                completed_trace.success = false;
+                completed_trace.result_text =
+                    mask_and_cap(&content, LOOP_TOOL_CALL_RESULT_MAX_CHARS);
+                pending_delivery_guard = None;
+                saved_result = None;
+                if let Some(runtime) = ccr.as_ref() {
+                    let source_tool = runtime
+                        .source_key_for_call(tools.server_of(&name).as_deref(), &name)
+                        .unwrap_or_else(|| name.clone());
+                    ccr_saved_results.retain(|saved| {
+                        saved.scope != runtime.scope
+                            || saved.source_tool != source_tool
+                            || saved.source_call_id != id
+                    });
+                }
+            } else if closed.active() {
+                // Keep metadata cleanup armed while later calls and the final
+                // source delivery checks run. No new handle is published yet.
+                if is_error {
+                    saved_result = None;
+                    pending_delivery_guard = None;
+                }
+                closed_outputs.push((
+                    result_parts.len(),
+                    tool_calls.len(),
+                    closed,
+                    saved_result.take(),
+                    pending_delivery_guard.take(),
+                    ccr_preview_sizes,
+                    cfg.result_trust(&name, &args),
+                ));
+            }
+            tool_calls.push(completed_trace);
 
             result_parts.push(ContentPart::ToolResult {
                 call_id: id,
@@ -725,7 +843,146 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                 "CCR source expired or revoked before model request".into(),
             ));
         }
+        // Complete every asynchronous validation before admitting any member
+        // of this batch, so a later wait cannot expire an already-published one.
+        for (_, _, budget, saved, guard, _, _) in &mut closed_outputs {
+            budget.recheck_metadata(saved.as_ref(), ccr.as_ref()).await;
+            if !budget.stop()
+                && let Some(guard) = guard.as_ref()
+            {
+                let owned = guard.clone();
+                if !matches!(
+                    budget
+                        .wait(tokio::task::spawn_blocking(move || owned.still_valid()))
+                        .await,
+                    Ok(Ok(true))
+                ) {
+                    budget.failed();
+                }
+            }
+        }
+        // Only Closed batches stage state. All existing Generic-only paths
+        // keep their ledger and result publication behavior.
+        let mut retired_closed_state = None;
+        if !closed_outputs.is_empty() {
+            let mut rejected = vec![false; closed_outputs.len()];
+            let (next_ledger, next_saved, next_guards, next_telemetry, next_trace, next_message) = loop {
+                let mut next_ledger = ledger.clone();
+                let mut next_saved = ccr_saved_results.clone();
+                let mut next_guards = ccr_delivery_guards.clone();
+                let mut next_telemetry = telemetry.clone();
+                let mut next_trace = tool_calls.clone();
+                let mut next_message = req.messages.last().expect("tool result message").clone();
+                for (
+                    index,
+                    (part_index, trace_index, budget, saved, guard, preview_sizes, trust),
+                ) in closed_outputs.iter_mut().enumerate()
+                {
+                    if rejected[index] || budget.stop() {
+                        rejected[index] = true;
+                        budget.retire();
+                        *saved = None;
+                        *guard = None;
+                        *preview_sizes = None;
+                        if let Some(ContentPart::ToolResult {
+                            content, is_error, ..
+                        }) = next_message.parts.get_mut(*part_index)
+                        {
+                            *content = budget.message().into();
+                            *is_error = true;
+                        }
+                        next_trace[*trace_index].success = false;
+                        next_trace[*trace_index].result_text =
+                            mask_and_cap(budget.message(), LOOP_TOOL_CALL_RESULT_MAX_CHARS);
+                        budget.retire_saved(&mut next_saved);
+                        continue;
+                    }
+                    if let Some(saved) = saved.as_ref() {
+                        next_saved.push(saved.clone());
+                    }
+                    if let Some(guard) = guard.as_ref() {
+                        next_guards.push(guard.clone());
+                    }
+                    if let Some((raw_bytes, preview_bytes)) = *preview_sizes {
+                        next_telemetry.ccr_compressed_results =
+                            next_telemetry.ccr_compressed_results.saturating_add(1);
+                        next_telemetry.ccr_original_bytes = next_telemetry
+                            .ccr_original_bytes
+                            .saturating_add(raw_bytes as u64);
+                        next_telemetry.ccr_delivered_bytes = next_telemetry
+                            .ccr_delivered_bytes
+                            .saturating_add(preview_bytes as u64);
+                    }
+                    if let Some(next_ledger) = next_ledger.as_mut() {
+                        if let Some(ContentPart::ToolResult { content, .. }) =
+                            next_message.parts.get(*part_index)
+                        {
+                            next_ledger.register(content, *trust);
+                            #[cfg(all(test, feature = "mcp-client"))]
+                            crate::mcp_client::closed_tests::r2_admission_checkpoint(
+                                "ledger",
+                                next_ledger.span_count(),
+                            );
+                        }
+                    }
+                }
+                #[cfg(all(test, feature = "mcp-client"))]
+                crate::mcp_client::closed_tests::r2_admission_checkpoint(
+                    "ready",
+                    next_ledger.as_ref().map_or(0, |value| value.span_count()),
+                );
+                // Every data-dependent synchronous step above has returned.
+                // A newly expired member discards this staged ledger and all
+                // its derived state. Each retry rejects at least one member.
+                let mut rebuild = false;
+                for (index, (_, _, budget, _, _, _, _)) in closed_outputs.iter_mut().enumerate() {
+                    if !rejected[index] && budget.stop() {
+                        rejected[index] = true;
+                        budget.retire();
+                        rebuild = true;
+                    }
+                }
+                if rebuild {
+                    continue;
+                }
+                break (
+                    next_ledger,
+                    next_saved,
+                    next_guards,
+                    next_telemetry,
+                    next_trace,
+                    next_message,
+                );
+            };
+            // Move-only commit: retain old buffers so their potentially large
+            // destruction cannot sit between the last check and model entry.
+            retired_closed_state = Some((
+                std::mem::replace(&mut ledger, next_ledger),
+                std::mem::replace(&mut ccr_saved_results, next_saved),
+                std::mem::replace(&mut ccr_delivery_guards, next_guards),
+                std::mem::replace(&mut telemetry, next_telemetry),
+                std::mem::replace(&mut tool_calls, next_trace),
+                std::mem::replace(
+                    req.messages.last_mut().expect("tool result message"),
+                    next_message,
+                ),
+            ));
+            for (index, (_, _, budget, _, _, _, _)) in closed_outputs.iter_mut().enumerate() {
+                if !rejected[index] {
+                    budget.admit();
+                }
+            }
+            #[cfg(all(test, feature = "mcp-client"))]
+            crate::mcp_client::closed_tests::r2_record_admitted(
+                ledger.as_ref().map_or(0, |value| value.span_count()),
+                ccr_saved_results.len(),
+                !ccr_delivery_guards.is_empty(),
+            );
+        }
+        // Model computation after this admission is outside a tool operation's
+        // validity budget. Its independent source leases remain unchanged.
         last = provider.complete(&req).await?;
+        drop(retired_closed_state);
         if !ccr_delivery_guards.still_valid().await {
             return Err(LlmError::InvalidRequest(
                 "CCR source expired or revoked during model request".into(),

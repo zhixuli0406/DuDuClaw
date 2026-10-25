@@ -35,7 +35,10 @@ impl MethodHandler {
     /// `{ success, changes[] }`.
     pub(crate) async fn handle_identity_config_set(&self, params: Value) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
 
         let mut changes = Vec::new();
         if let Err(e) = apply_identity_to_table(&mut table, &params, &mut changes) {
@@ -91,7 +94,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response("", "No valid identity fields to update");
         }
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }
         info!(?changes, "identity.config_set completed");

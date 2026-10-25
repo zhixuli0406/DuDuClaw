@@ -2,6 +2,7 @@
 //! and complete its own connection. All token handling stays in gateway.
 
 pub mod access;
+pub mod authority;
 pub mod flow;
 pub mod grants;
 pub mod history;

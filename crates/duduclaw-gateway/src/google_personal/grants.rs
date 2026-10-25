@@ -99,6 +99,15 @@ pub(super) fn fail_home_sync(home: &Path, fail: bool) {
     }
 }
 
+/// Early metadata-only refusal. This is not a lease and never proves an
+/// effect safe: the later effect must acquire its real grant lease again.
+pub(crate) fn check_metadata_barrier(home: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(marker(home)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(UNCERTAIN.into()),
+    }
+}
+
 pub async fn acquire(home: &Path) -> Result<Lease, String> {
     let canonical =
         std::fs::canonicalize(home).map_err(|_| "無法確認 Google 連線的資料目錄。".to_owned())?;
