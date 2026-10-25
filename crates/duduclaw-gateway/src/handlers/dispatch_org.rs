@@ -45,7 +45,9 @@ impl MethodHandler {
                 if !ctx.is_admin() {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
-                            if !ctx.has_agent_access(id, AccessLevel::Viewer) && !ctx.can_assign_to(id) {
+                            if !ctx.has_agent_access(id, AccessLevel::Viewer)
+                                && !ctx.can_assign_to(id)
+                            {
                                 return WsFrame::error_response("", "permission denied");
                             }
                         }
@@ -78,14 +80,23 @@ impl MethodHandler {
         }
 
         match method {
-            "me.google.status" | "me.google.connect_start" | "me.google.connect_finish" | "me.google.connect_paste"
-            | "me.google.disconnect" | "me.google.consents.set" | "users.google_disconnect" | "agents.primary_owner_set" => self.handle_personal_google_rpc(method, params, ctx).await,
-            "users.my_history_views" => self.handle_my_history_views(params,ctx).await,
-            "users.team_history.list" => self.handle_team_history_list(params,ctx).await,
-            "users.team_history.get" => self.handle_team_history_get(params,ctx).await,
+            "me.google.status"
+            | "me.google.connect_start"
+            | "me.google.connect_finish"
+            | "me.google.connect_paste"
+            | "me.google.disconnect"
+            | "me.google.consents.set"
+            | "users.google_disconnect"
+            | "agents.primary_owner_set" => {
+                self.handle_personal_google_rpc(method, params, ctx).await
+            }
+            "users.my_history_views" => self.handle_my_history_views(params, ctx).await,
+            "users.team_history.list" => self.handle_team_history_list(params, ctx).await,
+            "users.team_history.get" => self.handle_team_history_get(params, ctx).await,
             "users.org_settings.get" | "users.org_settings.update" => {
                 require_admin!();
-                self.handle_org_history_settings(params,ctx,method.ends_with(".update")).await
+                self.handle_org_history_settings(params, ctx, method.ends_with(".update"))
+                    .await
             }
             "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact"
             | "discovery.cancel" => self.handle_discovery_rpc(method, params, ctx).await,
@@ -239,7 +250,7 @@ impl MethodHandler {
             }
             "mcp.oauth.start" => {
                 require_admin!();
-                self.handle_mcp_oauth_start(params).await
+                self.handle_mcp_oauth_start(params, ctx).await
             }
             "mcp.oauth.status" => {
                 require_admin!();
@@ -294,14 +305,19 @@ impl MethodHandler {
             }
             "google.delegation.settings_set" => {
                 require_admin!();
-                self.handle_google_delegation_settings_set(params, ctx).await
+                self.handle_google_delegation_settings_set(params, ctx)
+                    .await
             }
             "google.identity.test" => {
                 require_admin!();
                 self.handle_google_identity_test(params).await
             }
             "agents.google_identity_get" => {
-                let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let agent_id = params
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 check_agent_named!(&agent_id, AccessLevel::Viewer);
                 self.handle_agents_google_identity_get(&agent_id).await
             }
@@ -313,7 +329,9 @@ impl MethodHandler {
 
             // P9 employee digest + feedback on finished work (per-call ACL
             // inside: Viewer to read, Operator + task audience to rate).
-            "digest.latest" | "digest.feedback" => self.handle_digest_rpc(method, params, ctx).await,
+            "digest.latest" | "digest.feedback" => {
+                self.handle_digest_rpc(method, params, ctx).await
+            }
 
             // ── Task Board (agent-scoped — HS4 fix) ────
             "responsibilities.create"
@@ -332,19 +350,67 @@ impl MethodHandler {
             | "tasks.steering"
             | "tasks.stop"
             | "tasks.stop_status" => self.handle_responsibilities_rpc(method, params, ctx).await,
-            "tasks.review_snapshot" => super::workflow_errors::with_workflow_error_code(method, self.handle_tasks_review_snapshot(params,ctx).await),
-            "tasks.review_accept" => super::workflow_errors::with_workflow_error_code(method, self.handle_tasks_review_accept(params,ctx).await),
-            "workflow_drafts.create" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_create(params,ctx).await),
-            "workflow_drafts.get" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_get(params,ctx).await),
-            "workflow_drafts.list" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_list(params,ctx).await),
-            "workflow_drafts.run_fixture" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_run_fixture(params,ctx).await),
-            "workflow_drafts.request_activation" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_request_activation(params,ctx).await),
-            "workflow_drafts.commit_activation" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_commit_activation(params,ctx).await),
-            "workflow_drafts.revoke_activation" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_revoke_activation(params,ctx).await),
-            "workflow_runs.get" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_get(params,ctx).await),
-            "workflow_runs.list" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_list(params,ctx).await),
-            "workflow_runs.cancel" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_cancel(params,ctx).await),
-            "workflow_runs.reset_failures" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_reset_failures(params,ctx).await),
+            "tasks.review_snapshot" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_tasks_review_snapshot(params, ctx).await,
+            ),
+            "tasks.review_accept" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_tasks_review_accept(params, ctx).await,
+            ),
+            "workflow_drafts.create" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_drafts_create(params, ctx).await,
+            ),
+            "workflow_drafts.get" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_drafts_get(params, ctx).await,
+            ),
+            "workflow_drafts.list" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_drafts_list(params, ctx).await,
+            ),
+            "workflow_drafts.run_fixture" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_drafts_run_fixture(params, ctx).await,
+            ),
+            "workflow_drafts.request_activation" => {
+                super::workflow_errors::with_workflow_error_code(
+                    method,
+                    self.handle_workflow_drafts_request_activation(params, ctx)
+                        .await,
+                )
+            }
+            "workflow_drafts.commit_activation" => {
+                super::workflow_errors::with_workflow_error_code(
+                    method,
+                    self.handle_workflow_drafts_commit_activation(params, ctx)
+                        .await,
+                )
+            }
+            "workflow_drafts.revoke_activation" => {
+                super::workflow_errors::with_workflow_error_code(
+                    method,
+                    self.handle_workflow_drafts_revoke_activation(params, ctx)
+                        .await,
+                )
+            }
+            "workflow_runs.get" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_runs_get(params, ctx).await,
+            ),
+            "workflow_runs.list" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_runs_list(params, ctx).await,
+            ),
+            "workflow_runs.cancel" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_runs_cancel(params, ctx).await,
+            ),
+            "workflow_runs.reset_failures" => super::workflow_errors::with_workflow_error_code(
+                method,
+                self.handle_workflow_runs_reset_failures(params, ctx).await,
+            ),
             "tasks.list" => {
                 // Non-admins must scope the listing to an agent they are
                 // bound to or may assign to.
@@ -417,13 +483,28 @@ impl MethodHandler {
             // Ownership is decided inside (`assign_schedule::manage`).
             "assign_schedules.list" => self.handle_assign_schedules_list(params, ctx).await,
             "assign_schedules.pause" => {
-                self.handle_assign_schedules_manage(params, ctx, crate::assign_schedule::ManageAction::Pause).await
+                self.handle_assign_schedules_manage(
+                    params,
+                    ctx,
+                    crate::assign_schedule::ManageAction::Pause,
+                )
+                .await
             }
             "assign_schedules.resume" => {
-                self.handle_assign_schedules_manage(params, ctx, crate::assign_schedule::ManageAction::Resume).await
+                self.handle_assign_schedules_manage(
+                    params,
+                    ctx,
+                    crate::assign_schedule::ManageAction::Resume,
+                )
+                .await
             }
             "assign_schedules.remove" => {
-                self.handle_assign_schedules_manage(params, ctx, crate::assign_schedule::ManageAction::Remove).await
+                self.handle_assign_schedules_manage(
+                    params,
+                    ctx,
+                    crate::assign_schedule::ManageAction::Remove,
+                )
+                .await
             }
             "tasks.flow_metrics" => {
                 check_agent_filter!(AccessLevel::Viewer);
@@ -582,7 +663,7 @@ impl MethodHandler {
             }
             "approvals.list" => {
                 require_manager!();
-                self.handle_approvals_list(params,ctx).await
+                self.handle_approvals_list(params, ctx).await
             }
             "approvals.decide" => {
                 require_manager!();
@@ -596,12 +677,10 @@ impl MethodHandler {
                 require_manager!();
                 self.handle_mail_status().await
             }
-            "mail.list" => {
-                match self.mailbox_reader_gate(ctx).await {
-                    Ok(reader) => self.handle_mail_list(params, reader).await,
-                    Err(e) => WsFrame::error_response("", &e),
-                }
-            }
+            "mail.list" => match self.mailbox_reader_gate(ctx).await {
+                Ok(reader) => self.handle_mail_list(params, reader).await,
+                Err(e) => WsFrame::error_response("", &e),
+            },
             "mail.read" => {
                 if let Err(e) = self.mailbox_reader_gate(ctx).await {
                     return WsFrame::error_response("", &e);

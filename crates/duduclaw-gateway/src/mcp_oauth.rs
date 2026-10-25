@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;
 
+#[cfg(test)]
+pub(crate) mod google_home_test_fixture;
 #[path = "mcp_oauth/home_lifecycle.rs"]
 pub(crate) mod home_lifecycle;
 #[path = "mcp_oauth/home_store.rs"]
 pub(crate) mod home_store;
-#[cfg(test)]
-pub(crate) mod google_home_test_fixture;
 
 /// Opaque naming facade; secret ownership stays in the lexical SourceOwner.
 pub(crate) mod home_oauth_material {
@@ -43,6 +43,16 @@ pub(crate) fn home_presence_for_personal_revoke(
     home_store::read_revoke_presence(home, lease)
 }
 
+/// Read the Google credential only to compare grant ownership before a
+/// Personal disconnect revokes at the provider. This does not make a legacy
+/// credential usable by tools and requires the caller's global grant lease.
+pub(crate) fn home_access_token_for_personal_revoke(
+    home: &Path,
+    lease: &crate::google_personal::grants::Lease,
+) -> home_store::Result<zeroize::Zeroizing<String>> {
+    home_store::read_revoke_access_token(home, lease)
+}
+
 /// OAuth provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpOAuthConfig {
@@ -65,6 +75,20 @@ pub struct McpOAuthToken {
     pub scopes: Vec<String>,
 }
 
+fn require_generic_non_google(config: &McpOAuthConfig) -> Result<(), String> {
+    if crate::google_oauth_policy::is_google_oauth_route(
+        &config.provider_id,
+        "",
+        &config.auth_url,
+        &config.token_url,
+        &config.scopes,
+    ) {
+        Err("Google requires a bound Home flow.".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// Closed RAM flow. Google never carries an unbound legacy config. No
 /// Debug/Clone/serialization or field constructor can bypass this distinction.
 pub struct PendingOAuth {
@@ -80,9 +104,7 @@ enum PendingOAuthFlow {
 }
 impl PendingOAuth {
     pub(crate) fn other(config: McpOAuthConfig, verifier: String) -> Result<Self, String> {
-        if config.provider_id == "google" {
-            return Err("Google requires a bound Home flow.".into());
-        }
+        require_generic_non_google(&config)?;
         Ok(Self {
             flow: PendingOAuthFlow::Other {
                 config,
@@ -129,6 +151,7 @@ pub(crate) async fn complete_callback_query(
     home: &Path,
     pending: &tokio::sync::RwLock<HashMap<String, PendingOAuth>>,
     query: &str,
+    actor_is_live_admin: impl Fn(&str) -> bool + Send + Sync,
 ) -> Result<String, ()> {
     // Unknown descriptions/scopes are never decoded or echoed. Even an
     // oversized rejection can consume its one unambiguous bounded state;
@@ -189,9 +212,18 @@ pub(crate) async fn complete_callback_query(
     let code = code.filter(|c| !c.is_empty()).ok_or(())?;
     match entry.flow {
         PendingOAuthFlow::Google(google) => {
-            home_lifecycle::complete_google_home_authorization(home, google, state, code)
-                .await
-                .map_err(|_| ())?;
+            if !actor_is_live_admin(google.consent_actor()) {
+                return Err(());
+            }
+            home_lifecycle::complete_google_home_authorization_with_admin_check(
+                home,
+                google,
+                state,
+                code,
+                &actor_is_live_admin,
+            )
+            .await
+            .map_err(|_| ())?;
             Ok("google".into())
         }
         PendingOAuthFlow::Other {
@@ -447,9 +479,7 @@ pub async fn exchange_and_store(
     code: &str,
     verifier: &str,
 ) -> Result<(), String> {
-    if config.provider_id == "google" {
-        return Err("Google requires a bound Home flow.".into());
-    }
+    require_generic_non_google(config)?;
     let _lease = crate::google_personal::grants::acquire(home).await?;
     let token = exchange_code(config, code, verifier).await?;
     upsert_token(home, token)
@@ -461,9 +491,7 @@ pub async fn exchange_code(
     code: &str,
     code_verifier: &str,
 ) -> Result<McpOAuthToken, String> {
-    if config.provider_id == "google" {
-        return Err("Google requires a bound Home flow.".into());
-    }
+    require_generic_non_google(config)?;
     #[cfg(test)]
     home_store::test_probe::provider(&config.client_id);
     let client = reqwest::Client::new();
@@ -535,9 +563,7 @@ pub async fn refresh_token(
     config: &McpOAuthConfig,
     refresh_tok: &str,
 ) -> Result<McpOAuthToken, String> {
-    if config.provider_id == "google" {
-        return Err(home_store::Error::PendingWiring.to_string());
-    }
+    require_generic_non_google(config).map_err(|_| home_store::Error::PendingWiring.to_string())?;
     let client = reqwest::Client::new();
     let params = [
         ("grant_type", "refresh_token"),
@@ -949,13 +975,22 @@ mod xc1_token_encryption_tests {
     }
 
     #[test]
-    fn legacy_plaintext_token_file_is_read_transparently() {
+    fn legacy_plaintext_non_google_token_file_is_read_transparently() {
         let home = tmp_home();
         // Simulate a pre-encryption file with cleartext tokens.
-        let legacy = r#"[{"provider_id":"google","access_token":"ya29.legacy","refresh_token":null,"expires_at":null,"scopes":[]}]"#;
+        let legacy = r#"[{"provider_id":"github","access_token":"gho.legacy","refresh_token":null,"expires_at":null,"scopes":[]}]"#;
         std::fs::write(home.join(TOKEN_FILE), legacy).unwrap();
         let loaded = load_tokens(&home);
-        assert_eq!(loaded[0].access_token, "ya29.legacy");
+        assert_eq!(loaded[0].access_token, "gho.legacy");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_plaintext_google_token_is_hidden_until_reconnect() {
+        let home = tmp_home();
+        let legacy = r#"[{"provider_id":"google","access_token":"ya29.legacy","refresh_token":null,"expires_at":null,"scopes":[]}]"#;
+        std::fs::write(home.join(TOKEN_FILE), legacy).unwrap();
+        assert!(load_tokens(&home).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 

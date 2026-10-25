@@ -4,8 +4,12 @@ use super::*;
 
 pub(crate) async fn connect(home: &Path, access: &str, refresh: Option<&str>) {
     use crate::mcp_oauth::home_lifecycle as flow;
-    let input =
-        flow::GoogleHomeStartInput::new(Some("client-fixture"), Some("secret-fixture")).unwrap();
+    let input = flow::GoogleHomeStartInput::new(
+        Some("client-fixture"),
+        Some("secret-fixture"),
+        "test-admin",
+    )
+    .unwrap();
     let plan = flow::capture_google_home_start(home, input).unwrap();
     let (_, state, pending) = flow::begin_google_home_authorization(home, plan)
         .await

@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use duduclaw_auth::{AccessLevel, User, UserDb, UserStatus};
-use duduclaw_core::google_identity::{self as gi, Effective, EffectiveIdentity, Requesters, Selector};
+use duduclaw_core::google_identity::{
+    self as gi, Effective, EffectiveIdentity, Requesters, Selector,
+};
 use duduclaw_knowledge::requester::RequesterIdentity;
 
 use super::{oauth, scopes};
@@ -137,6 +139,14 @@ pub(super) fn check_metadata_authority(
     metadata: &Metadata,
     tool: &str,
 ) -> Result<(), Refusal> {
+    crate::google_data_consent::require_current(metadata.google_data_consent.as_ref()).map_err(
+        |_| {
+            Refusal::soft(
+                "needs_reconnect",
+                "Google 資料使用說明已更新或尚未確認；請重新連結 Google。",
+            )
+        },
+    )?;
     if !domain_allowed(home, metadata).map_err(store_error)? {
         return Err(Refusal::hard(
             "config_invalid",

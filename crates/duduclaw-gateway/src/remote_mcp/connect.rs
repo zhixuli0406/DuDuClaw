@@ -85,7 +85,9 @@ fn take_pending(state: &str) -> Option<PendingConnect> {
 /// [`plan_redirect`] turns such an origin into the paste-back flow instead.
 pub fn validate_redirect_origin(raw: &str, allowed: &[String]) -> Result<String, String> {
     let (url, origin) = parse_origin(raw)?;
-    let host = url.host().ok_or_else(|| "redirect_origin has no host".to_string())?;
+    let host = url
+        .host()
+        .ok_or_else(|| "redirect_origin has no host".to_string())?;
     match url.scheme() {
         "http" | "https" if is_loopback_host(&host) => Ok(origin),
         "https" => {
@@ -96,7 +98,9 @@ pub fn validate_redirect_origin(raw: &str, allowed: &[String]) -> Result<String,
                 Err("redirect_origin is not one of the gateway's allowed origins ([gateway] allowed_origins)".into())
             }
         }
-        "http" => Err("a non-loopback dashboard origin must use https to receive an OAuth redirect".into()),
+        "http" => Err(
+            "a non-loopback dashboard origin must use https to receive an OAuth redirect".into(),
+        ),
         other => Err(format!("unsupported redirect_origin scheme {other}")),
     }
 }
@@ -109,11 +113,17 @@ fn parse_origin(raw: &str) -> Result<(Url, String), String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("redirect_origin must not contain a user name or password".into());
     }
-    if !(url.path() == "/" || url.path().is_empty()) || url.query().is_some() || url.fragment().is_some() {
+    if !(url.path() == "/" || url.path().is_empty())
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err("redirect_origin must be an origin (scheme, host and port only)".into());
     }
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!("unsupported redirect_origin scheme {}", url.scheme()));
+        return Err(format!(
+            "unsupported redirect_origin scheme {}",
+            url.scheme()
+        ));
     }
     if url.host().is_none() {
         return Err("redirect_origin has no host".into());
@@ -128,7 +138,10 @@ pub enum RedirectPlan {
     /// The dashboard origin can receive the redirect itself (loopback, or
     /// an https origin in `[gateway] allowed_origins`): the browser lands
     /// on `<origin>/oauth/mcp/callback` and the gateway finishes.
-    Direct { origin: String, redirect_uri: String },
+    Direct {
+        origin: String,
+        redirect_uri: String,
+    },
     /// The dashboard was opened on an address that cannot receive an OAuth
     /// redirect (plain http on a LAN IP or host name, or an https origin
     /// not in the allowlist). The redirect goes to the loopback address of
@@ -139,13 +152,17 @@ pub enum RedirectPlan {
     /// the address-bar URL back into the dashboard (`mcp.remote_complete`).
     /// The pasted URL carries only the one-time code and the state; the
     /// PKCE verifier never left the gateway.
-    Paste { origin: String, redirect_uri: String },
+    Paste {
+        origin: String,
+        redirect_uri: String,
+    },
 }
 
 impl RedirectPlan {
     pub fn redirect_uri(&self) -> &str {
         match self {
-            RedirectPlan::Direct { redirect_uri, .. } | RedirectPlan::Paste { redirect_uri, .. } => redirect_uri,
+            RedirectPlan::Direct { redirect_uri, .. }
+            | RedirectPlan::Paste { redirect_uri, .. } => redirect_uri,
         }
     }
 }
@@ -157,7 +174,10 @@ pub fn plan_redirect(raw: &str, allowed: &[String]) -> Result<RedirectPlan, Stri
     let (url, origin) = parse_origin(raw)?;
     if let Ok(origin) = validate_redirect_origin(raw, allowed) {
         let redirect_uri = format!("{origin}{CALLBACK_PATH}");
-        return Ok(RedirectPlan::Direct { origin, redirect_uri });
+        return Ok(RedirectPlan::Direct {
+            origin,
+            redirect_uri,
+        });
     }
     let port = url
         .port_or_known_default()
@@ -167,7 +187,10 @@ pub fn plan_redirect(raw: &str, allowed: &[String]) -> Result<RedirectPlan, Stri
     } else {
         format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
     };
-    Ok(RedirectPlan::Paste { origin, redirect_uri })
+    Ok(RedirectPlan::Paste {
+        origin,
+        redirect_uri,
+    })
 }
 
 /// How the dashboard should wait for a started sign-in.
@@ -192,8 +215,16 @@ impl Completion {
 /// A pasted callback URL, split into what the sign-in needs.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PastedCallback {
-    Code { state: String, code: String, redirect_uri: String },
-    Error { state: String, error: String, description: String },
+    Code {
+        state: String,
+        code: String,
+        redirect_uri: String,
+    },
+    Error {
+        state: String,
+        error: String,
+        description: String,
+    },
 }
 
 /// Parse the address-bar URL the operator pasted after a
@@ -204,10 +235,19 @@ pub fn parse_pasted_callback(raw: &str) -> Result<PastedCallback, String> {
     if raw.is_empty() || raw.len() > 8192 {
         return Err("paste the full address from the browser's address bar".into());
     }
-    let url = Url::parse(raw).map_err(|_| "that is not a URL; paste the full address from the browser's address bar".to_string())?;
-    let host = url.host().ok_or_else(|| "the pasted URL has no host".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || !is_loopback_host(&host) || url.path() != CALLBACK_PATH {
-        return Err(format!("the pasted URL is not a sign-in callback (expected http://127.0.0.1:<port>{CALLBACK_PATH}?…)"));
+    let url = Url::parse(raw).map_err(|_| {
+        "that is not a URL; paste the full address from the browser's address bar".to_string()
+    })?;
+    let host = url
+        .host()
+        .ok_or_else(|| "the pasted URL has no host".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !is_loopback_host(&host)
+        || url.path() != CALLBACK_PATH
+    {
+        return Err(format!(
+            "the pasted URL is not a sign-in callback (expected http://127.0.0.1:<port>{CALLBACK_PATH}?…)"
+        ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("the pasted URL must not contain a user name or password".into());
@@ -223,19 +263,33 @@ pub fn parse_pasted_callback(raw: &str) -> Result<PastedCallback, String> {
             "error" if error.is_none() => error = Some(v.into_owned()),
             "error_description" if description.is_empty() => description = v.into_owned(),
             // A repeated parameter is ambiguous: refuse rather than pick one.
-            "state" | "code" | "error" => return Err(format!("the pasted URL repeats the {k} parameter")),
+            "state" | "code" | "error" => {
+                return Err(format!("the pasted URL repeats the {k} parameter"));
+            }
             _ => {}
         }
     }
-    let state = state.filter(|s| !s.is_empty()).ok_or_else(|| "the pasted URL has no state".to_string())?;
+    let state = state
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "the pasted URL has no state".to_string())?;
     if let Some(error) = error {
-        return Ok(PastedCallback::Error { state, error, description });
+        return Ok(PastedCallback::Error {
+            state,
+            error,
+            description,
+        });
     }
-    let code = code.filter(|c| !c.is_empty()).ok_or_else(|| "the pasted URL has no authorization code".to_string())?;
+    let code = code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| "the pasted URL has no authorization code".to_string())?;
     let mut base = url.clone();
     base.set_query(None);
     base.set_fragment(None);
-    Ok(PastedCallback::Code { state, code, redirect_uri: base.to_string() })
+    Ok(PastedCallback::Code {
+        state,
+        code,
+        redirect_uri: base.to_string(),
+    })
 }
 
 /// Normalize a redirect URI for comparison (`localhost` and `127.0.0.1`
@@ -281,16 +335,19 @@ pub enum ConnectOutcome {
     Connected,
     /// The dashboard must open this URL; the callback finishes the job
     /// (or, for [`Completion::Paste`], the pasted address does).
-    Authorize { authorize_url: String, completion: Completion, redirect_uri: String },
+    Authorize {
+        authorize_url: String,
+        completion: Completion,
+        redirect_uri: String,
+    },
 }
 
 fn resolve_url(home: &Path, req: &ConnectRequest) -> Result<Url, String> {
     match req.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => validate_remote_url(raw),
         None => {
-            let rec = store::get(home, &req.agent_id, &req.server)?.ok_or_else(|| {
-                "no URL given and none is recorded for this server".to_string()
-            })?;
+            let rec = store::get(home, &req.agent_id, &req.server)?
+                .ok_or_else(|| "no URL given and none is recorded for this server".to_string())?;
             validate_remote_url(&store::open(home, &rec)?.url)
         }
     }
@@ -298,7 +355,10 @@ fn resolve_url(home: &Path, req: &ConnectRequest) -> Result<Url, String> {
 
 /// The headers and stream choice a request ends up with: what it says, or
 /// what is stored for (agent, server).
-fn effective_options(home: &Path, req: &ConnectRequest) -> Result<(Vec<(String, String)>, bool), String> {
+fn effective_options(
+    home: &Path,
+    req: &ConnectRequest,
+) -> Result<(Vec<(String, String)>, bool), String> {
     let existing = store::get(home, &req.agent_id, &req.server)?;
     let headers = match &req.headers {
         Some(h) => store::validate_custom_headers(h)?,
@@ -355,13 +415,23 @@ fn save_connected(
 pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOutcome, String> {
     // Check the persistent unknown-revocation fence before exposing a new
     // authorization URL. Finish takes its own lease through publication.
-    let _grant_lease = if req.auth == AuthKind::Oauth { Some(crate::google_personal::grants::acquire(home).await?) } else { None };
+    let _grant_lease = if req.auth == AuthKind::Oauth {
+        Some(crate::google_personal::grants::acquire(home).await?)
+    } else {
+        None
+    };
     store::validate_ids(&req.agent_id, &req.server)?;
     let url = resolve_url(home, &req)?;
     let policy = OutboundPolicy::for_mcp_url(&url);
     let (headers, server_stream) = effective_options(home, &req)?;
     match req.auth {
         AuthKind::None | AuthKind::Bearer => {
+            if req.auth == AuthKind::Bearer && is_google_remote_url(url.as_str()) {
+                return Err(
+                    "Google-hosted MCP cannot use a pasted bearer token; use Integrations → Google"
+                        .into(),
+                );
+            }
             let bearer = match req.auth {
                 AuthKind::Bearer => {
                     let b = req
@@ -369,9 +439,13 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                         .as_deref()
                         .map(str::trim)
                         .filter(|b| !b.is_empty())
-                        .ok_or_else(|| "a bearer token is required for auth = bearer".to_string())?;
+                        .ok_or_else(|| {
+                            "a bearer token is required for auth = bearer".to_string()
+                        })?;
                     if b.len() > 8192 || b.chars().any(|c| c.is_control()) {
-                        return Err("the bearer token is too long or contains control characters".into());
+                        return Err(
+                            "the bearer token is too long or contains control characters".into(),
+                        );
                     }
                     // Accept a pasted "Bearer xyz" as well as "xyz".
                     let b = match (b.get(..7), b.get(7..)) {
@@ -389,19 +463,50 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 &req.server,
                 &url,
                 req.auth,
-                RemoteSecrets { url: url.to_string(), bearer, oauth: None, headers },
+                RemoteSecrets {
+                    url: url.to_string(),
+                    bearer,
+                    oauth: None,
+                    headers,
+                },
                 server_stream,
             )?;
             Ok(ConnectOutcome::Connected)
         }
         AuthKind::Oauth => {
-            let plan = plan_redirect(req.redirect_origin.as_deref().unwrap_or(""), &req.allowed_origins)?;
+            let plan = plan_redirect(
+                req.redirect_origin.as_deref().unwrap_or(""),
+                &req.allowed_origins,
+            )?;
             let (origin, redirect_uri, paste) = match plan {
-                RedirectPlan::Direct { origin, redirect_uri } => (origin, redirect_uri, false),
-                RedirectPlan::Paste { origin, redirect_uri } => (origin, redirect_uri, true),
+                RedirectPlan::Direct {
+                    origin,
+                    redirect_uri,
+                } => (origin, redirect_uri, false),
+                RedirectPlan::Paste {
+                    origin,
+                    redirect_uri,
+                } => (origin, redirect_uri, true),
             };
             let disc = oauth::discover(&url, policy).await?;
-            let creds = match req.client_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if crate::google_oauth_policy::is_google_oauth_route(
+                "remote_mcp",
+                &disc.metadata.issuer,
+                disc.metadata.authorization_endpoint.as_str(),
+                disc.metadata.token_endpoint.as_str(),
+                disc.scope.as_deref().unwrap_or("").split_whitespace(),
+            ) {
+                return Err(
+                    "Google OAuth is not available through generic remote MCP; use Integrations → Google"
+                        .into(),
+                );
+            }
+            let creds = match req
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 Some(cid) => {
                     let secret = req
                         .client_secret
@@ -411,13 +516,21 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                         .map(str::to_string);
                     ClientCredentials {
                         client_id: cid.to_string(),
-                        token_endpoint_auth: oauth::auth_method_for_supplied(&disc.metadata, secret.is_some()),
+                        token_endpoint_auth: oauth::auth_method_for_supplied(
+                            &disc.metadata,
+                            secret.is_some(),
+                        ),
                         client_secret: secret,
                     }
                 }
                 None => {
-                    oauth::register_client(&disc.metadata, &redirect_uri, disc.scope.as_deref(), policy)
-                        .await?
+                    oauth::register_client(
+                        &disc.metadata,
+                        &redirect_uri,
+                        disc.scope.as_deref(),
+                        policy,
+                    )
+                    .await?
                 }
             };
             let (verifier, challenge) = oauth::pkce_pair();
@@ -483,8 +596,16 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 prune(&mut map);
                 map.insert(state, entry);
             }
-            let completion = if paste { Completion::Paste } else { Completion::Redirect };
-            Ok(ConnectOutcome::Authorize { authorize_url: authorize_url.to_string(), completion, redirect_uri })
+            let completion = if paste {
+                Completion::Paste
+            } else {
+                Completion::Redirect
+            };
+            Ok(ConnectOutcome::Authorize {
+                authorize_url: authorize_url.to_string(),
+                completion,
+                redirect_uri,
+            })
         }
     }
 }
@@ -496,7 +617,8 @@ async fn probe_static(
     bearer: Option<&str>,
     headers: &[(String, String)],
 ) -> Result<(), String> {
-    let client = super::url_policy::pinned_client(url, policy, super::http::REQUEST_TIMEOUT).await?;
+    let client =
+        super::url_policy::pinned_client(url, policy, super::http::REQUEST_TIMEOUT).await?;
     let mut req = client
         .post(url.clone())
         .header("Accept", "application/json, text/event-stream")
@@ -569,16 +691,22 @@ pub async fn complete_callback(home: &Path, state: &str, code: &str) -> Result<C
 /// answer from the authorization server abandons the sign-in.
 pub async fn complete_pasted(home: &Path, pasted: &str) -> Result<Completed, String> {
     match parse_pasted_callback(pasted)? {
-        PastedCallback::Error { state, error, description } => {
+        PastedCallback::Error {
+            state,
+            error,
+            description,
+        } => {
             let what = duduclaw_core::truncate_chars(&format!("{error} {description}"), 300);
             match cancel_pending(&state) {
                 Some(_) => Err(format!("The authorization server answered: {what}")),
                 None => Err("unknown or expired sign-in; start again from the dashboard".into()),
             }
         }
-        PastedCallback::Code { state, code, redirect_uri } => {
-            complete_inner(home, &state, &code, Some(&redirect_uri)).await
-        }
+        PastedCallback::Code {
+            state,
+            code,
+            redirect_uri,
+        } => complete_inner(home, &state, &code, Some(&redirect_uri)).await,
     }
 }
 
@@ -600,7 +728,10 @@ async fn complete_inner(
         && !(p.paste && same_redirect(pasted, &p.redirect_uri))
     {
         // The state was single use, so this sign-in is gone either way.
-        return Err("the pasted address does not belong to this sign-in; start again from the dashboard".into());
+        return Err(
+            "the pasted address does not belong to this sign-in; start again from the dashboard"
+                .into(),
+        );
     }
     let url = validate_remote_url(&p.mcp_url)?;
     let policy = OutboundPolicy::for_mcp_url(&url);
@@ -631,16 +762,31 @@ async fn complete_inner(
         expires_at: tokens.expires_at,
         revocation_endpoint: p.revocation_endpoint.as_ref().map(|u| u.to_string()),
     };
+    if oauth_secret_matches_google(&oauth_secrets) {
+        return Err(
+            "Google OAuth is not available through generic remote MCP; use Integrations → Google"
+                .into(),
+        );
+    }
     save_connected(
         home,
         &p.agent_id,
         &p.server,
         &url,
         AuthKind::Oauth,
-        RemoteSecrets { url: url.to_string(), bearer: None, oauth: Some(oauth_secrets), headers: p.headers.clone() },
+        RemoteSecrets {
+            url: url.to_string(),
+            bearer: None,
+            oauth: Some(oauth_secrets),
+            headers: p.headers.clone(),
+        },
         p.server_stream,
     )?;
-    Ok(Completed { agent_id: p.agent_id, server: p.server, redirect_origin: p.redirect_origin })
+    Ok(Completed {
+        agent_id: p.agent_id,
+        server: p.server,
+        redirect_origin: p.redirect_origin,
+    })
 }
 
 /// Forget the credentials of a connection. `forget = false` keeps the record
@@ -662,7 +808,15 @@ pub fn disconnect(home: &Path, agent_id: &str, server: &str, forget: bool) -> Re
         Ok(s) => (s.url, s.headers),
         Err(_) => return store::remove(home, agent_id, server),
     };
-    let sealed = store::seal(home, &RemoteSecrets { url, bearer: None, oauth: None, headers })?;
+    let sealed = store::seal(
+        home,
+        &RemoteSecrets {
+            url,
+            bearer: None,
+            oauth: None,
+            headers,
+        },
+    )?;
     store::update(home, agent_id, server, move |r| {
         r.status = ConnStatus::NotConnected;
         r.access_expires_at = None;
@@ -723,10 +877,12 @@ pub fn status_list(home: &Path, agent_filter: Option<&str>) -> Result<Vec<Value>
         .into_iter()
         .filter(|r| agent_filter.is_none_or(|a| r.agent_id == a))
         .map(|r| {
-            let installed = duduclaw_agent::mcp_template::read_mcp_config(&home.join("agents").join(&r.agent_id))
-                .ok()
-                .and_then(|c| c.mcp_servers.get(&r.server).cloned())
-                .is_some_and(|d| super::bridge_def::is_bridge_def(&d));
+            let installed = duduclaw_agent::mcp_template::read_mcp_config(
+                &home.join("agents").join(&r.agent_id),
+            )
+            .ok()
+            .and_then(|c| c.mcp_servers.get(&r.server).cloned())
+            .is_some_and(|d| super::bridge_def::is_bridge_def(&d));
             json!({
                 "agent_id": r.agent_id,
                 "server": r.server,
@@ -777,7 +933,10 @@ pub struct UpstreamAuth {
 
 /// Put the credential (and any other headers the record carries) on a
 /// request to the remote server.
-pub fn apply_upstream_headers(mut req: reqwest::RequestBuilder, auth: &UpstreamAuth) -> reqwest::RequestBuilder {
+pub fn apply_upstream_headers(
+    mut req: reqwest::RequestBuilder,
+    auth: &UpstreamAuth,
+) -> reqwest::RequestBuilder {
     for (k, v) in &auth.headers {
         req = req.header(k.as_str(), v.as_str());
     }
@@ -794,17 +953,77 @@ fn not_connected(agent_id: &str, server: &str, why: &str) -> AuthError {
     ))
 }
 
-fn load_usable(home: &Path, agent_id: &str, server: &str) -> Result<(RemoteServerRecord, RemoteSecrets), AuthError> {
+fn load_usable(
+    home: &Path,
+    agent_id: &str,
+    server: &str,
+) -> Result<(RemoteServerRecord, RemoteSecrets), AuthError> {
     let rec = store::get(home, agent_id, server)
         .map_err(AuthError::Transient)?
         .ok_or_else(|| not_connected(agent_id, server, "is not set up"))?;
     match rec.status {
         ConnStatus::Connected => {}
-        ConnStatus::NotConnected => return Err(not_connected(agent_id, server, "is not connected")),
-        ConnStatus::NeedsReauth => return Err(not_connected(agent_id, server, "needs to sign in again")),
+        ConnStatus::NotConnected => {
+            return Err(not_connected(agent_id, server, "is not connected"));
+        }
+        ConnStatus::NeedsReauth => {
+            return Err(not_connected(agent_id, server, "needs to sign in again"));
+        }
     }
     let secrets = store::open(home, &rec).map_err(|e| AuthError::NotConnected(e))?;
     Ok((rec, secrets))
+}
+
+fn refuse_stored_google_oauth(
+    home: &Path,
+    agent_id: &str,
+    server: &str,
+    secrets: &RemoteSecrets,
+) -> Result<(), AuthError> {
+    let google_bearer = secrets.bearer.is_some() && is_google_remote_url(&secrets.url);
+    let google_oauth = secrets
+        .oauth
+        .as_ref()
+        .is_some_and(oauth_secret_matches_google);
+    if !google_bearer && !google_oauth {
+        return Ok(());
+    }
+    let _ = store::update(home, agent_id, server, |record| {
+        record.status = ConnStatus::NeedsReauth;
+        Ok(true)
+    });
+    Err(not_connected(
+        agent_id,
+        server,
+        "matches Google OAuth and must be reconnected through Integrations → Google",
+    ))
+}
+
+fn is_google_remote_url(raw: &str) -> bool {
+    crate::google_oauth_policy::is_google_oauth_route("", raw, "", "", std::iter::empty::<&str>())
+}
+
+fn oauth_secret_matches_google(oauth: &OAuthSecrets) -> bool {
+    crate::google_oauth_policy::is_google_oauth_route(
+        "",
+        &oauth.issuer,
+        "",
+        &oauth.token_endpoint,
+        oauth
+            .scope
+            .as_deref()
+            .unwrap_or("")
+            .split_ascii_whitespace(),
+    )
+}
+
+fn merge_refreshed_non_google(oauth: &mut OAuthSecrets, fresh: oauth::TokenSet) -> Result<(), ()> {
+    oauth::merge_refreshed(oauth, fresh);
+    if oauth_secret_matches_google(oauth) {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 fn to_upstream(secrets: &RemoteSecrets) -> Result<UpstreamAuth, AuthError> {
@@ -815,13 +1034,22 @@ fn to_upstream(secrets: &RemoteSecrets) -> Result<UpstreamAuth, AuthError> {
         (None, Some(o)) => (Some(format!("Bearer {}", o.access_token)), o.expires_at),
         (None, None) => (None, None),
     };
-    Ok(UpstreamAuth { url, authorization, expires_at, headers })
+    Ok(UpstreamAuth {
+        url,
+        authorization,
+        expires_at,
+        headers,
+    })
 }
 
 /// Take the per-record refresh lock (a separate lock file, held across the
 /// network call so two bridge processes never spend the same rotating
 /// refresh token).
-async fn refresh_lock(home: &Path, agent_id: &str, server: &str) -> Result<std::fs::File, AuthError> {
+async fn refresh_lock(
+    home: &Path,
+    agent_id: &str,
+    server: &str,
+) -> Result<std::fs::File, AuthError> {
     use fs2::FileExt;
     let dir = store::lock_dir(home);
     let path = dir.join(format!("{agent_id}__{server}.lock"));
@@ -834,7 +1062,8 @@ async fn refresh_lock(home: &Path, agent_id: &str, server: &str) -> Result<std::
             .write(true)
             .open(&path)
             .map_err(|e| format!("cannot open refresh lock: {e}"))?;
-        f.lock_exclusive().map_err(|e| format!("cannot take refresh lock: {e}"))?;
+        f.lock_exclusive()
+            .map_err(|e| format!("cannot take refresh lock: {e}"))?;
         Ok(f)
     })
     .await
@@ -859,6 +1088,7 @@ pub async fn upstream_auth(
     seen: Option<&str>,
 ) -> Result<UpstreamAuth, AuthError> {
     let (rec, secrets) = load_usable(home, agent_id, server)?;
+    refuse_stored_google_oauth(home, agent_id, server, &secrets)?;
     let now = chrono::Utc::now().timestamp();
     let Some(o) = &secrets.oauth else {
         if force_refresh && rec.auth != AuthKind::None {
@@ -875,13 +1105,19 @@ pub async fn upstream_auth(
     }
 
     let _lock = refresh_lock(home, agent_id, server).await?;
-    let _google_grant_lease = crate::google_personal::grants::acquire(home).await.map_err(AuthError::Transient)?;
+    let _google_grant_lease = crate::google_personal::grants::acquire(home)
+        .await
+        .map_err(AuthError::Transient)?;
     // Re-read under the lock.
     let (_, mut secrets) = load_usable(home, agent_id, server)?;
+    refuse_stored_google_oauth(home, agent_id, server, &secrets)?;
     let current = to_upstream(&secrets)?;
     let now = chrono::Utc::now().timestamp();
     {
-        let o = secrets.oauth.as_ref().ok_or_else(|| not_connected(agent_id, server, "has no OAuth tokens"))?;
+        let o = secrets
+            .oauth
+            .as_ref()
+            .ok_or_else(|| not_connected(agent_id, server, "has no OAuth tokens"))?;
         let still_expiring = o.expires_at.is_some_and(|e| e - REFRESH_SKEW_SECS <= now);
         let changed_since_seen = seen.is_some() && current.authorization.as_deref() != seen;
         if (force_refresh && changed_since_seen) || (!force_refresh && !still_expiring) {
@@ -895,7 +1131,11 @@ pub async fn upstream_auth(
             r.status = ConnStatus::NeedsReauth;
             Ok(true)
         });
-        return Err(not_connected(agent_id, server, "has an expired sign-in and no refresh token"));
+        return Err(not_connected(
+            agent_id,
+            server,
+            "has an expired sign-in and no refresh token",
+        ));
     };
     let url = current.url.clone();
     let policy = OutboundPolicy::for_mcp_url(&url);
@@ -906,9 +1146,28 @@ pub async fn upstream_auth(
         client_secret: o.client_secret.clone(),
         token_endpoint_auth: o.token_endpoint_auth.clone(),
     };
-    match oauth::refresh(&token_endpoint, policy, &creds, &rt, &o.resource, o.scope.as_deref()).await {
+    match oauth::refresh(
+        &token_endpoint,
+        policy,
+        &creds,
+        &rt,
+        &o.resource,
+        o.scope.as_deref(),
+    )
+    .await
+    {
         Ok(fresh) => {
-            oauth::merge_refreshed(o, fresh);
+            if merge_refreshed_non_google(o, fresh).is_err() {
+                let _ = store::update(home, agent_id, server, |r| {
+                    r.status = ConnStatus::NeedsReauth;
+                    Ok(true)
+                });
+                return Err(not_connected(
+                    agent_id,
+                    server,
+                    "returned Google OAuth scope and must be reconnected through Integrations → Google",
+                ));
+            }
             let expires = o.expires_at;
             let has_rt = o.refresh_token.is_some();
             let sealed = store::seal(home, &secrets).map_err(AuthError::Transient)?;
@@ -927,7 +1186,11 @@ pub async fn upstream_auth(
                 r.status = ConnStatus::NeedsReauth;
                 Ok(true)
             });
-            Err(not_connected(agent_id, server, &format!("could not renew its sign-in ({msg})")))
+            Err(not_connected(
+                agent_id,
+                server,
+                &format!("could not renew its sign-in ({msg})"),
+            ))
         }
         Err(TokenError::Other(msg)) => Err(AuthError::Transient(msg)),
     }
@@ -939,11 +1202,23 @@ mod tests {
 
     #[test]
     fn redirect_origin_validation() {
-        let allowed = vec!["dash.example.com".to_string(), "other.example.com:8443".to_string()];
-        assert_eq!(validate_redirect_origin("http://localhost:18789", &allowed).unwrap(), "http://localhost:18789");
-        assert_eq!(validate_redirect_origin("http://127.0.0.1:5173/", &allowed).unwrap(), "http://127.0.0.1:5173");
+        let allowed = vec![
+            "dash.example.com".to_string(),
+            "other.example.com:8443".to_string(),
+        ];
+        assert_eq!(
+            validate_redirect_origin("http://localhost:18789", &allowed).unwrap(),
+            "http://localhost:18789"
+        );
+        assert_eq!(
+            validate_redirect_origin("http://127.0.0.1:5173/", &allowed).unwrap(),
+            "http://127.0.0.1:5173"
+        );
         assert!(validate_redirect_origin("http://[::1]:18789", &allowed).is_ok());
-        assert_eq!(validate_redirect_origin("https://dash.example.com", &allowed).unwrap(), "https://dash.example.com");
+        assert_eq!(
+            validate_redirect_origin("https://dash.example.com", &allowed).unwrap(),
+            "https://dash.example.com"
+        );
         assert!(validate_redirect_origin("https://other.example.com:8443", &allowed).is_ok());
         // Port-qualified allow entry must match the port exactly.
         assert!(validate_redirect_origin("https://other.example.com:9443", &allowed).is_err());
@@ -972,14 +1247,26 @@ mod tests {
                 redirect_uri: "http://localhost:18789/oauth/mcp/callback".into(),
             }
         );
-        assert!(matches!(plan_redirect("https://dash.example.com", &allowed).unwrap(), RedirectPlan::Direct { .. }));
+        assert!(matches!(
+            plan_redirect("https://dash.example.com", &allowed).unwrap(),
+            RedirectPlan::Direct { .. }
+        ));
         // A LAN IP, a LAN host name and an unlisted https origin: paste,
         // redirected to the browser machine's loopback on the same port.
         for (raw, uri) in [
-            ("http://192.168.1.20:18789", "http://127.0.0.1:18789/oauth/mcp/callback"),
-            ("http://duduclaw.local:8080/", "http://127.0.0.1:8080/oauth/mcp/callback"),
+            (
+                "http://192.168.1.20:18789",
+                "http://127.0.0.1:18789/oauth/mcp/callback",
+            ),
+            (
+                "http://duduclaw.local:8080/",
+                "http://127.0.0.1:8080/oauth/mcp/callback",
+            ),
             ("http://10.0.0.5", "http://127.0.0.1/oauth/mcp/callback"),
-            ("https://evil.example.org", "http://127.0.0.1:443/oauth/mcp/callback"),
+            (
+                "https://evil.example.org",
+                "http://127.0.0.1:443/oauth/mcp/callback",
+            ),
         ] {
             match plan_redirect(raw, &allowed).unwrap() {
                 RedirectPlan::Paste { redirect_uri, .. } => assert_eq!(redirect_uri, uri, "{raw}"),
@@ -987,7 +1274,13 @@ mod tests {
             }
         }
         // Malformed origins are still refused, never turned into paste.
-        for raw in ["", "javascript:alert(1)", "http://u:p@192.168.1.20", "http://192.168.1.20/app", "ftp://192.168.1.20"] {
+        for raw in [
+            "",
+            "javascript:alert(1)",
+            "http://u:p@192.168.1.20",
+            "http://192.168.1.20/app",
+            "ftp://192.168.1.20",
+        ] {
             assert!(plan_redirect(raw, &allowed).is_err(), "{raw}");
         }
     }
@@ -995,7 +1288,10 @@ mod tests {
     #[test]
     fn pasted_callback_parsing() {
         assert_eq!(
-            parse_pasted_callback("  http://127.0.0.1:18789/oauth/mcp/callback?code=abc&state=st1  ").unwrap(),
+            parse_pasted_callback(
+                "  http://127.0.0.1:18789/oauth/mcp/callback?code=abc&state=st1  "
+            )
+            .unwrap(),
             PastedCallback::Code {
                 state: "st1".into(),
                 code: "abc".into(),
@@ -1038,7 +1334,11 @@ mod tests {
                     code_verifier: "v".into(),
                     token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
                     issuer: "https://auth.example.com".into(),
-                    creds: ClientCredentials { client_id: "c".into(), client_secret: None, token_endpoint_auth: "none".into() },
+                    creds: ClientCredentials {
+                        client_id: "c".into(),
+                        client_secret: None,
+                        token_endpoint_auth: "none".into(),
+                    },
                     resource: "https://mcp.example.com/mcp".into(),
                     scope: None,
                     revocation_endpoint: None,
@@ -1050,14 +1350,24 @@ mod tests {
         };
         // Wrong port ⇒ refused, and the one-time state is consumed.
         insert("st-paste-port", true);
-        let err = complete_pasted(dir.path(), "http://127.0.0.1:9999/oauth/mcp/callback?code=c&state=st-paste-port")
-            .await
-            .unwrap_err();
+        let err = complete_pasted(
+            dir.path(),
+            "http://127.0.0.1:9999/oauth/mcp/callback?code=c&state=st-paste-port",
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("does not belong"), "{err}");
         assert!(take_pending("st-paste-port").is_none());
         // A direct (non-paste) sign-in cannot be finished by pasting.
         insert("st-direct", false);
-        assert!(complete_pasted(dir.path(), "http://127.0.0.1:18789/oauth/mcp/callback?code=c&state=st-direct").await.is_err());
+        assert!(
+            complete_pasted(
+                dir.path(),
+                "http://127.0.0.1:18789/oauth/mcp/callback?code=c&state=st-direct"
+            )
+            .await
+            .is_err()
+        );
         // An error answer abandons the sign-in.
         insert("st-denied", true);
         let err = complete_pasted(
@@ -1090,7 +1400,11 @@ mod tests {
                     code_verifier: "v".into(),
                     token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
                     issuer: "https://auth.example.com".into(),
-                    creds: ClientCredentials { client_id: "c".into(), client_secret: None, token_endpoint_auth: "none".into() },
+                    creds: ClientCredentials {
+                        client_id: "c".into(),
+                        client_secret: None,
+                        token_endpoint_auth: "none".into(),
+                    },
                     resource: "https://mcp.example.com/mcp".into(),
                     scope: None,
                     revocation_endpoint: None,
@@ -1102,7 +1416,11 @@ mod tests {
         }
         // Expired ⇒ refused, and removed.
         assert!(cancel_pending("st-test-1").is_none());
-        assert!(complete_callback(dir.path(), "st-test-1", "code").await.is_err());
+        assert!(
+            complete_callback(dir.path(), "st-test-1", "code")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1110,12 +1428,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let url = Url::parse("https://mcp.example.com/mcp").unwrap();
-        save_connected(home, "a1", "s1", &url, AuthKind::Bearer, RemoteSecrets {
-            url: url.to_string(),
-            bearer: Some("tok".into()),
-            oauth: None,
-            headers: vec![("X-Workspace".into(), "w1".into())],
-        }, false)
+        save_connected(
+            home,
+            "a1",
+            "s1",
+            &url,
+            AuthKind::Bearer,
+            RemoteSecrets {
+                url: url.to_string(),
+                bearer: Some("tok".into()),
+                oauth: None,
+                headers: vec![("X-Workspace".into(), "w1".into())],
+            },
+            false,
+        )
         .unwrap();
         assert!(disconnect(home, "a1", "s1", false).unwrap());
         let rec = store::get(home, "a1", "s1").unwrap().unwrap();
@@ -1131,10 +1457,158 @@ mod tests {
     async fn bridge_auth_refuses_records_that_are_not_connected() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let e = upstream_auth(home, "a1", "missing", false, None).await.err().unwrap();
+        let e = upstream_auth(home, "a1", "missing", false, None)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(e, AuthError::NotConnected(_)));
-        super::super::bridge_def::prepare_for_install(home, "a1", "s1", &super::super::bridge_def::candidate_def("https://mcp.example.com/mcp")).unwrap();
-        let e = upstream_auth(home, "a1", "s1", false, None).await.err().unwrap();
+        super::super::bridge_def::prepare_for_install(
+            home,
+            "a1",
+            "s1",
+            &super::super::bridge_def::candidate_def("https://mcp.example.com/mcp"),
+        )
+        .unwrap();
+        let e = upstream_auth(home, "a1", "s1", false, None)
+            .await
+            .err()
+            .unwrap();
         assert!(e.to_string().contains("is not connected"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn legacy_stored_google_oauth_is_fenced_before_bearer_or_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let url = Url::parse("https://mcp.example.com/mcp").unwrap();
+        save_connected(
+            home,
+            "a1",
+            "legacy-google",
+            &url,
+            AuthKind::Oauth,
+            RemoteSecrets {
+                url: url.to_string(),
+                bearer: None,
+                oauth: Some(OAuthSecrets {
+                    issuer: "https://accounts.google.com".into(),
+                    token_endpoint: "https://oauth2.googleapis.com/token".into(),
+                    client_id: "legacy-client".into(),
+                    client_secret: None,
+                    token_endpoint_auth: "none".into(),
+                    resource: url.to_string(),
+                    scope: Some("openid email".into()),
+                    access_token: "must-not-be-returned".into(),
+                    refresh_token: Some("must-not-be-sent".into()),
+                    expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+                    revocation_endpoint: None,
+                }),
+                headers: vec![],
+            },
+            false,
+        )
+        .unwrap();
+
+        let err = match upstream_auth(home, "a1", "legacy-google", false, None).await {
+            Err(err) => err,
+            Ok(_) => panic!("legacy Google credential must be fenced"),
+        };
+        assert!(matches!(err, AuthError::NotConnected(_)));
+        assert!(err.to_string().contains("Google"), "{err}");
+        assert_eq!(
+            store::get(home, "a1", "legacy-google")
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnStatus::NeedsReauth
+        );
+    }
+
+    #[tokio::test]
+    async fn new_google_host_bearer_is_refused_before_probe_or_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let result = start_connect(
+            home,
+            ConnectRequest {
+                agent_id: "a1".into(),
+                server: "google-bearer".into(),
+                url: Some("https://workspace.googleapis.com/mcp".into()),
+                auth: AuthKind::Bearer,
+                bearer: Some("must-not-be-sent".into()),
+                redirect_origin: None,
+                client_id: None,
+                client_secret: None,
+                allowed_origins: vec![],
+                headers: None,
+                server_stream: None,
+            },
+        )
+        .await;
+
+        let err = result.expect_err("Google-hosted bearer must be refused");
+        assert!(err.contains("Google-hosted MCP"), "{err}");
+        assert!(store::get(home, "a1", "google-bearer").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_stored_google_host_bearer_is_fenced_before_header_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let url = Url::parse("https://workspace.googleapis.com/mcp").unwrap();
+        save_connected(
+            home,
+            "a1",
+            "legacy-google-bearer",
+            &url,
+            AuthKind::Bearer,
+            RemoteSecrets {
+                url: url.to_string(),
+                bearer: Some("must-not-be-returned".into()),
+                oauth: None,
+                headers: vec![],
+            },
+            false,
+        )
+        .unwrap();
+
+        let err = match upstream_auth(home, "a1", "legacy-google-bearer", false, None).await {
+            Err(err) => err,
+            Ok(_) => panic!("legacy Google-hosted bearer must be fenced"),
+        };
+        assert!(matches!(err, AuthError::NotConnected(_)));
+        assert_eq!(
+            store::get(home, "a1", "legacy-google-bearer")
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnStatus::NeedsReauth
+        );
+    }
+
+    #[test]
+    fn token_or_refresh_response_workspace_scope_is_rejected_before_persistence() {
+        let mut stored = OAuthSecrets {
+            issuer: "https://auth.example.test".into(),
+            token_endpoint: "https://auth.example.test/token".into(),
+            client_id: "client".into(),
+            client_secret: None,
+            token_endpoint_auth: "none".into(),
+            resource: "https://mcp.example.test/mcp".into(),
+            scope: Some("openid".into()),
+            access_token: "old".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: None,
+            revocation_endpoint: None,
+        };
+        let fresh = oauth::TokenSet {
+            access_token: "must-not-be-persisted".into(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            scope: Some("https://www.googleapis.com/auth/drive.readonly".into()),
+        };
+
+        assert!(merge_refreshed_non_google(&mut stored, fresh).is_err());
+        assert!(oauth_secret_matches_google(&stored));
     }
 }

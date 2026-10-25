@@ -12,6 +12,7 @@ fn candidate() -> Pending {
         client_id: "client-fixture".into(),
         client_secret: "secret-fixture".into(),
         epoch: 1,
+        google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
         created: Instant::now(),
         code: None,
     }
@@ -67,6 +68,7 @@ fn pasted_callback_requires_exact_redirect_and_same_session_before_recording_cod
         client_id: "client".into(),
         client_secret: "secret".into(),
         epoch: 1,
+        google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
         created: Instant::now(),
         code: None,
     });

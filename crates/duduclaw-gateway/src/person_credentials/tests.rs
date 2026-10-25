@@ -26,6 +26,7 @@ fn metadata(user: &str) -> Metadata {
         connected_at: chrono::Utc::now().to_rfc3339(),
         last_refresh_at: None,
         oauth_client_id: "client-1".into(),
+        google_data_consent: Some(crate::google_data_consent::Evidence::issue(user).unwrap()),
     }
 }
 

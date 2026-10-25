@@ -13,8 +13,12 @@ async fn begun_mode(master: bool) -> (tempfile::TempDir, String, flow::GoogleHom
     )
     .unwrap();
     std::fs::write(d.path().join(".keyfile"), [7u8; 32]).unwrap();
-    let input =
-        flow::GoogleHomeStartInput::new(Some("owned-client"), Some("owned-client-secret")).unwrap();
+    let input = flow::GoogleHomeStartInput::new(
+        Some("owned-client"),
+        Some("owned-client-secret"),
+        "test-admin",
+    )
+    .unwrap();
     let plan = flow::capture_google_home_start(d.path(), input).unwrap();
     let (_, state, pending) = flow::begin_google_home_authorization(d.path(), plan)
         .await
@@ -51,6 +55,110 @@ async fn callback_same_ticket_three_points_enables_master_and_preserves_unrelate
     assert_eq!(row[0]["scopes"].as_array().unwrap().len(), 11);
     assert!(!d.path().join(GATE_FILE).exists());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_downgrade_after_exchange_refuses_before_first_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _clock = publication::ClockGuard::fixed_if_unset(NOW);
+    let (d, state, pending) = begun().await;
+    let before_config = std::fs::read(d.path().join("config.toml")).unwrap();
+    let wire = home_source::callback_testing::Wire::json(d.path(), None);
+    let checks = AtomicUsize::new(0);
+    let result = flow::complete_google_home_authorization_with_admin_check(
+        d.path(),
+        pending,
+        &state,
+        zeroize::Zeroizing::new("owned-code".into()),
+        &|actor| actor == "test-admin" && checks.fetch_add(1, Ordering::SeqCst) < 2,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(wire.requests(), 1, "the downgrade happens after exchange");
+    let rows: Value = serde_json::from_slice(&bytes(d.path())).unwrap();
+    assert!(rows[0].get("access_token").is_none());
+    assert!(rows[0]["google_home"]["credential"].is_null());
+    assert_eq!(
+        std::fs::read(d.path().join("config.toml")).unwrap(),
+        before_config,
+        "the integration must not be enabled"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_downgrade_inside_publication_fence_refuses_before_payload_publish() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for phase in [101, 201] {
+        let _clock = publication::ClockGuard::fixed_if_unset(NOW);
+        let (d, state, pending) = begun().await;
+        let before_config = std::fs::read(d.path().join("config.toml")).unwrap();
+        let wire = home_source::callback_testing::Wire::json(d.path(), None);
+        let live = Arc::new(AtomicBool::new(true));
+        let downgraded = Arc::clone(&live);
+        let boundary = flow::testing::FinishBoundaryGuard::at(d.path(), phase, move || {
+            downgraded.store(false, Ordering::SeqCst);
+        });
+        let result = flow::complete_google_home_authorization_with_admin_check(
+            d.path(),
+            pending,
+            &state,
+            zeroize::Zeroizing::new("owned-code".into()),
+            &|actor| actor == "test-admin" && live.load(Ordering::SeqCst),
+        )
+        .await;
+
+        assert!(boundary.triggered(), "phase {phase}");
+        assert!(result.is_err(), "phase {phase}");
+        assert_eq!(wire.requests(), 1, "phase {phase}");
+        let rows: Value = serde_json::from_slice(&bytes(d.path())).unwrap();
+        assert!(rows[0].get("access_token").is_none(), "phase {phase}");
+        assert!(
+            rows[0]["google_home"]["credential"].is_null(),
+            "phase {phase}"
+        );
+        assert_eq!(
+            std::fs::read(d.path().join("config.toml")).unwrap(),
+            before_config,
+            "phase {phase}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_downgrade_at_final_publication_fence_keeps_payload_blocked() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _clock = publication::ClockGuard::fixed_if_unset(NOW);
+    let (d, state, pending) = begun().await;
+    let wire = home_source::callback_testing::Wire::json(d.path(), None);
+    let live = Arc::new(AtomicBool::new(true));
+    let downgraded = Arc::clone(&live);
+    let boundary = flow::testing::FinishBoundaryGuard::at(d.path(), 301, move || {
+        downgraded.store(false, Ordering::SeqCst);
+    });
+    let result = flow::complete_google_home_authorization_with_admin_check(
+        d.path(),
+        pending,
+        &state,
+        zeroize::Zeroizing::new("owned-code".into()),
+        &|actor| actor == "test-admin" && live.load(Ordering::SeqCst),
+    )
+    .await;
+
+    assert!(boundary.triggered());
+    assert!(result.is_err());
+    assert_eq!(wire.requests(), 1);
+    assert!(api::get_token(d.path(), "google").is_none());
+    assert!(
+        !d.path().join(GATE_FILE).exists(),
+        "the first stage-3 authority check runs before a publication gate is created"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn wrong_state_stale_client_and_claim_cleanup_fail_before_provider() {
     for lane in [0, 1, 2] {
@@ -438,7 +546,7 @@ async fn exact_client_value_aba_through_public_writer_invalidates_original_claim
         "[integrations]\ngoogle_workspace=false\n",
     )
     .unwrap();
-    let input = flow::GoogleHomeStartInput::new(Some("owned-client"), None).unwrap();
+    let input = flow::GoogleHomeStartInput::new(Some("owned-client"), None, "test-admin").unwrap();
     let plan = flow::capture_google_home_start(d.path(), input).unwrap();
     let (_, state, pending) = flow::begin_google_home_authorization(d.path(), plan)
         .await
@@ -479,7 +587,7 @@ async fn final_ram_lock_wait_cannot_extend_durable_wall_ticket() {
         "[integrations]\ngoogle_workspace=false\n",
     )
     .unwrap();
-    let input = flow::GoogleHomeStartInput::new(Some("owned-client"), None).unwrap();
+    let input = flow::GoogleHomeStartInput::new(Some("owned-client"), None, "test-admin").unwrap();
     let plan = flow::capture_google_home_start(d.path(), input).unwrap();
     let started = flow::begin_google_home_authorization(d.path(), plan)
         .await

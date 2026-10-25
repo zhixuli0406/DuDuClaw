@@ -131,6 +131,7 @@ fn client_whole_file_cas_refuses_unrelated_provider_change_before_any_pending_or
                 RawDigest::of(b"s"),
                 NOW + 500,
                 NOW,
+                crate::google_data_consent::Evidence::issue("test-admin").unwrap(),
             )?;
             // Simulate a noncooperating writer touching only another provider.
             let mut actual: Vec<Value> = serde_json::from_slice(&before).unwrap();

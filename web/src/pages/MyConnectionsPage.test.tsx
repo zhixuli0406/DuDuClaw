@@ -12,6 +12,26 @@ const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_
 beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
+  it('requires an in-product Google data disclosure acknowledgement before OAuth starts', async () => {
+    vi.mocked(api.personalGoogle.status).mockResolvedValue({...status, connection: null});
+    const start = vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18789/api/me/google/callback',expires_in:600});
+    vi.spyOn(window,'open').mockReturnValue({opener:null,location:{replace:vi.fn()},close:vi.fn()} as never);
+    const user = userEvent.setup();
+    renderWithProviders(<MyConnectionsPage/>);
+
+    expect(await screen.findByText(/Google data may be stored in local conversation/i)).toBeInTheDocument();
+    expect(screen.getByText(/must not use Google data to train or improve a generalized AI/i)).toBeInTheDocument();
+    expect(screen.getByRole('link',{name:/privacy policy/i})).toHaveAttribute('href','https://dudustudio.monster/duduclaw/privacy/');
+    const connect = screen.getByRole('button',{name:'Connect my Google'});
+    expect(connect).toBeDisabled();
+    expect(start).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('checkbox',{name:/understand how my Google data is accessed/i}));
+    expect(connect).toBeEnabled();
+    await user.click(connect);
+    await waitFor(()=>expect(start).toHaveBeenCalledTimes(1));
+  });
+
   it('shows that Anyone includes external tools while public visitors remain excluded',async()=>{
     vi.mocked(api.personalGoogle.status).mockResolvedValue({...status,requests:status.requests.map(request=>({...request,requesters:'anyone'}))});
     renderWithProviders(<MyConnectionsPage/>);
@@ -24,6 +44,7 @@ describe('MyConnectionsPage', () => {
     vi.spyOn(window,'open').mockReturnValue({opener:null,location:{replace:vi.fn()},close:vi.fn()} as never);
     vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18789/api/me/google/callback',expires_in:600});
     renderWithProviders(<MyConnectionsPage/>);
+    await user.click(await screen.findByRole('checkbox',{name:/understand how my Google data is accessed/i}));
     await user.click(await screen.findByRole('button',{name:'Reconnect'}));
     expect(await screen.findByDisplayValue('http://127.0.0.1:18789/api/me/google/callback')).toBeInTheDocument();
     await user.click(screen.getByRole('button',{name:'Copy return address'}));

@@ -284,9 +284,11 @@ async fn ram_callback(
     tokio::sync::RwLock<std::collections::HashMap<String, super::super::PendingOAuth>>,
 ) {
     use super::super::home_lifecycle as flow;
-    let plan =
-        flow::capture_google_home_start(home, flow::GoogleHomeStartInput::new(None, None).unwrap())
-            .unwrap();
+    let plan = flow::capture_google_home_start(
+        home,
+        flow::GoogleHomeStartInput::new(None, None, "test-admin").unwrap(),
+    )
+    .unwrap();
     let started = flow::begin_google_home_authorization(home, plan)
         .await
         .unwrap();
@@ -316,7 +318,7 @@ async fn actual_ram_callback_waits_for_inflight_revoke_then_consumes_same_ticket
         .unwrap();
     lease.begin_revoke().unwrap();
     let query = format!("state={state}&code=owned-code");
-    let callback = super::super::complete_callback_query(d.path(), &map, &query);
+    let callback = super::super::complete_callback_query(d.path(), &map, &query, |_| true);
     tokio::pin!(callback);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(75), &mut callback)
@@ -340,7 +342,7 @@ async fn actual_ram_callback_waits_for_inflight_revoke_then_consumes_same_ticket
     );
     assert_eq!(wire.requests(), 1);
     assert!(
-        super::super::complete_callback_query(d.path(), &map, &query)
+        super::super::complete_callback_query(d.path(), &map, &query, |_| true)
             .await
             .is_err()
     );
@@ -359,7 +361,7 @@ async fn actual_ram_callback_refuses_persisted_marker_after_revoke_holder_is_can
     lease.begin_revoke().unwrap();
     let before = raw(d.path());
     let query = format!("state={state}&code=owned-code");
-    let callback = super::super::complete_callback_query(d.path(), &map, &query);
+    let callback = super::super::complete_callback_query(d.path(), &map, &query, |_| true);
     tokio::pin!(callback);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(75), &mut callback)
@@ -395,7 +397,7 @@ async fn actual_ram_callback_grant_wait_timeout_never_claims_or_sends_provider()
     lease.begin_revoke().unwrap();
     let before = raw(d.path());
     let query = format!("state={state}&code=owned-code");
-    let callback = super::super::complete_callback_query(d.path(), &map, &query);
+    let callback = super::super::complete_callback_query(d.path(), &map, &query, |_| true);
     tokio::pin!(callback);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(75), &mut callback)
@@ -430,7 +432,7 @@ async fn actual_ram_callback_wait_retains_original_ram_deadline_despite_fixed_wa
     lease.begin_revoke().unwrap();
     let before = raw(d.path());
     let query = format!("state={state}&code=owned-code");
-    let callback = super::super::complete_callback_query(d.path(), &map, &query);
+    let callback = super::super::complete_callback_query(d.path(), &map, &query, |_| true);
     tokio::pin!(callback);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(75), &mut callback)
@@ -463,7 +465,7 @@ async fn actual_ram_callback_bad_revocation_marker_is_consumed_without_claim_or_
     let before = raw(d.path());
     let query = format!("state={state}&code=owned-code");
     assert!(
-        super::super::complete_callback_query(d.path(), &map, &query)
+        super::super::complete_callback_query(d.path(), &map, &query, |_| true)
             .await
             .is_err()
     );

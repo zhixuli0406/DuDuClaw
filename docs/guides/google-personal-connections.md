@@ -12,7 +12,13 @@ Google's external apps in **Testing** status issue refresh tokens that expire af
 
 ## Connect your account
 
-1. Sign in to the Enterprise dashboard, open **My connections**, and select **Connect my Google**. Older login credentials require signing in again.
+Before DuDuClaw opens Google, it shows what Google data the requested scopes permit, where credentials and retrieved content are processed or stored, and that any configured AI provider must not use Google Workspace data to train or improve a generalized model. Review the linked privacy policy and explicitly confirm the disclosure. The official UI cannot continue without that confirmation, and the RPC must explicitly carry the acknowledgement. If an administrator cannot confirm that the configured provider follows this restriction, use a suitable local model or do not connect Google.
+
+Google authorization is accepted only through the dedicated Google connection flows. A custom OAuth provider or remote MCP whose issuer, authorization endpoint, token endpoint, or requested Workspace scope identifies Google is refused. Until training rows carry reliable source lineage that can prove Google Workspace data is absent, DuDuClaw also refuses dataset builds, dataset exports, and new fine-tuning jobs for every installation. Existing jobs can still be inspected or cancelled, and datasets can be deleted.
+
+Connections created before this disclosure revision cannot be used or refreshed until they are reconnected and the current disclosure is accepted. They remain visible for local disconnect and provider-revocation cleanup; DuDuClaw does not silently treat an older connection as accepted.
+
+1. Sign in to the Enterprise dashboard, open **My connections**, review and confirm the Google data disclosure, and select **Connect my Google**. Older login credentials require signing in again.
 2. Complete Google approval in the new window. Google allows individual services to be deselected. Only the permissions actually returned by Google are saved; a service you did not allow cannot be used.
 3. The browser returns to My connections. If the loopback page cannot load on your computer, copy its complete address-bar URL into the original dashboard's return-URL field. Do not send that URL to anyone else.
 4. Check the connected Google email. It may differ from your DuDuClaw sign-in email; the page explicitly highlights the difference.

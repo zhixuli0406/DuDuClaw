@@ -32,6 +32,13 @@ impl MethodHandler {
             match method {
                 "me.google.status" => self.personal_google_status(&db, ctx).await,
                 "me.google.connect_start" => {
+                    if params
+                        .get("acknowledge_google_data")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    {
+                        return Err("請先閱讀並確認 Google 資料的存取、分享、保存與刪除說明。".into());
+                    }
                     let session = google_personal::session_for(&ctx.user_id)?;
                     let origin = params
                         .get("redirect_origin")
@@ -44,6 +51,7 @@ impl MethodHandler {
                         &session,
                         origin,
                         &crate::server::allowed_origins_snapshot(),
+                        true,
                     )
                     .await
                 }
@@ -148,7 +156,15 @@ impl MethodHandler {
         ctx: &UserContext,
     ) -> Result<Value, String> {
         crate::person_credentials::sync_user_status(&self.home_dir, &ctx.user_id, true)?;
-        let own = crate::person_credentials::get(&self.home_dir, &ctx.user_id)?.map(|r| r.metadata);
+        let own = crate::person_credentials::get(&self.home_dir, &ctx.user_id)?.map(|r| {
+            let mut metadata = r.metadata;
+            if crate::google_data_consent::require_current(metadata.google_data_consent.as_ref())
+                .is_err()
+            {
+                metadata.status = crate::person_credentials::Status::NeedsReconnect;
+            }
+            metadata
+        });
         let consents = db.google_consents(&ctx.user_id)?;
         let registry = self.registry.read().await;
         let mut requests = Vec::new();

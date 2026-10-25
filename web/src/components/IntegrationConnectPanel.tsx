@@ -12,6 +12,7 @@ import {
 import { api } from '@/lib/api';
 import { openExternal } from '@/lib/external-link';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge, Input } from '@/components/mds';
+import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
 
 /** The OAuth redirect URI the gateway serves — users must register this exact
  *  value in each provider's OAuth app. Mirrors `handle_mcp_oauth_callback`. */
@@ -108,6 +109,7 @@ export function IntegrationConnectPanel({
   /** True once the user edits the id field — stops a refresh from overwriting it. */
   const clientIdTouched = useRef(false);
   const [busy, setBusy] = useState(false);
+  const [googleDataConfirmed, setGoogleDataConfirmed] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'error' | 'info'; text: string } | null>(null);
   /**
    * The consent URL of the in-flight authorization, kept on screen as
@@ -197,10 +199,17 @@ export function IntegrationConnectPanel({
   /** Returns whether the consent window was actually opened. */
   const openConsent = useCallback(
     async (id?: string, secret?: string): Promise<boolean> => {
+      if (providerId === 'google' && !googleDataConfirmed) return false;
       setBusy(true);
       setNotice(null);
       try {
-        const { auth_url } = await api.mcp.oauthStart(providerId, id, secret);
+        const { auth_url } = await api.mcp.oauthStart(
+          providerId,
+          id,
+          secret,
+          providerId === 'google' ? googleDataConfirmed : undefined,
+        );
+        if (providerId === 'google') setGoogleDataConfirmed(false);
         // Desktop-shell aware: window.open is a no-op in the wry webview.
         openExternal(auth_url);
         setAuthUrl(auth_url);
@@ -214,7 +223,7 @@ export function IntegrationConnectPanel({
         setBusy(false);
       }
     },
-    [providerId, startPolling, state.expiresAt, t],
+    [googleDataConfirmed, providerId, startPolling, state.expiresAt, t],
   );
 
   const handleSaveAndConnect = async () => {
@@ -434,8 +443,15 @@ export function IntegrationConnectPanel({
               )}
             </div>
 
+            {providerId === 'google' && (
+              <GoogleDataDisclosure
+                confirmed={googleDataConfirmed}
+                onConfirmedChange={setGoogleDataConfirmed}
+              />
+            )}
+
             <div className="flex flex-wrap gap-2">
-              <Button variant="brand" onClick={handleSaveAndConnect} disabled={busy || !clientId.trim()}>
+              <Button variant="brand" onClick={handleSaveAndConnect} disabled={busy || !clientId.trim() || (providerId === 'google' && !googleDataConfirmed)}>
                 {busy ? <Loader2 className="animate-spin" /> : <Plug />}
                 {t('action.connect')}
               </Button>
@@ -457,8 +473,14 @@ export function IntegrationConnectPanel({
           <CardContent className="flex flex-col items-stretch gap-3 pt-6">
             <p className="text-sm text-muted-foreground">{t('configured.hint')}</p>
             {savedSummary}
+            {providerId === 'google' && (
+              <GoogleDataDisclosure
+                confirmed={googleDataConfirmed}
+                onConfirmedChange={setGoogleDataConfirmed}
+              />
+            )}
             <div className="flex gap-2">
-              <Button variant="brand" onClick={() => openConsent()} disabled={busy}>
+              <Button variant="brand" onClick={() => openConsent()} disabled={busy || (providerId === 'google' && !googleDataConfirmed)}>
                 {busy ? <Loader2 className="animate-spin" /> : <Plug />}
                 {t('action.connect')}
               </Button>

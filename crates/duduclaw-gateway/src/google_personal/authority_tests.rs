@@ -64,6 +64,7 @@ fn fixture() -> (tempfile::TempDir, Arc<UserDb>, String) {
         connected_at: chrono::Utc::now().to_rfc3339(),
         last_refresh_at: None,
         oauth_client_id: "unit-client".into(),
+        google_data_consent: Some(crate::google_data_consent::Evidence::issue(&user.id).unwrap()),
     };
     let epoch = vault::begin_connection(home.path(), &user.id).unwrap();
     let key = crate::google_identity::protection_gate(home.path()).unwrap();
@@ -117,6 +118,59 @@ fn selection_uses_actual_tool_and_rejects_unknown_owner_only_and_consent_aba() {
         assert_eq!(refused.code, "requester_refused");
         assert!(!refused.fallback_eligible);
     }
+}
+
+#[test]
+fn legacy_personal_token_and_clear_metadata_consent_tamper_cannot_be_selected() {
+    let (home, db, user) = fixture();
+    let current = vault::disconnect(home.path(), &user).unwrap().unwrap();
+    let mut legacy = current.metadata;
+    legacy.credential_id = uuid::Uuid::new_v4().to_string();
+    legacy.google_data_consent = None;
+    let key = crate::google_identity::protection_gate(home.path()).unwrap();
+    let epoch = vault::begin_connection(home.path(), &user).unwrap();
+    vault::connect(
+        home.path(),
+        &key,
+        legacy,
+        &Secret {
+            access_token: "legacy-access-never-output".into(),
+            refresh_token: Some("legacy-refresh-never-output".into()),
+            expires_at: Some(4_000_000_000),
+        },
+        epoch,
+    )
+    .unwrap();
+
+    let people = UserDbPeople(db.clone());
+    let who = RequesterIdentity::Unknown;
+    assert_eq!(
+        PersonalSelection::capture(home.path(), "bot", &who, &people, "gmail_read")
+            .unwrap_err()
+            .code,
+        "needs_reconnect"
+    );
+
+    // Clear metadata is not authority. Adding current-looking consent without
+    // resealing the binding must still fail before a bearer is returned.
+    let path = vault::path(home.path());
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    raw["records"][0]["google_data_consent"] =
+        serde_json::to_value(crate::google_data_consent::Evidence::issue(&user).unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    let selected =
+        PersonalSelection::capture(home.path(), "bot", &who, &people, "gmail_read").unwrap();
+    assert!(
+        selected
+            .validate(home.path(), "bot", &who, &people, "gmail_read")
+            .is_ok()
+    );
+    let tampered = vault::get(home.path(), &user).unwrap().unwrap();
+    assert!(vault::unseal(&key, &tampered).is_err());
+
+    // Cleanup remains possible even though normal selection is fenced.
+    assert!(vault::disconnect(home.path(), &user).unwrap().is_some());
 }
 
 #[test]

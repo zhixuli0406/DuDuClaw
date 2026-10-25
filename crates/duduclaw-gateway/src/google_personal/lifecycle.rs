@@ -128,10 +128,11 @@ pub async fn safe_revoke_with_lease(
     if has_home_oauth {
         // Read the home OAuth account itself, not a configured service-account
         // subject which has a different grant. A failed refresh/probe is closed.
-        let Some(token) = crate::mcp_oauth::get_token(home, "google") else {
+        let Ok(access_token) = crate::mcp_oauth::home_access_token_for_personal_revoke(home, lease)
+        else {
             return revoke_result(home, account, "home_account_unknown", false);
         };
-        let Ok(home_account) = oauth::userinfo(&token.access_token).await else {
+        let Ok(home_account) = oauth::userinfo(&access_token).await else {
             return revoke_result(home, account, "home_account_unknown", false);
         };
         if home_account.sub == account.google_sub

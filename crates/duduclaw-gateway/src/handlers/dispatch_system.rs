@@ -54,6 +54,9 @@ impl MethodHandler {
             }
             "finetune.datasets.build" => {
                 require_admin!();
+                if let Err(e) = crate::finetune::require_generalized_training_lineage() {
+                    return finetune_error_frame(&e);
+                }
                 let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
                 let format = params.get("format").and_then(|v| v.as_str()).unwrap_or("sharegpt");
                 let prefs = params
@@ -83,6 +86,9 @@ impl MethodHandler {
             // must acknowledge that explicitly. Absent field = refusal.
             "finetune.datasets.export" => {
                 require_admin!();
+                if let Err(e) = crate::finetune::require_generalized_training_lineage() {
+                    return finetune_error_frame(&e);
+                }
                 let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
                 let ack = params
                     .get("acknowledged_data_leaves_device")
@@ -98,6 +104,9 @@ impl MethodHandler {
             }
             "finetune.jobs.create" => {
                 require_admin!();
+                if let Err(e) = crate::finetune::require_generalized_training_lineage() {
+                    return finetune_error_frame(&e);
+                }
                 let ack = params
                     .get("acknowledged_data_leaves_device")
                     .and_then(|v| v.as_bool())

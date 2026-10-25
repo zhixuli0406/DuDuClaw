@@ -4,6 +4,7 @@ import { Link, useSearchParams } from 'react-router';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { toast } from '@/lib/toast';
 import { Button, Card, CardContent, CardHeader, CardTitle, ErrorState, Input, Skeleton } from '@/components/mds';
+import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
 
 export function MyConnectionsPage() {
   const intl = useIntl();
@@ -18,6 +19,7 @@ export function MyConnectionsPage() {
   const [url,setUrl] = useState('');
   const [confirmed,setConfirmed] = useState<Record<string,boolean>>({});
   const [disconnectConfirmed,setDisconnectConfirmed] = useState(false);
+  const [googleDataConfirmed,setGoogleDataConfirmed] = useState(false);
   const [disconnectNote,setDisconnectNote] = useState('');
   const load = useCallback(async () => {
     try { setStatus(await api.personalGoogle.status()); setError(null); } catch(e) { setError(e); }
@@ -40,7 +42,7 @@ export function MyConnectionsPage() {
     const popup = window.open('about:blank','_blank');
     if (popup) popup.opener = null;
     setBusy(true);
-    try { const started = await api.personalGoogle.start(); setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); if (popup) popup.location.replace(started.authorization_url); else window.location.assign(started.authorization_url); }
+    try { const started = await api.personalGoogle.start(googleDataConfirmed); setGoogleDataConfirmed(false); setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); if (popup) popup.location.replace(started.authorization_url); else window.location.assign(started.authorization_url); }
     catch(e) { popup?.close(); toast.error(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   };
@@ -59,7 +61,8 @@ export function MyConnectionsPage() {
       {!status.integration_enabled && <p className="text-sm text-warning">{t('myConnections.integrationOff')}</p>}
       {status.requires_login && <p className="text-sm text-warning">{t('myConnections.loginAgain')}</p>}
       <p className="text-xs text-muted-foreground">{t('myConnections.testing')}</p>
-      <Button disabled={busy||!status.client_configured||status.requires_login} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>
+      <GoogleDataDisclosure confirmed={googleDataConfirmed} onConfirmedChange={setGoogleDataConfirmed}/>
+      <Button disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>
       {redirectUri&&<div className="space-y-2"><label htmlFor="google-registered-return">{t('myConnections.registeredReturn')}</label><Input id="google-registered-return" readOnly value={redirectUri}/><Button variant="outline" onClick={()=>void navigator.clipboard.writeText(redirectUri).catch(e=>toast.error(e instanceof Error?e.message:String(e)))}>{t('myConnections.copyReturn')}</Button></div>}
       {disconnectNote&&<p className="text-sm text-warning">{disconnectNote}</p>}
       {status.connection && <div className="space-y-2"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={disconnectConfirmed} onChange={e=>setDisconnectConfirmed(e.target.checked)}/>{t('myConnections.disconnectConfirm')}</label><Button variant="outline" disabled={busy||!disconnectConfirmed} onClick={()=>void run(async()=>{const result=await api.personalGoogle.disconnect();setDisconnectNote(result.provider_note??'');})}>{t('myConnections.disconnect')}</Button></div>}

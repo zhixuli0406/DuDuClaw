@@ -16,6 +16,16 @@ fn refused(frame: WsFrame) {
         "expected refusal: {frame:?}"
     );
 }
+fn error_text(frame: &WsFrame) -> String {
+    match frame {
+        WsFrame::Response {
+            ok: false,
+            error: Some(error),
+            ..
+        } => error.to_string(),
+        other => panic!("expected error response: {other:?}"),
+    }
+}
 async fn rpc(h: &MethodHandler, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
     Box::pin(h.handle(method, params, ctx)).await
 }
@@ -219,30 +229,53 @@ async fn assert_primary_owner_rejects_actor_change_after_browser_reset(change: &
     let f = PrimaryProfileFixture::new().await;
     // Keep another administrator so revoking this actor cannot be refused by
     // a last-administrator invariant.
-    f.db.create_user("backup@test.invalid", "Backup", "isolated-fixture-password", UserRole::Admin).unwrap();
+    f.db.create_user(
+        "backup@test.invalid",
+        "Backup",
+        "isolated-fixture-password",
+        UserRole::Admin,
+    )
+    .unwrap();
     drop(f.saved_profile());
     let reached = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let request = super::super::google_personal_rpc::PRIMARY_OWNER_AFTER_BROWSER_RESET.scope(
-        (reached.clone(), release.clone()), f.select(&f.bob)
-    );
+    let request = super::super::google_personal_rpc::PRIMARY_OWNER_AFTER_BROWSER_RESET
+        .scope((reached.clone(), release.clone()), f.select(&f.bob));
     tokio::pin!(request);
     tokio::select! {
         _ = reached.notified() => {},
         response = &mut request => panic!("request finished before controlled reset boundary: {response:?}"),
         _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => panic!("reset boundary was not reached"),
     }
-    assert!(crate::computer_profiles::state(&f.home, "bot").unwrap().is_none());
+    assert!(
+        crate::computer_profiles::state(&f.home, "bot")
+            .unwrap()
+            .is_none()
+    );
     match change {
-        "demoted" => f.db.apply_user_update(&f.admin, &duduclaw_auth::UserUpdate {
-            role: Some(UserRole::Employee), ..Default::default()
-        }).unwrap(),
-        "suspended" => f.db.set_user_status(&f.admin, duduclaw_auth::UserStatus::Suspended).unwrap(),
+        "demoted" => {
+            f.db.apply_user_update(
+                &f.admin,
+                &duduclaw_auth::UserUpdate {
+                    role: Some(UserRole::Employee),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        }
+        "suspended" => {
+            f.db.set_user_status(&f.admin, duduclaw_auth::UserStatus::Suspended)
+                .unwrap()
+        }
         "password_reset" => {
             // A host-owned account reset can set this flag while the RPC is
             // suspended. Use the real SQLite row rather than a stale ctx.
             let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
-            conn.execute("UPDATE users SET must_change_password = 1 WHERE id = ?1", [&f.admin]).unwrap();
+            conn.execute(
+                "UPDATE users SET must_change_password = 1 WHERE id = ?1",
+                [&f.admin],
+            )
+            .unwrap();
         }
         _ => panic!("unknown actor change"),
     }
@@ -331,7 +364,18 @@ async fn personal_rpc_self_consent_owner_change_and_legacy_session_are_enforced(
     );
     assert_eq!(db.google_consent(&alice.id, "bot").unwrap(), Some(true));
     assert_eq!(db.google_consent(&bob.id, "bot").unwrap(), None);
-    refused(rpc(&h,"me.google.connect_start",json!({"redirect_origin":"http://127.0.0.1:18789","session_ref":uuid::Uuid::new_v4(),"jti":uuid::Uuid::new_v4(),"user_id":bob.id}),&alice_ctx).await);
+    let missing_disclosure = rpc(
+        &h,
+        "me.google.connect_start",
+        json!({"redirect_origin":"http://127.0.0.1:18789"}),
+        &alice_ctx,
+    )
+    .await;
+    assert!(
+        error_text(&missing_disclosure).contains("Google 資料"),
+        "{missing_disclosure:?}"
+    );
+    refused(rpc(&h,"me.google.connect_start",json!({"redirect_origin":"http://127.0.0.1:18789","acknowledge_google_data":true,"session_ref":uuid::Uuid::new_v4(),"jti":uuid::Uuid::new_v4(),"user_id":bob.id}),&alice_ctx).await);
     refused(rpc(&h,"agents.google_identity_set",json!({"agent_id":"bot","identity":format!("user:{}",bob.id),"confirm_shared_access":true}),&alice_ctx).await);
     refused(
         rpc(
@@ -384,17 +428,16 @@ fn personal_rpc_family_is_enterprise_only_including_future_members() {
     ));
 }
 
-
 #[cfg(unix)]
 #[tokio::test]
-async fn primary_owner_browser_overlapping_resets_cannot_restore_a_profile_created_before_aba_writes() {
+async fn primary_owner_browser_overlapping_resets_cannot_restore_a_profile_created_before_aba_writes()
+ {
     let f = PrimaryProfileFixture::new().await;
     drop(f.saved_profile());
     let reached_b = Arc::new(tokio::sync::Notify::new());
     let release_b = Arc::new(tokio::sync::Notify::new());
-    let change_b = super::super::google_personal_rpc::PRIMARY_OWNER_AFTER_BROWSER_RESET.scope(
-        (reached_b.clone(), release_b.clone()), f.select(&f.bob)
-    );
+    let change_b = super::super::google_personal_rpc::PRIMARY_OWNER_AFTER_BROWSER_RESET
+        .scope((reached_b.clone(), release_b.clone()), f.select(&f.bob));
     tokio::pin!(change_b);
     tokio::select! {
         _ = reached_b.notified() => {},
@@ -403,9 +446,8 @@ async fn primary_owner_browser_overlapping_resets_cannot_restore_a_profile_creat
     }
     let reached_a = Arc::new(tokio::sync::Notify::new());
     let release_a = Arc::new(tokio::sync::Notify::new());
-    let change_a = super::super::google_personal_rpc::PRIMARY_OWNER_AFTER_BROWSER_RESET.scope(
-        (reached_a.clone(), release_a.clone()), f.select(&f.alice)
-    );
+    let change_a = super::super::google_personal_rpc::PRIMARY_OWNER_AFTER_BROWSER_RESET
+        .scope((reached_a.clone(), release_a.clone()), f.select(&f.alice));
     tokio::pin!(change_a);
     tokio::select! {
         _ = reached_a.notified() => {},
@@ -423,13 +465,22 @@ async fn primary_owner_browser_overlapping_resets_cannot_restore_a_profile_creat
     release_a.notify_one();
     payload(change_a.await);
     assert_eq!(f.db.google_owner("bot").unwrap().id, f.alice);
-    assert_eq!(serde_json::to_value(f.db.get_agent_users("bot").unwrap()).unwrap(), serde_json::to_value(old_rows).unwrap(), "the old final-state binding fingerprint is identical");
+    assert_eq!(
+        serde_json::to_value(f.db.get_agent_users("bot").unwrap()).unwrap(),
+        serde_json::to_value(old_rows).unwrap(),
+        "the old final-state binding fingerprint is identical"
+    );
     let (archive, reason) = profile.restore().unwrap();
-    assert!(archive.is_none(), "overlapping A→B→A restored the synthetic previous login");
+    assert!(
+        archive.is_none(),
+        "overlapping A→B→A restored the synthetic previous login"
+    );
     assert_eq!(reason, "reset_owner_changed");
-    assert_eq!(f.db.google_primary_owner_generation("bot").unwrap(), before + 2);
+    assert_eq!(
+        f.db.google_primary_owner_generation("bot").unwrap(),
+        before + 2
+    );
 }
-
 
 #[tokio::test]
 async fn owner_disable_and_reenable_preserves_requester_boundary_through_identity_rpc() {
@@ -438,44 +489,106 @@ async fn owner_disable_and_reenable_preserves_requester_boundary_through_identit
         let admin = f.db.live_user_context(&f.admin).unwrap().unwrap();
         let owner = f.db.live_user_context(&f.alice).unwrap().unwrap();
         assert!(!owner.is_admin());
-        assert_eq!(f.db.check_agent_access(&f.alice, "bot").unwrap(), Some(AccessLevel::Owner));
-        let identity = if follow_owner { "owner".to_owned() } else { format!("user:{}", f.alice) };
+        assert_eq!(
+            f.db.check_agent_access(&f.alice, "bot").unwrap(),
+            Some(AccessLevel::Owner)
+        );
+        let identity = if follow_owner {
+            "owner".to_owned()
+        } else {
+            format!("user:{}", f.alice)
+        };
         let path = f.home.join("agents/bot/agent.toml");
-        let seeded = payload(rpc(&f.handler, "agents.google_identity_set", json!({
-            "agent_id":"bot", "identity":identity, "requesters":"owner_only"
-        }), &admin).await);
+        let seeded = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_set",
+                json!({
+                    "agent_id":"bot", "identity":identity, "requesters":"owner_only"
+                }),
+                &admin,
+            )
+            .await,
+        );
         assert_eq!(seeded["requesters"], "owner_only");
 
         // Disabling needs no sharing confirmation and retains the dormant policy.
-        let disabled = payload(rpc(&f.handler, "agents.google_identity_set", json!({
-            "agent_id":"bot", "identity":"none"
-        }), &owner).await);
-        assert_eq!(disabled["requesters"], "owner_only", "follow_owner={follow_owner}");
+        let disabled = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_set",
+                json!({
+                    "agent_id":"bot", "identity":"none"
+                }),
+                &owner,
+            )
+            .await,
+        );
+        assert_eq!(
+            disabled["requesters"], "owner_only",
+            "follow_owner={follow_owner}"
+        );
         let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(table["google"]["identity"].as_str(), Some("none"));
         assert_eq!(table["google"]["requesters"].as_str(), Some("owner_only"));
         assert!(table["google"].get("fallback").is_none());
-        let readback = payload(rpc(&f.handler, "agents.google_identity_get", json!({"agent_id":"bot"}), &owner).await);
+        let readback = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_get",
+                json!({"agent_id":"bot"}),
+                &owner,
+            )
+            .await,
+        );
         assert_eq!(readback["requesters"], "owner_only");
 
         // Preserving serialization alone must not permit an explicit widening.
         for requesters in ["bound_people", "anyone"] {
             let before = std::fs::read(&path).unwrap();
-            refused(rpc(&f.handler, "agents.google_identity_set", json!({
-                "agent_id":"bot", "identity":"none", "requesters":requesters,
-                "confirm_anyone":true, "confirm_shared_access":true
-            }), &owner).await);
-            assert_eq!(std::fs::read(&path).unwrap(), before, "follow_owner={follow_owner}, requesters={requesters}");
+            refused(
+                rpc(
+                    &f.handler,
+                    "agents.google_identity_set",
+                    json!({
+                        "agent_id":"bot", "identity":"none", "requesters":requesters,
+                        "confirm_anyone":true, "confirm_shared_access":true
+                    }),
+                    &owner,
+                )
+                .await,
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "follow_owner={follow_owner}, requesters={requesters}"
+            );
         }
 
-        let enabled = payload(rpc(&f.handler, "agents.google_identity_set", json!({
-            "agent_id":"bot", "identity":identity, "confirm_shared_access":true
-        }), &owner).await);
+        let enabled = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_set",
+                json!({
+                    "agent_id":"bot", "identity":identity, "confirm_shared_access":true
+                }),
+                &owner,
+            )
+            .await,
+        );
         assert_eq!(enabled["requesters"], "owner_only");
         assert_eq!(enabled["identity"].as_str(), Some(identity.as_str()));
         let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(table["google"]["requesters"].as_str(), Some("owner_only"));
-        let readback = payload(rpc(&f.handler, "agents.google_identity_get", json!({"agent_id":"bot"}), &owner).await);
+        let readback = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_get",
+                json!({"agent_id":"bot"}),
+                &owner,
+            )
+            .await,
+        );
         assert_eq!(readback["requesters"], "owner_only");
         assert_eq!(f.db.google_consent(&f.alice, "bot").unwrap(), Some(true));
         let before = std::fs::read(&path).unwrap();
@@ -493,12 +606,27 @@ async fn generic_agent_update_keeps_google_narrowing_before_owner_reenable() {
         let admin = f.db.live_user_context(&f.admin).unwrap().unwrap();
         let owner = f.db.live_user_context(&f.alice).unwrap().unwrap();
         assert!(!owner.is_admin());
-        assert_eq!(f.db.check_agent_access(&f.alice, "bot").unwrap(), Some(AccessLevel::Owner));
-        let identity = if follow_owner { "owner".to_owned() } else { format!("user:{}", f.alice) };
+        assert_eq!(
+            f.db.check_agent_access(&f.alice, "bot").unwrap(),
+            Some(AccessLevel::Owner)
+        );
+        let identity = if follow_owner {
+            "owner".to_owned()
+        } else {
+            format!("user:{}", f.alice)
+        };
         let path = f.home.join("agents/bot/agent.toml");
-        payload(rpc(&f.handler, "agents.google_identity_set", json!({
-            "agent_id":"bot", "identity":identity, "requesters":"owner_only"
-        }), &admin).await);
+        payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_set",
+                json!({
+                    "agent_id":"bot", "identity":identity, "requesters":"owner_only"
+                }),
+                &admin,
+            )
+            .await,
+        );
 
         payload(rpc(&f.handler, "agents.update", json!({
             "agent_id":"bot", "advanced_kv":[{"section":"google", "key":"identity", "type":"string", "value":"none"}]
@@ -506,14 +634,26 @@ async fn generic_agent_update_keeps_google_narrowing_before_owner_reenable() {
         let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(table["google"]["identity"].as_str(), Some("none"));
         assert_eq!(table["google"]["requesters"].as_str(), Some("owner_only"));
-        let readback = payload(rpc(&f.handler, "agents.google_identity_get", json!({"agent_id":"bot"}), &owner).await);
+        let readback = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_get",
+                json!({"agent_id":"bot"}),
+                &owner,
+            )
+            .await,
+        );
         assert_eq!(readback["requesters"], "owner_only");
         for requesters in ["bound_people", "anyone"] {
             let before = std::fs::read(&path).unwrap();
             refused(rpc(&f.handler, "agents.update", json!({
                 "agent_id":"bot", "advanced_kv":[{"section":"google", "key":"requesters", "type":"string", "value":requesters}]
             }), &owner).await);
-            assert_eq!(std::fs::read(&path).unwrap(), before, "follow_owner={follow_owner}, requesters={requesters}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "follow_owner={follow_owner}, requesters={requesters}"
+            );
         }
         // The generic update remains unable to select a different person's account.
         let before = std::fs::read(&path).unwrap();
@@ -522,14 +662,30 @@ async fn generic_agent_update_keeps_google_narrowing_before_owner_reenable() {
         }), &owner).await);
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        let enabled = payload(rpc(&f.handler, "agents.google_identity_set", json!({
-            "agent_id":"bot", "identity":identity, "confirm_shared_access":true
-        }), &owner).await);
+        let enabled = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_set",
+                json!({
+                    "agent_id":"bot", "identity":identity, "confirm_shared_access":true
+                }),
+                &owner,
+            )
+            .await,
+        );
         assert_eq!(enabled["requesters"], "owner_only");
         assert_eq!(enabled["identity"].as_str(), Some(identity.as_str()));
         let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(table["google"]["requesters"].as_str(), Some("owner_only"));
-        let readback = payload(rpc(&f.handler, "agents.google_identity_get", json!({"agent_id":"bot"}), &owner).await);
+        let readback = payload(
+            rpc(
+                &f.handler,
+                "agents.google_identity_get",
+                json!({"agent_id":"bot"}),
+                &owner,
+            )
+            .await,
+        );
         assert_eq!(readback["requesters"], "owner_only");
     }
 }

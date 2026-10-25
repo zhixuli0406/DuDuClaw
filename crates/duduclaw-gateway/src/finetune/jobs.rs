@@ -1355,7 +1355,12 @@ pub fn list(home: &Path) -> Result<Vec<JobRecord>> {
 /// Order matters: the privacy gate runs before validation and before any
 /// network call, so an un-acknowledged remote job never so much as opens a
 /// socket.
-pub async fn create(home: &Path, mut cfg: JobConfig, acknowledged: bool) -> Result<JobRecord> {
+pub async fn create(home: &Path, cfg: JobConfig, acknowledged: bool) -> Result<JobRecord> {
+    super::require_generalized_training_lineage()?;
+    create_inner(home, cfg, acknowledged).await
+}
+
+async fn create_inner(home: &Path, mut cfg: JobConfig, acknowledged: bool) -> Result<JobRecord> {
     let backend = backend_for(&cfg.backend)?;
     if backend.is_remote() {
         require_data_leaves_device_ack(acknowledged, &format!("送到「{}」訓練", cfg.backend))?;
@@ -1809,7 +1814,7 @@ mod tests {
         let meta = dataset::create(home.path(), "測試資料集", "sharegpt").unwrap();
         // Build against empty stores, then drop two real rows in so the dry
         // run has something to count.
-        dataset::build(
+        dataset::build_inner(
             home.path(),
             &meta.id,
             dataset::DatasetSources::default(),
@@ -1841,10 +1846,26 @@ mod tests {
             key_path: "/nonexistent/key".into(),
             ..remote()
         });
-        let err = create(home.path(), c, false).await.unwrap_err();
+        let err = create_inner(home.path(), c, false).await.unwrap_err();
         assert_eq!(err.code(), "data_leaves_device_not_acknowledged");
         // Nothing was written.
         assert!(list(home.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_create_fails_before_storage_or_backend_without_lineage() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = cfg("remote_gpu_ssh", TrainMethod::Sft);
+        config.id = String::new();
+        config.dataset_id = "missing".into();
+        config.remote = Some(RemoteGpuConfig {
+            host: "gpu.invalid".into(),
+            key_path: "/nonexistent/key".into(),
+            ..remote()
+        });
+        let error = create(home.path(), config, true).await.unwrap_err();
+        assert_eq!(error.code(), "google_workspace_lineage_unavailable");
+        assert!(!jobs_root(home.path()).exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1857,7 +1878,7 @@ mod tests {
             model: "m".into(),
             suffix: None,
         });
-        let err = create(home.path(), c, false).await.unwrap_err();
+        let err = create_inner(home.path(), c, false).await.unwrap_err();
         assert_eq!(err.code(), "data_leaves_device_not_acknowledged");
     }
 
@@ -1868,7 +1889,7 @@ mod tests {
         c.id = String::new();
         c.dataset_id = ds;
         c.remote = Some(remote());
-        let rec = create(home.path(), c, false).await.unwrap();
+        let rec = create_inner(home.path(), c, false).await.unwrap();
 
         assert_eq!(rec.state, "planned");
         assert!(rec.detail.as_deref().unwrap().contains("沒有進行訓練"));
@@ -1903,7 +1924,7 @@ mod tests {
         c.id = String::new();
         c.dataset_id = ds.clone();
         // The seeded dataset has an empty preference.jsonl.
-        let rec = create(home.path(), c, false).await.unwrap();
+        let rec = create_inner(home.path(), c, false).await.unwrap();
         assert_eq!(rec.state, "planned");
         assert!(rec.detail.as_deref().unwrap().contains("沒有任何資料列"));
     }
@@ -1914,7 +1935,10 @@ mod tests {
         let mut bad = cfg("magic_cloud", TrainMethod::Sft);
         bad.dataset_id = ds.clone();
         assert_eq!(
-            create(home.path(), bad, true).await.unwrap_err().code(),
+            create_inner(home.path(), bad, true)
+                .await
+                .unwrap_err()
+                .code(),
             "bad_request"
         );
 
@@ -1922,7 +1946,10 @@ mod tests {
         missing.id = String::new();
         missing.dataset_id = "ds-does-not-exist".into();
         assert_eq!(
-            create(home.path(), missing, true).await.unwrap_err().code(),
+            create_inner(home.path(), missing, true)
+                .await
+                .unwrap_err()
+                .code(),
             "not_found"
         );
     }

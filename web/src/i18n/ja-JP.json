@@ -1,4 +1,10 @@
 {
+  "googleDataDisclosure.title": "Google に接続する前に確認してください",
+  "googleDataDisclosure.access": "DuDuClaw は、許可された Google データ（Gmail、カレンダー、ドライブ、ドキュメント、スプレッドシート、スライド、フォーム、Tasks、アカウントのメールアドレス）を、依頼された Google 機能の提供に使用します。",
+  "googleDataDisclosure.storage": "認証情報はローカルで暗号化され、Google にだけ送信されます。タスクデータは設定済みの AI プロバイダーに送信されることがあり、Google データはローカルの会話履歴、メモリ、ナレッジ、タスク、ツール／ランタイム記録、バックアップに保存されることがあります。切断しても削除されるのは認証情報だけで、既存のコンテンツは削除されません。",
+  "googleDataDisclosure.training": "DuDuClaw は Google データをモデルの学習に使用しません。設定済みの AI プロバイダーも、Google データを汎用 AI／ML モデルの学習または改善に使用してはなりません。DuDuClaw はプロバイダーの規約や設定を自動確認できないため、管理者が要件への適合を確認するまで接続しないでください。",
+  "googleDataDisclosure.privacy": "DuDuClaw のプライバシーポリシーを読む",
+  "googleDataDisclosure.confirm": "Google データがどのようにアクセス、使用、共有、保存、削除されるかを理解しました。",
   "myConnections.registeredReturn": "Google に登録する戻り先 URL 全体",
   "myConnections.copyReturn": "戻り先 URL をコピー",
   "myConnections.service.gmail": "Gmail",

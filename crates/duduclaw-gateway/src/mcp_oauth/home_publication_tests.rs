@@ -214,15 +214,19 @@ fn legacy_google_is_hidden_but_non_google_read_survives_gate_and_all_shared_writ
 #[test]
 fn exact_nonconnect_recovery_only_syncs_same_target_and_never_replays_a_mutation() {
     let d = fixture();
+    make_legacy_google(d.path());
     let fault = FaultGuard::at(d.path(), Fault::DataDirSync);
-    assert!(home_source::prepare_home_selection(d.path(), &["scope-a"]).is_err());
+    assert!(
+        run(d.path(), |g, s| publication_transaction(g, |r| r
+            .prepare(s)))
+        .is_err()
+    );
     drop(fault);
     let committed_bytes = bytes(d.path());
     let i = publication::inspect_publication(d.path()).unwrap();
     publication::stabilize_exact_publication(d.path(), &i).unwrap();
     assert_eq!(committed_bytes, bytes(d.path()));
-    let receipt = home_source::prepare_home_selection(d.path(), &["scope-a"]).unwrap();
-    home_source::validate_home_source(d.path(), &receipt).unwrap();
+    assert!(home_source::prepare_home_selection(d.path(), &["scope-a"]).is_err());
 }
 
 #[test]
@@ -235,7 +239,9 @@ fn final_ready_without_ticket_still_retains_connect_proof_and_refuses_generic_re
     .unwrap();
     let prepared = payload(&["scope-a"]);
     let finish = run(d.path(), |g, s| {
-        publication_transaction(g, |r| r.begin_claimed_finish(&claim, s, &prepared, None, NOW))
+        publication_transaction(g, |r| {
+            r.begin_claimed_finish(&claim, s, &prepared, None, NOW)
+        })
     })
     .unwrap();
     run(d.path(), |g, s| {
@@ -285,7 +291,9 @@ fn fresh_host_expiry_after_durable_ready_keeps_gate_and_requires_fresh_revoked_a
     })
     .unwrap();
     run(d.path(), |g, s| {
-        publication_transaction(g, |r| r.publish_claimed_payload(&finish, &claim, s, p, None, NOW))
+        publication_transaction(g, |r| {
+            r.publish_claimed_payload(&finish, &claim, s, p, None, NOW)
+        })
     })
     .unwrap();
     let before: Value = serde_json::from_slice(&bytes(d.path())).unwrap();
@@ -315,8 +323,13 @@ fn fresh_host_expiry_after_durable_ready_keeps_gate_and_requires_fresh_revoked_a
 #[test]
 fn recovery_mismatch_and_failed_abort_preserve_gate_and_never_restore_old_generation() {
     let d = fixture();
+    make_legacy_google(d.path());
     let f = FaultGuard::at(d.path(), Fault::DataDirSync);
-    assert!(home_source::prepare_home_selection(d.path(), &["scope-a"]).is_err());
+    assert!(
+        run(d.path(), |g, s| publication_transaction(g, |r| r
+            .prepare(s)))
+        .is_err()
+    );
     drop(f);
     let i = publication::inspect_publication(d.path()).unwrap();
     let mut changed: Value = serde_json::from_slice(&bytes(d.path())).unwrap();
@@ -362,8 +375,13 @@ fn gate_blocks_an_independent_reader_after_writer_closed_and_when_waiting_for_so
         return;
     }
     let d = fixture();
+    make_legacy_google(d.path());
     let f = FaultGuard::at(d.path(), Fault::DataDirSync);
-    assert!(home_source::prepare_home_selection(d.path(), &["scope-a"]).is_err());
+    assert!(
+        run(d.path(), |g, s| publication_transaction(g, |r| r
+            .prepare(s)))
+        .is_err()
+    );
     drop(f);
     let mut child = home_source::with_source_guard(d.path(), |_| {
         let mut child = spawn_reader(d.path(), false);
@@ -390,10 +408,12 @@ fn gate_blocks_an_independent_reader_after_writer_closed_and_when_waiting_for_so
 fn cleanup_unconfirmed_returns_no_receipt_but_absent_gate_exposes_only_confirmed_durable_data() {
     for fault in [Fault::GateUnlink, Fault::CleanupDirSync] {
         let d = fixture();
+        make_legacy_google(d.path());
         let probe = test_probe::Guard::install(d.path());
         let f = FaultGuard::at(d.path(), fault);
         assert!(matches!(
-            home_source::prepare_home_selection(d.path(), &["scope-a"]),
+            run(d.path(), |g, s| publication_transaction(g, |r| r
+                .prepare(s))),
             Err(Error::CommittedCleanupUnconfirmed)
         ));
         drop(f);
@@ -408,8 +428,7 @@ fn cleanup_unconfirmed_returns_no_receipt_but_absent_gate_exposes_only_confirmed
             let i = publication::inspect_publication(d.path()).unwrap();
             publication::stabilize_exact_publication(d.path(), &i).unwrap();
         }
-        let receipt = home_source::prepare_home_selection(d.path(), &["scope-a"]).unwrap();
-        home_source::validate_home_source(d.path(), &receipt).unwrap();
+        assert!(home_source::prepare_home_selection(d.path(), &["scope-a"]).is_err());
         assert_eq!(committed, bytes(d.path()));
         assert_eq!(probe.counts(), [0, 0]);
     }

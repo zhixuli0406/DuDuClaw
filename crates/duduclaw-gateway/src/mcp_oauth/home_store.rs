@@ -16,6 +16,7 @@ mod publication;
 #[path = "home_revoke_presence.rs"]
 mod revoke_presence;
 pub(super) use revoke_presence::read as read_revoke_presence;
+pub(super) use revoke_presence::read_access_token as read_revoke_access_token;
 #[path = "home_raw_array.rs"]
 pub(super) mod raw_array;
 #[cfg(test)]
@@ -132,6 +133,8 @@ pub(crate) struct Credential {
     pub(crate) credential_id: String,
     pub(crate) logical_epoch: u64,
     pub(crate) token_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) google_data_consent: Option<crate::google_data_consent::Evidence>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,6 +159,8 @@ struct TicketRecord {
     source_stamp: RawDigest,
     expires_at: u64,
     phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google_data_consent: Option<crate::google_data_consent::Evidence>,
 }
 impl TicketRecord {
     fn matches_source(&self, source: &SourceBinding) -> bool {
@@ -259,6 +264,7 @@ impl Control {
                 credential_id: id(),
                 logical_epoch: 1,
                 token_revision: 1,
+                google_data_consent: None,
             }),
             active_connect: None,
             pending_mutation: None,
@@ -268,10 +274,20 @@ impl Control {
         self.schema == 1
             && valid_id(&self.source_generation)
             && self.credential.as_ref().is_none_or(|c| {
-                valid_id(&c.credential_id) && c.logical_epoch > 0 && c.token_revision > 0
+                valid_id(&c.credential_id)
+                    && c.logical_epoch > 0
+                    && c.token_revision > 0
+                    && c.google_data_consent
+                        .as_ref()
+                        .is_none_or(crate::google_data_consent::Evidence::is_well_formed)
             })
             && self.active_connect.as_ref().is_none_or(|t| {
-                valid_id(&t.ticket_id) && t.generation == self.source_generation && t.expires_at > 0
+                valid_id(&t.ticket_id)
+                    && t.generation == self.source_generation
+                    && t.expires_at > 0
+                    && t.google_data_consent
+                        .as_ref()
+                        .is_none_or(crate::google_data_consent::Evidence::is_well_formed)
             })
             && self.pending_mutation.as_ref().is_none_or(|m| {
                 valid_id(&m.mutation_id)
@@ -506,6 +522,14 @@ impl Rows {
         source: &ObservedSource,
         now: u64,
     ) -> Result<()> {
+        let control = self.ready_control()?;
+        crate::google_data_consent::require_current(
+            control
+                .credential
+                .as_ref()
+                .and_then(|credential| credential.google_data_consent.as_ref()),
+        )
+        .map_err(|_| Error::NotReady)?;
         let raw = self
             .google()
             .filter(|r| r.get("access_token").is_some())
@@ -530,6 +554,7 @@ impl Rows {
     }
     /// Observed-client compatibility primitive. The desired-client lifecycle
     /// uses begin_connect_to with its held payload and exact target binding.
+    #[cfg(test)]
     pub(super) fn begin_connect(
         &mut self,
         source: &ObservedSource,
@@ -545,6 +570,8 @@ impl Rows {
             state_hash,
             expires_at,
             now,
+            crate::google_data_consent::Evidence::issue("test-admin")
+                .map_err(|_| Error::Invalid)?,
         )
     }
     /// Desired client is an H1-computed target binding, never a caller stamp.
@@ -558,7 +585,10 @@ impl Rows {
         state_hash: RawDigest,
         expires_at: u64,
         now: u64,
+        google_data_consent: crate::google_data_consent::Evidence,
     ) -> Result<Planned<StartConnect>> {
+        crate::google_data_consent::require_current(Some(&google_data_consent))
+            .map_err(|_| Error::Invalid)?;
         let before = self.google().cloned();
         if desired.home_stamp() != source.binding().home_stamp()
             || desired.source_stamp() != source.binding().source_stamp()
@@ -607,6 +637,7 @@ impl Rows {
             source_stamp: desired.source_stamp().clone(),
             expires_at,
             phase: Phase::Pending,
+            google_data_consent: Some(google_data_consent),
         };
         let result = StartConnect {
             generation: c.source_generation.clone(),
@@ -748,6 +779,12 @@ impl Rows {
     }
     fn oauth_identity(&self, source: &ObservedSource) -> Result<RefreshIdentity> {
         let c = self.ready_control()?;
+        crate::google_data_consent::require_current(
+            c.credential
+                .as_ref()
+                .and_then(|credential| credential.google_data_consent.as_ref()),
+        )
+        .map_err(|_| Error::NotReady)?;
         Ok(RefreshIdentity {
             credential: c.credential.ok_or(Error::Stale)?,
             generation: c.source_generation,
@@ -977,6 +1014,7 @@ impl Rows {
             credential_id: expected.credential_id.clone(),
             logical_epoch: expected.logical_epoch,
             token_revision: 1,
+            google_data_consent: claim.record.google_data_consent.clone(),
         });
         self.set_payload(&payload.0)?;
         self.put(&c)?;
@@ -1149,9 +1187,17 @@ fn google_public_visible(row: &Value) -> bool {
         return false;
     }
     match row.get("google_home") {
-        None => true,
-        Some(value) => serde_json::from_value::<Control>(value.clone())
-            .is_ok_and(|c| c.valid() && c.state == State::Ready && c.credential.is_some()),
+        None => false,
+        Some(value) => serde_json::from_value::<Control>(value.clone()).is_ok_and(|c| {
+            c.valid()
+                && c.state == State::Ready
+                && c.credential.as_ref().is_some_and(|credential| {
+                    crate::google_data_consent::require_current(
+                        credential.google_data_consent.as_ref(),
+                    )
+                    .is_ok()
+                })
+        }),
     }
 }
 struct PublicTokenRead {

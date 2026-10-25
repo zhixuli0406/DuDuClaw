@@ -2,6 +2,8 @@
 
 > Curate the data here, train it on a GPU elsewhere, bring the model back here. This machine never trains.
 
+> **Current safety restriction (v1.76):** DuDuClaw cannot yet prove that a selected conversation or task is free of Google Workspace data. Dataset build/export and new training jobs therefore fail closed before source data is read or sent. Import, list/preview, job status/cancel, and deletion remain available. This restriction will only be relaxed after source-level Google lineage is implemented and enforced.
+
 ---
 
 ## The claim we refuse to make

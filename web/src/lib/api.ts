@@ -7736,7 +7736,7 @@ export const api = {
   },
   personalGoogle: {
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
-    start: () => client.call('me.google.connect_start', { redirect_origin: window.location.origin }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    start: (acknowledgeGoogleData: boolean) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
     disconnect: () => client.call('me.google.disconnect', { confirm: true }) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
@@ -7756,11 +7756,12 @@ export const api = {
       }) as Promise<{ success: boolean }>,
     oauthProviders: () =>
       client.call('mcp.oauth.providers') as Promise<{ providers: McpOAuthProvider[] }>,
-    oauthStart: (providerId: string, clientId?: string, clientSecret?: string) =>
+    oauthStart: (providerId: string, clientId?: string, clientSecret?: string, acknowledgeGoogleData?: boolean) =>
       client.call('mcp.oauth.start', {
         provider_id: providerId,
         ...(clientId ? { client_id: clientId } : {}),
         ...(clientSecret ? { client_secret: clientSecret } : {}),
+        ...(acknowledgeGoogleData === undefined ? {} : { acknowledge_google_data: acknowledgeGoogleData }),
       }) as Promise<{ auth_url: string; state: string }>,
     oauthStatus: (providerId: string) =>
       client.call('mcp.oauth.status', { provider_id: providerId }) as Promise<{

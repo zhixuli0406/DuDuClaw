@@ -23,6 +23,7 @@ pub struct Pending {
     pub client_id: String,
     pub client_secret: String,
     pub epoch: u64,
+    pub google_data_consent: crate::google_data_consent::Evidence,
     pub created: Instant,
     pub code: Option<String>,
 }

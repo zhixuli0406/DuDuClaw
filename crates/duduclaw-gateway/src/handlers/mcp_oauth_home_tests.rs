@@ -24,15 +24,51 @@ fn fixture() -> tempfile::TempDir {
     d
 }
 #[tokio::test(flavor = "current_thread")]
+async fn google_oauth_start_requires_data_disclosure_acknowledgement() {
+    let d = fixture();
+    let h = MethodHandler::new(d.path().to_path_buf()).await;
+    assert!(refused(
+        h.handle_mcp_oauth_start(
+            json!({"provider_id":"google","client_id":"owned-client"}),
+            &UserContext::admin_fallback()
+        )
+        .await
+    ));
+    assert!(h.mcp_oauth_pending.read().await.is_empty());
+    assert!(!d.path().join(api::TOKEN_FILE).exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn renamed_google_provider_cannot_enter_generic_oauth_storage() {
+    let d = fixture();
+    let h = MethodHandler::new(d.path().to_path_buf()).await;
+    assert!(refused(
+        h.handle_mcp_oauth_start(
+            json!({
+                "provider_id":"renamed-google",
+                "client_id":"owned-client",
+                "auth_url":"https://accounts.google.com/o/oauth2/v2/auth",
+                "token_url":"https://oauth2.googleapis.com/token",
+                "scopes":["https://www.googleapis.com/auth/gmail.readonly"]
+            }),
+            &UserContext::admin_fallback()
+        )
+        .await
+    ));
+    assert!(h.mcp_oauth_pending.read().await.is_empty());
+    assert!(api::get_client_config(d.path(), "renamed-google").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn actual_handler_only_inserts_after_durable_ready_and_replaces_latest_google() {
     let d = fixture();
     let h = MethodHandler::new(d.path().to_path_buf()).await;
     let first = payload(
-        h.handle_mcp_oauth_start(json!({"provider_id":"google","client_id":"owned-client"}))
+        h.handle_mcp_oauth_start(json!({"provider_id":"google","client_id":"owned-client","acknowledge_google_data":true}), &UserContext::admin_fallback())
             .await,
     );
     let second = payload(
-        h.handle_mcp_oauth_start(json!({"provider_id":"google","client_id":"owned-client"}))
+        h.handle_mcp_oauth_start(json!({"provider_id":"google","client_id":"owned-client","acknowledge_google_data":true}), &UserContext::admin_fallback())
             .await,
     );
     assert_ne!(first["state"], second["state"]);
@@ -59,7 +95,7 @@ async fn actual_handler_start_durability_refusal_has_no_url_or_ram_pending() {
     let h = MethodHandler::new(d.path().to_path_buf()).await;
     let _fault = home_store::test_probe::fail_start_gate(d.path());
     assert!(refused(
-        h.handle_mcp_oauth_start(json!({"provider_id":"google","client_id":"owned-client"}))
+        h.handle_mcp_oauth_start(json!({"provider_id":"google","client_id":"owned-client","acknowledge_google_data":true}), &UserContext::admin_fallback())
             .await
     ));
     assert!(h.mcp_oauth_pending.read().await.is_empty());
@@ -71,7 +107,7 @@ async fn actual_google_pipeline_final_ram_wait_revalidates_same_ticket() {
     let map = tokio::sync::RwLock::new(std::collections::HashMap::new());
     let held = map.write().await;
     let params = json!({"client_id":"owned-client"});
-    let call = start_google_home_rpc(d.path(), &params, &map);
+    let call = start_google_home_rpc(d.path(), &params, "test-admin", &map);
     tokio::pin!(call);
     tokio::select! {_=&mut call=>panic!("unexpected completion while RAM lock held"),_=tokio::time::sleep(std::time::Duration::from_millis(30))=>{}}
     let mut client = api::get_client_config(d.path(), "google").unwrap();
@@ -93,20 +129,35 @@ async fn state_provider_error_missing_code_and_replay_consume_google_once() {
     ] {
         let d = fixture();
         let map = tokio::sync::RwLock::new(std::collections::HashMap::new());
-        let result = start_google_home_rpc(d.path(), &json!({"client_id":"owned-client"}), &map)
-            .await
-            .unwrap();
+        let result = start_google_home_rpc(
+            d.path(),
+            &json!({"client_id":"owned-client"}),
+            "test-admin",
+            &map,
+        )
+        .await
+        .unwrap();
         let state = result["state"].as_str().unwrap();
         assert!(
-            api::complete_callback_query(d.path(), &map, &format!("state={state}&{suffix}"))
-                .await
-                .is_err()
+            api::complete_callback_query(
+                d.path(),
+                &map,
+                &format!("state={state}&{suffix}"),
+                |_| true
+            )
+            .await
+            .is_err()
         );
         assert!(map.read().await.is_empty());
         assert!(
-            api::complete_callback_query(d.path(), &map, &format!("state={state}&code=owned-code"))
-                .await
-                .is_err()
+            api::complete_callback_query(
+                d.path(),
+                &map,
+                &format!("state={state}&code=owned-code"),
+                |_| true
+            )
+            .await
+            .is_err()
         );
     }
 }
@@ -138,6 +189,19 @@ async fn generic_google_exchange_refuses_before_any_provider_or_key() {
             .await
             .is_err()
     );
+    config.provider_id = "renamed-provider".into();
+    assert!(api::PendingOAuth::other(config.clone(), "owned-verifier".into()).is_err());
+    assert!(
+        api::exchange_and_store(d.path(), &config, "owned-code", "owned-verifier")
+            .await
+            .is_err()
+    );
+    assert!(
+        api::exchange_code(&config, "owned-code", "owned-verifier")
+            .await
+            .is_err()
+    );
+    assert!(api::refresh_token(&config, "owned-refresh").await.is_err());
     assert_eq!(wire.requests(), 0);
     assert!(!d.path().join(".keyfile").exists());
 }
@@ -146,9 +210,14 @@ async fn ordinary_github_callback_coexists_without_rotating_or_decrypting_google
     let d = fixture();
     std::fs::write(d.path().join(".keyfile"), [9u8; 32]).unwrap();
     let map = tokio::sync::RwLock::new(std::collections::HashMap::new());
-    start_google_home_rpc(d.path(), &json!({"client_id":"owned-client"}), &map)
-        .await
-        .unwrap();
+    start_google_home_rpc(
+        d.path(),
+        &json!({"client_id":"owned-client"}),
+        "test-admin",
+        &map,
+    )
+    .await
+    .unwrap();
     let before: Value =
         serde_json::from_slice(&std::fs::read(d.path().join(api::TOKEN_FILE)).unwrap()).unwrap();
     let probe = home_store::test_probe::Guard::install(d.path());
@@ -168,7 +237,8 @@ async fn ordinary_github_callback_coexists_without_rotating_or_decrypting_google
         api::complete_callback_query(
             d.path(),
             &map,
-            &format!("state={state}&code=owned-other-code")
+            &format!("state={state}&code=owned-other-code"),
+            |_| true,
         )
         .await
         .unwrap(),
@@ -186,9 +256,14 @@ async fn ordinary_github_callback_coexists_without_rotating_or_decrypting_google
 async fn actual_callback_query_scope_cannot_override_partial_token_response() {
     let d = fixture();
     let map = tokio::sync::RwLock::new(std::collections::HashMap::new());
-    let start = start_google_home_rpc(d.path(), &json!({"client_id":"owned-client"}), &map)
-        .await
-        .unwrap();
+    let start = start_google_home_rpc(
+        d.path(),
+        &json!({"client_id":"owned-client"}),
+        "test-admin",
+        &map,
+    )
+    .await
+    .unwrap();
     let wire = crate::google_identity::home_source::callback_testing::Wire::scenario(
         d.path(),
         "partial_scope",
@@ -199,7 +274,7 @@ async fn actual_callback_query_scope_cannot_override_partial_token_response() {
         .append_pair("scope", &crate::google_workspace::REQUIRED_SCOPES.join(" "))
         .finish();
     assert!(
-        api::complete_callback_query(d.path(), &map, &query)
+        api::complete_callback_query(d.path(), &map, &query, |_| true)
             .await
             .is_err()
     );
@@ -208,4 +283,27 @@ async fn actual_callback_query_scope_cannot_override_partial_token_response() {
     let rows: Value =
         serde_json::from_slice(&std::fs::read(d.path().join(api::TOKEN_FILE)).unwrap()).unwrap();
     assert!(rows[0].get("access_token").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn home_callback_rechecks_that_the_consent_actor_is_still_admin_before_provider_io() {
+    let d = fixture();
+    let map = tokio::sync::RwLock::new(std::collections::HashMap::new());
+    let start = start_google_home_rpc(
+        d.path(),
+        &json!({"client_id":"owned-client"}),
+        "admin-at-start",
+        &map,
+    )
+    .await
+    .unwrap();
+    let wire = crate::google_identity::home_source::callback_testing::Wire::json(d.path(), None);
+    let query = format!("state={}&code=owned-code", start["state"].as_str().unwrap());
+    assert!(
+        api::complete_callback_query(d.path(), &map, &query, |_| false)
+            .await
+            .is_err()
+    );
+    assert_eq!(wire.requests(), 0);
+    assert!(map.read().await.is_empty());
 }

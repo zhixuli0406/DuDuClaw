@@ -812,7 +812,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     })?);
     // Establish the non-retroactive window before any channel accepts turns.
     handler.resolve_edition_profile().await;
-    if let Err(e)=crate::team_oversight::observe_window(&home_dir,&user_db,"gateway_boot") {
+    if let Err(e) = crate::team_oversight::observe_window(&home_dir, &user_db, "gateway_boot") {
         // The observer persists reset-required (or retains a process latch
         // when the DB is unavailable). Only B5 stays fenced; ordinary
         // gateway operation must not depend on a new history audit writer.
@@ -2698,7 +2698,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             post(handle_causal_alias_revoke).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
-        .route(crate::google_personal::flow::CALLBACK_PATH, get(handle_personal_google_callback))
+        .route(
+            crate::google_personal::flow::CALLBACK_PATH,
+            get(handle_personal_google_callback),
+        )
         // Native remote MCP sign-in (remote_mcp). Unauthenticated by design
         // (a browser redirect from the authorization server); the single-use,
         // ten-minute `state` bound to the pending sign-in is the guard.
@@ -2813,7 +2816,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Separate MCP processes delegate human permission checks to this
     // host, using its verified license runtime and live opaque contexts.
     app = app.merge(crate::on_behalf_of::route::router(Arc::new(
-        crate::on_behalf_of::route::RouteState::new(home_dir.clone(), Some(_license_runtime.clone())),
+        crate::on_behalf_of::route::RouteState::new(
+            home_dir.clone(),
+            Some(_license_runtime.clone()),
+        ),
     )));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
@@ -3169,17 +3175,18 @@ async fn handle_login(
         .collect();
 
     // Issue tokens
-    let (access_token, refresh_token) = match state.jwt_config.issue_session_tokens(&user, &agent_access) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
-        }
-    };
+    let (access_token, refresh_token) =
+        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to issue access token: {e}");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "token generation failed"})),
+                )
+                    .into_response();
+            }
+        };
 
     // M2: clear the failed-attempt counter on success so legitimate users are
     // not penalised by earlier typos and an attacker cannot lock the account.
@@ -3324,17 +3331,18 @@ async fn handle_otp_verify(
         .map(|b| (b.agent_name.clone(), b.access_level))
         .collect();
 
-    let (access_token, refresh_token) = match state.jwt_config.issue_session_tokens(&user, &agent_access) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
-        }
-    };
+    let (access_token, refresh_token) =
+        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to issue access token: {e}");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "token generation failed"})),
+                )
+                    .into_response();
+            }
+        };
 
     let ip_str = ip.to_string();
     let _ = state
@@ -3670,7 +3678,11 @@ async fn handle_refresh(
         .map(|b| (b.agent_name.clone(), b.access_level))
         .collect();
 
-    let access_token = match state.jwt_config.issue_access_token_in_session(&user, &agent_access, claims.jti.as_deref()) {
+    let access_token = match state.jwt_config.issue_access_token_in_session(
+        &user,
+        &agent_access,
+        claims.jti.as_deref(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to issue access token: {e}");
@@ -4332,17 +4344,18 @@ async fn handle_local_session(
         .map(|b| (b.agent_name.clone(), b.access_level))
         .collect();
 
-    let (access_token, refresh_token) = match state.jwt_config.issue_session_tokens(&user, &agent_access) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("local session: failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
-        }
-    };
+    let (access_token, refresh_token) =
+        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("local session: failed to issue access token: {e}");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "token generation failed"})),
+                )
+                    .into_response();
+            }
+        };
 
     let _ = state.user_db.update_last_login(&user.id);
     // Attributed to the real user id — the reason plan A was chosen over
@@ -14292,7 +14305,12 @@ async fn handle_files_list(
     let files = crate::files_api::filter_files(files, &filter);
     let mut visible = Vec::new();
     for file in files {
-        if authorize_review_artifact(&state, &ctx, agent, &file.name).await.is_ok() { visible.push(file); }
+        if authorize_review_artifact(&state, &ctx, agent, &file.name)
+            .await
+            .is_ok()
+        {
+            visible.push(file);
+        }
     }
     Json(serde_json::json!({ "files": visible })).into_response()
 }
@@ -14369,7 +14387,9 @@ async fn handle_files_download(
         }
     };
 
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await { return resp; }
+    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
+        return resp;
+    }
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
     let ct = crate::files_api::content_type_for(&q.name);
@@ -14563,7 +14583,9 @@ async fn handle_files_preview(
         }
     }
 
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await { return resp; }
+    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
+        return resp;
+    }
     stream_preview_pdf(&cached, &format!("{stem}.pdf"), "application/pdf").await
 }
 
@@ -15705,8 +15727,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     Ok(ctx) => {
                                         // Session provenance comes only from this
                                         // verified JWT, never connect parameters.
-                                        dashboard_session = state.jwt_config.verify_access_token(jwt_str).ok()
-                                            .and_then(|claims| claims.jti.map(|jti| (claims.sub, jti)));
+                                        dashboard_session = state
+                                            .jwt_config
+                                            .verify_access_token(jwt_str)
+                                            .ok()
+                                            .and_then(|claims| {
+                                                claims.jti.map(|jti| (claims.sub, jti))
+                                            });
                                         // `must_change_password` is surfaced here so a
                                         // future frontend can route straight to a
                                         // change-password screen on the handshake
@@ -16395,28 +16422,57 @@ async fn handle_reliability_summary_http(
 /// GET /api/mcp/oauth/callback — fixed redacted result, including malformed,
 /// rejected and code-less replies. Identifiable state is consumed once by host.
 async fn handle_mcp_oauth_callback(
-    State(state):State<Arc<AppState>>,
-    axum::extract::RawQuery(query):axum::extract::RawQuery,
-)->axum::response::Response {
-    let result=crate::mcp_oauth::complete_callback_query(state.handler.home_dir(),state.handler.mcp_oauth_pending(),query.as_deref().unwrap_or("")).await;
-    if matches!(result.as_deref(),Ok("github")) {
+    State(state): State<Arc<AppState>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let user_db = Arc::clone(&state.user_db);
+    let result = crate::mcp_oauth::complete_callback_query(
+        state.handler.home_dir(),
+        state.handler.mcp_oauth_pending(),
+        query.as_deref().unwrap_or(""),
+        move |actor| {
+            user_db
+                .live_user_context(actor)
+                .is_ok_and(|ctx| ctx.is_some_and(|ctx| ctx.is_admin()))
+                || (actor == "system" && !has_users(&user_db))
+        },
+    )
+    .await;
+    if matches!(result.as_deref(), Ok("github")) {
         match crate::github_workspace::enable_integration(state.handler.home_dir()) {
-            Ok(true)=>info!("enabled [integrations] github in config.toml"),
-            Ok(false)=>{},Err(_)=>warn!("could not auto-enable github integration; enable it manually in config.toml"),
+            Ok(true) => info!("enabled [integrations] github in config.toml"),
+            Ok(false) => {}
+            Err(_) => {
+                warn!("could not auto-enable github integration; enable it manually in config.toml")
+            }
         }
     }
     // Google master enable already belongs to its same-ticket three-point
     // publication. A generic enable here would rotate/invalidate its source.
     mcp_oauth_callback_html(result.is_ok())
 }
-fn mcp_oauth_callback_html(success:bool)->axum::response::Response {
-    let body=if success{"<!doctype html><html><body><h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p></body></html>"}
-        else{"<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>"};
-    let mut response=axum::response::Html(body).into_response();
-    let headers=response.headers_mut();
-    headers.insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));
-    headers.insert(axum::http::HeaderName::from_static("referrer-policy"),axum::http::HeaderValue::from_static("no-referrer"));
-    headers.insert(axum::http::HeaderName::from_static("content-security-policy"),axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"));
+fn mcp_oauth_callback_html(success: bool) -> axum::response::Response {
+    let body = if success {
+        "<!doctype html><html><body><h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p></body></html>"
+    } else {
+        "<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>"
+    };
+    let mut response = axum::response::Html(body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
     response
 }
 
@@ -16425,14 +16481,21 @@ mod home_callback_response_tests {
     use super::*;
     #[tokio::test]
     async fn callback_html_is_fixed_redacted_and_has_no_store_or_referrer() {
-        for success in [false,true] {
-            let response=mcp_oauth_callback_html(success);
-            assert_eq!(response.headers()["cache-control"],"no-store");
-            assert_eq!(response.headers()["referrer-policy"],"no-referrer");
-            let body=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
-            let text=std::str::from_utf8(&body).unwrap();
-            assert!(!text.contains("error_description"));assert!(!text.contains("owned-code"));
-            assert!(text.contains(if success{"Authentication Successful"}else{"Authentication failed"}));
+        for success in [false, true] {
+            let response = mcp_oauth_callback_html(success);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(!text.contains("error_description"));
+            assert!(!text.contains("owned-code"));
+            assert!(text.contains(if success {
+                "Authentication Successful"
+            } else {
+                "Authentication failed"
+            }));
         }
     }
 }
@@ -16448,10 +16511,15 @@ async fn handle_personal_google_callback(
     personal_google_callback_response(state.handler.home_dir(), query.as_deref().unwrap_or(""))
 }
 
-fn personal_google_callback_response(home: &std::path::Path, query: &str) -> axum::response::Response {
-    let result = crate::google_personal::pending::callback_values(query)
-        .and_then(|(nonce, code)| crate::google_personal::pending::receive_code(home, &nonce, &code)
-            .map(|(origin, _)| (nonce, origin)));
+fn personal_google_callback_response(
+    home: &std::path::Path,
+    query: &str,
+) -> axum::response::Response {
+    let result =
+        crate::google_personal::pending::callback_values(query).and_then(|(nonce, code)| {
+            crate::google_personal::pending::receive_code(home, &nonce, &code)
+                .map(|(origin, _)| (nonce, origin))
+        });
     let mut response = match result {
         Ok((nonce, origin)) => {
             let target = format!("{origin}/me/connections?google_state={nonce}");
@@ -16462,9 +16530,20 @@ fn personal_google_callback_response(home: &std::path::Path, query: &str) -> axu
         )).into_response(),
     };
     let headers = response.headers_mut();
-    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
-    headers.insert(axum::http::HeaderName::from_static("referrer-policy"), axum::http::HeaderValue::from_static("no-referrer"));
-    headers.insert(axum::http::HeaderName::from_static("content-security-policy"), axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"));
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
     response
 }
 
@@ -16475,21 +16554,47 @@ mod personal_google_callback_tests {
     #[tokio::test]
     async fn callback_has_no_store_no_referrer_and_redirects_without_code() {
         let home = tempfile::tempdir().unwrap();
-        let nonce = crate::google_personal::pending::insert(crate::google_personal::pending::Pending {
-            home:home.path().into(),user_id:"alice".into(),session_ref:uuid::Uuid::new_v4().to_string(),
-            redirect_uri:"https://dashboard.example/api/me/google/callback".into(),dashboard_origin:"https://dashboard.example".into(),
-            paste:false,code_verifier:"VERIFIER_MUST_NOT_LEAK".into(),client_id:"fixture".into(),client_secret:"SECRET_MUST_NOT_LEAK".into(),
-            epoch:1,created:std::time::Instant::now(),code:None,
-        });
-        let response = personal_google_callback_response(home.path(), &format!("state={nonce}&code=CODE_MUST_NOT_LEAK"));
-        assert_eq!(response.status(),axum::http::StatusCode::SEE_OTHER);
-        assert_eq!(response.headers()[axum::http::header::LOCATION],format!("https://dashboard.example/me/connections?google_state={nonce}"));
-        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL],"no-store");
-        assert_eq!(response.headers()["referrer-policy"],"no-referrer");
-        let body=axum::body::to_bytes(response.into_body(),16*1024).await.unwrap();
+        let nonce =
+            crate::google_personal::pending::insert(crate::google_personal::pending::Pending {
+                home: home.path().into(),
+                user_id: "alice".into(),
+                session_ref: uuid::Uuid::new_v4().to_string(),
+                redirect_uri: "https://dashboard.example/api/me/google/callback".into(),
+                dashboard_origin: "https://dashboard.example".into(),
+                paste: false,
+                code_verifier: "VERIFIER_MUST_NOT_LEAK".into(),
+                client_id: "fixture".into(),
+                client_secret: "SECRET_MUST_NOT_LEAK".into(),
+                epoch: 1,
+                google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                created: std::time::Instant::now(),
+                code: None,
+            });
+        let response = personal_google_callback_response(
+            home.path(),
+            &format!("state={nonce}&code=CODE_MUST_NOT_LEAK"),
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            format!("https://dashboard.example/me/connections?google_state={nonce}")
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("MUST_NOT_LEAK"));
-        let error=personal_google_callback_response(home.path(),"state=unknown&error=%3Cscript%3Ealert(1)%3C/script%3E");
-        let body=axum::body::to_bytes(error.into_body(),16*1024).await.unwrap();
+        let error = personal_google_callback_response(
+            home.path(),
+            "state=unknown&error=%3Cscript%3Ealert(1)%3C/script%3E",
+        );
+        let body = axum::body::to_bytes(error.into_body(), 16 * 1024)
+            .await
+            .unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("<script>"));
     }
 }

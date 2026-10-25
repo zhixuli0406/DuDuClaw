@@ -25,7 +25,11 @@ pub async fn start(
     session: &str,
     origin: &str,
     allowed: &[String],
+    acknowledge_google_data: bool,
 ) -> Result<Value, String> {
+    if !acknowledge_google_data {
+        return Err("請先閱讀並確認 Google 資料的存取、分享、保存與刪除說明。".into());
+    }
     active_user(db, user)?;
     let _grant_lease = super::grants::acquire(home).await?;
     let _key = crate::google_identity::protection_gate_async(home)
@@ -48,6 +52,7 @@ pub async fn start(
     let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let epoch = vault::begin_connection(home, user)?;
+    let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
     pending::cancel_user(home, user);
     let state = pending::insert(pending::Pending {
         home: home.into(),
@@ -60,6 +65,7 @@ pub async fn start(
         client_id: client.client_id.clone(),
         client_secret: client.client_secret,
         epoch,
+        google_data_consent,
         created: Instant::now(),
         code: None,
     });
@@ -79,6 +85,7 @@ pub async fn finish(
 ) -> Result<Value, String> {
     active_user(db, user)?;
     let pending = pending::take(home, state, user, session)?;
+    crate::google_data_consent::require_current(Some(&pending.google_data_consent))?;
     let grant_lease = super::grants::acquire(home).await?;
     let tokens = oauth::exchange(
         &pending.client_id,
@@ -110,6 +117,7 @@ pub async fn finish(
         connected_at: chrono::Utc::now().to_rfc3339(),
         last_refresh_at: None,
         oauth_client_id: pending.client_id.clone(),
+        google_data_consent: Some(pending.google_data_consent.clone()),
     };
     if !access::domain_allowed(home, &metadata)? {
         // Apply the same shared-grant protection to a rejected connection.
@@ -137,9 +145,12 @@ pub async fn finish(
         return Err("管理員已變更允許的 Google 網域，請重新開始。".into());
     }
     vault::connect(home, &key, metadata.clone(), &tokens.secret, pending.epoch)?;
-    let detail =
-        json!({"google_email":metadata.account_email,"scope_count":metadata.granted_scopes.len()})
-            .to_string();
+    let detail = json!({
+        "google_email": metadata.account_email,
+        "scope_count": metadata.granted_scopes.len(),
+        "google_data_consent": metadata.google_data_consent,
+    })
+    .to_string();
     let _ = db.log_action(
         Some(user),
         "user.google_connect",

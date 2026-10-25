@@ -13,7 +13,7 @@ interface McpStore {
   addServer: (agentId: string, name: string, def: McpServerDef) => Promise<void>;
   removeServer: (agentId: string, name: string) => Promise<void>;
   fetchOAuthProviders: () => Promise<void>;
-  startOAuth: (providerId: string, clientId?: string, clientSecret?: string) => Promise<string>;
+  startOAuth: (providerId: string, clientId?: string, clientSecret?: string, acknowledgeGoogleData?: boolean) => Promise<string>;
   revokeOAuth: (providerId: string) => Promise<void>;
 }
 
@@ -67,14 +67,14 @@ export const useMcpStore = create<McpStore>((set, get) => ({
       set({ error: 'mcp.loadFailed' });
     }
   },
-  startOAuth: async (providerId, clientId?, clientSecret?) => {
+  startOAuth: async (providerId, clientId?, clientSecret?, acknowledgeGoogleData?) => {
     // Recorded before consent opens. `authenticated` is true for a stale but
     // refreshable token, so re-authorizing an already-connected provider would
     // otherwise report success on the first poll — off the old token that was
     // already on file. Success has to mean a token that actually moved.
     const baseline =
       get().oauthProviders.find((p) => p.provider_id === providerId)?.expires_at ?? null;
-    const result = await api.mcp.oauthStart(providerId, clientId, clientSecret);
+    const result = await api.mcp.oauthStart(providerId, clientId, clientSecret, acknowledgeGoogleData);
     const authUrl = result.auth_url;
 
     // Cancel any existing polling

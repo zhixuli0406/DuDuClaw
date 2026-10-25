@@ -62,6 +62,9 @@ impl Fixture {
             connected_at: chrono::Utc::now().to_rfc3339(),
             last_refresh_at: None,
             oauth_client_id: "unit-client".into(),
+            google_data_consent: Some(
+                crate::google_data_consent::Evidence::issue(&user.id).unwrap(),
+            ),
         };
         let epoch = vault::begin_connection(home.path(), &user.id).unwrap();
         let key = crate::google_identity::protection_gate(home.path()).unwrap();
@@ -2198,7 +2201,7 @@ async fn d1_signed_post(
 #[tokio::test]
 async fn d1_signed_select_bind_execute_consumes_the_same_private_claim_and_sends_once() {
     use duduclaw_core::google_identity::{
-        GoogleSelectionRequest, GoogleSelectionStamp, GOOGLE_SELECTION_ROUTE,
+        GOOGLE_SELECTION_ROUTE, GoogleSelectionRequest, GoogleSelectionStamp,
     };
     for home in [false, true] {
         let f = d1_fixture(home);
@@ -2391,7 +2394,7 @@ fn d1_r2_execute_audit_rows(f: &Fixture) -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn d1_r2_preflight_failures_audit_once_without_resolving_or_sending() {
     use duduclaw_core::google_identity::{
-        GoogleSelectionRequest, GoogleSelectionStamp, GOOGLE_SELECTION_ROUTE,
+        GOOGLE_SELECTION_ROUTE, GoogleSelectionRequest, GoogleSelectionStamp,
     };
     for home in [false, true] {
         let f = d1_fixture(home);
@@ -2913,7 +2916,10 @@ async fn m1_each_send_chunk_codec_and_completion_boundary_rechecks_original_auth
                 } else {
                     4
                 };
-                assert_eq!(hits, expected_hits, "home={home}, stage={stage}, hits={hits}");
+                assert_eq!(
+                    hits, expected_hits,
+                    "home={home}, stage={stage}, hits={hits}"
+                );
             }
         }
     }
@@ -3366,7 +3372,10 @@ async fn m1_refreshing_owners() -> usize {
             crate::google_personal::oauth::mcp_refresh_test::install(f.home.path(), &endpoint)
         });
         let _home = home.then(|| {
-            crate::google_identity::home_source::mcp_budget_testing::install(f.home.path(), &endpoint)
+            crate::google_identity::home_source::mcp_budget_testing::install(
+                f.home.path(),
+                &endpoint,
+            )
         });
         let wire = m1_wire(false).await;
         let registry = m1_registry(&f, &wire).await;
@@ -3401,9 +3410,9 @@ async fn m1_remote_held_refresh_mutex_and_client_rotation_refuse_without_provide
         let home_before = std::fs::read(&home_tokens).unwrap();
         let home_rows: Vec<serde_json::Value> = serde_json::from_slice(&home_before).unwrap();
         assert!(
-            home_rows.iter().all(|row| {
-                row["provider_id"] != "google" || row.get("access_token").is_none()
-            }),
+            home_rows
+                .iter()
+                .all(|row| { row["provider_id"] != "google" || row.get("access_token").is_none() }),
             "rotate={rotate}: fixture must have no Home access token"
         );
         let selected = f.selected("google_remote_mcp");
