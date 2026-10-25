@@ -1,0 +1,122 @@
+name: Windows11 native18 artifact builder
+
+on:
+  push:
+    branches: [chore/windows11-acceptance-artifacts-20261025]
+    paths:
+      - .github/workflows/windows11-acceptance-artifacts.yml
+      - scripts/qa/collect-windows11-artifacts.ps1
+      - scripts/qa/windows11-native-cases.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows11-native18-artifact-builder-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_INCREMENTAL: "false"
+  CARGO_PROFILE_TEST_INCREMENTAL: "false"
+  CARGO_INCREMENTAL: "0"
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: "false"
+
+jobs:
+  build-libtests:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/chore/windows11-acceptance-artifacts-20261025'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the reviewed builder revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Preserve builder tools outside the product checkout
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Workflow checkout does not match github.sha' }
+          if ($env:GITHUB_RUN_ID -notmatch '^\d+$' -or $env:GITHUB_RUN_ATTEMPT -notmatch '^\d+$') { throw 'Invalid run identity' }
+          $tools = Join-Path $env:RUNNER_TEMP "native18-tools-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $output = Join-Path $env:RUNNER_TEMP "native18-ba8211e6-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ((Test-Path -LiteralPath $tools) -or (Test-Path -LiteralPath $output)) { throw 'One-shot builder directory already exists' }
+          New-Item -ItemType Directory -Path $tools | Out-Null
+          $files = [ordered]@{}
+          foreach ($entry in @(
+            @{ source = 'scripts/qa/collect-windows11-artifacts.ps1'; basename = 'collector.ps1' },
+            @{ source = 'scripts/qa/windows11-native-cases.json'; basename = 'cases.json' },
+            @{ source = '.github/workflows/windows11-acceptance-artifacts.yml'; basename = 'workflow.yml' }
+          )) {
+            $before = (Get-FileHash -LiteralPath $entry.source -Algorithm SHA256).Hash.ToLowerInvariant()
+            $blob = (git rev-parse "HEAD:$($entry.source)").Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Builder source blob query failed' }
+            Copy-Item -LiteralPath $entry.source -Destination (Join-Path $tools $entry.basename)
+            $copied = (Get-FileHash -LiteralPath (Join-Path $tools $entry.basename) -Algorithm SHA256).Hash.ToLowerInvariant()
+            $after = (Get-FileHash -LiteralPath $entry.source -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($before -cne $copied -or $before -cne $after) { throw 'Builder source copy changed' }
+            $files[$entry.basename] = @{ source = $entry.source; sha256 = $copied; git_blob = $blob }
+          }
+          @{ head = $head; files = $files } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $tools 'workflow-source.json') -Encoding utf8NoBOM
+          "NATIVE18_TOOLS=$tools" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "NATIVE18_OUTPUT=$output" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Check out the fixed product source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ba8211e63307231482ee8f6f4c44ae58ad4d89e4
+          persist-credentials: false
+          clean: true
+      - name: Verify the product commit and tree
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne 'ba8211e63307231482ee8f6f4c44ae58ad4d89e4') { throw 'Wrong product HEAD' }
+          $tree = (git rev-parse 'HEAD^{tree}').Trim()
+          if ($LASTEXITCODE -ne 0 -or $tree -cne '68ed32d05b22a222edb22260dc55870acc4b8c84') { throw 'Wrong product tree' }
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        # Reuse the repository's documented stable-tag trust policy; actual
+        # rustc/cargo versions and host are recorded by the collector.
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          shared-key: windows11-native18-builder
+      - name: Build real dashboard embedding assets from the fixed source
+        working-directory: web
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --version | Set-Content -LiteralPath (Join-Path $env:NATIVE18_TOOLS 'node-version.txt') -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw 'Node version probe failed' }
+          npm --version | Set-Content -LiteralPath (Join-Path $env:NATIVE18_TOOLS 'npm-version.txt') -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw 'npm version probe failed' }
+          npm ci --legacy-peer-deps
+          if ($LASTEXITCODE -ne 0) { throw 'Locked frontend dependency installation failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Actual frontend build failed' }
+          $receipt = [ordered]@{ source_head = 'ba8211e63307231482ee8f6f4c44ae58ad4d89e4'; commands = @(@('npm', 'ci', '--legacy-peer-deps'), @('npm', 'run', 'build')); natural_exit_codes = @(0, 0); stub = $false }
+          $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $env:NATIVE18_TOOLS 'frontend-build.json') -Encoding utf8NoBOM
+      - name: Compile and collect three current-source libtests without running them
+        id: collect
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:NATIVE18_TOOLS 'collector.ps1') -RepositoryRoot $env:GITHUB_WORKSPACE -OutputDirectory $env:NATIVE18_OUTPUT -WorkflowHead $env:GITHUB_SHA
+          "complete=true" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Upload validated native18 libtests and evidence
+        if: success() && steps.collect.outputs.complete == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows11-native18-ba8211e6-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NATIVE18_OUTPUT }}/
+          if-no-files-found: error
+          retention-days: 3

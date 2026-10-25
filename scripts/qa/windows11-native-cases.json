@@ -1,0 +1,244 @@
+{
+  "scope": "WINDOWS11_NATIVE18_LIBTEST_ONLY",
+  "source": {
+    "head": "ba8211e63307231482ee8f6f4c44ae58ad4d89e4",
+    "tree": "68ed32d05b22a222edb22260dc55870acc4b8c84"
+  },
+  "target": "x86_64-pc-windows-msvc",
+  "source_files": {
+    "crates/duduclaw-cli/src/migrate_from/tests.rs": {
+      "sha256": "74846c537cb7526efdec8722eb261cc6a3d7e77cac29c3ce1a5d073f85a472f8",
+      "git_blob": "f470574e29a1c7ca179085a59e65daa5ab98745a",
+      "bytes": 20849
+    },
+    "crates/duduclaw-cli/src/onboard_config.rs": {
+      "sha256": "bf7bb7155b0195168eef6caa019ab58d1e2e6fbaf66c3fa912d001fd66aa165c",
+      "git_blob": "d164ce06880d8a7d9c63c429507c76d67ee3054a",
+      "bytes": 8172
+    },
+    "crates/duduclaw-cli/src/proxy.rs": {
+      "sha256": "749a290ce605a5ba51010d204f9c7cf8e0797063818e3be37dc91ef3a99f6f09",
+      "git_blob": "82ba1aeca9eac53d59ca0ed437705c78bd157559",
+      "bytes": 63826
+    },
+    "crates/duduclaw-cli/src/mcp/google_identity_client.rs": {
+      "sha256": "08b57efb376c98e8b5c14c4b5e2781e25253ee26154363d6cd9c18f386148d8c",
+      "git_blob": "91926e255dc5705bbf9f4a216b23c0a5c7a50799",
+      "bytes": 28804
+    },
+    "crates/duduclaw-gateway/src/mcp_oauth/home_publication.rs": {
+      "sha256": "dfa383e93b32f69a941915e48567bc8043be7bb7ab5983e2c590fad881847150",
+      "git_blob": "600057c8099d75c1cc299e52870a7944c1f9cc11",
+      "bytes": 53540
+    },
+    "crates/duduclaw-fork/src/publication_windows.rs": {
+      "sha256": "79464d0aec0f632be5130e6d9385a0ccdde3e467bba8218cdb7f69c5de781adb",
+      "git_blob": "6a8b946ecc9805ce2e84e826e44d87eccba05161",
+      "bytes": 15880
+    },
+    "crates/duduclaw-fork/src/test_runner.rs": {
+      "sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
+      "git_blob": "28e2dcd7e3e7ed2714a7ce5cde9096c2e272aed0",
+      "bytes": 19092
+    }
+  },
+  "cases": [
+    {
+      "artifact": "cli-libtest",
+      "name": "migrate_from::tests::end_to_end_openclaw_apply_writes_real_artifacts",
+      "source": "crates/duduclaw-cli/src/migrate_from/tests.rs",
+      "source_sha256": "74846c537cb7526efdec8722eb261cc6a3d7e77cac29c3ce1a5d073f85a472f8",
+      "function_line": 228
+    },
+    {
+      "artifact": "cli-libtest",
+      "name": "migrate_from::tests::openclaw_persona_files_land_in_read_slots_not_memory_dir",
+      "source": "crates/duduclaw-cli/src/migrate_from/tests.rs",
+      "source_sha256": "74846c537cb7526efdec8722eb261cc6a3d7e77cac29c3ce1a5d073f85a472f8",
+      "function_line": 534
+    },
+    {
+      "artifact": "cli-libtest",
+      "name": "onboard_config::tests::actual_reset_helper_keeps_config_and_gate_on_refusal",
+      "source": "crates/duduclaw-cli/src/onboard_config.rs",
+      "source_sha256": "bf7bb7155b0195168eef6caa019ab58d1e2e6fbaf66c3fa912d001fd66aa165c",
+      "function_line": 98
+    },
+    {
+      "artifact": "cli-libtest",
+      "name": "onboard_config::tests::existing_reset_snapshot_and_backup_cannot_bless_wizard_concurrent_winner",
+      "source": "crates/duduclaw-cli/src/onboard_config.rs",
+      "source_sha256": "bf7bb7155b0195168eef6caa019ab58d1e2e6fbaf66c3fa912d001fd66aa165c",
+      "function_line": 115
+    },
+    {
+      "artifact": "cli-libtest",
+      "name": "onboard_config::tests::normal_onboarding_and_requested_reset_use_actual_narrow_final_writer",
+      "source": "crates/duduclaw-cli/src/onboard_config.rs",
+      "source_sha256": "bf7bb7155b0195168eef6caa019ab58d1e2e6fbaf66c3fa912d001fd66aa165c",
+      "function_line": 183
+    },
+    {
+      "artifact": "cli-libtest",
+      "name": "proxy::tests::persist_rotated_credential_is_encrypted_only",
+      "source": "crates/duduclaw-cli/src/proxy.rs",
+      "source_sha256": "749a290ce605a5ba51010d204f9c7cf8e0797063818e3be37dc91ef3a99f6f09",
+      "function_line": 1560
+    },
+    {
+      "artifact": "cli-libtest",
+      "name": "mcp::google_identity_client::tests::internal_custom_key_without_employee_keeps_original_home_path",
+      "source": "crates/duduclaw-cli/src/mcp/google_identity_client.rs",
+      "source_sha256": "08b57efb376c98e8b5c14c4b5e2781e25253ee26154363d6cd9c18f386148d8c",
+      "function_line": 587
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "mcp_oauth::home_store::publication::windows_durability_tests::directory_sync_succeeds_after_create_replace_and_remove",
+      "source": "crates/duduclaw-gateway/src/mcp_oauth/home_publication.rs",
+      "source_sha256": "dfa383e93b32f69a941915e48567bc8043be7bb7ab5983e2c590fad881847150",
+      "function_line": 1303
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "mcp_oauth::home_store::publication::windows_durability_tests::existing_file_sync_preserves_bytes_and_never_creates_a_missing_file",
+      "source": "crates/duduclaw-gateway/src/mcp_oauth/home_publication.rs",
+      "source_sha256": "dfa383e93b32f69a941915e48567bc8043be7bb7ab5983e2c590fad881847150",
+      "function_line": 1318
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "mcp_oauth::home_store::publication::windows_durability_tests::exact_source_recovery_flushes_existing_files_without_replaying_the_write",
+      "source": "crates/duduclaw-gateway/src/mcp_oauth/home_publication.rs",
+      "source_sha256": "dfa383e93b32f69a941915e48567bc8043be7bb7ab5983e2c590fad881847150",
+      "function_line": 1331
+    },
+    {
+      "artifact": "gateway-libtest",
+      "name": "mcp_oauth::home_store::publication::windows_durability_tests::partial_gate_abort_flushes_a_tombstone_and_preserves_other_provider_fields",
+      "source": "crates/duduclaw-gateway/src/mcp_oauth/home_publication.rs",
+      "source_sha256": "dfa383e93b32f69a941915e48567bc8043be7bb7ab5983e2c590fad881847150",
+      "function_line": 1360
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "publication::windows::tests::protected_owner_mutex_and_private_recovery_directory_are_validated",
+      "source": "crates/duduclaw-fork/src/publication_windows.rs",
+      "source_sha256": "79464d0aec0f632be5130e6d9385a0ccdde3e467bba8218cdb7f69c5de781adb",
+      "function_line": 244
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "publication::windows::tests::namespace_squatter_with_broad_acl_is_rejected",
+      "source": "crates/duduclaw-fork/src/publication_windows.rs",
+      "source_sha256": "79464d0aec0f632be5130e6d9385a0ccdde3e467bba8218cdb7f69c5de781adb",
+      "function_line": 268
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "test_runner::tests::windows::passing_command_exit_zero",
+      "source": "crates/duduclaw-fork/src/test_runner.rs",
+      "source_sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
+      "function_line": 392
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "test_runner::tests::windows::failing_command_nonzero",
+      "source": "crates/duduclaw-fork/src/test_runner.rs",
+      "source_sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
+      "function_line": 405
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "test_runner::tests::windows::runs_in_workspace_cwd",
+      "source": "crates/duduclaw-fork/src/test_runner.rs",
+      "source_sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
+      "function_line": 417
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "test_runner::tests::windows::timeout_kills_and_marks",
+      "source": "crates/duduclaw-fork/src/test_runner.rs",
+      "source_sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
+      "function_line": 432
+    },
+    {
+      "artifact": "fork-libtest",
+      "name": "test_runner::tests::windows::timeout_kills_child_and_grandchild",
+      "source": "crates/duduclaw-fork/src/test_runner.rs",
+      "source_sha256": "1a9cae1e95443f1211976338066cb90c22c601e94f09099c4ed72f2abf0b0313",
+      "function_line": 442
+    }
+  ],
+  "artifacts_expected": [
+    {
+      "id": "cli-libtest",
+      "basename": "cli-libtest.exe",
+      "target_name": "duduclaw_cli",
+      "package": "duduclaw-cli",
+      "features": [
+        "dashboard",
+        "default"
+      ]
+    },
+    {
+      "id": "gateway-libtest",
+      "basename": "gateway-libtest.exe",
+      "target_name": "duduclaw_gateway",
+      "package": "duduclaw-gateway",
+      "features": []
+    },
+    {
+      "id": "fork-libtest",
+      "basename": "fork-libtest.exe",
+      "target_name": "duduclaw_fork",
+      "package": "duduclaw-fork",
+      "features": []
+    }
+  ],
+  "profile_required": {
+    "test": true,
+    "opt_level": "0",
+    "debuginfo": 0,
+    "debug_assertions": true,
+    "overflow_checks": true
+  },
+  "schema": "duduclaw-native18-cases-v1",
+  "inputs": {
+    "Cargo.toml": {
+      "sha256": "7fc89f4b548c0af36dad364d6e63cd0a4edbf4ce2fe0db0e0470baf3554a983d",
+      "git_blob": "1d148b9950491cca46f8d4c80d58b3787fcecdb6",
+      "bytes": 5843
+    },
+    "Cargo.lock": {
+      "sha256": "14203ef25b332265cbdd37a477f73891d7aa24394d49f929eca359183e009b16",
+      "git_blob": "a3fa4ff47af36f484db54ce8ca9efefd9e5b318d",
+      "bytes": 221161
+    },
+    "crates/duduclaw-cli/Cargo.toml": {
+      "sha256": "e994e91e3f0aa1c3bfabff2cb4f2ea0d6100e3b993bb7ef368a8825039696b3f",
+      "git_blob": "8ff732b0e6c5ac272fe8cec05c4480a406d5077d",
+      "bytes": 5525
+    },
+    "crates/duduclaw-gateway/Cargo.toml": {
+      "sha256": "4305eebdde0883f54c50d064b3278ae8d65b908e0a086d318e4f786f553ae28c",
+      "git_blob": "c07345468e5b5b519184aea43f72cde3cccb0b0d",
+      "bytes": 13429
+    },
+    "crates/duduclaw-fork/Cargo.toml": {
+      "sha256": "3736d79349c9349191f481441b3ad0b7745b869c735a5b9e1b9ed58a002634a9",
+      "git_blob": "d655947cfbb1c43ee05554d2740a573148f6865c",
+      "bytes": 1329
+    },
+    "web/package.json": {
+      "sha256": "9719912ef4e823e92e04d62dd704ccd6792ce56ff6c0e0d3e8a43563881594d7",
+      "git_blob": "cf468035c7dce472edd295768355bf79b7730ce7",
+      "bytes": 1471
+    },
+    "web/package-lock.json": {
+      "sha256": "55da2ffbf27304d46c454aedd781950518e558d0d058aeb0a45126f383260f88",
+      "git_blob": "17595b423812ad2cc670a12a59a5e3e087afa522",
+      "bytes": 144392
+    }
+  }
+}
