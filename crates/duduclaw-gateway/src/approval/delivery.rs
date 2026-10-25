@@ -107,7 +107,24 @@ impl TrustedReplyTarget {
         Box::new(BoundDecisionSender {
             target: self.clone(),
             http,
+            watch_notice: false,
         })
+    }
+    pub(crate) async fn send_watch_notice(&self, text: &str) -> Result<(), ChannelSendError> {
+        BoundDecisionSender { target: self.clone(), http: reqwest::Client::new(), watch_notice: true }
+            .send_text(text).await
+    }
+    fn watch_body(&self, text: &str) -> serde_json::Value {
+        let mut body = self.body(text);
+        match self.context.channel.as_str() {
+            "telegram" => body["link_preview_options"] = serde_json::json!({"is_disabled":true}),
+            "slack" => {
+                body["unfurl_links"] = serde_json::json!(false);
+                body["unfurl_media"] = serde_json::json!(false);
+            }
+            _ => {}
+        }
+        body
     }
     fn body(&self, text: &str) -> serde_json::Value {
         let mut body = match self.context.channel.as_str() {
@@ -156,6 +173,7 @@ pub(crate) async fn scope_trusted_reply<F: std::future::Future>(
 struct BoundDecisionSender {
     target: TrustedReplyTarget,
     http: reqwest::Client,
+    watch_notice: bool,
 }
 #[async_trait]
 impl ChannelSender for BoundDecisionSender {
@@ -201,7 +219,7 @@ impl ChannelSender for BoundDecisionSender {
                 .header("Authorization", format!("Bot {}", t.token)),
             _ => return Err(ChannelSendError("unsupported exact account route".into())),
         };
-        req = req.json(&t.body(text));
+        req = req.json(&if self.watch_notice { t.watch_body(text) } else { t.body(text) });
         let response = req
             .send()
             .await
@@ -240,6 +258,22 @@ impl ChannelSender for BoundDecisionSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_notice_keeps_exact_thread_and_disables_supported_previews() {
+        for (channel, thread, key) in [("telegram","17","message_thread_id"),("slack","123.456","thread_ts")] {
+            let target = TrustedReplyTarget::new(DecisionContext { channel:channel.into(),
+                account_id:"bot-A".into(),conversation_id:format!("chat:{thread}"),principal_id:"human".into() },
+                "private-bot-A".into(),"chat".into(),Some(thread.into())).unwrap();
+            let watch = target.watch_body("https://dashboard.example/computer/alice?l=context.tag");
+            assert_eq!(watch[key], target.body("normal")[key]);
+            assert_eq!(target.context.account_id,"bot-A");
+            assert!(!watch.to_string().contains("private-bot-A"));
+            if channel == "telegram" { assert_eq!(watch["link_preview_options"]["is_disabled"],true); }
+            else { assert_eq!(watch["unfurl_links"],false); assert_eq!(watch["unfurl_media"],false); }
+            assert!(target.body("normal").get("link_preview_options").is_none());
+            assert!(target.body("normal").get("unfurl_links").is_none());
+        }
+    }
     #[test]
     fn telegram_and_slack_exact_target_never_drop_thread_or_change_account() {
         for (channel, thread, key) in [

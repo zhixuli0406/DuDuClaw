@@ -1,3 +1,4 @@
+import { parseComputerWatch, type ComputerWatchRef } from '@/stores/chat-frames';
 /**
  * Run transcript transforms (G12 run inspector) — pure functions that shape
  * the `runs.get` event stream into renderable transcript cards.
@@ -61,6 +62,7 @@ export interface RunDetail {
 /** Renderable transcript card — a prose block, a collapsible tool card, a
  *  CLI-native tool step, or a TodoWrite board snapshot. */
 export type TranscriptCard =
+  | { type: 'computer_watch'; watch: ComputerWatchRef; ts: string }
   | { type: 'prose'; role: 'user' | 'assistant'; ts: string; text: string }
   | { type: 'tool'; tool: string; ok: boolean; ts: string; preview: string }
   | { type: 'step'; tool: string; ts: string; preview: string }
@@ -98,6 +100,10 @@ export function cardsForEvents(events: readonly RunEvent[]): TranscriptCard[] {
         ts: e.ts,
         preview: e.preview ?? '',
       });
+    } else if (e.kind === 'computer_watch') {
+      const agentId = /^\/computer\/([A-Za-z0-9_-]+)\?/.exec(e.preview ?? '')?.[1];
+      const watch = parseComputerWatch({ agent_id: agentId, href:e.preview });
+      if (watch) cards.push({ type:'computer_watch', watch, ts:e.ts });
     } else if (e.kind === 'tool_step' && typeof e.label === 'string' && e.label.length > 0) {
       // CLI-native step boundary from run_steps.db — label is the tool name;
       // no ok flag is persisted, so none is rendered (never invented).

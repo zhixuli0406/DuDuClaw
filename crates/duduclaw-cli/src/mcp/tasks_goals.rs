@@ -280,6 +280,7 @@ pub(crate) async fn handle_activity_post(
     if duduclaw_gateway::responsibility::activity::RESERVED_PREFIXES
         .iter()
         .any(|p| event_type.to_ascii_lowercase().starts_with(p))
+        || event_type.to_ascii_lowercase().starts_with("computer_session.")
     {
         return tool_error(&format!(
             "activity_post 遭拒：「{}」是系統保留的事件類型。",

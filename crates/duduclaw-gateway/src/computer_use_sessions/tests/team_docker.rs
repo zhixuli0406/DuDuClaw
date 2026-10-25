@@ -154,6 +154,7 @@ async fn computer_team_native_dashboard_fixture() {
         duduclaw_auth::UserRole::Admin,
     )
     .unwrap();
+    db.create_user("peer@team.test", "Unbound peer", "isolated-password", duduclaw_auth::UserRole::Employee).unwrap();
     db.set_manager(&report, Some(&manager)).unwrap();
     db.bind_agent(&report, "alice", duduclaw_auth::AccessLevel::Operator)
         .unwrap();
@@ -256,8 +257,15 @@ ws.call('Page.navigate',{'url':'data:text/html,<title>Team fixture</title><body 
 time.sleep(0.3)
 "#;
         docker(&["exec", &ids[0], "python3", "-c", page]).await?;
+        let now = chrono::Utc::now().timestamp();
+        let id = first["session_id"].as_str().ok_or("fixture missing session id")?;
+        let remaining = sessions.live_status("alice", &manager)["seconds_left"].as_u64().unwrap_or(0);
+        let watch_token = crate::computer_watch_links::issue_at(&home, "alice", id, now, remaining)?;
+        let expired_token = crate::computer_watch_links::issue_at(&home, "alice", id, now - 5, 1)?;
+        let other_session_token = crate::computer_watch_links::issue_at(&home, "alice", "cu-00000000000000000000000000000000", now, remaining)?;
         let manifest = json!({"status":"READY","port":port,"session_id":first["session_id"],"manager":manager,"report":report,
             "manager_email":"manager@team.test","admin_email":"admin@team.test","password":"isolated-password",
+            "peer_email":"peer@team.test", "watch_token":watch_token,"expired_token":expired_token,"other_session_token":other_session_token,
             "gateway_internal_test_key":INTERNAL_KEY,
             "boundary":"synthetic host requester, real gateway/container, no channel/model/provider acceptance"});
         let path = home.join("team-ui-ready.json");

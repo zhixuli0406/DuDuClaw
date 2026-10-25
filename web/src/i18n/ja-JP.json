@@ -65,6 +65,8 @@
   "googlePersonal.adminTitle": "同僚による個人接続",
   "googlePersonal.domains": "接続可能な Google ドメイン（空欄は制限なし）",
   "googlePersonal.domainHint": "Google の組織ドメインを優先し、なければメールのドメインを確認します。Workspace の所属確認を意味するものではありません。",
+  "computerWatch.expired": "このリンクは期限切れです。",
+  "computerWatch.current": "現在の状態を見る",
   "computerWatch.title": "チームのブラウザー画面",
   "computerWatch.loading": "ブラウザーの状態を読み込み中…",
   "computerWatch.denied": "現在、このブラウザーを表示できません。",
