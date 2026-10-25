@@ -85,6 +85,7 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 /// - `topology.*` (組織架構) — D6 turned it into progressive disclosure
 ///   (`requiresData`), visible in **both** editions once ≥3 agents exist.
 pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
+    if method.split('.').take(2).eq(["me", "google"]) || method == "agents.primary_owner_set" { return true; }
     // ── Self-service carve-outs inside an otherwise Enterprise family ──────
     // Checked first so the family rule below cannot swallow them.
     if matches!(method, "users.me" | "users.change_password" | "users.change_email") {

@@ -648,7 +648,17 @@ fn oversight_walks_suspended_managers_but_excludes_inactive_reports_and_corrupt_
     let reports = db.overseen_reports(&o.mgr, "sales").unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].user_id, o.emp1);
-    db.conn().execute("UPDATE user_agent_bindings SET access_level = 'unexpected' WHERE user_id = ?1", [&o.emp1]).unwrap();
+    // Corrupt only the access level under test; an invalid level must not
+    // also claim the independent primary-Owner designation.
+    let changed = db.conn().execute(
+        "UPDATE user_agent_bindings SET access_level = 'unexpected', is_primary = 0 WHERE user_id = ?1",
+        [&o.emp1],
+    ).unwrap();
+    assert!(changed > 0, "the malformed binding must actually be written");
+    assert_eq!(db.conn().query_row(
+        "SELECT access_level, is_primary FROM user_agent_bindings WHERE user_id = ?1 AND agent_name = 'sales'",
+        [&o.emp1], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+    ).unwrap(), ("unexpected".to_owned(), false));
     assert!(db.overseen_reports(&o.mgr, "sales").unwrap().is_empty());
 }
 

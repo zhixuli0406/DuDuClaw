@@ -8,6 +8,7 @@ production home (`~/.duduclaw`).
 | `make-home.sh <target-dir> [--port N]` | Creates an isolated DuDuClaw home: loopback `config.toml` (default port 18977) and two employees. `plain` has no tool allowlist (the old kind of test employee). `prod-shaped` is written like a production employee: `[capabilities] allowed_tools = ["mcp__duduclaw__*", "Read", "Write", "Edit", "Bash"]`, a `denied_tools` entry, `approval_required_tools`, all four `[permissions]` flags, `[budget]`, `[evolution] gvu_enabled = true`, a `CONTRACT.toml` and a `SOUL.md`. Refuses a non-empty target and any target inside `~/.duduclaw`. Writes no secrets. |
 | `mcp-probe.sh <home> <agent-id> [tool ...]` | Starts the real `duduclaw mcp-server` for that employee from the command and env in its own `.mcp.json`, sends `initialize`, `tools/list` and one `tools/call` per tool (default: `tasks_list`, `memory_search`, `working_state_get`, `user_profile_get`), and prints `ok`, `REFUSED: ...` or `ERROR: ...` per call. Exits 1 when a default check fails for `prod-shaped`. |
 | `google-delegated-identity.mjs` (historical, paused) | Do not run during the narrowed EXT follow-up; use the ordinary baseline below. Retained for the original evidence. Creates its own temporary home, starts a real gateway and stdio MCP servers, and exchanges signed RSA assertions with a loopback fake Google. Requires a debug build with `--features live-test-mocks` and Node 22+. Credential protection uses an in-memory store; no real keychain, model or Google account is touched. Checks shared-account compatibility, two delegated subjects, same-process account changes, domain refusal, unsigned and unproven callers, provider rejection, explicit fallback, `none`, the master switch, audit redaction and offline gateway refusal. Artifacts remain in the printed temporary folder. |
+| `node google-personal-identity.mjs <guarded-binary-wrapper>` | Creates a fresh Enterprise home and a loopback OAuth/service mock. Requires Node 22+, a debug `live-test-mocks` binary and an OS sandbox wrapper that denies real credential/keychain access and all outbound traffic except loopback. Checks exact redirect/PKCE, same-session completion after JWT refresh, cross-session/user refusal, actual partial scopes, self-consent, primary Owner changes, per-call refresh/status checks, local disconnect before delayed revoke, grant coordination and encrypted/redacted storage. Reversible suspension is injected into the fresh fixture database because this base has no reversible status RPC; it verifies resolver revalidation, not a status-management API. Artifacts remain in the printed folder. This is isolated mock evidence, not real Google or OS-keychain acceptance. |
 | `python3 on-behalf-of.py <home> <binary>` | After booting and stopping the isolated gateway, calls the real `prod-shaped` stdio MCP server. Checks host identity stamping on tasks and queue rows, forged tool arguments, rejection auditing, enforce refusals and absent-principal behavior. Writes disposable test rows and temporarily changes the isolated delegation policy. It calls no model; runtime delivery, real channels and human acceptance require separate checks. |
 
 ## Why `prod-shaped` exists
@@ -90,6 +91,26 @@ untouched unless you pass `--all-profiles`. The cache once reached 134 GB and a
 full disk crashed Docker Desktop; run it when free space drops below about
 100 GB.
 
+## Actual VNC authentication
+
+After installing the dashboard dependencies, run:
+
+```sh
+node scripts/live-test/computer-vnc-auth.mjs <already-built-local-image>
+```
+
+The test creates its own labelled container with no network, a read-only root,
+private tmpfs, no-new-privileges and CPU/memory limits. It checks actual RFB
+password authentication twice, rejects a wrong password and the sandbox user,
+checks both TCP tables for VNC listeners, then stops VNC and verifies socket
+removal. Its fixture directory is retained. Cleanup verifies the random ownership
+label before removing only that container. No image is pulled or published.
+
+An RFB greeting alone cannot verify these checks. The old helper emitted the
+greeting and then rejected the Unix peer named `localhost` against its
+`127.0.0.1` allowlist. The corrected helper binds to loopback without that IP-only
+allowlist; root-only socket permissions and VNC password authentication remain.
+
 ## Google connectors: ordinary local baseline
 
 `google-connectors-baseline.mjs <debug-binary>` uses a new temporary home,
@@ -125,23 +146,3 @@ mock credential store uses one home path.
 node --test scripts/live-test/google-connectors-harness.test.mjs
 node scripts/live-test/google-connectors-baseline.mjs /path/to/mock-debug-binary
 ```
-
-## Actual VNC authentication
-
-After installing the dashboard dependencies, run:
-
-```sh
-node scripts/live-test/computer-vnc-auth.mjs <already-built-local-image>
-```
-
-The test creates its own labelled container with no network, a read-only root,
-private tmpfs, no-new-privileges and CPU/memory limits. It checks actual RFB
-password authentication twice, rejects a wrong password and the sandbox user,
-checks both TCP tables for VNC listeners, then stops VNC and verifies socket
-removal. Its fixture directory is retained. Cleanup verifies the random ownership
-label before removing only that container. No image is pulled or published.
-
-An RFB greeting alone cannot verify these checks. The old helper emitted the
-greeting and then rejected the Unix peer named `localhost` against its
-`127.0.0.1` allowlist. The corrected helper binds to loopback without that IP-only
-allowlist; root-only socket permissions and VNC password authentication remain.

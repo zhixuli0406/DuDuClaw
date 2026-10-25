@@ -36,6 +36,11 @@ pub struct Claims {
     pub iat: u64,
     /// Token type — "access" or "refresh".
     pub token_type: String,
+    /// Stable dashboard login session identity, shared with its refresh
+    /// token. Missing on older tokens, which remain valid outside flows
+    /// requiring a proven browser session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 impl JwtConfig {
@@ -121,6 +126,31 @@ impl JwtConfig {
         user: &User,
         agent_access: &[(String, AccessLevel)],
     ) -> Result<String, String> {
+        self.issue_access_token_in_session(user, agent_access, Some(&uuid::Uuid::new_v4().to_string()))
+    }
+
+    /// Issue a new token pair for one login. A different login always gets
+    /// a different identity, even for the same person.
+    pub fn issue_session_tokens(
+        &self,
+        user: &User,
+        agent_access: &[(String, AccessLevel)],
+    ) -> Result<(String, String), String> {
+        let session = uuid::Uuid::new_v4().to_string();
+        Ok((
+            self.issue_access_token_in_session(user, agent_access, Some(&session))?,
+            self.issue_refresh_token_in_session(&user.id, Some(&session))?,
+        ))
+    }
+
+    /// Refresh keeps the authenticated login's identity. A legacy refresh
+    /// token with no identity must never mint one implicitly.
+    pub fn issue_access_token_in_session(
+        &self,
+        user: &User,
+        agent_access: &[(String, AccessLevel)],
+        session: Option<&str>,
+    ) -> Result<String, String> {
         let now = chrono::Utc::now().timestamp() as u64;
         let bound_agents: Vec<String> = agent_access.iter().map(|(a, _)| a.clone()).collect();
         let access_levels: HashMap<String, String> = agent_access
@@ -137,6 +167,7 @@ impl JwtConfig {
             exp: now + self.access_ttl_secs,
             iat: now,
             token_type: "access".to_string(),
+            jti: session.map(str::to_owned),
         };
 
         encode(&Header::default(), &claims, &self.encoding_key)
@@ -145,6 +176,10 @@ impl JwtConfig {
 
     /// Issue a refresh token (minimal claims).
     pub fn issue_refresh_token(&self, user_id: &str) -> Result<String, String> {
+        self.issue_refresh_token_in_session(user_id, Some(&uuid::Uuid::new_v4().to_string()))
+    }
+
+    fn issue_refresh_token_in_session(&self, user_id: &str, session: Option<&str>) -> Result<String, String> {
         let now = chrono::Utc::now().timestamp() as u64;
         let claims = Claims {
             sub: user_id.to_string(),
@@ -155,6 +190,7 @@ impl JwtConfig {
             exp: now + self.refresh_ttl_secs,
             iat: now,
             token_type: "refresh".to_string(),
+            jti: session.map(str::to_owned),
         };
 
         encode(&Header::default(), &claims, &self.encoding_key)
@@ -191,6 +227,32 @@ impl JwtConfig {
 mod tests {
     use super::*;
     use crate::models::{UserRole, UserStatus};
+
+    #[test]
+    fn dashboard_session_is_shared_by_the_pair_and_survives_refresh() {
+        let config = JwtConfig::new(b"a-session-test-secret-at-least-32-bytes");
+        let (access, refresh) = config.issue_session_tokens(&test_user(), &[]).unwrap();
+        let access = config.verify_access_token(&access).unwrap();
+        let refresh = config.verify_refresh_token(&refresh).unwrap();
+        assert!(access.jti.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()));
+        assert_eq!(access.jti, refresh.jti);
+        let renewed = config.issue_access_token_in_session(&test_user(), &[], refresh.jti.as_deref()).unwrap();
+        assert_eq!(config.verify_access_token(&renewed).unwrap().jti, access.jti);
+        let (other, _) = config.issue_session_tokens(&test_user(), &[]).unwrap();
+        assert_ne!(config.verify_access_token(&other).unwrap().jti, access.jti);
+    }
+
+    #[test]
+    fn legacy_tokens_remain_valid_but_refresh_cannot_invent_a_session() {
+        let config = JwtConfig::new(b"a-session-test-secret-at-least-32-bytes");
+        let token = config.issue_access_token_in_session(&test_user(), &[], None).unwrap();
+        let claims = config.verify_access_token(&token).unwrap();
+        assert!(claims.jti.is_none());
+        let mut legacy = serde_json::to_value(&claims).unwrap();
+        legacy.as_object_mut().unwrap().remove("jti");
+        let token = encode(&Header::default(), &legacy, &config.encoding_key).unwrap();
+        assert!(config.verify_access_token(&token).unwrap().jti.is_none());
+    }
 
     fn test_user() -> User {
         User {
@@ -263,6 +325,7 @@ mod tests {
             exp: now.saturating_sub(60), // 60 seconds in the past
             iat: now.saturating_sub(120),
             token_type: "access".to_string(),
+            jti: None,
         };
         let token = encode(
             &Header::default(),

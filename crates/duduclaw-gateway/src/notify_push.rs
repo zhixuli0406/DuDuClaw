@@ -187,6 +187,36 @@ pub(crate) async fn push(
     receipt
 }
 
+/// A personal connection status is a notice, not a decision: do not invent
+/// approval buttons. Destinations come from this active user's verified
+/// links; token lookup and plain sending reuse the established DM path.
+pub(crate) async fn push_person_notice(home: &Path, user_id: &str, text: &str) {
+    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return; };
+    let Ok(Some(user)) = db.get_user(user_id) else { return; };
+    if user.status != duduclaw_auth::UserStatus::Active { return; }
+    let Ok(links) = db.verified_channels_for_user(user_id) else { return; };
+    let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() else { return; };
+    let level = crate::notify_governance::NotifyLevel::Confirm;
+    let policy = crate::notify_governance::QuietPolicy {
+        window: crate::notify_governance::load_global_window(home),
+        tz: crate::notify_governance::NotifyTz::System,
+    };
+    for link in links.into_iter().take(16) {
+        if let Some(until) = policy.decide(level, chrono::Utc::now()) {
+            crate::notify_governance::enqueue(home, crate::notify_governance::DeferredNotice {
+                id: uuid::Uuid::new_v4().to_string(), agent_id: String::new(),
+                channel: link.channel, chat_id: link.channel_user_id,
+                level: level.as_str().into(), notify_type: "google.personal_connection".into(),
+                queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: until.to_rfc3339(),
+                kind: crate::notify_governance::NoticeKind::Plain, text: text.into(), link: None,
+                no_button_hint: None, decision_source: None, decision_id: None,
+            });
+        } else {
+            crate::install_notify::send_plain_text(home, &http, &link.channel, &link.channel_user_id, text).await;
+        }
+    }
+}
+
 /// `Sent` beats `Deferred` beats `Failed` — a card that reached one live
 /// destination is delivered even if another target's token was dead.
 fn merge(acc: DeliverOutcome, next: DeliverOutcome) -> DeliverOutcome {

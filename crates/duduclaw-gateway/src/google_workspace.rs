@@ -594,6 +594,10 @@ pub async fn get_valid_google_token(home_dir: &Path) -> Result<String, GoogleAut
         return Ok(t.access_token);
     }
 
+    // Shared by CLI/native tools as well as gateway calls. Keep the lease
+    // until a refresh has been durably published in the home token store.
+    let _grant_lease = crate::google_personal::grants::acquire(home_dir).await.map_err(GoogleAuthError::RefreshFailed)?;
+
     // Not returned by get_token ⇒ either missing entirely or expired.
     let existing = mcp_oauth::load_tokens(home_dir)
         .into_iter()

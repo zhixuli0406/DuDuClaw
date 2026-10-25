@@ -4,6 +4,13 @@
 use super::*;
 
 impl MethodHandler {
+    async fn own_google_mail_account(&self, user_id: &str) -> Result<Option<String>, String> {
+        let Some(record) = crate::person_credentials::get(&self.home_dir, user_id)? else { return Ok(None); };
+        let key = crate::google_identity::protection_gate_async(&self.home_dir).await.map_err(|r| r.message_zh)?;
+        // Ownership comes from the sealed binding, not editable clear metadata.
+        let _secret = crate::person_credentials::unseal(&key, &record)?;
+        Ok(Some(record.metadata.account_email))
+    }
     /// WP14-T14.7: decide a pending approval from the dashboard ("就地同意/退回").
     /// Board-only kinds (WP17 StrategicPlan/AgentHire) require admin — the
     /// dashboard's fail-closed stand-in for board rights until a board-user model
@@ -34,10 +41,12 @@ impl MethodHandler {
             return Ok(Reader::Admin);
         }
         let people = self.people_for_mail().await;
-        let email = people
-            .by_id(&ctx.user_id)
-            .filter(|p| p.active)
-            .map(|p| p.email);
+        let email = people.by_id(&ctx.user_id).filter(|p| p.active).map(|p| p.email);
+        if let Some(email) = &email {
+            let mut emails = vec![email.clone()];
+            if let Some(email) = self.own_google_mail_account(&ctx.user_id).await? { emails.push(email); }
+            return Ok(Reader::PersonAccounts { emails, manager: ctx.role.at_least(UserRole::Manager) });
+        }
         if ctx.role.at_least(UserRole::Manager) {
             return Ok(Reader::Manager { email });
         }
@@ -60,11 +69,14 @@ impl MethodHandler {
             {
                 crate::google_identity::Effective::Home => {}
                 crate::google_identity::Effective::Delegate { email } => accounts.push(email),
-                _ => {
-                    return Err(
-                        "目前無法確認這個信箱所屬的 Google 帳號，只有管理員可以查看。".into(),
-                    );
+                crate::google_identity::Effective::Personal { selector } => {
+                    let Some(db) = self.user_db.read().await.clone() else { return Err("人員資料尚未就緒。".into()); };
+                    let agent = owner.as_deref().ok_or("無法確認信箱所屬員工。")?;
+                    let user = crate::google_personal::access::select_user(&db, agent, &selector).map_err(|r| r.message_zh)?;
+                    let record = crate::person_credentials::get(&self.home_dir, &user.id)?.ok_or("信箱負責人尚未連結 Google。")?;
+                    accounts.push(record.metadata.account_email);
                 }
+                _ => return Err("目前無法確認這個信箱所屬的 Google 帳號，只有管理員可以查看。".into()),
             }
         }
         if accounts.is_empty() {
@@ -76,10 +88,9 @@ impl MethodHandler {
         let Some(person) = people.by_id(&ctx.user_id).filter(|p| p.active) else {
             return Err("無法確認你的有效帳號，請重新登入或聯絡管理員。".into());
         };
-        if accounts
-            .iter()
-            .any(|email| !person.email.trim().eq_ignore_ascii_case(email))
-        {
+        let mut own_accounts = vec![person.email];
+        if let Some(email) = self.own_google_mail_account(&ctx.user_id).await? { own_accounts.push(email); }
+        if accounts.iter().any(|email| !own_accounts.iter().any(|own| own.trim().eq_ignore_ascii_case(email))) {
             return Err("這個信箱包含個人的 Google 信件，只有帳號本人和管理員看得到；混合多個帳號時只限管理員。".into());
         }
         if read_only {

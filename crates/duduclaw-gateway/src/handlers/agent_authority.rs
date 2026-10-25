@@ -111,7 +111,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("budget.daily_cap_cents", &["v.daily_cap_cents"], Loosen),
     key("budget.hard_stop", &["form.hard_stop"], Loosen),
     // Whose Google account the employee acts as (a colleague's mailbox).
-    key("google", &[], GoogleNarrow),
+    key("google", &["form.google."], GoogleNarrow),
 ];
 
 /// The effective value of an authority key: an absent key reads as the value

@@ -303,11 +303,13 @@ async fn oauth_connect_callback_bridge_and_refresh() {
     let secrets = store::open(home, &rec).unwrap();
     assert_eq!(secrets.oauth.unwrap().refresh_token.as_deref(), Some("rt-3"), "rotated refresh token stored");
 
-    // 5b. RFC 7009: the disconnect path reads the target before the local
-    //     delete and revokes the refresh token at the provider.
+    // 5b. Even on a fresh home, a dynamic revocation endpoint cannot prove
+    //     the upstream account/project boundary. It must receive no request.
+    assert!(!home.join("person_credentials/store.json").exists());
+    assert!(!home.join("mcp-oauth-tokens.json").exists());
     let target = connect::revocation_target(home, "a1", "fake").expect("a revocation endpoint was advertised");
-    assert_eq!(connect::revoke_at_provider(target).await, "revoked");
-    assert_eq!(fake.lock().unwrap().revoked, vec![("rt-3".to_string(), "refresh_token".to_string())]);
+    assert_eq!(connect::revoke_at_provider(target).await, "local_only_unknown_grant");
+    assert!(fake.lock().unwrap().revoked.is_empty());
 
     // 6. A refresh token the server no longer accepts marks the record
     //    needs_reauth and the bridge answers with an operator-facing error.

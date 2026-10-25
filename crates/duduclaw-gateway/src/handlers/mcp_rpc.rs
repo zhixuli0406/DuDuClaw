@@ -183,8 +183,8 @@ impl MethodHandler {
                         .is_some_and(|d| crate::remote_mcp::bridge_def::is_bridge_def(&d));
                     remove_server_from_config(&ad, &sn)?;
                     // Removing a remote server also deletes its stored
-                    // credentials (no orphaned tokens), then revokes them
-                    // at the provider (best effort, after the local delete).
+                    // credentials (no orphaned tokens), then records the
+                    // local-only outcome for the unverified provider grant.
                     let target = if was_bridge {
                         crate::remote_mcp::connect::revocation_target(&home, &aid, &sn)
                     } else {
