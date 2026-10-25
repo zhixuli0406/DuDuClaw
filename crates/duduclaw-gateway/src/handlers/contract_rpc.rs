@@ -18,21 +18,7 @@ impl MethodHandler {
     /// Atomic write of a TOML table to `path` (temp + rename).
     pub(crate) async fn atomic_write_toml(&self, path: &Path, table: &toml::Table) -> Result<(), String> {
         if path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
-            let current = super::config_commit::read_text_or_empty(path)?;
-            let current_table = if current.trim().is_empty() {
-                toml::Table::new()
-            } else {
-                current.parse::<toml::Table>()
-                    .map_err(|e| format!("Invalid config.toml; refusing edit: {e}"))?
-            };
-            if current_table.get("accounts") != table.get("accounts") {
-                return Err("config.toml accounts changed while this edit was open; reload and retry".into());
-            }
-            return super::config_commit::commit_table_locked(
-                path,
-                super::config_commit::content_hash(&current),
-                table,
-            ).await;
+            return Err("config.toml requires the original read snapshot".into());
         }
         let tmp = path.with_extension("toml.tmp");
         if let Err(e) = self.write_config_table(&tmp, table).await {
@@ -43,6 +29,34 @@ impl MethodHandler {
             return Err(format!("Failed to commit {}: {e}", path.display()));
         }
         Ok(())
+    }
+
+    pub(crate) async fn read_toml_write_snapshot(
+        &self,
+        path: &Path,
+    ) -> Result<(toml::Table, super::config_commit::HomeTableSnapshot), String> {
+        if path != self.home_dir.join("config.toml").as_path() {
+            return Err("Home snapshot target must be this handler's config.toml".into());
+        }
+        super::config_commit::read_home_table_snapshot(path)
+    }
+
+    pub(crate) async fn atomic_write_toml_snapshot(
+        &self,
+        path: &Path,
+        table: &toml::Table,
+        snapshot: super::config_commit::HomeTableSnapshot,
+    ) -> Result<(), String> {
+        if path != self.home_dir.join("config.toml").as_path() {
+            return Err("Home snapshot target must be this handler's config.toml".into());
+        }
+        let path = path.to_path_buf();
+        let table = table.clone();
+        tokio::task::spawn_blocking(move || {
+            super::config_commit::commit_home_table_snapshot(&path, snapshot, &table)
+        })
+        .await
+        .map_err(|e| format!("config write task failed: {e}"))?
     }
 
     // ── CON: CONTRACT.toml (per-agent) ────────────────────────────────────────

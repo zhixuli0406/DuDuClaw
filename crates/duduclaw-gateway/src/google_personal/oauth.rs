@@ -68,6 +68,65 @@ fn client() -> Result<reqwest::Client, Error> {
         .map_err(|_| Error::Unavailable)
 }
 
+/// Pinned refresh must make one transport attempt, including protocol NACKs.
+/// The ordinary OAuth client retains its existing transport policy.
+enum ScopedRefreshPolicy<'a> {
+    Legacy,
+    Closed {
+        home: &'a std::path::Path,
+        deadline: tokio::time::Instant,
+    },
+}
+impl ScopedRefreshPolicy<'_> {
+    fn check(&self) -> Result<(), Error> {
+        if let Self::Closed { deadline, .. } = self {
+            if tokio::time::Instant::now() >= *deadline {
+                return Err(Error::Unavailable);
+            }
+        }
+        Ok(())
+    }
+    async fn wait<F: std::future::Future>(&self, future: F) -> Result<F::Output, Error> {
+        self.check()?;
+        let value = match self {
+            Self::Legacy => future.await,
+            Self::Closed { deadline, .. } => tokio::time::timeout_at(*deadline, future)
+                .await
+                .map_err(|_| Error::Unavailable)?,
+        };
+        self.check()?;
+        Ok(value)
+    }
+    fn endpoint(&self) -> Result<String, Error> {
+        match self {
+            Self::Legacy => Ok(endpoint(TOKEN)),
+            Self::Closed { home, .. } => {
+                #[cfg(test)]
+                {
+                    return mcp_refresh_test::endpoint(home).ok_or(Error::Unavailable);
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = home;
+                    Ok(TOKEN.to_owned())
+                }
+            }
+        }
+    }
+}
+fn scoped_refresh_client(policy: &ScopedRefreshPolicy<'_>) -> Result<reqwest::Client, Error> {
+    let builder = match policy {
+        ScopedRefreshPolicy::Legacy => reqwest::Client::builder(),
+        ScopedRefreshPolicy::Closed { .. } => reqwest::Client::builder().no_proxy(),
+    };
+    builder
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|_| Error::Unavailable)
+}
+
 async fn response_json(mut response: reqwest::Response) -> Result<Value, Error> {
     let status = response.status();
     let mut bytes = Vec::new();
@@ -190,6 +249,62 @@ pub async fn refresh(
     parse_tokens(response_json(response).await?)
 }
 
+pub(crate) async fn refresh_scoped(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<Tokens, Error> {
+    refresh_scoped_core(
+        client_id,
+        client_secret,
+        refresh_token,
+        ScopedRefreshPolicy::Legacy,
+    )
+    .await
+}
+pub(crate) async fn refresh_mcp(
+    home: &std::path::Path,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Tokens, Error> {
+    refresh_scoped_core(
+        client_id,
+        client_secret,
+        refresh_token,
+        ScopedRefreshPolicy::Closed { home, deadline },
+    )
+    .await
+}
+async fn refresh_scoped_core(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+    policy: ScopedRefreshPolicy<'_>,
+) -> Result<Tokens, Error> {
+    policy.check()?;
+    let sender = scoped_refresh_client(&policy)?;
+    let request = sender
+        .post(policy.endpoint()?)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", refresh_token),
+        ])
+        .build()
+        .map_err(|_| Error::Unavailable)?;
+    policy.check()?;
+    let response = policy
+        .wait(sender.execute(request))
+        .await?
+        .map_err(|_| Error::Unavailable)?;
+    let result = policy.wait(response_json(response)).await?;
+    policy.check()?;
+    parse_tokens(result?)
+}
+
 pub async fn userinfo(access_token: &str) -> Result<UserInfo, Error> {
     let response = client()?
         .get(endpoint(USERINFO))
@@ -291,5 +406,46 @@ mod tests {
             assert_eq!(q.get(key).unwrap(), value);
         }
         assert!(q["scope"].split_ascii_whitespace().any(|s| s == "openid"));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod mcp_refresh_test {
+    use std::{
+        path::{Path, PathBuf},
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    fn fixtures() -> &'static Mutex<HashMap<PathBuf, String>> {
+        static F: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+        F.get_or_init(Default::default)
+    }
+    pub(crate) struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            fixtures().lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(crate) fn install(home: &Path, endpoint: &str) -> Guard {
+        let url = reqwest::Url::parse(endpoint).unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(url.port().is_some());
+        let home = home.canonicalize().unwrap();
+        assert!(
+            fixtures()
+                .lock()
+                .unwrap()
+                .insert(home.clone(), endpoint.into())
+                .is_none()
+        );
+        Guard(home)
+    }
+    pub(super) fn endpoint(home: &Path) -> Option<String> {
+        fixtures()
+            .lock()
+            .unwrap()
+            .get(&home.canonicalize().ok()?)
+            .cloned()
     }
 }

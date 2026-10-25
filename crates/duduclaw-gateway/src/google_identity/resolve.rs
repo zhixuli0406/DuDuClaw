@@ -28,7 +28,13 @@ use crate::google_workspace::REQUIRED_SCOPES;
 pub enum Resolved {
     /// A token minted for the delegate.
     Delegated { email: String, token: MintedToken },
-    Personal { kind: &'static str, user_id: String, email: String, token: MintedToken },
+    Personal {
+        authority: crate::google_personal::authority::PersonalAuthority,
+        kind: &'static str,
+        user_id: String,
+        email: String,
+        token: MintedToken,
+    },
     /// The home account, in the caller's own process. `fallback` is true when
     /// a delegate failed and the employee's `fallback = "home"` covered it;
     /// `notice` is then prepended to the tool result.
@@ -151,11 +157,16 @@ pub async fn resolve_person_for_tool(
 ) -> Result<Resolved, Refusal> {
     let eff = gi::effective_for(home, Some(agent));
     if matches!(eff.effective, Effective::Personal { .. }) {
-        let outcome = crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool).await;
+        let outcome =
+            crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool)
+                .await;
         return match outcome {
-            Err(r) if r.fallback_eligible && eff.fallback == Fallback::Home => Ok(Resolved::UseHome {
-                fallback: true, notice: Some(format!("已改用公司共用帳號處理，因為：{}", r.message_zh)),
-            }),
+            Err(r) if r.fallback_eligible && eff.fallback == Fallback::Home => {
+                Ok(Resolved::UseHome {
+                    fallback: true,
+                    notice: Some(format!("已改用公司共用帳號處理，因為：{}", r.message_zh)),
+                })
+            }
             other => other,
         };
     }

@@ -380,7 +380,11 @@ impl MethodHandler {
         }
 
         let config_path = self.home_dir().join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let original=match super::config_commit::read_text_or_empty(&config_path) {
+            Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("Failed to write config: {e}")),
+        };
+        let config_expected_hash=super::config_commit::content_hash(&original);
+        let mut table=original.parse::<toml::Table>().unwrap_or_default();
         let mut changes: Vec<String> = Vec::new();
         {
             let backup = table
@@ -402,13 +406,8 @@ impl MethodHandler {
             }
         }
 
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        if let Err(e)=super::config_commit::commit_table_locked(&config_path,config_expected_hash,&table).await {
+            return WsFrame::error_response("",&format!("Failed to write config: {e}"));
         }
 
         let cfg = crate::backup_schedule::BackupScheduleConfig::from_home(self.home_dir());

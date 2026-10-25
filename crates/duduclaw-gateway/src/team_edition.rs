@@ -28,14 +28,18 @@ fn editions() -> std::sync::MutexGuard<'static, HashMap<PathBuf, EditionProfile>
 
 /// Remember the edition resolved for `home`.
 pub fn record(home: &Path, edition: EditionProfile) {
-    editions().insert(home.to_path_buf(), edition);
+    if let Ok(home) = home.canonicalize() {
+        editions().insert(home, edition);
+    }
 }
 
 /// Team grants apply only when `home` was last resolved as Enterprise.
 pub fn team_grants_enabled(home: &Path) -> bool {
-    editions()
-        .get(home)
-        .is_some_and(|e| *e == EditionProfile::Enterprise)
+    home.canonicalize().ok().is_some_and(|home| {
+        editions()
+            .get(&home)
+            .is_some_and(|e| *e == EditionProfile::Enterprise)
+    })
 }
 
 /// `access` with its team grants dropped unless they apply in `home`.

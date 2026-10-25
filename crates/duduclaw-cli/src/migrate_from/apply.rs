@@ -259,28 +259,19 @@ pub(super) fn plan_api_key(
 }
 
 /// Read config.toml into a mutable table (empty table if the file is absent).
-pub(super) fn read_config_table(home: &Path) -> toml::value::Table {
-    let path = home.join("config.toml");
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| c.parse::<toml::Table>().ok())
-        .unwrap_or_default()
+pub(super) fn read_config_table(home:&Path)->(toml::value::Table,String) {
+    let raw=std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    use sha2::Digest as _;
+    let hash=hex::encode(sha2::Sha256::digest(raw.as_bytes()));
+    (raw.parse::<toml::Table>().unwrap_or_default(),hash)
 }
-
-/// Persist a config.toml table (atomic temp + rename).
-pub(super) fn write_config_table(home: &Path, table: &toml::value::Table) -> Result<()> {
-    let path = home.join("config.toml");
-    let tmp = home.join("config.toml.migrate.tmp");
-    let content = toml::to_string_pretty(table)
-        .map_err(|e| DuDuClawError::Config(format!("序列化 config.toml 失敗: {e}")))?;
+/// Persist only the exact snapshot the import plan read; dry-run callers do
+/// not invoke this helper. No migration-generated source stamp is trusted.
+pub(super) fn write_config_table(home:&Path,table:&toml::value::Table,expected_hash:&str)->Result<()> {
+    let content=toml::to_string_pretty(table).map_err(|e|DuDuClawError::Config(format!("序列化 config.toml 失敗: {e}")))?;
     std::fs::create_dir_all(home).ok();
-    std::fs::write(&tmp, content)
-        .map_err(|e| DuDuClawError::Io(std::io::Error::other(format!("寫入暫存檔失敗: {e}"))))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        DuDuClawError::Io(std::io::Error::other(format!("覆寫 config.toml 失敗: {e}")))
-    })?;
-    Ok(())
+    duduclaw_gateway::commit_config_rendered(home,expected_hash,|_|Ok(content))
+        .map_err(|e|DuDuClawError::Io(std::io::Error::other(format!("覆寫 config.toml 失敗: {e}"))))
 }
 
 /// Scaffold an imported agent directory, honouring conflict/rename policy.

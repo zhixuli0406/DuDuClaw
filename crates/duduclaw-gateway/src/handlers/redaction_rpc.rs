@@ -65,7 +65,10 @@ impl MethodHandler {
     /// Response: `{ success, changes[], applied, warning }`.
     pub(crate) async fn handle_redaction_update(&self, params: Value) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         let mut changes = match apply_redaction_to_table(&mut table, &params) {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
@@ -90,7 +93,7 @@ impl MethodHandler {
         {
             return WsFrame::error_response("", &format!("規則試編失敗，未寫入：{e}"));
         }
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }
 
@@ -197,11 +200,11 @@ impl MethodHandler {
         name: &str,
     ) -> Result<(bool, Option<String>), String> {
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = self.read_toml_write_snapshot(&config_path).await?;
         if crate::redaction_custom_rules::profile_path(&self.home_dir, name).exists()
             && crate::redaction_custom_rules::ensure_profile_listed(&mut table, name)
         {
-            self.atomic_write_toml(&config_path, &table).await?;
+            self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await?;
         }
         Ok(self.apply_redaction_hot_reload(&table).await)
     }
@@ -458,9 +461,12 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &e),
         };
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         if crate::redaction_custom_rules::unlist_profile(&mut table, name)
-            && let Err(e) = self.atomic_write_toml(&config_path, &table).await
+            && let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await
         {
             return WsFrame::error_response("", &e);
         }

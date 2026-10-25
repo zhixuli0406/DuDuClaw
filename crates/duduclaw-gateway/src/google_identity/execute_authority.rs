@@ -55,6 +55,7 @@ mod tests {
             let state = ExecuteState::new(home.path().to_path_buf(), None);
             let request = ExecuteRequest {
                 tool: "google_status".into(),
+                selection_stamp: None,
                 arguments: json!({}),
                 credential_ref: CredentialRef {
                     kind: CredentialKind::Legacy,
@@ -113,25 +114,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn personal_resolution_never_becomes_dedicated_external_authority() {
+    async fn personal_fallback_needs_explicit_host_account_selection() {
         let user = uuid::Uuid::new_v4().to_string();
         for selector in ["owner".to_owned(), format!("user:{user}")] {
             let home = tempfile::tempdir().unwrap();
             let agent = "personal-unsupported";
             std::fs::create_dir_all(home.path().join("agents").join(agent)).unwrap();
-            std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_workspace=true\n").unwrap();
+            std::fs::write(
+                home.path().join("config.toml"),
+                "[integrations]\ngoogle_workspace=true\n",
+            )
+            .unwrap();
             std::fs::write(home.path().join("agents").join(agent).join("agent.toml"), format!(
                 "[agent]\nname='{agent}'\n[google]\nidentity='{selector}'\nrequesters='anyone'\nfallback='home'\n"
             )).unwrap();
             let state = ExecuteState::new(home.path().to_path_buf(), None);
             let authority = Authority::capture(&state, agent).await.unwrap();
-            assert!(matches!(authority.selected.effective, Effective::Personal { .. }));
-            let resolved = resolve::Resolved::Personal {
-                kind: if selector == "owner" { "owner" } else { "user" },
-                user_id: user.clone(), email: "person@test.invalid".into(),
-                token: crate::google_service_account::MintedToken {
-                    access_token: "unit-personal-do-not-forward".into(), expires_in: 3600,
-                },
+            assert!(matches!(
+                authority.selected.effective,
+                Effective::Personal { .. }
+            ));
+            let resolved = resolve::Resolved::UseHome {
+                fallback: true,
+                notice: None,
             };
             let error = authority.check_selected(&resolved).unwrap_err();
             assert_eq!(error.code, "identity_changed");

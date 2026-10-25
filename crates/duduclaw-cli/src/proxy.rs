@@ -817,13 +817,10 @@ async fn persist_qwen_seat_credential(
 
     let serialized =
         toml::to_string_pretty(&table).map_err(|e| format!("config.toml 序列化失敗：{e}"))?;
-    let tmp = config_path.with_extension("toml.tmp");
-    tokio::fs::write(&tmp, serialized)
-        .await
-        .map_err(|e| format!("寫入暫存檔失敗：{e}"))?;
-    tokio::fs::rename(&tmp, &config_path)
-        .await
-        .map_err(|e| format!("原子替換 config.toml 失敗：{e}"))?;
+    use sha2::Digest as _;
+    let expected_hash=hex::encode(sha2::Sha256::digest(content.as_bytes()));
+    duduclaw_gateway::commit_config_rendered(home,&expected_hash,|_|Ok(serialized))
+        .map_err(|e|format!("原子替換 config.toml 失敗：{e}"))?;
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 # 單次 MCP HTTP 操作的授權生命週期
 
-更新日期：2026-10-24。狀態：`duduclaw-llm` 的未發布開發者 API，使用 `mcp-client` feature。
+更新日期：2026-10-25。狀態：`duduclaw-llm` 的未發布開發者 API，使用 `mcp-client` feature。
 
-主機程式可以為 MCP 工具探索或單次工具呼叫提供新的 bearer 與該次操作持有的 lease。本文件說明共用傳輸 API；這項變更尚未接入 Gateway 或 Google 個人帳號流程，也沒有可供使用者切換的儀表板或設定開關。
+主機程式可以為 MCP 工具探索或單次工具呼叫提供新的 bearer 與該次操作持有的 lease。本文件說明共用傳輸 API；下述 bearer／lease API 保留為一般 Generic 路徑。未發布的 Google 個人掛載使用下節獨立 Closed 路徑，沒有新增儀表板開關。
 
 ## 主機 API 契約
 
@@ -33,6 +33,21 @@ Scoped 回應會把本次 bearer 從回傳 JSON 的 key 與 value 遮蔽，外�
 
 `RegistryClient::Persistent` 保留既有連線與 `before_call_async` 路徑；scoped 準備方法取代該 slot 的 before hook，不會重複授權。原本的 filter、同名工具先到者優先、`after_call`、來源證明／CCR 與主機提示仍走 registry 流程。
 
+## Google 主機的 Closed 接線（未發布原始碼草稿）
+
+主機明確使用 `RegistryClient::scoped_http_closed(recipe, host_binding, guard)`。真正的 slot 建立私有建構子的 `ClosedClientTarget`，綁定 server、recipe、filter、原設定項目與絕對期限。`prepare_closed_client_call` 必須回傳可消耗一次的 `OwnedScopedOperation`，預設拒絕。回傳型別錯誤或最終參數不同時拒絕，不改走 Generic bearer／lease API。
+
+Gateway 在移交中繼資料工作前取得真正發問者，固定原解析項目、原序號、完整 frame、操作 nonce 與原帳號選擇。三個 POST、JSON／SSE 解碼、文字拼接、已知 JSON 再解析、結果整理及最後 bearer／session 清理由憑證持有人完成，只交出型別化完成結果。Closed 請求及每個 POST 回覆各限 16 MiB，回覆不是整次累計限制；Closed 憑證更新與協定傳輸均停用環境 proxy、重新導向及重試。
+
+同一期限延續到 registry 與外層 loop 結果 hook、來源複核、CCR 準備及下一次模型請求前的交付。逾期內容、帳號告知與新 CCR 代碼一起扣留。`ToolOutcome` 新增 crate 私有的選用欄位：啟用 `mcp-client` 的外部 Rust struct literal 需改用建構子；原建構子預設沒有 Closed policy，Generic／Persistent 原簽名保留。
+
+同步金鑰圈與本機讀寫無法強制搶占，返回後與後續送出前重查期限。取消不撤回已開始的憑證更新、遠端效果或保存。CCR 沿用單次呼叫的中繼資料 tombstone 交易清理，已開始且有限的 SQLite 工作可能稍後完成。當機或清理失敗可能留下未公布資料列，直到既有到期清理；沒有新增持久逾時協調器，也不保證零保存。
+
+新增 M1 測試僅有來源，尚未編譯／執行。關閉 feature 的建置、獨立程式與安全審查、完整 CI、真供應商及使用者驗收均待完成；服務帳號委派、Bridge 與其他 W3 路徑另行處理。
+
+
+Closed 會暫存 provenance 與結果中繼資料，在同步 ledger／route 建構完成後重驗所有原期限。逾期項目會扣留，ledger 排除其 span 後重建，通過才提交。測試版本另須持有公司共用連線更新端點的 owned fixture；缺少時在解密與供應商送出前拒絕。Legacy 端點政策不變。
+
 ## 原始碼對照
 
 - [MCP client 與 registry](../../../crates/duduclaw-llm/src/mcp_client.rs)
@@ -40,3 +55,7 @@ Scoped 回應會把本次 bearer 從回傳 JSON 的 key 與 value 遮蔽，外�
 - [Scoped HTTP 測試情境](../../../crates/duduclaw-llm/src/mcp_client/scoped_http_tests.rs)
 
 [English](../mcp-call-lifetimes.md) · [日本語](../ja-JP/mcp-call-lifetimes.md)
+
+### W3 帳號來源
+
+未發布的 W3 來源把公司服務帳號與授權代表接入同一 Closed 操作契約，並為原 Google 帳號核准 wire 增加服務帳號／Apps Script 標籤及可選的 `home_source` 分型資料；舊 Personal／OAuth JSON 仍省略此欄。使用 Rust struct literal 建立 `GoogleAccountApproval` 的外部呼叫者必須補 `home_source`；這是 Rust 來源相容性變更，不能宣稱公開結構逐位元不變。沒有新增依賴、權杖 schema 或核准 gate。W3 測試全部尚未編譯／執行。

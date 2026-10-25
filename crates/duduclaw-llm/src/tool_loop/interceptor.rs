@@ -148,6 +148,17 @@ pub trait ToolInterceptor: Send + Sync {
         }
     }
 
+    /// Opt-in owned Closed operations. Ordinary hooks cannot authorize one.
+    #[cfg(feature = "mcp-client")]
+    async fn prepare_closed_client_call(
+        &self,
+        _target: crate::mcp_client::ClosedClientTarget<'_>,
+        _operation: ClientOperation<'_>,
+        _args: Value,
+    ) -> Result<Box<dyn crate::mcp_client::OwnedScopedOperation + Send + 'static>, String> {
+        Err("Closed MCP host authority unavailable".into())
+    }
+
     /// Called after a dispatched tool returned, with the parsed result so
     /// structured (JSON-path) rules can see keys rather than raw text.
     ///

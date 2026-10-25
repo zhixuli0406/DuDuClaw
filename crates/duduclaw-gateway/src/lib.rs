@@ -37,6 +37,16 @@ compile_error!(
     "the `live-test-mocks` feature is for isolated debug live tests only and must not be enabled in a release build"
 );
 
+/// Narrow local-operator final config commit. Existing caller authorization
+/// and policy are retained by the CLI; no receipt, source guard or secret is
+/// returned. The renderer runs under source -> config, never config -> source.
+pub fn commit_config_rendered(
+    home:&std::path::Path,expected_hash:&str,
+    render:impl FnOnce(&str)->Result<String,String>,
+)->Result<(),String> {
+    handlers::config_commit::commit_local_config_rendered(home,expected_hash,render)
+}
+
 pub mod a2a_signing;
 pub mod access_control;
 pub mod agent_binding;

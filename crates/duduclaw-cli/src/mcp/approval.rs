@@ -181,9 +181,35 @@ pub(crate) async fn run_approval(
     simulation: Option<Value>,
 ) -> InstallApprovalOutcome {
     run_approval_bound(
-        broker, agent_id, subject, summary, payload, ttl_seconds, poll, simulation, None,
+        broker,
+        agent_id,
+        subject,
+        summary,
+        payload,
+        ttl_seconds,
+        poll,
+        simulation,
+        None,
     )
     .await
+}
+
+/// A host-only annotation after exact private payload equality was checked.
+fn google_account_card(
+    account: &duduclaw_core::google_identity::GoogleAccountApproval,
+) -> std::result::Result<String, String> {
+    if !account.is_well_formed() {
+        return Err("Google 帳號核准的私有綁定無法確認。".into());
+    }
+    match account.selected_identity {
+        duduclaw_core::google_identity::ApprovedGoogleIdentity::Personal=>Ok(format!("選用個人 Google 帳號：{}\n連線擁有者：{}\n發問者：專用外部連線（未驗證真人身分）\n本次未核准改用公司帳號；個人連線失效時會停止並要求重新選擇。",account.selected_google_account,account.selected_person_login)),
+        duduclaw_core::google_identity::ApprovedGoogleIdentity::HomeOAuthFallback=>Ok("選用公司共用 Google OAuth 連線（Google 主體未驗證）\n原個人帳號目前不可用；本次明確核准公司共用連線。\n發問者：專用外部連線（未驗證真人身分）\n原個人或公司連線的授權改變時會停止，必須重新選擇並核准。".into()),
+        duduclaw_core::google_identity::ApprovedGoogleIdentity::HomeServiceAccountFallback=>{
+            let subject=match &account.home_source{Some(duduclaw_core::google_identity::GoogleHomeSourceApproval::ServiceAccount{declared_subject,..})=>declared_subject.as_deref().unwrap_or("未提供"),_=>return Err("Google 帳號核准的來源不相符。".into())};
+            Ok(format!("選用公司共用 Google 服務帳號連線\n宣告主體：{subject}（未另行驗證）\n原個人帳號目前不可用；本次明確核准此服務帳號來源。\n核准等待期間若憑證過期或來源改變，必須重新選擇並核准。"))
+        },
+        duduclaw_core::google_identity::ApprovedGoogleIdentity::HomeAppsScriptFallback=>Ok("選用公司 Apps Script 連線（Google 主體未驗證）\n原個人帳號目前不可用；本次明確核准此 Apps Script 來源。\n僅支援 Gmail、Calendar 與 Sheets 的指定操作；來源改變時必須重新選擇。".into()),
+    }
 }
 
 /// [`run_approval`] with an optional P7 [`ActionGrant`] binding: the request
@@ -194,6 +220,7 @@ pub(crate) async fn run_approval(
 /// [`ActionGrant`]: duduclaw_gateway::approval::action_grant::ActionGrant
 /// [`verify_and_consume`]: duduclaw_gateway::approval::action_grant::verify_and_consume
 #[allow(clippy::too_many_arguments)]
+
 pub(crate) async fn run_approval_bound(
     broker: &duduclaw_gateway::approval::ApprovalBroker,
     agent_id: &str,
@@ -215,6 +242,32 @@ pub(crate) async fn run_approval_bound(
     let summary = match grant {
         Some(g) => format!("{summary}\n\n{}", g.card_text()),
         None => summary.to_string(),
+    };
+    // Payload JSON is not authority. Only the private dispatcher scope may
+    // label a card with a selected Google credential owner/account.
+    let private_account = crate::mcp_auth::current_google_account_approval();
+    let account_json = payload.get(duduclaw_core::google_identity::GOOGLE_ACCOUNT_APPROVAL_KEY);
+    let summary = if let Some(account) = private_account {
+        if !matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some())
+            || !account.is_well_formed()
+            || account_json != serde_json::to_value(&account).ok().as_ref()
+        {
+            return InstallApprovalOutcome::Denied("Google 帳號核准的私有綁定無法確認。".into());
+        }
+        let card = match google_account_card(&account) {
+            Ok(card) => card,
+            Err(error) => return InstallApprovalOutcome::Denied(error),
+        };
+        format!("{summary}\n\n{card}")
+    } else {
+        if account_json.is_some()
+            && matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some())
+        {
+            return InstallApprovalOutcome::Denied(
+                "Google 帳號核准資料不能由工具參數提供。".into(),
+            );
+        }
+        summary
     };
     let summary = summary.as_str();
     let kind = subject.action_kind();
@@ -601,12 +654,13 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 payload.get("arguments").unwrap_or(&Value::Null),
             )
             .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask);
-            let grant = duduclaw_gateway::approval::action_grant::binding_applies(tool_name, ask_rule)
-                .then(|| {
-                    duduclaw_gateway::approval::action_grant::ActionGrant::build(
-                        agent_id, tool_name, &payload,
-                    )
-                });
+            let grant =
+                duduclaw_gateway::approval::action_grant::binding_applies(tool_name, ask_rule)
+                    .then(|| {
+                        duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                            agent_id, tool_name, &payload,
+                        )
+                    });
             let outcome = run_approval_bound(
                 &broker,
                 agent_id,
@@ -670,7 +724,10 @@ pub(crate) async fn run_action_review(
                 "action_review",
                 Value::String(action_review::audit_value(verdict).to_string()),
             ),
-            ("action_review_mode", Value::String(mode.as_str().to_string())),
+            (
+                "action_review_mode",
+                Value::String(mode.as_str().to_string()),
+            ),
         ],
     );
     match result {
@@ -1035,4 +1092,25 @@ pub(crate) async fn handle_capability_request(
             tool_error("等待授權決定時發生錯誤，已拒絕（fail-closed）。")
         }
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn google_account_payload_alone_never_mints_a_host_approval_annotation() {
+    let home = tempfile::tempdir().unwrap();
+    let broker = duduclaw_gateway::approval::ApprovalBroker::open(home.path()).unwrap();
+    let outcome=run_approval_bound(&broker,"unit-agent",ApprovalSubject::ToolCall("gmail_read"),"unit",serde_json::json!({"name":"gmail_read","arguments":{},"host_google_account":{"selected_google_account":"forged@unit.test"}}),30,std::time::Duration::from_millis(1),None,None).await;
+    assert!(matches!(outcome, InstallApprovalOutcome::Denied(_)));
+    assert!(broker.list_pending(None).await.unwrap().is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn home_account_card_never_invents_a_google_subject_or_personal_owner() {
+    let account: duduclaw_core::google_identity::GoogleAccountApproval=serde_json::from_value(serde_json::json!({"selected_identity":"home_oauth_fallback","selected_google_account":"","selected_credential_owner":"","selected_person_login":"","requester_kind":"unknown","configured_home_fallback":true,"home_fallback_authorized":true,"account_binding_digest":"a".repeat(64),"home_connection":{"credential_id":uuid::Uuid::new_v4().to_string(),"logical_epoch":1,"source_generation":uuid::Uuid::new_v4().to_string(),"original_selector":"owner","original_unavailable":"not_connected"}})).unwrap();
+    let card = google_account_card(&account).unwrap();
+    assert!(card.contains("未驗證"));
+    assert!(card.contains("公司共用"));
+    assert!(!card.contains("連線擁有者"));
+    assert!(!card.contains("選用個人"));
 }

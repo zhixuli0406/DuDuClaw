@@ -17,16 +17,11 @@ use duduclaw_knowledge::requester::RequesterIdentity;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{
-    Refusal, native_tools,
-    requester_gate::people_for,
-    resolve::{Resolved, resolve_person},
-};
+use super::Refusal;
 use crate::computer_use_sessions::auth::{RateLimiter, ReplayGuard, authenticate, check_peer};
-use crate::google_workspace::GoogleBackend;
 
-#[path = "execute_authority.rs"]
-mod authority;
+#[path = "account_selection.rs"]
+mod selection;
 
 pub const ROUTE: &str = "/api/internal/google-execute";
 pub const MAX_BODY: usize = 256 * 1024;
@@ -37,6 +32,7 @@ pub struct ExecuteState {
     users: Option<Arc<UserDb>>,
     replay: ReplayGuard,
     rate: RateLimiter,
+    selections: selection::SelectionStore,
 }
 impl ExecuteState {
     pub fn new(home: PathBuf, users: Option<Arc<UserDb>>) -> Self {
@@ -45,6 +41,7 @@ impl ExecuteState {
             users,
             replay: ReplayGuard::default(),
             rate: RateLimiter::default(),
+            selections: selection::SelectionStore::default(),
         }
     }
 }
@@ -55,11 +52,17 @@ struct ExecuteRequest {
     tool: String,
     arguments: Value,
     credential_ref: CredentialRef,
+    #[serde(default)]
+    selection_stamp: Option<String>,
 }
 
 pub fn router(state: Arc<ExecuteState>) -> Router {
     Router::new()
         .route(ROUTE, post(handle))
+        .route(
+            duduclaw_core::google_identity::GOOGLE_SELECTION_ROUTE,
+            post(selection::handle),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
@@ -154,7 +157,12 @@ async fn handle(
                 false,
                 error.code,
             );
-            refuse(StatusCode::FORBIDDEN, error.code, &error.message_zh)
+            let status = if error.code == "result_unconfirmed" {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            refuse(status, error.code, &error.message_zh)
         }
         Err(_) => {
             audit(
@@ -171,155 +179,49 @@ async fn handle(
     }
 }
 
-async fn credential_check(
-    state: &ExecuteState,
-    agent: &str,
-    request: &ExecuteRequest,
-) -> Result<(), Refusal> {
-    let (home, reference, agent, tool) = (
-        state.home.clone(),
-        request.credential_ref.clone(),
-        agent.to_string(),
-        request.tool.clone(),
-    );
-    tokio::task::spawn_blocking(move || {
-        super::credential_registry::authorize(&home, &reference, &agent, &tool)
-    })
-    .await
-    .map_err(|_| Refusal::hard("credential_refused", "Google 專用連線暫時無法查驗。"))?
-    .map_err(|message| Refusal::hard("credential_refused", message))
-}
-
 async fn serve(
     state: &ExecuteState,
     agent: &str,
     request: &ExecuteRequest,
 ) -> Result<Value, Refusal> {
-    credential_check(state, agent, request).await?;
-    if !crate::google_workspace::integration_enabled(&state.home) {
-        return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
-    }
-    // A dedicated API key proves the employee, never a person or system turn.
-    let requester = RequesterIdentity::Unknown;
-    let people = people_for(&state.home, state.users.as_ref());
-    let authority = authority::Authority::capture(state, agent).await?;
-    let outcome = resolve_person(&state.home, agent, &requester, people.as_ref()).await;
-    if let Ok(resolved) = &outcome {
-        authority.check_selected(resolved)?;
-    }
-    let (backend, account, fallback, notice) = match outcome {
-        Ok(Resolved::Delegated { email, token }) => (
-            GoogleBackend::Direct(token.access_token),
-            email,
-            false,
-            None,
-        ),
-        Ok(Resolved::UseHome { fallback, notice }) => {
-            let backend = crate::google_workspace::resolve_backend(&state.home)
-                .await
-                .map_err(|_| {
-                    Refusal::hard("account_unavailable", "公司共用 Google 帳號暫時無法使用。")
-                })?;
-            (backend, String::new(), fallback, notice)
-        }
-        Ok(Resolved::Personal { .. }) => {
-            return Err(Refusal::hard(
-                "personal_external_unsupported",
-                "這條專用外部連線尚未支援個人 Google 帳號。",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    // Minting/refresh may await a provider; revocation during that wait must
-    // stop the effect instead of relying on the pre-mint metadata check.
-    let backend = authority
-        .validate(state, agent, request, fallback, backend)
-        .await?;
-    let access = HostAccess(backend);
-    let mut result = if request.tool == "google_status" {
-        let message = if account.is_empty() {
-            "目前使用公司共用 Google 帳號。".to_string()
-        } else {
-            format!("目前代表 {account} 使用 Google；連線可用。")
-        };
-        json!({"content":[{"type":"text","text":message}]})
-    } else {
-        crate::google_workspace::with_dedicated_write_policy(dispatch_native(
-            &state.home,
+    if let Some(id) = request.selection_stamp.as_deref() {
+        // Synchronous one-shot consumption precedes every credential/resolve
+        // await. Even a later failure never puts the private entry back.
+        let pending = selection::claim_selection(
+            state,
+            agent,
+            &request.credential_ref,
             &request.tool,
+            id,
             &request.arguments,
-            &access,
-        ))
-        .await
-    };
-    if let Some(notice) = notice
-        && let Some(content) = result.get_mut("content").and_then(Value::as_array_mut)
-    {
-        content.insert(0, json!({"type":"text","text":notice}));
-    }
-    let success = result.get("isError").and_then(Value::as_bool) != Some(true);
-    if serde_json::to_vec(&json!({"ok":true,"result":&result}))
-        .map_or(true, |bytes| bytes.len() > MAX_RESPONSE)
-    {
-        return Err(Refusal::hard("result_unconfirmed", UNCERTAIN));
-    }
-    audit(
-        &state.home,
-        agent,
-        &request.tool,
-        &account,
-        success,
-        fallback,
-        "",
-    );
-    Ok(result)
-}
-
-struct HostAccess(GoogleBackend);
-#[async_trait::async_trait]
-impl native_tools::NativeGoogleAccess for HostAccess {
-    async fn backend(&self, _: &Path, _: &str) -> Result<GoogleBackend, String> {
-        Ok(match &self.0 {
-            GoogleBackend::Direct(token) => GoogleBackend::Direct(token.clone()),
-            GoogleBackend::AppsScript(config) => GoogleBackend::AppsScript(config.clone()),
-        })
-    }
-    async fn token(&self, _: &Path, _: &str) -> Result<String, String> {
-        match &self.0 {
-            GoogleBackend::Direct(token) => Ok(token.clone()),
-            // No credential acquisition may run after the final authority
-            // check. Direct acquisition already ran before selecting a bridge.
-            GoogleBackend::AppsScript(_) => Err("這個工具需要有效的 Google 直接連線。".into()),
+            crate::google_identity::effect_authority::Clock::now(),
+        )?;
+        if pending.is_metadata_status() {
+            return pending.metadata_status();
         }
+        return pending.execute_native(request.arguments.clone()).await;
     }
+    if matches!(
+        duduclaw_core::google_identity::effective_for(&state.home, Some(agent)).effective,
+        duduclaw_core::google_identity::Effective::Personal { .. }
+    ) {
+        return Err(Refusal::hard(
+            "personal_external_unsupported",
+            "個人 Google 專用連線需要本次已核准的帳號選擇，這次沒有執行操作。",
+        ));
+    }
+    crate::google_identity::effect_authority::execute_immediate_native(
+        &state.home,
+        state.users.as_ref(),
+        agent,
+        &request.credential_ref,
+        &request.tool,
+        request.arguments.clone(),
+    )
+    .await
 }
 
-async fn dispatch_native(home: &Path, tool: &str, args: &Value, access: &HostAccess) -> Value {
-    use native_tools::*;
-    match tool {
-        "gmail_search" => handle_gmail_search(args, home, access).await,
-        "gmail_read" => handle_gmail_read(args, home, access).await,
-        "gmail_create_draft" => handle_gmail_create_draft(args, home, access).await,
-        "calendar_list_events" => handle_calendar_list_events(args, home, access).await,
-        "calendar_create_event" => handle_calendar_create_event(args, home, access).await,
-        "sheets_read" => handle_sheets_read(args, home, access).await,
-        "sheets_append" => handle_sheets_append(args, home, access).await,
-        "forms_get" => handle_forms_get(args, home, access).await,
-        "forms_list_responses" => handle_forms_list_responses(args, home, access).await,
-        "gtasks_lists" => handle_gtasks_lists(home, access).await,
-        "gtasks_list" => handle_gtasks_list(args, home, access).await,
-        "gtasks_create" => handle_gtasks_create(args, home, access).await,
-        "gtasks_complete" => handle_gtasks_complete(args, home, access).await,
-        "drive_search" => handle_drive_search(args, home, access).await,
-        "drive_read" => handle_drive_read(args, home, access).await,
-        "docs_read" => handle_docs_read(args, home, access).await,
-        "docs_append" => handle_docs_append(args, home, access).await,
-        "slides_read" => handle_slides_read(args, home, access).await,
-        _ => json!({"content":[{"type":"text","text":"Google 工具不存在。"}],"isError":true}),
-    }
-}
-
-fn audit(
+pub(super) fn audit(
     home: &Path,
     agent: &str,
     tool: &str,

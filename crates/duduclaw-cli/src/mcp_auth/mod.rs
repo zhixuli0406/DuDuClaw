@@ -41,7 +41,8 @@ use subtle::ConstantTimeEq;
 
 mod accepted_google;
 pub(crate) use accepted_google::{
-    AcceptedGoogleCall, accept_google_lane, current_accepted_google_call, with_accepted_google_call,
+    AcceptedGoogleCall, accept_google_lane, current_accepted_google_call,
+    current_google_account_approval, with_accepted_google_call, with_google_account_approval,
 };
 
 #[derive(Debug, Clone)]

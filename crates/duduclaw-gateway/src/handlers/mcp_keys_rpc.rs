@@ -125,7 +125,10 @@ impl MethodHandler {
         let created_at = Utc::now().to_rfc3339();
 
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         let mcp_keys = table
             .entry("mcp_keys")
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
@@ -150,7 +153,7 @@ impl MethodHandler {
         );
         mcp_keys.insert(key.clone(), toml::Value::Table(entry));
 
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }
         info!(
@@ -181,7 +184,10 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", "Missing 'key' parameter"),
         };
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        let (mut table, config_snapshot) = match self.read_toml_write_snapshot(&config_path).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         let removed = match table.get_mut("mcp_keys").and_then(|v| v.as_table_mut()) {
             Some(keys) => keys.remove(&key).is_some(),
             None => false,
@@ -189,7 +195,7 @@ impl MethodHandler {
         if !removed {
             return WsFrame::error_response("", "Key not found");
         }
-        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+        if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }
         info!("mcp_keys.revoke completed");

@@ -175,6 +175,15 @@ fn redaction_scopes_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Private-call binding only; the ordinary evaluator still reads its caller
+/// scopes at the existing egress boundary. No values are restored here.
+pub(crate) fn redaction_scopes_snapshot() -> Vec<String> {
+    let mut scopes = redaction_scopes_from_env();
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
 /// Egress decision for a tool call whose arguments may carry `<REDACT:...>`
 /// tokens — the pure form that takes an explicit `(manager, agent_id,
 /// session_id)` instead of reading them off a [`McpRedactionLayer`].

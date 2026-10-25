@@ -114,23 +114,15 @@ pub async fn safe_revoke_with_lease(
                 .all(|r| r.auth != crate::remote_mcp::store::AuthKind::Oauth) => {}
         _ => return revoke_result(home, account, "remote_oauth_account_unknown", false),
     }
-    let token_file = home.join(crate::mcp_oauth::TOKEN_FILE);
-    let has_home_oauth = match std::fs::read(&token_file) {
-        Ok(bytes) => match serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
-            Ok(tokens) => {
-                if tokens
-                    .iter()
-                    .any(|t| t.get("provider_id").and_then(|v| v.as_str()) != Some("google"))
-                {
-                    return revoke_result(home, account, "other_home_oauth_account_unknown", false);
-                }
-                tokens
-                    .iter()
-                    .any(|t| t.get("provider_id").and_then(|v| v.as_str()) == Some("google"))
-            }
-            Err(_) => return revoke_result(home, account, "home_store_unreadable", false),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+    // H1 keeps private control/tombstone/start rows in the shared token file.
+    // Only its typed, publication-gated read can distinguish those rows from
+    // an existing Home grant; a hidden public token is not proof of absence.
+    let has_home_oauth = match crate::mcp_oauth::home_presence_for_personal_revoke(home, lease) {
+        Ok(crate::mcp_oauth::HomeRevokePresence::NoCredential) => false,
+        Ok(crate::mcp_oauth::HomeRevokePresence::GoogleCredential) => true,
+        Ok(crate::mcp_oauth::HomeRevokePresence::OtherProvider) => {
+            return revoke_result(home, account, "other_home_oauth_account_unknown", false);
+        }
         Err(_) => return revoke_result(home, account, "home_store_unreadable", false),
     };
     if has_home_oauth {

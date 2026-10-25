@@ -80,6 +80,7 @@ fn claims_of(assertion: &str) -> Value {
 }
 
 async fn token_endpoint(
+    headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -118,11 +119,44 @@ async fn token_endpoint(
             .into_response();
     }
     axum::Json(
-        json!({"access_token": format!("tok:{sub}"), "expires_in": 3600, "token_type": "Bearer"}),
+        json!({"access_token":if headers.get("x-duduclaw-w3-owned-issuer").is_some(){closed_fixture_token(&sub)}else{format!("tok:{sub}")}, "expires_in": 3600, "token_type": "Bearer"}),
     )
     .into_response()
 }
 
+fn closed_fixture_token(subject: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "w3.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(subject.as_bytes())
+    )
+}
+fn fixture_account(headers: &axum::http::HeaderMap) -> String {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if let Some(value) = token.strip_prefix("w3.") {
+        use base64::Engine as _;
+        return base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .ok()
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_default();
+    }
+    token.strip_prefix("tok:").unwrap_or("").to_owned()
+}
+async fn closed_refresh_endpoint(
+    axum::Form(form): axum::Form<HashMap<String, String>>,
+) -> axum::response::Response {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-duduclaw-w3-owned-issuer",
+        axum::http::HeaderValue::from_static("1"),
+    );
+    token_endpoint(headers, axum::Form(form)).await
+}
 async fn gmail_profile(headers: axum::http::HeaderMap) -> axum::Json<Value> {
     let bearer = headers
         .get("authorization")
@@ -152,12 +186,7 @@ async fn service_endpoint(
     uri: axum::http::Uri,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let account = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer tok:"))
-        .unwrap_or("")
-        .to_string();
+    let account = fixture_account(&headers);
     service_reads()
         .lock()
         .unwrap()
@@ -230,6 +259,7 @@ fn mock() -> &'static str {
             rt.block_on(async move {
                 let app = axum::Router::new()
                     .route("/token", axum::routing::post(token_endpoint))
+                    .route("/w3-refresh", axum::routing::post(closed_refresh_endpoint))
                     .route(
                         "/gmail.googleapis.com/gmail/v1/users/me/profile",
                         axum::routing::get(gmail_profile),
@@ -248,7 +278,7 @@ fn mock() -> &'static str {
 }
 
 /// A throwaway RSA key (generated once; never a real credential).
-fn key_json(token_uri: &str) -> String {
+pub(in crate::google_identity) fn key_json(token_uri: &str) -> String {
     static PEM: OnceLock<String> = OnceLock::new();
     let pem = PEM.get_or_init(|| {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
@@ -270,6 +300,13 @@ fn key_json(token_uri: &str) -> String {
 struct Home {
     _dir: tempfile::TempDir,
     path: PathBuf,
+    w3: Mutex<
+        Option<(
+            crate::google_workspace::native_call::testing::Guard,
+            crate::google_identity::effect_authority::variants::testing::Guard,
+            crate::google_identity::home_source::W3RefreshEndpointGuard,
+        )>,
+    >,
 }
 
 impl Home {
@@ -277,7 +314,11 @@ impl Home {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().canonicalize().unwrap();
         duduclaw_core::gateway_instance::acquire(&path).unwrap();
-        Self { _dir: dir, path }
+        Self {
+            _dir: dir,
+            path,
+            w3: Mutex::new(None),
+        }
     }
     fn p(&self) -> &Path {
         &self.path
@@ -317,6 +358,24 @@ impl Home {
             agent,
             &format!("[google]\nidentity='delegate:{email}'\n{extra}"),
         );
+        if self.w3.lock().unwrap().is_none() {
+            let native = crate::google_workspace::native_call::testing::install(
+                self.p(),
+                &format!("{}/", mock()),
+            );
+            let issuer =
+                crate::google_identity::effect_authority::variants::testing::install_issuer(
+                    self.p(),
+                    &format!("{}/token", mock()),
+                    &format!("{}/token", mock()),
+                );
+            let refresh =
+                crate::google_identity::home_source::W3RefreshEndpointGuard::owned_loopback(
+                    self.p(),
+                    &format!("{}/w3-refresh", mock()),
+                );
+            *self.w3.lock().unwrap() = Some((native, issuer, refresh));
+        }
     }
 }
 

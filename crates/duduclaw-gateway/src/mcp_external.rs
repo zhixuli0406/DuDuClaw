@@ -129,6 +129,9 @@ pub struct ExternalMcpServer {
     pub filter: ToolFilter,
     /// Host-only live authority; never parsed from server output or config.
     pub(crate) google_guard: Option<crate::google_identity::mcp_mount::GoogleMountGuard>,
+    pub(crate) google_closed:
+        Option<std::sync::Arc<crate::google_identity::mcp_mount::GoogleClosedMount>>,
+    pub(crate) source_ordinal: usize,
 }
 
 impl ExternalMcpServer {
@@ -295,7 +298,67 @@ pub async fn load_external_mcp_servers_resolved(
     agent_dir: &Path,
     home_dir: &Path,
 ) -> Vec<ExternalMcpServer> {
-    let mut servers = load_external_mcp_servers(agent_dir);
+    let agent = agent_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let personal = matches!(
+        duduclaw_core::google_identity::effective_for(home_dir, Some(agent)).effective,
+        duduclaw_core::google_identity::Effective::Personal { .. }
+            | duduclaw_core::google_identity::Effective::Home
+            | duduclaw_core::google_identity::Effective::Delegate { .. }
+    );
+    // Parse the same bounded bytes whose stamp is bound to the entry. A
+    // second independent config read cannot stand in for those bytes.
+    let original_snapshot = if personal {
+        mount_snapshot(&agent_dir.join("agent.toml"))
+    } else {
+        None
+    };
+    let mut servers = if personal {
+        let Some((_, bytes)) = &original_snapshot else {
+            return Vec::new();
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Vec::new();
+        };
+        parse_external_servers(&duduclaw_core::agent_toml::parse(text))
+    } else {
+        load_external_mcp_servers(agent_dir)
+    };
+    if personal {
+        let mut closed_ordinals = std::collections::HashSet::new();
+        servers.retain_mut(|server| {
+            if server.bearer_token.as_deref() != Some(OAUTH_GOOGLE_REF) {
+                return true;
+            }
+            if server.url.is_none() {
+                return false;
+            }
+            closed_ordinals.insert(server.source_ordinal);
+            // No Google token is acquired or cloned during admission.
+            server.bearer_token = None;
+            true
+        });
+        let servers = resolve_secret_refs_for(servers, home_dir, false).await;
+        return servers
+            .into_iter()
+            .filter_map(|mut server| {
+                if closed_ordinals.contains(&server.source_ordinal) {
+                    let entry = ExternalGoogleMountEntry::capture(
+                        home_dir,
+                        agent_dir,
+                        &server,
+                        &original_snapshot.as_ref()?.0,
+                    )?;
+                    let mount =
+                        crate::google_identity::mcp_mount::GoogleClosedMount::from_host_entry(
+                            entry,
+                        )
+                        .ok()?;
+                    server.google_closed = Some(std::sync::Arc::new(mount));
+                }
+                Some(server)
+            })
+            .collect();
+    }
     let has_google = servers
         .iter()
         .any(|s| s.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF));
@@ -400,7 +463,7 @@ fn tool_list_field(field: &Tri<Vec<String>>, key: &str, server: &str) -> Result<
 /// filter skip) is unchanged — only the field access is now typed.
 pub fn parse_external_servers(sections: &AgentTomlSections) -> Vec<ExternalMcpServer> {
     let mut out = Vec::new();
-    for entry in &sections.mcp.external {
+    for (source_ordinal, entry) in sections.mcp.external.iter().enumerate() {
         // Missing / wrong-typed ⇒ enabled (this is an opt-OUT flag).
         let enabled = entry.enabled.unwrap_or(true);
         if !enabled {
@@ -549,6 +612,8 @@ pub fn parse_external_servers(sections: &AgentTomlSections) -> Vec<ExternalMcpSe
             headers,
             filter,
             google_guard: None,
+            google_closed: None,
+            source_ordinal,
         });
     }
     out
@@ -1041,5 +1106,156 @@ env = { TOKEN = "secret://local/definitely-absent-secret" }
         assert_eq!(servers.len(), 1, "parse keeps secret:// verbatim");
         let out = resolve_secret_refs(servers, Path::new("/nonexistent-home")).await;
         assert!(out.is_empty(), "unresolvable secret ⇒ server dropped");
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MountStamp {
+    digest: String,
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+fn mount_stamp(path: &Path) -> Option<MountStamp> {
+    mount_snapshot(path).map(|(stamp, _)| stamp)
+}
+fn mount_snapshot(path: &Path) -> Option<(MountStamp, Vec<u8>)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file() || before.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    fn stamp(meta: &std::fs::Metadata, bytes: &[u8]) -> Option<MountStamp> {
+        use sha2::Digest;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(MountStamp {
+            digest: format!("{:x}", sha2::Sha256::digest(bytes)),
+            length: meta.len(),
+            modified: meta.modified().ok()?,
+            #[cfg(unix)]
+            device: meta.dev(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+        })
+    }
+    let selected = stamp(&before, &bytes)?;
+    if selected != stamp(&file.metadata().ok()?, &bytes)?
+        || selected != stamp(&std::fs::metadata(path).ok()?, &bytes)?
+    {
+        return None;
+    }
+    Some((selected, bytes))
+}
+/// Only this actual parser/admission module constructs this non-wire value.
+pub(crate) struct ExternalGoogleMountEntry {
+    home: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    agent: String,
+    server: String,
+    ordinal: usize,
+    stamp: MountStamp,
+    filter: ToolFilter,
+    effective: duduclaw_core::google_identity::EffectiveIdentity,
+    url: String,
+    headers: Vec<(String, String)>,
+    recipe: duduclaw_llm::ScopedHttpRecipe,
+}
+impl ExternalGoogleMountEntry {
+    fn capture(
+        home: &Path,
+        dir: &Path,
+        server: &ExternalMcpServer,
+        original: &MountStamp,
+    ) -> Option<Self> {
+        let home = home.canonicalize().ok()?;
+        let agents = home.join("agents").canonicalize().ok()?;
+        let dir = dir.canonicalize().ok()?;
+        let agent = dir.file_name()?.to_str()?.to_owned();
+        if dir.parent() != Some(agents.as_path())
+            || !duduclaw_core::is_valid_agent_id(&agent)
+            || mount_stamp(&dir.join("agent.toml")).as_ref() != Some(original)
+        {
+            return None;
+        }
+        let effective = duduclaw_core::google_identity::effective_for(&home, Some(&agent));
+        if !matches!(
+            &effective.effective,
+            duduclaw_core::google_identity::Effective::Personal { .. }
+                | duduclaw_core::google_identity::Effective::Home
+                | duduclaw_core::google_identity::Effective::Delegate { .. }
+        ) {
+            return None;
+        }
+        let url = server.url.clone()?;
+        let recipe = duduclaw_llm::ScopedHttpRecipe::new(
+            url.clone(),
+            server.headers.clone(),
+            duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+        )
+        .ok()?;
+        Some(Self {
+            home,
+            dir,
+            agent,
+            server: server.name.clone(),
+            ordinal: server.source_ordinal,
+            stamp: original.clone(),
+            filter: server.filter.clone(),
+            effective,
+            url,
+            headers: server.headers.clone(),
+            recipe,
+        })
+    }
+    pub(crate) fn validate(&self) -> bool {
+        self.home.canonicalize().ok().as_ref() == Some(&self.home)
+            && self.dir.canonicalize().ok().as_ref() == Some(&self.dir)
+            && self.home.join("agents").canonicalize().ok().as_deref() == self.dir.parent()
+            && mount_stamp(&self.dir.join("agent.toml")).as_ref() == Some(&self.stamp)
+            && duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent))
+                == self.effective
+    }
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+    pub(crate) fn agent(&self) -> &str {
+        &self.agent
+    }
+    pub(crate) fn server(&self) -> &str {
+        &self.server
+    }
+    pub(crate) fn filter(&self) -> &ToolFilter {
+        &self.filter
+    }
+    pub(crate) fn recipe(&self) -> &duduclaw_llm::ScopedHttpRecipe {
+        &self.recipe
+    }
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+    pub(crate) fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+    pub(crate) fn binding(&self) -> String {
+        format!(
+            "{}:{}:{}:{:?}",
+            self.stamp.digest, self.ordinal, self.agent, self.effective
+        )
     }
 }

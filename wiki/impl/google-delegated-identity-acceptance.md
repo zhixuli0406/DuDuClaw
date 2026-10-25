@@ -107,3 +107,64 @@ The earlier full local command returned failure only in the existing core
 gateway-instance lock reacquisition test. Its gateway and CLI suites passed;
 30 focused reruns and a separate full core rerun passed. These separate runs
 do not change the original command's failure result.
+
+## 2026-10-25 follow-up: integrated M1/W3 and requester-policy validation
+
+This section adds the latest focused result; every earlier failure, baseline,
+remaining-gate statement and native-probe outcome above remains a historical
+record. In particular, the three earlier failed focused attempts remain failed.
+Their three fixture-precondition corrections were independently reviewed; a
+new execution passed without dropping the original success assertions.
+
+The integrated source is `4e37c1f30b6b3e93b5e2e8d1e694301f3ff71db5`
+(tree `f0237f928f0dd9ccce31e82cb6a53393317ccf94`). It includes multiple
+unmerged changes, so these results must not be attributed to an isolated PR
+head. Code/security review and the independent actual-execution review passed.
+
+| Focused local gate | Result |
+| --- | --- |
+| Four libtest binary builds | Four natural exit0 results; 486.4104803330265 seconds |
+| Runtime | 22 commands, 107 unique tests; natural exit0 for every command |
+| Test outcome | 107 passed, 0 failed, 0 ignored, 0 measured; 143.9706507079536 seconds |
+| Coverage groups | M1/CLI 43; W3 58; requester-policy regressions 6 |
+| Binary totals | Gateway 91; core 2; CLI 0; LLM 14 |
+
+This is `PASS_FOCUSED107_ONLY`, not a complete workspace suite or a shipping
+CLI stdio acceptance result. PR CI applies to each PR's own latest head;
+local integrated evidence cannot replace it. Earlier D1/native evidence
+retains its own source and scope.
+
+### Requester policy and Bridge boundary
+
+A non-Admin direct Owner disabling Google retains the prior `requesters`
+restriction or a valid narrower value; explicit widening remains refused.
+Disabling sets company fallback to `none`. Re-enabling the caller's own
+`user:<your-user-id>` account, or `owner` only when the resolved primary
+Owner is the caller, keeps that requester policy and still requires the
+holder's sharing confirmation. Admin `none`/`home` policy clearing, generic update narrowing,
+live ACL, CAS and consent checks retain their existing contracts.
+
+The native `attendees` contract is a comma-separated string. Bridge refuses
+a nonempty `cc`, nonempty attendees parsed from CSV, or `with_meet=true`
+before I/O. Empty `cc` or attendees and `with_meet=false` do not request
+those unsupported features and can proceed as ordinary requests. This does
+not close all argument-validation gaps: an array
+passed as `attendees` is still ignored by the existing `as_str()` parsing
+path. The focused PASS must not be read as rejection of every malformed or
+unknown argument.
+
+### Gates still requiring separate evidence
+
+Real Google/Workspace Console configuration and provider compatibility,
+acceptance of a token by an official remote MCP endpoint, actual Keychain
+behavior, physical Windows operation, shipping CLI stdio, paid-license and
+browser user acceptance remain unverified by this run. Keychain/external
+secret rotation without a revision feed retains its per-operation snapshot
+limitation; synchronous OS calls and check-to-send races remain as documented.
+No release, deployment, CI approval or user acceptance is inferred.
+
+See the [personal-connection guide](../../docs/guides/google-personal-connections.md)
+and the source regressions in
+`crates/duduclaw-gateway/src/handlers/tests/google_identity_rpc_tests.rs`,
+`crates/duduclaw-gateway/src/google_personal/owner_change.rs` and
+`crates/duduclaw-gateway/src/google_identity/home_source/`.
