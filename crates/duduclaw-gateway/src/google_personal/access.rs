@@ -152,16 +152,17 @@ pub(super) fn check_metadata_authority(
     Ok(())
 }
 
-fn refresh_lock(home: &Path, user: &str) -> Arc<tokio::sync::Mutex<()>> {
+fn refresh_lock(home: &Path, user: &str) -> Result<Arc<tokio::sync::Mutex<()>>, Refusal> {
+    let home = std::fs::canonicalize(home).map_err(store_error)?;
     type Key = (PathBuf, String);
     static LOCKS: OnceLock<Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    LOCKS
+    Ok(LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .entry((home.to_path_buf(), user.into()))
+        .entry((home, user.into()))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+        .clone())
 }
 
 pub async fn resolve(
@@ -219,7 +220,7 @@ pub async fn resolve(
     vault::sync_user_status(home, &user.id, true).map_err(store_error)?;
     let selected =
         super::authority::PersonalSelection::capture(home, agent, requester, people, tool)?;
-    let lock = refresh_lock(home, &user.id);
+    let lock = refresh_lock(home, &user.id)?;
     let _guard = lock.lock().await;
     check_person(home, db, agent, &user)?;
     vault::sync_user_status(home, &user.id, true).map_err(store_error)?;
@@ -504,7 +505,7 @@ async fn resolve_pinned_core(
         .map_err(store_error)?
         .ok_or_else(pinned_changed)?;
     check_person_metadata(db, agent, &user)?;
-    let lock = refresh_lock(home, user_id);
+    let lock = refresh_lock(home, user_id)?;
     let guard = read_mode.wait(lock.lock()).await?;
     read_mode.check()?;
     validate_pinned_selection(home, agent, requester, people, selected, purpose_key)?;
@@ -715,7 +716,16 @@ pub(crate) mod pinned_test {
             .after_publish = Some(callback);
     }
     pub(crate) async fn hold_refresh(home: &Path, user: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        refresh_lock(home, user).lock_owned().await
+        refresh_lock(home, user)
+            .expect("owned fixture home must resolve")
+            .lock_owned()
+            .await
+    }
+    pub(crate) fn refresh_mutex(
+        home: &Path,
+        user: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, Refusal> {
+        refresh_lock(home, user)
     }
     pub(crate) fn set_before_publish(home: &Path, callback: Box<dyn FnOnce() + Send>) {
         probes()

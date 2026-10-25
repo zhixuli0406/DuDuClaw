@@ -748,6 +748,79 @@ async fn cancelled_refresh_mutex_wait_never_unseals_and_the_next_call_can_procee
         .unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn refresh_mutex_home_aliases_wait_cancel_and_release_in_both_directions() {
+    for alias_holds in [true, false] {
+        let f = Fixture::gmail(4_000_000_000);
+        let aliases = tempfile::tempdir().unwrap();
+        let alias = aliases.path().join("home-alias");
+        let canonical = f.home.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+        assert_ne!(alias, canonical);
+        let (held_home, waiting_home) = if alias_holds {
+            (alias.as_path(), canonical.as_path())
+        } else {
+            (canonical.as_path(), alias.as_path())
+        };
+        let blocked = access::pinned_test::hold_refresh(held_home, &f.user).await;
+        let people = UserDbPeople(f.db.clone());
+        let selected = f.selected("gmail_read");
+        let requester = RequesterIdentity::Unknown;
+        let mut waiting = Box::pin(access::resolve_pinned(
+            waiting_home,
+            "bot",
+            &requester,
+            &people,
+            &selected,
+            "gmail_read",
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert!(access::pinned_test::events(f.home.path()).is_empty());
+        drop(waiting);
+        drop(blocked);
+        let material = access::resolve_pinned(
+            waiting_home,
+            "bot",
+            &requester,
+            &people,
+            &selected,
+            "gmail_read",
+        )
+        .await
+        .unwrap();
+        assert!(material.fixture_token_matches("fixture-original-never-output"));
+        assert_eq!(
+            access::pinned_test::events(f.home.path()),
+            ["protection", "unseal", "resolve_locks_released"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_mutex_separates_homes_and_users_and_refuses_missing_home() {
+    let f = Fixture::gmail(4_000_000_000);
+    let other_home = tempfile::tempdir().unwrap();
+    let blocked = access::pinned_test::hold_refresh(f.home.path(), &f.user).await;
+    let other_home_lock = access::pinned_test::refresh_mutex(other_home.path(), &f.user).unwrap();
+    let other_user_lock =
+        access::pinned_test::refresh_mutex(f.home.path(), "other-fixture-user").unwrap();
+    let _other_home_guard = other_home_lock.try_lock().unwrap();
+    let _other_user_guard = other_user_lock.try_lock().unwrap();
+    let missing = other_home.path().join("missing").join("home");
+    let error = access::pinned_test::refresh_mutex(&missing, &f.user)
+        .err()
+        .expect("missing home must fail closed");
+    assert_eq!(error.code, "config_invalid");
+    assert!(!other_home.path().join("missing").exists());
+    assert!(access::pinned_test::events(f.home.path()).is_empty());
+    drop(blocked);
+}
+
 #[tokio::test]
 async fn late_refresh_cas_loss_returns_no_material_and_does_not_retry_or_overwrite() {
     let f = Fixture::gmail(1);
