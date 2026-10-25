@@ -290,6 +290,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/README.md](docs/README.md):公開文件索引(架構 / RFC / ADR / 規格 / 指南)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):生產部署(Tailscale / Docker / systemd / 自動更新 / 監控)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開發環境與 agent 開發
+- [MCP 操作授權生命週期](docs/guides/zh-TW/mcp-call-lifetimes.md)：未發布的主機 API 參考，說明每次 HTTP 操作的授權範圍
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):自訂 MCP 工具教學
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md 與 CONTRACT.toml 格式規範
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);[52-desktop-edition.md](docs/features/52-desktop-edition.md):桌面版,人機共用一台機器;硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md);app 相容層、映像建置與發布都在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo(相容層說明見該 repo 的 `docs/guides/app-compat.md`)
