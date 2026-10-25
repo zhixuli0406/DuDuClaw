@@ -27,17 +27,23 @@ permission either.
 
 ## Separate local checks
 
-- Gateway focused: 13 watch-link cases, five host-context cases, one recorded
-  run join, one notification-preview case, and four future-size cases passed
-  in separate exit-0 invocations. Earlier primitive/login cases are retained
-  separately and are not added into a new all-suite total.
+- On the clean post-#209 integration, gateway focused checks passed in separate
+  exit-0 invocations: 13 watch-link cases, five host-context cases, one
+  recorded-run join, one notification-preview case, and two future-size tests
+  covering four constructed futures. The gateway libtest was rebuilt from the
+  integration source before these tests ran.
 - CLI production and test type-check passed before the main #201 merge.
-- Latest frontend focus after the Team header integration: nine files,
-  61 tests passed; TypeScript and Vite production build exited 0.
+- Current frontend focus: five files and 39 tests passed. The full frontend
+  suite passed 372 files and 3,070 tests; TypeScript and Vite production build
+  both exited 0.
 - The four main #201 manual documentation/catalogue resolutions retain both
   complete sources and were independently approved; owned Watch source
-  remained unchanged except adjacent module/API additions. The full gateway
-  suite and CLI check on merge `f221d178` are running, not yet claimed passed.
+  remained unchanged except adjacent module/API additions. Independent code
+  and security reviews of the clean integration found no blocking finding.
+- `git diff --check` passed. A repository-wide `cargo fmt --all -- --check`
+  with the local formatter still reports broad pre-existing main-tree format
+  drift; it is retained as a failed advisory check and is not represented as a
+  branch-local regression or a passing release gate.
 
 ## Actual browser/native run
 
@@ -73,7 +79,27 @@ Evidence is retained under the owned temporary directories
 phase logs, result receipts and UI screenshots. R4 predates the main #201
 merge; its bounded claim is not a native rerun of every later integration.
 
+A current-main integration run then exercised source snapshot `358d01de` after
+#209 had merged. Its freshly linked libtest binary SHA-256 was
+`599fbf79d7b8d4a66a42f5fc3d72ae0146265bc6eba43f62ba7f823fd0a55f87`;
+the fixed local image was
+`sha256:50869233d29cbf14bd74c7c414310db24b2fbb453bf2d642e28421bf851545af`.
+The isolated fixture at `dudu-team-native-LpwQCz` exited 0 after 276.75
+seconds, the ignored native test passed, cleanup returned `Ok(())`, and the
+existing production LWM fingerprint remained running and healthy.
+
+That run passed baseline 11, watch-context six, policy-off four, restore four,
+session-fence seven and finish six API checks. Actual Chrome against the same
+gateway and the current Vite production build verified the exact `?l=` login
+return, masked snapshot, cancel-without-stop, 390 px body and scroll widths,
+expired and policy-revoked no-image/no-stop states, and refusal to follow a
+replacement session even after direct access was granted. An initial browser
+navigation used the obsolete `context` query name and correctly followed the
+ordinary-login route; it was a harness input error, was not counted as a pass,
+and the clean-origin `?l=` rerun supplied the acceptance evidence.
+
 The notification delivery claim comes from production-path unit checks.
 This fixture did not exercise an actual inbound model/channel delivery,
 provider login, physical owner presence, native Linux/Windows, or user
-acceptance. No image or release was published.
+acceptance. PR CI, merge and release remain separate gates. No image or
+release was published.
