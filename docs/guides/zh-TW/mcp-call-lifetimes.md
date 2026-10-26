@@ -1,8 +1,8 @@
 # 單次 MCP HTTP 操作的授權生命週期
 
-更新日期：2026-10-25。狀態：`duduclaw-llm` 的未發布開發者 API，使用 `mcp-client` feature。
+更新日期：2026-10-26。狀態：`duduclaw-llm` 納入 v1.76.0 的開發者 API，使用 `mcp-client` feature。
 
-主機程式可以為 MCP 工具探索或單次工具呼叫提供新的 bearer 與該次操作持有的 lease。本文件說明共用傳輸 API；下述 bearer／lease API 保留為一般 Generic 路徑。未發布的 Google 個人掛載使用下節獨立 Closed 路徑，沒有新增儀表板開關。
+主機程式可以為 MCP 工具探索或單次工具呼叫提供新的 bearer 與該次操作持有的 lease。本文件說明共用傳輸 API；下述 bearer／lease API 保留為一般 Generic 路徑。v1.76.0 納入的 Google 個人掛載使用下節獨立 Closed 路徑，沒有新增儀表板開關。
 
 ## 主機 API 契約
 
@@ -33,7 +33,7 @@ Scoped 回應會把本次 bearer 從回傳 JSON 的 key 與 value 遮蔽，外�
 
 `RegistryClient::Persistent` 保留既有連線與 `before_call_async` 路徑；scoped 準備方法取代該 slot 的 before hook，不會重複授權。原本的 filter、同名工具先到者優先、`after_call`、來源證明／CCR 與主機提示仍走 registry 流程。
 
-## Google 主機的 Closed 接線（未發布原始碼草稿）
+## Google 主機的 Closed 接線（v1.76.0）
 
 主機明確使用 `RegistryClient::scoped_http_closed(recipe, host_binding, guard)`。真正的 slot 建立私有建構子的 `ClosedClientTarget`，綁定 server、recipe、filter、原設定項目與絕對期限。`prepare_closed_client_call` 必須回傳可消耗一次的 `OwnedScopedOperation`，預設拒絕。回傳型別錯誤或最終參數不同時拒絕，不改走 Generic bearer／lease API。
 
@@ -43,7 +43,7 @@ Gateway 在移交中繼資料工作前取得真正發問者，固定原解析項
 
 同步金鑰圈與本機讀寫無法強制搶占，返回後與後續送出前重查期限。取消不撤回已開始的憑證更新、遠端效果或保存。CCR 沿用單次呼叫的中繼資料 tombstone 交易清理，已開始且有限的 SQLite 工作可能稍後完成。當機或清理失敗可能留下未公布資料列，直到既有到期清理；沒有新增持久逾時協調器，也不保證零保存。
 
-新增 M1 測試僅有來源，尚未編譯／執行。關閉 feature 的建置、獨立程式與安全審查、完整 CI、真供應商及使用者驗收均待完成；服務帳號委派、Bridge 與其他 W3 路徑另行處理。
+Google 個人連線指南所列的 M1／CLI 本機聚焦測試與獨立程式／安全審查已通過。完整 CI 以最終 release source 為準；真 provider、Keychain、平台與使用者驗收仍須獨立證據。
 
 
 Closed 會暫存 provenance 與結果中繼資料，在同步 ledger／route 建構完成後重驗所有原期限。逾期項目會扣留，ledger 排除其 span 後重建，通過才提交。測試版本另須持有公司共用連線更新端點的 owned fixture；缺少時在解密與供應商送出前拒絕。Legacy 端點政策不變。
@@ -58,4 +58,4 @@ Closed 會暫存 provenance 與結果中繼資料，在同步 ledger／route 建
 
 ### W3 帳號來源
 
-未發布的 W3 來源把公司服務帳號與授權代表接入同一 Closed 操作契約，並為原 Google 帳號核准 wire 增加服務帳號／Apps Script 標籤及可選的 `home_source` 分型資料；舊 Personal／OAuth JSON 仍省略此欄。使用 Rust struct literal 建立 `GoogleAccountApproval` 的外部呼叫者必須補 `home_source`；這是 Rust 來源相容性變更，不能宣稱公開結構逐位元不變。沒有新增依賴、權杖 schema 或核准 gate。W3 測試全部尚未編譯／執行。
+v1.76.0 的 W3 來源把公司服務帳號與授權代表接入同一 Closed 操作契約，並為原 Google 帳號核准 wire 增加服務帳號／Apps Script 標籤及可選的 `home_source` 分型資料；舊 Personal／OAuth JSON 仍省略此欄。使用 Rust struct literal 建立 `GoogleAccountApproval` 的外部呼叫者必須補 `home_source`；這是 Rust 來源相容性變更，不能宣稱公開結構逐位元不變。沒有新增依賴、權杖 schema 或核准 gate。聚焦測試與其限制見 Google 個人連線指南的驗證範圍。

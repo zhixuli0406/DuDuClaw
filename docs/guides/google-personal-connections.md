@@ -1,4 +1,4 @@
-# Connect a personal Google account (Enterprise, unreleased)
+# Connect a personal Google account (Enterprise, v1.76.0)
 
 Give an AI employee access to your own Google account without changing the company account. You choose which employees may use it and can withdraw permission at any time.
 
@@ -93,7 +93,7 @@ The platform gate does not isolate an employee with unrestricted Bash running as
 
 Related: [Native Google Workspace](google-workspace.md), [Google's PKCE guidance](https://developers.google.com/identity/protocols/oauth2/native-app#step1-code-verifier), [OpenID user info](https://developers.google.com/identity/openid-connect/openid-connect#obtaininguserprofileinformation), [Google revocation](https://developers.google.com/identity/protocols/oauth2/web-server#tokenrevoke).
 
-## Unreleased account selection and status
+## Account selection and status (v1.76.0)
 
 Company-account fallback fixes an existing granted scope to the originally selected native tool and preserves the current any-of service policy. It selects the same company-shared OAuth connection only when the original personal account is unavailable and an administrator has allowed company fallback. A healthy personal selection cannot switch to company fallback after a later error.
 
@@ -107,7 +107,7 @@ For remote Google MCP over HTTP, each operation fixes the original operator entr
 
 The remote operation has one deadline covering queueing, preparation, the three protocol POSTs and result processing. Its request frame is limited to 16 MiB and each POST response is separately limited to 16 MiB; this is not a 16 MiB total across the operation. It does not retry, follow redirects or use environment proxies. A late result is withheld, including its account notice and new retrieval handle. Cancellation cannot undo a Google write; inspect Google before retrying an unconfirmed operation. Local metadata maintenance that has already started can finish later, so cancellation does not promise immediate deletion of every local record.
 
-The remote extension remains unreleased. Its M1/CLI focused local tests and independent code/security review have passed within the integrated validation described below. Earlier D1 evidence remains separate; live Google verification and user acceptance are not established by these tests.
+The remote extension is included in v1.76.0. Its M1/CLI focused local tests and independent code/security review have passed within the integrated validation described below. Earlier D1 evidence remains separate; live Google verification and user acceptance are not established by these tests.
 
 System keychain and synchronous local reads or writes cannot be forcibly interrupted by a timeout; the same deadline is checked again when they return, before sending or delivering a result.
 
@@ -121,7 +121,7 @@ Home service accounts and Delegate support the 18 native HTTP tools and remote G
 
 The native `attendees` argument is a comma-separated string, not an array. Bridge refuses a nonempty `cc`, nonempty attendees parsed from CSV, or `with_meet=true` before I/O. Empty `cc` or attendees and `with_meet=false` do not request those unsupported features and can proceed as ordinary requests. This does not guarantee rejection of every unknown or malformed field.
 
-File/environment/config/marker changes are observed locally. Keychain and external secret managers without a revision feed use a per-operation snapshot; out-of-band rotation and external provider recovery cannot be detected immediately without another request. Synchronous OS/key-store calls cannot be hard-preempted; checks on return prevent starting the next step after expiry. Cross-file observation and check-to-send races remain limitations. These changes remain unreleased. W3 focused local tests and independent code/security review have passed; actual Google/Apps Script compatibility, platform checks and user acceptance require separate evidence. CI follows each PR’s latest head. Legacy automation APIs such as mail polling are outside this change.
+File/environment/config/marker changes are observed locally. Keychain and external secret managers without a revision feed use a per-operation snapshot; out-of-band rotation and external provider recovery cannot be detected immediately without another request. Synchronous OS/key-store calls cannot be hard-preempted; checks on return prevent starting the next step after expiry. Cross-file observation and check-to-send races remain limitations. These changes are included in v1.76.0. W3 focused local tests and independent code/security review have passed; actual Google/Apps Script compatibility, platform checks and user acceptance require separate evidence. CI follows each PR’s latest head. Legacy automation APIs such as mail polling are outside this change.
 
 Selection performs no Apps Script health POST. A historical direct credential failure fixes the pre-Ask choice; it is not current provider health. A direct data request that may have been sent never triggers a second Bridge request. The legacy direct-to-Bridge behavior remains in the legacy API lane.
 
