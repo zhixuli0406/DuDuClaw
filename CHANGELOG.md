@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.76.0] - 2026-10-26 — Google 整合、團隊隱私與持續責任
+
 ### Security
 - Google OAuth 連線在送往 Google 前新增必要的資料使用揭露與明確勾選；官方介面不能略過，gateway 的個人連線及 Google MCP OAuth RPC 也都必須明確帶入確認。揭露說明存取範圍、本機保存、設定的 AI 服務商及禁止將 Google Workspace 資料用於一般化模型訓練，並連到完整隱私政策。
 - Google 資料同意現在以 gateway 簽發的版本、時間與操作者綁定至個人密封憑證及 Home OAuth ticket／credential。缺少或非目前版本的既有連線只能中斷／撤銷，不能選用、解密、更新或呼叫供應商；Home 回呼還會重新確認原操作者仍是有效管理員。
