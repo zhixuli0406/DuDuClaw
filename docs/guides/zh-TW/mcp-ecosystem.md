@@ -92,7 +92,7 @@ Client ID Metadata Documents（CIMD）沒有實作：它需要一個公開網址
 - loopback 網址（`localhost`、`127.0.0.1`、`[::1]`），http 或 https；
 - 列在 `config.toml [gateway] allowed_origins`（或 `DUDUCLAW_ALLOWED_ORIGINS`）裡的 `https` 網址，主機與連接埠需完全相符。
 
-其他網址（例如區網 IP 的 `http://192.168.1.20:18789`、主機名稱 `http://duduclaw.local:18789`，或不在 `allowed_origins` 的 https 網址）無法直接收到轉回，因為 OAuth 2.1 只允許 loopback 使用非 https 的轉回網址。這時登入分兩步完成：
+其他網址（例如區網 IP 的 `http://192.168.1.20:18889`、主機名稱 `http://duduclaw.local:18889`，或不在 `allowed_origins` 的 https 網址）無法直接收到轉回，因為 OAuth 2.1 只允許 loopback 使用非 https 的轉回網址。這時登入分兩步完成：
 
 1. 登入頁會把瀏覽器導向 `http://127.0.0.1:<儀表板連接埠>/oauth/mcp/callback`，也就是「瀏覽器所在電腦」的本機位址（RFC 8252 §7.3，所有 OAuth 2.1 伺服器都接受）。如果瀏覽器就在 Gateway 主機上，這個位址就是 Gateway 本身，登入會自動完成。
 2. 在其他電腦上，這一頁會打不開（「無法連上這個網站」），這是正常的：把網址列上的完整網址複製，貼到連線對話框顯示的欄位（RPC `mcp.remote_complete`）。Gateway 只接受 `/oauth/mcp/callback` 上的本機位址，而且主機、連接埠與路徑都必須和這次登入註冊的轉回網址相同；state 只能用一次。貼上的網址只含一次性授權碼與 state，PKCE 驗證碼不會離開 Gateway。

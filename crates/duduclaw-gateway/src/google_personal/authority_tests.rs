@@ -45,7 +45,7 @@ fn fixture() -> (tempfile::TempDir, Arc<UserDb>, String) {
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
             token_url: "https://oauth2.googleapis.com/token".into(),
             scopes: vec![],
-            redirect_uri: "http://127.0.0.1:18789/api/mcp/oauth/callback".into(),
+            redirect_uri: "http://127.0.0.1:18889/api/mcp/oauth/callback".into(),
         },
     )
     .unwrap();

@@ -52,7 +52,7 @@ cd src-tauri && cargo tauri build
 ## Lifecycle behavior (what the shell does)
 
 - **單一實例**：第二次啟動只會把已存在的視窗帶到前景（§D2.1）。
-- **附掛或新啟動**：若 `DUDUCLAW_PORT`（預設 **18789**）上已經有 gateway 在跑，就直接附掛上去，*不會*把它殺掉；否則就在 `18789..=18797` 裡挑第一個空的 port 來 spawn sidecar（§D1 / §D2.2）。
+- **附掛或新啟動**：若 `DUDUCLAW_PORT`（預設 **18889**）上已經有 gateway 在跑，就直接附掛上去，*不會*把它殺掉；否則就在 `18889..=18897` 裡挑第一個空的 port 來 spawn sidecar（§D1 / §D2.2）。
 - **PATH**：sidecar 是以擴充過的 PATH 啟動（Homebrew、`.local/bin`、Bun、Volta、npm-global、asdf、cargo），確保從 Finder / Dock 啟動時也找得到 Claude CLI / node / containers（§D2.6）。
 - **資料目錄**：與 CLI 共用 `~/.duduclaw`，兩邊看到的 agent／SQLite／wiki 都是同一份（§D2.7）。
 - **關閉即縮到系統列**：關閉視窗只是隱藏它，要真正結束要從系統列選單選擇離開（§D2.4）。
@@ -79,7 +79,7 @@ cd src-tauri && cargo tauri build
    （已驗證：build hook 的 `pwd` 就是 repo root）。所以兩者都是 `cd web && npm run …`，**不是** `cd ../web`。（`cargo tauri dev/build` 是在 `src-tauri/` 底下被呼叫，但 Tauri 執行 hook 時的工作目錄是 project root。）
 
 5. **Vite 一直卡在「Waiting for frontend dev server …」。** Vite 必須綁定 IPv4 的
-   `127.0.0.1`（不是預設的 `localhost`/`::1`），才會跟 Tauri 的輪詢器與 proxy target 對上，這點已在 `web/vite.config.ts` 釘死（`host: '127.0.0.1'`、`strictPort`，以及 gateway proxy 預設值 `http://127.0.0.1:18789`）。
+   `127.0.0.1`（不是預設的 `localhost`/`::1`），才會跟 Tauri 的輪詢器與 proxy target 對上，這點已在 `web/vite.config.ts` 釘死（`host: '127.0.0.1'`、`strictPort`，以及 gateway proxy 預設值 `http://127.0.0.1:18889`）。
 
 6. **`cookie 0.18.1` 出現編譯錯誤（`Parsable::parse` arity 不符）。** `time 0.3.52`
    在 0.3.x 系列內破壞了 API，已在 `src-tauri/Cargo.toml` 中鎖在 `time = "=0.3.51"`。等 tauri/wry 支援新版 `time` 之後就可以拿掉這個鎖定。

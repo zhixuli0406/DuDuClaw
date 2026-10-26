@@ -2,7 +2,7 @@
 // gateway. See rpc.ts for the socket architecture note (why everything lives
 // in the extension host, never the webview).
 import * as vscode from 'vscode';
-import { SECRET_ACCESS, SECRET_REFRESH } from './config';
+import { SECRET_ACCESS, SECRET_REFRESH, initializeGatewayUrl } from './config';
 import { doLogin } from './auth';
 import { buildSelectionContext } from './editorContext';
 import { DuduPanelProvider, roleLabel } from './panel';
@@ -20,7 +20,8 @@ function updateStatusBar(item: vscode.StatusBarItem, state: PanelStatusState): v
   item.show();
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  await initializeGatewayUrl(context);
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'duduclaw.switchAgent';
   context.subscriptions.push(statusBar);

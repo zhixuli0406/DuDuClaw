@@ -14,25 +14,35 @@ cargo build --release
 duduclaw run
 
 # Access Dashboard
-open http://localhost:18789
+open http://localhost:18889
 ```
 
-Default port: `18789`. Configure in `~/.duduclaw/config.toml`:
+Default port: `18889`. Configure in `~/.duduclaw/config.toml`:
+
+Upgrades do not rewrite an explicit `DUDUCLAW_PORT` or an existing
+`[gateway] port`. Installations already using the former `18789` default keep
+that endpoint until the operator changes it; fresh, unconfigured installs use
+`18889`.
+
+For an existing Docker data volume, keep its current port mapping and
+healthcheck. To migrate, change `[gateway] port`, the Compose `ports` mapping,
+and the healthcheck URL to `18889` in one maintenance window; do not replace
+only the new-install Compose template.
 
 ```toml
 [gateway]
 bind = "127.0.0.1"
-port = 18789
+port = 18889
 ```
 
 ### Health check
 
 ```bash
-curl http://localhost:18789/health
+curl http://localhost:18889/health
 # {"status":"ok","version":"0.10.0","uptime_seconds":42,"agents_loaded":2,"channels_connected":["telegram","discord"]}
 
-curl http://localhost:18789/health/ready  # 200 when agents loaded
-curl http://localhost:18789/health/live   # 200 always (liveness probe)
+curl http://localhost:18889/health/ready  # 200 when agents loaded
+curl http://localhost:18889/health/live   # 200 always (liveness probe)
 ```
 
 ---
@@ -53,7 +63,7 @@ curl -fsSL https://tailscale.com/install.sh | sh  # Linux
 tailscale up
 
 # 3. Enable HTTPS + Funnel
-tailscale funnel 18789
+tailscale funnel 18889
 
 # This gives you a URL like:
 # https://your-machine.tail12345.ts.net/
@@ -71,7 +81,7 @@ tailscale funnel 18789
 
 ```bash
 # Run as background service
-tailscale funnel --bg 18789
+tailscale funnel --bg 18889
 
 # Or via systemd (Linux)
 # Add to duduclaw.service After=tailscaled.service
@@ -90,13 +100,13 @@ snap install ngrok        # Linux
 ngrok config add-authtoken YOUR_TOKEN
 
 # 3. Start tunnel
-ngrok http 18789
+ngrok http 18889
 
 # Copy the HTTPS URL (e.g., https://abc123.ngrok-free.app)
 # Set as LINE Webhook URL: https://abc123.ngrok-free.app/webhook/line
 ```
 
-**Note**: Free ngrok URLs change on restart. Use `ngrok http 18789 --domain=your-domain.ngrok-free.app` with a reserved domain.
+**Note**: Free ngrok URLs change on restart. Use `ngrok http 18889 --domain=your-domain.ngrok-free.app` with a reserved domain.
 
 ---
 
@@ -121,7 +131,7 @@ credentials-file: /Users/YOU/.cloudflared/YOUR_TUNNEL_ID.json
 
 ingress:
   - hostname: duduclaw.yourdomain.com
-    service: http://localhost:18789
+    service: http://localhost:18889
   - service: http_status:404
 EOF
 
@@ -142,7 +152,7 @@ Set LINE Webhook: `https://duduclaw.yourdomain.com/webhook/line`
 
 ```Caddyfile
 duduclaw.yourdomain.com {
-    reverse_proxy localhost:18789
+    reverse_proxy localhost:18889
 
     # WebSocket support (auto-detected by Caddy)
     # No extra config needed
@@ -164,7 +174,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/duduclaw.yourdomain.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:18789;
+        proxy_pass http://127.0.0.1:18889;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -273,7 +283,7 @@ services:
       context: .
       dockerfile: container/Dockerfile.server
     ports:
-      - "18789:18789"
+      - "18889:18889"
     volumes:
       - ~/.duduclaw:/home/duduclaw/.duduclaw
     environment:
@@ -282,7 +292,7 @@ services:
       - .env
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18889/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -380,7 +390,7 @@ Notes by install method:
 scrape_configs:
   - job_name: 'duduclaw'
     static_configs:
-      - targets: ['localhost:18789']
+      - targets: ['localhost:18889']
     metrics_path: '/metrics'
     scrape_interval: 30s
 ```
@@ -454,7 +464,7 @@ bind to a LAN interface (not loopback):
 # ~/.duduclaw/config.toml on the gateway server
 [gateway]
 bind = "0.0.0.0"        # reachable on the LAN (default 127.0.0.1 = local only)
-port = 18789
+port = 18889
 
 [general]
 name = "Office Gateway"  # shown as the instance name in the desktop picker
@@ -509,7 +519,7 @@ The picker itself offers three ways to connect:
 1. **本機 / Local** — the app's own bundled gateway (for solo use).
 2. **區網偵測 / On your network** — gateways discovered via mDNS, with a rescan
    button. Each row shows name, `host:port`, and version.
-3. **手動輸入 / Manual** — type `192.168.1.10:18789` or `https://gw.company.com`.
+3. **手動輸入 / Manual** — type `192.168.1.10:18889` or `https://gw.company.com`.
    The address is validated against `/healthz` before connecting; a bad address
    shows an error and does **not** navigate.
 
@@ -529,7 +539,7 @@ addresses are accepted (fail-closed).
 
 | Method | URL | Use Case |
 |--------|-----|----------|
-| Local only | `http://localhost:18789` | Development |
+| Local only | `http://localhost:18889` | Development |
 | Enterprise LAN | mDNS auto-discovery (desktop picker) | Employees → company gateway |
 | Tailscale | `https://xxx.ts.net` | Home server, LINE webhook |
 | ngrok | `https://xxx.ngrok-free.app` | Quick demo |

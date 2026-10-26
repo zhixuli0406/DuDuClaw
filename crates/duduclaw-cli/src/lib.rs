@@ -8029,9 +8029,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         let port: u16 = loop {
             let p: u16 = Input::new()
                 .with_prompt("Gateway Port (1024-65535)")
-                .default(18789u16)
+                .default(duduclaw_core::DEFAULT_GATEWAY_PORT)
                 .interact_text()
-                .unwrap_or(18789);
+                .unwrap_or(duduclaw_core::DEFAULT_GATEWAY_PORT);
             if p >= 1024 {
                 break p;
             }
@@ -8040,7 +8040,10 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
         (bind, port)
     } else {
-        ("127.0.0.1".to_string(), 18789u16)
+        (
+            "127.0.0.1".to_string(),
+            duduclaw_core::DEFAULT_GATEWAY_PORT,
+        )
     };
 
     // ── 6. Budget (advanced mode) ────────────────────────────

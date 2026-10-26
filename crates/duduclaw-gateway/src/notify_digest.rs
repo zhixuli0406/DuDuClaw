@@ -702,8 +702,8 @@ mod tests {
             tasks_done: 1,
             ..Default::default()
         };
-        let body = render(&stats, Some("http://localhost:18789/tasks")).unwrap();
-        assert!(body.ends_with("👉 http://localhost:18789/tasks"));
+        let body = render(&stats, Some("http://localhost:18889/tasks")).unwrap();
+        assert!(body.ends_with("👉 http://localhost:18889/tasks"));
         // No link ⇒ text reads exactly as it would without the feature.
         assert!(!render(&stats, None).unwrap().contains("👉"));
     }

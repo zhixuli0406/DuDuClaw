@@ -1265,7 +1265,7 @@ mod tests {
             Some("HTTPS://Ai.Example.com".to_string()),
             "scheme compare is case-insensitive but the URL is passed through verbatim"
         );
-        assert_eq!(https_base("http://localhost:18789"), None);
+        assert_eq!(https_base("http://localhost:18889"), None);
         // No substring shortcuts: an http URL that merely mentions https fails.
         assert_eq!(https_base("http://evil.test/https://ai.example.com"), None);
         assert_eq!(https_base("https://"), None);
@@ -1341,7 +1341,7 @@ mod tests {
         // http public_url ⇒ None (Telegram requires https).
         std::fs::write(
             &cfg,
-            "[miniapp]\nenabled = true\n\n[gateway]\nport = 18789\n",
+            "[miniapp]\nenabled = true\n\n[gateway]\nport = 18889\n",
         )
         .unwrap();
         assert_eq!(

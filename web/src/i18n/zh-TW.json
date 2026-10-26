@@ -5542,7 +5542,7 @@
   "gateway.rescan": "重新掃描",
   "gateway.scanning": "正在掃描區域網路…",
   "gateway.empty": "區網內沒有偵測到 Gateway。可用下方手動輸入位址。",
-  "gateway.manual.placeholder": "例如 192.168.1.10:18789 或 https://gw.company.com",
+  "gateway.manual.placeholder": "例如 192.168.1.10:18889 或 https://gw.company.com",
   "gateway.manual.hint": "支援 http/https；連線前會先驗證。公司伺服器建議使用 HTTPS。",
   "gateway.resolving": "正在為你連線 Gateway…",
   "gateway.autoConnecting": "已偵測到 {name}，正在自動連線…",

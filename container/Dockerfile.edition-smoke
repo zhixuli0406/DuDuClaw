@@ -25,6 +25,6 @@ RUN useradd -m -u 1000 duduclaw
 COPY --from=builder /build/target/release/duduclaw /usr/local/bin/duduclaw
 USER duduclaw
 WORKDIR /home/duduclaw
-EXPOSE 18789
+EXPOSE 18789 18889
 # Gateway auto-writes a minimal config on first run, then boots.
 CMD ["duduclaw", "gateway"]

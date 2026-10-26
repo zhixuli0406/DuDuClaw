@@ -587,7 +587,7 @@ async fn inspect_returns_proactive_timezone_and_permission_marker() {
 #[tokio::test]
 async fn raw_editor_unchanged_submission_is_a_true_no_op_and_types_are_checked() {
     let home = tempfile::tempdir().unwrap();
-    let original = "[gateway]\nport = 18789\n\n[mcp_keys.\"ddc_secret_key\"]\nclient_id = \"x\"\n\n[night]\nllm_enabled = false\n";
+    let original = "[gateway]\nport = 18889\n\n[mcp_keys.\"ddc_secret_key\"]\nclient_id = \"x\"\n\n[night]\nllm_enabled = false\n";
     std::fs::write(home.path().join("config.toml"), original).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let got = ok(&handler.handle("config.raw.get", json!({ "file": "config" }), &admin()).await);
@@ -604,7 +604,7 @@ async fn raw_editor_unchanged_submission_is_a_true_no_op_and_types_are_checked()
         .count();
     assert_eq!(backups, 0);
 
-    for (from, to) in [("port = 18789", "port = \"eighteen\""), ("llm_enabled = false", "llm_enabled = \"nah\"")] {
+    for (from, to) in [("port = 18889", "port = \"eighteen\""), ("llm_enabled = false", "llm_enabled = \"nah\"")] {
         let edited = got["content"].as_str().unwrap().replace(from, to);
         let e = err(&handler
             .handle("config.raw.set", json!({ "file": "config", "content": edited, "base_hash": got["hash"] }), &admin())
@@ -619,7 +619,7 @@ const COMMENTED: &str = r#"# DuDuClaw config, hand edited
 
 # Gateway section comment
 [gateway]
-port = 18789 # trailing on port
+port = 18889 # trailing on port
 bind = "127.0.0.1"
 # auth_token = "commented-out"
 

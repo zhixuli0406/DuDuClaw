@@ -8,7 +8,7 @@ DuDuClaw exposes a JSON-RPC 2.0 API over WebSocket at `ws://<host>:<port>/ws`.
 # Start the gateway
 duduclaw run
 
-# Connect via WebSocket (default: ws://localhost:18789/ws)
+# Connect via WebSocket (default: ws://localhost:18889/ws)
 ```
 
 ## Protocol

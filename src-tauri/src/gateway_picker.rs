@@ -382,7 +382,7 @@ pub fn gateway_local_status(manager: State<'_, Arc<SidecarManager>>) -> LocalSta
     let port = manager.port();
     let status = match manager.status() {
         SidecarStatus::Running => {
-            if lifecycle::is_listening(lifecycle::DEFAULT_HOST, port) {
+            if lifecycle::is_duduclaw_gateway(lifecycle::DEFAULT_HOST, port) {
                 "running"
             } else {
                 "stopped"
@@ -450,7 +450,7 @@ mod tests {
         GatewayRecord {
             name: "GW".into(),
             host: "h".into(),
-            port: 18789,
+            port: 18889,
             version: "1.45.0".into(),
             tls: false,
             url: url.into(),
@@ -460,8 +460,8 @@ mod tests {
     #[test]
     fn scheme_allowlist_accepts_http_and_https() {
         assert_eq!(
-            validate_gateway_url("http://192.168.1.5:18789").unwrap(),
-            "http://192.168.1.5:18789/"
+            validate_gateway_url("http://192.168.1.5:18889").unwrap(),
+            "http://192.168.1.5:18889/"
         );
         assert_eq!(
             validate_gateway_url("https://gw.example.com").unwrap(),
@@ -495,13 +495,13 @@ mod tests {
         let mut state = DesktopGatewayState::default();
         // Insert 7 distinct gateways; only the newest 5 survive, newest first.
         for i in 0..7 {
-            let r = rec(&format!("http://h{i}:18789/"));
+            let r = rec(&format!("http://h{i}:18889/"));
             state = with_selection(&state, &r);
         }
         assert_eq!(state.recent.len(), RECENT_MAX);
-        assert_eq!(state.recent[0].url, "http://h6:18789/");
-        assert_eq!(state.recent[4].url, "http://h2:18789/");
-        assert_eq!(state.last_gateway.as_ref().unwrap().url, "http://h6:18789/");
+        assert_eq!(state.recent[0].url, "http://h6:18889/");
+        assert_eq!(state.recent[4].url, "http://h2:18889/");
+        assert_eq!(state.last_gateway.as_ref().unwrap().url, "http://h6:18889/");
     }
 
     #[test]
@@ -536,10 +536,10 @@ mod tests {
 
     #[test]
     fn is_local_url_detects_loopback() {
-        assert!(is_local_url("http://127.0.0.1:18789/"));
-        assert!(is_local_url("http://localhost:18789/"));
-        assert!(is_local_url("http://[::1]:18789/"));
-        assert!(!is_local_url("http://192.168.1.5:18789/"));
+        assert!(is_local_url("http://127.0.0.1:18889/"));
+        assert!(is_local_url("http://localhost:18889/"));
+        assert!(is_local_url("http://[::1]:18889/"));
+        assert!(!is_local_url("http://192.168.1.5:18889/"));
         assert!(!is_local_url("https://gw.example.com/"));
     }
 
@@ -552,10 +552,10 @@ mod tests {
             "tls" => Some("0".to_string()),
             _ => None,
         };
-        let r = record_from_resolved(txt, "office.local.", 18789, Some("192.168.1.20"));
+        let r = record_from_resolved(txt, "office.local.", 18889, Some("192.168.1.20"));
         assert_eq!(r.name, "Office GW");
         assert_eq!(r.host, "office");
-        assert_eq!(r.url, "http://192.168.1.20:18789/");
+        assert_eq!(r.url, "http://192.168.1.20:18889/");
         assert!(!r.tls);
         assert_eq!(r.version, "1.45.0");
     }

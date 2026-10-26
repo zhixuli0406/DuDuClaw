@@ -10,7 +10,7 @@ isolation (separate OS users, or containers) see the alternatives at the bottom.
 | Env var | Purpose | Must differ per instance |
 | --- | --- | --- |
 | `DUDUCLAW_HOME` | State root — config, SQLite DBs, `bus_queue.jsonl`, `events.db`, models, shared wiki, secrets, cron. Default `~/.duduclaw`. | **Yes** |
-| `DUDUCLAW_PORT` | Gateway HTTP/WS port. Default `18789`. | **Yes** |
+| `DUDUCLAW_PORT` | Gateway HTTP/WS port. Default `18889`. | **Yes** |
 | `DUDUCLAW_INSTANCE` | Short instance name (`[a-z0-9-]`). Namespaces the **global MCP registration** key in `~/.claude/settings.json` (`duduclaw` → `duduclaw-<name>`) so instances don't overwrite each other. | Recommended |
 
 Every subsystem resolves its state root through a single canonical helper
@@ -21,11 +21,11 @@ per-instance state — no path silently leaks back to `~/.duduclaw`.
 
 ```bash
 # Instance "work"
-DUDUCLAW_HOME=~/dd-work  DUDUCLAW_PORT=18789 DUDUCLAW_INSTANCE=work \
+DUDUCLAW_HOME=~/dd-work  DUDUCLAW_PORT=18889 DUDUCLAW_INSTANCE=work \
   duduclaw run --yes
 
 # Instance "play"
-DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
+DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18890 DUDUCLAW_INSTANCE=play \
   duduclaw run --yes
 ```
 
@@ -40,12 +40,12 @@ instance:
     "duduclaw-work": {
       "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
-      "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18789", "DUDUCLAW_INSTANCE": "work" }
+      "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18889", "DUDUCLAW_INSTANCE": "work" }
     },
     "duduclaw-play": {
       "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
-      "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18790", "DUDUCLAW_INSTANCE": "play" }
+      "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18890", "DUDUCLAW_INSTANCE": "play" }
     }
   }
 }
@@ -80,6 +80,6 @@ to find it (e.g. the npm global bin directory, or the desktop app's bundled bina
   *and* `~/.claude` (OAuth) are naturally isolated with filesystem-level
   boundaries. Zero code reliance on env vars; still needs distinct ports.
 - **Containers** (Docker/Podman) — full filesystem + network-namespace
-  isolation; each container can reuse port `18789` internally and map to
+  isolation; each container can reuse port `18889` internally and map to
   distinct host ports. Note: on macOS, Linux containers have no Metal, so local
   GGUF inference falls back to CPU (keep inference on the host if you need GPU).

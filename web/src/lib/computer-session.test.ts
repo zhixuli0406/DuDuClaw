@@ -16,8 +16,8 @@ describe('computerViewUrl', () => {
     expect(computerViewUrl('wss://gw.example.com/ws', 'https://x', VIEW_PATH, TICKET)).toBe(
       `wss://gw.example.com/ws/computer-view?ticket=${TICKET}`,
     );
-    expect(computerViewUrl('ws://user:pw@127.0.0.1:18789/ws?jwt=secret#x', '', VIEW_PATH, TICKET)).toBe(
-      `ws://127.0.0.1:18789/ws/computer-view?ticket=${TICKET}`,
+    expect(computerViewUrl('ws://user:pw@127.0.0.1:18889/ws?jwt=secret#x', '', VIEW_PATH, TICKET)).toBe(
+      `ws://127.0.0.1:18889/ws/computer-view?ticket=${TICKET}`,
     );
   });
 

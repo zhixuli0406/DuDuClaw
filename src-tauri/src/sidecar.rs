@@ -157,7 +157,7 @@ impl SidecarManager {
                 // event ever reaching us (we hold no child handle), leaving a
                 // stale Running that used to make this a permanent no-op — the
                 // 連線 button could never revive the gateway.
-                if lifecycle::is_listening(lifecycle::DEFAULT_HOST, self.port()) {
+                if lifecycle::is_duduclaw_gateway(lifecycle::DEFAULT_HOST, self.port()) {
                     return Ok(self.port());
                 }
                 tracing::warn!(
@@ -247,7 +247,7 @@ impl SidecarManager {
                 {
                     return; // superseded or already resolved (crash → Error)
                 }
-                if lifecycle::is_listening(lifecycle::DEFAULT_HOST, port) {
+                if lifecycle::is_duduclaw_gateway(lifecycle::DEFAULT_HOST, port) {
                     if me.generation.load(Ordering::SeqCst) == my_gen {
                         me.set_status(SidecarStatus::Running);
                         tracing::info!("gateway sidecar ready on port {port}");
@@ -366,7 +366,7 @@ impl SidecarManager {
         let port = self.port();
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            if lifecycle::is_listening(lifecycle::DEFAULT_HOST, port) {
+            if lifecycle::is_duduclaw_gateway(lifecycle::DEFAULT_HOST, port) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(150));

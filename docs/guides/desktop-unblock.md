@@ -64,7 +64,7 @@ open "target/release/bundle/macos/DuDuClaw.app"
 | TODO item | How to verify |
 | --- | --- |
 | **D0 🧪** | `cargo tauri dev` launches, the window shows the login page, sending one chat message gets a response |
-| **D1 🧪** | (a) First make sure no launchd/CLI gateway is running → open the app; it should **auto-start the sidecar**. (b) First run `duduclaw run` to occupy port 18789 → open the app; it should **attach without restarting it** (Activity Monitor shows only one `duduclaw` process) |
+| **D1 🧪** | (a) First make sure no launchd/CLI gateway is running → open the app; it should **auto-start the sidecar**. (b) First run `duduclaw run` to occupy port 18889 → open the app; it should **attach without restarting it** (Activity Monitor shows only one `duduclaw` process) |
 | **D2.1 🧪** | Open the app twice in a row → only one window gets focus, only one `duduclaw` process exists |
 | **D2.3 🧪** | After a normal quit, `ps aux | grep duduclaw` shows no leftover process; after `kill -9`-ing the app and reopening it, it should reclaim the orphan pointed to by the old pidfile (`~/.duduclaw/desktop-sidecar.pid`) |
 | **D2.4 🧪** | The tray icon shows status; the Start/Stop menu items drive the sidecar; closing the window minimizes to the tray instead of quitting |

@@ -23,7 +23,7 @@ impl MethodHandler {
             "channels_connected": channels_connected,
             "gateway_address": crate::deep_link::dashboard_base_url(&self.home_dir)
                 .and_then(|url| url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).map(str::to_string))
-                .unwrap_or_else(|| "localhost:18789".to_string()),
+                .unwrap_or_else(|| "localhost:18889".to_string()),
             // Product form-factor (personal|enterprise). Orthogonal to the
             // license `edition` string returned by system.version. The
             // dashboard reads this to hide/show enterprise management surfaces.

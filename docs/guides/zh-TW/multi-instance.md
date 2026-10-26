@@ -7,7 +7,7 @@
 | 環境變數 | 用途 | 每個實例是否必須不同 |
 | --- | --- | --- |
 | `DUDUCLAW_HOME` | 狀態根目錄：config、SQLite 資料庫、`bus_queue.jsonl`、`events.db`、models、shared wiki、secrets、cron。預設為 `~/.duduclaw`。 | **是** |
-| `DUDUCLAW_PORT` | Gateway 的 HTTP/WS 埠號。預設為 `18789`。 | **是** |
+| `DUDUCLAW_PORT` | Gateway 的 HTTP/WS 埠號。預設為 `18889`。 | **是** |
 | `DUDUCLAW_INSTANCE` | 短實例名稱（`[a-z0-9-]`）。用來替 `~/.claude/settings.json` 裡的**全域 MCP 註冊**鍵名加上命名空間（`duduclaw` → `duduclaw-<name>`），避免各實例互相覆蓋。 | 建議設定 |
 
 每個子系統都透過同一個標準 helper（`duduclaw_core::duduclaw_home()`）來解析自己的狀態根目錄，因此設定 `DUDUCLAW_HOME` 會搬動*所有*屬於該實例的狀態，不會有任何路徑悄悄漏回 `~/.duduclaw`。
@@ -16,11 +16,11 @@
 
 ```bash
 # 實例 "work"
-DUDUCLAW_HOME=~/dd-work  DUDUCLAW_PORT=18789 DUDUCLAW_INSTANCE=work \
+DUDUCLAW_HOME=~/dd-work  DUDUCLAW_PORT=18889 DUDUCLAW_INSTANCE=work \
   duduclaw run --yes
 
 # 實例 "play"
-DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
+DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18890 DUDUCLAW_INSTANCE=play \
   duduclaw run --yes
 ```
 
@@ -32,12 +32,12 @@ DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
     "duduclaw-work": {
       "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
-      "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18789", "DUDUCLAW_INSTANCE": "work" }
+      "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18889", "DUDUCLAW_INSTANCE": "work" }
     },
     "duduclaw-play": {
       "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
-      "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18790", "DUDUCLAW_INSTANCE": "play" }
+      "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18890", "DUDUCLAW_INSTANCE": "play" }
     }
   }
 }
@@ -61,4 +61,4 @@ DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
 ## 何時該選更強的隔離模型
 
 - **獨立作業系統使用者**：每個實例跑在自己的帳號底下，`~/.duduclaw` 與 `~/.claude`（OAuth）天然就有檔案系統層級的邊界隔離，完全不依賴環境變數，但仍需要各自獨立的埠號。
-- **容器（Docker／Podman）**：完整的檔案系統與網路命名空間隔離，每個容器內部都可以沿用同一個埠號 `18789`，再各自對應到主機上不同的埠號。注意：在 macOS 上，Linux 容器沒有 Metal，本機 GGUF 推論會退回 CPU 執行（若需要 GPU，請把推論留在主機上執行）。
+- **容器（Docker／Podman）**：完整的檔案系統與網路命名空間隔離，每個容器內部都可以沿用同一個埠號 `18889`，再各自對應到主機上不同的埠號。注意：在 macOS 上，Linux 容器沒有 Metal，本機 GGUF 推論會退回 CPU 執行（若需要 GPU，請把推論留在主機上執行）。

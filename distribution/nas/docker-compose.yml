@@ -9,6 +9,7 @@ services:
       - "18789:18789"
     environment:
       - DUDUCLAW_BIND=0.0.0.0
+      - DUDUCLAW_INITIAL_PORT=18789
       # 起步最簡路徑：填 API key（sk-ant-…）。訂閱帳號（OAuth）改照
       # README「訂閱帳號接入」一節，不用這個變數。
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}

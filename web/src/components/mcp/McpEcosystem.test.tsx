@@ -104,7 +104,7 @@ describe('RemoteConnectDialog', () => {
       if (method === 'mcp.remote_connect') {
         return Promise.resolve({
           status: 'authorize', authorize_url: 'https://auth.example.com/authorize?x=2', expires_in: 600,
-          completion: 'paste', redirect_uri: 'http://127.0.0.1:18789/oauth/mcp/callback',
+          completion: 'paste', redirect_uri: 'http://127.0.0.1:18889/oauth/mcp/callback',
           agent_id: 'nova', server: 'zapier',
         });
       }
@@ -123,10 +123,10 @@ describe('RemoteConnectDialog', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
     const box = await screen.findByTestId('remote-paste');
-    expect(box).toHaveTextContent('http://127.0.0.1:18789/oauth/mcp/callback');
+    expect(box).toHaveTextContent('http://127.0.0.1:18889/oauth/mcp/callback');
     const finish = screen.getByRole('button', { name: /finish sign-in/i });
     expect(finish).toBeDisabled();
-    const pasted = 'http://127.0.0.1:18789/oauth/mcp/callback?code=c1&state=s1';
+    const pasted = 'http://127.0.0.1:18889/oauth/mcp/callback?code=c1&state=s1';
     fireEvent.change(screen.getByLabelText(/address bar/i), { target: { value: pasted } });
     fireEvent.click(finish);
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('mcp.remote_complete', { callback_url: pasted }));

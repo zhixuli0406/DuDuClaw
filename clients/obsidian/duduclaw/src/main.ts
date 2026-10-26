@@ -23,6 +23,8 @@ import {
 } from 'obsidian';
 
 const VIEW_TYPE = 'duduclaw-chat';
+const NEW_GATEWAY = 'http://127.0.0.1:18889';
+const LEGACY_GATEWAY = 'http://127.0.0.1:18789';
 
 // Brand cat mark (C1) as a one-color icon. Obsidian's `addIcon` takes SVG
 // content for a 0 0 100 100 viewBox and tints it with currentColor, so the
@@ -42,7 +44,7 @@ interface DuduSettings {
 }
 
 const DEFAULT_SETTINGS: DuduSettings = {
-  gatewayUrl: 'http://127.0.0.1:18789',
+  gatewayUrl: NEW_GATEWAY,
   email: '',
   accessToken: '',
   refreshToken: '',
@@ -74,7 +76,44 @@ export default class DuduClawPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loaded = (await this.loadData()) as Partial<DuduSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+    if (!loaded?.gatewayUrl) {
+      const [currentLive, legacyLive] = await Promise.all([
+        this.isDuduClawGateway(NEW_GATEWAY),
+        this.isDuduClawGateway(LEGACY_GATEWAY),
+      ]);
+      this.settings.gatewayUrl = loaded?.accessToken
+        ? LEGACY_GATEWAY
+        : currentLive
+          ? NEW_GATEWAY
+          : legacyLive
+            ? LEGACY_GATEWAY
+            : NEW_GATEWAY;
+      if (currentLive || legacyLive) await this.saveSettings();
+    }
+  }
+
+  async isDuduClawGateway(base: string): Promise<boolean> {
+    const probe = async (): Promise<boolean> => {
+      const response = await requestUrl({
+        url: `${base}/healthz`,
+        method: 'GET',
+        throw: false,
+      });
+      const body = response.json as { service?: unknown };
+      return body.service === 'duduclaw-gateway';
+    };
+    return Promise.race([
+      probe().catch(() => false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 750)),
+    ]);
+  }
+
+  async ensureGatewayIdentity(base = this.gatewayBase()): Promise<boolean> {
+    const ok = await this.isDuduClawGateway(base);
+    if (!ok) new Notice('DuDuClaw：拒絕傳送憑證——目標不是 DuDuClaw gateway');
+    return ok;
   }
 
   async saveSettings(): Promise<void> {
@@ -85,8 +124,25 @@ export default class DuduClawPlugin extends Plugin {
     return this.settings.gatewayUrl.replace(/\/+$/, '');
   }
 
+  async updateGatewayUrl(value: string): Promise<void> {
+    const next = value.trim().replace(/\/+$/, '');
+    if (next === this.gatewayBase()) return;
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      const view = leaf.view;
+      if (view instanceof ChatView) view.resetConnection();
+    }
+    this.settings.gatewayUrl = next;
+    // Tokens are scoped to the previous gateway instance. Never replay them
+    // merely because the newly selected endpoint identifies as DuDuClaw.
+    this.settings.accessToken = '';
+    this.settings.refreshToken = '';
+    await this.saveSettings();
+    new Notice('DuDuClaw：gateway 已變更，請重新登入');
+  }
+
   async login(password: string): Promise<boolean> {
     try {
+      if (!(await this.ensureGatewayIdentity())) return false;
       const res = await requestUrl({
         url: `${this.gatewayBase()}/api/login`,
         method: 'POST',
@@ -113,6 +169,7 @@ export default class DuduClawPlugin extends Plugin {
   async refreshAccessToken(): Promise<boolean> {
     if (!this.settings.refreshToken) return false;
     try {
+      if (!(await this.ensureGatewayIdentity())) return false;
       const res = await requestUrl({
         url: `${this.gatewayBase()}/api/refresh`,
         method: 'POST',
@@ -172,6 +229,8 @@ export default class DuduClawPlugin extends Plugin {
 
 class ChatView extends ItemView {
   private ws: WebSocket | null = null;
+  private wsGateway: string | null = null;
+  private wsToken: string | null = null;
   private botBuf: HTMLElement | null = null;
   private log!: HTMLElement;
   private input!: HTMLTextAreaElement;
@@ -211,12 +270,20 @@ class ChatView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.resetConnection();
+  }
+
+  resetConnection(): void {
+    const old = this.ws;
+    this.ws = null;
+    this.wsGateway = null;
+    this.wsToken = null;
+    this.botBuf = null;
     try {
-      this.ws?.close();
+      old?.close();
     } catch {
       /* noop */
     }
-    this.ws = null;
   }
 
   private bubble(cls: string, text: string): HTMLElement {
@@ -226,21 +293,36 @@ class ChatView extends ItemView {
     return el;
   }
 
-  private connect(retried = false): void {
+  private async connect(retried = false): Promise<void> {
     const token = this.plugin.settings.accessToken;
+    const base = this.plugin.gatewayBase();
     if (!token) {
       this.bubble('sys', '尚未登入——請到設定頁填 gateway/Email 並登入。');
       return;
     }
-    try {
-      this.ws?.close();
-    } catch {
-      /* noop */
+    if (!(await this.plugin.ensureGatewayIdentity(base))) {
+      this.bubble('sys', '拒絕連線：目標不是 DuDuClaw gateway。');
+      return;
     }
-    const ws = new WebSocket(this.plugin.gatewayBase().replace(/^http/, 'ws') + '/ws/chat');
+    if (base !== this.plugin.gatewayBase() || token !== this.plugin.settings.accessToken) return;
+    this.resetConnection();
+    const ws = new WebSocket(base.replace(/^http/, 'ws') + '/ws/chat');
     this.ws = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
+    this.wsGateway = base;
+    this.wsToken = token;
+    ws.onopen = () => {
+      if (
+        this.ws !== ws ||
+        this.wsGateway !== this.plugin.gatewayBase() ||
+        this.wsToken !== this.plugin.settings.accessToken
+      ) {
+        ws.close();
+        return;
+      }
+      ws.send(JSON.stringify({ type: 'auth', token }));
+    };
     ws.onmessage = async (ev) => {
+      if (this.ws !== ws || this.wsGateway !== this.plugin.gatewayBase()) return;
       let m: { type?: string; content?: string; message?: string; agent_name?: string };
       try {
         m = JSON.parse(String(ev.data));
@@ -275,6 +357,11 @@ class ChatView extends ItemView {
       }
     };
     ws.onclose = () => {
+      if (this.ws === ws) {
+        this.ws = null;
+        this.wsGateway = null;
+        this.wsToken = null;
+      }
       // Reconnect lazily on next send; a closed socket while idle is normal.
     };
     ws.onerror = () => {
@@ -287,7 +374,13 @@ class ChatView extends ItemView {
 
   sendText(text: string): void {
     if (!text.trim()) return;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN ||
+      this.wsGateway !== this.plugin.gatewayBase() ||
+      this.wsToken !== this.plugin.settings.accessToken
+    ) {
+      this.resetConnection();
       this.connect();
       setTimeout(() => this.sendText(text), 700);
       return;
@@ -321,11 +414,10 @@ class DuduSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Gateway 位址')
-      .setDesc('你的 DuDuClaw gateway（本機預設 http://127.0.0.1:18789）')
+      .setDesc('你的 DuDuClaw gateway（本機預設 http://127.0.0.1:18889）')
       .addText((t) =>
         t.setValue(this.plugin.settings.gatewayUrl).onChange(async (v) => {
-          this.plugin.settings.gatewayUrl = v.trim();
-          await this.plugin.saveSettings();
+          await this.plugin.updateGatewayUrl(v);
         })
       );
 

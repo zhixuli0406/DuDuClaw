@@ -28,7 +28,7 @@ fn rejects_hostnames_and_injection_fail_closed() {
         "gateway.company.com",
         "0.0.0.0; rm -rf /",
         "0.0.0.0 --disable-auth",
-        "127.0.0.1:18789",
+        "127.0.0.1:18889",
         "0.0.0.0/0",
         "999.999.999.999",
         "0x7f000001",

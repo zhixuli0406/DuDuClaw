@@ -80,7 +80,7 @@ pub use concurrency_gate::{
 };
 pub use config::{
     gateway_bind_for_home, gateway_port_for_home, read_gateway_raw_settings, resolve_gateway_bind,
-    resolve_gateway_port, write_minimal_config, GatewaySettingSource,
+    resolve_gateway_port, write_minimal_config, GatewaySettingSource, DEFAULT_GATEWAY_PORT,
 };
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
 pub use delegation_policy::{

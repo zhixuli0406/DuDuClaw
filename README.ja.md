@@ -29,7 +29,7 @@ DuDuClaw は、Claude Code・Codex・Antigravity などの AI コマンドライ
 
 ```bash
 npm install -g duduclaw
-duduclaw run                  # 起動後 http://localhost:18789 を開く
+duduclaw run                  # 起動後 http://localhost:18889 を開く
 ```
 
 ## 目次
@@ -169,7 +169,7 @@ pip install duduclaw
 
   ```bash
   duduclaw run                  # まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
-  open http://localhost:18789   # ダッシュボードを開く
+  open http://localhost:18889   # ダッシュボードを開く
   ```
 
 どちらの方法でも、初回アクセスではウィザードが案内します:AI バックエンドを選ぶ → 最初のエージェントを作る → 内蔵 WebChat でそのまま会話。先にターミナルで `duduclaw onboard` を実行する必要はありません。あとは Channels ページに bot token を貼れば、同じエージェントを再起動なしで Telegram・LINE・Discord などに接続できます。

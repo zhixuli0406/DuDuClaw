@@ -679,9 +679,9 @@ mod tests {
         let body = alert_body(
             "Telegram",
             5,
-            Some("http://localhost:18789/manage/channels"),
+            Some("http://localhost:18889/manage/channels"),
         );
-        assert!(body.contains("👉 http://localhost:18789/manage/channels"));
+        assert!(body.contains("👉 http://localhost:18889/manage/channels"));
         assert!(body.starts_with("⚠️ Telegram"));
     }
 

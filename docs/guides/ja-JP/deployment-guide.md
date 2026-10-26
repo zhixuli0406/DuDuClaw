@@ -14,25 +14,34 @@ cargo build --release
 duduclaw run
 
 # Access Dashboard
-open http://localhost:18789
+open http://localhost:18889
 ```
 
-デフォルトポート：`18789`。`~/.duduclaw/config.toml` で設定します。
+デフォルトポート：`18889`。`~/.duduclaw/config.toml` で設定します。
+
+アップグレード時に、明示した `DUDUCLAW_PORT` や既存の `[gateway] port` は書き換えません。
+旧デフォルトの `18789` を使用しているインストールは、管理者が変更するまでそのポートを
+維持します。未設定の新規インストールだけが `18889` を使用します。
+
+既存の Docker データボリュームでは、現在のポートマッピングとヘルスチェックを維持して
+ください。移行する場合は、同じメンテナンス時間内に `[gateway] port`、Compose の
+`ports` マッピング、ヘルスチェック URL をまとめて `18889` に変更し、新規インストール用
+Compose テンプレートだけを置き換えないでください。
 
 ```toml
 [gateway]
 bind = "127.0.0.1"
-port = 18789
+port = 18889
 ```
 
 ### ヘルスチェック
 
 ```bash
-curl http://localhost:18789/health
+curl http://localhost:18889/health
 # {"status":"ok","version":"0.10.0","uptime_seconds":42,"agents_loaded":2,"channels_connected":["telegram","discord"]}
 
-curl http://localhost:18789/health/ready  # 200 when agents loaded
-curl http://localhost:18789/health/live   # 200 always (liveness probe)
+curl http://localhost:18889/health/ready  # 200 when agents loaded
+curl http://localhost:18889/health/live   # 200 always (liveness probe)
 ```
 
 ---
@@ -53,7 +62,7 @@ curl -fsSL https://tailscale.com/install.sh | sh  # Linux
 tailscale up
 
 # 3. Enable HTTPS + Funnel
-tailscale funnel 18789
+tailscale funnel 18889
 
 # This gives you a URL like:
 # https://your-machine.tail12345.ts.net/
@@ -71,7 +80,7 @@ tailscale funnel 18789
 
 ```bash
 # Run as background service
-tailscale funnel --bg 18789
+tailscale funnel --bg 18889
 
 # Or via systemd (Linux)
 # Add to duduclaw.service After=tailscaled.service
@@ -90,14 +99,14 @@ snap install ngrok        # Linux
 ngrok config add-authtoken YOUR_TOKEN
 
 # 3. Start tunnel
-ngrok http 18789
+ngrok http 18889
 
 # Copy the HTTPS URL (e.g., https://abc123.ngrok-free.app)
 # Set as LINE Webhook URL: https://abc123.ngrok-free.app/webhook/line
 ```
 
 **注意**：無料版 ngrok の URL は再起動のたびに変わります。固定したい場合は予約
-ドメインを使って `ngrok http 18789 --domain=your-domain.ngrok-free.app` のよう
+ドメインを使って `ngrok http 18889 --domain=your-domain.ngrok-free.app` のよう
 に実行してください。
 
 ---
@@ -123,7 +132,7 @@ credentials-file: /Users/YOU/.cloudflared/YOUR_TUNNEL_ID.json
 
 ingress:
   - hostname: duduclaw.yourdomain.com
-    service: http://localhost:18789
+    service: http://localhost:18889
   - service: http_status:404
 EOF
 
@@ -144,7 +153,7 @@ LINE Webhook を設定：`https://duduclaw.yourdomain.com/webhook/line`
 
 ```Caddyfile
 duduclaw.yourdomain.com {
-    reverse_proxy localhost:18789
+    reverse_proxy localhost:18889
 
     # WebSocket support (auto-detected by Caddy)
     # No extra config needed
@@ -166,7 +175,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/duduclaw.yourdomain.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:18789;
+        proxy_pass http://127.0.0.1:18889;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -277,7 +286,7 @@ services:
       context: .
       dockerfile: container/Dockerfile.server
     ports:
-      - "18789:18789"
+      - "18889:18889"
     volumes:
       - ~/.duduclaw:/home/duduclaw/.duduclaw
     environment:
@@ -286,7 +295,7 @@ services:
       - .env
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18889/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -390,7 +399,7 @@ auto_update = true   # default: false — dashboard notification only
 scrape_configs:
   - job_name: 'duduclaw'
     static_configs:
-      - targets: ['localhost:18789']
+      - targets: ['localhost:18889']
     metrics_path: '/metrics'
     scrape_interval: 30s
 ```
@@ -464,7 +473,7 @@ gateway になることはありません。共有サーバー側では、この
 # ~/.duduclaw/config.toml on the gateway server
 [gateway]
 bind = "0.0.0.0"        # reachable on the LAN (default 127.0.0.1 = local only)
-port = 18789
+port = 18889
 
 [general]
 name = "Office Gateway"  # shown as the instance name in the desktop picker
@@ -528,7 +537,7 @@ picker 自体は 3 通りの接続方法を提供します。
 1. **本機 / Local**：アプリに内蔵された gateway（単独利用向け）。
 2. **區網偵測 / On your network**：mDNS で発見された gateway。再スキャン
    ボタン付きで、各行に名前・`host:port`・バージョンが表示されます。
-3. **手動輸入 / Manual**：`192.168.1.10:18789` や `https://gw.company.com`
+3. **手動輸入 / Manual**：`192.168.1.10:18889` や `https://gw.company.com`
    を入力します。接続前にそのアドレスが `/healthz` で検証され、無効なア
    ドレスの場合はエラーが表示されて画面遷移**しません**。
 
@@ -549,7 +558,7 @@ gateway を選ぶとローカルの sidecar は解放されます（競合する
 
 | 方法 | URL | 用途 |
 |--------|-----|----------|
-| ローカルのみ | `http://localhost:18789` | 開発 |
+| ローカルのみ | `http://localhost:18889` | 開発 |
 | 企業 LAN | mDNS 自動検出（デスクトップ picker） | 社員 → 会社の gateway |
 | Tailscale | `https://xxx.ts.net` | 自宅サーバー、LINE webhook |
 | ngrok | `https://xxx.ngrok-free.app` | 簡易デモ |

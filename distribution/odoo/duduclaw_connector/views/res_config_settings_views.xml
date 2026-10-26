@@ -11,7 +11,7 @@
             <setting string="Gateway" help="模組只會連線到這個位址（你自己的伺服器）。無遙測、無第三方服務。">
               <field name="duduclaw_gateway_url" placeholder="http://192.168.1.10:8765"/>
               <field name="duduclaw_api_key" password="True"/>
-              <field name="duduclaw_dashboard_url" placeholder="http://192.168.1.10:18789"/>
+              <field name="duduclaw_dashboard_url" placeholder="http://192.168.1.10:18889"/>
               <button name="action_duduclaw_test_connection" type="object"
                       string="測試連線" class="btn-primary" icon="fa-plug"/>
             </setting>

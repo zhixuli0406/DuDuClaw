@@ -695,7 +695,7 @@ mod tests {
 
 # Gateway section comment
 [gateway]
-port = 18789 # trailing on port
+port = 18889 # trailing on port
 bind = "127.0.0.1"
 # auth_token = "commented-out"
 

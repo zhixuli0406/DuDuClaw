@@ -17,7 +17,7 @@ duduclaw gateway
 ```
 
 独立した `duduclaw dev` モードはありません。サーバーは以下を行います。
-- `config.toml [gateway]` のアドレス（`bind` / `port`、既定は `http://127.0.0.1:18789`）で Dashboard を提供します
+- `config.toml [gateway]` のアドレス（`bind` / `port`、既定は `http://127.0.0.1:18889`）で Dashboard を提供します
 - ログをリアルタイムで Dashboard にストリーミングします
 - どの Agent にもブラウザ MCP server を追加しません。`.mcp.json` にブラウザの項目を入れる方法は 2.4 節を参照してください
 

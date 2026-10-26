@@ -30,7 +30,7 @@ AI 員工清單一律由 gateway 依帳號綁定過濾（`agents.list` RPC），
 ## 安裝與設定
 
 1. 執行一個 DuDuClaw gateway（`duduclaw gateway`），本機或遠端皆可。
-2. 在 VS Code 設定裡調整 `duduclaw.gatewayUrl`（預設 `http://127.0.0.1:18789`）。
+2. 在 VS Code 設定裡調整 `duduclaw.gatewayUrl`（預設 `http://127.0.0.1:18889`）。
 3. 打開 DuDuClaw 側邊欄（爪印圖示），點擊**登入**，用你的 dashboard email/密碼登入。
 4. 面板頂部的下拉選單會列出你能對話的 AI 員工；選一位開始聊天，或用指令面板執行 `DuDuClaw: 切換 AI 員工`。
 

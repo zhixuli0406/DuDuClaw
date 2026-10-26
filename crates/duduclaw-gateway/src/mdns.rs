@@ -357,13 +357,13 @@ mdns_advertise = 1  # inline comment
             "tls" => Some("0".to_string()),
             _ => None,
         };
-        let rec = parse_gateway_advert(txt, "office-server.local.", 18789, Some("192.168.1.20"));
+        let rec = parse_gateway_advert(txt, "office-server.local.", 18889, Some("192.168.1.20"));
         assert_eq!(rec.name, "Office GW");
         assert_eq!(rec.host, "office-server"); // trailing `.local.` stripped
-        assert_eq!(rec.port, 18789);
+        assert_eq!(rec.port, 18889);
         assert_eq!(rec.version, "1.45.0");
         assert!(!rec.tls);
-        assert_eq!(rec.url, "http://192.168.1.20:18789/");
+        assert_eq!(rec.url, "http://192.168.1.20:18889/");
     }
 
     #[test]
@@ -382,9 +382,9 @@ mdns_advertise = 1  # inline comment
     #[test]
     fn parse_advert_falls_back_to_hostname_without_ipv4() {
         let txt = |_: &str| None;
-        let rec = parse_gateway_advert(txt, "gw.local.", 18789, None);
+        let rec = parse_gateway_advert(txt, "gw.local.", 18889, None);
         // No IPv4 → target is the hostname; no TXT → http, version empty.
-        assert_eq!(rec.url, "http://gw:18789/");
+        assert_eq!(rec.url, "http://gw:18889/");
         assert_eq!(rec.version, "");
         assert!(!rec.tls);
     }

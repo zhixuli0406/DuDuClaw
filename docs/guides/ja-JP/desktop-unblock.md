@@ -64,7 +64,7 @@ open "target/release/bundle/macos/DuDuClaw.app"
 | TODO項目 | 検証方法 |
 | --- | --- |
 | **D0🧪** | `cargo tauri dev`が起動し、ウィンドウにログインページが表示され、チャットを1件送ると応答が返ってくる |
-| **D1🧪** | （a）まずlaunchd／CLI gatewayが動いていないことを確認 → アプリを開くと**sidecarが自動起動する**こと。（b）先に`duduclaw run`でポート18789を占有しておく → アプリを開くと**再起動せずに接続する**こと（Activity Monitorに`duduclaw`プロセスが1つしか見えない） |
+| **D1🧪** | （a）まずlaunchd／CLI gatewayが動いていないことを確認 → アプリを開くと**sidecarが自動起動する**こと。（b）先に`duduclaw run`でポート18889を占有しておく → アプリを開くと**再起動せずに接続する**こと（Activity Monitorに`duduclaw`プロセスが1つしか見えない） |
 | **D2.1🧪** | アプリを2回連続で開く → 既存のウィンドウにフォーカスが移るだけで、`duduclaw`プロセスは1つしか存在しない |
 | **D2.3🧪** | 正常終了後に`ps aux | grep duduclaw`で残留プロセスがないこと。`kill -9`でアプリを強制終了して再度開くと、古いpidfile（`~/.duduclaw/desktop-sidecar.pid`）が指していた孤児プロセスを回収すること |
 | **D2.4🧪** | トレイアイコンに状態が表示される。メニューのStart／Stopでsidecarを操作できる。ウィンドウを閉じてもトレイに常駐し終了しない |

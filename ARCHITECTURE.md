@@ -517,7 +517,7 @@ strategy = "priority"        # round_robin | least_cost | failover | priority
 
 [gateway]
 bind = "127.0.0.1"
-port = 18789
+port = 18889
 
 # [channels]                 # 扁平 `<platform>_<field>[_enc]` 鍵
 # telegram_bot_token_enc = "<ciphertext>"

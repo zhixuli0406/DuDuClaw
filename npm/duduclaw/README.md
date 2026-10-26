@@ -11,7 +11,7 @@ npm install -g duduclaw
 duduclaw run
 ```
 
-Open http://localhost:18789 and follow the setup wizard. Bring an AI provider API key, a supported CLI, or a local OpenAI-compatible model server. Provider usage may incur charges. Subscription sign-in has provider-specific terms and a risk notice; it is not a promise of unlimited or included usage.
+Open http://localhost:18889 and follow the setup wizard. Bring an AI provider API key, a supported CLI, or a local OpenAI-compatible model server. Provider usage may incur charges. Subscription sign-in has provider-specific terms and a risk notice; it is not a promise of unlimited or included usage.
 
 ## Standalone MCP memory server
 

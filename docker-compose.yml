@@ -33,6 +33,7 @@ services:
       # Grok (xAI): API key — deployment-key/OIDC login lives in duduclaw-grok volume
       - XAI_API_KEY=${XAI_API_KEY:-}
       - DUDUCLAW_BIND=0.0.0.0
+      - DUDUCLAW_INITIAL_PORT=18789
       - LINE_CHANNEL_TOKEN=${LINE_CHANNEL_TOKEN:-}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}

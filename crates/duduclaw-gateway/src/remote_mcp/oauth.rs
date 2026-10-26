@@ -790,10 +790,10 @@ mod tests {
 
     #[test]
     fn registration_body_is_a_public_client_named_duduclaw() {
-        let b = registration_body("http://localhost:18789/oauth/mcp/callback", None);
+        let b = registration_body("http://localhost:18889/oauth/mcp/callback", None);
         assert_eq!(b["client_name"], "DuDuClaw");
         assert_eq!(b["token_endpoint_auth_method"], "none");
-        assert_eq!(b["redirect_uris"][0], "http://localhost:18789/oauth/mcp/callback");
+        assert_eq!(b["redirect_uris"][0], "http://localhost:18889/oauth/mcp/callback");
     }
 
     #[test]

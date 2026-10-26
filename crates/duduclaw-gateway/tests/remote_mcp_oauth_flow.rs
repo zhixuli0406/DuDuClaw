@@ -224,7 +224,7 @@ async fn oauth_connect_callback_bridge_and_refresh() {
             url: Some(format!("{base}/mcp")),
             auth: store::AuthKind::Oauth,
             bearer: None,
-            redirect_origin: Some("http://localhost:18789".into()),
+            redirect_origin: Some("http://localhost:18889".into()),
             client_id: None,
             client_secret: None,
             allowed_origins: vec![],
@@ -245,14 +245,14 @@ async fn oauth_connect_callback_bridge_and_refresh() {
     let resp = http.get(&authorize_url).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 302);
     let location = resp.headers()["location"].to_str().unwrap().to_string();
-    assert!(location.starts_with("http://localhost:18789/oauth/mcp/callback?"), "{location}");
+    assert!(location.starts_with("http://localhost:18889/oauth/mcp/callback?"), "{location}");
     let loc = url::Url::parse(&location).unwrap();
     let q: HashMap<String, String> = loc.query_pairs().into_owned().collect();
 
     // 3. Callback: state is single use.
     let done = connect::complete_callback(home, &q["state"], &q["code"]).await.expect("callback");
     assert_eq!((done.agent_id.as_str(), done.server.as_str()), ("a1", "fake"));
-    assert_eq!(done.redirect_origin, "http://localhost:18789");
+    assert_eq!(done.redirect_origin, "http://localhost:18889");
     assert!(connect::complete_callback(home, &q["state"], &q["code"]).await.is_err());
     {
         let f = fake.lock().unwrap();
@@ -369,7 +369,7 @@ async fn lan_http_dashboard_signs_in_through_a_pasted_loopback_callback() {
             url: Some(format!("{base}/mcp")),
             auth: store::AuthKind::Oauth,
             bearer: None,
-            redirect_origin: Some("http://192.168.1.20:18789".into()),
+            redirect_origin: Some("http://192.168.1.20:18889".into()),
             client_id: None,
             client_secret: None,
             allowed_origins: vec![],
@@ -383,12 +383,12 @@ async fn lan_http_dashboard_signs_in_through_a_pasted_loopback_callback() {
         panic!("expected an authorize URL")
     };
     assert_eq!(completion, connect::Completion::Paste);
-    assert_eq!(redirect_uri, "http://127.0.0.1:18789/oauth/mcp/callback");
+    assert_eq!(redirect_uri, "http://127.0.0.1:18889/oauth/mcp/callback");
 
     let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
     let resp = http.get(&authorize_url).send().await.unwrap();
     let location = resp.headers()["location"].to_str().unwrap().to_string();
-    assert!(location.starts_with("http://127.0.0.1:18789/oauth/mcp/callback?"), "{location}");
+    assert!(location.starts_with("http://127.0.0.1:18889/oauth/mcp/callback?"), "{location}");
 
     // What the operator copies from the address bar of the failed page.
     let done = connect::complete_pasted(home, &location).await.expect("pasted callback");

@@ -7,7 +7,7 @@
 | 環境変数 | 用途 | インスタンスごとに変える必要 |
 | --- | --- | --- |
 | `DUDUCLAW_HOME` | 状態ルート：config、SQLite データベース、`bus_queue.jsonl`、`events.db`、models、shared wiki、secrets、cron。デフォルトは `~/.duduclaw`。 | **あり** |
-| `DUDUCLAW_PORT` | Gateway の HTTP/WS ポート。デフォルトは `18789`。 | **あり** |
+| `DUDUCLAW_PORT` | Gateway の HTTP/WS ポート。デフォルトは `18889`。 | **あり** |
 | `DUDUCLAW_INSTANCE` | 短いインスタンス名（`[a-z0-9-]`）。`~/.claude/settings.json` 内の**グローバル MCP 登録**キーに名前空間を付け（`duduclaw` → `duduclaw-<name>`）、インスタンス同士が互いを上書きしないようにする。 | 推奨 |
 
 各サブシステムは単一の標準ヘルパー（`duduclaw_core::duduclaw_home()`）を通じて自身の状態ルートを解決するため、`DUDUCLAW_HOME` を設定すると、そのインスタンスに属する*すべて*の状態が移動します。パスが `~/.duduclaw` へこっそり漏れ戻ることはありません。
@@ -16,11 +16,11 @@
 
 ```bash
 # インスタンス "work"
-DUDUCLAW_HOME=~/dd-work  DUDUCLAW_PORT=18789 DUDUCLAW_INSTANCE=work \
+DUDUCLAW_HOME=~/dd-work  DUDUCLAW_PORT=18889 DUDUCLAW_INSTANCE=work \
   duduclaw run --yes
 
 # インスタンス "play"
-DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
+DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18890 DUDUCLAW_INSTANCE=play \
   duduclaw run --yes
 ```
 
@@ -32,12 +32,12 @@ DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
     "duduclaw-work": {
       "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
-      "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18789", "DUDUCLAW_INSTANCE": "work" }
+      "env": { "DUDUCLAW_HOME": "/Users/you/dd-work", "DUDUCLAW_PORT": "18889", "DUDUCLAW_INSTANCE": "work" }
     },
     "duduclaw-play": {
       "command": "/path/to/duduclaw",
       "args": ["mcp-server"],
-      "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18790", "DUDUCLAW_INSTANCE": "play" }
+      "env": { "DUDUCLAW_HOME": "/Users/you/dd-play", "DUDUCLAW_PORT": "18890", "DUDUCLAW_INSTANCE": "play" }
     }
   }
 }
@@ -61,4 +61,4 @@ DUDUCLAW_HOME=~/dd-play  DUDUCLAW_PORT=18790 DUDUCLAW_INSTANCE=play \
 ## より強い分離モデルを選ぶべきとき
 
 - **独立した OS ユーザー**：各インスタンスが自分のアカウント配下で動くため、`~/.duduclaw` と `~/.claude`（OAuth）はファイルシステムレベルの境界で自然に分離されます。環境変数への依存はゼロですが、ポートは依然として個別に必要です。
-- **コンテナ（Docker／Podman）**：ファイルシステムとネットワーク名前空間の完全な分離。各コンテナは内部で同じポート `18789` を再利用し、ホスト側の異なるポートへマッピングできます。注意：macOS 上では Linux コンテナに Metal がないため、ローカルの GGUF 推論は CPU にフォールバックします（GPU が必要な場合は推論をホスト側に残してください）。
+- **コンテナ（Docker／Podman）**：ファイルシステムとネットワーク名前空間の完全な分離。各コンテナは内部で同じポート `18889` を再利用し、ホスト側の異なるポートへマッピングできます。注意：macOS 上では Linux コンテナに Metal がないため、ローカルの GGUF 推論は CPU にフォールバックします（GPU が必要な場合は推論をホスト側に残してください）。

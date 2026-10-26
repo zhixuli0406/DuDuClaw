@@ -10,6 +10,12 @@
 use crate::error::{DuDuClawError, Result};
 use std::path::Path;
 
+/// Factory-default HTTP/WebSocket port for the gateway.
+///
+/// Explicit `DUDUCLAW_PORT` and `[gateway] port` values always take priority,
+/// so upgrades do not rewrite an operator's existing endpoint.
+pub const DEFAULT_GATEWAY_PORT: u16 = 18889;
+
 /// Write a minimal but valid `config.toml` into `home`.
 ///
 /// Only the sections the operator cares about on first boot are written —
@@ -170,11 +176,11 @@ pub fn gateway_bind_for_home(home: &Path) -> (String, GatewaySettingSource) {
 
 /// Convenience wrapper: resolve the effective gateway port for `home`,
 /// reading `DUDUCLAW_PORT` and `<home>/config.toml [gateway] port`. Default
-/// is `18789`, matching the CLI's historical default.
+/// is [`DEFAULT_GATEWAY_PORT`].
 pub fn gateway_port_for_home(home: &Path) -> (u16, GatewaySettingSource) {
     let (_, config_port) = read_gateway_raw_settings(home);
     let env_port = std::env::var("DUDUCLAW_PORT").ok();
-    resolve_gateway_port(env_port.as_deref(), config_port, 18789)
+    resolve_gateway_port(env_port.as_deref(), config_port, DEFAULT_GATEWAY_PORT)
 }
 
 #[cfg(test)]
@@ -216,16 +222,16 @@ mod tests {
 
     #[test]
     fn port_prefers_env_over_config_over_default() {
-        let (port, source) = resolve_gateway_port(Some("9000"), Some(9100), 18789);
+        let (port, source) = resolve_gateway_port(Some("9000"), Some(9100), 18889);
         assert_eq!(port, 9000);
         assert_eq!(source, GatewaySettingSource::Env);
 
-        let (port, source) = resolve_gateway_port(None, Some(9100), 18789);
+        let (port, source) = resolve_gateway_port(None, Some(9100), 18889);
         assert_eq!(port, 9100);
         assert_eq!(source, GatewaySettingSource::Config);
 
-        let (port, source) = resolve_gateway_port(None, None, 18789);
-        assert_eq!(port, 18789);
+        let (port, source) = resolve_gateway_port(None, None, 18889);
+        assert_eq!(port, 18889);
         assert_eq!(source, GatewaySettingSource::Default);
     }
 
@@ -233,12 +239,12 @@ mod tests {
     fn port_falls_through_on_unparseable_env_value() {
         // A malformed env var must not shadow a valid config.toml value —
         // it's treated as absent, not as "force default".
-        let (port, source) = resolve_gateway_port(Some("not-a-port"), Some(9100), 18789);
+        let (port, source) = resolve_gateway_port(Some("not-a-port"), Some(9100), 18889);
         assert_eq!(port, 9100);
         assert_eq!(source, GatewaySettingSource::Config);
 
-        let (port, source) = resolve_gateway_port(Some("not-a-port"), None, 18789);
-        assert_eq!(port, 18789);
+        let (port, source) = resolve_gateway_port(Some("not-a-port"), None, 18889);
+        assert_eq!(port, 18889);
         assert_eq!(source, GatewaySettingSource::Default);
     }
 
@@ -246,12 +252,12 @@ mod tests {
     fn port_config_value_out_of_u16_range_is_ignored() {
         // A corrupt/out-of-range config value (negative or > 65535) must not
         // panic and must fall through to the default.
-        let (port, source) = resolve_gateway_port(None, Some(999_999), 18789);
-        assert_eq!(port, 18789);
+        let (port, source) = resolve_gateway_port(None, Some(999_999), 18889);
+        assert_eq!(port, 18889);
         assert_eq!(source, GatewaySettingSource::Default);
 
-        let (port, source) = resolve_gateway_port(None, Some(-1), 18789);
-        assert_eq!(port, 18789);
+        let (port, source) = resolve_gateway_port(None, Some(-1), 18889);
+        assert_eq!(port, 18889);
         assert_eq!(source, GatewaySettingSource::Default);
     }
 
@@ -284,12 +290,12 @@ mod tests {
     }
 
     #[test]
-    fn backward_compat_neither_env_nor_config_set_behaves_as_before() {
-        // The exact pre-fix behavior (both absent) must be unchanged.
+    fn factory_default_avoids_the_competitor_gateway_port() {
         assert_eq!(
-            resolve_gateway_port(None, None, 18789),
-            (18789, GatewaySettingSource::Default)
+            resolve_gateway_port(None, None, DEFAULT_GATEWAY_PORT),
+            (18889, GatewaySettingSource::Default)
         );
+        assert_ne!(DEFAULT_GATEWAY_PORT, 18789);
         assert_eq!(
             resolve_gateway_bind(None, None, "127.0.0.1"),
             ("127.0.0.1".to_string(), GatewaySettingSource::Default)

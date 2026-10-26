@@ -594,7 +594,7 @@ mod tests {
         assert!(interpret(403, br#"{"ok":false}"#).unwrap_err().contains("HTTP 403"));
         // `ok` must be true on a 200 too.
         assert!(interpret(200, br#"{"ok":false,"message":"x"}"#).is_err());
-        assert!(transport_message(TransportFailure::Connect, 18789, START_TIMEOUT).contains("127.0.0.1:18789"));
+        assert!(transport_message(TransportFailure::Connect, 18889, START_TIMEOUT).contains("127.0.0.1:18889"));
         assert!(transport_message(TransportFailure::Timeout, 1, ACTION_TIMEOUT).contains("400 秒"));
     }
 

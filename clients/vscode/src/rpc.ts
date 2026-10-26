@@ -8,7 +8,7 @@
 // the JWT never enters the webview at all.
 import * as vscode from 'vscode';
 import WebSocket from 'ws';
-import { SECRET_ACCESS, gatewayUrl, sessionStateKey } from './config';
+import { SECRET_ACCESS, ensureGatewayIdentity, gatewayUrl, sessionStateKey } from './config';
 import { friendlyErrorMessage, isAuthError, refreshAccessToken } from './auth';
 import type { AgentListEntry, GoalCreateResult, TaskItem } from './types';
 
@@ -100,6 +100,7 @@ export class GatewayClient {
     if (this.chat && this.chat.readyState === WebSocket.OPEN) return this.chat;
     const token = await this.token();
     if (!token) throw new Error(NOT_AUTHED_ERROR);
+    await ensureGatewayIdentity();
     const sock = new WebSocket(this.wsUrl('/ws/chat'));
     this.chat = sock;
     // Fresh socket ⇒ fresh connection ⇒ the gateway will mint a NEW random
@@ -276,6 +277,7 @@ export class GatewayClient {
     }
     const token = await this.token();
     if (!token) throw new Error(NOT_AUTHED_ERROR);
+    await ensureGatewayIdentity();
     const sock = new WebSocket(this.wsUrl('/ws'));
     this.rpcSock = sock;
     // The gateway speaks its own `WsFrame` protocol (see

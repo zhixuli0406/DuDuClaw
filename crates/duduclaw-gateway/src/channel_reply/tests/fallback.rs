@@ -336,17 +336,17 @@ mod fallback_tests {
     #[test]
     fn format_fallback_message_appends_console_link_when_dashboard_resolvable() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 18789\n").unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 18889\n").unwrap();
 
         let billing_msg = format_fallback_message("Agnes", FailureReason::RateLimited, dir.path());
         assert!(
-            billing_msg.contains("🔎 詳情：http://localhost:18789/manage/billing"),
+            billing_msg.contains("🔎 詳情：http://localhost:18889/manage/billing"),
             "billing-group failure must link to /manage/billing: {billing_msg}"
         );
 
         let system_msg = format_fallback_message("Agnes", FailureReason::Timeout, dir.path());
         assert!(
-            system_msg.contains("🔎 詳情：http://localhost:18789/manage/logs"),
+            system_msg.contains("🔎 詳情：http://localhost:18889/manage/logs"),
             "CLI-side failure must link to /manage/logs: {system_msg}"
         );
 

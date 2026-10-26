@@ -9,7 +9,7 @@ Railway 模板不是 repo 內檔案，而是在 Railway dashboard 用「Template
    - Service 名稱：`duduclaw`
 2. Service 設定：
    - **Volume**：mount path `/home/duduclaw/.duduclaw`（沒 volume 重啟就掉資料——必設）
-   - **Networking**：expose port `18789`（Railway 會給 `https://<app>.up.railway.app` 公網域名）
+   - **Networking**：expose port `18889`（Railway 會給 `https://<app>.up.railway.app` 公網域名）
    - **Healthcheck**：path `/health`
 3. 環境變數（模板欄位，讓部署者填）：
    - `DUDUCLAW_BIND=0.0.0.0`（固定值）

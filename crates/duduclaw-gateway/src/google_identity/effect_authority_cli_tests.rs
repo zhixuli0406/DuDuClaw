@@ -184,7 +184,7 @@ struct Composed {
 }
 impl Composed {
     async fn new(home_fallback: bool, native_fixture: bool) -> Self {
-        // Do not overwrite global environment or accidentally target port18789.
+        // Do not overwrite global environment or accidentally target port18889.
         assert!(std::env::var_os("DUDUCLAW_PORT").is_none());
         let fixture = d1_fixture(home_fallback);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

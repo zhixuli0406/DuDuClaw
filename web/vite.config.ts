@@ -6,7 +6,7 @@ import path from 'path';
 // Gateway backend URL — configurable via DUDUCLAW_GATEWAY env var (FE-L6).
 // Default to IPv4 127.0.0.1 (not "localhost"): the gateway binds 127.0.0.1, and
 // Node's proxy resolves "localhost" to IPv6 ::1 first on macOS → ECONNREFUSED.
-const gatewayUrl = process.env.DUDUCLAW_GATEWAY ?? 'http://127.0.0.1:18789';
+const gatewayUrl = process.env.DUDUCLAW_GATEWAY ?? 'http://127.0.0.1:18889';
 const gatewayWs = gatewayUrl.replace(/^http/, 'ws');
 
 export default defineConfig({

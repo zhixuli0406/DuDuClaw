@@ -17,7 +17,7 @@ duduclaw gateway
 ```
 
 There is no separate `duduclaw dev` mode. The server:
-- Serves the dashboard on the address in `config.toml [gateway]` (`bind` / `port`, default `http://127.0.0.1:18789`)
+- Serves the dashboard on the address in `config.toml [gateway]` (`bind` / `port`, default `http://127.0.0.1:18889`)
 - Streams logs to the dashboard in real time
 - Does not add a browser MCP server to any agent; see section 2.4 for how one gets into `.mcp.json`
 

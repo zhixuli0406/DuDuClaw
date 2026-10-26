@@ -29,7 +29,7 @@ DuDuClaw 把 Claude Code、Codex、Antigravity 這類 AI 指令列工具，變�
 
 ```bash
 npm install -g duduclaw
-duduclaw run                  # 接著打開 http://localhost:18789
+duduclaw run                  # 接著打開 http://localhost:18889
 ```
 
 
@@ -170,7 +170,7 @@ pip install duduclaw
 
   ```bash
   duduclaw run                  # 啟動(gateway + 通道 + 排程 + dispatcher 一次拉起)
-  open http://localhost:18789   # 打開管理後台
+  open http://localhost:18889   # 打開管理後台
   ```
 
 無論走哪條路,第一次打開都會進入引導精靈,所有設定都在瀏覽器裡完成:選 AI 後端 → 建立第一個 agent → 直接在內建 WebChat 對話,不必先在終端機跑 `duduclaw onboard`。之後到 Channels 頁貼上 bot token,就能把同一個 agent 接上 Telegram、LINE、Discord 等平台,不用重啟。

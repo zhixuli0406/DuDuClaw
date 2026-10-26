@@ -108,10 +108,10 @@ google_workspace = true
 5. 「已授權的重新導向 URI」加入：
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
-   `18789` 是 gateway 預設埠；若用 `DUDUCLAW_PORT` 改了埠，dashboard 這頁
+   `18889` 是 gateway 預設埠；若用 `DUDUCLAW_PORT` 改了埠，dashboard 這頁
    會顯示改埠後的正確網址，以畫面顯示為準。這裡埠號不一致是**沉默**失敗：
    Google 會把瀏覽器導到一個沒有東西在聽的埠，畫面停在「尚未連接」，不會
    跳出明顯錯誤訊息。

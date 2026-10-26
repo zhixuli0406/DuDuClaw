@@ -16,8 +16,20 @@ async function ensureHostPermission(url) {
   }
 }
 
+async function isDuduClawGateway(url) {
+  try {
+    const res = await fetch(url + '/healthz', {
+      signal: AbortSignal.timeout(750),
+    });
+    const body = await res.json();
+    return body?.service === 'duduclaw-gateway';
+  } catch {
+    return false;
+  }
+}
+
 $('loginBtn').addEventListener('click', async () => {
-  const gateway = ($('gateway').value.trim() || 'http://127.0.0.1:18789').replace(/\/+$/, '');
+  const gateway = ($('gateway').value.trim() || 'http://127.0.0.1:18889').replace(/\/+$/, '');
   const email = $('email').value.trim();
   const password = $('password').value;
   if (!email || !password) { show('請填 Email 與密碼', false); return; }
@@ -31,6 +43,10 @@ $('loginBtn').addEventListener('click', async () => {
 
   show('登入中…', true);
   try {
+    if (!(await isDuduClawGateway(gateway))) {
+      show('拒絕傳送密碼：目標不是 DuDuClaw gateway', false);
+      return;
+    }
     const res = await fetch(gateway + '/api/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -45,6 +61,7 @@ $('loginBtn').addEventListener('click', async () => {
       gatewayUrl: gateway,
       accessToken: data.access_token,
       refreshToken: data.refresh_token || null,
+      gatewayMigrationPending: false,
     });
     $('password').value = '';
     show('登入成功，可以回側邊欄開始對話了', true);
@@ -55,7 +72,7 @@ $('loginBtn').addEventListener('click', async () => {
 
 (async function init() {
   const cfg = await chrome.storage.local.get(['gatewayUrl']);
-  $('gateway').value = cfg.gatewayUrl || 'http://127.0.0.1:18789';
+  $('gateway').value = cfg.gatewayUrl || 'http://127.0.0.1:18889';
   $('extid').textContent = chrome.runtime.id;
   $('copyId').addEventListener('click', () => navigator.clipboard.writeText(chrome.runtime.id));
 })();

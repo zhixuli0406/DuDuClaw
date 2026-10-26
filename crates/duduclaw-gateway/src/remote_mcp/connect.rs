@@ -1207,14 +1207,14 @@ mod tests {
             "other.example.com:8443".to_string(),
         ];
         assert_eq!(
-            validate_redirect_origin("http://localhost:18789", &allowed).unwrap(),
-            "http://localhost:18789"
+            validate_redirect_origin("http://localhost:18889", &allowed).unwrap(),
+            "http://localhost:18889"
         );
         assert_eq!(
             validate_redirect_origin("http://127.0.0.1:5173/", &allowed).unwrap(),
             "http://127.0.0.1:5173"
         );
-        assert!(validate_redirect_origin("http://[::1]:18789", &allowed).is_ok());
+        assert!(validate_redirect_origin("http://[::1]:18889", &allowed).is_ok());
         assert_eq!(
             validate_redirect_origin("https://dash.example.com", &allowed).unwrap(),
             "https://dash.example.com"
@@ -1241,10 +1241,10 @@ mod tests {
         let allowed = vec!["dash.example.com".to_string()];
         // Loopback and allowlisted https stay direct.
         assert_eq!(
-            plan_redirect("http://localhost:18789", &allowed).unwrap(),
+            plan_redirect("http://localhost:18889", &allowed).unwrap(),
             RedirectPlan::Direct {
-                origin: "http://localhost:18789".into(),
-                redirect_uri: "http://localhost:18789/oauth/mcp/callback".into(),
+                origin: "http://localhost:18889".into(),
+                redirect_uri: "http://localhost:18889/oauth/mcp/callback".into(),
             }
         );
         assert!(matches!(
@@ -1255,8 +1255,8 @@ mod tests {
         // redirected to the browser machine's loopback on the same port.
         for (raw, uri) in [
             (
-                "http://192.168.1.20:18789",
-                "http://127.0.0.1:18789/oauth/mcp/callback",
+                "http://192.168.1.20:18889",
+                "http://127.0.0.1:18889/oauth/mcp/callback",
             ),
             (
                 "http://duduclaw.local:8080/",
@@ -1289,29 +1289,29 @@ mod tests {
     fn pasted_callback_parsing() {
         assert_eq!(
             parse_pasted_callback(
-                "  http://127.0.0.1:18789/oauth/mcp/callback?code=abc&state=st1  "
+                "  http://127.0.0.1:18889/oauth/mcp/callback?code=abc&state=st1  "
             )
             .unwrap(),
             PastedCallback::Code {
                 state: "st1".into(),
                 code: "abc".into(),
-                redirect_uri: "http://127.0.0.1:18789/oauth/mcp/callback".into(),
+                redirect_uri: "http://127.0.0.1:18889/oauth/mcp/callback".into(),
             }
         );
         assert_eq!(
-            parse_pasted_callback("http://127.0.0.1:18789/oauth/mcp/callback?error=access_denied&error_description=no&state=st1").unwrap(),
+            parse_pasted_callback("http://127.0.0.1:18889/oauth/mcp/callback?error=access_denied&error_description=no&state=st1").unwrap(),
             PastedCallback::Error { state: "st1".into(), error: "access_denied".into(), description: "no".into() }
         );
         for bad in [
             "",
             "code=abc&state=st1",
-            "http://192.168.1.20:18789/oauth/mcp/callback?code=abc&state=st1",
+            "http://192.168.1.20:18889/oauth/mcp/callback?code=abc&state=st1",
             "http://localhost.evil.com/oauth/mcp/callback?code=abc&state=st1",
-            "http://127.0.0.1:18789/elsewhere?code=abc&state=st1",
-            "http://127.0.0.1:18789/oauth/mcp/callback?code=abc",
-            "http://127.0.0.1:18789/oauth/mcp/callback?state=st1",
-            "http://127.0.0.1:18789/oauth/mcp/callback?code=a&code=b&state=st1",
-            "http://u:p@127.0.0.1:18789/oauth/mcp/callback?code=abc&state=st1",
+            "http://127.0.0.1:18889/elsewhere?code=abc&state=st1",
+            "http://127.0.0.1:18889/oauth/mcp/callback?code=abc",
+            "http://127.0.0.1:18889/oauth/mcp/callback?state=st1",
+            "http://127.0.0.1:18889/oauth/mcp/callback?code=a&code=b&state=st1",
+            "http://u:p@127.0.0.1:18889/oauth/mcp/callback?code=abc&state=st1",
         ] {
             assert!(parse_pasted_callback(bad).is_err(), "{bad}");
         }
@@ -1328,8 +1328,8 @@ mod tests {
                     agent_id: "a1".into(),
                     server: "s".into(),
                     mcp_url: "https://mcp.example.com/mcp".into(),
-                    redirect_uri: "http://127.0.0.1:18789/oauth/mcp/callback".into(),
-                    redirect_origin: "http://192.168.1.20:18789".into(),
+                    redirect_uri: "http://127.0.0.1:18889/oauth/mcp/callback".into(),
+                    redirect_origin: "http://192.168.1.20:18889".into(),
                     paste,
                     code_verifier: "v".into(),
                     token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
@@ -1363,7 +1363,7 @@ mod tests {
         assert!(
             complete_pasted(
                 dir.path(),
-                "http://127.0.0.1:18789/oauth/mcp/callback?code=c&state=st-direct"
+                "http://127.0.0.1:18889/oauth/mcp/callback?code=c&state=st-direct"
             )
             .await
             .is_err()
@@ -1372,7 +1372,7 @@ mod tests {
         insert("st-denied", true);
         let err = complete_pasted(
             dir.path(),
-            "http://127.0.0.1:18789/oauth/mcp/callback?error=access_denied&state=st-denied",
+            "http://127.0.0.1:18889/oauth/mcp/callback?error=access_denied&state=st-denied",
         )
         .await
         .unwrap_err();
