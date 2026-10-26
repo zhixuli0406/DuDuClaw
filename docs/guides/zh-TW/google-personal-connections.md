@@ -1,4 +1,4 @@
-# 連結自己的 Google（企業版，未發布）
+# 連結自己的 Google（企業版，v1.76.0）
 
 讓 AI 員工使用你自己的 Google，不必更動公司共用帳號。哪些員工可以用，要由你本人決定；你隨時可以收回。
 
@@ -93,7 +93,7 @@ requesters = "bound_people"      # 或 "owner_only"；"anyone" 須明確確認
 
 另見：[原生 Google Workspace](google-workspace.md)、[Google PKCE 說明](https://developers.google.com/identity/protocols/oauth2/native-app#step1-code-verifier)、[OpenID 帳號資訊](https://developers.google.com/identity/openid-connect/openid-connect#obtaininguserprofileinformation)、[Google 撤銷授權](https://developers.google.com/identity/protocols/oauth2/web-server#tokenrevoke)。
 
-## 未發布的帳號選擇與狀態查詢
+## 帳號選擇與狀態查詢（v1.76.0）
 
 公司帳號備援會把已授予的服務權限固定到原先選定的原生工具，保留既有的擇一授權規則。只有原先的個人帳號無法使用、且管理員已允許公司備援時，才會選用同一份公司共用 OAuth 連線；原本可用的個人選擇不能在後續出錯後改成公司備援。
 
@@ -107,7 +107,7 @@ requesters = "bound_people"      # 或 "owner_only"；"anyone" 須明確確認
 
 遠端操作共用同一期限，涵蓋排隊、準備、三個協定 POST 與結果處理。請求 frame 上限 16 MiB，每個 POST 的回覆各自上限 16 MiB，不是整次累計 16 MiB。不自動重試、跟隨重新導向或使用環境 proxy。逾期結果連同帳號告知與新查閱代碼一起扣留。取消不會撤回 Google 寫入；結果不明時請先到 Google 檢查，再決定是否重試。已開始的本機紀錄維護可能稍後才完成，因此取消不保證所有本機紀錄立即刪除。
 
-遠端延伸尚未發布。M1／CLI 本機聚焦測試與獨立程式／安全審查已通過，範圍見下方整合驗證說明。既有 D1 證據仍獨立保留；這些測試不代表 Google 實際連線或使用者驗收。
+遠端延伸納入 v1.76.0。M1／CLI 本機聚焦測試與獨立程式／安全審查已通過，範圍見下方整合驗證說明。既有 D1 證據仍獨立保留；這些測試不代表 Google 實際連線或使用者驗收。
 
 系統金鑰圈與本機同步讀寫無法被逾時強制中止；返回後會重新核對同一期限，再決定是否送出或交付結果。
 
@@ -121,7 +121,7 @@ requesters = "bound_people"      # 或 "owner_only"；"anyone" 須明確確認
 
 原生工具的 `attendees` 參數是逗號分隔的字串，不是陣列。Bridge 會在 I/O 前拒絕非空 `cc`、CSV 解析後非空的參與者清單，或 `with_meet=true`。空的 `cc`、空參與者清單與 `with_meet=false` 沒有要求這些不支援的功能，可繼續一般請求；這不保證所有未知或錯型欄位都會被拒絕。
 
-檔案、環境變數、設定與標記的本機變化會使原選擇失效。沒有版本通知的 Keychain／外部秘密管理服務採每次操作快照；無法立即察覺帶外輪替或外部服務恢復。同步 OS／金鑰圈操作無法硬中斷，返回後會先驗期限，再決定是否開始下一步；跨檔案觀察與最後檢查到送出之間仍有競態限制。這些變更尚未發布。W3 本機聚焦測試與獨立程式／安全審查已通過；真 Google／Apps Script 相容性、平台檢查與使用者驗收仍須獨立證據，CI 以各 PR 最新 head 為準。郵件輪詢等既有自動化 API 不在本次範圍。
+檔案、環境變數、設定與標記的本機變化會使原選擇失效。沒有版本通知的 Keychain／外部秘密管理服務採每次操作快照；無法立即察覺帶外輪替或外部服務恢復。同步 OS／金鑰圈操作無法硬中斷，返回後會先驗期限，再決定是否開始下一步；跨檔案觀察與最後檢查到送出之間仍有競態限制。這些變更納入 v1.76.0。W3 本機聚焦測試與獨立程式／安全審查已通過；真 Google／Apps Script 相容性、平台檢查與使用者驗收仍須獨立證據，CI 以各 PR 最新 head 為準。郵件輪詢等既有自動化 API 不在本次範圍。
 
 帳號選擇不會試跑 Apps Script POST 當健康檢查。直接憑證取得的歷史失敗只用來固定 Ask 前的選擇，不代表服務當下健康狀態；直接資料操作可能已送出後，不會再改用 Bridge 重送第二次。既有 direct→Bridge 備援行為保留在舊 API 路徑。
 

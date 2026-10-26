@@ -1,8 +1,8 @@
 # MCP HTTP 操作ごとの権限の有効期間
 
-更新日：2026-10-25。状態：`mcp-client` feature を使う、`duduclaw-llm` の未リリース開発者 API。
+更新日：2026-10-26。状態：v1.76.0 に含まれる、`mcp-client` feature を使う `duduclaw-llm` の開発者 API。
 
-ホストは MCP のツール探索や一回のツール呼び出しに、新しい bearer とその操作だけが所有する lease を渡せます。本書は共通トランスポート API のリファレンスです。以下の bearer／lease API は従来の Generic 経路です。未リリースの Google 個人アカウント連携は下記の独立した Closed 経路を使い、新しい画面スイッチは追加しません。
+ホストは MCP のツール探索や一回のツール呼び出しに、新しい bearer とその操作だけが所有する lease を渡せます。本書は共通トランスポート API のリファレンスです。以下の bearer／lease API は従来の Generic 経路です。v1.76.0 に含まれる Google 個人アカウント連携は下記の独立した Closed 経路を使い、新しい画面スイッチは追加しません。
 
 ## ホスト API の契約
 
@@ -33,7 +33,7 @@ Scoped の応答は、今回の bearer を返却 JSON の key と value から�
 
 `RegistryClient::Persistent` は既存の接続と `before_call_async` 経路を維持します。scoped の準備はその slot の before hook を置き換え、二重には呼びません。既存の filter、同名ツールの先着優先、`after_call`、ソース証明／CCR、ホスト通知は registry の処理を通ります。
 
-## Google ホストの Closed 接続（未リリースのソース草稿）
+## Google ホストの Closed 接続（v1.76.0）
 
 `RegistryClient::scoped_http_closed(recipe, host_binding, guard)` で明示的に選択します。実際の slot が server、recipe、filter、元の設定項目、絶対期限を持つ `ClosedClientTarget` を非公開コンストラクターで作ります。`prepare_closed_client_call` は一度だけ消費する `OwnedScopedOperation` を返し、既定では拒否します。応答型や最終引数が違う場合、Generic bearer／lease API へ切り替えません。
 
@@ -43,7 +43,7 @@ Gateway はメタデータ処理の移譲前に実際の依頼者を取得し、
 
 同期キーチェーンとローカル処理は強制中断できず、戻った時点と次の送信前に期限を再確認します。中断は開始済みの資格情報更新、遠隔作用、保存を取り消しません。CCR は既存の単一呼び出しメタデータ tombstone 取引で清理し、開始済みの有限な SQLite 処理が後で完了する場合があります。クラッシュや清理失敗では未公開行が既存の期限処理まで残り得ます。永続的なタイムアウト調整機構や保存ゼロの保証は追加しません。
 
-新しい M1 テストはソースのみで未コンパイル／未実行です。feature 無効のビルド、独立コード／セキュリティ審査、完全な CI、実プロバイダーと利用者の受入れは未完了です。サービスアカウント委任、Bridge、その他 W3 経路は別作業です。
+Google 個人接続ガイドに記録した M1/CLI のローカル重点テストと独立コード／セキュリティ審査は通過しました。完全な CI は最終 release source ごとに確認し、実プロバイダー、Keychain、各プラットフォーム、利用者受け入れには別の証拠が必要です。
 
 
 Closed は provenance と結果メタデータを一時保持し、同期 ledger／route 構築後に元の期限をすべて再確認します。期限切れの結果を除外し、その span を含めず ledger を再構築してから確定します。テスト版では Home 更新端点の独立した owned fixture が必要で、欠ける場合は復号やプロバイダー送信前に拒否します。Legacy の端点方針は変更しません。
@@ -58,4 +58,4 @@ Closed は provenance と結果メタデータを一時保持し、同期 ledger
 
 ### W3 アカウント種別
 
-未公開W3ソースは Home SA と委任を同じClosed操作契約に接続し、Google承認wireにサービスアカウント／Apps Scriptタグと任意の型付き `home_source` を追加します。既存Personal/OAuth JSONはこのフィールドを省略したままです。Rust struct literalで `GoogleAccountApproval` を作る外部コードは `home_source` の追加が必要です。Rustソース互換性の変更であり、公開構造体が同じバイト列であるとは主張しません。新たな依存、token schema、承認gateはありません。W3テストは未コンパイル・未実行です。
+v1.76.0 の W3 ソースは Home SA と委任を同じ Closed 操作契約に接続し、Google 承認 wire にサービスアカウント／Apps Script タグと任意の型付き `home_source` を追加します。既存 Personal/OAuth JSON はこのフィールドを省略したままです。Rust struct literal で `GoogleAccountApproval` を作る外部コードは `home_source` の追加が必要です。Rust ソース互換性の変更であり、公開構造体が同じバイト列であるとは主張しません。新たな依存、token schema、承認 gate はありません。重点テストの記録と制約は Google 個人接続ガイドの検証範囲を参照してください。
