@@ -154,6 +154,26 @@ class CiWorkflowTests(unittest.TestCase):
                         "src-tauri/Cargo.lock", "variant_str_iter"):
             self.assertIn(command, security)
 
+    def test_dashboard_embedding_excludes_vulnerable_zstd_stack(self):
+        workspace = (ROOT / "Cargo.toml").read_text()
+        rust_embed_line = next(
+            line for line in workspace.splitlines()
+            if line.startswith("rust-embed =")
+        )
+        self.assertNotIn("compression", rust_embed_line)
+
+        lock = (ROOT / "Cargo.lock").read_text()
+        for package in (
+            "include-flate",
+            "include-flate-codegen",
+            "include-flate-compress",
+            "zstd",
+            "zstd-safe",
+            "zstd-sys",
+        ):
+            with self.subTest(package=package):
+                self.assertNotIn(f'name = "{package}"', lock)
+
 
 if __name__ == "__main__":
     unittest.main()

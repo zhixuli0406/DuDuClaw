@@ -77,7 +77,10 @@ tracing-appender = "0.2"
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rust-embed = { version = "8", features = ["compression"] }
+# Keep dashboard assets embedded without include-flate's vulnerable zstd stack.
+# The dashboard already ships pre-minified Vite assets, so runtime behaviour is
+# unchanged; the binary-size trade-off is preferable to carrying unsafe codecs.
+rust-embed = "8"
 mime_guess = "2"
 
 # CLI
