@@ -471,7 +471,8 @@ pub(crate) mod mcp_budget_testing {
             "[integrations]\ngoogle_workspace=true\n",
         )
         .unwrap();
-        std::fs::write(directory.path().join(crate::mcp_oauth::TOKEN_FILE),serde_json::to_vec(&json!([{"provider_id":"google","access_token":"owned-expired","refresh_token":"owned-refresh","expires_at":"2000-01-01T00:00:00Z","scopes":["scope-a"]}])).unwrap()).unwrap();
+        let google_home = crate::mcp_oauth::google_home_test_fixture::current_control("test-admin");
+        std::fs::write(directory.path().join(crate::mcp_oauth::TOKEN_FILE),serde_json::to_vec(&json!([{"provider_id":"google","access_token":"owned-expired","refresh_token":"owned-refresh","expires_at":"2000-01-01T00:00:00Z","scopes":["scope-a"],"google_home":google_home}])).unwrap()).unwrap();
         std::fs::write(directory.path().join(crate::mcp_oauth::CLIENT_CONFIG_FILE),serde_json::to_vec(&json!([{"provider_id":"google","client_id":"owned-client","client_secret":"owned-secret","auth_url":"https://accounts.google.com/o/oauth2/v2/auth","token_url":"https://oauth2.googleapis.com/token","redirect_uri":"http://127.0.0.1/callback","scopes":["scope-a"]}])).unwrap()).unwrap();
         directory
     }

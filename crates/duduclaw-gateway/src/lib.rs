@@ -41,10 +41,11 @@ compile_error!(
 /// and policy are retained by the CLI; no receipt, source guard or secret is
 /// returned. The renderer runs under source -> config, never config -> source.
 pub fn commit_config_rendered(
-    home:&std::path::Path,expected_hash:&str,
-    render:impl FnOnce(&str)->Result<String,String>,
-)->Result<(),String> {
-    handlers::config_commit::commit_local_config_rendered(home,expected_hash,render)
+    home: &std::path::Path,
+    expected_hash: &str,
+    render: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    handlers::config_commit::commit_local_config_rendered(home, expected_hash, render)
 }
 
 pub mod a2a_signing;
@@ -113,8 +114,8 @@ pub mod doctor_probes;
 pub mod extension;
 pub mod github_workspace;
 pub mod google_apps_script;
+pub(crate) mod google_data_consent;
 pub mod google_identity;
-pub mod person_credentials;
 pub mod google_personal;
 pub mod google_service_account;
 pub mod google_workspace;
@@ -126,6 +127,7 @@ pub mod mcp_external;
 pub mod mcp_internal_key;
 pub mod msteams;
 pub mod notion_workspace;
+pub mod person_credentials;
 pub mod rate_limit_watch;
 pub mod redaction_sources;
 pub(crate) mod synthetic_connector_adapter;
@@ -166,6 +168,7 @@ pub mod notify_governance;
 // O5 — `push(card, dest)`: the single outbound entry the four notification
 // modules (goal / approval / install / autopilot) share. Authorization and
 // card rendering deliberately stay with them.
+pub(crate) mod history_privacy;
 pub(crate) mod notify_push;
 pub mod notify_stats;
 pub mod posture_watch;
@@ -173,20 +176,19 @@ pub mod premium_templates;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
-pub mod team_edition;
-pub mod team_history;
-pub(crate) mod history_privacy;
-pub mod team_oversight;
-pub mod trigger_route;
-pub mod task_store;
 /// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
 /// Discovery attempt-container blocks.
 pub mod task_sandbox;
+pub mod task_store;
+pub mod team_edition;
+pub mod team_history;
+pub mod team_oversight;
 pub mod tick_config;
 pub mod tick_headers;
 pub mod tick_source;
 pub mod tick_source_poll;
 pub mod tick_source_ws;
+pub mod trigger_route;
 // WP-E2: box-side relay client (crates/duduclaw-relay's WebSocket
 // counterpart) — reuses tick_source_ws's reconnect-backoff shape, hence the
 // grouping alongside the resident-sensing modules above.
@@ -252,12 +254,13 @@ pub mod memory_forget_approval;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
 pub mod memory_provenance;
-pub mod on_behalf_of;
 pub mod message_queue;
 pub mod miniapp;
+pub mod on_behalf_of;
 pub mod wiki_host_sources;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
 // background poller → autopilot bus. Both transports default OFF.
+pub(crate) mod google_oauth_policy;
 pub mod odoo_events;
 pub mod odoo_livechat;
 pub mod os_events;
@@ -290,11 +293,11 @@ pub mod ccr_runtime;
 pub mod channel_sender;
 pub mod chat_commands;
 pub mod computer_profiles;
-mod computer_watch_links;
 pub mod computer_use;
 pub mod computer_use_image;
 pub mod computer_use_orchestrator;
 pub mod computer_use_sessions;
+mod computer_watch_links;
 pub mod computer_workspaces;
 pub mod decision_brief;
 pub mod decision_calibration;

@@ -109,7 +109,7 @@ impl MethodHandler {
     }
 
     /// Start an OAuth flow: generate PKCE, store pending state, return auth URL.
-    pub(crate) async fn handle_mcp_oauth_start(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_mcp_oauth_start(&self, params: Value, ctx: &UserContext) -> WsFrame {
         use crate::mcp_oauth;
 
         let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {
@@ -118,8 +118,23 @@ impl MethodHandler {
         };
 
         if provider_id == "google" {
-            return match start_google_home_rpc(&self.home_dir, &params, &self.mcp_oauth_pending)
-                .await
+            if params
+                .get("acknowledge_google_data")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return WsFrame::error_response(
+                    "",
+                    "請先閱讀並確認 Google 資料的存取、分享、保存與刪除說明。",
+                );
+            }
+            return match start_google_home_rpc(
+                &self.home_dir,
+                &params,
+                &ctx.user_id,
+                &self.mcp_oauth_pending,
+            )
+            .await
             {
                 Ok(payload) => WsFrame::ok_response("", payload),
                 Err(_) => WsFrame::error_response("", "Google 連結未完成，請重新從控制台開始。"),
@@ -209,6 +224,19 @@ impl MethodHandler {
             );
         }
 
+        if crate::google_oauth_policy::is_google_oauth_route(
+            &provider_id,
+            "",
+            &config.auth_url,
+            &config.token_url,
+            &config.scopes,
+        ) {
+            return WsFrame::error_response(
+                "",
+                "Google OAuth 只能使用「整合 → Google」的專用連線流程。",
+            );
+        }
+
         // Persist client credentials so the token can be refreshed later without
         // re-prompting the user (secret encrypted at rest). See mcp_oauth.
         if let Err(e) = mcp_oauth::upsert_client_config(
@@ -261,6 +289,7 @@ impl MethodHandler {
 async fn start_google_home_rpc(
     home: &std::path::Path,
     params: &Value,
+    actor: &str,
     pending: &tokio::sync::RwLock<
         std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>,
     >,
@@ -276,6 +305,7 @@ async fn start_google_home_rpc(
     let input = flow::GoogleHomeStartInput::new(
         text(params, "client_id")?,
         text(params, "client_secret")?,
+        actor,
     )?;
     let captured = flow::capture_google_home_start(home, input)?;
     let started = flow::begin_google_home_authorization(home, captured).await?;

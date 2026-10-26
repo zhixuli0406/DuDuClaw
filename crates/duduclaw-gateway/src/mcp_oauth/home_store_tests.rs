@@ -13,9 +13,13 @@ fn fixture() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(d.path().join(super::super::CLIENT_CONFIG_FILE), r#"[{"provider_id":"google","client_id":"fake-client","client_secret":"enc:v1:unusable-client","auth_url":"https://accounts.google.com/auth","token_url":"https://oauth2.googleapis.com/token","redirect_uri":"http://127.0.0.1/callback","scopes":["scope-a"]}]"#).unwrap();
+    let consent = crate::google_data_consent::Evidence::issue("test-admin").unwrap();
     std::fs::write(d.path().join(super::super::TOKEN_FILE), serde_json::to_vec(&json!([
         {"provider_id":"github","access_token":"enc:v1:non-google","refresh_token":null,"expires_at":null,"scopes":["repo"],"future_field":{"retained":true}},
-        {"provider_id":"google","access_token":"enc:v1:unusable-access","refresh_token":"enc:v1:unusable-refresh","expires_at":null,"scopes":["scope-a","scope-b"]}
+        {"provider_id":"google","access_token":"enc:v1:unusable-access","refresh_token":"enc:v1:unusable-refresh","expires_at":null,"scopes":["scope-a","scope-b"],
+         "google_home":{"schema":1,"source_generation":uuid::Uuid::new_v4().to_string(),"state":"ready",
+          "credential":{"credential_id":uuid::Uuid::new_v4().to_string(),"logical_epoch":1,"token_revision":1,"google_data_consent":consent},
+          "active_connect":null,"pending_mutation":null}}
     ])).unwrap()).unwrap();
     // Unique client ids isolate the provider-boundary counter across tests.
     let path = d.path().join(super::super::CLIENT_CONFIG_FILE);
@@ -55,6 +59,15 @@ fn payload(scope: &[&str]) -> PreparedGooglePayload {
 fn bytes(home: &Path) -> Vec<u8> {
     std::fs::read(home.join(super::super::TOKEN_FILE)).unwrap()
 }
+fn make_legacy_google(home: &Path) {
+    let mut rows: Value = serde_json::from_slice(&bytes(home)).unwrap();
+    rows[1].as_object_mut().unwrap().remove("google_home");
+    std::fs::write(
+        home.join(super::super::TOKEN_FILE),
+        serde_json::to_vec(&rows).unwrap(),
+    )
+    .unwrap();
+}
 #[test]
 fn migration_changes_only_control_and_never_reads_or_creates_a_key() {
     let d = fixture();
@@ -79,6 +92,26 @@ fn migration_changes_only_control_and_never_reads_or_creates_a_key() {
         [0, 0],
         "metadata must not enter OAuth crypto or provider code"
     );
+}
+
+#[test]
+fn legacy_google_token_is_readable_for_revoke_but_never_selected_or_returned() {
+    let d = fixture();
+    let path = d.path().join(super::super::TOKEN_FILE);
+    let mut rows: Value = serde_json::from_slice(&bytes(d.path())).unwrap();
+    rows[1].as_object_mut().unwrap().remove("google_home");
+    std::fs::write(&path, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let before = bytes(d.path());
+
+    assert!(home_source::prepare_home_selection(d.path(), &["scope-a"]).is_err());
+    assert!(super::super::get_stored_token(d.path(), "google").is_none());
+    assert_eq!(
+        before,
+        bytes(d.path()),
+        "refusal must not rewrite a legacy token"
+    );
+    revoke_google(d.path()).unwrap();
+    assert!(super::super::get_stored_token(d.path(), "google").is_none());
 }
 #[test]
 fn missing_invalid_static_metadata_refuses_before_control_or_payload_write() {
@@ -525,6 +558,7 @@ fn invalid_legacy_google_import_is_rejected_before_any_key_or_store_write() {
 #[test]
 fn migration_raw_store_cas_refuses_a_changed_row_instead_of_overwriting_it() {
     let d = fixture();
+    make_legacy_google(d.path());
     let result = run(d.path(), |g, s| {
         publication_transaction(g, |r| {
             let prepared = r.prepare(s)?;

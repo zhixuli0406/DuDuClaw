@@ -26,7 +26,14 @@
 //!
 //! ## Privacy gate
 //!
-//! Steps 1 → 2 move curated *customer* data off this machine. Both
+//! DuDuClaw currently cannot prove that a selected conversation or task is
+//! free of Google Workspace data. Dataset build/export and new training jobs
+//! therefore fail closed before reading or transmitting source data. Import,
+//! list/preview, job status/cancel, and deletion remain available. This gate
+//! can only be relaxed after source-level Google lineage is implemented and
+//! enforced by the dataset selector.
+//!
+//! Independently, steps 1 → 2 move curated *customer* data off this machine. Both
 //! `finetune.datasets.export` and `finetune.jobs.create` against a remote
 //! backend refuse unless the caller passes
 //! `acknowledged_data_leaves_device: true`; the refusal is a structured
@@ -72,6 +79,9 @@ pub enum FinetuneError {
     /// The backend's wire format is not verified against live provider
     /// documentation, so it is compiled out by default. Fails closed.
     UnverifiedBackend(String),
+    /// Generalized training is unavailable until Google-origin lineage can be
+    /// proven absent from the selected data.
+    PolicyBlocked(String),
 }
 
 impl FinetuneError {
@@ -84,6 +94,7 @@ impl FinetuneError {
             Self::Io(_) => "io_error",
             Self::Backend(_) => "backend_error",
             Self::UnverifiedBackend(_) => "unverified_backend",
+            Self::PolicyBlocked(_) => "google_workspace_lineage_unavailable",
         }
     }
 
@@ -101,6 +112,7 @@ impl FinetuneError {
             Self::UnverifiedBackend(m) => {
                 format!("這個訓練後端的介面尚未經過實地查證，預設關閉：{m}")
             }
+            Self::PolicyBlocked(m) => m.clone(),
         }
     }
 }
@@ -201,6 +213,15 @@ pub fn require_data_leaves_device_ack(acknowledged: bool, what: &str) -> Result<
     }
 }
 
+/// Fail closed until curated rows carry source lineage that can prove Google
+/// Workspace API data is absent. A generic acknowledgement is not sufficient.
+pub fn require_generalized_training_lineage() -> Result<()> {
+    Err(FinetuneError::PolicyBlocked(
+        "Google Workspace 資料目前沒有可傳播到訓練資料集的來源標記；在能證明資料集不含 Google 資料前，建構、匯出與啟動微調一律停用。"
+            .to_string(),
+    ))
+}
+
 /// `std::fs` error → [`FinetuneError::Io`], with the path for context.
 pub(crate) fn io_err(path: &Path, e: impl std::fmt::Display) -> FinetuneError {
     FinetuneError::Io(format!("{}: {e}", path.display()))
@@ -248,6 +269,12 @@ mod tests {
         assert!(backend_is_remote("together"));
         // Unknown names fail closed — a backend added later still gets gated.
         assert!(backend_is_remote("some_future_cloud"));
+    }
+
+    #[test]
+    fn generalized_training_is_blocked_without_google_lineage() {
+        let err = require_generalized_training_lineage().unwrap_err();
+        assert_eq!(err.code(), "google_workspace_lineage_unavailable");
     }
 
     #[test]

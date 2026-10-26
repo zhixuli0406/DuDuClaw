@@ -12,8 +12,9 @@ fn fixture(expired: bool, client: bool) -> tempfile::TempDir {
     )
     .unwrap();
     let expiry = expired.then(|| "2000-01-01T00:00:00Z");
+    let google_home = crate::mcp_oauth::google_home_test_fixture::current_control("test-admin");
     std::fs::write(d.path().join(crate::mcp_oauth::TOKEN_FILE), serde_json::to_vec(&json!([
-        {"provider_id":"google","access_token":"legacy.access","refresh_token":"legacy-refresh","expires_at":expiry,"scopes":["scope-a"],"unknown_google":{"kept":true}},
+        {"provider_id":"google","access_token":"legacy.access","refresh_token":"legacy-refresh","expires_at":expiry,"scopes":["scope-a"],"unknown_google":{"kept":true},"google_home":google_home},
         {"provider_id":"github","access_token":"foreign-token","refresh_token":null,"expires_at":null,"scopes":["repo"]}
     ])).unwrap()).unwrap();
     if client {
@@ -38,7 +39,7 @@ fn mutate(home: &Path, f: impl FnOnce(&mut Value)) {
 }
 
 #[tokio::test]
-async fn original_public_path_fresh_legacy_fewer_scopes_no_client_none_expiry() {
+async fn original_public_path_fresh_current_fewer_scopes_no_client_none_expiry() {
     let d = fixture(false, false);
     let before = raw(d.path());
     let access = crate::google_workspace::get_valid_google_token(d.path())
@@ -493,6 +494,9 @@ async fn preseal_uses_cipher_expansion_and_actual_foreign_whitespace_emitter() {
 #[tokio::test]
 async fn configured_broken_service_account_keeps_original_precedence() {
     let d = fixture(false, false);
+    mutate(d.path(), |rows| {
+        rows[0].as_object_mut().unwrap().remove("google_home");
+    });
     std::fs::write(d.path().join("config.toml"), "[integrations]\ngoogle_workspace=true\n[integrations.google_service_account]\nkey_file='missing.json'\n").unwrap();
     assert!(matches!(
         crate::google_workspace::get_valid_google_token(d.path()).await,

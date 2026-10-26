@@ -12,7 +12,7 @@ fn b1_home() -> tempfile::TempDir {
     d
 }
 fn input(secret: Option<&str>) -> start::GoogleHomeStartInput {
-    start::GoogleHomeStartInput::new(Some("owned-client"), secret).unwrap()
+    start::GoogleHomeStartInput::new(Some("owned-client"), secret, "test-admin").unwrap()
 }
 fn capture(home: &Path, secret: Option<&str>) -> start::GoogleHomeStartPlan {
     start::capture_google_home_start(home, input(secret)).unwrap()
@@ -211,11 +211,13 @@ fn static_primitives_reserved_prefill_and_encoded_size_refuse_before_crypto() {
     let d = b1_home();
     let _clock = publication::ClockGuard::fixed_if_unset(NOW);
     let probe = test_probe::Guard::install(d.path());
-    assert!(start::GoogleHomeStartInput::new(Some("bad\nid"), Some("secret")).is_err());
+    assert!(
+        start::GoogleHomeStartInput::new(Some("bad\nid"), Some("secret"), "test-admin").is_err()
+    );
     assert!(
         start::capture_google_home_start(
             d.path(),
-            start::GoogleHomeStartInput::new(None, None).unwrap()
+            start::GoogleHomeStartInput::new(None, None, "test-admin").unwrap()
         )
         .is_err()
     );

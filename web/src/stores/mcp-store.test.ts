@@ -29,9 +29,9 @@ describe('mcp-store consent polling', () => {
     useMcpStore.setState({
       oauthProviders: [
         {
-          provider_id: 'google',
-          name: 'Google',
-          auth_url: 'https://accounts.google.com/o/oauth2/v2/auth',
+          provider_id: 'notion',
+          name: 'Notion',
+          auth_url: 'https://api.notion.com/v1/oauth/authorize',
           scopes: [],
           configured: true,
           token_status: 'authenticated',
@@ -58,7 +58,7 @@ describe('mcp-store consent polling', () => {
     });
     const fetchProviders = vi.spyOn(api.mcp, 'oauthProviders');
 
-    await useMcpStore.getState().startOAuth('google');
+    await useMcpStore.getState().startOAuth('notion');
     await vi.advanceTimersByTimeAsync(3500);
 
     expect(fetchProviders).not.toHaveBeenCalled();
@@ -77,7 +77,7 @@ describe('mcp-store consent polling', () => {
       .spyOn(api.mcp, 'oauthProviders')
       .mockResolvedValue({ providers: [] });
 
-    await useMcpStore.getState().startOAuth('google');
+    await useMcpStore.getState().startOAuth('notion');
     await vi.advanceTimersByTimeAsync(3500);
 
     expect(fetchProviders).toHaveBeenCalled();
@@ -94,7 +94,7 @@ describe('mcp-store consent polling', () => {
       .spyOn(api.mcp, 'oauthProviders')
       .mockResolvedValue({ providers: [] });
 
-    await useMcpStore.getState().startOAuth('google');
+    await useMcpStore.getState().startOAuth('notion');
     await vi.advanceTimersByTimeAsync(3500);
 
     expect(fetchProviders).toHaveBeenCalled();

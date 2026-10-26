@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Security
+- Google OAuth 連線在送往 Google 前新增必要的資料使用揭露與明確勾選；官方介面不能略過，gateway 的個人連線及 Google MCP OAuth RPC 也都必須明確帶入確認。揭露說明存取範圍、本機保存、設定的 AI 服務商及禁止將 Google Workspace 資料用於一般化模型訓練，並連到完整隱私政策。
+- Google 資料同意現在以 gateway 簽發的版本、時間與操作者綁定至個人密封憑證及 Home OAuth ticket／credential。缺少或非目前版本的既有連線只能中斷／撤銷，不能選用、解密、更新或呼叫供應商；Home 回呼還會重新確認原操作者仍是有效管理員。
+- Google OAuth 不再能以改名的自訂 provider 或動態 remote MCP 繞過專用連線流程：issuer、授權／token 端點或 Workspace scope 指向 Google 時，一律拒絕 generic OAuth。由於訓練資料集尚無可證明排除 Google 來源的 lineage，暫時 fail-closed 停用資料集建構、匯出與新微調工作；刪除既有資料集、查看／取消既有工作仍可用。
 - 修正來源草稿（未發布）：非管理員直接 Owner 關閉 Google 時保留原發問者限制或接受合法的較窄範圍，並關閉公司備援；明示較寬限制仍拒絕。重新啟用自己的帳號保留該發問者限制，仍須本人確認分享範圍。管理員與一般更新入口的原有規則不變。六項本機聚焦回歸已通過；整體驗證範圍見下列 Google 驗證紀錄。
 - Google 公司來源封閉接線草稿（W3 R2，未發布）：預備結果交付前重核原期限；OAuth 憑證的可用期間同時受系統時間與已捕捉的單調期限限制；Apps Script 結果網址含原密鑰的已知表示時，在 GET 前拒絕。新增期限與密鑰反射回歸已納入本機聚焦驗證，程式與安全審查已通過；不代表真 Google 活驗。
 

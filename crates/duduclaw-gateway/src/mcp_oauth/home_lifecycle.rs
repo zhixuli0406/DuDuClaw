@@ -84,6 +84,7 @@ pub(crate) fn begin_google_home_connect(
         PreparedGoogleClient::from_encrypted_raw(raw)?,
         state_hash,
         expires_at,
+        crate::google_data_consent::Evidence::issue("test-admin").map_err(|_| Error::Invalid)?,
     )
 }
 /// Test-only W1 encrypted metadata seam. It captures an exact original
@@ -100,7 +101,14 @@ pub(super) fn begin_prepared_google_home_connect(
         check_expiry(g, expires_at)?;
         ExpectedStart::capture(g, source)
     })?;
-    publish_expected_start(home, &expected, desired, state_hash, expires_at)
+    publish_expected_start(
+        home,
+        &expected,
+        desired,
+        state_hash,
+        expires_at,
+        crate::google_data_consent::Evidence::issue("test-admin").map_err(|_| Error::Invalid)?,
+    )
 }
 
 use home_source::{ObservedSource, SourceBinding, SourceGuard};
@@ -116,6 +124,7 @@ use zeroize::Zeroizing;
 pub(crate) struct GoogleHomeStartInput {
     client_id: Option<String>,
     secret: Option<Zeroizing<String>>,
+    google_data_consent: crate::google_data_consent::Evidence,
 }
 fn primitive(s: &str) -> Result<()> {
     if s.len() > 64 * 1024 || s.chars().any(char::is_control) {
@@ -125,7 +134,7 @@ fn primitive(s: &str) -> Result<()> {
     }
 }
 impl GoogleHomeStartInput {
-    pub(crate) fn new(client_id: Option<&str>, secret: Option<&str>) -> Result<Self> {
+    pub(crate) fn new(client_id: Option<&str>, secret: Option<&str>, actor: &str) -> Result<Self> {
         if let Some(s) = client_id {
             primitive(s)?;
         }
@@ -137,6 +146,8 @@ impl GoogleHomeStartInput {
             secret: secret
                 .filter(|s| !s.is_empty())
                 .map(|s| Zeroizing::new(s.to_owned())),
+            google_data_consent: crate::google_data_consent::Evidence::issue(actor)
+                .map_err(|_| Error::Invalid)?,
         })
     }
 }
@@ -201,6 +212,7 @@ fn publish_expected_start(
     desired: PreparedGoogleClient,
     state_hash: RawDigest,
     expires_at: u64,
+    google_data_consent: crate::google_data_consent::Evidence,
 ) -> Result<GoogleConnectTicket> {
     let (start, final_clients) = home_source::with_metadata(home, |g, observed| {
         expected.validate(g, observed)?;
@@ -216,7 +228,15 @@ fn publish_expected_start(
         let now = home_store::host_time_now(g);
         let start = home_store::publication_transaction(g, |r| {
             r.require_snapshot(&expected.tokens)?;
-            r.begin_connect_to(observed, binding, Some(write), state_hash, expires_at, now)
+            r.begin_connect_to(
+                observed,
+                binding,
+                Some(write),
+                state_hash,
+                expires_at,
+                now,
+                google_data_consent,
+            )
         })?;
         Ok((start, bytes))
     })?;
@@ -252,6 +272,7 @@ pub(crate) struct GoogleHomeStartPlan {
     authorization_url: String,
     expires_at: u64,
     created_at: Instant,
+    google_data_consent: crate::google_data_consent::Evidence,
 }
 pub(crate) struct GoogleHomePending {
     home: PathBuf,
@@ -261,8 +282,12 @@ pub(crate) struct GoogleHomePending {
     requested_scopes: Vec<String>,
     expires_at: u64,
     created_at: Instant,
+    google_data_consent: crate::google_data_consent::Evidence,
 }
 impl GoogleHomePending {
+    pub(crate) fn consent_actor(&self) -> &str {
+        &self.google_data_consent.actor
+    }
     pub(crate) fn is_expired_in_ram(&self) -> bool {
         ram_elapsed(&self.home, self.created_at) >= Duration::from_secs(super::PENDING_TTL_SECS)
     }
@@ -312,6 +337,8 @@ pub(crate) fn capture_google_home_start(
     home: &Path,
     input: GoogleHomeStartInput,
 ) -> Result<GoogleHomeStartPlan> {
+    crate::google_data_consent::require_current(Some(&input.google_data_consent))
+        .map_err(|_| Error::Invalid)?;
     crate::google_personal::grants::check_metadata_barrier(home).map_err(|_| Error::NotReady)?;
     home_source::with_metadata(home, |g, source| {
         let expected = ExpectedStart::capture(g, source)?;
@@ -389,6 +416,7 @@ pub(crate) fn capture_google_home_start(
             authorization_url: url.into(),
             expires_at,
             created_at: Instant::now(),
+            google_data_consent: input.google_data_consent,
         })
     })
 }
@@ -447,6 +475,7 @@ pub(crate) async fn begin_google_home_authorization(
         desired,
         plan.state_hash.clone(),
         plan.expires_at,
+        plan.google_data_consent.clone(),
     )?;
     let requested_scopes =
         serde_json::from_value(plan.metadata["scopes"].clone()).map_err(|_| Error::Invalid)?;
@@ -458,6 +487,7 @@ pub(crate) async fn begin_google_home_authorization(
         requested_scopes,
         expires_at: plan.expires_at,
         created_at: plan.created_at,
+        google_data_consent: plan.google_data_consent,
     };
     validate_google_home_pending(home, &pending)?;
     drop(grant);
@@ -701,6 +731,8 @@ fn callback_publication<T>(
     home: &Path,
     g: &SourceGuard,
     context: &GoogleHomeCallbackContext,
+    consent_actor: &str,
+    actor_is_live_admin: &(dyn Fn(&str) -> bool + Send + Sync),
     _stage: i32,
     f: impl FnOnce(&mut home_store::Rows) -> Result<home_store::Planned<T>>,
 ) -> Result<T> {
@@ -714,7 +746,8 @@ fn callback_publication<T>(
                 checks.set(checks.get() + 1);
                 testing::finish_boundary(home, _stage * 100 + checks.get());
             }
-            context.validate_deadlines(home)
+            context.validate_deadlines(home)?;
+            require_live_admin(actor_is_live_admin, consent_actor)
         },
         f,
     )
@@ -735,12 +768,15 @@ pub(crate) fn validate_google_home_claim(
 }
 /// Callback consumes the original opaque RAM flow. Grant spans the durable
 /// claim, exactly one provider request, and all three same-ticket finish points.
-pub(crate) async fn complete_google_home_authorization(
+pub(crate) async fn complete_google_home_authorization_with_admin_check(
     home: &Path,
     pending: GoogleHomePending,
     returned_state: &str,
     code: Zeroizing<String>,
+    actor_is_live_admin: &(dyn Fn(&str) -> bool + Send + Sync),
 ) -> Result<()> {
+    let consent_actor = pending.consent_actor().to_owned();
+    require_live_admin(actor_is_live_admin, &consent_actor)?;
     if pending.state_hash != RawDigest::of(returned_state.as_bytes())
         || code.is_empty()
         || code.len() > 16 * 1024
@@ -757,6 +793,7 @@ pub(crate) async fn complete_google_home_authorization(
     let grant = crate::google_personal::grants::acquire(home).await;
     validate_google_home_pending(home, &pending)?;
     let grant = grant.map_err(|_| Error::NotReady)?;
+    require_live_admin(actor_is_live_admin, &consent_actor)?;
     let claim = home_source::with_metadata(home, |g, source| {
         let now = home_store::host_time_now(g);
         home_store::publication_transaction_checked(
@@ -789,19 +826,52 @@ pub(crate) async fn complete_google_home_authorization(
     )
     .await;
     validate_google_home_claim(home, &claim)?;
+    require_live_admin(actor_is_live_admin, &consent_actor)?;
     let candidate = candidate?;
-    finish_claimed_callback(home, &claim, candidate)?;
+    finish_claimed_callback(home, &claim, candidate, &consent_actor, actor_is_live_admin)?;
     drop(grant);
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) async fn complete_google_home_authorization(
+    home: &Path,
+    pending: GoogleHomePending,
+    returned_state: &str,
+    code: Zeroizing<String>,
+) -> Result<()> {
+    fn always_admin(_: &str) -> bool {
+        true
+    }
+    complete_google_home_authorization_with_admin_check(
+        home,
+        pending,
+        returned_state,
+        code,
+        &always_admin,
+    )
+    .await
+}
+
+fn require_live_admin(check: &(dyn Fn(&str) -> bool + Send + Sync), actor: &str) -> Result<()> {
+    if check(actor) {
+        Ok(())
+    } else {
+        Err(Error::NotReady)
+    }
+}
+
 fn finish_claimed_callback(
     home: &Path,
     claim: &GoogleHomeCallbackContext,
     candidate: home_store::PreparedGoogleCallback,
+    consent_actor: &str,
+    actor_is_live_admin: &(dyn Fn(&str) -> bool + Send + Sync),
 ) -> Result<()> {
     #[cfg(test)]
     testing::finish_boundary(home, 1);
     claim.validate_deadlines(home)?;
+    require_live_admin(actor_is_live_admin, consent_actor)?;
     let (change, write) = home_source::with_metadata(home, |g, source| {
         let before = home_store::read_config_snapshot(g)?;
         let current = match &before {
@@ -843,16 +913,17 @@ fn finish_claimed_callback(
             )?)
         };
         let now = home_store::host_time_now(g);
-        let change = callback_publication(home, g, claim, 1, |r| {
-            candidate.require_original(r)?;
-            r.begin_claimed_finish(
-                claim.durable(),
-                source,
-                candidate.payload(),
-                write.as_ref(),
-                now,
-            )
-        })?;
+        let change =
+            callback_publication(home, g, claim, consent_actor, actor_is_live_admin, 1, |r| {
+                candidate.require_original(r)?;
+                r.begin_claimed_finish(
+                    claim.durable(),
+                    source,
+                    candidate.payload(),
+                    write.as_ref(),
+                    now,
+                )
+            })?;
         Ok((change, write))
     })?;
     #[cfg(test)]
@@ -861,9 +932,10 @@ fn finish_claimed_callback(
     #[cfg(test)]
     testing::finish_boundary(home, 2);
     claim.validate_deadlines(home)?;
+    require_live_admin(actor_is_live_admin, consent_actor)?;
     home_source::with_metadata(home, |g, source| {
         let now = home_store::host_time_now(g);
-        callback_publication(home, g, claim, 2, |r| {
+        callback_publication(home, g, claim, consent_actor, actor_is_live_admin, 2, |r| {
             r.publish_claimed_payload(
                 &change,
                 claim.durable(),
@@ -880,9 +952,12 @@ fn finish_claimed_callback(
     #[cfg(test)]
     testing::finish_boundary(home, 3);
     claim.validate_deadlines(home)?;
+    require_live_admin(actor_is_live_admin, consent_actor)?;
     home_source::with_metadata(home, |g, source| {
         let now = home_store::host_time_now(g);
-        callback_publication(home, g, claim, 3, |r| r.finish_change(&change, source, now))
+        callback_publication(home, g, claim, consent_actor, actor_is_live_admin, 3, |r| {
+            r.finish_change(&change, source, now)
+        })
     })?;
     #[cfg(test)]
     testing::finish_boundary(home, 13);

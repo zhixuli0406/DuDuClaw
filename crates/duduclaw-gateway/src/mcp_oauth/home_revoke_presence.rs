@@ -17,6 +17,26 @@ pub(in crate::mcp_oauth) fn read(
     })
 }
 
+pub(in crate::mcp_oauth) fn read_access_token(
+    home: &Path,
+    lease: &crate::google_personal::grants::Lease,
+) -> Result<zeroize::Zeroizing<String>> {
+    if std::fs::canonicalize(home).ok().as_deref() != Some(lease.home()) {
+        return Err(Error::Stale);
+    }
+    home_source::with_metadata(home, |g, source| {
+        transaction(g, |rows| {
+            if classify(rows, source, host_time_now(g))? != HomeRevokePresence::GoogleCredential {
+                return Err(Error::Invalid);
+            }
+            let stored = token_view(rows.google().ok_or(Error::Invalid)?)?;
+            super::super::decode_secret(home, "google", &stored.access_token)
+                .map(zeroize::Zeroizing::new)
+                .ok_or(Error::Invalid)
+        })
+    })
+}
+
 fn classify(rows: &Rows, source: &ObservedSource, now: u64) -> Result<HomeRevokePresence> {
     // Generic/custom providers cannot establish a different Google account.
     if rows.rows.iter().any(|row| row["provider_id"] != "google") {

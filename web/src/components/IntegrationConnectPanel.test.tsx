@@ -50,6 +50,23 @@ beforeEach(() => {
 });
 
 describe('IntegrationConnectPanel setup guidance', () => {
+  it('requires the Google data disclosure acknowledgement before starting OAuth', async () => {
+    mockUnconfigured();
+    const start = vi.spyOn(api.mcp, 'oauthStart').mockResolvedValue({ auth_url: 'https://accounts.google.com/consent', state: 's' });
+    const user = userEvent.setup();
+    renderPanel();
+
+    const connect = await screen.findByRole('button',{name:'Connect Google'});
+    expect(screen.getByText(/Google data may be stored in local conversation/i)).toBeInTheDocument();
+    expect(connect).toBeDisabled();
+    await user.type(screen.getByPlaceholderText('x.apps.googleusercontent.com'),'client-id');
+    expect(connect).toBeDisabled();
+    await user.click(screen.getByRole('checkbox',{name:/understand how my Google data is accessed/i}));
+    expect(connect).toBeEnabled();
+    await user.click(connect);
+    await waitFor(()=>expect(start).toHaveBeenCalledWith('google','client-id',undefined,true));
+  });
+
   it('shows the redirect URI the gateway reports, not a hardcoded one', async () => {
     // The gateway derives this from its live port. A UI constant is wrong the
     // moment DUDUCLAW_PORT differs — and a wrong URI dead-ends every consent
@@ -192,6 +209,7 @@ describe('IntegrationConnectPanel saved-credential display', () => {
     expect(idField).toBeInTheDocument();
     expect(screen.getByPlaceholderText('Saved ••••9f3c, leave blank to keep it')).toBeInTheDocument();
 
+    await user.click(screen.getByRole('checkbox',{name:/understand how my Google data is accessed/i}));
     await user.click(screen.getByText('Connect Google'));
     await waitFor(() => expect(start).toHaveBeenCalled());
     // No secret supplied ⇒ the gateway keeps the stored one. Sending an empty
@@ -200,6 +218,7 @@ describe('IntegrationConnectPanel saved-credential display', () => {
       'google',
       '1234567890-abcdef.apps.googleusercontent.com',
       undefined,
+      true,
     );
   });
 

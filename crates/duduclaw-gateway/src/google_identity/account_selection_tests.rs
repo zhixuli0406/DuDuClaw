@@ -44,11 +44,13 @@ impl Fixture {
         db.set_google_consent(&user.id, AGENT, true, &user.id)
             .unwrap();
         std::fs::create_dir(home.join("person_credentials")).unwrap();
+        let google_data_consent = crate::google_data_consent::Evidence::issue(&user.id).unwrap();
         std::fs::write(home.join("person_credentials/store.json"),serde_json::to_vec(&json!({"version":1,"epochs":{(user.id.clone()):1},"records":[{
             "owner_kind":"user","owner_id":user.id,"provider":"google","credential_id":uuid::Uuid::new_v4().to_string(),"revision":1,
             "account_email":"alice-google@unit.test","google_sub":"unit-alice-sub","hosted_domain":null,
             "granted_scopes":["https://www.googleapis.com/auth/gmail.readonly"],"status":"connected","connected_at":chrono::Utc::now().to_rfc3339(),
-            "last_refresh_at":null,"oauth_client_id":"unit-client","secret":"pk:v1:unusable-no-key-exists"}]})).unwrap()).unwrap();
+            "last_refresh_at":null,"oauth_client_id":"unit-client","google_data_consent":google_data_consent,
+            "secret":"pk:v1:unusable-no-key-exists"}]})).unwrap()).unwrap();
         std::fs::write(home.join("mcp-oauth-configs.json"),serde_json::to_vec(&json!([{"provider_id":"google","client_id":"unit-client","client_secret":"unit-not-for-output"}])).unwrap()).unwrap();
         // Only the gateway's verified edition context authorizes this. There
         // is deliberately no protection marker/key or gateway instance lease.
@@ -819,9 +821,10 @@ fn home_fallback_fixture() -> Fixture {
         "auth_url":"https://accounts.google.com/o/oauth2/v2/auth","token_url":"https://oauth2.googleapis.com/token",
         "redirect_uri":"http://127.0.0.1/callback","scopes":["client-request-not-authority"]
     }])).unwrap()).unwrap();
+    let google_home = crate::mcp_oauth::google_home_test_fixture::current_control("test-admin");
     std::fs::write(f.state.home.join("mcp-oauth-tokens.json"), serde_json::to_vec(&json!([{
         "provider_id":"google","access_token":"owned-home-access","refresh_token":null,"expires_at":null,
-        "scopes":["https://www.googleapis.com/auth/gmail.readonly"]
+        "scopes":["https://www.googleapis.com/auth/gmail.readonly"],"google_home":google_home
     }])).unwrap()).unwrap();
     f
 }
@@ -975,7 +978,8 @@ fn stored_home_union_weight_counts_private_metadata_and_rejects_oversized_origin
     data["records"][0]["granted_scopes"] = json!(scopes);
     std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
     std::fs::write(f.state.home.join("mcp-oauth-configs.json"),serde_json::to_vec(&json!([{"provider_id":"google","client_id":"unit-client","client_secret":"","auth_url":"https://accounts.google.com/o/oauth2/v2/auth","token_url":"https://oauth2.googleapis.com/token","redirect_uri":"http://127.0.0.1/callback","scopes":[]}])).unwrap()).unwrap();
-    std::fs::write(f.state.home.join("mcp-oauth-tokens.json"),serde_json::to_vec(&json!([{"provider_id":"google","access_token":"owned-home","refresh_token":null,"expires_at":null,"scopes":["https://www.googleapis.com/auth/gmail.readonly"]}])).unwrap()).unwrap();
+    let google_home = crate::mcp_oauth::google_home_test_fixture::current_control("test-admin");
+    std::fs::write(f.state.home.join("mcp-oauth-tokens.json"),serde_json::to_vec(&json!([{"provider_id":"google","access_token":"owned-home","refresh_token":null,"expires_at":null,"scopes":["https://www.googleapis.com/auth/gmail.readonly"],"google_home":google_home}])).unwrap()).unwrap();
     let result = select_account(
         &f.state,
         AGENT,

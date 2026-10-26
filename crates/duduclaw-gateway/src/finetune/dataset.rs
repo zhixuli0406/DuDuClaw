@@ -644,10 +644,12 @@ pub fn collect_review_pairs(
         .filter(|(_, _, _, agent, ts, _, _, _)| {
             sources.matches_agent(agent) && sources.after_since(ts)
         })
-        .filter_map(|(id, title, desc, agent, ts, acc_excerpt, summary, rejected)| {
-            let chosen = accepted_text(acc_excerpt.as_deref(), summary.as_deref())?;
-            Some((id, title, desc, agent, ts, chosen, rejected))
-        })
+        .filter_map(
+            |(id, title, desc, agent, ts, acc_excerpt, summary, rejected)| {
+                let chosen = accepted_text(acc_excerpt.as_deref(), summary.as_deref())?;
+                Some((id, title, desc, agent, ts, chosen, rejected))
+            },
+        )
         .map(|(_, title, desc, _, _, chosen, rejected)| PreferencePair {
             source: "task_review".to_string(),
             prompt: if field_ok(&desc) {
@@ -825,10 +827,20 @@ pub fn dataset_info_json(format: DatasetFormat, has_preference: bool) -> Value {
 /// `train.jsonl` (+ `preference.jsonl`, `dataset_info.json`, `meta.json`)
 /// under `<home>/finetune/datasets/<id>/`.
 ///
-/// Nothing leaves the machine here, so this is NOT behind the privacy gate:
-/// building is local curation. Export and remote training are the gated
-/// steps.
+/// Local curation still requires explicit generalized-training lineage at the
+/// public boundary. The private inner builder exists only for focused tests.
 pub fn build(
+    home: &Path,
+    id: &str,
+    sources: DatasetSources,
+    format_raw: &str,
+    preference_pairs: bool,
+) -> Result<DatasetMeta> {
+    super::require_generalized_training_lineage()?;
+    build_inner(home, id, sources, format_raw, preference_pairs)
+}
+
+pub(super) fn build_inner(
     home: &Path,
     id: &str,
     sources: DatasetSources,
@@ -951,6 +963,11 @@ pub fn preview(home: &Path, id: &str, n: usize) -> Result<Value> {
 /// built files. **Privacy-gated**: naming the path is the first step of
 /// moving customer data off this machine.
 pub fn export(home: &Path, id: &str, acknowledged: bool) -> Result<Value> {
+    super::require_generalized_training_lineage()?;
+    export_inner(home, id, acknowledged)
+}
+
+fn export_inner(home: &Path, id: &str, acknowledged: bool) -> Result<Value> {
     require_data_leaves_device_ack(acknowledged, "匯出資料集")?;
     let meta = read_meta(home, id)?;
     let dir = dataset_dir(home, id)?;
@@ -1479,7 +1496,7 @@ mod tests {
         seed_approvals(&home.join("approvals.db"));
 
         let meta = create(home, "值班紀錄", "sharegpt").unwrap();
-        let built = build(
+        let built = build_inner(
             home,
             &meta.id,
             DatasetSources {
@@ -1526,7 +1543,8 @@ mod tests {
         let home = home.path();
         seed_sessions(&home.join("sessions.db"));
         let meta = create(home, "只做 SFT", "alpaca").unwrap();
-        let built = build(home, &meta.id, DatasetSources::default(), "alpaca", false).unwrap();
+        let built =
+            build_inner(home, &meta.id, DatasetSources::default(), "alpaca", false).unwrap();
         assert_eq!(built.counts.preference_rows, 0);
         assert!(
             !dataset_dir(home, &meta.id)
@@ -1545,16 +1563,16 @@ mod tests {
 
         // Gate first: no acknowledgement, no path — even before we check
         // whether the dataset was built.
-        let err = export(home, &meta.id, false).unwrap_err();
+        let err = export_inner(home, &meta.id, false).unwrap_err();
         assert_eq!(err.code(), "data_leaves_device_not_acknowledged");
 
         // Acknowledged but never built → an honest not-found, not a path to
         // a file that does not exist.
-        let err = export(home, &meta.id, true).unwrap_err();
+        let err = export_inner(home, &meta.id, true).unwrap_err();
         assert_eq!(err.code(), "not_found");
 
-        build(home, &meta.id, DatasetSources::default(), "sharegpt", false).unwrap();
-        let out = export(home, &meta.id, true).unwrap();
+        build_inner(home, &meta.id, DatasetSources::default(), "sharegpt", false).unwrap();
+        let out = export_inner(home, &meta.id, true).unwrap();
         assert!(out["path"].as_str().unwrap().ends_with("train.jsonl"));
         assert!(
             out["files"]
@@ -1563,6 +1581,24 @@ mod tests {
                 .iter()
                 .any(|f| f["name"] == "train.jsonl")
         );
+    }
+
+    #[test]
+    fn public_build_and_export_fail_before_touching_storage_without_lineage() {
+        let home = tempfile::tempdir().unwrap();
+        let root = super::super::finetune_root(home.path());
+        let build_error = build(
+            home.path(),
+            "missing",
+            DatasetSources::default(),
+            "sharegpt",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(build_error.code(), "google_workspace_lineage_unavailable");
+        let export_error = export(home.path(), "missing", true).unwrap_err();
+        assert_eq!(export_error.code(), "google_workspace_lineage_unavailable");
+        assert!(!root.exists());
     }
 
     #[test]

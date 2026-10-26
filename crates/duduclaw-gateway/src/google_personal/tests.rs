@@ -121,24 +121,61 @@ async fn token(
 
 // Test-only adjacent Home fixture. The Personal endpoint keeps its exact
 // three-scope response; this separate route models the captured Home11 grant.
-async fn bound_home_token(Form(form):Form<std::collections::HashMap<String,String>>)->(StatusCode,Json<Value>) {
-    assert_eq!(form.get("grant_type").map(String::as_str),Some("authorization_code"));
-    assert!(form.get("code_verifier").is_some_and(|s|s.len()==43));
-    assert!(form.get("redirect_uri").is_some_and(|s|s.ends_with("/api/mcp/oauth/callback")));
-    let code=form.get("code").unwrap();
-    if let Some(delay)=delay_for(code) {
-        delay.exchanges.fetch_add(1,Ordering::SeqCst);
-        if delay.block_exchange.load(Ordering::SeqCst){delay.exchange_started.notify_one();delay.exchange_release.notified().await;}
+async fn bound_home_token(
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert!(form.get("code_verifier").is_some_and(|s| s.len() == 43));
+    assert!(
+        form.get("redirect_uri")
+            .is_some_and(|s| s.ends_with("/api/mcp/oauth/callback"))
+    );
+    let code = form.get("code").unwrap();
+    if let Some(delay) = delay_for(code) {
+        delay.exchanges.fetch_add(1, Ordering::SeqCst);
+        if delay.block_exchange.load(Ordering::SeqCst) {
+            delay.exchange_started.notify_one();
+            delay.exchange_release.notified().await;
+        }
     }
-    (StatusCode::OK,Json(json!({"access_token":"owned-home-access","refresh_token":"owned-home-refresh","token_type":"Bearer","expires_in":3600,"scope":crate::google_workspace::REQUIRED_SCOPES.join(" ")})))
+    (
+        StatusCode::OK,
+        Json(
+            json!({"access_token":"owned-home-access","refresh_token":"owned-home-refresh","token_type":"Bearer","expires_in":3600,"scope":crate::google_workspace::REQUIRED_SCOPES.join(" ")}),
+        ),
+    )
 }
-async fn bound_home_before_personal_capture(f:&Fixture)->(String,crate::mcp_oauth::home_lifecycle::GoogleHomePending,crate::google_identity::home_source::callback_testing::EndpointGuard) {
+async fn bound_home_before_personal_capture(
+    f: &Fixture,
+) -> (
+    String,
+    crate::mcp_oauth::home_lifecycle::GoogleHomePending,
+    crate::google_identity::home_source::callback_testing::EndpointGuard,
+) {
     use crate::mcp_oauth::home_lifecycle as home;
-    let input=home::GoogleHomeStartInput::new(Some("client-fixture"),Some("secret-fixture")).unwrap();
-    let capture=home::capture_google_home_start(&f.home,input).unwrap();
-    let(_,state,pending)=home::begin_google_home_authorization(&f.home,capture).await.unwrap().into_response_parts();
-    let guard=crate::google_identity::home_source::callback_testing::EndpointGuard::owned_loopback(&f.home,&format!("{}/h1-owned-google-home-token",oauth::test_base().get().unwrap()));
-    (state,pending,guard)
+    let input = home::GoogleHomeStartInput::new(
+        Some("client-fixture"),
+        Some("secret-fixture"),
+        "test-admin",
+    )
+    .unwrap();
+    let capture = home::capture_google_home_start(&f.home, input).unwrap();
+    let (_, state, pending) = home::begin_google_home_authorization(&f.home, capture)
+        .await
+        .unwrap()
+        .into_response_parts();
+    let guard =
+        crate::google_identity::home_source::callback_testing::EndpointGuard::owned_loopback(
+            &f.home,
+            &format!(
+                "{}/h1-owned-google-home-token",
+                oauth::test_base().get().unwrap()
+            ),
+        );
+    (state, pending, guard)
 }
 
 async fn info(headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -231,6 +268,7 @@ impl Fixture {
             "login-a",
             "http://127.0.0.1:18789",
             &[],
+            true,
         )
         .await
         .unwrap();
@@ -251,6 +289,24 @@ impl Fixture {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn core_start_requires_google_data_acknowledgement_before_state_changes() {
+    let f = Fixture::new();
+    let err = flow::start(
+        &f.home,
+        &f.db,
+        &f.alice.id,
+        "login-a",
+        "http://127.0.0.1:18789",
+        &[],
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("Google 資料"), "{err}");
+    assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -295,11 +351,23 @@ async fn session_bound_connect_records_actual_scopes_and_every_call_rechecks_con
     );
     // A suspended requester is rejected before account selection/fallback.
     // A host-owned job still reaches the separate selected-person status gate.
-    let host = RequesterIdentity::System { kind: "cron".into(), on_behalf_of: None };
+    let host = RequesterIdentity::System {
+        kind: "cron".into(),
+        on_behalf_of: None,
+    };
     let inactive = access::resolve(&f.home, "bot", &host, &people, &effective, "gmail_read")
-        .await.err().unwrap();
+        .await
+        .err()
+        .unwrap();
     assert_eq!(inactive.code, "person_inactive");
-    assert_eq!(vault::get(&f.home, &f.alice.id).unwrap().unwrap().metadata.status, Status::Suspended);
+    assert_eq!(
+        vault::get(&f.home, &f.alice.id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .status,
+        Status::Suspended
+    );
     f.db.set_user_status(&f.alice.id, UserStatus::Active)
         .unwrap();
     assert!(call("gmail_read").await.is_ok());
@@ -439,6 +507,7 @@ async fn invalid_grant_transitions_once_and_disconnect_fences_inflight_connectio
         "login-a",
         "http://127.0.0.1:18789",
         &[],
+        true,
     )
     .await
     .unwrap();
@@ -479,7 +548,11 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
         let f = Fixture::new();
         // Complete shared-client publication before Personal selection capture,
         // so setup ciphertext changes cannot make revoke assertions stale.
-        let bound_home=if kind=="home"{Some(bound_home_before_personal_capture(&f).await)}else{None};
+        let bound_home = if kind == "home" {
+            Some(bound_home_before_personal_capture(&f).await)
+        } else {
+            None
+        };
         let code = format!("race-{}", uuid::Uuid::new_v4());
         let delay = Arc::new(RevokeDelay::default());
         delays().lock().unwrap().insert(code.clone(), delay.clone());
@@ -490,6 +563,7 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
             "login-a",
             "http://127.0.0.1:18789",
             &[],
+            true,
         )
         .await
         .unwrap();
@@ -532,8 +606,15 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
         let b = tokio::spawn(async move {
             ready_b.notify_one();
             if kind == "home" {
-                let(state,pending,_endpoint_guard)=bound_home.unwrap();
-                crate::mcp_oauth::home_lifecycle::complete_google_home_authorization(&home,pending,&state,zeroize::Zeroizing::new(code_b)).await.map_err(|e|e.to_string())
+                let (state, pending, _endpoint_guard) = bound_home.unwrap();
+                crate::mcp_oauth::home_lifecycle::complete_google_home_authorization(
+                    &home,
+                    pending,
+                    &state,
+                    zeroize::Zeroizing::new(code_b),
+                )
+                .await
+                .map_err(|e| e.to_string())
             } else {
                 let start = flow::start(
                     &home,
@@ -542,6 +623,7 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
                     "login-b",
                     "http://127.0.0.1:18789",
                     &[],
+                    true,
                 )
                 .await?;
                 let state = start["state"].as_str().unwrap();
@@ -586,7 +668,7 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
 #[cfg(unix)]
 async fn cancelled_provider_revoke_leaves_new_personal_and_home_grants_closed() {
     let f = Fixture::new();
-    let(home_state,home_pending,_endpoint_guard)=bound_home_before_personal_capture(&f).await;
+    let (home_state, home_pending, _endpoint_guard) = bound_home_before_personal_capture(&f).await;
     let code = format!("race-cancel-{}", uuid::Uuid::new_v4());
     let delay = Arc::new(RevokeDelay::default());
     delays().lock().unwrap().insert(code.clone(), delay.clone());
@@ -597,6 +679,7 @@ async fn cancelled_provider_revoke_leaves_new_personal_and_home_grants_closed() 
         "login-a",
         "http://127.0.0.1:18789",
         &[],
+        true,
     )
     .await
     .unwrap();
@@ -623,12 +706,22 @@ async fn cancelled_provider_revoke_leaves_new_personal_and_home_grants_closed() 
             &f.alice.id,
             "new-login",
             "http://127.0.0.1:18789",
-            &[]
+            &[],
+            true,
         )
         .await
         .is_err()
     );
-    assert!(crate::mcp_oauth::home_lifecycle::complete_google_home_authorization(&f.home,home_pending,&home_state,zeroize::Zeroizing::new(code.clone())).await.is_err());
+    assert!(
+        crate::mcp_oauth::home_lifecycle::complete_google_home_authorization(
+            &f.home,
+            home_pending,
+            &home_state,
+            zeroize::Zeroizing::new(code.clone())
+        )
+        .await
+        .is_err()
+    );
     assert_eq!(delay.exchanges.load(Ordering::SeqCst), 1);
     delay.release.notify_one();
     assert!(
@@ -658,6 +751,7 @@ async fn prepare_delayed_case_with_code(f: &Fixture, code: String) -> (String, A
         "login-a",
         "http://127.0.0.1:18789",
         &[],
+        true,
     )
     .await
     .unwrap();
@@ -675,8 +769,11 @@ async fn home_account_probe_and_revoke_share_one_lease_before_new_connect() {
     let f = Fixture::new();
     let code = format!("race-{}", uuid::Uuid::new_v4());
     crate::mcp_oauth::google_home_test_fixture::connect(
-        &f.home, &format!("access-probe-{code}"), None,
-    ).await;
+        &f.home,
+        &format!("access-probe-{code}"),
+        None,
+    )
+    .await;
     let (code, delay) = prepare_delayed_case_with_code(&f, code).await;
     let home = f.home.clone();
     let db = f.db.clone();
@@ -701,6 +798,7 @@ async fn home_account_probe_and_revoke_share_one_lease_before_new_connect() {
             "next-login",
             "http://127.0.0.1:18789",
             &[],
+            true,
         )
         .await
     });
@@ -735,6 +833,7 @@ async fn revoke_waits_for_inflight_other_person_exchange_then_preserves_its_shar
         "bob-login",
         "http://127.0.0.1:18789",
         &[],
+        true,
     )
     .await
     .unwrap();
@@ -809,44 +908,76 @@ async fn saved_client_only_control_does_not_suppress_actual_personal_provider_re
     let before = std::fs::read(f.home.join(crate::mcp_oauth::TOKEN_FILE)).unwrap();
     assert!(crate::mcp_oauth::get_token(&f.home, "google").is_none());
     delay.release.notify_one();
-    assert!(lifecycle::disconnect(&f.home, &f.db, &f.alice.id, &f.alice.id, false).await.unwrap());
+    assert!(
+        lifecycle::disconnect(&f.home, &f.db, &f.alice.id, &f.alice.id, false)
+            .await
+            .unwrap()
+    );
     assert_eq!(delay.revoke_requests.load(Ordering::SeqCst), 1);
     assert_eq!(delay.exchanges.load(Ordering::SeqCst), 1);
-    assert_eq!(std::fs::read(f.home.join(crate::mcp_oauth::TOKEN_FILE)).unwrap(), before);
+    assert_eq!(
+        std::fs::read(f.home.join(crate::mcp_oauth::TOKEN_FILE)).unwrap(),
+        before
+    );
     assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
     delays().lock().unwrap().remove(&code);
 }
 #[tokio::test]
 #[cfg(unix)]
 async fn invalid_or_unknown_home_store_never_reaches_personal_provider_revoke() {
-    for kind in ["legacy-missing-token", "residual-refresh", "invalid-control", "unknown-provider"] {
+    for kind in [
+        "legacy-missing-token",
+        "residual-refresh",
+        "invalid-control",
+        "unknown-provider",
+    ] {
         let f = Fixture::new();
         let (code, delay) = prepare_delayed_case(&f).await;
         let path = f.home.join(crate::mcp_oauth::TOKEN_FILE);
         let mut rows: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         match kind {
-            "legacy-missing-token" => { rows[0].as_object_mut().unwrap().remove("google_home"); },
+            "legacy-missing-token" => {
+                rows[0].as_object_mut().unwrap().remove("google_home");
+            }
             "residual-refresh" => rows[0]["refresh_token"] = json!("enc:v1:unusable-residual"),
             "invalid-control" => rows[0]["google_home"]["schema"] = json!(99),
-            "unknown-provider" => rows.as_array_mut().unwrap().push(json!({"provider_id":"unknown","future":true})),
+            "unknown-provider" => rows
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"provider_id":"unknown","future":true})),
             _ => unreachable!(),
         }
         std::fs::write(&path, serde_json::to_vec(&rows).unwrap()).unwrap();
         let before = std::fs::read(&path).unwrap();
         delay.release.notify_one();
-        assert!(!lifecycle::disconnect(&f.home, &f.db, &f.alice.id, &f.alice.id, false).await.unwrap(), "{kind}");
+        assert!(
+            !lifecycle::disconnect(&f.home, &f.db, &f.alice.id, &f.alice.id, false)
+                .await
+                .unwrap(),
+            "{kind}"
+        );
         assert_eq!(delay.revoke_requests.load(Ordering::SeqCst), 0, "{kind}");
         assert_eq!(delay.exchanges.load(Ordering::SeqCst), 1, "{kind}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "{kind}");
-        assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none(), "local disconnect is preserved");
+        assert!(
+            vault::get(&f.home, &f.alice.id).unwrap().is_none(),
+            "local disconnect is preserved"
+        );
         delays().lock().unwrap().remove(&code);
     }
 }
 
 #[tokio::test]
 #[cfg(unix)]
-async fn actual_legacy_home_grant_still_requires_readable_distinct_account_before_personal_revoke() {
-    for kind in ["shared", "different", "unreadable", "unknown-prefix", "probe-failed"] {
+async fn actual_legacy_home_grant_still_requires_readable_distinct_account_before_personal_revoke()
+{
+    for kind in [
+        "shared",
+        "different",
+        "unreadable",
+        "unknown-prefix",
+        "probe-failed",
+    ] {
         let f = Fixture::new();
         let (code, delay) = prepare_delayed_case(&f).await;
         // This is an actual legacy token fixture, not a control-only row
@@ -860,15 +991,30 @@ async fn actual_legacy_home_grant_still_requires_readable_distinct_account_befor
             _ => unreachable!(),
         };
         let path = f.home.join(crate::mcp_oauth::TOKEN_FILE);
-        std::fs::write(&path, serde_json::to_vec(&json!([{
-            "provider_id":"google", "access_token":access, "refresh_token":null,
-            "expires_at":null, "scopes":["openid","email"]
-        }])).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "provider_id":"google", "access_token":access, "refresh_token":null,
+                "expires_at":null, "scopes":["openid","email"]
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
         let before = std::fs::read(&path).unwrap();
         delay.release.notify_one();
         let expected = kind == "different";
-        assert_eq!(lifecycle::disconnect(&f.home, &f.db, &f.alice.id, &f.alice.id, false).await.unwrap(), expected, "{kind}");
-        assert_eq!(delay.revoke_requests.load(Ordering::SeqCst), usize::from(expected), "{kind}");
+        assert_eq!(
+            lifecycle::disconnect(&f.home, &f.db, &f.alice.id, &f.alice.id, false)
+                .await
+                .unwrap(),
+            expected,
+            "{kind}"
+        );
+        assert_eq!(
+            delay.revoke_requests.load(Ordering::SeqCst),
+            usize::from(expected),
+            "{kind}"
+        );
         assert_eq!(delay.exchanges.load(Ordering::SeqCst), 1, "{kind}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "{kind}");
         delays().lock().unwrap().remove(&code);

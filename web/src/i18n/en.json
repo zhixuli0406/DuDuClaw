@@ -1,4 +1,10 @@
 {
+  "googleDataDisclosure.title": "Before connecting Google",
+  "googleDataDisclosure.access": "DuDuClaw uses the Google data you authorize—Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, and your account email—to provide the Google features you request.",
+  "googleDataDisclosure.storage": "Credentials are encrypted locally and sent only to Google. Task data may be sent to your configured AI provider and Google data may be stored in local conversation history, memory, knowledge, task, tool/runtime records, and backups. Disconnecting removes credentials, not existing content.",
+  "googleDataDisclosure.training": "DuDuClaw does not use Google data to train models. Your configured AI provider must not use Google data to train or improve a generalized AI or ML model. DuDuClaw cannot verify provider terms or settings automatically; do not connect until your administrator has confirmed them.",
+  "googleDataDisclosure.privacy": "Read the DuDuClaw privacy policy",
+  "googleDataDisclosure.confirm": "I understand how my Google data is accessed, used, shared, stored, and deleted.",
   "myConnections.registeredReturn": "Exact return address to register in Google",
   "myConnections.copyReturn": "Copy return address",
   "myConnections.service.gmail": "Gmail",

@@ -38,6 +38,10 @@ pub struct Metadata {
     pub connected_at: String,
     pub last_refresh_at: Option<String>,
     pub oauth_client_id: String,
+    /// Missing on legacy records. Legacy credentials remain removable but
+    /// cannot be selected, unsealed through normal use, or refreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_data_consent: Option<crate::google_data_consent::Evidence>,
 }
 
 /// Intentionally not Debug or Serialize on a public response type.
@@ -66,6 +70,8 @@ struct Binding {
     hosted_domain: Option<String>,
     oauth_client_id: String,
     granted_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google_data_consent: Option<crate::google_data_consent::Evidence>,
 }
 
 impl From<&Metadata> for Binding {
@@ -78,6 +84,7 @@ impl From<&Metadata> for Binding {
             hosted_domain: m.hosted_domain.clone(),
             oauth_client_id: m.oauth_client_id.clone(),
             granted_scopes: m.granted_scopes.clone(),
+            google_data_consent: m.google_data_consent.clone(),
         }
     }
 }
@@ -185,6 +192,9 @@ fn valid_metadata(m: &Metadata) -> bool {
         && m.last_refresh_at
             .as_deref()
             .is_none_or(|time| chrono::DateTime::parse_from_rfc3339(time).is_ok())
+        && m.google_data_consent
+            .as_ref()
+            .is_none_or(crate::google_data_consent::Evidence::is_well_formed)
 }
 
 fn modify<T>(
@@ -248,6 +258,7 @@ pub struct CredentialAuthority {
     pub granted_scopes: Vec<String>,
     pub status: Status,
     pub epoch: u64,
+    pub google_data_consent: Option<crate::google_data_consent::Evidence>,
 }
 
 impl CredentialAuthority {
@@ -265,6 +276,7 @@ impl CredentialAuthority {
             granted_scopes: scopes,
             status: metadata.status,
             epoch,
+            google_data_consent: metadata.google_data_consent.clone(),
         }
     }
 }
