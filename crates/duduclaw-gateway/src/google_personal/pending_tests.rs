@@ -61,8 +61,8 @@ fn pasted_callback_requires_exact_redirect_and_same_session_before_recording_cod
         home: home.into(),
         user_id: "alice".into(),
         session_ref: "session-a".into(),
-        redirect_uri: "http://127.0.0.1:18789/api/me/google/callback".into(),
-        dashboard_origin: "http://lan:18789".into(),
+        redirect_uri: "http://127.0.0.1:18889/api/me/google/callback".into(),
+        dashboard_origin: "http://lan:18889".into(),
         paste: true,
         code_verifier: "verifier".into(),
         client_id: "client".into(),
@@ -72,10 +72,10 @@ fn pasted_callback_requires_exact_redirect_and_same_session_before_recording_cod
         created: Instant::now(),
         code: None,
     });
-    let good = format!("http://127.0.0.1:18789/api/me/google/callback?state={state}&code=code-a");
+    let good = format!("http://127.0.0.1:18889/api/me/google/callback?state={state}&code=code-a");
     assert!(receive_pasted(home, "bob", "session-a", &good).is_err());
     assert!(receive_pasted(home, "alice", "session-b", &good).is_err());
-    assert!(receive_pasted(home, "alice", "session-a", &good.replace(":18789", ":9999")).is_err());
+    assert!(receive_pasted(home, "alice", "session-a", &good.replace(":18889", ":9999")).is_err());
     assert!(receive_pasted(home, "alice", "session-a", &format!("{good}&code=another")).is_err());
     assert_eq!(
         receive_pasted(home, "alice", "session-a", &good).unwrap(),

@@ -65,8 +65,8 @@ Artifacts land in `src-tauri/target/release/bundle/` (`.app`/`.dmg`,
 
 - **Single instance** — a second launch focuses the existing window (§D2.1).
 - **Attach vs spawn** — if a gateway is already serving on `DUDUCLAW_PORT`
-  (default **18789**) it attaches and will *not* kill it; otherwise it spawns
-  the sidecar on the first free port in `18789..=18797` (§D1 / §D2.2).
+  (default **18889**) it attaches and will *not* kill it; otherwise it spawns
+  the sidecar on the first free port in `18889..=18897` (§D1 / §D2.2).
 - **PATH** — the sidecar is spawned with an augmented PATH (Homebrew, `.local/bin`,
   Bun, Volta, npm-global, asdf, cargo) so Finder/Dock launches still find Claude
   CLI / node / containers (§D2.6).
@@ -110,7 +110,7 @@ Ordered roughly by when you hit them. All are resolved in the repo; this is the
 5. **Vite "Waiting for frontend dev server …" forever.** Vite must bind IPv4
    `127.0.0.1` (not the default `localhost`/`::1`) to match the Tauri poller and
    the proxy target — pinned in `web/vite.config.ts` (`host: '127.0.0.1'`,
-   `strictPort`, and the gateway proxy default `http://127.0.0.1:18789`).
+   `strictPort`, and the gateway proxy default `http://127.0.0.1:18889`).
 
 6. **Compile error in `cookie 0.18.1` (`Parsable::parse` arity).** `time 0.3.52`
    broke the API within 0.3.x; held at `time = "=0.3.51"` in `src-tauri/Cargo.toml`.

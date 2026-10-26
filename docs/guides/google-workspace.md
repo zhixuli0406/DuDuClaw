@@ -317,10 +317,10 @@ credentials). One-time setup:
 5. Under **Authorized redirect URIs**, add exactly:
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
-   18789 is the gateway's default port. If you run it elsewhere (`DUDUCLAW_PORT`),
+   18889 is the gateway's default port. If you run it elsewhere (`DUDUCLAW_PORT`),
    register that port instead — the dashboard's setup step shows the exact URI,
    derived from the port the gateway is actually listening on. A mismatch here
    is silent: Google redirects the browser to a port with nothing on it, so the
@@ -395,6 +395,6 @@ current scopes.
 - **`403` with a scope list** — The token is missing required scopes. Reconnect
   to re-consent.
 - **Redirect URI mismatch during consent** — The redirect URI in your Google
-  OAuth client must be exactly `http://localhost:18789/api/mcp/oauth/callback`.
+  OAuth client must be exactly `http://localhost:18889/api/mcp/oauth/callback`.
 
 Run `google_status` at any time for a live diagnosis.

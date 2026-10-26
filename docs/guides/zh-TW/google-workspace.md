@@ -200,10 +200,10 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 5. 在 **Authorized redirect URIs** 下，準確加入：
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
-   18789 是 gateway 的預設連接埠。如果你在別的連接埠上執行（`DUDUCLAW_PORT`），
+   18889 是 gateway 的預設連接埠。如果你在別的連接埠上執行（`DUDUCLAW_PORT`），
    請改註冊那個連接埠，dashboard 的設定步驟會顯示精確的 URI，並依 gateway
    實際監聽的連接埠推導出來。這裡的不匹配是無聲的：Google 會把瀏覽器導向一個
    什麼都沒有的連接埠，token 永遠不會抵達，頁面會一直停在「尚未連接」。
@@ -271,6 +271,6 @@ Google」重新連接，即可用目前的 scope 集合重新同意。
 - **`401 Unauthorized`**：授權已被撤銷或已失效，請重新連接。
 - **`403` 並附上 scope 清單**：token 缺少必要的 scope，請重新連接以重新同意。
 - **同意過程中出現 Redirect URI 不符**：你 Google OAuth client 中的 redirect
-  URI 必須精確等於 `http://localhost:18789/api/mcp/oauth/callback`。
+  URI 必須精確等於 `http://localhost:18889/api/mcp/oauth/callback`。
 
 隨時執行 `google_status` 即可取得即時診斷結果。

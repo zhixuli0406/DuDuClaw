@@ -27,7 +27,7 @@ fn defaults_to_enabled_when_no_config_file() {
 #[test]
 fn defaults_to_enabled_when_section_absent() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 18789\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 18889\n").unwrap();
     assert!(DecisionConfig::from_home(dir.path()).enabled);
 }
 

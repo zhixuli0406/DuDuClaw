@@ -56,7 +56,7 @@ Notionのworkspaceを接続すると、あなたのAI社員はページとデー
    正確に追加する:
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
 4. **OAuth client ID**と**OAuth client secret**をコピーする。

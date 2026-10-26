@@ -194,8 +194,8 @@ The redirect goes to the dashboard address you are using
 - an `https` address listed in `config.toml [gateway] allowed_origins` (or
   `DUDUCLAW_ALLOWED_ORIGINS`), compared by exact host and port.
 
-Any other address (plain `http` on a LAN IP such as `http://192.168.1.20:18789`
-or a host name such as `http://duduclaw.local:18789`, or an https address not
+Any other address (plain `http` on a LAN IP such as `http://192.168.1.20:18889`
+or a host name such as `http://duduclaw.local:18889`, or an https address not
 in `allowed_origins`) cannot receive the redirect, because OAuth 2.1 allows
 non-https redirect URIs only for loopback. For those, the sign-in still works
 in two steps:

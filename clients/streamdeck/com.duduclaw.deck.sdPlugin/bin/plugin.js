@@ -6429,6 +6429,32 @@ if (streamDeck.manifest.SDKVersion >= 3) {
 }
 
 // src/plugin.ts
+var NEW_GATEWAY = "http://127.0.0.1:18889";
+var LEGACY_GATEWAY = "http://127.0.0.1:18789";
+async function isDuduClawGateway(base) {
+  try {
+    const res = await fetch(`${base}/healthz`, {
+      signal: AbortSignal.timeout(500)
+    });
+    const body = await res.json();
+    return body.service === "duduclaw-gateway";
+  } catch {
+    return false;
+  }
+}
+async function resolveImplicitGateway(settings2) {
+  if (settings2.gatewayUrl) return settings2;
+  const [currentLive, legacyLive] = await Promise.all([
+    isDuduClawGateway(NEW_GATEWAY),
+    isDuduClawGateway(LEGACY_GATEWAY)
+  ]);
+  const hasCredentials = Boolean(settings2.email || settings2.password);
+  const gatewayUrl = hasCredentials ? legacyLive ? LEGACY_GATEWAY : void 0 : NEW_GATEWAY;
+  if (!gatewayUrl) return settings2;
+  const resolved = { ...settings2, gatewayUrl };
+  await streamDeck.settings.setGlobalSettings(resolved);
+  return resolved;
+}
 var Gateway = class {
   constructor(settings2) {
     this.settings = settings2;
@@ -6440,7 +6466,10 @@ var Gateway = class {
   accessToken;
   refreshToken;
   base() {
-    return (this.settings.gatewayUrl ?? "http://127.0.0.1:18789").replace(/\/+$/, "");
+    if (!this.settings.gatewayUrl) {
+      throw new Error("\u5C1A\u672A\u78BA\u8A8D DuDuClaw gateway\uFF0C\u8ACB\u5148\u5728\u8A2D\u5B9A\u4E2D\u6307\u5B9A gateway URL");
+    }
+    return this.settings.gatewayUrl.replace(/\/+$/, "");
   }
   async login() {
     const { email, password } = this.settings;
@@ -6458,6 +6487,7 @@ var Gateway = class {
   async refresh() {
     if (!this.refreshToken) return false;
     try {
+      if (!await isDuduClawGateway(this.base())) return false;
       const res = await fetch(`${this.base()}/api/refresh`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -6476,6 +6506,9 @@ var Gateway = class {
   connect() {
     if (this.ws && this.ws.readyState === wrapper_default.OPEN && this.ready) return this.ready;
     this.ready = (async () => {
+      if (!await isDuduClawGateway(this.base())) {
+        throw new Error("\u62D2\u7D55\u50B3\u9001\u6191\u8B49\uFF1A\u76EE\u6A19\u4E0D\u662F DuDuClaw gateway");
+      }
       if (!this.accessToken) await this.login();
       const sock = new wrapper_default(this.base().replace(/^http/, "ws") + "/ws");
       this.ws = sock;
@@ -6547,8 +6580,8 @@ var Gateway = class {
   }
 };
 var gateway = new Gateway({});
-streamDeck.settings.onDidReceiveGlobalSettings((ev) => {
-  gateway.updateSettings(ev.settings);
+streamDeck.settings.onDidReceiveGlobalSettings(async (ev) => {
+  gateway.updateSettings(await resolveImplicitGateway(ev.settings));
 });
 async function oldestApproval() {
   const res = await gateway.rpc("approvals.list", {});
@@ -6630,7 +6663,10 @@ var StatusAction = class extends (_a3 = SingletonAction) {
     setInterval(refresh, 15e3);
   }
   async onKeyDown() {
-    const url = (await streamDeck.settings.getGlobalSettings()).gatewayUrl ?? "http://127.0.0.1:18789";
+    const settings2 = await resolveImplicitGateway(
+      await streamDeck.settings.getGlobalSettings()
+    );
+    const url = settings2.gatewayUrl ?? NEW_GATEWAY;
     await streamDeck.system.openUrl(url);
   }
 };
@@ -6644,13 +6680,6 @@ streamDeck.connect();
 /*! Bundled license information:
 
 @elgato/schemas/dist/streamdeck/plugins/index.mjs:
-  (**!
-   * @author Elgato
-   * @module elgato/streamdeck
-   * @license MIT
-   * @copyright Copyright (c) Corsair Memory Inc.
-   *)
-
 @elgato/streamdeck/dist/index.js:
   (**!
    * @author Elgato

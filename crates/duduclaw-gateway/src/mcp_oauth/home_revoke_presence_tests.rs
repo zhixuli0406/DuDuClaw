@@ -17,7 +17,7 @@ fn home() -> tempfile::TempDir {
             client_secret: String::new(),
             auth_url: crate::google_personal::oauth::AUTHORIZE.into(),
             token_url: crate::google_personal::oauth::TOKEN.into(),
-            redirect_uri: "http://127.0.0.1:18789/api/mcp/oauth/callback".into(),
+            redirect_uri: "http://127.0.0.1:18889/api/mcp/oauth/callback".into(),
             scopes: vec![],
         },
     )
@@ -39,7 +39,7 @@ fn pending(home: &Path) {
         client_secret: String::new(),
         auth_url: crate::google_personal::oauth::AUTHORIZE.into(),
         token_url: crate::google_personal::oauth::TOKEN.into(),
-        redirect_uri: "http://127.0.0.1:18789/api/mcp/oauth/callback".into(),
+        redirect_uri: "http://127.0.0.1:18889/api/mcp/oauth/callback".into(),
         scopes: vec![],
     };
     super::super::home_lifecycle::begin_google_home_connect(

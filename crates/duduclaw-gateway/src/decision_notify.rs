@@ -1025,7 +1025,7 @@ mod tests {
             source: DecisionSource::Kickoff,
             decision_id: "apv-123",
             body: "🚀 新任務要開工",
-            link: Some("http://localhost:18789/inbox?item=apv-123"),
+            link: Some("http://localhost:18889/inbox?item=apv-123"),
             no_button_hint: "請至儀表板同意或拒絕。",
         };
         let http = reqwest::Client::new();
@@ -1045,7 +1045,7 @@ mod tests {
         assert_eq!(n.text, "🚀 新任務要開工");
         assert_eq!(
             n.link.as_deref(),
-            Some("http://localhost:18789/inbox?item=apv-123")
+            Some("http://localhost:18889/inbox?item=apv-123")
         );
         assert_eq!(n.no_button_hint.as_deref(), Some("請至儀表板同意或拒絕。"));
         assert_eq!(

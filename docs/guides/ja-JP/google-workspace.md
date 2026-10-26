@@ -225,10 +225,10 @@ Agent Mail は最後に完了したポーリング時刻、アカウント利用
 5. **Authorized redirect URIs**に、正確に以下を追加する:
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
-   18789はgatewayのデフォルトポートです。別のポートで実行している場合
+   18889はgatewayのデフォルトポートです。別のポートで実行している場合
    (`DUDUCLAW_PORT`)は、そのポートを代わりに登録してください。ダッシュボードの
    セットアップ手順には、gatewayが実際にリッスンしているポートから導出された
    正確なURIが表示されます。ここが一致していないと、失敗は静かに起こります。
@@ -307,6 +307,6 @@ Googleページに戻って再接続するよう案内します。
 - **スコープ一覧付きの`403`**: トークンに必要なスコープが不足しています。
   再接続して再同意してください。
 - **同意中のRedirect URI不一致**: Google OAuth clientのredirect URIは
-  正確に`http://localhost:18789/api/mcp/oauth/callback`である必要があります。
+  正確に`http://localhost:18889/api/mcp/oauth/callback`である必要があります。
 
 いつでも`google_status`を実行すれば、その場で診断結果を確認できます。

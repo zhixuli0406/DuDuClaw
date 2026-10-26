@@ -5,14 +5,15 @@
 //! of Tauri. `main.rs` wires these into the app + tray lifecycle.
 
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// The gateway's default loopback host and port. Mirrors the CLI:
-/// `DUDUCLAW_PORT` env override, else 18789 (see duduclaw-cli `lib.rs`).
+/// `DUDUCLAW_PORT` env override, else 18889 (see duduclaw-cli `lib.rs`).
 pub const DEFAULT_HOST: &str = "127.0.0.1";
-pub const DEFAULT_PORT: u16 = 18789;
+pub const DEFAULT_PORT: u16 = 18889;
 
 /// Resolve the configured port with the full priority chain (§D2.2):
 /// `DUDUCLAW_PORT` env (if set & non-privileged) > `~/.duduclaw/config.toml`
@@ -96,8 +97,8 @@ pub fn candidate_ports(preferred: u16) -> Vec<u16> {
     v
 }
 
-/// True if *something* is already listening on host:port — used both to detect
-/// an existing gateway (attach instead of spawn, §D1) and to find a free port.
+/// True if *something* is already listening on host:port — used to avoid a
+/// bind collision while selecting a sidecar port.
 pub fn is_listening(host: &str, port: u16) -> bool {
     let addr = format!("{host}:{port}");
     match addr.to_socket_addrs() {
@@ -105,6 +106,267 @@ pub fn is_listening(host: &str, port: u16) -> bool {
             addrs.any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(250)).is_ok())
         }
         Err(_) => false,
+    }
+}
+
+/// True only when the listener identifies itself as DuDuClaw's gateway.
+/// A TCP listener alone is insufficient now that another product commonly
+/// occupies the former default port.
+pub fn is_duduclaw_gateway(host: &str, port: u16) -> bool {
+    let addr = format!("{host}:{port}");
+    let Ok(addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    addrs.into_iter().any(|socket| {
+        let Ok(mut stream) = TcpStream::connect_timeout(&socket, Duration::from_millis(250)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+        let request = format!(
+            "GET /healthz HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut response = String::new();
+        if stream.take(64 * 1024).read_to_string(&mut response).is_err() {
+            return false;
+        }
+        is_duduclaw_health_response(&response)
+    })
+}
+
+pub fn is_duduclaw_health_response(response: &str) -> bool {
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Some(status) = headers.lines().next() else {
+        return false;
+    };
+    if !(status.starts_with("HTTP/1.1 200 ") || status.starts_with("HTTP/1.1 503 ")) {
+        return false;
+    }
+    top_level_service_is_duduclaw(body)
+}
+
+fn top_level_service_is_duduclaw(body: &str) -> bool {
+    let mut json = JsonCursor::new(body);
+    json.parse_top_level_service() == Some(true)
+}
+
+struct JsonCursor<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonCursor<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn ws(&mut self) {
+        while self.bytes.get(self.pos).is_some_and(u8::is_ascii_whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn take(&mut self, byte: u8) -> bool {
+        self.ws();
+        if self.bytes.get(self.pos) == Some(&byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the raw UTF-8 contents and whether JSON escapes were present.
+    fn string(&mut self) -> Option<(&'a str, bool)> {
+        self.ws();
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return None;
+        }
+        self.pos += 1;
+        let start = self.pos;
+        let mut escaped = false;
+        while let Some(&byte) = self.bytes.get(self.pos) {
+            match byte {
+                b'"' => {
+                    let end = self.pos;
+                    self.pos += 1;
+                    return Some((&self.input[start..end], escaped));
+                }
+                b'\\' => {
+                    escaped = true;
+                    self.pos += 1;
+                    let escape = *self.bytes.get(self.pos)?;
+                    if escape == b'u' {
+                        for offset in 1..=4 {
+                            if !self.bytes.get(self.pos + offset)?.is_ascii_hexdigit() {
+                                return None;
+                            }
+                        }
+                        self.pos += 5;
+                    } else if matches!(escape, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') {
+                        self.pos += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                0x00..=0x1f => return None,
+                _ => self.pos += 1,
+            }
+        }
+        None
+    }
+
+    fn number(&mut self) -> bool {
+        self.ws();
+        let start = self.pos;
+        if self.bytes.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
+        }
+        match self.bytes.get(self.pos) {
+            Some(b'0') => self.pos += 1,
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return false,
+        }
+        if self.bytes.get(self.pos) == Some(&b'.') {
+            self.pos += 1;
+            let digits = self.pos;
+            while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == digits {
+                return false;
+            }
+        }
+        if matches!(self.bytes.get(self.pos), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.bytes.get(self.pos), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let digits = self.pos;
+            while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == digits {
+                return false;
+            }
+        }
+        self.pos > start
+    }
+
+    fn value(&mut self, depth: u8) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        self.ws();
+        match self.bytes.get(self.pos).copied() {
+            Some(b'"') => self.string().is_some(),
+            Some(b'{') => self.object(depth + 1),
+            Some(b'[') => self.array(depth + 1),
+            Some(b't') => self.literal(b"true"),
+            Some(b'f') => self.literal(b"false"),
+            Some(b'n') => self.literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => false,
+        }
+    }
+
+    fn literal(&mut self, literal: &[u8]) -> bool {
+        if self.bytes.get(self.pos..self.pos + literal.len()) == Some(literal) {
+            self.pos += literal.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn object(&mut self, depth: u8) -> bool {
+        if !self.take(b'{') {
+            return false;
+        }
+        self.ws();
+        if self.take(b'}') {
+            return true;
+        }
+        loop {
+            if self.string().is_none() || !self.take(b':') || !self.value(depth) {
+                return false;
+            }
+            if self.take(b'}') {
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn array(&mut self, depth: u8) -> bool {
+        if !self.take(b'[') {
+            return false;
+        }
+        self.ws();
+        if self.take(b']') {
+            return true;
+        }
+        loop {
+            if !self.value(depth) {
+                return false;
+            }
+            if self.take(b']') {
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn parse_top_level_service(&mut self) -> Option<bool> {
+        if !self.take(b'{') {
+            return None;
+        }
+        let mut service = None;
+        self.ws();
+        if !self.take(b'}') {
+            loop {
+                let (key, key_escaped) = self.string()?;
+                if !self.take(b':') {
+                    return None;
+                }
+                if !key_escaped && key == "service" {
+                    if service.is_some() {
+                        return None;
+                    }
+                    let (value, value_escaped) = self.string()?;
+                    service = Some(!value_escaped && value == "duduclaw-gateway");
+                } else if !self.value(1) {
+                    return None;
+                }
+                if self.take(b'}') {
+                    break;
+                }
+                if !self.take(b',') {
+                    return None;
+                }
+            }
+        }
+        self.ws();
+        (self.pos == self.bytes.len()).then_some(service == Some(true))
     }
 }
 
@@ -174,15 +436,21 @@ pub fn known_ports() -> Vec<u16> {
 }
 
 /// Decide whether to attach or spawn, honoring [`DesktopMode`] and probing every
-/// known port for an existing gateway before spawning. Thin wrapper over
-/// [`decide_plan`] with the real [`is_listening`] probe.
+/// known port for an existing gateway before spawning. Product identity and
+/// raw port occupancy are intentionally separate probes.
 pub fn plan_gateway_with(
     mode: DesktopMode,
     host: &str,
     known: &[u16],
     preferred: u16,
 ) -> GatewayPlan {
-    decide_plan(mode, known, preferred, |p| is_listening(host, p))
+    decide_plan_with_probes(
+        mode,
+        known,
+        preferred,
+        |port| is_duduclaw_gateway(host, port),
+        |port| is_listening(host, port),
+    )
 }
 
 /// Pure decision core (§D1/§D2.2): generic over the liveness probe so the whole
@@ -200,11 +468,27 @@ pub fn decide_plan<F: Fn(u16) -> bool>(
     preferred: u16,
     is_live: F,
 ) -> GatewayPlan {
-    let first_live = || known.iter().copied().find(|p| is_live(*p));
+    let probe = &is_live;
+    decide_plan_with_probes(mode, known, preferred, |port| probe(port), |port| {
+        probe(port)
+    })
+}
+
+/// Decision core with separate product-identity and port-occupancy probes.
+/// This keeps a foreign service on a known port from being treated as an
+/// attachable DuDuClaw gateway while still avoiding a bind collision.
+pub fn decide_plan_with_probes<F: Fn(u16) -> bool, G: Fn(u16) -> bool>(
+    mode: DesktopMode,
+    known: &[u16],
+    preferred: u16,
+    is_gateway: F,
+    is_occupied: G,
+) -> GatewayPlan {
+    let first_live = || known.iter().copied().find(|p| is_gateway(*p));
     let spawn_free = || {
         candidate_ports(preferred)
             .into_iter()
-            .find(|p| !is_live(*p))
+            .find(|p| !is_occupied(*p))
             .map(|port| GatewayPlan::Spawn { port })
             // Every candidate busy but none is "our" gateway — fall back.
             .unwrap_or(GatewayPlan::Spawn { port: preferred })
@@ -297,11 +581,13 @@ mod tests {
 
     #[test]
     fn candidate_ports_starts_with_preferred_and_bands() {
-        let c = candidate_ports(18789);
-        assert_eq!(c[0], 18789);
+        assert_eq!(DEFAULT_PORT, 18889);
+        assert_ne!(DEFAULT_PORT, 18789);
+        let c = candidate_ports(DEFAULT_PORT);
+        assert_eq!(c[0], 18889);
         assert_eq!(c.len(), 9);
-        assert_eq!(c[1], 18790);
-        assert_eq!(*c.last().unwrap(), 18797);
+        assert_eq!(c[1], 18890);
+        assert_eq!(*c.last().unwrap(), 18897);
     }
 
     #[test]
@@ -315,9 +601,40 @@ mod tests {
     #[test]
     fn health_url_is_well_formed() {
         assert_eq!(
-            health_url("127.0.0.1", 18789),
-            "http://127.0.0.1:18789/healthz"
+            health_url("127.0.0.1", 18889),
+            "http://127.0.0.1:18889/healthz"
         );
+    }
+
+    #[test]
+    fn health_response_requires_duduclaw_service_identity() {
+        assert!(is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"ok\":true,\"service\":\"duduclaw-gateway\"}"
+        ));
+        assert!(is_duduclaw_health_response(
+            "HTTP/1.1 503 Service Unavailable\r\n\r\n{ \"service\" : \"duduclaw-gateway\" }"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"service\":\"openclaw-gateway\"}"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\nX-Test: {\"service\":\"duduclaw-gateway\"}\r\n\r\n{}"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"xservice\":\"duduclaw-gateway\"}"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"nested\":{\"service\":\"duduclaw-gateway\"}}"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "not-http\r\n\r\n{\"service\":\"duduclaw-gateway\"}"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"service\":\"duduclaw-gateway\",garbage}"
+        ));
+        assert!(!is_duduclaw_health_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"service\":\"openclaw-gateway\",\"service\":\"duduclaw-gateway\"}"
+        ));
     }
 
     #[test]
@@ -427,11 +744,33 @@ mod tests {
 
     #[test]
     fn decide_plan_auto_attaches_to_any_live_known_port() {
-        // config points at 18950 but the live gateway is on the default 18789;
-        // Auto must attach to 18789, NOT spawn a competing instance over 18950.
+        // config points at 18950 but the live gateway is on the default 18889;
+        // Auto must attach to 18889, NOT spawn a competing instance over 18950.
         let known = vec![18950u16, DEFAULT_PORT];
         let plan = decide_plan(DesktopMode::Auto, &known, 18950, |p| p == DEFAULT_PORT);
         assert_eq!(plan, GatewayPlan::Attach { port: DEFAULT_PORT });
+    }
+
+    #[test]
+    fn decide_plan_does_not_attach_to_a_foreign_listener() {
+        let known = vec![18789u16, DEFAULT_PORT];
+        let plan = decide_plan_with_probes(
+            DesktopMode::Auto,
+            &known,
+            18789,
+            |port| port == DEFAULT_PORT,
+            |port| port == 18789 || port == DEFAULT_PORT,
+        );
+        assert_eq!(plan, GatewayPlan::Attach { port: DEFAULT_PORT });
+
+        let plan = decide_plan_with_probes(
+            DesktopMode::Auto,
+            &[18789],
+            18789,
+            |_| false,
+            |port| port == 18789 || port == 18790,
+        );
+        assert_eq!(plan, GatewayPlan::Spawn { port: 18791 });
     }
 
     #[test]

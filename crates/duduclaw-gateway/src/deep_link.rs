@@ -142,7 +142,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
-            "[dashboard]\npublic_url = \"https://ai.example.com/\"\n\n[gateway]\nport = 18789\n",
+            "[dashboard]\npublic_url = \"https://ai.example.com/\"\n\n[gateway]\nport = 18889\n",
         );
         assert_eq!(
             dashboard_base_url(dir.path()),
@@ -156,11 +156,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
-            "[gateway]\nbind = \"127.0.0.1\"\nport = 18789\n",
+            "[gateway]\nbind = \"127.0.0.1\"\nport = 18889\n",
         );
         assert_eq!(
             dashboard_base_url(dir.path()),
-            Some("http://localhost:18789".to_string())
+            Some("http://localhost:18889".to_string())
         );
     }
 
@@ -210,54 +210,54 @@ mod tests {
     #[test]
     fn deep_link_task_lands_on_the_task_detail_route() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18789\n");
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::Task, "abc123"),
-            Some("http://localhost:18789/tasks/abc123".to_string())
+            Some("http://localhost:18889/tasks/abc123".to_string())
         );
     }
 
     #[test]
     fn deep_link_approval_lands_on_inbox_with_item_query() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18789\n");
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::Approval, "ap-1"),
-            Some("http://localhost:18789/inbox?item=ap-1".to_string())
+            Some("http://localhost:18889/inbox?item=ap-1".to_string())
         );
     }
 
     #[test]
     fn deep_link_channels_and_billing_land_on_manage_subpages() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18789\n");
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::Channels, ""),
-            Some("http://localhost:18789/manage/channels".to_string())
+            Some("http://localhost:18889/manage/channels".to_string())
         );
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::Billing, ""),
-            Some("http://localhost:18789/manage/billing".to_string())
+            Some("http://localhost:18889/manage/billing".to_string())
         );
     }
 
     #[test]
     fn deep_link_system_lands_on_manage_logs() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18789\n");
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::System, ""),
-            Some("http://localhost:18789/manage/logs".to_string())
+            Some("http://localhost:18889/manage/logs".to_string())
         );
     }
 
     #[test]
     fn deep_link_autopilot_lands_on_the_autopilot_settings_tab() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nport = 18789\n");
+        write_config(dir.path(), "[gateway]\nport = 18889\n");
         assert_eq!(
             deep_link(dir.path(), DeepLinkKind::Autopilot, "rule-1"),
-            Some("http://localhost:18789/manage/system?tab=autopilot".to_string())
+            Some("http://localhost:18889/manage/system?tab=autopilot".to_string())
         );
     }
 

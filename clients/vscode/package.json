@@ -81,8 +81,8 @@
       "properties": {
         "duduclaw.gatewayUrl": {
           "type": "string",
-          "default": "http://127.0.0.1:18789",
-          "description": "你的 DuDuClaw gateway 位址（本機預設 http://127.0.0.1:18789；遠端請用 https）。擴充功能只會連線到這個位址。"
+          "default": "http://127.0.0.1:18889",
+          "description": "你的 DuDuClaw gateway 位址（本機預設 http://127.0.0.1:18889；遠端請用 https）。擴充功能只會連線到這個位址。"
         }
       }
     }

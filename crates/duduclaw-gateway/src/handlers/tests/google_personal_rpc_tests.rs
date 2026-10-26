@@ -367,7 +367,7 @@ async fn personal_rpc_self_consent_owner_change_and_legacy_session_are_enforced(
     let missing_disclosure = rpc(
         &h,
         "me.google.connect_start",
-        json!({"redirect_origin":"http://127.0.0.1:18789"}),
+        json!({"redirect_origin":"http://127.0.0.1:18889"}),
         &alice_ctx,
     )
     .await;
@@ -375,7 +375,7 @@ async fn personal_rpc_self_consent_owner_change_and_legacy_session_are_enforced(
         error_text(&missing_disclosure).contains("Google 資料"),
         "{missing_disclosure:?}"
     );
-    refused(rpc(&h,"me.google.connect_start",json!({"redirect_origin":"http://127.0.0.1:18789","acknowledge_google_data":true,"session_ref":uuid::Uuid::new_v4(),"jti":uuid::Uuid::new_v4(),"user_id":bob.id}),&alice_ctx).await);
+    refused(rpc(&h,"me.google.connect_start",json!({"redirect_origin":"http://127.0.0.1:18889","acknowledge_google_data":true,"session_ref":uuid::Uuid::new_v4(),"jti":uuid::Uuid::new_v4(),"user_id":bob.id}),&alice_ctx).await);
     refused(rpc(&h,"agents.google_identity_set",json!({"agent_id":"bot","identity":format!("user:{}",bob.id),"confirm_shared_access":true}),&alice_ctx).await);
     refused(
         rpc(

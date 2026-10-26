@@ -247,7 +247,7 @@ const PENDING_TTL_SECS: u64 = 600; // 10 minutes
 ///
 /// The gateway's own port, resolved through the exact same shared priority
 /// order `duduclaw run` uses — `DUDUCLAW_PORT` env > `config.toml [gateway]
-/// port` > 18789 (`duduclaw_core::gateway_port_for_home`) — so the two can
+/// port` > 18889 (`duduclaw_core::gateway_port_for_home`) — so the two can
 /// never disagree. Before `duduclaw_core::gateway_port_for_home` existed,
 /// this read `DUDUCLAW_PORT` only and the CLI did too, which happened to
 /// agree by coincidence; once the CLI started honoring a hand-edited
@@ -263,7 +263,7 @@ pub fn gateway_port(home: &Path) -> u16 {
 /// This MUST match where the gateway actually serves
 /// `GET /api/mcp/oauth/callback` (registered on the same axum router as
 /// everything else). It was previously hardcoded to port 3000 while the gateway
-/// listened on 18789, so every provider redirected the browser to a port with
+/// listened on 18889, so every provider redirected the browser to a port with
 /// nothing on it and no OAuth flow could complete — the callback never fired,
 /// no token was ever stored, and the dashboard sat on "not connected".
 pub fn redirect_uri(home: &Path) -> String {
@@ -856,26 +856,26 @@ mod redirect_uri_tests {
     /// The redirect URI is the one value the user copies into Google/Notion/
     /// GitHub's console, and it must point at the port the gateway actually
     /// serves `/api/mcp/oauth/callback` on. It was hardcoded to 3000 while the
-    /// gateway listened on 18789, so every consent flow redirected into a dead
+    /// gateway listened on 18889, so every consent flow redirected into a dead
     /// port and no token was ever stored. Lock the default here.
     #[test]
     fn redirect_uri_targets_the_gateway_default_port() {
         // `DUDUCLAW_PORT` is process-global; only assert the default when the
         // environment has not overridden it, so a parallel test that sets it
         // cannot make this one flaky. No config.toml at `home` either, so the
-        // shared resolver falls through to its 18789 default.
+        // shared resolver falls through to its 18889 default.
         if std::env::var("DUDUCLAW_PORT").is_ok() {
             return;
         }
         let home = tmp_home();
         assert_eq!(
             gateway_port(&home),
-            18789,
+            18889,
             "must match the CLI's `duduclaw run` default"
         );
         assert_eq!(
             redirect_uri(&home),
-            "http://localhost:18789/api/mcp/oauth/callback",
+            "http://localhost:18889/api/mcp/oauth/callback",
             "redirect URI must point at the port serving the callback route"
         );
         let _ = std::fs::remove_dir_all(&home);

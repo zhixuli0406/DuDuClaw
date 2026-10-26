@@ -22,7 +22,7 @@ COPY --chown=duduclaw:duduclaw home-seed/ /home/duduclaw/.duduclaw/
 EOF
 gcloud run deploy duduclaw-demo \
   --source . --region asia-east1 --project louis-460302 \
-  --port 18789 --memory 1Gi --max-instances 1 --min-instances 0 \
+  --port 18889 --memory 1Gi --max-instances 1 --min-instances 0 \
   --set-env-vars DUDUCLAW_BIND=0.0.0.0 \
   --set-secrets ANTHROPIC_API_KEY=duduclaw-demo-anthropic:latest \
   --allow-unauthenticated

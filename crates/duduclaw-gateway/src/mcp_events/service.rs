@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(validate_base_url("https://hooks.example.com/").unwrap(), "https://hooks.example.com");
         assert_eq!(validate_base_url("https://x.example/gw").unwrap(), "https://x.example/gw");
         assert!(validate_base_url("http://hooks.example.com").is_err());
-        assert!(validate_base_url("http://127.0.0.1:18789").is_ok());
+        assert!(validate_base_url("http://127.0.0.1:18889").is_ok());
         assert!(validate_base_url("https://u:p@x.example").is_err());
         assert!(validate_base_url("https://x.example/?a=1").is_err());
         assert!(validate_base_url("ftp://x.example").is_err());

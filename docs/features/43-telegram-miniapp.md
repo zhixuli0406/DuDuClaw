@@ -70,7 +70,7 @@ public_url = "https://ai.example.com"
 
 Restart the gateway after the change. If any of the three conditions fails, the card is **exactly** what it was before this feature existed — no missing button, no undelivered message.
 
-An address like `http://localhost:18789` is a valid dashboard location but not a valid Mini App location. Deployments without a public https domain (most local installs) need to do nothing; the feature stays silent for them.
+An address like `http://localhost:18889` is a valid dashboard location but not a valid Mini App location. Deployments without a public https domain (most local installs) need to do nothing; the feature stays silent for them.
 
 ---
 

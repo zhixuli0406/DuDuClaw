@@ -35,8 +35,8 @@ case "$PORT" in ''|*[!0-9]*) echo "--port must be a number" >&2; exit 2 ;; esac
 if [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
   echo "--port must be between 1024 and 65535" >&2; exit 2
 fi
-if [ "$PORT" -eq 18789 ]; then
-  echo "port 18789 is the production default; pick another one" >&2; exit 2
+if [ "$PORT" -eq 18889 ]; then
+  echo "port 18889 is the production default; pick another one" >&2; exit 2
 fi
 
 # Resolve to an absolute path without creating anything: canonicalise the

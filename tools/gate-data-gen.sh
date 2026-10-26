@@ -2,12 +2,12 @@
 # GATE Data Generator — rapidly accumulate prediction_log via agents.delegate
 #
 # Usage: ./tools/gate-data-gen.sh [gateway_url] [auth_token]
-# Default: ws://localhost:18789/ws
+# Default: ws://localhost:18889/ws
 #
 # Sends 20 diverse prompts to each of 2 agents (40 total conversations)
 # to accumulate enough prediction_log for GATE experiment.
 
-GATEWAY="${1:-http://localhost:18789}"
+GATEWAY="${1:-http://localhost:18889}"
 TOKEN="${2:-}"
 
 AGENTS=("duduclaw-agent" "lab-bot")

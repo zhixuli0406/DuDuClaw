@@ -52,7 +52,7 @@ cd src-tauri && cargo tauri build
 ## Lifecycle behavior (what the shell does)
 
 - **単一インスタンス**：2回目の起動では既存のウィンドウがフォーカスされます（§D2.1）。
-- **アタッチ or 新規起動**：`DUDUCLAW_PORT`（デフォルト**18789**）で既にgatewayが動いている場合はそこにアタッチし、*終了させません*。動いていなければ`18789..=18797`の中から最初に空いているポートでsidecarをspawnします（§D1 / §D2.2）。
+- **アタッチ or 新規起動**：`DUDUCLAW_PORT`（デフォルト**18889**）で既にgatewayが動いている場合はそこにアタッチし、*終了させません*。動いていなければ`18889..=18897`の中から最初に空いているポートでsidecarをspawnします（§D1 / §D2.2）。
 - **PATH**：sidecarは拡張されたPATH（Homebrew、`.local/bin`、Bun、Volta、npm-global、asdf、cargo）で起動されるため、FinderやDockからの起動でもClaude CLI / node / containersを見つけられます（§D2.6）。
 - **データディレクトリ**：CLIと`~/.duduclaw`を共有し、agent／SQLite／wikiは両者で同じものを見ています（§D2.7）。
 - **閉じるとトレイに常駐**：ウィンドウを閉じても非表示になるだけです。終了するにはトレイメニューから選んでください（§D2.4）。
@@ -79,7 +79,7 @@ cd src-tauri && cargo tauri build
    （検証済み：build hookの`pwd`はrepo rootです）。そのため両方とも`cd web && npm run …`であり、**`cd ../web`ではありません**。（`cargo tauri dev/build`自体は`src-tauri/`から呼ばれますが、Tauriがhookを実行する際の作業ディレクトリはproject rootです。）
 
 5. **Viteが「Waiting for frontend dev server …」のまま進まない。** ViteはIPv4の
-   `127.0.0.1`にバインドする必要があります（デフォルトの`localhost`/`::1`ではありません）。これがTauriのポーリングとproxy targetに一致します。`web/vite.config.ts`で固定済みです（`host: '127.0.0.1'`、`strictPort`、gateway proxyのデフォルト値`http://127.0.0.1:18789`）。
+   `127.0.0.1`にバインドする必要があります（デフォルトの`localhost`/`::1`ではありません）。これがTauriのポーリングとproxy targetに一致します。`web/vite.config.ts`で固定済みです（`host: '127.0.0.1'`、`strictPort`、gateway proxyのデフォルト値`http://127.0.0.1:18889`）。
 
 6. **`cookie 0.18.1`でコンパイルエラー（`Parsable::parse`のarity不一致）。** `time 0.3.52`
    が0.3.x系列内でAPIを壊したため、`src-tauri/Cargo.toml`で`time = "=0.3.51"`に固定しています。tauri/wryが新しい`time`に対応したら外してください。

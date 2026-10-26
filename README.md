@@ -29,7 +29,7 @@ All you need is one Rust binary. Channel routing, conversation memory, multi-acc
 
 ```bash
 npm install -g duduclaw
-duduclaw run                  # then open http://localhost:18789
+duduclaw run                  # then open http://localhost:18889
 ```
 
 ## Table of contents
@@ -169,7 +169,7 @@ pip install duduclaw
 
   ```bash
   duduclaw run                  # start everything (gateway + channels + scheduler + dispatcher)
-  open http://localhost:18789   # open the dashboard
+  open http://localhost:18889   # open the dashboard
   ```
 
 Either way, the first visit takes you through a wizard: pick an AI backend, create your first agent, then chat with it in the built-in WebChat — no need to run `duduclaw onboard` from a terminal first. Later, paste a bot token on the Channels page to put the same agent on Telegram, LINE, Discord, and the rest, without restarting.

@@ -5542,7 +5542,7 @@
   "gateway.rescan": "Rescan",
   "gateway.scanning": "Scanning your network…",
   "gateway.empty": "No gateways found on your network. Enter an address manually below.",
-  "gateway.manual.placeholder": "e.g. 192.168.1.10:18789 or https://gw.company.com",
+  "gateway.manual.placeholder": "e.g. 192.168.1.10:18889 or https://gw.company.com",
   "gateway.manual.hint": "http/https supported; the address is verified before connecting. HTTPS is recommended for company servers.",
   "gateway.resolving": "Connecting to your gateway…",
   "gateway.autoConnecting": "Found {name}, connecting…",

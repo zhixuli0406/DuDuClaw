@@ -131,10 +131,10 @@ IT にサービスアカウントのフローを依頼したくないユーザ�
 5. 「承認済みのリダイレクト URI」に以下を追加します。
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
-   `18789` は gateway のデフォルトポートです。`DUDUCLAW_PORT` でポートを
+   `18889` は gateway のデフォルトポートです。`DUDUCLAW_PORT` でポートを
    変更している場合、dashboard のこのページに変更後の正しい URL が
    表示されるので、画面表示に従ってください。ここでポート番号が一致
    しないと**サイレント**に失敗します。Google はブラウザを誰も listen

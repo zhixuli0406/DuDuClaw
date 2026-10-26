@@ -5,12 +5,12 @@ services:
       context: ..
       dockerfile: container/Dockerfile.server
     ports:
-      - "18789:18789"
+      - "18889:18889"
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DUDUCLAW_BIND=0.0.0.0
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:18789/healthz"]  # /healthz 含排程器活性（停擺→503）；/health 永遠回 ok
+      test: ["CMD", "curl", "-sf", "http://localhost:18889/healthz"]  # /healthz 含排程器活性（停擺→503）；/health 永遠回 ok
       interval: 30s
       timeout: 5s
       retries: 3

@@ -28,7 +28,7 @@ cooldown_after_rate_limit_seconds = 120
 
 [gateway]
 bind = "127.0.0.1"
-port = 18789
+port = 18889
 # auto_update = true  # Pro default: true (auto-download + install + restart)
                        # CE default: false (notify only). Override with env DUDUCLAW_AUTO_UPDATE.
 # allowed_origins = []       # Extra dashboard origins; empty means loopback only

@@ -174,6 +174,109 @@ class CiWorkflowTests(unittest.TestCase):
             with self.subTest(package=package):
                 self.assertNotIn(f'name = "{package}"', lock)
 
+    def test_default_gateway_port_is_consistent_across_shipping_surfaces(self):
+        expected = {
+            "crates/duduclaw-core/src/config.rs":
+                "pub const DEFAULT_GATEWAY_PORT: u16 = 18889;",
+            "crates/duduclaw-cli/src/lib.rs":
+                ".default(duduclaw_core::DEFAULT_GATEWAY_PORT)",
+            "src-tauri/src/lifecycle.rs": "pub const DEFAULT_PORT: u16 = 18889;",
+            "config/duduclaw.example.toml": "port = 18889",
+            "container/Dockerfile.server": "EXPOSE 18789 18889",
+            "container/Dockerfile.edition-smoke": "EXPOSE 18789 18889",
+            "container/docker-compose.quickstart.yml": '"18889:18889"',
+            "web/vite.config.ts": "http://127.0.0.1:18889",
+            "clients/vscode/package.json": "http://127.0.0.1:18889",
+            "clients/vscode/src/config.ts":
+                "body.service === 'duduclaw-gateway'",
+            "clients/obsidian/duduclaw/src/main.ts":
+                "body.service === 'duduclaw-gateway'",
+            "clients/streamdeck/src/plugin.ts":
+                "body.service === 'duduclaw-gateway'",
+            "clients/chrome/options.js": "http://127.0.0.1:18889",
+            "clients/chrome/sw.js": "gatewayMigrationPending: !selected",
+            "distribution/demo-sandbox/home-seed/config.toml": "port = 18889",
+            "crates/duduclaw-gateway/src/handlers/system_status.rs":
+                '"localhost:18889"',
+            "README.md": "http://localhost:18889",
+            "README.zh-TW.md": "http://localhost:18889",
+            "README.ja.md": "http://localhost:18889",
+        }
+        for relative, needle in expected.items():
+            with self.subTest(path=relative):
+                self.assertIn(needle, (ROOT / relative).read_text())
+
+        for relative in expected:
+            if relative in {
+                "crates/duduclaw-core/src/config.rs",
+                "src-tauri/src/lifecycle.rs",
+                "clients/vscode/src/config.ts",
+                "clients/obsidian/duduclaw/src/main.ts",
+                "clients/streamdeck/src/plugin.ts",
+                "clients/chrome/sw.js",
+                "container/Dockerfile.server",
+                "container/Dockerfile.edition-smoke",
+            }:
+                continue
+            with self.subTest(no_legacy_default=relative):
+                self.assertNotIn("18789", (ROOT / relative).read_text())
+
+        for relative in (
+            "docker-compose.yml",
+            "docker-compose.quickstart.yml",
+            "container/docker-compose.quickstart.yml",
+            "distribution/nas/docker-compose.yml",
+        ):
+            with self.subTest(config_precedence=relative):
+                self.assertNotIn("DUDUCLAW_PORT=", (ROOT / relative).read_text())
+
+        for relative in (
+            "docker-compose.yml",
+            "docker-compose.quickstart.yml",
+            "distribution/nas/docker-compose.yml",
+        ):
+            text = (ROOT / relative).read_text()
+            with self.subTest(persisted_platform=relative):
+                self.assertIn('"18789:18789"', text)
+                self.assertIn("DUDUCLAW_INITIAL_PORT=18789", text)
+                self.assertIn("localhost:18789/healthz", text)
+
+        self.assertNotIn(
+            "DUDUCLAW_INITIAL_PORT",
+            (ROOT / "container/docker-compose.quickstart.yml").read_text(),
+        )
+
+        vscode_config = (ROOT / "clients/vscode/src/config.ts").read_text()
+        self.assertIn("const selected = gatewayUrl();", vscode_config)
+        identity_guard = vscode_config.split(
+            "export async function ensureGatewayIdentity", 1
+        )[1].split("/** Workspace-scoped", 1)[0]
+        self.assertNotIn("explicitGatewayUrl()", identity_guard)
+
+        streamdeck = (ROOT / "clients/streamdeck/src/plugin.ts").read_text()
+        self.assertIn(": NEW_GATEWAY;", streamdeck)
+
+        obsidian = (
+            ROOT / "clients/obsidian/duduclaw/src/main.ts"
+        ).read_text()
+        self.assertIn("async updateGatewayUrl", obsidian)
+        self.assertIn("view.resetConnection();", obsidian)
+        self.assertIn("this.settings.accessToken = '';", obsidian)
+        self.assertIn("this.wsGateway !== this.plugin.gatewayBase()", obsidian)
+
+        chrome_sidepanel = (ROOT / "clients/chrome/sidepanel.js").read_text()
+        self.assertIn("function resetConnections", chrome_sidepanel)
+        self.assertIn("rpcPending.clear();", chrome_sidepanel)
+        self.assertIn(
+            "ch.accessToken || ch.gatewayUrl || ch.refreshToken",
+            chrome_sidepanel,
+        )
+
+        self.assertIn(
+            "port: 18789",
+            (ROOT / "distribution/umbrel/duduclaw/umbrel-app.yml").read_text(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

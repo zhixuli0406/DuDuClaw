@@ -134,10 +134,10 @@ domain who doesn't want to go through IT for the service-account flow. All
 5. Add this to "Authorized redirect URIs":
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
-   `18789` is the gateway's default port; if you changed it with
+   `18889` is the gateway's default port; if you changed it with
    `DUDUCLAW_PORT`, this dashboard page shows the correct, updated URI —
    trust what's on screen. A port mismatch here fails **silently**: Google
    redirects the browser to a port nothing is listening on, the screen

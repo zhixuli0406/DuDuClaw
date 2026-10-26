@@ -47,7 +47,7 @@
    redirect URI：
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
 4. 複製 **OAuth client ID** 與 **OAuth client secret**。

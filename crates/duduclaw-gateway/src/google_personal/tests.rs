@@ -249,7 +249,7 @@ impl Fixture {
                 auth_url: oauth::AUTHORIZE.into(),
                 token_url: oauth::TOKEN.into(),
                 scopes: vec![],
-                redirect_uri: "http://127.0.0.1:18789/api/mcp/oauth/callback".into(),
+                redirect_uri: "http://127.0.0.1:18889/api/mcp/oauth/callback".into(),
             },
         )
         .unwrap();
@@ -266,7 +266,7 @@ impl Fixture {
             &self.db,
             &self.alice.id,
             "login-a",
-            "http://127.0.0.1:18789",
+            "http://127.0.0.1:18889",
             &[],
             true,
         )
@@ -299,7 +299,7 @@ async fn core_start_requires_google_data_acknowledgement_before_state_changes() 
         &f.db,
         &f.alice.id,
         "login-a",
-        "http://127.0.0.1:18789",
+        "http://127.0.0.1:18889",
         &[],
         false,
     )
@@ -505,7 +505,7 @@ async fn invalid_grant_transitions_once_and_disconnect_fences_inflight_connectio
         &f.db,
         &f.alice.id,
         "login-a",
-        "http://127.0.0.1:18789",
+        "http://127.0.0.1:18889",
         &[],
         true,
     )
@@ -561,7 +561,7 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
             &f.db,
             &f.alice.id,
             "login-a",
-            "http://127.0.0.1:18789",
+            "http://127.0.0.1:18889",
             &[],
             true,
         )
@@ -621,7 +621,7 @@ async fn delayed_revoke_serializes_same_person_other_person_and_home_exchanges()
                     &db,
                     &person_b,
                     "login-b",
-                    "http://127.0.0.1:18789",
+                    "http://127.0.0.1:18889",
                     &[],
                     true,
                 )
@@ -677,7 +677,7 @@ async fn cancelled_provider_revoke_leaves_new_personal_and_home_grants_closed() 
         &f.db,
         &f.alice.id,
         "login-a",
-        "http://127.0.0.1:18789",
+        "http://127.0.0.1:18889",
         &[],
         true,
     )
@@ -705,7 +705,7 @@ async fn cancelled_provider_revoke_leaves_new_personal_and_home_grants_closed() 
             &f.db,
             &f.alice.id,
             "new-login",
-            "http://127.0.0.1:18789",
+            "http://127.0.0.1:18889",
             &[],
             true,
         )
@@ -749,7 +749,7 @@ async fn prepare_delayed_case_with_code(f: &Fixture, code: String) -> (String, A
         &f.db,
         &f.alice.id,
         "login-a",
-        "http://127.0.0.1:18789",
+        "http://127.0.0.1:18889",
         &[],
         true,
     )
@@ -796,7 +796,7 @@ async fn home_account_probe_and_revoke_share_one_lease_before_new_connect() {
             &db,
             &user,
             "next-login",
-            "http://127.0.0.1:18789",
+            "http://127.0.0.1:18889",
             &[],
             true,
         )
@@ -831,7 +831,7 @@ async fn revoke_waits_for_inflight_other_person_exchange_then_preserves_its_shar
         &f.db,
         &bob.id,
         "bob-login",
-        "http://127.0.0.1:18789",
+        "http://127.0.0.1:18889",
         &[],
         true,
     )

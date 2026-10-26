@@ -17,6 +17,37 @@ type GlobalSettings = {
   password?: string;
 };
 
+const NEW_GATEWAY = 'http://127.0.0.1:18889';
+const LEGACY_GATEWAY = 'http://127.0.0.1:18789';
+
+async function isDuduClawGateway(base: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${base}/healthz`, {
+      signal: AbortSignal.timeout(500),
+    });
+    const body = (await res.json()) as { service?: unknown };
+    return body.service === 'duduclaw-gateway';
+  } catch {
+    return false;
+  }
+}
+
+async function resolveImplicitGateway(settings: GlobalSettings): Promise<GlobalSettings> {
+  if (settings.gatewayUrl) return settings;
+  const [currentLive, legacyLive] = await Promise.all([
+    isDuduClawGateway(NEW_GATEWAY),
+    isDuduClawGateway(LEGACY_GATEWAY),
+  ]);
+  const hasCredentials = Boolean(settings.email || settings.password);
+  const gatewayUrl = hasCredentials
+    ? legacyLive ? LEGACY_GATEWAY : undefined
+    : NEW_GATEWAY;
+  if (!gatewayUrl) return settings;
+  const resolved = { ...settings, gatewayUrl };
+  await streamDeck.settings.setGlobalSettings(resolved);
+  return resolved;
+}
+
 type Approval = {
   id: string;
   agent_id?: string;
@@ -38,7 +69,10 @@ class Gateway {
   constructor(private settings: GlobalSettings) {}
 
   private base(): string {
-    return (this.settings.gatewayUrl ?? 'http://127.0.0.1:18789').replace(/\/+$/, '');
+    if (!this.settings.gatewayUrl) {
+      throw new Error('尚未確認 DuDuClaw gateway，請先在設定中指定 gateway URL');
+    }
+    return this.settings.gatewayUrl.replace(/\/+$/, '');
   }
 
   private async login(): Promise<void> {
@@ -62,6 +96,7 @@ class Gateway {
   private async refresh(): Promise<boolean> {
     if (!this.refreshToken) return false;
     try {
+      if (!(await isDuduClawGateway(this.base()))) return false;
       const res = await fetch(`${this.base()}/api/refresh`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -81,6 +116,9 @@ class Gateway {
   private connect(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.ready) return this.ready;
     this.ready = (async () => {
+      if (!(await isDuduClawGateway(this.base()))) {
+        throw new Error('拒絕傳送憑證：目標不是 DuDuClaw gateway');
+      }
       if (!this.accessToken) await this.login();
       const sock = new WebSocket(this.base().replace(/^http/, 'ws') + '/ws');
       this.ws = sock;
@@ -168,8 +206,8 @@ class Gateway {
 }
 
 let gateway = new Gateway({});
-streamDeck.settings.onDidReceiveGlobalSettings<GlobalSettings>((ev) => {
-  gateway.updateSettings(ev.settings);
+streamDeck.settings.onDidReceiveGlobalSettings<GlobalSettings>(async (ev) => {
+  gateway.updateSettings(await resolveImplicitGateway(ev.settings));
 });
 
 async function oldestApproval(): Promise<Approval | undefined> {
@@ -250,7 +288,10 @@ class StatusAction extends SingletonAction {
   }
 
   override async onKeyDown(): Promise<void> {
-    const url = (await streamDeck.settings.getGlobalSettings<GlobalSettings>()).gatewayUrl ?? 'http://127.0.0.1:18789';
+    const settings = await resolveImplicitGateway(
+      await streamDeck.settings.getGlobalSettings<GlobalSettings>(),
+    );
+    const url = settings.gatewayUrl ?? NEW_GATEWAY;
     await streamDeck.system.openUrl(url);
   }
 }

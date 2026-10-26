@@ -340,6 +340,6 @@ mod tests {
 
     #[test]
     fn right_types_and_unknown_keys_pass() {
-        check("[gateway]\nport = 18789\nfuture_key = \"x\"\n[belief]\nflat_band_pct = 1\n[mystery]\nx = 1\n").unwrap();
+        check("[gateway]\nport = 18889\nfuture_key = \"x\"\n[belief]\nflat_band_pct = 1\n[mystery]\nx = 1\n").unwrap();
     }
 }

@@ -44,7 +44,7 @@ MCP server。存取權杖會存放在 DuDuClaw 加密的 OAuth vault 中。
 3. 把 **Authorization callback URL** 精確設為：
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
 4. 註冊完成後複製 **Client ID**，再點 **Generate a new client secret** 取得
@@ -106,6 +106,6 @@ GitHub 的 token endpoint 預設會回傳 **form-encoded** 格式；DuDuClaw 會
 - **`404` 「not found」** 請檢查 owner／repo／number 是否正確，或為私有
   repository 授權 `repo`。
 - **同意授權時 callback URL 不符** OAuth App 的 Authorization callback URL
-  必須精確等於 `http://localhost:18789/api/mcp/oauth/callback`。
+  必須精確等於 `http://localhost:18889/api/mcp/oauth/callback`。
 
 隨時都可以執行 `github_status` 取得即時診斷。

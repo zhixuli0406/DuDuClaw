@@ -4,7 +4,7 @@
 #   2. allowed_origins — 換成官網網域
 
 [gateway]
-port = 18789
+port = 18889
 # 官網（掛 demo widget 的那個網域）；瀏覽器帶 Origin，必須列名才放行。
 allowed_origins = ["duduclaw.app", "www.duduclaw.app"]
 

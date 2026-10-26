@@ -167,7 +167,7 @@ VOLUME /home/duduclaw/.claude
 VOLUME /home/duduclaw/.codex
 VOLUME /home/duduclaw/.gemini
 VOLUME /home/duduclaw/.grok
-EXPOSE 18789
+EXPOSE 18789 18889
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["duduclaw", "run", "--yes"]

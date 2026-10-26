@@ -17,7 +17,7 @@ duduclaw gateway
 ```
 
 沒有獨立的 `duduclaw dev` 模式。伺服器會：
-- 在 `config.toml [gateway]` 的位址（`bind` / `port`，預設 `http://127.0.0.1:18789`）提供 Dashboard
+- 在 `config.toml [gateway]` 的位址（`bind` / `port`，預設 `http://127.0.0.1:18889`）提供 Dashboard
 - 即時把日誌串流到 Dashboard
 - 不會替任何 Agent 加上瀏覽器 MCP server；`.mcp.json` 裡的瀏覽器項目怎麼來，見 2.4 節
 

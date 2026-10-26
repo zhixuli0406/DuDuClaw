@@ -82,7 +82,7 @@ mod launchd {
     pub async fn stop() -> Result<()> {
         // Same priority resolution `duduclaw run` uses (env > config.toml
         // [gateway] port > default) — this used to read only `DUDUCLAW_PORT`
-        // and default to 18789, so a gateway actually running on a
+        // and default to 18889, so a gateway actually running on a
         // config.toml-configured port would go un-found: `service stop`
         // would report "no process found" while the gateway kept running.
         let (port, _source) = duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home());

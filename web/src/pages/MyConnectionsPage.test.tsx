@@ -14,7 +14,7 @@ beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').m
 describe('MyConnectionsPage', () => {
   it('requires an in-product Google data disclosure acknowledgement before OAuth starts', async () => {
     vi.mocked(api.personalGoogle.status).mockResolvedValue({...status, connection: null});
-    const start = vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18789/api/me/google/callback',expires_in:600});
+    const start = vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18889/api/me/google/callback',expires_in:600});
     vi.spyOn(window,'open').mockReturnValue({opener:null,location:{replace:vi.fn()},close:vi.fn()} as never);
     const user = userEvent.setup();
     renderWithProviders(<MyConnectionsPage/>);
@@ -42,13 +42,13 @@ describe('MyConnectionsPage', () => {
     const user=userEvent.setup();
     const write=vi.spyOn(navigator.clipboard,'writeText').mockResolvedValue();
     vi.spyOn(window,'open').mockReturnValue({opener:null,location:{replace:vi.fn()},close:vi.fn()} as never);
-    vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18789/api/me/google/callback',expires_in:600});
+    vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18889/api/me/google/callback',expires_in:600});
     renderWithProviders(<MyConnectionsPage/>);
     await user.click(await screen.findByRole('checkbox',{name:/understand how my Google data is accessed/i}));
     await user.click(await screen.findByRole('button',{name:'Reconnect'}));
-    expect(await screen.findByDisplayValue('http://127.0.0.1:18789/api/me/google/callback')).toBeInTheDocument();
+    expect(await screen.findByDisplayValue('http://127.0.0.1:18889/api/me/google/callback')).toBeInTheDocument();
     await user.click(screen.getByRole('button',{name:'Copy return address'}));
-    expect(write).toHaveBeenCalledWith('http://127.0.0.1:18789/api/me/google/callback');
+    expect(write).toHaveBeenCalledWith('http://127.0.0.1:18889/api/me/google/callback');
   });
   it('explains different account, disabled integration and shared access before consent', async () => {
     const consent = vi.spyOn(api.personalGoogle,'consent').mockResolvedValue({});

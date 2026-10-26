@@ -8930,7 +8930,7 @@ mod decision_shadow_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -9760,7 +9760,7 @@ mod decision_sla_shadow_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -10209,7 +10209,7 @@ mod decision_model_candidate_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -11079,7 +11079,7 @@ mod causal_curation_api_tests {
             home_dir: home,
         });
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let body =
             || Bytes::from_static(b"{\"tenant_id\":1,\"probe_schema_field\":\"probe-secret\"}");
         let raw = || axum::extract::RawQuery(Some("probe_schema_field=probe-secret".into()));
@@ -11221,7 +11221,7 @@ mod causal_curation_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -11884,7 +11884,7 @@ mod causal_curation_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -12069,7 +12069,7 @@ mod causal_curation_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -12231,7 +12231,7 @@ mod causal_curation_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -14095,7 +14095,7 @@ mod causal_curation_api_tests {
             "authorization",
             format!("Bearer {admin_token}").parse().unwrap(),
         );
-        admin_headers.insert("origin", "http://localhost:18789".parse().unwrap());
+        admin_headers.insert("origin", "http://localhost:18889".parse().unwrap());
         let mut employee_headers = admin_headers.clone();
         employee_headers.insert(
             "authorization",
@@ -17186,7 +17186,7 @@ mod origin_allowlist_tests {
     fn loopback_allowed_by_default_external_blocked() {
         // (a) With an empty extra list, only built-in loopback origins pass.
         assert!(origin_is_allowed_with(
-            &origin_headers("http://localhost:18789"),
+            &origin_headers("http://localhost:18889"),
             &[]
         ));
         assert!(origin_is_allowed_with(
@@ -17504,7 +17504,7 @@ fn build_agent_card() -> serde_json::Value {
         // Same shared resolver `duduclaw run` uses (env > config.toml
         // [gateway] port > default) — this used to read `DUDUCLAW_PORT` only
         // and default to a stale 3000 (the gateway's actual default is
-        // 18789), so an unconfigured A2A client following this card's `url`
+        // 18889), so an unconfigured A2A client following this card's `url`
         // with no env var set landed on a dead port.
         "url": format!(
             "http://localhost:{}",

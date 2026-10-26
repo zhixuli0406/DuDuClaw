@@ -203,7 +203,9 @@ jobs:
             echo "No Python tests found, skipping"
           fi
       - name: Test CI coverage contract
-        run: python3 -m unittest discover -s scripts/tests -p test_ci_workflow.py -v
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_ci_workflow.py -v
+          python3 -m unittest scripts.tests.test_server_entrypoint -v
       - name: Test distributor release tooling
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_*distributor*.py' -v

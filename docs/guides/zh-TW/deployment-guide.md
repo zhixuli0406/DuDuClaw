@@ -14,25 +14,32 @@ cargo build --release
 duduclaw run
 
 # Access Dashboard
-open http://localhost:18789
+open http://localhost:18889
 ```
 
-預設埠號：`18789`。可在 `~/.duduclaw/config.toml` 設定：
+預設埠號：`18889`。可在 `~/.duduclaw/config.toml` 設定：
+
+升級不會改寫明確設定的 `DUDUCLAW_PORT` 或既有的 `[gateway] port`。原本使用舊預設埠
+`18789` 的安裝會繼續沿用，直到管理員自行變更；只有尚未設定埠號的新安裝使用 `18889`。
+
+既有 Docker 資料卷請保留目前的 port mapping 與健康檢查。若要遷移，請在同一個維護時段
+一併把 `[gateway] port`、Compose `ports` mapping 與健康檢查網址改為 `18889`；不要只替換
+供新安裝使用的 Compose 範本。
 
 ```toml
 [gateway]
 bind = "127.0.0.1"
-port = 18789
+port = 18889
 ```
 
 ### 健康檢查
 
 ```bash
-curl http://localhost:18789/health
+curl http://localhost:18889/health
 # {"status":"ok","version":"0.10.0","uptime_seconds":42,"agents_loaded":2,"channels_connected":["telegram","discord"]}
 
-curl http://localhost:18789/health/ready  # 200 when agents loaded
-curl http://localhost:18789/health/live   # 200 always (liveness probe)
+curl http://localhost:18889/health/ready  # 200 when agents loaded
+curl http://localhost:18889/health/live   # 200 always (liveness probe)
 ```
 
 ---
@@ -52,7 +59,7 @@ curl -fsSL https://tailscale.com/install.sh | sh  # Linux
 tailscale up
 
 # 3. Enable HTTPS + Funnel
-tailscale funnel 18789
+tailscale funnel 18889
 
 # This gives you a URL like:
 # https://your-machine.tail12345.ts.net/
@@ -70,7 +77,7 @@ tailscale funnel 18789
 
 ```bash
 # Run as background service
-tailscale funnel --bg 18789
+tailscale funnel --bg 18889
 
 # Or via systemd (Linux)
 # Add to duduclaw.service After=tailscaled.service
@@ -89,13 +96,13 @@ snap install ngrok        # Linux
 ngrok config add-authtoken YOUR_TOKEN
 
 # 3. Start tunnel
-ngrok http 18789
+ngrok http 18889
 
 # Copy the HTTPS URL (e.g., https://abc123.ngrok-free.app)
 # Set as LINE Webhook URL: https://abc123.ngrok-free.app/webhook/line
 ```
 
-**注意**：免費版 ngrok 的網址每次重啟都會改變。若要固定網址，請搭配保留網域使用 `ngrok http 18789 --domain=your-domain.ngrok-free.app`。
+**注意**：免費版 ngrok 的網址每次重啟都會改變。若要固定網址，請搭配保留網域使用 `ngrok http 18889 --domain=your-domain.ngrok-free.app`。
 
 ---
 
@@ -120,7 +127,7 @@ credentials-file: /Users/YOU/.cloudflared/YOUR_TUNNEL_ID.json
 
 ingress:
   - hostname: duduclaw.yourdomain.com
-    service: http://localhost:18789
+    service: http://localhost:18889
   - service: http_status:404
 EOF
 
@@ -141,7 +148,7 @@ cloudflared tunnel run duduclaw
 
 ```Caddyfile
 duduclaw.yourdomain.com {
-    reverse_proxy localhost:18789
+    reverse_proxy localhost:18889
 
     # WebSocket support (auto-detected by Caddy)
     # No extra config needed
@@ -163,7 +170,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/duduclaw.yourdomain.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:18789;
+        proxy_pass http://127.0.0.1:18889;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -256,7 +263,7 @@ services:
       context: .
       dockerfile: container/Dockerfile.server
     ports:
-      - "18789:18789"
+      - "18889:18889"
     volumes:
       - ~/.duduclaw:/home/duduclaw/.duduclaw
     environment:
@@ -265,7 +272,7 @@ services:
       - .env
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18889/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -358,7 +365,7 @@ auto_update = true   # default: false — dashboard notification only
 scrape_configs:
   - job_name: 'duduclaw'
     static_configs:
-      - targets: ['localhost:18789']
+      - targets: ['localhost:18889']
     metrics_path: '/metrics'
     scrape_interval: 30s
 ```
@@ -426,7 +433,7 @@ gateway 會透過 mDNS/DNS-SD 以 `_duduclaw._tcp.local.` 廣播自己。廣播�
 # ~/.duduclaw/config.toml on the gateway server
 [gateway]
 bind = "0.0.0.0"        # reachable on the LAN (default 127.0.0.1 = local only)
-port = 18789
+port = 18889
 
 [general]
 name = "Office Gateway"  # shown as the instance name in the desktop picker
@@ -477,7 +484,7 @@ picker 本身提供三種連線方式：
 1. **本機 / Local**：應用程式自帶的內建 gateway（適合單機使用）。
 2. **區網偵測 / On your network**：透過 mDNS 找到的 gateway，附重新掃描按鈕；
    每一列會顯示名稱、`host:port` 與版本號。
-3. **手動輸入 / Manual**：輸入 `192.168.1.10:18789` 或 `https://gw.company.com`。
+3. **手動輸入 / Manual**：輸入 `192.168.1.10:18889` 或 `https://gw.company.com`。
    連線前會先用 `/healthz` 驗證這個位址，位址錯誤會顯示錯誤訊息，並且**不會**跳轉。
 
 之後若要切換 gateway，可以在應用程式的工具列選單裡使用**切換 Gateway / Switch
@@ -494,7 +501,7 @@ Gateway**，會重新打開 picker。選擇遠端 gateway 會釋放本機的 sid
 
 | 方式 | 網址 | 使用情境 |
 |--------|-----|----------|
-| 純本機 | `http://localhost:18789` | 開發 |
+| 純本機 | `http://localhost:18889` | 開發 |
 | 企業區網 | mDNS 自動探索（桌面 picker） | 員工 → 公司 gateway |
 | Tailscale | `https://xxx.ts.net` | 家用伺服器、LINE webhook |
 | ngrok | `https://xxx.ngrok-free.app` | 快速展示 |

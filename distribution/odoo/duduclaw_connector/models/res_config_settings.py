@@ -19,7 +19,7 @@ class ResConfigSettings(models.TransientModel):
     duduclaw_dashboard_url = fields.Char(
         string="DuDuClaw Dashboard URL",
         config_parameter="duduclaw.dashboard_url",
-        help="儀表板位址（預設 gateway 的 18789 埠），選填，用於選單捷徑。",
+        help="儀表板位址（預設 gateway 的 18889 埠），選填，用於選單捷徑。",
     )
 
     def action_duduclaw_test_connection(self):

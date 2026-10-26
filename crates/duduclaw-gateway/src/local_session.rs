@@ -46,7 +46,7 @@
 //! away the peer address, the one input an attacker cannot control.
 //!
 //! **6 — malicious website in the operator's own browser (§2.4.3).** A page on
-//! `evil.example` can POST to `http://127.0.0.1:18789/…`. CORS stops it from
+//! `evil.example` can POST to `http://127.0.0.1:18889/…`. CORS stops it from
 //! *reading* the token, but a "simple request" is still *sent*, which would be
 //! enough to trigger the implicit claim. Requiring a custom header makes the
 //! request non-simple, so the browser must send a CORS preflight first — and
@@ -238,7 +238,7 @@ mod tests {
     fn good_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(LOCAL_MARKER_HEADER, "1".parse().unwrap());
-        h.insert("origin", "http://127.0.0.1:18789".parse().unwrap());
+        h.insert("origin", "http://127.0.0.1:18889".parse().unwrap());
         h
     }
 
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn missing_or_wrong_marker_is_refused() {
         let mut bare = HeaderMap::new();
-        bare.insert("origin", "http://127.0.0.1:18789".parse().unwrap());
+        bare.insert("origin", "http://127.0.0.1:18889".parse().unwrap());
         assert_eq!(
             evaluate(true, true, true, true, &bare),
             Err(LocalSessionDenial::MissingMarker),

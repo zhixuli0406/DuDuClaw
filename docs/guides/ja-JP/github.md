@@ -51,7 +51,7 @@ GitHub REST APIにネイティブに接続するため、サードパーティ�
 3. **Authorization callback URL**を正確に次の値に設定する:
 
    ```
-   http://localhost:18789/api/mcp/oauth/callback
+   http://localhost:18889/api/mcp/oauth/callback
    ```
 
 4. appを登録し、**Client ID**をコピーする。続けて**Generate a new
@@ -124,7 +124,7 @@ DuDuClawは`Accept: application/json`を送ることで、代わりにJSONを返
 - **`404`「not found」**: owner／repo／numberを確認するか、プライベー
   トrepositoryに対して`repo`を付与してください。
 - **同意時にcallback URLが一致しない**: OAuth AppのAuthorization
-  callback URLは正確に`http://localhost:18789/api/mcp/oauth/callback`
+  callback URLは正確に`http://localhost:18889/api/mcp/oauth/callback`
   である必要があります。
 
 いつでも`github_status`を実行すれば、その場で診断結果を確認できます。

@@ -6,6 +6,10 @@
 
 - Dashboard 內嵌資產改用未壓縮的 `rust-embed` 路徑，移除含有 `RUSTSEC-2026-0391`、`RUSTSEC-2026-0398`、`RUSTSEC-2026-0403`、`RUSTSEC-2026-0410` 的 `include-flate`／`zstd` 相依鏈。
 
+### Changed
+
+- Gateway、桌面 sidecar、無狀態 container quickstart 與官方客戶端的新安裝預設埠由 `18789` 改為 `18889`，避開 OpenClaw Gateway 的 `18789` 與 bridge 的 `18790`。明確設定的 `DUDUCLAW_PORT` 或既有 `config.toml [gateway] port` 不會被改寫；自動選擇的客戶端端點會先驗證 DuDuClaw 身分。使用持久化資料卷的 Docker／NAS、Umbrel 與 DuDuClaw-OS 暫時維持 `18789`，待平台遷移流程另案完成。
+
 ## [1.76.0] - 2026-10-26 — Google 整合、團隊隱私與持續責任
 
 ### Security
