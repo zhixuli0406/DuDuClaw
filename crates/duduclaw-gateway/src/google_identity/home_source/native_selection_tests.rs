@@ -9,8 +9,9 @@ fn fixture(scopes: &[&str]) -> tempfile::TempDir {
         "[integrations]\ngoogle_workspace=true\n",
     )
     .unwrap();
+    let google_home = crate::mcp_oauth::google_home_test_fixture::current_control("test-admin");
     std::fs::write(d.path().join(crate::mcp_oauth::TOKEN_FILE), serde_json::to_vec(&json!([
-        {"provider_id":"google","access_token":"owned-native-access","refresh_token":null,"expires_at":null,"scopes":scopes,"unknown":{"kept":true}},
+        {"provider_id":"google","access_token":"owned-native-access","refresh_token":null,"expires_at":null,"scopes":scopes,"unknown":{"kept":true},"google_home":google_home},
         {"provider_id":"github","access_token":"foreign","refresh_token":null,"expires_at":null,"scopes":["repo"]}
     ])).unwrap()).unwrap();
     d
@@ -249,13 +250,20 @@ fn malformed_actual_grants_fail_before_metadata_migration() {
 }
 
 #[test]
-fn publication_failure_never_issues_a_native_selection() {
+fn legacy_source_never_issues_a_native_selection_even_with_publication_faults() {
     for fault in [
         home_store::oauth_testing::Fault::GateWrite,
         home_store::oauth_testing::Fault::DataRename,
         home_store::oauth_testing::Fault::CleanupDirSync,
     ] {
         let d = fixture(&["https://www.googleapis.com/auth/gmail.readonly"]);
+        let mut raw = rows(d.path());
+        raw[0].as_object_mut().unwrap().remove("google_home");
+        std::fs::write(
+            d.path().join(crate::mcp_oauth::TOKEN_FILE),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
         let _fault = home_store::oauth_testing::FaultGuard::at(d.path(), fault);
         assert!(prepare_home_native_selection(d.path(), "gmail_read").is_err());
         assert!(!d.path().join(".keyfile").exists());

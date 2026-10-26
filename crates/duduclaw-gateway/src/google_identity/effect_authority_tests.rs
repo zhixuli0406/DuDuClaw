@@ -6,6 +6,29 @@ use crate::person_credentials::{self as vault, Metadata, Secret, Status};
 use duduclaw_auth::{AccessLevel, UserDb, UserRole};
 use std::sync::Arc;
 
+fn write_current_home_token(
+    home: &std::path::Path,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at: Option<&str>,
+    scopes: &[&str],
+) {
+    let google_home = crate::mcp_oauth::google_home_test_fixture::current_control("test-admin");
+    std::fs::write(
+        home.join("mcp-oauth-tokens.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "provider_id": "google",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+            "scopes": scopes,
+            "google_home": google_home,
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 struct Fixture {
     home: tempfile::TempDir,
     db: Arc<UserDb>,
@@ -1202,7 +1225,13 @@ fn host_home_pending(
     String,
 ) {
     vault::disconnect(f.home.path(), &f.user).unwrap();
-    std::fs::write(f.home.path().join("mcp-oauth-tokens.json"), serde_json::to_vec(&serde_json::json!([{"provider_id":"google","access_token":"owned-c2-home-access","refresh_token":null,"expires_at":null,"scopes":["https://www.googleapis.com/auth/gmail.readonly"]}])).unwrap()).unwrap();
+    write_current_home_token(
+        f.home.path(),
+        "owned-c2-home-access",
+        None,
+        None,
+        &["https://www.googleapis.com/auth/gmail.readonly"],
+    );
     host_home_pending_same_lineage(f)
 }
 fn host_home_pending_same_lineage(
@@ -1603,7 +1632,13 @@ fn d1_fixture(home: bool) -> Fixture {
     std::fs::write(f.home.path().join("config.toml"), config).unwrap();
     if home {
         vault::disconnect(f.home.path(), &f.user).unwrap();
-        std::fs::write(f.home.path().join("mcp-oauth-tokens.json"),serde_json::to_vec(&serde_json::json!([{"provider_id":"google","access_token":D1_SECRET,"refresh_token":null,"expires_at":null,"scopes":crate::google_workspace::REQUIRED_SCOPES}])).unwrap()).unwrap();
+        write_current_home_token(
+            f.home.path(),
+            D1_SECRET,
+            None,
+            None,
+            crate::google_workspace::REQUIRED_SCOPES,
+        );
     }
     f
 }
@@ -2529,7 +2564,13 @@ async fn d1_r2_preflight_failures_audit_once_without_resolving_or_sending() {
 fn d1_r2_reflection_fixture(home: bool, token: &str) -> Fixture {
     let f = d1_fixture(home);
     if home {
-        std::fs::write(f.home.path().join("mcp-oauth-tokens.json"),serde_json::to_vec(&serde_json::json!([{"provider_id":"google","access_token":token,"refresh_token":null,"expires_at":null,"scopes":crate::google_workspace::REQUIRED_SCOPES}])).unwrap()).unwrap();
+        write_current_home_token(
+            f.home.path(),
+            token,
+            None,
+            None,
+            crate::google_workspace::REQUIRED_SCOPES,
+        );
     } else {
         let old = vault::get(f.home.path(), &f.user).unwrap().unwrap();
         let key = crate::google_identity::protection_gate(f.home.path()).unwrap();
@@ -3313,7 +3354,13 @@ async fn m1_refreshing_owners() -> usize {
     for home in [false, true] {
         let f = d1_fixture(home);
         if home {
-            std::fs::write(f.home.path().join("mcp-oauth-tokens.json"),serde_json::to_vec(&serde_json::json!([{"provider_id":"google","access_token":D1_SECRET,"refresh_token":"owned-refresh","expires_at":"2000-01-01T00:00:00Z","scopes":crate::google_workspace::REQUIRED_SCOPES}])).unwrap()).unwrap();
+            write_current_home_token(
+                f.home.path(),
+                D1_SECRET,
+                Some("owned-refresh"),
+                Some("2000-01-01T00:00:00Z"),
+                crate::google_workspace::REQUIRED_SCOPES,
+            );
         } else {
             let old = vault::get(f.home.path(), &f.user).unwrap().unwrap();
             let key = crate::google_identity::protection_gate(f.home.path()).unwrap();
@@ -3490,7 +3537,13 @@ async fn m1_rotated_session_headers_keep_all_original_values_inside_both_owners(
 #[tokio::test]
 async fn m1_r2_missing_home_refresh_fixture_refuses_true_closed_mount_with_zero_sends() {
     let f = d1_fixture(true);
-    std::fs::write(f.home.path().join("mcp-oauth-tokens.json"),serde_json::to_vec(&serde_json::json!([{"provider_id":"google","access_token":D1_SECRET,"refresh_token":"owned-refresh","expires_at":"2000-01-01T00:00:00Z","scopes":crate::google_workspace::REQUIRED_SCOPES}])).unwrap()).unwrap();
+    write_current_home_token(
+        f.home.path(),
+        D1_SECRET,
+        Some("owned-refresh"),
+        Some("2000-01-01T00:00:00Z"),
+        crate::google_workspace::REQUIRED_SCOPES,
+    );
     let wire = m1_wire(false).await;
     let path = f.home.path().join("agents/bot/agent.toml");
     let original = std::fs::read_to_string(&path).unwrap();

@@ -1,6 +1,24 @@
-//! Owned test credentials enter through the actual Home authorization flow.
-//! No generic writer, raw row insertion, ENV endpoint, or real provider is used.
+//! Owned test credentials enter through the actual Home authorization flow;
+//! lower-level fixtures may synthesize only its non-secret control metadata.
+//! No production writer, ENV endpoint, or real provider is used.
 use super::*;
+
+pub(crate) fn current_control(actor: &str) -> serde_json::Value {
+    let consent = crate::google_data_consent::Evidence::issue(actor).unwrap();
+    serde_json::json!({
+        "schema": 1,
+        "source_generation": uuid::Uuid::new_v4().to_string(),
+        "state": "ready",
+        "credential": {
+            "credential_id": uuid::Uuid::new_v4().to_string(),
+            "logical_epoch": 1,
+            "token_revision": 1,
+            "google_data_consent": consent,
+        },
+        "active_connect": null,
+        "pending_mutation": null,
+    })
+}
 
 pub(crate) async fn connect(home: &Path, access: &str, refresh: Option<&str>) {
     use crate::mcp_oauth::home_lifecycle as flow;
