@@ -68,7 +68,7 @@ changed file modes, changed feature notes or extra parents are refused. The lega
 technical-brief renderer can still produce its separate private HTML, but that
 optional output cannot satisfy either mandatory full-manual item.
 
-## Enterprise channel gate (unreleased)
+## Enterprise channel gate (v1.76.2)
 
 `scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private enterprise checkout, the Pro signing key, `minisign`, `gcloud` and `docker` on `PATH`, a running Docker daemon and an active gcloud account. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
 

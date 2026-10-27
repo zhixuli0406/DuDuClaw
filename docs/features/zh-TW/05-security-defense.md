@@ -1,6 +1,6 @@
 # 安全防線
 
-尚未發版的企業版[團隊對話 API](68-manager-team-history.md)以即時報告線獨立判斷，不放寬原本的員工存取權。外部文字在讀取時遮蔽，每次揭露都要完成雜湊鏈稽核；設定關閉、來源不明、已裝模型故障或稽核失敗都不回對話內容。只跑 regex 時會明示 `ner: false`，姓名與地址仍可能漏遮。直接主機／資料庫存取仍在產品入口保護範圍外。
+企業版[團隊對話 API](68-manager-team-history.md)（v1.76.0）以即時報告線獨立判斷，不放寬原本的員工存取權。外部文字在讀取時遮蔽，每次揭露都要完成雜湊鏈稽核；設定關閉、來源不明、已裝模型故障或稽核失敗都不回對話內容。只跑 regex 時會明示 `ner: false`，姓名與地址仍可能漏遮。直接主機／資料庫存取仍在產品入口保護範圍外。
 
 > 四道現役守衛、各自跑在哪裡，以及它們都擋不住什麼。
 
@@ -157,7 +157,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 ## 動作規則、探索通道與動作審查
 
-2026-10 新增（尚未發佈）。三層都只會收緊員工能做的事，不會解除其他閘門設下的核准或拒絕。
+2026-10 新增（v1.72.0）。三層都只會收緊員工能做的事，不會解除其他閘門設下的核准或拒絕。
 
 **動作類型。** 每個 DuDuClaw MCP 工具都有一個副作用類型（`duduclaw_core::tool_effect::effect_of_builtin`）：`read`（讀取）、`draft`（擬稿）、`send`（傳送）、`publish`（發布）、`purchase`（花錢或承諾交易）、`delete`（刪除）、`modify`（修改資料）、`admin`（管理操作）。`read` 與 `draft` 在回覆之外不留下任何東西，其餘六類都有副作用。效果會隨參數改變的工具取較嚴格的類型（`wiki_write` 兩種 scope 都是 `modify`）。`mail_send` 只會建立一份要人核可的草稿，但它歸在 `send`，因為它最後的效果是寄出；`gmail_create_draft` 永遠不寄，歸在 `draft`。表裡沒有的工具名稱當作 `admin`（fail closed），並有測試逐一檢查每個對外宣告的工具，新工具沒分類就無法通過。內建工具目錄（`tools.catalog`）以 `effect` 欄位帶出類型。
 
@@ -187,7 +187,7 @@ action_rules = [
 
 ## 員工動作的單次核准（ActionGrant）
 
-2026-10-08 新增（尚未發行）。改動前，每個需要人核准的工具呼叫都會建立自己的請求、等那一筆的決定，所以核准不會被之後的呼叫重複使用；缺的是「綁定」：卡片看不到參數，決定也沒有綁在實際執行的那次呼叫上。現在，工具屬於 `send` 或 `purchase` 類（例如 `mail_send`、`odoo_sale_confirm`），或因 `action_rules` 的 `ask` 而需要人核准的呼叫，請求會帶 `payload.action_grant`（`duduclaw-gateway/src/approval/action_grant.rs`）：
+2026-10-08 新增（v1.72.0）。改動前，每個需要人核准的工具呼叫都會建立自己的請求、等那一筆的決定，所以核准不會被之後的呼叫重複使用；缺的是「綁定」：卡片看不到參數，決定也沒有綁在實際執行的那次呼叫上。現在，工具屬於 `send` 或 `purchase` 類（例如 `mail_send`、`odoo_sale_confirm`），或因 `action_rules` 的 `ask` 而需要人核准的呼叫，請求會帶 `payload.action_grant`（`duduclaw-gateway/src/approval/action_grant.rs`）：
 
 - 員工、工具、動作類別、員工＋工具＋正規化參數（物件鍵排序）的 SHA-256 指紋，以及最多八行 `鍵 = 值` 的摘要（只取識別字形狀的參數鍵與純量值；看起來像機密的鍵與值用 `tool_calls.jsonl` 同一套遮蔽，字串截 60 字，巢狀值只顯示數量）。卡片文字與收件匣詳細面板（「這份核准涵蓋的內容」）都會顯示。
 - 核准後，存下的綁定必須與即將執行的呼叫一致（同員工、工具、指紋），並在呼叫前消耗一次（`approved → invalidated`，原因 `consumed:action_grant:<uuid>`）。不一致、搶輸或第二次使用都算拒絕。
@@ -204,11 +204,11 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 帳號現在可以有一位直屬主管（`users.manager_user_id`，只有多人團隊版，經 `users.create`／`users.update` 設定）。同一次 `users.create`／`users.update` 的所有欄位在一個交易裡寫入，主管或降級被擋時，這次請求的其他修改也不會套用。寫入會擋下繞成一圈（`manager_cycle`）、一條主管鏈超過 8 個人（含最上層，`manager_too_deep`）、主管角色低於主管或不在職（`manager_role`、`manager_inactive`）；還有直屬部屬的人不能降成員工（`manager_has_reports`）；離職時部屬改掛 `transfer_to` 或離職者的主管，每一筆以 `user.reparent` 記稽核；轉給 `transfer_to` 的綁定，若對方原本就綁了同一位員工，保留兩者中較高的等級。系統會算出主管可以碰到部屬綁定的員工（最高 Operator），但這一版還沒有任何地方用到：路由、`agents.list` 與 Operator 等級的 RPC（記憶、對話紀錄、設定）仍然只看直接綁定。
 
-## 人修改 AI 員工設定檔（未發布）
+## 人修改 AI 員工設定檔（v1.76.0）
 
-人格設定、自我介紹、工作規則、行為界線（`SOUL.md`、`IDENTITY.md`、`INSTRUCTIONS.md`、`CONTRACT.toml`）可以由員工的負責人與管理員在儀表板修改，每次存檔都先檢查再生效（拍板 D7）。誰能寫，每次呼叫都從 `users.db` 重新讀取，寫入前在檔案鎖內再讀一次，所以檢查進行中被解除綁定也會擋下寫入。先跑固定規則（大小與控制字元、嚴格解析行為界線、隱藏或看不見的內容、新增文字裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪掉某條）。接著由部署的輔助模型看差異：被改的文字包在帶隨機 nonce 的標籤裡、先去掉隱藏內容，回覆必須完全符合固定格式。模型只能讓結果更嚴。檢查沒完成至少算警告，不會當成通過，也不能關掉。非管理員遇到高風險只能送管理員審核（`agent_file_change`，只能在儀表板決定，通道只收沒有按鈕的通知）。這個檢查看的是人送出的內容，`agent-file-guard` 照舊擋員工自己寫這些檔。每次寫入都在員工資料夾外留版本並寫 `agent_file_changed`，被拒絕寫 `agent_file_change_refused`。INSTRUCTIONS.md 現在和 SOUL.md 一樣有自己的核可指紋。同一版也擴大只限管理員的 `agent.toml` 欄位（bot token、`[odoo]`、`[runtime] provider`／`fallback`、`[prompt] cli_bare_mode`、`[os_watch]`、`[model] account_pool`、`role = "main"`、放寬預算），見[儀表板設定](../../guides/zh-TW/dashboard-settings.md#設定檔未發布)。
+人格設定、自我介紹、工作規則、行為界線（`SOUL.md`、`IDENTITY.md`、`INSTRUCTIONS.md`、`CONTRACT.toml`）可以由員工的負責人與管理員在儀表板修改，每次存檔都先檢查再生效（拍板 D7）。誰能寫，每次呼叫都從 `users.db` 重新讀取，寫入前在檔案鎖內再讀一次，所以檢查進行中被解除綁定也會擋下寫入。先跑固定規則（大小與控制字元、嚴格解析行為界線、隱藏或看不見的內容、新增文字裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪掉某條）。接著由部署的輔助模型看差異：被改的文字包在帶隨機 nonce 的標籤裡、先去掉隱藏內容，回覆必須完全符合固定格式。模型只能讓結果更嚴。檢查沒完成至少算警告，不會當成通過，也不能關掉。非管理員遇到高風險只能送管理員審核（`agent_file_change`，只能在儀表板決定，通道只收沒有按鈕的通知）。這個檢查看的是人送出的內容，`agent-file-guard` 照舊擋員工自己寫這些檔。每次寫入都在員工資料夾外留版本並寫 `agent_file_changed`，被拒絕寫 `agent_file_change_refused`。INSTRUCTIONS.md 現在和 SOUL.md 一樣有自己的核可指紋。同一版也擴大只限管理員的 `agent.toml` 欄位（bot token、`[odoo]`、`[runtime] provider`／`fallback`、`[prompt] cli_bare_mode`、`[os_watch]`、`[model] account_pool`、`role = "main"`、放寬預算），見[儀表板設定](../../guides/zh-TW/dashboard-settings.md#設定檔v1760)。
 
-## 工作替誰做（`on_behalf_of`，未發布）
+## 工作替誰做（`on_behalf_of`，v1.76.0）
 
 由真人發起的工作（一輪對話、`/交辦`、dashboard 建的任務），gateway 現在會把「這是替誰做的」一路帶下去：員工的 runtime 會拿到 `DUDUCLAW_ON_BEHALF_OF`（所有 runtime，不只 Claude）；`send_to_agent`／`spawn_agent` 把它寫進佇列（`message_queue.on_behalf_of`、`bus_queue.jsonl` 欄位），派工器再套到接手的那一輪；目標任務的每一輪與 heartbeat 喚醒從任務列（`tasks.on_behalf_of`）抄過來；`tasks_create` 建的新任務會記上；這一輪提出的核可也會存（`approvals.on_behalf_of`）。值是 `user:<帳號 id>`（WebChat 帳號或已驗證的通道身分），或 `unmapped:<通道>:<摘要>`（沒有帳號的發話者，用的是 `@` 路由稽核同一把金鑰的 HMAC，不會出現平台原始 id）。來源只有 gateway 寫的東西：spawn 時設定的環境變數，以及 gateway 或 MCP server（依該環境變數）寫的資料列，絕不讀工具參數。系統發送者名稱（`dashboard`、`cron` 等）、保留 id、格式不對的值一律拒收，並記為 `on_behalf_of_rejected`；第一個寫入的值為準，下游不覆寫。gateway 自己的環境變數不會傳下去：spawn 白名單不含這個變數，各 runtime 在設定本輪的值之前會先移除繼承來的值。
 
@@ -253,7 +253,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 **非 root 閘道擋得住什麼、擋不住什麼（DuDuClaw OS v0.4.0）** — 在 DuDuClaw OS v0.4.0 以後的映像上，拿到 shell 的 AI 員工就是以閘道的使用者身分執行。它讀得到閘道的金鑰，所以閘道能做的事它都能做，包括偽造閘道的簽章內部請求與儀表板登入狀態。閘道改成非 root，是讓這樣的員工碰不到 root，不是讓它碰不到閘道本身的權力。原本的規則仍然成立：真正的隔離是不給 Bash，或把工作放進任務沙箱。所以防止取回 root 的關卡不信任任何呼叫者：`duduclaw-sysd --min-rollback-version <版本>`（第一個閘道非 root 的版本 v0.4.0 把它設成自己的映像版本 `1.73.4-y1-bringup`）在回退可能開機的任何項目比這個版本舊、或無法從開機映像本身（內嵌的 `os-release`，並與檔名交叉核對）讀出版本時，拒絕回退。Type #1 開機項目（`loader/entries/*.conf`）無法同樣嚴格地核對，只要存在就拒絕回退。安裝更新原本也是一條回到 root 的路：系統更新程式會安裝來源目錄裡的任何東西、不做檢查，而那個目錄就是閘道自己的下載資料夾，同一使用者的行程可以放進任何映像（包括改名成較高版本的舊簽章映像）。現在安裝改走輔助程式的新指令：以 root 用內建在輔助程式裡的 OS 簽章金鑰驗證版本的簽章校驗清單，只把清單列出的檔案（不跟隨連結、只接受一般檔案、邊複製邊比對雜湊）複製到只有 root 能存取的暫存目錄，挑出綁定目的槽位的開機映像，並且只有在該映像內嵌的版本比目前執行的新、也不低於回退下限時才安裝。閘道自己的檢查保留，用來更早給出清楚的錯誤。原本的安裝指令不再能經閘道內部路由呼叫。清除用盡的開機項目只會刪掉它。輔助程式管不到的部分：開機載入器自己的開機計數，在新項目被標記成功前連續三次開不起來時會退回另一個項目，所以 v0.4.0 在第一次開機被標記成功後，會刪掉比下限舊的開機項目。這讓升級變成單向：v0.4.0 映像成功開機過一次之後，裝置就回不去 v0.3.0 或更早的版本，之後的版本出問題只能裝更新的映像或用救援項目。第一次開機被標記成功之前，舊的 root 閘道項目仍是開機載入器的備援，新映像上的員工可以故意讓試開機失敗回到那裡；這個窗口只有幾次開機。
 
-**維修 SSH 改用專用帳號與臨時金鑰（輔助程式端，尚未發版，目前還不能用）** — 輔助程式新增 `ssh_maint_open`、`ssh_maint_status` 兩個指令，讓維修登入改用專用帳號（`duduclaw-maint`，uid／gid 4800）加上每個視窗一把公鑰。閘道與 AI 員工是同一個使用者，所以金鑰只由輔助程式決定：只收一把（Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元、指數為奇數且不超過 64 位元的 RSA），解碼後逐欄檢查型別與長度，拒絕 `authorized_keys` 選項、憑證、私鑰（OpenSSH、PEM、PuTTY）、RFC 4716 區塊，以及多把或多行；寫進檔案的只有固定選項（`no-port-forwarding,no-agent-forwarding,no-X11-forwarding`）加上解碼後位元組的標準編碼。金鑰檔放在 tmpfs（`/run/duduclaw-maint-ssh/authorized_keys`，root:duduclaw-maint 0640），經目錄控制代碼寫入、不跟隨符號連結，以不會覆蓋既有金鑰的 rename 放到定位，再讀回比對。寫入前輔助程式先檢查實際生效的設定（systemd 合併後的單元與已載入的 nftables 規則）：OS 的就緒標記、帳號的 uid 與 gid、dropbear 合併後的指令列與預期值逐個 token 相同、dropbear 的單元綁在輔助程式上（`BindsTo=`）、拒絕這個帳號 loopback 流量的防火牆規則與通往它的跳轉，以及 22 埠只收區網／VPN 來源的集合；任何一項不符就拒絕開窗。視窗在下列情況結束：輔助程式自己的期限到（最多 24 小時，以 `CLOCK_BOOTTIME` 計，改系統時間延長不了）、閘道關閉、輔助程式重啟時發現殘留，或輔助程式停擺時由它開窗時掛上的 systemd 臨時計時器收回（關窗時會撤掉）。輔助程式每 15 秒從 journal 讀登入與登出，只認 journald 自己填的欄位（`_SYSTEMD_SLICE=system-dropbear.slice`、`_UID`），寫進只有 root 能讀寫的稽核檔 `/data/system/maint-ssh-audit.log`；這件事不經過閘道，閘道停掉或被入侵都不會讓這些紀錄停止寫入。輔助程式等稽核檔的鎖最多幾秒：寫不進去時視窗不會打開；關窗時則回報問題，把紀錄（以及還沒讀到的 journal 事件）留著，之後寫進去為止。視窗狀態與 journal 讀取位置存在持久儲存上只有 root 能存取的目錄（`/data/system/maint-ssh/`），視窗期間重開機也抹不掉登入紀錄：下次開機的清理會從存下的位置重讀 journal，並以 `reboot` 寫入關窗紀錄。視窗開著時，每次檢查也會重讀防火牆的維修出站規則，規則不見就關窗。開窗有頻率限制（間隔至少 5 秒、每小時最多 12 次）。事件裡的字串截到 128 字元並去掉控制字元。每個視窗前 50 筆登入逐筆寫，之後只計數；檔案輪替時會把本視窗的開窗紀錄重寫到新檔開頭。映像有這個帳號時，舊的只開埠 `ssh_service_start` 會被拒絕。這兩個指令都不能經閘道給 `os_*` 工具用的內部路由呼叫。要等 OS 映像帶上這個帳號、閘道與儀表板部分也完成後才能使用。
+**維修 SSH 改用專用帳號與臨時金鑰（輔助程式端，v1.75.0，目前還不能用）** — 輔助程式新增 `ssh_maint_open`、`ssh_maint_status` 兩個指令，讓維修登入改用專用帳號（`duduclaw-maint`，uid／gid 4800）加上每個視窗一把公鑰。閘道與 AI 員工是同一個使用者，所以金鑰只由輔助程式決定：只收一把（Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元、指數為奇數且不超過 64 位元的 RSA），解碼後逐欄檢查型別與長度，拒絕 `authorized_keys` 選項、憑證、私鑰（OpenSSH、PEM、PuTTY）、RFC 4716 區塊，以及多把或多行；寫進檔案的只有固定選項（`no-port-forwarding,no-agent-forwarding,no-X11-forwarding`）加上解碼後位元組的標準編碼。金鑰檔放在 tmpfs（`/run/duduclaw-maint-ssh/authorized_keys`，root:duduclaw-maint 0640），經目錄控制代碼寫入、不跟隨符號連結，以不會覆蓋既有金鑰的 rename 放到定位，再讀回比對。寫入前輔助程式先檢查實際生效的設定（systemd 合併後的單元與已載入的 nftables 規則）：OS 的就緒標記、帳號的 uid 與 gid、dropbear 合併後的指令列與預期值逐個 token 相同、dropbear 的單元綁在輔助程式上（`BindsTo=`）、拒絕這個帳號 loopback 流量的防火牆規則與通往它的跳轉，以及 22 埠只收區網／VPN 來源的集合；任何一項不符就拒絕開窗。視窗在下列情況結束：輔助程式自己的期限到（最多 24 小時，以 `CLOCK_BOOTTIME` 計，改系統時間延長不了）、閘道關閉、輔助程式重啟時發現殘留，或輔助程式停擺時由它開窗時掛上的 systemd 臨時計時器收回（關窗時會撤掉）。輔助程式每 15 秒從 journal 讀登入與登出，只認 journald 自己填的欄位（`_SYSTEMD_SLICE=system-dropbear.slice`、`_UID`），寫進只有 root 能讀寫的稽核檔 `/data/system/maint-ssh-audit.log`；這件事不經過閘道，閘道停掉或被入侵都不會讓這些紀錄停止寫入。輔助程式等稽核檔的鎖最多幾秒：寫不進去時視窗不會打開；關窗時則回報問題，把紀錄（以及還沒讀到的 journal 事件）留著，之後寫進去為止。視窗狀態與 journal 讀取位置存在持久儲存上只有 root 能存取的目錄（`/data/system/maint-ssh/`），視窗期間重開機也抹不掉登入紀錄：下次開機的清理會從存下的位置重讀 journal，並以 `reboot` 寫入關窗紀錄。視窗開著時，每次檢查也會重讀防火牆的維修出站規則，規則不見就關窗。開窗有頻率限制（間隔至少 5 秒、每小時最多 12 次）。事件裡的字串截到 128 字元並去掉控制字元。每個視窗前 50 筆登入逐筆寫，之後只計數；檔案輪替時會把本視窗的開窗紀錄重寫到新檔開頭。映像有這個帳號時，舊的只開埠 `ssh_service_start` 會被拒絕。這兩個指令都不能經閘道給 `os_*` 工具用的內部路由呼叫。要等 OS 映像帶上這個帳號、閘道與儀表板部分也完成後才能使用。
 
 ---
 
@@ -275,7 +275,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 尚未涵蓋：Windows 上的解析沒有沙箱（預設因此拒收）也沒有記憶體上限；心跳沒有 turn id 也沒有 run id，它的工具呼叫什麼都讀不到。規則式去識別化無法辨認送往雲端向量供應商的段落中的每一個人名（AI 偵測模型表現較好，但也不完美）。
 
-## 指定人的憑證放系統金鑰圈（未發布）
+## 指定人的憑證放系統金鑰圈（v1.76.0）
 
 讓 AI 員工代表某一個人（例如同事的 Google 帳號）之後，憑證被偷的代價變高，所以這類憑證另外用一把金鑰。這把「保護金鑰」是 32 bytes 的 AES-256 金鑰，只存在作業系統的憑證儲存區，代表特定人的憑證用它封存（`pk:v1:<金鑰代號>:…`）。全 home 共用的憑證（`.keyfile` 與它解密的 `*_enc` 值）不變。
 
@@ -289,7 +289,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 擋不住的部分：能執行指令的員工仍可以換掉金鑰（會被偵測，見上）、殺掉 gateway 自己起一個，或在發布的 macOS CLI 還沒開 hardened runtime 之前對 `duduclaw` 執行檔注入程式碼。真正的隔離仍是不給 Bash、用任務沙箱，或讓 gateway 用另一個作業系統帳號執行。
 
-## 代表同事使用 Google 帳號（未發布）
+## 代表同事使用 Google 帳號（v1.76.0）
 
 公司授權代表（B2a）讓 AI 員工以一位指定同事的身分使用 Google。各道守門都在失敗時拒絕：
 
@@ -300,7 +300,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **每次重讀人員狀態。** 同事的 DuDuClaw 帳號停權或離職後，下一次呼叫就拒絕。
 - **設定只有管理員能改。** `[google]` 對員工自己的 Write/Edit 是凍結的（員工檔案守衛），也是權限欄位：非管理員的擁有者只能改得更窄。
 
-限制：`gmail.compose` 讓拿到權杖的人能寄信；有不受限 shell 的員工可以拿自己那位同事的權杖直接呼叫 Google，而且和 gateway 是同一個作業系統帳號。這個版本對代表同事的員工會跳過外掛的 Google MCP 伺服器（`oauth://google`）。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+限制：`gmail.compose` 讓拿到權杖的人能寄信；有不受限 shell 的員工可以拿自己那位同事的權杖直接呼叫 Google，而且和 gateway 是同一個作業系統帳號。這個版本對代表同事的員工會跳過外掛的 Google MCP 伺服器（`oauth://google`）。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
 ## 這些守衛擋不住什麼
 
@@ -311,7 +311,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **Bash 通道也會誤擋一些無害的指令。** 受檢位置上的路徑解析失敗時一律拒絕，即使路徑在資料目錄以外；懸空的符號連結即使指向資料目錄以外也會被拒絕。
 - **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
-- **系統金鑰圈分不開員工與 gateway。** 兩者是同一個作業系統帳號。macOS 上保護金鑰擋得住其他程式讀取，擋不住被換掉；Windows 上同帳號的任何程式都讀得到。見[指定人的憑證放系統金鑰圈](#指定人的憑證放系統金鑰圈未發布)。
+- **系統金鑰圈分不開員工與 gateway。** 兩者是同一個作業系統帳號。macOS 上保護金鑰擋得住其他程式讀取，擋不住被換掉；Windows 上同帳號的任何程式都讀得到。見[指定人的憑證放系統金鑰圈](#指定人的憑證放系統金鑰圈v1760)。
 - **只有 Claude runtime 會跑這些 hook。** Codex、Antigravity 與其他 runtime 靠各自的沙箱旗標。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）

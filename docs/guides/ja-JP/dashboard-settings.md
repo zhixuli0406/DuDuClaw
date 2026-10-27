@@ -1,6 +1,6 @@
 # ダッシュボード設定の対応表（v1.68.0）
 
-未リリースのEnterprise設定（ユーザー管理 → 組織の設定）：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。有効にする前に職員へ通知してください。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
+Enterprise設定（v1.76.0、ユーザー管理 → 組織の設定）：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。有効にする前に職員へ通知してください。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
 
 v1.68.0 からダッシュボードで設定できる項目について、どのページにあるか、どの設定キーに書き込むか、保存後に gateway の再起動が必要かをまとめます。最後の節では、専用のコントロールがないキーを編集する「設定ファイルの詳細編集」を説明します。
 
@@ -86,7 +86,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | タブ → セクション | キー |
 |---|---|
 | 予算 → 1日の上限 | `[budget] daily_cap_cents` |
-| スキル → この社員のスキル（未リリース） | 設定キーではない：オン／オフは `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`）、削除したスキルは `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）に移る。社員の担当者または管理者。[スキルライブラリ画面](../../features/ja-JP/15-skill-lifecycle.md)参照 |
+| スキル → この社員のスキル（v1.76.0） | 設定キーではない：オン／オフは `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`）、削除したスキルは `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）に移る。社員の担当者または管理者。[スキルライブラリ画面](../../features/ja-JP/15-skill-lifecycle.md)参照 |
 | ツールと権限 → 確認が必要なツール（常に承認待ち、不可逆として扱う、先に判定役が判断、タスク許可が必要） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | ツールと権限 → 並行ブランチ | `[fork] enabled` |
 | ツールと権限 → 送信内容の保護 | `[guardrails] enabled`、`block_secrets`、`block_injection_echo`、`redact_pii`、`deny_phrases` |
@@ -96,14 +96,14 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | 頭脳とエンジン → 起動内容の簡素化 | `[runtime] minimal_context` |
 | 頭脳とエンジン → 1人の社員に4つの役割 | `[team] enabled`、`[team.roles.<役割>]` |
 | 自動化 → 夜間の整理 | `[night_engine] enabled` |
-| 連携 → 専用チャンネル（未リリース） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`。`agents.channels.*` で設定（管理者が設定、担当者は状態を確認可。[専用チャンネル](per-employee-channels.md)） |
+| 連携 → 専用チャンネル（v1.76.0） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`。`agents.channels.*` で設定（管理者が設定、担当者は状態を確認可。[専用チャンネル](per-employee-channels.md)） |
 | チャネルと連携 → 外部の連絡先から @ で呼び出し（v1.76） | `[channels] public_trigger`（管理者のみ。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照） |
 | 自動化 → 記憶 → 決定の継続、決定の保持日数 | `[memory] decision_continuity`、`decision_ttl_days`（1〜3650） |
-| 詳細設定 → モデル詳細設定 → 詳細キー／値 | 任意の `[セクション] キー`。各行に型（文字列、整数、小数、真偽値、文字列配列）を指定。書き込み前に `AgentConfig` 全体として解析し、失敗すると全体を拒否。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` セクションはここでは編集できません（未リリース：`prompt`、`os_watch`、`budget` を追加。`prompt.cli_bare_mode` など管理者専用のキーを含むため、管理者は設定ファイルの詳細編集で変更します） |
+| 詳細設定 → モデル詳細設定 → 詳細キー／値 | 任意の `[セクション] キー`。各行に型（文字列、整数、小数、真偽値、文字列配列）を指定。書き込み前に `AgentConfig` 全体として解析し、失敗すると全体を拒否。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` セクションはここでは編集できません（v1.76.0：`prompt`、`os_watch`、`budget` を追加。`prompt.cli_bare_mode` など管理者専用のキーを含むため、管理者は設定ファイルの詳細編集で変更します） |
 
-**管理者だけが変更できる項目。** `[agent] reports_to`、`department`、`name`、`[capabilities]` 全体、`[container] sandbox_enabled`、`network_access`、`readonly_project`、`[permissions]` の 5 つのフラグ（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）と（未リリース）`[permissions] allowed_channels`、`[guardrails] enabled` と `block_secrets`、（v1.76）`[channels] public_trigger`、そして（未リリース）社員ごとの bot トークン `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、`[odoo]` 全体、`[runtime] provider` と `fallback`、`[prompt] cli_bare_mode`、`[os_watch]` 全体、`[model] account_pool`、`role = "main"` への変更とその解除、予算の緩和（`monthly_limit_cents` や `daily_cap_cents` の引き上げ、上限の撤廃（0 は上限なし）、`hard_stop` のオフ）。社員のオーナーは上限の追加や引き下げ、`hard_stop` のオンは引き続き行えます。管理者以外からの変更は拒否され、管理者による変更が成功すると監査イベント `agent_authority_changed` が、拒否された試みには `agent_authority_refused` が記録されます。モデルの変更で実行環境が自動的に切り替わる場合、管理者以外にはその旨が表示されます。`org.toml` は `reports_to` か `department` が実際に変わったときだけ更新されます。`agents.inspect` は対応するフォーム項目を `admin_only_fields` として返し、編集ページは管理者以外に対してそれらを無効にします。
+**管理者だけが変更できる項目。** `[agent] reports_to`、`department`、`name`、`[capabilities]` 全体、`[container] sandbox_enabled`、`network_access`、`readonly_project`、`[permissions]` の 5 つのフラグ（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）と（v1.76.0）`[permissions] allowed_channels`、`[guardrails] enabled` と `block_secrets`、（v1.76）`[channels] public_trigger`、そして（v1.76.0）社員ごとの bot トークン `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、`[odoo]` 全体、`[runtime] provider` と `fallback`、`[prompt] cli_bare_mode`、`[os_watch]` 全体、`[model] account_pool`、`role = "main"` への変更とその解除、予算の緩和（`monthly_limit_cents` や `daily_cap_cents` の引き上げ、上限の撤廃（0 は上限なし）、`hard_stop` のオフ）。社員のオーナーは上限の追加や引き下げ、`hard_stop` のオンは引き続き行えます。管理者以外からの変更は拒否され、管理者による変更が成功すると監査イベント `agent_authority_changed` が、拒否された試みには `agent_authority_refused` が記録されます。モデルの変更で実行環境が自動的に切り替わる場合、管理者以外にはその旨が表示されます。`org.toml` は `reports_to` か `department` が実際に変わったときだけ更新されます。`agents.inspect` は対応するフォーム項目を `admin_only_fields` として返し、編集ページは管理者以外に対してそれらを無効にします。
 
-**保存できる人（未リリース、動作の変更）。** `agents.update` は保存のたびに呼び出し元のロールと社員への紐付けをアカウントデータベースから読み直し、書き込み直前にファイルロック内でもう一度確認します。紐付けの解除、アカウントの停止、パスワード変更の要求は、セッションの期限を待たず次の保存から有効です。どの経路からの `agent.toml` の書き込みも（このページ、チャットの `/model`、設定ファイルの詳細編集、自動の変更）コメントとキーの順序を保ち、版を残し（[設定ファイル](#設定ファイル未リリース)を参照）、`agent_file_changed` を記録します。保存後に社員一覧を再読み込みできなかったときのメッセージは「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」です（定期的な再読み込みはありません）。
+**保存できる人（v1.76.0、動作の変更）。** `agents.update` は保存のたびに呼び出し元のロールと社員への紐付けをアカウントデータベースから読み直し、書き込み直前にファイルロック内でもう一度確認します。紐付けの解除、アカウントの停止、パスワード変更の要求は、セッションの期限を待たず次の保存から有効です。どの経路からの `agent.toml` の書き込みも（このページ、チャットの `/model`、設定ファイルの詳細編集、自動の変更）コメントとキーの順序を保ち、版を残し（[設定ファイル](#設定ファイルv1760)を参照）、`agent_file_changed` を記録します。保存後に社員一覧を再読み込みできなかったときのメッセージは「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」です（定期的な再読み込みはありません）。
 
 **権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
 
@@ -130,7 +130,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 
 データは RPC `users.my_team` から取得し、毎回の呼び出しや依頼と同じ判断を使うので、一覧にあるものはすべて呼び出せます。Personal 版と一般社員のロールでは拒否されます。
 
-## AI 社員ページ → データソース（未リリース）
+## AI 社員ページ → データソース（v1.76.0）
 
 AI 社員に紐づいている人（閲覧者以上）なら誰でも見られます。ファイルの追加と削除には、その社員のオーナーとしての紐づけか管理者であること（毎回アカウントデータベースから読み直します）に加え、社員専用コレクションの編集者かオーナーであることが必要です。
 
@@ -143,7 +143,7 @@ AI 社員に紐づいている人（閲覧者以上）なら誰でも見られ�
 
 社員をアーカイブまたは削除すると専用コレクションもアーカイブされ（オーナーである人だけがアクセスを残します）、社員を復元するとアーカイブで外した共有が戻ります。最初のアップロードでは既存の `[knowledge] collections` の一覧にもコレクションを追加し、その後のアップロードでは一覧に触れません。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md#ダッシュボードでの操作)。
 
-## AI 社員ページ → 接続（未リリース）
+## AI 社員ページ → 接続（v1.76.0）
 
 この社員に紐づく人（閲覧者以上）は、どの Google アカウントを使っているか、今使えるかを見られます（`agents.google_identity_get`）。変更と「接続テスト」は管理者だけです。
 
@@ -153,9 +153,9 @@ AI 社員に紐づいている人（閲覧者以上）なら誰でも見られ�
 | 「同僚のアカウントが使えないときは会社の共用アカウントを使う」 | `[google] fallback = "home"`（チェックなしなら書きません） | 対象は、鍵が未取り込み、同僚の停止・退職、Google の拒否や接続不能だけです。依頼者の拒否、設定の誤り、保護の問題では切り替えません。 |
 | 接続テスト | なし | 同僚向けにトークンを取得し（全スコープ、次にサービスごと）、Gmail が同じアドレスを返すか確かめます。何も送信しません。 |
 
-`[google] requesters`（既定 `bound_people`、ほかに `owner_only`、`anyone`）はこのページにまだ操作がありません。`agents.google_identity_set`（`anyone` には `confirm_anyone: true` が必要）か設定ファイルの詳細編集（管理者）で設定します。管理者でない担当者が `agent.toml` を編集する場合、`[google]` は狭める方向にしか変えられません（`none` にする、`fallback` を外す、`requesters` を厳しくする）。詳しくは[AI 社員ごとに別の Google アカウントを使う](google-workspace.md#ai-社員ごとに別の-google-アカウントを使う会社の委任未リリース)。
+`[google] requesters`（既定 `bound_people`、ほかに `owner_only`、`anyone`）はこのページにまだ操作がありません。`agents.google_identity_set`（`anyone` には `confirm_anyone: true` が必要）か設定ファイルの詳細編集（管理者）で設定します。管理者でない担当者が `agent.toml` を編集する場合、`[google]` は狭める方向にしか変えられません（`none` にする、`fallback` を外す、`requesters` を厳しくする）。詳しくは[AI 社員ごとに別の Google アカウントを使う](google-workspace.md#ai-社員ごとに別の-google-アカウントを使う会社の委任v1760)。
 
-## 連携 → Google → 会社の委任（未リリース）
+## 連携 → Google → 会社の委任（v1.76.0）
 
 管理者のみ、両エディション。
 
@@ -183,7 +183,7 @@ AI 社員に紐づいている人（閲覧者以上）なら誰でも見られ�
 
 詳細：[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md#ベクトルモデル)。
 
-## 設定ファイル（未リリース）
+## 設定ファイル（v1.76.0）
 
 RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`。社員編集ページの「行動の境界」も同じ仕組みを使います（`contract.update`）。対象：人格設定（`SOUL.md`）、自己紹介（`IDENTITY.md`）、作業ルール（`INSTRUCTIONS.md`）、行動の境界（`CONTRACT.toml`）、基本設定（`agent.toml`。ここでは閲覧のみでシークレットはマスク。変更は編集ページ、管理者は設定ファイルの詳細編集でも可）、この社員専用のスキル（`SKILLS/` 配下に既にある `.md`。ファイルキーは `skill:<パス>`、例 `skill:quote/SKILL.md`）。スキルはここでは編集のみで、追加・削除はできません（追加は自作スキルの流れを使います）。スキルの隣のスクリプトには触れません。パスは各階層が単一の名前で `..` や見えない文字（ゼロ幅・方向制御など）を含まず、最大 4 階層。シンボリックリンクとハードリンクは拒否し、保存時はファイルロック内でフォルダーが差し替えられていないことを確認してから書き込みます（ロックファイルは社員フォルダーの外）。ほかのスキル書き込み経路（自作スキル、社員自身のスキルツール、スキルの卒業）はここを通らず、版も残らず、このロックも使いません。上限：Markdown とスキルは 1 ファイル 64 KB、`CONTRACT.toml` は 32 KB、`must_not` と `must_always` はそれぞれ最大 100 項目・各 500 文字。
 
@@ -199,7 +199,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **審査依頼：** 種類 `agent_file_change`。現在も管理者である人がダッシュボードでのみ判断でき、期限は 3 日（期限切れは拒否扱い）。チャネルにはボタンのない通知だけが届きます。提案された内容は依頼が終わるまで `<home>/agent_file_pending/` に保存されます。承認時はまず適用し、待っている間にファイルが変わっていた場合は拒否され、依頼者が送り直す必要があります。
 - **監査：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（記録するのはハッシュだけで、内容は記録しません）。
 
-## 予約して依頼する（未リリース）
+## 予約して依頼する（v1.76.0）
 
 依頼パネルで実行時刻を指定できます。日時を指定して 1 回、毎日、平日、曜日指定、毎時から選べ、管理者は cron も使えます。時刻はブラウザーのタイムゾーンで解釈され、設定時にはタスクを作成せず、予定時刻に作成者の権限を確認し直して依頼します。
 
@@ -207,7 +207,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 設定ファイルの `[goal_defaults] assign_schedule_max_active` は既定で 1 人 20 件（0–200）、`assign_schedule_min_interval_minutes` は管理者以外の最短間隔で既定 60 分、引き上げのみです。既存の予約も次回実行時に確認されます。詳しくは[予約して依頼する](../../features/ja-JP/67-assigning-tasks.md)を参照してください。
 
-## システム → システム更新（未リリース）
+## システム → システム更新（v1.76.2）
 
 このページはインストール全体を一つの順序で更新します。デスクトップアプリが自分で起動していない gateway（launchd／systemd／Enterprise の gateway、またはリモートの gateway）に接続しているとき、ページには二つのコンポーネントが並びます。gateway の現在のバージョンと更新先、デスクトップアプリの現在のバージョンとダウンロード済みのバージョンです。ボタン一つで gateway を先に更新し、再起動を待ってからアプリを更新します。アプリは gateway のバージョンまでしか更新しません。より新しいアプリがダウンロード済みの場合は待機し、その理由をページに表示します。アプリが自分の gateway サイドカーを持つ場合は、これまでどおり両方を一緒に更新します。
 
@@ -239,7 +239,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **ドキュメントナレッジベース：**コレクション、資料、共有、閲覧記録はサイドバーの「会社 → ドキュメントライブラリ」で管理します。全体の上限 `[knowledge]` にはまだ設定ページがなく、各キー（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`、`extract_when_unavailable` = `refuse`／`run_unsandboxed`、`auto_retrieve`、`inject_budget_chars_max`）はここで型を検査します。`[knowledge.embedding]` の各キー（`provider` = `local`／`openai`／`gemini`／`none`、`local_model`、`cloud_model`、`cloud_account`、`cloud_base_url`、`allow_private_endpoint`、`batch_size`、`threads`、`max_vector_rows`、`idle_unload_minutes`）も同様です。開示の確認記録 `cloud_disclosure_ack` はここでは変更できず（保存は拒否されます）、「ナレッジベース検索」の開示ダイアログからのみ書き込まれます。社員の `[knowledge] collections` は「Agent 管理 → 設定を編集 → ツールと権限 → ドキュメントライブラリ」で設定します（共有されたコレクションだけ選べます）。その社員の `agent.toml` を直接編集することもできます。返信に関する `auto_retrieve`、`answer_mode` = `assist`／`kb_only`、`top_k`、`inject_budget_chars` もそこにあります。詳しくは[ドキュメントナレッジベース](../../features/ja-JP/63-knowledge-base.md)。
 - **再起動の一覧：**保存後に再起動が必要な部分を表示します。`config.toml` の `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` は起動時にだけ読まれます。`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（アップロードルートのサイズ上限を決める）も再起動が必要です。ログレベル、常駐センシング、秘匿化はその場で反映できた場合は一覧に出ません。`inference.toml` の保存は常にその場で推論エンジンをリセットします。社員ファイルで再起動が必要なのは `heartbeat.max_concurrent_runs` だけです。
 
-## メンテナンス SSH 画面（未リリース）
+## メンテナンス SSH 画面（v1.75.0）
 
 「デバイス → メンテナンス」で管理者が期間と機能を選択し、
 パスワードを再入力して `MAINTENANCE` と入力します。SSH を選ぶ場合は、
@@ -265,7 +265,7 @@ IPv4 アドレス、担当者の鍵とデバイスの指紋、終了日時、接
 完全な OS イメージ、実際の SSH、通知配信はまだ検証していません。
 未リリースの画面であり、組み立てたデバイスの受け入れ完了を意味しません。
 
-## セキュリティ → 認証情報の保護（未リリース）
+## セキュリティ → 認証情報の保護（v1.76.0）
 
 「セキュリティ」ページの「認証情報の保護」カード（管理者、両エディション）は 1 行で
 「認証情報の保護：ファイル」または「認証情報の保護：システムのキーチェーン（…）」と表示し、その意味を説明
@@ -289,6 +289,6 @@ IPv4 アドレス、担当者の鍵とデバイスの指紋、終了日時、接
   入力が必要）はキーを削除し、保存済みの個人の認証情報は無効になります。
 
 ターミナルでは `duduclaw credentials status`（スクリプト用に `--json`）で同じ状態を
-確認できます。詳細は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置く未リリース)。
+確認できます。詳細は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置くv1760)。
 
 直接バインドの履歴プライバシー：`[people] bound_history_privacy = true` が既定で、欠落・不正値でも制限を維持します。移行時に Admin が詳細エディターで明示的に `false` を指定すると、従来の Viewer／Operator の広い履歴アクセスを復元できます。Owner／Admin とチャット・呼び出し権限は維持します。検索・エクスポート・添付・NER の制限は機能 68 を参照。

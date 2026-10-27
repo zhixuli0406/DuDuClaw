@@ -6,7 +6,7 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 
 ## How saving works
 
-Unreleased Enterprise setting (User Management → Organisation settings): `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). Inform staff before enabling it. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).
+Enterprise setting (v1.76.0, User Management → Organisation settings): `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). Inform staff before enabling it. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).
 
 - System settings (`config.toml`) are written through `system.update_config`, which is admin-only. A page sends only the fields you changed; with no change nothing is sent and the page says "Nothing changed, so there is nothing to save."
 - The write locks the file and re-reads it. If another writer changed the file after you loaded it, the save is refused; reload and save again.
@@ -86,7 +86,7 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 | Tab → section | Key |
 |---|---|
 | Budget → Daily cap | `[budget] daily_cap_cents` |
-| Skills → This staffer's skills (unreleased) | not a config key: switches are stored in `<home>/skill_state/<agent_id>.json` (`skills.set_enabled`), removed skills move to `<home>/skill_archive/<agent_id>/` (`skills.remove` / `skills.restore`); Owner of the employee or admin. See [Skill library page](../features/15-skill-lifecycle.md#the-skill-library-page-unreleased) |
+| Skills → This staffer's skills (v1.76.0) | not a config key: switches are stored in `<home>/skill_state/<agent_id>.json` (`skills.set_enabled`), removed skills move to `<home>/skill_archive/<agent_id>/` (`skills.remove` / `skills.restore`); Owner of the employee or admin. See [Skill library page](../features/15-skill-lifecycle.md#the-skill-library-page-v1760) |
 | Tools & permissions → Tools that need a checkpoint (always wait for approval, treat as irreversible, let the judge decide first, needs a task grant) | `[capabilities] approval_required_tools`, `irreversible_tools`, `maybe_irreversible_tools`, `scoped_tools` |
 | Tools & permissions → Parallel branches | `[fork] enabled` |
 | Tools & permissions → Outgoing reply protection | `[guardrails] enabled`, `block_secrets`, `block_injection_echo`, `redact_pii`, `deny_phrases` |
@@ -96,14 +96,14 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 | Brain & engine → Slim startup context | `[runtime] minimal_context` |
 | Brain & engine → One employee, four roles | `[team] enabled`, `[team.roles.<role>]` |
 | Automation → Night-time tidy-up | `[night_engine] enabled` |
-| Integrations → Own channels (unreleased) | `[channels.telegram] bot_token_enc`, `[channels.googlechat] project_number` / `service_account_json_enc` through `agents.channels.*` (admin binds; the owner sees status; see [Own channels](per-employee-channels.md)) |
+| Integrations → Own channels (v1.76.0) | `[channels.telegram] bot_token_enc`, `[channels.googlechat] project_number` / `service_account_json_enc` through `agents.channels.*` (admin binds; the owner sees status; see [Own channels](per-employee-channels.md)) |
 | Channels & integrations → Callable by outside contacts (v1.76) | `[channels] public_trigger` (admin-only; see [Calling AI staff with `@`](../features/62-calling-ai-staff.md)) |
 | Automation → Memory → decision continuity, keep decisions for (days) | `[memory] decision_continuity`, `decision_ttl_days` (1 to 3650) |
-| Advanced → Model Extras → Advanced key/value | any `[section] key`, each row typed (string, integer, float, boolean, string array); the result is parsed as a full `AgentConfig` before writing and the whole save is refused on failure. The `agent`, `capabilities`, `container`, `permissions`, `channels`, `odoo`, `mcp`, `runtime`, `prompt`, `os_watch` and `budget` sections cannot be edited here (unreleased: `prompt`, `os_watch` and `budget` added; they hold admin-only keys such as `prompt.cli_bare_mode`, which an admin now changes in the Advanced config editor) |
+| Advanced → Model Extras → Advanced key/value | any `[section] key`, each row typed (string, integer, float, boolean, string array); the result is parsed as a full `AgentConfig` before writing and the whole save is refused on failure. The `agent`, `capabilities`, `container`, `permissions`, `channels`, `odoo`, `mcp`, `runtime`, `prompt`, `os_watch` and `budget` sections cannot be edited here (v1.76.0: `prompt`, `os_watch` and `budget` added; they hold admin-only keys such as `prompt.cli_bare_mode`, which an admin now changes in the Advanced config editor) |
 
-**Admin-only fields.** `[agent] reports_to`, `department`, `name`, all of `[capabilities]`, `[container] sandbox_enabled`, `network_access`, `readonly_project`, the five `[permissions]` flags (`can_modify_own_soul`, `can_create_agents`, `can_send_cross_agent`, `can_schedule_tasks`, `can_modify_own_skills`) and (unreleased) `[permissions] allowed_channels`, `[guardrails] enabled` and `block_secrets`, (v1.76) `[channels] public_trigger`, and (unreleased) the per-employee bot tokens `[channels.discord]`, `[channels.telegram]`, `[channels.slack]`, `[channels.googlechat]`, the whole `[odoo]` table, `[runtime] provider` and `fallback`, `[prompt] cli_bare_mode`, the whole `[os_watch]` table, `[model] account_pool`, `role = "main"` (becoming or leaving it), and loosening the budget: raising `monthly_limit_cents` or `daily_cap_cents`, removing a cap (0 = no cap) or turning `hard_stop` off. An employee's Owner may still add or lower a cap and turn `hard_stop` on. A change from a non-admin is refused, and a successful change by an admin writes the audit event `agent_authority_changed`, and a refused attempt writes `agent_authority_refused`. When a model change would switch the runtime automatically, a non-admin gets a message saying so. `org.toml` is updated only when `reports_to` or `department` really changed. `agents.inspect` returns the matching form fields as `admin_only_fields`; the edit page disables them for non-admins.
+**Admin-only fields.** `[agent] reports_to`, `department`, `name`, all of `[capabilities]`, `[container] sandbox_enabled`, `network_access`, `readonly_project`, the five `[permissions]` flags (`can_modify_own_soul`, `can_create_agents`, `can_send_cross_agent`, `can_schedule_tasks`, `can_modify_own_skills`) and (v1.76.0) `[permissions] allowed_channels`, `[guardrails] enabled` and `block_secrets`, (v1.76) `[channels] public_trigger`, and (v1.76.0) the per-employee bot tokens `[channels.discord]`, `[channels.telegram]`, `[channels.slack]`, `[channels.googlechat]`, the whole `[odoo]` table, `[runtime] provider` and `fallback`, `[prompt] cli_bare_mode`, the whole `[os_watch]` table, `[model] account_pool`, `role = "main"` (becoming or leaving it), and loosening the budget: raising `monthly_limit_cents` or `daily_cap_cents`, removing a cap (0 = no cap) or turning `hard_stop` off. An employee's Owner may still add or lower a cap and turn `hard_stop` on. A change from a non-admin is refused, and a successful change by an admin writes the audit event `agent_authority_changed`, and a refused attempt writes `agent_authority_refused`. When a model change would switch the runtime automatically, a non-admin gets a message saying so. `org.toml` is updated only when `reports_to` or `department` really changed. `agents.inspect` returns the matching form fields as `admin_only_fields`; the edit page disables them for non-admins.
 
-**Who may save (unreleased, behaviour change).** `agents.update` re-reads the caller's role and employee binding from the account database on every save, and again right before writing. Removing someone's binding, suspending them or requiring a password change takes effect on their next save without waiting for their session to expire. Every save of `agent.toml` from any path (this page, `/model` in a chat, the Advanced config editor, automatic edits) now keeps comments and key order, keeps a version (see [Profile files](#profile-files-unreleased)) and writes `agent_file_changed`. When the registry cannot be reloaded after a save, the message reads 「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」 (there is no periodic reload).
+**Who may save (v1.76.0, behaviour change).** `agents.update` re-reads the caller's role and employee binding from the account database on every save, and again right before writing. Removing someone's binding, suspending them or requiring a password change takes effect on their next save without waiting for their session to expire. Every save of `agent.toml` from any path (this page, `/model` in a chat, the Advanced config editor, automatic edits) now keeps comments and key order, keeps a version (see [Profile files](#profile-files-v1760)) and writes `agent_file_changed`. When the registry cannot be reloaded after a save, the message reads 「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」 (there is no periodic reload).
 
 **Permission flags are enforced (behaviour change).** `can_create_agents`, `can_send_cross_agent`, `can_modify_own_skills` and `can_schedule_tasks` had no reader before. Since v1.68.0 a flag written as `false` blocks the matching tools at the MCP dispatch gate (`create_agent`; `send_to_agent`, `spawn_agent`; `create_reminder`, `tasks_create` with a `schedule`; `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording`); an absent or wrongly typed flag allows. Older templates often wrote these flags as `false`, so the first boot after the upgrade migrates every employee once: in a `[permissions]` table without the marker `permissions_enforced_since`, each of the four flags that is `false` becomes `true` and `permissions_enforced_since = "1.68.0"` is added; each reset writes the audit event `permission_flags_reset`. A `false` written afterwards on this page or in the Advanced config editor counts as an operator decision. Ephemeral role members (`agents/.ephemeral/`) are not migrated and keep least privilege.
 
@@ -130,7 +130,7 @@ Only people whose role is Manager or Admin see it (sidebar group "Organization")
 
 The data comes from the RPC `users.my_team`, computed with the same rules every call and assignment uses, so everything listed can be reached. It is refused in the Personal edition and for the Employee role.
 
-## Employee page → Data sources (unreleased)
+## Employee page → Data sources (v1.76.0)
 
 Visible to everyone bound to the employee (Viewer and up); adding and removing files needs the employee's Owner binding or Admin, re-read from the account database on every call, and on top of that the editor or owner role on the employee's own collection.
 
@@ -143,7 +143,7 @@ Visible to everyone bound to the employee (Viewer and up); adding and removing f
 
 Archiving or deleting the employee archives its own collection (only people owners keep access); restoring the employee puts back the grants archiving removed. The first upload also adds the collection to an existing `[knowledge] collections` list; later uploads leave that list alone. Details: [Document knowledge base](../features/63-knowledge-base.md#using-the-dashboard).
 
-## Employee page → Connections (unreleased)
+## Employee page → Connections (v1.76.0)
 
 Everyone bound to the employee (Viewer and up) sees which Google account it uses and whether that works right now (`agents.google_identity_get`). Changing it and **Test connection** are Admin only.
 
@@ -153,9 +153,9 @@ Everyone bound to the employee (Viewer and up) sees which Google account it uses
 | "If the colleague's account cannot be used, use the company's shared account" | `[google] fallback = "home"` (unticked: the key is left out) | Covers only: no key imported, colleague suspended or offboarded, Google rejected or unreachable. A refused requester, a setting error or a protection problem never falls back. |
 | Test connection | nothing | Mints for the colleague (full list, then per service), checks Gmail reports the same address. Sends nothing. |
 
-`[google] requesters` (`bound_people` default, `owner_only`, `anyone`) has no control on this page yet; set it with `agents.google_identity_set` (`anyone` needs `confirm_anyone: true`) or the Advanced config editor (Admin). A non-admin Owner editing `agent.toml` may only narrow `[google]` (switch to `none`, drop `fallback`, tighten `requesters`). Details: [Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-unreleased).
+`[google] requesters` (`bound_people` default, `owner_only`, `anyone`) has no control on this page yet; set it with `agents.google_identity_set` (`anyone` needs `confirm_anyone: true`) or the Advanced config editor (Admin). A non-admin Owner editing `agent.toml` may only narrow `[google]` (switch to `none`, drop `fallback`, tighten `requesters`). Details: [Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
 
-## Integrations → Google → Company delegation (unreleased)
+## Integrations → Google → Company delegation (v1.76.0)
 
 Admin only, both editions.
 
@@ -183,7 +183,7 @@ Admin only (new in 1.76.0). Shows whether the document knowledge base searches b
 
 Details: [Document knowledge base](../features/63-knowledge-base.md#embedding-models).
 
-## Profile files (unreleased)
+## Profile files (v1.76.0)
 
 RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`; also used by the boundaries editor on the employee edit page (`contract.update`). Files: persona (`SOUL.md`), self-introduction (`IDENTITY.md`), work rules (`INSTRUCTIONS.md`), boundaries (`CONTRACT.toml`), basic settings (`agent.toml`, read-only and masked here; edit it on the edit page or, as an admin, in the Advanced config editor), and the employee's own skills (existing `.md` files under `SKILLS/`, file key `skill:<path>`, for example `skill:quote/SKILL.md`). Skills can only be edited here, not created or deleted (use the custom skill flow to add one), and scripts next to a skill are never touched; every path level must be a single name without `..` or invisible characters (zero-width, direction controls), at most four levels deep; symlinks and hard links are refused, and a save checks under the file lock that no folder was swapped before it writes (the lock file lives outside the employee's folder). Other writers of skill files (custom skills, the employee's own skill tools, skill graduation) do not go through here, keep no versions and do not take this lock. Limits: 64 KB per Markdown or skill file, 32 KB for `CONTRACT.toml`, at most 100 `must_not` and 100 `must_always` entries of up to 500 characters.
 
@@ -199,7 +199,7 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
 
-## Assign panel → When, and Goals → Assigned by me → Scheduled (unreleased)
+## Assign panel → When, and Goals → Assigned by me → Scheduled (v1.76.0)
 
 | Control | Writes | Effect |
 |---|---|---|
@@ -209,7 +209,7 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 
 Caps live in `config.toml` (no control yet; Advanced config editor): `[goal_defaults] assign_schedule_max_active` (default 20 per person, 0..200) and `assign_schedule_min_interval_minutes` (non-Admins, default 60, can only be raised). Existing schedules also recheck the interval at every run and resume. Pause/remove prevents a run whose task has not yet been stored; stop an already stored task separately. Details: [Scheduling an assignment](../features/67-assigning-tasks.md#scheduling-an-assignment).
 
-## System → Updates (unreleased)
+## System → Updates (v1.76.2)
 
 The page shows one update order for the whole install. When the desktop app is attached to a gateway it does not own (a launchd/systemd/Enterprise gateway, or a remote one), the page lists both components: the gateway with its current and next version, and the desktop app with its current and downloaded version. One button updates the gateway first, waits for it to come back, then updates the app. The app is only updated up to the gateway's version; a newer app download waits and the page says so. An app that runs its own gateway sidecar updates both together, as before.
 
@@ -241,7 +241,7 @@ Location: Settings → Advanced → Advanced config editor. Admins only; RPCs `c
 - **Audit:** every write records `config_raw_edited`, at Warning level when it touches `[delegation]`, `[acp]`, or an employee's `[agent]`, `[capabilities]`, `sandbox_enabled`, `network_access` or `can_modify_own_soul`.
 - **Restart list:** after saving, the editor lists what needs a restart. In `config.toml`, `[gateway]`, `[server]`, `[telemetry]`, `[logging]`, `[channels]`, `[wiki]`, `[relay]` and `[decision]` are read only at boot; `general.name`, `rotation.health_check_interval_seconds`, `goal_loop.resume_on_restart` and `knowledge.max_source_bytes` (it sizes the upload route's body limit) also need a restart; the log level, live data feeds and redaction are not listed when they could be applied live. Saving `inference.toml` always resets the inference engine immediately. For an employee file only `heartbeat.max_concurrent_runs` needs a restart.
 
-## Maintenance SSH dashboard (unreleased)
+## Maintenance SSH dashboard (v1.75.0)
 
 In Device → Maintenance mode, an Admin selects the duration and capabilities,
 re-enters their password and types `MAINTENANCE`. Selecting SSH also requires
@@ -267,7 +267,7 @@ for recent window fingerprints and connection events. The UI polls every
 The complete OS image and real SSH/notification flow are not yet verified;
 this is an unreleased interface, not acceptance of the assembled device.
 
-## Security → Credential protection (unreleased)
+## Security → Credential protection (v1.76.0)
 
 The **Credential protection** card on the Security page (Admin, both editions) shows one
 line: "Credential protection: Files" or "Credential protection: System keychain (…)", followed by what that
@@ -294,6 +294,6 @@ says.
   working.
 
 `duduclaw credentials status` (add `--json` for scripts) prints the same
-state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).
+state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
 
 Direct-binding history privacy: `[people] bound_history_privacy = true` is enabled by default (missing/invalid values stay restricted). Admins may explicitly set `false` in the advanced editor for migration; this restores old broad Viewer/Operator history. Owner/Admin and chat/call permissions are unchanged. See feature 68 for search/export/attachment scope and NER limits.

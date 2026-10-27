@@ -160,7 +160,7 @@ gateway, not by the desktop.
   stops dropbear, ends every session process and removes the port. No
   account on the images can log in over SSH yet (root is locked and
   dropbear refuses root logins), so for now the switch only controls the
-  port. Unreleased platform code (CHANGELOG `[Unreleased]`) adds the
+  port. Platform v1.75.0 adds the
   helper side of a dedicated maintenance login: an account
   `duduclaw-maint` (uid 4800) and one public key per window, which the
   helper checks, installs and removes when the window closes, with its
@@ -168,7 +168,7 @@ gateway, not by the desktop.
   [Security defense](05-security-defense.md)). It does nothing until an
   OS image ships the account; on such an image the helper refuses the
   old port-only switch.
-  The unreleased gateway side asks for the technician's public key in the
+  The v1.75.0 gateway side asks for the technician's public key in the
   same request as the typed confirmation and the password re-entry
   (five wrong passwords in a row lock opening for 15 minutes), records the
   window before asking the helper, and never falls back to the port-only
@@ -301,7 +301,7 @@ None of this blocks flashing and experimenting with a release today; it's
 what's left before the appliance is something you'd hand to someone who
 isn't comfortable debugging a boot failure themselves.
 
-## Maintenance SSH dashboard (unreleased)
+## Maintenance SSH dashboard (v1.75.0)
 
 In Device → Maintenance mode, an Admin selects the duration and capabilities,
 re-enters their password and types `MAINTENANCE`. Selecting SSH also requires

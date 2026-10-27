@@ -1,6 +1,6 @@
 # Save browser login state
 
-Unreleased. This feature applies to the container browser on Unix hosts.
+Added in v1.76.0. This feature applies to the container browser on Unix hosts.
 It does not use your regular browser profile.
 
 An administrator enables **Allow browser login persistence** under Settings →

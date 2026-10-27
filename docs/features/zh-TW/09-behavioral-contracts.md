@@ -129,7 +129,7 @@ BLOCK   Is the caller an agent?
 
 agent 改不了任何一份 `CONTRACT.toml`，包括自己的。別的 agent 的契約歸跨 agent 規則管；自己的契約由另一條規則（`BlockedOwnContractWrite`）擋下，這條規則沒有開放旗標，和 `SOUL.md` 的 `can_modify_own_soul` 不同。規則涵蓋 Write、Edit、MultiEdit，另有一條 Bash 啟發式規則：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/CONTRACT.toml`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。擋下時的訊息會請 agent 去找操作者。Bash 規則只是減速帶：把檔名藏起來的指令（變數、編碼字串、腳本）可以繞過。真正的隔離是不給 agent Bash。
 
-操作者在儀表板的 AI 員工編輯頁修改契約，背後呼叫 `contract.get`（綁定這位員工的人）／`contract.update`（員工的負責人或管理員；放寬界線需要管理員，每次存檔都跑[儀表板設定](../../guides/zh-TW/dashboard-settings.md#設定檔未發布)說明的嚴格檢查）RPC，這條路徑不經過 hook。live fork（`fork_run`）的分支可以讀契約，但把分支採用回 agent 目錄時，絕不會用分支的版本覆蓋上層的 `CONTRACT.toml`（`SOUL.md`、`agent.toml`、`.mcp.json`、`.claude/` 等其他 agent 結構檔也一樣）。
+操作者在儀表板的 AI 員工編輯頁修改契約，背後呼叫 `contract.get`（綁定這位員工的人）／`contract.update`（員工的負責人或管理員；放寬界線需要管理員，每次存檔都跑[儀表板設定](../../guides/zh-TW/dashboard-settings.md#設定檔v1760)說明的嚴格檢查）RPC，這條路徑不經過 hook。live fork（`fork_run`）的分支可以讀契約，但把分支採用回 agent 目錄時，絕不會用分支的版本覆蓋上層的 `CONTRACT.toml`（`SOUL.md`、`agent.toml`、`.mcp.json`、`.claude/` 等其他 agent 結構檔也一樣）。
 
 ---
 

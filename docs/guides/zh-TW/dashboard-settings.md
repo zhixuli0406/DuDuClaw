@@ -1,6 +1,6 @@
 # 儀表板設定對照（v1.68.0）
 
-尚未發版的企業版設定（成員管理 → 組織設定）：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。開啟前請先告知職員。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
+企業版設定（v1.76.0，成員管理 → 組織設定）：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。開啟前請先告知職員。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
 
 這份文件列出 v1.68.0 起可以在儀表板設定的項目：在哪一頁、寫到哪個設定鍵、存檔後是否要重啟 gateway。最後一節說明「設定檔進階編輯」，用來修改沒有專屬控制項的鍵。
 
@@ -86,7 +86,7 @@
 | 分頁 → 區塊 | 設定鍵 |
 |---|---|
 | 預算 → 每日上限 | `[budget] daily_cap_cents` |
-| 技能 → 這位員工的技能（尚未發版） | 不是設定鍵：開關存在 `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`），移除的技能搬到 `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）；需員工負責人或管理員。見[技能庫頁面](../../features/zh-TW/15-skill-lifecycle.md) |
+| 技能 → 這位員工的技能（v1.76.0） | 不是設定鍵：開關存在 `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`），移除的技能搬到 `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）；需員工負責人或管理員。見[技能庫頁面](../../features/zh-TW/15-skill-lifecycle.md) |
 | 工具與權限 → 需要把關的工具（一律等人核可、視為不可逆、先由判官判斷、需任務授權） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | 工具與權限 → 平行分支 | `[fork] enabled` |
 | 工具與權限 → 出站內容防護 | `[guardrails] enabled`、`block_secrets`、`block_injection_echo`、`redact_pii`、`deny_phrases` |
@@ -96,14 +96,14 @@
 | 腦袋與引擎 → 精簡啟動內容 | `[runtime] minimal_context` |
 | 腦袋與引擎 → 一員工四角色 | `[team] enabled`、`[team.roles.<角色>]` |
 | 自動化 → 夜間整理 | `[night_engine] enabled` |
-| 整合 → 專屬通道（未發布） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`，經 `agents.channels.*` 設定（管理員設定，負責人看得到狀態；見[專屬通道](per-employee-channels.md)） |
+| 整合 → 專屬通道（v1.76.0） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`，經 `agents.channels.*` 設定（管理員設定，負責人看得到狀態；見[專屬通道](per-employee-channels.md)） |
 | 通道與整合 → 讓外部聯絡人用 @ 呼叫（v1.76） | `[channels] public_trigger`（只限管理員；見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)） |
 | 自動化 → 記憶 → 決策延續、決定保留天數 | `[memory] decision_continuity`、`decision_ttl_days`（1 到 3650） |
-| 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` 區段不能在這裡改（未發布：新增 `prompt`、`os_watch`、`budget`，裡面有只限管理員的設定，例如 `prompt.cli_bare_mode`，管理員改用設定檔進階編輯修改） |
+| 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` 區段不能在這裡改（v1.76.0：新增 `prompt`、`os_watch`、`budget`，裡面有只限管理員的設定，例如 `prompt.cli_bare_mode`，管理員改用設定檔進階編輯修改） |
 
-**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（未發布）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（未發布）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
+**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（v1.76.0）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（v1.76.0）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
 
-**誰能存檔（未發布，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔未發布)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
+**誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
 **權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
@@ -130,7 +130,7 @@
 
 資料來自 RPC `users.my_team`，和每一次呼叫、交辦用的是同一套判斷，所以列出來的都叫得到。個人版與一般員工呼叫這個 RPC 會被拒絕。
 
-## 員工頁 → 資料來源（未發布）
+## 員工頁 → 資料來源（v1.76.0）
 
 綁定這位員工的人（檢視者以上）都看得到；新增與移除檔案需要這位員工的擁有者綁定或管理員身分（每次呼叫都重新從帳號資料庫讀取），而且還要是員工專用集合的編輯者或擁有者。
 
@@ -143,7 +143,7 @@
 
 封存或刪除員工時，專用集合一起封存（只有身為擁有者的同事保留存取）；恢復員工時，放回封存時移除的授權。第一次上傳也會把集合加進既有的 `[knowledge] collections` 清單，之後的上傳不再動這份清單。細節見[文件知識庫](../../features/zh-TW/63-knowledge-base.md#在儀表板操作)。
 
-## 員工頁 → 連線（未發布）
+## 員工頁 → 連線（v1.76.0）
 
 綁定這位員工的人（檢視者以上）都看得到它用哪個 Google 帳號、現在能不能用（`agents.google_identity_get`）。變更與「測試連線」只有管理員能做。
 
@@ -153,9 +153,9 @@
 | 「萬一這位同事的帳號用不了，改用公司共用帳號」 | `[google] fallback = "home"`（不勾就不寫這個欄位） | 只涵蓋：還沒匯入金鑰、同事停權或離職、Google 拒絕或連不上。發問者沒有權限、設定錯誤、憑證保護的問題一律不改用。 |
 | 測試連線 | 不寫入 | 替同事取權杖（先完整清單，再逐一服務），確認 Gmail 回報同一個信箱。不寄任何東西。 |
 
-`[google] requesters`（預設 `bound_people`，另有 `owner_only`、`anyone`）這一頁還沒有控制項，用 `agents.google_identity_set`（`anyone` 要加 `confirm_anyone: true`）或設定檔進階編輯（管理員）設定。非管理員的擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`）。細節見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+`[google] requesters`（預設 `bound_people`，另有 `owner_only`、`anyone`）這一頁還沒有控制項，用 `agents.google_identity_set`（`anyone` 要加 `confirm_anyone: true`）或設定檔進階編輯（管理員）設定。非管理員的擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`）。細節見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
-## 整合 → Google → 公司授權代表（未發布）
+## 整合 → Google → 公司授權代表（v1.76.0）
 
 只有管理員，兩個版本都有。
 
@@ -183,7 +183,7 @@
 
 詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md#向量模型)。
 
-## 設定檔（未發布）
+## 設定檔（v1.76.0）
 
 RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯），以及這位員工自己的技能（`SKILLS/` 底下已經存在的 `.md`，檔案代號 `skill:<路徑>`，例如 `skill:quote/SKILL.md`）。技能在這裡只能修改，不能新增或刪除（新增請用自建技能流程），旁邊的程式檔不會被碰到；路徑每一層都必須是單一名稱、不能有 `..`、不能有看不見的字元（零寬、方向控制等）、最多四層；捷徑（symlink）與硬連結一律拒絕，存檔時在檔案鎖內確認資料夾沒有被換掉才寫入（鎖檔放在員工資料夾外）。其他寫技能檔的途徑（自建技能、員工自己的技能工具、技能畢業）不經過這裡，沒有版本紀錄，也不拿同一把鎖。上限：Markdown 與技能每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
 
@@ -199,7 +199,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
-## 排程交辦（尚未發版）
+## 排程交辦（v1.76.0）
 
 交辦面板的「什麼時候做」可選指定時間一次、每天、平日、每週或每小時，管理員另有自訂 cron。時間以瀏覽器時區解讀；設定當下不建立任務，時間到才重新確認建立者權限並交辦。
 
@@ -207,7 +207,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 設定檔 `[goal_defaults] assign_schedule_max_active` 預設每人 20 個（0–200）；`assign_schedule_min_interval_minutes` 預設非管理員最短 60 分鐘，只能調高，既有排程下次執行也會檢查。詳見[排程交辦](../../features/zh-TW/67-assigning-tasks.md)。
 
-## 系統 → 系統更新（未發布）
+## 系統 → 系統更新（v1.76.2）
 
 這一頁照同一個順序更新整套安裝。桌面 App 連到不是自己啟動的 gateway 時（launchd／systemd／企業版 gateway，或遠端 gateway），頁面會列出兩個元件：gateway 的目前版本與要更新到的版本，桌面 App 的目前版本與已下載版本。一個按鈕先更新 gateway，等它重新上線，再更新 App。App 只會更新到 gateway 的版本；App 下載到較新的版本時會先等著，頁面會說明原因。App 自己帶 gateway sidecar 時，兩者照舊一起更新。
 
@@ -239,7 +239,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **稽核：**每次寫入記 `config_raw_edited`。改到 `[delegation]`、`[acp]`，或員工的 `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時等級為 Warning。
 - **重啟清單：**存檔後列出需要重啟的部分。`config.toml` 的 `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` 只在開機時讀；`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（上傳路由的大小上限依它決定）也要重啟；日誌等級、常駐感知、去識別化能立即套用時就不列。`inference.toml` 存檔後一律立即重設推理引擎。員工檔案只有 `heartbeat.max_concurrent_runs` 需要重啟。
 
-## 維修 SSH 儀表板（尚未發版）
+## 維修 SSH 儀表板（v1.75.0）
 
 到「裝置 → 維修模式」，由管理員選期限與功能、重新輸入密碼，
 再輸入 `MAINTENANCE`。勾選 SSH 還需要貼上一把技術人員的 OpenSSH
@@ -261,7 +261,7 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 自行關閉可能要等下次讀取才顯示。完整 OS 映像、真實 SSH 與推播
 流程尚未驗證；這是尚未發版的介面，不代表整機已驗收。
 
-## 安全 → 憑證保護（未發布）
+## 安全 → 憑證保護（v1.76.0）
 
 「安全」頁的「憑證保護」卡片（管理員，兩版都有）顯示一行：「憑證保護：檔案」
 或「憑證保護：系統金鑰圈（…）」，下面說明代表什麼。它只管讓 AI 員工代表特定人
@@ -281,6 +281,6 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
   確認文字）刪除金鑰，已保存的個人憑證作廢。
 
 終端機用 `duduclaw credentials status`（腳本可加 `--json`）看同樣的狀態。細節見
-[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)。
+[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)。
 
 直接綁定歷史隱私：`[people] bound_history_privacy = true` 預設開啟，缺值或格式錯誤也維持限制。管理員可在進階編輯器明確設 `false` 過渡，恢復先前 Viewer／Operator 的廣泛歷史讀取。Owner／Admin 及聊天／呼叫權限不變；搜尋、匯出、附件與 NER 限制見功能 68。

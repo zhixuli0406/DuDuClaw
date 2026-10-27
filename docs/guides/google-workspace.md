@@ -114,9 +114,9 @@ fewest tools. `google_status` names the source actually in effect.
 The two credential-free paths are documented in
 [google-no-oauth-client.md](google-no-oauth-client.md). To give each AI
 employee its own colleague's account, see
-[Per-employee Google accounts](#per-employee-google-accounts-company-delegation-unreleased).
+[Per-employee Google accounts](#per-employee-google-accounts-company-delegation-v1760).
 
-## Per-employee Google accounts (company delegation, unreleased)
+## Per-employee Google accounts (company delegation, v1.76.0)
 
 By default every AI employee uses the one Google account set up below (the
 company's shared account). A Google Workspace customer can instead let each
@@ -131,7 +131,7 @@ delegation serves all of them; each employee names the colleague it acts as.
   id (Admin console → Security → Access and data control → API controls →
   Manage Domain Wide Delegation) for the full scope list the dashboard shows.
 - Credential protection in the system keychain (Security page, see
-  [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased)).
+  [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760)).
   The service-account key is sealed with that protection key, so it is never
   a file an AI employee can read. macOS and Windows qualify. On Linux and in
   Docker there is no supported keychain yet, and acting as a colleague is
@@ -191,7 +191,7 @@ from that employee and refuses calls to them. A value that cannot be read
 (a typo, an unknown key) refuses Google for that employee; it never turns
 into the shared account. Enterprise employees may use `owner` or `user:<id>`
 with an active direct Owner and that person's explicit consent; see
-[Personal Google connections (unreleased)](google-personal-connections.md).
+[Personal Google connections (v1.76.0)](google-personal-connections.md).
 
 ### Who can use the account through the employee
 
@@ -244,7 +244,7 @@ setting error and a protection problem never fall back.
   identity writes `agent.google_identity_set` to the account audit log and
   `agent_google_identity_set` to `security_audit.jsonl`.
 
-### Dedicated employee API keys and Google MCP mounts (unreleased)
+### Dedicated employee API keys and Google MCP mounts (v1.76.0)
 
 An authenticated employee-specific API key with explicit `google:read` or
 `google:write` may use the corresponding tools in the closed 19-tool Google
@@ -290,7 +290,7 @@ Dedicated gateway execution makes one attempt for non-GET/HEAD REST requests: tr
   only create drafts, but an employee with an unrestricted shell can call
   Google directly with a token it was issued for its own colleague.
 - An employee with a shell runs as the same OS user as the gateway; see the
-  keychain limits in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).
+  keychain limits in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
 - Not yet verified against a real Workspace tenant: the exact Admin console
   flow, Google's real error strings, a Gmail-disabled organizational unit,
   and whether Google's own remote MCP endpoints accept delegated tokens.
