@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.76.1] - 2026-10-27 — Default port compatibility and updater security hotfix
+
 ### Security
 
 - Dashboard 內嵌資產改用未壓縮的 `rust-embed` 路徑，移除含有 `RUSTSEC-2026-0391`、`RUSTSEC-2026-0398`、`RUSTSEC-2026-0403`、`RUSTSEC-2026-0410` 的 `include-flate`／`zstd` 相依鏈。

@@ -1,0 +1,42 @@
+{
+  "delta_sha256": "0b1f4ef2ae9f1b1728ea47555c2c12735764945741f061a87a9c2ea50ef300aa",
+  "expires_at": "2026-11-10T01:10:35.983271+00:00",
+  "issued_at": "2026-10-27T01:10:35.983271+00:00",
+  "items": {
+    "company_site": {
+      "artifact_sha256": "656cc08d5312bebc39b98d9c0f1000d6e07a5c5636abd76efd64c52020d7cfe2",
+      "evidence_sha256": "ebc75cfcb9bea0974c62e8613222b6a5231e23bc59b3a5049713be0612cfa3ec",
+      "reason_sha256": "fa540864f15f118fd9412266e257712cb160a1471fda36c579b07f340e2e49f6",
+      "status": "unchanged"
+    },
+    "it_manual": {
+      "artifact_sha256": "6aad33a625a1be9b3b419a1b583d758228ea3b759e3851f79e1c252ee52c7f18",
+      "evidence_sha256": "c85d3f88511ef711918591d1b8686969e15b131f7977a88a988554d092373743",
+      "reason_sha256": null,
+      "status": "updated"
+    },
+    "os_site": {
+      "artifact_sha256": "337a3648557ca7ae386844cadde0d16ee48a9ab5f236ef5092f43cf2c03327cc",
+      "evidence_sha256": "2f36213fc3f72cc000e20f7d9e51fa7481dc487ba93353245186ddfa7b3f5b28",
+      "reason_sha256": null,
+      "status": "updated"
+    },
+    "product_site": {
+      "artifact_sha256": "2dc4ed30e39ff596b067b215700b714587942da67392a8fbfac7f14b19d54660",
+      "evidence_sha256": "30447361bb4e250b8670813bd77419854cf93468aab73eaa1d239bcb035b7cfa",
+      "reason_sha256": null,
+      "status": "updated"
+    },
+    "user_manual": {
+      "artifact_sha256": "9430cbda89c12483322c40b0ad9ad914df9dbe2c8acd1a61be5cb3becfa200d3",
+      "evidence_sha256": "4a51e428cde0a8d5fd9e8ff28ce913792052226abdf0aaac3707ab09f40a94b9",
+      "reason_sha256": null,
+      "status": "updated"
+    }
+  },
+  "previous_tag": "v1.76.0",
+  "private_review_sha256": "053d491b2a1af685d881f54658404747ef9467efd185a0b6f44f959716aca358",
+  "schema": 1,
+  "source_commit": "0f45c4a3020141b19200837f352632e2f9d6c7e8",
+  "version": "1.76.1"
+}
