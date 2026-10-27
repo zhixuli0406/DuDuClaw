@@ -542,7 +542,6 @@ mod tests {
     use std::time::Duration;
 
     use tempfile::TempDir;
-    use tokio::time::sleep;
 
     use super::*;
     use crate::evolution_events::logger::EvolutionEventLogger;
@@ -577,7 +576,7 @@ mod tests {
         let emitter = make_emitter(tmp.path());
 
         emitter.emit_skill_activate("agent-1", "python-patterns", "prediction_error_diagnosis");
-        sleep(Duration::from_millis(50)).await; // let spawn finish
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 1);
@@ -604,7 +603,7 @@ mod tests {
             "effectiveness_evaluation",
             serde_json::json!({"conversations": 20}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 1);
@@ -625,7 +624,7 @@ mod tests {
             "sandbox_trial_discard",
             serde_json::json!({"reason": "no lift after 30 conversations"}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines[0]["trigger_signal"], "sandbox_trial_discard");
@@ -646,7 +645,7 @@ mod tests {
                 "new_skill": "new-skill",
             }),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 1);
@@ -671,7 +670,7 @@ mod tests {
             true,
             serde_json::json!({"risk_level": "Clean", "findings": 0}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         let ev = &lines[0];
@@ -692,7 +691,7 @@ mod tests {
             false,
             serde_json::json!({"risk_level": "High", "findings": 3}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines[0]["outcome"], "failure");
@@ -711,7 +710,7 @@ mod tests {
             "gvu_trigger",
             serde_json::json!({"gvu_outcome": "applied", "version_id": "v42"}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         let ev = &lines[0];
@@ -732,7 +731,7 @@ mod tests {
             "gvu_trigger",
             serde_json::json!({"gvu_outcome": "abandoned"}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines[0]["outcome"], "failure");
@@ -750,7 +749,7 @@ mod tests {
             "agent-8",
             serde_json::json!({"suppressed_signal": null, "trigger_count": null, "window_seconds": null}),
         );
-        sleep(Duration::from_millis(50)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         let ev = &lines[0];
@@ -777,7 +776,7 @@ mod tests {
         emitter.emit_security_scan("a", "s3", true, serde_json::json!({}));
         emitter.emit_gvu_generation("a", Outcome::Success, "gvu_trigger", serde_json::json!({}));
         emitter.emit_signal_suppressed_stub("a", serde_json::json!({"suppressed_signal": null, "trigger_count": null, "window_seconds": null}));
-        sleep(Duration::from_millis(100)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 5, "all 5 events must be persisted");
@@ -810,7 +809,7 @@ mod tests {
         emitter.emit_signal_suppressed_stub("x", serde_json::json!({"suppressed_signal": null, "trigger_count": null, "window_seconds": null}));
 
         // All returned before this point — no blocking.
-        sleep(Duration::from_millis(100)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 5);
     }
@@ -837,7 +836,7 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        sleep(Duration::from_millis(150)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(
@@ -885,7 +884,7 @@ mod tests {
                 _ => {}
             }
         }
-        sleep(Duration::from_millis(100)).await;
+        emitter.wait_pending(Duration::from_secs(5)).await;
 
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 6);
