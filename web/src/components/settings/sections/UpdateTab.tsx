@@ -11,7 +11,17 @@ import {
   SettingsCard,
 } from '@/components/mds';
 import { RowSwitch } from '@/pages/agent-form/form-rows';
-import { stagedDesktopUpdateVersion, restartAndUpdateDesktop } from '@/lib/desktop-update';
+import {
+  desktopUpdateInfo,
+  restartAndUpdateDesktop,
+  type DesktopUpdateInfo,
+} from '@/lib/desktop-update';
+import {
+  compareVersions,
+  planUpdate,
+  rememberDesktopResume,
+  takeDesktopResume,
+} from '@/lib/update-plan';
 import { RefreshCw, Download, CheckCircle, XCircle } from 'lucide-react';
 
 /**
@@ -85,18 +95,21 @@ export function UpdateTab() {
   // [H1] useRef guard prevents double-click race — declared before handleCheck
   const installingRef = useRef(false);
 
-  // Desktop shell only: version of the shell update already downloaded and
-  // waiting for a restart. The update-ready notification tells the user to
-  // click「重啟並更新」— render that button here, where the notification sends
-  // them, not only in the tray menu they cannot find (2026-08-05 report).
-  // Null outside the shell / nothing staged, so browsers see no change.
-  const [stagedVersion, setStagedVersion] = useState<string | null>(null);
+  // Desktop shell only: the shell's own version, the shell update already
+  // downloaded and waiting for a restart, and whether the shell owns its
+  // gateway. The update-ready notification sends users here, so the
+  // 「重啟並更新」affordance lives on this page (2026-08-05 report). Attached
+  // to an external gateway, the app update is ordered after the gateway's
+  // (2026-10-27 report). Null outside the shell, so browsers see no change.
+  const [desktop, setDesktop] = useState<DesktopUpdateInfo | null>(null);
+  const stagedVersion = desktop?.stagedVersion ?? null;
+  const desktopExternal = desktop?.gateway === 'external';
   const [restarting, setRestarting] = useState(false);
   useEffect(() => {
     let cancelled = false;
     const refresh = () =>
-      stagedDesktopUpdateVersion().then((v) => {
-        if (!cancelled) setStagedVersion(v);
+      desktopUpdateInfo().then((info) => {
+        if (!cancelled) setDesktop(info);
       });
     void refresh();
     // The background download can finish while the tab is open.
@@ -119,6 +132,31 @@ export function UpdateTab() {
       );
     }
   }, [intl]);
+
+  // Second half of a combined update: the page reloaded once the gateway came
+  // back. Update the app only if the gateway really reached its version.
+  useEffect(() => {
+    const resume = takeDesktopResume();
+    if (!resume) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [{ version }, info] = await Promise.all([api.system.version(), desktopUpdateInfo()]);
+        if (cancelled) return;
+        const staged = info?.stagedVersion;
+        if (staged && compareVersions(staged, version) <= 0) {
+          await handleRestartAndUpdate();
+        } else if (staged) {
+          toast.info(intl.formatMessage({ id: 'settings.update.desktopHeld' }, { version: staged }));
+        }
+      } catch (err) {
+        toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(err) }));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [handleRestartAndUpdate, intl]);
 
   // The gateway retries a failed download twice (5s / 15s back-off). Without
   // this the button would sit on a silent "安裝中…" for up to 20 extra seconds
@@ -154,25 +192,36 @@ export function UpdateTab() {
   }, [intl]);
 
   // [M2] applyUpdate no longer sends URL — server uses cached URL from check_update
+  // One button, one order: the gateway step first (install, or restart onto
+  // a binary already on disk), then the desktop app up to the gateway's
+  // version. The gateway step reloads the page, so the app step resumes
+  // after the reload (see the resume effect above).
   const handleInstall = async () => {
-    // A control-plane provider resolves its asset server-side at install time,
-    // so it legitimately reports no download_url — the gateway holds the cached
-    // descriptor either way (`system.apply_update` never takes a URL from us).
-    const installable =
-      !!updateInfo?.download_url || updateInfo?.update_channel === 'control_plane';
-    if (installingRef.current || !installable) return;
+    if (installingRef.current || !plan) return;
     installingRef.current = true;
     setInstalling(true);
     setError('');
     setRetry(null);
     try {
-      const result = await api.system.applyUpdate();
+      if (plan.gatewayStep === 'none') {
+        if (plan.desktopStep === 'install') await handleRestartAndUpdate();
+        return;
+      }
+      if (plan.desktopStep === 'install' && stagedVersion) rememberDesktopResume(stagedVersion);
+      const result =
+        plan.gatewayStep === 'restart'
+          ? await api.system.restartPendingUpdate()
+          : await api.system.applyUpdate();
       if (result.success) {
         setInstalled(true);
+        // Only a restart reloads this page and resumes the app step.
+        if (!result.needs_restart) takeDesktopResume();
       } else {
-        setError(result.message);
+        takeDesktopResume();
+        setError('message' in result ? result.message : '');
       }
     } catch (err) {
+      takeDesktopResume();
       const msg = err instanceof Error ? err.message : '';
       setError(`${intl.formatMessage({ id: 'settings.update.failed' })}${msg ? `: ${msg}` : ''}`);
     } finally {
@@ -209,6 +258,49 @@ export function UpdateTab() {
     !usesProvider &&
     !isContainerized;
   const isPro = edition !== 'community';
+  // A control-plane provider resolves its asset server-side at install time,
+  // so it legitimately reports no download_url — the gateway holds the cached
+  // descriptor either way (`system.apply_update` never takes a URL from us).
+  const gatewayInstallable =
+    !isHomebrew &&
+    !isDesktop &&
+    !noBinary &&
+    !isProNoChannel &&
+    !isContainerized &&
+    (!!updateInfo?.download_url || usesProvider);
+  const plan = updateInfo
+    ? planUpdate(
+        {
+          currentVersion: updateInfo.current_version,
+          latestVersion: updateInfo.latest_version,
+          available: updateInfo.available,
+          installable: gatewayInstallable,
+          // Restarting is the gateway's own job; containers and the desktop
+          // sidecar restart through their owner instead.
+          restartPendingVersion:
+            isContainerized || isDesktop ? null : (updateInfo.restart_pending_version ?? null),
+        },
+        desktop,
+      )
+    : null;
+  const installLabel = (() => {
+    if (!plan) return '';
+    if (plan.gatewayStep === 'restart') {
+      return intl.formatMessage(
+        { id: 'settings.update.restartGateway' },
+        { version: plan.gatewayVersionAfter },
+      );
+    }
+    if (plan.gatewayStep === 'install' && plan.desktopStep === 'install') {
+      return intl.formatMessage({ id: 'settings.update.installBoth' });
+    }
+    if (plan.gatewayStep === 'none') {
+      return intl.formatMessage({ id: 'settings.update.restartAndUpdate' });
+    }
+    return intl.formatMessage({ id: 'settings.update.install' });
+  })();
+  const showInstall =
+    !!plan && (plan.gatewayStep !== 'none' || (desktopExternal && plan.desktopStep === 'install'));
 
   const handleAutoUpdateToggle = useCallback(async (enabled: boolean) => {
     try {
@@ -240,7 +332,18 @@ export function UpdateTab() {
           the tray「重啟並更新」item. Shown unconditionally (before any manual
           check): the user typically lands here straight from the update-ready
           notification. */}
-      {stagedVersion && (
+      {stagedVersion && desktopExternal && (
+        <div className="flex items-center gap-3 rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
+          <RefreshCw className="h-5 w-5 shrink-0 text-warning" />
+          <span className="min-w-0 flex-1 text-sm text-warning">
+            {intl.formatMessage(
+              { id: 'settings.update.desktopStagedExternal' },
+              { version: stagedVersion },
+            )}
+          </span>
+        </div>
+      )}
+      {stagedVersion && !desktopExternal && (
         <div className="flex flex-wrap items-center gap-3 rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
           <RefreshCw className="h-5 w-5 shrink-0 text-warning" />
           <span className="min-w-0 flex-1 text-sm text-warning">
@@ -349,7 +452,43 @@ export function UpdateTab() {
             </div>
           </div>
 
-          {!updateInfo.available && (
+          {/* Desktop shell attached to an external gateway: show both
+              installs so the app's version never looks like the gateway's. */}
+          {desktopExternal && plan && (
+            <div className="space-y-2 rounded-lg p-4 ring-1 ring-inset ring-surface-border">
+              <h4 className="text-sm font-medium text-foreground">
+                {intl.formatMessage({ id: 'settings.update.components' })}
+              </h4>
+              <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
+                <span className="text-muted-foreground">
+                  {intl.formatMessage({ id: 'settings.update.component.gateway' })}
+                </span>
+                <span className="text-foreground">
+                  v{updateInfo.current_version}
+                  {plan.gatewayStep !== 'none' && ` → v${plan.gatewayVersionAfter}`}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
+                <span className="text-muted-foreground">
+                  {intl.formatMessage({ id: 'settings.update.component.desktop' })}
+                </span>
+                <span className="text-foreground">
+                  {desktop?.currentVersion ? `v${desktop.currentVersion}` : '—'}
+                  {plan.desktopStep === 'install' && stagedVersion && ` → v${stagedVersion}`}
+                </span>
+              </div>
+              {plan.desktopStep === 'hold' && stagedVersion && (
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage(
+                    { id: 'settings.update.desktopHeld' },
+                    { version: stagedVersion },
+                  )}
+                </p>
+              )}
+            </div>
+          )}
+
+          {!updateInfo.available && !showInstall && (
             <div className="flex items-center gap-2 rounded-lg bg-success/10 p-4 ring-1 ring-inset ring-success/20">
               <CheckCircle className="h-5 w-5 text-success" />
               <span className="text-sm text-success">
@@ -420,26 +559,27 @@ export function UpdateTab() {
                 </div>
               )}
 
-              {/* Install button */}
-              {!isHomebrew && !isDesktop && !noBinary && !isProNoChannel && !isContainerized && (
-                <Button
-                  variant="brand"
-                  onClick={handleInstall}
-                  disabled={installing}
-                  className="w-full py-3"
-                >
-                  <Download />
-                  {!installing
-                    ? intl.formatMessage({ id: 'settings.update.install' })
-                    : retry
-                      ? intl.formatMessage(
-                          { id: 'settings.update.retrying' },
-                          { attempt: retry.attempt, total: retry.maxAttempts },
-                        )
-                      : intl.formatMessage({ id: 'settings.update.installing' })}
-                </Button>
-              )}
             </>
+          )}
+
+          {/* One install button for the whole order (gateway, then app). */}
+          {showInstall && (
+            <Button
+              variant="brand"
+              onClick={handleInstall}
+              disabled={installing || restarting}
+              className="w-full py-3"
+            >
+              <Download />
+              {!installing
+                ? installLabel
+                : retry
+                  ? intl.formatMessage(
+                      { id: 'settings.update.retrying' },
+                      { attempt: retry.attempt, total: retry.maxAttempts },
+                    )
+                  : intl.formatMessage({ id: 'settings.update.installing' })}
+            </Button>
           )}
         </div>
       )}

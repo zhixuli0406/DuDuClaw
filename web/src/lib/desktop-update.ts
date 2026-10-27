@@ -44,3 +44,43 @@ export async function restartAndUpdateDesktop(): Promise<void> {
   if (!invoke) throw new Error('not running in the desktop shell');
   await invoke('desktop_restart_and_update');
 }
+
+/** Shell ↔ gateway relation reported by `desktop_update_info`. */
+export type DesktopGatewayRelation = 'bundled' | 'external';
+
+export interface DesktopUpdateInfo {
+  /** Running shell version; empty on an older shell without the command. */
+  currentVersion: string;
+  stagedVersion: string | null;
+  /**
+   * `bundled` = the shell runs its own gateway sidecar; `external` = attached
+   * to a gateway it does not own. Null on an older shell (relation unknown).
+   */
+  gateway: DesktopGatewayRelation | null;
+}
+
+/**
+ * Shell version, staged update and gateway relation, or null outside the
+ * desktop shell. An older shell without `desktop_update_info` falls back to
+ * the staged version alone.
+ */
+export async function desktopUpdateInfo(): Promise<DesktopUpdateInfo | null> {
+  const invoke = tauriInvoke();
+  if (!invoke) return null;
+  try {
+    const raw = (await invoke('desktop_update_info')) as {
+      current_version?: unknown;
+      staged_version?: unknown;
+      gateway?: unknown;
+    } | null;
+    const gateway = raw?.gateway === 'bundled' || raw?.gateway === 'external' ? raw.gateway : null;
+    return {
+      currentVersion: typeof raw?.current_version === 'string' ? raw.current_version : '',
+      stagedVersion:
+        typeof raw?.staged_version === 'string' && raw.staged_version ? raw.staged_version : null,
+      gateway,
+    };
+  } catch {
+    return { currentVersion: '', stagedVersion: await stagedDesktopUpdateVersion(), gateway: null };
+  }
+}

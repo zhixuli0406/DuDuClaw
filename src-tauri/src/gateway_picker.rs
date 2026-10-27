@@ -352,7 +352,7 @@ pub async fn gateway_select(
     // Release the preheated local sidecar when the user goes remote.
     if !is_local_url(&origin) {
         tracing::info!("remote gateway selected — releasing local sidecar");
-        manager.stop();
+        manager.release_for_remote();
     }
 
     // Navigate the main window to the chosen gateway (fresh page load from its

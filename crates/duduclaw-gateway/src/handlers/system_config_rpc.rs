@@ -351,29 +351,8 @@ impl MethodHandler {
                 *self.pending_update.write().await = None;
 
                 if result.needs_restart {
-                    // Broadcast to ALL dashboard tabs (not just the RPC caller)
-                    // so every client can wait out the restart and reload.
-                    if let Some(tx) = self.event_tx.read().await.clone() {
-                        let frame = WsFrame::Event {
-                            event: "system.update_installed".to_string(),
-                            payload: json!({
-                                "version": pending.version,
-                                "needs_restart": true,
-                                "message": result.message,
-                            }),
-                            seq: None,
-                            state_version: None,
-                        };
-                        let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
-                    }
-                    tokio::spawn(async {
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        tracing::info!(
-                            "Shutting down for update — will re-exec new binary after graceful shutdown"
-                        );
-                        duduclaw_core::platform::request_restart_after_shutdown();
-                        duduclaw_core::platform::self_interrupt();
-                    });
+                    self.schedule_update_restart(&pending.version, &result.message)
+                        .await;
                 }
 
                 crate::security_autopilot::audit_and_emit(
@@ -413,5 +392,120 @@ impl MethodHandler {
                 WsFrame::error_response("", &format!("Update failed: {e}"))
             }
         }
+    }
+
+    /// Broadcast `system.update_installed` to ALL dashboard tabs (not just the
+    /// RPC caller) so every client can wait out the restart and reload, then
+    /// shut down gracefully and re-exec the binary now on disk.
+    async fn schedule_update_restart(&self, version: &str, message: &str) {
+        if let Some(tx) = self.event_tx.read().await.clone() {
+            let frame = WsFrame::Event {
+                event: "system.update_installed".to_string(),
+                payload: json!({
+                    "version": version,
+                    "needs_restart": true,
+                    "message": message,
+                }),
+                seq: None,
+                state_version: None,
+            };
+            let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
+        }
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tracing::info!(
+                "Shutting down for update — will re-exec new binary after graceful shutdown"
+            );
+            duduclaw_core::platform::request_restart_after_shutdown();
+            duduclaw_core::platform::self_interrupt();
+        });
+    }
+
+    /// `system.restart_pending_update` — restart onto a binary that is already
+    /// on disk but not yet running (npm / manual swap / an install whose
+    /// restart never happened). Before this the update page could only say
+    /// "restart DuDuClaw (or the desktop app)", and restarting the desktop app
+    /// never restarts a launchd/systemd gateway (2026-10-27 field report).
+    /// Narrow by design: refused unless the on-disk version really differs.
+    pub(crate) async fn handle_system_restart_pending_update(&self) -> WsFrame {
+        let on_disk = crate::updater::on_disk_version().await;
+        if let Some(reason) = restart_pending_refusal(
+            on_disk.as_deref(),
+            crate::updater::current_version(),
+            crate::updater::is_containerized(),
+            crate::updater::detect_install_method(),
+        ) {
+            return WsFrame::error_response("", reason);
+        }
+        if !crate::updater::claim_update_slot_for_restart() {
+            return WsFrame::error_response("", "另一個更新或重新啟動正在進行，請稍後再試");
+        }
+        let version = on_disk.unwrap_or_default();
+        crate::security_autopilot::audit_and_emit(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "system_update",
+                "system",
+                duduclaw_security::audit::Severity::Info,
+                json!({ "action": "restart_pending", "target_version": version }),
+            ),
+        );
+        let message = format!("Restarting onto v{version}");
+        self.schedule_update_restart(&version, &message).await;
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "version": version, "needs_restart": true }),
+        )
+    }
+}
+
+/// Why `system.restart_pending_update` must refuse, or `None` to proceed.
+/// Containers rebuild from an immutable image and the desktop sidecar is
+/// restarted by its app — neither may be re-exec'd from the dashboard.
+pub(crate) fn restart_pending_refusal(
+    on_disk: Option<&str>,
+    current: &str,
+    containerized: bool,
+    method: crate::updater::InstallMethod,
+) -> Option<&'static str> {
+    if containerized {
+        return Some("容器內的 gateway 請以更新 image 的方式重新啟動");
+    }
+    if matches!(method, crate::updater::InstallMethod::Desktop) {
+        return Some("桌面版的背景服務由 DuDuClaw App 管理，請從 App 重新啟動");
+    }
+    match on_disk {
+        Some(v) if v != current => None,
+        Some(_) => Some("磁碟上的版本與執行中相同，不需要重新啟動"),
+        None => Some("無法讀取磁碟上的 gateway 版本，未重新啟動"),
+    }
+}
+
+#[cfg(test)]
+mod restart_pending_tests {
+    use super::restart_pending_refusal;
+    use crate::updater::InstallMethod;
+
+    #[test]
+    fn proceeds_only_when_on_disk_version_differs() {
+        assert_eq!(
+            restart_pending_refusal(Some("1.76.1"), "1.76.0", false, InstallMethod::Pro),
+            None
+        );
+        assert!(
+            restart_pending_refusal(Some("1.76.0"), "1.76.0", false, InstallMethod::Pro).is_some()
+        );
+        assert!(restart_pending_refusal(None, "1.76.0", false, InstallMethod::Pro).is_some());
+    }
+
+    #[test]
+    fn refuses_container_and_desktop_sidecar() {
+        assert!(
+            restart_pending_refusal(Some("1.76.1"), "1.76.0", true, InstallMethod::Pro).is_some()
+        );
+        assert!(
+            restart_pending_refusal(Some("1.76.1"), "1.76.0", false, InstallMethod::Desktop)
+                .is_some()
+        );
     }
 }

@@ -221,6 +221,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_system_apply_update(params).await
             }
+            "system.restart_pending_update" => {
+                require_admin!();
+                self.handle_system_restart_pending_update().await
+            }
 
             // ── Logs (manager+) ──────────────────────────────
             "logs.subscribe" => {

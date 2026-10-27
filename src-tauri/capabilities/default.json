@@ -51,6 +51,7 @@
     "allow-gateway-start-local",
     "allow-gateway-open-picker",
     "allow-desktop-update-status",
+    "allow-desktop-update-info",
     "allow-desktop-restart-and-update"
   ]
 }

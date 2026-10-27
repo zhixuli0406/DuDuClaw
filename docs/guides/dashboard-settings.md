@@ -209,6 +209,12 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 
 Caps live in `config.toml` (no control yet; Advanced config editor): `[goal_defaults] assign_schedule_max_active` (default 20 per person, 0..200) and `assign_schedule_min_interval_minutes` (non-Admins, default 60, can only be raised). Existing schedules also recheck the interval at every run and resume. Pause/remove prevents a run whose task has not yet been stored; stop an already stored task separately. Details: [Scheduling an assignment](../features/67-assigning-tasks.md#scheduling-an-assignment).
 
+## System → Updates (unreleased)
+
+The page shows one update order for the whole install. When the desktop app is attached to a gateway it does not own (a launchd/systemd/Enterprise gateway, or a remote one), the page lists both components: the gateway with its current and next version, and the desktop app with its current and downloaded version. One button updates the gateway first, waits for it to come back, then updates the app. The app is only updated up to the gateway's version; a newer app download waits and the page says so. An app that runs its own gateway sidecar updates both together, as before.
+
+When a newer gateway binary is already on disk but not running (an npm install, a manual swap, an update whose restart never happened), the button reads "Restart the gateway to apply v…" and calls `system.restart_pending_update` (admin). The gateway refuses it unless the on-disk version really differs from the running one, and refuses it inside a container or for the desktop sidecar, which restart through their owner. Restarting the desktop app does not restart an external gateway.
+
 ## Thinking display
 
 No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.

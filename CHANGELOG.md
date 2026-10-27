@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 桌面 App 與 gateway 的更新改成同一個順序。App 連到不是自己啟動的 gateway（launchd／systemd／企業版，或遠端）時，不再自行跳「從系統匣重啟並更新」、退出時也不自動安裝；通知與系統匣項目改為帶你到「系統更新」頁。該頁列出 gateway 與桌面 App 兩個元件，一個按鈕先更新 gateway、等它重新上線，再把 App 更新到不超過 gateway 的版本；App 下載到較新的版本時會等 gateway 有同一版再一起更新。App 自己帶 gateway sidecar 時行為不變。
+- 磁碟上已有較新 gateway binary 但尚未執行時，系統更新頁改給「重新啟動 gateway 套用 v…」按鈕（新的管理員 RPC `system.restart_pending_update`，只在磁碟版本不同於執行中版本時接受，容器與桌面 sidecar 會拒絕），說明文字不再寫「重啟桌面 App 也可以」。
+- 發版流程加上企業版關卡：`scripts/release.sh` 在修改任何檔案前檢查企業版前置條件（commercial checkout、Pro 簽章金鑰、minisign／gcloud／docker），缺了就停止，只有明確設定 `DUDUCLAW_RELEASE_WITHOUT_PRO=1` 才能發純開源版。Pro image、離線 tar、darwin／linux-x64 binary、控制面允許清單與交付清單任一失敗或被略過，結尾列出缺項並以非零結束；`release.sh verify` 加查控制面實際提供的版本，沒有 commercial checkout 時判為未驗證。
+
+### Fixed
+
+- 企業版（`duduclaw-pro`）從系統更新頁或自動更新安裝新版時，一律失敗並顯示 `Binary 'duduclaw' not found in archive`。企業版更新包內的執行檔名是 `duduclaw-pro`，換裝程序卻找開源版的 `duduclaw`；現在依執行中的程式決定要取出的檔名，開源版行為不變。v1.76.1 以前的企業版仍帶著這個問題，升到這一版需要管理者手動換上新版 binary 後重新啟動 gateway，之後即可從頁面更新。
+
 ## [1.76.1] - 2026-10-27 — Default port compatibility and updater security hotfix
 
 ### Security

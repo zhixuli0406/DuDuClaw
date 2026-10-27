@@ -42,6 +42,9 @@ pub struct SidecarManager {
     shutting_down: AtomicBool,
     /// True when we attached to an externally-managed gateway (do not kill it).
     attached: AtomicBool,
+    /// True after the sidecar was released because the user picked a remote
+    /// gateway. Cleared by the next `start()`.
+    released_for_remote: AtomicBool,
     /// Spawn generation. Bumped on every spawn/stop/reset so the event-drain
     /// and readiness tasks of a superseded child can detect they are stale and
     /// must not touch shared state (prevents a killed child's Terminated event
@@ -57,6 +60,7 @@ impl SidecarManager {
             port: Mutex::new(lifecycle::DEFAULT_PORT),
             shutting_down: AtomicBool::new(false),
             attached: AtomicBool::new(false),
+            released_for_remote: AtomicBool::new(false),
             generation: AtomicU64::new(0),
         }
     }
@@ -67,6 +71,19 @@ impl SidecarManager {
 
     pub fn port(&self) -> u16 {
         *self.port.lock().unwrap()
+    }
+
+    /// True unless the shell is attached to an external gateway or released
+    /// its sidecar for a remote one. A sidecar that is still starting, has
+    /// crashed or was just stopped for quit is still the shell's own gateway.
+    pub fn owns_gateway(&self) -> bool {
+        !self.attached.load(Ordering::SeqCst) && !self.released_for_remote.load(Ordering::SeqCst)
+    }
+
+    /// Stop the sidecar because the user picked a remote gateway.
+    pub fn release_for_remote(&self) {
+        self.stop();
+        self.released_for_remote.store(true, Ordering::SeqCst);
     }
 
     fn set_status(&self, s: SidecarStatus) {
@@ -150,6 +167,7 @@ impl SidecarManager {
         // A previous stop() (remote pick released the sidecar, tray restart)
         // must not leave auto-restart permanently disabled for this fresh start.
         self.shutting_down.store(false, Ordering::SeqCst);
+        self.released_for_remote.store(false, Ordering::SeqCst);
         match self.status() {
             SidecarStatus::Starting => return Ok(self.port()),
             SidecarStatus::Running => {
