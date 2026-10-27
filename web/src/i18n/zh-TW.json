@@ -1552,6 +1552,8 @@
   "settings.update.checking": "檢查中...",
   "settings.update.upToDate": "目前已是最新版本。",
   "settings.update.restartPending": "新版本 v{version} 已放到這台主機上，gateway 重新啟動後才會生效（重開桌面 App 不會重啟 gateway）。",
+  "settings.update.restartPendingDesktop": "新版本 v{version} 已放到這台主機上，重新開啟桌面 App 後 gateway 會一起換成新版。",
+  "settings.update.restartPendingContainer": "磁碟上已有 v{version}，但容器內的 gateway 要以更新 image、重新建立容器的方式套用新版。",
   "settings.update.restartGateway": "重新啟動 gateway 套用 v{version}",
   "settings.update.installBoth": "依序更新 gateway 與桌面 App",
   "settings.update.components": "要更新的元件",

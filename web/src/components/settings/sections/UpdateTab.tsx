@@ -50,6 +50,21 @@ export function showsNetworkHint(message: string): boolean {
 /** Non-5xx statuses the gateway treats as retryable (`classify_http_status`). */
 const RETRYABLE_HTTP = new Set([403, 404, 408, 425, 429]);
 
+/**
+ * Which "already on disk, restart to apply" banner fits this gateway. Only a
+ * standalone gateway gets the "restarting the desktop app does not restart
+ * the gateway" wording: a desktop sidecar does restart with the app, and a
+ * container restarts by recreating it from the new image.
+ */
+export function restartPendingMessageId(info: {
+  install_method: string;
+  containerized?: boolean;
+}): string {
+  if (info.containerized === true) return 'settings.update.restartPendingContainer';
+  if (info.install_method === 'desktop') return 'settings.update.restartPendingDesktop';
+  return 'settings.update.restartPending';
+}
+
 /** Live download-retry state pushed by the gateway during an install. */
 interface RetryState {
   attempt: number;
@@ -416,7 +431,7 @@ export function UpdateTab() {
               <RefreshCw className="h-5 w-5 shrink-0 text-warning" />
               <span className="text-sm text-warning">
                 {intl.formatMessage(
-                  { id: 'settings.update.restartPending' },
+                  { id: restartPendingMessageId(updateInfo) },
                   { version: updateInfo.restart_pending_version },
                 )}
               </span>
