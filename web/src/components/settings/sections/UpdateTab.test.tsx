@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { showsNetworkHint } from './UpdateTab';
+import { restartPendingMessageId, showsNetworkHint } from './UpdateTab';
 
 /**
  * WP18-A (2026-08-04 field report): the gateway retries download-class update
@@ -48,5 +48,31 @@ describe('UpdateTab failure classification', () => {
     expect(showsNetworkHint(`${PREFIX}Rejected unsafe download URL: http://evil/x`)).toBe(false);
     expect(showsNetworkHint(`${PREFIX}New binary verification failed: exec format error`)).toBe(false);
     expect(showsNetworkHint('')).toBe(false);
+  });
+});
+
+// A desktop sidecar restarts with its app and a container restarts from a new
+// image, so only a standalone gateway may say "restarting the desktop app
+// does not restart the gateway" (2026-10-27 review of v1.76.2).
+describe('UpdateTab restart-pending banner', () => {
+  it('keeps the standalone wording for launchd/systemd/npm/pro gateways', () => {
+    for (const install_method of ['npm', 'pro', 'binary', 'cargo']) {
+      expect(restartPendingMessageId({ install_method })).toBe('settings.update.restartPending');
+    }
+  });
+
+  it('tells a desktop sidecar to reopen the app', () => {
+    expect(restartPendingMessageId({ install_method: 'desktop' })).toBe(
+      'settings.update.restartPendingDesktop',
+    );
+  });
+
+  it('tells a container to recreate from the image, whatever the install method', () => {
+    expect(restartPendingMessageId({ install_method: 'pro', containerized: true })).toBe(
+      'settings.update.restartPendingContainer',
+    );
+    expect(restartPendingMessageId({ install_method: 'desktop', containerized: true })).toBe(
+      'settings.update.restartPendingContainer',
+    );
   });
 });

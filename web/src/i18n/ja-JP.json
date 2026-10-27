@@ -1552,6 +1552,8 @@
   "settings.update.checking": "確認中...",
   "settings.update.upToDate": "最新バージョンを使用しています。",
   "settings.update.restartPending": "新しいバージョン v{version} はこのマシンにあります。gateway を再起動すると適用されます（デスクトップアプリを再起動しても gateway は再起動されません）。",
+  "settings.update.restartPendingDesktop": "新しいバージョン v{version} はこのマシンにあります。デスクトップアプリを再起動すると gateway も新しいバージョンで起動します。",
+  "settings.update.restartPendingContainer": "ディスク上に v{version} がありますが、コンテナ内の gateway は image を更新してコンテナを作り直すことで新しいバージョンを適用します。",
   "settings.update.restartGateway": "gateway を再起動して v{version} を適用",
   "settings.update.installBoth": "gateway とデスクトップアプリを順に更新",
   "settings.update.components": "更新するコンポーネント",
