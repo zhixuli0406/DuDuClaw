@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.76.2] - 2026-10-27 — Enterprise self-update and unified update order hotfix
+
 ### Changed
 
 - 桌面 App 與 gateway 的更新改成同一個順序。App 連到不是自己啟動的 gateway（launchd／systemd／企業版，或遠端）時，不再自行跳「從系統匣重啟並更新」、退出時也不自動安裝；通知與系統匣項目改為帶你到「系統更新」頁。該頁列出 gateway 與桌面 App 兩個元件，一個按鈕先更新 gateway、等它重新上線，再把 App 更新到不超過 gateway 的版本；App 下載到較新的版本時會等 gateway 有同一版再一起更新。App 自己帶 gateway sidecar 時行為不變。
