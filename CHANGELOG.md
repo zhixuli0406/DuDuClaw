@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.76.3] - 2026-10-28 — Restart notice and sidebar version hotfix
+
 ### Fixed
 
 - 系統更新頁「磁碟上已有新版、重新啟動後生效」的提醒，在桌面 App 自帶 gateway 時誤寫「重開桌面 App 不會重啟 gateway」（實際上會）；在容器裡則沒說要用新 image 重建容器。現在依安裝方式顯示對應說明，launchd／systemd／企業版等獨立 gateway 的說明不變。
