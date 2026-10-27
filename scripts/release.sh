@@ -498,6 +498,31 @@ else
         --format='value(account)' 2>/dev/null)" ]]; then
         PRO_MISSING+=("an active gcloud account (gcloud auth activate-service-account ...)")
     fi
+    # The image and the darwin binary embed the distributor notice fetched
+    # from the control plane with the admin token. v1.76.2's first run had no
+    # token in the shell, so the local image build stopped and the darwin
+    # binary shipped without the notice. Read it from Secret Manager (the
+    # deploy service account has access) unless the caller provides one or
+    # opts out with DUDUCLAW_DISTRIBUTOR_NOTICE=skip. Kept in a variable and
+    # handed only to the notice fetch and build-image.sh, never exported.
+    PRO_NOTICE_TOKEN="${DUDUCLAW_CONTROL_ADMIN_TOKEN:-}"
+    if [[ "${DUDUCLAW_DISTRIBUTOR_NOTICE:-fetch}" == "fetch" && -z "$PRO_NOTICE_TOKEN" ]] && \
+        command -v gcloud >/dev/null 2>&1; then
+        PRO_NOTICE_TOKEN="$(gcloud secrets versions access latest --secret=duduclaw-admin-token \
+            --project "${DUDUCLAW_GCP_PROJECT:-louis-460302}" 2>/dev/null || true)"
+    fi
+    if [[ "${DUDUCLAW_DISTRIBUTOR_NOTICE:-fetch}" == "fetch" && -z "$PRO_NOTICE_TOKEN" ]]; then
+        PRO_MISSING+=("the distributor-notice token (DUDUCLAW_CONTROL_ADMIN_TOKEN, read access to Secret Manager duduclaw-admin-token, or DUDUCLAW_DISTRIBUTOR_NOTICE=skip)")
+    fi
+    # The release commits the re-resolved enterprise Cargo.lock in the private
+    # checkout (see the gate at the end), so that checkout must sit on a
+    # branch that can go through a PR.
+    if git -C commercial rev-parse --git-dir >/dev/null 2>&1; then
+        PRO_COMMERCIAL_BRANCH="$(git -C commercial symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        if [[ -z "$PRO_COMMERCIAL_BRANCH" || "$PRO_COMMERCIAL_BRANCH" == "main" ]]; then
+            PRO_MISSING+=("the commercial checkout on its own branch, not main or a detached HEAD (the release commits duduclaw-pro-gateway/Cargo.lock there)")
+        fi
+    fi
     if [[ ${#PRO_MISSING[@]} -gt 0 ]]; then
         echo "Error: enterprise release prerequisites are missing:"
         printf '  - %s\n' "${PRO_MISSING[@]}"
@@ -871,10 +896,28 @@ PRO_TAR_SHA_FILE="$(mktemp)"
 if [[ "$PRO_RELEASE" == "1" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" == "1" ]]; then
     PRO_GAPS+=("pro-image + oem-tar skipped (DUDUCLAW_SKIP_PRO_IMAGE=1) — re-run: $PRO_IMAGE_SCRIPT v$NEW_VERSION")
 fi
+# Fetch the distributor notice once so the darwin binary below embeds the same
+# notice as the image (build-image.sh fetches its own copy). The token goes in
+# as a prefix assignment, never as an `env` argument, so it does not show up
+# in a process listing. A previous release's file is removed first: a failed
+# fetch must not leave an old notice for the darwin build to embed.
+if [[ "$PRO_RELEASE" == "1" && "${DUDUCLAW_DISTRIBUTOR_NOTICE:-fetch}" == "fetch" ]]; then
+    echo ""
+    echo "Fetching the distributor notice..."
+    rm -f commercial/duduclaw-pro-gateway/distributor-notice.html
+    if ! ( cd commercial/duduclaw-pro-gateway &&
+           DUDUCLAW_CONTROL_ADMIN_TOKEN="${PRO_NOTICE_TOKEN:-}" ./fetch-distributor-notice.sh distributor-notice.html &&
+           python3 build-policy.py --check ); then
+        rm -f commercial/duduclaw-pro-gateway/distributor-notice.html
+        echo "  WARNING: distributor notice fetch failed — the darwin binary will ship without it."
+        PRO_GAPS+=("distributor notice not fetched — re-run commercial/duduclaw-pro-gateway/fetch-distributor-notice.sh and rebuild the darwin binary")
+    fi
+fi
 if [[ "$PRO_RELEASE" == "1" && -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
     echo ""
     echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
-    if DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
+    if DUDUCLAW_CONTROL_ADMIN_TOKEN="${PRO_NOTICE_TOKEN:-}" DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" \
+        "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
         echo "  Enterprise image v$NEW_VERSION pushed."
         PRO_IMAGE_PUSHED=1
     else
@@ -977,6 +1020,14 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
             echo "           'rustc -vV' — skipping darwin binary asset (fail-closed)."
         else
             echo "  [$DARWIN_PLATFORM_LABEL] validating policy and building duduclaw-pro..."
+            # Ask cargo where the binary lands: CARGO_TARGET_DIR (a shared
+            # target across worktrees) overrides the crate's target-dir, and
+            # v1.76.2's first run looked in ../../target after a good build.
+            PRO_TARGET_DIR="$( (cd commercial/duduclaw-pro-gateway &&
+                cargo metadata --no-deps --format-version 1 2>/dev/null) |
+                python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null || true)"
+            [[ -n "$PRO_TARGET_DIR" ]] || PRO_TARGET_DIR="$PWD/target"
+            PRO_DARWIN_BIN="$PRO_TARGET_DIR/release/duduclaw-pro"
             # The distributor build also embeds the About-page distributor
             # notice when the private checkout has exported one
             # (distributor-notice.html, validated by build-policy.py --check).
@@ -988,15 +1039,15 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
                  env ${notice_env[@]+"${notice_env[@]}"} \
                      DUDUCLAW_INSTALLATION_POLICY_PATH="$PWD/installation-policy.json" \
                      cargo build --release --locked --bin duduclaw-pro &&
-                 ../../target/release/duduclaw-pro --version >/dev/null ); then
+                 "$PRO_DARWIN_BIN" --version >/dev/null ); then
                 mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
-                if cp target/release/duduclaw-pro "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then
+                if cp "$PRO_DARWIN_BIN" "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then
                     if package_and_upload_pro_bin "$DARWIN_PLATFORM_LABEL" "$PRO_BIN_TMP" "$NEW_VERSION"; then
                         PRO_BIN_UPLOADED=1
                         PRO_BIN_DARWIN_OK=1
                     fi
                 else
-                    echo "  WARNING: built binary missing at target/release/duduclaw-pro — skipping $DARWIN_PLATFORM_LABEL."
+                    echo "  WARNING: built binary missing at $PRO_DARWIN_BIN — skipping $DARWIN_PLATFORM_LABEL."
                 fi
             else
                 echo "  WARNING: $DARWIN_PLATFORM_LABEL duduclaw-pro build failed — skipping this platform."
@@ -1056,6 +1107,13 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
     # packaging default pin. Best-effort like every step above — a failure
     # WARNs with the manual command, never fails the release.
     # Opt out: DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1.
+    # With neither the image nor a binary uploaded the sync below does not
+    # run (it would offer a version with nothing behind it); v1.76.2's first
+    # run hit this without the gap being listed.
+    if [[ "${DUDUCLAW_SKIP_PRO_VERSIONS_ENV:-0}" != "1" && "$PRO_IMAGE_PUSHED" != "1" && \
+        "$PRO_BIN_UPLOADED" != "1" ]]; then
+        PRO_GAPS+=("control-plane allowlist and delivery manifest not synced (no enterprise asset was uploaded)")
+    fi
     if [[ "${DUDUCLAW_SKIP_PRO_VERSIONS_ENV:-0}" == "1" ]]; then
         echo ""
         echo "Skipping control-plane DUDUCLAW_PRO_VERSIONS sync (DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1)."
@@ -1175,10 +1233,28 @@ rm -f "${PRO_TAR_SHA_FILE:-}"
 # `cargo check` above re-resolves commercial/duduclaw-pro-gateway/Cargo.lock
 # for the new workspace versions; the image build and the next release use
 # `--locked`, so that lock must be committed in the private repository
-# (v1.76.1's backfill failed its first image build on a stale lock).
-if [[ "$PRO_RELEASE" == "1" ]] && git -C commercial rev-parse --git-dir >/dev/null 2>&1 && \
-    [[ -n "$(git -C commercial status --porcelain -- duduclaw-pro-gateway/Cargo.lock)" ]]; then
-    PRO_GAPS+=("commercial/duduclaw-pro-gateway/Cargo.lock changed — commit it in the private repository")
+# (v1.76.1's backfill failed its first image build on a stale lock). It
+# changes on every release, so the release commits it here, together with
+# the distributor brief generated above, on the commercial branch the
+# preflight required; only a failed commit is a gap.
+PRO_FOLLOW_UPS=()
+if [[ "$PRO_RELEASE" == "1" ]] && git -C commercial rev-parse --git-dir >/dev/null 2>&1; then
+    PRO_COMMIT_PATHS=()
+    [[ -z "$(git -C commercial status --porcelain -- duduclaw-pro-gateway/Cargo.lock)" ]] \
+        || PRO_COMMIT_PATHS+=("duduclaw-pro-gateway/Cargo.lock")
+    PRO_BRIEF="marketing/distributor/releases/duduclaw-technology-brief-v$NEW_VERSION.html"
+    [[ -z "$(git -C commercial status --porcelain -- "$PRO_BRIEF")" ]] || PRO_COMMIT_PATHS+=("$PRO_BRIEF")
+    if [[ ${#PRO_COMMIT_PATHS[@]} -gt 0 ]]; then
+        PRO_COMMERCIAL_BRANCH="$(git -C commercial symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        if git -C commercial add -- "${PRO_COMMIT_PATHS[@]}" &&
+            git -C commercial commit -q -m "chore: v$NEW_VERSION pro-gateway Cargo.lock and distributor brief" \
+                -- "${PRO_COMMIT_PATHS[@]}"; then
+            echo "  Committed in commercial ($PRO_COMMERCIAL_BRANCH): ${PRO_COMMIT_PATHS[*]}"
+            PRO_FOLLOW_UPS+=("push the commercial branch and open its PR: git -C commercial push -u origin $PRO_COMMERCIAL_BRANCH")
+        else
+            PRO_GAPS+=("could not commit ${PRO_COMMIT_PATHS[*]} in commercial — commit it in the private repository")
+        fi
+    fi
 fi
 if [[ "$PRO_RELEASE" == "1" && ${#PRO_GAPS[@]} -gt 0 ]]; then
     echo ""
@@ -1204,6 +1280,9 @@ echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs / OS
 echo "================================================"
 echo ""
 echo "Next steps:"
+if [[ ${#PRO_FOLLOW_UPS[@]} -gt 0 ]]; then
+    printf '  0. %s\n' "${PRO_FOLLOW_UPS[@]}"
+fi
 echo "  1. Review CHANGELOG.md release notes (curated [Unreleased] was renamed)"
 echo "  2. Amend the commit if needed:  git commit --amend"
 echo "  3. Push to remote:              git push && git push --tags"
