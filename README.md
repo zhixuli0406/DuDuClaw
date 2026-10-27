@@ -20,7 +20,7 @@ All you need is one Rust binary. Channel routing, conversation memory, multi-acc
 </p>
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.76.2-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.76.3-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![Glama MCP server score](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw/badges/score.svg)](https://glama.ai/mcp/servers/zhixuli0406/DuDuClaw)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
