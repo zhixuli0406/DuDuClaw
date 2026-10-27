@@ -74,7 +74,7 @@ optional output cannot satisfy either mandatory full-manual item.
 
 After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) must all succeed. The script commits the re-resolved enterprise `Cargo.lock` and the distributor brief on the enterprise checkout's branch and prints the push command; only a failed commit is a gap. The darwin binary is taken from cargo's actual target directory, so a shared `CARGO_TARGET_DIR` works. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the enterprise checkout.
 
-Unreleased (after v1.76.2): the distributor-notice token and enterprise-branch preflight checks, the automatic enterprise commit, and reading the darwin binary from cargo's target directory.
+Added after v1.76.2: the distributor-notice token and enterprise-branch preflight checks, the automatic enterprise commit, and reading the darwin binary from cargo's target directory.
 
 ## Merge, then publish
 
