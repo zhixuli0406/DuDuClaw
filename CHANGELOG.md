@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 公開文件（三語）裡 163 處早已出貨卻還標「（未發布）」的功能，改標實際出貨的版本（v1.70.0～v1.76.2，依首次包含該內容的 release tag 判定），連到改名標題的 37 個連結一併更新；維修 SSH 頁「未發布的介面」改寫成「要搭配帶有維修帳號的 OS 映像」。
+
 ## [1.76.2] - 2026-10-27 — Enterprise self-update and unified update order hotfix
 
 ### Changed

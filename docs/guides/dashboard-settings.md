@@ -265,7 +265,7 @@ An unconfirmed close stays visible as a warning. Expand Maintenance history
 for recent window fingerprints and connection events. The UI polls every
 30 seconds, so an expiry or device-side close may appear on the next poll.
 The complete OS image and real SSH/notification flow are not yet verified;
-this is an unreleased interface, not acceptance of the assembled device.
+the page works only with an OS image that ships the maintenance account, and it is not acceptance of the assembled device.
 
 ## Security → Credential protection (v1.76.0)
 
