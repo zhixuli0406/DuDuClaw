@@ -70,9 +70,9 @@ optional output cannot satisfy either mandatory full-manual item.
 
 ## Enterprise channel gate (unreleased)
 
-`scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private `commercial/duduclaw-pro-gateway` checkout, the Pro signing key `~/.minisign/duduclaw-pro-release.key`, and `minisign`, `gcloud` and `docker` on `PATH`. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
+`scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private enterprise checkout, the Pro signing key, `minisign`, `gcloud` and `docker` on `PATH`, a running Docker daemon and an active gcloud account. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
 
-After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) and the committed `commercial/duduclaw-pro-gateway/Cargo.lock` must all succeed. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the commercial checkout.
+After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) and a committed enterprise `Cargo.lock` must all succeed. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the enterprise checkout.
 
 ## Merge, then publish
 
