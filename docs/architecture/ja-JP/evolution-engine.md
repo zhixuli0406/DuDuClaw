@@ -4,7 +4,7 @@
 > 日付：2026-03-29（v3追補：2026-08-06）
 > ステータス：第3章（予測エンジン）と第12章（AEE）が現行コードを説明する。v2.0 の SOUL.md 書き換え経路は 2026-09-29 に削除済み（下の注記を参照）
 
-**本稿を読む前にご確認ください（S11の現況、2026-09-29）**：第4章で説明する「GVUがSOUL.mdを直接書き換える」フローと、それを支えていたすべて（`agent.toml [evolution] legacy_soul_evolution` 非常口、`SOUL.md` バージョン管理、24時間の観察ウィンドウ、自動ロールバック、サイズ上限のconsolidate書き換え、deferred GVU再試行、`duduclaw evolution finalize` CLI）は**コードベースから削除されました**。`SOUL.md` はv3（2026-08-06）でエージェントに対して読み取り専用になっており、その時点でこれらが守っていた書き込み経路はすでに存在していませんでした。**第4・7・8・9章は履歴として残します**：エンジンが以前どう動いていたか、各ガードがなぜ建てられたかを説明しており、第12章の設計圧力を理解する最短経路であることは変わりません——ただし、そこに生きたコードは1行もありません。実際に動くエンジンはAEE（第12章）で、`[evolution] gvu_enabled` は出荷時 `true` になりました。設計全文：`commercial/docs/specs/DESIGN-evolution-v3-aee.md`；計画と根本原因の鑑識：`commercial/docs/plans/TODO-evolution-v3-2026-08.md`；ユーザー向けの解説：`docs/features/ja-JP/38-aee-playbook-evolution.md`；スイッチの詳細：`docs/guides/ja-JP/evolution-switches.md`。
+**本稿を読む前にご確認ください（S11の現況、2026-09-29）**：第4章で説明する「GVUがSOUL.mdを直接書き換える」フローと、それを支えていたすべて（`agent.toml [evolution] legacy_soul_evolution` 非常口、`SOUL.md` バージョン管理、24時間の観察ウィンドウ、自動ロールバック、サイズ上限のconsolidate書き換え、deferred GVU再試行、`duduclaw evolution finalize` CLI）は**コードベースから削除されました**。`SOUL.md` はv3（2026-08-06）でエージェントに対して読み取り専用になっており、その時点でこれらが守っていた書き込み経路はすでに存在していませんでした。**第4・7・8・9章は履歴として残します**：エンジンが以前どう動いていたか、各ガードがなぜ建てられたかを説明しており、第12章の設計圧力を理解する最短経路であることは変わりません——ただし、そこに生きたコードは1行もありません。実際に動くエンジンはAEE（第12章）で、`[evolution] gvu_enabled` は出荷時 `true` になりました。設計全文、計画と根本原因の鑑識：社内の設計資料（非公開）；ユーザー向けの解説：`docs/features/ja-JP/38-aee-playbook-evolution.md`；スイッチの詳細：`docs/guides/ja-JP/evolution-switches.md`。
 
 ---
 
@@ -870,8 +870,8 @@ peer_signals = false               # Peer Agentシグナル
 
 > 実装日：2026-08-06。設計全文（gene schemaのフィールド単位の定義、Gate/Measureの
 > 完全なリスト、Generator内側ループのprompt組み立てを含む）は
-> `commercial/docs/specs/DESIGN-evolution-v3-aee.md` 第1〜3章を参照；根本原因の鑑識と
-> ワークパッケージの分解は `commercial/docs/plans/TODO-evolution-v3-2026-08.md` を参照。
+> 社内の設計資料（非公開）にあります；根本原因の鑑識と
+> ワークパッケージの分解も同じ社内資料にあります。
 
 ### 12.0 一言でいうと
 

@@ -12,9 +12,8 @@ deferred GVU 重試、`duduclaw evolution finalize` CLI）**已從程式碼移�
 已經不存在了。**第四、七、八、九章保留為歷史紀錄**：它們說明引擎過去怎麼
 運作、每一道防線為什麼被建起來，仍是理解第十二章設計壓力最快的路徑——但
 裡面沒有任何一行還是活的程式碼。實際運行的引擎是 AEE（第十二章），而
-`[evolution] gvu_enabled` 現在出廠即為 `true`。設計全文：
-`commercial/docs/specs/DESIGN-evolution-v3-aee.md`；規劃與根因鑑識：
-`commercial/docs/plans/TODO-evolution-v3-2026-08.md`；使用者視角導覽：
+`[evolution] gvu_enabled` 現在出廠即為 `true`。設計全文、規劃與根因鑑識：
+內部設計文件（未公開）；使用者視角導覽：
 `docs/features/zh-TW/38-aee-playbook-evolution.md`；開關細節：
 `docs/guides/evolution-switches.md`。
 
@@ -883,8 +882,8 @@ peer_signals = false               # Peer Agent 信號
 ## 十二、AEE — Agentic Evolution Engine（v3 預設路徑）
 
 > 落地日期：2026-08-06。設計全文（含 gene schema 逐欄位定義、Gate/Measure 完整清單、
-> Generator 內迴圈 prompt 組裝）見 `commercial/docs/specs/DESIGN-evolution-v3-aee.md` 第一至三章；
-> 根因鑑識與工作包拆解見 `commercial/docs/plans/TODO-evolution-v3-2026-08.md`。
+> Generator 內迴圈 prompt 組裝）見內部設計文件（未公開）；
+> 根因鑑識與工作包拆解也在同一批內部文件中。
 
 ### 12.0 一句話定位
 

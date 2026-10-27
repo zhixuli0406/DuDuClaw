@@ -337,7 +337,7 @@ verifier 的指標有三個，而不是一個：在大多數都會通過的 suit
 矩陣量的是 **model**，不是人格設定。所以當一個 suite 是為這個 home 沒有的 agent 撰寫時（針對 premium suite 做探測時很常見），`--agent <id>` 會讓每個 case 都改在一個已佈署的 agent 底下執行：
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix --agent agnes ...
+duduclaw eval <eval-suite-dir> --matrix --agent agnes ...
 ```
 
 對探測而言這是可以接受的折衷，而且是**明確宣告，不是推論出來的**：它會改變每個 case 所用的 system prompt，所以報告標頭帶有 `agent_override`，每一列 `runs[]` 也帶有它實際使用的 `agent`。有兩個後果值得說明：跨 suite 的比較，只有在 `agent_override` *相同*的執行之間才成立；而斷言依賴原本那個 agent 的工具或人格設定的 case，可能因為這個原因而失敗，與 model 的好壞無關。
@@ -399,7 +399,7 @@ Antigravity `agy` 1.2.10 現在會向它的 runtime 提供 `stream-json` 的終�
 ### Smoke 執行
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix \
+duduclaw eval <eval-suite-dir> --matrix \
   --roles executor,verifier \
   --models claude:claude-haiku-4-5,codex:gpt-5.6-sol \
   --weak claude:claude-haiku-4-5 \
@@ -412,7 +412,7 @@ duduclaw eval commercial/evals/hr-recruit --matrix \
 要做完整 team 的探測，請替每個選中的 case 加上一個凍結的 `[case] team_acceptance = "..."`。在隔離的 eval home 中、對一個已佈署的 agent 執行：
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix --team-2x2 \
+duduclaw eval <eval-suite-dir> --matrix --team-2x2 \
   --agent agnes --planner-weak codex:gpt-5.6-terra \
   --planner-strong codex:gpt-5.6-sol \
   --executor-weak codex:gpt-5.6-terra \

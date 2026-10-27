@@ -258,7 +258,7 @@ Dashboard 顯示「文中聲稱多 agent 共寫但實際只有單 agent caller�
 ## Open Questions
 
 1. **Q**: `CONTRACT.toml` 已存在還是新檔？
-   - 從 commercial/CLAUDE.md 提到 `CONTRACT.toml with must_not / must_always boundaries + duduclaw test red-team CLI`，似乎已存在
+   - 企業版私有 repo 的開發守則提到 `CONTRACT.toml with must_not / must_always boundaries + duduclaw test red-team CLI`，似乎已存在
    - **TODO**: Phase 2 實作前先確認位置
 
 2. **Q**: `actually_written_by` 是否影響既有 wiki 索引（`_wiki.db`）？

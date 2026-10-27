@@ -338,7 +338,7 @@ verifier の指標は 1 つではなく 3 つです。合格が多数を占め�
 マトリクスが測るのは **model** であり、ペルソナではありません。そのため、この home にはないエージェント向けに書かれた suite（premium の suite に対するプローブ実行でよくあるケース）では、`--agent <id>` がすべての case を 1 つのデプロイ済みエージェントで実行します。
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix --agent agnes ...
+duduclaw eval <eval-suite-dir> --matrix --agent agnes ...
 ```
 
 プローブとしては許容できる妥協であり、**宣言されるもので、推論されるものではありません**。すべての case が動くときの system prompt が変わるため、レポートヘッダーに `agent_override` が、すべての `runs[]` 行に実際に使われた `agent` が記録されます。述べておく価値のある帰結が 2 つあります。suite をまたぐ比較は、*同じ* `agent_override` の実行同士でしか成り立たないこと。そして、元のエージェントのツールやペルソナに依存するアサーションを持つ case は、model のせいではなくその理由で失敗することがある、ということです。
@@ -400,7 +400,7 @@ Antigravity `agy` 1.2.10 は、その runtime に `stream-json` の終端ツー�
 ### Smoke 実行
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix \
+duduclaw eval <eval-suite-dir> --matrix \
   --roles executor,verifier \
   --models claude:claude-haiku-4-5,codex:gpt-5.6-sol \
   --weak claude:claude-haiku-4-5 \
@@ -413,7 +413,7 @@ duduclaw eval commercial/evals/hr-recruit --matrix \
 完全な team のプローブでは、選択したすべての case に固定の `[case] team_acceptance = "..."` を追加します。隔離された eval home で、デプロイ済みのエージェントに対して実行してください。
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix --team-2x2 \
+duduclaw eval <eval-suite-dir> --matrix --team-2x2 \
   --agent agnes --planner-weak codex:gpt-5.6-terra \
   --planner-strong codex:gpt-5.6-sol \
   --executor-weak codex:gpt-5.6-terra \

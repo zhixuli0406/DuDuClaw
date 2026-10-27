@@ -184,7 +184,7 @@ eval_suites_root = "evals"        # default: <home>/evals; relative paths resolv
 ```
 
 `DUDUCLAW_EVAL_SUITES_ROOT` overrides `eval_suites_root` for one process.
-A developer checkout typically points it at the repo's `commercial/evals`.
+A developer checkout typically points it at an eval suite directory inside the checkout.
 
 **Record the corpus once before the scores mean anything.** AEE measures in
 replay mode (offline, zero LLM cost), which reads a recorded transcript per

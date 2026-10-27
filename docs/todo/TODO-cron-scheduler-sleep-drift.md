@@ -28,7 +28,7 @@
   （stderr + 每日輪替檔案 + BroadcastLayer + OTel，等價開源 CLI 疊層），
   `duduclaw-pro.rs` 改為呼叫之。任何繞過 CLI 直接 boot gateway 的嵌入者都必須呼叫。
 - **依賴對齊**：兩個 pro Dockerfile（enterprise + experiment）在 build 前
-  `cp Cargo.lock commercial/duduclaw-pro-gateway/Cargo.lock`——同一 image 內
+  把 workspace 的 `Cargo.lock` 複製成企業版私有 checkout 中 pro gateway 的鎖檔——同一 image 內
   兩個 binary 共享依賴一律解析到 workspace-locked 版本；本機 pro lock 也已
   種鎖並納入 commercial repo 版控（gitignore 解禁）。
 - **boot 路徑無界 await 補洞**：googlechat／msteams 的 token client 是 boot
@@ -58,7 +58,7 @@ v1.56-dev（2026-08-13 晚 bake）部署後，**cron／heartbeat／tick sources 
    生產 `duduclaw-pro` 行程三次重啟後 scheduler 仍死。
 9. `EnterpriseExtension` 讀畢：純被動 RPC handler，無 boot hook——排除。
 10. 剩餘唯一差異軸：**Dockerfile.experiment 對 pro 用獨立 manifest 編譯**
-    （`--manifest-path commercial/duduclaw-pro-gateway/Cargo.toml`，獨立
+    （`--manifest-path` 指向企業版私有 checkout 的 pro gateway manifest，獨立
     target/、feature 解析與 workspace build 不同；開源 binary 帶
     `duduclaw-gateway/dashboard`）。v1.55 同法無恙 ⇒ 觸發者=2026-08-13
     working-tree 某變更 × pro 的 feature 組合（feature-gated cfg 分支卡

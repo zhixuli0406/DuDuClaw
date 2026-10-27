@@ -120,7 +120,7 @@ eval_suites_root = "evals"        # default: <home>/evals; relative paths resolv
 # eval_binary    = "/usr/local/bin/duduclaw"   # optional: which binary to spawn for `duduclaw eval`
 ```
 
-`DUDUCLAW_EVAL_SUITES_ROOT` 可以針對單一行程覆寫 `eval_suites_root`。開發者的 checkout 通常會把它指向 repo 裡的 `commercial/evals`。
+`DUDUCLAW_EVAL_SUITES_ROOT` 可以針對單一行程覆寫 `eval_suites_root`。開發者的 checkout 通常會把它指向 checkout 內的某個 eval suite 目錄。
 
 **分數要有意義，語料庫得先錄過一次。** AEE 是以重播模式量測（離線、零 LLM 成本），每個案例都要讀取一份已錄製的 transcript。旁邊沒有 `<stem>.transcript.jsonl` 的案例無法重播：
 

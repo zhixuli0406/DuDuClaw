@@ -278,7 +278,7 @@ Unset is the default, and it means *no flag is passed at all* — the spawn is b
 
 ### Per-runtime flag mapping
 
-Probed against the installed binaries on 2026-09-24 (`research/multi-model-routing-2026-09/17-P0-cli-flag-probe.md` §4 + §6) — not inferred from docs:
+Probed against the installed binaries on 2026-09-24 (recorded in internal probe notes, not published) — not inferred from docs:
 
 | Runtime | Version probed | How effort is expressed | Values the CLI accepts |
 |---|---|---|---|

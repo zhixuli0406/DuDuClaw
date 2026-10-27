@@ -120,7 +120,7 @@ eval_suites_root = "evals"        # default: <home>/evals; relative paths resolv
 # eval_binary    = "/usr/local/bin/duduclaw"   # optional: which binary to spawn for `duduclaw eval`
 ```
 
-`DUDUCLAW_EVAL_SUITES_ROOT`は1プロセス限定で`eval_suites_root`を上書きします。開発者のチェックアウトでは通常、リポジトリの`commercial/evals`を指すよう設定されます。
+`DUDUCLAW_EVAL_SUITES_ROOT`は1プロセス限定で`eval_suites_root`を上書きします。開発者のチェックアウトでは通常、チェックアウト内の eval suite ディレクトリを指すよう設定されます。
 
 **スコアが意味を持つには、コーパスを一度記録しておく必要があります。** AEEはリプレイモード（オフライン、LLMコストゼロ）で計測を行い、各ケースにつき記録済みのtranscriptを読み込みます。`<stem>.transcript.jsonl`が横に存在しないケースはリプレイできません。
 
