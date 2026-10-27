@@ -12,10 +12,22 @@ function LocationProbe() {
   return <div data-testid="location-probe">{location.pathname}</div>;
 }
 
+const STATUS = {
+  version: '1.54.0',
+  uptime_seconds: 3725, // 1h 2m
+  agents_count: 4,
+  channels_connected: 2,
+  gateway_address: '127.0.0.1:8787',
+};
+
 function mockRpc(overrides: Partial<Record<string, unknown>> = {}) {
   mockWsClient.call.mockImplementation((method: string) => {
     if (method in overrides) return Promise.resolve(overrides[method]);
     switch (method) {
+      // Entering `authenticated` refetches the status (system-store), so the
+      // gateway answers with the same status the store was seeded with.
+      case 'system.status':
+        return Promise.resolve(STATUS);
       case 'runtime.detect':
         return Promise.resolve({
           claude_cli: true,
@@ -37,17 +49,9 @@ function mockRpc(overrides: Partial<Record<string, unknown>> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useConnectionStore.setState({ state: 'authenticated' as never, error: null } as never);
-  useSystemStore.setState({
-    status: {
-      version: '1.54.0',
-      uptime_seconds: 3725, // 1h 2m
-      agents_count: 4,
-      channels_connected: 2,
-      gateway_address: '127.0.0.1:8787',
-    },
-  } as never);
   mockRpc();
+  useConnectionStore.setState({ state: 'authenticated' as never, error: null } as never);
+  useSystemStore.setState({ status: STATUS } as never);
 });
 
 describe('DevPanelSystemTab — system status', () => {

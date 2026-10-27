@@ -5,6 +5,7 @@
 ### Fixed
 
 - 系統更新頁「磁碟上已有新版、重新啟動後生效」的提醒，在桌面 App 自帶 gateway 時誤寫「重開桌面 App 不會重啟 gateway」（實際上會）；在容器裡則沒說要用新 image 重建容器。現在依安裝方式顯示對應說明，launchd／systemd／企業版等獨立 gateway 的說明不變。
+- 儀表板左下角的版號與版本徽章只在頁面第一次連上 gateway 時讀取一次。gateway 之後換版重啟（更新、launchd 重啟）時，畫面會自動重連，但一直顯示舊 gateway 的版號：桌面 App 在 1.70.1 時開啟的視窗，gateway 重啟三次升到 1.76.2 後仍寫 v1.70.1，而系統更新頁顯示 v1.76.2。現在每次重連成功都會重新讀取，重連期間沿用原本的狀態，舊連線遲到的回應也不會蓋掉新的。
 
 ## [1.76.2] - 2026-10-27 — Enterprise self-update and unified update order hotfix
 
