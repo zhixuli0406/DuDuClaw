@@ -69,6 +69,10 @@ copies `latest.json` to the fixed-tag `desktop-updater` release — that fixed
 URL is the updater endpoint, because `releases/latest/...` would point at the
 much more frequent core releases and 404.
 
+## 5a. Updates when attached to an external gateway (unreleased)
+
+The shell still downloads new versions in the background. When it runs its own gateway sidecar it behaves as before: notification, tray「重啟並更新」, install on quit. When it is attached to a gateway it does not own, the app and the gateway are separate installs on separate channels, so the shell does not install on its own: the notification and the tray item point at the dashboard 系統更新 page, and quitting does not install the staged update. That page updates the gateway first and the app only up to the gateway's version. The page reads the relation through the `desktop_update_info` command (`bundled` or `external`).
+
 ## 6. Certificate hygiene
 
 - Never commit certs/keys; only GitHub secrets.

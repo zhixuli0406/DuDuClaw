@@ -557,6 +557,25 @@ fn binary_name() -> &'static str {
     }
 }
 
+/// The archive entry to install over `current_exe`. The Pro control-plane
+/// asset (`duduclaw-pro-<plat>.tar.gz`, packaged by `scripts/release.sh`)
+/// holds `duduclaw-pro`, not the CE `duduclaw`; looking for the CE name made
+/// every Pro self-update fail with "Binary 'duduclaw' not found in archive"
+/// (2026-10-27 field report, v1.70.1 → v1.76.0).
+fn archive_binary_name(current_exe: &std::path::Path) -> &'static str {
+    if !is_pro_wrapper_exe(current_exe) {
+        return binary_name();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "duduclaw-pro.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "duduclaw-pro"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // URL validation [H2][R2:NC1] — validates both download and checksum URLs
 // ---------------------------------------------------------------------------
@@ -885,7 +904,8 @@ async fn install_archive_bytes(
 ) -> Result<ApplyResult, String> {
     // Extract binary
     info!("Extracting binary...");
-    let new_binary_bytes = extract_binary_from_archive(archive_bytes)?;
+    let new_binary_bytes =
+        extract_binary_from_archive(archive_bytes, archive_binary_name(current_exe))?;
 
     // [R2:NC2] Verify decompressed size
     if new_binary_bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
@@ -934,6 +954,16 @@ pub async fn install_verified_binary(archive_bytes: &[u8]) -> Result<ApplyResult
                 .into(),
         );
     }
+
+    // [C2] Same concurrency guard as the CE path: a provider install must not
+    // overlap another install or a `system.restart_pending_update` restart.
+    if UPDATE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Another update is already in progress".into());
+    }
+    let _guard = UpdateGuard;
 
     let current_exe = duduclaw_core::platform::executable_path();
     if current_exe.as_os_str().is_empty() {
@@ -1163,6 +1193,15 @@ async fn apply_update_inner(
     })
 }
 
+/// Claim the update slot for a restart onto the on-disk binary. Never
+/// released: the process is about to exit, and no install may start (or be
+/// mid-write) underneath it. False when an install or restart already holds it.
+pub fn claim_update_slot_for_restart() -> bool {
+    UPDATE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 /// RAII guard to reset UPDATE_IN_PROGRESS on drop. [C2]
 struct UpdateGuard;
 impl Drop for UpdateGuard {
@@ -1175,9 +1214,7 @@ impl Drop for UpdateGuard {
 // Archive extraction [C3][R2:NH3] — rejects absolute paths, symlinks, hard links
 // ---------------------------------------------------------------------------
 
-fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let target = binary_name();
-
+fn extract_binary_from_archive(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, String> {
     if let Ok(result) = extract_from_tar_gz(archive_bytes, target) {
         return Ok(result);
     }
@@ -1573,6 +1610,56 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         assert_eq!(binary_name(), "duduclaw.exe");
         #[cfg(not(target_os = "windows"))]
         assert_eq!(binary_name(), "duduclaw");
+    }
+
+    #[test]
+    fn test_archive_binary_name_follows_running_exe() {
+        use std::path::Path;
+        assert_eq!(
+            archive_binary_name(Path::new("/usr/local/bin/duduclaw")),
+            binary_name()
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            archive_binary_name(Path::new("/usr/local/bin/duduclaw-pro")),
+            "duduclaw-pro"
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            archive_binary_name(Path::new(r"C:\DuDuClaw\duduclaw-pro.exe")),
+            "duduclaw-pro.exe"
+        );
+    }
+
+    /// The Pro asset layout from `scripts/release.sh`
+    /// (`tar czf … duduclaw-pro`) must extract when running as the wrapper.
+    #[test]
+    fn test_extract_pro_archive_layout() {
+        use std::io::Write;
+
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let content = b"FAKE_PRO_BINARY";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar_builder
+            .append_data(&mut header, "duduclaw-pro", &content[..])
+            .unwrap();
+        let tar_bytes = tar_builder.into_inner().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&tar_bytes).unwrap();
+        let gz_bytes = enc.finish().unwrap();
+
+        let pro_exe = std::path::Path::new("/usr/local/bin/duduclaw-pro");
+        let target = archive_binary_name(pro_exe);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            extract_binary_from_archive(&gz_bytes, target).unwrap(),
+            b"FAKE_PRO_BINARY"
+        );
+        // The CE name is not in a Pro archive — the pre-fix failure.
+        assert!(extract_binary_from_archive(&gz_bytes, binary_name()).is_err());
     }
 
     #[test]

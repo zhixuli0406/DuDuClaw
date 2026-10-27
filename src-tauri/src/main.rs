@@ -102,6 +102,7 @@ fn main() {
             gateway_picker::gateway_open_picker,
             updater::desktop_update_status,
             updater::desktop_restart_and_update,
+            updater::desktop_update_info,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -171,13 +172,17 @@ fn main() {
         .expect("error while building DuDuClaw desktop")
         .run(move |app, event| {
             if let RunEvent::ExitRequested { .. } = event {
+                // Whether the app owns its gateway decides if quitting may
+                // install a staged update (see `install_pending_on_quit`).
+                let relation = updater::gateway_relation(app);
                 // Graceful sidecar shutdown on quit (§D2.3).
                 if let Some(mgr) = app.try_state::<Arc<SidecarManager>>() {
                     mgr.stop();
                 }
                 // Apply any staged update on the way out so the next manual
-                // launch runs the new version (Chrome-style hot update).
-                updater::install_pending(app);
+                // launch runs the new version (Chrome-style hot update) —
+                // only when the app carries its own gateway sidecar.
+                updater::install_pending_on_quit(app, relation);
             }
         });
 }
@@ -271,7 +276,7 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
             "quit" => {
                 manager_for_menu.stop();
                 // exit(0) fires RunEvent::ExitRequested, which applies any
-                // staged update (main.rs run handler).
+                // staged update when the app owns its gateway (run handler).
                 app.exit(0);
             }
             _ => {}

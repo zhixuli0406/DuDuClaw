@@ -207,6 +207,12 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 設定檔 `[goal_defaults] assign_schedule_max_active` 預設每人 20 個（0–200）；`assign_schedule_min_interval_minutes` 預設非管理員最短 60 分鐘，只能調高，既有排程下次執行也會檢查。詳見[排程交辦](../../features/zh-TW/67-assigning-tasks.md)。
 
+## 系統 → 系統更新（未發布）
+
+這一頁照同一個順序更新整套安裝。桌面 App 連到不是自己啟動的 gateway 時（launchd／systemd／企業版 gateway，或遠端 gateway），頁面會列出兩個元件：gateway 的目前版本與要更新到的版本，桌面 App 的目前版本與已下載版本。一個按鈕先更新 gateway，等它重新上線，再更新 App。App 只會更新到 gateway 的版本；App 下載到較新的版本時會先等著，頁面會說明原因。App 自己帶 gateway sidecar 時，兩者照舊一起更新。
+
+磁碟上已經有較新的 gateway binary 但還沒執行時（npm 安裝、手動換檔、更新後沒重新啟動），按鈕會顯示「重新啟動 gateway 套用 v…」，呼叫 `system.restart_pending_update`（管理員）。gateway 只有在磁碟版本確實不同於執行中版本時才接受；容器與桌面 sidecar 由各自的擁有者重新啟動，這裡會拒絕。重開桌面 App 不會重啟外部 gateway。
+
 ## 思考過程顯示
 
 目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。

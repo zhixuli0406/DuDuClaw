@@ -7259,6 +7259,17 @@ export const api = {
         message: string;
         needs_restart: boolean;
       }>,
+    /**
+     * Restart onto the binary already on disk (`restart_pending_version`).
+     * Refused unless that version differs from the running one, and on
+     * containers / desktop sidecars, which restart through their own owner.
+     */
+    restartPendingUpdate: () =>
+      client.call('system.restart_pending_update', {}) as Promise<{
+        success: boolean;
+        version: string;
+        needs_restart: boolean;
+      }>,
   },
   cron: {
     list: () =>

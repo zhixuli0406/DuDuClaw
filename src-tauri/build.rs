@@ -36,6 +36,7 @@ fn main() {
         "gateway_open_picker",
         "desktop_update_status",
         "desktop_restart_and_update",
+        "desktop_update_info",
     ];
     tauri_build::try_build(
         tauri_build::Attributes::new()

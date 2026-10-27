@@ -324,9 +324,40 @@ run_verify() {
                     "pro-bin-linux" "v$want" "$tar"
                 rc=1
             fi
+
+            # The control plane offers a version only when it is in the
+            # allowlist of the revision that actually serves traffic.
+            local cp_service cp_rev cp_versions
+            cp_service="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
+            cp_rev="$(gcloud run services describe "$cp_service" --project "$proj" --region "$region" \
+                --format=json 2>/dev/null | python3 -c 'import json, sys
+live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic", []) if t.get("percent")]
+print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
+            cp_versions=""
+            if [[ -n "$cp_rev" ]]; then
+                cp_versions="$(gcloud run revisions describe "$cp_rev" --project "$proj" --region "$region" \
+                    --format=json 2>/dev/null | python3 -c 'import json, sys
+env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
+print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
+            fi
+            if [[ ",$cp_versions," == *",v$want,"* ]]; then
+                printf "  %-10s %-10s OK (%s)\n" "pro-offer" "v$want" "$cp_rev"
+            else
+                printf "  %-10s %-10s MISSING — serving revision '%s' offers '%s'\n" \
+                    "pro-offer" "v$want" "${cp_rev:-unknown}" "${cp_versions:-unknown}"
+                rc=1
+            fi
         else
-            echo "  pro-image / oem-tar: skipped (no GCP project configured)"
+            echo "  pro-image / oem-tar: NOT VERIFIED (no GCP project configured)"
+            rc=1
         fi
+    elif [[ "${DUDUCLAW_RELEASE_WITHOUT_PRO:-0}" == "1" ]]; then
+        echo "  enterprise: skipped (DUDUCLAW_RELEASE_WITHOUT_PRO=1)"
+    else
+        # A public checkout cannot see the private assets; saying nothing here
+        # is how v1.76.1 shipped with no enterprise channel at all.
+        echo "  enterprise: NOT VERIFIED — needs the commercial checkout and gcloud"
+        rc=1
     fi
 
     echo "------------------------------------------------------------------"
@@ -436,6 +467,45 @@ if $DRY_RUN; then
     echo "[DRY RUN] Requires signed two-manual / three-website delivery assertion before any mutation."
     exit 0
 fi
+
+# --- Enterprise release preflight (before any source mutation) ---
+# The enterprise channel (duduclaw-pro image, offline tar, bare-metal binaries,
+# control-plane allowlist) rides the same release train. Every one of those
+# steps used to be best-effort and the whole section was skipped silently when
+# no commercial checkout was present: v1.76.1 was cut from such a worktree, so
+# enterprise installs stayed on v1.76.0 while the desktop app offered v1.76.1
+# (2026-10-27). Missing prerequisites now stop the release before anything is
+# changed. A CE-only release must say so with DUDUCLAW_RELEASE_WITHOUT_PRO=1.
+PRO_RELEASE=1
+PRO_GAPS=()
+if [[ "${DUDUCLAW_RELEASE_WITHOUT_PRO:-0}" == "1" ]]; then
+    PRO_RELEASE=0
+    echo "WARNING: DUDUCLAW_RELEASE_WITHOUT_PRO=1 — this release ships NO enterprise assets."
+    echo "         Enterprise installs stay on their current version until they are backfilled."
+else
+    PRO_MISSING=()
+    [[ -x "commercial/duduclaw-pro-gateway/build-image.sh" ]] \
+        || PRO_MISSING+=("commercial/duduclaw-pro-gateway checkout (private repository)")
+    [[ -f "$HOME/.minisign/duduclaw-pro-release.key" ]] \
+        || PRO_MISSING+=("Pro signing key ~/.minisign/duduclaw-pro-release.key")
+    for PRO_TOOL in minisign gcloud docker; do
+        command -v "$PRO_TOOL" >/dev/null 2>&1 || PRO_MISSING+=("$PRO_TOOL on PATH")
+    done
+    if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+        PRO_MISSING+=("a running Docker daemon (linux-x64 is extracted from the pro image)")
+    fi
+    if command -v gcloud >/dev/null 2>&1 && [[ -z "$(gcloud auth list --filter=status:ACTIVE \
+        --format='value(account)' 2>/dev/null)" ]]; then
+        PRO_MISSING+=("an active gcloud account (gcloud auth activate-service-account ...)")
+    fi
+    if [[ ${#PRO_MISSING[@]} -gt 0 ]]; then
+        echo "Error: enterprise release prerequisites are missing:"
+        printf '  - %s\n' "${PRO_MISSING[@]}"
+        echo "Fix them, or set DUDUCLAW_RELEASE_WITHOUT_PRO=1 for a deliberate CE-only release."
+        exit 1
+    fi
+fi
+# --- End enterprise release preflight ---
 
 # --- Mandatory delivery review (before any source mutation) ---
 # Only the neutral, signed assertion enters this public repository. The actual
@@ -798,7 +868,10 @@ PRO_IMAGE_PUSHED=0
 # offline tar; the control-plane sync below turns it into the delivery
 # manifest entry for this release.
 PRO_TAR_SHA_FILE="$(mktemp)"
-if [[ -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
+if [[ "$PRO_RELEASE" == "1" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" == "1" ]]; then
+    PRO_GAPS+=("pro-image + oem-tar skipped (DUDUCLAW_SKIP_PRO_IMAGE=1) — re-run: $PRO_IMAGE_SCRIPT v$NEW_VERSION")
+fi
+if [[ "$PRO_RELEASE" == "1" && -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
     echo ""
     echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
     if DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
@@ -809,6 +882,7 @@ if [[ -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
         echo "  WARNING: duduclaw-pro image build/push FAILED. The release commit +"
         echo "  tag stand, but the cloud console will not offer v$NEW_VERSION until"
         echo "  you re-run:  $PRO_IMAGE_SCRIPT v$NEW_VERSION"
+        PRO_GAPS+=("pro-image build/push failed — re-run: $PRO_IMAGE_SCRIPT v$NEW_VERSION")
     fi
 fi
 
@@ -831,6 +905,8 @@ PRO_BIN_BUCKET="${DUDUCLAW_IMAGE_TAR_BUCKET:-duduclaw-oem-images}"
 # Tracked so the control-plane allowlist sync below only fires when this
 # release actually shipped at least one pro asset.
 PRO_BIN_UPLOADED=0
+PRO_BIN_DARWIN_OK=0
+PRO_BIN_LINUX_OK=0
 
 # Package <staged_dir>/<plat>/duduclaw-pro into a signed, checksummed tar.gz
 # and upload the three-piece set (tar.gz + .sha256 + .minisig) to GCS.
@@ -867,10 +943,11 @@ package_and_upload_pro_bin() {
     return 1
 }
 
-if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
+if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
     if [[ "${DUDUCLAW_SKIP_PRO_BIN:-0}" == "1" ]]; then
         echo ""
         echo "Skipping duduclaw-pro binary assets (DUDUCLAW_SKIP_PRO_BIN=1)."
+        PRO_GAPS+=("pro-bin darwin + linux-x64 skipped (DUDUCLAW_SKIP_PRO_BIN=1)")
     elif ! command -v minisign >/dev/null 2>&1; then
         echo ""
         echo "  WARNING: minisign not found in PATH — skipping duduclaw-pro binary assets."
@@ -916,6 +993,7 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
                 if cp target/release/duduclaw-pro "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then
                     if package_and_upload_pro_bin "$DARWIN_PLATFORM_LABEL" "$PRO_BIN_TMP" "$NEW_VERSION"; then
                         PRO_BIN_UPLOADED=1
+                        PRO_BIN_DARWIN_OK=1
                     fi
                 else
                     echo "  WARNING: built binary missing at target/release/duduclaw-pro — skipping $DARWIN_PLATFORM_LABEL."
@@ -940,6 +1018,7 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
                     if docker cp "$PRO_BIN_CID:/usr/local/bin/duduclaw-pro" "$PRO_BIN_TMP/linux-x64/duduclaw-pro" 2>/dev/null; then
                         if package_and_upload_pro_bin linux-x64 "$PRO_BIN_TMP" "$NEW_VERSION"; then
                             PRO_BIN_UPLOADED=1
+                            PRO_BIN_LINUX_OK=1
                         fi
                     else
                         echo "  WARNING: docker cp from duduclaw-pro image failed — skipping linux-x64."
@@ -958,6 +1037,12 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
 
         rm -rf "$PRO_BIN_TMP"
     fi
+    if [[ "${DUDUCLAW_SKIP_PRO_BIN:-0}" != "1" ]]; then
+        [[ "$PRO_BIN_DARWIN_OK" == "1" ]] \
+            || PRO_GAPS+=("pro-bin-mac v$NEW_VERSION not uploaded — see the WARNING above")
+        [[ "$PRO_BIN_LINUX_OK" == "1" ]] \
+            || PRO_GAPS+=("pro-bin-linux v$NEW_VERSION not uploaded (needs the pro image) — see the WARNING above")
+    fi
 
     # --- Control-plane offered-version allowlist (DUDUCLAW_PRO_VERSIONS) ---
     # Auto-discovery (GitHub releases × AR manifest probe) proved unreliable
@@ -974,6 +1059,7 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
     if [[ "${DUDUCLAW_SKIP_PRO_VERSIONS_ENV:-0}" == "1" ]]; then
         echo ""
         echo "Skipping control-plane DUDUCLAW_PRO_VERSIONS sync (DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1)."
+        PRO_GAPS+=("control-plane allowlist not synced (DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1)")
     elif [[ "$PRO_IMAGE_PUSHED" == "1" || "$PRO_BIN_UPLOADED" == "1" ]]; then
         CP_SERVICE="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
         CP_REGION="${DUDUCLAW_GCP_REGION:-asia-east1}"
@@ -985,11 +1071,13 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
         if ! command -v gcloud >/dev/null 2>&1 || [[ -z "$CP_PROJECT" || "$CP_PROJECT" == "(unset)" ]]; then
             echo ""
             echo "  WARNING: gcloud/project unavailable — control-plane version allowlist NOT synced."
+            PRO_GAPS+=("control-plane allowlist not synced (gcloud/project unavailable)")
             echo "           Run manually:  gcloud run services update $CP_SERVICE --region $CP_REGION \\"
             echo "                            --update-env-vars '^:^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS:-v$NEW_VERSION}'"
         elif [[ -z "$CP_VERSIONS" ]]; then
             echo ""
             echo "  WARNING: could not derive a version list from git tags — allowlist NOT synced."
+            PRO_GAPS+=("control-plane allowlist not synced (no version list from git tags)")
         else
             # --- General-distributor delivery manifest (same update) ---
             # /v1/dist/versions offers only versions that are BOTH in the
@@ -1022,6 +1110,7 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DE
                     echo "  WARNING: delivery manifest could not be computed — left unchanged."
                 fi
                 if [[ -z "$CP_ADD" ]]; then
+                    PRO_GAPS+=("delivery manifest has no offline tar SHA for v$NEW_VERSION")
                     echo "  WARNING: no offline tar was uploaded for v$NEW_VERSION, so distributors"
                     echo "           cannot download it from the console until build-image.sh succeeds"
                     echo "           and the manifest gets its tar SHA."
@@ -1058,17 +1147,20 @@ env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
 print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"), ""))' 2>/dev/null || true)"
                 fi
                 if [[ -n "$CP_MANIFEST" && "$CP_SERVING_MANIFEST" != "$CP_MANIFEST" ]]; then
+                    PRO_GAPS+=("delivery manifest written but not serving on '${CP_SERVING_REV:-unknown}'")
                     echo "  WARNING: delivery manifest was written but the serving revision"
                     echo "           '${CP_SERVING_REV:-unknown}' does not carry it."
                 fi
                 if [[ "$CP_SERVING_VERSIONS" == "$CP_VERSIONS" ]]; then
                     echo "  Control-plane allowlist updated; serving revision $CP_SERVING_REV carries it."
                 else
+                    PRO_GAPS+=("control-plane allowlist written but not serving on '${CP_SERVING_REV:-unknown}'")
                     echo "  WARNING: control-plane allowlist was written but is NOT serving"
                     echo "           (serving revision '${CP_SERVING_REV:-unknown}' has '${CP_SERVING_VERSIONS:-unknown}')."
                     echo "           Check: gcloud run services describe $CP_SERVICE --region $CP_REGION --format='yaml(spec.traffic,status.traffic)'"
                 fi
             else
+                PRO_GAPS+=("control-plane env update failed — see the manual command above")
                 echo "  WARNING: control-plane env update FAILED. Run manually:"
                 echo "    gcloud run services update $CP_SERVICE --region $CP_REGION \\"
                 echo "      --update-env-vars '^|^DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS${CP_MANIFEST:+|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=$CP_MANIFEST}'"
@@ -1078,6 +1170,32 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DE
 fi
 
 rm -f "${PRO_TAR_SHA_FILE:-}"
+
+# --- Enterprise release gate ---
+# `cargo check` above re-resolves commercial/duduclaw-pro-gateway/Cargo.lock
+# for the new workspace versions; the image build and the next release use
+# `--locked`, so that lock must be committed in the private repository
+# (v1.76.1's backfill failed its first image build on a stale lock).
+if [[ "$PRO_RELEASE" == "1" ]] && git -C commercial rev-parse --git-dir >/dev/null 2>&1 && \
+    [[ -n "$(git -C commercial status --porcelain -- duduclaw-pro-gateway/Cargo.lock)" ]]; then
+    PRO_GAPS+=("commercial/duduclaw-pro-gateway/Cargo.lock changed — commit it in the private repository")
+fi
+if [[ "$PRO_RELEASE" == "1" && ${#PRO_GAPS[@]} -gt 0 ]]; then
+    echo ""
+    echo "================================================"
+    echo " Release v$NEW_VERSION is INCOMPLETE: the enterprise channel is missing pieces."
+    echo "================================================"
+    printf '  - %s\n' "${PRO_GAPS[@]}"
+    echo ""
+    echo "The commit and tags stand locally. Fix every item above, then confirm with:"
+    echo "  ./scripts/release.sh verify $NEW_VERSION"
+    exit 1
+fi
+if [[ "$PRO_RELEASE" != "1" ]]; then
+    echo ""
+    echo "NOTE: CE-only release (DUDUCLAW_RELEASE_WITHOUT_PRO=1) — no enterprise assets"
+    echo "      were built; enterprise installs keep their current version."
+fi
 
 echo ""
 echo "================================================"
