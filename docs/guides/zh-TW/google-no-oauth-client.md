@@ -12,7 +12,7 @@
 
 服務帳號是由執行 DuDuClaw 的那一方所擁有。客戶的超級管理員只要授權一次它的 client id，之後 DuDuClaw 就能為該網域內的使用者核發權杖，完全不需要跳出同意畫面，更重要的是**完全不需要 Google 的應用程式驗證或 CASA 審查**，而這正是 OAuth 路徑無法服務開發者自身網域以外客戶的卡點。
 
-要讓每位 AI 員工各自代表不同的同事（而不是所有人共用一個 `subject`），見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+要讓每位 AI 員工各自代表不同的同事（而不是所有人共用一個 `subject`），見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
 ### 該怎麼跟客戶說明
 

@@ -72,7 +72,7 @@ git push origin desktop-v1.44.0
 URL 就是更新端點，因為 `releases/latest/...` 會指向更新頻繁得多的核心版
 本發布，反而會 404。
 
-## 5a. 連到外部 gateway 時的更新（未發布）
+## 5a. 連到外部 gateway 時的更新（v1.76.2）
 
 App 仍在背景下載新版本。App 自己帶 gateway sidecar 時行為不變：通知、系統匣「重啟並更新」、退出時安裝。連到不是自己啟動的 gateway 時，App 和 gateway 是兩套安裝、兩條更新通道，App 不會自行安裝：通知與系統匣項目改成指向儀表板的「系統更新」頁，退出時也不安裝已下載的版本。那一頁先更新 gateway，App 只更新到 gateway 的版本。頁面透過 `desktop_update_info` 指令讀取兩者關係（`bundled` 或 `external`）。
 

@@ -65,7 +65,7 @@ duduclaw run                  # 接著打開 http://localhost:18889
 
 <a id="architecture"></a>
 
-尚未發版：[排程交辦](docs/features/zh-TW/67-assigning-tasks.md)可從聊天或儀表板把工作排到之後，或固定週期交辦給 AI 員工；每次執行前都重新確認建立者的權限。
+v1.76.0：[排程交辦](docs/features/zh-TW/67-assigning-tasks.md)可從聊天或儀表板把工作排到之後，或固定週期交辦給 AI 員工；每次執行前都重新確認建立者的權限。
 
 ## 架構一覽
 
@@ -246,8 +246,8 @@ duduclaw license             # 授權管理(activate / status / redeem / rebind 
 - **不需特權**:完全在 user space 執行
 - **維護者**:嘟嘟數位科技有限公司(台灣登記公司,統編 94139082)
 - **頻道裡的高風險操作**:AI 員工在頻道裡請你核准高風險 Computer Use 步驟時,你要回覆該請求的完整 ID;執行結果不明的操作不會自動重送,由 Admin 在管理後台核對。見[操作指南](docs/guides/zh-TW/durable-channel-decisions.md)
-- **瀏覽器登入保存（未發布）**：可選擇加密保存每位員工的容器登入，預設關閉，提供清除與交接保護。真容器驗收待完成。見[使用指南](docs/guides/zh-TW/browser-login-state.md)。
-- **主管觀看瀏覽器（未發布）**：主管可看部屬在真人回合啟動的容器瀏覽器遮罩快照，並結束該工作階段。原有直接綁定的操作權限保留。已驗證對話及對應的工作／執行紀錄可提供限定工作階段的觀看入口，登入後會返回原連結。見[使用指南](docs/guides/zh-TW/browser-watch.md)。
+- **瀏覽器登入保存（v1.76.0）**：可選擇加密保存每位員工的容器登入，預設關閉，提供清除與交接保護。真容器驗收待完成。見[使用指南](docs/guides/zh-TW/browser-login-state.md)。
+- **主管觀看瀏覽器（v1.76.0）**：主管可看部屬在真人回合啟動的容器瀏覽器遮罩快照，並結束該工作階段。原有直接綁定的操作權限保留。已驗證對話及對應的工作／執行紀錄可提供限定工作階段的觀看入口，登入後會返回原連結。見[使用指南](docs/guides/zh-TW/browser-watch.md)。
 
 每個 Release 資產都附三種驗證:SHA-256 checksum、[cosign](https://github.com/sigstore/cosign) keyless 簽章、minisign Ed25519 簽章(內建自動更新器會強制驗證,拒絕未簽章或被竄改的版本):
 
@@ -283,15 +283,15 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## 文件
 
-企業版個人 Google 連線（未發布）：自行連結帳號，逐位允許或關閉 AI 員工使用，見[我的連線](docs/guides/zh-TW/google-personal-connections.md)。
+企業版個人 Google 連線（v1.76.0）：自行連結帳號，逐位允許或關閉 AI 員工使用，見[我的連線](docs/guides/zh-TW/google-personal-connections.md)。
 
-- [主管唯讀團隊對話](docs/features/zh-TW/68-manager-team-history.md)：尚未發版的企業版頁面與 API；部屬 WebChat 全文、外部對話遮蔽，含職員提示、生效時間與強制稽核。 直接 Viewer／Operator 的本人 WebChat 保留全文、外部遮蔽、他人隱藏；Owner／Admin 維持全文，行為變更附明確過渡設定。
+- [主管唯讀團隊對話](docs/features/zh-TW/68-manager-team-history.md)：企業版頁面與 API（v1.76.0）；部屬 WebChat 全文、外部對話遮蔽，含職員提示、生效時間與強制稽核。 直接 Viewer／Operator 的本人 WebChat 保留全文、外部遮蔽、他人隱藏；Owner／Admin 維持全文，行為變更附明確過渡設定。
 - 自身透明度：**誰看過我的對話**只列主管經團隊入口查看本人 WebChat 的紀錄（[說明](docs/features/zh-TW/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):完整系統架構
 - [docs/README.md](docs/README.md):公開文件索引(架構 / RFC / ADR / 規格 / 指南)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):生產部署(Tailscale / Docker / systemd / 自動更新 / 監控)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開發環境與 agent 開發
-- [MCP 操作授權生命週期](docs/guides/zh-TW/mcp-call-lifetimes.md)：未發布的主機 API 參考，說明每次 HTTP 操作的授權範圍
+- [MCP 操作授權生命週期](docs/guides/zh-TW/mcp-call-lifetimes.md)：主機 API 參考（v1.76.0），說明每次 HTTP 操作的授權範圍
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):自訂 MCP 工具教學
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md 與 CONTRACT.toml 格式規範
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);[52-desktop-edition.md](docs/features/52-desktop-edition.md):桌面版,人機共用一台機器;硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md);app 相容層、映像建置與發布都在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo(相容層說明見該 repo 的 `docs/guides/app-compat.md`)

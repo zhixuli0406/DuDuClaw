@@ -112,7 +112,7 @@ Residual risks the operator accepts by adding a site:
 - Addresses are pinned at session start; a site whose address changes during the session stops working until a new session starts.
 - The allowlist is per agent and covers tool-driven sessions only.
 
-**Live view and takeover (unreleased).** The dashboard can watch a session and take it over. The VNC server inside the container is started only on demand, listens only on a unix socket in the root-only `/tmp/duduclaw-root` (no TCP port; the helper refuses to run if anything listens on 5900-5999) and is reached only through `docker exec … duduclaw-vnc-relay` from the gateway's `/ws/computer-view` route; no port is published. A viewer needs a single-use 30-second ticket from the `computer_sessions.*` RPCs; the account's role and bindings are re-read from `users.db` on every request and every connection (watch: Admin, a bound Manager or an account bound at Operator level; take over: Admin or a Manager bound at Operator level). The gateway parses the viewer's RFB stream and forwards keyboard, pointer and clipboard events only from the takeover holder, never forwards screen-resize or `xvp` power requests, and closes on anything else it does not recognise. While a takeover is held the employee's actions are refused (`human_has_control`). Residual risks: VNC authentication is an 8-character DES password that reaches the authorized viewer's browser (the socket and the authenticated relay are the real boundary); the live stream is not masked, so a viewer sees whatever the page shows, including fields the employee's screenshots mask; a human in control can type anything on an allowlisted site. Every view, takeover and hand back is audited without its content. Each screenshot's page text also goes through `input_guard`; a block-level hit holds the session (actions refused, screenshots fully masked) until a person resumes it from the dashboard. Details: [docs/features/08-browser-automation.md](docs/features/08-browser-automation.md#keep-alive-live-view-and-takeover).
+**Live view and takeover (v1.72.0).** The dashboard can watch a session and take it over. The VNC server inside the container is started only on demand, listens only on a unix socket in the root-only `/tmp/duduclaw-root` (no TCP port; the helper refuses to run if anything listens on 5900-5999) and is reached only through `docker exec … duduclaw-vnc-relay` from the gateway's `/ws/computer-view` route; no port is published. A viewer needs a single-use 30-second ticket from the `computer_sessions.*` RPCs; the account's role and bindings are re-read from `users.db` on every request and every connection (watch: Admin, a bound Manager or an account bound at Operator level; take over: Admin or a Manager bound at Operator level). The gateway parses the viewer's RFB stream and forwards keyboard, pointer and clipboard events only from the takeover holder, never forwards screen-resize or `xvp` power requests, and closes on anything else it does not recognise. While a takeover is held the employee's actions are refused (`human_has_control`). Residual risks: VNC authentication is an 8-character DES password that reaches the authorized viewer's browser (the socket and the authenticated relay are the real boundary); the live stream is not masked, so a viewer sees whatever the page shows, including fields the employee's screenshots mask; a human in control can type anything on an allowlisted site. Every view, takeover and hand back is audited without its content. Each screenshot's page text also goes through `input_guard`; a block-level hit holds the session (actions refused, screenshots fully masked) until a person resumes it from the dashboard. Details: [docs/features/08-browser-automation.md](docs/features/08-browser-automation.md#keep-alive-live-view-and-takeover).
 
 ### Outbound address check (fixed in v1.67.0)
 
@@ -227,7 +227,7 @@ What the operator should know:
 
 Not yet verified: the end-to-end test with a real key has not been rerun since the last change to this code, and it has not been run on Linux, inside a Docker container or on Windows. See [docs/features/13-multi-runtime.md](docs/features/13-multi-runtime.md).
 
-### Computer-use workspaces: what the owner check and the approval gate do not cover (unreleased)
+### Computer-use workspaces: what the owner check and the approval gate do not cover (v1.70.0)
 
 Computer-use workspaces (`config.toml [computer_use.workspaces]`, off by default; guide: `docs/guides/computer-workspaces.md`) keep an AI employee's files across computer-use sessions under `<home>/computer_workspaces/`. The gateway is the only writer, a session sees the files read-only at `/workspace/files` under a root-only tmpfs, and every state-changing operator action from the terminal (`fence`, `revoke`, `regrant`, `renew`, `delete`) needs an Admin's approval in the dashboard, because the terminal cannot tell the operator from an AI employee with Bash; emergencies go through the dashboard RPCs (a signed-in Admin) or the master switch. Every terminal action is audited when requested, applied and refused (`computer_workspace_cli_action`). Residual risks, stated plainly:
 
@@ -240,7 +240,7 @@ Computer-use workspaces (`config.toml [computer_use.workspaces]`, off by default
 - **Container.** The browser runs with `--no-sandbox` (as before). Root `docker exec` can write the 64 KiB tmpfs at `/workspace`; `/workspace/files` is read-only. Only the gateway runs such commands.
 - **Verified on** Docker Desktop on macOS arm64 only; native Linux Docker, amd64 and Windows are not verified. On Windows the feature refuses every call.
 
-### Continuous responsibilities, mid-run directions and stopping a task: residual risks (unreleased)
+### Continuous responsibilities, mid-run directions and stopping a task: residual risks (v1.70.0)
 
 This describes a new feature, off by default (`config.toml [responsibilities] enabled`, `[goal_loop] steering_enabled`), not a fixed vulnerability. A continuous responsibility lets an AI employee wake on a schedule or an event and run bounded goal tasks; the operator manages it from the command line `duduclaw responsibility …`. Guide: [docs/guides/continuous-responsibilities.md](docs/guides/continuous-responsibilities.md).
 
@@ -265,7 +265,7 @@ Residual risks:
 - If the feature is switched off and back on while the gateway is down, the gateway does not see the switch and event subscriptions keep their earlier starting point. Events older than the 7-day retention are lost after a longer outage, with a gap record.
 - There is no `/responsibilities` dashboard page yet; responsibilities are managed from the command line with inbox approval.
 
-### Forget by source: residual risks (not yet released)
+### Forget by source: residual risks (v1.70.0)
 
 `duduclaw memory forget-source` deletes the memories a source produced and blocks that source from being learned again. It is gated by a dashboard approval from an Admin, a refusal inside an employee's session, and a Bash-lane rule. Not yet verified on a live gateway with real channels. What it does not do, and where it can be bypassed:
 
@@ -312,7 +312,7 @@ We commit to:
 - Crediting researchers in security advisories
 - Keeping researchers informed of fix progress
 
-## Maintenance SSH (unreleased)
+## Maintenance SSH (v1.75.0)
 
 The dashboard opens a maintenance SSH window only for an Admin after typed
 confirmation and password re-entry. One technician public key is required;

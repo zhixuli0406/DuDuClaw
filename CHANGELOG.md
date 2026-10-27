@@ -6,6 +6,7 @@
 
 - 系統更新頁「磁碟上已有新版、重新啟動後生效」的提醒，在桌面 App 自帶 gateway 時誤寫「重開桌面 App 不會重啟 gateway」（實際上會）；在容器裡則沒說要用新 image 重建容器。現在依安裝方式顯示對應說明，launchd／systemd／企業版等獨立 gateway 的說明不變。
 - 發版流程（`scripts/release.sh`）的企業版步驟修正四個在 v1.76.2 發版時遇到的問題：本機建置企業版 image 時沒有總經銷說明的 token 就整步失敗，現在會從 Secret Manager 讀取並在發版前檢查，darwin binary 也會內嵌同一份說明；設定共用的 `CARGO_TARGET_DIR` 時找不到已編好的 darwin binary；image 與 binary 都失敗時控制面清單沒同步卻沒列為缺項；每次發版都會改動的企業版 `Cargo.lock` 被當成缺項，現在由發版流程直接 commit 到企業版 checkout 的分支（前置檢查要求它不在 main）。
+- 公開文件（三語）裡 163 處早已出貨卻還標「（未發布）」的功能，改標實際出貨的版本（v1.70.0～v1.76.2，依首次包含該內容的 release tag 判定），連到改名標題的 37 個連結一併更新；維修 SSH 頁「未發布的介面」改寫成「要搭配帶有維修帳號的 OS 映像」。
 
 ## [1.76.2] - 2026-10-27 — Enterprise self-update and unified update order hotfix
 

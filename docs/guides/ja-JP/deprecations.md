@@ -157,7 +157,7 @@ DuDuClaw OS の初回セットアップ（OOBE）も `auth.cli_login.start` を�
 
 ---
 
-## Gemini CLI ランタイムを削除（未リリース）
+## Gemini CLI ランタイムを削除（v1.75.0）
 
 `gemini` エージェントランタイムは v1.67.0 で非推奨となり、この変更で削除されました。
 削除予定は v1.69.0 から v1.75.0 まで延期されていました。過去の発表は CHANGELOG

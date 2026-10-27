@@ -95,16 +95,16 @@ Google 事先驗證過應用程式。
 來源。
 
 兩條免憑證的路徑記錄在
-[google-no-oauth-client.md](../google-no-oauth-client.md)。要讓每位 AI 員工各自代表一位同事，見[每位 AI 員工用不同的 Google 帳號](#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+[google-no-oauth-client.md](../google-no-oauth-client.md)。要讓每位 AI 員工各自代表一位同事，見[每位 AI 員工用不同的 Google 帳號](#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
-## 每位 AI 員工用不同的 Google 帳號（公司授權代表，未發布）
+## 每位 AI 員工用不同的 Google 帳號（公司授權代表，v1.76.0）
 
 預設所有 AI 員工共用下方設定的那一個 Google 帳號（公司共用帳號）。Google Workspace 客戶可以改成讓每位員工代表一位指定的同事：業務助理在 `alice@customer.com` 的信箱裡讀信、存草稿，排程助理管理 `bob@customer.com` 的日曆。全部共用一個開了網域委派的服務帳號，每位員工各自指定代表的同事。
 
 ### 需要什麼
 
 - 一個 Google Workspace 網域，以及一位能授權用戶端 ID 的超級管理員（Google 管理控制台 → 安全性 → 存取權與資料控管 → API 控制項 → 管理全網域委派），授權的權限清單要和儀表板顯示的完全一致。
-- 憑證保護已改放系統金鑰圈（「安全」頁，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)）。服務帳號金鑰用這把保護金鑰封存，AI 員工讀不到它的檔案。macOS 與 Windows 可以用；Linux 與 Docker 目前沒有支援的金鑰圈，代表同事一律拒絕。
+- 憑證保護已改放系統金鑰圈（「安全」頁，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)）。服務帳號金鑰用這把保護金鑰封存，AI 員工讀不到它的檔案。macOS 與 Windows 可以用；Linux 與 Docker 目前沒有支援的金鑰圈，代表同事一律拒絕。
 
 ### 設定步驟
 
@@ -133,7 +133,7 @@ default_identity = "home"   # 沒寫 [google] 的員工用什麼：home（預設
 allowed_subject_domains = ["customer.com"]
 ```
 
-沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 19 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（未發布）](google-personal-connections.md)。
+沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 19 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
 
 ### 誰能透過這位員工使用這個帳號
 
@@ -160,7 +160,7 @@ allowed_subject_domains = ["customer.com"]
 - **外掛的 Google MCP 伺服器**（`bearer_token = "oauth://google"`）在 HTTP 掛載使用這位員工選定的帳號。權限不通過時只略過那個 Google 掛載，其他已設定的伺服器仍保留，詳見下方。
 - **稽核**：gateway 每次發出或拒絕權杖，都在 `tool_calls.jsonl` 寫一列 `google_token`（員工、身分、帳號、發問者類型、工具、拒絕代碼）；用同事身分的每次 Google 工具呼叫寫一列 `google_call`。兩者都不含權杖。變更員工身分會在帳號稽核記錄寫 `agent.google_identity_set`，並在 `security_audit.jsonl` 寫 `agent_google_identity_set`。
 
-### 員工專用 API key 與 Google MCP 掛載（未發布）
+### 員工專用 API key 與 Google MCP 掛載（v1.76.0）
 
 通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 19 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
 
@@ -177,7 +177,7 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 ### 限制
 
 - `gmail.compose` 讓拿到存取權杖的人可以寄信。工具只會存草稿，但有不受限 shell 的員工可以拿它替自己那位同事取得的權杖直接呼叫 Google。
-- 有 shell 的員工和 gateway 是同一個作業系統帳號，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈未發布)中金鑰圈的限制。
+- 有 shell 的員工和 gateway 是同一個作業系統帳號，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)中金鑰圈的限制。
 - 還沒在真的 Workspace 上驗證：管理控制台的實際流程、Google 真正的錯誤字串、關閉 Gmail 的組織單位，以及 Google 自家遠端 MCP 端點收不收委派權杖。
 
 ## 前置準備：建立一個 Google OAuth client

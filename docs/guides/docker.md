@@ -441,7 +441,7 @@ docker inspect duduclaw-server --format '{{json .State.Health}}' | jq
 ### 8.3 Prometheus metrics
 
 The gateway exposes a `GET /metrics` endpoint; see the metrics list at
-[docs/deployment-guide.md §8](deployment-guide.md#8-prometheus--grafana-monitoring).
+[docs/deployment-guide.md §9](deployment-guide.md#9-prometheus--grafana-monitoring).
 
 ---
 
@@ -612,7 +612,7 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 ```
 
 After a restart, the startup log prints the extra origins that took effect. See
-[deployment-guide §5 WebSocket origin allowlist](deployment-guide.md#websocket-origin-allowlist-required-reading-for-reverse-proxy-tailnet-setups) for details.
+[deployment-guide §5 WebSocket origin allowlist](deployment-guide.md#websocket-origin-allowlist-required-reading-for-reverse-proxy--tailnet-setups) for details.
 
 ### Channel webhook isn't triggering the agent
 

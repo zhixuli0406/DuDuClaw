@@ -64,7 +64,7 @@ duduclaw run                  # 起動後 http://localhost:18889 を開く
 
 <a id="architecture"></a>
 
-未リリース：[予約して依頼する](docs/features/ja-JP/67-assigning-tasks.md)機能で、チャットやダッシュボードから AI スタッフへ日時指定・繰り返しの依頼ができます。毎回の実行前に作成者の権限を確認し直します。
+v1.76.0：[予約して依頼する](docs/features/ja-JP/67-assigning-tasks.md)機能で、チャットやダッシュボードから AI スタッフへ日時指定・繰り返しの依頼ができます。毎回の実行前に作成者の権限を確認し直します。
 
 ## アーキテクチャ概要
 
@@ -245,8 +245,8 @@ duduclaw license             # ライセンス管理(activate / status / redeem 
 - **特権昇格なし**:完全にユーザー空間で動作
 - **メンテナ**:嘟嘟數位科技有限公司(台湾登記企業、統一編号 94139082)
 - **チャネルでの高リスク操作**:AI社員がチャネルで高リスクな Computer Use ステップの承認を求めたら、リクエストの完全な ID を付けて返信します。結果が不明な操作は自動で再送されず、Admin がダッシュボードで確定させます。詳しくは[運用ガイド](docs/guides/ja-JP/durable-channel-decisions.md)
-- **ブラウザーログイン保存（未リリース）**：社員ごとのコンテナーログインを暗号化して保存できます。既定は無効で、削除・所有者変更に対応します。実コンテナー検証は未完了です。[ガイド](docs/guides/ja-JP/browser-login-state.md)。
-- **チームのブラウザー閲覧（未リリース）**：上司は、部下との対話で開始したコンテナーのマスク済み画像を閲覧し、そのセッションを停止できます。既存の直接バインド権限は維持します。認証済みの会話と対応するタスク・実行記録からセッション限定リンクを開き、ログイン後に戻れます。[ガイド](docs/guides/ja-JP/browser-watch.md)。
+- **ブラウザーログイン保存（v1.76.0）**：社員ごとのコンテナーログインを暗号化して保存できます。既定は無効で、削除・所有者変更に対応します。実コンテナー検証は未完了です。[ガイド](docs/guides/ja-JP/browser-login-state.md)。
+- **チームのブラウザー閲覧（v1.76.0）**：上司は、部下との対話で開始したコンテナーのマスク済み画像を閲覧し、そのセッションを停止できます。既存の直接バインド権限は維持します。認証済みの会話と対応するタスク・実行記録からセッション限定リンクを開き、ログイン後に戻れます。[ガイド](docs/guides/ja-JP/browser-watch.md)。
 
 各リリース資産には 3 種類の検証手段が付属します:SHA-256 チェックサム、[cosign](https://github.com/sigstore/cosign) keyless 署名、minisign Ed25519 署名(内蔵オートアップデータはこの署名を必須とし、未署名・改竄されたリリースを拒否します):
 
@@ -282,15 +282,15 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 
 ## ドキュメント
 
-Enterprise の個人 Google 接続（未リリース）：本人が接続し、社員ごとに利用を許可・解除できます。[自分の接続](docs/guides/ja-JP/google-personal-connections.md)を参照してください。
+Enterprise の個人 Google 接続（v1.76.0）：本人が接続し、社員ごとに利用を許可・解除できます。[自分の接続](docs/guides/ja-JP/google-personal-connections.md)を参照してください。
 
-- [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：未リリースのEnterprise画面とAPI。部下のWebChatとマスクした外部会話を、職員向け通知、有効期間、必須監査とともに提供します。 直接 Viewer／Operator は本人の WebChat を全文、外部をマスク、他人を非表示とします。Owner／Admin の全文権限は維持し、移行設定を用意します。
+- [チーム会話の読み取り専用閲覧](docs/features/ja-JP/68-manager-team-history.md)：Enterprise画面とAPI（v1.76.0）。部下のWebChatとマスクした外部会話を、職員向け通知、有効期間、必須監査とともに提供します。 直接 Viewer／Operator は本人の WebChat を全文、外部をマスク、他人を非表示とします。Owner／Admin の全文権限は維持し、移行設定を用意します。
 - **会話を閲覧した人**では、自分のチーム閲覧記録のみを確認できます（[説明](docs/features/ja-JP/68-manager-team-history.md)）。
 - [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体
 - [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
 - [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
-- [MCP 操作ごとの権限](docs/guides/ja-JP/mcp-call-lifetimes.md)：HTTP 操作単位の権限を扱う未リリースのホスト API リファレンス
+- [MCP 操作ごとの権限](docs/guides/ja-JP/mcp-call-lifetimes.md)：HTTP 操作単位の権限を扱うホスト API リファレンス（v1.76.0）
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
 - [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);[52-desktop-edition.md](docs/features/52-desktop-edition.md):デスクトップ版、人と AI で一台を共有;ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md);アプリ互換・イメージのビルド・リリースはいずれも [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ(互換層は同リポジトリの `docs/guides/app-compat.md`)

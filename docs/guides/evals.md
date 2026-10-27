@@ -298,7 +298,7 @@ n=42 clusters=6 pass=83.3% ±7.1pp (clustered) | MDE@n=10.0pp | q=1.84 → pass 
   the point estimate looks.
 - **`→ pass|fail|unresolved (vs chance|vs baseline)`** — the verdict word,
   plus which question it's answering. See
-  [Top‑level verdict precedence](#top-level-verdict-precedence) below — this
+  [Top‑level verdict precedence](#toplevel-verdict-precedence) below — this
   suffix exists specifically because, without it, a `--baseline` run's
   top‑level verdict and its own `stats.suite.verdict` can print opposite
   words and look like a bug.
