@@ -22,6 +22,7 @@ def block(start: str, end: str) -> str:
 PREFLIGHT = block(
     "# --- Enterprise release preflight", "# --- End enterprise release preflight ---"
 )
+FETCH = block("# Fetch the distributor notice once", 'if [[ "$PRO_RELEASE" == "1" && -x "$PRO_IMAGE_SCRIPT"')
 GATE = block("# --- Enterprise release gate ---", 'echo " Release v$NEW_VERSION prepared successfully!"')
 
 
@@ -145,6 +146,34 @@ class ReleaseProGateTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(self.root / "commercial"), "status", "--porcelain"],
                                 capture_output=True, text=True).stdout
         self.assertEqual(status, "")
+
+    def run_fetch(self, fetch_body: str):
+        gw = self.root / "commercial/duduclaw-pro-gateway"
+        gw.mkdir(parents=True, exist_ok=True)
+        (gw / "distributor-notice.html").write_text("stale notice from last release")
+        fetch = gw / "fetch-distributor-notice.sh"
+        fetch.write_text(f"#!/bin/sh\necho \"argv=$*\" > {self.root}/fetch.log\n"
+                         f"echo \"env=$DUDUCLAW_CONTROL_ADMIN_TOKEN\" >> {self.root}/fetch.log\n{fetch_body}\n")
+        fetch.chmod(0o755)
+        (gw / "build-policy.py").write_text("")
+        result = self.run_bash("PRO_RELEASE=1\nPRO_GAPS=()\nPRO_NOTICE_TOKEN=s3cret\n" + FETCH +
+                               '\nprintf "GAPS=%s\\n" "${#PRO_GAPS[@]}"\n')
+        return result, (self.root / "fetch.log").read_text(), gw / "distributor-notice.html"
+
+    def test_notice_fetch_gets_the_token_only_through_its_environment(self):
+        result, log, notice = self.run_fetch('echo fresh > "$1"')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("env=s3cret", log)
+        self.assertNotIn("s3cret", log.splitlines()[0])  # argv line
+        self.assertNotIn("s3cret", result.stdout + result.stderr)
+        self.assertEqual(notice.read_text().strip(), "fresh")
+        self.assertIn("GAPS=0", result.stdout)
+
+    def test_failed_notice_fetch_leaves_no_stale_notice(self):
+        result, _, notice = self.run_fetch("exit 1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(notice.exists())
+        self.assertIn("GAPS=1", result.stdout)
 
     def test_darwin_binary_path_follows_cargo_target_dir(self):
         darwin = RELEASE[RELEASE.index("validating policy and building duduclaw-pro"):

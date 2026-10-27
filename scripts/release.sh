@@ -897,25 +897,26 @@ if [[ "$PRO_RELEASE" == "1" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" == "1" ]]; then
     PRO_GAPS+=("pro-image + oem-tar skipped (DUDUCLAW_SKIP_PRO_IMAGE=1) — re-run: $PRO_IMAGE_SCRIPT v$NEW_VERSION")
 fi
 # Fetch the distributor notice once so the darwin binary below embeds the same
-# notice as the image (build-image.sh fetches its own copy).
-PRO_NOTICE_ENV=()
-if [[ "$PRO_RELEASE" == "1" && -n "${PRO_NOTICE_TOKEN:-}" ]]; then
-    PRO_NOTICE_ENV=("DUDUCLAW_CONTROL_ADMIN_TOKEN=$PRO_NOTICE_TOKEN")
-fi
+# notice as the image (build-image.sh fetches its own copy). The token goes in
+# as a prefix assignment, never as an `env` argument, so it does not show up
+# in a process listing. A previous release's file is removed first: a failed
+# fetch must not leave an old notice for the darwin build to embed.
 if [[ "$PRO_RELEASE" == "1" && "${DUDUCLAW_DISTRIBUTOR_NOTICE:-fetch}" == "fetch" ]]; then
     echo ""
     echo "Fetching the distributor notice..."
+    rm -f commercial/duduclaw-pro-gateway/distributor-notice.html
     if ! ( cd commercial/duduclaw-pro-gateway &&
-           env ${PRO_NOTICE_ENV[@]+"${PRO_NOTICE_ENV[@]}"} ./fetch-distributor-notice.sh distributor-notice.html &&
+           DUDUCLAW_CONTROL_ADMIN_TOKEN="${PRO_NOTICE_TOKEN:-}" ./fetch-distributor-notice.sh distributor-notice.html &&
            python3 build-policy.py --check ); then
-        echo "  WARNING: distributor notice fetch failed — the darwin binary would ship without it."
+        rm -f commercial/duduclaw-pro-gateway/distributor-notice.html
+        echo "  WARNING: distributor notice fetch failed — the darwin binary will ship without it."
         PRO_GAPS+=("distributor notice not fetched — re-run commercial/duduclaw-pro-gateway/fetch-distributor-notice.sh and rebuild the darwin binary")
     fi
 fi
 if [[ "$PRO_RELEASE" == "1" && -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
     echo ""
     echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
-    if env ${PRO_NOTICE_ENV[@]+"${PRO_NOTICE_ENV[@]}"} DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" \
+    if DUDUCLAW_CONTROL_ADMIN_TOKEN="${PRO_NOTICE_TOKEN:-}" DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" \
         "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
         echo "  Enterprise image v$NEW_VERSION pushed."
         PRO_IMAGE_PUSHED=1
