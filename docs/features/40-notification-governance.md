@@ -155,7 +155,7 @@ The one-per-day cap is hard: a state file records the last local date a digest w
 
 ## Employee digest ("while you were away")
 
-Added 2026-10-08 (unreleased), separate from the deployment-wide `[notify] daily_digest` above.
+Added 2026-10-08 (v1.72.0), separate from the deployment-wide `[notify] daily_digest` above.
 
 ```toml
 # ~/.duduclaw/config.toml
@@ -178,7 +178,7 @@ Each finished item on the home page has 👍 / 👎 / "needs changes" (with an o
 
 ## Interim status while a reply is slow
 
-Added 2026-10-08 (unreleased), on by default (owner decision 2026-10-08).
+Added 2026-10-08 (v1.72.0), on by default (owner decision 2026-10-08).
 
 ```toml
 [channel_reply]

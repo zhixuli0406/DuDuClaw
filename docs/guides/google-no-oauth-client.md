@@ -25,7 +25,7 @@ customers outside the developer's own domain.
 
 To have each AI employee act as a different colleague (instead of one
 `subject` for everyone), see
-[Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-unreleased).
+[Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
 
 ### What you are asking the customer for
 

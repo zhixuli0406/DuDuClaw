@@ -131,9 +131,9 @@ v1.68.0 起，`enabled`、`gmail_enabled`、`dropfolder_enabled`、`default_agen
 指定另一個 agent 的 `agent_id` 會走跟其他跨 agent 工具一樣的委派政策檢查：
 信箱存取權跟著組織架構走，不是一個誰都能亂讀的扁平命名空間。
 
-## 讀的是誰的 Gmail（未發布）
+## 讀的是誰的 Gmail（v1.76.0）
 
-Gmail 收信用「收信所屬員工」（上面說的 `[mail] default_agent`）的 Google 身分讀信。員工用公司共用帳號時，和以前完全一樣。員工設定成透過公司授權代表某位同事（`agent.toml [google] identity = "delegate:<email>"`）時，讀的是那位同事的信箱，權杖由 gateway 在自己的行程裡取得。身分用不了時，這一輪不收信並記錄原因；除非這位員工設了 `fallback = "home"`，否則不會改讀公司共用帳號。信箱屬於某位同事期間，信箱頁（`mail.list`、`mail.read`、`mail.archive`、`mail.outbox`、`mail.decide`）只有管理員和那位同事能開（**行為變更**；用公司共用帳號的信箱仍是主管以上可看）。一個安裝仍然只有一個信箱。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表未發布)。
+Gmail 收信用「收信所屬員工」（上面說的 `[mail] default_agent`）的 Google 身分讀信。員工用公司共用帳號時，和以前完全一樣。員工設定成透過公司授權代表某位同事（`agent.toml [google] identity = "delegate:<email>"`）時，讀的是那位同事的信箱，權杖由 gateway 在自己的行程裡取得。身分用不了時，這一輪不收信並記錄原因；除非這位員工設了 `fallback = "home"`，否則不會改讀公司共用帳號。信箱屬於某位同事期間，信箱頁（`mail.list`、`mail.read`、`mail.archive`、`mail.outbox`、`mail.decide`）只有管理員和那位同事能開（**行為變更**；用公司共用帳號的信箱仍是主管以上可看）。一個安裝仍然只有一個信箱。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
 每封 Gmail 收件都會記下實際使用的代表帳號；明確改用公司共用帳號時，就記成共用收件。`mail.list` 先過濾再分頁，`mail.read` 通過這封信的授權後才標成已讀。管理員能讀全部；有效帳號本人（包含一般員工角色）只讀自己的個人收件。共用、舊版、來源不明及投遞資料夾信件仍只給主管以上。變更目前的代表帳號或關閉 Gmail，不會重標以前收的信。員工「連線」分頁提供本人唯讀信箱入口，不顯示封存或寄件決定。
 

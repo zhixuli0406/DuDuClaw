@@ -261,11 +261,11 @@ The marketplace is accessible through MCP:
 | Tool | Purpose |
 |------|---------|
 | `skill_search` | Search every skill source (hubs + learned bank) with weighted ranking; `source` narrows it |
-| `skill_list` | List the skills an agent loads (company-wide, department and own); skills switched off for that agent are not listed. Defaults to the calling agent (unreleased; it used to default to the main agent and skip the department layer) |
+| `skill_list` | List the skills an agent loads (company-wide, department and own); skills switched off for that agent are not listed. Defaults to the calling agent (v1.76.0; it used to default to the main agent and skip the department layer) |
 
 ---
 
-## The Skill Library page (unreleased)
+## The Skill Library page (v1.76.0)
 
 The dashboard's **Skills** page has four tabs: Market, Team Skills, My Skills and Leaderboard. The open tab is part of the address (`/skills?tab=shared`, `?tab=mySkills`, `?tab=leaderboard`), so a link or a reload lands on the same tab.
 

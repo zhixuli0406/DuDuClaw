@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The gateway's default loopback host and port. Mirrors the CLI:
@@ -531,7 +531,11 @@ pub fn duduclaw_home() -> PathBuf {
 /// Pidfile recording the sidecar we spawned, so a later launch (or a crash
 /// recovery pass) can reclaim an orphaned process (§D2.1 / §D2.3).
 pub fn sidecar_pidfile() -> PathBuf {
-    duduclaw_home().join("desktop-sidecar.pid")
+    sidecar_pidfile_in(&duduclaw_home())
+}
+
+fn sidecar_pidfile_in(home: &Path) -> PathBuf {
+    home.join("desktop-sidecar.pid")
 }
 
 /// Directories a GUI launch (Finder/Dock) typically misses because it does not
@@ -815,10 +819,12 @@ mod tests {
         }
     }
 
+    // Reads no environment: `configured_port_defaults_when_unset` points
+    // DUDUCLAW_HOME at a temp dir while other tests run in parallel, which made
+    // the old `sidecar_pidfile()`-based assertion flaky.
     #[test]
     fn pidfile_under_home() {
-        let p = sidecar_pidfile();
-        assert!(p.ends_with("desktop-sidecar.pid"));
-        assert!(p.to_string_lossy().contains(".duduclaw"));
+        let home = Path::new("/home/someone/.duduclaw");
+        assert_eq!(sidecar_pidfile_in(home), home.join("desktop-sidecar.pid"));
     }
 }

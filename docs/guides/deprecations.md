@@ -174,7 +174,7 @@ warning that the check could not be made.
 
 ---
 
-## Gemini CLI runtime removed (unreleased)
+## Gemini CLI runtime removed (v1.75.0)
 
 The `gemini` agent runtime was deprecated in v1.67.0 and is removed in this
 change. The announced removal moved through v1.69.0–v1.75.0; the older

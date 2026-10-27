@@ -193,7 +193,7 @@ Gmail（搜尋／讀取／建草稿）、行事曆（列出／建立）、Sheets
 ## 疑難排解
 
 三條路各自的錯誤訊息、re-auth 流程、已知限制都在對應的深入文件裡：
-- OAuth client 路徑的 `401`／`403`／redirect URI 不符 → [google-workspace.md#troubleshooting](google-workspace.md#troubleshooting)
+- OAuth client 路徑的 `401`／`403`／redirect URI 不符 → [google-workspace.md#troubleshooting](google-workspace.md#疑難排解)
 - 服務帳號 `unauthorized_client`（多半是管理員貼的 scope 清單少一個）、
   Apps Script 網址／密鑰驗證規則 → [google-no-oauth-client.md](google-no-oauth-client.md)
 

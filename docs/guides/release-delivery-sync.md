@@ -68,11 +68,13 @@ changed file modes, changed feature notes or extra parents are refused. The lega
 technical-brief renderer can still produce its separate private HTML, but that
 optional output cannot satisfy either mandatory full-manual item.
 
-## Enterprise channel gate (unreleased)
+## Enterprise channel gate (v1.76.2)
 
-`scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private enterprise checkout, the Pro signing key, `minisign`, `gcloud` and `docker` on `PATH`, a running Docker daemon and an active gcloud account. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
+`scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private enterprise checkout, the Pro signing key, `minisign`, `gcloud` and `docker` on `PATH`, a running Docker daemon, an active gcloud account, the token that fetches the distributor notice (read from Secret Manager when `DUDUCLAW_CONTROL_ADMIN_TOKEN` is unset; `DUDUCLAW_DISTRIBUTOR_NOTICE=skip` builds without fetching) and the enterprise checkout on its own branch. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
 
-After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) and a committed enterprise `Cargo.lock` must all succeed. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the enterprise checkout.
+After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) must all succeed. The script commits the re-resolved enterprise `Cargo.lock` and the distributor brief on the enterprise checkout's branch and prints the push command; only a failed commit is a gap. The darwin binary is taken from cargo's actual target directory, so a shared `CARGO_TARGET_DIR` works. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the enterprise checkout.
+
+Unreleased (after v1.76.2): the distributor-notice token and enterprise-branch preflight checks, the automatic enterprise commit, and reading the darwin binary from cargo's target directory.
 
 ## Merge, then publish
 

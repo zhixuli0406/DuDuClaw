@@ -1,6 +1,6 @@
 # Read-only team conversations
 
-Unreleased Enterprise dashboard and read-only API.
+Enterprise dashboard and read-only API (v1.76.0).
 
 In the Enterprise edition, an active Manager or Admin can read conversations for an AI employee directly bound at Operator or Owner to an active person below them in the reporting tree (up to eight levels). Admin alone grants no access to this view. A forced password change, reassignment, suspension or removed binding takes effect on the next request; permissions are checked again before returning content. Manager oversight does not widen ordinary history, export, download or WebChat resume permissions. The separate direct-binding privacy change is described below.
 
@@ -75,7 +75,7 @@ Counts describe the returned parts after message selection/truncation; numbering
 
 See [Calling AI staff](62-calling-ai-staff.md) and [Security defense](05-security-defense.md).
 
-## Direct Viewer and Operator bindings (unreleased behavior change)
+## Direct Viewer and Operator bindings (v1.76.0 behavior change)
 
 Directly bound Viewers and Operators can continue chatting and calling AI staff. Their conversation history is now scoped: their own signed-in WebChat stays full text, other accounts’ WebChats are hidden, and external customer conversations open in a separate read-only masked view. Direct Owners and Admins retain full access. Unknown and internal session origins are excluded from this conversation view; task runs retain their existing task audience.
 

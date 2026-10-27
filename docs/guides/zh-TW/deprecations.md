@@ -142,7 +142,7 @@ DuDuClaw OS 的首次設定（OOBE）也會呼叫 `auth.cli_login.start`。v0.4.
 
 ---
 
-## Gemini CLI runtime 已移除（未發版）
+## Gemini CLI runtime 已移除（v1.75.0）
 
 `gemini` 員工 runtime 從 v1.67.0 開始棄用，已在本次變更移除。先前公告曾把移除
 時間從 v1.69.0 延到 v1.75.0；歷史紀錄保留在 CHANGELOG。升級前應先修改仍使用

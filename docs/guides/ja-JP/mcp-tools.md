@@ -22,7 +22,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | 外部クライアント許可リスト | `principal.is_external` | 従来の許可リスト 7 ツールと、明示的に付与した scope のツールのみ。続けて次の行の scope 規則が適用されます |
 | 社員でない呼び出し元の scope | `principal.scopes`。`admin` を持たず AI 社員でもないキー（gateway 内部キーでも、社員ごとのキーでも、gateway が社員用に起動したプロセスでもない）に適用 | キーが最低 scope を持つツールだけを掲載。プロセス自身のエージェントとして動くツール（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` と三つの統合状態の参照など）は掲載せず、すべての外部キーにも掲載しません。呼び出しはディスパッチゲートが同じ規則で拒否します（`process_agent_tool`）。[mcp-standalone.md](mcp-standalone.md) を参照 |
 | Google Workspace | `config.toml [integrations] google_workspace` | Google 系 19 ツールを非表示 |
-| Google の身元（未リリース） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 19 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
+| Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 19 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
 | GitHub | `config.toml [integrations] github` | `github_*` 5 ツールを非表示 |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示。項目は完全一致、または末尾の `*` で照合：`*`、`mcp__duduclaw__*`（DuDuClaw の全ツール）、`mcp__duduclaw__odoo_*`／`memory_*`（先頭からの前方一致）。`mcp__<他のサーバー>__…` は DuDuClaw のツールに一致しない。それ以外の位置の `*` は通常の文字。3 つの承認リストと `scoped_tools` も同じ規則 |
 | `os_native` | `agent.toml [capabilities]` | `os_*` 自動化 6 ツールを非表示 |
