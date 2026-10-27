@@ -427,7 +427,7 @@ duduclaw eval commercial/evals/hr-recruit --matrix --team-2x2 \
 
 この home に suite 自身のエージェント（`hr-recruit`）がデプロイされているなら、`--agent agnes` は外してください。そうでなければ残します。[1 つのエージェントを借りる](#1-つのエージェントを借りる--agent) を参照してください。
 
-`--max-cases 6` は suite から取る case の数に上限をかけます。`--weak`／`--strong` のアームは、`claude-sonnet-4-6` が `--models` のエントリーでなくても測定されます（そうしないと Δ に比べるアームがなくなります）。6 件の case と `K=1` では、達成される MDE は宣言された 10pp よりはるかに粗くなるので、`unresolved` の cell と `unresolved` のボトルネックになるでしょう。それは smoke 実行の正直な結果であり、失敗ではありません。verifier cell には各 case の記録済み `*.transcript.jsonl` が必要で、ないものは数えられるのではなく `no_recorded_transcript` としてスキップされます。また、今日の古い premium 基準に対しては、さらに `degenerate_gold` で返ってきます（[verifier cell には混合した gold が必要](#verifier-cell-には混合した-gold) を参照）。
+`--max-cases 6` は suite から取る case の数に上限をかけます。`--weak`／`--strong` のアームは、`claude-sonnet-4-6` が `--models` のエントリーでなくても測定されます（そうしないと Δ に比べるアームがなくなります）。6 件の case と `K=1` では、達成される MDE は宣言された 10pp よりはるかに粗くなるので、`unresolved` の cell と `unresolved` のボトルネックになるでしょう。それは smoke 実行の正直な結果であり、失敗ではありません。verifier cell には各 case の記録済み `*.transcript.jsonl` が必要で、ないものは数えられるのではなく `no_recorded_transcript` としてスキップされます。また、今日の古い premium 基準に対しては、さらに `degenerate_gold` で返ってきます（[verifier cell には混合した gold が必要](#verifier-cell-には混合した-gold-が必要) を参照）。
 
 **exit code。** 失敗した、または `unresolved` の cell は*測定*なので、`--matrix` は 0 で終了します。非ゼロで終了するのは、仕様／インフラの失敗、つまり拒否されたフラグの組み合わせ、書き込めないレポート、またはマトリクス全体で使える観測が 1 件もない場合（すべての実行がエラー、スキップ、または差し替えられた場合）だけです。その場合に緑で終了すると、事実と異なることを伝えることになります。
 

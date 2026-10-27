@@ -240,7 +240,7 @@ Script を無効化していなければ利用可能）で、OAuth client の申
 3つの経路それぞれのエラーメッセージ、re-auth の流れ、既知の制限は、
 対応する詳細ドキュメントにまとめてあります。
 - OAuth client 経路の `401`／`403`／redirect URI 不一致 →
-  [google-workspace.md#troubleshooting](google-workspace.md#troubleshooting)
+  [google-workspace.md#troubleshooting](google-workspace.md#トラブルシューティング)
 - サービスアカウントの `unauthorized_client`（多くは管理者が貼り付けた
   scope 一覧に抜けがある場合）、Apps Script の URL／秘密鍵の検証ルール →
   [google-no-oauth-client.md](google-no-oauth-client.md)

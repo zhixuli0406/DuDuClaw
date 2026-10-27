@@ -6,7 +6,7 @@
 本指南涵蓋 Docker Compose 部署、Codex 裝置碼登入、API key、憑證 volume、channel webhook 與更新。
 
 若只是想在本機試跑，請先參考
-[docs/deployment-guide.md §1](deployment-guide.md#1-local-development)
+[docs/deployment-guide.md §1](deployment-guide.md#1-本機開發)
 的原生安裝方式；原生安裝通常啟動更快、除錯更簡單。
 Docker 適合伺服器部署、隔離執行環境、或需要統一環境的團隊。
 
@@ -43,8 +43,8 @@ DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段
 
 若要讓 channel webhook（LINE、WhatsApp、Feishu 等走 webhook 的通道）能收到外部訊息，
 還需要一個 **公開 HTTPS URL**。最簡單的方案是
-[Tailscale Funnel](#11-tailscale-funnel-公開-https-給-webhook) 或
-[Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel-long-term-stable)。
+[Tailscale Funnel](#11-tailscale-funnel公開-https-給-webhook) 或
+[Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel長期穩定)。
 
 ---
 
@@ -458,7 +458,7 @@ docker inspect duduclaw-server --format '{{json .State.Health}}' | jq
 ### 8.3 Prometheus Metrics
 
 Gateway 提供 `GET /metrics` 端點，指標清單見
-[docs/deployment-guide.md §8](deployment-guide.md#8-prometheus--grafana-monitoring)。
+[docs/deployment-guide.md §9](deployment-guide.md#9-prometheus--grafana-監控)。
 
 ---
 
@@ -489,10 +489,10 @@ LINE / WhatsApp / Feishu 等走 webhook 的通道都需要**可從網際網路�
 
 | 方案 | 適用情境 | 成本 | 指引 |
 |------|---------|------|------|
-| Tailscale Funnel | 家用 / 開發 / 臨時 | 免費 | [§11](#11-tailscale-funnel-公開-https-給-webhook) |
-| Cloudflare Tunnel | 長期生產 | 免費（需自有網域） | [deployment-guide §4](deployment-guide.md#4-cloudflare-tunnel-long-term-stable) |
-| ngrok | 快速 demo | 免費版 URL 會變 | [deployment-guide §3](deployment-guide.md#3-ngrok-alternative) |
-| 反向代理（Caddy / Nginx） | 自有公網 IP + 網域 | 需自行維護 | [deployment-guide §5](deployment-guide.md#5-reverse-proxy-caddy--nginx) |
+| Tailscale Funnel | 家用 / 開發 / 臨時 | 免費 | [§11](#11-tailscale-funnel公開-https-給-webhook) |
+| Cloudflare Tunnel | 長期生產 | 免費（需自有網域） | [deployment-guide §4](deployment-guide.md#4-cloudflare-tunnel長期穩定) |
+| ngrok | 快速 demo | 免費版 URL 會變 | [deployment-guide §3](deployment-guide.md#3-ngrok替代方案) |
+| 反向代理（Caddy / Nginx） | 自有公網 IP + 網域 | 需自行維護 | [deployment-guide §5](deployment-guide.md#5-反向代理caddy--nginx) |
 
 ---
 
@@ -645,7 +645,7 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 ```
 
 重啟後啟動 log 會印出生效的額外 origins。詳見
-[deployment-guide §5 WebSocket Origin 白名單](deployment-guide.md#websocket-origin-白名單反向代理-tailnet-必讀)。
+[deployment-guide §5 WebSocket Origin 白名單](deployment-guide.md#websocket-origin-白名單反向代理--tailnet-必讀)。
 
 ### Channel webhook 沒有觸發 agent
 

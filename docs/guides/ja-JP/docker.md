@@ -6,7 +6,7 @@
 本ガイドでは Docker Compose のデプロイ、Codex のデバイスコードログイン、API キー、認証情報の volume、channel webhook、更新を説明します。
 
 ローカルで試すだけなら、まず
-[docs/deployment-guide.md §1](deployment-guide.md#1-local-development)
+[docs/deployment-guide.md §1](deployment-guide.md#1-ローカル開発)
 のネイティブインストール手順を参照してください。ネイティブインストールの方が起動が速く、デバッグも簡単です。
 Dockerはサーバーデプロイ、実行環境の分離、統一環境が必要なチームに向いています。
 
@@ -43,9 +43,9 @@ DuDuClawのDockerイメージは `container/Dockerfile.server` で構築され�
 
 channel webhook（LINE、WhatsApp、Feishu など webhook を使うチャネル）で外部からのメッセージを受信するには、
 **公開HTTPS URL** が別途必要です。最も手軽な選択肢は
-[Tailscale Funnel](#11-tailscale-funnel-公開httpsをwebhookに提供)
+[Tailscale Funnel](#11-tailscale-funnel公開httpsをwebhookに提供)
 または
-[Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel-long-term-stable)です。
+[Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel長期安定運用向け)です。
 
 ---
 
@@ -119,7 +119,7 @@ open http://localhost:18789
 | 変数 | デフォルト | 説明 |
 |------|------|------|
 | `DUDUCLAW_BIND` | `0.0.0.0` | Gatewayのlistenアドレス。コンテナ内では必ず `0.0.0.0` でなければ外部からアクセスできません |
-| `DUDUCLAW_ALLOWED_ORIGINS` | （空） | Dashboard WebSocket/CORSの追加許可 `Origin`、カンマ区切り。tailnetやリバースプロキシ経由でdashboardを開き、WSが403になる場合に設定します（[§13 トラブルシューティング](#dashboardがくるくる回り続ける-websocket-403)を参照）。config.tomlの `[gateway] allowed_origins` とマージされます |
+| `DUDUCLAW_ALLOWED_ORIGINS` | （空） | Dashboard WebSocket/CORSの追加許可 `Origin`、カンマ区切り。tailnetやリバースプロキシ経由でdashboardを開き、WSが403になる場合に設定します（[§13 トラブルシューティング](#dashboardがくるくる回り続けるwebsocket-403)を参照）。config.tomlの `[gateway] allowed_origins` とマージされます |
 
 Portはenv varではなくcompose ファイル内で設定します。詳細は[§5 Port設定の詳細](#5-port設定の詳細)を参照してください。
 
@@ -456,7 +456,7 @@ docker inspect duduclaw-server --format '{{json .State.Health}}' | jq
 ### 8.3 Prometheus Metrics
 
 Gatewayは `GET /metrics` エンドポイントを提供しています。指標一覧は
-[docs/deployment-guide.md §8](deployment-guide.md#8-prometheus--grafana-monitoring)を参照してください。
+[docs/deployment-guide.md §9](deployment-guide.md#9-prometheus--grafana-モニタリング)を参照してください。
 
 ---
 
@@ -487,10 +487,10 @@ LINE / WhatsApp / Feishu など webhook を使うチャネルはいずれも**�
 
 | 方法 | 適したシーン | コスト | ガイド |
 |------|---------|------|------|
-| Tailscale Funnel | 家庭 / 開発 / 一時的な利用 | 無料 | [§11](#11-tailscale-funnel-公開httpsをwebhookに提供) |
-| Cloudflare Tunnel | 長期的な本番運用 | 無料（独自ドメインが必要） | [deployment-guide §4](deployment-guide.md#4-cloudflare-tunnel-long-term-stable) |
-| ngrok | クイックデモ | 無料版はURLが変わる | [deployment-guide §3](deployment-guide.md#3-ngrok-alternative) |
-| リバースプロキシ（Caddy / Nginx） | 独自のグローバルIP＋ドメイン | 自前でメンテナンスが必要 | [deployment-guide §5](deployment-guide.md#5-reverse-proxy-caddy--nginx) |
+| Tailscale Funnel | 家庭 / 開発 / 一時的な利用 | 無料 | [§11](#11-tailscale-funnel公開httpsをwebhookに提供) |
+| Cloudflare Tunnel | 長期的な本番運用 | 無料（独自ドメインが必要） | [deployment-guide §4](deployment-guide.md#4-cloudflare-tunnel長期安定運用向け) |
+| ngrok | クイックデモ | 無料版はURLが変わる | [deployment-guide §3](deployment-guide.md#3-ngrok代替手段) |
+| リバースプロキシ（Caddy / Nginx） | 独自のグローバルIP＋ドメイン | 自前でメンテナンスが必要 | [deployment-guide §5](deployment-guide.md#5-リバースプロキシcaddy--nginx) |
 
 ---
 
