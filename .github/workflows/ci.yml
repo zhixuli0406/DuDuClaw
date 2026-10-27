@@ -210,6 +210,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_*distributor*.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_release_delivery.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_release_pro_gate.py' -v
           bash -n scripts/release.sh
 
   security:
