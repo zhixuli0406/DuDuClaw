@@ -1553,6 +1553,8 @@
   "settings.update.checking": "Checking...",
   "settings.update.upToDate": "You are running the latest version.",
   "settings.update.restartPending": "Version v{version} is on this machine; it takes effect when the gateway restarts (restarting the desktop app does not restart the gateway).",
+  "settings.update.restartPendingDesktop": "Version v{version} is on this machine; quit and reopen the desktop app to restart its gateway on the new version.",
+  "settings.update.restartPendingContainer": "Version v{version} is on disk, but a gateway in a container applies a new version by updating the image and recreating the container.",
   "settings.update.restartGateway": "Restart the gateway to apply v{version}",
   "settings.update.installBoth": "Update the gateway, then the desktop app",
   "settings.update.components": "Components",
