@@ -140,6 +140,12 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(r.payload).toEqual({ odoo: { allowed_models: ['crm.lead'] } });
   });
 
+  it('does not send untouched empty Odoo lists and sends an intentional clear', () => {
+    const s = state({ odoo: { ...DEFAULT_ODOO, unblock_models: [], clear_api_key: false, clear_password: false } });
+    expect(buildUpdatePayload(s, new Set(['odoo.username']), CTX).payload).toEqual({ odoo: { username: '' } });
+    expect(buildUpdatePayload(s, new Set(['odoo.allowed_models']), CTX).payload).toEqual({ odoo: { allowed_models: [] } });
+  });
+
   it('maps the v1.68 controls onto their sections', () => {
     const v = {
       ...DEFAULT_V168,

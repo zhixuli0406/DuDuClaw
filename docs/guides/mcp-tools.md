@@ -473,6 +473,15 @@ used, the reason (no model installed, cloud provider not acknowledged, redaction
 cloud error, …); `knowledge_list_collections` also reports each collection's vector
 coverage. Vectors only ever rank passages inside the collections the call may read.
 
+### `odoo_schema_overview` — saved Odoo structure
+
+- `odoo_schema_overview` requires **`odoo:read`**. With no parameters it lists scanned models, labels and custom-field markers. Optional `model` returns fields for one model; optional `query` searches model / field names and labels. The response is narrowed to models the employee's Odoo model / action settings and feature switches allow. Snapshot metadata does not grant access to blocked business records.
+- Odoo schema scans are available only to dashboard administrators through **Re-scan Odoo structure** (`odoo.schema_scan`), with a persisted 60-second limit per saved profile, including failures. The overview marks metadata as untrusted, screens and caps labels, and drops invalid technical names.
+- `odoo_schema_fields {model}` still reads live metadata for one permitted model. Built-in and generic reads with explicit field lists drop missing fields using live `fields_get`; a metadata failure or an empty surviving projection refuses the read.
+- `odoo_status` includes snapshot age, scan-time server version and the latest scan failure. A version mismatch recommends a re-scan. Missing snapshots and changed server versions trigger a background scan after successful connection, at most one automatic attempt per hour per effective profile. Same-version customizations need a manual scan.
+
+A scan is bounded to 400 models, 500 fields per model and 90 seconds; module and model discovery catalogs each cap at 5,000 entries. Truncation is explicit, and partial diffs do not prove removals. See [Odoo field compatibility and schema scans](../features/12-industry-templates.md#schema-scans-and-field-compatibility) for storage and permission details.
+
 ## Deprecated aliases are still listed
 
 A deprecated tool name keeps appearing in `tools/list` with a

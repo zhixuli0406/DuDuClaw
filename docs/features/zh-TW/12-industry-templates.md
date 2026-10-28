@@ -133,7 +133,7 @@ Agent：「已建立銷售訂單 SO-2024-0042，客戶 ABC。
         Widget X 10 個，合計：$1,500。」
 ```
 
-### 可用操作（17 個 MCP 工具）
+### 可用操作（18 個 MCP 工具）
 
 橋接提供以下工具（`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`）：
 
@@ -142,7 +142,27 @@ Agent：「已建立銷售訂單 SO-2024-0042，客戶 ABC。
 - **銷售**：`odoo_sale_orders`（列出訂單）、`odoo_sale_create_quotation`、`odoo_sale_confirm`
 - **庫存**：`odoo_inventory_products`（搜尋產品）、`odoo_inventory_check`（庫存水位）
 - **會計**：`odoo_invoice_list`、`odoo_payment_status`
-- **通用**：`odoo_search`（搜尋任一模型）、`odoo_execute`（呼叫模型方法）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`
+- **通用**：`odoo_search`（搜尋任一模型）、`odoo_execute`（呼叫模型方法）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`、`odoo_schema_overview`
+
+### 結構掃描與欄位相容
+
+Odoo 升級或客製後，管理員可以在 Odoo 頁按「**重新掃描 Odoo 結構**」（dashboard RPC `odoo.schema_scan`，限管理員）。掃描只讀伺服器版本、已安裝模組中繼資料、模型目錄及 `fields_get`，不讀業務資料列或二進位內容。快照包含欄位名稱、型別、標籤、關聯、必填／唯讀／儲存屬性，並標記 `x_*` 自訂欄位。 手動掃描每個已存 profile 每 60 秒最多嘗試一次，失敗也計入，重啟不重設。不合法技術名稱會丟棄並計數，標籤經注入篩查、最多 120 字元；員工總覽明示 Odoo 中繼資料不可信。所有 Odoo RPC 回應以串流累計，超過 32 MiB 會在解析前拒絕。
+
+每次最多保留 **400 個模型、每模型 500 個欄位**，總時間上限 **90 秒**。優先收錄內建工具使用的模型，其次是非 transient 的業務模型；達到上限或個別模型的中繼資料讀取失敗時會明示。模組及模型探索目錄各以 5,000 筆為上限。截斷的比較不會把未出現的模型或欄位當成已刪除。
+
+快照帶有格式版本，以原子寫入存到 `<home>/odoo/schema/<effective-profile>.json`，Unix 目錄及檔案僅擁有者可存取。有效 profile 包含端點、資料庫、Odoo 使用者及公司範圍，避免套用其他連線的快照。差異摘要列出模型／欄位增減與伺服器版本變更。這份快照與舊的「解析資料庫」寫入共享 Wiki 流程分開。
+
+`odoo_schema_overview`（`odoo:read`）讀取已存快照；可用 `model` 查看指定模型的欄位，以 `query` 搜尋模型／欄位名稱及標籤。回傳內容會依員工的模型、動作權限及 Odoo 功能模組開關過濾。預設封鎖模型在這些權限允許時仍可查中繼資料，不會因此開放業務資料列。`odoo_status` 顯示快照距今多久、掃描時版本、掃描失敗狀態；版本不同時提示 `re-scan recommended`。
+
+第一次成功連線且沒有快照，或連線時發現伺服器版本不同，會在背景自動掃描，不等待掃描才完成連線。每個有效 profile 每小時最多嘗試一次，失敗也計入；同版本的客製變更需由管理員手動重掃；其他已連線員工可呼叫 `odoo_connect`，重新取得欄位清單。
+
+內建工具讀取時，每個連線、每個模型先以 `fields_get` 取得實際欄位名稱，再從原本要求的欄位中移除不存在的項目。例如客戶搜尋保留 `phone`，伺服器沒有 `mobile` 就不要求它，不會擴大原本的安全欄位清單。中繼資料查詢失敗，或過濾後沒有任何欄位時，直接拒絕讀取，避免變成讀取全部欄位。通用查詢的明確欄位清單也使用這個相容過濾；快照不取代這次連線的實際檢查。商品類型優先使用仍存在的 `detailed_type`，缺少時採伺服器的 `type` 欄位；客戶搜尋的安全欄位清單維持不變。
+
+### Odoo 查詢被拒絕時
+
+`allowed_models`、`allowed_actions` 空清單代表不增加員工限制。功能模組關閉、通用工具的內建封鎖清單、MCP scope／工具白名單及 Odoo 自己的 ACL 仍會拒絕。查 `res.partner` 這類預設封鎖模型的業務資料，需要管理員設定 `unblock_models`；只加入 `allowed_models` 不會解除封鎖。只要員工有覆寫設定，其中的 `unblock_models` 就取代全域值，即使它是空清單。專用 `odoo_partner_search` 維持固定的安全欄位範圍。
+
+DuDuClaw 的拒絕訊息會指出是哪一道關卡與對應設定。唯讀 SQL 連接器的 `allowed_tables` 語義不同：必須非空，儲存 RPC 會拒絕空清單，不能套用 Odoo 模型白名單的解讀。
 
 ### 版本偵測
 

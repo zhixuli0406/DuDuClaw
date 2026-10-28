@@ -182,7 +182,10 @@ async fn employee_and_internal_listings_are_unchanged() {
     // tools"). The four `knowledge_*` tools are not in it: a scaffold
     // employee has no knowledge collection granted. Moves only with a
     // deliberate CHANGELOG entry.
-    assert_eq!(per_agent.len(), 167, "{per_agent:?}");
+    // The saved, permission-filtered Odoo overview adds one read tool.
+    assert_eq!(per_agent.len(), 168, "{per_agent:?}");
+    assert!(per_agent.contains("odoo_schema_overview"));
+    assert!(!per_agent.contains("odoo_schema_scan"));
 
     // The gateway-internal key acting for the same employee.
     let internal = principal(

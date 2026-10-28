@@ -404,8 +404,8 @@ async fn run_poll_loop(home_dir: PathBuf, tx: broadcast::Sender<AutopilotEvent>)
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(model = %model, error = %e, "Odoo poll failed");
+                Err(_) => {
+                    warn!("Odoo poll failed");
                     failed = true;
                 }
             }
@@ -436,9 +436,14 @@ async fn connect(home_dir: &Path, cfg: &OdooConfig) -> Option<Arc<OdooConnector>
         return None;
     };
     match OdooConnector::connect(cfg, &credential).await {
-        Ok(c) => Some(Arc::new(c)),
-        Err(e) => {
-            warn!(error = %e, "Odoo poll: connection failed — retrying next tick");
+        Ok(c) => {
+            let conn = Arc::new(c);
+            let profile = conn.schema_profile("default");
+            duduclaw_odoo::schema::spawn_auto_scan(conn.clone(), home_dir.to_path_buf(), profile);
+            Some(conn)
+        },
+        Err(_) => {
+            warn!("Odoo poll: connection failed — retrying next tick");
             None
         }
     }

@@ -25,6 +25,14 @@ use crate::mcp_rate_limit::{OpType, RateLimiter};
 use duduclaw_core::types::ToolPolicy;
 use duduclaw_memory::SqliteMemoryEngine;
 
+fn scope_denial_message(tool: &str, required: Scope) -> String {
+    if tool.starts_with("odoo_") {
+        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes.")
+    } else {
+        format!("Insufficient scope: {required:?} required for '{tool}'")
+    }
+}
+
 #[cfg(test)]
 #[path = "mcp_dispatch_google_tests.rs"]
 mod google_tests;
@@ -782,10 +790,7 @@ impl McpDispatcher {
                 return jsonrpc_error(
                     id,
                     -32003,
-                    &format!(
-                        "Insufficient scope: {:?} required for '{}'",
-                        required, tool_name
-                    ),
+                    &scope_denial_message(tool_name, required),
                 );
             }
         }
@@ -1571,7 +1576,7 @@ impl McpDispatcher {
                 return jsonrpc_error(
                     id,
                     -32003,
-                    &format!("Insufficient scope: {required:?} required for '{tool_name}'"),
+                    &scope_denial_message(tool_name, required),
                 );
             }
         }
@@ -1781,6 +1786,16 @@ impl McpDispatcher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn odoo_scope_denial_names_gate_and_operator_scopes() {
+        for (tool, scope) in [("odoo_search", super::Scope::OdooRead), ("odoo_execute", super::Scope::OdooExecute), ("odoo_schema_overview", super::Scope::OdooRead)] {
+            let message = super::scope_denial_message(tool, scope.clone());
+            assert!(message.contains("MCP scope gate"));
+            assert!(message.contains(&scope.to_string()));
+            assert!(message.contains("MCP key scopes"));
+            assert!(!message.contains(".rs"));
+        }
+    }
     use super::*;
     use crate::mcp_auth::{Principal, Scope};
     use crate::mcp_namespace::NamespaceContext;
@@ -4324,6 +4339,7 @@ effect = "forbid"
         "odoo_sale_create_quotation",
         "odoo_sale_orders",
         "odoo_schema_fields",
+        "odoo_schema_overview",
         "odoo_search",
         "odoo_status",
         "office_script",
@@ -4439,7 +4455,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            251,
+            252,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

@@ -203,7 +203,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | Live Forking | RFC-26:進行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write 隔離、AI ジャッジが勝者を選んでマージ(デフォルト無効。v1.67.0 では Windows で有効にしないこと、CHANGELOG 参照) | [docs/rfc](docs/rfc) |
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web ダッシュボード | React 19 + TypeScript SPA、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
-| ERP 連携 | Odoo ブリッジ 17 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| ERP 連携 | Odoo ブリッジ 18 MCP ツール(CRM / 販売 / 在庫 / 会計 / 構造概要)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 | DuDuClaw OS | Yocto アプライアンスイメージ(現行 v0.4.0、プラットフォーム v1.73.4 を同梱):自前コンポジタ / シェルとショートカット、人と AI の共同運転(エージェント専用シート、シャドウワークスペース、人の入力でエージェントを凍結、Super+Esc 緊急停止;ビルドには組み込み済みで既定オフ)、A/B アトミックアップデートとロールバック(v0.4.0 より前には戻れない)、読み取り専用ルート、非 root の gateway と rootless Podman コンテナ、SSH は既定オフ、初回起動時の自動プロビジョニング + LAN ダッシュボード、アプリ互換レイヤー(Flatpak / Bottles / Waydroid);Secure Boot 署名 / dm-verity / TPM2 はビルドオーバーレイオプション(v0.4.0 でもまだ未有効化);独立リポジトリ・独立バージョン、pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。

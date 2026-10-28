@@ -204,7 +204,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉;v1.67.0 請勿在 Windows 開啟,見 CHANGELOG) | [docs/rfc](docs/rfc) |
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web Dashboard | React 19 + TypeScript SPA,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
-| ERP 整合 | Odoo 中間層 17 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| ERP 整合 | Odoo 中間層 18 個 MCP 工具(CRM / 銷售 / 庫存 / 會計 / 結構總覽),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 | DuDuClaw OS | Yocto 值班機映像(現行 v0.4.0,內嵌平台 v1.73.4):自家 compositor / 殼與快捷鍵、人機共駕(agent 專屬 seat、影子工作區、人輸入即凍結、Super+Esc 急停,已編譯進映像但預設關閉)、A/B 原子更新與回滾(不能回滾到 v0.4.0 以前)、唯讀 root、非 root gateway 與 rootless Podman 容器、SSH 預設關閉、首次開機自動 provision + 區網後台、app 相容層(Flatpak / Bottles / Waydroid);Secure Boot 簽章 / dm-verity / TPM2 為建置 overlay 選項,截至 v0.4.0 仍未啟用;獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。

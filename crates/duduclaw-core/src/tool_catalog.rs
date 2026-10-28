@@ -557,6 +557,12 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "odoo",
     ),
     (
+        "odoo_schema_overview",
+        "Browse the scanned Odoo structure",
+        "odoo:read",
+        "odoo",
+    ),
+    (
         "odoo_search",
         "Generic Odoo search_read",
         "odoo:read",

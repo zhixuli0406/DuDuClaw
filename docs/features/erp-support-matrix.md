@@ -7,7 +7,7 @@ DuDuClaw lets AI employees read and write data in your ERP / CRM directly. The t
 
 | System | Version / type | Status | What it can do | Isolation & audit |
 |--------|----------------|--------|----------------|-------------------|
-| **Odoo** | CE (Community) / EE (Enterprise) | ✅ Supported | CRM leads, quotations and sales orders, inventory lookups, invoice and payment status (17 tools in total) | Per-agent credentials, action / model allowlists, every operation audited |
+| **Odoo** | CE (Community) / EE (Enterprise) | ✅ Supported | CRM leads, quotations and sales orders, inventory lookups, invoice and payment status (18 tools in total) | Per-agent credentials, action / model allowlists, every operation audited |
 | **ERPNext** | v14+ | 🔜 Planned | First validation implementation once the abstraction layer lands | Shares the same isolation mechanisms as Odoo |
 | **Twenty** | Open-source CRM | 📋 Planned | CRM scenarios (leads / opportunities / contacts) | Same as above |
 | Other REST/JSON-RPC ERPs | — | 📋 Under evaluation | Extensible via the planned `ErpConnector` contract (ADR-004, not implemented yet) | Would be built into the contract |

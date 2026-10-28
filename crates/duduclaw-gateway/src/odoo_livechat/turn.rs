@@ -44,7 +44,7 @@ pub(super) async fn run(
                     s.greeted = true;
                 }
             }),
-            Err(e) => warn!(session = sid, error = %e, "odoo livechat: greeting failed"),
+            Err(_) => warn!(session = sid, "odoo livechat: greeting failed"),
         }
     }
     let Some(first) = input.visitor.first() else {
@@ -73,8 +73,8 @@ pub(super) async fn run(
             Ok(n) if n > 0 => {
                 let msg = lc.handoff_message.trim();
                 if !msg.is_empty() {
-                    if let Err(e) = rpc::post_reply(conn, sid, &reply_to_html(msg), msg).await {
-                        warn!(session = sid, error = %e, "odoo livechat: handoff notice failed");
+                    if rpc::post_reply(conn, sid, &reply_to_html(msg), msg).await.is_err() {
+                        warn!(session = sid, "odoo livechat: handoff notice failed");
                     }
                 }
                 with_state(home, |st| {
@@ -87,7 +87,7 @@ pub(super) async fn run(
                 return;
             }
             Ok(_) => warn!(session = sid, "odoo livechat: handoff users not found — the AI keeps answering"),
-            Err(e) => warn!(session = sid, error = %e, "odoo livechat: handoff invite failed — the AI keeps answering"),
+            Err(_) => warn!(session = sid, "odoo livechat: handoff invite failed — the AI keeps answering"),
         }
     }
 
@@ -102,8 +102,8 @@ pub(super) async fn run(
             s.last_error_at = Some(chrono::Utc::now().to_rfc3339());
         });
         let msg = super::VISITOR_FALLBACK_MESSAGE;
-        if let Err(e) = rpc::post_reply(conn, sid, &reply_to_html(msg), msg).await {
-            warn!(session = sid, error = %e, "odoo livechat: posting the fallback failed");
+        if rpc::post_reply(conn, sid, &reply_to_html(msg), msg).await.is_err() {
+            warn!(session = sid, "odoo livechat: posting the fallback failed");
         }
         return;
     };
@@ -142,7 +142,7 @@ pub(super) async fn run(
                 s.last_activity = chrono::Utc::now().to_rfc3339();
             }
         }),
-        Err(e) => warn!(session = sid, error = %e, "odoo livechat: posting the reply failed"),
+        Err(_) => warn!(session = sid, "odoo livechat: posting the reply failed"),
     }
 }
 

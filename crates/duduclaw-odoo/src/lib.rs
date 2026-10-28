@@ -20,3 +20,6 @@ pub use connector::{
 };
 pub use edition::{Edition, EditionGate};
 pub use events::{OdooEvent, PollTracker};
+
+/// Versioned, bounded metadata snapshots and automatic scan scheduling.
+pub mod schema;

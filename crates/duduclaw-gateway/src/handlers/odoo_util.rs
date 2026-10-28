@@ -35,6 +35,9 @@ impl MethodHandler {
         match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
             Ok(conn) => {
                 let st = conn.status();
+                let profile = conn.schema_profile("default");
+                let schema = duduclaw_odoo::schema::load_scan_status(&self.home_dir, &profile);
+                duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -42,11 +45,12 @@ impl MethodHandler {
                         "edition": st.edition,
                         "version": st.version,
                         "uid": st.uid,
+                        "schema": schema,
                     }),
                 )
             }
             Err(e) => {
-                warn!("Odoo connection failed: {e}");
+                warn!("Odoo connection failed");
                 WsFrame::ok_response(
                     "",
                     json!({

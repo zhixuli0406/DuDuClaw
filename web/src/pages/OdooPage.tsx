@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useAuthStore } from '@/stores/auth-store';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
@@ -7,6 +8,8 @@ import {
   type OdooStatus,
   type OdooAgentConfig,
   type OdooDiscoverSchemaResult,
+  type OdooSchemaScanStatus,
+  type OdooSchemaDiff,
 } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -45,6 +48,7 @@ type FeatureKey = (typeof FEATURE_MODULES)[number];
  */
 export function OdooPage() {
   const intl = useIntl();
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const t = (id: string) => intl.formatMessage({ id });
 
   // Connection config
@@ -109,6 +113,11 @@ export function OdooPage() {
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [scanning, setScanning] = useState(false);
+  const [scanStatus, setScanStatus] = useState<OdooSchemaScanStatus | null>(null);
+  const [scanDiff, setScanDiff] = useState<OdooSchemaDiff | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+
   // Schema discovery ("解析資料庫")
   const [discovering, setDiscovering] = useState(false);
   const [schema, setSchema] = useState<OdooDiscoverSchemaResult | null>(null);
@@ -125,7 +134,7 @@ export function OdooPage() {
     setLoading(true);
     void api.odoo
       .status()
-      .then((res) => setStatus(res))
+      .then((res) => { setStatus(res); setScanStatus(res.schema ?? null); setScanDiff(res.schema?.diff ?? null); })
       .catch((e) => console.warn('[api]', e));
     try {
       const configRes = await api.odoo.config();
@@ -275,6 +284,25 @@ export function OdooPage() {
     }
   };
 
+  const handleScan = async () => {
+    if (!isAdmin) return;
+    setScanning(true);
+    setScanError(null);
+    try {
+      const res = await api.odoo.scanSchema();
+      if (!res.success) {
+        setScanError(res.message || t('odoo.schema.failed'));
+        return;
+      }
+      setScanStatus(res.schema ?? null);
+      setScanDiff(res.diff ?? null);
+    } catch (e) {
+      setScanError(formatError(e));
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const handleDiscover = async () => {
     setDiscovering(true);
     setSchemaError(null);
@@ -412,6 +440,14 @@ export function OdooPage() {
             {testing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             {t('odoo.testConnection')}
           </Button>
+          {isAdmin && (
+            <Button variant="outline" size="sm" onClick={handleScan}
+              disabled={scanning || !configLoaded || !url.trim() || !db.trim() || saving}
+              title={t('odoo.scan.hint')}>
+              {scanning ? <Loader2 className="animate-spin" /> : <Database />}
+              {t('odoo.scan.action')}
+            </Button>
+          )}
           {/* Schema discovery — introspect models/fields + write to the wiki. */}
           <Button
             variant="outline"
@@ -441,6 +477,31 @@ export function OdooPage() {
             </span>
           )}
         </div>
+
+        {isAdmin && (
+          <div className="space-y-2 rounded-lg border border-surface-border p-4 text-sm" aria-live="polite">
+            {scanStatus?.snapshot ? (
+              <>
+                <p>{intl.formatMessage({ id: 'odoo.scan.snapshot' }, {
+                  time: intl.formatDate(scanStatus.snapshot.scanned_at, { dateStyle: 'medium', timeStyle: 'short' }),
+                  version: scanStatus.snapshot.server_version,
+                  models: scanStatus.snapshot.model_count,
+                  fields: scanStatus.snapshot.field_count,
+                })}</p>
+                {scanStatus.snapshot.truncated && <p className="text-warning">{t('odoo.scan.truncated')}</p>}
+                {status?.version && status.version !== scanStatus.snapshot.server_version && (
+                  <p className="text-warning">{t('odoo.scan.versionMismatch')}</p>
+                )}
+              </>
+            ) : <p className="text-muted-foreground">{t('odoo.scan.none')}</p>}
+            {scanDiff && <p>{intl.formatMessage({ id: 'odoo.scan.diff' }, {
+              addedModels: scanDiff.added_models.length, removedModels: scanDiff.removed_models.length,
+              addedFields: scanDiff.added_fields.length, removedFields: scanDiff.removed_fields.length,
+            })}</p>}
+            {scanDiff?.partial_comparison && <p className="text-muted-foreground">{t('odoo.scan.partialDiff')}</p>}
+            {(scanError || scanStatus?.last_error) && <p className="text-destructive">{t('odoo.scan.error')} {scanError || scanStatus?.last_error}</p>}
+          </div>
+        )}
 
         {/* Schema discovery results — searchable, checkable model list. */}
         {schema && (

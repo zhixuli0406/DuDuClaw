@@ -189,7 +189,7 @@ pub async fn go_offline_on_shutdown() {
     if let Some(h) = handle {
         match duduclaw_odoo::livechat::rpc::set_offline(&h.conn, h.api, h.bot_uid).await {
             Ok(()) => tracing::info!("odoo livechat: bot marked offline for shutdown"),
-            Err(e) => tracing::warn!(error = %e, "odoo livechat: could not mark the bot offline"),
+            Err(_) => tracing::warn!("odoo livechat: could not mark the bot offline"),
         }
     }
 }

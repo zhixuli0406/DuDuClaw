@@ -2157,9 +2157,12 @@ version = "1.76.3"
 dependencies = [
  "chrono",
  "duduclaw-core",
+ "duduclaw-security",
+ "fs2",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "toml",

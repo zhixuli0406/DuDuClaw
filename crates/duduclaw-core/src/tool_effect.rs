@@ -170,7 +170,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "notion_status" | "odoo_connect" | "odoo_crm_leads" | "odoo_inventory_check"
         | "odoo_inventory_products" | "odoo_invoice_list" | "odoo_partner_search"
         | "odoo_payment_status" | "odoo_report" | "odoo_sale_orders" | "odoo_schema_fields"
-        | "odoo_search" | "odoo_status" | "os_audio_get" | "os_backup_list"
+        | "odoo_schema_overview" | "odoo_search" | "odoo_status" | "os_audio_get" | "os_backup_list"
         | "os_boot_assessment" | "os_calendar_today" | "os_check_update" | "os_device_status"
         | "os_display_get" | "os_frontmost" | "os_network_info"
         | "os_spotlight_search" | "os_system_status" | "os_watch_status" | "os_wifi_scan"
