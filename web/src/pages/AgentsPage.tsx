@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { Link, useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useAssignStore } from '@/stores/assign-store';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { useTasksStore } from '@/stores/tasks-store';
 import { type AgentDetail } from '@/lib/api';
 import {
@@ -107,7 +107,7 @@ export function AgentsPage() {
   // to `agents.delegate` — a fourth create surface behind the same verb, whose
   // fire-and-forget bus message left no task to follow and never met the
   // acceptance judge.
-  const openAssign = useAssignStore((s) => s.openAssign);
+  const openAssign = useOpenAssign();
   const [offboardTarget, setOffboardTarget] = useState<AgentDetail | null>(null);
 
   useEffect(() => {

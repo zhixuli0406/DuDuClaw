@@ -11,10 +11,10 @@ import { GoalsPage } from './GoalsPage';
 import type { TaskInfo } from '@/lib/api';
 
 // I-2c: `/goals` no longer opens a page-local detail dialog — a task click
-// navigates straight to `/tasks/:id`, and `?task=<id>` (AssignSheet's landing
+// navigates straight to `/tasks/:id`, and `?task=<id>` (the /assign page's landing
 // URL after `tasks.goal_create`) is a redirect-only compatibility shim. Both
 // need to observe `useNavigate` calls, so the whole module is mocked here
-// (same pattern as `AssignSheet.test.tsx`) — `useSearchParams` is left as the
+// (same pattern as `AssignPage.test.tsx`) — `useSearchParams` is left as the
 // real implementation via `...actual` so `?task=` still comes from the router.
 const mockNavigate = vi.fn();
 vi.mock('react-router', async (importOriginal) => {
@@ -75,7 +75,7 @@ describe('GoalsPage', () => {
     expect(screen.getByRole('heading', { name: 'Goals' })).toBeInTheDocument();
     // One verb across the app (UX plan I-1a): this button used to say
     // "Assign goal" and open a page-local seven-field dialog; it now opens the
-    // shared AssignSheet mounted in MainLayout.
+    // shared /assign page.
     expect(screen.getAllByRole('button', { name: /Assign task/ }).length).toBeGreaterThan(0);
   });
 
@@ -148,7 +148,7 @@ describe('GoalsPage — I-2c detail navigation (no local dialog)', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
-  it('redirects a legacy /goals?task= entry point to /tasks/:id (AssignSheet compat)', async () => {
+  it('redirects a legacy /goals?task= entry point to /tasks/:id (/assign landing compat)', async () => {
     renderGoalsAt('/goals?task=gt-9');
     await waitFor(() => {
       expect(mockNavigate).toHaveBeenCalledWith('/tasks/gt-9', { replace: true });

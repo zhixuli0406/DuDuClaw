@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { api, type GalleryCard as GalleryCardData } from '@/lib/api';
-import { useAssignStore } from '@/stores/assign-store';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
 import {
   CollectionPageHeader,
   CollectionPageState,
@@ -33,7 +33,7 @@ function cardTitle(example: string): string {
  * GalleryPage (`/gallery`, P2-b MVP) — "靈感畫廊": curated showcase cards, one
  * per team task example (`gallery.list`, a straight fan-out of the same
  * `team.toml` data `/experts` reads — no new storage). Each card's "做同款"
- * action opens the single 交辦 panel (`useAssignStore`) prefilled with an
+ * action opens the 交辦任務 page (`useOpenAssign`, 複雜任務 tab) prefilled with an
  * editable description + an outcome-style acceptance criterion, so trying an
  * idea costs one click instead of a blank page.
  *
@@ -45,7 +45,7 @@ function cardTitle(example: string): string {
 export function GalleryPage() {
   const intl = useIntl();
   const t = useCallback((id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values), [intl]);
-  const openAssign = useAssignStore((s) => s.openAssign);
+  const openAssign = useOpenAssign();
 
   const [cards, setCards] = useState<GalleryCardData[] | null>(null);
   const [deployed, setDeployed] = useState(false);

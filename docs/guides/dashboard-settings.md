@@ -199,11 +199,11 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
 
-## Assign panel → When, and Goals → Assigned by me → Scheduled (v1.76.0)
+## 交辦任務 page → When, and Goals → Assigned by me → Scheduled (v1.76.0)
 
 | Control | Writes | Effect |
 |---|---|---|
-| Assign panel → **When**: now / once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins) | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the browser's zone) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
+| 交辦任務 page → **Complex task** → **When**: now / once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins) | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the browser's zone) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
 | Goals → Assigned by me → Scheduled: **Pause / Resume / Remove** | the row's `status` | At once. Resume re-checks the creator's right and continues from the next slot after now; a one-time schedule whose time passed cannot resume. Remove keeps the row as `removed` (never listed or run again). |
 | **Show everyone's** (Admins) | — | Lists every person's schedules with the creator's name. |
 

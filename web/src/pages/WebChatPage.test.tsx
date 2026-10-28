@@ -7,6 +7,11 @@ import { useChatStore } from '@/stores/chat-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { api } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
+import { render } from '@testing-library/react';
+import { IntlProvider } from 'react-intl';
+import { MemoryRouter, Route, Routes } from 'react-router';
+import en from '@/i18n/en.json';
+import { stashChatAttachments } from '@/lib/chat-handoff';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -33,6 +38,21 @@ describe('WebChatPage', () => {
     callable.mockResolvedValue({ agents: [{ ...sales, manager_may_read: false }], default_agent: null });
     fireEvent(window, new Event('focus'));
     await waitFor(() => expect(screen.queryByRole('link', { name: /Your manager can read/ })).not.toBeInTheDocument());
+  });
+
+  it('picks up the 問一問 draft and the handed-over files from the 交辦任務 page', async () => {
+    const attachmentsKey = stashChatAttachments([{ name: 'brief.txt', mime: 'text/plain', dataBase64: 'aGk=' }]);
+    render(
+      <IntlProvider messages={en} locale="en" defaultLocale="en">
+        <MemoryRouter initialEntries={[{ pathname: '/chat', state: { draft: 'look at this', attachmentsKey } }]}>
+          <Routes>
+            <Route path="/chat" element={<WebChatPage />} />
+          </Routes>
+        </MemoryRouter>
+      </IntlProvider>,
+    );
+    expect(await screen.findByDisplayValue('look at this')).toBeInTheDocument();
+    expect(screen.getByText('brief.txt')).toBeInTheDocument();
   });
 
   it('renders the chat composer', () => {

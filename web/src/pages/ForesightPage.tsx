@@ -15,7 +15,7 @@ import {
 import { timeAgo } from '@/lib/format';
 import { toast } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useAssignStore } from '@/stores/assign-store';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { useConnectionStore } from '@/stores/connection-store';
 import {
   ActorAvatar,
@@ -745,7 +745,7 @@ export function ForesightPage() {
   const errorText = useErrorMessage();
   const connState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents } = useAgentsStore();
-  const openAssign = useAssignStore((s) => s.openAssign);
+  const openAssign = useOpenAssign();
   const [selectedAgent, setSelectedAgent] = useState('');
   const [summaries, setSummaries] = useState<ForwardAgentSummary[]>([]);
   const [rows, setRows] = useState<ForwardPredictionRow[]>([]);

@@ -53,6 +53,7 @@ const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'),
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
 const PlansPage = lazyPage(() => import('./pages/PlansPage'), 'PlansPage');
 const GoalsPage = lazyPage(() => import('./pages/GoalsPage'), 'GoalsPage');
+const AssignPage = lazyPage(() => import('./pages/AssignPage'), 'AssignPage');
 const ResponsibilitiesPage = lazyPage(() => import('./pages/ResponsibilitiesPage'), 'ResponsibilitiesPage');
 const ForesightPage = lazyPage(() => import('./pages/ForesightPage'), 'ForesightPage');
 const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
@@ -234,10 +235,9 @@ export function App() {
               {/* ── Zone A 每日 — open to all authenticated users ──
                   Home is the single spine: a read-only overview (the former
                   workspace mode was collapsed into it, so `/workspace` renders
-                  the same page). It carries no composer — the 交辦 panel is
-                  global and mounted in `MainLayout` (UX plan I-1a); this
-                  comment used to claim a "launcher hero" that no version of
-                  HomePage ever rendered. */}
+                  the same page). It carries no composer — 交辦 has its own
+                  page, `/assign` (below); this comment used to claim a
+                  "launcher hero" that no version of HomePage ever rendered. */}
               {/* O-2: appliance lands on the conversational console; every
                   other install still lands on HomePage (see `HomeLanding`). */}
               <Route index element={<HomeLanding />} />
@@ -258,6 +258,10 @@ export function App() {
               <Route path="tasks" element={<TaskBoardPage />} />
               <Route path="tasks/:id" element={<TaskDetailPage />} />
               <Route path="goals" element={<GoalsPage />} />
+              {/* 交辦任務 — both editions, every entry point (sidebar, mobile ＋,
+                  board, /goals, agent cards, gallery) lands here. Not a nav
+                  row; the sidebar's primary button is its entry. */}
+              <Route path="assign" element={<AssignPage />} />
               {/* P5 持續任務 — every `responsibilities.*` RPC re-checks the
                   caller's binding to the owner employee server-side. */}
               <Route path="responsibilities" element={<ResponsibilitiesPage />} />

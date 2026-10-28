@@ -1,4 +1,5 @@
 import { client } from './ws-client';
+import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
 // v1.68 W2 — dashboard-switches RPC wire types.
 import type {
   TickSourcesListResult,
@@ -537,6 +538,18 @@ export interface SharedWikiStats {
     updated: string;
     author: string | null;
   };
+}
+
+/** `tasks.goal_create` / `tasks.skill_assign` answer. */
+export interface GoalCreateResult {
+  task: TaskInfo;
+  iteration_cap: number;
+  dispatch_enabled: boolean;
+  /** Echoes the request's `plan_first` — lets the caller show "計畫已
+   *  生成，等待你核准" instead of the normal assign toast. */
+  plan_first: boolean;
+  /** How many files were saved with the task. */
+  attachments_saved?: number;
 }
 
 export interface SkillInfo {
@@ -6080,7 +6093,7 @@ export const api = {
       client.call('agents.create', params) as Promise<{ success: boolean; agent: AgentInfo }>,
     /** Fire-and-forget bus message to one agent. No dashboard surface calls
      *  this since UX plan I-1a: the employee-card 交辦 action now opens the
-     *  AssignSheet, which files a trackable, judge-verified goal task instead.
+     *  /assign page, which files a trackable, judge-verified goal task instead.
      *  Kept as the thin wrapper for the RPC the gateway still serves. */
     delegate: (agentId: string, prompt: string) =>
       client.call('agents.delegate', { agent_id: agentId, prompt }) as Promise<{
@@ -8020,20 +8033,30 @@ export const api = {
        *  `belief_settle`) about the goal's measurable external indicators,
        *  folded into the judge's acceptance bar. Default `false`. */
       require_beliefs?: boolean;
-      /** I-1c "想一想" (AssignSheet's third execution mode): generate a
+      /** I-1c "想一想" (the /assign 複雜任務 tab's third mode): generate a
        *  short human-readable plan and park the task `needs_human` for
        *  approval instead of letting the goal loop execute immediately.
        *  Default `false` (the existing `直接做` behaviour). */
       plan_first?: boolean;
+      /** Files handed over with the goal (交辦任務 page). Saved into the
+       *  employee's file area; their paths are appended to the description.
+       *  With files the request goes over HTTP (`lib/task-rpc`). */
+      attachments?: TaskAttachmentInput[];
     }) =>
-      client.call('tasks.goal_create', { ...params }) as Promise<{
-        task: TaskInfo;
-        iteration_cap: number;
-        dispatch_enabled: boolean;
-        /** Echoes the request's `plan_first` — lets the caller show "計畫已
-         *  生成，等待你核准" instead of the normal assign toast. */
-        plan_first: boolean;
-      }>,
+      callTaskRpc<GoalCreateResult>('tasks.goal_create', { ...params }),
+    /** 交辦任務 page 「一般」 tab: hand a skill to the AI employee who last
+     *  ran it. The gateway picks the runner (never this client) and refuses
+     *  when nobody has the skill switched on or the caller may not assign to
+     *  that employee. Same response shape as `goalCreate`, plus who runs it. */
+    skillAssign: (params: {
+      skill_name: string;
+      note?: string;
+      attachments?: TaskAttachmentInput[];
+    }) =>
+      callTaskRpc<GoalCreateResult & {
+        runner: { agent_id: string; display_name: string };
+        skill: { name: string; display_name: string };
+      }>('tasks.skill_assign', { ...params }),
     /** `tasks.goal_create` with a `schedule`: nothing starts now; the goal
      *  is created at each fire on the caller's behalf. */
     goalSchedule: (params: {
@@ -8047,7 +8070,10 @@ export const api = {
       plan_first?: boolean;
       schedule: AssignScheduleInput;
       schedule_timezone?: string;
-    }) => client.call('tasks.goal_create', { ...params }) as Promise<{ schedule: AssignScheduleInfo }>,
+      /** Saved once, when the schedule is created; every run points at the
+       *  same saved copies. */
+      attachments?: TaskAttachmentInput[];
+    }) => callTaskRpc<{ schedule: AssignScheduleInfo }>('tasks.goal_create', { ...params }),
     /** One goal task's whole loop story: rounds, task-scoped activity,
      *  pending kickoff approval. */
     timeline: (taskId: string) =>

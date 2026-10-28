@@ -677,7 +677,7 @@ What's shown today is which files were touched and what the operation was, not a
 
 ## "Think it through" plan-first mode (I-1c)
 
-Besides "Just ask (問一問)" and "Assign (交辦)," the dashboard's dispatch panel has a third mode, "Plan first (想一想)": the AI employee drafts an execution plan for you to review first, and only starts working once you approve it.
+Besides "Just ask (問一問)" and "Assign (交辦)," the **Complex task** tab of the dashboard's 交辦任務 page (`/assign`) has a third mode, "Plan first (想一想)": the AI employee drafts an execution plan for you to review first, and only starts working once you approve it.
 
 ### Creation
 

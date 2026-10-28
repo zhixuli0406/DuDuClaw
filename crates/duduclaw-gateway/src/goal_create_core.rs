@@ -171,8 +171,15 @@ async fn create_goal_task_inner(
     // Title reflects the goal itself — computed from the base description
     // BEFORE the belief-declaration teaching paragraph is appended below, so
     // the 60-char truncation never crowds out the actual goal text with
-    // boilerplate.
-    let title = duduclaw_core::truncate_chars(&description, 60);
+    // boilerplate. Only the first non-empty line: a multi-line goal (the
+    // 交辦任務 page's skill header, an appended attachment list) would
+    // otherwise run its later lines into the title.
+    let first_line = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let title = duduclaw_core::truncate_chars(first_line, 60);
     let description = if req.require_beliefs {
         format!(
             "{description}\n\n【信念申報要求】執行期間對目標相關的可量測外部指標用 \
@@ -347,6 +354,17 @@ mod tests {
             Some("整理報表")
         );
         assert_eq!(created.task.priority, "medium");
+    }
+
+    /// A multi-line goal is titled by its first non-empty line only.
+    #[tokio::test]
+    async fn goal_create_core_titles_by_the_first_line() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let store = store_in(home.path()).await;
+        let mut r = req("a");
+        r.description = "\n  技能「試算表」：只看本週\n技能 ID：xlsx\n附件：…".to_string();
+        let created = create_goal_task(home.path(), &store, r).await.expect("create");
+        assert_eq!(created.task.title, "技能「試算表」：只看本週");
     }
 
     /// Round 4 (H-2a): a goal created during a round carries the parent the

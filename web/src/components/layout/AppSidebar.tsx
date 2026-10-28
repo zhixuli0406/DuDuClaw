@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { NavLink, useNavigate } from 'react-router';
+import { NavLink, useLocation, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import {
   Plus,
@@ -19,7 +19,8 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
-import { useAssignStore } from '@/stores/assign-store';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
+import { ASSIGN_PATH } from '@/lib/assign-entry';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useGrowthStore } from '@/stores/growth-store';
 import { useThemeStore } from '@/stores/theme-store';
@@ -467,7 +468,9 @@ function EditionCard() {
  */
 export function AppSidebar() {
   const intl = useIntl();
-  const openAssign = useAssignStore((s) => s.openAssign);
+  const openAssign = useOpenAssign();
+  // On the 交辦任務 page the primary button reads as the current page.
+  const onAssign = useLocation().pathname === ASSIGN_PATH;
   const { state, isMobile } = useSidebar();
   const collapsed = state === 'collapsed' && !isMobile;
 
@@ -553,8 +556,8 @@ export function AppSidebar() {
             round took this button down with the task board, which left the
             edition aimed at non-technical users with no primary action at all;
             it also used to route to the board's `?new=1` create-a-card intent,
-            which never starts the autonomous loop. It now opens the one
-            AssignSheet. The search trigger USED to be Personal-hidden — I-5
+            which never starts the autonomous loop. It now opens the 交辦任務
+            page (`/assign`). The search trigger USED to be Personal-hidden — I-5
             (2026-08-16) restores it: ⌘K still worked via the global keyboard
             shortcut on Personal, but there was no discoverable entry point
             for a mouse/touch user, which is precisely the "個人版恢復搜尋觸發
@@ -564,15 +567,21 @@ export function AppSidebar() {
           <Button
             variant="brand"
             size="icon"
-            className="mx-auto"
+            className={cn('mx-auto', onAssign && 'ring-2 ring-brand/40 ring-offset-1 ring-offset-sidebar')}
             onClick={() => openAssign()}
+            aria-current={onAssign ? 'page' : undefined}
             title={intl.formatMessage({ id: 'sidebar.newTask' })}
             aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
           >
             <Plus />
           </Button>
         ) : (
-          <Button variant="brand" className="w-full" onClick={() => openAssign()}>
+          <Button
+            variant="brand"
+            className={cn('w-full', onAssign && 'ring-2 ring-brand/40 ring-offset-1 ring-offset-sidebar')}
+            onClick={() => openAssign()}
+            aria-current={onAssign ? 'page' : undefined}
+          >
             <Plus />
             {intl.formatMessage({ id: 'sidebar.newTask' })}
           </Button>
