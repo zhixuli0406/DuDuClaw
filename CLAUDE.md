@@ -5,9 +5,10 @@
 Owner instruction, 2026-10-03: 「每次有新功能與修復時都開分支」. It outranks every other workflow rule in this file.
 
 - Before starting a feature or a fix, create a branch from the latest `origin/main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`). Feature and fix commits never go on `main` directly.
-- The change reaches `main` through a pull request. `main` requires five checks on a PR merge: Rust ubuntu-latest, Rust macos-latest, Dashboard, Python, Security Audit (`cargo audit`, required since 2026-10-08). The ECC Tools app comments on PRs (security evidence, risk taxonomy and other audits); its results are advisory and not required checks.
+- The change reaches `main` through a pull request. `main` requires four checks on a PR merge: Rust ubuntu-latest, Dashboard, Python, Security Audit (`cargo audit`, required since 2026-10-08). The ECC Tools app comments on PRs (security evidence, risk taxonomy and other audits); its results are advisory and not required checks.
 - When another session is using the main checkout, work in a separate `git worktree` instead of switching branches there.
 - When several open PRs touch the same files, merge them in the order the owner gives; the later one rebases.
+- Release lanes: `minor`/`major` require the full signed delivery review; `hotfix` (deprecated alias: `patch`) auto-signs five unchanged delivery items and publishes all channels. Hotfix fixes and bump PRs use owner admin merge after `Rust ubuntu-latest` succeeds.
 - Opening a branch is not permission to merge or release. Merging a PR and cutting a release stay the owner's decision.
 
 
@@ -83,7 +84,7 @@ DuDuClaw is a multi-runtime AI agent platform: it routes channel messages and di
 - Every spawn that hands an employee's `.mcp.json` to a CLI goes through the spawn gate; employees never write MCP or CLI config files.
 - Facts that need the live gateway (`ApprovalBroker`, sessions, rotator) stay in the gateway; the separate `mcp-server` process reaches them through signed loopback routes or the shared databases.
 - Write honest "not verified" notes. Live tests use an isolated home (`scripts/live-test/make-home.sh`, `mcp-probe.sh`) with a production-shaped employee (wildcard `mcp__duduclaw__*` allowlist).
-- Windows runs in CI as an advisory leg (not one of the five required checks); before a release also run the local Windows cross-compile check. Discovery and computer-use workspaces are Unix-only by design.
+- PR Rust CI runs on Linux; main pushes, nightly and manual runs test Linux, macOS and Windows as real legs. The release preflight blocks minor/major on missing or red native platform results and warns for hotfix. Discovery and computer-use workspaces are Unix-only by design.
 
 ## Design Context
 

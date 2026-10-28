@@ -19,11 +19,6 @@ on:
         description: Desktop release tag (desktop-vX.Y.Z)
         required: true
         type: string
-      rebuild_v1750_desktop:
-        description: Rebuild desktop-v1.75.0 from the signed source plus src-tauri/.taurignore
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   delivery-gate:
@@ -39,45 +34,12 @@ jobs:
     outputs:
       commit: ${{ steps.select.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify desktop build source
+      - name: Select signed desktop build source
         id: select
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
           SIGNED_SOURCE: ${{ needs.delivery-gate.outputs.commit }}
-          REBUILD_V1750: ${{ inputs.rebuild_v1750_desktop && 'true' || 'false' }}
-        run: |
-          set -euo pipefail
-          if [[ "$REBUILD_V1750" != true ]]; then
-            echo "commit=$SIGNED_SOURCE" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # The v1.75.0 delivery assertion remains bound to its original tag.
-          # The only permitted desktop packaging change is one commit directly
-          # on the signed source that adds src-tauri/.taurignore, so Tauri stops
-          # resolving the vendored tauri-plugin-updater as the frontend
-          # directory. (PR #153's `cd ../web` change did not fix that.)
-          [[ "$RELEASE_TAG" == desktop-v1.75.0 ]]
-          [[ "$SIGNED_SOURCE" == b80df7f423f7bc2179f1ffb60f66d757aec5d323 ]]
-          BUILD_SOURCE=5e1af525409efed098c631b9c41dbb805b92ba0c
-          TAURIGNORE_BLOB=06f7acd184a03ae8f723bfae0c63bf0d936b97fa
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          git cat-file -e "$BUILD_SOURCE^{commit}"
-          [[ "$(git rev-parse "$BUILD_SOURCE^@")" == "$SIGNED_SOURCE" ]]
-          git merge-base --is-ancestor "$BUILD_SOURCE" origin/main
-          changed="$(git diff --name-only "$SIGNED_SOURCE" "$BUILD_SOURCE")"
-          if [[ "$changed" != src-tauri/.taurignore ]]; then
-            echo "unexpected desktop source changes: $changed" >&2
-            exit 1
-          fi
-          [[ "$(git rev-parse "$BUILD_SOURCE:src-tauri/.taurignore")" == "$TAURIGNORE_BLOB" ]]
-          echo "commit=$BUILD_SOURCE" >> "$GITHUB_OUTPUT"
+        run: echo "commit=$SIGNED_SOURCE" >> "$GITHUB_OUTPUT"
 
   build:
     needs: [delivery-gate, build-source]
@@ -111,6 +73,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          # Tags only restore caches written on main (protected), never PRs.
+          shared-key: desktop-release-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            src-tauri -> target
+          save-if: false
 
       - name: Linux deps (WebKitGTK)
         if: matrix.os == 'ubuntu-22.04'
@@ -234,23 +205,6 @@ jobs:
               --notes "Moving pointer for the desktop auto-updater. latest.json here always describes the newest desktop release; installers live on the desktop-v* releases."
           fi
           gh release upload desktop-updater latest.json --repo "${{ github.repository }}" --clobber
-
-      - name: Record desktop v1.75.0 rebuild provenance
-        if: inputs.rebuild_v1750_desktop
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.event.inputs.tag }}
-          BUILD_SOURCE: ${{ needs.build-source.outputs.commit }}
-        run: |
-          cat > desktop-release-notes.md <<EOF
-          Desktop installers for DuDuClaw v1.75.0.
-
-          Signed delivery tag: \`desktop-v1.75.0\` (source \`b80df7f423f7bc2179f1ffb60f66d757aec5d323\`).
-          Desktop build source: \`$BUILD_SOURCE\` (the signed source plus \`src-tauri/.taurignore\`).
-          The build source differs from the signed tag only by that one file, which keeps the vendored updater crate out of Tauri's frontend lookup. The signed tag and CLI release were not moved.
-          EOF
-          gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" \
-            --notes-file desktop-release-notes.md
 
       # A desktop-v* release publishes minutes AFTER its paired CLI v* release,
       # so it steals the repo's "Latest" marker — /releases/latest then returns

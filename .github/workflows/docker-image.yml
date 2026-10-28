@@ -137,13 +137,7 @@ jobs:
             org.duduclaw.build-recipe-sha256=${{ steps.recipe.outputs.sha256 }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          # ignore-error: the GHA cache backend's export step has failed AFTER
-          # a fully successful build before (v1.42.0 + v1.43.0), killing the
-          # run at the finish line. A cache-export failure must never fail the
-          # publish — the cache is an optimization, the pushed image is the
-          # product.
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }},ignore-error=true
+          # Tag refs cannot share GHA caches, and main writes no Docker cache scope.
 
       - name: Export digest
         run: |

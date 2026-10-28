@@ -111,6 +111,68 @@ class DeliveryTests(unittest.TestCase):
     def test_valid_signature_and_all_five_deliverables(self):
         self.verify()
 
+    def schema2(self, lane="full"):
+        self.data.update(schema=2, lane=lane,
+                         review_kind="independent" if lane == "full" else "automatic-hotfix-retention")
+
+    def test_schema2_full(self):
+        self.schema2()
+        self.verify()
+
+    def test_schema2_hotfix_all_unchanged(self):
+        self.schema2("hotfix")
+        for item in self.data["items"].values():
+            item.update(status="unchanged", reason_sha256="d" * 64)
+        self.verify()
+
+    def test_schema2_hotfix_rejects_any_updated_item(self):
+        for name in delivery.ITEMS:
+            self.schema2("hotfix")
+            for item in self.data["items"].values():
+                item.update(status="unchanged", reason_sha256="d" * 64)
+            self.data["items"][name].update(status="updated", reason_sha256=None)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "all five items unchanged"):
+                self.verify()
+
+    def test_schema2_hotfix_non_patch_rejected(self):
+        self.schema2("hotfix")
+        for item in self.data["items"].values():
+            item.update(status="unchanged", reason_sha256="d" * 64)
+        self.run_git("tag", "v1.1.3", "v1.2.3")
+        self.data["previous_tag"] = "v1.1.3"
+        with self.assertRaisesRegex(ValueError, "patch bump"):
+            self.verify()
+
+    def test_cli_pass_identifies_legacy_full_and_automatic_hotfix(self):
+        for lane in ("full", "hotfix"):
+            if lane == "hotfix":
+                self.schema2(lane)
+                for item in self.data["items"].values():
+                    item.update(status="unchanged", reason_sha256="d" * 64)
+            raw, sig = self.sign()
+            self.write("candidate.json", raw.decode())
+            self.write("candidate.sig", sig.decode())
+            result = subprocess.run(["python3", str(ROOT / "scripts/release_delivery.py"),
+                "--root", str(self.root), "--version", "1.2.4", "--assertion",
+                str(self.root / "candidate.json"), "--signature", str(self.root / "candidate.sig")],
+                capture_output=True, text=True,
+                env=dict(os.environ, RELEASE_DELIVERY_PUBLIC_KEY_PEM=self.public))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("lane=" + lane, result.stdout)
+            self.assertIn("review_kind=" + ("independent" if lane == "full" else "automatic-hotfix-retention"),
+                          result.stdout)
+            if lane == "hotfix":
+                self.assertNotIn("independently reviewed", result.stdout)
+
+    def test_schema2_lane_review_mismatch_and_legacy_extra_fields_rejected(self):
+        self.schema2("hotfix")
+        self.data["review_kind"] = "independent"
+        with self.assertRaisesRegex(ValueError, "lane/review"):
+            self.verify()
+        self.data.update(schema=1)
+        with self.assertRaisesRegex(ValueError, "schema"):
+            self.verify()
+
     def test_tampered_assertion(self):
         raw, sig = self.sign()
         with self.assertRaises(ValueError):
@@ -219,11 +281,8 @@ class DeliveryTests(unittest.TestCase):
                 self.assertIn("  build-source:\n    needs: delivery-gate", body)
                 self.assertIn("  build:\n    needs: [delivery-gate, build-source]", body)
                 self.assertIn("ref: ${{ needs.build-source.outputs.commit }}", body)
-                self.assertIn("[[ \"$RELEASE_TAG\" == desktop-v1.75.0 ]]", body)
-                self.assertIn("[[ \"$SIGNED_SOURCE\" == b80df7f423f7bc2179f1ffb60f66d757aec5d323 ]]", body)
-                self.assertIn("BUILD_SOURCE=5e1af525409efed098c631b9c41dbb805b92ba0c", body)
-                self.assertIn("TAURIGNORE_BLOB=06f7acd184a03ae8f723bfae0c63bf0d936b97fa", body)
-                self.assertIn('[[ "$changed" != src-tauri/.taurignore ]]', body)
+                self.assertIn('run: echo "commit=$SIGNED_SOURCE" >> "$GITHUB_OUTPUT"', body)
+                self.assertNotIn("rebuild_v1750_desktop", body)
             else:
                 self.assertIn("  build:\n    needs: delivery-gate", body)
                 self.assertIn("ref: ${{ needs.delivery-gate.outputs.commit }}", body)

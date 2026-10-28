@@ -23,8 +23,8 @@ class ReleaseDistributorStepTests(unittest.TestCase):
         shutil.copyfile(ROOT / "scripts/build-distributor-brief.py", scripts / "build-distributor-brief.py")
         self.source = self.root / "commercial/marketing/distributor/technology-brief-v1.67-src"
 
-    def run_step(self):
-        env = dict(os.environ, NEW_VERSION="1.70.0")
+    def run_step(self, lane="minor"):
+        env = dict(os.environ, NEW_VERSION="1.70.0", BUMP_TYPE=lane)
         return subprocess.run(
             ["bash", "-eu", "-c", BLOCK + '\nprintf "REACHED_COMMIT_STAGE\\n"\n',
              str(self.root / "scripts/release.sh")],
@@ -43,6 +43,13 @@ class ReleaseDistributorStepTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("REACHED_COMMIT_STAGE", result.stdout)
         self.assertIn("no release commit or tag", result.stdout)
+
+    def test_hotfix_skips_even_incomplete_distributor_sources(self):
+        self.source.mkdir(parents=True)
+        result = self.run_step("hotfix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("technical brief unchanged", result.stdout)
+        self.assertIn("REACHED_COMMIT_STAGE", result.stdout)
 
     def test_valid_source_uses_new_version_before_commit(self):
         self.source.mkdir(parents=True)

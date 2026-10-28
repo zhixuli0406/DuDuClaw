@@ -107,8 +107,18 @@ def verify_assertion(raw, signature, public_key, version, root, source):
     data = json.loads(raw, object_pairs_hook=parse_unique)
     expected = {"schema", "version", "source_commit", "previous_tag", "delta_sha256",
                 "private_review_sha256", "issued_at", "expires_at", "items"}
-    if set(data) != expected or data["schema"] != 1:
+    schema = data.get("schema")
+    if type(schema) is not int or schema not in {1, 2}:
         raise ValueError("unsupported assertion schema")
+    if schema == 2:
+        expected |= {"lane", "review_kind"}
+    if set(data) != expected:
+        raise ValueError("unsupported assertion schema")
+    lane = data.get("lane", "full")
+    review_kind = data.get("review_kind", "independent")
+    if (lane, review_kind) not in {("full", "independent"),
+                                   ("hotfix", "automatic-hotfix-retention")}:
+        raise ValueError("invalid delivery lane/review kind")
     if not VERSION.fullmatch(version) or data["version"] != version:
         raise ValueError("delivery version mismatch")
     if not SHA.fullmatch(data["source_commit"]) or data["source_commit"] != source:
@@ -139,6 +149,13 @@ def verify_assertion(raw, signature, public_key, version, root, source):
                 raise ValueError("unchanged item lacks reviewed reason")
         elif item["reason_sha256"] is not None:
             raise ValueError("updated item must not have an unchanged reason")
+    if lane == "hotfix":
+        previous = tuple(map(int, data["previous_tag"][1:].split(".")))
+        current = tuple(map(int, version.split(".")))
+        if current != (previous[0], previous[1], previous[2] + 1):
+            raise ValueError("hotfix must be exactly one patch bump of previous_tag")
+        if any(item["status"] != "unchanged" for item in data["items"].values()):
+            raise ValueError("hotfix requires all five items unchanged")
     return data
 
 
@@ -297,12 +314,14 @@ def main():
             raw = read_regular(args.assertion)
             signature = read_regular(args.signature).strip()
             source = git(args.root, "rev-parse", "HEAD").decode().strip()
-        verify_assertion(raw, signature, key, args.version, args.root, source)
+        data = verify_assertion(raw, signature, key, args.version, args.root, source)
         if args.release_ref:
             verify_release_commit(args.root, revision, source, args.version)
         elif args.install:
             install_assertion(args.root, args.version, raw, signature)
-        print("Release delivery gate: PASS (two manuals and three websites independently reviewed)")
+        print("Release delivery gate: PASS (lane=" + data.get("lane", "full") +
+              ", review_kind=" + data.get("review_kind", "independent") +
+              "; two manuals and three websites)")
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError, json.JSONDecodeError):
         # Do not print external/private content, paths, diffs, or subprocess stderr.
         parser.exit(1, "Release delivery gate: BLOCKED; check configuration, version/source binding, signature and five reviewed deliverables.\n")

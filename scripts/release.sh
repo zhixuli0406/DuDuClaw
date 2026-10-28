@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DuDuClaw Release Automation
 # Usage:
-#   ./scripts/release.sh <patch|minor|major> [--title "<theme>"] [--dry-run]
+#   ./scripts/release.sh <hotfix|minor|major> [--title "<theme>"] [--dry-run]
 #                                                          # bump + sync all platforms
 #   ./scripts/release.sh audit                              # show every platform's version + drift
 #   ./scripts/release.sh verify [version]                  # confirm registries published <version>
@@ -19,27 +19,21 @@
 # the miss invisible). This script bumps EVERY manifest from one place and then
 # ASSERTS they all reached the new version, so no platform can be left behind.
 #
-# DuDuClaw OS versioning is NO LONGER coupled here. Y3-3 (2026-08-25) briefly
-# put the Yocto layer on the same release train (the yocto_inc / yocto_bb
-# kinds), but the 2026-09 repo split (wiki/pm/repo-split-runbook-2026-09.md)
-# moved meta-duduclaw/ into its own DuDuClaw-OS repo, which carries its OWN
-# independent release version (its VERSION file) and publishes .wic images via
-# that repo's scripts/release-os.sh. This script owns ONLY the platform
-# manifests below (Cargo / crates / npm / pyproject / READMEs / installers /
-# desktop). The embedded platform version the OS vendors is refreshed on the
-# OS side (refresh-src.sh + duduclaw-platform-version.inc), on its own cadence.
+# Release lanes: minor/major retain the full signed delivery review; hotfix
+# automatically signs five unchanged items from the preceding public assertion.
+# patch is a deprecated alias for hotfix. Every lane publishes every channel.
 #
 # Steps (bump mode):
-#   1. Validate working tree is clean
-#   2. Pre-flight audit: print every platform's current version + flag drift
-#   3. Require signed delivery review of both manuals and all three websites
-#   4. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs / installers / desktop)
-#   4. POST-BUMP ASSERT: every platform manifest now reads the new version, else abort
-#   5. Update CHANGELOG.md
-#   6. cargo check (+ re-resolve the desktop app's own src-tauri/Cargo.lock)
-#   7. Generate versioned distributor HTML when commercial sources are present
-#   8. git commit + tag
-#   9. Print next steps + the registry-verify command
+#   1. Validate arguments and clean working tree
+#   2. Print platform version audit (minor/major only)
+#   3. Preflight main macOS + Windows CI, enterprise prerequisites and branch
+#   4. Verify/install signed delivery assertion (automatic for hotfix)
+#   5. Bump every manifest, assert versions, move curated CHANGELOG notes
+#   6. cargo check workspace + commercial; re-resolve desktop Cargo.lock
+#   7. Generate distributor brief (minor/major only)
+#   8. Commit, validate the actual bump, prepare core + desktop tags
+#   9. Build all enterprise assets and sync the control-plane allowlist
+#  10. Print branch/PR/check/merge/tag/verify commands for the owner
 #
 # Runtime note (2026-09-08 incident): a full bump run takes roughly 20-45
 # minutes end to end — `cargo check --workspace` right after the version
@@ -52,25 +46,16 @@
 # the commit+tag but before the pro image / binary asset / allowlist steps
 # ran, and those had to be replayed by hand afterward.
 #
-# The enterprise pro-image step below calls
-# commercial/duduclaw-pro-gateway/build-image.sh, which supports CLOUD_BUILD=1
-# to build the amd64 image on Google Cloud Build instead of a local `docker
-# build --platform linux/amd64` (the latter runs under QEMU on Apple Silicon
-# and takes 6+ hours). No extra plumbing is needed to use it here — env vars
-# set on this script's own invocation (e.g. `CLOUD_BUILD=1
-# ./scripts/release.sh minor ...`) are inherited by every subprocess it
-# calls, build-image.sh included, by default.
+# Enterprise images default to CLOUD_BUILD=1 (native amd64 Cloud Build).
+# Set CLOUD_BUILD=0 only for a deliberate local Docker build.
 set -euo pipefail
 
 # --- Config ---
 WORKSPACE_TOML="Cargo.toml"
 PYPI_PKG="duduclaw"   # PyPI + npm package name (used by `verify`)
 NPM_PKG="duduclaw"
-# Homebrew tap: unmaintained (frozen at 1.50.0). published_tap_version() below
-# still reads it for the `audit` drift row — no more `homebrew` sync subcommand.
-TAP_REPO="zhixuli0406/homebrew-tap"
-TAP_FORMULA="Formula/duduclaw.rb"
 DRY_RUN=false
+export CLOUD_BUILD="${CLOUD_BUILD:-1}"
 
 # Extended-regex semver matcher (no leading anchor — reused in several patterns).
 SEMVER='[0-9]+\.[0-9]+\.[0-9]+'
@@ -117,10 +102,6 @@ platform_manifests() {
     if [[ -f distribution/registries/mcp/server.json ]]; then
         echo "mcp_registry|distribution/registries/mcp/server.json"
     fi
-    # NOTE: the DuDuClaw OS Yocto layer (meta-duduclaw/) is deliberately NOT
-    # enumerated here. Since the 2026-09 repo split it lives in the separate
-    # DuDuClaw-OS repo with its own independent version (see the header
-    # comment). This script must never bump OS-side metadata again.
 }
 
 # --- Read the current version out of a manifest, by kind. (Never fails: empty on miss.) ---
@@ -168,29 +149,10 @@ extract_version() {
     esac
 }
 
-# --- Homebrew tap: read the formula version actually published on the tap. ---
-# The tap lives in a SEPARATE repo, so it is not covered by platform_manifests
-# (which enumerates files in this checkout). Prefer the GitHub API (no cache) —
-# the raw.githubusercontent fallback has a ~5 min CDN cache, which would show a
-# stale MISMATCH right after a successful push. Empty string on network failure.
-published_tap_version() {
-    local body=""
-    if command -v gh >/dev/null 2>&1; then
-        body="$(gh api "repos/$TAP_REPO/contents/$TAP_FORMULA" --jq '.content' 2>/dev/null \
-            | base64 -d 2>/dev/null)" || true
-    fi
-    if [[ -z "$body" ]]; then
-        body="$(curl -fsSL "https://raw.githubusercontent.com/$TAP_REPO/main/$TAP_FORMULA" 2>/dev/null)" || true
-    fi
-    { printf '%s\n' "$body" \
-        | grep -m1 -E "^[[:space:]]*version \"$SEMVER\"" \
-        | sed -E "s/.*version \"($SEMVER)\".*/\1/"; } || true
-}
-
 # --- Audit: print each platform's current version, flagging drift vs Cargo. ---
 # Returns non-zero if any manifest disagrees with the Cargo workspace version.
 run_audit() {
-    local truth="$1" drift=0 kind file v flag brew_v
+    local truth="$1" drift=0 kind file v flag
     echo "Platform version audit (source of truth: Cargo workspace = $truth)"
     echo "------------------------------------------------------------------"
     while IFS='|' read -r kind file; do
@@ -202,19 +164,6 @@ run_audit() {
         fi
         printf "  %-34s %-10s [%s]%s\n" "$file" "${v:-?}" "$kind" "$flag"
     done < <(platform_manifests)
-    # Homebrew tap (remote repo — audited from the published formula, not a local
-    # file). This is how the tap froze at 1.8.8 for ~35 releases: it was updated
-    # by hand, never enumerated anywhere, so nothing ever flagged it.
-    brew_v="$(published_tap_version)"
-    flag=""
-    if [[ -z "$brew_v" ]]; then
-        brew_v="?"
-        flag="   (tap unreachable — not checked)"
-    elif [[ "$brew_v" != "$truth" ]]; then
-        flag="   <-- DRIFT (brew installs $brew_v; tap unmaintained, not fixed here)"
-        drift=1
-    fi
-    printf "  %-34s %-10s [%s]%s\n" "tap:$TAP_REPO" "$brew_v" "brew" "$flag"
     echo "------------------------------------------------------------------"
     return $drift
 }
@@ -372,7 +321,7 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIO
 # --- Arg parsing / sub-commands ---
 if [[ $# -lt 1 ]]; then
     echo "Usage:"
-    echo "  $0 <patch|minor|major> [--title \"<theme>\"] [--dry-run]"
+    echo "  $0 <hotfix|minor|major> [--title \"<theme>\"] [--dry-run]"
     echo "                                       bump + sync every platform manifest"
     echo "  $0 audit                             show each platform's version + drift"
     echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
@@ -391,10 +340,7 @@ case "$1" in
         run_audit "$CURRENT_VERSION" || {
             echo ""
             echo "DRIFT DETECTED: a manifest is behind the Cargo version. The next"
-            echo "'$0 <patch|minor|major>' run re-syncs every manifest to the new version."
-            echo "(Homebrew tap drift is expected and no longer fixed by this script —"
-            echo " the tap is unmaintained and frozen at 1.50.0; direct users to npm"
-            echo " or the desktop app instead of a tap sync.)"
+            echo "'$0 <hotfix|minor|major>' run re-syncs every manifest to the new version."
         }
         exit 0
         ;;
@@ -405,6 +351,10 @@ case "$1" in
 esac
 
 BUMP_TYPE="$1"
+if [[ "$BUMP_TYPE" == "patch" ]]; then
+    echo "NOTICE: patch is deprecated; use hotfix (same patch bump and all-channel delivery)."
+    BUMP_TYPE=hotfix
+fi
 shift
 # Optional flags in any order: --dry-run, --title "<tagline>" (or --title=...).
 # TITLE is the one-line release theme that goes after the date in the CHANGELOG
@@ -432,13 +382,13 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-if [[ "$BUMP_TYPE" != "patch" && "$BUMP_TYPE" != "minor" && "$BUMP_TYPE" != "major" ]]; then
-    echo "Error: bump type must be 'patch', 'minor', 'major', or sub-command 'audit'/'verify'"
+if [[ "$BUMP_TYPE" != "hotfix" && "$BUMP_TYPE" != "minor" && "$BUMP_TYPE" != "major" ]]; then
+    echo "Error: bump type must be 'hotfix', 'minor', 'major', or sub-command 'audit'/'verify'"
     exit 1
 fi
 
 # Check working tree is clean
-if ! git diff --quiet HEAD 2>/dev/null; then
+if ! $DRY_RUN && ! git diff --quiet HEAD 2>/dev/null; then
     echo "Error: working tree has uncommitted changes"
     echo "Please commit or stash your changes first."
     exit 1
@@ -446,7 +396,7 @@ fi
 
 IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
 case "$BUMP_TYPE" in
-    patch) NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+    hotfix) NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
     minor) NEW_VERSION="$MAJOR.$((MINOR + 1)).0" ;;
     major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
 esac
@@ -454,17 +404,29 @@ esac
 echo "Version: $CURRENT_VERSION -> $NEW_VERSION"
 echo ""
 
-# --- Pre-flight platform audit (always shown; surfaces pre-existing drift) ---
-run_audit "$CURRENT_VERSION" || echo "(drift above will be re-synced to $NEW_VERSION below)"
-echo ""
+# --- Pre-flight platform audit (informational; hotfix skips it) ---
+if [[ "$BUMP_TYPE" != "hotfix" ]]; then
+    run_audit "$CURRENT_VERSION" || echo "(drift above will be re-synced to $NEW_VERSION below)"
+    echo ""
+fi
 
 if $DRY_RUN; then
-    echo "[DRY RUN] Would bump every manifest above to $NEW_VERSION, update CHANGELOG,"
-    echo "          cargo check, generate distributor HTML when sources exist, then commit + tag v$NEW_VERSION."
-    echo "[DRY RUN] Distributor output: commercial/marketing/distributor/releases/duduclaw-technology-brief-v$NEW_VERSION.html"
-    echo "[DRY RUN] After tag push, CI release.yml publishes GitHub + npm + PyPI."
-    echo "[DRY RUN] Confirm with: $0 verify $NEW_VERSION"
-    echo "[DRY RUN] Requires signed two-manual / three-website delivery assertion before any mutation."
+    echo "[DRY RUN] Lane: $BUMP_TYPE; would bump all manifests, preserve CHANGELOG notes,"
+    echo "          cargo check workspace + pro-gateway, re-resolve src-tauri lock, commit + tag."
+    if [[ "$BUMP_TYPE" == "hotfix" ]]; then
+        echo "[DRY RUN] Auto-sign five unchanged items from v$CURRENT_VERSION; doc drift requires a reason."
+        echo "[DRY RUN] Skip informational audit and distributor technical brief; no manuals/sites rebuilt."
+    else
+        echo "[DRY RUN] Requires full signed two-manual / three-website delivery review."
+        echo "[DRY RUN] Distributor output: commercial/marketing/distributor/releases/duduclaw-technology-brief-v$NEW_VERSION.html"
+    fi
+    echo "[DRY RUN] ALL channels: 5 GitHub targets + minisign/cosign, npm, PyPI, KB, GHCR,"
+    echo "          computer-use image, desktop, Pro image/OEM tar/pro-bin/control-plane allowlist."
+    echo "[DRY RUN] Pro image CLOUD_BUILD=$CLOUD_BUILD; no signing/build/install/commit/tag/publish performed."
+    echo "[DRY RUN] Confirm after publishing: $0 verify $NEW_VERSION"
+fi
+python3 "$(dirname "$0")/release_platform_ci.py" --lane "$BUMP_TYPE"
+if $DRY_RUN; then
     exit 0
 fi
 
@@ -546,6 +508,48 @@ if [[ -z "${RELEASE_DELIVERY_PUBLIC_KEY_PEM:-}" ]]; then
     RELEASE_DELIVERY_PUBLIC_KEY_PEM="$(gh variable get RELEASE_DELIVERY_PUBLIC_KEY_PEM --repo zhixuli0406/DuDuClaw)"
     export RELEASE_DELIVERY_PUBLIC_KEY_PEM
 fi
+if [[ "$BUMP_TYPE" == "hotfix" ]]; then
+    commercial_git() (
+        # Neither inherited Git overrides nor local replace objects may change
+        # the signer checkout/history whose merged state we are certifying.
+        for variable in ${!GIT_@}; do unset "$variable"; done
+        git --no-replace-objects -C commercial "$@"
+    )
+    if [[ "$(commercial_git rev-parse --show-toplevel 2>/dev/null)" != "$(cd commercial 2>/dev/null && pwd -P)" ]]; then
+        echo 'Error: commercial must be a separate private Git checkout; hotfix signer refused.'
+        exit 1
+    fi
+    if ! COMMERCIAL_STATUS="$(commercial_git status --porcelain --untracked-files=all)"; then
+        echo 'Error: cannot inspect commercial signer checkout; hotfix refused.'
+        exit 1
+    fi
+    if [[ -n "$COMMERCIAL_STATUS" ]]; then
+        echo 'Error: commercial signer checkout must be clean (including untracked files); merge signer changes in the private repo before hotfix signing.'
+        exit 1
+    fi
+    if ! commercial_git fetch origin +refs/heads/main:refs/remotes/origin/main; then
+        echo 'Error: cannot fetch commercial origin/main; hotfix signer integrity cannot be verified.'
+        exit 1
+    fi
+    if ! commercial_git merge-base --is-ancestor HEAD origin/main; then
+        echo 'Error: commercial signer HEAD has not been merged into origin/main; hotfix refused.'
+        exit 1
+    fi
+    HOTFIX_OUTPUT="$PWD/commercial/artifacts/release-delivery/v$NEW_VERSION/assertion"
+    HOTFIX_ARGS=(--hotfix --version "$NEW_VERSION" --previous-tag "v$CURRENT_VERSION"
+        --platform-root "$PWD" --private-root "$PWD/commercial"
+        --signing-key "$HOME/.duduclaw-keys/release-delivery/signing-20261011.key"
+        --output "$HOTFIX_OUTPUT")
+    if [[ -n "${DUDUCLAW_HOTFIX_ALLOW_DOC_DRIFT:-}" ]]; then
+        HOTFIX_ARGS+=(--allow-doc-drift "$DUDUCLAW_HOTFIX_ALLOW_DOC_DRIFT")
+    fi
+    if ! python3 commercial/scripts/prepare-release-delivery.py "${HOTFIX_ARGS[@]}"; then
+        echo 'Error: hotfix delivery refused. Use minor for delivery updates, or for reviewed doc drift rerun with DUDUCLAW_HOTFIX_ALLOW_DOC_DRIFT="<reason>".'
+        exit 1
+    fi
+    DELIVERY_ASSERTION="$HOTFIX_OUTPUT/v$NEW_VERSION.json"
+    DELIVERY_SIGNATURE="$HOTFIX_OUTPUT/v$NEW_VERSION.sig"
+fi
 python3 "$(dirname "$0")/release_delivery.py" --version "$NEW_VERSION" \
     --assertion "$DELIVERY_ASSERTION" --signature "$DELIVERY_SIGNATURE" --install
 # Snapshot exact bytes that were verified; the pre-tag validator verifies them
@@ -576,69 +580,6 @@ while IFS='|' read -r kind file; do
                 }
                 { print }
             ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
-            # A workspace-EXCLUDED crate (see the root Cargo.toml
-            # `[workspace] exclude` list) carries its OWN standalone
-            # Cargo.lock with a self-referential
-            # `[[package]] name = "<crate>" version = "..."` entry
-            # (workspace-member crates don't -- they resolve through
-            # the ONE root Cargo.lock, already staged separately below).
-            #
-            # 2026-09-29 (S16): the three crates this was written for
-            # (duduclaw-shell / duduclaw-native-gui / duduclaw-comp) now live
-            # in the DuDuClaw-OS repo's `crates/`, so `crates/*/Cargo.lock`
-            # currently matches nothing here and the block below is a no-op.
-            # It is kept, not deleted: the mechanism is generic and the next
-            # excluded crate under `crates/` gets it for free. The historical
-            # account below is why it exists at all.
-            # This script bumps the crate's Cargo.toml above but, until this
-            # fix, never touched that sibling Cargo.lock -- `cargo build
-            # --locked` (what cargo.bbclass runs for duduclaw-comp's Yocto
-            # recipe, and what CI would run for shell/native-gui) then
-            # hard-fails on a lock/manifest version mismatch. duduclaw-shell
-            # and duduclaw-native-gui happened to stay in sync historically
-            # only because they're buildable on macOS and got a local
-            # `cargo build` at some point after their last hand-edit, which
-            # silently re-synced their Cargo.lock; duduclaw-comp CANNOT be
-            # built on this host (smithay's Linux-only system deps -- see
-            # meta-duduclaw/recipes-duduclaw/duduclaw-comp/refresh-src.sh),
-            # so it had no such self-healing path and was caught genuinely
-            # stale by `release.sh audit` (0.1.0 while everything else was
-            # already at 1.62.0). Fixed at the mechanism level here, for
-            # every such crate, not just duduclaw-comp.
-            if [[ "$file" =~ ^crates/([^/]+)/Cargo\.toml$ ]]; then
-                _crate_name="${BASH_REMATCH[1]}"
-                _crate_lock="crates/${_crate_name}/Cargo.lock"
-                if [[ -f "$_crate_lock" ]] && grep -qE "^name = \"${_crate_name}\"\$" "$_crate_lock"; then
-                    # Rewrite the version line immediately following the
-                    # `name = "..."` line of this crate's own self-entry AND of
-                    # every other platform crate that appears in this lock as a
-                    # path dependency -- never a third-party dependency pinned
-                    # to the same old version number. Why "every platform
-                    # crate", not just self (2026-09-08, DuDuClaw-OS fix14
-                    # bake): duduclaw-shell's Cargo.lock also carries
-                    # duduclaw-native-gui (a `path = "../duduclaw-native-gui"`
-                    # dependency, workspace-excluded, no lock of its own that
-                    # matters here). The self-only rewrite left that entry at
-                    # the old version; the OS layer vendored the lock as-is and
-                    # bitbake's `cargo build --frozen` -- which cannot re-sync a
-                    # lock -- treated native-gui's dependencies as unlocked,
-                    # tried to load the zed git source and died offline. All
-                    # platform crates share ONE version, so any of their entries
-                    # in any sibling lock must move together.
-                    _platform_crates_re="$(ls -d crates/*/ | sed -E 's|^crates/||; s|/$||' | paste -sd'|' -)"
-                    awk -v names_re="^name = \"(${_platform_crates_re})\"\$" -v newv="$NEW_VERSION" '
-                        BEGIN { in_self = 0 }
-                        /^name = / { in_self = ($0 ~ names_re) }
-                        in_self && /^version = / {
-                            print "version = \"" newv "\""
-                            in_self = 0
-                            next
-                        }
-                        { print }
-                    ' "$_crate_lock" > "${_crate_lock}.tmp" && mv "${_crate_lock}.tmp" "$_crate_lock"
-                    echo "  Updated: $_crate_lock (self entry + sibling platform-crate path deps)"
-                fi
-            fi
             ;;
         pyinit)
             sed -i '' -E "s/^([[:space:]]*)__version__ = \"$SEMVER\"/\1__version__ = \"$NEW_VERSION\"/" "$file"
@@ -824,7 +765,9 @@ fi
 # Never stage commercial artifacts in the public release commit.
 echo ""
 echo "Generating distributor technical brief..."
-if ! python3 "$(dirname "$0")/build-distributor-brief.py" --version "$NEW_VERSION" --output-dir "commercial/marketing/distributor/releases" --skip-missing; then
+if [[ "${BUMP_TYPE:-minor}" == "hotfix" ]]; then
+    echo "Hotfix: distributor technical brief unchanged."
+elif ! python3 "$(dirname "$0")/build-distributor-brief.py" --version "$NEW_VERSION" --output-dir "commercial/marketing/distributor/releases" --skip-missing; then
     echo "Error: distributor HTML generation failed; no release commit or tag was created."
     echo "       Fix the document source and regenerate before retrying the release."
     echo "       The version bump remains uncommitted for inspection."
@@ -843,15 +786,6 @@ echo "Creating git commit and tag..."
 STAGE_FILES=()
 while IFS='|' read -r _kind file; do
     STAGE_FILES+=("$file")
-    # Workspace-excluded crates' own sibling Cargo.lock (self version entry
-    # patched above, in the same case arm that bumps their Cargo.toml) —
-    # not returned by platform_manifests() itself (that enumerates bump
-    # TARGETS, and this file is a side effect of bumping one), so it must be
-    # staged explicitly here or it silently rides along uncommitted.
-    if [[ "$file" =~ ^crates/([^/]+)/Cargo\.toml$ ]]; then
-        _lock="crates/${BASH_REMATCH[1]}/Cargo.lock"
-        [[ -f "$_lock" ]] && STAGE_FILES+=("$_lock")
-    fi
 done < <(platform_manifests)
 [[ -f Cargo.lock ]] && STAGE_FILES+=("Cargo.lock")
 [[ -f src-tauri/Cargo.lock ]] && STAGE_FILES+=("src-tauri/Cargo.lock")
@@ -1063,7 +997,10 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
             PRO_BIN_PROJECT="${DUDUCLAW_GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
             if [[ -n "$PRO_BIN_PROJECT" && "$PRO_BIN_PROJECT" != "(unset)" ]]; then
                 PRO_BIN_IMAGE="${PRO_BIN_REGION}-docker.pkg.dev/${PRO_BIN_PROJECT}/duduclaw/duduclaw-pro:v${NEW_VERSION}"
-                PRO_BIN_CID="$(docker create "$PRO_BIN_IMAGE" 2>/dev/null || true)"
+                PRO_BIN_CID=""
+                if docker pull --platform linux/amd64 "$PRO_BIN_IMAGE"; then
+                    PRO_BIN_CID="$(docker create --platform linux/amd64 "$PRO_BIN_IMAGE" 2>/dev/null || true)"
+                fi
                 if [[ -n "$PRO_BIN_CID" ]]; then
                     mkdir -p "$PRO_BIN_TMP/linux-x64"
                     if docker cp "$PRO_BIN_CID:/usr/local/bin/duduclaw-pro" "$PRO_BIN_TMP/linux-x64/duduclaw-pro" 2>/dev/null; then
@@ -1276,34 +1213,36 @@ fi
 echo ""
 echo "================================================"
 echo " Release v$NEW_VERSION prepared successfully!"
-echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs / OS metadata"
+echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs / installers / desktop"
 echo "================================================"
 echo ""
-echo "Next steps:"
-if [[ ${#PRO_FOLLOW_UPS[@]} -gt 0 ]]; then
-    printf '  0. %s\n' "${PRO_FOLLOW_UPS[@]}"
+echo "Lane: $BUMP_TYPE; Pro image CLOUD_BUILD=$CLOUD_BUILD"
+if [[ -n "${DUDUCLAW_RELEASE_IGNORE_PLATFORM_CI:-}" ]]; then
+    printf 'Platform CI override reason: %s\n' "$DUDUCLAW_RELEASE_IGNORE_PLATFORM_CI"
 fi
-echo "  1. Review CHANGELOG.md release notes (curated [Unreleased] was renamed)"
-echo "  2. Amend the commit if needed:  git commit --amend"
-echo "  3. Push to remote:              git push && git push --tags"
-echo "     -> v$NEW_VERSION triggers release.yml (binaries + GitHub Release + npm + PyPI)"
-echo "     -> desktop-v$NEW_VERSION triggers desktop-release.yml (Tauri installers,"
-echo "        signed + notarized, published directly — no draft)"
-echo "     -> v$NEW_VERSION also triggers docker-image.yml (ghcr.io/zhixuli0406/duduclaw:v$NEW_VERSION)"
-echo "        and computer-use-image.yml (ghcr.io/zhixuli0406/duduclaw-computer-use:v$NEW_VERSION,"
-echo "        the image computer-use sessions of this version run; never pulled automatically)."
-echo "        Neither image is checked by 'verify'; watch both runs in GitHub Actions."
-echo "  4. CONFIRM every registry actually got it:"
-echo "       ./scripts/release.sh verify $NEW_VERSION"
-echo "     (this catches a PyPI/npm 'skip-existing' silent miss)"
-echo "     The cloud console's enterprise version dropdown picks the new"
-echo "     version up automatically once the GitHub Release exists AND the"
-echo "     duduclaw-pro:v$NEW_VERSION image is in the registry (built above)."
-echo "  5. DuDuClaw OS ships from its OWN repo now (2026-09 split) on an"
-echo "     INDEPENDENT version — this run did NOT touch any OS metadata."
-echo "     To cut an OS image, work in the DuDuClaw-OS checkout:"
-echo "       cd ../DuDuClaw-OS && ./scripts/release-os.sh build && \\"
-echo "         ./scripts/release-os.sh package && ./scripts/release-os.sh publish"
-echo "     (OS version lives in DuDuClaw-OS/VERSION; see that repo's"
-echo "      release-os.sh --help and wiki/pm/repo-split-runbook-2026-09.md)."
-echo ""
+if [[ -n "${DUDUCLAW_HOTFIX_ALLOW_DOC_DRIFT:-}" && "$BUMP_TYPE" == "hotfix" ]]; then
+    printf 'Hotfix doc-drift reason (signed evidence): %s\n' "$DUDUCLAW_HOTFIX_ALLOW_DOC_DRIFT"
+fi
+echo "Next steps (owner):"
+if [[ ${#PRO_FOLLOW_UPS[@]} -gt 0 ]]; then
+    printf '  %s\n' "${PRO_FOLLOW_UPS[@]}"
+fi
+echo "  git push -u origin $RELEASE_BRANCH"
+echo "  gh pr create --base main --head $RELEASE_BRANCH --title 'chore: bump v$NEW_VERSION' --body 'Prepare $BUMP_TYPE release v$NEW_VERSION'"
+if [[ "$BUMP_TYPE" == "hotfix" ]]; then
+    echo "  Wait for Rust ubuntu-latest success (hotfix fixes and bump PRs)."
+    echo "  gh pr merge --admin <n> --merge"
+else
+    echo "  Wait for Rust ubuntu-latest, Dashboard, Python, Security Audit success."
+    echo "  gh pr merge <n> --merge"
+fi
+echo "  git fetch origin main"
+echo "  git merge-base --is-ancestor v$NEW_VERSION origin/main"
+echo "  git push origin v$NEW_VERSION desktop-v$NEW_VERSION"
+echo "  Watch release, desktop-release, docker-image and computer-use-image workflows."
+echo "  ./scripts/release.sh verify $NEW_VERSION"
+if [[ "$BUMP_TYPE" == "hotfix" ]]; then
+    echo "  Websites and manuals retain the preceding artifacts."
+else
+    echo "  Deploy the reviewed website builds and deliver private manuals."
+fi

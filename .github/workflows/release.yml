@@ -66,6 +66,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          # Tags only restore caches written on main (protected), never PRs.
+          shared-key: release-${{ matrix.target }}
+          workspaces: . -> target
+          save-if: false
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
