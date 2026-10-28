@@ -4004,6 +4004,7 @@ pub async fn entry_point() {
     let file_writer = match tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("gateway.log")
+        .max_log_files(duduclaw_gateway::log::FILE_LOG_MAX_FILES)
         .build(&log_dir)
     {
         Ok(appender) => {

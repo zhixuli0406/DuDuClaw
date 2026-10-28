@@ -8,7 +8,7 @@ impl TaskStore {
         let db_path = home_dir.join("tasks.db");
         let conn = Connection::open(&db_path).map_err(|e| format!("open task store: {e}"))?;
         Self::init_schema(&conn)?;
-        info!(?db_path, "TaskStore initialized");
+        debug!(?db_path, "TaskStore initialized");
         Ok(Self {
             conn: Mutex::new(conn),
             db_path,

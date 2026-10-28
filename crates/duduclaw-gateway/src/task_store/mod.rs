@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::debug;
 
 /// Canonical column list for `tasks` SELECTs. Kept in one place so
 /// `row_to_task`'s positional indices stay in lock-step with every query.

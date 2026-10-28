@@ -1431,14 +1431,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Dedicated discovery tasks share durable CAS claims and the host lease;
     // ordinary task dispatch never sees this queue.
-    if task_store_opt.is_some() {
+    if let Some(discovery_store) = task_store_opt.clone() {
         let discovery_home = home_dir.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Reuse the shared task store and keep one broker; a failed open
+            // is retried on the next tick, as before.
+            let mut broker: Option<crate::approval::ApprovalBroker> = None;
             loop {
                 tick.tick().await;
-                if let Err(error) = crate::discovery::service::poll(&discovery_home).await {
+                if broker.is_none() {
+                    match crate::approval::ApprovalBroker::open(&discovery_home) {
+                        Ok(opened) => broker = Some(opened),
+                        Err(error) => {
+                            warn!(%error, "discovery task queue refused execution");
+                            continue;
+                        }
+                    }
+                }
+                let Some(broker) = broker.as_ref() else { continue };
+                if let Err(error) =
+                    crate::discovery::service::poll_with(&discovery_home, &discovery_store, broker).await
+                {
                     warn!(%error, "discovery task queue refused execution");
                 }
             }

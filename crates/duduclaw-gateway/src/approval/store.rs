@@ -69,7 +69,7 @@ impl ApprovalStore {
                 }
             }
         }
-        info!(?db_path, "ApprovalStore initialized");
+        debug!(?db_path, "ApprovalStore initialized");
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: Some(db_path),
