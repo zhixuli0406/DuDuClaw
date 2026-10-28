@@ -62,6 +62,12 @@
 
 「允許連到內網的 Odoo」寫入 `[odoo] allow_private_network`（只有管理員能改，預設關閉；隨連線設定由 `odoo.configure` 一起儲存，「測試連線」用畫面上的開關值）。關閉時，Odoo 網址（全域或個別員工）必須是 HTTPS 且指向公開主機（只有 `localhost` 可用 `http://`）。開啟後允許 192.168.x.x、10.x.x.x 這類內網位址，HTTPS 或 HTTP 都可以；本機位址、link-local 與雲端 metadata 位址（169.254.169.254、`metadata.google.internal`）仍一律拒絕，連線會釘在解析時檢查過的位址上，也不走代理。升級後第一次開機時，若已設定的 Odoo 網址解析到內網位址，系統會自動把它打開（稽核事件 `odoo_allow_private_network_auto_enabled`），舊客戶不會斷線。下次連線時生效。
 
+## 整合 → Odoo → 結構快照
+
+「**重新掃描 Odoo 結構**」呼叫 `odoo.schema_scan`，只有管理員可用，RPC 也會檢查相同角色。請先儲存連線設定；掃描使用已存的全域連線，不使用表單尚未儲存的值。畫面顯示上次掃描時間、掃描時伺服器版本、模型／欄位數、是否截斷、最近失敗及差異摘要。版本不同時建議重掃。不修改 Odoo 資料、權限或共享 Wiki。 手動掃描（含失敗）每個已存 profile 每 60 秒最多嘗試一次，重啟不重設；提早重試會顯示還要等幾秒。 兩個 dashboard 動作（`odoo.schema_scan`、`odoo.discover_schema`）共用此限速與掃描鎖。Wiki 流程寫入前會驗證名稱、篩查標籤，明示外部中繼資料只能當作資料參考，並保留技術名稱、欄位類型與關聯。
+
+成功連線後，沒有快照或偵測到版本變更會在背景掃描，不拖延連線。每個有效 profile 每小時最多自動嘗試一次，失敗也計入。同版本的客製變更請用按鈕重新掃描。原本的「解析資料庫」仍是另一個寫入共享 Wiki 的流程。上限及儲存方式詳見[結構掃描](../../features/zh-TW/12-industry-templates.md#結構掃描與欄位相容)。
+
 ## 整合 → Odoo → 網站線上客服
 
 用自己的儲存按鈕透過 `odoo.livechat.set`（管理員）寫入 `[odoo_livechat]`。它和 `[odoo]` 分開，因為儲存 Odoo 連線設定時會整段改寫 `[odoo]`。機器人 API 金鑰加密存成 `bot_api_key_enc`，不會回傳；欄位留空表示不變。每次儲存與每次「交回 AI」都寫入稽核紀錄。詳見 [features/zh-TW/61-odoo-livechat.md](../../features/zh-TW/61-odoo-livechat.md)。

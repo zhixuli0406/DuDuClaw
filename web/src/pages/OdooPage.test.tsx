@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, fireEvent, waitFor } from '@testing-library/react';
+import { useAuthStore } from '@/stores/auth-store';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { OdooPage } from './OdooPage';
@@ -220,5 +221,39 @@ describe('OdooPage polling default', () => {
 
     const toggle = await screen.findByRole('switch', { name: 'Enable polling sync' });
     expect(toggle).toHaveAttribute('aria-checked', 'true');
+  });
+});
+
+
+describe('OdooPage schema snapshot', () => {
+  beforeEach(() => {
+    useAuthStore.setState({ user: { id: 'admin', email: 'admin@test', display_name: 'Admin', role: 'admin', status: 'active' } });
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.config') return Promise.resolve({ url: 'https://erp.example.com', db: 'prod' });
+      if (method === 'odoo.status') return Promise.resolve({ connected: true, version: '20.0', schema: {
+        snapshot: { scanned_at: '2026-10-28T01:00:00Z', server_version: '19.0', model_count: 4, field_count: 30, truncated: true },
+        last_error: null,
+      } });
+      if (method === 'odoo.schema_scan') return Promise.resolve({ success: true, diff: { added_models: ['x_new'], removed_models: [], added_fields: [], removed_fields: [], version_changed: true }, schema: {
+        snapshot: { scanned_at: '2026-10-28T02:00:00Z', server_version: '20.0', model_count: 5, field_count: 35, truncated: false }, last_error: null,
+      } });
+      return Promise.resolve({ agents: [] });
+    });
+  });
+
+  it('shows snapshot version and truncation, then scans through the admin RPC', async () => {
+    renderWithProviders(<OdooPage />);
+    expect(await screen.findByText(/19.0/)).toBeInTheDocument();
+    expect(screen.getByText(/re-scan recommended/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Re-scan Odoo structure' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 300000));
+    expect(await screen.findByText(/Added models: 1/)).toBeInTheDocument();
+  });
+
+  it('does not offer the scan action to employees', async () => {
+    useAuthStore.setState({ user: { id: 'staff', email: 'staff@test', display_name: 'Staff', role: 'employee', status: 'active' } });
+    renderWithProviders(<OdooPage />);
+    await screen.findByText('Connection Settings');
+    expect(screen.queryByRole('button', { name: 'Re-scan Odoo structure' })).not.toBeInTheDocument();
   });
 });

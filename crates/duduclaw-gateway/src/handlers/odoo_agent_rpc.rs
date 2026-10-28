@@ -270,8 +270,14 @@ impl MethodHandler {
         };
 
         match duduclaw_odoo::OdooConnector::connect(&cfg, &credential).await {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                let over = duduclaw_odoo::AgentOdooConfig::from_table(&agent_table).ok().flatten();
+                if let Some(over) = over.as_ref() {
+                    conn = conn.with_company_ids(over.company_ids.iter().map(|&id| id as i64).collect());
+                }
                 let st = conn.status();
+                let profile = conn.schema_profile(over.as_ref().map(|o| o.profile_or_default()).unwrap_or("default"));
+                duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -281,7 +287,7 @@ impl MethodHandler {
                 )
             }
             Err(e) => {
-                warn!("Odoo agent test connection failed: {e}");
+                warn!("Odoo agent test connection failed");
                 WsFrame::ok_response(
                     "",
                     json!({

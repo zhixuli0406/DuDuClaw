@@ -461,6 +461,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_odoo_test(params).await
             }
+            "odoo.schema_scan" => {
+                require_admin!();
+                self.handle_odoo_schema_scan().await
+            }
             // Schema introspection — enumerate models/fields + write to wiki.
             "odoo.discover_schema" => {
                 require_admin!();

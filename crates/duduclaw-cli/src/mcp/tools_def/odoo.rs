@@ -257,6 +257,22 @@ pub(super) const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "odoo_schema_overview",
+        description: "Browse the scanned Odoo structure within agent permissions. Optional model returns fields; query searches names and labels. x_* fields are marked custom. No business rows.",
+        params: &[
+            ParamDef {
+                name: "model",
+                description: "Optional exact model name to inspect its scanned fields",
+                required: false,
+            },
+            ParamDef {
+                name: "query",
+                description: "Optional case-insensitive substring in model/field names and labels",
+                required: false,
+            },
+        ],
+    },
+    ToolDef {
         name: "odoo_schema_fields",
         description: "Inspect one Odoo model's field structure (fields_get). Returns field metadata only (name, type, label, required, relation) — no records. Use it to learn a custom model's columns before querying.",
         params: &[ParamDef {

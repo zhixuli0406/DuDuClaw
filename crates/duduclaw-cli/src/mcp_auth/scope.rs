@@ -339,6 +339,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "odoo_payment_status"
         | "odoo_partner_search"
         | "odoo_schema_fields"
+        | "odoo_schema_overview"
         | "odoo_search" => Some(Scope::OdooRead),
         // Connect is read-class — it acquires/refreshes the connection but
         // doesn't mutate Odoo state. Without it, no read can happen either.

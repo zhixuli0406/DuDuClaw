@@ -4,6 +4,54 @@
 use super::*;
 
 impl MethodHandler {
+    /// Explicit operator scan. Persists isolated metadata only, never business rows.
+    pub(crate) async fn handle_odoo_schema_scan(&self) -> WsFrame {
+        // Authentication retries and edition detection precede the scanner's
+        // own budget. Bound the whole RPC below the dashboard response timeout.
+        match tokio::time::timeout(std::time::Duration::from_secs(240), self.run_odoo_schema_scan()).await {
+            Ok(frame) => frame,
+            Err(_) => WsFrame::ok_response("", json!({
+                "success": false,
+                "message": "Odoo schema scan timed out after 240 seconds. Check Odoo connectivity and metadata permissions, then re-scan.",
+            })),
+        }
+    }
+
+    async fn run_odoo_schema_scan(&self) -> WsFrame {
+        let table = self.read_config_table(&self.home_dir.join("config.toml")).await;
+        let cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+        if !cfg.is_configured() {
+            return WsFrame::ok_response("", json!({ "success": false, "message": "Odoo not configured — save the connection settings first" }));
+        }
+        let Some(credential) = self.resolve_odoo_credential(&table).filter(|s| !s.is_empty()) else {
+            return WsFrame::ok_response("", json!({ "success": false, "message": "No API key or password configured" }));
+        };
+        // The dashboard operates on the saved default profile. Reserve before
+        // network access; changing credentials must not bypass its cooldown.
+        let _manual_scan = match duduclaw_odoo::schema::claim_manual_scan(
+            &self.home_dir, "default", chrono::Utc::now().timestamp(),
+        ) {
+            Ok(lock) => lock,
+            Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": e })),
+        };
+        let conn = match duduclaw_odoo::OdooConnector::connect(&cfg, &credential).await {
+            Ok(conn) => conn,
+            Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": Self::scrub_odoo_error(&e) })),
+        };
+        let profile = conn.schema_profile("default");
+        match duduclaw_odoo::schema::scan_and_save(&conn, &self.home_dir, &profile).await {
+            Ok(diff) => WsFrame::ok_response("", json!({
+                "success": true,
+                "diff": diff,
+                "schema": duduclaw_odoo::schema::load_scan_status(&self.home_dir, &profile),
+            })),
+            Err(e) => {
+                warn!("Odoo schema scan failed");
+                WsFrame::ok_response("", json!({ "success": false, "message": Self::scrub_odoo_error(&e) }))
+            }
+        }
+    }
+
     /// Test the Odoo connection.
     ///
     /// Two modes:
@@ -24,6 +72,8 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
+
+        let stored_connection = inline_url.is_none();
 
         // Always read config.toml once — needed for stored-credential fallback in inline mode.
         let config_path = self.home_dir.join("config.toml");
@@ -90,6 +140,10 @@ impl MethodHandler {
         match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
             Ok(conn) => {
                 let st = conn.status();
+                if stored_connection {
+                    let profile = conn.schema_profile("default");
+                    duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
+                }
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -99,7 +153,7 @@ impl MethodHandler {
                 )
             }
             Err(e) => {
-                warn!("Odoo test connection failed: {e}");
+                warn!("Odoo test connection failed");
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -150,10 +204,19 @@ impl MethodHandler {
             }
         };
 
+        // Both dashboard endpoints reserve the same persisted slot and hold
+        // its lock through connection, metadata reads and wiki persistence.
+        let _manual_scan = match duduclaw_odoo::schema::claim_manual_scan(
+            &self.home_dir, "default", chrono::Utc::now().timestamp(),
+        ) {
+            Ok(lock) => lock,
+            Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": e })),
+        };
+
         let conn = match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
             Ok(c) => c,
             Err(e) => {
-                warn!("Odoo discover_schema connect failed: {e}");
+                warn!("Odoo discover_schema connect failed");
                 return WsFrame::ok_response(
                     "",
                     json!({
@@ -164,10 +227,18 @@ impl MethodHandler {
             }
         };
 
+        // Also exclude automatic snapshot scans for the same connection.
+        let _scan = match duduclaw_odoo::schema::acquire_scan_lock(
+            &self.home_dir, &conn.schema_profile("default"),
+        ) {
+            Ok(lock) => lock,
+            Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": e })),
+        };
+
         let report = match conn.introspect_schema(max_models).await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Odoo introspect_schema failed: {e}");
+                warn!("Odoo introspect_schema failed");
                 return WsFrame::ok_response(
                     "",
                     json!({
@@ -201,6 +272,8 @@ impl MethodHandler {
             json!({
                 "success": true,
                 "models": models,
+                "invalid_models_dropped": report.invalid_models_dropped,
+                "invalid_fields_dropped": report.invalid_fields_dropped,
                 "total_models": report.total_models,
                 "truncated": report.truncated,
                 "wiki_written": wiki_written,
@@ -210,7 +283,7 @@ impl MethodHandler {
     }
 
     /// Persist an introspected schema to the shared wiki as two pages:
-    /// `odoo/schema` (context layer — compact summary, auto-injectable) and
+    /// `odoo/schema` (context layer — compact summary) and
     /// `odoo/schema-fields` (deep layer — full field tables for search).
     /// Returns `(written, note)`. Skips the write (fail-safe) when the `odoo`
     /// namespace is locked by `.scope.toml`.

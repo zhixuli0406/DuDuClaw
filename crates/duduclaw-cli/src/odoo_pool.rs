@@ -367,12 +367,12 @@ pub fn check_action_permission(
     };
     if !cfg.permits_model(model) {
         return Err(format!(
-            "model '{model}' is not in this agent's allowed_models list"
+            "allowed_models gate: model '{model}' is not in allowed_models in the agent's Odoo settings (dashboard: Odoo → employee permissions)"
         ));
     }
     if !cfg.permits(verb, model) {
         return Err(format!(
-            "action '{verb}' on model '{model}' is not in this agent's allowed_actions list"
+            "allowed_actions gate: action '{verb}' on model '{model}' is not in allowed_actions in the agent's Odoo settings (dashboard: Odoo → employee permissions)"
         ));
     }
     Ok(())

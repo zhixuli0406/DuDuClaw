@@ -278,7 +278,7 @@ fn test_dangerous_tools_require_admin() {
 fn test_new_odoo_read_tools_require_odoo_read() {
     // The safe customer search + schema introspection tools must sit in the
     // read scope class — never fall through to Admin or (worse) None.
-    for tool in ["odoo_partner_search", "odoo_schema_fields"] {
+    for tool in ["odoo_partner_search", "odoo_schema_fields", "odoo_schema_overview"] {
         assert_eq!(
             tool_requires_scope(tool),
             Some(Scope::OdooRead),

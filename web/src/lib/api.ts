@@ -2414,6 +2414,29 @@ export interface OdooStatus {
   version?: string;
   uid?: number;
   error?: string;
+  schema?: OdooSchemaScanStatus;
+}
+
+export interface OdooSchemaScanStatus {
+  snapshot: { scanned_at: string; server_version: string; model_count: number; field_count: number; truncated: boolean } | null;
+  last_error: string | null;
+  diff?: OdooSchemaDiff | null;
+}
+
+export interface OdooSchemaDiff {
+  added_models: string[];
+  removed_models: string[];
+  added_fields: unknown[];
+  removed_fields: unknown[];
+  version_changed: boolean;
+  partial_comparison?: boolean;
+}
+
+export interface OdooSchemaScanResult {
+  success: boolean;
+  message?: string;
+  diff?: OdooSchemaDiff;
+  schema?: OdooSchemaScanStatus;
 }
 
 /** One model row from `odoo.discover_schema` (metadata only). */
@@ -7608,6 +7631,8 @@ export const api = {
       }) as Promise<{ success: boolean; agent_id: string }>,
   },
   odoo: {
+    // Gateway bounds connect + scan at 240s; leave time for the final response.
+    scanSchema: () => client.call('odoo.schema_scan', {}, false, 300000) as Promise<OdooSchemaScanResult>,
     status: () =>
       client.call('odoo.status') as Promise<OdooStatus>,
     config: () =>

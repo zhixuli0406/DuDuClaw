@@ -28,14 +28,33 @@ pub(crate) async fn handle_odoo_tool(
                     .await
                 {
                     Ok(conn) => {
-                        let s = conn.status();
+                        // Probe common.version: a long-lived connector may
+                        // survive an Odoo upgrade between two status calls.
+                        let live_version = conn.version().await.ok().and_then(|v| {
+                            v.get("server_version")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(duduclaw_odoo::schema::safe_version)
+                        });
+                        let mut s = conn.status();
+                        s.version = live_version
+                            .clone()
+                            .unwrap_or_else(|| "unknown (live version probe failed)".into());
                         let key = odoo.pool_key(caller_agent).await;
-                        serde_json::json!({ "content": [{"type": "text", "text": format!(
-                            "Odoo connected (agent={}, profile={}): {} ({})\nEdition: {}\nVersion: {}\nUser ID: {}\nEE modules: {}",
-                            key.0, key.1, s.url, s.db, s.edition, s.version,
-                            s.uid.map(|u| u.to_string()).unwrap_or("-".into()),
-                            if s.ee_modules.is_empty() { "none".to_string() } else { s.ee_modules.join(", ") },
-                        )}]})
+                        let schema_line = schema_status_line(
+                            home_dir,
+                            &conn,
+                            &key.1,
+                            live_version.as_deref().unwrap_or("unknown"),
+                        );
+                        if live_version.is_some() {
+                            duduclaw_odoo::schema::spawn_auto_scan(
+                                conn.clone(),
+                                home_dir.to_path_buf(),
+                                conn.schema_profile(&key.1),
+                            );
+                        }
+                        serde_json::json!({ "content": [{"type": "text", "text": odoo_status_text(&s, &key.0, &key.1, &schema_line)}]})
                     }
                     Err(e) => mcp_error(&format!("Odoo status: connector slot lost: {e}")),
                 }
@@ -63,7 +82,7 @@ pub(crate) async fn handle_odoo_tool(
                 false,
             );
             return mcp_error(&format!(
-                "Odoo module '{module}' is switched off in the dashboard (Odoo → 功能模組); \
+                "Odoo feature_gate: module '{module}' is switched off in the dashboard (Odoo → 功能模組); \
                  '{model}' is not available."
             ));
         }
@@ -112,6 +131,28 @@ pub(crate) async fn handle_odoo_tool(
     let unblock_models = odoo.unblock_models(caller_agent).await;
 
     let result: std::result::Result<String, String> = match tool {
+        "odoo_schema_overview" => {
+            let profile = conn.schema_profile(&_audit_profile);
+            match duduclaw_odoo::schema::load_snapshot(home_dir, &profile) {
+                Ok(Some(snapshot)) if snapshot.connection_identity == conn.connection_identity() => {
+                    let cfg = odoo.agent_override(caller_agent).await;
+                    let mut permitted = std::collections::HashSet::new();
+                    for model in &snapshot.models {
+                        if odoo.feature_gate(&model.model).await.is_ok()
+                            && crate::odoo_pool::check_action_permission(cfg.as_ref(), "read", &model.model).is_ok()
+                        {
+                            permitted.insert(model.model.clone());
+                        }
+                    }
+                    let model = params.get("model").and_then(Value::as_str).unwrap_or("");
+                    let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+                    Ok(schema_overview(&snapshot, &permitted, model, query).to_string())
+                }
+                Ok(Some(_)) => Err("Odoo schema snapshot belongs to a different connection; ask an admin to press 重新掃描 Odoo 結構 in the dashboard".into()),
+                Ok(None) => Err("No Odoo schema snapshot yet. Ask an admin to press 重新掃描 Odoo 結構 in the dashboard".into()),
+                Err(error) => Err(error),
+            }
+        }
         "odoo_crm_leads" => {
             let stage = params.get("stage").and_then(|v| v.as_str()).unwrap_or("");
             let limit = params
@@ -474,9 +515,7 @@ pub(crate) async fn handle_odoo_tool(
                 "execute_import",
             ];
             if BLOCKED_METHODS.contains(&method) {
-                return mcp_error(&format!(
-                    "Method '{method}' is blocked for security reasons"
-                ));
+                return mcp_error(&method_denial_message(method));
             }
             let ids: Vec<Value> = serde_json::from_str(ids_str).unwrap_or_default();
             match conn
@@ -549,8 +588,8 @@ pub(crate) async fn handle_odoo_tool(
             if model.is_empty() {
                 return mcp_error("model is required");
             }
-            match conn.schema_fields(model, 200).await {
-                Ok(fields) => Ok(serde_json::to_string_pretty(&fields).unwrap_or_default()),
+            match conn.schema_fields_report(model, 200).await {
+                Ok(fields) => Ok(schema_fields_metadata(&fields).to_string()),
                 Err(e) => Err(e),
             }
         }
@@ -614,7 +653,7 @@ pub(crate) fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static
         "odoo_inventory_check" => Some(("search", "stock.quant".into())),
         "odoo_invoice_list" | "odoo_payment_status" => Some(("search", "account.move".into())),
         "odoo_partner_search" => Some(("read", "res.partner".into())),
-        "odoo_schema_fields" => {
+        "odoo_schema_fields" | "odoo_schema_overview" => {
             let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
             if model.is_empty() {
                 None
@@ -664,15 +703,19 @@ pub(crate) fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static
 pub(crate) fn blocklist_denial_message(model: &str, denial: duduclaw_odoo::BlockDenial) -> String {
     match denial {
         duduclaw_odoo::BlockDenial::SecurityDefault => format!(
-            "Model '{model}' is blocked by a security default. An admin can unlock it by adding \
-             it to unblock_models in the agent's Odoo settings (agent.toml [odoo] or the \
-             dashboard Odoo page)."
+            "Odoo block list gate: model '{model}' is blocked by a security default. An admin can unlock it by adding \
+             it to unblock_models in the agent's Odoo settings (dashboard: Odoo → 解鎖的 Models)."
         ),
         duduclaw_odoo::BlockDenial::SystemReadOnly => format!(
-            "Model '{model}' is a system metadata table — readable when unblocked, but writing \
-             or deleting on it is never allowed."
+            "Odoo block list gate (system read-only): model '{model}' may be read with unblock_models in the agent's Odoo settings; writing or deleting is always refused, even when unblocked."
         ),
     }
+}
+
+pub(crate) fn method_denial_message(method: &str) -> String {
+    format!(
+        "Odoo method safety gate: method '{method}' is blocked. This fixed safety rule cannot be changed by allowed_actions or unblock_models in the agent's Odoo settings."
+    )
 }
 
 /// Map an Odoo ORM `method` name to the coarse verb used by the per-agent
@@ -701,7 +744,11 @@ pub(crate) fn odoo_method_to_verb(method: &str) -> &'static str {
 /// `agent.toml [odoo]` block (when present). RFC-21 §2: each agent ends up
 /// with its own per-pool slot so cross-project credential leakage and
 /// audit-log mis-attribution are eliminated at the system layer.
-pub(crate) async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, caller_agent: &str) -> Value {
+pub(crate) async fn handle_odoo_connect(
+    home_dir: &Path,
+    odoo: &OdooState,
+    caller_agent: &str,
+) -> Value {
     use duduclaw_odoo::AgentOdooConfig;
 
     // ── 1. Reload global config from disk so operator edits land on next connect ─
@@ -796,11 +843,121 @@ pub(crate) async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, calle
 
     let status = connector.status();
     let key = odoo.pool_key(caller_agent).await;
+    let schema_profile = connector.schema_profile(&key.1);
+    duduclaw_odoo::schema::spawn_auto_scan(
+        connector.clone(),
+        home_dir.to_path_buf(),
+        schema_profile,
+    );
     serde_json::json!({
-        "content": [{"type": "text", "text": format!(
-            "Connected to Odoo {} ({}) — {} v{}\n  agent={}, profile={}",
-            status.url, status.db, status.edition, status.version,
-            key.0, key.1,
-        )}]
+        "content": [{"type": "text", "text": odoo_connect_text(&status, &key.0, &key.1)}]
+    })
+}
+
+pub(crate) fn odoo_status_text(
+    status: &duduclaw_odoo::connector::OdooStatus, agent: &str, profile: &str, schema_line: &str,
+) -> String {
+    let mut s = status.clone();
+    s.sanitize_metadata();
+    format!(
+        "Odoo connected (agent={}, profile={}): {} ({})\nEdition: {}\nVersion: {}\nUser ID: {}\nEE modules: {}\n{}\nuntrusted_odoo_metadata: true\n{}",
+        agent, profile, s.url, s.db, s.edition, s.version,
+        s.uid.map(|u| u.to_string()).unwrap_or("-".into()),
+        if s.ee_modules.is_empty() { "none".to_string() } else { s.ee_modules.join(", ") },
+        schema_line, duduclaw_odoo::schema::UNTRUSTED_METADATA_NOTE,
+    )
+}
+
+pub(crate) fn odoo_connect_text(
+    status: &duduclaw_odoo::connector::OdooStatus, agent: &str, profile: &str,
+) -> String {
+    let mut status = status.clone();
+    status.sanitize_metadata();
+    format!(
+        "Connected to Odoo {} ({}) — {} v{}\n  agent={}, profile={}\nuntrusted_odoo_metadata: true\n{}",
+        status.url, status.db, status.edition, status.version,
+        agent, profile, duduclaw_odoo::schema::UNTRUSTED_METADATA_NOTE,
+    )
+}
+
+fn schema_status_line(
+    home: &Path,
+    conn: &duduclaw_odoo::OdooConnector,
+    profile: &str,
+    live_version: &str,
+) -> String {
+    let profile = conn.schema_profile(profile);
+    let mut line = match duduclaw_odoo::schema::load_snapshot(home, &profile) {
+        Ok(Some(snapshot)) if snapshot.connection_identity == conn.connection_identity() => {
+            snapshot.status_line(live_version)
+        }
+        Ok(None) => "Schema snapshot: not scanned yet; ask an admin to press 重新掃描 Odoo 結構 in the dashboard".into(),
+        _ => "Schema snapshot: unavailable; re-scan recommended".into(),
+    };
+    if duduclaw_odoo::schema::load_scan_status(home, &profile).last_error.is_some() {
+        line.push_str("; last schema scan failed; check Odoo connectivity and metadata permissions, then re-scan");
+    }
+    line
+}
+
+/// The authorization set is computed before projection or searching. Never
+/// return inventory counts or relations from models outside that set.
+pub(crate) fn schema_overview(
+    snapshot: &duduclaw_odoo::schema::SchemaSnapshot,
+    permitted: &std::collections::HashSet<String>,
+    model_filter: &str,
+    query: &str,
+) -> Value {
+    // Sanitize even callers constructing an in-memory or legacy snapshot.
+    // Filter first so metadata from other models never enters the projection.
+    let mut snapshot = snapshot.clone();
+    snapshot.models.retain(|m| permitted.contains(&m.model));
+    snapshot.invalid_models_dropped = 0;
+    snapshot.invalid_fields_dropped = 0;
+    duduclaw_odoo::schema::sanitize_snapshot(&mut snapshot);
+    let query = query.trim().to_lowercase();
+    let matches = |name: &str| query.is_empty() || name.to_lowercase().contains(&query);
+    let models: Vec<Value> = snapshot.models.iter()
+        .filter(|model| permitted.contains(&model.model))
+        .filter(|model| model_filter.is_empty() || model.model == model_filter)
+        .filter_map(|model| {
+            let model_matches = matches(&model.model) || matches(&model.name);
+            let fields: Vec<Value> = model.fields.iter()
+                .filter(|field| model_matches || matches(&field.name) || matches(&field.label))
+                .map(|field| {
+                    let mut value = serde_json::to_value(field).unwrap_or(Value::Null);
+                    if field.relation.as_ref().is_some_and(|r| !permitted.contains(r)) {
+                        value["relation"] = Value::Null;
+                    }
+                    value
+                }).collect();
+            if !model_matches && fields.is_empty() { return None; }
+            let mut value = serde_json::json!({
+                "model": model.model, "name": model.name, "label_flagged": model.label_flagged, "custom": model.custom,
+                "field_count": model.fields.len(), "truncated": model.truncated,
+                "custom_fields": model.fields.iter().filter(|f| f.custom).map(|f| &f.name).collect::<Vec<_>>(),
+            });
+            if !model_filter.is_empty() || !query.is_empty() { value["fields"] = serde_json::json!(fields); }
+            Some(value)
+        }).collect();
+    serde_json::json!({
+        "untrusted_odoo_metadata": true,
+        "note": duduclaw_odoo::schema::UNTRUSTED_METADATA_NOTE,
+        "invalid_models_dropped": snapshot.invalid_models_dropped,
+        "invalid_fields_dropped": snapshot.invalid_fields_dropped,
+        "scanned_at": snapshot.scanned_at, "server_version": snapshot.server_version,
+        "truncated": snapshot.truncated, "models": models})
+}
+
+/// Keep the same trust marker on every agent-facing metadata entry point.
+pub(crate) fn schema_fields_metadata(report: &duduclaw_odoo::connector::SchemaFieldsReport) -> Value {
+    serde_json::json!({
+        "untrusted_odoo_metadata": true,
+        "note": duduclaw_odoo::schema::UNTRUSTED_METADATA_NOTE,
+        "invalid_models_dropped": 0,
+        "invalid_fields_dropped": report.invalid_fields_dropped,
+        "total_fields": report.total_fields,
+        "truncated": report.truncated,
+        "fields": report.fields,
     })
 }

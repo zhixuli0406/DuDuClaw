@@ -143,7 +143,7 @@ Agent: "Sales order SO-2024-0042 created for ABC.
         10 units of Widget X, total: $1,500."
 ```
 
-### Available Operations (17 MCP Tools)
+### Available Operations (18 MCP Tools)
 
 The bridge exposes these tools (`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`):
 
@@ -152,7 +152,27 @@ The bridge exposes these tools (`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`)
 - **Sales**: `odoo_sale_orders` (list orders), `odoo_sale_create_quotation`, `odoo_sale_confirm`
 - **Inventory**: `odoo_inventory_products` (search products), `odoo_inventory_check` (stock level)
 - **Accounting**: `odoo_invoice_list`, `odoo_payment_status`
-- **Generic**: `odoo_search` (search any model), `odoo_execute` (call a model method), `odoo_report`, `odoo_partner_search`, `odoo_schema_fields`
+- **Generic**: `odoo_search` (search any model), `odoo_execute` (call a model method), `odoo_report`, `odoo_partner_search`, `odoo_schema_fields`, `odoo_schema_overview`
+
+### Schema scans and field compatibility
+
+After an Odoo upgrade or customization, an administrator can use **Re-scan Odoo structure** on the Odoo page (dashboard RPC `odoo.schema_scan`, administrator only). The scan reads the server version, installed-module metadata, the model catalog and `fields_get`; it never reads business rows or binary values. It records field names, types, labels, relations and required / readonly / stored flags, including `x_*` custom-field markers. Manual scans have a persisted 60-second cooldown per saved profile, including failures. Invalid technical names are dropped and counted; labels are injection-screened and capped at 120 characters. The employee overview explicitly marks Odoo metadata as untrusted. All Odoo RPC response bodies are streamed with a 32 MiB cap before parsing.
+
+A scan keeps at most **400 models and 500 fields per model**, with a **90-second total budget**. It prioritizes models used by built-in tools, then non-transient business models, and reports truncation and per-model metadata failures. The module and model discovery catalogs each have a 5,000-entry cap. A truncated comparison does not establish that a missing model or field was removed.
+
+The schema-versioned snapshot is stored under `<home>/odoo/schema/<effective-profile>.json`, using an atomic write and owner-only permissions on Unix. The effective profile includes the endpoint, database, Odoo user and company scope, so a snapshot from another connection is not reused. The diff records added and removed models / fields and server-version changes. This snapshot is separate from the older **Scan database** workflow that writes shared-wiki summaries.
+
+`odoo_schema_overview` (`odoo:read`) reads the saved snapshot. An optional `model` returns that model's fields; `query` searches model / field names and labels. Results are filtered by the employee's model and action permissions and the Odoo feature switches. Metadata inspection remains available on default-blocked models when those permissions allow it; it does not unblock their business records. `odoo_status` reports snapshot age, its server version, scan failures and a **re-scan recommended** hint when the live version differs.
+
+The first successful connection without a snapshot, or a connection that detects a server-version change, starts a background scan. Automatic attempts are limited to once per hour per effective profile, including failed attempts; connecting does not wait for the scan. Same-version customizations need a manual re-scan. Reconnect other active employee sessions with `odoo_connect` to refresh their field cache.
+
+Built-in reads resolve each model's live field names once per connection with `fields_get` and only remove unavailable fields from their requested projection. For example, customer search keeps `phone` and omits `mobile` when it no longer exists. It never adds fields to the safe customer projection. Metadata lookup failure, or a projection with no surviving fields, fails the read instead of requesting every field. Explicit field lists in generic queries use the same compatibility filter. The snapshot does not replace this live check. Product reads preserve `detailed_type` when available and otherwise use the server's `type` field; customer fields remain unchanged.
+
+### Diagnosing a denied Odoo query
+
+An empty `allowed_models` or `allowed_actions` list adds no employee restriction. It does not disable other gates: a disabled **功能模組 / Feature modules** switch, the generic-tool block list, MCP scopes / tool allowlists, and Odoo's own ACLs can still refuse the query. For a blocked model such as `res.partner`, generic record access needs an administrator to set `unblock_models`; `allowed_models` alone does not unblock it. An employee override's `unblock_models`, including an empty list, replaces the global value. The dedicated `odoo_partner_search` keeps its fixed safe projection.
+
+DuDuClaw denial messages identify the relevant gate and setting. The separate read-only SQL connector has different semantics: `allowed_tables` must be non-empty, and its save RPC rejects an empty list. It is not the Odoo model allowlist.
 
 ### Edition Detection
 
