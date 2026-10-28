@@ -400,22 +400,48 @@ impl MethodHandler {
         if risk_boundary.is_some() && !ctx.is_admin() {
             return WsFrame::error_response("", "only an admin can set a risk boundary");
         }
+        // Files handed over with the goal (交辦任務 page). All of them are
+        // decoded and size-checked before anything is written; then they are
+        // saved into the assigned employee's attachment area and their paths
+        // appended to the description (see `task_attachments`).
+        let agent_owned = agent_id.to_string();
+        let agent_id = agent_owned.as_str();
+        let (params, saved) = match self.goal_params_with_attachments(agent_id, params).await {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         // `schedule`: assign the goal later or on a repeat (`assign_schedule`);
-        // the right checked above is checked again at every fire.
+        // the right checked above is checked again at every fire. Files are
+        // saved once, now; every fire's goal points at the same saved copies.
         if params.get("schedule").is_some_and(|s| !s.is_null()) {
-            return self
-                .handle_assign_schedule_create(crate::assign_schedule::AssignKind::Goal, agent_id, &params, ctx)
+            let frame = self
+                .handle_assign_schedule_create(
+                    crate::assign_schedule::AssignKind::Goal,
+                    agent_id,
+                    &params,
+                    ctx,
+                )
                 .await;
+            if matches!(frame, WsFrame::Response { ok: false, .. }) {
+                super::task_attachments::remove_saved(&saved).await;
+            }
+            return frame;
         }
         let store = match self.task_store().await {
             Ok(s) => s,
-            Err(f) => return f,
+            Err(f) => {
+                super::task_attachments::remove_saved(&saved).await;
+                return f;
+            }
         };
         let duration_hours = match params.get("duration_hours") {
             None | Some(Value::Null) => None,
             Some(v) => match v.as_f64() {
                 Some(h) => Some(h),
-                None => return WsFrame::error_response("", "duration_hours must be a number"),
+                None => {
+                    super::task_attachments::remove_saved(&saved).await;
+                    return WsFrame::error_response("", "duration_hours must be a number");
+                }
             },
         };
         let req = crate::goal_create_core::GoalCreateRequest {
@@ -469,7 +495,10 @@ impl MethodHandler {
         .await
         {
             Ok(c) => c,
-            Err(e) => return WsFrame::error_response("", &e),
+            Err(e) => {
+                super::task_attachments::remove_saved(&saved).await;
+                return WsFrame::error_response("", &e);
+            }
         };
         let task = created.task;
         let plan_first = created.plan_first;
@@ -485,6 +514,7 @@ impl MethodHandler {
                 // 你核准" instead of the normal "已交辦" toast without having
                 // to re-derive it from `task.status`/`pause_reason`.
                 "plan_first": plan_first,
+                "attachments_saved": saved.len(),
             }),
         )
     }

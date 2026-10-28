@@ -148,6 +148,8 @@ mod accounts_util;
 mod tasks_rpc;
 mod discovery_rpc;
 mod tasks_detail_rpc;
+pub(crate) mod task_attachments;
+mod tasks_skill_assign_rpc;
 pub(crate) mod task_privacy;
 mod push_filter;
 mod artifact_evidence;

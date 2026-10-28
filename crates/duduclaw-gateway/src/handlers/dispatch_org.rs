@@ -479,6 +479,10 @@ impl MethodHandler {
             "tasks.role_turns" => self.handle_tasks_role_turns(params, ctx).await,
             "tasks.goal_decide" => self.handle_tasks_goal_decide(params, ctx).await,
             "tasks.goal_create" => self.handle_tasks_goal_create(params, ctx).await,
+            // 交辦任務 page 「一般」 tab: a skill handed to the employee that last
+            // ran it. Same right as goal_create, checked on the server-picked
+            // runner inside (`tasks_skill_assign_rpc`).
+            "tasks.skill_assign" => self.handle_tasks_skill_assign(params, ctx).await,
             // Scheduled assignments: the caller's own (an Admin: everyone's).
             // Ownership is decided inside (`assign_schedule::manage`).
             "assign_schedules.list" => self.handle_assign_schedules_list(params, ctx).await,

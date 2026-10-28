@@ -226,6 +226,68 @@ impl MethodHandler {
     }
 }
 
+/// One employee's composed copy of a skill, read exactly the way `skills.list`
+/// reads it (same layers, same switches, same usage index, same verdicts).
+/// Used by `tasks.skill_assign` to pick who runs a skill.
+#[derive(Debug, Clone)]
+pub(crate) struct SkillHolding {
+    pub agent_id: String,
+    pub agent_display_name: String,
+    pub enabled: bool,
+    /// RFC 3339 time of the latest activation, `None` when never run.
+    pub last_used_at: Option<String>,
+    pub display_name: String,
+    pub description: String,
+    pub content: String,
+    /// The install scan rated this copy `fail`.
+    pub security_failed: bool,
+}
+
+impl MethodHandler {
+    /// Every employee visible to `fresh` (Viewer or above, the same rule as
+    /// the aggregate `skills.list`) whose composed skill set has a skill named
+    /// exactly `skill_name`, in registry order (by employee id).
+    pub(crate) async fn skill_holdings(
+        &self,
+        fresh: &UserContext,
+        skill_name: &str,
+    ) -> (Vec<SkillHolding>, Option<String>) {
+        let global_skills = AgentRegistry::load_skills(&self.home_dir.join("skills")).await;
+        let verdicts = self.load_skill_scan_verdicts();
+        let (summary, usage_error) = self.skill_usage_map().await;
+        let lc = ListCtx {
+            verdicts: &verdicts,
+            usage: &summary.usage,
+        };
+        let reg = self.registry.read().await;
+        let mut out = Vec::new();
+        for agent in reg
+            .list()
+            .into_iter()
+            .filter(|a| fresh.has_agent_access(&a.config.agent.name, AccessLevel::Viewer))
+        {
+            let (skills, _, _) = self
+                .read_agent_skill_layers(agent, &global_skills, &lc)
+                .await;
+            let Some(entry) = skills.into_iter().find(|s| s["name"] == skill_name) else {
+                continue;
+            };
+            let text = |k: &str| entry[k].as_str().unwrap_or_default().to_string();
+            out.push(SkillHolding {
+                agent_id: agent.config.agent.name.clone(),
+                agent_display_name: agent.config.agent.display_name.clone(),
+                enabled: entry["enabled"] == true,
+                last_used_at: entry["last_used_at"].as_str().map(str::to_string),
+                display_name: text("display_name"),
+                description: text("description"),
+                content: text("content"),
+                security_failed: entry["security_status"] == "fail",
+            });
+        }
+        (out, usage_error)
+    }
+}
+
 /// A company-wide skill in the aggregate view: who has it and their totals.
 fn global_entry(s: &SkillFile, holders: Vec<Value>, lc: &ListCtx<'_>) -> Value {
     let use_count: u64 = holders.iter().filter_map(|h| h["use_count"].as_u64()).sum();

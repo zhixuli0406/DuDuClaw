@@ -1,6 +1,8 @@
 mod data_exports_http;
 #[cfg(test)]
 mod data_exports_http_tests;
+#[cfg(test)]
+mod task_rpc_http_tests;
 
 use axum::body::Bytes;
 use axum::{
@@ -2745,6 +2747,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route(
             "/api/knowledge/sources/{id}/original",
             get(handle_knowledge_original),
+        )
+        // Task RPCs that carry files (交辦任務 page): the dashboard RPC socket
+        // refuses frames over 1 MiB, so `tasks.goal_create` /
+        // `tasks.skill_assign` with attachments come over HTTP and run the
+        // same `MethodHandler::handle` dispatch. Bearer JWT; body cap from
+        // `handlers::task_attachments`.
+        .route(
+            "/api/tasks/rpc",
+            post(handle_task_rpc_with_files).layer(DefaultBodyLimit::max(
+                crate::handlers::task_attachments::MAX_TASK_RPC_BODY_BYTES,
+            )),
         )
         // WP-G1: device-migration ("汰機搬家") restore upload + the
         // dedicated scheduled-backup download route. Admin + appliance JWT
@@ -14696,6 +14709,58 @@ async fn handle_knowledge_upload(
         }
         Err(resp) => resp,
     }
+}
+
+/// The only methods `POST /api/tasks/rpc` forwards.
+const TASK_RPC_HTTP_METHODS: [&str; 2] = ["tasks.goal_create", "tasks.skill_assign"];
+
+/// Requests with files `POST /api/tasks/rpc` works on at once; each one can
+/// hold its ~67 MB body, the parsed JSON and the decoded files in memory.
+static TASK_RPC_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// POST /api/tasks/rpc — `{ "method", "params" }` for a task RPC whose
+/// attachments do not fit a dashboard socket frame. Authenticated like the
+/// knowledge upload (Bearer JWT, password already changed), then dispatched
+/// through `MethodHandler::handle`, so the live identity, edition and
+/// per-method authorisation are exactly the socket's. Answers with the same
+/// `res` frame the socket would send.
+async fn handle_task_rpc_with_files(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let ctx = match knowledge_caller(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    let Ok(_slot) = TASK_RPC_SLOTS.try_acquire() else {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "busy: another upload is in progress, try again" })),
+        )
+            .into_response();
+    };
+    let bad_request = |msg: &str| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+    let mut req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return bad_request("body must be JSON"),
+    };
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !TASK_RPC_HTTP_METHODS.contains(&method.as_str()) {
+        return bad_request("method not available here");
+    }
+    let params = match req.get_mut("params").map(serde_json::Value::take) {
+        Some(p @ serde_json::Value::Object(_)) => p,
+        _ => return bad_request("params must be an object"),
+    };
+    let frame = state.handler.handle(&method, params, &ctx).await;
+    Json(frame).into_response()
 }
 
 /// GET /api/knowledge/sources/{id}/original — see `knowledge::upload`.
