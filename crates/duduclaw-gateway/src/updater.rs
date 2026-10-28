@@ -421,7 +421,11 @@ pub fn detect_install_method() -> InstallMethod {
         return InstallMethod::Desktop;
     }
     if let Some(dir) = exe.parent() {
-        if dir.join("DuDuClaw.exe").exists() || dir.join("duduclaw-desktop-app").exists() {
+        let windows_main = dir.join("DuDuClaw.exe");
+        let linux_main = dir.join("duduclaw-desktop-app");
+        if (windows_main.exists() && is_distinct_desktop_neighbor(&exe, "DuDuClaw.exe"))
+            || (linux_main.exists() && is_distinct_desktop_neighbor(&exe, "duduclaw-desktop-app"))
+        {
             return InstallMethod::Desktop;
         }
     }
@@ -444,6 +448,17 @@ pub fn detect_install_method() -> InstallMethod {
         return InstallMethod::Source;
     }
     InstallMethod::Standalone
+}
+
+/// Whether a desktop main-executable candidate is a different file name from
+/// the running updater. Windows file systems normally compare names without
+/// case, so a standalone `duduclaw.exe` must not discover itself through the
+/// `DuDuClaw.exe` spelling and be misclassified as a Desktop sidecar.
+fn is_distinct_desktop_neighbor(current_exe: &std::path::Path, neighbor_name: &str) -> bool {
+    current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| !name.eq_ignore_ascii_case(neighbor_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -1602,6 +1617,18 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     #[test]
     fn test_platform_asset_suffix() {
         assert!(!platform_asset_suffix().is_empty());
+    }
+
+    #[test]
+    fn windows_standalone_name_is_not_its_own_desktop_neighbor() {
+        assert!(!is_distinct_desktop_neighbor(
+            std::path::Path::new("C:/tools/duduclaw.exe"),
+            "DuDuClaw.exe"
+        ));
+        assert!(is_distinct_desktop_neighbor(
+            std::path::Path::new("C:/Program Files/DuDuClaw/duduclaw-sidecar.exe"),
+            "DuDuClaw.exe"
+        ));
     }
 
     #[test]
