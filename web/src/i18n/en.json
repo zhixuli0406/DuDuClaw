@@ -3306,6 +3306,8 @@
   "assign.tabs": "How to assign",
   "assign.tab.general": "Standard",
   "assign.tab.complex": "Complex task",
+  "assign.skill.heading": "Pick a skill to run",
+  "assign.attach.heading": "Attachments (optional)",
   "assign.skill.search": "Search skills",
   "assign.skill.recent": "Recently run",
   "assign.skill.other": "Other skills",

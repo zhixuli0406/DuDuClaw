@@ -3306,6 +3306,8 @@
   "assign.tabs": "交辦方式",
   "assign.tab.general": "一般",
   "assign.tab.complex": "複雜任務",
+  "assign.skill.heading": "選一個要執行的技能",
+  "assign.attach.heading": "附件（選填）",
   "assign.skill.search": "搜尋技能",
   "assign.skill.recent": "最近執行",
   "assign.skill.other": "其他技能",

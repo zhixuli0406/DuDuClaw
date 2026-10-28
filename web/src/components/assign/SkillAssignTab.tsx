@@ -182,6 +182,9 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
   return (
     <div>
       <div className="space-y-5">
+        <h2 className="text-sm font-semibold text-foreground">
+          {intl.formatMessage({ id: 'assign.skill.heading' })}
+        </h2>
         {!noneAvailable && !loadError && (
           <div className="relative">
             <label htmlFor="assign-skill-search" className="sr-only">
@@ -260,6 +263,9 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
             </div>
 
             <div className="space-y-2">
+              <h2 className="text-xs font-medium text-muted-foreground">
+                {intl.formatMessage({ id: 'assign.attach.heading' })}
+              </h2>
               <AttachmentDropZone
                 onFiles={(f) => void attach.addFiles(f)}
                 hint={intl.formatMessage({ id: 'assign.attach.skillHint' })}

@@ -3306,6 +3306,8 @@
   "assign.tabs": "依頼の方法",
   "assign.tab.general": "通常",
   "assign.tab.complex": "複雑なタスク",
+  "assign.skill.heading": "実行するスキルを選ぶ",
+  "assign.attach.heading": "添付ファイル（任意）",
   "assign.skill.search": "スキルを検索",
   "assign.skill.recent": "最近実行したもの",
   "assign.skill.other": "その他のスキル",
