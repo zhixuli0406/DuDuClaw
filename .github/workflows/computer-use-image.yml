@@ -80,9 +80,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Build into the local Docker image store first, so the smoke test runs
-      # the exact layers that are pushed next. Cache scopes are distinct from
-      # docker-image.yml's (`amd64` / `arm64`) so the two images never evict
-      # each other's GHA cache entries.
+      # the exact layers that are pushed next.
+      # Smoke and push share this run's GHA cache; mode=min limits its size.
       - name: Build for smoke test (load)
         uses: docker/build-push-action@v6
         with:
@@ -92,9 +91,9 @@ jobs:
           load: true
           tags: duduclaw-computer-use:smoke
           cache-from: type=gha,scope=computer-use-${{ matrix.arch }}
-          # ignore-error: same reason as docker-image.yml — a cache-export
-          # failure after a good build must never fail the publish.
-          cache-to: type=gha,mode=max,scope=computer-use-${{ matrix.arch }},ignore-error=true
+          # The GHA cache export has failed after a fully successful build
+          # before (v1.42.0 and v1.43.0); it must never fail the publish.
+          cache-to: type=gha,mode=min,scope=computer-use-${{ matrix.arch }},ignore-error=true
 
       # Mirrors the orchestrator's no-network `docker run` argv and its
       # readiness probe (`xdotool getactivewindow`), then exercises the
@@ -180,7 +179,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=computer-use-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=computer-use-${{ matrix.arch }},ignore-error=true
+          cache-to: type=gha,mode=min,scope=computer-use-${{ matrix.arch }},ignore-error=true
 
       - name: Export digest
         run: |

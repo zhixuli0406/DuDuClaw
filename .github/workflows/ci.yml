@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * *"
 
 # Superseded revisions do not need to finish their full suite. Separate event
 # groups keep a manual run from cancelling PR or post-merge verification.
@@ -39,8 +41,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+        # PRs keep the required Linux check; native platform coverage runs
+        # after merge, nightly and on demand for the release preflight.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
@@ -48,6 +51,8 @@ jobs:
         # member and does not follow SHA-pinning conventions upstream. Pinning
         # by tag is accepted here as a documented trust decision.
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)
         # duduclaw-gateway pulls `xcap` (screenshot for computer-use), which on
         # Linux builds `wayland-sys`/`gbm` via pkg-config and needs these -dev
@@ -108,6 +113,32 @@ jobs:
           cargo test --locked -p duduclaw-cli --lib --features app-compat -- compat
       - name: Test (no dashboard)
         run: cargo test --locked --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      - name: Run every required Windows case on the native host
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $tests = @(
+            'publication::windows::tests::protected_owner_mutex_and_private_recovery_directory_are_validated',
+            'publication::windows::tests::namespace_squatter_with_broad_acl_is_rejected',
+            'test_runner::tests::windows::passing_command_exit_zero',
+            'test_runner::tests::windows::failing_command_nonzero',
+            'test_runner::tests::windows::runs_in_workspace_cwd',
+            'test_runner::tests::windows::timeout_kills_and_marks',
+            'test_runner::tests::windows::timeout_kills_child_and_grandchild'
+          )
+          foreach ($test in $tests) {
+            $filename = $test.Replace('::', '-') + '.log'
+            $output = & cargo test --locked -p duduclaw-fork --lib $test -- --exact --nocapture --test-threads=1 2>&1 |
+              Tee-Object -FilePath (Join-Path evidence $filename)
+            $exitCode = $LASTEXITCODE
+            $output | Write-Output
+            if ($exitCode -ne 0) { throw "Required Windows test failed: $test (exit $exitCode)" }
+            if (-not ($output | Where-Object { "$_" -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;' })) {
+              throw "Required Windows test did not execute exactly once: $test"
+            }
+          }
       # The reviewable-workflow end-to-end tests drive a real stdio CLI and
       # pause it at test checkpoints; they run in their own step below.
       - name: Test gateway
@@ -128,16 +159,6 @@ jobs:
           cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::resume_tests -- --test-threads=1
           cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::f1b_e2e_tests -- --test-threads=1
           cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::f5a_e2e_tests -- --test-threads=1
-      # Clippy is advisory for now: `-D warnings` was never enforced (CI never
-      # went green before, so the step never ran), leaving accumulated pre-existing
-      # lints across the workspace. Kept running for visibility via continue-on-error
-      # so it does not block CI. TODO: dedicated clippy cleanup, then drop these flags.
-      - name: Clippy (no dashboard)
-        continue-on-error: true
-        run: cargo clippy --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway -- -D warnings
-      - name: Clippy gateway
-        continue-on-error: true
-        run: cargo clippy --locked -p duduclaw-gateway --no-default-features -- -D warnings
 
   dashboard:
     needs: settle
@@ -158,6 +179,8 @@ jobs:
         # member and does not follow SHA-pinning conventions upstream. Pinning
         # by tag is accepted here as a documented trust decision.
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)
         run: |
           sudo apt-get update

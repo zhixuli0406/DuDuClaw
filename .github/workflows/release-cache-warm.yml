@@ -1,0 +1,152 @@
+# Compile release dependencies on the default branch so fresh tags can restore
+# them. Only protected main writes these shared caches; PR caches are invisible
+# to tag builds. Keep setup, runner, workspaces and cache inputs in sync with
+# release.yml and desktop-release.yml (rustc, compiler env, manifests/locks and
+# .cargo/config.toml/rust-toolchain files also contribute to rust-cache's key).
+name: Warm release Rust caches
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**/Cargo.toml
+      - src-tauri/Cargo.lock
+      - src-tauri/Cargo.toml
+      - rust-toolchain*
+  schedule:
+    - cron: "0 18 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache-warm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cross (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked
+
+      - name: Build frontend
+        run: cd web && npm ci --legacy-peer-deps && npm run build
+
+      - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+        env:
+          PKG_CONFIG_ALLOW_CROSS: 1
+
+      - name: Build binary (macOS/Windows — with desktop feature)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
+
+      - name: Build binary (Linux x64 — no desktop, uses L5a container mode)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
+
+  desktop-release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          shared-key: desktop-release-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Linux deps (WebKitGTK)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Generate app icons
+        shell: bash
+        run: |
+          cargo install tauri-cli --version "^2" --locked
+          cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
+
+      - name: Build & stage gateway sidecar
+        shell: bash
+        run: |
+          cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+          mkdir -p src-tauri/binaries
+          EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
+          cp "target/${{ matrix.target }}/release/duduclaw${EXT}" \
+             "src-tauri/binaries/duduclaw-${{ matrix.target }}${EXT}"
+
+      # Tauri uses the same release profile and custom-protocol feature as its
+      # publishing action; --no-bundle stops before packaging and signing.
+      - name: Build desktop Rust (no bundles)
+        working-directory: src-tauri
+        run: cargo tauri build --no-bundle --target ${{ matrix.target }}

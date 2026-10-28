@@ -1,6 +1,8 @@
 """Protect full CI coverage when reducing obsolete runs and build overhead."""
 
 from pathlib import Path
+import json
+import re
 import shlex
 import unittest
 
@@ -57,8 +59,151 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertIn(self.jobs[job]["needs"], ("settle", ["settle"]))
                 # A status function avoids GitHub's implicit success() guard.
                 self.assertEqual(self.jobs[job]["if"], "${{ !cancelled() }}")
-        self.assertEqual(self.jobs["rust"]["strategy"]["matrix"]["os"],
-                         ["ubuntu-latest", "macos-latest", "windows-latest"])
+
+    def test_prs_run_linux_and_main_nightly_manual_run_all_platforms(self):
+        matrix = self.jobs["rust"]["strategy"]["matrix"]["os"]
+        expression = re.fullmatch(
+            r"\$\{\{ fromJSON\(github.event_name == 'pull_request' && '(.*?)' \|\| '(.*?)'\) \}\}",
+            matrix,
+        )
+        self.assertIsNotNone(expression, "matrix must distinguish PRs from full platform runs")
+        self.assertEqual(json.loads(expression[1]), ["ubuntu-latest"])
+        for event in ("push", "schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assertIn(event, self.workflow["on"])
+                self.assertEqual(json.loads(expression[2]),
+                                 ["ubuntu-latest", "macos-latest", "windows-latest"])
+        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "0 18 * * *"}])
+
+    def test_ci_and_tag_docker_cache_write_policy(self):
+        rust_caches = [
+            step
+            for job in self.jobs.values()
+            for step in job.get("steps", [])
+            if step.get("uses", "").startswith("Swatinem/rust-cache@")
+        ]
+        self.assertEqual(len(rust_caches), 2)
+        for step in rust_caches:
+            self.assertEqual(
+                step["with"]["save-if"],
+                "${{ github.ref == 'refs/heads/main' }}",
+            )
+
+        docker_path = ROOT / ".github/workflows/docker-image.yml"
+        docker_text = docker_path.read_text()
+        docker = yaml.load(docker_text, Loader=yaml.BaseLoader)
+        build = next(
+            step for step in docker["jobs"]["build"]["steps"]
+            if step.get("uses", "").startswith("docker/build-push-action@")
+        )
+        self.assertNotIn("cache-from", build.get("with", {}))
+        self.assertNotIn("cache-to", build.get("with", {}))
+        self.assertIn(
+            "# Tag refs cannot share GHA caches, and main writes no Docker cache scope.",
+            docker_text,
+        )
+
+    def test_windows_native_cases_remain_serial_and_cannot_silently_match_zero(self):
+        # These exact cases previously ran in release-readiness.yml. The
+        # workspace suite also covers duduclaw-fork, but explicit invocations
+        # keep the named Windows acceptance cases visible and serialized.
+        step = next(s for s in self.jobs["rust"]["steps"]
+                    if s.get("name") == "Run every required Windows case on the native host")
+        self.assertEqual(step["if"], "runner.os == 'Windows'")
+        self.assertEqual(step["shell"], "pwsh")
+        for case in (
+            "publication::windows::tests::protected_owner_mutex_and_private_recovery_directory_are_validated",
+            "publication::windows::tests::namespace_squatter_with_broad_acl_is_rejected",
+            "test_runner::tests::windows::passing_command_exit_zero",
+            "test_runner::tests::windows::failing_command_nonzero",
+            "test_runner::tests::windows::runs_in_workspace_cwd",
+            "test_runner::tests::windows::timeout_kills_and_marks",
+            "test_runner::tests::windows::timeout_kills_child_and_grandchild",
+        ):
+            self.assertIn("'" + case + "'", step["run"])
+        self.assertIn("cargo test --locked -p duduclaw-fork --lib $test -- --exact --nocapture --test-threads=1", step["run"])
+        self.assertIn("$LASTEXITCODE", step["run"])
+        self.assertIn("1 passed; 0 failed; 0 ignored;", step["run"])
+        self.assertFalse((ROOT / ".github/workflows/release-readiness.yml").exists())
+
+    def test_release_rust_caches_are_pinned_and_target_specific(self):
+        cache = next(s["uses"] for s in self.jobs["rust"]["steps"]
+                     if s.get("uses", "").startswith("Swatinem/rust-cache@"))
+        warm = yaml.load(
+            (ROOT / ".github/workflows/release-cache-warm.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        for name in ("release", "desktop-release"):
+            workflow = yaml.load(
+                (ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader
+            )
+            steps = workflow["jobs"]["build"]["steps"]
+            configured = next(s for s in steps if s.get("uses") == cache)
+            warmed = warm["jobs"][name]
+            warm_cache = next(s for s in warmed["steps"] if s.get("uses") == cache)
+            self.assertEqual(configured["with"]["shared-key"], name + "-${{ matrix.target }}")
+            self.assertEqual(configured["with"]["save-if"], "false")
+            self.assertNotIn("key", configured["with"])
+            warm_options = dict(warm_cache["with"])
+            self.assertEqual(warm_options.pop("save-if"), "${{ github.ref == 'refs/heads/main' }}")
+            self.assertEqual(warm_options,
+                             {k: v for k, v in configured["with"].items() if k != "save-if"})
+            self.assertEqual(warmed["runs-on"], workflow["jobs"]["build"]["runs-on"])
+            self.assertEqual(
+                [(m["os"], m["target"]) for m in warmed["strategy"]["matrix"]["include"]],
+                [(m["os"], m["target"]) for m in workflow["jobs"]["build"]["strategy"]["matrix"]["include"]],
+            )
+            # Compare toolchain/setup and all explicit compiler environment inputs
+            # at the cache step, before step-local signing/build variables exist.
+            def cache_setup(document, job):
+                setup = []
+                env = dict(document.get("env", {}), **job.get("env", {}))
+                for step in job["steps"]:
+                    if step.get("uses") == cache:
+                        return setup, env
+                    if step.get("uses", "").startswith(("dtolnay/rust-toolchain@", "actions/setup-node@")):
+                        setup.append((step["uses"], step.get("with", {})))
+                    self.assertNotIn("GITHUB_ENV", step.get("run", ""))
+                self.fail("cache step missing")
+            self.assertEqual(cache_setup(warm, warmed), cache_setup(workflow, workflow["jobs"]["build"]))
+            warm_steps = warmed["steps"]
+            for step in steps:
+                if step.get("run", "").startswith(("cargo build --release", "cross build --release")):
+                    self.assertIn(step, warm_steps)
+            if name == "desktop-release":
+                self.assertIn("src-tauri -> target", configured["with"]["workspaces"])
+                self.assertNotIn("rebuild_v1750_desktop", str(workflow))
+                shell_build = next(s for s in warm_steps if s.get("name") == "Build desktop Rust (no bundles)")
+                self.assertEqual(shell_build["working-directory"], "src-tauri")
+                self.assertEqual(shell_build["run"], "cargo tauri build --no-bundle --target ${{ matrix.target }}")
+            else:
+                for step_name in ("Install cross (aarch64-linux)", "Build frontend"):
+                    self.assertIn(next(s for s in steps if s.get("name") == step_name), warm_steps)
+
+    def test_release_cache_warming_is_main_only_read_only_and_secretless(self):
+        path = ROOT / ".github/workflows/release-cache-warm.yml"
+        self.assertTrue(path.is_file())
+        body = path.read_text()
+        warm = yaml.load(body, Loader=yaml.BaseLoader)
+        self.assertEqual(set(warm["on"]), {"push", "schedule", "workflow_dispatch"})
+        self.assertEqual(warm["on"]["push"]["branches"], ["main"])
+        self.assertEqual(set(warm["on"]["push"]["paths"]), {
+            "Cargo.lock", "Cargo.toml", "crates/**/Cargo.toml",
+            "src-tauri/Cargo.lock", "src-tauri/Cargo.toml", "rust-toolchain*",
+        })
+        self.assertEqual(warm["on"]["schedule"], [{"cron": "0 18 * * 0"}])
+        self.assertEqual(warm["permissions"], {"contents": "read"})
+        self.assertNotIn("secrets", body.lower())
+        self.assertEqual(set(warm["jobs"]), {"release", "desktop-release"})
+        for job in warm["jobs"].values():
+            self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+            self.assertNotIn("permissions", job)
+            checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+            self.assertEqual(checkout["with"]["persist-credentials"], "false")
+            for step in job["steps"]:
+                self.assertNotIn("cargo test", step.get("run", ""))
+                self.assertNotIn("continue-on-error", step)
+                self.assertNotIn("tauri-apps/tauri-action", step.get("uses", ""))
 
     def test_build_profiles_keep_debug_assertions(self):
         env = self.workflow["env"]
@@ -72,27 +217,22 @@ class CiWorkflowTests(unittest.TestCase):
             "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)":
                 "runner.os == 'Linux'",
             "Test gateway Discord voice TLS transport": "runner.os == 'Linux'",
+            "Run every required Windows case on the native host": "runner.os == 'Windows'",
             "Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)":
                 "matrix.os == 'ubuntu-latest'",
             "Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI":
                 "matrix.os == 'ubuntu-latest'",
         }
-        advisory_steps = {"Clippy (no dashboard)", "Clippy gateway"}
         self.assertEqual(self.jobs["rust"]["strategy"]["fail-fast"], "false")
-        self.assertEqual(self.jobs["rust"]["continue-on-error"],
-                         "${{ matrix.os == 'windows-latest' }}")
         for job in ("rust", "dashboard", "python", "security"):
-            if job != "rust":
-                self.assertNotIn("continue-on-error", self.jobs[job])
+            self.assertNotIn("continue-on-error", self.jobs[job])
             for step in self.jobs[job]["steps"]:
                 name = step.get("name", step.get("uses"))
                 with self.subTest(job=job, step=name):
                     expected = conditional_steps.get(name) if job == "rust" else None
                     self.assertEqual(step.get("if"), expected)
-                    if job == "rust" and name in advisory_steps:
-                        self.assertEqual(step.get("continue-on-error"), "true")
-                    else:
-                        self.assertNotIn("continue-on-error", step)
+                    self.assertNotIn("continue-on-error", step)
+                    self.assertNotIn("clippy", step.get("run", ""))
 
     def test_settle_only_delays_pr_runs(self):
         settle = self.jobs["settle"]
