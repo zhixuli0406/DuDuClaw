@@ -88,7 +88,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 「想一想」計畫模式(I-1c)
 
-儀表板交辦面板的第三種模式,與「問一問」「交辦」並列。選它時 `tasks.goal_create` 帶 `plan_first: true`:後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`(沿用既有的 `blocked_needs_decision` 分類,沒有新增分類),核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
+儀表板交辦任務頁「複雜任務」分頁的第三種模式,與「問一問」「交辦」並列。選它時 `tasks.goal_create` 帶 `plan_first: true`:後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`(沿用既有的 `blocked_needs_decision` 分類,沒有新增分類),核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
 
 計畫存在獨立欄位 `plan_pending`,刻意與 `judge_feedback` 分開:任何 `needs_human` 任務用來恢復執行的「重試」動作會用你的核准備註覆寫 `judge_feedback`,若共用同一欄位,核准當下計畫就會被自己的核准動作洗掉、永遠傳不到第一輪派工。核准就是既有的「重試」按鈕,沒有新增按鈕種類。核准後的第一輪派工會把 `plan_pending` 的內容包成 `<execution_plan>` 區塊注入工作提示,注入後立刻清空,後續輪次不再重複貼。計畫是指引,不是免驗收憑證;執行結果仍要通過與其他目標任務相同的兩段式驗收裁決／MAV 判官團。
 

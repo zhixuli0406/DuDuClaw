@@ -71,7 +71,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 64 | [Thinking display](64-thinking-display.md) | Live thinking timer in WebChat for every runtime; masked, shortened thinking summaries for signed-in dashboard users; never sent to messaging apps |
 | 65 | [Where thinking comes from](65-thinking-sources.md) | Which runtimes report thinking (Claude CLI, Codex, OpenAI-compatible APIs, Anthropic Direct API), what each shows, and when a request changes |
 | 66 | [Thinking display in messaging apps](66-thinking-in-messaging-apps.md) | Timer and masked summary in Telegram, Discord, Slack, Teams, LINE and the other apps; `[thinking] channel_audience` / `channel_group_display` |
-| 67 | [Assigning tasks from a chat](67-assigning-tasks.md) | `/交辦 @employee task` (`/assign`) creates a goal task on the sender's behalf, limited to employees they may assign to; progress back to the chat; `/交辦 狀態`; "Assigned by me" on the Goals page |
+| 67 | [Assigning tasks from a chat](67-assigning-tasks.md) | `/交辦 @employee task` (`/assign`) creates a goal task on the sender's behalf, limited to employees they may assign to; progress back to the chat; `/交辦 狀態`; "Assigned by me" on the Goals page; the dashboard 交辦任務 page (`/assign`: hand over a skill, or the full form; attachments) |
 | 68 | [Read-only team conversations](68-manager-team-history.md) | Enterprise backend (v1.76.0): live reporting-line scope, full-text report WebChat, masked external transcripts, activation boundary, mandatory audit and limits; [繁體中文](zh-TW/68-manager-team-history.md) / [日本語](ja-JP/68-manager-team-history.md) |
 
 ---
