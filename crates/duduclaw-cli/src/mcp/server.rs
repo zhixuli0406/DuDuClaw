@@ -203,11 +203,8 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                         crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
                 {
                     let current: Vec<String> =
-                        visible_tool_names(&p, home_dir, &default_agent)
-                            .await
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect();
+                        visible_tool_schemas(&p, home_dir, &default_agent)
+                            .await;
                     if &current != previous {
                         tracing::info!(
                             before = previous.len(),
@@ -338,11 +335,8 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 let baseline = if wants {
                     match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
                         Ok(p) => Some(
-                            visible_tool_names(&p, home_dir, &default_agent)
-                                .await
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect::<Vec<_>>(),
+                            visible_tool_schemas(&p, home_dir, &default_agent)
+                                .await,
                         ),
                         Err(e) => {
                             let err = crate::mcp_protocol::modernize_response(jsonrpc_error(
@@ -395,7 +389,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                         // second evaluation, so the watcher above compares
                         // against the real wire content and the hot path pays
                         // for one pass, not two.
-                        last_advertised = Some(advertised_tool_names(&resp));
+                        last_advertised = Some(advertised_tool_schemas(&resp));
                         if modern {
                             crate::mcp_protocol::with_cache_hints(
                                 resp,

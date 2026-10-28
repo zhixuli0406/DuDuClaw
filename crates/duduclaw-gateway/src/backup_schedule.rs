@@ -216,6 +216,7 @@ pub fn schedule_backup_excludes(home_dir: &Path) -> Vec<String> {
     let mut out = Vec::with_capacity(5);
     if let Some(base) = base {
         out.push(format!("./{base}/computer_profiles"));
+        out.push(format!("./{base}/local_browser"));
         out.push(format!("./{base}/{BACKUPS_DIRNAME}"));
         out.push(format!(
             "./{base}/{}",
@@ -682,6 +683,7 @@ mod tests {
         let home = Path::new("/data/duduclaw");
         let excludes = schedule_backup_excludes(home);
         assert!(excludes.contains(&"./duduclaw/computer_profiles".to_string()));
+        assert!(excludes.contains(&"./duduclaw/local_browser".to_string()));
         assert!(
             excludes.contains(&"./duduclaw/backups".to_string()),
             "{excludes:?}"

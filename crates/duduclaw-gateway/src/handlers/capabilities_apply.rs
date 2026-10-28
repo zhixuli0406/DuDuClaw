@@ -264,6 +264,11 @@ pub(crate) fn apply_capabilities_to_table(
                 "capabilities.computer_use_config.persist_login = {enabled}"
             ));
         }
+        if let Some(raw) = cfg.get("local_browser") {
+            let enabled = raw.as_bool().ok_or("local_browser must be true or false")?;
+            sub.insert("local_browser".into(), toml::Value::Boolean(enabled));
+            changes.push(format!("capabilities.computer_use_config.local_browser = {enabled}"));
+        }
 
         for (param_key, toml_key) in &[
             ("allowed_apps", "allowed_apps"),

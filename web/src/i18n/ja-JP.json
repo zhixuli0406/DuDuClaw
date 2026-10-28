@@ -1,4 +1,10 @@
 {
+  "localBrowser.employeeEnable": "専用のローカルブラウザーを許可",
+  "localBrowser.employeeEnable.help": "macOS デスクトップアプリと本人の在席が必要です。各操作はローカルで承認します。普段のブラウザーとは別です。",
+  "localBrowser.globalEnable": "専用ローカルブラウザーを有効化（初期値はオフ）",
+  "localBrowser.globalEnable.help": "ローカルの macOS アプリが起動した gateway のみ利用できます。専用画面に本人がログインし、メニューバーから承認・再開・停止します。",
+  "localBrowser.riskAck": "このコンピューターで AI が専用ブラウザーを開くことを理解しました。自分でログインし、各操作をローカルで承認し、メニューバーから停止できます。メモリー内処理は DuDuClaw の画面・同意の監査経路に限り、画像・本文・URL・キーは実行器の記録、提供者のキャッシュ、モデルの回答に残る場合があります。専用 Chrome profile もサイトの状態を保存します。",
+  "localBrowser.dashboardNotice": "ここでは状態の確認と停止のみ可能です。画面の確認、承認、再開はローカルのデスクトップアプリで行ってください。",
   "causalCuration.title": "因果エビデンス審査",
   "causalCuration.desc": "出典付き主張、変数別名、因果モデルを審査",
   "decisionLab.title": "Decision Lab",

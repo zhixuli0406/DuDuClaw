@@ -61,7 +61,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
       const next = await computerSessionApi.status(agentId);
       setStatus(next);
       setDenied(false);
-      if (!next.active) setTicket(null);
+      if (!next.active || next.target === 'local_browser') setTicket(null);
     } catch {
       setDenied(true);
     }
@@ -124,10 +124,11 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
   const phase = sessionPhase(status);
   const active = status?.active ? status : null;
   const mine = Boolean(active?.takeover?.mine);
+  const local = active?.target === 'local_browser';
 
   return (
     <div className="mx-auto w-full max-w-[1440px] space-y-4 p-4 sm:p-6">
-      <BrowserLoginState agentId={agentId} />
+      {!local && <BrowserLoginState agentId={agentId} />}
       <Card>
         <CardHeader>
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
@@ -163,7 +164,8 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
                 </p>
               )}
 
-              {active.hold && (
+              {local && <p role="status" className="rounded-lg bg-muted p-3 text-sm">{t('localBrowser.dashboardNotice')}</p>}
+              {!local && active.hold && (
                 <div
                   role="alert"
                   className="flex flex-wrap items-start gap-3 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm"
@@ -194,17 +196,17 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
               )}
 
               <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" variant="outline" disabled={busy || !active.stream_available} onClick={watch}>
+                {!local && <Button size="sm" variant="outline" disabled={busy || !active.stream_available} onClick={watch}>
                   <Eye />
                   {t(ticket ? 'computerSession.reconnect' : 'computerSession.watch')}
-                </Button>
-                {!active.takeover && (
+                </Button>}
+                {!local && !active.takeover && (
                   <Button size="sm" variant="brand" disabled={busy || !active.stream_available} onClick={takeOver}>
                     <Hand />
                     {t('computerSession.takeover')}
                   </Button>
                 )}
-                {mine && (
+                {!local && mine && (
                   <>
                     <input
                       value={note}
@@ -250,7 +252,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
         </CardContent>
       </Card>
 
-      {active && ticket && !ended && (
+      {active && !local && ticket && !ended && (
         <ComputerViewer
           ticket={ticket}
           onEnd={(why) => {

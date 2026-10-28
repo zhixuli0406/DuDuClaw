@@ -20,6 +20,8 @@ use tracing::{info, warn};
 use super::live_view::{
     self, Hold, LiveAction, TICKET_TTL, TakeoverLease, ViewTicket, VncMode, operator_label,
 };
+#[cfg(unix)]
+use super::local_browser;
 use super::{ComputerUseSessions, EndReason, Entry, ErrorCode, OpError, write_audit};
 
 /// How long a viewer request waits for the session lock (to resume a paused
@@ -32,7 +34,10 @@ const STOP_LOCK_WAIT: Duration = Duration::from_secs(30);
 const NOTE_MAX_CHARS: usize = 200;
 
 fn no_session() -> OpError {
-    OpError::new(ErrorCode::NotFound, "這位員工目前沒有進行中的電腦操作 session。")
+    OpError::new(
+        ErrorCode::NotFound,
+        "這位員工目前沒有進行中的電腦操作 session。",
+    )
 }
 
 fn stream_unavailable() -> OpError {
@@ -107,7 +112,10 @@ pub(crate) fn takeover_handoff(
         }
     }
     if let Some(prev) = previous.map(str::trim).filter(|p| !p.is_empty()) {
-        note.push_str(&format!(" 接手前的交接：{}", duduclaw_core::truncate_chars(prev, 300)));
+        note.push_str(&format!(
+            " 接手前的交接：{}",
+            duduclaw_core::truncate_chars(prev, 300)
+        ));
     }
     let next = "先呼叫 computer_screenshot 看目前畫面再決定下一步；畫面可能已和接手前不同，不要沿用舊的座標。".to_string();
     (note, next)
@@ -125,7 +133,11 @@ async fn write_takeover_handoff(
     let res = tokio::task::spawn_blocking(move || {
         let previous = crate::working_state::read_full(&home, &agent_id, 0)
             .ok()
-            .and_then(|v| v.pointer("/handoff/note").and_then(Value::as_str).map(str::to_string));
+            .and_then(|v| {
+                v.pointer("/handoff/note")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
         let (note, next) = takeover_handoff(
             &lease.holder_label,
             &session_id,
@@ -155,7 +167,11 @@ async fn write_takeover_handoff(
 
 /// Push the injection-hold notice: Activity Feed first, then a channel push
 /// through the employee's notify target (best effort, detached).
-pub(crate) fn notify_injection_hold(home: std::path::PathBuf, agent_id: String, categories: Vec<String>) {
+pub(crate) fn notify_injection_hold(
+    home: std::path::PathBuf,
+    agent_id: String,
+    categories: Vec<String>,
+) {
     tokio::spawn(async move {
         let summary = format!(
             "電腦操作畫面疑似提示注入（{}），已暫停員工的操作；請到儀表板確認畫面後恢復或結束。",
@@ -187,6 +203,16 @@ pub(crate) fn notify_injection_hold(home: std::path::PathBuf, agent_id: String, 
     });
 }
 
+fn reject_local_page(entry: &Entry) -> Result<(), OpError> {
+    if entry.shared.target == super::SessionTarget::LocalBrowser {
+        return Err(OpError::new(
+            ErrorCode::Forbidden,
+            "本機瀏覽器的核准與繼續只能在本機桌面 app 決定。",
+        ));
+    }
+    Ok(())
+}
+
 impl ComputerUseSessions {
     /// The live entry of `agent_id`, if its session id is `session_id` (or
     /// any, when `None`).
@@ -197,6 +223,9 @@ impl ComputerUseSessions {
 
     fn audit_operator(&self, agent_id: &str, action: &str, mut details: Value, operator: &str) {
         details["operator"] = json!(operator);
+        if let Some(entry) = self.entry(agent_id) {
+            details["target"] = json!(entry.shared.target);
+        }
         let entry = super::audit_entry(agent_id, action, details, None);
         tokio::spawn(write_audit(self.home.clone(), entry));
     }
@@ -204,13 +233,25 @@ impl ComputerUseSessions {
     /// Resume a paused session for a viewer and mark the activity. Waits at
     /// most [`WAKE_LOCK_WAIT`] for the lock; a busy session is not paused.
     async fn wake_for_viewer(&self, agent_id: &str, entry: &Entry) -> Result<(), OpError> {
-        *entry.shared.touched.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        if entry.shared.target == super::SessionTarget::LocalBrowser {
+            return Err(OpError::new(
+                super::ErrorCode::Forbidden,
+                "本機瀏覽器只允許在本機桌面 app 檢視與核准；儀表板只提供狀態與停止。",
+            ));
+        }
+        *entry
+            .shared
+            .touched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
         match tokio::time::timeout(WAKE_LOCK_WAIT, Arc::clone(&entry.session).lock_owned()).await {
             Ok(mut guard) => {
                 if guard.agent_id != agent_id {
                     return Err(no_session());
                 }
-                self.check_alive(&mut guard).await.map_err(|_| no_session())?;
+                self.check_alive(&mut guard)
+                    .await
+                    .map_err(|_| no_session())?;
                 guard.last_activity = Instant::now();
                 Ok(())
             }
@@ -269,14 +310,17 @@ impl ComputerUseSessions {
             json!({"reason": "injection_suspected", "categories": h.categories, "since": h.since_unix})
         });
         let paused_seconds_left = match (frozen, meta) {
-            (Some(since), Some(m)) => {
-                Some(m.keep_alive.saturating_sub(now.saturating_duration_since(since)).as_secs())
-            }
+            (Some(since), Some(m)) => Some(
+                m.keep_alive
+                    .saturating_sub(now.saturating_duration_since(since))
+                    .as_secs(),
+            ),
             _ => None,
         };
         json!({
             "ok": true,
             "active": true,
+            "target": entry.shared.target,
             "session_id": entry.session_id,
             "state": if frozen.is_some() { "paused" } else { "running" },
             "actions_used": live.actions_used.load(Ordering::Acquire),
@@ -292,7 +336,12 @@ impl ComputerUseSessions {
     }
 
     /// A one-time viewer ticket plus the stream's password.
-    async fn viewer_ticket(&self, agent_id: &str, entry: &Entry, ctx: &UserContext) -> Result<Value, OpError> {
+    async fn viewer_ticket(
+        &self,
+        agent_id: &str,
+        entry: &Entry,
+        ctx: &UserContext,
+    ) -> Result<Value, OpError> {
         let mode = Self::wanted_mode(entry);
         let password = self.ensure_vnc(entry, mode).await?;
         let now = Instant::now();
@@ -324,7 +373,11 @@ impl ComputerUseSessions {
 
     /// Watch: resume a paused session, (re)start the stream in the mode the
     /// lease asks for, hand out a ticket.
-    pub async fn live_view_open(&self, agent_id: &str, ctx: &UserContext) -> Result<Value, OpError> {
+    pub async fn live_view_open(
+        &self,
+        agent_id: &str,
+        ctx: &UserContext,
+    ) -> Result<Value, OpError> {
         let entry = self.entry(agent_id).ok_or_else(no_session)?;
         self.wake_for_viewer(agent_id, &entry).await?;
         self.viewer_ticket(agent_id, &entry, ctx).await
@@ -345,7 +398,12 @@ impl ComputerUseSessions {
             .unwrap_or(Duration::from_secs(600));
         let label = operator_label(ctx);
         {
-            let mut slot = entry.shared.live.takeover.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = entry
+                .shared
+                .live
+                .takeover
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             match slot.as_mut() {
                 Some(l) if l.active(now) && l.holder_id != ctx.user_id => {
                     return Err(OpError::new(
@@ -368,9 +426,16 @@ impl ComputerUseSessions {
             Ok(body) => Ok(body),
             Err(err) => {
                 // No stream, no takeover: the employee is not kept waiting.
-                let lease = entry.shared.live.takeover.lock().unwrap_or_else(|p| p.into_inner()).take();
+                let lease = entry
+                    .shared
+                    .live
+                    .takeover
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
                 if let Some(lease) = lease {
-                    self.release(&entry, agent_id, lease, ReleaseReason::StreamFailed, None).await;
+                    self.release(&entry, agent_id, lease, ReleaseReason::StreamFailed, None)
+                        .await;
                 }
                 Err(err)
             }
@@ -388,7 +453,9 @@ impl ComputerUseSessions {
         human_note: Option<String>,
     ) {
         let running = entry.shared.live.vnc.lock().await.mode;
-        if running == Some(VncMode::Control) && self.ensure_vnc(entry, VncMode::ViewOnly).await.is_err() {
+        if running == Some(VncMode::Control)
+            && self.ensure_vnc(entry, VncMode::ViewOnly).await.is_err()
+        {
             // Never leave an input-accepting server behind.
             if let Some(access) = entry.shared.live.access() {
                 access.stop_vnc().await;
@@ -427,33 +494,56 @@ impl ComputerUseSessions {
         note: Option<&str>,
     ) -> Result<Value, OpError> {
         let entry = self.entry(agent_id).ok_or_else(no_session)?;
+        reject_local_page(&entry)?;
         let lease = {
-            let mut slot = entry.shared.live.takeover.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = entry
+                .shared
+                .live
+                .takeover
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             match slot.as_ref() {
                 None => None,
                 Some(l) if l.holder_id == ctx.user_id || ctx.is_admin() => slot.take(),
                 Some(l) => {
                     return Err(OpError::new(
                         ErrorCode::Forbidden,
-                        format!("目前是 {} 在接手，只有對方或管理員可以交還。", l.holder_label),
+                        format!(
+                            "目前是 {} 在接手，只有對方或管理員可以交還。",
+                            l.holder_label
+                        ),
                     ));
                 }
             }
         };
         let Some(lease) = lease else {
-            return Err(OpError::new(ErrorCode::BadRequest, "目前沒有人接手這台電腦。"));
+            return Err(OpError::new(
+                ErrorCode::BadRequest,
+                "目前沒有人接手這台電腦。",
+            ));
         };
         let note = note.map(|n| duduclaw_core::truncate_chars(n, NOTE_MAX_CHARS));
-        self.release(&entry, agent_id, lease, ReleaseReason::HandBack, note).await;
+        self.release(&entry, agent_id, lease, ReleaseReason::HandBack, note)
+            .await;
         Ok(json!({"ok": true, "session_id": entry.session_id}))
     }
 
     /// Lift an injection hold.
     pub async fn live_resume(&self, agent_id: &str, ctx: &UserContext) -> Result<Value, OpError> {
         let entry = self.entry(agent_id).ok_or_else(no_session)?;
-        let hold: Option<Hold> = entry.shared.live.hold.lock().unwrap_or_else(|p| p.into_inner()).take();
+        reject_local_page(&entry)?;
+        let hold: Option<Hold> = entry
+            .shared
+            .live
+            .hold
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         let Some(hold) = hold else {
-            return Err(OpError::new(ErrorCode::BadRequest, "這個 session 沒有因疑似注入而暫停。"));
+            return Err(OpError::new(
+                ErrorCode::BadRequest,
+                "這個 session 沒有因疑似注入而暫停。",
+            ));
         };
         self.audit_operator(
             agent_id,
@@ -486,7 +576,12 @@ impl ComputerUseSessions {
         }
         let entry = self.entry(agent_id).ok_or_else(no_session)?;
         let operator = operator_label(ctx);
-        self.audit_operator(agent_id, "operator_stop", json!({"session_id": entry.session_id}), &operator);
+        self.audit_operator(
+            agent_id,
+            "operator_stop",
+            json!({"session_id": entry.session_id}),
+            &operator,
+        );
         entry.control.stopped.store(true, Ordering::Release);
         let mut ended = false;
         if let Ok(mut session) =
@@ -525,6 +620,12 @@ impl ComputerUseSessions {
     /// Resetting login state never exports the session being terminated.
     pub async fn reset_login(&self, agent_id: &str, ctx: &UserContext) -> Result<(), OpError> {
         if let Some(entry) = self.entry(agent_id) {
+            if entry.shared.target == super::SessionTarget::LocalBrowser {
+                return Err(OpError::new(
+                    super::ErrorCode::Forbidden,
+                    "本機瀏覽器的登入狀態必須在本機桌面 app 處理。",
+                ));
+            }
             entry.shared.discard_profile.store(true, Ordering::Release);
             let result = self.live_stop(agent_id, ctx).await?;
             if result["ended"] != true {
@@ -552,10 +653,18 @@ impl ComputerUseSessions {
     /// Host-owned offboarding/handover hook. No operator impersonation and
     /// no export of the previous owner's login state.
     pub(crate) async fn forget_login(&self, agent_id: &str, reason: &str) -> Result<(), String> {
+        // This precedes every return and every cleanup await: a first pending
+        // native permit already has an epoch even without a profile/session.
+        super::invalidate_local_browser_owner(&self.home, agent_id)?;
+        #[cfg(unix)]
+        let local = local_browser::profile::has_profile(&self.home, agent_id)?;
+        #[cfg(not(unix))]
+        let local = false;
         let caps =
             duduclaw_core::agent_toml::load(&self.home.join("agents").join(agent_id)).capabilities;
         let saved = crate::computer_profiles::state(&self.home, agent_id)?.is_some();
-        if !saved
+        if !local
+            && !saved
             && !(caps.computer_use_config.persist_login
                 && crate::computer_profiles::ProfilesConfig::active(&self.home).is_some())
         {
@@ -569,7 +678,11 @@ impl ComputerUseSessions {
                 .await;
         }
         crate::computer_profiles::reset(&self.home, agent_id)?;
-        self.audit_line(agent_id, "profile_deleted", json!({"reason": reason}), None)
+        #[cfg(unix)]
+        if local {
+            local_browser::profile::forget_profile(&self.home, agent_id)?;
+        }
+        self.audit_line(agent_id, "profile_deleted", json!({"reason": reason,"target":if local{super::SessionTarget::LocalBrowser}else{super::SessionTarget::Container}}), None)
             .await;
         Ok(())
     }
@@ -586,14 +699,20 @@ impl ComputerUseSessions {
         let now = Instant::now();
         for (agent, entry) in entries {
             let expired = {
-                let mut slot = entry.shared.live.takeover.lock().unwrap_or_else(|p| p.into_inner());
+                let mut slot = entry
+                    .shared
+                    .live
+                    .takeover
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 match slot.as_ref() {
                     Some(l) if !l.active(now) => slot.take(),
                     _ => None,
                 }
             };
             if let Some(lease) = expired {
-                self.release(&entry, &agent, lease, ReleaseReason::IdleTimeout, None).await;
+                self.release(&entry, &agent, lease, ReleaseReason::IdleTimeout, None)
+                    .await;
             }
         }
     }
@@ -605,9 +724,9 @@ pub fn rpc_action(method: &str) -> Option<LiveAction> {
         "computer_sessions.status" | "computer_sessions.view" | "computer_sessions.stop" => {
             LiveAction::Watch
         }
-        "computer_sessions.takeover" | "computer_sessions.hand_back" | "computer_sessions.resume" => {
-            LiveAction::Control
-        }
+        "computer_sessions.takeover"
+        | "computer_sessions.hand_back"
+        | "computer_sessions.resume" => LiveAction::Control,
         _ => return None,
     })
 }
@@ -633,7 +752,15 @@ pub(crate) async fn release_on_end(
             None,
         );
         write_audit(home.clone(), entry).await;
-        write_takeover_handoff(home, agent_id, session_id, lease, ReleaseReason::SessionEnded, None).await;
+        write_takeover_handoff(
+            home,
+            agent_id,
+            session_id,
+            lease,
+            ReleaseReason::SessionEnded,
+            None,
+        )
+        .await;
     }
 }
 
@@ -652,7 +779,9 @@ mod tests {
             Some("已幫你登入，接下來可以繼續填表"),
             Some("正在填寫報名表第 2 頁"),
         );
-        assert!(note.contains("ops@example.com") && note.contains("cu-1") && note.contains("3 分鐘"));
+        assert!(
+            note.contains("ops@example.com") && note.contains("cu-1") && note.contains("3 分鐘")
+        );
         assert!(note.contains("7 次") && note.contains("已幫你登入") && note.contains("第 2 頁"));
         assert!(next.contains("computer_screenshot"));
     }
@@ -676,11 +805,26 @@ mod tests {
 
     #[test]
     fn rpc_methods_map_to_closed_actions() {
-        assert_eq!(rpc_action("computer_sessions.view"), Some(LiveAction::Watch));
-        assert_eq!(rpc_action("computer_sessions.stop"), Some(LiveAction::Watch));
-        assert_eq!(rpc_action("computer_sessions.takeover"), Some(LiveAction::Control));
-        assert_eq!(rpc_action("computer_sessions.resume"), Some(LiveAction::Control));
-        assert_eq!(rpc_action("computer_sessions.hand_back"), Some(LiveAction::Control));
+        assert_eq!(
+            rpc_action("computer_sessions.view"),
+            Some(LiveAction::Watch)
+        );
+        assert_eq!(
+            rpc_action("computer_sessions.stop"),
+            Some(LiveAction::Watch)
+        );
+        assert_eq!(
+            rpc_action("computer_sessions.takeover"),
+            Some(LiveAction::Control)
+        );
+        assert_eq!(
+            rpc_action("computer_sessions.resume"),
+            Some(LiveAction::Control)
+        );
+        assert_eq!(
+            rpc_action("computer_sessions.hand_back"),
+            Some(LiveAction::Control)
+        );
         assert_eq!(rpc_action("computer_sessions.other"), None);
     }
 }

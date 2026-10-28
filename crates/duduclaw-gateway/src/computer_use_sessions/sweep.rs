@@ -63,7 +63,8 @@ pub fn parse_listing(text: &str) -> Option<Vec<Listed>> {
     let mut out = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let mut parts = line.split('|');
-        let (id, name, state, deadline) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        let (id, name, state, deadline) =
+            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
         // Optional workspace + lease labels (both or neither).
         let (workspace, lease) = match (parts.next(), parts.next()) {
             (None, None) => (None, None),
@@ -104,7 +105,9 @@ pub fn removable(container: &Listed, now: u64) -> bool {
     if matches!(container.state.as_str(), "exited" | "dead") {
         return true;
     }
-    container.deadline.is_some_and(|deadline| now > deadline.saturating_add(GRACE.as_secs()))
+    container
+        .deadline
+        .is_some_and(|deadline| now > deadline.saturating_add(GRACE.as_secs()))
 }
 
 /// The keep-alive rule (P8, single-gateway maintenance): a computer-use
@@ -126,7 +129,10 @@ pub fn paused_past_deadline(container: &Listed, now: u64) -> bool {
 /// workspace labels whose epoch is not the live lease of that workspace.
 /// `live_epoch(id)` is `Some(Some(epoch))` for a live lease, `Some(None)` for
 /// no live lease, `None` when the registry does not know (nothing removed).
-pub fn stale_workspace_container(container: &Listed, live_epoch: impl Fn(&str) -> Option<Option<i64>>) -> bool {
+pub fn stale_workspace_container(
+    container: &Listed,
+    live_epoch: impl Fn(&str) -> Option<Option<i64>>,
+) -> bool {
     let is_cu = container
         .name
         .strip_prefix("duduclaw-cu-")
@@ -178,7 +184,9 @@ pub async fn reconcile_workspaces(home: &Path) {
 /// [`reconcile_workspaces`] without the lock gate (callers decide).
 pub async fn reconcile_workspaces_unchecked(home: &Path) {
     let h = home.to_path_buf();
-    let expired = tokio::task::spawn_blocking(move || crate::computer_workspaces::reconcile_registry(&h)).await;
+    let expired =
+        tokio::task::spawn_blocking(move || crate::computer_workspaces::reconcile_registry(&h))
+            .await;
     let expired = match expired {
         Ok(Ok(expired)) => expired,
         Ok(Err(e)) => {
@@ -187,14 +195,18 @@ pub async fn reconcile_workspaces_unchecked(home: &Path) {
         }
         Err(_) => return,
     };
-    let Ok(store) = crate::task_store::TaskStore::open(home) else { return };
+    let Ok(store) = crate::task_store::TaskStore::open(home) else {
+        return;
+    };
     for (id, owner) in expired {
         let row = crate::task_store::ActivityRow {
             id: uuid::Uuid::new_v4().to_string(),
             event_type: "workspace_expired".to_string(),
             agent_id: owner,
             task_id: None,
-            summary: "電腦操作工作區已超過保留期限，轉為唯讀（資料沒有刪除）；需要時請管理員延長或刪除。".to_string(),
+            summary:
+                "電腦操作工作區已超過保留期限，轉為唯讀（資料沒有刪除）；需要時請管理員延長或刪除。"
+                    .to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             metadata: Some(serde_json::json!({"workspace_id": id}).to_string()),
         };
@@ -223,7 +235,8 @@ pub async fn run_periodically(home: std::path::PathBuf) {
 pub async fn cleanup_screenshots(home: &Path) -> u32 {
     let home = home.to_path_buf();
     let cleaned = tokio::task::spawn_blocking(move || {
-        crate::screenshot_audit::BrowserAuditLog::new(&home, super::AUDIT_RETENTION_DAYS).cleanup_expired()
+        crate::screenshot_audit::BrowserAuditLog::new(&home, super::AUDIT_RETENTION_DAYS)
+            .cleanup_expired()
     })
     .await;
     match cleaned {
@@ -276,7 +289,15 @@ pub async fn sweep_once_with(home: &Path, maintain: bool) -> usize {
         "{{{{.ID}}}}|{{{{.Names}}}}|{{{{.State}}}}|{{{{.Label \"{DEADLINE_LABEL}\"}}}}|{{{{.Label \"{WORKSPACE_LABEL}\"}}}}|{{{{.Label \"{LEASE_LABEL}\"}}}}"
     );
     let filter = format!("label={HOME_LABEL}={label}");
-    let args = ["ps", "--all", "--no-trunc", "--filter", filter.as_str(), "--format", format.as_str()];
+    let args = [
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        filter.as_str(),
+        "--format",
+        format.as_str(),
+    ];
     let listing = match docker_output(&args, DOCKER_CALL_TIMEOUT, "Computer-use sweep list").await {
         Ok(out) if out.status.success() => String::from_utf8(out.stdout).ok(),
         _ => None,
@@ -318,7 +339,8 @@ pub async fn sweep_once_with(home: &Path, maintain: bool) -> usize {
         // removal can kill it on every Docker version.
         if container.state == "paused" {
             let unpause = ["unpause", container.id.as_str()];
-            let _ = docker_output(&unpause, DOCKER_CALL_TIMEOUT, "Computer-use sweep unpause").await;
+            let _ =
+                docker_output(&unpause, DOCKER_CALL_TIMEOUT, "Computer-use sweep unpause").await;
         }
         let rm = ["rm", "--force", container.id.as_str()];
         match docker_output(&rm, DOCKER_CALL_TIMEOUT, "Computer-use sweep remove").await {

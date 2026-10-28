@@ -275,6 +275,7 @@ impl DeviceOps for SystemDeviceOps {
             .arg(dest_path)
             // Browser sessions must reauthenticate after any restore.
             .arg("--exclude=*/computer_profiles")
+            .arg("--exclude=*/local_browser")
             .arg("-C")
             .arg(source_dir)
             .arg(".");

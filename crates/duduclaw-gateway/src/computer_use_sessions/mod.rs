@@ -40,6 +40,7 @@
 
 pub mod actions;
 pub(crate) mod attended;
+pub(crate) mod attended_call;
 pub mod auth;
 mod backend;
 pub mod gates;
@@ -47,6 +48,7 @@ pub mod http;
 pub mod keepalive;
 pub(crate) mod live_ops;
 pub mod live_view;
+pub(crate) mod local_browser;
 pub mod navigation;
 pub mod rfb;
 pub mod sweep;
@@ -81,7 +83,37 @@ use crate::screenshot_audit::{AuditEntry, BrowserAuditLog};
 
 use actions::{ActionRequest, Gate};
 use backend::EndedBackend;
+pub use backend::SessionTarget;
 pub(crate) use backend::{BackendFactory, SessionBackend};
+
+/// Discovery only; runtime admission independently checks every condition.
+pub fn local_browser_discoverable(home: &Path, agent: &str) -> bool {
+    local_browser::policy::platform_supported()
+        && duduclaw_core::is_valid_agent_id(agent)
+        && !crate::ephemeral::is_ephemeral_id(agent)
+        && local_browser::policy::LocalBrowserConfig::load(home).is_ok_and(|config| config.enabled)
+        && {
+            let caps = agent_capabilities(home, agent);
+            caps.computer_use && caps.computer_use_config.local_browser
+        }
+}
+
+/// Metadata only; this never launches a browser or reads a pairing key.
+pub async fn local_browser_doctor(home: &Path) -> (crate::task_sandbox::doctor::Level, String) {
+    local_browser::doctor::check(home).await
+}
+
+/// Host ownership mutation barrier. Call BEFORE each owner/primary-owner
+/// change, including A→B→A. Failure must abort the ownership write.
+pub fn invalidate_local_browser_owner(home: &Path, agent: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    if local_browser::profile::has_identity(home, agent)? {
+        local_browser::profile::invalidate_owner(home, agent)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (home, agent);
+    Ok(())
+}
 
 /// A session with no operation for this long is stopped.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -301,6 +333,10 @@ pub enum EndReason {
     OperatorStopped,
     /// A paused (keep-alive) container could not be resumed.
     ResumeFailed,
+    /// The authenticated native controller has not reported for 30 seconds.
+    LocalControllerLost,
+    /// Normal destruction of the owned dedicated window, observed by host.
+    LocalWindowClosed,
 }
 
 fn preserve_login_on_end(
@@ -317,6 +353,7 @@ fn preserve_login_on_end(
                 | EndReason::Deadline
                 | EndReason::Idle
                 | EndReason::OperatorStopped
+                | EndReason::LocalWindowClosed
         )
 }
 
@@ -332,6 +369,8 @@ impl EndReason {
             Self::LeaseLost => "lease_lost",
             Self::OperatorStopped => "operator_stopped",
             Self::ResumeFailed => "resume_failed",
+            Self::LocalControllerLost => "local_controller_lost",
+            Self::LocalWindowClosed => "local_window_closed",
         }
     }
 
@@ -358,6 +397,8 @@ impl EndReason {
             Self::ResumeFailed => {
                 "暫停中的電腦操作容器無法恢復，session 已結束。需要的話請重新呼叫 computer_session_start。"
             }
+            Self::LocalControllerLost => "本機原生控制器已失聯三十秒，專用瀏覽器工作階段已結束。",
+            Self::LocalWindowClosed => "專用瀏覽器視窗已正常關閉，工作階段已結束。",
         }
     }
 }
@@ -431,6 +472,7 @@ impl ConfirmerResolver for LiveTurnConfirmers {
 /// What `start` accepts.
 #[derive(Debug, Clone, Default)]
 pub struct StartRequest {
+    pub target: SessionTarget,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub task: Option<String>,
@@ -445,6 +487,10 @@ pub struct StartRequest {
 /// State an approval wait updates without taking the session lock.
 #[derive(Default)]
 pub(crate) struct SessionShared {
+    pub(crate) target: SessionTarget,
+    /// Server receive time of an authenticated native controller heartbeat.
+    /// This is liveness only: never a person, presence, or page-read grant.
+    native_controller_heartbeat: std::sync::Mutex<Option<Instant>>,
     /// Approvals currently awaited for this session's employee. While one
     /// is pending the session does not count as idle.
     approvals_waiting: AtomicU32,
@@ -461,7 +507,23 @@ pub(crate) struct SessionShared {
 }
 
 impl SessionShared {
+    fn native_controller_lost(&self, now: Instant) -> bool {
+        self.target == SessionTarget::LocalBrowser
+            && self
+                .native_controller_heartbeat
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none_or(|at| {
+                    now.saturating_duration_since(at)
+                        >= local_browser::presence::LOST_COMPANION_STOP
+                })
+    }
     fn effective_activity(&self, last_activity: Instant, now: Instant) -> Instant {
+        // Controller liveness extends only the idle clock. Physical presence,
+        // opaque call/read consent, stop/threat and hard deadline stay separate.
+        if self.target == SessionTarget::LocalBrowser && !self.native_controller_lost(now) {
+            return now;
+        }
         // A pending approval, an open dashboard viewer or an active takeover
         // keeps the session from idling out (the hard deadline still holds).
         if self.approvals_waiting.load(Ordering::Acquire) > 0
@@ -520,6 +582,7 @@ impl ManagedSession {
 
     fn counters(&self, now: Instant) -> Value {
         json!({
+            "target": self.shared.target,
             "session_id": self.session_id,
             "actions_used": self.actions_used,
             "max_actions": self.config.max_actions,
@@ -555,6 +618,9 @@ pub struct ComputerUseSessions {
     pub(crate) replay: auth::ReplayGuard,
     idle_timeout: Duration,
     factory: BackendFactory,
+    #[cfg(test)]
+    local_factory: Option<BackendFactory>,
+    pub(crate) companion: Arc<local_browser::companion::Companion>,
     confirmers: Arc<dyn ConfirmerResolver>,
     resolver: Arc<dyn navigation::HostResolver>,
     workspace_rt: Arc<dyn workspace::WorkspaceRuntime>,
@@ -642,6 +708,22 @@ fn audit_entry(
 }
 
 impl ComputerUseSessions {
+    pub(crate) fn note_native_controller_heartbeat(&self, at: Instant) {
+        let shared: Vec<_> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter(|entry| entry.shared.target == SessionTarget::LocalBrowser)
+            .map(|entry| entry.shared.clone())
+            .collect();
+        for shared in shared {
+            *shared
+                .native_controller_heartbeat
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(at);
+        }
+    }
     /// The production registry (real containers, [`IDLE_TIMEOUT`],
     /// confirmations through live channel-reply turns).
     pub fn new(home: PathBuf) -> Arc<Self> {
@@ -651,6 +733,7 @@ impl ComputerUseSessions {
             IDLE_TIMEOUT,
         ));
         *active_registry().lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(&sessions);
+        sessions.companion.attach_manager(&sessions);
         sessions
     }
 
@@ -665,6 +748,7 @@ impl ComputerUseSessions {
             .unwrap_or_default();
         let confirmers = Arc::new(LiveTurnConfirmers { http });
         Self {
+            companion: local_browser::companion::Companion::new(&home),
             home,
             sessions: std::sync::Mutex::new(HashMap::new()),
             starting: std::sync::Mutex::new(HashSet::new()),
@@ -672,6 +756,8 @@ impl ComputerUseSessions {
             replay: auth::ReplayGuard::default(),
             idle_timeout,
             factory,
+            #[cfg(test)]
+            local_factory: None,
             confirmers,
             resolver: Arc::new(navigation::DnsResolver),
             workspace_rt: workspace::docker_runtime(),
@@ -699,7 +785,10 @@ impl ComputerUseSessions {
 
     /// Replace the Docker facts a workspace start needs (tests).
     #[cfg(test)]
-    pub(crate) fn with_workspace_runtime(mut self, rt: Arc<dyn workspace::WorkspaceRuntime>) -> Self {
+    pub(crate) fn with_workspace_runtime(
+        mut self,
+        rt: Arc<dyn workspace::WorkspaceRuntime>,
+    ) -> Self {
         self.workspace_rt = rt;
         self
     }
@@ -734,6 +823,11 @@ impl ComputerUseSessions {
 
     /// Insert a ready session (tests use this to skip the container start).
     pub(crate) fn insert(&self, session: ManagedSession) -> SessionRef {
+        assert_eq!(
+            session.shared.target,
+            session.backend.target(),
+            "immutable backend target mismatch"
+        );
         let agent = session.agent_id.clone();
         let _ = session.shared.live.meta.set(live_view::SessionMeta {
             max_actions: session.config.max_actions,
@@ -779,9 +873,23 @@ impl ComputerUseSessions {
         &self,
         agent_id: &str,
         action: &str,
-        details: Value,
-        screenshot: Option<PathBuf>,
+        mut details: Value,
+        mut screenshot: Option<PathBuf>,
     ) {
+        if self
+            .entry(agent_id)
+            .is_some_and(|entry| entry.shared.target == SessionTarget::LocalBrowser)
+        {
+            // Local audit keeps closed metadata, never key sequences, DOM
+            // titles, page URLs or pixels supplied by the legacy container lane.
+            if let Some(fields) = details.as_object_mut() {
+                for key in ["summary", "window_title", "url", "text", "png_base64"] {
+                    fields.remove(key);
+                }
+                fields.insert("target".into(), json!(SessionTarget::LocalBrowser));
+            }
+            screenshot = None;
+        }
         write_audit(
             self.home.clone(),
             audit_entry(agent_id, action, details, screenshot),
@@ -796,6 +904,22 @@ impl ComputerUseSessions {
     /// release and the audit line run on a detached task; the handle lets a
     /// caller wait for them (waiting is optional and cancelling the wait
     /// cancels nothing). `None` when it had already ended.
+    fn resolve_backend_end_reason(session: &ManagedSession, reason: EndReason) -> EndReason {
+        if reason == EndReason::Stopped
+            && session.shared.target == SessionTarget::LocalBrowser
+            && session.backend.normal_local_exit()
+            && session.backend.login_owner_valid()
+            && !session
+                .backend
+                .control()
+                .discard_login
+                .load(Ordering::Acquire)
+        {
+            EndReason::LocalWindowClosed
+        } else {
+            reason
+        }
+    }
     fn end(
         &self,
         session: &mut ManagedSession,
@@ -804,6 +928,7 @@ impl ComputerUseSessions {
         if session.ended {
             return None;
         }
+        let reason = Self::resolve_backend_end_reason(session, reason);
         session.ended = true;
         self.remove_entry(&session.agent_id, &session.session_id);
         let control = session.backend.control();
@@ -821,6 +946,7 @@ impl ComputerUseSessions {
             "session_end",
             json!({
                 "session_id": session.session_id,
+                "target": session.shared.target,
                 "reason": reason.as_str(),
                 "actions_used": session.actions_used,
                 "duration_secs": session.started.elapsed().as_secs(),
@@ -919,11 +1045,18 @@ impl ComputerUseSessions {
                 keepalive::OnOp::End(reason) => Some(reason),
                 _ => None,
             })
+            .or_else(|| {
+                session
+                    .shared
+                    .native_controller_lost(now)
+                    .then_some(EndReason::LocalControllerLost)
+            })
             .or_else(|| capability_problem(&caps).map(|_| EndReason::CapabilityRevoked))
             .or_else(|| {
                 (!session.backend.login_owner_valid()).then_some(EndReason::CapabilityRevoked)
             });
         if let Some(reason) = reason {
+            let reason = Self::resolve_backend_end_reason(session, reason);
             self.end_and_wait(session, reason).await;
             return Err(OpError::new(ErrorCode::SessionEnded, reason.message()));
         }
@@ -1010,7 +1143,43 @@ impl ComputerUseSessions {
         detail: &str,
         args: &Value,
     ) -> Result<(), OpError> {
+        self.admit_target(agent_id, tool, detail, args, SessionTarget::Container)
+            .await
+    }
+
+    async fn admit_target(
+        &self,
+        agent_id: &str,
+        tool: &'static str,
+        detail: &str,
+        args: &Value,
+        target: SessionTarget,
+    ) -> Result<(), OpError> {
         gates::tool_gates(&self.home, agent_id, tool).await?;
+        if target == SessionTarget::LocalBrowser {
+            // Stop is a narrowing emergency action: it never waits for any
+            // approval surface. Dashboard stop has its own authorization.
+            if tool == gates::TOOL_STOP {
+                return Ok(());
+            }
+            let extra = gates::local_navigation_rule(&self.home, agent_id, tool)?;
+            let review_asks = gates::local_action_review(&self.home, agent_id, tool, args).await?;
+            let asked =
+                gates::approval_required(&self.home, agent_id, tool) || review_asks || extra;
+            // Start always presents a native card inside the new backend,
+            // after registration and before spawning Chrome. Never file a
+            // dashboard/chat Broker request for a local target.
+            if asked && tool != gates::TOOL_START {
+                let mut session = self.locked(agent_id, None).await?;
+                session
+                    .backend
+                    .native_review(json!({"kind":tool,"arguments":args}))
+                    .await
+                    .map_err(|_| OpError::new(ErrorCode::ApprovalDenied, "本機原生核准未通過。"))?;
+                self.check_alive(&mut session).await?;
+            }
+            return gates::tool_gates(&self.home, agent_id, tool).await;
+        }
         if !gates::approval_required(&self.home, agent_id, tool) {
             match gates::action_review(&self.home, agent_id, tool, args).await {
                 Ok(false) => return Ok(()),
@@ -1057,6 +1226,73 @@ impl ComputerUseSessions {
 
     // ── start ────────────────────────────────────────────────────────────
 
+    fn local_start_allowed(
+        &self,
+        agent: &str,
+        request: &StartRequest,
+        native: Option<&local_browser::native_start::Authorization>,
+    ) -> Result<(), OpError> {
+        let refused = |message| OpError::new(ErrorCode::Forbidden, message);
+        if !local_browser::policy::platform_supported() {
+            return Err(OpError::new(
+                ErrorCode::NativeUnsupported,
+                "本機專用瀏覽器目前只支援 macOS。",
+            ));
+        }
+        if request.workspace.is_some() {
+            return Err(refused("本機專用瀏覽器不能掛載容器工作區。"));
+        }
+        if !local_browser::policy::LocalBrowserConfig::load(&self.home)
+            .is_ok_and(|config| config.enabled)
+            || !agent_capabilities(&self.home, agent)
+                .computer_use_config
+                .local_browser
+        {
+            return Err(refused("本機專用瀏覽器尚未由管理員啟用。"));
+        }
+        if !(attended_call::current(agent)
+            || native.is_some_and(|authorization| {
+                authorization
+                    .check(&self.home, agent, &self.companion)
+                    .is_ok()
+            }))
+        {
+            return Err(refused(
+                "本機專用瀏覽器需要正在處理的人類對話；背景、派工與排程不能使用。",
+            ));
+        }
+        if !self.companion.ready() {
+            return Err(refused(
+                "請使用本機桌面 app，確認人在場並按繼續；遠端儀表板不能核准。",
+            ));
+        }
+        Ok(())
+    }
+
+    fn local_call_allowed(&self, agent: &str) -> Result<(), OpError> {
+        if self
+            .entry(agent)
+            .is_some_and(|entry| entry.shared.target == SessionTarget::LocalBrowser)
+            && !local_browser::policy::platform_supported()
+        {
+            return Err(OpError::new(
+                ErrorCode::NativeUnsupported,
+                "本機專用瀏覽器目前只支援 macOS。",
+            ));
+        }
+        if self
+            .entry(agent)
+            .is_some_and(|entry| entry.shared.target == SessionTarget::LocalBrowser)
+            && !attended_call::current(agent)
+        {
+            return Err(OpError::new(
+                ErrorCode::Forbidden,
+                "本機瀏覽器的頁面只能由當下已驗證的人類對話操作；儀表板只提供狀態與停止。",
+            ));
+        }
+        Ok(())
+    }
+
     /// Capability and threat level for a new session.
     async fn start_allowed(
         &self,
@@ -1076,22 +1312,74 @@ impl ComputerUseSessions {
     }
 
     pub async fn start(&self, agent_id: &str, req: StartRequest) -> Result<Value, OpError> {
+        self.start_inner(agent_id, req, None).await
+    }
+
+    pub(crate) async fn start_native(
+        &self,
+        agent: &str,
+        permit: local_browser::native_start::Permit,
+    ) -> Result<Value, OpError> {
+        let authorization = permit
+            .claim(&self.home, agent, &self.companion)
+            .map_err(|_| OpError::new(ErrorCode::Forbidden, "本機原生啟動意圖已失效。"))?;
+        let _scope = authorization.scope();
+        local_browser::audit::record(
+            &self.home,
+            agent,
+            "local_native_start_requested",
+            json!({"actor":local_browser::native_start::ACTOR,"intent_hash":crate::approval::payload_hash(&json!(authorization.nonce()))}),
+        );
+        attended_call::runtime_scope(
+            false,
+            attended_call::request_scope(
+                None,
+                crate::on_behalf_of::ON_BEHALF_OF.scope(
+                    None,
+                    self.start_inner(
+                        agent,
+                        StartRequest {
+                            target: SessionTarget::LocalBrowser,
+                            ..Default::default()
+                        },
+                        Some(authorization),
+                    ),
+                ),
+            ),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        &self,
+        agent_id: &str,
+        req: StartRequest,
+        native: Option<local_browser::native_start::Authorization>,
+    ) -> Result<Value, OpError> {
         if crate::ephemeral::is_ephemeral_id(agent_id) {
             return Err(OpError::new(
                 ErrorCode::Forbidden,
                 "臨時角色成員不能開啟電腦操作 session；請由員工本人使用 computer_* 工具。",
             ));
         }
+        if req.target == SessionTarget::LocalBrowser {
+            self.local_start_allowed(agent_id, &req, native.as_ref())?;
+        }
         self.start_allowed(agent_id).await?;
         let start_args = json!({
+            "target": req.target,
             "width": req.width,
             "height": req.height,
             "workspace": req.workspace,
             "task_hash": req.task.as_ref().map(|t| crate::approval::payload_hash(&json!(t))),
         });
-        self.admit(agent_id, gates::TOOL_START, "", &start_args).await?;
+        self.admit_target(agent_id, gates::TOOL_START, "", &start_args, req.target)
+            .await?;
         // Re-checked after a possible approval wait.
         let caps = self.start_allowed(agent_id).await?;
+        if req.target == SessionTarget::LocalBrowser {
+            self.local_start_allowed(agent_id, &req, native.as_ref())?;
+        }
         // An existing live session is reported, never replaced.
         if let Some(existing) = self.lookup(agent_id) {
             let mut guard = existing.lock().await;
@@ -1137,12 +1425,16 @@ impl ComputerUseSessions {
             }
         };
         let (width, height) = display_size(&req, &caps.computer_use_config)?;
-        let image = crate::computer_use_image::load(&self.home).map_err(|why| {
-            OpError::new(
-                ErrorCode::Unavailable,
-                crate::computer_use_image::invalid_config_message(&why),
-            )
-        })?;
+        let image = if req.target == SessionTarget::Container {
+            crate::computer_use_image::load(&self.home).map_err(|why| {
+                OpError::new(
+                    ErrorCode::Unavailable,
+                    crate::computer_use_image::invalid_config_message(&why),
+                )
+            })?
+        } else {
+            String::new()
+        };
         let cap = &caps.computer_use_config;
         // Navigation allowlist (design §7): resolved here, on the gateway;
         // the container never resolves a name itself.
@@ -1181,13 +1473,48 @@ impl ComputerUseSessions {
         // The id exists before any lease is taken (it is the lease holder).
         let session_id = format!("cu-{}", uuid::Uuid::new_v4().as_simple());
         let attached = match req.workspace.as_deref() {
-            Some(spec) => Some(self.attach_workspace(agent_id, spec, &session_id, &mut config).await?),
+            Some(spec) => Some(
+                self.attach_workspace(agent_id, spec, &session_id, &mut config)
+                    .await?,
+            ),
             None => None,
         };
         let release_on_failure = |attached: &Option<(workspace::AttachedWorkspace, _)>| {
             attached.as_ref().map(|(a, _)| a.lease.clone())
         };
-        let mut backend = (self.factory)(agent_id, &self.home, config.clone());
+        let mut backend: Box<dyn SessionBackend> = match req.target {
+            SessionTarget::Container => (self.factory)(agent_id, &self.home, config.clone()),
+            SessionTarget::LocalBrowser => {
+                #[cfg(target_os = "macos")]
+                {
+                    #[cfg(test)]
+                    let injected = self
+                        .local_factory
+                        .as_ref()
+                        .map(|factory| factory(agent_id, &self.home, config.clone()));
+                    #[cfg(not(test))]
+                    let injected: Option<Box<dyn SessionBackend>> = None;
+                    injected.unwrap_or_else(|| {
+                        Box::new(
+                            local_browser::backend::LocalBrowserBackend::new(
+                                self.home.clone(),
+                                agent_id.into(),
+                                config.clone(),
+                                self.companion.clone(),
+                            )
+                            .with_native_start(native.clone()),
+                        )
+                    })
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(OpError::new(
+                        ErrorCode::NativeUnsupported,
+                        "本機專用瀏覽器目前只支援 macOS。",
+                    ));
+                }
+            }
+        };
         // Reserve the global slot before any container runs; every failure
         // below releases it (`stop` leaves the registry, and a dropped
         // orchestrator does too).
@@ -1220,6 +1547,12 @@ impl ComputerUseSessions {
                 }
             });
         }
+        if req.target == SessionTarget::LocalBrowser {
+            if let Err(error) = self.local_start_allowed(agent_id, &req, native.as_ref()) {
+                Self::stop_detached(backend).await;
+                return Err(error);
+            }
+        }
         let confirmation_channel = match req.turn_id.as_deref() {
             Some(turn) => self.confirmers.resolve(agent_id, turn).await.is_some(),
             None => false,
@@ -1235,7 +1568,17 @@ impl ComputerUseSessions {
             deadline,
             actions_used: 0,
             last_activity: now,
-            shared: Arc::new(SessionShared::default()),
+            shared: Arc::new(SessionShared {
+                target: req.target,
+                native_controller_heartbeat: std::sync::Mutex::new(
+                    if req.target == SessionTarget::LocalBrowser {
+                        self.companion.heartbeat_received()
+                    } else {
+                        None
+                    },
+                ),
+                ..Default::default()
+            }),
             ended: false,
             nav_hosts: nav_hosts.clone(),
             nav_configured: !nav.hosts.is_empty(),
@@ -1268,13 +1611,19 @@ impl ComputerUseSessions {
             "max_session_minutes": session.config.max_session_minutes,
             "keep_alive_minutes": session.config.keep_alive_minutes,
             "confirmation_channel": confirmation_channel,
+            "actor":native.as_ref().map(|_|local_browser::native_start::ACTOR),
             "login_state": session.backend.login_state(),
             "reachable_hosts": nav_hosts,
             "unreachable_hosts": skipped_hosts,
             "ignored_allowlist_entries": nav.dropped.len(),
         });
         if let Some((a, _)) = attached {
-            *session.shared.workspace.attached.lock().unwrap_or_else(|p| p.into_inner()) = Some(a);
+            *session
+                .shared
+                .workspace
+                .attached
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(a);
         }
         self.insert(session);
         info!(agent = %agent_id, session = %session_id, "computer-use tool session started");
@@ -1285,13 +1634,53 @@ impl ComputerUseSessions {
 
     // ── screenshot ───────────────────────────────────────────────────────
 
+    async fn authorize_local_read(&self, session: &mut ManagedSession) -> Result<(), OpError> {
+        if session.shared.target != SessionTarget::LocalBrowser {
+            return Ok(());
+        }
+        let refused = || {
+            OpError::new(
+                ErrorCode::ApprovalDenied,
+                "目前回合讀取本機頁面尚未得到原生同意，或同意已失效。",
+            )
+        };
+        let call = attended_call::current_call(&session.agent_id).ok_or_else(refused)?;
+        let binding = local_browser::consent::binding(&self.home, &session.agent_id)
+            .map_err(|_| refused())?;
+        let consent = session.backend.local_read_consent().ok_or_else(refused)?;
+        if consent.allows(&call, &binding) {
+            return Ok(());
+        }
+        let _waiting = ApprovalWaitGuard::new(session.shared.clone());
+        session
+            .backend
+            .native_review(json!({"kind":"read_current_live_turn","expires_seconds":60}))
+            .await
+            .map_err(|_| refused())?;
+        self.check_alive(session).await?;
+        let current = attended_call::current_call(&session.agent_id).ok_or_else(refused)?;
+        if !call.same_live_call(&current)
+            || local_browser::consent::binding(&self.home, &session.agent_id)
+                .map_err(|_| refused())?
+                != binding
+        {
+            return Err(refused());
+        }
+        consent.record(call, binding);
+        Ok(())
+    }
+
     pub async fn screenshot(
         &self,
         agent_id: &str,
         session_id: Option<&str>,
     ) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_SCREENSHOT, "", &json!({})).await?;
+        self.local_call_allowed(agent_id)?;
+        let target = self.entry(agent_id).ok_or_else(not_found)?.shared.target;
+        self.admit_target(agent_id, gates::TOOL_SCREENSHOT, "", &json!({}), target)
+            .await?;
         let mut session = self.locked(agent_id, session_id).await?;
+        self.authorize_local_read(&mut session).await?;
         let shot = session.backend.screenshot().await;
         let now = Instant::now();
         session.last_activity = now;
@@ -1314,32 +1703,44 @@ impl ComputerUseSessions {
         if let Some(reason) = extra_mask {
             b64 = crate::computer_use::mask_screenshot_regions(
                 &b64,
-                &[[0, 0, session.config.display_width, session.config.display_height]],
+                &[[
+                    0,
+                    0,
+                    session.config.display_width,
+                    session.config.display_height,
+                ]],
                 crate::computer_use::MaskingConfig::default().fill_color,
             )
             .map_err(|_| OpError::new(ErrorCode::ScreenshotFailed, "截圖失敗，請稍後再試。"))?;
             fully_masked = true;
             mask_reason = Some(reason);
         }
-        let saved = match base64::engine::general_purpose::STANDARD.decode(&b64) {
-            Ok(png) => {
-                let (home, agent) = (self.home.clone(), agent_id.to_string());
-                tokio::task::spawn_blocking(move || {
-                    BrowserAuditLog::new(&home, AUDIT_RETENTION_DAYS)
-                        .save_screenshot(&agent, &png)
-                        .ok()
-                })
-                .await
-                .ok()
-                .flatten()
+        // Local page pixels are returned only to the current live runtime.
+        // Even a masked local frame must never enter the persistent audit.
+        let saved = if session.shared.target == SessionTarget::LocalBrowser {
+            None
+        } else {
+            match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                Ok(png) => {
+                    let (home, agent) = (self.home.clone(), agent_id.to_string());
+                    tokio::task::spawn_blocking(move || {
+                        BrowserAuditLog::new(&home, AUDIT_RETENTION_DAYS)
+                            .save_screenshot(&agent, &png)
+                            .ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+                Err(_) => None,
             }
-            Err(_) => None,
         };
         self.audit_line(
             agent_id,
             "screenshot",
             json!({
                 "session_id": session.session_id,
+                "target": session.shared.target,
                 "masked": true,
                 "fully_masked": fully_masked,
                 "mask_reason": mask_reason,
@@ -1406,6 +1807,7 @@ impl ComputerUseSessions {
         turn_id: Option<&str>,
         req: &ActionRequest,
     ) -> Result<Value, OpError> {
+        self.local_call_allowed(agent_id)?;
         let tool = action_tool(req);
         // `navigate`: the URL is checked against this session's pinned hosts
         // BEFORE any approval is requested, so an approver is never asked
@@ -1431,9 +1833,12 @@ impl ComputerUseSessions {
             }
             _ => (approval_detail(req), approval_action_snapshot(req)),
         };
-        self.admit(agent_id, tool, &detail, &grant_args).await?;
+        let target = self.entry(agent_id).ok_or_else(not_found)?.shared.target;
+        self.admit_target(agent_id, tool, &detail, &grant_args, target)
+            .await?;
         let mut session = self.locked(agent_id, session_id).await?;
         session.last_activity = Instant::now();
+        self.authorize_local_read(&mut session).await?;
         self.ensure_not_paused(&session).await?;
         let policy_revision =
             crate::approval::policy_revision(&self.home, agent_id).map_err(|_| {
@@ -1471,6 +1876,23 @@ impl ComputerUseSessions {
         let risk = risk_detector::assess_risk(&ctx, &session.config);
         let contract_hit =
             contract_must_not_violated(&session.config.contract_must_not, &action, &None);
+        if target == SessionTarget::LocalBrowser && risk == RiskLevel::High && !contract_hit {
+            session
+                .backend
+                .native_review(
+                    json!({"kind":"high_risk_action","action":approval_action_snapshot(req)}),
+                )
+                .await
+                .map_err(|_| {
+                    OpError::new(
+                        ErrorCode::ConfirmationDenied,
+                        "高風險操作未得到本機原生核准。",
+                    )
+                })?;
+            self.check_alive(&mut session).await?;
+            self.ensure_not_paused(&session).await?;
+            gates::tool_gates(&self.home, agent_id, tool).await?;
+        }
         // The confirmation target comes from the gateway's own record of this
         // employee's live turns, never from the request.
         let confirmer = match turn_id {
@@ -1483,10 +1905,13 @@ impl ComputerUseSessions {
             }
             _ => None,
         };
+        // Local state-changing operations always receive a native review in
+        // the backend, including high-risk actions. They must never ask a
+        // chat confirmer or consume a dashboard approval instead.
         let gate = actions::risk_gate(
             risk,
             contract_hit,
-            session.config.auto_confirm_trusted,
+            session.config.auto_confirm_trusted || target == SessionTarget::LocalBrowser,
             confirmer.is_some(),
         );
         let summary = actions::describe(&action);
@@ -1672,18 +2097,26 @@ impl ComputerUseSessions {
                         .await;
                 }
                 // Only observation probes ran: the action backend was never invoked.
-                if broker.settle_operation(
-                    claim,
-                    crate::approval::OperationState::Failed,
-                    Some(json!({
-                        "session_id": session.session_id,
-                        "backend_invoked": false,
-                        "observations_only": true,
-                        "refusal_code": err.code.as_str()
-                    })),
-                    Some("final_action_precondition_failed"),
-                ).await.is_err() {
-                    session.backend.control().stopped.store(true, Ordering::Release);
+                if broker
+                    .settle_operation(
+                        claim,
+                        crate::approval::OperationState::Failed,
+                        Some(json!({
+                            "session_id": session.session_id,
+                            "backend_invoked": false,
+                            "observations_only": true,
+                            "refusal_code": err.code.as_str()
+                        })),
+                        Some("final_action_precondition_failed"),
+                    )
+                    .await
+                    .is_err()
+                {
+                    session
+                        .backend
+                        .control()
+                        .stopped
+                        .store(true, Ordering::Release);
                 }
             }
             return Err(err);
@@ -1853,6 +2286,9 @@ impl ComputerUseSessions {
         policy: &str,
     ) -> Result<Value, OpError> {
         let agent_id = session.agent_id.clone();
+        if session.shared.target == SessionTarget::LocalBrowser {
+            gates::local_navigation_rule(&self.home, &agent_id, gates::TOOL_NAVIGATE)?;
+        }
         let checked = navigation::validate_url(url, &session.nav_hosts, session.nav_configured)?;
         action_budget(session)?;
         let summary = format!("開啟網頁 {}", checked.audit_url);
@@ -1882,7 +2318,11 @@ impl ComputerUseSessions {
             }),
             None,
         );
-        entry.url = Some(checked.audit_url.clone());
+        if session.shared.target == SessionTarget::LocalBrowser {
+            entry.details = json!({"session_id":session.session_id,"target":SessionTarget::LocalBrowser,"risk":"Low","host":checked.host});
+        } else {
+            entry.url = Some(checked.audit_url.clone());
+        }
         entry.domain = Some(checked.host.clone());
         write_audit(self.home.clone(), entry).await;
         self.check_alive(session).await?;
@@ -1958,8 +2398,15 @@ impl ComputerUseSessions {
         payload["action_hash"] = json!(action_hash);
         let binding = ExecutionBinding {
             schema_version: 1,
-            run_id: ingress_run_id.clone().unwrap_or_else(|| session.session_id.clone()),
-            run_origin_kind: if ingress_run_id.is_some() { "ingress" } else { "computer_session" }.into(),
+            run_id: ingress_run_id
+                .clone()
+                .unwrap_or_else(|| session.session_id.clone()),
+            run_origin_kind: if ingress_run_id.is_some() {
+                "ingress"
+            } else {
+                "computer_session"
+            }
+            .into(),
             actor_principal: session.agent_id.clone(),
             decision_context: context,
             task_id: None,
@@ -1988,7 +2435,11 @@ impl ComputerUseSessions {
             .await
             .ok()?;
         let operation = broker
-            .prepare_operation(&id, &format!("action-request-{id}-{}", &action_hash[..12]), None)
+            .prepare_operation(
+                &id,
+                &format!("action-request-{id}-{}", &action_hash[..12]),
+                None,
+            )
             .await
             .ok()?;
         let message = format!(
@@ -2053,7 +2504,9 @@ impl ComputerUseSessions {
     // ── stop / status ────────────────────────────────────────────────────
 
     pub async fn stop(&self, agent_id: &str, session_id: Option<&str>) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_STOP, "", &json!({})).await?;
+        let target = self.entry(agent_id).ok_or_else(not_found)?.shared.target;
+        self.admit_target(agent_id, gates::TOOL_STOP, "", &json!({}), target)
+            .await?;
         let entry = self.lookup(agent_id).ok_or_else(not_found)?;
         let mut session = entry.lock().await;
         if session.ended || session.agent_id != agent_id {
@@ -2141,6 +2594,8 @@ impl ComputerUseSessions {
                 keepalive::OnReap::End(EndReason::CapabilityRevoked)
             } else if session.shared.workspace.lost.load(Ordering::Acquire) {
                 keepalive::OnReap::End(EndReason::LeaseLost)
+            } else if session.shared.native_controller_lost(now) {
+                keepalive::OnReap::End(EndReason::LocalControllerLost)
             } else {
                 keepalive::on_reap(&keepalive::Clock {
                     now,

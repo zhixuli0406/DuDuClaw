@@ -637,7 +637,7 @@ impl McpDispatcher {
             &agent_id,
             tool_name,
             error_class,
-            detail,
+            crate::mcp::audit_safe_denial_detail(tool_name, detail),
             arguments.as_ref(),
         );
     }
@@ -743,7 +743,9 @@ impl McpDispatcher {
         // present but empty or unknown value refuses every call (fail
         // closed). `tools/list` hides the same tools through the same
         // predicate (`mcp::tools_list::lane_permits`).
-        if let Some(msg) = crate::mcp::lane_refusal(&duduclaw_core::ProcessLane::current(), tool_name) {
+        if let Some(msg) =
+            crate::mcp::lane_refusal(&duduclaw_core::ProcessLane::current(), tool_name)
+        {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             self.audit_dispatch_denial(tool_name, params, "explore_lane", &msg);
             return jsonrpc_error(id, -32003, &msg);
@@ -1683,6 +1685,45 @@ mod tests {
     use super::*;
     use crate::mcp_auth::{Principal, Scope};
     use crate::mcp_namespace::NamespaceContext;
+    #[tokio::test]
+    async fn computer_key_dispatch_guard_denial_persists_metadata_without_key_or_echo() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&root).await;
+        write_scoped_toml(&root, "[capabilities]\ndenied_tools=['computer_key']\n");
+        for key in ["PRIVATE SENTINEL FOR LOCAL AUDIT", "Return"] {
+            let params = make_params("computer_key", serde_json::json!({"key":key}));
+            let reply = dispatcher
+                .dispatch_tool_call(
+                    &make_principal(vec![Scope::Admin], false),
+                    &make_ns_ctx(false),
+                    &params,
+                    &serde_json::json!(901),
+                )
+                .await;
+            assert!(reply.get("error").is_some());
+        }
+        // Also exercise the actual denial writer with an error that echoes
+        // invalid input, independently of which static guard fires first.
+        dispatcher.audit_dispatch_denial(
+            "computer_key",
+            &make_params(
+                "computer_key",
+                serde_json::json!({"key":"PRIVATE SENTINEL FOR LOCAL AUDIT"}),
+            ),
+            "invalid_key",
+            "invalid key: PRIVATE SENTINEL FOR LOCAL AUDIT",
+        );
+        let saved = std::fs::read_to_string(root.path().join("tool_calls.jsonl")).unwrap();
+        assert!(
+            !saved.contains("PRIVATE SENTINEL") && !saved.contains("Return"),
+            "{saved}"
+        );
+        assert!(
+            saved
+                .lines()
+                .all(|line| serde_json::from_str::<Value>(line).unwrap()["success"] == false)
+        );
+    }
 
     #[tokio::test]
     async fn role_member_gate_reads_ephemeral_config_and_refuses_missing_scaffold() {
@@ -2277,15 +2318,22 @@ effect = "forbid"
         let principal = make_principal(vec![Scope::Admin], false);
         let ns_ctx = make_ns_ctx(false);
 
-        let params = make_params("wiki_write", serde_json::json!({ "path": "a.md", "content": "x" }));
+        let params = make_params(
+            "wiki_write",
+            serde_json::json!({ "path": "a.md", "content": "x" }),
+        );
         let result = dispatcher
             .dispatch_tool_call(&principal, &ns_ctx, &params, &serde_json::json!(90))
             .await;
         assert_eq!(result["error"]["code"], -32003, "got: {result}");
         let msg = result["error"]["message"].as_str().unwrap_or("");
         assert!(msg.contains("action_rules"), "got: {msg}");
-        let audit = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
-        assert!(audit.contains("\"action_rule\""), "audit row expected: {audit}");
+        let audit =
+            std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
+        assert!(
+            audit.contains("\"action_rule\""),
+            "audit row expected: {audit}"
+        );
 
         // A tool rule beats the effect rule; reads are untouched.
         for tool in ["memory_store", "memory_search"] {
@@ -2310,10 +2358,20 @@ effect = "forbid"
         let principal = make_principal(vec![Scope::Admin], false);
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let result = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &params, &serde_json::json!(92))
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &params,
+                &serde_json::json!(92),
+            )
             .await;
         assert_eq!(result["error"]["code"], -32003, "got: {result}");
-        assert!(result["error"]["message"].as_str().unwrap_or("").contains("denied_tools"));
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("denied_tools")
+        );
     }
 
     // A scoped tool with NO active grant is denied (fail-closed) with guidance
@@ -3038,8 +3096,12 @@ effect = "forbid"
             serde_json::json!({"workspace_id": "ws-0123456789abcdef0123456789abcdef", "path": "a.md", "content": EMAIL_TOKEN}),
         );
         let typed = make_params("computer_type", serde_json::json!({ "text": EMAIL_TOKEN }));
-        let w = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &write, &serde_json::json!(31)).await;
-        let _typed_result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &typed, &serde_json::json!(32)).await;
+        let w = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &write, &serde_json::json!(31))
+            .await;
+        let _typed_result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &typed, &serde_json::json!(32))
+            .await;
         unsafe {
             std::env::remove_var("DUDUCLAW_REDACTION_SCOPES");
         }
@@ -3058,8 +3120,16 @@ effect = "forbid"
                 .find_map(|v| find_key(&v, "chars"))
         };
         let token_chars = EMAIL_TOKEN.chars().count() as u64;
-        assert_eq!(chars_of("computer_type"), Some("alice@acme.com".len() as u64), "control: the * rule does restore computer_type; rows: {rows}");
-        assert_eq!(chars_of("computer_workspace_write"), Some(token_chars), "workspace content stayed a token; rows: {rows}");
+        assert_eq!(
+            chars_of("computer_type"),
+            Some("alice@acme.com".len() as u64),
+            "control: the * rule does restore computer_type; rows: {rows}"
+        );
+        assert_eq!(
+            chars_of("computer_workspace_write"),
+            Some(token_chars),
+            "workspace content stayed a token; rows: {rows}"
+        );
         assert!(!rows.contains("alice@acme.com"));
     }
 
@@ -3098,11 +3168,20 @@ effect = "forbid"
                 rows.push_str(&std::fs::read_to_string(&entry).unwrap_or_default());
             }
         }
-        for tool in ["computer_workspace_list", "computer_workspace_read", "computer_workspace_write"] {
+        for tool in [
+            "computer_workspace_list",
+            "computer_workspace_read",
+            "computer_workspace_write",
+        ] {
             assert!(rows.contains(tool), "{tool} audited; rows: {rows}");
         }
         assert!(rows.contains("path_sha256"), "{rows}");
-        assert!(!rows.contains("secret-dir") && !rows.contains("plan.md") && !rows.contains("PRIVATE-BODY"), "{rows}");
+        assert!(
+            !rows.contains("secret-dir")
+                && !rows.contains("plan.md")
+                && !rows.contains("PRIVATE-BODY"),
+            "{rows}"
+        );
     }
 
     fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -3762,11 +3841,18 @@ effect = "forbid"
             true,
         )
         .await;
-        assert_ne!(result["error"]["code"], -32003, "approved call runs: {result}");
+        assert_ne!(
+            result["error"]["code"], -32003,
+            "approved call runs: {result}"
+        );
         let grant = &rec.payload[duduclaw_gateway::approval::action_grant::ACTION_GRANT_KEY];
         assert_eq!(grant["tool"], "memory_search");
         assert_eq!(grant["agent_id"], "dudu");
-        assert!(rec.summary.contains("此核准只涵蓋這一次呼叫"), "{}", rec.summary);
+        assert!(
+            rec.summary.contains("此核准只涵蓋這一次呼叫"),
+            "{}",
+            rec.summary
+        );
         let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
         let after = broker.get(&rec.id).await.unwrap().unwrap();
         assert_eq!(
@@ -3820,7 +3906,13 @@ effect = "forbid"
         let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
         let mut filed = None;
         for _ in 0..400 {
-            if let Some(rec) = broker.list_pending(None).await.unwrap_or_default().into_iter().next() {
+            if let Some(rec) = broker
+                .list_pending(None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+            {
                 filed = Some(rec);
                 break;
             }
@@ -3830,7 +3922,10 @@ effect = "forbid"
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         if let (Some(rec), Some(approve)) = (&filed, decide) {
-            broker.decide(&rec.id, approve, "test-approver").await.unwrap();
+            broker
+                .decide(&rec.id, approve, "test-approver")
+                .await
+                .unwrap();
         }
         let result = tokio::time::timeout(Duration::from_secs(30), task)
             .await
@@ -3847,7 +3942,10 @@ effect = "forbid"
         assert!(filed.is_none(), "block files no approval");
         assert_eq!(result["error"]["code"], -32003, "{result}");
         assert!(
-            result["error"]["message"].as_str().unwrap_or("").contains("動作審查"),
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("動作審查"),
             "{result}"
         );
     }
@@ -3856,18 +3954,22 @@ effect = "forbid"
     async fn enforce_review_ask_runs_only_after_an_approval() {
         use duduclaw_gateway::action_review::ReviewVerdict;
         let tmp = enforce_home();
-        let (filed, result) =
-            dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(true)).await;
+        let (filed, result) = dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(true)).await;
         let rec = filed.expect("ask files an approval");
         assert_eq!(rec.agent_id, "dudu");
         assert!(rec.summary.contains("動作審查"), "{}", rec.summary);
-        assert!(result.get("error").is_none(), "approved call runs: {result}");
+        assert!(
+            result.get("error").is_none(),
+            "approved call runs: {result}"
+        );
 
         let tmp = enforce_home();
-        let (filed, result) =
-            dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(false)).await;
+        let (filed, result) = dispatch_reviewed(&tmp, Some(ReviewVerdict::Ask), Some(false)).await;
         assert!(filed.is_some());
-        assert_eq!(result["error"]["code"], -32003, "denied call refused: {result}");
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "denied call refused: {result}"
+        );
     }
 
     #[tokio::test]

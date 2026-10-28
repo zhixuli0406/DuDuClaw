@@ -70,7 +70,11 @@ pub(crate) struct Admitted {
 
 impl Drop for Admitted {
     fn drop(&mut self) {
-        self.entry.shared.live.viewers.fetch_sub(1, Ordering::AcqRel);
+        self.entry
+            .shared
+            .live
+            .viewers
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -92,6 +96,9 @@ pub(crate) fn admit_viewer(
     let entry = sessions
         .live_entry(&ticket.agent_id, Some(&ticket.session_id))
         .ok_or(StatusCode::NOT_FOUND)?;
+    if entry.shared.target == super::SessionTarget::LocalBrowser {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let before = entry.shared.live.viewers.fetch_add(1, Ordering::AcqRel);
     let admitted = Admitted {
         entry,
@@ -292,8 +299,12 @@ mod tests {
         assert_eq!(out.len(), handshake().len() + update.len());
 
         // Somebody else's lease: still nothing.
-        *live.takeover.lock().unwrap() =
-            Some(TakeoverLease::new("u2", "u2", now, Duration::from_secs(600)));
+        *live.takeover.lock().unwrap() = Some(TakeoverLease::new(
+            "u2",
+            "u2",
+            now,
+            Duration::from_secs(600),
+        ));
         let (out, inputs) = filter_viewer_bytes(&mut f, &live, "u1", now, &key).unwrap();
         assert!(out.is_empty() && inputs == 0);
 
@@ -311,8 +322,12 @@ mod tests {
     fn resize_requests_never_reach_the_server_even_for_the_holder() {
         let live = LiveState::default();
         let now = Instant::now();
-        *live.takeover.lock().unwrap() =
-            Some(TakeoverLease::new("u1", "u1", now, Duration::from_secs(600)));
+        *live.takeover.lock().unwrap() = Some(TakeoverLease::new(
+            "u1",
+            "u1",
+            now,
+            Duration::from_secs(600),
+        ));
         let mut f = ClientFilter::new();
         filter_viewer_bytes(&mut f, &live, "u1", now, &handshake()).unwrap();
         let mut resize = vec![251u8, 0, 0, 100, 0, 100, 1, 0];

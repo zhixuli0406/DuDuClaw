@@ -112,6 +112,10 @@ pub(crate) fn build_request(tool: &str, args: &Value, turn_id: Option<String>) -
             if let Some(ws) = str_arg(args, "workspace") {
                 body["workspace"] = json!(ws);
             }
+            if let Some(target)=args.get("target") {
+                if !matches!(target.as_str(),Some("container"|"local_browser")) {return Err("target 必須是 container 或 local_browser。".into());}
+                body["target"]=target.clone();
+            }
             Ok(body)
         }
         "computer_screenshot" => {
@@ -304,7 +308,13 @@ async fn post(home: &Path, agent_id: &str, body: &Value, timeout: Duration) -> R
         .timeout(timeout)
         .build()
         .map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
-    let bytes = serde_json::to_vec(body).map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
+    let mut body=body.clone();
+    // Host-issued per-runtime reference is part of the signed body. Never
+    // accept this field from model arguments or infer it from a turn id.
+    if let Ok(reference)=std::env::var("DUDUCLAW_PRINCIPAL_CONTEXT") {
+        body["principal_context"]=json!(reference);
+    }
+    let bytes = serde_json::to_vec(&body).map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

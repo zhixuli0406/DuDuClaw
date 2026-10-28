@@ -252,3 +252,7 @@ says.
 
 `duduclaw credentials status` (add `--json` for scripts) prints the same
 state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-unreleased).
+
+## Dedicated local browser (macOS, off by default)
+
+An Admin can enable the dedicated local browser in both system and employee settings. It requires the local desktop app, a live human conversation, native presence and approval for each state-changing step. Dashboard accounts have status and stop only. It never imports the normal browser profile or falls back to a different target. See [setup, restrictions and verification boundaries](local-browser.md).

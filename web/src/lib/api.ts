@@ -4063,6 +4063,7 @@ export interface IdentityResolveResult {
 export type ComputerUseMode = 'container' | 'native' | 'auto';
 
 export interface ComputerUseConfig {
+  local_browser?: boolean;
   persist_login?: boolean;
   allowed_apps?: string[];
   blocked_actions?: string[];

@@ -64,6 +64,7 @@ pub mod mcp_proxy_rewrite;
 pub mod toml_merge;
 pub mod traits;
 pub mod types;
+pub mod local_browser_channel;
 pub mod zh_variant;
 
 pub use agent_guard::{

@@ -13,34 +13,7 @@
 //! refuses the command for employees.
 
 /// Variables that mark a DuDuClaw-spawned employee process.
-pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
-    duduclaw_core::ENV_AGENT_ID,
-    duduclaw_core::ENV_AGENT_TOKEN,
-    duduclaw_core::ENV_TRUST_TURN_ID,
-    duduclaw_core::ENV_TRUST_SESSION_ID,
-    duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ,
-    duduclaw_core::ENV_TURN_USER_MESSAGE_AT,
-    duduclaw_core::ENV_DISPATCH_SESSION,
-    duduclaw_core::ENV_DISPATCH_RUN_ID,
-    duduclaw_core::ENV_UPSTREAM_UNKNOWN,
-    duduclaw_core::ENV_DELEGATION_SENDER,
-    duduclaw_core::ENV_DELEGATION_ORIGIN,
-    duduclaw_core::ENV_DELEGATION_DEPTH,
-    duduclaw_core::ENV_HOP_DEPTH,
-    duduclaw_core::ENV_REPLY_CHANNEL,
-    duduclaw_core::ENV_REPLY_SENDER,
-    // The task of a goal round (set per call by the gateway's runtimes).
-    duduclaw_core::ENV_TASK_ID,
-    // The read-only explore lane (heartbeat proactive check, 2026-10).
-    duduclaw_core::ENV_LANE,
-    // The person the run works for (`on_behalf_of`).
-    duduclaw_core::ENV_ON_BEHALF_OF,
-    duduclaw_gateway::on_behalf_of::context::ENV_CONTEXT,
-    // Also refused by the LINE inbox and computer-workspace commands before
-    // the lists were merged into this one.
-    "DUDUCLAW_MCP_API_KEY",
-    "DUDUCLAW_DATA_FILE_GUARD",
-];
+pub(crate) use duduclaw_core::local_browser_channel::AI_SESSION_ENV_VARS;
 
 /// The marker variables present according to `is_set`.
 pub(crate) fn markers_with(is_set: &dyn Fn(&str) -> bool) -> Vec<&'static str> {

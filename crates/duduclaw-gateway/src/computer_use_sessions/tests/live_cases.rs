@@ -33,7 +33,9 @@ fn manager_ctx(id: &str) -> UserContext {
         user_id: id.into(),
         email: format!("{id}@example.com"),
         role: UserRole::Manager,
-        agent_access: [("alice".to_string(), AccessLevel::Operator)].into_iter().collect(),
+        agent_access: [("alice".to_string(), AccessLevel::Operator)]
+            .into_iter()
+            .collect(),
         must_change_password: false,
         team_access: Default::default(),
         acl_generation: 0,
@@ -50,7 +52,73 @@ fn audit_actions(home: &std::path::Path) -> Vec<(String, Value)> {
 }
 
 fn ago(d: Duration) -> Instant {
-    Instant::now().checked_sub(d).expect("monotonic clock far enough from boot")
+    Instant::now()
+        .checked_sub(d)
+        .expect("monotonic clock far enough from boot")
+}
+
+#[tokio::test]
+async fn local_target_dashboard_page_paths_refuse_admin_before_waiting_for_session_lock() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    state.local_target.store(true, Ordering::Release);
+    let mgr = manager(tmp.path(), &state, Duration::from_secs(600));
+    insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let session = mgr.lookup("alice").unwrap();
+    let _held = session.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        mgr.live_view_open("alice", &admin()),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Ok(Err(OpError {
+                code: ErrorCode::Forbidden,
+                ..
+            }))
+        ),
+        "local dashboard watch must refuse before locking: {result:?}"
+    );
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        mgr.live_takeover("alice", &admin()),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Ok(Err(OpError {
+            code: ErrorCode::Forbidden,
+            ..
+        }))
+    ));
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        mgr.reset_login("alice", &admin()),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Ok(Err(OpError {
+            code: ErrorCode::Forbidden,
+            ..
+        }))
+    ));
+    let result =
+        tokio::time::timeout(Duration::from_millis(100), mgr.screenshot("alice", None)).await;
+    assert!(matches!(
+        result,
+        Ok(Err(OpError {
+            code: ErrorCode::Forbidden,
+            ..
+        }))
+    ));
+    assert_eq!(
+        mgr.live_status("alice", "system")["target"],
+        "local_browser"
+    );
+    assert!(state.vnc_starts.lock().unwrap().is_empty());
 }
 
 async fn settle() {
@@ -78,9 +146,18 @@ async fn an_idle_session_is_paused_with_keep_alive_and_resumed_by_the_next_call(
     mgr.screenshot("alice", None).await.unwrap();
     assert_eq!(state.thaws.load(Ordering::SeqCst), 1);
     assert_eq!(mgr.live_status("alice", "system")["state"], "running");
-    let actions: Vec<String> = audit_actions(tmp.path()).into_iter().map(|(a, _)| a).collect();
-    assert!(actions.contains(&"session_pause".to_string()), "{actions:?}");
-    assert!(actions.contains(&"session_resume".to_string()), "{actions:?}");
+    let actions: Vec<String> = audit_actions(tmp.path())
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
+    assert!(
+        actions.contains(&"session_pause".to_string()),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&"session_resume".to_string()),
+        "{actions:?}"
+    );
 }
 
 #[tokio::test]
@@ -102,12 +179,19 @@ async fn a_paused_session_ends_past_its_window_or_when_it_will_not_resume() {
     let mgr = manager(tmp.path(), &state, Duration::from_millis(50));
     insert_session(&mgr, &state, "alice", ka_config());
     let entry = mgr.entry("alice").unwrap();
-    entry.shared.live.set_frozen(Some(ago(Duration::from_secs(301))));
+    entry
+        .shared
+        .live
+        .set_frozen(Some(ago(Duration::from_secs(301))));
     assert_eq!(mgr.reap_once().await, 1);
     assert!(mgr.is_empty());
 
     insert_session(&mgr, &state, "alice", ka_config());
-    mgr.entry("alice").unwrap().shared.live.set_frozen(Some(Instant::now()));
+    mgr.entry("alice")
+        .unwrap()
+        .shared
+        .live
+        .set_frozen(Some(Instant::now()));
     state.fail_thaw.store(true, Ordering::SeqCst);
     let err = mgr.screenshot("alice", None).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::SessionEnded);
@@ -120,7 +204,11 @@ async fn keep_alive_switched_off_ends_a_paused_session_instead_of_resuming_it() 
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ka_config());
-    mgr.entry("alice").unwrap().shared.live.set_frozen(Some(Instant::now()));
+    mgr.entry("alice")
+        .unwrap()
+        .shared
+        .live
+        .set_frozen(Some(Instant::now()));
     let err = mgr.screenshot("alice", None).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::SessionEnded);
     assert_eq!(state.thaws.load(Ordering::SeqCst), 0);
@@ -132,7 +220,12 @@ async fn an_open_viewer_keeps_the_session_from_pausing() {
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, Duration::from_millis(50));
     insert_session(&mgr, &state, "alice", ka_config());
-    mgr.entry("alice").unwrap().shared.live.viewers.store(1, Ordering::SeqCst);
+    mgr.entry("alice")
+        .unwrap()
+        .shared
+        .live
+        .viewers
+        .store(1, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(80)).await;
     mgr.reap_once().await;
     assert_eq!(state.freezes.load(Ordering::SeqCst), 0);
@@ -153,32 +246,57 @@ async fn a_takeover_refuses_the_employee_and_hand_back_leaves_a_handoff() {
     assert_eq!(body["ticket"].as_str().unwrap().len(), 32);
     assert_eq!(*state.vnc_starts.lock().unwrap(), vec!["control"]);
 
-    let err = mgr.action("alice", None, None, &click(10, 10)).await.unwrap_err();
+    let err = mgr
+        .action("alice", None, None, &click(10, 10))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::HumanHasControl);
     assert!(state.executed.lock().unwrap().is_empty());
-    assert!(mgr.screenshot("alice", None).await.is_ok(), "screenshots still run");
+    assert!(
+        mgr.screenshot("alice", None).await.is_ok(),
+        "screenshots still run"
+    );
     assert_eq!(mgr.status("alice").await["human_has_control"], true);
 
     // Somebody else can neither take over nor hand back.
     let other = manager_ctx("u2");
-    assert_eq!(mgr.live_takeover("alice", &other).await.unwrap_err().code, ErrorCode::SessionExists);
     assert_eq!(
-        mgr.live_hand_back("alice", &other, None).await.unwrap_err().code,
+        mgr.live_takeover("alice", &other).await.unwrap_err().code,
+        ErrorCode::SessionExists
+    );
+    assert_eq!(
+        mgr.live_hand_back("alice", &other, None)
+            .await
+            .unwrap_err()
+            .code,
         ErrorCode::Forbidden
     );
     assert_eq!(mgr.live_status("alice", "u2")["takeover"]["mine"], false);
 
-    mgr.live_hand_back("alice", &admin(), Some("已經登入好了")).await.unwrap();
-    assert_eq!(state.vnc_starts.lock().unwrap().last().copied(), Some("viewonly"));
-    mgr.action("alice", None, None, &click(10, 10)).await.unwrap();
+    mgr.live_hand_back("alice", &admin(), Some("已經登入好了"))
+        .await
+        .unwrap();
+    assert_eq!(
+        state.vnc_starts.lock().unwrap().last().copied(),
+        Some("viewonly")
+    );
+    mgr.action("alice", None, None, &click(10, 10))
+        .await
+        .unwrap();
     assert_eq!(state.executed.lock().unwrap().len(), 1);
 
     let ws = crate::working_state::read_full(tmp.path(), "alice", 0).unwrap();
     let note = ws["handoff"]["note"].as_str().unwrap();
-    assert!(note.contains("已經登入好了") && note.contains("已交還"), "{note}");
+    assert!(
+        note.contains("已經登入好了") && note.contains("已交還"),
+        "{note}"
+    );
     assert_eq!(ws["handoff"]["status"], "continue");
     settle().await;
-    let actions: Vec<String> = audit_actions(tmp.path()).into_iter().map(|(a, _)| a).collect();
+    let actions: Vec<String> = audit_actions(tmp.path())
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
     for want in ["takeover_start", "takeover_end"] {
         assert!(actions.contains(&want.to_string()), "{want} in {actions:?}");
     }
@@ -190,16 +308,28 @@ async fn an_idle_takeover_expires_on_the_reaper_and_control_returns() {
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
-    mgr.live_takeover("alice", &manager_ctx("u1")).await.unwrap();
+    mgr.live_takeover("alice", &manager_ctx("u1"))
+        .await
+        .unwrap();
     let entry = mgr.entry("alice").unwrap();
-    entry.shared.live.takeover.lock().unwrap().as_mut().unwrap().last_input =
-        ago(Duration::from_secs(601));
+    entry
+        .shared
+        .live
+        .takeover
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .last_input = ago(Duration::from_secs(601));
     // Expired already counts as released for the employee's gates...
     mgr.action("alice", None, None, &click(1, 1)).await.unwrap();
     // ...and the reaper cleans it up with a handoff.
     mgr.reap_once().await;
     assert!(entry.shared.live.takeover.lock().unwrap().is_none());
-    assert_eq!(state.vnc_starts.lock().unwrap().last().copied(), Some("viewonly"));
+    assert_eq!(
+        state.vnc_starts.lock().unwrap().last().copied(),
+        Some("viewonly")
+    );
     let ws = crate::working_state::read_full(tmp.path(), "alice", 0).unwrap();
     assert!(ws["handoff"]["note"].as_str().unwrap().contains("自動交還"));
 }
@@ -213,7 +343,16 @@ async fn a_takeover_without_a_stream_is_cancelled() {
     state.fail_vnc.store(true, Ordering::SeqCst);
     let err = mgr.live_takeover("alice", &admin()).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable);
-    assert!(mgr.entry("alice").unwrap().shared.live.takeover.lock().unwrap().is_none());
+    assert!(
+        mgr.entry("alice")
+            .unwrap()
+            .shared
+            .live
+            .takeover
+            .lock()
+            .unwrap()
+            .is_none()
+    );
     mgr.action("alice", None, None, &click(1, 1)).await.unwrap();
 }
 
@@ -240,8 +379,14 @@ async fn dashboard_stop_ends_the_session_and_is_audited() {
     assert!(mgr.is_empty());
     settle().await;
     let rows = audit_actions(tmp.path());
-    assert!(rows.iter().any(|(a, d)| a == "operator_stop" && d["operator"] == "u1@example.com"));
-    assert!(rows.iter().any(|(a, d)| a == "session_end" && d["reason"] == "operator_stopped"));
+    assert!(
+        rows.iter()
+            .any(|(a, d)| a == "operator_stop" && d["operator"] == "u1@example.com")
+    );
+    assert!(
+        rows.iter()
+            .any(|(a, d)| a == "session_end" && d["reason"] == "operator_stopped")
+    );
 }
 
 // ── injection hold ───────────────────────────────────────────────────────
@@ -265,7 +410,10 @@ async fn a_suspicious_page_holds_the_session_until_a_human_resumes() {
     assert_eq!(shot["fully_masked"], true);
     assert_eq!(shot["mask_reason"], "injection_suspected");
     assert_eq!(shot["injection_hold"], true);
-    let err = mgr.action("alice", None, None, &click(1, 1)).await.unwrap_err();
+    let err = mgr
+        .action("alice", None, None, &click(1, 1))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::InjectionSuspected);
     assert!(state.executed.lock().unwrap().is_empty());
 
@@ -278,7 +426,10 @@ async fn a_suspicious_page_holds_the_session_until_a_human_resumes() {
 
     // The audit names categories only, never the page text.
     let rows = audit_actions(tmp.path());
-    let hit = rows.iter().find(|(a, _)| a == "injection_suspected").expect("audited");
+    let hit = rows
+        .iter()
+        .find(|(a, _)| a == "injection_suspected")
+        .expect("audited");
     assert!(!hit.1["categories"].as_array().unwrap().is_empty());
     let all = serde_json::to_string(&rows.iter().map(|(_, d)| d).collect::<Vec<_>>()).unwrap();
     assert!(!all.contains("developer mode") && !all.contains("attacker@example.com"));
@@ -301,7 +452,10 @@ async fn an_unreadable_page_masks_the_screenshot() {
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     *state.page_text.lock().unwrap() = Some(Err("helper failed".into()));
     let shot = mgr.screenshot("alice", None).await.unwrap();
-    assert_eq!((shot["fully_masked"].clone(), shot["mask_reason"].clone()), (json!(true), json!("text_unscanned")));
+    assert_eq!(
+        (shot["fully_masked"].clone(), shot["mask_reason"].clone()),
+        (json!(true), json!("text_unscanned"))
+    );
     // An already fully masked picture keeps its own reason.
     *state.full_mask.lock().unwrap() = Some(FullMaskReason::TitleSensitive);
     let shot = mgr.screenshot("alice", None).await.unwrap();
@@ -356,7 +510,10 @@ async fn viewer_tickets_are_single_use_bound_to_the_session_and_capped() {
         view_ws::admit_viewer(&mgr, &t, Instant::now()).err(),
         Some(axum::http::StatusCode::TOO_MANY_REQUESTS)
     );
-    assert_eq!(entry.shared.live.viewers.load(Ordering::SeqCst), live_view::MAX_VIEWERS_PER_SESSION);
+    assert_eq!(
+        entry.shared.live.viewers.load(Ordering::SeqCst),
+        live_view::MAX_VIEWERS_PER_SESSION
+    );
     drop(held);
 
     // A ticket outlives nothing: the session ended, the ticket is void.
@@ -379,7 +536,10 @@ async fn a_ticket_issued_to_a_non_users_db_identity_is_refused_on_connect() {
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     // Issued to a Manager context that `users.db` does not know (no store):
     // the re-read on connect fails closed.
-    let t = mgr.live_view_open("alice", &manager_ctx("ghost")).await.unwrap()["ticket"]
+    let t = mgr
+        .live_view_open("alice", &manager_ctx("ghost"))
+        .await
+        .unwrap()["ticket"]
         .as_str()
         .unwrap()
         .to_string();
@@ -406,7 +566,10 @@ fn paused_containers_past_their_deadline_go_only_with_maintenance() {
     assert!(!sweep::paused_past_deadline(&paused[0], 1000));
     assert!(!sweep::paused_past_deadline(&listed("running"), 1001));
     assert!(sweep::select_removable(&paused, 1001, false, |_| None).is_empty());
-    assert_eq!(sweep::select_removable(&paused, 1001, true, |_| None).len(), 1);
+    assert_eq!(
+        sweep::select_removable(&paused, 1001, true, |_| None).len(),
+        1
+    );
     // The orphan rule still takes it after the grace, in every gateway.
     assert_eq!(
         sweep::select_removable(&paused, 1001 + sweep::GRACE.as_secs(), false, |_| None).len(),

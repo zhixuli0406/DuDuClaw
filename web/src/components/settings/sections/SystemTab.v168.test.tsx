@@ -62,6 +62,29 @@ async function ready() {
 }
 
 describe('<SystemTab> v1.68', () => {
+  it('requires a checked local-browser acknowledgement before submitting the enabling change', async () => {
+    await ready();
+    fireEvent.click(screen.getByRole('switch', { name: /Enable dedicated local browser/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+    const acknowledgement=screen.getByRole('checkbox', { name: /runtime transcripts, provider caches or model replies/ });
+    expect(acknowledgement).toHaveAccessibleName(/dedicated Chrome profile retains website state/);
+    fireEvent.click(acknowledgement);
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
+    expect(updateConfigMock.mock.calls[0][0]).toEqual({ computer_use: { local_browser: { enabled: true } }, ack_local_browser_risks: true });
+  });
+
+  it('does not offer non-admins the local-browser enabling switch', async () => {
+    setAdmin(false);
+    await ready();
+    const toggle=screen.getByRole('switch', { name: /Enable dedicated local browser/ });
+    expect(toggle).toHaveAttribute('aria-disabled','true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-checked','false');
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+  });
   it('treats a stored plain log format as pretty and does not rewrite it', async () => {
     configMock.mockResolvedValue({ config: BASE + '\n[logging]\nformat = "plain"\n', allowed_origins: [] });
     await ready();

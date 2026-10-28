@@ -67,6 +67,8 @@ pub const STATUS_BUDGET: Duration = Duration::from_secs(10);
 pub enum Request {
     Start {
         #[serde(default)]
+        target: super::SessionTarget,
+        #[serde(default)]
         width: Option<u32>,
         #[serde(default)]
         height: Option<u32>,
@@ -116,9 +118,9 @@ pub fn op_budget(request: &Request) -> Duration {
         Request::Stop { .. } => STOP_BUDGET,
         Request::Status {} => STATUS_BUDGET,
         // An approval may be asked (up to 300 s) before the file work.
-        Request::WorkspaceList {} | Request::WorkspaceRead { .. } | Request::WorkspaceWrite { .. } => {
-            STOP_BUDGET
-        }
+        Request::WorkspaceList {}
+        | Request::WorkspaceRead { .. }
+        | Request::WorkspaceWrite { .. } => STOP_BUDGET,
     }
 }
 
@@ -163,7 +165,11 @@ fn unix_now() -> u64 {
 /// Only a live host registration for the authenticated employee can name
 /// the person. A caller cannot borrow another employee's turn or supply
 /// `on_behalf_of` in the JSON body. Missing/unknown turns name nobody.
-pub(super) fn request_principal(home: &std::path::Path, agent: &str, request: &Request) -> Option<String> {
+pub(super) fn request_principal(
+    home: &std::path::Path,
+    agent: &str,
+    request: &Request,
+) -> Option<String> {
     let turn = match request {
         Request::Start { turn_id, .. } | Request::Action { turn_id, .. } => turn_id.as_deref()?,
         _ => return None,
@@ -193,7 +199,8 @@ async fn handle(
             ));
         }
     };
-    let caller = match super::auth::authenticate(sessions.home(), peer, &headers, &body, unix_now()) {
+    let caller = match super::auth::authenticate(sessions.home(), peer, &headers, &body, unix_now())
+    {
         Ok(caller) => caller,
         Err(failure) => {
             tracing::debug!(reason = failure.as_str(), "computer-use route refused");
@@ -208,7 +215,10 @@ async fn handle(
         ));
     }
     if !sessions.replay.record(&caller.nonce, now) {
-        tracing::debug!(reason = super::auth::AuthFailure::Replayed.as_str(), "computer-use route refused");
+        tracing::debug!(
+            reason = super::auth::AuthFailure::Replayed.as_str(),
+            "computer-use route refused"
+        );
         return unauthorized();
     }
     let agent_id = caller.agent_id;
@@ -222,23 +232,65 @@ async fn handle(
         }
     };
     let budget = op_budget(&request);
+    let attendance = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|body| {
+            body.get("principal_context")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .and_then(|reference| {
+            crate::on_behalf_of::context::attended_call(sessions.home(), &agent_id, &reference)
+        })
+        .filter(|call| match &request {
+            Request::Start { turn_id, .. } | Request::Action { turn_id, .. } => turn_id
+                .as_deref()
+                .is_some_and(|turn| call.matches_turn(&agent_id, turn)),
+            _ => true,
+        });
     let principal = request_principal(sessions.home(), &agent_id, &request);
     let op = async {
         match request {
-            Request::Start { width, height, task, turn_id, workspace } if valid_turn_id(&turn_id) => {
+            Request::Start {
+                width,
+                height,
+                task,
+                turn_id,
+                workspace,
+                target,
+            } if valid_turn_id(&turn_id) => {
                 sessions
-                    .start(&agent_id, StartRequest { width, height, task, turn_id, workspace })
+                    .start(
+                        &agent_id,
+                        StartRequest {
+                            width,
+                            height,
+                            task,
+                            turn_id,
+                            workspace,
+                            target,
+                        },
+                    )
                     .await
             }
-            Request::Start { .. } => Err(OpError::new(ErrorCode::BadRequest, "turn_id 格式不正確。")),
+            Request::Start { .. } => {
+                Err(OpError::new(ErrorCode::BadRequest, "turn_id 格式不正確。"))
+            }
             Request::Screenshot { session_id } if valid_session_id(&session_id) => {
                 sessions.screenshot(&agent_id, session_id.as_deref()).await
             }
-            Request::Action { session_id, turn_id, action }
-                if valid_session_id(&session_id) && valid_turn_id(&turn_id) =>
-            {
+            Request::Action {
+                session_id,
+                turn_id,
+                action,
+            } if valid_session_id(&session_id) && valid_turn_id(&turn_id) => {
                 sessions
-                    .action(&agent_id, session_id.as_deref(), turn_id.as_deref(), &action)
+                    .action(
+                        &agent_id,
+                        session_id.as_deref(),
+                        turn_id.as_deref(),
+                        &action,
+                    )
                     .await
             }
             Request::Action { session_id, .. } if valid_session_id(&session_id) => {
@@ -250,9 +302,16 @@ async fn handle(
             Request::Status {} => Ok(sessions.status(&agent_id).await),
             Request::WorkspaceList {} => sessions.workspace_list(&agent_id).await,
             Request::WorkspaceRead { workspace_id, path } => {
-                sessions.workspace_read(&agent_id, &workspace_id, &path).await
+                sessions
+                    .workspace_read(&agent_id, &workspace_id, &path)
+                    .await
             }
-            Request::WorkspaceWrite { workspace_id, path, content, expected_revision } => {
+            Request::WorkspaceWrite {
+                workspace_id,
+                path,
+                content,
+                expected_revision,
+            } => {
                 sessions
                     .workspace_write(&agent_id, &workspace_id, &path, &content, expected_revision)
                     .await
@@ -261,7 +320,10 @@ async fn handle(
             _ => Err(super::not_found()),
         }
     };
-    let op = crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op);
+    let op = super::attended_call::request_scope(
+        attendance,
+        crate::on_behalf_of::ON_BEHALF_OF.scope(principal, op),
+    );
     let outcome: Result<Value, OpError> = match tokio::time::timeout(budget, op).await {
         Ok(outcome) => outcome,
         Err(_) => {

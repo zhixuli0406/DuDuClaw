@@ -21,7 +21,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
 /// Top-level directory names skipped during export (heavy or ephemeral).
-const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target", "computer_profiles"];
+const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target", "computer_profiles", "local_browser"];
 
 /// `true` if a top-level entry name should be excluded from the export.
 fn is_excluded(name: &str) -> bool {
@@ -156,6 +156,7 @@ mod tests {
     #[test]
     fn excludes_heavy_and_ephemeral() {
         assert!(is_excluded("computer_profiles"));
+        assert!(is_excluded("local_browser"));
         assert!(is_excluded("models"));
         assert!(is_excluded("logs"));
         assert!(is_excluded("backup_2026"));
@@ -182,6 +183,7 @@ mod tests {
         write(&home1.join("models/big.gguf"), "HUGE");
         write(&home1.join("logs/run.log"), "noise");
         write(&home1.join("backup_old/x"), "old");
+        write(&home1.join("local_browser/alice/profile/Default/Cookies"), "synthetic credential");
 
         let archive = root.join("export.tar.gz");
         let n = export_home(&home1, &archive).unwrap();
@@ -205,6 +207,7 @@ mod tests {
         assert!(!home2.join("models").exists());
         assert!(!home2.join("logs").exists());
         assert!(!home2.join("backup_old").exists());
+        assert!(!home2.join("local_browser").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

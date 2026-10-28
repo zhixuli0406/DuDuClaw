@@ -9,6 +9,7 @@
 
 mod gateway_picker;
 mod lifecycle;
+mod local_browser;
 mod mascot_window;
 mod pet_gen;
 mod sidecar;
@@ -104,6 +105,7 @@ fn main() {
             updater::desktop_restart_and_update,
         ])
         .setup(move |app| {
+            app.manage(local_browser::NativeControls::default());
             let handle = app.handle().clone();
 
             // Hot-update (§D4): stage new versions in the background, apply on
@@ -195,6 +197,30 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
     let switch_gw = MenuItem::with_id(app, "switch_gateway", "切換 Gateway", true, None::<&str>)?;
     let mascot = MenuItem::with_id(app, "toggle_mascot", "顯示/隱藏桌寵", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重啟背景服務", true, None::<&str>)?;
+    #[cfg(target_os = "macos")]
+    let local_stop = MenuItem::with_id(
+        app,
+        "local_browser_stop",
+        "停止 AI 本機瀏覽器",
+        true,
+        None::<&str>,
+    )?;
+    #[cfg(target_os = "macos")]
+    let local_start = MenuItem::with_id(
+        app,
+        "local_browser_start",
+        "讓 AI 開瀏覽器…",
+        true,
+        None::<&str>,
+    )?;
+    #[cfg(target_os = "macos")]
+    let local_continue = MenuItem::with_id(
+        app,
+        "local_browser_continue",
+        "繼續 AI 本機瀏覽器（人在場）",
+        true,
+        None::<&str>,
+    )?;
     // Login-item registration for the desktop shell itself (the gateway rides
     // along as its sidecar). Backed by tauri-plugin-autostart — LaunchAgent on
     // macOS, per-user registry Run key on Windows, XDG autostart on Linux.
@@ -222,9 +248,38 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
     }
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
+    #[cfg(target_os = "macos")]
     let menu = Menu::with_items(
         app,
-        &[&open, &switch_gw, &mascot, &autostart, &status, &restart, &check_update, &sep, &quit],
+        &[
+            &open,
+            &switch_gw,
+            &mascot,
+            &autostart,
+            &status,
+            &local_start,
+            &local_stop,
+            &local_continue,
+            &restart,
+            &check_update,
+            &sep,
+            &quit,
+        ],
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let menu = Menu::with_items(
+        app,
+        &[
+            &open,
+            &switch_gw,
+            &mascot,
+            &autostart,
+            &status,
+            &restart,
+            &check_update,
+            &sep,
+            &quit,
+        ],
     )?;
 
     let manager_for_menu = manager.clone();
@@ -234,6 +289,12 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
         .tooltip("DuDuClaw")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
+            #[cfg(target_os = "macos")]
+            "local_browser_stop" => local_browser::emergency_stop(app),
+            #[cfg(target_os = "macos")]
+            "local_browser_start" => local_browser::start_from_tray(app),
+            #[cfg(target_os = "macos")]
+            "local_browser_continue" => local_browser::continue_from_tray(app),
             "open" => show_main_window(app),
             "switch_gateway" => {
                 if let Err(e) = gateway_picker::open_picker(app) {

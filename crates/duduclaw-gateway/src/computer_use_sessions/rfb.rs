@@ -149,7 +149,8 @@ impl ClientFilter {
                             return Ok(None);
                         }
                         // Negative = extended clipboard format, |len| bytes.
-                        let len = i32::from_be_bytes([p[4], p[5], p[6], p[7]]).unsigned_abs() as usize;
+                        let len =
+                            i32::from_be_bytes([p[4], p[5], p[6], p[7]]).unsigned_abs() as usize;
                         if len > MAX_CUT_TEXT {
                             return Err(RfbError::TooLarge);
                         }
@@ -237,7 +238,13 @@ mod tests {
         enc.extend_from_slice(&[0u8; 12]);
         assert!(f.feed(&enc[..5]).unwrap().is_empty());
         let out = f.feed(&enc[5..]).unwrap();
-        assert_eq!(out, vec![Message { kind: Kind::Forward, bytes: enc }]);
+        assert_eq!(
+            out,
+            vec![Message {
+                kind: Kind::Forward,
+                bytes: enc
+            }]
+        );
     }
 
     #[test]
@@ -252,7 +259,13 @@ mod tests {
         let out = f.feed(&stream).unwrap();
         assert_eq!(
             kinds(&out),
-            vec![Kind::Forward, Kind::Input, Kind::Input, Kind::Input, Kind::Input]
+            vec![
+                Kind::Forward,
+                Kind::Input,
+                Kind::Input,
+                Kind::Input,
+                Kind::Input
+            ]
         );
     }
 

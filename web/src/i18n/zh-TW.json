@@ -1,4 +1,10 @@
 {
+  "localBrowser.employeeEnable": "允許本機專用瀏覽器",
+  "localBrowser.employeeEnable.help": "macOS 桌面 app 必須在線、本人在場。每一步操作都需本機核准；不會操作你平常的瀏覽器。",
+  "localBrowser.globalEnable": "啟用本機專用瀏覽器（預設關閉）",
+  "localBrowser.globalEnable.help": "僅 macOS 本機桌面 app 啟動的 gateway 可用。你必須親手登入專用視窗，並從選單列核准、繼續或停止。",
+  "localBrowser.riskAck": "我了解 AI 會在這台電腦開專用瀏覽器；登入由我親手完成，每一步在本機核准，選單列可隨時停止。不落盤只限 DuDuClaw 的本機畫面與同意稽核路徑；模型收到的圖文、網址與按鍵仍可能留在執行器紀錄、供應商快取或模型回覆，Chrome 專用 profile 也會保存網站狀態。",
+  "localBrowser.dashboardNotice": "這是本機專用瀏覽器。儀表板只提供狀態與停止；畫面、核准與繼續只能在本機桌面 app 操作。",
   "causalCuration.title": "因果證據審查",
   "causalCuration.desc": "審查來源主張、變數別名與因果模型",
   "decisionLab.title": "決策實驗室",

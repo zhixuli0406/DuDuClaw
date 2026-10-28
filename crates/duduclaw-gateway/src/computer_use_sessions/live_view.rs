@@ -135,10 +135,17 @@ impl tokio::io::AsyncWrite for ChildIo {
 /// The `docker exec` argv that starts the VNC server (password on stdin,
 /// never in argv). Pure, for tests.
 pub(crate) fn vnc_start_args(container: &str, mode: VncMode) -> Vec<String> {
-    ["exec", "-i", container, "duduclaw-vnc", "start", mode.as_str()]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "exec",
+        "-i",
+        container,
+        "duduclaw-vnc",
+        "start",
+        mode.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// The `docker exec` argv of one relay connection. Pure, for tests.
@@ -164,7 +171,9 @@ impl LiveViewAccess for DockerLiveView {
         )
         .await?;
         if !out.status.success() {
-            return Err(ComputerUseError::ApiError("VNC server did not start".into()));
+            return Err(ComputerUseError::ApiError(
+                "VNC server did not start".into(),
+            ));
         }
         Ok(())
     }
@@ -187,9 +196,19 @@ impl LiveViewAccess for DockerLiveView {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| ComputerUseError::ApiError(format!("relay spawn failed: {e}")))?;
-        let stdin = child.stdin.take().ok_or_else(|| ComputerUseError::ApiError("relay stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| ComputerUseError::ApiError("relay stdout".into()))?;
-        Ok(Box::new(ChildIo { _child: child, stdin, stdout }))
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ComputerUseError::ApiError("relay stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ComputerUseError::ApiError("relay stdout".into()))?;
+        Ok(Box::new(ChildIo {
+            _child: child,
+            stdin,
+            stdout,
+        }))
     }
 }
 
@@ -313,7 +332,10 @@ impl LiveState {
     }
 
     pub(crate) fn access(&self) -> Option<Arc<dyn LiveViewAccess>> {
-        self.access.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.access
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Record viewer input for `user_id`: `true` (and the lease's idle clock
@@ -365,7 +387,11 @@ pub fn authorize(live: &UserContext, agent_id: &str, action: LiveAction) -> bool
 
 /// The label an operator is recorded under (email, else id; ≤64 chars).
 pub fn operator_label(ctx: &UserContext) -> String {
-    let raw = if ctx.email.is_empty() { &ctx.user_id } else { &ctx.email };
+    let raw = if ctx.email.is_empty() {
+        &ctx.user_id
+    } else {
+        &ctx.email
+    };
     duduclaw_core::truncate_chars(raw, 64)
 }
 
@@ -454,7 +480,10 @@ mod tests {
         assert!(!authorize(&mgr_viewer, "alice", Control));
         let emp_owner = ctx(Employee, &[("alice", Owner)]);
         assert!(authorize(&emp_owner, "alice", Watch));
-        assert!(!authorize(&emp_owner, "alice", Control), "takeover needs a Manager");
+        assert!(
+            !authorize(&emp_owner, "alice", Control),
+            "takeover needs a Manager"
+        );
         let emp_viewer = ctx(Employee, &[("alice", Viewer)]);
         assert!(!authorize(&emp_viewer, "alice", Watch));
         let unbound_mgr = ctx(Manager, &[]);
@@ -468,15 +497,37 @@ mod tests {
     fn lease_expires_without_input_and_only_the_holder_counts() {
         let now = Instant::now();
         let state = LiveState::default();
-        *state.takeover.lock().unwrap() =
-            Some(TakeoverLease::new("u1", "u1@example.com", now, Duration::from_secs(600)));
-        assert!(state.active_takeover(now + Duration::from_secs(599)).is_some());
-        assert!(!state.note_input("u2", now + Duration::from_secs(10)), "not the holder");
+        *state.takeover.lock().unwrap() = Some(TakeoverLease::new(
+            "u1",
+            "u1@example.com",
+            now,
+            Duration::from_secs(600),
+        ));
+        assert!(
+            state
+                .active_takeover(now + Duration::from_secs(599))
+                .is_some()
+        );
+        assert!(
+            !state.note_input("u2", now + Duration::from_secs(10)),
+            "not the holder"
+        );
         assert!(state.note_input("u1", now + Duration::from_secs(500)));
         // The idle clock restarted at +500 s.
-        assert!(state.active_takeover(now + Duration::from_secs(1000)).is_some());
-        assert!(state.active_takeover(now + Duration::from_secs(1100)).is_none());
-        assert!(!state.note_input("u1", now + Duration::from_secs(1100)), "expired lease takes no input");
+        assert!(
+            state
+                .active_takeover(now + Duration::from_secs(1000))
+                .is_some()
+        );
+        assert!(
+            state
+                .active_takeover(now + Duration::from_secs(1100))
+                .is_none()
+        );
+        assert!(
+            !state.note_input("u1", now + Duration::from_secs(1100)),
+            "expired lease takes no input"
+        );
         let lease = state.takeover.lock().unwrap().clone().unwrap();
         assert_eq!(lease.inputs, 1);
     }
@@ -512,10 +563,26 @@ mod tests {
     #[test]
     fn exec_argv_never_carries_the_password_or_a_port() {
         let start = vnc_start_args("duduclaw-cu-0123", VncMode::ViewOnly);
-        assert_eq!(start, ["exec", "-i", "duduclaw-cu-0123", "duduclaw-vnc", "start", "viewonly"]);
-        assert_eq!(vnc_start_args("c", VncMode::Control).last().unwrap(), "control");
+        assert_eq!(
+            start,
+            [
+                "exec",
+                "-i",
+                "duduclaw-cu-0123",
+                "duduclaw-vnc",
+                "start",
+                "viewonly"
+            ]
+        );
+        assert_eq!(
+            vnc_start_args("c", VncMode::Control).last().unwrap(),
+            "control"
+        );
         let relay = relay_args("duduclaw-cu-0123");
-        assert_eq!(relay, ["exec", "-i", "duduclaw-cu-0123", "duduclaw-vnc-relay"]);
+        assert_eq!(
+            relay,
+            ["exec", "-i", "duduclaw-cu-0123", "duduclaw-vnc-relay"]
+        );
         for a in start.iter().chain(relay.iter()) {
             assert!(!a.contains("5900") && !a.starts_with("-p"), "{a}");
         }

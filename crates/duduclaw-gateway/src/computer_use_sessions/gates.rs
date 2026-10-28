@@ -73,16 +73,28 @@ fn forbidden(message: String) -> OpError {
 
 /// Write the MCP gate's denial row (`append_tool_call_denied`, no input) off
 /// the async runtime.
-async fn audit_denial(home: &Path, agent_id: &str, tool: &'static str, class: &'static str, detail: &str) {
+async fn audit_denial(
+    home: &Path,
+    agent_id: &str,
+    tool: &'static str,
+    class: &'static str,
+    detail: &str,
+) {
     let (home, agent, detail) = (home.to_path_buf(), agent_id.to_string(), detail.to_string());
     let _ = tokio::task::spawn_blocking(move || {
-        duduclaw_security::audit::append_tool_call_denied(&home, &agent, tool, class, &detail, None);
+        duduclaw_security::audit::append_tool_call_denied(
+            &home, &agent, tool, class, &detail, None,
+        );
     })
     .await;
 }
 
 /// `denied_tools` / `allowed_tools` and `scoped_tools` for `tool`.
-pub(super) async fn tool_gates(home: &Path, agent_id: &str, tool: &'static str) -> Result<(), OpError> {
+pub(super) async fn tool_gates(
+    home: &Path,
+    agent_id: &str,
+    tool: &'static str,
+) -> Result<(), OpError> {
     use duduclaw_core::tool_catalog::{ToolListVerdict, tool_list_verdict};
 
     let dir = agent_dir(home, agent_id);
@@ -91,11 +103,15 @@ pub(super) async fn tool_gates(home: &Path, agent_id: &str, tool: &'static str) 
         ToolListVerdict::Allowed => None,
         ToolListVerdict::Denied => Some((
             "denied_tools",
-            format!("工具「{tool}」已被此員工的 [capabilities] denied_tools 設定阻擋，已拒絕執行。"),
+            format!(
+                "工具「{tool}」已被此員工的 [capabilities] denied_tools 設定阻擋，已拒絕執行。"
+            ),
         )),
         ToolListVerdict::NotAllowlisted => Some((
             "allowed_tools",
-            format!("工具「{tool}」不在此員工的 [capabilities] allowed_tools 允許清單中，已拒絕執行。"),
+            format!(
+                "工具「{tool}」不在此員工的 [capabilities] allowed_tools 允許清單中，已拒絕執行。"
+            ),
         )),
     };
     if let Some((class, message)) = refusal {
@@ -137,6 +153,27 @@ fn action_rule_verdict(dir: &Path, tool: &str) -> Option<duduclaw_core::ActionVe
     duduclaw_core::agent_toml::load_action_rules(dir).resolve(tool, duduclaw_core::effect_of(tool))
 }
 
+/// Every local operation also checks Modify. Navigation additionally sends
+/// an authenticated website request: retain Modify AND add Send. These
+/// classes are unordered; an allow in one never erases a block in the other.
+pub(super) fn local_navigation_rule(home: &Path, agent: &str, tool: &str) -> Result<bool, OpError> {
+    let rules = duduclaw_core::agent_toml::load_action_rules(&agent_dir(home, agent));
+    let mut verdict = rules.resolve(tool, duduclaw_core::ToolEffect::Modify);
+    if tool == TOOL_NAVIGATE {
+        verdict = verdict
+            .into_iter()
+            .chain(rules.resolve(tool, duduclaw_core::ToolEffect::Send))
+            .max();
+    }
+    match verdict {
+        Some(duduclaw_core::ActionVerdict::Block) => {
+            Err(forbidden("本機操作被 Modify／Send 動作規則阻擋。".into()))
+        }
+        Some(duduclaw_core::ActionVerdict::Ask) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
 /// Whether `tool` is in any of the employee's approval lists, or an action
 /// rule asks (or blocks) it.
 pub(super) fn approval_required(home: &Path, agent_id: &str, tool: &str) -> bool {
@@ -164,8 +201,34 @@ pub(super) async fn action_review(
     tool: &'static str,
     args: &serde_json::Value,
 ) -> Result<bool, OpError> {
+    action_review_effect(home, agent_id, tool, args, duduclaw_core::effect_of(tool)).await
+}
+
+pub(super) async fn local_action_review(
+    home: &Path,
+    agent: &str,
+    tool: &'static str,
+    args: &serde_json::Value,
+) -> Result<bool, OpError> {
+    let first =
+        action_review_effect(home, agent, tool, args, duduclaw_core::ToolEffect::Modify).await?;
+    let second = if tool == TOOL_NAVIGATE {
+        action_review_effect(home, agent, tool, args, duduclaw_core::ToolEffect::Send).await?
+    } else {
+        false
+    };
+    Ok(first || second)
+}
+
+async fn action_review_effect(
+    home: &Path,
+    agent_id: &str,
+    tool: &'static str,
+    args: &serde_json::Value,
+    effect: duduclaw_core::ToolEffect,
+) -> Result<bool, OpError> {
     use crate::action_review::{self as ar, ActionReviewMode, ReviewOutcome};
-    if !duduclaw_core::effect_of(tool).is_side_effecting() {
+    if !effect.is_side_effecting() {
         return Ok(false);
     }
     let mode = ActionReviewMode::from_home(home);
@@ -173,7 +236,8 @@ pub(super) async fn action_review(
         return Ok(false);
     }
     let dir = agent_dir(home, agent_id);
-    let input = ar::ReviewInput::build(tool, &json!({ "arguments": args }), &dir);
+    let mut input = ar::ReviewInput::build(tool, &json!({ "arguments": args }), &dir);
+    input.effect = effect;
     let verdict = ar::review(home, &dir, &input).await;
     let result = ar::outcome(mode, verdict);
     {
@@ -189,8 +253,14 @@ pub(super) async fn action_review(
                 &format!("action review ({mode_s}) → {audit}"),
                 ok,
                 &[
-                    ("action_review", serde_json::Value::String(audit.to_string())),
-                    ("action_review_mode", serde_json::Value::String(mode_s.to_string())),
+                    (
+                        "action_review",
+                        serde_json::Value::String(audit.to_string()),
+                    ),
+                    (
+                        "action_review_mode",
+                        serde_json::Value::String(mode_s.to_string()),
+                    ),
                 ],
             );
         })
@@ -223,7 +293,9 @@ pub(super) async fn obtain_approval(
     ttl_secs: i64,
     poll: Duration,
 ) -> Result<(), OpError> {
-    use crate::approval::action_grant::{ACTION_GRANT_KEY, ActionGrant, GrantRefusal, verify_and_consume};
+    use crate::approval::action_grant::{
+        ACTION_GRANT_KEY, ActionGrant, GrantRefusal, verify_and_consume,
+    };
     let broker = match ApprovalBroker::open(home) {
         Ok(b) => b,
         Err(e) => {
@@ -244,7 +316,10 @@ pub(super) async fn obtain_approval(
         "via": "computer_use_route",
         ACTION_GRANT_KEY: grant.to_json(),
     });
-    let id = match broker.request(agent_id, "mcp_call", &summary, payload, ttl_secs).await {
+    let id = match broker
+        .request(agent_id, "mcp_call", &summary, payload, ttl_secs)
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             warn!(error = %e, "computer tool approval request failed — denying (fail-closed)");
@@ -260,16 +335,21 @@ pub(super) async fn obtain_approval(
                 warn!(approval = %id, ?refusal, "computer tool approval not usable — denying (fail-closed)");
                 let what = match refusal {
                     GrantRefusal::Mismatch => "核准內容與這次呼叫不符",
-                    GrantRefusal::AlreadyUsed | GrantRefusal::NotApproved => "這份核准已被使用或已失效",
+                    GrantRefusal::AlreadyUsed | GrantRefusal::NotApproved => {
+                        "這份核准已被使用或已失效"
+                    }
                     GrantRefusal::Store(_) => "無法確認核准內容",
                 };
-                Err(approval_denied(format!("{what}，工具「{tool}」的呼叫已拒絕。")))
+                Err(approval_denied(format!(
+                    "{what}，工具「{tool}」的呼叫已拒絕。"
+                )))
             }
         },
-        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) =>
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) => {
             Err(approval_denied(format!(
-            "工具「{tool}」的呼叫已被管理員拒絕（審核編號 {id}）。"
-        ))),
+                "工具「{tool}」的呼叫已被管理員拒絕（審核編號 {id}）。"
+            )))
+        }
         Ok(ApprovalStatus::Expired) => Err(approval_denied(format!(
             "工具「{tool}」的呼叫逾時未核可，已自動拒絕（審核編號 {id}）。"
         ))),

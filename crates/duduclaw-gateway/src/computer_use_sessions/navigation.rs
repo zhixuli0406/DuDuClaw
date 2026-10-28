@@ -36,8 +36,11 @@ pub(crate) struct DnsResolver;
 #[async_trait]
 impl HostResolver for DnsResolver {
     async fn resolve(&self, host: &str) -> Option<Ipv4Addr> {
-        let addrs = match tokio::time::timeout(RESOLVE_TIMEOUT, crate::web_fetch::resolve_public_addrs(host, 443))
-            .await
+        let addrs = match tokio::time::timeout(
+            RESOLVE_TIMEOUT,
+            crate::web_fetch::resolve_public_addrs(host, 443),
+        )
+        .await
         {
             Ok(Ok(addrs)) => addrs,
             _ => return None,
@@ -79,7 +82,10 @@ pub(crate) async fn resolve_hosts(
     let mut skipped = Vec::new();
     for (host, answer) in hosts.iter().zip(answers) {
         match answer {
-            Some(ip) => pinned.push(PinnedHost { host: host.clone(), ip }),
+            Some(ip) => pinned.push(PinnedHost {
+                host: host.clone(),
+                ip,
+            }),
             None => skipped.push(host.clone()),
         }
     }
@@ -87,7 +93,12 @@ pub(crate) async fn resolve_hosts(
 }
 
 /// The start result's network sentence (no addresses in it).
-pub fn start_message(configured: usize, reachable: &[String], skipped: &[String], ignored: usize) -> String {
+pub fn start_message(
+    configured: usize,
+    reachable: &[String],
+    skipped: &[String],
+    ignored: usize,
+) -> String {
     let mut out = if configured == 0 {
         "這個 session 沒有網路連線。要開網頁，請管理者在此員工 agent.toml 的 [capabilities.computer_use_config] allowed_domains 加入網域。".to_string()
     } else if reachable.is_empty() {
@@ -96,7 +107,10 @@ pub fn start_message(configured: usize, reachable: &[String], skipped: &[String]
             skipped.join("、")
         )
     } else {
-        let mut s = format!("可用 computer_navigate 開啟的網站：{}。", reachable.join("、"));
+        let mut s = format!(
+            "可用 computer_navigate 開啟的網站：{}。",
+            reachable.join("、")
+        );
         if !skipped.is_empty() {
             s.push_str(&format!(
                 "以下網站這次連不上（無法解析，或解析到內部網路）：{}。",
@@ -160,7 +174,10 @@ pub fn validate_url(raw: &str, hosts: &[String], configured: bool) -> Result<Che
             ),
         )
     };
-    if raw.is_empty() || raw.len() > MAX_URL_BYTES || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if raw.is_empty()
+        || raw.len() > MAX_URL_BYTES
+        || raw.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
         return Err(bad_format());
     }
     let parsed = reqwest::Url::parse(raw).map_err(|_| bad_format())?;
@@ -195,7 +212,10 @@ pub fn validate_url(raw: &str, hosts: &[String], configured: bool) -> Result<Che
     let path = parsed.path();
     Ok(CheckedUrl {
         url: parsed.as_str().to_string(),
-        audit_url: format!("https://{host}{}", duduclaw_core::truncate_chars(path, AUDIT_PATH_MAX_CHARS)),
+        audit_url: format!(
+            "https://{host}{}",
+            duduclaw_core::truncate_chars(path, AUDIT_PATH_MAX_CHARS)
+        ),
         path_len: path.len(),
         host,
     })
@@ -207,16 +227,28 @@ pub fn error_token(error: Option<&str>) -> String {
     let Some(e) = error else {
         return "unknown".to_string();
     };
-    let net = e
-        .strip_prefix("net::ERR_")
-        .is_some_and(|rest| !rest.is_empty() && rest.len() <= 64 && rest.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'));
-    let short = !e.is_empty() && e.len() <= 32 && e.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
-    if net || short { e.to_string() } else { "unknown".to_string() }
+    let net = e.strip_prefix("net::ERR_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 64
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    });
+    let short =
+        !e.is_empty() && e.len() <= 32 && e.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    if net || short {
+        e.to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 /// The CONTRACT.toml `must_not` text for a navigation.
 pub fn semantic_string(checked: &CheckedUrl) -> String {
-    format!("navigate open web page url {}", checked.audit_url.to_lowercase())
+    format!(
+        "navigate open web page url {}",
+        checked.audit_url.to_lowercase()
+    )
 }
 
 #[cfg(test)]
@@ -278,7 +310,11 @@ mod tests {
             let e = r.expect_err(url);
             assert_eq!(e.code, ErrorCode::InvalidAction, "{url}");
             assert!(e.message.contains("example.com"), "{url}: {}", e.message);
-            assert!(!e.message.contains("不是") && !e.message.contains("——"), "{}", e.message);
+            assert!(
+                !e.message.contains("不是") && !e.message.contains("——"),
+                "{}",
+                e.message
+            );
         }
         let long = format!("https://example.com/{}", "a".repeat(MAX_URL_BYTES));
         assert!(validate_url(&long, &hosts(), true).is_err());
@@ -291,7 +327,10 @@ mod tests {
     #[test]
     fn empty_session_hosts_name_the_setting() {
         let e = validate_url("https://example.com/", &[], false).unwrap_err();
-        assert!(e.message.contains("[capabilities.computer_use_config] allowed_domains"));
+        assert!(
+            e.message
+                .contains("[capabilities.computer_use_config] allowed_domains")
+        );
         let e = validate_url("https://example.com/", &[], true).unwrap_err();
         assert!(e.message.contains("連不上"));
     }
@@ -299,13 +338,33 @@ mod tests {
     #[test]
     fn public_address_screen() {
         for bad in [
-            "0.1.2.3", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "192.168.65.1",
-            "192.0.2.1", "198.18.0.1", "224.0.0.1", "255.255.255.255", "::", "::1", "fe80::1", "fd00::1",
-            "ff02::1", "::ffff:10.0.0.1", "2001:db8::1",
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.168.65.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "ff02::1",
+            "::ffff:10.0.0.1",
+            "2001:db8::1",
         ] {
             assert!(!strictly_public(&bad.parse().unwrap()), "{bad}");
         }
-        for good in ["93.184.215.14", "1.1.1.1", "2606:4700::1111", "::ffff:1.1.1.1"] {
+        for good in [
+            "93.184.215.14",
+            "1.1.1.1",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1",
+        ] {
             assert!(strictly_public(&good.parse().unwrap()), "{good}");
         }
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
@@ -314,14 +373,23 @@ mod tests {
             Some(Ipv4Addr::new(1, 1, 1, 1))
         );
         // One internal answer refuses the whole host.
-        assert_eq!(first_pinnable_ipv4([ip("1.1.1.1"), ip("10.0.0.1")].into_iter()), None);
+        assert_eq!(
+            first_pinnable_ipv4([ip("1.1.1.1"), ip("10.0.0.1")].into_iter()),
+            None
+        );
         // IPv6 only: nothing to pin.
-        assert_eq!(first_pinnable_ipv4([ip("2606:4700::1111")].into_iter()), None);
+        assert_eq!(
+            first_pinnable_ipv4([ip("2606:4700::1111")].into_iter()),
+            None
+        );
     }
 
     #[test]
     fn error_tokens_are_shape_checked() {
-        assert_eq!(error_token(Some("net::ERR_NAME_NOT_RESOLVED")), "net::ERR_NAME_NOT_RESOLVED");
+        assert_eq!(
+            error_token(Some("net::ERR_NAME_NOT_RESOLVED")),
+            "net::ERR_NAME_NOT_RESOLVED"
+        );
         assert_eq!(error_token(Some("timeout")), "timeout");
         assert_eq!(error_token(Some("net::ERR_<script>")), "unknown");
         assert_eq!(error_token(Some("Page says: hello")), "unknown");

@@ -236,3 +236,7 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 - [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth トランスポート
 - [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 仕様
 - [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` ツール。MCP サーバーではなく直接 API のツールループが注入します
+
+## 専用ローカルブラウザー（macOS、初期値はオフ）
+
+Admin が全体と従業員の両方の設定を有効にします。ローカルアプリ、現在処理中の本人との会話、在席確認、各操作のネイティブ承認が必要です。dashboard は状態と停止のみ提供します。通常の profile を読み込まず、拒否時に別の target へ切り替えません。[設定、制限、検証範囲](local-browser.md)を参照してください。

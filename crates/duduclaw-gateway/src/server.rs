@@ -803,6 +803,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let computer_use_sessions =
         crate::computer_use_sessions::ComputerUseSessions::new(home_dir.clone());
     computer_use_sessions.spawn_background();
+    #[cfg(target_os="macos")]
+    {
+        let companion=computer_use_sessions.companion.clone();
+        tokio::spawn(async move {
+            if let Err(reason)=crate::computer_use_sessions::local_browser::companion::bootstrap(companion).await {
+                tracing::debug!(%reason,"local browser companion not paired");
+            }
+        });
+    }
 
     // ── Initialize user database & JWT ───────────────────────
     let user_db_path = home_dir.join("users.db");
@@ -2793,6 +2802,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::computer_use_sessions::http::router(
         computer_use_sessions.clone(),
     ));
+    app=app.merge(crate::computer_use_sessions::local_browser::companion::router(computer_use_sessions.companion.clone()));
     // Separate MCP processes delegate human permission checks to this
     // host, using its verified license runtime and live opaque contexts.
     app = app.merge(crate::on_behalf_of::route::router(Arc::new(

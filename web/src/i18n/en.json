@@ -1,4 +1,10 @@
 {
+  "localBrowser.employeeEnable": "Allow dedicated local browser",
+  "localBrowser.employeeEnable.help": "Requires the macOS desktop app and your presence. Each step needs local approval; your normal browser stays separate.",
+  "localBrowser.globalEnable": "Enable dedicated local browser (off by default)",
+  "localBrowser.globalEnable.help": "Only a gateway started by the local macOS desktop app can use this. Sign in yourself in the dedicated window; approve, continue or stop from the menu bar.",
+  "localBrowser.riskAck": "I understand AI will open a dedicated browser on this computer. I sign in myself, approve each step locally and can stop it from the menu bar. Memory-only handling covers DuDuClaw's local viewport and consent audit paths; model images, text, URLs and keys may remain in runtime transcripts, provider caches or model replies, and the dedicated Chrome profile retains website state.",
+  "localBrowser.dashboardNotice": "Only status and stop are available here. View the dedicated browser and approve or continue steps in the local desktop app.",
   "causalCuration.title": "Causal evidence review",
   "causalCuration.desc": "Review source-backed claims, aliases, and causal models",
   "decisionLab.title": "Decision Lab",

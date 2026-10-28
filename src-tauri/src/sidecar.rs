@@ -69,6 +69,12 @@ impl SidecarManager {
         *self.port.lock().unwrap()
     }
 
+    pub(crate) fn local_child_is_current(&self,pid:u32,generation:u64)->bool {
+        !self.attached.load(Ordering::Acquire) && !self.shutting_down.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire)==generation
+            && self.child.lock().unwrap().as_ref().is_some_and(|child|child.pid()==pid)
+    }
+
     fn set_status(&self, s: SidecarStatus) {
         *self.status.lock().unwrap() = s;
     }
@@ -219,6 +225,7 @@ impl SidecarManager {
             // gateway (design §2.5 "防 gateway 蔓延"). Force mDNS off regardless
             // of config.toml — this env wins over `[server] mdns_advertise`.
             .env("DUDUCLAW_MDNS_ADVERTISE", "0")
+            .env("DUDUCLAW_LOCAL_COMPANION_PARENT",std::process::id().to_string())
             .env("PATH", lifecycle::augmented_path());
 
         let (mut rx, child) = sidecar
@@ -231,6 +238,7 @@ impl SidecarManager {
         *self.port.lock().unwrap() = port;
         *self.child.lock().unwrap() = Some(child);
         self.attached.store(false, Ordering::SeqCst);
+        crate::local_browser::start(app.clone(),self.clone(),pid,my_gen,port);
         self.set_status(SidecarStatus::Starting);
         tracing::info!("spawned gateway sidecar pid={pid} port={port} — waiting for readiness");
 

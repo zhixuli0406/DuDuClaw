@@ -4,6 +4,8 @@
 
 ### Added
 
+- **未發布，驗證中**：macOS 本機專用瀏覽器（B9b），個人版與企業版皆可由管理員開啟，預設關閉。使用獨立 profile、CDP pipe、白名單 proxy 與原生在場／步進核准；儀表板只提供狀態與停止。Windows、Linux、遠端或附掛的 gateway 均拒絕。已完成合成 native spike 與部分 Rust 回歸；完整桌面整合、實際鎖屏、本人網站登入與出貨放行仍分開追蹤。見 `docs/guides/zh-TW/local-browser.md`、`wiki/impl/local-browser-spike-acceptance.md`。
+
 - **未發布，驗證中**：容器瀏覽器可選擇保存登入狀態。全域與員工開關預設關閉，正常結束時只封存 Cookies／Local Storage／IndexedDB，加密綁定員工實例，主機不解開封存檔。白名單縮小、換負責人、刪除／封存員工時清除；電腦分頁可查看與清除。RED／緊急停止不保存，注入暫停後須有接手權限的人明確選擇保留。匯出與備份排除登入快照。已完成 12,799 項 Rust 測試、封存 helper 6 項測試、dashboard 62 項測試與建置。真實 gateway 容器流程另外抓到設定解析與輸入管線問題，修正後完成合成 Cookie 保存、重開還原及清除；修正後 14 項相關 Rust 回歸也通過。最後的 shipping binary 與正式前端產物已在 Chrome 完成保存／還原／清除、390px 無橫向溢出；即時畫面另需 VNC 修復 #207 的本機組合候選。真網站帳號與實際金鑰圈未驗，分層證據見 `wiki/impl/browser-profile-acceptance.md`。
 - AI 員工專屬通道：員工頁「整合」分頁多了「專屬通道」區塊，可以讓一位員工用自己的 Telegram Bot 和自己的 Google Chat 應用程式對外說話，不用重新啟動。沒設定的員工照舊走共用通道。設定步驟見 `docs/guides/per-employee-channels.md`（三語）。
   - **Telegram**：貼上 BotFather 的 Token 按「連線」。存檔前先用 `getMe` 問 Telegram，被拒絕的 Token 不會存；當下連不到 Telegram 時先存、Bot 自己重試。卡片顯示「已連線，Bot 是 @xxx」或沒連上的原因（Token 被撤銷會顯示「Bot Token 無效」）。存檔只重啟這位員工的 Bot，其他 Bot 不受影響（以前每次存檔都把所有 Bot 重啟一輪）。

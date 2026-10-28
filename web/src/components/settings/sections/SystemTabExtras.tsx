@@ -93,7 +93,7 @@ function RowTextValue({
   );
 }
 
-export function SandboxSection({ values, set }: { values: FlatValues; set: SetFn }) {
+export function SandboxSection({ values, set, isAdmin = false }: { values: FlatValues; set: SetFn; isAdmin?: boolean }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const modeOptions = (prefix: string): SelectOption[] =>
@@ -188,6 +188,13 @@ export function SandboxSection({ values, set }: { values: FlatValues; set: SetFn
         <RowSwitch label={t('browserLogin.enable')} description={t('browserLogin.enable.help')}
           checked={vBool(values, 'computer_use.profiles.enabled')}
           onChange={(v) => set('computer_use.profiles.enabled', v)} />
+        <RowSwitch disabled={!isAdmin} label={t('localBrowser.globalEnable')} description={t('localBrowser.globalEnable.help')}
+          checked={vBool(values, 'computer_use.local_browser.enabled')}
+          onChange={(v) => { set('computer_use.local_browser.enabled', v); set('ack_local_browser_risks', false); }} />
+        {vBool(values, 'computer_use.local_browser.enabled') && <label className="flex items-start gap-3 p-3 text-sm">
+          <input type="checkbox" disabled={!isAdmin} checked={vBool(values, 'ack_local_browser_risks')} onChange={(event) => set('ack_local_browser_risks', event.target.checked)} />
+          {t('localBrowser.riskAck')}
+        </label>}
         <RowNum label={t('browserLogin.maxMiB')} value={vNum(values, 'computer_use.profiles.max_bytes', 64 * MIB) / MIB}
           min={1} max={128} onChange={(n) => set('computer_use.profiles.max_bytes', n * MIB)} />
         <RowNum label={t('browserLogin.retentionDays')} value={vNum(values, 'computer_use.profiles.retention_days', 30)}

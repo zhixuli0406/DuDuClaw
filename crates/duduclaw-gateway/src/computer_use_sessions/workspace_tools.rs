@@ -98,7 +98,8 @@ impl ComputerUseSessions {
     }
 
     pub async fn workspace_list(&self, agent_id: &str) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_WS_LIST, "", &json!({})).await?;
+        self.admit(agent_id, gates::TOOL_WS_LIST, "", &json!({}))
+            .await?;
         self.workspace_capability(agent_id)?;
         if !cfg!(unix) {
             return Err(workspace::unavailable());

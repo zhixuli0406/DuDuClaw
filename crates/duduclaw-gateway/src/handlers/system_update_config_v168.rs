@@ -464,6 +464,20 @@ fn apply_computer_use(
     params: &Value,
     out: &mut V168Outcome,
 ) -> Result<(), String> {
+    if let Some(enabled) = bool_param(params, "computer_use.local_browser.enabled")? {
+        let was_enabled = crate::computer_use_sessions::local_browser::policy::LocalBrowserConfig::parse(table)?.enabled;
+        if enabled && !was_enabled && bool_param(params, "ack_local_browser_risks")? != Some(true) {
+            return Err("開啟本機瀏覽器前，請確認專用視窗、親手登入、每步本機核准與停止方式。".into());
+        }
+        set_bool(table, &["computer_use", "local_browser"], "enabled", enabled, out)?;
+        // A newly enabled native app must pair with its own gateway process.
+        // Existing sessions immediately re-read the narrowing switch.
+        out.applied_immediate = true;
+    }
+    if let Some(seconds) = u64_param(params, "computer_use.local_browser.idle_seconds", 30, 600)? {
+        set_int(table, &["computer_use", "local_browser"], "idle_seconds", seconds, out)?;
+        out.applied_immediate = true;
+    }
     if let Some(v) = str_param(params, "computer_use.image")? {
         set_or_clear_str(table, &["computer_use"], "image", v.trim(), out)?;
         crate::computer_use_image::parse(table)
@@ -599,6 +613,17 @@ mod tests {
         let mut t = toml::Table::new();
         let o = apply_v168_keys(&mut t, &params)?;
         Ok((t, o))
+    }
+
+    #[test]
+    fn local_browser_requires_explicit_ack_and_never_stores_the_ack() {
+        assert!(apply(json!({"computer_use.local_browser.enabled": true})).is_err());
+        assert!(apply(json!({"computer_use.local_browser.enabled": true,"ack_local_browser_risks":"true"})).is_err());
+        let (table, _) = apply(json!({"computer_use.local_browser.enabled":true,"ack_local_browser_risks":true})).unwrap();
+        assert!(crate::computer_use_sessions::local_browser::policy::LocalBrowserConfig::parse(&table).unwrap().enabled);
+        assert!(!table.contains_key("ack_local_browser_risks"));
+        assert!(apply(json!({"computer_use.local_browser.enabled":false})).is_ok());
+        assert!(apply(json!({"computer_use.local_browser.idle_seconds":601})).is_err());
     }
 
     #[test]

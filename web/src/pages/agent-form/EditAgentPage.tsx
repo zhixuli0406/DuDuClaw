@@ -1528,6 +1528,7 @@ export function EditAgentPage() {
               />
               <RowSwitch disabled={!isAdmin} label={t('agents.cap.autoConfirmTrusted')} description={t('agents.cap.autoConfirmTrusted.help')} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
               <RowSwitch disabled={!isAdmin} label={t('browserLogin.persist')} description={t('browserLogin.persist.help')} checked={caps.computer_use_config.persist_login ?? false} onChange={(v) => updateCapConfig('persist_login', v)} />
+              <RowSwitch disabled={!isAdmin} label={t('localBrowser.employeeEnable')} description={t('localBrowser.employeeEnable.help')} checked={caps.computer_use_config.local_browser ?? false} onChange={(v) => updateCapConfig('local_browser', v)} />
             </SettingsCard>
           </DangerZone>
           </fieldset>

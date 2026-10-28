@@ -263,9 +263,29 @@ pub(crate) async fn handle_tools_list_for_agent(
     let tools: Vec<Value> = visible_tools(principal, home_dir, default_agent)
         .await
         .into_iter()
-        .map(build_tool_schema)
+        .map(|tool| caller_tool_schema(tool,principal,home_dir,default_agent))
         .collect();
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
+}
+
+fn caller_tool_schema(tool:&ToolDef,principal:&crate::mcp_auth::Principal,home:&Path,default_agent:&str)->Value {
+    let mut schema=build_tool_schema(tool);
+    if tool.name=="computer_session_start" {
+        let agent=acting_agent_id(&principal.client_id,default_agent);
+        let local=!principal.is_external && duduclaw_gateway::computer_use_sessions::local_browser_discoverable(home,agent);
+        schema["inputSchema"]["properties"]["target"]=serde_json::json!({"type":"string","enum":if local {vec!["container","local_browser"]}else{vec!["container"]},"default":"container"});
+    }
+    schema
+}
+
+/// The full advertised schemas, so a target enum change emits list_changed
+/// even while the tool's name and the total tool count stay the same.
+pub(crate) async fn visible_tool_schemas(principal:&crate::mcp_auth::Principal,home:&Path,agent:&str)->Vec<String> {
+    visible_tools(principal,home,agent).await.into_iter().map(|tool|
+        caller_tool_schema(tool,principal,home,agent).to_string()).collect()
+}
+pub(crate) fn advertised_tool_schemas(response:&Value)->Vec<String> {
+    response["result"]["tools"].as_array().map(|tools|tools.iter().map(Value::to_string).collect()).unwrap_or_default()
 }
 
 /// The exact set of tool names this caller would be shown right now.

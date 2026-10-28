@@ -236,3 +236,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 - [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth 傳輸
 - [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 規格
 - [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` 工具，由直連 API 的 tool loop 注入，不經 MCP server 派送
+
+## 本機專用瀏覽器（macOS，預設關閉）
+
+管理員需同時啟用全域與員工開關。使用時必須有本機桌面 app、正在處理的人類對話、在場證明，以及每一步的原生核准。儀表板帳號只提供狀態與停止，不匯入平常的瀏覽器 profile，拒絕後也不會改用其他目標。詳見[設定、限制與驗證界線](local-browser.md)。

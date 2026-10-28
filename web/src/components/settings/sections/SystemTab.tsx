@@ -105,6 +105,9 @@ function readV168(tables: TomlTables): FlatValues {
     'container.sandbox.max_turns': tomlNum(tables, sb, 'max_turns', SANDBOX_DEFAULTS.max_turns),
     'computer_use.image': tomlStr(tables, 'computer_use', 'image', ''),
     'computer_use.profiles.enabled': tomlBool(tables, 'computer_use.profiles', 'enabled', false),
+    'computer_use.local_browser.enabled': tomlBool(tables, 'computer_use.local_browser', 'enabled', false),
+    'computer_use.local_browser.idle_seconds': tomlNum(tables, 'computer_use.local_browser', 'idle_seconds', 600),
+    'ack_local_browser_risks': false,
     'computer_use.profiles.max_bytes': tomlNum(tables, 'computer_use.profiles', 'max_bytes', 64 * 1024 * 1024),
     'computer_use.profiles.retention_days': tomlNum(tables, 'computer_use.profiles', 'retention_days', 30),
     'memory.supersession_trust_guard': tomlBool(tables, 'memory', 'supersession_trust_guard', true),
@@ -324,6 +327,10 @@ export function SystemTab() {
       extra,
     });
     const payload = changedPayload(initialRef.current, current);
+    if (extra['computer_use.local_browser.enabled'] === true && initialRef.current['computer_use.local_browser.enabled'] !== true && extra.ack_local_browser_risks !== true) {
+      toast.error(intl.formatMessage({ id: 'localBrowser.riskAck' }));
+      return;
+    }
     if (authToken.trim() !== '') payload.auth_token = authToken.trim();
     const smSecrets: Record<string, string> = {};
     if (vaultToken.trim() !== '') smSecrets.vault_token = vaultToken.trim();
@@ -582,7 +589,7 @@ export function SystemTab() {
       <FilesRootsSection values={extra} set={setExtraKey} />
 
       {/* v1.68 (W2) — task sandbox + computer-use image */}
-      <SandboxSection values={extra} set={setExtraKey} />
+      <SandboxSection values={extra} set={setExtraKey} isAdmin={isAdmin} />
 
       {/* S20 — Telegram Mini App approval screen. Off by default; needs an
           https dashboard URL to render a button at all. */}

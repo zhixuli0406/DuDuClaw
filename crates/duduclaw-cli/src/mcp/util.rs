@@ -63,7 +63,9 @@ pub(crate) fn count_existing_agents(home_dir: &Path) -> usize {
 /// see `AgentRegistry::scan`) or the delegation `name → dir` resolver pick one
 /// of the two silently, mis-routing delegation/channel traffic to the wrong
 /// agent. One directory scan, not per-check re-reads.
-pub(crate) fn collect_existing_agent_identifiers(home_dir: &Path) -> std::collections::HashSet<String> {
+pub(crate) fn collect_existing_agent_identifiers(
+    home_dir: &Path,
+) -> std::collections::HashSet<String> {
     let mut ids = std::collections::HashSet::new();
     let entries = match std::fs::read_dir(home_dir.join("agents")) {
         Ok(e) => e,
@@ -266,19 +268,42 @@ pub(crate) fn extract_tool_result_text(result: &Value) -> Option<String> {
         Some(parts.join("\n"))
     }
 }
+pub(crate) fn audit_safe_result_text(tool_name: &str, result: &Value) -> Option<String> {
+    if tool_name == "computer_key"
+        || duduclaw_core::grounding::is_self_echo_tool(tool_name)
+        || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
+    {
+        None
+    } else {
+        extract_tool_result_text(result)
+    }
+}
+pub(crate) fn audit_safe_denial_detail<'a>(tool_name: &str, detail: &'a str) -> &'a str {
+    if tool_name == "computer_key" {
+        "keypress action refused"
+    } else {
+        detail
+    }
+}
 
 /// Build a short summary of tool call parameters for audit logging.
 /// Avoids logging full payloads (which may contain sensitive data).
 /// The tool arguments as they may be written to an audit row. `computer_type`
 /// is reduced to `{"chars": n}`: the text typed inside the computer-use
 /// container (a password, say) must never reach `tool_calls.jsonl`, from
-/// where the recent-actions feed can replay it into prompts. Every other
-/// tool's arguments are returned unchanged (`computer_key` carries a key
-/// name, which is fine).
+/// where the recent-actions feed can replay it into prompts.
+/// `computer_key` always keeps metadata only, including malformed requests:
+/// a rejected key or its echoed error may contain private text. Do not infer
+/// the active backend from mutable configuration while writing this audit.
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
     match tool_name {
+        "computer_key" => serde_json::json!({"action":"keypress"}),
         "computer_type" => {
-            let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
+            let chars = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|t| t.chars().count())
+                .unwrap_or(0);
             serde_json::json!({ "chars": chars })
         }
         "computer_navigate" => {
@@ -298,10 +323,14 @@ pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
 /// string (tokens, search terms) and the path itself never reach
 /// `tool_calls.jsonl`. An unparseable URL gives `None` / 0.
 fn navigate_url_summary(args: &Value) -> (Option<String>, usize) {
-    let parsed = args.get("url").and_then(|v| v.as_str()).and_then(|u| reqwest::Url::parse(u).ok());
+    let parsed = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .and_then(|u| reqwest::Url::parse(u).ok());
     match parsed {
         Some(url) => (
-            url.host_str().map(|h| duduclaw_core::truncate_chars(h, 80).to_string()),
+            url.host_str()
+                .map(|h| duduclaw_core::truncate_chars(h, 80).to_string()),
             url.path().len(),
         ),
         None => (None, 0),
@@ -311,12 +340,23 @@ fn navigate_url_summary(args: &Value) -> (Option<String>, usize) {
 /// A workspace tool's arguments reduced to the workspace id, the first 16
 /// hex of the path's sha256 and the content length in characters.
 fn workspace_args_summary(args: &Value) -> (String, String, usize) {
-    let ws = args.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+    let ws = args
+        .get("workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     // Same hash as the gateway's browser audit (NFC, then sha256).
     let hash = duduclaw_core::workspace_path::workspace_path_hash(path);
-    let chars = args.get("content").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
-    (duduclaw_core::truncate_chars(ws, 40).to_string(), hash[..16].to_string(), chars)
+    let chars = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(|t| t.chars().count())
+        .unwrap_or(0);
+    (
+        duduclaw_core::truncate_chars(ws, 40).to_string(),
+        hash[..16].to_string(),
+        chars,
+    )
 }
 
 pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
@@ -333,20 +373,27 @@ pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
             format!("x={} y={}", n("x"), n("y"))
         }
         "computer_type" => {
-            let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
+            let chars = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|t| t.chars().count())
+                .unwrap_or(0);
             format!("chars={chars}")
         }
-        "computer_key" => {
-            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            format!("key={}", duduclaw_core::truncate_chars(key, 32))
-        }
+        "computer_key" => "keypress action".into(),
         "computer_screenshot" => "screenshot".to_string(),
         "computer_navigate" => {
             let (host, path_len) = navigate_url_summary(args);
-            format!("host={} path_len={path_len}", host.as_deref().unwrap_or("?"))
+            format!(
+                "host={} path_len={path_len}",
+                host.as_deref().unwrap_or("?")
+            )
         }
         "computer_session_start" | "computer_session_stop" => {
-            let id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             format!("session_id={}", duduclaw_core::truncate_chars(id, 64))
         }
         "create_agent" => {
@@ -430,12 +477,74 @@ mod computer_navigate_audit_tests {
     fn navigate_audit_keeps_host_and_path_length_only() {
         let args = serde_json::json!({"url": "https://Example.com/a/b?token=secret#frag"});
         let safe = audit_safe_arguments("computer_navigate", &args);
-        assert_eq!(safe, serde_json::json!({"host": "example.com", "path_len": 4}));
+        assert_eq!(
+            safe,
+            serde_json::json!({"host": "example.com", "path_len": 4})
+        );
         let summary = build_params_summary("computer_navigate", &args);
         assert_eq!(summary, "host=example.com path_len=4");
         assert!(!safe.to_string().contains("secret") && !summary.contains("secret"));
         let bad = serde_json::json!({"url": "not a url"});
-        assert_eq!(audit_safe_arguments("computer_navigate", &bad), serde_json::json!({"host": null, "path_len": 0}));
-        assert_eq!(build_params_summary("computer_navigate", &bad), "host=? path_len=0");
+        assert_eq!(
+            audit_safe_arguments("computer_navigate", &bad),
+            serde_json::json!({"host": null, "path_len": 0})
+        );
+        assert_eq!(
+            build_params_summary("computer_navigate", &bad),
+            "host=? path_len=0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod computer_key_audit_tests {
+    use super::*;
+    #[test]
+    fn computer_key_success_and_error_results_never_persist_key_payloads() {
+        for success in [true, false] {
+            for key in ["PRIVATE SENTINEL FOR LOCAL AUDIT", "Return"] {
+                let root = tempfile::tempdir().unwrap();
+                let args =
+                    serde_json::json!({"key":key,"unexpected":"PRIVATE SENTINEL FOR LOCAL AUDIT"});
+                let result = serde_json::json!({"content":[{"type":"text","text":format!("key outcome: {key}")}],"isError":!success});
+                let safe = audit_safe_arguments("computer_key", &args);
+                let text = audit_safe_result_text("computer_key", &result);
+                duduclaw_security::audit::append_tool_call_with_input(
+                    root.path(),
+                    "alice",
+                    "computer_key",
+                    &build_params_summary("computer_key", &args),
+                    success,
+                    Some(&safe),
+                    text.as_deref(),
+                );
+                let saved = std::fs::read_to_string(root.path().join("tool_calls.jsonl")).unwrap();
+                assert!(
+                    !saved.contains("PRIVATE SENTINEL") && !saved.contains("Return"),
+                    "success={success}: {saved}"
+                );
+                let row: Value = serde_json::from_str(saved.lines().next().unwrap()).unwrap();
+                assert_eq!(row["tool_name"], "computer_key");
+                assert_eq!(row["success"], success);
+            }
+        }
+    }
+    #[test]
+    fn computer_key_guard_denial_never_persists_rejected_key_or_error_echo() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "PRIVATE SENTINEL FOR LOCAL AUDIT";
+        let safe = audit_safe_arguments("computer_key", &serde_json::json!({"key":key}));
+        let detail = format!("invalid key: {key}");
+        duduclaw_security::audit::append_tool_call_denied(
+            root.path(),
+            "alice",
+            "computer_key",
+            "invalid_key",
+            audit_safe_denial_detail("computer_key", &detail),
+            Some(&safe),
+        );
+        let saved = std::fs::read_to_string(root.path().join("tool_calls.jsonl")).unwrap();
+        assert!(!saved.contains("PRIVATE SENTINEL"), "{saved}");
+        assert!(saved.contains("computer_key") && saved.contains("invalid_key"));
     }
 }

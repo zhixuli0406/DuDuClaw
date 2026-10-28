@@ -321,3 +321,7 @@ Four guards with stated failure modes beat a three-layer story with no code behi
 ## Durable channel decisions
 
 High-risk Computer Use confirmations use the inbound account and exact conversation/thread. Reply with `確認 <full UUID>` or `取消 <full UUID>`; questions use `回答 <full UUID> <answer>` and never grant tool permission. Bare yes/A/B cannot select a request. Before execution, the host rechecks the live screen, title, policy and cancellation gates. Restart invalidates old GUI approvals instead of replaying coordinates; an execution without a receipt becomes `uncertain` and requires Admin reconciliation. See the [decision guide](../guides/durable-channel-decisions.md) for the exact supported inbound routes and current limitations.
+
+## Dedicated local browser (macOS, off by default)
+
+An Admin can enable the dedicated local browser in both system and employee settings. It requires the local desktop app, a live human conversation, native presence and approval for each state-changing step. Dashboard accounts have status and stop only. It never imports the normal browser profile or falls back to a different target. See [setup, restrictions and verification boundaries](../guides/local-browser.md).

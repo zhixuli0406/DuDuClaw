@@ -285,3 +285,7 @@ A person resumes it from the Computer tab (**Resume**, audited `injection_resume
 - Keep-alive, takeover and the viewer count live in the gateway process: a gateway restart ends sessions as before.
 - Both settings are on the employee edit page (computer-use section, Admin only, through `agents.update`): keep-alive 0–240 minutes, takeover idle limit 1–60 minutes; the server refuses any other value or type.
 
+
+## Dedicated local browser (macOS, off by default)
+
+An Admin can enable the dedicated local browser in both system and employee settings. It requires the local desktop app, a live human conversation, native presence and approval for each state-changing step. Dashboard accounts have status and stop only. It never imports the normal browser profile or falls back to a different target. See [setup, restrictions and verification boundaries](../guides/local-browser.md).

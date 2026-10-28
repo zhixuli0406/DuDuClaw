@@ -258,10 +258,15 @@ pub(crate) fn target_for(
 
 /// A verified inbound human message is still live for this exact employee and
 /// turn. Principal/transport context alone never establishes this proof.
-pub(crate) fn attended_live_for(agent_id:&str,turn_id:&str)->bool {
-    if !valid_turn_id(turn_id) {return false;}
-    registry().lock().unwrap_or_else(|p|p.into_inner())
-        .get(&(agent_id.into(),turn_id.into())).and_then(|list|list.last())
-        .and_then(|(_,_,_,_,proof)|proof.as_ref())
-        .is_some_and(|proof|proof.valid_for(agent_id,turn_id))
+pub(crate) fn attended_live_for(agent_id: &str, turn_id: &str) -> bool {
+    if !valid_turn_id(turn_id) {
+        return false;
+    }
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(agent_id.into(), turn_id.into()))
+        .and_then(|list| list.last())
+        .and_then(|(_, _, _, _, proof)| proof.as_ref())
+        .is_some_and(|proof| proof.valid_for(agent_id, turn_id))
 }

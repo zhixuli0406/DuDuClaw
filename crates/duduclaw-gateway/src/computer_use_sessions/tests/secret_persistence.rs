@@ -195,9 +195,11 @@ async fn bt5_type_deny_approve_signed_routes_never_persist_plaintext_in_live_med
         // observed while live, rather than silently skipped after final close.
         let broker = crate::approval::ApprovalBroker::open(h).unwrap();
         let conn = rusqlite::Connection::open(h.join("approvals.db")).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL;
-            PRAGMA wal_autocheckpoint=0;")
-            .unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;",
+        )
+        .unwrap();
         let handler = crate::handlers::MethodHandler::new(h.to_path_buf()).await;
         let router = http::router(mgr.clone());
         for (turn, expected) in [("no", false), ("yes", true)] {
@@ -277,8 +279,10 @@ async fn bt5_type_deny_approve_signed_routes_never_persist_plaintext_in_live_med
         let reopened = rusqlite::Connection::open(h.join("approvals.db")).unwrap();
         // Reading a WAL database establishes its real sidecars again.
         reopened
-            .execute_batch("PRAGMA journal_mode=WAL;
-                SELECT count(*) FROM approvals;")
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                SELECT count(*) FROM approvals;",
+            )
             .unwrap();
         scan_database(&reopened, h, &marker);
         let logs = capture.0.lock().unwrap();

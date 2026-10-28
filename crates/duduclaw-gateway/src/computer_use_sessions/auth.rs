@@ -92,11 +92,17 @@ pub struct Authenticated {
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty())
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    s.len() == len
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 /// Check 1 alone (before the body is read).
@@ -131,7 +137,9 @@ pub fn authenticate(
     if !duduclaw_core::is_valid_agent_id(agent_id) {
         return Err(AuthFailure::InvalidAgentId);
     }
-    let ts_ok = !timestamp.is_empty() && timestamp.len() <= 20 && timestamp.bytes().all(|c| c.is_ascii_digit());
+    let ts_ok = !timestamp.is_empty()
+        && timestamp.len() <= 20
+        && timestamp.bytes().all(|c| c.is_ascii_digit());
     if !ts_ok || !is_lower_hex(nonce, 32) || !is_lower_hex(signature, 64) {
         return Err(AuthFailure::MalformedHeaders);
     }
@@ -146,21 +154,26 @@ pub fn authenticate(
     };
     let agent_token = duduclaw_core::mint_identity_token(&identity_key, agent_id);
     // Every valid internal key is tried, without early exit.
-    let verified = crate::mcp_internal_key::valid_internal_keys(home).iter().fold(false, |ok, key| {
-        ok | duduclaw_core::verify_internal_request_signature(
-            key.as_bytes(),
-            agent_id,
-            &agent_token,
-            timestamp,
-            nonce,
-            body,
-            signature,
-        )
-    });
+    let verified = crate::mcp_internal_key::valid_internal_keys(home)
+        .iter()
+        .fold(false, |ok, key| {
+            ok | duduclaw_core::verify_internal_request_signature(
+                key.as_bytes(),
+                agent_id,
+                &agent_token,
+                timestamp,
+                nonce,
+                body,
+                signature,
+            )
+        });
     if !verified {
         return Err(AuthFailure::BadSignature);
     }
-    Ok(Authenticated { agent_id: agent_id.to_string(), nonce: nonce.to_string() })
+    Ok(Authenticated {
+        agent_id: agent_id.to_string(),
+        nonce: nonce.to_string(),
+    })
 }
 
 /// Nonces of authenticated requests seen within [`NONCE_WINDOW`].
@@ -195,9 +208,15 @@ impl RateLimiter {
     pub fn allow(&self, agent_id: &str, now: Instant) -> bool {
         let mut hits = self.hits.lock().unwrap_or_else(|p| p.into_inner());
         // Drop employees whose window emptied, so the map stays bounded.
-        hits.retain(|_, q| q.back().is_some_and(|t| now.duration_since(*t) < RATE_WINDOW));
+        hits.retain(|_, q| {
+            q.back()
+                .is_some_and(|t| now.duration_since(*t) < RATE_WINDOW)
+        });
         let queue = hits.entry(agent_id.to_string()).or_default();
-        while queue.front().is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW) {
+        while queue
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
+        {
             queue.pop_front();
         }
         if queue.len() >= RATE_LIMIT_PER_MINUTE {

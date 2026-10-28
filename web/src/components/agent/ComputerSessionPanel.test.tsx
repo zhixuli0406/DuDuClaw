@@ -61,6 +61,14 @@ beforeEach(() => {
 });
 
 describe('ComputerSessionPanel', () => {
+  it('shows only status and stop for a local browser even if a response advertises a stream', async () => {
+    respond({ 'computer_sessions.status': { ...RUNNING, target: 'local_browser' } });
+    renderPanel();
+    expect(await screen.findByText(/Only status and stop/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Watch|Take over|Resume/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Stop session$/ })).toBeInTheDocument();
+    expect(screen.queryByTestId('viewer')).not.toBeInTheDocument();
+  });
   it('shows the empty state when no session runs', async () => {
     respond({ 'computer_sessions.status': { ok: true, active: false } });
     renderPanel();

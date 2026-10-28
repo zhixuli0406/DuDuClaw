@@ -28,6 +28,7 @@ export type ComputerSessionStatus =
   | {
       ok: true;
       active: true;
+      target?: 'container' | 'local_browser';
       session_id: string;
       state: 'running' | 'paused';
       actions_used: number;

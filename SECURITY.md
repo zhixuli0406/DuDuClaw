@@ -74,6 +74,29 @@ The following are in scope for security reports:
 
 ## Security Architecture
 
+### Dedicated local browser (unreleased, validation in progress)
+
+The optional macOS local-browser target uses a fixed, separate Chrome/Edge
+profile and inherited CDP pipes. Both Admin switches default off. A live host
+caller proof and the paired native desktop app are required; an inherited turn,
+human principal, dashboard JWT or remote account cannot authorize local input.
+Dashboard access is limited to status and stop. Decisions come from native
+dialogs, with signed, replay-checked loopback messages and OS Keychain storage.
+Local page images stay in memory and are not saved in the browser audit.
+
+The dedicated profile forces `Default`, resets per-origin permission grants,
+denies file-system access, disables WebRTC UDP bypass, and is excluded from
+product backups and exports. Browser network traffic uses a session-authenticated
+CONNECT proxy restricted to exact allowlisted public hosts and pinned IPs.
+These controls do not create a separate OS identity or VM. Unrestricted code
+running as the same OS user can bypass application controls. Third-party headed
+Playwright servers are outside these controls and are reported by doctor.
+
+Native spike evidence does not establish full backend/app acceptance. Physical
+screen-lock behavior, real provider sign-in, final independent security review
+and release approval remain separate gates. Windows and Linux explicitly refuse
+the local target; no TCP CDP or removed desktop-native fallback is supported.
+
 DuDuClaw implements defense in depth. Each layer below is what the code does today:
 
 - **Layer 1**: Input Guard — prompt-injection scanner (`duduclaw-security/src/input_guard.rs`): 11 rule categories, risk score 0-100, blocks at 60 or above (a few categories block instantly). Runs on inbound chat messages, at the MCP dispatch front door, in conversation/profile/knowledge distillation (dropped on any rule match), on `user_profile_record`, Agent Mail (flagged), reminders, `migrate from` imports and expert-pack installs. Since v1.67.1 Chinese instruction override is matched as a phrase shape (override verb + scope word + instruction noun within one clause, 12 characters) instead of four exact strings, which released versions let through when a word was inserted; this also blocks some ordinary sentences of the same shape (see [docs/features/05-security-defense.md](docs/features/05-security-defense.md))

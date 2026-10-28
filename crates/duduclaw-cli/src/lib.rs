@@ -10076,6 +10076,8 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4b-3: durable computer-use workspaces (P2-C).
     checks.push(computer_workspaces_check(&home).await);
     checks.push(computer_profiles_check(&home));
+    let (level,detail)=duduclaw_gateway::computer_use_sessions::local_browser_doctor(&home).await;
+    checks.push(("本機瀏覽器".into(),match level {duduclaw_gateway::task_sandbox::doctor::Level::Pass=>CheckStatus::Pass,duduclaw_gateway::task_sandbox::doctor::Level::Warn=>CheckStatus::Warn},detail));
 
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);

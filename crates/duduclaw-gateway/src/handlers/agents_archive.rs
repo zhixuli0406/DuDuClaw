@@ -74,7 +74,12 @@ impl MethodHandler {
     /// Set `status` **and** flip the freeze kill-switch (`heartbeat.enabled` /
     /// `evolution.enabled = false`) in one atomic `agent.toml` write. Shared by
     /// archive + soft-delete so an off-boarded agent never keeps ticking.
-    pub(crate) async fn offboard_agent_toml(&self, agent_id: &str, status: &str) -> Result<(), String> {
+    pub(crate) async fn offboard_agent_toml(
+        &self,
+        agent_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        crate::computer_use_sessions::invalidate_local_browser_owner(&self.home_dir, agent_id)?;
         let status = status.to_string();
         self.update_agent_toml(agent_id, move |table| offboard_freeze_table(table, &status))
             .await?;
@@ -410,7 +415,11 @@ impl MethodHandler {
 
     /// Merge `agents/<from>/wiki` into `agents/<to>/wiki`. Filename collisions
     /// get a numeric suffix (never overwrite). Returns the number of files moved.
-    pub(crate) async fn handoff_wiki(&self, from_agent: &str, to_agent: &str) -> Result<u64, String> {
+    pub(crate) async fn handoff_wiki(
+        &self,
+        from_agent: &str,
+        to_agent: &str,
+    ) -> Result<u64, String> {
         let agents_dir = self.home_dir.join("agents");
         let from_wiki = agents_dir.join(from_agent).join("wiki");
         if !from_wiki.exists() {

@@ -1954,6 +1954,10 @@ pub struct ComputerUseCapConfig {
     /// `[computer_use.profiles] enabled` switch is also on. Default off.
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub persist_login: bool,
+    /// Dedicated local browser, also requiring the Admin gateway switch and
+    /// an authenticated native companion. Wrong-typed/missing remains off.
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub local_browser: bool,
     /// Keep an idle tool-driven session for this many minutes with its
     /// container paused (`docker pause`) instead of ending it after the
     /// idle timeout; resumed on the next tool call or dashboard viewer.
@@ -2075,6 +2079,7 @@ impl Default for ComputerUseCapConfig {
             allowed_domains: Vec::new(),
             workspace: false,
             persist_login: false,
+            local_browser: false,
             keep_alive_minutes: 0,
             takeover_idle_minutes: 0,
         }

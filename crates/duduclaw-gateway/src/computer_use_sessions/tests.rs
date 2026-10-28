@@ -109,6 +109,9 @@ fn loopback() -> SocketAddr {
 
 #[derive(Default)]
 struct FakeState {
+    observed_attendance: Mutex<Vec<bool>>,
+    observed_action_turn: Mutex<Vec<Option<String>>>,
+    local_target: AtomicBool,
     executed: Mutex<Vec<ComputerAction>>,
     stops: AtomicU32,
     starts: AtomicU32,
@@ -136,6 +139,11 @@ struct FakeState {
     fail_vnc: AtomicBool,
     owner_changed: AtomicBool,
     login_discarded: AtomicBool,
+    native_review_approved: AtomicBool,
+    read_consent: Arc<local_browser::consent::ReadConsent>,
+    start_delay_ms: std::sync::atomic::AtomicU64,
+    start_human: Mutex<Vec<bool>>,
+    normal_local_exit: AtomicBool,
 }
 
 /// The fake container access a viewer gets.
@@ -171,7 +179,36 @@ struct FakeBackend {
 
 #[async_trait]
 impl SessionBackend for FakeBackend {
+    fn normal_local_exit(&self) -> bool {
+        self.state.normal_local_exit.load(Ordering::Acquire)
+    }
+    fn local_read_consent(&self) -> Option<Arc<local_browser::consent::ReadConsent>> {
+        Some(self.state.read_consent.clone())
+    }
+    async fn native_review(&self, _action: Value) -> Result<(), String> {
+        if self.state.native_review_approved.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err("synthetic native refusal".into())
+        }
+    }
+    fn target(&self) -> SessionTarget {
+        if self.state.local_target.load(Ordering::Acquire) {
+            SessionTarget::LocalBrowser
+        } else {
+            SessionTarget::Container
+        }
+    }
     async fn start(&mut self) -> Result<(), ComputerUseError> {
+        self.state
+            .start_human
+            .lock()
+            .unwrap()
+            .push(attended_call::current("alice"));
+        let delay = self.state.start_delay_ms.load(Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.state.fail_start.load(Ordering::SeqCst) {
             return Err(ComputerUseError::ApiError(
                 "docker said: secret /path".into(),
@@ -191,8 +228,19 @@ impl SessionBackend for FakeBackend {
         self.state.stops.fetch_add(1, Ordering::SeqCst);
     }
     async fn screenshot(&self) -> Result<MaskedScreenshot, ComputerUseError> {
+        self.state
+            .observed_attendance
+            .lock()
+            .unwrap()
+            .push(attended_call::current("alice"));
         Ok(MaskedScreenshot {
-            png_base64: self.state.frame.lock().unwrap().clone().unwrap_or_else(tiny_png_b64),
+            png_base64: self
+                .state
+                .frame
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(tiny_png_b64),
             full_mask: *self.state.full_mask.lock().unwrap(),
         })
     }
@@ -205,6 +253,11 @@ impl SessionBackend for FakeBackend {
             .unwrap_or_else(|| Ok("about:blank - Chromium".to_string()))
     }
     async fn execute(&self, action: &ComputerAction) -> Result<(), ComputerUseError> {
+        self.state
+            .observed_action_turn
+            .lock()
+            .unwrap()
+            .push(attended_call::current_turn("alice"));
         self.state.executed.lock().unwrap().push(action.clone());
         Ok(())
     }
@@ -369,7 +422,21 @@ fn insert_session(
         deadline: now + Duration::from_secs(600),
         actions_used: 0,
         last_activity: now,
-        shared: Arc::new(SessionShared::default()),
+        shared: Arc::new(SessionShared {
+            target: if state.local_target.load(Ordering::Acquire) {
+                SessionTarget::LocalBrowser
+            } else {
+                SessionTarget::Container
+            },
+            native_controller_heartbeat: std::sync::Mutex::new(
+                if state.local_target.load(Ordering::Acquire) {
+                    Some(now)
+                } else {
+                    None
+                },
+            ),
+            ..Default::default()
+        }),
         ended: false,
         nav_hosts: Vec::new(),
         nav_configured: false,
@@ -2588,6 +2655,10 @@ mod secret_persistence;
 #[path = "tests/workspace_cases.rs"]
 mod workspace_cases;
 
+#[path = "tests/attended_call.rs"]
+mod attended_call_cases;
+#[path = "tests/local_cases.rs"]
+mod local_cases;
 #[path = "tests/on_behalf_of.rs"]
 mod on_behalf_of;
 
@@ -2613,13 +2684,35 @@ async fn action_rules_block_and_ask_computer_tools_like_the_mcp_gate() {
          action_rules = [{ tool = \"computer_click\", verdict = \"block\" }, \
          { effect = \"modify\", verdict = \"ask\" }]\n",
     );
-    let err = gates::tool_gates(tmp.path(), "alice", gates::TOOL_CLICK).await.unwrap_err();
+    let err = gates::tool_gates(tmp.path(), "alice", gates::TOOL_CLICK)
+        .await
+        .unwrap_err();
     assert!(err.message.contains("action_rules"), "{}", err.message);
     // Reads pass both gates; a modify tool passes `tool_gates` but needs a person.
-    assert!(gates::tool_gates(tmp.path(), "alice", gates::TOOL_SCREENSHOT).await.is_ok());
-    assert!(!gates::approval_required(tmp.path(), "alice", gates::TOOL_SCREENSHOT));
-    assert!(gates::tool_gates(tmp.path(), "alice", gates::TOOL_TYPE).await.is_ok());
-    assert!(gates::approval_required(tmp.path(), "alice", gates::TOOL_TYPE));
+    assert!(
+        gates::tool_gates(tmp.path(), "alice", gates::TOOL_SCREENSHOT)
+            .await
+            .is_ok()
+    );
+    assert!(!gates::approval_required(
+        tmp.path(),
+        "alice",
+        gates::TOOL_SCREENSHOT
+    ));
+    assert!(
+        gates::tool_gates(tmp.path(), "alice", gates::TOOL_TYPE)
+            .await
+            .is_ok()
+    );
+    assert!(gates::approval_required(
+        tmp.path(),
+        "alice",
+        gates::TOOL_TYPE
+    ));
     // No rules: unchanged.
-    assert!(!gates::approval_required(tmp.path(), "bob", gates::TOOL_TYPE));
+    assert!(!gates::approval_required(
+        tmp.path(),
+        "bob",
+        gates::TOOL_TYPE
+    ));
 }

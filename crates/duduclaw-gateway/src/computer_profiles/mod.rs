@@ -156,7 +156,7 @@ fn lock_profile(_home: &Path, _agent: &str) -> Result<std::fs::File, String> {
     Err("browser login persistence is unavailable on this platform".into())
 }
 
-fn owners(home: &Path, agent: &str) -> Result<Option<Vec<(String, String)>>, String> {
+pub(crate) fn owners(home: &Path, agent: &str) -> Result<Option<Vec<(String, String)>>, String> {
     let path = home.join("users.db");
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),

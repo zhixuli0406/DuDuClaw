@@ -7,7 +7,13 @@
     "mascot"
   ],
   "permissions": [
-    "core:default",
+    "core:app:default",
+    "core:event:default",
+    "core:image:default",
+    "core:path:default",
+    "core:resources:default",
+    "core:webview:default",
+    "core:window:default",
     "core:window:allow-show",
     "core:window:allow-hide",
     "core:window:allow-set-focus",

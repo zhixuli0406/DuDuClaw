@@ -14,9 +14,34 @@ use crate::computer_use_orchestrator::{
     OrchestratorControl,
 };
 
+/// Fixed at admission and copied into SessionShared before publication.
+/// Remote page-read policy must use this marker, never a mutable capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTarget {
+    #[default]
+    Container,
+    LocalBrowser,
+}
+
 /// One session's container. Production: [`OrchestratorBackend`].
 #[async_trait]
 pub(crate) trait SessionBackend: Send + Sync {
+    fn target(&self) -> SessionTarget {
+        SessionTarget::Container
+    }
+    /// Only the paired native app can decide a local policy escalation.
+    /// Container/fake backends cannot accidentally approve through this lane.
+    async fn native_review(&self, _action: serde_json::Value) -> Result<(), String> {
+        Err("native approval unavailable".into())
+    }
+    fn local_read_consent(&self) -> Option<Arc<super::local_browser::consent::ReadConsent>> {
+        None
+    }
+    /// Host-owned termination observation, never a request/body field.
+    fn normal_local_exit(&self) -> bool {
+        false
+    }
     /// Start the container and wait for its display.
     async fn start(&mut self) -> Result<(), ComputerUseError>;
     /// Register the control handle in the global registry (5-session cap,
@@ -33,7 +58,9 @@ pub(crate) trait SessionBackend: Send + Sync {
     async fn execute(&self, action: &ComputerAction) -> Result<(), ComputerUseError>;
     /// Open an already-validated `https://` URL in the container's browser.
     async fn navigate(&self, _url: &str) -> Result<NavigateOutcome, ComputerUseError> {
-        Err(ComputerUseError::ApiError("navigation not supported".into()))
+        Err(ComputerUseError::ApiError(
+            "navigation not supported".into(),
+        ))
     }
     /// Pause the container (keep-alive). Default: unsupported.
     async fn freeze(&self) -> Result<(), ComputerUseError> {

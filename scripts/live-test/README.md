@@ -72,6 +72,44 @@ external services (Drive, Gmail, Calendar, web)" into it. The generated
 `SOUL.md` and `CONTRACT.toml` say this too, but a contract line is not a
 technical block.
 
+## Dedicated local-browser backend fixture (macOS, review required)
+
+`local-browser-backend-native.mjs` runs one exact ignored gateway test from this
+worktree's freshly built test binary. It requires the binary's SHA256 and
+`--run-reviewed-native`; execute it only after independent review of the frozen
+launcher, cleanup helper and matching Rust test source. The original
+`local-browser-spike.mjs` is a separate lower-level spike and its result is not
+product acceptance.
+
+```bash
+node scripts/live-test/local-browser-backend-native.mjs \
+  --run-reviewed-native --test-binary /absolute/worktree/target/debug/deps/duduclaw_gateway-HASH \
+  --sha256 EXACT_TEST_BINARY_SHA256
+```
+
+The launcher creates a new `ddc-b9b-native-*` home, sets a minimal environment
+from its first subprocess, and records PID/birth/executable ownership before
+fallible CDP operations. Chrome retains its native sandbox; mock Keychain and
+synthetic page fulfillment exist only under `cfg(test)`. The native app key,
+presence and human ingress are synthetic fixtures, while the backend, Chrome,
+profile, pipe, masking and network guards run real code. No real account or OS
+Keychain is used. This is native-host trust, not an extra OS sandbox or VM.
+The machine-wide lease logic also runs, but `cfg(test)` routes its file to
+`<fresh-home>/owned-machine-lease.lock` after checking the canonical owned
+root and marker. Neither a dirty/unknown fixture cleanup nor a fault injection
+may dirty the user's real UID lease. PASS requires that exact owned file to
+exist safely and be clear after verified product cleanup; fallback cleanup
+never clears the barrier or converts the run to PASS.
+
+The result is written after bounded child cleanup and browser ownership checks.
+A missing inventory, fallback cleanup, unknown surviving child, signal, test
+failure or evidence-write failure cannot produce PASS. Artifacts remain in the
+new home. Physical screen-lock behavior, a signed Tauri app, actual native
+approval gestures, provider sign-in and release approval remain separate gates.
+
+Pure cleanup-policy regressions (no browser or process signals):
+`python3 scripts/live-test/local-browser-native-cleanup.test.py`.
+
 ## Cleanup
 
 ```bash

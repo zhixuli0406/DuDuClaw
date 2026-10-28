@@ -106,8 +106,11 @@ impl MethodHandler {
         // Argon2 + SQLite: off the runtime workers.
         let created = {
             let db = db.clone();
-            let (email, display_name, password) =
-                (email.to_string(), display_name.to_string(), password.to_string());
+            let (email, display_name, password) = (
+                email.to_string(),
+                display_name.to_string(),
+                password.to_string(),
+            );
             let (department, manager) = (department.map(str::to_string), manager.clone());
             tokio::task::spawn_blocking(move || {
                 db.create_user_with(&duduclaw_auth::NewUser {
@@ -237,7 +240,10 @@ impl MethodHandler {
                         Some(&ctx.user_id),
                         "user.set_manager",
                         Some(user_id),
-                        Some(&format!("manager={}", manager_change.target().unwrap_or("none"))),
+                        Some(&format!(
+                            "manager={}",
+                            manager_change.target().unwrap_or("none")
+                        )),
                         None,
                     );
                 }
@@ -278,7 +284,11 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_users_bind_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_users_bind_agent(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -312,6 +322,14 @@ impl MethodHandler {
             Ok(value) => value == Some(AccessLevel::Owner),
             Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
         };
+        if (was_owner || access_level == AccessLevel::Owner)
+            && let Err(error) = crate::computer_use_sessions::invalidate_local_browser_owner(
+                &self.home_dir,
+                agent_name,
+            )
+        {
+            return WsFrame::error_response("", &error);
+        }
         match db.bind_agent(user_id, agent_name, access_level) {
             Ok(()) => {
                 if was_owner || access_level == AccessLevel::Owner {
@@ -338,7 +356,11 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_users_unbind_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_users_unbind_agent(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -357,6 +379,14 @@ impl MethodHandler {
             Ok(value) => value == Some(AccessLevel::Owner),
             Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
         };
+        if was_owner
+            && let Err(error) = crate::computer_use_sessions::invalidate_local_browser_owner(
+                &self.home_dir,
+                agent_name,
+            )
+        {
+            return WsFrame::error_response("", &error);
+        }
         match db.unbind_agent(user_id, agent_name) {
             Ok(()) => {
                 if was_owner {
@@ -523,7 +553,11 @@ impl MethodHandler {
     /// required unless [`Self::email_setup_state`] says otherwise. The caller's
     /// tokens keep the old email until refreshed; the dashboard refreshes them
     /// right after.
-    pub(crate) async fn handle_users_change_email(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_users_change_email(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -582,7 +616,11 @@ impl MethodHandler {
     /// account (identified by `ctx.user_id`). Verifies the current password
     /// first, unless [`Self::email_setup_state`] says none is needed; on
     /// success `update_user` also clears any `must_change_password`.
-    pub(crate) async fn handle_users_change_password(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_users_change_password(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -631,7 +669,11 @@ impl MethodHandler {
             Ok(()) => {
                 let _ = db.log_action(
                     Some(&ctx.user_id),
-                    if password_required { "password.change" } else { "password.set_local_owner" },
+                    if password_required {
+                        "password.change"
+                    } else {
+                        "password.set_local_owner"
+                    },
                     Some(&ctx.user_id),
                     None,
                     None,

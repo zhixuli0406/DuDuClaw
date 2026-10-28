@@ -780,7 +780,8 @@ fn listed_for_gate() -> Vec<sweep::Listed> {
     let orphan = format!("duduclaw-cu-{}", "c".repeat(32));
     let ws_name = format!("duduclaw-cu-{}", "b".repeat(32));
     let ws = "ws-0123456789abcdef0123456789abcdef";
-    let text = format!("{id}|{orphan}|exited|9999999999||\n{id}|{ws_name}|running|9999999999|{ws}|4\n");
+    let text =
+        format!("{id}|{orphan}|exited|9999999999||\n{id}|{ws_name}|running|9999999999|{ws}|4\n");
     sweep::parse_listing(&text).unwrap()
 }
 

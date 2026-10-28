@@ -488,3 +488,7 @@ new table is [deprecations.md](deprecations.md). No MCP tool is deprecated at th
 - [../spec/reversible-context-ccr.md](../spec/reversible-context-ccr.md) — the
   `duduclaw_ccr_*` tools, which are injected by the direct-API tool loop rather
   than dispatched by the MCP server
+
+## Dedicated local browser (macOS, off by default)
+
+An Admin can enable the dedicated local browser in both system and employee settings. It requires the local desktop app, a live human conversation, native presence and approval for each state-changing step. Dashboard accounts have status and stop only. It never imports the normal browser profile or falls back to a different target. See [setup, restrictions and verification boundaries](local-browser.md).

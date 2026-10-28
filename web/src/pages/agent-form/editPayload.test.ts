@@ -57,6 +57,11 @@ function state(over: Partial<EditFormState> = {}): EditFormState {
 }
 
 describe('buildUpdatePayload — only dirty fields are sent', () => {
+  it('preserves the explicit local-browser capability without adding other settings', () => {
+    const result=buildUpdatePayload(state({ caps: { ...DEFAULT_CAPABILITIES, computer_use_config: { ...DEFAULT_CAPABILITIES.computer_use_config, local_browser: true } } }),new Set(['caps.computer_use_config.local_browser']),CTX);
+    expect(result.payload).toEqual({ capabilities: { computer_use_config: { local_browser: true } } });
+    expect(isAdminOnlyPath('caps.computer_use_config.local_browser',null)).toBe(true);
+  });
   it('sends nothing when nothing is dirty', () => {
     const r = buildUpdatePayload(state(), new Set(), CTX);
     expect(r.hasChanges).toBe(false);

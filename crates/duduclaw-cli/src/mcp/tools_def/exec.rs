@@ -162,6 +162,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
         description: "Start your own computer-use session: a virtual display in an isolated container; network only to allowlisted sites. One per employee; ends on stop, after 2 idle minutes, or at its limits.",
         params: &[
             ParamDef {
+                name: "target",
+                description: "Session target. container is the default; local_browser requires an enabled macOS desktop companion and a live human conversation, with native approval for every step.",
+                required: false,
+            },
+            ParamDef {
                 name: "task",
                 description: "What the session is for (kept in the audit log)",
                 required: false,
