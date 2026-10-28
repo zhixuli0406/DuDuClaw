@@ -475,7 +475,7 @@ async fn discovery_real_rpc_approval_queue_online_terminal_tree_and_artifact_jou
     assert_eq!(store.get_task(task).await.unwrap().unwrap().status,"queued");
     assert_eq!(store.atomic_claim(task,"ordinary","2026-09-30T00:00:00Z","2099-09-30T00:00:00Z").await.unwrap(),crate::task_store::ClaimOutcome::NotClaimable);
     let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    lifecycle::poll_inner(&home,journey_mode(calls.clone(),false)).await.unwrap();
+    lifecycle::poll_inner(&home,&Arc::new(TaskStore::open(&home).unwrap()),&crate::approval::ApprovalBroker::open(&home).unwrap(),journey_mode(calls.clone(),false)).await.unwrap();
     let row=wait_terminal(&home,task).await;
     assert_eq!(row.status,"done","the real queue callback must run Online, not synthesize a terminal row");
     assert!(row.claimed_by.as_deref().unwrap().starts_with("discovery-"));
@@ -511,7 +511,7 @@ async fn discovery_real_rpc_cancellation_stops_shared_budget_and_survives_restar
         "title":"Explore","description":"Improve fixture","discovery":spec}),&manager).await);
     let task=created["task_id"].as_str().unwrap(); let run=created["run_id"].as_str().unwrap();
     let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    lifecycle::poll_inner(&home,journey_mode(calls.clone(),true)).await.unwrap();
+    lifecycle::poll_inner(&home,&Arc::new(TaskStore::open(&home).unwrap()),&crate::approval::ApprovalBroker::open(&home).unwrap(),journey_mode(calls.clone(),true)).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5),async {
         while calls.load(std::sync::atomic::Ordering::SeqCst)==0 {tokio::time::sleep(std::time::Duration::from_millis(10)).await;}
     }).await.unwrap();

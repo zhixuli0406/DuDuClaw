@@ -44,6 +44,10 @@ pub fn push_log(level: &str, target: &str, message: &str) {
     }
 }
 
+/// Daily `gateway.log.YYYY-MM-DD` files kept by the rolling appender (older
+/// ones are deleted at rotation). Shared with the CLI's own file appender.
+pub const FILE_LOG_MAX_FILES: usize = 14;
+
 /// Install the full gateway tracing stack: env filter (`RUST_LOG` →
 /// `config.toml [general] log_level` → `"warn"`), stderr fmt layer,
 /// daily-rolling file layer under `<home>/logs/`, the WebSocket
@@ -72,6 +76,7 @@ pub fn init_tracing_stack(home_dir: &std::path::Path) {
     let file_writer = match tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("gateway.log")
+        .max_log_files(FILE_LOG_MAX_FILES)
         .build(&log_dir)
     {
         Ok(appender) => {

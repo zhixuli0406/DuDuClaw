@@ -1,6 +1,6 @@
 # TODO: gateway 三個 SQLite store 每次 RPC 都重開（日誌噪音＋輕微浪費）
 
-- **狀態**: Open
+- **狀態**: Open（部分處理：2026-10-22 修掉 discovery 輪詢這個最大來源，`initialized` 日誌降為 `debug!`）
 - **建立**: 2026-08-17
 - **嚴重度**: Low（衛生問題，非洩漏、非正確性）
 
@@ -33,3 +33,16 @@ task spawn，drop 即釋放——**不是洩漏**。該事故的 OOM 兇手另�
 
 注意 `ApprovalBroker::open` 呼叫端遍布 goal loop / topology / skill approval /
 mcp（`grep -rn "ApprovalBroker::open("`），收斂時要一起盤點，避免只改 dashboard 面。
+
+## 2026-10-22 進度
+
+- 最大來源其實是 discovery 佇列：`server.rs` 每 2 秒呼叫 `discovery::service::poll`，
+  每輪都重開 `TaskStore` 與 `ApprovalBroker`，一天約 17 萬行 `…Store initialized`
+  （實測佔 gateway log 行數 72%）。現在輪詢改用 gateway 共用的 `Arc<TaskStore>`
+  與一個常駐的 broker（`discovery::service::poll_with`）；`poll(home)` 保留重開語意，
+  給一次性呼叫與重啟測試用。
+- `TaskStore initialized`／`ApprovalStore initialized` 降為 `debug!`。
+- 每日檔 `gateway.log.YYYY-MM-DD` 原本沒有保留上限，現在 rolling appender 只留
+  14 個（`log::FILE_LOG_MAX_FILES`，gateway 與 CLI 共用）。
+- 仍未處理：dashboard RPC 與其他 `ApprovalBroker::open` 呼叫端每次重開（上面「建議修法」
+  第一點）、`init_schema` 每次開啟都跑。

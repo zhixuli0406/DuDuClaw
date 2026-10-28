@@ -15,13 +15,22 @@ pub(super) enum ExecutionMode {
     #[cfg(test)]
     Injected(Box<dyn FnOnce(SharedBudget) -> OnlineComponents + Send>),
 }
+/// One-shot poll on freshly opened stores (restart-shaped callers and tests).
+/// The gateway's 2s queue loop uses [`poll_with`] instead.
 pub async fn poll(home: &Path) -> Result<(), String> {
-    poll_inner(home,ExecutionMode::Production).await
-}
-pub(super) async fn poll_inner(home: &Path, mode: ExecutionMode) -> Result<(),String> {
     let store = Arc::new(TaskStore::open(home)?);
-    let tasks = store.discovery_active_tasks().await?;
     let broker = ApprovalBroker::open(home)?;
+    poll_with(home, &store, &broker).await
+}
+/// Poll on long-lived stores. Reopening both per tick re-ran schema init and
+/// logged two INFO lines every 2s (~170k lines/day in the gateway log).
+pub async fn poll_with(home: &Path, store: &Arc<TaskStore>, broker: &ApprovalBroker) -> Result<(), String> {
+    poll_inner(home, store, broker, ExecutionMode::Production).await
+}
+pub(super) async fn poll_inner(home: &Path, store: &Arc<TaskStore>, broker: &ApprovalBroker,
+    mode: ExecutionMode) -> Result<(),String> {
+    let store = store.clone();
+    let tasks = store.discovery_active_tasks().await?;
     // `list_pending` sweeps TTL expiry first, then returns what is still open.
     let pending = broker.list_pending(None).await?;
     // Crash window of a withdrawal: the task CAS committed but the broker row

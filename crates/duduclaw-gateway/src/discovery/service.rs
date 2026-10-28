@@ -16,7 +16,7 @@ use super::{config::{DiscoveryConfig, AttemptSandbox, EvaluatorSandbox}, contrac
 mod lifecycle;
 #[path = "service_queries.rs"]
 mod queries;
-pub use lifecycle::poll;
+pub use lifecycle::{poll, poll_with};
 pub use queries::{catalog, list, tree, artifact, cancel};
 
 // Exact `blocked_reason` values written on cancellation; public views map them
