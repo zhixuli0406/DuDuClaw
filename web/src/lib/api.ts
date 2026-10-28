@@ -997,6 +997,9 @@ export interface TaskInfo {
   // ── Goal-loop surface (2026-08-14 /goals page) ────────────
   /** True for autonomous goal tasks driven by the goal loop. */
   goal_mode?: boolean;
+  cost_cap_cents?: number | null;
+  effective_cost_cap_cents?: number | null;
+  measured_spent_cents?: number | null;
   /** Acceptance contract the judge verifies against. */
   acceptance_criteria?: string | null;
   /** The current round's submitted result (judge input). */
@@ -1098,6 +1101,7 @@ export interface TaskCreateParams {
 }
 
 export interface TaskUpdateParams {
+  cost_cap_cents?: number;
   title?: string;
   description?: string;
   status?: TaskStatus;
@@ -8053,6 +8057,7 @@ export const api = {
        *  (1-720). Omitted / undefined ⇒ the global `[goal_loop]
        *  wall_clock_hours` default applies. */
       duration_hours?: number;
+      cost_cap_cents?: number;
       /** Goal assignment form v2: optional per-goal risk boundary text
        *  (≤2000 chars). Empty / undefined ⇒ the deployment baseline
        *  boundary (config `[goal_defaults] baseline_boundary`) applies. */
@@ -8095,6 +8100,7 @@ export const api = {
       acceptance_criteria?: string;
       priority?: 'low' | 'medium' | 'high' | 'urgent';
       duration_hours?: number;
+      cost_cap_cents?: number;
       risk_boundary?: string;
       require_beliefs?: boolean;
       plan_first?: boolean;

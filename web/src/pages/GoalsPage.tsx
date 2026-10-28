@@ -161,6 +161,71 @@ function InterventionButtons({
   );
 }
 
+function GoalSpend({ task }: { task: TaskInfo }) {
+  const intl = useIntl();
+  const cap = task.effective_cost_cap_cents ?? task.cost_cap_cents;
+  if (!cap) return null;
+  const money = (cents: number) => intl.formatNumber(cents / 100, { style: 'currency', currency: 'USD' });
+  return (
+    <p className="text-xs text-muted-foreground">
+      {intl.formatMessage({ id: task.measured_spent_cents == null ? 'goals.cost.unavailable' : 'goals.cost.spent' }, {
+        spent: money(task.measured_spent_cents ?? 0), cap: money(cap),
+      })}
+    </p>
+  );
+}
+
+function GoalCost({ task, onChanged }: { task: TaskInfo; onChanged: () => void }) {
+  const intl = useIntl();
+  const [newCap, setNewCap] = useState('');
+  const [busy, setBusy] = useState(false);
+  const cap = task.effective_cost_cap_cents ?? task.cost_cap_cents;
+  if (!cap) return null;
+  const parsed = Number(newCap);
+  const canRaise = Number.isSafeInteger(parsed) && parsed > Math.max(cap, task.measured_spent_cents ?? 0);
+  const raiseAndRetry = async () => {
+    if (!canRaise || busy) return;
+    setBusy(true);
+    try {
+      await api.tasks.update(task.id, { cost_cap_cents: parsed });
+      const result = await api.tasks.goalDecide(task.id, 'retry');
+      toast.success(result.message);
+      setNewCap('');
+      onChanged();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+      onChanged();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="space-y-2 text-xs text-muted-foreground">
+      <GoalSpend task={task} />
+      {task.status === 'needs_human' && (
+        <div className="flex flex-wrap items-end gap-1.5">
+          <div className="space-y-1">
+            <label htmlFor={`goal-cap-${task.id}`}>{intl.formatMessage({ id: 'goals.cost.newCap' })}</label>
+            <Input
+              id={`goal-cap-${task.id}`}
+              type="number"
+              min={Math.floor(Math.max(cap, task.measured_spent_cents ?? 0)) + 1}
+              step={1}
+              value={newCap}
+              disabled={busy}
+              onChange={(e) => setNewCap(e.target.value)}
+              className="h-8 w-40 text-xs"
+            />
+          </div>
+          <Button variant="outline" size="sm" disabled={!canRaise || busy} onClick={() => void raiseAndRetry()}>
+            {intl.formatMessage({ id: 'goals.cost.raiseRetry' })}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GoalCard({
   task,
   onOpen,
@@ -210,13 +275,17 @@ function GoalCard({
             onRename={onRename}
           />
         </div>
+        <GoalCost task={task} onChanged={onChanged} />
+        {task.blocked_reason && (
+          <p role="status" className="whitespace-pre-wrap break-words text-xs text-warning">{task.blocked_reason}</p>
+        )}
         {task.status === 'needs_human' && (
           <div className="border-t border-surface-border pt-2">
             <div className="mb-1.5">
               <PauseReasonChip reason={task.pause_reason} />
             </div>
             {task.judge_feedback && (
-              <p className="mb-1.5 line-clamp-2 text-xs text-muted-foreground">{task.judge_feedback}</p>
+              <p className="mb-1.5 whitespace-pre-wrap break-words text-xs text-muted-foreground">{task.judge_feedback}</p>
             )}
             <InterventionButtons task={task} compact onDecided={onChanged} />
           </div>
@@ -244,7 +313,10 @@ function GoalListRow({
     <div className="flex items-center gap-2 py-2 text-xs">
       <button type="button" onClick={onOpen} className="flex min-w-0 flex-1 items-center gap-2 text-left">
         {task.pinned && <Pin className="size-3 shrink-0 text-amber-500" aria-hidden="true" />}
-        <span className="min-w-0 flex-1 truncate text-foreground">{task.title}</span>
+        <div className="min-w-0 flex-1">
+          <span className="block truncate text-foreground">{task.title}</span>
+          <GoalSpend task={task} />
+        </div>
         <GoalStatusBadge status={task.status} />
         <span className="font-mono tabular-nums text-muted-foreground">
           {timeAgo(task.completed_at ?? task.updated_at)}

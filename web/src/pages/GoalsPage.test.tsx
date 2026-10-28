@@ -341,3 +341,92 @@ describe('GoalsPage — assigned by me', () => {
     expect(screen.getAllByText('Assigned by me').length).toBeGreaterThan(0);
   });
 });
+
+
+describe('GoalsPage — goal cost cap', () => {
+  it('shows a deferred configuration notice even on an uncapped goal awaiting dispatch', async () => {
+    const notice = '目標花費上限設定無法讀取或格式錯誤，已暫停派工。請檢查 [goal_loop] default_cost_cap_cents（須為非負整數，0 代表不限額）。';
+    const original = mockWsClient.call.getMockImplementation();
+    mockWsClient.call.mockImplementation((method: string, ...args: unknown[]) => method === 'tasks.list'
+      ? Promise.resolve({ tasks: [{ ...goalTask, status: 'todo', cost_cap_cents: null, effective_cost_cap_cents: null, blocked_reason: notice }] })
+      : original?.(method, ...args));
+    renderWithProviders(<GoalsPage />);
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    expect(screen.queryByText(/Spent \$0.00/)).not.toBeInTheDocument();
+  });
+
+  function costGoal(spent: number | null = 250) {
+    const original = mockWsClient.call.getMockImplementation();
+    mockWsClient.call.mockImplementation((method: string, ...args: unknown[]) =>
+      method === 'tasks.list'
+        ? Promise.resolve({ tasks: [{ ...goalTask, cost_cap_cents: null, effective_cost_cap_cents: 200, measured_spent_cents: spent, pause_reason: 'budget_exhausted', judge_feedback: 'Spent 250 cents; cap 200 cents.' }] })
+        : original?.(method, ...args));
+  }
+
+  it('shows measured spend against the effective cap and the complete pause detail', async () => {
+    costGoal();
+    renderWithProviders(<GoalsPage />);
+    expect(await screen.findByText('Spent $2.50 / $2.00 cap')).toBeInTheDocument();
+    expect(screen.getByText('Spent 250 cents; cap 200 cents.')).toBeInTheDocument();
+    expect(screen.getByText('Rounds, time or cost limit reached')).toBeInTheDocument();
+  });
+
+  it('shows unavailable spend explicitly instead of displaying zero', async () => {
+    costGoal(null);
+    renderWithProviders(<GoalsPage />);
+    expect(await screen.findByText('Spend unavailable / $2.00 cap')).toBeInTheDocument();
+    expect(screen.queryByText('Spent $0.00 / $2.00 cap')).not.toBeInTheDocument();
+  });
+
+  it('raises a paused cap before retrying through the existing decision gate', async () => {
+    costGoal();
+    const user = userEvent.setup();
+    renderWithProviders(<GoalsPage />);
+    const input = await screen.findByRole('spinbutton', { name: 'New cost cap (US cents)' });
+    await user.type(input, '400');
+    await user.click(screen.getByRole('button', { name: 'Raise cap and retry' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.update', { task_id: 'gt-1', cost_cap_cents: 400 }));
+    expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', { task_id: 'gt-1', action: 'retry', note: '' });
+    const methods = mockWsClient.call.mock.calls.map(([method]) => method);
+    expect(methods.indexOf('tasks.update')).toBeLessThan(methods.indexOf('tasks.goal_decide'));
+  });
+
+  it('shows spend and cap for finished goals too', async () => {
+    mockWsClient.call.mockImplementation((method: string, params?: Record<string, unknown>) => {
+      if (method === 'tasks.list') return Promise.resolve({ tasks: [] });
+      if (method === 'tasks.list_page') return Promise.resolve({ tasks: params?.status === 'done'
+        ? [{ ...goalTask, status: 'done', cost_cap_cents: 500, measured_spent_cents: 100 }] : [], total: params?.status === 'done' ? 1 : 0 });
+      if (method === 'agents.list') return Promise.resolve({ agents: [{ name: 'agnes' }] });
+      return Promise.resolve({});
+    });
+    renderWithProviders(<GoalsPage />);
+    expect(await screen.findByText('Spent $1.00 / $5.00 cap')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Raise cap and retry' })).not.toBeInTheDocument();
+  });
+
+  it('does not retry when saving the raised cap fails', async () => {
+    costGoal();
+    const original = mockWsClient.call.getMockImplementation();
+    mockWsClient.call.mockImplementation((method: string, ...args: unknown[]) => method === 'tasks.update'
+      ? Promise.reject(new Error('Not authorized')) : original?.(method, ...args));
+    const user = userEvent.setup();
+    renderWithProviders(<GoalsPage />);
+    await user.type(await screen.findByRole('spinbutton', { name: 'New cost cap (US cents)' }), '400');
+    await user.click(screen.getByRole('button', { name: 'Raise cap and retry' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.update', expect.anything()));
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.goal_decide')).toBe(false);
+  });
+
+  it('rejects a cap that is not an integer above both current spend and cap', async () => {
+    costGoal();
+    const user = userEvent.setup();
+    renderWithProviders(<GoalsPage />);
+    const input = await screen.findByRole('spinbutton', { name: 'New cost cap (US cents)' });
+    const save = screen.getByRole('button', { name: 'Raise cap and retry' });
+    for (const value of ['200', '250', '250.5', '9007199254740992']) {
+      await user.clear(input);
+      await user.type(input, value);
+      expect(save).toBeDisabled();
+    }
+  });
+});

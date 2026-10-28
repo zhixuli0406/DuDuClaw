@@ -133,6 +133,17 @@ pub async fn tree_spent(
         .collect())
 }
 
+/// Measured spend for a goal, using the same bounded tree and telemetry query
+/// as responsibility occurrences. An unreadable source remains an error.
+pub async fn goal_tree_cost(
+    store: &crate::task_store::TaskStore,
+    cost: &dyn CostSource,
+    task_id: &str,
+) -> Result<EpisodeCost, String> {
+    let measured = tree_spent(store, cost, &[task_id.to_string()]).await?;
+    Ok(measured.get(task_id).copied().unwrap_or_default())
+}
+
 /// Charge for a settled occurrence: measured if everything was measured,
 /// otherwise at least the full reservation. The charge never falls below what
 /// was measured. Returns `(charged, cost_basis)`.

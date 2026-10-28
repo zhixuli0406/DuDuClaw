@@ -9,6 +9,7 @@ mod escalate_cases;
 mod kickoff_cases;
 mod notify_cases;
 mod tick_cases;
+mod cost_cap_cases;
 
 use super::*;
 
@@ -56,6 +57,8 @@ fn small_cfg() -> GoalLoopConfig {
         progress_report_minutes: 0,
         resume_on_restart: "auto".to_string(),
         tool_streak_advisory: true,
+        default_cost_cap_cents: 0,
+        tool_streak_pause: 8,
     }
 }
 

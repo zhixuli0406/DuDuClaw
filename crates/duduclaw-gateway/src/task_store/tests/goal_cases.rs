@@ -400,3 +400,102 @@ async fn reject_review_routes_to_revising_and_bumps_round() {
     assert_eq!(iters[0].verdict.as_deref(), Some("rejected"));
     assert_eq!(iters[0].judge_feedback.as_deref(), Some("missing summary"));
 }
+
+#[tokio::test]
+async fn goal_cost_cap_roundtrips_raises_and_rejects_invalid_values() {
+    let (store, _dir) = temp_store();
+    let mut goal = pending_task("cost-goal");
+    goal.goal_mode = true;
+    goal.status = "needs_human".into();
+    goal.cost_cap_cents = Some(100);
+    store.insert_task(&goal).await.unwrap();
+    assert_eq!(
+        store
+            .get_task(&goal.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cost_cap_cents,
+        Some(100)
+    );
+    let raised = store
+        .update_task(&goal.id, &serde_json::json!({"cost_cap_cents": 250}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(raised.cost_cap_cents, Some(250));
+    assert!(raised.authority_revision > goal.authority_revision);
+    assert_eq!(raised.status, "needs_human");
+    for value in [
+        serde_json::json!(0),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("100"),
+        serde_json::Value::Null,
+        serde_json::json!(u64::MAX),
+    ] {
+        assert!(store
+            .update_task(&goal.id, &serde_json::json!({"cost_cap_cents": value}))
+            .await
+            .is_err());
+    }
+    let ordinary = pending_task("no-cap");
+    store.insert_task(&ordinary).await.unwrap();
+    assert_eq!(
+        store
+            .get_task(&ordinary.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cost_cap_cents,
+        None
+    );
+    assert!(store
+        .update_task(&ordinary.id, &serde_json::json!({"cost_cap_cents": 100}))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn employee_cost_policy_checks_the_stored_ceiling_in_the_write_transaction() {
+    let (store, _dir) = temp_store();
+    let mut goal = pending_task("cost-policy");
+    goal.goal_mode = true;
+    goal.cost_cap_cents = Some(100);
+    store.insert_task(&goal).await.unwrap();
+    assert!(store
+        .update_task_with_cost_policy(
+            &goal.id,
+            &serde_json::json!({"cost_cap_cents": 101}),
+            Some(1000)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .update_task_with_cost_policy(
+                &goal.id,
+                &serde_json::json!({"cost_cap_cents": 50}),
+                Some(1000)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .cost_cap_cents,
+        Some(50)
+    );
+}
+
+#[tokio::test]
+async fn goal_cost_cap_migration_leaves_old_rows_uncapped() {
+    let (store, dir) = temp_store();
+    let mut old_goal = pending_task("old-goal");
+    old_goal.goal_mode = true;
+    store.insert_task(&old_goal).await.unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    conn.execute_batch("DROP TRIGGER task_authority_revision_v1; ALTER TABLE tasks DROP COLUMN cost_cap_cents;").unwrap();
+    drop(conn);
+    let store = TaskStore::open(dir.path()).unwrap();
+    assert_eq!(store.get_task("old-goal").await.unwrap().unwrap().cost_cap_cents, None);
+}

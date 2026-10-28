@@ -258,6 +258,7 @@ impl MethodHandler {
             priority: String::new(),
             outcome: None,
             duration_hours: None,
+            cost_cap_cents: None,
             risk_boundary: None,
             require_beliefs: false,
             plan_first: false,

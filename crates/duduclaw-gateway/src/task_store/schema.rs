@@ -338,6 +338,7 @@ impl TaskStore {
             // Goal assignment form v2 (design-market-belief-loop-2026-08.md
             // §6, G1, 2026-08-14): per-goal deadline + risk boundary.
             ("deadline_at", "deadline_at TEXT"),
+            ("cost_cap_cents", "cost_cap_cents INTEGER CHECK (cost_cap_cents > 0)"),
             ("risk_boundary", "risk_boundary TEXT"),
             // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D):
             // immutable snapshot of acceptance_criteria at goal-creation time.

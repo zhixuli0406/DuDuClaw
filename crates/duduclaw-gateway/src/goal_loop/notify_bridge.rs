@@ -5,6 +5,25 @@
 use super::*;
 
 impl GoalLoopDriver {
+    /// Check only a completed round's evidence window. The ledger survives a
+    /// review/rejection between ticks and a restart; its pause stamp prevents
+    /// re-pausing the same round after a human explicitly retries it.
+    pub(super) async fn tool_streak_pause_detail(
+        &self,
+        task: &TaskRow,
+    ) -> Result<Option<String>, String> {
+        if self.config.tool_streak_pause == 0 || !self.has_real_home() {
+            return Ok(None);
+        }
+        super::signals::tool_streak_pause_detail(
+            &self.home_dir,
+            &self.store,
+            task,
+            self.config.tool_streak_pause,
+        )
+        .await
+    }
+
     /// P5: push one progress line to the goal's source conversation, deduped by
     /// `phase_key` so the same phase never double-posts. Best-effort — a
     /// transient send failure is retried (bounded) on later ticks rather than

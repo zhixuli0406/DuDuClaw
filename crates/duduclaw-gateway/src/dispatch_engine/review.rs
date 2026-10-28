@@ -6,6 +6,29 @@ impl DispatchEngine {
         let Some(judge) = &self.judge else {
             // No evaluator configured — leave review tasks for later / human.
             let pending = self.store.tasks_in_status("review").await?;
+            // The deterministic pause also applies when a restarted gateway
+            // has not configured an acceptance judge yet.
+            if let Some(home) = self.home_dir.as_deref() {
+                let threshold = crate::goal_loop::GoalLoopConfig::from_home(home).tool_streak_pause;
+                for task in &pending {
+                    let detail = match crate::goal_loop::signals::tool_streak_pause_detail(
+                        home, &self.store, task, threshold,
+                    ).await {
+                        Ok(detail) => detail,
+                        Err(error) => {
+                            warn!(task = %task.id, %error, "review: tool streak history unreadable — skipping this task");
+                            continue;
+                        }
+                    };
+                    if let Some(reason) = detail {
+                        self.store.mark_needs_human_sealing_round(
+                            &task.id, &reason, crate::pause_reason::PauseReason::NoProgress,
+                            self.round_knobs_json(task).as_deref(),
+                        ).await?;
+                        self.revoke_task_grants(&task.id).await;
+                    }
+                }
+            }
             if !pending.is_empty() {
                 debug!(
                     count = pending.len(),
@@ -35,6 +58,23 @@ impl DispatchEngine {
                 round: cost_round,
             };
             crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attribution, async {
+            // Read the streak ledger before consuming remove-once native
+            // evidence or updating review state. A task-local read failure
+            // leaves both the task and its evidence available for retry.
+            let streak_detail = if let Some(home) = self.home_dir.as_deref() {
+                let threshold = crate::goal_loop::GoalLoopConfig::from_home(home).tool_streak_pause;
+                match crate::goal_loop::signals::tool_streak_pause_detail(
+                    home, &self.store, &task, threshold,
+                ).await {
+                    Ok(detail) => detail,
+                    Err(error) => {
+                        warn!(task = %task.id, %error, "review: tool streak history unreadable — skipping this task");
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
             // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D):
             // the judge reads the immutable baseline snapshotted at goal
             // creation, not the mutable `acceptance_criteria` field a
@@ -198,6 +238,22 @@ impl DispatchEngine {
                 self.report_removed_judge_mode(&task, judge_mode).await;
             }
 
+            // WP-B: enforce the completed-round streak before any judge can
+            // accept or reject it, including reviews recovered after restart.
+            if let Some(reason) = streak_detail {
+                self.store
+                    .mark_needs_human_sealing_round(
+                        &task.id,
+                        &reason,
+                        crate::pause_reason::PauseReason::NoProgress,
+                        knobs_json.as_deref(),
+                    )
+                    .await?;
+                self.revoke_task_grants(&task.id).await;
+                observed_outcome =
+                    Some(crate::prediction::task_forward::ObservedOutcome::Escalated);
+                judge_feedback_for_settle = Some(reason);
+            }
             // Leftover `human_only`: still never machine-judged. Falling back
             // to `mav` would let the AI panel accept work this deployment had
             // reserved for a person, so every review parks BEFORE any
@@ -206,7 +262,9 @@ impl DispatchEngine {
             // not from anything in the work itself. Uses the WP-A9
             // `observed_outcome` short-circuit (not a bare `continue`) so the
             // A3 settle tail still records the escalation.
-            if judge_mode == crate::judge_mode::JudgeMode::RemovedHumanOnly {
+            if observed_outcome.is_none()
+                && judge_mode == crate::judge_mode::JudgeMode::RemovedHumanOnly
+            {
                 let reason = crate::judge_mode::HUMAN_ONLY_REMOVED_PARK_REASON.to_string();
                 self.store
                     .mark_needs_human_sealing_round(

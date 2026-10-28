@@ -80,6 +80,7 @@ export function ComplexAssignTab({
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('unspecified');
   const [priority, setPriority] = useState('medium');
   const [durationHours, setDurationHours] = useState('');
+  const [costCap, setCostCap] = useState('');
   const [riskBoundary, setRiskBoundary] = useState('');
   // A per-goal risk boundary replaces the deployment baseline: Admin only
   // (the gateway refuses it from anyone else).
@@ -149,6 +150,11 @@ export function ComplexAssignTab({
       toast.error(intl.formatMessage({ id: 'goals.create.durationInvalid' }));
       return;
     }
+    const parsedCap = costCap.trim() ? Number(costCap) : undefined;
+    if (parsedCap !== undefined && (!Number.isSafeInteger(parsedCap) || parsedCap <= 0)) {
+      toast.error(intl.formatMessage({ id: 'goals.create.costCapInvalid' }));
+      return;
+    }
     let schedule;
     try {
       schedule = toScheduleInput(when);
@@ -162,6 +168,7 @@ export function ComplexAssignTab({
       acceptance_criteria: composeCriteria(),
       priority: priority as 'low' | 'medium' | 'high' | 'urgent',
       duration_hours: parsedDuration,
+      cost_cap_cents: parsedCap,
       risk_boundary: (isAdmin && riskBoundary.trim()) || undefined,
       require_beliefs: requireBeliefs || undefined,
       plan_first: planFirst || undefined,
@@ -380,6 +387,23 @@ export function ComplexAssignTab({
                       placeholder={intl.formatMessage({ id: 'goals.create.durationPlaceholder' })}
                       onChange={(e) => setDurationHours(e.target.value)}
                     />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label htmlFor="assign-cost-cap" className="text-xs font-medium text-muted-foreground">
+                      {intl.formatMessage({ id: 'goals.create.costCap' })}
+                    </label>
+                    <Input
+                      id="assign-cost-cap"
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={costCap}
+                      onChange={(e) => setCostCap(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {intl.formatMessage({ id: 'goals.create.costCapHint' })}
+                    </p>
                   </div>
 
                   {isAdmin && (

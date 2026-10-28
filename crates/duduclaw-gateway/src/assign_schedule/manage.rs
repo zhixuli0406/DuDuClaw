@@ -84,6 +84,11 @@ pub async fn create(
     req: NewSchedule,
     now: DateTime<Utc>,
 ) -> Result<AssignScheduleRow, CreateError> {
+    if let Some(cap) = req.payload.cost_cap_cents {
+        if req.kind != AssignKind::Goal || cap == 0 || cap > i64::MAX as u64 {
+            return Err(CreateError::Store("cost_cap_cents must be a positive integer for a goal".into()));
+        }
+    }
     let zone = Zone::parse(req.timezone.as_deref()).map_err(CreateError::Spec)?;
     let (max_active, min_interval) = caps(home).map_err(CreateError::Store)?;
     let first = req

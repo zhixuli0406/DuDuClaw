@@ -23,7 +23,7 @@ pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority,
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
      pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
      discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision, \
-     on_behalf_of, created_via";
+     on_behalf_of, created_via, cost_cap_cents";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -249,6 +249,9 @@ pub struct TaskRow {
     /// which takes the earlier of this and the global wall clock.
     #[serde(default)]
     pub deadline_at: Option<String>,
+    /// Optional measured task-tree spend ceiling in cents; None uses the deployment default.
+    #[serde(default)]
+    pub cost_cap_cents: Option<u64>,
     /// Optional per-goal risk boundary text the user explicitly typed into
     /// the assign form (≤2000 chars, `duduclaw_core::truncate_chars`).
     /// `None` ⇒ the deployment's baseline boundary
@@ -432,6 +435,7 @@ impl TaskRow {
             goal_state_json: None,
             source_discord_guild_id: None,
             deadline_at: None,
+            cost_cap_cents: None,
             risk_boundary: None,
             acceptance_criteria_baseline: None,
             pause_reason: None,

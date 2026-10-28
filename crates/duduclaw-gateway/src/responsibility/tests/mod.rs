@@ -106,6 +106,8 @@ impl Env {
 
 pub(super) fn loop_cfg() -> GoalLoopConfig {
     GoalLoopConfig {
+        default_cost_cap_cents: 0,
+        tool_streak_pause: 8,
         iteration_cap: 5,
         iteration_cap_simple: 5,
         soft_cap: 3,

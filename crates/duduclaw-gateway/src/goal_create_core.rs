@@ -58,6 +58,8 @@ pub struct GoalCreateRequest {
     pub outcome: Option<String>,
     /// Per-goal wall clock, 1–720 hours. `None` ⇒ deployment default.
     pub duration_hours: Option<f64>,
+    /// Optional positive measured task-tree spend ceiling in cents.
+    pub cost_cap_cents: Option<u64>,
     /// Per-goal risk boundary text. `None` ⇒ `[goal_defaults] baseline_boundary`.
     pub risk_boundary: Option<String>,
     /// Require structured belief declarations during execution.
@@ -88,6 +90,20 @@ pub struct GoalCreateRequest {
     /// Where the caller's right to assign came from (`binding`,
     /// `team:<user>:<depth>`, `admin`), for the activity row's metadata.
     pub grant_via: Option<String>,
+}
+
+/// Parse the optional cost ceiling without silently accepting malformed values.
+pub fn parse_cost_cap_cents(args: &serde_json::Value) -> Result<Option<u64>, String> {
+    match args.get("cost_cap_cents") {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|cap| *cap > 0 && *cap <= i64::MAX as u64)
+            .map(Some)
+            .ok_or_else(|| {
+                "cost_cap_cents must be a positive integer <= 9223372036854775807".into()
+            }),
+    }
 }
 
 /// The created goal plus the flags a caller needs to render its own response.
@@ -151,6 +167,12 @@ async fn create_goal_task_inner(
         Some(Err(e)) => return Err(format!("outcome 產出驗收格式錯誤：{e}")),
         None => None,
     };
+    if req
+        .cost_cap_cents
+        .is_some_and(|cap| cap == 0 || cap > i64::MAX as u64)
+    {
+        return Err("cost_cap_cents must be a positive integer <= 9223372036854775807".into());
+    }
     let duration_hours = match req.duration_hours {
         None => None,
         Some(h) if (1.0..=720.0).contains(&h) => Some(h),
@@ -224,6 +246,7 @@ async fn create_goal_task_inner(
         task.deadline_at =
             Some((Utc::now() + ChronoDuration::minutes((hours * 60.0).round() as i64)).to_rfc3339());
     }
+    task.cost_cap_cents = req.cost_cap_cents;
     task.risk_boundary = risk_boundary;
     task.on_behalf_of = req.on_behalf_of.clone();
     task.created_via = req.on_behalf_of.as_ref().and(req.created_via.clone());

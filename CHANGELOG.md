@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- 目標任務可設定費用上限（美分），每輪開始前檢查目標與子任務的已記錄費用，達上限就暫停請你決定；費用讀不到時不派工，runtime 未回報用量時會明確暫停請你決定；預設上限設定錯誤也會顯示在目標卡片。目標頁顯示已用金額、上限與暫停原因，有權限的操作者可提高上限再重試。`tasks_create kind="goal"` 與儀表板交辦支援 `cost_cap_cents`；`[goal_loop] default_cost_cap_cents` 可設定未填上限時的預設值（預設 `0`，不限額）。執行中的回合仍可能超出上限。
+- 目標一輪內連續呼叫同一工具、同一組參數達 8 次，現在會在該輪結束後暫停，原因列出工具與次數。`[goal_loop] tool_streak_pause` 可調整門檻（`0` 關閉），未達門檻時仍保留原本提醒。
+
 ## [1.76.4] - 2026-10-29 — Codex timeout, background runtime and Odoo compatibility hotfix
 
 ### Added

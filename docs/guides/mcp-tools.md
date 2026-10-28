@@ -197,6 +197,12 @@ build the model's tool list from name, description and input schema only.
 
 ## Long-form details moved out of descriptions
 
+### `tasks_create` / `tasks_update` — goal cost cap
+
+`tasks_create` accepts `cost_cap_cents` with `kind="goal"`: a positive integer in US cents (up to `9223372036854775807`). Omit it to use `[goal_loop] default_cost_cap_cents` (`0` means no default cap). Non-goal and scheduled requests reject the argument. Example: `{"kind":"goal","title":"Review the report","assigned_to":"agnes","cost_cap_cents":500}`. Keep the usual description and acceptance criteria for your goal.
+
+`tasks_update` accepts the same field for a goal. Employees may add or narrow a ceiling, but cannot raise or remove an effective ceiling; raising is an operator action. Saving a new cap does not itself resume a paused goal. The dashboard's **Raise cap and retry** saves it, then uses the existing retry decision. At or above the measured task-tree cap, the goal pauses as `budget_exhausted`; unreadable cost skips dispatch. See [goal loop](../features/34-goal-loop.md).
+
 ### `codrive_run` — the three-rung execution ladder
 
 Each step is dispatched through three rungs, tried in this order; prefer the

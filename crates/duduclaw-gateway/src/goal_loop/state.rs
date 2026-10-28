@@ -492,10 +492,10 @@ pub fn build_state_block(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseReason {
     /// The loop ran but the state stopped changing — A2 oscillation
-    /// (identical `state_hash` two rounds running).
+    /// (identical `state_hash` two rounds running), or an in-round tool streak.
     NoProgress,
     /// A hard cap fired: iteration cap, judge retry budget, the global
-    /// wall clock, or a per-goal `deadline_at`.
+    /// wall clock, per-goal `deadline_at`, or measured goal-tree cost ceiling.
     BudgetExhausted,
     /// Something outside the agent blocks the goal and a person must act —
     /// the two-stage evaluator's `Blocked` verdict, or an upstream
@@ -550,7 +550,7 @@ impl PauseReason {
     pub fn label_zh(self) -> &'static str {
         match self {
             PauseReason::NoProgress => "卡住沒進展",
-            PauseReason::BudgetExhausted => "次數或時限用盡",
+            PauseReason::BudgetExhausted => "費用、次數或時限用盡",
             PauseReason::BlockedNeedsDecision => "等你決策",
             PauseReason::Infra => "系統問題",
             PauseReason::Restart => "系統重啟後暫停",

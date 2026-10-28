@@ -111,6 +111,59 @@ impl MethodHandler {
         v["channel_link"] = json!(channel_link);
     }
 
+    /// Batch visible capped goals into one telemetry query; private board
+    /// cards do not acquire cost fields or expose their task-tree spend.
+    async fn set_goal_cost_fields(
+        &self,
+        store: &TaskStore,
+        reader: &TaskReader<'_>,
+        rows: &[TaskRow],
+        tasks: &mut [Value],
+    ) {
+        let default_cap =
+            crate::goal_loop::GoalLoopConfig::cost_cap_default_from_home(&self.home_dir);
+        let mut ids = Vec::new();
+        for (row, value) in rows.iter().zip(tasks.iter_mut()) {
+            if !row.goal_mode || !reader.can_read_row(row) {
+                continue;
+            }
+            if default_cap.is_err()
+                && !matches!(row.status.as_str(), "done" | "failed" | "cancelled")
+            {
+                // A live notice, not a task mutation: it clears when config
+                // is repaired and keeps any existing blocked reason visible.
+                let notice = "目標花費上限設定無法讀取或格式錯誤，已暫停派工。請檢查 [goal_loop] default_cost_cap_cents（須為非負整數，0 代表不限額）。";
+                value["blocked_reason"] = json!(match row.blocked_reason.as_deref() {
+                    Some(reason) if !reason.is_empty() => format!("{notice}\n{reason}"),
+                    _ => notice.to_string(),
+                });
+            }
+            let cap = row
+                .cost_cap_cents
+                .or_else(|| default_cap.as_ref().ok().copied().filter(|cap| *cap > 0));
+            value["effective_cost_cap_cents"] = json!(cap);
+            if cap.is_some() {
+                value["measured_spent_cents"] = Value::Null;
+                ids.push(row.id.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let source = crate::responsibility::TelemetryCostSource::new(&self.home_dir);
+        if let Ok(spend) = crate::responsibility::cost::tree_spent(store, &source, &ids).await {
+            for (row, value) in rows.iter().zip(tasks.iter_mut()) {
+                if value.get("measured_spent_cents").is_some() {
+                    value["measured_spent_cents"] = match spend.get(&row.id) {
+                        Some(cost) if cost.unmeasured > 0 => Value::Null,
+                        Some(cost) => json!(cost.cost),
+                        None => json!(0),
+                    };
+                }
+            }
+        }
+    }
+
     pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
@@ -147,6 +200,8 @@ impl MethodHandler {
                     self.set_channel_fields(&reader, r, &mut v).await;
                     tasks.push(v);
                 }
+                self.set_goal_cost_fields(&store, &reader, &rows, &mut tasks)
+                    .await;
                 WsFrame::ok_response("", json!({ "tasks": tasks }))
             }
             Err(e) => WsFrame::error_response("", &format!("list tasks: {e}")),
@@ -638,6 +693,8 @@ impl MethodHandler {
                     self.set_channel_fields(&reader, r, &mut v).await;
                     tasks.push(v);
                 }
+                self.set_goal_cost_fields(&store, &reader, &rows, &mut tasks)
+                    .await;
                 WsFrame::ok_response(
                     "",
                     json!({ "tasks": tasks, "total": total, "limit": limit, "offset": offset }),
@@ -687,6 +744,8 @@ impl MethodHandler {
                     self.set_channel_fields(&reader, r, &mut v).await;
                     tasks.push(v);
                 }
+                self.set_goal_cost_fields(&store, &reader, &rows, &mut tasks)
+                    .await;
                 WsFrame::ok_response(
                     "",
                     json!({ "tasks": tasks, "total": total, "limit": limit, "offset": offset }),

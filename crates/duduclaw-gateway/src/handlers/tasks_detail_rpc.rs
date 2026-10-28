@@ -444,6 +444,13 @@ impl MethodHandler {
                 }
             },
         };
+        let cost_cap_cents = match crate::goal_create_core::parse_cost_cap_cents(&params) {
+            Ok(cap) => cap,
+            Err(e) => {
+                super::task_attachments::remove_saved(&saved).await;
+                return WsFrame::error_response("", &e);
+            }
+        };
         let req = crate::goal_create_core::GoalCreateRequest {
             agent_id: agent_id.to_string(),
             created_by: "goal:dashboard".to_string(),
@@ -466,6 +473,7 @@ impl MethodHandler {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             duration_hours,
+            cost_cap_cents,
             risk_boundary,
             require_beliefs: params
                 .get("require_beliefs")

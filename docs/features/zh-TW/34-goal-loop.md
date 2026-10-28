@@ -64,6 +64,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 |---|---|---|
 | 迭代上限(每任務派工數) | 5(困難目標)、3(簡單目標) | `needs_human` |
 | 自建立起算的 wall clock | 24 h | `needs_human` |
+| 目標費用上限（`cost_cap_cents`，未填用 `default_cost_cap_cents`） | 預設不限額（`0`） | 任務樹已量測費用達上限：`needs_human`／`budget_exhausted`；費用讀不到：延後派工；用量未量測：暫停請人決定 |
 | 並行目標任務數 | 3 | 排隊,不派工 |
 | 停滯偵測 | 連續兩輪駁回回饋的 **gap 指紋**相同(從回饋抽取 `path:line` 引用與反引號關鍵詞正規化而成,不是逐字比對,換句話說的同一個 gap 也算;抽不到任何引用/關鍵詞才退回逐字比對) | 提前 `needs_human` |
 | 提前收工偵測 | 九條 zh+en 正則比對 agent 最後一段非空文字(如自簽 `VERDICT:`、「請稍後再來查看」、「請你審核一下」) | 記遙測與 activity 事件,提示帶進下一輪判官/評估器輸入,但不會自己駁回或卡住任務 |
@@ -73,10 +74,20 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | 委派 hop 深度 | 5 | 拒絕派工 |
 | gateway 重啟時的復活行為(`resume_on_restart`) | `pause`(**預設**):開機把所有 in-flight `goal_mode` 任務轉 `needs_human`(原因 `gateway_restart`) | `auto` 時重啟後 in-flight 任務照常接續(這項設定出現前的唯一行為);可在 `config.toml` 或儀表板「設定→自動化」切換(`system.update_config` 只收 `"auto"`/`"pause"`) |
 | 逾時進度通報(`progress_report_minutes`) | 已認領任務靜默 10 分鐘(以 Activity Feed 訊號為準,不是會被 lease renewer 定期刷新的 `updated_at`) | 推一則「仍在執行、未回報進度」通知到 Activity Feed ＋來源對話,同一輪最多一次,不重派工、不升級、不取消;`0` 關閉 |
-| 工具連擊 advisory(`tool_streak_advisory`) | 單一輪內對同一工具、同一組(遮罩後)參數連續呼叫 3／5／8 次 | 逐級加重的 zh-TW 提醒注入下一輪 `<state>` 區塊(零 LLM 成本、純 advisory),不會擋下或否決任何呼叫;排除在震盪偵測的狀態雜湊之外 |
+| 工具連擊（`tool_streak_pause`、`tool_streak_advisory`） | 一輪內相同呼叫連續 8 次即暫停，`0` 關閉暫停；啟用 advisory 時仍有 3／5／8 次提醒 | 回合結束後轉 `needs_human`／`no_progress`，附工具與次數；未達暫停門檻只提醒 |
 | ephemeral spawn 准入(`[dispatch] admission`) | 撞到並發上限(`ephemeral_max_active`,預設 32) | `"queue"`(**預設**)有界 FIFO 持久排隊而非直接拒絕(佇列深度上限、每張票 TTL、全數落稽核);`"fail"` 退回 H19 之前的立即拒絕 |
 
 全部在 `config.toml` 的 `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` 之下,區段缺席時使用內建預設。
+
+## 目標費用上限與重複呼叫暫停
+
+透過 `tasks_create`、`kind="goal"` 設定正整數 `cost_cap_cents`，或在儀表板「交辦任務 → 複雜任務 → 更多設定 → 費用上限（美分）」為目標填入上限。例如 `500` 代表 5 美元。既有目標不會自動寫入上限；沒有個別上限時，使用 `[goal_loop] default_cost_cap_cents`，預設 `0` 代表不限額。
+
+每輪開始前，驅動器會透過持續職責共用的費用來源，讀取目標與已記錄子任務的費用總額。達到或超過上限就暫停為 `needs_human`／`budget_exhausted`，原因文字會列出已用金額與上限。費用讀不到時會跳過這輪派工。任務樹有用量紀錄卻沒有 token 數時，會暫停為 `needs_human`／`blocked_needs_decision`，明確顯示 runtime 未回報用量、無法套用花費上限；只提高上限不會解決未知花費。一般目標沒有持續職責的預留額度替代計算；未知用量不會估算，也不能當作零元。這是回合之間的防護，不是帳單保證：執行中的回合與同時執行的子任務仍可能超支，沒有回報的費用也不會變成已量測費用；目標費用上限與員工預算分開設定。
+
+`/goals` 會顯示已用費用與生效上限；讀不到費用時會明確標示。暫停卡片會完整顯示原因。若 `[goal_loop] default_cost_cap_cents` 格式錯誤或設定讀不到，所有目標（包括未填上限者）都延後派工，`/goals` 會顯示設定問題，修正後提示即消失。有管理權限的操作者可填入較高上限，按「提高上限並重試」：先透過 `tasks.update` 儲存上限，再走既有 `tasks.goal_decide` 重試流程，儲存失敗就不恢復。MCP `tasks_update` 也接受此欄位；員工只能新增或收緊上限，操作者可以提高。儀表板排程交辦也會把上限帶入每次建立的目標。
+
+`[goal_loop] tool_streak_pause = 8` 會在一輪結束後，檢查同一工具、同一組遮罩後參數是否連續呼叫至少 8 次；達標就以 `no_progress` 暫停，原因帶有工具名稱與次數。設為 `0` 可獨立關閉這道暫停防護，不影響 `tool_streak_advisory`；未達暫停門檻時，仍保留原本 3／5／8 次的提醒（須啟用 advisory）。不會中途打斷工具呼叫。透過儀表板的設定檔進階編輯器儲存後，目標迴圈會重新載入；直接修改 `config.toml` 則需重新啟動 gateway。
 
 ## needs_human 升級
 

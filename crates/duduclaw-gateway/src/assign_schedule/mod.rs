@@ -103,6 +103,8 @@ pub struct AssignPayload {
     pub outcome: Option<String>,
     #[serde(default)]
     pub duration_hours: Option<f64>,
+    #[serde(default)]
+    pub cost_cap_cents: Option<u64>,
     /// Admin-only (it replaces the deployment baseline).
     #[serde(default)]
     pub risk_boundary: Option<String>,
