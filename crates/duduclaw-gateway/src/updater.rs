@@ -1658,15 +1658,22 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
 
     #[test]
     fn windows_standalone_has_no_desktop_neighbor_on_case_insensitive_filesystem() {
+        use std::ffi::OsStr;
         use std::path::Path;
         let exe = Path::new("C:/Users/x/.duduclaw/bin/duduclaw.exe");
         // Simulate NTFS reporting DuDuClaw.exe as existing through the sidecar itself.
         let exists = |path: &Path| {
-            path.to_str()
-                .unwrap()
-                .eq_ignore_ascii_case(exe.to_str().unwrap())
+            path.parent() == exe.parent()
+                && matches!(
+                    (
+                        path.file_name().and_then(OsStr::to_str),
+                        exe.file_name().and_then(OsStr::to_str)
+                    ),
+                    (Some(candidate), Some(exe_name))
+                        if candidate.eq_ignore_ascii_case(exe_name)
+                )
         };
-        assert!(exists(Path::new("C:/Users/x/.duduclaw/bin/DuDuClaw.exe")));
+        assert!(exists(&exe.parent().unwrap().join("DuDuClaw.exe")));
         assert!(!has_desktop_neighbor(exe, exists));
     }
 
