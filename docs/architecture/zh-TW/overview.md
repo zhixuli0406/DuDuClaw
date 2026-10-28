@@ -36,9 +36,9 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **逐輪裁剪（Turn trimming）**（超過 800 字元 → 保留頭 300 + 尾 200 + `[trimmed N chars]`，CJK 安全）。
 - **Direct API prompt 快取**（"system_and_3" 斷點策略；未公布實測命中率）。
 - **壓縮摘要**在達到 50k token 門檻時注入 system prompt（而非對話輪次本身）。
-- **Instruction Pinning**（v1.8.6 P0）— 使用者第一輪 → 非同步以 Haiku 萃取核心任務 → 存入 `sessions.pinned_instructions` → 注入到 system prompt 尾端（U 形注意力）。澄清回答會持續累積（≤1000 字元）。
+- **Instruction Pinning**（v1.8.6 P0）— 使用者第一輪 → 非同步以解析後的輔助模型（Codex 受限模式或 Claude／API 無工具模式）（員工後端不支援時改用全域設定）萃取核心任務 → 存入 `sessions.pinned_instructions` → 注入到 system prompt 尾端（U 形注意力）。澄清回答會持續累積（≤1000 字元）。
 - **Snowball Recap**（v1.8.6 P0）— 每一輪都在使用者訊息前加上 `<task_recap>`。零 LLM 成本。
-- **P2 Key-Fact Accumulator**（v1.8.6）— 每個有實質內容的輪次，由 Haiku 萃取 2-4 條關鍵事實 → 存入具 FTS5 索引的 `key_facts` 表 → 挑最相關的前 3 條注入 system prompt。約 100-150 token，相較 MemGPT 的 6,500 token（−87%）。
+- **P2 Key-Fact Accumulator**（v1.8.6）— 每個有實質內容的輪次，由解析後的輔助模型（Codex 受限模式或 Claude／API 無工具模式）（員工後端不支援時改用全域設定）萃取 2-4 條關鍵事實 → 存入具 FTS5 索引的 `key_facts` 表 → 挑最相關的前 3 條注入 system prompt。約 100-150 token，相較 MemGPT 的 6,500 token（−87%）。
 - **CLI 輕量路徑**— `call_claude_cli_lightweight()` 搭配 `--effort medium --max-turns 1 --no-session-persistence --tools ""`，用於 metadata 任務。可降低 25-40% 成本。
 - **穩定化旗標**— `--strict-mcp-config`（MCP 隔離）+ `--exclude-dynamic-system-prompt-sections`（跨輪次 prompt 穩定性，減少 10-15% token）。`--bare` 已於 v1.8.11 移除（會破壞 OS 鑰匙圈憑證查詢）。
 

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 #[derive(Clone, Debug)]
 struct Call {
     agent: String,
+    utility: bool,
     model: String,
     dir: Option<std::path::PathBuf>,
 }
@@ -38,6 +39,7 @@ impl crate::runtime::AgentRuntime for CountedRuntime {
     ) -> Result<crate::runtime::RuntimeResponse, String> {
         self.calls.lock().unwrap().push(Call {
             agent: ctx.agent_id.clone(),
+            utility: crate::runtime_dispatch::in_utility_call(),
             model: ctx.model.clone(),
             dir: ctx.agent_dir.clone(),
         });
@@ -63,6 +65,7 @@ impl crate::runtime::AgentRuntime for CountedRuntime {
         let reply = self.success_reply.lock().unwrap().clone();
         if let Some(content) = reply {
             Ok(crate::runtime::RuntimeResponse {
+                partial_timeout_secs: None,
                 content,
                 model_used: ctx.model.clone(),
                 runtime_name: self.kind.as_str().into(),
@@ -309,11 +312,16 @@ enabled=false
     }
     fn worker_called_once(&self, webhook: bool) {
         let calls = self.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "{calls:?}");
-        assert_eq!(calls[0].agent, "worker");
-        assert_eq!(calls[0].model, "gpt-5.4");
+        // Pinning and other background jobs may arrive before or after this
+        // snapshot. Exactly one reply is required; every observed call must
+        // still belong to the worker, including any utility calls.
+        assert_eq!(calls.iter().filter(|call| !call.utility).count(), 1, "{calls:?}");
         let expected_dir = self.ctx.home_dir.join("agents/worker");
-        assert_eq!(calls[0].dir.as_deref(), Some(expected_dir.as_path()));
+        for call in calls.iter() {
+            assert_eq!(call.agent, "worker", "{calls:?}");
+            assert_eq!(call.model, "gpt-5.4", "{calls:?}");
+            assert_eq!(call.dir.as_deref(), Some(expected_dir.as_path()), "{calls:?}");
+        }
         assert_eq!(self.cloud.counts(), [0, 0]);
         let body = self.final_bodies();
         assert!(body.contains("Actual Worker"), "{body}");

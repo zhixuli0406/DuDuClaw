@@ -94,6 +94,14 @@ impl MethodHandler {
                             "",
                             json!({
                                 "config": masked,
+                                // A removed provider is refused at execution, not
+                                // an effective Claude fallback. Preserve it so
+                                // explicitly choosing Claude can repair the key.
+                                "utility_provider": if crate::runtime_config::ensure_active_utility_provider(&self.home_dir).is_err() {
+                                    "gemini"
+                                } else {
+                                    crate::runtime_config::global_utility_provider(&self.home_dir).as_str()
+                                },
                                 "voice": voice,
                                 "allowed_origins": allowed_origins,
                                 "gap_digest_enabled": gap_digest_enabled,

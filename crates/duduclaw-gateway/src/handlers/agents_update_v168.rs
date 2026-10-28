@@ -343,7 +343,7 @@ pub(crate) fn agent_settings_json(raw: &toml::Table) -> Value {
         "heartbeat": pick(raw, "heartbeat", &["enabled", "interval_seconds", "cron", "cron_timezone", "max_concurrent_runs"]),
         "budget": pick(raw, "budget", &["monthly_limit_cents", "warn_threshold_percent", "hard_stop", "daily_cap_cents"]),
         "model": pick(raw, "model", &["preferred", "fallback", "api_mode", "account_pool", "utility", "effort"]),
-        "runtime": pick(raw, "runtime", &["provider", "fallback", "minimal_context"]),
+        "runtime": pick(raw, "runtime", &["provider", "fallback", "minimal_context", "timeout_secs"]),
         "fork": pick(raw, "fork", &["enabled"]),
         "team": team,
         "guardrails": pick(raw, "guardrails", &["enabled", "block_secrets", "block_injection_echo", "redact_pii", "deny_phrases"]),

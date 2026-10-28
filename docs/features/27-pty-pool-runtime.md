@@ -23,7 +23,7 @@ invoke_oneshot(program, args, env, cwd, deadline, clear_env)
 captured stdout
 ```
 
-That is the whole feature. Current users: the Grok runtime (whose CLI insists on a TTY) and `duduclaw`'s own CLI-login helper.
+The CLI-login helper uses this feature. Grok no longer retries empty pipe-mode replies here: the PTY path cannot guarantee process-tree cleanup on timeout, so the runtime now returns an empty-response error.
 
 Two behaviours are worth knowing:
 

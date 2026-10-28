@@ -14,7 +14,7 @@ pub(crate) enum FailureReason {
     /// Claude CLI reported "Not logged in" / authentication failure.
     /// Distinct from BinaryMissing (binary exists, just not authenticated).
     AuthFailed,
-    /// 30-minute hard timeout tripped.
+    /// The runtime execution time limit was reached.
     Timeout,
     /// Subprocess failed to spawn or exited non-zero without recognizable cause.
     SpawnError,

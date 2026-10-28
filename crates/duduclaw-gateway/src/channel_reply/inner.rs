@@ -1599,6 +1599,7 @@ pub(super) async fn build_reply_with_session_inner(
                     // P0/WP-B: ordinary caller — failover behavior unchanged.
                     allow_cross_family_failover: true,
                 });
+            let work = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), work);
             tokio::pin!(work);
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
@@ -1649,7 +1650,7 @@ pub(super) async fn build_reply_with_session_inner(
                 }
             }
             let origin = ReplyOrigin::runtime_name(&resp.runtime_name);
-            Ok(ReplyAttempt::new(resp.content, origin))
+            Ok(ReplyAttempt::new(runtime_content_for_session(resp, hb_session_id), origin))
         })
     } else {
         Box::pin(async {
@@ -2154,10 +2155,7 @@ pub(super) async fn build_reply_with_session_inner(
                     .as_deref()
                     .map(crate::runtime_config::decision_ttl_days)
                     .unwrap_or(7);
-                let util_model = agent_dir
-                    .as_deref()
-                    .map(crate::runtime_config::agent_utility_model)
-                    .unwrap_or_else(|| crate::runtime_config::DEFAULT_UTILITY_MODEL.to_string());
+                let agent_dir_for_dec = agent_dir.clone();
                 let home_for_dec = ctx.home_dir.clone();
                 let decision_provenance = turn_sources.assistant_provenance();
                 let ctx_meta = {
@@ -2188,14 +2186,16 @@ pub(super) async fn build_reply_with_session_inner(
                         .await;
                     }
 
-                    // P3.1: confident → zero-cost; suspected → one Haiku confirm;
+                    // P3.1: confident → zero-cost; suspected → one utility confirm;
                     // no-choice → done.
                     let draft = match crate::decision_capture::classify_outbound(&reply_for_dec) {
                         crate::decision_capture::DetectionResult::Confident(d) => d,
                         crate::decision_capture::DetectionResult::Suspected => {
                             let prompt =
                                 crate::decision_capture::build_extraction_prompt(&reply_for_dec);
-                            match call_claude_cli_lightweight(&prompt, &util_model, &home_for_dec)
+                            match super::cli_spawn::call_background_utility(
+                                &prompt, &home_for_dec, agent_dir_for_dec.as_deref(), &agent_for_dec, 512,
+                            )
                                 .await
                             {
                                 Ok(out) => {
@@ -2203,15 +2203,15 @@ pub(super) async fn build_reply_with_session_inner(
                                         Some(d) => {
                                             tracing::info!(
                                                 agent = %agent_for_dec,
-                                                "RFC-24: suspected choice confirmed by Haiku second-pass"
+                                                "RFC-24: suspected choice confirmed by utility second-pass"
                                             );
                                             d
                                         }
-                                        None => return, // Haiku said not a decision
+                                        None => return, // Utility said not a decision
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = %e, "decision capture: Haiku second-pass failed");
+                                    tracing::warn!(error = %e, "decision capture: utility second-pass failed");
                                     return;
                                 }
                             }
@@ -2435,13 +2435,15 @@ pub(super) async fn build_reply_with_session_inner(
 
         // ── Instruction Pinning: extract on first turn ──────────────
         // Asynchronously extract core task instructions from the first user
-        // message using Haiku (lightweight, same path as session compression).
+        // message using the agent's utility runtime (same as compression).
         // Pinned instructions persist across turns and survive compression.
         if !has_history {
             let sm = ctx.session_manager.clone();
             let sid = session_id.to_string();
             let user_text = sanitized_text.clone();
             let home = ctx.home_dir.clone();
+            let agent_dir_for_pin = agent_dir.clone();
+            let agent_for_pin = agent_id.clone();
             tokio::spawn(async move {
                 let prompt = format!(
                     "Extract the core task instructions from this user message. \
@@ -2449,10 +2451,8 @@ pub(super) async fn build_reply_with_session_inner(
                      and deliverables. Max 200 words. Use the same language as the input.\n\n\
                      {user_text}"
                 );
-                match call_claude_cli_lightweight(
-                    &prompt,
-                    crate::runtime_config::DEFAULT_UTILITY_MODEL,
-                    &home,
+                match super::cli_spawn::call_background_utility(
+                    &prompt, &home, agent_dir_for_pin.as_deref(), &agent_for_pin, 512,
                 )
                 .await
                 {
@@ -2483,6 +2483,7 @@ pub(super) async fn build_reply_with_session_inner(
                 let chat_id_for_facts = cid.to_string();
                 let session_for_facts = session_id.to_string();
                 let home_for_facts = ctx.home_dir.clone();
+                let agent_dir_for_facts = agent_dir.clone();
                 let home_for_activity = ctx.home_dir.clone();
                 let tx_for_activity = ctx.event_tx.clone();
                 let fact_provenance = turn_sources.provenance();
@@ -2501,10 +2502,8 @@ pub(super) async fn build_reply_with_session_inner(
                          User: {user_text_for_facts}\n\
                          Assistant: {reply_snippet}"
                     );
-                    let facts_text = match call_claude_cli_lightweight(
-                        &prompt,
-                        crate::runtime_config::DEFAULT_UTILITY_MODEL,
-                        &home_for_facts,
+                    let facts_text = match super::cli_spawn::call_background_utility(
+                        &prompt, &home_for_facts, agent_dir_for_facts.as_deref(), &agent_id_for_facts, 512,
                     )
                     .await
                     {
@@ -3642,10 +3641,12 @@ pub(super) async fn build_reply_with_session_inner(
             recorder.record_turn(&session_key, "assistant", &reply, vec![]);
         }
 
-        // Check if compression needed; generate Claude summary then compress in background
+        // Check if compression is needed; summarize on the agent's runtime in background
         let sm = ctx.session_manager.clone();
         let sid = session_id.to_string();
         let home_for_compress = ctx.home_dir.clone();
+        let agent_dir_for_compress = agent_dir.clone();
+        let agent_for_compress = agent_id.clone();
         tokio::spawn(async move {
             if sm.should_compress(&sid).await {
                 // Gather last messages to summarise
@@ -3673,10 +3674,8 @@ pub(super) async fn build_reply_with_session_inner(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match call_claude_cli_lightweight(
-                    &prompt,
-                    crate::runtime_config::DEFAULT_UTILITY_MODEL,
-                    &home_for_compress,
+                let summary = match super::cli_spawn::call_background_utility(
+                    &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
                 )
                 .await
                 {
@@ -3817,6 +3816,40 @@ pub(super) async fn build_reply_with_session_inner(
         return msg.to_string();
     }
     failure.message(&name, &ctx.home_dir)
+}
+
+/// Render operational status at the audience boundary, never in model text.
+fn runtime_content_for_session(response: crate::runtime::RuntimeResponse, session_id: &str) -> String {
+    let mut content = response.content;
+    if let Some(seconds) = response.partial_timeout_secs {
+        if !crate::odoo_livechat::is_public_visitor_session(session_id) {
+            content.push_str(&format!("\n\n（已達執行時間上限 {seconds} 秒，以上為已完成的部分。）"));
+        }
+    }
+    content
+}
+
+#[cfg(test)]
+mod timeout_audience_tests {
+    use super::*;
+
+    #[test]
+    fn partial_runtime_timeout_notice_is_operator_only() {
+        for session in ["odoolivechat:site:visitor", "webchat:owner", "line:owner"] {
+            let response = crate::runtime::RuntimeResponse {
+                content: "已完成的答覆".into(), partial_timeout_secs: Some(300), ..Default::default()
+            };
+            let text = runtime_content_for_session(response, session);
+            if crate::odoo_livechat::is_public_visitor_session(session) {
+                assert_eq!(text, "已完成的答覆");
+            } else {
+                assert_eq!(text, "已完成的答覆\n\n（已達執行時間上限 300 秒，以上為已完成的部分。）");
+            }
+        }
+        assert_eq!(runtime_content_for_session(crate::runtime::RuntimeResponse {
+            content: "normal".into(), ..Default::default()
+        }, "webchat:owner"), "normal");
+    }
 }
 
 /// True when a non-Claude reply's actual answering runtime differs from the

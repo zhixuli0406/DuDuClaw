@@ -22,14 +22,30 @@ use tracing::{info, warn};
 // ── Core trait ──────────────────────────────────────────────────
 
 /// Unified response from any agent runtime.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RuntimeResponse {
+    /// Completed output returned when a run reached its deadline. Channel code
+    /// decides whether this operational detail belongs in a public reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_timeout_secs: Option<u64>,
     pub content: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub model_used: String,
     pub runtime_name: String,
+}
+
+impl RuntimeResponse {
+    /// A partial answer is display-only and must never become a verdict.
+    pub fn ensure_complete(&self) -> Result<(), String> {
+        match self.partial_timeout_secs {
+            Some(seconds) => Err(format!(
+                "{} CLI hard timeout after {seconds}s (partial output discarded)", self.runtime_name
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A single turn in conversation history.
@@ -1061,6 +1077,7 @@ mod tests {
             tool_use("shell"),
             tool_result(false),
             RuntimeChunk::Done(RuntimeResponse {
+                partial_timeout_secs: None,
                 content: "done".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,

@@ -3334,6 +3334,12 @@ pub struct RuntimeSection {
     #[serde(deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// Per-run CLI or per-request OpenAI-compatible API limit in seconds.
+    /// Claude retains its fixed 30-minute limit. Missing or wrong-typed values use
+    /// the runtime default; resolution clamps integers to 30..=3600.
+    #[serde(deserialize_with = "crate::agent_toml::deserialize_timeout_secs")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<i64>,
     /// Minimal-context spawn optimization (WP-7A). When applied, the spawned
     /// official CLI drops the operator's *user*-global settings and memory
     /// (`--setting-sources project,local` — keeps the agent's own
@@ -5803,5 +5809,24 @@ credit_rate = 2.0
         assert!(caps.computer_use_config.allowed_domains.is_empty());
         // Absent = empty.
         assert!(ComputerUseCapConfig::default().navigation_hosts().hosts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod runtime_timeout_tests {
+    use super::RuntimeSection;
+
+    #[test]
+    fn optional_timeout_preserves_existing_runtime_shape() {
+        let absent: RuntimeSection = toml::from_str("provider = \"codex\"\n").unwrap();
+        assert!(!toml::to_string(&absent).unwrap().contains("timeout_secs"));
+        let configured: RuntimeSection = toml::from_str("timeout_secs = 900\n").unwrap();
+        assert_eq!(configured.timeout_secs, Some(900));
+        assert!(toml::to_string(&configured).unwrap().contains("timeout_secs = 900"));
+        for value in ["\"bad\"", "1.5", "true", "[]", "{}"] {
+            let parsed: RuntimeSection = toml::from_str(&format!("provider = \"codex\"\ntimeout_secs = {value}\n")).unwrap();
+            assert_eq!(parsed.timeout_secs, None);
+            assert_eq!(parsed.provider.as_deref(), Some("codex"));
+        }
     }
 }

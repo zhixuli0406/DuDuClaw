@@ -112,13 +112,13 @@ impl AgentRegistry {
                 continue;
             }
 
-            // Skip directories starting with _
+            // Skip internal and hidden directories
             let dir_name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(name) => name.to_string(),
                 None => continue,
             };
-            if dir_name.starts_with('_') {
-                info!(dir = %dir_name, "skipping underscore-prefixed directory");
+            if duduclaw_core::is_internal_agent_dir(&dir_name) {
+                info!(dir = %dir_name, "skipping internal or hidden directory");
                 continue;
             }
 

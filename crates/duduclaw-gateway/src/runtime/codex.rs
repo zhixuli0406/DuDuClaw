@@ -15,8 +15,6 @@ use duduclaw_core::types::{CapabilitiesConfig, sandbox_level_for};
 
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
-
 /// Derive Codex CLI sandbox/approval flags from the agent's capabilities.
 ///
 /// Replaces the former blanket `--full-auto` (which unconditionally implied
@@ -594,18 +592,11 @@ static CODEX_ENV_VARS_SUPPORT: std::sync::OnceLock<EnvVarsSupportCache> =
 /// The probe can never make a spawn fail: every failure mode returns `None`,
 /// which [`codex_supports_env_vars`] reads as "not supported".
 async fn probe_codex_version_output(bin: &str) -> Option<String> {
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::process::Command::new(bin)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version");
+    let out = crate::process_group::output(
+        &mut cmd, None, std::time::Duration::from_secs(5),
+    ).await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -879,6 +870,215 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
     (content, input_tokens, output_tokens, chunks)
 }
 
+/// Keep completed assistant messages in emission order for a timed-out run.
+/// The normal parser deliberately keeps only the last message; do not change it.
+fn completed_codex_messages(stdout: &str) -> Vec<String> {
+    stdout.lines().filter_map(|line| {
+        let event: CodexEvent = serde_json::from_str(line).ok()?;
+        if event.event_type != "item.completed" {
+            return None;
+        }
+        let item = event.extra.get("item")?;
+        let kind = item.get("type")?.as_str()?;
+        if kind != "agent_message" && kind != "message" {
+            return None;
+        }
+        let text = if kind == "agent_message" && item.get("text").and_then(|v| v.as_str()).is_some() {
+            item["text"].as_str()?.to_string()
+        } else {
+            item.get("content")?.as_array()?.iter()
+                .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("output_text"))
+                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>().join("\n")
+        };
+        (!text.trim().is_empty()).then_some(text)
+    }).collect()
+}
+
+// Bound every retained representation independently. Pipes are always drained,
+// including oversized lines and streams beyond the retention budget.
+const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STDOUT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct CodexOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    line: Vec<u8>,
+    dropping_line: bool,
+    truncated: bool,
+    content: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    chunks: Vec<super::RuntimeChunk>,
+    chunk_bytes: usize,
+    completed: Vec<String>,
+    completed_bytes: usize,
+    last_line: String,
+    status: Option<std::process::ExitStatus>,
+}
+
+impl CodexOutput {
+    fn stdout_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.dropping_line {
+                if byte == b'\n' { self.dropping_line = false; }
+                continue;
+            }
+            if self.line.len() == MAX_STDOUT_LINE_BYTES {
+                self.line.clear();
+                self.dropping_line = byte != b'\n';
+                self.truncated = true;
+                continue;
+            }
+            self.line.push(byte);
+            if byte == b'\n' { self.finish_line(); }
+        }
+    }
+
+    fn finish_line(&mut self) {
+        if self.line.is_empty() { return; }
+        let line_bytes = std::mem::take(&mut self.line);
+        if self.stdout.len() + line_bytes.len() <= MAX_STDOUT_BYTES {
+            self.stdout.extend_from_slice(&line_bytes);
+        } else {
+            self.truncated = true;
+        }
+        let line = String::from_utf8_lossy(&line_bytes);
+        self.last_line = line.lines().last().unwrap_or("").to_string();
+        // Parse each bounded event as it arrives, even after the raw-output
+        // retention cap. In particular, final usage must not disappear merely
+        // because earlier tool output consumed the raw-log budget.
+        if let Ok(event) = serde_json::from_str::<CodexEvent>(&line) {
+            let (content, input, output, chunks) = parse_codex_stdout(&line);
+            if event.event_type == "turn.completed"
+                && event.extra.get("usage").and_then(|u| serde_json::from_value::<CodexUsage>(u.clone()).ok()).is_some()
+            {
+                self.input_tokens = input;
+                self.output_tokens = output;
+            }
+            if event.event_type == "item.completed" {
+                if let Some(item) = event.extra.get("item") {
+                    let kind = item.get("type").and_then(|v| v.as_str());
+                    let has_text = (kind == Some("agent_message") && item.get("text").and_then(|v| v.as_str()).is_some())
+                        || item.get("content").and_then(|v| v.as_array())
+                            .and_then(|blocks| blocks.iter().find(|block|
+                                block.get("type").and_then(|v| v.as_str()) == Some("output_text")))
+                            .and_then(|block| block.get("text")).and_then(|v| v.as_str()).is_some();
+                    if matches!(kind, Some("message" | "agent_message")) && has_text {
+                        self.content = content;
+                    }
+                }
+                for text in completed_codex_messages(&line) {
+                    let charge = text.len().max(128);
+                    if self.completed_bytes + charge <= MAX_STDOUT_BYTES {
+                        self.completed_bytes += charge;
+                        self.completed.push(text);
+                    } else {
+                        self.truncated = true;
+                    }
+                }
+            }
+            if !chunks.is_empty() {
+                // Charge at least 128 bytes per event to bound vector overhead
+                // for adversarial streams containing many tiny tool events.
+                let charge = line_bytes.len().max(128);
+                if self.chunk_bytes + charge <= MAX_STDOUT_BYTES {
+                    self.chunk_bytes += charge;
+                    self.chunks.extend(chunks);
+                } else {
+                    self.truncated = true;
+                }
+            }
+        }
+    }
+
+    fn stderr_bytes(&mut self, bytes: &[u8]) {
+        if self.stderr.len() + bytes.len() > MAX_STDERR_BYTES {
+            self.truncated = true;
+            let remove = (self.stderr.len() + bytes.len() - MAX_STDERR_BYTES).min(self.stderr.len());
+            self.stderr.drain(..remove);
+        }
+        let start = bytes.len().saturating_sub(MAX_STDERR_BYTES);
+        self.stderr.extend_from_slice(&bytes[start..]);
+    }
+
+    fn timeout_content(&self, timeout_secs: u64) -> Result<String, String> {
+        if self.completed.is_empty() {
+            return Err(format!("Codex CLI hard timeout after {timeout_secs}s (no completed output)"));
+        }
+        warn!(timeout_secs, completed_messages = self.completed.len(),
+            "Codex CLI hard timeout; returning completed output");
+        Ok(self.completed.join("\n\n"))
+    }
+}
+
+/// All readers are local futures. Cancellation drops the readers and the
+/// managed leader, which kills its group and schedules reaping.
+async fn collect_codex_output(
+    cmd: &mut tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Result<CodexOutput, String> {
+    #[cfg(test)]
+    if let Ok(output) = tests::COLLECT_PROBE.try_with(|probe| probe(cmd)) {
+        return output;
+    }
+    use tokio::io::AsyncReadExt;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut managed = crate::process_group::ManagedChild::spawn(cmd)
+        .map_err(|e| format!("Failed to spawn codex: {e}"))?;
+    let mut stdout = managed.child().stdout.take().ok_or("Failed to capture codex stdout")?;
+    let mut stderr = managed.child().stderr.take().ok_or("Failed to capture codex stderr")?;
+    let mut output = CodexOutput::default();
+    let mut stdout_buffer = [0u8; 8192];
+    let mut stderr_buffer = [0u8; 8192];
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut status = None;
+    let result = tokio::time::timeout(timeout, async {
+        while !stdout_done || !stderr_done || status.is_none() {
+            tokio::select! {
+                read = stdout.read(&mut stdout_buffer), if !stdout_done => {
+                    let read = read?;
+                    if read == 0 { stdout_done = true; output.finish_line(); }
+                    else { output.stdout_bytes(&stdout_buffer[..read]); }
+                }
+                read = stderr.read(&mut stderr_buffer), if !stderr_done => {
+                    let read = read?;
+                    if read == 0 { stderr_done = true; }
+                    else { output.stderr_bytes(&stderr_buffer[..read]); }
+                }
+                waited = managed.child().wait(), if status.is_none() => {
+                    status = Some(waited?);
+                    managed.leader_exited();
+                }
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    }).await;
+    output.finish_line();
+    if output.truncated {
+        warn!(stdout_limit = MAX_STDOUT_BYTES, line_limit = MAX_STDOUT_LINE_BYTES,
+            stderr_limit = MAX_STDERR_BYTES, "Codex output retention truncated; pipes continued draining");
+    }
+    match result {
+        Ok(Ok(())) => {
+            if status.is_some_and(|status| status.success()) { managed.disarm(); }
+            else { managed.kill_and_reap().await; }
+            output.status = status;
+        }
+        Ok(Err(error)) => {
+            managed.kill_and_reap().await;
+            return Err(format!("Failed to read codex output: {error}"));
+        }
+        Err(_) => { managed.kill_and_reap().await; }
+    }
+    Ok(output)
+}
+
 /// R1: extract an `mcp_tool_call` item's output text for `RuntimeChunk::ToolResult`.
 /// Tries the documented success shape first (`result.content[].text`, the
 /// same content-block array MCP `tool_result`s use), then falls back to
@@ -907,6 +1107,82 @@ fn extract_mcp_tool_call_output(item: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// Restricted utility profile, verified against codex-cli 0.164.0 help and
+/// upstream 970111f6 config/features/tool registry. This is NOT tool-free:
+/// built-in read-capable tools may remain. See the security report for the
+/// system/managed configuration boundary of --ignore-user-config.
+fn utility_args() -> Vec<String> {
+    ["exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
+        "--ignore-user-config", "--ephemeral", "--ignore-rules",
+        "-c", "approval_policy=never",
+        "-c", "features.shell_tool=false",
+        "-c", "features.view_image=false",
+        "-c", "features.image_generation=false",
+        "-c", "features.multi_agent=false",
+        "-c", "features.multi_agent_v2=false",
+        "-c", "agents.enabled=false",
+        "-c", "web_search=\"disabled\"",
+        "-c", "features.hooks=false",
+        "-c", "features.plugins=false",
+        "-c", "features.apps=false",
+        "-c", "features.skip_host_skill_discovery=true",
+        "-c", "project_doc_max_bytes=0",
+    ].into_iter().map(str::to_owned).collect()
+}
+
+fn utility_native_caps(caps: Option<&CapabilitiesConfig>) -> CapabilitiesConfig {
+    CapabilitiesConfig {
+        native_sandbox: caps.is_some_and(|c| c.native_sandbox),
+        allowed_tools: vec!["Read".into()],
+        computer_use: false,
+        browser_via_bash: false,
+        ..Default::default()
+    }
+}
+
+impl CodexRuntime {
+    fn prepare_utility_command(
+        &self,
+        prompt: &str,
+        context: &RuntimeContext,
+    ) -> Result<(tokio::process::Command, tempfile::TempDir, Option<tempfile::NamedTempFile>), String> {
+        // TempDir owns cleanup on success, spawn failure, timeout and cancellation.
+        // tempfile creates private directories (0700 on Unix); set explicitly too.
+        let work_dir = tempfile::Builder::new().prefix("duduclaw-codex-utility-")
+            .tempdir().map_err(|e| format!("cannot create Codex utility directory: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(work_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("cannot secure Codex utility directory: {e}"))?;
+        }
+        let mut cmd = tokio::process::Command::new(&self.codex_path);
+        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+        // Auth stays in the real auth store, never copied into the temporary cwd.
+        // CODEX_HOME is an auth location, absent from the generic spawn allowlist.
+        if let Some(home) = std::env::var_os("CODEX_HOME") { cmd.env("CODEX_HOME", home); }
+        if let Some(key) = std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY", key); }
+        cmd.args(utility_args());
+        cmd.args(effort_args(context.effort));
+        let (schema_args, schema_file) =
+            output_schema_args(crate::runtime_dispatch::output_schema_override().as_ref());
+        cmd.args(schema_args);
+        let safe_prompt = if prompt.starts_with('-') { format!(" {prompt}") } else { prompt.to_owned() };
+        let system_prompt = duduclaw_core::truncate_bytes(&context.system_prompt, 65536);
+        let augmented = if system_prompt.is_empty() { safe_prompt } else {
+            format!("<role_system_prompt>\n{}\n</role_system_prompt>\n\n{safe_prompt}",
+                system_prompt.replace("</role_system_prompt>", "&lt;/role_system_prompt&gt;"))
+        };
+        cmd.arg(augmented);
+        if !context.model.is_empty() { cmd.arg("-m").arg(&context.model); }
+        // Both process cwd and Codex's working root exclude employee/project files.
+        cmd.current_dir(work_dir.path()).arg("--cd").arg(work_dir.path());
+        let caps = utility_native_caps(context.capabilities.as_ref());
+        super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_dir.path()), "codex")?;
+        Ok((cmd, work_dir, schema_file))
+    }
+}
+
 // ── AgentRuntime impl ───────────────────────────────────────────
 
 #[async_trait]
@@ -920,6 +1196,10 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        if crate::runtime_dispatch::in_utility_call() {
+            let (mut cmd, _work_dir, _schema_file) = self.prepare_utility_command(prompt, context)?;
+            return execute_codex_command(&mut cmd, context).await;
+        }
         // Explore lane: `-s read-only` whatever the capability level, and the
         // duduclaw MCP server registered with the lane variable (below).
         let explore = crate::explore_lane::in_explore();
@@ -1166,72 +1446,93 @@ impl AgentRuntime for CodexRuntime {
         // the writes the override exists to allow).
         super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "codex")?;
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| "Codex CLI timed out".to_string())?
-        .map_err(|e| format!("Failed to spawn codex: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Codex CLI exited with {}: {}",
-                output.status,
-                stderr.chars().take(500).collect::<String>()
-            ));
-        }
-
-        // Parse JSONL output
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let (mut content, input_tokens, output_tokens, chunks) = parse_codex_stdout(&stdout);
-        super::extend_native_tool_events(super::native_tool_events_from_chunks(&chunks));
-        // Thinking display: `reasoning` items and reasoning tokens, reported
-        // after the run (no-op outside a reply turn).
-        crate::thinking::producers::report_codex(
-            &crate::thinking::producers::parse_codex_thinking(&stdout),
-            &mut crate::thinking::Recorder::new("codex"),
-        );
-
-        if content.is_empty() {
-            // Fallback: use the last line as content
-            content = stdout.lines().last().unwrap_or("").to_string();
-        }
-
-        // Still empty ⇒ FAILURE, not success: Ok("") would be silently dropped
-        // by every channel and poison the session with an empty assistant turn.
-        if content.trim().is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Empty response from Codex CLI (exit 0); stderr tail: {}",
-                duduclaw_core::truncate_bytes(stderr.trim(), 300)
-            ));
-        }
-
-        Ok(RuntimeResponse {
-            content,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens: 0,
-            model_used: context.model.clone(),
-            runtime_name: "codex".to_string(),
-        })
+        execute_codex_command(&mut cmd, context).await
     }
 
     async fn is_available(&self) -> bool {
-        tokio::process::Command::new(&self.codex_path)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+        probe_codex_version_output(&self.codex_path).await.is_some()
     }
 }
 
+// Shared by conversational and utility calls: retain bounded incremental output,
+// process-group cleanup, timeout partials, usage and native-event reporting.
+async fn execute_codex_command(
+    cmd: &mut tokio::process::Command,
+    context: &RuntimeContext,
+) -> Result<RuntimeResponse, String> {
+    let timeout_secs = context.agent_dir.as_deref()
+        .map(crate::runtime_config::agent_timeout_secs)
+        .unwrap_or(crate::runtime_config::DEFAULT_TIMEOUT_SECS);
+    let output = collect_codex_output(
+        cmd, std::time::Duration::from_secs(timeout_secs),
+    ).await?;
+
+    if let Some(status) = output.status {
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Codex CLI exited with {}: {}",
+                status,
+                stderr.chars().take(500).collect::<String>()
+            ));
+        }
+    }
+
+    // Parse JSONL output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut response = RuntimeResponse {
+        partial_timeout_secs: output.status.is_none().then_some(timeout_secs),
+        content: output.content.clone(),
+        input_tokens: output.input_tokens,
+        output_tokens: output.output_tokens,
+        cache_read_tokens: 0,
+        model_used: context.model.clone(),
+        runtime_name: "codex".to_string(),
+    };
+    super::extend_native_tool_events(super::native_tool_events_from_chunks(&output.chunks));
+    // Thinking display: `reasoning` items and reasoning tokens, reported
+    // after the run (no-op outside a reply turn).
+    crate::thinking::producers::report_codex(
+        &crate::thinking::producers::parse_codex_thinking(&stdout),
+        &mut crate::thinking::Recorder::new("codex"),
+    );
+
+    // Parse usage, native events and thinking above on both paths, even
+    // when the deadline left no completed assistant message.
+    if output.status.is_none() {
+        response = crate::runtime_dispatch::validate_runtime_response(response, context).await?;
+        response.content = match output.timeout_content(timeout_secs) {
+            Ok(content) => content,
+            Err(error) => {
+                crate::runtime_dispatch::record_discarded_runtime_usage(context, &response).await;
+                return Err(error);
+            }
+        };
+    }
+
+    if response.content.is_empty() {
+        // Fallback: use the last line as content
+        response.content = output.last_line.clone();
+    }
+
+    // Still empty ⇒ FAILURE, not success: Ok("") would be silently dropped
+    // by every channel and poison the session with an empty assistant turn.
+    if response.content.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Empty response from Codex CLI (exit 0); stderr tail: {}",
+            duduclaw_core::truncate_bytes(stderr.trim(), 300)
+        ));
+    }
+
+    Ok(response)
+}
+
 // ── Streaming ───────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "codex_timeout_usage_tests.rs"]
+mod timeout_usage_tests;
 
 impl CodexRuntime {
     /// Execute and return chunks. Codex CLI does not support true streaming,
@@ -1375,6 +1676,324 @@ mod tests {
             serde_json::from_value(event.extra.get("usage").unwrap().clone()).unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn bounded_parser_preserves_normal_messages_usage_and_tools() {
+        let stdout = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"完成\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"echo ok\",\"aggregated_output\":\"ok\",\"status\":\"completed\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}\n"
+        );
+        let expected = parse_codex_stdout(stdout);
+        let actual = collected_fixture(stdout);
+        assert_eq!((actual.content, actual.input_tokens, actual.output_tokens), (expected.0, expected.1, expected.2));
+        assert_eq!(format!("{:?}", actual.chunks), format!("{:?}", expected.3));
+        assert_eq!(actual.stdout, stdout.as_bytes());
+        assert!(!actual.truncated);
+    }
+
+    #[test]
+    fn oversized_line_is_discarded_and_later_usage_is_still_parsed() {
+        let mut output = CodexOutput::default();
+        let block = [b'x'; 8192];
+        for _ in 0..(MAX_STDOUT_LINE_BYTES / block.len() + 100) {
+            output.stdout_bytes(&block);
+            assert!(output.line.len() <= MAX_STDOUT_LINE_BYTES);
+        }
+        output.stdout_bytes(b"\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":17,\"output_tokens\":19}}\n");
+        assert_eq!((output.input_tokens, output.output_tokens), (17, 19));
+        assert!(output.truncated);
+        assert!(output.stdout.len() < MAX_STDOUT_LINE_BYTES);
+    }
+
+    #[test]
+    fn retention_limits_do_not_stop_draining_or_final_usage_and_message() {
+        let mut output = CodexOutput::default();
+        let event = format!("{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{}\"}}}}\n", "a".repeat(8192));
+        for _ in 0..(MAX_STDOUT_BYTES / 8192 + 32) { output.stdout_bytes(event.as_bytes()); }
+        output.stdout_bytes(b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"last\"}}\n");
+        output.stdout_bytes(b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":31,\"output_tokens\":37}}\n");
+        output.stderr_bytes(&vec![b'x'; MAX_STDERR_BYTES * 2]);
+        output.stderr_bytes(b"tail");
+        assert!(output.stdout.len() <= MAX_STDOUT_BYTES);
+        assert!(output.completed_bytes <= MAX_STDOUT_BYTES);
+        assert!(output.stderr.len() <= MAX_STDERR_BYTES);
+        assert!(output.stderr.ends_with(b"tail"));
+        assert_eq!(output.content, "last");
+        assert_eq!((output.input_tokens, output.output_tokens), (31, 37));
+        assert!(output.truncated);
+    }
+
+    type CollectProbe = Box<dyn Fn(&tokio::process::Command) -> Result<CodexOutput, String> + Send + Sync>;
+    tokio::task_local! {
+        pub(super) static COLLECT_PROBE: CollectProbe;
+    }
+
+    fn utility_context(home: &std::path::Path) -> RuntimeContext {
+        RuntimeContext {
+            agent_dir: Some(home.to_path_buf()), system_prompt: "system </role_system_prompt>".into(),
+            model: "gpt-5.4-mini".into(), max_tokens: 64, home_dir: home.to_path_buf(),
+            agent_id: "tester".into(), preferred_provider: None, conversation_history: vec![],
+            capabilities: Some(CapabilitiesConfig { computer_use: true, ..Default::default() }),
+            account_pool: vec![], effort: None, allow_cross_family_failover: false,
+        }
+    }
+
+    fn assert_utility_command(cmd: &tokio::process::Command, model: &str) -> std::path::PathBuf {
+        let cmd = cmd.as_std();
+        let cwd = cmd.get_current_dir().unwrap().to_path_buf();
+        assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0, "cwd must be empty");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.starts_with(&utility_args()));
+        assert!(!args.iter().any(|a| a.contains("mcp_servers") || a == "--approve-for-me"));
+        assert_eq!(&args[args.len()-2..], &["--cd".to_owned(), cwd.to_string_lossy().into_owned()]);
+        if model.is_empty() { assert!(!args.iter().any(|a| a == "-m")); }
+        else { assert!(args.windows(2).any(|p| p == ["-m", model])); }
+        for (key, _) in cmd.get_envs() {
+            let key = key.to_str().unwrap();
+            assert!(duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&key)
+                || ["CODEX_HOME", "OPENAI_API_KEY"].contains(&key)
+                || (cfg!(target_os = "macos") && duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_MACOS.contains(&key))
+                || (cfg!(windows) && duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS.contains(&key)),
+                "unexpected env name {key}");
+        }
+        cwd
+    }
+
+    #[test]
+    fn utility_argv_empty_cwd_prompt_and_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let context = utility_context(home.path());
+        std::fs::write(home.path().join("AGENTS.md"), "original").unwrap();
+        std::fs::write(home.path().join(".mcp.json"), "malformed employee MCP must not be read").unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), "original config").unwrap();
+        let runtime = CodexRuntime { codex_path: "/nonexistent/vendor-cli".into() };
+        for model in ["", "gpt-5.4-mini"] {
+            let mut context = context.clone();
+            context.model = model.into();
+            let (cmd, dir, schema) = runtime.prepare_utility_command("-injected", &context).unwrap();
+            let cwd = assert_utility_command(&cmd, model);
+            assert_ne!(cwd, home.path());
+            let mut expected: Vec<String> = [
+                "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
+                "--ignore-user-config", "--ephemeral", "--ignore-rules",
+                "-c", "approval_policy=never", "-c", "features.shell_tool=false",
+                "-c", "features.view_image=false", "-c", "features.image_generation=false",
+                "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                "-c", "agents.enabled=false",
+                "-c", "web_search=\"disabled\"",
+                "-c", "features.hooks=false", "-c", "features.plugins=false",
+                "-c", "features.apps=false", "-c", "features.skip_host_skill_discovery=true",
+                "-c", "project_doc_max_bytes=0",
+            ].into_iter().map(str::to_owned).collect();
+            expected.push("<role_system_prompt>\nsystem &lt;/role_system_prompt&gt;\n</role_system_prompt>\n\n -injected".into());
+            if !model.is_empty() { expected.extend(["-m".into(), model.into()]); }
+            expected.extend(["--cd".into(), cwd.to_string_lossy().into_owned()]);
+            assert_eq!(cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), expected);
+            assert!(schema.is_none());
+            drop(dir);
+            assert!(!cwd.exists());
+        }
+        assert_eq!(std::fs::read_to_string(home.path().join("AGENTS.md")).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap(), "original config");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 3);
+        let caps = utility_native_caps(Some(&CapabilitiesConfig {
+            native_sandbox: true, computer_use: true, browser_via_bash: true, ..Default::default()
+        }));
+        assert!(caps.native_sandbox);
+        assert_eq!(sandbox_level_for(Some(&caps)), duduclaw_core::types::SandboxLevel::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn collected_partial_timeout_is_display_only() {
+        let home = tempfile::tempdir().unwrap();
+        let context = utility_context(home.path());
+        for utility in [false, true] {
+            let probe: CollectProbe = Box::new(|_| {
+                let mut output = collected_fixture(
+                    "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n");
+                output.status = None;
+                Ok(output)
+            });
+            let mut cmd = tokio::process::Command::new("fixture-never-spawned");
+            let call = COLLECT_PROBE.scope(probe, execute_codex_command(&mut cmd, &context));
+            if utility {
+                let error = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((),
+                    crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err();
+                assert_eq!(error, "codex CLI hard timeout after 300s (partial output discarded)");
+            } else {
+                let response = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap();
+                assert_eq!(response.content, "PASS");
+                assert_eq!(response.partial_timeout_secs, Some(300));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_codex_command_keeps_conversational_flags_and_agent_prompt_file() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = utility_context(home.path());
+        context.capabilities = None;
+        let runtime = CodexRuntime { codex_path: "/nonexistent/vendor-cli".into() };
+        let agent = home.path().to_owned();
+        let probe: CollectProbe = Box::new(move |cmd| {
+            let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            assert_eq!(&args[..8], &["exec", "--json", "--skip-git-repo-check", "--approve-for-me",
+                "-c", "approval_policy=never", "-c", "sandbox_mode=\"workspace-write\""]);
+            assert!(!args.iter().any(|a| ["--ignore-user-config", "--ephemeral", "--ignore-rules",
+                "features.shell_tool=false", "project_doc_max_bytes=0"].contains(&a.as_str())));
+            assert_eq!(&args[args.len()-5..], &["normal".to_owned(), "-m".into(),
+                "gpt-5.4-mini".into(), "--cd".into(), agent.to_string_lossy().into_owned()]);
+            assert_eq!(std::fs::read_to_string(agent.join("AGENTS.md")).unwrap(), "system </role_system_prompt>");
+            Err("normal argv observed".into())
+        });
+        let error = COLLECT_PROBE.scope(probe, runtime.execute("normal", &context)).await.unwrap_err();
+        assert_eq!(error, "normal argv observed");
+    }
+
+    #[tokio::test]
+    async fn utility_cleans_temp_dir_after_error_and_timeout() {
+        let home = tempfile::tempdir().unwrap();
+        let context = utility_context(home.path());
+        let runtime = CodexRuntime { codex_path: "/nonexistent/vendor-cli".into() };
+        for timeout in [false, true] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = seen.clone();
+            let probe: CollectProbe = Box::new(move |cmd| {
+                *captured.lock().unwrap() = Some(assert_utility_command(cmd, "gpt-5.4-mini"));
+                if timeout { Ok(CodexOutput::default()) } else { Err("fixture spawn error".into()) }
+            });
+            let error = COLLECT_PROBE.scope(probe, crate::runtime_dispatch::UTILITY_CALL.scope((),
+                runtime.execute("text", &context))).await.unwrap_err();
+            assert!(if timeout { error.contains("hard timeout") } else { error == "fixture spawn error" }, "{error}");
+            assert!(!seen.lock().unwrap().as_ref().unwrap().exists());
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn hinted_team_verifier_and_judge_dispatch_to_restricted_codex() {
+        use crate::runtime_dispatch::{UtilityModelHint, run_utility_prompt_with_hint};
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/tester");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[runtime]\nprovider='codex'\n[model]\nutility='gpt-5.4-mini'\n").unwrap();
+        // No host CLI detection or credential-file reads: use the real Codex
+        // runtime, but intercept its collector before any subprocess is spawned.
+        let registry = super::super::RuntimeRegistry::with_runtimes(std::collections::HashMap::from([
+            (duduclaw_core::types::RuntimeType::Codex,
+                Box::new(CodexRuntime { codex_path: "/nonexistent/vendor-cli".into() }) as Box<dyn AgentRuntime>),
+        ]));
+        let _guard = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(), registry).await;
+        for owner in [Some(agent.as_path()), None] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = seen.clone();
+            let probe: CollectProbe = Box::new(move |cmd| {
+                assert!(crate::runtime_dispatch::in_utility_call());
+                *captured.lock().unwrap() = Some(assert_utility_command(cmd, "gpt-5.4-mini"));
+                let mut output = collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"verdict\"}}\n");
+                output.status = Some(std::process::ExitStatus::default());
+                Ok(output)
+            });
+            let hint = UtilityModelHint { provider: Some(duduclaw_core::types::RuntimeType::Codex),
+                model: Some("gpt-5.4-mini".into()), ..Default::default() };
+            let result = COLLECT_PROBE.scope(probe, run_utility_prompt_with_hint(
+                home.path(), owner, "tester", "system", "verifier/judge material", 64, Some(&hint),
+            )).await.unwrap();
+            assert_eq!(result, "verdict");
+            assert!(!seen.lock().unwrap().as_ref().unwrap().exists());
+            assert!(!agent.join("AGENTS.md").exists());
+            assert!(!agent.join(".codex").exists());
+        }
+    }
+
+    fn collected_fixture(stdout: &str) -> CodexOutput {
+        let mut output = CodexOutput::default();
+        output.stdout_bytes(stdout.as_bytes());
+        output.finish_line();
+        output
+    }
+
+    #[test]
+    fn timeout_keeps_all_completed_messages_from_truncated_jsonl() {
+        let stdout = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"查詢完成\"}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"type\":\"agent_message\",\"text\":\"未完成\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"已整理\"},{\"type\":\"output_text\",\"text\":\"細節\"}]}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"  \"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{"
+        );
+        assert_eq!(completed_codex_messages(stdout), vec!["查詢完成", "已整理\n細節"]);
+        assert_eq!(collected_fixture(stdout).timeout_content(300).unwrap(),
+            "查詢完成\n\n已整理\n細節");
+        // Normal parsing still returns only the final completed message (even blank).
+        assert_eq!(parse_codex_stdout(stdout).0, "  ");
+    }
+
+    #[test]
+    fn timeout_without_completed_message_is_an_error() {
+        for stdout in ["", "plain text", r#"{"type":"item.started","item":{"type":"agent_message","text":"pending"}}"#] {
+            assert_eq!(collected_fixture(stdout).timeout_content(30).unwrap_err(),
+                "Codex CLI hard timeout after 30s (no completed output)");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_collector_kills_long_sleeping_grandchild() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.env_clear().env("HOME", home.path()).current_dir(home.path())
+            .args(["-c", "/bin/sleep 30 & echo $! > pid; wait"]);
+        let output = collect_codex_output(&mut cmd, std::time::Duration::from_millis(300)).await.unwrap();
+        assert!(output.status.is_none());
+        let pid: i32 = std::fs::read_to_string(home.path().join("pid")).unwrap().trim().parse().unwrap();
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("Codex grandchild {pid} survived timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_collects_stdout_while_draining_stderr() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.env_clear().env("HOME", home.path()).current_dir(home.path());
+        cmd.args(["-c", r#"printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"完成"}}'; /bin/dd if=/dev/zero bs=65536 count=4 >&2 2>/dev/null; exec /bin/sleep 5"#]);
+        let output = collect_codex_output(&mut cmd, std::time::Duration::from_millis(200)).await.unwrap();
+        assert!(output.status.is_none());
+        assert_eq!(output.stderr.len(), MAX_STDERR_BYTES);
+        assert!(output.timeout_content(1).unwrap().starts_with("完成"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collected_normal_output_preserves_every_byte() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.env_clear().args(["-c", "printf 'first\\r\\nsecond'; printf 'diagnostic' >&2"]);
+        let output = collect_codex_output(&mut cmd, std::time::Duration::from_secs(2)).await.unwrap();
+        assert!(output.status.unwrap().success());
+        assert_eq!(output.stdout, b"first\r\nsecond");
+        assert_eq!(output.stderr, b"diagnostic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_with_no_completed_output_never_returns_raw_json() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.env_clear().args(["-c", r#"printf '%s\n' '{"type":"turn.started"}'; exec /bin/sleep 5"#]);
+        let output = collect_codex_output(&mut cmd, std::time::Duration::from_millis(100)).await.unwrap();
+        assert!(output.status.is_none());
+        assert!(output.timeout_content(1).is_err());
     }
 
     // ── T10: parse_codex_stdout → RuntimeChunk → NativeToolEvent ────────

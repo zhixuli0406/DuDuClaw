@@ -151,6 +151,7 @@ export interface AgentDetail extends AgentInfo {
   runtime?: {
     provider?: string;
     fallback?: string;
+    timeout_secs?: number | null;
   };
   /** [research] table — returned by agents.inspect so the automation tab's
    *  self-study toggle can prefill the agent's own value (belief loop ×
@@ -3178,6 +3179,8 @@ export type RuntimeProvider =
  *  string clears the fallback. */
 export interface AgentRuntime {
   provider?: RuntimeProvider;
+  /** Per-run CLI / per-request OpenAI-compatible API limit, 30–3600 seconds. Claude is fixed at 30 minutes. Null clears it. */
+  timeout_secs?: number | null;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;
   /** v1.68 W1 — `[runtime] minimal_context` (精簡啟動內容). Default true. */
@@ -3260,7 +3263,7 @@ export interface AgentDetailV168 {
     max_concurrent_runs?: number;
   };
   budget?: { daily_cap_cents?: number };
-  model?: { effort?: string; utility?: string };
+  model?: { effort?: string; utility?: string | null };
   permissions?: { permissions_enforced_since?: string | number | null };
   runtime?: { minimal_context?: boolean };
   fork?: { enabled?: boolean };
@@ -7208,6 +7211,8 @@ export const api = {
     config: () =>
       client.call('system.config') as Promise<{
         config?: string;
+        /** Global utility provider, canonicalized; removed Gemini is retained for explicit repair. */
+        utility_provider?: string;
         voice?: Partial<VoiceSettings> | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.
         allowed_origins?: string[];

@@ -104,6 +104,7 @@ export function RowNumber({
     <SettingsRow label={label} description={description} tier={tier}>
       <Input
         type="number"
+        aria-label={typeof label === 'string' ? label : undefined}
         value={value}
         min={min}
         max={max}

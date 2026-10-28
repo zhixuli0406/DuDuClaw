@@ -151,7 +151,7 @@
 | Turn trimming | >800 chars → 首 300 + 尾 200 + `[trimmed N chars]`，CJK-safe 字元切片 |
 | Prompt Cache 策略 | Direct API「system_and_3」斷點配置（未公布實測命中率） |
 | 壓縮摘要注入 | 壓縮摘要（role=system）注入 system prompt，不放進對話輪次 |
-| Instruction Pinning | 首則使用者訊息 → async Haiku 擷取 → `sessions.pinned_instructions` → 注入 system prompt 尾端 |
+| Instruction Pinning | 首則使用者訊息 → 非同步以解析後的輔助模型（Codex 受限模式或 Claude／API 無工具模式）（員工後端不支援時改用全域設定）擷取 → `sessions.pinned_instructions` → 注入 system prompt 尾端 |
 | Snowball Recap | 每輪 user message 前置 `<task_recap>`，零 LLM 成本、U-shape 注意力尾端 |
 | Clarification 累積 | Agent 提問 + 使用者回答追加至 pinned instructions（≤1000 字元） |
 | P2 Key-Fact Accumulator | 每輪實質對話 2-4 則事實 → `key_facts` FTS5 表 → 注入 top-3（約 100-150 tokens vs MemGPT 6,500，−87%） |
@@ -394,7 +394,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| 一次性 PTY 呼叫（`duduclaw-cli-runtime`） | 在真正的偽終端下 spawn CLI（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty）並把 stdout 讀到 EOF，服務那些 stdout 接到 pipe 就拒跑的 CLI。使用者：Grok runtime 與 CLI 登入輔助流程。`clear_env` 把 gateway 的廠商 API 金鑰擋在子行程外；`deadline` 是絕對 wall-clock 上限。見 [27-pty-pool-runtime](27-pty-pool-runtime.md) |
+| 一次性 PTY 呼叫（`duduclaw-cli-runtime`） | 在真正的偽終端下 spawn CLI（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty）並把 stdout 讀到 EOF，服務那些 stdout 接到 pipe 就拒跑的 CLI。使用者：CLI 登入輔助流程。Grok 已停用 PTY 重試，因該路徑無法保證逾時後清理行程樹。`clear_env` 把 gateway 的廠商 API 金鑰擋在子行程外；`deadline` 是絕對 wall-clock 上限。見 [27-pty-pool-runtime](27-pty-pool-runtime.md) |
 | PTY session 連線池（**2026-09 移除**） | 長駐的 sentinel-framed `claude` REPL 連線池、`duduclaw-cli-worker` 子行程＋supervisor、`RuntimeMode::PtyPool`、`GET /api/runtime/status`、`pty_pool_*` / `worker_*` 指標與 `[runtime] pty_pool_enabled` / `worker_managed` 鍵全部移除。理由：它所保的 Anthropic 程式化用量拆分於 2026-06-15 暫停後從未恢復，而連線池的 session 沒有對話維度（跨對話 context 洩漏），無法安全啟用 |
 
 ## MCP HTTP/SSE 傳輸（W20）

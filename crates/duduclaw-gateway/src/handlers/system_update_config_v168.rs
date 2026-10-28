@@ -155,6 +155,7 @@ pub(crate) fn apply_v168_keys(table: &mut toml::Table, params: &Value) -> Result
     apply_files(table, params, &mut out)?;
     apply_simple_bools(table, params, &mut out)?;
     apply_judge_model(table, params, &mut out)?;
+    apply_global_utility(table, params, &mut out)?;
     apply_telemetry(table, params, &mut out)?;
     apply_sandbox(table, params, &mut out)?;
     apply_computer_use(table, params, &mut out)?;
@@ -192,6 +193,27 @@ fn set_or_clear_str(table: &mut toml::Table, path: &[&str], key: &str, v: &str, 
     } else {
         section.insert(key.into(), toml::Value::String(v.into()));
         out.changes.push(format!("{}.{key} = \"{v}\"", path.join(".")));
+    }
+    Ok(())
+}
+
+fn apply_global_utility(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
+    for key in ["utility_provider", "utility_model"] {
+        let value = params.get("runtime").and_then(|r| r.get(key))
+            .or_else(|| params.get(format!("runtime.{key}")));
+        if value.is_some_and(Value::is_null) {
+            return Err(format!("runtime.{key} must be a string"));
+        }
+    }
+    if let Some(v) = str_param(params, "runtime.utility_provider")? {
+        let provider = duduclaw_core::types::RuntimeType::parse(v.trim())
+            .ok_or_else(|| format!("runtime.utility_provider must be one of: {}", duduclaw_core::types::RuntimeType::valid_values()))?;
+        set_or_clear_str(table, &["runtime"], "utility_provider", provider.as_str(), out)?;
+        out.applied_immediate = true;
+    }
+    if let Some(v) = str_param(params, "runtime.utility_model")? {
+        set_or_clear_str(table, &["runtime"], "utility_model", if v.trim().is_empty() { "" } else { v }, out)?;
+        out.applied_immediate = true;
     }
     Ok(())
 }

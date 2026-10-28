@@ -117,7 +117,9 @@ impl MethodHandler {
                             "fallback": cfg.model.fallback,
                             "account_pool": cfg.model.account_pool,
                             "api_mode": cfg.model.api_mode,
-                            "utility": cfg.model.utility,
+                            // Preserve unset: the typed model's Claude default must
+                            // not turn a non-Claude agent's empty choice into an override.
+                            "utility": settings["model"].get("utility").cloned().unwrap_or(Value::Null),
                             // Raw: absent ⇒ null (the runtime default).
                             "effort": settings["model"].get("effort").cloned().unwrap_or(Value::Null),
                             // v1.68: backend / context_length / gpu_layers had no reader.

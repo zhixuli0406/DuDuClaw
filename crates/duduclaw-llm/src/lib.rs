@@ -66,7 +66,7 @@ pub use registry::{Feature, ModelCaps, ModelInfo, ModelRegistry, PriceCliff};
 pub use tool_loop::{
     CcrDeliveryGuards, CcrSavedResult, ClientOperation, DEFAULT_MAX_TOOL_ITERS, InterceptDecision,
     MAX_ITERS_STOP, PolicyExecutor, PreparedClientCall, SecretBearer, ToolCallLease, ToolExecutor,
-    ToolInterceptor, ToolLoopOutcome, ToolLoopTelemetry, ToolOutcome, run_tool_loop,
+    ToolInterceptor, ToolLoopOutcome, ToolLoopTelemetry, ToolOutcome, complete_without_tools, run_tool_loop,
     run_tool_loop_with_provenance, run_tool_loop_with_provenance_and_ccr,
 };
 

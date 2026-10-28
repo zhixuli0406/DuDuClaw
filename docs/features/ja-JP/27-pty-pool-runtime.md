@@ -23,7 +23,7 @@ invoke_oneshot(program, args, env, cwd, deadline, clear_env)
 取得したstdout
 ```
 
-機能はこれで全部です。現在の利用者: Grokランタイム（そのCLIはTTYを要求します）と、`duduclaw`自身のCLIログイン補助フロー。
+現在は `duduclaw` の CLI ログイン補助フローが使います。Grok はパイプの空応答を PTY で再実行しません。タイムアウト後のプロセスツリー終了を保証できないため、空応答のエラーを返します。
 
 知っておくべき挙動が2つあります:
 

@@ -149,7 +149,7 @@
 | ターントリミング（Turn Trimming） | >800 chars → 先頭 300 + 末尾 200 + `[trimmed N chars]`、CJK セーフ文字スライス |
 | プロンプトキャッシュ戦略 | Direct API "system_and_3" ブレークポイント配置（実測ヒット率は公開していない） |
 | 圧縮サマリー注入 | 圧縮後サマリー（role=system）を system prompt に注入、会話ターンではない |
-| Instruction Pinning | 最初のユーザーメッセージ → 非同期 Haiku 抽出 → `sessions.pinned_instructions` → system prompt 末尾に注入 |
+| Instruction Pinning | 最初のユーザーメッセージ → 解決された補助モデル（Codex の制限モード、または Claude／API のツールなしモード）（社員ランタイムが非対応ならグローバル設定）による非同期抽出 → `sessions.pinned_instructions` → system prompt 末尾に注入 |
 | Snowball Recap | 各ターンの user message 先頭に `<task_recap>` を付加、LLM コストゼロ、U 字型注意の末尾 |
 | Clarification 累積 | エージェントの質問 + ユーザー回答 → pinned instructions に追加（≤1000 文字） |
 | P2 Key-Fact Accumulator | 実質的なターン毎に 2-4 事実 → `key_facts` FTS5 テーブル → top-3 注入（~100-150 tokens vs MemGPT 6,500、−87%） |
@@ -393,7 +393,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| ワンショットPTY呼び出し（`duduclaw-cli-runtime`）| 本物の疑似端末の下でCLIをspawnし（Win 10 1809+はConPTY、Unixは`portable-pty`経由openpty）、stdoutをEOFまで読み切る。stdoutがただのパイプだと実行を拒むCLI向け。利用者はGrokランタイムとCLIログイン補助フロー。`clear_env`はgatewayのベンダーAPIキーを子プロセスから遮断し、`deadline`は絶対的なwall-clock上限。[27-pty-pool-runtime](27-pty-pool-runtime.md)参照 |
+| ワンショットPTY呼び出し（`duduclaw-cli-runtime`）| 本物の疑似端末の下でCLIをspawnし（Win 10 1809+はConPTY、Unixは`portable-pty`経由openpty）、stdoutをEOFまで読み切る。stdoutがただのパイプだと実行を拒むCLI向け。利用者はCLIログイン補助フロー。Grokはタイムアウト時のプロセスツリー終了を保証できないためPTY再試行を無効にしました。`clear_env`はgatewayのベンダーAPIキーを子プロセスから遮断し、`deadline`は絶対的なwall-clock上限。[27-pty-pool-runtime](27-pty-pool-runtime.md)参照 |
 | PTYセッションプール —— **2026-09に削除** | 長寿命のsentinel-framed `claude` REPLプール、`duduclaw-cli-worker`サブプロセス＋supervisor、`RuntimeMode::PtyPool`、`GET /api/runtime/status`、`pty_pool_*` / `worker_*`メトリクス、`[runtime] pty_pool_enabled` / `worker_managed`キーをすべて削除。理由: 備えていたAnthropicのプログラマティック利用分割は2026-06-15に停止されたまま再開されず、またプールのセッションには会話の次元がなく（会話間コンテキスト漏れ）、安全に有効化できなかった |
 
 ## MCP HTTP/SSE トランスポート（W20）

@@ -473,6 +473,12 @@ pub fn is_valid_agent_id(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Internal and hidden directories are never discoverable employee owners.
+/// Shared by registry discovery and session-owner resolution.
+pub fn is_internal_agent_dir(name: &str) -> bool {
+    matches!(name.as_bytes().first(), Some(b'_' | b'.'))
+}
+
 /// Validate a *newly minted* agent id/slug — used when creating an agent via
 /// the CLI `agent create` command, the dashboard `agents.create` RPC, and the
 /// MCP `create_agent` tool.
