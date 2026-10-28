@@ -17,6 +17,7 @@
 ### Fixed
 
 - Gateway 日誌不再被 discovery 佇列洗版：每 2 秒的輪詢改用共用的任務與審批資料庫連線，不再每次重開並寫兩行 INFO（實測佔日誌 72%）；`gateway.log.YYYY-MM-DD` 每日檔改為只保留最近 14 份。
+- Windows 獨立版不再被誤認成桌面版（NTFS 不分大小寫讓 `duduclaw.exe` 對上 `DuDuClaw.exe`）；Windows 桌面版改以實際主程式 `duduclaw-desktop-app.exe` 辨識。
 
 ## [1.76.3] - 2026-10-28 — Restart notice and sidebar version hotfix
 
