@@ -414,20 +414,15 @@ pub fn detect_install_method() -> InstallMethod {
     let exe_str = exe.to_string_lossy();
 
     // Desktop-app sidecar: macOS bundle path, or (Windows/Linux) the Tauri
-    // main executable sitting next to us. Checked FIRST — a sidecar under
-    // /Applications would otherwise fall through to Standalone and try to
-    // rewrite the signed bundle.
+    // main executable sitting next to us. Windows installs duduclaw-desktop-app.exe
+    // as the main executable and duduclaw.exe as the sidecar. Checked FIRST —
+    // a sidecar under /Applications would otherwise fall through to Standalone
+    // and try to rewrite the signed bundle.
     if exe_str.contains(".app/Contents/") {
         return InstallMethod::Desktop;
     }
-    if let Some(dir) = exe.parent() {
-        let windows_main = dir.join("DuDuClaw.exe");
-        let linux_main = dir.join("duduclaw-desktop-app");
-        if (windows_main.exists() && is_distinct_desktop_neighbor(&exe, "DuDuClaw.exe"))
-            || (linux_main.exists() && is_distinct_desktop_neighbor(&exe, "duduclaw-desktop-app"))
-        {
-            return InstallMethod::Desktop;
-        }
+    if has_desktop_neighbor(&exe, |path| path.exists()) {
+        return InstallMethod::Desktop;
     }
     if exe_str.contains("/Cellar/duduclaw/")
         || exe_str.contains("/homebrew/")
@@ -448,6 +443,23 @@ pub fn detect_install_method() -> InstallMethod {
         return InstallMethod::Source;
     }
     InstallMethod::Standalone
+}
+
+/// Check desktop main-executable candidates with an injectable existence query.
+fn has_desktop_neighbor(
+    current_exe: &std::path::Path,
+    mut exists: impl FnMut(&std::path::Path) -> bool,
+) -> bool {
+    const CANDIDATES: &[&str] = &[
+        "duduclaw-desktop-app.exe",
+        "duduclaw-desktop-app",
+        "DuDuClaw.exe",
+    ];
+    current_exe.parent().is_some_and(|dir| {
+        CANDIDATES.iter().any(|name| {
+            is_distinct_desktop_neighbor(current_exe, name) && exists(&dir.join(name))
+        })
+    })
 }
 
 /// Whether a desktop main-executable candidate is a different file name from
@@ -1628,6 +1640,42 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         assert!(is_distinct_desktop_neighbor(
             std::path::Path::new("C:/Program Files/DuDuClaw/duduclaw-sidecar.exe"),
             "DuDuClaw.exe"
+        ));
+    }
+
+    #[test]
+    fn windows_desktop_sidecar_has_desktop_neighbor() {
+        use std::path::Path;
+        let existing = [
+            Path::new("C:/Program Files/DuDuClaw/duduclaw-desktop-app.exe"),
+            Path::new("C:/Program Files/DuDuClaw/duduclaw.exe"),
+        ];
+        assert!(has_desktop_neighbor(
+            Path::new("C:/Program Files/DuDuClaw/duduclaw.exe"),
+            |path| existing.contains(&path)
+        ));
+    }
+
+    #[test]
+    fn windows_standalone_has_no_desktop_neighbor_on_case_insensitive_filesystem() {
+        use std::path::Path;
+        let exe = Path::new("C:/Users/x/.duduclaw/bin/duduclaw.exe");
+        // Simulate NTFS reporting DuDuClaw.exe as existing through the sidecar itself.
+        let exists = |path: &Path| {
+            path.to_str()
+                .unwrap()
+                .eq_ignore_ascii_case(exe.to_str().unwrap())
+        };
+        assert!(exists(Path::new("C:/Users/x/.duduclaw/bin/DuDuClaw.exe")));
+        assert!(!has_desktop_neighbor(exe, exists));
+    }
+
+    #[test]
+    fn linux_desktop_sidecar_has_desktop_neighbor() {
+        use std::path::Path;
+        assert!(has_desktop_neighbor(
+            Path::new("/opt/duduclaw/duduclaw"),
+            |path| path == Path::new("/opt/duduclaw/duduclaw-desktop-app")
         ));
     }
 
