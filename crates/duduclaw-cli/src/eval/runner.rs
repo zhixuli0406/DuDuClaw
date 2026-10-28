@@ -1426,6 +1426,7 @@ missing memory_search",
     #[test]
     fn reported_usage_distinguishes_free_from_unmeasured() {
         let zero = duduclaw_gateway::runtime::RuntimeResponse {
+            partial_timeout_secs: None,
             content: String::new(),
             input_tokens: 0,
             output_tokens: 0,
@@ -1439,6 +1440,7 @@ missing memory_search",
             "an all-zero usage block is `unmeasured`, never `Some(0)`"
         );
         let some = duduclaw_gateway::runtime::RuntimeResponse {
+            partial_timeout_secs: None,
             input_tokens: 10,
             ..zero
         };

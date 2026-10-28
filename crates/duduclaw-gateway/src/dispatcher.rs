@@ -708,7 +708,7 @@ fn short_failure_label(reason: crate::channel_reply::FailureReason) -> &'static 
         FailureReason::AuthFailed => "帳號未登入或認證失效",
         FailureReason::RateLimited => "API 使用量已達上限",
         FailureReason::Billing => "帳號額度已用完",
-        FailureReason::Timeout => "處理超時",
+        FailureReason::Timeout => "處理逾時",
         FailureReason::SpawnError => "子程序啟動失敗",
         FailureReason::EmptyResponse => "未產生回應內容",
         FailureReason::NoAccounts => "沒有可用帳號",
@@ -5708,7 +5708,7 @@ bot_token = "{token}"
             assert_eq!(reply, "⚠️ 子任務處理失敗：未知錯誤。請稍後再試或改寫指令。", "{raw}");
         }
         let reply = dispatch_failure_reply(&DispatchError::Other("hard timeout after 300s".into()));
-        assert_eq!(reply, "⚠️ 子任務處理失敗：處理超時。請稍後再試或改寫指令。");
+        assert_eq!(reply, "⚠️ 子任務處理失敗：處理逾時。請稍後再試或改寫指令。");
     }
 
     /// One explore lane, two sources: a responsibility round's contract lane

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -62,6 +63,80 @@ async function ready() {
 }
 
 describe('<SystemTab> v1.68', () => {
+  it('updates the blank model placeholder when the global provider changes', async () => {
+    const user = userEvent.setup();
+    await ready();
+    const model = screen.getByRole('textbox', { name: 'Global utility model' });
+    expect(model).toHaveAttribute('placeholder', 'claude-haiku-4-5');
+    await user.click(screen.getByRole('combobox', { name: 'Global utility provider' }));
+    await user.click(await screen.findByRole('option', { name: 'Codex' }));
+    expect(model).toHaveAttribute('placeholder', "Use the backend's default");
+    expect(model).toHaveValue('');
+  });
+
+  it('warns for a known mismatched global utility model and clears the warning on correction', async () => {
+    configMock.mockResolvedValue({ config: BASE + '\n[runtime]\nutility_provider = "codex"\n' });
+    await ready();
+    const model = screen.getByRole('textbox', { name: 'Global utility model' });
+    const warning = /The model belongs to a different vendor family/;
+    for (const value of ['claude-haiku-4-5', 'gemini-2.5-flash', 'grok-4']) {
+      fireEvent.change(model, { target: { value } });
+      expect(screen.getByRole('alert')).toHaveTextContent(warning);
+    }
+    for (const value of ['gpt-5.4', 'custom-model', '']) {
+      fireEvent.change(model, { target: { value } });
+      expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    }
+  });
+
+  it('loads global utility settings and saves only edited keys', async () => {
+    configMock.mockResolvedValue({ config: BASE + '\n[runtime]\nutility_provider = "codex"\nutility_model = "gpt-5.4"\n' });
+    await ready();
+    expect(screen.getByRole('combobox', { name: 'Global utility provider' })).toHaveTextContent('Codex');
+    const model = screen.getByRole('textbox', { name: 'Global utility model' });
+    expect(model).toHaveValue('gpt-5.4');
+    fireEvent.change(model, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ runtime: { utility_model: '' } }));
+  });
+
+  it('lets an operator replace the removed global Gemini provider with Claude', async () => {
+    const user = userEvent.setup();
+    configMock.mockResolvedValue({ config: BASE + '\n[runtime]\nutility_provider = "gemini"\n', utility_provider: 'gemini' });
+    await ready();
+    expect(screen.getByRole('alert')).toHaveTextContent('Gemini CLI provider has been removed');
+    await user.click(screen.getByRole('combobox', { name: 'Global utility provider' }));
+    await user.click(await screen.findByRole('option', { name: 'Claude' }));
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ runtime: { utility_provider: 'claude' } }));
+  });
+
+  it('uses the effective global provider returned by the server for legacy values', async () => {
+    configMock.mockResolvedValue({ config: BASE + '\n[runtime]\nutility_provider = "legacy-unknown"\n', utility_provider: 'claude' });
+    useAgentsStore.setState({ loaded: true, error: null, agents: [{ name: 'coder', runtime: { provider: 'codex' } }] as never });
+    await ready();
+    expect(screen.getByRole('alert')).toHaveTextContent('Global background tasks still use Claude');
+  });
+
+  it('warns for default Claude global utility with no Claude employees', async () => {
+    useAgentsStore.setState({ loaded: true, error: null, agents: [{ name: 'coder', runtime: { provider: 'codex' } }] as never });
+    await ready();
+    expect(screen.getByRole('alert')).toHaveTextContent('Global background tasks still use Claude');
+  });
+
+  it('does not warn for a non-Claude global utility or a Claude employee', async () => {
+    configMock.mockResolvedValue({ config: BASE + '\n[runtime]\nutility_provider = "codex"\n' });
+    useAgentsStore.setState({ loaded: true, error: null, agents: [] });
+    await ready();
+    expect(screen.queryByText(/Global background tasks still use Claude/)).not.toBeInTheDocument();
+  });
+
+  it('does not warn when an employee uses the default Claude runtime', async () => {
+    useAgentsStore.setState({ loaded: true, error: null, agents: [{ name: 'claude-worker' }] as never });
+    await ready();
+    expect(screen.queryByText(/Global background tasks still use Claude/)).not.toBeInTheDocument();
+  });
+
   it('treats a stored plain log format as pretty and does not rewrite it', async () => {
     configMock.mockResolvedValue({ config: BASE + '\n[logging]\nformat = "plain"\n', allowed_origins: [] });
     await ready();

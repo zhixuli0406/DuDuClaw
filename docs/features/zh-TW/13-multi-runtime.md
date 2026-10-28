@@ -86,7 +86,7 @@ Dashboard 會顯示對應的條款提示，要求勾選同意後才開始或儲�
 
 ### 後端怎麼被驅動
 
-四個 CLI 後端（`claude`、`codex`、`antigravity`、`grok`；見 `runtime/mod.rs` 的 `BESPOKE_RUNTIME_IDS`）有各自的 runtime 模組，因為它們各有無法共用的廠商專屬接線，包括帳號輪替（Claude）、以該 CLI 自己的格式注入 MCP 設定、能力→sandbox 旗標的轉譯、空輸出時的 PTY 補救。其餘全部由**同一支**通用 print-mode runtime（`runtime/generic_cli.rs`）直接依目錄項目驅動：用模板 argv 啟動執行檔，把 prompt 以參數或 stdin 送進去，把 text／JSON／JSONL 解析回最終回覆文字，並把非零離開碼或「需要登入」的訊號對應成 failover 鏈看得懂的具名錯誤。其餘七個 CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）都走這支通用 runtime。`openai_compat` 不是 CLI，它有自己的 HTTP 模組（`runtime/openai_compat.rs`）。所以手寫模組一共五個。
+四個 CLI 後端（`claude`、`codex`、`antigravity`、`grok`；見 `runtime/mod.rs` 的 `BESPOKE_RUNTIME_IDS`）有各自的 runtime 模組，因為它們各有無法共用的廠商專屬接線，包括帳號輪替（Claude）、以該 CLI 自己的格式注入 MCP 設定、能力→sandbox 旗標的轉譯。其餘全部由**同一支**通用 print-mode runtime（`runtime/generic_cli.rs`）直接依目錄項目驅動：用模板 argv 啟動執行檔，把 prompt 以參數或 stdin 送進去，把 text／JSON／JSONL 解析回最終回覆文字，並把非零離開碼或「需要登入」的訊號對應成 failover 鏈看得懂的具名錯誤。其餘七個 CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）都走這支通用 runtime。`openai_compat` 不是 CLI，它有自己的 HTTP 模組（`runtime/openai_compat.rs`）。所以手寫模組一共五個。
 
 ### 主要後端
 
@@ -170,6 +170,26 @@ fallback = "antigravity"     # 主要不可用時的備案
 
 沒有寫 `provider` 時，Agent 使用 Claude。無法辨識的值會記一筆警告，同樣退回 Claude。
 
+### 執行時間上限與背景模型
+
+`agent.toml [runtime] timeout_secs` 設定 Codex、Grok、Antigravity 與其他 CLI 執行環境單次執行的時間上限，也套用至 OpenAI 相容 API 的每次請求（一般、串流及工具迴圈）。預設 **300 秒**，接受 **30～3600** 的整數。Claude 保留另外固定的 **30 分鐘安全上限**，不受此設定影響。手動編輯時，超出範圍的整數會調整到最近的界線並記錄警告；型別錯誤則忽略該值、採用 300 秒並記錄警告。儀表板存檔時會直接拒絕不合規的值。這與容器任務的逾時設定不同。Antigravity 將設定秒數傳給 `--print-timeout`，外層再多留 30 秒作為最後上限。
+
+提高 `timeout_secs` 的實際上限需要管理員。員工擁有者可降低上限；清空設定會還原為 300 秒，若因此高於目前上限，同樣需要管理員。
+
+Codex 原本在 120 秒停止，現在只有使用者的頻道回覆會在逾時時保留已完成的文字。輔助呼叫（含 judge／verifier）與所有內部純文字呼叫一律丟棄部分輸出、回報逾時失敗。內部對話另附已達時間上限的提醒；Odoo 公開訪客只會收到已完成的文字。尚未完成的 JSONL 項目不會當成答案；沒有任何已完成回覆時，仍回報逾時失敗。Grok、Antigravity 逾時也會正確標示為逾時，不再顯示未知錯誤。
+
+Windows 的受管理 CLI 子行程先以暫停狀態建立，成功加入關閉即終止的 Job Object 後才繼續執行。即使主行程已退出，清理時仍會終止整個 Job；加入失敗會殺掉子行程並回報錯誤。本輪尚未做 Windows 原生執行驗證。會話 owner 以 `_` 或 `.` 開頭時視為內部目錄，停止背景工作。
+
+Grok 在管線模式回傳空白內容時，不再使用 PTY 重試，因該路徑無法保證逾時後清理整個行程樹；現在回報空回應錯誤。
+
+背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok、Antigravity 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
+
+Claude 輔助呼叫先清空繼承的環境、套用共用 spawn 白名單，再從一般 Claude 無輪替路徑相同的來源注入 Anthropic API key（OAuth 保留原有 HOME／鑰匙圈／設定目錄），走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
+
+輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok、Antigravity 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](05-security-defense.md)。
+
+定期對話摘要與自動標題也依對話所屬員工，套用相同的輔助後端選擇與全域備援規則。儲存的所屬員工必須是非系統保留名稱，且具備相符的 `agent.toml`；目錄不得是符號連結，正規化後必須是 `<home>/agents` 的直接子目錄。非空白但無效的員工身分會讓本次輔助工作停止並記錄錯誤，只有未指定員工的對話直接使用全域輔助設定。摘要的受保護區塊仍不會送入模型，並按既有限額逐字保留。明確指定但不相容的輔助模型仍保留原值，每個員工／模型組合只記錄一次警告。沒有所屬員工的工作使用 `[runtime] utility_provider`／`utility_model`，可在「設定 → 進階 → 系統」調整。
+
 ### Per-Agent 設定
 
 不同 Agent 可以同時使用不同後端：
@@ -246,7 +266,7 @@ API 層路徑（`duduclaw-llm`）把同一個值帶進各家的原生欄位：
 - **effort 要花 token。** 它是繼免費優化（快取、prompt 整理）之後第一個拿品質換成本的槓桿，範圍的最高段只在真正困難的工作上才值回票價。寫程式與長時程的 agent 任務反應明顯；聊天、分類與高流量的路由通常 `low` 就夠。
 - **對話中途改 effort 會讓多數模型的 prompt 快取失效**，因為 effort 屬於快取前綴的一部分。每個 agent 挑一個值，之後不要動，不要逐回合調整。
 
-唯一刻意*不*由 agent 決定 effort 的地方是輕量擷取路徑（session 壓縮、GVU、wiki 匯入），固定在 `medium`。機械式的擷取不應該因為某個對話 agent 被調到 `max` 而變貴。
+唯一刻意*不*由 agent 決定 effort 的地方是 Claude 的輕量擷取路徑（session 壓縮、GVU、wiki 匯入），固定在 `medium`。機械式的擷取不應該因為某個對話 agent 被調到 `max` 而變貴。
 
 ### PTY pool
 
@@ -319,7 +339,7 @@ Codex 0.156.x 會把每一次 MCP 工具呼叫都擋在核准請求後面。在 
 
 ### Codex MCP 憑證：0.157+ 用 `env_vars`，更舊的版本退回 `argv`（2026-09-28）
 
-Codex spawn 透過每次呼叫的 `-c` 設定覆寫來註冊 duduclaw MCP server，這份註冊帶的值裡有兩個是機密：`DUDUCLAW_MCP_API_KEY` 與 `DUDUCLAW_AGENT_TOKEN`。每次 Codex spawn 都會做這份註冊（以及下面所有處理），ReadOnly 也一樣：ReadOnly 時 server 照樣註冊，但 Codex 會自動拒絕對它的每一次呼叫，也就是上表所說的情況。
+Codex spawn 透過每次呼叫的 `-c` 設定覆寫來註冊 duduclaw MCP server，這份註冊帶的值裡有兩個是機密：`DUDUCLAW_MCP_API_KEY` 與 `DUDUCLAW_AGENT_TOKEN`。每次一般 Codex spawn（不含輔助呼叫）都會做這份註冊（以及下面所有處理），ReadOnly 也一樣：ReadOnly 時 server 照樣註冊，但 Codex 會自動拒絕對它的每一次呼叫，也就是上表所說的情況。
 
 **為什麼憑證不能直接放在環境變數。** 2026-09-28 實測，並對照 Codex 原始碼確認：Codex 會對每個 stdio MCP server 子行程做 `env_clear()`，只補回 11 個名稱的預設白名單（`HOME`、`PATH`、`SHELL`、`USER`、`LOGNAME`、`TERM`、`TMPDIR`、`TZ`、`LANG`、`LC_ALL`、`__CF_USER_TEXT_ENCODING`），再加上設定裡宣告的項目。Gateway 自己的行程環境到不了 MCP server，所以單用 `Command::env()` 什麼都送不到，設定通道是唯一的通道。
 
@@ -342,7 +362,7 @@ Codex spawn 透過每次呼叫的 `-c` 設定覆寫來註冊 duduclaw MCP server
 
 Codex 不讀 `.mcp.json`，所以 Codex spawn 用登記 duduclaw 的同一種方式登記員工的其他伺服器：`-c mcp_servers.<name>.…` 覆寫（也寫進 `<agent_dir>/.codex/config.toml`）。之前 spawn 只登記 duduclaw，`.mcp.json` 裡像券商連線這類伺服器在 Codex 上會消失。規則如下：
 
-- `.mcp.json` 讀不到或解析失敗時，這次 spawn 停止（行為變更：以前 Codex 不讀這個檔）。沒有這個檔，或檔裡只有 DuDuClaw 自己的伺服器（團隊角色的骨架寫的就是這樣），維持原本的啟動流程：不跑閘門、不寫檔。在員工 runtime 上跑的輔助呼叫（摘要、分類、裁判）不會拿到員工的伺服器，和 Claude 的輔助呼叫一樣。
+- `.mcp.json` 讀不到或解析失敗時，這次 spawn 停止（行為變更：以前 Codex 不讀這個檔）。沒有這個檔，或檔裡只有 DuDuClaw 自己的伺服器（團隊角色的骨架寫的就是這樣），維持原本的啟動流程：不跑閘門、不寫檔。Codex 輔助呼叫略過此 MCP 設定流程，使用前述受限模式。
 - 有第三方伺服器時，先跑 `.mcp.json` spawn 閘門，和 Claude spawn 一樣；閘門拒絕就停止，而且不寫任何東西。通過時可能改寫檔裡 DuDuClaw 自己的項目（其他項目保留），和 Claude 每次 spawn、gateway 每次開機做的修復相同。
 - 每個第三方 stdio 伺服器都登記成 `duduclaw mcp-proxy --server <name> -- <command> …`，一律如此（Claude 只在有 `action_rules` 或唯讀通道時才這樣做），因為 Codex 以 `approval_policy=never` 執行，這些伺服器又以 `default_tools_approval_mode = "auto"` 登記，真正做決定的是 proxy 的第三方工具閘門。遠端橋接照原樣登記（它們自己管制）；直接的 `url`／`type` 項目會被移除，並記稽核 `third_party_remote_entry_dropped`。無法包裝的項目、名稱不是單純 TOML 鍵的項目，不會登記。
 - `.mcp.json` 裡用 DuDuClaw 名稱（`duduclaw`、`duduclaw-pro`、`duduclaw-<instance>`）的項目，永遠取代不了 gateway 自己產生的伺服器。
@@ -357,13 +377,13 @@ Codex 不讀 `.mcp.json`，所以 Codex spawn 用登記 duduclaw 的同一種方
 
 **Antigravity。** agy 只讀 `.agents/mcp_config.json`（1.4.2 實測：`.mcp.json` 裡的伺服器從不啟動），所以這些伺服器之前就是不存在。現在每個通過管制的伺服器都登記在那裡，只寫 `command` 和 `args`，並在 `~/.gemini/antigravity-cli/settings.json` 加上 `mcp(<伺服器>/*)` 規則和它 schema 目錄的讀取規則；少了這兩條，agy 的 print 模式會拒絕呼叫。真正做決定的是 proxy，和 Codex 的 `default_tools_approval_mode = "auto"` 相同。
 
-**spawn 範圍的 proxy（Grok 與 Antigravity）。** 這兩個檔案都長期存在，同一個目錄的每次 spawn 共用，兩個 CLI 也都沒有單次執行的 MCP 覆寫，所以檔案裡不放任何單次 spawn 的東西，也不放上游憑證。每個伺服器登記成 `duduclaw mcp-proxy --spawn-scoped --server <名稱> -- …`。spawn 會把上游伺服器的環境變數寫進 `<home>/tmp/mcp-proxy-env/` 底下一個新的、只有擁有者能進的目錄，並用 `DUDUCLAW_MCP_PROXY_ENV_DIR` 指向它：agy 會把自己的環境交給它啟動的 MCP 子行程，Grok 則在載入時展開項目 `env` 裡的 `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}`。CLI 結束時目錄就刪掉，gateway 啟動時也會清掉超過 15 分鐘的殘留。spawn 範圍的 proxy 找不到目錄、或目錄裡沒有自己伺服器的檔案時，什麼都不啟動。所以這兩個 runtime 上的輔助呼叫拿不到員工的伺服器，管理者在該目錄手動執行 `grok` 或 `agy` 也拿不到。同一位員工同時跑兩次 spawn 時，寫進檔案的內容相同，各自有自己的目錄。Grok 的項目還放了 proxy 自己的身分（agent id、home，以及同一個檔案裡 `duduclaw` 項目本來就有的 MCP 憑證），不放 agent token。上游伺服器從 agent CLI 的允許清單環境加上它宣告的環境變數起跑，CLI 自己的廠商金鑰（`XAI_API_KEY`、`GEMINI_API_KEY`）不會給它。
+**spawn 範圍的 proxy（Grok 與 Antigravity）。** 這兩個檔案都長期存在，同一個目錄的每次 spawn 共用，兩個 CLI 也都沒有單次執行的 MCP 覆寫，所以檔案裡不放任何單次 spawn 的東西，也不放上游憑證。每個伺服器登記成 `duduclaw mcp-proxy --spawn-scoped --server <名稱> -- …`。spawn 會把上游伺服器的環境變數寫進 `<home>/tmp/mcp-proxy-env/` 底下一個新的、只有擁有者能進的目錄，並用 `DUDUCLAW_MCP_PROXY_ENV_DIR` 指向它：agy 會把自己的環境交給它啟動的 MCP 子行程，Grok 則在載入時展開項目 `env` 裡的 `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}`。CLI 結束時目錄就刪掉，gateway 啟動時也會清掉超過 15 分鐘的殘留。spawn 範圍的 proxy 找不到目錄、或目錄裡沒有自己伺服器的檔案時，什麼都不啟動。管理者在該目錄手動執行 `grok` 或 `agy` 因此拿不到這些代理伺服器。這兩個後端的輔助呼叫會在啟動之前被拒絕；員工背景工作改用支援的全域輔助後端。同一位員工同時跑兩次 spawn 時，寫進檔案的內容相同，各自有自己的目錄。Grok 的項目還放了 proxy 自己的身分（agent id、home，以及同一個檔案裡 `duduclaw` 項目本來就有的 MCP 憑證），不放 agent token。上游伺服器從 agent CLI 的允許清單環境加上它宣告的環境變數起跑，CLI 自己的廠商金鑰（`XAI_API_KEY`、`GEMINI_API_KEY`）不會給它。
 
 已知限制：agy 的權限規則加在作業系統使用者的設定檔裡，之後不會移除（管理者手動使用的工作區若出現同名伺服器，也會被自動放行）；`.grok/config.toml` 或 `.agents/mcp_config.json` 裡任何不是 DuDuClaw 寫的項目（`duduclaw` 除外）都照原樣保留，每次 spawn 記一次警告，CLI 會不經 proxy 啟動它；借用的工作根目錄裡，兩位員工若有同名伺服器會共用同一個項目，實際執行的那次 spawn 用自己的環境檔；spawn 讀完之後、Grok 自己讀之前才改動的 `.mcp.json`（或 `.cursor/mcp.json`）不在保護範圍內；兩個只差大小寫的伺服器名稱會拒絕 spawn（在不分大小寫的磁碟上會共用同一個環境檔）；Grok 使用者層級的 `~/.grok/config.toml` 在員工目錄之外，不會被覆蓋。Grok 的 Claude／Cursor 相容 MCP 讀取（`~/.claude.json`、`~/.cursor/mcp.json`、`<cwd>/.cursor/mcp.json`）在 DuDuClaw 啟動的每次 spawn 都以 `GROK_CLAUDE_MCPS_ENABLED=false`、`GROK_CURSOR_MCPS_ENABLED=false` 關閉（2026-10-20 owner 拍板；`grok inspect` 會把這些伺服器標成 `[disabled]`）。Grok 的 Claude／Cursor 相容 hook 讀取也用同樣方式關閉（`GROK_CLAUDE_HOOKS_ENABLED=false`、`GROK_CURSOR_HOOKS_ENABLED=false`），作業系統使用者 `~/.claude/settings.json` 與 `~/.cursor/hooks.json` 的 hook 不會在員工的回合裡執行。這樣 Grok 也不再讀員工的 `.claude/settings.json`，所以 DuDuClaw 的 `agent-file-guard` 與 `data-file-guard` 在每次 spawn 前寫成 Grok 的專案 hook 檔 `<cwd>/.grok/hooks/duduclaw-guards-<員工>.json`，比對規則與指令相同；寫不進去的 spawn 會被拒絕。管理者另外加在員工 `.claude/settings.json` 的 hook，Grok 員工不再執行；Grok 自己的全域 hook（`~/.grok/hooks/`）仍會執行。Claude／Cursor 相容的 rules、skills、agents 讀取也一併關閉（`GROK_CLAUDE_RULES_ENABLED`、`GROK_CLAUDE_SKILLS_ENABLED`、`GROK_CLAUDE_AGENTS_ENABLED` 與對應的三個 `GROK_CURSOR_*`，都設成 `false`），作業系統使用者的 `~/.claude/CLAUDE.md`、`~/.claude/rules/`、`~/.claude/skills/`、`~/.cursor/skills/` 不會進到員工的回合。工作目錄自己的 `AGENTS.md` 與 `CLAUDE.md` 是 Grok 原生讀取，照常載入（員工目錄上方沒有 git repository 時，Grok 不讀上層目錄的 `AGENTS.md` 或 `CLAUDE.md`）；管理者放在員工 `.claude/rules/` 或 `.claude/skills/` 的 rule 與 skill，Grok 員工不再載入（DuDuClaw 自己的 skill 放在 `SKILLS/`，不受影響）。Grok 1.0.62 的已知限制：agents 開關關掉後，`grok inspect` 仍列出 `~/.claude/agents/` 的子代理定義；Cursor rules 開關不論開或關，`grok inspect` 都沒有列出任何 `.cursor/rules/` 檔，所以這個開關有設但效果未驗證；Grok 原生的使用者層級來源（`~/.grok/`、`~/.agents/skills/`）不屬於相容開關，仍會載入。
 
 **openai-compat、Direct API 與本地推論。** 這三條路徑共用一個工具迴圈的建構函式（`claude_runner::build_mcp_tool_registry`），之前只掛載 DuDuClaw 的伺服器和 `agent.toml [[mcp.external]]`。現在也會掛載 `.mcp.json` 的伺服器，每個都照管制改寫的結果啟動，而且從 agent CLI 的允許清單環境起跑，不繼承 gateway 的環境，所以 gateway 環境裡其他廠商的金鑰不會流到第三方伺服器。這條路徑不寫任何檔案。唯讀通道裡它們照樣掛載，但帶 `DUDUCLAW_LANE=explore`，只有唯讀工具能通過 proxy，和 Claude 在唯讀通道的 spawn 相同；`agent.toml` 的外部伺服器在唯讀通道仍然不掛載，因為沒有東西管制它們。兩個檔案都宣告的同一台伺服器（同名，或指令與參數相同）只掛載一次，用 `agent.toml` 那一份，它帶著工具允許清單和 `secret://` 參照。
 
-**失敗時拒絕。** 有第三方伺服器時，`.mcp.json` 讀不到或解析失敗、或 spawn 閘門拒絕，這次執行就以 spawn 閘門錯誤停止，容錯切換也會停。openai-compat runtime 拒絕這次回覆；Direct API 與本地推論的工具迴圈改成不帶工具回答。Grok 的設定寫不進去時也會拒絕 spawn（少了停用項目，Grok 就會自己啟動沒有管制的伺服器）；`.mcp.json` 格式壞掉時，Grok 的輔助呼叫現在也會被拒絕，因為 Grok 自己會去讀那個檔。Antigravity 有第三方伺服器而登記失敗時拒絕 spawn。沒有任何第三方伺服器時，這些 spawn 都和以前一樣。Grok 和 Antigravity 在這些步驟之前就會拒絕唯讀通道。
+**失敗時拒絕。** 有第三方伺服器時，`.mcp.json` 讀不到或解析失敗、或 spawn 閘門拒絕，這次執行就以 spawn 閘門錯誤停止，容錯切換也會停。openai-compat runtime 拒絕這次回覆；Direct API 與本地推論的工具迴圈改成不帶工具回答。Grok 的設定寫不進去時也會拒絕 spawn（少了停用項目，Grok 就會自己啟動沒有管制的伺服器）；Grok 輔助呼叫不論 `.mcp.json` 是否有效，都在檢查設定或啟動之前被拒絕。Antigravity 有第三方伺服器而登記失敗時拒絕 spawn。沒有任何第三方伺服器時，這些 spawn 都和以前一樣。Grok 和 Antigravity 在這些步驟之前就會拒絕唯讀通道。
 
 **尚未驗證。** 真正的 `grok -p` 對話（需要已登入的 Grok；設定是在暫時的 `HOME` 下用 `grok mcp doctor` 與 `grok inspect` 檢查的）；任何一個 runtime 的真實模型實際呼叫第三方工具；需要核准的第三方工具能否在 CLI 的時限內等到核准。
 
@@ -437,7 +457,7 @@ Codex 不讀 `.mcp.json`，所以 Codex spawn 用登記 duduclaw 的同一種方
 
 每次替換都以 `warn` 層級記錄 `agent / from_runtime / to_runtime / from_model / to_model`。
 
-**Judge 與 evaluator 呼叫完全不參與跨家族 failover**（2026-09-28 更正）。操作者指定 judge runtime 或模型（`[dispatch] judge_provider` / `judge_model`）時，這次呼叫的重點就是*由哪一家回答*，所以失敗的 judge spawn 絕不會靠換成另一家的模型來救援，呼叫端會明確、可見地降級。這個不參與的條件以前只有在 judge 提示把 provider 從解析出的預設值*移開*時才觸發，所以當 judge 家族與預設的 utility 家族碰巧相同（例如兩者都是 `codex`，正是去相關 judge 設定在 Codex 也被設為預設 utility runtime 後會落入的情況），替換就會悄悄恢復。現在只要指名了某個家族，就是要求那一家，不論它是否同時是預設。沒有指名的 utility 呼叫，failover 行為不變。
+**Judge 與 evaluator 的執行不進入一般對話的跨家族 failover。** 輔助執行入口保留明確的 `[dispatch] judge_provider`／`judge_model` 指定，不支援輔助執行模式的後端直接拒絕；Codex 使用受限模式。既有評審上層仍可依降級策略記錄警告後，不帶指定重試；重試也只能解析成支援的輔助模式。未指定評審後端的員工輔助呼叫，遇到不支援的員工後端時，會在執行之前解析成全域設定；全域後端也不支援輔助模式時則拒絕。
 
 - **Account Rotator**：跨所有供應商管理認證，具備跨供應商容錯。
 - **Confidence Router**：位於 runtime 層之下（決定本地 vs. 雲端）。Runtime 層決定*哪個*雲端。

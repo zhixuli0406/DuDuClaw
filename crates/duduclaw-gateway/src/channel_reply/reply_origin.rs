@@ -296,7 +296,10 @@ fn origin_message(agent: &str, origin: ReplyOrigin, reason: FailureReason, home:
         }
         FailureReason::RateLimited => "使用量已達限制，請稍後重試或檢查此後端配額。",
         FailureReason::Billing => "帳務或額度不足，請管理員檢查此後端帳務。",
-        FailureReason::Timeout => "回應逾時，請稍後重試。",
+        FailureReason::Timeout if matches!(origin, ReplyOrigin::Runtime(_)) => {
+            "回應逾時，可在員工設定提高時間上限。"
+        }
+        FailureReason::Timeout => "回應逾時，請稍後重試或將任務拆成較小的步驟。",
         FailureReason::EmptyResponse => "回傳空白內容，請稍後重試。",
         _ => "暫時無法回應，請管理員查看此後端的診斷紀錄。",
     };
@@ -384,6 +387,28 @@ pub(super) mod testing {
                 counts.claude.fetch_add(1, Ordering::SeqCst);
             }
             panic!("owned test refused a real implicit cloud call before credential access");
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn settings_hint_only_for_runtimes_with_configurable_timeout() {
+        for origin in [ReplyOrigin::AnthropicApi, ReplyOrigin::Local, ReplyOrigin::Moa, ReplyOrigin::Unknown] {
+            let message = origin_message("worker", origin, FailureReason::Timeout, Path::new("/nonexistent"));
+            assert!(!message.contains("員工設定"), "{origin:?}");
+        }
+        for runtime in RuntimeType::ALL {
+            let message = origin_message("worker", ReplyOrigin::Runtime(*runtime), FailureReason::Timeout, Path::new("/nonexistent"));
+            if *runtime == RuntimeType::Claude {
+                assert!(message.contains("30 分鐘安全上限"));
+                assert!(!message.contains("員工設定"));
+            } else {
+                assert!(message.contains("員工設定"), "{runtime:?}");
+            }
         }
     }
 }

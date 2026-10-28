@@ -210,6 +210,16 @@ export function isAdminOnlyPath(path: string, serverList?: ReadonlyArray<string>
   return list.some((entry) => matchesAdminPath(path, entry));
 }
 
+/** Match the gateway's effective timeout (unset/wrong type = 300). */
+export function effectiveRuntimeTimeout(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value)
+    ? Math.min(3600, Math.max(30, value)) : 300;
+}
+
+export function runtimeTimeoutNeedsAdmin(before: unknown, after: unknown): boolean {
+  return effectiveRuntimeTimeout(after) > effectiveRuntimeTimeout(before);
+}
+
 function has(dirty: ReadonlySet<string>, path: string): boolean {
   return dirty.has(path);
 }
@@ -300,10 +310,11 @@ export function buildUpdatePayload(
     put('research', rs);
   }
 
-  // [runtime] — provider/fallback plus minimal_context.
+  // [runtime] — provider/fallback, execution timeout and minimal_context.
   const rt: Record<string, unknown> = {};
   if (has(dirty, 'runtime.provider')) rt.provider = s.runtime.provider;
   if (has(dirty, 'runtime.fallback')) rt.fallback = s.runtime.fallback;
+  if (has(dirty, 'runtime.timeout_secs')) rt.timeout_secs = s.runtime.timeout_secs;
   if (has(dirty, 'v.minimal_context')) rt.minimal_context = s.v.minimal_context;
   if (Object.keys(rt).length > 0) put('runtime', rt);
 
@@ -434,4 +445,26 @@ export function teamRolesShareVendor(roles: Record<AgentTeamRoleKey, TeamRoleFor
 export function clampInt(v: number, min: number, max: number): number {
   if (!Number.isFinite(v)) return min;
   return Math.min(max, Math.max(min, Math.round(v)));
+}
+
+/** A known utility-model family that the selected engine cannot serve.
+ *  The web form has no shared model-family resolver; mirror runtime_catalog's
+ *  declared families. Unknown models and multi-vendor engines stay quiet.
+ *  This is a hint only; the gateway remains authoritative for routing. */
+export function utilityModelMismatchesRuntime(provider: string, model: string): boolean {
+  if (provider === 'claude') return false;
+  const families: Record<string, RegExp> = {
+    claude: /^claude/,
+    codex: /^(gpt-|o1|o3|codex)/,
+    antigravity: /^gemini/,
+    grok: /^grok/,
+    qwen: /^qwen/,
+    kimi: /^kimi/,
+    vibe: /^(mistral|codestral|devstral|magistral)/,
+  };
+  const expected = families[provider];
+  if (!expected) return false;
+  const id = model.trim().toLowerCase().split('/').at(-1) ?? '';
+  const knownFamily = Object.values(families).some((pattern) => pattern.test(id));
+  return knownFamily && !expected.test(id);
 }

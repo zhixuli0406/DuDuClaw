@@ -150,8 +150,7 @@ call without it (see [Subscription-Login Risk Disclosure](#subscription-login-ri
 Four CLI backends (`claude`, `codex`, `antigravity`, `grok`;
 `BESPOKE_RUNTIME_IDS` in `runtime/mod.rs`) have bespoke runtime modules, because each has real per-vendor
 wiring that is not shareable — account rotation (Claude), MCP config injection
-in the CLI's own format, capability→sandbox-flag translation, PTY recovery for
-empty-output failures. Everything else is driven by **one** generic print-mode
+in the CLI's own format, capability→sandbox-flag translation. Everything else is driven by **one** generic print-mode
 runtime (`runtime/generic_cli.rs`) built straight from the catalog entry: spawn
 the binary with the templated argv, deliver the prompt as an argument or on
 stdin, parse text / JSON / JSONL back to the final assistant text, and map a
@@ -246,6 +245,26 @@ fallback = "antigravity"     # If primary is unavailable
 
 If `provider` is absent, the agent runs on Claude. An unrecognised value logs a warning and also falls back to Claude.
 
+### Execution time limit and background models
+
+`agent.toml [runtime] timeout_secs` sets the per-run limit for Codex, Grok, Antigravity and other CLI runtimes, and the per-request limit for OpenAI-compatible APIs (plain, streaming and tool-loop requests). It defaults to **300 seconds** and accepts integers from **30 to 3600**. Claude keeps its separate fixed **30-minute safety limit**; this setting does not change it. A manually edited integer outside that range is clamped with a warning; a wrong-typed value is ignored with a warning and uses 300 seconds. The dashboard rejects invalid values when saving. This is separate from the container task timeout. Antigravity passes this limit to `--print-timeout` and keeps a wrapper backstop 30 seconds longer.
+
+Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores 300 seconds and needs an administrator only when that increases the current effective limit.
+
+Codex previously stopped at 120 seconds. Only the user-facing channel reply path returns retained completed assistant messages on timeout. Utility calls (including judges and verifiers) and all internal text-only calls discard partial output and fail with a hard-timeout error. Internal conversations also receive a time-limit notice; Odoo public visitors receive only the completed text. Incomplete JSONL items are not returned as an answer. With no completed message, the run fails as a timeout. Grok and Antigravity timeouts are also identified as timeouts rather than unknown errors.
+
+On Windows, managed CLI children start suspended, join a kill-on-close Job Object, and resume only after assignment succeeds. Cleanup terminates the job even if the leader already exited; assignment failure kills the child and returns an error. Native Windows execution remains unverified in this round.
+
+Grok no longer retries an empty pipe-mode response under a PTY: that path cannot guarantee whole-process-tree cleanup after timeout. An empty response is returned as an error.
+
+Background decision checks, instruction pinning, fact extraction and conversation compression use the employee's runtime for Claude, Codex and OpenAI-compatible APIs. A non-blank `[model] utility` wins; otherwise Claude uses `claude-haiku-4-5`, while Codex and OpenAI-compatible APIs use `[model] preferred`. If both are blank, Codex omits `-m` and uses its CLI default; OpenAI-compatible APIs refuse the call. Grok, Antigravity and generic CLI employees use the global background settings. The dashboard warns when an explicit utility model belongs to a different vendor family.
+
+Claude utility calls clear the inherited environment, apply the shared spawn allowlist, then inject only the Anthropic API key from the same credential source as the normal no-rotation Claude spawn (OAuth keeps its usual HOME/keychain/config directory). They use the lightweight lane and do not enter account rotation. Normal chat retains its existing account rotation.
+
+Utility calls, including classifiers and judges, use a dedicated execution profile. Claude uses the tool-free, single-turn lightweight lane; OpenAI-compatible APIs send one completion without tools and never enter the tool loop. Codex uses a restricted profile: a read-only sandbox, no DuDuClaw MCP overrides, a fresh owner-only empty temporary working directory, ignored user config, and no persisted session. The temporary directory is removed after the call, including errors and timeouts; the system prompt travels in the prompt without writing `AGENTS.md`. This also applies to explicit Codex judge and team-verifier hints. Grok, Antigravity and generic CLIs remain unsupported for utility execution, so employee background work resolves to the global utility provider/model (default Claude / `claude-haiku-4-5`), with one warning per employee/runtime. The global provider must be Claude, Codex or OpenAI-compatible; an unsupported global provider or explicit hint is refused. Existing higher-level judge degradation may retry without an unsupported hint, subject to these same profiles. Codex may retain built-in reading tools; see [Security defense](05-security-defense.md) for the residual risk.
+
+The scheduled session summarizer and auto-titler apply the same utility provider selection and global fallback to the session owner. The stored owner must not begin with `_` or `.` and must name a non-reserved, existing employee with a matching `agent.toml`, in a non-symlink direct child of the canonical `<home>/agents` directory. A nonempty invalid owner skips the utility call with an error; only an empty owner uses the global utility settings. Protected summary sections remain excluded from the model prompt and are preserved verbatim with the existing cap. Explicit utility-model mismatches keep the saved value and emit one warning per agent/model. Agent-less work uses `[runtime] utility_provider` / `utility_model`, now editable in Settings → Advanced → System.
+
 ### Per-Agent Configuration
 
 Different agents can use different backends simultaneously:
@@ -322,7 +341,7 @@ Two things to know before you turn this up:
 - **Effort costs tokens.** It is the first quality-trading lever after the free wins (caching, prompt hygiene), and the top of the range earns its price only on genuinely hard work. Coding and long-horizon agentic tasks respond strongly; chat, classification, and high-volume routes often do fine at `low`.
 - **Changing effort mid-conversation invalidates the prompt cache** on most models — effort participates in the cached prefix. Pick a value per agent and leave it; do not tune it turn by turn.
 
-The one place effort is deliberately *not* agent-driven is the lightweight extraction path (session compression, GVU, wiki ingest), which is pinned to `medium`. Mechanical extraction should not get more expensive because a conversational agent was turned up to `max`.
+The one place effort is deliberately *not* agent-driven is Claude's lightweight extraction path (session compression, GVU, wiki ingest), which is pinned to `medium`. Mechanical extraction should not get more expensive because a conversational agent was turned up to `max`.
 
 ### PTY pool
 
@@ -411,7 +430,7 @@ means "may not change anything", tools included.
 A Codex spawn registers the duduclaw MCP server through per-invocation `-c`
 config overrides, and two of the values that registration carries are secrets:
 `DUDUCLAW_MCP_API_KEY` and `DUDUCLAW_AGENT_TOKEN`. The registration (and
-everything below) happens on every Codex spawn, ReadOnly included: at ReadOnly
+everything below) happens on every non-utility Codex spawn, ReadOnly included: at ReadOnly
 the server is registered, but Codex auto-rejects each call to it, as the table
 above says.
 
@@ -472,9 +491,8 @@ registered duduclaw alone, and a server such as a broker connection listed in
 - A `.mcp.json` that cannot be read or parsed stops the spawn (a behavior
   change: Codex did not read the file before). No file, or a file listing
   only DuDuClaw's own server (team role scaffolds write exactly that), keeps
-  the old spawn: no gate, no write. Utility calls on the employee's runtime
-  (summaries, classifiers, judges) never get the employee's servers, as on
-  the Claude utility path.
+  the old conversational spawn: no gate, no write. Codex utility execution skips this MCP setup entirely and uses the restricted
+  profile described above.
 - When third-party servers are listed, the `.mcp.json` spawn gate runs first,
   as for a Claude spawn; a refusal stops the spawn and writes nothing. When
   it passes it may rewrite the file's DuDuClaw entries (other entries are
@@ -551,10 +569,10 @@ owner-only directory under `<home>/tmp/mcp-proxy-env/` and names it in
 it starts, and Grok expands `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}` in the entry's
 `env`. The directory is deleted when the CLI exits; the gateway removes
 leftovers older than 15 minutes when it starts. A spawn-scoped proxy that
-finds no directory, or no file for its server, starts nothing. That is why a
-utility call on these runtimes gets none of the employee's servers, and why
-an operator running `grok` or `agy` by hand in the directory gets none
-either. Two spawns of the same employee write the same file content and each
+finds no directory, or no file for its server, starts nothing. An operator
+running `grok` or `agy` by hand in the directory therefore gets none of
+these proxied servers. Utility execution on both runtimes is refused before
+spawning; employee background calls use the supported global utility provider. Two spawns of the same employee write the same file content and each
 get their own directory. The Grok entry also holds the proxy's own identity
 (agent id, home, and the MCP credential the `duduclaw` entry of the same file
 already holds), never the agent token. The upstream server starts from the
@@ -620,9 +638,9 @@ cannot be read or parsed, or a spawn-gate refusal, stops the run with the
 spawn-gate error, which also stops failover. The openai-compat runtime
 refuses the reply; the Direct-API and local-inference loops answer without
 tools. On Grok a config that cannot be written also refuses the spawn (a
-missing shadow would let Grok start a server ungated), and a malformed
-`.mcp.json` now refuses Grok utility calls too, because Grok would read that
-file itself. On Antigravity a failed registration refuses the spawn when
+missing shadow would let Grok start a server ungated). Grok utility calls
+are refused before config inspection or spawning, regardless of whether
+`.mcp.json` is valid. On Antigravity a failed registration refuses the spawn when
 third-party servers are listed. With no third-party server listed every one
 of these spawns is the old one. Grok and Antigravity refuse the read-only
 lane before any of this runs.
@@ -742,18 +760,7 @@ refuses to spawn when none applies:
 Every substitution logs `agent / from_runtime / to_runtime / from_model /
 to_model` at `warn` level.
 
-**Judge and evaluator calls opt out of cross-family failover entirely**
-(corrected 2026-09-28). When an operator names a judge runtime or model
-(`[dispatch] judge_provider` / `judge_model`), the point of the call is *which
-family answers* — so a failed judge spawn is never rescued by substituting
-another family's model; the caller degrades explicitly and audibly instead. The
-opt-out used to trigger only when the judge hint *moved* the provider away from
-the resolved default, which quietly re-enabled substitution whenever the judge
-family and the default utility family happened to be the same (both `codex`, for
-instance — exactly where a decorrelated-judge setup ends up once Codex is also
-made the default utility runtime). Naming a family is now a request for that
-family whether or not it is also the default. Un-hinted utility calls keep
-failover unchanged.
+**Judge and evaluator execution does not use conversational cross-family failover.** The utility execution entry point preserves explicit `[dispatch] judge_provider` / `judge_model` hints and refuses providers without a supported utility profile. Existing higher-level judge degradation can record a warning and retry without the hint; that retry still resolves only to a supported utility profile. Unhinted employee utility calls resolve unsupported employee runtimes to the global utility settings before execution. A configured global provider that has no supported utility profile is refused.
 
 - **Account Rotator**: Manages credentials across all providers, with cross-provider failover.
 - **Confidence Router**: Sits below the runtime layer — decides local vs. cloud. The runtime layer decides *which* cloud.

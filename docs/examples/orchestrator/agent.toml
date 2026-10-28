@@ -23,8 +23,10 @@ icon = "git-branch"
 # [runtime]
 # provider = "antigravity"
 # fallback = "claude"
+# timeout_secs = 300  # Per-run CLI limit, 30..3600 seconds; separate from container.timeout_ms
 
 [model]
+# utility = "claude-haiku-4-5"  # Explicit override; unset follows preferred outside Claude
 preferred = "claude-sonnet-4-6"  # Planning needs mid-tier reasoning
 fallback = "claude-haiku-4-5"
 account_pool = []  # empty = every rotator account; list account ids/labels to restrict this agent

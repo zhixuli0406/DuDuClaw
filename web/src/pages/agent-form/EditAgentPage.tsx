@@ -97,6 +97,9 @@ import {
   buildUpdatePayload,
   isAdminOnlyPath,
   teamRolesShareVendor,
+  utilityModelMismatchesRuntime,
+  effectiveRuntimeTimeout,
+  runtimeTimeoutNeedsAdmin,
   type OdooFormState,
   clampInt,
 } from './editPayload';
@@ -426,6 +429,8 @@ export function EditAgentPage() {
   // can_modify_own_soul): the gateway refuses and audits them for anyone
   // else, so the page disables them and never sends them for a non-admin.
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
+  const [savedRuntimeTimeout, setSavedRuntimeTimeout] = useState(300);
+  const savedRuntimeTimeoutRef = useRef(300);
   const isAdminRef = useRef(isAdmin);
   useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
   // The gateway's own admin-only path list (`agents.inspect.admin_only_fields`);
@@ -583,9 +588,12 @@ export function EditAgentPage() {
     setContractHeld(null);
 
     const rt = agent.runtime;
+    savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(rt?.timeout_secs);
+    setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
     setRuntime({
       provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
+      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs),
     });
 
     const ef = ev?.external_factors ?? {};
@@ -736,6 +744,7 @@ export function EditAgentPage() {
 
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
     if (lockedPath(`runtime.${String(key)}`)) return;
+    if (key === 'timeout_secs' && !isAdminRef.current && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, value)) return;
     markDirty(`runtime.${String(key)}`);
     setRuntime((prev) => ({ ...prev, [key]: value }));
   }, [markDirty, lockedPath]);
@@ -843,7 +852,8 @@ export function EditAgentPage() {
     // the whole save); the controls are disabled anyway.
     const dirty = isAdminRef.current
       ? consumed
-      : new Set([...consumed].filter((p) => !isAdminOnlyPath(p, agent.admin_only_fields)));
+      : new Set([...consumed].filter((p) => !isAdminOnlyPath(p, agent.admin_only_fields)
+        && !(p === 'runtime.timeout_secs' && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, runtime.timeout_secs))));
     const savedPref = agent.model?.preferred ?? '';
     const savedFb = agent.model?.fallback ?? '';
     const { payload, hasChanges, includesKv } = buildUpdatePayload(
@@ -871,6 +881,10 @@ export function EditAgentPage() {
         // navigates away — the header SettingsSaveState is the only feedback.
         const res = await updateAgent(agent.name, payload as AgentUpdateParams);
         sectionsSaved = true;
+        if (payload.runtime && Object.hasOwn(payload.runtime, 'timeout_secs')) {
+          savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(payload.runtime.timeout_secs);
+          setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+        }
         if (includesKv) setKvServerError(null);
         // Save-time auto-align: the gateway rewrote [runtime] provider to
         // match the model family — tell the operator instead of leaving a
@@ -1730,6 +1744,7 @@ export function EditAgentPage() {
             <SettingsCard>
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+              <RowNumber label={t('agents.runtime.timeout')} description={t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')} value={runtime.timeout_secs} min={30} max={isAdmin ? 3600 : savedRuntimeTimeout} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
             {usesGenericCli && (
@@ -1782,6 +1797,9 @@ export function EditAgentPage() {
             <FieldBlock label={t('agents.adv.utility')} description={t('agents.adv.utility.hint')}>
               <ModelSelect value={adv.utility} onChange={(v) => updateAdv('utility', v)} models={availableModels} loading={modelsLoading} error={modelsError} discoveredAt={modelsDiscoveredAt} refreshing={modelsRefreshing} onRefresh={modelsRefresh} ariaLabel={t('agents.adv.utility')} />
             </FieldBlock>
+            {utilityModelMismatchesRuntime(runtime.provider, adv.utility) && (
+              <p role="alert" className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.adv.utility.mismatch')}</p>
+            )}
           </SettingsSection>
 
           <SettingsSection title={t('settings.container')}>

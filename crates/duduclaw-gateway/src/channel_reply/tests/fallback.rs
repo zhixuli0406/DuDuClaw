@@ -41,6 +41,18 @@ mod fallback_tests {
     }
 
     #[test]
+    fn classify_all_runtime_timeouts_and_keep_auth_precedence() {
+        for name in ["Codex", "Grok", "Antigravity"] {
+            for err in [format!("{name} CLI timed out"),
+                format!("{name} CLI hard timeout after 300s"),
+                format!("{name} CLI hard timeout after 300s (no completed output)")] {
+                assert_eq!(classify_cli_failure(&err), FailureReason::Timeout, "{err}");
+            }
+        }
+        assert_eq!(classify_cli_failure("not logged in; request timed out"), FailureReason::AuthFailed);
+    }
+
+    #[test]
     fn classify_binary_missing() {
         assert_eq!(
             classify_cli_failure("claude CLI not found in PATH"),
@@ -210,13 +222,15 @@ mod fallback_tests {
     }
 
     #[test]
-    fn message_timeout_mentions_30_min() {
+    fn message_timeout_mentions_claude_safety_limit() {
         let msg = format_fallback_message(
             "Agnes",
             FailureReason::Timeout,
             Path::new("/nonexistent-duduclaw-test-home"),
         );
-        assert!(msg.contains("30 分鐘"));
+        assert!(msg.contains("30 分鐘安全上限"));
+        assert!(msg.contains("拆成較小的步驟"));
+        assert!(!msg.contains("員工設定"));
     }
 
     // ── W0-12: console_url / doc_url mapping (Stripe error-object pattern) ──

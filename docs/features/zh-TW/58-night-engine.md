@@ -17,7 +17,7 @@
 | N3 | Schema 歸納 | 否 | 把情節記憶裡反覆出現的模式提升成 schema 條目 |
 | N4 | 複現門檻式整併 | 否 | 只有語意上反覆出現的知識才觸發整併，寫入前還要通過涵蓋度／保存度／忠實度檢查，不過就回滾 |
 
-N3、N4 是確定性的，零成本。N1、N2 打的是該 agent 的**輔助（utility）模型**（預設 haiku 級），也只有這兩個會受花費上限影響。
+N3、N4 是確定性的，零成本。N1、N2 使用解析後的輔助後端與模型，也只有這兩項受花費上限影響。Claude 員工採用非空白的 `[model] utility` 或 `claude-haiku-4-5`；OpenAI 相容 API 員工採用非空白的 `utility` 或 `preferred`，至少須設定一個。Codex 員工依序使用 `utility`、`preferred` 或 CLI 預設模型，以受限模式執行。Grok、Antigravity 與通用 CLI 員工改用全域背景設定，全域也必須是 Claude、Codex 或 OpenAI 相容 API。詳見[多後端](13-multi-runtime.md#執行時間上限與背景模型)。
 
 論文依據：睡眠期運算（arXiv:2504.13171）、ProAct（arXiv:2605.25971）、DCPM schema 歸納（arXiv:2606.09483）、RecMem（arXiv:2605.16045）＋ TRUSTMEM（arXiv:2606.25161）。
 

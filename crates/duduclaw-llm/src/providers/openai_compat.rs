@@ -117,6 +117,8 @@ pub struct OpenAiCompatProvider {
     /// O11: an owned client replacing the shared 120s singleton. `None` ⇒ the
     /// singleton, i.e. byte-identical behavior for every pre-O11 caller.
     client: Option<reqwest::Client>,
+    /// Per-request override that preserves the client's connection policy.
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl OpenAiCompatProvider {
@@ -141,6 +143,7 @@ impl OpenAiCompatProvider {
             extra_headers: Vec::new(),
             verbatim_model_id: false,
             client: None,
+            request_timeout: None,
         }
     }
 
@@ -181,6 +184,22 @@ impl OpenAiCompatProvider {
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.client = reqwest::Client::builder().timeout(timeout).build().ok();
         self
+    }
+
+    /// Override each completion request's deadline, including tool-loop rounds,
+    /// without replacing the shared client's connection timeout or pool.
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    fn http_request(&self) -> reqwest::RequestBuilder {
+        let request = self.client.as_ref().unwrap_or_else(|| http_client())
+            .post(self.chat_url());
+        match self.request_timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 
     fn chat_url(&self) -> String {
@@ -720,11 +739,7 @@ impl SseParser for CompatSse {
 impl OpenAiCompatProvider {
     async fn send(&self, req: &ChatRequest, stream: bool) -> Result<reqwest::Response, LlmError> {
         let body = build_request_body_with(req, stream, self.verbatim_model_id);
-        let mut http = self
-            .client
-            .as_ref()
-            .unwrap_or_else(|| http_client())
-            .post(self.chat_url())
+        let mut http = self.http_request()
             .header("content-type", "application/json");
         if !self.auth.api_key.is_empty() {
             http = http.bearer_auth(&self.auth.api_key);
@@ -801,6 +816,15 @@ impl ChatProvider for OpenAiCompatProvider {
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, SystemBlock, ToolDef};
+
+    #[test]
+    fn request_timeout_overrides_shared_client_for_all_completion_modes() {
+        let provider = OpenAiCompatProvider::new("test", ApiAuth::new(""), "https://example.invalid/v1");
+        assert_eq!(provider.http_request().build().unwrap().timeout(), None);
+        let provider = provider.with_request_timeout(std::time::Duration::from_secs(900));
+        assert_eq!(provider.http_request().build().unwrap().timeout().copied(),
+            Some(std::time::Duration::from_secs(900)));
+    }
 
     #[test]
     fn presets_ported_from_gateway_table() {

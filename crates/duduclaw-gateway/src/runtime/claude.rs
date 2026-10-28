@@ -29,6 +29,15 @@ impl AgentRuntime for ClaudeRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        if crate::runtime_dispatch::in_utility_call() {
+            let content = crate::channel_reply::call_claude_cli_public(
+                prompt, &context.model, &context.system_prompt, &self.home_dir,
+            ).await?;
+            return Ok(RuntimeResponse {
+                content, model_used: context.model.clone(), runtime_name: "claude".into(),
+                ..Default::default()
+            });
+        }
         // Delegate to the existing account-rotated Claude CLI path.
         info!(agent = %context.agent_id, model = %context.model, "ClaudeRuntime: executing via claude CLI");
 
@@ -57,6 +66,7 @@ impl AgentRuntime for ClaudeRuntime {
         .await?;
 
         Ok(RuntimeResponse {
+            partial_timeout_secs: None,
             content: result,
             input_tokens: 0, // Token counting happens at the telemetry layer
             output_tokens: 0,

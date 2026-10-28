@@ -163,6 +163,24 @@ fn tool_calls_of(resp: &ChatResponse) -> Vec<(String, String, Value)> {
         .collect()
 }
 
+/// A single completion for untrusted utility input. No executor is accepted:
+/// even a provider that ignores the empty tool surface cannot execute a call.
+/// Do not use an empty-tools `run_tool_loop`: that loop seeds executor defs.
+pub async fn complete_without_tools(
+    provider: &dyn ChatProvider,
+    mut req: ChatRequest,
+) -> Result<ChatResponse, LlmError> {
+    req.tools.clear();
+    req.tool_choice = crate::ToolChoice::None;
+    let response = provider.complete(&req).await?;
+    if response.stop == StopReason::ToolUse
+        || response.parts.iter().any(|part| matches!(part, ContentPart::ToolCall { .. }))
+    {
+        return Err(LlmError::InvalidRequest("utility completion requested a forbidden tool".into()));
+    }
+    Ok(response)
+}
+
 /// Run the provider-agnostic agentic tool-use loop. See the module docs for
 /// the full contract.
 ///

@@ -170,6 +170,15 @@ pub(crate) fn apply_runtime_to_table_reporting(
         None => return Ok(RuntimeApplyOutcome::default()),
     };
 
+    // Validate before touching the proposal. The config commit path preserves
+    // formatting and publishes nothing if this closure returns an error.
+    let timeout_secs = rt.get("timeout_secs");
+    if let Some(value) = timeout_secs.filter(|v| !v.is_null()) {
+        if !value.as_i64().is_some_and(|secs| (30..=3600).contains(&secs)) {
+            return Err("單次執行時間上限必須是 30–3600 秒的整數".to_string());
+        }
+    }
+
     let section = table
         .entry("runtime")
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -222,6 +231,15 @@ pub(crate) fn apply_runtime_to_table_reporting(
             if introduces(previous, v) {
                 deprecated.extend(DeprecatedRuntimeWrite::for_value("fallback", v));
             }
+        }
+    }
+    if let Some(value) = timeout_secs {
+        if value.is_null() {
+            section.remove("timeout_secs");
+            changes.push("runtime.timeout_secs cleared".to_string());
+        } else if let Some(secs) = value.as_i64() {
+            section.insert("timeout_secs".into(), toml::Value::Integer(secs));
+            changes.push(format!("runtime.timeout_secs = {secs}"));
         }
     }
     Ok(RuntimeApplyOutcome { changes, deprecated })
@@ -371,3 +389,30 @@ pub(crate) fn apply_evolution_advanced_to_table(
 }
 
 
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_timeout_rejects_invalid_updates_without_mutation() {
+        for value in [serde_json::json!(29), serde_json::json!(3601), serde_json::json!(300.5),
+            serde_json::json!("300"), serde_json::json!(true)] {
+            let mut table = toml::Table::new();
+            let result = apply_runtime_to_table(&mut table, &serde_json::json!({"runtime": {"timeout_secs": value}}));
+            assert!(result.unwrap_err().contains("30–3600"));
+            assert!(table.is_empty());
+        }
+    }
+
+    #[test]
+    fn runtime_timeout_can_be_written_and_cleared() {
+        let mut table = toml::Table::new();
+        for secs in [30, 300, 3600] {
+            apply_runtime_to_table(&mut table, &serde_json::json!({"runtime": {"timeout_secs": secs}})).unwrap();
+            assert_eq!(table["runtime"]["timeout_secs"].as_integer(), Some(secs));
+        }
+        apply_runtime_to_table(&mut table, &serde_json::json!({"runtime": {"timeout_secs": null}})).unwrap();
+        assert!(table["runtime"].get("timeout_secs").is_none());
+    }
+}

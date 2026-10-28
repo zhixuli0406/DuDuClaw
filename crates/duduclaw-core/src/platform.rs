@@ -3,6 +3,11 @@
 //! This module abstracts away Unix-specific APIs (flock, chmod, signals) so the
 //! rest of the codebase compiles and runs on both Unix and Windows.
 
+#[cfg(windows)]
+mod windows_job;
+#[cfg(windows)]
+pub use windows_job::WindowsJob;
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -612,7 +617,9 @@ pub fn process_alive(pid: u32) -> bool {
 /// values 0 (the caller's own group), 1 (`kill(-1)` would signal every
 /// process the caller may signal) and anything that does not fit `i32` are
 /// refused with `InvalidInput` rather than sent.
-/// Windows: `taskkill /T /F /PID <pgid>` — the process and its descendants.
+/// Windows: legacy best-effort `taskkill /T /F /PID <pgid>`; it cannot find
+/// descendants after the leader exits. Managed CLI spawns must use `WindowsJob`
+/// (Windows only), assigned before resuming a CREATE_SUSPENDED child.
 pub fn kill_process_group(pgid: u32) -> std::io::Result<()> {
     sys::kill_process_group(pgid)
 }

@@ -8,7 +8,8 @@
 //!
 //! Mirrors [`crate::session_summarizer_task`]'s shape: 10-min tick, per-tick
 //! cap, per-session error isolation, `run_utility_prompt` dispatch (account
-//! rotator + provider config handled there).
+//! rotator + provider config handled there). Existing session owners use their
+//! own utility runtime; absent owners use global settings, invalid owners are refused.
 //!
 //! Cost guards:
 //! - only sessions active within [`TitleParams::active_within_secs`] are ever
@@ -253,12 +254,15 @@ async fn title_one(
     }
 
     let prompt = format_title_prompt(&transcript);
-    // Utility dispatch (RFC-25 N2): agent-less maintenance call, provider/model
-    // from `config.toml [runtime] utility_provider` / `utility_model`.
+    let agent_id = session_manager.session_agent(&c.session_id).await
+        .map_err(|e| format!("session_agent: {e}"))?;
+    let agent_dir = crate::runtime_config::session_agent_dir(home_dir, agent_id.as_deref())?;
+    let agent_id = agent_dir.as_ref().and(agent_id.as_deref()).unwrap_or("");
+    // Existing session owners use their own utility runtime and model.
     let raw = crate::runtime_dispatch::run_utility_prompt(
         home_dir,
-        None,
-        "",
+        agent_dir.as_deref(),
+        agent_id,
         "",
         &prompt,
         crate::runtime_dispatch::UTILITY_MAX_TOKENS,
@@ -288,6 +292,122 @@ async fn title_one(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    struct SessionUtilityRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for SessionUtilityRuntime {
+        fn name(&self) -> &str { "openai_compat" }
+        async fn is_available(&self) -> bool { panic!("owned registry must not probe host") }
+        async fn execute(&self, _prompt: &str, context: &crate::runtime::RuntimeContext)
+            -> Result<crate::runtime::RuntimeResponse, String> {
+            assert_eq!(context.agent_id, "utility-worker");
+            assert_eq!(context.model, "gpt-5.4");
+            assert_eq!(context.agent_dir.as_deref(), Some(context.home_dir.join("agents/utility-worker").canonicalize().unwrap().as_path()));
+            Ok(crate::runtime::RuntimeResponse {
+                partial_timeout_secs: None,
+                content: "Session utility result".into(), input_tokens: 1, output_tokens: 1,
+                cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "openai_compat".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_session_dispatches_through_agent_runtime() {
+        let (sm, home) = make_session_manager();
+        let dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
+        // A mistaken global dispatch also reaches the fake runtime, but with
+        // a different model/id, failing before any external call can occur.
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4-mini'\n").unwrap();
+        let runtimes = std::collections::HashMap::from([(
+            crate::runtime::RuntimeType::OpenAiCompat,
+            Box::new(SessionUtilityRuntime) as Box<dyn crate::runtime::AgentRuntime>,
+        )]);
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes),
+        ).await;
+        sm.get_or_create("owned", "utility-worker").await.unwrap();
+        sm.append_message("owned", "user", "Summarize this session", 4).await.unwrap();
+        sm.append_message("owned", "assistant", "Here is the discussion", 4).await.unwrap();
+        title_one(&sm, home.path(), &cand("owned", 2, 0)).await.unwrap();
+        assert_eq!(sm.get_title("owned").await.unwrap(), ("Session utility result".into(), 2));
+    }
+
+    #[tokio::test]
+    async fn refused_owner_runtime_uses_tool_free_global_spec() {
+        let (sm, home) = make_session_manager();
+        let dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4'\n").unwrap();
+        let runtimes = std::collections::HashMap::from([(
+            crate::runtime::RuntimeType::OpenAiCompat,
+            Box::new(SessionUtilityRuntime) as Box<dyn crate::runtime::AgentRuntime>,
+        )]);
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes),
+        ).await;
+        sm.get_or_create("fallback-owner", "utility-worker").await.unwrap();
+        sm.append_message("fallback-owner", "user", "Summarize this session", 4).await.unwrap();
+        sm.append_message("fallback-owner", "assistant", "Here is the discussion", 4).await.unwrap();
+        title_one(&sm, home.path(), &cand("fallback-owner", 2, 0)).await.unwrap();
+        assert_eq!(sm.get_title("fallback-owner").await.unwrap().0, "Session utility result");
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_owner_never_reaches_global_utility() {
+        let (sm, home) = make_session_manager();
+        // If fallback dispatch occurs this fake global runtime panics because
+        // it only accepts the named employee and model used by the valid test.
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4-mini'\n").unwrap();
+        let runtimes = std::collections::HashMap::from([(
+            crate::runtime::RuntimeType::OpenAiCompat,
+            Box::new(SessionUtilityRuntime) as Box<dyn crate::runtime::AgentRuntime>,
+        )]);
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes),
+        ).await;
+        for (index, owner) in ["missing", "../worker", "dashboard", " "].into_iter().enumerate() {
+            let sid = format!("invalid-owner-{index}");
+            sm.get_or_create(&sid, owner).await.unwrap();
+            sm.append_message(&sid, "user", "Summarize this conversation", 4).await.unwrap();
+            sm.append_message(&sid, "assistant", "Discussion content", 4).await.unwrap();
+            let error = title_one(&sm, home.path(), &cand(&sid, 2, 0)).await.unwrap_err();
+            assert!(error.contains("invalid session owner"), "{error}");
+            assert_eq!(sm.get_title(&sid).await.unwrap().0, "");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_utility_uses_valid_existing_agent_only() {
+        let (sm, home) = make_session_manager();
+        let agent_dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[agent]\nname = \"utility-worker\"\n[runtime]\nprovider = \"openai_compat\"\n[model]\npreferred = \"gpt-5.4\"\n").unwrap();
+        std::fs::create_dir_all(home.path().join("utility-worker")).unwrap();
+        std::fs::write(home.path().join("agents/file-agent"), "not a directory").unwrap();
+        for (sid, owner) in [("file", "file-agent"), ("known", "utility-worker"), ("unknown", "missing"),
+            ("invalid", "../utility-worker"), ("absolute", "/tmp"), ("blank", "")] {
+            sm.get_or_create(sid, owner).await.unwrap();
+            let id = sm.session_agent(sid).await.unwrap();
+            let dir = crate::runtime_config::session_agent_dir(home.path(), id.as_deref());
+            if sid == "known" {
+                let dir = dir.unwrap();
+                assert_eq!(dir.as_deref(), Some(agent_dir.canonicalize().unwrap().as_path()));
+                let spec = crate::runtime_config::resolve_utility(home.path(), dir.as_deref());
+                assert_eq!(spec.provider, duduclaw_core::types::RuntimeType::OpenAiCompat);
+                assert_eq!(spec.model, "gpt-5.4");
+            } else if sid == "blank" {
+                assert!(dir.unwrap().is_none());
+            } else {
+                assert!(dir.is_err(), "{sid}");
+            }
+        }
+        assert!(crate::runtime_config::session_agent_dir(home.path(), None).unwrap().is_none());
+    }
 
     fn make_session_manager() -> (Arc<SessionManager>, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
