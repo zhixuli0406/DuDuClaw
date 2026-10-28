@@ -12,9 +12,9 @@ python3 scripts/build-distributor-brief.py --version 1.69.1 --skip-missing
 ```
 
 The source belongs to the separate private `commercial` repository. The default
-source directory is `commercial/marketing/distributor/technology-brief-v1.67-src`;
-that historical directory name is stable. The output is a standalone HTML file:
-`commercial/marketing/distributor/duduclaw-technology-brief-v1.69.1.html`.
+source directory is a folder in that repository's distributor marketing area;
+its historical name is stable. The output is a standalone HTML file written to
+the same private area, with the release version in its filename.
 Versioned files from earlier releases remain available. The public release commit
 does not stage, commit, upload, or publish the private document.
 

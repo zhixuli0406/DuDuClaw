@@ -50,7 +50,7 @@ invoke_oneshot(program, args, env, cwd, deadline, clear_env)
 
 ### 如果 Anthropic 真的重啟拆分
 
-那就重做一次——而且是刻意地做，從第一個 commit 就把對話維度放進 session 身分。設計筆記在 `commercial/docs/specs/runtime-pty-pool-design.md`，被移除的實作留在 v1.65 tag 的 git 歷史裡。
+那就重做一次——而且是刻意地做，從第一個 commit 就把對話維度放進 session 身分。設計筆記是內部文件（未公開），被移除的實作留在 v1.65 tag 的 git 歷史裡。
 
 ---
 

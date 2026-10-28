@@ -4,7 +4,7 @@
 > Date: 2026-03-29 (v3 addendum: 2026-08-06)
 > Status: chapter 3 (prediction engine) and chapter 12 (AEE) describe the running code; the v2.0 SOUL.md rewrite path was removed on 2026-09-29 (see the note below)
 
-**Read this before the rest of the document (S11 status, 2026-09-29)**: the "GVU rewrites SOUL.md directly" flow described in chapter 4 — and everything that supported it (the `agent.toml [evolution] legacy_soul_evolution` escape hatch, `SOUL.md` versioning, the 24-hour observation window, automatic rollback, the cap-deadlock consolidate rewrite, deferred-GVU retry, the `duduclaw evolution finalize` CLI) — has been **removed from the codebase**. `SOUL.md` became read-only for agents in v3 (2026-08-06), so by then those mechanisms were already guarding a write path that no longer existed. **Chapters 4, 7, 8 and 9 are retained as history**: they describe how the engine used to work and why each guard was built, which is still the fastest way to understand the design pressure behind chapter 12 — but nothing in them is live code any more. The engine that runs is AEE (chapter 12), and `[evolution] gvu_enabled` now ships `true` from the factory. Full design: `commercial/docs/specs/DESIGN-evolution-v3-aee.md`; planning and root-cause forensics: `commercial/docs/plans/TODO-evolution-v3-2026-08.md`; user-facing walkthrough: `docs/features/38-aee-playbook-evolution.md`; switch details: `docs/guides/evolution-switches.md`.
+**Read this before the rest of the document (S11 status, 2026-09-29)**: the "GVU rewrites SOUL.md directly" flow described in chapter 4 — and everything that supported it (the `agent.toml [evolution] legacy_soul_evolution` escape hatch, `SOUL.md` versioning, the 24-hour observation window, automatic rollback, the cap-deadlock consolidate rewrite, deferred-GVU retry, the `duduclaw evolution finalize` CLI) — has been **removed from the codebase**. `SOUL.md` became read-only for agents in v3 (2026-08-06), so by then those mechanisms were already guarding a write path that no longer existed. **Chapters 4, 7, 8 and 9 are retained as history**: they describe how the engine used to work and why each guard was built, which is still the fastest way to understand the design pressure behind chapter 12 — but nothing in them is live code any more. The engine that runs is AEE (chapter 12), and `[evolution] gvu_enabled` now ships `true` from the factory. Full design, planning and root-cause forensics: internal design notes (not published); user-facing walkthrough: `docs/features/38-aee-playbook-evolution.md`; switch details: `docs/guides/evolution-switches.md`.
 
 ---
 
@@ -870,8 +870,8 @@ peer_signals = false               # Peer agent signals
 
 > Landed: 2026-08-06. Full design (including the field-by-field gene schema, the
 > complete Gate/Measure list, and the Generator inner-loop prompt assembly) is in
-> `commercial/docs/specs/DESIGN-evolution-v3-aee.md` chapters 1-3; root-cause forensics
-> and work-package breakdown are in `commercial/docs/plans/TODO-evolution-v3-2026-08.md`.
+> the internal design notes (not published), as are the root-cause forensics
+> and work-package breakdown.
 
 ### 12.0 One-sentence framing
 

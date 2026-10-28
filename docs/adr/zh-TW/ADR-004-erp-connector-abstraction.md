@@ -29,7 +29,7 @@ OpenAI-compat 四個實作，加上 `ModelRegistry` 這種資料驅動的能力�
 這側沒有理由重新發明。
 
 trait 切面的完整規格(方法簽名、`duduclaw-erp` 骨架 crate 的拆分、ERPNext
-實作細節)已由 `commercial/docs/plans/TODO-feature-gaps-2026-07.md` §一 規劃完成，
+實作細節)已由一份內部規劃文件(未公開)規劃完成，
 那是調研產出。本 ADR 只做一件事：把那份規劃升格為正式決策，並記錄取捨。
 規格不在此重述。執行時兩份文件同時打開。
 

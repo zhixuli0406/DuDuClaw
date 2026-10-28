@@ -202,7 +202,7 @@ effort    = "high"          # low | medium | high | xhigh | max
 
 ### 各 runtime 的旗標對應
 
-2026-09-24 針對已安裝的執行檔實測（`research/multi-model-routing-2026-09/17-P0-cli-flag-probe.md` §4 + §6），不是從文件推測：
+2026-09-24 針對已安裝的執行檔實測（記錄於內部實測筆記，未公開），不是從文件推測：
 
 | Runtime | 實測版本 | effort 的表達方式 | CLI 接受的值 |
 |---|---|---|---|

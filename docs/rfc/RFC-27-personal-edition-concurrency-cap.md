@@ -3,13 +3,13 @@
 **Status:** Implemented (core) — the concurrency gate primitive, goal-loop wiring, and edition resolution have landed; see [`docs/features`] and the CHANGELOG. Enforcement is default-on for the Personal edition (cap 2) and a no-op for Enterprise.
 **Author:** DuDuClaw team
 **Date:** 2026-08-12
-**Supersedes decision:** none. Implements the **D1-C / D2-B** ruling in `commercial/design/reviews/ux-redesign-2026-08/09-edition-split-features.md §4` — "個人版不限 Agent 數量,改限併發(同時執行的 goal loop／dispatch 數)". Item 16 of that document's §5.2 (規模 L) is the work this RFC covers.
+**Supersedes decision:** none. Implements the **D1-C / D2-B** ruling in the internal 2026-08 UX review of edition-split features (not published) — "個人版不限 Agent 數量,改限併發(同時執行的 goal loop／dispatch 數)". This RFC covers one work item from that review (規模 L).
 
 ---
 
 ## 1. Motivation
 
-The 2026-07-16 decision (recorded in `commercial/docs/business/edition-split-moat-strategy-2026-07-13.md`) is a hard constraint: **the Personal edition never gets a hard agent-count cap** — the self-host / open-core promise wins, and `EditionProfile::personal_max_agents()` defaults to `0` (unlimited). The 2026-08-12 UX review then asked for "一點限制" (some visible limit) that a single user barely notices but a commercial workload feels.
+The 2026-07-16 decision (recorded in an internal business document, not published) is a hard constraint: **the Personal edition never gets a hard agent-count cap** — the self-host / open-core promise wins, and `EditionProfile::personal_max_agents()` defaults to `0` (unlimited). The 2026-08-12 UX review then asked for "一點限制" (some visible limit) that a single user barely notices but a commercial workload feels.
 
 Those two constraints collide only if the limit is placed on *agent count*. They do **not** collide on *resource concurrency*: capping how many goal dispatches run **simultaneously** limits resource use, never capability. A single owner rarely fires two autonomous goals at once; a team running a board of goals hits it immediately. This is the same shape as the one edition quota that already exists — `os_native_agent_quota()` returns `Some(1)` for Personal, `None` for Enterprise — "鎖 quota 不鎖能力" applied to a different resource.
 

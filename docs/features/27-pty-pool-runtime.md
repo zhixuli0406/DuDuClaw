@@ -50,7 +50,7 @@ Nothing, unless you had explicitly opted in. If your `agent.toml` still carries 
 
 ### If Anthropic re-activates the split
 
-Rebuild it — deliberately, with a conversation key in the session identity from the first commit. The design notes live in `commercial/docs/specs/runtime-pty-pool-design.md`, and the removed implementation is in git history at the v1.65 tag.
+Rebuild it — deliberately, with a conversation key in the session identity from the first commit. The design notes are internal (not published), and the removed implementation is in git history at the v1.65 tag.
 
 ---
 

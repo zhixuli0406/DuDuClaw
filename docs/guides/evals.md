@@ -610,7 +610,7 @@ premium suites — `--agent <id>` runs every case under one provisioned agent
 instead:
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix --agent agnes ...
+duduclaw eval <eval-suite-dir> --matrix --agent agnes ...
 ```
 
 This is an acceptable compromise for a probe, and it is **declared, never
@@ -798,7 +798,7 @@ priced entirely from the coarse assumption.
 ### Smoke run
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix \
+duduclaw eval <eval-suite-dir> --matrix \
   --roles executor,verifier \
   --models claude:claude-haiku-4-5,codex:gpt-5.6-sol \
   --weak claude:claude-haiku-4-5 \
@@ -812,7 +812,7 @@ For the full-team probe, add a frozen `[case] team_acceptance = "..."` to every
 selected case. Run it on a provisioned agent in an isolated eval home:
 
 ```bash
-duduclaw eval commercial/evals/hr-recruit --matrix --team-2x2 \
+duduclaw eval <eval-suite-dir> --matrix --team-2x2 \
   --agent agnes --planner-weak codex:gpt-5.6-terra \
   --planner-strong codex:gpt-5.6-sol \
   --executor-weak codex:gpt-5.6-terra \

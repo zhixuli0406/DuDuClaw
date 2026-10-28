@@ -6,7 +6,7 @@
 | 作者 | DuDuClaw Core |
 | 建立日期 | 2026-06-22 |
 | 目標版本 | v1.23.0 |
-| 相關文件 | `commercial/docs/plans/TODO-instruction-pinning.md`、`commercial/docs/plans/TODO-anti-hallucination.md`、`commercial/docs/plans/TODO-key-fact-accumulator.md`、`docs/architecture/evolution-engine.md` |
+| 相關文件 | 三份內部規劃文件(未公開；主題為指令釘選、防幻覺、關鍵事實累積)、`docs/architecture/evolution-engine.md` |
 | 取代 / 擴充 | 擴充既有 `pinned_instructions`(session.rs)+ Temporal Memory F1(RFC 無,v1.19.0 實作) |
 
 ---

@@ -253,7 +253,6 @@ The same `[proactive] quiet_hours` has two editing entry points: the「自動化
 
 ## Related
 
-- Design basis: `commercial/design/reviews/ux-redesign-2026-08/02-ux-methodology.md` theme 4 (P4-1, P4-4, P4-5, P4-6) and `03-analogous-products.md` C1 / C7 / C8 / C12
 - Code: `crates/duduclaw-gateway/src/notify_governance.rs`, `notify_stats.rs`, `notify_digest.rs`
 - Frontend: `web/src/pages/agent-form/EditAgentPage.tsx` (automation tab), `web/src/components/settings/sections/ProactiveTab.tsx`, `SystemTab.tsx`, `web/src/pages/ReportPage.tsx`
 - Related features: [34-goal-loop.md](34-goal-loop.md) (needs_human decision cards), [23-autopilot-engine.md](23-autopilot-engine.md) (rule circuit-breaker notifications)
