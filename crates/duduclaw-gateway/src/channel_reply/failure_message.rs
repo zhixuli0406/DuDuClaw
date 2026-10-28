@@ -58,7 +58,7 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
     {
         return FailureReason::AuthFailed;
     }
-    if lower.contains("hard timeout") {
+    if lower.contains("hard timeout") || lower.contains("timed out") {
         return FailureReason::Timeout;
     }
     if lower.contains("empty response") {
@@ -276,7 +276,7 @@ pub(crate) fn format_fallback_message(
              請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
         ),
         FailureReason::Timeout => format!(
-            "{agent_name} 這次處理超時（已達 30 分鐘安全上限）。\n\
+            "{agent_name} 這次處理逾時（已達 30 分鐘安全上限）。\n\
              請重新送出訊息，或將任務拆成較小的步驟。"
         ),
         FailureReason::SpawnError => format!(
@@ -337,7 +337,7 @@ pub(super) fn classify_cli_error_hint(err: &str) -> &'static str {
         FailureReason::RateLimited => "使用量已達上限",
         FailureReason::Billing => "帳號額度用完",
         FailureReason::AuthFailed => "認證失效",
-        FailureReason::Timeout => "處理超時",
+        FailureReason::Timeout => "處理逾時",
         FailureReason::EmptyResponse => "空回應",
         FailureReason::BinaryMissing => "CLI 未安裝",
         FailureReason::NoAccounts => "無可用帳號",

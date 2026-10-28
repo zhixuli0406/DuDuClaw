@@ -193,7 +193,10 @@ impl FailoverManager {
         } else if let Some(runtime)=registry.get(primary) {
             match {
                 #[cfg(test)] crate::model_call_probe::record("failover_execute");
-                runtime.execute(prompt,context).await
+                match runtime.execute(prompt,context).await {
+                    Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,context).await,
+                    Err(error) => Err(error),
+                }
             } {
                 Ok(response) if !response.content.trim().is_empty()=>{
                     self.record_success(primary).await;
@@ -242,7 +245,10 @@ impl FailoverManager {
         let mut fb_context=context.clone();fb_context.model=fb_model;
         match {
             #[cfg(test)] crate::model_call_probe::record("failover_execute");
-            runtime.execute(prompt,&fb_context).await
+            match runtime.execute(prompt,&fb_context).await {
+                Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,&fb_context).await,
+                Err(error) => Err(error),
+            }
         } {
             Ok(response) if !response.content.trim().is_empty()=>{
                 self.record_success(fb).await;
@@ -437,6 +443,7 @@ mod tests {
             context: &RuntimeContext,
         ) -> Result<RuntimeResponse, String> {
             Ok(RuntimeResponse {
+                partial_timeout_secs: None,
                 content: self.content.to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -710,6 +717,7 @@ mod tests {
             context: &RuntimeContext,
         ) -> Result<RuntimeResponse, String> {
             Ok(RuntimeResponse {
+                partial_timeout_secs: None,
                 content: format!("answered with {}", context.model),
                 input_tokens: 0,
                 output_tokens: 0,

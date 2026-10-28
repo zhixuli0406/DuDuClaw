@@ -1,5 +1,5 @@
 {
-  "_comment": "Admin-only agent.toml fields. Read by the gateway test (crates/duduclaw-gateway/src/handlers/agent_authority.rs) and the editPayload vitest, so the server table and the dashboard fallback list cannot drift. kind: change = any change needs an admin; loosen = only raising a budget cap / turning hard_stop off needs an admin; role_main = becoming or leaving role \"main\" needs an admin; google_narrow = the owner may only narrow [google] (switch to none, drop fallback, tighten requesters). form_paths ending in \".\" are prefixes.",
+  "_comment": "Admin-only agent.toml fields. Read by the gateway test (crates/duduclaw-gateway/src/handlers/agent_authority.rs) and the editPayload vitest, so the server table and the dashboard fallback list cannot drift. kind: change = any change needs an admin; loosen = only raising an effective runtime timeout or budget cap / turning hard_stop off needs an admin; role_main = becoming or leaving role \"main\" needs an admin; google_narrow = the owner may only narrow [google] (switch to none, drop fallback, tighten requesters). form_paths ending in \".\" are prefixes.",
   "fields": [
     { "key": "agent.reports_to", "form_paths": ["form.reports_to"], "kind": "change" },
     { "key": "agent.department", "form_paths": ["form.department"], "kind": "change" },
@@ -25,6 +25,7 @@
     { "key": "odoo", "form_paths": ["odoo."], "kind": "change" },
     { "key": "runtime.provider", "form_paths": ["runtime.provider"], "kind": "change" },
     { "key": "runtime.fallback", "form_paths": ["runtime.fallback"], "kind": "change" },
+    { "key": "runtime.timeout_secs", "form_paths": ["runtime.timeout_secs"], "kind": "loosen" },
     { "key": "prompt.cli_bare_mode", "form_paths": [], "kind": "change" },
     { "key": "os_watch", "form_paths": ["osWatch."], "kind": "change" },
     { "key": "model.account_pool", "form_paths": ["adv.account_pool"], "kind": "change" },

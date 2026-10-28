@@ -22,8 +22,7 @@ Four sub-passes, run in one "night pass" per agent:
 | N3 | Schema induction | no | Recurring patterns in episodic memory promoted to schema entries |
 | N4 | Recurrence-gated consolidation | no | Semantically recurring knowledge consolidated, behind a coverage / preservation / faithfulness check that rolls back on failure |
 
-N3 and N4 are deterministic and cost nothing. N1 and N2 call the agent's **utility**
-model (haiku-class by default), and only those two are affected by the spend cap.
+N3 and N4 are deterministic and cost nothing. N1 and N2 use the resolved utility provider/model, and only these two passes are affected by the spend cap. Claude employees use a non-blank `[model] utility` or `claude-haiku-4-5`; OpenAI-compatible employees use a non-blank `utility` or `preferred` and require one of them. Codex employees use `utility`, then `preferred`, then the CLI default, in the restricted profile. Grok, Antigravity and generic CLI employees use the global background settings, which must resolve to Claude, Codex or OpenAI-compatible API. See [Multi-runtime](13-multi-runtime.md#execution-time-limit-and-background-models).
 
 References: sleep-time compute (arXiv:2504.13171), ProAct (arXiv:2605.25971),
 DCPM schema induction (arXiv:2606.09483), RecMem (arXiv:2605.16045) + TRUSTMEM

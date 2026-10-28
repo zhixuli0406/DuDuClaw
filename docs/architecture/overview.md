@@ -36,9 +36,9 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **Turn trimming** (>800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe).
 - **Direct API prompt cache** ("system_and_3" breakpoint strategy; no measured hit rate is published).
 - **Compression summaries** injected into system prompt (not conversation turns) at 50k token threshold.
-- **Instruction Pinning** (v1.8.6 P0) — first user turn → async Haiku extraction of core task → stored in `sessions.pinned_instructions` → injected at system prompt tail (U-shaped attention). Clarification answers accumulate (≤1000 chars).
+- **Instruction Pinning** (v1.8.6 P0) — first user turn → async extraction of the core task by the resolved utility model (restricted Codex or tool-free Claude/API) (global fallback for unsupported employee runtimes) → stored in `sessions.pinned_instructions` → injected at system prompt tail (U-shaped attention). Clarification answers accumulate (≤1000 chars).
 - **Snowball Recap** (v1.8.6 P0) — every turn prepends `<task_recap>` to the user message. Zero LLM cost.
-- **P2 Key-Fact Accumulator** (v1.8.6) — per substantive turn, Haiku extracts 2-4 key facts → `key_facts` table with FTS5 → top-3 relevant facts injected into system prompt. ~100-150 tokens vs MemGPT's 6,500 (−87%).
+- **P2 Key-Fact Accumulator** (v1.8.6) — per substantive turn, the resolved utility model (restricted Codex or tool-free Claude/API) (global fallback for unsupported employee runtimes) extracts 2-4 key facts → `key_facts` table with FTS5 → top-3 relevant facts injected into system prompt. ~100-150 tokens vs MemGPT's 6,500 (−87%).
 - **CLI lightweight path** — `call_claude_cli_lightweight()` with `--effort medium --max-turns 1 --no-session-persistence --tools ""` for metadata tasks. 25-40% cost reduction.
 - **Stabilization flags** — `--strict-mcp-config` (MCP isolation) + `--exclude-dynamic-system-prompt-sections` (cross-turn prompt stability, 10-15% token reduction). `--bare` was removed in v1.8.11 (broke OS keychain credential lookup).
 

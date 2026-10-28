@@ -101,6 +101,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     // The runtime decides the sandbox and the tool semantics.
     key("runtime.provider", &["runtime.provider"], Change),
     key("runtime.fallback", &["runtime.fallback"], Change),
+    key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
     // `--bare` skips the hooks, the employee file guard included.
     key("prompt.cli_bare_mode", &[], Change),
     // Widens what the employee watches on the machine.
@@ -124,6 +125,7 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback" => {
             or(Value::String(String::new()))
         }
+        "runtime.timeout_secs" => json!(raw.as_i64().map(|v| v.clamp(30, 3600)).unwrap_or(300)),
         "runtime.provider" => or(Value::String(duduclaw_core::types::RuntimeType::default().as_str().into())),
         "container.sandbox_enabled"
         | "container.network_access"
@@ -178,6 +180,7 @@ fn needs_admin(k: &AuthorityKey, before: &Value, after: &Value) -> bool {
         Loosen if k.toml_key == "budget.hard_stop" => {
             before.as_bool() == Some(true) && after.as_bool() != Some(true)
         }
+        Loosen if k.toml_key == "runtime.timeout_secs" => after.as_u64() > before.as_u64(),
         Loosen => cap_loosened(before, after),
         GoogleNarrow => !google_only_narrows(before, after),
     }
@@ -288,6 +291,27 @@ mod tests {
         assert_eq!(keys(&base(2000, 100, true)), vec!["budget.monthly_limit_cents"]);
         assert_eq!(keys(&base(1000, 0, true)), vec!["budget.daily_cap_cents"], "0 removes the cap");
         assert_eq!(keys(&base(1000, 100, false)), vec!["budget.hard_stop"]);
+    }
+
+    #[test]
+    fn runtime_timeout_only_effective_increases_need_admin() {
+        let value = |v: &str| t(&format!("[runtime]\ntimeout_secs={v}\n"));
+        let unset = t("");
+        for (before, after, widening) in [
+            (unset.clone(), value("301"), true),
+            (unset.clone(), value("300"), false),
+            (unset.clone(), value("30"), false),
+            (value("900"), value("600"), false),
+            (value("900"), unset.clone(), false),
+            (value("30"), unset.clone(), true),
+            (value("4000"), value("3600"), false),
+            (value("-1"), value("31"), true),
+            (value("'bad'"), value("301"), true),
+        ] {
+            let changes = authority_diff(&before, &after);
+            assert_eq!(!changes.is_empty(), widening, "{before:?} -> {after:?}");
+            if widening { assert_eq!(changes[0].key, "runtime.timeout_secs"); }
+        }
     }
 
     #[test]

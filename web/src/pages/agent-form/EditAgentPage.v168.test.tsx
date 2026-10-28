@@ -1,6 +1,6 @@
 import { useProductPolicyStore } from '@/lib/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
@@ -131,6 +131,87 @@ describe('heartbeat cron (audit F1)', () => {
 });
 
 describe('new controls round-trip from inspect to payload', () => {
+  it('warns that a Claude utility model will fail on a Codex agent', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      runtime: { provider: 'codex' },
+      model: { preferred: 'gpt-5.4', utility: 'claude-haiku-4-5' },
+    });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const warning = await screen.findByText(en['agents.adv.utility.mismatch']);
+    expect(warning).toHaveAttribute('role', 'alert');
+  });
+
+  it.each(['', 'gpt-5.4'])('keeps the utility warning quiet for a compatible or empty model (%s)', async (utility) => {
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      runtime: { provider: 'codex' },
+      model: { preferred: 'gpt-5.4', utility },
+    });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    await screen.findByRole('combobox', { name: 'AI Backend (Provider)' });
+    expect(screen.queryByText(en['agents.adv.utility.mismatch'])).not.toBeInTheDocument();
+  });
+
+  it('shows an unset inspect utility as an empty selection without a warning', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      runtime: { provider: 'codex' },
+      model: { preferred: 'gpt-5.4', utility: null },
+    });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const utility = await screen.findByRole('textbox', { name: 'Utility Model' });
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Preferred Model' })).toHaveValue('gpt-5.4'));
+    expect(utility).toHaveValue('');
+    expect(screen.queryByText(en['agents.adv.utility.mismatch'])).not.toBeInTheDocument();
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
+  it('loads and saves runtime seconds independently of the container timeout', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      runtime: { provider: 'codex', timeout_secs: 450 },
+      container: { timeout_ms: 1800000 },
+    });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const timeout = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
+    await waitFor(() => expect(timeout).toHaveValue(450));
+    expect(timeout).toHaveAttribute('min', '30');
+    expect(timeout).toHaveAttribute('max', '3600');
+    fireEvent.change(timeout, { target: { value: '600' } });
+    await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+    expect(lastPayload()).toEqual({ runtime: { timeout_secs: 600 } });
+  });
+
+  it('lets an owner lower timeout but rejects increases including after a saved decrease', async () => {
+    setRole('employee');
+    mockWsClient.call.mockResolvedValue({ ...FULL, runtime: { provider: 'codex', timeout_secs: 450 } });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const timeout = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
+    await waitFor(() => expect(timeout).toHaveValue(450));
+    expect(timeout).toHaveAttribute('max', '450');
+    expect(screen.getByText(en['agents.runtime.timeout.lowerOnly'])).toBeInTheDocument();
+    fireEvent.change(timeout, { target: { value: '600' } });
+    expect(timeout).toHaveValue(450);
+    expect(updateAgent).not.toHaveBeenCalled();
+    fireEvent.change(timeout, { target: { value: '300' } });
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1), { timeout: 3000 });
+    expect(lastPayload()).toEqual({ runtime: { timeout_secs: 300 } });
+    await waitFor(() => expect(timeout).toHaveAttribute('max', '300'));
+    fireEvent.change(timeout, { target: { value: '450' } });
+    expect(timeout).toHaveValue(300);
+  });
+
+  it('shows the 300-second runtime default without writing it on an unrelated edit', async () => {
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const timeout = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
+    expect(timeout).toHaveValue(300);
+    await user.click(screen.getByRole('switch', { name: 'Slim startup context' }));
+    await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+    expect(lastPayload()).toEqual({ runtime: { minimal_context: true } });
+  });
+
   it('prefills effort, minimal context, team roles and sends only the touched role field', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=brain');

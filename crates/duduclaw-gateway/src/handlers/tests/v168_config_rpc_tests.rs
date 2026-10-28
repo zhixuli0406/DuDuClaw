@@ -397,7 +397,7 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
                 "guardrails": { "enabled": true },
                 "memory": { "decision_ttl_days": 9 },
                 "night_engine": { "enabled": true },
-                "runtime": { "fallback": "qwen", "minimal_context": false },
+                "runtime": { "fallback": "qwen", "minimal_context": false, "timeout_secs": 900 },
                 "utility": "",
                 // `[prompt]` left the key/value editor (it holds the admin-only
                 // `cli_bare_mode`); the typed `prompt` object still writes it.
@@ -416,6 +416,8 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
     assert_eq!(p["night_engine"]["enabled"], true);
     assert_eq!(p["runtime"]["fallback"], "qwen");
     assert_eq!(p["runtime"]["minimal_context"], false);
+    assert_eq!(p["runtime"]["timeout_secs"], 900);
+    assert!(p["model"]["utility"].is_null(), "unset utility must stay unset: {p}");
     assert_eq!(p["prompt"]["cli_bare_mode"], true);
     assert_eq!(p["capabilities"]["approval_required_tools"], json!([]));
     let raw = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap();
@@ -758,4 +760,81 @@ async fn raw_editor_cannot_forge_or_change_the_embedding_disclosure_record() {
         .handle("config.raw.set", json!({ "file": "config", "content": removed, "base_hash": got["hash"] }), &admin())
         .await);
     assert!(config(home.path())["knowledge"]["embedding"].get("cloud_disclosure_ack").is_none());
+}
+
+#[tokio::test]
+async fn runtime_timeout_rpc_preserves_comments_and_rejects_invalid_values() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("# Keep the operator's comment\n{original}")).unwrap();
+    for value in [json!(29), json!(3601), json!(300.5), json!("300")] {
+        let before = std::fs::read_to_string(&path).unwrap();
+        let e = err(&handler.handle("agents.update", json!({"agent_id": "a1", "runtime": {"timeout_secs": value}}), &admin()).await);
+        assert!(e.contains("30–3600"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    ok(&handler.handle("agents.update", json!({"agent_id": "a1", "runtime": {"timeout_secs": 600}}), &admin()).await);
+    assert!(std::fs::read_to_string(&path).unwrap().starts_with("# Keep the operator's comment\n"));
+    let p = ok(&handler.handle("agents.inspect", json!({"agent_id": "a1"}), &admin()).await);
+    assert_eq!(p["runtime"]["timeout_secs"], 600);
+    ok(&handler.handle("agents.update", json!({"agent_id": "a1", "runtime": {"timeout_secs": null}}), &admin()).await);
+    let p = ok(&handler.handle("agents.inspect", json!({"agent_id": "a1"}), &admin()).await);
+    assert!(p["runtime"].get("timeout_secs").is_none());
+}
+
+#[tokio::test]
+async fn global_utility_config_validates_persists_and_clears() {
+    let (home, handler) = handler_with_agent().await;
+    std::fs::write(home.path().join("config.toml"), "# keep this comment\n[runtime]\nutility_model = \"old\"\n").unwrap();
+    let before = std::fs::read(home.path().join("config.toml")).unwrap();
+    for provider in [json!("gemini"), json!("unknown"), json!(""), json!(123), Value::Null] {
+        let frame = handler.handle("system.update_config", json!({"runtime": {"utility_provider": provider, "utility_model": "changed"}}), &admin()).await;
+        assert!(err(&frame).contains("runtime.utility_provider"));
+        assert_eq!(std::fs::read(home.path().join("config.toml")).unwrap(), before);
+    }
+    let frame = handler.handle("system.update_config", json!({"runtime": {"utility_model": false}}), &admin()).await;
+    assert!(err(&frame).contains("runtime.utility_model"));
+    let frame = handler.handle("system.update_config", json!({"runtime": {"utility_provider": "codex", "utility_model": "gpt-5.4"}}), &owner_of_a1()).await;
+    err(&frame);
+    assert_eq!(std::fs::read(home.path().join("config.toml")).unwrap(), before);
+    let frame = handler.handle("system.update_config", json!({"runtime": {"utility_provider": "codex", "utility_model": "gpt-5.4"}}), &admin()).await;
+    assert_eq!(ok(&frame)["restart_required"], json!([]));
+    let spec = crate::runtime_config::resolve_utility(home.path(), None);
+    assert_eq!(spec.provider, duduclaw_core::types::RuntimeType::Codex);
+    assert_eq!(spec.model, "gpt-5.4");
+    assert!(std::fs::read_to_string(home.path().join("config.toml")).unwrap().contains("# keep this comment"));
+    ok(&handler.handle("system.update_config", json!({"runtime.utility_model": "   "}), &admin()).await);
+    assert!(config(home.path())["runtime"].get("utility_model").is_none());
+    let listed = ok(&handler.handle("agents.list", json!({}), &admin()).await);
+    assert_eq!(listed["agents"][0]["runtime"]["provider"], "claude");
+}
+
+#[tokio::test]
+async fn global_utility_read_returns_effective_provider() {
+    let (home, handler) = handler_with_agent().await;
+    for value in [" CLAUDE ", "unknown-legacy-value"] {
+        std::fs::write(home.path().join("config.toml"), format!("[runtime]\nutility_provider = {value:?}\n")).unwrap();
+        let output = ok(&handler.handle("system.config", json!({}), &admin()).await);
+        assert_eq!(output["utility_provider"], "claude");
+    }
+    std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='gemini'\n").unwrap();
+    let removed = ok(&handler.handle("system.config", json!({}), &admin()).await);
+    assert_eq!(removed["utility_provider"], "gemini");
+    ok(&handler.handle("system.update_config", json!({"runtime.utility_provider": " CODEX "}), &admin()).await);
+    assert_eq!(config(home.path())["runtime"]["utility_provider"].as_str(), Some("codex"));
+}
+
+#[tokio::test]
+async fn agents_list_normalizes_active_runtime_without_reviving_removed_gemini() {
+    let (home, handler) = handler_with_agent().await;
+    let file = home.path().join("agents/a1/agent.toml");
+    let mut agent: toml::Table = std::fs::read_to_string(&file).unwrap().parse().unwrap();
+    for (stored, expected) in [(" CLAUDE ", "claude"), (" GeMiNi ", "gemini")] {
+        let runtime = agent.entry("runtime").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        runtime.as_table_mut().unwrap().insert("provider".into(), toml::Value::String(stored.into()));
+        std::fs::write(&file, toml::to_string(&agent).unwrap()).unwrap();
+        let listed = ok(&handler.handle("agents.list", json!({}), &admin()).await);
+        assert_eq!(listed["agents"][0]["runtime"]["provider"], expected);
+    }
 }

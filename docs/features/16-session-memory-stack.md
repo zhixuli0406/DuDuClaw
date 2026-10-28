@@ -37,7 +37,7 @@ Turn 1: "Help me migrate this React app from CRA to Vite,
          keep the existing tests, and don't touch the auth flow."
      |
      v
-Async Haiku extraction:
+Async utility-model extraction:
    "migrate React app CRA → Vite; preserve tests; don't touch auth flow"
      |
      v
@@ -47,7 +47,13 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-The extraction runs *asynchronously* — it doesn't block the first response. It's a **metadata task**, so it uses the CLI lightweight path (`--effort medium --max-turns 1 --no-session-persistence --tools ""`) at ~25-40% of normal cost.
+Extraction runs asynchronously without blocking the first response. Background decision checks, instruction pinning, fact extraction and conversation compression use the employee's runtime for Claude, Codex and OpenAI-compatible APIs. A non-blank `[model] utility` wins; otherwise Claude uses `claude-haiku-4-5`, while Codex and OpenAI-compatible APIs use `[model] preferred`. If both are blank, Codex omits `-m` and uses its CLI default; OpenAI-compatible APIs refuse the call. Grok, Antigravity and generic CLI employees use the global background settings. The dashboard warns when an explicit utility model belongs to a different vendor family.
+
+Claude utility calls use the lightweight lane with the CLI's available credentials and do not enter account rotation. Normal chat retains its existing account rotation.
+
+Utility calls, including classifiers and judges, use a dedicated execution profile. Claude uses the tool-free, single-turn lightweight lane; OpenAI-compatible APIs send one completion without tools and never enter the tool loop. Codex uses a restricted profile: a read-only sandbox, no DuDuClaw MCP overrides, a fresh owner-only empty temporary working directory, ignored user config, and no persisted session. The temporary directory is removed after the call, including errors and timeouts; the system prompt travels in the prompt without writing `AGENTS.md`. This also applies to explicit Codex judge and team-verifier hints. Grok, Antigravity and generic CLIs remain unsupported for utility execution, so employee background work resolves to the global utility provider/model (default Claude / `claude-haiku-4-5`), with one warning per employee/runtime. The global provider must be Claude, Codex or OpenAI-compatible; an unsupported global provider or explicit hint is refused. Existing higher-level judge degradation may retry without an unsupported hint, subject to these same profiles. Codex may retain built-in reading tools; see [Security defense](05-security-defense.md) for the residual risk.
+
+The scheduled session summarizer and auto-titler apply the same utility provider selection and global fallback to the session owner. The stored owner must name a non-reserved, existing employee with a matching `agent.toml`, in a non-symlink direct child of the canonical `<home>/agents` directory. A nonempty invalid owner skips the utility call with an error; only an empty owner uses the global utility settings. Protected summary sections remain excluded from the model prompt and are preserved verbatim with the existing cap. Explicit utility-model mismatches keep the saved value and emit one warning per agent/model. Agent-less work uses `[runtime] utility_provider` / `utility_model`, now editable in Settings → Advanced → System.
 
 ### Clarification Accumulation
 
@@ -102,7 +108,7 @@ MemGPT's Core Memory was trying to capture these, but at ~6,500 tokens/turn. The
 Each substantive turn (non-trivial content)
      |
      v
-Async Haiku extraction (lightweight CLI path):
+Async utility-model extraction:
    "Extract 2-4 key facts about the user, project, or preferences.
     Skip ephemeral context."
      |
@@ -190,7 +196,7 @@ The session memory stack isn't isolated from evolution:
 
 ### Cost
 
-The lightweight CLI path, paired with only injecting top-3 key facts, keeps metadata overhead under 10% of the total token budget — vs MemGPT's 30-40%.
+Only the top three key facts are injected. Claude also keeps its tool-free, single-turn extraction path. Background cost follows the resolved utility provider/model. For Codex and OpenAI-compatible employees, a blank utility model uses the main model; Grok, Antigravity and generic CLI employees use global background settings.
 
 ### Attention Quality
 
@@ -202,7 +208,7 @@ The old MemGPT design required the model to actively call `core_memory_append`. 
 
 ### Backwards-Compatible Degradation
 
-If the Haiku extraction fails (rate limit, timeout), the session still works — it just doesn't get the benefit of pinning/facts for that turn. Nothing breaks.
+If utility-model extraction fails (rate limit, timeout), the session still works — it just doesn't get the benefit of pinning/facts for that turn. Nothing breaks.
 
 ---
 

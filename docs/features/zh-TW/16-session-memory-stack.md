@@ -37,7 +37,7 @@ Turn 1: "Help me migrate this React app from CRA to Vite,
          keep the existing tests, and don't touch the auth flow."
      |
      v
-Async Haiku extraction:
+Async utility-model extraction:
    "migrate React app CRA → Vite; preserve tests; don't touch auth flow"
      |
      v
@@ -47,7 +47,13 @@ Stored in: sessions.pinned_instructions (SQLite column)
 Injected at: system prompt tail (high-attention U-shape position)
 ```
 
-萃取以*非同步*方式執行：不會阻塞第一個回應。它是一項**中介資料任務（metadata task）**，所以使用 CLI 輕量路徑（`--effort medium --max-turns 1 --no-session-persistence --tools ""`），成本約為正常的 25-40%。
+萃取以非同步方式執行，不會阻塞第一個回應。背景決策確認、指令擷取、事實擷取與對話壓縮，Claude、Codex 與 OpenAI 相容 API 員工沿用自己的後端。明確填寫且非空白的 `[model] utility` 優先；否則 Claude 使用 `claude-haiku-4-5`，Codex 與 OpenAI 相容 API 沿用 `[model] preferred`。兩者都空白時，Codex 省略 `-m`、使用 CLI 預設模型；OpenAI 相容 API 則拒絕呼叫。Grok、Antigravity 與通用 CLI 員工改用全域背景設定。明確指定的輔助模型與後端屬於不同廠商家族時，儀表板會顯示警告。
+
+Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
+
+輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok、Antigravity 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](05-security-defense.md)。
+
+定期對話摘要與自動標題也依對話所屬員工，套用相同的輔助後端選擇與全域備援規則。儲存的所屬員工必須是非系統保留名稱，且具備相符的 `agent.toml`；目錄不得是符號連結，正規化後必須是 `<home>/agents` 的直接子目錄。非空白但無效的員工身分會讓本次輔助工作停止並記錄錯誤，只有未指定員工的對話直接使用全域輔助設定。摘要的受保護區塊仍不會送入模型，並按既有限額逐字保留。明確指定但不相容的輔助模型仍保留原值，每個員工／模型組合只記錄一次警告。沒有所屬員工的工作使用 `[runtime] utility_provider`／`utility_model`，可在「設定 → 進階 → 系統」調整。
 
 ### 澄清累積
 
@@ -102,7 +108,7 @@ MemGPT 的 Core Memory 嘗試捕捉這些，但每輪要花約 6,500 token。Key
 Each substantive turn (non-trivial content)
      |
      v
-Async Haiku extraction (lightweight CLI path):
+Async utility-model extraction:
    "Extract 2-4 key facts about the user, project, or preferences.
     Skip ephemeral context."
      |
@@ -190,7 +196,7 @@ session memory stack 並非與演化系統隔離：
 
 ### 成本
 
-輕量 CLI 路徑搭配只注入排名前 3 的 key facts，讓中介資料開銷維持在總 token 預算的 10% 以下（相較於 MemGPT 的 30-40%）。
+只注入排名前 3 的 key facts。Claude 另保留不帶工具、單回合的擷取路徑；背景成本取決於最後選用的輔助後端與模型；Codex 與 OpenAI 相容 API 員工的輔助模型留白時沿用主要模型；Grok、Antigravity 與通用 CLI 員工改用全域背景設定。
 
 ### 注意力品質
 
@@ -202,7 +208,7 @@ session memory stack 並非與演化系統隔離：
 
 ### 向後相容的降級
 
-如果 Haiku 萃取失敗（rate limit、逾時），session 仍然可運作，只是該輪沒有 pinning／facts 的好處而已。不會有任何東西損壞。
+如果輔助模型萃取失敗（rate limit、逾時），session 仍然可運作，只是該輪沒有 pinning／facts 的好處而已。不會有任何東西損壞。
 
 ---
 

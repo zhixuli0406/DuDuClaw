@@ -239,6 +239,27 @@ async fn owner_cannot_change_authority_keys_through_agents_update() {
 }
 
 #[tokio::test]
+async fn runtime_timeout_owner_may_only_lower_admin_may_raise() {
+    let f = fixture().await;
+    let path = f.home.join("agents/a1/agent.toml");
+    let update = |seconds: Value| json!({"agent_id": "a1", "runtime": {"timeout_secs": seconds}});
+    let before = std::fs::read(&path).unwrap();
+    let e = err(&f.call("agents.update", update(json!(600)), &f.owner_a).await);
+    assert!(e.contains("runtime.timeout_secs"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    ok(&f.call("agents.update", update(json!(600)), &f.admin).await);
+    ok(&f.call("agents.update", update(json!(450)), &f.owner_a).await);
+    ok(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert_eq!(crate::runtime_config::agent_timeout_secs(path.parent().unwrap()), 300);
+    ok(&f.call("agents.update", update(json!(30)), &f.owner_a).await);
+    let before = std::fs::read(&path).unwrap();
+    let e = err(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert!(e.contains("runtime.timeout_secs"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "clearing 30 to default 300 is widening");
+    ok(&f.call("agents.update", update(Value::Null), &f.admin).await);
+}
+
+#[tokio::test]
 async fn agents_update_keeps_comments_versions_and_says_no_periodic_sync() {
     let f = fixture().await;
     let path = f.home.join("agents/a1/agent.toml");

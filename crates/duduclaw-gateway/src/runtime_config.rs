@@ -38,8 +38,8 @@ use duduclaw_core::types::RuntimeType;
 /// [`duduclaw_core::types::ModelConfig::utility`] field (serde round-trip for
 /// full-config load/save, e.g. dashboard editing) and this lightweight
 /// `agent.toml` reader (for callers that only have an `agent_dir`) both read the
-/// same `[model] utility` key and share this default — they are intentionally
-/// parallel paths, not duplicated config.
+/// same `[model] utility` key. Claude keeps this default; other providers
+/// inherit the main model when the utility override is absent or blank.
 pub use duduclaw_core::types::DEFAULT_UTILITY_MODEL;
 
 /// One typed read of the agent's `agent.toml` sections.
@@ -275,6 +275,65 @@ pub fn warn_once_if_deprecated_runtime_for(
     }
 }
 
+/// Default CLI run / OpenAI-compatible request limit, including agent-less calls.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Only an absent or empty stored owner may use the global utility path.
+/// Reject filesystem aliases and require the employee's declared identity.
+pub(crate) fn session_agent_dir(home_dir: &Path, agent_id: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(id) = agent_id.filter(|id| !id.is_empty()) else { return Ok(None) };
+    let invalid = || format!("invalid session owner {id:?}; utility call refused");
+    if !duduclaw_core::is_valid_agent_id(id) || duduclaw_core::is_reserved_agent_id(id)
+        || duduclaw_core::is_internal_agent_dir(id) {
+        return Err(invalid());
+    }
+    let agents = home_dir.join("agents").canonicalize().map_err(|_| invalid())?;
+    let dir = agents.join(id);
+    let meta = std::fs::symlink_metadata(&dir).map_err(|_| invalid())?;
+    if !meta.is_dir() || meta.file_type().is_symlink() { return Err(invalid()); }
+    let dir = dir.canonicalize().map_err(|_| invalid())?;
+    if dir.parent() != Some(agents.as_path()) || dir.file_name().and_then(|n| n.to_str()) != Some(id) {
+        return Err(invalid());
+    }
+    let config = dir.join("agent.toml");
+    let meta = std::fs::symlink_metadata(&config).map_err(|_| invalid())?;
+    if !meta.is_file() || meta.file_type().is_symlink() { return Err(invalid()); }
+    // Use the shared typed identity schema, without invoking the registry's
+    // load_agent side effects (preset artifacts, skills and optional files).
+    let text = std::fs::read_to_string(config).map_err(|_| invalid())?;
+    let sections: AgentTomlSections = toml::from_str(&text).map_err(|_| invalid())?;
+    if sections.agent.and_then(|agent| agent.name).as_deref() != Some(id) { return Err(invalid()); }
+    Ok(Some(dir))
+}
+
+/// This authority field is per-agent only. Ignore cached preset artifacts,
+/// including artifacts written before the preset sanitizer excluded it.
+fn raw_agent_timeout_secs(agent_dir: &Path) -> Option<i64> {
+    std::fs::read_to_string(agent_dir.join("agent.toml")).ok()
+        .and_then(|text| agent_toml::parse(&text).runtime.timeout_secs)
+}
+
+/// Resolve the typed per-agent timeout, tolerating old or malformed settings.
+pub fn agent_timeout_secs(agent_dir: &Path) -> u64 {
+    match raw_agent_timeout_secs(agent_dir) {
+        Some(value) => {
+            let clamped = value.clamp(30, 3600);
+            if clamped != value {
+                static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, i64>>> = std::sync::OnceLock::new();
+                let should_warn = WARNED.get_or_init(Default::default).lock()
+                    .map(|mut values| values.insert(agent_dir.to_path_buf(), value) != Some(value))
+                    .unwrap_or(false);
+                if should_warn {
+                    tracing::warn!(agent_dir = %agent_dir.display(), value, effective = clamped,
+                        "[runtime] timeout_secs outside 30..=3600; clamping");
+                }
+            }
+            clamped as u64
+        }
+        None => DEFAULT_TIMEOUT_SECS,
+    }
+}
+
 /// Load `[runtime] provider` / `[runtime] fallback` / `[model] utility` from the
 /// agent's `agent.toml` in a single read. Missing/malformed file ⇒ defaults
 /// (Claude / no fallback / [`DEFAULT_UTILITY_MODEL`]).
@@ -319,7 +378,16 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
     let utility_model = s
         .model
         .utility
-        .unwrap_or_else(|| DEFAULT_UTILITY_MODEL.to_string());
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            if provider == RuntimeType::Claude {
+                DEFAULT_UTILITY_MODEL.to_string()
+            } else {
+                s.model.preferred.clone().filter(|model| !model.trim().is_empty()).unwrap_or_default()
+            }
+        });
 
     // Provider↔model sanity check: `preferred = "gpt-5"` with the default
     // Claude provider used to route silently into the Claude CLI and fail at
@@ -327,7 +395,12 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
     // is visible without spamming the hot reply path.
     if let Some(preferred) = s.model.preferred.as_deref() {
         if !model_matches_provider(preferred, provider) {
-            warn_mismatch_once(agent_dir, preferred, provider);
+            warn_mismatch_once(agent_dir, "preferred", preferred, provider);
+        }
+    }
+    if let Some(utility) = s.model.utility.as_deref().filter(|v| !v.trim().is_empty()) {
+        if !model_matches_provider(utility, provider) {
+            warn_mismatch_once(agent_dir, "utility", utility, provider);
         }
     }
 
@@ -356,6 +429,9 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
     }
     if let Some(s) = rt.fallback {
         obj.insert("fallback".into(), serde_json::Value::String(s));
+    }
+    if let Some(secs) = raw_agent_timeout_secs(agent_dir) {
+        obj.insert("timeout_secs".into(), serde_json::Value::from(secs));
     }
     serde_json::Value::Object(obj)
 }
@@ -462,7 +538,7 @@ pub fn infer_provider_for_model(model: &str) -> Option<RuntimeType> {
     })
 }
 
-fn warn_mismatch_once(agent_dir: &Path, model: &str, provider: RuntimeType) {
+fn warn_mismatch_once(agent_dir: &Path, field: &str, model: &str, provider: RuntimeType) {
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let key = format!("{}|{model}", agent_dir.display());
@@ -473,7 +549,8 @@ fn warn_mismatch_once(agent_dir: &Path, model: &str, provider: RuntimeType) {
                 agent_dir = %agent_dir.display(),
                 model,
                 provider = provider.as_str(),
-                "[model] preferred does not match [runtime] provider — requests will \
+                field,
+                "[model] field does not match [runtime] provider — requests will \
                  likely fail at the provider API; set [runtime] provider to the \
                  runtime that serves this model"
             );
@@ -632,8 +709,8 @@ pub fn delegation_routing_enabled(home_dir: &Path, agent_dir: &Path) -> bool {
 //   utility_provider = "claude"   # claude | codex | gemini | openai_compat
 //   utility_model    = "claude-haiku-4-5"
 //
-// Both layers fall back to Claude / DEFAULT_UTILITY_MODEL, so an absent or
-// malformed file is fail-safe (identical to the previous hardcoded behavior).
+// An absent/malformed file keeps Claude / DEFAULT_UTILITY_MODEL. With another
+// provider, a missing/blank global model lets the backend choose its default.
 
 fn read_global_config(home_dir: &Path) -> Option<toml::Value> {
     let text = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
@@ -660,21 +737,16 @@ pub fn global_utility_provider(home_dir: &Path) -> RuntimeType {
 }
 
 /// Global utility model from `config.toml [runtime] utility_model`.
-/// Falls back to [`DEFAULT_UTILITY_MODEL`].
+/// Missing/blank models use [`DEFAULT_UTILITY_MODEL`] for Claude, otherwise the
+/// backend's default (empty string; OpenAI-compatible endpoints require a model).
 pub fn global_utility_model(home_dir: &Path) -> String {
-    read_global_config(home_dir)
-        .as_ref()
-        .and_then(|v| v.get("runtime"))
-        .and_then(|r| r.get("utility_model"))
-        .and_then(|s| s.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_UTILITY_MODEL.to_string())
+    global_utility_spec(home_dir).model
 }
 
 /// Global utility provider + model in a single `config.toml` read.
 /// Used by [`resolve_utility`] for the agent-less path so it doesn't parse the
 /// file twice (once per field).
-fn global_utility_spec(home_dir: &Path) -> UtilitySpec {
+pub(crate) fn global_utility_spec(home_dir: &Path) -> UtilitySpec {
     let cfg = read_global_config(home_dir);
     let runtime = cfg.as_ref().and_then(|v| v.get("runtime"));
     let provider = runtime
@@ -692,8 +764,15 @@ fn global_utility_spec(home_dir: &Path) -> UtilitySpec {
     let model = runtime
         .and_then(|r| r.get("utility_model"))
         .and_then(|s| s.as_str())
+        .filter(|model| !model.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_UTILITY_MODEL.to_string());
+        .unwrap_or_else(|| {
+            if provider == RuntimeType::Claude {
+                DEFAULT_UTILITY_MODEL.to_string()
+            } else {
+                String::new()
+            }
+        });
     UtilitySpec { provider, model }
 }
 
@@ -726,6 +805,84 @@ pub fn resolve_utility(home_dir: &Path, agent_dir: Option<&Path>) -> UtilitySpec
     }
 }
 
+/// Utility selection is an authority gate: unreadable/malformed configured
+/// files and unknown provider names cannot silently select another provider.
+fn validate_utility_config(path: &Path, key: &str, optional: bool) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => {
+            if matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+                return Ok(());
+            }
+            return Err(format!("cannot read utility config {}: {e}", path.display()));
+        }
+        Err(e) => return Err(format!("cannot read utility config {}: {e}", path.display())),
+    };
+    let cfg: toml::Value = text.parse().map_err(|e| format!("invalid utility config: {e}"))?;
+    if let Some(runtime) = cfg.get("runtime") {
+        let table = runtime.as_table().ok_or("utility runtime config must be a table")?;
+        if let Some(value) = table.get(key) {
+            let id = value.as_str().ok_or("utility provider must be a string")?;
+            if RuntimeType::parse(id).is_none() {
+                return Err(format!("unknown utility runtime {id}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Only these runtimes implement the mandatory utility execution profile.
+/// Claude/API are tool-free; Codex uses the owner-approved restricted profile.
+/// Unknown/new CLI providers remain denied until a utility lane is verified.
+pub(crate) fn utility_profile_supported(provider: RuntimeType) -> bool {
+    matches!(provider, RuntimeType::Claude | RuntimeType::OpenAiCompat | RuntimeType::Codex)
+}
+
+/// Resolve execution, keeping explicit judge hints fail-closed. Only an
+/// employee's unsupported runtime may fall back to the global utility spec.
+pub(crate) fn resolve_utility_profile(
+    home: &Path,
+    agent: Option<&Path>,
+    spec: UtilitySpec,
+    explicit_hint: bool,
+) -> Result<UtilitySpec, String> {
+    match agent {
+        Some(dir) => {
+            validate_utility_config(&dir.join("agent.toml"), "provider", false)?;
+            // load_runtime_settings uses this gateway-owned artifact when it
+            // exists. Validate it as well as the source, without silently
+            // falling back to raw config on a read or parse failure.
+            if let Some(agent_home) = duduclaw_core::preset::agent_home_dir(dir) {
+                let id = dir.file_name().and_then(|name| name.to_str())
+                    .ok_or("invalid utility agent directory")?;
+                let resolved = duduclaw_core::preset::agent_resolved_path(&agent_home, id);
+                validate_utility_config(&resolved, "provider", true)?;
+            }
+        }
+        None => validate_utility_config(&home.join("config.toml"), "utility_provider", true)?,
+    }
+    if utility_profile_supported(spec.provider) { return Ok(spec); }
+    if explicit_hint || agent.is_none() {
+        return Err(format!("utility runtime {} has no supported utility profile", spec.provider.as_str()));
+    }
+    validate_utility_config(&home.join("config.toml"), "utility_provider", true)?;
+    ensure_active_utility_provider(home)?;
+    let fallback = global_utility_spec(home);
+    // Warn once per employee/runtime, including when the global setting is
+    // itself unsupported. No silent retry through the conversational runtime.
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, RuntimeType)>>> = std::sync::OnceLock::new();
+    let key = (agent.unwrap().to_path_buf(), spec.provider);
+    if WARNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+        tracing::warn!(agent = %agent.unwrap().display(), runtime = spec.provider.as_str(),
+            global_runtime = fallback.provider.as_str(),
+            "utility runtime has no supported utility profile; using global background settings only if a utility profile is supported");
+    }
+    if !utility_profile_supported(fallback.provider) {
+        return Err(format!("global utility runtime {} has no supported utility profile", fallback.provider.as_str()));
+    }
+    Ok(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +892,175 @@ mod tests {
     fn write_agent_toml(dir: &Path, body: &str) {
         let mut f = std::fs::File::create(dir.join("agent.toml")).unwrap();
         f.write_all(body.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn utility_validation_checks_effective_and_raw_config() {
+        let home = TempDir::new().unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        write_agent_toml(&agent, "[runtime]\nprovider='openai_compat'\n");
+        let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+        for invalid in ["[broken", "runtime='bad'", "[runtime]\nprovider='unknown'\n", "[runtime]\nprovider=1\n"] {
+            std::fs::write(&resolved, invalid).unwrap();
+            let spec = resolve_utility(home.path(), Some(&agent));
+            assert!(resolve_utility_profile(home.path(), Some(&agent), spec, false).is_err(), "{invalid}");
+        }
+        std::fs::write(&resolved, "[runtime]\nprovider='openai_compat'\n").unwrap();
+        let spec = resolve_utility(home.path(), Some(&agent));
+        assert!(resolve_utility_profile(home.path(), Some(&agent), spec, false).is_ok());
+        write_agent_toml(&agent, "[broken");
+        let spec = resolve_utility(home.path(), Some(&agent));
+        assert!(resolve_utility_profile(home.path(), Some(&agent), spec, false).is_err(), "valid artifact cannot hide invalid source");
+        write_agent_toml(&agent, "[runtime]\nprovider='openai_compat'\n");
+        std::fs::remove_file(&resolved).unwrap();
+        std::fs::create_dir(&resolved).unwrap();
+        let spec = resolve_utility(home.path(), Some(&agent));
+        assert!(resolve_utility_profile(home.path(), Some(&agent), spec, false).is_err(), "unreadable artifact must not fall back to source");
+        std::fs::remove_dir(&resolved).unwrap();
+        let spec = resolve_utility(home.path(), Some(&agent));
+        assert!(resolve_utility_profile(home.path(), Some(&agent), spec, false).is_ok(), "absent artifact uses valid source");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.path().join("missing"), &resolved).unwrap();
+            let spec = resolve_utility(home.path(), Some(&agent));
+            assert!(resolve_utility_profile(home.path(), Some(&agent), spec, false).is_err(), "dangling artifact is unreadable, not absent");
+        }
+    }
+
+    #[test]
+    fn utility_profiles_fallback_only_to_a_verified_global_runtime() {
+        let home = TempDir::new().unwrap();
+        let agent = TempDir::new().unwrap();
+        std::fs::write(agent.path().join("agent.toml"), "").unwrap();
+        for provider in RuntimeType::ALL.iter().copied() {
+            let spec = UtilitySpec { provider, model: "fixture".into() };
+            if utility_profile_supported(provider) {
+                assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), false).unwrap(), spec);
+            } else {
+                assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), false).unwrap(),
+                    UtilitySpec { provider: RuntimeType::Claude, model: DEFAULT_UTILITY_MODEL.into() });
+                assert!(resolve_utility_profile(home.path(), None, spec.clone(), false).is_err());
+                assert!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), true).is_err());
+            }
+        }
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='grok'\n").unwrap();
+        assert!(resolve_utility_profile(home.path(), Some(agent.path()),
+            UtilitySpec { provider: RuntimeType::Antigravity, model: "gemini".into() }, false).is_err());
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='fixture-model'\n").unwrap();
+        assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()),
+            UtilitySpec { provider: RuntimeType::Grok, model: "grok".into() }, false).unwrap(),
+            UtilitySpec { provider: RuntimeType::OpenAiCompat, model: "fixture-model".into() });
+    }
+
+    #[test]
+    fn session_owner_requires_real_direct_child_and_declared_identity() {
+        let home = TempDir::new().unwrap();
+        let agents = home.path().join("agents");
+        std::fs::create_dir(&agents).unwrap();
+        assert!(session_agent_dir(home.path(), None).unwrap().is_none());
+        assert!(session_agent_dir(home.path(), Some("")).unwrap().is_none());
+        for id in duduclaw_core::SYSTEM_SENDERS.iter()
+            .chain(duduclaw_core::RESERVED_QUEUE_SENDERS.iter())
+            .copied().chain(["../escape", "/tmp", " ", "missing", "default"]) {
+            assert!(session_agent_dir(home.path(), Some(id)).is_err(), "{id}");
+        }
+        for id in ["_trash", "_defaults", "_x", ".hidden"] {
+            let internal = agents.join(id);
+            std::fs::create_dir(&internal).unwrap();
+            std::fs::write(internal.join("agent.toml"), format!("[agent]\nname='{id}'\n")).unwrap();
+            assert!(session_agent_dir(home.path(), Some(id)).is_err(), "{id}");
+        }
+        let employee = agents.join("worker");
+        std::fs::create_dir(&employee).unwrap();
+        assert!(session_agent_dir(home.path(), Some("worker")).is_err());
+        for config in ["", "[agent]\nname='other'\n", "[agent]\nname=1\n", "invalid toml"] {
+            std::fs::write(employee.join("agent.toml"), config).unwrap();
+            assert!(session_agent_dir(home.path(), Some("worker")).is_err(), "{config}");
+        }
+        std::fs::write(employee.join("agent.toml"), "[agent]\nname='worker'\n").unwrap();
+        assert_eq!(session_agent_dir(home.path(), Some("worker")).unwrap(), Some(employee.canonicalize().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_owner_rejects_directory_and_config_symlinks() {
+        use std::os::unix::fs::symlink;
+        let home = TempDir::new().unwrap();
+        let agents = home.path().join("agents");
+        let outside = home.path().join("outside");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("agent.toml"), "[agent]\nname='worker'\n").unwrap();
+        symlink(&outside, agents.join("worker")).unwrap();
+        assert!(session_agent_dir(home.path(), Some("worker")).is_err());
+        std::fs::remove_file(agents.join("worker")).unwrap();
+        std::fs::create_dir(agents.join("worker")).unwrap();
+        symlink(outside.join("agent.toml"), agents.join("worker/agent.toml")).unwrap();
+        assert!(session_agent_dir(home.path(), Some("worker")).is_err());
+        // Even a symlink pointing to another direct child is not an identity.
+        symlink(agents.join("worker"), agents.join("alias")).unwrap();
+        assert!(session_agent_dir(home.path(), Some("alias")).is_err());
+    }
+
+    #[test]
+    fn explicit_mismatched_utility_model_is_preserved() {
+        let agent = tempfile::tempdir().unwrap();
+        std::fs::write(agent.path().join("agent.toml"),
+            "[runtime]\nprovider = \"codex\"\n[model]\npreferred = \"gpt-5.4\"\nutility = \"claude-haiku-4-5\"\n",
+        ).unwrap();
+        for _ in 0..2 {
+            let settings = load_runtime_settings(agent.path());
+            assert_eq!(settings.provider, RuntimeType::Codex);
+            assert_eq!(settings.utility_model, "claude-haiku-4-5");
+        }
+    }
+
+    #[test]
+    fn runtime_timeout_ignores_stale_preset_artifacts() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+        std::fs::write(resolved, "[runtime]\ntimeout_secs=3600\n").unwrap();
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs=900\n");
+        assert_eq!(agent_timeout_secs(&dir), 900);
+        assert_eq!(read_runtime_json(&dir)["timeout_secs"], serde_json::json!(900));
+        write_agent_toml(&dir, "[runtime]\n");
+        assert_eq!(agent_timeout_secs(&dir), 300, "clearing must use the fixed default");
+        assert!(read_runtime_json(&dir).get("timeout_secs").is_none(), "UI must not expose stale preset limits");
+    }
+
+    #[test]
+    fn runtime_timeout_defaults_clamps_and_ignores_wrong_types() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(agent_timeout_secs(dir.path()), 300);
+        for (literal, expected) in [("900", 900), ("30", 30), ("3600", 3600),
+            ("-1", 30), ("3601", 3600), ("\"oops\"", 300), ("1.5", 300), ("true", 300)] {
+            write_agent_toml(dir.path(), &format!("[runtime]\ntimeout_secs = {literal}\n"));
+            assert_eq!(agent_timeout_secs(dir.path()), expected, "{literal}");
+        }
+    }
+
+    #[test]
+    fn utility_default_follows_non_claude_main_model() {
+        let dir = TempDir::new().unwrap();
+        for (provider, preferred, utility, expected) in [
+            ("codex", "gpt-5", None, "gpt-5"),
+            ("codex", "", None, ""),
+            ("codex", "  ", Some("  "), ""),
+            ("claude", "claude-sonnet-4-6", None, DEFAULT_UTILITY_MODEL),
+            ("claude", "claude-sonnet-4-6", Some("  "), DEFAULT_UTILITY_MODEL),
+            ("codex", "gpt-5", Some("o4-mini"), "o4-mini"),
+        ] {
+            let model = if preferred.is_empty() { String::new() }
+                else { format!("preferred = {preferred:?}\n") };
+            let utility = utility.map(|v| format!("utility = {v:?}\n")).unwrap_or_default();
+            write_agent_toml(dir.path(), &format!("[runtime]\nprovider = {provider:?}\n[model]\n{model}{utility}"));
+            assert_eq!(load_runtime_settings(dir.path()).utility_model, expected);
+        }
     }
 
     #[test]
@@ -955,6 +1281,31 @@ mod tests {
     }
 
     #[test]
+    fn global_utility_blank_model_defaults_follow_provider() {
+        let home = TempDir::new().unwrap();
+        for (provider, expected_provider, expected_model) in [
+            ("claude", RuntimeType::Claude, DEFAULT_UTILITY_MODEL),
+            ("codex", RuntimeType::Codex, ""),
+            ("antigravity", RuntimeType::Antigravity, ""),
+            ("grok", RuntimeType::Grok, ""),
+            ("openai_compat", RuntimeType::OpenAiCompat, ""),
+            ("nonsense", RuntimeType::Claude, DEFAULT_UTILITY_MODEL),
+        ] {
+            for model in ["", "utility_model = ''\n", "utility_model = '  '\n"] {
+                write_global_config(home.path(), &format!(
+                    "[runtime]\nutility_provider = {provider:?}\n{model}"
+                ));
+                assert_eq!(global_utility_provider(home.path()), expected_provider);
+                assert_eq!(global_utility_model(home.path()), expected_model, "{provider}: {model}");
+                assert_eq!(resolve_utility(home.path(), None), UtilitySpec {
+                    provider: expected_provider,
+                    model: expected_model.into(),
+                });
+            }
+        }
+    }
+
+    #[test]
     fn global_utility_reads_config() {
         let home = TempDir::new().unwrap();
         write_global_config(
@@ -989,6 +1340,7 @@ mod tests {
             "[runtime]\nprovider = \"codex\"\n[model]\nutility = \"o4-mini\"\n",
         );
         let spec = resolve_utility(home.path(), Some(agent.path()));
+        assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()), spec.clone(), false).unwrap(), spec);
         assert_eq!(spec.provider, RuntimeType::Codex);
         assert_eq!(spec.model, "o4-mini");
     }

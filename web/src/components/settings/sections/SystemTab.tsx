@@ -16,6 +16,8 @@ import {
 } from '@/components/mds';
 import { AdvancedSection, DangerZone, type SelectOption } from '@/components/settings/controls';
 import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
+import { RUNTIME_PROVIDERS } from '@/pages/agent-form/defaults';
+import { utilityModelMismatchesRuntime } from '@/pages/agent-form/editPayload';
 import { useAuthStore } from '@/stores/auth-store';
 import { useRestartRequiredStore } from '@/stores/restart-required-store';
 import {
@@ -61,6 +63,8 @@ const FIELD_LABEL_IDS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\bcooldown_after_rate_limit_seconds\b/i, 'settings.system.cooldown'],
   [/\bdefault_agent\b/i, 'settings.system.defaultAgent'],
   [/\binference_mode\b/i, 'settings.system.inferenceMode'],
+  [/\butility_provider\b/i, 'settings.utility.provider'],
+  [/\butility_model\b/i, 'settings.utility.model'],
   [/\blog_format\b/i, 'settings.system.logFormat'],
   [/\ballowed_origins?\b/i, 'settings.system.remoteAccess'],
   [/\bvault_addr\b/i, 'settings.system.vaultAddr'],
@@ -94,6 +98,8 @@ const isValidIp = (raw: string): boolean => {
 function readV168(tables: TomlTables): FlatValues {
   const sb = 'container.sandbox';
   return {
+    'runtime.utility_provider': tomlStr(tables, 'runtime', 'utility_provider', 'claude'),
+    'runtime.utility_model': tomlStr(tables, 'runtime', 'utility_model', ''),
     'container.sandbox.image': tomlStr(tables, sb, 'image', ''),
     'container.sandbox.when_unavailable': tomlStr(tables, sb, 'when_unavailable', 'fail'),
     'container.sandbox.script_when_unavailable': tomlStr(tables, sb, 'script_when_unavailable', 'fail'),
@@ -133,7 +139,7 @@ const SANDBOX_NUMERIC_KEYS = [
 
 export function SystemTab() {
   const intl = useIntl();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { agents, fetchAgents, loaded: agentsLoaded, error: agentsError } = useAgentsStore();
   // [server] — display name + LAN advertising (restart required).
   const [name, setName] = useState('');
   const [mdnsAdvertise, setMdnsAdvertise] = useState(false);
@@ -244,6 +250,11 @@ export function SystemTab() {
       setDailyDigestAt(res.daily_digest_at ?? '09:00');
       const tables = parseTomlSubset(raw);
       const v168 = readV168(tables);
+      // The server resolves aliases and legacy invalid values exactly as the
+      // global utility caller does. Keep the warning tied to that provider.
+      if (typeof res.utility_provider === 'string') {
+        v168['runtime.utility_provider'] = res.utility_provider;
+      }
       setExtra(v168);
       setSmTokenSet({
         onepassword_token: tomlSecretSet(tables, 'secret_manager', 'onepassword_token'),
@@ -561,6 +572,53 @@ export function SystemTab() {
             options={logFormatOptions}
           />
         </SettingsCard>
+      </SettingsSection>
+
+      {/* Global utility provider and model */}
+      <SettingsSection title={intl.formatMessage({ id: 'settings.utility.title' })}>
+        <SettingsCard>
+          <RowSelect
+            label={intl.formatMessage({ id: 'settings.utility.provider' })}
+            description={intl.formatMessage({ id: 'settings.utility.provider.help' })}
+            value={String(extra['runtime.utility_provider'] ?? 'claude')}
+            onChange={(v) => setExtraKey('runtime.utility_provider', v)}
+            options={[...RUNTIME_PROVIDERS, ...(extra['runtime.utility_provider'] === 'gemini' ? ['gemini'] : [])].map((value) => ({
+              value, label: intl.formatMessage({ id: `agents.runtime.provider.${value}` }), raw: value,
+            }))}
+          />
+          <SettingsRow
+            label={intl.formatMessage({ id: 'settings.utility.model' })}
+            description={intl.formatMessage({ id: 'settings.utility.model.help' })}
+          >
+            <Input
+              aria-label={intl.formatMessage({ id: 'settings.utility.model' })}
+              value={String(extra['runtime.utility_model'] ?? '')}
+              placeholder={extra['runtime.utility_provider'] === 'claude'
+                ? 'claude-haiku-4-5'
+                : intl.formatMessage({ id: 'settings.utility.model.placeholder' })}
+              onChange={(e) => setExtraKey('runtime.utility_model', e.target.value)}
+            />
+          </SettingsRow>
+        </SettingsCard>
+        {utilityModelMismatchesRuntime(
+          String(extra['runtime.utility_provider'] ?? 'claude'),
+          String(extra['runtime.utility_model'] ?? ''),
+        ) && (
+          <p role="alert" className="text-sm text-warning">
+            {intl.formatMessage({ id: 'settings.utility.model.mismatchWarning' })}
+          </p>
+        )}
+        {extra['runtime.utility_provider'] === 'gemini' && (
+          <p role="alert" className="text-sm text-warning">
+            {intl.formatMessage({ id: 'settings.utility.removedWarning' })}
+          </p>
+        )}
+        {extra['runtime.utility_provider'] === 'claude' && agentsLoaded && agentsError == null
+          && !agents.some((a) => (a.runtime?.provider ?? 'claude') === 'claude') && (
+            <p role="alert" className="text-sm text-warning">
+              {intl.formatMessage({ id: 'settings.utility.claudeWarning' })}
+            </p>
+          )}
       </SettingsSection>
 
       {/* Memory — B1 write-time dedup gate */}

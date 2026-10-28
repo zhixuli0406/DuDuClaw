@@ -12,6 +12,8 @@ import {
   kvRowsFromTable,
   parseKvRow,
   teamRolesShareVendor,
+  utilityModelMismatchesRuntime,
+  runtimeTimeoutNeedsAdmin,
   type EditFormState,
   type PayloadContext,
 } from './editPayload';
@@ -66,6 +68,15 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
   it('a display-name edit sends only display_name (no cron, no org fields, no local table)', () => {
     const r = buildUpdatePayload(state(), new Set(['form.display_name']), CTX);
     expect(r.payload).toEqual({ display_name: 'Bot' });
+  });
+
+  it('sends only the runtime timeout when it is edited', () => {
+    const r = buildUpdatePayload(
+      state({ runtime: { ...DEFAULT_RUNTIME, timeout_secs: 600 } }),
+      new Set(['runtime.timeout_secs']),
+      CTX,
+    );
+    expect(r.payload).toEqual({ runtime: { timeout_secs: 600 } });
   });
 
   it('does not send an unset proactive max_turns', () => {
@@ -285,5 +296,40 @@ describe('i18n catalogues', () => {
     const keys = (o: Record<string, string>) => Object.keys(o).sort();
     expect(keys(zhTW)).toEqual(keys(en));
     expect(keys(jaJP)).toEqual(keys(en));
+  });
+});
+
+
+describe('utility model/runtime warning', () => {
+  it.each([
+    ['codex', 'claude-haiku-4-5', true],
+    ['grok', 'gpt-5.4', true],
+    ['antigravity', 'claude-sonnet-4-6', true],
+    ['codex', 'openai/gpt-5.4', false],
+    ['antigravity', 'gemini-2.5-flash', false],
+    ['antigravity', 'Gemini 3 Pro', false],
+    ['qwen', 'qwen3-coder-plus', false],
+    ['qwen', 'claude-haiku-4-5', true],
+    ['vibe', 'codestral-latest', false],
+    ['claude', 'gpt-5.4', false],
+    ['openai_compat', 'claude-haiku-4-5', false],
+    ['copilot', 'claude-haiku-4-5', false],
+    ['cursor', 'gpt-5.4', false],
+    ['opencode', 'gemini-2.5-flash', false],
+    ['codex', 'custom-model', false],
+    ['codex', '', false],
+    ['codex', '   ', false],
+  ])('%s with %s warns = %s', (provider, model, expected) => {
+    expect(utilityModelMismatchesRuntime(provider, model)).toBe(expected);
+  });
+});
+
+
+describe('runtime timeout authority', () => {
+  it.each([
+    [undefined, 301, true], [undefined, 300, false], [900, 600, false],
+    [900, null, false], [30, null, true], [4000, 3600, false], ['bad', 301, true],
+  ])('compares effective values %s -> %s', (before, after, expected) => {
+    expect(runtimeTimeoutNeedsAdmin(before, after)).toBe(expected);
   });
 });

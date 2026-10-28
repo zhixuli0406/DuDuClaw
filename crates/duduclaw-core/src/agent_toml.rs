@@ -49,6 +49,22 @@ use crate::types::{
 #[cfg(test)]
 use crate::types::PolicyEffect;
 
+/// Tolerate a malformed timeout without discarding the rest of the agent.
+/// Repeated typed/lightweight reads share one wrong-type warning per process.
+pub(crate) fn deserialize_timeout_secs<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Tri<i64> = crate::lenient::tri(d)?;
+    if value.is_wrong_type() {
+        static WRONG_TYPE_WARNING: std::sync::Once = std::sync::Once::new();
+        WRONG_TYPE_WARNING.call_once(|| {
+            tracing::warn!("[runtime] timeout_secs must be integer seconds; using 300s for wrong-typed settings");
+        });
+    }
+    Ok(value.value())
+}
+
 /// The `[model]` keys the former shadow readers consumed.
 ///
 /// A deliberately narrow projection rather than [`crate::types::ModelConfig`]:

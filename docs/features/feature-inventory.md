@@ -153,7 +153,7 @@
 | Turn Trimming | >800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe char-level slicing |
 | Prompt Cache Strategy | Direct API "system_and_3" breakpoint placement (no measured hit rate is published) |
 | Compression Summary Injection | Post-compression summaries (role=system) injected into system prompt, not conversation turns |
-| Instruction Pinning | First user message → async Haiku extraction → `sessions.pinned_instructions` → injected at system prompt tail |
+| Instruction Pinning | First user message → async extraction by the resolved utility model (restricted Codex or tool-free Claude/API) (global fallback for unsupported employee runtimes) → `sessions.pinned_instructions` → injected at system prompt tail |
 | Snowball Recap | Each turn prepends `<task_recap>` to user message — zero LLM cost, U-shaped attention tail |
 | Clarification Accumulation | Agent-question + user-answer appended to pinned instructions (≤1000 chars) |
 | P2 Key-Fact Accumulator | 2-4 facts per substantive turn → `key_facts` FTS5 table → top-3 injected (~100-150 tokens vs MemGPT 6,500, −87%) |
@@ -398,7 +398,7 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| One-shot PTY invocation (`duduclaw-cli-runtime`) | Spawns a CLI under a real pseudo-terminal (ConPTY on Win 10 1809+, openpty on Unix via `portable-pty`) and drains stdout to EOF, for CLIs that refuse to run when stdout is a plain pipe. Used by the Grok runtime and the CLI-login helper. `clear_env` keeps the gateway's vendor API keys out of the child; `deadline` is an absolute wall-clock cap. See [27-pty-pool-runtime](27-pty-pool-runtime.md) |
+| One-shot PTY invocation (`duduclaw-cli-runtime`) | Spawns a CLI under a real pseudo-terminal (ConPTY on Win 10 1809+, openpty on Unix via `portable-pty`) and drains stdout to EOF, for CLIs that refuse to run when stdout is a plain pipe. Used by the CLI-login helper. Grok no longer uses PTY retry because process-tree cleanup on timeout is not guaranteed. `clear_env` keeps the gateway's vendor API keys out of the child; `deadline` is an absolute wall-clock cap. See [27-pty-pool-runtime](27-pty-pool-runtime.md) |
 | PTY session pool — **removed 2026-09** | The long-lived sentinel-framed `claude` REPL pool, the `duduclaw-cli-worker` subprocess + supervisor, `RuntimeMode::PtyPool`, `GET /api/runtime/status`, the `pty_pool_*` / `worker_*` metrics and the `[runtime] pty_pool_enabled` / `worker_managed` keys were all removed. Reason: the Anthropic programmatic-usage split it insured against was paused on 2026-06-15 and never resumed, and pool sessions had no conversation dimension (cross-conversation context bleed), so it could not be enabled safely |
 
 ## MCP HTTP/SSE Transport (W20)

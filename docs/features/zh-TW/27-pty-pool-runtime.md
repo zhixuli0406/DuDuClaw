@@ -23,7 +23,7 @@ invoke_oneshot(program, args, env, cwd, deadline, clear_env)
 擷取到的 stdout
 ```
 
-整個功能就這樣。目前的使用者：Grok runtime（它的 CLI 堅持要 TTY），以及 `duduclaw` 自己的 CLI 登入輔助流程。
+目前由 `duduclaw` 的 CLI 登入輔助流程使用。Grok 已停用管線空回覆的 PTY 重試，因該路徑無法保證逾時後清理整個行程樹；現在回報空回應錯誤。
 
 兩個行為值得知道：
 

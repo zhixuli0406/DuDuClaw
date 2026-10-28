@@ -22,6 +22,7 @@ impl crate::runtime::AgentRuntime for Counted {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.result
             .map(|content| RuntimeResponse {
+                partial_timeout_secs: None,
                 content: content.into(),
                 model_used: ctx.model.clone(),
                 runtime_name: self.id.as_str().into(),

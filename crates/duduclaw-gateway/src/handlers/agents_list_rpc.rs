@@ -72,6 +72,16 @@ impl MethodHandler {
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
                     "reports_to": cfg.agent.reports_to,
+                    "runtime": {
+                        "provider": if cfg.runtime.provider.as_deref()
+                            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gemini")) {
+                            "gemini"
+                        } else {
+                            cfg.runtime.provider.as_deref()
+                                .and_then(duduclaw_core::types::RuntimeType::parse)
+                                .unwrap_or_default().as_str()
+                        },
+                    },
                     "model": {
                         "preferred": cfg.model.preferred,
                         "fallback": cfg.model.fallback,

@@ -86,6 +86,9 @@ pub const PRESET_BINDINGS_SCHEMA: i64 = 1;
 const ORG_TABLE: &str = "agent";
 const SECRET_TABLES: &[&str] = &["channels", "odoo"];
 const PER_AGENT_SCALAR_FIELDS: &[(&str, &str)] = &[
+    // Clearing a per-agent timeout must mean the fixed 300-second default,
+    // never reveal a wider preset value behind the Owner authority gate.
+    ("runtime", "timeout_secs"),
     ("os_watch", "paths"),
     ("model", "account_pool"),
     ("container", "additional_mounts"),
@@ -1122,6 +1125,31 @@ max_active_skills = 2
             merged.get("capabilities").and_then(|v| v.as_table()).and_then(|t| t.get("allowed_tools")).is_some(),
             "a section the agent never wrote must be inherited from the preset"
         );
+    }
+
+    #[test]
+    fn runtime_timeout_is_never_inherited_when_owner_clears_override() {
+        let h = home();
+        let dir = write_agent(h.path(), "clinic-sales", MINIMAL_AGENT);
+        write_preset(h.path(), "timeout", "[preset]\nversion='1'\n[runtime]\ntimeout_secs=3600\nprovider='codex'\n");
+        let parsed = load_preset(h.path(), "timeout").unwrap();
+        assert!(parsed.stripped_other.contains(&"runtime.timeout_secs".to_string()));
+        assert!(parsed.config["runtime"].get("timeout_secs").is_none());
+        assert_eq!(parsed.config["runtime"]["provider"].as_str(), Some("codex"));
+        bind(h.path(), "clinic-sales", &dir, "timeout", "tester", "test").unwrap();
+        let mut table: toml::Table = MINIMAL_AGENT.parse().unwrap();
+        table.insert("runtime".into(), toml::Value::Table(
+            [("timeout_secs".to_string(), toml::Value::Integer(900))].into_iter().collect(),
+        ));
+        let (resolved, state) = resolve_for_agent(h.path(), "clinic-sales", &table);
+        assert!(state.is_applied());
+        assert_eq!(resolved["runtime"]["timeout_secs"].as_integer(), Some(900));
+        table.get_mut("runtime").unwrap().as_table_mut().unwrap().remove("timeout_secs");
+        let (resolved, state) = resolve_for_agent(h.path(), "clinic-sales", &table);
+        assert!(state.is_applied());
+        assert!(resolved["runtime"].get("timeout_secs").is_none(), "clearing cannot reveal 3600 from the preset");
+        let sections = crate::agent_toml::parse(&toml::to_string(&resolved).unwrap());
+        assert_eq!(sections.runtime.timeout_secs, None, "unset retains the runtime's 300-second default");
     }
 
     #[test]
