@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.76.4] - 2026-10-29 — Codex timeout, background runtime and Odoo compatibility hotfix
+
 ### Added
 
 - Odoo 結構掃描：管理員可在 Odoo 頁按「重新掃描 Odoo 結構」（每個已存 profile 每 60 秒最多嘗試一次，含失敗，重啟不重設），保存伺服器版本、已安裝模組、模型與欄位中繼資料，查看增減差異。員工可用 `odoo_schema_overview` 搜尋獲准模型的結構與自訂欄位；首次連線及版本變更會在背景掃描，每個連線範圍每小時最多自動嘗試一次。掃描有模型、欄位與時間上限，明示截斷及失敗，不讀業務資料列。員工新增的工具僅有 `odoo_schema_overview`（scaffold 列表 167 → 168）；名稱驗證、標籤篩查與不可信內容標記也套用於已存快照，RPC 回應以串流限制為 32 MiB。
