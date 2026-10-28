@@ -1,13 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
-import { MemoryRouter, Routes, Route } from 'react-router';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { GalleryPage } from './GalleryPage';
-import { useAssignStore } from '@/stores/assign-store';
+import { readAssignPrefill, type AssignPrefill } from '@/lib/assign-entry';
 import type { GalleryCard } from '@/lib/api';
+
+/** What the /assign page received as its seed. */
+let landedPrefill: AssignPrefill | null = null;
+function AssignProbe() {
+  landedPrefill = readAssignPrefill(useLocation().state);
+  return <div>assign-page-probe</div>;
+}
 
 function renderPage() {
   return render(
@@ -16,6 +23,7 @@ function renderPage() {
         <Routes>
           <Route path="/gallery" element={<GalleryPage />} />
           <Route path="/experts" element={<div>experts-page-probe</div>} />
+          <Route path="/assign" element={<AssignProbe />} />
         </Routes>
       </MemoryRouter>
     </IntlProvider>,
@@ -64,7 +72,7 @@ function mockGallery(res: {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useAssignStore.setState({ open: false, prefill: null });
+  landedPrefill = null;
 });
 
 describe('GalleryPage — curated inspiration gallery (P2-b MVP)', () => {
@@ -97,7 +105,7 @@ describe('GalleryPage — curated inspiration gallery (P2-b MVP)', () => {
     expect(await screen.findByText('experts-page-probe')).toBeInTheDocument();
   });
 
-  it('opens the 交辦 panel prefilled from the example when the team is already installed', async () => {
+  it('opens the 交辦任務 page prefilled from the example when the team is already installed', async () => {
     mockGallery({ deployed: true, unlocked: true, present_but_locked: false, cards: [installedCard] });
     renderPage();
     const user = userEvent.setup();
@@ -105,8 +113,8 @@ describe('GalleryPage — curated inspiration gallery (P2-b MVP)', () => {
     const remakeButton = await screen.findByRole('button', { name: /Make my own version/i });
     await user.click(remakeButton);
 
-    await waitFor(() => expect(useAssignStore.getState().open).toBe(true));
-    const { prefill } = useAssignStore.getState();
+    expect(await screen.findByText('assign-page-probe')).toBeInTheDocument();
+    const prefill = landedPrefill;
     expect(prefill?.agentId).toBe('clinic-assistant');
     expect(prefill?.mode).toBe('assign');
     // Description is the example rewritten into an editable template, not the

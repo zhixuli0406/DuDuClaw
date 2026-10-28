@@ -9,7 +9,7 @@ import { ScheduledAssignmentsSection } from '@/components/tasks/ScheduledAssignm
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useAssignStore } from '@/stores/assign-store';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { PauseReasonChip, TaskListActionsMenu, RenameTaskDialog } from '@/components/task';
@@ -47,7 +47,7 @@ import {
  * page. That content now lives in `/tasks/:id` (via the shared
  * `GoalLoopPanel` pieces), so opening a task here just navigates there;
  * `?task=<id>` is kept as a redirect-only compatibility shim for existing
- * entry points (`AssignSheet` still lands on this URL after creating a goal).
+ * entry points (the `/assign` page still lands on this URL after creating a goal).
  */
 
 const ACTIVE_STATUSES = ['todo', 'pending', 'in_progress', 'review', 'revising'] as const;
@@ -264,12 +264,12 @@ export function GoalsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const errorText = useErrorMessage();
-  // UX plan I-1a: 交辦 opens the one shared panel. The seven-field
-  // `CreateGoalDialog` that used to live here was the only form that actually
-  // drove `tasks.goal_create` and nothing in the app linked to it; the
-  // AssignSheet carries every one of its fields (the advanced four behind
-  // 更多設定) and is reachable from every entry point.
-  const openAssign = useAssignStore((s) => s.openAssign);
+  // UX plan I-1a: 交辦 opens the one shared surface, the `/assign` page. The
+  // seven-field `CreateGoalDialog` that used to live here was the only form
+  // that actually drove `tasks.goal_create` and nothing in the app linked to
+  // it; the page's 複雜任務 tab carries every one of its fields (the advanced
+  // four behind 更多設定) and is reachable from every entry point.
+  const openAssign = useOpenAssign();
   const connState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents, loaded: agentsLoaded } = useAgentsStore();
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
@@ -445,8 +445,8 @@ export function GoalsPage() {
 
   // I-2c: `/goals?task=<id>` used to open a page-local detail dialog; the
   // dialog is gone and `/tasks/:id` is the single detail surface now. Kept
-  // as a redirect so existing links (AssignSheet lands here right after
-  // `tasks.goal_create`) keep working.
+  // as a redirect so existing links (the `/assign` page lands here right
+  // after `tasks.goal_create` / `tasks.skill_assign`) keep working.
   const redirectTaskId = searchParams.get('task');
   useEffect(() => {
     if (redirectTaskId) navigate(`/tasks/${redirectTaskId}`, { replace: true });

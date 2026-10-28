@@ -4,7 +4,7 @@ import { IntlContext } from 'react-intl';
 /**
  * L2 round 5: safety net above the router and layout. `RouteErrorBoundary`
  * only covers the routed page; this one catches a throw in the layout chrome
- * (sidebar, CommandPalette, AssignSheet …), `ToastProvider` or the router.
+ * (sidebar, CommandPalette …), `ToastProvider` or the router.
  *
  * Coverage limit: it is mounted INSIDE `IntlProvider` in `main.tsx` (so the
  * fallback can be translated), which means a crash in `Root` itself or in

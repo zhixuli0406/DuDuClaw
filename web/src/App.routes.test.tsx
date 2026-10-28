@@ -118,6 +118,17 @@ describe('App routes — legacy paths land somewhere real (WP-A §2-8/§2-13)', 
   });
 });
 
+describe('App routes — the 交辦任務 page', () => {
+  for (const edition of ['personal', 'enterprise'] as const) {
+    it(`/assign renders on ${edition}`, async () => {
+      setEdition(edition);
+      renderAppAt('/assign');
+      expect(await screen.findByRole('heading', { name: 'Assign task', level: 1 })).toBeInTheDocument();
+      expect(screen.getByTestId('loc')).toHaveTextContent('/assign');
+    });
+  }
+});
+
 describe('App routes — Enterprise-only pages are closed on Personal (WP-A D8/D10-B)', () => {
   it('blocks personal Google self-service on the Personal edition', async()=>{
     setEdition('personal');

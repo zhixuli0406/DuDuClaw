@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
+import { takeChatAttachments } from '@/lib/chat-handoff';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { cn } from '@/lib/utils';
@@ -126,16 +127,21 @@ function InteractiveWebChatPage() {
     // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 問一問 handoff (UX plan I-1b): the AssignSheet passes its draft through
+  // 問一問 handoff (UX plan I-1b): the 交辦任務 page passes its draft through
   // router state rather than the URL (a goal paragraph does not belong in a
-  // query string). Seeded into the composer, never auto-sent — the user still
-  // reads it and presses send — and consumed once so a back-navigation or a
-  // refresh cannot resurrect an already-sent draft.
+  // query string), and its files as a one-time key into `chat-handoff` (they
+  // are too large for history state). Seeded into the composer as text and
+  // pending attachments, never auto-sent — the user still reads it and
+  // presses send — and consumed once so a back-navigation or a refresh cannot
+  // resurrect an already-sent draft.
   const location = useLocation();
   useEffect(() => {
-    const draft = (location.state as { draft?: unknown } | null)?.draft;
-    if (typeof draft !== 'string' || draft.trim().length === 0) return;
-    setInput((prev) => (prev ? prev : draft));
+    const state = location.state as { draft?: unknown; attachmentsKey?: unknown } | null;
+    const draft = typeof state?.draft === 'string' && state.draft.trim().length > 0 ? state.draft : null;
+    const handed = takeChatAttachments(state?.attachmentsKey);
+    if (!draft && handed.length === 0) return;
+    if (draft) setInput((prev) => (prev ? prev : draft));
+    if (handed.length > 0) setAttachments((prev) => [...prev, ...handed]);
     navigate(location.pathname + location.search, { replace: true, state: null });
     inputRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps

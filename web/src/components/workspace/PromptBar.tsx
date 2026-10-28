@@ -5,17 +5,17 @@ import { isImeComposing } from '@/lib/keyboard';
 import { cn } from '@/lib/utils';
 
 /**
- * The large composer used by the 交辦 panel (`AssignSheet`, UX plan I-1b): one
- * rounded input with a control row underneath.
+ * The large composer used by the 交辦任務 page's 複雜任務 tab (UX plan I-1b):
+ * one rounded input with a control row underneath.
  *
  * Originally written against `useChatStore` for a workspace landing that never
  * shipped (zero importers until 2026-08-15). Rewritten as a **controlled,
  * presentational** composer so the assign panel owns the draft and the caller
  * decides what "submit" means — `/chat` in 問一問 mode, `tasks.goal_create` in
- * 交辦 mode. Attachment/voice affordances were dropped rather than carried
- * over: `/chat` has its own attachment pipeline (`WebChatPage`), and
- * `goal_create` has no attachment channel at all, so an attach button here
- * would be a promise the assign path cannot keep.
+ * 交辦 mode. Voice was dropped. Files are the caller's: it passes an attach
+ * button through `controls` and the picked-file chips through `attachments`
+ * (the assign page hands them to `/chat` in 問一問 mode and to
+ * `tasks.goal_create` otherwise).
  */
 export function PromptBar({
   value,
@@ -29,6 +29,7 @@ export function PromptBar({
   showSubmit = true,
   rows = 3,
   controls,
+  attachments,
   id = 'assign-prompt',
 }: {
   value: string;
@@ -45,6 +46,8 @@ export function PromptBar({
   rows?: number;
   /** Control row rendered to the left of the send button. */
   controls?: ReactNode;
+  /** Rendered between the textarea and the control row (file chips). */
+  attachments?: ReactNode;
   id?: string;
 }) {
   const intl = useIntl();
@@ -82,6 +85,8 @@ export function PromptBar({
         className="w-full resize-none bg-transparent px-1 text-base text-foreground placeholder:text-muted-foreground focus-visible:outline-none"
         disabled={disabled}
       />
+
+      {attachments && <div className="mt-2">{attachments}</div>}
 
       {/* Control row */}
       <div className="mt-2 flex flex-wrap items-center gap-2">

@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
 import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useAssignStore } from '@/stores/assign-store';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
 import {
   PageHeader,
   Button,
@@ -732,7 +732,7 @@ function DisplayPopover({
 export function TaskBoardPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const openAssign = useAssignStore((s) => s.openAssign);
+  const openAssign = useOpenAssign();
   const [searchParams, setSearchParams] = useSearchParams();
   // `error` was unread across this whole file (P05 Blocker, phase-4 audit):
   // every failed read and write was silent, and a failed delete still closed
@@ -778,7 +778,7 @@ export function TaskBoardPage() {
 
   // Open the record-only create modal when routed here with `?new=1`. The
   // sidebar / mobile ＋ stopped pointing here in UX plan I-1a (they open the
-  // AssignSheet now); the param stays for existing bookmarks and for the
+  // /assign page now); the param stays for existing bookmarks and for the
   // employee-detail "＋" deep links below.
   useEffect(() => {
     if (searchParams.get('new') === '1') setShowCreate(true);
