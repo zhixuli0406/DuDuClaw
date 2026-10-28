@@ -337,12 +337,13 @@ async fn goal_create_saves_files_and_lists_them_in_the_description() {
         row.description
     );
     assert!(row.description.contains(&saved[0].display().to_string()));
-    // Criteria default to the goal text as before; the file list is in the
-    // description the employee reads.
-    assert!(row
-        .acceptance_criteria_baseline
-        .unwrap()
-        .contains("整理附件裡的名單"));
+    // Criteria default to the goal text alone (live test 2026-10-28: the file
+    // list had become criteria C2/C3); the list stays in the description.
+    assert_eq!(
+        row.acceptance_criteria_baseline.as_deref(),
+        Some("整理附件裡的名單")
+    );
+    assert_eq!(row.title, "整理附件裡的名單");
 }
 
 #[tokio::test]

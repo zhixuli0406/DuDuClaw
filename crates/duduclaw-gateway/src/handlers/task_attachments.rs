@@ -61,6 +61,20 @@ pub(crate) fn decode_task_attachments(params: &Value) -> Result<Vec<TaskAttachme
     // Base64 length bound checked before decoding, so an oversized string is
     // refused without allocating its decoded copy.
     let max_b64_len = (MAX_TASK_ATTACHMENT_BYTES as usize / 3 + 1) * 4;
+    // The same bound over all files together, before any of them is decoded:
+    // otherwise the file that crosses the total cap is decoded first.
+    let max_total_b64_len = (MAX_TASK_ATTACHMENTS_TOTAL_BYTES as usize / 3 + 1) * 4;
+    let total_b64_len: usize = list
+        .iter()
+        .filter_map(|e| e.get("data_base64").and_then(Value::as_str))
+        .map(str::len)
+        .sum();
+    if total_b64_len > max_total_b64_len {
+        return Err(format!(
+            "attachments_too_large: all files together are over {} MB",
+            MAX_TASK_ATTACHMENTS_TOTAL_BYTES / (1024 * 1024)
+        ));
+    }
     let mut total: u64 = 0;
     let mut out = Vec::with_capacity(list.len());
     for (i, entry) in list.iter().enumerate() {
@@ -130,11 +144,25 @@ pub(crate) async fn save_task_attachments(
         // The index keeps two same-named files saved in the same millisecond
         // apart (the store names files `<ms>_<name>`).
         let name = format!("{}_{}", i + 1, f.name);
-        match crate::media::save_attachment_in_base(&base, &f.data, &name).await {
-            Ok(path) => saved.push(path),
+        // Untracked save plus an explicit `uploaded` row: the tracked
+        // variant also registers the file for the chat 「加入知識庫」 claim,
+        // which is for files a chat message carried, not dashboard tasks.
+        match crate::media::save_attachment_in_base_untracked(&base, &f.data, &name).await {
+            Ok(path) => {
+                crate::artifacts::record_saved(
+                    &base,
+                    &path,
+                    &name,
+                    f.data.len() as u64,
+                    &crate::artifacts::SaveContext::uploaded(Some("dashboard")),
+                );
+                saved.push(path);
+            }
             Err(e) => {
                 remove_saved(&saved).await;
-                return Err(format!("attachments_save_failed: {e}"));
+                // The OS error names host paths; keep it in the log only.
+                tracing::warn!(agent = %agent_id, "task attachment save failed: {e}");
+                return Err("attachments_save_failed: the file could not be saved".to_string());
             }
         }
     }
@@ -242,6 +270,16 @@ impl super::MethodHandler {
             return Err(e);
         }
         let block = attachments_block(&entries);
+        // Without explicit criteria the goal text becomes the acceptance
+        // baseline, and the ledger splits it per line: pin the criteria to the
+        // text the person wrote so the file list never turns into criteria.
+        let criteria_given = params
+            .get("acceptance_criteria")
+            .and_then(Value::as_str)
+            .is_some_and(|c| !c.trim().is_empty());
+        if !criteria_given {
+            params["acceptance_criteria"] = Value::String(description.clone());
+        }
         params["description"] = Value::String(append_block(&description, &block));
         Ok((params, saved))
     }
@@ -312,6 +350,19 @@ mod tests {
     fn refuses_files_over_the_total_cap() {
         let chunk = vec![0u8; MAX_TASK_ATTACHMENT_BYTES as usize];
         let entry = json!({ "name": "c.bin", "data_base64": b64(&chunk) });
+        let err = decode_task_attachments(
+            &json!({ "attachments": [entry.clone(), entry.clone(), entry] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("all files together"), "{err}");
+    }
+
+    #[test]
+    fn the_total_cap_is_checked_before_anything_is_decoded() {
+        // Each string is under the per-file bound but they are not base64:
+        // decoding any of them would answer `attachments_invalid`.
+        let junk = "%".repeat((MAX_TASK_ATTACHMENT_BYTES as usize / 3) * 4);
+        let entry = json!({ "name": "j.bin", "data_base64": junk });
         let err = decode_task_attachments(
             &json!({ "attachments": [entry.clone(), entry.clone(), entry] }),
         )

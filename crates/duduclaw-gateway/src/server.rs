@@ -14718,6 +14718,9 @@ const TASK_RPC_HTTP_METHODS: [&str; 2] = ["tasks.goal_create", "tasks.skill_assi
 /// hold its ~67 MB body, the parsed JSON and the decoded files in memory.
 static TASK_RPC_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// Longest a `POST /api/tasks/rpc` body may take to arrive once it holds a slot.
+const TASK_RPC_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// POST /api/tasks/rpc — `{ "method", "params" }` for a task RPC whose
 /// attachments do not fit a dashboard socket frame. Authenticated like the
 /// knowledge upload (Bearer JWT, password already changed), then dispatched
@@ -14727,12 +14730,29 @@ static TASK_RPC_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 async fn handle_task_rpc_with_files(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
+    // Authenticate and take a slot from the headers alone, before a byte of
+    // the (up to ~67 MB) body is read: an unauthenticated or surplus request
+    // is refused without the gateway buffering its upload.
     let ctx = match knowledge_caller(&state, &headers) {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
+    let too_large = || {
+        (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "error": "request body too large" })),
+        )
+            .into_response()
+    };
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > crate::handlers::task_attachments::MAX_TASK_RPC_BODY_BYTES as u64) {
+        return too_large();
+    }
     let Ok(_slot) = TASK_RPC_SLOTS.try_acquire() else {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -14746,6 +14766,23 @@ async fn handle_task_rpc_with_files(
             Json(serde_json::json!({ "error": msg })),
         )
             .into_response()
+    };
+    // A slow sender must not hold one of the two slots indefinitely.
+    let read = tokio::time::timeout(
+        TASK_RPC_BODY_READ_TIMEOUT,
+        axum::body::to_bytes(body, crate::handlers::task_attachments::MAX_TASK_RPC_BODY_BYTES),
+    )
+    .await;
+    let body = match read {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return too_large(),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({ "error": "upload took too long" })),
+            )
+                .into_response();
+        }
     };
     let mut req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,

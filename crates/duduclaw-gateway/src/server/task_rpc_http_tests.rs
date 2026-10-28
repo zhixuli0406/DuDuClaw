@@ -177,3 +177,49 @@ async fn runs_the_same_dispatch_as_the_socket() {
     assert_eq!(frame["error"], "permission denied");
     assert_eq!(saved_files(&f.home), 1);
 }
+
+/// A body that fails as soon as anything reads it: a request answered with
+/// 401 / 413 instead of a body error was refused from its headers alone.
+fn unreadable_body() -> axum::body::Body {
+    axum::body::Body::from_stream(futures_util::stream::once(async {
+        Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other("body must not be read"))
+    }))
+}
+
+async fn post_raw(router: &Router, token: Option<&str>, length: Option<u64>) -> StatusCode {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/tasks/rpc")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(length) = length {
+        request = request.header(header::CONTENT_LENGTH, length.to_string());
+    }
+    router
+        .clone()
+        .oneshot(request.body(unreadable_body()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn refuses_from_the_headers_before_reading_the_body() {
+    let f = fixture().await;
+    let r = router(f.state.clone());
+    let huge = crate::handlers::task_attachments::MAX_TASK_RPC_BODY_BYTES as u64 + 1;
+    // No token: 401 without touching the (unreadable) body, whatever its size.
+    assert_eq!(
+        post_raw(&r, None, Some(huge)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(post_raw(&r, None, None).await, StatusCode::UNAUTHORIZED);
+    // Signed in, but the declared size is over the cap: 413, body still unread.
+    assert_eq!(
+        post_raw(&r, Some(&f.admin_token), Some(huge)).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(saved_files(&f.home), 0);
+}

@@ -39,6 +39,9 @@ use super::task_attachments::{
 /// Longest `note` accepted (characters).
 pub(crate) const MAX_NOTE_CHARS: usize = 500;
 
+/// `trigger_signal` of the `skill_activate` row a 一般-tab hand-over writes.
+pub(crate) const SKILL_ASSIGN_TRIGGER: &str = "skill_assign";
+
 /// Pick the runner among `holdings` (already in registry order): the enabled,
 /// scan-clean holder that ran the skill most recently, else the first enabled,
 /// scan-clean holder. Ties on the timestamp keep registry order.
@@ -79,13 +82,14 @@ pub(crate) fn skill_goal_description(
     attachment_paths: &[SavedAttachment],
     full_copy: Option<&std::path::Path>,
 ) -> String {
-    let shown = label(&skill.display_name, skill_name);
+    let shown = header_safe(&label(&skill.display_name, skill_name));
+    let id = header_safe(skill_name);
     let mut head = if note.is_empty() {
         format!("執行技能「{shown}」")
     } else {
         format!("技能「{shown}」：{note}")
     };
-    head.push_str(&format!("\n技能 ID：{skill_name}"));
+    head.push_str(&format!("\n技能 ID：{id}"));
     if !attachment_paths.is_empty() {
         head.push('\n');
         head.push_str(&attachments_block(attachment_paths));
@@ -98,7 +102,7 @@ pub(crate) fn skill_goal_description(
             p.display()
         ),
     };
-    let open = format!("<skill name=\"{skill_name}\">\n");
+    let open = format!("<skill name=\"{id}\">\n");
     let close = "\n</skill>";
     let fixed = head.chars().count()
         + 2
@@ -109,6 +113,19 @@ pub(crate) fn skill_goal_description(
     let room = DESCRIPTION_MAX_CHARS.saturating_sub(fixed);
     let body = duduclaw_core::truncate_chars(skill.content.trim(), room);
     format!("{head}\n\n{intro}\n{open}{body}{close}")
+}
+
+/// A skill name or display name as it may appear in the header and the
+/// `<skill name="…">` wrapper: one line, without the quote and angle brackets
+/// that could close the wrapper early. Names on disk may contain them.
+fn header_safe(raw: &str) -> String {
+    raw.chars()
+        .map(|c| match c {
+            '"' | '<' | '>' => '_',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
 }
 
 /// Whether the full skill text fits inline next to the header.
@@ -260,6 +277,21 @@ impl MethodHandler {
                     return WsFrame::error_response("", &e);
                 }
             };
+        // A skill handed over from the 一般 tab counts as a use: the tab
+        // orders skills by `last_used_at`, which only `skill_activate` rows
+        // feed. A distinct trigger keeps these apart from the evolution
+        // loop's own activations.
+        // The global emitter writes where `skills.list` reads usage from
+        // (`resolve_default_dir`, from the environment). Only write when that
+        // is this handler's own home, so a handler built over another
+        // directory (tests) never appends to the operator's real audit log.
+        if crate::evolution_events::logger::resolve_default_dir().starts_with(&self.home_dir) {
+            crate::evolution_events::emitter::EvolutionEventEmitter::global().emit_skill_activate(
+                &runner.agent_id,
+                skill_name,
+                SKILL_ASSIGN_TRIGGER,
+            );
+        }
         let cap = crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir).iteration_cap;
         let dispatch_enabled = crate::dispatch_engine::dispatch_engine_enabled(&self.home_dir);
         WsFrame::ok_response(
@@ -286,6 +318,12 @@ impl MethodHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_names_cannot_close_the_skill_wrapper() {
+        assert_eq!(header_safe("x\">\n</skill>"), "x__ _/skill_");
+        assert_eq!(header_safe("報價整理"), "報價整理");
+    }
 
     fn holding(agent: &str, enabled: bool, last: Option<&str>) -> SkillHolding {
         SkillHolding {
