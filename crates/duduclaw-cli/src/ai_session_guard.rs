@@ -1,16 +1,18 @@
 //! "Is this process running inside an AI employee's turn?" for operator-only
-//! commands: `memory forget-source`, `memory migrate-namespace` and
-//! `responsibility …` (present even when empty counts), and
+//! commands: `memory forget-source`, `memory migrate-namespace`,
+//! `responsibility …` and `agent pause|resume|freeze|unfreeze` (present
+//! even when empty counts), and
 //! `channel-ingress` / `computer-workspaces` (same list, non-empty
 //! values count there). One list for all of them.
 //!
 //! The gateway sets one or more of these variables on every process it
 //! spawns for an employee (identity, turn, session, delegation chain, run).
 //! Any one of them present, even empty, counts: an operator's own terminal
-//! carries none, and a command that deletes or moves memory fails closed.
+//! carries none, and operator-only commands fail closed.
 //! This is a first line only — an employee with Bash can unset variables —
-//! so the destructive step also needs a dashboard approval and the Bash lane
-//! refuses the command for employees.
+//! so the Bash lane also refuses these commands for employees. Destructive
+//! memory operations additionally need dashboard approval; employee status
+//! and evolution switches remain directly available in an operator's terminal.
 
 /// Variables that mark a DuDuClaw-spawned employee process.
 pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[

@@ -238,6 +238,8 @@ everything" and reminds you to disable autopilot separately.
 
 ## One-shot freeze / unfreeze (enterprise escape hatch)
 
+Run `agent pause`, `resume`, `freeze` and `unfreeze` from your own operator terminal. They refuse when any DuDuClaw AI-session environment variable is present, even empty; the Bash lane also blocks employees and unverified callers using these commands. No dashboard approval is required. `pause` / `resume` change `[agent] status` to `paused` / `active`; the freeze switches below change evolution and heartbeat separately. All four use the shared locked writer, preserving comments and formatting in `agent.toml`, and record file history and security audits (including refusals). These checks are speed bumps; they do not contain an employee with unrestricted Bash.
+
 When something looks wrong and you want an agent to stop changing itself *now*:
 
 ```bash

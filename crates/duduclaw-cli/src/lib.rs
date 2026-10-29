@@ -92,6 +92,7 @@ mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (opera
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
+mod agent_control_cmd; // Operator-only pause/resume/freeze/unfreeze
 mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
@@ -6448,6 +6449,9 @@ fn agent_file_guard_decision(
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
                         })
                         .or_else(|| {
+                            agent_control_cmd::bash_agent_control_decision(command, &caller)
+                        })
+                        .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(
                                 command,
                                 &caller,
@@ -10877,150 +10881,24 @@ pub(crate) fn sanitize_agent_id(raw: &str) -> String {
     duduclaw_core::truncate_chars(&s, 64)
 }
 
-/// `duduclaw agent pause/resume <agent>` - Modify agent.toml status.
+/// `duduclaw agent pause/resume <agent>` — operator-only status change.
 async fn cmd_agent_set_status(agent: &str, status: &str) -> duduclaw_core::error::Result<()> {
-    use console::style;
-
-    if !is_valid_agent_id(agent) {
-        return Err(DuDuClawError::Agent(
-            "Agent name must be lowercase alphanumeric with hyphens".to_string(),
-        ));
-    }
-
-    let home = duduclaw_home();
-    let agent_toml_path = home.join("agents").join(agent).join("agent.toml");
-
-    if !agent_toml_path.exists() {
-        return Err(DuDuClawError::Agent(format!("Agent '{}' not found", agent)));
-    }
-
-    let content = tokio::fs::read_to_string(&agent_toml_path)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to read agent.toml: {e}")))?;
-
-    let mut table: toml::Table = content
-        .parse()
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to parse agent.toml: {e}")))?;
-
-    if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
-        agent_section.insert(
-            "status".to_string(),
-            toml::Value::String(status.to_string()),
-        );
-    } else {
-        return Err(DuDuClawError::Agent(
-            "agent.toml missing [agent] section".to_string(),
-        ));
-    }
-
-    let new_content = toml::to_string_pretty(&table)
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to serialise agent.toml: {e}")))?;
-
-    tokio::fs::write(&agent_toml_path, new_content)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
-
-    let icon = if status == "paused" {
-        style("⏸").yellow()
-    } else {
-        style("▶").green()
+    let action = match status {
+        "paused" => agent_control_cmd::Action::Pause,
+        "active" => agent_control_cmd::Action::Resume,
+        _ => return Err(DuDuClawError::Agent("Invalid agent status".into())),
     };
-    println!(
-        "  {} Agent '{}' is now {}",
-        icon,
-        agent,
-        style(status).bold()
-    );
-    Ok(())
+    agent_control_cmd::run(&duduclaw_home(), agent, action)
 }
 
-/// `duduclaw agent freeze|unfreeze <id>` — one-shot enterprise kill-switch.
-///
-/// `freeze=true`  → `[evolution] enabled = false` + `[heartbeat] enabled = false`.
-/// `freeze=false` → both set back to `true`.
-///
-/// Both operations are additive TOML edits (missing sections are created) and
-/// write a `security_audit.jsonl` record so the freeze is forensically visible.
-/// User-authored autopilot rules live in a separate store and are intentionally
-/// NOT auto-modified here (see `docs/guides/evolution-switches.md` — autopilot is
-/// explicit user automation, disable those from the dashboard if needed).
+/// `duduclaw agent freeze|unfreeze <id>` — operator-only evolution/heartbeat switch.
 async fn cmd_agent_freeze(agent: &str, freeze: bool) -> duduclaw_core::error::Result<()> {
-    use console::style;
-    use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event};
-
-    if !is_valid_agent_id(agent) {
-        return Err(DuDuClawError::Agent(
-            "Agent name must be lowercase alphanumeric with hyphens".to_string(),
-        ));
-    }
-
-    let home = duduclaw_home();
-    let agent_toml_path = home.join("agents").join(agent).join("agent.toml");
-    if !agent_toml_path.exists() {
-        return Err(DuDuClawError::Agent(format!("Agent '{}' not found", agent)));
-    }
-
-    let content = tokio::fs::read_to_string(&agent_toml_path)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to read agent.toml: {e}")))?;
-    let mut table: toml::Table = content
-        .parse()
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to parse agent.toml: {e}")))?;
-
-    let enabled = !freeze;
-    for section in ["evolution", "heartbeat"] {
-        let sub = table
-            .entry(section.to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let Some(t) = sub.as_table_mut() {
-            t.insert("enabled".to_string(), toml::Value::Boolean(enabled));
-        }
-    }
-
-    let new_content = toml::to_string_pretty(&table)
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to serialise agent.toml: {e}")))?;
-    tokio::fs::write(&agent_toml_path, new_content)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
-
-    append_audit_event(
-        &home,
-        &AuditEvent::new(
-            if freeze {
-                "agent_freeze"
-            } else {
-                "agent_unfreeze"
-            },
-            agent,
-            Severity::Warning,
-            serde_json::json!({
-                "evolution_enabled": enabled,
-                "heartbeat_enabled": enabled,
-                "source": "cli",
-            }),
-        ),
-    );
-
-    if freeze {
-        println!(
-            "  {} Agent '{}' is now {} — evolution and heartbeat halted.",
-            style("🧊").blue(),
-            agent,
-            style("FROZEN").bold().blue()
-        );
-        println!(
-            "      {}",
-            style("Autopilot rules (if any) are user-defined — disable them in the dashboard if needed.").dim()
-        );
+    let action = if freeze {
+        agent_control_cmd::Action::Freeze
     } else {
-        println!(
-            "  {} Agent '{}' is {} — evolution and heartbeat re-enabled.",
-            style("▶").green(),
-            agent,
-            style("UNFROZEN").bold().green()
-        );
-    }
-    Ok(())
+        agent_control_cmd::Action::Unfreeze
+    };
+    agent_control_cmd::run(&duduclaw_home(), agent, action)
 }
 
 /// `duduclaw migrate` - Migrate agent.toml to Claude Code format.
@@ -14398,6 +14276,37 @@ mod removed_name_hook_tests {
         )
         .unwrap();
         assert!(d.is_allowed(), "{d:?}");
+    }
+
+    #[test]
+    fn bash_agent_cli_guard_blocks_controls_through_the_hook() {
+        let h = home_with_trash();
+        for action in ["pause", "resume", "freeze", "unfreeze"] {
+            for cmd in [
+                format!("duduclaw agent {action} writer"),
+                format!("/usr/local/bin/duduclaw-pro agent {action} writer"),
+                format!("env -u DUDUCLAW_AGENT_ID duduclaw agent {action} writer"),
+                format!("duduclaw.exe --verbose agent \\\n{action}>out writer"),
+                format!("duduclaw ag''ent \"{action}\" writer"),
+            ] {
+                let d = agent_file_guard_decision("Bash", &bash(&cmd), h.path(), &agent("ceo")).unwrap();
+                assert!(
+                    matches!(&d, GuardDecision::BlockedOperatorCommand { command, .. }
+                        if *command == format!("duduclaw agent {action}")),
+                    "{cmd:?}: {d:?}"
+                );
+                let d = agent_file_guard_decision(
+                    "Bash", &bash(&cmd), h.path(), &HookCaller::Untrusted("ceo".into()),
+                ).unwrap();
+                assert!(!d.is_allowed(), "{cmd:?}: {d:?}");
+                let d = agent_file_guard_decision("Bash", &bash(&cmd), h.path(), &HookCaller::Absent).unwrap();
+                assert!(d.is_allowed(), "{cmd:?}: {d:?}");
+            }
+        }
+        for cmd in ["duduclaw agent list", "duduclaw agent status writer", "duduclaw agent freezer writer"] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(d.is_allowed(), "{cmd:?}: {d:?}");
+        }
     }
 
     /// Standalone profile: an employee may not issue itself an MCP key.
