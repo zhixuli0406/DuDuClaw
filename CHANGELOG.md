@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- MCP 頁 Marketplace 卡片的「安裝到 AI 員工」改成跟右上角「新增 MCP Server」同一個表單，安裝前可以修改指令、參數與環境變數（先前卡片上的安裝只能選員工，例如無法拿掉 Playwright 的 `--headless`）。「AI 員工設定」的伺服器列新增「編輯」；用員工已有的名稱再安裝也會進入編輯、取代原本設定，不必先移除。已保存的機密值會沿用，`${…}` 參照的值需要重新填寫。
 - 文件與操作者指令說明中的 `duduclaw ops channel-ingress`、`duduclaw ops computer-workspaces`、`duduclaw ops computer-profiles` 改為實際可執行的 `duduclaw channel-ingress` 等；AI 員工 Bash 指令的操作者指令攔阻也改為比對實際寫法（先前比對的是無法執行的 `ops` 寫法，實際指令未被這一層攔下；行程內的 AI 工作階段檢查與儀表板核准不受影響）。補上 `computer-profiles` 的 Bash hook 攔阻（含唯讀查詢），保守比對字面的指令詞組，並對 `echo`／`printf` 各個不超過 64 KiB 的字串參數、shell `-c` 與 `eval` 內容共用最多兩層重解析；支援 `-xc` 等短旗標組合、`-c` 前後的選項與 `--`。Bash 層仍是有已知缺口的減速帶：不支援 ANSI-C 引號與命令替換動態組裝，格式錯誤的引號也不會一律拒絕；受保護狀態變更的真正關卡是行程內的 AI 工作階段檢查與儀表板 Admin 核准。
 
 ## [1.76.4] - 2026-10-29 — Codex timeout, background runtime and Odoo compatibility hotfix
