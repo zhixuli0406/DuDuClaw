@@ -1,4 +1,4 @@
-//! `duduclaw ops channel-ingress` — the operator terminal entry point
+//! `duduclaw channel-ingress` — the operator terminal entry point
 //! (review I-HIGH-4 (3)).
 //!
 //! `list` and `show` answer directly. `resolve` (close / retry) and `rerun`

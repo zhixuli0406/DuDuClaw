@@ -122,14 +122,16 @@ LINE Messaging API 文件寫明：reply token 只能用一次，而且要在收�
 ### 指令列
 
 ```bash
-duduclaw ops channel-ingress list
-duduclaw ops channel-ingress show <ingress_id>
-duduclaw ops channel-ingress resolve <ingress_id> --note "理由" [--retry] [--provider-receipt <編號>]
-duduclaw ops channel-ingress rerun <ingress_id> --note "理由" --confirm-duplicate-risk [--provider-receipt <編號>]
-duduclaw ops channel-ingress batch --action close|retry|rerun --status <狀態> [--reason <原因代碼>] --note "理由" [--confirm-duplicate-risk] [--limit 200]
+duduclaw channel-ingress list
+duduclaw channel-ingress show <ingress_id>
+duduclaw channel-ingress resolve <ingress_id> --note "理由" [--retry] [--provider-receipt <編號>]
+duduclaw channel-ingress rerun <ingress_id> --note "理由" --confirm-duplicate-risk [--provider-receipt <編號>]
+duduclaw channel-ingress batch --action close|retry|rerun --status <狀態> [--reason <原因代碼>] --note "理由" [--confirm-duplicate-risk] [--limit 200]
 ```
 
-AI 員工在 Bash 裡執行 `duduclaw`／`duduclaw-pro` 的 `ops channel-ingress` 會被 agent-file-guard hook 擋下（`BlockedOperatorCommand`）。比對前先照 bash 的讀法還原指令（換行續行、引號拼接、黏在字後的重導向、`env`／`npx` 前綴、絕對路徑）。這只是減速：用變數、別名、腳本或改名的執行檔就能繞過，非 Claude 的 runtime 也不跑這個 hook；真正的關卡是下面的儀表板核准。
+AI 員工或身分未驗證的呼叫者在 Bash 裡執行 `duduclaw`／`duduclaw-pro` 的 `channel-ingress` 會被 agent-file-guard hook 擋下（`BlockedOperatorCommand`）。同一個 hook 也涵蓋 `computer-workspaces` 與 `computer-profiles`，包含唯讀指令；`echo`／`printf` 參數裡出現完整的操作者指令詞組也採保守攔阻，接受誤攔，只有 `grep`／`egrep`／`fgrep` 的提及會略過。文字比對可辨識常見 Bash 寫法（換行續行、引號拼接、黏在字後的重導向、`env`／`npx` 前綴、絕對路徑）。這只是減速：用變數、別名、腳本或改名的執行檔就能繞過，非 Claude 的 runtime 也不跑這個 hook；受保護狀態變更的真正關卡是行程內的 AI 工作階段檢查與下面的儀表板 Admin 核准。
+
+Bash 層的已知缺口：不支援 ANSI-C `$'…'` 引號、透過命令替換動態組裝指令，格式錯誤的引號也不會一律拒絕。`bash`／`sh`／`zsh`／`dash` 的 `-c`、`eval` 與 `echo`／`printf` 各個字串參數共用最多兩層重解析；超過 64 KiB 的 `echo`／`printf` 參數不重解析。可比對 `-xc` 等短旗標組合、`-c` 前後的選項（含 `-o value`），以及 `-c` 後的 `--`，並接受保守誤攔。這仍是減速帶；受保護狀態變更的真正關卡是行程內的 AI 工作階段檢查與儀表板 Admin 核准。
 
 `list` 與 `show` 直接回答。`resolve` 和 `rerun` 第一次執行**不會生效**，只建立一筆核准請求，終端機印出「請到儀表板的待辦核准」與核准編號並以非零碼結束。指令列分不出下指令的是操作者還是有 Bash 的 AI 員工，所以這類變更一律要管理者（Admin）在儀表板核准；通道上的回覆不能核准。核准後 30 分鐘內再執行一次**同一個指令**（相同理由與回執編號）才會套用，每筆核准只能用一次；事件狀態在這之間有變動，核准就作廢，要重新申請。同時等待中的指令列請求最多 20 筆。請求等待期間事件狀態變了，等待中的卡片會被撤回，下次執行再建一張新的（不會原地改寫卡片內容）。每次申請、套用與拒絕都寫一筆安全稽核 `channel_ingress_cli_action`。帶有 AI 員工工作階段環境變數的行程通常會被拒，但拿掉這些變數就能繞過；真正的關卡是儀表板核准。急用時請改用儀表板 RPC。
 
@@ -171,6 +173,6 @@ v1.70.0 之後的版本起，所有操作者指令共用同一套核准規則（
 
 ## 驗證範圍
 
-本地測試涵蓋：設為 fail 時逾期事件的 `retry`／`rerun` 被拒、核准後才改成 fail 的重新執行不會執行也不送出任何請求；Bash 通道擋下 `ops channel-ingress`；還原標記存在時排隊中的事件在 worker 取件前就被暫停、標記只生效一次；驗簽、整批 rollback／磁碟滿／資料庫唯讀／資料庫忙碌時不回 200；同一事件 20 個並發 webhook 只執行一次；排隊造成逾期時兩種設定（push 送到同一對話、fail 不執行也不送任何請求）；進度推播失敗不影響事件狀態；文件通知併入回覆；preset 生效設定進入快照；無關員工變更與損毀不影響快照及 ACK；讀不到設定時退避而非立即隔離；經過 webhook handler 與 worker 的實際 OS 強殺（ACK 後、執行中）；指令列需儀表板 Admin 核准、核准只用一次、狀態變動作廢；快照補上前事件不可領取、讀不到快照時退避、停機期間沒補到快照的事件隔離成 `snapshot_unavailable`；重送的 webhook 不試 reply token（push 時改用 Push、fail 時不執行）；reply token 被拒時 push 改用 Push、fail 維持 `undelivered`；送出前讀不到記成 `revalidation_unavailable`、讀到而且不同記成 `authorization_changed_before_delivery`；500 筆告警合成一筆帶數量的 Activity、重啟後不重複；批次只處理狀態沒變的事件、篩選結果變了就重建卡片；指令列輸出不含 LINE 原始 ID；標記寫不進去時還原在搬動資料前中止；Bash 通道擋下換行續行、引號拼接、重導向黏字的寫法。
+本地測試涵蓋：設為 fail 時逾期事件的 `retry`／`rerun` 被拒、核准後才改成 fail 的重新執行不會執行也不送出任何請求；Bash 通道擋下 `channel-ingress`；還原標記存在時排隊中的事件在 worker 取件前就被暫停、標記只生效一次；驗簽、整批 rollback／磁碟滿／資料庫唯讀／資料庫忙碌時不回 200；同一事件 20 個並發 webhook 只執行一次；排隊造成逾期時兩種設定（push 送到同一對話、fail 不執行也不送任何請求）；進度推播失敗不影響事件狀態；文件通知併入回覆；preset 生效設定進入快照；無關員工變更與損毀不影響快照及 ACK；讀不到設定時退避而非立即隔離；經過 webhook handler 與 worker 的實際 OS 強殺（ACK 後、執行中）；指令列需儀表板 Admin 核准、核准只用一次、狀態變動作廢；快照補上前事件不可領取、讀不到快照時退避、停機期間沒補到快照的事件隔離成 `snapshot_unavailable`；重送的 webhook 不試 reply token（push 時改用 Push、fail 時不執行）；reply token 被拒時 push 改用 Push、fail 維持 `undelivered`；送出前讀不到記成 `revalidation_unavailable`、讀到而且不同記成 `authorization_changed_before_delivery`；500 筆告警合成一筆帶數量的 Activity、重啟後不重複；批次只處理狀態沒變的事件、篩選結果變了就重建卡片；指令列輸出不含 LINE 原始 ID；標記寫不進去時還原在搬動資料前中止；Bash 通道擋下換行續行、引號拼接、重導向黏字的寫法。
 
 真實 LINE 帳號的 redelivery、reply token 實際期限、token 已用過或過期時 LINE 實際回的錯誤內容（閘道比對訊息 `Invalid reply token`，其他 400 仍記 `reply_rejected`）、Push 額度用盡的回應、`X-Line-Retry-Key` 的去重效果，以及 relay 上游的行為，尚未在真實帳號驗證；本地測試以假的 provider 代替。

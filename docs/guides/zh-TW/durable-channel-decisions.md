@@ -69,7 +69,7 @@ Discord 按鈕使用平台驗證過的頻道 ID、種類與 guild。每一則 gu
 以閘道內建的「只限儀表板」清單為準，目前包含：
 
 - 知識審核（被保留的記憶主張）
-- 用 `duduclaw ops channel-ingress` 申請的 LINE 收件匣操作
+- 用 `duduclaw channel-ingress` 申請的 LINE 收件匣操作
 - 工作流程啟用
 - 執行結果未知的操作核對（`approvals.resolve_uncertain`，限 Admin）
 

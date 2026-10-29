@@ -99,12 +99,12 @@ An ownerless workspace can only be handled by an operator (deleted). Re-assignin
 ## Operator commands
 
 ```bash
-duduclaw ops computer-workspaces list [--owner <employee>]
-duduclaw ops computer-workspaces fence <workspace id> [--reason <reason>]
-duduclaw ops computer-workspaces revoke <workspace id>
-duduclaw ops computer-workspaces regrant <workspace id>
-duduclaw ops computer-workspaces renew <workspace id>
-duduclaw ops computer-workspaces delete <workspace id> --confirm
+duduclaw computer-workspaces list [--owner <employee>]
+duduclaw computer-workspaces fence <workspace id> [--reason <reason>]
+duduclaw computer-workspaces revoke <workspace id>
+duduclaw computer-workspaces regrant <workspace id>
+duduclaw computer-workspaces renew <workspace id>
+duduclaw computer-workspaces delete <workspace id> --confirm
 ```
 
 | Action | Effect | Approval |
@@ -131,7 +131,7 @@ The flow: the first run only files a request in the dashboard inbox, prints `請
 **Other rules:**
 
 - The command refuses to run when any DuDuClaw session or identity variable is present (for example `DUDUCLAW_AGENT_ID`, `DUDUCLAW_TURN_ID`).
-- The agent-file-guard hook refuses `duduclaw` / `duduclaw-pro` `ops computer-workspaces` in an AI employee's Bash (and for unverified callers).
+- The agent-file-guard hook refuses `duduclaw` / `duduclaw-pro` `computer-workspaces` in an AI employee's Bash (and for unverified callers). Known Bash-lane gaps: ANSI-C `$'…'` quoting, dynamic command assembly via command substitution, and malformed quotes (which do not fail closed). `bash`/`sh`/`zsh`/`dash` `-c`, `eval` and individual `echo`/`printf` string arguments share a two-level re-parse limit; `echo`/`printf` arguments over 64 KiB are not re-parsed. Short-flag clusters such as `-xc`, options before or after `-c` (including `-o value`), and `--` after `-c` are matched. Conservative false positives are accepted. This remains a speed bump; the real gates for protected state changes are the in-process AI-session check and dashboard Admin approval.
 - Terminal actions are audited as `本機指令列（身分未驗證）` (local command line, identity not verified).
 - Every terminal action writes a security audit row when it is requested, applied and refused (`security_audit.jsonl`, event `computer_workspace_cli_action`).
 - An approved `fence` / `revoke` / `delete` applied from the terminal changes the registry only (the terminal process holds no sessions): an action of a running session that has not passed its last check is refused at once, one that already passed it finishes, and the session ends at its next operation or at the next lease renewal (about 15 seconds).

@@ -86,10 +86,10 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod computer_profiles_cmd;
-mod computer_workspaces_cmd; // P2-C: `duduclaw ops computer-workspaces` (operator-only)
+mod computer_workspaces_cmd; // P2-C: `duduclaw computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
-mod channel_ingress_cmd; // F2: `duduclaw ops channel-ingress` (operator-only, dashboard-approved changes)
+mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
 mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
@@ -6442,6 +6442,9 @@ fn agent_file_guard_decision(
                             computer_workspaces_cmd::bash_workspace_ops_decision(command, &caller)
                         })
                         .or_else(|| {
+                            computer_profiles_cmd::bash_computer_profiles_decision(command, &caller)
+                        })
+                        .or_else(|| {
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
                         })
                         .or_else(|| {
@@ -12158,7 +12161,7 @@ fn run_redteam_bank(bank_path: &Path) -> duduclaw_core::error::Result<serde_json
 /// deterministic input guard. Blocked ⇒ covered; not blocked ⇒ 「待活體驗證」
 /// (the live model's refusal is unobserved — not a vulnerability verdict).
 /// With `emit_evals`, writes one `duduclaw eval` case per unit that needs
-/// live validation. Shared by `duduclaw test` and `duduclaw ops redteam`.
+/// live validation. Shared by `duduclaw test` and `duduclaw redteam`.
 fn run_redteam_ledger(
     agent: &str,
     must_not: &[String],
@@ -13648,6 +13651,41 @@ mod cli_verb_consolidation_tests {
     }
 
     #[test]
+    fn channel_ingress_operator_spelling_matches_the_real_cli() {
+        run_on_big_stack(|| {
+            assert!(matches!(parse(&["channel-ingress", "list"]).command,
+                Commands::Ops(OpsCommands::ChannelIngress {
+                    command: channel_ingress_cmd::ChannelIngressCommands::List { .. }
+                })));
+            assert_eq!(channel_ingress_cmd::OPERATOR_COMMANDS[0].path, &["channel-ingress"]);
+            rejects(&["ops", "channel-ingress", "list"]);
+        });
+    }
+
+    #[test]
+    fn computer_workspaces_operator_spelling_matches_the_real_cli() {
+        run_on_big_stack(|| {
+            assert!(matches!(parse(&["computer-workspaces", "list"]).command,
+                Commands::Ops(OpsCommands::ComputerWorkspaces {
+                    command: computer_workspaces_cmd::ComputerWorkspaceCommands::List { .. }
+                })));
+            assert_eq!(computer_workspaces_cmd::OPERATOR_COMMANDS[0].path, &["computer-workspaces"]);
+            rejects(&["ops", "computer-workspaces", "list"]);
+        });
+    }
+
+    #[test]
+    fn computer_profiles_operator_spelling_matches_the_real_cli() {
+        run_on_big_stack(|| {
+            assert!(matches!(parse(&["computer-profiles", "list"]).command,
+                Commands::Ops(OpsCommands::ComputerProfiles {
+                    command: computer_profiles_cmd::ComputerProfileCommands::List
+                })));
+            rejects(&["ops", "computer-profiles", "list"]);
+        });
+    }
+
+    #[test]
     fn migrate_group_parses_and_bare_form_keeps_its_meaning() {
         run_on_big_stack(migrate_group_parses_and_bare_form_keeps_its_meaning_body);
     }
@@ -14401,24 +14439,34 @@ mod removed_name_hook_tests {
         );
     }
 
+    // These cases exercise the operator gate, independently of home-directory
+    // protection for an untrusted caller whose spawn directory is unavailable.
+    fn operator_bash(cmd: &str) -> serde_json::Value {
+        let mut envelope = bash(cmd);
+        envelope["cwd"] = json!(std::env::temp_dir());
+        envelope
+    }
+
     #[test]
     fn bash_channel_ingress_is_blocked_through_the_hook() {
         let h = home_with_trash();
+        for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+            let d = agent_file_guard_decision(
+                "Bash",
+                &operator_bash("duduclaw channel-ingress rerun abc --note x --confirm-duplicate-risk"),
+                h.path(),
+                &caller,
+            )
+            .unwrap();
+            assert!(
+                matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
+                    if *command == "duduclaw channel-ingress"),
+                "{d:?}"
+            );
+        }
         let d = agent_file_guard_decision(
             "Bash",
-            &bash("duduclaw ops channel-ingress rerun abc --note x --confirm-duplicate-risk"),
-            h.path(),
-            &agent("ceo"),
-        )
-        .unwrap();
-        assert!(
-            matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
-                if *command == "duduclaw ops channel-ingress"),
-            "{d:?}"
-        );
-        let d = agent_file_guard_decision(
-            "Bash",
-            &bash("duduclaw ops channel-ingress list"),
+            &operator_bash("duduclaw channel-ingress list"),
             h.path(),
             &HookCaller::Absent,
         )
@@ -14429,28 +14477,92 @@ mod removed_name_hook_tests {
     #[test]
     fn bash_computer_workspaces_is_blocked_through_the_hook() {
         let h = home_with_trash();
+        for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+            let d = agent_file_guard_decision(
+                "Bash",
+                &operator_bash("duduclaw \\\ncomputer-work''spaces delete ws-1 --confirm"),
+                h.path(),
+                &caller,
+            )
+            .unwrap();
+            assert!(
+                matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
+                    if *command == "duduclaw computer-workspaces"),
+                "{d:?}"
+            );
+            let msg = d.block_message().unwrap();
+            assert!(msg.contains("電腦操作工作區"), "{msg}");
+        }
         let d = agent_file_guard_decision(
             "Bash",
-            &bash("duduclaw ops \\\ncomputer-work''spaces delete ws-1 --confirm"),
-            h.path(),
-            &agent("ceo"),
-        )
-        .unwrap();
-        assert!(
-            matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
-                if *command == "duduclaw ops computer-workspaces"),
-            "{d:?}"
-        );
-        let msg = d.block_message().unwrap();
-        assert!(msg.contains("電腦操作工作區"), "{msg}");
-        let d = agent_file_guard_decision(
-            "Bash",
-            &bash("duduclaw ops computer-workspaces list"),
+            &operator_bash("duduclaw computer-workspaces list"),
             h.path(),
             &HookCaller::Absent,
         )
         .unwrap();
         assert!(d.is_allowed(), "{d:?}");
+    }
+
+    #[test]
+    fn bash_computer_profiles_is_blocked_through_the_hook() {
+        let h = home_with_trash();
+        for cmd in [
+            "duduclaw computer-profiles list",
+            "duduclaw-pro.exe computer-profiles list",
+            "/usr/local/bin/duduclaw --redact off computer-profiles list",
+            "env -i duduclaw computer-profiles list",
+            "duduclaw computer-pro''files list",
+            "sh -c 'duduclaw computer-profiles list'",
+        ] {
+            for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+                let d = agent_file_guard_decision("Bash", &operator_bash(cmd), h.path(), &caller).unwrap();
+                assert!(matches!(d, GuardDecision::BlockedOperatorCommand { command: "duduclaw computer-profiles", .. }), "{cmd}: {d:?}");
+                assert!(d.block_message().unwrap().contains("瀏覽器登入狀態"), "{cmd}");
+            }
+            let d = agent_file_guard_decision("Bash", &operator_bash(cmd), h.path(), &HookCaller::Absent).unwrap();
+            assert!(d.is_allowed(), "{cmd}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn bash_echo_and_printf_operator_mentions_are_conservatively_blocked() {
+        let h = home_with_trash();
+        for cmd in [
+            "echo duduclaw channel-ingress list",
+            "echo duduclaw computer-workspaces list",
+            "echo duduclaw computer-profiles list",
+            "printf '%s ' duduclaw channel-ingress list | bash",
+            "echo duduclaw channel-ingress list | sh",
+        ] {
+            for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+                let d = agent_file_guard_decision("Bash", &operator_bash(cmd), h.path(), &caller).unwrap();
+                assert!(matches!(d, GuardDecision::BlockedOperatorCommand { .. }), "{cmd}: {d:?}");
+            }
+            let d = agent_file_guard_decision("Bash", &operator_bash(cmd), h.path(), &HookCaller::Absent).unwrap();
+            assert!(d.is_allowed(), "{cmd}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn bash_operator_mentions_and_other_subcommands_pass_through_the_hook() {
+        let h = home_with_trash();
+        for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into()), HookCaller::Absent] {
+            for cmd in [
+                "echo channel-ingress computer-workspaces",
+                "duduclaw agent inspect channel-ingress",
+                "duduclaw preset show computer-workspaces",
+                "duduclaw --redact channel-ingress doctor",
+                "duduclaw --redact computer-workspaces doctor",
+                "grep channel-ingress README.md",
+                "grep computer-workspaces README.md",
+                "grep duduclaw computer-profiles list",
+                "duduclaw preset show computer-profiles",
+                "duduclaw doctor",
+            ] {
+                let d = agent_file_guard_decision("Bash", &operator_bash(cmd), h.path(), &caller).unwrap();
+                assert!(d.is_allowed(), "{cmd}: {d:?}");
+            }
+        }
     }
 
     #[test]

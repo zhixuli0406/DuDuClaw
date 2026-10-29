@@ -1,4 +1,4 @@
-//! `duduclaw ops channel-ingress` — operator view and resolution of the LINE
+//! `duduclaw channel-ingress` — operator view and resolution of the LINE
 //! durable inbox (hidden; review I-HIGH-4 (3)).
 //!
 //! - `list` / `show` answer directly (never payloads or reply tokens).
@@ -96,12 +96,12 @@ pub const SESSION_ENV_VARS: &[&str] = crate::ai_session_guard::AI_SESSION_ENV_VA
 /// shared matcher (`duduclaw_core::bash_operator_command_decision`).
 pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] =
     &[duduclaw_core::OperatorCommand {
-        name: "duduclaw ops channel-ingress",
-        path: &["ops", "channel-ingress"],
+        name: "duduclaw channel-ingress",
+        path: &["channel-ingress"],
     }];
 
 /// The Bash-lane decision for the agent-file-guard hook: employees and
-/// unverified callers may not run `duduclaw ops channel-ingress`. A speed
+/// unverified callers may not run `duduclaw channel-ingress`. A speed
 /// bump: the command is read the way bash reads it (continuations, quote
 /// concatenation, stuck redirects), but variables, aliases, scripts and
 /// renamed binaries still get past it; the dashboard approval is the gate.
@@ -302,14 +302,17 @@ mod tests {
     fn bash_lane_blocks_employees_and_unverified_callers_only() {
         use duduclaw_core::HookCaller;
         for cmd in [
-            "duduclaw ops channel-ingress list",
-            "/opt/homebrew/bin/duduclaw-pro --verbose ops channel-ingress rerun x --note n",
-            "cd /tmp && 'duduclaw' ops \"channel-ingress\" show x",
-            "echo hi; duduclaw.exe OPS channel-ingress resolve x --note n",
+            "duduclaw channel-ingress list",
+            "echo duduclaw channel-ingress list",
+            "printf '%s ' duduclaw channel-ingress list | bash",
+            "/opt/homebrew/bin/duduclaw-pro --verbose channel-ingress rerun x --note n",
+            "cd /tmp && 'duduclaw' \"channel-ingress\" show x",
+            "duduclaw-pro.exe channel-ingress list",
+            "echo hi; duduclaw.exe channel-ingress resolve x --note n",
             // Review L8: the spellings bash still runs as the same command.
-            "duduclaw ops \\\nchannel-ingress list",
-            "duduclaw ops chan''nel-ingress list",
-            "duduclaw ops channel-ingress>out list",
+            "duduclaw \\\nchannel-ingress list",
+            "duduclaw chan''nel-ingress list",
+            "duduclaw channel-ingress>out list",
         ] {
             for caller in [
                 HookCaller::Agent("alice".into()),
@@ -329,10 +332,13 @@ mod tests {
             assert!(bash_channel_ingress_decision(cmd, &HookCaller::Absent).is_none());
         }
         for cmd in [
-            "duduclaw ops doctor",
-            "echo ops channel-ingress",
+            "duduclaw doctor",
+            "echo channel-ingress",
+            "duduclaw agent inspect channel-ingress",
+            "duduclaw --redact channel-ingress doctor",
             "grep channel-ingress docs/guides/durable-line-ingress.md",
-            "duduclaw channel-ingress list",
+            "duduclaw computer-workspaces list",
+            "duduclaw channel-ingressx list",
         ] {
             assert!(
                 bash_channel_ingress_decision(cmd, &HookCaller::Agent("alice".into())).is_none(),

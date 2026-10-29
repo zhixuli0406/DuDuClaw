@@ -69,7 +69,7 @@ Bound requests do not get the older reminder cards with buttons; the request is 
 The gateway's dashboard-only list is the authority; today it contains:
 
 - knowledge reviews (held memory claims)
-- LINE inbox operator actions requested with `duduclaw ops channel-ingress`
+- LINE inbox operator actions requested with `duduclaw channel-ingress`
 - workflow activation
 - reconciling an operation whose result is unknown (`approvals.resolve_uncertain`, Admin)
 

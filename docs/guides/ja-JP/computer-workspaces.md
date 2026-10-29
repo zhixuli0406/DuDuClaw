@@ -99,12 +99,12 @@ workspace = true
 ## 運用者のコマンド
 
 ```bash
-duduclaw ops computer-workspaces list [--owner <社員>]
-duduclaw ops computer-workspaces fence <ワークスペース id> [--reason <理由>]
-duduclaw ops computer-workspaces revoke <ワークスペース id>
-duduclaw ops computer-workspaces regrant <ワークスペース id>
-duduclaw ops computer-workspaces renew <ワークスペース id>
-duduclaw ops computer-workspaces delete <ワークスペース id> --confirm
+duduclaw computer-workspaces list [--owner <社員>]
+duduclaw computer-workspaces fence <ワークスペース id> [--reason <理由>]
+duduclaw computer-workspaces revoke <ワークスペース id>
+duduclaw computer-workspaces regrant <ワークスペース id>
+duduclaw computer-workspaces renew <ワークスペース id>
+duduclaw computer-workspaces delete <ワークスペース id> --confirm
 ```
 
 | 操作 | 内容 | 承認 |
@@ -131,7 +131,7 @@ duduclaw ops computer-workspaces delete <ワークスペース id> --confirm
 **その他のルール：**
 
 - DuDuClaw のセッションや身元を示す環境変数（`DUDUCLAW_AGENT_ID`、`DUDUCLAW_TURN_ID` など）が 1 つでもあると、コマンドは実行を拒否します。
-- AI 社員の Bash で `duduclaw`／`duduclaw-pro` の `ops computer-workspaces` を実行すると、agent-file-guard フックが拒否します（未検証の呼び出し元も同様）。
+- AI 社員の Bash で `duduclaw`／`duduclaw-pro` の `computer-workspaces` を実行すると、agent-file-guard フックが拒否します（未検証の呼び出し元も同様）。 Bash レーンの既知の制限：ANSI-C `$'…'` 引用、コマンド置換による動的なコマンド組み立ては未対応で、引用符が不正でも一律には拒否しません。`bash`／`sh`／`zsh`／`dash` の `-c`、`eval`、`echo`／`printf` の各文字列引数は最大 2 階層の再解析上限を共有し、64 KiB を超える `echo`／`printf` 引数は再解析しません。`-xc` などの短いフラグの組み合わせ、`-c` の前後のオプション（`-o value` を含む）、`-c` の後の `--` は照合します。保守的な誤検知は許容します。これは減速帯であり、保護対象の状態変更の本当の関門はプロセス内の AI セッションチェックとダッシュボードの Admin 承認です。
 - ターミナルからの操作は監査に「本機指令列（身分未驗證）」（ローカルのコマンドライン、身元未確認）として記録されます。
 - ターミナルからの操作は、依頼・適用・拒否のたびにセキュリティ監査の記録を書きます（`security_audit.jsonl`、イベント `computer_workspace_cli_action`）。
 - 承認後にターミナルから適用する `fence`／`revoke`／`delete` は登録簿だけを変更します（ターミナルのプロセスはセッションを持ちません）。最後の確認をまだ通っていない操作はすぐ拒否され、すでに通った 1 件は最後まで実行され、セッションは次の操作か約 15 秒後のリース更新で終わります。

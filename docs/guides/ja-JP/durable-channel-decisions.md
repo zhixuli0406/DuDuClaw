@@ -69,7 +69,7 @@ Discord のボタンはプラットフォームが検証したチャンネル ID
 ゲートウェイ内蔵の「ダッシュボードのみ」リストが基準で、現在は次のとおりです。
 
 - ナレッジレビュー（保留された記憶の主張）
-- `duduclaw ops channel-ingress` で申請された LINE 受信箱の操作
+- `duduclaw channel-ingress` で申請された LINE 受信箱の操作
 - ワークフローの有効化
 - 結果が不明な操作の照合（`approvals.resolve_uncertain`、Admin のみ）
 

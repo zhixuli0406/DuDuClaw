@@ -151,7 +151,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 ## 指令列的操作者動作共用一道核准
 
-四個指令會從終端機改變狀態：`duduclaw ops channel-ingress`（LINE 收件匣）、`duduclaw responsibility`（持續任務）、`duduclaw memory forget-source apply`、`duduclaw ops computer-workspaces`。終端機證明不了是誰下的指令，所以這四個都只會在儀表板建立一筆請求，由目前仍是管理員（Admin）的帳號決定，指令之後只套用一次。v1.70.0 之後的版本起，四者共用一份實作（gateway crate 的 `approval/operator_cli_gate.rs`）和同一張種類表：只有在儀表板做的決定才算數，而且必須是同一筆請求、同一個狀態（LINE 批次除外）；請求等待期間對象狀態變了，等待中的卡片會撤回（`state_changed`）並另建一筆，不會原地改寫；核准用一個條件式更新消耗，搶輸的那次執行什麼都不做、也不另送請求；同一個動作與對象最多 3 筆不同內容的請求在等，同一種類最多 20 筆；每個對象每小時最多推播 2 次（忘記記憶的請求以 AI 員工計）。`approvals.decide` 用同一個檢查擋掉非管理員的決定。四個指令也共用同一份 AI 員工工作階段環境變數清單（CLI crate 的 `ai_session_guard.rs`）。限制不變：Bash 權限不受限的員工仍能直接改本機資料庫。
+四個指令會從終端機改變狀態：`duduclaw channel-ingress`（LINE 收件匣）、`duduclaw responsibility`（持續任務）、`duduclaw memory forget-source apply`、`duduclaw computer-workspaces`。終端機證明不了是誰下的指令，所以這四個都只會在儀表板建立一筆請求，由目前仍是管理員（Admin）的帳號決定，指令之後只套用一次。v1.70.0 之後的版本起，四者共用一份實作（gateway crate 的 `approval/operator_cli_gate.rs`）和同一張種類表：只有在儀表板做的決定才算數，而且必須是同一筆請求、同一個狀態（LINE 批次除外）；請求等待期間對象狀態變了，等待中的卡片會撤回（`state_changed`）並另建一筆，不會原地改寫；核准用一個條件式更新消耗，搶輸的那次執行什麼都不做、也不另送請求；同一個動作與對象最多 3 筆不同內容的請求在等，同一種類最多 20 筆；每個對象每小時最多推播 2 次（忘記記憶的請求以 AI 員工計）。`approvals.decide` 用同一個檢查擋掉非管理員的決定。四個指令也共用同一份 AI 員工工作階段環境變數清單（CLI crate 的 `ai_session_guard.rs`）。限制不變：Bash 權限不受限的員工仍能直接改本機資料庫。
 
 **升級須知。** 這道閘把綁定資訊存在請求內容的 `gate` 物件裡。v1.70.0 以前建立的請求沒有這個物件，新版本不會比對到、也不會計數。升級前送出的請求，就算已經核准、還沒套用，升級後也不會被套用：再執行一次指令會另建一筆新請求，要重新核准。舊的等待中卡片在過期前照常收到提醒推播（持續任務的請求本來就不提醒），但核准它不會有任何作用。
 

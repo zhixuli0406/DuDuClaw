@@ -1,7 +1,7 @@
 //! "Is this process running inside an AI employee's turn?" for operator-only
 //! commands: `memory forget-source`, `memory migrate-namespace` and
 //! `responsibility …` (present even when empty counts), and
-//! `ops channel-ingress` / `ops computer-workspaces` (same list, non-empty
+//! `channel-ingress` / `computer-workspaces` (same list, non-empty
 //! values count there). One list for all of them.
 //!
 //! The gateway sets one or more of these variables on every process it

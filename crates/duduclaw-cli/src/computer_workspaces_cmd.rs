@@ -1,4 +1,4 @@
-//! `duduclaw ops computer-workspaces` — operator management of durable
+//! `duduclaw computer-workspaces` — operator management of durable
 //! computer-use workspaces (P2-C design Appendix B D8): list / fence /
 //! revoke / regrant / renew / delete.
 //!
@@ -82,15 +82,15 @@ fn agent_session_refusal(get: impl Fn(&str) -> Option<String>) -> Option<String>
 
 /// The operator-only subcommands this module owns on the Bash lane, judged by
 /// the shared matcher (`duduclaw_core::bash_operator_command_decision`), the
-/// same one `duduclaw ops channel-ingress` uses.
+/// same one `duduclaw channel-ingress` uses.
 pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] =
     &[duduclaw_core::OperatorCommand {
-        name: "duduclaw ops computer-workspaces",
-        path: &["ops", "computer-workspaces"],
+        name: "duduclaw computer-workspaces",
+        path: &["computer-workspaces"],
     }];
 
 /// The Bash-lane decision for the agent-file-guard hook: employees and
-/// unverified callers may not run `duduclaw ops computer-workspaces`. A speed
+/// unverified callers may not run `duduclaw computer-workspaces`. A speed
 /// bump like the rest of the Bash lane: the command is read the way bash
 /// reads it, but a variable, an alias or a renamed binary evades it; the
 /// command's own environment check is the second line.
