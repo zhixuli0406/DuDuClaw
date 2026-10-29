@@ -1038,3 +1038,11 @@ main 合進本 session 的三個小修補後再 rebase 一次，衝突 4 檔，�
 - `lib.rs` 的 `agent pause/resume/freeze/unfreeze`：採用 #254 的 `agent_control_cmd`（AI 工作階段拒絕、共用加鎖寫入器、稽核）。本功能原本的 `agent_freeze.rs` 刪除；它保護的行為（凍結不覆蓋同時完成的暫停／封存）由共用寫入器提供，測試 `freeze_delayed_edit_preserves_completed_lifecycle_changes` 移到 `agent_control_cmd/agent_cli_guard_tests.rs`，改測真正的指令路徑。上文提到 `agent_freeze.rs` 的段落是 rebase 前的歷史紀錄。
 - `wiki_namespace_tests/part3.rs`：保留本功能的 `with_background_caller` 包裝，加上 #252 新增的 `op` 參數。
 - `CHANGELOG.md`：兩邊 `[Unreleased] Security` 條目都保留。
+
+第二次 rebase 的獨立審查（Claude subagent，唯讀）判定可出貨。採納並修正：`evolution_toggle` 取得 admission 之後再重查一次組織權限（admission 可能在生命週期屏障後等最多 30 秒，期間的 `reports_to`／org.toml 撤權要生效）；CHANGELOG 的 Python API 說明改為 `DUDUCLAW_BIN` 必須是可信任的絕對路徑，且在 AI 工作階段中會被拒。
+
+列後續：
+- admission 身分取自 task-local 而非 actor；目前不可達，但可改成直接以 `actor.agent()` 呼叫 `admit_blocking`。
+- 沒有針對 `evolution_toggle` 寫入路徑 admission 的測試（呼叫者在前置閘門與寫入之間被暫停 → 拒絕且檔案不變；Operator 照常成功）。
+- `freeze_delayed_edit_preserves_completed_lifecycle_changes` 在目前程式下只能防止有人在掛鉤點前重新加入鎖外讀取，屬弱回歸保護。
+- `expert_admin::tests::remove_pack_waits_for_inflight_admission` 在全量負載下偶發 `admission_wait_timeout`，單獨重跑 3/3 通過；審查者從程式碼解釋不了 30 秒的等待逾時，原因未查明。

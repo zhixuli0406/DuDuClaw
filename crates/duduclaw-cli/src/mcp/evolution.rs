@@ -226,7 +226,15 @@ pub(super) fn write_evolution_toggle(
             Ok(())
         },
         || {
-            admission = admit_background_identity_blocking(home_dir, "", "evolution_toggle")?;
+            // MCP dispatch sets the task-local caller, which wins; a direct
+            // call falls back to this actor. An operator has no employee
+            // identity to admit (same mapping as `with_background_caller`).
+            if let Some(agent) = actor.agent() {
+                admission = admit_background_identity_blocking(home_dir, agent, "evolution_toggle")?;
+                // Admission can wait behind a lifecycle barrier; re-read org
+                // authority after that wait so a revocation in between holds.
+                check_evolution_subject_locked(home_dir, actor, agent_id)?;
+            }
             Ok(())
         },
         false,
