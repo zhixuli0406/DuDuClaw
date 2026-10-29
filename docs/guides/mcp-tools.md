@@ -272,12 +272,20 @@ Leave `source` alone unless you already know where the skill lives.
 - `bank` — only what this deployment learned on its own. `hub` is not accepted
   with this source.
 
-### `evolution_toggle` — the stagnation sub-fields
+### `evolution_toggle` — fields and permissions
 
-Beyond the standard flags, `field` accepts `stagnation_enabled` (bool),
-`stagnation_window_seconds` (60–604800), `stagnation_trigger_threshold`
-(1–1000) and `stagnation_action` (`log_only` | `suppress`). See
+`field` accepts `gvu_enabled` (bool), `max_silence_hours`,
+`skill_token_budget` and `max_active_skills` (numbers). The old
+`stagnation_*` fields are no longer writable. See
 [evolution-switches.md](evolution-switches.md).
+
+An AI employee may change its own settings or those of its subordinates,
+using the same identity check and organization gate as `agent_update`. The
+`open` delegation policy permits cross-team changes; human operators remain
+unrestricted. Callers rejected by either check are refused before reading
+the target configuration. Self-edits remain allowed because these fields
+do not grant tool, data or organization permissions and do not bypass the
+evolution master switch.
 
 ### `execute_program` — where the script runs
 

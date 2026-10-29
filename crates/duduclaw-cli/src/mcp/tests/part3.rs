@@ -2,6 +2,265 @@ use super::*;
 use crate::mcp::caller_shims::handle_agent_update;
 
 #[tokio::test]
+async fn evolution_toggle_denies_unrelated_peers_without_writing_or_probing() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    for (caller, target) in [("sales-lead", "mkt-rep"), ("sales-rep", "sales-rep2")] {
+        let path = home.join("agents").join(target).join("agent.toml");
+        let before = fs::read(&path).unwrap();
+        let params = serde_json::json!({ "agent_id": target, "field": "gvu_enabled", "value": true });
+        let out = handle_evolution_toggle(&params, home, RecordActor::Agent(caller)).await;
+        assert_eq!(out["isError"], true, "{out}");
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Error: ") && text.contains("不在你的團隊之內"),
+            "{out}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // The same denial precedes parsing or even finding the target file.
+        fs::write(&path, "not valid TOML").unwrap();
+        assert_eq!(
+            handle_evolution_toggle(&params, home, RecordActor::Agent(caller)).await,
+            out
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            handle_evolution_toggle(&params, home, RecordActor::Agent(caller)).await,
+            out
+        );
+    }
+}
+
+#[tokio::test]
+async fn evolution_toggle_rechecks_revoked_authority_at_locked_write() {
+    for authoritative_store in [false, true] {
+        let tmp = delegation_home();
+        let home = tmp.path();
+        if authoritative_store {
+            duduclaw_core::org_store::seed_if_absent(home).unwrap();
+        }
+        let path = home.join("agents/sales-rep/agent.toml");
+        let before = fs::read(&path).unwrap();
+        let actor = RecordActor::Agent("ceo");
+        check_org_subject_allowed(home, actor.id(), "sales-rep", "調整 AI 員工演化設定")
+            .await
+            .expect("the front gate must pass before revocation");
+
+        // Revoke an intermediate reporting link after the front gate. In
+        // the store case the mirror deliberately still grants the old link.
+        if authoritative_store {
+            duduclaw_core::org_store::upsert(
+                home,
+                "sales-lead",
+                duduclaw_core::org_store::OrgEntry::new("", "業務"),
+            )
+            .unwrap();
+        } else {
+            tamper_agent_toml(home, "sales-lead", "", "業務");
+        }
+
+        let err = super::super::evolution::write_evolution_toggle(
+            home,
+            "sales-rep",
+            actor,
+            "gvu_enabled",
+            toml::Value::Boolean(true),
+        )
+        .expect_err("the locked write must re-read the revoked reporting link");
+        assert!(err.contains("不在你的團隊之內"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!home.join("agent_file_history/sales-rep/agent_toml/index.jsonl").exists());
+        let audit = fs::read_to_string(home.join("security_audit.jsonl")).unwrap_or_default();
+        assert!(!audit.contains("agent_file_changed"), "{audit}");
+    }
+}
+
+#[tokio::test]
+async fn evolution_toggle_allows_subordinates_and_operators() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    for (actor, target) in [
+        (RecordActor::Agent("sales-lead"), "sales-rep"),
+        (RecordActor::Agent("ceo"), "sales-rep2"),
+        (RecordActor::Operator("dashboard"), "mkt-rep"),
+        (RecordActor::Operator("external-admin"), "sales-lead"),
+    ] {
+        let params = serde_json::json!({ "agent_id": target, "field": "gvu_enabled", "value": true });
+        let out = handle_evolution_toggle(&params, home, actor).await;
+        assert_ne!(out["isError"], true, "{actor:?}: {out}");
+        let cfg: toml::Table = fs::read_to_string(home.join("agents").join(target).join("agent.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(cfg["evolution"]["gvu_enabled"].as_bool(), Some(true));
+
+        let index = fs::read_to_string(
+            home.join("agent_file_history").join(target).join("agent_toml/index.jsonl"),
+        )
+        .unwrap();
+        let version: Value = serde_json::from_str(index.lines().last().unwrap()).unwrap();
+        assert_eq!(version["source"], "mcp");
+        assert_eq!(version["user_id"], actor.id());
+        let audit = fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+        let event = audit
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .rev()
+            .find(|event| event["event_type"] == "agent_file_changed" && event["agent_id"] == target)
+            .expect("successful toggle must be audited");
+        assert_eq!(event["details"]["source"], "mcp");
+        assert_eq!(event["details"]["user_id"], actor.id());
+    }
+
+    // The documented Open-policy escape hatch still permits known employees.
+    fs::write(home.join("config.toml"), "[delegation]\npolicy = 'open'\n").unwrap();
+    let out = handle_evolution_toggle(
+        &serde_json::json!({ "agent_id": "mkt-rep", "field": "gvu_enabled", "value": false }),
+        home,
+        RecordActor::Agent("sales-rep"),
+    )
+    .await;
+    assert_ne!(out["isError"], true, "{out}");
+    let cfg: toml::Table = fs::read_to_string(home.join("agents/mkt-rep/agent.toml"))
+        .unwrap().parse().unwrap();
+    assert_eq!(cfg["evolution"]["gvu_enabled"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn evolution_toggle_allows_non_authority_self_settings() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    for (field, value) in [
+        ("gvu_enabled", serde_json::json!(true)),
+        ("max_silence_hours", serde_json::json!(24)),
+        ("skill_token_budget", serde_json::json!(5000)),
+        ("max_active_skills", serde_json::json!(10)),
+    ] {
+        let params = serde_json::json!({ "agent_id": "sales-rep", "field": field, "value": value });
+        let out = handle_evolution_toggle(&params, home, RecordActor::Agent("sales-rep")).await;
+        assert_ne!(out["isError"], true, "{field}: {out}");
+        let cfg: toml::Table = fs::read_to_string(home.join("agents/sales-rep/agent.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(serde_json::to_value(&cfg["evolution"][field]).unwrap(), value);
+    }
+}
+
+#[tokio::test]
+async fn evolution_toggle_rejects_invalid_agent_ids() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    let path = home.join("agents/sales-rep/agent.toml");
+    let before = fs::read(&path).unwrap();
+    for id in ["", "../sales-rep", "SALES", "員工", &"a".repeat(65)] {
+        let out = handle_evolution_toggle(
+            &serde_json::json!({ "agent_id": id, "field": "gvu_enabled", "value": true }),
+            home,
+            RecordActor::Operator("dashboard"),
+        )
+        .await;
+        assert_eq!(out["isError"], true, "{id}: {out}");
+        assert!(out["content"][0]["text"].as_str().unwrap().starts_with("Error: "), "{out}");
+    }
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn evolution_toggle_denies_empty_and_reserved_callers_even_with_open_policy() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    fs::write(home.join("config.toml"), "[delegation]\npolicy = 'open'\n").unwrap();
+    let path = home.join("agents/sales-rep/agent.toml");
+    let before = fs::read(&path).unwrap();
+    for caller in [
+        "", "dashboard", "heartbeat-scheduler", "workflow",
+    ] {
+        let out = handle_evolution_toggle(
+            &serde_json::json!({ "agent_id": "sales-rep", "field": "gvu_enabled", "value": true }),
+            home,
+            RecordActor::Agent(caller),
+        )
+        .await;
+        assert_eq!(out["isError"], true, "{caller}: {out}");
+        assert!(out["content"][0]["text"].as_str().unwrap().starts_with("Error: "), "{out}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn evolution_toggle_denies_unknown_callers_under_default_policy() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    let path = home.join("agents/sales-rep/agent.toml");
+    let before = fs::read(&path).unwrap();
+    let params = serde_json::json!({ "agent_id": "sales-rep", "field": "gvu_enabled", "value": true });
+    for caller in ["unknown", "__untrusted__", "gateway-internal"] {
+        let out = handle_evolution_toggle(&params, home, RecordActor::Agent(caller)).await;
+        assert_eq!(out["isError"], true, "{caller}: {out}");
+        assert!(out["content"][0]["text"].as_str().unwrap().contains("不在你的團隊之內"), "{out}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn evolution_toggle_unreadable_config_keeps_default_subtree_gate() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    let config = home.join("config.toml");
+    let peer_path = home.join("agents/mkt-rep/agent.toml");
+    let before = fs::read(&peer_path).unwrap();
+    let subordinate_path = home.join("agents/sales-rep/agent.toml");
+    let subordinate_before = fs::read(&subordinate_path).unwrap();
+    // Unreadable/invalid config keeps the default Department authorization:
+    // outsiders are denied there; managers and operators reach the writer,
+    // which fails closed when it cannot determine the Product profile.
+    for malformed in [false, true] {
+        if malformed {
+            fs::write(&config, "not valid TOML").unwrap();
+        } else {
+            fs::create_dir(&config).unwrap();
+        }
+        let out = handle_evolution_toggle(
+            &serde_json::json!({ "agent_id": "mkt-rep", "field": "gvu_enabled", "value": true }),
+            home,
+            RecordActor::Agent("sales-lead"),
+        )
+        .await;
+        assert_eq!(out["isError"], true, "{out}");
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Error: ") && text.contains("不在你的團隊之內"), "{out}");
+        assert_eq!(fs::read(&peer_path).unwrap(), before);
+
+        let expected_error = if malformed {
+            "Error writing agent.toml: Invalid config.toml; Product profile cannot be determined"
+        } else {
+            "Error writing agent.toml: Unable to read Product profile configuration"
+        };
+        for actor in [
+            RecordActor::Agent("sales-lead"),
+            RecordActor::Operator("dashboard"),
+        ] {
+            let out = handle_evolution_toggle(
+                &serde_json::json!({ "agent_id": "sales-rep", "field": "gvu_enabled", "value": true }),
+                home,
+                actor,
+            )
+            .await;
+            assert_eq!(out["isError"], true, "{actor:?}: {out}");
+            assert_eq!(out["content"][0]["text"], expected_error, "{actor:?}: {out}");
+            assert_eq!(fs::read(&subordinate_path).unwrap(), subordinate_before);
+        }
+        if malformed {
+            fs::remove_file(&config).unwrap();
+        } else {
+            fs::remove_dir(&config).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn org_subject_gate_protects_other_teams() {
     let tmp = delegation_home();
     let home = tmp.path();

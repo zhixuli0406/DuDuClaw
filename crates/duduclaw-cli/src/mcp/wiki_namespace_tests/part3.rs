@@ -289,6 +289,7 @@ async fn mcp_agent_toml_writes_are_format_preserving_and_versioned() {
     let r = super::super::evolution::handle_evolution_toggle(
         &serde_json::json!({ "agent_id": "keeper", "field": "gvu_enabled", "value": "false" }),
         home,
+        op,
     )
     .await;
     assert!(r.get("isError").and_then(|v| v.as_bool()) != Some(true), "{r}");
