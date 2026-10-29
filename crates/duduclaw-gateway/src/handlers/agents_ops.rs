@@ -113,14 +113,14 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_agents_pause(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_agents_pause(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params
             .get("agent_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         info!(agent_id, "agents.pause requested");
 
-        if let Err(e) = self.update_agent_status(agent_id, "paused").await {
+        if let Err(e) = self.update_agent_status_as(agent_id, "paused", "agents.pause", ctx).await {
             return WsFrame::error_response("", &format!("Failed to pause agent: {e}"));
         }
 
@@ -130,14 +130,14 @@ impl MethodHandler {
         )
     }
 
-    pub(crate) async fn handle_agents_resume(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_agents_resume(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params
             .get("agent_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         info!(agent_id, "agents.resume requested");
 
-        if let Err(e) = self.update_agent_status(agent_id, "active").await {
+        if let Err(e) = self.update_agent_status_as(agent_id, "active", "agents.resume", ctx).await {
             return WsFrame::error_response("", &format!("Failed to resume agent: {e}"));
         }
 
@@ -199,10 +199,26 @@ impl MethodHandler {
         crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, mutate).await
     }
 
-    /// Convenience: update only the `status` field in an agent's `agent.toml`.
-    pub(crate) async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<(), String> {
+    /// Update status with the caller's role and binding re-checked inside the file lock.
+    pub(crate) async fn update_agent_status_as(
+        &self,
+        agent_id: &str,
+        status: &str,
+        source: &'static str,
+        ctx: &UserContext,
+    ) -> Result<(), String> {
         let status = status.to_string();
-        self.update_agent_toml(agent_id, move |table| {
+        let edit = crate::channel_reply::AgentTomlEdit {
+            source,
+            user_id: &ctx.user_id,
+            guard: || {
+                let live = crate::agent_files::flow::require_live_agent_access(
+                    &self.home_dir, ctx, agent_id, AccessLevel::Operator,
+                )?;
+                acl::require_role(&live, UserRole::Manager)
+            },
+        };
+        crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, move |table| {
             let agent_section = table
                 .get_mut("agent")
                 .and_then(|v| v.as_table_mut())

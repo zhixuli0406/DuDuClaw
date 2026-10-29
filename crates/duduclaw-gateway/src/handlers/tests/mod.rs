@@ -80,6 +80,7 @@ mod knowledge_quarantine_decide_tests;
 mod v168_config_rpc_tests;
 mod agent_channels_rpc_tests;
 mod agent_files_rpc_tests;
+mod agents_pause_binding_tests;
 mod agent_files_skill_tests;
 mod responsibilities_rpc_tests;
 

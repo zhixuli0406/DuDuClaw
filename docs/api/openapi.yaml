@@ -266,6 +266,7 @@ paths:
     post:
       tags: [agents]
       summary: Pause an agent
+      description: Requires Manager role and a direct Operator or Owner binding, re-read from users.db before writing. Admins retain full access.
       requestBody:
         content:
           application/json:
@@ -287,6 +288,7 @@ paths:
     post:
       tags: [agents]
       summary: Resume a paused agent
+      description: Requires Manager role and a direct Operator or Owner binding, re-read from users.db before writing. Admins retain full access.
       requestBody:
         content:
           application/json:

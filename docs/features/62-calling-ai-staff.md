@@ -33,10 +33,13 @@ Rights that come through a report stop at Operator, never Owner:
 |---|---|---|---|---|---|---|---|
 | `@` chat, pick the employee as the WebChat partner | ✅ | ✅ | ✅ | ✅ | ✅ | `@` only, not as a picked partner (the default employee is who answers when nobody is picked) | default and public employees only |
 | Hand over work (dashboard task create, goal create, task reassign) | ✅ | ✅ | ✅ | ❌ | ✅ when the report's binding is Owner or Operator | ❌ | ❌ |
+| Pause / resume an employee in the dashboard | ✅ | Manager role also required | Manager role also required | ❌ | ❌; direct Operator or Owner binding required | ❌ | ❌ |
 | Task board listing for the employee | ✅ | ✅ | ✅ | ✅ | ✅ when work may be handed over; cards only (title, status), no content | — | — |
 | Memory, conversation history, employee settings and persona files | ✅ | by binding level | by binding level | by binding level | ❌ | — | — |
 
 When the report's binding is Viewer, the manager may only chat with that employee. The **AI staff** page and the employee settings pages still list direct bindings only.
+
+Pausing or resuming an employee requires both the Manager role and a direct Operator or Owner binding; Admins retain full access. The gateway re-reads the account role and binding from `users.db` before writing. Missing or unknown employee ids and unreadable permissions are refused.
 
 A manager may update, reassign, cancel or remove a task they handed to a team employee from the dashboard (they created it) while they may still assign to that employee; tasks created by others still need direct Operator. A task shown as a card only carries no link to its source conversation (`channel` and `channel_link` are null).
 

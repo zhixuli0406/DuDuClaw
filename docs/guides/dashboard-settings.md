@@ -152,6 +152,10 @@ Only people whose role is Manager or Admin see it (sidebar group "Organization")
 
 The data comes from the RPC `users.my_team`, computed with the same rules every call and assignment uses, so everything listed can be reached. It is refused in the Personal edition and for the Employee role.
 
+## AI staff → Pause / Resume
+
+Pausing or resuming an employee (`agents.pause` / `agents.resume`, parameter `agent_id`) requires the Manager role and a direct Operator or Owner binding to that employee. Admins retain full access. The gateway re-reads the account role and binding from `users.db` before writing; missing or unknown employee ids and unreadable permissions are refused. A Manager's access through reports does not grant this control.
+
 ## Employee page → Data sources (v1.76.0)
 
 Visible to everyone bound to the employee (Viewer and up); adding and removing files needs the employee's Owner binding or Admin, re-read from the account database on every call, and on top of that the editor or owner role on the employee's own collection.
