@@ -1,6 +1,6 @@
 # Outgoing data guard
 
-Unreleased. The guard tracks private reads during an AI employee's turn and checks later outgoing MCP calls before execution, outside the model.
+Available from v1.77.0. The guard tracks private reads during an AI employee's turn and checks later outgoing MCP calls before execution, outside the model.
 
 ## Choose a mode
 

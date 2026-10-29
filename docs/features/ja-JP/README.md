@@ -72,7 +72,7 @@
 | 65 | [思考はどこから来るか](65-thinking-sources.md) | 思考を報告する runtime（Claude CLI、Codex、OpenAI 互換 API、Anthropic Direct API）、それぞれの表示内容、リクエストが変わる条件 |
 | 66 | [メッセージングアプリでの思考表示](66-thinking-in-messaging-apps.md) | Telegram、Discord、Slack、Teams、LINE などでのタイマーと伏せ字化した要約。`[thinking] channel_audience`／`channel_group_display` |
 | 67 | [チャットからタスクを任せる](67-assigning-tasks.md) | `/交辦 @スタッフ 内容`（`/assign`）で送信者の代わりに目標タスクを作成。任せる権限のあるスタッフのみ。進捗は元の会話へ、`/交辦 狀態`、「目標」ページの「自分が任せた」、dashboard の交辦任務ページ（`/assign`：スキルを任せる／完全なフォーム、ファイル添付） |
-| 69 | [データ送信の保護](69-egress-guard.md) | 未リリース：ターン単位の MCP 非公開データ読み取り記録、送信承認、常設権限の制限 |
+| 69 | [データ送信の保護](69-egress-guard.md) | v1.77.0：ターン単位の MCP 非公開データ読み取り記録、送信承認、常設権限の制限 |
 
 ---
 
