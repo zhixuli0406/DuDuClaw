@@ -114,6 +114,7 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 pub(crate) const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("tasks_create", "cost_cap_cents", "integer"),
     ("tasks_update", "cost_cap_cents", "integer"),
+    ("tasks_create", "timeout_secs", "integer"),
     ("knowledge_search", "collections", "array"),
     ("knowledge_search", "limit", "integer"),
     ("knowledge_get_passage", "chunk_id", "integer"),
@@ -179,6 +180,10 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
         }));
     }
     if tool.name == "tasks_create" {
+        properties.insert("timeout_secs".into(), serde_json::json!({
+            "type": "integer", "minimum": 30, "maximum": 3600,
+            "description": tool.params.iter().find(|p| p.name == "timeout_secs").map(|p| p.description).unwrap_or("")
+        }));
         properties.insert("kind".into(),serde_json::json!({"type":"string","enum":["task","goal","discovery"],"default":"task"}));
         properties.insert("discovery".into(),serde_json::json!({
             "type":"object","additionalProperties":false,

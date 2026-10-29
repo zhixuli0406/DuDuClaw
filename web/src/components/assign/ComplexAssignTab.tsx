@@ -81,6 +81,8 @@ export function ComplexAssignTab({
   const [priority, setPriority] = useState('medium');
   const [durationHours, setDurationHours] = useState('');
   const [costCap, setCostCap] = useState('');
+  // Per-goal run limit, in minutes on the form (1-60), sent as seconds.
+  const [runLimitMinutes, setRunLimitMinutes] = useState('');
   const [riskBoundary, setRiskBoundary] = useState('');
   // A per-goal risk boundary replaces the deployment baseline: Admin only
   // (the gateway refuses it from anyone else).
@@ -155,6 +157,14 @@ export function ComplexAssignTab({
       toast.error(intl.formatMessage({ id: 'goals.create.costCapInvalid' }));
       return;
     }
+    const parsedRunLimit = runLimitMinutes.trim() ? Number(runLimitMinutes) : undefined;
+    if (
+      parsedRunLimit !== undefined &&
+      (!Number.isSafeInteger(parsedRunLimit) || parsedRunLimit < 1 || parsedRunLimit > 60)
+    ) {
+      toast.error(intl.formatMessage({ id: 'goals.create.runLimitInvalid' }));
+      return;
+    }
     let schedule;
     try {
       schedule = toScheduleInput(when);
@@ -169,6 +179,7 @@ export function ComplexAssignTab({
       priority: priority as 'low' | 'medium' | 'high' | 'urgent',
       duration_hours: parsedDuration,
       cost_cap_cents: parsedCap,
+      timeout_secs: parsedRunLimit !== undefined ? parsedRunLimit * 60 : undefined,
       risk_boundary: (isAdmin && riskBoundary.trim()) || undefined,
       require_beliefs: requireBeliefs || undefined,
       plan_first: planFirst || undefined,
@@ -403,6 +414,25 @@ export function ComplexAssignTab({
                     />
                     <p className="text-xs text-muted-foreground">
                       {intl.formatMessage({ id: 'goals.create.costCapHint' })}
+                    </p>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label htmlFor="assign-run-limit" className="text-xs font-medium text-muted-foreground">
+                      {intl.formatMessage({ id: 'goals.create.runLimit' })}
+                    </label>
+                    <Input
+                      id="assign-run-limit"
+                      type="number"
+                      min={1}
+                      max={60}
+                      step={1}
+                      value={runLimitMinutes}
+                      placeholder={intl.formatMessage({ id: 'goals.create.runLimitPlaceholder' })}
+                      onChange={(e) => setRunLimitMinutes(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {intl.formatMessage({ id: isAdmin ? 'goals.create.runLimitHint' : 'goals.create.runLimitHintNonAdmin' })}
                     </p>
                   </div>
 

@@ -999,6 +999,8 @@ export interface TaskInfo {
   goal_mode?: boolean;
   cost_cap_cents?: number | null;
   effective_cost_cap_cents?: number | null;
+  /** This goal's own run limit in seconds; null ⇒ the employee's own. */
+  timeout_secs?: number | null;
   measured_spent_cents?: number | null;
   /** Acceptance contract the judge verifies against. */
   acceptance_criteria?: string | null;
@@ -8058,6 +8060,9 @@ export const api = {
        *  wall_clock_hours` default applies. */
       duration_hours?: number;
       cost_cap_cents?: number;
+      /** Run limit in seconds (30-3600) for each run of this goal's rounds,
+       *  replacing the employee's own limit. Above that limit: Admin only. */
+      timeout_secs?: number;
       /** Goal assignment form v2: optional per-goal risk boundary text
        *  (≤2000 chars). Empty / undefined ⇒ the deployment baseline
        *  boundary (config `[goal_defaults] baseline_boundary`) applies. */
@@ -8101,6 +8106,7 @@ export const api = {
       priority?: 'low' | 'medium' | 'high' | 'urgent';
       duration_hours?: number;
       cost_cap_cents?: number;
+      timeout_secs?: number;
       risk_boundary?: string;
       require_beliefs?: boolean;
       plan_first?: boolean;

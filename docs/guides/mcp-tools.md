@@ -203,6 +203,10 @@ build the model's tool list from name, description and input schema only.
 
 `tasks_update` accepts the same field for a goal. Employees may add or narrow a ceiling, but cannot raise or remove an effective ceiling; raising is an operator action. Saving a new cap does not itself resume a paused goal. The dashboard's **Raise cap and retry** saves it, then uses the existing retry decision. At or above the measured task-tree cap, the goal pauses as `budget_exhausted`; unreadable cost skips dispatch. See [goal loop](../features/34-goal-loop.md).
 
+### `tasks_create` — per-goal run limit
+
+`tasks_create` with `kind="goal"` (not scheduled) accepts `timeout_secs`, an integer from 30 to 3600: the limit for each CLI run / API request of that goal's rounds, replacing the assignee's own run limit. Over MCP it can only be shorter than or equal to that limit; giving a goal more time is an Admin decision on the dashboard. Claude employees ignore it (fixed 30-minute limit). `tasks_update` refuses the field. Example: `{"kind":"goal","title":"Reconcile the ledger","assigned_to":"anna","timeout_secs":180}`.
+
 ### `codrive_run` — the three-rung execution ladder
 
 Each step is dispatched through three rungs, tried in this order; prefer the

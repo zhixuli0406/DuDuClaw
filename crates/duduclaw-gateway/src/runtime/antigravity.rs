@@ -764,9 +764,7 @@ impl AgentRuntime for AntigravityRuntime {
         for a in &sb_args {
             cmd.arg(a);
         }
-        let timeout_secs = context.agent_dir.as_deref()
-            .map(crate::runtime_config::agent_timeout_secs)
-            .unwrap_or(crate::runtime_config::DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         // Let agy self-bound first; the wrapper allows 30s for orderly exit.
         let wrapper_timeout_secs = timeout_secs + 30;
         cmd.arg("--print-timeout").arg(format!("{timeout_secs}s"));

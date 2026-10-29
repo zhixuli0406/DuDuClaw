@@ -532,6 +532,17 @@ export function GoalDiminishingBadge({ task }: { task: TaskInfo }) {
   );
 }
 
+/** The goal's own run limit, when it was given one at assignment. */
+export function GoalRunLimitBadge({ task }: { task: TaskInfo }) {
+  const intl = useIntl();
+  if (!task.goal_mode || !task.timeout_secs) return null;
+  return (
+    <Badge variant="secondary" className="text-muted-foreground">
+      {intl.formatMessage({ id: 'goals.detail.runLimit' }, { minutes: Math.round(task.timeout_secs / 60) })}
+    </Badge>
+  );
+}
+
 /** Goal assignment form v2's per-goal wall-clock deadline badge — was part of
  *  the old dialog's status strip, now next to `GoalRoundBadge`. */
 export function GoalDeadlineBadge({ task }: { task: TaskInfo }) {

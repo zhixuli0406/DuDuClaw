@@ -1466,9 +1466,7 @@ async fn execute_codex_command(
     cmd: &mut tokio::process::Command,
     context: &RuntimeContext,
 ) -> Result<RuntimeResponse, String> {
-    let timeout_secs = context.agent_dir.as_deref()
-        .map(crate::runtime_config::agent_timeout_secs)
-        .unwrap_or(crate::runtime_config::DEFAULT_TIMEOUT_SECS);
+    let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
     let output = collect_codex_output(
         cmd, std::time::Duration::from_secs(timeout_secs),
     ).await?;

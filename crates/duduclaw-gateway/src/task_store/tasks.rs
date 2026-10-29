@@ -677,6 +677,7 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         on_behalf_of: row.get(47)?,
         created_via: row.get(48)?,
         cost_cap_cents: row.get(49)?,
+        timeout_secs: row.get(50)?,
     })
 }
 
@@ -695,6 +696,10 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
     }
     if row.cost_cap_cents.is_some() && !row.goal_mode {
         return Err("cost_cap_cents is only supported for goals".into());
+    }
+    crate::goal_create_core::check_timeout_secs(row.timeout_secs)?;
+    if row.timeout_secs.is_some() && !row.goal_mode {
+        return Err("timeout_secs is only supported for goals".into());
     }
     if row.kind == TaskKind::Discovery
         && (row.goal_mode || row.discovery_run_id.is_none() || row.discovery_spec_json.is_none())
@@ -748,11 +753,11 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
              revision_round, diminishing, agent_seconds, source_discord_guild_id,
              deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
              plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision,
-             on_behalf_of, created_via, cost_cap_cents)
+             on_behalf_of, created_via, cost_cap_cents, timeout_secs)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                  ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46,
-                 ?47, ?48, ?49)",
+                 ?47, ?48, ?49, ?50)",
         params![
             row.id,
             row.title,
@@ -803,6 +808,7 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.on_behalf_of,
             row.created_via,
             row.cost_cap_cents,
+            row.timeout_secs,
         ],
     )
     .map_err(|e| format!("insert task: {e}"))?;

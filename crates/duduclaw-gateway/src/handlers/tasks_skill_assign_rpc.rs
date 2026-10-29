@@ -259,6 +259,7 @@ impl MethodHandler {
             outcome: None,
             duration_hours: None,
             cost_cap_cents: None,
+            timeout_secs: None,
             risk_boundary: None,
             require_beliefs: false,
             plan_first: false,

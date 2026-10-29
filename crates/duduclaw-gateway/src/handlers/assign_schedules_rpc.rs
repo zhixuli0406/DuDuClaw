@@ -73,6 +73,7 @@ fn goal_payload(params: &Value) -> Result<AssignPayload, String> {
         outcome,
         duration_hours,
         cost_cap_cents: crate::goal_create_core::parse_cost_cap_cents(params)?,
+        timeout_secs: crate::goal_create_core::parse_timeout_secs(params)?,
         risk_boundary: s("risk_boundary").filter(|b| !b.trim().is_empty()),
         require_beliefs: params
             .get("require_beliefs")

@@ -102,6 +102,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 required: false,
             },
             ParamDef {
+                name: "timeout_secs",
+                description: "With kind='goal' (unscheduled): run limit in seconds (30-3600) for each CLI run / API request of this goal's rounds, replacing the assignee's own run limit. Omit to use that limit. Only a shorter limit is accepted here; giving a goal more time is an admin decision on the dashboard. Not applied to Claude employees (fixed 30-minute limit). Cannot be changed after creation.",
+                required: false,
+            },
+            ParamDef {
                 name: "duration_hours",
                 description: "With kind='goal': per-goal wall clock in hours (1-720). Omit for the deployment default.",
                 required: false,
