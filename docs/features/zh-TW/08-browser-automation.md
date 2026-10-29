@@ -221,7 +221,7 @@ L1 就答得出來的問題卻動用 L5，是最昂貴的誤用，而且要靠 a
 
 電腦操作的容器在 session 結束時就刪除。要留下員工整理的內容，可以在 session 掛上一個**電腦操作工作區**：`computer_session_start` 帶 `workspace = "new"` 或既有的 `ws-…` id。只有 gateway 會寫入（`computer_workspace_write`，寫進員工這次 session 掛上的工作區）；`computer_workspace_list` 與 `computer_workspace_read` 不需要開著 session。容器裡的檔案在 `/workspace/files`，唯讀，放在只有 root 能進的 tmpfs 底下，瀏覽器的帳號進不去。預設關閉：要打開 `config.toml [computer_use.workspaces] enabled = true`，以及該員工的 `[capabilities.computer_use_config] workspace = true`。只支援 macOS 與 Linux。
 
-配額、保留期限、同時只能一個 session 的租約、操作者指令（`duduclaw ops computer-workspaces`，指令列上所有會改變狀態的動作都要先由管理員在儀表板核准；緊急處置用儀表板或總開關），以及已知限制（包括擁有者隔離只對三個工作區工具成立，對有 `Read` 或 Bash 的員工不成立），見[電腦操作工作區指南](../../guides/zh-TW/computer-workspaces.md)。
+配額、保留期限、同時只能一個 session 的租約、操作者指令（`duduclaw computer-workspaces`，指令列上所有會改變狀態的動作都要先由管理員在儀表板核准；緊急處置用儀表板或總開關），以及已知限制（包括擁有者隔離只對三個工作區工具成立，對有 `Read` 或 Bash 的員工不成立），見[電腦操作工作區指南](../../guides/zh-TW/computer-workspaces.md)。
 
 ## 閒置保留、即時畫面與接手
 

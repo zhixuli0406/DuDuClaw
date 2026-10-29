@@ -122,14 +122,16 @@ reply token の有効期限はイベントが届いた時点から数えられ�
 ### コマンドライン
 
 ```bash
-duduclaw ops channel-ingress list
-duduclaw ops channel-ingress show <ingress_id>
-duduclaw ops channel-ingress resolve <ingress_id> --note "理由" [--retry] [--provider-receipt <番号>]
-duduclaw ops channel-ingress rerun <ingress_id> --note "理由" --confirm-duplicate-risk [--provider-receipt <番号>]
-duduclaw ops channel-ingress batch --action close|retry|rerun --status <状態> [--reason <理由コード>] --note "理由" [--confirm-duplicate-risk] [--limit 200]
+duduclaw channel-ingress list
+duduclaw channel-ingress show <ingress_id>
+duduclaw channel-ingress resolve <ingress_id> --note "理由" [--retry] [--provider-receipt <番号>]
+duduclaw channel-ingress rerun <ingress_id> --note "理由" --confirm-duplicate-risk [--provider-receipt <番号>]
+duduclaw channel-ingress batch --action close|retry|rerun --status <状態> [--reason <理由コード>] --note "理由" [--confirm-duplicate-risk] [--limit 200]
 ```
 
-AI エージェントが Bash で `duduclaw`／`duduclaw-pro` の `ops channel-ingress` を実行すると、agent-file-guard hook が止めます（`BlockedOperatorCommand`）。照合の前に、コマンドを bash と同じように読み直します（行継続、語にくっついた引用符、語にくっついたリダイレクト、`env`／`npx` の前置、絶対パス）。これは減速帯にすぎません。変数、エイリアス、スクリプト、名前を変えた実行ファイルで回避でき、Claude 以外の runtime はこの hook を実行しません。本当の関門は下のダッシュボード承認です。
+AI エージェントまたは身分未検証の呼び出し元が Bash で `duduclaw`／`duduclaw-pro` の `channel-ingress` を実行すると、agent-file-guard hook が止めます（`BlockedOperatorCommand`）。同じ hook は `computer-workspaces` と `computer-profiles` も読み取り専用コマンドを含めて拒否します。`echo`／`printf` の引数にあるオペレーターコマンドの語も保守的に照合し、誤検知を許容しますが、`grep`／`egrep`／`fgrep` の言及は除外します。文字列照合は一般的な Bash の記法を認識します（行継続、語にくっついた引用符、語にくっついたリダイレクト、`env`／`npx` の前置、絶対パス）。これは減速帯にすぎません。変数、エイリアス、スクリプト、名前を変えた実行ファイルで回避でき、Claude 以外の runtime はこの hook を実行しません。保護対象の状態変更の本当の関門はプロセス内の AI セッションチェックと下のダッシュボードの Admin 承認です。
+
+Bash レーンの既知の制限：ANSI-C `$'…'` 引用、コマンド置換による動的なコマンド組み立ては未対応で、引用符が不正でも一律には拒否しません。`bash`／`sh`／`zsh`／`dash` の `-c`、`eval`、`echo`／`printf` の各文字列引数は最大 2 階層の再解析上限を共有し、64 KiB を超える `echo`／`printf` 引数は再解析しません。`-xc` などの短いフラグの組み合わせ、`-c` の前後のオプション（`-o value` を含む）、`-c` の後の `--` は照合します。保守的な誤検知は許容します。これは減速帯であり、保護対象の状態変更の本当の関門はプロセス内の AI セッションチェックとダッシュボードの Admin 承認です。
 
 `list` と `show` はそのまま答えます。`resolve` と `rerun` は最初の実行では**反映されず**、承認リクエストを 1 件作り、「請到儀表板的待辦核准」（ダッシュボードの承認待ちへ）と承認番号を表示して非ゼロで終了します。コマンドラインでは、実行したのが運用者なのか Bash を持つ AI エージェントなのか区別できないため、この種の変更は必ず Admin がダッシュボードで承認します。チャネル上の返信では承認できません。承認から 30 分以内に**同じコマンド**（同じ理由と受領番号）をもう一度実行すると反映されます。承認は 1 回しか使えず、その間にイベントの状態が変われば無効になり、申請し直しです。同時に待てるコマンドラインのリクエストは 20 件までです。待っている間にイベントの状態が変わると、待機中のカードは取り下げられ、次の実行で新しいカードが作られます（カードの内容をその場で書き換えることはありません）。申請、反映、拒否のたびにセキュリティ監査 `channel_ingress_cli_action` を 1 件書きます。AI エージェントのセッションの環境変数を持つプロセスは通常拒否されますが、その変数を外せば回避できます。本当の関門はダッシュボード承認です。急ぐときはダッシュボード RPC を使ってください。
 
@@ -171,6 +173,6 @@ DB ファイルの権限は 0600 です。開くときはシンボリックリ�
 
 ## 検証の範囲
 
-ローカルテストで確認していること：fail 設定で期限切れのイベントへの `retry`／`rerun` が拒否されること、判断後に fail に変えた再実行は実行も送信もしないこと。Bash 経路で `ops channel-ingress` が止まること。復元マーカーがあるとワーカーが取得する前に待機中のイベントを止め、マーカーは 1 回だけ効くこと。署名不正、一括 rollback、ディスクフル、DB 読み取り専用、DB 混雑で 200 を返さないこと。同じイベントの webhook 20 件同時でも実行は 1 回。待ち行列による期限切れの 2 つの設定（push は同じ会話へ送る、fail は実行も送信もしない）。進捗 Push の失敗がイベントの状態に影響しないこと。ファイル通知が返信に含まれること。プリセットの実効設定がスナップショットに入ること。関係のないエージェントの変更や破損がスナップショットと ACK に影響しないこと。設定が読めないときは即時隔離せずバックオフすること。webhook handler とワーカーを通した実際の OS kill（ACK 後、実行中）。コマンドラインの変更にはダッシュボードの Admin 承認が必要で、承認は 1 回だけ使え、状態が変われば無効になること。スナップショットが保存されるまでイベントを取らないこと、読めないスナップショットはバックオフし、停止中にスナップショットが取れなかったイベントは `snapshot_unavailable` で隔離されること。再送された webhook は reply token を試さないこと（push なら Push、fail なら実行しない）。reply token が拒否されたとき push なら Push に切り替え、fail なら `undelivered` のままであること。送信前に読めない場合は `revalidation_unavailable`、読めて違う場合は `authorization_changed_before_delivery` と記録すること。500 件の警告が件数付きの Activity 1 件にまとまり、再起動しても繰り返さないこと。`batch` は状態が変わっていないイベントだけを処理し、選択結果が変わればカードを作り直すこと。コマンドラインの出力に LINE の生の ID が出ないこと。マーカーが書けないとき復元はデータを動かす前に止まること。行継続、引用符の連結、リダイレクトがくっついた書き方も Bash 経路で止まること。
+ローカルテストで確認していること：fail 設定で期限切れのイベントへの `retry`／`rerun` が拒否されること、判断後に fail に変えた再実行は実行も送信もしないこと。Bash 経路で `channel-ingress` が止まること。復元マーカーがあるとワーカーが取得する前に待機中のイベントを止め、マーカーは 1 回だけ効くこと。署名不正、一括 rollback、ディスクフル、DB 読み取り専用、DB 混雑で 200 を返さないこと。同じイベントの webhook 20 件同時でも実行は 1 回。待ち行列による期限切れの 2 つの設定（push は同じ会話へ送る、fail は実行も送信もしない）。進捗 Push の失敗がイベントの状態に影響しないこと。ファイル通知が返信に含まれること。プリセットの実効設定がスナップショットに入ること。関係のないエージェントの変更や破損がスナップショットと ACK に影響しないこと。設定が読めないときは即時隔離せずバックオフすること。webhook handler とワーカーを通した実際の OS kill（ACK 後、実行中）。コマンドラインの変更にはダッシュボードの Admin 承認が必要で、承認は 1 回だけ使え、状態が変われば無効になること。スナップショットが保存されるまでイベントを取らないこと、読めないスナップショットはバックオフし、停止中にスナップショットが取れなかったイベントは `snapshot_unavailable` で隔離されること。再送された webhook は reply token を試さないこと（push なら Push、fail なら実行しない）。reply token が拒否されたとき push なら Push に切り替え、fail なら `undelivered` のままであること。送信前に読めない場合は `revalidation_unavailable`、読めて違う場合は `authorization_changed_before_delivery` と記録すること。500 件の警告が件数付きの Activity 1 件にまとまり、再起動しても繰り返さないこと。`batch` は状態が変わっていないイベントだけを処理し、選択結果が変わればカードを作り直すこと。コマンドラインの出力に LINE の生の ID が出ないこと。マーカーが書けないとき復元はデータを動かす前に止まること。行継続、引用符の連結、リダイレクトがくっついた書き方も Bash 経路で止まること。
 
 実際の LINE アカウントでは、再送、reply token の実際の期限、使用済み・期限切れの token に LINE が実際に返すエラー内容（ゲートウェイはメッセージ `Invalid reply token` と照合し、それ以外の 400 は `reply_rejected` のまま）、Push 枠を使い切ったときの応答、`X-Line-Retry-Key` による重複排除、relay 上流の挙動をまだ確認していません。ローカルテストは偽の provider を使っています。

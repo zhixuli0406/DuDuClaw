@@ -97,12 +97,12 @@ workspace = true
 ## 操作者的指令
 
 ```bash
-duduclaw ops computer-workspaces list [--owner <員工>]
-duduclaw ops computer-workspaces fence <工作區 id> [--reason <原因>]
-duduclaw ops computer-workspaces revoke <工作區 id>
-duduclaw ops computer-workspaces regrant <工作區 id>
-duduclaw ops computer-workspaces renew <工作區 id>
-duduclaw ops computer-workspaces delete <工作區 id> --confirm
+duduclaw computer-workspaces list [--owner <員工>]
+duduclaw computer-workspaces fence <工作區 id> [--reason <原因>]
+duduclaw computer-workspaces revoke <工作區 id>
+duduclaw computer-workspaces regrant <工作區 id>
+duduclaw computer-workspaces renew <工作區 id>
+duduclaw computer-workspaces delete <工作區 id> --confirm
 ```
 
 | 動作 | 做什麼 | 需要核准 |
@@ -129,7 +129,7 @@ duduclaw ops computer-workspaces delete <工作區 id> --confirm
 **其他規則**：
 
 - 指令偵測到任何 DuDuClaw 工作階段或身分的環境變數（例如 `DUDUCLAW_AGENT_ID`、`DUDUCLAW_TURN_ID`）就拒絕執行。
-- AI 員工的 Bash 執行 `duduclaw`／`duduclaw-pro` `ops computer-workspaces` 會被 agent-file-guard 擋下（未驗證身分的呼叫者也一樣）。
+- AI 員工的 Bash 執行 `duduclaw`／`duduclaw-pro` `computer-workspaces` 會被 agent-file-guard 擋下（未驗證身分的呼叫者也一樣）。 Bash 層的已知缺口：不支援 ANSI-C `$'…'` 引號、透過命令替換動態組裝指令，格式錯誤的引號也不會一律拒絕。`bash`／`sh`／`zsh`／`dash` 的 `-c`、`eval` 與 `echo`／`printf` 各個字串參數共用最多兩層重解析；超過 64 KiB 的 `echo`／`printf` 參數不重解析。可比對 `-xc` 等短旗標組合、`-c` 前後的選項（含 `-o value`），以及 `-c` 後的 `--`，並接受保守誤攔。這仍是減速帶；受保護狀態變更的真正關卡是行程內的 AI 工作階段檢查與儀表板 Admin 核准。
 - 終端機的動作在稽核裡記成「本機指令列（身分未驗證）」。
 - 每一次指令列動作的提出、套用與拒絕都寫一筆安全稽核（`security_audit.jsonl`，事件 `computer_workspace_cli_action`）。
 - 核准後由終端機套用的 fence／revoke／delete 只改登錄（終端機這個行程沒有進行中的 session）：還沒通過最後一道檢查的動作會立即被拒，已經通過的那一個會跑完，session 最慢在下一次操作或約 15 秒後的續約時結束。

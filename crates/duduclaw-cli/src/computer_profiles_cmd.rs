@@ -9,6 +9,21 @@ pub enum ComputerProfileCommands {
     List,
 }
 
+/// Read-only metadata is operator-only too; share the Bash-lane matcher.
+pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] =
+    &[duduclaw_core::OperatorCommand {
+        name: "duduclaw computer-profiles",
+        path: &["computer-profiles"],
+    }];
+
+/// A speed bump for employee and unverified callers; operators pass through.
+pub fn bash_computer_profiles_decision(
+    command: &str,
+    caller: &duduclaw_core::HookCaller,
+) -> Option<duduclaw_core::GuardDecision> {
+    duduclaw_core::bash_operator_command_decision(command, caller, OPERATOR_COMMANDS)
+}
+
 pub fn run(home: &Path, command: ComputerProfileCommands) -> Result<()> {
     if !crate::ai_session_guard::markers().is_empty() {
         return Err(DuDuClawError::Security(

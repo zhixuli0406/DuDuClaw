@@ -11,7 +11,7 @@
 //! keys live in `ingress_alerts`, so a restart neither repeats nor loses
 //! them. Texts carry 12-character id prefixes, a state and a fixed reason
 //! code only: never message text, a LINE user id or a token. They point at
-//! the entries that exist today: the terminal `duduclaw ops channel-ingress`
+//! the entries that exist today: the terminal `duduclaw channel-ingress`
 //! and the dashboard's pending approvals (there is no inbox page yet).
 
 use std::collections::BTreeMap;
@@ -97,7 +97,7 @@ impl AlertKind {
 }
 
 /// Where an operator actually acts today (review N5).
-const HOW_TO_ACT: &str = "處理：終端機 `duduclaw ops channel-ingress list` 或 `show <編號>` 檢視；要結案、重試或重新執行，用 `resolve`／`rerun`／`batch` 送出申請，再到儀表板的待辦清單核准（目前沒有收件匣頁面）。";
+const HOW_TO_ACT: &str = "處理：終端機 `duduclaw channel-ingress list` 或 `show <編號>` 檢視；要結案、重試或重新執行，用 `resolve`／`rerun`／`batch` 送出申請，再到儀表板的待辦清單核准（目前沒有收件匣頁面）。";
 
 /// The text of one summary row.
 pub(crate) fn alert_text(
@@ -292,7 +292,7 @@ mod tests {
         let rows = activity(dir.path(), AlertKind::Quarantined).await;
         assert_eq!(rows.len(), 1);
         assert!(rows[0].summary.contains("數量：500"), "{}", rows[0].summary);
-        assert!(rows[0].summary.contains("duduclaw ops channel-ingress"));
+        assert!(rows[0].summary.contains("duduclaw channel-ingress"));
         assert!(
             !rows[0].summary.contains("收件紀錄"),
             "no page that does not exist"

@@ -1,6 +1,6 @@
 //! Dashboard approval for operator-terminal workspace changes (review H2).
 //!
-//! `duduclaw ops computer-workspaces fence | revoke | regrant | renew |
+//! `duduclaw computer-workspaces fence | revoke | regrant | renew |
 //! delete` cannot prove who typed it: anything with a shell under this OS
 //! user could. So every state-changing terminal action only runs after an
 //! Admin approved it in the dashboard (emergencies go through the

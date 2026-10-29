@@ -1,4 +1,4 @@
-//! `duduclaw ops channel-ingress batch` — one approval for many events
+//! `duduclaw channel-ingress batch` — one approval for many events
 //! (review N5).
 //!
 //! An incident can leave hundreds of events waiting, and there is no inbox

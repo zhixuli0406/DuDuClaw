@@ -1,4 +1,4 @@
-//! Tests of `duduclaw ops computer-workspaces` (review H2, L5).
+//! Tests of `duduclaw computer-workspaces` (review H2, L5).
 
 use super::*;
 use duduclaw_core::HookCaller;
@@ -33,11 +33,17 @@ fn terminal_answers_carry_no_barrier_time() {
 #[test]
 fn bash_rule_blocks_employees_and_unverified_callers() {
     let positives = [
-        "duduclaw ops computer-workspaces delete ws-1 --confirm",
-        "/usr/local/bin/duduclaw ops computer-workspaces regrant ws-1",
-        "duduclaw-pro --home /tmp/x ops computer-workspaces renew ws-1",
-        "cd /tmp && 'duduclaw' ops computer-workspaces list",
-        "echo hi; DUDUCLAW.EXE ops computer-workspaces fence ws-1",
+        "echo duduclaw computer-workspaces list",
+        "printf '%s ' duduclaw computer-workspaces list | bash",
+        "duduclaw computer-workspaces delete ws-1 --confirm",
+        "/usr/local/bin/duduclaw computer-workspaces regrant ws-1",
+        "duduclaw-pro --home /tmp/x computer-workspaces renew ws-1",
+        "cd /tmp && 'duduclaw' computer-workspaces list",
+        "duduclaw-pro.exe --verbose computer-workspaces list",
+        "duduclaw \\\ncomputer-workspaces list",
+        "duduclaw computer-work\"spaces\" list",
+        "duduclaw computer-work''spaces>out list",
+        "echo hi; DUDUCLAW.EXE computer-workspaces fence ws-1",
     ];
     for cmd in positives {
         for caller in [
@@ -54,13 +60,18 @@ fn bash_rule_blocks_employees_and_unverified_callers() {
                 "{cmd}"
             );
         }
+        assert!(bash_workspace_ops_decision(cmd, &HookCaller::Absent).is_none(), "{cmd}");
     }
     let negatives = [
-        "duduclaw ops tunnel",
+        "duduclaw doctor",
         "duduclaw agent create bob",
-        "echo duduclaw ops",
+        "duduclaw channel-ingress list",
+        "duduclaw computer-workspacesx list",
+        "echo computer-workspaces",
+        "duduclaw preset show computer-workspaces",
+        "duduclaw --redact computer-workspaces doctor",
         "grep computer-workspaces README.md",
-        "duduclawx ops computer-workspaces list",
+        "duduclawx computer-workspaces list",
     ];
     for cmd in negatives {
         assert!(
@@ -71,7 +82,7 @@ fn bash_rule_blocks_employees_and_unverified_callers() {
     // The operator (no claimed identity) is not judged here.
     assert!(
         bash_workspace_ops_decision(
-            "duduclaw ops computer-workspaces delete ws-1 --confirm",
+            "duduclaw computer-workspaces delete ws-1 --confirm",
             &HookCaller::Absent
         )
         .is_none()

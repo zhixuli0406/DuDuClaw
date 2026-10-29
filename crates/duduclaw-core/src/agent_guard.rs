@@ -236,8 +236,8 @@ pub enum GuardDecision {
         command: String,
     },
     /// An AI employee (or an unverified caller) ran an operator-only
-    /// command from Bash, e.g. `duduclaw ops channel-ingress` or
-    /// `duduclaw ops computer-workspaces`. Same
+    /// command from Bash, e.g. `duduclaw channel-ingress` or
+    /// `duduclaw computer-workspaces`. Same
     /// level as [`Self::BlockedReservedAgentName`]: a speed bump on the Bash
     /// lane; the command itself also refuses when DuDuClaw identity
     /// variables are present.
@@ -391,11 +391,14 @@ impl GuardDecision {
                  你的身分：{caller}\n\
                  {}",
                 match *command {
-                    "duduclaw ops channel-ingress" => {
+                    "duduclaw channel-ingress" => {
                         "需要結案或重新執行 LINE 收件事件，請由管理者在儀表板處理。"
                     }
-                    "duduclaw ops computer-workspaces" => {
+                    "duduclaw computer-workspaces" => {
                         "需要凍結、撤銷或刪除電腦操作工作區，請由管理者在儀表板處理。"
+                    }
+                    "duduclaw computer-profiles" => {
+                        "瀏覽器登入狀態只能由管理者在自己的終端機查詢。"
                     }
                     "duduclaw mcp init" | "duduclaw mcp issue-refresh-token" => {
                         "MCP 金鑰只能由管理者簽發，AI 員工不可為自己簽發金鑰。"

@@ -45,7 +45,9 @@ not. A replaced employee, changed owner or primary owner, or owner suspension
 cannot reuse the previous owner's snapshot. Removing or archiving an employee
 clears saved state. **Clear login state** ends the current browser without
 exporting it, then clears the saved snapshot. It requires the same authority as
-browser takeover. `duduclaw ops computer-profiles list` only lists metadata.
+browser takeover. `duduclaw computer-profiles list` only lists metadata. The agent-file-guard Bash hook blocks this command for AI employees and unverified callers, including read-only listing; operators without an employee identity may run it from their own terminal. This lexical check is a speed bump; a renamed binary or a command assembled from variables can bypass it.
+
+Known Bash-lane gaps: ANSI-C `$'…'` quoting, dynamic command assembly via command substitution, and malformed quotes (which do not fail closed). `bash`/`sh`/`zsh`/`dash` `-c`, `eval` and individual `echo`/`printf` string arguments share a two-level re-parse limit; `echo`/`printf` arguments over 64 KiB are not re-parsed. Short-flag clusters such as `-xc`, options before or after `-c` (including `-o value`), and `--` after `-c` are matched. Conservative false positives are accepted. This remains a speed bump; the real gates for protected state changes are the in-process AI-session check and dashboard Admin approval.
 
 Saved logins increase what a manipulated browser session can do as that account.
 Use a narrow website allowlist and action rules requiring review for clicks and
