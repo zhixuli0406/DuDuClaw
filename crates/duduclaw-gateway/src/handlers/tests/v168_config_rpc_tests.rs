@@ -838,3 +838,20 @@ async fn agents_list_normalizes_active_runtime_without_reviving_removed_gemini()
         assert_eq!(listed["agents"][0]["runtime"]["provider"], expected);
     }
 }
+
+#[tokio::test]
+async fn egress_guard_mode_is_validated_and_audited() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    for mode in ["off", "shadow", "ask", "block"] {
+        ok(&handler.handle("system.update_config", json!({"security.egress_guard": mode}), &admin()).await);
+        assert_eq!(config(home.path())["security"]["egress_guard"].as_str(), Some(mode));
+    }
+    let rows = audit_rows(home.path(), "config_protected_key_changed");
+    assert_eq!(rows.len(), 4);
+    for value in [json!("invalid"), json!(true), json!(12)] {
+        let error = err(&handler.handle("system.update_config", json!({"security": {"egress_guard": value}}), &admin()).await);
+        assert!(error.contains("security.egress_guard"));
+        assert_eq!(config(home.path())["security"]["egress_guard"].as_str(), Some("block"));
+    }
+}

@@ -331,6 +331,8 @@ Unicode normalization (zero-width characters, homoglyphs) adds further protectio
 
 ### 3.3 Tool approval (HITL ApprovalBroker)
 
+Gateway data also includes `<home>/egress_leases.db`: durable outgoing-call fences (SQLite WAL, Unix 0600), restored before loopback routes open. See [Outgoing data guard](../features/69-egress-guard.md).
+
 High-risk operations go through the unified ApprovalBroker (`approvals.db`; a TTL expiry is treated as a denial, fail-closed):
 - `agent.toml [capabilities] approval_required_tools` declares which tools require approval; `irreversible_tools` always ask, `maybe_irreversible_tools` ask when a model judge says the call may be irreversible (fail-closed). The lists are read for the agent making the call. Before v1.67.0, calls an agent made through its own MCP server were checked against the gateway's internal key name instead, so these three lists had no effect there.
 - Requests for an ordinary tool are filed as kind `mcp_call` and worded as a tool call; install-class tools keep kind `mcp_install`. The eight `computer_*` tools are asked about by the gateway's computer-use route instead (always, for any of the three lists), so a human is never asked twice.
@@ -461,3 +463,5 @@ It prints `[]` when it works. Otherwise its stderr gives the reason (browser not
 
 ### Emergency Stop won't recover
 Send `!RESUME` (or `!恢復`) in the channel from an admin account. The halt state is held in memory, so restarting the gateway also clears it. There is no signal file to delete and no `emergency_stop` MCP tool.
+
+The store holds an exclusive `<home>/egress_leases.lock` file lock for its lifetime (0600 on Unix). A second gateway using the same home refuses private reads and new sinks in `ask`/`block` and retries; `shadow` allows and audits. After taking ownership it restores all leases before admitting reads. Never delete the lock file while a gateway is running. Duplicate active lease IDs are refused before insertion without fencing other employees.

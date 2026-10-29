@@ -6,7 +6,7 @@
 
 | 環境変数 | 用途 | インスタンスごとに変える必要 |
 | --- | --- | --- |
-| `DUDUCLAW_HOME` | 状態ルート：config、SQLite データベース、`bus_queue.jsonl`、`events.db`、models、shared wiki、secrets、cron。デフォルトは `~/.duduclaw`。 | **あり** |
+| `DUDUCLAW_HOME` | 状態ルート：config、SQLite データベース、`bus_queue.jsonl`、`events.db`、`egress_leases.db`、`egress_leases.lock`、models、shared wiki、secrets、cron。デフォルトは `~/.duduclaw`。 | **あり** |
 | `DUDUCLAW_PORT` | Gateway の HTTP/WS ポート。デフォルトは `18889`。 | **あり** |
 | `DUDUCLAW_INSTANCE` | 短いインスタンス名（`[a-z0-9-]`）。`~/.claude/settings.json` 内の**グローバル MCP 登録**キーに名前空間を付け（`duduclaw` → `duduclaw-<name>`）、インスタンス同士が互いを上書きしないようにする。 | 推奨 |
 

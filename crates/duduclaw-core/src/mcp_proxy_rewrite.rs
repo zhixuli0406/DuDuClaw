@@ -79,10 +79,10 @@ pub fn spawn_env_file_name(server: &str) -> Option<String> {
 /// rewritten proxy entry, so the proxy process resolves the same home, the
 /// same agent identity and the same MCP credential the built-in server does.
 ///
-/// `DUDUCLAW_AGENT_TOKEN` is deliberately NOT carried: it proves an agent id
-/// to the MCP server, and the proxy makes no MCP tool calls of its own;
-/// handing it (and, by inheritance, a third-party server) that token would
-/// widen the blast radius for nothing.
+/// `DUDUCLAW_AGENT_TOKEN` is deliberately absent from this persistent carry
+/// set. The host supplies it and the turn identity separately at spawn for
+/// the proxy's signed egress-ledger requests; the external upstream never
+/// inherits these values.
 pub const PROXY_CARRY_ENV: &[&str] = &[
     "DUDUCLAW_HOME",
     "DUDUCLAW_PORT",

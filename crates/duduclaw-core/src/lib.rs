@@ -1470,3 +1470,5 @@ pub mod show_thinking;
 
 /// Strip a leading `<think>…</think>` block from open-model answers.
 pub mod think_tags;
+
+pub mod egress_guard;

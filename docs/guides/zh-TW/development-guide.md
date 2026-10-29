@@ -307,6 +307,8 @@ claude
 
 ### 3.3 Tool Approval（HITL ApprovalBroker）
 
+Gateway 資料另包含 `<home>/egress_leases.db`：外送呼叫的持久保護紀錄（SQLite WAL，Unix 0600），在 loopback 路由開放前復原。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
+
 高風險操作走統一的 ApprovalBroker（`approvals.db`，TTL 過期即拒絕、fail-closed）：
 - `agent.toml [capabilities] approval_required_tools` 宣告需審批的工具；`irreversible_tools` 一律詢問，`maybe_irreversible_tools` 在模型判官認為該呼叫可能不可逆時詢問（fail-closed）。這些清單是針對發出呼叫的 agent 讀取。在 v1.67.0 之前，agent 透過自己的 MCP server 發出的呼叫，是拿 gateway 的內部金鑰名稱去檢查，所以這三個清單在那條路徑上沒有任何效果。
 - 一般工具的請求以 `mcp_call` 類型建立，文字寫成工具呼叫；安裝類工具維持 `mcp_install` 類型。八個 `computer_*` 工具改由 gateway 的電腦操作路由詢問（三個清單中任何一個列到都一律詢問），所以不會有人被問兩次。
@@ -437,3 +439,5 @@ docker exec <容器> duduclaw-eval-dom 'JSON.stringify([])'
 
 ### Emergency Stop 無法恢復
 用管理員帳號在通道裡送出 `!RESUME`（或 `!恢復`）。停止狀態存在記憶體裡，所以重啟 gateway 也會清掉。沒有可刪除的信號檔，也沒有 `emergency_stop` 這個 MCP 工具。
+
+Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0600）。使用同一 home 的第二個 gateway 會拒絕讀取與新外送並重試，取得鎖後先恢復所有 lease 才接受讀取；`shadow` 仍允許並稽核。Gateway 執行中不可刪除鎖檔。重複的有效 lease ID 會在寫入前拒絕，不會連帶阻擋其他員工。

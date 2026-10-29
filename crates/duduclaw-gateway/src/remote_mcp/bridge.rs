@@ -2,8 +2,9 @@
 //!
 //! The Claude CLI starts the bridge as an ordinary stdio MCP server. Every
 //! line it writes (requests, notifications, and responses to server-initiated
-//! requests) is POSTed unchanged to the remote server with a fresh access
-//! token; every JSON-RPC message the server answers with, as a JSON body or as
+//! requests) is POSTed to the remote server with a fresh access
+//! token. Tool calls use generation-specific wire IDs, restored on correlated
+//! terminal responses; every JSON-RPC message the server answers with, as a JSON body or as
 //! `text/event-stream` events, is written back as one line. The bridge does
 //! not interpret MCP beyond three things the transport needs: it remembers the
 //! `Mcp-Session-Id` the server assigns, sends the negotiated
@@ -128,7 +129,7 @@ impl Bridge {
         Ok(c)
     }
 
-    async fn post(&self, auth: &UpstreamAuth, body: &str) -> Result<reqwest::Response, String> {
+    async fn post(&self, auth: &UpstreamAuth, body: &str, permit: Option<&crate::third_party_tools::DispatchPermit>) -> Result<reqwest::Response, String> {
         let client = self.client_for(&auth.url).await?;
         let mut req = client
             .post(auth.url.clone())
@@ -145,6 +146,11 @@ impl Bridge {
                 req = req.header("MCP-Protocol-Version", v);
             }
         }
+        if let Some(permit) = permit {
+            if !permit.is_live() { return Err("Tool call expired before dispatch".into()); }
+            // No await between the phase change and the potentially partial send.
+            permit.dispatched();
+        }
         req.send()
             .await
             .map_err(|e| format!("cannot reach {}: {e}", super::http::host_label(&auth.url)))
@@ -153,38 +159,70 @@ impl Bridge {
     /// Forward one input line. Errors become JSON-RPC error responses for
     /// requests and are logged for everything else.
     async fn forward(&self, line: String) {
-        let frame: Value = match serde_json::from_str(&line) {
+        let mut frame: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => {
                 self.emit(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}).to_string());
                 return;
             }
         };
+        if !frame.is_object() {
+            self.emit(crate::third_party_tools::refusal_frame(&Value::Null,
+                "Batch or malformed requests cannot pass the egress gate."));
+            return;
+        }
         let kind = classify(&frame);
-        let method = frame.get("method").and_then(|m| m.as_str());
-        let is_initialize = method == Some("initialize");
-        // Third-party tool gate: a refused or unapproved call never leaves.
-        if let (Kind::Request(id), Some("tools/call")) = (&kind, method) {
-            let tool = frame
-                .get("params")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            if let Err(msg) = self.gate.check_call(tool).await {
-                self.emit(crate::third_party_tools::refusal_frame(id, &msg));
+        if let Kind::Request(id) = &kind {
+            if crate::third_party_tools::bridge_reserved_id(id) {
+                self.emit(crate::third_party_tools::refusal_frame(id,
+                    "Request ID uses the bridge's reserved namespace; choose a different ID."));
                 return;
             }
         }
+        let method = frame.get("method").and_then(|m| m.as_str());
+        let is_initialize = method == Some("initialize");
+        if method == Some("tools/call") && !matches!(&kind, Kind::Request(_)) {
+            self.emit(crate::third_party_tools::refusal_frame(&Value::Null,
+                "Malformed tools/call cannot pass the egress gate."));
+            return;
+        }
+
+        // Hold admission through a correlated reply, including asynchronous 202/204.
+        let call = if let (Kind::Request(id), Some("tools/call")) = (&kind, method) {
+            let tool = frame["params"]["name"].as_str().unwrap_or("");
+            match self.gate.begin_call(id, tool, &frame["params"]["arguments"]).await {
+                Ok(call) => Some(call),
+                Err(msg) => {
+                    self.emit(crate::third_party_tools::refusal_frame(id, &msg));
+                    return;
+                }
+            }
+        } else { None };
         let list_id = match (&kind, method) {
             (Kind::Request(id), Some("tools/list")) => Some(id.clone()),
             _ => None,
         };
-        if let Err(msg) = self.exchange(&line, &kind, is_initialize, list_id.as_ref()).await {
+        if method == Some("notifications/cancelled") {
+            if let Some(wire_id) = frame.get("params").and_then(|p| p.get("requestId"))
+                .and_then(|id| self.gate.bridge_cancel_id(id)) {
+                frame["params"]["requestId"] = wire_id;
+            }
+        }
+        if let Some(call) = &call { frame["id"] = call.bridge_wire_id(); }
+        let wire_kind = classify(&frame);
+        let wire_line = frame.to_string();
+        let permit = call.as_ref().map(crate::third_party_tools::PendingCall::dispatch_permit);
+        if let Err(msg) = self.exchange(&wire_line, &wire_kind, is_initialize, list_id.as_ref(), permit.as_ref()).await {
             match &kind {
                 Kind::Request(id) => self.emit(error_frame(id, &msg)),
                 _ => tracing::warn!(server = %self.server, error = %msg, "remote MCP message not delivered"),
             }
+            return;
         }
+        // A successful POST may only acknowledge acceptance (202/204).
+        // The event stream completes the call; keep its sink lease until that
+        // response; an uncertain deadline retains the fence until the lease TTL.
+        if let Some(call) = call { call.wait().await; }
     }
 
     async fn exchange(
@@ -193,12 +231,13 @@ impl Bridge {
         kind: &Kind,
         is_initialize: bool,
         list_id: Option<&Value>,
+        permit: Option<&crate::third_party_tools::DispatchPermit>,
     ) -> Result<(), String> {
         let mut auth = self.auth(false).await.map_err(|e| e.to_string())?;
-        let mut resp = self.post(&auth, body).await?;
+        let mut resp = self.post(&auth, body, permit).await?;
         if resp.status().as_u16() == 401 {
             auth = self.auth(true).await.map_err(|e| e.to_string())?;
-            resp = self.post(&auth, body).await?;
+            resp = self.post(&auth, body, permit).await?;
             if resp.status().as_u16() == 401 {
                 return Err(format!(
                     "remote MCP server '{}' still refuses the credential after a refresh (HTTP 401); \
@@ -266,6 +305,7 @@ impl Bridge {
     }
 
     async fn deliver(&self, mut msg: Value, is_initialize: bool, list_id: Option<&Value>) {
+        if !self.gate.observe_bridge_response(&mut msg).await { return; }
         // The answer to a `tools/list`: hide the tools this employee may not
         // call here and remember every tool's annotations.
         if let Some(id) = list_id
@@ -714,6 +754,30 @@ mod tests {
         assert!(matches!(classify(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})), Kind::Request(_)));
         assert!(matches!(classify(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})), Kind::Notification));
         assert!(matches!(classify(&json!({"jsonrpc":"2.0","id":7,"result":{}})), Kind::Response));
+    }
+
+    #[tokio::test]
+    async fn third_party_bridge_reserved_request_ids_receive_explicit_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = String::new();
+        for method in ["initialize", "tools/list", "ping", "tools/call"] {
+            input.push_str(&json!({"jsonrpc":"2.0","id":format!("duduclaw-egress:{method}"),"method":method,"params":{}}).to_string());
+            input.push('\n');
+        }
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        assert_eq!(run_bridge(dir.path(), "a1", "remote", input.as_bytes(), server).await, 0);
+        let mut out = String::new();
+        let mut reader = tokio::io::BufReader::new(client);
+        use tokio::io::AsyncReadExt;
+        reader.read_to_string(&mut out).await.unwrap();
+        let lines: Vec<Value> = out.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(lines.len(), 4, "{out}");
+        for method in ["initialize", "tools/list", "ping", "tools/call"] {
+            let id = format!("duduclaw-egress:{method}");
+            let reply = lines.iter().find(|reply| reply["id"] == id).unwrap();
+            assert_eq!(reply["error"]["code"], crate::third_party_tools::REFUSED_CODE);
+            assert_eq!(reply["error"]["message"], "Request ID uses the bridge's reserved namespace; choose a different ID.");
+        }
     }
 
     #[tokio::test]

@@ -60,6 +60,7 @@ pub fn register(agent_id: &str, turn_id: &str, who: RequesterIdentity) -> Option
     {
         return None;
     }
+    crate::egress_guard::register_turn(agent_id, turn_id);
     let key = (agent_id.to_string(), turn_id.to_string());
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     registry()

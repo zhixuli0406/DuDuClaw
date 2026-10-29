@@ -17,7 +17,7 @@ vi.mock('@/lib/ws-client', () => ({
   },
 }));
 
-import { ApprovalDetailPanel } from './ApprovalDetailPanel';
+import { ApprovalDetailPanel, parseActionGrant } from './ApprovalDetailPanel';
 import { diffRows } from './AgentFileChangeFacts';
 import { client } from '@/lib/ws-client';
 import type { ApprovalItem } from '@/lib/api';
@@ -660,5 +660,94 @@ describe('<ApprovalDetailPanel> agent_file_change', () => {
     expect(rows.filter((r) => r.kind === 'equal')).toHaveLength(4);
     // Short runs stay visible.
     expect(diffRows([{ op: 'equal', lines: ['a', 'b'] }]).every((r) => r.kind === 'equal')).toBe(true);
+  });
+});
+
+
+describe('<ApprovalDetailPanel> egress review', () => {
+  it.each(['read', 'draft'])('shows the matching rule and expiry for %s approvals without full arguments', (effect) => {
+    const approval = genericApproval({
+      expires_at: 1793210400,
+      payload: {
+        name: 'memory_search', arguments: { query: 'private query' },
+        reason: 'action_rule',
+        action_rule_matches: [{ tool: 'memory_search', verdict: 'ask' }],
+        action_grant: { tool: 'memory_search', effect, args_digest: 'abc123', args_summary: [] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('An action rule requires approval');
+    expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"tool": "memory_search"');
+    expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"verdict": "ask"');
+    expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
+    expect(screen.queryByTestId('approval-full-content')).not.toBeInTheDocument();
+  });
+
+  it('shows both egress and matching action-rule reasons on one approval', () => {
+    const approval = genericApproval({
+      payload: {
+        name: 'send_message', arguments: { text: 'message' },
+        egress_guard: { sources: ['mail_read'] },
+        action_rule_matches: [{ effect: 'send', verdict: 'ask' }],
+        action_grant: { tool: 'send_message', effect: 'send', args_digest: 'abc123', args_summary: [] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('Private data was read during this turn');
+    expect(box).toHaveTextContent('An action rule requires approval');
+    expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"effect": "send"');
+  });
+
+  it('accepts only complete known matching-rule shapes from the host payload', () => {
+    const payload = {
+      action_grant: { tool: 'send_message', effect: 'send', args_digest: 'abc123' },
+      action_rule_matches: [
+        null, 'forged', [], { tool: 42, verdict: 'ask' },
+        { tool: 'send_message', effect: 'send', verdict: 'ask' },
+        { effect: 'invented', verdict: 'ask' }, { tool: 'send_message', verdict: 'invented' },
+        { malformed: false, verdict: 'ask' }, { tool: 'send_message', verdict: 'ask', html: '<b>forged</b>' },
+        { tool: 'send_message', verdict: 'ask' }, { malformed: true, verdict: 'ask' },
+      ],
+    };
+    expect(parseActionGrant(payload)?.ruleMatches).toEqual([
+      { tool: 'send_message', verdict: 'ask' }, { malformed: true, verdict: 'ask' },
+    ]);
+    expect(parseActionGrant({ ...payload, action_rule_matches: { tool: 'send_message', verdict: 'ask' } })?.ruleMatches).toEqual([]);
+  });
+
+  it.each(['send', 'publish', 'purchase'])('expands %s content even without an egress reason', (effect) => {
+    const approval = genericApproval({
+      payload: {
+        name: 'outgoing_tool', arguments: { channel: 'email', to: 'recipient@example.test', text: 'Full outgoing text' },
+        reason: 'action_rule',
+        action_grant: { tool: 'outgoing_tool', effect, args_digest: 'abc123', args_summary: [] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('approval-full-content');
+    expect(box.querySelector('pre')?.textContent).toContain('Full outgoing text');
+    expect(box).toHaveTextContent('recipient@example.test');
+    expect(box).toHaveTextContent('An action rule requires approval');
+  });
+  it.each(['send', 'publish', 'purchase', 'read'])('expands complete %s arguments, sources, destination and expiry', (effect) => {
+    const content = 'Confidential customer note '.repeat(100) + 'END OF FULL CONTENT';
+    const approval = genericApproval({
+      expires_at: 1793210400,
+      payload: {
+        name: 'web_extract', arguments: { url: 'https://example.test/submit', content },
+        egress_guard: { sources: ['memory_search', 'mail_read'] },
+        action_grant: { tool: 'web_extract', effect, args_digest: 'abc123', args_summary: ['content = truncated'] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('approval-full-content');
+    expect(box.querySelector('pre')?.textContent).toContain(content);
+    expect(box).toHaveTextContent('https://example.test/submit');
+    expect(box).toHaveTextContent('memory_search');
+    expect(box).toHaveTextContent('mail_read');
+    expect(box).toHaveTextContent('Private data was read during this turn');
+    expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
   });
 });

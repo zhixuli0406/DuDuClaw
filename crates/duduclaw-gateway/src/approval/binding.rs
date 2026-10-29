@@ -353,6 +353,10 @@ impl ApprovalBroker {
     ) -> Result<(), String> {
         context.validate()?;
         let rec = self.get(id).await?.ok_or("request not found")?;
+        if rec.payload.get("egress_guard").is_some() {
+            let ctx = dashboard.ok_or("outgoing data approval requires a dashboard Admin")?;
+            self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+        }
         let binding = rec
             .binding
             .as_ref()
@@ -437,7 +441,7 @@ impl ApprovalBroker {
             rec.action_kind == WORKFLOW_ACTIVATION_KIND || is_activation_payload(&rec.payload);
         self.require_current_dashboard_role(
             ctx,
-            if activation {
+            if activation || rec.payload.get("egress_guard").is_some() {
                 duduclaw_auth::UserRole::Admin
             } else {
                 duduclaw_auth::UserRole::Manager

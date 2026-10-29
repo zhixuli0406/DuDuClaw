@@ -87,6 +87,16 @@ pub fn set_contains_tool(set: &HashSet<String>, tool: &str) -> bool {
         .any(|e| duduclaw_core::tool_catalog::tool_entry_matches(e, tool) || tool_token_matches(e, tool))
 }
 
+/// Purchase and deletion always need call-specific authority, including for
+/// grants stored before this restriction was introduced. Normalize exactly
+/// as the historical grant matcher does before checking the effect class.
+pub fn standing_grant_allowed(tool: &str) -> bool {
+    !matches!(
+        duduclaw_core::effect_of(&tool_base(tool).to_ascii_lowercase()),
+        duduclaw_core::ToolEffect::Purchase | duduclaw_core::ToolEffect::Delete
+    )
+}
+
 // ── Grant row ───────────────────────────────────────────────
 
 /// One row of `capability_task_grants`.
@@ -230,6 +240,9 @@ impl CapabilityGrantStore {
         granted_by: &str,
         ttl_seconds: i64,
     ) -> Result<String, String> {
+        if !standing_grant_allowed(tool) {
+            return Err("Purchase and Delete tools cannot receive standing grants".into());
+        }
         let ttl = if ttl_seconds > 0 {
             ttl_seconds
         } else {
@@ -275,13 +288,19 @@ impl CapabilityGrantStore {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let rows = select_nonrevoked_for_agent(&conn, agent_id)?;
-        Ok(rows.into_iter().filter(|r| r.is_active(now)).collect())
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.is_active(now) && standing_grant_allowed(&r.tool))
+            .collect())
     }
 
     /// True when the agent currently holds an active grant for `tool`.
     /// **Fail-closed:** any store/query error resolves to `false` (deny).
     /// Tool match is token-anchored, never substring.
     pub async fn has_active_grant(&self, agent_id: &str, tool: &str) -> bool {
+        if !standing_grant_allowed(tool) {
+            return false;
+        }
         match self.active_grants(agent_id).await {
             Ok(rows) => rows.iter().any(|r| tool_token_matches(&r.tool, tool)),
             Err(e) => {
@@ -461,7 +480,7 @@ fn active_grant_tools_sync(home_dir: &Path, agent_id: &str) -> Result<HashSet<St
     let rows = select_nonrevoked_for_agent(&conn, agent_id)?;
     Ok(rows
         .into_iter()
-        .filter(|r| r.is_active(now))
+        .filter(|r| r.is_active(now) && standing_grant_allowed(&r.tool))
         .map(|r| r.tool)
         .collect())
 }
@@ -469,6 +488,76 @@ fn active_grant_tools_sync(home_dir: &Path, agent_id: &str) -> Result<HashSet<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn purchase_and_delete_grants_cannot_be_created() {
+        let store = CapabilityGrantStore::open_in_memory().unwrap();
+        for tool in [
+            "odoo_sale_confirm",
+            "agent_remove",
+            "shared_wiki_delete",
+            "MCP__DUDUCLAW__DELETE_CRON_TASK",
+            "cancel_reminder(*)",
+        ] {
+            assert!(store.grant("alice", None, tool, GRANTED_BY_REQUEST, 60).await.is_err());
+        }
+        let conn = store.conn.lock().await;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM capability_task_grants", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn purchase_and_delete_grants_are_filtered_without_migration() {
+        let home = tempfile::tempdir().unwrap();
+        let store = CapabilityGrantStore::open(home.path()).unwrap();
+        for tool in [
+            "odoo_sale_confirm",
+            "agent_remove",
+            "shared_wiki_delete",
+            "MCP__DUDUCLAW__DELETE_CRON_TASK",
+            "cancel_reminder(*)",
+            "send_message",
+        ] {
+            // Seed historical rows directly: new restricted grants are refused.
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO capability_task_grants
+                 (id, agent_id, task_id, tool, granted_at, granted_by, expires_at)
+                 VALUES (?1, 'alice', NULL, ?2, ?3, ?4, ?5)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    tool,
+                    Utc::now().to_rfc3339(),
+                    GRANTED_BY_REQUEST,
+                    (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+                ],
+            ).unwrap();
+        }
+        let active = store.active_grants("alice").await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].tool, "send_message");
+        assert!(store.has_active_grant("alice", "send_message").await);
+        for tool in [
+            "odoo_sale_confirm",
+            "agent_remove",
+            "shared_wiki_delete",
+            "MCP__DUDUCLAW__DELETE_CRON_TASK",
+            "cancel_reminder",
+        ] {
+            assert!(!store.has_active_grant("alice", tool).await, "{tool}");
+        }
+        assert_eq!(
+            active_grant_tools_sync(home.path(), "alice").unwrap(),
+            HashSet::from(["send_message".into()])
+        );
+        let conn = store.conn.lock().await;
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM capability_task_grants", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 6, "stored grants remain untouched");
+    }
 
     fn store() -> CapabilityGrantStore {
         CapabilityGrantStore::open_in_memory().unwrap()

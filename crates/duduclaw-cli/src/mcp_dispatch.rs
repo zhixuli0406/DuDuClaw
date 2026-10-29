@@ -366,7 +366,7 @@ pub(crate) fn action_rule_verdict_for_call(
     tool_name: &str,
     args: &Value,
 ) -> Option<duduclaw_core::ActionVerdict> {
-    rules.resolve_for_call(tool_name, duduclaw_core::effect_of(tool_name), args)
+    rules.resolve_for_call(tool_name, duduclaw_core::tool_effect::effect_of_call(tool_name, args), args)
 }
 
 /// Tools always governed by a `[permissions]` flag (v1.68), by exact name.
@@ -934,6 +934,12 @@ impl McpDispatcher {
 
         // ── 3. Namespace injection (external clients only) ───────────────────
         let mut params_owned = params.clone();
+        if let Some(obj) = params_owned.as_object_mut() {
+            obj.remove("egress_guard");
+            obj.remove("reason");
+            obj.remove("action_grant");
+            obj.remove("action_rule_matches");
+        }
         if principal.is_external {
             if let Some(args) = params_owned.get_mut("arguments") {
                 if let Some(obj) = args.as_object_mut() {
@@ -1581,6 +1587,62 @@ impl McpDispatcher {
             }
         }
 
+        // Reserve before executing any private read, across all MCP processes.
+        let mut private_read_failure = None;
+        let (mut private_read, read_taint) = if !principal.is_external
+            && duduclaw_core::tool_effect::reads_private(tool_name).unwrap_or(true)
+        {
+            match crate::mcp::egress_client::reserve(&self.home_dir, gate_agent, tool_name).await {
+                Ok((read, taint)) => (Some(read), Some(taint)),
+                Err(reason) => {
+                    if let Err(message) = crate::mcp::egress_client::reservation_failure(&self.home_dir, gate_agent, tool_name, &reason) {
+                        // A live sink conflict must never enter an approval wait.
+                        // Other unavailable-state failures retain the existing
+                        // combined approval/audit path, but cannot dispatch.
+                        if reason == duduclaw_gateway::egress_guard::READ_DURING_SINK {
+                            self.audit_dispatch_denial(tool_name, &params_owned, "egress_guard", &message);
+                            return jsonrpc_error(id, -32003, &message);
+                        }
+                        private_read_failure = Some(message);
+                    }
+                    (None, Some(duduclaw_gateway::egress_guard::Taint::unknown()))
+                }
+            }
+        } else { (None, None) };
+        // ── 3.69 Per-turn private-data egress guard ──────────────────────────
+        // Never accept a model-supplied reason; bind the final arguments after
+        // policy/redaction rewrites to the existing single-use approval.
+        if let Some(obj) = params_owned.as_object_mut() {
+            obj.remove("egress_guard");
+        }
+        let sink = matches!(
+                duduclaw_core::tool_effect::effect_of_call(tool_name, params_owned.get("arguments").unwrap_or(&Value::Null)),
+                duduclaw_core::ToolEffect::Send
+                    | duduclaw_core::ToolEffect::Publish
+                    | duduclaw_core::ToolEffect::Purchase
+            ) || duduclaw_core::tool_effect::egress_capable(tool_name).unwrap_or(true);
+        {
+            let decision = if !principal.is_external {
+                if let Some(taint) = read_taint {
+                    duduclaw_gateway::egress_gate::evaluate(&self.home_dir, gate_agent, tool_name, sink, taint)
+                } else {
+                    crate::mcp::egress_gate::check(&self.home_dir, gate_agent, tool_name, sink).await
+                }
+            } else if dedicated_google {
+                duduclaw_gateway::egress_gate::check_unattributed_employee(&self.home_dir, gate_agent, tool_name, sink)
+            } else {
+                duduclaw_gateway::egress_gate::check_external(&self.home_dir, gate_agent, tool_name, sink)
+            };
+            match decision {
+                Ok(Some(reason)) => { params_owned["egress_guard"] = reason; }
+                Ok(None) => {}
+                Err(message) => {
+                    self.audit_dispatch_denial(tool_name, &params_owned, "egress_guard", &message);
+                    return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+                }
+            }
+        }
+
         // ── 3.7 Install / operator-required approval (WP5 elevation, I3) ─────
         // Elevated from the individual tool handlers to this shared choke point
         // so `agent.toml [capabilities] approval_required_tools` is honoured for
@@ -1591,18 +1653,43 @@ impl McpDispatcher {
         // are already confined to the read-only whitelist and carry no per-agent
         // approval config, so they're skipped. Fail-closed: a denial/expiry/
         // broker-unavailable returns an error instead of dispatching.
+        if workflow.is_some() {
+            let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(&self.home_dir, gate_agent)
+                .unwrap_or_else(|| self.home_dir.join("agents").join(gate_agent));
+            let matches = duduclaw_core::agent_toml::load_action_rules(&dir)
+                .approval_matches_for_call(
+                    tool_name,
+                    duduclaw_core::tool_effect::effect_of_call(tool_name, params_owned.get("arguments").unwrap_or(&Value::Null)),
+                    params_owned.get("arguments").unwrap_or(&Value::Null),
+                );
+            if !matches.is_empty() {
+                params_owned["action_rule_matches"] = serde_json::json!(matches);
+                if params_owned.get("egress_guard").is_none() {
+                    params_owned["reason"] = serde_json::json!("action_rule");
+                }
+            }
+        }
+        if workflow.is_some()
+            && (params_owned.get("egress_guard").is_some()
+                || params_owned.get("action_rule_matches").is_some())
+        {
+            let grant = duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                gate_agent, tool_name, &params_owned,
+            );
+            params_owned["action_grant"] = grant.to_json();
+        }
         let google_approval_payload = if let Some(lane) = google_lane.as_mut() {
             match lane
                 .final_approval_payload(&self.home_dir, &params_owned, self.redaction.as_deref())
                 .await
             {
                 Ok(payload) => payload,
-                Err(message) => return jsonrpc_error(id, -32003, &message),
+                Err(message) => return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await,
             }
         } else {
             params_owned.clone()
         };
-        if employee_policy_applies {
+        if employee_policy_applies || params_owned.get("egress_guard").is_some() {
             // Keyed by the ACTING agent: with the internal key the client_id
             // is `gateway-internal`, whose `agents/gateway-internal/agent.toml`
             // does not exist, so approval_required_tools / irreversible_tools /
@@ -1622,23 +1709,24 @@ impl McpDispatcher {
             .await
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
-                return jsonrpc_error(id, -32003, &msg);
+                return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &msg)).await;
             }
         }
 
         if let Some(call) = &workflow {
             if call.is_prepare() {
-                return match call.finish_prepare(&params_owned) {
+                let response = match call.finish_prepare(&params_owned) {
                     Ok(ticket) => jsonrpc_response(id, ticket),
                     Err(error) => jsonrpc_error(id, -32003, &error),
                 };
+                return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), response).await;
             }
         }
         let operation_claim = if let Some(call) = &workflow {
             if !call.is_read() {
                 match call.before_effect(&params_owned).await {
                     Ok(value) => Some(value),
-                    Err(error) => return jsonrpc_error(id, -32003, &error),
+                    Err(error) => return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &error)).await,
                 }
             } else {
                 None
@@ -1655,7 +1743,7 @@ impl McpDispatcher {
                 .validate(&self.home_dir, &args, self.redaction.as_deref())
                 .await
             {
-                return jsonrpc_error(id, -32003, &message);
+                return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
             }
         }
         let effect_observation = Arc::new(std::sync::Mutex::new(
@@ -1674,6 +1762,35 @@ impl McpDispatcher {
                     .unwrap_or_else(|| serde_json::json!({})),
             )
         });
+        if let Some(message) = private_read_failure {
+            return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+        }
+        // Acquire only after all approval waits. Keep the scope guard through
+        // the handler. Uncertain dispatched calls retain the fence until lease TTL.
+        let sink_lease = if !principal.is_external && sink {
+            match duduclaw_gateway::egress_client::SinkLease::acquire(&self.home_dir, gate_agent, private_read.as_ref()).await {
+                Ok((lease, taint)) => {
+                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch(
+                        &self.home_dir, gate_agent, tool_name, true, taint, params_owned.get("egress_guard"),
+                    ) {
+                        return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+                    }
+                    Some(lease)
+                }
+                Err(reason) => {
+                    if let Err(message) = crate::mcp::egress_client::reservation_failure(&self.home_dir, gate_agent, tool_name, &reason) {
+                        return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+                    }
+                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch(
+                        &self.home_dir, gate_agent, tool_name, true,
+                        duduclaw_gateway::egress_guard::Taint::unknown(), params_owned.get("egress_guard"),
+                    ) {
+                        return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+                    }
+                    None
+                }
+            }
+        } else { None };
         let handler = crate::mcp_auth::with_accepted_google_call(
             accepted_google,
             crate::mcp::handle_tools_call(
@@ -1690,6 +1807,7 @@ impl McpDispatcher {
                 caller_is_admin,
             ),
         );
+        if let Some(lease) = &sink_lease { lease.dispatched(); }
         let mut result = if let Some(call) = &workflow {
             if call.is_read() {
                 crate::mcp::workflow_operation::READ_OBSERVATION
@@ -1703,6 +1821,26 @@ impl McpDispatcher {
         } else {
             handler.await
         };
+        // Built-in handlers flatten transport errors into JSON-RPC errors. Only
+        // successful completion proves the effect ended; local errors may hide
+        // a timeout/partial write and must keep the fence.
+        if crate::mcp::egress_gate::confirmed_sink_completion(tool_name, &result) {
+            if let Some(lease) = &sink_lease { lease.terminal_response(); }
+        }
+        let payload = crate::mcp::egress_gate::model_visible_payload(&result);
+        let completion = if let Some(read) = private_read {
+            read.finish(payload).await
+        } else if !principal.is_external && payload
+            && duduclaw_core::tool_effect::reads_private(tool_name).unwrap_or(true)
+        {
+            crate::mcp::egress_client::mark(&self.home_dir, gate_agent, tool_name).await
+        } else { Ok(()) };
+        if let Err(reason) = completion {
+            if let Err(message) = crate::mcp::egress_client::reservation_failure(&self.home_dir, gate_agent, tool_name, &reason) {
+                result = jsonrpc_error(id, -32003, &message);
+            }
+        }
+        if let Some(lease) = sink_lease { lease.release().await; }
         let workflow_response = if let Some(call) = &workflow {
             let response = if let Some((broker, claim)) = &operation_claim {
                 let observation = effect_observation
@@ -1899,6 +2037,14 @@ mod tests {
     // Helper: build a McpDispatcher backed by a temp dir (no real tools called).
     async fn make_dispatcher(tmp: &tempfile::TempDir) -> McpDispatcher {
         let home_dir = tmp.path().to_path_buf();
+        if !home_dir.join("config.toml").exists() {
+            std::fs::write(home_dir.join("config.toml"), "").unwrap();
+        }
+        let agent_dir = home_dir.join("agents/dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        if !agent_dir.join("agent.toml").exists() {
+            std::fs::write(agent_dir.join("agent.toml"), "").unwrap();
+        }
         let http = reqwest::Client::new();
         let memory_path = home_dir.join("memory.db");
         let memory = Arc::new(
@@ -1914,6 +2060,142 @@ mod tests {
             RateLimiter::new(),
             DailyQuota::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn egress_no_turn_employee_reads_require_gateway_but_external_reads_proceed() {
+        assert!(std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID).is_none());
+        assert!(std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS).is_none());
+        for mode in ["ask", "block", "shadow"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dispatcher = make_dispatcher(&tmp).await;
+            std::fs::write(tmp.path().join("config.toml"), format!("[security]\negress_guard='{mode}'\n")).unwrap();
+            let response = dispatcher.dispatch_tool_call(
+                &internal_principal(), &make_ns_ctx(false),
+                &make_params("tasks_list", serde_json::json!({})), &serde_json::json!(18),
+            ).await;
+            if mode == "shadow" {
+                assert!(response.get("result").is_some(), "{mode}: {response}");
+                assert_ne!(response["result"]["isError"], true, "{mode}: {response}");
+            } else {
+                // No gateway attestation means no employee read, even without
+                // a turn: an active per-agent sink cannot be ruled out locally.
+                assert_eq!(response["error"]["code"], -32003, "{mode}: {response}");
+            }
+            assert!(read_tool_call_rows(&tmp).iter().any(|r| r["egress_guard"] == "reservation_failed"
+                && r["sources"] == serde_json::json!(["tasks_list"])));
+            // Standalone mcp init issues external keys. They retain read access
+            // without a turn or a gateway, under their own namespace.
+            let external = dispatcher.dispatch_tool_call(
+                &make_principal(vec![Scope::MemoryRead], true), &make_ns_ctx(true),
+                &make_params("memory_search", serde_json::json!({"query":"missing"})), &serde_json::json!(20),
+            ).await;
+            assert!(external.get("result").is_some(), "{mode}: {external}");
+            assert_ne!(external["result"]["isError"], true, "{mode}: {external}");
+            let sink = crate::mcp::egress_gate::check(tmp.path(), "dudu", "send_message", true).await;
+            match mode {
+                "ask" => assert!(sink.unwrap().is_some()),
+                "block" => assert!(sink.is_err()),
+                _ => assert!(sink.unwrap().is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn egress_builtin_errors_do_not_attest_upstream_termination() {
+        for response in [
+            serde_json::json!({"id":1,"error":{"code":-1,"message":"timeout"}}),
+            serde_json::json!({"id":1,"result":{"isError":true,"content":[]}}),
+        ] { assert!(!crate::mcp::egress_gate::confirmed_sink_completion("send_message", &response)); }
+        let success = serde_json::json!({"id":1,"result":{"content":[]}});
+        assert!(crate::mcp::egress_gate::confirmed_sink_completion("web_fetch_cached", &success));
+        for tool in ["unknown_tool", "model_search", "model_download", "skill_search", "codrive_run", "browser_record_start", "os_open"] {
+            assert!(!crate::mcp::egress_gate::confirmed_sink_completion(tool, &success), "{tool}");
+        }
+        assert!(crate::mcp::egress_gate::confirmed_sink_completion("send_message",
+            &serde_json::json!({"id":1,"result":{"isError":false,"content":[]}})));
+    }
+
+    #[tokio::test]
+    async fn egress_builtin_transport_error_is_not_success_shaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let response = dispatcher.dispatch_tool_call(
+            &internal_principal(), &make_ns_ctx(false),
+            &make_params("send_message", serde_json::json!({"channel":"unknown", "chat_id":"test", "text":"test"})),
+            &serde_json::json!(17),
+        ).await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(!crate::mcp::egress_gate::confirmed_sink_completion("send_message", &response));
+    }
+
+    #[tokio::test]
+    async fn egress_shared_wiki_is_a_sink_but_private_wiki_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='block'\n").unwrap();
+        for (scope, blocked) in [(" Shared ", true), ("agent", false)] {
+            let response = dispatcher.dispatch_tool_call(
+                &internal_principal(), &make_ns_ctx(false),
+                &make_params("wiki_write", serde_json::json!({"scope":scope,"page_path":"a.md","content":"private"})),
+                &serde_json::json!(19),
+            ).await;
+            let egress_denied = response["error"]["message"].as_str().unwrap_or("").contains("外送防護");
+            assert_eq!(egress_denied, blocked, "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_block_refuses_unknown_turn_and_shadow_audits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='block'\n").unwrap();
+        let params = make_params("web_fetch_cached", serde_json::json!({"url":"https://example.invalid"}));
+        let result = dispatcher.dispatch_tool_call(&internal_principal(), &make_ns_ctx(false), &params, &serde_json::json!(9)).await;
+        assert_eq!(result["error"]["code"], -32003);
+        assert!(result["error"]["message"].as_str().unwrap().contains("外送防護"));
+        assert!(read_tool_call_rows(&tmp).iter().any(|r| r["error_class"] == "egress_guard"));
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        assert!(crate::mcp::egress_gate::check(tmp.path(), "dudu", "send_message", true).await.unwrap().is_none());
+        let rows = read_tool_call_rows(&tmp);
+        let shadow = rows.iter().find(|r| r["egress_guard"] == "would_ask").unwrap();
+        assert!(shadow["sources"].as_array().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn external_calls_apply_global_egress_policy_without_inheriting_an_employee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let principal = make_principal(vec![Scope::MessagingSend], true);
+        let params = make_params("send_message", serde_json::json!({"channel":"test", "chat_id":"out", "text":"private"}));
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='block'\n").unwrap();
+        let response = dispatcher.dispatch_tool_call(&principal, &make_ns_ctx(true), &params, &serde_json::json!(90)).await;
+        assert!(response["error"]["message"].as_str().unwrap().contains("外送防護"), "{response}");
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let _ = dispatcher.dispatch_tool_call(&principal, &make_ns_ctx(true), &params, &serde_json::json!(91)).await;
+        assert!(read_tool_call_rows(&tmp).iter().any(|r| r["egress_guard"] == "would_ask"));
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='ask'\n").unwrap();
+        let (record, response) = dispatch_held_then_decide(&tmp, principal, "send_message", params["arguments"].clone(), false).await;
+        assert_eq!(record.agent_id, "test-client");
+        assert_eq!(record.payload["egress_guard"]["sources"], serde_json::json!(["turn_state_unavailable"]));
+        assert!(record.payload.get("action_grant").is_some());
+        assert_eq!(response["error"]["code"], -32003);
+    }
+
+    #[tokio::test]
+    async fn egress_ask_and_action_rule_share_one_full_bound_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='ask'\n").unwrap();
+        write_acting_agent_toml(&tmp, "[capabilities]\naction_rules=[{tool='web_fetch_cached',verdict='ask'}]\n");
+        let args = serde_json::json!({"url": format!("https://example.invalid/{}", "完整內容".repeat(100))});
+        let (record, response) = dispatch_held_then_decide(&tmp, internal_principal(), "web_fetch_cached", args.clone(), false).await;
+        assert_eq!(record.payload["arguments"], args);
+        assert_eq!(record.payload["egress_guard"]["reason"], "egress_guard");
+        assert_eq!(record.payload["action_grant"]["args_digest"],
+            duduclaw_gateway::approval::action_grant::args_digest("dudu", "web_fetch_cached", &args));
+        assert_eq!(response["error"]["code"], -32003);
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert!(broker.list_pending(Some("dudu")).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3732,10 +4014,11 @@ effect = "forbid"
             let result = task.await.unwrap();
             panic!("call was never held for approval (gate fell open): {result}");
         };
-        broker
-            .decide(&rec.id, approve, "test-approver")
-            .await
-            .unwrap();
+        if rec.payload.get("egress_guard").is_some() {
+            broker.decide_egress_dashboard(&rec.id, &duduclaw_auth::UserContext::admin_fallback(), approve).await.unwrap();
+        } else {
+            broker.decide(&rec.id, approve, "test-approver").await.unwrap();
+        }
         let result = tokio::time::timeout(Duration::from_secs(30), task)
             .await
             .expect("dispatch must return once the approval is decided")

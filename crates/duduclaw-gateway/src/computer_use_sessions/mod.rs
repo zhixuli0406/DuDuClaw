@@ -1021,8 +1021,19 @@ impl ComputerUseSessions {
         detail: &str,
         args: &Value,
     ) -> Result<(), OpError> {
+        self.admit_with_egress(agent_id, tool, detail, args, None).await
+    }
+
+    async fn admit_with_egress(
+        &self,
+        agent_id: &str,
+        tool: &'static str,
+        detail: &str,
+        args: &Value,
+        egress: Option<&Value>,
+    ) -> Result<(), OpError> {
         gates::tool_gates(&self.home, agent_id, tool).await?;
-        if !gates::approval_required(&self.home, agent_id, tool) {
+        if egress.is_none() && !gates::approval_required(&self.home, agent_id, tool) {
             match gates::action_review(&self.home, agent_id, tool, args).await {
                 Ok(false) => return Ok(()),
                 Ok(true) => {}
@@ -1047,6 +1058,7 @@ impl ComputerUseSessions {
             tool,
             detail,
             args,
+            egress,
             self.approval_ttl_secs,
             self.approval_poll,
         )
@@ -1460,7 +1472,17 @@ impl ComputerUseSessions {
             }
             _ => (approval_detail(req), approval_action_snapshot(req)),
         };
-        self.admit(agent_id, tool, &detail, &grant_args).await?;
+        let egress = gates::egress_check(&self.home, agent_id, tool, turn_id)?;
+        let grant_args = if egress.is_some() {
+            let mut full = serde_json::to_value(req).expect("serializable action");
+            full["session_id"] = json!(session_id);
+            full
+        } else { grant_args };
+        self.admit_with_egress(agent_id, tool, &detail, &grant_args, egress.as_ref()).await?;
+        // A policy change during approval can only narrow this operation.
+        if gates::egress_check(&self.home, agent_id, tool, turn_id)?.is_some() && egress.is_none() {
+            return Err(OpError::new(ErrorCode::ApprovalDenied, "外送防護狀態已改變，請重新提出操作以取得完整內容核准。"));
+        }
         let mut session = self.locked(agent_id, session_id).await?;
         session.last_activity = Instant::now();
         self.ensure_not_paused(&session).await?;

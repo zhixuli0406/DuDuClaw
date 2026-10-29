@@ -18,6 +18,40 @@ use std::{
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_duduclaw");
+
+struct EgressGateway {
+    port: u16,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl EgressGateway {
+    async fn start(home: &Path) -> Self {
+        // setup() provisions the same internal MCP and identity keys as production.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind isolated egress gateway loopback listener");
+        let port = listener.local_addr().unwrap().port();
+        let app = duduclaw_gateway::egress_guard::router(std::sync::Arc::new(
+            duduclaw_gateway::egress_guard::RouteState::new(home.to_path_buf()),
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("serve isolated egress gateway routes");
+        });
+        Self { port, server }
+    }
+}
+
+impl Drop for EgressGateway {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 struct Session {
     client: McpClient,
     id: String,
@@ -69,6 +103,8 @@ async fn session_with_env(
 }
 fn setup() -> (tempfile::TempDir, String) {
     let home = tempfile::tempdir().unwrap();
+    // An initialized instance defaults to shadow, as does a missing config.
+    std::fs::write(home.path().join("config.toml"), "").unwrap();
     for actor in ["alice", "bob"] {
         let dir = home.path().join("agents").join(actor);
         std::fs::create_dir_all(&dir).unwrap();
@@ -624,8 +660,7 @@ async fn authorized_ticket(
         &prepare.mac,
     )
     .unwrap();
-    let payload =
-        json!({"name":prepare.effective.tool,"arguments":prepare.effective.effective_arguments});
+    let payload = prepare.effective.payload();
     let ctx = DecisionContext {
         channel: "dashboard".into(),
         account_id: "fixture-account".into(),
@@ -669,7 +704,25 @@ async fn authorized_ticket(
         )
         .await
         .unwrap();
-    broker.decide_bound(&approval, &ctx, true).await.unwrap();
+    if prepare.effective.payload().get("egress_guard").is_some() {
+        // Egress approvals require a current Admin through the dashboard path.
+        let users = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+        let admin = users
+            .create_user(
+                "egress-admin@test.invalid",
+                "Egress admin",
+                "isolated-test-password",
+                duduclaw_auth::UserRole::Admin,
+            )
+            .unwrap();
+        let admin_ctx = users.live_user_context(&admin.id).unwrap().unwrap();
+        broker
+            .decide_bound_dashboard(&approval, &admin_ctx, true)
+            .await
+            .unwrap();
+    } else {
+        broker.decide_bound(&approval, &ctx, true).await.unwrap();
+    }
     let operation = broker
         .prepare_operation(&approval, &prepare.effective.step_key, None)
         .await

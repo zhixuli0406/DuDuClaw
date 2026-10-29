@@ -89,6 +89,9 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
         ]
     );
     assert_eq!(ml["enabled"].as_bool(), Some(true));
+    assert_eq!(ml["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(), Some("${DUDUCLAW_AGENT_TOKEN:-}"));
+    assert_eq!(ml["env"]["DUDUCLAW_TURN_ID"].as_str(), Some("${DUDUCLAW_TURN_ID:-}"));
+
     let exe = duduclaw_core::resolve_duduclaw_bin();
     assert_eq!(ml["command"].as_str(), Some(exe.to_string_lossy().as_ref()));
     assert_eq!(
@@ -97,7 +100,6 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
         "Grok expands the per-spawn directory from its own environment"
     );
     assert_eq!(ml["env"]["DUDUCLAW_AGENT_ID"].as_str(), Some("trader"));
-    assert!(ml["env"].get("DUDUCLAW_AGENT_TOKEN").is_none());
     // The persistent file never carries the upstream credentials.
     assert!(!raw.contains("broker-secret-pw"), "{raw}");
     assert!(!raw.contains("DUDUCLAW_MCP_PROXY_ENV\""), "{raw}");
@@ -105,6 +107,10 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
     let env_dir = p.env_dir.expect("an env directory for this spawn");
     let body = std::fs::read_to_string(env_dir.path().join("masterlink.json")).unwrap();
     assert!(body.contains("broker-secret-pw"));
+    // Runtime identity belongs to the proxy, never the upstream server.
+    let upstream: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(upstream.get("DUDUCLAW_AGENT_TOKEN").is_none());
+    assert!(upstream.get("DUDUCLAW_TURN_ID").is_none());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -1660,18 +1660,25 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
 /// `runtime::duduclaw_mcp_server_json` (self-identify via `DUDUCLAW_AGENT_ID` +
 /// the multi-instance overrides) so the API-path tool loop reaches the same MCP
 /// tools the CLI backends do.
+#[cfg(test)]
 fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
+    mcp_client_envs_in(agent_id, &duduclaw_core::platform::duduclaw_home())
+}
+
+fn mcp_client_envs_in(agent_id: &str, home: &Path) -> Vec<(String, String)> {
     // Identity pair: id + (when `<home>/identity.key` exists) the WP21 debt ⑧
     // `DUDUCLAW_AGENT_TOKEN`. Without the token this path is the one MCP
     // spawn point that `[delegation] require_identity_token = true` would
     // refuse to boot — API-mode agents would silently lose their whole tool
     // surface the moment an operator enables strict mode.
-    let mut envs = duduclaw_core::agent_identity_env_vars_default(agent_id);
+    let mut envs = duduclaw_core::agent_identity_env_vars(home, agent_id);
     // Shared forward set (home/port/instance + MCP auth) — see
     // `duduclaw_core::mcp_forward_env_vars`. The spawned mcp-server inherits
     // this process env too, but the explicit pairs keep the tool loop working
     // even if a future spawn path sanitizes the child env.
-    envs.extend(duduclaw_core::mcp_forward_env_vars());
+    envs.extend(duduclaw_core::mcp_forward_env_vars().into_iter()
+        .filter(|(key, _)| key != "DUDUCLAW_HOME"));
+    envs.push(("DUDUCLAW_HOME".into(), home.to_string_lossy().into_owned()));
     // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
     envs.extend(crate::runtime::round_task_env());
     // The explore lane (`crate::explore_lane`, either source): the
@@ -1808,7 +1815,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         duduclaw_llm::McpClient::connect(
             &bin.to_string_lossy(),
             &["mcp-server".to_string()],
-            &mcp_client_envs(agent_id),
+            &mcp_client_envs_in(agent_id, &home_dir),
             duduclaw_llm::DEFAULT_MCP_TIMEOUT,
         )
         .await
@@ -1847,8 +1854,10 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     )];
     let mut filters = vec![duduclaw_llm::ToolFilter::default()];
     let mut google_guards = Vec::new();
+    let mut external_boundaries = Vec::new();
     for ext in externals {
         if let Some(mount) = ext.google_closed.clone() {
+            external_boundaries.push((clients.len(), ext.name.clone()));
             clients.push((ext.name.clone(), mount.registry_slot()));
             filters.push(ext.filter);
             continue;
@@ -1878,6 +1887,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         match connected {
             Ok(c) => {
                 info!(server = %ext.name, "external MCP server mounted");
+                external_boundaries.push((clients.len(), ext.name.clone()));
                 if let Some(guard) = ext.google_guard {
                     google_guards.push((clients.len(), guard));
                 }
@@ -1920,6 +1930,12 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     let registry = match duduclaw_llm::ToolRegistry::from_client_slots_named(clients, filters).await
     {
         Ok(mut reg) => {
+            for (client, server) in external_boundaries {
+                let boundary = crate::egress_registry::RegistryBoundary::new(&home_dir, agent_id, &server);
+                if reg.register_client_boundary(client, std::sync::Arc::new(boundary)).is_err() {
+                    return Err("external MCP egress boundary unavailable".into());
+                }
+            }
             for (client, guard) in google_guards {
                 if let Some(notice) = guard.fallback_notice()
                     && reg.set_client_notice(client, notice).is_err()
@@ -5260,6 +5276,16 @@ mod chain_tests {
             envs.iter()
                 .any(|(k, v)| k == duduclaw_core::ENV_AGENT_ID && v == "agnes")
         );
+    }
+
+    #[test]
+    fn mcp_client_envs_use_the_explicit_home_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let key = duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let envs = mcp_client_envs_in("agnes", home.path());
+        let pairs: std::collections::HashMap<_, _> = envs.into_iter().collect();
+        assert_eq!(pairs["DUDUCLAW_HOME"], home.path().to_string_lossy());
+        assert_eq!(pairs[duduclaw_core::ENV_AGENT_TOKEN], duduclaw_core::mint_identity_token(&key, "agnes"));
     }
 
     /// P2-B N4: the openai-compat tool loop's MCP server gets the turn and

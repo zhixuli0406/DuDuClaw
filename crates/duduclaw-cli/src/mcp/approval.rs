@@ -74,7 +74,8 @@ pub(crate) fn static_gate_flags(
         tool_name,
         payload.get("arguments").unwrap_or(&Value::Null),
     );
-    let always = install_approval_required(agent_dir, tool_name, false)
+    let always = payload.get("egress_guard").is_some()
+        || install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
         || crate::mcp_dispatch::action_rule_verdict_for_call(
             &duduclaw_core::agent_toml::load_action_rules(agent_dir),
@@ -458,10 +459,11 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
     home_dir: &Path,
     agent_id: &str,
     tool_name: &str,
-    payload: Value,
+    mut payload: Value,
     workflow: Option<&super::workflow_operation::WorkflowCall>,
 ) -> std::result::Result<(), String> {
-    if tool_name == "skill_hub_install" {
+    let egress_ask = payload.get("egress_guard").is_some();
+    if tool_name == "skill_hub_install" && !egress_ask {
         // Keeps its own post-scan install gate (`handle_skill_hub_install`);
         // the action review (default off) only adds a refusal or a person's
         // approval in front of it.
@@ -490,6 +492,20 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
     let agent_dir = caller_agent_dir(home_dir, agent_id);
 
     // ── P2b ActionGuard: three-value irreversibility gate ────────────────────
+    // Workflow metadata is already host-built by the dispatcher and bound
+    // into its prepare ticket; never mutate a local clone of that payload.
+    if workflow.is_none() {
+        let rules = duduclaw_core::agent_toml::load_action_rules(&agent_dir);
+        let rule_matches = rules.approval_matches_for_call(
+            tool_name,
+            duduclaw_core::effect_of(tool_name),
+            payload.get("arguments").unwrap_or(&Value::Null),
+        );
+        payload["action_rule_matches"] = serde_json::json!(rule_matches);
+        if !rule_matches.is_empty() && !egress_ask {
+            payload["reason"] = serde_json::json!("action_rule");
+        }
+    }
     // Stage 1 — static classification, take-the-stricter. `in_always` folds in
     // the legacy `approval_required_tools` + install-class gate
     // (`install_approval_required`) so pre-P2b configs behave **identically**;
@@ -602,7 +618,9 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
         ActionGate::Auto => Ok(()),
         ActionGate::RequireApproval => {
             if let Some(workflow) = workflow {
-                let reason = if asked_by_review {
+                let reason = if egress_ask {
+                    "egress_guard"
+                } else if asked_by_review {
                     "action_review_require_approval"
                 } else {
                     "action_guard_require_approval"
@@ -621,7 +639,9 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
             // 說明") and stamp it structurally on the approval row
             // (`request_with_simulation`) so the D2 channel push can render
             // the "若核准，接下來預計" forward-trajectory line.
-            let mut summary = if asked_by_review {
+            let mut summary = if egress_ask {
+                format!("工具「{tool_name}」將在讀取私人資料後向外傳送資料，需確認完整內容與目的地（egress_guard）。")
+            } else if asked_by_review {
                 format!(
                     "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）要求人工確認，需經管理員核可後才能執行"
                 )
@@ -654,8 +674,11 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 payload.get("arguments").unwrap_or(&Value::Null),
             )
             .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask);
+            if ask_rule && !egress_ask {
+                payload["reason"] = serde_json::json!("action_rule");
+            }
             let grant =
-                duduclaw_gateway::approval::action_grant::binding_applies(tool_name, ask_rule)
+                duduclaw_gateway::approval::action_grant::binding_applies_for_request(tool_name, ask_rule, egress_ask)
                     .then(|| {
                         duduclaw_gateway::approval::action_grant::ActionGrant::build(
                             agent_id, tool_name, &payload,
@@ -974,6 +997,9 @@ pub(crate) async fn handle_capability_request(
     if reason.is_empty() {
         return tool_error("capability_request 需要 reason 參數（向人工說明用途）");
     }
+    if !capability_grants::standing_grant_allowed(tool) {
+        return tool_error("購買與刪除工具不能申請常駐授權，請逐次取得核准或由動作規則允許。");
+    }
 
     // The tool must actually be listed in scoped_tools — otherwise a grant is
     // meaningless (the tool is either freely allowed or hard-denied elsewhere).
@@ -1092,6 +1118,20 @@ pub(crate) async fn handle_capability_request(
             tool_error("等待授權決定時發生錯誤，已拒絕（fail-closed）。")
         }
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn capability_request_refuses_purchase_and_delete_without_an_approval() {
+    let home = tempfile::tempdir().unwrap();
+    for tool in ["odoo_sale_confirm", "agent_remove", "MCP__DUDUCLAW__DELETE_CRON_TASK"] {
+        let response = handle_capability_request(
+            &serde_json::json!({"tool": tool, "reason": "test"}), home.path(), "alice",
+        ).await;
+        assert_eq!(response["isError"], true, "{tool}");
+        assert!(response.to_string().contains("不能申請常駐授權"));
+    }
+    assert!(!home.path().join("approvals.db").exists());
 }
 
 #[cfg(test)]

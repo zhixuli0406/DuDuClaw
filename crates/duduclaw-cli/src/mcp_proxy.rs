@@ -63,7 +63,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -75,7 +76,7 @@ use duduclaw_redaction::EgressDecision;
 use crate::mcp_redaction::{
     McpRedactionLayer, decide_tool_args_with, egress_deny_response, redact_tool_result_with,
 };
-use duduclaw_gateway::third_party_tools::ThirdPartyGate;
+use duduclaw_gateway::third_party_tools::{DispatchPermit, ThirdPartyGate};
 
 /// Env var carrying the upstream server's `.mcp.json` `env` map, JSON-encoded.
 /// Written by the gateway's config rewrite, consumed (and removed) here.
@@ -109,6 +110,17 @@ pub const PROXY_PRIVATE_ENV: &[&str] = &[
     "DUDUCLAW_MCP_API_KEY",
     "DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED",
     "DUDUCLAW_REDACTION_SCOPES",
+    "DUDUCLAW_TURN_ID",
+    "DUDUCLAW_EGRESS_TURN_ID",
+    "DUDUCLAW_SESSION_ID",
+    "DUDUCLAW_TURN_USER_MESSAGE_SEQ",
+    "DUDUCLAW_TURN_USER_MESSAGE_AT",
+    "DUDUCLAW_DISPATCH_SESSION",
+    "DUDUCLAW_DISPATCH_RUN_ID",
+    "DUDUCLAW_UPSTREAM_UNKNOWN",
+    "DUDUCLAW_ON_BEHALF_OF",
+    "DUDUCLAW_TASK_ID",
+
 ];
 
 // ── Pure frame helpers (unit-tested without any process) ────────────────────
@@ -122,7 +134,8 @@ pub fn parse_frame(line: &str) -> Option<Value> {
 /// Extract `(id, tool_name, arguments)` from a `tools/call` request.
 ///
 /// Returns `None` for every other method, for notifications (no `id`), and
-/// for a malformed `params` — all of which are forwarded untouched.
+/// for malformed `params`. The proxy loop refuses malformed tool calls;
+/// other protocol traffic retains its passthrough behavior.
 pub fn tool_call_of(frame: &Value) -> Option<(Value, String, Value)> {
     if frame.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
         return None;
@@ -181,9 +194,22 @@ pub fn with_restored_args(frame: &Value, args: Value) -> Value {
 
 /// In-flight `tools/call` requests, keyed by [`id_key`], so the response can
 /// be redacted with the call's own `(tool, arguments)` context.
+const MAX_PENDING_CALLS: usize = 512;
+const PENDING_CALL_TTL: Duration = Duration::from_secs(300);
+const MAX_ACTIVE_CALLS: usize = 512;
+const CORRELATION_PREFIX: &str = "duduclaw-proxy:";
+
+#[derive(Debug)]
+struct PendingContext {
+    tool: String,
+    args: Value,
+    generation: String,
+    deadline: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct PendingCalls {
-    inner: HashMap<String, (String, Value)>,
+    inner: HashMap<String, PendingContext>,
 }
 
 impl PendingCalls {
@@ -191,27 +217,106 @@ impl PendingCalls {
         Self::default()
     }
 
-    /// Remember a dispatched call. `tool` is already namespaced.
-    pub fn insert(&mut self, id: &Value, tool: String, args: Value) {
-        if let Some(k) = id_key(id) {
-            self.inner.insert(k, (tool, args));
+    /// Never replace a live call's redaction context with a duplicate ID.
+    pub fn insert(&mut self, id: &Value, tool: String, args: Value) -> std::result::Result<String, &'static str> {
+        let key = id_key(id).filter(|k| k.len() <= 258)
+            .ok_or("工具呼叫的識別碼無效，已拒絕。")?;
+        let now = Instant::now();
+        self.inner.retain(|_, entry| entry.deadline > now);
+        if self.inner.contains_key(&key) {
+            return Err("工具呼叫的識別碼重複，請等候原呼叫結束後再試。");
+        }
+        if self.inner.len() >= MAX_PENDING_CALLS {
+            return Err("等候中的工具呼叫已達上限，請稍後再試。");
+        }
+        let generation = uuid::Uuid::new_v4().to_string();
+        self.inner.insert(key, PendingContext {
+            tool, args, generation: generation.clone(), deadline: now + PENDING_CALL_TTL,
+        });
+        Ok(generation)
+    }
+
+    pub fn take(&mut self, id: &Value) -> Option<(String, Value)> {
+        let entry = self.inner.remove(&id_key(id)?)?;
+        (entry.deadline > Instant::now()).then_some((entry.tool, entry.args))
+    }
+
+    fn remove_generation(&mut self, id: &Value, generation: &str) -> Option<PendingContext> {
+        let key = id_key(id)?;
+        if self.inner.get(&key).is_some_and(|entry| entry.generation == generation) {
+            self.inner.remove(&key)
+        } else { None }
+    }
+
+    pub fn len(&self) -> usize { self.inner.len() }
+    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+}
+
+/// Owns the slot until the upstream write completes. Every local refusal, cancellation,
+/// parse error or failed write drops it without touching a newer call.
+struct PendingSlot {
+    pending: Arc<Mutex<PendingCalls>>,
+    id: Value,
+    generation: String,
+    armed: bool,
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove_generation(&self.id, &self.generation);
+            }
         }
     }
+}
 
-    /// Take the context for an answered call. `None` ⇒ not one of ours
-    /// (a `tools/list` response, a server-initiated request, a duplicate id).
-    pub fn take(&mut self, id: &Value) -> Option<(String, Value)> {
-        let k = id_key(id)?;
-        self.inner.remove(&k)
+struct PreparedFrame {
+    line: String,
+    slot: Option<PendingSlot>,
+}
+
+impl PreparedFrame {
+    fn queued(self, permit: Option<DispatchPermit>) -> QueuedFrame {
+        QueuedFrame { line: self.line, permit, slot: self.slot }
+    }
+}
+
+struct QueuedFrame {
+    line: String,
+    permit: Option<DispatchPermit>,
+    slot: Option<PendingSlot>,
+}
+
+impl QueuedFrame {
+    fn dispatch_allowed(&self) -> bool {
+        self.permit.as_ref().is_none_or(DispatchPermit::is_live)
     }
 
-    pub fn len(&self) -> usize {
-        self.inner.len()
+    fn forwarded(&mut self) {
+        if let Some(slot) = &mut self.slot { slot.armed = false; }
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
+// A fresh wire ID makes expired responses distinguishable from unrelated
+// protocol traffic and prevents an old response from consuming a reused ID.
+fn wire_id(id: &Value, generation: &str) -> Value {
+    Value::String(format!("{CORRELATION_PREFIX}{generation}:{id}"))
+}
+
+fn correlation(id: &Value) -> Option<(Value, String)> {
+    let encoded = id.as_str()?.strip_prefix(CORRELATION_PREFIX)?;
+    let (generation, original) = encoded.split_once(':')?;
+    uuid::Uuid::parse_str(generation).ok()?;
+    let original: Value = serde_json::from_str(original).ok()?;
+    id_key(&original)?;
+    Some((original, generation.into()))
+}
+
+/// Reap without waiting; returning false never queues another held call.
+fn call_capacity(held: &mut tokio::task::JoinSet<()>) -> bool {
+    while held.try_join_next().is_some() {}
+    held.len() < MAX_ACTIVE_CALLS
 }
 
 /// Split the upstream environment: this process's env minus
@@ -335,17 +440,21 @@ pub async fn run_proxy_io_gated(
 
     // One writer owns `upstream_in` too: a call held for approval is
     // forwarded later, from its own task.
-    let (up_tx, mut up_rx) = mpsc::unbounded_channel::<String>();
+    let pending = Arc::new(Mutex::new(PendingCalls::new()));
+    let (up_tx, mut up_rx) = mpsc::unbounded_channel::<QueuedFrame>();
+    let writer_gate = gate.clone();
+    let writer_pending = pending.clone();
     let up_writer = tokio::spawn(async move {
-        while let Some(line) = up_rx.recv().await {
-            if write_line(&mut upstream_in, &line).await.is_err() {
+        while let Some(mut frame) = up_rx.recv().await {
+            if write_queued_frame(&mut upstream_in, &mut frame).await.is_err() {
+                if let Ok(mut pending) = writer_pending.lock() { pending.inner.clear(); }
+                if let Some(gate) = &writer_gate { gate.close_pending(); }
                 break;
             }
         }
         // Dropping `upstream_in` closes the upstream's stdin.
     });
 
-    let pending = Arc::new(tokio::sync::Mutex::new(PendingCalls::new()));
     let list_ids = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
 
     // ── upstream → client ────────────────────────────────────────────
@@ -366,33 +475,80 @@ pub async fn run_proxy_io_gated(
                 let out = match parse_frame(&line) {
                     // Non-JSON: opaque, forward verbatim.
                     None => line,
-                    Some(frame) => {
+                    Some(mut frame) => {
+                        let mut line = line;
+                        let upstream_id = frame.get("id").cloned();
+                        let context = if layer.is_some() {
+                            match response_context(&pending, &mut frame) {
+                                Ok(context) => context,
+                                Err(refusal) => {
+                                    if tx.send(refusal).is_err() { break; }
+                                    continue;
+                                }
+                            }
+                        } else { None };
+                        if let Some(gate) = gate.as_ref() {
+                            let client_id = frame.get("id").cloned();
+                            // The gate correlates the unique upstream generation,
+                            // including when a client ID has since been reused.
+                            if context.is_some() {
+                                if let Some(id) = upstream_id { frame["id"] = id; }
+                            }
+                            gate.observe_response(&mut frame).await;
+                            if context.is_some() {
+                                if let Some(id) = client_id { frame["id"] = id; }
+                            }
+                            line = frame.to_string();
+                        }
                         let (frame, line) = filter_listing(gate.as_deref(), &list_ids, frame, line);
-                        rewrite_upstream_frame(layer.as_deref(), &pending, frame, line).await
+                        rewrite_upstream_frame(layer.as_deref(), frame, line, context)
                     }
                 };
                 if tx.send(out).is_err() {
                     break;
                 }
             }
+            if let Ok(mut pending) = pending.lock() { pending.inner.clear(); }
+            if let Some(gate) = &gate { gate.close_pending(); }
         })
     };
 
     // ── client → upstream ────────────────────────────────────────────
     let mut held = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(client_in).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = tokio::select! {
+            completed = held.join_next(), if !held.is_empty() => {
+                let _ = completed;
+                continue;
+            }
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => line,
+                _ => break,
+            },
+        };
+        call_capacity(&mut held);
         if line.trim().is_empty() {
             continue;
         }
         let Some(frame) = parse_frame(&line) else {
             // Opaque line — forward verbatim.
-            if up_tx.send(line).is_err() {
+            if up_tx.send(QueuedFrame { line, permit: None, slot: None }).is_err() {
                 break;
             }
             continue;
         };
 
+        if !frame.is_object()
+            || (frame.get("method").and_then(Value::as_str) == Some("tools/call")
+                && tool_call_of(&frame).is_none())
+        {
+            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
+                &frame.get("id").cloned().unwrap_or(Value::Null),
+                "Malformed tools/call cannot pass the egress gate.",
+            ));
+            continue;
+        }
         if let Some(gate) = gate.as_ref() {
             if frame.get("method").and_then(|m| m.as_str()) == Some("tools/list")
                 && let Some(k) = frame.get("id").and_then(id_key)
@@ -401,35 +557,39 @@ pub async fn run_proxy_io_gated(
                 ids.insert(k);
             }
             if let Some((id, tool, _)) = tool_call_of(&frame) {
-                match gate.decide(&tool).1 {
-                    duduclaw_core::ThirdPartyDecision::Allow => {}
-                    duduclaw_core::ThirdPartyDecision::Block(_) => {
-                        let msg = gate.check_call(&tool).await.err().unwrap_or_default();
-                        let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
-                        continue;
-                    }
-                    duduclaw_core::ThirdPartyDecision::Ask => {
-                        // Wait for a person without stalling the stream.
-                        let (gate, tx, up_tx) = (gate.clone(), tx.clone(), up_tx.clone());
-                        let (pending, layer) = (pending.clone(), layer.clone());
-                        let server = server.to_string();
-                        held.spawn(async move {
-                            match gate.check_call(&tool).await {
-                                Ok(()) => {
-                                    if let Some(payload) =
-                                        prepare_upstream(&server, layer.as_deref(), &pending, &tx, &frame, &line).await
-                                    {
-                                        let _ = up_tx.send(payload);
-                                    }
-                                }
-                                Err(msg) => {
-                                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
-                                }
-                            }
-                        });
-                        continue;
-                    }
+                if !call_capacity(&mut held) {
+                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
+                        &id, "同時執行的工具呼叫已達上限，請稍後再試。",
+                    ));
+                    continue;
                 }
+                if matches!(gate.decide(&tool).1, duduclaw_core::ThirdPartyDecision::Block(_)) {
+                    let msg = gate.check_call(&tool).await.err().unwrap_or_default();
+                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                    continue;
+                }
+                // Restore before approval so the card and digest describe the
+                // exact upstream payload. Waiting must not stall other replies.
+                let Some(payload) = prepare_upstream(server, layer.as_deref(), &pending, &tx, &frame, &line).await else { continue; };
+                let effective: Value = match serde_json::from_str(&payload.line) { Ok(v) => v, Err(_) => continue };
+                let args = effective["params"]["arguments"].clone();
+                let gate_id = effective["id"].clone();
+                let (gate, tx, up_tx) = (gate.clone(), tx.clone(), up_tx.clone());
+                held.spawn(async move {
+                    match gate.begin_call(&gate_id, &tool, &args).await {
+                        Ok(call) => {
+                            if up_tx.send(payload.queued(Some(call.dispatch_permit()))).is_ok() {
+                                call.wait().await;
+                            } else {
+                                call.finish_empty().await;
+                            }
+                        }
+                        Err(msg) => {
+                            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                        }
+                    }
+                });
+                continue;
             }
         }
 
@@ -437,7 +597,7 @@ pub async fn run_proxy_io_gated(
         else {
             continue;
         };
-        if up_tx.send(payload).is_err() {
+        if up_tx.send(payload.queued(None)).is_err() {
             break;
         }
     }
@@ -459,37 +619,53 @@ pub async fn run_proxy_io_gated(
 async fn prepare_upstream(
     server: &str,
     layer: Option<&McpRedactionLayer>,
-    pending: &Arc<tokio::sync::Mutex<PendingCalls>>,
+    pending: &Arc<Mutex<PendingCalls>>,
     tx: &mpsc::UnboundedSender<String>,
     frame: &Value,
     line: &str,
-) -> Option<String> {
-    match (layer, tool_call_of(frame)) {
-        // Redaction off, or not a tools/call → verbatim.
-        (None, _) | (_, None) => Some(line.to_string()),
-        (Some(layer), Some((id, tool, args))) => {
-            let ns = namespaced_tool(server, &tool);
-            match decide_args(layer, &ns, &args) {
-                ArgDecision::Deny {
-                    reason,
-                    tokens_seen,
-                } => {
-                    // Answer here; the call NEVER reaches upstream.
-                    let resp = egress_deny_response(&id, &ns, &reason, tokens_seen);
-                    let _ = tx.send(resp.to_string());
-                    None
-                }
-                ArgDecision::Forward(restored) => {
-                    let effective_args = restored.clone().unwrap_or_else(|| args.clone());
-                    pending.lock().await.insert(&id, ns, effective_args);
-                    match restored {
-                        Some(new_args) => Some(with_restored_args(frame, new_args).to_string()),
-                        None => Some(line.to_string()),
-                    }
+) -> Option<PreparedFrame> {
+    let (Some(layer), Some((id, tool, args))) = (layer, tool_call_of(frame)) else {
+        // Propagate cancellation using the same wire ID as the tool request.
+        if frame.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            if let Some(id) = frame.pointer("/params/requestId") {
+                if let Some(generation) = pending.lock().ok().and_then(|p| {
+                    p.inner.get(&id_key(id)?).map(|entry| entry.generation.clone())
+                }) {
+                    let mut frame = frame.clone();
+                    frame["params"]["requestId"] = wire_id(id, &generation);
+                    return Some(PreparedFrame { line: frame.to_string(), slot: None });
                 }
             }
         }
-    }
+        return Some(PreparedFrame { line: line.into(), slot: None });
+    };
+    let ns = namespaced_tool(server, &tool);
+    let restored = match decide_args(layer, &ns, &args) {
+        ArgDecision::Deny { reason, tokens_seen } => {
+            let _ = tx.send(egress_deny_response(&id, &ns, &reason, tokens_seen).to_string());
+            return None;
+        }
+        ArgDecision::Forward(restored) => restored,
+    };
+    let effective_args = restored.clone().unwrap_or_else(|| args.clone());
+    let generation = match pending.lock().map_err(|_| "工具呼叫狀態無法讀取，已拒絕。")
+        .and_then(|mut p| p.insert(&id, ns, effective_args))
+    {
+        Ok(generation) => generation,
+        Err(reason) => {
+            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, reason));
+            return None;
+        }
+    };
+    let mut frame = match restored {
+        Some(args) => with_restored_args(frame, args),
+        None => frame.clone(),
+    };
+    frame["id"] = wire_id(&id, &generation);
+    Some(PreparedFrame {
+        line: frame.to_string(),
+        slot: Some(PendingSlot { pending: pending.clone(), id, generation, armed: true }),
+    })
 }
 
 /// When `frame` answers a `tools/list` this proxy saw, let the gate hide the
@@ -556,42 +732,69 @@ fn decide_args(layer: &McpRedactionLayer, ns_tool: &str, args: &Value) -> ArgDec
     }
 }
 
-/// Redact a `tools/call` response's `result` when it answers a call we
-/// remembered. Returns the line to write out.
-async fn rewrite_upstream_frame(
+/// Claim the redaction context before the gate's completion notification can
+/// wake its waiter. Expired generations never consume a replacement call.
+fn response_context(
+    pending: &Arc<Mutex<PendingCalls>>, frame: &mut Value,
+) -> std::result::Result<Option<PendingContext>, String> {
+    if !is_response(frame) { return Ok(None); }
+    let Some((id, generation)) = frame.get("id").and_then(correlation) else { return Ok(None); };
+    frame["id"] = id.clone();
+    let entry = pending.lock().ok().and_then(|mut p| p.remove_generation(&id, &generation));
+    entry.filter(|entry| entry.deadline > Instant::now()).map(Some).ok_or_else(|| {
+        duduclaw_gateway::third_party_tools::refusal_frame(
+            &id, "工具回應已逾時或無法確認原呼叫，內容已扣留，請重新呼叫。",
+        )
+    })
+}
+
+/// Redact using the context claimed before observing terminal completion.
+fn rewrite_upstream_frame(
     layer: Option<&McpRedactionLayer>,
-    pending: &Arc<tokio::sync::Mutex<PendingCalls>>,
-    frame: Value,
+    mut frame: Value,
     original: String,
+    context: Option<PendingContext>,
 ) -> String {
-    let Some(layer) = layer else {
-        return original;
-    };
-    if !is_response(&frame) {
-        // A server-initiated request (sampling/createMessage, roots/list) —
-        // forwarded untouched in both directions.
-        return original;
-    }
-    let Some(id) = frame.get("id") else {
-        return original;
-    };
-    let Some((tool, args)) = pending.lock().await.take(id) else {
-        return original;
-    };
-    let mut frame = frame;
+    let (Some(layer), Some(entry)) = (layer, context) else { return original; };
     let Some(result) = frame.get_mut("result") else {
-        // An error response: nothing to redact (and the tool never ran).
-        return original;
+        return frame.to_string();
     };
     redact_tool_result_with(
         &layer.manager,
-        &tool,
+        &entry.tool,
         result,
         &layer.agent_id,
         &layer.session_id,
-        Some(&args),
+        Some(&entry.args),
     );
     frame.to_string()
+}
+
+async fn write_queued_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W, frame: &mut QueuedFrame,
+) -> std::io::Result<bool> {
+    // A queued call may have timed out or been canceled while an earlier
+    // write stalled. The permit holds its lease across this write and flush.
+    if !frame.dispatch_allowed() { return Ok(false); }
+    if let Some(permit) = &mut frame.permit {
+        // Mark before writing: cancellation or an error may leave a partial frame.
+        permit.dispatched();
+        tokio::select! {
+            biased;
+            _ = permit.cancelled() => {
+                // The frame may be partially written. The caller must close
+                // the pipe rather than send another frame after this error.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted, "工具呼叫已取消或逾時，已停止傳送。",
+                ));
+            }
+            result = write_line(writer, &frame.line) => result?,
+        }
+    } else {
+        write_line(writer, &frame.line).await?;
+    }
+    frame.forwarded();
+    Ok(true)
 }
 
 async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> std::io::Result<()> {
@@ -733,6 +936,20 @@ pub async fn run_mcp_proxy_scoped(
     cmd.args(args);
     cmd.env_clear();
     cmd.envs(env_pairs);
+    if upstream_is_bridge {
+        // This is this executable's exact remote-bridge subcommand, not an
+        // external server. It needs host identity to sign its ledger calls.
+        for key in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE",
+            duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN,
+            duduclaw_core::ENV_MCP_API_KEY, duduclaw_core::ENV_TRUST_TURN_ID,
+            duduclaw_core::egress_guard::ENV_TURN_ALIAS,
+            duduclaw_core::ENV_TASK_ID, duduclaw_core::ENV_ON_BEHALF_OF]
+        {
+            cmd.env_remove(key);
+            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+        }
+    }
+
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     // stderr is inherited so the upstream's diagnostics still reach the
@@ -841,7 +1058,7 @@ mod tests {
     #[test]
     fn pending_calls_bookkeeping_is_take_once() {
         let mut p = PendingCalls::new();
-        p.insert(&json!(1), "fakepg.pg_select".into(), json!({"table": "t"}));
+        p.insert(&json!(1), "fakepg.pg_select".into(), json!({"table": "t"})).unwrap();
         assert_eq!(p.len(), 1);
         let (tool, args) = p.take(&json!(1)).expect("first take wins");
         assert_eq!(tool, "fakepg.pg_select");
@@ -850,6 +1067,190 @@ mod tests {
         assert!(p.is_empty());
         // An id we never dispatched (tools/list response) is not ours.
         assert!(p.take(&json!(99)).is_none());
+    }
+
+    #[test]
+    fn pending_calls_refuse_duplicates_without_changing_redaction_context() {
+        let mut pending = PendingCalls::new();
+        pending.insert(&json!(1), "fakepg.pg_select".into(), json!({"table":"private"})).unwrap();
+        assert!(pending.insert(&json!(1), "fakepg.public".into(), json!({})).is_err());
+        let (tool, args) = pending.take(&json!(1)).unwrap();
+        assert_eq!(tool, "fakepg.pg_select");
+        assert_eq!(args["table"], "private");
+    }
+
+    #[test]
+    fn pending_calls_bound_capacity_expire_and_reject_invalid_ids() {
+        let mut pending = PendingCalls::new();
+        for id in 0..MAX_PENDING_CALLS {
+            pending.insert(&json!(id), "fakepg.get".into(), json!({})).unwrap();
+        }
+        assert!(pending.insert(&json!(MAX_PENDING_CALLS), "fakepg.get".into(), json!({})).is_err());
+        assert!(pending.insert(&json!({}), "fakepg.get".into(), json!({})).is_err());
+        assert!(pending.insert(&json!("x".repeat(257)), "fakepg.get".into(), json!({})).is_err());
+        let entry = pending.inner.get_mut(&id_key(&json!(0)).unwrap()).unwrap();
+        assert!(entry.deadline <= Instant::now() + Duration::from_secs(300));
+        entry.deadline = Instant::now();
+        pending.insert(&json!(MAX_PENDING_CALLS), "fakepg.get".into(), json!({})).unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_CALLS);
+        assert!(pending.take(&json!(0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_refusal_or_cancellation_drops_only_its_own_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = layer_for(tmp.path());
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let frame = json!({"id":1, "method":"tools/call", "params":{"name":"pg_select", "arguments":{}}});
+        let old = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &frame, &frame.to_string()).await.unwrap();
+        assert_eq!(pending.lock().unwrap().len(), 1);
+        // Dropping a prepared call covers gate refusal, canceled approval,
+        // failed parsing, and failed enqueue before upstream dispatch.
+        drop(old);
+        assert!(pending.lock().unwrap().is_empty());
+        let old = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &frame, &frame.to_string()).await.unwrap();
+        pending.lock().unwrap().inner.get_mut("n:1").unwrap().deadline = Instant::now();
+        let replacement = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &frame, &frame.to_string()).await.unwrap();
+        drop(old);
+        assert_eq!(pending.lock().unwrap().len(), 1, "expired guard cannot remove a replacement");
+        drop(replacement);
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_preparation_preserves_original_response_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = layer_for(tmp.path());
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let original = json!({"id":1, "method":"tools/call", "params":{"name":"pg_select", "arguments":{}}});
+        let first = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &original, &original.to_string()).await.unwrap();
+        let duplicate = json!({"id":1, "method":"tools/call", "params":{"name":"public", "arguments":{}}});
+        assert!(prepare_upstream("fakepg", Some(&layer), &pending, &tx, &duplicate, &duplicate.to_string()).await.is_none());
+        assert!(rx.recv().await.unwrap().contains("重複"));
+        let sent: Value = serde_json::from_str(&first.line).unwrap();
+        let mut response = json!({"id":sent["id"], "result":{"rows":[{"name":"王小明"}]}});
+        let context = response_context(&pending, &mut response).unwrap();
+        let out = rewrite_upstream_frame(Some(&layer), response, String::new(), context);
+        assert!(!out.contains("王小明"), "{out}");
+        assert!(out.contains("<REDACT:DB_FIELD:"), "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["id"], 1);
+    }
+
+    #[test]
+    fn expired_wire_response_is_withheld_and_cannot_take_reused_id() {
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let old = pending.lock().unwrap().insert(&json!("same"), "fakepg.private".into(), json!({})).unwrap();
+        pending.lock().unwrap().inner.get_mut("s:same").unwrap().deadline = Instant::now();
+        let new = pending.lock().unwrap().insert(&json!("same"), "fakepg.public".into(), json!({})).unwrap();
+        let mut response = json!({"id":wire_id(&json!("same"), &old), "result":{"secret":"private"}});
+        let refusal = response_context(&pending, &mut response).unwrap_err();
+        assert!(!refusal.contains("private"));
+        assert_eq!(pending.lock().unwrap().len(), 1);
+        let mut response = json!({"id":wire_id(&json!("same"), &new), "result":{}});
+        assert_eq!(response_context(&pending, &mut response).unwrap().unwrap().tool, "fakepg.public");
+        assert_eq!(response["id"], "same");
+    }
+
+    #[tokio::test]
+    async fn cancellation_uses_the_same_upstream_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = layer_for(tmp.path());
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let frame = json!({"id":"call", "method":"tools/call", "params":{"name":"pg_select"}});
+        let call = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &frame, &frame.to_string()).await.unwrap();
+        let cancel = json!({"method":"notifications/cancelled", "params":{"requestId":"call"}});
+        let cancel = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &cancel, &cancel.to_string()).await.unwrap();
+        let call: Value = serde_json::from_str(&call.line).unwrap();
+        let cancel: Value = serde_json::from_str(&cancel.line).unwrap();
+        assert_eq!(call["id"], cancel["params"]["requestId"]);
+    }
+
+    #[tokio::test]
+    async fn canceled_queued_call_never_reaches_upstream_and_releases_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("agents/a1")).unwrap();
+        std::fs::write(tmp.path().join("agents/a1/agent.toml"), "[capabilities]\n").unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let gate = ThirdPartyGate::with_lane(
+            tmp.path(), "a1", "fakepg", "proxy", duduclaw_core::ProcessLane::Normal,
+        );
+        let layer = layer_for(tmp.path());
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let frame = json!({"id":1, "method":"tools/call", "params":{"name":"pg_select", "arguments":{}}});
+        let prepared = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &frame, &frame.to_string()).await.unwrap();
+        let sent: Value = serde_json::from_str(&prepared.line).unwrap();
+        let call = gate.begin_call(&sent["id"], "pg_select", &json!({})).await.unwrap();
+        let mut queued = prepared.queued(Some(call.dispatch_permit()));
+        assert!(queued.dispatch_allowed());
+        drop(call);
+        assert!(!queued.dispatch_allowed());
+        let (mut writer, mut reader) = duplex(64);
+        assert!(!write_queued_frame(&mut writer, &mut queued).await.unwrap());
+        drop(queued);
+        assert!(pending.lock().unwrap().is_empty());
+        drop(writer);
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes).await.unwrap();
+        assert!(bytes.is_empty(), "a canceled queued call must never be dispatched");
+    }
+
+    #[tokio::test]
+    async fn blocked_upstream_write_stops_when_call_owner_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("agents/a1")).unwrap();
+        std::fs::write(tmp.path().join("agents/a1/agent.toml"), "[capabilities]\n").unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let gate = ThirdPartyGate::with_lane(
+            tmp.path(), "a1", "fakepg", "proxy", duduclaw_core::ProcessLane::Normal,
+        );
+        let layer = layer_for(tmp.path());
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let frame = json!({"id":1, "method":"tools/call", "params":{"name":"pg_select", "arguments":{}}});
+        let prepared = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &frame, &frame.to_string()).await.unwrap();
+        let sent: Value = serde_json::from_str(&prepared.line).unwrap();
+        let call = gate.begin_call(&sent["id"], "pg_select", &json!({})).await.unwrap();
+        let mut queued = prepared.queued(Some(call.dispatch_permit()));
+        let (mut writer, mut reader) = duplex(8);
+        writer.write_all(b"occupied").await.unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let writing = tokio::spawn(async move {
+            let _ = started.send(());
+            // The full pipe prevents any bytes of this frame from landing.
+            // Returning drops the writer, just like the production error path.
+            write_queued_frame(&mut writer, &mut queued).await
+        });
+        ready.await.unwrap();
+        drop(call);
+        let error = tokio::time::timeout(Duration::from_secs(1), writing)
+            .await.expect("cancellation must interrupt a blocked write")
+            .unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(pending.lock().unwrap().is_empty());
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"occupied", "no delayed tool frame may follow cancellation");
+    }
+
+    #[tokio::test]
+    async fn active_calls_are_bounded_and_completed_tasks_are_reaped() {
+        let mut held = tokio::task::JoinSet::new();
+        for _ in 0..MAX_ACTIVE_CALLS {
+            held.spawn(std::future::pending::<()>());
+        }
+        assert!(!call_capacity(&mut held));
+        held.abort_all();
+        while held.join_next().await.is_some() {}
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        held.spawn(async move { let _ = tx.send(()); });
+        rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(call_capacity(&mut held));
+        assert!(held.is_empty(), "completed task is reaped without waiting for EOF");
     }
 
     #[test]
@@ -986,6 +1387,18 @@ mod tests {
     }
 
     // ── upstream env ────────────────────────────────────────────────
+
+    #[test]
+    fn turn_identity_never_reaches_an_external_upstream() {
+        let inherited = [
+            ("DUDUCLAW_TURN_ID".into(), "turn".into()),
+            ("DUDUCLAW_EGRESS_TURN_ID".into(), "turn".into()),
+            ("DUDUCLAW_SESSION_ID".into(), "session".into()),
+            ("DUDUCLAW_AGENT_TOKEN".into(), "token".into()),
+            ("DUDUCLAW_ON_BEHALF_OF".into(), "user".into()),
+        ];
+        assert!(upstream_env(inherited, None).is_empty());
+    }
 
     #[test]
     fn upstream_env_strips_duduclaw_internals_and_applies_the_declared_map() {
@@ -1144,6 +1557,7 @@ mod tests {
     #[tokio::test]
     async fn gate_hides_refuses_and_holds_calls_for_approval() {
         let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard=\"shadow\"\n").unwrap();
         let agent = tmp.path().join("agents").join("a1");
         std::fs::create_dir_all(&agent).unwrap();
         std::fs::write(
@@ -1336,6 +1750,24 @@ mod tests {
         assert_eq!(err["error"]["code"], json!(-32007));
         assert_eq!(err["error"]["data"]["tool"], json!("fakepg.pg_select"));
         assert_eq!(err["id"], json!(11));
+    }
+
+    #[tokio::test]
+    async fn batch_tool_call_cannot_bypass_gate() {
+        let batch = json!([{"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"send", "arguments":{}}}]);
+        let (seen, replies) = drive("crm", None, vec![batch.to_string()], None).await;
+        assert!(seen.is_empty());
+        let reply: Value = serde_json::from_str(&replies[0]).unwrap();
+        assert_eq!(reply["error"]["code"], -32003);
+    }
+
+    #[tokio::test]
+    async fn notification_tool_call_cannot_bypass_gate() {
+        let call = json!({"jsonrpc":"2.0", "method":"tools/call", "params":{"name":"send", "arguments":{}}});
+        let (seen, replies) = drive("crm", None, vec![call.to_string()], None).await;
+        assert!(seen.is_empty());
+        let reply: Value = serde_json::from_str(&replies[0]).unwrap();
+        assert_eq!(reply["error"]["code"], -32003);
     }
 
     #[tokio::test]

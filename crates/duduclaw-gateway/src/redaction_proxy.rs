@@ -203,8 +203,11 @@ pub fn maybe_proxy_mcp_config_in_lane(
     let agent_dir = mcp_json.parent();
     let purpose = ProxyPurpose {
         redaction: redaction_active_for_spawn(home_dir),
-        tool_gate: agent_dir
-            .is_some_and(|dir| duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)),
+        tool_gate: agent_dir.is_some_and(|dir| {
+            duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)
+                || duduclaw_core::egress_guard::effective_mode(home_dir, Some(dir))
+                    != duduclaw_core::egress_guard::Mode::Off
+        }),
     };
     if purpose.none() {
         return Ok(None);

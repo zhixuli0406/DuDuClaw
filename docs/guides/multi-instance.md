@@ -9,7 +9,7 @@ isolation (separate OS users, or containers) see the alternatives at the bottom.
 
 | Env var | Purpose | Must differ per instance |
 | --- | --- | --- |
-| `DUDUCLAW_HOME` | State root — config, SQLite DBs, `bus_queue.jsonl`, `events.db`, models, shared wiki, secrets, cron. Default `~/.duduclaw`. | **Yes** |
+| `DUDUCLAW_HOME` | State root — config, SQLite DBs, `bus_queue.jsonl`, `events.db`, `egress_leases.db`, `egress_leases.lock`, models, shared wiki, secrets, cron. Default `~/.duduclaw`. | **Yes** |
 | `DUDUCLAW_PORT` | Gateway HTTP/WS port. Default `18889`. | **Yes** |
 | `DUDUCLAW_INSTANCE` | Short instance name (`[a-z0-9-]`). Namespaces the **global MCP registration** key in `~/.claude/settings.json` (`duduclaw` → `duduclaw-<name>`) so instances don't overwrite each other. | Recommended |
 

@@ -342,3 +342,9 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 ## 頻道核准的保存與核對
 
 高風險 Computer Use 使用原帳號及原對話或討論串送出確認，回覆 `確認 <完整 UUID>` 或 `取消 <完整 UUID>`；問題使用 `回答 <完整 UUID> <答案>`，不授權工具。單獨的是、A/B 不會選取請求。執行前重驗畫面、視窗、政策與取消狀態，重啟會讓舊畫面核准失效。沒有收據的執行成為 `uncertain`，需 Admin 核對。支援入口及限制見[操作指南](../../guides/durable-channel-decisions.md)。
+
+## 資料外送防護的重啟保護
+
+回合污點只存在記憶體；外送 lease 則先存入 `<home>/egress_leases.db`（SQLite WAL，Unix 0600）才授予呼叫端。Gateway 開放 loopback 路由前會復原，並在每次重啟後以單調時鐘重新保護同一員工所有回合的私人讀取完整六小時，不依 UTC 年齡或時鐘跳動縮短。舊回覆不能釋放復原的 lease。資料庫無法讀取時，`ask`／`block` 暫停所有員工的私人讀取與新外送，`shadow` 允許並稽核；每五秒重試、每分鐘最多記錄一次錯誤。新增失敗拒絕強制模式外送，刪除失敗保留保護。CLI 原生工具與跨輪資訊複製仍不在防護範圍，詳見[資料外送防護](69-egress-guard.md)。
+
+Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0600）。使用同一 home 的第二個 gateway 會拒絕讀取與新外送並重試，取得鎖後先恢復所有 lease 才接受讀取；`shadow` 仍允許並稽核。Gateway 執行中不可刪除鎖檔。重複的有效 lease ID 會在寫入前拒絕，不會連帶阻擋其他員工。

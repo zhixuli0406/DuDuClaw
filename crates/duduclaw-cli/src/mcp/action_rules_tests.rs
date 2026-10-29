@@ -24,6 +24,66 @@ fn every_advertised_tool_has_an_explicit_effect_class() {
     );
 }
 
+#[test]
+fn every_advertised_tool_has_explicit_private_and_egress_classes() {
+    use duduclaw_core::tool_effect::{egress_capable, reads_private, EGRESS_CAPABLE_READS};
+    for tool in tools() {
+        assert!(
+            reads_private(tool.name).is_some(),
+            "private classification missing: {}",
+            tool.name
+        );
+        assert!(
+            egress_capable(tool.name).is_some(),
+            "egress classification missing: {}",
+            tool.name
+        );
+        assert_eq!(
+            egress_capable(tool.name),
+            Some(EGRESS_CAPABLE_READS.contains(&tool.name))
+        );
+    }
+    let names: BTreeSet<_> = tools().map(|tool| tool.name).collect();
+    let unique: BTreeSet<_> = EGRESS_CAPABLE_READS.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        EGRESS_CAPABLE_READS.len(),
+        "duplicate egress entry"
+    );
+    for tool in EGRESS_CAPABLE_READS {
+        assert!(
+            names.contains(tool) || *tool == "web_fetch",
+            "stale egress entry: {tool}"
+        );
+    }
+    for tool in [
+        "web_fetch",
+        "web_extract",
+        "web_fetch_cached",
+        "web_search",
+        "computer_navigate",
+        "os_open",
+    ] {
+        assert_eq!(egress_capable(tool), Some(true), "{tool}");
+    }
+    for tool in [
+        "memory_search",
+        "wiki_read",
+        "file_read",
+        "db_query",
+        "gmail_read",
+        "tasks_list",
+        "working_state_get",
+    ] {
+        assert_eq!(reads_private(tool), Some(true), "{tool}");
+    }
+    assert_eq!(reads_private("unknown_tool"), None);
+    assert!(reads_private("unknown_tool").unwrap_or(true));
+    assert_eq!(egress_capable("unknown_tool"), None);
+    assert_eq!(reads_private("prefix_memory_search"), None);
+    assert_eq!(egress_capable("web_extract_suffix"), None);
+}
+
 /// The effect table must not carry names that are no longer tools (a stale
 /// row would hide a typo in a real entry). Read the classified set back from
 /// the catalog, which lists exactly the advertised MCP tools.

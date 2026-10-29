@@ -1267,7 +1267,7 @@ impl AgentRuntime for CodexRuntime {
         // unreadable / malformed `.mcp.json`) stops this spawn: fail closed.
         let own_mcp =
             super::duduclaw_mcp_server_json_for_home(&context.agent_id, &context.home_dir);
-        let third_party_servers = match (context.agent_dir.as_deref(), own_mcp.as_ref()) {
+        let mut third_party_servers = match (context.agent_dir.as_deref(), own_mcp.as_ref()) {
             (Some(dir), Some(own)) => {
                 third_party::gated_servers_for_spawn(dir, &context.home_dir, own, explore).await?
             }
@@ -1334,6 +1334,12 @@ impl AgentRuntime for CodexRuntime {
         cmd.args(&mcp_overrides.args);
         // Third-party servers (2026-10-19). `_third_party_env_files` holds
         // each proxy's upstream-env temp file until Codex has exited.
+        // Host identity is ephemeral: the persistent config above deliberately
+        // keeps the identity MAC and turn out of third-party entries.
+        let host_proxy_env = super::third_party_mcp::host_proxy_env(&context.home_dir, &context.agent_id);
+        for server in third_party_servers.values_mut() {
+            server.env.extend(host_proxy_env.iter().cloned());
+        }
         let third_party_overrides = third_party::override_args(
             &third_party_servers,
             supports_env_vars,
