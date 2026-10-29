@@ -92,14 +92,14 @@ pub struct GatewayJudgeCaller {
 #[async_trait]
 impl LlmCaller for GatewayJudgeCaller {
     async fn complete(&self, prompt: &str) -> duduclaw_fork::Result<String> {
-        duduclaw_gateway::runtime_dispatch::run_utility_prompt(
+        crate::ai_session_guard::with_cli_utility_context(&self.home_dir, None, duduclaw_gateway::runtime_dispatch::run_utility_prompt(
             &self.home_dir,
             None,         // agent-less: resolve the global utility runtime
             "eval-judge", // attribution id for telemetry
             "",           // judge instructions live in the prompt itself
             prompt,
             duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
-        )
+        ))
         .await
         .map_err(ForkError::Executor)
     }

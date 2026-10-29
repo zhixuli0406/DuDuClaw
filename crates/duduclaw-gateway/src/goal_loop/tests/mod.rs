@@ -29,6 +29,11 @@ fn home_with_agent(agent_id: &str, body: &str) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     let dir = home.path().join("agents").join(agent_id);
     std::fs::create_dir_all(&dir).unwrap();
+    let body = if body.contains("[agent]") {
+        body.to_string()
+    } else {
+        format!("[agent]\nname = \"{agent_id}\"\nstatus = \"active\"\n{body}")
+    };
     std::fs::write(dir.join("agent.toml"), body).unwrap();
     home
 }
@@ -79,6 +84,12 @@ fn goal_task(id: &str, agent: &str) -> TaskRow {
 }
 
 async fn open_stores(dir: &Path) -> (Arc<TaskStore>, Arc<MessageQueue>) {
+    let agent_dir = dir.join("agents/alice");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let path = agent_dir.join("agent.toml");
+    if !path.exists() {
+        std::fs::write(path, "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
+    }
     let store = Arc::new(TaskStore::open(dir).unwrap());
     let queue = Arc::new(MessageQueue::open(dir).unwrap());
     (store, queue)
@@ -213,6 +224,11 @@ async fn agent_round_then_reject(
 fn write_agent_toml(home: &Path, agent: &str, body: &str) {
     let dir = home.join("agents").join(agent);
     std::fs::create_dir_all(&dir).unwrap();
+    let body = if body.contains("[agent]") {
+        body.to_string()
+    } else {
+        format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n{body}")
+    };
     std::fs::write(dir.join("agent.toml"), body).unwrap();
 }
 

@@ -481,3 +481,39 @@ async fn dispatch_injects_the_criteria_ledger_only_when_present_and_not_off() {
     assert!(!off.contains("驗收帳本"));
     assert_eq!(off, none, "off with a ledger == no ledger");
 }
+
+#[tokio::test]
+async fn autonomy_pause_goal_admission_waits_and_resume_dispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    store.insert_task(&goal_task("pause-new", "alice")).await.unwrap();
+    let d = driver(store.clone(), queue.clone(), small_cfg());
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("alice"), "休息", "operator").unwrap();
+    d.tick_once().await.unwrap();
+    assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    assert_eq!(store.get_task("pause-new").await.unwrap().unwrap().status, "todo");
+    duduclaw_core::autonomy_gate::resume(dir.path(), Some("alice")).unwrap();
+    d.tick_once().await.unwrap();
+    assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn autonomy_pause_rejected_round_requires_human() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    let mut task = goal_task("pause-retry", "alice");
+    task.status = "revising".into();
+    task.revision_round = 1;
+    store.insert_task(&task).await.unwrap();
+    let d = driver(store.clone(), queue.clone(), small_cfg());
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), None, "維護", "operator").unwrap();
+    d.tick_once().await.unwrap();
+    let paused = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(paused.status, "needs_human");
+    assert_eq!(paused.pause_reason.as_deref(), Some("operator_paused"));
+    assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    duduclaw_core::autonomy_gate::resume(dir.path(), None).unwrap();
+    store.resolve_needs_human(&task.id, "retry", "繼續").await.unwrap();
+    d.tick_once().await.unwrap();
+    assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
+}

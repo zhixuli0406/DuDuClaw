@@ -48,6 +48,7 @@ fn write_goal_loop_config(home: &std::path::Path, mode: &str) {
 /// Seed a `review` goal with a two-criterion ledger (or none) and an open
 /// iteration round, completed with `reply`.
 async fn seed(store: &TaskStore, id: &str, with_ledger: bool, reply: &str) {
+    ensure_autonomy_agent(store, "probe");
     let mut g = pending_goal(id);
     g.assigned_to = "probe".into();
     g.acceptance_criteria = Some("產出 hello.txt\n內容含「你好」".into());

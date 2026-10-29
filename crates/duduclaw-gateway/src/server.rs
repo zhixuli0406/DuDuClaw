@@ -1937,6 +1937,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // does no workflow reconciliation, dispatch or sweep at all.
     match duduclaw_core::gateway_instance::acquire(&home_dir) {
         Ok(()) => {
+            handler.reconcile_autonomy_changes().await;
             reconcile_workflows_on_boot(&home_dir).await;
             spawn_workflow_sweep(home_dir.to_path_buf());
         }
@@ -7868,7 +7869,8 @@ async fn handle_causal_extract(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let store = CausalStore::new(state.home_dir.join("memory.db"));
-    match crate::causal_extraction_runner::extract_candidates_with_provider(
+    match crate::autonomous_runtime::human_interactive(&state.home_dir,
+        crate::causal_extraction_runner::extract_candidates_with_provider(
         &store,
         &scope,
         &request.artifact_id,
@@ -7876,6 +7878,7 @@ async fn handle_causal_extract(
         policy.model(),
         provider.as_ref(),
         |scope, provider, model| policy.allows(scope, provider, model),
+    )
     )
     .await
     {

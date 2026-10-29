@@ -185,6 +185,7 @@ pub(super) fn scaffold_with(
     let agent_id = plan.agent_id.clone().unwrap_or_else(new_ephemeral_id);
     let dir = root.join(&agent_id);
     let created = duduclaw_core::with_file_lock(&root, || {
+        check_parent_autonomy(home_dir, &spec.parent).map_err(std::io::Error::other)?;
         if active_count(&root) >= cap {
             return Ok(false);
         }
@@ -600,4 +601,15 @@ pub(super) fn validate_role_runtime_model(
         ));
     }
     Ok(spec.id)
+}
+
+/// Shared parent-chain gate for scaffold creation and durable capacity tickets.
+pub fn check_parent_autonomy(home: &Path, parent: &str) -> Result<(), String> {
+    if is_ephemeral_id(parent) {
+        super::dispatch::check_autonomy(home, parent).map(|_| ())
+    } else {
+        duduclaw_core::autonomy_gate::check(
+            home, parent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+        ).map_err(|pause| pause.to_string())
+    }
 }

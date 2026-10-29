@@ -127,14 +127,14 @@ pub struct SecauditCaller {
 #[async_trait]
 impl duduclaw_fork::judge::LlmCaller for SecauditCaller {
     async fn complete(&self, prompt: &str) -> duduclaw_fork::Result<String> {
-        duduclaw_gateway::runtime_dispatch::run_utility_prompt(
+        crate::ai_session_guard::with_cli_utility_context(&self.home_dir, self.agent_dir.as_deref().and_then(|dir| dir.file_name()).and_then(|id| id.to_str()), duduclaw_gateway::runtime_dispatch::run_utility_prompt(
             &self.home_dir,
             self.agent_dir.as_deref(),
             self.attribution,
             "",
             prompt,
             self.max_tokens,
-        )
+        ))
         .await
         .map_err(duduclaw_fork::ForkError::Executor)
     }

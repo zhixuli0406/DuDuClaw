@@ -109,7 +109,12 @@ pub(crate) async fn handle_working_state_handoff(args: &Value, home_dir: &Path, 
         .map(str::to_string);
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
+    let admission = match admit_background_identity(home_dir, default_agent, "working_state_handoff").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     let result = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         duduclaw_gateway::working_state::set_handoff(
             &home,
             &agent,

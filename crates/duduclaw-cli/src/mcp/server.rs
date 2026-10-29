@@ -167,7 +167,8 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // sent; `None` means no `tools/list` has been answered yet and there is
     // therefore nothing to invalidate. The watcher compares SETS rather than
     // file mtimes, so a touched-but-unchanged config emits nothing and a WAL
-    // write we cannot stat still gets noticed.
+    // write we cannot stat still gets noticed. Live autonomy state is also
+    // re-read by visible_tool_names on every tick; pause/resume needs no mtime watch.
     let mut last_advertised: Option<Vec<String>> = None;
     // Protocol era bookkeeping (MCP 2026-07-28, see `crate::mcp_protocol`).
     // A legacy client (`initialize`) gets the unsolicited `list_changed`; a
@@ -198,7 +199,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 }
             }
             _ = watch.tick() => {
-                if let Some(previous) = last_advertised.as_ref()
+                if last_advertised.is_some()
                     && let Ok(p) =
                         crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache)
                 {
@@ -209,24 +210,14 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                             .into_iter()
                             .map(str::to_string)
                             .collect();
-                    if &current != previous {
-                        tracing::info!(
-                            before = previous.len(),
-                            after = current.len(),
-                            "MCP tools/list changed — notifying client"
-                        );
-                        last_advertised = Some(current);
-                        if legacy_initialized || !modern_seen {
-                            write_response(&mut stdout, &tools_list_changed_notification())
-                                .await?;
-                        }
-                        for sub in &tool_subscriptions {
-                            write_response(
-                                &mut stdout,
-                                &crate::mcp_protocol::tagged_tools_list_changed(sub),
-                            )
-                            .await?;
-                        }
+                    for notification in tools_list_change_notifications(
+                        &mut last_advertised,
+                        current,
+                        legacy_initialized,
+                        modern_seen,
+                        &tool_subscriptions,
+                    ) {
+                        write_response(&mut stdout, &notification).await?;
                     }
                 }
                 continue;
@@ -479,6 +470,37 @@ pub(crate) fn startup_auth_error(e: &crate::mcp_auth::AuthError) -> String {
         }
         _ => format!("MCP authentication failed: {e}"),
     }
+}
+
+/// Compare the advertised set and build the actual watcher notifications.
+/// Keeping this shared with tests covers pause/resume without running stdio.
+pub(super) fn tools_list_change_notifications(
+    previous: &mut Option<Vec<String>>,
+    current: Vec<String>,
+    legacy_initialized: bool,
+    modern_seen: bool,
+    subscriptions: &[Value],
+) -> Vec<Value> {
+    let Some(before) = previous.as_ref() else {
+        return Vec::new();
+    };
+    if before == &current {
+        return Vec::new();
+    }
+    tracing::info!(
+        before = before.len(),
+        after = current.len(),
+        "MCP tools/list changed — notifying client"
+    );
+    *previous = Some(current);
+    let mut notifications = Vec::new();
+    if legacy_initialized || !modern_seen {
+        notifications.push(tools_list_changed_notification());
+    }
+    for sub in subscriptions {
+        notifications.push(crate::mcp_protocol::tagged_tools_list_changed(sub));
+    }
+    notifications
 }
 
 #[cfg(test)]

@@ -757,14 +757,14 @@ pub(crate) async fn handle_skill_from_recording(
     // per-agent runtime/model settings). Ordinary ids are unchanged.
     let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent);
     let agent_dir_opt = agent_dir.is_dir().then_some(agent_dir.as_path());
-    let reply = match duduclaw_gateway::runtime_dispatch::run_utility_prompt(
+    let reply = match crate::ai_session_guard::with_autonomous_utility_context(home_dir, agent, duduclaw_gateway::runtime_dispatch::run_utility_prompt(
         home_dir,
         agent_dir_opt,
         "recording-distill",
         "",
         &prompt,
         duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
-    )
+    ))
     .await
     {
         Ok(r) => r,
@@ -790,9 +790,9 @@ pub(crate) async fn handle_skill_from_recording(
     // ── Fail-closed security scan (deterministic; incl. injection ruleset) ──
     let scan = duduclaw_gateway::skill_lifecycle::security_scanner::scan_skill(&skill_md, None);
     if !duduclaw_gateway::custom_skills::scan_permits_submit(scan.risk_level) {
-        let rejected_path = dir.join("skill.rejected.md");
-        let _ = std::fs::write(&rejected_path, &skill_md);
-        set_owner_only(&rejected_path, false);
+        if let Err(reason) = write_rejected_draft(home_dir, agent, &dir, &skill_md).await {
+            return rec_error(&reason);
+        }
         warn!(recording = %id, risk = ?scan.risk_level, "distilled skill blocked by security scan");
         return rec_error(&format!(
             "蒸餾出的 SKILL.md 未通過安全掃描（風險 {:?}，{} 項發現），已擋下不送審。\
@@ -801,6 +801,13 @@ pub(crate) async fn handle_skill_from_recording(
             scan.findings.len()
         ));
     }
+
+    let _admission = match crate::mcp::admit_background_identity(
+        home_dir, agent, "skill_from_recording",
+    ).await {
+        Ok(guard) => guard,
+        Err(reason) => return rec_error(&reason),
+    };
 
     // ── Stage through the existing custom-skills approval pipeline ──────────
     use duduclaw_gateway::custom_skills;
@@ -920,11 +927,48 @@ pub(crate) async fn handle_skill_from_recording(
     ))
 }
 
+async fn write_rejected_draft(
+    home: &Path, agent: &str, directory: &Path, skill_md: &str,
+) -> Result<(), String> {
+    let _admission = crate::mcp::admit_background_identity(
+        home, agent, "skill_from_recording",
+    ).await?;
+    // Synchronous I/O keeps cancellation from dropping the lease before the write.
+    let path = directory.join("skill.rejected.md");
+    std::fs::write(&path, skill_md).map_err(|error| format!("Cannot preserve rejected draft: {error}"))?;
+    set_owner_only(&path, false);
+    Ok(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn paused_rejected_draft_writes_nothing_and_resume_preserves_it() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents/a1");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+        let directory = home.path().join("recordings/rejected");
+        std::fs::create_dir_all(&directory).unwrap();
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("a1"), "test", "operator").unwrap();
+        let expected = crate::mcp::check_background_caller(
+            home.path(), crate::mcp::RecordActor::Agent("a1"), "skill_from_recording",
+        ).unwrap_err();
+        let draft = "---\nname: rejected\n---\nRejected model output";
+        assert_eq!(write_rejected_draft(home.path(), "a1", &directory, draft).await.unwrap_err(), expected);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        let path = directory.join("skill.rejected.md");
+        std::fs::write(&path, "previous draft").unwrap();
+        assert_eq!(write_rejected_draft(home.path(), "a1", &directory, draft).await.unwrap_err(), expected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous draft");
+        duduclaw_core::autonomy_gate::resume(home.path(), Some("a1")).unwrap();
+        write_rejected_draft(home.path(), "a1", &directory, draft).await.unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), draft);
+    }
 
     fn sample_har() -> Value {
         serde_json::json!({

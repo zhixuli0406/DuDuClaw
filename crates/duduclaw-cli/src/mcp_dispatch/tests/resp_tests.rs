@@ -85,6 +85,29 @@ async fn scoped_tools_without_a_grant_blocks_each_responsibility_tool() {
 
 #[tokio::test]
 async fn approval_required_tools_holds_each_responsibility_tool() {
+    // The internal key is not an employee identity on its own. Production
+    // verifies/stamps this process identity at MCP startup; isolate it here
+    // so parallel tests never observe a process-global environment mutation.
+    const CHILD: &str = "DUDU_TEST_RESP_APPROVAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mcp_dispatch::tests::resp_tests::approval_required_tools_holds_each_responsibility_tool",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(duduclaw_core::ENV_AGENT_ID, "dudu")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     for tool in TOOLS {
         let tmp = tempfile::TempDir::new().unwrap();
         enable_feature(&tmp);
@@ -106,7 +129,10 @@ async fn approval_required_tools_holds_each_responsibility_tool() {
 async fn unlisted_responsibility_tools_reach_their_handlers() {
     let tmp = tempfile::TempDir::new().unwrap();
     enable_feature(&tmp);
-    write_scoped_toml(&tmp, "[agent]\nname = \"test-client\"\n");
+    write_scoped_toml(
+        &tmp,
+        "[agent]\nname = \"test-client\"\nstatus = \"active\"\n",
+    );
     for (i, tool) in TOOLS.iter().enumerate() {
         let result = call(&tmp, tool, 920 + i as i64).await;
         assert!(result.get("error").is_none(), "{tool}: {result}");

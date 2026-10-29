@@ -34,6 +34,31 @@ pub fn read_meta(dir: &Path) -> Option<EphemeralMeta> {
     toml::from_str(&text).ok()
 }
 
+/// An ephemeral's workspace metadata is not authority: the host-owned org
+/// store must independently name the same parent. Missing/corrupt authority,
+/// missing metadata, cycles and paused ancestors all refuse execution.
+/// The same gate runs before queue claiming and at the actual spawn boundary.
+pub(crate) fn check_autonomy(home: &Path, agent_id: &str) -> Result<EphemeralMeta, String> {
+    use duduclaw_core::autonomy_gate::{self, AutonomyPath};
+
+    if !is_ephemeral_id(agent_id) {
+        return Err("not an ephemeral agent".into());
+    }
+    let dir = resolve_agent_dir(home, agent_id)
+        .ok_or_else(|| "ephemeral scaffold unavailable (fail-closed)".to_string())?;
+    let meta = read_meta(&dir)
+        .ok_or_else(|| "ephemeral metadata unavailable (fail-closed)".to_string())?;
+    let identities = autonomy_gate::effective_identities(home, agent_id, AutonomyPath::Dispatcher)
+        .map_err(|pause| pause.to_string())?;
+    // Do not return parent metadata read before a concurrent scaffold change.
+    if identities.get(1) != Some(&meta.parent) {
+        return Err("ephemeral parent authority mismatch (fail-closed)".into());
+    }
+    autonomy_gate::check(home, agent_id, AutonomyPath::Dispatcher)
+        .map_err(|pause| pause.to_string())?;
+    Ok(meta)
+}
+
 /// Resolve the tier-appropriate model for a scaffold directory.
 ///
 /// Reads the scaffold's `[model]` (copied verbatim from the parent) and
@@ -111,9 +136,7 @@ pub async fn dispatch_with(
     let dir = resolve_agent_dir(home_dir, agent_id)
         .ok_or_else(|| format!("ephemeral agent '{agent_id}' not found (expired or swept?)"))?;
 
-    let meta = read_meta(&dir).ok_or_else(|| {
-        format!("ephemeral agent '{agent_id}' has no readable metadata (fail-closed)")
-    })?;
+    let meta = check_autonomy(home_dir, agent_id)?;
     if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
         if chrono::Utc::now() > expires {
             return Err(format!(
@@ -154,6 +177,7 @@ pub async fn dispatch_with(
         crate::task_sandbox::HostAction::RanOnHost,
     );
 
+    check_autonomy(home_dir, agent_id)?;
     let result = crate::claude_runner::call_claude_for_agent_preloaded_with(
         home_dir,
         registry,
@@ -164,6 +188,11 @@ pub async fn dispatch_with(
     )
     .await;
 
+    // A refused admission never ran and must remain eligible after resume.
+    if !crate::autonomous_runtime::was_handed_off()
+        && (crate::autonomous_runtime::was_denied() || result.as_ref().err().is_some_and(|e| e.starts_with("AUTONOMY_PAUSED:"))) {
+        return result;
+    }
     // Mark completed (success OR failure) so the GC grace clock starts.
     let marker = dir.join(".completed");
     if let Err(e) = std::fs::write(&marker, chrono::Utc::now().to_rfc3339()) {

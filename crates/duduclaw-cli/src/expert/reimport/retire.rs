@@ -83,6 +83,8 @@ pub fn retire(home: &Path, target: &ReplaceTarget) -> Result<RetireLog> {
         .ok_or_else(|| import_err("import.replace_failed", json!({ "slug": slug }), "備份資料夾名稱已用完，請稍後再試"))?;
     let failed = |msg: String| import_err("import.replace_failed", json!({ "slug": slug }), msg);
 
+    let barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home)
+        .map_err(|error| failed(error.to_string()))?;
     let moves = plan_moves(home, target, now, &backup).map_err(failed)?;
     let mut j = ReplaceJournal::new(home, slug, &backup);
     let org = org_store::load(home);
@@ -101,9 +103,11 @@ pub fn retire(home: &Path, target: &ReplaceTarget) -> Result<RetireLog> {
     let mut log = RetireLog { home: home.to_path_buf(), journal: j, agents: Vec::new(), backup };
     for (from, to, agent) in moves {
         if let Err(e) = move_path(&from, &to) {
+            // Rollback acquires its own barrier; never nest exclusive leases.
+            drop(barrier);
             rollback(&log);
             return Err(failed(format!(
-                "無法把之前的版本移到備份（{}）：{e}；已還原，什麼都沒改",
+                "無法把之前的版本移到備份（{}）：{e}；已嘗試還原，失敗項目會保留紀錄",
                 from.display()
             )));
         }
@@ -122,7 +126,9 @@ pub fn rollback(log: &RetireLog) -> Option<PathBuf> {
     for f in &out.failures {
         eprintln!("  ✗ 還原失敗：{f}（請手動處理）");
     }
-    log.close();
+    if out.failures.is_empty() {
+        log.close();
+    }
     out.failed_record
 }
 

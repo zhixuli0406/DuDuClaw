@@ -104,7 +104,13 @@ pub(crate) async fn tick_once(
     );
 
     for (session_id, through_turn) in to_run {
-        match summarize_one(session_manager, home_dir, &session_id, through_turn).await {
+        let Some(candidate) = candidates.iter().find(|c| c.session_id == session_id) else {
+            continue;
+        };
+        match crate::autonomous_runtime::scope(
+            home_dir, &candidate.agent_id, &[],
+            summarize_one(session_manager, home_dir, &session_id, through_turn),
+        ).await {
             Ok(bytes) => info!(
                 session_id = %session_id,
                 through_turn,

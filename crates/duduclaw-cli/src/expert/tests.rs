@@ -836,3 +836,18 @@ rank = "boss"
         "{problems:?}"
     );
 }
+
+#[test]
+fn expert_profile_patch_preserves_lifecycle_and_comments() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("agents/a1/agent.toml");
+    write(&path, "# operator comment\n[agent]\nname='a1'\nstatus='archived'\n");
+    super::patch_agent_toml(home.path(), "a1", |table| {
+        super::set_capabilities(table, &["Read".into()], &[]);
+    }).unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("# operator comment"));
+    let table: toml::Table = text.parse().unwrap();
+    assert_eq!(table["agent"]["status"].as_str(), Some("archived"));
+    assert_eq!(table["capabilities"]["allowed_tools"][0].as_str(), Some("Read"));
+}

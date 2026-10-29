@@ -171,6 +171,27 @@ fn concurrent_status_and_freeze_edits_keep_both_changes() {
     assert_eq!(parsed["heartbeat"]["enabled"].as_bool(), Some(true));
 }
 
+/// A freeze whose snapshot predates a completed lifecycle write (archive,
+/// resume or pause) must keep that write. Deterministic interleaving, no sleeps.
+#[test]
+fn freeze_delayed_edit_preserves_completed_lifecycle_changes() {
+    for action in [Action::Freeze, Action::Unfreeze] {
+        let enabled = matches!(action, Action::Unfreeze);
+        for (old, new) in [("active", "archived"), ("paused", "active"), ("active", "paused")] {
+            let (_tmp, home) = fixture(&format!("# keep me\n[agent]\nname = 'writer'\nstatus = '{old}'\n"));
+            crate::profile_edit_test_hook::after_snapshot(&home, "writer", old, new);
+            run_with_markers(&home, "writer", action, &[]).unwrap();
+            let text = read(&home);
+            assert!(text.contains("# keep me"), "{text}");
+            let table: toml::Table = text.parse().unwrap();
+            assert_eq!(table["agent"]["status"].as_str(), Some(new), "{action:?} {old}->{new}");
+            for section in ["evolution", "heartbeat"] {
+                assert_eq!(table[section]["enabled"].as_bool(), Some(enabled), "{action:?} {section}");
+            }
+        }
+    }
+}
+
 #[test]
 fn shared_bash_matcher_protects_all_controls_for_agents_and_untrusted_callers() {
     for action in ACTIONS {

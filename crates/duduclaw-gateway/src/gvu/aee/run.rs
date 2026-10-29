@@ -882,6 +882,7 @@ where
          Reply with ONLY this JSON object:\n\
          {{\"approved\": true|false, \"score\": 0.0-1.0, \"feedback\": \"one sentence\"}}"
     );
+    crate::autonomous_runtime::check_current().await.ok()?;
     match call_llm(prompt).await {
         Ok(r) => Some(verifier::parse_judge_response(&r)),
         Err(e) => {

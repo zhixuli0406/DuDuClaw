@@ -212,7 +212,9 @@ pub(crate) async fn tick_once(
         "titler: dispatching"
     );
     for c in to_run {
-        match title_one(session_manager, home_dir, c).await {
+        match crate::autonomous_runtime::scope(
+            home_dir, &c.agent_id, &[], title_one(session_manager, home_dir, c),
+        ).await {
             Ok(title) => {
                 info!(session_id = %c.session_id, title = %title, "titler: persisted title")
             }
@@ -419,6 +421,7 @@ mod tests {
     fn cand(id: &str, turns: u32, titled: u32) -> TitleCandidate {
         TitleCandidate {
             session_id: id.to_string(),
+            agent_id: "worker".to_string(),
             turn_count: turns,
             titled_through_turn: titled,
         }

@@ -137,7 +137,9 @@ pub async fn oneshot_pty_invoke(invocation: OneshotInvocation) -> Result<Oneshot
         pty_cmd = pty_cmd.env(k, v);
     }
 
-    let pty = PtyHandle::spawn(pty_cmd)?;
+    let admission = duduclaw_core::autonomy_handoff::admit().await
+        .map_err(|error| PtyError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)))?;
+    let pty = PtyHandle::spawn_with_handoff(pty_cmd, || admission.handed_off())?;
     let start = Instant::now();
     let result = drain_until_eof(&pty, invocation.deadline).await;
 

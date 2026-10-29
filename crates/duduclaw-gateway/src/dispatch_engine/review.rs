@@ -1,8 +1,58 @@
 use super::*;
 
+enum ReviewAdmission {
+    Allowed,
+    Paused,
+}
+
 impl DispatchEngine {
+    /// Return true for a paused review. A live worker finishes its turn before
+    /// the dispatcher parks it; an idle review is parked here with no model call.
+    async fn park_autonomy_paused_review(&self, task: &TaskRow) -> Result<bool, String> {
+        let Some(home) = &self.home_dir else { return Ok(false) };
+        let Err(pause) = duduclaw_core::autonomy_gate::check(
+            home, &task.assigned_to, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+        ) else { return Ok(false) };
+        if !crate::dispatcher::goal_turn_active(home, &task.id).await? {
+            self.store.mark_needs_human_with_pause(
+                &task.id, &pause.to_string(), crate::pause_reason::PauseReason::OperatorPaused,
+            ).await?;
+            self.store.stamp_iteration_pause(&task.id, "operator_paused").await?;
+            self.revoke_task_grants(&task.id).await;
+        }
+        Ok(true)
+    }
+
+    // Preflight only: the scoped transport acquires its own lease for each
+    // send/spawn and releases it at handoff, before reading the model response.
+    async fn admit_review_model(
+        &self, task: &TaskRow,
+    ) -> Result<ReviewAdmission, String> {
+        let Some(home) = &self.home_dir else { return Ok(ReviewAdmission::Allowed) };
+        match duduclaw_core::autonomy_gate::check(
+            home, &task.assigned_to, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+        ) {
+            Ok(()) => Ok(ReviewAdmission::Allowed),
+            Err(pause) => {
+                if !crate::dispatcher::goal_turn_active(home, &task.id).await? {
+                    self.store.mark_needs_human_with_pause(
+                        &task.id, &pause.to_string(), crate::pause_reason::PauseReason::OperatorPaused,
+                    ).await?;
+                    self.store.stamp_iteration_pause(&task.id, "operator_paused").await?;
+                    self.revoke_task_grants(&task.id).await;
+                }
+                Ok(ReviewAdmission::Paused)
+            }
+        }
+    }
+
     /// Evaluate every `review` task through the judge.
     pub(super) async fn review_goal_tasks(&self) -> Result<(), String> {
+        // A completed turn is parked before any judge/model call, including
+        // when no judge is configured. Human conversations remain unaffected.
+        for task in self.store.tasks_in_status("review").await? {
+            self.park_autonomy_paused_review(&task).await?;
+        }
         let Some(judge) = &self.judge else {
             // No evaluator configured — leave review tasks for later / human.
             let pending = self.store.tasks_in_status("review").await?;
@@ -40,6 +90,9 @@ impl DispatchEngine {
 
         let now = Utc::now().to_rfc3339();
         for task in self.store.tasks_in_status("review").await? {
+            if self.park_autonomy_paused_review(&task).await? {
+                continue;
+            }
             // Attribute both adjudication stages to the same open iteration
             // the settle methods seal. A task counter can diverge from the
             // ledger after a repair; do not derive this from dispatch ordinals
@@ -57,7 +110,7 @@ impl DispatchEngine {
                 episode_id: task.id.clone(),
                 round: cost_round,
             };
-            crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attribution, async {
+            let review = crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attribution, async {
             // Read the streak ledger before consuming remove-once native
             // evidence or updating review state. A task-local read failure
             // leaves both the task and its evidence available for retry.
@@ -657,10 +710,17 @@ impl DispatchEngine {
                             // nothing to the transcript.
                             ("bail_hint", bail_hint_note.as_deref().unwrap_or("")),
                         ]);
+                        match self.admit_review_model(&task).await? {
+                            ReviewAdmission::Allowed => (),
+                            ReviewAdmission::Paused => return Ok::<(), String>(()),
+                        };
                         let eval_fut = evaluator.evaluate(&criteria, &task_text, &transcript);
                         let eval_result =
                             time::timeout(Duration::from_secs(EVALUATOR_TIMEOUT_SECS), eval_fut)
                                 .await;
+                        if self.park_autonomy_paused_review(&task).await? {
+                            return Ok::<(), String>(());
+                        }
                         // A1 ledger: record the first-stage verdict on the
                         // round about to be sealed (NULL stays NULL when the
                         // evaluator errored or timed out). Pure bookkeeping —
@@ -788,19 +848,29 @@ impl DispatchEngine {
                                     judge_mode,
                                     &detail,
                                 );
-                                call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await
+                                {
+                                    match self.admit_review_model(&task).await? {
+                                        ReviewAdmission::Allowed => (),
+                                        ReviewAdmission::Paused => return Ok::<(), String>(()),
+                                    };
+                                    call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await
+                                }
                             }
                             Some(cfg) => {
                                 let ext = crate::judge_mode::ExternalAcceptanceJudge::new(cfg);
-                                match ext
+                                match self.admit_review_model(&task).await? {
+                                    ReviewAdmission::Allowed => (),
+                                    ReviewAdmission::Paused => return Ok::<(), String>(()),
+                                };
+                                let external_verdict = ext
                                     .judge_with_context(
                                         &criteria,
                                         &task_desc,
                                         &result,
                                         tool_activity_body.as_deref().unwrap_or(""),
                                     )
-                                    .await
-                                {
+                                    .await;
+                                match external_verdict {
                                     Ok(v) => {
                                         info!(
                                             task = %task.id, passed = v.passed,
@@ -820,14 +890,30 @@ impl DispatchEngine {
                                             judge_mode,
                                             &e,
                                         );
+                                        if self.park_autonomy_paused_review(&task).await? {
+                                            return Ok::<(), String>(());
+                                        }
+                                        match self.admit_review_model(&task).await? {
+                                            ReviewAdmission::Allowed => (),
+                                            ReviewAdmission::Paused => return Ok::<(), String>(()),
+                                        };
                                         call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await
                                     }
                                 }
                             }
                         }
                     }
-                    _ => call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await,
+                    _ => {
+                        match self.admit_review_model(&task).await? {
+                            ReviewAdmission::Allowed => (),
+                            ReviewAdmission::Paused => return Ok::<(), String>(()),
+                        };
+                        call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await
+                    },
                 };
+                if self.park_autonomy_paused_review(&task).await? {
+                    return Ok::<(), String>(());
+                }
                 match verdict {
                     Ok(v) if v.passed => {
                         // P0/WP-C: a judge actually ruled this round.
@@ -1082,7 +1168,13 @@ impl DispatchEngine {
                 }
             }
             Ok::<(), String>(())
-            }).await?;
+            });
+            if let Some(home) = &self.home_dir {
+                let callers = crate::autonomous_runtime::task_caller(home, &task).into_iter().collect::<Vec<_>>();
+                crate::autonomous_runtime::scope(home, &task.assigned_to, &callers, review).await?;
+            } else {
+                review.await?;
+            }
         }
         Ok(())
     }
@@ -1232,6 +1324,9 @@ mod survival_snapshot_tests {
     #[tokio::test]
     async fn survival_evidence_sealed_knobs_include_task_retry_cap_without_reclassifying_current_task() {
         let home=tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
         let store=Arc::new(TaskStore::open(home.path()).unwrap());
         let mut task=TaskRow::new("snapshot".into(),"Send report".into(),"".into(),"medium".into(),"alice".into(),"system".into());
         task.goal_mode=true; task.status="pending".into(); task.max_retries=7;

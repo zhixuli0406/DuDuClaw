@@ -480,7 +480,12 @@ pub(crate) async fn handle_team_handoff(args: &Value, home_dir: &Path, default_a
     let write_canonical = canonical.clone();
     let write_id = packet.packet_id.clone();
     let write_bytes = bytes.clone();
+    let admission = match admit_background_identity(home_dir, default_agent, "team_handoff").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     let path = match tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         write_packet_atomic(&write_canonical, &write_id, &write_bytes)
     })
     .await

@@ -38,7 +38,7 @@ fn scaffold_home() -> tempfile::TempDir {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("agent.toml"),
-        "[agent]\nid = \"scaffold\"\nname = \"Scaffold\"\n",
+        "[agent]\nid = \"scaffold\"\nname = \"Scaffold\"\nstatus = \"active\"\n",
     )
     .unwrap();
     home
@@ -167,7 +167,7 @@ async fn init_token_listing_matches_the_internal_scoped_listing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn employee_and_internal_listings_are_unchanged() {
+async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hidden() {
     let home = scaffold_home();
     // Per-agent key whose client id is the employee (the O7 budget fixture):
     // no scopes, but an employee, so the scope listing does not apply.
@@ -187,7 +187,8 @@ async fn employee_and_internal_listings_are_unchanged() {
     assert!(per_agent.contains("odoo_schema_overview"));
     assert!(!per_agent.contains("odoo_schema_scan"));
 
-    // The gateway-internal key acting for the same employee.
+    // No verified employee environment accompanies this shared internal key.
+    // Dispatch fails closed for background work, so discovery must hide it.
     let internal = principal(
         duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID,
         "admin",
@@ -196,6 +197,10 @@ async fn employee_and_internal_listings_are_unchanged() {
     assert_eq!(
         names(&internal, home.path(), "scaffold", false).await,
         per_agent
+            .iter()
+            .copied()
+            .filter(|name| !creates_background_work(name))
+            .collect::<BTreeSet<_>>()
     );
 
     // An employee process holding some other scoped key keeps the full list

@@ -48,7 +48,7 @@ fn scaffold_home() -> tempfile::TempDir {
     std::fs::create_dir_all(&dir).expect("agent dir");
     std::fs::write(
         dir.join("agent.toml"),
-        "[agent]\nid = \"scaffold\"\nname = \"Scaffold\"\n",
+        "[agent]\nid = \"scaffold\"\nname = \"Scaffold\"\nstatus = \"active\"\n",
     )
     .expect("agent.toml");
     home
@@ -200,6 +200,11 @@ fn home_with(agent: &str, body: &str) -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("tempdir");
     let dir = home.path().join("agents").join(agent);
     std::fs::create_dir_all(&dir).expect("agent dir");
+    let body = if body.contains("[agent]") {
+        body.to_owned()
+    } else {
+        format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n{body}")
+    };
     std::fs::write(dir.join("agent.toml"), body).expect("agent.toml");
     home
 }
@@ -399,4 +404,53 @@ fn list_changed_notification_is_well_formed() {
         n.get("id").is_none(),
         "a notification must not carry an id: {n}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn paused_caller_hides_background_tools_and_resume_restores_them() {
+    let home = home_with("w", "[capabilities]\n");
+    let before = names_for(home.path(), "w").await;
+    assert!(before.contains(&"tasks_create"));
+    assert!(before.contains(&"agent_update"));
+    duduclaw_core::autonomy_gate::set_pause(home.path(), Some("w"), "test", "operator")
+        .unwrap();
+    let paused = names_for(home.path(), "w").await;
+    assert!(paused.iter().all(|name| !creates_background_work(name)));
+    assert!(paused.contains(&"agent_update"), "argument-dependent tools stay listed");
+    assert!(paused.contains(&"plan_start"), "read-only planning remains available");
+    assert!(!paused.contains(&"tasks_create"));
+    let scaffold = crate::mcp_planner::handle_plan_start(
+        &json!({"task": "plan without creating work"}), home.path(), "w",
+    ).await;
+    assert_ne!(scaffold.get("isError").and_then(serde_json::Value::as_bool), Some(true));
+    duduclaw_core::autonomy_gate::resume(home.path(), Some("w")).unwrap();
+    assert_eq!(names_for(home.path(), "w").await, before);
+
+    std::fs::write(home.path().join(duduclaw_core::autonomy_gate::STATE_FILE), "bad state")
+        .unwrap();
+    assert_eq!(names_for(home.path(), "w").await, paused);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_resume_emit_tools_list_changed_once_per_visible_change() {
+    let home = home_with("w", "[capabilities]\n");
+    let owned = |names: Vec<&str>| names.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let mut advertised = Some(owned(names_for(home.path(), "w").await));
+    for paused in [true, false] {
+        if paused {
+            duduclaw_core::autonomy_gate::set_pause(home.path(), None, "test", "operator")
+                .unwrap();
+        } else {
+            duduclaw_core::autonomy_gate::resume(home.path(), None).unwrap();
+        }
+        let current = owned(names_for(home.path(), "w").await);
+        let messages = super::server::tools_list_change_notifications(
+            &mut advertised, current.clone(), true, false, &[],
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["method"], "notifications/tools/list_changed");
+        assert!(super::server::tools_list_change_notifications(
+            &mut advertised, current, true, false, &[],
+        ).is_empty());
+    }
 }

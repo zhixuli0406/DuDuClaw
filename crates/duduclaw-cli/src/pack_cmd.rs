@@ -1139,8 +1139,36 @@ reports_to = "front"
 
     /// Every regular file under `root`, as (relative path, bytes), sorted.
     /// `experts/` is excluded: its `install.json` records a wall-clock
-    /// `installed_at`, the one field that cannot be equal across two runs.
+    /// `installed_at`. Profile history and audit retain all content and metadata
+    /// except wall-clock timestamps (including the timestamp part of version IDs
+    /// and the audit chain derived from timestamped rows).
     fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn stable_version(value: &str) -> &str {
+            value.split_once('-').map(|(_, hash)| hash).unwrap_or(value)
+        }
+        fn stable_jsonl(bytes: &[u8], history: bool) -> Vec<u8> {
+            let text = std::str::from_utf8(bytes).unwrap();
+            let mut out = String::new();
+            for line in text.lines() {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                let object = row.as_object_mut().unwrap();
+                if history {
+                    object.remove("at");
+                } else {
+                    object.remove("timestamp");
+                    object.remove("_prev_hash");
+                }
+                let version = if history { row.get_mut("version_id") }
+                    else { row.get_mut("details").and_then(|d| d.get_mut("version_id")) };
+                if let Some(version) = version.and_then(|v| v.as_str().map(str::to_owned)) {
+                    if history { row["version_id"] = serde_json::json!(stable_version(&version)); }
+                    else { row["details"]["version_id"] = serde_json::json!(stable_version(&version)); }
+                }
+                out.push_str(&serde_json::to_string(&row).unwrap());
+                out.push('\n');
+            }
+            out.into_bytes()
+        }
         fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let Ok(rd) = std::fs::read_dir(dir) else {
                 return;
@@ -1156,11 +1184,22 @@ reports_to = "front"
                 } else if ft.is_file()
                     && let Ok(rel) = p.strip_prefix(base)
                 {
-                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    let mut rel = rel.to_string_lossy().replace('\\', "/");
                     if rel.starts_with("experts/") {
                         continue;
                     }
-                    out.push((rel, std::fs::read(&p).unwrap_or_default()));
+                    let mut bytes = std::fs::read(&p).unwrap();
+                    if rel.starts_with("agent_file_history/") {
+                        if rel.ends_with("/index.jsonl") {
+                            bytes = stable_jsonl(&bytes, true);
+                        } else if rel.ends_with(".toml") {
+                            let (dir, file) = rel.rsplit_once('/').unwrap();
+                            rel = format!("{dir}/{}", stable_version(file));
+                        }
+                    } else if rel == "security_audit.jsonl" {
+                        bytes = stable_jsonl(&bytes, false);
+                    }
+                    out.push((rel, bytes));
                 }
             }
         }

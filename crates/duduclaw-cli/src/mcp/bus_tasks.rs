@@ -209,6 +209,10 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
     let step_count = spec.steps.len();
 
     let agent_dir = home_dir.join("agents").join(caller);
+    let admission = match admit_background_identity(home_dir, caller, "create_task").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     if let Err(e) = spec.save(&agent_dir) {
         return mcp_error(&format!("failed to save task: {e}"));
     }
@@ -223,6 +227,8 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
     let queue_path = home_dir.join("bus_queue.jsonl");
     if let Ok(line) = serde_json::to_string(&signal) {
         let _ = tokio::task::spawn_blocking(move || {
+            // Keep the lease through the wake-up signal even if the RPC is cancelled.
+            let _admission = admission;
             append_to_jsonl_sync(&queue_path, &line);
         })
         .await;

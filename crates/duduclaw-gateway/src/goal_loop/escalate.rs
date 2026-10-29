@@ -133,7 +133,10 @@ impl GoalLoopDriver {
                 serde_json::json!({ "task_id": task.id, "agent_id": task.assigned_to,
                     "pause_reason": task.pause_reason }));
             let level = AutonomyLevel::for_agent(&self.home_dir, &task.assigned_to);
-            if level == AutonomyLevel::Observer {
+            if level == AutonomyLevel::Observer
+                && crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
+                    .observer_may_autoclose()
+            {
                 // Observer: notify-only, no waiting — resolve straight to cancelled.
                 match self
                     .store

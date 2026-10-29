@@ -7,6 +7,15 @@ use super::*;
 /// (≤ 30 seconds) — no inter-process signal is required because both
 /// processes use WAL-mode SQLite.
 pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    handle_schedule_task_for_actor(params, home_dir, RecordActor::Agent(caller)).await
+}
+
+pub(crate) async fn handle_schedule_task_for_actor(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let caller = actor.id();
     use duduclaw_gateway::cron_store::{CronStore, CronTaskRow};
 
     let agent_id = params
@@ -153,6 +162,10 @@ pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller
     row.notify_thread_id = notify_thread_id;
     row.cron_timezone = cron_timezone;
 
+    let _admission = match admit_background_caller(home_dir, actor, "tasks_create").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     match store.insert(&row).await {
         Ok(()) => {
             // WP6.4 — channel receipt. The old result text was an English
@@ -476,6 +489,10 @@ pub(crate) async fn handle_update_cron_task(
         }
     }
 
+    let _admission = match admit_background_caller(home_dir, actor, "update_cron_task").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     super::workflow_operation::effect_start();
     match store
         .update_fields(
@@ -595,6 +612,10 @@ pub(crate) async fn handle_pause_cron_task(
     let key = if !id.is_empty() { id } else { name };
 
     let action = if enabled { "resumed" } else { "paused" };
+    let _admission = match admit_background_caller(home_dir, actor, "pause_cron_task").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     match store.set_enabled(&row.id, enabled).await {
         Ok(true) => serde_json::json!({
             "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
@@ -630,10 +651,22 @@ pub(crate) async fn handle_run_cron_task(
     // Release the store before the (long, blocking) run opens its own.
     drop(store);
 
-    match duduclaw_gateway::cron_scheduler::run_cron_task_now_standalone(home_dir, &row.id).await {
+    // Fast refusal here; the runtime re-admits the caller and target at handoff.
+    match admit_background_caller(home_dir, actor, "run_cron_task").await {
+        Ok(guard) => drop(guard),
+        Err(reason) => return tool_error(&reason),
+    }
+    match duduclaw_gateway::cron_scheduler::run_cron_task_now_for_caller(
+        home_dir, &row.id, actor.agent(),
+    ).await {
         Ok(summary) => serde_json::json!({
             "content": [{"type": "text", "text": summary}]
         }),
-        Err(e) => tool_error(&format!("run cron task: {e}")),
+        Err(duduclaw_gateway::cron_scheduler::ManualCronError::Autonomy(pause)) => {
+            tool_error(&background_caller_refusal("run_cron_task", &pause))
+        }
+        Err(duduclaw_gateway::cron_scheduler::ManualCronError::Other(error)) => {
+            tool_error(&format!("run cron task: {error}"))
+        }
     }
 }

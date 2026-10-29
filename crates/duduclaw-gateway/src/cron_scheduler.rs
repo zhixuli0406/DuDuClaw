@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::claude_runner::call_claude_for_agent_with_type;
 use crate::cron_store::{CronStore, CronTaskRow};
 use duduclaw_agent::registry::AgentRegistry;
+use duduclaw_core::autonomy_gate::{self, AutonomyPath};
 
 /// Re-export the DB row type under the historical name so external callers
 /// that used `cron_scheduler::CronTask` keep compiling. Prefer
@@ -62,14 +63,16 @@ impl AgentInvoker for RealAgentInvoker {
             crate::task_sandbox::HostPath::Cron,
             crate::task_sandbox::HostAction::RanOnHost,
         );
-        call_claude_for_agent_with_type(
-            home_dir,
-            registry,
-            agent_id,
-            prompt,
-            crate::cost_telemetry::RequestType::Cron,
-        )
-        .await
+        crate::autonomous_runtime::scope(
+            home_dir, agent_id, &[],
+            call_claude_for_agent_with_type(
+                home_dir,
+                registry,
+                agent_id,
+                prompt,
+                crate::cost_telemetry::RequestType::Cron,
+            ),
+        ).await
     }
 }
 
@@ -164,6 +167,11 @@ impl CronScheduler {
                     cursor = to;
                 }
                 let Some(slot) = latest_routine_slot(&row, cursor, now)? else { return Ok(None) };
+                if let Err(pause) = cron_autonomy_check(&self.home_dir, &self.registry, &row.agent_id).await {
+                    self.store.record_autonomy_skip(&row.id, &pause).await?;
+                    self.store.advance_routine_cursor(&row.id, &material_hash, slot.timestamp()).await?;
+                    return Ok(None);
+                }
                 let trigger = crate::workflow::Trigger::Scheduled {
                     cron_id: row.id.clone(),
                     timezone: row.cron_timezone.clone().ok_or("workflow cron timezone missing")?,
@@ -172,6 +180,7 @@ impl CronScheduler {
                 let run = enqueue_routine_trigger(
                     &self.home_dir,
                     &self.store,
+                    &self.registry,
                     &row.id,
                     trigger,
                     self.workflow_service.as_deref()
@@ -207,6 +216,7 @@ impl CronScheduler {
             return enqueue_routine_trigger(
                 &self.home_dir,
                 &self.store,
+                &self.registry,
                 task_id,
                 crate::workflow::Trigger::Manual {
                     request_id: request_id.into()
@@ -511,11 +521,12 @@ pub(crate) fn routine_slot_matches(expression: &str, timezone: &str, scheduled_a
 /// Every typed entry point rereads the current cron row and server-owned binding.
 /// Authorization/fixed revision/fixtures/policy/skill checks belong to the service.
 async fn enqueue_routine_trigger(
-    home_dir: &Path, store: &Arc<CronStore>, task_id: &str,
+    home_dir: &Path, store: &Arc<CronStore>, registry: &Arc<RwLock<AgentRegistry>>, task_id: &str,
     trigger: crate::workflow::Trigger, injected: Option<&crate::workflow::WorkflowService>,
 ) -> Result<String, String> {
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
+    cron_autonomy_check(home_dir, registry, &task.agent_id).await?;
     let (activation_id, material_hash) = store.workflow_binding(task_id).await?.ok_or("workflow cron binding missing")?;
     let owned;
     let service = match injected {
@@ -590,6 +601,37 @@ async fn dispatch_cron_task_with_slot(
     home_dir:&std::path::Path,store:&Arc<CronStore>,registry:&Arc<RwLock<AgentRegistry>>,
     task:&CronTaskRow,invoker:&dyn AgentInvoker,slot:Option<String>,
 ) {
+    // Bind the legacy alias to the same concrete employee the runner resolves.
+    // Pass that ID onward so a later registry main-role change cannot retarget
+    // a fire after its autonomy check.
+    let mut effective_task = task.clone();
+    match cron_autonomy_check(home_dir, registry, &task.agent_id).await {
+        Ok(agent) => effective_task.agent_id = agent,
+        Err(reason) => {
+            if let Err(error) = store.record_autonomy_skip(&task.id, &reason).await {
+                warn!(id = %task.id, %error, "cron autonomy skip could not be recorded");
+            }
+            return;
+        }
+    }
+    crate::autonomous_runtime::scope(
+        home_dir, &effective_task.agent_id, &[],
+        dispatch_effective_cron_task(home_dir, store, registry, &effective_task, invoker, slot),
+    ).await;
+}
+
+async fn dispatch_effective_cron_task(
+    home_dir: &Path, store: &Arc<CronStore>, registry: &Arc<RwLock<AgentRegistry>>,
+    task: &CronTaskRow, invoker: &dyn AgentInvoker, slot: Option<String>,
+) {
+    // Check the initiating caller as well as the effective target before
+    // trigger evaluation or runtime setup; final transport admission remains.
+    if let Err(reason) = crate::autonomous_runtime::check_current().await {
+        if let Err(error) = store.record_autonomy_skip(&task.id, &reason).await {
+            warn!(id = %task.id, %error, "cron caller autonomy skip could not be recorded");
+        }
+        return;
+    }
     match store.workflow_binding(&task.id).await {
         Ok(Some((activation_id,material_hash))) => {
             let _ = (activation_id, material_hash);
@@ -608,7 +650,7 @@ async fn dispatch_cron_task_with_slot(
                     return;
                 }
             };
-            let outcome = enqueue_routine_trigger(home_dir, store, &task.id, trigger, None).await;
+            let outcome = enqueue_routine_trigger(home_dir, store, registry, &task.id, trigger, None).await;
             // An enqueue is not an execution receipt. Never record success here.
             if let Err(error) = outcome {
                 warn!(id=%task.id,"workflow cron enqueue refused: {error}");
@@ -727,6 +769,37 @@ async fn dispatch_cron_task_with_slot(
 /// `trigger_message` (G3) is optional context from a `condition` script's
 /// `message` field; when present it is appended to the prompt so the agent
 /// sees why the task fired.
+async fn cron_autonomy_check(home: &Path, registry: &Arc<RwLock<AgentRegistry>>, agent: &str) -> Result<String, String> {
+    let effective = if agent == "default" {
+        registry.read().await.main_agent()
+            .map(|agent| agent.config.agent.name.clone())
+            .ok_or_else(|| "autonomy paused: default employee unavailable".to_string())?
+    } else {
+        agent.to_string()
+    };
+    autonomy_gate::check(home, &effective, AutonomyPath::Cron)
+        .map_err(|pause| {
+            let reason = format!("autonomy paused: {pause}");
+            let _ = crate::autonomous_runtime::pause_refusal(pause);
+            reason
+        })?;
+    Ok(effective)
+}
+
+/// A skipped due fire is a durable scheduler outcome, including after a
+/// condition script finished while the operator paused this employee.
+async fn record_autonomy_skip(home: &Path, store: &CronStore, task: &CronTaskRow) -> bool {
+    let Err(pause) = autonomy_gate::check(home, &task.agent_id, AutonomyPath::Cron) else {
+        return false;
+    };
+    let reason = format!("autonomy paused: {pause}");
+    let _ = crate::autonomous_runtime::pause_refusal(pause);
+    if let Err(error) = store.record_autonomy_skip(&task.id, &reason).await {
+        warn!(id = %task.id, %error, "cron autonomy skip could not be recorded");
+    }
+    true
+}
+
 async fn execute_cron_task(
     home_dir: &std::path::Path,
     store: &Arc<CronStore>,
@@ -735,6 +808,9 @@ async fn execute_cron_task(
     trigger_message: Option<&str>,
     invoker: &dyn AgentInvoker,
 ) {
+    if record_autonomy_skip(home_dir, store, task).await {
+        return;
+    }
     // RFC-23 `[redaction.sources] cron_context` (v1.68.0): the trigger
     // context a condition script produced is data, like a tool result, and
     // is redacted before it reaches the model (default mode `on`). The task
@@ -798,6 +874,9 @@ async fn execute_cron_task(
     // `None` and does not affect dispatch.
     let typing_guard = build_cron_typing_guard(home_dir, task).await;
 
+    if record_autonomy_skip(home_dir, store, task).await {
+        return;
+    }
     let dispatch_fut = crate::claude_runner::DELEGATION_ENV.scope(delegation_env, async {
         match prompt_result {
             Ok(prompt) => {
@@ -1182,6 +1261,35 @@ pub async fn run_cron_task_now_standalone(
     run_cron_task_now_with(home_dir, id_or_name, &RealAgentInvoker).await
 }
 
+/// Retain the employee who initiated a manual run through the final transport
+/// admission, even when the cron row belongs to a different employee.
+#[derive(Debug)]
+pub enum ManualCronError {
+    Autonomy(Box<autonomy_gate::PauseInfo>),
+    Other(String),
+}
+
+pub async fn run_cron_task_now_for_caller(
+    home_dir: &Path,
+    id_or_name: &str,
+    caller: Option<&str>,
+) -> Result<String, ManualCronError> {
+    let run = run_cron_task_now_with(home_dir, id_or_name, &RealAgentInvoker);
+    let (result, pause) = crate::autonomous_runtime::capture_pause(async {
+        match caller {
+            Some(caller) => crate::autonomous_runtime::scope(home_dir, caller, &[], async {
+                crate::autonomous_runtime::check_current().await?;
+                run.await
+            }).await,
+            None => run.await,
+        }
+    }).await;
+    match pause {
+        Some(pause) => Err(ManualCronError::Autonomy(pause)),
+        None => result.map_err(ManualCronError::Other),
+    }
+}
+
 /// Injectable core of [`run_cron_task_now_standalone`] — parameterised over
 /// the [`AgentInvoker`] so tests can substitute a mock for the real CLI.
 async fn run_cron_task_now_with(
@@ -1268,6 +1376,12 @@ mod tests {
         }
     }
 
+    fn active_agent(home: &Path, agent: &str) {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+    }
+
     /// run-now goes through the SAME `dispatch_cron_task` path a scheduled
     /// fire uses: the mock invoker receives the canonical
     /// `[Scheduled Task: <name>] <task>` prompt and the run is recorded in
@@ -1276,6 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_dispatch_uses_same_path_and_records_run() {
         let dir = tempfile::tempdir().unwrap();
+        active_agent(dir.path(), "agnes");
         let store = Arc::new(CronStore::open(dir.path()).unwrap());
         let row = CronTaskRow::new(
             "rn1".into(),
@@ -1313,6 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_dispatch_records_failure() {
         let dir = tempfile::tempdir().unwrap();
+        active_agent(dir.path(), "agnes");
         let store = Arc::new(CronStore::open(dir.path()).unwrap());
         let row = CronTaskRow::new(
             "rn2".into(),
@@ -1346,6 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_run_now_resolves_and_reports() {
         let dir = tempfile::tempdir().unwrap();
+        active_agent(dir.path(), "agnes");
         let store = CronStore::open(dir.path()).unwrap();
         let row = CronTaskRow::new(
             "sr1".into(),
@@ -1523,4 +1640,69 @@ mod tests {
         let task = task_with_notify(Some("discord"), Some("parent"), Some("thread-42"));
         assert!(deliver_cron_result(dir.path(), &task, "結果").await.is_ok());
     }
+    #[tokio::test]
+    async fn autonomy_pause_cron_records_skip_then_resume_invokes() {
+        let dir = tempfile::tempdir().unwrap();
+        active_agent(dir.path(), "agnes");
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let row = CronTaskRow::new("pause-cron".into(), "Paused job".into(), "agnes".into(), "0 9 * * *".into(), "work".into());
+        store.insert(&row).await.unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let invoker = RecordingInvoker { calls: calls.clone(), reply: "done".into(), fail: false };
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+        for target in [Some("agnes"), None] {
+            autonomy_gate::set_pause(dir.path(), target, "operator request", "user").unwrap();
+            dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+            assert!(calls.lock().unwrap().is_empty());
+            let skipped = store.get(&row.id).await.unwrap().unwrap();
+            assert_eq!(skipped.last_status.as_deref(), Some("skipped"));
+            assert_eq!((skipped.run_count, skipped.failure_count), (0, 0));
+            assert!(skipped.last_error.unwrap().contains("autonomy paused"));
+            autonomy_gate::resume(dir.path(), target).unwrap();
+        }
+        dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(store.get(&row.id).await.unwrap().unwrap().last_status.as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn autonomy_pause_cron_default_alias_uses_the_main_employee() {
+        let (dir, reg) = crate::trigger_route::tests::registry(false).await;
+        let agent = reg.main_agent().unwrap().config.agent.name.clone();
+        let registry = Arc::new(RwLock::new(reg));
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let row = CronTaskRow::new("alias-cron".into(), "Legacy".into(), "default".into(), "0 9 * * *".into(), "work".into());
+        store.insert(&row).await.unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let invoker = RecordingInvoker { calls: calls.clone(), reply: "done".into(), fail: false };
+        autonomy_gate::set_pause(dir.path(), Some(&agent), "pause", "user").unwrap();
+        dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+        assert!(calls.lock().unwrap().is_empty());
+        autonomy_gate::resume(dir.path(), Some(&agent)).unwrap();
+        dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+        assert_eq!(calls.lock().unwrap()[0].0, agent);
+        assert_eq!(store.get(&row.id).await.unwrap().unwrap().last_status.as_deref(), Some("success"));
+    }
+
+
+    #[tokio::test]
+    async fn manual_cron_reports_caller_pause_as_typed_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        active_agent(home.path(), "alice");
+        active_agent(home.path(), "bob");
+        let store = CronStore::open(home.path()).unwrap();
+        let row = CronTaskRow::new(
+            "manual-pause".into(), "Manual job".into(), "bob".into(),
+            "0 9 * * *".into(), "work".into(),
+        );
+        store.insert(&row).await.unwrap();
+        autonomy_gate::set_pause(home.path(), Some("alice"), "pause caller", "operator").unwrap();
+        let result = run_cron_task_now_for_caller(home.path(), &row.id, Some("alice")).await;
+        match result {
+            Err(ManualCronError::Autonomy(pause)) => assert_eq!(pause.reason, "agent_pause"),
+            other => panic!("expected typed autonomy refusal, got {other:?}"),
+        }
+        assert_eq!(store.get(&row.id).await.unwrap().unwrap().run_count, 0);
+    }
+
 }

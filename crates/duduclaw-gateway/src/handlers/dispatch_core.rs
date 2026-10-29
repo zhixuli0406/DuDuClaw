@@ -81,6 +81,9 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Operator);
                 Box::pin(self.handle_agents_delegate(params)).await
             }
+            "autonomy.pause" | "autonomy.resume" | "autonomy.status" => {
+                self.handle_autonomy_rpc(method, params, ctx).await
+            }
             "agents.pause" => {
                 require_manager!();
                 let agent_id = check_agent!(AccessLevel::Operator);

@@ -176,6 +176,12 @@ pub(crate) async fn handle_tools_call(
     // Who this call acts as for the record-relationship checks
     // (`record_authz.rs`), resolved once per call.
     let record_actor = record_actor_for(home_dir, caller_client_id, default_agent);
+    if changes_background_work(tool_name, &arguments)
+        && let Err(reason) = check_background_caller(home_dir, record_actor, tool_name)
+    {
+        return jsonrpc_response(id, tool_error(&reason));
+    }
+
     // Per-employee Google identity: decided from the proven employee only
     // (never a tool argument). Only built for the Google tools.
     let google_caller = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
@@ -183,7 +189,7 @@ pub(crate) async fn handle_tools_call(
     } else {
         super::google_identity_client::GoogleCaller::default()
     };
-    let result = match tool_name {
+    let result = with_background_caller(record_actor, async { Ok(match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
         // ── W19-P0 M1: namespace-aware memory endpoints ────────────────────
@@ -286,7 +292,7 @@ pub(crate) async fn handle_tools_call(
         "plan_start" => {
             crate::mcp_planner::handle_plan_start(&arguments, home_dir, default_agent).await
         }
-        "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
+        "send_to_agent" => handle_send_to_agent(&arguments, home_dir, record_actor.id()).await,
         "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
         "list_cron_tasks" => handle_list_cron_tasks(&arguments, home_dir, default_agent).await,
@@ -309,12 +315,12 @@ pub(crate) async fn handle_tools_call(
             .await
         }
         "list_agents" => handle_list_agents(&arguments, home_dir, default_agent).await,
-        "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
+        "create_task" => handle_create_task(&arguments, home_dir, record_actor.id()).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
         "agent_status" => handle_agent_status(&arguments, home_dir, default_agent).await,
-        "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,
-        "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, default_agent).await,
+        "spawn_agent" => handle_spawn_agent(&arguments, home_dir, record_actor.id()).await,
+        "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, record_actor.id()).await,
         "agent_update" => handle_agent_update(&arguments, home_dir, record_actor).await,
         "agent_remove" => {
             handle_agent_remove(
@@ -333,7 +339,7 @@ pub(crate) async fn handle_tools_call(
         "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
         "skill_synthesis_status" => handle_skill_synthesis_status(&arguments, home_dir).await,
         "skill_synthesis_run" => {
-            handle_skill_synthesis_run(&arguments, home_dir, default_agent).await
+            handle_skill_synthesis_run(&arguments, home_dir, record_actor).await
         }
         "skill_hub_install" => {
             handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await
@@ -485,7 +491,7 @@ pub(crate) async fn handle_tools_call(
         }
         "responsibility_ask" => handle_responsibility_ask(&arguments, home_dir, record_actor).await,
         // Goal chain tools (G8)
-        "goals_create" => handle_goals_create(&arguments, home_dir, default_agent).await,
+        "goals_create" => handle_goals_create(&arguments, home_dir, record_actor.id()).await,
         "goals_list" => handle_goals_list(&arguments, home_dir).await,
         // Co-edited plan tools (U4)
         "plan_get" => handle_plan_get(&arguments, home_dir, default_agent).await,
@@ -514,7 +520,7 @@ pub(crate) async fn handle_tools_call(
         {
             // SEC: Validate agent ID before path construction (prevent traversal)
             if !is_valid_agent_id(default_agent) {
-                return jsonrpc_error(id, -32602, "Invalid agent ID");
+                return Err(jsonrpc_error(id, -32602, "Invalid agent ID"));
             }
             // SEC: Verify the calling agent has computer_use capability enabled.
             let cu_allowed = {
@@ -535,11 +541,11 @@ pub(crate) async fn handle_tools_call(
                     .unwrap_or(false)
             };
             if !cu_allowed {
-                return jsonrpc_error(
+                return Err(jsonrpc_error(
                     id,
                     -32603,
                     "computer_use capability is not enabled for this agent. Set [capabilities] computer_use = true in agent.toml",
-                );
+                ));
             }
             // The session lives in the gateway, which re-checks the
             // capability, the image (never pulled; a missing image comes back
@@ -787,8 +793,12 @@ pub(crate) async fn handle_tools_call(
             removed_tool_result(name).unwrap_or_else(|| tool_error("tool removed"))
         }
         _ => {
-            return jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}"));
+            return Err(jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}")));
         }
+    }) }).await;
+    let result = match result {
+        Ok(value) => value,
+        Err(response) => return response,
     };
 
     let result = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {

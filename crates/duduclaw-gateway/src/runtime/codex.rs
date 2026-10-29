@@ -1147,8 +1147,13 @@ async fn collect_codex_output(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // After the test probe returns. Hold the lease across spawn only; a failed
+    // spawn drops it without marking the round handed off.
+    let admission = crate::autonomous_runtime::admit_current().await?;
     let mut managed = crate::process_group::ManagedChild::spawn(cmd)
         .map_err(|e| format!("Failed to spawn codex: {e}"))?;
+    crate::autonomous_runtime::mark_handoff();
+    drop(admission);
     let mut stdout = managed.child().stdout.take().ok_or("Failed to capture codex stdout")?;
     let mut stderr = managed.child().stderr.take().ok_or("Failed to capture codex stderr")?;
     let mut output = CodexOutput::default();

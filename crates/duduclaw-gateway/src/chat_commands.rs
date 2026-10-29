@@ -1314,10 +1314,12 @@ pub(crate) async fn handle_goal_create(
     // branch exactly (same two functions, same field semantics).
     if plan_first {
         let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
-        let plan_result = crate::goal_plan::generate_plan_first(
+        let plan_result = crate::autonomous_runtime::human_interactive(&ctx.home_dir,
+            crate::goal_plan::generate_plan_first(
             &ctx.home_dir,
             &task.description,
             criteria_for_plan,
+        )
         )
         .await;
         if let Err(e) = &plan_result {
@@ -1409,7 +1411,9 @@ async fn try_decompose_goal(
         crate::goal_plan::LlmGoalDecomposer::new(crate::goal_plan::UtilityDecomposeCaller {
             home_dir: home_dir.to_path_buf(),
         });
-    let plan = match decomposer.decompose(description, criteria).await {
+    let plan = match crate::autonomous_runtime::human_interactive(
+        home_dir, decomposer.decompose(description, criteria),
+    ).await {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "goal planner: decompose failed — falling back to single task");

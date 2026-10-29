@@ -208,6 +208,81 @@ pub fn start_agent_dispatcher_with_crypto(
     })
 }
 
+/// Resolve the dispatcher-only `default` alias before checking persisted
+/// autonomy state. Human conversation routing never calls this gate.
+async fn check_autonomous_dispatch(
+    home: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+) -> Result<(), String> {
+    let resolved = resolve_dispatch_agent(registry, agent_id).await?;
+    duduclaw_core::autonomy_gate::check(
+        home, &resolved, duduclaw_core::autonomy_gate::AutonomyPath::Dispatcher,
+    ).map_err(|pause| pause.to_string())?;
+    if crate::ephemeral::is_ephemeral_id(&resolved) {
+        crate::ephemeral::check_autonomy(home, &resolved)?;
+    }
+    Ok(())
+}
+
+/// Host-stamped delegation identities constrain admission along with the target.
+async fn check_dispatch_sources(
+    home: &Path, registry: &Arc<RwLock<AgentRegistry>>,
+    sender: Option<&str>, origin: Option<&str>,
+) -> Result<(), String> {
+    for source in [sender, origin].into_iter().flatten() {
+        if source.is_empty() || duduclaw_core::is_system_sender(source)
+            || duduclaw_core::is_reserved_queue_sender(source) { continue; }
+        check_autonomous_dispatch(home, registry, source).await?;
+    }
+    Ok(())
+}
+
+async fn resolve_dispatch_agent(
+    registry: &Arc<RwLock<AgentRegistry>>, agent_id: &str,
+) -> Result<String, String> {
+    if agent_id == "default" {
+        registry.read().await.main_agent()
+            .map(|agent| agent.config.agent.name.clone())
+            .ok_or_else(|| "autonomy: default agent unavailable".to_string())
+    } else {
+        Ok(agent_id.to_string())
+    }
+}
+
+/// A task may enter review through MCP before the model turn actually ends.
+/// Keep it untouched until the dispatcher/team composer reaches its boundary.
+pub(crate) async fn goal_turn_active(home: &Path, task_id: &str) -> Result<bool, String> {
+    if crate::responsibility::team_activity::registered(task_id) {
+        return Ok(true);
+    }
+    let queue = crate::message_queue::MessageQueue::open(home)?;
+    Ok(queue.open_task_messages().await?.iter().any(|message| {
+        matches!(message.status, crate::message_queue::MessageStatus::Acked
+            | crate::message_queue::MessageStatus::Processing)
+            && message.sender == crate::responsibility::GOAL_LOOP_SENDER
+            && extract_goal_loop_task_id_and_round(&message.payload)
+                .is_some_and(|(id, _)| id == task_id)
+    }))
+}
+
+/// The runtime turn has returned: pausing never interrupts it, but prevents
+/// automatic continuation even if the employee left its task in progress.
+async fn park_paused_goal_after_turn(
+    home: &Path, registry: &Arc<RwLock<AgentRegistry>>, agent: &str, task_id: &str,
+) -> Result<(), String> {
+    let resolved = resolve_dispatch_agent(registry, agent).await?;
+    let Err(pause) = duduclaw_core::autonomy_gate::check(
+        home, &resolved, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+    ) else { return Ok(()) };
+    let store = crate::task_store::TaskStore::open(home)?;
+    store.mark_needs_human_with_pause(
+        task_id, &pause.to_string(), crate::pause_reason::PauseReason::OperatorPaused,
+    ).await?;
+    store.stamp_iteration_pause(task_id, "operator_paused").await?;
+    Ok(())
+}
+
 /// Poll the SQLite message queue for pending messages and dispatch them.
 pub(crate) async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
@@ -216,7 +291,33 @@ pub(crate) async fn poll_and_dispatch_sqlite(
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
     gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
-    let messages = queue.pending_messages(10).await?;
+    let mut messages = Vec::new();
+    let mut cursor: Option<(String, String)> = None;
+    let mut eligibility = std::collections::HashMap::new();
+    // A paused employee's backlog remains pending, but cannot occupy every
+    // slot of the fixed-size batch and starve unrelated employees.
+    while messages.len() < 10 {
+        let page = queue.pending_messages_after(
+            100, cursor.as_ref().map(|(at, id)| (at.as_str(), id.as_str())),
+        ).await?;
+        let Some(last) = page.last() else { break };
+        cursor = Some((last.created_at.clone(), last.id.clone()));
+        for msg in page {
+            let allowed = if let Some(allowed) = eligibility.get(&msg.target) {
+                *allowed
+            } else {
+                let allowed = check_autonomous_dispatch(home_dir, registry, &msg.target).await.is_ok();
+                eligibility.insert(msg.target.clone(), allowed);
+                allowed
+            };
+            if allowed && check_dispatch_sources(home_dir, registry,
+                msg.sender_agent.as_deref().or(Some(msg.sender.as_str())),
+                msg.origin_agent.as_deref()).await.is_ok() {
+                messages.push(msg);
+                if messages.len() == 10 { break; }
+            }
+        }
+    }
     if messages.is_empty() {
         return Ok(());
     }
@@ -233,6 +334,12 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             && !duduclaw_core::gateway_instance::held(home_dir)
         {
             continue;
+        }
+        if check_autonomous_dispatch(home_dir, registry, &msg.target).await.is_err()
+            || check_dispatch_sources(home_dir, registry,
+                msg.sender_agent.as_deref().or(Some(msg.sender.as_str())),
+                msg.origin_agent.as_deref()).await.is_err() {
+            continue; // Do not claim it: resume can pick up the pending message.
         }
         // ACK immediately to prevent double-pickup
         queue.ack(&msg.id).await?;
@@ -320,7 +427,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         let delegation = DelegationEnv {
             depth: msg.delegation_depth as u8,
             origin: msg.origin_agent.clone().unwrap_or_default(),
-            sender: msg.sender_agent.clone().unwrap_or_default(),
+            sender: msg.sender_agent.clone().unwrap_or_else(|| msg.sender.clone()),
             // SQLite queue rows do not carry hop_depth (no schema column); the
             // JSONL bus is the hop_depth-bearing rail. Seed from delegation_depth
             // so a SQLite-dispatched chain still inherits a non-resetting depth.
@@ -381,18 +488,12 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             }
         };
 
-        // M3-1: a durable round records that it is being handed to a runtime
-        // before anything is started; cost accounting treats a round with
-        // this mark as one that ran, whatever its queue message does later.
-        if msg.id.starts_with("goal:") {
-            if let Err(e) = crate::responsibility::mark_round_started(home_dir, &msg.id).await {
-                warn!(msg_id = %msg.id, error = %e, "SQLite queue: round start not recorded — round not started");
-                queue
-                    .fail(&msg.id, &format!("round start could not be recorded: {e}"))
-                    .await?;
-                crate::responsibility::return_unrun_round(home_dir, &msg.id).await;
-                continue;
-            }
+        if check_autonomous_dispatch(home_dir, registry, &msg.target).await.is_err()
+            || check_dispatch_sources(home_dir, registry,
+                msg.sender_agent.as_deref().or(Some(msg.sender.as_str())),
+                msg.origin_agent.as_deref()).await.is_err() {
+            queue.defer_to_pending(&msg.id).await?;
+            continue;
         }
 
         // L4-3: only the goal-loop driver's own messages may point the typing
@@ -430,7 +531,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             );
         }
         let dispatch_fut =
-            dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation);
+            dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation,
+                msg.id.starts_with("goal:").then_some(msg.id.as_str()));
         // v1.10: scope wiki RL trust feedback context so the sub-agent's
         // wiki RAG citations land in the same tracker bucket as the
         // originating turn. Pulled from `message_queue.{turn_id, session_id}`
@@ -564,6 +666,17 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             },
         };
         drop(typing_guard);
+        if matches!(&result, Err(DispatchError::AutonomyPaused(_))) {
+            queue.defer_to_pending(&msg.id).await?;
+            continue;
+        }
+        if result.is_err() && msg.id.starts_with("goal:") {
+            crate::responsibility::return_unrun_round(home_dir, &msg.id).await;
+        }
+        if let Some((task_id, _)) = goal_loop_ref {
+            park_paused_goal_after_turn(home_dir, registry, &msg.target, task_id).await?;
+        }
+
 
         // H19: same turn-end invalidation as the JSONL bus rail above — this
         // turn concluded, so any ephemeral spawn tickets it queued while over
@@ -667,6 +780,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
 /// Why a dispatch failed, as the two delegation reply paths need it.
 #[derive(Debug)]
 enum DispatchError {
+    /// Admission was deferred; no runtime started and no failure is charged.
+    AutonomyPaused(String),
     /// The task sandbox refused or failed the task. Its `message` is built
     /// by `task_sandbox` without CLI output or host paths, so it may be
     /// forwarded to the requester.
@@ -677,11 +792,28 @@ enum DispatchError {
 }
 
 impl DispatchError {
+    fn from_runtime(error: String) -> Self {
+        if !crate::autonomous_runtime::was_handed_off()
+            && (crate::autonomous_runtime::was_denied() || error.starts_with("AUTONOMY_PAUSED:")) {
+            Self::AutonomyPaused(error)
+        } else {
+            Self::Other(error)
+        }
+    }
+
+    fn from_sandbox(error: crate::task_sandbox::SandboxFailure) -> Self {
+        if !crate::autonomous_runtime::was_handed_off() && crate::autonomous_runtime::was_denied() {
+            Self::AutonomyPaused("AUTONOMY_PAUSED: sandbox handoff refused".into())
+        } else {
+            Self::Sandbox(error)
+        }
+    }
+
     /// Full text for host-local records (logs, the queue row).
     fn host_text(&self) -> String {
         match self {
             Self::Sandbox(failure) => failure.host_text(),
-            Self::Other(e) => e.clone(),
+            Self::AutonomyPaused(e) | Self::Other(e) => e.clone(),
         }
     }
 }
@@ -693,6 +825,7 @@ impl DispatchError {
 /// classified, non-leaking fallback: the raw text never leaves the host.
 fn dispatch_failure_reply(error: &DispatchError) -> String {
     match error {
+        DispatchError::AutonomyPaused(_) => "自主工作已暫停，恢復後再執行。".into(),
         DispatchError::Sandbox(failure) if failure.unavailable => {
             format!("⚠️ 子任務未執行（任務沙箱）：{}", failure.message)
         }
@@ -780,7 +913,7 @@ async fn poll_and_dispatch(
 
     let mut to_dispatch: Vec<BusMessage> = Vec::new();
     let mut remaining_lines: Vec<String> = Vec::new();
-    let mut proactive_sends: Vec<ProactiveSend> = Vec::new();
+    let mut proactive_sends: Vec<(ProactiveSend, String)> = Vec::new();
     // Messages consumed (removed from the queue) without producing a dispatch:
     // oversized, depth-exceeded, invalid id, delegation-denied. They still
     // require the queue rewrite below — without this counter a poll cycle that
@@ -800,7 +933,11 @@ async fn poll_and_dispatch(
         // used to fall into the "unknown type" arm below and sit in the queue
         // as dead letters FOREVER — the whole proactive feature ended here.
         if let Some(send) = parse_proactive_line(line) {
-            proactive_sends.push(send);
+            if check_autonomous_dispatch(home_dir, registry, &send.agent_id).await.is_err() {
+                remaining_lines.push(line.to_string());
+            } else {
+                proactive_sends.push((send, line.to_string()));
+            }
             continue;
         }
         match serde_json::from_str::<BusMessage>(line) {
@@ -808,6 +945,12 @@ async fn poll_and_dispatch(
                 if !duduclaw_core::is_valid_agent_id(&msg.agent_id) {
                     warn!("Invalid agent_id in bus queue, skipping");
                     consumed_without_dispatch += 1;
+                    continue;
+                }
+                if check_autonomous_dispatch(home_dir, registry, &msg.agent_id).await.is_err()
+                    || check_dispatch_sources(home_dir, registry,
+                        msg.sender_agent.as_deref(), msg.origin_agent.as_deref()).await.is_err() {
+                    remaining_lines.push(line.to_string());
                     continue;
                 }
                 // Enforce payload size limit (BE-H6) — drop, do NOT keep in queue
@@ -941,6 +1084,10 @@ async fn poll_and_dispatch(
     // This reduces API calls and amortizes the system prompt overhead.
     // Max: 5 messages per coalesced group, 2-second window is implicit
     // (we batch within a single poll cycle which is 5 seconds).
+    // Keep the original messages so a late pause restores their exact payloads
+    // and callback identities rather than re-enqueuing a coalesced prompt.
+    let mut deferred_messages: std::collections::HashMap<_, _> = to_dispatch.iter()
+        .map(|message| (message.message_id.clone(), message.clone())).collect();
     let to_dispatch = coalesce_messages(to_dispatch);
 
     info!(
@@ -975,8 +1122,8 @@ async fn poll_and_dispatch(
     }
 
     // ── Deliver proactive notifications (already removed from the queue) ──
-    for send in proactive_sends {
-        match forward_to_channel_as(
+    for (send, original) in proactive_sends {
+        match deliver_proactive_if_allowed(home_dir, registry, &queue_path, &original, &send, || forward_to_channel_as(
             home_dir,
             &send.channel,
             &send.channel_id,
@@ -986,10 +1133,9 @@ async fn poll_and_dispatch(
             &send.agent_id,
             None,
             send.sender_agent.as_deref(),
-        )
-        .await
-        {
-            Ok(()) => info!(
+        )).await {
+            Ok(false) => continue,
+            Ok(true) => info!(
                 agent = %send.agent_id,
                 channel = %send.channel,
                 chat_id = %send.channel_id,
@@ -1019,6 +1165,9 @@ async fn poll_and_dispatch(
 
     let mut handles = Vec::new();
     for msg in to_dispatch {
+        let originals: Vec<_> = std::iter::once(&msg.message_id)
+            .chain(msg.coalesced_ids.iter())
+            .filter_map(|id| deferred_messages.remove(id)).collect();
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -1073,7 +1222,7 @@ async fn poll_and_dispatch(
             // "Stop blocks late spawns" analog). See the invalidation call
             // after this dispatch resolves.
             let turn_id_for_admission_invalidate = turn_id_for_scope.clone();
-            let dispatch_fut = dispatch_to_agent_outcome(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
+            let dispatch_fut = dispatch_to_agent_outcome(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env, None);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
@@ -1098,6 +1247,21 @@ async fn poll_and_dispatch(
                     Err(DispatchError::Other(reason))
                 }
             };
+
+            if matches!(&result, Err(DispatchError::AutonomyPaused(_))) {
+                for original in originals {
+                    match serde_json::to_string(&original) {
+                        Ok(line) => {
+                            if let Err(error) = append_line(&queue, &line).await {
+                                warn!(message_id = %original.message_id, %error,
+                                    "could not restore autonomy-deferred bus message");
+                            }
+                        }
+                        Err(error) => warn!(%error, "could not encode deferred bus message"),
+                    }
+                }
+                return;
+            }
 
             // H19: this turn has concluded — any ephemeral spawn tickets it
             // enqueued while over capacity are now moot (the turn that would
@@ -1368,7 +1532,7 @@ async fn dispatch_to_agent(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, String> {
-    dispatch_to_agent_outcome(home_dir, registry, agent_id, prompt, delegation)
+    dispatch_to_agent_outcome(home_dir, registry, agent_id, prompt, delegation, None)
         .await
         .map_err(|e| e.host_text())
 }
@@ -1381,74 +1545,116 @@ async fn dispatch_to_agent_outcome(
     agent_id: &str,
     prompt: &str,
     delegation: &DelegationEnv,
+    round_message_id: Option<&str>,
 ) -> Result<String, DispatchError> {
-    #[cfg(test)]
-    {
-        crate::model_call_probe::record("dispatch_to_agent_outcome");
-        if crate::model_call_probe::dry_run() {
-            crate::model_call_probe::set_last_round(
-                crate::runtime::round_task_env().map(|(_, v)| v),
-            );
-            crate::model_call_probe::set_last_lane(crate::explore_lane::in_explore());
-            return Ok("model-call-probe dry run".to_string());
+    // Freeze `default` before awaiting the final gate: later registry changes
+    // cannot retarget a dispatch that was admitted for another employee.
+    let resolved_agent = resolve_dispatch_agent(registry, agent_id)
+        .await.map_err(DispatchError::AutonomyPaused)?;
+    let agent_id = resolved_agent.as_str();
+    crate::responsibility::test_hooks::pause_point(
+        "autonomy_dispatch_handoff", round_message_id.unwrap_or(agent_id),
+    ).await;
+    check_dispatch_sources(home_dir, registry, Some(&delegation.sender), Some(&delegation.origin))
+        .await.map_err(DispatchError::AutonomyPaused)?;
+
+    check_autonomous_dispatch(home_dir, registry, agent_id)
+        .await.map_err(DispatchError::AutonomyPaused)?;
+    let mut callers: Vec<String> = [&delegation.sender, &delegation.origin].into_iter()
+        .filter(|id| !id.is_empty()
+            && !duduclaw_core::delegation_policy::is_system_sender(id)
+            && !duduclaw_core::delegation_policy::is_reserved_queue_sender(id))
+        .cloned().collect();
+    let task_id = if delegation.sender == crate::responsibility::GOAL_LOOP_SENDER {
+        extract_goal_loop_task_id(prompt)
+    } else if delegation.sender == "heartbeat-scheduler" {
+        extract_heartbeat_task_id(prompt)
+    } else { None };
+    if let Some(task_id) = task_id {
+        let store = crate::task_store::TaskStore::open(home_dir).map_err(DispatchError::Other)?;
+        let task = store.get_task(task_id).await.map_err(DispatchError::Other)?
+            .ok_or_else(|| DispatchError::Other("autonomy task source missing".into()))?;
+        if let Some(caller) = crate::autonomous_runtime::task_caller(home_dir, &task) {
+            check_autonomous_dispatch(home_dir, registry, &caller).await
+                .map_err(DispatchError::AutonomyPaused)?;
+            callers.push(caller);
         }
     }
-    // O2: ephemeral synthesized agents (`eph-*`) live under
-    // `<home>/agents/.ephemeral/` and are invisible to the registry scan.
-    // Route them through the ephemeral loader; everything downstream
-    // (response append, delegation callback forwarding, prediction record)
-    // is shared with normal agents because this branch sits inside the
-    // same dispatch flow.
-    if crate::ephemeral::is_ephemeral_id(agent_id) {
-        let env_map = delegation.to_env_map();
-        return crate::claude_runner::DELEGATION_ENV
-            .scope(
-                env_map,
-                crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
-            )
-            .await
-            .map_err(DispatchError::Other);
-    }
-    // Read isolation flags from agent config.
-    let use_sandbox = {
-        let reg = registry.read().await;
-        let agent = if agent_id == "default" {
-            reg.main_agent()
-        } else {
-            reg.get(agent_id)
-        };
-        match agent {
-            Some(a) => a.config.container.sandbox_enabled,
-            None => false,
-        }
-    };
-
-    // Pass delegation context via task-local so prepare_claude_cmd can
-    // inject it as per-subprocess env vars (thread-safe, no global state).
-    let env_map = delegation.to_env_map();
-
-    crate::claude_runner::DELEGATION_ENV
-        .scope(env_map, async {
-            if use_sandbox {
-                info!(agent = agent_id, "Dispatching via task sandbox");
-                match dispatch_sandboxed(home_dir, registry, agent_id, prompt).await {
-                    crate::task_sandbox::SandboxDispatch::Completed(result) => {
-                        return result.map_err(DispatchError::Sandbox);
-                    }
-                    crate::task_sandbox::SandboxDispatch::RunUnsandboxed => {}
-                }
+    crate::autonomous_runtime::round_scope(home_dir, round_message_id,
+    crate::autonomous_runtime::scope(home_dir, agent_id, &callers, async {
+        #[cfg(test)]
+        {
+            if crate::model_call_probe::dry_run() {
+                let _admission = crate::autonomous_runtime::admit_current().await
+                    .map_err(DispatchError::from_runtime)?;
+                crate::autonomous_runtime::mark_handoff();
+                crate::model_call_probe::record("dispatch_to_agent_outcome");
+                crate::model_call_probe::set_last_round(
+                    crate::runtime::round_task_env().map(|(_, v)| v),
+                );
+                crate::model_call_probe::set_last_lane(crate::explore_lane::in_explore());
+                return Ok("model-call-probe dry run".to_string());
             }
-            call_claude_for_agent_with_type(
-                home_dir,
-                registry,
-                agent_id,
-                prompt,
-                crate::cost_telemetry::RequestType::Dispatch,
-            )
+        }
+        // O2: ephemeral synthesized agents (`eph-*`) live under
+        // `<home>/agents/.ephemeral/` and are invisible to the registry scan.
+        // Route them through the ephemeral loader; everything downstream
+        // (response append, delegation callback forwarding, prediction record)
+        // is shared with normal agents because this branch sits inside the
+        // same dispatch flow.
+        if crate::ephemeral::is_ephemeral_id(agent_id) {
+            let env_map = delegation.to_env_map();
+            return crate::claude_runner::DELEGATION_ENV
+                .scope(
+                    env_map,
+                    crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
+                )
+                .await
+                .map_err(DispatchError::from_runtime);
+        }
+        // Read isolation flags from agent config.
+        let use_sandbox = {
+            let reg = registry.read().await;
+            let agent = if agent_id == "default" {
+                reg.main_agent()
+            } else {
+                reg.get(agent_id)
+            };
+            match agent {
+                Some(a) => a.config.container.sandbox_enabled,
+                None => false,
+            }
+        };
+
+        // Pass delegation context via task-local so prepare_claude_cmd can
+        // inject it as per-subprocess env vars (thread-safe, no global state).
+        let env_map = delegation.to_env_map();
+
+        crate::claude_runner::DELEGATION_ENV
+            .scope(env_map, async {
+                if use_sandbox {
+                    info!(agent = agent_id, "Dispatching via task sandbox");
+                    // The sandbox start transport owns the admission lease.
+                    let sandbox_result = dispatch_sandboxed(home_dir, registry, agent_id, prompt).await;
+                    match sandbox_result {
+                        crate::task_sandbox::SandboxDispatch::Completed(result) => {
+                            return result.map_err(DispatchError::from_sandbox);
+                        }
+                        crate::task_sandbox::SandboxDispatch::RunUnsandboxed => {}
+                    }
+                }
+                call_claude_for_agent_with_type(
+                    home_dir,
+                    registry,
+                    agent_id,
+                    prompt,
+                    crate::cost_telemetry::RequestType::Dispatch,
+                )
+                .await
+                .map_err(DispatchError::from_runtime)
+            })
             .await
-            .map_err(DispatchError::Other)
-        })
-        .await
+    })).await
 }
 
 /// Execute a task inside the per-agent task sandbox (`crate::task_sandbox`).
@@ -1502,6 +1708,9 @@ async fn poll_pending_taskspecs(home_dir: &Path, registry: &Arc<RwLock<AgentRegi
             _ => continue,
         };
 
+        if check_autonomous_dispatch(home_dir, registry, &agent_name).await.is_err() {
+            continue;
+        }
         let task_ids = crate::task_spec::TaskSpec::list(&agent_dir);
         for task_id in task_ids {
             let mut spec = match crate::task_spec::TaskSpec::load(&agent_dir, &task_id) {
@@ -1617,6 +1826,14 @@ pub async fn dispatch_taskspec(
             step.agent.clone()
         };
 
+        if check_autonomous_dispatch(home_dir, registry, &spec.agent_id).await.is_err()
+            || check_autonomous_dispatch(home_dir, registry, &target_agent).await.is_err()
+        {
+            spec.status = TaskStatus::Planned;
+            spec.save(agent_dir).map_err(|e| format!("Save paused TaskSpec: {e}"))?;
+            return Ok(());
+        }
+
         info!(
             task = %spec.task_id,
             step = step_index,
@@ -1684,10 +1901,21 @@ pub async fn dispatch_taskspec(
             sender: spec.agent_id.clone(),
             hop_depth: 0,
         };
-        let result =
-            dispatch_to_agent(home_dir, registry, &target_agent, &prompt, &delegation).await;
+        crate::responsibility::test_hooks::pause_point("autonomy_taskspec_handoff", &spec.task_id).await;
+        let result = match check_autonomous_dispatch(home_dir, registry, &spec.agent_id).await {
+            Ok(()) => dispatch_to_agent_outcome(
+                home_dir, registry, &target_agent, &prompt, &delegation, None,
+            ).await,
+            Err(reason) => Err(DispatchError::AutonomyPaused(reason)),
+        };
 
         match result {
+            Err(DispatchError::AutonomyPaused(_)) => {
+                spec.steps[step_index].status = StepStatus::Pending;
+                spec.status = TaskStatus::Planned;
+                spec.save(agent_dir).map_err(|e| format!("Save paused TaskSpec: {e}"))?;
+                return Ok(());
+            }
             Ok(output) => {
                 // Verify with Auto criteria
                 let criteria_results = verify_step_auto(&spec.steps[step_index], &output);
@@ -1720,7 +1948,7 @@ pub async fn dispatch_taskspec(
                 }
             }
             Err(e) => {
-                handle_step_failure(spec, step_index, &e, home_dir, registry, agent_dir).await?;
+                handle_step_failure(spec, step_index, &e.host_text(), home_dir, registry, agent_dir).await?;
             }
         }
 
@@ -1798,7 +2026,7 @@ async fn handle_step_failure(
             let delegation = DelegationEnv {
                 depth: 0,
                 origin: spec.agent_id.clone(),
-                sender: "__planner__".to_string(),
+                sender: spec.agent_id.clone(),
                 hop_depth: 0,
             };
             let planner_response = dispatch_to_agent(
@@ -1950,22 +2178,14 @@ pub async fn append_line(path: &Path, line: &str) -> Result<(), String> {
     let line = line.to_string();
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        // `read(true)`: on Windows an append-only handle lacks FILE_WRITE_DATA,
-        // and LockFileEx needs read or write access, so the lock (and with it
-        // every bus response) failed there.
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
-
-        duduclaw_core::platform::flock_exclusive(&file)
-            .map_err(|e| format!("flock failed on {}: {e}", path.display()))?;
-
-        writeln!(file, "{line}")
-            .map_err(|e| format!("Failed to write to {}: {e}", path.display()))?;
-        Ok(())
+        duduclaw_core::with_file_lock(&path, || {
+            // Keep the data-inode lock for legacy writers, and use the shared
+            // sidecar lock for writers which replace the queue atomically.
+            let mut file = std::fs::OpenOptions::new()
+                .create(true).read(true).append(true).open(&path)?;
+            duduclaw_core::platform::flock_exclusive(&file)?;
+            writeln!(file, "{line}")
+        }).map_err(|e| format!("Failed to append {}: {e}", path.display()))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
@@ -2350,6 +2570,28 @@ struct ProactiveSend {
     /// B11: the employee whose own bot / app the target conversation came in
     /// through (`None` = the default token cascade).
     sender_agent: Option<String>,
+}
+
+/// Re-check immediately before delivery; restore the exact queued notification
+/// if the operator paused after classification. Direct human replies bypass it.
+async fn deliver_proactive_if_allowed<F, Fut>(
+    home: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    queue: &Path,
+    original: &str,
+    send: &ProactiveSend,
+    deliver: F,
+) -> Result<bool, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if check_autonomous_dispatch(home, registry, &send.agent_id).await.is_err() {
+        append_line(queue, original).await?;
+        return Ok(false);
+    }
+    deliver().await?;
+    Ok(true)
 }
 
 /// Parse one bus-queue line as a `proactive_notification`, `None` for every
@@ -4091,7 +4333,7 @@ mod tests {
             std::fs::write(
                 dir.join("agent.toml"),
                 format!(
-                    "[agent]\nname = \"{name}\"\nrole = \"worker\"\n\
+                    "[agent]\nname = \"{name}\"\nstatus = \"active\"\nrole = \"worker\"\n\
                      reports_to = \"\"\ndepartment = \"{department}\"\n"
                 ),
             )
@@ -4194,7 +4436,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("agent.toml"),
-                format!("[agent]\nname = \"{name}\"\nrole = \"worker\"\nreports_to = \"\"\n{extra}"),
+                format!("[agent]\nname = \"{name}\"\nstatus = \"active\"\nrole = \"worker\"\nreports_to = \"\"\n{extra}"),
             )
             .unwrap();
         }

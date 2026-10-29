@@ -643,6 +643,15 @@ impl CronStore {
         Ok(changed > 0)
     }
 
+    /// A due occurrence deliberately skipped by the operator is not a failed run.
+    pub async fn record_autonomy_skip(&self, id: &str, reason: &str) -> Result<(), String> {
+        self.conn.lock().await.execute(
+            "UPDATE cron_tasks SET last_run_at=?2,last_status='skipped',last_error=?3,updated_at=?2 WHERE id=?1",
+            params![id, Utc::now().to_rfc3339(), reason],
+        ).map_err(|e| format!("record_autonomy_skip: {e}"))?;
+        Ok(())
+    }
+
     /// Record the outcome of a firing. Bumps `run_count` and (on failure) `failure_count`.
     pub async fn record_run(
         &self,

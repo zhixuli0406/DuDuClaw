@@ -249,6 +249,12 @@ impl GvuLoop {
             }
         };
 
+        let Some(home) = self.db_path.parent() else {
+            return GvuOutcome::Skipped { reason: "autonomy home unavailable".into() };
+        };
+        if let Err(pause) = duduclaw_core::autonomy_gate::check(home, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background) {
+            return GvuOutcome::Skipped { reason: format!("autonomy paused: {pause}") };
+        }
         let vs = VersionStore::with_crypto(&self.db_path, self.encryption_key.as_ref());
 
         // WP0.3 (2026-08-06, root cause R4): per-agent cooldown gate. Sits
@@ -297,7 +303,7 @@ impl GvuLoop {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| agent_dir.to_path_buf());
-        let result = super::aee::run_aee_round(
+        let result = crate::autonomous_runtime::scope(home, agent_id, &[], super::aee::run_aee_round(
             super::aee::AeeRoundInput {
                 agent_id,
                 agent_dir,
@@ -311,7 +317,7 @@ impl GvuLoop {
             },
             &vs,
             call_llm,
-        )
+        ))
         .await;
 
         // The round record is the audit trail §3.2.4 asks for: without the
@@ -422,10 +428,20 @@ mod cooldown_tests {
     #[tokio::test]
     async fn cooldown_blocks_second_call_within_window() {
         let db_dir = tempfile::TempDir::new().unwrap();
+        for agent in ["agent-cd", "agent-nocd", "agent-a", "agent-b", "agent-legacy"] {
+            let path = db_dir.path().join("agents").join(agent);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+        }
         let gvu = GvuLoop::new(&db_dir.path().join("evolution.db"));
         let agent_dir = agent_dir_with_cooldown(Some(60));
         let calls = Arc::new(AtomicUsize::new(0));
 
+        duduclaw_core::autonomy_gate::set_pause(db_dir.path(), Some("agent-cd"), "pause", "user").unwrap();
+        let paused = gvu.run_with_context("agent-cd", agent_dir.path(), "ctx", &[], &[], counting_llm(calls.clone()), Vec::new()).await;
+        assert!(matches!(paused, GvuOutcome::Skipped { reason } if reason.starts_with("autonomy paused")));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        duduclaw_core::autonomy_gate::resume(db_dir.path(), Some("agent-cd")).unwrap();
         let first = gvu
             .run_with_context(
                 "agent-cd",
@@ -474,6 +490,11 @@ mod cooldown_tests {
     #[tokio::test]
     async fn cooldown_zero_disables_throttling() {
         let db_dir = tempfile::TempDir::new().unwrap();
+        for agent in ["agent-cd", "agent-nocd", "agent-a", "agent-b", "agent-legacy"] {
+            let path = db_dir.path().join("agents").join(agent);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+        }
         let gvu = GvuLoop::new(&db_dir.path().join("evolution.db"));
         let agent_dir = agent_dir_with_cooldown(Some(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -500,6 +521,11 @@ mod cooldown_tests {
     #[tokio::test]
     async fn cooldown_is_per_agent_not_global() {
         let db_dir = tempfile::TempDir::new().unwrap();
+        for agent in ["agent-cd", "agent-nocd", "agent-a", "agent-b", "agent-legacy"] {
+            let path = db_dir.path().join("agents").join(agent);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+        }
         let gvu = GvuLoop::new(&db_dir.path().join("evolution.db"));
         let agent_a = agent_dir_with_cooldown(Some(60));
         let agent_b = agent_dir_with_cooldown(Some(60));
@@ -544,6 +570,11 @@ mod cooldown_tests {
     #[tokio::test]
     async fn legacy_soul_evolution_key_no_longer_rewrites_soul() {
         let db_dir = tempfile::TempDir::new().unwrap();
+        for agent in ["agent-cd", "agent-nocd", "agent-a", "agent-b", "agent-legacy"] {
+            let path = db_dir.path().join("agents").join(agent);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+        }
         let gvu = GvuLoop::new(&db_dir.path().join("evolution.db"));
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(

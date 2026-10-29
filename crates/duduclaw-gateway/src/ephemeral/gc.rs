@@ -24,6 +24,14 @@ fn sweep_blocking(home_dir: &Path) -> usize {
     let Ok(canonical_root) = root.canonicalize() else {
         return 0; // no ephemeral namespace yet — nothing to do
     };
+    // Hold the home-wide barrier across the sweep, including containment checks.
+    let _barrier = match duduclaw_core::autonomy_gate::exclusive_barrier(home_dir) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(%error, "ephemeral GC deferred; no scaffold removed");
+            return 0;
+        }
+    };
     let Ok(entries) = std::fs::read_dir(&canonical_root) else {
         return 0;
     };
@@ -141,6 +149,8 @@ pub struct AdmissionDrainSummary {
     /// cross-process race lost to another spawn, or a malformed/stale
     /// payload). Never retried — see [`replay_queued_ephemeral`] doc.
     pub failed: u32,
+    /// Pause landed after selection: restored with the original deadline.
+    pub deferred: u32,
 }
 
 /// Drain the H19 admission queue for ephemeral spawn requests (class
@@ -208,8 +218,14 @@ fn drain_admission_queue_blocking(home_dir: &Path) -> AdmissionDrainSummary {
         if active_count(&root) >= cap {
             break; // still at capacity — retry on the next hourly tick
         }
-        let result =
-            duduclaw_core::spawn_admission::dequeue_next(home_dir, EPHEMERAL_ADMISSION_CLASS);
+        let result = duduclaw_core::spawn_admission::dequeue_next_matching(
+            home_dir, EPHEMERAL_ADMISSION_CLASS, |ticket| {
+                ticket.payload.get("parent").and_then(serde_json::Value::as_str)
+                    .is_some_and(|parent| duduclaw_core::autonomy_gate::check(
+                        home_dir, parent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                    ).is_ok())
+            },
+        );
         for expired in result.expired {
             summary.expired += 1;
             tracing::info!(ticket = %expired.ticket_id, "H19: queued ephemeral spawn expired, discarded");
@@ -224,7 +240,14 @@ fn drain_admission_queue_blocking(home_dir: &Path) -> AdmissionDrainSummary {
         let Some(ticket) = result.ticket else {
             break; // queue empty — nothing left to admit
         };
-        match replay_queued_ephemeral(home_dir, &ticket) {
+        let replay = replay_queued_ephemeral(home_dir, &ticket);
+        if !matches!(&replay, Err(ReplayError::Paused(_))) {
+            if let Err(error) = duduclaw_core::spawn_admission::finish_dequeued(home_dir, &ticket) {
+                tracing::error!(ticket = %ticket.ticket_id, %error,
+                    "could not finish ephemeral admission reservation");
+            }
+        }
+        match replay {
             Ok(eph_id) => {
                 summary.admitted += 1;
                 tracing::info!(
@@ -239,7 +262,24 @@ fn drain_admission_queue_blocking(home_dir: &Path) -> AdmissionDrainSummary {
                     true,
                 );
             }
-            Err(reason) => {
+            Err(ReplayError::Paused(reason)) => {
+                match duduclaw_core::spawn_admission::restore_dequeued(home_dir, &ticket) {
+                    Ok(true) => {
+                        summary.deferred += 1;
+                        log_admission_event(home_dir, "ephemeral_admission_paused",
+                            &ticket.ticket_id, "", true);
+                    }
+                    Ok(false) => {} // Already restored or its original TTL expired.
+                    Err(error) => {
+                        summary.failed += 1;
+                        tracing::error!(ticket = %ticket.ticket_id, %error,
+                            "could not restore paused ephemeral admission ticket");
+                    }
+                }
+                tracing::debug!(ticket = %ticket.ticket_id, %reason, "ephemeral admission deferred by autonomy pause");
+                break; // Do not spin on a changing gate in this drain pass.
+            }
+            Err(ReplayError::Other(reason)) => {
                 summary.failed += 1;
                 tracing::warn!(
                     ticket = %ticket.ticket_id, error = %reason,
@@ -259,6 +299,16 @@ fn drain_admission_queue_blocking(home_dir: &Path) -> AdmissionDrainSummary {
     summary
 }
 
+#[derive(Debug)]
+pub(super) enum ReplayError {
+    Paused(String),
+    Other(String),
+}
+
+impl From<String> for ReplayError {
+    fn from(value: String) -> Self { Self::Other(value) }
+}
+
 /// Reconstruct and replay one queued ephemeral spawn — `scaffold` (under the
 /// free capacity [`drain_admission_queue_blocking`]'s loop already confirmed)
 /// followed by the same bus-queue enqueue `spawn_ephemeral_with_ctx` performs
@@ -270,14 +320,13 @@ fn drain_admission_queue_blocking(home_dir: &Path) -> AdmissionDrainSummary {
 /// `spawn_ephemeral_with_ctx`'s ordering (rate-limiting must gate when the
 /// bus task is actually created, not when the request was merely queued).
 /// A malformed payload or a lost cross-process race is a non-retryable
-/// failure: this function is never called again for the same ticket (the
-/// caller already popped it), which is intentional — retrying a request that
-/// fails for a reason OTHER than capacity would just fail again and starve
-/// FIFO order behind it.
-fn replay_queued_ephemeral(
+/// failure. A temporary autonomy refusal is distinct: the caller restores
+/// the original ticket without changing its FIFO sequence or expiry, so a
+/// pause racing selection cannot silently consume queued work.
+pub(super) fn replay_queued_ephemeral(
     home_dir: &Path,
     ticket: &duduclaw_core::spawn_admission::QueuedSpawn,
-) -> Result<String, String> {
+) -> Result<String, ReplayError> {
     let p = &ticket.payload;
     let get_str = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let parent = get_str("parent");
@@ -301,8 +350,12 @@ fn replay_queued_ephemeral(
     let incoming_hop = p.get("incoming_hop").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
     if parent.is_empty() || instruction.is_empty() || context.is_empty() || tools.is_empty() {
-        return Err("queued payload malformed (missing a required field)".to_string());
+        return Err(ReplayError::Other("queued payload malformed (missing a required field)".to_string()));
     }
+
+    duduclaw_core::autonomy_gate::check(
+        home_dir, &parent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ).map_err(|pause| ReplayError::Paused(pause.to_string()))?;
 
     let spec = EphemeralSpawnSpec {
         parent: parent.clone(),
@@ -324,16 +377,21 @@ fn replay_queued_ephemeral(
         return Err(format!(
             "hop_depth {outgoing_hop} exceeds max {} on replay",
             guard_cfg.max_hop_depth
-        ));
+        ).into());
     }
     match duduclaw_core::dispatch_guard_check(home_dir, "ephemeral", &parent, &guard_cfg) {
         duduclaw_core::DispatchGuardDecision::Trip { reason, .. } => {
             let _ = std::fs::remove_dir_all(&scaffolded.dir);
             return Err(format!(
                 "dispatch circuit breaker tripped on replay: {reason}"
-            ));
+            ).into());
         }
         duduclaw_core::DispatchGuardDecision::Allow => {}
+    }
+
+    if let Err(reason) = super::dispatch::check_autonomy(home_dir, &eph_id) {
+        let _ = std::fs::remove_dir_all(&scaffolded.dir);
+        return Err(ReplayError::Paused(reason));
     }
 
     // ── Enqueue on the bus — identical shape to `spawn_ephemeral_with_ctx` ──
@@ -375,7 +433,7 @@ fn replay_queued_ephemeral(
         // Queueing failed — tear the scaffold down (mirrors the live path's
         // same rollback), do NOT fabricate a reply on the ephemeral's behalf.
         let _ = std::fs::remove_dir_all(&scaffolded.dir);
-        return Err(format!("bus enqueue failed on replay: {e}"));
+        return Err(ReplayError::Other(format!("bus enqueue failed on replay: {e}")));
     }
 
     Ok(eph_id)

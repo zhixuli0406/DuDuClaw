@@ -205,7 +205,10 @@ pub(super) fn write_evolution_toggle(
     field: &str,
     value: toml::Value,
 ) -> std::result::Result<(), String> {
-    duduclaw_gateway::agent_files::external::edit_agent_toml(
+    // The background admission is taken in the writer's final guard and held
+    // through commit, so a pause cannot land between the check and the write.
+    let mut admission = None;
+    let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded(
         home_dir,
         agent_id,
         "mcp",
@@ -222,8 +225,15 @@ pub(super) fn write_evolution_toggle(
             evo.insert(field.to_string(), value);
             Ok(())
         },
+        || {
+            admission = admit_background_identity_blocking(home_dir, "", "evolution_toggle")?;
+            Ok(())
+        },
+        false,
     )
-    .map(|_| ())
+    .map(|_| ());
+    drop(admission);
+    written
 }
 
 fn check_evolution_subject_locked(

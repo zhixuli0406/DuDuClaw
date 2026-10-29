@@ -497,3 +497,21 @@ async fn a_non_admin_schedule_only_narrows_the_run_limit_and_it_reaches_the_goal
     let task = store.get_task(&report.created[0]).await.unwrap().unwrap();
     assert_eq!(task.timeout_secs, Some(120));
 }
+
+#[tokio::test]
+async fn autonomy_pause_assign_schedule_skips_slot_and_resumes_next_slot() {
+    let (dir, reg) = home().await;
+    let o = org(dir.path());
+    let store = TaskStore::open(dir.path()).unwrap();
+    let row = create(dir.path(), &store, &Creator::new(&o.mgr, false).unwrap(), weekly_goal("週報"), now()).await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("sales-rep"), "pause", &o.mgr).unwrap();
+    let paused = tick(dir.path(), &reg, at("2026-10-26T01:00:20Z")).await.unwrap();
+    assert!(paused.created.is_empty());
+    assert_eq!(paused.skipped, 1);
+    let after = store.get_assign_schedule(&row.id).await.unwrap().unwrap();
+    assert_eq!(after.fire_count, 0);
+    assert_eq!(after.next_fire_at.as_deref(), Some("2026-11-02T01:00:00+00:00"));
+    duduclaw_core::autonomy_gate::resume(dir.path(), Some("sales-rep")).unwrap();
+    let resumed = tick(dir.path(), &reg, at("2026-11-02T01:00:20Z")).await.unwrap();
+    assert_eq!(resumed.created.len(), 1);
+}

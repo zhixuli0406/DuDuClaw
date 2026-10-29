@@ -213,7 +213,7 @@ pub(crate) fn tmp_home_with_all_capabilities() -> tempfile::TempDir {
     std::fs::create_dir_all(&dir).expect("agent dir");
     std::fs::write(
         dir.join("agent.toml"),
-        "[capabilities]\n\
+        "[agent]\nname = \"Test\"\nstatus = \"active\"\n[capabilities]\n\
          os_native = true\n\
          recording = true\n\
          system_operator = true\n\
@@ -495,7 +495,13 @@ pub(crate) async fn visible_tools_in_lane(
             == duduclaw_core::tool_catalog::ToolListVerdict::Allowed
     };
 
+    // Match dispatch's verified caller classification and fail-closed predicate.
+    // Argument-dependent changes (e.g. agent_update) remain discoverable.
+    let actor = super::record_actor_for(home_dir, &principal.client_id, default_agent);
+    let background_allowed = super::check_background_caller(home_dir, actor, "tools/list").is_ok();
+
     tools()
+        .filter(|t| background_allowed || !super::creates_background_work(t.name))
         .filter(|t| {
             // C4: discoverable ⇔ callable — same predicate as the dispatch
             // gate (legacy whitelist ∪ explicitly-granted grantable scopes).

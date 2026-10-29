@@ -18,6 +18,11 @@ struct Rig {
 impl Rig {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
+
         std::fs::write(
             dir.path().join("config.toml"),
             "[dispatch]\nenabled = true\n\n[goal_loop]\nsteering_enabled = true\n",
@@ -617,4 +622,399 @@ async fn the_start_mark_comes_before_the_runtime_and_gates_it() {
             .contains("round start could not be recorded"),
         "the failure names why"
     );
+}
+
+#[tokio::test]
+async fn autonomy_pause_dispatcher_never_claims_then_resume_runs() {
+    let rig = Rig::new().await;
+    let task = rig.steered_task("autonomy-dispatch").await;
+    rig.queue.enqueue(&plain_goal_message("autonomy-message", &task.id)).await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "休息", "op").unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    assert_eq!(model_call_probe::calls(), before);
+    let pending = rig.queue.get_by_id("autonomy-message").await.unwrap().unwrap();
+    assert_eq!(pending.status, MessageStatus::Pending);
+    assert!(pending.acked_at.is_none());
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some("alice")).unwrap();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert_eq!(rig.queue.get_by_id("autonomy-message").await.unwrap().unwrap().status, MessageStatus::Done);
+}
+
+#[tokio::test]
+async fn autonomy_pause_finished_turn_parks_then_human_can_resume() {
+    let rig = Rig::new().await;
+    let task = rig.steered_task("autonomy-finished").await;
+    rig.store.update_task(&task.id, &serde_json::json!({"status": "pending"})).await.unwrap();
+    // The task-store claim reproduces the state during a running turn.
+    rig.store.atomic_claim(&task.id, "alice", &Utc::now().to_rfc3339(), "2099-01-01T00:00:00Z").await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), None, "維護", "op").unwrap();
+    assert_eq!(rig.store.get_task(&task.id).await.unwrap().unwrap().status, "in_progress");
+    park_paused_goal_after_turn(rig.dir.path(), &rig.registry, "alice", &task.id).await.unwrap();
+    let stopped = rig.store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stopped.status, "needs_human");
+    assert_eq!(stopped.pause_reason.as_deref(), Some("operator_paused"));
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), None).unwrap();
+    rig.store.resolve_needs_human(&task.id, "retry", "繼續").await.unwrap();
+    rig.queue.enqueue(&plain_goal_message("autonomy-after-turn", &task.id)).await.unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+}
+
+#[tokio::test]
+async fn autonomy_pause_waits_for_running_unclaimed_round() {
+    let rig = Rig::new().await;
+    let mut task = TaskRow::new("autonomy-unclaimed".into(), "work".into(), "work".into(),
+        "medium".into(), "alice".into(), "system".into());
+    task.goal_mode = true;
+    task.status = "revising".into();
+    task.revision_round = 1;
+    rig.store.insert_task(&task).await.unwrap();
+    rig.queue.enqueue(&plain_goal_message("autonomy-live", &task.id)).await.unwrap();
+    rig.queue.ack("autonomy-live").await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "pause", "op").unwrap();
+    rig.driver().tick_once().await.unwrap();
+    assert_eq!(rig.store.get_task(&task.id).await.unwrap().unwrap().status, "revising",
+        "an acknowledged runtime turn may not have called tasks_claim yet");
+    park_paused_goal_after_turn(rig.dir.path(), &rig.registry, "alice", &task.id).await.unwrap();
+    assert_eq!(rig.store.get_task(&task.id).await.unwrap().unwrap().pause_reason.as_deref(),
+        Some("operator_paused"));
+    rig.queue.complete("autonomy-live", "finished turn").await.unwrap();
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some("alice")).unwrap();
+    rig.store.resolve_needs_human(&task.id, "retry", "resume").await.unwrap();
+    rig.driver().tick_once().await.unwrap();
+    assert_eq!(rig.queue.pending_messages(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn autonomy_pause_backlog_does_not_starve_other_agents() {
+    let rig = Rig::new().await;
+    let dir = rig.dir.path().join("agents/bob");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"bob\"\nstatus = \"active\"\n").unwrap();
+    // Cross a complete page, not merely the 10-message dispatch batch.
+    for i in 0..112 {
+        let mut message = plain_goal_message(&format!("paused-{i:03}"), "alice-task");
+        message.created_at = "2026-10-27T00:00:00Z".into();
+        rig.queue.enqueue(&message).await.unwrap();
+    }
+    let mut task = TaskRow::new("bob-task".into(), "work".into(), "work".into(),
+        "medium".into(), "bob".into(), "system".into());
+    task.goal_mode = true;
+    task.status = "pending".into();
+    rig.store.insert_task(&task).await.unwrap();
+    let mut message = plain_goal_message("active-tail", &task.id);
+    message.target = "bob".into();
+    message.created_at = "2026-10-28T00:00:00Z".into();
+    rig.queue.enqueue(&message).await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "pause", "op").unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert_eq!(rig.queue.get_by_id("active-tail").await.unwrap().unwrap().status, MessageStatus::Done);
+    assert_eq!(rig.queue.pending_messages(200).await.unwrap().len(), 112);
+    assert!(rig.queue.pending_messages(200).await.unwrap().iter().all(|m| m.acked_at.is_none()));
+}
+
+#[tokio::test]
+async fn autonomy_pause_at_sqlite_handoff_defers_without_start_charge() {
+    let rig = Rig::new().await;
+    let task = rig.steered_task("autonomy-late-sqlite").await;
+    rig.driver().tick_once().await.unwrap();
+    let message = rig.queue.pending_messages(10).await.unwrap().remove(0);
+    let gate = test_hooks::install("autonomy_dispatch_handoff", &message.id);
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    let pause = async {
+        gate.arrived.wait().await;
+        duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "late pause", "op").unwrap();
+        gate.release.wait().await;
+    };
+    tokio::join!(rig.poll(), pause);
+    assert_eq!(model_call_probe::calls(), before);
+    assert!(!rig.store.any_round_started(&task.id).await.unwrap());
+    let pending = rig.queue.get_by_id(&message.id).await.unwrap().unwrap();
+    assert_eq!(pending.status, MessageStatus::Pending);
+    assert_eq!(pending.retry_count, 0);
+    assert!(pending.error.is_none());
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some("alice")).unwrap();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert!(rig.store.any_round_started(&task.id).await.unwrap());
+    assert_eq!(rig.queue.get_by_id(&message.id).await.unwrap().unwrap().status, MessageStatus::Done);
+}
+
+#[tokio::test]
+async fn autonomy_pause_at_taskspec_handoff_preserves_retry_budget() {
+    use crate::task_spec::{Step, StepStatus, TaskSpec, TaskStatus};
+    let rig = Rig::new().await;
+    let agent = "taskspec-late-pause";
+    let agent_dir = rig.dir.path().join("agents").join(agent);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n")).unwrap();
+    let mut spec = TaskSpec::new(agent, "finish one step", vec![Step {
+        id: 0, description: "work".into(), agent: agent.into(), depends_on: vec![],
+        acceptance_criteria: vec![], status: StepStatus::Pending, result: None, retry_count: 2,
+    }]);
+    let gate = test_hooks::install("autonomy_dispatch_handoff", agent);
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    let pause = async {
+        gate.arrived.wait().await;
+        duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some(agent), "late pause", "op").unwrap();
+        gate.release.wait().await;
+    };
+    let (result, ()) = tokio::join!(dispatch_taskspec(rig.dir.path(), &rig.registry, &mut spec, &agent_dir), pause);
+    result.unwrap();
+    assert_eq!(model_call_probe::calls(), before);
+    assert_eq!(spec.status, TaskStatus::Planned);
+    assert_eq!(spec.steps[0].status, StepStatus::Pending);
+    assert_eq!(spec.steps[0].retry_count, 2);
+    assert_eq!(spec.replan_count, 0);
+    let reopened = TaskSpec::load(&agent_dir, &spec.task_id).unwrap();
+    assert_eq!(reopened.status, TaskStatus::Planned);
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some(agent)).unwrap();
+    dispatch_taskspec(rig.dir.path(), &rig.registry, &mut spec, &agent_dir).await.unwrap();
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert_eq!(spec.steps[0].status, StepStatus::Passed);
+}
+
+#[tokio::test]
+async fn autonomy_pause_at_jsonl_handoff_restores_original_messages() {
+    let rig = Rig::new().await;
+    let agent = "jsonl-late-pause";
+    let agent_dir = rig.dir.path().join("agents").join(agent);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n")).unwrap();
+    let path = rig.dir.path().join("bus_queue.jsonl");
+    let originals: Vec<serde_json::Value> = (0..2).map(|i| serde_json::json!({
+        "type":"agent_message", "message_id":format!("late-jsonl-{i}"),
+        "agent_id":agent, "payload":format!("original {i}"),
+        "timestamp":Utc::now().to_rfc3339(), "sender_agent":"dashboard",
+    })).collect();
+    std::fs::write(&path, originals.iter().map(|message| format!("{message}\n")).collect::<String>()).unwrap();
+    let gate = test_hooks::install("autonomy_dispatch_handoff", agent);
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    let pause = async {
+        gate.arrived.wait().await;
+        duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some(agent), "late pause", "op").unwrap();
+        gate.release.wait().await;
+    };
+    let (result, ()) = tokio::join!(poll_and_dispatch(rig.dir.path(), &rig.registry, None, None), pause);
+    result.unwrap();
+    assert_eq!(model_call_probe::calls(), before);
+    let restored: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(restored.len(), 2);
+    for (actual, expected) in restored.iter().zip(&originals) {
+        assert_eq!(actual["type"], "agent_message");
+        assert_eq!(actual["message_id"], expected["message_id"]);
+        assert_eq!(actual["payload"], expected["payload"]);
+    }
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some(agent)).unwrap();
+    poll_and_dispatch(rig.dir.path(), &rig.registry, None, None).await.unwrap();
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+    let response: serde_json::Value = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+    assert_eq!(response["type"], "agent_response");
+}
+
+#[tokio::test]
+async fn autonomy_pause_proactive_delivery_preserves_queue_then_resumes() {
+    let rig = Rig::new().await;
+    let queue = rig.dir.path().join("bus_queue.jsonl");
+    let original = serde_json::json!({
+        "type":"proactive_notification", "agent_id":"alice", "channel":"telegram",
+        "chat_id":"123456", "message":"scheduled update",
+    }).to_string();
+    std::fs::write(&queue, format!("{original}\n")).unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "pause", "op").unwrap();
+    poll_and_dispatch(rig.dir.path(), &rig.registry, None, None).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&queue).unwrap(), format!("{original}\n"));
+    // Also cover a pause after classification removed the line, at delivery.
+    std::fs::write(&queue, "").unwrap();
+    let send = parse_proactive_line(&original).unwrap();
+    let deliveries = std::cell::Cell::new(0);
+    let invoke = || async {
+        deliveries.set(deliveries.get() + 1);
+        Ok(())
+    };
+    assert!(!deliver_proactive_if_allowed(rig.dir.path(), &rig.registry, &queue, &original, &send, invoke).await.unwrap());
+    assert_eq!(deliveries.get(), 0);
+    assert_eq!(std::fs::read_to_string(&queue).unwrap(), format!("{original}\n"));
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some("alice")).unwrap();
+    assert!(deliver_proactive_if_allowed(rig.dir.path(), &rig.registry, &queue, &original, &send, invoke).await.unwrap());
+    assert_eq!(deliveries.get(), 1);
+}
+
+#[tokio::test]
+async fn queued_delegation_from_paused_sender_stays_pending() {
+    let rig = Rig::new().await;
+    let dir = rig.dir.path().join("agents/bob");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"bob\"\nstatus = \"active\"\n").unwrap();
+    let mut message = plain_goal_message("sender-paused", "unused");
+    message.sender = "alice".into();
+    message.sender_agent = Some("alice".into());
+    message.origin_agent = Some("alice".into());
+    message.target = "bob".into();
+    message.payload = "delegated work".into();
+    rig.queue.enqueue(&message).await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "test", "operator").unwrap();
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    assert_eq!(model_call_probe::calls(), before);
+    let row = rig.queue.get_by_id(&message.id).await.unwrap().unwrap();
+    assert_eq!(row.status, MessageStatus::Pending);
+    assert!(row.acked_at.is_none());
+    assert_eq!(row.retry_count, 0);
+}
+
+    fn write_alias_agent(dir: &Path, name: &str, role: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "{role}"
+status = "active"
+trigger = "@{name}"
+reports_to = ""
+icon = "🤖"
+department = ""
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+#[tokio::test]
+async fn default_alias_cannot_retarget_after_admission_identity_is_selected() {
+    let rig = Rig::new().await;
+    let home = rig.dir.path();
+    write_alias_agent(&home.join("agents/alice"), "alice", "main");
+    write_alias_agent(&home.join("agents/bob"), "bob", "specialist");
+    rig.registry.write().await.scan().await.unwrap();
+    let task = rig.steered_task("alias-retarget").await;
+    rig.driver().tick_once().await.unwrap();
+    let message_id = format!("goal:{}:1", task.id);
+    let hook = test_hooks::install("autonomy_dispatch_handoff", &message_id);
+    duduclaw_core::autonomy_gate::set_pause(home, Some("bob"), "test", "operator").unwrap();
+    let delegation = DelegationEnv { depth: 0, origin: String::new(), sender: String::new(), hop_depth: 0 };
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    let retarget = async {
+        hook.arrived.wait().await;
+        write_alias_agent(&home.join("agents/alice"), "alice", "specialist");
+        write_alias_agent(&home.join("agents/bob"), "bob", "main");
+        rig.registry.write().await.scan().await.unwrap();
+        hook.release.wait().await;
+    };
+    let (result, ()) = tokio::join!(
+        dispatch_to_agent_outcome(home, &rig.registry, "default", "work", &delegation, Some(&message_id)),
+        retarget,
+    );
+    model_call_probe::set_dry_run(false);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert_eq!(resolve_dispatch_agent(&rig.registry, "default").await.unwrap(), "bob");
+}
+
+#[tokio::test]
+async fn paused_task_creator_cannot_hide_behind_goal_loop_sender() {
+    let rig = Rig::new().await;
+    let bob = rig.dir.path().join("agents/bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    std::fs::write(bob.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+    let mut task = TaskRow::new("origin-goal".into(), "work".into(), "work".into(),
+        "medium".into(), "alice".into(), "bob".into());
+    task.goal_mode = true;
+    task.created_via = Some("agent".into());
+    rig.store.insert_task(&task).await.unwrap();
+    let message = plain_goal_message("origin-message", &task.id);
+    rig.queue.enqueue(&message).await.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("bob"), "pause", "user").unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    assert_eq!(model_call_probe::calls(), before);
+    let retained = rig.queue.get_by_id(&message.id).await.unwrap().unwrap();
+    assert_eq!(retained.status, MessageStatus::Pending);
+    assert_eq!(retained.retry_count, 0);
+    duduclaw_core::autonomy_gate::resume(rig.dir.path(), Some("bob")).unwrap();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+}
+
+#[tokio::test]
+async fn sandbox_admission_refusal_defers_only_before_first_handoff() {
+    let rig = Rig::new().await;
+    let home = rig.dir.path();
+    let failure = || crate::task_sandbox::SandboxFailure::failed(
+        crate::task_sandbox::failure_code::TRANSPORT_FAILED, "sandbox transport failed",
+    );
+    crate::autonomous_runtime::scope(home, "alice", &[], async {
+        assert!(matches!(DispatchError::from_sandbox(failure()), DispatchError::Sandbox(_)));
+        duduclaw_core::autonomy_gate::set_pause(home, None, "pause", "operator").unwrap();
+        assert!(duduclaw_core::autonomy_handoff::admit().await.is_err());
+        assert!(matches!(DispatchError::from_sandbox(failure()), DispatchError::AutonomyPaused(_)));
+    }).await;
+    duduclaw_core::autonomy_gate::resume(home, None).unwrap();
+    crate::autonomous_runtime::scope(home, "alice", &[], async {
+        duduclaw_core::autonomy_handoff::admit().await.unwrap().handed_off();
+        duduclaw_core::autonomy_gate::set_pause(home, None, "pause", "operator").unwrap();
+        assert!(duduclaw_core::autonomy_handoff::admit().await.is_err());
+        // A later refused attempt cannot replay an already-started sandbox run.
+        assert!(matches!(DispatchError::from_sandbox(failure()), DispatchError::Sandbox(_)));
+    }).await;
 }

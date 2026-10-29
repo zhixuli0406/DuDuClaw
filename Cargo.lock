@@ -1787,6 +1787,7 @@ dependencies = [
 name = "duduclaw-cli-runtime"
 version = "1.77.1"
 dependencies = [
+ "duduclaw-core",
  "parking_lot",
  "portable-pty",
  "thiserror 2.0.18",

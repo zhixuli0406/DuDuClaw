@@ -38,6 +38,8 @@ pub(crate) enum PushRule {
     Task,
     /// About one employee: binding on `payload.agent_id` (absent ⇒ authenticated).
     Agent,
+    /// Autonomy scope: one visible employee, or an explicitly global change.
+    Autonomy,
     /// Admins only.
     Admin,
     Approval,
@@ -60,6 +62,7 @@ pub(crate) fn classify(event: &str) -> PushRule {
         "approval.created" | "approval.decided" | "approval.expired" => PushRule::Approval,
         "agent.turn_started" | "agent.turn_finished" | "agent.status_changed" => PushRule::Agent,
         "run.step" => PushRule::Never,
+        "autonomy.changed" => PushRule::Autonomy,
         "budget.breaker_open" | "autopilot.breaker_open" => PushRule::Admin,
         "chat.sessions.updated"
         | "plan.updated"
@@ -284,6 +287,15 @@ impl PushGate {
                     None if matches!(event.as_str(), "agent.turn_started" | "agent.turn_finished" | "agent.status_changed") => self.drop_event(&event, "employee event without employee"),
                     None if !live.is_admin() => self.drop_event(&event, "unscoped employee event"),
                     _ => Some(line.to_string()),
+                }
+            }
+            PushRule::Autonomy => {
+                let agent = payload.get("agent_id").and_then(Value::as_str);
+                match (agent, payload.get("all").and_then(Value::as_bool)) {
+                    (Some(id), Some(false)) if !id.is_empty()
+                        && live.has_agent_access(id, AccessLevel::Viewer) => Some(line.to_string()),
+                    (None, Some(true)) => Some(line.to_string()),
+                    _ => self.drop_event(&event, "invalid autonomy scope or no binding"),
                 }
             }
             PushRule::Task => self.filter_task(&event, line, &payload, &live),

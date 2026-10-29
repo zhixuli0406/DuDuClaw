@@ -400,3 +400,18 @@ async fn negative_fixture_cases_must_carry_what_their_kind_names() {
     });
     assert!(harmless_injection.is_err());
 }
+
+#[tokio::test]
+async fn autonomy_pause_workflow_blocks_steps_and_resumes_same_run() {
+    let (home, service, request, context) = process_fixture().await;
+    duduclaw_core::autonomy_gate::set_pause(home.path(), Some("alice"), "maintenance", "admin").unwrap();
+    let blocked = CURRENT_DECISION_CONTEXT.scope(Some(context), service.run_fixture(request)).await.unwrap();
+    assert!(!super::run_control::run_is_terminal(blocked.status));
+    assert!(blocked.steps.iter().all(|step| step.status == StepStatus::Pending));
+    duduclaw_core::autonomy_gate::resume(home.path(), Some("alice")).unwrap();
+    let resumed = service.runner.execute(&blocked.run_id).await.unwrap();
+    assert_eq!(resumed.run_id, blocked.run_id);
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    let steps = service.store.get_steps(&resumed.run_id).await.unwrap();
+    assert!(steps.iter().all(|step| step.status == StepStatus::Succeeded));
+}

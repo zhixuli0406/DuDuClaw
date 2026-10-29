@@ -139,8 +139,7 @@ async fn run_periodic(home_dir: PathBuf) {
         if cfg.auto_run {
             let interval = Duration::from_secs(cfg.interval_hours.saturating_mul(3600).max(3600));
             let due = last_run.map(|t| t.elapsed() >= interval).unwrap_or(true);
-            if due {
-                run_once(&home_dir, &cfg).await;
+            if due && run_once(&home_dir, &cfg).await {
                 last_run = Some(std::time::Instant::now());
             }
         }
@@ -155,11 +154,15 @@ async fn run_periodic(home_dir: PathBuf) {
 }
 
 /// Execute a single pipeline run for the configured target agent.
-async fn run_once(home_dir: &Path, cfg: &SynthesisScheduleConfig) {
+async fn run_once(home_dir: &Path, cfg: &SynthesisScheduleConfig) -> bool {
     let target_agent = cfg
         .target_agent
         .clone()
         .unwrap_or_else(|| resolve_default_agent(home_dir));
+
+    if duduclaw_core::autonomy_gate::check(home_dir, &target_agent, duduclaw_core::autonomy_gate::AutonomyPath::Background).is_err() {
+        return false;
+    }
 
     // WP1 master kill-switch: skill synthesis is an autonomous evolution path,
     // so a frozen target agent (`[evolution] enabled = false`) must be a no-op
@@ -171,7 +174,7 @@ async fn run_once(home_dir: &Path, cfg: &SynthesisScheduleConfig) {
             agent = %target_agent,
             "Auto-run skipped: [evolution] enabled = false (master switch off)"
         );
-        return;
+        return false;
     }
 
     let api_key = resolve_api_key(home_dir);
@@ -182,7 +185,7 @@ async fn run_once(home_dir: &Path, cfg: &SynthesisScheduleConfig) {
             "Auto-run is live (dry_run=false) but no ANTHROPIC_API_KEY / [api] anthropic_api_key \
              is configured — skipping run to avoid silent no-op graduation"
         );
-        return;
+        return false;
     }
 
     let events_dir = std::env::var("EVOLUTION_EVENTS_DIR")
@@ -212,6 +215,7 @@ async fn run_once(home_dir: &Path, cfg: &SynthesisScheduleConfig) {
         summary = %run.summary(),
         "Auto-run: synthesis pipeline complete"
     );
+    true
 }
 
 // ── Config resolution helpers ────────────────────────────────────────────────
@@ -261,6 +265,19 @@ fn resolve_api_key(home_dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn autonomy_pause_skill_synthesis_skips_without_consuming_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"worker\"\nstatus = \"active\"\n").unwrap();
+        let cfg = SynthesisScheduleConfig { auto_run: true, target_agent: Some("worker".into()), ..Default::default() };
+        duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("worker"), "pause", "user").unwrap();
+        assert!(!run_once(dir.path(), &cfg).await);
+        duduclaw_core::autonomy_gate::resume(dir.path(), Some("worker")).unwrap();
+        assert!(run_once(dir.path(), &cfg).await);
+    }
 
     #[test]
     fn default_is_disabled_and_dry_run() {

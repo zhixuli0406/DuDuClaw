@@ -200,6 +200,10 @@ pub(crate) async fn handle_goals_create(args: &Value, home_dir: &Path, default_a
         description,
     );
     row.parent_goal_id = parent_goal_id;
+    let _admission = match admit_background_identity(home_dir, default_agent, "goals_create").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     if let Err(e) = store.insert_goal(&row).await {
         return tool_error(&format!("create goal: {e}"));
     }
@@ -556,6 +560,10 @@ pub(crate) async fn handle_plan_update_step(args: &Value, home_dir: &Path, defau
     if fields.is_empty() {
         return tool_error("no fields to update (pass status and/or text)");
     }
+    let _admission = match admit_background_identity(home_dir, default_agent, "plan_update_step").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     let updated = match store
         .update_plan_step(step_id, &Value::Object(fields))
         .await
