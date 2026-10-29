@@ -380,41 +380,47 @@ impl ApprovalBroker {
         }
         binding.validate_host_files()?;
         self.validate_task_snapshot(binding).await?;
-        let mut conn = self.store.conn.lock().await;
-        self.attach_tasks(&conn, binding)?;
-        let resume_workflow = self.attach_workflow_for_resume(&conn, binding)?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
-        Self::check_task(&tx, binding)?;
-        let n = tx
-            .execute(
-                "UPDATE approvals SET status=?1, decided_at=?2, decided_by=?3, answer_json=?4
-            WHERE id=?5 AND status='pending' AND request_kind=?6 AND binding_json=?7
-            AND julianday(?2) < julianday(json_extract(binding_json,'$.expires_at'))
-            AND julianday(?2) < julianday(created_at) + ttl_seconds/86400.0",
-                params![
-                    status.as_str(),
-                    Utc::now().to_rfc3339(),
-                    dashboard
-                        .map(|c| format!("dashboard:{}", c.user_id))
-                        .unwrap_or_else(|| format!("{}:{}", context.channel, context.principal_id)),
-                    answer.map(|v| v.to_string()),
-                    id.as_str(),
-                    kind.as_str(),
-                    serde_json::to_string(binding).unwrap()
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        if n != 1 {
-            return Err("request expired or decided concurrently".into());
+        {
+            let mut conn = self.store.conn.lock().await;
+            self.attach_tasks(&conn, binding)?;
+            let resume_workflow = self.attach_workflow_for_resume(&conn, binding)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            Self::check_task(&tx, binding)?;
+            let current = super::store::record_in_connection(&tx, id)?.ok_or("request missing")?;
+            check_expected_digest(&current)?;
+            let n = tx
+                .execute(
+                    "UPDATE approvals SET status=?1, decided_at=?2, decided_by=?3, answer_json=?4
+                WHERE id=?5 AND status='pending' AND request_kind=?6 AND binding_json=?7
+                AND julianday(?2) < julianday(json_extract(binding_json,'$.expires_at'))
+                AND julianday(?2) < julianday(created_at) + ttl_seconds/86400.0",
+                    params![
+                        status.as_str(),
+                        Utc::now().to_rfc3339(),
+                        dashboard
+                            .map(|c| format!("dashboard:{}", c.user_id))
+                            .unwrap_or_else(|| format!("{}:{}", context.channel, context.principal_id)),
+                        answer.map(|v| v.to_string()),
+                        id.as_str(),
+                        kind.as_str(),
+                        serde_json::to_string(binding).unwrap()
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            if n != 1 {
+                return Err("request expired or decided concurrently".into());
+            }
+            // A decision on a workflow step wakes the same run in the same
+            // transaction; the runner still re-checks every gate on resume.
+            if resume_workflow {
+                Self::write_workflow_resume(&tx, binding, id)?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
         }
-        // A decision on a workflow step wakes the same run in the same
-        // transaction; the runner still re-checks every gate on resume.
-        if resume_workflow {
-            Self::write_workflow_resume(&tx, binding, id)?;
-        }
-        tx.commit().map_err(|e| e.to_string())
+        self.store.emit_lifecycle("approval.decided", &rec, status).await;
+        Ok(())
     }
 
     pub(crate) fn require_current_dashboard_role(
@@ -469,13 +475,22 @@ impl ApprovalBroker {
     }
 
     pub async fn invalidate_request(&self, id: &ApprovalId, reason: &str) -> Result<(), String> {
-        let conn = self.store.conn.lock().await;
-        conn.execute(
-            "UPDATE approvals SET status='invalidated',invalidated_reason=?1 WHERE id=?2 AND status IN ('pending',
-                'approved')",
-            params![reason, id.as_str()]
-        )
-        .map_err(|e| e.to_string())?;
+        let changed = {
+            let mut conn = self.store.conn.lock().await;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            let rec = super::store::record_in_connection(&tx, id)?;
+            let n = tx.execute(
+                "UPDATE approvals SET status='invalidated',invalidated_reason=?1 WHERE id=?2 AND status IN ('pending',
+                    'approved')",
+                params![reason, id.as_str()],
+            ).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            if n > 0 { rec } else { None }
+        };
+        if let Some(rec) = changed {
+            self.store.emit_lifecycle("approval.decided", &rec, ApprovalStatus::Invalidated).await;
+        }
         Ok(())
     }
 

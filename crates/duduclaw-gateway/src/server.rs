@@ -175,6 +175,7 @@ struct AppState {
     tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
     event_tx: broadcast::Sender<String>,
+    prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
     /// User database for multi-user authentication.
     user_db: Arc<UserDb>,
     /// JWT configuration for token issuance and verification.
@@ -1129,7 +1130,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
-    let (event_tx, _) = broadcast::channel::<String>(64);
+    let _ = crate::live_events::boot_id();
+    let (event_tx, _) = broadcast::channel::<String>(1024);
     handler.set_event_tx(event_tx.clone()).await;
     // B5: give `dashboard_navigate::push_dashboard_navigate` a handle to the
     // SAME sender every `/ws` connection subscribes to, so any code path in
@@ -2057,6 +2059,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                             }),
                             seq: None,
                             state_version: None,
+                            boot_id: None,
                         };
                         if let Ok(json) = serde_json::to_string(&event) {
                             let _ = etx.send(json);
@@ -2122,6 +2125,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                         }),
                                         seq: None,
                                         state_version: None,
+                                        boot_id: None,
                                     };
                                     if let Ok(json) = serde_json::to_string(&done_event) {
                                         let _ = etx.send(json);
@@ -2293,6 +2297,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler,
         tx,
         event_tx,
+            prepared_events: Default::default(),
         user_db,
         jwt_config,
         otp_delivery,
@@ -8950,6 +8955,7 @@ mod decision_shadow_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -9780,6 +9786,7 @@ mod decision_sla_shadow_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -10229,6 +10236,7 @@ mod decision_model_candidate_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -11103,6 +11111,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -11241,6 +11250,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -11904,6 +11914,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -12089,6 +12100,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -12251,6 +12263,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -14115,6 +14128,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -15866,6 +15880,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                             &id,
                                             serde_json::json!({
                                                 "status": "authenticated",
+                                                "boot_id": crate::live_events::boot_id(),
                                                 "user": {
                                                     "id": ctx.user_id,
                                                     "email": ctx.email,
@@ -15916,7 +15931,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 pre_auth = true;
                                 let ok = WsFrame::ok_response(
                                     &id,
-                                    serde_json::json!({ "status": "pre_auth" }),
+                                    serde_json::json!({ "status": "pre_auth", "boot_id": crate::live_events::boot_id() }),
                                 );
                                 let _ = socket
                                     .send(Message::Text(
@@ -15935,7 +15950,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                         legacy_admin_authenticated = true;
                                         let ok = WsFrame::ok_response(
                                             &id,
-                                            serde_json::json!({"status": "authenticated"}),
+                                            serde_json::json!({"status": "authenticated", "boot_id": crate::live_events::boot_id()}),
                                         );
                                         let _ = socket
                                             .send(Message::Text(
@@ -16016,7 +16031,33 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // Split the socket so we can drive sending and receiving concurrently.
     let (mut sink, mut stream) = socket.split();
     let mut log_rx = state.tx.subscribe();
-    let mut event_rx = state.event_tx.subscribe();
+    // Clone before OnceCell::get_or_init. The init future must not borrow
+    // AppState while the cell itself is borrowed, and the snapshot task is
+    // shared by every connection on this process.
+    let raw_events = state.event_tx.clone();
+    let prepare_home = state.home_dir.clone();
+    let prepared_tx = state.prepared_events.get_or_init(|| async move {
+        let mut raw = raw_events.subscribe();
+        let (prepared_tx, _) = broadcast::channel(1024);
+        let output = prepared_tx.clone();
+        let home = prepare_home;
+        tokio::spawn(async move {
+            loop {
+                let line = match raw.recv().await {
+                    Ok(line) => line,
+                    Err(broadcast::error::RecvError::Lagged(_)) =>
+                        serde_json::to_string(&WsFrame::event("events_lost", serde_json::json!({}))).unwrap(),
+                    Err(_) => break,
+                };
+                if let Some(frame) = crate::handlers::PreparedPush::prepare(home.clone(), line).await {
+                    let _ = output.send(Arc::new(frame));
+                }
+            }
+        });
+        prepared_tx
+    }).await;
+    let mut prepared_rx = prepared_tx.subscribe();
+
     // Per-connection gate for broadcast events (task gate, employee binding,
     // admin-only kinds, lock screen); see `handlers/push_filter.rs`.
     let mut push_gate = crate::handlers::PushGate::new_with_legacy(
@@ -16025,7 +16066,48 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         pre_auth,
         conn_info.legacy_admin_authenticated,
     );
+    // Keep at most one authorization future, started only after selecting a
+    // frame for delivery. Never queue already-authorized JSON: a slow socket
+    // must not build a backlog retaining a revoked reader's authority.
+    let mut event_gate = Some(push_gate.clone());
+    let mut pending_push: Option<tokio::task::JoinHandle<(crate::handlers::PushGate, Option<String>)>> = None;
     let mut logs_subscribed = false;
+    let mut sequence = crate::live_events::EventSequence::default();
+    let run_state = state.clone();
+    let run_ctx = user_ctx.clone();
+    let (run_subscriptions, queued_rx) = crate::live_events::RunSubscriptions::new_authorized(
+        &state.home_dir, Arc::new(move |step| {
+            let state = run_state.clone();
+            let ctx = run_ctx.clone();
+            Box::pin(async move { state.handler.may_push_run_step(&step, &ctx).await })
+        }),
+    );
+    // Authorize again off the select loop, into a one-slot channel. The arm
+    // below only receives a step that already passed that check.
+    let (ready_tx, mut run_rx) = tokio::sync::mpsc::channel(1);
+    {
+        let subscriptions = run_subscriptions.clone();
+        let deliver_state = state.clone();
+        let deliver_ctx = user_ctx.clone();
+        tokio::spawn(async move {
+            crate::live_events::forward_authorized(
+                &subscriptions,
+                queued_rx,
+                ready_tx,
+                Arc::new(move |step| {
+                    let state = deliver_state.clone();
+                    let ctx = deliver_ctx.clone();
+                    Box::pin(async move { state.handler.may_push_run_step(&step, &ctx).await })
+                }),
+            )
+            .await;
+        });
+    }
+    let mut run_commands = crate::live_events::RateWindow::default();
+    let mut run_rate = crate::live_events::RateWindow::default();
+    // Serialize subscription changes; other RPCs remain fully concurrent.
+    let mut run_command_pending = false;
+    let mut run_dropped_notice = false;
 
     // ── P4-3+: OS-native live event tail (opt-in, admin-gated) ────────────
     // A fresh `Receiver` scoped to THIS connection — dropping it (loop exit /
@@ -16063,7 +16145,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // os_events_subscribed and logs_subscribed updates (see the
     // os.events.subscribe authorization note below).
     let (rpc_tx, mut rpc_rx) =
-        tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>)>(64);
+        tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>, Option<(bool, serde_json::Value)>)>(64);
 
     loop {
         tokio::select! {
@@ -16101,6 +16183,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
 
                         match frame {
                             WsFrame::Request { id, method, params } => {
+                                let is_run_command = matches!(method.as_str(), "runs.subscribe" | "runs.unsubscribe");
+                                if is_run_command {
+                                    if run_command_pending || !run_commands.command(conn_start.elapsed().as_millis() as u64) {
+                                        let response = WsFrame::error_response(&id, "run subscription rate limited; retry later");
+                                        let text = serde_json::to_string(&response).unwrap_or_default();
+                                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                                        continue;
+                                    }
+                                    run_command_pending = true;
+                                }
                                 // Log subscription state is gated on the
                                 // response below, like os.events (F5-D: the
                                 // flag used to flip on the method name before
@@ -16149,7 +16241,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     if let WsFrame::Response { id: ref mut resp_id, .. } = response {
                                         *resp_id = id;
                                     }
-                                    let _ = task_tx.send((response, os_update, logs_update)).await;
+                                    let run_update = is_run_command.then(|| {
+                                        let selected = match &response {
+                                            WsFrame::Response { ok: true, payload: Some(p), .. } => p.get("subscription").cloned().unwrap_or_default(),
+                                            _ => serde_json::Value::Null,
+                                        };
+                                        (method == "runs.subscribe", selected)
+                                    });
+                                    let _ = task_tx.send((response, os_update, logs_update, run_update)).await;
                                 });
                             }
                             other => { warn!("Received non-request frame: {:?}", other); }
@@ -16170,7 +16269,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             // `rpc_tx` is held by this scope, so recv() can only yield None
             // after every in-flight task dropped its clone AND the local
             // sender was dropped — which never happens while this loop runs.
-            Some((response, os_update, logs_update)) = rpc_rx.recv() => {
+            Some((mut response, os_update, logs_update, run_update)) = rpc_rx.recv() => {
+                if let Some((subscribe, selected)) = run_update {
+                    run_command_pending = false;
+                    if let Ok(selector) = crate::live_events::RunSelector::parse(&selected) {
+                        if let Err(error) = run_subscriptions.update(selector, subscribe) {
+                            let id = match &response { WsFrame::Response { id, .. } => id.clone(), _ => String::new() };
+                            response = WsFrame::error_response(&id, error);
+                        }
+                    }
+                }
                 if let Some(on) = logs_update {
                     logs_subscribed = on;
                 }
@@ -16185,6 +16293,29 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 }
                 let resp_text = serde_json::to_string(&response).unwrap_or_default();
                 if sink.send(Message::Text(resp_text.into())).await.is_err() { break; }
+            }
+
+            // Dedicated per-connection step queue: no dashboard broadcast.
+            // The step was authorized on the forwarder immediately before it
+            // entered this one-slot channel. A failed re-check is dropped
+            // there and does not set events_lost.
+            Some(step) = run_rx.recv() => {
+                if !run_subscriptions.matches(&step) { continue; }
+                if run_subscriptions.take_lost() {
+                    let Some(text) = sequence.lost() else { break; };
+                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                }
+                if !run_rate.take(conn_start.elapsed().as_millis() as u64, crate::live_events::RUN_STEPS_PER_SEC) {
+                    // Emit one reconciliation signal per capped window.
+                    if run_dropped_notice { continue; }
+                    run_dropped_notice = true;
+                    let Some(text) = sequence.lost() else { break; };
+                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                    continue;
+                }
+                run_dropped_notice = false;
+                let Some(text) = sequence.encode(step.frame()) else { break; };
+                if sink.send(Message::Text(text.into())).await.is_err() { break; }
             }
 
             // ── Outbound log broadcast (only when subscribed) ─
@@ -16202,30 +16333,44 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                             payload: data,
                             seq: None,
                             state_version: None,
+                            boot_id: None,
                         };
-                        let text = serde_json::to_string(&push).unwrap_or_default();
+                        let Some(text) = sequence.encode(push) else { break; };
                         if sink.send(Message::Text(text.into())).await.is_err() { break; }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(text) = sequence.lost() else { break; };
+                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                    }
                     Err(_) => break,
                 }
             }
 
-            // ── Outbound event broadcast (always active for authenticated clients) ─
-            event_line = event_rx.recv() => {
-                match event_line {
-                    Ok(json) => {
-                        // Events are already serialized as WsFrame::Event JSON.
-                        // Task events pass the same per-reader gate as the
-                        // task RPCs (live identity + TaskPacket audience):
-                        // dropped or reduced to the board card per connection.
-                        let Some(json) = push_gate.filter(&json) else {
-                            continue;
-                        };
-                        if sink.send(Message::Text(json.into())).await.is_err() { break; }
+            // Start bounded authorization without blocking incoming frames,
+            // heartbeats or RPC responses. Preserve the future across selects.
+            event_frame = prepared_rx.recv(), if pending_push.is_none() => {
+                let frame = match event_frame {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(text) = sequence.lost() else { break; };
+                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                        continue;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
                     Err(_) => break,
+                };
+                let mut gate = event_gate.take().expect("one pending push");
+                pending_push = Some(tokio::spawn(async move {
+                    let result = gate.filter_prepared(frame).await;
+                    (gate, result)
+                }));
+            }
+            result = async { pending_push.as_mut().expect("pending push").await }, if pending_push.is_some() => {
+                pending_push = None;
+                let Ok((gate, line)) = result else { break; };
+                event_gate = Some(gate);
+                if let Some(line) = line {
+                    let Some(json) = sequence.filtered(&line) else { break; };
+                    if sink.send(Message::Text(json.into())).await.is_err() { break; }
                 }
             }
 
@@ -16257,8 +16402,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     payload,
                                     seq: None,
                                     state_version: None,
+                                    boot_id: None,
                                 };
-                                let text = serde_json::to_string(&push).unwrap_or_default();
+                                let Some(text) = sequence.encode(push) else { break; };
                                 if sink.send(Message::Text(text.into())).await.is_err() { break; }
                             } else {
                                 os_dropped += 1;
@@ -16274,7 +16420,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                         // Non-OS AutopilotEvent variants (TaskCreated, AgentIdle, ...)
                         // are silently ignored — this tail forwards os_file/os_frontmost only.
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(text) = sequence.lost() else { break; };
+                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                    }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Autopilot event bus torn down — stop polling a dead
                         // receiver instead of hot-looping on repeated `Closed`.
@@ -16874,6 +17023,7 @@ mod owner_verify_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db: Arc::new(user_db),
             jwt_config: Arc::new(JwtConfig::new(b"owner-verify-test-secret-32-bytes!!")),
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -17799,5 +17949,88 @@ async fn reconcile_workflows_on_boot(home_dir: &std::path::Path) {
             Err(e) => warn!(error = %e, "workflow boot reconciliation failed"),
         },
         Err(e) => warn!(error = %e, "workflow boot reconciliation unavailable"),
+    }
+}
+
+#[cfg(test)]
+mod live_events_socket_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn next_json(client: &mut Client) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match client.next().await.expect("socket open").expect("valid frame") {
+                    ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                    ClientMessage::Ping(data) => client.send(ClientMessage::Pong(data)).await.unwrap(),
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }).await.expect("socket frame deadline")
+    }
+
+    #[tokio::test]
+    async fn broker_database_bridge_reaches_ws_with_filtered_sequence_and_loss() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let (tx, _) = broadcast::channel(4);
+        let (event_tx, _) = broadcast::channel(1024);
+        handler.set_event_tx(event_tx.clone()).await;
+        let state = Arc::new(AppState {
+            auth: AuthManager::new(None), handler, tx, event_tx: event_tx.clone(),
+            prepared_events: Default::default(),
+            user_db: Arc::new(UserDb::new(&home.path().join("users.db")).unwrap()),
+            jwt_config: Arc::new(JwtConfig::new(b"live-events-test-secret-32-bytes!!")),
+            otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
+            home_dir: home.path().to_path_buf(),
+        });
+        let app = Router::new().route("/ws", get(ws_handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        client.send(ClientMessage::Text(json!({"type":"req","id":"connect","method":"connect","params":{}}).to_string().into())).await.unwrap();
+        let connected = next_json(&mut client).await;
+        assert_eq!(connected["payload"]["boot_id"], crate::live_events::boot_id());
+        // A forbidden run broadcast consumes no per-connection sequence.
+        event_tx.send(serde_json::to_string(&WsFrame::event("run.step", json!({"secret":"must not escape"}))).unwrap()).unwrap();
+
+        // Independently opened broker models mcp-server: SQLite is its only
+        // link to this gateway, no handler or sender is passed to it.
+        let employee_broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let id = employee_broker.request("sales", "goal_kickoff", "secret prompt",
+            json!({"token":"secret token"}), 300).await.unwrap();
+        let bus = crate::events_store::EventBusStore::open(home.path()).unwrap();
+        let rows = bus.fetch_since(0, 100).await.unwrap();
+        // Drive the production bridge transform deterministically (the
+        // production poller's two-second scheduling is not exercised here).
+        for row in rows {
+            if let Some(frame) = crate::dashboard_feedback::dashboard_push_frame(home.path(), &row.event, &row.payload).await {
+                event_tx.send(frame).unwrap();
+            }
+        }
+        let event = next_json(&mut client).await;
+        assert_eq!(event["event"], "approval.created");
+        assert_eq!(event["payload"]["id"], id.as_str());
+        assert_eq!(event["seq"], 1);
+        assert_eq!(event["boot_id"], connected["payload"]["boot_id"]);
+        assert!(!event.to_string().contains("secret"));
+
+        // Current-thread runtime: this loop cannot schedule the socket reader
+        // until it has overflowed the bounded broadcast receiver.
+        for _ in 0..2048 {
+            event_tx.send(serde_json::to_string(&WsFrame::event("system.status_changed", json!({}))).unwrap()).unwrap();
+        }
+        let lost = next_json(&mut client).await;
+        assert_eq!(lost["event"], "events_lost");
+        assert_eq!(lost["seq"], 2);
+        assert_eq!(lost["payload"], json!({}));
+        client.close(None).await.unwrap();
+        server.abort();
     }
 }

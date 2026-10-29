@@ -14,6 +14,7 @@ import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallR
 import { approvalListTitle, parseKnowledgeQuarantine, quarantineResultMessage } from '@/components/inbox/knowledge-quarantine';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
+import { INBOX_INVALIDATIONS, subscribeInvalidations } from '@/lib/live-events';
 import { useAuthStore } from '@/stores/auth-store';
 import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
@@ -126,6 +127,7 @@ export function InboxPage() {
   const deepLinkItemRef = useRef(searchParams.get('item'));
   const deepLinkAppliedRef = useRef(false);
 
+  const loadSeq = useRef(0);
   const [entries, setEntries] = useState<RawEntry[]>([]);
   const [agentNames, setAgentNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
@@ -161,6 +163,7 @@ export function InboxPage() {
   // fail-safe, not fail-loud). Splitting the decisions poll out of the initial
   // burst keeps the Inbox from firing ~17 RPCs the moment it opens (Bug#2).
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     // Each source stays best-effort, but a source that failed is recorded so
     // the list can say "part of this didn't load" instead of silently folding
     // the failure into an empty tab (P05, phase-4 audit).
@@ -197,6 +200,7 @@ export function InboxPage() {
     // request failed) — keep its rows, but say part of the Inbox is missing.
     if (tasksRes?.partial_error != null) note(tasksRes.partial_error);
     if (needsHumanRes?.partial_error != null) note(needsHumanRes.partial_error);
+    if (seq !== loadSeq.current) return firstFailure == null;
     setLoadError(firstFailure);
 
     const nameMap: Record<string, string> = {};
@@ -313,7 +317,10 @@ export function InboxPage() {
           api.decisions
             .list(name, 10)
             .then((r) => ({ name, decisions: r?.decisions ?? [] }))
-            .catch(() => ({ name, decisions: [] as DecisionInfo[] })),
+            .catch((error: unknown) => {
+              note(error);
+              return { name, decisions: [] as DecisionInfo[] };
+            }),
         ),
       );
       for (const { name, decisions } of results) {
@@ -334,15 +341,26 @@ export function InboxPage() {
         }
       }
     }
+    if (seq !== loadSeq.current) return firstFailure == null;
     if (decisionEntries.length > 0) {
       setEntries([...merged, ...decisionEntries]);
     }
+    return firstFailure == null;
   }, [intl]);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
     setLoading(true);
-    load().finally(() => setLoading(false));
+    void load().finally(() => setLoading(false));
+    const unsubscribe = subscribeInvalidations(INBOX_INVALIDATIONS, load, () => {
+      ++loadSeq.current;
+    });
+    const fallback = setInterval(() => { void load(); }, 5 * 60_000);
+    return () => {
+      ++loadSeq.current;
+      unsubscribe();
+      clearInterval(fallback);
+    };
   }, [connectionState, load]);
 
   const items = useMemo(() => entries.map((e) => e.item), [entries]);
@@ -439,7 +457,7 @@ export function InboxPage() {
         return rest;
       });
       try {
-        const res = await api.approvals.decide(a.id, approve);
+        const res = await api.approvals.decide(a.id, approve, undefined, a.digest ?? undefined);
         if (approve) setApprovedToday(bumpApprovedToday());
         // A knowledge-quarantine decision says what happened to the memory;
         // every other kind keeps the generic text.

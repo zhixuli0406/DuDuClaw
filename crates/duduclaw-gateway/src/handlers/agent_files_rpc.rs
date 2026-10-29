@@ -350,6 +350,9 @@ impl MethodHandler {
             Ok(_) => return WsFrame::error_response("", "找不到這筆審核"),
             Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗：{e}")),
         };
+        if let Err(error) = crate::approval::check_expected_digest(&rec) {
+            return WsFrame::error_response("", &error);
+        }
         if rec.status != crate::approval::ApprovalStatus::Pending {
             return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
         }

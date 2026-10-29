@@ -98,6 +98,12 @@ mod gates;
 pub mod operator_cli_gate;
 mod simulation;
 mod store;
+mod live_events;
+pub use live_events::{decision_digest, decision_digest_at};
+pub(crate) use live_events::{
+    activation_facts, is_activation_record, decision_digest_with_activation,
+    check_expected_digest, EXPECTED_DECISION_DIGEST, EXPECTED_DECISION_HOME,
+};
 
 /// SQLite-backed persistence for approvals. Mirrors the `events_store` /
 /// `autopilot_store` idioms: `Mutex<Connection>`, WAL, self-healing

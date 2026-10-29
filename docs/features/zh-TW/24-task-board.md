@@ -251,3 +251,30 @@ poll_assigned_tasks(agent)：
 ## 總結
 
 一個團隊需要一塊大家都能看見、認領、回報的看板。DuDuClaw 的 Task Board 就是那塊看板：單一 SQLite 儲存層，配上一道人類的門（dashboard RPC）與一道 agent 的門（MCP 工具）、一個用於站立會議的即時 Activity Feed、讓工作中的 agent 永遠看得到自己佇列的 prompt 自動注入，以及一個讓閒置 agent 在工作落到自己名下時仍會被喚醒的排程器層級拉取。這正是把 AI agent 從「你呼叫的函式」轉變為「會撿起卡片的隊友」的關鍵。
+
+## 閘道即時事件
+
+儀表板收到 `/ws` 通知後，會重新讀取任務、待處理事項與員工狀態。只有待處理數量保留每五分鐘一次的備援更新；任務與員工狀態依靠事件、重新連線或手動重讀，沒有定時備援。待處理數量讀取失敗時保留舊值，並以 `?` 標示資料可能過時。重新連線、收到 `events_lost` 或 `boot_id` 改變時，應重新呼叫既有 list RPC。
+
+事件可能重複，例如 RPC 直接推送後，資料庫橋接再送一次。事件只表示「資料可能已改變」，實際資料仍以 RPC 回應為準。每條連線在權限過濾後，從 `seq: 1` 編號；握手與事件多帶一個相容舊客戶端的 `boot_id`。連線落後時會收到 `events_lost`，沒有事件重播或新的 snapshot RPC。員工行程的任務與核准變更透過 `events.db` 約每兩秒轉送；閘道自己的執行與目標事件直接推送。
+
+| 事件 | 可見範圍 |
+|---|---|
+| `agent.turn_started`、`agent.turn_finished`、`agent.status_changed` | 具備該員工讀取權限者；執行事件附 runtime 與 source |
+| `task.created`、`task.updated`、`task.needs_human`、`goal.round_started`、`goal.round_finished`、`goal.done`、`goal.failed` | 員工權限加上任務 audience；受限看板卡片仍會遮蔽 |
+| `approval.created`、`approval.decided`、`approval.expired` | 與該連線的 `approvals.get` 相同：必須是當下的 Manager，需要改密碼則拒絕。`knowledge_add_source` 須為 Admin，或該集合目前的編輯者／擁有者（集合讀不到時非 Admin 拒絕，不另要求員工 Viewer）。operator CLI、工作流程啟用、`agent_file_change`、`support_pilot_review`，以及董事會種類（`strategic_plan`、`agent_hire`）只有當下的 Admin。`knowledge_quarantine` 與 `expert_skills_enable` 需具備員工 Viewer。其後仍檢查工作流程啟用快照與未綁定任務的 audience |
+| `budget.breaker_open`、`autopilot.breaker_open` | Admin |
+
+新通知只帶識別碼與列舉狀態，不帶提示詞、工具參數或檔案內容。目標事件使用獨立名稱，不會觸發監聽 `task.updated` 的 autopilot 規則。source 為 `channel`、`goal`、`cron`、`heartbeat`、`responsibility`、`assign` 或 `autopilot`。turn／round finished 只代表此次呼叫結束（包含取消），不等於任務驗收通過。
+
+`runs.subscribe {"run_id":"…"}` 可訂閱精簡的 `run.step`，僅接受指定執行 ID，不接受員工範圍訂閱；用相同參數呼叫 `runs.unsubscribe` 取消。每條連線最多 16 組訂閱、每秒 20 次訂閱操作（同時僅處理一個）及 20 個步驟；斷線自動解除。每個步驟入列前與送出前都重新檢查 run inspector 的員工權限、任務 audience 與歷史隱私規則，未授權步驟不入列、不觸發遺失提示、不計入速率。受限歷史不提供工具步驟；已授權佇列溢位或超速以 `events_lost` 提示重讀。每條連線最多同時驗權 4 個步驟，忙碌時捨棄新候選且不發遺失提示；請重讀 `runs.get` 補齊，步驟順序可能不同。
+
+指定 run 訂閱的限制：dispatch 的 run ID 到完成記錄時才產生，一般用戶端無法提前訂閱該批步驟，請以 `runs.get` 讀取歷史。既有 cron／memory／skill／channel 橋接事件只帶已驗證的 `agent_id` 或空物件，不傳實體名稱或 subject。
+
+執行事件只有 `agent_id`、`source`、`runtime`，不帶會話或任務 ID。資料庫橋接會驗證 ID，並重讀任務、核准卡片與員工資料；解析前拒絕超過 8 KiB 的 payload，每輪依事件類型與實體 ID 合併，只有通過權威查詢的資料才計入 64 組傳送額度，缺列或無效 ID 不占額度。另設每輪 256 列的解析與查詢上限。因位元組、工作量或傳送上限捨棄資料時仍推進游標，並在該輪送出一次空的 `events_lost`，讓任務、員工狀態與待處理事項重讀。網頁事件刷新至少間隔兩秒，保留首尾刷新，錯誤時指數退避最長 60 秒。
+
+目前只有 Claude 產生這類即時步驟通知。通道工具的開始事件在寫入步驟紀錄時送出；排程／派工步驟則於整次執行記錄完成後批次送出，phase 為 `finished`。其他 runtime 可以保留既有歷史證據，但不產生 `run.step`。摘要是依字元截短的固定標籤，不含工具參數預覽。
+
+`approvals.list` 與 `approvals.get {"id":"…"}` 回傳的卡片新增 `digest`；無權查看決策資料時為 `null`。get 沿用 `{approvals, count}` 格式。將 digest 放入 `approvals.decide` 的選填 `expected_digest`，即可在卡片變更時拒絕決策並要求重讀；省略時維持原行為。計算方式為遞迴排序物件 key、保留陣列順序、compact UTF-8 JSON，再取 SHA-256 小寫十六進位。涵蓋 id、員工、kind、summary、可見 payload（或 bound hash）、request kind、status、binding、answer、invalidated reason、建立與到期時間、TTL、simulation、dashboard-only 標記，以及顯示的 workflow activation（含 pricing）。不涵蓋 channel link、讀者權限標記與 digest 本身。核准狀態與事件分開寫入；若行程在兩者之間中斷，備援更新會補回狀態。
+
+turn 事件的 `runtime` 表示呼叫開始時選用的 provider；後續 failover 可能改用其他 provider，不能據此認定最後回覆由誰產生。

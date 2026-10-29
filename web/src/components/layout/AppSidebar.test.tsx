@@ -9,6 +9,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useApprovalsStore } from '@/stores/approvals-store';
 import { ORG_CHART_MIN_AGENTS } from '@/lib/nav-visibility';
 
 /** Minimal agent fixtures — just enough for `agents.length` (D6 org-chart gate). */
@@ -45,6 +46,7 @@ beforeEach(() => {
   useSystemStore.setState({ status: null } as never);
   // Default to no agents; the org-chart-disclosure tests opt into a roster.
   useAgentsStore.setState({ agents: [] as never, fetchAgents: vi.fn() as never });
+  useApprovalsStore.setState({ pendingCount: 0, stale: true });
 });
 
 describe('AppSidebar (Multica shell)', () => {
@@ -52,8 +54,7 @@ describe('AppSidebar (Multica shell)', () => {
   // 員工 zone. Home is the single spine.
   it('renders the flat daily items and the three collapsible group labels', () => {
     renderSidebar();
-    // Flat daily items (no group header). Inbox appears twice (the nav row +
-    // the footer bell shortcut), so assert at least one.
+    // Flat daily items (no group header), plus the footer Inbox bell shortcut.
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /Inbox/i }).length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: /New chat/i })).toBeInTheDocument();
@@ -66,6 +67,21 @@ describe('AppSidebar (Multica shell)', () => {
     // The primary 交辦 action + the ⌘K search trigger.
     expect(screen.getByRole('button', { name: /New task/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Command palette/i })).toBeInTheDocument();
+  });
+
+  it.each([
+    { stale: true, pendingCount: 0, badge: '?', label: 'Inbox (Data may be stale)' },
+    { stale: true, pendingCount: 7, badge: '?', label: 'Inbox (Data may be stale)' },
+    { stale: false, pendingCount: 0, badge: '', label: 'Inbox' },
+    { stale: false, pendingCount: 7, badge: '7', label: 'Inbox (7 need you)' },
+  ])('keeps Inbox identifiable with stale=$stale and count=$pendingCount', ({ stale, pendingCount, badge, label }) => {
+    useApprovalsStore.setState({ stale, pendingCount });
+    renderSidebar();
+    const inbox = screen.getByRole('link', { name: /Inbox/i });
+    expect(inbox).toHaveAccessibleName(label);
+    expect(inbox).toHaveAttribute('href', '/inbox');
+    expect(inbox).toHaveAttribute('title', label);
+    expect(inbox.textContent).toBe(badge);
   });
 
   it('hides role-gated items below the required role (fail-closed UX)', () => {

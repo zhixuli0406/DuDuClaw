@@ -78,11 +78,12 @@ describe('InboxPage deep link (W2-5 H5, ?item=<id>)', () => {
   });
 
   it('a failed approve shows the server error and keeps the item in place', async () => {
+    const digest = 'a'.repeat(64);
     mockWsClient.call.mockImplementation((method: string) => {
       if (method === 'approvals.list') {
         return Promise.resolve({
           count: 1,
-          approvals: [{ ...APPROVAL_FIXTURE, id: 'apr-9', summary: 'Hold this knowledge' }],
+          approvals: [{ ...APPROVAL_FIXTURE, id: 'apr-9', summary: 'Hold this knowledge', digest }],
         });
       }
       if (method === 'approvals.decide') {
@@ -96,6 +97,9 @@ describe('InboxPage deep link (W2-5 H5, ?item=<id>)', () => {
     approve.click();
 
     const alert = await screen.findByRole('alert');
+    expect(mockWsClient.call).toHaveBeenCalledWith('approvals.decide', {
+      id: 'apr-9', approve: true, expected_digest: digest,
+    });
     expect(alert.textContent).toContain('db locked');
     // Still selected, still decidable: nothing was removed optimistically.
     expect(screen.getAllByText('Hold this knowledge').length).toBeGreaterThan(0);

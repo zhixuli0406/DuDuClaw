@@ -340,6 +340,7 @@ impl MethodHandler {
                 }),
                 seq: None,
                 state_version: None,
+                boot_id: None,
             };
             let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
         };
@@ -417,6 +418,7 @@ impl MethodHandler {
                 }),
                 seq: None,
                 state_version: None,
+                boot_id: None,
             };
             let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
         }

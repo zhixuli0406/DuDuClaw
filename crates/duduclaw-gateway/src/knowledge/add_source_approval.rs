@@ -388,6 +388,7 @@ pub async fn decide(
         Ok(_) => return Err("找不到這筆審核".into()),
         Err(e) => return Err(format!("讀取審核失敗：{e}")),
     };
+    crate::approval::check_expected_digest(&rec)?;
     if rec.status != ApprovalStatus::Pending {
         return Err(format!(
             "approval {} already {}",

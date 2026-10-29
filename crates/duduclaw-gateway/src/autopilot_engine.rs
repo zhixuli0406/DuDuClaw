@@ -1124,6 +1124,10 @@ impl AutopilotEngine {
         // (probe one request; re-trip on any retry within probe window).
         let (allowed, transitioned) = self.circuit_check(&rule.id).await;
         if let Some(new_state) = transitioned {
+            if matches!(new_state, "open" | "open_retrip") {
+                crate::dashboard_feedback::emit_live(&self.home_dir, "autopilot.breaker_open",
+                    serde_json::json!({ "rule_id": rule.id }));
+            }
             info!(
                 rule = %rule.name,
                 rule_id = %rule.id,
@@ -2194,6 +2198,13 @@ const EVENTS_POLL_BATCH: i64 = 1000;
 /// Convert a `(event, payload)` row from `events.db` into a typed
 /// `AutopilotEvent`. Returns `None` for events the engine doesn't handle.
 fn row_to_event(event: &str, payload_json: &str) -> Option<AutopilotEvent> {
+    // Dashboard-only hints have no autopilot representation. Avoid parsing
+    // their untrusted payload a second time after the bounded bridge pass.
+    if crate::dashboard_feedback::DASHBOARD_EVENTS.contains(&event)
+        && !matches!(event, "task.created" | "task.updated")
+    {
+        return None;
+    }
     let payload: Value = serde_json::from_str(payload_json).unwrap_or(Value::Null);
     match event {
         "task.created" => Some(AutopilotEvent::TaskCreated { task: payload }),
@@ -2409,19 +2420,10 @@ pub fn spawn_events_db_poll(
             match store.fetch_since(last_seen_id, EVENTS_POLL_BATCH).await {
                 Ok(rows) if !rows.is_empty() => {
                     let batch_size = rows.len();
+                    if let Some(ref dtx) = dashboard_tx {
+                        crate::dashboard_feedback::bridge_tick(store.home_dir(), &rows, &mut last_seen_id, dtx).await;
+                    }
                     for row in &rows {
-                        // WP6: dashboard live feedback. Independent of
-                        // `should_rebroadcast` (which only guards the autopilot
-                        // bus against double-dispatching already-broadcast OS
-                        // events) — a feedback row is never an autopilot event.
-                        if let Some(ref dtx) = dashboard_tx {
-                            if let Some(frame) = crate::dashboard_feedback::dashboard_push_frame(
-                                &row.event,
-                                &row.payload,
-                            ) {
-                                let _ = dtx.send(frame);
-                            }
-                        }
                         if !should_rebroadcast(row) {
                             continue;
                         }

@@ -1,4 +1,5 @@
 {
+  "liveEvents.stale": "Data may be stale",
   "googleDataDisclosure.title": "Before connecting Google",
   "googleDataDisclosure.access": "DuDuClaw uses the Google data you authorize—Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, and your account email—to provide the Google features you request.",
   "googleDataDisclosure.storage": "Credentials are encrypted locally and sent only to Google. Task data may be sent to your configured AI provider and Google data may be stored in local conversation history, memory, knowledge, task, tool/runtime records, and backups. Disconnecting removes credentials, not existing content.",

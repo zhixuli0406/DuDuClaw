@@ -570,3 +570,29 @@ mod preset_policy_cases;
 mod resume_cases;
 mod f1b_cases;
 mod stop_case;
+
+#[tokio::test]
+async fn bound_requests_emit_redacted_created_and_decided_events() {
+    let home = fixture();
+    let broker = ApprovalBroker::open(home.path()).unwrap();
+    let payload = json!({"secret": "tool arguments"});
+    let id = broker.request_bound(
+        RequestKind::Approval, "alice", "private summary", payload.clone(),
+        binding(home.path(), &payload, "live_only_v1"),
+    ).await.unwrap();
+    let rec = broker.get(&id).await.unwrap().unwrap();
+    EXPECTED_DECISION_DIGEST.scope(
+        Some((id.to_string(), "0".repeat(64))),
+        broker.decide_bound(&id, &context(), true),
+    ).await.unwrap_err();
+    assert_eq!(broker.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Pending);
+    EXPECTED_DECISION_DIGEST.scope(
+        Some((id.to_string(), decision_digest(&rec))),
+        broker.decide_bound(&id, &context(), true),
+    ).await.unwrap();
+    let bus = crate::events_store::EventBusStore::open(home.path()).unwrap();
+    let rows = bus.fetch_since(0, 100).await.unwrap();
+    assert_eq!(rows.iter().map(|r| r.event.as_str()).collect::<Vec<_>>(),
+        vec!["approval.created", "approval.decided"]);
+    assert!(rows.iter().all(|r| !r.payload.contains("secret") && !r.payload.contains("private")));
+}

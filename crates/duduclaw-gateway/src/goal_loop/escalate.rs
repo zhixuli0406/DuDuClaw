@@ -60,6 +60,9 @@ impl GoalLoopDriver {
                 .mark_needs_human_with_pause(&task.id, &effective_reason, pause)
                 .await?;
         }
+        crate::dashboard_feedback::emit_live(&self.home_dir, "task.needs_human",
+            serde_json::json!({ "task_id": task.id, "agent_id": task.assigned_to,
+                "pause_reason": pause.as_str() }));
         // A1 ledger: keep the pause class on the latest round row, where it
         // survives `resolve_needs_human` clearing `tasks.pause_reason`. The
         // verdict is not touched. Bookkeeping only — failure is logged.
@@ -126,6 +129,9 @@ impl GoalLoopDriver {
             if !task.goal_mode || notified.contains(&task.id) {
                 continue;
             }
+            crate::dashboard_feedback::emit_live(&self.home_dir, "task.needs_human",
+                serde_json::json!({ "task_id": task.id, "agent_id": task.assigned_to,
+                    "pause_reason": task.pause_reason }));
             let level = AutonomyLevel::for_agent(&self.home_dir, &task.assigned_to);
             if level == AutonomyLevel::Observer {
                 // Observer: notify-only, no waiting — resolve straight to cancelled.
