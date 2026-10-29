@@ -152,9 +152,11 @@ AI 社員のものになっているレコードを変更・起動するツー�
 - `hub` — キュレーション済みレジストリ（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）。`hub` パラメータで 1 つに絞れます。
 - `bank` — この構成が自力で学習したものだけ。この source では `hub` パラメータは受け付けません。
 
-### `evolution_toggle` — 停滞検知のサブフィールド
+### `evolution_toggle` — フィールドと権限
 
-標準フラグに加えて `field` は `stagnation_enabled`（bool）、`stagnation_window_seconds`（60–604800）、`stagnation_trigger_threshold`（1–1000）、`stagnation_action`（`log_only` | `suppress`）を受け付けます。[evolution-switches.md](../evolution-switches.md) を参照してください。
+`field` は `gvu_enabled`（真偽値）、`max_silence_hours`、`skill_token_budget`、`max_active_skills`（数値）を受け付けます。旧 `stagnation_*` フィールドはこのツールでは変更できません。[evolution-switches.md](../evolution-switches.md) を参照してください。
+
+AI スタッフは、自分または部下の設定を変更できます。`agent_update` と同じ身元・組織権限チェックを使い、委任ポリシーが `open` の場合はチームをまたぐ変更も許可されます。人間のオペレーターはこの制限を受けません。身元または組織権限のチェックを通過しない場合は、対象の設定ファイルを読む前に拒否します。これらのフィールドはツール・データ・組織の権限を付与せず、進化のマスタースイッチも迂回しないため、自分の設定変更は引き続き可能です。
 
 ### `execute_program` — スクリプトの実行場所
 

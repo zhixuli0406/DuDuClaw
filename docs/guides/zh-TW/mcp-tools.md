@@ -152,9 +152,11 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 - `hub` — 策展登錄庫（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）；用 `hub` 參數收斂到單一個。
 - `bank` — 只看這套部署自己學到的技能。此來源不接受 `hub` 參數。
 
-### `evolution_toggle` — 停滯偵測子欄位
+### `evolution_toggle` — 欄位與權限
 
-除標準旗標外，`field` 還接受 `stagnation_enabled`（bool）、`stagnation_window_seconds`（60–604800）、`stagnation_trigger_threshold`（1–1000）、`stagnation_action`（`log_only` | `suppress`）。見 [evolution-switches.md](../evolution-switches.md)。
+`field` 接受 `gvu_enabled`（布林值），以及 `max_silence_hours`、`skill_token_budget`、`max_active_skills`（數值）。舊的 `stagnation_*` 欄位已不能透過此工具修改。見 [evolution-switches.md](../evolution-switches.md)。
+
+AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同的身分與組織授權檢查；委派政策設為 `open` 時允許跨團隊調整，操作者不受此限制。未通過身分或組織授權檢查時，會在讀取目標設定檔前拒絕。這些欄位不會授予工具、資料或組織權限，也不會繞過演化主開關，因此保留自身調整。
 
 ### `execute_program`：腳本在哪裡執行
 

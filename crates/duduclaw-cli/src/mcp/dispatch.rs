@@ -341,7 +341,7 @@ pub(crate) async fn handle_tools_call(
         "skill_curator_status" => handle_skill_curator_status(&arguments, home_dir).await,
         "skill_pin" => handle_skill_pin(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
-        "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
+        "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir, record_actor).await,
         "evolution_status" => {
             handle_evolution_status_tool(&arguments, home_dir, default_agent).await
         }
