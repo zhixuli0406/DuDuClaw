@@ -3941,7 +3941,7 @@ pub(crate) fn mcp_proxy_cli_args(
 /// config source that overrides cwd auto-discovery.
 ///
 /// `explicit = None` ⇒ exactly [`mcp_proxy_cli_args`], i.e. the pre-existing
-/// behaviour (nothing at all unless redaction is active).
+/// behaviour (nothing added unless redaction or a third-party gate needs a rewrite).
 ///
 /// `explicit = Some(path)` is the Team-as-Agent case (design §4.3 E3). A role
 /// member's cwd is the *employee's* workspace, and the Claude CLI would
@@ -5416,27 +5416,57 @@ mod redaction_proxy_cli_args_tests {
     }
 
     #[test]
-    fn redaction_off_adds_no_mcp_flags_at_all() {
-        // The dispatch path relies on the CLI auto-discovering `.mcp.json`
-        // from the working directory. With redaction off that must stay
-        // byte-identical — in particular `--strict-mcp-config` must NOT
-        // appear on its own, or the ambient/global MCP config would be
-        // dropped for every dispatch turn.
+    fn redaction_off_and_egress_off_add_no_mcp_flags_at_all() {
+        // With no gate active, preserve CLI auto-discovery byte for byte:
+        // neither --mcp-config nor --strict-mcp-config may be added.
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
-        assert!(
-            mcp_proxy_cli_args(tmp.path(), Some(&dir))
-                .unwrap()
-                .is_none()
-        );
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+    }
+
+    #[test]
+    fn redaction_off_without_third_party_servers_adds_no_mcp_flags_in_any_egress_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        let path = dir.join(".mcp.json");
+        let mut cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        cfg["mcpServers"].as_object_mut().unwrap().remove("crm_pg");
+        let original = cfg.to_string();
+        std::fs::write(&path, &original).unwrap();
+        for mode in ["off", "shadow", "ask", "block"] {
+            std::fs::write(tmp.path().join("config.toml"), format!("[security]\negress_guard='{mode}'\n")).unwrap();
+            assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none(), "{mode}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn redaction_off_egress_modes_proxy_third_party_servers_including_employee_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        let original = std::fs::read_to_string(dir.join(".mcp.json")).unwrap();
+        for (global, employee) in [("shadow", "off"), ("ask", "off"), ("block", "off"), ("off", "ask")] {
+            std::fs::write(tmp.path().join("config.toml"), format!("[security]\negress_guard='{global}'\n")).unwrap();
+            std::fs::write(dir.join("agent.toml"), format!("[capabilities]\negress_guard='{employee}'\n")).unwrap();
+            let (args, _guard) = mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().expect("egress needs response tainting");
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[0], "--mcp-config");
+            assert_eq!(args[2], "--strict-mcp-config");
+            let body: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
+            assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
+            assert_eq!(body["mcpServers"]["duduclaw"], serde_json::from_str::<serde_json::Value>(&original).unwrap()["mcpServers"]["duduclaw"]);
+            assert_eq!(std::fs::read_to_string(dir.join(".mcp.json")).unwrap(), original);
+        }
     }
 
     /// 2026-10-08: the explore lane and `action_rules` route third-party
     /// servers through the gated proxy even with redaction off.
     #[test]
-    fn explore_lane_and_action_rules_route_through_the_proxy() {
+    fn explore_lane_and_action_rules_route_through_the_proxy_even_with_egress_off() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
                 .unwrap()
@@ -5463,19 +5493,28 @@ mod redaction_proxy_cli_args_tests {
     /// cannot be produced, the spawn is refused instead of falling back to
     /// the ungated file; redaction alone keeps the old fallback.
     #[test]
-    fn an_unproducible_gated_config_refuses_the_spawn() {
+    fn an_unproducible_gated_config_refuses_egress_explore_and_action_rules_spawns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("agents").join("agnes");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".mcp.json"), "{ not json").unwrap();
+        // Default shadow, ask and block all require a producible gated config.
+        let err = mcp_proxy_cli_args(tmp.path(), Some(&dir)).expect_err("default shadow must fail closed");
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err), "{err}");
+        for mode in ["shadow", "ask", "block"] {
+            std::fs::write(tmp.path().join("config.toml"), format!("[security]\negress_guard='{mode}'\n")).unwrap();
+            let err = mcp_proxy_cli_args(tmp.path(), Some(&dir)).expect_err("egress must fail closed");
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err), "{mode}: {err}");
+        }
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
         // Nothing needs gating ⇒ untouched.
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
                 .unwrap()
                 .is_none()
         );
-        // Redaction only ⇒ old fallback.
-        enable_redaction(tmp.path());
+        // Redaction only with egress explicitly off retains the old fallback.
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n[redaction]\nenabled=true\nprofiles=['general']\n").unwrap();
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
                 .unwrap()

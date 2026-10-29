@@ -8,8 +8,10 @@
 //!    longer points at the agent's raw `.mcp.json`: every third-party stdio
 //!    server in it is rewritten to launch through `duduclaw mcp-proxy`
 //!    ([`rewrite_mcp_config_for_proxy`]), which applies the same egress /
-//!    result redaction the built-in choke point applies. Redaction inactive ⇒
-//!    nothing is written and the spawn is byte-identical to before.
+//!    result redaction the built-in choke point applies. The explore lane,
+//!    action rules and active egress guard also require the third-party gate.
+//!    With no third-party servers, or with all these purposes off, nothing
+//!    is written and the spawn stays byte-identical.
 //!
 //! 2. **Direct-API tool loop** — [`RedactionToolInterceptor`], a
 //!    [`duduclaw_llm::ToolInterceptor`]. The openai-compat runtime drives
@@ -958,14 +960,18 @@ mod mcp_config_proxy_tests {
     }
 
     #[test]
-    fn redaction_inactive_when_no_config_exists() {
+    fn redaction_inactive_without_config_but_default_egress_proxies_third_party_servers() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!redaction_active_for_spawn(dir.path()));
         let mcp = dir.path().join(".mcp.json");
         std::fs::write(&mcp, sample().to_string()).unwrap();
+        let guard = maybe_proxy_mcp_config(dir.path(), &mcp).unwrap().expect("default shadow needs response tainting");
+        let body: Value = serde_json::from_str(&std::fs::read_to_string(&guard).unwrap()).unwrap();
+        assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
+        std::fs::write(dir.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
         assert!(
             maybe_proxy_mcp_config(dir.path(), &mcp).unwrap().is_none(),
-            "redaction off ⇒ the spawn must be byte-identical to today"
+            "redaction and egress off must preserve the original spawn"
         );
     }
 

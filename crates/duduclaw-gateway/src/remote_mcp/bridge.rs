@@ -187,7 +187,9 @@ impl Bridge {
             return;
         }
 
-        // Hold admission through a correlated reply, including asynchronous 202/204.
+        // Claim once per caller request. Hold this same pending entry and lease
+        // through POST retries and all GET/Last-Event-ID resumes in exchange;
+        // only a new caller request may allocate a new generation.
         let call = if let (Kind::Request(id), Some("tools/call")) = (&kind, method) {
             let tool = frame["params"]["name"].as_str().unwrap_or("");
             match self.gate.begin_call(id, tool, &frame["params"]["arguments"]).await {
@@ -336,7 +338,9 @@ impl Bridge {
     /// Redelivery"): when the stream breaks or ends before the answer and
     /// the server has given its events an `id:`, the bridge reconnects with
     /// `GET` + `Last-Event-ID` (the server replays what followed on the same
-    /// stream) after the server's `retry:` hint (capped at
+    /// stream). `expect_id` remains the original POST's generation wire ID;
+    /// the caller retains its PendingCall and lease throughout this loop.
+    /// Reconnect after the server's `retry:` hint (capped at
     /// [`RESUME_DELAY_MAX`]) or a 1 s doubling backoff, at most
     /// [`MAX_RESUME_ATTEMPTS`] times in a row without a new event and
     /// [`MAX_RESUMES_TOTAL`] times per request. No event id seen ⇒ nothing to
