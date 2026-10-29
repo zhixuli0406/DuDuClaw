@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- zip 套件升級到 9.0.5（GHSA-m665-v7pm-7grj：兩種讀取方式對同一壓縮檔判讀不一致，可能導致任意檔案覆寫）；DuDuClaw 只用隨機存取讀取，但更新包、知識庫文件與模型安裝都會解壓縮，因此一併升級。
+
 ## [1.76.4] - 2026-10-29 — Codex timeout, background runtime and Odoo compatibility hotfix
 
 ### Added
