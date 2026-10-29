@@ -65,6 +65,22 @@ async fn egress_error_shaped_responses_are_observed_before_delivery() {
     assert!(!model_visible_tool_reply(&Err(McpError::Timeout)));
 }
 
+// `/usr/bin/python3` on GitHub macos-latest is an Xcode CLT shim that can miss
+// a short initialize. Prefer an executable `python3` on PATH.
+#[cfg(unix)]
+fn python3_interpreter() -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join("python3");
+            std::fs::metadata(&candidate).is_ok_and(|meta| {
+                meta.is_file() && meta.permissions().mode() & 0o111 != 0
+            })
+        })
+    });
+    if on_path { "python3" } else { "/usr/bin/python3" }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn egress_stdio_transport_terminal_releases_but_timeout_and_abort_retain() {
@@ -91,7 +107,8 @@ for line in sys.stdin:
     for case in ["success", "error", "timeout", "abort"] {
         let home = tempfile::tempdir().unwrap();
         let accepted = home.path().join("accepted");
-        let mut client = McpClient::connect("/usr/bin/python3", &["-u".into(), "-c".into(), script.into(), accepted.to_string_lossy().into_owned()], &[], Duration::from_secs(5)).await.unwrap();
+        let python = python3_interpreter();
+        let mut client = McpClient::connect(python, &["-u".into(), "-c".into(), script.into(), accepted.to_string_lossy().into_owned()], &[], Duration::from_secs(30)).await.unwrap();
         client.timeout = if case == "abort" { Duration::from_secs(5) } else { Duration::from_millis(100) };
         let mut registry = ToolRegistry::from_clients_named(vec![("test".into(), client)], vec![]).await.unwrap();
         let boundary = Arc::new(Probe::default());
