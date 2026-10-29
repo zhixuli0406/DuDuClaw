@@ -64,6 +64,7 @@ Termination is guaranteed by the driver, not by trusting the model:
 |---|---|---|
 | Iteration cap (dispatches per task) | 5 (hard goals), 3 (simple) | `needs_human` |
 | Wall clock from creation | 24 h | `needs_human` |
+| Goal cost cap (`cost_cap_cents`, fallback `default_cost_cap_cents`) | No default cap (`0`) | Measured task-tree spend at or above cap: `needs_human` / `budget_exhausted`; unreadable cost: defer dispatch; unmeasured usage: pause for a human decision |
 | Concurrent goal tasks | 3 | queued, not dispatched |
 | Stagnation detection | two consecutive rejections with the same **gap fingerprint** (`path:line` citations + backtick key tokens extracted and normalized from the feedback, not raw text equality — a reworded restatement of the same gap still matches; falls back to literal-text comparison only when no citation/token is extractable) | early `needs_human` |
 | Bail-pattern detection | nine zh+en anchored regexes over the agent's last non-empty paragraph (e.g. self-signed `VERDICT:`, "check back later", "ready for review") | telemetry + activity event + a hint folded into the next round's judge/evaluator input — never rejects or blocks on its own |
@@ -73,10 +74,20 @@ Termination is guaranteed by the driver, not by trusting the model:
 | Delegation hop depth | 5 | dispatch refused |
 | Resume on gateway restart (`resume_on_restart`) | `pause` (**default**) escalates every in-flight `goal_mode` task to `needs_human` (reason `gateway_restart`) at boot | `auto` resumes in-flight tasks exactly as before a restart instead; toggle either in `config.toml` or the dashboard's Settings → Automation tab (`system.update_config`, whitelisted to `"auto"`/`"pause"` only) |
 | No-progress report (`progress_report_minutes`) | 10 min of silence on an already-claimed task (Activity Feed signal, not the lease-renewer-refreshed `updated_at`) | one "still running, no progress signal" notice to Activity Feed + source conversation, at most once per round — never re-dispatches, escalates, or cancels; `0` disables it |
-| Tool-call streak advisory (`tool_streak_advisory`) | 3 / 5 / 8 consecutive calls to the same tool with the same (masked) arguments, within one round | an escalating zh-TW hint injected into the next round's `<state>` block — zero LLM cost, advisory only, never blocks or vetoes a call; excluded from the oscillation-detection state hash |
+| Tool-call streak (`tool_streak_pause`, `tool_streak_advisory`) | Pause at 8 identical consecutive calls within one round; `0` disables pause. Hints at 3 / 5 / 8 when advisory is on | After the round: `needs_human` / `no_progress`, with tool and count; below the pause threshold, hint only |
 | Ephemeral spawn admission (`[dispatch] admission`) | Over the concurrency cap (`ephemeral_max_active`, default 32) | `"queue"` (**default**) durably FIFO-queues the request instead of rejecting it (bounded depth, per-ticket TTL, audited); `"fail"` reverts to the pre-H19 immediate rejection |
 
 All under `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` in `config.toml`, with built-in defaults when the sections are absent.
+
+## Goal cost cap and repeated-call pause
+
+Set `cost_cap_cents` to a positive integer in `tasks_create` with `kind="goal"`, or in the dashboard's **Assign task → Complex task → More settings → Cost cap (US cents)**. For example, `500` means US$5.00. Existing goals have no explicit cap. When no cap is stored, `[goal_loop] default_cost_cap_cents` applies (`0`, the default, means no cap).
+
+Before every round, the driver reads measured spend across the goal's recorded task tree through the shared responsibility cost source. At or above the ceiling it pauses as `needs_human` / `budget_exhausted`; the detail includes the cap and spend. An unreadable cost source skips dispatch for that round. A recorded usage row with zero token counts anywhere in the tree pauses the goal as `needs_human` / `blocked_needs_decision`, with a visible explanation that the runtime did not report usage; raising the ceiling alone does not resolve unknown spend. An ordinary capped goal has no reservation fallback: unknown usage is neither estimated nor counted as zero. This is a between-round guard, not a billing guarantee: a running round and concurrent child tasks may exceed the ceiling, and unreported costs are not measured spend. The goal ceiling and employee budget are configured separately.
+
+`/goals` shows measured spend and the effective ceiling, or explicitly says spend is unavailable. Paused cards show the pause detail. If `[goal_loop] default_cost_cap_cents` is malformed or unreadable, all goals defer dispatch, including goals without an explicit cap; `/goals` displays the configuration issue until it is repaired. An authorized operator can enter a higher ceiling and choose **Raise cap and retry**: the cap is saved through `tasks.update` before the existing `tasks.goal_decide` retry action runs. A failed save never resumes the goal. MCP `tasks_update` accepts the same field; employees may only add or narrow a cap, while an operator can raise it. The dashboard also carries the cap into each goal created by a scheduled assignment.
+
+`[goal_loop] tool_streak_pause = 8` pauses a goal after a finished round contains at least eight consecutive calls to the same tool with the same masked arguments. The reason is `no_progress`, with the tool name and count in the detail. `0` disables this pause independently of `tool_streak_advisory`; below the pause threshold the existing 3 / 5 / 8 hints remain when advisory is enabled. No tool call is interrupted mid-round. Saving these settings in the dashboard’s Advanced config editor reloads the goal loop. If you edit `config.toml` directly, restart the gateway.
 
 ## needs_human Escalation
 

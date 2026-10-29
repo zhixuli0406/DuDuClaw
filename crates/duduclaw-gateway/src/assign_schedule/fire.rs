@@ -349,6 +349,7 @@ async fn create_run(
                 priority: p.priority,
                 outcome: p.outcome,
                 duration_hours: p.duration_hours,
+                cost_cap_cents: p.cost_cap_cents,
                 risk_boundary: p.risk_boundary,
                 require_beliefs: p.require_beliefs,
                 plan_first: p.plan_first,

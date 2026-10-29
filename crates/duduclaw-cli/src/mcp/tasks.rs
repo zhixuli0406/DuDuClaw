@@ -32,6 +32,7 @@ pub(crate) fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> V
         "retry_count": row.retry_count,
         "max_retries": row.max_retries,
         "goal_mode": row.goal_mode,
+        "cost_cap_cents": row.cost_cap_cents,
         "acceptance_criteria": row.acceptance_criteria,
         // H9-G goal contract freeze: the immutable snapshot taken at goal
         // creation, when one exists (see `TaskRow::acceptance_criteria_baseline`).
@@ -164,6 +165,25 @@ pub(crate) async fn handle_tasks_create(
         Ok(k) => k,
         Err(e) => return tool_error(&e),
     };
+    let cost_cap_cents = match duduclaw_gateway::goal_create_core::parse_cost_cap_cents(args) {
+        Ok(cap) => cap,
+        Err(e) => return tool_error(&e),
+    };
+    if cost_cap_cents.is_some()
+        && (kind != crate::mcp_alias::TaskKind::Goal
+            || args.get("schedule").is_some_and(|v| !v.is_null()))
+    {
+        return tool_error("cost_cap_cents is only supported for unscheduled goals");
+    }
+    if let Some(cap) = cost_cap_cents {
+        let default_cap = match duduclaw_gateway::goal_loop::GoalLoopConfig::cost_cap_default_from_home(home_dir) {
+            Ok(cap) => cap,
+            Err(e) => return tool_error(&e),
+        };
+        if actor.agent().is_some() && default_cap > 0 && cap > default_cap {
+            return tool_error("only an operator can raise the deployment goal cost ceiling");
+        }
+    }
     if kind == crate::mcp_alias::TaskKind::Discovery {
         if args.get("schedule").is_some_and(|value| !value.is_null()) {
             return tool_error("discovery cannot be scheduled through ordinary task workers");
@@ -313,6 +333,7 @@ pub(crate) async fn handle_tasks_create(
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             duration_hours: args.get("duration_hours").and_then(|v| v.as_f64()),
+            cost_cap_cents,
             risk_boundary: args
                 .get("risk_boundary")
                 .and_then(|v| v.as_str())
@@ -674,12 +695,33 @@ pub(crate) async fn handle_tasks_update(
              operator can change it, from the dashboard — not via this tool",
         );
     }
+    let cost_cap_cents = match duduclaw_gateway::goal_create_core::parse_cost_cap_cents(args) {
+        Ok(cap) => cap,
+        Err(e) => return tool_error(&e),
+    };
+    let employee_default_cap = if cost_cap_cents.is_some() && actor.agent().is_some() {
+        match duduclaw_gateway::goal_loop::GoalLoopConfig::cost_cap_default_from_home(home_dir) {
+            Ok(cap) => Some(cap),
+            Err(e) => return tool_error(&e),
+        }
+    } else {
+        None
+    };
+    if let Some(cap) = cost_cap_cents {
+        if !current.goal_mode {
+            return tool_error("cost_cap_cents is only supported for goals");
+        }
+        let old_cap = current.cost_cap_cents.unwrap_or(employee_default_cap.unwrap_or(0));
+        if actor.agent().is_some() && old_cap > 0 && cap > old_cap {
+            return tool_error("only an operator can raise a goal cost ceiling");
+        }
+    }
     if let Err(refusal) = check_task_update_by_employee(home_dir, actor, &current, args).await {
         return refusal;
     }
     // Build fields map — only pass through allowed fields
     let mut fields = serde_json::Map::new();
-    for k in ["title", "description", "priority", "tags"] {
+    for k in ["title", "description", "priority", "tags", "cost_cap_cents"] {
         if let Some(v) = args.get(k) {
             fields.insert(k.into(), v.clone());
         }
@@ -738,7 +780,10 @@ pub(crate) async fn handle_tasks_update(
         return tool_error("no fields to update");
     }
     super::workflow_operation::effect_start();
-    let updated = match store.update_task(task_id, &Value::Object(fields)).await {
+    let updated = match store
+        .update_task_with_cost_policy(task_id, &Value::Object(fields), employee_default_cap)
+        .await
+    {
         Ok(Some(r)) => r,
         Ok(None) => return tool_error(&format!("task not found: {task_id}")),
         Err(e) => return tool_error(&format!("update task: {e}")),
@@ -748,15 +793,13 @@ pub(crate) async fn handle_tasks_update(
         let expected = task_row_to_json(&updated);
         let observed = task_row_to_json(&readback);
         if expected == observed {
-            super::workflow_operation::effect_committed(
-                serde_json::json!({
-                    "adapter": "tasks_update",
-                    "adapter_version": 1,
-                    "task_id": task_id,
-                    "row": observed,
-                    "row_hash": duduclaw_gateway::approval::payload_hash(&expected)
-                }),
-            );
+            super::workflow_operation::effect_committed(serde_json::json!({
+                "adapter": "tasks_update",
+                "adapter_version": 1,
+                "task_id": task_id,
+                "row": observed,
+                "row_hash": duduclaw_gateway::approval::payload_hash(&expected)
+            }));
         }
     }
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
@@ -1094,10 +1137,14 @@ async fn resolve_parent_inner(
         Ok(None) => return Err(tool_error("tasks_create 遭拒：找不到指定的上層任務。")),
         Err(e) => return Err(tool_error(&format!("open parent task: {e}"))),
     };
-    let related = [Some(&parent.assigned_to), parent.claimed_by.as_ref(), Some(&parent.created_by)]
-        .into_iter()
-        .flatten()
-        .any(|who| who.trim() == caller);
+    let related = [
+        Some(&parent.assigned_to),
+        parent.claimed_by.as_ref(),
+        Some(&parent.created_by),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|who| who.trim() == caller);
     if !related {
         check_record_change_allowed(
             home_dir,
@@ -1110,4 +1157,92 @@ async fn resolve_parent_inner(
         .map_err(|reason| tool_error(&reason))?;
     }
     Ok(Some(parent_id))
+}
+
+#[cfg(test)]
+mod cost_cap_tests {
+    use super::*;
+
+    fn parsed(value: &Value) -> Value {
+        serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tasks_create_cost_cap_validates_and_persists() {
+        let home = tempfile::tempdir().unwrap();
+        let actor = RecordActor::Operator("bot");
+        for cap in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("100"),
+            Value::Null,
+            serde_json::json!(u64::MAX),
+        ] {
+            let out = handle_tasks_create(
+                &serde_json::json!({"title":"goal","kind":"goal","cost_cap_cents":cap}),
+                home.path(),
+                actor,
+            )
+            .await;
+            assert_eq!(out["isError"], true, "{out}");
+        }
+        let out = handle_tasks_create(
+            &serde_json::json!({"title":"goal","kind":"goal","cost_cap_cents":100}),
+            home.path(),
+            actor,
+        )
+        .await;
+        assert_eq!(parsed(&out)["task"]["cost_cap_cents"], 100);
+        let plain = handle_tasks_create(
+            &serde_json::json!({"title":"task","cost_cap_cents":100}),
+            home.path(),
+            actor,
+        )
+        .await;
+        assert_eq!(plain["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn tasks_create_cost_cap_employee_cannot_widen_or_ignore_bad_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[goal_loop]\ndefault_cost_cap_cents = 100").unwrap();
+        let args = serde_json::json!({"title":"goal","kind":"goal","cost_cap_cents":101});
+        let refused = handle_tasks_create(&args, home.path(), RecordActor::Agent("bot")).await;
+        assert_eq!(refused["isError"], true);
+        std::fs::write(home.path().join("config.toml"), "[goal_loop]\ndefault_cost_cap_cents = 'broken'").unwrap();
+        let refused = handle_tasks_create(&args, home.path(), RecordActor::Agent("bot")).await;
+        assert_eq!(refused["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn tasks_update_cost_cap_operator_raises_employee_only_narrows() {
+        let home = tempfile::tempdir().unwrap();
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        let mut task = duduclaw_gateway::task_store::TaskRow::new(
+            "capped".into(),
+            "goal".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "bot".into(),
+        );
+        task.goal_mode = true;
+        task.status = "needs_human".into();
+        task.cost_cap_cents = Some(100);
+        store.insert_task(&task).await.unwrap();
+        let args = serde_json::json!({"task_id":"capped","cost_cap_cents":200});
+        let denied = handle_tasks_update(&args, home.path(), RecordActor::Agent("bot")).await;
+        assert_eq!(denied["isError"], true);
+        let raised = handle_tasks_update(&args, home.path(), RecordActor::Operator("bot")).await;
+        assert_eq!(parsed(&raised)["task"]["cost_cap_cents"], 200);
+        assert_eq!(parsed(&raised)["task"]["status"], "needs_human");
+        let narrowed = handle_tasks_update(
+            &serde_json::json!({"task_id":"capped","cost_cap_cents":150}),
+            home.path(),
+            RecordActor::Agent("bot"),
+        )
+        .await;
+        assert_eq!(parsed(&narrowed)["task"]["cost_cap_cents"], 150);
+    }
 }

@@ -4,6 +4,9 @@ This page lists what can be set from the dashboard as of v1.68.0: which page, wh
 
 Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-JP/dashboard-settings.md)
 
+Goal cost and loop guards currently use the **Advanced config editor**, without dedicated Automation controls. In `config.toml [goal_loop]`, `default_cost_cap_cents = 0` sets the fallback goal ceiling in US cents (`0` = no cap), and `tool_streak_pause = 8` pauses after that many identical consecutive tool calls within one finished round (`0` = disabled). Saving in the Advanced config editor reloads the goal loop; direct edits to `config.toml` require a gateway restart. `tool_streak_advisory` independently controls the existing hints. Per-goal ceilings are set when assigning a goal; `/goals` shows spend and lets an authorized operator raise a paused goal's ceiling and retry.
+
+
 ## How saving works
 
 Enterprise setting (v1.76.0, User Management → Organisation settings): `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). Inform staff before enabling it. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).

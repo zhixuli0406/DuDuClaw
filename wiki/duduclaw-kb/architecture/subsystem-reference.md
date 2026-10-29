@@ -7,6 +7,13 @@
 > here. Release-by-release details: `release-implementation-notes.md` in this
 > directory.
 
+
+## Unreleased: goal cost caps and completed-round streak pauses (WP-B)
+
+`tasks.cost_cap_cents` is an additive nullable INTEGER; old rows retain no explicit cap. `[goal_loop] default_cost_cap_cents` defaults to 0 (uncapped). Each capped goal checks its bounded task-tree spend using `responsibility::cost::tree_spent` / `TelemetryCostSource` before dispatch. Known spend at or above the cap pauses as `budget_exhausted`; an unreadable source defers the round. Zero-token usage pauses as `blocked_needs_decision` with a visible zh-TW explanation: ordinary goals have no reservation fallback, so unknown cost is never zero or an invented estimate. Invalid default-cap configuration defers even uncapped goals and is exposed as a live, non-persisted `blocked_reason` notice on `/goals`. The board shows spent/cap and full pause detail; raising a cap saves through `tasks.update` before `tasks.goal_decide` retries it. Employee MCP writes may only narrow a ceiling.
+
+`tool_streak_pause` defaults to 8 (0 disables), independently of the advisory. The completed-round guard runs before both redispatch and acceptance, reads a bounded round window and seals a `no_progress` pause once. A task-specific iteration-read failure skips only that task in both the goal driver and acceptance engine; other goals continue. Running rounds and parallel child tasks can exceed a cap; the guard does not guarantee billing totals or measure unreported work. Verification in this worktree uses temporary homes and automated tests; a live gateway/runtime acceptance is not claimed.
+
 DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini (deprecated, removal scheduled for v1.75.0)** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, local LLM inference, and browser automation.
 
 ## Unreleased: CLI timeout and utility routing (2026-10-28)

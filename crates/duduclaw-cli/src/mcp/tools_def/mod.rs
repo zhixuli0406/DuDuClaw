@@ -112,6 +112,8 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub(crate) const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("tasks_create", "cost_cap_cents", "integer"),
+    ("tasks_update", "cost_cap_cents", "integer"),
     ("knowledge_search", "collections", "array"),
     ("knowledge_search", "limit", "integer"),
     ("knowledge_get_passage", "chunk_id", "integer"),
@@ -170,6 +172,12 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
         }
     }
 
+    if matches!(tool.name, "tasks_create" | "tasks_update") {
+        properties.insert("cost_cap_cents".into(), serde_json::json!({
+            "type": "integer", "minimum": 1, "maximum": i64::MAX,
+            "description": tool.params.iter().find(|p| p.name == "cost_cap_cents").map(|p| p.description).unwrap_or("")
+        }));
+    }
     if tool.name == "tasks_create" {
         properties.insert("kind".into(),serde_json::json!({"type":"string","enum":["task","goal","discovery"],"default":"task"}));
         properties.insert("discovery".into(),serde_json::json!({
@@ -218,6 +226,22 @@ mod registration_tests {
                 matches!(*ty, "integer" | "boolean" | "number" | "array"),
                 "{tool}.{param}: {ty}"
             );
+        }
+    }
+
+    #[test]
+    fn task_cost_cap_schemas_declare_positive_integer() {
+        for name in ["tasks_create", "tasks_update"] {
+            let schema = build_tool_schema(tools().find(|t| t.name == name).unwrap());
+            let cap = &schema["inputSchema"]["properties"]["cost_cap_cents"];
+            assert_eq!(cap["type"], "integer");
+            assert_eq!(cap["minimum"], 1);
+            assert_eq!(cap["maximum"], i64::MAX);
+            assert!(!schema["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == "cost_cap_cents"));
         }
     }
 

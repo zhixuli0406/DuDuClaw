@@ -2343,7 +2343,7 @@ mod tests {
 
         t.pause_reason = Some("budget_exhausted".into());
         let body = needs_human_body(&t, None, "telegram");
-        assert!(body.contains("類型：次數或時限用盡"), "{body}");
+        assert!(body.contains("類型：費用、次數或時限用盡"), "{body}");
         // The free text is still there — the class is triage, not a replacement.
         assert!(body.contains("卡住原因：goal-loop iteration cap"), "{body}");
         // Class above the detail, matching how a person reads the card.

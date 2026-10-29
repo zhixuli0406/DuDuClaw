@@ -140,6 +140,24 @@ impl GoalLoopDriver {
                         if first_capture {
                             self.capture_round_state(t).await;
                         }
+                        let streak_detail = match self.tool_streak_pause_detail(t).await {
+                            Ok(detail) => detail,
+                            Err(e) => {
+                                warn!(task = %t.id, error = %e, "goal loop: tool streak history unreadable — skipping this task");
+                                continue;
+                            }
+                        };
+                        if let Some(detail) = streak_detail {
+                            self.escalate(
+                                &mut inflight,
+                                t,
+                                &detail,
+                                crate::pause_reason::PauseReason::NoProgress,
+                            )
+                            .await?;
+                            escalated_this_tick.insert(id.clone());
+                            continue;
+                        }
                         self.push_progress(
                             t,
                             "review",
@@ -259,7 +277,8 @@ impl GoalLoopDriver {
             // that landed since the candidate scan skips the task now. Only the
             // stop tree and status are checked here (M-1): a paused, expired or
             // reassigned occurrence still meets the deadline guard below. ──
-            let _dispatch_guard = crate::responsibility::team_activity::DispatchGuard::register(&task.id);
+            let _dispatch_guard =
+                crate::responsibility::team_activity::DispatchGuard::register(&task.id);
             if let Err(reason) = self.store.fence_candidate(&task.id).await {
                 debug!(task = %task.id, %reason, "goal loop: candidate no longer dispatchable");
                 continue;
@@ -380,6 +399,27 @@ impl GoalLoopDriver {
                 }
             }
 
+            // A fast judge can return a completed round to revising before
+            // the driver observes review. Read its bounded ledger window too.
+            let streak_detail = match self.tool_streak_pause_detail(task).await {
+                Ok(detail) => detail,
+                Err(e) => {
+                    warn!(task = %task.id, error = %e, "goal loop: tool streak history unreadable — skipping this task");
+                    continue;
+                }
+            };
+            if let Some(detail) = streak_detail {
+                self.escalate(
+                    &mut inflight,
+                    task,
+                    &detail,
+                    crate::pause_reason::PauseReason::NoProgress,
+                )
+                .await?;
+                active = inflight.len();
+                continue;
+            }
+
             // ── D4 item 2: resolve the agent via the dispatch policy ──
             // Default (no policy) ⇒ `task` unchanged (dispatch to `assigned_to`).
             // A policy may re-route to another roster member; the reassignment is
@@ -491,6 +531,45 @@ impl GoalLoopDriver {
                 continue;
             }
 
+            match self.goal_cost(task).await {
+                durable::OccurrenceCost::Within => {}
+                durable::OccurrenceCost::Unavailable => continue,
+                durable::OccurrenceCost::NeedsDecision(detail) => {
+                    self.escalate(
+                        &mut inflight,
+                        task,
+                        &detail,
+                        crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                    )
+                    .await?;
+                    active = inflight.len();
+                    continue;
+                }
+                durable::OccurrenceCost::Exceeded { spent, cap } => {
+                    let detail = format!("目標已花費 {spent} 美分，達到費用上限 {cap} 美分，已暫停。提高上限後可繼續。");
+                    self.escalate(
+                        &mut inflight,
+                        task,
+                        &detail,
+                        crate::pause_reason::PauseReason::BudgetExhausted,
+                    )
+                    .await?;
+                    active = inflight.len();
+                    continue;
+                }
+                durable::OccurrenceCost::AgentBudget(message) => {
+                    self.escalate(
+                        &mut inflight,
+                        task,
+                        &message,
+                        crate::pause_reason::PauseReason::BudgetExhausted,
+                    )
+                    .await?;
+                    active = inflight.len();
+                    continue;
+                }
+            }
+
             // ── A1: build this round's structured `<state>` block ──
             // Computed once per candidate per tick (before any escalation
             // decision) and reused both for the A2 loop-detection checks
@@ -600,6 +679,17 @@ impl GoalLoopDriver {
                 match self.occurrence_cost(task, info).await {
                     durable::OccurrenceCost::Within => {}
                     durable::OccurrenceCost::Unavailable => continue,
+                    durable::OccurrenceCost::NeedsDecision(detail) => {
+                        self.escalate(
+                            &mut inflight,
+                            task,
+                            &detail,
+                            crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                        )
+                        .await?;
+                        active = inflight.len();
+                        continue;
+                    }
                     durable::OccurrenceCost::AgentBudget(message) => {
                         self.post_activity(
                             crate::responsibility::activity::OCCURRENCE_COST_CAP,

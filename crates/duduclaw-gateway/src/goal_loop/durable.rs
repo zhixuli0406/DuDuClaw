@@ -38,6 +38,8 @@ pub(super) enum OccurrenceCost {
     },
     /// Cost could not be read: do not dispatch this tick (fail closed).
     Unavailable,
+    /// Spend happened but cannot be measured; a human must decide how to proceed.
+    NeedsDecision(String),
     /// H-2(c): the employee's own budget cap (`agent.toml [budget]`) is
     /// spent — the outermost limit, also for an occurrence round.
     AgentBudget(String),
@@ -66,6 +68,45 @@ impl GoalLoopDriver {
         self.cost_source
             .clone()
             .unwrap_or_else(|| Arc::new(TelemetryCostSource::new(&self.home_dir)))
+    }
+
+    /// Per-goal measured-spend cap. A missing telemetry database defers even
+    /// the first round; it must never masquerade as an empty cost ledger.
+    pub(super) async fn goal_cost(&self, task: &TaskRow) -> OccurrenceCost {
+        if self.has_real_home() {
+            if let Err(e) = GoalLoopConfig::cost_cap_default_from_home(&self.home_dir) {
+                warn!(task = %task.id, error = %e, "goal cost configuration unreadable — round deferred");
+                return OccurrenceCost::Unavailable;
+            }
+        }
+        let cap = task
+            .cost_cap_cents
+            .unwrap_or(self.config.default_cost_cap_cents);
+        if cap == 0 {
+            return OccurrenceCost::Within;
+        }
+        let cost = self.cost_source();
+        match crate::responsibility::cost::goal_tree_cost(&self.store, cost.as_ref(), &task.id)
+            .await
+        {
+            Ok(measured) if measured.cost >= 0 && measured.cost as u64 >= cap => {
+                OccurrenceCost::Exceeded {
+                    spent: measured.cost,
+                    cap: i64::try_from(cap).unwrap_or(i64::MAX),
+                }
+            }
+            // Ordinary goals have no reservation to charge as an estimate.
+            // Reuse the human-decision path instead of silently retrying an
+            // unmeasurable ledger forever or treating its unknown spend as zero.
+            Ok(measured) if measured.unmeasured > 0 => OccurrenceCost::NeedsDecision(
+                "此目標有回合無法量測花費（runtime 未回報），無法套用花費上限，請確認後再繼續。".into(),
+            ),
+            Ok(_) => OccurrenceCost::Within,
+            Err(e) => {
+                warn!(task = %task.id, error = %e, "goal cost unreadable — round deferred");
+                OccurrenceCost::Unavailable
+            }
+        }
     }
 
     /// Number of tracked in-flight goal tasks (test accessor).

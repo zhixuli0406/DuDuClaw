@@ -59,7 +59,8 @@ fn task_evidence(row: &crate::task_store::TaskRow) -> Value {
         "lease_renewed_at": row.lease_renewed_at, "goal_id": row.goal_id,
         "depends_on": crate::task_store::parse_depends_on(&row.depends_on),
         "retry_count": row.retry_count, "max_retries": row.max_retries,
-        "goal_mode": row.goal_mode, "acceptance_criteria": row.acceptance_criteria,
+        "goal_mode": row.goal_mode, "cost_cap_cents": row.cost_cap_cents,
+        "acceptance_criteria": row.acceptance_criteria,
         "acceptance_criteria_baseline": row.acceptance_criteria_baseline,
         "result_summary": crate::goal_loop::criteria_ledger::display_result_summary(
             row.criteria_ledger.as_deref(), row.result_summary.as_deref()),

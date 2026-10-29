@@ -192,11 +192,13 @@ async fn a_team_manager_schedule_fires_a_goal_on_their_behalf_once() {
     let (dir, reg) = home().await;
     let o = org(dir.path());
     let store = TaskStore::open(dir.path()).unwrap();
+    let mut req = weekly_goal("寫週報");
+    req.payload.cost_cap_cents = Some(125);
     let row = create(
         dir.path(),
         &store,
         &Creator::new(&o.mgr, false).unwrap(),
-        weekly_goal("寫週報"),
+        req,
         now(),
     )
     .await
@@ -223,6 +225,7 @@ async fn a_team_manager_schedule_fires_a_goal_on_their_behalf_once() {
     );
     assert_eq!(task.created_via.as_deref(), Some("dashboard"));
     assert!(task.goal_mode);
+    assert_eq!(task.cost_cap_cents, Some(125));
     let after = store.get_assign_schedule(&row.id).await.unwrap().unwrap();
     assert_eq!(
         after.next_fire_at.as_deref(),

@@ -308,6 +308,18 @@ impl TaskStore {
         id: &str,
         fields: &serde_json::Value,
     ) -> Result<Option<TaskRow>, String> {
+        self.update_task_with_cost_policy(id, fields, None).await
+    }
+
+    /// Employee writes can narrow a ceiling, checked under the same write lock.
+    /// `Some(default)` refuses widening the current explicit/default ceiling.
+    pub async fn update_task_with_cost_policy(
+        &self,
+        id: &str,
+        fields: &serde_json::Value,
+        employee_default_cap: Option<u64>,
+    ) -> Result<Option<TaskRow>, String> {
+        let cost_cap_cents = crate::goal_create_core::parse_cost_cap_cents(fields)?;
         // depends_on rewires the dependency graph — gate it fail-closed at the
         // store boundary: must be a JSON array of ids, no self-dependency, and
         // must not close a cycle (visited-set walk over the current edges).
@@ -382,6 +394,24 @@ impl TaskStore {
                     ));
                 }
             }
+            if cost_cap_cents.is_some() {
+                let (goal_mode, old_cap): (bool, Option<u64>) = tx
+                    .query_row(
+                        "SELECT goal_mode, cost_cap_cents FROM tasks WHERE id=?1",
+                        params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| format!("update task: goal check: {e}"))?;
+                if let Some(default_cap) = employee_default_cap {
+                    let ceiling = old_cap.unwrap_or(default_cap);
+                    if ceiling > 0 && cost_cap_cents.is_some_and(|cap| cap > ceiling) {
+                        return Err("only an operator can raise a goal cost ceiling".into());
+                    }
+                }
+                if !goal_mode {
+                    return Err("cost_cap_cents is only supported for goals".into());
+                }
+            }
             let now = Utc::now().to_rfc3339();
             let mut sets = vec!["updated_at = ?1".to_string()];
             let mut binds: Vec<String> = vec![now];
@@ -393,6 +423,10 @@ impl TaskStore {
                         sets.push(format!("{} = ?{}", $col, binds.len()));
                     }
                 };
+            }
+            if let Some(cap) = cost_cap_cents {
+                binds.push(cap.to_string());
+                sets.push(format!("cost_cap_cents = ?{}", binds.len()));
             }
             opt_field!("title", "title");
             opt_field!("description", "description");
@@ -642,6 +676,7 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         authority_revision: row.get(46)?,
         on_behalf_of: row.get(47)?,
         created_via: row.get(48)?,
+        cost_cap_cents: row.get(49)?,
     })
 }
 
@@ -652,6 +687,15 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
 /// P2-A C7: a task whose `parent_task_id` lies inside a stop request's tree is
 /// refused — an employee cannot open new sub-tasks under a stopped run.
 pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), String> {
+    if row
+        .cost_cap_cents
+        .is_some_and(|cap| cap == 0 || cap > i64::MAX as u64)
+    {
+        return Err("cost_cap_cents must be a positive integer <= 9223372036854775807".into());
+    }
+    if row.cost_cap_cents.is_some() && !row.goal_mode {
+        return Err("cost_cap_cents is only supported for goals".into());
+    }
     if row.kind == TaskKind::Discovery
         && (row.goal_mode || row.discovery_run_id.is_none() || row.discovery_spec_json.is_none())
     {
@@ -704,11 +748,11 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
              revision_round, diminishing, agent_seconds, source_discord_guild_id,
              deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
              plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision,
-             on_behalf_of, created_via)
+             on_behalf_of, created_via, cost_cap_cents)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                  ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46,
-                 ?47, ?48)",
+                 ?47, ?48, ?49)",
         params![
             row.id,
             row.title,
@@ -758,6 +802,7 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.authority_revision,
             row.on_behalf_of,
             row.created_via,
+            row.cost_cap_cents,
         ],
     )
     .map_err(|e| format!("insert task: {e}"))?;

@@ -97,6 +97,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 required: false,
             },
             ParamDef {
+                name: "cost_cap_cents",
+                description: "With kind='goal': positive integer measured task-tree spend ceiling in cents. Omit for the deployment default. Employees may only narrow that default.",
+                required: false,
+            },
+            ParamDef {
                 name: "duration_hours",
                 description: "With kind='goal': per-goal wall clock in hours (1-720). Omit for the deployment default.",
                 required: false,
@@ -181,6 +186,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 name: "task_id",
                 description: "Task ID",
                 required: true,
+            },
+            ParamDef {
+                name: "cost_cap_cents",
+                description: "Positive integer goal cost ceiling in cents. Operators may raise it before resuming a paused goal; employees may only narrow the current ceiling.",
+                required: false,
             },
             ParamDef {
                 name: "title",

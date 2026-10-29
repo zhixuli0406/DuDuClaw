@@ -362,6 +362,16 @@ async fn an_occurrence_cannot_be_reassigned_or_have_its_control_fields_changed()
             .is_ok()
     );
     assert_eq!(task(&env, &occ).await.assigned_to, OWNER);
+    // The independent goal guard does not edit the responsibility contract.
+    for cap in [100, 200] {
+        let updated = env
+            .store
+            .update_task(&occ, &serde_json::json!({ "cost_cap_cents": cap }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.cost_cap_cents, Some(cap));
+    }
 }
 
 // ── E-H2 / E-H3: stop reconciliation sees every running path ────────────

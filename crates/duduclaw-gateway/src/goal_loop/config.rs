@@ -148,6 +148,12 @@ pub struct GoalLoopConfig {
     /// unlike most goal-loop gates the safe default is ON, not off. Set
     /// `false` in `config.toml [goal_loop]` to silence it entirely.
     pub tool_streak_advisory: bool,
+    /// Default measured-spend ceiling in cents when a goal has no explicit cap.
+    /// Zero leaves uncapped goals unchanged.
+    pub default_cost_cap_cents: u64,
+    /// Pause after a completed round repeats the same tool and arguments this
+    /// many consecutive times. Zero disables pausing, independently of hints.
+    pub tool_streak_pause: u32,
 }
 
 impl Default for GoalLoopConfig {
@@ -176,11 +182,37 @@ impl Default for GoalLoopConfig {
             resume_on_restart: "pause".to_string(),
             // H10: on by default — advisory-only, never behavior-changing.
             tool_streak_advisory: true,
+            default_cost_cap_cents: 0,
+            tool_streak_pause: 8,
         }
     }
 }
 
 impl GoalLoopConfig {
+    /// Read the budget guard independently so malformed settings cannot remove a ceiling.
+    pub fn cost_cap_default_from_home(home_dir: &Path) -> Result<u64, String> {
+        let content = match std::fs::read_to_string(home_dir.join("config.toml")) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(format!("read goal cost ceiling: {e}")),
+        };
+        let table = content
+            .parse::<toml::Table>()
+            .map_err(|_| "could not parse goal cost ceiling configuration".to_string())?;
+        let Some(section) = table.get("goal_loop") else {
+            return Ok(0);
+        };
+        let section = section.as_table().ok_or("goal_loop must be a table")?;
+        match section.get("default_cost_cap_cents") {
+            None => Ok(0),
+            Some(value) => value
+                .as_integer()
+                .filter(|cap| *cap >= 0)
+                .map(|cap| cap as u64)
+                .ok_or_else(|| "default_cost_cap_cents must be a nonnegative integer".into()),
+        }
+    }
+
     /// Load `[goal_loop]` from `<home>/config.toml`. The section is parsed in
     /// isolation (from a generic `toml::Table`), so unrelated config sections
     /// can never make this fail — absent / malformed ⇒ defaults.
@@ -192,13 +224,31 @@ impl GoalLoopConfig {
         let Ok(table) = content.parse::<toml::Table>() else {
             return Self::default();
         };
-        match table.get("goal_loop") {
-            Some(section) => section
-                .clone()
-                .try_into::<GoalLoopConfig>()
-                .unwrap_or_default(),
-            None => Self::default(),
+        let Some(section) = table.get("goal_loop") else {
+            return Self::default();
+        };
+        let mut base = section.clone();
+        if let Some(fields) = base.as_table_mut() {
+            fields.remove("default_cost_cap_cents");
+            fields.remove("tool_streak_pause");
         }
+        let mut config = base.try_into::<GoalLoopConfig>().unwrap_or_default();
+        // A malformed sibling must not discard a valid cost ceiling.
+        if let Some(cap) = section
+            .get("default_cost_cap_cents")
+            .and_then(toml::Value::as_integer)
+            .filter(|n| *n >= 0)
+        {
+            config.default_cost_cap_cents = cap as u64;
+        }
+        if let Some(threshold) = section
+            .get("tool_streak_pause")
+            .and_then(toml::Value::as_integer)
+            .and_then(|n| u32::try_from(n).ok())
+        {
+            config.tool_streak_pause = threshold;
+        }
+        config
     }
 
     /// H6: the parsed [`ResumeOnRestart`] policy. Unrecognized / empty /
@@ -516,4 +566,65 @@ pub(crate) fn no_progress_minutes(
     }
     let elapsed = (now - last_signal).num_minutes();
     (elapsed >= threshold_minutes).then_some(elapsed)
+}
+
+#[cfg(test)]
+mod cost_cap_config_tests {
+    use super::GoalLoopConfig;
+
+    #[test]
+    fn cost_cap_default_read_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            GoalLoopConfig::cost_cap_default_from_home(home.path()).unwrap(),
+            0
+        );
+        for content in [
+            "[goal_loop]\ndefault_cost_cap_cents = 100",
+            "[goal_loop]\ndefault_cost_cap_cents = 0",
+        ] {
+            std::fs::write(home.path().join("config.toml"), content).unwrap();
+            assert!(GoalLoopConfig::cost_cap_default_from_home(home.path()).is_ok());
+        }
+        for content in [
+            "[goal_loop]\ndefault_cost_cap_cents = -1",
+            "[goal_loop]\ndefault_cost_cap_cents = '100'",
+            "[goal_loop]\ndefault_cost_cap_cents = 1.5",
+            "goal_loop = true",
+            "[broken",
+        ] {
+            std::fs::write(home.path().join("config.toml"), content).unwrap();
+            assert!(
+                GoalLoopConfig::cost_cap_default_from_home(home.path()).is_err(),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_streak_setting_does_not_discard_other_limits() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[goal_loop]\niteration_cap = 1\ndefault_cost_cap_cents = 100\ntool_streak_pause = -1",
+        )
+        .unwrap();
+        let config = GoalLoopConfig::from_home(home.path());
+        assert_eq!(config.iteration_cap, 1);
+        assert_eq!(config.default_cost_cap_cents, 100);
+        assert_eq!(config.tool_streak_pause, 8);
+    }
+
+    #[test]
+    fn cost_config_errors_do_not_echo_settings_content() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "api_key = 'sensitive-sentinel\n",
+        )
+        .unwrap();
+        let error = GoalLoopConfig::cost_cap_default_from_home(home.path()).unwrap_err();
+        assert!(!error.contains("sensitive-sentinel"));
+        assert!(error.contains("could not parse"));
+    }
 }

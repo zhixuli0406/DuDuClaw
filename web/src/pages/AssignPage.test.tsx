@@ -328,6 +328,39 @@ describe('複雜任務 tab', () => {
     expect(mockWsClient.call.mock.calls.filter((c) => c[0] === 'tasks.create')).toHaveLength(0);
   });
 
+  it('sends a positive integer cost cap when assigning a goal', async () => {
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Sort the feedback');
+    await user.click(screen.getByRole('button', { name: /^More settings/ }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Cost cap (US cents)' }), '500');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ cost_cap_cents: 500 })));
+  });
+
+  it('preserves the cap on scheduled dashboard assignments', async () => {
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Sort the feedback');
+    await user.click(screen.getByRole('button', { name: /^More settings/ }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Cost cap (US cents)' }), '500');
+    await user.click(screen.getByRole('combobox', { name: en['assign.when.label'] }));
+    await user.click(await screen.findByRole('option', { name: en['assign.when.kind.hourly'] }));
+    await user.click(within(visiblePanel()).getByRole('button', { name: en['assign.when.submit'] }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ cost_cap_cents: 500, schedule: expect.objectContaining({ kind: 'hourly' }) })));
+  });
+
+  it('refuses fractional cost caps before creating a goal', async () => {
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Sort the feedback');
+    await user.click(screen.getByRole('button', { name: /^More settings/ }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Cost cap (US cents)' }), '2.5');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    expect(toastError).toHaveBeenCalledWith('Enter a positive whole number of US cents.');
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.goal_create')).toBe(false);
+  });
+
   it('carries the chosen output format into the acceptance criteria (no new backend field)', async () => {
     const user = userEvent.setup();
     openComplex();

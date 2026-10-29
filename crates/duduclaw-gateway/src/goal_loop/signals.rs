@@ -8,9 +8,9 @@
 //! verbatim as the section banner below it, and the old crate-root paths
 //! stay available as re-exports in `lib.rs` for one release.
 //!
-//! Nothing here performs I/O beyond the shared `tool_calls.jsonl` reader,
-//! and nothing here vetoes a dispatch — every output is either a hash to
-//! compare or an advisory string for the next round's `<state>` block.
+//! Signals use the shared `tool_calls.jsonl` reader and round ledger,
+//! and the driver decides how to act on each signal, including pausing a
+//! completed round whose repeated-call streak reaches its configured limit.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,7 +20,7 @@ use regex::Regex;
 use tokio::sync::Mutex;
 
 use crate::goal_loop::state::short_hash;
-use crate::tool_activity::{ToolActivityRecord, read_tool_activity_records};
+use crate::tool_activity::{read_tool_activity_records, ToolActivityRecord};
 
 // ══════════════════════════════════════════════════════════════════════
 // goal_gap_fingerprint ══════════════════════════════════════════════
@@ -423,11 +423,10 @@ fn tool_categories(home_dir: &Path, agent_id: &str, since: &str, until: &str) ->
 // This module looks INSIDE a single round's tool activity: an agent that
 // calls the exact same tool with the exact same (masked) arguments three,
 // five, eight times in a row within one round is stuck well before the
-// judge ever sees a result. Zero LLM cost, purely advisory — dsh's own
-// framing is "the decision stays with the model", so this only ever
-// injects a text hint into the NEXT dispatch round's `<state>` block
-// (`goal_state::StateBlock::tool_streak_hint`); it never blocks, retries,
-// or vetoes a dispatch.
+// judge ever sees a result. Zero LLM cost: the advisory text is injected
+// into the NEXT dispatch round's `<state>` block
+// (`goal_state::StateBlock::tool_streak_hint`). The driver also uses the
+// hit to pause after a completed round at `tool_streak_pause` (default 8).
 //
 // ## Signal source
 //
@@ -550,6 +549,74 @@ pub fn detect_tool_streak(
 ) -> Option<StreakHit> {
     let records = read_tool_activity_records(home_dir, agent_id, since, until);
     longest_streak(&records)
+}
+
+/// Completed-round guard shared by dispatch and acceptance, so a fast judge
+/// or a restarted driver cannot bypass the pause. A stamped pause belongs to
+/// an already reviewed human decision and must not fire again on retry.
+pub(crate) async fn tool_streak_pause_detail(
+    home_dir: &Path,
+    store: &crate::task_store::TaskStore,
+    task: &crate::task_store::TaskRow,
+    threshold: u32,
+) -> Result<Option<String>, String> {
+    if threshold == 0 || !task.goal_mode {
+        return Ok(None);
+    }
+    let iterations = store.list_iterations(&task.id).await?;
+    let latest = iterations.last();
+    if latest.is_some_and(|r| r.pause_reason.as_deref() == Some("no_progress")) {
+        return Ok(None);
+    }
+    let window = latest.and_then(|r| {
+        r.submitted_at
+            .as_deref()
+            .map(|end| (r.dispatched_at.as_str(), end))
+    });
+    let now = chrono::Utc::now().to_rfc3339();
+    let team_since = if window.is_none() && task.team_spec_json.is_some() {
+        crate::role_turns::round_started_at(
+            home_dir,
+            &task.id,
+            crate::prediction::task_observe::evidence_round_for_revision(task.revision_round),
+        )
+    } else {
+        None
+    };
+    let (since, until) = match window {
+        Some(window) => window,
+        None if task.status == "review" && task.team_spec_json.is_some() => {
+            let Some(since) = team_since.as_deref() else {
+                return Ok(None);
+            };
+            (since, now.as_str())
+        }
+        None if task.status == "review" => (
+            task.claimed_at.as_deref().unwrap_or(&task.created_at),
+            now.as_str(),
+        ),
+        None => return Ok(None),
+    };
+    let agent = task.claimed_by.as_deref().unwrap_or(&task.assigned_to);
+    let mut agents = vec![agent.to_string()];
+    if task.team_spec_json.is_some() {
+        agents.extend(crate::role_turns::member_ids_for_task_since(
+            home_dir, &task.id, since,
+        ));
+    }
+    // Each worker owns a sequence; interleaved team calls must not be combined
+    // into a streak no individual worker actually made.
+    let hit = agents
+        .iter()
+        .filter_map(|agent| detect_tool_streak(home_dir, agent, since, until))
+        .max_by_key(|hit| hit.len);
+    Ok(hit.filter(|h| h.len >= threshold).map(|h| {
+        format!(
+            "同一輪連續 {} 次呼叫工具「{}」且參數相同，已暫停目標，請確認後再繼續。",
+            h.len,
+            duduclaw_core::truncate_chars(&h.tool_name, 120)
+        )
+    }))
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -706,6 +773,6 @@ pub fn detect_bail_pattern(text: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests_text;
-#[cfg(test)]
 mod tests_activity;
+#[cfg(test)]
+mod tests_text;
