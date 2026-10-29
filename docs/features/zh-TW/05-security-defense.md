@@ -149,6 +149,10 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 **AI session 判斷。** 只要程序環境裡有 gateway 替員工程序設定的任何一個變數（即使是空值），指令本身就會拒絕執行：員工身分與 token、回合與對話 id、該回合的使用者訊息序號與時間、派工的 session 與 run id、委派的發送者／來源／深度、hop 深度、回覆通道、MCP API 金鑰、資料檔守門旗標、goal 回合的任務 id（唯一一份清單 `ai_session_guard::AI_SESSION_ENV_VARS`，2026-10-06 起所有會送出核准的操作者指令共用）。操作者自己的終端機不帶這些變數。這項檢查只是第一道。對直接從員工 Bash 執行的指令並不可靠，因為有 Bash 的員工可以把變數 unset。真正的隔離是不授予 Bash，或讓員工跑在任務沙箱裡。以同一個作業系統使用者執行、能跑任意指令並刻意繞過檔案守門的員工，仍然可以直接改寫本機資料庫（`approvals.db`、`memory.db`）。
 
+## 操作者的員工控制指令
+
+`duduclaw agent pause|resume|freeze|unfreeze <agent>` 只要偵測到共用 AI 工作階段清單中的任一變數（即使為空）就會拒絕執行。`agent-file-guard` 的 Bash 通道也會阻擋員工與未驗證身分呼叫這四個子指令（`BlockedOperatorCommand`），重用共用操作者指令比對器，涵蓋 `duduclaw`／`duduclaw-pro`、絕對路徑、`.exe`、`env`／`npx` 前綴、引號拼接與換行續行。管理者仍可在自己的終端機直接執行，這四個指令不需要儀表板核准。`pause`／`resume` 修改 `[agent] status`；`freeze`／`unfreeze` 修改演化與心跳。寫入使用與 `agent_update`、儀表板相同的共用鎖與保留格式的原子寫入流程，留下檔案版本及 `agent_file_changed` 稽核。成功執行另記 `agent_pause`、`agent_resume`、`agent_freeze` 或 `agent_unfreeze`，拒絕則記 `agent_cli_refused`。這仍是減速帶：清除環境變數、改名的執行檔或動態組合的指令可繞過檢查，非 Claude runtime 不跑 hook，有不受限 Bash 的員工仍能直接改檔。真正的隔離是不授予 Bash，或讓員工跑在任務沙箱裡。
+
 ## 指令列的操作者動作共用一道核准
 
 四個指令會從終端機改變狀態：`duduclaw channel-ingress`（LINE 收件匣）、`duduclaw responsibility`（持續任務）、`duduclaw memory forget-source apply`、`duduclaw computer-workspaces`。終端機證明不了是誰下的指令，所以這四個都只會在儀表板建立一筆請求，由目前仍是管理員（Admin）的帳號決定，指令之後只套用一次。v1.70.0 之後的版本起，四者共用一份實作（gateway crate 的 `approval/operator_cli_gate.rs`）和同一張種類表：只有在儀表板做的決定才算數，而且必須是同一筆請求、同一個狀態（LINE 批次除外）；請求等待期間對象狀態變了，等待中的卡片會撤回（`state_changed`）並另建一筆，不會原地改寫；核准用一個條件式更新消耗，搶輸的那次執行什麼都不做、也不另送請求；同一個動作與對象最多 3 筆不同內容的請求在等，同一種類最多 20 筆；每個對象每小時最多推播 2 次（忘記記憶的請求以 AI 員工計）。`approvals.decide` 用同一個檢查擋掉非管理員的決定。四個指令也共用同一份 AI 員工工作階段環境變數清單（CLI crate 的 `ai_session_guard.rs`）。限制不變：Bash 權限不受限的員工仍能直接改本機資料庫。
