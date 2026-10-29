@@ -124,7 +124,7 @@ openssl-sys = { version = "0.9", optional = true }
 # promoted to a normal cross-platform dependency so `artifact_gate.rs` can
 # validate on macOS/Linux too — same crate/version/features, just no longer
 # target-gated.
-zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 # OpenTelemetry GenAI tracing + OTLP export (feature "otel", default OFF —
 # zero deps / zero overhead when disabled; spans are plain `tracing` either
