@@ -1330,6 +1330,8 @@ mod cost_cap_tests {
     #[tokio::test]
     async fn tasks_update_cost_cap_operator_raises_employee_only_narrows() {
         let home = tempfile::tempdir().unwrap();
+        // Employee writes are admitted only for a readable, active profile.
+        super::super::tests::create_test_agent(&home.path().join("agents"), "bot", "");
         let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
         let mut task = duduclaw_gateway::task_store::TaskRow::new(
             "capped".into(),
