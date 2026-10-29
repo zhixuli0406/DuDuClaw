@@ -55,8 +55,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -108,6 +108,122 @@ pub struct ThirdPartyGate {
     lane: ProcessLane,
     /// Annotations from the latest listing, by tool name.
     annotations: Mutex<HashMap<String, ToolAnnotations>>,
+    pending_reads: Arc<Mutex<HashMap<String, PendingRead>>>,
+}
+
+const MAX_PENDING_READS: usize = 512;
+const PENDING_READ_TTL: Duration = Duration::from_secs(300);
+const BRIDGE_WIRE_NAMESPACE: &str = "duduclaw-egress";
+
+fn bridge_wire_id(generation: &str) -> Value {
+    Value::String(format!("{BRIDGE_WIRE_NAMESPACE}:{generation}"))
+}
+
+fn bridge_wire_generation(id: &Value) -> Option<&str> {
+    let (namespace, generation) = id.as_str()?.split_once(':')?;
+    (namespace == BRIDGE_WIRE_NAMESPACE).then_some(generation)
+}
+
+/// Keep the wire namespace disjoint from caller-chosen IDs, including requests
+/// such as initialize/list/ping whose IDs are otherwise forwarded unchanged.
+pub(crate) fn bridge_reserved_id(id: &Value) -> bool {
+    bridge_wire_generation(id).is_some()
+}
+
+struct PendingRead {
+    generation: String,
+    deadline: Instant,
+    read: Option<crate::egress_client::PrivateRead>,
+    source: String,
+    done: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Owns one correlation slot. Cancellation/timeout removes it without releasing
+/// gateway taint: an uncertain upstream call may still produce private data.
+pub struct PendingCall {
+    pending: Arc<Mutex<HashMap<String, PendingRead>>>,
+    key: String,
+    generation: String,
+    deadline: Instant,
+    done: Option<tokio::sync::oneshot::Receiver<()>>,
+    sink: Option<Arc<crate::egress_client::SinkLease>>,
+    live: Arc<std::sync::atomic::AtomicBool>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+/// A queued write must not dispatch after its owning call timed out/cancelled.
+#[derive(Clone)]
+pub struct DispatchPermit {
+    // Retain the lease through the actual queued write/flush.
+    _sink: Option<Arc<crate::egress_client::SinkLease>>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    live: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Instant,
+}
+
+impl DispatchPermit {
+    /// The transport calls this before any bytes may leave the process.
+    pub fn dispatched(&self) {
+        if let Some(sink) = &self._sink { sink.dispatched(); }
+    }
+
+    /// End an in-progress pipe write when the call is cancelled or expires.
+    pub async fn cancelled(&mut self) {
+        let _ = tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), async {
+            loop {
+                let live = *self.cancel.borrow_and_update();
+                if !live || self.cancel.changed().await.is_err() { break; }
+            }
+        }).await;
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < self.deadline
+    }
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        self.live.store(false, std::sync::atomic::Ordering::Release);
+        self.cancel.send_replace(false);
+        if let Ok(mut pending) = self.pending.lock() {
+            if pending.get(&self.key).is_some_and(|p| p.generation == self.generation) {
+                pending.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl PendingCall {
+    /// The bridge must send this generation-specific ID, never the caller's
+    /// reusable JSON-RPC ID, including when an answer arrives on the GET stream.
+    pub(crate) fn bridge_wire_id(&self) -> Value {
+        bridge_wire_id(&self.generation)
+    }
+
+    pub fn dispatch_permit(&self) -> DispatchPermit {
+        DispatchPermit { live: self.live.clone(), deadline: self.deadline, _sink: self.sink.clone(), cancel: self.cancel.subscribe() }
+    }
+
+    pub async fn wait(mut self) {
+        if let Some(done) = self.done.take() {
+            if matches!(tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), done).await, Ok(Ok(()))) {
+                if let Some(sink) = &self.sink { sink.terminal_response(); }
+            }
+        }
+    }
+
+    /// Pre-dispatch failure cleanup. Never attests upstream cancellation.
+    pub async fn finish_empty(&self) {
+        let entry = self.pending.lock().ok().and_then(|mut pending| {
+            if pending.get(&self.key).is_some_and(|p| p.generation == self.generation) {
+                pending.remove(&self.key)
+            } else { None }
+        });
+        if let Some(entry) = entry {
+            if let Some(read) = entry.read { let _ = read.finish(false).await; }
+        }
+    }
 }
 
 impl ThirdPartyGate {
@@ -132,6 +248,7 @@ impl ThirdPartyGate {
             seen_by,
             lane,
             annotations: Mutex::new(HashMap::new()),
+            pending_reads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -239,6 +356,207 @@ impl ThirdPartyGate {
         })();
         if let Err(e) = result {
             warn!(server = %self.server, error = %e, "could not record the third-party tools snapshot");
+        }
+    }
+
+    /// Upstream EOF/write failure ends all correlations. Unknown completions
+    /// keep their gateway reservations tainted.
+    pub fn close_pending(&self) {
+        if let Ok(mut pending) = self.pending_reads.lock() { pending.clear(); }
+    }
+
+    fn claim_call(&self, id: &Value) -> Result<PendingCall, String> {
+        if !id.is_string() && !id.is_number() { return Err("Invalid in-flight request id".into()); }
+        let key = id.to_string();
+        if key.len() > 1024 { return Err("Request id is too long".into()); }
+        let mut pending = self.pending_reads.lock().map_err(|_| "Pending calls unavailable")?;
+        // Expired slots retain their gateway reservation, so a late payload
+        // cannot make a previously private turn clean.
+        pending.retain(|_, p| p.deadline > Instant::now());
+        if pending.contains_key(&key) { return Err("Duplicate in-flight request id".into()); }
+        if pending.len() >= MAX_PENDING_READS { return Err("Too many in-flight private reads".into()); }
+        let generation = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let deadline = Instant::now() + PENDING_READ_TTL;
+        pending.insert(key.clone(), PendingRead {
+            generation: generation.clone(), deadline,
+            read: None, source: "unclassified_external_tool".into(), done: tx,
+        });
+        let (cancel, _) = tokio::sync::watch::channel(true);
+        Ok(PendingCall { pending: self.pending_reads.clone(), key, generation, deadline, done: Some(rx), sink: None, live: Arc::new(std::sync::atomic::AtomicBool::new(true)), cancel })
+    }
+
+    /// Atomic gateway query-and-reserve precedes approval and upstream execution.
+    /// The snapshot excludes only this call's own reservation.
+    pub async fn begin_call(&self, id: &Value, tool: &str, args: &Value) -> Result<PendingCall, String> {
+        let mut call = self.claim_call(id)?;
+        let label = format!("{}.{tool}", self.server);
+        let source = duduclaw_core::truncate_bytes(&label, 256);
+        if let Ok(mut pending) = self.pending_reads.lock() {
+            if let Some(entry) = pending.get_mut(&call.key) { entry.source = source.into(); }
+        }
+        let taint = match crate::egress_client::reserve(&self.home, &self.agent_id, source).await {
+            Ok((read, taint)) => {
+                let mut pending = self.pending_reads.lock().map_err(|_| "Pending calls unavailable")?;
+                let entry = pending.get_mut(&call.key).filter(|p| p.generation == call.generation)
+                    .ok_or("Private read expired before dispatch")?;
+                entry.read = Some(read);
+                taint
+            }
+            Err(reason) => {
+                crate::egress_client::reservation_failure(&self.home, &self.agent_id, tool, &reason)?;
+                crate::egress_guard::Taint::unknown()
+            }
+        };
+        let approved = match self.check_call_with_taint(tool, args, taint).await {
+            Ok(approved) => approved,
+            Err(reason) => {
+                call.finish_empty().await;
+                return Err(reason);
+            }
+        };
+        if self.decide(tool).0 != ToolEffect::Read {
+            let own_read = self.pending_reads.lock().map_err(|_| "Pending calls unavailable")?
+                .get(&call.key).and_then(|entry| entry.read.as_ref().map(|read| read.id().to_string()));
+            match crate::egress_client::SinkLease::acquire_id(&self.home, &self.agent_id, own_read.as_deref()).await {
+                Ok((lease, taint)) => {
+                    call.sink = Some(Arc::new(lease));
+                    if let Err(reason) = crate::egress_gate::confirm_dispatch(&self.home, &self.agent_id, &label, true, taint, approved.as_ref()) {
+                        call.finish_empty().await;
+                        return Err(reason);
+                    }
+                }
+                Err(reason) => {
+                    if let Err(message) = crate::egress_client::reservation_failure(&self.home, &self.agent_id, tool, &reason) {
+                        call.finish_empty().await;
+                        return Err(message);
+                    }
+                    if let Err(message) = crate::egress_gate::confirm_dispatch(
+                        &self.home, &self.agent_id, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(),
+                    ) {
+                        call.finish_empty().await;
+                        return Err(message);
+                    }
+                }
+            }
+        }
+        if Instant::now() >= call.deadline {
+            call.finish_empty().await;
+            return Err("Private read expired before dispatch".into());
+        }
+        Ok(call)
+    }
+
+    pub async fn observe_response(&self, response: &mut Value) {
+        if response.get("method").is_some()
+            || (response.get("result").is_none() && response.get("error").is_none()) { return; }
+        let Some(id) = response.get("id").cloned() else { return; };
+        let entry = self.pending_reads.lock().ok().and_then(|mut p| p.remove(&id.to_string()));
+        self.finish_response(response, id, entry).await;
+    }
+
+    /// Remap cancellation to the currently admitted call. This only forwards a
+    /// request; it never attests that upstream cancellation has completed.
+    pub(crate) fn bridge_cancel_id(&self, id: &Value) -> Option<Value> {
+        self.pending_reads.lock().ok()?.get(&id.to_string())
+            .filter(|entry| entry.deadline > Instant::now())
+            .map(|entry| bridge_wire_id(&entry.generation))
+    }
+
+    /// Return false for stale bridge responses so they cannot be delivered as
+    /// the answer to a newer call. Lookup and removal share the same lock.
+    pub(crate) async fn observe_bridge_response(&self, response: &mut Value) -> bool {
+        if response.get("method").is_some()
+            || (response.get("result").is_none() && response.get("error").is_none()) { return true; }
+        let Some(generation) = response.get("id").and_then(bridge_wire_generation) else { return true; };
+        if uuid::Uuid::parse_str(generation).is_err() { return false; }
+        let entry = self.pending_reads.lock().ok().and_then(|mut pending| {
+            let key = pending.iter().find(|(_, entry)| entry.generation == generation
+                && entry.deadline > Instant::now()).map(|(key, _)| key.clone())?;
+            let entry = pending.remove(&key)?;
+            Some((key, entry))
+        });
+        let Some((key, entry)) = entry else { return false; };
+        let Ok(id) = serde_json::from_str::<Value>(&key) else { return false; };
+        response["id"] = id.clone();
+        self.finish_response(response, id, Some(entry)).await;
+        true
+    }
+
+    async fn finish_response(&self, response: &mut Value, id: Value, entry: Option<PendingRead>) {
+        if let Some(entry) = entry {
+            // Every correlated third-party response is model-visible, even
+            // isError, error.data, or a server-controlled error message.
+            let marked = if let Some(read) = entry.read {
+                read.finish(true).await
+            } else {
+                // Shadow may have admitted while the gateway was unreachable.
+                crate::egress_client::mark(&self.home, &self.agent_id, &entry.source).await
+            };
+            if let Err(reason) = marked {
+                if let Err(message) = crate::egress_client::reservation_failure(&self.home, &self.agent_id, "third_party_response", &reason) {
+                    *response = json!({"jsonrpc":"2.0", "id":id, "error": {
+                        "code": REFUSED_CODE, "message": message
+                    }});
+                }
+            }
+            let _ = entry.done.send(());
+        }
+    }
+
+    /// Checks the exact arguments that will leave the proxy after restoration.
+    pub async fn check_call_with_args(&self, tool: &str, args: &Value) -> Result<(), String> {
+        let (effect, decision) = self.decide(tool);
+        if matches!(decision, ThirdPartyDecision::Block(_)) {
+            return Err(self.check_call(tool).await.err()
+                .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
+        }
+        let label = format!("{}.{tool}", self.server);
+        let egress = crate::egress_gate::check(&self.home, &self.agent_id, &label, effect != ToolEffect::Read).await?;
+        if decision == ThirdPartyDecision::Ask || egress.is_some() {
+            self.ask_bound(tool, effect, args, egress).await
+        } else { Ok(()) }
+    }
+
+    pub(crate) async fn check_call_with_taint(
+        &self, tool: &str, args: &Value, taint: crate::egress_guard::Taint,
+    ) -> Result<Option<Value>, String> {
+        let (effect, decision) = self.decide(tool);
+        if matches!(decision, ThirdPartyDecision::Block(_)) {
+            return Err(self.check_call(tool).await.err()
+                .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
+        }
+        let label = format!("{}.{tool}", self.server);
+        let egress = crate::egress_gate::evaluate(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint)?;
+        if decision == ThirdPartyDecision::Ask || egress.is_some() {
+            self.ask_bound(tool, effect, args, egress.clone()).await?;
+        }
+        Ok(egress)
+    }
+
+    async fn ask_bound(&self, tool: &str, effect: ToolEffect, args: &Value, egress: Option<Value>) -> Result<(), String> {
+        use crate::approval::{ApprovalBroker, ApprovalStatus};
+        use crate::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY, verify_and_consume};
+        let label = format!("{}.{tool}", self.server);
+        let broker = ApprovalBroker::open(&self.home).map_err(|e| format!("Approval unavailable: {e}"))?;
+        let mut payload = duduclaw_core::with_host_task_id(json!({
+            "name": label, "tool": label, "server": self.server, "effect": effect.as_str(),
+            "third_party": true, "arguments": args,
+            "reason": if egress.is_some() { "egress_guard" } else { "action_rule" }
+        }), duduclaw_core::host_task_id().as_deref());
+        if let Some(reason) = egress { payload["egress_guard"] = reason; }
+        payload["action_rule_matches"] = json!(self.policy().rules.approval_matches_for_call(
+            &duduclaw_core::tool_effect::third_party_tool_ref(&self.server, tool), effect, args,
+        ));
+        let mut grant = ActionGrant::build(&self.agent_id, &label, &payload);
+        grant.effect = effect;
+        payload[ACTION_GRANT_KEY] = grant.to_json();
+        let summary = format!("工具「{label}」需要管理員確認完整內容與目的地（{}）。", payload["reason"].as_str().unwrap_or("action_rule"));
+        let id = broker.request(&self.agent_id, "mcp_call", &summary, payload, APPROVAL_TTL_SECONDS).await?;
+        match broker.await_decision(&id, APPROVAL_POLL).await {
+            Ok(ApprovalStatus::Approved) => verify_and_consume(&broker, &id, &grant).await
+                .map_err(|e| format!("Approval binding refused: {e:?}")),
+            _ => Err(format!("工具「{label}」未獲核准，已拒絕。")),
         }
     }
 
@@ -461,6 +779,141 @@ mod tests {
 
     fn names(v: &Value) -> Vec<&str> {
         v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn third_party_dispatch_permit_keeps_fence_after_local_termination() {
+        let home = home_with_rules("");
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='block'\n").unwrap();
+        for case in ["not_dispatched", "terminal", "timeout", "cancel", "partial_write", "eof"] {
+            let agent = format!("lease-{}", uuid::Uuid::new_v4());
+            let agent_dir = home.path().join("agents").join(&agent);
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::write(agent_dir.join("agent.toml"), "").unwrap();
+            let gate = ThirdPartyGate::new(home.path(), &agent, "crm", "proxy");
+            let turn = uuid::Uuid::new_v4().to_string();
+            crate::egress_guard::register_turn(&agent, &turn);
+            let mut call = gate.claim_call(&json!(case)).unwrap();
+            let (lease, _) = crate::egress_client::SinkLease::direct(home.path(), &agent, Some(&turn), None).unwrap();
+            call.sink = Some(Arc::new(lease));
+            let permit = call.dispatch_permit();
+            if case != "not_dispatched" { permit.dispatched(); }
+            match case {
+                "terminal" => {
+                    let mut reply = json!({"id":case,"error":{"code":-1,"message":"terminal"}});
+                    gate.observe_response(&mut reply).await;
+                    call.wait().await;
+                }
+                "timeout" => { call.deadline = Instant::now(); call.wait().await; }
+                "eof" => { gate.close_pending(); call.wait().await; }
+                "partial_write" => { call.finish_empty().await; drop(call); }
+                _ => drop(call),
+            }
+            drop(permit);
+            let refused = crate::egress_guard::reserve_turn(home.path(), &agent, Some(&turn), "memory_search", "next").is_err();
+            assert_eq!(refused, !matches!(case, "not_dispatched" | "terminal"), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn third_party_bridge_normal_response_ids_pass_through_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let gate = ThirdPartyGate::new(home.path(), "bot", "crm", "bridge");
+        for id in [json!(1), json!("initialize"), json!("duduclaw-egress"), json!("other:123"), json!("duduclaw-egress-other:123")] {
+            assert!(!bridge_reserved_id(&id));
+            let mut response = json!({"jsonrpc":"2.0","id":id,"result":{}});
+            let before = response.clone();
+            assert!(gate.observe_bridge_response(&mut response).await);
+            assert_eq!(response, before);
+        }
+        for id in [json!("duduclaw-egress:"), json!("duduclaw-egress:invalid"), bridge_wire_id(&uuid::Uuid::new_v4().to_string())] {
+            assert!(bridge_reserved_id(&id));
+            let mut response = json!({"id":id,"result":{}});
+            assert!(!gate.observe_bridge_response(&mut response).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn third_party_bridge_late_generation_cannot_finish_reused_id_sink() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = format!("bridge-{}", uuid::Uuid::new_v4());
+        let dir = home.path().join("agents").join(&agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='block'\n").unwrap();
+        let gate = ThirdPartyGate::new(home.path(), &agent, "crm", "bridge");
+        let id = json!("reused");
+        let old = gate.claim_call(&id).unwrap();
+        let old_wire = old.bridge_wire_id();
+        gate.pending_reads.lock().unwrap().get_mut(&id.to_string()).unwrap().deadline = Instant::now();
+        let mut current = gate.claim_call(&id).unwrap();
+        let current_wire = current.bridge_wire_id();
+        assert_ne!(old_wire, current_wire);
+        drop(old);
+        assert_eq!(gate.bridge_cancel_id(&id), Some(current_wire.clone()));
+        let turn = uuid::Uuid::new_v4().to_string();
+        crate::egress_guard::register_turn(&agent, &turn);
+        let (lease, _) = crate::egress_client::SinkLease::direct(home.path(), &agent, Some(&turn), None).unwrap();
+        current.sink = Some(Arc::new(lease));
+        current.dispatch_permit().dispatched();
+
+        let mut late = json!({"id":old_wire,"result":{"content":[]}});
+        assert!(!gate.observe_bridge_response(&mut late).await);
+        // A server replying with the reusable caller ID cannot bypass the
+        // generation correlation either.
+        let mut wrong_id = json!({"id":id,"result":{}});
+        assert!(gate.observe_bridge_response(&mut wrong_id).await);
+        assert!(matches!(current.done.as_mut().unwrap().try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert_eq!(gate.pending_reads.lock().unwrap().len(), 1);
+        assert!(crate::egress_guard::reserve_turn(home.path(), &agent, Some(&turn), "memory_search", "next").is_err());
+
+        let mut terminal = json!({"id":current_wire,"error":{"code":-1,"message":"done"}});
+        assert!(gate.observe_bridge_response(&mut terminal).await);
+        assert_eq!(terminal["id"], id);
+        current.wait().await;
+        assert!(crate::egress_guard::reserve_turn(home.path(), &agent, Some(&turn), "memory_search", "next").is_ok());
+        assert!(!gate.observe_bridge_response(&mut late).await);
+        assert!(gate.bridge_cancel_id(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn third_party_pending_cap_duplicates_deadline_and_terminal_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let gate = ThirdPartyGate::new(home.path(), "bot", "crm", "proxy");
+        let mut calls = Vec::new();
+        for id in 0..MAX_PENDING_READS { calls.push(gate.claim_call(&json!(id)).unwrap()); }
+        assert!(gate.claim_call(&json!(0)).is_err());
+        assert!(gate.claim_call(&json!(MAX_PENDING_READS)).is_err());
+        drop(calls.pop());
+        let call = gate.claim_call(&json!("new")).unwrap();
+        let permit = call.dispatch_permit();
+        assert!(permit.is_live());
+        call.finish_empty().await; // Confirmed pre-dispatch terminal failure.
+        assert_eq!(gate.pending_reads.lock().unwrap().len(), MAX_PENDING_READS - 1);
+        drop(call);
+        assert!(!permit.is_live());
+        let mut permit = permit;
+        tokio::time::timeout(Duration::from_millis(100), permit.cancelled()).await.unwrap();
+        let mut expiring = calls[0].dispatch_permit();
+        expiring.deadline = Instant::now();
+        tokio::time::timeout(Duration::from_millis(100), expiring.cancelled()).await.unwrap();
+        drop(calls);
+        assert!(gate.pending_reads.lock().unwrap().is_empty());
+        let old = gate.claim_call(&json!("expired")).unwrap();
+        gate.pending_reads.lock().unwrap().get_mut(&json!("expired").to_string()).unwrap().deadline = Instant::now();
+        let replacement = gate.claim_call(&json!("expired")).unwrap();
+        drop(old);
+        assert_eq!(gate.pending_reads.lock().unwrap().len(), 1, "old guard cannot remove a replacement");
+        drop(replacement);
+        for mut response in [
+            json!({"id":1,"result":{"isError":true,"content":[{"text":"private"}]}}),
+            json!({"id":1,"error":{"code":-1,"data":{"private":42}}}),
+        ] {
+            let call = gate.claim_call(&json!(1)).unwrap();
+            gate.observe_response(&mut response).await;
+            assert!(gate.pending_reads.lock().unwrap().is_empty());
+            call.wait().await;
+        }
     }
 
     #[tokio::test]

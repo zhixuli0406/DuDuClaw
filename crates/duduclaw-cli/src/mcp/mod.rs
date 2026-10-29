@@ -169,6 +169,7 @@ mod bus_tasks;
 mod channels;
 mod codrive_mail;
 mod computer_use_client;
+pub(crate) mod egress_client;
 mod config_read;
 mod cost;
 mod cron_tasks;
@@ -345,3 +346,5 @@ mod round_parent_tests;
 // Task audience (U6) in `tasks_list` / `activity_list`.
 #[cfg(test)]
 mod task_audience_mcp_tests;
+
+pub(crate) mod egress_gate;

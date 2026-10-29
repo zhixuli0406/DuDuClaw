@@ -116,10 +116,17 @@ struct FakeOperation {
 impl OwnedScopedOperation for FakeOperation {
     async fn execute(self: Box<Self>) -> Result<OwnedScopedReply, OwnedScopedFailure> {
         self.count.fetch_add(1, Ordering::SeqCst);
+        if !self.discover && self.args.get("hold_operation") == Some(&json!(true)) {
+            std::future::pending::<()>().await;
+        }
+        if !self.discover && self.args.get("fail_operation") == Some(&json!(true)) {
+            return Err(OwnedScopedFailure::Unconfirmed);
+        }
         // Only the paused-clock fixture opts in; default operations never yield here.
         if !self.clock_step.is_zero() {
             tokio::time::advance(self.clock_step).await;
         }
+        let is_error = self.args.get("isError") == Some(&json!(true));
         let reply = if self.discover || self.wrong {
             OwnedScopedReply::Discover(vec![McpToolDef {
                 name: "closed_tool".into(),
@@ -131,7 +138,7 @@ impl OwnedScopedOperation for FakeOperation {
                 arguments: self.args,
                 result: ToolCallResult {
                     content: self.body,
-                    is_error: false,
+                    is_error,
                 },
                 notice: Some("private-owner-notice".into()),
             }
@@ -949,5 +956,67 @@ async fn r2_discovery_registry_construction_rechecks_after_the_actual_route_buil
         }
         assert_eq!(guard.generic.load(Ordering::SeqCst), 0);
         drop(hook);
+    }
+}
+
+#[tokio::test]
+async fn additive_boundary_keeps_closed_authority_and_refuses_before_execute() {
+    let guard = Arc::new(FakeClosedGuard::new(false));
+    let mut registry = closed_registry(guard.clone(), Duration::from_secs(1)).await.unwrap();
+    let boundary = Arc::new(super::boundary_tests::Probe::default());
+    registry.register_client_boundary(0, boundary.clone()).unwrap();
+    assert!(!registry.call("closed_tool", json!({"x":1})).await.unwrap().is_error);
+    assert_eq!(*boundary.args.lock().unwrap(), json!({"x":1}));
+    assert_eq!(boundary.after.load(Ordering::SeqCst), 1);
+    assert_eq!(boundary.released.load(Ordering::SeqCst), 1);
+    let executed = guard.executed.load(Ordering::SeqCst);
+    boundary.deny.store(true, Ordering::SeqCst);
+    assert!(registry.call("closed_tool", json!({"x":2})).await.unwrap().is_error);
+    assert_eq!(guard.executed.load(Ordering::SeqCst), executed);
+    assert_eq!(guard.generic.load(Ordering::SeqCst), 0);
+    assert_eq!(boundary.after.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn egress_closed_error_payload_calls_completion_boundary() {
+    let guard = Arc::new(FakeClosedGuard::new(false));
+    let mut registry = closed_registry(guard, Duration::from_secs(1)).await.unwrap();
+    let boundary = Arc::new(super::boundary_tests::Probe::default());
+    registry.register_client_boundary(0, boundary.clone()).unwrap();
+    let result = registry.call("closed_tool", json!({"isError":true})).await.unwrap();
+    assert!(result.is_error);
+    assert!(result.content.contains("private-owned-result"));
+    assert_eq!(boundary.after.load(Ordering::SeqCst), 1);
+    assert_eq!(boundary.released.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn egress_closed_boundary_lease_retains_on_failure_timeout_and_cancel() {
+    for case in ["failure", "timeout", "cancel"] {
+        let guard = Arc::new(FakeClosedGuard::new(false));
+        let timeout = if case == "timeout" { Duration::from_millis(20) } else { Duration::from_secs(5) };
+        let mut registry = closed_registry(guard.clone(), timeout).await.unwrap();
+        let boundary = Arc::new(super::boundary_tests::Probe::default());
+        registry.register_client_boundary(0, boundary.clone()).unwrap();
+        if case == "cancel" {
+            let registry = Arc::new(registry);
+            let task_registry = registry.clone();
+            let task = tokio::spawn(async move {
+                task_registry.call("closed_tool", json!({"hold_operation":true})).await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while guard.executed.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert_eq!(boundary.released.load(Ordering::SeqCst), 0, "lease held during execution");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            let args = if case == "failure" { json!({"fail_operation":true}) } else { json!({"hold_operation":true}) };
+            assert!(registry.call("closed_tool", args).await.unwrap().is_error);
+        }
+        assert_eq!(boundary.released.load(Ordering::SeqCst), 0, "{case}");
+        assert_eq!(boundary.after.load(Ordering::SeqCst), 0, "uncertain reads retain their reservation");
     }
 }

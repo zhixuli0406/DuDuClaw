@@ -147,6 +147,27 @@ pub(super) fn approval_required(home: &Path, agent_id: &str, tool: &str) -> bool
         || action_rule_verdict(&dir, tool).is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask)
 }
 
+/// Route callers share the gateway ledger, including calls that bypass MCP.
+pub(super) fn egress_check(home: &Path, agent: &str, tool: &str, turn: Option<&str>) -> Result<Option<serde_json::Value>, OpError> {
+    use duduclaw_core::egress_guard::{effective_mode_checked, Mode};
+    if !matches!(tool, TOOL_NAVIGATE | TOOL_TYPE) { return Ok(None); }
+    let mode = effective_mode_checked(home, Some(&agent_dir(home, agent))).map_err(forbidden)?;
+    if mode == Mode::Off { return Ok(None); }
+    let taint = crate::egress_guard::query_turn(agent, turn);
+    if !taint.tainted { return Ok(None); }
+    match mode {
+        Mode::Off => Ok(None),
+        Mode::Shadow => {
+            duduclaw_security::audit::append_tool_call_with_extras(home, agent, tool,
+                "egress_guard: would ask before sending private data", true,
+                &[("egress_guard", json!("would_ask")), ("sources", json!(taint.sources))]);
+            Ok(None)
+        }
+        Mode::Ask => Ok(Some(json!({"reason": "egress_guard", "sources": taint.sources}))),
+        Mode::Block => Err(forbidden(format!("外送防護已阻擋工具「{tool}」：本回合已讀取私人資料（來源：{}）。", taint.sources.join("、")))),
+    }
+}
+
 fn approval_denied(message: String) -> OpError {
     OpError::new(ErrorCode::ApprovalDenied, message)
 }
@@ -220,6 +241,7 @@ pub(super) async fn obtain_approval(
     tool: &'static str,
     detail: &str,
     args: &serde_json::Value,
+    egress: Option<&serde_json::Value>,
     ttl_secs: i64,
     poll: Duration,
 ) -> Result<(), OpError> {
@@ -239,11 +261,21 @@ pub(super) async fn obtain_approval(
         "AI 員工 {agent_id} 要使用電腦操作工具「{tool}」{detail}；此工具列在審批清單中，需經管理員核可後才能執行。\n\n{}",
         grant.card_text()
     );
-    let payload = json!({
+    let mut payload = json!({
         "tool": tool,
         "via": "computer_use_route",
         ACTION_GRANT_KEY: grant.to_json(),
     });
+    let matches = duduclaw_core::agent_toml::load_action_rules(&agent_dir(home, agent_id))
+        .approval_matches_for_call(tool, duduclaw_core::effect_of(tool), args);
+    if !matches.is_empty() {
+        payload["action_rule_matches"] = json!(matches);
+        payload["reason"] = json!("action_rule");
+    }
+    if let Some(egress) = egress {
+        payload["egress_guard"] = egress.clone();
+        payload["arguments"] = args.clone();
+    }
     let id = match broker.request(agent_id, "mcp_call", &summary, payload, ttl_secs).await {
         Ok(id) => id,
         Err(e) => {
@@ -282,5 +314,33 @@ pub(super) async fn obtain_approval(
                 "等待審核決定時發生錯誤，工具「{tool}」的呼叫已拒絕。"
             )))
         }
+    }
+}
+
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    #[test]
+    fn route_egress_reads_the_gateway_ledger_and_strict_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let agent = "computer-egress-test";
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "").unwrap();
+        std::fs::write(home.join("config.toml"), "[security]\negress_guard='ask'").unwrap();
+        let metadata = egress_check(home, agent, TOOL_NAVIGATE, None).unwrap().unwrap();
+        assert_eq!(metadata["reason"], "egress_guard");
+        assert_eq!(metadata["sources"], json!(["turn_state_unavailable"]));
+        assert!(egress_check(home, agent, TOOL_CLICK, None).unwrap().is_none());
+        let turn = uuid::Uuid::new_v4().to_string();
+        crate::egress_guard::register_turn(agent, &turn);
+        assert!(egress_check(home, agent, TOOL_TYPE, Some(&turn)).unwrap().is_none());
+        std::fs::write(home.join("config.toml"), "[security]\negress_guard='block'").unwrap();
+        assert!(egress_check(home, agent, TOOL_TYPE, None).unwrap_err().message.contains("turn_state_unavailable"));
+        std::fs::write(home.join("config.toml"), "[security]\negress_guard='off'").unwrap();
+        assert!(egress_check(home, agent, TOOL_TYPE, None).unwrap().is_none());
     }
 }

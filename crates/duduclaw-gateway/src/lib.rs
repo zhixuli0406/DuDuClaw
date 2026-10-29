@@ -615,3 +615,11 @@ pub mod product_policy;
 /// Thinking display: the normalised `ThinkingEvent`, the per-turn sink and
 /// gate (masking, truncation, CONTRACT checks) and the display policy.
 pub mod thinking;
+
+pub mod egress_guard;
+
+pub mod egress_client;
+
+pub mod egress_gate;
+
+mod egress_registry;

@@ -1050,6 +1050,10 @@ impl GrokRuntime {
         for (k, v) in duduclaw_core::agent_identity_env_vars(home_dir, agent_id) {
             env.insert(k, toml::Value::String(v));
         }
+        env.insert(
+            duduclaw_core::egress_guard::ENV_TURN_ALIAS.into(),
+            toml::Value::String(format!("${{{}:-}}", duduclaw_core::ENV_TRUST_TURN_ID)),
+        );
         // Shared forward set (home/port/instance + MCP auth). Grok spawns MCP
         // children with ONLY this declared env block — omitting
         // DUDUCLAW_MCP_API_KEY here was the root cause of "grok 查 odoo 不行":

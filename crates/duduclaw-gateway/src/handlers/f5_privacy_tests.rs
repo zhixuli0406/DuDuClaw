@@ -6,6 +6,27 @@ use super::accounts_add_rpc::CredentialWriteGuard;
 use super::*;
 
 #[tokio::test]
+async fn egress_approval_unbound_manager_list_and_decide_require_admin() {
+    let f = fixture().await;
+    let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+    let id = broker.request("sales", "mcp_call", "outgoing data", json!({
+        "name":"send_message", "arguments":{"text":"private"}, "egress_guard":null
+    }), 300).await.unwrap();
+    let manager = payload(f.handler.handle_approvals_list(json!({"id":id.as_str()}), &f.alice).await);
+    let row = &manager["approvals"][0];
+    assert_eq!(row["may_decide"], false);
+    assert!(!row["payload"].to_string().contains("private"));
+    let args = json!({"id":id.as_str(),"approve":true});
+    assert!(!ok(&f.handler.handle_approvals_decide(args.clone(), &f.alice).await));
+    assert!(broker.decide(&id, true, "channel:manager").await.is_err());
+    assert!(broker.decide_egress_dashboard(&id, &f.alice, true).await.is_err());
+    let root = admin(&f);
+    let listed = payload(f.handler.handle_approvals_list(json!({"id":id.as_str()}), &root).await);
+    assert_eq!(listed["approvals"][0]["may_decide"], true);
+    assert!(ok(&f.handler.handle_approvals_decide(args, &root).await));
+}
+
+#[tokio::test]
 async fn writes_to_a_private_task_follow_the_goal_decide_bar() {
     let f = fixture().await;
     let h = &f.handler;

@@ -29,7 +29,7 @@ pub(crate) async fn handle_send_message(
     // B11: a message back into the conversation that came through an
     // employee's own bot / app goes out through that bot / app.
     let sender = duduclaw_gateway::claude_runner::reply_sender_for(channel, chat_id);
-    let result = match duduclaw_gateway::reminder_scheduler::send_channel_message_as(
+    let result = duduclaw_gateway::reminder_scheduler::send_channel_message_as(
         home_dir,
         http,
         channel,
@@ -37,15 +37,8 @@ pub(crate) async fn handle_send_message(
         text,
         sender.as_deref(),
     )
-    .await
-    {
-        Ok(()) => "Message sent successfully.".to_string(),
-        Err(e) => format!("Error: {e}"),
-    };
-
-    serde_json::json!({
-        "content": [{"type": "text", "text": result}]
-    })
+    .await.map(|()| "Message sent successfully.".to_string()).map_err(|e| e.to_string());
+    sink_result(result)
 }
 
 pub(crate) async fn handle_web_search(params: &Value, http: &reqwest::Client) -> Value {
@@ -74,14 +67,12 @@ pub(crate) async fn handle_web_search(params: &Value, http: &reqwest::Client) ->
 
     let result = match tokio::time::timeout(std::time::Duration::from_secs(10), search_future).await
     {
-        Ok(Ok(body)) => extract_search_results(&body),
-        Ok(Err(e)) => format!("Error performing search: {e}"),
-        Err(_) => "Error: web search timed out after 10 seconds".to_string(),
+        Ok(Ok(body)) => Ok(extract_search_results(&body)),
+        Ok(Err(e)) => Err(format!("Error performing search: {e}")),
+        Err(_) => Err("Error: web search timed out after 10 seconds".to_string()),
     };
 
-    serde_json::json!({
-        "content": [{"type": "text", "text": result}]
-    })
+    sink_result(result)
 }
 
 /// Extract text results from DuckDuckGo HTML response using `scraper` (CLI-M5).
@@ -157,7 +148,7 @@ pub(crate) async fn handle_send_media(
                 None => String::new(),
             };
             if token.is_empty() {
-                "Error: telegram_bot_token not configured".to_string()
+                Err("Error: telegram_bot_token not configured".to_string())
             } else {
                 let (method, key) = match media_type {
                     "photo" => ("sendPhoto", "photo"),
@@ -170,8 +161,8 @@ pub(crate) async fn handle_send_media(
                     .send()
                     .await
                 {
-                    Ok(r) => format!("{media_type} sent. Status: {}", r.status()),
-                    Err(e) => format!("Error: {e}"),
+                    Ok(r) => Ok(format!("{media_type} sent. Status: {}", r.status())),
+                    Err(e) => Err(format!("Error: {e}")),
                 }
             }
         }
@@ -181,7 +172,7 @@ pub(crate) async fn handle_send_media(
                 None => String::new(),
             };
             if token.is_empty() {
-                "Error: discord_bot_token not configured".to_string()
+                Err("Error: discord_bot_token not configured".to_string())
             } else {
                 let api_url = format!("https://discord.com/api/v10/channels/{chat_id}/messages");
                 match http
@@ -191,13 +182,20 @@ pub(crate) async fn handle_send_media(
                     .send()
                     .await
                 {
-                    Ok(r) => format!("{media_type} sent. Status: {}", r.status()),
-                    Err(e) => format!("Error: {e}"),
+                    Ok(r) => Ok(format!("{media_type} sent. Status: {}", r.status())),
+                    Err(e) => Err(format!("Error: {e}")),
                 }
             }
         }
-        _ => format!("Channel '{channel}' does not support {media_type} yet"),
+        _ => Err(format!("Channel '{channel}' does not support {media_type} yet")),
     };
 
-    serde_json::json!({ "content": [{"type": "text", "text": result}] })
+    sink_result(result)
+}
+
+// Preserve typed transport success; error text must never attest completion.
+fn sink_result(result: std::result::Result<String, String>) -> Value {
+    let failed = result.is_err();
+    let text = result.unwrap_or_else(|error| error);
+    serde_json::json!({"content":[{"type":"text","text":text}], "isError":failed})
 }

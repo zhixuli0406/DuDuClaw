@@ -58,6 +58,7 @@ const PROTECTED_KEYS: &[&str] = &[
     "memory.supersession_trust_guard",
     // 2026-10: turning the action review off removes a gate.
     "action_review.mode",
+    "security.egress_guard",
 ];
 
 /// Team role slots. The dashboard contract says `synthesizer`; the config
@@ -379,6 +380,14 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
             set_bool(table, section, key, v, out)?;
             out.applied_immediate = true;
         }
+    }
+    if let Some(v) = str_param(params, "security.egress_guard")? {
+        if duduclaw_core::egress_guard::Mode::parse(v).is_none() {
+            return Err("security.egress_guard must be one of: off, shadow, ask, block".into());
+        }
+        table_at_mut(table, &["security"])?.insert("egress_guard".into(), toml::Value::String(v.into()));
+        out.changes.push(format!("security.egress_guard = \"{v}\""));
+        out.applied_immediate = true;
     }
     // 2026-10: `[action_review] mode`, read on every tool call.
     if let Some(v) = str_param(params, "action_review.mode")? {

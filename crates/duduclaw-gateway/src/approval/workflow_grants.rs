@@ -67,7 +67,20 @@ impl GrantSpec {
         }
         Ok(())
     }
+    fn validate_standing_tools(&self) -> Result<(), String> {
+        for template in self.templates.values() {
+            if !crate::capability_grants::standing_grant_allowed(&template.tool) {
+                return Err(format!(
+                    "purchase/delete tool requires single-call approval: {}",
+                    template.tool
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_standing_tools()?;
         self.operator_context.validate()?;
         if self.schema_version != 1
             || self.workflow_revision < 1

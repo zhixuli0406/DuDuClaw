@@ -16,6 +16,7 @@
 | 設定 | `~/.duduclaw/config.toml`、`~/.duduclaw/inference.toml` |
 | 授權 | `~/.duduclaw/license.json` |
 | 任務 / 自動化 / 事件 | `~/.duduclaw/*.jsonl`、`events.db` |
+| 進行中的外送 lease（含 WAL／SHM） | `~/.duduclaw/egress_leases.db`、`egress_leases.db-wal`、`egress_leases.db-shm`、`egress_leases.lock` |
 
 ## 立即可用：手動搬移（tar）
 

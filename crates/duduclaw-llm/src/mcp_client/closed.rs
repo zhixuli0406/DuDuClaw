@@ -208,6 +208,13 @@ impl ToolRegistry {
         if tokio::time::Instant::now() >= deadline {
             return Ok(deny());
         }
+        let (reservation, boundary_lease) = if let Some(boundary) = self.client_boundaries.get(&idx) {
+            match tokio::time::timeout_at(deadline, boundary.begin_scoped_call(name, &args)).await {
+                Ok(Ok(admission)) => admission,
+                _ => return Ok(deny()),
+            }
+        } else { (None, None) };
+        if let Some(lease) = &boundary_lease { lease.dispatched(); }
         let reply = match tokio::time::timeout_at(deadline, operation.execute()).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(error)) => return Ok(failed(deadline, true, error)),
@@ -232,6 +239,16 @@ impl ToolRegistry {
         if arguments != args {
             return Ok(uncertain());
         }
+        if let Some(lease) = &boundary_lease { lease.terminal_response(); }
+        if let Some(boundary) = self.client_boundaries.get(&idx) {
+            match policy.wait(boundary.finish_call(name, reservation.as_deref(), true)).await {
+                Ok(Ok(())) => {}
+                _ => return Ok(uncertain()),
+            }
+        }
+        // Hold the sink lease until private-read completion is recorded. Every
+        // uncertain return, timeout or cancellation keeps the dispatched fence.
+        drop(boundary_lease);
         if let Some(interceptor) = self.client_interceptors.get(&idx) {
             let mut content = serde_json::from_str::<Value>(&result.content)
                 .unwrap_or_else(|_| Value::String(result.content.clone()));

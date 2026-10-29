@@ -1826,6 +1826,10 @@ pub struct CapabilitiesConfig {
     #[serde(default, skip_serializing_if = "crate::tool_effect::ActionRules::is_absent")]
     pub action_rules: crate::tool_effect::ActionRules,
 
+    /// Optional narrowing of the global egress guard; raw values survive round trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_guard: Option<toml::Value>,
+
     /// Third-party MCP servers (`.mcp.json` keys) whose `readOnlyHint`
     /// annotation is believed (2026-10-08). For any other server a tool that
     /// says it is read-only is still classed `modify`, because a server can
@@ -2111,6 +2115,7 @@ impl Default for CapabilitiesConfig {
             autonomy_level: None,
             auto_approve_install: None,
             action_rules: crate::tool_effect::ActionRules::default(),
+            egress_guard: None,
             trusted_read_hint_servers: Vec::new(),
         }
     }

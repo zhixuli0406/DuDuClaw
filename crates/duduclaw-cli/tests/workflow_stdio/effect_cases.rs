@@ -1,6 +1,72 @@
 use super::*;
 
 #[tokio::test]
+async fn workflow_egress_ask_preserves_full_card_and_executes_only_once() {
+    workflow_rule_card_executes_once("ask").await;
+}
+
+#[tokio::test]
+async fn workflow_action_rule_preserves_full_card_without_egress() {
+    workflow_rule_card_executes_once("off").await;
+}
+
+async fn workflow_rule_card_executes_once(mode: &str) {
+    let (home, key) = setup();
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    // Keep the internal MCP credential registered by setup().
+    std::fs::write(config_path, format!("{config}\n[security]\negress_guard='{mode}'\n")).unwrap();
+    let agent_path = home.path().join("agents/alice/agent.toml");
+    let agent_config = std::fs::read_to_string(&agent_path).unwrap();
+    std::fs::write(&agent_path, agent_config.replace(
+        "[capabilities]", "[capabilities]\naction_rules=[{tool='update_cron_task',verdict='ask'}]",
+    )).unwrap();
+    let gateway = if mode == "ask" {
+        Some(EgressGateway::start(home.path()).await)
+    } else {
+        None
+    };
+    let gateway_env: Vec<_> = gateway.as_ref().map(|gateway| {
+        ("DUDUCLAW_PORT".into(), gateway.port.to_string())
+    }).into_iter().collect();
+    // No turn identity: exercise the real signed routes' turnless sink rule
+    // while preserving the unknown-turn approval card asserted below.
+    let mut alice = session_with_env(home.path(), "alice", &key, &gateway_env).await;
+    let cron = duduclaw_gateway::cron_store::CronStore::open(home.path()).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    cron.insert(&duduclaw_gateway::cron_store::CronTaskRow::new(
+        id.clone(), "fixture".into(), "alice".into(), "0 0 * * *".into(), "before".into(),
+    )).await.unwrap();
+    register_staging(home.path(), "fixture_cron_ids", &id);
+    let args = json!({"id":id,"task":"完整外送內容".repeat(100)});
+    let call = json!({"name":"update_cron_task","arguments":args});
+    let (run, step) = seed(home.path(), &alice, "update_cron_task", &args).await;
+    let ctx = context(&alice, &run, &step, &args);
+    let prepared = alice.client.prepare_workflow_call(call.clone(), ctx).await.unwrap();
+    assert_eq!(prepared.effective.approval_requirements.iter().any(|r| r == "egress_guard"), mode == "ask");
+    let payload = prepared.effective.payload();
+    assert_eq!(prepared.effective.payload_hash, payload_hash(&payload));
+    assert_eq!(payload["arguments"], args);
+    assert_eq!(payload["action_rule_matches"], json!([{"tool":"update_cron_task","verdict":"ask"}]));
+    if mode == "ask" {
+        assert_eq!(payload["egress_guard"]["sources"], json!(["turn_state_unavailable"]));
+    } else {
+        assert!(payload.get("egress_guard").is_none());
+        assert_eq!(payload["reason"], "action_rule");
+    }
+    assert_eq!(payload["action_grant"]["args_digest"],
+        duduclaw_gateway::approval::action_grant::args_digest("alice", "update_cron_task", &args));
+    let ticket = authorized_ticket(home.path(), &alice, &prepared).await;
+    let reply = alice.client.execute_workflow_call(call.clone(), ticket.clone()).await.unwrap();
+    assert_eq!(reply.state, "succeeded");
+    assert_eq!(cron.get(&id).await.unwrap().unwrap().task, args["task"].as_str().unwrap());
+    assert!(alice.client.execute_workflow_call(call, ticket).await.is_err());
+    let requests: i64 = rusqlite::Connection::open(home.path().join("approvals.db")).unwrap()
+        .query_row("SELECT COUNT(*) FROM approvals", [], |row| row.get(0)).unwrap();
+    assert_eq!(requests, 1, "one bound request serves the egress gate and workflow");
+}
+
+#[tokio::test]
 async fn workflow_stdio_real_owner_write_receipt_forgery_replay_and_foreign_owner_denial() {
     let (home, key) = setup();
     let mut alice = session(home.path(), "alice", &key).await;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -131,5 +131,18 @@ describe('SecurityPage', () => {
     await user.click(toggle);
     expect(await screen.findByText('Kill Switch')).toBeInTheDocument();
     expect(screen.getByText('Security Audit Log')).toBeInTheDocument();
+  });
+});
+
+
+describe('Egress guard setting', () => {
+  it('defaults to shadow and writes only the chosen security setting', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\n', success: true });
+    renderWithProviders(<SecurityPage />);
+    const select = await screen.findByLabelText('Mode');
+    await waitFor(() => expect(select).toHaveValue('shadow'));
+    fireEvent.change(select, { target: { value: 'ask' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save outgoing data guard' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('system.update_config', { security: { egress_guard: 'ask' } }));
   });
 });

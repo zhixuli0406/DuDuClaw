@@ -18,6 +18,7 @@ means all of your state lives under one directory, `~/.duduclaw/`:
 | Configuration | `~/.duduclaw/config.toml`, `~/.duduclaw/inference.toml` |
 | License | `~/.duduclaw/license.json` |
 | Tasks / automation / events | `~/.duduclaw/*.jsonl`, `events.db` |
+| Active outgoing-call leases (including WAL/SHM) | `~/.duduclaw/egress_leases.db`, `egress_leases.db-wal`, `egress_leases.db-shm`, `egress_leases.lock` |
 
 ## Available today: manual migration with tar
 

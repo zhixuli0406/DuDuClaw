@@ -2849,6 +2849,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Some(_license_runtime.clone()),
         ),
     )));
+    // RouteState synchronously restores durable sink fences (or records a
+    // fail-closed store error) before the listener below can serve any request.
+    app = app.merge(crate::egress_guard::router(Arc::new(
+        crate::egress_guard::RouteState::new(home_dir.clone()),
+    )));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
     // tools: same loopback + signed-identity authentication as the

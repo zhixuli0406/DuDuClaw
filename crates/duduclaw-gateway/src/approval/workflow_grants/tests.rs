@@ -4,6 +4,69 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[tokio::test]
+async fn legacy_purchase_delete_workflow_grants_cannot_authorize_calls() {
+    let (_home, broker, store, accepted, run) = fixture().await;
+    let (_, _, binding) = operation(&broker, &store, &accepted, run).await;
+    for tool in ["odoo_sale_confirm", "shared_wiki_delete"] {
+        let mut spec = accepted.spec.clone();
+        spec.activation_id = uuid::Uuid::new_v4().to_string();
+        spec.templates.values_mut().next().unwrap().tool = tool.into();
+        spec.creator_grant.allowed_tools.insert(tool.into());
+        assert!(spec
+            .validate()
+            .unwrap_err()
+            .contains("single-call approval"));
+        let reference = GrantRef {
+            grant_id: uuid::Uuid::new_v4().to_string(),
+            epoch: 1,
+            spec_hash: spec.hash(),
+        };
+        // An existing on-disk grant remains stored; every authority read
+        // applies today's restriction without relying on a migration.
+        broker.store.conn.lock().await.execute(
+            "INSERT INTO workflow_revision_grants(grant_id,activation_id,workflow_id,workflow_revision,
+                revision_hash,skill_hash,fixtures_digest,activation_acceptance_id,grant_spec_json,grant_spec_hash,
+                actor_principal,audience_hash,authority_epoch,state,expires_at,created_at)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,'active',?13,?14)",
+            params![reference.grant_id, spec.activation_id, spec.workflow_id, spec.workflow_revision,
+                spec.revision_hash, spec.skill_hash, spec.fixtures_digest, accepted.acceptance_id,
+                serde_json::to_string(&spec).unwrap(), reference.spec_hash, spec.actor,
+                payload_hash(&json!(spec.audience)), spec.expires_at, Utc::now().to_rfc3339()],
+        ).unwrap();
+        assert!(broker
+            .inspect_revision_grant(&reference)
+            .await
+            .unwrap_err()
+            .contains("single-call approval"));
+        assert!(broker
+            .current_revision_grant(&spec.activation_id)
+            .await
+            .unwrap_err()
+            .contains("single-call approval"));
+        let payload = json!({"name": tool, "arguments": {"task_id": "owned", "status": "done"}});
+        let mut changed = binding.clone();
+        changed.payload_hash = payload_hash(&payload);
+        assert!(broker
+            .prepare_granted_operation(&reference, "update", &payload, &changed, None)
+            .await
+            .unwrap_err()
+            .contains("single-call approval"));
+        let count: i64 = broker
+            .store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_revision_grants WHERE grant_id=?1",
+                params![reference.grant_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[tokio::test]
 async fn broker_premint_revocation_survives_reopen_and_refuses_prepare() {
     let (home, broker, _store, accepted, _run) = fixture().await;
     assert!(

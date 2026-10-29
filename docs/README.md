@@ -79,6 +79,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/67-assigning-tasks.md](features/67-assigning-tasks.md) | Assigning tasks from a chat — `/交辦 @employee task` (`/assign`, `／交辦`) creates a goal task with `on_behalf_of`, who may assign to whom, the one-message wait after `/交辦 @name`, `/交辦 狀態`, progress back to the chat, "Assigned by me" on the Goals page, scheduled and recurring assignments (`|| 時間:每週一 9:00`, `/交辦 排程`, re-checked at every run), the dashboard 交辦任務 page (`/assign`, `tasks.skill_assign`, attachments), audit events; [繁體中文](features/zh-TW/67-assigning-tasks.md) / [日本語](features/ja-JP/67-assigning-tasks.md) |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — Enterprise backend API (v1.76.0), live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
+| [features/69-egress-guard.md](features/69-egress-guard.md) | Unreleased: per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---
