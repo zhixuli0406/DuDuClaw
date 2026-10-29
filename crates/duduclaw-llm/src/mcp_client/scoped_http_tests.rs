@@ -996,3 +996,20 @@ async fn revocation_after_notification_validation_prevents_the_tools_call_post()
         before_drops + 1
     );
 }
+
+#[tokio::test]
+async fn additive_boundary_sees_scoped_final_args_and_refuses_before_network() {
+    let fixture = Fixture::new().await;
+    let mut registry = fixture.registry(Duration::from_secs(2)).await;
+    let boundary = Arc::new(super::boundary_tests::Probe::default());
+    registry.register_client_boundary(0, boundary.clone()).unwrap();
+    assert!(!registry.call("echo", json!({})).await.unwrap().is_error);
+    assert_eq!(boundary.args.lock().unwrap()["host_rewritten"], true);
+    assert_eq!(boundary.after.load(Ordering::SeqCst), 1);
+    let count = fixture.state.requests.lock().unwrap().len();
+    boundary.deny.store(true, Ordering::SeqCst);
+    assert!(registry.call("echo", json!({})).await.unwrap().is_error);
+    assert_eq!(fixture.state.requests.lock().unwrap().len(), count);
+    assert_eq!(boundary.after.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.active.load(Ordering::SeqCst), 0);
+}

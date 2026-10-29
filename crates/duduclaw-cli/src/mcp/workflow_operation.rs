@@ -576,6 +576,16 @@ impl WorkflowCall {
             step_key: self.stored.step.step_id.clone(),
             tool: payload["name"].as_str().ok_or("missing tool")?.into(),
             effective_arguments: payload["arguments"].clone(),
+            approval_metadata: if let Some(grant) = payload.get("action_grant") {
+                Some(WorkflowApprovalMetadata {
+                    egress_guard: payload.get("egress_guard").cloned(),
+                    action_grant: grant.clone(),
+                    action_rule_matches: payload.get("action_rule_matches").cloned(),
+                    reason: payload.get("reason").cloned(),
+                })
+            } else {
+                None
+            },
             payload_hash: payload_hash(payload),
             policy_revision: self.policy_before.clone(),
             authority_digest: self.stored.authority_digest(),

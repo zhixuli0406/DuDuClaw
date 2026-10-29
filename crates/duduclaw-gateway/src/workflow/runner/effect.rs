@@ -122,10 +122,7 @@ impl WorkflowRunner {
         )
         .await
         .map_err(|_| "workflow_step_timeout")??;
-        let effective = json!({
-            "name": prepared.effective.tool,
-            "arguments": prepared.effective.effective_arguments
-        });
+        let effective = prepared.effective.payload();
         if prepared.effective.actor != run.actor
             || prepared.effective.run_id != run.run_id
             || prepared.effective.step_key != step.step_id

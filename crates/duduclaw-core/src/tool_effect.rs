@@ -123,8 +123,8 @@ impl FromStr for ToolEffect {
 /// - `mail_send` only files a draft a person must approve, but the effect it
 ///   leads to is a send, so it is `send`; `gmail_create_draft` never sends
 ///   and is `draft`.
-/// - `wiki_write` is `modify` for both scopes; `wiki_share` (copies a page
-///   into the shared wiki) is `publish`.
+/// - `wiki_write` defaults to `modify`; `effect_of_call` classifies shared
+///   scope as `publish`, like `wiki_share`.
 /// - `memory_invalidate_by_origin` expires rather than deletes, but it takes
 ///   facts out of use in bulk, so it is `delete`.
 /// - `odoo_sale_confirm` turns a quotation into a binding order (`purchase`);
@@ -140,6 +140,8 @@ impl FromStr for ToolEffect {
 ///   credentials already configured. It writes no file and no Odoo record,
 ///   and every Odoo read tool needs it first, so a `read`-only lane or rule
 ///   that allows Odoo reads must allow it too.
+/// - `odoo_schema_overview` returns private ERP model and field metadata, but
+///   takes no destination arguments and cannot send data outside the system.
 /// - `os_doctor_repair` is `admin`, not `read`: besides reporting, its MCP
 ///   cold-start probe mints the `gateway-internal` MCP key on a fresh home
 ///   and rotates it once it is past its age limit (the same provisioning as
@@ -239,6 +241,222 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         _ => return None,
     };
     Some(effect)
+}
+
+/// Whether a successful MCP result can bring private user or business data
+/// into context. Both sides are explicit: adding a tool requires a decision.
+/// Unknown names must be treated as private by the caller (`unwrap_or(true)`).
+/// Metadata, local configuration, arbitrary execution results and mutations
+/// that return existing records count as private too. A write acknowledgement
+/// or a public model-catalog search does not introduce private data.
+pub fn reads_private(tool_name: &str) -> Option<bool> {
+    match tool_name {
+        "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
+        | "belief_settle" | "belief_stats" | "calendar_list_events" | "channel_config"
+        | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
+        | "codrive_run" | "codrive_status" | "computer_screenshot" | "computer_session_start"
+        | "computer_workspace_list" | "computer_workspace_read" | "cost_agents"
+        | "cost_multi_vs_single" | "cost_recent" | "cost_summary" | "cost_users" | "csv_read"
+        | "db_query" | "db_select" | "db_sources" | "db_tables" | "decision_list"
+        | "decision_resolve" | "diff_branches" | "discovery_artifact" | "discovery_catalog"
+        | "discovery_list" | "discovery_tree" | "docs_read" | "drive_read" | "drive_search"
+        | "evolution_status" | "execute_program" | "file_read" | "fork_cost" | "fork_run"
+        | "forms_get" | "forms_list_responses" | "github_issue_read" | "github_pr_read"
+        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search"
+        | "goals_list" | "google_status" | "gtasks_list" | "gtasks_lists" | "hardware_info"
+        | "identity_resolve" | "inference_mode" | "inference_status" | "inspect_branches"
+        | "knowledge_get_passage" | "knowledge_list_collections" | "knowledge_search"
+        | "list_agents" | "list_cron_tasks" | "list_reminders" | "llamafile_list" | "mail_list"
+        | "mail_read" | "memory_alias_list" | "memory_consolidation_status"
+        | "memory_episodic_pressure" | "memory_fetch_batch" | "memory_get_at"
+        | "memory_get_history" | "memory_improve" | "memory_read" | "memory_search"
+        | "memory_search_by_layer" | "memory_successful_conversations" | "merge_or_select"
+        | "model_list" | "model_recommend" | "notion_page_read" | "notion_search"
+        | "notion_status" | "odoo_connect" | "odoo_crm_leads" | "odoo_execute"
+        | "odoo_inventory_check" | "odoo_inventory_products" | "odoo_invoice_list"
+        | "odoo_partner_search" | "odoo_payment_status" | "odoo_report" | "odoo_sale_confirm"
+        | "odoo_sale_orders" | "odoo_schema_fields" | "odoo_schema_overview" | "odoo_search"
+        | "odoo_status"
+        | "office_script" | "os_audio_get" | "os_backup_list" | "os_boot_assessment"
+        | "os_calendar_today" | "os_check_update" | "os_device_status" | "os_display_get"
+        | "os_doctor_repair" | "os_frontmost" | "os_network_info" | "os_spotlight_search"
+        | "os_system_status" | "os_watch_status" | "os_wifi_scan" | "os_wifi_status"
+        | "pairing_manage" | "plan_get" | "plan_update_step" | "reliability_summary"
+        | "responsibility_get" | "route_query" | "run_cron_task" | "session_restore_context"
+        | "shared_skill_list" | "sheets_read" | "skill_curator_status" | "skill_extract"
+        | "skill_from_recording" | "skill_gaps" | "skill_list" | "skill_search"
+        | "skill_security_scan" | "skill_synthesis_run" | "skill_synthesis_status"
+        | "slides_read" | "task_status" | "tasks_claim" | "tasks_list" | "tasks_update"
+        | "transcribe_audio" | "user_code_profile" | "user_profile_get" | "web_extract"
+        | "web_fetch" | "web_fetch_cached" | "web_search" | "wiki_dedup" | "wiki_graph"
+        | "wiki_lint" | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search"
+        | "wiki_stats" | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get"
+        | "xlsx_read" => Some(true),
+        "activity_post" | "agent_remove" | "agent_update" | "agent_update_soul"
+        | "belief_submit" | "browser_record_start" | "browser_record_stop"
+        | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
+        | "capability_request" | "computer_click" | "computer_key" | "computer_navigate"
+        | "computer_scroll" | "computer_session_stop" | "computer_type"
+        | "computer_workspace_write" | "create_agent" | "create_reminder" | "create_task"
+        | "delete_cron_task" | "desktop_record_start" | "desktop_record_stop"
+        | "discovery_cancel" | "docs_append" | "evolution_toggle" | "github_issue_comment"
+        | "gmail_create_draft" | "goals_create" | "gtasks_complete" | "gtasks_create"
+        | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send"
+        | "memory_alias_add" | "memory_invalidate_by_origin" | "memory_store" | "model_download"
+        | "model_load" | "model_search" | "model_unload" | "notion_page_append"
+        | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
+        | "os_apply_update" | "os_audio_set" | "os_backup_create" | "os_display_set"
+        | "os_factory_reset" | "os_notify" | "os_open" | "os_power" | "os_update_rollback"
+        | "os_wifi_connect" | "pause_cron_task" | "plan_start" | "responsibility_ask"
+        | "responsibility_followup" | "send_message" | "send_photo" | "send_sticker"
+        | "send_to_agent" | "shared_skill_adopt" | "shared_skill_share" | "shared_wiki_delete"
+        | "sheets_append" | "skill_bank_feedback" | "skill_graduate" | "skill_hub_install"
+        | "skill_pin" | "spawn_agent" | "spawn_ephemeral" | "submit_feedback"
+        | "synthesize_speech" | "tasks_block" | "tasks_complete" | "tasks_create"
+        | "tasks_renew" | "team_handoff" | "terminate_branch" | "update_cron_task"
+        | "user_profile_record" | "wiki_export" | "wiki_rebuild_fts" | "wiki_share"
+        | "wiki_write" | "working_state_clear" | "working_state_handoff" | "working_state_set" => Some(false),
+        _ => None,
+    }
+}
+
+/// Calls that can carry arguments to a remote service or an argument-chosen
+/// destination, even when their effect is classified as read or draft.
+/// Search strings and remote record IDs can carry data too. Scheduled
+/// notification destinations and browser navigation are included regardless
+/// of their effect class. `web_fetch` is retained as a conservative alias.
+pub const EGRESS_CAPABLE_READS: &[&str] = &[
+    "browser_record_start",
+    "calendar_create_event",
+    "calendar_list_events",
+    "codrive_run",
+    "computer_navigate",
+    "computer_type",
+    "db_query",
+    "db_select",
+    "db_tables",
+    "docs_append",
+    "docs_read",
+    "drive_read",
+    "drive_search",
+    "forms_get",
+    "forms_list_responses",
+    "github_issue_comment",
+    "github_issue_read",
+    "github_pr_read",
+    "github_search_issues",
+    "gmail_create_draft",
+    "gmail_read",
+    "gmail_search",
+    "gtasks_complete",
+    "gtasks_create",
+    "gtasks_list",
+    "knowledge_add_source",
+    "model_download",
+    "model_search",
+    "notion_page_append",
+    "notion_page_read",
+    "notion_search",
+    "odoo_crm_create_lead",
+    "odoo_crm_leads",
+    "odoo_crm_update_stage",
+    "odoo_execute",
+    "odoo_inventory_check",
+    "odoo_inventory_products",
+    "odoo_invoice_list",
+    "odoo_partner_search",
+    "odoo_payment_status",
+    "odoo_report",
+    "odoo_sale_confirm",
+    "odoo_sale_create_quotation",
+    "odoo_sale_orders",
+    "odoo_schema_fields",
+    "odoo_search",
+    "os_open",
+    "sheets_append",
+    "sheets_read",
+    "skill_hub_install",
+    "skill_search",
+    "slides_read",
+    "synthesize_speech",
+    "tasks_create",
+    "transcribe_audio",
+    "update_cron_task",
+    "web_extract",
+    "web_fetch",
+    "web_fetch_cached",
+    "web_search",
+];
+
+/// Explicit egress classification for every advertised MCP tool. Keep the
+/// negative entries independent of the private-read table, so completeness
+/// tests require a separate egress decision whenever a tool is added.
+pub fn egress_capable(tool_name: &str) -> Option<bool> {
+    if EGRESS_CAPABLE_READS.contains(&tool_name) {
+        return Some(true);
+    }
+    match tool_name {
+        "activity_list" | "activity_post" | "agent_remove" | "agent_status" | "agent_update"
+        | "agent_update_soul" | "audit_trail_query" | "autopilot_list" | "belief_settle"
+        | "belief_stats" | "belief_submit" | "browser_record_stop" | "cancel_reminder"
+        | "canvas_clear" | "canvas_push" | "capability_request" | "channel_config"
+        | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
+        | "codrive_status" | "computer_click" | "computer_key" | "computer_screenshot"
+        | "computer_scroll" | "computer_session_start" | "computer_session_stop"
+        | "computer_workspace_list" | "computer_workspace_read" | "computer_workspace_write"
+        | "cost_agents" | "cost_multi_vs_single" | "cost_recent" | "cost_summary" | "cost_users"
+        | "create_agent" | "create_reminder" | "create_task" | "csv_read" | "db_sources"
+        | "decision_list" | "decision_resolve" | "delete_cron_task" | "desktop_record_start"
+        | "desktop_record_stop" | "diff_branches" | "discovery_artifact" | "discovery_cancel"
+        | "discovery_catalog" | "discovery_list" | "discovery_tree" | "evolution_status"
+        | "evolution_toggle" | "execute_program" | "file_read" | "fork_cost" | "fork_run"
+        | "github_status" | "goals_create" | "goals_list" | "google_status" | "gtasks_lists"
+        | "hardware_info" | "identity_resolve" | "inference_mode" | "inference_status"
+        | "inspect_branches" | "knowledge_get_passage" | "knowledge_list_collections"
+        | "knowledge_search" | "list_agents" | "list_cron_tasks" | "list_reminders"
+        | "llamafile_list" | "llamafile_start" | "llamafile_stop" | "mail_list" | "mail_read"
+        | "mail_send" | "memory_alias_add" | "memory_alias_list" | "memory_consolidation_status"
+        | "memory_episodic_pressure" | "memory_fetch_batch" | "memory_get_at"
+        | "memory_get_history" | "memory_improve" | "memory_invalidate_by_origin"
+        | "memory_read" | "memory_search" | "memory_search_by_layer" | "memory_store"
+        | "memory_successful_conversations" | "merge_or_select" | "model_list" | "model_load"
+        | "model_recommend" | "model_unload" | "notion_status" | "odoo_connect"
+        | "odoo_schema_overview" | "odoo_status"
+        | "office_script" | "os_apply_update" | "os_audio_get" | "os_audio_set"
+        | "os_backup_create" | "os_backup_list" | "os_boot_assessment" | "os_calendar_today"
+        | "os_check_update" | "os_device_status" | "os_display_get" | "os_display_set"
+        | "os_doctor_repair" | "os_factory_reset" | "os_frontmost" | "os_network_info"
+        | "os_notify" | "os_power" | "os_spotlight_search" | "os_system_status"
+        | "os_update_rollback" | "os_watch_status" | "os_wifi_connect" | "os_wifi_scan"
+        | "os_wifi_status" | "pairing_manage" | "pause_cron_task" | "plan_get" | "plan_start"
+        | "plan_update_step" | "reliability_summary" | "responsibility_ask"
+        | "responsibility_followup" | "responsibility_get" | "route_query" | "run_cron_task"
+        | "send_message" | "send_photo" | "send_sticker" | "send_to_agent"
+        | "session_restore_context" | "shared_skill_adopt" | "shared_skill_list"
+        | "shared_skill_share" | "shared_wiki_delete" | "skill_bank_feedback"
+        | "skill_curator_status" | "skill_extract" | "skill_from_recording" | "skill_gaps"
+        | "skill_graduate" | "skill_list" | "skill_pin" | "skill_security_scan"
+        | "skill_synthesis_run" | "skill_synthesis_status" | "spawn_agent" | "spawn_ephemeral"
+        | "submit_feedback" | "task_status" | "tasks_block" | "tasks_claim" | "tasks_complete"
+        | "tasks_list" | "tasks_renew" | "tasks_update" | "team_handoff" | "terminate_branch"
+        | "user_code_profile" | "user_profile_get" | "user_profile_record" | "wiki_dedup"
+        | "wiki_export" | "wiki_graph" | "wiki_lint" | "wiki_ls" | "wiki_namespace_status"
+        | "wiki_read" | "wiki_rebuild_fts" | "wiki_search" | "wiki_share" | "wiki_stats"
+        | "wiki_trust_audit" | "wiki_trust_history" | "wiki_write" | "working_state_clear"
+        | "working_state_get" | "working_state_handoff" | "working_state_set" | "xlsx_read" => Some(false),
+        _ => None,
+    }
+}
+
+/// Classify the final call arguments using the catalog's compatibility mapping.
+pub fn effect_of_call(tool_name: &str, args: &serde_json::Value) -> ToolEffect {
+    let bare = tool_name.strip_prefix("mcp__duduclaw__").unwrap_or(tool_name);
+    match crate::tool_catalog::removed_name_for_call(bare, args) {
+        Some("shared_wiki_write") => ToolEffect::Publish,
+        // Other mapped calls retain their conservative existing class:
+        // shared wiki reads/lint, scheduled tasks, and skill-bank search.
+        _ => effect_of(tool_name),
+    }
 }
 
 /// The class of a native Claude Code tool by exact name, or `None` for a
@@ -454,13 +672,58 @@ impl ActionRules {
         effect: ToolEffect,
         args: &serde_json::Value,
     ) -> Option<ActionVerdict> {
-        let own = self.resolve(tool_name, effect);
-        let legacy = crate::tool_catalog::removed_name_for_call(tool_name, args)
-            .and_then(|legacy| self.tool_rule_verdict(legacy));
+        let mapped = crate::tool_catalog::removed_name_for_call(tool_name, args);
+        let mut own = self.resolve(tool_name, effect);
+        if mapped == Some("shared_wiki_write") {
+            // Reclassification may narrow policy, never remove an existing
+            // Modify restriction on shared writes.
+            own = [own, self.resolve(tool_name, ToolEffect::Modify),
+                self.resolve(tool_name, ToolEffect::Publish)].into_iter().flatten().max();
+        }
+        let legacy = mapped.and_then(|legacy| self.tool_rule_verdict(legacy));
         match (own, legacy) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// Host-owned evidence for the rules that require approval for this call.
+    /// Uses the same precedence and removed-name matching as the resolver;
+    /// this is display metadata, never an additional authorization input.
+    pub fn approval_matches_for_call(
+        &self,
+        tool_name: &str,
+        effect: ToolEffect,
+        args: &serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        let Some(verdict) = self.resolve_for_call(tool_name, effect, args)
+            .filter(|v| *v >= ActionVerdict::Ask) else {
+            return Vec::new();
+        };
+        let by_tool = self.tool_rule_verdict(tool_name);
+        let legacy = crate::tool_catalog::removed_name_for_call(tool_name, args);
+        let mut matches = Vec::new();
+        for rule in &self.rules {
+            if rule.verdict != verdict {
+                continue;
+            }
+            match &rule.target {
+                ActionTarget::Tool(entry) if
+                    crate::tool_catalog::tool_entry_matches(entry, tool_name)
+                    || legacy.is_some_and(|name| crate::tool_catalog::tool_entry_matches(entry, name)) => {
+                    matches.push(serde_json::json!({"tool": entry, "verdict": verdict}));
+                }
+                ActionTarget::Effect(target) if by_tool.is_none() && (*target == effect
+                    || (legacy == Some("shared_wiki_write") && matches!(target, ToolEffect::Modify | ToolEffect::Publish))) => {
+                    matches.push(serde_json::json!({"effect": target.as_str(), "verdict": verdict}));
+                }
+                _ => {}
+            }
+        }
+        if self.malformed && effect.is_side_effecting() && verdict == ActionVerdict::Ask {
+            matches.push(serde_json::json!({"malformed": true, "verdict": "ask"}));
+        }
+        matches
     }
 
     /// The Claude Code built-in tools these rules keep away from a spawned
@@ -768,6 +1031,99 @@ pub const EXPLORE_LANE_BUILTIN_TOOLS: &[&str] = &["Read", "Glob", "Grep", "WebFe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn egress_shared_wiki_reclassification_only_narrows_action_rules() {
+        for (blocked, allowed) in [("modify", "publish"), ("publish", "modify")] {
+            let rules: ActionRules = serde_json::from_value(serde_json::json!([
+                {"effect":blocked,"verdict":"block"}, {"effect":allowed,"verdict":"allow"}
+            ])).unwrap();
+            let args = serde_json::json!({"scope":"shared"});
+            assert_eq!(rules.resolve_for_call("wiki_write", ToolEffect::Publish, &args), Some(ActionVerdict::Block));
+            assert_eq!(rules.approval_matches_for_call("wiki_write", ToolEffect::Publish, &args)[0]["effect"], blocked);
+        }
+    }
+
+    #[test]
+    fn egress_shared_wiki_uses_final_scope() {
+        for scope in ["shared", " Shared ", "SHARED"] {
+            assert_eq!(effect_of_call("wiki_write", &serde_json::json!({"scope":scope})), ToolEffect::Publish);
+            assert_eq!(effect_of_call("mcp__duduclaw__wiki_write", &serde_json::json!({"scope":scope})), ToolEffect::Publish);
+        }
+        for args in [serde_json::json!({}), serde_json::json!({"scope":"private"}), serde_json::json!({"scope":"agent"})] {
+            assert_eq!(effect_of_call("wiki_write", &args), ToolEffect::Modify);
+        }
+        assert_eq!(effect_of_call("wiki_write_extra", &serde_json::json!({"scope":"shared"})), ToolEffect::Admin);
+    }
+
+    #[test]
+    fn approval_matches_follow_precedence_legacy_names_and_malformed_policy() {
+        let rules = super::ActionRules::from_value(serde_json::json!([
+            {"effect": "send", "verdict": "ask"},
+            {"tool": "send_message", "verdict": "allow"},
+            {"tool": "memory_search", "verdict": "ask"},
+            {"tool": "shared_wiki_write", "verdict": "ask"}
+        ]));
+        let empty = serde_json::json!({});
+        assert!(rules.approval_matches_for_call("send_message", super::ToolEffect::Send, &empty).is_empty());
+        assert_eq!(rules.approval_matches_for_call("mail_send", super::ToolEffect::Send, &empty),
+            vec![serde_json::json!({"effect": "send", "verdict": "ask"})]);
+        assert_eq!(rules.approval_matches_for_call("memory_search", super::ToolEffect::Read, &empty),
+            vec![serde_json::json!({"tool": "memory_search", "verdict": "ask"})]);
+        assert_eq!(rules.approval_matches_for_call("wiki_write", super::ToolEffect::Modify, &serde_json::json!({"scope": "shared"})),
+            vec![serde_json::json!({"tool": "shared_wiki_write", "verdict": "ask"})]);
+        assert_eq!(super::ActionRules::unreadable().approval_matches_for_call("mail_send", super::ToolEffect::Send, &empty),
+            vec![serde_json::json!({"malformed": true, "verdict": "ask"})]);
+    }
+
+    #[test]
+    fn private_and_egress_tables_match_exact_names() {
+        for name in [
+            "memory_search",
+            "knowledge_get_passage",
+            "db_query",
+            "file_read",
+            "mail_read",
+            "activity_list",
+            "working_state_get",
+            "decision_resolve",
+            "computer_screenshot",
+        ] {
+            assert_eq!(super::reads_private(name), Some(true), "{name}");
+        }
+        for name in [
+            "send_message",
+            "memory_store",
+            "working_state_set",
+            "model_search",
+        ] {
+            assert_eq!(super::reads_private(name), Some(false), "{name}");
+        }
+        for name in [
+            "web_fetch",
+            "web_fetch_cached",
+            "web_extract",
+            "web_search",
+            "computer_navigate",
+            "browser_record_start",
+            "os_open",
+            "gmail_search",
+            "docs_append",
+        ] {
+            assert_eq!(super::egress_capable(name), Some(true), "{name}");
+        }
+        assert_eq!(super::egress_capable("working_state_get"), Some(false));
+        for name in [
+            "unknown",
+            "xmemory_search",
+            "memory_search_extra",
+            "WEB_FETCH",
+        ] {
+            assert_eq!(super::reads_private(name), None, "{name}");
+            assert_eq!(super::egress_capable(name), None, "{name}");
+            assert!(super::reads_private(name).unwrap_or(true));
+        }
+    }
+
     use super::*;
 
     fn rules(v: serde_json::Value) -> ActionRules {

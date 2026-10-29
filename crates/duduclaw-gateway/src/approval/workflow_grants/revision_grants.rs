@@ -218,6 +218,7 @@ impl ApprovalBroker {
             {
                 return Err("current grant material corrupt".into());
             }
+            spec.validate_standing_tools()?;
             Ok((
                 GrantRef {
                     grant_id: id,
@@ -247,6 +248,7 @@ impl ApprovalBroker {
         if spec.hash() != reference.spec_hash {
             return Err("grant spec corrupt".into());
         }
+        spec.validate_standing_tools()?;
         Ok((spec, state))
     }
     pub async fn activate_revision_grant(&self, reference: &GrantRef) -> Result<GrantRef, String> {

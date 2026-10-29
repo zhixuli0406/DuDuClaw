@@ -54,6 +54,14 @@ pub(crate) fn activation_facts(home: &std::path::Path, rec: &ApprovalRecord) -> 
 }
 
 impl MethodHandler {
+    pub(crate) fn authorize_egress_decider(&self, rec: &ApprovalRecord, ctx: &UserContext) -> Result<(), String> {
+        if rec.payload.get("egress_guard").is_some() {
+            let fresh = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)?;
+            if !fresh.is_admin() { return Err("outgoing data approval requires an Admin".into()); }
+        }
+        Ok(())
+    }
+
     /// The fresh identity allowed to decide `rec`, or why not.
     pub(crate) async fn authorize_bound_decider(
         &self,
@@ -63,6 +71,11 @@ impl MethodHandler {
         let fresh = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)
             .map_err(|_| "permission denied".to_string())?;
         let binding = rec.binding.as_ref().ok_or("permission denied")?;
+        // Egress cards disclose full private arguments only to Admins.
+        // Keep decision authority aligned with that visibility rule.
+        if rec.payload.get("egress_guard").is_some() && !fresh.is_admin() {
+            return Err("outgoing data approval requires an Admin".into());
+        }
         if is_activation_record(rec) {
             if !fresh.is_admin() {
                 return Err("workflow activation can only be decided by an Admin".into());

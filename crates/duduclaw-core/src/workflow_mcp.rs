@@ -31,12 +31,51 @@ pub struct EffectiveToolCall {
     pub step_key: String,
     pub tool: String,
     pub effective_arguments: Value,
+    /// Host-built approval facts travel inside the signed prepare ticket.
+    /// They are part of the execution payload hash, never tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_metadata: Option<WorkflowApprovalMetadata>,
     pub payload_hash: String,
     pub policy_revision: String,
     pub authority_digest: String,
     pub environment_hash: String,
     pub approval_requirements: Vec<String>,
     pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowApprovalMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_guard: Option<Value>,
+    pub action_grant: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_rule_matches: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Value>,
+}
+
+impl EffectiveToolCall {
+    /// Reconstruct exactly what the dispatcher prepared and will execute.
+    pub fn payload(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "name": self.tool,
+            "arguments": self.effective_arguments,
+        });
+        if let Some(metadata) = &self.approval_metadata {
+            if let Some(egress) = &metadata.egress_guard {
+                payload["egress_guard"] = egress.clone();
+            }
+            payload["action_grant"] = metadata.action_grant.clone();
+            if let Some(matches) = &metadata.action_rule_matches {
+                payload["action_rule_matches"] = matches.clone();
+            }
+            if let Some(reason) = &metadata.reason {
+                payload["reason"] = reason.clone();
+            }
+        }
+        payload
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +213,49 @@ pub fn verify<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_payload_keeps_full_egress_metadata_in_the_signature() {
+        let args = serde_json::json!({"id":"cron-1","task":"完整內容".repeat(100)});
+        let metadata = serde_json::json!({
+            "egress_guard":{"reason":"egress_guard","sources":["memory_read"]},
+            "action_grant":{"agent_id":"alice","tool":"update_cron_task","args_digest":"digest"}
+        });
+        let effective: EffectiveToolCall = serde_json::from_value(serde_json::json!({
+            "version":1,"actor":"alice","session_id":"session","run_id":"run","step_key":"step",
+            "tool":"update_cron_task","effective_arguments":args,"approval_metadata":metadata,
+            "payload_hash":"hash","policy_revision":"policy","authority_digest":"authority",
+            "environment_hash":"environment","approval_requirements":["egress_guard"],"expires_at":"deadline"
+        })).unwrap();
+        let expected = serde_json::json!({
+            "name":"update_cron_task","arguments":args,
+            "egress_guard":metadata["egress_guard"],"action_grant":metadata["action_grant"]
+        });
+        assert_eq!(effective.payload(), expected);
+        let key = [9; 32];
+        let serialized = serde_json::to_value(&effective).unwrap();
+        let tag = sign(&key, "prepare", &serialized).unwrap();
+        let mut forged = serialized.clone();
+        forged["approval_metadata"]["egress_guard"]["sources"] = serde_json::json!([]);
+        assert!(verify(&key, "prepare", &forged, &tag).is_err());
+        let mut rule_only = serialized.clone();
+        rule_only["approval_metadata"].as_object_mut().unwrap().remove("egress_guard");
+        rule_only["approval_metadata"]["action_rule_matches"] =
+            serde_json::json!([{"tool":"update_cron_task","verdict":"ask"}]);
+        rule_only["approval_metadata"]["reason"] = serde_json::json!("action_rule");
+        let rule_call: EffectiveToolCall = serde_json::from_value(rule_only.clone()).unwrap();
+        let rule_payload = rule_call.payload();
+        assert!(rule_payload.get("egress_guard").is_none());
+        assert_eq!(rule_payload["reason"], "action_rule");
+        assert_eq!(rule_payload["action_rule_matches"], rule_only["approval_metadata"]["action_rule_matches"]);
+        let tag = sign(&key, "prepare", &rule_only).unwrap();
+        rule_only["approval_metadata"]["action_rule_matches"][0]["verdict"] = serde_json::json!("allow");
+        assert!(verify(&key, "prepare", &rule_only, &tag).is_err());
+        let mut legacy = serialized;
+        legacy.as_object_mut().unwrap().remove("approval_metadata");
+        let legacy: EffectiveToolCall = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.payload(), serde_json::json!({"name":"update_cron_task","arguments":args}));
+    }
+
     #[test]
     fn workflow_canonical_fixture_matches_cross_crate_authority_and_environment() {
         let fixture: Value =

@@ -715,10 +715,22 @@ impl McpClient {
 
     /// Call one tool by name with parsed JSON arguments.
     pub async fn call_tool(&mut self, name: &str, args: Value) -> Result<ToolCallResult, McpError> {
+        self.call_tool_with_boundary(name, args, None).await
+    }
+
+    async fn call_tool_with_boundary(
+        &mut self, name: &str, args: Value, lease: Option<&dyn ClientCallLease>,
+    ) -> Result<ToolCallResult, McpError> {
         let id = self.alloc_id();
-        let resp = self
-            .request(build_tools_call_request(id, name, args), id)
-            .await?;
+        if let Some(lease) = lease { lease.dispatched(); }
+        let resp = self.request(build_tools_call_request(id, name, args), id).await?;
+        // request() correlates the id. Parsing failures after a terminal frame
+        // do not imply the remote operation is still running.
+        if resp.get("method").is_none()
+            && (resp.get("result").is_some() || resp.get("error").is_some())
+        {
+            if let Some(lease) = lease { lease.terminal_response(); }
+        }
         parse_tool_call_result(&resp)
     }
 
@@ -1172,20 +1184,60 @@ impl ScopedHttpSlot {
         server: &str,
         name: &str,
         args: Value,
-    ) -> Result<(Value, ToolCallResult), ScopedCallError> {
+        boundary: Option<&Arc<dyn ClientCallBoundary>>,
+    ) -> Result<(Value, ToolCallResult, Option<String>, Option<Box<dyn ClientCallLease>>), ScopedCallError> {
         let (args, bearer, lease) = self
             .prepare(server, ClientOperation::Tool { name }, args)
             .await?;
+        let (reservation, boundary_lease) = if let Some(boundary) = boundary {
+            boundary.begin_scoped_call(name, &args).await.map_err(|_| ScopedCallError::Denied)?
+        } else { (None, None) };
         let mut client = McpClient::connect_http_with_call_lease(&self.recipe, bearer, lease)
             .await
             .map_err(|_| ScopedCallError::Unconfirmed)?;
-        let result = client.call_tool(name, args.clone()).await;
+        let result = client.call_tool_with_boundary(name, args.clone(), boundary_lease.as_deref()).await;
         // Drop the authority before releasing the registry's exact-client
         // mutex. Error, timeout and cancellation drop the same owned value.
         drop(client);
         result
-            .map(|result| (args, result))
+            .map(|result| (args, result, reservation, boundary_lease))
             .map_err(|_| ScopedCallError::Unconfirmed)
+    }
+}
+
+fn model_visible_tool_reply(result: &Result<ToolCallResult, McpError>) -> bool {
+    // Io includes HTTP error bodies; Parse can include upstream diagnostics.
+    // Only fixed, payload-less terminal messages can release a reservation.
+    !matches!(result, Err(McpError::Closed | McpError::Timeout))
+}
+
+/// Transport-owned egress fence, separate from credential authority. Mark
+/// before a potentially partial write; only a correlated terminal response (or
+/// confirmed upstream cancellation) permits release after dispatch.
+pub trait ClientCallLease: Send + Sync {
+    fn dispatched(&self);
+    fn terminal_response(&self);
+}
+
+/// An additive host boundary, independent of credential/transport authority.
+/// Admission sees final arguments; completion is based on model-visible payload.
+#[async_trait]
+pub trait ClientCallBoundary: Send + Sync {
+    async fn before_call(&self, tool: &str, args: &Value) -> Result<(), String>;
+    async fn after_success(&self, tool: &str) -> Result<(), String>;
+    async fn begin_call(&self, tool: &str, args: &Value) -> Result<Option<String>, String> {
+        self.before_call(tool, args).await?;
+        Ok(None)
+    }
+    /// The transport owns this guard through completion, including cancellation
+    /// and timeout. It must not be kept in a process-local correlation map.
+    async fn begin_scoped_call(
+        &self, tool: &str, args: &Value,
+    ) -> Result<(Option<String>, Option<Box<dyn ClientCallLease>>), String> {
+        Ok((self.begin_call(tool, args).await?, None))
+    }
+    async fn finish_call(&self, tool: &str, _reservation: Option<&str>, payload: bool) -> Result<(), String> {
+        if payload { self.after_success(tool).await } else { Ok(()) }
     }
 }
 
@@ -1215,6 +1267,7 @@ pub struct ToolRegistry {
     /// Host-owned guards bound to the exact connected client, never a name
     /// supplied by a model or a colliding logical server name.
     client_interceptors: HashMap<usize, Arc<dyn ToolInterceptor>>,
+    client_boundaries: HashMap<usize, Arc<dyn ClientCallBoundary>>,
     client_notices: HashMap<usize, String>,
     /// Host-only deadlines parallel to scoped slots. Keeping this outside the
     /// mutex lets one timeout also bound waiting for that exact client lock.
@@ -1316,6 +1369,7 @@ impl ToolRegistry {
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
             client_interceptors: HashMap::new(),
+            client_boundaries: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
@@ -1394,6 +1448,7 @@ impl ToolRegistry {
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
             client_interceptors,
+            client_boundaries: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts,
             closed_client_indices,
@@ -1440,6 +1495,18 @@ impl ToolRegistry {
             return Err("MCP guard already registered for this client".into());
         }
         self.client_interceptors.insert(client, interceptor);
+        Ok(())
+    }
+
+    pub fn register_client_boundary(
+        &mut self,
+        client: usize,
+        boundary: Arc<dyn ClientCallBoundary>,
+    ) -> Result<(), String> {
+        if client >= self.clients.len() || self.client_boundaries.contains_key(&client) {
+            return Err("MCP call boundary slot unavailable".into());
+        }
+        self.client_boundaries.insert(client, boundary);
         Ok(())
     }
 
@@ -1731,7 +1798,8 @@ impl ToolRegistry {
         let mut client = self.clients[idx].lock().await;
         let server = self.server_names.get(idx).map(String::as_str).unwrap_or("");
         let interceptor = self.client_interceptors.get(&idx);
-        let (args, result) = match &mut *client {
+        let boundary = self.client_boundaries.get(&idx);
+        let (args, result, reservation, boundary_lease) = match &mut *client {
             RegistryClient::Persistent(client) => {
                 let args = if let Some(interceptor) = interceptor {
                     match interceptor.before_call_async(server, name, args).await {
@@ -1741,22 +1809,38 @@ impl ToolRegistry {
                 } else {
                     args
                 };
-                let result = client.call_tool(name, args.clone()).await;
-                (args, result)
+                let (reservation, boundary_lease) = if let Some(boundary) = boundary {
+                    match boundary.begin_scoped_call(name, &args).await {
+                        Ok(admission) => admission,
+                        Err(reason) => return Ok(ToolOutcome::error(reason)),
+                    }
+                } else { (None, None) };
+                let result = client.call_tool_with_boundary(name, args.clone(), boundary_lease.as_deref()).await;
+                (args, result, reservation, boundary_lease)
             }
             RegistryClient::ScopedHttp(slot) => {
                 // prepare_client_call replaces the old before hook only for
                 // this branch; calling both would authorize twice.
-                match slot.call(server, name, args.clone()).await {
-                    Ok((args, result)) => (args, Ok(result)),
+                match slot.call(server, name, args.clone(), boundary).await {
+                    Ok((args, result, reservation, lease)) => (args, Ok(result), reservation, lease),
                     Err(ScopedCallError::Denied) => {
                         return Ok(ToolOutcome::error(ScopedCallError::Denied.message()));
                     }
-                    Err(error) => (args, Err(error.into_mcp_error())),
+                    Err(error) => (args, Err(error.into_mcp_error()), None, None),
                 }
             }
         };
         drop(client);
+        // RPC error messages are upstream-controlled payload too. Scoped
+        // failures/cancellation retain the reservation when completion is unknown.
+        let payload = model_visible_tool_reply(&result);
+        if let Some(boundary) = boundary {
+            if let Err(reason) = boundary.finish_call(name, reservation.as_deref(), payload).await {
+                return Ok(ToolOutcome::error(reason));
+            }
+        }
+        // The private-read completion is recorded before a later read can enter.
+        drop(boundary_lease);
         let outcome = match result {
             Ok(mut result) => {
                 if let Some(interceptor) = interceptor {
@@ -1787,6 +1871,10 @@ impl ToolRegistry {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_client/boundary_tests.rs"]
+mod boundary_tests;
 
 // ---------------------------------------------------------------------------
 // Tests — pure framing + routing, no child processes.
@@ -2000,6 +2088,7 @@ mod tests {
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
             client_interceptors: HashMap::new(),
+            client_boundaries: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
@@ -2045,6 +2134,7 @@ mod tests {
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
             client_interceptors: HashMap::new(),
+            client_boundaries: HashMap::new(),
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
@@ -2531,7 +2621,7 @@ mod http_transport_tests {
                                 "200 OK",
                                 Some(json!({"jsonrpc":"2.0","id":id,"result":{
                                 "content":[{"type":"text","text":"echoed!"}],
-                                "isError":false}})),
+                                "isError":frame["params"]["arguments"]["fail"] == true}})),
                             )
                         }
                         _ => ("400 Bad Request", None),
@@ -2635,6 +2725,29 @@ mod http_transport_tests {
             fallback.host_notice.as_deref(),
             Some("company-account fallback")
         );
+        let boundary = Arc::new(boundary_tests::Probe::default());
+        registry.register_client_boundary(0, boundary.clone()).unwrap();
+        assert!(!registry.call("echo", json!({"final": true})).await.unwrap().is_error);
+        assert_eq!(boundary.after.load(Ordering::SeqCst), 1);
+        assert_eq!(boundary.released.load(Ordering::SeqCst), 1);
+        assert_eq!(*boundary.args.lock().unwrap(), json!({"final": true}));
+        assert!(registry.call("echo", json!({"fail": true})).await.unwrap().is_error);
+        assert_eq!(
+            boundary.after.load(Ordering::SeqCst),
+            2,
+            "MCP error responses with payload mark a read"
+        );
+        assert_eq!(boundary.released.load(Ordering::SeqCst), 2, "error completion releases the sink lease");
+        let count = calls.load(Ordering::SeqCst);
+        boundary.deny.store(true, Ordering::SeqCst);
+        assert!(registry.call("echo", json!({})).await.unwrap().is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), count);
+        assert_eq!(
+            boundary.after.load(Ordering::SeqCst),
+            2,
+            "pre-call denial does not mark another read"
+        );
+        boundary.deny.store(false, Ordering::SeqCst);
         let before = calls.load(Ordering::SeqCst);
         let held = registry.clients[0].lock().await;
         let queued = registry.call("echo", json!({}));

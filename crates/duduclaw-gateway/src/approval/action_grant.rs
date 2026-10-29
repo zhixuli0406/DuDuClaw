@@ -16,7 +16,7 @@
 //!   the call proceeds. A second use, a changed row or a lost claim refuses.
 //!
 //! Which calls are bound ([`binding_applies`]): tools whose effect class is
-//! `send` or `purchase`, and every call that reached human approval because
+//! `send`, `publish` or `purchase`, and every call that reached human approval because
 //! an `[capabilities] action_rules` rule said `ask`. Everything else keeps
 //! the previous behaviour (a fresh request per call, not consumed).
 
@@ -51,8 +51,17 @@ pub fn binding_applies(tool: &str, routed_by_action_rule_ask: bool) -> bool {
     routed_by_action_rule_ask
         || matches!(
             duduclaw_core::effect_of(tool),
-            ToolEffect::Send | ToolEffect::Purchase
+            ToolEffect::Send | ToolEffect::Publish | ToolEffect::Purchase
         )
+}
+
+/// Egress requests bind even tools ordinarily classified as read or draft.
+pub fn binding_applies_for_request(
+    tool: &str,
+    routed_by_action_rule_ask: bool,
+    routed_by_egress_guard: bool,
+) -> bool {
+    routed_by_egress_guard || binding_applies(tool, routed_by_action_rule_ask)
 }
 
 /// Canonical JSON: object keys sorted at every depth, no whitespace.
@@ -154,7 +163,7 @@ impl ActionGrant {
         Self {
             agent_id: agent_id.to_string(),
             tool: tool.to_string(),
-            effect: duduclaw_core::effect_of(tool),
+            effect: duduclaw_core::tool_effect::effect_of_call(tool, args),
             args_digest: args_digest(agent_id, tool, args),
             args_summary: summarize_args(args),
         }
@@ -237,10 +246,22 @@ pub async fn verify_and_consume(
         return Err(GrantRefusal::Mismatch);
     }
     let reason = format!("{CONSUMED_PREFIX}{}", uuid::Uuid::new_v4());
-    match broker.consume_approved(id, &reason).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(GrantRefusal::AlreadyUsed),
-        Err(e) => Err(GrantRefusal::Store(e)),
+    let conn = broker.store.conn.lock().await;
+    if !rec.expires_at().is_some_and(|expiry| chrono::Utc::now() < expiry) {
+        return Err(GrantRefusal::NotApproved);
+    }
+    // Bind consumption to the row just verified, including its deadline.
+    // Check the deadline in the UPDATE too, after any SQLite lock wait.
+    let consumed = conn.execute(
+        "UPDATE approvals SET status='invalidated', invalidated_reason=?1
+         WHERE id=?2 AND status='approved' AND agent_id=?3
+           AND payload=?4 AND created_at=?5 AND ttl_seconds=?6
+           AND julianday(created_at) + ttl_seconds / 86400.0 > julianday('now')",
+        rusqlite::params![reason, id.as_str(), rec.agent_id, rec.payload.to_string(), rec.created_at, rec.ttl_seconds],
+    ).map_err(|e| GrantRefusal::Store(e.to_string()))?;
+    match consumed {
+        1 => Ok(()),
+        _ => Err(GrantRefusal::AlreadyUsed),
     }
 }
 
@@ -298,11 +319,32 @@ mod action_grant_tests {
     }
 
     #[test]
-    fn only_send_purchase_or_ask_rule_calls_are_bound() {
+    fn sends_publications_purchases_rules_and_egress_requests_are_bound() {
         assert!(binding_applies("mail_send", false));
+        assert!(binding_applies("wiki_share", false));
+        assert!(binding_applies_for_request("web_extract", false, true));
+        assert!(!binding_applies_for_request("web_extract", false, false));
         assert!(binding_applies("odoo_sale_confirm", false));
         assert!(!binding_applies("memory_search", false));
         assert!(binding_applies("memory_search", true));
+    }
+
+    #[tokio::test]
+    async fn approved_but_expired_or_malformed_deadline_cannot_be_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = ApprovalBroker::open(dir.path()).unwrap();
+        for created_at in ["2000-01-01T00:00:00Z", "not-a-date"] {
+            let mut payload = json!({"arguments":{"url":"https://example.invalid/private"}});
+            let grant = ActionGrant::build("alice", "web_extract", &payload);
+            payload[ACTION_GRANT_KEY] = grant.to_json();
+            let id = broker.request("alice", "mcp_call", "egress", payload, 60).await.unwrap();
+            broker.decide(&id, true, "dashboard:test").await.unwrap();
+            broker.store.conn.lock().await.execute(
+                "UPDATE approvals SET created_at=?1 WHERE id=?2",
+                rusqlite::params![created_at, id.as_str()],
+            ).unwrap();
+            assert_eq!(verify_and_consume(&broker, &id, &grant).await, Err(GrantRefusal::NotApproved));
+        }
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ Personal Edition（`EditionProfile::Personal`）は**自己完結した単一所
 | 設定 | `~/.duduclaw/config.toml`、`~/.duduclaw/inference.toml` |
 | ライセンス | `~/.duduclaw/license.json` |
 | タスク／自動化／イベント | `~/.duduclaw/*.jsonl`、`events.db` |
+| 実行中の送信 lease（WAL／SHM を含む） | `~/.duduclaw/egress_leases.db`、`egress_leases.db-wal`、`egress_leases.db-shm`、`egress_leases.lock` |
 
 ## 今すぐ使える方法：手動移行（tar）
 

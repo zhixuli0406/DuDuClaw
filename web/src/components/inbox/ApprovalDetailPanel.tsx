@@ -116,6 +116,23 @@ export interface ActionGrantView {
   effect: string;
   argsSummary: string[];
   digest: string;
+  fullArgs?: Record<string, unknown>;
+  sources?: string[];
+  reason?: string;
+  ruleMatches: ActionRuleMatch[];
+}
+
+type ActionRuleMatch = { verdict: 'allow' | 'ask' | 'block' } & (
+  { tool: string } | { effect: string } | { malformed: true }
+);
+
+function isActionRuleMatch(value: unknown): value is ActionRuleMatch {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const rule = value as Record<string, unknown>;
+  if (Object.keys(rule).length !== 2 || typeof rule.verdict !== 'string' || !['allow', 'ask', 'block'].includes(rule.verdict)) return false;
+  return (typeof rule.tool === 'string' && rule.tool.trim().length > 0)
+    || (typeof rule.effect === 'string' && ['read', 'draft', 'send', 'publish', 'purchase', 'delete', 'modify', 'admin'].includes(rule.effect))
+    || (rule.malformed === true && rule.verdict === 'ask');
 }
 
 export function parseActionGrant(payload: unknown): ActionGrantView | null {
@@ -132,7 +149,18 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
   const tool = typeof g.tool === 'string' ? g.tool : '';
   const digest = typeof g.args_digest === 'string' ? g.args_digest : '';
   if (!tool || !digest) return null;
+  const record = p as Record<string, unknown>;
+  const egress = record.egress_guard;
+  const isEgress = !!egress && typeof egress === 'object';
+  const showFull = isEgress || ['send', 'publish', 'purchase'].includes(String(g.effect));
+  const args = record.arguments;
+  const sources = isEgress ? (egress as Record<string, unknown>).sources : undefined;
   return {
+    fullArgs: showFull && args && typeof args === 'object' && !Array.isArray(args)
+      ? args as Record<string, unknown> : undefined,
+    sources: Array.isArray(sources) ? sources.filter((s): s is string => typeof s === 'string') : undefined,
+    reason: isEgress ? 'egress_guard' : typeof record.reason === 'string' ? record.reason : undefined,
+    ruleMatches: Array.isArray(record.action_rule_matches) ? record.action_rule_matches.filter(isActionRuleMatch) : [],
     tool,
     effect: typeof g.effect === 'string' ? g.effect : '',
     argsSummary: Array.isArray(g.args_summary) ? g.args_summary.filter((x): x is string => typeof x === 'string') : [],
@@ -140,7 +168,10 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
   };
 }
 
-function ActionGrantSection({ grant, t }: { grant: ActionGrantView; t: (id: string) => string }) {
+function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; expiresAt: number | null; t: (id: string) => string }) {
+  const destinations = Object.entries(grant.fullArgs ?? {}).filter(([key]) =>
+    ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id'].includes(key),
+  );
   return (
     <Section title={t('approval.grant.title')}>
       <div className="space-y-1 rounded-lg border p-3 text-sm" data-testid="action-grant">
@@ -165,6 +196,35 @@ function ActionGrantSection({ grant, t }: { grant: ActionGrantView; t: (id: stri
                 </li>
               ))}
             </ul>
+          )}
+        </div>
+        <div className="space-y-2 pt-2" data-testid={grant.fullArgs ? 'approval-full-content' : undefined}>
+          {grant.fullArgs && (
+            <>
+              <div>
+                <p className="text-xs text-muted-foreground">{t('approval.grant.destination')}</p>
+                {destinations.length ? destinations.map(([key, value]) => (
+                  <p key={key} className="break-all text-sm">{key}: {typeof value === 'string' ? value : JSON.stringify(value)}</p>
+                )) : <p className="text-xs">{t('approval.grant.destinationInContent')}</p>}
+              </div>
+              <p className="text-xs text-muted-foreground">{t('approval.grant.fullContent')}</p>
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs" tabIndex={0}>
+                {JSON.stringify(grant.fullArgs, null, 2)}
+              </pre>
+            </>
+          )}
+          <p className="text-sm">{t('approval.grant.reason')}: {t(grant.reason === 'egress_guard' ? 'approval.grant.reasonEgress' : grant.reason === 'action_rule' ? 'approval.grant.reasonRule' : 'approval.grant.reasonRequired')}</p>
+          {!!grant.sources?.length && <ul className="list-inside list-disc text-xs">{grant.sources.map((source, i) => <li key={i} className="break-all">{source}</li>)}</ul>}
+          {grant.ruleMatches.length > 0 && (
+            <div>
+              {grant.reason !== 'action_rule' && <p className="text-sm">{t('approval.grant.reasonRule')}</p>}
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs" data-testid="approval-action-rules" tabIndex={0}>
+                {JSON.stringify(grant.ruleMatches, null, 2)}
+              </pre>
+            </div>
+          )}
+          {expiresAt != null && Number.isFinite(expiresAt) && (
+            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={new Date(expiresAt * 1000).toISOString()}>{new Date(expiresAt * 1000).toLocaleString()}</time></p>
           )}
         </div>
         <p className="text-[11px] text-muted-foreground">
@@ -546,7 +606,7 @@ function GenericApprovalView({
         </div>
       </Section>
 
-      {actionGrant && <ActionGrantSection grant={actionGrant} t={t} />}
+      {actionGrant && <ActionGrantSection grant={actionGrant} expiresAt={expiresAtEpoch} t={t} />}
 
       {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
 

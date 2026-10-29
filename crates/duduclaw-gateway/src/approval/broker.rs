@@ -296,11 +296,26 @@ impl ApprovalBroker {
         approve: bool,
         decided_by: &str,
     ) -> Result<(), String> {
+        self.decide_unbound(id, approve, decided_by, false).await
+    }
+
+    /// Egress approvals require live Admin authority even without a binding.
+    pub async fn decide_egress_dashboard(
+        &self, id: &ApprovalId, ctx: &duduclaw_auth::UserContext, approve: bool,
+    ) -> Result<(), String> {
+        self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+        self.decide_unbound(id, approve, &format!("dashboard:{}", ctx.user_id), true).await
+    }
+
+    async fn decide_unbound(&self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool) -> Result<(), String> {
         let rec = self
             .store
             .get(id)
             .await?
             .ok_or_else(|| format!("approval {id} not found"))?;
+        if rec.payload.get("egress_guard").is_some() && !egress_admin {
+            return Err("outgoing data approval requires an authenticated Admin".into());
+        }
         if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
             return Err("bound requests require authenticated decision context".into());
         }

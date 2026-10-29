@@ -172,10 +172,11 @@ async fn headers_server_stream_and_tool_gate() {
 #[derive(Default)]
 struct Resume {
     gets: Vec<Option<String>>,
+    slow_wire_ids: Vec<Value>,
 }
 type R = Arc<Mutex<Resume>>;
 
-async fn resume_post(body: String) -> Response {
+async fn resume_post(State(s): State<R>, body: String) -> Response {
     let frame: Value = serde_json::from_str(&body).unwrap();
     let method = frame["method"].as_str().unwrap_or("").to_string();
     if frame.get("id").is_none() {
@@ -190,6 +191,7 @@ async fn resume_post(body: String) -> Response {
         // A priming event with an id and a short retry hint, a progress
         // notification, then the stream closes before the answer.
         "tools/call" if frame["params"]["name"] == "slow" => {
+            s.lock().unwrap().slow_wire_ids.push(frame["id"].clone());
             let note = json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"t","progress":1}});
             (
                 [("content-type", "text/event-stream")],
@@ -222,7 +224,10 @@ async fn resume_get(State(s): State<R>, headers: HeaderMap) -> Response {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     assert_eq!(last.as_deref(), Some("p-1"));
-    let answer = json!({"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"resumed"}]}});
+    // Resume the original POST's response, using its wire ID, never the
+    // caller's reusable ID. SSE event IDs are an independent cursor.
+    let wire_id = s.lock().unwrap().slow_wire_ids[0].clone();
+    let answer = json!({"jsonrpc":"2.0","id":wire_id,"result":{"content":[{"type":"text","text":"resumed"}]}});
     ([("content-type", "text/event-stream")], format!("id: p-2\ndata: {answer}\n\n")).into_response()
 }
 
@@ -266,7 +271,10 @@ async fn a_broken_post_answer_stream_is_resumed_with_last_event_id() {
                  {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}}}\n\
                  {\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"plain\",\"arguments\":{}}}\n";
     let (client, server) = tokio::io::duplex(1 << 20);
-    let code = bridge::run_bridge(home, "a1", "slowsrv", input.as_bytes(), server).await;
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bridge::run_bridge(home, "a1", "slowsrv", input.as_bytes(), server),
+    ).await.expect("resumption must complete the original pending call");
     assert_eq!(code, 0);
     let mut out = String::new();
     tokio::io::BufReader::new(client).read_to_string(&mut out).await.unwrap();
@@ -276,7 +284,11 @@ async fn a_broken_post_answer_stream_is_resumed_with_last_event_id() {
     // the resume (a 503 first, retried within the bounds).
     assert!(msgs.iter().any(|m| m["method"] == "notifications/progress"), "{out}");
     assert_eq!(by_id(7)["result"]["content"][0]["text"], "resumed", "{out}");
-    let gets = s.lock().unwrap().gets.clone();
+    assert_eq!(msgs.iter().filter(|m| m["id"] == 7).count(), 1, "{out}");
+    let state = s.lock().unwrap();
+    assert_eq!(state.slow_wire_ids.len(), 1, "resume must not dispatch a new call");
+    assert_ne!(state.slow_wire_ids[0], json!(7), "upstream uses the generation wire ID");
+    let gets = state.gets.clone();
     assert_eq!(gets, vec![Some("p-1".to_string()), Some("p-1".to_string())], "{gets:?}");
     // A stream without event ids cannot be resumed: the request fails.
     assert!(

@@ -80,6 +80,15 @@ pub(crate) fn gated_servers(
     Ok(extract_gated(&config, self_exe, own_server))
 }
 
+/// Per-spawn identity for host-owned proxies/bridges only. Never persist
+/// these pairs or merge them into an external server's declared environment.
+pub(crate) fn host_proxy_env(home: &Path, agent: &str) -> Vec<(String, String)> {
+    let mut env = duduclaw_core::agent_identity_env_vars(home, agent);
+    env.extend(crate::memory_provenance::turn_source_env_pairs());
+    env.extend(crate::runtime::round_task_env());
+    env
+}
+
 /// The spawn-time half. Nothing changes for a spawn that has no third-party
 /// server to register:
 ///

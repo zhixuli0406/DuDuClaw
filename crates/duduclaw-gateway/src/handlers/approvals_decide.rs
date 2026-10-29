@@ -34,6 +34,9 @@ impl MethodHandler {
             Err(response) => return response,
         };
         if let Some(r) = &record {
+            if let Err(error) = self.authorize_egress_decider(r, ctx) {
+                return WsFrame::error_response("", &error);
+            }
             if self
                 .authorize_workflow_activation_record(&r.payload, ctx)
                 .await
@@ -214,7 +217,12 @@ impl MethodHandler {
             }
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
-        if let Err(e) = broker.decide(&approval_id, approve, &decided_by).await {
+        let decision = if record.as_ref().is_some_and(|r| r.payload.get("egress_guard").is_some()) {
+            broker.decide_egress_dashboard(&approval_id, ctx, approve).await
+        } else {
+            broker.decide(&approval_id, approve, &decided_by).await
+        };
+        if let Err(e) = decision {
             return WsFrame::error_response("", &format!("decide: {e}"));
         }
 

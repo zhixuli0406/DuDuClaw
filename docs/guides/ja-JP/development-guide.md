@@ -332,6 +332,8 @@ Agent に入るユーザー入力は `duduclaw-security` の `input_guard` ス�
 
 ### 3.3 Tool Approval（HITL ApprovalBroker）
 
+Gateway のデータには `<home>/egress_leases.db` も含まれます。送信呼び出しの永続 fence（SQLite WAL、Unix 0600）を保存し、loopback ルートの公開前に復元します。[送信ガード](../../features/ja-JP/69-egress-guard.md)を参照してください。
+
 高リスクな操作は統一された ApprovalBroker を経由します（`approvals.db`、TTL 失
 効は拒否扱い、fail-closed）。
 - `agent.toml [capabilities] approval_required_tools` で承認が必要なツールを宣言します。`irreversible_tools` は常に確認し、`maybe_irreversible_tools` はモデルの判定が「取り消せない可能性がある」としたときに確認します（fail-closed）。リストは、呼び出しを行うエージェントについて読み込まれます。v1.67.0 より前は、エージェントが自身の MCP サーバー経由で行った呼び出しが、gateway の内部キー名に対してチェックされていたため、この 3 つのリストはそこでは効果がありませんでした。
@@ -524,3 +526,5 @@ viewport がズームされている、タイムアウト）が出ます。ヘ�
 管理者アカウントでチャンネルに `!RESUME`（または `!恢復`）を送ってください。停止状
 態はメモリ上にあるため、gateway を再起動しても解除されます。削除するシグナルファイ
 ルはなく、`emergency_stop` という MCP ツールもありません。
+
+Store は存続中に `<home>/egress_leases.lock` の排他ファイルロック（Unix 0600）を保持します。同じ home を使う二つ目の gateway は強制モードで読み取りと新規送信を拒否して再試行し、取得後に全 lease を復元してから読み取りを許可します。`shadow` は許可して監査します。Gateway の実行中はロックファイルを削除しないでください。有効な lease ID の重複は挿入前に拒否し、他のスタッフを停止しません。

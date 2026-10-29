@@ -225,6 +225,10 @@ pub(crate) fn live_entry(s: &ScopedServer) -> toml::Value {
     for (k, v) in &s.proxy_env {
         env.insert(k.clone(), toml::Value::String(v.clone()));
     }
+    // Values are resolved from this spawn, never written into this shared file.
+    for key in [duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::ENV_TRUST_TURN_ID] {
+        env.insert(key.into(), toml::Value::String(format!("${{{key}:-}}")));
+    }
     env.insert(
         PROXY_UPSTREAM_ENV_DIR_VAR.to_string(),
         toml::Value::String(env_dir_reference()),

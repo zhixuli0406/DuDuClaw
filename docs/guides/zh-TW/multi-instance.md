@@ -6,7 +6,7 @@
 
 | 環境變數 | 用途 | 每個實例是否必須不同 |
 | --- | --- | --- |
-| `DUDUCLAW_HOME` | 狀態根目錄：config、SQLite 資料庫、`bus_queue.jsonl`、`events.db`、models、shared wiki、secrets、cron。預設為 `~/.duduclaw`。 | **是** |
+| `DUDUCLAW_HOME` | 狀態根目錄：config、SQLite 資料庫、`bus_queue.jsonl`、`events.db`、`egress_leases.db`、`egress_leases.lock`、models、shared wiki、secrets、cron。預設為 `~/.duduclaw`。 | **是** |
 | `DUDUCLAW_PORT` | Gateway 的 HTTP/WS 埠號。預設為 `18889`。 | **是** |
 | `DUDUCLAW_INSTANCE` | 短實例名稱（`[a-z0-9-]`）。用來替 `~/.claude/settings.json` 裡的**全域 MCP 註冊**鍵名加上命名空間（`duduclaw` → `duduclaw-<name>`），避免各實例互相覆蓋。 | 建議設定 |
 

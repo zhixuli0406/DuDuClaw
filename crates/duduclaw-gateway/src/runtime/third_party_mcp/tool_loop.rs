@@ -12,7 +12,7 @@
 //! - Each server is started as the gated rewrite produced it: `duduclaw
 //!   mcp-proxy` for a stdio server, DuDuClaw's bridge for a remote one; a
 //!   direct URL entry is removed (audited). The proxy's env (identity
-//!   without the MAC, the MCP credential, the upstream env inline in
+//!   with its per-spawn MAC, the MCP credential, the upstream env inline in
 //!   `DUDUCLAW_MCP_PROXY_ENV`) is handed to the child process only; nothing
 //!   is written to disk. The child starts from the agent-CLI allowlisted
 //!   environment (`McpClient::connect_scrubbed`), not the gateway's.
@@ -58,6 +58,7 @@ pub(crate) async fn servers_for_tool_loop(
     let explore = crate::explore_lane::in_explore();
     let gated = gated_servers_for_spawn(agent_dir, home_dir, &own, explore).await?;
     let lane = crate::explore_lane::lane_env();
+    let host_env = super::host_proxy_env(home_dir, agent_id);
     Ok(gated
         .into_iter()
         .filter(|(name, server)| {
@@ -74,6 +75,10 @@ pub(crate) async fn servers_for_tool_loop(
         .map(|(name, server)| {
             let mut env: Vec<(String, String)> = server.env.into_iter().collect();
             env.extend(lane.clone());
+            for (key, value) in &host_env {
+                env.retain(|(existing, _)| existing != key);
+                env.push((key.clone(), value.clone()));
+            }
             ToolLoopServer {
                 name,
                 command: server.command,
@@ -212,6 +217,22 @@ mod tests {
         assert!(lane(&explore), "{:?}", explore[0].env);
         // The upstream env rides inline in the child env, never on argv.
         assert!(!explore[0].args.iter().any(|a| a.contains("pw")));
+    }
+
+    #[tokio::test]
+    async fn host_identity_and_turn_reach_only_the_proxy_environment() {
+        let (home, dir) = employee_with_broker();
+        let key = duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let servers = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(
+            Some("proxy-turn-123".into()),
+            servers_for_tool_loop("trader", home.path(), &dir, &[]),
+        ).await.unwrap();
+        let env: std::collections::HashMap<_, _> = servers[0].env.iter().cloned().collect();
+        assert_eq!(env[duduclaw_core::ENV_TRUST_TURN_ID], "proxy-turn-123");
+        assert_eq!(env[duduclaw_core::ENV_AGENT_TOKEN], duduclaw_core::mint_identity_token(&key, "trader"));
+        let upstream: serde_json::Value = serde_json::from_str(&env[duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_VAR]).unwrap();
+        assert!(upstream.get(duduclaw_core::ENV_AGENT_TOKEN).is_none());
+        assert!(upstream.get(duduclaw_core::ENV_TRUST_TURN_ID).is_none());
     }
 
     #[tokio::test]

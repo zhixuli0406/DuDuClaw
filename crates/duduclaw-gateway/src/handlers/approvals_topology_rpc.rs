@@ -74,8 +74,9 @@ impl MethodHandler {
                     }
                     // Binding data and question answers go only to a viewer
                     // who may decide this card.
-                    let may_decide = r.binding.is_none()
-                        || Box::pin(self.authorize_bound_decider(r, &fresh)).await.is_ok();
+                    let may_decide = self.authorize_egress_decider(r, &fresh).is_ok()
+                        && (r.binding.is_none()
+                            || Box::pin(self.authorize_bound_decider(r, &fresh)).await.is_ok());
                     let activation = super::approval_decider::is_activation_record(r);
                     let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
                     // E8 reverse handoff: "在 <通道> 中開啟" — the WP20
@@ -136,16 +137,17 @@ impl MethodHandler {
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
                         "summary": r.summary,
-                        "payload": if r.binding.is_some() {json!({
+                        "payload": if r.binding.is_some()
+                            && !may_show_bound_egress(&r.payload, fresh.is_admin(), may_decide) {json!({
                             "redacted": true,
                             "payload_hash": r.binding.as_ref().map(|b|&b.payload_hash)
-                        })}else{r.payload.clone()},
+                        })}else{dashboard_action_payload(&r.payload, fresh.is_admin())},
                         "request_kind":r.request_kind,
                         "status":r.status,
                         "binding": if may_decide { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
-                        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_kind(&r.action_kind),
+                        "decided_in_dashboard_only": r.payload.get("egress_guard").is_some() || crate::approval_notify::is_dashboard_only_kind(&r.action_kind),
                         "submitter_is_viewer": activation
                             && super::approval_decider::submitter_is_decider(r, &fresh),
                         // A-H-1: what an Admin accepts — each effect and the
@@ -282,5 +284,44 @@ impl MethodHandler {
         })
         .await
         .is_ok()
+    }
+}
+
+/// Full outbound content is only delivered to the dashboard administrator.
+fn may_show_bound_egress(payload: &Value, admin: bool, may_decide: bool) -> bool {
+    admin && may_decide && payload.get("egress_guard").is_some()
+}
+
+fn dashboard_action_payload(payload: &Value, admin: bool) -> Value {
+    let outbound = payload.get("egress_guard").is_some()
+        || matches!(payload.get("action_grant").and_then(|g| g.get("effect")).and_then(Value::as_str),
+            Some("send" | "publish" | "purchase"));
+    if outbound && !admin { json!({"redacted": true}) } else { payload.clone() }
+}
+
+#[cfg(test)]
+mod egress_payload_tests {
+    use super::*;
+
+    #[test]
+    fn bound_egress_requires_fresh_decision_authority() {
+        let payload = json!({"egress_guard": {"sources": ["memory_read"]}});
+        assert!(may_show_bound_egress(&payload, true, true));
+        assert!(!may_show_bound_egress(&payload, true, false));
+        assert!(!may_show_bound_egress(&payload, false, true));
+        assert!(!may_show_bound_egress(&json!({}), true, true));
+    }
+
+    #[test]
+    fn full_outbound_arguments_are_admin_only() {
+        for marker in [json!({"egress_guard": {"sources": ["memory_read"]}}),
+            json!({"action_grant": {"effect": "send"}}),
+            json!({"action_grant": {"effect": "publish"}}),
+            json!({"action_grant": {"effect": "purchase"}})] {
+            let mut payload = marker;
+            payload["args"] = json!({"content": "complete private content", "to": "recipient@example.com"});
+            assert_eq!(dashboard_action_payload(&payload, true), payload);
+            assert_eq!(dashboard_action_payload(&payload, false), json!({"redacted": true}));
+        }
     }
 }

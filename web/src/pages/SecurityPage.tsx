@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router';
 import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
-import { AdvancedSection, ConfirmDialog } from '@/components/settings/controls';
+import { AdvancedSection, ConfirmDialog, OptionSelect } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
@@ -42,6 +42,7 @@ import {
   type SettingsSaveStatus,
 } from '@/components/mds';
 import { cn } from '@/lib/utils';
+import { useConfigForm, vStr } from '@/components/settings/useConfigForm';
 import {
   Shield,
   Users,
@@ -145,6 +146,8 @@ export function SecurityPage() {
           Every edition: person identities by domain-wide delegation exist in
           both, so both need to see (and change) where they are protected. */}
       <CredentialProtectionPanel />
+
+      <EgressGuardSection />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an
@@ -689,3 +692,32 @@ function SecurityCard({
 
 // G2 (2026-09 feature audit): `StatusRow` and `RuleRow` were removed with the
 // Credential Proxy and Mount Guard cards — they had no other call site.
+
+function EgressGuardSection() {
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+  const form = useConfigForm((tables) => ({
+    'security.egress_guard': tables.security?.egress_guard ?? 'shadow',
+  }));
+  const mode = vStr(form.values, 'security.egress_guard');
+  const modes = ['off', 'shadow', 'ask', 'block'];
+  return (
+    <SecurityCard icon={Shield} title={t('security.egress.title')} description={t('security.egress.description')}>
+      <div className="space-y-3">
+        <label htmlFor="egress-guard-mode" className="text-sm">{t('security.egress.mode')}</label>
+        <OptionSelect
+          id="egress-guard-mode"
+          value={modes.includes(mode) ? mode : 'block'}
+          onChange={(value) => form.set('security.egress_guard', value)}
+          options={modes.map((value) => ({ value, label: t(`security.egress.${value}`) }))}
+          disabled={!form.loaded || form.saving || form.loadError != null}
+        />
+        <p className="text-xs text-muted-foreground">{t('security.egress.limits')}</p>
+        {form.loadError != null && <p role="alert" className="text-sm text-destructive">{t('security.egress.loadFailed')}</p>}
+        <Button size="sm" variant="brand" onClick={() => void form.save()} disabled={!form.loaded || form.saving || form.loadError != null || form.dirtyKeys.length === 0}>
+          {t(form.saving ? 'common.saving' : 'security.egress.save')}
+        </Button>
+      </div>
+    </SecurityCard>
+  );
+}
