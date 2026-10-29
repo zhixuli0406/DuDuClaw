@@ -198,7 +198,7 @@ impl ApprovalBroker {
     pub async fn current_revision_grant(
         &self,
         activation_id: &str,
-    ) -> Result<Option<(GrantRef, GrantSpec, String)>, String> {
+    ) -> Result<Option<(GrantRef, GrantSpec, String)>, RevisionGrantReadError> {
         let conn = self.store.conn.lock().await;
         let row: Option<(String, i64, String, String, String)> = conn
             .query_row(
@@ -208,15 +208,15 @@ impl ApprovalBroker {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             )
             .optional()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| RevisionGrantReadError::Store(e.to_string()))?;
         row.map(|(id, epoch, hash, raw, state)| {
-            let spec: GrantSpec =
-                serde_json::from_str(&raw).map_err(|_| "invalid current grant")?;
+            let spec: GrantSpec = serde_json::from_str(&raw)
+                .map_err(|_| RevisionGrantReadError::InvalidCurrentGrant)?;
             if spec.hash() != hash
                 || spec.activation_id != activation_id
                 || !matches!(state.as_str(), "prepared" | "active" | "revoked")
             {
-                return Err("current grant material corrupt".into());
+                return Err(RevisionGrantReadError::MaterialCorrupt);
             }
             spec.validate_standing_tools()?;
             Ok((
@@ -452,13 +452,16 @@ impl ApprovalBroker {
         })
     }
     /// True when an authoritative revocation tombstone exists for the activation.
-    pub async fn activation_revoked(&self, activation_id: &str) -> Result<bool, String> {
+    pub async fn activation_revoked(
+        &self,
+        activation_id: &str,
+    ) -> Result<bool, RevisionGrantReadError> {
         let conn = self.store.conn.lock().await;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM main.workflow_activation_revocations WHERE activation_id=?1)",
             params![activation_id],
             |r| r.get(0),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| RevisionGrantReadError::Store(e.to_string()))
     }
 }

@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- 既有工作流程授權含購買或刪除工具，或授權內容無效、損毀、已撤銷或遺失時，gateway 開機對帳只把該工作流程標為失敗、停用它的排程並記下原因，其餘工作流程照常處理。授權帳本讀取失敗（資料庫忙碌、鎖定、讀寫錯誤、資料表不存在）不再把每一個工作流程標成失敗，而是停止該階段並讓這次開機對帳失敗；其他階段仍會執行。停用排程寫入失敗時，該工作流程仍標為失敗，後面的項目繼續處理。對帳日誌只記固定原因代碼與最多 120 字的工具名稱，錯誤最多保留 200 筆並記下省略的筆數。
 - 文件與操作者指令說明中的 `duduclaw ops channel-ingress`、`duduclaw ops computer-workspaces`、`duduclaw ops computer-profiles` 改為實際可執行的 `duduclaw channel-ingress` 等；AI 員工 Bash 指令的操作者指令攔阻也改為比對實際寫法（先前比對的是無法執行的 `ops` 寫法，實際指令未被這一層攔下；行程內的 AI 工作階段檢查與儀表板核准不受影響）。補上 `computer-profiles` 的 Bash hook 攔阻（含唯讀查詢），保守比對字面的指令詞組，並對 `echo`／`printf` 各個不超過 64 KiB 的字串參數、shell `-c` 與 `eval` 內容共用最多兩層重解析；支援 `-xc` 等短旗標組合、`-c` 前後的選項與 `--`。Bash 層仍是有已知缺口的減速帶：不支援 ANSI-C 引號與命令替換動態組裝，格式錯誤的引號也不會一律拒絕；受保護狀態變更的真正關卡是行程內的 AI 工作階段檢查與儀表板 Admin 核准。
 
 ## [1.76.4] - 2026-10-29 — Codex timeout, background runtime and Odoo compatibility hotfix
