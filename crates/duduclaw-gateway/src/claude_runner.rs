@@ -3401,6 +3401,11 @@ async fn call_with_rotation(
                 if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
                     return Err(e);
                 }
+                // An autonomy pause refusal is not the account's fault, and every
+                // other account would be refused the same way.
+                if crate::autonomous_runtime::was_denied() {
+                    return Err(e);
+                }
                 last_error = e.clone();
                 if is_billing_error(&e) {
                     // Billing/credit exhaustion: long cooldown (24h), mark unhealthy immediately

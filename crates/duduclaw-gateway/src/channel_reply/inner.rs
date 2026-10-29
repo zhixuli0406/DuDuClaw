@@ -3692,14 +3692,22 @@ pub(super) async fn build_reply_with_session_inner(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match crate::autonomous_runtime::scope(
+                // Read the denial flag inside the scope: non-Claude runtimes
+                // wrap the refusal text, so the prefix alone can miss a pause
+                // that lands between the context check and spawn/send.
+                let (result, denied) = crate::autonomous_runtime::scope(
                     &home_for_compress, &agent_for_compress, &[],
-                    super::cli_spawn::call_background_utility(
-                        &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
-                    ),
+                    async {
+                        let result = super::cli_spawn::call_background_utility(
+                            &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
+                        )
+                        .await;
+                        (result, crate::autonomous_runtime::was_denied())
+                    },
                 )
-                .await
-                {
+                .await;
+                let summary = match result {
+                    _ if denied => return,
                     Ok(s) => s,
                     Err(e) if e.starts_with("AUTONOMY_") => return,
                     Err(_) => {

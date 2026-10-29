@@ -906,8 +906,23 @@ where
                 crate::task_sandbox::HostAction::RanOnHost,
             );
             reminder_autonomy_check(home_dir, registry, reminder).await?;
-            let result = invoke(reminder.agent_id.clone(), full_prompt).await;
+            // Read the denial flag inside the scope: runtimes wrap the refusal
+            // text, so a pause landing after the check above must still leave
+            // the reminder Pending rather than Failed.
+            let (result, denied) = crate::autonomous_runtime::scope(
+                home_dir, &reminder.agent_id, &[],
+                async {
+                    let result = invoke(reminder.agent_id.clone(), full_prompt).await;
+                    (result, crate::autonomous_runtime::was_denied())
+                },
+            )
+            .await;
             drop(typing_guard);
+            if denied {
+                if let Err(e) = &result {
+                    return Err(format!("{AUTONOMY_PAUSED}{e}"));
+                }
+            }
             result.map_err(|e| format!("Agent callback failed: {e}"))?
         }
     };

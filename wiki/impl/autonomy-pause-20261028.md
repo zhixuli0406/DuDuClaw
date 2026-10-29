@@ -1010,3 +1010,31 @@ Daybreak Blue 第九輪：第八輪 MEDIUM 與兩個 LOW 已關閉；新找到�
 | `fork.resolve` 缺 per-agent Operator 檢查；清理 DB 錯誤被忽略 | `handlers/dispatch_org.rs:641`、`fork_migrate_rpc.rs:190,227` | 第七輪列出，既有問題。 |
 
 已知限制維持：handoff 自動封存前已搬移資料；`merge_or_select` 持 admission 時可能使暫停 30 秒逾時；Windows 非 Unix 路徑缺 handle 層級驗證（擁有者未決）；跨程序競態、crash/fsync、Linux／Windows 原生與真實 LLM 未做活體驗收。
+
+## Rebase 到 main 7040fac7 與合併後修補（Claude，2026-10-30）
+
+分支從 cea6515a1 rebase 到 7040fac7（main 期間合進 fb37bc5c 背景工作改走員工 runtime、bd1b7f36 資料外送防護、287214cb 目標費用上限等）。27 段衝突由 Grok 合併；Grok 隨後額度用完，Codex 也不可用（至 2026-11-04），之後的修補由 Claude 撰寫，審查改由獨立 Claude subagent 唯讀進行。
+
+合併要點：main 把壓縮、事實擷取、指令釘選、決策擷取、摘要、標題等背景工作改走各 runtime 後，admission 移到新的共用位置：`process_group.rs` `output_for_model`（CLI 類 runtime 持 lease 跨 spawn）、`runtime/codex.rs` `collect_codex_output`、OpenAI-compat 在 response headers 後釋放。版本探測（`--version`）仍走不取 lease 的 `output()`。獨立審查逐條確認每條 runtime 路徑在暫停時都會被擋。
+
+rebase 後 11 個 main 新增測試不符本功能的閘門，全部只改測試：宣告自主或全域維護身分（`autonomous_runtime::scope`／`with_utility_context`）或補上 `status = "active"` 的員工設定檔，對應正式呼叫端的做法。`goal_judge` 測試的第 6 次 CLI 呼叫原本因缺身分被擋、斷言卻仍成立，補上 scope 後才真正測到。
+
+審查發現與修補（Claude 撰寫）：
+
+| 發現 | 嚴重度 | 修補 |
+|---|---|---|
+| 對話壓縮只認 `AUTONOMY_` 前綴；非 Claude runtime 會把拒絕包一層，暫停若落在檢查與 spawn 之間，整段對話歷史會被占位文字取代 | MEDIUM（合併後出現） | `channel_reply/inner.rs` 在 scope 內讀 `was_denied()`，被拒就 return |
+| failover 把傳輸層的暫停拒絕記成供應端失敗，三次後讓 runtime 冷卻，真人聊天也受影響 | LOW | `failover.rs` 主要分支被拒即停、不記失敗、不試備援；備援分支被拒不記失敗。測試 `autonomy_refusal_never_puts_a_runtime_into_cooldown` 涵蓋兩個分支 |
+| Claude 帳號輪替把暫停拒絕記到每個帳號 | LOW～MEDIUM（本功能既有） | `claude_runner.rs` `call_with_rotation` 與 `channel_reply/cli_spawn.rs` 輪替迴圈，被拒即回傳、不計帳號、不換下一個 |
+| 提醒在檢查後才被暫停時，包過的拒絕對不上本地前綴，提醒被標成 Failed | LOW（本功能既有） | `reminder_scheduler.rs` 在 scope 內讀 `was_denied()`，被拒時加上 `autonomy paused: ` 前綴，維持 Pending |
+
+未修、列後續：`DENIED` 旗標在同一個 root scope 內是黏著的；先前有過一次被吞掉的拒絕（例如 team round 內另一個已暫停身分的巢狀 scope）或長 scope 中途解除暫停時，之後真的供應端錯誤不會被計入、也不試備援。dispatcher 與 ephemeral dispatch 早已是同樣行為，影響小。可行修法：提供「在新的子旗標下執行並回傳本次是否被拒」的輔助函式。
+
+### 再 rebase 到 c672814b（v1.77.0 的 #252–#254 合併後）
+
+main 合進本 session 的三個小修補後再 rebase 一次，衝突 4 檔，由 Claude 解：
+
+- `mcp/evolution.rs`：保留 #252 抽出的 `write_evolution_toggle`（鎖內重查呼叫者權限、以 `actor.id()` 記錄寫入者），改用 `edit_agent_toml_guarded`，把本功能的背景 admission 放在寫入前的 guard，持有到寫入完成。
+- `lib.rs` 的 `agent pause/resume/freeze/unfreeze`：採用 #254 的 `agent_control_cmd`（AI 工作階段拒絕、共用加鎖寫入器、稽核）。本功能原本的 `agent_freeze.rs` 刪除；它保護的行為（凍結不覆蓋同時完成的暫停／封存）由共用寫入器提供，測試 `freeze_delayed_edit_preserves_completed_lifecycle_changes` 移到 `agent_control_cmd/agent_cli_guard_tests.rs`，改測真正的指令路徑。上文提到 `agent_freeze.rs` 的段落是 rebase 前的歷史紀錄。
+- `wiki_namespace_tests/part3.rs`：保留本功能的 `with_background_caller` 包裝，加上 #252 新增的 `op` 參數。
+- `CHANGELOG.md`：兩邊 `[Unreleased] Security` 條目都保留。

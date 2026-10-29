@@ -590,6 +590,12 @@ where
                     );
                     return Err(e);
                 }
+                // Same for an autonomy pause refusal: not an account failure,
+                // and the next account would be refused too.
+                if crate::autonomous_runtime::was_denied() {
+                    warn!(account = %selected.id, "Autonomy paused — not an account failure, not retried");
+                    return Err(e);
+                }
                 last_error = e.clone();
                 if crate::claude_runner::is_billing_error(&e) {
                     warn!(account = %selected.id, error = %e, "Account billing exhausted — 24h cooldown");
