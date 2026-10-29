@@ -20,6 +20,20 @@ All three are Admin features for connecting; anyone signed in can search the
 Registry, and a non-Admin's install becomes an install request for the usual
 manager → Admin approval.
 
+### Installing from the built-in catalogue, and changing arguments later
+
+The **Add MCP Server** button in the page header and the **Install to Agent**
+button on a Marketplace card open the same form. It shows the command,
+arguments and environment variables the server will run with, so you can
+change them before installing (for example, remove `--headless` from
+Playwright to see the browser window on the machine that runs DuDuClaw).
+
+To change an installed server, open **Agent Config**, pick the employee, and
+choose **Edit** from the row's menu. Installing a server under a name the
+employee already has also opens it for editing and replaces its settings.
+Stored secret values are kept; values written as a `${…}` reference must be
+entered again. The change applies from the employee's next run.
+
 ## 1. MCP Registry search and install
 
 `MCP → MCP Registry`: type a name or topic and search. Results come from

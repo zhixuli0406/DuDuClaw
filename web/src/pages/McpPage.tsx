@@ -59,6 +59,7 @@ import {
 import {
   Plug,
   Plus,
+  Pencil,
   Trash2,
   Package,
   Globe,
@@ -99,6 +100,26 @@ function transportOf(def: McpServerDef): 'stdio' | 'http' {
   return blob.includes('mcp-remote') || blob.includes('http') ? 'http' : 'stdio';
 }
 
+/**
+ * What the add/edit dialog opens with. Every install path (header button,
+ * marketplace card, a row's 編輯) goes through the one dialog, so the
+ * command/args the operator may want to change are always on screen.
+ * `lock` pins the agent and server name (editing an installed row).
+ */
+type AddDialogPreset = {
+  catalogId?: string;
+  agentId?: string;
+  serverName?: string;
+  lock?: boolean;
+};
+
+/** Normalize an agent config's `servers` (array, or the older object shape). */
+function serverEntriesOf(servers: McpServerEntry[] | Record<string, McpServerDef>): McpServerEntry[] {
+  return Array.isArray(servers)
+    ? servers
+    : Object.entries(servers).map(([name, def]) => ({ name, ...def }));
+}
+
 /** Column template shared by the MCP-server ListGrid header + rows (spec §4). */
 const SERVER_COLUMNS =
   'minmax(0,1.4fr) minmax(0,1.6fr) minmax(0,0.7fr) minmax(0,0.5fr) 2.5rem';
@@ -117,7 +138,9 @@ export function McpPage() {
   // one query string must not fight over the same key.
   const [activeTab, setActiveTab] = useUrlState('mcp_tab', 'agents', { allowed: TABS });
   const [selectedAgentId, setSelectedAgentId] = useUrlStateNullable('mcp_agent');
-  const [showAddDialog, setShowAddDialog] = useState(false);
+  // `null` = closed. One dialog for every install / edit entry point.
+  const [addPreset, setAddPreset] = useState<AddDialogPreset | null>(null);
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [catalogFilter, setCatalogFilter] = useUrlStateNullable('mcp_cat');
   const [catalogSearch, setCatalogSearch] = useUrlState('mcp_q', '');
@@ -150,12 +173,13 @@ export function McpPage() {
   // entries; normalize to McpServerEntry[]. The Array.isArray guard keeps older
   // object-shaped payloads working.
   const serverEntries: McpServerEntry[] = selectedConfig
-    ? Array.isArray(selectedConfig.servers)
-      ? selectedConfig.servers
-      : Object.entries(
-          selectedConfig.servers as Record<string, McpServerDef>,
-        ).map(([name, def]) => ({ name, ...def }))
+    ? serverEntriesOf(selectedConfig.servers)
     : [];
+
+  const installedServers = (agentId: string): McpServerEntry[] => {
+    const cfg = agentConfigs.find((c) => c.agent_id === agentId);
+    return cfg ? serverEntriesOf(cfg.servers) : [];
+  };
 
   const agentLabel = (agentId: string) =>
     agents.find((a) => a.name === agentId)?.display_name ?? agentId;
@@ -182,9 +206,7 @@ export function McpPage() {
 
   // Check if a catalog item is installed on any agent
   const isInstalled = (catalogId: string) =>
-    agentConfigs.some((cfg) =>
-      (Array.isArray(cfg.servers) ? cfg.servers.map((s) => s.name) : Object.keys(cfg.servers)).includes(catalogId),
-    );
+    agentConfigs.some((cfg) => serverEntriesOf(cfg.servers).some((s) => s.name === catalogId));
 
   // 2026-08-04 (D19): the separate 授權 sub-tab is gone. Services that need a
   // sign-in now show their state and their 授權 button on their own card, in
@@ -223,7 +245,7 @@ export function McpPage() {
             <LinkIcon />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.import.fromUrl' })}</span>
           </Button>
-          <Button variant="brand" size="sm" onClick={() => setShowAddDialog(true)}>
+          <Button variant="brand" size="sm" onClick={() => setAddPreset({})}>
             <Plus />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.add' })}</span>
           </Button>
@@ -294,6 +316,11 @@ export function McpPage() {
                   <ServerRow
                     key={entry.name}
                     entry={entry}
+                    canEdit={isAdmin}
+                    onEdit={() =>
+                      selectedAgentId &&
+                      setAddPreset({ agentId: selectedAgentId, serverName: entry.name, lock: true })
+                    }
                     onRemove={() => selectedAgentId && setRemoveTarget({ agentId: selectedAgentId, serverName: entry.name })}
                   />
                 ))}
@@ -318,34 +345,33 @@ export function McpPage() {
           setCatalogSearch={setCatalogSearch}
           isInstalled={isInstalled}
           agents={agents}
-          onInstall={async (agentId, item, env) => {
-            // v1.68: install through `marketplace.install`, which uses the
-            // catalogue's real definition server-side. `item.default_def.env`
-            // here holds masked status words (set / not_set / reference) and
-            // must never be echoed back as values.
-            try {
-              await api.marketplace.install(item.id, agentId, env);
-              await useMcpStore.getState().fetchAll();
-              showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: item.name, agent: agentLabel(agentId) }));
-            } catch (e) {
-              showToast('error', intl.formatMessage({ id: 'mcp.installFailed' }, { message: e instanceof Error ? e.message : String(e) }));
-              throw e;
-            }
-          }}
+          // 2026-10-30: the card used to open its own agent-only dialog, so
+          // an operator who needed different arguments (e.g. Playwright
+          // without `--headless`) had no field to change them. It now opens
+          // the shared dialog with this item preselected.
+          onOpenInstall={(item) => setAddPreset({ catalogId: item.id })}
         />
       )}
 
-      {/* Add Server Dialog */}
+      {/* Add / edit server dialog — the only install form on this page. */}
       <AddServerDialog
-        open={showAddDialog}
-        onClose={() => setShowAddDialog(false)}
+        preset={addPreset}
+        onClose={() => setAddPreset(null)}
         catalog={catalog}
         agents={agents}
-        onAdded={(serverName, agentId) => {
-          showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: serverName, agent: agentLabel(agentId) }));
+        installedServers={installedServers}
+        canEdit={isAdmin}
+        onAdded={(serverName, agentId, replaced) => {
+          showToast(
+            'success',
+            intl.formatMessage(
+              { id: replaced ? 'mcp.edit.saved' : 'mcp.added' },
+              { server: serverName, agent: agentLabel(agentId) },
+            ),
+          );
         }}
-        onError={() => {
-          showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
+        onError={(message) => {
+          showToast('error', intl.formatMessage({ id: 'mcp.installFailed' }, { message }));
         }}
       />
 
@@ -384,7 +410,17 @@ export function McpPage() {
 
 // ── Agent-config server row (spec §4 ListGrid) ─────────────────
 
-function ServerRow({ entry, onRemove }: { entry: McpServerEntry; onRemove: () => void }) {
+function ServerRow({
+  entry,
+  canEdit,
+  onEdit,
+  onRemove,
+}: {
+  entry: McpServerEntry;
+  canEdit: boolean;
+  onEdit: () => void;
+  onRemove: () => void;
+}) {
   const intl = useIntl();
   const transport = transportOf(entry);
   const envCount = Object.keys(entry.env).length;
@@ -423,6 +459,10 @@ function ServerRow({ entry, onRemove }: { entry: McpServerEntry; onRemove: () =>
             <MoreHorizontal />
           </DropdownMenuTrigger>
           <DropdownMenuContent>
+            <DropdownMenuItem onClick={onEdit} disabled={!canEdit}>
+              <Pencil />
+              {intl.formatMessage({ id: 'common.edit' })}
+            </DropdownMenuItem>
             <DropdownMenuItem variant="destructive" onClick={onRemove}>
               <Trash2 />
               {intl.formatMessage({ id: 'mcp.remove' })}
@@ -445,7 +485,7 @@ function MarketplaceTab({
   setCatalogSearch,
   isInstalled,
   agents,
-  onInstall,
+  onOpenInstall,
 }: {
   catalog: ReadonlyArray<McpCatalogItem>;
   categories: string[];
@@ -455,7 +495,7 @@ function MarketplaceTab({
   setCatalogSearch: (v: string) => void;
   isInstalled: (id: string) => boolean;
   agents: ReadonlyArray<AgentLite>;
-  onInstall: (agentId: string, item: McpCatalogItem, env: Record<string, string>) => Promise<void>;
+  onOpenInstall: (item: McpCatalogItem) => void;
 }) {
   const intl = useIntl();
   return (
@@ -503,7 +543,7 @@ function MarketplaceTab({
               item={item}
               installed={isInstalled(item.id)}
               agents={agents}
-              onInstall={(agentId, env) => onInstall(agentId, item, env)}
+              onOpenInstall={() => onOpenInstall(item)}
             />
           ))}
         </div>
@@ -516,43 +556,18 @@ function CatalogRow({
   item,
   installed,
   agents,
-  onInstall,
+  onOpenInstall,
 }: {
   item: McpCatalogItem;
   installed: boolean;
   agents: ReadonlyArray<AgentLite>;
-  onInstall: (agentId: string, env: Record<string, string>) => Promise<void>;
+  onOpenInstall: () => void;
 }) {
   const intl = useIntl();
   const CatIcon = getCategoryIcon(item.category);
-  const [showInstall, setShowInstall] = useState(false);
   // E3: a remote card (hosted aggregator) is connected, not installed.
   const [showConnect, setShowConnect] = useState(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
-  const [targetAgent, setTargetAgent] = useState('');
-  const [installing, setInstalling] = useState(false);
-  // Typed values for the item's required env names; cleared on close/success.
-  const [envValues, setEnvValues] = useState<Record<string, string>>({});
-  const envMissing = missingRequiredEnv(item.required_env, envValues).length > 0;
-
-  const closeInstall = () => {
-    setShowInstall(false);
-    setTargetAgent('');
-    setEnvValues({});
-  };
-
-  const handleInstall = async () => {
-    if (!targetAgent || envMissing) return;
-    setInstalling(true);
-    try {
-      await onInstall(targetAgent, requiredEnvPayload(item.required_env, envValues));
-      closeInstall();
-    } catch {
-      /* the parent already showed the error; keep the dialog open */
-    } finally {
-      setInstalling(false);
-    }
-  };
 
   return (
     <div className="flex items-center gap-3 px-4 py-3">
@@ -594,7 +609,7 @@ function CatalogRow({
           <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.remote.connect' })}</span>
         </Button>
       ) : (
-        <Button variant="outline" size="sm" onClick={() => setShowInstall(true)} className="shrink-0">
+        <Button variant="outline" size="sm" onClick={onOpenInstall} className="shrink-0">
           <Plus />
           <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.catalog.install' })}</span>
         </Button>
@@ -616,33 +631,6 @@ function CatalogRow({
         />
       )}
 
-      <Dialog open={showInstall} onOpenChange={(o) => { if (!o) closeInstall(); }}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{intl.formatMessage({ id: 'mcp.catalog.install' })}</DialogTitle>
-            <DialogDescription>{item.name}</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground">
-              {intl.formatMessage({ id: 'mcp.targetAgent' })}
-            </label>
-            <AgentSelect
-              value={targetAgent}
-              onChange={setTargetAgent}
-              agents={agents}
-              placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
-            />
-          </div>
-          <RequiredEnvFields required={item.required_env} values={envValues} onChange={setEnvValues} />
-          <AutonomyNote id="mcpInstall" />
-          <DialogFooter>
-            <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
-            <Button variant="brand" onClick={handleInstall} disabled={installing || !targetAgent || envMissing}>
-              {installing ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.catalog.install' })}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
@@ -1272,24 +1260,73 @@ function ConfigureOAuthDialog({
   );
 }
 
-// ── Add server dialog (catalog / custom) ───────────────────────
+// ── Add / edit server dialog (catalog / custom) ────────────────
+
+/**
+ * Prefill for an already-installed server. `mcp.list` answers env values as
+ * status words: `set` is sent back verbatim so `mcp.update` keeps the stored
+ * secret; `reference` / `not_set` cannot be carried over, so the line is left
+ * empty and the name is reported for re-entry. A required name that is not
+ * `set` gets no line at all: the required-value field asks for it instead.
+ */
+function prefillFromInstalled(
+  entry: McpServerEntry,
+  required: ReadonlyArray<string>,
+): {
+  command: string;
+  args: string;
+  envText: string;
+  reenter: string[];
+} {
+  const reenter: string[] = [];
+  const lines: string[] = [];
+  for (const [name, status] of Object.entries(entry.env)) {
+    if (status === 'set') {
+      lines.push(`${name}=set`);
+    } else if (!required.includes(name)) {
+      if (status === 'reference') reenter.push(name);
+      lines.push(`${name}=`);
+    }
+  }
+  return { command: entry.command, args: entry.args.join(' '), envText: lines.join('\n'), reenter };
+}
+
+function parseEnvText(envText: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  for (const line of envText.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const eqIdx = t.indexOf('=');
+    if (eqIdx > 0) {
+      parsed[t.slice(0, eqIdx)] = t.slice(eqIdx + 1);
+    }
+  }
+  return parsed;
+}
 
 function AddServerDialog({
-  open,
+  preset,
   onClose,
   catalog,
   agents,
+  installedServers,
+  canEdit,
   onAdded,
   onError,
 }: {
-  open: boolean;
+  /** `null` = closed. */
+  preset: AddDialogPreset | null;
   onClose: () => void;
   catalog: ReadonlyArray<McpCatalogItem>;
   agents: ReadonlyArray<AgentLite>;
-  onAdded: (serverName: string, agentId: string) => void;
-  onError: () => void;
+  installedServers: (agentId: string) => ReadonlyArray<McpServerEntry>;
+  canEdit: boolean;
+  onAdded: (serverName: string, agentId: string, replaced: boolean) => void;
+  onError: (message: string) => void;
 }) {
   const intl = useIntl();
+  const open = preset !== null;
+  const locked = preset?.lock === true;
   const [mode, setMode] = useState<'catalog' | 'custom'>('catalog');
   const [selectedCatalogId, setSelectedCatalogId] = useState('');
   const [targetAgent, setTargetAgent] = useState('');
@@ -1299,32 +1336,20 @@ function AddServerDialog({
   const [envText, setEnvText] = useState('');
   // v1.68: typed values for the catalogue item's required env names.
   const [requiredValues, setRequiredValues] = useState<Record<string, string>>({});
+  // Env names of the installed server whose value cannot be carried over.
+  const [reenter, setReenter] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // When a catalog item is selected, auto-fill fields
-  useEffect(() => {
-    if (mode === 'catalog' && selectedCatalogId) {
-      const item = catalog.find((c) => c.id === selectedCatalogId);
-      if (item) {
-        setServerName(item.id);
-        setCommand(item.default_def.command);
-        setArgs(item.default_def.args.join(' '));
-        // v1.68: the catalogue env comes back masked (set / not_set /
-        // reference). Prefill only real values; required names are typed
-        // separately below.
-        setEnvText(
-          Object.entries(unmaskedEnv(item.default_def.env))
-            .filter(([k]) => !item.required_env.includes(k))
-            .map(([k, v]) => `${k}=${v}`)
-            .join('\n'),
-        );
-        setRequiredValues({});
-      }
-    }
-  }, [mode, selectedCatalogId, catalog]);
+  // Which source last filled command/args/env, so a refreshed `catalog`
+  // array (new identity after fetchAll) never overwrites the operator's edits.
+  const prefilledKey = useRef('');
+  // Set once the operator edits command / args / env: from then on nothing
+  // refills those fields behind their back (picking another catalogue item
+  // clears it — that is an explicit request for that item's defaults).
+  const touched = useRef(false);
 
   const resetForm = () => {
+    setMode('catalog');
     setSelectedCatalogId('');
     setTargetAgent('');
     setServerName('');
@@ -1332,55 +1357,153 @@ function AddServerDialog({
     setArgs('');
     setEnvText('');
     setRequiredValues({});
+    setReenter([]);
     setError(null);
+    prefilledKey.current = '';
+    touched.current = false;
+  };
+
+  // Apply the preset each time the dialog opens.
+  useEffect(() => {
+    if (!preset) return;
+    resetForm();
+    const catalogId =
+      preset.catalogId ??
+      (preset.serverName && catalog.some((c) => c.id === preset.serverName) ? preset.serverName : undefined);
+    if (catalogId) {
+      setMode('catalog');
+      setSelectedCatalogId(catalogId);
+    } else if (preset.serverName) {
+      setMode('custom');
+    }
+    if (preset.serverName) setServerName(preset.serverName);
+    if (preset.agentId) setTargetAgent(preset.agentId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on open
+  }, [preset]);
+
+  // Catalogue item → its server name.
+  useEffect(() => {
+    if (mode !== 'catalog' || !selectedCatalogId) return;
+    const item = catalog.find((c) => c.id === selectedCatalogId);
+    if (item) setServerName(item.id);
+  }, [mode, selectedCatalogId, catalog]);
+
+  const trimmedName = serverName.trim();
+  const existing = targetAgent && trimmedName
+    ? installedServers(targetAgent).find((s) => s.name === trimmedName)
+    : undefined;
+  const selectedCatalogItem =
+    mode === 'catalog' ? catalog.find((c) => c.id === selectedCatalogId) : undefined;
+
+  // Fill command / args / env: from the installed definition when this agent
+  // already has a server of this name (so 送出 edits it in place), otherwise
+  // from the catalogue defaults. A name typed in custom mode never pulls the
+  // installed definition in (it would overwrite what is being typed); only a
+  // catalogue pick or the row's 編輯 does.
+  const prefillFromExisting = existing !== undefined && (mode === 'catalog' || !!preset?.serverName);
+  useEffect(() => {
+    if (touched.current) return;
+    let key = '';
+    if (existing && prefillFromExisting) key = `installed:${targetAgent}/${existing.name}`;
+    else if (selectedCatalogItem) key = `catalog:${selectedCatalogItem.id}`;
+    if (!key || key === prefilledKey.current) return;
+    prefilledKey.current = key;
+    if (existing && prefillFromExisting) {
+      const fill = prefillFromInstalled(existing, selectedCatalogItem?.required_env ?? []);
+      setCommand(fill.command);
+      setArgs(fill.args);
+      setEnvText(fill.envText);
+      setReenter(fill.reenter);
+    } else if (selectedCatalogItem) {
+      setCommand(selectedCatalogItem.default_def.command);
+      setArgs(selectedCatalogItem.default_def.args.join(' '));
+      // v1.68: the catalogue env comes back masked (set / not_set /
+      // reference). Prefill only real values; required names are typed
+      // separately below.
+      setEnvText(
+        Object.entries(unmaskedEnv(selectedCatalogItem.default_def.env))
+          .filter(([k]) => !selectedCatalogItem.required_env.includes(k))
+          .map(([k, v]) => `${k}=${v}`)
+          .join('\n'),
+      );
+      setReenter([]);
+    }
+    setRequiredValues({});
+  }, [existing, prefillFromExisting, selectedCatalogItem, targetAgent]);
+
+  const parsedNow = parseEnvText(envText);
+  // Required names still to be typed: an installed server keeps the ones it
+  // already holds, as long as their `NAME=set` line is still in the form.
+  const requiredToType = (selectedCatalogItem?.required_env ?? []).filter(
+    (name) => !(existing?.env[name] === 'set' && parsedNow[name]?.trim() === 'set'),
+  );
+  // Stored values that saving would remove (their line was deleted or never
+  // filled); `mcp.update` replaces the whole definition.
+  const dropped = existing
+    ? Object.keys(existing.env).filter(
+        (name) =>
+          existing.env[name] !== 'not_set' &&
+          !parsedNow[name]?.trim() &&
+          !requiredValues[name]?.trim() &&
+          // An emptied re-entry line is refused at save; a deleted one is dropped.
+          !(reenter.includes(name) && name in parsedNow) &&
+          !requiredToType.includes(name),
+      )
+    : [];
+
+  const close = () => {
+    onClose();
+    resetForm();
   };
 
   const handleSubmit = async () => {
-    if (!targetAgent || !serverName.trim() || !command.trim()) return;
-    setSubmitting(true);
+    if (!targetAgent || !trimmedName || !command.trim()) return;
     setError(null);
+    const parsedEnv = parseEnvText(envText);
+    const missing = missingRequiredEnv(requiredToType, requiredValues);
+    if (missing.length > 0) {
+      setError(intl.formatMessage({ id: 'mcp.requiredEnv.missing' }, { vars: missing.join(', ') }));
+      return;
+    }
+    const stillEmpty = reenter.filter(
+      (name) => name in parsedEnv && !parsedEnv[name].trim() && !requiredValues[name]?.trim(),
+    );
+    if (stillEmpty.length > 0) {
+      setError(intl.formatMessage({ id: 'mcp.edit.reenterMissing' }, { vars: stillEmpty.join(', ') }));
+      return;
+    }
+    setSubmitting(true);
     try {
-      const parsedEnv: Record<string, string> = {};
-      for (const line of envText.split('\n')) {
-        const t = line.trim();
-        if (!t) continue;
-        const eqIdx = t.indexOf('=');
-        if (eqIdx > 0) {
-          parsedEnv[t.slice(0, eqIdx)] = t.slice(eqIdx + 1);
-        }
-      }
-      const item = mode === 'catalog' ? catalog.find((c) => c.id === selectedCatalogId) : undefined;
-      const required = item?.required_env ?? [];
-      if (missingRequiredEnv(required, requiredValues).length > 0) {
-        setError(intl.formatMessage({ id: 'mcp.requiredEnv.missing' }, { vars: missingRequiredEnv(required, requiredValues).join(', ') }));
-        return;
-      }
       const argList = args.trim() ? args.trim().split(/\s+/) : [];
+      const item = selectedCatalogItem;
       const untouched =
+        !existing &&
         item !== undefined &&
-        serverName.trim() === item.id &&
+        trimmedName === item.id &&
         command.trim() === item.default_def.command &&
         argList.join(' ') === item.default_def.args.join(' ') &&
-        Object.keys(parsedEnv).length === Object.keys(unmaskedEnv(item.default_def.env)).filter((k) => !required.includes(k)).length;
+        Object.keys(parsedEnv).length ===
+          Object.keys(unmaskedEnv(item.default_def.env)).filter((k) => !item.required_env.includes(k)).length;
       if (item && untouched) {
         // Unchanged catalogue item: let the gateway use its own definition.
-        await api.marketplace.install(item.id, targetAgent, requiredEnvPayload(required, requiredValues));
+        await api.marketplace.install(item.id, targetAgent, requiredEnvPayload(item.required_env, requiredValues));
         await useMcpStore.getState().fetchAll();
       } else {
+        // `mcp.update` add replaces a same-name server, so an installed
+        // server is edited in place.
         const def: McpServerDef = {
           command: command.trim(),
           args: argList,
-          env: { ...parsedEnv, ...requiredEnvPayload(required, requiredValues) },
+          env: { ...parsedEnv, ...requiredEnvPayload(requiredToType, requiredValues) },
         };
-        await useMcpStore.getState().addServer(targetAgent, serverName.trim(), def);
+        await useMcpStore.getState().addServer(targetAgent, trimmedName, def);
       }
-      setRequiredValues({});
-      onAdded(serverName.trim(), targetAgent);
-      onClose();
-      resetForm();
-    } catch {
-      setError(intl.formatMessage({ id: 'mcp.loadFailed' }));
-      onError();
+      onAdded(trimmedName, targetAgent, existing !== undefined);
+      close();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(intl.formatMessage({ id: 'mcp.installFailed' }, { message }));
+      onError(message);
     } finally {
       setSubmitting(false);
     }
@@ -1390,27 +1513,36 @@ function AddServerDialog({
     { value: 'catalog', label: intl.formatMessage({ id: 'mcp.fromCatalog' }) },
     { value: 'custom', label: intl.formatMessage({ id: 'mcp.custom' }) },
   ];
-  const selectedCatalogItem = catalog.find((c) => c.id === selectedCatalogId);
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { if (!o) { onClose(); resetForm(); } }}>
+    <Dialog open={open} onOpenChange={(o) => { if (!o) close(); }}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'mcp.addTitle' })}</DialogTitle>
+          <DialogTitle>
+            {intl.formatMessage({ id: existing ? 'mcp.edit.title' : 'mcp.addTitle' })}
+          </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
-          {/* Mode toggle */}
-          <Segmented value={mode} onValueChange={setMode} options={catalogModeOptions} className="w-full" />
+          {/* Mode toggle — not offered when editing an installed row. */}
+          {!locked && (
+            <Segmented value={mode} onValueChange={setMode} options={catalogModeOptions} className="w-full" />
+          )}
 
           {/* Catalog selector */}
-          {mode === 'catalog' && (
+          {mode === 'catalog' && !locked && (
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'mcp.fromCatalog' })}
               </label>
-              <Select value={selectedCatalogId} onValueChange={(v) => setSelectedCatalogId(String(v))}>
-                <SelectTrigger className="w-full">
+              <Select
+                value={selectedCatalogId}
+                onValueChange={(v) => {
+                  touched.current = false;
+                  setSelectedCatalogId(String(v));
+                }}
+              >
+                <SelectTrigger className="w-full" aria-label={intl.formatMessage({ id: 'mcp.fromCatalog' })}>
                   <SelectValue placeholder="--">{selectedCatalogItem?.name}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
@@ -1432,6 +1564,7 @@ function AddServerDialog({
               onChange={setTargetAgent}
               agents={agents}
               placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
+              disabled={locked}
             />
           </div>
 
@@ -1445,7 +1578,7 @@ function AddServerDialog({
               value={serverName}
               onChange={(e) => setServerName(e.target.value)}
               placeholder="e.g. filesystem"
-              readOnly={mode === 'catalog' && !!selectedCatalogId}
+              readOnly={locked || (mode === 'catalog' && !!selectedCatalogId)}
             />
           </div>
 
@@ -1458,50 +1591,81 @@ function AddServerDialog({
             description={intl.formatMessage({ id: 'mcp.custom.dangerDesc' })}
           >
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label htmlFor="mcp-add-command" className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'mcp.command' })}
               </label>
               <Input
+                id="mcp-add-command"
                 type="text"
                 value={command}
-                onChange={(e) => setCommand(e.target.value)}
+                onChange={(e) => {
+                  touched.current = true;
+                  setCommand(e.target.value);
+                }}
                 placeholder="e.g. npx"
+                disabled={!canEdit}
               />
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label htmlFor="mcp-add-args" className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'mcp.args' })}
               </label>
               <Input
+                id="mcp-add-args"
                 type="text"
                 value={args}
-                onChange={(e) => setArgs(e.target.value)}
+                onChange={(e) => {
+                  touched.current = true;
+                  setArgs(e.target.value);
+                }}
                 placeholder="e.g. -y @modelcontextprotocol/server-filesystem /path"
+                disabled={!canEdit}
               />
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label htmlFor="mcp-add-env" className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'mcp.env' })}
               </label>
               <Textarea
+                id="mcp-add-env"
                 value={envText}
-                onChange={(e) => setEnvText(e.target.value)}
+                onChange={(e) => {
+                  touched.current = true;
+                  setEnvText(e.target.value);
+                }}
                 placeholder={'API_KEY=your-key\nANOTHER_VAR=value'}
                 rows={3}
                 className="resize-none font-mono text-xs"
+                disabled={!canEdit}
               />
               <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.env.help' })}</p>
+              {reenter.length > 0 && (
+                <p className="text-xs text-warning">
+                  {intl.formatMessage({ id: 'mcp.edit.reenter' }, { vars: reenter.join(', ') })}
+                </p>
+              )}
+              {dropped.length > 0 && (
+                <p className="text-xs text-warning">
+                  {intl.formatMessage({ id: 'mcp.edit.dropped' }, { vars: dropped.join(', ') })}
+                </p>
+              )}
             </div>
           </DangerZone>
 
-          {mode === 'catalog' && selectedCatalogItem && (
+          {selectedCatalogItem && requiredToType.length > 0 && (
             <RequiredEnvFields
-              required={selectedCatalogItem.required_env}
+              required={requiredToType}
               values={requiredValues}
               onChange={setRequiredValues}
             />
+          )}
+
+          {existing && (
+            <p role="status" className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'mcp.edit.replaceNotice' }, { server: existing.name })}
+            </p>
           )}
 
           {error && (
@@ -1517,9 +1681,11 @@ function AddServerDialog({
           <Button
             variant="brand"
             onClick={handleSubmit}
-            disabled={submitting || !targetAgent || !serverName.trim() || !command.trim()}
+            disabled={submitting || !canEdit || !targetAgent || !trimmedName || !command.trim()}
           >
-            {submitting ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.add' })}
+            {submitting
+              ? intl.formatMessage({ id: 'mcp.adding' })
+              : intl.formatMessage({ id: existing ? 'mcp.edit.save' : 'mcp.add' })}
           </Button>
         </DialogFooter>
       </DialogContent>
